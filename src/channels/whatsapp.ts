@@ -40,6 +40,7 @@ export class WhatsAppChannel implements Channel {
 
   private sock!: WASocket;
   private connected = false;
+  private disabled = false;
   private lidToPhoneMap: Record<string, string> = {};
   private outgoingQueue: Array<{ jid: string; text: string }> = [];
   private flushing = false;
@@ -91,7 +92,12 @@ export class WhatsAppChannel implements Channel {
         exec(
           `osascript -e 'display notification "${msg}" with title "NanoClaw" sound name "Basso"'`,
         );
-        setTimeout(() => process.exit(1), 1000);
+        // Disable this channel instead of killing the entire process —
+        // other channels (Telegram, Slack, etc.) should keep running.
+        this.connected = false;
+        this.disabled = true;
+        logger.warn('WhatsApp disabled (needs re-auth). Other channels unaffected.');
+        return;
       }
 
       if (connection === 'close') {
@@ -109,7 +115,7 @@ export class WhatsAppChannel implements Channel {
           'Connection closed',
         );
 
-        if (shouldReconnect) {
+        if (shouldReconnect && !this.disabled) {
           logger.info('Reconnecting...');
           this.connectInternal().catch((err) => {
             logger.error({ err }, 'Failed to reconnect, retrying in 5s');
@@ -120,8 +126,10 @@ export class WhatsAppChannel implements Channel {
             }, 5000);
           });
         } else {
-          logger.info('Logged out. Run /setup to re-authenticate.');
-          process.exit(0);
+          // Logged out (401) — disable this channel instead of killing the
+          // entire process. Other channels should keep running.
+          this.disabled = true;
+          logger.warn('WhatsApp logged out. Run /setup to re-authenticate. Other channels unaffected.');
         }
       } else if (connection === 'open') {
         this.connected = true;
