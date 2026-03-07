@@ -116,7 +116,8 @@ export class DiscordChannel implements Channel {
         }
       }
 
-      // Handle reply context — include who the user is replying to
+      // Handle reply context — include who the user is replying to.
+      // Replying to a bot message implicitly triggers the bot (no @mention needed).
       if (message.reference?.messageId) {
         try {
           const repliedTo = await message.channel.messages.fetch(
@@ -127,6 +128,15 @@ export class DiscordChannel implements Channel {
             repliedTo.author.displayName ||
             repliedTo.author.username;
           content = `[Reply to ${replyAuthor}] ${content}`;
+
+          // If replying to the bot, treat as implicit trigger
+          if (
+            this.client?.user &&
+            repliedTo.author.id === this.client.user.id &&
+            !TRIGGER_PATTERN.test(content)
+          ) {
+            content = `@${ASSISTANT_NAME} ${content}`;
+          }
         } catch {
           // Referenced message may have been deleted
         }
@@ -209,10 +219,17 @@ export class DiscordChannel implements Channel {
       for (const [, member] of members) {
         if (member.user.bot) continue;
         nameMap.push([member.displayName.toLowerCase(), member.id]);
-        if (member.user.username.toLowerCase() !== member.displayName.toLowerCase()) {
+        if (
+          member.user.username.toLowerCase() !==
+          member.displayName.toLowerCase()
+        ) {
           nameMap.push([member.user.username.toLowerCase(), member.id]);
         }
-        if (member.user.globalName && member.user.globalName.toLowerCase() !== member.displayName.toLowerCase()) {
+        if (
+          member.user.globalName &&
+          member.user.globalName.toLowerCase() !==
+            member.displayName.toLowerCase()
+        ) {
           nameMap.push([member.user.globalName.toLowerCase(), member.id]);
         }
       }

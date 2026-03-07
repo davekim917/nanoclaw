@@ -377,7 +377,10 @@ export class SlackChannel implements Channel {
     let result = text;
     for (const [name, userId] of names) {
       // Match @Name or @name (case-insensitive, word boundary)
-      const pattern = new RegExp(`@${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'gi');
+      const pattern = new RegExp(
+        `@${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`,
+        'gi',
+      );
       result = result.replace(pattern, `<@${userId}>`);
     }
     return result;
