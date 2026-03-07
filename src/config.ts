@@ -77,6 +77,10 @@ export const TRIGGER_PATTERN = new RegExp(
   'i',
 );
 
+// External Claude Code plugin directory (e.g. davekim917/bootstrap)
+// Skills and agents are synced into each group's .claude/ before container runs
+export const PLUGIN_DIR = process.env.PLUGIN_DIR || path.join(HOME_DIR, 'bootstrap');
+
 // Timezone for scheduled tasks (cron expressions, etc.)
 // Uses system timezone by default
 export const TIMEZONE =

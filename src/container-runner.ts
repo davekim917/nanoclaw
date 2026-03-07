@@ -14,6 +14,7 @@ import {
   DATA_DIR,
   GROUPS_DIR,
   IDLE_TIMEOUT,
+  PLUGIN_DIR,
   TIMEZONE,
 } from './config.js';
 import { readEnvFile } from './env.js';
@@ -178,6 +179,41 @@ function buildVolumeMounts(
       if (!fs.statSync(srcDir).isDirectory()) continue;
       const dstDir = path.join(skillsDst, skillDir);
       fs.cpSync(srcDir, dstDir, { recursive: true });
+    }
+  }
+
+  // Sync skills and agents from external plugin (e.g. davekim917/bootstrap)
+  if (fs.existsSync(PLUGIN_DIR)) {
+    // Skills: plugin has skills/{category}/{skill-name}/SKILL.md — flatten into .claude/skills/
+    const pluginSkillsDir = path.join(PLUGIN_DIR, 'skills');
+    if (fs.existsSync(pluginSkillsDir)) {
+      for (const category of fs.readdirSync(pluginSkillsDir)) {
+        const categoryDir = path.join(pluginSkillsDir, category);
+        if (!fs.statSync(categoryDir).isDirectory()) continue;
+        for (const skill of fs.readdirSync(categoryDir)) {
+          const skillSrc = path.join(categoryDir, skill);
+          if (!fs.statSync(skillSrc).isDirectory()) continue;
+          // Skip non-skill directories (e.g. 'shared')
+          if (!fs.existsSync(path.join(skillSrc, 'SKILL.md'))) continue;
+          fs.cpSync(skillSrc, path.join(skillsDst, skill), {
+            recursive: true,
+          });
+        }
+      }
+    }
+
+    // Agents: plugin has agents/*.md — sync into .claude/agents/
+    const pluginAgentsDir = path.join(PLUGIN_DIR, 'agents');
+    if (fs.existsSync(pluginAgentsDir)) {
+      const agentsDst = path.join(groupSessionsDir, 'agents');
+      fs.mkdirSync(agentsDst, { recursive: true });
+      for (const agentFile of fs.readdirSync(pluginAgentsDir)) {
+        if (!agentFile.endsWith('.md')) continue;
+        fs.copyFileSync(
+          path.join(pluginAgentsDir, agentFile),
+          path.join(agentsDst, agentFile),
+        );
+      }
     }
   }
   mounts.push({
