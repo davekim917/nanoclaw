@@ -4,6 +4,11 @@ cd /app && npx tsc --outDir /tmp/dist 2>&1 >&2
 ln -s /app/node_modules /tmp/dist/node_modules
 chmod -R a-w /tmp/dist
 cat > /tmp/input.json
+
+# Configure browser proxy for residential IP routing (geo-fenced sites)
+if [ -n "$RESIDENTIAL_PROXY_URL" ]; then
+  export AGENT_BROWSER_LAUNCH_OPTIONS="{\"args\":[\"--proxy-server=$RESIDENTIAL_PROXY_URL\"]}"
+fi
 # Configure git/gh auth if GITHUB_TOKEN is present in secrets
 GH_TOKEN=$(node -e 'try{const d=JSON.parse(require("fs").readFileSync("/tmp/input.json","utf8"));if(d.secrets?.GITHUB_TOKEN)process.stdout.write(d.secrets.GITHUB_TOKEN)}catch{}' 2>/dev/null)
 if [ -n "$GH_TOKEN" ]; then

@@ -248,7 +248,10 @@ export class SlackChannel implements Channel {
   async setTyping(jid: string, isTyping: boolean): Promise<void> {
     const channelId = jid.replace(/^slack:/, '');
     const messageTs = this.lastUserMessageTs.get(jid);
-    if (!messageTs) return;
+    if (!messageTs) {
+      logger.debug({ jid, isTyping }, 'No lastUserMessageTs for reaction');
+      return;
+    }
 
     try {
       if (isTyping) {
@@ -264,8 +267,12 @@ export class SlackChannel implements Channel {
           name: 'eyes',
         });
       }
-    } catch {
-      // ignore — reaction may already exist or be removed
+    } catch (err: unknown) {
+      // "already_reacted" / "no_reaction" are expected races — suppress those
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!msg.includes('already_reacted') && !msg.includes('no_reaction')) {
+        logger.warn({ jid, isTyping, err: msg }, 'Slack reaction failed');
+      }
     }
   }
 
@@ -409,10 +416,7 @@ export class SlackChannel implements Channel {
       const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
       // Match @Name or plain Name with word boundaries on both sides.
       // Negative lookbehind prevents matching inside <@U...> slack mentions.
-      const pattern = new RegExp(
-        `(?<!<)@?\\b${escaped}\\b`,
-        'gi',
-      );
+      const pattern = new RegExp(`(?<!<)@?\\b${escaped}\\b`, 'gi');
       result = result.replace(pattern, `<@${userId}>`);
     }
     return result;
