@@ -167,10 +167,7 @@ function buildVolumeMounts(
       url: 'https://mcp.granola.ai/mcp',
     };
   }
-  fs.writeFileSync(
-    mcpJsonPath,
-    JSON.stringify({ mcpServers }, null, 2) + '\n',
-  );
+  fs.writeFileSync(mcpJsonPath, JSON.stringify({ mcpServers }, null, 2) + '\n');
 
   // Sync skills from container/skills/ into each group's .claude/skills/
   const skillsSrc = path.join(process.cwd(), 'container', 'skills');
@@ -190,13 +187,15 @@ function buildVolumeMounts(
   });
 
   // Gmail credentials — gated by tools config
-  const gmailEnabled = !tools || tools.some(t => t === 'gmail' || t.startsWith('gmail:'));
+  const gmailEnabled =
+    !tools || tools.some((t) => t === 'gmail' || t.startsWith('gmail:'));
   if (gmailEnabled) {
     // Check for account-specific restriction (e.g. 'gmail:illysium')
     const gmailAccounts = tools
-      ?.filter(t => t.startsWith('gmail:'))
-      .map(t => t.split(':')[1]);
-    const accountSpecific = gmailAccounts && gmailAccounts.length > 0 && !tools!.includes('gmail');
+      ?.filter((t) => t.startsWith('gmail:'))
+      .map((t) => t.split(':')[1]);
+    const accountSpecific =
+      gmailAccounts && gmailAccounts.length > 0 && !tools!.includes('gmail');
 
     if (accountSpecific) {
       // Mount only the specified account's credentials as /home/node/.gmail-mcp
@@ -255,7 +254,8 @@ function buildVolumeMounts(
       // since the host paths (/root/.snowflake/keys/...) map to /home/node/.snowflake/keys/... in-container
       const origToml = path.join(snowflakeDir, 'connections.toml');
       if (fs.existsSync(origToml)) {
-        const tomlContent = fs.readFileSync(origToml, 'utf-8')
+        const tomlContent = fs
+          .readFileSync(origToml, 'utf-8')
           .replace(/\/root\/\.snowflake\//g, '/home/node/.snowflake/');
         const containerTomlDir = path.join(
           DATA_DIR,
