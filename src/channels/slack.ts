@@ -37,6 +37,7 @@ export class SlackChannel implements Channel {
   private outgoingQueue: Array<{ jid: string; text: string }> = [];
   private flushing = false;
   private userNameCache = new Map<string, string>();
+  private userIdByName = new Map<string, string>();
 
   // Track the thread_ts of the last triggering message per channel,
   // so replies go into the correct thread. For top-level messages, the
@@ -193,6 +194,7 @@ export class SlackChannel implements Channel {
 
     try {
       const threadTs = this.replyThreadTs.get(jid);
+      text = this.replaceMentions(text);
 
       // Slack limits messages to ~4000 characters; split if needed
       if (text.length <= MAX_MESSAGE_LENGTH) {
@@ -269,6 +271,28 @@ export class SlackChannel implements Channel {
       } while (cursor);
 
       logger.info({ count }, 'Slack channel metadata synced');
+
+      // Pre-populate user name cache for registered channels
+      const groups = this.opts.registeredGroups();
+      for (const jid of Object.keys(groups)) {
+        if (!jid.startsWith('slack:')) continue;
+        const channelId = jid.replace(/^slack:/, '');
+        try {
+          const members = await this.app.client.conversations.members({
+            channel: channelId,
+            limit: 200,
+          });
+          for (const userId of members.members || []) {
+            await this.resolveUserName(userId);
+          }
+        } catch {
+          // ignore — channel may not be accessible
+        }
+      }
+      logger.info(
+        { userCount: this.userIdByName.size },
+        'Slack user name cache populated',
+      );
     } catch (err) {
       logger.error({ err }, 'Failed to sync Slack channel metadata');
     }
@@ -324,12 +348,39 @@ export class SlackChannel implements Channel {
     try {
       const result = await this.app.client.users.info({ user: userId });
       const name = result.user?.real_name || result.user?.name;
-      if (name) this.userNameCache.set(userId, name);
+      if (name) {
+        this.userNameCache.set(userId, name);
+        this.userIdByName.set(name.toLowerCase(), userId);
+        // Also cache display_name for matching
+        const displayName = result.user?.profile?.display_name;
+        if (displayName) {
+          this.userIdByName.set(displayName.toLowerCase(), userId);
+        }
+      }
       return name;
     } catch (err) {
       logger.debug({ userId, err }, 'Failed to resolve Slack user name');
       return undefined;
     }
+  }
+
+  /**
+   * Convert @Name mentions in outbound text to Slack <@USER_ID> format.
+   * Matches against cached real_name and display_name (case-insensitive).
+   */
+  private replaceMentions(text: string): string {
+    if (this.userIdByName.size === 0) return text;
+    // Sort names by length (longest first) to avoid partial matches
+    const names = [...this.userIdByName.entries()].sort(
+      (a, b) => b[0].length - a[0].length,
+    );
+    let result = text;
+    for (const [name, userId] of names) {
+      // Match @Name or @name (case-insensitive, word boundary)
+      const pattern = new RegExp(`@${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'gi');
+      result = result.replace(pattern, `<@${userId}>`);
+    }
+    return result;
   }
 
   private async flushOutgoingQueue(): Promise<void> {
