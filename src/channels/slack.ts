@@ -261,10 +261,16 @@ export class SlackChannel implements Channel {
           name: 'eyes',
         });
       } else {
+        // Swap 👀 → ✅ to signal completion
         await this.app.client.reactions.remove({
           channel: channelId,
           timestamp: messageTs,
           name: 'eyes',
+        });
+        await this.app.client.reactions.add({
+          channel: channelId,
+          timestamp: messageTs,
+          name: 'white_check_mark',
         });
       }
     } catch (err: unknown) {

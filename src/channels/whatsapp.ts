@@ -45,6 +45,7 @@ export class WhatsAppChannel implements Channel {
   private outgoingQueue: Array<{ jid: string; text: string }> = [];
   private flushing = false;
   private groupSyncTimerStarted = false;
+  private typingIntervals = new Map<string, ReturnType<typeof setInterval>>();
 
   private opts: WhatsAppChannelOpts;
 
@@ -308,6 +309,12 @@ export class WhatsAppChannel implements Channel {
   }
 
   async setTyping(jid: string, isTyping: boolean): Promise<void> {
+    const existing = this.typingIntervals.get(jid);
+    if (existing) {
+      clearInterval(existing);
+      this.typingIntervals.delete(jid);
+    }
+
     try {
       const status = isTyping ? 'composing' : 'paused';
       logger.debug({ jid, status }, 'Sending presence update');
@@ -315,6 +322,17 @@ export class WhatsAppChannel implements Channel {
     } catch (err) {
       logger.debug({ jid, err }, 'Failed to update typing status');
     }
+
+    if (!isTyping) return;
+
+    this.typingIntervals.set(
+      jid,
+      setInterval(() => {
+        this.sock.sendPresenceUpdate('composing', jid).catch((err) => {
+          logger.debug({ jid, err }, 'Failed to refresh typing status');
+        });
+      }, 4000),
+    );
   }
 
   async syncGroups(force: boolean): Promise<void> {
