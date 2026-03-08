@@ -253,10 +253,7 @@ export class SlackChannel implements Channel {
       return;
     }
 
-    const safeReaction = async (
-      method: 'add' | 'remove',
-      name: string,
-    ) => {
+    const safeReaction = async (method: 'add' | 'remove', name: string) => {
       try {
         await this.app.client.reactions[method]({
           channel: channelId,

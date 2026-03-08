@@ -232,9 +232,7 @@ function buildVolumeMounts(
         const pluginHooks = JSON.parse(
           fs.readFileSync(pluginHooksJson, 'utf-8'),
         );
-        const settings = JSON.parse(
-          fs.readFileSync(settingsFile, 'utf-8'),
-        );
+        const settings = JSON.parse(fs.readFileSync(settingsFile, 'utf-8'));
         settings.hooks = pluginHooks;
         fs.writeFileSync(
           settingsFile,
