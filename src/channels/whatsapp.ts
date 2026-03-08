@@ -19,21 +19,10 @@ import {
 } from '../config.js';
 import { getLastGroupSync, setLastGroupSync, updateChatName } from '../db.js';
 import { logger } from '../logger.js';
-import {
-  Channel,
-  OnInboundMessage,
-  OnChatMetadata,
-  RegisteredGroup,
-} from '../types.js';
+import { Channel } from '../types.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 
 const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
-
-export interface WhatsAppChannelOpts {
-  onMessage: OnInboundMessage;
-  onChatMetadata: OnChatMetadata;
-  registeredGroups: () => Record<string, RegisteredGroup>;
-}
 
 export class WhatsAppChannel implements Channel {
   name = 'whatsapp';
@@ -47,9 +36,9 @@ export class WhatsAppChannel implements Channel {
   private groupSyncTimerStarted = false;
   private typingIntervals = new Map<string, ReturnType<typeof setInterval>>();
 
-  private opts: WhatsAppChannelOpts;
+  private opts: ChannelOpts;
 
-  constructor(opts: WhatsAppChannelOpts) {
+  constructor(opts: ChannelOpts) {
     this.opts = opts;
   }
 
@@ -300,6 +289,11 @@ export class WhatsAppChannel implements Channel {
   async disconnect(): Promise<void> {
     this.connected = false;
     this.disabled = true; // Prevent reconnect loop during shutdown
+    // Clear all typing intervals to prevent callbacks on destroyed socket
+    for (const interval of this.typingIntervals.values()) {
+      clearInterval(interval);
+    }
+    this.typingIntervals.clear();
     try {
       await this.sock?.ws?.close();
     } catch {

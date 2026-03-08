@@ -3,9 +3,10 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // Mock registry (registerChannel runs at import time)
 vi.mock('./registry.js', () => ({ registerChannel: vi.fn() }));
 
-import { GmailChannel, GmailChannelOpts } from './gmail.js';
+import { GmailChannel } from './gmail.js';
+import type { ChannelOpts } from './registry.js';
 
-function makeOpts(overrides?: Partial<GmailChannelOpts>): GmailChannelOpts {
+function makeOpts(overrides?: Partial<ChannelOpts>): ChannelOpts {
   return {
     onMessage: vi.fn(),
     onChatMetadata: vi.fn(),
@@ -58,14 +59,6 @@ describe('GmailChannel', () => {
     it('accepts custom poll interval', () => {
       const ch = new GmailChannel(makeOpts(), 30000);
       expect(ch.name).toBe('gmail');
-    });
-
-    it('defaults to unread query when no filter configured', () => {
-      const ch = new GmailChannel(makeOpts());
-      const query = (
-        ch as unknown as { buildQuery: () => string }
-      ).buildQuery();
-      expect(query).toBe('is:unread category:primary');
     });
 
     it('defaults with no options provided', () => {

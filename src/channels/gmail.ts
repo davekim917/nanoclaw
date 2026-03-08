@@ -7,18 +7,7 @@ import { OAuth2Client } from 'google-auth-library';
 
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
-import {
-  Channel,
-  OnChatMetadata,
-  OnInboundMessage,
-  RegisteredGroup,
-} from '../types.js';
-
-export interface GmailChannelOpts {
-  onMessage: OnInboundMessage;
-  onChatMetadata: OnChatMetadata;
-  registeredGroups: () => Record<string, RegisteredGroup>;
-}
+import { Channel } from '../types.js';
 
 interface ThreadMeta {
   sender: string;
@@ -48,12 +37,12 @@ export class GmailChannel implements Channel {
   name = 'gmail';
 
   private accounts: GmailAccount[] = [];
-  private opts: GmailChannelOpts;
+  private opts: ChannelOpts;
   private pollIntervalMs: number;
   private pollTimer: ReturnType<typeof setTimeout> | null = null;
   private threadMeta = new Map<string, ThreadMeta>();
 
-  constructor(opts: GmailChannelOpts, pollIntervalMs = 60000) {
+  constructor(opts: ChannelOpts, pollIntervalMs = 60000) {
     this.opts = opts;
     this.pollIntervalMs = pollIntervalMs;
   }
@@ -330,7 +319,13 @@ export class GmailChannel implements Channel {
 
     const chatJid = `gmail:${threadId}`;
 
-    // Cache thread metadata for replies
+    // Cache thread metadata for replies (capped to prevent unbounded growth)
+    if (this.threadMeta.size > 5000) {
+      const keys = [...this.threadMeta.keys()];
+      for (let i = 0; i < keys.length - 2500; i++) {
+        this.threadMeta.delete(keys[i]);
+      }
+    }
     this.threadMeta.set(threadId, {
       sender: senderEmail,
       senderName,

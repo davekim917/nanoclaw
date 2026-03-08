@@ -14,7 +14,10 @@ vi.mock('./config.js', () => ({
   DATA_DIR: '/tmp/nanoclaw-test-data',
   GROUPS_DIR: '/tmp/nanoclaw-test-groups',
   IDLE_TIMEOUT: 1800000, // 30min
+  PLUGIN_DIR: '/tmp/nanoclaw-test-plugin',
+  RESIDENTIAL_PROXY_URL: undefined,
   TIMEZONE: 'America/Los_Angeles',
+  escapeRegex: (str: string) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
 }));
 
 // Mock logger

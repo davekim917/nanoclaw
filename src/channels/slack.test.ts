@@ -9,6 +9,7 @@ vi.mock('./registry.js', () => ({ registerChannel: vi.fn() }));
 vi.mock('../config.js', () => ({
   ASSISTANT_NAME: 'Jonesy',
   TRIGGER_PATTERN: /^@Jonesy\b/i,
+  escapeRegex: (str: string) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
 }));
 
 // Mock logger
@@ -82,15 +83,16 @@ vi.mock('../env.js', () => ({
   }),
 }));
 
-import { SlackChannel, SlackChannelOpts } from './slack.js';
+import { SlackChannel } from './slack.js';
+import type { ChannelOpts } from './registry.js';
 import { updateChatName } from '../db.js';
 import { readEnvFile } from '../env.js';
 
 // --- Test helpers ---
 
 function createTestOpts(
-  overrides?: Partial<SlackChannelOpts>,
-): SlackChannelOpts {
+  overrides?: Partial<ChannelOpts>,
+): ChannelOpts {
   return {
     onMessage: vi.fn(),
     onChatMetadata: vi.fn(),

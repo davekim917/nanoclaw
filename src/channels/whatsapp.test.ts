@@ -99,14 +99,15 @@ vi.mock('@whiskeysockets/baileys', () => {
   };
 });
 
-import { WhatsAppChannel, WhatsAppChannelOpts } from './whatsapp.js';
+import { WhatsAppChannel } from './whatsapp.js';
+import type { ChannelOpts } from './registry.js';
 import { getLastGroupSync, updateChatName, setLastGroupSync } from '../db.js';
 
 // --- Test helpers ---
 
 function createTestOpts(
-  overrides?: Partial<WhatsAppChannelOpts>,
-): WhatsAppChannelOpts {
+  overrides?: Partial<ChannelOpts>,
+): ChannelOpts {
   return {
     onMessage: vi.fn(),
     onChatMetadata: vi.fn(),

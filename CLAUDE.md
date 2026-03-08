@@ -55,6 +55,10 @@ systemctl --user stop nanoclaw
 systemctl --user restart nanoclaw
 ```
 
+## Code Quality
+
+Run `/simplify` before every PR or push to main. This reviews changed code for reuse, quality, and efficiency issues and fixes them.
+
 ## Troubleshooting
 
 **WhatsApp not connecting after upgrade:** WhatsApp is now a separate skill, not bundled in core. Run `/add-whatsapp` (or `npx tsx scripts/apply-skill.ts .claude/skills/add-whatsapp && npm run build`) to install it. Existing auth credentials and groups are preserved.

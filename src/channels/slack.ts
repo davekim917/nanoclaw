@@ -1,17 +1,12 @@
 import { App, LogLevel } from '@slack/bolt';
 import type { GenericMessageEvent, BotMessageEvent } from '@slack/types';
 
-import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
+import { ASSISTANT_NAME, TRIGGER_PATTERN, escapeRegex } from '../config.js';
 import { updateChatName } from '../db.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
-import {
-  Channel,
-  OnInboundMessage,
-  OnChatMetadata,
-  RegisteredGroup,
-} from '../types.js';
+import { Channel } from '../types.js';
 
 // Slack's chat.postMessage API limits text to ~4000 characters per call.
 // Messages exceeding this are split into sequential chunks.
@@ -21,12 +16,6 @@ const MAX_MESSAGE_LENGTH = 4000;
 // we filter to regular messages (GenericMessageEvent, subtype undefined) and bot messages
 // (BotMessageEvent, subtype 'bot_message') so we can track our own output.
 type HandledMessageEvent = GenericMessageEvent | BotMessageEvent;
-
-export interface SlackChannelOpts {
-  onMessage: OnInboundMessage;
-  onChatMetadata: OnChatMetadata;
-  registeredGroups: () => Record<string, RegisteredGroup>;
-}
 
 export class SlackChannel implements Channel {
   name = 'slack';
@@ -47,9 +36,9 @@ export class SlackChannel implements Channel {
   // Track the ts of the last user message per channel for reaction emoji.
   private lastUserMessageTs = new Map<string, string>();
 
-  private opts: SlackChannelOpts;
+  private opts: ChannelOpts;
 
-  constructor(opts: SlackChannelOpts) {
+  constructor(opts: ChannelOpts) {
     this.opts = opts;
 
     // Read tokens from .env (not process.env — keeps secrets off the environment
@@ -414,7 +403,7 @@ export class SlackChannel implements Channel {
     let result = text;
     for (const [name, userId] of names) {
       if (userId === this.botUserId) continue;
-      const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const escaped = escapeRegex(name);
       // Match @Name or plain Name with word boundaries on both sides.
       // Negative lookbehind prevents matching inside <@U...> slack mentions.
       const pattern = new RegExp(`(?<!<)@?\\b${escaped}\\b`, 'gi');
@@ -452,10 +441,10 @@ export class SlackChannel implements Channel {
 }
 
 registerChannel('slack', (opts: ChannelOpts) => {
-  const envVars = readEnvFile(['SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN']);
-  if (!envVars.SLACK_BOT_TOKEN || !envVars.SLACK_APP_TOKEN) {
+  try {
+    return new SlackChannel(opts);
+  } catch {
     logger.warn('Slack: SLACK_BOT_TOKEN or SLACK_APP_TOKEN not set');
     return null;
   }
-  return new SlackChannel(opts);
 });

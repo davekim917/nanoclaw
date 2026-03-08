@@ -12,6 +12,7 @@ vi.mock('../env.js', () => ({ readEnvFile: vi.fn(() => ({})) }));
 vi.mock('../config.js', () => ({
   ASSISTANT_NAME: 'Andy',
   TRIGGER_PATTERN: /^@Andy\b/i,
+  escapeRegex: (str: string) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
 }));
 
 // Mock logger
@@ -100,13 +101,14 @@ vi.mock('discord.js', () => {
   };
 });
 
-import { DiscordChannel, DiscordChannelOpts } from './discord.js';
+import { DiscordChannel } from './discord.js';
+import type { ChannelOpts } from './registry.js';
 
 // --- Test helpers ---
 
 function createTestOpts(
-  overrides?: Partial<DiscordChannelOpts>,
-): DiscordChannelOpts {
+  overrides?: Partial<ChannelOpts>,
+): ChannelOpts {
   return {
     onMessage: vi.fn(),
     onChatMetadata: vi.fn(),

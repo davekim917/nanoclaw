@@ -6,31 +6,22 @@ import {
   TextChannel,
 } from 'discord.js';
 
-import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
+import { ASSISTANT_NAME, TRIGGER_PATTERN, escapeRegex } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
-import {
-  Channel,
-  OnChatMetadata,
-  OnInboundMessage,
-  RegisteredGroup,
-} from '../types.js';
-
-export interface DiscordChannelOpts {
-  onMessage: OnInboundMessage;
-  onChatMetadata: OnChatMetadata;
-  registeredGroups: () => Record<string, RegisteredGroup>;
-}
+import { Channel } from '../types.js';
 
 export class DiscordChannel implements Channel {
   name = 'discord';
 
   private client: Client | null = null;
-  private opts: DiscordChannelOpts;
+  private opts: ChannelOpts;
   private botToken: string;
+  private memberCacheTime = new Map<string, number>();
+  private static MEMBER_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
-  constructor(botToken: string, opts: DiscordChannelOpts) {
+  constructor(botToken: string, opts: ChannelOpts) {
     this.botToken = botToken;
     this.opts = opts;
   }
@@ -206,8 +197,13 @@ export class DiscordChannel implements Channel {
   ): Promise<string> {
     if (!channel.guild) return text;
     try {
-      // Ensure guild members are cached
-      await channel.guild.members.fetch();
+      // Fetch guild members with TTL cache to avoid API call on every outbound message
+      const guildId = channel.guild.id;
+      const lastFetch = this.memberCacheTime.get(guildId) || 0;
+      if (Date.now() - lastFetch > DiscordChannel.MEMBER_CACHE_TTL) {
+        await channel.guild.members.fetch();
+        this.memberCacheTime.set(guildId, Date.now());
+      }
       const members = channel.guild.members.cache;
       // Build name→id map, longest names first to avoid partial matches
       const nameMap: Array<[string, string]> = [];
@@ -232,7 +228,7 @@ export class DiscordChannel implements Channel {
       let result = text;
       for (const [name, userId] of nameMap) {
         const pattern = new RegExp(
-          `@${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`,
+          `@${escapeRegex(name)}\\b`,
           'gi',
         );
         result = result.replace(pattern, `<@${userId}>`);

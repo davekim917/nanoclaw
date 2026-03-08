@@ -17,6 +17,7 @@ import {
   PLUGIN_DIR,
   RESIDENTIAL_PROXY_URL,
   TIMEZONE,
+  escapeRegex,
 } from './config.js';
 import { readEnvFile } from './env.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
@@ -80,7 +81,10 @@ async function getGranolaAccessToken(): Promise<string | null> {
 
   // Token still valid (with 5-minute buffer)
   if (expiresAt && Date.now() < expiresAt - 5 * 60 * 1000 && accessToken) {
-    granolaTokenCache = { token: accessToken, expiresAt: expiresAt - 5 * 60 * 1000 };
+    granolaTokenCache = {
+      token: accessToken,
+      expiresAt: expiresAt - 5 * 60 * 1000,
+    };
     return accessToken;
   }
 
@@ -128,9 +132,7 @@ async function getGranolaAccessToken(): Promise<string | null> {
         ...entry,
         accessToken: newAccessToken,
         expiresAt: newExpiresAt,
-        ...(tokens.refresh_token
-          ? { refreshToken: tokens.refresh_token }
-          : {}),
+        ...(tokens.refresh_token ? { refreshToken: tokens.refresh_token } : {}),
       };
       freshCreds.mcpOAuth = freshOAuth;
       fs.writeFileSync(
@@ -177,6 +179,19 @@ interface VolumeMount {
   hostPath: string;
   containerPath: string;
   readonly: boolean;
+}
+
+/**
+ * Check if a tool is enabled in the group's tool config.
+ * Supports scoped tool names (e.g., 'gmail:sunday' matches 'gmail').
+ * Returns true if tools is undefined (all tools enabled).
+ */
+function isToolEnabled(
+  tools: string[] | undefined,
+  name: string,
+): boolean {
+  if (!tools) return true;
+  return tools.some((t) => t === name || t.startsWith(name + ':'));
 }
 
 function buildVolumeMounts(
@@ -283,7 +298,7 @@ function buildVolumeMounts(
   const tools = group.containerConfig?.tools;
   const mcpJsonPath = path.join(groupSessionsDir, '.mcp.json');
   const mcpServers: Record<string, unknown> = {};
-  if (!tools || tools.includes('exa')) {
+  if (isToolEnabled(tools, 'exa')) {
     mcpServers.exa = {
       type: 'http',
       url: 'https://mcp.exa.ai/mcp?tools=web_search_exa,web_search_advanced_exa,get_code_context_exa,crawling_exa,company_research_exa,people_search_exa,deep_researcher_start,deep_researcher_check,deep_search_exa',
@@ -374,9 +389,7 @@ function buildVolumeMounts(
   });
 
   // Gmail credentials — gated by tools config
-  const gmailEnabled =
-    !tools || tools.some((t) => t === 'gmail' || t.startsWith('gmail:'));
-  if (gmailEnabled) {
+  if (isToolEnabled(tools, 'gmail')) {
     // Check for account-specific restriction (e.g. 'gmail:illysium')
     const gmailAccounts = tools
       ?.filter((t) => t.startsWith('gmail:'))
@@ -423,7 +436,7 @@ function buildVolumeMounts(
   }
 
   // Google Calendar MCP credentials — gated by tools config
-  if (!tools || tools.includes('calendar')) {
+  if (isToolEnabled(tools, 'calendar')) {
     const calendarDir = path.join(homeDir, '.config', 'google-calendar-mcp');
     fs.mkdirSync(calendarDir, { recursive: true });
     mounts.push({
@@ -436,10 +449,7 @@ function buildVolumeMounts(
   // Snowflake credentials — gated by tools config.
   // Supports scoped access: 'snowflake' = all connections,
   // 'snowflake:sunday' or 'snowflake:apollo' = only those connections.
-  const snowflakeEnabled =
-    !tools ||
-    tools.some((t) => t === 'snowflake' || t.startsWith('snowflake:'));
-  if (snowflakeEnabled) {
+  if (isToolEnabled(tools, 'snowflake')) {
     const snowflakeDir = path.join(homeDir, '.snowflake');
     if (fs.existsSync(snowflakeDir)) {
       const origToml = path.join(snowflakeDir, 'connections.toml');
@@ -467,7 +477,7 @@ function buildVolumeMounts(
         // Rewrite connections.toml key paths for container home,
         // and optionally filter to only allowed connection sections
         const homePattern = new RegExp(
-          homeDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '/\\.snowflake/',
+          escapeRegex(homeDir) + '/\\.snowflake/',
           'g',
         );
         let tomlContent = fs
@@ -673,7 +683,7 @@ export async function runContainerAgent(
   // Resolve Granola OAuth access token (refreshes if expired)
   const tools = group.containerConfig?.tools;
   let granolaAccessToken: string | undefined;
-  if (!tools || tools.includes('granola')) {
+  if (isToolEnabled(tools, 'granola')) {
     granolaAccessToken = (await getGranolaAccessToken()) || undefined;
   }
 

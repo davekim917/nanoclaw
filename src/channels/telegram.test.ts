@@ -69,13 +69,14 @@ vi.mock('grammy', () => ({
   },
 }));
 
-import { TelegramChannel, TelegramChannelOpts } from './telegram.js';
+import { TelegramChannel } from './telegram.js';
+import type { ChannelOpts } from './registry.js';
 
 // --- Test helpers ---
 
 function createTestOpts(
-  overrides?: Partial<TelegramChannelOpts>,
-): TelegramChannelOpts {
+  overrides?: Partial<ChannelOpts>,
+): ChannelOpts {
   return {
     onMessage: vi.fn(),
     onChatMetadata: vi.fn(),
