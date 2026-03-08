@@ -8,6 +8,8 @@ vi.mock('../config.js', () => ({
   STORE_DIR: '/tmp/nanoclaw-test-store',
   ASSISTANT_NAME: 'Andy',
   ASSISTANT_HAS_OWN_NUMBER: false,
+  resolveAssistantName: (config?: { assistantName?: string }) =>
+    config?.assistantName || 'Andy',
 }));
 
 // Mock logger

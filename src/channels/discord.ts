@@ -6,7 +6,12 @@ import {
   TextChannel,
 } from 'discord.js';
 
-import { ASSISTANT_NAME, TRIGGER_PATTERN, escapeRegex } from '../config.js';
+import {
+  ASSISTANT_NAME,
+  buildTriggerPattern,
+  escapeRegex,
+  resolveAssistantName,
+} from '../config.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
@@ -61,9 +66,14 @@ export class DiscordChannel implements Channel {
         chatName = senderName;
       }
 
+      // Resolve per-group assistant name (falls back to global default)
+      const group = this.opts.registeredGroups()[chatJid];
+      const assistantName = resolveAssistantName(group?.containerConfig);
+      const triggerPattern = buildTriggerPattern(assistantName);
+
       // Translate Discord @bot mentions into TRIGGER_PATTERN format.
       // Discord mentions look like <@botUserId> — these won't match
-      // TRIGGER_PATTERN (e.g., ^@Andy\b), so we prepend the trigger
+      // TRIGGER_PATTERN (e.g., ^@Axie\b), so we prepend the trigger
       // when the bot is @mentioned.
       if (this.client?.user) {
         const botId = this.client.user.id;
@@ -78,8 +88,8 @@ export class DiscordChannel implements Channel {
             .replace(new RegExp(`<@!?${botId}>`, 'g'), '')
             .trim();
           // Prepend trigger if not already present
-          if (!TRIGGER_PATTERN.test(content)) {
-            content = `@${ASSISTANT_NAME} ${content}`;
+          if (!triggerPattern.test(content)) {
+            content = `@${assistantName} ${content}`;
           }
         }
       }
@@ -124,8 +134,8 @@ export class DiscordChannel implements Channel {
       }
 
       // Always trigger on Discord messages — no @mention needed.
-      if (!TRIGGER_PATTERN.test(content)) {
-        content = `@${ASSISTANT_NAME} ${content}`;
+      if (!triggerPattern.test(content)) {
+        content = `@${assistantName} ${content}`;
       }
 
       // Store chat metadata for discovery
@@ -139,7 +149,6 @@ export class DiscordChannel implements Channel {
       );
 
       // Only deliver full message for registered groups
-      const group = this.opts.registeredGroups()[chatJid];
       if (!group) {
         logger.debug(
           { chatJid, chatName },

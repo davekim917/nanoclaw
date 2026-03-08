@@ -3,11 +3,11 @@ import { CronExpressionParser } from 'cron-parser';
 import fs from 'fs';
 
 import {
-  ASSISTANT_NAME,
   DEFAULT_MODEL,
   MODEL_ALIASES,
   SCHEDULER_POLL_INTERVAL,
   TIMEZONE,
+  resolveAssistantName,
 } from './config.js';
 import {
   ContainerOutput,
@@ -184,7 +184,7 @@ async function runTask(
         chatJid: task.chat_jid,
         isMain,
         isScheduledTask: true,
-        assistantName: ASSISTANT_NAME,
+        assistantName: resolveAssistantName(group.containerConfig),
         model: group.containerConfig?.model
           ? MODEL_ALIASES[group.containerConfig.model.toLowerCase()] ||
             group.containerConfig.model

@@ -1,7 +1,12 @@
 import { App, LogLevel } from '@slack/bolt';
 import type { GenericMessageEvent, BotMessageEvent } from '@slack/types';
 
-import { ASSISTANT_NAME, TRIGGER_PATTERN, escapeRegex } from '../config.js';
+import {
+  ASSISTANT_NAME,
+  buildTriggerPattern,
+  escapeRegex,
+  resolveAssistantName,
+} from '../config.js';
 import { updateChatName } from '../db.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
@@ -91,11 +96,16 @@ export class SlackChannel implements Channel {
       const groups = this.opts.registeredGroups();
       if (!groups[jid]) return;
 
+      // Resolve per-group assistant name (falls back to global default)
+      const group = groups[jid];
+      const assistantName = resolveAssistantName(group.containerConfig);
+      const triggerPattern = buildTriggerPattern(assistantName);
+
       const isBotMessage = !!msg.bot_id || msg.user === this.botUserId;
 
       let senderName: string;
       if (isBotMessage) {
-        senderName = ASSISTANT_NAME;
+        senderName = assistantName;
       } else {
         senderName =
           (msg.user ? await this.resolveUserName(msg.user) : undefined) ||
@@ -126,6 +136,7 @@ export class SlackChannel implements Channel {
           msg.channel,
           threadTs,
           msg.ts,
+          assistantName,
         );
         if (threadContext) {
           content = `[Thread context]\n${threadContext}\n[Latest message]\n${content}`;
@@ -133,11 +144,11 @@ export class SlackChannel implements Channel {
       }
 
       // Translate Slack <@UBOTID> mentions into TRIGGER_PATTERN format.
-      // Prepend @AssistantName so the trigger pattern (^@Claw\b) matches.
+      // Prepend @AssistantName so the trigger pattern matches.
       // Uses the pre-wrapping bot mention check to avoid false positives
       // from old mentions in thread context.
-      if (hasBotMention && !TRIGGER_PATTERN.test(content)) {
-        content = `@${ASSISTANT_NAME} ${content}`;
+      if (hasBotMention && !triggerPattern.test(content)) {
+        content = `@${assistantName} ${content}`;
       }
 
       this.opts.onMessage(jid, {
@@ -330,6 +341,7 @@ export class SlackChannel implements Channel {
     channel: string,
     threadTs: string,
     currentTs: string,
+    assistantName?: string,
   ): Promise<string | undefined> {
     try {
       const result = await this.app.client.conversations.replies({
@@ -344,11 +356,12 @@ export class SlackChannel implements Channel {
 
       if (messages.length === 0) return undefined;
 
+      const botName = assistantName || ASSISTANT_NAME;
       const lines = await Promise.all(
         messages.map(async (m) => {
           const isBotMsg = !!m.bot_id || m.user === this.botUserId;
           const name = isBotMsg
-            ? ASSISTANT_NAME
+            ? botName
             : m.user
               ? (await this.resolveUserName(m.user)) || m.user
               : 'unknown';

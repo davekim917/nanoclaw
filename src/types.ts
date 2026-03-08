@@ -28,6 +28,7 @@ export interface AllowedRoot {
 }
 
 export interface ContainerConfig {
+  assistantName?: string; // Per-group assistant name override (falls back to ASSISTANT_NAME)
   additionalMounts?: AdditionalMount[];
   timeout?: number; // Default: 300000 (5 minutes)
   model?: string; // Default model for this group (e.g. "claude-sonnet-4-6")

@@ -10,6 +10,10 @@ vi.mock('../config.js', () => ({
   ASSISTANT_NAME: 'Jonesy',
   TRIGGER_PATTERN: /^@Jonesy\b/i,
   escapeRegex: (str: string) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'),
+  buildTriggerPattern: (name: string) =>
+    new RegExp(`^@${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i'),
+  resolveAssistantName: (config?: { assistantName?: string }) =>
+    config?.assistantName || 'Jonesy',
 }));
 
 // Mock logger

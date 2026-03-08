@@ -81,6 +81,18 @@ export const TRIGGER_PATTERN = new RegExp(
   'i',
 );
 
+/** Build a trigger pattern for a specific assistant name. */
+export function buildTriggerPattern(name: string): RegExp {
+  return new RegExp(`^@${escapeRegex(name)}\\b`, 'i');
+}
+
+/** Resolve per-group assistant name, falling back to global default. */
+export function resolveAssistantName(containerConfig?: {
+  assistantName?: string;
+}): string {
+  return containerConfig?.assistantName || ASSISTANT_NAME;
+}
+
 // External Claude Code plugin directory (e.g. davekim917/bootstrap)
 // Skills and agents are synced into each group's .claude/ before container runs
 export const PLUGIN_DIR =

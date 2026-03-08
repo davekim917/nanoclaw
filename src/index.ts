@@ -9,7 +9,8 @@ import {
   MODEL_ALIASES,
   MODEL_OVERRIDE_PATTERN,
   POLL_INTERVAL,
-  TRIGGER_PATTERN,
+  buildTriggerPattern,
+  resolveAssistantName,
 } from './config.js';
 import './channels/index.js';
 import {
@@ -196,12 +197,14 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   }
 
   const isMainGroup = group.isMain === true;
+  const groupAssistantName = resolveAssistantName(group.containerConfig);
+  const triggerPattern = buildTriggerPattern(groupAssistantName);
 
   const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
   const missedMessages = getMessagesSince(
     chatJid,
     sinceTimestamp,
-    ASSISTANT_NAME,
+    groupAssistantName,
   );
 
   if (missedMessages.length === 0) return true;
@@ -211,7 +214,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     const allowlistCfg = loadSenderAllowlist();
     const hasTrigger = missedMessages.some(
       (m) =>
-        TRIGGER_PATTERN.test(m.content.trim()) &&
+        triggerPattern.test(m.content.trim()) &&
         (m.is_from_me || isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
     );
     if (!hasTrigger) return true;
@@ -371,7 +374,7 @@ async function runAgent(
         groupFolder: group.folder,
         chatJid,
         isMain,
-        assistantName: ASSISTANT_NAME,
+        assistantName: resolveAssistantName(group.containerConfig),
         model,
       },
       (proc, containerName) =>
@@ -452,10 +455,12 @@ async function startMessageLoop(): Promise<void> {
           // Non-trigger messages accumulate in DB and get pulled as
           // context when a trigger eventually arrives.
           if (needsTrigger) {
+            const groupName = resolveAssistantName(group.containerConfig);
+            const groupTrigger = buildTriggerPattern(groupName);
             const allowlistCfg = loadSenderAllowlist();
             const hasTrigger = groupMessages.some(
               (m) =>
-                TRIGGER_PATTERN.test(m.content.trim()) &&
+                groupTrigger.test(m.content.trim()) &&
                 (m.is_from_me ||
                   isTriggerAllowed(chatJid, m.sender, allowlistCfg)),
             );
@@ -467,7 +472,7 @@ async function startMessageLoop(): Promise<void> {
           const allPending = getMessagesSince(
             chatJid,
             lastAgentTimestamp[chatJid] || '',
-            ASSISTANT_NAME,
+            resolveAssistantName(group.containerConfig),
           );
           const messagesToSend =
             allPending.length > 0 ? allPending : groupMessages;
