@@ -5,9 +5,13 @@ ln -s /app/node_modules /tmp/dist/node_modules
 chmod -R a-w /tmp/dist
 cat > /tmp/input.json
 
-# Configure agent-browser: disable Chromium crash reporter to prevent
-# "chrome_crashpad_handler: --database is required" errors in containers
-export AGENT_BROWSER_ARGS="--disable-crash-reporter"
+# Fix Chromium crashpad in containers: crashpad derives its database path from
+# XDG_CONFIG_HOME. If that dir isn't writable (or gets corrupted in long-running
+# containers), chromium crashes with "chrome_crashpad_handler: --database is required".
+# Pointing XDG dirs to /tmp ensures a writable, ephemeral location.
+# See: https://github.com/microsoft/playwright/issues/34031
+export XDG_CONFIG_HOME=/tmp/.chromium
+export XDG_CACHE_HOME=/tmp/.chromium
 # Route browser through residential proxy for geo-fenced sites
 if [ -n "$RESIDENTIAL_PROXY_URL" ]; then
   export AGENT_BROWSER_PROXY="$RESIDENTIAL_PROXY_URL"
