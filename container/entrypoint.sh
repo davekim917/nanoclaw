@@ -5,14 +5,13 @@ ln -s /app/node_modules /tmp/dist/node_modules
 chmod -R a-w /tmp/dist
 cat > /tmp/input.json
 
-# Configure Chromium launch options for agent-browser
-# --disable-crash-reporter: prevents crashpad "—database is required" errors
-# --proxy-server: routes through residential IP for geo-fenced sites
-BROWSER_ARGS="\"--disable-crash-reporter\""
+# Configure agent-browser: disable Chromium crash reporter to prevent
+# "chrome_crashpad_handler: --database is required" errors in containers
+export AGENT_BROWSER_ARGS="--disable-crash-reporter"
+# Route browser through residential proxy for geo-fenced sites
 if [ -n "$RESIDENTIAL_PROXY_URL" ]; then
-  BROWSER_ARGS="$BROWSER_ARGS,\"--proxy-server=$RESIDENTIAL_PROXY_URL\""
+  export AGENT_BROWSER_PROXY="$RESIDENTIAL_PROXY_URL"
 fi
-export AGENT_BROWSER_LAUNCH_OPTIONS="{\"args\":[$BROWSER_ARGS]}"
 # Configure git/gh auth if GITHUB_TOKEN is present in secrets
 GH_TOKEN=$(node -e 'try{const d=JSON.parse(require("fs").readFileSync("/tmp/input.json","utf8"));if(d.secrets?.GITHUB_TOKEN)process.stdout.write(d.secrets.GITHUB_TOKEN)}catch{}' 2>/dev/null)
 if [ -n "$GH_TOKEN" ]; then

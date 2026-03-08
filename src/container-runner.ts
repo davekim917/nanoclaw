@@ -15,6 +15,7 @@ import {
   GROUPS_DIR,
   IDLE_TIMEOUT,
   PLUGIN_DIR,
+  RESIDENTIAL_PROXY_URL,
   TIMEZONE,
 } from './config.js';
 import { readEnvFile } from './env.js';
@@ -463,15 +464,21 @@ function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
 ): string[] {
-  const args: string[] = ['run', '-i', '--rm', '--shm-size=256m', '--name', containerName];
+  const args: string[] = [
+    'run',
+    '-i',
+    '--rm',
+    '--shm-size=256m',
+    '--name',
+    containerName,
+  ];
 
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
 
   // Pass residential proxy URL for browser automation on geo-fenced sites
-  const proxyUrl = process.env.RESIDENTIAL_PROXY_URL;
-  if (proxyUrl) {
-    args.push('-e', `RESIDENTIAL_PROXY_URL=${proxyUrl}`);
+  if (RESIDENTIAL_PROXY_URL) {
+    args.push('-e', `RESIDENTIAL_PROXY_URL=${RESIDENTIAL_PROXY_URL}`);
   }
 
   // Run as host user so bind-mounted files are accessible.
