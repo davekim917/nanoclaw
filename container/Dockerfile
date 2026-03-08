@@ -24,6 +24,7 @@ RUN apt-get update && apt-get install -y \
     libxshmfence1 \
     curl \
     git \
+    jq \
     && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
        -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
@@ -42,6 +43,11 @@ RUN apt-get update && apt-get install -y python3 python3-pip python3-venv \
 # Set Chromium path for agent-browser
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
+
+# Install bun (needed by plugin hooks that use TypeScript)
+RUN apt-get update && apt-get install -y unzip \
+    && curl -fsSL https://bun.sh/install | BUN_INSTALL=/usr/local bash \
+    && rm -rf /var/lib/apt/lists/*
 
 # Install agent-browser and claude-code globally
 RUN npm install -g agent-browser @anthropic-ai/claude-code

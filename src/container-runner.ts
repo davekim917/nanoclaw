@@ -169,6 +169,12 @@ function buildVolumeMounts(
       url: 'https://mcp.granola.ai/mcp',
     };
   }
+  if (!tools || tools.includes('exa')) {
+    mcpServers.exa = {
+      type: 'http',
+      url: 'https://mcp.exa.ai/mcp?tools=web_search_exa,web_search_advanced_exa,get_code_context_exa,crawling_exa,company_research_exa,people_search_exa,deep_researcher_start,deep_researcher_check,deep_search_exa',
+    };
+  }
   fs.writeFileSync(mcpJsonPath, JSON.stringify({ mcpServers }, null, 2) + '\n');
 
   // Sync skills from container/skills/ into each group's .claude/skills/
@@ -183,7 +189,7 @@ function buildVolumeMounts(
     }
   }
 
-  // Sync skills and agents from external plugin (e.g. davekim917/bootstrap)
+  // Sync skills, agents, and hooks from external plugin (e.g. davekim917/bootstrap)
   if (fs.existsSync(PLUGIN_DIR)) {
     // Skills: plugin has skills/{category}/{skill-name}/SKILL.md — flatten into .claude/skills/
     const pluginSkillsDir = path.join(PLUGIN_DIR, 'skills');
@@ -216,6 +222,38 @@ function buildVolumeMounts(
         );
       }
     }
+
+    // Hooks: merge plugin hooks.json into settings.json so Claude Code
+    // loads them via settingSources: ['user']. Also set CLAUDE_PLUGIN_ROOT
+    // so ${CLAUDE_PLUGIN_ROOT} references in hook commands resolve correctly.
+    const pluginHooksJson = path.join(PLUGIN_DIR, 'hooks', 'hooks.json');
+    if (fs.existsSync(pluginHooksJson)) {
+      try {
+        const pluginHooks = JSON.parse(
+          fs.readFileSync(pluginHooksJson, 'utf-8'),
+        );
+        const settings = JSON.parse(
+          fs.readFileSync(settingsFile, 'utf-8'),
+        );
+        settings.hooks = pluginHooks;
+        fs.writeFileSync(
+          settingsFile,
+          JSON.stringify(settings, null, 2) + '\n',
+        );
+      } catch (err) {
+        logger.warn(
+          { error: err, path: pluginHooksJson },
+          'Failed to merge plugin hooks into settings',
+        );
+      }
+    }
+
+    // Mount plugin directory read-only so hook scripts can execute inside container
+    mounts.push({
+      hostPath: PLUGIN_DIR,
+      containerPath: '/workspace/plugin',
+      readonly: true,
+    });
   }
   mounts.push({
     hostPath: groupSessionsDir,
@@ -479,6 +517,11 @@ function buildContainerArgs(
   // Pass residential proxy URL for browser automation on geo-fenced sites
   if (RESIDENTIAL_PROXY_URL) {
     args.push('-e', `RESIDENTIAL_PROXY_URL=${RESIDENTIAL_PROXY_URL}`);
+  }
+
+  // Set plugin root so hook shell commands can resolve ${CLAUDE_PLUGIN_ROOT}
+  if (fs.existsSync(PLUGIN_DIR)) {
+    args.push('-e', 'CLAUDE_PLUGIN_ROOT=/workspace/plugin');
   }
 
   // Run as host user so bind-mounted files are accessible.

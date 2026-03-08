@@ -90,10 +90,11 @@ Always specify `-c <connection>` to pick the right database. If unsure which con
 
 When asked to make code changes or open PRs:
 1. Clone the repo if not already cloned in your workspace
-2. Create a feature branch
-3. Make the changes
-4. Commit, push, and open a PR using `gh pr create`
-5. Share the PR link
+2. **Read the repo's CLAUDE.md** (if it exists) before writing any code — it contains project-specific conventions, guardrails, and skills you must follow
+3. Create a feature branch
+4. Make the changes
+5. Commit, push, and open a PR using `gh pr create`
+6. Share the PR link
 
 ## Message Formatting
 
