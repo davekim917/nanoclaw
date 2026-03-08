@@ -253,32 +253,30 @@ export class SlackChannel implements Channel {
       return;
     }
 
-    try {
-      if (isTyping) {
-        await this.app.client.reactions.add({
+    const safeReaction = async (
+      method: 'add' | 'remove',
+      name: string,
+    ) => {
+      try {
+        await this.app.client.reactions[method]({
           channel: channelId,
           timestamp: messageTs,
-          name: 'eyes',
+          name,
         });
-      } else {
-        // Swap 👀 → ✅ to signal completion
-        await this.app.client.reactions.remove({
-          channel: channelId,
-          timestamp: messageTs,
-          name: 'eyes',
-        });
-        await this.app.client.reactions.add({
-          channel: channelId,
-          timestamp: messageTs,
-          name: 'white_check_mark',
-        });
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (!msg.includes('already_reacted') && !msg.includes('no_reaction')) {
+          logger.warn({ jid, isTyping, err: msg }, 'Slack reaction failed');
+        }
       }
-    } catch (err: unknown) {
-      // "already_reacted" / "no_reaction" are expected races — suppress those
-      const msg = err instanceof Error ? err.message : String(err);
-      if (!msg.includes('already_reacted') && !msg.includes('no_reaction')) {
-        logger.warn({ jid, isTyping, err: msg }, 'Slack reaction failed');
-      }
+    };
+
+    if (isTyping) {
+      await safeReaction('add', 'eyes');
+    } else {
+      // Swap 👀 → ✅ to signal completion
+      await safeReaction('remove', 'eyes');
+      await safeReaction('add', 'white_check_mark');
     }
   }
 
