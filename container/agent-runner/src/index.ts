@@ -376,12 +376,16 @@ function buildAllowedTools(tools: string[] | undefined): string[] {
   return allowed;
 }
 
+type StdioServer = { command: string; args: string[]; env?: Record<string, string> };
+type HttpServer = { type: 'http'; url: string; headers?: Record<string, string> };
+type McpServer = StdioServer | HttpServer;
+
 function buildMcpServers(
   containerInput: ContainerInput,
   mcpServerPath: string,
 ) {
   const tools = containerInput.tools;
-  const servers: Record<string, { command: string; args: string[]; env?: Record<string, string> }> = {
+  const servers: Record<string, McpServer> = {
     nanoclaw: {
       command: 'node',
       args: [mcpServerPath],
@@ -431,6 +435,16 @@ function buildMcpServers(
         GOOGLE_OAUTH_CREDENTIALS: '/home/node/.gmail-mcp/gcp-oauth.keys.json',
       },
     };
+  }
+  if (isToolEnabled(tools, 'granola')) {
+    const granolaToken = containerInput.secrets?.GRANOLA_ACCESS_TOKEN;
+    if (granolaToken) {
+      servers.granola = {
+        type: 'http',
+        url: 'https://mcp.granola.ai/mcp',
+        headers: { Authorization: `Bearer ${granolaToken}` },
+      };
+    }
   }
   return servers;
 }

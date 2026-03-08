@@ -33,6 +33,126 @@ import { RegisteredGroup } from './types.js';
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
 
+// Path to Claude Code's host credentials (contains MCP OAuth tokens)
+const HOST_CREDENTIALS_PATH = path.join(
+  os.homedir(),
+  '.claude',
+  '.credentials.json',
+);
+
+const GRANOLA_TOKEN_ENDPOINT = 'https://mcp-auth.granola.ai/oauth2/token';
+const GRANOLA_REFRESH_TIMEOUT_MS = 10_000;
+
+// In-memory cache to avoid redundant disk reads / duplicate refresh calls
+let granolaTokenCache: { token: string; expiresAt: number } | null = null;
+
+/**
+ * Read Granola MCP OAuth access token from the host's Claude credentials file,
+ * refresh if expired. Returns the access token string or null.
+ */
+async function getGranolaAccessToken(): Promise<string | null> {
+  if (granolaTokenCache && Date.now() < granolaTokenCache.expiresAt) {
+    return granolaTokenCache.token;
+  }
+
+  let creds: Record<string, unknown>;
+  try {
+    creds = JSON.parse(fs.readFileSync(HOST_CREDENTIALS_PATH, 'utf-8'));
+  } catch {
+    return null;
+  }
+
+  const mcpOAuth = creds.mcpOAuth as
+    | Record<string, Record<string, unknown>>
+    | undefined;
+  if (!mcpOAuth) return null;
+
+  const granolaKey = Object.keys(mcpOAuth).find((k) =>
+    k.startsWith('granola|'),
+  );
+  if (!granolaKey) return null;
+
+  const entry = mcpOAuth[granolaKey];
+  const expiresAt = entry.expiresAt as number;
+  const accessToken = entry.accessToken as string | undefined;
+  const refreshToken = entry.refreshToken as string | undefined;
+  const clientId = entry.clientId as string | undefined;
+
+  // Token still valid (with 5-minute buffer)
+  if (expiresAt && Date.now() < expiresAt - 5 * 60 * 1000 && accessToken) {
+    granolaTokenCache = { token: accessToken, expiresAt: expiresAt - 5 * 60 * 1000 };
+    return accessToken;
+  }
+
+  // Token expired — try to refresh
+  if (!refreshToken || !clientId) {
+    logger.error('Granola OAuth token expired and no refresh token available');
+    return accessToken || null;
+  }
+
+  try {
+    logger.info('Refreshing Granola OAuth token...');
+    const resp = await fetch(GRANOLA_TOKEN_ENDPOINT, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'refresh_token',
+        client_id: clientId,
+        refresh_token: refreshToken,
+      }),
+      signal: AbortSignal.timeout(GRANOLA_REFRESH_TIMEOUT_MS),
+    });
+
+    if (!resp.ok) {
+      logger.error(
+        `Granola token refresh failed: ${resp.status} ${resp.statusText}`,
+      );
+      return accessToken || null;
+    }
+
+    const tokens = (await resp.json()) as Record<string, unknown>;
+    const expiresIn = ((tokens.expires_in as number) || 3600) * 1000;
+    const newAccessToken = tokens.access_token as string;
+    const newExpiresAt = Date.now() + expiresIn;
+
+    // Persist refreshed tokens back to host credentials — re-read to minimize race window
+    try {
+      const freshCreds = JSON.parse(
+        fs.readFileSync(HOST_CREDENTIALS_PATH, 'utf-8'),
+      ) as Record<string, unknown>;
+      const freshOAuth = (freshCreds.mcpOAuth || {}) as Record<
+        string,
+        Record<string, unknown>
+      >;
+      freshOAuth[granolaKey] = {
+        ...entry,
+        accessToken: newAccessToken,
+        expiresAt: newExpiresAt,
+        ...(tokens.refresh_token
+          ? { refreshToken: tokens.refresh_token }
+          : {}),
+      };
+      freshCreds.mcpOAuth = freshOAuth;
+      fs.writeFileSync(
+        HOST_CREDENTIALS_PATH,
+        JSON.stringify(freshCreds, null, 4) + '\n',
+      );
+    } catch (writeErr) {
+      logger.warn(`Failed to persist refreshed Granola token: ${writeErr}`);
+    }
+
+    granolaTokenCache = {
+      token: newAccessToken,
+      expiresAt: newExpiresAt - 5 * 60 * 1000,
+    };
+    logger.info('Granola OAuth token refreshed successfully');
+    return newAccessToken;
+  } catch (err) {
+    logger.error(`Granola token refresh error: ${err}`);
+    return accessToken || null;
+  }
+}
+
 export interface ContainerInput {
   prompt: string;
   sessionId?: string;
@@ -163,12 +283,6 @@ function buildVolumeMounts(
   const tools = group.containerConfig?.tools;
   const mcpJsonPath = path.join(groupSessionsDir, '.mcp.json');
   const mcpServers: Record<string, unknown> = {};
-  if (!tools || tools.includes('granola')) {
-    mcpServers.granola = {
-      type: 'http',
-      url: 'https://mcp.granola.ai/mcp',
-    };
-  }
   if (!tools || tools.includes('exa')) {
     mcpServers.exa = {
       type: 'http',
@@ -556,6 +670,13 @@ export async function runContainerAgent(
   const groupDir = resolveGroupFolderPath(group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
 
+  // Resolve Granola OAuth access token (refreshes if expired)
+  const tools = group.containerConfig?.tools;
+  let granolaAccessToken: string | undefined;
+  if (!tools || tools.includes('granola')) {
+    granolaAccessToken = (await getGranolaAccessToken()) || undefined;
+  }
+
   const mounts = buildVolumeMounts(group, input.isMain);
 
   // When running as root (UID 0), writable mount directories are owned by root,
@@ -625,6 +746,9 @@ export async function runContainerAgent(
 
     // Pass secrets via stdin (never written to disk or mounted as files)
     input.secrets = readSecrets();
+    if (granolaAccessToken) {
+      input.secrets.GRANOLA_ACCESS_TOKEN = granolaAccessToken;
+    }
     // Pass tools restriction so agent-runner can gate MCP servers
     input.tools = group.containerConfig?.tools;
     container.stdin.write(JSON.stringify(input));
