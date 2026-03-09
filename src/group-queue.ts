@@ -71,6 +71,10 @@ export class GroupQueue {
       if (!state.pendingProcessJids.includes(pid)) {
         state.pendingProcessJids.push(pid);
       }
+      // Preempt idle container if the queued message is for a different thread
+      if (state.idleWaiting && state.activeThreadId !== pid) {
+        this.closeStdin(groupJid);
+      }
       logger.debug(
         { groupJid, processJid: pid },
         'Container active, message queued',
@@ -153,12 +157,16 @@ export class GroupQueue {
 
   /**
    * Mark the container as idle-waiting (finished work, waiting for IPC input).
-   * If tasks are pending, preempt the idle container immediately.
+   * If tasks or different-thread messages are pending, preempt immediately.
    */
   notifyIdle(groupJid: string): void {
     const state = this.getGroup(groupJid);
     state.idleWaiting = true;
-    if (state.pendingTasks.length > 0) {
+    // Preempt if tasks are pending or if messages are queued for a different thread
+    const hasPendingOtherThread = state.pendingProcessJids.some(
+      (pid) => pid !== state.activeThreadId,
+    );
+    if (state.pendingTasks.length > 0 || hasPendingOtherThread) {
       this.closeStdin(groupJid);
     }
   }
