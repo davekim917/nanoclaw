@@ -606,10 +606,7 @@ describe('GroupQueue', () => {
     completionCallbacks[1]();
     await vi.advanceTimersByTimeAsync(10);
 
-    expect(processed).toEqual([
-      'dc:parent:thread:t1',
-      'dc:parent:thread:t2',
-    ]);
+    expect(processed).toEqual(['dc:parent:thread:t1', 'dc:parent:thread:t2']);
     expect(processMessages).toHaveBeenCalledTimes(2);
   });
 

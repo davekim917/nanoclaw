@@ -71,7 +71,10 @@ export class GroupQueue {
       if (!state.pendingProcessJids.includes(pid)) {
         state.pendingProcessJids.push(pid);
       }
-      logger.debug({ groupJid, processJid: pid }, 'Container active, message queued');
+      logger.debug(
+        { groupJid, processJid: pid },
+        'Container active, message queued',
+      );
       return;
     }
 
@@ -244,7 +247,10 @@ export class GroupQueue {
         }
       }
     } catch (err) {
-      logger.error({ groupJid, processJid, err }, 'Error processing messages for group');
+      logger.error(
+        { groupJid, processJid, err },
+        'Error processing messages for group',
+      );
       this.scheduleRetry(groupJid, state, processJid);
     } finally {
       state.active = false;

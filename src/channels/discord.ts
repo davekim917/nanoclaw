@@ -11,6 +11,7 @@ import {
   ASSISTANT_NAME,
   buildTriggerPattern,
   escapeRegex,
+  parseThreadJid,
   resolveAssistantName,
 } from '../config.js';
 import { getThreadOrigin, setThreadOrigin } from '../db.js';
@@ -327,9 +328,11 @@ export class DiscordChannel implements Channel {
       }
 
       // Parse JID: dc:{channelId} or dc:{parentId}:thread:{threadId}
-      const threadMatch = jid.match(/^dc:([^:]+):thread:(.+)$/);
-      const isThreadJid = !!threadMatch;
-      const channelId = threadMatch ? threadMatch[2] : jid.replace(/^dc:/, '');
+      const parsed = parseThreadJid(jid);
+      const isThreadJid = !!parsed;
+      // For thread JIDs, the channel to send to is the thread channel (threadId);
+      // for top-level JIDs, strip the dc: prefix to get the channel ID.
+      const channelId = parsed ? parsed.threadId : jid.replace(/^dc:/, '');
 
       // Thread creation: for top-level JIDs, create a thread from the
       // user's triggering message on first response.
@@ -353,7 +356,10 @@ export class DiscordChannel implements Channel {
             try {
               setThreadOrigin(threadId, originalMsgId, jid);
             } catch (err) {
-              logger.warn({ threadId, originalMsgId, jid, err }, 'Failed to persist thread origin to SQLite');
+              logger.warn(
+                { threadId, originalMsgId, jid, err },
+                'Failed to persist thread origin to SQLite',
+              );
             }
             return;
           }
@@ -371,16 +377,7 @@ export class DiscordChannel implements Channel {
 
       const textChannel = channel as TextChannel;
       text = await this.replaceMentions(text, textChannel);
-
-      // Discord has a 2000 character limit per message — split if needed
-      const MAX_LENGTH = 2000;
-      if (text.length <= MAX_LENGTH) {
-        await textChannel.send(text);
-      } else {
-        for (let i = 0; i < text.length; i += MAX_LENGTH) {
-          await textChannel.send(text.slice(i, i + MAX_LENGTH));
-        }
-      }
+      await this.sendChunked(textChannel, text);
       logger.info({ jid, length: text.length }, 'Discord message sent');
     } catch (err) {
       logger.error({ jid, err }, 'Failed to send Discord message');
@@ -422,14 +419,7 @@ export class DiscordChannel implements Channel {
       });
 
       text = await this.replaceMentions(text, textChannel);
-      const MAX_LENGTH = 2000;
-      if (text.length <= MAX_LENGTH) {
-        await thread.send(text);
-      } else {
-        for (let i = 0; i < text.length; i += MAX_LENGTH) {
-          await thread.send(text.slice(i, i + MAX_LENGTH));
-        }
-      }
+      await this.sendChunked(thread, text);
 
       logger.info(
         { parentChannelId, threadId: thread.id, threadName: name },
@@ -444,6 +434,23 @@ export class DiscordChannel implements Channel {
       // Fallback: send directly in channel
       await this.sendMessage(`dc:${parentChannelId}`, text);
       return null;
+    }
+  }
+
+  private static MAX_MESSAGE_LENGTH = 2000;
+
+  /** Send text in chunks respecting Discord's 2000 char limit. */
+  private async sendChunked(
+    target: { send(text: string): Promise<unknown> },
+    text: string,
+  ): Promise<void> {
+    const max = DiscordChannel.MAX_MESSAGE_LENGTH;
+    if (text.length <= max) {
+      await target.send(text);
+    } else {
+      for (let i = 0; i < text.length; i += max) {
+        await target.send(text.slice(i, i + max));
+      }
     }
   }
 
@@ -480,9 +487,8 @@ export class DiscordChannel implements Channel {
 
     if (!this.client || !isTyping) return;
 
-    // Parse thread JID format
-    const threadMatch = jid.match(/^dc:([^:]+):thread:(.+)$/);
-    const channelId = threadMatch ? threadMatch[2] : jid.replace(/^dc:/, '');
+    const parsedJid = parseThreadJid(jid);
+    const channelId = parsedJid ? parsedJid.threadId : jid.replace(/^dc:/, '');
     const sendTyping = async () => {
       try {
         const channel = await this.client!.channels.fetch(channelId);

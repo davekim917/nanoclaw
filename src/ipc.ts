@@ -3,7 +3,7 @@ import path from 'path';
 
 import { CronExpressionParser } from 'cron-parser';
 
-import { DATA_DIR, IPC_POLL_INTERVAL, TIMEZONE } from './config.js';
+import { DATA_DIR, IPC_POLL_INTERVAL, TIMEZONE, getParentJid } from './config.js';
 import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
@@ -78,13 +78,7 @@ export function startIpcWatcher(deps: IpcDeps): void {
                 // Handle thread JIDs by checking parent JID for group resolution
                 const targetGroup =
                   registeredGroups[data.chatJid] ||
-                  (() => {
-                    const dcM = data.chatJid.match(/^(dc:[^:]+):thread:.+$/);
-                    if (dcM) return registeredGroups[dcM[1]];
-                    const slM = data.chatJid.match(/^(slack:[^:]+):thread:.+$/);
-                    if (slM) return registeredGroups[slM[1]];
-                    return undefined;
-                  })();
+                  registeredGroups[getParentJid(data.chatJid)];
                 if (
                   isMain ||
                   (targetGroup && targetGroup.folder === sourceGroup)

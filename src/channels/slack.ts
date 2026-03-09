@@ -5,6 +5,7 @@ import {
   ASSISTANT_NAME,
   buildTriggerPattern,
   escapeRegex,
+  parseThreadJid,
   resolveAssistantName,
 } from '../config.js';
 import { getRouterState, setRouterState, updateChatName } from '../db.js';
@@ -290,9 +291,8 @@ export class SlackChannel implements Channel {
   }
 
   async sendMessage(jid: string, text: string): Promise<void> {
-    // Parse thread JID: slack:{channel}:thread:{ts}
-    const threadMatch = jid.match(/^slack:([^:]+):thread:(.+)$/);
-    const channelId = threadMatch ? threadMatch[1] : jid.replace(/^slack:/, '');
+    const parsed = parseThreadJid(jid);
+    const channelId = parsed ? parsed.parentId : jid.replace(/^slack:/, '');
 
     if (!this.connected) {
       this.outgoingQueue.push({ jid, text });
@@ -306,9 +306,7 @@ export class SlackChannel implements Channel {
     try {
       // Thread ts from JID takes priority (thread-session mode),
       // then fall back to replyThreadTs map (legacy mode)
-      const threadTs = threadMatch
-        ? threadMatch[2]
-        : this.replyThreadTs.get(jid);
+      const threadTs = parsed ? parsed.threadId : this.replyThreadTs.get(jid);
       text = this.replaceMentions(text);
 
       // Slack limits messages to ~4000 characters; split if needed
@@ -368,15 +366,15 @@ export class SlackChannel implements Channel {
   // Instead, add/remove a reaction emoji on the triggering message
   // so the user knows the bot is processing.
   async setTyping(jid: string, isTyping: boolean): Promise<void> {
-    const threadMatch = jid.match(/^slack:([^:]+):thread:(.+)$/);
-    const channelId = threadMatch ? threadMatch[1] : jid.replace(/^slack:/, '');
-    const baseJid = threadMatch ? `slack:${threadMatch[1]}` : jid;
+    const parsedJid = parseThreadJid(jid);
+    const channelId = parsedJid ? parsedJid.parentId : jid.replace(/^slack:/, '');
+    const baseJid = parsedJid ? `slack:${parsedJid.parentId}` : jid;
 
     // On start: snapshot the current user message ts so the ✅ swap
     // targets the same message even if new messages arrive while processing.
     // On stop: use the snapshot (fall back to latest if no snapshot).
     // Check thread JID first (for thread messages), then baseJid.
-    const lookupKey = threadMatch ? jid : baseJid;
+    const lookupKey = parsedJid ? jid : baseJid;
     let messageTs: string | undefined;
     if (isTyping) {
       messageTs =

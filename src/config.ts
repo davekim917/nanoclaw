@@ -105,6 +105,33 @@ export function resolveAssistantName(containerConfig?: {
   return containerConfig?.assistantName || ASSISTANT_NAME;
 }
 
+// --- Thread JID parsing utilities ---
+
+export interface ParsedThreadJid {
+  channel: 'dc' | 'slack';
+  parentId: string;
+  threadId: string;
+}
+
+const THREAD_JID_RE = /^(dc|slack):([^:]+):thread:(.+)$/;
+
+/** Parse a thread JID into its components, or return null for non-thread JIDs. */
+export function parseThreadJid(jid: string): ParsedThreadJid | null {
+  const match = jid.match(THREAD_JID_RE);
+  if (!match) return null;
+  return {
+    channel: match[1] as 'dc' | 'slack',
+    parentId: match[2],
+    threadId: match[3],
+  };
+}
+
+/** Extract parent JID from a thread JID, or return the JID unchanged. */
+export function getParentJid(jid: string): string {
+  const parsed = parseThreadJid(jid);
+  return parsed ? `${parsed.channel}:${parsed.parentId}` : jid;
+}
+
 // External Claude Code plugin directory (e.g. davekim917/bootstrap)
 // Skills and agents are synced into each group's .claude/ before container runs
 export const PLUGIN_DIR =

@@ -114,28 +114,35 @@ function createSchema(database: Database.Database): void {
     );
   `);
 
-  // Migrate existing sessions into sessions_v2 (idempotent — skips rows that already exist)
-  const existingSessions = database
-    .prepare('SELECT group_folder, session_id FROM sessions')
-    .all() as Array<{ group_folder: string; session_id: string }>;
-  if (existingSessions.length > 0) {
-    const migrateV2 = database.transaction(() => {
-      const now = new Date().toISOString();
-      const insert = database.prepare(
-        `INSERT OR IGNORE INTO sessions_v2 (session_key, group_folder, thread_id, session_id, last_activity, created_at)
-         VALUES (?, ?, NULL, ?, ?, ?)`,
-      );
-      for (const row of existingSessions) {
-        insert.run(
-          row.group_folder,
-          row.group_folder,
-          row.session_id,
-          now,
-          now,
+  // Migrate existing sessions into sessions_v2 (skip if already migrated)
+  const v2Count = (
+    database.prepare('SELECT COUNT(*) AS c FROM sessions_v2').get() as {
+      c: number;
+    }
+  ).c;
+  if (v2Count === 0) {
+    const existingSessions = database
+      .prepare('SELECT group_folder, session_id FROM sessions')
+      .all() as Array<{ group_folder: string; session_id: string }>;
+    if (existingSessions.length > 0) {
+      const migrateV2 = database.transaction(() => {
+        const now = new Date().toISOString();
+        const insert = database.prepare(
+          `INSERT OR IGNORE INTO sessions_v2 (session_key, group_folder, thread_id, session_id, last_activity, created_at)
+           VALUES (?, ?, NULL, ?, ?, ?)`,
         );
-      }
-    });
-    migrateV2();
+        for (const row of existingSessions) {
+          insert.run(
+            row.group_folder,
+            row.group_folder,
+            row.session_id,
+            now,
+            now,
+          );
+        }
+      });
+      migrateV2();
+    }
   }
 
   // Add context_mode column if it doesn't exist (migration for existing DBs)
@@ -344,13 +351,22 @@ export function setLastGroupSync(): void {
  * Store a message with full content.
  * Only call this for registered groups where message history is needed.
  */
+// Cache of thread JIDs we've already ensured have a chats row,
+// avoiding a redundant INSERT OR IGNORE on every thread message.
+const knownThreadChats = new Set<string>();
+
 export function storeMessage(msg: NewMessage): void {
   // Thread JIDs (e.g. slack:C123:thread:ts) may not have a chats row yet.
   // Auto-create one to satisfy the foreign key on messages.chat_jid.
-  if (msg.chat_jid.includes(':thread:')) {
+  if (msg.chat_jid.includes(':thread:') && !knownThreadChats.has(msg.chat_jid)) {
     db.prepare(
       `INSERT OR IGNORE INTO chats (jid, last_message_time, channel, is_group) VALUES (?, ?, ?, 1)`,
-    ).run(msg.chat_jid, msg.timestamp, msg.chat_jid.startsWith('slack:') ? 'slack' : 'discord');
+    ).run(
+      msg.chat_jid,
+      msg.timestamp,
+      msg.chat_jid.startsWith('slack:') ? 'slack' : 'discord',
+    );
+    knownThreadChats.add(msg.chat_jid);
   }
   db.prepare(
     `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -495,11 +511,14 @@ export function findPendingThreadJids(
   `;
   const rows = db
     .prepare(sql)
-    .all(`${parentJid}:thread:%`, `${botPrefix}:%`) as Array<{ chat_jid: string }>;
+    .all(`${parentJid}:thread:%`, `${botPrefix}:%`) as Array<{
+    chat_jid: string;
+  }>;
 
   const result: string[] = [];
   for (const row of rows) {
-    const since = sinceTimestamps[row.chat_jid] || sinceTimestamps[parentJid] || '';
+    const since =
+      sinceTimestamps[row.chat_jid] || sinceTimestamps[parentJid] || '';
     // Check if this thread has messages newer than what we've processed
     const pending = db
       .prepare(

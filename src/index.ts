@@ -14,6 +14,8 @@ import {
   THREAD_DEBOUNCE_MS,
   THREAD_SESSION_IDLE_HOURS,
   buildTriggerPattern,
+  getParentJid,
+  parseThreadJid,
   resolveAssistantName,
 } from './config.js';
 import './channels/index.js';
@@ -89,10 +91,7 @@ const queue = new GroupQueue();
 
 // Thread creation debounce: batch rapid messages before enqueuing
 // Key: parentJid, Value: debounce timer
-const debounceTimers = new Map<
-  string,
-  ReturnType<typeof setTimeout>
->();
+const debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 // Throttle touchSessionActivity to max once per 30s per session key
 const lastTouchTime = new Map<string, number>();
@@ -116,18 +115,11 @@ function resolveGroup(
   const direct = registeredGroups[jid];
   if (direct) return { group: direct };
 
-  // Discord thread: dc:{parentId}:thread:{threadId}
-  const dcMatch = jid.match(/^(dc:[^:]+):thread:(.+)$/);
-  if (dcMatch) {
-    const parent = registeredGroups[dcMatch[1]];
-    if (parent) return { group: parent, threadId: dcMatch[2] };
-  }
-
-  // Slack thread: slack:{channel}:thread:{ts}
-  const slackMatch = jid.match(/^(slack:[^:]+):thread:(.+)$/);
-  if (slackMatch) {
-    const parent = registeredGroups[slackMatch[1]];
-    if (parent) return { group: parent, threadId: slackMatch[2] };
+  const parsed = parseThreadJid(jid);
+  if (parsed) {
+    const parentJid = `${parsed.channel}:${parsed.parentId}`;
+    const parent = registeredGroups[parentJid];
+    if (parent) return { group: parent, threadId: parsed.threadId };
   }
 
   return undefined;
@@ -144,14 +136,6 @@ function isThreadSessionEnabled(jid: string, group: RegisteredGroup): boolean {
   return jid.startsWith('dc:') || jid.startsWith('slack:');
 }
 
-/** Extract parent JID from a thread JID, or return the JID unchanged. */
-function getParentJid(jid: string): string {
-  const dcMatch = jid.match(/^(dc:[^:]+):thread:.+$/);
-  if (dcMatch) return dcMatch[1];
-  const slackMatch = jid.match(/^(slack:[^:]+):thread:.+$/);
-  if (slackMatch) return slackMatch[1];
-  return jid;
-}
 
 /**
  * Extract a per-message model override from raw message content.
@@ -283,16 +267,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   const groupAssistantName = resolveAssistantName(group.containerConfig);
   const triggerPattern = buildTriggerPattern(groupAssistantName);
 
-  // Query messages using the chatJid directly:
-  // - Slack threads: stored as slack:{channel}:thread:{ts} → query that JID
-  // - Discord threads: stored under parent JID → chatJid IS the parent JID
-  //   (Discord emits thread JIDs on inbound but stores under parent)
-  // - Top-level messages: chatJid = parentJid → same either way
-  let queryJid = chatJid;
   const sinceTimestamp =
     lastAgentTimestamp[chatJid] || lastAgentTimestamp[parentJid] || '';
   let missedMessages = getMessagesSince(
-    queryJid,
+    chatJid,
     sinceTimestamp,
     groupAssistantName,
   );
@@ -428,9 +406,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }, IDLE_TIMEOUT);
   };
 
-  // Use parent JID for typing/sending (channel doesn't know thread JIDs yet)
-  const sendJid = chatJid;
-  await channel.setTyping?.(sendJid, true);
+  await channel.setTyping?.(chatJid, true);
   let hadError = false;
   let outputSentToUser = false;
 
@@ -454,9 +430,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           `Agent output: ${raw.slice(0, 200)}`,
         );
         if (text) {
-          await channel.sendMessage(sendJid, text);
+          await channel.sendMessage(chatJid, text);
           if (!outputSentToUser) {
-            await channel.setTyping?.(sendJid, false);
+            await channel.setTyping?.(chatJid, false);
           }
           outputSentToUser = true;
         }
@@ -477,7 +453,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     },
   );
 
-  await channel.setTyping?.(sendJid, false);
+  await channel.setTyping?.(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
 
   // Clear stale thread redirect state so the next conversation (or scheduled
@@ -544,15 +520,17 @@ async function runAgent(
     new Set(Object.keys(registeredGroups)),
   );
 
+  // Persist session ID to both in-memory cache and SQLite (V1 + V2)
+  const persistSession = (newSessionId: string) => {
+    sessions.set(sessionKey, newSessionId);
+    setSessionV2(sessionKey, group.folder, newSessionId, threadId);
+    if (!threadId) setSession(group.folder, newSessionId);
+  };
+
   // Wrap onOutput to track session ID from streamed results
   const wrappedOnOutput = onOutput
     ? async (output: ContainerOutput) => {
-        if (output.newSessionId) {
-          sessions.set(sessionKey, output.newSessionId);
-          setSessionV2(sessionKey, group.folder, output.newSessionId, threadId);
-          // Keep V1 in sync for upstream compat (group-level only)
-          if (!threadId) setSession(group.folder, output.newSessionId);
-        }
+        if (output.newSessionId) persistSession(output.newSessionId);
         await onOutput(output);
       }
     : undefined;
@@ -576,11 +554,7 @@ async function runAgent(
       wrappedOnOutput,
     );
 
-    if (output.newSessionId) {
-      sessions.set(sessionKey, output.newSessionId);
-      setSessionV2(sessionKey, group.folder, output.newSessionId, threadId);
-      if (!threadId) setSession(group.folder, output.newSessionId);
-    }
+    if (output.newSessionId) persistSession(output.newSessionId);
 
     if (output.status === 'error') {
       // Auto-recovery: if prompt_too_long, delete broken session and retry fresh
@@ -621,16 +595,8 @@ async function runAgent(
             wrappedOnOutput,
           );
 
-          if (retryOutput.newSessionId) {
-            sessions.set(sessionKey, retryOutput.newSessionId);
-            setSessionV2(
-              sessionKey,
-              group.folder,
-              retryOutput.newSessionId,
-              threadId,
-            );
-            if (!threadId) setSession(group.folder, retryOutput.newSessionId);
-          }
+          if (retryOutput.newSessionId)
+            persistSession(retryOutput.newSessionId);
 
           if (retryOutput.status === 'error') {
             logger.error(
@@ -718,13 +684,13 @@ async function startMessageLoop(): Promise<void> {
 
           const isMainGroup = group.isMain === true;
           const needsTrigger = !isMainGroup && group.requiresTrigger !== false;
+          const groupAssistantName = resolveAssistantName(group.containerConfig);
 
           // For non-main groups, only act on trigger messages.
           // Non-trigger messages accumulate in DB and get pulled as
           // context when a trigger eventually arrives.
           if (needsTrigger) {
-            const groupName = resolveAssistantName(group.containerConfig);
-            const groupTrigger = buildTriggerPattern(groupName);
+            const groupTrigger = buildTriggerPattern(groupAssistantName);
             const allowlistCfg = loadSenderAllowlist();
             const hasTrigger = groupMessages.some(
               (m) =>
@@ -746,7 +712,7 @@ async function startMessageLoop(): Promise<void> {
           const allPending = getMessagesSince(
             chatJid,
             lastAgentTimestamp[chatJid] || '',
-            resolveAssistantName(group.containerConfig),
+            groupAssistantName,
           );
           const messagesToSend =
             allPending.length > 0 ? allPending : groupMessages;
@@ -787,10 +753,13 @@ async function startMessageLoop(): Promise<void> {
             if (existing) {
               clearTimeout(existing);
             }
-            debounceTimers.set(parentJid, setTimeout(() => {
-              debounceTimers.delete(parentJid);
-              queue.enqueueMessageCheck(parentJid);
-            }, THREAD_DEBOUNCE_MS));
+            debounceTimers.set(
+              parentJid,
+              setTimeout(() => {
+                debounceTimers.delete(parentJid);
+                queue.enqueueMessageCheck(parentJid);
+              }, THREAD_DEBOUNCE_MS),
+            );
             logger.debug(
               { chatJid, debounceMs: THREAD_DEBOUNCE_MS },
               'Debouncing thread creation for rapid messages',
@@ -873,15 +842,20 @@ function startSessionSweep(): void {
         }
       }
 
+      // Build folder→group map for O(1) lookups in the sweep loop
+      const folderToGroup = new Map<string, RegisteredGroup>();
+      for (const g of Object.values(registeredGroups)) {
+        folderToGroup.set(g.folder, g);
+      }
+
       for (const session of idleSessions) {
         // Skip if any container is active for this group
         if (activeFolders.has(session.group_folder)) continue;
 
+        const group = folderToGroup.get(session.group_folder);
+
         // For thread sessions, use thread-specific idle hours if configured
         if (session.thread_id) {
-          const group = Object.values(registeredGroups).find(
-            (g) => g.folder === session.group_folder,
-          );
           const threadIdleHours =
             group?.containerConfig?.threadSessionIdleHours ??
             THREAD_SESSION_IDLE_HOURS;
@@ -893,9 +867,6 @@ function startSessionSweep(): void {
 
         // Honor sessionIdleResetHours: 0 as "never auto-reset"
         if (!session.thread_id) {
-          const group = Object.values(registeredGroups).find(
-            (g) => g.folder === session.group_folder,
-          );
           const idleHours =
             group?.containerConfig?.sessionIdleResetHours ??
             SESSION_IDLE_RESET_HOURS;
@@ -922,7 +893,10 @@ function startSessionSweep(): void {
       // Use the max configured idle hours across all groups so we don't prune
       // timestamps that a group with a longer idle window still needs.
       const registeredJids = new Set(Object.keys(registeredGroups));
-      let maxIdleHours = Math.max(SESSION_IDLE_RESET_HOURS, THREAD_SESSION_IDLE_HOURS);
+      let maxIdleHours = Math.max(
+        SESSION_IDLE_RESET_HOURS,
+        THREAD_SESSION_IDLE_HOURS,
+      );
       for (const group of Object.values(registeredGroups)) {
         const h = group.containerConfig?.threadSessionIdleHours;
         if (h && h > maxIdleHours) maxIdleHours = h;
