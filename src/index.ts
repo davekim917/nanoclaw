@@ -68,10 +68,7 @@ import {
   shouldDropMessage,
 } from './sender-allowlist.js';
 import { startSchedulerLoop } from './task-scheduler.js';
-import {
-  checkUserOverride,
-  shouldResetSession,
-} from './topic-classifier.js';
+import { checkUserOverride, shouldResetSession } from './topic-classifier.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
 
@@ -131,6 +128,20 @@ function resolveGroup(
   }
 
   return undefined;
+}
+
+/**
+ * Check if thread sessions are enabled for a group.
+ * Default on for Discord/Slack channels; explicit false to disable.
+ */
+function isThreadSessionEnabled(
+  jid: string,
+  group: RegisteredGroup,
+): boolean {
+  if (group.containerConfig?.enableThreadSessions === false) return false;
+  if (group.containerConfig?.enableThreadSessions === true) return true;
+  // Default: on for Discord and Slack, off for others
+  return jid.startsWith('dc:') || jid.startsWith('slack:');
 }
 
 /** Extract parent JID from a thread JID, or return the JID unchanged. */
@@ -275,7 +286,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // For thread JIDs, query messages stored under the parent JID
   // (thread messages are stored with parent JID — routing is handled by orchestrator)
   const queryJid = parentJid;
-  const sinceTimestamp = lastAgentTimestamp[chatJid] || lastAgentTimestamp[parentJid] || '';
+  const sinceTimestamp =
+    lastAgentTimestamp[chatJid] || lastAgentTimestamp[parentJid] || '';
   const missedMessages = getMessagesSince(
     queryJid,
     sinceTimestamp,
@@ -311,7 +323,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       if (override === 'new') {
         deleteSessionV2(sessionKey);
         sessions.delete(sessionKey);
-        logger.info({ sessionKey, reason: 'user_override' }, 'Session reset (/new)');
+        logger.info(
+          { sessionKey, reason: 'user_override' },
+          'Session reset (/new)',
+        );
       } else if (override !== 'continue') {
         // Run topic classifier (if not overridden to continue)
         const recentMsgs = getRecentMessages(chatJid, 5);
@@ -357,7 +372,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   const sessionKey = buildSessionKey(group.folder, threadId);
   logger.info(
-    { group: group.name, messageCount: missedMessages.length, sessionKey, threadId },
+    {
+      group: group.name,
+      messageCount: missedMessages.length,
+      sessionKey,
+      threadId,
+    },
     'Processing messages',
   );
 
@@ -539,9 +559,7 @@ async function runAgent(
         const summary = output.result?.startsWith('[Previous context summary]')
           ? output.result.slice(0, 4000)
           : '';
-        const retryPrompt = summary
-          ? `${summary}\n\n---\n\n${prompt}`
-          : prompt;
+        const retryPrompt = summary ? `${summary}\n\n---\n\n${prompt}` : prompt;
 
         // Retry once with fresh session (no sessionId)
         try {
@@ -557,13 +575,23 @@ async function runAgent(
               model,
             },
             (proc, containerName) =>
-              queue.registerProcess(parentJid, proc, containerName, group.folder),
+              queue.registerProcess(
+                parentJid,
+                proc,
+                containerName,
+                group.folder,
+              ),
             wrappedOnOutput,
           );
 
           if (retryOutput.newSessionId) {
             sessions.set(sessionKey, retryOutput.newSessionId);
-            setSessionV2(sessionKey, group.folder, retryOutput.newSessionId, threadId);
+            setSessionV2(
+              sessionKey,
+              group.folder,
+              retryOutput.newSessionId,
+              threadId,
+            );
             if (!threadId) setSession(group.folder, retryOutput.newSessionId);
           }
 
@@ -575,10 +603,16 @@ async function runAgent(
             return 'error';
           }
 
-          logger.info({ group: group.name }, 'Auto-recovered from prompt_too_long');
+          logger.info(
+            { group: group.name },
+            'Auto-recovered from prompt_too_long',
+          );
           return 'success';
         } catch (retryErr) {
-          logger.error({ group: group.name, err: retryErr }, 'Retry after prompt_too_long threw');
+          logger.error(
+            { group: group.name, err: retryErr },
+            'Retry after prompt_too_long threw',
+          );
           return 'error';
         }
       }
@@ -668,7 +702,7 @@ async function startMessageLoop(): Promise<void> {
           // check if the incoming message belongs to the same thread.
           // Only pipe if thread affinity matches; otherwise enqueue new invocation.
           const activeThreadId = queue.getActiveThreadId(parentJid);
-          const isThreadEnabled = group.containerConfig?.enableThreadSessions === true;
+          const isThreadEnabled = isThreadSessionEnabled(parentJid, group);
 
           // Pull all messages since lastAgentTimestamp so non-trigger
           // context that accumulated between triggers is included.
@@ -688,8 +722,7 @@ async function startMessageLoop(): Promise<void> {
           //   pipe into a thread container.
           const incomingThreadId = resolved.threadId || null;
           const canPipe =
-            !isThreadEnabled ||
-            activeThreadId === incomingThreadId;
+            !isThreadEnabled || activeThreadId === incomingThreadId;
 
           if (canPipe && queue.sendMessage(parentJid, formatted)) {
             logger.debug(
@@ -808,7 +841,8 @@ function startSessionSweep(): void {
             (g) => g.folder === session.group_folder,
           );
           const idleHours =
-            group?.containerConfig?.sessionIdleResetHours ?? SESSION_IDLE_RESET_HOURS;
+            group?.containerConfig?.sessionIdleResetHours ??
+            SESSION_IDLE_RESET_HOURS;
           if (idleHours === 0) continue;
           const specificCutoff = new Date(
             Date.now() - idleHours * 60 * 60 * 1000,

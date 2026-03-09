@@ -171,8 +171,9 @@ export class SlackChannel implements Channel {
       const group = groups[baseJid];
       const assistantName = resolveAssistantName(group.containerConfig);
       const triggerPattern = buildTriggerPattern(assistantName);
+      // Thread sessions default on for Slack; explicit false to disable
       const threadSessionsEnabled =
-        group.containerConfig?.enableThreadSessions === true;
+        group.containerConfig?.enableThreadSessions !== false;
 
       const isBotMessage = !!msg.bot_id || msg.user === this.botUserId;
 
