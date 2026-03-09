@@ -257,7 +257,14 @@ function buildVolumeMounts(
   // Each group gets their own .claude/ to prevent cross-group session access.
   // Thread sessions get their own subdirectory under the group.
   const groupSessionsDir = threadId
-    ? path.join(DATA_DIR, 'sessions', group.folder, 'threads', threadId, '.claude')
+    ? path.join(
+        DATA_DIR,
+        'sessions',
+        group.folder,
+        'threads',
+        threadId,
+        '.claude',
+      )
     : path.join(DATA_DIR, 'sessions', group.folder, '.claude');
   fs.mkdirSync(groupSessionsDir, { recursive: true });
   fs.mkdirSync(path.join(groupSessionsDir, 'debug'), { recursive: true });

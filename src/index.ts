@@ -134,10 +134,7 @@ function resolveGroup(
  * Check if thread sessions are enabled for a group.
  * Default on for Discord/Slack channels; explicit false to disable.
  */
-function isThreadSessionEnabled(
-  jid: string,
-  group: RegisteredGroup,
-): boolean {
+function isThreadSessionEnabled(jid: string, group: RegisteredGroup): boolean {
   if (group.containerConfig?.enableThreadSessions === false) return false;
   if (group.containerConfig?.enableThreadSessions === true) return true;
   // Default: on for Discord and Slack, off for others

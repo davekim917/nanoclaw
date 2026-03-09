@@ -62,9 +62,7 @@ export async function shouldResetSession(
  * Check for user override commands in the message.
  * Returns 'new' (force reset), 'continue' (force same), or null (no override).
  */
-export function checkUserOverride(
-  content: string,
-): 'new' | 'continue' | null {
+export function checkUserOverride(content: string): 'new' | 'continue' | null {
   const trimmed = content.trim().toLowerCase();
   if (trimmed.includes('/new')) return 'new';
   if (trimmed.includes('/continue')) return 'continue';
@@ -84,7 +82,10 @@ async function classifyWithHaiku(
   // Build context from recent messages (last 5)
   const context = recentMessages
     .slice(-5)
-    .map((m) => `${m.is_from_me ? 'Assistant' : 'User'}: ${m.content.slice(0, 200)}`)
+    .map(
+      (m) =>
+        `${m.is_from_me ? 'Assistant' : 'User'}: ${m.content.slice(0, 200)}`,
+    )
     .join('\n');
 
   const resp = await fetch('https://api.anthropic.com/v1/messages', {

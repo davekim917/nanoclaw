@@ -26,6 +26,12 @@ export class DiscordChannel implements Channel {
   private botToken: string;
   private memberCacheTime = new Map<string, number>();
   private typingIntervals = new Map<string, ReturnType<typeof setInterval>>();
+  // Track the last user message ID per channel for thread creation.
+  // When the first response is sent to a top-level JID, we create a thread
+  // from this message and redirect all subsequent sends there.
+  private lastUserMessageId = new Map<string, string>();
+  // After thread creation, redirect sends for a parent JID to the thread JID
+  private createdThreadJid = new Map<string, string>();
   private static MEMBER_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
   constructor(botToken: string, opts: ChannelOpts) {
@@ -181,6 +187,13 @@ export class DiscordChannel implements Channel {
         return;
       }
 
+      // Track user message ID for thread creation (top-level messages only)
+      if (!isInThread) {
+        this.lastUserMessageId.set(parentJid, msgId);
+        // Clear any stale thread redirect from a previous conversation
+        this.createdThreadJid.delete(parentJid);
+      }
+
       // Store messages with parent JID so getNewMessages() finds them
       // (thread routing is handled by the orchestrator, not the DB)
       this.opts.onMessage(parentJid, {
@@ -278,9 +291,38 @@ export class DiscordChannel implements Channel {
     }
 
     try {
+      // If we already created a thread for this parent JID, redirect there
+      const redirectJid = this.createdThreadJid.get(jid);
+      if (redirectJid) {
+        return this.sendMessage(redirectJid, text);
+      }
+
       // Parse JID: dc:{channelId} or dc:{parentId}:thread:{threadId}
       const threadMatch = jid.match(/^dc:([^:]+):thread:(.+)$/);
+      const isThreadJid = !!threadMatch;
       const channelId = threadMatch ? threadMatch[2] : jid.replace(/^dc:/, '');
+
+      // Thread creation: for top-level JIDs, create a thread from the
+      // user's triggering message on first response.
+      if (!isThreadJid) {
+        const originalMsgId = this.lastUserMessageId.get(jid);
+        if (originalMsgId) {
+          this.lastUserMessageId.delete(jid);
+          const threadId = await this.createThreadAndSend(
+            channelId,
+            originalMsgId,
+            text,
+          );
+          if (threadId) {
+            // Redirect future sends for this parent JID to the thread
+            const threadJid = `dc:${channelId}:thread:${threadId}`;
+            this.createdThreadJid.set(jid, threadJid);
+            return;
+          }
+          // Fallback: createThreadAndSend already sent to channel on failure
+          return;
+        }
+      }
 
       const channel = await this.client.channels.fetch(channelId);
 
@@ -324,7 +366,8 @@ export class DiscordChannel implements Channel {
       if (!channel || !('messages' in channel)) return null;
 
       const textChannel = channel as TextChannel;
-      const originalMessage = await textChannel.messages.fetch(originalMessageId);
+      const originalMessage =
+        await textChannel.messages.fetch(originalMessageId);
 
       // Generate thread name from the user's message (first ~40 chars)
       const name =

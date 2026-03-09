@@ -76,7 +76,7 @@ function createSchema(database: Database.Database): void {
     CREATE TABLE IF NOT EXISTS registered_groups (
       jid TEXT PRIMARY KEY,
       name TEXT NOT NULL,
-      folder TEXT NOT NULL UNIQUE,
+      folder TEXT NOT NULL,
       trigger_pattern TEXT NOT NULL,
       added_at TEXT NOT NULL,
       container_config TEXT,
@@ -110,7 +110,13 @@ function createSchema(database: Database.Database): void {
          VALUES (?, ?, NULL, ?, ?, ?)`,
       );
       for (const row of existingSessions) {
-        insert.run(row.group_folder, row.group_folder, row.session_id, now, now);
+        insert.run(
+          row.group_folder,
+          row.group_folder,
+          row.session_id,
+          now,
+          now,
+        );
       }
     });
     migrateV2();
@@ -149,6 +155,36 @@ function createSchema(database: Database.Database): void {
     );
   } catch {
     /* column already exists */
+  }
+
+  // Drop UNIQUE constraint on folder — multiple channels can share the same workspace
+  // (e.g. all Slack channels in a workspace using the same group folder).
+  // SQLite doesn't support DROP CONSTRAINT, so we recreate the table.
+  try {
+    const hasUnique = database
+      .prepare(
+        `SELECT sql FROM sqlite_master WHERE type='table' AND name='registered_groups'`,
+      )
+      .get() as { sql: string } | undefined;
+    if (hasUnique?.sql?.includes('UNIQUE')) {
+      database.exec(`
+        CREATE TABLE registered_groups_new (
+          jid TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          folder TEXT NOT NULL,
+          trigger_pattern TEXT NOT NULL,
+          added_at TEXT NOT NULL,
+          container_config TEXT,
+          requires_trigger INTEGER DEFAULT 1,
+          is_main INTEGER DEFAULT 0
+        );
+        INSERT INTO registered_groups_new SELECT * FROM registered_groups;
+        DROP TABLE registered_groups;
+        ALTER TABLE registered_groups_new RENAME TO registered_groups;
+      `);
+    }
+  } catch {
+    /* migration already applied or table doesn't exist yet */
   }
 
   // Add channel and is_group columns if they don't exist (migration for existing DBs)
@@ -615,10 +651,9 @@ export function setSessionV2(
 /** Throttled last_activity update — caller is responsible for throttling. */
 export function touchSessionActivity(key: string): void {
   const now = new Date().toISOString();
-  db.prepare('UPDATE sessions_v2 SET last_activity = ? WHERE session_key = ?').run(
-    now,
-    key,
-  );
+  db.prepare(
+    'UPDATE sessions_v2 SET last_activity = ? WHERE session_key = ?',
+  ).run(now, key);
 }
 
 export function deleteSessionV2(key: string): void {
