@@ -377,21 +377,37 @@ export function getNewMessages(
 ): { messages: NewMessage[]; newTimestamp: string } {
   if (jids.length === 0) return { messages: [], newTimestamp: lastTimestamp };
 
+  // Build a WHERE clause that matches both exact JIDs and their thread variants.
+  // Thread messages are stored as dc:{parent}:thread:{id} or slack:{channel}:thread:{ts}.
+  const conditions: string[] = [];
+  const params: string[] = [lastTimestamp];
+
+  // Exact match for all JIDs
   const placeholders = jids.map(() => '?').join(',');
+  conditions.push(`chat_jid IN (${placeholders})`);
+  params.push(...jids);
+
+  // LIKE match for thread-capable channels (dc: and slack:)
+  for (const jid of jids) {
+    if (jid.startsWith('dc:') || jid.startsWith('slack:')) {
+      conditions.push('chat_jid LIKE ?');
+      params.push(`${jid}:thread:%`);
+    }
+  }
+
   // Filter bot messages using both the is_bot_message flag AND the content
   // prefix as a backstop for messages written before the migration ran.
   const sql = `
     SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me
     FROM messages
-    WHERE timestamp > ? AND chat_jid IN (${placeholders})
+    WHERE timestamp > ? AND (${conditions.join(' OR ')})
       AND is_bot_message = 0 AND content NOT LIKE ?
       AND content != '' AND content IS NOT NULL
     ORDER BY timestamp
   `;
 
-  const rows = db
-    .prepare(sql)
-    .all(lastTimestamp, ...jids, `${botPrefix}:%`) as NewMessage[];
+  params.push(`${botPrefix}:%`);
+  const rows = db.prepare(sql).all(...params) as NewMessage[];
 
   let newTimestamp = lastTimestamp;
   for (const row of rows) {

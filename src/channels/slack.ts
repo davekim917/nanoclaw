@@ -233,10 +233,16 @@ export class SlackChannel implements Channel {
         content = `@${assistantName} ${content}`;
       }
 
-      // Store messages with base JID (thread routing handled by orchestrator)
-      this.opts.onMessage(baseJid, {
+      // When thread sessions are enabled and the message is inside a thread,
+      // emit a thread-scoped JID so the orchestrator creates an isolated session.
+      // Top-level messages always use baseJid — the thread is created on reply.
+      const storeJid =
+        threadSessionsEnabled && threadTs
+          ? `slack:${msg.channel}:thread:${threadTs}`
+          : baseJid;
+      this.opts.onMessage(storeJid, {
         id: msg.ts,
-        chat_jid: baseJid,
+        chat_jid: storeJid,
         sender: msg.user || msg.bot_id || '',
         sender_name: senderName,
         content,
