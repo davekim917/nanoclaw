@@ -75,7 +75,16 @@ export function startIpcWatcher(deps: IpcDeps): void {
               const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
               if (data.type === 'message' && data.chatJid && data.text) {
                 // Authorization: verify this group can send to this chatJid
-                const targetGroup = registeredGroups[data.chatJid];
+                // Handle thread JIDs by checking parent JID for group resolution
+                const targetGroup =
+                  registeredGroups[data.chatJid] ||
+                  (() => {
+                    const dcM = data.chatJid.match(/^(dc:[^:]+):thread:.+$/);
+                    if (dcM) return registeredGroups[dcM[1]];
+                    const slM = data.chatJid.match(/^(slack:[^:]+):thread:.+$/);
+                    if (slM) return registeredGroups[slM[1]];
+                    return undefined;
+                  })();
                 if (
                   isMain ||
                   (targetGroup && targetGroup.folder === sourceGroup)

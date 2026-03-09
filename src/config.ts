@@ -20,6 +20,18 @@ export const ASSISTANT_HAS_OWN_NUMBER =
 export const POLL_INTERVAL = 2000;
 export const SCHEDULER_POLL_INTERVAL = 60000;
 
+// Session management
+export const SESSION_IDLE_RESET_HOURS = parseInt(
+  process.env.SESSION_IDLE_RESET_HOURS || '2',
+  10,
+);
+export const THREAD_SESSION_IDLE_HOURS = parseInt(
+  process.env.THREAD_SESSION_IDLE_HOURS || '2',
+  10,
+);
+export const SESSION_SWEEP_INTERVAL = 5 * 60 * 1000; // 5 min
+export const THREAD_DEBOUNCE_MS = 1000; // 1s batch window for rapid messages
+
 // Absolute paths needed for container mounts
 const PROJECT_ROOT = process.cwd();
 const HOME_DIR = process.env.HOME || os.homedir();

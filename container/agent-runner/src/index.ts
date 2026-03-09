@@ -26,6 +26,7 @@ interface ContainerInput {
   chatJid: string;
   isMain: boolean;
   isScheduledTask?: boolean;
+  threadId?: string;
   assistantName?: string;
   model?: string;
   secrets?: Record<string, string>;
@@ -37,6 +38,7 @@ interface ContainerOutput {
   result: string | null;
   newSessionId?: string;
   error?: string;
+  errorType?: 'prompt_too_long' | 'general';
 }
 
 interface SessionEntry {
@@ -144,8 +146,10 @@ function getSessionSummary(sessionId: string, transcriptPath: string): string | 
 
 /**
  * Archive the full transcript to conversations/ before compaction.
+ * For thread sessions, also archives to /workspace/thread/conversations/
+ * and writes a summary.txt for future Plan C indexing.
  */
-function createPreCompactHook(assistantName?: string): HookCallback {
+function createPreCompactHook(assistantName?: string, threadId?: string): HookCallback {
   return async (input, _toolUseId, _context) => {
     const preCompact = input as PreCompactHookInput;
     const transcriptPath = preCompact.transcript_path;
@@ -167,18 +171,33 @@ function createPreCompactHook(assistantName?: string): HookCallback {
 
       const summary = getSessionSummary(sessionId, transcriptPath);
       const name = summary ? sanitizeFilename(summary) : generateFallbackName();
-
-      const conversationsDir = '/workspace/group/conversations';
-      fs.mkdirSync(conversationsDir, { recursive: true });
-
       const date = new Date().toISOString().split('T')[0];
       const filename = `${date}-${name}.md`;
-      const filePath = path.join(conversationsDir, filename);
-
       const markdown = formatTranscriptMarkdown(messages, summary, assistantName);
-      fs.writeFileSync(filePath, markdown);
 
+      // Always archive to group conversations
+      const conversationsDir = '/workspace/group/conversations';
+      fs.mkdirSync(conversationsDir, { recursive: true });
+      const filePath = path.join(conversationsDir, filename);
+      fs.writeFileSync(filePath, markdown);
       log(`Archived conversation to ${filePath}`);
+
+      // Thread-scoped archival: also archive to thread workspace
+      if (threadId) {
+        const threadConvDir = '/workspace/thread/conversations';
+        fs.mkdirSync(threadConvDir, { recursive: true });
+        const threadFilePath = path.join(threadConvDir, filename);
+        fs.writeFileSync(threadFilePath, markdown);
+
+        // Write summary.txt for future Plan C FTS5 indexing
+        if (summary) {
+          fs.writeFileSync(
+            '/workspace/thread/summary.txt',
+            summary,
+          );
+        }
+        log(`Archived thread conversation to ${threadFilePath}`);
+      }
     } catch (err) {
       log(`Failed to archive transcript: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -512,6 +531,14 @@ async function runQuery(
       }
     }
   }
+
+  // Thread workspace: if running in a thread session, add /workspace/thread
+  // as an additional directory so the agent can access thread-specific files
+  const threadDir = '/workspace/thread';
+  if (containerInput.threadId && fs.existsSync(threadDir)) {
+    extraDirs.push(threadDir);
+  }
+
   if (extraDirs.length > 0) {
     log(`Additional directories: ${extraDirs.join(', ')}`);
   }
@@ -533,7 +560,7 @@ async function runQuery(
       settingSources: ['project', 'user'],
       mcpServers: buildMcpServers(containerInput, mcpServerPath),
       hooks: {
-        PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
+        PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName, containerInput.threadId)] }],
         PreToolUse: [{ matcher: 'Bash', hooks: [createSanitizeBashHook()] }],
       },
     }
@@ -664,11 +691,27 @@ async function main(): Promise<void> {
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
     log(`Agent error: ${errorMessage}`);
+
+    // Detect prompt_too_long errors for auto-recovery by the host
+    const isPromptTooLong =
+      errorMessage.includes('prompt is too long') ||
+      errorMessage.includes('prompt_too_long') ||
+      errorMessage.includes('maximum context length');
+
+    // Try to retrieve session summary for recovery context
+    let summary: string | undefined;
+    if (isPromptTooLong && sessionId) {
+      const claudeDir = '/home/node/.claude';
+      const indexPath = path.join(claudeDir, 'projects', 'default', 'sessions-index.json');
+      summary = getSessionSummary(sessionId, indexPath) || undefined;
+    }
+
     writeOutput({
       status: 'error',
-      result: null,
+      result: summary ? `[Previous context summary]: ${summary}` : null,
       newSessionId: sessionId,
-      error: errorMessage
+      error: errorMessage,
+      errorType: isPromptTooLong ? 'prompt_too_long' : 'general',
     });
     process.exit(1);
   }

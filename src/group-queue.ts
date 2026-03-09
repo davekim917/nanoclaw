@@ -25,6 +25,7 @@ interface GroupState {
   containerName: string | null;
   groupFolder: string | null;
   retryCount: number;
+  activeThreadId: string | null; // Thread ID the active container is handling
 }
 
 export class GroupQueue {
@@ -49,6 +50,7 @@ export class GroupQueue {
         containerName: null,
         groupFolder: null,
         retryCount: 0,
+        activeThreadId: null,
       };
       this.groups.set(groupJid, state);
     }
@@ -153,6 +155,24 @@ export class GroupQueue {
     }
   }
 
+  /** Check if a group has an active container. */
+  isActive(groupJid: string): boolean {
+    const state = this.groups.get(groupJid);
+    return state?.active === true;
+  }
+
+  /** Get the thread ID the active container is handling (null = group-level session). */
+  getActiveThreadId(groupJid: string): string | null {
+    const state = this.groups.get(groupJid);
+    return state?.activeThreadId ?? null;
+  }
+
+  /** Set the thread ID for the active container. */
+  setActiveThreadId(groupJid: string, threadId: string | null): void {
+    const state = this.groups.get(groupJid);
+    if (state) state.activeThreadId = threadId;
+  }
+
   /**
    * Send a follow-up message to the active container via IPC file.
    * Returns true if the message was written, false if no active container.
@@ -226,6 +246,7 @@ export class GroupQueue {
       state.process = null;
       state.containerName = null;
       state.groupFolder = null;
+      state.activeThreadId = null;
       this.activeCount--;
       this.drainGroup(groupJid);
     }
@@ -255,6 +276,7 @@ export class GroupQueue {
       state.process = null;
       state.containerName = null;
       state.groupFolder = null;
+      state.activeThreadId = null;
       this.activeCount--;
       this.drainGroup(groupJid);
     }

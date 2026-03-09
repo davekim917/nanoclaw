@@ -9,6 +9,10 @@ import {
   MODEL_ALIASES,
   MODEL_OVERRIDE_PATTERN,
   POLL_INTERVAL,
+  SESSION_IDLE_RESET_HOURS,
+  SESSION_SWEEP_INTERVAL,
+  THREAD_DEBOUNCE_MS,
+  THREAD_SESSION_IDLE_HOURS,
   buildTriggerPattern,
   resolveAssistantName,
 } from './config.js';
@@ -28,19 +32,25 @@ import {
   ensureContainerRuntimeRunning,
 } from './container-runtime.js';
 import {
+  buildSessionKey,
+  deleteSessionV2,
   getAllChats,
   getAllRegisteredGroups,
-  getAllSessions,
+  getAllSessionsV2,
   getAllTasks,
+  getIdleSessions,
   getMessagesSince,
+  getRecentMessages,
   getNewMessages,
   getRouterState,
   initDatabase,
   setRegisteredGroup,
   setRouterState,
   setSession,
+  setSessionV2,
   storeChatMetadata,
   storeMessage,
+  touchSessionActivity,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
@@ -58,6 +68,10 @@ import {
   shouldDropMessage,
 } from './sender-allowlist.js';
 import { startSchedulerLoop } from './task-scheduler.js';
+import {
+  checkUserOverride,
+  shouldResetSession,
+} from './topic-classifier.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
 
@@ -65,13 +79,68 @@ import { logger } from './logger.js';
 export { escapeXml, formatMessages } from './router.js';
 
 let lastTimestamp = '';
-let sessions: Record<string, string> = {};
+let sessions = new Map<string, string>(); // V2: composite session keys
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
+
+// Thread creation debounce: batch rapid messages before enqueuing
+// Key: parentJid, Value: { timer, chatJid (last seen thread JID) }
+const debounceTimers = new Map<
+  string,
+  { timer: ReturnType<typeof setTimeout>; chatJid: string }
+>();
+
+// Throttle touchSessionActivity to max once per 30s per session key
+const lastTouchTime = new Map<string, number>();
+
+function throttledTouchActivity(sessionKey: string): void {
+  const now = Date.now();
+  const last = lastTouchTime.get(sessionKey) || 0;
+  if (now - last >= 30_000) {
+    touchSessionActivity(sessionKey);
+    lastTouchTime.set(sessionKey, now);
+  }
+}
+
+/**
+ * Resolve a chat JID to its registered group, handling thread JID formats.
+ * Thread JIDs: dc:{parentId}:thread:{threadId}, slack:{channel}:thread:{ts}
+ */
+function resolveGroup(
+  jid: string,
+): { group: RegisteredGroup; threadId?: string } | undefined {
+  const direct = registeredGroups[jid];
+  if (direct) return { group: direct };
+
+  // Discord thread: dc:{parentId}:thread:{threadId}
+  const dcMatch = jid.match(/^(dc:[^:]+):thread:(.+)$/);
+  if (dcMatch) {
+    const parent = registeredGroups[dcMatch[1]];
+    if (parent) return { group: parent, threadId: dcMatch[2] };
+  }
+
+  // Slack thread: slack:{channel}:thread:{ts}
+  const slackMatch = jid.match(/^(slack:[^:]+):thread:(.+)$/);
+  if (slackMatch) {
+    const parent = registeredGroups[slackMatch[1]];
+    if (parent) return { group: parent, threadId: slackMatch[2] };
+  }
+
+  return undefined;
+}
+
+/** Extract parent JID from a thread JID, or return the JID unchanged. */
+function getParentJid(jid: string): string {
+  const dcMatch = jid.match(/^(dc:[^:]+):thread:.+$/);
+  if (dcMatch) return dcMatch[1];
+  const slackMatch = jid.match(/^(slack:[^:]+):thread:.+$/);
+  if (slackMatch) return slackMatch[1];
+  return jid;
+}
 
 /**
  * Extract a per-message model override from raw message content.
@@ -120,7 +189,7 @@ function loadState(): void {
     logger.warn('Corrupted last_agent_timestamp in DB, resetting');
     lastAgentTimestamp = {};
   }
-  sessions = getAllSessions();
+  sessions = getAllSessionsV2();
   registeredGroups = getAllRegisteredGroups();
   logger.info(
     { groupCount: Object.keys(registeredGroups).length },
@@ -187,10 +256,13 @@ export function _setRegisteredGroups(
  * Called by the GroupQueue when it's this group's turn.
  */
 async function processGroupMessages(chatJid: string): Promise<boolean> {
-  const group = registeredGroups[chatJid];
-  if (!group) return true;
+  const resolved = resolveGroup(chatJid);
+  if (!resolved) return true;
+  const { group, threadId } = resolved;
 
-  const channel = findChannel(channels, chatJid);
+  // Use parent JID for channel lookup (channels own parent JIDs, not thread JIDs)
+  const parentJid = getParentJid(chatJid);
+  const channel = findChannel(channels, parentJid);
   if (!channel) {
     logger.warn({ chatJid }, 'No channel owns JID, skipping messages');
     return true;
@@ -200,9 +272,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   const groupAssistantName = resolveAssistantName(group.containerConfig);
   const triggerPattern = buildTriggerPattern(groupAssistantName);
 
-  const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
+  // For thread JIDs, query messages stored under the parent JID
+  // (thread messages are stored with parent JID — routing is handled by orchestrator)
+  const queryJid = parentJid;
+  const sinceTimestamp = lastAgentTimestamp[chatJid] || lastAgentTimestamp[parentJid] || '';
   const missedMessages = getMessagesSince(
-    chatJid,
+    queryJid,
     sinceTimestamp,
     groupAssistantName,
   );
@@ -220,6 +295,52 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     if (!hasTrigger) return true;
   }
 
+  // Topic classifier for threadless channels (WhatsApp, Telegram)
+  // Discord/Slack use thread-as-session instead, so skip classifier for them.
+  const isThreadChannel =
+    chatJid.startsWith('dc:') || chatJid.startsWith('slack:');
+  if (!isThreadChannel && !threadId) {
+    const sessionKey = buildSessionKey(group.folder);
+    const existingSession = sessions.get(sessionKey);
+
+    if (existingSession) {
+      // Check for user override commands
+      const lastMsg = missedMessages[missedMessages.length - 1];
+      const override = checkUserOverride(lastMsg.content);
+
+      if (override === 'new') {
+        deleteSessionV2(sessionKey);
+        sessions.delete(sessionKey);
+        logger.info({ sessionKey, reason: 'user_override' }, 'Session reset (/new)');
+      } else if (override !== 'continue') {
+        // Run topic classifier (if not overridden to continue)
+        const recentMsgs = getRecentMessages(chatJid, 5);
+        const lastActivity = recentMsgs[0]?.timestamp;
+        const idleMinutes = lastActivity
+          ? (Date.now() - new Date(lastActivity).getTime()) / 60000
+          : Infinity;
+
+        const decision = await shouldResetSession(
+          recentMsgs.map((m) => ({
+            content: m.content,
+            is_from_me: !!m.is_from_me,
+          })),
+          lastMsg.content,
+          idleMinutes,
+        );
+
+        if (decision.reset) {
+          deleteSessionV2(sessionKey);
+          sessions.delete(sessionKey);
+          logger.info(
+            { sessionKey, reason: decision.reason, idleMinutes },
+            'Session reset (topic change)',
+          );
+        }
+      }
+    }
+  }
+
   const modelOverride = extractModelOverride(missedMessages);
   const model = resolveModel(group, modelOverride);
   const prompt = formatMessages(missedMessages);
@@ -231,8 +352,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     missedMessages[missedMessages.length - 1].timestamp;
   saveState();
 
+  // Track thread ID on the queue so piping can check thread affinity
+  queue.setActiveThreadId(parentJid, threadId || null);
+
+  const sessionKey = buildSessionKey(group.folder, threadId);
   logger.info(
-    { group: group.name, messageCount: missedMessages.length },
+    { group: group.name, messageCount: missedMessages.length, sessionKey, threadId },
     'Processing messages',
   );
 
@@ -246,11 +371,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         { group: group.name },
         'Idle timeout, closing container stdin',
       );
-      queue.closeStdin(chatJid);
+      queue.closeStdin(parentJid);
     }, IDLE_TIMEOUT);
   };
 
-  await channel.setTyping?.(chatJid, true);
+  // Use parent JID for typing/sending (channel doesn't know thread JIDs yet)
+  const sendJid = chatJid;
+  await channel.setTyping?.(sendJid, true);
   let hadError = false;
   let outputSentToUser = false;
 
@@ -259,6 +386,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     prompt,
     chatJid,
     model,
+    threadId,
     async (result) => {
       // Streaming output callback — called for each agent result
       if (result.result) {
@@ -273,9 +401,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           `Agent output: ${raw.slice(0, 200)}`,
         );
         if (text) {
-          await channel.sendMessage(chatJid, text);
+          await channel.sendMessage(sendJid, text);
           if (!outputSentToUser) {
-            await channel.setTyping?.(chatJid, false);
+            await channel.setTyping?.(sendJid, false);
           }
           outputSentToUser = true;
         }
@@ -283,8 +411,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         resetIdleTimer();
       }
 
+      // Throttled activity touch for session sweep
+      throttledTouchActivity(sessionKey);
+
       if (result.status === 'success') {
-        queue.notifyIdle(chatJid);
+        queue.notifyIdle(parentJid);
       }
 
       if (result.status === 'error') {
@@ -293,7 +424,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     },
   );
 
-  await channel.setTyping?.(chatJid, false);
+  await channel.setTyping?.(sendJid, false);
   if (idleTimer) clearTimeout(idleTimer);
 
   if (output === 'error' || hadError) {
@@ -324,10 +455,12 @@ async function runAgent(
   prompt: string,
   chatJid: string,
   model?: string,
+  threadId?: string,
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<'success' | 'error'> {
   const isMain = group.isMain === true;
-  const sessionId = sessions[group.folder];
+  const sessionKey = buildSessionKey(group.folder, threadId);
+  const sessionId = sessions.get(sessionKey);
 
   // Update tasks snapshot for container to read (filtered by group)
   const tasks = getAllTasks();
@@ -358,14 +491,17 @@ async function runAgent(
   const wrappedOnOutput = onOutput
     ? async (output: ContainerOutput) => {
         if (output.newSessionId) {
-          sessions[group.folder] = output.newSessionId;
-          setSession(group.folder, output.newSessionId);
+          sessions.set(sessionKey, output.newSessionId);
+          setSessionV2(sessionKey, group.folder, output.newSessionId, threadId);
+          // Keep V1 in sync for upstream compat (group-level only)
+          if (!threadId) setSession(group.folder, output.newSessionId);
         }
         await onOutput(output);
       }
     : undefined;
 
   try {
+    const parentJid = getParentJid(chatJid);
     const output = await runContainerAgent(
       group,
       {
@@ -374,20 +510,79 @@ async function runAgent(
         groupFolder: group.folder,
         chatJid,
         isMain,
+        threadId,
         assistantName: resolveAssistantName(group.containerConfig),
         model,
       },
       (proc, containerName) =>
-        queue.registerProcess(chatJid, proc, containerName, group.folder),
+        queue.registerProcess(parentJid, proc, containerName, group.folder),
       wrappedOnOutput,
     );
 
     if (output.newSessionId) {
-      sessions[group.folder] = output.newSessionId;
-      setSession(group.folder, output.newSessionId);
+      sessions.set(sessionKey, output.newSessionId);
+      setSessionV2(sessionKey, group.folder, output.newSessionId, threadId);
+      if (!threadId) setSession(group.folder, output.newSessionId);
     }
 
     if (output.status === 'error') {
+      // Auto-recovery: if prompt_too_long, delete broken session and retry fresh
+      if (output.errorType === 'prompt_too_long' && sessionId) {
+        logger.warn(
+          { group: group.name, sessionKey },
+          'prompt_too_long detected — deleting broken session and retrying',
+        );
+        deleteSessionV2(sessionKey);
+        sessions.delete(sessionKey);
+
+        // Prepend summary from the broken session (if available, capped at 4000 chars)
+        const summary = output.result?.startsWith('[Previous context summary]')
+          ? output.result.slice(0, 4000)
+          : '';
+        const retryPrompt = summary
+          ? `${summary}\n\n---\n\n${prompt}`
+          : prompt;
+
+        // Retry once with fresh session (no sessionId)
+        try {
+          const retryOutput = await runContainerAgent(
+            group,
+            {
+              prompt: retryPrompt,
+              groupFolder: group.folder,
+              chatJid,
+              isMain,
+              threadId,
+              assistantName: resolveAssistantName(group.containerConfig),
+              model,
+            },
+            (proc, containerName) =>
+              queue.registerProcess(parentJid, proc, containerName, group.folder),
+            wrappedOnOutput,
+          );
+
+          if (retryOutput.newSessionId) {
+            sessions.set(sessionKey, retryOutput.newSessionId);
+            setSessionV2(sessionKey, group.folder, retryOutput.newSessionId, threadId);
+            if (!threadId) setSession(group.folder, retryOutput.newSessionId);
+          }
+
+          if (retryOutput.status === 'error') {
+            logger.error(
+              { group: group.name, error: retryOutput.error },
+              'Retry after prompt_too_long also failed',
+            );
+            return 'error';
+          }
+
+          logger.info({ group: group.name }, 'Auto-recovered from prompt_too_long');
+          return 'success';
+        } catch (retryErr) {
+          logger.error({ group: group.name, err: retryErr }, 'Retry after prompt_too_long threw');
+          return 'error';
+        }
+      }
+
       logger.error(
         { group: group.name, error: output.error },
         'Container agent error',
@@ -439,10 +634,12 @@ async function startMessageLoop(): Promise<void> {
         }
 
         for (const [chatJid, groupMessages] of messagesByGroup) {
-          const group = registeredGroups[chatJid];
-          if (!group) continue;
+          const resolved = resolveGroup(chatJid);
+          if (!resolved) continue;
+          const { group } = resolved;
 
-          const channel = findChannel(channels, chatJid);
+          const parentJid = getParentJid(chatJid);
+          const channel = findChannel(channels, parentJid);
           if (!channel) {
             logger.warn({ chatJid }, 'No channel owns JID, skipping messages');
             continue;
@@ -467,6 +664,12 @@ async function startMessageLoop(): Promise<void> {
             if (!hasTrigger) continue;
           }
 
+          // Thread-aware piping: if a container is active for this group,
+          // check if the incoming message belongs to the same thread.
+          // Only pipe if thread affinity matches; otherwise enqueue new invocation.
+          const activeThreadId = queue.getActiveThreadId(parentJid);
+          const isThreadEnabled = group.containerConfig?.enableThreadSessions === true;
+
           // Pull all messages since lastAgentTimestamp so non-trigger
           // context that accumulated between triggers is included.
           const allPending = getMessagesSince(
@@ -478,7 +681,17 @@ async function startMessageLoop(): Promise<void> {
             allPending.length > 0 ? allPending : groupMessages;
           const formatted = formatMessages(messagesToSend);
 
-          if (queue.sendMessage(chatJid, formatted)) {
+          // Thread-aware piping decision:
+          // - If thread sessions enabled and active container is handling a different thread,
+          //   DON'T pipe — enqueue for a new container instead.
+          // - Top-level messages (no threadId) on thread-enabled channels should NOT
+          //   pipe into a thread container.
+          const incomingThreadId = resolved.threadId || null;
+          const canPipe =
+            !isThreadEnabled ||
+            activeThreadId === incomingThreadId;
+
+          if (canPipe && queue.sendMessage(parentJid, formatted)) {
             logger.debug(
               { chatJid, count: messagesToSend.length },
               'Piped messages to active container',
@@ -489,12 +702,35 @@ async function startMessageLoop(): Promise<void> {
             // Show typing indicator while the container processes the piped message
             channel
               .setTyping?.(chatJid, true)
-              ?.catch((err) =>
+              ?.catch((err: unknown) =>
                 logger.warn({ chatJid, err }, 'Failed to set typing indicator'),
               );
+          } else if (
+            isThreadEnabled &&
+            !incomingThreadId &&
+            THREAD_DEBOUNCE_MS > 0
+          ) {
+            // Debounce top-level messages on thread-enabled channels:
+            // Wait THREAD_DEBOUNCE_MS for rapid follow-up messages before
+            // creating a new thread. Batches multiple messages into one thread.
+            const existing = debounceTimers.get(parentJid);
+            if (existing) {
+              clearTimeout(existing.timer);
+            }
+            debounceTimers.set(parentJid, {
+              chatJid,
+              timer: setTimeout(() => {
+                debounceTimers.delete(parentJid);
+                queue.enqueueMessageCheck(parentJid);
+              }, THREAD_DEBOUNCE_MS),
+            });
+            logger.debug(
+              { chatJid, debounceMs: THREAD_DEBOUNCE_MS },
+              'Debouncing thread creation for rapid messages',
+            );
           } else {
-            // No active container — enqueue for a new one
-            queue.enqueueMessageCheck(chatJid);
+            // No active container or thread mismatch — enqueue for a new one
+            queue.enqueueMessageCheck(parentJid);
           }
         }
       }
@@ -511,8 +747,9 @@ async function startMessageLoop(): Promise<void> {
  */
 function recoverPendingMessages(): void {
   for (const [chatJid, group] of Object.entries(registeredGroups)) {
+    const assistantName = resolveAssistantName(group.containerConfig);
     const sinceTimestamp = lastAgentTimestamp[chatJid] || '';
-    const pending = getMessagesSince(chatJid, sinceTimestamp, ASSISTANT_NAME);
+    const pending = getMessagesSince(chatJid, sinceTimestamp, assistantName);
     if (pending.length > 0) {
       logger.info(
         { group: group.name, pendingCount: pending.length },
@@ -521,6 +758,83 @@ function recoverPendingMessages(): void {
       queue.enqueueMessageCheck(chatJid);
     }
   }
+}
+
+/**
+ * Session sweep: periodically clean up idle sessions.
+ * Runs every SESSION_SWEEP_INTERVAL (5 min).
+ */
+function startSessionSweep(): void {
+  const sweep = () => {
+    try {
+      // Compute cutoff for group-level sessions
+      const groupCutoff = new Date(
+        Date.now() - SESSION_IDLE_RESET_HOURS * 60 * 60 * 1000,
+      ).toISOString();
+
+      const idleSessions = getIdleSessions(groupCutoff);
+      if (idleSessions.length === 0) return;
+
+      // Collect group folders with active containers (skip ALL their sessions)
+      const activeFolders = new Set<string>();
+      for (const [jid] of Object.entries(registeredGroups)) {
+        if (queue.isActive(jid)) {
+          const group = registeredGroups[jid];
+          if (group) activeFolders.add(group.folder);
+        }
+      }
+
+      for (const session of idleSessions) {
+        // Skip if any container is active for this group
+        if (activeFolders.has(session.group_folder)) continue;
+
+        // For thread sessions, use thread-specific idle hours if configured
+        if (session.thread_id) {
+          const group = Object.values(registeredGroups).find(
+            (g) => g.folder === session.group_folder,
+          );
+          const threadIdleHours =
+            group?.containerConfig?.threadSessionIdleHours ??
+            THREAD_SESSION_IDLE_HOURS;
+          const threadCutoff = new Date(
+            Date.now() - threadIdleHours * 60 * 60 * 1000,
+          ).toISOString();
+          if (session.last_activity >= threadCutoff) continue;
+        }
+
+        // Honor sessionIdleResetHours: 0 as "never auto-reset"
+        if (!session.thread_id) {
+          const group = Object.values(registeredGroups).find(
+            (g) => g.folder === session.group_folder,
+          );
+          const idleHours =
+            group?.containerConfig?.sessionIdleResetHours ?? SESSION_IDLE_RESET_HOURS;
+          if (idleHours === 0) continue;
+          const specificCutoff = new Date(
+            Date.now() - idleHours * 60 * 60 * 1000,
+          ).toISOString();
+          if (session.last_activity >= specificCutoff) continue;
+        }
+
+        // Delete the session from DB (disk cleanup happens on container close)
+        deleteSessionV2(session.session_key);
+        sessions.delete(session.session_key);
+        logger.info(
+          {
+            sessionKey: session.session_key,
+            reason: 'idle_timeout',
+            lastActivity: session.last_activity,
+          },
+          'Session swept (idle)',
+        );
+      }
+    } catch (err) {
+      logger.error({ err }, 'Error in session sweep');
+    }
+  };
+
+  setInterval(sweep, SESSION_SWEEP_INTERVAL);
+  logger.info('Session sweep started');
 }
 
 function ensureContainerSystemRunning(): void {
@@ -572,7 +886,7 @@ async function main(): Promise<void> {
   const channelOpts = {
     onMessage: (chatJid: string, msg: NewMessage) => {
       // Sender allowlist drop mode: discard messages from denied senders before storing
-      if (!msg.is_from_me && !msg.is_bot_message && registeredGroups[chatJid]) {
+      if (!msg.is_from_me && !msg.is_bot_message && resolveGroup(chatJid)) {
         const cfg = loadSenderAllowlist();
         if (
           shouldDropMessage(chatJid, cfg) &&
@@ -639,10 +953,13 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  // Start session sweep (idle session cleanup)
+  startSessionSweep();
+
   // Start subsystems (independently of connection handler)
   startSchedulerLoop({
     registeredGroups: () => registeredGroups,
-    getSessions: () => sessions,
+    getSessions: () => Object.fromEntries(sessions),
     queue,
     onProcess: (groupJid, proc, containerName, groupFolder) =>
       queue.registerProcess(groupJid, proc, containerName, groupFolder),

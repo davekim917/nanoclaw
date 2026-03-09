@@ -4,6 +4,7 @@ import {
   GatewayIntentBits,
   Message,
   TextChannel,
+  ThreadChannel,
 } from 'discord.js';
 
 import {
@@ -48,7 +49,6 @@ export class DiscordChannel implements Channel {
       if (message.author.bot) return;
 
       const channelId = message.channelId;
-      const chatJid = `dc:${channelId}`;
       let content = message.content;
       const timestamp = message.createdAt.toISOString();
       const senderName =
@@ -58,17 +58,40 @@ export class DiscordChannel implements Channel {
       const sender = message.author.id;
       const msgId = message.id;
 
+      // Thread detection: if the message is in a thread, use the parent channel
+      // for group lookup and encode the thread in the JID
+      let chatJid: string;
+      let isInThread = false;
+      if (message.channel.isThread() && message.channel.parentId) {
+        chatJid = `dc:${message.channel.parentId}:thread:${channelId}`;
+        isInThread = true;
+      } else {
+        chatJid = `dc:${channelId}`;
+      }
+
+      // Parent JID for group lookup (threads resolve to their parent channel)
+      const parentJid = isInThread
+        ? `dc:${(message.channel as ThreadChannel).parentId}`
+        : chatJid;
+
       // Determine chat name
       let chatName: string;
       if (message.guild) {
-        const textChannel = message.channel as TextChannel;
-        chatName = `${message.guild.name} #${textChannel.name}`;
+        if (isInThread) {
+          const parentChannel = message.channel.isThread()
+            ? ((message.channel as ThreadChannel).parent as TextChannel | null)
+            : null;
+          chatName = `${message.guild.name} #${parentChannel?.name ?? channelId}`;
+        } else {
+          const textChannel = message.channel as TextChannel;
+          chatName = `${message.guild.name} #${textChannel.name}`;
+        }
       } else {
         chatName = senderName;
       }
 
-      // Resolve per-group assistant name (falls back to global default)
-      const group = this.opts.registeredGroups()[chatJid];
+      // Resolve per-group assistant name using parent JID (threads inherit parent config)
+      const group = this.opts.registeredGroups()[parentJid];
       const assistantName = resolveAssistantName(group?.containerConfig);
       const triggerPattern = buildTriggerPattern(assistantName);
 
@@ -139,10 +162,10 @@ export class DiscordChannel implements Channel {
         content = `@${assistantName} ${content}`;
       }
 
-      // Store chat metadata for discovery
+      // Store chat metadata for discovery (always use parent JID)
       const isGroup = message.guild !== null;
       this.opts.onChatMetadata(
-        chatJid,
+        parentJid,
         timestamp,
         chatName,
         'discord',
@@ -152,16 +175,17 @@ export class DiscordChannel implements Channel {
       // Only deliver full message for registered groups
       if (!group) {
         logger.debug(
-          { chatJid, chatName },
+          { chatJid: parentJid, chatName },
           'Message from unregistered Discord channel',
         );
         return;
       }
 
-      // Deliver message — startMessageLoop() will pick it up
-      this.opts.onMessage(chatJid, {
+      // Store messages with parent JID so getNewMessages() finds them
+      // (thread routing is handled by the orchestrator, not the DB)
+      this.opts.onMessage(parentJid, {
         id: msgId,
-        chat_jid: chatJid,
+        chat_jid: parentJid,
         sender,
         sender_name: senderName,
         content,
@@ -170,7 +194,7 @@ export class DiscordChannel implements Channel {
       });
 
       logger.info(
-        { chatJid, chatName, sender: senderName },
+        { chatJid, parentJid, chatName, sender: senderName, isInThread },
         'Discord message stored',
       );
     });
@@ -254,7 +278,10 @@ export class DiscordChannel implements Channel {
     }
 
     try {
-      const channelId = jid.replace(/^dc:/, '');
+      // Parse JID: dc:{channelId} or dc:{parentId}:thread:{threadId}
+      const threadMatch = jid.match(/^dc:([^:]+):thread:(.+)$/);
+      const channelId = threadMatch ? threadMatch[2] : jid.replace(/^dc:/, '');
+
       const channel = await this.client.channels.fetch(channelId);
 
       if (!channel || !('send' in channel)) {
@@ -277,6 +304,65 @@ export class DiscordChannel implements Channel {
       logger.info({ jid, length: text.length }, 'Discord message sent');
     } catch (err) {
       logger.error({ jid, err }, 'Failed to send Discord message');
+    }
+  }
+
+  /**
+   * Create a Discord thread from a message and send the response there.
+   * Returns the thread's channel ID, or null if thread creation failed.
+   */
+  async createThreadAndSend(
+    parentChannelId: string,
+    originalMessageId: string,
+    text: string,
+    threadName?: string,
+  ): Promise<string | null> {
+    if (!this.client) return null;
+
+    try {
+      const channel = await this.client.channels.fetch(parentChannelId);
+      if (!channel || !('messages' in channel)) return null;
+
+      const textChannel = channel as TextChannel;
+      const originalMessage = await textChannel.messages.fetch(originalMessageId);
+
+      // Generate thread name from the user's message (first ~40 chars)
+      const name =
+        threadName ||
+        originalMessage.content
+          .replace(/@\w+\s*/g, '')
+          .trim()
+          .slice(0, 40) ||
+        'Thread';
+
+      const thread = await originalMessage.startThread({
+        name,
+        autoArchiveDuration: 1440, // 24h
+      });
+
+      text = await this.replaceMentions(text, textChannel);
+      const MAX_LENGTH = 2000;
+      if (text.length <= MAX_LENGTH) {
+        await thread.send(text);
+      } else {
+        for (let i = 0; i < text.length; i += MAX_LENGTH) {
+          await thread.send(text.slice(i, i + MAX_LENGTH));
+        }
+      }
+
+      logger.info(
+        { parentChannelId, threadId: thread.id, threadName: name },
+        'Discord thread created',
+      );
+      return thread.id;
+    } catch (err) {
+      logger.error(
+        { parentChannelId, originalMessageId, err },
+        'Failed to create Discord thread, falling back to channel',
+      );
+      // Fallback: send directly in channel
+      await this.sendMessage(`dc:${parentChannelId}`, text);
+      return null;
     }
   }
 
@@ -308,7 +394,9 @@ export class DiscordChannel implements Channel {
 
     if (!this.client || !isTyping) return;
 
-    const channelId = jid.replace(/^dc:/, '');
+    // Parse thread JID format
+    const threadMatch = jid.match(/^dc:([^:]+):thread:(.+)$/);
+    const channelId = threadMatch ? threadMatch[2] : jid.replace(/^dc:/, '');
     const sendTyping = async () => {
       try {
         const channel = await this.client!.channels.fetch(channelId);

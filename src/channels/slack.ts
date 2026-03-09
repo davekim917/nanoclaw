@@ -153,24 +153,26 @@ export class SlackChannel implements Channel {
 
       if (!msg.text) return;
 
-      const jid = `slack:${msg.channel}`;
+      const baseJid = `slack:${msg.channel}`;
       // thread_ts is present when the message is inside a thread.
       // For top-level messages it's undefined — we use msg.ts to start a new thread.
       const threadTs = (msg as { thread_ts?: string }).thread_ts;
       const timestamp = new Date(parseFloat(msg.ts) * 1000).toISOString();
       const isGroup = msg.channel_type !== 'im';
 
-      // Always report metadata for group discovery
-      this.opts.onChatMetadata(jid, timestamp, undefined, 'slack', isGroup);
+      // Always report metadata for group discovery (use base JID)
+      this.opts.onChatMetadata(baseJid, timestamp, undefined, 'slack', isGroup);
 
       // Only deliver full messages for registered groups
       const groups = this.opts.registeredGroups();
-      if (!groups[jid]) return;
+      if (!groups[baseJid]) return;
 
       // Resolve per-group assistant name (falls back to global default)
-      const group = groups[jid];
+      const group = groups[baseJid];
       const assistantName = resolveAssistantName(group.containerConfig);
       const triggerPattern = buildTriggerPattern(assistantName);
+      const threadSessionsEnabled =
+        group.containerConfig?.enableThreadSessions === true;
 
       const isBotMessage = !!msg.bot_id || msg.user === this.botUserId;
 
@@ -196,13 +198,15 @@ export class SlackChannel implements Channel {
       // Track which thread to reply in. For threaded messages, reply in the
       // same thread. For top-level messages, reply as a thread on that message.
       if (!isBotMessage) {
-        this.replyThreadTs.set(jid, threadTs || msg.ts);
-        this.lastUserMessageTs.set(jid, msg.ts);
+        this.replyThreadTs.set(baseJid, threadTs || msg.ts);
+        this.lastUserMessageTs.set(baseJid, msg.ts);
       }
 
-      // If the message is inside a thread, fetch thread history so the agent
-      // has full context of the conversation.
-      if (threadTs && !isBotMessage) {
+      // If the message is inside a thread and thread sessions are NOT enabled,
+      // fetch thread history so the agent has full context of the conversation.
+      // When thread sessions ARE enabled, the session already has context —
+      // skip the expensive history fetch.
+      if (threadTs && !isBotMessage && !threadSessionsEnabled) {
         const threadContext = await this.fetchThreadHistory(
           msg.channel,
           threadTs,
@@ -222,9 +226,10 @@ export class SlackChannel implements Channel {
         content = `@${assistantName} ${content}`;
       }
 
-      this.opts.onMessage(jid, {
+      // Store messages with base JID (thread routing handled by orchestrator)
+      this.opts.onMessage(baseJid, {
         id: msg.ts,
-        chat_jid: jid,
+        chat_jid: baseJid,
         sender: msg.user || msg.bot_id || '',
         sender_name: senderName,
         content,
@@ -266,7 +271,9 @@ export class SlackChannel implements Channel {
   }
 
   async sendMessage(jid: string, text: string): Promise<void> {
-    const channelId = jid.replace(/^slack:/, '');
+    // Parse thread JID: slack:{channel}:thread:{ts}
+    const threadMatch = jid.match(/^slack:([^:]+):thread:(.+)$/);
+    const channelId = threadMatch ? threadMatch[1] : jid.replace(/^slack:/, '');
 
     if (!this.connected) {
       this.outgoingQueue.push({ jid, text });
@@ -278,7 +285,11 @@ export class SlackChannel implements Channel {
     }
 
     try {
-      const threadTs = this.replyThreadTs.get(jid);
+      // Thread ts from JID takes priority (thread-session mode),
+      // then fall back to replyThreadTs map (legacy mode)
+      const threadTs = threadMatch
+        ? threadMatch[2]
+        : this.replyThreadTs.get(jid);
       text = this.replaceMentions(text);
 
       // Slack limits messages to ~4000 characters; split if needed
@@ -324,8 +335,10 @@ export class SlackChannel implements Channel {
   // Instead, add/remove a reaction emoji on the triggering message
   // so the user knows the bot is processing.
   async setTyping(jid: string, isTyping: boolean): Promise<void> {
-    const channelId = jid.replace(/^slack:/, '');
-    const messageTs = this.lastUserMessageTs.get(jid);
+    const threadMatch = jid.match(/^slack:([^:]+):thread:(.+)$/);
+    const channelId = threadMatch ? threadMatch[1] : jid.replace(/^slack:/, '');
+    const baseJid = threadMatch ? `slack:${threadMatch[1]}` : jid;
+    const messageTs = this.lastUserMessageTs.get(baseJid);
     if (!messageTs) {
       logger.debug({ jid, isTyping }, 'No lastUserMessageTs for reaction');
       return;

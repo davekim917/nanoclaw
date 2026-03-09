@@ -84,6 +84,38 @@ function createSchema(database: Database.Database): void {
     );
   `);
 
+  // sessions_v2: thread-aware session management (additive, does NOT drop sessions table)
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS sessions_v2 (
+      session_key TEXT PRIMARY KEY,
+      group_folder TEXT NOT NULL,
+      thread_id TEXT,
+      session_id TEXT NOT NULL,
+      last_activity TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_sessions_v2_group ON sessions_v2(group_folder);
+    CREATE INDEX IF NOT EXISTS idx_sessions_v2_activity ON sessions_v2(last_activity);
+  `);
+
+  // Migrate existing sessions into sessions_v2 (idempotent — skips rows that already exist)
+  const existingSessions = database
+    .prepare('SELECT group_folder, session_id FROM sessions')
+    .all() as Array<{ group_folder: string; session_id: string }>;
+  if (existingSessions.length > 0) {
+    const migrateV2 = database.transaction(() => {
+      const now = new Date().toISOString();
+      const insert = database.prepare(
+        `INSERT OR IGNORE INTO sessions_v2 (session_key, group_folder, thread_id, session_id, last_activity, created_at)
+         VALUES (?, ?, NULL, ?, ?, ?)`,
+      );
+      for (const row of existingSessions) {
+        insert.run(row.group_folder, row.group_folder, row.session_id, now, now);
+      }
+    });
+    migrateV2();
+  }
+
   // Add context_mode column if it doesn't exist (migration for existing DBs)
   try {
     database.exec(
@@ -501,7 +533,7 @@ export function setRouterState(key: string, value: string): void {
   ).run(key, value);
 }
 
-// --- Session accessors ---
+// --- Session accessors (V1 — kept for upstream merge safety) ---
 
 export function getSession(groupFolder: string): string | undefined {
   const row = db
@@ -525,6 +557,114 @@ export function getAllSessions(): Record<string, string> {
     result[row.group_folder] = row.session_id;
   }
   return result;
+}
+
+// --- Session V2 accessors (thread-aware) ---
+
+export interface SessionV2Row {
+  session_key: string;
+  group_folder: string;
+  thread_id: string | null;
+  session_id: string;
+  last_activity: string;
+  created_at: string;
+}
+
+export function buildSessionKey(
+  groupFolder: string,
+  threadId?: string,
+): string {
+  return threadId ? `${groupFolder}:thread:${threadId}` : groupFolder;
+}
+
+export function parseSessionKey(key: string): {
+  groupFolder: string;
+  threadId?: string;
+} {
+  const match = key.match(/^(.+?):thread:(.+)$/);
+  if (match) return { groupFolder: match[1], threadId: match[2] };
+  return { groupFolder: key };
+}
+
+export function getSessionV2(
+  key: string,
+): { session_id: string; last_activity: string } | undefined {
+  return db
+    .prepare(
+      'SELECT session_id, last_activity FROM sessions_v2 WHERE session_key = ?',
+    )
+    .get(key) as { session_id: string; last_activity: string } | undefined;
+}
+
+export function setSessionV2(
+  key: string,
+  groupFolder: string,
+  sessionId: string,
+  threadId?: string,
+): void {
+  const now = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO sessions_v2 (session_key, group_folder, thread_id, session_id, last_activity, created_at)
+     VALUES (?, ?, ?, ?, ?, ?)
+     ON CONFLICT(session_key) DO UPDATE SET
+       session_id = excluded.session_id,
+       last_activity = excluded.last_activity`,
+  ).run(key, groupFolder, threadId || null, sessionId, now, now);
+}
+
+/** Throttled last_activity update — caller is responsible for throttling. */
+export function touchSessionActivity(key: string): void {
+  const now = new Date().toISOString();
+  db.prepare('UPDATE sessions_v2 SET last_activity = ? WHERE session_key = ?').run(
+    now,
+    key,
+  );
+}
+
+export function deleteSessionV2(key: string): void {
+  db.prepare('DELETE FROM sessions_v2 WHERE session_key = ?').run(key);
+}
+
+export function getIdleSessions(cutoffISO: string): SessionV2Row[] {
+  return db
+    .prepare('SELECT * FROM sessions_v2 WHERE last_activity < ?')
+    .all(cutoffISO) as SessionV2Row[];
+}
+
+export function getThreadSessions(groupFolder: string): SessionV2Row[] {
+  return db
+    .prepare(
+      'SELECT * FROM sessions_v2 WHERE group_folder = ? AND thread_id IS NOT NULL',
+    )
+    .all(groupFolder) as SessionV2Row[];
+}
+
+export function getAllSessionsV2(): Map<string, string> {
+  const rows = db
+    .prepare('SELECT session_key, session_id FROM sessions_v2')
+    .all() as Array<{ session_key: string; session_id: string }>;
+  const result = new Map<string, string>();
+  for (const row of rows) {
+    result.set(row.session_key, row.session_id);
+  }
+  return result;
+}
+
+export function getRecentMessages(
+  chatJid: string,
+  limit: number,
+): Array<{ content: string; is_from_me: boolean; timestamp: string }> {
+  return db
+    .prepare(
+      `SELECT content, is_from_me, timestamp FROM messages
+       WHERE chat_jid = ? AND content != '' AND content IS NOT NULL
+       ORDER BY timestamp DESC LIMIT ?`,
+    )
+    .all(chatJid, limit) as Array<{
+    content: string;
+    is_from_me: boolean;
+    timestamp: string;
+  }>;
 }
 
 // --- Registered group accessors ---

@@ -39,6 +39,9 @@ export interface ContainerConfig {
   // Account-specific gmail mounts only that account's credentials as the default.
   // Connection-specific snowflake filters connections.toml to only allowed sections + keys.
   tools?: string[];
+  enableThreadSessions?: boolean; // Discord/Slack groups opt in to thread-as-session
+  sessionIdleResetHours?: number; // Override global idle reset (0 = never auto-reset)
+  threadSessionIdleHours?: number; // Override idle reset for thread sessions
 }
 
 export interface RegisteredGroup {

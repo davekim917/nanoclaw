@@ -162,6 +162,7 @@ export interface ContainerInput {
   chatJid: string;
   isMain: boolean;
   isScheduledTask?: boolean;
+  threadId?: string;
   assistantName?: string;
   model?: string;
   secrets?: Record<string, string>;
@@ -173,6 +174,7 @@ export interface ContainerOutput {
   result: string | null;
   newSessionId?: string;
   error?: string;
+  errorType?: 'prompt_too_long' | 'general';
 }
 
 interface VolumeMount {
@@ -194,6 +196,7 @@ function isToolEnabled(tools: string[] | undefined, name: string): boolean {
 function buildVolumeMounts(
   group: RegisteredGroup,
   isMain: boolean,
+  threadId?: string,
 ): VolumeMount[] {
   const mounts: VolumeMount[] = [];
   const projectRoot = process.cwd();
@@ -238,14 +241,24 @@ function buildVolumeMounts(
     }
   }
 
+  // Thread workspace: mount thread-specific directory for thread sessions.
+  // Used for thread-scoped conversation archives and context.
+  if (threadId) {
+    const threadDir = path.join(groupDir, 'threads', threadId);
+    fs.mkdirSync(threadDir, { recursive: true });
+    mounts.push({
+      hostPath: threadDir,
+      containerPath: '/workspace/thread',
+      readonly: false,
+    });
+  }
+
   // Per-group Claude sessions directory (isolated from other groups)
-  // Each group gets their own .claude/ to prevent cross-group session access
-  const groupSessionsDir = path.join(
-    DATA_DIR,
-    'sessions',
-    group.folder,
-    '.claude',
-  );
+  // Each group gets their own .claude/ to prevent cross-group session access.
+  // Thread sessions get their own subdirectory under the group.
+  const groupSessionsDir = threadId
+    ? path.join(DATA_DIR, 'sessions', group.folder, 'threads', threadId, '.claude')
+    : path.join(DATA_DIR, 'sessions', group.folder, '.claude');
   fs.mkdirSync(groupSessionsDir, { recursive: true });
   fs.mkdirSync(path.join(groupSessionsDir, 'debug'), { recursive: true });
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
@@ -698,7 +711,7 @@ export async function runContainerAgent(
     granolaAccessToken = (await getGranolaAccessToken()) || undefined;
   }
 
-  const mounts = buildVolumeMounts(group, input.isMain);
+  const mounts = buildVolumeMounts(group, input.isMain, input.threadId);
 
   // When running as root (UID 0), writable mount directories are owned by root,
   // but the container runs as `node` (UID 1000). chown them so the container can write.
