@@ -50,6 +50,9 @@ export class SlackChannel implements Channel {
 
   // Track the ts of the last user message per channel for reaction emoji.
   private lastUserMessageTs = new Map<string, string>();
+  // Snapshot of the message ts that received the 👀 emoji, so the ✅ swap
+  // targets the correct message even if new messages arrive while processing.
+  private typingMessageTs = new Map<string, string>();
 
   private opts: ChannelOpts;
 
@@ -339,7 +342,21 @@ export class SlackChannel implements Channel {
     const threadMatch = jid.match(/^slack:([^:]+):thread:(.+)$/);
     const channelId = threadMatch ? threadMatch[1] : jid.replace(/^slack:/, '');
     const baseJid = threadMatch ? `slack:${threadMatch[1]}` : jid;
-    const messageTs = this.lastUserMessageTs.get(baseJid);
+
+    // On start: snapshot the current user message ts so the ✅ swap
+    // targets the same message even if new messages arrive while processing.
+    // On stop: use the snapshot (fall back to latest if no snapshot).
+    let messageTs: string | undefined;
+    if (isTyping) {
+      messageTs = this.lastUserMessageTs.get(baseJid);
+      if (messageTs) this.typingMessageTs.set(baseJid, messageTs);
+    } else {
+      messageTs =
+        this.typingMessageTs.get(baseJid) ||
+        this.lastUserMessageTs.get(baseJid);
+      this.typingMessageTs.delete(baseJid);
+    }
+
     if (!messageTs) {
       logger.debug({ jid, isTyping }, 'No lastUserMessageTs for reaction');
       return;
