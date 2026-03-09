@@ -56,12 +56,7 @@ describe('GmailChannel', () => {
   });
 
   describe('constructor options', () => {
-    it('accepts custom poll interval', () => {
-      const ch = new GmailChannel(makeOpts(), 30000);
-      expect(ch.name).toBe('gmail');
-    });
-
-    it('defaults with no options provided', () => {
+    it('creates channel with opts', () => {
       const ch = new GmailChannel(makeOpts());
       expect(ch.name).toBe('gmail');
     });
