@@ -8,6 +8,7 @@ import os from 'os';
 import path from 'path';
 
 import {
+  ATTACHMENTS_DIR,
   CONTAINER_IMAGE,
   CONTAINER_MAX_OUTPUT_SIZE,
   CONTAINER_TIMEOUT,
@@ -163,6 +164,13 @@ async function getGranolaAccessToken(): Promise<string | null> {
   }
 }
 
+export interface ContainerAttachment {
+  filename: string;
+  mimeType: string;
+  containerPath: string; // e.g. /workspace/attachments/{msgId}/photo.png
+  messageId: string; // links attachment to specific message for correct ordering
+}
+
 export interface ContainerInput {
   prompt: string;
   sessionId?: string;
@@ -175,6 +183,7 @@ export interface ContainerInput {
   model?: string;
   secrets?: Record<string, string>;
   tools?: string[];
+  attachments?: ContainerAttachment[];
 }
 
 export interface ContainerOutput {
@@ -863,6 +872,16 @@ function buildVolumeMounts(
         });
       }
     }
+  }
+
+  // Attachments: mount group-specific attachments directory read-only
+  const groupAttachmentsDir = path.join(ATTACHMENTS_DIR, group.folder);
+  if (fs.existsSync(groupAttachmentsDir)) {
+    mounts.push({
+      hostPath: groupAttachmentsDir,
+      containerPath: '/workspace/attachments',
+      readonly: true,
+    });
   }
 
   // Per-group IPC namespace: each group gets its own IPC directory

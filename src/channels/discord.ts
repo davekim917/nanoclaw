@@ -14,11 +14,12 @@ import {
   parseThreadJid,
   resolveAssistantName,
 } from '../config.js';
+import { downloadAttachment } from '../attachment-downloader.js';
 import { getThreadOrigin, setThreadOrigin } from '../db.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
-import { Channel } from '../types.js';
+import { Attachment, Channel } from '../types.js';
 
 export class DiscordChannel implements Channel {
   name = 'discord';
@@ -152,22 +153,45 @@ export class DiscordChannel implements Channel {
         }
       }
 
-      // Handle attachments — store placeholders so the agent knows something was sent
+      // Handle attachments — download files and add text placeholders
+      const downloadedAttachments: Attachment[] = [];
       if (message.attachments.size > 0) {
-        const attachmentDescriptions = [...message.attachments.values()].map(
-          (att) => {
+        const attachmentDescriptions: string[] = [];
+        const downloads = await Promise.all(
+          [...message.attachments.values()].map(async (att) => {
             const contentType = att.contentType || '';
+            const name = att.name || 'file';
+            // Text placeholder (always added for context)
             if (contentType.startsWith('image/')) {
-              return `[Image: ${att.name || 'image'}]`;
+              attachmentDescriptions.push(`[Image: ${name}]`);
             } else if (contentType.startsWith('video/')) {
-              return `[Video: ${att.name || 'video'}]`;
+              attachmentDescriptions.push(`[Video: ${name}]`);
             } else if (contentType.startsWith('audio/')) {
-              return `[Audio: ${att.name || 'audio'}]`;
+              attachmentDescriptions.push(`[Audio: ${name}]`);
             } else {
-              return `[File: ${att.name || 'file'}]`;
+              attachmentDescriptions.push(`[File: ${name}]`);
             }
-          },
+            // Download for vision/document support (skips audio internally)
+            if (att.url && group) {
+              return downloadAttachment({
+                messageId: msgId,
+                groupFolder: group.folder,
+                filename: name,
+                mimeType: contentType,
+                fetchFn: async () => {
+                  const resp = await fetch(att.url);
+                  if (!resp.ok)
+                    throw new Error(`HTTP ${resp.status} ${resp.statusText}`);
+                  return Buffer.from(await resp.arrayBuffer());
+                },
+              });
+            }
+            return null;
+          }),
         );
+        for (const dl of downloads) {
+          if (dl) downloadedAttachments.push(dl);
+        }
         if (content) {
           content = `${content}\n${attachmentDescriptions.join('\n')}`;
         } else {
@@ -234,6 +258,10 @@ export class DiscordChannel implements Channel {
         content,
         timestamp,
         is_from_me: false,
+        attachments:
+          downloadedAttachments.length > 0
+            ? downloadedAttachments
+            : undefined,
       });
 
       logger.info(

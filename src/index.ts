@@ -24,7 +24,9 @@ import {
   getChannelFactory,
   getRegisteredChannelNames,
 } from './channels/registry.js';
+import { cleanupOldAttachments } from './attachment-downloader.js';
 import {
+  ContainerAttachment,
   ContainerOutput,
   cleanupOrphanWorktrees,
   cleanupThreadWorkspace,
@@ -79,7 +81,7 @@ import {
 } from './sender-allowlist.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { checkUserOverride, shouldResetSession } from './topic-classifier.js';
-import { Channel, NewMessage, RegisteredGroup } from './types.js';
+import { Attachment, Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
 
 // Re-export for backwards compatibility during refactor
@@ -90,6 +92,11 @@ let sessions = new Map<string, string>(); // V2: composite session keys
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
+
+// In-memory cache for message attachments.
+// Attachments are ephemeral (not stored in DB) — they travel through this cache
+// from onMessage() to processGroupMessages() and are cleaned up after processing.
+const attachmentCache = new Map<string, Attachment[]>(); // key: message ID
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
@@ -379,9 +386,36 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
   }
 
+  // Reattach cached attachments to messages read from DB
+  for (const msg of missedMessages) {
+    const cached = attachmentCache.get(msg.id);
+    if (cached) {
+      msg.attachments = cached;
+    }
+  }
+
   const modelOverride = extractModelOverride(missedMessages);
   const model = resolveModel(group, modelOverride);
   const prompt = formatMessages(missedMessages);
+
+  // Collect attachments from messages and remap paths for container mount
+  const containerAttachments: ContainerAttachment[] = [];
+  for (const msg of missedMessages) {
+    if (!msg.attachments) continue;
+    for (const att of msg.attachments) {
+      // Remap host path to container path:
+      // host: data/attachments/{group}/{msgId}/file.png
+      // container: /workspace/attachments/{msgId}/file.png
+      const msgDir = path.basename(path.dirname(att.localPath));
+      const containerPath = `/workspace/attachments/${msgDir}/${att.filename}`;
+      containerAttachments.push({
+        filename: att.filename,
+        mimeType: att.mimeType,
+        containerPath,
+        messageId: msg.id,
+      });
+    }
+  }
 
   // Advance cursor in-memory so concurrent checks for this group won't
   // re-fetch these messages while the container is running. We deliberately
@@ -427,6 +461,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     chatJid,
     model,
     effectiveThreadId,
+    containerAttachments.length > 0 ? containerAttachments : undefined,
     async (result) => {
       // Streaming output callback — called for each agent result
       if (result.result) {
@@ -492,6 +527,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     return false;
   }
 
+  // Clean up attachment cache for processed messages
+  for (const msg of missedMessages) {
+    attachmentCache.delete(msg.id);
+  }
+
   // Success — persist the cursor advance now that the container has completed.
   saveState();
   return true;
@@ -503,6 +543,7 @@ async function runAgent(
   chatJid: string,
   model?: string,
   threadId?: string,
+  attachments?: ContainerAttachment[],
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<'success' | 'error'> {
   const isMain = group.isMain === true;
@@ -562,6 +603,7 @@ async function runAgent(
         threadId,
         assistantName: resolveAssistantName(group.containerConfig),
         model,
+        attachments,
       },
       (proc, containerName) =>
         queue.registerProcess(
@@ -618,6 +660,7 @@ async function runAgent(
               threadId,
               assistantName: resolveAssistantName(group.containerConfig),
               model,
+              attachments,
             },
             (proc, containerName) =>
               queue.registerProcess(
@@ -754,13 +797,34 @@ async function startMessageLoop(): Promise<void> {
             allPending.length > 0 ? allPending : groupMessages;
           const formatted = formatMessages(messagesToSend);
 
+          // Collect attachments for piped messages
+          const pipeAttachments: ContainerAttachment[] = [];
+          for (const msg of messagesToSend) {
+            const cached = attachmentCache.get(msg.id);
+            if (!cached) continue;
+            for (const att of cached) {
+              const msgDir = path.basename(path.dirname(att.localPath));
+              pipeAttachments.push({
+                filename: att.filename,
+                mimeType: att.mimeType,
+                containerPath: `/workspace/attachments/${msgDir}/${att.filename}`,
+                messageId: msg.id,
+              });
+            }
+          }
+
           // Pipe into active container only if same thread has an active slot.
           // For non-threaded channels, this checks the GROUP_THREAD_KEY slot.
           const canPipe = queue.isThreadActive(parentJid, incomingThreadId);
 
           if (
             canPipe &&
-            queue.sendMessage(parentJid, incomingThreadId, formatted)
+            queue.sendMessage(
+              parentJid,
+              incomingThreadId,
+              formatted,
+              pipeAttachments.length > 0 ? pipeAttachments : undefined,
+            )
           ) {
             logger.debug(
               { chatJid, count: messagesToSend.length },
@@ -978,6 +1042,9 @@ function startSessionSweep(): void {
         logger.debug({ pruned }, 'Pruned stale lastAgentTimestamp entries');
       }
 
+      // Clean up old attachment files
+      cleanupOldAttachments();
+
       // Prune old thread_origins rows (7 days — they're immutable mappings,
       // keep longer than sessions so restarts within a week still resolve)
       const originsCutoff = new Date(
@@ -1061,6 +1128,10 @@ async function main(): Promise<void> {
           }
           return;
         }
+      }
+      // Cache attachments in-memory before storing (DB only keeps text)
+      if (msg.attachments && msg.attachments.length > 0) {
+        attachmentCache.set(msg.id, msg.attachments);
       }
       storeMessage(msg);
     },

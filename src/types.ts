@@ -63,6 +63,14 @@ export interface NewMessage {
   timestamp: string;
   is_from_me?: boolean;
   is_bot_message?: boolean;
+  attachments?: Attachment[];
+}
+
+export interface Attachment {
+  filename: string;
+  mimeType: string;
+  localPath: string; // absolute host path
+  size: number;
 }
 
 export interface ScheduledTask {
