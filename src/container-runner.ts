@@ -316,7 +316,23 @@ export async function prepareThreadWorkspace(
           await execAsync('git config gc.auto 0', { cwd: srcPath });
           gcDisabledRepos.add(srcPath);
         }
-        await execAsync(`git worktree add --detach "${wtPath}" HEAD`, {
+        // Fetch latest from remote so worktree isn't based on stale local HEAD
+        try {
+          await execAsync('git fetch origin', { cwd: srcPath });
+        } catch {
+          // Offline or no remote — fall through to local HEAD
+        }
+        // Use remote default branch if available, otherwise local HEAD
+        let ref = 'HEAD';
+        try {
+          ref = await execAsync(
+            'git symbolic-ref refs/remotes/origin/HEAD',
+            { cwd: srcPath },
+          ); // e.g. refs/remotes/origin/main
+        } catch {
+          // origin/HEAD not set — use local HEAD
+        }
+        await execAsync(`git worktree add --detach "${wtPath}" ${ref}`, {
           cwd: srcPath,
         });
         createdWorktrees.push({ repoDir: srcPath, wtPath });
