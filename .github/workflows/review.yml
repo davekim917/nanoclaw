@@ -1,0 +1,26 @@
+name: NanoClaw Review
+on:
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - 'docs/**'
+      - 'README.md'
+      - 'CHANGELOG.md'
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            Review this PR against the NanoClaw-specific checklist in .claude/skills/review-swarm/SKILL.md.
+            Read that file first, then review the PR diff against each criterion.
+            Post your findings as a PR review.
+            Note: The author may have already run /review-swarm locally. This CI review is a safety net — do not skip any checks based on what the PR body claims was already reviewed.
