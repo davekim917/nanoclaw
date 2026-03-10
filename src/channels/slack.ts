@@ -191,7 +191,10 @@ export class SlackChannel implements Channel {
         senderName = assistantName;
       } else if (isAnyBot) {
         senderName =
-          (msg as any).username || (msg as any).bot_profile?.name || msg.bot_id || 'bot'; // eslint-disable-line @typescript-eslint/no-explicit-any
+          (msg as any).username ||
+          (msg as any).bot_profile?.name ||
+          msg.bot_id ||
+          'bot'; // eslint-disable-line @typescript-eslint/no-explicit-any
       } else {
         senderName =
           (msg.user ? await this.resolveUserName(msg.user) : undefined) ||

@@ -108,7 +108,10 @@ export interface Channel {
   clearThreadState?(parentJid: string, threadId?: string): void;
   // Optional: fetch a single message by ID from the platform API.
   // Used as fallback when the message isn't in the local DB (e.g. external bot messages).
-  fetchMessage?(jid: string, messageId: string): Promise<NewMessage | undefined>;
+  fetchMessage?(
+    jid: string,
+    messageId: string,
+  ): Promise<NewMessage | undefined>;
 }
 
 // Callback type that channels use to deliver inbound messages

@@ -97,7 +97,6 @@ When asked to make code changes or open PRs:
 4. Make the changes
 5. Commit, push, and open a PR using `gh pr create`
 6. Share the PR link
-
 ## Message Formatting
 
 NEVER use markdown. Only use WhatsApp/Telegram formatting:
