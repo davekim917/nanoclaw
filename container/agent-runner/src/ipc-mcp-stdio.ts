@@ -341,39 +341,74 @@ function parseSlackUrl(url: string): { channelId: string; threadTs: string } | n
   return { channelId, threadTs };
 }
 
+/**
+ * Parse a Discord message URL into guild, channel, and message IDs.
+ * Format: https://discord.com/channels/{guildId}/{channelId}/{messageId}
+ * The channelId may be a regular channel or a thread channel.
+ */
+function parseDiscordUrl(url: string): { guildId: string; channelId: string; messageId?: string } | null {
+  const match = url.match(/https?:\/\/(?:ptb\.|canary\.)?discord\.com\/channels\/(\d+)\/(\d+)(?:\/(\d+))?/);
+  if (!match) return null;
+  return {
+    guildId: match[1],
+    channelId: match[2],
+    messageId: match[3] || undefined,
+  };
+}
+
 server.tool(
   'read_thread',
-  `Read messages from a Slack thread. Provide a Slack message URL (copy link from Slack).
-Returns the full conversation in the thread including all replies.
+  `Read messages from a Slack thread or Discord channel/thread. Provide a message URL (copy link from Slack or Discord).
+Returns the conversation including all replies.
 
 Use this when you need to:
-• Reference a discussion from another thread
+• Reference a discussion from another channel or thread
 • Get context from a related conversation
-• Answer questions about what was discussed elsewhere`,
+• Investigate issues reported in other channels
+• Answer questions about what was discussed elsewhere
+
+Supports:
+• Slack URLs: https://workspace.slack.com/archives/CHANNEL_ID/pTIMESTAMP
+• Discord URLs: https://discord.com/channels/GUILD_ID/CHANNEL_ID/MESSAGE_ID`,
   {
-    slack_url: z.string().describe('Slack message URL (e.g., https://workspace.slack.com/archives/C0AJA89MN2E/p1773071476205929)'),
-    limit: z.number().optional().default(100).describe('Maximum number of messages to return (default: 100)'),
+    url: z.string().describe('Slack or Discord message URL'),
+    limit: z.number().optional().default(50).describe('Maximum number of messages to return (default: 50)'),
   },
   async (args) => {
-    const parsed = parseSlackUrl(args.slack_url);
-    if (!parsed) {
+    // Detect URL type and route accordingly
+    const slackParsed = parseSlackUrl(args.url);
+    const discordParsed = parseDiscordUrl(args.url);
+
+    if (!slackParsed && !discordParsed) {
       return {
-        content: [{ type: 'text' as const, text: 'Invalid Slack URL. Expected format: https://workspace.slack.com/archives/CHANNEL_ID/pTIMESTAMP' }],
+        content: [{ type: 'text' as const, text: 'Invalid URL. Provide a Slack URL (https://workspace.slack.com/archives/...) or Discord URL (https://discord.com/channels/...)' }],
         isError: true,
       };
     }
 
     try {
-      const requestId = writeQueryFile({
-        type: 'read_thread',
-        channelId: parsed.channelId,
-        threadTs: parsed.threadTs,
-        limit: args.limit,
-      });
+      let requestId: string;
+
+      if (slackParsed) {
+        requestId = writeQueryFile({
+          type: 'read_thread',
+          channelId: slackParsed.channelId,
+          threadTs: slackParsed.threadTs,
+          limit: args.limit,
+        });
+      } else {
+        requestId = writeQueryFile({
+          type: 'read_discord',
+          channelId: discordParsed!.channelId,
+          messageId: discordParsed!.messageId,
+          limit: args.limit,
+        });
+      }
 
       const response = await waitForResponse(requestId) as {
         status: string;
         error?: string;
+        chatJid?: string;
         threadJid?: string;
         messages?: Array<{ sender: string; content: string; timestamp: string; is_from_me: boolean }>;
       };
@@ -386,9 +421,10 @@ Use this when you need to:
       }
 
       const messages = response.messages || [];
+      const jid = response.chatJid || response.threadJid || 'unknown';
       if (messages.length === 0) {
         return {
-          content: [{ type: 'text' as const, text: `No messages found in thread (${response.threadJid}). The thread may not be monitored or may have no stored messages.` }],
+          content: [{ type: 'text' as const, text: `No messages found (${jid}). The channel may not be monitored or may have no stored messages.` }],
         };
       }
 
@@ -397,11 +433,11 @@ Use this when you need to:
         .join('\n\n');
 
       return {
-        content: [{ type: 'text' as const, text: `Thread messages (${messages.length} total from ${response.threadJid}):\n\n${formatted}` }],
+        content: [{ type: 'text' as const, text: `Messages (${messages.length} total from ${jid}):\n\n${formatted}` }],
       };
     } catch (err) {
       return {
-        content: [{ type: 'text' as const, text: `Error reading thread: ${err instanceof Error ? err.message : String(err)}` }],
+        content: [{ type: 'text' as const, text: `Error reading messages: ${err instanceof Error ? err.message : String(err)}` }],
         isError: true,
       };
     }

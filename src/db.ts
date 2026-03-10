@@ -616,6 +616,71 @@ export function getThreadMessages(
   }>;
 }
 
+/**
+ * Look up a single message by its platform-specific ID across all chats.
+ * Used when we have a message ID but don't know the chat_jid (e.g., Discord link).
+ */
+export function findMessageById(
+  id: string,
+): { chat_jid: string; timestamp: string; sender_name: string; content: string } | undefined {
+  return db
+    .prepare(
+      `SELECT chat_jid, timestamp, sender_name, content FROM messages WHERE id = ? LIMIT 1`,
+    )
+    .get(id) as
+    | { chat_jid: string; timestamp: string; sender_name: string; content: string }
+    | undefined;
+}
+
+/**
+ * Get messages from a chat_jid centered around a given timestamp.
+ * Returns `limit` messages: half before, half after (or as many as exist).
+ */
+export function getMessagesAroundTimestamp(
+  chatJid: string,
+  timestamp: string,
+  limit: number = 50,
+): Array<{
+  sender_name: string;
+  content: string;
+  timestamp: string;
+  is_from_me: number;
+}> {
+  const half = Math.ceil(limit / 2);
+  // Get messages before (inclusive) and after the timestamp, then merge
+  const before = db
+    .prepare(
+      `SELECT sender_name, content, timestamp, is_from_me
+       FROM messages
+       WHERE chat_jid = ? AND timestamp <= ? AND content != '' AND content IS NOT NULL
+       ORDER BY timestamp DESC
+       LIMIT ?`,
+    )
+    .all(chatJid, timestamp, half) as Array<{
+    sender_name: string;
+    content: string;
+    timestamp: string;
+    is_from_me: number;
+  }>;
+
+  const after = db
+    .prepare(
+      `SELECT sender_name, content, timestamp, is_from_me
+       FROM messages
+       WHERE chat_jid = ? AND timestamp > ? AND content != '' AND content IS NOT NULL
+       ORDER BY timestamp ASC
+       LIMIT ?`,
+    )
+    .all(chatJid, timestamp, half) as Array<{
+    sender_name: string;
+    content: string;
+    timestamp: string;
+    is_from_me: number;
+  }>;
+
+  return [...before.reverse(), ...after];
+}
+
 export function createTask(
   task: Omit<ScheduledTask, 'last_run' | 'last_result'>,
 ): void {

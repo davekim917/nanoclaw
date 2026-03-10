@@ -13,8 +13,11 @@ import { AvailableGroup } from './container-runner.js';
 import {
   createTask,
   deleteTask,
+  findMessageById,
+  getMessagesAroundTimestamp,
   getTaskById,
   getThreadMessages,
+  getThreadOrigin,
   updateTask,
 } from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
@@ -472,6 +475,7 @@ function processQueryIpc(
     channelId?: string;
     threadTs?: string;
     chatJid?: string;
+    messageId?: string;
     limit?: number;
   },
   sourceGroup: string,
@@ -514,14 +518,14 @@ function processQueryIpc(
         break;
       }
 
-      const messages = getThreadMessages(threadJid, data.limit || 100);
+      const messages = getThreadMessages(threadJid, data.limit || 50);
       logger.info(
         { sourceGroup, threadJid, count: messages.length },
         'IPC read_thread query served',
       );
       writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
         status: 'ok',
-        threadJid,
+        chatJid: threadJid,
         messages: messages.map((m) => ({
           sender: m.sender_name,
           content: m.content,
@@ -557,7 +561,7 @@ function processQueryIpc(
         break;
       }
 
-      const msgs = getThreadMessages(data.chatJid, data.limit || 100);
+      const msgs = getThreadMessages(data.chatJid, data.limit || 50);
       logger.info(
         { sourceGroup, chatJid: data.chatJid, count: msgs.length },
         'IPC read_messages query served',
@@ -566,6 +570,63 @@ function processQueryIpc(
         status: 'ok',
         chatJid: data.chatJid,
         messages: msgs.map((m) => ({
+          sender: m.sender_name,
+          content: m.content,
+          timestamp: m.timestamp,
+          is_from_me: m.is_from_me === 1,
+        })),
+      });
+      break;
+    }
+
+    case 'read_discord': {
+      // Read messages from a Discord channel or thread by channel ID.
+      // Resolves thread channel IDs via thread_origins table.
+      // Cross-group reads allowed — URL-is-authorization model.
+      if (!data.channelId) {
+        writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
+          status: 'error',
+          error: 'Missing channelId',
+        });
+        break;
+      }
+
+      // Resolve chat_jid: try direct channel first, then thread_origins
+      let chatJid = `dc:${data.channelId}`;
+      const threadOrigin = getThreadOrigin(data.channelId);
+      if (threadOrigin) {
+        chatJid = `${threadOrigin.parent_jid}:thread:${threadOrigin.origin_message_id}`;
+      }
+
+      let messages;
+      if (data.messageId) {
+        // Specific message linked — find it and return context around it.
+        // Validate it's a Discord message to prevent cross-platform auth bypass.
+        const target = findMessageById(data.messageId);
+        if (target && target.chat_jid.startsWith('dc:')) {
+          // Use the chat_jid from the found message (most reliable)
+          messages = getMessagesAroundTimestamp(
+            target.chat_jid,
+            target.timestamp,
+            data.limit || 50,
+          );
+          chatJid = target.chat_jid;
+        } else {
+          // Message not in DB — fall back to latest from the channel
+          messages = getThreadMessages(chatJid, data.limit || 50);
+        }
+      } else {
+        messages = getThreadMessages(chatJid, data.limit || 50);
+      }
+
+      logger.info(
+        { sourceGroup, chatJid, channelId: data.channelId, count: messages.length },
+        'IPC read_discord query served',
+      );
+      writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
+        status: 'ok',
+        chatJid,
+        messages: messages.map((m) => ({
           sender: m.sender_name,
           content: m.content,
           timestamp: m.timestamp,
