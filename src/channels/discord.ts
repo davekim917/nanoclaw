@@ -280,8 +280,10 @@ export class DiscordChannel implements Channel {
       );
     });
 
-    // Handle button clicks and slash commands
+    // Handle button clicks and slash commands (deploy restricted to #nanoclaw-dev)
+    const deployChannelId = '1480411210183610418';
     this.client.on(Events.InteractionCreate, async (interaction) => {
+      if (interaction.channelId !== deployChannelId) return;
       if (interaction.isButton()) {
         if (interaction.customId.startsWith('deploy:')) {
           await this.handleDeployButton(interaction as ButtonInteraction);
