@@ -590,8 +590,6 @@ export class DiscordChannel implements Channel {
   ): Promise<void> {
     try {
       const rest = new REST({ version: '10' }).setToken(this.botToken);
-      // Clear stale global commands, register guild-only
-      await rest.put(Routes.applicationCommands(clientId), { body: [] });
       await rest.put(Routes.applicationGuildCommands(clientId, guildId), {
         body: [{ name: 'deploy', description: 'Deploy latest main branch' }],
       });
