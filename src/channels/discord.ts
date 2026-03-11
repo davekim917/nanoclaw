@@ -284,9 +284,7 @@ export class DiscordChannel implements Channel {
     this.client.on(Events.InteractionCreate, async (interaction) => {
       if (interaction.isButton()) {
         if (interaction.customId.startsWith('deploy:')) {
-          await this.handleDeployButton(
-            interaction as ButtonInteraction,
-          );
+          await this.handleDeployButton(interaction as ButtonInteraction);
         }
       } else if (interaction.isChatInputCommand()) {
         if (interaction.commandName === 'deploy') {
@@ -585,9 +583,7 @@ export class DiscordChannel implements Channel {
     try {
       const rest = new REST({ version: '10' }).setToken(this.botToken);
       await rest.put(Routes.applicationCommands(clientId), {
-        body: [
-          { name: 'deploy', description: 'Deploy latest main branch' },
-        ],
+        body: [{ name: 'deploy', description: 'Deploy latest main branch' }],
       });
       logger.info('Discord slash commands registered');
     } catch (err) {
@@ -604,10 +600,10 @@ export class DiscordChannel implements Channel {
 
     try {
       const { execSync } = await import('child_process');
-      const result = execSync(
-        `gh pr view "${prUrl}" --json state -q .state`,
-        { encoding: 'utf-8', timeout: 15000 },
-      ).trim();
+      const result = execSync(`gh pr view "${prUrl}" --json state -q .state`, {
+        encoding: 'utf-8',
+        timeout: 15000,
+      }).trim();
 
       if (result !== 'MERGED') {
         await interaction.editReply(
@@ -616,9 +612,7 @@ export class DiscordChannel implements Channel {
         return;
       }
 
-      await interaction.editReply(
-        'PR is merged. Deploying latest main...',
-      );
+      await interaction.editReply('PR is merged. Deploying latest main...');
       this.runDetachedDeploy();
     } catch (err) {
       logger.error({ err, prUrl }, 'Deploy button handler error');

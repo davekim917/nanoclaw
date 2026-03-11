@@ -17,10 +17,6 @@ Note: Your name may differ by channel. Check your group-level CLAUDE.md for any 
 | Number Drinks | number-drinks | Side business — non-software, business admin |
 | Personal | personal | Email triage, brainstorms, general admin |
 
-## Timezone
-
-Dave is in Eastern time (America/New_York). Always display times, timestamps, and schedules in Eastern time. Never show UTC times to Dave unless he specifically asks.
-
 ## What You Can Do
 
 - Answer questions and have conversations
