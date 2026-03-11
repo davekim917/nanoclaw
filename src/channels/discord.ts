@@ -312,7 +312,10 @@ export class DiscordChannel implements Channel {
         console.log(
           `  Use /chatid command or check channel IDs in Discord settings\n`,
         );
-        await this.registerSlashCommands(readyClient.user.id);
+        const guild = readyClient.guilds.cache.first();
+        if (guild) {
+          await this.registerSlashCommands(readyClient.user.id, guild.id);
+        }
         resolve();
       });
 
@@ -581,10 +584,13 @@ export class DiscordChannel implements Channel {
     }
   }
 
-  private async registerSlashCommands(clientId: string): Promise<void> {
+  private async registerSlashCommands(
+    clientId: string,
+    guildId: string,
+  ): Promise<void> {
     try {
       const rest = new REST({ version: '10' }).setToken(this.botToken);
-      await rest.put(Routes.applicationCommands(clientId), {
+      await rest.put(Routes.applicationGuildCommands(clientId, guildId), {
         body: [{ name: 'deploy', description: 'Deploy latest main branch' }],
       });
       logger.info('Discord slash commands registered');
