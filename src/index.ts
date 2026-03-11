@@ -54,7 +54,6 @@ import {
   getNewMessages,
   getRouterState,
   initDatabase,
-  hasUserMessageAtTimestamp,
   pruneThreadOrigins,
   setRegisteredGroup,
   setRouterState,
@@ -923,25 +922,11 @@ function recoverPendingMessages(): void {
         queue.enqueueMessageCheck(chatJid, threadJid, parsedThread?.threadId);
       }
 
-      // Unstick cursors where the cursor exactly matches the latest user message
-      // timestamp. This happens when a SIGTERM kills the container after the
-      // cursor was advanced in-memory but before saveState() was called. Since
-      // the old code saved state eagerly, the DB cursor ends up pointing exactly
-      // at an unanswered message. Nudge the cursor back 1ms so recovery picks it up.
-      for (const [jid, ts] of Object.entries(lastAgentTimestamp)) {
-        if (!jid.startsWith(chatJid + ':thread:')) continue;
-        if (!ts) continue;
-        if (hasUserMessageAtTimestamp(jid, ts)) {
-          const prevMs = new Date(ts).getTime() - 1;
-          lastAgentTimestamp[jid] = new Date(prevMs).toISOString();
-          const parsedThread = parseThreadJid(jid);
-          logger.info(
-            { group: group.name, threadJid: jid },
-            'Recovery: unstuck stuck thread cursor',
-          );
-          queue.enqueueMessageCheck(chatJid, jid, parsedThread?.threadId);
-        }
-      }
+      // NOTE: Previous "unstick" logic lived here — it nudged cursors back 1ms
+      // when the cursor exactly matched a user message timestamp. This caused
+      // false positives on every restart because the cursor is always set to
+      // the last user message timestamp. The root cause (lost in-memory cursor
+      // on SIGTERM) is now fixed by calling saveState() in the shutdown handler.
     }
   }
 }
@@ -1105,6 +1090,11 @@ async function main(): Promise<void> {
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
+    // Persist in-memory cursor positions before exiting. Containers that
+    // advanced cursors (via processGroupMessages or pipe) but haven't
+    // completed yet would otherwise lose those advances, causing message
+    // re-processing on the next startup.
+    saveState();
     await queue.shutdown(10000);
     for (const ch of channels) await ch.disconnect();
     try {

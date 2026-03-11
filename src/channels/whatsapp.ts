@@ -231,9 +231,9 @@ export class WhatsAppChannel implements Channel {
                   groupFolder: group.folder,
                   filename: 'image.jpg',
                   mimeType: normalized.imageMessage.mimetype || 'image/jpeg',
-                  expectedSize: Number(
-                    normalized.imageMessage.fileLength || 0,
-                  ) || undefined,
+                  expectedSize:
+                    Number(normalized.imageMessage.fileLength || 0) ||
+                    undefined,
                   fetchFn: async () => {
                     const buffer = await downloadMediaMessage(
                       msg,
@@ -264,9 +264,9 @@ export class WhatsAppChannel implements Channel {
                   groupFolder: group.folder,
                   filename: docName,
                   mimeType: docMime,
-                  expectedSize: Number(
-                    normalized.documentMessage.fileLength || 0,
-                  ) || undefined,
+                  expectedSize:
+                    Number(normalized.documentMessage.fileLength || 0) ||
+                    undefined,
                   fetchFn: async () => {
                     const buffer = await downloadMediaMessage(
                       msg,
