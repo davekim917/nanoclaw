@@ -114,6 +114,28 @@ function createSchema(database: Database.Database): void {
     );
   `);
 
+  // Thread search: FTS5 full-text search + metadata for cross-thread search (Plan C)
+  // FTS5 indexes only thread_key + topic_summary. Group scoping is enforced
+  // by joining with thread_metadata.group_folder (not via FTS5 column).
+  database.exec(`
+    CREATE VIRTUAL TABLE IF NOT EXISTS thread_search USING fts5(
+      thread_key UNINDEXED,
+      topic_summary
+    );
+
+    CREATE TABLE IF NOT EXISTS thread_metadata (
+      thread_key TEXT PRIMARY KEY,
+      group_folder TEXT NOT NULL,
+      thread_id TEXT NOT NULL,
+      platform TEXT NOT NULL,
+      topic_summary TEXT,
+      created_at TEXT NOT NULL,
+      last_activity TEXT NOT NULL,
+      indexed_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_thread_meta_group ON thread_metadata(group_folder);
+  `);
+
   // Migrate existing sessions into sessions_v2 (skip if already migrated)
   const v2Count = (
     database.prepare('SELECT COUNT(*) AS c FROM sessions_v2').get() as {
@@ -953,6 +975,88 @@ export function getAllSessionsV2(): Map<string, string> {
     result.set(row.session_key, row.session_id);
   }
   return result;
+}
+
+// --- Thread search accessors (Plan C: FTS5 + Haiku reranking) ---
+
+export interface ThreadMetadataRow {
+  thread_key: string;
+  group_folder: string;
+  thread_id: string;
+  platform: string;
+  topic_summary: string | null;
+  created_at: string;
+  last_activity: string;
+  indexed_at: string | null;
+}
+
+/** Returns true if the index was actually updated, false if skipped (unchanged). */
+export function upsertThreadIndex(
+  threadKey: string,
+  groupFolder: string,
+  threadId: string,
+  platform: string,
+  summary: string,
+): boolean {
+  const now = new Date().toISOString();
+
+  // Check if already indexed with the same summary (skip re-index)
+  const existing = db
+    .prepare('SELECT topic_summary FROM thread_metadata WHERE thread_key = ?')
+    .get(threadKey) as { topic_summary: string | null } | undefined;
+
+  if (existing?.topic_summary === summary) return false;
+
+  db.transaction(() => {
+    // Remove old FTS5 entry if exists, then re-insert with updated summary
+    if (existing) {
+      db.prepare('DELETE FROM thread_search WHERE thread_key = ?').run(
+        threadKey,
+      );
+    }
+
+    // Insert into FTS5
+    db.prepare(
+      'INSERT INTO thread_search (thread_key, topic_summary) VALUES (?, ?)',
+    ).run(threadKey, summary);
+
+    // Upsert metadata
+    db.prepare(
+      `INSERT INTO thread_metadata (thread_key, group_folder, thread_id, platform, topic_summary, created_at, last_activity, indexed_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(thread_key) DO UPDATE SET
+         topic_summary = excluded.topic_summary,
+         last_activity = excluded.last_activity,
+         indexed_at = excluded.indexed_at`,
+    ).run(threadKey, groupFolder, threadId, platform, summary, now, now, now);
+  })();
+
+  return true;
+}
+
+export function searchThreadsFTS(
+  groupFolder: string,
+  query: string,
+  limit: number = 20,
+): ThreadMetadataRow[] {
+  // FTS5 MATCH on topic_summary, group scoping via metadata join
+  return db
+    .prepare(
+      `SELECT m.* FROM thread_search s
+       JOIN thread_metadata m ON m.thread_key = s.thread_key
+       WHERE s.topic_summary MATCH ? AND m.group_folder = ?
+       ORDER BY s.rank
+       LIMIT ?`,
+    )
+    .all(query, groupFolder, limit) as ThreadMetadataRow[];
+}
+
+export function getThreadMetadata(
+  threadKey: string,
+): ThreadMetadataRow | undefined {
+  return db
+    .prepare('SELECT * FROM thread_metadata WHERE thread_key = ?')
+    .get(threadKey) as ThreadMetadataRow | undefined;
 }
 
 export function getRecentMessages(

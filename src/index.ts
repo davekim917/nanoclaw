@@ -78,6 +78,7 @@ import {
   shouldDropMessage,
 } from './sender-allowlist.js';
 import { startSchedulerLoop } from './task-scheduler.js';
+import { indexSingleThread, indexThreadSummaries } from './thread-search.js';
 import { checkUserOverride, shouldResetSession } from './topic-classifier.js';
 import { Attachment, Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
@@ -631,6 +632,16 @@ async function runAgent(
           'Worktree cleanup error',
         ),
       );
+
+      // Index this thread's summary (if PreCompact wrote one).
+      // Only indexes the single thread that just completed — not a full scan.
+      setImmediate(() => {
+        try {
+          indexSingleThread(group.folder, threadId);
+        } catch (err) {
+          logger.warn({ err }, 'Post-run thread indexing failed (non-fatal)');
+        }
+      });
     }
 
     if (output.status === 'error') {
@@ -1070,6 +1081,14 @@ async function main(): Promise<void> {
   initDatabase();
   logger.info('Database initialized');
   loadState();
+
+  // Index thread summaries from previous runs (catches crash-orphaned summaries)
+  try {
+    const indexed = indexThreadSummaries();
+    if (indexed > 0) logger.info({ indexed }, 'Startup thread index complete');
+  } catch (err) {
+    logger.warn({ err }, 'Startup thread indexing failed (non-fatal)');
+  }
 
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {

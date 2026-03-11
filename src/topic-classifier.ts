@@ -7,7 +7,7 @@
  * 3. Ambiguous zone (5-30 min): call Haiku to classify topic change
  */
 
-import { readEnvFile } from './env.js';
+import { getAnthropicApiKey } from './env.js';
 import { logger } from './logger.js';
 
 const SHORT_CIRCUIT_MINUTES = 5;
@@ -69,21 +69,11 @@ export function checkUserOverride(content: string): 'new' | 'continue' | null {
   return null;
 }
 
-let cachedApiKey: string | undefined;
-function getApiKey(): string {
-  if (!cachedApiKey) {
-    cachedApiKey = readEnvFile(['ANTHROPIC_API_KEY']).ANTHROPIC_API_KEY;
-  }
-  if (!cachedApiKey)
-    throw new Error('ANTHROPIC_API_KEY not available for topic classifier');
-  return cachedApiKey;
-}
-
 async function classifyWithHaiku(
   recentMessages: Array<{ content: string; is_from_me: boolean }>,
   newMessage: string,
 ): Promise<boolean> {
-  const apiKey = getApiKey();
+  const apiKey = getAnthropicApiKey();
 
   // Build context from recent messages (last 5)
   const context = recentMessages

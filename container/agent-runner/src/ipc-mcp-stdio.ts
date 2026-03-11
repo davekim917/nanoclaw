@@ -443,6 +443,130 @@ Supports:
   },
 );
 
+server.tool(
+  'search_threads',
+  `Search past conversation threads in this group by keyword or topic. Returns matching threads ranked by relevance.
+
+Use this when you need to:
+• Find a past discussion about a specific topic
+• Recall context from a previous thread
+• Reference earlier work or decisions
+• Answer "did we discuss X before?"
+
+Returns thread summaries with thread keys. Use read_thread_by_key to get full messages from a found thread.
+
+Note: only threads with a generated summary are searchable. Very new or short threads that haven't been compacted may not appear in results.`,
+  {
+    query: z.string().describe('Search query — keywords or natural language description of the topic'),
+    limit: z.number().max(20).optional().default(5).describe('Maximum number of results (default: 5, max: 20)'),
+  },
+  async (args) => {
+    try {
+      const requestId = writeQueryFile({
+        type: 'search_threads',
+        query: args.query,
+        limit: args.limit,
+      });
+
+      const response = await waitForResponse(requestId) as {
+        status: string;
+        error?: string;
+        results?: Array<{
+          thread_key: string;
+          thread_id: string;
+          platform: string;
+          topic_summary: string;
+          last_activity: string;
+        }>;
+      };
+
+      if (response.status !== 'ok') {
+        return {
+          content: [{ type: 'text' as const, text: `Error: ${response.error || 'Unknown error'}` }],
+          isError: true,
+        };
+      }
+
+      const results = response.results || [];
+      if (results.length === 0) {
+        return {
+          content: [{ type: 'text' as const, text: `No threads found matching "${args.query}".` }],
+        };
+      }
+
+      const formatted = results
+        .map((r, i) => `${i + 1}. **${r.topic_summary}**\n   Thread: ${r.thread_id} (${r.platform})\n   Last active: ${r.last_activity}`)
+        .join('\n\n');
+
+      return {
+        content: [{ type: 'text' as const, text: `Found ${results.length} matching thread(s):\n\n${formatted}` }],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: 'text' as const, text: `Error searching threads: ${err instanceof Error ? err.message : String(err)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
+  'read_thread_by_key',
+  `Read full messages from a thread using its thread_key (returned by search_threads).
+
+This is the companion tool to search_threads. After finding relevant threads via search, use this tool to load the full conversation.
+
+Workflow: search_threads → get thread_key → read_thread_by_key → full messages`,
+  {
+    thread_key: z.string().describe('Thread key from search_threads results (e.g., "illysium:thread:1773071476.205929")'),
+    limit: z.number().optional().default(100).describe('Maximum number of messages to return (default: 100)'),
+  },
+  async (args) => {
+    try {
+      const requestId = writeQueryFile({
+        type: 'read_thread_by_key',
+        threadKey: args.thread_key,
+        limit: args.limit,
+      });
+
+      const response = await waitForResponse(requestId) as {
+        status: string;
+        error?: string;
+        chatJid?: string;
+        threadKey?: string;
+        messages?: Array<{ sender: string; content: string; timestamp: string; is_from_me: boolean }>;
+      };
+
+      if (response.status !== 'ok') {
+        return {
+          content: [{ type: 'text' as const, text: `Error: ${response.error || 'Unknown error'}` }],
+          isError: true,
+        };
+      }
+
+      const messages = response.messages || [];
+      if (messages.length === 0) {
+        return {
+          content: [{ type: 'text' as const, text: `No messages found for thread ${args.thread_key}. The thread may have been archived or messages may have been purged.` }],
+        };
+      }
+
+      const formatted = messages
+        .map((m) => `[${m.timestamp}] ${m.sender}: ${m.content}`)
+        .join('\n\n');
+
+      return {
+        content: [{ type: 'text' as const, text: `Messages from thread ${args.thread_key} (${messages.length} total):\n\n${formatted}` }],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: 'text' as const, text: `Error reading thread: ${err instanceof Error ? err.message : String(err)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
 // Start the stdio transport
 const transport = new StdioServerTransport();
 await server.connect(transport);

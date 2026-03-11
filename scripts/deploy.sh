@@ -3,7 +3,7 @@
 # Spawned detached so it survives the systemctl restart.
 set -e
 
-cd /root/nanoclaw
+cd /home/ubuntu/nanoclaw
 
 echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Deploy started" >> logs/deploy.log
 

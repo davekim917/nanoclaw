@@ -3,7 +3,7 @@
 ## Server Details
 - **Hetzner (source):** root@88.198.229.116 (SSH key: nanoclaw-ssh-key)
 - **Oracle (target):** ubuntu@129.153.28.75 (SSH key: nanoclaw-ssh-key)
-- **Key change:** root user → ubuntu user, `/root/` → `/home/ubuntu/`
+- **Key change:** root user → ubuntu user, `/home/ubuntu/` → `/home/ubuntu/`
 
 ---
 
@@ -354,17 +354,17 @@ git pull origin main
 
 ---
 
-## PHASE 5: Fix all paths (`/root/` → `/home/ubuntu/`)
+## PHASE 5: Fix all paths (`/home/ubuntu/` → `/home/ubuntu/`)
 
-This is the most critical phase. Every file that references `/root/` must be updated.
+This is the most critical phase. Every file that references `/home/ubuntu/` must be updated.
 
 ### Step 5.1 — Fix nanoclaw config files
 
 ```bash
 cd ~/nanoclaw
 
-# Find every config file that references /root/
-grep -rl "/root/" \
+# Find every config file that references /home/ubuntu/
+grep -rl "/home/ubuntu/" \
   --include="*.env" \
   --include="*.json" \
   --include="*.yaml" \
@@ -378,7 +378,7 @@ grep -rl "/root/" \
 
 Review this list. Then apply the fix:
 ```bash
-grep -rl "/root/" \
+grep -rl "/home/ubuntu/" \
   --include="*.env" \
   --include="*.json" \
   --include="*.yaml" \
@@ -389,16 +389,16 @@ grep -rl "/root/" \
   --include="*.service" \
   . 2>/dev/null | grep -v node_modules | grep -v .git | while read f; do
     echo "Fixing: $f"
-    sed -i 's|/root/|/home/ubuntu/|g' "$f"
+    sed -i 's|/home/ubuntu/|/home/ubuntu/|g' "$f"
 done
 ```
 
-**IMPORTANT:** We replace `/root/` (with trailing slash) not `/root` (without). This avoids mangling strings like `-root-nanoclaw` in Claude project paths.
+**IMPORTANT:** We replace `/home/ubuntu/` (with trailing slash) not `/root` (without). This avoids mangling strings like `-root-nanoclaw` in Claude project paths.
 
 ### Step 5.2 — Fix Snowflake config
 ```bash
-sed -i 's|/root/|/home/ubuntu/|g' ~/.snowflake/config.toml
-sed -i 's|/root/|/home/ubuntu/|g' ~/.snowflake/connections.toml
+sed -i 's|/home/ubuntu/|/home/ubuntu/|g' ~/.snowflake/config.toml
+sed -i 's|/home/ubuntu/|/home/ubuntu/|g' ~/.snowflake/connections.toml
 ```
 
 Verify all 5 connections now point to `/home/ubuntu/`:
@@ -417,8 +417,8 @@ Should show `/home/ubuntu/.snowflake/logs`.
 
 ### Step 5.3 — Fix Claude Code settings
 ```bash
-sed -i 's|/root/|/home/ubuntu/|g' ~/.claude/settings.json
-sed -i 's|/root/|/home/ubuntu/|g' ~/.claude.json
+sed -i 's|/home/ubuntu/|/home/ubuntu/|g' ~/.claude/settings.json
+sed -i 's|/home/ubuntu/|/home/ubuntu/|g' ~/.claude.json
 ```
 
 Verify:
@@ -471,7 +471,7 @@ Should show `"path": "/home/ubuntu"`.
 
 ### Step 5.6 — Fix the auto-update script
 ```bash
-sed -i 's|/root/|/home/ubuntu/|g' ~/scripts/nanoclaw-auto-update.sh
+sed -i 's|/home/ubuntu/|/home/ubuntu/|g' ~/scripts/nanoclaw-auto-update.sh
 ```
 
 Verify:
@@ -479,7 +479,7 @@ Verify:
 cat ~/scripts/nanoclaw-auto-update.sh
 ```
 
-Should reference `/home/ubuntu/nanoclaw` not `/root/nanoclaw`.
+Should reference `/home/ubuntu/nanoclaw` not `/home/ubuntu/nanoclaw`.
 
 Make it executable:
 ```bash
@@ -491,9 +491,9 @@ chmod +x ~/scripts/nanoclaw-auto-update.sh
 cd ~/systemd-backup
 
 # Fix all three files
-sed -i 's|/root/|/home/ubuntu/|g' nanoclaw.service
+sed -i 's|/home/ubuntu/|/home/ubuntu/|g' nanoclaw.service
 sed -i 's|/root|/home/ubuntu|g' nanoclaw.service
-sed -i 's|/root/|/home/ubuntu/|g' nanoclaw-update.service
+sed -i 's|/home/ubuntu/|/home/ubuntu/|g' nanoclaw-update.service
 sed -i 's|/root|/home/ubuntu|g' nanoclaw-update.service
 ```
 
@@ -561,32 +561,32 @@ sudo systemctl daemon-reload
 
 ### Step 5.9 — Fix the deploy script
 ```bash
-sed -i 's|/root/|/home/ubuntu/|g' ~/nanoclaw/scripts/deploy.sh
+sed -i 's|/home/ubuntu/|/home/ubuntu/|g' ~/nanoclaw/scripts/deploy.sh
 chmod +x ~/nanoclaw/scripts/deploy.sh
 ```
 
 ### Step 5.10 — Fix any remaining files in .claude directory
 ```bash
-find ~/.claude -type f \( -name "*.json" -o -name "*.sh" -o -name "*.md" \) -exec grep -l "/root/" {} \; 2>/dev/null | while read f; do
+find ~/.claude -type f \( -name "*.json" -o -name "*.sh" -o -name "*.md" \) -exec grep -l "/home/ubuntu/" {} \; 2>/dev/null | while read f; do
     echo "Fixing: $f"
-    sed -i 's|/root/|/home/ubuntu/|g' "$f"
+    sed -i 's|/home/ubuntu/|/home/ubuntu/|g' "$f"
 done
 ```
 
 ### Step 5.11 — Final sweep: check nothing was missed
 ```bash
 echo "=== nanoclaw directory ==="
-grep -r "/root/" ~/nanoclaw/ \
+grep -r "/home/ubuntu/" ~/nanoclaw/ \
   --include="*.env" --include="*.json" --include="*.yaml" \
   --include="*.yml" --include="*.sh" --include="*.conf" \
   --include="*.toml" --include="*.service" --include="*.md" \
   2>/dev/null | grep -v node_modules | grep -v ".git/" | grep -v ".trash/"
 
 echo "=== snowflake ==="
-grep -r "/root/" ~/.snowflake/ 2>/dev/null
+grep -r "/home/ubuntu/" ~/.snowflake/ 2>/dev/null
 
 echo "=== claude ==="
-grep -r "/root/" ~/.claude/settings.json ~/.claude.json 2>/dev/null
+grep -r "/home/ubuntu/" ~/.claude/settings.json ~/.claude.json 2>/dev/null
 
 echo "=== systemd ==="
 grep -r "/root" /etc/systemd/system/nanoclaw* 2>/dev/null
@@ -759,7 +759,7 @@ tail -f ~/nanoclaw/logs/nanoclaw.log
 Watch for 1-2 minutes. Look for:
 - "listening" or "connected" messages (good)
 - "ENOENT" or "not found" errors (missing files — path issue)
-- "/root/" appearing anywhere (missed a path fix)
+- "/home/ubuntu/" appearing anywhere (missed a path fix)
 - WhatsApp auth errors (need to re-pair — see Step 7.3)
 - "EACCES" or "permission denied" (ownership issue — re-run Step 6.1)
 
@@ -850,8 +850,8 @@ Delete the Hetzner server from the Hetzner Console UI.
 # Check the exact error
 sudo journalctl -u nanoclaw --no-pager -n 50
 
-# Most common: leftover /root/ path
-grep -r "/root/" /etc/systemd/system/nanoclaw* ~/nanoclaw/.env
+# Most common: leftover /home/ubuntu/ path
+grep -r "/home/ubuntu/" /etc/systemd/system/nanoclaw* ~/nanoclaw/.env
 ```
 
 ### "Permission denied" errors
@@ -898,13 +898,13 @@ cat ~/.config/nanoclaw/mount-allowlist.json
 # Should show /home/ubuntu, not /root
 ```
 
-### Logs show "/root/" in error messages
+### Logs show "/home/ubuntu/" in error messages
 ```bash
 # Nuclear option: find and fix every remaining reference
 find ~ -type f -not -path "*/node_modules/*" -not -path "*/.git/*" \
   \( -name "*.env" -o -name "*.json" -o -name "*.toml" -o -name "*.sh" \
      -o -name "*.service" -o -name "*.conf" -o -name "*.yaml" -o -name "*.yml" \) \
-  -exec grep -l "/root/" {} \; 2>/dev/null
+  -exec grep -l "/home/ubuntu/" {} \; 2>/dev/null
 # Fix each file found
 ```
 

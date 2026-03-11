@@ -40,3 +40,17 @@ export function readEnvFile(keys: string[]): Record<string, string> {
 
   return result;
 }
+
+/**
+ * Cached Anthropic API key reader.
+ * Shared by topic-classifier.ts and thread-search.ts to avoid
+ * duplicate caching logic.
+ */
+let cachedApiKey: string | undefined;
+export function getAnthropicApiKey(): string {
+  if (!cachedApiKey) {
+    cachedApiKey = readEnvFile(['ANTHROPIC_API_KEY']).ANTHROPIC_API_KEY;
+  }
+  if (!cachedApiKey) throw new Error('ANTHROPIC_API_KEY not found in .env');
+  return cachedApiKey;
+}

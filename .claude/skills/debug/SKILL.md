@@ -24,7 +24,7 @@ src/container-runner.ts               container/agent-runner/
     └── (main only) project root ──> /workspace/project
 ```
 
-**Important:** The container runs as user `node` with `HOME=/home/node`. Session files must be mounted to `/home/node/.claude/` (not `/root/.claude/`) for session resumption to work.
+**Important:** The container runs as user `node` with `HOME=/home/node`. Session files must be mounted to `/home/node/.claude/` (not `/home/ubuntu/.claude/`) for session resumption to work.
 
 ## Log Locations
 
@@ -148,7 +148,7 @@ If sessions aren't being resumed (new session ID every time), or Claude Code exi
 
 **Check the mount path:**
 ```bash
-# In container-runner.ts, verify mount is to /home/node/.claude/, NOT /root/.claude/
+# In container-runner.ts, verify mount is to /home/node/.claude/, NOT /home/ubuntu/.claude/
 grep -A3 "Claude sessions" src/container-runner.ts
 ```
 
@@ -166,7 +166,7 @@ ls -la $HOME/.claude/projects/ 2>&1 | head -5
 ```typescript
 mounts.push({
   hostPath: claudeDir,
-  containerPath: '/home/node/.claude',  // NOT /root/.claude
+  containerPath: '/home/node/.claude',  // NOT /home/ubuntu/.claude
   readonly: false
 });
 ```
@@ -267,7 +267,7 @@ Claude sessions are stored per-group in `data/sessions/{group}/.claude/` for sec
 **Critical:** The mount path must match the container user's HOME directory:
 - Container user: `node`
 - Container HOME: `/home/node`
-- Mount target: `/home/node/.claude/` (NOT `/root/.claude/`)
+- Mount target: `/home/node/.claude/` (NOT `/home/ubuntu/.claude/`)
 
 To clear sessions:
 
@@ -335,7 +335,7 @@ echo -e "\n4. Container image exists?"
 echo '{}' | docker run -i --entrypoint /bin/echo nanoclaw-agent:latest "OK" 2>/dev/null || echo "MISSING - run ./container/build.sh"
 
 echo -e "\n5. Session mount path correct?"
-grep -q "/home/node/.claude" src/container-runner.ts 2>/dev/null && echo "OK" || echo "WRONG - should mount to /home/node/.claude/, not /root/.claude/"
+grep -q "/home/node/.claude" src/container-runner.ts 2>/dev/null && echo "OK" || echo "WRONG - should mount to /home/node/.claude/, not /home/ubuntu/.claude/"
 
 echo -e "\n6. Groups directory?"
 ls -la groups/ 2>/dev/null || echo "MISSING - run setup"

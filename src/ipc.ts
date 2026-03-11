@@ -17,9 +17,11 @@ import {
   getMessagesAroundTimestamp,
   getTaskById,
   getThreadMessages,
+  getThreadMetadata,
   getThreadOrigin,
   updateTask,
 } from './db.js';
+import { searchThreads } from './thread-search.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
@@ -499,6 +501,8 @@ function processQueryIpc(
     chatJid?: string;
     messageId?: string;
     limit?: number;
+    query?: string;
+    threadKey?: string;
   },
   sourceGroup: string,
   isMain: boolean,
@@ -645,6 +649,106 @@ function processQueryIpc(
         chatJid,
         messages: formatMessagesForIpc(messages),
       });
+      break;
+    }
+
+    case 'read_thread_by_key': {
+      // Read thread messages using a thread_key from search_threads results.
+      // Resolves the chat_jid by trying each registered parent JID for the group.
+      if (!data.threadKey) {
+        writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
+          status: 'error',
+          error: 'Missing threadKey',
+        });
+        break;
+      }
+
+      const meta = getThreadMetadata(data.threadKey);
+      if (!meta) {
+        writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
+          status: 'error',
+          error: 'Thread not found in index',
+        });
+        break;
+      }
+
+      // Security: verify the thread belongs to the requesting group
+      if (!isMain && meta.group_folder !== sourceGroup) {
+        logger.warn(
+          { sourceGroup, threadKey: data.threadKey },
+          'Unauthorized read_thread_by_key attempt blocked',
+        );
+        writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
+          status: 'error',
+          error: 'Unauthorized: thread not accessible to this group',
+        });
+        break;
+      }
+
+      // Find the chat_jid by trying each registered parent JID for this group.
+      // Thread chat_jids are "{parentJid}:thread:{threadId}" in the messages table.
+      const parentJids = Object.entries(registeredGroups)
+        .filter(([, g]) => g.folder === meta.group_folder)
+        .map(([jid]) => jid);
+
+      let found = false;
+      for (const parentJid of parentJids) {
+        const chatJid = `${parentJid}:thread:${meta.thread_id}`;
+        const msgs = getThreadMessages(chatJid, data.limit || 100);
+        if (msgs.length > 0) {
+          logger.info(
+            { sourceGroup, chatJid, count: msgs.length },
+            'IPC read_thread_by_key query served',
+          );
+          writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
+            status: 'ok',
+            chatJid,
+            threadKey: data.threadKey,
+            messages: formatMessagesForIpc(msgs),
+          });
+          found = true;
+          break;
+        }
+      }
+
+      if (!found) {
+        writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
+          status: 'ok',
+          threadKey: data.threadKey,
+          messages: [],
+        });
+      }
+      break;
+    }
+
+    case 'search_threads': {
+      if (!data.query) {
+        writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
+          status: 'error',
+          error: 'Missing query',
+        });
+        break;
+      }
+
+      // Security: scope search to sourceGroup (derived from IPC directory, not payload)
+      searchThreads(sourceGroup, data.query, data.limit || 5)
+        .then((results) => {
+          logger.info(
+            { sourceGroup, query: data.query, count: results.length },
+            'IPC search_threads query served',
+          );
+          writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
+            status: 'ok',
+            results,
+          });
+        })
+        .catch((err) => {
+          logger.error({ err, sourceGroup }, 'search_threads query failed');
+          writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
+            status: 'error',
+            error: 'Search failed',
+          });
+        });
       break;
     }
 
