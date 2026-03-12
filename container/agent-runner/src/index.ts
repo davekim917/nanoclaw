@@ -800,8 +800,8 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Credentials are injected by the host's credential proxy via ANTHROPIC_BASE_URL.
-  // No real secrets exist in the container environment.
+  // Credentials are injected via stdin JSON pipe (secrets field).
+  // The entrypoint sets them as env vars; they never touch disk.
   const sdkEnv: Record<string, string | undefined> = { ...process.env };
 
   // Set model for this container run (per-message flag > session sticky > per-group > global default)
