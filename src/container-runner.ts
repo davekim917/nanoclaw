@@ -41,6 +41,7 @@ import {
 } from './container-runtime.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
+import YAML from 'yaml';
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
@@ -1079,6 +1080,37 @@ function buildVolumeMounts(
           readonly: true,
         });
       }
+    }
+  }
+
+  // dbt profiles — gated by tools config.
+  // 'dbt' = all profiles, 'dbt:sunday-snowflake-db' = only that profile.
+  if (isToolEnabled(tools, 'dbt')) {
+    const dbtDir = path.join(homeDir, '.dbt');
+    const origProfiles = path.join(dbtDir, 'profiles.yml');
+    if (fs.existsSync(origProfiles)) {
+      const { scopes, isScoped } = extractToolScopes(tools, 'dbt');
+      const stagingDir = path.join(DATA_DIR, 'sessions', group.folder, 'dbt');
+      fs.mkdirSync(stagingDir, { recursive: true });
+
+      let profiles = YAML.parse(fs.readFileSync(origProfiles, 'utf-8'));
+      if (isScoped) {
+        const filtered: Record<string, unknown> = {};
+        for (const name of scopes) {
+          if (profiles[name] !== undefined) filtered[name] = profiles[name];
+        }
+        profiles = filtered;
+      }
+
+      fs.writeFileSync(
+        path.join(stagingDir, 'profiles.yml'),
+        YAML.stringify(profiles),
+      );
+      mounts.push({
+        hostPath: stagingDir,
+        containerPath: '/home/node/.dbt',
+        readonly: true,
+      });
     }
   }
 

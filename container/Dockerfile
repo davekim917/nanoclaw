@@ -40,6 +40,11 @@ RUN apt-get update && apt-get install -y python3 python3-pip python3-venv \
     && ln -s /opt/snow-venv/bin/snow /usr/local/bin/snow \
     && rm -rf /var/lib/apt/lists/*
 
+# Install dbt-core + dbt-snowflake adapter (separate venv to avoid connector conflicts with snow CLI)
+RUN python3 -m venv /opt/dbt-venv \
+    && /opt/dbt-venv/bin/pip install dbt-core==1.11.7 dbt-snowflake==1.11.3 \
+    && ln -s /opt/dbt-venv/bin/dbt /usr/local/bin/dbt
+
 # Set Chromium path for agent-browser
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium

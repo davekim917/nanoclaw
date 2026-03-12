@@ -88,6 +88,24 @@ Available connections are listed in `~/.snowflake/connections.toml`. Common ones
 
 Always specify `-c <connection>` to pick the right database. If unsure which connection to use, check `cat ~/.snowflake/connections.toml`.
 
+## dbt
+
+If `~/.dbt/profiles.yml` exists, you have dbt access via the `dbt` CLI. Use it to run models, tests, and compile SQL:
+
+```bash
+dbt run --profiles-dir ~/.dbt --profile <profile_name> --project-dir <path_to_dbt_project>
+dbt test --profiles-dir ~/.dbt --profile <profile_name> --project-dir <path_to_dbt_project>
+dbt compile --profiles-dir ~/.dbt --profile <profile_name> --project-dir <path_to_dbt_project>
+dbt debug --profiles-dir ~/.dbt --profile <profile_name>
+```
+
+Available profiles are listed in `~/.dbt/profiles.yml`. Common ones:
+- `sunday-snowflake-db` — Sunday/Prairie-Dev (getsunday_analytics)
+- `apollo-snowflake` — Apollo/William Grant (APOLLO_DEVELOPMENT / APOLLO_WILLIAMGRANT)
+- `xzo-snowflake` — XZO (XZO_DEV / XZO_PROD)
+
+Always specify `--profile <name>` to pick the right database. If unsure, check `cat ~/.dbt/profiles.yml`.
+
 ## GitHub Workflow
 
 When asked to make code changes or open PRs:
