@@ -842,14 +842,19 @@ async function main(): Promise<void> {
   const mcpServerPath = path.join(__dirname, 'ipc-mcp-stdio.js');
 
   // Build systemPrompt once — chatJid and global CLAUDE.md are invariant for the container lifetime.
-  // channelFormatting is placed AFTER globalClaudeMd so it overrides the WA/Telegram formatting
-  // rule in global CLAUDE.md for Slack/Discord groups. This also ensures globalContext:false groups
-  // (no /workspace/global mount) still receive channel-appropriate formatting guidance.
+  // channelFormatting is only injected for globalContext:false groups (those without the global
+  // CLAUDE.md mounted). MAIN groups get formatting via /workspace/project SDK auto-load;
+  // non-MAIN globalContext:true groups get it via /workspace/global/CLAUDE.md. Only groups with
+  // no global mount at all (identified by isMain:false + file absence) need explicit injection.
   const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
   const globalClaudeMd = !containerInput.isMain && fs.existsSync(globalClaudeMdPath)
     ? fs.readFileSync(globalClaudeMdPath, 'utf-8')
     : undefined;
-  const channelFormatting = getChannelFormattingInstructions(containerInput.chatJid);
+  // Inject only when globalClaudeMd is absent AND not a MAIN group — i.e., globalContext:false.
+  const channelFormatting =
+    !containerInput.isMain && globalClaudeMd === undefined
+      ? getChannelFormattingInstructions(containerInput.chatJid)
+      : undefined;
   // Inject model identity so the agent can report it accurately
   const modelNote = containerInput.model
     ? `You are running on model: ${containerInput.model}. If the user asks what model you are using, report this accurately.`
