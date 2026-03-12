@@ -1188,7 +1188,10 @@ function buildVolumeMounts(
  * This ensures shared/multi-tenant groups get a fine-grained PAT scoped
  * to their org, making cross-org repo access impossible by construction.
  */
-function readSecrets(groupFolder: string, tools?: string[]): Record<string, string> {
+function readSecrets(
+  groupFolder: string,
+  tools?: string[],
+): Record<string, string> {
   // Determine which GitHub token env var to read
   const { scopes: githubScopes, isScoped: githubScoped } = extractToolScopes(
     tools,

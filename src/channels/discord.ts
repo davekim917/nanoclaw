@@ -320,7 +320,7 @@ export class DiscordChannel implements Channel {
         if (guild) {
           await this.registerSlashCommands(readyClient.user.id, guild.id);
         }
-        await this.announceDeployComplete(deployChannelId);
+        await this.announceDeployStatus(deployChannelId);
         resolve();
       });
 
@@ -723,17 +723,31 @@ export class DiscordChannel implements Channel {
     logger.info({ pid: child.pid }, 'Detached deploy script spawned');
   }
 
-  private async announceDeployComplete(channelId: string): Promise<void> {
+  private async announceDeployStatus(channelId: string): Promise<void> {
     try {
-      const logPath = path.resolve(process.cwd(), 'logs/deploy.log');
-      const stat = fs.statSync(logPath);
-      if (Date.now() - stat.mtimeMs > 30_000) return;
+      const statusPath = path.resolve(process.cwd(), 'logs/deploy-status.json');
+      if (!fs.existsSync(statusPath)) return;
+
+      const stat = fs.statSync(statusPath);
+      // Only announce if status file was written in the last 60s (covers restart lag)
+      if (Date.now() - stat.mtimeMs > 60_000) return;
+
+      const status = JSON.parse(fs.readFileSync(statusPath, 'utf-8'));
       const channel = await this.client!.channels.fetch(channelId);
-      if (channel && 'send' in channel) {
-        await (channel as TextChannel).send('Deploy complete.');
+      if (!channel || !('send' in channel)) return;
+
+      const textChannel = channel as TextChannel;
+      if (status.status === 'ok') {
+        await textChannel.send('Deploy complete — service is up.');
+      } else if (status.status === 'failed') {
+        await textChannel.send(
+          `Deploy failed at **${status.step}**: ${status.error}`,
+        );
       }
+      // Clear status file after announcing so we don't re-announce on next restart
+      fs.unlinkSync(statusPath);
     } catch {
-      // No deploy log or channel not found — skip silently
+      // No status file or channel not found — skip silently
     }
   }
 

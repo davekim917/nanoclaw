@@ -1,18 +1,43 @@
 #!/usr/bin/env bash
 # Self-deploy: pull latest main, build, restart.
 # Spawned detached so it survives the systemctl restart.
-set -e
+# Writes JSON status to logs/deploy-status.json for Discord notifications.
 
 cd /home/ubuntu/nanoclaw
 
-echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Deploy started" >> logs/deploy.log
+STATUS_FILE="logs/deploy-status.json"
+LOG="logs/deploy.log"
 
-git checkout main >> logs/deploy.log 2>&1 || true
-git pull origin main >> logs/deploy.log 2>&1
-npm run build >> logs/deploy.log 2>&1
+write_status() {
+  local status="$1" step="$2" error="$3"
+  printf '{"status":"%s","step":"%s","error":"%s","timestamp":"%s"}\n' \
+    "$status" "$step" "$error" "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" > "$STATUS_FILE"
+}
 
-echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Build complete, restarting..." >> logs/deploy.log
+echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Deploy started" >> "$LOG"
+write_status "running" "git pull" ""
 
-sudo systemctl restart nanoclaw >> logs/deploy.log 2>&1
+if ! git checkout main >> "$LOG" 2>&1; then
+  write_status "failed" "git checkout" "checkout failed — check deploy.log"
+  exit 1
+fi
 
-echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Deploy complete" >> logs/deploy.log
+if ! git pull origin main >> "$LOG" 2>&1; then
+  write_status "failed" "git pull" "pull failed — local changes or merge conflict"
+  exit 1
+fi
+
+write_status "running" "build" ""
+if ! npm run build >> "$LOG" 2>&1; then
+  write_status "failed" "build" "TypeScript build failed"
+  exit 1
+fi
+
+echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Build complete, restarting..." >> "$LOG"
+write_status "running" "restart" ""
+
+sudo systemctl restart nanoclaw >> "$LOG" 2>&1
+
+# If we get here, restart was issued. The new process writes "ok" on startup.
+echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Deploy complete" >> "$LOG"
+write_status "ok" "done" ""
