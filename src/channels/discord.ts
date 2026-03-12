@@ -63,6 +63,14 @@ export class DiscordChannel implements Channel {
   private threadOriginMessage = new Map<string, string>();
   private static MEMBER_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
+  /** Resolve the parent channel ID from an interaction (thread → parent, else null). */
+  private static getInteractionParentId(
+    interaction: { channel: { isThread(): boolean; parentId?: string | null } | null },
+  ): string | null {
+    const ch = interaction.channel;
+    return ch?.isThread() ? (ch.parentId ?? null) : null;
+  }
+
   constructor(botToken: string, opts: ChannelOpts) {
     this.botToken = botToken;
     this.opts = opts;
@@ -284,20 +292,30 @@ export class DiscordChannel implements Channel {
     // Handle button clicks and slash commands (restricted to #nanoclaw-dev)
     const deployChannelId = '1480411210183610418';
     this.client.on(Events.InteractionCreate, async (interaction) => {
-      if (interaction.channelId !== deployChannelId) return;
-      if (interaction.isButton()) {
-        const btn = interaction as ButtonInteraction;
-        if (btn.customId.startsWith('review-merge:')) {
-          await this.handleReviewMergeButton(btn);
-        } else if (btn.customId.startsWith('merge:')) {
-          await this.handleMergeButton(btn);
+      // Allow interactions from the deploy channel itself OR from threads under it
+      const parentId = DiscordChannel.getInteractionParentId(interaction);
+      if (
+        interaction.channelId !== deployChannelId &&
+        parentId !== deployChannelId
+      )
+        return;
+      try {
+        if (interaction.isButton()) {
+          const btn = interaction as ButtonInteraction;
+          if (btn.customId.startsWith('review-merge:')) {
+            await this.handleReviewMergeButton(btn);
+          } else if (btn.customId.startsWith('merge:')) {
+            await this.handleMergeButton(btn);
+          }
+        } else if (interaction.isChatInputCommand()) {
+          if (interaction.commandName === 'deploy') {
+            await this.handleDeployCommand(
+              interaction as ChatInputCommandInteraction,
+            );
+          }
         }
-      } else if (interaction.isChatInputCommand()) {
-        if (interaction.commandName === 'deploy') {
-          await this.handleDeployCommand(
-            interaction as ChatInputCommandInteraction,
-          );
-        }
+      } catch (err) {
+        logger.error({ err }, 'Discord interaction handler error');
       }
     });
 
@@ -683,8 +701,11 @@ export class DiscordChannel implements Channel {
 
   /** Inject a synthetic message into the inbound pipeline for the agent to process. */
   private injectMessage(interaction: ButtonInteraction, prompt: string): void {
-    const channelId = interaction.channelId;
-    const jid = `dc:${channelId}`;
+    // Resolve JID: if in a thread, use parent channel for group lookup
+    const parentId = DiscordChannel.getInteractionParentId(interaction);
+    const jid = parentId
+      ? `dc:${parentId}`
+      : `dc:${interaction.channelId}`;
     const msgId = interaction.id;
     const sender = interaction.user.id;
     const senderName = interaction.user.username;
