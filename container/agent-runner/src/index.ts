@@ -100,33 +100,40 @@ const IPC_POLL_MS = 500;
  */
 function getChannelFormattingInstructions(chatJid: string): string | undefined {
   if (chatJid.startsWith('slack:')) {
-    return `## Message Formatting
+    return `## Response Style
 
-You are responding in a Slack channel. Use Slack mrkdwn only:
+Structure every response for scannability:
+- Use emoji + *bold* section headers to anchor major sections (e.g. 🔑 *Decisions*, ✅ *Action Items*, 📋 *Summary*). Pick emojis contextually — informative, not decorative.
+- Bullet points for lists, not paragraphs
+- Bold key terms inline
+- Short paragraphs — no walls of text
+
+## Message Formatting
+
+You are responding in a Slack channel. Use Slack mrkdwn syntax:
 - *single asterisks* for bold
 - _underscores_ for italic
 - \`backticks\` for inline code
 - \`\`\`triple backticks\`\`\` for code blocks
 - - for bullet points
 
-Do NOT use: **double asterisks**, ## headings, --- horizontal rules, [text](url) link syntax, or markdown tables. These do not render in Slack and will appear as raw characters.
-
-Structure every response for scannability: use *bold* labels for sections, bullet points for lists, short paragraphs. Avoid walls of text.`;
+Do NOT use: **double asterisks**, ## headings, --- horizontal rules, [text](url) link syntax, or markdown tables. These do not render in Slack.`;
   }
   if (chatJid.startsWith('dc:')) {
     return `## Message Formatting
 
-You are responding in a Discord channel. Use Discord markdown:
+You are responding in a Discord channel. Use Discord markdown syntax:
 - **double asterisks** for bold
 - *single asterisks* for italic
 - \`backticks\` for inline code
 - \`\`\`triple backticks\`\`\` for code blocks
 - - or * for bullet points
 - > for blockquotes
+- \`---\` as a visual separator between major sections
 
-Do NOT use: \`---\` horizontal rules (Discord does not render them — they appear as literal "---"), or [text](url) link syntax.
+Do NOT use: [text](url) link syntax, or ## markdown headings.
 
-Use **bold** for section labels instead of --- dividers. Structure every response for scannability: clear sections, bullet points for lists, short paragraphs. Avoid walls of text.`;
+Apply the Response Style rules from your system instructions: emoji + **bold** section headers, bullet points, no walls of text.`;
   }
   // WhatsApp/Telegram JIDs reach here intentionally — they use global CLAUDE.md for formatting.
   return undefined;
