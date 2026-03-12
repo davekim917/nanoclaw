@@ -123,10 +123,11 @@ You are responding in a Discord channel. Use Discord markdown:
 - \`\`\`triple backticks\`\`\` for code blocks
 - - or * for bullet points
 - > for blockquotes
+- \`---\` as a visual separator between major sections
 
-Do NOT use: \`---\` horizontal rules (Discord does not render them — they appear as literal "---"), or [text](url) link syntax.
+Structure every response for scannability: use emoji + **Bold Title** for section headers (e.g. 🔑 **Decisions**, 📋 **Summary**, ✅ **Action Items**). Use contextual emojis that match the content — informative, not decorative. Bold key terms inline. Bullet points for lists. Short paragraphs. Avoid walls of text.
 
-Use **bold** for section labels instead of --- dividers. Structure every response for scannability: clear sections, bullet points for lists, short paragraphs. Avoid walls of text.`;
+Do NOT use: [text](url) link syntax, or ## markdown headings.`;
   }
   // WhatsApp/Telegram JIDs reach here intentionally — they use global CLAUDE.md for formatting.
   return undefined;
