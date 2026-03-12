@@ -100,7 +100,15 @@ const IPC_POLL_MS = 500;
  */
 function getChannelFormattingInstructions(chatJid: string): string | undefined {
   if (chatJid.startsWith('slack:')) {
-    return `## Message Formatting
+    return `## Response Style
+
+Structure every response for scannability:
+- Use emoji + *bold* section headers to anchor major sections (e.g. 🔑 *Decisions*, ✅ *Action Items*, 📋 *Summary*). Pick emojis contextually — informative, not decorative.
+- Bullet points for lists, not paragraphs
+- Bold key terms inline
+- Short paragraphs — no walls of text
+
+## Message Formatting
 
 You are responding in a Slack channel. Use Slack mrkdwn syntax:
 - *single asterisks* for bold
@@ -109,9 +117,7 @@ You are responding in a Slack channel. Use Slack mrkdwn syntax:
 - \`\`\`triple backticks\`\`\` for code blocks
 - - for bullet points
 
-Do NOT use: **double asterisks**, ## headings, --- horizontal rules, [text](url) link syntax, or markdown tables. These do not render in Slack.
-
-Apply the Response Style rules from your system instructions: emoji + *bold* section headers, bullet points, no walls of text.`;
+Do NOT use: **double asterisks**, ## headings, --- horizontal rules, [text](url) link syntax, or markdown tables. These do not render in Slack.`;
   }
   if (chatJid.startsWith('dc:')) {
     return `## Message Formatting
