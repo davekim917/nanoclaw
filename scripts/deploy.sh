@@ -13,6 +13,6 @@ npm run build >> logs/deploy.log 2>&1
 
 echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Build complete, restarting..." >> logs/deploy.log
 
-systemctl restart nanoclaw >> logs/deploy.log 2>&1
+sudo systemctl restart nanoclaw >> logs/deploy.log 2>&1
 
 echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Deploy complete" >> logs/deploy.log
