@@ -1177,6 +1177,8 @@ function readSecrets(tools?: string[]): Record<string, string> {
     'CLAUDE_CODE_OAUTH_TOKEN',
     'ANTHROPIC_API_KEY',
     githubTokenKey,
+    'DBT_CLOUD_EMAIL',
+    'DBT_CLOUD_PASSWORD',
   ]);
 
   // Warn if scoped token is missing (fail-closed: no GITHUB_TOKEN at all)
