@@ -1215,6 +1215,8 @@ function readSecrets(tools?: string[]): Record<string, string> {
     'DBT_CLOUD_PASSWORD_ILLYSIUM',
     'DBT_CLOUD_EMAIL_SUNDAY',
     'DBT_CLOUD_PASSWORD_SUNDAY',
+    'DBT_CLOUD_API_KEY_SUNDAY',
+    'DBT_CLOUD_API_URL_SUNDAY',
   ]);
 
   // Warn if scoped token is missing (fail-closed: no GITHUB_TOKEN at all)
