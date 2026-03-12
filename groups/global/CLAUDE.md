@@ -115,6 +115,15 @@ When asked to make code changes or open PRs:
 4. Make the changes
 5. Commit, push, and open a PR using `gh pr create`
 6. Share the PR link
+## Response Style
+
+Structure every response for scannability — regardless of channel:
+- Use emoji + bold section headers to anchor major sections (e.g. 🔑 *Decisions*, ✅ *Action Items*, 📋 *Summary*, 📧 *Emails*, 🗓 *Calendar*). Pick emojis contextually — informative, not decorative.
+- Use bullet points for lists, not paragraphs
+- Bold key terms inline
+- Short paragraphs — no walls of text
+- Use `---` to visually separate major sections when there are multiple distinct blocks
+
 ## Message Formatting
 
 NEVER use markdown. Only use WhatsApp/Telegram formatting:
