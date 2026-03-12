@@ -34,6 +34,7 @@ import {
   cleanupOrphanWorktrees,
   cleanupThreadWorkspace,
   runContainerAgent,
+  startGranolaTokenRefresh,
   withGroupMutex,
   writeGroupsSnapshot,
   writeTasksSnapshot,
@@ -610,7 +611,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     effectiveThreadId,
     containerAttachments.length > 0 ? containerAttachments : undefined,
     async (result) => {
-      // Streaming output callback — called for each agent result
+      // Streaming output callback — called for each agent result.
+      // A single query may produce multiple results when piped messages
+      // create follow-up turns.  Only the between-query session-update
+      // marker carries idle: true — intermediate results do NOT.
       if (result.result) {
         const raw =
           typeof result.result === 'string'
@@ -638,17 +642,30 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           await channel.setTyping?.(chatJid, false);
           outputSentToUser = true;
         }
-        // Only reset idle timer on actual results, not session-update markers (result: null)
-        resetIdleTimer();
       }
+
+      // Reset idle timer on every result (text or null) so the hard
+      // timeout doesn't kill the container while it's still processing
+      // multi-turn piped messages.
+      resetIdleTimer();
 
       // Throttled activity touch for session sweep
       throttledTouchActivity(sessionKey);
 
-      if (result.status === 'success') {
-        // Clear typing as soon as the agent signals idle — don't wait for
-        // the container to exit, which can take much longer and leaves a
-        // stale "typing…" indicator visible to the user.
+      if (result.status === 'success' && result.idle) {
+        // Agent is truly idle (between queries, waiting for new IPC
+        // input).  Safe to mark idle and allow preemption.
+        if (!outputSentToUser && !result.result) {
+          logger.warn(
+            { group: group.name },
+            'Agent completed with no text output',
+          );
+          await channel.sendMessage(
+            chatJid,
+            'I finished processing but wasn\u2019t able to produce a response. Please try again.',
+          );
+          outputSentToUser = true;
+        }
         await channel.setTyping?.(chatJid, false);
         queue.notifyIdle(parentJid, effectiveThreadId);
       }
@@ -1277,6 +1294,8 @@ async function main(): Promise<void> {
   // Clean up orphan worktrees from previous crash/restart
   await cleanupOrphanWorktrees();
   initDatabase();
+  // Keep Granola OAuth token chain alive (proactive refresh every 4h)
+  startGranolaTokenRefresh();
   logger.info('Database initialized');
   loadState();
 

@@ -56,9 +56,13 @@ const HOST_CREDENTIALS_PATH = path.join(
 
 const GRANOLA_TOKEN_ENDPOINT = 'https://mcp-auth.granola.ai/oauth2/token';
 const GRANOLA_REFRESH_TIMEOUT_MS = 10_000;
+// Proactive refresh interval — keeps the refresh token chain alive even when
+// no container spawns occur. 4 hours is well within the ~6h access token TTL.
+const GRANOLA_PROACTIVE_REFRESH_MS = 4 * 60 * 60 * 1000;
 
 // In-memory cache to avoid redundant disk reads / duplicate refresh calls
 let granolaTokenCache: { token: string; expiresAt: number } | null = null;
+let granolaRefreshTimer: ReturnType<typeof setInterval> | null = null;
 
 /**
  * Read Granola MCP OAuth access token from the host's Claude credentials file,
@@ -103,8 +107,8 @@ async function getGranolaAccessToken(): Promise<string | null> {
 
   // Token expired — try to refresh
   if (!refreshToken || !clientId) {
-    logger.error('Granola OAuth token expired and no refresh token available');
-    return accessToken || null;
+    logger.error('Granola OAuth token expired and no refresh token available. Re-authenticate: claude mcp add granola --transport http https://mcp.granola.ai/mcp');
+    return null;
   }
 
   try {
@@ -121,10 +125,12 @@ async function getGranolaAccessToken(): Promise<string | null> {
     });
 
     if (!resp.ok) {
+      const body = await resp.text().catch(() => '');
       logger.error(
-        `Granola token refresh failed: ${resp.status} ${resp.statusText}`,
+        `Granola token refresh failed: ${resp.status} ${resp.statusText} — ${body}. Re-authenticate: claude mcp add granola --transport http https://mcp.granola.ai/mcp`,
       );
-      return accessToken || null;
+      // Don't pass the expired token — it causes silent MCP tool failures
+      return null;
     }
 
     const tokens = (await resp.json()) as Record<string, unknown>;
@@ -163,8 +169,36 @@ async function getGranolaAccessToken(): Promise<string | null> {
     logger.info('Granola OAuth token refreshed successfully');
     return newAccessToken;
   } catch (err) {
-    logger.error(`Granola token refresh error: ${err}`);
-    return accessToken || null;
+    logger.error(`Granola token refresh error: ${err}. Re-authenticate: claude mcp add granola --transport http https://mcp.granola.ai/mcp`);
+    return null;
+  }
+}
+
+/**
+ * Start a proactive refresh timer that keeps the Granola OAuth token chain alive.
+ * Runs immediately on start (to refresh on boot if stale), then every 4 hours.
+ * This prevents the refresh token from expiring during overnight / idle periods.
+ */
+export function startGranolaTokenRefresh(): void {
+  if (granolaRefreshTimer) return; // already running
+  const doRefresh = async () => {
+    const token = await getGranolaAccessToken();
+    if (token) {
+      logger.debug('Granola proactive token refresh: OK');
+    }
+    // Errors are already logged inside getGranolaAccessToken
+  };
+  // Refresh immediately, then on interval
+  doRefresh();
+  granolaRefreshTimer = setInterval(doRefresh, GRANOLA_PROACTIVE_REFRESH_MS);
+  granolaRefreshTimer.unref(); // don't keep the process alive just for this
+  logger.info(`Granola proactive token refresh started (every ${GRANOLA_PROACTIVE_REFRESH_MS / 1000 / 60 / 60}h)`);
+}
+
+export function stopGranolaTokenRefresh(): void {
+  if (granolaRefreshTimer) {
+    clearInterval(granolaRefreshTimer);
+    granolaRefreshTimer = null;
   }
 }
 
@@ -196,6 +230,10 @@ export interface ContainerOutput {
   newSessionId?: string;
   error?: string;
   errorType?: 'prompt_too_long' | 'general';
+  /** True when the agent is idle and waiting for new input.
+   *  Only set on the between-query session-update marker.
+   *  Intermediate results within a multi-turn query do NOT carry this flag. */
+  idle?: boolean;
 }
 
 interface VolumeMount {
@@ -362,9 +400,30 @@ export async function prepareThreadWorkspace(
         } catch {
           // origin/HEAD not set — use local HEAD
         }
-        await execAsync(`git worktree add --detach "${wtPath}" "${ref}"`, {
-          cwd: srcPath,
-        });
+        try {
+          await execAsync(`git worktree add --detach "${wtPath}" "${ref}"`, {
+            cwd: srcPath,
+          });
+        } catch (addErr) {
+          // Stale worktree registration — prune and retry once
+          const msg = addErr instanceof Error ? addErr.message : String(addErr);
+          if (msg.includes('already registered')) {
+            logger.warn(
+              { repo: path.basename(srcPath), wtPath },
+              'Stale worktree detected, pruning and retrying',
+            );
+            await execAsync('git worktree prune', { cwd: srcPath });
+            // Clean up leftover directory if it exists
+            try {
+              fs.rmSync(wtPath, { recursive: true, force: true });
+            } catch { /* ignore */ }
+            await execAsync(`git worktree add --detach "${wtPath}" "${ref}"`, {
+              cwd: srcPath,
+            });
+          } else {
+            throw addErr;
+          }
+        }
         createdWorktrees.push({ repoDir: srcPath, wtPath });
       }),
     );
@@ -1333,6 +1392,9 @@ export async function runContainerAgent(
   let granolaAccessToken: string | undefined;
   if (isToolEnabled(tools, 'granola')) {
     granolaAccessToken = (await getGranolaAccessToken()) || undefined;
+    if (!granolaAccessToken) {
+      logger.warn({ group: group.name }, 'Granola enabled but no valid token — Granola tools will be unavailable');
+    }
   }
 
   // Determine IPC input subdirectory for this container
@@ -1353,10 +1415,9 @@ export async function runContainerAgent(
     } catch (err) {
       logger.error(
         { group: group.name, threadId: input.threadId, err },
-        'Failed to prepare thread worktree, falling back to direct mount',
+        'Failed to prepare thread worktree',
       );
-      // Fall back to direct mount (no concurrency isolation)
-      worktreePath = undefined;
+      throw err;
     }
   }
 
@@ -1660,6 +1721,9 @@ export async function runContainerAgent(
             `Duration: ${duration}ms`,
             `Exit Code: ${code}`,
             `Had Streaming Output: ${hadStreamingOutput}`,
+            ``,
+            `=== Stderr${stderrTruncated ? ' (TRUNCATED)' : ''} ===`,
+            stderr,
           ].join('\n'),
         );
 
