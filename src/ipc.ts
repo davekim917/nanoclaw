@@ -533,7 +533,10 @@ export async function processTaskIpc(
 
     case 'add_ship_log':
       if (!isMain) {
-        logger.warn({ sourceGroup }, 'Unauthorized add_ship_log attempt blocked');
+        logger.warn(
+          { sourceGroup },
+          'Unauthorized add_ship_log attempt blocked',
+        );
         break;
       }
       if (data.title) {
@@ -547,7 +550,10 @@ export async function processTaskIpc(
           tags: data.tags || null,
           shipped_at: new Date().toISOString(),
         });
-        logger.info({ entryId, title: data.title }, 'Ship log entry added via IPC');
+        logger.info(
+          { entryId, title: data.title },
+          'Ship log entry added via IPC',
+        );
       } else {
         logger.warn({ data }, 'add_ship_log missing title');
       }
@@ -555,7 +561,10 @@ export async function processTaskIpc(
 
     case 'add_backlog_item':
       if (!isMain) {
-        logger.warn({ sourceGroup }, 'Unauthorized add_backlog_item attempt blocked');
+        logger.warn(
+          { sourceGroup },
+          'Unauthorized add_backlog_item attempt blocked',
+        );
         break;
       }
       if (data.title) {
@@ -565,7 +574,9 @@ export async function processTaskIpc(
           id: itemId,
           title: data.title,
           description: data.description || null,
-          status: (data.status as 'open' | 'in_progress' | 'resolved' | 'wont_fix') || 'open',
+          status:
+            (data.status as 'open' | 'in_progress' | 'resolved' | 'wont_fix') ||
+            'open',
           priority: (data.priority as 'low' | 'medium' | 'high') || 'medium',
           tags: data.tags || null,
           notes: data.notes || null,
@@ -573,7 +584,10 @@ export async function processTaskIpc(
           updated_at: now,
           resolved_at: null,
         });
-        logger.info({ itemId, title: data.title }, 'Backlog item added via IPC');
+        logger.info(
+          { itemId, title: data.title },
+          'Backlog item added via IPC',
+        );
       } else {
         logger.warn({ data }, 'add_backlog_item missing title');
       }
@@ -581,22 +595,35 @@ export async function processTaskIpc(
 
     case 'update_backlog_item':
       if (!isMain) {
-        logger.warn({ sourceGroup }, 'Unauthorized update_backlog_item attempt blocked');
+        logger.warn(
+          { sourceGroup },
+          'Unauthorized update_backlog_item attempt blocked',
+        );
         break;
       }
       if (data.itemId) {
         const updates: Parameters<typeof updateBacklogItem>[1] = {};
         if (data.title !== undefined) updates.title = data.title;
-        if (data.description !== undefined) updates.description = data.description;
-        if (data.status !== undefined) updates.status = data.status as 'open' | 'in_progress' | 'resolved' | 'wont_fix';
-        if (data.priority !== undefined) updates.priority = data.priority as 'low' | 'medium' | 'high';
+        if (data.description !== undefined)
+          updates.description = data.description;
+        if (data.status !== undefined)
+          updates.status = data.status as
+            | 'open'
+            | 'in_progress'
+            | 'resolved'
+            | 'wont_fix';
+        if (data.priority !== undefined)
+          updates.priority = data.priority as 'low' | 'medium' | 'high';
         if (data.tags !== undefined) updates.tags = data.tags;
         if (data.notes !== undefined) updates.notes = data.notes;
         if (data.status === 'resolved' || data.status === 'wont_fix') {
           updates.resolved_at = new Date().toISOString();
         }
         updateBacklogItem(data.itemId, updates);
-        logger.info({ itemId: data.itemId, updates }, 'Backlog item updated via IPC');
+        logger.info(
+          { itemId: data.itemId, updates },
+          'Backlog item updated via IPC',
+        );
       } else {
         logger.warn({ data }, 'update_backlog_item missing itemId');
       }
@@ -604,7 +631,10 @@ export async function processTaskIpc(
 
     case 'delete_backlog_item':
       if (!isMain) {
-        logger.warn({ sourceGroup }, 'Unauthorized delete_backlog_item attempt blocked');
+        logger.warn(
+          { sourceGroup },
+          'Unauthorized delete_backlog_item attempt blocked',
+        );
         break;
       }
       if (data.itemId) {
@@ -952,7 +982,10 @@ function processQueryIpc(
         break;
       }
       const items = getBacklog(data.status, data.limit || 50);
-      logger.info({ sourceGroup, count: items.length }, 'IPC list_backlog query served');
+      logger.info(
+        { sourceGroup, count: items.length },
+        'IPC list_backlog query served',
+      );
       writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
         status: 'ok',
         items,
@@ -969,7 +1002,10 @@ function processQueryIpc(
         break;
       }
       const entries = getShipLog(data.limit || 20);
-      logger.info({ sourceGroup, count: entries.length }, 'IPC list_ship_log query served');
+      logger.info(
+        { sourceGroup, count: entries.length },
+        'IPC list_ship_log query served',
+      );
       writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
         status: 'ok',
         entries,

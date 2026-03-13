@@ -1342,9 +1342,7 @@ export function addShipLogEntry(entry: ShipLogEntry): void {
 
 export function getShipLog(limit: number = 50): ShipLogEntry[] {
   return db
-    .prepare(
-      `SELECT * FROM ship_log ORDER BY shipped_at DESC LIMIT ?`,
-    )
+    .prepare(`SELECT * FROM ship_log ORDER BY shipped_at DESC LIMIT ?`)
     .all(limit) as ShipLogEntry[];
 }
 
@@ -1370,25 +1368,59 @@ export function addBacklogItem(item: BacklogItem): void {
 
 export function updateBacklogItem(
   id: string,
-  updates: Partial<Pick<BacklogItem, 'title' | 'description' | 'status' | 'priority' | 'tags' | 'notes' | 'resolved_at'>>,
+  updates: Partial<
+    Pick<
+      BacklogItem,
+      | 'title'
+      | 'description'
+      | 'status'
+      | 'priority'
+      | 'tags'
+      | 'notes'
+      | 'resolved_at'
+    >
+  >,
 ): void {
   const fields: string[] = [];
   const values: unknown[] = [];
 
-  if (updates.title !== undefined) { fields.push('title = ?'); values.push(updates.title); }
-  if (updates.description !== undefined) { fields.push('description = ?'); values.push(updates.description); }
-  if (updates.status !== undefined) { fields.push('status = ?'); values.push(updates.status); }
-  if (updates.priority !== undefined) { fields.push('priority = ?'); values.push(updates.priority); }
-  if (updates.tags !== undefined) { fields.push('tags = ?'); values.push(updates.tags); }
-  if (updates.notes !== undefined) { fields.push('notes = ?'); values.push(updates.notes); }
-  if (updates.resolved_at !== undefined) { fields.push('resolved_at = ?'); values.push(updates.resolved_at); }
+  if (updates.title !== undefined) {
+    fields.push('title = ?');
+    values.push(updates.title);
+  }
+  if (updates.description !== undefined) {
+    fields.push('description = ?');
+    values.push(updates.description);
+  }
+  if (updates.status !== undefined) {
+    fields.push('status = ?');
+    values.push(updates.status);
+  }
+  if (updates.priority !== undefined) {
+    fields.push('priority = ?');
+    values.push(updates.priority);
+  }
+  if (updates.tags !== undefined) {
+    fields.push('tags = ?');
+    values.push(updates.tags);
+  }
+  if (updates.notes !== undefined) {
+    fields.push('notes = ?');
+    values.push(updates.notes);
+  }
+  if (updates.resolved_at !== undefined) {
+    fields.push('resolved_at = ?');
+    values.push(updates.resolved_at);
+  }
 
   if (fields.length === 0) return;
 
   fields.push('updated_at = ?');
   values.push(new Date().toISOString());
   values.push(id);
-  db.prepare(`UPDATE backlog SET ${fields.join(', ')} WHERE id = ?`).run(...values);
+  db.prepare(`UPDATE backlog SET ${fields.join(', ')} WHERE id = ?`).run(
+    ...values,
+  );
 }
 
 export function deleteBacklogItem(id: string): void {
@@ -1397,7 +1429,10 @@ export function deleteBacklogItem(id: string): void {
 
 const PRIORITY_ORDER = `CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END`;
 
-export function getBacklog(status?: string, limit: number = 100): BacklogItem[] {
+export function getBacklog(
+  status?: string,
+  limit: number = 100,
+): BacklogItem[] {
   if (status) {
     return db
       .prepare(
