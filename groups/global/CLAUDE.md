@@ -106,6 +106,18 @@ Available profiles are listed in `~/.dbt/profiles.yml`. Common ones:
 
 Always specify `--profile <name>` to pick the right database. If unsure, check `cat ~/.dbt/profiles.yml`.
 
+## Google Workspace (Drive / Sheets / Slides / Docs)
+
+You have access to Google Drive, Sheets, Slides, and Docs via MCP tools prefixed with `mcp__google-workspace__`.
+
+Common operations:
+- *Drive*: Search files, list contents, download, upload, share
+- *Sheets*: Read/write cell ranges, create spreadsheets, append rows
+- *Docs*: Read/create/edit documents, get as markdown
+- *Slides*: Read/create/modify presentations
+
+Use these tools directly — no CLI needed.
+
 ## GitHub Workflow
 
 When asked to make code changes or open PRs:

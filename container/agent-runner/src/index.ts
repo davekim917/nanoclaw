@@ -188,11 +188,21 @@ async function readStdin(): Promise<string> {
 
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
+const PROGRESS_START_MARKER = '---NANOCLAW_PROGRESS_START---';
+const PROGRESS_END_MARKER = '---NANOCLAW_PROGRESS_END---';
+let progressSeq = 0;
 
 function writeOutput(output: ContainerOutput): void {
   console.log(OUTPUT_START_MARKER);
   console.log(JSON.stringify(output));
   console.log(OUTPUT_END_MARKER);
+}
+
+function writeProgress(eventType: string, data: Record<string, string | undefined>): void {
+  progressSeq++;
+  console.log(PROGRESS_START_MARKER);
+  console.log(JSON.stringify({ eventType, data, seq: progressSeq, ts: Date.now() }));
+  console.log(PROGRESS_END_MARKER);
 }
 
 function log(message: string): void {
@@ -499,6 +509,24 @@ const CALENDAR_READ_TOOLS = [
   'mcp__google-calendar__get-freebusy',
 ] as const;
 
+// Read-only Google Workspace tools — scoped groups get these instead of mcp__google-workspace__*
+// Excluded write tools: create/update/delete for drive files, spreadsheets, documents, presentations
+const GOOGLE_WORKSPACE_READ_TOOLS = [
+  'mcp__google-workspace__search_drive_files',
+  'mcp__google-workspace__get_drive_file_info',
+  'mcp__google-workspace__list_drive_files',
+  'mcp__google-workspace__download_drive_file',
+  'mcp__google-workspace__get_spreadsheet_info',
+  'mcp__google-workspace__read_spreadsheet_range',
+  'mcp__google-workspace__list_spreadsheets',
+  'mcp__google-workspace__get_document',
+  'mcp__google-workspace__list_documents',
+  'mcp__google-workspace__read_document_content',
+  'mcp__google-workspace__get_presentation',
+  'mcp__google-workspace__list_presentations',
+  'mcp__google-workspace__get_slide_content',
+] as const;
+
 function buildAllowedTools(tools: string[] | undefined): string[] {
   const allowed = [
     'Bash',
@@ -521,6 +549,13 @@ function buildAllowedTools(tools: string[] | undefined): string[] {
     }
   }
   if (isToolEnabled(tools, 'granola')) allowed.push('mcp__granola__*');
+  if (isToolEnabled(tools, 'google-workspace')) {
+    if (isToolScoped(tools, 'google-workspace')) {
+      allowed.push(...GOOGLE_WORKSPACE_READ_TOOLS);
+    } else {
+      allowed.push('mcp__google-workspace__*');
+    }
+  }
   if (isToolEnabled(tools, 'calendar')) {
     if (isToolScoped(tools, 'calendar')) {
       allowed.push(...CALENDAR_READ_TOOLS);
@@ -601,6 +636,20 @@ function buildMcpServers(
         headers: { Authorization: `Bearer ${granolaToken}` },
       };
     }
+  }
+  if (isToolEnabled(tools, 'google-workspace')) {
+    servers['google-workspace'] = {
+      command: 'workspace-mcp',
+      args: ['--tools', 'drive', 'sheets', 'slides', 'docs'],
+      env: {
+        GOOGLE_OAUTH_CLIENT_ID:
+          containerInput.secrets?.GOOGLE_OAUTH_CLIENT_ID || '',
+        GOOGLE_OAUTH_CLIENT_SECRET:
+          containerInput.secrets?.GOOGLE_OAUTH_CLIENT_SECRET || '',
+        WORKSPACE_MCP_CREDENTIALS_DIR:
+          '/home/node/.google_workspace_mcp/credentials',
+      },
+    };
   }
   return servers;
 }
@@ -792,6 +841,35 @@ async function runQuery(
 
     if (message.type === 'assistant' && 'uuid' in message) {
       lastAssistantUuid = (message as { uuid: string }).uuid;
+    }
+
+    // Emit progress events for real-time web UI streaming
+    if (message.type === 'assistant' && 'message' in message) {
+      const content = (message as { message: { content: Array<{ type: string; text?: string; thinking?: string; name?: string; input?: unknown; id?: string }> } }).message.content;
+      if (Array.isArray(content)) {
+        for (const block of content) {
+          if (block.type === 'text' && block.text) {
+            writeProgress('text', { text: block.text });
+          } else if (block.type === 'tool_use') {
+            writeProgress('tool_use', {
+              name: block.name,
+              input: JSON.stringify(block.input).slice(0, 2000),
+              id: block.id,
+            });
+          } else if (block.type === 'thinking' && block.thinking) {
+            writeProgress('thinking', { text: block.thinking.slice(0, 1000) });
+          }
+        }
+      }
+    }
+
+    if (message.type === 'system') {
+      const subtype = (message as { subtype?: string }).subtype || 'unknown';
+      writeProgress('system', {
+        subtype,
+        info: (message as { session_id?: string }).session_id ||
+              (message as { summary?: string }).summary,
+      });
     }
 
     if (message.type === 'system' && message.subtype === 'init') {

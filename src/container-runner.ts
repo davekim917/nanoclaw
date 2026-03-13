@@ -46,6 +46,8 @@ import YAML from 'yaml';
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
+const PROGRESS_START_MARKER = '---NANOCLAW_PROGRESS_START---';
+const PROGRESS_END_MARKER = '---NANOCLAW_PROGRESS_END---';
 
 // Path to Claude Code's host credentials (contains MCP OAuth tokens)
 const HOST_CREDENTIALS_PATH = path.join(
@@ -240,6 +242,13 @@ export interface ContainerOutput {
    *  Only set on the between-query session-update marker.
    *  Intermediate results within a multi-turn query do NOT carry this flag. */
   idle?: boolean;
+}
+
+export interface ProgressEvent {
+  eventType: 'text' | 'tool_use' | 'thinking' | 'system';
+  data: Record<string, string | undefined>;
+  seq: number;
+  ts: number;
 }
 
 interface VolumeMount {
@@ -1139,6 +1148,84 @@ function buildVolumeMounts(
     }
   }
 
+  // Google Workspace (Drive/Sheets/Slides/Docs) credentials — gated by tools config.
+  // Supports scoped access: 'google-workspace' = all accounts,
+  // 'google-workspace:illysium' = only that account's credential file.
+  if (isToolEnabled(tools, 'google-workspace')) {
+    const gwDir = path.join(homeDir, '.google_workspace_mcp', 'credentials');
+
+    if (!fs.existsSync(gwDir)) {
+      logger.warn(
+        { group: group.folder },
+        'Google Workspace credentials dir not found — MCP server will have no pre-existing tokens',
+      );
+    } else {
+      const { scopes: gwAccounts, isScoped: gwScoped } = extractToolScopes(
+        tools,
+        'google-workspace',
+      );
+
+      if (gwScoped) {
+        // Stage filtered credentials directory with only allowed account files
+        const stagingDir = path.join(
+          DATA_DIR,
+          'sessions',
+          group.folder,
+          threadId ? `threads/${threadId}` : 'main',
+          'google-workspace-mcp',
+        );
+        // Clean stale files from previous runs (same pattern as Snowflake staging)
+        if (fs.existsSync(stagingDir)) {
+          fs.rmSync(stagingDir, { recursive: true });
+        }
+        fs.mkdirSync(stagingDir, { recursive: true });
+
+        // Copy only matching credential files (scope name matches email substring)
+        try {
+          for (const entry of fs.readdirSync(gwDir)) {
+            if (gwAccounts.some((acct) => entry.includes(acct))) {
+              fs.copyFileSync(
+                path.join(gwDir, entry),
+                path.join(stagingDir, entry),
+              );
+            }
+          }
+
+          mounts.push({
+            hostPath: stagingDir,
+            containerPath: '/home/node/.google_workspace_mcp/credentials',
+            readonly: false,
+          });
+        } catch (err) {
+          // Fail closed — do NOT fall back to full dir, that defeats scoping
+          logger.warn(
+            { err, group: group.folder },
+            'Failed to filter Google Workspace credentials — skipping mount',
+          );
+        }
+      } else {
+        // Mount entire credentials directory
+        mounts.push({
+          hostPath: gwDir,
+          containerPath: '/home/node/.google_workspace_mcp/credentials',
+          readonly: false,
+        });
+      }
+    }
+
+    // Ensure OAuth keys are available (reuse Gmail's GCP OAuth app)
+    if (!isToolEnabled(tools, 'gmail') && !isToolEnabled(tools, 'calendar')) {
+      const oauthKeys = path.join(homeDir, '.gmail-mcp', 'gcp-oauth.keys.json');
+      if (fs.existsSync(oauthKeys)) {
+        mounts.push({
+          hostPath: oauthKeys,
+          containerPath: '/home/node/.gmail-mcp/gcp-oauth.keys.json',
+          readonly: true,
+        });
+      }
+    }
+  }
+
   // Snowflake credentials — gated by tools config.
   // Supports scoped access: 'snowflake' = all connections,
   // 'snowflake:sunday' or 'snowflake:apollo' = only those connections.
@@ -1381,7 +1468,8 @@ function readSecrets(
   const dbtScopedApiKey = `DBT_CLOUD_API_KEY_${scope}`;
   const dbtScopedApiUrl = `DBT_CLOUD_API_URL_${scope}`;
 
-  const secrets = readEnvFile([
+  // Build env var list — conditionally include google-workspace OAuth keys
+  const envKeys = [
     'CLAUDE_CODE_OAUTH_TOKEN',
     'ANTHROPIC_API_KEY',
     githubTokenKey,
@@ -1391,7 +1479,11 @@ function readSecrets(
     dbtScopedPassword,
     dbtScopedApiKey,
     dbtScopedApiUrl,
-  ]);
+    ...(isToolEnabled(tools, 'google-workspace')
+      ? ['GOOGLE_OAUTH_CLIENT_ID', 'GOOGLE_OAUTH_CLIENT_SECRET']
+      : []),
+  ];
+  const secrets = readEnvFile(envKeys);
 
   // Warn if scoped token is missing (fail-closed: no GITHUB_TOKEN at all)
   if (githubTokenKey !== 'GITHUB_TOKEN' && !secrets[githubTokenKey]) {
@@ -1486,6 +1578,7 @@ export async function runContainerAgent(
   input: ContainerInput,
   onProcess: (proc: ChildProcess, containerName: string) => void,
   onOutput?: (output: ContainerOutput) => Promise<void>,
+  onProgress?: (event: ProgressEvent) => void,
 ): Promise<ContainerOutput> {
   const startTime = Date.now();
 
@@ -1695,6 +1788,9 @@ export async function runContainerAgent(
 
     // Streaming output: parse OUTPUT_START/END marker pairs as they arrive
     let parseBuffer = '';
+    // Separate progress buffer — cannot share with parseBuffer because consuming
+    // a PROGRESS marker would discard incomplete OUTPUT markers and vice versa
+    let progressBuffer = '';
     let newSessionId: string | undefined;
     let outputChain = Promise.resolve();
 
@@ -1745,6 +1841,29 @@ export async function runContainerAgent(
               { group: group.name, error: err },
               'Failed to parse streamed output chunk',
             );
+          }
+        }
+      }
+
+      // Stream-parse for progress markers (does NOT reset timeout or count toward output size)
+      if (onProgress) {
+        progressBuffer += chunk;
+        let pIdx: number;
+        while (
+          (pIdx = progressBuffer.indexOf(PROGRESS_START_MARKER)) !== -1
+        ) {
+          const pEnd = progressBuffer.indexOf(PROGRESS_END_MARKER, pIdx);
+          if (pEnd === -1) break;
+          const json = progressBuffer
+            .slice(pIdx + PROGRESS_START_MARKER.length, pEnd)
+            .trim();
+          progressBuffer = progressBuffer.slice(
+            pEnd + PROGRESS_END_MARKER.length,
+          );
+          try {
+            onProgress(JSON.parse(json));
+          } catch {
+            // skip malformed progress events
           }
         }
       }

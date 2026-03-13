@@ -37,11 +37,13 @@ export interface ContainerConfig {
   // Undefined = all tools (backwards compatible).
   // Supported: 'gmail', 'gmail:<account>' (e.g. 'gmail:illysium'), 'calendar',
   //            'calendar:<account>' (e.g. 'calendar:illysium'), 'granola',
+  //            'google-workspace', 'google-workspace:<account>' (e.g. 'google-workspace:illysium'),
   //            'dbt', 'dbt:<profile>' (e.g. 'dbt:sunday-snowflake-db', 'dbt:apollo-snowflake'),
   //            'snowflake', 'snowflake:<connection>' (e.g. 'snowflake:sunday', 'snowflake:apollo'),
   //            'github', 'github:<scope>' (e.g. 'github:illysium' → reads GITHUB_TOKEN_ILLYSIUM from .env)
   // Account-specific gmail mounts only that account's credentials as the default.
   // Account-specific calendar stages a filtered tokens.json with only allowed accounts.
+  // Account-specific google-workspace stages filtered credential files (email.json) for allowed accounts.
   // Connection-specific snowflake filters connections.toml to only allowed sections + keys.
   // Scope-specific github reads GITHUB_TOKEN_<SCOPE> from .env instead of global GITHUB_TOKEN.
   tools?: string[];

@@ -45,6 +45,11 @@ RUN python3 -m venv /opt/dbt-venv \
     && /opt/dbt-venv/bin/pip install dbt-core==1.11.7 dbt-snowflake==1.11.3 \
     && ln -s /opt/dbt-venv/bin/dbt /usr/local/bin/dbt
 
+# Install Google Workspace MCP server (Drive, Sheets, Slides, Docs)
+RUN python3 -m venv /opt/gwmcp-venv \
+    && /opt/gwmcp-venv/bin/pip install workspace-mcp \
+    && ln -s /opt/gwmcp-venv/bin/workspace-mcp /usr/local/bin/workspace-mcp
+
 # Set Chromium path for agent-browser
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
