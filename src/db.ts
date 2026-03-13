@@ -1014,8 +1014,24 @@ export function getSessionModel(key: string): string | undefined {
   return row?.model ?? undefined;
 }
 
-/** Set or clear the sticky model override for a session. */
-export function setSessionModel(key: string, model: string | null): void {
+/** Set or clear the sticky model override for a session.
+ *  When groupFolder is provided, creates a stub row if one doesn't exist yet
+ *  (the bare UPDATE would silently affect 0 rows for new sessions). */
+export function setSessionModel(
+  key: string,
+  model: string | null,
+  groupFolder?: string,
+  threadId?: string,
+): void {
+  if (groupFolder && model !== null) {
+    // Ensure the row exists — create a stub with empty session_id if needed.
+    // setSessionV2() will fill in the real session_id when the container returns.
+    const now = new Date().toISOString();
+    db.prepare(
+      `INSERT OR IGNORE INTO sessions_v2 (session_key, group_folder, thread_id, session_id, last_activity, created_at)
+       VALUES (?, ?, ?, '', ?, ?)`,
+    ).run(key, groupFolder, threadId || null, now, now);
+  }
   db.prepare('UPDATE sessions_v2 SET model = ? WHERE session_key = ?').run(
     model,
     key,

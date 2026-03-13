@@ -525,10 +525,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   const sessionModel = getSessionModel(sessionKey);
 
   let model: string;
+  let modelSwitchNotice = '';
   if (overrideResult?.reset) {
     // "-m default" / "-m reset" — clear sticky, revert to group/global default
     setSessionModel(sessionKey, null);
     model = resolveModel(group);
+    modelSwitchNotice = `[Model reverted to default: ${model}] `;
     logger.info(
       { group: group.name, model, sessionKey },
       'Model override cleared, reverted to default',
@@ -536,12 +538,14 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   } else if (overrideResult) {
     model = overrideResult.model;
     if (overrideResult.sticky) {
-      setSessionModel(sessionKey, overrideResult.model);
+      setSessionModel(sessionKey, overrideResult.model, group.folder, effectiveThreadId);
+      modelSwitchNotice = `[Model switched to ${model} for this session] `;
       logger.info(
         { group: group.name, model: overrideResult.model, sessionKey },
         'Model override persisted for session',
       );
     } else {
+      modelSwitchNotice = `[Model switched to ${model} for this message only] `;
       logger.info(
         { group: group.name, model: overrideResult.model, sessionKey },
         'One-shot model override (not persisted)',
@@ -551,7 +555,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     model = resolveModel(group, undefined, sessionModel);
   }
 
-  const prompt = formatMessages(missedMessages, TIMEZONE);
+  const prompt = modelSwitchNotice + formatMessages(missedMessages, TIMEZONE);
 
   // Collect attachments from messages and remap paths for container mount
   const containerAttachments: ContainerAttachment[] = [];
