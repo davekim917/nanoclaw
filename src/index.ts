@@ -52,6 +52,7 @@ import {
   deleteSessionV2,
   getAllChats,
   getAllRegisteredGroups,
+  findPendingThreadJids,
   getAllSessionsV2,
   getAllTasks,
   getBotResponsesSince,
@@ -1155,13 +1156,33 @@ function recoverPendingMessages(): void {
       queue.enqueueMessageCheck(chatJid); // parent processes itself
     }
 
-    // Thread recovery is intentionally skipped. Thread sessions are
-    // user-initiated — if a restart interrupts a response, the user will
-    // re-trigger by sending another message. Attempting to auto-recover
-    // threads causes duplicate responses because:
-    // 1. Discord bot messages aren't stored in DB (can't detect prior response)
-    // 2. Cursor persistence is fragile (saveState writes entire map, can
-    //    overwrite individually-fixed cursors)
+    // Thread auto-recovery is skipped (causes duplicate responses — see below).
+    // Instead, notify the user in each pending thread so they know to resend.
+    const pendingThreadJids = findPendingThreadJids(
+      chatJid,
+      lastAgentTimestamp,
+      assistantName,
+    );
+    for (const threadJid of pendingThreadJids) {
+      const channel = findChannel(channels, chatJid);
+      if (channel?.isConnected()) {
+        channel
+          .sendMessage(
+            threadJid,
+            `_Service restarted — your last message wasn't processed. Please resend to continue._`,
+          )
+          .catch((err: unknown) =>
+            logger.warn(
+              { group: group.name, threadJid, err },
+              'Failed to send thread recovery notice',
+            ),
+          );
+        logger.info(
+          { group: group.name, threadJid },
+          'Sent thread recovery notice (auto-recovery skipped)',
+        );
+      }
+    }
   }
 }
 
