@@ -148,7 +148,7 @@ The host has a safety net that rescues unpushed commits to `rescue/` branches, b
 ## Response Style
 
 Structure every response for scannability — regardless of channel:
-- Use emoji + bold section headers to anchor major sections (e.g. 🔑 *Decisions*, ✅ *Action Items*, 📋 *Summary*, 📧 *Emails*, 🗓 *Calendar*). Pick emojis contextually — informative, not decorative.
+- Use emoji + bold section headers to anchor major sections (e.g. 🔑 Decisions, ✅ Action Items, 📋 Summary, 📧 Emails, 🗓 Calendar). Pick emojis contextually — informative, not decorative. Use the bold syntax appropriate for your channel (see Message Formatting below).
 - Use bullet points for lists, not paragraphs
 - Bold key terms inline
 - Short paragraphs — no walls of text
