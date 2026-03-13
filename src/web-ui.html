@@ -5,65 +5,123 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>NanoClaw Monitor</title>
 <style>
+:root {
+  --bg-primary: #0d1117;
+  --bg-secondary: #161b22;
+  --bg-tertiary: #1c2128;
+  --border: #21262d;
+  --text-primary: #e6edf3;
+  --text-secondary: #8b949e;
+  --text-muted: #484f58;
+  --accent: #58a6ff;
+  --green: #3fb950;
+  --red: #f85149;
+  --orange: #ffa657;
+  --purple: #bc8cff;
+  --radius: 8px;
+}
 * { margin: 0; padding: 0; box-sizing: border-box; }
-body { font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace; background: #0d1117; color: #c9d1d9; height: 100vh; display: flex; flex-direction: column; }
-header { display: flex; align-items: center; justify-content: space-between; padding: 12px 16px; border-bottom: 1px solid #21262d; background: #161b22; }
-header h1 { font-size: 16px; font-weight: 600; color: #58a6ff; }
-.controls { display: flex; gap: 8px; align-items: center; }
-.controls input[type="text"] { background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 4px 8px; color: #c9d1d9; font-size: 12px; width: 140px; }
-.controls label { font-size: 11px; color: #8b949e; cursor: pointer; user-select: none; }
-.controls input[type="checkbox"] { margin-right: 3px; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif; background: var(--bg-primary); color: var(--text-primary); height: 100vh; height: 100dvh; display: flex; flex-direction: column; -webkit-font-smoothing: antialiased; }
+code, .mono { font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', ui-monospace, monospace; }
+
+/* Header */
+header { display: flex; align-items: center; justify-content: space-between; padding: 10px 16px; border-bottom: 1px solid var(--border); background: var(--bg-secondary); flex-shrink: 0; }
+header h1 { font-size: 15px; font-weight: 700; color: var(--accent); letter-spacing: -0.3px; }
+.header-right { display: flex; gap: 6px; align-items: center; }
+
+/* Filter pills */
+.filter-bar { display: flex; gap: 6px; padding: 8px 12px; border-bottom: 1px solid var(--border); background: var(--bg-secondary); flex-wrap: wrap; align-items: center; flex-shrink: 0; }
+.filter-bar input[type="text"] { background: var(--bg-primary); border: 1px solid var(--border); border-radius: var(--radius); padding: 5px 10px; color: var(--text-primary); font-size: 13px; flex: 1; min-width: 100px; max-width: 200px; }
+.filter-bar input[type="text"]:focus { border-color: var(--accent); outline: none; }
+.filter-pill { display: inline-flex; align-items: center; gap: 4px; padding: 4px 10px; border-radius: 20px; font-size: 12px; font-weight: 500; cursor: pointer; user-select: none; border: 1px solid var(--border); background: var(--bg-primary); color: var(--text-secondary); transition: all 0.15s; }
+.filter-pill.active { border-color: transparent; color: #fff; }
+.filter-pill.active.text { background: #1f6feb; }
+.filter-pill.active.tool_use { background: #238636; }
+.filter-pill.active.thinking { background: #6e40c9; }
+.filter-pill.active.system { background: #484f58; }
+.filter-pill:not(.active) { opacity: 0.5; }
+
+/* Layout */
 .main { display: flex; flex: 1; overflow: hidden; }
-.sidebar { width: 200px; min-width: 200px; border-right: 1px solid #21262d; background: #161b22; overflow-y: auto; padding: 8px; }
-.sidebar h2 { font-size: 12px; color: #8b949e; text-transform: uppercase; margin-bottom: 8px; }
-.session-item { padding: 6px 8px; border-radius: 4px; margin-bottom: 4px; cursor: pointer; font-size: 12px; }
-.session-item:hover { background: #21262d; }
-.session-item.active { background: #1f6feb33; border: 1px solid #1f6feb; }
-.session-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: 6px; }
-.session-dot.live { background: #3fb950; }
-.session-dot.idle { background: #8b949e; }
-.session-group { font-weight: 600; color: #c9d1d9; }
-.session-thread { color: #8b949e; font-size: 11px; display: block; margin-left: 12px; }
-.no-sessions { color: #484f58; font-size: 12px; font-style: italic; padding: 8px; }
-.content { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
-.events { flex: 1; overflow-y: auto; padding: 8px 12px; }
-.event { padding: 4px 0; border-bottom: 1px solid #21262d; font-size: 13px; line-height: 1.5; display: flex; gap: 8px; }
-.event-time { color: #484f58; flex-shrink: 0; font-size: 11px; min-width: 55px; }
-.event-group { color: #8b949e; flex-shrink: 0; font-size: 11px; min-width: 70px; overflow: hidden; text-overflow: ellipsis; }
-.event-type { flex-shrink: 0; font-size: 11px; padding: 1px 5px; border-radius: 3px; min-width: 60px; text-align: center; }
-.event-type.text { background: #1f6feb33; color: #58a6ff; }
-.event-type.tool_use { background: #238636; color: #3fb950; }
-.event-type.thinking { background: #8957e533; color: #bc8cff; }
-.event-type.system { background: #21262d; color: #8b949e; }
-.event-body { flex: 1; overflow: hidden; word-break: break-word; }
-.event-body .tool-name { color: #ffa657; font-weight: 600; }
-.event-body .tool-input { color: #8b949e; }
-.event-body.collapsed { max-height: 40px; overflow: hidden; cursor: pointer; position: relative; }
-.event-body.collapsed::after { content: '...click to expand'; position: absolute; bottom: 0; right: 0; background: #0d1117; color: #484f58; padding: 0 4px; font-size: 10px; }
+.sidebar { width: 200px; min-width: 200px; border-right: 1px solid var(--border); background: var(--bg-secondary); overflow-y: auto; flex-shrink: 0; }
+.sidebar h2 { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; padding: 12px 12px 6px; }
+.session-item { display: flex; align-items: center; gap: 8px; padding: 8px 12px; cursor: pointer; font-size: 13px; border-left: 2px solid transparent; transition: background 0.1s; }
+.session-item:hover { background: var(--bg-tertiary); }
+.session-item.selected { background: var(--bg-tertiary); border-left-color: var(--accent); }
+.session-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); flex-shrink: 0; animation: pulse 2s infinite; }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+.session-info { overflow: hidden; }
+.session-group { font-weight: 600; color: var(--text-primary); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.session-thread { color: var(--text-muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.session-channel { color: var(--text-muted); font-size: 10px; }
+.no-sessions { color: var(--text-muted); font-size: 12px; padding: 16px 12px; text-align: center; }
+
+/* Events */
+.content { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-width: 0; }
+.events { flex: 1; overflow-y: auto; padding: 4px 0; -webkit-overflow-scrolling: touch; }
+.event { display: flex; align-items: flex-start; gap: 6px; padding: 4px 12px; font-size: 13px; line-height: 1.4; border-bottom: 1px solid var(--border); }
+.event-meta { display: flex; gap: 6px; align-items: center; flex-shrink: 0; padding-top: 1px; }
+.event-time { color: var(--text-muted); font-size: 11px; font-family: ui-monospace, monospace; }
+.event-badge { font-size: 10px; font-weight: 600; padding: 1px 6px; border-radius: 4px; text-transform: uppercase; letter-spacing: 0.3px; white-space: nowrap; }
+.event-badge.text { background: #1f6feb33; color: var(--accent); }
+.event-badge.tool_use { background: #23863633; color: var(--green); }
+.event-badge.thinking { background: #6e40c933; color: var(--purple); }
+.event-badge.system { background: #21262d; color: var(--text-muted); }
+.event-body { flex: 1; min-width: 0; overflow: hidden; color: var(--text-secondary); font-size: 13px; max-height: 2.8em; line-height: 1.4; }
 .event-body.expanded { max-height: none; }
-.intervention { display: flex; gap: 8px; padding: 8px 12px; border-top: 1px solid #21262d; background: #161b22; }
-.intervention select { background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 6px 8px; color: #c9d1d9; font-size: 12px; min-width: 120px; }
-.intervention input[type="text"] { flex: 1; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 6px 10px; color: #c9d1d9; font-size: 13px; }
-.intervention input[type="text"]:focus { border-color: #1f6feb; outline: none; }
-.intervention button { background: #238636; border: none; border-radius: 6px; padding: 6px 16px; color: #fff; font-size: 13px; cursor: pointer; font-weight: 600; }
-.intervention button:hover { background: #2ea043; }
-.intervention button:disabled { background: #21262d; color: #484f58; cursor: not-allowed; }
-.status-bar { font-size: 11px; color: #484f58; padding: 4px 12px; border-top: 1px solid #21262d; display: flex; justify-content: space-between; }
-.connected { color: #3fb950; }
-.disconnected { color: #f85149; }
-.auto-scroll-btn { position: fixed; bottom: 80px; right: 20px; background: #1f6feb; border: none; border-radius: 20px; padding: 6px 12px; color: #fff; font-size: 11px; cursor: pointer; display: none; z-index: 10; }
-.auto-scroll-btn.visible { display: block; }
+.event-body .tool-name { color: var(--orange); font-weight: 600; font-family: ui-monospace, monospace; font-size: 12px; }
+.event-body .tool-input { color: var(--text-muted); font-family: ui-monospace, monospace; font-size: 11px; }
+.event-expand { flex-shrink: 0; color: var(--text-muted); cursor: pointer; font-size: 11px; padding: 2px 4px; border-radius: 4px; }
+.event-expand:hover { background: var(--bg-tertiary); color: var(--text-secondary); }
+.event-group-tag { color: var(--text-muted); font-size: 10px; flex-shrink: 0; max-width: 60px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Bottom bar */
+.intervention { display: flex; gap: 8px; padding: 8px 12px; border-top: 1px solid var(--border); background: var(--bg-secondary); flex-shrink: 0; }
+.intervention select { background: var(--bg-primary); border: 1px solid var(--border); border-radius: var(--radius); padding: 8px; color: var(--text-primary); font-size: 13px; min-width: 100px; max-width: 160px; }
+.intervention input[type="text"] { flex: 1; background: var(--bg-primary); border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 12px; color: var(--text-primary); font-size: 14px; min-width: 0; }
+.intervention input[type="text"]:focus { border-color: var(--accent); outline: none; }
+.intervention button { background: var(--green); border: none; border-radius: var(--radius); padding: 8px 16px; color: #fff; font-size: 13px; cursor: pointer; font-weight: 600; flex-shrink: 0; }
+.intervention button:hover { filter: brightness(1.1); }
+.intervention button:disabled { background: var(--border); color: var(--text-muted); cursor: not-allowed; filter: none; }
+.status-bar { font-size: 11px; color: var(--text-muted); padding: 4px 12px; border-top: 1px solid var(--border); display: flex; justify-content: space-between; flex-shrink: 0; }
+.connected { color: var(--green); }
+.disconnected { color: var(--red); }
+.scroll-fab { position: fixed; bottom: 100px; right: 16px; background: var(--accent); border: none; border-radius: 24px; width: 40px; height: 40px; color: #fff; font-size: 18px; cursor: pointer; display: none; z-index: 10; box-shadow: 0 2px 8px rgba(0,0,0,0.4); }
+.scroll-fab.visible { display: flex; align-items: center; justify-content: center; }
+
+/* Mobile */
+@media (max-width: 640px) {
+  .sidebar { display: none; }
+  .filter-bar { padding: 6px 8px; gap: 4px; }
+  .filter-bar input[type="text"] { max-width: 120px; font-size: 12px; padding: 4px 8px; }
+  .filter-pill { font-size: 11px; padding: 3px 8px; }
+  .event { padding: 4px 8px; gap: 4px; }
+  .event-meta { flex-direction: column; gap: 2px; align-items: flex-start; min-width: 50px; }
+  .event-time { font-size: 10px; }
+  .event-body { font-size: 12px; max-height: 2.8em; }
+  .event-group-tag { display: none; }
+  .intervention { padding: 6px 8px; gap: 4px; }
+  .intervention select { min-width: 80px; max-width: 100px; font-size: 12px; padding: 6px; }
+  .intervention input[type="text"] { font-size: 13px; padding: 6px 8px; }
+  .intervention button { padding: 6px 12px; font-size: 12px; }
+}
 </style>
 </head>
 <body>
 <header>
-  <h1>NanoClaw Monitor</h1>
-  <div class="controls">
-    <input type="text" id="filter" placeholder="Filter group...">
-    <label><input type="checkbox" id="toggle-thinking" checked> thinking</label>
-    <label><input type="checkbox" id="toggle-system" checked> system</label>
+  <h1>NanoClaw</h1>
+  <div class="header-right">
+    <span id="status" class="disconnected" style="font-size:11px">Connecting...</span>
   </div>
 </header>
+<div class="filter-bar">
+  <input type="text" id="filter" placeholder="Filter group...">
+  <span class="filter-pill active text" data-type="text" onclick="toggleType(this)">text</span>
+  <span class="filter-pill active tool_use" data-type="tool_use" onclick="toggleType(this)">tools</span>
+  <span class="filter-pill active thinking" data-type="thinking" onclick="toggleType(this)">thinking</span>
+  <span class="filter-pill active system" data-type="system" onclick="toggleType(this)">system</span>
+  <span id="event-count" style="font-size:11px;color:var(--text-muted);margin-left:auto"></span>
+</div>
 <div class="main">
   <div class="sidebar">
     <h2>Sessions</h2>
@@ -71,15 +129,15 @@ header h1 { font-size: 16px; font-weight: 600; color: #58a6ff; }
   </div>
   <div class="content">
     <div class="events" id="events"></div>
-    <button class="auto-scroll-btn" id="scroll-btn" onclick="resumeAutoScroll()">Resume auto-scroll</button>
+    <button class="scroll-fab" id="scroll-btn" onclick="resumeAutoScroll()">&#8595;</button>
     <div class="intervention">
-      <select id="session-select"><option value="">Select session...</option></select>
-      <input type="text" id="intervene-text" placeholder="Send message to agent..." disabled>
+      <select id="session-select"><option value="">Session...</option></select>
+      <input type="text" id="intervene-text" placeholder="Message agent..." disabled>
       <button id="intervene-btn" disabled onclick="sendIntervention()">Send</button>
     </div>
     <div class="status-bar">
-      <span id="status" class="disconnected">Connecting...</span>
-      <span id="event-count">0 events</span>
+      <span id="sessions-summary"></span>
+      <span></span>
     </div>
   </div>
 </div>
@@ -93,22 +151,21 @@ const sessionSelectEl = document.getElementById('session-select');
 const interveneTextEl = document.getElementById('intervene-text');
 const interveneBtnEl = document.getElementById('intervene-btn');
 const scrollBtnEl = document.getElementById('scroll-btn');
-const toggleThinking = document.getElementById('toggle-thinking');
-const toggleSystem = document.getElementById('toggle-system');
+const sessionsSummaryEl = document.getElementById('sessions-summary');
 
 let sessions = {};
 let eventCount = 0;
 let autoScroll = true;
 let selectedFilter = '';
-const MAX_EVENTS = 2000;
+const MAX_EVENTS = 1500;
 
-// Extract auth token from URL query param (e.g. ?token=abc123)
+// Track which event types are visible
+const visibleTypes = { text: true, tool_use: true, thinking: true, system: true };
+
 const urlParams = new URLSearchParams(window.location.search);
 const authToken = urlParams.get('token') || '';
 
 filterEl.addEventListener('input', () => { selectedFilter = filterEl.value.toLowerCase(); applyFilters(); });
-toggleThinking.addEventListener('change', applyFilters);
-toggleSystem.addEventListener('change', applyFilters);
 sessionSelectEl.addEventListener('change', () => {
   const hasSession = sessionSelectEl.value !== '';
   interveneTextEl.disabled = !hasSession;
@@ -120,14 +177,16 @@ interveneTextEl.addEventListener('keydown', (e) => {
 
 eventsEl.addEventListener('scroll', () => {
   const atBottom = eventsEl.scrollHeight - eventsEl.scrollTop - eventsEl.clientHeight < 40;
-  if (atBottom) {
-    autoScroll = true;
-    scrollBtnEl.classList.remove('visible');
-  } else {
-    autoScroll = false;
-    scrollBtnEl.classList.add('visible');
-  }
+  if (atBottom) { autoScroll = true; scrollBtnEl.classList.remove('visible'); }
+  else { autoScroll = false; scrollBtnEl.classList.add('visible'); }
 });
+
+function toggleType(el) {
+  const type = el.dataset.type;
+  visibleTypes[type] = !visibleTypes[type];
+  el.classList.toggle('active', visibleTypes[type]);
+  applyFilters();
+}
 
 function resumeAutoScroll() {
   autoScroll = true;
@@ -136,13 +195,12 @@ function resumeAutoScroll() {
 }
 
 function formatTime(ts) {
-  const d = new Date(ts);
-  return d.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+  return new Date(ts).toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
 
 function truncate(str, max) {
   if (!str) return '';
-  return str.length > max ? str.slice(0, max) + '...' : str;
+  return str.length > max ? str.slice(0, max) + '\u2026' : str;
 }
 
 function escapeHtml(str) {
@@ -151,29 +209,46 @@ function escapeHtml(str) {
   return div.innerHTML;
 }
 
+/** Derive a friendly channel label from a JID */
+function channelFromJid(jid) {
+  if (!jid) return '';
+  if (jid.startsWith('dc:')) return 'Discord';
+  if (jid.startsWith('slack:')) return 'Slack';
+  if (jid.startsWith('tg:')) return 'Telegram';
+  if (jid.startsWith('wa:') || jid.includes('@')) return 'WhatsApp';
+  if (jid.startsWith('gmail:')) return 'Gmail';
+  return '';
+}
+
 function renderSessions() {
   const keys = Object.keys(sessions);
+  // Update mobile summary
+  sessionsSummaryEl.textContent = keys.length ? keys.length + ' active session' + (keys.length > 1 ? 's' : '') : 'No active sessions';
   if (keys.length === 0) {
     sessionsEl.innerHTML = '<div class="no-sessions">No active sessions</div>';
-    sessionSelectEl.innerHTML = '<option value="">No active sessions</option>';
+    sessionSelectEl.innerHTML = '<option value="">No sessions</option>';
     interveneTextEl.disabled = true;
     interveneBtnEl.disabled = true;
     return;
   }
   sessionsEl.innerHTML = keys.map(key => {
     const s = sessions[key];
+    const ch = channelFromJid(s.groupJid);
     return `<div class="session-item" onclick="setFilter(${escapeHtml(JSON.stringify(s.group))})">
-      <span class="session-dot live"></span>
-      <span class="session-group">${escapeHtml(s.group)}</span>
-      ${s.threadId ? `<span class="session-thread">${escapeHtml(s.threadId)}</span>` : ''}
+      <span class="session-dot"></span>
+      <div class="session-info">
+        <div class="session-group">${escapeHtml(s.group)}</div>
+        ${ch ? `<div class="session-channel">${escapeHtml(ch)}</div>` : ''}
+        ${s.threadId ? `<div class="session-thread">thread ${escapeHtml(s.threadId.slice(0,12))}</div>` : ''}
+      </div>
     </div>`;
   }).join('');
-  // Update session selector for intervention
   const prevVal = sessionSelectEl.value;
-  sessionSelectEl.innerHTML = '<option value="">Select session...</option>' +
+  sessionSelectEl.innerHTML = '<option value="">Session...</option>' +
     keys.map(key => {
       const s = sessions[key];
-      const label = s.group + (s.threadId ? ` (${s.threadId.slice(0,8)})` : '');
+      const ch = channelFromJid(s.groupJid);
+      const label = s.group + (ch ? ' (' + ch + ')' : '') + (s.threadId ? ' #' + s.threadId.slice(0,6) : '');
       return `<option value="${escapeHtml(key)}" data-jid="${escapeHtml(s.groupJid)}" data-thread="${escapeHtml(s.threadId || '')}">${escapeHtml(label)}</option>`;
     }).join('');
   if (prevVal && sessionSelectEl.querySelector(`option[value="${prevVal}"]`)) {
@@ -194,8 +269,7 @@ function applyFilters() {
     const type = ev.dataset.type || '';
     let show = true;
     if (selectedFilter && !group.includes(selectedFilter)) show = false;
-    if (type === 'thinking' && !toggleThinking.checked) show = false;
-    if (type === 'system' && !toggleSystem.checked) show = false;
+    if (!visibleTypes[type]) show = false;
     ev.style.display = show ? '' : 'none';
   });
 }
@@ -208,12 +282,13 @@ function appendEvent(msg) {
   el.dataset.type = ev.eventType;
 
   let bodyHtml = '';
+  const isLong = (ev.data.text || ev.data.input || '').length > 120;
   switch (ev.eventType) {
     case 'text':
       bodyHtml = escapeHtml(truncate(ev.data.text, 500));
       break;
     case 'tool_use':
-      bodyHtml = `<span class="tool-name">${escapeHtml(ev.data.name || '')}</span> <span class="tool-input">${escapeHtml(truncate(ev.data.input, 200))}</span>`;
+      bodyHtml = `<span class="tool-name">${escapeHtml(ev.data.name || '')}</span> <span class="tool-input">${escapeHtml(truncate(ev.data.input, 150))}</span>`;
       break;
     case 'thinking':
       bodyHtml = escapeHtml(truncate(ev.data.text, 300));
@@ -223,52 +298,42 @@ function appendEvent(msg) {
       break;
   }
 
-  const isLong = (ev.data.text || ev.data.input || '').length > 200;
-  const collapseClass = isLong ? 'collapsed' : '';
-
-  el.innerHTML = `
-    <span class="event-time">${formatTime(ev.ts)}</span>
-    <span class="event-group">${escapeHtml(msg.group)}</span>
-    <span class="event-type ${ev.eventType}">${ev.eventType}</span>
-    <span class="event-body ${collapseClass}" onclick="this.classList.toggle('collapsed');this.classList.toggle('expanded')">${bodyHtml}</span>
-  `;
+  el.innerHTML =
+    `<div class="event-meta"><span class="event-time">${formatTime(ev.ts)}</span><span class="event-badge ${ev.eventType}">${ev.eventType === 'tool_use' ? 'tool' : ev.eventType}</span></div>` +
+    `<span class="event-group-tag">${escapeHtml(msg.group)}</span>` +
+    `<span class="event-body" data-full="${isLong ? '1' : ''}">${bodyHtml}</span>` +
+    (isLong ? `<span class="event-expand" onclick="toggleExpand(this)">+</span>` : '');
 
   // Apply current filters
   const group = (msg.group || '').toLowerCase();
   let show = true;
   if (selectedFilter && !group.includes(selectedFilter)) show = false;
-  if (ev.eventType === 'thinking' && !toggleThinking.checked) show = false;
-  if (ev.eventType === 'system' && !toggleSystem.checked) show = false;
+  if (!visibleTypes[ev.eventType]) show = false;
   if (!show) el.style.display = 'none';
 
   eventsEl.appendChild(el);
   eventCount++;
-  eventCountEl.textContent = eventCount + ' events';
+  eventCountEl.textContent = eventCount.toLocaleString();
 
-  // Prune old events
   while (eventsEl.children.length > MAX_EVENTS) {
     eventsEl.removeChild(eventsEl.firstChild);
   }
 
-  if (autoScroll) {
-    eventsEl.scrollTop = eventsEl.scrollHeight;
-  }
+  if (autoScroll) eventsEl.scrollTop = eventsEl.scrollHeight;
 }
 
-function initSessions(s) {
-  sessions = s || {};
-  renderSessions();
+function toggleExpand(btn) {
+  const body = btn.previousElementSibling;
+  const expanded = body.classList.toggle('expanded');
+  btn.textContent = expanded ? '\u2212' : '+';
 }
 
+function initSessions(s) { sessions = s || {}; renderSessions(); }
 function addSession(msg) {
   sessions[msg.sessionKey] = { group: msg.group, groupJid: msg.groupJid, threadId: msg.threadId };
   renderSessions();
 }
-
-function removeSession(msg) {
-  delete sessions[msg.sessionKey];
-  renderSessions();
-}
+function removeSession(msg) { delete sessions[msg.sessionKey]; renderSessions(); }
 
 async function sendIntervention() {
   const opt = sessionSelectEl.selectedOptions[0];
@@ -282,32 +347,18 @@ async function sendIntervention() {
   try {
     const headers = { 'Content-Type': 'application/json' };
     if (authToken) headers['Authorization'] = 'Bearer ' + authToken;
-    const res = await fetch('/api/intervene', {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ groupJid, threadId, text }),
-    });
+    const res = await fetch('/api/intervene', { method: 'POST', headers, body: JSON.stringify({ groupJid, threadId, text }) });
     const data = await res.json();
-    if (data.ok) {
-      interveneTextEl.value = '';
-    } else {
-      alert('Failed to send: no active container for this session');
-    }
-  } catch (err) {
-    alert('Failed to send: ' + err.message);
-  } finally {
-    interveneBtnEl.disabled = sessionSelectEl.value === '';
-  }
+    if (data.ok) { interveneTextEl.value = ''; }
+    else { alert('No active container for this session'); }
+  } catch (err) { alert('Send failed: ' + err.message); }
+  finally { interveneBtnEl.disabled = sessionSelectEl.value === ''; }
 }
 
-// SSE connection
 function connect() {
   const eventsUrl = authToken ? '/events?token=' + encodeURIComponent(authToken) : '/events';
   const es = new EventSource(eventsUrl);
-  es.onopen = () => {
-    statusEl.textContent = 'Connected';
-    statusEl.className = 'connected';
-  };
+  es.onopen = () => { statusEl.textContent = '\u25cf Connected'; statusEl.className = 'connected'; };
   es.onmessage = (e) => {
     try {
       const msg = JSON.parse(e.data);
@@ -317,14 +368,9 @@ function connect() {
         case 'session_end': removeSession(msg); break;
         case 'sessions': initSessions(msg.sessions); break;
       }
-    } catch (err) {
-      console.error('Failed to parse SSE message:', err);
-    }
+    } catch (err) { console.error('SSE parse error:', err); }
   };
-  es.onerror = () => {
-    statusEl.textContent = 'Disconnected - reconnecting...';
-    statusEl.className = 'disconnected';
-  };
+  es.onerror = () => { statusEl.textContent = '\u25cb Reconnecting...'; statusEl.className = 'disconnected'; };
 }
 
 connect();
