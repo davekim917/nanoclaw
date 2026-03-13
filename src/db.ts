@@ -1197,17 +1197,18 @@ export function getRecentMessages(
 
 /**
  * Fallback: search raw message content for a group's threads when FTS returns 0.
- * Uses sessions_v2 to map group_folder → chat_jids, then does LIKE-based keyword
- * matching on message content. Returns at most `limit` matching thread+snippet pairs.
+ * Uses sessions_v2 to map group_folder → chat_jids, then does a single bulk LIKE
+ * query across all chat_jids. Returns at most `limit` matching thread+snippet pairs
+ * with the actual last-activity timestamp of the matched message.
  */
 export function searchMessagesRaw(
   groupFolder: string,
   words: string[],
   limit: number = 5,
-): Array<{ thread_id: string; chat_jid: string; snippet: string }> {
+): Array<{ thread_id: string; chat_jid: string; snippet: string; last_activity: string }> {
   if (words.length === 0) return [];
 
-  // Get all chat_jids known for this group's threads
+  // One query to get all sessions for this group
   const sessions = db
     .prepare(
       `SELECT DISTINCT thread_id, chat_jid FROM sessions_v2
@@ -1217,31 +1218,54 @@ export function searchMessagesRaw(
 
   if (sessions.length === 0) return [];
 
-  const results: Array<{ thread_id: string; chat_jid: string; snippet: string }> = [];
+  // One bulk query across all chat_jids — avoids N+1 per-session queries
+  const chatJids = sessions.map((s) => s.chat_jid);
+  const inClause = chatJids.map(() => '?').join(', ');
+  const likeClauses = words.map(() => 'content LIKE ?').join(' OR ');
+  const likeParams = words.map((w) => `%${w}%`);
+
+  const matches = db
+    .prepare(
+      `SELECT chat_jid, content, timestamp FROM messages
+       WHERE chat_jid IN (${inClause})
+         AND content != '' AND content IS NOT NULL
+         AND (${likeClauses})
+       ORDER BY timestamp DESC`,
+    )
+    .all(...chatJids, ...likeParams) as Array<{
+    chat_jid: string;
+    content: string;
+    timestamp: string;
+  }>;
+
+  // Take the most recent matching message per chat_jid (already ordered DESC)
+  const matchByChatJid = new Map<string, { content: string; timestamp: string }>();
+  for (const m of matches) {
+    if (!matchByChatJid.has(m.chat_jid)) {
+      matchByChatJid.set(m.chat_jid, { content: m.content, timestamp: m.timestamp });
+    }
+  }
+
+  // Collect results in session order up to limit; seen guards against duplicate thread_ids
+  const results: Array<{
+    thread_id: string;
+    chat_jid: string;
+    snippet: string;
+    last_activity: string;
+  }> = [];
   const seen = new Set<string>();
 
   for (const { thread_id, chat_jid } of sessions) {
     if (results.length >= limit) break;
     if (seen.has(thread_id)) continue;
-
-    // Check if any keyword appears in messages for this chat_jid
-    const likeClauses = words.map(() => 'content LIKE ?').join(' OR ');
-    const likeParams = words.map((w) => `%${w}%`);
-    const match = db
-      .prepare(
-        `SELECT content FROM messages
-         WHERE chat_jid = ? AND content != '' AND content IS NOT NULL
-           AND (${likeClauses})
-         ORDER BY timestamp DESC LIMIT 1`,
-      )
-      .get(chat_jid, ...likeParams) as { content: string } | undefined;
-
+    const match = matchByChatJid.get(chat_jid);
     if (match) {
       seen.add(thread_id);
       results.push({
         thread_id,
         chat_jid,
         snippet: match.content.slice(0, 300),
+        last_activity: match.timestamp,
       });
     }
   }

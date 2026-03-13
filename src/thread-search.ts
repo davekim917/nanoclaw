@@ -12,6 +12,7 @@ import path from 'path';
 import { GROUPS_DIR } from './config.js';
 import {
   ThreadMetadataRow,
+  buildSessionKey,
   getRecentMessages,
   searchMessagesRaw,
   searchThreadsFTS,
@@ -56,7 +57,7 @@ export async function searchThreads(
       { query: sanitized, groupFolder, reason: 'no_fts_index_entries' },
       'FTS search returned 0 results — trying raw message fallback',
     );
-    return searchRawMessageFallback(groupFolder, query, sanitized, limit);
+    return searchRawMessageFallback(groupFolder, query, limit);
   }
 
   const results = candidates
@@ -92,13 +93,12 @@ export async function searchThreads(
 async function searchRawMessageFallback(
   groupFolder: string,
   originalQuery: string,
-  sanitizedQuery: string,
   limit: number,
 ): Promise<ThreadSearchResult[]> {
-  // Extract plain words from the sanitized FTS5 query ("word1" OR "word2" → ['word1','word2'])
-  const words = sanitizedQuery
-    .split(/\s+OR\s+/i)
-    .map((t) => t.replace(/^"|"$/g, '').trim())
+  // Tokenize using the same logic as sanitizeFtsQuery — extract plain words from the raw query
+  const words = originalQuery
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .split(/\s+/)
     .filter((w) => w.length > 0);
 
   const hits = searchMessagesRaw(groupFolder, words, limit);
@@ -116,13 +116,13 @@ async function searchRawMessageFallback(
     'FTS fallback: found matches in raw messages',
   );
 
-  return hits.map(({ thread_id, snippet }) => ({
-    thread_key: `${groupFolder}:thread:${thread_id}`,
+  return hits.map(({ thread_id, snippet, last_activity }) => ({
+    thread_key: buildSessionKey(groupFolder, thread_id),
     group_folder: groupFolder,
     thread_id,
     platform: detectPlatform(thread_id),
     topic_summary: `(unindexed thread) ${snippet}`,
-    last_activity: new Date().toISOString(),
+    last_activity,
   }));
 }
 
@@ -321,7 +321,8 @@ export function indexThreadSummaries(): number {
 /**
  * Generate a minimal summary from recent messages and index the thread.
  * Called after a container run when no summary.txt exists (session was too short
- * to trigger SDK compaction). Writes summary.txt so future runs also pick it up.
+ * to trigger SDK compaction). Writes summary.txt then delegates to indexSingleThread
+ * so future startup scans also pick it up without duplicating indexing logic.
  */
 export function indexThreadFromMessages(
   groupFolder: string,
@@ -332,7 +333,7 @@ export function indexThreadFromMessages(
   const messages = getRecentMessages(chatJid, 10);
   if (messages.length === 0) return false;
 
-  // Build a compact summary: first non-empty user message (most recent last)
+  // Build a compact summary from user messages (getRecentMessages returns DESC, reverse for chronological)
   const userMessages = messages
     .filter((m) => !m.is_from_me && m.content.trim())
     .reverse();
@@ -344,26 +345,19 @@ export function indexThreadFromMessages(
     .slice(0, 500);
   const summary = `[auto-indexed] ${snippet}`;
 
-  // Write summary.txt so indexSingleThread can pick it up next time too
+  // Write summary.txt so indexSingleThread (and future startup scans) can read it
+  const summaryPath = path.join(GROUPS_DIR, groupFolder, 'threads', threadId, 'summary.txt');
   try {
-    const threadDir = path.join(GROUPS_DIR, groupFolder, 'threads', threadId);
-    fs.mkdirSync(threadDir, { recursive: true });
-    fs.writeFileSync(path.join(threadDir, 'summary.txt'), summary, 'utf-8');
+    fs.mkdirSync(path.dirname(summaryPath), { recursive: true });
+    fs.writeFileSync(summaryPath, summary, 'utf-8');
   } catch (err) {
     logger.warn({ err, groupFolder, threadId }, 'Failed to write auto summary.txt');
-    // Still attempt to index directly
-  }
-
-  try {
-    const platform = detectPlatform(threadId);
-    const threadKey = `${groupFolder}:thread:${threadId}`;
-    const result = upsertThreadIndex(threadKey, groupFolder, threadId, platform, summary);
-    if (result) {
-      logger.info({ groupFolder, threadId }, 'Auto-indexed short thread from messages');
-    }
-    return result;
-  } catch (err) {
-    logger.warn({ err, groupFolder, threadId }, 'Failed to auto-index thread from messages');
     return false;
   }
+
+  const indexed = indexSingleThread(groupFolder, threadId);
+  if (indexed) {
+    logger.info({ groupFolder, threadId }, 'Auto-indexed short thread from messages');
+  }
+  return indexed;
 }
