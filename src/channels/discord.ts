@@ -770,8 +770,8 @@ export class DiscordChannel implements Channel {
       if (!fs.existsSync(statusPath)) return;
 
       const stat = fs.statSync(statusPath);
-      // Only announce if status file was written in the last 60s (covers restart lag)
-      if (Date.now() - stat.mtimeMs > 60_000) return;
+      // Only announce if status file was written in the last 5 min (covers slow restarts)
+      if (Date.now() - stat.mtimeMs > 300_000) return;
 
       const status = JSON.parse(fs.readFileSync(statusPath, 'utf-8'));
       const channel = await this.client!.channels.fetch(channelId);
