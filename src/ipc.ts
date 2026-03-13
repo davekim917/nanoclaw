@@ -243,6 +243,7 @@ export async function processTaskIpc(
     trigger?: string;
     requiresTrigger?: boolean;
     containerConfig?: RegisteredGroup['containerConfig'];
+    model?: string;
     // For ship_log / backlog
     itemId?: string;
     title?: string;
@@ -528,6 +529,43 @@ export async function processTaskIpc(
           { data },
           'Invalid register_group request - missing required fields',
         );
+      }
+      break;
+
+    case 'set_group_model':
+      // Only main group can update group model
+      if (!isMain) {
+        logger.warn(
+          { sourceGroup },
+          'Unauthorized set_group_model attempt blocked',
+        );
+        break;
+      }
+      if (data.jid) {
+        const existing = registeredGroups[data.jid];
+        if (!existing) {
+          logger.warn({ jid: data.jid }, 'set_group_model: unknown JID');
+          break;
+        }
+        const updatedConfig = {
+          ...existing.containerConfig,
+          ...(data.model ? { model: data.model } : {}),
+        };
+        // If model is null/empty string, remove the key
+        if (!data.model) {
+          delete updatedConfig.model;
+        }
+        deps.registerGroup(data.jid, {
+          ...existing,
+          containerConfig:
+            Object.keys(updatedConfig).length > 0 ? updatedConfig : undefined,
+        });
+        logger.info(
+          { jid: data.jid, model: data.model || '(cleared)' },
+          'Group model updated',
+        );
+      } else {
+        logger.warn({ data }, 'set_group_model: missing jid');
       }
       break;
 
