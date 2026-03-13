@@ -12,6 +12,8 @@ import path from 'path';
 import { GROUPS_DIR } from './config.js';
 import {
   ThreadMetadataRow,
+  getRecentMessages,
+  searchMessagesRaw,
   searchThreadsFTS,
   upsertThreadIndex,
 } from './db.js';
@@ -49,7 +51,13 @@ export async function searchThreads(
     return [];
   }
 
-  if (candidates.length === 0) return [];
+  if (candidates.length === 0) {
+    logger.info(
+      { query: sanitized, groupFolder, reason: 'no_fts_index_entries' },
+      'FTS search returned 0 results — trying raw message fallback',
+    );
+    return searchRawMessageFallback(groupFolder, query, sanitized, limit);
+  }
 
   const results = candidates
     .filter((c) => c.topic_summary)
@@ -74,6 +82,48 @@ export async function searchThreads(
     logger.warn({ err }, 'Haiku reranking failed, returning FTS5 results');
     return results.slice(0, limit);
   }
+}
+
+/**
+ * Fallback search used when FTS5 returns 0 results (thread was never summarized/indexed).
+ * Searches raw message content in the DB for threads matching any query keyword.
+ * Returns synthetic ThreadSearchResults with a content snippet as the summary.
+ */
+async function searchRawMessageFallback(
+  groupFolder: string,
+  originalQuery: string,
+  sanitizedQuery: string,
+  limit: number,
+): Promise<ThreadSearchResult[]> {
+  // Extract plain words from the sanitized FTS5 query ("word1" OR "word2" → ['word1','word2'])
+  const words = sanitizedQuery
+    .split(/\s+OR\s+/i)
+    .map((t) => t.replace(/^"|"$/g, '').trim())
+    .filter((w) => w.length > 0);
+
+  const hits = searchMessagesRaw(groupFolder, words, limit);
+
+  if (hits.length === 0) {
+    logger.info(
+      { query: originalQuery, groupFolder, reason: 'no_raw_message_matches' },
+      'Fallback message search also returned 0 results — no indexed or raw matches found',
+    );
+    return [];
+  }
+
+  logger.info(
+    { query: originalQuery, groupFolder, hits: hits.length },
+    'FTS fallback: found matches in raw messages',
+  );
+
+  return hits.map(({ thread_id, snippet }) => ({
+    thread_key: `${groupFolder}:thread:${thread_id}`,
+    group_folder: groupFolder,
+    thread_id,
+    platform: detectPlatform(thread_id),
+    topic_summary: `(unindexed thread) ${snippet}`,
+    last_activity: new Date().toISOString(),
+  }));
 }
 
 /**
@@ -266,4 +316,54 @@ export function indexThreadSummaries(): number {
   }
 
   return indexed;
+}
+
+/**
+ * Generate a minimal summary from recent messages and index the thread.
+ * Called after a container run when no summary.txt exists (session was too short
+ * to trigger SDK compaction). Writes summary.txt so future runs also pick it up.
+ */
+export function indexThreadFromMessages(
+  groupFolder: string,
+  threadId: string,
+  chatJid: string,
+): boolean {
+  // Grab the last 10 user messages for a quick topic snippet
+  const messages = getRecentMessages(chatJid, 10);
+  if (messages.length === 0) return false;
+
+  // Build a compact summary: first non-empty user message (most recent last)
+  const userMessages = messages
+    .filter((m) => !m.is_from_me && m.content.trim())
+    .reverse();
+  if (userMessages.length === 0) return false;
+
+  const snippet = userMessages
+    .map((m) => m.content.trim().slice(0, 150))
+    .join(' | ')
+    .slice(0, 500);
+  const summary = `[auto-indexed] ${snippet}`;
+
+  // Write summary.txt so indexSingleThread can pick it up next time too
+  try {
+    const threadDir = path.join(GROUPS_DIR, groupFolder, 'threads', threadId);
+    fs.mkdirSync(threadDir, { recursive: true });
+    fs.writeFileSync(path.join(threadDir, 'summary.txt'), summary, 'utf-8');
+  } catch (err) {
+    logger.warn({ err, groupFolder, threadId }, 'Failed to write auto summary.txt');
+    // Still attempt to index directly
+  }
+
+  try {
+    const platform = detectPlatform(threadId);
+    const threadKey = `${groupFolder}:thread:${threadId}`;
+    const result = upsertThreadIndex(threadKey, groupFolder, threadId, platform, summary);
+    if (result) {
+      logger.info({ groupFolder, threadId }, 'Auto-indexed short thread from messages');
+    }
+    return result;
+  } catch (err) {
+    logger.warn({ err, groupFolder, threadId }, 'Failed to auto-index thread from messages');
+    return false;
+  }
 }

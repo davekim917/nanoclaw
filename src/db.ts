@@ -1195,6 +1195,60 @@ export function getRecentMessages(
   }>;
 }
 
+/**
+ * Fallback: search raw message content for a group's threads when FTS returns 0.
+ * Uses sessions_v2 to map group_folder → chat_jids, then does LIKE-based keyword
+ * matching on message content. Returns at most `limit` matching thread+snippet pairs.
+ */
+export function searchMessagesRaw(
+  groupFolder: string,
+  words: string[],
+  limit: number = 5,
+): Array<{ thread_id: string; chat_jid: string; snippet: string }> {
+  if (words.length === 0) return [];
+
+  // Get all chat_jids known for this group's threads
+  const sessions = db
+    .prepare(
+      `SELECT DISTINCT thread_id, chat_jid FROM sessions_v2
+       WHERE group_folder = ? AND thread_id IS NOT NULL AND chat_jid IS NOT NULL`,
+    )
+    .all(groupFolder) as Array<{ thread_id: string; chat_jid: string }>;
+
+  if (sessions.length === 0) return [];
+
+  const results: Array<{ thread_id: string; chat_jid: string; snippet: string }> = [];
+  const seen = new Set<string>();
+
+  for (const { thread_id, chat_jid } of sessions) {
+    if (results.length >= limit) break;
+    if (seen.has(thread_id)) continue;
+
+    // Check if any keyword appears in messages for this chat_jid
+    const likeClauses = words.map(() => 'content LIKE ?').join(' OR ');
+    const likeParams = words.map((w) => `%${w}%`);
+    const match = db
+      .prepare(
+        `SELECT content FROM messages
+         WHERE chat_jid = ? AND content != '' AND content IS NOT NULL
+           AND (${likeClauses})
+         ORDER BY timestamp DESC LIMIT 1`,
+      )
+      .get(chat_jid, ...likeParams) as { content: string } | undefined;
+
+    if (match) {
+      seen.add(thread_id);
+      results.push({
+        thread_id,
+        chat_jid,
+        snippet: match.content.slice(0, 300),
+      });
+    }
+  }
+
+  return results;
+}
+
 // --- Registered group accessors ---
 
 export function getRegisteredGroup(

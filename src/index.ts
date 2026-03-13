@@ -99,7 +99,7 @@ import {
   isSessionCommandAllowed,
 } from './session-commands.js';
 import { startSchedulerLoop } from './task-scheduler.js';
-import { indexSingleThread, indexThreadSummaries } from './thread-search.js';
+import { indexSingleThread, indexThreadFromMessages, indexThreadSummaries } from './thread-search.js';
 import { checkUserOverride, shouldResetSession } from './topic-classifier.js';
 import { Attachment, Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
@@ -848,10 +848,14 @@ async function runAgent(
       );
 
       // Index this thread's summary (if PreCompact wrote one).
-      // Only indexes the single thread that just completed — not a full scan.
+      // If no summary.txt exists (short session, compaction never fired), generate
+      // a minimal summary from recent messages so the thread is searchable.
       setImmediate(() => {
         try {
-          indexSingleThread(group.folder, threadId);
+          const indexed = indexSingleThread(group.folder, threadId);
+          if (!indexed) {
+            indexThreadFromMessages(group.folder, threadId, chatJid);
+          }
         } catch (err) {
           logger.warn({ err }, 'Post-run thread indexing failed (non-fatal)');
         }
@@ -1167,13 +1171,16 @@ function recoverPendingMessages(): void {
       );
       queue.enqueueMessageCheck(chatJid); // parent processes itself
     }
-
   }
 
   // Notify threads that were mid-processing when the service stopped.
   // Single query returns all in-flight threads with their correct chat_jid.
   const inFlightThreads = findAllInFlightThreads();
-  for (const { thread_id, chat_jid: parentJid, group_folder } of inFlightThreads) {
+  for (const {
+    thread_id,
+    chat_jid: parentJid,
+    group_folder,
+  } of inFlightThreads) {
     const threadJid = `${parentJid}:thread:${thread_id}`;
     const channel = findChannel(channels, parentJid);
     if (channel?.isConnected()) {
