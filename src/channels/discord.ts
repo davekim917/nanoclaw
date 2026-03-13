@@ -304,6 +304,8 @@ export class DiscordChannel implements Channel {
           const btn = interaction as ButtonInteraction;
           if (btn.customId.startsWith('review-merge:')) {
             await this.handleReviewMergeButton(btn);
+          } else if (btn.customId.startsWith('simplify-merge:')) {
+            await this.handleSimplifyMergeButton(btn);
           } else if (btn.customId.startsWith('merge:')) {
             await this.handleMergeButton(btn);
           }
@@ -540,6 +542,10 @@ export class DiscordChannel implements Channel {
           .setLabel('Review & Merge')
           .setStyle(ButtonStyle.Primary),
         new ButtonBuilder()
+          .setCustomId(`simplify-merge:${match[0]}`)
+          .setLabel('Simplify & Merge')
+          .setStyle(ButtonStyle.Primary),
+        new ButtonBuilder()
           .setCustomId(`merge:${match[0]}`)
           .setLabel('Merge')
           .setStyle(ButtonStyle.Secondary),
@@ -674,6 +680,22 @@ export class DiscordChannel implements Channel {
 
     this.injectMessage(interaction, prompt);
     await interaction.editReply('Starting review pipeline...');
+  }
+
+  /** Simplify & Merge: run /simplify then merge (no review swarm). */
+  private async handleSimplifyMergeButton(
+    interaction: ButtonInteraction,
+  ): Promise<void> {
+    const prUrl = interaction.customId.replace('simplify-merge:', '');
+    await interaction.deferReply();
+
+    const prompt =
+      `Simplify and merge ${prUrl}:\n` +
+      `1. Run /simplify on the PR changed files — fix any code quality issues\n` +
+      `2. If clean, merge with \`gh pr merge ${prUrl} --squash --delete-branch\``;
+
+    this.injectMessage(interaction, prompt);
+    await interaction.editReply('Starting simplify pipeline...');
   }
 
   /** Merge: merge the PR directly via gh CLI. */
