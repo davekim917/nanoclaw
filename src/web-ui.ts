@@ -26,6 +26,12 @@ interface WebUIDeps {
     threadId: string | undefined,
     text: string,
   ) => boolean;
+  getRegisteredGroups: () => Array<{
+    jid: string;
+    name: string;
+    folder: string;
+  }>;
+  startSession: (groupJid: string, text: string) => boolean;
 }
 
 export interface WebUIHandle {
@@ -175,6 +181,47 @@ function handleIntervene(
   });
 }
 
+function handleSend(
+  req: IncomingMessage,
+  res: ServerResponse,
+  deps: WebUIDeps,
+): void {
+  let body = '';
+  let aborted = false;
+  req.on('error', () => {
+    aborted = true;
+  });
+  req.on('data', (chunk: Buffer) => {
+    if (body.length + chunk.length > 65_536) {
+      aborted = true;
+      req.destroy();
+      res.writeHead(413, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'Body too large' }));
+      return;
+    }
+    body += chunk;
+  });
+  req.on('end', () => {
+    if (aborted) return;
+    try {
+      const { groupJid, text } = JSON.parse(body);
+      if (!groupJid || !text) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({ ok: false, error: 'Missing groupJid or text' }),
+        );
+        return;
+      }
+      const ok = deps.startSession(groupJid, text);
+      res.writeHead(ok ? 200 : 404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok }));
+    } catch {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'Invalid JSON' }));
+    }
+  });
+}
+
 export function startWebUI(
   port: number,
   htmlPath: string,
@@ -205,6 +252,11 @@ export function startWebUI(
       req.on('close', () => clients.delete(res));
     } else if (pathname === '/api/intervene' && req.method === 'POST') {
       handleIntervene(req, res, deps);
+    } else if (pathname === '/api/groups' && req.method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ groups: deps.getRegisteredGroups() }));
+    } else if (pathname === '/api/send' && req.method === 'POST') {
+      handleSend(req, res, deps);
     } else if (pathname === '/api/sessions' && req.method === 'GET') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(
