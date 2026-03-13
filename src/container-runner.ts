@@ -304,6 +304,86 @@ function execAsync(cmd: string, options?: { cwd?: string }): Promise<string> {
   });
 }
 
+/** Find subdirectories that are git worktrees (contain a `.git` file, not directory). */
+function findGitWorktrees(
+  dir: string,
+): Array<{ name: string; wtPath: string }> {
+  const results: Array<{ name: string; wtPath: string }> = [];
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const wtPath = path.join(dir, entry.name);
+    try {
+      if (fs.statSync(path.join(wtPath, '.git')).isFile()) {
+        results.push({ name: entry.name, wtPath });
+      }
+    } catch {
+      /* .git doesn't exist — not a worktree */
+    }
+  }
+  return results;
+}
+
+/**
+ * Rescue uncommitted or unpushed work from a worktree before it's removed.
+ * Creates a rescue branch and pushes it to origin so no work is lost.
+ * Best-effort — failures are logged but never prevent cleanup.
+ */
+async function rescueWorktreeChanges(
+  wtPath: string,
+  groupFolder: string,
+  threadId?: string,
+): Promise<void> {
+  const repoName = path.basename(wtPath);
+  try {
+    // Check for uncommitted changes
+    const status = await execAsync('git status --porcelain', { cwd: wtPath });
+
+    if (status) {
+      // Stage and commit everything
+      await execAsync('git add -A', { cwd: wtPath });
+      await execAsync(
+        'git commit -m "rescue: auto-save uncommitted work before worktree cleanup"',
+        { cwd: wtPath },
+      );
+    }
+
+    // Skip repos without a remote (nothing to push to)
+    const remoteOutput = await execAsync('git remote', { cwd: wtPath });
+    if (!remoteOutput) return;
+
+    // Check if current HEAD has commits not on any remote branch
+    const unpushed = await execAsync('git log --oneline HEAD --not --remotes', {
+      cwd: wtPath,
+    });
+    if (!unpushed) return;
+
+    // Push HEAD to a rescue branch without changing local branch pointer
+    const timestamp = new Date()
+      .toISOString()
+      .replace(/[:.]/g, '-')
+      .slice(0, 19);
+    const threadSuffix = threadId
+      ? `/${threadId.slice(0, 12).replace(/[^a-zA-Z0-9_-]/g, '_')}`
+      : '';
+    const safeFolderName = groupFolder.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const branchName = `rescue/${safeFolderName}${threadSuffix}/${timestamp}`;
+
+    await execAsync(`git push origin HEAD:refs/heads/${branchName}`, {
+      cwd: wtPath,
+    });
+
+    logger.info(
+      { group: groupFolder, threadId, repo: repoName, branch: branchName },
+      'Rescued unpushed worktree changes to remote branch',
+    );
+  } catch (err) {
+    logger.warn(
+      { group: groupFolder, threadId, repo: repoName, err },
+      'Failed to rescue worktree changes (work may be lost)',
+    );
+  }
+}
+
 /** Remove a git worktree with fallback to rm + prune. Best-effort, never throws. */
 async function removeWorktree(repoDir: string, wtPath: string): Promise<void> {
   try {
@@ -484,19 +564,23 @@ export async function cleanupThreadWorkspace(
     }
   }
 
-  // Remove git worktrees
+  // Rescue unpushed work, then remove git worktrees
   try {
-    const entries = fs.readdirSync(worktreeBase, { withFileTypes: true });
-    const removals: Promise<void>[] = [];
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
-      const wtPath = path.join(worktreeBase, entry.name);
-      const gitFile = path.join(wtPath, '.git');
-      if (fs.existsSync(gitFile) && fs.statSync(gitFile).isFile()) {
-        removals.push(removeWorktree(path.join(groupDir, entry.name), wtPath));
-      }
-    }
-    await Promise.all(removals);
+    const gitWorktrees = findGitWorktrees(worktreeBase);
+
+    // Rescue phase: independent repos, safe to parallelize
+    await Promise.all(
+      gitWorktrees.map(({ wtPath }) =>
+        rescueWorktreeChanges(wtPath, groupFolder, threadId),
+      ),
+    );
+
+    // Removal phase
+    await Promise.all(
+      gitWorktrees.map(({ name, wtPath }) =>
+        removeWorktree(path.join(groupDir, name), wtPath),
+      ),
+    );
   } catch {
     // ignore readdir errors
   }
@@ -634,11 +718,24 @@ export async function cleanupOrphanWorktrees(): Promise<void> {
         await Promise.all(pruneOps);
       }
 
-      // Remove stale worktree directories
+      // Rescue unpushed work from orphan worktrees, then remove them
       const threadDirs = fs.readdirSync(gfPath);
       for (const td of threadDirs) {
         const tdPath = path.join(gfPath, td);
         if (!fs.statSync(tdPath).isDirectory()) continue;
+
+        // Rescue unpushed work from git worktrees inside this thread dir
+        try {
+          const worktrees = findGitWorktrees(tdPath);
+          await Promise.all(
+            worktrees.map(({ wtPath }) =>
+              rescueWorktreeChanges(wtPath, gf, td),
+            ),
+          );
+        } catch {
+          /* best-effort rescue */
+        }
+
         try {
           fs.rmSync(tdPath, { recursive: true, force: true });
           cleaned++;

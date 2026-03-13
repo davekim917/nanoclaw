@@ -115,6 +115,15 @@ When asked to make code changes or open PRs:
 4. Make the changes
 5. Commit, push, and open a PR using `gh pr create`
 6. Share the PR link
+
+### Save your work before finishing
+
+Your workspace is a temporary worktree — it gets cleaned up after your session ends. **Always commit and push before you stop working**, even if the work is incomplete:
+- Create a WIP branch if needed (`git checkout -b wip/{descriptive-name}`)
+- `git add -A && git commit -m "wip: {what was done so far}"`
+- `git push origin HEAD`
+
+The host has a safety net that rescues unpushed commits to `rescue/` branches, but don't rely on it — push your own work explicitly.
 ## Response Style
 
 Structure every response for scannability — regardless of channel:
