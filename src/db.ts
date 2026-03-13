@@ -1205,7 +1205,12 @@ export function searchMessagesRaw(
   groupFolder: string,
   words: string[],
   limit: number = 5,
-): Array<{ thread_id: string; chat_jid: string; snippet: string; last_activity: string }> {
+): Array<{
+  thread_id: string;
+  chat_jid: string;
+  snippet: string;
+  last_activity: string;
+}> {
   if (words.length === 0) return [];
 
   // One query to get all sessions for this group
@@ -1239,10 +1244,16 @@ export function searchMessagesRaw(
   }>;
 
   // Take the most recent matching message per chat_jid (already ordered DESC)
-  const matchByChatJid = new Map<string, { content: string; timestamp: string }>();
+  const matchByChatJid = new Map<
+    string,
+    { content: string; timestamp: string }
+  >();
   for (const m of matches) {
     if (!matchByChatJid.has(m.chat_jid)) {
-      matchByChatJid.set(m.chat_jid, { content: m.content, timestamp: m.timestamp });
+      matchByChatJid.set(m.chat_jid, {
+        content: m.content,
+        timestamp: m.timestamp,
+      });
     }
   }
 

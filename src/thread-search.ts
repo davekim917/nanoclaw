@@ -346,18 +346,30 @@ export function indexThreadFromMessages(
   const summary = `[auto-indexed] ${snippet}`;
 
   // Write summary.txt so indexSingleThread (and future startup scans) can read it
-  const summaryPath = path.join(GROUPS_DIR, groupFolder, 'threads', threadId, 'summary.txt');
+  const summaryPath = path.join(
+    GROUPS_DIR,
+    groupFolder,
+    'threads',
+    threadId,
+    'summary.txt',
+  );
   try {
     fs.mkdirSync(path.dirname(summaryPath), { recursive: true });
     fs.writeFileSync(summaryPath, summary, 'utf-8');
   } catch (err) {
-    logger.warn({ err, groupFolder, threadId }, 'Failed to write auto summary.txt');
+    logger.warn(
+      { err, groupFolder, threadId },
+      'Failed to write auto summary.txt',
+    );
     return false;
   }
 
   const indexed = indexSingleThread(groupFolder, threadId);
   if (indexed) {
-    logger.info({ groupFolder, threadId }, 'Auto-indexed short thread from messages');
+    logger.info(
+      { groupFolder, threadId },
+      'Auto-indexed short thread from messages',
+    );
   }
   return indexed;
 }
