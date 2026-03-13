@@ -99,7 +99,11 @@ import {
   isSessionCommandAllowed,
 } from './session-commands.js';
 import { startSchedulerLoop } from './task-scheduler.js';
-import { indexSingleThread, indexThreadFromMessages, indexThreadSummaries } from './thread-search.js';
+import {
+  indexSingleThread,
+  indexThreadFromMessages,
+  indexThreadSummaries,
+} from './thread-search.js';
 import { checkUserOverride, shouldResetSession } from './topic-classifier.js';
 import { Attachment, Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
