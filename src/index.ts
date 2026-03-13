@@ -17,6 +17,8 @@ import {
   THREAD_DEBOUNCE_MS,
   THREAD_SESSION_IDLE_HOURS,
   TIMEZONE,
+  WEB_UI_PORT,
+  WEB_UI_TOKEN,
   buildTriggerPattern,
   getParentJid,
   parseThreadJid,
@@ -31,6 +33,7 @@ import { cleanupOldAttachments } from './attachment-downloader.js';
 import {
   ContainerAttachment,
   ContainerOutput,
+  ProgressEvent,
   cleanupOrphanWorktrees,
   cleanupThreadWorkspace,
   runContainerAgent,
@@ -39,6 +42,7 @@ import {
   writeGroupsSnapshot,
   writeTasksSnapshot,
 } from './container-runner.js';
+import { startWebUI, WebUIHandle } from './web-ui.js';
 import {
   cleanupOrphans,
   ensureContainerRuntimeRunning,
@@ -112,6 +116,7 @@ const attachmentCache = new Map<string, Attachment[]>(); // key: message ID
 
 const channels: Channel[] = [];
 const queue = new GroupQueue();
+let webUI: WebUIHandle | null = null;
 
 // Thread creation debounce: batch rapid messages before enqueuing
 // Key: parentJid, Value: debounce timer
@@ -674,6 +679,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         hadError = true;
       }
     },
+    webUI
+      ? (event: ProgressEvent) =>
+          webUI!.broadcast(sessionKey, group.name, effectiveThreadId, event)
+      : undefined,
   );
 
   await channel.setTyping?.(chatJid, false);
@@ -727,10 +736,13 @@ async function runAgent(
   threadId?: string,
   attachments?: ContainerAttachment[],
   onOutput?: (output: ContainerOutput) => Promise<void>,
+  onProgress?: (event: ProgressEvent) => void,
 ): Promise<'success' | 'error'> {
   const isMain = group.isMain === true;
   const sessionKey = buildSessionKey(group.folder, threadId);
   const sessionId = sessions.get(sessionKey);
+
+  webUI?.notifySessionStart(sessionKey, group.name, chatJid, threadId);
 
   // Update tasks snapshot for container to read (filtered by group)
   const tasks = getAllTasks();
@@ -796,6 +808,7 @@ async function runAgent(
           group.folder,
         ),
       wrappedOnOutput,
+      onProgress,
     );
 
     if (output.newSessionId) persistSession(output.newSessionId);
@@ -901,6 +914,8 @@ async function runAgent(
   } catch (err) {
     logger.error({ group: group.name, err }, 'Agent error');
     return 'error';
+  } finally {
+    webUI?.notifySessionEnd(sessionKey);
   }
 }
 
@@ -1447,6 +1462,17 @@ async function main(): Promise<void> {
     writeGroupsSnapshot: (gf, im, ag, rj) =>
       writeGroupsSnapshot(gf, im, ag, rj),
   });
+  // Start web UI for real-time agent activity monitoring
+  webUI = await startWebUI(
+    WEB_UI_PORT,
+    path.resolve('src', 'web-ui.html'),
+    {
+      sendMessage: (groupJid, threadId, text) =>
+        queue.sendMessage(groupJid, threadId, text),
+    },
+    WEB_UI_TOKEN,
+  );
+
   queue.setProcessMessagesFn(processGroupMessages);
   recoverPendingMessages();
   startMessageLoop().catch((err) => {

@@ -10,6 +10,7 @@ const envConfig = readEnvFile([
   'ASSISTANT_NAME',
   'ASSISTANT_HAS_OWN_NUMBER',
   'RESIDENTIAL_PROXY_URL',
+  'WEB_UI_TOKEN',
 ]);
 
 export const ASSISTANT_NAME =
@@ -164,3 +165,9 @@ export const TIMEZONE =
 // Residential proxy for browser automation (bypasses datacenter IP geo-fencing)
 export const RESIDENTIAL_PROXY_URL =
   process.env.RESIDENTIAL_PROXY_URL || envConfig.RESIDENTIAL_PROXY_URL;
+
+// Web UI port for real-time agent activity monitor
+export const WEB_UI_PORT = parseInt(process.env.WEB_UI_PORT || '3002', 10);
+// Token for web UI access — when set, binds to 0.0.0.0 (public); when unset, binds to 127.0.0.1 (local only)
+export const WEB_UI_TOKEN =
+  process.env.WEB_UI_TOKEN || envConfig.WEB_UI_TOKEN || '';

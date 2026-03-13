@@ -1849,9 +1849,7 @@ export async function runContainerAgent(
       if (onProgress) {
         progressBuffer += chunk;
         let pIdx: number;
-        while (
-          (pIdx = progressBuffer.indexOf(PROGRESS_START_MARKER)) !== -1
-        ) {
+        while ((pIdx = progressBuffer.indexOf(PROGRESS_START_MARKER)) !== -1) {
           const pEnd = progressBuffer.indexOf(PROGRESS_END_MARKER, pIdx);
           if (pEnd === -1) break;
           const json = progressBuffer

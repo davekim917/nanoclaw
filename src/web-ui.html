@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NanoClaw Monitor</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace; background: #0d1117; color: #c9d1d9; height: 100vh; display: flex; flex-direction: column; }
+header { display: flex; align-items: center; justify-content: space-between; padding: 12px 16px; border-bottom: 1px solid #21262d; background: #161b22; }
+header h1 { font-size: 16px; font-weight: 600; color: #58a6ff; }
+.controls { display: flex; gap: 8px; align-items: center; }
+.controls input[type="text"] { background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 4px 8px; color: #c9d1d9; font-size: 12px; width: 140px; }
+.controls label { font-size: 11px; color: #8b949e; cursor: pointer; user-select: none; }
+.controls input[type="checkbox"] { margin-right: 3px; }
+.main { display: flex; flex: 1; overflow: hidden; }
+.sidebar { width: 200px; min-width: 200px; border-right: 1px solid #21262d; background: #161b22; overflow-y: auto; padding: 8px; }
+.sidebar h2 { font-size: 12px; color: #8b949e; text-transform: uppercase; margin-bottom: 8px; }
+.session-item { padding: 6px 8px; border-radius: 4px; margin-bottom: 4px; cursor: pointer; font-size: 12px; }
+.session-item:hover { background: #21262d; }
+.session-item.active { background: #1f6feb33; border: 1px solid #1f6feb; }
+.session-dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; margin-right: 6px; }
+.session-dot.live { background: #3fb950; }
+.session-dot.idle { background: #8b949e; }
+.session-group { font-weight: 600; color: #c9d1d9; }
+.session-thread { color: #8b949e; font-size: 11px; display: block; margin-left: 12px; }
+.no-sessions { color: #484f58; font-size: 12px; font-style: italic; padding: 8px; }
+.content { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+.events { flex: 1; overflow-y: auto; padding: 8px 12px; }
+.event { padding: 4px 0; border-bottom: 1px solid #21262d; font-size: 13px; line-height: 1.5; display: flex; gap: 8px; }
+.event-time { color: #484f58; flex-shrink: 0; font-size: 11px; min-width: 55px; }
+.event-group { color: #8b949e; flex-shrink: 0; font-size: 11px; min-width: 70px; overflow: hidden; text-overflow: ellipsis; }
+.event-type { flex-shrink: 0; font-size: 11px; padding: 1px 5px; border-radius: 3px; min-width: 60px; text-align: center; }
+.event-type.text { background: #1f6feb33; color: #58a6ff; }
+.event-type.tool_use { background: #238636; color: #3fb950; }
+.event-type.thinking { background: #8957e533; color: #bc8cff; }
+.event-type.system { background: #21262d; color: #8b949e; }
+.event-body { flex: 1; overflow: hidden; word-break: break-word; }
+.event-body .tool-name { color: #ffa657; font-weight: 600; }
+.event-body .tool-input { color: #8b949e; }
+.event-body.collapsed { max-height: 40px; overflow: hidden; cursor: pointer; position: relative; }
+.event-body.collapsed::after { content: '...click to expand'; position: absolute; bottom: 0; right: 0; background: #0d1117; color: #484f58; padding: 0 4px; font-size: 10px; }
+.event-body.expanded { max-height: none; }
+.intervention { display: flex; gap: 8px; padding: 8px 12px; border-top: 1px solid #21262d; background: #161b22; }
+.intervention select { background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 6px 8px; color: #c9d1d9; font-size: 12px; min-width: 120px; }
+.intervention input[type="text"] { flex: 1; background: #0d1117; border: 1px solid #30363d; border-radius: 6px; padding: 6px 10px; color: #c9d1d9; font-size: 13px; }
+.intervention input[type="text"]:focus { border-color: #1f6feb; outline: none; }
+.intervention button { background: #238636; border: none; border-radius: 6px; padding: 6px 16px; color: #fff; font-size: 13px; cursor: pointer; font-weight: 600; }
+.intervention button:hover { background: #2ea043; }
+.intervention button:disabled { background: #21262d; color: #484f58; cursor: not-allowed; }
+.status-bar { font-size: 11px; color: #484f58; padding: 4px 12px; border-top: 1px solid #21262d; display: flex; justify-content: space-between; }
+.connected { color: #3fb950; }
+.disconnected { color: #f85149; }
+.auto-scroll-btn { position: fixed; bottom: 80px; right: 20px; background: #1f6feb; border: none; border-radius: 20px; padding: 6px 12px; color: #fff; font-size: 11px; cursor: pointer; display: none; z-index: 10; }
+.auto-scroll-btn.visible { display: block; }
+</style>
+</head>
+<body>
+<header>
+  <h1>NanoClaw Monitor</h1>
+  <div class="controls">
+    <input type="text" id="filter" placeholder="Filter group...">
+    <label><input type="checkbox" id="toggle-thinking" checked> thinking</label>
+    <label><input type="checkbox" id="toggle-system" checked> system</label>
+  </div>
+</header>
+<div class="main">
+  <div class="sidebar">
+    <h2>Sessions</h2>
+    <div id="sessions"><div class="no-sessions">No active sessions</div></div>
+  </div>
+  <div class="content">
+    <div class="events" id="events"></div>
+    <button class="auto-scroll-btn" id="scroll-btn" onclick="resumeAutoScroll()">Resume auto-scroll</button>
+    <div class="intervention">
+      <select id="session-select"><option value="">Select session...</option></select>
+      <input type="text" id="intervene-text" placeholder="Send message to agent..." disabled>
+      <button id="intervene-btn" disabled onclick="sendIntervention()">Send</button>
+    </div>
+    <div class="status-bar">
+      <span id="status" class="disconnected">Connecting...</span>
+      <span id="event-count">0 events</span>
+    </div>
+  </div>
+</div>
+<script>
+const eventsEl = document.getElementById('events');
+const sessionsEl = document.getElementById('sessions');
+const statusEl = document.getElementById('status');
+const eventCountEl = document.getElementById('event-count');
+const filterEl = document.getElementById('filter');
+const sessionSelectEl = document.getElementById('session-select');
+const interveneTextEl = document.getElementById('intervene-text');
+const interveneBtnEl = document.getElementById('intervene-btn');
+const scrollBtnEl = document.getElementById('scroll-btn');
+const toggleThinking = document.getElementById('toggle-thinking');
+const toggleSystem = document.getElementById('toggle-system');
+
+let sessions = {};
+let eventCount = 0;
+let autoScroll = true;
+let selectedFilter = '';
+const MAX_EVENTS = 2000;
+
+// Extract auth token from URL query param (e.g. ?token=abc123)
+const urlParams = new URLSearchParams(window.location.search);
+const authToken = urlParams.get('token') || '';
+
+filterEl.addEventListener('input', () => { selectedFilter = filterEl.value.toLowerCase(); applyFilters(); });
+toggleThinking.addEventListener('change', applyFilters);
+toggleSystem.addEventListener('change', applyFilters);
+sessionSelectEl.addEventListener('change', () => {
+  const hasSession = sessionSelectEl.value !== '';
+  interveneTextEl.disabled = !hasSession;
+  interveneBtnEl.disabled = !hasSession;
+});
+interveneTextEl.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !interveneBtnEl.disabled) sendIntervention();
+});
+
+eventsEl.addEventListener('scroll', () => {
+  const atBottom = eventsEl.scrollHeight - eventsEl.scrollTop - eventsEl.clientHeight < 40;
+  if (atBottom) {
+    autoScroll = true;
+    scrollBtnEl.classList.remove('visible');
+  } else {
+    autoScroll = false;
+    scrollBtnEl.classList.add('visible');
+  }
+});
+
+function resumeAutoScroll() {
+  autoScroll = true;
+  scrollBtnEl.classList.remove('visible');
+  eventsEl.scrollTop = eventsEl.scrollHeight;
+}
+
+function formatTime(ts) {
+  const d = new Date(ts);
+  return d.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+
+function truncate(str, max) {
+  if (!str) return '';
+  return str.length > max ? str.slice(0, max) + '...' : str;
+}
+
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+function renderSessions() {
+  const keys = Object.keys(sessions);
+  if (keys.length === 0) {
+    sessionsEl.innerHTML = '<div class="no-sessions">No active sessions</div>';
+    sessionSelectEl.innerHTML = '<option value="">No active sessions</option>';
+    interveneTextEl.disabled = true;
+    interveneBtnEl.disabled = true;
+    return;
+  }
+  sessionsEl.innerHTML = keys.map(key => {
+    const s = sessions[key];
+    return `<div class="session-item" onclick="setFilter(${escapeHtml(JSON.stringify(s.group))})">
+      <span class="session-dot live"></span>
+      <span class="session-group">${escapeHtml(s.group)}</span>
+      ${s.threadId ? `<span class="session-thread">${escapeHtml(s.threadId)}</span>` : ''}
+    </div>`;
+  }).join('');
+  // Update session selector for intervention
+  const prevVal = sessionSelectEl.value;
+  sessionSelectEl.innerHTML = '<option value="">Select session...</option>' +
+    keys.map(key => {
+      const s = sessions[key];
+      const label = s.group + (s.threadId ? ` (${s.threadId.slice(0,8)})` : '');
+      return `<option value="${escapeHtml(key)}" data-jid="${escapeHtml(s.groupJid)}" data-thread="${escapeHtml(s.threadId || '')}">${escapeHtml(label)}</option>`;
+    }).join('');
+  if (prevVal && sessionSelectEl.querySelector(`option[value="${prevVal}"]`)) {
+    sessionSelectEl.value = prevVal;
+  }
+}
+
+function setFilter(group) {
+  filterEl.value = group;
+  selectedFilter = group.toLowerCase();
+  applyFilters();
+}
+
+function applyFilters() {
+  const events = eventsEl.querySelectorAll('.event');
+  events.forEach(ev => {
+    const group = (ev.dataset.group || '').toLowerCase();
+    const type = ev.dataset.type || '';
+    let show = true;
+    if (selectedFilter && !group.includes(selectedFilter)) show = false;
+    if (type === 'thinking' && !toggleThinking.checked) show = false;
+    if (type === 'system' && !toggleSystem.checked) show = false;
+    ev.style.display = show ? '' : 'none';
+  });
+}
+
+function appendEvent(msg) {
+  const ev = msg.event;
+  const el = document.createElement('div');
+  el.className = 'event';
+  el.dataset.group = msg.group;
+  el.dataset.type = ev.eventType;
+
+  let bodyHtml = '';
+  switch (ev.eventType) {
+    case 'text':
+      bodyHtml = escapeHtml(truncate(ev.data.text, 500));
+      break;
+    case 'tool_use':
+      bodyHtml = `<span class="tool-name">${escapeHtml(ev.data.name || '')}</span> <span class="tool-input">${escapeHtml(truncate(ev.data.input, 200))}</span>`;
+      break;
+    case 'thinking':
+      bodyHtml = escapeHtml(truncate(ev.data.text, 300));
+      break;
+    case 'system':
+      bodyHtml = `${escapeHtml(ev.data.subtype || '')} ${escapeHtml(ev.data.info || '')}`;
+      break;
+  }
+
+  const isLong = (ev.data.text || ev.data.input || '').length > 200;
+  const collapseClass = isLong ? 'collapsed' : '';
+
+  el.innerHTML = `
+    <span class="event-time">${formatTime(ev.ts)}</span>
+    <span class="event-group">${escapeHtml(msg.group)}</span>
+    <span class="event-type ${ev.eventType}">${ev.eventType}</span>
+    <span class="event-body ${collapseClass}" onclick="this.classList.toggle('collapsed');this.classList.toggle('expanded')">${bodyHtml}</span>
+  `;
+
+  // Apply current filters
+  const group = (msg.group || '').toLowerCase();
+  let show = true;
+  if (selectedFilter && !group.includes(selectedFilter)) show = false;
+  if (ev.eventType === 'thinking' && !toggleThinking.checked) show = false;
+  if (ev.eventType === 'system' && !toggleSystem.checked) show = false;
+  if (!show) el.style.display = 'none';
+
+  eventsEl.appendChild(el);
+  eventCount++;
+  eventCountEl.textContent = eventCount + ' events';
+
+  // Prune old events
+  while (eventsEl.children.length > MAX_EVENTS) {
+    eventsEl.removeChild(eventsEl.firstChild);
+  }
+
+  if (autoScroll) {
+    eventsEl.scrollTop = eventsEl.scrollHeight;
+  }
+}
+
+function initSessions(s) {
+  sessions = s || {};
+  renderSessions();
+}
+
+function addSession(msg) {
+  sessions[msg.sessionKey] = { group: msg.group, groupJid: msg.groupJid, threadId: msg.threadId };
+  renderSessions();
+}
+
+function removeSession(msg) {
+  delete sessions[msg.sessionKey];
+  renderSessions();
+}
+
+async function sendIntervention() {
+  const opt = sessionSelectEl.selectedOptions[0];
+  if (!opt || !opt.value) return;
+  const groupJid = opt.dataset.jid;
+  const threadId = opt.dataset.thread || undefined;
+  const text = interveneTextEl.value.trim();
+  if (!text) return;
+
+  interveneBtnEl.disabled = true;
+  try {
+    const headers = { 'Content-Type': 'application/json' };
+    if (authToken) headers['Authorization'] = 'Bearer ' + authToken;
+    const res = await fetch('/api/intervene', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ groupJid, threadId, text }),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      interveneTextEl.value = '';
+    } else {
+      alert('Failed to send: no active container for this session');
+    }
+  } catch (err) {
+    alert('Failed to send: ' + err.message);
+  } finally {
+    interveneBtnEl.disabled = sessionSelectEl.value === '';
+  }
+}
+
+// SSE connection
+function connect() {
+  const eventsUrl = authToken ? '/events?token=' + encodeURIComponent(authToken) : '/events';
+  const es = new EventSource(eventsUrl);
+  es.onopen = () => {
+    statusEl.textContent = 'Connected';
+    statusEl.className = 'connected';
+  };
+  es.onmessage = (e) => {
+    try {
+      const msg = JSON.parse(e.data);
+      switch (msg.type) {
+        case 'progress': appendEvent(msg); break;
+        case 'session_start': addSession(msg); break;
+        case 'session_end': removeSession(msg); break;
+        case 'sessions': initSessions(msg.sessions); break;
+      }
+    } catch (err) {
+      console.error('Failed to parse SSE message:', err);
+    }
+  };
+  es.onerror = () => {
+    statusEl.textContent = 'Disconnected - reconnecting...';
+    statusEl.className = 'disconnected';
+  };
+}
+
+connect();
+</script>
+</body>
+</html>
