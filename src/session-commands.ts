@@ -103,7 +103,8 @@ export async function handleSessionCommand(opts: {
   logger.info({ group: groupName, command }, 'Session command');
 
   // /close: immediately kill the container without running the agent.
-  // Useful for cutting off a stuck or long-running thread.
+  // Intentionally skips pre-command message processing (unlike /compact) — this is a
+  // hard stop. Any messages before /close in the same batch are silently dropped.
   if (command === '/close') {
     deps.closeStdin();
     deps.advanceCursor(cmdMsg.timestamp);

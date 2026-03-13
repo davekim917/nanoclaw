@@ -12,6 +12,7 @@ import path from 'path';
 import { GROUPS_DIR } from './config.js';
 import {
   ThreadMetadataRow,
+  buildSessionKey,
   getRecentMessages,
   searchMessagesRaw,
   searchThreadsFTS,
@@ -56,7 +57,7 @@ export async function searchThreads(
       { query: sanitized, groupFolder, reason: 'no_fts_index_entries' },
       'FTS search returned 0 results — trying raw message fallback',
     );
-    return searchRawMessageFallback(groupFolder, query, sanitized, limit);
+    return searchRawMessageFallback(groupFolder, query, limit);
   }
 
   const results = candidates
@@ -89,41 +90,47 @@ export async function searchThreads(
  * Searches raw message content in the DB for threads matching any query keyword.
  * Returns synthetic ThreadSearchResults with a content snippet as the summary.
  */
-async function searchRawMessageFallback(
+function searchRawMessageFallback(
   groupFolder: string,
-  originalQuery: string,
-  sanitizedQuery: string,
+  query: string,
   limit: number,
-): Promise<ThreadSearchResult[]> {
-  // Extract plain words from the sanitized FTS5 query ("word1" OR "word2" → ['word1','word2'])
-  const words = sanitizedQuery
-    .split(/\s+OR\s+/i)
-    .map((t) => t.replace(/^"|"$/g, '').trim())
-    .filter((w) => w.length > 0);
-
+): ThreadSearchResult[] {
+  const words = extractWords(query);
   const hits = searchMessagesRaw(groupFolder, words, limit);
 
   if (hits.length === 0) {
     logger.info(
-      { query: originalQuery, groupFolder, reason: 'no_raw_message_matches' },
+      { query, groupFolder, reason: 'no_raw_message_matches' },
       'Fallback message search also returned 0 results — no indexed or raw matches found',
     );
     return [];
   }
 
   logger.info(
-    { query: originalQuery, groupFolder, hits: hits.length },
+    { query, groupFolder, hits: hits.length },
     'FTS fallback: found matches in raw messages',
   );
 
-  return hits.map(({ thread_id, snippet }) => ({
-    thread_key: `${groupFolder}:thread:${thread_id}`,
+  return hits.map(({ thread_id, snippet, last_activity }) => ({
+    thread_key: buildSessionKey(groupFolder, thread_id),
     group_folder: groupFolder,
     thread_id,
     platform: detectPlatform(thread_id),
     topic_summary: `(unindexed thread) ${snippet}`,
-    last_activity: new Date().toISOString(),
+    last_activity,
   }));
+}
+
+/**
+ * Extract normalized words from a search query for LIKE-based matching.
+ * Strips non-letter/non-number characters (Unicode-aware), then splits on whitespace.
+ * Shared by sanitizeFtsQuery (FTS formatting) and the raw message fallback (LIKE params).
+ */
+function extractWords(query: string): string[] {
+  return query
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ') // strip non-letter/non-number chars (Unicode-aware)
+    .split(/\s+/)
+    .filter((w) => w.length > 0);
 }
 
 /**
@@ -134,10 +141,7 @@ async function searchRawMessageFallback(
  * Uses Unicode-aware regex to preserve accented/non-Latin characters.
  */
 function sanitizeFtsQuery(query: string): string {
-  const words = query
-    .replace(/[^\p{L}\p{N}\s]/gu, ' ') // strip non-letter/non-number chars (Unicode-aware)
-    .split(/\s+/)
-    .filter((w) => w.length > 0);
+  const words = extractWords(query);
   if (words.length === 0) return '';
   // Use OR to match any keyword (broad search, Haiku will narrow down)
   return words.map((w) => `"${w}"`).join(' OR ');
@@ -249,7 +253,7 @@ export function indexSingleThread(
 
   try {
     const platform = detectPlatform(threadId);
-    const threadKey = `${groupFolder}:thread:${threadId}`;
+    const threadKey = buildSessionKey(groupFolder, threadId);
     return upsertThreadIndex(
       threadKey,
       groupFolder,
@@ -321,7 +325,9 @@ export function indexThreadSummaries(): number {
 /**
  * Generate a minimal summary from recent messages and index the thread.
  * Called after a container run when no summary.txt exists (session was too short
- * to trigger SDK compaction). Writes summary.txt so future runs also pick it up.
+ * to trigger SDK compaction). Writes summary.txt then delegates to indexSingleThread
+ * to avoid duplicating the upsert logic. If the write fails, does not index —
+ * the FTS index should always reflect what is on disk.
  */
 export function indexThreadFromMessages(
   groupFolder: string,
@@ -332,7 +338,7 @@ export function indexThreadFromMessages(
   const messages = getRecentMessages(chatJid, 10);
   if (messages.length === 0) return false;
 
-  // Build a compact summary: first non-empty user message (most recent last)
+  // Build a compact summary in chronological order (getRecentMessages returns DESC)
   const userMessages = messages
     .filter((m) => !m.is_from_me && m.content.trim())
     .reverse();
@@ -344,26 +350,19 @@ export function indexThreadFromMessages(
     .slice(0, 500);
   const summary = `[auto-indexed] ${snippet}`;
 
-  // Write summary.txt so indexSingleThread can pick it up next time too
+  // Write summary.txt then delegate to indexSingleThread (avoids duplicating upsert logic)
+  const threadDir = path.join(GROUPS_DIR, groupFolder, 'threads', threadId);
   try {
-    const threadDir = path.join(GROUPS_DIR, groupFolder, 'threads', threadId);
     fs.mkdirSync(threadDir, { recursive: true });
     fs.writeFileSync(path.join(threadDir, 'summary.txt'), summary, 'utf-8');
   } catch (err) {
     logger.warn({ err, groupFolder, threadId }, 'Failed to write auto summary.txt');
-    // Still attempt to index directly
-  }
-
-  try {
-    const platform = detectPlatform(threadId);
-    const threadKey = `${groupFolder}:thread:${threadId}`;
-    const result = upsertThreadIndex(threadKey, groupFolder, threadId, platform, summary);
-    if (result) {
-      logger.info({ groupFolder, threadId }, 'Auto-indexed short thread from messages');
-    }
-    return result;
-  } catch (err) {
-    logger.warn({ err, groupFolder, threadId }, 'Failed to auto-index thread from messages');
     return false;
   }
+
+  const indexed = indexSingleThread(groupFolder, threadId);
+  if (indexed) {
+    logger.info({ groupFolder, threadId }, 'Auto-indexed short thread from messages');
+  }
+  return indexed;
 }

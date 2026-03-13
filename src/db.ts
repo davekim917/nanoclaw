@@ -1197,53 +1197,57 @@ export function getRecentMessages(
 
 /**
  * Fallback: search raw message content for a group's threads when FTS returns 0.
- * Uses sessions_v2 to map group_folder → chat_jids, then does LIKE-based keyword
- * matching on message content. Returns at most `limit` matching thread+snippet pairs.
+ * Uses a single JOIN across sessions_v2 and messages — one DB round-trip instead of N+1.
+ * Sessions subquery is capped at 100 to avoid unbounded scans for large groups.
+ * Returns at most `limit` matching thread+snippet pairs, one per thread_id.
  */
 export function searchMessagesRaw(
   groupFolder: string,
   words: string[],
   limit: number = 5,
-): Array<{ thread_id: string; chat_jid: string; snippet: string }> {
+): Array<{ thread_id: string; chat_jid: string; snippet: string; last_activity: string }> {
   if (words.length === 0) return [];
 
-  // Get all chat_jids known for this group's threads
-  const sessions = db
+  const likeClauses = words.map(() => 'm.content LIKE ?').join(' OR ');
+  const likeParams = words.map((w) => `%${w}%`);
+
+  const rows = db
     .prepare(
-      `SELECT DISTINCT thread_id, chat_jid FROM sessions_v2
-       WHERE group_folder = ? AND thread_id IS NOT NULL AND chat_jid IS NOT NULL`,
+      `SELECT s.thread_id, s.chat_jid, m.content, m.timestamp
+       FROM (
+         SELECT DISTINCT thread_id, chat_jid FROM sessions_v2
+         WHERE group_folder = ? AND thread_id IS NOT NULL AND chat_jid IS NOT NULL
+         LIMIT 100
+       ) s
+       JOIN messages m ON m.chat_jid = s.chat_jid
+       WHERE m.content != '' AND m.content IS NOT NULL AND (${likeClauses})
+       ORDER BY m.timestamp DESC`,
     )
-    .all(groupFolder) as Array<{ thread_id: string; chat_jid: string }>;
+    .all(groupFolder, ...likeParams) as Array<{
+    thread_id: string;
+    chat_jid: string;
+    content: string;
+    timestamp: string;
+  }>;
 
-  if (sessions.length === 0) return [];
-
-  const results: Array<{ thread_id: string; chat_jid: string; snippet: string }> = [];
+  // Deduplicate: keep the most-recent match per thread_id (rows are DESC by timestamp)
   const seen = new Set<string>();
-
-  for (const { thread_id, chat_jid } of sessions) {
+  const results: Array<{
+    thread_id: string;
+    chat_jid: string;
+    snippet: string;
+    last_activity: string;
+  }> = [];
+  for (const row of rows) {
+    if (seen.has(row.thread_id)) continue;
+    seen.add(row.thread_id);
+    results.push({
+      thread_id: row.thread_id,
+      chat_jid: row.chat_jid,
+      snippet: row.content.slice(0, 300),
+      last_activity: row.timestamp,
+    });
     if (results.length >= limit) break;
-    if (seen.has(thread_id)) continue;
-
-    // Check if any keyword appears in messages for this chat_jid
-    const likeClauses = words.map(() => 'content LIKE ?').join(' OR ');
-    const likeParams = words.map((w) => `%${w}%`);
-    const match = db
-      .prepare(
-        `SELECT content FROM messages
-         WHERE chat_jid = ? AND content != '' AND content IS NOT NULL
-           AND (${likeClauses})
-         ORDER BY timestamp DESC LIMIT 1`,
-      )
-      .get(chat_jid, ...likeParams) as { content: string } | undefined;
-
-    if (match) {
-      seen.add(thread_id);
-      results.push({
-        thread_id,
-        chat_jid,
-        snippet: match.content.slice(0, 300),
-      });
-    }
   }
 
   return results;
