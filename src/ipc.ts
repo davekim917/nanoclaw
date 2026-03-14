@@ -574,6 +574,7 @@ export async function processTaskIpc(
         const entryId = `ship-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
         addShipLogEntry({
           id: entryId,
+          group_folder: sourceGroup,
           title: data.title,
           description: data.description || null,
           pr_url: data.pr_url || null,
@@ -582,7 +583,7 @@ export async function processTaskIpc(
           shipped_at: new Date().toISOString(),
         });
         logger.info(
-          { entryId, title: data.title },
+          { entryId, title: data.title, sourceGroup },
           'Ship log entry added via IPC',
         );
       } else {
@@ -596,6 +597,7 @@ export async function processTaskIpc(
         const now = new Date().toISOString();
         addBacklogItem({
           id: itemId,
+          group_folder: sourceGroup,
           title: data.title,
           description: data.description || null,
           status:
@@ -609,7 +611,7 @@ export async function processTaskIpc(
           resolved_at: null,
         });
         logger.info(
-          { itemId, title: data.title },
+          { itemId, title: data.title, sourceGroup },
           'Backlog item added via IPC',
         );
       } else {
@@ -648,7 +650,7 @@ export async function processTaskIpc(
 
     case 'delete_backlog_item':
       if (data.itemId) {
-        deleteBacklogItem(data.itemId);
+        deleteBacklogItem(data.itemId, sourceGroup);
         logger.info({ itemId: data.itemId }, 'Backlog item deleted via IPC');
       } else {
         logger.warn({ data }, 'delete_backlog_item missing itemId');
@@ -984,7 +986,7 @@ function processQueryIpc(
     }
 
     case 'list_backlog': {
-      const items = getBacklog(data.status, data.limit || 50);
+      const items = getBacklog(sourceGroup, data.status, data.limit || 50);
       logger.info(
         { sourceGroup, count: items.length },
         'IPC list_backlog query served',
@@ -997,7 +999,7 @@ function processQueryIpc(
     }
 
     case 'list_ship_log': {
-      const entries = getShipLog(data.limit || 20);
+      const entries = getShipLog(sourceGroup, data.limit || 20);
       logger.info(
         { sourceGroup, count: entries.length },
         'IPC list_ship_log query served',
