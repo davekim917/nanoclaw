@@ -1,0 +1,15 @@
+[Unit]
+Description=sqlite-web — read-only browser for NanoClaw DB
+After=network.target nanoclaw.service
+BindsTo=nanoclaw.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/nanoclaw
+ExecStart=sqlite_web --host 127.0.0.1 --port 8088 --read-only store/messages.db
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
