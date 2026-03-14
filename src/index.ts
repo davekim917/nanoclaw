@@ -624,7 +624,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   // Effort resolution: per-message flag > session sticky > default
   const effortOverride = extractEffortOverride(missedMessages);
-  const sessionEffort = getSessionEffort(sessionKey);
 
   let effort: string;
   let effortNotice = '';
@@ -658,7 +657,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       );
     }
   } else {
-    effort = resolveEffort(undefined, sessionEffort);
+    effort = resolveEffort(undefined, getSessionEffort(sessionKey));
   }
 
   const prompt =

@@ -505,12 +505,7 @@ const GMAIL_READ_TOOLS = [
 // Gmail tools for scoped groups (e.g. gmail:illysium) — everything except permanent delete.
 // Excluded: delete_email, batch_delete_emails (permanent delete requires mail.google.com scope anyway)
 const GMAIL_SCOPED_TOOLS = [
-  'mcp__gmail__search_emails',
-  'mcp__gmail__read_email',
-  'mcp__gmail__list_email_labels',
-  'mcp__gmail__list_filters',
-  'mcp__gmail__get_filter',
-  'mcp__gmail__download_attachment',
+  ...GMAIL_READ_TOOLS,
   'mcp__gmail__modify_email',
   'mcp__gmail__batch_modify_emails',
   'mcp__gmail__send_email',

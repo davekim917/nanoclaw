@@ -17,6 +17,7 @@ import {
   Routes,
   TextChannel,
   ThreadChannel,
+  Webhook,
 } from 'discord.js';
 
 import {
@@ -105,6 +106,8 @@ export class DiscordChannel implements Channel {
   private pendingTopLevelMsgIds = new Map<string, string[]>();
   private createdThreadJid = new Map<string, string>();
   private threadOriginMessage = new Map<string, string>();
+  private webhookCache = new Map<string, Webhook>();
+  private webhookCreating = new Map<string, Promise<Webhook | null>>();
   private static MEMBER_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
   /** Resolve the parent channel ID from an interaction (thread → parent, else null). */
@@ -537,6 +540,141 @@ export class DiscordChannel implements Channel {
   }
 
   /**
+   * Get or create a webhook for swarm messaging on a channel.
+   * Reuses existing "NanoClaw Swarm" webhooks owned by our bot.
+   * Deduplicates concurrent calls via in-flight promise map.
+   */
+  private async getOrCreateWebhook(channelId: string): Promise<Webhook | null> {
+    const cached = this.webhookCache.get(channelId);
+    if (cached) return cached;
+
+    // Deduplicate concurrent creation attempts for the same channel
+    let inflight = this.webhookCreating.get(channelId);
+    if (inflight) return inflight;
+
+    inflight = this.doGetOrCreateWebhook(channelId);
+    this.webhookCreating.set(channelId, inflight);
+    inflight.finally(() => this.webhookCreating.delete(channelId));
+    return inflight;
+  }
+
+  private async doGetOrCreateWebhook(
+    channelId: string,
+  ): Promise<Webhook | null> {
+    if (!this.client) return null;
+
+    try {
+      const channel = await this.client.channels.fetch(channelId);
+      if (!channel || !('fetchWebhooks' in channel)) return null;
+
+      const textChannel = channel as TextChannel;
+      const existing = await textChannel.fetchWebhooks();
+      let webhook = existing.find(
+        (w) =>
+          w.name === 'NanoClaw Swarm' && w.owner?.id === this.client!.user?.id,
+      );
+
+      if (!webhook) {
+        webhook = await textChannel.createWebhook({
+          name: 'NanoClaw Swarm',
+          reason: 'Agent swarm identity support',
+        });
+      }
+
+      this.webhookCache.set(channelId, webhook);
+      return webhook;
+    } catch (err) {
+      logger.warn({ channelId, err }, 'Failed to get/create webhook for swarm');
+      return null;
+    }
+  }
+
+  /**
+   * Send a message via webhook with a custom username (agent swarm).
+   * Falls back to prefixed sendMessage if webhook is unavailable.
+   */
+  async sendSwarmMessage(
+    jid: string,
+    text: string,
+    sender: string,
+  ): Promise<void> {
+    if (!this.client) {
+      logger.warn('Discord client not initialized');
+      return;
+    }
+
+    // Preserve original text for fallback (sendMessage re-applies transforms)
+    const originalText = text;
+
+    try {
+      const parsed = parseThreadJid(jid);
+      const parentChannelId = parsed
+        ? parsed.parentId
+        : jid.replace(/^dc:/, '');
+      const threadChannelId = parsed ? parsed.threadId : undefined;
+
+      const webhook = await this.getOrCreateWebhook(parentChannelId);
+      if (!webhook) {
+        return this.sendMessage(jid, `**[${sender}]** ${originalText}`);
+      }
+
+      // Apply text transforms
+      const channel = await this.client.channels.fetch(parentChannelId);
+      if (channel && 'guild' in channel) {
+        text = await this.replaceMentions(text, channel as TextChannel);
+      }
+      ({ text } = transformTablesInText('discord', text));
+
+      const baseOptions: Record<string, unknown> = {
+        username: sender,
+        ...(threadChannelId ? { threadId: threadChannelId } : {}),
+      };
+
+      const max = DiscordChannel.MAX_MESSAGE_LENGTH;
+      if (text.length <= max) {
+        await webhook.send({ ...baseOptions, content: text });
+      } else {
+        const chunks: string[] = [];
+        let remaining = text;
+        while (remaining.length > max) {
+          const split = DiscordChannel.splitAtBoundary(remaining, max);
+          chunks.push(remaining.slice(0, split).trimEnd());
+          remaining = remaining.slice(split).trimStart();
+        }
+        if (remaining.length > 0) chunks.push(remaining);
+
+        for (const chunk of chunks) {
+          await webhook.send({ ...baseOptions, content: chunk });
+        }
+      }
+
+      logger.info(
+        { jid, sender, length: text.length },
+        'Discord swarm message sent',
+      );
+    } catch (err) {
+      // Evict stale webhook from cache
+      const errCode = (err as { code?: number | string })?.code;
+      if (errCode === 10015 || errCode === 'Unknown Webhook') {
+        const parsed = parseThreadJid(jid);
+        const parentChannelId = parsed
+          ? parsed.parentId
+          : jid.replace(/^dc:/, '');
+        this.webhookCache.delete(parentChannelId);
+      }
+      logger.error(
+        { jid, sender, err },
+        'Failed to send Discord swarm message',
+      );
+      try {
+        await this.sendMessage(jid, `**[${sender}]** ${originalText}`);
+      } catch {
+        // Already logged in sendMessage
+      }
+    }
+  }
+
+  /**
    * Create a Discord thread from a message and send the response there.
    * Returns the thread's channel ID, or null if thread creation failed.
    */
@@ -722,6 +860,8 @@ export class DiscordChannel implements Channel {
     for (const interval of this.typingIntervals.values())
       clearInterval(interval);
     this.typingIntervals.clear();
+    this.webhookCache.clear();
+    this.webhookCreating.clear();
     if (this.client) {
       this.client.destroy();
       this.client = null;
@@ -845,6 +985,7 @@ export class DiscordChannel implements Channel {
       cwd: process.cwd(),
     });
     child.unref();
+    fs.closeSync(logFd); // Parent's copy — child inherited its own fd
 
     logger.info({ pid: child.pid }, 'Detached deploy script spawned');
 
@@ -852,6 +993,10 @@ export class DiscordChannel implements Channel {
     // file is written but announceDeployStatus (which runs on startup) never
     // fires. We poll here to catch pre-restart failures and report them.
     const startTime = Date.now();
+    const stopPolling = () => {
+      clearInterval(poll);
+      clearTimeout(guard);
+    };
     const poll = setInterval(async () => {
       try {
         if (!fs.existsSync(statusPath)) return;
@@ -860,14 +1005,14 @@ export class DiscordChannel implements Channel {
 
         const status = JSON.parse(fs.readFileSync(statusPath, 'utf-8'));
         if (status.status === 'failed') {
-          clearInterval(poll);
+          stopPolling();
           await interaction.followUp(
             `Deploy failed at **${status.step}**: ${status.error}`,
           );
           fs.unlinkSync(statusPath);
         } else if (status.status === 'ok') {
           // Success — announceDeployStatus will handle it after restart
-          clearInterval(poll);
+          stopPolling();
         }
       } catch {
         // File mid-write or gone — retry next tick
@@ -875,7 +1020,7 @@ export class DiscordChannel implements Channel {
     }, 2_000);
 
     // Stop polling after 2 minutes regardless
-    setTimeout(() => clearInterval(poll), 120_000);
+    const guard = setTimeout(stopPolling, 120_000);
   }
 
   private async announceDeployStatus(channelId: string): Promise<void> {
