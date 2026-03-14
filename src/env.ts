@@ -58,24 +58,95 @@ export function getAnthropicApiKey(): string {
 /**
  * Returns HTTP auth headers for direct Anthropic API calls.
  * Supports both API key mode (ANTHROPIC_API_KEY → x-api-key) and
- * OAuth mode (CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_AUTH_TOKEN → Authorization: Bearer).
+ * OAuth mode (CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_AUTH_TOKEN → exchange for
+ * a temporary API key via /api/oauth/claude_cli/create_api_key, same as
+ * the credential proxy does for containers).
  * Throws if neither credential is available in .env.
+ * Note: a process restart is required after changing credential type in .env.
  */
+const OAUTH_KEY_TTL_MS = 50 * 60 * 1000; // 50 min (temp keys expire after 1 h)
+
 let cachedAuthHeaders: Record<string, string> | undefined;
-export function getAnthropicAuthHeaders(): Record<string, string> {
-  if (cachedAuthHeaders) return cachedAuthHeaders;
-  const secrets = readEnvFile([
-    'ANTHROPIC_API_KEY',
-    'CLAUDE_CODE_OAUTH_TOKEN',
-    'ANTHROPIC_AUTH_TOKEN',
-  ]);
-  if (secrets.ANTHROPIC_API_KEY) {
-    cachedAuthHeaders = { 'x-api-key': secrets.ANTHROPIC_API_KEY };
-  } else {
+let cachedAuthHeadersExpiry = 0;
+let inflightExchange: Promise<Record<string, string>> | undefined;
+let cacheGeneration = 0; // incremented on invalidation to discard in-flight results
+
+export async function getAnthropicAuthHeaders(): Promise<Record<string, string>> {
+  if (cachedAuthHeaders && Date.now() < cachedAuthHeadersExpiry)
+    return cachedAuthHeaders;
+
+  if (inflightExchange) return inflightExchange;
+
+  inflightExchange = (async () => {
+    const gen = cacheGeneration;
+    const secrets = readEnvFile([
+      'ANTHROPIC_API_KEY',
+      'CLAUDE_CODE_OAUTH_TOKEN',
+      'ANTHROPIC_AUTH_TOKEN',
+      'ANTHROPIC_BASE_URL',
+    ]);
+
+    if (secrets.ANTHROPIC_API_KEY) {
+      if (gen === cacheGeneration) {
+        cachedAuthHeaders = { 'x-api-key': secrets.ANTHROPIC_API_KEY };
+        cachedAuthHeadersExpiry = Infinity;
+      }
+      return cachedAuthHeaders!;
+    }
+
     const oauthToken =
       secrets.CLAUDE_CODE_OAUTH_TOKEN || secrets.ANTHROPIC_AUTH_TOKEN;
     if (!oauthToken) throw new Error('No Anthropic credentials found in .env');
-    cachedAuthHeaders = { Authorization: `Bearer ${oauthToken}` };
-  }
-  return cachedAuthHeaders;
+
+    // OAuth mode: exchange the refresh token for a temporary API key.
+    // Passing the OAuth token directly to /v1/messages does not work —
+    // it must first be exchanged here (mirrors the credential proxy flow).
+    const baseUrl =
+      secrets.ANTHROPIC_BASE_URL || 'https://api.anthropic.com';
+    const exchangeUrl = `${baseUrl}/api/oauth/claude_cli/create_api_key`;
+
+    const resp = await fetch(exchangeUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'anthropic-version': '2023-06-01',
+        Authorization: `Bearer ${oauthToken}`,
+      },
+      body: JSON.stringify({}),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!resp.ok) {
+      const body = await resp.text().catch(() => '');
+      throw new Error(
+        `OAuth key exchange failed: HTTP ${resp.status}: ${body.slice(0, 200)}`,
+      );
+    }
+
+    const data = (await resp.json()) as Record<string, unknown>;
+    const tempKey = (
+      data['api_key'] ??
+      data['raw_key'] ??
+      data['key']
+    ) as string | undefined;
+    if (!tempKey || typeof tempKey !== 'string')
+      throw new Error('OAuth key exchange: no api_key in response');
+
+    if (gen === cacheGeneration) {
+      cachedAuthHeaders = { 'x-api-key': tempKey };
+      cachedAuthHeadersExpiry = Date.now() + OAUTH_KEY_TTL_MS;
+    }
+    return cachedAuthHeaders!;
+  })().finally(() => {
+    inflightExchange = undefined;
+  });
+
+  return inflightExchange;
+}
+
+/** Force re-exchange on next call. Call this when a caller receives a 401. */
+export function invalidateAnthropicAuthCache(): void {
+  cacheGeneration++;
+  cachedAuthHeaders = undefined;
+  cachedAuthHeadersExpiry = 0;
+  inflightExchange = undefined;
 }
