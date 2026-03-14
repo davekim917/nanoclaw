@@ -229,14 +229,30 @@ export function startWebUI(
   token: string,
 ): Promise<WebUIHandle> {
   const server = createServer((req, res) => {
-    // Auth check on all endpoints
+    // Strip query params for route matching
+    const pathname = (req.url || '/').split('?')[0];
+
+    // Serve HTML unauthenticated — login form is handled client-side
+    if (pathname === '/' && req.method === 'GET') {
+      if (!cachedHtml) {
+        try {
+          cachedHtml = fs.readFileSync(htmlPath);
+        } catch {
+          res.writeHead(404, { 'Content-Type': 'text/plain' });
+          res.end('Web UI HTML not found');
+          return;
+        }
+      }
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end(cachedHtml);
+      return;
+    }
+
+    // Auth check on all other endpoints
     if (!checkAuth(req, token)) {
       rejectAuth(res);
       return;
     }
-
-    // Strip query params for route matching
-    const pathname = (req.url || '/').split('?')[0];
 
     if (pathname === '/events' && req.method === 'GET') {
       // SSE endpoint
@@ -265,18 +281,8 @@ export function startWebUI(
         }),
       );
     } else {
-      // Serve HTML (lazy-loaded, cached on first request)
-      if (!cachedHtml) {
-        try {
-          cachedHtml = fs.readFileSync(htmlPath);
-        } catch {
-          res.writeHead(404, { 'Content-Type': 'text/plain' });
-          res.end('Web UI HTML not found');
-          return;
-        }
-      }
-      res.writeHead(200, { 'Content-Type': 'text/html' });
-      res.end(cachedHtml);
+      res.writeHead(404, { 'Content-Type': 'text/plain' });
+      res.end('Not found');
     }
   });
 
