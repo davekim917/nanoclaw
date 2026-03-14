@@ -183,7 +183,6 @@ function createSchema(database: Database.Database): void {
       shipped_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_ship_log_shipped_at ON ship_log(shipped_at);
-    CREATE INDEX IF NOT EXISTS idx_ship_log_group ON ship_log(group_folder);
 
     CREATE TABLE IF NOT EXISTS backlog (
       id TEXT PRIMARY KEY,
@@ -200,7 +199,6 @@ function createSchema(database: Database.Database): void {
     );
     CREATE INDEX IF NOT EXISTS idx_backlog_status ON backlog(status);
     CREATE INDEX IF NOT EXISTS idx_backlog_priority ON backlog(priority);
-    CREATE INDEX IF NOT EXISTS idx_backlog_group ON backlog(group_folder);
   `);
 
   // Add group_folder to ship_log (scopes entries per group)
@@ -220,6 +218,13 @@ function createSchema(database: Database.Database): void {
   } catch {
     // Column already exists — ignore
   }
+
+  // Group-folder indexes — must come AFTER the ALTER TABLE migrations
+  // (old tables may not have group_folder yet)
+  database.exec(`
+    CREATE INDEX IF NOT EXISTS idx_ship_log_group ON ship_log(group_folder);
+    CREATE INDEX IF NOT EXISTS idx_backlog_group ON backlog(group_folder);
+  `);
 
   // Migrate existing sessions into sessions_v2 (skip if already migrated)
   const v2Count = (
