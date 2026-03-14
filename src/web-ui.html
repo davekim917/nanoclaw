@@ -437,9 +437,80 @@ body {
   .hdr { padding-top: calc(12px + env(safe-area-inset-top)); }
   .bottom { padding-bottom: env(safe-area-inset-bottom); }
 }
+
+/* ── Login overlay ── */
+.login-overlay {
+  position: fixed;
+  inset: 0;
+  background: var(--bg);
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.login-overlay.hidden { display: none; }
+.login-box {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 32px 28px;
+  width: 100%;
+  max-width: 360px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+.login-logo {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 4px;
+}
+.login-logo img { width: 32px; height: 32px; border-radius: 7px; }
+.login-logo span { font-size: 18px; font-weight: 700; letter-spacing: -0.5px; }
+.login-label { font-size: 12px; color: var(--text-2); }
+.login-input {
+  width: 100%;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r);
+  padding: 10px 14px;
+  color: var(--text);
+  font-size: 14px;
+  font-family: ui-monospace, 'SF Mono', monospace;
+  letter-spacing: 0.05em;
+}
+.login-input:focus { border-color: var(--accent); outline: none; }
+.login-btn {
+  background: var(--accent);
+  border: none;
+  border-radius: var(--r);
+  padding: 10px;
+  color: #111;
+  font-size: 14px;
+  font-weight: 700;
+  font-family: inherit;
+  cursor: pointer;
+  transition: filter 0.1s;
+}
+.login-btn:hover { filter: brightness(1.1); }
+.login-btn:disabled { background: var(--border); color: var(--text-3); cursor: not-allowed; filter: none; }
+.login-error { font-size: 12px; color: var(--red); min-height: 16px; }
 </style>
 </head>
 <body>
+<div class="login-overlay hidden" id="login-overlay">
+  <div class="login-box">
+    <div class="login-logo">
+      <img src="data:image/png;base64,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" alt="">
+      <span>NanoClaw</span>
+    </div>
+    <div class="login-label">Enter your access token to continue</div>
+    <input type="password" class="login-input" id="login-input" placeholder="Token" autocomplete="current-password">
+    <div class="login-error" id="login-error"></div>
+    <button class="login-btn" id="login-btn" onclick="doLogin()">Sign in</button>
+  </div>
+</div>
 <div class="hdr">
   <div class="hdr-brand">
     <button class="hdr-menu" id="menu-btn" onclick="openSidebar()">&#9776;</button>
@@ -523,9 +594,59 @@ let autoScroll = true;
 let filterKey = ''; // sessionKey to filter by, '' = all
 const MAX = 1500;
 const vis = { text: true, tool_use: true, thinking: true, system: true };
-const params = new URLSearchParams(location.search);
-const token = params.get('token') || '';
+let token = '';
 let registeredGroupsList = []; // from /api/groups
+
+const loginOverlay = $('login-overlay');
+const loginInput = $('login-input');
+const loginBtn = $('login-btn');
+const loginError = $('login-error');
+
+// If URL has ?token=, absorb it into localStorage and clean the URL
+(function absorbUrlToken() {
+  const p = new URLSearchParams(location.search);
+  const t = p.get('token');
+  if (t) {
+    localStorage.setItem('nanoclaw_token', t);
+    history.replaceState(null, '', location.pathname);
+  }
+})();
+
+async function doLogin() {
+  const t = loginInput.value.trim();
+  if (!t) return;
+  loginBtn.disabled = true;
+  loginError.textContent = '';
+  try {
+    const r = await fetch('/api/sessions', { headers: { Authorization: 'Bearer ' + t } });
+    if (r.status === 401) { loginError.textContent = 'Invalid token.'; loginBtn.disabled = false; return; }
+    localStorage.setItem('nanoclaw_token', t);
+    token = t;
+    loginOverlay.classList.add('hidden');
+    bootstrap();
+  } catch { loginError.textContent = 'Connection error.'; loginBtn.disabled = false; }
+}
+loginInput.addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
+
+async function init() {
+  // No-auth mode: try connecting without a token
+  const stored = localStorage.getItem('nanoclaw_token') || '';
+  const r = await fetch('/api/sessions', stored ? { headers: { Authorization: 'Bearer ' + stored } } : {}).catch(() => null);
+  if (!r) { loginOverlay.classList.remove('hidden'); return; }
+  if (r.status === 401) {
+    // Auth required — show login
+    loginOverlay.classList.remove('hidden');
+    return;
+  }
+  // Auth passed (either no-auth mode or valid stored token)
+  token = stored;
+  bootstrap();
+}
+
+function bootstrap() {
+  fetchGroups();
+  connect();
+}
 
 // Response panel state
 const sessionTexts = {};  // Map<sessionKey, string[]>
@@ -554,7 +675,6 @@ async function fetchGroups() {
     renderSessions();
   } catch {}
 }
-fetchGroups();
 eventsEl.addEventListener('scroll', () => {
   const atEnd = eventsEl.scrollHeight - eventsEl.scrollTop - eventsEl.clientHeight < 40;
   autoScroll = atEnd;
@@ -923,9 +1043,18 @@ function connect() {
       else if (m.type === 'sessions') initSessions(m.sessions);
     } catch {}
   };
-  es.onerror = () => { statusDot.className = 'hdr-dot off'; statusText.textContent = 'Reconnecting\u2026'; };
+  es.onerror = () => {
+    statusDot.className = 'hdr-dot off';
+    statusText.textContent = 'Reconnecting\u2026';
+    // If we get a persistent error, the stored token may be stale — offer re-login
+    es.addEventListener('error', () => {
+      if (es.readyState === EventSource.CLOSED && token) {
+        setTimeout(() => connect(), 3000);
+      }
+    }, { once: true });
+  };
 }
-connect();
+init();
 </script>
 </body>
 </html>
