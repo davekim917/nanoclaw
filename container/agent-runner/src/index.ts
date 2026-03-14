@@ -609,6 +609,43 @@ function buildAllowedTools(tools: string[] | undefined): string[] {
   return allowed;
 }
 
+// Gmail write tools to deny for gmail-readonly groups.
+// disallowedTools overrides both allowedTools and bypassPermissions.
+const GMAIL_WRITE_TOOLS = [
+  'mcp__gmail__send_email',
+  'mcp__gmail__draft_email',
+  'mcp__gmail__modify_email',
+  'mcp__gmail__batch_modify_emails',
+  'mcp__gmail__delete_email',
+  'mcp__gmail__batch_delete_emails',
+  'mcp__gmail__create_label',
+  'mcp__gmail__update_label',
+  'mcp__gmail__delete_label',
+  'mcp__gmail__get_or_create_label',
+  'mcp__gmail__create_filter',
+  'mcp__gmail__create_filter_from_template',
+  'mcp__gmail__delete_filter',
+] as const;
+
+// Permanent-delete tools to deny for scoped gmail groups.
+const GMAIL_DELETE_TOOLS = [
+  'mcp__gmail__delete_email',
+  'mcp__gmail__batch_delete_emails',
+] as const;
+
+function buildDisallowedTools(tools: string[] | undefined): string[] {
+  const denied: string[] = [];
+  if (isToolEnabled(tools, 'gmail-readonly') && !tools?.includes('gmail')) {
+    // Hard-deny all write tools for gmail-readonly groups
+    denied.push(...GMAIL_WRITE_TOOLS);
+  }
+  if (isToolScoped(tools, 'gmail')) {
+    // Hard-deny permanent delete for scoped gmail groups
+    denied.push(...GMAIL_DELETE_TOOLS);
+  }
+  return denied;
+}
+
 type StdioServer = { command: string; args: string[]; env?: Record<string, string> };
 type HttpServer = { type: 'http'; url: string; headers?: Record<string, string> };
 type McpServer = StdioServer | HttpServer;
@@ -878,6 +915,7 @@ async function runQuery(
       resumeSessionAt: resumeAt,
       systemPrompt: systemPromptOption,
       allowedTools: buildAllowedTools(containerInput.tools),
+      disallowedTools: buildDisallowedTools(containerInput.tools),
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
       allowDangerouslySkipPermissions: true,
