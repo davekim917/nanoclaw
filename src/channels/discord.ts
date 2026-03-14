@@ -830,12 +830,13 @@ export class DiscordChannel implements Channel {
   ): Promise<void> {
     await interaction.deferReply();
     await interaction.editReply('Deploying latest main...');
-    this.runDetachedDeploy();
+    this.runDetachedDeploy(interaction);
   }
 
-  private runDetachedDeploy(): void {
+  private runDetachedDeploy(interaction: ChatInputCommandInteraction): void {
     const scriptPath = path.resolve(process.cwd(), 'scripts/deploy.sh');
     const logPath = path.resolve(process.cwd(), 'logs/deploy.log');
+    const statusPath = path.resolve(process.cwd(), 'logs/deploy-status.json');
 
     const logFd = fs.openSync(logPath, 'a');
     const child = spawn('bash', [scriptPath], {
@@ -846,6 +847,35 @@ export class DiscordChannel implements Channel {
     child.unref();
 
     logger.info({ pid: child.pid }, 'Detached deploy script spawned');
+
+    // Poll for failure status — if deploy fails before restart, the status
+    // file is written but announceDeployStatus (which runs on startup) never
+    // fires. We poll here to catch pre-restart failures and report them.
+    const startTime = Date.now();
+    const poll = setInterval(async () => {
+      try {
+        if (!fs.existsSync(statusPath)) return;
+        const stat = fs.statSync(statusPath);
+        if (stat.mtimeMs < startTime) return; // stale file from prior deploy
+
+        const status = JSON.parse(fs.readFileSync(statusPath, 'utf-8'));
+        if (status.status === 'failed') {
+          clearInterval(poll);
+          await interaction.followUp(
+            `Deploy failed at **${status.step}**: ${status.error}`,
+          );
+          fs.unlinkSync(statusPath);
+        } else if (status.status === 'ok') {
+          // Success — announceDeployStatus will handle it after restart
+          clearInterval(poll);
+        }
+      } catch {
+        // File mid-write or gone — retry next tick
+      }
+    }, 2_000);
+
+    // Stop polling after 2 minutes regardless
+    setTimeout(() => clearInterval(poll), 120_000);
   }
 
   private async announceDeployStatus(channelId: string): Promise<void> {
