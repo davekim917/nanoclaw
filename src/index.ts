@@ -706,6 +706,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // Track idle timer for closing stdin when agent is idle
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
 
+  // Use the original threadId from resolveGroup for queue slot lookup —
+  // synthesized effectiveThreadId won't match the GROUP_THREAD_KEY slot
+  // used for top-level Discord/Slack messages.
+  const slotLookupKey = threadId || undefined;
+
   const resetIdleTimer = () => {
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
@@ -713,15 +718,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         { group: group.name },
         'Idle timeout, closing container stdin',
       );
-      queue.closeStdin(parentJid, effectiveThreadId);
+      queue.closeStdin(parentJid, slotLookupKey);
     }, IDLE_TIMEOUT);
   };
-
-  // Register idle timer reset on the queue slot so piped messages (from
-  // the message loop) also reset the timer, preventing premature kills.
-  // Use the original threadId from resolveGroup for lookup — synthesized
-  // effectiveThreadId won't match the GROUP_THREAD_KEY slot.
-  const slotLookupKey = threadId || undefined;
   queue.setOnActivity(parentJid, slotLookupKey, resetIdleTimer);
 
   await channel.setTyping?.(chatJid, true);
@@ -794,7 +793,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           outputSentToUser = true;
         }
         await channel.setTyping?.(chatJid, false);
-        queue.notifyIdle(parentJid, effectiveThreadId);
+        queue.notifyIdle(parentJid, slotLookupKey);
       }
 
       if (result.status === 'error') {
