@@ -545,3 +545,74 @@ describe('register_group success', () => {
     expect(getRegisteredGroup('partial@g.us')).toBeUndefined();
   });
 });
+
+// --- set_group_model ---
+
+describe('set_group_model', () => {
+  it('non-main group cannot set group model', async () => {
+    await processTaskIpc(
+      { type: 'set_group_model', jid: 'other@g.us', model: 'claude-opus-4-6' },
+      'other-group',
+      false,
+      deps,
+    );
+    const group = getRegisteredGroup('other@g.us');
+    expect(group?.containerConfig?.model).toBeUndefined();
+  });
+
+  it('main group can set model on existing group', async () => {
+    await processTaskIpc(
+      { type: 'set_group_model', jid: 'other@g.us', model: 'claude-opus-4-6' },
+      'whatsapp_main',
+      true,
+      deps,
+    );
+    const group = getRegisteredGroup('other@g.us');
+    expect(group?.containerConfig?.model).toBe('claude-opus-4-6');
+  });
+
+  it('set_group_model merges with existing containerConfig', async () => {
+    setRegisteredGroup('other@g.us', {
+      ...OTHER_GROUP,
+      containerConfig: { enableThreadSessions: true },
+    });
+    groups['other@g.us'] = { ...OTHER_GROUP, containerConfig: { enableThreadSessions: true } };
+
+    await processTaskIpc(
+      { type: 'set_group_model', jid: 'other@g.us', model: 'claude-opus-4-6' },
+      'whatsapp_main',
+      true,
+      deps,
+    );
+    const group = getRegisteredGroup('other@g.us');
+    expect(group?.containerConfig?.model).toBe('claude-opus-4-6');
+    expect(group?.containerConfig?.enableThreadSessions).toBe(true);
+  });
+
+  it('set_group_model with empty string clears the model', async () => {
+    setRegisteredGroup('other@g.us', {
+      ...OTHER_GROUP,
+      containerConfig: { model: 'claude-opus-4-6' },
+    });
+    groups['other@g.us'] = { ...OTHER_GROUP, containerConfig: { model: 'claude-opus-4-6' } };
+
+    await processTaskIpc(
+      { type: 'set_group_model', jid: 'other@g.us', model: '' },
+      'whatsapp_main',
+      true,
+      deps,
+    );
+    const group = getRegisteredGroup('other@g.us');
+    expect(group?.containerConfig?.model).toBeUndefined();
+  });
+
+  it('set_group_model ignores unknown jid', async () => {
+    await processTaskIpc(
+      { type: 'set_group_model', jid: 'nonexistent@g.us', model: 'claude-opus-4-6' },
+      'whatsapp_main',
+      true,
+      deps,
+    );
+    expect(getRegisteredGroup('nonexistent@g.us')).toBeUndefined();
+  });
+});

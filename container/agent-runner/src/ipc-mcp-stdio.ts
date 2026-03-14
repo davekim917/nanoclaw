@@ -333,6 +333,39 @@ Use available_groups.json to find the JID for a group. The folder name must be c
   },
 );
 
+server.tool(
+  'set_group_model',
+  `Set the default model for a registered group. Main group only.
+
+Use this to configure which Claude model a group uses by default (e.g. "opus", "sonnet", "haiku", or a full model ID like "claude-opus-4-6"). Pass an empty string to clear the override and revert to the global default.`,
+  {
+    jid: z.string().describe('The JID of the group to update (e.g., "dc:1479489865702703155")'),
+    model: z.string().describe('Model alias ("opus", "sonnet", "haiku") or full model ID. Empty string to clear.'),
+  },
+  async (args) => {
+    if (!isMain) {
+      return {
+        content: [{ type: 'text' as const, text: 'Only the main group can update group model.' }],
+        isError: true,
+      };
+    }
+
+    const data = {
+      type: 'set_group_model',
+      jid: args.jid,
+      model: args.model,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(TASKS_DIR, data);
+
+    const label = args.model || '(cleared — reverts to global default)';
+    return {
+      content: [{ type: 'text' as const, text: `Group model set to ${label} for JID ${args.jid}.` }],
+    };
+  },
+);
+
 // --- Query helpers (request-response IPC) ---
 
 const QUERIES_DIR = path.join(IPC_DIR, 'queries');
