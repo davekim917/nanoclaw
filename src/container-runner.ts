@@ -226,11 +226,18 @@ function readGcpOAuthKeys(): {
   clientSecret: string;
 } | null {
   try {
-    const keysPath = path.join(os.homedir(), '.gmail-mcp', 'gcp-oauth.keys.json');
+    const keysPath = path.join(
+      os.homedir(),
+      '.gmail-mcp',
+      'gcp-oauth.keys.json',
+    );
     const keys = JSON.parse(fs.readFileSync(keysPath, 'utf-8'));
     const installed = keys.installed || keys.web;
     if (!installed?.client_id || !installed?.client_secret) return null;
-    return { clientId: installed.client_id, clientSecret: installed.client_secret };
+    return {
+      clientId: installed.client_id,
+      clientSecret: installed.client_secret,
+    };
   } catch {
     return null;
   }
@@ -308,7 +315,10 @@ async function refreshAllGmailTokens(oauthKeys: {
       const expiryDate = creds.expiry_date as number | undefined;
       if (expiryDate && Date.now() < expiryDate - 5 * 60 * 1000) continue;
       if (!creds.refresh_token) {
-        logger.warn({ account: label }, 'Gmail token expired, no refresh_token');
+        logger.warn(
+          { account: label },
+          'Gmail token expired, no refresh_token',
+        );
         continue;
       }
 
@@ -422,14 +432,21 @@ async function refreshGoogleWorkspaceTokens(oauthKeys: {
 
       const refreshToken = creds.refresh_token as string | undefined;
       if (!refreshToken) {
-        logger.warn({ account }, 'Google Workspace token expired, no refresh_token');
+        logger.warn(
+          { account },
+          'Google Workspace token expired, no refresh_token',
+        );
         continue;
       }
 
       const clientId = creds.client_id || oauthKeys.clientId;
       const clientSecret = creds.client_secret || oauthKeys.clientSecret;
 
-      const result = await refreshGoogleToken(refreshToken, clientId, clientSecret);
+      const result = await refreshGoogleToken(
+        refreshToken,
+        clientId,
+        clientSecret,
+      );
       if (!result) {
         logger.error({ account }, 'Google Workspace token refresh failed');
         continue;
