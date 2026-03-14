@@ -7,7 +7,8 @@ BindsTo=nanoclaw.service
 Type=simple
 User=ubuntu
 WorkingDirectory=/home/ubuntu/nanoclaw
-ExecStart=sqlite_web --host 127.0.0.1 --port 8088 --read-only store/messages.db
+EnvironmentFile=/home/ubuntu/nanoclaw/.env
+ExecStart=/bin/sh -c 'sqlite_web --host 0.0.0.0 --port 8088 --read-only --password "${SQLITE_WEB_PASSWORD}" store/messages.db'
 Restart=on-failure
 RestartSec=5
 
