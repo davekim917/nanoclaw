@@ -227,6 +227,7 @@ export interface ContainerInput {
   threadId?: string;
   assistantName?: string;
   model?: string;
+  effort?: string;
   secrets?: Record<string, string>;
   tools?: string[];
   attachments?: ContainerAttachment[];
@@ -1024,8 +1025,7 @@ function buildVolumeMounts(
     const gmailScopes = extractToolScopes(tools, 'gmail');
     const readonlyScopes = extractToolScopes(tools, 'gmail-readonly');
     const gmailAccounts = [...gmailScopes.scopes, ...readonlyScopes.scopes];
-    const gmailScoped =
-      gmailAccounts.length > 0 && !tools?.includes('gmail');
+    const gmailScoped = gmailAccounts.length > 0 && !tools?.includes('gmail');
 
     if (gmailScoped) {
       // Mount only the specified account's credentials as /home/node/.gmail-mcp

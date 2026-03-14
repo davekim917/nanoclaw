@@ -36,6 +36,7 @@ interface ContainerInput {
   threadId?: string;
   assistantName?: string;
   model?: string;
+  effort?: string;
   secrets?: Record<string, string>;
   tools?: string[];
   attachments?: ContainerAttachment[];
@@ -871,6 +872,7 @@ async function runQuery(
       allowDangerouslySkipPermissions: true,
       settingSources: ['project', 'user'],
       mcpServers: buildMcpServers(containerInput, mcpServerPath),
+      ...(effort ? { effort } : {}),
       hooks: {
         PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName, containerInput.threadId)] }],
         PreToolUse: [{ matcher: 'Bash', hooks: [createSanitizeBashHook()] }],
@@ -970,6 +972,17 @@ async function main(): Promise<void> {
   if (containerInput.model) {
     sdkEnv['CLAUDE_CODE_USE_MODEL'] = containerInput.model;
     log(`Using model: ${containerInput.model}`);
+  }
+
+  // Effort level for this run (per-message flag > session sticky > default 'high')
+  const effort = containerInput.effort as
+    | 'low'
+    | 'medium'
+    | 'high'
+    | 'max'
+    | undefined;
+  if (effort) {
+    log(`Using effort: ${effort}`);
   }
 
   const __dirname = path.dirname(fileURLToPath(import.meta.url));

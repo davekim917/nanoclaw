@@ -123,6 +123,15 @@ function createSchema(database: Database.Database): void {
     // Column already exists — ignore
   }
 
+  // Add effort column to sessions_v2 (sticky effort override per session)
+  try {
+    database.exec(
+      `ALTER TABLE sessions_v2 ADD COLUMN effort TEXT DEFAULT NULL`,
+    );
+  } catch {
+    // Column already exists — ignore
+  }
+
   // Index for thread LIKE queries in getNewMessages (e.g. chat_jid LIKE 'slack:C123:thread:%')
   database.exec(
     `CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_jid, timestamp)`,
@@ -1098,6 +1107,30 @@ export function setSessionModel(
   }
   db.prepare('UPDATE sessions_v2 SET model = ? WHERE session_key = ?').run(
     model,
+    key,
+  );
+}
+
+/** Get the sticky effort override for a session, if any. */
+export function getSessionEffort(key: string): string | undefined {
+  const row = db
+    .prepare('SELECT effort FROM sessions_v2 WHERE session_key = ?')
+    .get(key) as { effort: string | null } | undefined;
+  return row?.effort ?? undefined;
+}
+
+/** Set or clear the sticky effort override for a session. */
+export function setSessionEffort(
+  key: string,
+  effort: string | null,
+  groupFolder?: string,
+  threadId?: string,
+): void {
+  if (groupFolder && effort !== null) {
+    ensureSessionRow(key, groupFolder, threadId);
+  }
+  db.prepare('UPDATE sessions_v2 SET effort = ? WHERE session_key = ?').run(
+    effort,
     key,
   );
 }

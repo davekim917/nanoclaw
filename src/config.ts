@@ -108,6 +108,24 @@ export const MODEL_FLAG_PATTERN =
 // One-shot flag: "-m1 opus" — just this invocation, doesn't stick
 export const MODEL_ONESHOT_PATTERN = /(?:^|\s)-m1\s+(opus|sonnet|haiku)\b/i;
 
+// Effort levels for the agent SDK (controls thinking depth).
+// Default is 'high'; per-message overrides via "-e max" (sticky) or "-e1 max" (one-shot).
+export type EffortLevel = 'low' | 'medium' | 'high' | 'max';
+export const DEFAULT_EFFORT: EffortLevel = 'high';
+export const EFFORT_LEVELS: Set<string> = new Set([
+  'low',
+  'medium',
+  'high',
+  'max',
+]);
+
+// Sticky flag: "-e max" — sets effort for rest of session; "-e default" clears
+export const EFFORT_FLAG_PATTERN =
+  /(?:^|\s)-e\s+(low|medium|high|max|default|reset)\b/i;
+// One-shot flag: "-e1 max" — just this invocation, doesn't stick
+export const EFFORT_ONESHOT_PATTERN =
+  /(?:^|\s)-e1\s+(low|medium|high|max)\b/i;
+
 export const TRIGGER_PATTERN = new RegExp(
   `^@${escapeRegex(ASSISTANT_NAME)}\\b`,
   'i',

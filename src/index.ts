@@ -5,7 +5,11 @@ import path from 'path';
 import {
   ASSISTANT_NAME,
   DATA_DIR,
+  DEFAULT_EFFORT,
   DEFAULT_MODEL,
+  EFFORT_FLAG_PATTERN,
+  EFFORT_LEVELS,
+  EFFORT_ONESHOT_PATTERN,
   GROUP_THREAD_KEY,
   IDLE_TIMEOUT,
   MODEL_ALIASES,
@@ -65,12 +69,14 @@ import {
   getNewMessages,
   getRegisteredGroup,
   getRouterState,
+  getSessionEffort,
   getSessionModel,
   initDatabase,
   pruneThreadOrigins,
   setRegisteredGroup,
   setRouterState,
   setSession,
+  setSessionEffort,
   setSessionModel,
   setSessionProcessing,
   setSessionV2,
@@ -235,6 +241,53 @@ function resolveModel(
   return DEFAULT_MODEL;
 }
 
+interface EffortOverrideResult {
+  effort: string; // 'low' | 'medium' | 'high' | 'max'
+  sticky: boolean;
+  reset?: boolean;
+}
+
+/**
+ * Extract a per-message effort override from raw message content.
+ * Checks (in priority order):
+ *   1. One-shot flag: "-e1 max" — this invocation only, doesn't persist
+ *   2. Sticky flag: "-e max" — persists for rest of session; "-e default" clears
+ */
+function extractEffortOverride(
+  messages: NewMessage[],
+): EffortOverrideResult | undefined {
+  for (const msg of messages) {
+    const oneshotMatch = EFFORT_ONESHOT_PATTERN.exec(msg.content);
+    if (oneshotMatch) {
+      return { effort: oneshotMatch[1].toLowerCase(), sticky: false };
+    }
+
+    const flagMatch = EFFORT_FLAG_PATTERN.exec(msg.content);
+    if (flagMatch) {
+      const val = flagMatch[1].toLowerCase();
+      if (val === 'default' || val === 'reset') {
+        return { effort: '', sticky: true, reset: true };
+      }
+      return { effort: val, sticky: true };
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Resolve the effort level for a container run.
+ * Priority: per-message override > session sticky > global default.
+ */
+function resolveEffort(
+  messageOverride?: string,
+  sessionEffort?: string,
+): string {
+  if (messageOverride && EFFORT_LEVELS.has(messageOverride))
+    return messageOverride;
+  if (sessionEffort && EFFORT_LEVELS.has(sessionEffort)) return sessionEffort;
+  return DEFAULT_EFFORT;
+}
+
 function loadState(): void {
   lastTimestamp = getRouterState('last_timestamp') || '';
   const agentTs = getRouterState('last_agent_timestamp');
@@ -354,6 +407,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           group,
           prompt,
           chatJid,
+          undefined,
           undefined,
           undefined,
           undefined,
@@ -568,7 +622,49 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     model = resolveModel(group, undefined, sessionModel);
   }
 
-  const prompt = formatMessages(missedMessages, TIMEZONE) + modelSwitchNotice;
+  // Effort resolution: per-message flag > session sticky > default
+  const effortOverride = extractEffortOverride(missedMessages);
+  const sessionEffort = getSessionEffort(sessionKey);
+
+  let effort: string;
+  let effortNotice = '';
+  if (effortOverride?.reset) {
+    setSessionEffort(sessionKey, null);
+    effort = resolveEffort();
+    effortNotice = `\n\n[SYSTEM: Effort level reverted to default (${effort}).]`;
+    logger.info(
+      { group: group.name, effort, sessionKey },
+      'Effort override cleared, reverted to default',
+    );
+  } else if (effortOverride) {
+    effort = effortOverride.effort;
+    if (effortOverride.sticky) {
+      setSessionEffort(
+        sessionKey,
+        effortOverride.effort,
+        group.folder,
+        effectiveThreadId,
+      );
+      effortNotice = `\n\n[SYSTEM: Effort level set to ${effort} for this session.]`;
+      logger.info(
+        { group: group.name, effort, sessionKey },
+        'Effort override persisted for session',
+      );
+    } else {
+      effortNotice = `\n\n[SYSTEM: Effort level set to ${effort} for this message only.]`;
+      logger.info(
+        { group: group.name, effort, sessionKey },
+        'One-shot effort override (not persisted)',
+      );
+    }
+  } else {
+    effort = resolveEffort(undefined, sessionEffort);
+  }
+
+  const prompt =
+    formatMessages(missedMessages, TIMEZONE) +
+    modelSwitchNotice +
+    effortNotice;
 
   // Collect attachments from messages and remap paths for container mount
   const containerAttachments: ContainerAttachment[] = [];
@@ -637,6 +733,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     prompt,
     chatJid,
     model,
+    effort,
     effectiveThreadId,
     containerAttachments.length > 0 ? containerAttachments : undefined,
     async (result) => {
@@ -758,6 +855,7 @@ async function runAgent(
   prompt: string,
   chatJid: string,
   model?: string,
+  effort?: string,
   threadId?: string,
   attachments?: ContainerAttachment[],
   onOutput?: (output: ContainerOutput) => Promise<void>,
@@ -823,6 +921,7 @@ async function runAgent(
         threadId,
         assistantName: resolveAssistantName(group.containerConfig),
         model,
+        effort,
         attachments,
       },
       (proc, containerName) =>
