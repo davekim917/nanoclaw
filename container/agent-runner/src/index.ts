@@ -130,11 +130,10 @@ You are responding in a Discord channel. Use Discord markdown syntax:
 - \`\`\`triple backticks\`\`\` for code blocks
 - - or * for bullet points
 - > for blockquotes
-- \`---\` as a visual separator between major sections
 
-Do NOT use: [text](url) link syntax, or ## markdown headings.
+Do NOT use: \`---\` horizontal rules (they appear as literal "---" in Discord, not dividers), [text](url) link syntax, or ## markdown headings.
 
-Apply the Response Style rules from your system instructions: emoji + **bold** section headers, bullet points, no walls of text.`;
+Use **bold** section headers to separate major sections instead of dividers. Apply the Response Style rules from your system instructions: emoji + **bold** section headers, bullet points, no walls of text.`;
   }
   // WhatsApp/Telegram JIDs reach here intentionally — they use global CLAUDE.md for formatting.
   return undefined;
