@@ -84,6 +84,7 @@ export const MAX_THREADS_PER_GROUP = Math.max(
   parseInt(process.env.MAX_THREADS_PER_GROUP || '6', 10) || 6,
 );
 export const WORKTREES_DIR = path.resolve(DATA_DIR, 'worktrees');
+export const WORKTREE_CACHE_DIR = path.resolve(DATA_DIR, 'worktree-cache');
 export const GROUP_THREAD_KEY = '__group__';
 
 export function escapeRegex(str: string): string {

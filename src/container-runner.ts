@@ -21,6 +21,7 @@ import {
   RESIDENTIAL_PROXY_URL,
   TIMEZONE,
   WORKTREES_DIR,
+  WORKTREE_CACHE_DIR,
   escapeRegex,
 } from './config.js';
 import { readEnvFile } from './env.js';
@@ -68,6 +69,47 @@ const GRANOLA_PROACTIVE_REFRESH_MS = 4 * 60 * 60 * 1000;
 const GOOGLE_TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token';
 const GOOGLE_PROACTIVE_REFRESH_MS = 4 * 60 * 60 * 1000;
 let googleRefreshTimer: ReturnType<typeof setInterval> | null = null;
+
+// Worktree file cache: directories to exclude when caching untracked files
+const CACHE_EXCLUDE_DIRS = new Set([
+  'node_modules',
+  '.next',
+  'dist',
+  'build',
+  '__pycache__',
+  '.venv',
+  'venv',
+  'coverage',
+  '.cache',
+  'dbt_packages',
+  'target',
+  'logs',
+  '.tox',
+  '.mypy_cache',
+  '.pytest_cache',
+  '.ruff_cache',
+  '.turbo',
+  '.parcel-cache',
+]);
+const CACHE_MAX_FILE_SIZE = 1_048_576; // 1MB per-file limit
+const CACHE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+// Sensitive files to never cache (exact basename match; .env* handled by prefix check)
+const CACHE_EXCLUDE_FILES = new Set([
+  'credentials.json',
+  'service-account.json',
+  '.secret',
+  '.secrets',
+]);
+// Sensitive file extensions to never cache
+const CACHE_EXCLUDE_EXTENSIONS = new Set([
+  '.key',
+  '.pem',
+  '.p12',
+  '.pfx',
+  '.jks',
+  '.keystore',
+  '.p8',
+]);
 
 // In-memory cache to avoid redundant disk reads / duplicate refresh calls
 let granolaTokenCache: { token: string; expiresAt: number } | null = null;
@@ -591,7 +633,10 @@ export function withGroupMutex<T>(
   return next;
 }
 
-function execAsync(cmd: string, options?: { cwd?: string }): Promise<string> {
+function execAsync(
+  cmd: string,
+  options?: { cwd?: string; maxBuffer?: number },
+): Promise<string> {
   return new Promise((resolve, reject) => {
     exec(cmd, { timeout: 30_000, ...options }, (err, stdout, stderr) => {
       if (err) reject(new Error(`${cmd}: ${stderr || err.message}`));
@@ -697,6 +742,201 @@ async function removeWorktree(repoDir: string, wtPath: string): Promise<void> {
     } catch {
       /* ignore */
     }
+  }
+}
+
+/**
+ * Cache untracked files (including gitignored) from a worktree before removal.
+ * Uses the external sidecar pattern — files are stored outside git at
+ * data/worktree-cache/{groupFolder}/{repoName}/ and restored into new worktrees.
+ * Best-effort — never throws, never blocks cleanup.
+ */
+async function cacheWorktreeUntrackedFiles(
+  wtPath: string,
+  groupFolder: string,
+): Promise<void> {
+  const repoName = path.basename(wtPath);
+  const cacheDir = path.join(WORKTREE_CACHE_DIR, groupFolder, repoName);
+  // Write to a temp dir, then atomically rename into place. Prevents concurrent
+  // cleanups from interleaving writes into a mixed-state cache.
+  const tmpDir = `${cacheDir}.tmp.${process.pid}`;
+
+  try {
+    // List all untracked files including gitignored (omitting --exclude-standard
+    // means no excludes are applied, so everything not in the index is listed).
+    // -z for null-delimited output (safe for filenames with spaces/special chars).
+    const output = await execAsync('git ls-files --others -z', {
+      cwd: wtPath,
+      maxBuffer: 10 * 1024 * 1024,
+    });
+    if (!output) return;
+
+    const files = output.split('\0').filter(Boolean);
+    let cached = 0;
+
+    for (const relPath of files) {
+      // Skip files in excluded directories (match any path component)
+      const parts = relPath.split('/');
+      if (parts.some((p) => CACHE_EXCLUDE_DIRS.has(p))) continue;
+
+      // Skip sensitive files by name or extension
+      const fileName = parts[parts.length - 1];
+      if (fileName === '.env' || fileName.startsWith('.env.')) continue;
+      if (CACHE_EXCLUDE_FILES.has(fileName)) continue;
+      const ext = path.extname(fileName).toLowerCase();
+      if (CACHE_EXCLUDE_EXTENSIONS.has(ext)) continue;
+
+      const srcFile = path.join(wtPath, relPath);
+
+      // lstatSync does not follow symlinks — isFile() returns false for symlinks,
+      // preventing sensitive symlink targets from being cached
+      try {
+        const stat = fs.lstatSync(srcFile);
+        if (!stat.isFile() || stat.size > CACHE_MAX_FILE_SIZE) continue;
+      } catch {
+        continue; // file vanished or unreadable
+      }
+
+      const dstFile = path.join(tmpDir, relPath);
+      try {
+        fs.mkdirSync(path.dirname(dstFile), { recursive: true });
+        fs.copyFileSync(srcFile, dstFile);
+        cached++;
+      } catch {
+        // skip individual file errors
+      }
+    }
+
+    if (cached > 0) {
+      // Atomic swap: remove old cache, rename tmp into place
+      try {
+        fs.rmSync(cacheDir, { recursive: true, force: true });
+      } catch {
+        /* may not exist */
+      }
+      fs.renameSync(tmpDir, cacheDir);
+      logger.info(
+        { group: groupFolder, repo: repoName, cached },
+        'Cached untracked files from worktree',
+      );
+    }
+  } catch (err) {
+    logger.warn(
+      { group: groupFolder, repo: repoName, err },
+      'Failed to cache worktree untracked files',
+    );
+  } finally {
+    // Clean up tmp dir if it still exists (wasn't renamed into place)
+    try {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+/**
+ * Restore cached untracked files into a freshly created worktree.
+ * Skips files that already exist (git-checked-out version wins).
+ * Synchronous to match existing prepareThreadWorkspace patterns. Best-effort.
+ */
+function restoreWorktreeCachedFiles(
+  wtPath: string,
+  groupFolder: string,
+): void {
+  const repoName = path.basename(wtPath);
+  const cacheDir = path.join(WORKTREE_CACHE_DIR, groupFolder, repoName);
+
+  if (!fs.existsSync(cacheDir)) return;
+
+  try {
+    let restored = 0;
+
+    function walkAndCopy(srcDir: string, relBase: string): void {
+      for (const entry of fs.readdirSync(srcDir, { withFileTypes: true })) {
+        const srcPath = path.join(srcDir, entry.name);
+        const relPath = relBase ? `${relBase}/${entry.name}` : entry.name;
+
+        if (entry.isDirectory()) {
+          walkAndCopy(srcPath, relPath);
+        } else if (entry.isFile()) {
+          const dstPath = path.join(wtPath, relPath);
+          // Only restore if the file doesn't already exist in the worktree
+          if (!fs.existsSync(dstPath)) {
+            try {
+              fs.mkdirSync(path.dirname(dstPath), { recursive: true });
+              fs.copyFileSync(srcPath, dstPath);
+              restored++;
+            } catch {
+              // skip individual file errors
+            }
+          }
+        }
+      }
+    }
+
+    walkAndCopy(cacheDir, '');
+
+    if (restored > 0) {
+      logger.info(
+        { group: groupFolder, repo: repoName, restored },
+        'Restored cached untracked files to worktree',
+      );
+    }
+  } catch (err) {
+    logger.warn(
+      { group: groupFolder, repo: repoName, err },
+      'Failed to restore cached files to worktree',
+    );
+  }
+}
+
+/**
+ * Evict stale cached files older than CACHE_MAX_AGE_MS.
+ * Removes empty directories after eviction. Best-effort.
+ */
+function evictStaleCacheFiles(): void {
+  if (!fs.existsSync(WORKTREE_CACHE_DIR)) return;
+
+  const cutoff = Date.now() - CACHE_MAX_AGE_MS;
+  let evicted = 0;
+
+  function walkAndEvict(dir: string): void {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walkAndEvict(fullPath);
+        // Remove empty directories
+        try {
+          fs.rmdirSync(fullPath);
+        } catch {
+          /* not empty */
+        }
+      } else if (entry.isFile()) {
+        try {
+          const stat = fs.statSync(fullPath);
+          if (stat.mtimeMs < cutoff) {
+            fs.unlinkSync(fullPath);
+            evicted++;
+          }
+        } catch {
+          // skip
+        }
+      }
+    }
+  }
+
+  walkAndEvict(WORKTREE_CACHE_DIR);
+
+  if (evicted > 0) {
+    logger.info({ evicted }, 'Evicted stale worktree cache files');
   }
 }
 
@@ -811,6 +1051,11 @@ export async function prepareThreadWorkspace(
         createdWorktrees.push({ repoDir: srcPath, wtPath });
       }),
     );
+
+    // Restore cached untracked files into freshly created worktrees
+    for (const { wtPath } of createdWorktrees) {
+      restoreWorktreeCachedFiles(wtPath, groupFolder);
+    }
   } catch (err) {
     // Rollback: clean up any created worktrees
     await Promise.all(
@@ -860,15 +1105,16 @@ export async function cleanupThreadWorkspace(
     }
   }
 
-  // Rescue unpushed work, then remove git worktrees
+  // Cache untracked files, rescue unpushed work, then remove git worktrees
   try {
     const gitWorktrees = findGitWorktrees(worktreeBase);
 
-    // Rescue phase: independent repos, safe to parallelize
+    // Cache + rescue phase: cache first (rescue's git add stages files, leaving nothing to cache after)
     await Promise.all(
-      gitWorktrees.map(({ wtPath }) =>
-        rescueWorktreeChanges(wtPath, groupFolder, threadId),
-      ),
+      gitWorktrees.map(async ({ wtPath }) => {
+        await cacheWorktreeUntrackedFiles(wtPath, groupFolder);
+        await rescueWorktreeChanges(wtPath, groupFolder, threadId);
+      }),
     );
 
     // Removal phase
@@ -1020,16 +1266,17 @@ export async function cleanupOrphanWorktrees(): Promise<void> {
         const tdPath = path.join(gfPath, td);
         if (!fs.statSync(tdPath).isDirectory()) continue;
 
-        // Rescue unpushed work from git worktrees inside this thread dir
+        // Cache untracked files, then rescue unpushed work from git worktrees
         try {
           const worktrees = findGitWorktrees(tdPath);
           await Promise.all(
-            worktrees.map(({ wtPath }) =>
-              rescueWorktreeChanges(wtPath, gf, td),
-            ),
+            worktrees.map(async ({ wtPath }) => {
+              await cacheWorktreeUntrackedFiles(wtPath, gf);
+              await rescueWorktreeChanges(wtPath, gf, td);
+            }),
           );
         } catch {
-          /* best-effort rescue */
+          /* best-effort cache + rescue */
         }
 
         try {
@@ -1075,6 +1322,9 @@ export async function cleanupOrphanWorktrees(): Promise<void> {
   if (cleaned > 0) {
     logger.info({ cleaned }, 'Cleaned up orphan worktrees');
   }
+
+  // Evict stale cache files at startup (natural GC point)
+  evictStaleCacheFiles();
 }
 
 function buildVolumeMounts(
