@@ -18,7 +18,7 @@ import {
   searchThreadsFTS,
   upsertThreadIndex,
 } from './db.js';
-import { getAnthropicAuthHeaders } from './env.js';
+import { callHaiku } from './llm.js';
 import { logger } from './logger.js';
 
 export interface ThreadSearchResult {
@@ -156,40 +156,14 @@ async function rerankWithHaiku(
     .map((c, i) => `${i + 1}. [${c.thread_key}] ${c.topic_summary}`)
     .join('\n');
 
-  const resp = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'anthropic-version': '2023-06-01',
-      ...(await getAnthropicAuthHeaders()),
-    },
-    body: JSON.stringify({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 200,
-      messages: [
-        {
-          role: 'user',
-          content: `Given this search query: "${query}"
+  const prompt = `Given this search query: "${query}"
 
 Rank these thread summaries by relevance to the query. Return ONLY the numbers of the top ${limit} most relevant threads, comma-separated, most relevant first.
 
 ${summaryList}
 
-Reply with ONLY the numbers (e.g., "3,1,7"):`,
-        },
-      ],
-    }),
-    signal: AbortSignal.timeout(5000),
-  });
-
-  if (!resp.ok) {
-    throw new Error(`Haiku API error: ${resp.status}`);
-  }
-
-  const data = (await resp.json()) as {
-    content: Array<{ type: string; text?: string }>;
-  };
-  const text = data.content?.find((c) => c.type === 'text')?.text?.trim() || '';
+Reply with ONLY the numbers (e.g., "3,1,7"):`;
+  const text = await callHaiku(prompt);
 
   // Parse comma-separated numbers
   const indices = text

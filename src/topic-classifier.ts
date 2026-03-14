@@ -7,7 +7,7 @@
  * 3. Ambiguous zone (5-30 min): call Haiku to classify topic change
  */
 
-import { getAnthropicAuthHeaders } from './env.js';
+import { callHaiku } from './llm.js';
 import { logger } from './logger.js';
 
 const SHORT_CIRCUIT_MINUTES = 5;
@@ -82,38 +82,8 @@ async function classifyWithHaiku(
     )
     .join('\n');
 
-  const resp = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'anthropic-version': '2023-06-01',
-      ...(await getAnthropicAuthHeaders()),
-    },
-    body: JSON.stringify({
-      model: 'claude-haiku-4-5-20251001',
-      max_tokens: 10,
-      messages: [
-        {
-          role: 'user',
-          content: `Given this recent conversation:\n${context}\n\nIs this new message a continuation of the same topic, or a completely new topic?\nNew message: "${newMessage.slice(0, 300)}"\n\nReply with exactly one word: SAME or NEW`,
-        },
-      ],
-    }),
-    signal: AbortSignal.timeout(5000),
-  });
+  const prompt = `Given this recent conversation:\n${context}\n\nIs this new message a continuation of the same topic, or a completely new topic?\nNew message: "${newMessage.slice(0, 300)}"\n\nReply with exactly one word: SAME or NEW`;
+  const text = await callHaiku(prompt);
 
-  if (!resp.ok) {
-    throw new Error(`Haiku API error: ${resp.status}`);
-  }
-
-  const data = (await resp.json()) as {
-    content: Array<{ type: string; text?: string }>;
-  };
-  const text =
-    data.content
-      ?.find((c) => c.type === 'text')
-      ?.text?.trim()
-      .toUpperCase() || '';
-
-  return text.includes('NEW');
+  return text.toUpperCase().includes('NEW');
 }

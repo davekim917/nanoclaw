@@ -29,7 +29,8 @@ import {
 } from '../config.js';
 import { downloadAttachment } from '../attachment-downloader.js';
 import { getThreadOrigin, setThreadOrigin } from '../db.js';
-import { getAnthropicAuthHeaders, readEnvFile } from '../env.js';
+import { readEnvFile } from '../env.js';
+import { callHaiku } from '../llm.js';
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 import { Attachment, Channel } from '../types.js';
@@ -42,31 +43,8 @@ import { transformTablesInText } from '../table-renderer.js';
  */
 async function generateThreadName(userMessage: string): Promise<string> {
   try {
-    const resp = await fetch('https://api.anthropic.com/v1/messages', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'anthropic-version': '2023-06-01',
-        ...(await getAnthropicAuthHeaders()),
-      },
-      body: JSON.stringify({
-        model: 'claude-haiku-4-5-20251001',
-        max_tokens: 20,
-        messages: [
-          {
-            role: 'user',
-            content: `Generate a concise 2–5 word title that captures the topic of this message. Reply with only the title — no quotes, no punctuation, no explanation.\n\nMessage: ${userMessage.slice(0, 500)}`,
-          },
-        ],
-      }),
-      signal: AbortSignal.timeout(5000),
-    });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const data = (await resp.json()) as {
-      content: Array<{ type: string; text?: string }>;
-    };
-    const name =
-      data.content?.find((c) => c.type === 'text')?.text?.trim() ?? '';
+    const prompt = `Generate a concise 2–5 word title that captures the topic of this message. Reply with only the title — no quotes, no punctuation, no explanation.\n\nMessage: ${userMessage.slice(0, 500)}`;
+    const name = await callHaiku(prompt);
     return name.slice(0, 100) || 'Thread';
   } catch (err) {
     logger.warn({ err }, 'Failed to generate thread name');
