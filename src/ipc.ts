@@ -570,13 +570,6 @@ export async function processTaskIpc(
       break;
 
     case 'add_ship_log':
-      if (!isMain) {
-        logger.warn(
-          { sourceGroup },
-          'Unauthorized add_ship_log attempt blocked',
-        );
-        break;
-      }
       if (data.title) {
         const entryId = `ship-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
         addShipLogEntry({
@@ -598,13 +591,6 @@ export async function processTaskIpc(
       break;
 
     case 'add_backlog_item':
-      if (!isMain) {
-        logger.warn(
-          { sourceGroup },
-          'Unauthorized add_backlog_item attempt blocked',
-        );
-        break;
-      }
       if (data.title) {
         const itemId = `backlog-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
         const now = new Date().toISOString();
@@ -632,13 +618,6 @@ export async function processTaskIpc(
       break;
 
     case 'update_backlog_item':
-      if (!isMain) {
-        logger.warn(
-          { sourceGroup },
-          'Unauthorized update_backlog_item attempt blocked',
-        );
-        break;
-      }
       if (data.itemId) {
         const updates: Parameters<typeof updateBacklogItem>[1] = {};
         if (data.title !== undefined) updates.title = data.title;
@@ -668,13 +647,6 @@ export async function processTaskIpc(
       break;
 
     case 'delete_backlog_item':
-      if (!isMain) {
-        logger.warn(
-          { sourceGroup },
-          'Unauthorized delete_backlog_item attempt blocked',
-        );
-        break;
-      }
       if (data.itemId) {
         deleteBacklogItem(data.itemId);
         logger.info({ itemId: data.itemId }, 'Backlog item deleted via IPC');
@@ -1012,13 +984,6 @@ function processQueryIpc(
     }
 
     case 'list_backlog': {
-      if (!isMain) {
-        writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
-          status: 'error',
-          error: 'Unauthorized: backlog is accessible to the main group only',
-        });
-        break;
-      }
       const items = getBacklog(data.status, data.limit || 50);
       logger.info(
         { sourceGroup, count: items.length },
@@ -1032,13 +997,6 @@ function processQueryIpc(
     }
 
     case 'list_ship_log': {
-      if (!isMain) {
-        writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
-          status: 'error',
-          error: 'Unauthorized: ship log is accessible to the main group only',
-        });
-        break;
-      }
       const entries = getShipLog(data.limit || 20);
       logger.info(
         { sourceGroup, count: entries.length },
