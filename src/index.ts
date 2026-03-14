@@ -508,6 +508,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // ─────────────────────────────────────────────────────────────
   let effectiveThreadId = threadId;
   const isThreadEnabled = isThreadSessionEnabled(chatJid, group);
+  // Set when we truncate at a second trigger so we can re-enqueue after this run.
+  let hasMorePendingTriggers = false;
   if (isThreadEnabled && !effectiveThreadId && missedMessages.length > 0) {
     // Each @trigger on the base channel is a separate conversation (possibly
     // from different people asking unrelated questions). Anchor on the first
@@ -525,6 +527,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       );
       if (nextTriggerIdx >= 0) {
         missedMessages = missedMessages.slice(0, nextTriggerIdx);
+        // Signal that there are more triggers waiting in the DB so we re-enqueue
+        // after this run completes. This handles the case where two @triggers
+        // arrive within the debounce window and get coalesced into one
+        // enqueueMessageCheck — without this, the second trigger is never picked up.
+        hasMorePendingTriggers = true;
       }
     }
   }
@@ -824,6 +831,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         attachmentCache.delete(msg.id);
       }
       saveState();
+      // Still re-enqueue for the next trigger even if this run errored after
+      // sending output — the cursor was advanced past the truncated batch,
+      // so msg2 would otherwise be permanently stuck.
+      if (hasMorePendingTriggers) {
+        setImmediate(() => queue.enqueueMessageCheck(parentJid, chatJid));
+      }
       return true;
     }
     // Roll back in-memory cursor so retries can re-process these messages.
@@ -843,6 +856,15 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   // Success — persist the cursor advance now that the container has completed.
   saveState();
+
+  // If we truncated at a second trigger, re-enqueue so the next trigger gets its
+  // own container. Use setImmediate so this runs after runForGroup's finally block
+  // has cleared the slot — otherwise enqueueMessageCheck would see the slot as
+  // still active and add to pendingProcessJids instead of starting immediately.
+  if (hasMorePendingTriggers) {
+    setImmediate(() => queue.enqueueMessageCheck(parentJid, chatJid));
+  }
+
   return true;
 }
 
