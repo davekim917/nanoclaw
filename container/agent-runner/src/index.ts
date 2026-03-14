@@ -299,7 +299,12 @@ function createPreCompactHook(assistantName?: string, threadId?: string): HookCa
 // Secrets to strip from Bash tool subprocess environments.
 // These are needed by claude-code for API auth but should never
 // be visible to commands Kit runs.
-const SECRET_ENV_VARS = ['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN'];
+const SECRET_ENV_VARS = [
+  'ANTHROPIC_API_KEY',
+  'CLAUDE_CODE_OAUTH_TOKEN',
+  'GMAIL_OAUTH_PATH',
+  'GMAIL_CREDENTIALS_PATH',
+];
 
 function createSanitizeBashHook(): HookCallback {
   return async (input, _toolUseId, _context) => {
@@ -858,6 +863,17 @@ async function runQuery(
     log(`Additional directories: ${extraDirs.join(', ')}`);
   }
 
+  // Effort level for this run (per-message flag > session sticky > default 'high')
+  const effort = containerInput.effort as
+    | 'low'
+    | 'medium'
+    | 'high'
+    | 'max'
+    | undefined;
+  if (effort) {
+    log(`Using effort: ${effort}`);
+  }
+
   for await (const message of query({
     prompt: stream,
     options: {
@@ -972,17 +988,6 @@ async function main(): Promise<void> {
   if (containerInput.model) {
     sdkEnv['CLAUDE_CODE_USE_MODEL'] = containerInput.model;
     log(`Using model: ${containerInput.model}`);
-  }
-
-  // Effort level for this run (per-message flag > session sticky > default 'high')
-  const effort = containerInput.effort as
-    | 'low'
-    | 'medium'
-    | 'high'
-    | 'max'
-    | undefined;
-  if (effort) {
-    log(`Using effort: ${effort}`);
   }
 
   const __dirname = path.dirname(fileURLToPath(import.meta.url));

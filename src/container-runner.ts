@@ -1024,19 +1024,35 @@ function buildVolumeMounts(
   if (isToolEnabled(tools, 'gmail') || isToolEnabled(tools, 'gmail-readonly')) {
     const gmailScopes = extractToolScopes(tools, 'gmail');
     const readonlyScopes = extractToolScopes(tools, 'gmail-readonly');
-    const gmailAccounts = [...gmailScopes.scopes, ...readonlyScopes.scopes];
+    const gmailAccounts = [
+      ...new Set([...gmailScopes.scopes, ...readonlyScopes.scopes]),
+    ];
     const gmailScoped = gmailAccounts.length > 0 && !tools?.includes('gmail');
 
     if (gmailScoped) {
-      // Mount only the specified account's credentials as /home/node/.gmail-mcp
-      // so the Gmail MCP server finds it at its default location
-      const accountDir = path.join(homeDir, `.gmail-mcp-${gmailAccounts[0]}`);
-      if (fs.existsSync(accountDir)) {
+      // Mount first scoped account as primary (/home/node/.gmail-mcp)
+      // and any additional accounts at their named paths
+      const primaryAccount = gmailAccounts[0];
+      const primaryDir = path.join(homeDir, `.gmail-mcp-${primaryAccount}`);
+      if (fs.existsSync(primaryDir)) {
         mounts.push({
-          hostPath: accountDir,
+          hostPath: primaryDir,
           containerPath: '/home/node/.gmail-mcp',
           readonly: false,
         });
+      }
+      for (let i = 1; i < gmailAccounts.length; i++) {
+        const accountDir = path.join(
+          homeDir,
+          `.gmail-mcp-${gmailAccounts[i]}`,
+        );
+        if (fs.existsSync(accountDir)) {
+          mounts.push({
+            hostPath: accountDir,
+            containerPath: `/home/node/.gmail-mcp-${gmailAccounts[i]}`,
+            readonly: false,
+          });
+        }
       }
     } else {
       // All accounts: mount primary and all additional accounts

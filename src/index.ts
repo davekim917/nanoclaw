@@ -662,9 +662,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   }
 
   const prompt =
-    formatMessages(missedMessages, TIMEZONE) +
-    modelSwitchNotice +
-    effortNotice;
+    formatMessages(missedMessages, TIMEZONE) + modelSwitchNotice + effortNotice;
 
   // Collect attachments from messages and remap paths for container mount
   const containerAttachments: ContainerAttachment[] = [];
@@ -994,6 +992,7 @@ async function runAgent(
               threadId,
               assistantName: resolveAssistantName(group.containerConfig),
               model,
+              effort,
               attachments,
             },
             (proc, containerName) =>
@@ -1599,9 +1598,12 @@ async function main(): Promise<void> {
     },
   });
   startIpcWatcher({
-    sendMessage: (jid, text) => {
+    sendMessage: (jid, text, sender?) => {
       const channel = findChannel(channels, jid);
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
+      if (sender && channel.sendSwarmMessage) {
+        return channel.sendSwarmMessage(jid, text, sender);
+      }
       return channel.sendMessage(jid, text);
     },
     registeredGroups: () => registeredGroups,
