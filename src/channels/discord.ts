@@ -65,7 +65,8 @@ async function generateThreadName(userMessage: string): Promise<string> {
     const data = (await resp.json()) as {
       content: Array<{ type: string; text?: string }>;
     };
-    const name = data.content?.find((c) => c.type === 'text')?.text?.trim() ?? '';
+    const name =
+      data.content?.find((c) => c.type === 'text')?.text?.trim() ?? '';
     return name.slice(0, 100) || 'Thread';
   } catch (err) {
     logger.debug({ err }, 'Failed to generate thread name');

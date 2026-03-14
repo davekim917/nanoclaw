@@ -886,11 +886,16 @@ describe('SlackChannel', () => {
 
       await channel.sendMessage('slack:C0123456789', 'Hello');
 
-      expect(vi.mocked(transformTablesInText)).toHaveBeenCalledWith('slack', 'Hello');
+      expect(vi.mocked(transformTablesInText)).toHaveBeenCalledWith(
+        'slack',
+        'Hello',
+      );
     });
 
     it('sends without attachments when no slackAttachmentBlocks returned', async () => {
-      vi.mocked(transformTablesInText).mockReturnValueOnce({ text: 'No table' });
+      vi.mocked(transformTablesInText).mockReturnValueOnce({
+        text: 'No table',
+      });
 
       const opts = createTestOpts();
       const channel = new SlackChannel(opts);
@@ -951,7 +956,9 @@ describe('SlackChannel', () => {
       // First chunk: no attachments
       expect(calls[0][0]).not.toHaveProperty('attachments');
       // Last chunk: has attachments
-      expect(calls[1][0]).toHaveProperty('attachments', [{ blocks: [fakeBlock] }]);
+      expect(calls[1][0]).toHaveProperty('attachments', [
+        { blocks: [fakeBlock] },
+      ]);
     });
 
     it('queues original pre-transform text on send failure for correct retry', async () => {

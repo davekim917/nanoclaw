@@ -378,7 +378,8 @@ export class SlackChannel implements Channel {
 
       // Convert markdown tables: single table → Slack Block Kit attachment,
       // multiple tables → monospace code blocks inline.
-      const { text: transformed, slackAttachmentBlocks } = transformTablesInText('slack', text);
+      const { text: transformed, slackAttachmentBlocks } =
+        transformTablesInText('slack', text);
       text = transformed;
       const attachments = slackAttachmentBlocks?.length
         ? [{ blocks: slackAttachmentBlocks }]
@@ -841,10 +842,8 @@ export class SlackChannel implements Channel {
         const channelId = item.jid.replace(/^slack:/, '');
         const threadTs = this.replyThreadTs.get(item.jid);
         const flushedText = this.replaceMentions(item.text);
-        const { text: transformed, slackAttachmentBlocks } = transformTablesInText(
-          'slack',
-          flushedText,
-        );
+        const { text: transformed, slackAttachmentBlocks } =
+          transformTablesInText('slack', flushedText);
         const attachments = slackAttachmentBlocks?.length
           ? [{ blocks: slackAttachmentBlocks }]
           : undefined;

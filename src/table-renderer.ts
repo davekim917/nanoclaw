@@ -117,7 +117,11 @@ function truncateStr(s: string, maxVisual: number): string {
   return s.slice(0, i) + '\u2026';
 }
 
-function padCell(val: string, width: number, align: 'left' | 'right' | 'center'): string {
+function padCell(
+  val: string,
+  width: number,
+  align: 'left' | 'right' | 'center',
+): string {
   const vw = visualWidth(val);
   if (vw >= width) return val;
   const pad = width - vw;
@@ -152,7 +156,10 @@ function cellAlign(sep: string): 'left' | 'right' | 'center' {
 }
 
 function labelToKey(label: string, idx: number): string {
-  const key = label.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
+  const key = label
+    .toLowerCase()
+    .replace(/\s+/g, '_')
+    .replace(/[^a-z0-9_]/g, '');
   return key || `col_${idx}`;
 }
 
@@ -235,7 +242,11 @@ export function extractMarkdownTables(text: string): ParsedTableLocation[] {
         ? endCharOfLastLine + 1
         : endCharOfLastLine;
 
-    results.push({ raw: text.slice(startIndex, endIndex), startIndex, endIndex });
+    results.push({
+      raw: text.slice(startIndex, endIndex),
+      startIndex,
+      endIndex,
+    });
     i = endLine + 1;
   }
 
@@ -279,7 +290,10 @@ export function parseMarkdownTable(raw: string): TableModel | null {
 // Public: rendering
 // ---------------------------------------------------------------------------
 
-export function renderMonospace(model: TableModel, opts: TableRenderOptions = {}): string {
+export function renderMonospace(
+  model: TableModel,
+  opts: TableRenderOptions = {},
+): string {
   const maxColWidth = opts.maxColWidth ?? 30;
   const shouldTruncate = opts.truncateCell !== false;
   const includeHeader = opts.includeHeader !== false;
@@ -293,12 +307,13 @@ export function renderMonospace(model: TableModel, opts: TableRenderOptions = {}
   }
 
   // Auto-detect numeric columns for right-alignment
-  const numericCol = columns.map((col) =>
-    rows.length > 0 &&
-    rows.every((row) => {
-      const val = coerceToString(row[col.key]);
-      return val === '' || isNumericLike(val);
-    }),
+  const numericCol = columns.map(
+    (col) =>
+      rows.length > 0 &&
+      rows.every((row) => {
+        const val = coerceToString(row[col.key]);
+        return val === '' || isNumericLike(val);
+      }),
   );
 
   const effectiveAlign = columns.map((col, i): 'left' | 'right' | 'center' => {
@@ -321,7 +336,9 @@ export function renderMonospace(model: TableModel, opts: TableRenderOptions = {}
 
   if (includeHeader) {
     output.push(
-      columns.map((col, i) => padCell(col.label, widths[i], effectiveAlign[i])).join('  '),
+      columns
+        .map((col, i) => padCell(col.label, widths[i], effectiveAlign[i]))
+        .join('  '),
     );
     output.push(
       columns
@@ -343,7 +360,8 @@ export function renderMonospace(model: TableModel, opts: TableRenderOptions = {}
   for (const row of rows) {
     const cells = columns.map((col, i) => {
       let val = coerceToString(row[col.key]);
-      if (shouldTruncate && visualWidth(val) > widths[i]) val = truncateStr(val, widths[i]);
+      if (shouldTruncate && visualWidth(val) > widths[i])
+        val = truncateStr(val, widths[i]);
       return padCell(val, widths[i], effectiveAlign[i]);
     });
     output.push(cells.join('  '));
@@ -363,7 +381,10 @@ export function wrapInCodeFence(text: string): string {
 /** @deprecated Use wrapInCodeFence. Kept for backwards compatibility. */
 export const wrapForDiscord = wrapInCodeFence;
 
-export function renderSlackBlock(model: TableModel, opts: TableRenderOptions = {}): SlackTableBlock {
+export function renderSlackBlock(
+  model: TableModel,
+  opts: TableRenderOptions = {},
+): SlackTableBlock {
   const columns = model.columns.slice(0, SLACK_MAX_COLS);
   let dataRows = model.rows;
   if (opts.maxRows !== undefined && dataRows.length > opts.maxRows) {
@@ -386,7 +407,10 @@ export function renderSlackBlock(model: TableModel, opts: TableRenderOptions = {
 
   return {
     type: 'table',
-    column_settings: columns.map((col) => ({ align: col.align, is_wrapped: false })),
+    column_settings: columns.map((col) => ({
+      align: col.align,
+      is_wrapped: false,
+    })),
     rows: [headerRow, ...dataRowsFormatted],
   };
 }
@@ -396,7 +420,8 @@ export function selectSlackStrategy(
   totalRawChars: number,
   opts: TableRenderOptions = {},
 ): 'block' | 'monospace' {
-  if (opts.slackStrategy === 'monospace' || opts.fallbackMode === 'monospace') return 'monospace';
+  if (opts.slackStrategy === 'monospace' || opts.fallbackMode === 'monospace')
+    return 'monospace';
   if (opts.slackStrategy === 'block') return 'block';
   if (tableCount === 1 && totalRawChars < 3000) return 'block';
   return 'monospace';
@@ -448,10 +473,15 @@ export function transformTablesInText(
     const model = parseMarkdownTable(loc.raw);
     if (!model) {
       // Unparseable table — fall back to monospace
-      return transformTablesInText(platform, text, { ...opts, slackStrategy: 'monospace' });
+      return transformTablesInText(platform, text, {
+        ...opts,
+        slackStrategy: 'monospace',
+      });
     }
     const block = renderSlackBlock(model, opts);
-    const stripped = (text.slice(0, loc.startIndex) + text.slice(loc.endIndex)).trim();
+    const stripped = (
+      text.slice(0, loc.startIndex) + text.slice(loc.endIndex)
+    ).trim();
     return { text: stripped, slackAttachmentBlocks: [block] };
   }
 

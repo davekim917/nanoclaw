@@ -881,11 +881,16 @@ describe('DiscordChannel', () => {
 
       await channel.sendMessage('dc:1234567890123456', 'Hello');
 
-      expect(vi.mocked(transformTablesInText)).toHaveBeenCalledWith('discord', 'Hello');
+      expect(vi.mocked(transformTablesInText)).toHaveBeenCalledWith(
+        'discord',
+        'Hello',
+      );
     });
 
     it('sends the transformed text returned by transformTablesInText', async () => {
-      vi.mocked(transformTablesInText).mockReturnValueOnce({ text: 'TRANSFORMED' });
+      vi.mocked(transformTablesInText).mockReturnValueOnce({
+        text: 'TRANSFORMED',
+      });
 
       const opts = createTestOpts();
       const channel = new DiscordChannel('test-token', opts);
@@ -893,13 +898,16 @@ describe('DiscordChannel', () => {
 
       await channel.sendMessage('dc:1234567890123456', 'Original');
 
-      const textChannel = await currentClient().channels.fetch('1234567890123456');
+      const textChannel =
+        await currentClient().channels.fetch('1234567890123456');
       // sendChunked calls target.send(text) when there are no components
       expect(textChannel.send).toHaveBeenCalledWith('TRANSFORMED');
     });
 
     it('passes transformed text to buildPrButtons, not original', async () => {
-      vi.mocked(transformTablesInText).mockReturnValueOnce({ text: 'No PR links here' });
+      vi.mocked(transformTablesInText).mockReturnValueOnce({
+        text: 'No PR links here',
+      });
 
       const opts = createTestOpts();
       const channel = new DiscordChannel('test-token', opts);
@@ -911,7 +919,8 @@ describe('DiscordChannel', () => {
         'https://github.com/owner/repo/pull/1',
       );
 
-      const textChannel = await currentClient().channels.fetch('1234567890123456');
+      const textChannel =
+        await currentClient().channels.fetch('1234567890123456');
       // Called with no components because transformed text has no PR link
       expect(textChannel.send).toHaveBeenCalledWith('No PR links here');
     });

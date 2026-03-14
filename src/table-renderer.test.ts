@@ -84,7 +84,8 @@ describe('extractMarkdownTables', () => {
     expect(loc.startIndex).toBe(prefix.length);
     expect(text.slice(loc.startIndex, loc.endIndex)).toContain('Name');
     // Splice should reconstruct: prefix + replacement + suffix
-    const spliced = text.slice(0, loc.startIndex) + '[TABLE]' + text.slice(loc.endIndex);
+    const spliced =
+      text.slice(0, loc.startIndex) + '[TABLE]' + text.slice(loc.endIndex);
     expect(spliced).toBe(prefix + '[TABLE]' + suffix.trimStart());
   });
 
@@ -189,7 +190,10 @@ describe('renderMonospace', () => {
 
   it('does not truncate when truncateCell=false', () => {
     const model = parseMarkdownTable(WIDE_TABLE)!;
-    const out = renderMonospace(model, { maxColWidth: 10, truncateCell: false });
+    const out = renderMonospace(model, {
+      maxColWidth: 10,
+      truncateCell: false,
+    });
     // Cells are hard-capped at width when padding, but values are not truncated
     expect(out).toContain('x'.repeat(10));
   });
@@ -289,7 +293,10 @@ describe('renderSlackBlock', () => {
     expect(block.type).toBe('table');
     expect(block.column_settings).toHaveLength(2);
     // Official API schema: no title field in column_settings
-    expect(block.column_settings[0]).toEqual({ align: 'left', is_wrapped: false });
+    expect(block.column_settings[0]).toEqual({
+      align: 'left',
+      is_wrapped: false,
+    });
     expect(block.column_settings[0]).not.toHaveProperty('title');
   });
 
@@ -378,11 +385,15 @@ describe('selectSlackStrategy', () => {
   });
 
   it('returns "monospace" when slackStrategy option is "monospace"', () => {
-    expect(selectSlackStrategy(1, 100, { slackStrategy: 'monospace' })).toBe('monospace');
+    expect(selectSlackStrategy(1, 100, { slackStrategy: 'monospace' })).toBe(
+      'monospace',
+    );
   });
 
   it('returns "monospace" when fallbackMode is "monospace"', () => {
-    expect(selectSlackStrategy(1, 100, { fallbackMode: 'monospace' })).toBe('monospace');
+    expect(selectSlackStrategy(1, 100, { fallbackMode: 'monospace' })).toBe(
+      'monospace',
+    );
   });
 
   it('returns "monospace" when table exceeds size budget', () => {
@@ -390,12 +401,16 @@ describe('selectSlackStrategy', () => {
   });
 
   it('returns "block" when strategy is "auto" (default)', () => {
-    expect(selectSlackStrategy(1, 2999, { slackStrategy: 'auto' })).toBe('block');
+    expect(selectSlackStrategy(1, 2999, { slackStrategy: 'auto' })).toBe(
+      'block',
+    );
   });
 
   it('returns "block" when slackStrategy is explicitly "block"', () => {
     // Even with multiple tables or large size, explicit 'block' forces block strategy
-    expect(selectSlackStrategy(5, 10000, { slackStrategy: 'block' })).toBe('block');
+    expect(selectSlackStrategy(5, 10000, { slackStrategy: 'block' })).toBe(
+      'block',
+    );
   });
 });
 
@@ -433,7 +448,10 @@ describe('transformTablesInText', () => {
   });
 
   it('does not return slackAttachmentBlocks on Discord', () => {
-    const { slackAttachmentBlocks } = transformTablesInText('discord', SIMPLE_TABLE);
+    const { slackAttachmentBlocks } = transformTablesInText(
+      'discord',
+      SIMPLE_TABLE,
+    );
     expect(slackAttachmentBlocks).toBeUndefined();
   });
 
@@ -441,7 +459,10 @@ describe('transformTablesInText', () => {
 
   it('removes single table from text and returns slackAttachmentBlocks for Slack', () => {
     const input = `Here are results:\n\n${SIMPLE_TABLE}\n\nThanks`;
-    const { text, slackAttachmentBlocks } = transformTablesInText('slack', input);
+    const { text, slackAttachmentBlocks } = transformTablesInText(
+      'slack',
+      input,
+    );
     expect(slackAttachmentBlocks).toHaveLength(1);
     expect(slackAttachmentBlocks![0].type).toBe('table');
     expect(text).not.toMatch(/^\|.*\|$/m);
@@ -450,7 +471,10 @@ describe('transformTablesInText', () => {
   });
 
   it('returns a well-formed Slack block for a single table', () => {
-    const { slackAttachmentBlocks } = transformTablesInText('slack', SIMPLE_TABLE);
+    const { slackAttachmentBlocks } = transformTablesInText(
+      'slack',
+      SIMPLE_TABLE,
+    );
     const block = slackAttachmentBlocks![0];
     // column_settings has align/is_wrapped (no title per API spec)
     expect(block.column_settings[0].align).toBe('left');
@@ -463,15 +487,22 @@ describe('transformTablesInText', () => {
 
   it('replaces all tables with monospace when multiple tables on Slack', () => {
     const input = `${SIMPLE_TABLE}\n\nSome text\n\n${RIGHT_ALIGN_TABLE}`;
-    const { text, slackAttachmentBlocks } = transformTablesInText('slack', input);
+    const { text, slackAttachmentBlocks } = transformTablesInText(
+      'slack',
+      input,
+    );
     expect(slackAttachmentBlocks).toBeUndefined();
     expect(text.match(/```/g)?.length).toBeGreaterThanOrEqual(4);
   });
 
   it('uses monospace when slackStrategy forces it', () => {
-    const { text, slackAttachmentBlocks } = transformTablesInText('slack', SIMPLE_TABLE, {
-      slackStrategy: 'monospace',
-    });
+    const { text, slackAttachmentBlocks } = transformTablesInText(
+      'slack',
+      SIMPLE_TABLE,
+      {
+        slackStrategy: 'monospace',
+      },
+    );
     expect(slackAttachmentBlocks).toBeUndefined();
     expect(text).toContain('```');
   });
@@ -480,7 +511,10 @@ describe('transformTablesInText', () => {
 
   it('returns text unchanged when no tables on Slack', () => {
     const plain = 'Nothing here.';
-    const { text, slackAttachmentBlocks } = transformTablesInText('slack', plain);
+    const { text, slackAttachmentBlocks } = transformTablesInText(
+      'slack',
+      plain,
+    );
     expect(text).toBe(plain);
     expect(slackAttachmentBlocks).toBeUndefined();
   });
