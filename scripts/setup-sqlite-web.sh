@@ -25,8 +25,13 @@ fi
 
 # --- Install sqlite-web ---
 
-echo "Installing sqlite-web..."
-pip3 install sqlite-web
+echo "Installing sqlite-web via pipx..."
+if ! command -v pipx &>/dev/null; then
+  echo "Installing pipx..."
+  sudo apt-get install -y pipx
+fi
+export PATH="$PATH:$HOME/.local/bin"
+pipx install sqlite-web
 
 # --- Register systemd service ---
 
@@ -45,7 +50,12 @@ echo "Done. sqlite-web is running at http://${SERVER_IP}:8088"
 echo "Password: $(grep '^SQLITE_WEB_PASSWORD=' "$ENV_FILE" | cut -d= -f2)"
 echo ""
 echo "Open port 8088 on your firewall if needed:"
-echo "  sudo ufw allow 8088"
+if command -v ufw &>/dev/null; then
+  echo "  sudo ufw allow 8088"
+else
+  echo "  ufw not found — use your cloud provider's security group/firewall rules,"
+  echo "  or: sudo iptables -I INPUT -p tcp --dport 8088 -j ACCEPT"
+fi
 echo ""
 echo "Service commands:"
 echo "  sudo systemctl status sqlite-web"
