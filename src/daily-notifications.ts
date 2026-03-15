@@ -1,12 +1,12 @@
 import { CronExpressionParser } from 'cron-parser';
 
-import { TIMEZONE } from './config.js';
 import { getBacklogResolvedSince, getShipLogSince } from './db.js';
 import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
 
-// Default: 9am local time
-const DAILY_NOTIFY_CRON = process.env.DAILY_NOTIFY_CRON || '0 9 * * *';
+// Default: 8am Eastern (America/New_York handles DST automatically)
+const DAILY_NOTIFY_CRON = process.env.DAILY_NOTIFY_CRON || '0 8 * * *';
+const DAILY_NOTIFY_TZ = process.env.DAILY_NOTIFY_TZ || 'America/New_York';
 
 export interface DailyNotificationDeps {
   registeredGroups: () => Record<string, RegisteredGroup>;
@@ -88,7 +88,7 @@ export function startDailyNotifier(deps: DailyNotificationDeps): void {
   const scheduleNextRun = () => {
     try {
       const interval = CronExpressionParser.parse(DAILY_NOTIFY_CRON, {
-        tz: TIMEZONE,
+        tz: DAILY_NOTIFY_TZ,
       });
       const next = interval.next().toDate();
       const delay = next.getTime() - Date.now();
@@ -103,7 +103,10 @@ export function startDailyNotifier(deps: DailyNotificationDeps): void {
         scheduleNextRun();
       }, delay);
     } catch (err) {
-      logger.error({ err, cron: DAILY_NOTIFY_CRON }, 'Invalid daily notify cron expression');
+      logger.error(
+        { err, cron: DAILY_NOTIFY_CRON },
+        'Invalid daily notify cron expression',
+      );
     }
   };
 
