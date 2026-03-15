@@ -8,7 +8,7 @@ Type=simple
 User=ubuntu
 WorkingDirectory=/home/ubuntu/nanoclaw
 EnvironmentFile=/home/ubuntu/nanoclaw/.env
-ExecStart=/bin/sh -c 'sqlite_web --host 0.0.0.0 --port 8088 --read-only --password "${SQLITE_WEB_PASSWORD}" store/messages.db'
+ExecStart=/bin/sh -c 'PATH="$PATH:/home/ubuntu/.local/bin" sqlite_web --host 0.0.0.0 --port 8088 --read-only --password "${SQLITE_WEB_PASSWORD}" store/messages.db'
 Restart=on-failure
 RestartSec=5
 
