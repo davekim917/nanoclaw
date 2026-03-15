@@ -1501,6 +1501,13 @@ export function getShipLog(
 
 // --- Backlog accessors ---
 
+export function getBacklogItemById(id: string): BacklogItem | null {
+  return (
+    (db.prepare('SELECT * FROM backlog WHERE id = ?').get(id) as BacklogItem) ||
+    null
+  );
+}
+
 export function addBacklogItem(item: BacklogItem): void {
   db.prepare(
     `INSERT OR REPLACE INTO backlog (id, group_folder, title, description, status, priority, tags, notes, created_at, updated_at, resolved_at)

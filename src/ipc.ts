@@ -18,6 +18,7 @@ import {
   deleteTask,
   findMessageById,
   getBacklog,
+  getBacklogItemById,
   getMessagesAroundTimestamp,
   getShipLog,
   getTaskById,
@@ -49,6 +50,24 @@ export interface IpcDeps {
 }
 
 let ipcWatcherRunning = false;
+
+/** Send a notification message to the first non-thread JID for a given group folder. */
+async function notifyGroup(
+  deps: IpcDeps,
+  groups: Record<string, RegisteredGroup>,
+  sourceGroup: string,
+  message: string,
+): Promise<void> {
+  const entry = Object.entries(groups).find(
+    ([jid, g]) => g.folder === sourceGroup && !jid.includes(':thread:'),
+  );
+  if (!entry) return;
+  try {
+    await deps.sendMessage(entry[0], message);
+  } catch (err) {
+    logger.warn({ sourceGroup, err }, 'Failed to send group notification');
+  }
+}
 
 export function startIpcWatcher(deps: IpcDeps): void {
   if (ipcWatcherRunning) {
@@ -588,6 +607,10 @@ export async function processTaskIpc(
           { entryId, title: data.title, sourceGroup },
           'Ship log entry added via IPC',
         );
+        const shipLines = [`📦 **Shipped**: ${data.title}`];
+        if (data.description) shipLines.push(data.description);
+        if (data.pr_url) shipLines.push(`PR: ${data.pr_url}`);
+        void notifyGroup(deps, registeredGroups, sourceGroup, shipLines.join('\n'));
       } else {
         logger.warn({ data }, 'add_ship_log missing title');
       }
@@ -597,6 +620,8 @@ export async function processTaskIpc(
       if (data.title) {
         const itemId = `backlog-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
         const now = new Date().toISOString();
+        const itemPriority =
+          (data.priority as 'low' | 'medium' | 'high') || 'medium';
         addBacklogItem({
           id: itemId,
           group_folder: sourceGroup,
@@ -605,7 +630,7 @@ export async function processTaskIpc(
           status:
             (data.status as 'open' | 'in_progress' | 'resolved' | 'wont_fix') ||
             'open',
-          priority: (data.priority as 'low' | 'medium' | 'high') || 'medium',
+          priority: itemPriority,
           tags: data.tags || null,
           notes: data.notes || null,
           created_at: now,
@@ -616,6 +641,11 @@ export async function processTaskIpc(
           { itemId, title: data.title, sourceGroup },
           'Backlog item added via IPC',
         );
+        const backlogLines = [
+          `📋 **Backlog**: ${data.title} · ${itemPriority} priority`,
+        ];
+        if (data.description) backlogLines.push(data.description);
+        void notifyGroup(deps, registeredGroups, sourceGroup, backlogLines.join('\n'));
       } else {
         logger.warn({ data }, 'add_backlog_item missing title');
       }
@@ -623,6 +653,21 @@ export async function processTaskIpc(
 
     case 'update_backlog_item':
       if (data.itemId) {
+        const existingItem = getBacklogItemById(data.itemId);
+        if (!existingItem) {
+          logger.warn(
+            { itemId: data.itemId, sourceGroup },
+            'update_backlog_item: item not found',
+          );
+          break;
+        }
+        if (!isMain && existingItem.group_folder !== sourceGroup) {
+          logger.warn(
+            { itemId: data.itemId, sourceGroup, owner: existingItem.group_folder },
+            'Unauthorized update_backlog_item attempt blocked',
+          );
+          break;
+        }
         const updates: Parameters<typeof updateBacklogItem>[1] = {};
         if (data.title !== undefined) updates.title = data.title;
         if (data.description !== undefined)
@@ -652,6 +697,16 @@ export async function processTaskIpc(
             { itemId: data.itemId, updates },
             'Backlog item updated via IPC',
           );
+          // Notify on meaningful status transitions only
+          if (data.status === 'resolved' || data.status === 'wont_fix') {
+            const emoji = data.status === 'resolved' ? '✅' : '🚫';
+            const label = data.status === 'resolved' ? 'Resolved' : "Won't fix";
+            const resolvedLines = [
+              `${emoji} **${label}**: ${existingItem.title}`,
+            ];
+            if (data.notes) resolvedLines.push(data.notes);
+            void notifyGroup(deps, registeredGroups, sourceGroup, resolvedLines.join('\n'));
+          }
         } else {
           logger.warn(
             { itemId: data.itemId, sourceGroup },
