@@ -403,6 +403,12 @@ export class GroupQueue {
     } finally {
       // Use slot.currentKey (not the original threadKey) because
       // reassignThreadKey may have moved the slot to a different key.
+      if (!state.activeThreads.has(slot.currentKey)) {
+        logger.error(
+          { groupJid, key: slot.currentKey, threadKey },
+          'BUG: cleaning up non-existent thread slot — reassignThreadKey/cleanup mismatch',
+        );
+      }
       state.activeThreads.delete(slot.currentKey);
       this.activeCount--;
       this.drainGroup(groupJid);
@@ -434,6 +440,12 @@ export class GroupQueue {
     } catch (err) {
       logger.error({ groupJid, taskId: task.id, err }, 'Error running task');
     } finally {
+      if (!state.activeThreads.has(taskThreadKey)) {
+        logger.error(
+          { groupJid, taskId: task.id, key: taskThreadKey },
+          'BUG: cleaning up non-existent task slot',
+        );
+      }
       state.activeThreads.delete(taskThreadKey);
       this.activeCount--;
       this.drainGroup(groupJid);
@@ -471,6 +483,17 @@ export class GroupQueue {
 
   private drainGroup(groupJid: string): void {
     if (this.shuttingDown) return;
+
+    // Invariant: activeCount must equal the total number of active thread slots
+    let totalSlots = 0;
+    for (const [, s] of this.groups) totalSlots += s.activeThreads.size;
+    if (totalSlots !== this.activeCount) {
+      logger.error(
+        { activeCount: this.activeCount, totalSlots, groupJid },
+        'BUG: activeCount drifted from actual slot count',
+      );
+      this.activeCount = totalSlots;
+    }
 
     const state = this.getGroup(groupJid);
 
