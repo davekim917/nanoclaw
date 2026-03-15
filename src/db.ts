@@ -1534,7 +1534,8 @@ export function updateBacklogItem(
       | 'resolved_at'
     >
   >,
-): void {
+  groupFolder?: string,
+): boolean {
   const fields: string[] = [];
   const values: unknown[] = [];
 
@@ -1567,21 +1568,27 @@ export function updateBacklogItem(
     values.push(updates.resolved_at);
   }
 
-  if (fields.length === 0) return;
+  if (fields.length === 0) return false;
 
   fields.push('updated_at = ?');
   values.push(new Date().toISOString());
   values.push(id);
-  db.prepare(`UPDATE backlog SET ${fields.join(', ')} WHERE id = ?`).run(
-    ...values,
-  );
+
+  const whereClause =
+    groupFolder !== undefined ? 'WHERE id = ? AND group_folder = ?' : 'WHERE id = ?';
+  if (groupFolder !== undefined) values.push(groupFolder);
+
+  const result = db
+    .prepare(`UPDATE backlog SET ${fields.join(', ')} ${whereClause}`)
+    .run(...values);
+  return result.changes > 0;
 }
 
-export function deleteBacklogItem(id: string, groupFolder: string): void {
-  db.prepare('DELETE FROM backlog WHERE id = ? AND group_folder = ?').run(
-    id,
-    groupFolder,
-  );
+export function deleteBacklogItem(id: string, groupFolder: string): boolean {
+  const result = db
+    .prepare('DELETE FROM backlog WHERE id = ? AND group_folder = ?')
+    .run(id, groupFolder);
+  return result.changes > 0;
 }
 
 const PRIORITY_ORDER = `CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END`;

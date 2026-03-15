@@ -35,6 +35,8 @@ import { registerChannel, ChannelOpts } from './registry.js';
 import { Attachment, Channel } from '../types.js';
 import { transformTablesInText } from '../table-renderer.js';
 
+const execAsync = promisify(exec);
+
 export class DiscordChannel implements Channel {
   name = 'discord';
 
@@ -899,17 +901,18 @@ export class DiscordChannel implements Channel {
     await interaction.deferReply();
 
     try {
-      const execAsync = promisify(exec);
-      const { stdout } = await execAsync(
+      const { stdout, stderr } = await execAsync(
         `gh pr merge "${prUrl}" --squash --delete-branch`,
         { encoding: 'utf-8', timeout: 30000 },
       );
 
-      await interaction.editReply(stdout.trim() || 'PR merged.');
+      await interaction.editReply(stdout.trim() || stderr.trim() || 'PR merged.');
     } catch (err) {
       logger.error({ err, prUrl }, 'Merge button handler error');
+      const execErr = err as NodeJS.ErrnoException & { stderr?: string };
       const msg =
-        err instanceof Error ? err.message.split('\n')[0] : 'Unknown error';
+        execErr.stderr?.trim().split('\n')[0] ||
+        (err instanceof Error ? err.message.split('\n')[0] : 'Unknown error');
       await interaction.editReply(`Merge failed: ${msg}`).catch(() => {});
     }
   }

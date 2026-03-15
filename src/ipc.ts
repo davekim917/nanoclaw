@@ -32,6 +32,8 @@ import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import { RegisteredGroup } from './types.js';
 
+const BACKLOG_NOT_OWNED_MSG = 'Backlog item not found or not owned by group';
+
 export interface IpcDeps {
   sendMessage: (jid: string, text: string, sender?: string) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
@@ -638,11 +640,24 @@ export async function processTaskIpc(
         if (data.status === 'resolved' || data.status === 'wont_fix') {
           updates.resolved_at = new Date().toISOString();
         }
-        updateBacklogItem(data.itemId, updates);
-        logger.info(
-          { itemId: data.itemId, updates },
-          'Backlog item updated via IPC',
+        // Non-main groups can only update their own items
+        const updateGroupFilter = isMain ? undefined : sourceGroup;
+        const updated = updateBacklogItem(
+          data.itemId,
+          updates,
+          updateGroupFilter,
         );
+        if (updated) {
+          logger.info(
+            { itemId: data.itemId, updates },
+            'Backlog item updated via IPC',
+          );
+        } else {
+          logger.warn(
+            { itemId: data.itemId, sourceGroup },
+            BACKLOG_NOT_OWNED_MSG,
+          );
+        }
       } else {
         logger.warn({ data }, 'update_backlog_item missing itemId');
       }
@@ -650,8 +665,15 @@ export async function processTaskIpc(
 
     case 'delete_backlog_item':
       if (data.itemId) {
-        deleteBacklogItem(data.itemId, sourceGroup);
-        logger.info({ itemId: data.itemId }, 'Backlog item deleted via IPC');
+        const deleted = deleteBacklogItem(data.itemId, sourceGroup);
+        if (deleted) {
+          logger.info({ itemId: data.itemId }, 'Backlog item deleted via IPC');
+        } else {
+          logger.warn(
+            { itemId: data.itemId, sourceGroup },
+            BACKLOG_NOT_OWNED_MSG,
+          );
+        }
       } else {
         logger.warn({ data }, 'delete_backlog_item missing itemId');
       }
