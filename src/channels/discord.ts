@@ -30,26 +30,24 @@ import {
 import { downloadAttachment } from '../attachment-downloader.js';
 import { getThreadOrigin, setThreadOrigin } from '../db.js';
 import { readEnvFile } from '../env.js';
-import { callHaiku } from '../llm.js';
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 import { Attachment, Channel } from '../types.js';
 import { transformTablesInText } from '../table-renderer.js';
 
+const THREAD_TITLE_RE = /<thread-title>([\s\S]*?)<\/thread-title>/;
+
 /**
- * Ask Haiku to generate a short, descriptive thread title from the user's message.
- * Returns a trimmed string of ≤100 chars (Discord's thread name limit), or 'Thread'
- * on any failure.
+ * Extract and strip a `<thread-title>` tag from the agent's response.
+ * Returns { title, text } where title is the extracted name (or undefined)
+ * and text is the response with the tag removed.
  */
-async function generateThreadName(userMessage: string): Promise<string> {
-  try {
-    const prompt = `Generate a concise 2–5 word title that captures the topic of this message. Reply with only the title — no quotes, no punctuation, no explanation.\n\nMessage: ${userMessage.slice(0, 500)}`;
-    const name = await callHaiku(prompt);
-    return name.slice(0, 100) || 'Thread';
-  } catch (err) {
-    logger.warn({ err }, 'Failed to generate thread name');
-    return 'Thread';
-  }
+function extractThreadTitle(text: string): { title?: string; text: string } {
+  const match = text.match(THREAD_TITLE_RE);
+  if (!match) return { text };
+  const title = match[1].trim().slice(0, 100); // Discord limit
+  const cleaned = text.replace(THREAD_TITLE_RE, '').trim();
+  return { title: title || undefined, text: cleaned };
 }
 
 export class DiscordChannel implements Channel {
@@ -682,11 +680,18 @@ export class DiscordChannel implements Channel {
       const originalMessage =
         await textChannel.messages.fetch(originalMessageId);
 
-      // Strip mentions once; reuse for both the initial thread name and AI rename
-      const strippedContent = threadName
-        ? ''
-        : originalMessage.content.replace(/@\w+\s*/g, '').trim();
-      const name = threadName || strippedContent.slice(0, 40) || 'Thread';
+      // Extract agent-generated thread title from response (if present)
+      const extracted = extractThreadTitle(text);
+      text = extracted.text;
+
+      const fallbackName =
+        threadName ||
+        originalMessage.content
+          .replace(/@\w+\s*/g, '')
+          .trim()
+          .slice(0, 40) ||
+        'Thread';
+      const name = extracted.title || fallbackName;
 
       const thread = await originalMessage.startThread({
         name,
@@ -697,21 +702,6 @@ export class DiscordChannel implements Channel {
       ({ text } = transformTablesInText('discord', text));
       const components = this.buildPrButtons(text);
       await this.sendChunked(thread, text, components);
-
-      // Fire-and-forget: rename with an AI-generated topic title
-      if (strippedContent) {
-        void generateThreadName(strippedContent)
-          .then((aiName) => {
-            if (aiName && aiName !== 'Thread') {
-              thread.setName(aiName).catch((err) => {
-                logger.warn({ err }, 'Failed to rename Discord thread');
-              });
-            }
-          })
-          .catch((err) => {
-            logger.warn({ err }, 'Failed to generate thread name');
-          });
-      }
 
       logger.info(
         { parentChannelId, threadId: thread.id, threadName: name },

@@ -641,7 +641,11 @@ describe('GroupQueue', () => {
     expect(queue.isActive('slack:C123')).toBe(false);
 
     // New message for the same thread should start immediately (not get stuck)
-    queue.enqueueMessageCheck('slack:C123', 'slack:C123:thread:thread-abc', 'thread-abc');
+    queue.enqueueMessageCheck(
+      'slack:C123',
+      'slack:C123:thread:thread-abc',
+      'thread-abc',
+    );
     await vi.advanceTimersByTimeAsync(10);
 
     expect(processed).toHaveLength(2);

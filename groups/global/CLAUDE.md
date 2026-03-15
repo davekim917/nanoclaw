@@ -47,6 +47,18 @@ Here are the key findings from the research...
 
 Text inside `<internal>` tags is logged but not sent to the user. If you've already sent the key information via `send_message`, you can wrap the recap in `<internal>` to avoid sending it again.
 
+### Thread titles
+
+When responding to a new conversation (no existing thread), include a concise 2–5 word topic title in `<thread-title>` tags anywhere in your response:
+
+```
+<thread-title>Weekly Sales Report</thread-title>
+
+Here's the breakdown of this week's numbers...
+```
+
+The title is used to name the Discord thread. It is stripped from your visible response. Keep titles short, descriptive, and without punctuation. If the conversation is casual or unclear, omit the tag — a default title will be used.
+
 ### Sub-agents and teammates
 
 When working as a sub-agent or teammate, only use `send_message` if instructed to by the main agent.
