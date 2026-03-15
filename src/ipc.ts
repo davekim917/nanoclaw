@@ -52,7 +52,7 @@ export interface IpcDeps {
 let ipcWatcherRunning = false;
 
 /** Send a notification message for a group folder.
- *  Prefers any entry with containerConfig.notifyJid set; falls back to first non-thread JID. */
+ *  Always sends to the first non-thread JID; also sends to notifyJid if set and different. */
 async function notifyGroup(
   deps: IpcDeps,
   groups: Record<string, RegisteredGroup>,
@@ -62,18 +62,21 @@ async function notifyGroup(
   const folderEntries = Object.entries(groups).filter(
     ([jid, g]) => g.folder === sourceGroup && !jid.includes(':thread:'),
   );
-  // Prefer an entry that explicitly declares a notifyJid override
-  const overrideEntry = folderEntries.find(
-    ([, g]) => g.containerConfig?.notifyJid,
-  );
-  const targetJid = overrideEntry
-    ? overrideEntry[1].containerConfig!.notifyJid!
-    : folderEntries[0]?.[0];
-  if (!targetJid) return;
-  try {
-    await deps.sendMessage(targetJid, message);
-  } catch (err) {
-    logger.warn({ sourceGroup, err }, 'Failed to send group notification');
+  const defaultJid = folderEntries[0]?.[0];
+  if (!defaultJid) return;
+
+  // Collect unique targets: default JID plus any notifyJid override
+  const overrideEntry = folderEntries.find(([, g]) => g.containerConfig?.notifyJid);
+  const notifyJid = overrideEntry?.[1].containerConfig?.notifyJid;
+  const targets = [defaultJid];
+  if (notifyJid && notifyJid !== defaultJid) targets.push(notifyJid);
+
+  for (const jid of targets) {
+    try {
+      await deps.sendMessage(jid, message);
+    } catch (err) {
+      logger.warn({ sourceGroup, jid, err }, 'Failed to send group notification');
+    }
   }
 }
 
