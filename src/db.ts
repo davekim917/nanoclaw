@@ -1575,7 +1575,9 @@ export function updateBacklogItem(
   values.push(id);
 
   const whereClause =
-    groupFolder !== undefined ? 'WHERE id = ? AND group_folder = ?' : 'WHERE id = ?';
+    groupFolder !== undefined
+      ? 'WHERE id = ? AND group_folder = ?'
+      : 'WHERE id = ?';
   if (groupFolder !== undefined) values.push(groupFolder);
 
   const result = db

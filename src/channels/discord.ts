@@ -906,7 +906,9 @@ export class DiscordChannel implements Channel {
         { encoding: 'utf-8', timeout: 30000 },
       );
 
-      await interaction.editReply(stdout.trim() || stderr.trim() || 'PR merged.');
+      await interaction.editReply(
+        stdout.trim() || stderr.trim() || 'PR merged.',
+      );
     } catch (err) {
       logger.error({ err, prUrl }, 'Merge button handler error');
       const execErr = err as NodeJS.ErrnoException & { stderr?: string };
