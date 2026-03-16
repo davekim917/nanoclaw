@@ -176,6 +176,14 @@ When asked to make code changes or open PRs:
 5. Commit, push, and open a PR using `gh pr create`
 6. Share the PR link
 
+### No Attribution
+
+NEVER add attribution to commits or PRs. Specifically:
+- Do NOT add "Co-Authored-By" trailers to commit messages
+- Do NOT add "Generated with Claude Code" or similar footers to PR descriptions
+- Do NOT add any AI attribution text whatsoever
+- This applies to all commits, PRs, and code changes
+
 ### Save your work before finishing
 
 Your workspace is a temporary worktree — it gets cleaned up after your session ends. **Always commit and push before you stop working**, even if the work is incomplete:
