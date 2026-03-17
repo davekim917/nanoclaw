@@ -968,67 +968,6 @@ server.tool(
 );
 
 server.tool(
-  'list_ship_log',
-  'View the ship log — only entries logged by NanoClaw agents via add_ship_log. For a complete picture including team GitHub PRs and resolved backlog, use get_activity_summary instead.',
-  {
-    limit: z.number().optional().default(20).describe('Maximum entries to return (default: 20)'),
-  },
-  async (args) => {
-    try {
-      const requestId = writeQueryFile({
-        type: 'list_ship_log',
-        limit: args.limit,
-      });
-
-      const response = await waitForResponse(requestId) as {
-        status: string;
-        error?: string;
-        entries?: Array<{
-          id: string;
-          title: string;
-          description: string | null;
-          pr_url: string | null;
-          branch: string | null;
-          tags: string | null;
-          shipped_at: string;
-        }>;
-      };
-
-      if (response.status !== 'ok') {
-        return {
-          content: [{ type: 'text' as const, text: `Error: ${response.error || 'Unknown error'}` }],
-          isError: true,
-        };
-      }
-
-      const entries = response.entries || [];
-      if (entries.length === 0) {
-        return { content: [{ type: 'text' as const, text: 'Ship log is empty.' }] };
-      }
-
-      const formatted = entries
-        .map((e) => {
-          let tagStr = '';
-          if (e.tags) {
-            try { tagStr = ` [${(JSON.parse(e.tags) as string[]).join(', ')}]`; } catch { /* malformed tags — skip */ }
-          }
-          const pr = e.pr_url ? `\n   PR: ${e.pr_url}` : '';
-          const desc = e.description ? `\n   ${e.description}` : '';
-          return `- **${e.title}**${tagStr} — ${e.shipped_at.slice(0, 10)}${desc}${pr}`;
-        })
-        .join('\n\n');
-
-      return { content: [{ type: 'text' as const, text: `Ship log (${entries.length} entries):\n\n${formatted}` }] };
-    } catch (err) {
-      return {
-        content: [{ type: 'text' as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
-        isError: true,
-      };
-    }
-  },
-);
-
-server.tool(
   'get_activity_summary',
   'Get a summary of all recent activity: shipped features (from the ship log), team GitHub PRs (merged in watched orgs/repos, if configured), and resolved backlog items. Use this when asked "what shipped?", "any updates?", "what happened recently?", or similar.',
   {
