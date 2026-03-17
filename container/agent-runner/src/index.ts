@@ -1003,7 +1003,11 @@ async function runQuery(
     if (message.type === 'result') {
       resultCount++;
       const textResult = 'result' in message ? (message as { result?: string }).result : null;
+      const modelUsage = 'modelUsage' in message ? (message as { modelUsage?: { contextWindow?: number; inputTokens?: number; outputTokens?: number; costUSD?: number } }).modelUsage : null;
       log(`Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
+      if (modelUsage) {
+        log(`Model usage: contextWindow=${modelUsage.contextWindow} inputTokens=${modelUsage.inputTokens} outputTokens=${modelUsage.outputTokens} costUSD=${modelUsage.costUSD}`);
+      }
       writeOutput({
         status: 'success',
         result: textResult || null,
