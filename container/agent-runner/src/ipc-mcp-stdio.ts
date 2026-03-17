@@ -384,7 +384,7 @@ When set, ship log and backlog notifications from that group will be sent to thi
     }
 
     const data = {
-      type: 'set_group_model',
+      type: 'set_group_notify_jid',
       jid: args.jid,
       notifyJid: args.notifyJid,
       timestamp: new Date().toISOString(),
@@ -395,6 +395,59 @@ When set, ship log and backlog notifications from that group will be sent to thi
     const label = args.notifyJid || '(cleared — reverts to default channel)';
     return {
       content: [{ type: 'text' as const, text: `Notification channel set to ${label} for JID ${args.jid}.` }],
+    };
+  },
+);
+
+server.tool(
+  'set_group_tools',
+  `Set the tools (integrations) available in a registered group's container. Main group only.
+
+Controls which credentials and CLI tools are mounted into the group's container.
+Pass null to revert to the default (all tools enabled). Pass an empty array to disable all tools.
+
+Common tool values:
+• "snowflake" — all Snowflake connections
+• "snowflake:<connection>" — specific connection only (e.g. "snowflake:sunday", "snowflake:apollo")
+• "dbt" — all dbt profiles
+• "dbt:<profile>" — specific profile (e.g. "dbt:sunday-snowflake-db")
+• "gmail", "gmail:<account>" — Gmail access
+• "github", "github:<scope>" — GitHub token
+
+Examples:
+• tools: ["snowflake:sunday"] → Sunday channel sees only the sunday connection
+• tools: ["snowflake:apollo", "snowflake:xzo_dev", "snowflake:xzo_prod"] → illysium scope
+• tools: [] → no tools (e.g. nanoclaw-dev, security sandboxes)
+• tools: null → all tools enabled (default for new groups)`,
+  {
+    jid: z.string().describe('The JID of the group to update (e.g., "dc:1479516849371873403")'),
+    tools: z.array(z.string()).nullable().describe('Array of tool strings, empty array to disable all, or null to revert to default (all tools enabled)'),
+  },
+  async (args) => {
+    if (!isMain) {
+      return {
+        content: [{ type: 'text' as const, text: 'Only the main group can update group tools.' }],
+        isError: true,
+      };
+    }
+
+    const data = {
+      type: 'set_group_tools',
+      jid: args.jid,
+      tools: args.tools,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(TASKS_DIR, data);
+
+    const label =
+      args.tools === null
+        ? '(cleared — all tools enabled)'
+        : args.tools.length === 0
+          ? '(empty — all tools disabled)'
+          : args.tools.join(', ');
+    return {
+      content: [{ type: 'text' as const, text: `Tools set to [${label}] for JID ${args.jid}.` }],
     };
   },
 );
