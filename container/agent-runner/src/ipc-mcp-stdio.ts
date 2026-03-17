@@ -1028,6 +1028,36 @@ server.tool(
   },
 );
 
+server.tool(
+  'update_plugin',
+  'Update the bootstrap plugin by pulling latest changes from its remote repository. Only available to the main group.',
+  {},
+  async () => {
+    try {
+      const requestId = writeQueryFile({ type: 'update_plugin' });
+      const response = await waitForResponse(requestId) as {
+        status: string;
+        error?: string;
+        output?: string;
+      };
+      if (response.status !== 'ok') {
+        return {
+          content: [{ type: 'text' as const, text: `Error: ${response.error || 'Unknown error'}` }],
+          isError: true,
+        };
+      }
+      return {
+        content: [{ type: 'text' as const, text: `Plugin updated:\n${response.output}` }],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: 'text' as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
 // Start the stdio transport
 const transport = new StdioServerTransport();
 await server.connect(transport);

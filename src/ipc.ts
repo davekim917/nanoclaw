@@ -1,3 +1,4 @@
+import { execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
@@ -6,6 +7,7 @@ import { CronExpressionParser } from 'cron-parser';
 import {
   DATA_DIR,
   IPC_POLL_INTERVAL,
+  PLUGIN_DIR,
   TIMEZONE,
   getParentJid,
 } from './config.js';
@@ -1203,6 +1205,29 @@ function processQueryIpc(
         status: 'ok',
         memories: results,
       });
+      break;
+    }
+
+    case 'update_plugin': {
+      try {
+        const output = execSync('git pull', {
+          cwd: PLUGIN_DIR,
+          encoding: 'utf-8',
+          timeout: 30_000,
+        }).trim();
+        logger.info({ sourceGroup, output }, 'Plugin updated via IPC');
+        writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
+          status: 'ok',
+          output,
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        logger.error({ sourceGroup, error: message }, 'Plugin update failed');
+        writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
+          status: 'error',
+          error: message,
+        });
+      }
       break;
     }
 
