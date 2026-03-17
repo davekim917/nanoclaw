@@ -89,6 +89,7 @@ import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import { startDailyNotifier } from './daily-notifications.js';
+import { callHaiku } from './llm.js';
 import {
   extractThreadTitle,
   findChannel,
@@ -765,6 +766,33 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let hadError = false;
   let outputSentToUser = false;
 
+  // For Discord top-level messages (new threads), pre-generate a Haiku title
+  // in parallel with the agent run. This is used as a fallback when the agent
+  // doesn't include <thread-title> tags (~90% of the time). The promise
+  // resolves well before the agent's first output, so it adds no latency.
+  let haikusTitlePromise: Promise<string | undefined> | undefined;
+  if (
+    'setPendingThreadTitle' in channel &&
+    isThreadEnabled &&
+    effectiveThreadId &&
+    !threadId
+  ) {
+    const triggerMsg = missedMessages
+      .find((m) => m.id === effectiveThreadId)
+      ?.content.replace(/@\w+\s*/g, '')
+      .trim();
+    if (triggerMsg) {
+      haikusTitlePromise = callHaiku(
+        `Generate a concise 2–5 word title that captures the topic of this message. Reply with only the title — no quotes, no punctuation, no explanation.\n\nMessage: ${triggerMsg.slice(0, 500)}`,
+      )
+        .then((t) => t.replace(/\*+/g, '').trim().slice(0, 100) || undefined)
+        .catch((err) => {
+          logger.warn({ err }, 'Haiku thread title generation failed');
+          return undefined;
+        });
+    }
+  }
+
   const output = await runAgent(
     group,
     prompt,
@@ -792,8 +820,12 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           typeof result.result === 'string'
             ? result.result
             : JSON.stringify(result.result);
-        // Extract thread title before stripping (Discord uses it for thread names)
-        const threadTitle = extractThreadTitle(raw);
+        // Extract thread title before stripping (Discord uses it for thread names).
+        // If the agent didn't include one, fall back to the pre-generated Haiku title.
+        let threadTitle = extractThreadTitle(raw);
+        if (!threadTitle && haikusTitlePromise && !outputSentToUser) {
+          threadTitle = await haikusTitlePromise;
+        }
         if (threadTitle && 'setPendingThreadTitle' in channel) {
           (
             channel as { setPendingThreadTitle(t: string): void }
