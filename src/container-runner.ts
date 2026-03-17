@@ -1881,9 +1881,7 @@ function buildVolumeMounts(
         }
 
         const connTomlPath = path.join(stagingDir, 'connections.toml');
-        fs.writeFileSync(connTomlPath, tomlContent);
-        fs.chownSync(connTomlPath, 1000, 1000);
-        fs.chmodSync(connTomlPath, 0o600);
+        fs.writeFileSync(connTomlPath, tomlContent, { mode: 0o600 });
 
         // Rewrite config.toml log path for container home
         const origConfig = path.join(snowflakeDir, 'config.toml');
@@ -1891,10 +1889,9 @@ function buildVolumeMounts(
           const configContent = fs
             .readFileSync(origConfig, 'utf-8')
             .replace(homePattern, '/home/node/.snowflake/');
-          const configTomlPath = path.join(stagingDir, 'config.toml');
-          fs.writeFileSync(configTomlPath, configContent);
-          fs.chownSync(configTomlPath, 1000, 1000);
-          fs.chmodSync(configTomlPath, 0o600);
+          fs.writeFileSync(path.join(stagingDir, 'config.toml'), configContent, {
+            mode: 0o600,
+          });
         }
 
         // Copy only key files referenced in the (possibly filtered) connections.toml,
@@ -1932,16 +1929,16 @@ function buildVolumeMounts(
               const destPath = path.join(destKeysDir, relPath);
               fs.mkdirSync(path.dirname(destPath), { recursive: true });
               fs.copyFileSync(srcPath, destPath);
-              fs.chownSync(destPath, 1000, 1000);
               fs.chmodSync(destPath, 0o600);
             }
           }
         }
 
+        // Mount read-write: snow CLI writes to ~/.snowflake/logs/
         mounts.push({
           hostPath: stagingDir,
           containerPath: '/home/node/.snowflake',
-          readonly: true,
+          readonly: false,
         });
       }
     }
