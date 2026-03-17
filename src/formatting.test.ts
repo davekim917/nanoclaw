@@ -122,7 +122,10 @@ describe('formatMessages', () => {
   });
 
   it('includes both is_from_me and is_bot for own bot messages', () => {
-    const result = formatMessages([makeMsg({ is_from_me: true, is_any_bot: true })], TZ);
+    const result = formatMessages(
+      [makeMsg({ is_from_me: true, is_any_bot: true })],
+      TZ,
+    );
     expect(result).toContain('is_from_me="true"');
     expect(result).toContain('is_bot="true"');
   });

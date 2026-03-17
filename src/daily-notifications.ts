@@ -204,9 +204,7 @@ export async function getActivitySummary(
       const ghToken = envTokens[tokenKey] || envTokens['GITHUB_TOKEN'];
       const allPRs = await fetchGithubMergedPRs(watchGithub, since, ghToken);
       // Filter out PRs already in ship_log (agent-created work)
-      const shippedUrls = new Set(
-        shipped.map((s) => s.pr_url).filter(Boolean),
-      );
+      const shippedUrls = new Set(shipped.map((s) => s.pr_url).filter(Boolean));
       teamPRs = allPRs.filter((pr) => !shippedUrls.has(pr.url));
     } catch (err) {
       logger.warn({ folder, err }, 'Failed to fetch GitHub PRs for folder');
@@ -347,10 +345,7 @@ export function ensureDailyNotifierTask(): void {
 
     if (Object.keys(updates).length > 0) {
       updateTask(DAILY_TASK_ID, updates);
-      logger.info(
-        { updates, nextRun },
-        'Daily notifier task updated',
-      );
+      logger.info({ updates, nextRun }, 'Daily notifier task updated');
     } else {
       logger.info(
         { nextRun, cron: DAILY_NOTIFY_CRON },

@@ -13,19 +13,23 @@ beforeEach(() => {
   _initTestDatabase();
 });
 
-function makeGate(overrides: Partial<{
-  id: string;
-  group_folder: string;
-  chat_jid: string;
-  label: string;
-  summary: string;
-  context_data: string | null;
-  resume_prompt: string | null;
-  session_key: string | null;
-  status: 'pending' | 'approved' | 'cancelled';
-}> = {}) {
+function makeGate(
+  overrides: Partial<{
+    id: string;
+    group_folder: string;
+    chat_jid: string;
+    label: string;
+    summary: string;
+    context_data: string | null;
+    resume_prompt: string | null;
+    session_key: string | null;
+    status: 'pending' | 'approved' | 'cancelled';
+  }> = {},
+) {
   return {
-    id: overrides.id || `gate-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    id:
+      overrides.id ||
+      `gate-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     group_folder: overrides.group_folder || 'test-group',
     chat_jid: overrides.chat_jid || 'dc:123456',
     label: overrides.label || 'Test Gate',
@@ -53,7 +57,10 @@ describe('createGate', () => {
   });
 
   it('stores context_data as JSON', () => {
-    const contextData = JSON.stringify({ emails: ['a@b.com', 'c@d.com'], count: 2 });
+    const contextData = JSON.stringify({
+      emails: ['a@b.com', 'c@d.com'],
+      count: 2,
+    });
     const gate = makeGate({ id: 'gate-ctx', context_data: contextData });
     createGate(gate);
 
@@ -65,11 +72,16 @@ describe('createGate', () => {
   });
 
   it('stores resume_prompt', () => {
-    const gate = makeGate({ id: 'gate-rp', resume_prompt: 'Call read_gate_context and send emails.' });
+    const gate = makeGate({
+      id: 'gate-rp',
+      resume_prompt: 'Call read_gate_context and send emails.',
+    });
     createGate(gate);
 
     const retrieved = getGateById('gate-rp');
-    expect(retrieved!.resume_prompt).toBe('Call read_gate_context and send emails.');
+    expect(retrieved!.resume_prompt).toBe(
+      'Call read_gate_context and send emails.',
+    );
   });
 });
 
@@ -176,16 +188,21 @@ describe('resolveGate', () => {
 
 describe('gate protocol integration', () => {
   it('full lifecycle: create → pending → approve → read context', () => {
-    const contextData = JSON.stringify({ tables: ['old_data', 'temp_logs', 'cache_v1'] });
-    createGate(makeGate({
-      id: 'gate-lifecycle',
-      group_folder: 'dev',
-      chat_jid: 'dc:456',
-      label: 'Drop tables',
-      summary: 'About to drop 3 tables: old_data, temp_logs, cache_v1',
-      context_data: contextData,
-      resume_prompt: 'User approved. Call read_gate_context with gate_id "gate-lifecycle", then drop the tables.',
-    }));
+    const contextData = JSON.stringify({
+      tables: ['old_data', 'temp_logs', 'cache_v1'],
+    });
+    createGate(
+      makeGate({
+        id: 'gate-lifecycle',
+        group_folder: 'dev',
+        chat_jid: 'dc:456',
+        label: 'Drop tables',
+        summary: 'About to drop 3 tables: old_data, temp_logs, cache_v1',
+        context_data: contextData,
+        resume_prompt:
+          'User approved. Call read_gate_context with gate_id "gate-lifecycle", then drop the tables.',
+      }),
+    );
 
     // Verify it's pending
     const pending = getPendingGateByJid('dc:456');

@@ -1288,10 +1288,7 @@ function processQueryIpc(
           });
         })
         .catch((err) => {
-          logger.warn(
-            { sourceGroup, err },
-            'Failed to get activity summary',
-          );
+          logger.warn({ sourceGroup, err }, 'Failed to get activity summary');
           writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
             status: 'error',
             error: 'Failed to get activity summary',
