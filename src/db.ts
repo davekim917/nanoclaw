@@ -330,6 +330,19 @@ function createSchema(database: Database.Database): void {
     /* column already exists */
   }
 
+  // Add is_any_bot column if it doesn't exist (migration for existing DBs)
+  try {
+    database.exec(
+      `ALTER TABLE messages ADD COLUMN is_any_bot INTEGER DEFAULT 0`,
+    );
+    // Backfill: existing is_bot_message=1 rows are also "any bot"
+    database.exec(
+      `UPDATE messages SET is_any_bot = 1 WHERE is_bot_message = 1`,
+    );
+  } catch {
+    /* column already exists */
+  }
+
   // Add is_main column if it doesn't exist (migration for existing DBs)
   try {
     database.exec(
@@ -573,7 +586,7 @@ export function storeMessage(msg: NewMessage): void {
   }
 
   const insertStmt = db.prepare(
-    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message, is_any_bot) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
   const params = [
     msg.id,
@@ -584,6 +597,7 @@ export function storeMessage(msg: NewMessage): void {
     msg.timestamp,
     msg.is_from_me ? 1 : 0,
     msg.is_bot_message ? 1 : 0,
+    msg.is_any_bot ? 1 : 0,
   ];
 
   try {
@@ -616,9 +630,10 @@ export function storeMessageDirect(msg: {
   timestamp: string;
   is_from_me: boolean;
   is_bot_message?: boolean;
+  is_any_bot?: boolean;
 }): void {
   db.prepare(
-    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message, is_any_bot) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     msg.id,
     msg.chat_jid,
@@ -628,6 +643,7 @@ export function storeMessageDirect(msg: {
     msg.timestamp,
     msg.is_from_me ? 1 : 0,
     msg.is_bot_message ? 1 : 0,
+    msg.is_any_bot ? 1 : 0,
   );
 }
 
@@ -662,7 +678,7 @@ export function getNewMessages(
   // Subquery takes the N most recent, outer query re-sorts chronologically.
   const sql = `
     SELECT * FROM (
-      SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me
+      SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message, is_any_bot
       FROM messages
       WHERE timestamp > ? AND (${conditions.join(' OR ')})
         AND is_bot_message = 0 AND content NOT LIKE ?
@@ -696,7 +712,7 @@ export function getMessagesSince(
   // Subquery takes the N most recent, outer query re-sorts chronologically.
   const sql = `
     SELECT * FROM (
-      SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me
+      SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message, is_any_bot
       FROM messages
       WHERE chat_jid = ? AND timestamp > ?
         AND is_bot_message = 0 AND content NOT LIKE ?
@@ -725,7 +741,7 @@ export function getBotResponsesSince(
   sinceTimestamp: string,
 ): NewMessage[] {
   const sql = `
-    SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me
+    SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message, is_any_bot
     FROM messages
     WHERE chat_jid = ? AND timestamp > ?
       AND is_bot_message = 1
@@ -754,7 +770,7 @@ export function getMessageById(
 ): NewMessage | undefined {
   return db
     .prepare(
-      `SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me
+      `SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message, is_any_bot
        FROM messages WHERE id = ? AND chat_jid = ?`,
     )
     .get(id, chatJid) as NewMessage | undefined;
