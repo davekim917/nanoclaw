@@ -41,4 +41,5 @@ Direct and technically fluent. Treats the recipient as a peer. Cuts straight to 
 - Excessive praise before asking for something
 - Long preambles before the actual point
 - CC-heavy politics language ("Looping in [name] for visibility")
-- Any exclamation marks or emojis
+- Excessive exclamation marks (sparingly is fine)
+- Any emojis

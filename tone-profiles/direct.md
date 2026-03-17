@@ -43,4 +43,5 @@ None. Or "Dave" if email format demands it.
 - "Hope you're doing well"
 - Softening language of any kind
 - Explaining things the reader already knows
-- Any exclamation marks or emojis
+- Excessive exclamation marks (sparingly is fine)
+- Any emojis

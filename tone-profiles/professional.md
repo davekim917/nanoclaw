@@ -42,7 +42,7 @@ Concise, confident, and structured. Reads like a senior technical leader who res
 - "Thanks in advance"
 - "At your earliest convenience"
 - "Sorry for the delay"
-- Any exclamation marks
+- Excessive exclamation marks (sparingly is fine for genuine emphasis)
 - Any emojis
 - Passive voice
 - Hedging ("I think", "I believe")
