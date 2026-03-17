@@ -434,17 +434,7 @@ export class DiscordChannel implements Channel {
       const convKey = triggerMessageId ? `${jid}:${triggerMessageId}` : jid;
 
       // If we already created a thread for this conversation, redirect there.
-      let redirectJid = this.createdThreadJid.get(convKey);
-      // When triggerMessageId is absent (e.g. IPC send_message), scan for any
-      // redirect whose key starts with this JID — same approach as sendSwarmMessage.
-      if (!redirectJid && !triggerMessageId) {
-        for (const [key, threadJid] of this.createdThreadJid) {
-          if (key === jid || key.startsWith(`${jid}:`)) {
-            redirectJid = threadJid;
-            break;
-          }
-        }
-      }
+      const redirectJid = this.createdThreadJid.get(convKey);
       if (redirectJid) {
         return this.sendMessage(redirectJid, text, triggerMessageId);
       }
