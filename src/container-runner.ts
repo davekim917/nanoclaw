@@ -986,9 +986,11 @@ export async function prepareThreadWorkspace(
             wtPath: path.join(worktreeBase, entry.name),
           });
         } else if (entry.name === 'conversations' || entry.name === 'threads') {
-          // Copy directories that get written to concurrently
+          // Copy directories that get written to concurrently.
+          // dereference: false preserves symlinks (e.g. node_modules/.bin)
+          // instead of following them, which causes EINVAL on circular refs.
           const dstPath = path.join(worktreeBase, entry.name);
-          fs.cpSync(srcPath, dstPath, { recursive: true });
+          fs.cpSync(srcPath, dstPath, { recursive: true, dereference: false });
         } else {
           // Symlink other directories (logs, etc.)
           const dstPath = path.join(worktreeBase, entry.name);
