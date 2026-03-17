@@ -969,7 +969,7 @@ server.tool(
 
 server.tool(
   'list_ship_log',
-  'View the ship log — recent features, fixes, and improvements that have been shipped.',
+  'View the ship log — only entries logged by NanoClaw agents via add_ship_log. For a complete picture including team GitHub PRs and resolved backlog, use get_activity_summary instead.',
   {
     limit: z.number().optional().default(20).describe('Maximum entries to return (default: 20)'),
   },
