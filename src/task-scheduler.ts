@@ -27,6 +27,19 @@ import { resolveGroupFolderPath } from './group-folder.js';
 import { logger } from './logger.js';
 import { RegisteredGroup, ScheduledTask } from './types.js';
 
+// --- System task handler registry ---
+
+export type SystemTaskHandler = (task: ScheduledTask) => Promise<void>;
+
+const systemTaskHandlers = new Map<string, SystemTaskHandler>();
+
+export function registerSystemTaskHandler(
+  taskId: string,
+  handler: SystemTaskHandler,
+): void {
+  systemTaskHandlers.set(taskId, handler);
+}
+
 /**
  * Compute the next run time for a recurring task, anchored to the
  * task's scheduled time rather than Date.now() to prevent cumulative
@@ -40,8 +53,9 @@ export function computeNextRun(task: ScheduledTask): string | null {
   const now = Date.now();
 
   if (task.schedule_type === 'cron') {
+    const tz = task.schedule_tz || TIMEZONE;
     const interval = CronExpressionParser.parse(task.schedule_value, {
-      tz: TIMEZONE,
+      tz,
     });
     return interval.next().toISOString();
   }
@@ -81,10 +95,59 @@ export interface SchedulerDependencies {
   sendMessage: (jid: string, text: string) => Promise<void>;
 }
 
+/**
+ * Run a system task (host-side, no container).
+ * Advances next_run before execution to prevent double-dispatch
+ * if the handler takes longer than the poll interval.
+ */
+async function runSystemTask(
+  task: ScheduledTask,
+  handler: SystemTaskHandler,
+): Promise<void> {
+  const startTime = Date.now();
+  let error: string | null = null;
+
+  // Advance next_run BEFORE execution to prevent double-dispatch
+  const nextRun = computeNextRun(task);
+  updateTask(task.id, { next_run: nextRun });
+
+  try {
+    logger.info({ taskId: task.id }, 'Running system task');
+    await handler(task);
+  } catch (err) {
+    error = err instanceof Error ? err.message : String(err);
+    logger.error({ taskId: task.id, error }, 'System task failed');
+  }
+
+  const durationMs = Date.now() - startTime;
+
+  logTaskRun({
+    task_id: task.id,
+    run_at: new Date().toISOString(),
+    duration_ms: durationMs,
+    status: error ? 'error' : 'success',
+    result: error ? null : `Completed in ${durationMs}ms`,
+    error,
+  });
+
+  // Update last_result with final status (next_run already advanced above)
+  const resultSummary = error ? `Error: ${error}` : 'Completed';
+  updateTaskAfterRun(task.id, nextRun, resultSummary);
+}
+
 async function runTask(
   task: ScheduledTask,
   deps: SchedulerDependencies,
 ): Promise<void> {
+  // Guard: system tasks must not reach container execution path
+  if (task.task_type === 'system') {
+    logger.error(
+      { taskId: task.id },
+      'BUG: system task routed to container runTask',
+    );
+    return;
+  }
+
   const startTime = Date.now();
   let groupDir: string;
   try {
@@ -270,6 +333,25 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
         // Re-check task status in case it was paused/cancelled
         const currentTask = getTaskById(task.id);
         if (!currentTask || currentTask.status !== 'active') {
+          continue;
+        }
+
+        // System tasks run host-side (no container, no GroupQueue slot)
+        if (currentTask.task_type === 'system') {
+          const handler = systemTaskHandlers.get(currentTask.id);
+          if (!handler) {
+            logger.warn(
+              { taskId: currentTask.id },
+              'No handler registered for system task',
+            );
+            continue;
+          }
+          runSystemTask(currentTask, handler).catch((err) =>
+            logger.error(
+              { taskId: currentTask.id, err },
+              'System task unhandled error',
+            ),
+          );
           continue;
         }
 

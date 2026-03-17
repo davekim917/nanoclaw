@@ -1029,6 +1029,77 @@ server.tool(
 );
 
 server.tool(
+  'get_activity_summary',
+  'Get a summary of all recent activity: shipped features (from the ship log), team GitHub PRs (merged in watched orgs/repos, if configured), and resolved backlog items. Use this when asked "what shipped?", "any updates?", "what happened recently?", or similar.',
+  {
+    hours: z.number().min(1).max(8760).optional().default(24).describe('Look back this many hours (default: 24, max: 8760 = 1 year)'),
+  },
+  async (args) => {
+    try {
+      const requestId = writeQueryFile({
+        type: 'get_activity_summary',
+        hours: args.hours,
+      });
+
+      const response = await waitForResponse(requestId) as {
+        status: string;
+        error?: string;
+        shipped?: Array<{ title: string; description: string | null; pr_url: string | null; shipped_at: string }>;
+        teamPRs?: Array<{ title: string; url: string; author: string; repo: string }>;
+        resolved?: Array<{ title: string; status: string }>;
+      };
+
+      if (response.status !== 'ok') {
+        return {
+          content: [{ type: 'text' as const, text: `Error: ${response.error || 'Unknown error'}` }],
+          isError: true,
+        };
+      }
+
+      const shipped = response.shipped || [];
+      const teamPRs = response.teamPRs || [];
+      const resolved = response.resolved || [];
+
+      if (shipped.length === 0 && teamPRs.length === 0 && resolved.length === 0) {
+        return { content: [{ type: 'text' as const, text: `No activity found in the last ${args.hours} hours.` }] };
+      }
+
+      const sections: string[] = [];
+
+      if (shipped.length > 0) {
+        const items = shipped.map((s) => {
+          const pr = s.pr_url ? ` — ${s.pr_url}` : '';
+          return `- **${s.title}**${pr} (${s.shipped_at.slice(0, 10)})`;
+        }).join('\n');
+        sections.push(`**Shipped** (${shipped.length}):\n${items}`);
+      }
+
+      if (teamPRs.length > 0) {
+        const items = teamPRs.map((pr) =>
+          `- **${pr.title}** — ${pr.url} (${pr.author}, ${pr.repo})`
+        ).join('\n');
+        sections.push(`**Team PRs** (${teamPRs.length}):\n${items}`);
+      }
+
+      if (resolved.length > 0) {
+        const items = resolved.map((r) => {
+          const emoji = r.status === 'resolved' ? '✅' : '🚫';
+          return `${emoji} ${r.title}`;
+        }).join('\n');
+        sections.push(`**Resolved Backlog** (${resolved.length}):\n${items}`);
+      }
+
+      return { content: [{ type: 'text' as const, text: sections.join('\n\n') }] };
+    } catch (err) {
+      return {
+        content: [{ type: 'text' as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
   'update_plugin',
   'Update the bootstrap plugin by pulling latest changes from its remote repository. Only available to the main group.',
   {},

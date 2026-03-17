@@ -39,6 +39,7 @@ import {
   searchMemoriesKeyword,
   updateMemory,
 } from './memory-store.js';
+import { getActivitySummary } from './daily-notifications.js';
 import { searchThreads } from './thread-search.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
@@ -961,6 +962,8 @@ function processQueryIpc(
     threadKey?: string;
     // For backlog/ship_log queries
     status?: string;
+    // For activity summary
+    hours?: number;
     // For memory queries
     memoryId?: string;
     // For gate queries
@@ -1260,6 +1263,40 @@ function processQueryIpc(
         status: 'ok',
         entries,
       });
+      break;
+    }
+
+    case 'get_activity_summary': {
+      const sinceHours = data.hours ?? 24;
+      const since = new Date(
+        Date.now() - sinceHours * 60 * 60 * 1000,
+      ).toISOString();
+      getActivitySummary(sourceGroup, registeredGroups, since)
+        .then((summary) => {
+          logger.info(
+            {
+              sourceGroup,
+              shipped: summary.shipped.length,
+              teamPRs: summary.teamPRs.length,
+              resolved: summary.resolved.length,
+            },
+            'IPC get_activity_summary query served',
+          );
+          writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
+            status: 'ok',
+            ...summary,
+          });
+        })
+        .catch((err) => {
+          logger.warn(
+            { sourceGroup, err },
+            'Failed to get activity summary',
+          );
+          writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
+            status: 'error',
+            error: 'Failed to get activity summary',
+          });
+        });
       break;
     }
 

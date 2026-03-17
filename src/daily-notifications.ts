@@ -3,9 +3,16 @@ import { promisify } from 'util';
 
 import { CronExpressionParser } from 'cron-parser';
 
-import { getBacklogResolvedSince, getShipLogSince } from './db.js';
+import {
+  createTask,
+  getBacklogResolvedSince,
+  getShipLogSince,
+  getTaskById,
+  updateTask,
+} from './db.js';
 import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
+import { registerSystemTaskHandler } from './task-scheduler.js';
 import { ContainerConfig, RegisteredGroup } from './types.js';
 
 const execFileAsync = promisify(execFile);
@@ -13,6 +20,8 @@ const execFileAsync = promisify(execFile);
 // Default: 8am Eastern (America/New_York handles DST automatically)
 const DAILY_NOTIFY_CRON = process.env.DAILY_NOTIFY_CRON || '0 8 * * *';
 const DAILY_NOTIFY_TZ = process.env.DAILY_NOTIFY_TZ || 'America/New_York';
+
+export const DAILY_TASK_ID = '__daily_summary';
 
 // Matches container-runner.ts SAFE_SCOPE_RE — rejects path traversal in tool scopes
 const SAFE_SCOPE_RE = /^[a-zA-Z0-9_-]+$/;
@@ -92,9 +101,10 @@ async function fetchGithubMergedPRs(
   const sinceDate = `>=${since.slice(0, 10)}`; // >=YYYY-MM-DD for gh --merged-at
   const jsonFields = 'title,url,author,repository';
 
+  // Timeout must fit within container IPC deadline (QUERY_TIMEOUT_MS = 10s)
   const execOpts = ghToken
-    ? { env: { ...process.env, GH_TOKEN: ghToken }, timeout: 15000 }
-    : { timeout: 15000 };
+    ? { env: { ...process.env, GH_TOKEN: ghToken }, timeout: 8000 }
+    : { timeout: 8000 };
 
   // Build unified query list: --owner for orgs, --repo for specific repos
   const queries = [
@@ -146,6 +156,83 @@ async function fetchGithubMergedPRs(
   });
 }
 
+export interface ActivitySummary {
+  shipped: Array<{
+    title: string;
+    description: string | null;
+    pr_url: string | null;
+    shipped_at: string;
+  }>;
+  teamPRs: Array<{
+    title: string;
+    url: string;
+    author: string;
+    repo: string;
+  }>;
+  resolved: Array<{
+    title: string;
+    status: string;
+  }>;
+}
+
+/**
+ * Get activity summary for a single folder: ship log entries, GitHub team PRs,
+ * and resolved backlog items since `since`.
+ * Reused by both daily summary notifications and the get_activity_summary IPC query.
+ */
+export async function getActivitySummary(
+  folder: string,
+  groups: Record<string, RegisteredGroup>,
+  since: string,
+  envTokens?: Record<string, string>,
+): Promise<ActivitySummary> {
+  const shipped = getShipLogSince(folder, since);
+  const resolved = getBacklogResolvedSince(folder, since);
+  const config = getContainerConfigForFolder(groups, folder);
+  const watchGithub = config?.watchGithub ?? [];
+  const tokenKey = resolveGithubTokenKey(config?.tools);
+
+  // Resolve GitHub token if not pre-fetched
+  if (!envTokens) {
+    envTokens = readEnvFile(['GITHUB_TOKEN', tokenKey]);
+  }
+
+  // Fetch team PRs from GitHub (if configured)
+  let teamPRs: GitHubPR[] = [];
+  if (watchGithub.length > 0) {
+    try {
+      const ghToken = envTokens[tokenKey] || envTokens['GITHUB_TOKEN'];
+      const allPRs = await fetchGithubMergedPRs(watchGithub, since, ghToken);
+      // Filter out PRs already in ship_log (agent-created work)
+      const shippedUrls = new Set(
+        shipped.map((s) => s.pr_url).filter(Boolean),
+      );
+      teamPRs = allPRs.filter((pr) => !shippedUrls.has(pr.url));
+    } catch (err) {
+      logger.warn({ folder, err }, 'Failed to fetch GitHub PRs for folder');
+    }
+  }
+
+  return {
+    shipped: shipped.map((s) => ({
+      title: s.title,
+      description: s.description,
+      pr_url: s.pr_url,
+      shipped_at: s.shipped_at,
+    })),
+    teamPRs: teamPRs.map((pr) => ({
+      title: pr.title,
+      url: pr.url,
+      author: pr.author.login,
+      repo: pr.repository.nameWithOwner,
+    })),
+    resolved: resolved.map((item) => ({
+      title: item.title,
+      status: item.status,
+    })),
+  };
+}
+
 export async function sendDailySummaries(
   deps: DailyNotificationDeps,
 ): Promise<void> {
@@ -163,30 +250,18 @@ export async function sendDailySummaries(
   }
   const envTokens = readEnvFile([...tokenKeys]);
 
-  for (const folder of folders) {
-    const shipped = getShipLogSince(folder, since);
-    const resolved = getBacklogResolvedSince(folder, since);
-    const config = getContainerConfigForFolder(groups, folder);
-    const watchGithub = config?.watchGithub ?? [];
+  // Fetch all summaries in parallel (GitHub API calls are the bottleneck)
+  const summaries = await Promise.all(
+    folders.map(async (folder) => ({
+      folder,
+      summary: await getActivitySummary(folder, groups, since, envTokens),
+    })),
+  );
 
-    // Fetch team PRs from GitHub (if configured)
-    let teamPRs: GitHubPR[] = [];
-    if (watchGithub.length > 0) {
-      try {
-        const tokenKey = resolveGithubTokenKey(config?.tools);
-        const ghToken = envTokens[tokenKey] || envTokens['GITHUB_TOKEN'];
-        const allPRs = await fetchGithubMergedPRs(watchGithub, since, ghToken);
-        // Filter out PRs already in ship_log (agent-created work)
-        const shippedUrls = new Set(
-          shipped.map((s) => s.pr_url).filter(Boolean),
-        );
-        teamPRs = allPRs.filter((pr) => !shippedUrls.has(pr.url));
-      } catch (err) {
-        logger.warn({ folder, err }, 'Failed to fetch GitHub PRs for folder');
-      }
-    }
+  for (const { folder, summary } of summaries) {
+    const { shipped, teamPRs, resolved } = summary;
 
-    if (shipped.length === 0 && resolved.length === 0 && teamPRs.length === 0)
+    if (shipped.length === 0 && teamPRs.length === 0 && resolved.length === 0)
       continue;
 
     const lines: string[] = [`📋 **Daily Summary** — ${folder}`];
@@ -202,7 +277,7 @@ export async function sendDailySummaries(
     if (teamPRs.length > 0) {
       lines.push(`\n👥 **Team Activity** (${teamPRs.length}):`);
       for (const pr of teamPRs) {
-        lines.push(`• ${pr.title} — ${pr.url} (${pr.author.login})`);
+        lines.push(`• ${pr.title} — ${pr.url} (${pr.author})`);
       }
     }
 
@@ -237,31 +312,83 @@ export async function sendDailySummaries(
   }
 }
 
-export function startDailyNotifier(deps: DailyNotificationDeps): void {
-  const scheduleNextRun = () => {
-    try {
-      const interval = CronExpressionParser.parse(DAILY_NOTIFY_CRON, {
-        tz: DAILY_NOTIFY_TZ,
-      });
-      const next = interval.next().toDate();
-      const delay = next.getTime() - Date.now();
+function computeNextRunForCron(): string {
+  const interval = CronExpressionParser.parse(DAILY_NOTIFY_CRON, {
+    tz: DAILY_NOTIFY_TZ,
+  });
+  return interval.next().toDate().toISOString();
+}
+
+/**
+ * Idempotent: ensures the daily summary task row exists in scheduled_tasks.
+ * If the row already exists, leaves it untouched (preserving next_run for catch-up).
+ * If the cron expression has changed (env var updated), updates schedule_value and recomputes next_run.
+ */
+export function ensureDailyNotifierTask(): void {
+  const existing = getTaskById(DAILY_TASK_ID);
+  if (existing) {
+    // Collect all needed updates into a single DB write
+    const updates: Parameters<typeof updateTask>[1] = {};
+    let nextRun = existing.next_run;
+
+    if (existing.schedule_value !== DAILY_NOTIFY_CRON) {
+      updates.schedule_value = DAILY_NOTIFY_CRON;
+    }
+    if (existing.schedule_tz !== DAILY_NOTIFY_TZ) {
+      updates.schedule_tz = DAILY_NOTIFY_TZ;
+    }
+    if (updates.schedule_value || updates.schedule_tz) {
+      nextRun = computeNextRunForCron();
+      updates.next_run = nextRun;
+    }
+    if (existing.status !== 'active') {
+      updates.status = 'active';
+    }
+
+    if (Object.keys(updates).length > 0) {
+      updateTask(DAILY_TASK_ID, updates);
       logger.info(
-        { next: next.toISOString(), cron: DAILY_NOTIFY_CRON },
-        'Daily notifier scheduled',
+        { updates, nextRun },
+        'Daily notifier task updated',
       );
-      setTimeout(async () => {
-        await sendDailySummaries(deps).catch((err) =>
-          logger.error({ err }, 'Daily summary failed'),
-        );
-        scheduleNextRun();
-      }, delay);
-    } catch (err) {
-      logger.error(
-        { err, cron: DAILY_NOTIFY_CRON },
-        'Invalid daily notify cron expression',
+    } else {
+      logger.info(
+        { nextRun, cron: DAILY_NOTIFY_CRON },
+        'Daily notifier task exists',
       );
     }
-  };
+    return;
+  }
 
-  scheduleNextRun();
+  const nextRun = computeNextRunForCron();
+  createTask({
+    id: DAILY_TASK_ID,
+    group_folder: '__system',
+    chat_jid: '__system',
+    prompt: 'Daily summary (system task)',
+    schedule_type: 'cron',
+    schedule_value: DAILY_NOTIFY_CRON,
+    context_mode: 'isolated',
+    task_type: 'system',
+    schedule_tz: DAILY_NOTIFY_TZ,
+    next_run: nextRun,
+    status: 'active',
+    created_at: new Date().toISOString(),
+  });
+  logger.info(
+    { nextRun, cron: DAILY_NOTIFY_CRON },
+    'Daily notifier task created',
+  );
+}
+
+/**
+ * Register the daily summary handler with the task scheduler.
+ * Must be called before startSchedulerLoop().
+ */
+export function registerDailyNotifierHandler(
+  deps: DailyNotificationDeps,
+): void {
+  registerSystemTaskHandler(DAILY_TASK_ID, async () => {
+    await sendDailySummaries(deps);
+  });
 }

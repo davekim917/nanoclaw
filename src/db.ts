@@ -317,6 +317,24 @@ function createSchema(database: Database.Database): void {
     /* column already exists */
   }
 
+  // Add task_type column (system vs container tasks)
+  try {
+    database.exec(
+      `ALTER TABLE scheduled_tasks ADD COLUMN task_type TEXT DEFAULT 'container'`,
+    );
+  } catch {
+    /* column already exists */
+  }
+
+  // Add schedule_tz column (per-task timezone for cron)
+  try {
+    database.exec(
+      `ALTER TABLE scheduled_tasks ADD COLUMN schedule_tz TEXT DEFAULT NULL`,
+    );
+  } catch {
+    /* column already exists */
+  }
+
   // Add is_bot_message column if it doesn't exist (migration for existing DBs)
   try {
     database.exec(
@@ -985,8 +1003,8 @@ export function createTask(
 ): void {
   db.prepare(
     `
-    INSERT INTO scheduled_tasks (id, group_folder, chat_jid, prompt, schedule_type, schedule_value, context_mode, next_run, status, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO scheduled_tasks (id, group_folder, chat_jid, prompt, schedule_type, schedule_value, context_mode, task_type, schedule_tz, next_run, status, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `,
   ).run(
     task.id,
@@ -996,6 +1014,8 @@ export function createTask(
     task.schedule_type,
     task.schedule_value,
     task.context_mode || 'isolated',
+    task.task_type || 'container',
+    task.schedule_tz || null,
     task.next_run,
     task.status,
     task.created_at,
@@ -1027,7 +1047,12 @@ export function updateTask(
   updates: Partial<
     Pick<
       ScheduledTask,
-      'prompt' | 'schedule_type' | 'schedule_value' | 'next_run' | 'status'
+      | 'prompt'
+      | 'schedule_type'
+      | 'schedule_value'
+      | 'schedule_tz'
+      | 'next_run'
+      | 'status'
     >
   >,
 ): void {
@@ -1045,6 +1070,10 @@ export function updateTask(
   if (updates.schedule_value !== undefined) {
     fields.push('schedule_value = ?');
     values.push(updates.schedule_value);
+  }
+  if (updates.schedule_tz !== undefined) {
+    fields.push('schedule_tz = ?');
+    values.push(updates.schedule_tz);
   }
   if (updates.next_run !== undefined) {
     fields.push('next_run = ?');

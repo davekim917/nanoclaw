@@ -94,6 +94,8 @@ export interface ScheduledTask {
   schedule_type: 'cron' | 'interval' | 'once';
   schedule_value: string;
   context_mode: 'group' | 'isolated';
+  task_type?: 'container' | 'system'; // default 'container'
+  schedule_tz?: string | null; // IANA timezone (e.g. 'America/New_York'). Null = use TIMEZONE from config
   next_run: string | null;
   last_run: string | null;
   last_result: string | null;

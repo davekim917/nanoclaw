@@ -91,7 +91,10 @@ import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import { getMemoryBlock } from './memory-store.js';
-import { startDailyNotifier } from './daily-notifications.js';
+import {
+  ensureDailyNotifierTask,
+  registerDailyNotifierHandler,
+} from './daily-notifications.js';
 import { callHaiku } from './llm.js';
 import {
   extractThreadTitle,
@@ -1866,6 +1869,21 @@ async function main(): Promise<void> {
   // Start session sweep (idle session cleanup)
   startSessionSweep();
 
+  // Daily summary: persistent scheduled task (survives restarts, catches up on missed runs)
+  // Must be registered BEFORE startSchedulerLoop so the handler exists for the first poll.
+  ensureDailyNotifierTask();
+  registerDailyNotifierHandler({
+    registeredGroups: () => registeredGroups,
+    sendMessage: async (jid, text) => {
+      const channel = findChannel(channels, jid);
+      if (!channel) {
+        logger.warn({ jid }, 'No channel owns JID, cannot send daily summary');
+        return;
+      }
+      await channel.sendMessage(jid, text);
+    },
+  });
+
   // Start subsystems (independently of connection handler)
   startSchedulerLoop({
     registeredGroups: () => registeredGroups,
@@ -1912,17 +1930,6 @@ async function main(): Promise<void> {
     getAvailableGroups,
     writeGroupsSnapshot: (gf, im, ag, rj) =>
       writeGroupsSnapshot(gf, im, ag, rj),
-  });
-  startDailyNotifier({
-    registeredGroups: () => registeredGroups,
-    sendMessage: async (jid, text) => {
-      const channel = findChannel(channels, jid);
-      if (!channel) {
-        logger.warn({ jid }, 'No channel owns JID, cannot send daily summary');
-        return;
-      }
-      await channel.sendMessage(jid, text);
-    },
   });
   // Start web UI for real-time agent activity monitoring
   webUI = await startWebUI(

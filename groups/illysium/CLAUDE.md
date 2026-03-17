@@ -101,6 +101,27 @@ dbt run --profiles-dir ~/.dbt --profile <profile_name> --project-dir <path_to_db
 dbt test --profiles-dir ~/.dbt --profile <profile_name> --project-dir <path_to_dbt_project>
 ```
 
+## Ship Log & Backlog — MANDATORY POST-PR ACTIONS
+
+These are **non-optional**. Execute immediately after `gh pr create` succeeds, every time, without being asked.
+
+**After every PR:**
+```
+mcp__nanoclaw__add_ship_log({ title, description, pr_url, branch, tags })
+```
+
+**If the PR resolves a known backlog item:**
+```
+mcp__nanoclaw__update_backlog_item({ item_id, status: "resolved", notes: "Fixed in PR #N" })
+```
+
+**When discovering bugs or issues during development (proactively):**
+```
+mcp__nanoclaw__add_backlog_item({ title, description, priority, tags })
+```
+
+Dave never manually triggers these — if you built it and opened the PR, you log it.
+
 ## USER GENERATED — Snowflake & dbt Guardrails
 
 > These rules were added manually by Dave based on production learnings. Do not overwrite during re-bootstrap.
