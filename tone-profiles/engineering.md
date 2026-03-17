@@ -55,7 +55,7 @@ Use emojis to increase readability and engagement, not as decoration:
 ## Anti-Patterns (NEVER use)
 
 - Corporate buzzwords ("synergize", "leverage", "circle back")
-- Excessive enthusiasm ("Amazing work!!!", "Love it!!!")
+- Excessive enthusiasm ("Amazing work!!!", "Love it!!!") — a single "!" is fine for genuine moments, just don't overdo it
 - Filler acknowledgments ("Great question!", "That's a really good point!")
 - Apologetic hedging ("Sorry, I might be overstepping, but...")
 - Explaining basic concepts to experienced engineers
