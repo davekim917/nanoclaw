@@ -94,6 +94,39 @@ describe('formatMessages', () => {
     expect(result).toContain('<messages>\n\n</messages>');
   });
 
+  it('includes is_from_me attribute when true', () => {
+    const result = formatMessages([makeMsg({ is_from_me: true })], TZ);
+    expect(result).toContain('is_from_me="true"');
+  });
+
+  it('omits is_from_me attribute when false or undefined', () => {
+    const result = formatMessages([makeMsg({ is_from_me: false })], TZ);
+    expect(result).not.toContain('is_from_me');
+    const result2 = formatMessages([makeMsg()], TZ);
+    expect(result2).not.toContain('is_from_me');
+  });
+
+  it('includes is_bot attribute for bot messages', () => {
+    const result = formatMessages([makeMsg({ is_any_bot: true })], TZ);
+    expect(result).toContain('is_bot="true"');
+  });
+
+  it('includes is_bot attribute from is_bot_message fallback', () => {
+    const result = formatMessages([makeMsg({ is_bot_message: true })], TZ);
+    expect(result).toContain('is_bot="true"');
+  });
+
+  it('omits is_bot attribute for non-bot messages', () => {
+    const result = formatMessages([makeMsg()], TZ);
+    expect(result).not.toContain('is_bot');
+  });
+
+  it('includes both is_from_me and is_bot for own bot messages', () => {
+    const result = formatMessages([makeMsg({ is_from_me: true, is_any_bot: true })], TZ);
+    expect(result).toContain('is_from_me="true"');
+    expect(result).toContain('is_bot="true"');
+  });
+
   it('converts timestamps to local time for given timezone', () => {
     // 2024-01-01T18:30:00Z in America/New_York (EST) = 1:30 PM
     const result = formatMessages(

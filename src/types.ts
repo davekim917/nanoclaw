@@ -75,6 +75,7 @@ export interface NewMessage {
   timestamp: string;
   is_from_me?: boolean;
   is_bot_message?: boolean;
+  is_any_bot?: boolean; // True for messages from any bot (own or external)
   attachments?: Attachment[];
 }
 

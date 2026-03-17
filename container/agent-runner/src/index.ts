@@ -1078,11 +1078,15 @@ async function main(): Promise<void> {
     ? fs.readFileSync(globalClaudeMdPath, 'utf-8')
     : undefined;
   const channelFormatting = getChannelFormattingInstructions(containerInput.chatJid);
+  // Inject agent identity so the agent knows its own name and can distinguish itself from other bots
+  const identityNote = containerInput.assistantName
+    ? `Your name is ${containerInput.assistantName}. Messages in the conversation history may include is_from_me="true" (your own previous messages) and is_bot="true" (messages from any bot). A message with is_bot="true" but without is_from_me="true" is from a different bot — not you. When referencing or tagging yourself, always use the name "${containerInput.assistantName}".`
+    : undefined;
   // Inject model identity so the agent can report it accurately
   const modelNote = containerInput.model
     ? `You are running on model: ${containerInput.model}. If the user asks what model you are using, report this accurately.`
     : undefined;
-  const systemPromptParts = [globalClaudeMd, channelFormatting, modelNote].filter(Boolean);
+  const systemPromptParts = [globalClaudeMd, channelFormatting, identityNote, modelNote].filter(Boolean);
   const systemPromptOption = systemPromptParts.length > 0
     ? { type: 'preset' as const, preset: 'claude_code' as const, append: systemPromptParts.join('\n\n') }
     : undefined;

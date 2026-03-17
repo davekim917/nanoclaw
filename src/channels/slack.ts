@@ -332,6 +332,7 @@ export class SlackChannel implements Channel {
         timestamp,
         is_from_me: isOurBot,
         is_bot_message: isOurBot,
+        is_any_bot: isAnyBot,
         attachments:
           downloadedAttachments.length > 0 ? downloadedAttachments : undefined,
       });
@@ -761,6 +762,7 @@ export class SlackChannel implements Channel {
         timestamp: new Date(parseFloat(msg.ts!) * 1000).toISOString(),
         is_from_me: isOurBot,
         is_bot_message: isOurBot,
+        is_any_bot: isBotMsg,
       };
     } catch (err) {
       logger.warn({ jid, messageId, err }, 'Failed to fetch Slack message');
