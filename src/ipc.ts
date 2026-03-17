@@ -51,7 +51,6 @@ export interface IpcDeps {
 
 let ipcWatcherRunning = false;
 
-
 export function startIpcWatcher(deps: IpcDeps): void {
   if (ipcWatcherRunning) {
     logger.debug('IPC watcher already running, skipping duplicate start');

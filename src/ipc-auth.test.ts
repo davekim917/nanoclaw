@@ -632,7 +632,11 @@ describe('set_group_model', () => {
 describe('set_group_tools', () => {
   it('main group can set an explicit tool list', async () => {
     await processTaskIpc(
-      { type: 'set_group_tools', jid: 'other@g.us', tools: ['snowflake:sunday'] },
+      {
+        type: 'set_group_tools',
+        jid: 'other@g.us',
+        tools: ['snowflake:sunday'],
+      },
       'whatsapp_main',
       true,
       deps,
@@ -643,7 +647,10 @@ describe('set_group_tools', () => {
 
   it('main group can set empty tools list (disable all)', async () => {
     // First give it some tools
-    groups['other@g.us'] = { ...OTHER_GROUP, containerConfig: { tools: ['snowflake:sunday'] } };
+    groups['other@g.us'] = {
+      ...OTHER_GROUP,
+      containerConfig: { tools: ['snowflake:sunday'] },
+    };
     await processTaskIpc(
       { type: 'set_group_tools', jid: 'other@g.us', tools: [] },
       'whatsapp_main',
@@ -655,7 +662,10 @@ describe('set_group_tools', () => {
   });
 
   it('main group can clear tools with null (reverts to all-enabled)', async () => {
-    groups['other@g.us'] = { ...OTHER_GROUP, containerConfig: { tools: ['snowflake:sunday'] } };
+    groups['other@g.us'] = {
+      ...OTHER_GROUP,
+      containerConfig: { tools: ['snowflake:sunday'] },
+    };
     await processTaskIpc(
       { type: 'set_group_tools', jid: 'other@g.us', tools: null },
       'whatsapp_main',
@@ -685,7 +695,11 @@ describe('set_group_tools', () => {
       containerConfig: { model: 'opus', tools: ['snowflake:sunday'] },
     };
     await processTaskIpc(
-      { type: 'set_group_tools', jid: 'other@g.us', tools: ['snowflake:apollo'] },
+      {
+        type: 'set_group_tools',
+        jid: 'other@g.us',
+        tools: ['snowflake:apollo'],
+      },
       'whatsapp_main',
       true,
       deps,
@@ -697,7 +711,11 @@ describe('set_group_tools', () => {
 
   it('non-main group cannot set tools', async () => {
     await processTaskIpc(
-      { type: 'set_group_tools', jid: 'other@g.us', tools: ['snowflake:sunday'] },
+      {
+        type: 'set_group_tools',
+        jid: 'other@g.us',
+        tools: ['snowflake:sunday'],
+      },
       'other-group',
       false,
       deps,
@@ -708,7 +726,11 @@ describe('set_group_tools', () => {
 
   it('set_group_tools ignores unknown jid', async () => {
     await processTaskIpc(
-      { type: 'set_group_tools', jid: 'nonexistent@g.us', tools: ['snowflake:sunday'] },
+      {
+        type: 'set_group_tools',
+        jid: 'nonexistent@g.us',
+        tools: ['snowflake:sunday'],
+      },
       'whatsapp_main',
       true,
       deps,
