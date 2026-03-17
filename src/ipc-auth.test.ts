@@ -626,3 +626,115 @@ describe('set_group_model', () => {
     expect(getRegisteredGroup('nonexistent@g.us')).toBeUndefined();
   });
 });
+
+// --- set_group_tools ---
+
+describe('set_group_tools', () => {
+  it('main group can set an explicit tool list', async () => {
+    await processTaskIpc(
+      {
+        type: 'set_group_tools',
+        jid: 'other@g.us',
+        tools: ['snowflake:sunday'],
+      },
+      'whatsapp_main',
+      true,
+      deps,
+    );
+    const group = getRegisteredGroup('other@g.us');
+    expect(group?.containerConfig?.tools).toEqual(['snowflake:sunday']);
+  });
+
+  it('main group can set empty tools list (disable all)', async () => {
+    // First give it some tools
+    groups['other@g.us'] = {
+      ...OTHER_GROUP,
+      containerConfig: { tools: ['snowflake:sunday'] },
+    };
+    await processTaskIpc(
+      { type: 'set_group_tools', jid: 'other@g.us', tools: [] },
+      'whatsapp_main',
+      true,
+      deps,
+    );
+    const group = getRegisteredGroup('other@g.us');
+    expect(group?.containerConfig?.tools).toEqual([]);
+  });
+
+  it('main group can clear tools with null (reverts to all-enabled)', async () => {
+    groups['other@g.us'] = {
+      ...OTHER_GROUP,
+      containerConfig: { tools: ['snowflake:sunday'] },
+    };
+    await processTaskIpc(
+      { type: 'set_group_tools', jid: 'other@g.us', tools: null },
+      'whatsapp_main',
+      true,
+      deps,
+    );
+    const group = getRegisteredGroup('other@g.us');
+    expect(group?.containerConfig?.tools).toBeUndefined();
+  });
+
+  it('absent tools field is a no-op (does not clear existing restriction)', async () => {
+    groups['other@g.us'] = { ...OTHER_GROUP, containerConfig: { tools: [] } };
+    await processTaskIpc(
+      { type: 'set_group_tools', jid: 'other@g.us' },
+      'whatsapp_main',
+      true,
+      deps,
+    );
+    const group = getRegisteredGroup('other@g.us');
+    // tools: [] restriction must be preserved, not silently cleared
+    expect(group?.containerConfig?.tools).toEqual([]);
+  });
+
+  it('set_group_tools preserves other containerConfig fields', async () => {
+    groups['other@g.us'] = {
+      ...OTHER_GROUP,
+      containerConfig: { model: 'opus', tools: ['snowflake:sunday'] },
+    };
+    await processTaskIpc(
+      {
+        type: 'set_group_tools',
+        jid: 'other@g.us',
+        tools: ['snowflake:apollo'],
+      },
+      'whatsapp_main',
+      true,
+      deps,
+    );
+    const group = getRegisteredGroup('other@g.us');
+    expect(group?.containerConfig?.model).toBe('opus');
+    expect(group?.containerConfig?.tools).toEqual(['snowflake:apollo']);
+  });
+
+  it('non-main group cannot set tools', async () => {
+    await processTaskIpc(
+      {
+        type: 'set_group_tools',
+        jid: 'other@g.us',
+        tools: ['snowflake:sunday'],
+      },
+      'other-group',
+      false,
+      deps,
+    );
+    const group = getRegisteredGroup('other@g.us');
+    expect(group?.containerConfig?.tools).toBeUndefined();
+  });
+
+  it('set_group_tools ignores unknown jid', async () => {
+    await processTaskIpc(
+      {
+        type: 'set_group_tools',
+        jid: 'nonexistent@g.us',
+        tools: ['snowflake:sunday'],
+      },
+      'whatsapp_main',
+      true,
+      deps,
+    );
+    expect(getRegisteredGroup('nonexistent@g.us')).toBeUndefined();
+  });
+});

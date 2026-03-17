@@ -51,7 +51,6 @@ export interface IpcDeps {
 
 let ipcWatcherRunning = false;
 
-
 export function startIpcWatcher(deps: IpcDeps): void {
   if (ipcWatcherRunning) {
     logger.debug('IPC watcher already running, skipping duplicate start');
@@ -249,6 +248,7 @@ export async function processTaskIpc(
     containerConfig?: RegisteredGroup['containerConfig'];
     model?: string;
     notifyJid?: string;
+    tools?: string[] | null;
     // For ship_log / backlog
     itemId?: string;
     title?: string;
@@ -537,6 +537,9 @@ export async function processTaskIpc(
       }
       break;
 
+    case 'set_group_notify_jid':
+    // falls through — notifyJid updates share the same handler as model updates
+    // eslint-disable-next-line no-fallthrough
     case 'set_group_model':
       // Only main group can update group model
       if (!isMain) {
@@ -582,6 +585,47 @@ export async function processTaskIpc(
         );
       } else {
         logger.warn({ data }, 'set_group_model: missing jid');
+      }
+      break;
+
+    case 'set_group_tools':
+      // Only main group can update group tools
+      if (!isMain) {
+        logger.warn(
+          { sourceGroup },
+          'Unauthorized set_group_tools attempt blocked',
+        );
+        break;
+      }
+      if (data.jid) {
+        const existing = registeredGroups[data.jid];
+        if (!existing) {
+          logger.warn({ jid: data.jid }, 'set_group_tools: unknown JID');
+          break;
+        }
+        // null = remove tools key (all tools enabled), [] or [...] = explicit list
+        // undefined (field absent from IPC JSON) = no-op, leave tools unchanged
+        const updatedConfig = { ...existing.containerConfig };
+        if (data.tools === null) {
+          delete updatedConfig.tools;
+        } else if (data.tools !== undefined) {
+          updatedConfig.tools = data.tools;
+        }
+        deps.registerGroup(data.jid, {
+          ...existing,
+          containerConfig:
+            Object.keys(updatedConfig).length > 0 ? updatedConfig : undefined,
+        });
+        const tools = data.tools;
+        const label =
+          tools === null || tools === undefined
+            ? '(cleared — all tools enabled)'
+            : tools.length === 0
+              ? '(empty — all tools disabled)'
+              : tools.join(', ');
+        logger.info({ jid: data.jid, tools: label }, 'Group tools updated');
+      } else {
+        logger.warn({ data }, 'set_group_tools: missing jid');
       }
       break;
 

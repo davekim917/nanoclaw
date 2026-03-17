@@ -600,6 +600,10 @@ function isToolEnabled(tools: string[] | undefined, name: string): boolean {
  * Extract scoped access entries from tools array (e.g. 'gmail:illysium' → ['illysium']).
  * Returns scopes and whether the tool is scope-restricted (no bare entry like 'gmail').
  */
+// Safe scope pattern: alphanumeric, hyphens, underscores only.
+// Rejects path traversal attempts like '../../.ssh' or absolute paths.
+const SAFE_SCOPE_RE = /^[a-zA-Z0-9_-]+$/;
+
 function extractToolScopes(
   tools: string[] | undefined,
   toolName: string,
@@ -607,7 +611,14 @@ function extractToolScopes(
   const scopes =
     tools
       ?.filter((t) => t.startsWith(`${toolName}:`))
-      .map((t) => t.split(':')[1]) ?? [];
+      .map((t) => t.split(':')[1])
+      .filter((scope) => {
+        if (!SAFE_SCOPE_RE.test(scope)) {
+          logger.warn({ scope, toolName }, 'Rejecting unsafe tool scope value');
+          return false;
+        }
+        return true;
+      }) ?? [];
   return {
     scopes,
     isScoped: scopes.length > 0 && !tools?.includes(toolName),
