@@ -83,6 +83,8 @@ import {
   setSessionV2,
   storeChatMetadata,
   storeMessage,
+  getPendingGateByJid,
+  resolveGate,
   touchSessionActivity,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
@@ -126,6 +128,12 @@ import { logger } from './logger.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
+
+// Gate protocol: approval/cancel keyword patterns (module-level to avoid recompilation)
+const GATE_APPROVE_PATTERN =
+  /^(approve[d]?|yes|go|proceed|do it|send it|lgtm|ok|confirmed?|ship it)$/;
+const GATE_CANCEL_PATTERN =
+  /^(cancel|no|stop|abort|don'?t|reject|nope|nevermind|never mind)$/;
 
 let lastTimestamp = '';
 let sessions = new Map<string, string>(); // V2: composite session keys
@@ -457,6 +465,78 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       return true;
     }
   }
+
+  // --- Gate resolution (check before normal agent dispatch) ---
+  // If a gate is pending for this group, check if the user is approving or cancelling.
+  // Gates are resolved by matching the last user message against approve/cancel keywords.
+  const pendingGate = getPendingGateByJid(chatJid);
+  if (pendingGate) {
+    const lastMsg = missedMessages[missedMessages.length - 1];
+    // Strip trigger pattern from message to get the actual content
+    const rawContent = lastMsg.content
+      .replace(triggerPattern, '')
+      .trim()
+      .toLowerCase();
+
+    if (GATE_APPROVE_PATTERN.test(rawContent)) {
+      resolveGate(pendingGate.id, 'approved');
+      logger.info(
+        { gateId: pendingGate.id, label: pendingGate.label },
+        'Gate approved by user',
+      );
+
+      // Advance cursor past the approval message
+      lastAgentTimestamp[chatJid] = lastMsg.timestamp;
+      saveState();
+
+      // Spawn Phase 2 agent with resume prompt
+      const resumePrompt =
+        pendingGate.resume_prompt ||
+        `The user approved gate "${pendingGate.label}". Call read_gate_context with gate_id "${pendingGate.id}" to retrieve the context data, then proceed.`;
+
+      const fullPrompt = `[SYSTEM: Gate "${pendingGate.label}" was approved. Gate ID: ${pendingGate.id}]\n\n${resumePrompt}`;
+
+      await channel.setTyping?.(chatJid, true);
+      await runAgent(
+        group,
+        fullPrompt,
+        chatJid,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        async (result) => {
+          if (result.result) {
+            const formatted = formatOutbound(result.result);
+            if (formatted) {
+              await channel.sendMessage(chatJid, formatted);
+            }
+          }
+        },
+      );
+      await channel.setTyping?.(chatJid, false);
+      return true;
+    } else if (GATE_CANCEL_PATTERN.test(rawContent)) {
+      resolveGate(pendingGate.id, 'cancelled');
+      logger.info(
+        { gateId: pendingGate.id, label: pendingGate.label },
+        'Gate cancelled by user',
+      );
+
+      // Advance cursor past the cancel message
+      lastAgentTimestamp[chatJid] = lastMsg.timestamp;
+      saveState();
+
+      await channel.sendMessage(
+        chatJid,
+        `Gate "${pendingGate.label}" cancelled.`,
+      );
+      return true;
+    }
+    // If the message doesn't match approve/cancel, fall through to normal processing
+    // (the user might be asking a different question while a gate is pending)
+  }
+  // --- End gate resolution ---
 
   // Topic classifier for threadless channels (WhatsApp, Telegram)
   // Discord/Slack use thread-as-session instead, so skip classifier for them.

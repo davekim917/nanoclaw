@@ -131,6 +131,20 @@ export interface Memory {
   updated_at: string;
 }
 
+export interface PendingGate {
+  id: string;
+  group_folder: string;
+  chat_jid: string;
+  label: string;
+  summary: string;
+  context_data: string | null; // JSON blob
+  resume_prompt: string | null;
+  session_key: string | null;
+  status: 'pending' | 'approved' | 'cancelled';
+  created_at: string;
+  resolved_at: string | null;
+}
+
 export interface BacklogItem {
   id: string;
   group_folder: string;

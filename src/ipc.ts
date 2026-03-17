@@ -15,12 +15,14 @@ import { AvailableGroup } from './container-runner.js';
 import {
   addBacklogItem,
   addShipLogEntry,
+  createGate,
   createTask,
   deleteBacklogItem,
   deleteTask,
   findMessageById,
   getBacklog,
   getBacklogItemById,
+  getGateById,
   getMessagesAroundTimestamp,
   getShipLog,
   getTaskById,
@@ -281,6 +283,13 @@ export async function processTaskIpc(
     memoryDescription?: string;
     memoryContent?: string;
     memoryFields?: Record<string, string>;
+    // For gate protocol
+    label?: string;
+    summary?: string;
+    context_data?: string;
+    resume_prompt?: string;
+    session_key?: string;
+    gateId?: string;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isMain: boolean, // Verified from directory path
@@ -850,6 +859,52 @@ export async function processTaskIpc(
       }
       break;
 
+    case 'request_gate':
+      if (data.label && data.summary) {
+        const gateId = `gate-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        // Find the chat JID for this group to send the gate message
+        let gateChatJid: string | undefined;
+        for (const [jid, g] of Object.entries(registeredGroups)) {
+          if (g.folder === sourceGroup) {
+            gateChatJid = jid;
+            break;
+          }
+        }
+
+        if (!gateChatJid) {
+          logger.warn(
+            { sourceGroup },
+            'request_gate: could not find chat JID for group',
+          );
+          break;
+        }
+
+        createGate({
+          id: gateId,
+          group_folder: sourceGroup,
+          chat_jid: data.chatJid || gateChatJid,
+          label: data.label,
+          summary: data.summary,
+          context_data: data.context_data || null,
+          resume_prompt: data.resume_prompt || null,
+          session_key: data.session_key || null,
+          status: 'pending',
+          created_at: new Date().toISOString(),
+        });
+
+        // Send gate notification to the group
+        const gateMsg = `⚠️ **Gate: ${data.label}**\n${data.summary}\n\nReply \`approve\` or \`cancel\`.`;
+        await deps.sendMessage(data.chatJid || gateChatJid, gateMsg);
+
+        logger.info(
+          { gateId, label: data.label, sourceGroup },
+          'Gate created via IPC',
+        );
+      } else {
+        logger.warn({ data }, 'request_gate missing label or summary');
+      }
+      break;
+
     default:
       logger.warn({ type: data.type }, 'Unknown IPC task type');
   }
@@ -908,6 +963,8 @@ function processQueryIpc(
     status?: string;
     // For memory queries
     memoryId?: string;
+    // For gate queries
+    gateId?: string;
   },
   sourceGroup: string,
   isMain: boolean,
@@ -1255,6 +1312,56 @@ function processQueryIpc(
           error: message,
         });
       }
+      break;
+    }
+
+    case 'read_gate_context': {
+      if (!data.gateId) {
+        writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
+          status: 'error',
+          error: 'Missing gateId',
+        });
+        break;
+      }
+
+      const gate = getGateById(data.gateId);
+      if (!gate) {
+        writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
+          status: 'error',
+          error: 'Gate not found',
+        });
+        break;
+      }
+
+      // Authorization: only the group that created the gate can read it
+      if (!isMain && gate.group_folder !== sourceGroup) {
+        logger.warn(
+          { sourceGroup, gateId: data.gateId },
+          'Unauthorized read_gate_context attempt blocked',
+        );
+        writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
+          status: 'error',
+          error: 'Unauthorized: gate not accessible to this group',
+        });
+        break;
+      }
+
+      logger.info(
+        { sourceGroup, gateId: data.gateId, gateStatus: gate.status },
+        'IPC read_gate_context query served',
+      );
+      writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
+        status: 'ok',
+        gate: {
+          id: gate.id,
+          label: gate.label,
+          summary: gate.summary,
+          context_data: gate.context_data,
+          status: gate.status,
+          created_at: gate.created_at,
+          resolved_at: gate.resolved_at,
+        },
+      });
       break;
     }
 

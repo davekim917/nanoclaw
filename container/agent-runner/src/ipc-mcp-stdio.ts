@@ -1058,6 +1058,119 @@ server.tool(
   },
 );
 
+// --- Gate protocol tools ---
+
+server.tool(
+  'request_gate',
+  `Pause the current task and ask the user for approval before continuing. The agent session ends cleanly after calling this — a new session resumes when the user approves.
+
+Use this when you're about to take an irreversible or high-impact action and need explicit human confirmation first. Examples:
+• Sending emails to customers
+• Deleting data or dropping tables
+• Merging PRs or deploying to production
+• Any bulk operation affecting external systems
+
+IMPORTANT: This tool is designed for team leads. If you are a teammate in an agent team, do NOT call this directly — instead, communicate with the lead via SendMessage and let the lead decide whether to gate.
+
+How it works:
+1. You call request_gate with a label, summary, and optionally structured context data
+2. The user sees your summary and is asked to approve or cancel
+3. If approved, a new agent session starts with your resume_prompt
+4. The new session calls read_gate_context to retrieve the structured context data you saved
+
+Tips:
+• Put structured data (lists, objects) in context_data — it's stored as JSON and survives across sessions
+• Keep resume_prompt short — it's the starting instruction for Phase 2
+• Include enough detail in summary for the user to make an informed decision`,
+  {
+    label: z.string().describe('Short label for the gate (e.g. "Send customer emails", "Drop tables")'),
+    summary: z.string().describe('Clear description of what will happen if approved — help the user make an informed decision'),
+    context_data: z.string().optional().describe('JSON string of structured data for Phase 2 (e.g. list of emails to send, tables to drop). Stored in DB, retrieved via read_gate_context.'),
+    resume_prompt: z.string().optional().describe('Instruction for the Phase 2 agent when the user approves (e.g. "User approved. Call read_gate_context to get the email list, then send them.")'),
+  },
+  async (args) => {
+    const data = {
+      type: 'request_gate',
+      chatJid,
+      label: args.label,
+      summary: args.summary,
+      context_data: args.context_data,
+      resume_prompt: args.resume_prompt,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(TASKS_DIR, data);
+
+    return {
+      content: [{ type: 'text' as const, text: `Gate requested: "${args.label}". The user will be asked to approve or cancel. Your session will end — a new session resumes if approved.` }],
+    };
+  },
+);
+
+server.tool(
+  'read_gate_context',
+  `Read the structured context data from an approved gate. Use this in Phase 2 (after the user approves a gate) to retrieve the data that Phase 1 saved.
+
+Workflow:
+1. Phase 1 calls request_gate with context_data
+2. User approves
+3. Phase 2 starts with the resume_prompt
+4. Phase 2 calls read_gate_context to get the saved context_data
+5. Phase 2 proceeds with the approved action
+
+The gate ID is provided in your resume prompt by the system.`,
+  {
+    gate_id: z.string().describe('The gate ID to read context from (provided in your resume prompt)'),
+  },
+  async (args) => {
+    try {
+      const requestId = writeQueryFile({
+        type: 'read_gate_context',
+        gateId: args.gate_id,
+      });
+
+      const response = await waitForResponse(requestId) as {
+        status: string;
+        error?: string;
+        gate?: {
+          id: string;
+          label: string;
+          summary: string;
+          context_data: string | null;
+          status: string;
+          created_at: string;
+          resolved_at: string | null;
+        };
+      };
+
+      if (response.status !== 'ok') {
+        return {
+          content: [{ type: 'text' as const, text: `Error: ${response.error || 'Unknown error'}` }],
+          isError: true,
+        };
+      }
+
+      const gate = response.gate;
+      if (!gate) {
+        return {
+          content: [{ type: 'text' as const, text: 'Gate not found.' }],
+          isError: true,
+        };
+      }
+
+      const contextStr = gate.context_data || '(no context data)';
+      return {
+        content: [{ type: 'text' as const, text: `Gate "${gate.label}" (${gate.status}):\n\nContext data:\n${contextStr}` }],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: 'text' as const, text: `Error reading gate context: ${err instanceof Error ? err.message : String(err)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
 // Start the stdio transport
 const transport = new StdioServerTransport();
 await server.connect(transport);

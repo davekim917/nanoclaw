@@ -10,6 +10,7 @@ import {
   BacklogItem,
   Memory,
   NewMessage,
+  PendingGate,
   RegisteredGroup,
   ScheduledTask,
   ShipLogEntry,
@@ -254,6 +255,26 @@ function createSchema(database: Database.Database): void {
   database.exec(`
     CREATE INDEX IF NOT EXISTS idx_ship_log_group ON ship_log(group_folder);
     CREATE INDEX IF NOT EXISTS idx_backlog_group ON backlog(group_folder);
+  `);
+
+  // Gate protocol — pause/resume for agent teams
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS pending_gates (
+      id TEXT PRIMARY KEY,
+      group_folder TEXT NOT NULL,
+      chat_jid TEXT NOT NULL,
+      label TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      context_data TEXT,
+      resume_prompt TEXT,
+      session_key TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at TEXT NOT NULL,
+      resolved_at TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_pending_gates_group ON pending_gates(group_folder);
+    CREATE INDEX IF NOT EXISTS idx_pending_gates_status ON pending_gates(status);
+    CREATE INDEX IF NOT EXISTS idx_pending_gates_chat_jid ON pending_gates(chat_jid, status);
   `);
 
   // Migrate existing sessions into sessions_v2 (skip if already migrated)
@@ -1690,6 +1711,67 @@ export function getBacklogResolvedSince(
       `SELECT * FROM backlog WHERE group_folder = ? AND resolved_at >= ? ORDER BY resolved_at ASC`,
     )
     .all(groupFolder, since) as BacklogItem[];
+}
+
+// --- Gate protocol ---
+
+export function createGate(gate: Omit<PendingGate, 'resolved_at'>): void {
+  db.prepare(
+    `INSERT INTO pending_gates (id, group_folder, chat_jid, label, summary, context_data, resume_prompt, session_key, status, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    gate.id,
+    gate.group_folder,
+    gate.chat_jid,
+    gate.label,
+    gate.summary,
+    gate.context_data,
+    gate.resume_prompt,
+    gate.session_key,
+    gate.status,
+    gate.created_at,
+  );
+}
+
+export function getGateById(id: string): PendingGate | null {
+  return (
+    (db
+      .prepare('SELECT * FROM pending_gates WHERE id = ?')
+      .get(id) as PendingGate) || null
+  );
+}
+
+export function getPendingGate(groupFolder: string): PendingGate | null {
+  return (
+    (db
+      .prepare(
+        `SELECT * FROM pending_gates WHERE group_folder = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1`,
+      )
+      .get(groupFolder) as PendingGate) || null
+  );
+}
+
+export function getPendingGateByJid(chatJid: string): PendingGate | null {
+  return (
+    (db
+      .prepare(
+        `SELECT id, group_folder, chat_jid, label, summary, resume_prompt, session_key, status, created_at, resolved_at
+         FROM pending_gates WHERE chat_jid = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1`,
+      )
+      .get(chatJid) as PendingGate) || null
+  );
+}
+
+export function resolveGate(
+  id: string,
+  status: 'approved' | 'cancelled',
+): boolean {
+  const result = db
+    .prepare(
+      `UPDATE pending_gates SET status = ?, resolved_at = ? WHERE id = ? AND status = 'pending'`,
+    )
+    .run(status, new Date().toISOString(), id);
+  return result.changes > 0;
 }
 
 // --- JSON migration ---
