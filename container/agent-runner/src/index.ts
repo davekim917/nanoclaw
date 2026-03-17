@@ -941,6 +941,7 @@ async function runQuery(
       allowedTools: buildAllowedTools(containerInput.tools),
       disallowedTools: buildDisallowedTools(containerInput.tools),
       env: sdkEnv,
+      ...(containerInput.model ? { model: containerInput.model } : {}),
       permissionMode: 'bypassPermissions',
       allowDangerouslySkipPermissions: true,
       settingSources: ['project', 'user'],
@@ -1003,10 +1004,17 @@ async function runQuery(
     if (message.type === 'result') {
       resultCount++;
       const textResult = 'result' in message ? (message as { result?: string }).result : null;
-      const modelUsage = 'modelUsage' in message ? (message as { modelUsage?: { contextWindow?: number; inputTokens?: number; outputTokens?: number; costUSD?: number } }).modelUsage : null;
       log(`Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
-      if (modelUsage) {
-        log(`Model usage: contextWindow=${modelUsage.contextWindow} inputTokens=${modelUsage.inputTokens} outputTokens=${modelUsage.outputTokens} costUSD=${modelUsage.costUSD}`);
+      // Log full result message keys and modelUsage to discover the actual shape
+      const msgAny = message as Record<string, unknown>;
+      if (msgAny.modelUsage) {
+        log(`Model usage: ${JSON.stringify(msgAny.modelUsage)}`);
+      } else {
+        // Check all top-level keys for usage-related fields
+        const usageKeys = Object.keys(msgAny).filter(k => k !== 'type' && k !== 'subtype' && k !== 'result');
+        if (usageKeys.length > 0) {
+          log(`Result extra keys: ${usageKeys.join(', ')} = ${JSON.stringify(Object.fromEntries(usageKeys.map(k => [k, msgAny[k]])))}`);
+        }
       }
       writeOutput({
         status: 'success',
@@ -1124,6 +1132,7 @@ async function main(): Promise<void> {
           systemPrompt: undefined,
           allowedTools: [],
           env: sdkEnv,
+          ...(containerInput.model ? { model: containerInput.model } : {}),
           permissionMode: 'bypassPermissions' as const,
           allowDangerouslySkipPermissions: true,
           settingSources: ['project', 'user'] as const,
