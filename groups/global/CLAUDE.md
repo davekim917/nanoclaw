@@ -261,6 +261,8 @@ The user can override the tone for any single message:
 
 The override applies to the current response only. Group default resumes next interaction.
 
+If the requested tone doesn't match a saved profile, interpret it as an ad-hoc style hint for this response only. See `tone-profiles/selection-guide.md` for full fallback rules.
+
 ## Response Style
 
 Structure every response for scannability — regardless of channel:

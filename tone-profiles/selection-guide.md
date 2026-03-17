@@ -45,6 +45,19 @@ The override applies to the current response only. The group default resumes on 
 
 Medieval is a humor profile — never assigned as a group default. Override only.
 
+### Unknown Tone Fallback
+
+When the user says "use X tone" but no `tone-profiles/{x}.md` file exists:
+
+1. **Check for a matching file first** — look for `tone-profiles/{x}.md` (case-insensitive, hyphenated). If found, use it.
+2. **If no file exists, treat it as an ad-hoc style hint** — interpret the word literally and adapt your response accordingly. "Use sarcastic tone" → the agent goes sarcastic for that message. No file needed.
+3. **Indicate what happened** — briefly note which mode you used so the user knows:
+   - Named profile: no note needed (this is normal)
+   - Ad-hoc: mention it once, e.g., "*(using sarcastic tone — ad-hoc, no saved profile)*"
+4. **Suggest persisting it** — if the user uses the same ad-hoc tone more than once, suggest: "Want me to save this as a profile? Use `/add-tone-profile` in nanoclaw-dev."
+
+Ad-hoc overrides are useful for one-offs — formalized profiles are better for consistency across sessions.
+
 ## Universal Rules
 
 ### Dave's Voice (professional, collaborative, direct)
