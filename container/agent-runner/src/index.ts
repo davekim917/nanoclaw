@@ -606,6 +606,7 @@ function buildAllowedTools(tools: string[] | undefined): string[] {
       allowed.push('mcp__google-calendar__*');
     }
   }
+  allowed.push('mcp__ollama__*');
   return allowed;
 }
 
@@ -731,6 +732,10 @@ function buildMcpServers(
       },
     };
   }
+  servers.ollama = {
+    command: 'node',
+    args: [path.join(path.dirname(mcpServerPath), 'ollama-mcp-stdio.js')],
+  };
   return servers;
 }
 
