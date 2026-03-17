@@ -1028,6 +1028,126 @@ server.tool(
   },
 );
 
+// --- Memory tools ---
+
+server.tool(
+  'save_memory',
+  `Save a memory for future conversations. Memories are automatically retrieved and injected into future prompts based on relevance.
+
+Types:
+- user: Facts about the user (role, preferences, expertise, communication style)
+- feedback: Guidance or corrections from the user that should change your behavior
+- project: Ongoing work, decisions, deadlines, context behind requests
+- reference: Pointers to external resources, URLs, systems, credentials
+
+Memories are keyword-searchable immediately. Semantic search activates once the embedding is generated (async, seconds after save).`,
+  {
+    name: z.string().describe('Short identifier (e.g. "Dave role", "no mock DBs in tests")'),
+    description: z.string().describe('One-line description — used to decide relevance in future conversations'),
+    content: z.string().describe('The memory content — can be multi-line, structured text'),
+    type: z.enum(['user', 'feedback', 'project', 'reference']).default('reference'),
+  },
+  async (args) => {
+    writeIpcFile(TASKS_DIR, {
+      type: 'save_memory',
+      memoryType: args.type,
+      memoryName: args.name,
+      memoryDescription: args.description,
+      memoryContent: args.content,
+    });
+    return { content: [{ type: 'text' as const, text: `Memory "${args.name}" saved.` }] };
+  },
+);
+
+server.tool(
+  'delete_memory',
+  'Delete a memory by ID. Use list_memories to find the ID first.',
+  {
+    memory_id: z.string().describe('The memory ID to delete (from list_memories)'),
+  },
+  async (args) => {
+    writeIpcFile(TASKS_DIR, {
+      type: 'delete_memory',
+      memoryId: args.memory_id,
+    });
+    return { content: [{ type: 'text' as const, text: `Memory ${args.memory_id} deletion queued.` }] };
+  },
+);
+
+server.tool(
+  'update_memory',
+  'Update an existing memory by ID. Only provide the fields you want to change.',
+  {
+    memory_id: z.string().describe('The memory ID to update (from list_memories)'),
+    name: z.string().optional(),
+    description: z.string().optional(),
+    content: z.string().optional(),
+    type: z.enum(['user', 'feedback', 'project', 'reference']).optional(),
+  },
+  async (args) => {
+    const fields: Record<string, string> = {};
+    if (args.name !== undefined) fields.name = args.name;
+    if (args.description !== undefined) fields.description = args.description;
+    if (args.content !== undefined) fields.content = args.content;
+    if (args.type !== undefined) fields.type = args.type;
+    writeIpcFile(TASKS_DIR, {
+      type: 'update_memory',
+      memoryId: args.memory_id,
+      memoryFields: fields,
+    });
+    return { content: [{ type: 'text' as const, text: `Memory ${args.memory_id} update queued.` }] };
+  },
+);
+
+server.tool(
+  'list_memories',
+  'List all memories for this group. Returns up to 50, most recently updated first.',
+  {},
+  async () => {
+    try {
+      const requestId = writeQueryFile({ type: 'list_memories' });
+      const response = await waitForResponse(requestId) as { status: string; memories?: Array<{ id: string; type: string; name: string; content: string; updated_at: string }>; error?: string };
+      if (response.status !== 'ok') {
+        return { content: [{ type: 'text' as const, text: `Error: ${response.error ?? 'unknown'}` }], isError: true };
+      }
+      const memories = response.memories ?? [];
+      if (memories.length === 0) {
+        return { content: [{ type: 'text' as const, text: 'No memories saved yet.' }] };
+      }
+      const formatted = memories.map((m) => `[${m.id}] (${m.type}) **${m.name}** — ${m.updated_at.slice(0, 10)}\n  ${m.content}`).join('\n\n');
+      return { content: [{ type: 'text' as const, text: formatted }] };
+    } catch (err) {
+      return { content: [{ type: 'text' as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  'search_memories',
+  'Keyword search across all memories for this group.',
+  {
+    query: z.string().describe('Search term — matches against name, description, and content'),
+    limit: z.number().int().min(1).max(20).default(6).optional(),
+  },
+  async (args) => {
+    try {
+      const requestId = writeQueryFile({ type: 'search_memories', query: args.query, limit: args.limit ?? 6 });
+      const response = await waitForResponse(requestId) as { status: string; memories?: Array<{ id: string; type: string; name: string; content: string; updated_at: string }>; error?: string };
+      if (response.status !== 'ok') {
+        return { content: [{ type: 'text' as const, text: `Error: ${response.error ?? 'unknown'}` }], isError: true };
+      }
+      const memories = response.memories ?? [];
+      if (memories.length === 0) {
+        return { content: [{ type: 'text' as const, text: `No memories found for "${args.query}".` }] };
+      }
+      const formatted = memories.map((m) => `[${m.id}] (${m.type}) **${m.name}**\n  ${m.content}`).join('\n\n');
+      return { content: [{ type: 'text' as const, text: formatted }] };
+    } catch (err) {
+      return { content: [{ type: 'text' as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+    }
+  },
+);
+
 // Start the stdio transport
 const transport = new StdioServerTransport();
 await server.connect(transport);
