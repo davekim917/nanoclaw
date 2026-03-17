@@ -121,11 +121,13 @@ If `~/.snowflake/connections.toml` exists, you have Snowflake access via the `sn
 snow sql -q "SELECT ..." -c <connection_name>
 ```
 
-Available connections are listed in `~/.snowflake/connections.toml`. Common ones:
-- `sunday` — Sunday/Prairie-Dev warehouse
-- `apollo`, `apollo_wgs`, `xzo_dev`, `xzo_prod` — XZO/Illysium warehouses
+Your available connections are listed in `~/.snowflake/connections.toml`. Check it to see which connections you have access to:
 
-Always specify `-c <connection>` to pick the right database. If unsure which connection to use, check `cat ~/.snowflake/connections.toml`.
+```bash
+cat ~/.snowflake/connections.toml
+```
+
+Always specify `-c <connection>` to pick the right database.
 
 ## dbt
 

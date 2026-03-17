@@ -50,6 +50,57 @@ When creating a team to tackle a complex task, follow these rules:
 
 ---
 
+## Snowflake
+
+If `~/.snowflake/connections.toml` exists, you have Snowflake access via the `snow` CLI. Use it to run queries:
+
+```bash
+snow sql -q "SELECT ..." -c <connection_name>
+```
+
+Available connections are listed in `~/.snowflake/connections.toml`. Common ones:
+- `apollo` — Apollo development warehouse
+- `apollo_wgs` — Apollo William Grant warehouse
+- `xzo_dev` — XZO development warehouse
+- `xzo_prod` — XZO production warehouse
+
+Always specify `-c <connection>` to pick the right database. If unsure which connection to use, check `cat ~/.snowflake/connections.toml`.
+
+**Python fallback:** If `snow sql` fails for any reason, you can also query Snowflake using the Python connector (installed in the snow venv):
+
+```bash
+/opt/snow-venv/bin/python3 -c "
+import snowflake.connector, tomllib, os
+
+with open(os.path.expanduser('~/.snowflake/connections.toml'), 'rb') as f:
+    config = tomllib.load(f)
+conn_cfg = config['<connection_name>']
+conn = snowflake.connector.connect(
+    account=conn_cfg['account'],
+    user=conn_cfg['user'],
+    private_key_file=conn_cfg['private_key_path'],
+    authenticator='SNOWFLAKE_JWT',
+    database=conn_cfg.get('database'),
+    schema=conn_cfg.get('schema'),
+    warehouse=conn_cfg.get('warehouse'),
+    role=conn_cfg.get('role'),
+)
+cur = conn.cursor()
+cur.execute('SELECT ...')
+for row in cur: print(row)
+conn.close()
+"
+```
+
+## dbt
+
+If `~/.dbt/profiles.yml` exists, you have dbt access via the `dbt` CLI:
+
+```bash
+dbt run --profiles-dir ~/.dbt --profile <profile_name> --project-dir <path_to_dbt_project>
+dbt test --profiles-dir ~/.dbt --profile <profile_name> --project-dir <path_to_dbt_project>
+```
+
 ## USER GENERATED — Snowflake & dbt Guardrails
 
 > These rules were added manually by Dave based on production learnings. Do not overwrite during re-bootstrap.
