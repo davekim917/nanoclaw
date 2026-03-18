@@ -171,7 +171,7 @@ export interface Channel {
   sendMessage(
     jid: string,
     text: string,
-    triggerMessageId?: string,
+    triggerMessageId?: string | null,
   ): Promise<void>;
   isConnected(): boolean;
   ownsJid(jid: string): boolean;

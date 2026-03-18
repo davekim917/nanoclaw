@@ -47,17 +47,9 @@ export class DiscordChannel implements Channel {
   private typingIntervals = new Map<string, ReturnType<typeof setInterval>>();
   // ── Discord thread state maps ──────────────────────────────────
   //
-  // pendingTopLevelMsgIds: TRANSIENT. FIFO queue of top-level message IDs
-  //   per parent channel JID, awaiting thread creation on first reply.
-  //   Using a queue (not last-in-wins) prevents a fast second message from
-  //   overwriting the first — each response pops the correct trigger ID.
-  //   Lost on restart = harmless (no thread created, response goes to channel).
-  //
   // createdThreadJid: TRANSIENT. Redirects subsequent sends for a
   //   conversation to the thread. Keyed by "parentJid:triggerMsgId" so
   //   concurrent conversations on the same channel each get their own thread.
-  //   Falls back to plain "parentJid" key when no triggerMessageId is provided
-  //   (e.g. session command responses).
   //
   // threadOriginMessage: PERSISTED (SQLite-backed with in-memory cache).
   //   Maps threadChannelId → originalMsgId so thread replies resolve to
@@ -65,7 +57,6 @@ export class DiscordChannel implements Channel {
   //   continuity across restarts — without it, Discord thread replies
   //   after restart create orphaned sessions.
   // ─────────────────────────────────────────────────────────────────
-  private pendingTopLevelMsgIds = new Map<string, string[]>();
   private createdThreadJid = new Map<string, string>();
   private threadOriginMessage = new Map<string, string>();
   private webhookCache = new Map<string, Webhook>();
@@ -275,15 +266,6 @@ export class DiscordChannel implements Channel {
         return;
       }
 
-      // Queue message ID for thread creation (top-level messages only).
-      // Using a FIFO queue prevents a rapid second message from overwriting
-      // the first: each response will pop the correct trigger message ID.
-      if (!isInThread) {
-        const queue = this.pendingTopLevelMsgIds.get(parentJid) ?? [];
-        queue.push(msgId);
-        this.pendingTopLevelMsgIds.set(parentJid, queue);
-      }
-
       // Store messages with the most specific JID:
       // - Thread messages use thread JID for session isolation
       // - Top-level messages use parent JID (thread created on first reply)
@@ -412,7 +394,7 @@ export class DiscordChannel implements Channel {
   async sendMessage(
     jid: string,
     text: string,
-    triggerMessageId?: string,
+    triggerMessageId?: string | null,
   ): Promise<void> {
     if (!this.client) {
       logger.warn('Discord client not initialized');
@@ -439,48 +421,35 @@ export class DiscordChannel implements Channel {
 
       // Thread creation: for top-level JIDs, create a thread from the
       // user's triggering message on first response.
-      if (!isThreadJid) {
-        // Prefer the explicit triggerMessageId supplied by the caller (index.ts
-        // passes effectiveThreadId so each conversation threads correctly even
-        // when two messages arrive before the first response is sent).
-        // Fall back to the FIFO queue for session commands that don't supply one.
-        let originalMsgId: string | undefined = triggerMessageId;
-        if (!originalMsgId) {
-          const queue = this.pendingTopLevelMsgIds.get(jid);
-          if (queue && queue.length > 0) {
-            originalMsgId = queue.shift();
-            if (queue.length === 0) {
-              this.pendingTopLevelMsgIds.delete(jid);
-            }
+      // Callers MUST pass an explicit triggerMessageId (string) to create a
+      // thread, or null to send directly to the channel. The old FIFO queue
+      // fallback has been removed — all callers now pass explicit values.
+      if (!isThreadJid && triggerMessageId) {
+        const threadId = await this.createThreadAndSend(
+          channelId,
+          triggerMessageId,
+          text,
+        );
+        if (threadId) {
+          // Redirect future sends for this conversation to the thread.
+          const threadJid = `dc:${channelId}:thread:${threadId}`;
+          this.createdThreadJid.set(convKey, threadJid);
+          // Map threadChannelId → originalMsgId so thread replies
+          // resolve to the same session as the top-level message.
+          // Write-through: persist to SQLite for restart survival.
+          this.threadOriginMessage.set(threadId, triggerMessageId);
+          try {
+            setThreadOrigin(threadId, triggerMessageId, jid);
+          } catch (err) {
+            logger.warn(
+              { threadId, triggerMessageId, jid, err },
+              'Failed to persist thread origin to SQLite',
+            );
           }
-        }
-        if (originalMsgId) {
-          const threadId = await this.createThreadAndSend(
-            channelId,
-            originalMsgId,
-            text,
-          );
-          if (threadId) {
-            // Redirect future sends for this conversation to the thread.
-            const threadJid = `dc:${channelId}:thread:${threadId}`;
-            this.createdThreadJid.set(convKey, threadJid);
-            // Map threadChannelId → originalMsgId so thread replies
-            // resolve to the same session as the top-level message.
-            // Write-through: persist to SQLite for restart survival.
-            this.threadOriginMessage.set(threadId, originalMsgId);
-            try {
-              setThreadOrigin(threadId, originalMsgId, jid);
-            } catch (err) {
-              logger.warn(
-                { threadId, originalMsgId, jid, err },
-                'Failed to persist thread origin to SQLite',
-              );
-            }
-            return;
-          }
-          // Fallback: createThreadAndSend already sent to channel on failure
           return;
         }
+        // Fallback: createThreadAndSend already sent to channel on failure
+        return;
       }
 
       const channel = await this.client.channels.fetch(channelId);
@@ -590,7 +559,7 @@ export class DiscordChannel implements Channel {
 
       const webhook = await this.getOrCreateWebhook(parentChannelId);
       if (!webhook) {
-        return this.sendMessage(jid, `**[${sender}]** ${originalText}`);
+        return this.sendMessage(jid, `**[${sender}]** ${originalText}`, null);
       }
 
       // Apply text transforms
@@ -642,7 +611,7 @@ export class DiscordChannel implements Channel {
         'Failed to send Discord swarm message',
       );
       try {
-        await this.sendMessage(jid, `**[${sender}]** ${originalText}`);
+        await this.sendMessage(jid, `**[${sender}]** ${originalText}`, null);
       } catch {
         // Already logged in sendMessage
       }
@@ -740,7 +709,7 @@ export class DiscordChannel implements Channel {
         'Failed to create Discord thread, falling back to channel',
       );
       // Fallback: send directly in channel
-      await this.sendMessage(`dc:${parentChannelId}`, text);
+      await this.sendMessage(`dc:${parentChannelId}`, text, null);
       return null;
     }
   }
@@ -848,7 +817,6 @@ export class DiscordChannel implements Channel {
           this.createdThreadJid.delete(key);
         }
       }
-      this.pendingTopLevelMsgIds.delete(parentJid);
     }
   }
 

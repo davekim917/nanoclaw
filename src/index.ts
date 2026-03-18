@@ -414,6 +414,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   if (missedMessages.length === 0) return true;
 
   // --- Session command interception (before trigger check) ---
+  // Use first message ID as the trigger for thread creation (session commands
+  // are immediate responses to the user's message).
+  const triggerMsgId = missedMessages[0]?.id;
   const cmdResult = await handleSessionCommand({
     missedMessages,
     isMainGroup,
@@ -421,7 +424,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     triggerPattern,
     timezone: TIMEZONE,
     deps: {
-      sendMessage: (text) => channel.sendMessage(chatJid, text),
+      sendMessage: (text) => channel.sendMessage(chatJid, text, triggerMsgId),
       setTyping: (typing) =>
         channel.setTyping?.(chatJid, typing) ?? Promise.resolve(),
       runAgent: (prompt, onOutput) =>
@@ -513,7 +516,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           if (result.result) {
             const formatted = formatOutbound(result.result);
             if (formatted) {
-              await channel.sendMessage(chatJid, formatted);
+              await channel.sendMessage(chatJid, formatted, triggerMsgId);
             }
           }
         },
@@ -534,6 +537,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       await channel.sendMessage(
         chatJid,
         `Gate "${pendingGate.label}" cancelled.`,
+        triggerMsgId,
       );
       return true;
     }
@@ -1547,6 +1551,7 @@ function recoverPendingMessages(): void {
         .sendMessage(
           threadJid,
           `_Service restarted — your last message wasn't processed. Please resend to continue._`,
+          null,
         )
         .catch((err: unknown) =>
           logger.warn(
@@ -1778,19 +1783,20 @@ async function main(): Promise<void> {
         process.cwd(),
       );
       if (result.ok) {
-        await channel.sendMessage(chatJid, result.url);
+        await channel.sendMessage(chatJid, result.url, msg.id);
       } else {
         await channel.sendMessage(
           chatJid,
           `Remote Control failed: ${result.error}`,
+          msg.id,
         );
       }
     } else {
       const result = stopRemoteControl();
       if (result.ok) {
-        await channel.sendMessage(chatJid, 'Remote Control session ended.');
+        await channel.sendMessage(chatJid, 'Remote Control session ended.', msg.id);
       } else {
-        await channel.sendMessage(chatJid, result.error);
+        await channel.sendMessage(chatJid, result.error, msg.id);
       }
     }
   }
@@ -1893,7 +1899,9 @@ async function main(): Promise<void> {
         logger.warn({ jid }, 'No channel owns JID, cannot send daily summary');
         return;
       }
-      await channel.sendMessage(jid, text);
+      // Pass null to explicitly skip thread creation — daily summaries
+      // are system-originated messages that should post to the channel directly.
+      await channel.sendMessage(jid, text, null);
     },
   });
 
@@ -1917,7 +1925,9 @@ async function main(): Promise<void> {
         return;
       }
       const text = formatOutbound(rawText);
-      if (text) await channel.sendMessage(jid, text);
+      // Pass null to explicitly skip thread creation — scheduled task output
+      // is system-originated and should post to the channel directly.
+      if (text) await channel.sendMessage(jid, text, null);
     },
   });
   startIpcWatcher({
@@ -1929,7 +1939,10 @@ async function main(): Promise<void> {
       if (sender && channel.sendSwarmMessage) {
         return channel.sendSwarmMessage(jid, text, sender);
       }
-      return channel.sendMessage(jid, text);
+      // Pass null: IPC messages are async — the pending message queue can't
+      // reliably match them to the right trigger message. If the container
+      // knows the thread JID it'll be in `jid`; otherwise send to channel.
+      return channel.sendMessage(jid, text, null);
     },
     registeredGroups: () => registeredGroups,
     registerGroup,

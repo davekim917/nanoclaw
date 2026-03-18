@@ -377,7 +377,7 @@ export class SlackChannel implements Channel {
   async sendMessage(
     jid: string,
     text: string,
-    triggerMessageId?: string,
+    triggerMessageId?: string | null,
   ): Promise<void> {
     const parsed = parseThreadJid(jid);
     const channelId = parsed ? parsed.parentId : jid.replace(/^slack:/, '');
@@ -393,9 +393,12 @@ export class SlackChannel implements Channel {
 
     const originalText = text;
     try {
+      // null = explicitly no thread (system messages), undefined = use fallback
       const threadTs = parsed
         ? parsed.threadId
-        : triggerMessageId || this.replyThreadTs.get(jid);
+        : triggerMessageId === null
+          ? undefined
+          : (triggerMessageId ?? this.replyThreadTs.get(jid));
       await this.postToSlack(channelId, text, threadTs);
       logger.info({ jid, length: text.length, threadTs }, 'Slack message sent');
     } catch (err) {
