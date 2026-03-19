@@ -931,21 +931,22 @@ describe('DiscordChannel', () => {
       expect(textChannel.send).toHaveBeenCalledWith('TRANSFORMED');
     });
 
-    it('does not show merge button without triggerMessageId even if text has PR URL', async () => {
+    it('does not show merge button when suppressActions is true', async () => {
       const opts = createTestOpts();
       const channel = new DiscordChannel('test-token', opts);
       await channel.connect();
 
-      // Send with null triggerMessageId (like scheduled tasks / IPC)
+      // Send with suppressActions (like daily summaries / scheduled tasks)
       await channel.sendMessage(
         'dc:1234567890123456',
         'Check out https://github.com/owner/repo/pull/1',
         null,
+        { suppressActions: true },
       );
 
       const textChannel =
         await currentClient().channels.fetch('1234567890123456');
-      // Called with plain text (no components) because triggerMessageId is absent
+      // Called with plain text (no components) because suppressActions is set
       expect(textChannel.send).toHaveBeenCalledWith(
         'Check out https://github.com/owner/repo/pull/1',
       );

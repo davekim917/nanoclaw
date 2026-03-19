@@ -1961,7 +1961,8 @@ async function main(): Promise<void> {
       }
       // Pass null to explicitly skip thread creation — daily summaries
       // are system-originated messages that should post to the channel directly.
-      await channel.sendMessage(jid, text, null);
+      // suppressActions: daily summaries list many team PRs — merge button would be dangerous.
+      await channel.sendMessage(jid, text, null, { suppressActions: true });
     },
   });
 
@@ -1987,7 +1988,8 @@ async function main(): Promise<void> {
       const text = formatOutbound(rawText);
       // Pass null to explicitly skip thread creation — scheduled task output
       // is system-originated and should post to the channel directly.
-      if (text) await channel.sendMessage(jid, text, null);
+      // suppressActions: scheduled output may list PRs the user didn't create.
+      if (text) await channel.sendMessage(jid, text, null, { suppressActions: true });
     },
   });
   startIpcWatcher({
