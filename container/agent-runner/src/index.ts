@@ -326,6 +326,37 @@ function createSanitizeBashHook(): HookCallback {
   };
 }
 
+// Block ad-hoc use of Python's snowflake.connector.
+// The snow CLI is gated by destructive-operation controls; the Python
+// connector bypasses them.  Only blocks direct python execution — grep,
+// echo, pip install, and existing scripts are unaffected.
+const SNOWFLAKE_CONNECTOR_EXEC_RE =
+  /\bpython[23]?\b.*\bsnowflake[._]connector\b/i;
+
+function createBlockSnowflakeConnectorHook(): HookCallback {
+  return async (input, _toolUseId, _context) => {
+    const preInput = input as PreToolUseHookInput;
+    const command = (preInput.tool_input as { command?: string })?.command;
+    if (!command) return {};
+
+    if (SNOWFLAKE_CONNECTOR_EXEC_RE.test(command)) {
+      return {
+        systemMessage:
+          'Direct use of Python snowflake.connector is blocked. ' +
+          'Use the `snow sql` CLI for ad-hoc queries. If snow is not working, ' +
+          'report the error to Dave instead of falling back to Python.',
+        hookSpecificOutput: {
+          hookEventName: 'PreToolUse',
+          permissionDecision: 'deny',
+          permissionDecisionReason:
+            'Python snowflake.connector bypasses destructive-operation controls. Use snow CLI instead.',
+        },
+      };
+    }
+    return {};
+  };
+}
+
 function sanitizeFilename(summary: string): string {
   return summary
     .toLowerCase()
@@ -951,7 +982,7 @@ async function runQuery(
       ...(effort ? { effort } : {}),
       hooks: {
         PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName, containerInput.threadId)] }],
-        PreToolUse: [{ matcher: 'Bash', hooks: [createSanitizeBashHook()] }],
+        PreToolUse: [{ matcher: 'Bash', hooks: [createBlockSnowflakeConnectorHook(), createSanitizeBashHook()] }],
       },
     }
   })) {

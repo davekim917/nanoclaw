@@ -33,17 +33,20 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
-# Install Snowflake CLI (snow)
-RUN apt-get update && apt-get install -y python3 python3-pip python3-venv \
-    && python3 -m venv /opt/snow-venv \
-    && /opt/snow-venv/bin/pip install snowflake-cli==3.15.0 \
-    && ln -s /opt/snow-venv/bin/snow /usr/local/bin/snow \
-    && rm -rf /var/lib/apt/lists/*
+# Install Snowflake CLI (snow) via .deb from Snowflake's package repo
+ARG SNOW_VERSION=3.15.0
+RUN UARCH=$(uname -m | sed 's/arm64/aarch64/') \
+    && curl -fsSL "https://sfc-repo.snowflakecomputing.com/snowflake-cli/linux_${UARCH}/${SNOW_VERSION}/snowflake-cli-${SNOW_VERSION}.${UARCH}.deb" \
+       -o /tmp/snowflake-cli.deb \
+    && dpkg -i /tmp/snowflake-cli.deb \
+    && rm /tmp/snowflake-cli.deb
 
-# Install dbt-core + dbt-snowflake adapter (separate venv to avoid connector conflicts with snow CLI)
-RUN python3 -m venv /opt/dbt-venv \
+# Install dbt-core + dbt-snowflake adapter
+RUN apt-get update && apt-get install -y python3 python3-pip python3-venv \
+    && python3 -m venv /opt/dbt-venv \
     && /opt/dbt-venv/bin/pip install dbt-core==1.11.7 dbt-snowflake==1.11.3 \
-    && ln -s /opt/dbt-venv/bin/dbt /usr/local/bin/dbt
+    && ln -s /opt/dbt-venv/bin/dbt /usr/local/bin/dbt \
+    && rm -rf /var/lib/apt/lists/*
 
 # Install Google Workspace MCP server (Drive, Sheets, Slides, Docs)
 RUN python3 -m venv /opt/gwmcp-venv \
@@ -68,6 +71,47 @@ RUN npm install -g \
     @anthropic-ai/claude-code \
     @gongrzhe/server-gmail-autoauth-mcp@1.1.11 \
     @cocal/google-calendar-mcp@2.6.1
+
+# Install PostgreSQL client and Google Cloud CLI
+RUN curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+       | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" \
+       > /etc/apt/sources.list.d/google-cloud-sdk.list \
+    && apt-get update && apt-get install -y --no-install-recommends \
+       postgresql-client \
+       google-cloud-cli \
+    && rm -rf /var/lib/apt/lists/* && apt-get clean
+
+# Install AWS CLI v2
+RUN ARCH=$(uname -m) \
+    && curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-${ARCH}.zip" -o /tmp/awscli.zip \
+    && unzip -q /tmp/awscli.zip -d /tmp \
+    && /tmp/aws/install \
+    && rm -rf /tmp/awscli.zip /tmp/aws
+
+# Install Render CLI, Railway CLI, and Supabase CLI
+ARG RENDER_VERSION=2.14.0
+ARG RAILWAY_VERSION=4.33.0
+ARG SUPABASE_VERSION=2.78.1
+RUN DPKG_ARCH=$(dpkg --print-architecture) && UARCH=$(uname -m) \
+    && curl -fsSL "https://github.com/render-oss/cli/releases/download/v${RENDER_VERSION}/cli_${RENDER_VERSION}_linux_${DPKG_ARCH}.zip" \
+       -o /tmp/render.zip \
+    && unzip -q /tmp/render.zip -d /tmp/render \
+    && mv /tmp/render/cli_v${RENDER_VERSION} /usr/local/bin/render \
+    && chmod +x /usr/local/bin/render \
+    && curl -fsSL "https://github.com/railwayapp/cli/releases/download/v${RAILWAY_VERSION}/railway-v${RAILWAY_VERSION}-${UARCH}-unknown-linux-musl.tar.gz" \
+       | tar xz -C /usr/local/bin railway \
+    && chmod +x /usr/local/bin/railway \
+    && curl -fsSL "https://github.com/supabase/cli/releases/download/v${SUPABASE_VERSION}/supabase_${SUPABASE_VERSION}_linux_${DPKG_ARCH}.deb" \
+       -o /tmp/supabase.deb \
+    && dpkg -i /tmp/supabase.deb \
+    && rm -rf /tmp/render.zip /tmp/render /tmp/supabase.deb
+
+# Install Cortex Code (Snowflake AI coding CLI)
+RUN HOME=/home/node curl -fsSL https://ai.snowflake.com/static/cc-scripts/install.sh \
+       | HOME=/home/node DOCKER_ENV=1 bash \
+    && chown -R node:node /home/node/.local
+ENV PATH="/home/node/.local/bin:${PATH}"
 
 # Create app directory
 WORKDIR /app

@@ -40,6 +40,26 @@ check_package_updates() {
     fi
   done < <(grep -E '==[0-9]+\.[0-9]+\.[0-9]+' Dockerfile | grep -v '^#')
 
+  # GitHub release packages: match ARG TOOL_VERSION=1.2.3
+  declare -A gh_repos=(
+    ["RENDER"]="render-oss/cli"
+    ["RAILWAY"]="railwayapp/cli"
+    ["SUPABASE"]="supabase/cli"
+  )
+  while IFS= read -r line; do
+    if [[ "$line" =~ ARG[[:space:]]+([A-Z]+)_VERSION=([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+      local name="${BASH_REMATCH[1]}"
+      local pinned="${BASH_REMATCH[2]}"
+      local repo="${gh_repos[$name]}"
+      [ -z "$repo" ] && continue
+      local latest
+      latest=$(gh release list --repo "$repo" --limit 1 --json tagName --jq '.[0].tagName' 2>/dev/null | sed 's/^v//') || continue
+      if [ "$pinned" != "$latest" ]; then
+        outdated+=("  $name: $pinned -> $latest (gh:$repo)")
+      fi
+    fi
+  done < <(grep -E '^ARG [A-Z]+_VERSION=' Dockerfile)
+
   if [ ${#outdated[@]} -gt 0 ]; then
     echo ""
     echo "Package updates available:"

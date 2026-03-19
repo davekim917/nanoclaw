@@ -142,6 +142,8 @@ cat ~/.snowflake/connections.toml
 
 Always specify `-c <connection>` to pick the right database.
 
+**IMPORTANT:** When running ad-hoc Snowflake queries, only use the `snow` CLI. Do NOT fall back to Python's snowflake.connector as a workaround when `snow` fails — report the error to Dave instead. The `snow` CLI is gated by the destructive operation hook; direct Python connector usage bypasses it. This applies to ad-hoc queries only — dbt and existing project scripts that use the connector internally are fine.
+
 ## dbt
 
 If `~/.dbt/profiles.yml` exists, you have dbt access via the `dbt` CLI. Use it to run models, tests, and compile SQL:
