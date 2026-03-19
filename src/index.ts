@@ -93,6 +93,10 @@ import { startIpcWatcher } from './ipc.js';
 import { extractMemoriesAsync } from './memory-extractor.js';
 import { getMemoryBlock } from './memory-store.js';
 import {
+  ensureCommitDigestTask,
+  registerCommitDigestHandler,
+} from './commit-digest.js';
+import {
   ensureDailyNotifierTask,
   registerDailyNotifierHandler,
 } from './daily-notifications.js';
@@ -1935,6 +1939,14 @@ async function main(): Promise<void> {
 
   // Start session sweep (idle session cleanup)
   startSessionSweep();
+
+  // Commit digest: scans repos for direct commits to default branch and creates ship log entries.
+  // Runs 10 min before daily summary so the notification includes the latest commits.
+  // Must be registered BEFORE startSchedulerLoop so the handler exists for the first poll.
+  ensureCommitDigestTask();
+  registerCommitDigestHandler({
+    registeredGroups: () => registeredGroups,
+  });
 
   // Daily summary: persistent scheduled task (survives restarts, catches up on missed runs)
   // Must be registered BEFORE startSchedulerLoop so the handler exists for the first poll.

@@ -257,6 +257,17 @@ function createSchema(database: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_backlog_group ON backlog(group_folder);
   `);
 
+  // Commit digest — tracks last-scanned commit per repo for ship log auto-population
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS commit_digest_state (
+      repo_path TEXT PRIMARY KEY,
+      group_folder TEXT NOT NULL,
+      last_commit_sha TEXT NOT NULL,
+      last_scan TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_commit_digest_group ON commit_digest_state(group_folder);
+  `);
+
   // Gate protocol — pause/resume for agent teams
   database.exec(`
     CREATE TABLE IF NOT EXISTS pending_gates (
@@ -1620,6 +1631,32 @@ export function getShipLogSince(
       `SELECT * FROM ship_log WHERE group_folder = ? AND shipped_at >= ? ORDER BY shipped_at ASC`,
     )
     .all(groupFolder, since) as ShipLogEntry[];
+}
+
+// --- Commit digest state accessors ---
+
+export interface CommitDigestState {
+  repo_path: string;
+  group_folder: string;
+  last_commit_sha: string;
+  last_scan: string;
+}
+
+export function getCommitDigestState(
+  repoPath: string,
+): CommitDigestState | null {
+  return (
+    (db
+      .prepare('SELECT * FROM commit_digest_state WHERE repo_path = ?')
+      .get(repoPath) as CommitDigestState) || null
+  );
+}
+
+export function upsertCommitDigestState(state: CommitDigestState): void {
+  db.prepare(
+    `INSERT OR REPLACE INTO commit_digest_state (repo_path, group_folder, last_commit_sha, last_scan)
+     VALUES (?, ?, ?, ?)`,
+  ).run(state.repo_path, state.group_folder, state.last_commit_sha, state.last_scan);
 }
 
 // --- Backlog accessors ---

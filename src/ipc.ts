@@ -39,6 +39,7 @@ import {
   searchMemoriesKeyword,
   updateMemory,
 } from './memory-store.js';
+import { runCommitDigestForGroup } from './commit-digest.js';
 import { getActivitySummary } from './daily-notifications.js';
 import { searchThreads } from './thread-search.js';
 import { isValidGroupFolder } from './group-folder.js';
@@ -1292,6 +1293,29 @@ function processQueryIpc(
           writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
             status: 'error',
             error: 'Failed to get activity summary',
+          });
+        });
+      break;
+    }
+
+    case 'scan_commits': {
+      runCommitDigestForGroup(sourceGroup, registeredGroups)
+        .then((result) => {
+          logger.info(
+            { sourceGroup, ...result },
+            'IPC scan_commits completed',
+          );
+          writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
+            status: 'ok',
+            repos: result.repos,
+            commits: result.commits,
+          });
+        })
+        .catch((err) => {
+          logger.warn({ sourceGroup, err }, 'Failed to scan commits');
+          writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
+            status: 'error',
+            error: 'Failed to scan commits',
           });
         });
       break;
