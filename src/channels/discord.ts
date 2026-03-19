@@ -396,6 +396,7 @@ export class DiscordChannel implements Channel {
     jid: string,
     text: string,
     triggerMessageId?: string | null,
+    options?: import('../types.js').SendMessageOptions,
   ): Promise<void> {
     if (!this.client) {
       logger.warn('Discord client not initialized');
@@ -465,12 +466,9 @@ export class DiscordChannel implements Channel {
       // Collapse --- horizontal rules (and surrounding blank lines) into a single blank line
       text = text.replace(/\n*^\s*---\s*$\n*/gm, '\n\n');
       ({ text } = transformTablesInText('discord', text));
-      // Only show merge button for agent responses (triggerMessageId is set),
-      // not for scheduled tasks or IPC send_message calls which may mention
-      // unrelated PRs (e.g., daily summaries listing team PRs).
-      const components = triggerMessageId
-        ? this.buildPrButtons(text)
-        : undefined;
+      const components = options?.suppressActions
+        ? undefined
+        : this.buildPrButtons(text);
       await this.sendChunked(textChannel, text, components);
       logger.info({ jid, length: text.length }, 'Discord message sent');
     } catch (err) {

@@ -170,6 +170,11 @@ export interface BacklogItem {
 
 // --- Channel abstraction ---
 
+export interface SendMessageOptions {
+  /** When true, suppress interactive elements like merge buttons. */
+  suppressActions?: boolean;
+}
+
 export interface Channel {
   name: string;
   connect(): Promise<void>;
@@ -177,6 +182,7 @@ export interface Channel {
     jid: string,
     text: string,
     triggerMessageId?: string | null,
+    options?: SendMessageOptions,
   ): Promise<void>;
   isConnected(): boolean;
   ownsJid(jid: string): boolean;
