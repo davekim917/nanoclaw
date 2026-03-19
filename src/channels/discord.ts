@@ -920,9 +920,7 @@ export class DiscordChannel implements Channel {
     interaction: ChatInputCommandInteraction,
   ): Promise<void> {
     await interaction.deferReply();
-    await interaction.editReply(
-      'Checking for container package updates...',
-    );
+    await interaction.editReply('Checking for container package updates...');
 
     const prompt =
       'Check for container package updates. Read the Dockerfile at ' +
