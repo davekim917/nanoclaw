@@ -72,13 +72,14 @@ RUN npm install -g \
     @gongrzhe/server-gmail-autoauth-mcp@1.1.11 \
     @cocal/google-calendar-mcp@2.6.1
 
-# Install PostgreSQL client and Google Cloud CLI
+# Install PostgreSQL client, Redis CLI, and Google Cloud CLI
 RUN curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
        | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg \
     && echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" \
        > /etc/apt/sources.list.d/google-cloud-sdk.list \
     && apt-get update && apt-get install -y --no-install-recommends \
        postgresql-client \
+       redis-tools \
        google-cloud-cli \
     && rm -rf /var/lib/apt/lists/* && apt-get clean
 

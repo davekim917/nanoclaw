@@ -24,7 +24,7 @@ import {
   WORKTREE_CACHE_DIR,
   escapeRegex,
 } from './config.js';
-import { readEnvFile } from './env.js';
+import { readEnvFile, readEnvFileMatching } from './env.js';
 import {
   assertValidThreadId,
   resolveGroupFolderPath,
@@ -668,6 +668,32 @@ function extractToolScopes(
     scopes,
     isScoped: scopes.length > 0 && !tools?.includes(toolName),
   };
+}
+
+/**
+ * Filter INI/TOML-style config file sections.
+ * Splits content on section headers ([name]) and keeps only allowed ones.
+ * Used for AWS credentials/config and Snowflake connections.toml.
+ */
+function filterConfigSections(
+  content: string,
+  allowed: string[],
+  opts?: {
+    headerTransform?: (header: string) => string;
+    alwaysInclude?: Set<string>;
+  },
+): string {
+  const sections = content.split(/^(?=\[)/m);
+  return sections
+    .filter((section) => {
+      const match = section.match(/^\[([^\]]+)\]/);
+      if (!match) return !section.trim(); // keep blank preamble
+      const header = match[1].trim();
+      if (opts?.alwaysInclude?.has(header)) return true;
+      const name = opts?.headerTransform?.(header) ?? header;
+      return allowed.includes(name);
+    })
+    .join('');
 }
 
 // Per-group mutex for serializing worktree creation (git locks .git/worktrees/)
@@ -1926,15 +1952,7 @@ function buildVolumeMounts(
           .replace(homePattern, '/home/node/.snowflake/');
 
         if (filterConnections) {
-          // Split TOML into sections and keep only allowed ones
-          const sections = tomlContent.split(/^(?=\[)/m);
-          tomlContent = sections
-            .filter((section) => {
-              const match = section.match(/^\[([^\]]+)\]/);
-              if (!match) return !section.trim(); // keep blank preamble
-              return allowedConns.includes(match[1]);
-            })
-            .join('');
+          tomlContent = filterConfigSections(tomlContent, allowedConns);
         }
 
         const connTomlPath = path.join(stagingDir, 'connections.toml');
@@ -2002,6 +2020,128 @@ function buildVolumeMounts(
           readonly: false,
         });
       }
+    }
+  }
+
+  // AWS credentials — gated by tools config.
+  // 'aws' = all profiles, 'aws:apollo' = only the [apollo] profile (plus [default]).
+  if (isToolEnabled(tools, 'aws')) {
+    const awsDir = path.join(homeDir, '.aws');
+    if (fs.existsSync(awsDir)) {
+      const { scopes: allowedProfiles, isScoped: filterProfiles } =
+        extractToolScopes(tools, 'aws');
+
+      const stagingDir = path.join(
+        DATA_DIR,
+        'sessions',
+        group.folder,
+        'aws',
+      );
+      fs.mkdirSync(stagingDir, { recursive: true });
+
+      const defaultSet = new Set(['default']);
+
+      // Stage credentials file ([default] + allowed profiles)
+      const origCreds = path.join(awsDir, 'credentials');
+      if (fs.existsSync(origCreds)) {
+        let content = fs.readFileSync(origCreds, 'utf-8');
+        if (filterProfiles) {
+          content = filterConfigSections(content, allowedProfiles, {
+            alwaysInclude: defaultSet,
+          });
+        }
+        fs.writeFileSync(path.join(stagingDir, 'credentials'), content, {
+          mode: 0o600,
+        });
+      }
+
+      // Stage config file ([default] + [profile <name>] for allowed profiles)
+      const origConfig = path.join(awsDir, 'config');
+      if (fs.existsSync(origConfig)) {
+        let content = fs.readFileSync(origConfig, 'utf-8');
+        if (filterProfiles) {
+          content = filterConfigSections(content, allowedProfiles, {
+            headerTransform: (h) => h.replace(/^profile\s+/, ''),
+            alwaysInclude: defaultSet,
+          });
+        }
+        fs.writeFileSync(path.join(stagingDir, 'config'), content, {
+          mode: 0o600,
+        });
+      }
+
+      mounts.push({
+        hostPath: stagingDir,
+        containerPath: '/home/node/.aws',
+        readonly: true,
+      });
+    }
+  }
+
+  // Google Cloud credentials — gated by tools config.
+  // 'gcloud:sunday' → mounts the key file named by GCLOUD_KEY_SUNDAY in .env
+  // from ~/.gcloud-keys/ and sets GOOGLE_APPLICATION_CREDENTIALS.
+  // 'gcloud' (unscoped) → mounts all key files from ~/.gcloud-keys/.
+  if (isToolEnabled(tools, 'gcloud')) {
+    const gcloudKeysDir = path.join(homeDir, '.gcloud-keys');
+    if (fs.existsSync(gcloudKeysDir)) {
+      const { scopes: gcloudScopes, isScoped: gcloudScoped } =
+        extractToolScopes(tools, 'gcloud');
+
+      const containerKeysDir = '/home/node/.gcloud-keys';
+      const stagingDir = path.join(
+        DATA_DIR,
+        'sessions',
+        group.folder,
+        'gcloud-keys',
+      );
+      fs.mkdirSync(stagingDir, { recursive: true });
+
+      if (gcloudScoped) {
+        // Read GCLOUD_KEY_<SCOPE> from .env to get the key filename for each scope
+        const envKeys = gcloudScopes.map(
+          (s) => `GCLOUD_KEY_${s.toUpperCase()}`,
+        );
+        const keyMap = readEnvFile(envKeys);
+
+        for (const s of gcloudScopes) {
+          const envKey = `GCLOUD_KEY_${s.toUpperCase()}`;
+          const keyFile = keyMap[envKey];
+          if (!keyFile) {
+            logger.warn(
+              { scope: s, envKey },
+              'gcloud key file mapping not found in .env',
+            );
+            continue;
+          }
+          const srcPath = path.join(gcloudKeysDir, keyFile);
+          if (!fs.existsSync(srcPath)) {
+            logger.warn({ srcPath }, 'gcloud key file not found');
+            continue;
+          }
+          const destPath = path.join(stagingDir, keyFile);
+          fs.copyFileSync(srcPath, destPath);
+          fs.chmodSync(destPath, 0o600);
+        }
+        // GOOGLE_APPLICATION_CREDENTIALS is set in readSecrets() using the same
+        // GCLOUD_KEY_<SCOPE> mapping.
+      } else {
+        // Unscoped: copy all key files
+        for (const entry of fs.readdirSync(gcloudKeysDir)) {
+          const srcPath = path.join(gcloudKeysDir, entry);
+          if (fs.statSync(srcPath).isFile() && entry.endsWith('.json')) {
+            const destPath = path.join(stagingDir, entry);
+            fs.copyFileSync(srcPath, destPath);
+            fs.chmodSync(destPath, 0o600);
+          }
+        }
+      }
+
+      mounts.push({
+        hostPath: stagingDir,
+        containerPath: containerKeysDir,
+        readonly: true,
+      });
     }
   }
 
@@ -2153,6 +2293,7 @@ function readSecrets(
     ...(isToolEnabled(tools, 'google-workspace')
       ? ['GOOGLE_OAUTH_CLIENT_ID', 'GOOGLE_OAUTH_CLIENT_SECRET']
       : []),
+    ...(isToolEnabled(tools, 'railway') ? ['RAILWAY_TOKEN'] : []),
   ];
   const secrets = readEnvFile(envKeys);
 
@@ -2182,6 +2323,57 @@ function readSecrets(
     if (secrets[scoped]) {
       secrets[generic] = secrets[scoped];
       delete secrets[scoped];
+    }
+  }
+
+  // Google Cloud credentials — set GOOGLE_APPLICATION_CREDENTIALS for gcloud/gsutil.
+  // Key files are mounted by prepareMounts(); here we just set the env var.
+  if (isToolEnabled(tools, 'gcloud')) {
+    const { scopes: gcloudScopes, isScoped: gcloudScoped } =
+      extractToolScopes(tools, 'gcloud');
+
+    if (gcloudScoped && gcloudScopes.length > 0) {
+      const gcloudEnvKeys = gcloudScopes.map(
+        (s) => `GCLOUD_KEY_${s.toUpperCase()}`,
+      );
+      const gcloudKeyMap = readEnvFile(gcloudEnvKeys);
+      // Use the first scope's key file for GOOGLE_APPLICATION_CREDENTIALS
+      const firstEnvKey = gcloudEnvKeys[0];
+      const keyFile = gcloudKeyMap[firstEnvKey];
+      if (keyFile) {
+        secrets.GOOGLE_APPLICATION_CREDENTIALS = `/home/node/.gcloud-keys/${keyFile}`;
+      }
+    }
+  }
+
+  // Render credentials — gated by tools config.
+  // 'render:illysium' → RENDER_API_KEY_ILLYSIUM + all RENDER_PG_*/RENDER_REDIS_* for that scope.
+  // Scope portion is stripped from key names inside the container.
+  if (isToolEnabled(tools, 'render')) {
+    const { scopes: renderScopes, isScoped: renderScoped } = extractToolScopes(
+      tools,
+      'render',
+    );
+    const renderScope = renderScoped ? renderScopes[0].toUpperCase() : scope; // scope = groupFolder.toUpperCase()
+    const scopeToken = `_${renderScope}_`;
+    const apiKeyName = `RENDER_API_KEY_${renderScope}`;
+
+    // Single .env pass: API key + all PG/Redis connection strings for this scope
+    const renderVars = readEnvFileMatching(
+      (key) =>
+        key === apiKeyName ||
+        ((key.startsWith('RENDER_PG_') || key.startsWith('RENDER_REDIS_')) &&
+          key.includes(scopeToken)),
+    );
+
+    // Normalize: API key → RENDER_API_KEY, connection strings → strip scope
+    if (renderVars[apiKeyName]) {
+      secrets.RENDER_API_KEY = renderVars[apiKeyName];
+    }
+    for (const [key, value] of Object.entries(renderVars)) {
+      if (key !== apiKeyName) {
+        secrets[key.replace(scopeToken, '_')] = value;
+      }
     }
   }
 

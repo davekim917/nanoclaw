@@ -41,12 +41,17 @@ export interface ContainerConfig {
   //            'google-workspace', 'google-workspace:<account>' (e.g. 'google-workspace:illysium'),
   //            'dbt', 'dbt:<profile>' (e.g. 'dbt:sunday-snowflake-db', 'dbt:apollo-snowflake'),
   //            'snowflake', 'snowflake:<connection>' (e.g. 'snowflake:sunday', 'snowflake:apollo'),
-  //            'github', 'github:<scope>' (e.g. 'github:illysium' → reads GITHUB_TOKEN_ILLYSIUM from .env)
+  //            'github', 'github:<scope>' (e.g. 'github:illysium' → reads GITHUB_TOKEN_ILLYSIUM from .env),
+  //            'render', 'render:<scope>' (e.g. 'render:illysium' → API key + PG/Redis URLs for that scope),
+  //            'aws', 'aws:<profile>' (e.g. 'aws:apollo' → only [apollo] + [default] from ~/.aws/),
+  //            'railway' (passes RAILWAY_TOKEN env var),
+  //            'gcloud', 'gcloud:<scope>' (e.g. 'gcloud:sunday' → mounts key from GCLOUD_KEY_SUNDAY)
   // Account-specific gmail mounts only that account's credentials as the default.
   // Account-specific calendar stages a filtered tokens.json with only allowed accounts.
   // Account-specific google-workspace stages filtered credential files (email.json) for allowed accounts.
   // Connection-specific snowflake filters connections.toml to only allowed sections + keys.
   // Scope-specific github reads GITHUB_TOKEN_<SCOPE> from .env instead of global GITHUB_TOKEN.
+  // Scope-specific render reads RENDER_API_KEY_<SCOPE>, RENDER_PG_*_<SCOPE>_*, RENDER_REDIS_*_<SCOPE>_*.
   tools?: string[];
   tone?: string; // Default tone profile name (e.g. "assistant", "engineering"). Read from tone-profiles/{name}.md
   globalContext?: boolean; // Mount groups/global/ into container (default true; set false for shared groups)
