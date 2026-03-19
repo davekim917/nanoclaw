@@ -1039,6 +1039,44 @@ server.tool(
 );
 
 server.tool(
+  'scan_commits',
+  'Scan git repos for direct commits to the default branch and add them to the ship log. Useful when you want to capture recent pushes to main/master that were not made through PRs. Runs automatically before the daily summary, but you can trigger it manually with this tool.',
+  {},
+  async () => {
+    try {
+      const requestId = writeQueryFile({ type: 'scan_commits' });
+      const response = await waitForResponse(requestId) as {
+        status: string;
+        error?: string;
+        repos?: number;
+        commits?: number;
+      };
+
+      if (response.status !== 'ok') {
+        return {
+          content: [{ type: 'text' as const, text: `Error: ${response.error || 'Unknown error'}` }],
+          isError: true,
+        };
+      }
+
+      const repos = response.repos ?? 0;
+      const commits = response.commits ?? 0;
+
+      if (commits === 0) {
+        return { content: [{ type: 'text' as const, text: `Scanned ${repos} repo(s) — no new direct commits found.` }] };
+      }
+
+      return { content: [{ type: 'text' as const, text: `Scanned ${repos} repo(s), found ${commits} new direct commit(s). Ship log entries created.` }] };
+    } catch (err) {
+      return {
+        content: [{ type: 'text' as const, text: `Error: ${err instanceof Error ? err.message : String(err)}` }],
+        isError: true,
+      };
+    }
+  },
+);
+
+server.tool(
   'update_plugin',
   'Update the bootstrap plugin by pulling latest changes from its remote repository. Only available to the main group.',
   {},
