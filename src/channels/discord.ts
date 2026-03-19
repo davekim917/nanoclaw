@@ -1059,6 +1059,26 @@ export class DiscordChannel implements Channel {
     await sendTyping();
     this.typingIntervals.set(jid, setInterval(sendTyping, 8000));
   }
+
+  /**
+   * Resolve a parent JID to its active thread JID for IPC routing.
+   * When a container sends IPC messages using its NANOCLAW_CHAT_JID (parent),
+   * this resolves to the thread JID created by the streaming output path.
+   * Returns the original JID if no thread redirect is found.
+   */
+  resolveIpcJid(jid: string): string {
+    // Already a thread JID — no resolution needed
+    if (parseThreadJid(jid)) return jid;
+
+    // Scan for any active thread redirect from this parent channel
+    // Match both bare-JID keys and prefixed keys (consistent with sendSwarmMessage)
+    for (const [key, threadJid] of this.createdThreadJid) {
+      if (key === jid || key.startsWith(`${jid}:`)) {
+        return threadJid;
+      }
+    }
+    return jid;
+  }
 }
 
 registerChannel('discord', (opts: ChannelOpts) => {

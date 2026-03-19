@@ -201,6 +201,10 @@ export interface Channel {
   // Discord uses webhooks, Slack uses username override.
   // Channels that don't implement this fall back to normal sendMessage.
   sendSwarmMessage?(jid: string, text: string, sender: string): Promise<void>;
+  // Optional: resolve a parent JID to its active thread JID for IPC routing.
+  // When a container sends IPC messages using its NANOCLAW_CHAT_JID (parent),
+  // this resolves to the thread JID created by the streaming output path.
+  resolveIpcJid?(jid: string): string;
 }
 
 // Callback type that channels use to deliver inbound messages

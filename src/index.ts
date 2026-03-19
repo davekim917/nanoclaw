@@ -158,6 +158,12 @@ let webUI: WebUIHandle | null = null;
 // Key: parentJid, Value: debounce timer
 const debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
+// Track JIDs where IPC send_message was used to deliver output.
+// Prevents the "finished processing" safety net from firing when the agent
+// sent its actual response via IPC but streaming output only contained <internal> tags.
+// Key: chatJid (parent or thread), cleared after container exits.
+const ipcOutputSentJids = new Set<string>();
+
 // Throttle touchSessionActivity to max once per 30s per session key
 const lastTouchTime = new Map<string, number>();
 
@@ -969,7 +975,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       if (result.status === 'success' && result.idle) {
         // Agent is truly idle (between queries, waiting for new IPC
         // input).  Safe to mark idle and allow preemption.
-        if (!outputSentToUser && !result.result) {
+        const ipcSentOutput = ipcOutputSentJids.has(chatJid);
+        if (!outputSentToUser && !ipcSentOutput && !result.result) {
           logger.warn(
             { group: group.name },
             'Agent completed with no text output',
@@ -1001,7 +1008,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // Safety net: if the container exited without ever sending output to the user
   // (e.g. closedDuringQuery prevented the idle marker, or the SDK produced no
   // result text), send a fallback message so the user isn't left hanging.
-  if (!outputSentToUser && output !== 'error' && !hadError) {
+  // Skip if IPC send_message already delivered output (agent responded via IPC
+  // but streaming output only contained <internal> tags).
+  const ipcSentOutput = ipcOutputSentJids.has(chatJid);
+  if (!outputSentToUser && !ipcSentOutput && output !== 'error' && !hadError) {
     logger.warn(
       { group: group.name },
       'Container exited without sending any output to user',
@@ -1019,6 +1029,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       );
     }
   }
+  // Clear IPC output tracking for this container run
+  ipcOutputSentJids.delete(chatJid);
 
   // Clear stale thread redirect state so the next conversation (or scheduled
   // task) for this channel doesn't accidentally send into the old thread.
@@ -1940,13 +1952,19 @@ async function main(): Promise<void> {
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
       text = stripInternalTags(text);
       if (!text) return Promise.resolve();
+      // Resolve parent JID → thread JID when the container only knows
+      // the parent (NANOCLAW_CHAT_JID set before thread was created).
+      const resolvedJid = channel.resolveIpcJid?.(jid) ?? jid;
+      // Track that IPC output was sent for this JID so the "finished
+      // processing" safety net doesn't fire a false positive.
+      // Only track thread-specific JIDs — NOT parentJid, which is shared
+      // across concurrent threads and would cause cross-contamination.
+      ipcOutputSentJids.add(jid);
+      if (resolvedJid !== jid) ipcOutputSentJids.add(resolvedJid);
       if (sender && channel.sendSwarmMessage) {
-        return channel.sendSwarmMessage(jid, text, sender);
+        return channel.sendSwarmMessage(resolvedJid, text, sender);
       }
-      // Pass null: IPC messages are async — the pending message queue can't
-      // reliably match them to the right trigger message. If the container
-      // knows the thread JID it'll be in `jid`; otherwise send to channel.
-      return channel.sendMessage(jid, text, null);
+      return channel.sendMessage(resolvedJid, text, null);
     },
     registeredGroups: () => registeredGroups,
     registerGroup,
