@@ -1955,8 +1955,11 @@ function buildVolumeMounts(
           tomlContent = filterConfigSections(tomlContent, allowedConns);
         }
 
+        // Stage as 0o644 so container user (UID 1000) can read files staged by
+        // host (UID 1001). The entrypoint copies to a node-owned dir and tightens
+        // to 0o600 before snow CLI runs.
         const connTomlPath = path.join(stagingDir, 'connections.toml');
-        fs.writeFileSync(connTomlPath, tomlContent, { mode: 0o600 });
+        fs.writeFileSync(connTomlPath, tomlContent, { mode: 0o644 });
 
         // Rewrite config.toml log path for container home
         const origConfig = path.join(snowflakeDir, 'config.toml');
@@ -1968,7 +1971,7 @@ function buildVolumeMounts(
             path.join(stagingDir, 'config.toml'),
             configContent,
             {
-              mode: 0o600,
+              mode: 0o644,
             },
           );
         }
@@ -2008,7 +2011,7 @@ function buildVolumeMounts(
               const destPath = path.join(destKeysDir, relPath);
               fs.mkdirSync(path.dirname(destPath), { recursive: true });
               fs.copyFileSync(srcPath, destPath);
-              fs.chmodSync(destPath, 0o600);
+              fs.chmodSync(destPath, 0o644);
             }
           }
         }
@@ -2031,12 +2034,7 @@ function buildVolumeMounts(
       const { scopes: allowedProfiles, isScoped: filterProfiles } =
         extractToolScopes(tools, 'aws');
 
-      const stagingDir = path.join(
-        DATA_DIR,
-        'sessions',
-        group.folder,
-        'aws',
-      );
+      const stagingDir = path.join(DATA_DIR, 'sessions', group.folder, 'aws');
       fs.mkdirSync(stagingDir, { recursive: true });
 
       const defaultSet = new Set(['default']);
@@ -2329,8 +2327,10 @@ function readSecrets(
   // Google Cloud credentials — set GOOGLE_APPLICATION_CREDENTIALS for gcloud/gsutil.
   // Key files are mounted by prepareMounts(); here we just set the env var.
   if (isToolEnabled(tools, 'gcloud')) {
-    const { scopes: gcloudScopes, isScoped: gcloudScoped } =
-      extractToolScopes(tools, 'gcloud');
+    const { scopes: gcloudScopes, isScoped: gcloudScoped } = extractToolScopes(
+      tools,
+      'gcloud',
+    );
 
     if (gcloudScoped && gcloudScopes.length > 0) {
       const gcloudEnvKeys = gcloudScopes.map(

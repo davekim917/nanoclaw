@@ -1075,7 +1075,10 @@ export class DiscordChannel implements Channel {
       const msg = await this.fetchDiscordMessage(jid, messageId);
       if (msg) await msg.react(emoji);
     } catch (err) {
-      logger.debug({ jid, messageId, emoji, err }, 'Failed to add Discord reaction');
+      logger.debug(
+        { jid, messageId, emoji, err },
+        'Failed to add Discord reaction',
+      );
     }
   }
 
@@ -1093,7 +1096,10 @@ export class DiscordChannel implements Channel {
       );
       if (botReaction) await botReaction.users.remove();
     } catch (err) {
-      logger.debug({ jid, messageId, emoji, err }, 'Failed to remove Discord reaction');
+      logger.debug(
+        { jid, messageId, emoji, err },
+        'Failed to remove Discord reaction',
+      );
     }
   }
 

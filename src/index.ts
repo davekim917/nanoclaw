@@ -980,7 +980,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             channel
               .removeReaction?.(chatJid, thinkingReactionMsg, '💭')
               ?.catch((err: unknown) =>
-                logger.debug({ chatJid, err }, 'Failed to remove thinking reaction'),
+                logger.debug(
+                  { chatJid, err },
+                  'Failed to remove thinking reaction',
+                ),
               );
           }
           outputSentToUser = true;
