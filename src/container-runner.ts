@@ -1955,11 +1955,8 @@ function buildVolumeMounts(
           tomlContent = filterConfigSections(tomlContent, allowedConns);
         }
 
-        // Stage as 0o644 so container user (UID 1000) can read files staged by
-        // host (UID 1001). The entrypoint copies to a node-owned dir and tightens
-        // to 0o600 before snow CLI runs.
         const connTomlPath = path.join(stagingDir, 'connections.toml');
-        fs.writeFileSync(connTomlPath, tomlContent, { mode: 0o644 });
+        fs.writeFileSync(connTomlPath, tomlContent, { mode: 0o600 });
 
         // Rewrite config.toml log path for container home
         const origConfig = path.join(snowflakeDir, 'config.toml');
@@ -1971,7 +1968,7 @@ function buildVolumeMounts(
             path.join(stagingDir, 'config.toml'),
             configContent,
             {
-              mode: 0o644,
+              mode: 0o600,
             },
           );
         }
@@ -2011,7 +2008,7 @@ function buildVolumeMounts(
               const destPath = path.join(destKeysDir, relPath);
               fs.mkdirSync(path.dirname(destPath), { recursive: true });
               fs.copyFileSync(srcPath, destPath);
-              fs.chmodSync(destPath, 0o644);
+              fs.chmodSync(destPath, 0o600);
             }
           }
         }
@@ -2086,7 +2083,6 @@ function buildVolumeMounts(
       const { scopes: gcloudScopes, isScoped: gcloudScoped } =
         extractToolScopes(tools, 'gcloud');
 
-      const containerKeysDir = '/home/node/.gcloud-keys';
       const stagingDir = path.join(
         DATA_DIR,
         'sessions',
@@ -2097,13 +2093,12 @@ function buildVolumeMounts(
 
       if (gcloudScoped) {
         // Read GCLOUD_KEY_<SCOPE> from .env to get the key filename for each scope
-        const envKeys = gcloudScopes.map(
-          (s) => `GCLOUD_KEY_${s.toUpperCase()}`,
+        const envKeysByScope = new Map(
+          gcloudScopes.map((s) => [s, `GCLOUD_KEY_${s.toUpperCase()}`]),
         );
-        const keyMap = readEnvFile(envKeys);
+        const keyMap = readEnvFile([...envKeysByScope.values()]);
 
-        for (const s of gcloudScopes) {
-          const envKey = `GCLOUD_KEY_${s.toUpperCase()}`;
+        for (const [s, envKey] of envKeysByScope) {
           const keyFile = keyMap[envKey];
           if (!keyFile) {
             logger.warn(
@@ -2137,7 +2132,7 @@ function buildVolumeMounts(
 
       mounts.push({
         hostPath: stagingDir,
-        containerPath: containerKeysDir,
+        containerPath: '/home/node/.gcloud-keys',
         readonly: true,
       });
     }

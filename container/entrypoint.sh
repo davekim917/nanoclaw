@@ -16,20 +16,7 @@ export XDG_CACHE_HOME=/tmp/.chromium
 if [ -n "$RESIDENTIAL_PROXY_URL" ]; then
   export AGENT_BROWSER_PROXY="$RESIDENTIAL_PROXY_URL"
 fi
-# Fix Snowflake config ownership: host stages files as UID 1001 but container
-# runs as node (1000). snow CLI .deb enforces strict owner + mode 0600 checks.
-# Copy to a node-owned dir and redirect via SNOWFLAKE_HOME.
-if [ -d /home/node/.snowflake/keys ] || [ -f /home/node/.snowflake/connections.toml ]; then
-  SF_DIR=/tmp/.snowflake
-  mkdir -p "$SF_DIR/logs"
-  cp -r /home/node/.snowflake/* "$SF_DIR/" 2>/dev/null || true
-  chmod 600 "$SF_DIR"/*.toml 2>/dev/null || true
-  find "$SF_DIR/keys" -type d -exec chmod 700 {} + 2>/dev/null || true
-  find "$SF_DIR/keys" -type f -exec chmod 600 {} + 2>/dev/null || true
-  # Rewrite all paths (logs, key files) from old mount to new SNOWFLAKE_HOME
-  sed -i 's|/home/node/.snowflake/|/tmp/.snowflake/|g' "$SF_DIR/config.toml" "$SF_DIR/connections.toml" 2>/dev/null || true
-  export SNOWFLAKE_HOME="$SF_DIR"
-fi
+
 # Configure git/gh auth if GITHUB_TOKEN is present in secrets
 GH_TOKEN=$(node -e 'try{const d=JSON.parse(require("fs").readFileSync("/tmp/input.json","utf8"));if(d.secrets?.GITHUB_TOKEN)process.stdout.write(d.secrets.GITHUB_TOKEN)}catch{}' 2>/dev/null)
 if [ -n "$GH_TOKEN" ]; then

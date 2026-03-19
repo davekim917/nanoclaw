@@ -33,17 +33,15 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
-# Install Snowflake CLI (snow) via .deb from Snowflake's package repo
-ARG SNOW_VERSION=3.15.0
-RUN UARCH=$(uname -m | sed 's/arm64/aarch64/') \
-    && curl -fsSL "https://sfc-repo.snowflakecomputing.com/snowflake-cli/linux_${UARCH}/${SNOW_VERSION}/snowflake-cli-${SNOW_VERSION}.${UARCH}.deb" \
-       -o /tmp/snowflake-cli.deb \
-    && dpkg -i /tmp/snowflake-cli.deb \
-    && rm /tmp/snowflake-cli.deb
+# Install Snowflake CLI (snow)
+RUN apt-get update && apt-get install -y python3 python3-pip python3-venv \
+    && python3 -m venv /opt/snow-venv \
+    && /opt/snow-venv/bin/pip install snowflake-cli==3.15.0 \
+    && ln -s /opt/snow-venv/bin/snow /usr/local/bin/snow \
+    && rm -rf /var/lib/apt/lists/*
 
 # Install dbt-core + dbt-snowflake adapter
-RUN apt-get update && apt-get install -y python3 python3-pip python3-venv \
-    && python3 -m venv /opt/dbt-venv \
+RUN python3 -m venv /opt/dbt-venv \
     && /opt/dbt-venv/bin/pip install dbt-core==1.11.7 dbt-snowflake==1.11.3 \
     && ln -s /opt/dbt-venv/bin/dbt /usr/local/bin/dbt \
     && rm -rf /var/lib/apt/lists/*
@@ -139,11 +137,8 @@ RUN mkdir -p /workspace/group /workspace/global /workspace/extra /workspace/ipc/
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
-# Set ownership to node user (non-root) for writable directories.
-# chmod 777 on /home/node and .local so the container works when run
-# as the host UID (--user 1001:1001) for bind-mount compatibility.
-RUN chown -R node:node /workspace && chmod 777 /home/node \
-    && chmod -R 777 /home/node/.local
+# Set ownership to node user (non-root) for writable directories
+RUN chown -R node:node /workspace && chmod 777 /home/node
 
 # Claude Code user settings (applied via settingSources: ['user'])
 RUN mkdir -p /home/node/.claude && \
