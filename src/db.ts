@@ -1164,9 +1164,7 @@ export function getTaskRunLogs(
 ): { data: TaskRunLogRow[]; total: number } {
   const total = (
     db
-      .prepare(
-        'SELECT COUNT(*) AS c FROM task_run_logs WHERE task_id = ?',
-      )
+      .prepare('SELECT COUNT(*) AS c FROM task_run_logs WHERE task_id = ?')
       .get(taskId) as { c: number }
   ).c;
   const data = db
@@ -1373,9 +1371,7 @@ export function getSessionsV2Full(
 ): { data: SessionV2Full[]; total: number } {
   const total = (
     db
-      .prepare(
-        'SELECT COUNT(*) AS c FROM sessions_v2 WHERE group_folder = ?',
-      )
+      .prepare('SELECT COUNT(*) AS c FROM sessions_v2 WHERE group_folder = ?')
       .get(groupFolder) as { c: number }
   ).c;
   const data = db
@@ -1708,7 +1704,12 @@ export function upsertCommitDigestState(state: CommitDigestState): void {
   db.prepare(
     `INSERT OR REPLACE INTO commit_digest_state (repo_path, group_folder, last_commit_sha, last_scan)
      VALUES (?, ?, ?, ?)`,
-  ).run(state.repo_path, state.group_folder, state.last_commit_sha, state.last_scan);
+  ).run(
+    state.repo_path,
+    state.group_folder,
+    state.last_commit_sha,
+    state.last_scan,
+  );
 }
 
 // --- Backlog accessors ---
@@ -2169,9 +2170,7 @@ export function getShipLogPaginated(
 ): { data: ShipLogEntry[]; total: number } {
   const total = (
     db
-      .prepare(
-        'SELECT COUNT(*) AS c FROM ship_log WHERE group_folder = ?',
-      )
+      .prepare('SELECT COUNT(*) AS c FROM ship_log WHERE group_folder = ?')
       .get(groupFolder) as { c: number }
   ).c;
   const data = db
@@ -2205,9 +2204,7 @@ export function getBacklogPaginated(
   }
   const total = (
     db
-      .prepare(
-        'SELECT COUNT(*) AS c FROM backlog WHERE group_folder = ?',
-      )
+      .prepare('SELECT COUNT(*) AS c FROM backlog WHERE group_folder = ?')
       .get(groupFolder) as { c: number }
   ).c;
   const data = db
@@ -2228,9 +2225,7 @@ export function listMemoriesPaginated(
 ): { data: Memory[]; total: number } {
   const total = (
     db
-      .prepare(
-        'SELECT COUNT(*) AS c FROM memories WHERE group_folder = ?',
-      )
+      .prepare('SELECT COUNT(*) AS c FROM memories WHERE group_folder = ?')
       .get(groupFolder) as { c: number }
   ).c;
   const data = db
@@ -2267,9 +2262,9 @@ export function getAllTasksPaginated(
   offset: number = 0,
 ): { data: ScheduledTask[]; total: number } {
   const total = (
-    db
-      .prepare('SELECT COUNT(*) AS c FROM scheduled_tasks')
-      .get() as { c: number }
+    db.prepare('SELECT COUNT(*) AS c FROM scheduled_tasks').get() as {
+      c: number;
+    }
   ).c;
   const data = db
     .prepare(
@@ -2277,4 +2272,43 @@ export function getAllTasksPaginated(
     )
     .all(limit, offset) as ScheduledTask[];
   return { data, total };
+}
+
+// --- Capability detection helpers (used by api/capabilities.ts) ---
+
+/** Check if sqlite-vec extension is loaded. */
+export function isVecLoaded(): boolean {
+  return vecLoaded;
+}
+
+/** Count total backlog items across all groups. */
+export function countAllBacklog(): number {
+  const row = db
+    .prepare('SELECT COUNT(*) AS c FROM backlog')
+    .get() as { c: number };
+  return row.c;
+}
+
+/** Count total ship log entries across all groups. */
+export function countAllShipLog(): number {
+  const row = db
+    .prepare('SELECT COUNT(*) AS c FROM ship_log')
+    .get() as { c: number };
+  return row.c;
+}
+
+/** Count total indexed thread metadata rows. */
+export function countThreadMetadata(): number {
+  const row = db
+    .prepare('SELECT COUNT(*) AS c FROM thread_metadata')
+    .get() as { c: number };
+  return row.c;
+}
+
+/** Count total pending gates (any status). */
+export function countPendingGates(): number {
+  const row = db
+    .prepare('SELECT COUNT(*) AS c FROM pending_gates')
+    .get() as { c: number };
+  return row.c;
 }

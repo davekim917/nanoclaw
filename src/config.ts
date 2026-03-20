@@ -193,8 +193,7 @@ export const WEB_UI_TOKEN =
   process.env.WEB_UI_TOKEN || envConfig.WEB_UI_TOKEN || '';
 
 // Allowed CORS origins for the web UI (comma-separated in .env)
-const rawOrigins =
-  process.env.WEB_UI_ORIGINS || envConfig.WEB_UI_ORIGINS || '';
+const rawOrigins = process.env.WEB_UI_ORIGINS || envConfig.WEB_UI_ORIGINS || '';
 export const WEB_UI_ORIGINS: string[] = rawOrigins
   .split(',')
   .map((s) => s.trim())
