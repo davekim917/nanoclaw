@@ -16,6 +16,17 @@ const ALLOWED_HEADERS = 'Authorization, Content-Type';
 const MAX_AGE = '86400'; // 24 hours
 
 /**
+ * Check if an origin is in the WEB_UI_ORIGINS allowlist.
+ * Returns true if origin is allowed, false otherwise.
+ * Used by both CORS middleware and WebSocket upgrade validation.
+ */
+export function isOriginAllowed(origin: string | undefined): boolean {
+  if (!origin) return false;
+  if (WEB_UI_ORIGINS.length === 0) return false;
+  return WEB_UI_ORIGINS.includes(origin);
+}
+
+/**
  * Apply CORS headers if the request's Origin matches WEB_UI_ORIGINS.
  * Returns true if this was an OPTIONS preflight (response already sent).
  * Returns false if request should continue to route matching.
@@ -33,7 +44,7 @@ export function handleCors(
   if (WEB_UI_ORIGINS.length === 0) return false;
 
   // Check if this origin is in the allowlist
-  if (!WEB_UI_ORIGINS.includes(origin)) {
+  if (!isOriginAllowed(origin)) {
     // Non-matching origin — no CORS headers, but don't block the request
     // (the browser will reject the response without CORS headers)
     if (req.method === 'OPTIONS') {

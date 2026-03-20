@@ -51,6 +51,7 @@ interface CacheEntry {
 }
 
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+const MAX_CACHE_ENTRIES = 50;
 const marketplaceCache = new Map<string, CacheEntry>();
 
 // --- Install job tracking ---
@@ -58,6 +59,11 @@ const marketplaceCache = new Map<string, CacheEntry>();
 const installJobs = new Map<string, SkillInstallJob>();
 const MAX_JOBS = 100;
 const MAX_OUTPUT_BYTES = 1_048_576; // 1MB
+
+// --- Installed skills cache (60s TTL — skills only change on install which triggers restart) ---
+
+let cachedInstalledSkills: { data: InstalledSkill[]; timestamp: number } | null = null;
+const INSTALLED_SKILLS_TTL_MS = 60_000;
 
 // --- Installed skills ---
 
@@ -90,6 +96,11 @@ function parseFrontmatter(content: string): {
  * Read installed skills from container/skills/ and per-group skill directories.
  */
 export function getInstalledSkills(): InstalledSkill[] {
+  const now = Date.now();
+  if (cachedInstalledSkills && now - cachedInstalledSkills.timestamp < INSTALLED_SKILLS_TTL_MS) {
+    return cachedInstalledSkills.data;
+  }
+
   const skills: InstalledSkill[] = [];
   const projectRoot = process.cwd();
 
@@ -185,6 +196,7 @@ export function getInstalledSkills(): InstalledSkill[] {
     }
   }
 
+  cachedInstalledSkills = { data: skills, timestamp: Date.now() };
   return skills;
 }
 
@@ -291,6 +303,18 @@ export async function searchMarketplace(query: string): Promise<{
 
         const data = parseSkillsOutput(stdout || stderr || '');
         marketplaceCache.set(cacheKey, { data, timestamp: Date.now() });
+        // Evict oldest entry if cache exceeds max size
+        if (marketplaceCache.size > MAX_CACHE_ENTRIES) {
+          let oldestKey: string | null = null;
+          let oldestTs = Infinity;
+          for (const [key, entry] of marketplaceCache) {
+            if (entry.timestamp < oldestTs) {
+              oldestTs = entry.timestamp;
+              oldestKey = key;
+            }
+          }
+          if (oldestKey) marketplaceCache.delete(oldestKey);
+        }
         resolve({ data });
       },
     );

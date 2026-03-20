@@ -7,11 +7,11 @@
  */
 import crypto from 'crypto';
 import { IncomingMessage, Server } from 'http';
-import { URL } from 'url';
 import { WebSocket, WebSocketServer } from 'ws';
 
-import { WEB_UI_ORIGINS, WEB_UI_SENDER_NAME } from '../config.js';
+import { WEB_UI_SENDER_NAME } from '../config.js';
 import { logger } from '../logger.js';
+import { isOriginAllowed } from './cors.js';
 import type { Capabilities, WsServerMessage } from './types.js';
 
 // --- Rate limiting ---
@@ -145,17 +145,10 @@ function checkRateLimit(tokenHash: string): boolean {
 
 function validateOrigin(req: IncomingMessage): boolean {
   const origin = req.headers.origin;
-
   // No Origin header (same-origin / non-browser) — allow
   if (!origin) return true;
-
-  // No origins configured — only allow same-origin (no Origin header)
-  // But we already checked that. If origins is empty and origin IS present,
-  // reject to prevent cross-site WebSocket hijacking in bundled mode.
-  if (WEB_UI_ORIGINS.length === 0) return false;
-
-  // Check allowlist
-  return WEB_UI_ORIGINS.includes(origin);
+  // Delegate to shared origin validation
+  return isOriginAllowed(origin);
 }
 
 // --- Init ---
@@ -172,7 +165,6 @@ export function initWebSocket(
   broadcastWs: (
     sessionKey: string,
     group: string,
-    threadId: string | undefined,
     event: unknown,
   ) => void;
   notifyWsSessionStart: (
@@ -185,7 +177,7 @@ export function initWebSocket(
   notifyWsSkillInstall: (
     jobId: string,
     output: string,
-    status: string,
+    status: 'running' | 'completed' | 'failed',
   ) => void;
 } {
   const wss = new WebSocketServer({ noServer: true, maxPayload: 65_536 });
@@ -360,39 +352,37 @@ export function initWebSocket(
 
   // --- Broadcast functions ---
 
-  function broadcastWs(
-    sessionKey: string,
-    group: string,
-    threadId: string | undefined,
-    event: unknown,
+  /**
+   * Send data to all matching WS clients, with optional group filtering and backpressure.
+   * When skipBackpressure is true, messages are always sent (for lifecycle events).
+   */
+  function broadcastToWsClients(
+    data: string,
+    opts?: { group?: string; skipBackpressure?: boolean },
   ): void {
-    const msg: WsServerMessage = {
-      type: 'progress',
-      sessionKey,
-      group,
-      event,
-    };
-    const data = JSON.stringify(msg);
-    pushToRingBuffer(data, group);
-
+    const group = opts?.group;
+    const skipBackpressure = opts?.skipBackpressure ?? false;
     for (const client of wsClients) {
-      // Group filter
-      if (
-        client.subscribedGroups !== null &&
-        !client.subscribedGroups.has(group)
-      ) {
+      if (group !== undefined && client.subscribedGroups !== null && !client.subscribedGroups.has(group)) {
         continue;
       }
-
-      // Backpressure: drop progress events when bufferedAmount > 1MB
-      if (client.ws.bufferedAmount > BACKPRESSURE_THRESHOLD) {
-        continue; // Drop progress (non-critical)
+      if (!skipBackpressure && client.ws.bufferedAmount > BACKPRESSURE_THRESHOLD) {
+        continue;
       }
-
       if (client.ws.readyState === WebSocket.OPEN) {
         client.ws.send(data);
       }
     }
+  }
+
+  function broadcastWs(
+    sessionKey: string,
+    group: string,
+    event: unknown,
+  ): void {
+    const data = JSON.stringify({ type: 'progress', sessionKey, group, event } satisfies WsServerMessage);
+    pushToRingBuffer(data, group);
+    broadcastToWsClients(data, { group });
   }
 
   function notifyWsSessionStart(
@@ -401,62 +391,24 @@ export function initWebSocket(
     groupJid: string,
     threadId?: string,
   ): void {
-    const msg: WsServerMessage = {
-      type: 'session_start',
-      sessionKey,
-      group,
-      groupJid,
-      threadId,
-    };
-    const data = JSON.stringify(msg);
+    const data = JSON.stringify({ type: 'session_start', sessionKey, group, groupJid, threadId } satisfies WsServerMessage);
     pushToRingBuffer(data, group);
-
-    for (const client of wsClients) {
-      if (
-        client.subscribedGroups !== null &&
-        !client.subscribedGroups.has(group)
-      ) {
-        continue;
-      }
-      // Lifecycle events are always sent (no backpressure drop)
-      if (client.ws.readyState === WebSocket.OPEN) {
-        client.ws.send(data);
-      }
-    }
+    broadcastToWsClients(data, { group, skipBackpressure: true });
   }
 
   function notifyWsSessionEnd(sessionKey: string): void {
-    const msg: WsServerMessage = { type: 'session_end', sessionKey };
-    const data = JSON.stringify(msg);
+    const data = JSON.stringify({ type: 'session_end', sessionKey } satisfies WsServerMessage);
     pushToRingBuffer(data, '');
-
-    for (const client of wsClients) {
-      // No group filter — session_end doesn't include group info
-      // Lifecycle events are always sent
-      if (client.ws.readyState === WebSocket.OPEN) {
-        client.ws.send(data);
-      }
-    }
+    broadcastToWsClients(data, { skipBackpressure: true });
   }
 
   function notifyWsSkillInstall(
     jobId: string,
     output: string,
-    status: string,
+    status: 'running' | 'completed' | 'failed',
   ): void {
-    const msg: WsServerMessage = {
-      type: 'skill_install_progress',
-      jobId,
-      output,
-      status,
-    };
-    const data = JSON.stringify(msg);
-
-    for (const client of wsClients) {
-      if (client.ws.readyState === WebSocket.OPEN) {
-        client.ws.send(data);
-      }
-    }
+    const data = JSON.stringify({ type: 'skill_install_progress', jobId, output, status } satisfies WsServerMessage);
+    broadcastToWsClients(data, { skipBackpressure: true });
   }
 
   return {

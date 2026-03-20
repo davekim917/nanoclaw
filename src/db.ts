@@ -1039,6 +1039,14 @@ export function getTaskById(id: string): ScheduledTask | undefined {
     | undefined;
 }
 
+/** Check if a task with the given ID exists. More efficient than getTaskById when only presence is needed. */
+export function taskExistsById(id: string): boolean {
+  const row = db
+    .prepare('SELECT 1 FROM scheduled_tasks WHERE id = ? LIMIT 1')
+    .get(id);
+  return row !== undefined;
+}
+
 export function getTasksForGroup(groupFolder: string): ScheduledTask[] {
   return db
     .prepare(
@@ -2085,6 +2093,7 @@ export function searchMemoriesKeyword(
   groupFolder: string,
   query: string,
   topK = 6,
+  offset = 0,
 ): Memory[] {
   const term = `%${query}%`;
   return db
@@ -2094,9 +2103,24 @@ export function searchMemoriesKeyword(
        WHERE group_folder = ?
          AND (name LIKE ? OR description LIKE ? OR content LIKE ?)
        ORDER BY updated_at DESC
-       LIMIT ?`,
+       LIMIT ? OFFSET ?`,
     )
-    .all(groupFolder, term, term, term, topK) as Memory[];
+    .all(groupFolder, term, term, term, topK, offset) as Memory[];
+}
+
+export function countMemoriesKeyword(
+  groupFolder: string,
+  query: string,
+): number {
+  const term = `%${query}%`;
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS c FROM memories
+       WHERE group_folder = ?
+         AND (name LIKE ? OR description LIKE ? OR content LIKE ?)`,
+    )
+    .get(groupFolder, term, term, term) as { c: number };
+  return row.c;
 }
 
 export function searchMemoriesVec(

@@ -8,6 +8,7 @@ import { IncomingMessage, ServerResponse } from 'http';
 import { URL } from 'url';
 
 import {
+  countMemoriesKeyword,
   getAllTasksPaginated,
   getBacklogPaginated,
   getRecentMessages,
@@ -30,16 +31,9 @@ import {
   searchMarketplace,
   startSkillInstall,
 } from './skills.js';
-import type { Capabilities } from './types.js';
+import type { ActiveSession, Capabilities } from './types.js';
 
 // --- Deps ---
-
-interface ActiveSession {
-  group: string;
-  groupJid: string;
-  threadId?: string;
-  startedAt: string;
-}
 
 export interface RouteDeps {
   sendMessage: (
@@ -88,6 +82,19 @@ function requireGroup(url: URL, res: ServerResponse): string | null {
   return group;
 }
 
+/** Handle body parse errors. Legacy endpoints include `ok` in the response. */
+function handleBodyError(res: ServerResponse, err: unknown, includeOk?: boolean): void {
+  if (err instanceof BodyParseError) {
+    json(res, err.status, includeOk ? { ok: false, error: err.message } : { error: err.message });
+  } else {
+    json(res, 400, includeOk ? { ok: false, error: 'Invalid JSON' } : { error: 'Invalid JSON' });
+  }
+}
+
+// Valid values for task fields — keep in sync with ScheduledTask type in types.ts
+const VALID_STATUSES = ['active', 'paused', 'completed'];
+const VALID_SCHEDULE_TYPES = ['cron', 'interval', 'once'];
+
 // --- Route handler ---
 
 /**
@@ -135,11 +142,7 @@ export async function handleRoute(
       const ok = deps.sendMessage(body.groupJid, body.threadId, body.text);
       json(res, ok ? 200 : 404, { ok });
     } catch (err) {
-      if (err instanceof BodyParseError) {
-        json(res, err.status, { ok: false, error: err.message });
-      } else {
-        json(res, 400, { ok: false, error: 'Invalid JSON' });
-      }
+      handleBodyError(res, err, true);
     }
     return true;
   }
@@ -157,11 +160,7 @@ export async function handleRoute(
       const ok = deps.startSession(body.groupJid, body.text);
       json(res, ok ? 200 : 404, { ok });
     } catch (err) {
-      if (err instanceof BodyParseError) {
-        json(res, err.status, { ok: false, error: err.message });
-      } else {
-        json(res, 400, { ok: false, error: 'Invalid JSON' });
-      }
+      handleBodyError(res, err, true);
     }
     return true;
   }
@@ -225,10 +224,16 @@ export async function handleRoute(
   }
 
   // Match /api/tasks/:id patterns (but not /api/tasks/:id/logs, /pause, /resume)
-  const taskIdMatch = pathname.match(/^\/api\/tasks\/([^/]+)$/);
-  const taskLogsMatch = pathname.match(/^\/api\/tasks\/([^/]+)\/logs$/);
-  const taskPauseMatch = pathname.match(/^\/api\/tasks\/([^/]+)\/pause$/);
-  const taskResumeMatch = pathname.match(/^\/api\/tasks\/([^/]+)\/resume$/);
+  let taskIdMatch: RegExpMatchArray | null = null;
+  let taskLogsMatch: RegExpMatchArray | null = null;
+  let taskPauseMatch: RegExpMatchArray | null = null;
+  let taskResumeMatch: RegExpMatchArray | null = null;
+  if (pathname.startsWith('/api/tasks/')) {
+    taskIdMatch = pathname.match(/^\/api\/tasks\/([^/]+)$/);
+    taskLogsMatch = pathname.match(/^\/api\/tasks\/([^/]+)\/logs$/);
+    taskPauseMatch = pathname.match(/^\/api\/tasks\/([^/]+)\/pause$/);
+    taskResumeMatch = pathname.match(/^\/api\/tasks\/([^/]+)\/resume$/);
+  }
 
   // GET /api/tasks/:id/logs
   if (taskLogsMatch && method === 'GET') {
@@ -308,10 +313,7 @@ export async function handleRoute(
         return true;
       }
 
-      // BUG 7: Validate field values
-      const VALID_STATUSES = ['active', 'paused', 'completed'];
-      const VALID_SCHEDULE_TYPES = ['cron', 'interval', 'once'];
-
+      // Validate field values
       if (
         updates.status !== undefined &&
         (typeof updates.status !== 'string' ||
@@ -367,11 +369,7 @@ export async function handleRoute(
       );
       json(res, 200, { ok: true, task: getTaskById(taskId) });
     } catch (err) {
-      if (err instanceof BodyParseError) {
-        json(res, err.status, { error: err.message });
-      } else {
-        json(res, 400, { error: 'Invalid JSON' });
-      }
+      handleBodyError(res, err);
     }
     return true;
   }
@@ -396,10 +394,9 @@ export async function handleRoute(
       return true;
     }
     const { limit, offset } = parsePagination(url);
-    // Fetch extra results to support offset, then slice
-    const all = searchMemoriesKeyword(group, q, limit + offset);
-    const data = all.slice(offset);
-    json(res, 200, { data, total: all.length, limit, offset });
+    const total = countMemoriesKeyword(group, q);
+    const data = searchMemoriesKeyword(group, q, limit, offset);
+    json(res, 200, { data, total, limit, offset });
     return true;
   }
 
@@ -435,12 +432,13 @@ export async function handleRoute(
     }
     const { limit, offset } = parsePagination(url);
     try {
-      // 10-second timeout via AbortController pattern
+      // 10-second timeout with cleanup on success
+      let timer: NodeJS.Timeout;
       const data = await Promise.race([
-        searchThreads(group, q),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error('Thread search timeout')), 10_000),
-        ),
+        searchThreads(group, q).finally(() => clearTimeout(timer)),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error('Thread search timeout')), 10_000);
+        }),
       ]);
       json(res, 200, { data, total: data.length, limit, offset });
     } catch (err) {
@@ -494,11 +492,7 @@ export async function handleRoute(
         });
       }
     } catch (err) {
-      if (err instanceof BodyParseError) {
-        json(res, err.status, { error: err.message });
-      } else {
-        json(res, 400, { error: 'Invalid JSON' });
-      }
+      handleBodyError(res, err);
     }
     return true;
   }

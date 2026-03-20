@@ -17,7 +17,7 @@ import {
   countAllShipLog,
   countPendingGates,
   countThreadMetadata,
-  getAllTasks,
+  taskExistsById,
 } from '../db.js';
 import type { Capabilities } from './types.js';
 
@@ -39,7 +39,16 @@ export interface CapabilityDeps {
   }>;
 }
 
+// --- Capabilities cache (30s TTL) ---
+
+let cachedCapabilities: { data: Capabilities; timestamp: number } | null = null;
+const CAPABILITIES_TTL_MS = 30_000;
+
 export function getCapabilities(deps: CapabilityDeps): Capabilities {
+  const now = Date.now();
+  if (cachedCapabilities && now - cachedCapabilities.timestamp < CAPABILITIES_TTL_MS) {
+    return cachedCapabilities.data;
+  }
   const groups = deps.getRegisteredGroups();
 
   // --- Feature detection ---
@@ -59,19 +68,12 @@ export function getCapabilities(deps: CapabilityDeps): Capabilities {
   // Gate protocol: check if pending gates have ever been created
   const gateProtocolAvailable = countPendingGates() > 0;
 
-  // Activity summary / Commit digest: match by task ID, not prompt content
+  // Activity summary / Commit digest: targeted existence check by task ID
   let activitySummaryAvailable = false;
   let commitDigestAvailable = false;
   try {
-    const allTasks = getAllTasks();
-    for (const task of allTasks) {
-      if (task.id === DAILY_TASK_ID) {
-        activitySummaryAvailable = true;
-      }
-      if (task.id === COMMIT_DIGEST_TASK_ID) {
-        commitDigestAvailable = true;
-      }
-    }
+    activitySummaryAvailable = taskExistsById(DAILY_TASK_ID);
+    commitDigestAvailable = taskExistsById(COMMIT_DIGEST_TASK_ID);
   } catch {
     // DB not initialized
   }
@@ -93,7 +95,7 @@ export function getCapabilities(deps: CapabilityDeps): Capabilities {
     process.env.OLLAMA_HOST && process.env.OLLAMA_HOST.trim()
   );
 
-  return {
+  const result: Capabilities = {
     version: cachedVersion,
     features: {
       memory: memoryAvailable,
@@ -109,4 +111,7 @@ export function getCapabilities(deps: CapabilityDeps): Capabilities {
     channels: getRegisteredChannelNames(),
     groups,
   };
+
+  cachedCapabilities = { data: result, timestamp: Date.now() };
+  return result;
 }

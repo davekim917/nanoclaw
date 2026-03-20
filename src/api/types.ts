@@ -1,6 +1,14 @@
 // Shared API types for the NanoClaw Web UI.
 // Types only — no runtime imports.
 
+/** Active session state shared between routes.ts and web-ui.ts. */
+export interface ActiveSession {
+  group: string;
+  groupJid: string;
+  threadId?: string;
+  startedAt: string;
+}
+
 // Paginated response envelope used by all list endpoints
 export interface PaginatedResponse<T> {
   data: T[];
@@ -60,7 +68,7 @@ export type WsServerMessage =
       type: 'skill_install_progress';
       jobId: string;
       output: string;
-      status: string;
+      status: 'running' | 'completed' | 'failed';
     }
   | { type: 'resync' }
   | { type: 'error'; code: string; message: string };

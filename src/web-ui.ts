@@ -22,17 +22,14 @@ import { getCapabilities, CapabilityDeps } from './api/capabilities.js';
 import { handleCors } from './api/cors.js';
 import { handleRoute, RouteDeps } from './api/routes.js';
 import { initWebSocket, WsDeps } from './api/ws.js';
-import type { Capabilities } from './api/types.js';
+import type { ActiveSession, Capabilities } from './api/types.js';
 import { logger } from './logger.js';
 import type { ProgressEvent } from './container-runner.js';
 
 // --- SSE client tracking ---
 
 const clients = new Set<ServerResponse>();
-const activeSessions = new Map<
-  string,
-  { group: string; groupJid: string; threadId?: string; startedAt: string }
->();
+const activeSessions = new Map<string, ActiveSession>();
 let cachedHtml: Buffer | null = null;
 
 // --- Static file serving (bundled mode) ---
@@ -144,6 +141,20 @@ function rejectAuth(res: ServerResponse): void {
 
 // --- SSE broadcast ---
 
+const SSE_BACKPRESSURE_THRESHOLD = 1_048_576; // 1MB
+
+/** Send data to all SSE clients, disconnecting any that exceed the backpressure threshold. */
+function broadcastToSseClients(sseClients: Set<ServerResponse>, data: string): void {
+  for (const res of sseClients) {
+    if (res.writableLength > SSE_BACKPRESSURE_THRESHOLD) {
+      sseClients.delete(res);
+      res.end();
+      continue;
+    }
+    res.write(`data: ${data}\n\n`);
+  }
+}
+
 function broadcastSse(
   sessionKey: string,
   group: string,
@@ -151,21 +162,8 @@ function broadcastSse(
   event: ProgressEvent,
 ): void {
   if (clients.size === 0) return;
-  const data = JSON.stringify({
-    type: 'progress',
-    group,
-    threadId,
-    sessionKey,
-    event,
-  });
-  for (const res of clients) {
-    if (res.writableLength > 1_048_576) {
-      clients.delete(res);
-      res.end();
-      continue;
-    }
-    res.write(`data: ${data}\n\n`);
-  }
+  const data = JSON.stringify({ type: 'progress', group, threadId, sessionKey, event });
+  broadcastToSseClients(clients, data);
 }
 
 function notifySessionStartSse(
@@ -181,35 +179,15 @@ function notifySessionStartSse(
     startedAt: new Date().toISOString(),
   });
   if (clients.size === 0) return;
-  const data = JSON.stringify({
-    type: 'session_start',
-    sessionKey,
-    group,
-    groupJid,
-    threadId,
-  });
-  for (const res of clients) {
-    if (res.writableLength > 1_048_576) {
-      clients.delete(res);
-      res.end();
-      continue;
-    }
-    res.write(`data: ${data}\n\n`);
-  }
+  const data = JSON.stringify({ type: 'session_start', sessionKey, group, groupJid, threadId });
+  broadcastToSseClients(clients, data);
 }
 
 function notifySessionEndSse(sessionKey: string): void {
   activeSessions.delete(sessionKey);
   if (clients.size === 0) return;
   const data = JSON.stringify({ type: 'session_end', sessionKey });
-  for (const res of clients) {
-    if (res.writableLength > 1_048_576) {
-      clients.delete(res);
-      res.end();
-      continue;
-    }
-    res.write(`data: ${data}\n\n`);
-  }
+  broadcastToSseClients(clients, data);
 }
 
 function addSseClient(res: ServerResponse, req: IncomingMessage): void {
@@ -313,7 +291,6 @@ export function startWebUI(
   let broadcastWs: (
     sessionKey: string,
     group: string,
-    threadId: string | undefined,
     event: unknown,
   ) => void = () => {};
   let notifyWsSessionStart: (
@@ -326,7 +303,7 @@ export function startWebUI(
   let notifyWsSkillInstall: (
     jobId: string,
     output: string,
-    status: string,
+    status: 'running' | 'completed' | 'failed',
   ) => void = () => {};
 
   // Route deps
@@ -447,7 +424,7 @@ export function startWebUI(
         event: ProgressEvent,
       ): void => {
         broadcastSse(sessionKey, group, threadId, event);
-        broadcastWs(sessionKey, group, threadId, event);
+        broadcastWs(sessionKey, group, event);
       };
 
       const notifySessionStart = (
