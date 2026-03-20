@@ -17,7 +17,9 @@ Single Node.js process with skill-based channel system. Channels (WhatsApp, Tele
 | `src/config.ts` | Trigger pattern, paths, intervals |
 | `src/container-runner.ts` | Spawns agent containers with mounts |
 | `src/task-scheduler.ts` | Runs scheduled tasks |
-| `src/db.ts` | SQLite operations |
+| `src/db.ts` | SQLite operations (schema, queries, paginated API reads) |
+| `src/web-ui.ts` | API gateway: HTTP server, SSE, WebSocket, static file serving |
+| `src/api/` | REST routes, CORS, capabilities, skills, WebSocket handler |
 | `groups/{name}/CLAUDE.md` | Per-group memory (isolated) |
 | `container/skills/agent-browser.md` | Browser automation tool (available to all agents via Bash) |
 
@@ -31,6 +33,16 @@ Single Node.js process with skill-based channel system. Channels (WhatsApp, Tele
 | `/update-nanoclaw` | Bring upstream NanoClaw updates into a customized install |
 | `/qodo-pr-resolver` | Fetch and fix Qodo PR review issues interactively or in batch |
 | `/get-qodo-rules` | Load org- and repo-level coding rules from Qodo before code tasks |
+
+## Environment Variables
+
+| Variable | Purpose |
+|----------|---------|
+| `WEB_UI_TOKEN` | Auth token for the Web UI API. When set, binds to 0.0.0.0 (public). When unset, binds to 127.0.0.1 (no auth). |
+| `WEB_UI_PORT` | Port for the Web UI HTTP server (default: 3002) |
+| `WEB_UI_ORIGINS` | Comma-separated allowed CORS origins for the Web UI |
+| `WEB_UI_SENDER_NAME` | Display name for messages sent via the Web UI (default: "Web User") |
+| `OLLAMA_HOST` | Ollama server URL. When set, enables Ollama capability detection in `/api/capabilities`. |
 
 ## Development
 

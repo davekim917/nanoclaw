@@ -46,7 +46,10 @@ const CAPABILITIES_TTL_MS = 30_000;
 
 export function getCapabilities(deps: CapabilityDeps): Capabilities {
   const now = Date.now();
-  if (cachedCapabilities && now - cachedCapabilities.timestamp < CAPABILITIES_TTL_MS) {
+  if (
+    cachedCapabilities &&
+    now - cachedCapabilities.timestamp < CAPABILITIES_TTL_MS
+  ) {
     return cachedCapabilities.data;
   }
   const groups = deps.getRegisteredGroups();
@@ -54,19 +57,19 @@ export function getCapabilities(deps: CapabilityDeps): Capabilities {
   // --- Feature detection ---
 
   // Memory: check if any memories exist (keyword search works even without vec)
-  const memoryAvailable = countAllMemories() > 0;
+  const memoryAvailable = countAllMemories();
 
   // Backlog: check if any backlog items exist
-  const backlogAvailable = countAllBacklog() > 0;
+  const backlogAvailable = countAllBacklog();
 
   // Ship log: check if any ship log entries exist
-  const shipLogAvailable = countAllShipLog() > 0;
+  const shipLogAvailable = countAllShipLog();
 
   // Thread search: check if any thread metadata is indexed
-  const threadSearchAvailable = countThreadMetadata() > 0;
+  const threadSearchAvailable = countThreadMetadata();
 
   // Gate protocol: check if pending gates have ever been created
-  const gateProtocolAvailable = countPendingGates() > 0;
+  const gateProtocolAvailable = countPendingGates();
 
   // Activity summary / Commit digest: targeted existence check by task ID
   let activitySummaryAvailable = false;

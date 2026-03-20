@@ -8,12 +8,8 @@
  * When WEB_UI_TOKEN is set, binds to 0.0.0.0 (public) and requires token auth.
  * When unset, binds to 127.0.0.1 (local only, no auth).
  */
-import {
-  createServer,
-  IncomingMessage,
-  Server,
-  ServerResponse,
-} from 'http';
+import crypto from 'crypto';
+import { createServer, IncomingMessage, Server, ServerResponse } from 'http';
 import fs from 'fs';
 import path from 'path';
 import { URL } from 'url';
@@ -28,6 +24,7 @@ import type { ProgressEvent } from './container-runner.js';
 
 // --- SSE client tracking ---
 
+const MAX_SSE_CONNECTIONS = 100;
 const clients = new Set<ServerResponse>();
 const activeSessions = new Map<string, ActiveSession>();
 let cachedHtml: Buffer | null = null;
@@ -128,10 +125,19 @@ export function checkAuth(req: IncomingMessage, token: string): boolean {
     req.url || '/',
     `http://${req.headers.host || 'localhost'}`,
   );
-  if (url.searchParams.get('token') === token) return true;
-  const authHeader = req.headers.authorization;
-  if (authHeader && authHeader === `Bearer ${token}`) return true;
+  const queryToken = url.searchParams.get('token') || '';
+  if (timingSafeCompare(queryToken, token)) return true;
+  const authHeader = req.headers.authorization || '';
+  if (timingSafeCompare(authHeader, `Bearer ${token}`)) return true;
   return false;
+}
+
+/** Constant-time string comparison. Uses the expected value's length to avoid leaking length info. */
+function timingSafeCompare(a: string, b: string): boolean {
+  const bufB = Buffer.from(b);
+  const bufA = a.length === b.length ? Buffer.from(a) : bufB;
+  const match = crypto.timingSafeEqual(bufA, bufB);
+  return match && a.length === b.length;
 }
 
 function rejectAuth(res: ServerResponse): void {
@@ -144,7 +150,10 @@ function rejectAuth(res: ServerResponse): void {
 const SSE_BACKPRESSURE_THRESHOLD = 1_048_576; // 1MB
 
 /** Send data to all SSE clients, disconnecting any that exceed the backpressure threshold. */
-function broadcastToSseClients(sseClients: Set<ServerResponse>, data: string): void {
+function broadcastToSseClients(
+  sseClients: Set<ServerResponse>,
+  data: string,
+): void {
   for (const res of sseClients) {
     if (res.writableLength > SSE_BACKPRESSURE_THRESHOLD) {
       sseClients.delete(res);
@@ -162,7 +171,13 @@ function broadcastSse(
   event: ProgressEvent,
 ): void {
   if (clients.size === 0) return;
-  const data = JSON.stringify({ type: 'progress', group, threadId, sessionKey, event });
+  const data = JSON.stringify({
+    type: 'progress',
+    group,
+    threadId,
+    sessionKey,
+    event,
+  });
   broadcastToSseClients(clients, data);
 }
 
@@ -179,7 +194,13 @@ function notifySessionStartSse(
     startedAt: new Date().toISOString(),
   });
   if (clients.size === 0) return;
-  const data = JSON.stringify({ type: 'session_start', sessionKey, group, groupJid, threadId });
+  const data = JSON.stringify({
+    type: 'session_start',
+    sessionKey,
+    group,
+    groupJid,
+    threadId,
+  });
   broadcastToSseClients(clients, data);
 }
 
@@ -191,6 +212,11 @@ function notifySessionEndSse(sessionKey: string): void {
 }
 
 function addSseClient(res: ServerResponse, req: IncomingMessage): void {
+  if (clients.size >= MAX_SSE_CONNECTIONS) {
+    res.writeHead(503, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Too many SSE connections' }));
+    return;
+  }
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
@@ -205,10 +231,7 @@ function addSseClient(res: ServerResponse, req: IncomingMessage): void {
 
 // --- Static file serving ---
 
-function serveStaticFile(
-  pathname: string,
-  res: ServerResponse,
-): boolean {
+function serveStaticFile(pathname: string, res: ServerResponse): boolean {
   if (!uiDistPath) {
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(
@@ -321,6 +344,11 @@ export function startWebUI(
   };
 
   const server = createServer((req, res) => {
+    // Security headers on every response
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+
     const url = new URL(
       req.url || '/',
       `http://${req.headers.host || 'localhost'}`,
@@ -365,14 +393,7 @@ export function startWebUI(
     }
 
     // Route matching
-    handleRoute(
-      pathname,
-      req.method || 'GET',
-      url,
-      req,
-      res,
-      routeDeps,
-    )
+    handleRoute(pathname, req.method || 'GET', url, req, res, routeDeps)
       .then((handled) => {
         if (!handled) {
           res.writeHead(404, { 'Content-Type': 'text/plain' });

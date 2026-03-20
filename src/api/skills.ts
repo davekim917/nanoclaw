@@ -35,7 +35,7 @@ export interface SkillInstallJob {
   output: string;
   repo: string;
   startedAt: string;
-  requires_restart: boolean;
+  requires_restart: boolean; // snake_case: matches API response contract
 }
 
 // --- Repo validation ---
@@ -62,7 +62,10 @@ const MAX_OUTPUT_BYTES = 1_048_576; // 1MB
 
 // --- Installed skills cache (60s TTL — skills only change on install which triggers restart) ---
 
-let cachedInstalledSkills: { data: InstalledSkill[]; timestamp: number } | null = null;
+let cachedInstalledSkills: {
+  data: InstalledSkill[];
+  timestamp: number;
+} | null = null;
 const INSTALLED_SKILLS_TTL_MS = 60_000;
 
 // --- Installed skills ---
@@ -83,7 +86,8 @@ function parseFrontmatter(content: string): {
 
   for (const line of yaml.split('\n')) {
     const nameMatch = line.match(/^name:\s*(.+)/);
-    if (nameMatch) result.name = nameMatch[1].trim().replace(/^['"]|['"]$/g, '');
+    if (nameMatch)
+      result.name = nameMatch[1].trim().replace(/^['"]|['"]$/g, '');
     const descMatch = line.match(/^description:\s*(.+)/);
     if (descMatch)
       result.description = descMatch[1].trim().replace(/^['"]|['"]$/g, '');
@@ -97,7 +101,10 @@ function parseFrontmatter(content: string): {
  */
 export function getInstalledSkills(): InstalledSkill[] {
   const now = Date.now();
-  if (cachedInstalledSkills && now - cachedInstalledSkills.timestamp < INSTALLED_SKILLS_TTL_MS) {
+  if (
+    cachedInstalledSkills &&
+    now - cachedInstalledSkills.timestamp < INSTALLED_SKILLS_TTL_MS
+  ) {
     return cachedInstalledSkills.data;
   }
 
@@ -123,8 +130,7 @@ export function getInstalledSkills(): InstalledSkill[] {
 
         skills.push({
           name: frontmatter.name || entry.name,
-          description:
-            frontmatter.description || `Skill from ${entry.name}`,
+          description: frontmatter.description || `Skill from ${entry.name}`,
           path: path.relative(projectRoot, skillDir),
         });
       }
@@ -168,8 +174,7 @@ export function getInstalledSkills(): InstalledSkill[] {
             skills.push({
               name: frontmatter.name || skillEntry.name,
               description:
-                frontmatter.description ||
-                `Skill from ${skillEntry.name}`,
+                frontmatter.description || `Skill from ${skillEntry.name}`,
               path: path.relative(projectRoot, skillDir),
               group: groupEntry.name,
             });
@@ -179,12 +184,9 @@ export function getInstalledSkills(): InstalledSkill[] {
             const frontmatter = parseFrontmatter(content);
 
             skills.push({
-              name:
-                frontmatter.name ||
-                skillEntry.name.replace(/\.md$/, ''),
+              name: frontmatter.name || skillEntry.name.replace(/\.md$/, ''),
               description:
-                frontmatter.description ||
-                `Skill from ${skillEntry.name}`,
+                frontmatter.description || `Skill from ${skillEntry.name}`,
               path: path.relative(projectRoot, mdPath),
               group: groupEntry.name,
             });
@@ -346,7 +348,7 @@ export function startSkillInstall(
     };
   }
 
-  // S1: Prune old completed/failed jobs to cap installJobs map
+  // Prune old completed/failed jobs to cap installJobs map
   if (installJobs.size >= MAX_JOBS) {
     const oneHourAgo = Date.now() - 60 * 60 * 1000;
     for (const [id, j] of installJobs) {

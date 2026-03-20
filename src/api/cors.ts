@@ -31,10 +31,7 @@ export function isOriginAllowed(origin: string | undefined): boolean {
  * Returns true if this was an OPTIONS preflight (response already sent).
  * Returns false if request should continue to route matching.
  */
-export function handleCors(
-  req: IncomingMessage,
-  res: ServerResponse,
-): boolean {
+export function handleCors(req: IncomingMessage, res: ServerResponse): boolean {
   const origin = req.headers.origin;
 
   // No Origin header (same-origin request or non-browser) — skip CORS

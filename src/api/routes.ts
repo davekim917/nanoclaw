@@ -50,10 +50,7 @@ export interface RouteDeps {
   getCapabilities: () => Capabilities;
   activeSessions: () => Map<string, ActiveSession>;
   addSseClient: (res: ServerResponse, req: IncomingMessage) => void;
-  onSkillInstallProgress: (
-    jobId: string,
-    output: string,
-  ) => void;
+  onSkillInstallProgress: (jobId: string, output: string) => void;
   onSkillInstallComplete: (jobId: string, success: boolean) => void;
 }
 
@@ -83,11 +80,25 @@ function requireGroup(url: URL, res: ServerResponse): string | null {
 }
 
 /** Handle body parse errors. Legacy endpoints include `ok` in the response. */
-function handleBodyError(res: ServerResponse, err: unknown, includeOk?: boolean): void {
+function handleBodyError(
+  res: ServerResponse,
+  err: unknown,
+  includeOk?: boolean,
+): void {
   if (err instanceof BodyParseError) {
-    json(res, err.status, includeOk ? { ok: false, error: err.message } : { error: err.message });
+    json(
+      res,
+      err.status,
+      includeOk ? { ok: false, error: err.message } : { error: err.message },
+    );
   } else {
-    json(res, 400, includeOk ? { ok: false, error: 'Invalid JSON' } : { error: 'Invalid JSON' });
+    json(
+      res,
+      400,
+      includeOk
+        ? { ok: false, error: 'Invalid JSON' }
+        : { error: 'Invalid JSON' },
+    );
   }
 }
 
@@ -184,9 +195,7 @@ export async function handleRoute(
   }
 
   // GET /api/sessions/:key/messages
-  const sessKeyMsgMatch = pathname.match(
-    /^\/api\/sessions\/(.+)\/messages$/,
-  );
+  const sessKeyMsgMatch = pathname.match(/^\/api\/sessions\/(.+)\/messages$/);
   if (sessKeyMsgMatch && method === 'GET') {
     const sessionKey = decodeURIComponent(sessKeyMsgMatch[1]);
     const { limit } = parsePagination(url);
@@ -313,6 +322,12 @@ export async function handleRoute(
         return true;
       }
 
+      // Validate prompt field type
+      if (updates.prompt !== undefined && typeof updates.prompt !== 'string') {
+        json(res, 400, { error: 'Invalid prompt: must be a string' });
+        return true;
+      }
+
       // Validate field values
       if (
         updates.status !== undefined &&
@@ -346,7 +361,8 @@ export async function handleRoute(
           updates.schedule_value.trim() === ''
         ) {
           json(res, 400, {
-            error: 'Invalid schedule_value: cron expression must be a non-empty string',
+            error:
+              'Invalid schedule_value: cron expression must be a non-empty string',
           });
           return true;
         }
@@ -363,10 +379,7 @@ export async function handleRoute(
         }
       }
 
-      updateTask(
-        taskId,
-        updates as Parameters<typeof updateTask>[1],
-      );
+      updateTask(taskId, updates as Parameters<typeof updateTask>[1]);
       json(res, 200, { ok: true, task: getTaskById(taskId) });
     } catch (err) {
       handleBodyError(res, err);
@@ -437,13 +450,22 @@ export async function handleRoute(
       const data = await Promise.race([
         searchThreads(group, q).finally(() => clearTimeout(timer)),
         new Promise<never>((_, reject) => {
-          timer = setTimeout(() => reject(new Error('Thread search timeout')), 10_000);
+          timer = setTimeout(
+            () => reject(new Error('Thread search timeout')),
+            10_000,
+          );
         }),
       ]);
       json(res, 200, { data, total: data.length, limit, offset });
     } catch (err) {
       logger.warn({ err, group, query: q }, 'Thread search failed/timed out');
-      json(res, 200, { data: [], total: 0, limit, offset, error: 'search_timeout' });
+      json(res, 200, {
+        data: [],
+        total: 0,
+        limit,
+        offset,
+        error: 'search_timeout',
+      });
     }
     return true;
   }
@@ -498,9 +520,7 @@ export async function handleRoute(
   }
 
   // GET /api/skills/install/:jobId
-  const installJobMatch = pathname.match(
-    /^\/api\/skills\/install\/([^/]+)$/,
-  );
+  const installJobMatch = pathname.match(/^\/api\/skills\/install\/([^/]+)$/);
   if (installJobMatch && method === 'GET') {
     const jobId = decodeURIComponent(installJobMatch[1]);
     const job = getInstallJob(jobId);

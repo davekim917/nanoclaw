@@ -1270,9 +1270,7 @@ export function getSessionV2(
 }
 
 /** Get a session_v2 row by session_key, including chat_jid. */
-export function getSessionV2ByKey(
-  key: string,
-): SessionV2Full | undefined {
+export function getSessionV2ByKey(key: string): SessionV2Full | undefined {
   return db
     .prepare('SELECT * FROM sessions_v2 WHERE session_key = ?')
     .get(key) as SessionV2Full | undefined;
@@ -2161,11 +2159,9 @@ export function recentMemories(groupFolder: string, topK = 6): Memory[] {
 
 // --- Cross-group retrieval (for personal/main groups) ---
 
-export function countAllMemories(): number {
-  const row = db.prepare('SELECT COUNT(*) AS c FROM memories').get() as {
-    c: number;
-  };
-  return row.c;
+export function countAllMemories(): boolean {
+  const row = db.prepare('SELECT 1 FROM memories LIMIT 1').get();
+  return row !== undefined;
 }
 
 export function searchMemoriesVecAllGroups(
@@ -2309,39 +2305,27 @@ export function getAllTasksPaginated(
 
 // --- Capability detection helpers (used by api/capabilities.ts) ---
 
-/** Check if sqlite-vec extension is loaded. */
-export function isVecLoaded(): boolean {
-  return vecLoaded;
+
+/** Check if any backlog items exist across all groups. */
+export function countAllBacklog(): boolean {
+  const row = db.prepare('SELECT 1 FROM backlog LIMIT 1').get();
+  return row !== undefined;
 }
 
-/** Count total backlog items across all groups. */
-export function countAllBacklog(): number {
-  const row = db
-    .prepare('SELECT COUNT(*) AS c FROM backlog')
-    .get() as { c: number };
-  return row.c;
+/** Check if any ship log entries exist across all groups. */
+export function countAllShipLog(): boolean {
+  const row = db.prepare('SELECT 1 FROM ship_log LIMIT 1').get();
+  return row !== undefined;
 }
 
-/** Count total ship log entries across all groups. */
-export function countAllShipLog(): number {
-  const row = db
-    .prepare('SELECT COUNT(*) AS c FROM ship_log')
-    .get() as { c: number };
-  return row.c;
+/** Check if any indexed thread metadata rows exist. */
+export function countThreadMetadata(): boolean {
+  const row = db.prepare('SELECT 1 FROM thread_metadata LIMIT 1').get();
+  return row !== undefined;
 }
 
-/** Count total indexed thread metadata rows. */
-export function countThreadMetadata(): number {
-  const row = db
-    .prepare('SELECT COUNT(*) AS c FROM thread_metadata')
-    .get() as { c: number };
-  return row.c;
-}
-
-/** Count total pending gates (any status). */
-export function countPendingGates(): number {
-  const row = db
-    .prepare('SELECT COUNT(*) AS c FROM pending_gates')
-    .get() as { c: number };
-  return row.c;
+/** Check if any pending gates exist (any status). */
+export function countPendingGates(): boolean {
+  const row = db.prepare('SELECT 1 FROM pending_gates LIMIT 1').get();
+  return row !== undefined;
 }

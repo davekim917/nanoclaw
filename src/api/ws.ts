@@ -51,9 +51,7 @@ export function getEventsSince(
   const len = ringCount;
   for (let i = 0; i < len; i++) {
     const idx =
-      ringCount < RING_BUFFER_SIZE
-        ? i
-        : (ringHead + i) % RING_BUFFER_SIZE;
+      ringCount < RING_BUFFER_SIZE ? i : (ringHead + i) % RING_BUFFER_SIZE;
     const entry = ringBuffer[idx];
     if (entry && entry.timestamp > since) {
       // Filter by subscribed groups if specified.
@@ -74,8 +72,7 @@ export function getEventsSince(
 /** Get the timestamp of the oldest entry in the ring buffer, or 0 if empty. */
 function getOldestBufferTimestamp(): number {
   if (ringCount === 0) return 0;
-  const oldestIdx =
-    ringCount < RING_BUFFER_SIZE ? 0 : ringHead;
+  const oldestIdx = ringCount < RING_BUFFER_SIZE ? 0 : ringHead;
   return ringBuffer[oldestIdx]?.timestamp ?? 0;
 }
 
@@ -162,11 +159,7 @@ export function initWebSocket(
   deps: WsDeps,
   token: string,
 ): {
-  broadcastWs: (
-    sessionKey: string,
-    group: string,
-    event: unknown,
-  ) => void;
+  broadcastWs: (sessionKey: string, group: string, event: unknown) => void;
   notifyWsSessionStart: (
     sessionKey: string,
     group: string,
@@ -184,7 +177,7 @@ export function initWebSocket(
 
   // Handle HTTP upgrade
   server.on('upgrade', (req, socket, head) => {
-    // BUG 5: Reject if at connection limit (before auth to save work)
+    // Reject if at connection limit (before auth to save work)
     if (wsClients.size >= MAX_WS_CONNECTIONS) {
       socket.write('HTTP/1.1 503 Service Unavailable\r\n\r\n');
       socket.destroy();
@@ -237,9 +230,7 @@ export function initWebSocket(
     ws.on('message', (raw: Buffer | string) => {
       let msg: unknown;
       try {
-        msg = JSON.parse(
-          typeof raw === 'string' ? raw : raw.toString('utf-8'),
-        );
+        msg = JSON.parse(typeof raw === 'string' ? raw : raw.toString('utf-8'));
       } catch {
         sendJson(ws, {
           type: 'error',
@@ -249,7 +240,7 @@ export function initWebSocket(
         return;
       }
 
-      // BUG 10: Validate parsed message shape
+      // Validate parsed message shape
       if (
         !msg ||
         typeof msg !== 'object' ||
@@ -266,7 +257,7 @@ export function initWebSocket(
       const parsed = msg as Record<string, unknown>;
 
       if (parsed.type === 'send_message') {
-        // Rate limit check (BUG 6: keyed by token hash, not per-connection)
+        // Rate limit check (keyed by token hash, not per-connection)
         if (!checkRateLimit(client.tokenHash)) {
           sendJson(ws, {
             type: 'error',
@@ -276,14 +267,15 @@ export function initWebSocket(
           return;
         }
 
-        // BUG 10: Validate field types, not just truthiness
+        // Validate field types, not just truthiness
         const groupJid = parsed.groupJid;
         const text = parsed.text;
         if (typeof groupJid !== 'string' || typeof text !== 'string') {
           sendJson(ws, {
             type: 'error',
             code: 'invalid_params',
-            message: 'Missing required fields: groupJid (string), text (string)',
+            message:
+              'Missing required fields: groupJid (string), text (string)',
           });
           return;
         }
@@ -295,7 +287,7 @@ export function initWebSocket(
           (typeof parsed.senderId === 'string' && parsed.senderId) ||
           `web-ui-${crypto.randomUUID().slice(0, 8)}`;
 
-        // S3: startSession now returns the real message ID or false
+        // startSession now returns the real message ID or false
         const msgId = deps.startSession(groupJid, text, senderName, senderId);
         if (msgId) {
           sendJson(ws, { type: 'message_stored', id: msgId });
@@ -316,7 +308,7 @@ export function initWebSocket(
           client.subscribedGroups = null; // all groups
         }
 
-        // BUG 9: Replay missed events on subscribe with since
+        // Replay missed events on subscribe with since
         const since = parsed.since;
         if (typeof since === 'number' && since > 0) {
           const oldest = getOldestBufferTimestamp();
@@ -363,10 +355,17 @@ export function initWebSocket(
     const group = opts?.group;
     const skipBackpressure = opts?.skipBackpressure ?? false;
     for (const client of wsClients) {
-      if (group !== undefined && client.subscribedGroups !== null && !client.subscribedGroups.has(group)) {
+      if (
+        group !== undefined &&
+        client.subscribedGroups !== null &&
+        !client.subscribedGroups.has(group)
+      ) {
         continue;
       }
-      if (!skipBackpressure && client.ws.bufferedAmount > BACKPRESSURE_THRESHOLD) {
+      if (
+        !skipBackpressure &&
+        client.ws.bufferedAmount > BACKPRESSURE_THRESHOLD
+      ) {
         continue;
       }
       if (client.ws.readyState === WebSocket.OPEN) {
@@ -380,7 +379,12 @@ export function initWebSocket(
     group: string,
     event: unknown,
   ): void {
-    const data = JSON.stringify({ type: 'progress', sessionKey, group, event } satisfies WsServerMessage);
+    const data = JSON.stringify({
+      type: 'progress',
+      sessionKey,
+      group,
+      event,
+    } satisfies WsServerMessage);
     pushToRingBuffer(data, group);
     broadcastToWsClients(data, { group });
   }
@@ -391,13 +395,22 @@ export function initWebSocket(
     groupJid: string,
     threadId?: string,
   ): void {
-    const data = JSON.stringify({ type: 'session_start', sessionKey, group, groupJid, threadId } satisfies WsServerMessage);
+    const data = JSON.stringify({
+      type: 'session_start',
+      sessionKey,
+      group,
+      groupJid,
+      threadId,
+    } satisfies WsServerMessage);
     pushToRingBuffer(data, group);
     broadcastToWsClients(data, { group, skipBackpressure: true });
   }
 
   function notifyWsSessionEnd(sessionKey: string): void {
-    const data = JSON.stringify({ type: 'session_end', sessionKey } satisfies WsServerMessage);
+    const data = JSON.stringify({
+      type: 'session_end',
+      sessionKey,
+    } satisfies WsServerMessage);
     pushToRingBuffer(data, '');
     broadcastToWsClients(data, { skipBackpressure: true });
   }
@@ -407,7 +420,12 @@ export function initWebSocket(
     output: string,
     status: 'running' | 'completed' | 'failed',
   ): void {
-    const data = JSON.stringify({ type: 'skill_install_progress', jobId, output, status } satisfies WsServerMessage);
+    const data = JSON.stringify({
+      type: 'skill_install_progress',
+      jobId,
+      output,
+      status,
+    } satisfies WsServerMessage);
     broadcastToWsClients(data, { skipBackpressure: true });
   }
 
