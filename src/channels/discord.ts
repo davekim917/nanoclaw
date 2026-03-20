@@ -1049,8 +1049,15 @@ export class DiscordChannel implements Channel {
     const parsedJid = parseThreadJid(jid);
     const channelId = parsedJid ? parsedJid.threadId : jid.replace(/^dc:/, '');
     const sendTyping = async () => {
+      // Guard: if setTyping(false) was called while this closure was
+      // in-flight (race between interval fire and clearInterval), bail
+      // out so we don't send a stale typing event after the response.
+      if (!this.typingIntervals.has(jid)) return;
       try {
         const channel = await this.client!.channels.fetch(channelId);
+        // Re-check after async fetch — setTyping(false) may have fired
+        // while we were awaiting the channel lookup.
+        if (!this.typingIntervals.has(jid)) return;
         if (channel && 'sendTyping' in channel) {
           await (channel as TextChannel).sendTyping();
         }
@@ -1059,8 +1066,11 @@ export class DiscordChannel implements Channel {
       }
     };
 
-    await sendTyping();
+    // Set the interval FIRST so the JID is in the map before sendTyping's
+    // guard check.  The initial sendTyping() call shares the same closure
+    // and will bail out if setTyping(false) races in before the await.
     this.typingIntervals.set(jid, setInterval(sendTyping, 8000));
+    await sendTyping();
   }
 
   async addReaction(
