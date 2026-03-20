@@ -23,7 +23,10 @@ const execFileAsync = promisify(execFile);
 
 // Run 10 minutes before the daily summary (default 7:50am Eastern)
 const DIGEST_CRON = process.env.COMMIT_DIGEST_CRON || '50 7 * * *';
-const DIGEST_TZ = process.env.COMMIT_DIGEST_TZ || process.env.DAILY_NOTIFY_TZ || 'America/New_York';
+const DIGEST_TZ =
+  process.env.COMMIT_DIGEST_TZ ||
+  process.env.DAILY_NOTIFY_TZ ||
+  'America/New_York';
 
 export const COMMIT_DIGEST_TASK_ID = '__commit_digest';
 
@@ -93,11 +96,10 @@ async function getLatestCommitSha(
   branch: string,
 ): Promise<string | null> {
   try {
-    const { stdout } = await execFileAsync(
-      'git',
-      ['rev-parse', branch],
-      { cwd: repoDir, timeout: 5000 },
-    );
+    const { stdout } = await execFileAsync('git', ['rev-parse', branch], {
+      cwd: repoDir,
+      timeout: 5000,
+    });
     return stdout.trim() || null;
   } catch {
     return null;
@@ -133,11 +135,7 @@ async function getDirectCommitsSince(
 
     if (!stdout.trim()) return [];
 
-    return stdout
-      .trim()
-      .split('\n')
-      .map(parseCommitLine)
-      .reverse(); // chronological order
+    return stdout.trim().split('\n').map(parseCommitLine).reverse(); // chronological order
   } catch {
     return [];
   }
@@ -197,10 +195,7 @@ function discoverRepos(
  * Scan a single repo for direct commits and create ship log entries.
  * Returns the number of commits found.
  */
-async function scanRepo(
-  repoDir: string,
-  groupFolder: string,
-): Promise<number> {
+async function scanRepo(repoDir: string, groupFolder: string): Promise<number> {
   const defaultBranch = await getDefaultBranch(repoDir);
   if (!defaultBranch) {
     logger.debug({ repoDir }, 'Could not determine default branch, skipping');
@@ -221,7 +216,11 @@ async function scanRepo(
 
   if (state) {
     // Get commits since last scan
-    commits = await getDirectCommitsSince(repoDir, defaultBranch, state.last_commit_sha);
+    commits = await getDirectCommitsSince(
+      repoDir,
+      defaultBranch,
+      state.last_commit_sha,
+    );
   } else {
     // First scan — don't backfill entire history, just record current position.
     // Get last 24h of commits as initial batch (capped at 100).
@@ -232,7 +231,8 @@ async function scanRepo(
           'log',
           '--no-merges',
           '--first-parent',
-          '-n', '100',
+          '-n',
+          '100',
           '--format=%H%x00%h%x00%s%x00%an%x00%aI',
           '--since=24 hours ago',
           defaultBranch,
@@ -294,9 +294,7 @@ async function scanRepo(
  * Scans each group's repos for direct commits to the default branch
  * and creates ship log entries for any found.
  */
-export async function runCommitDigest(
-  deps: CommitDigestDeps,
-): Promise<void> {
+export async function runCommitDigest(deps: CommitDigestDeps): Promise<void> {
   const groups = deps.registeredGroups();
   const folders = [...new Set(Object.values(groups).map((g) => g.folder))];
 
@@ -335,10 +333,7 @@ export async function runCommitDigest(
     totalCommits += r.commits;
   }
 
-  logger.info(
-    { totalRepos, totalCommits },
-    'Commit digest completed',
-  );
+  logger.info({ totalRepos, totalCommits }, 'Commit digest completed');
 }
 
 /**
@@ -405,10 +400,7 @@ export function ensureCommitDigestTask(): void {
       updateTask(COMMIT_DIGEST_TASK_ID, updates);
       logger.info({ updates, nextRun }, 'Commit digest task updated');
     } else {
-      logger.info(
-        { nextRun, cron: DIGEST_CRON },
-        'Commit digest task exists',
-      );
+      logger.info({ nextRun, cron: DIGEST_CRON }, 'Commit digest task exists');
     }
     return;
   }
@@ -428,19 +420,14 @@ export function ensureCommitDigestTask(): void {
     status: 'active',
     created_at: new Date().toISOString(),
   });
-  logger.info(
-    { nextRun, cron: DIGEST_CRON },
-    'Commit digest task created',
-  );
+  logger.info({ nextRun, cron: DIGEST_CRON }, 'Commit digest task created');
 }
 
 /**
  * Register the commit digest handler with the task scheduler.
  * Must be called before startSchedulerLoop().
  */
-export function registerCommitDigestHandler(
-  deps: CommitDigestDeps,
-): void {
+export function registerCommitDigestHandler(deps: CommitDigestDeps): void {
   registerSystemTaskHandler(COMMIT_DIGEST_TASK_ID, async () => {
     await runCommitDigest(deps);
   });

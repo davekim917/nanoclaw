@@ -22,6 +22,7 @@ import {
   THREAD_SESSION_IDLE_HOURS,
   TIMEZONE,
   WEB_UI_PORT,
+  WEB_UI_SENDER_NAME,
   WEB_UI_TOKEN,
   buildTriggerPattern,
   getParentJid,
@@ -2019,7 +2020,11 @@ async function main(): Promise<void> {
         // If the thread doesn't exist yet, send via regular sendMessage
         // first to create it, then the swarm path will find the redirect.
         if (triggerMsgId) {
-          return channel.sendMessage(resolvedJid, `**[${sender}]** ${text}`, triggerMsgId);
+          return channel.sendMessage(
+            resolvedJid,
+            `**[${sender}]** ${text}`,
+            triggerMsgId,
+          );
         }
         return channel.sendSwarmMessage(resolvedJid, text, sender);
       }
@@ -2061,13 +2066,32 @@ async function main(): Promise<void> {
           id: `web-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`,
           chat_jid: groupJid,
           sender: 'web-ui',
-          sender_name: 'Dave',
+          sender_name: WEB_UI_SENDER_NAME,
           content: trigger + text,
           timestamp: new Date().toISOString(),
           is_from_me: false,
         });
         queue.enqueueMessageCheck(groupJid);
         return true;
+      },
+      startSessionWs: (groupJid, text, senderName, senderId) => {
+        const group = registeredGroups[groupJid];
+        if (!group) return false;
+        const assistantName = resolveAssistantName(group.containerConfig);
+        const trigger =
+          group.requiresTrigger !== false ? `@${assistantName} ` : '';
+        const msgId = `web-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
+        storeMessage({
+          id: msgId,
+          chat_jid: groupJid,
+          sender: senderId || 'web-ui',
+          sender_name: senderName,
+          content: trigger + text,
+          timestamp: new Date().toISOString(),
+          is_from_me: false,
+        });
+        queue.enqueueMessageCheck(groupJid);
+        return msgId;
       },
     },
     WEB_UI_TOKEN,

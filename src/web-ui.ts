@@ -1,24 +1,81 @@
 /**
- * Web UI — Real-time agent activity monitor via SSE.
- * Single HTTP server: serves HTML, streams progress events, handles intervention.
- * Zero dependencies beyond Node built-in `http`.
+ * Web UI — API gateway for NanoClaw.
+ *
+ * Single HTTP server: serves HTML, streams progress events via SSE,
+ * handles REST API endpoints, WebSocket connections, and optional
+ * static file serving for the bundled SPA.
  *
  * When WEB_UI_TOKEN is set, binds to 0.0.0.0 (public) and requires token auth.
  * When unset, binds to 127.0.0.1 (local only, no auth).
  */
-import { createServer, IncomingMessage, ServerResponse } from 'http';
+import crypto from 'crypto';
+import { createServer, IncomingMessage, Server, ServerResponse } from 'http';
 import fs from 'fs';
+import path from 'path';
 import { URL } from 'url';
 
+import { getCapabilities, CapabilityDeps } from './api/capabilities.js';
+import { handleCors } from './api/cors.js';
+import { handleRoute, RouteDeps } from './api/routes.js';
+import { initWebSocket, WsDeps } from './api/ws.js';
+import type { ActiveSession, Capabilities } from './api/types.js';
 import { logger } from './logger.js';
 import type { ProgressEvent } from './container-runner.js';
 
+// --- SSE client tracking ---
+
+const MAX_SSE_CONNECTIONS = 100;
 const clients = new Set<ServerResponse>();
-const activeSessions = new Map<
-  string,
-  { group: string; groupJid: string; threadId?: string; startedAt: string }
->();
+const activeSessions = new Map<string, ActiveSession>();
 let cachedHtml: Buffer | null = null;
+
+// --- Static file serving (bundled mode) ---
+
+/** MIME types for static file serving. */
+const MIME_TYPES: Record<string, string> = {
+  '.html': 'text/html',
+  '.js': 'application/javascript',
+  '.css': 'text/css',
+  '.json': 'application/json',
+  '.svg': 'image/svg+xml',
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.ico': 'image/x-icon',
+  '.woff': 'font/woff',
+  '.woff2': 'font/woff2',
+  '.ttf': 'font/ttf',
+  '.map': 'application/json',
+};
+
+/** Detect nanoclaw-ui dist directory at startup (once). */
+let uiDistPath: string | null = null;
+try {
+  // Try require.resolve-style lookup
+  const candidates = [
+    path.resolve(process.cwd(), 'nanoclaw-ui', 'dist'),
+    path.resolve(process.cwd(), 'node_modules', 'nanoclaw-ui', 'dist'),
+  ];
+  for (const candidate of candidates) {
+    if (
+      fs.existsSync(candidate) &&
+      fs.existsSync(path.join(candidate, 'index.html'))
+    ) {
+      uiDistPath = candidate;
+      break;
+    }
+  }
+} catch {
+  // Package not found — uiDistPath stays null
+}
+
+/** Check if a filename contains a hash (e.g., main.a1b2c3.js). */
+function isHashedAsset(filename: string): boolean {
+  const parts = filename.split('.');
+  // Hashed assets have at least 3 parts: name.hash.ext
+  return parts.length >= 3 && parts[parts.length - 2].length >= 6;
+}
+
+// --- Auth ---
 
 interface WebUIDeps {
   sendMessage: (
@@ -32,9 +89,16 @@ interface WebUIDeps {
     folder: string;
   }>;
   startSession: (groupJid: string, text: string) => boolean;
+  startSessionWs: (
+    groupJid: string,
+    text: string,
+    senderName: string,
+    senderId: string,
+  ) => string | false;
 }
 
 export interface WebUIHandle {
+  server: Server;
   broadcast: (
     sessionKey: string,
     group: string,
@@ -50,7 +114,57 @@ export interface WebUIHandle {
   notifySessionEnd: (sessionKey: string) => void;
 }
 
-function broadcast(
+/**
+ * Check token auth. Accepts either:
+ *   - ?token=<value> query param (for SSE/EventSource which can't set headers)
+ *   - Authorization: Bearer <value> header
+ */
+export function checkAuth(req: IncomingMessage, token: string): boolean {
+  if (!token) return true; // No token configured = no auth required (localhost-only mode)
+  const url = new URL(
+    req.url || '/',
+    `http://${req.headers.host || 'localhost'}`,
+  );
+  const queryToken = url.searchParams.get('token') || '';
+  if (timingSafeCompare(queryToken, token)) return true;
+  const authHeader = req.headers.authorization || '';
+  if (timingSafeCompare(authHeader, `Bearer ${token}`)) return true;
+  return false;
+}
+
+/** Constant-time string comparison. Uses the expected value's length to avoid leaking length info. */
+function timingSafeCompare(a: string, b: string): boolean {
+  const bufB = Buffer.from(b);
+  const bufA = a.length === b.length ? Buffer.from(a) : bufB;
+  const match = crypto.timingSafeEqual(bufA, bufB);
+  return match && a.length === b.length;
+}
+
+function rejectAuth(res: ServerResponse): void {
+  res.writeHead(401, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: 'Unauthorized' }));
+}
+
+// --- SSE broadcast ---
+
+const SSE_BACKPRESSURE_THRESHOLD = 1_048_576; // 1MB
+
+/** Send data to all SSE clients, disconnecting any that exceed the backpressure threshold. */
+function broadcastToSseClients(
+  sseClients: Set<ServerResponse>,
+  data: string,
+): void {
+  for (const res of sseClients) {
+    if (res.writableLength > SSE_BACKPRESSURE_THRESHOLD) {
+      sseClients.delete(res);
+      res.end();
+      continue;
+    }
+    res.write(`data: ${data}\n\n`);
+  }
+}
+
+function broadcastSse(
   sessionKey: string,
   group: string,
   threadId: string | undefined,
@@ -64,17 +178,10 @@ function broadcast(
     sessionKey,
     event,
   });
-  for (const res of clients) {
-    if (res.writableLength > 1_048_576) {
-      clients.delete(res);
-      res.end();
-      continue;
-    }
-    res.write(`data: ${data}\n\n`);
-  }
+  broadcastToSseClients(clients, data);
 }
 
-function notifySessionStart(
+function notifySessionStartSse(
   sessionKey: string,
   group: string,
   groupJid: string,
@@ -94,133 +201,101 @@ function notifySessionStart(
     groupJid,
     threadId,
   });
-  for (const res of clients) {
-    if (res.writableLength > 1_048_576) {
-      clients.delete(res);
-      res.end();
-      continue;
-    }
-    res.write(`data: ${data}\n\n`);
-  }
+  broadcastToSseClients(clients, data);
 }
 
-function notifySessionEnd(sessionKey: string): void {
+function notifySessionEndSse(sessionKey: string): void {
   activeSessions.delete(sessionKey);
   if (clients.size === 0) return;
   const data = JSON.stringify({ type: 'session_end', sessionKey });
-  for (const res of clients) {
-    if (res.writableLength > 1_048_576) {
-      clients.delete(res);
-      res.end();
-      continue;
-    }
-    res.write(`data: ${data}\n\n`);
+  broadcastToSseClients(clients, data);
+}
+
+function addSseClient(res: ServerResponse, req: IncomingMessage): void {
+  if (clients.size >= MAX_SSE_CONNECTIONS) {
+    res.writeHead(503, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Too many SSE connections' }));
+    return;
   }
-}
-
-/**
- * Check token auth. Accepts either:
- *   - ?token=<value> query param (for SSE/EventSource which can't set headers)
- *   - Authorization: Bearer <value> header
- */
-function checkAuth(req: IncomingMessage, token: string): boolean {
-  if (!token) return true; // No token configured = no auth required (localhost-only mode)
-  const url = new URL(
-    req.url || '/',
-    `http://${req.headers.host || 'localhost'}`,
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+  });
+  res.write(
+    `data: ${JSON.stringify({ type: 'sessions', sessions: Object.fromEntries(activeSessions) })}\n\n`,
   );
-  if (url.searchParams.get('token') === token) return true;
-  const authHeader = req.headers.authorization;
-  if (authHeader && authHeader === `Bearer ${token}`) return true;
-  return false;
+  clients.add(res);
+  req.on('close', () => clients.delete(res));
 }
 
-function rejectAuth(res: ServerResponse): void {
-  res.writeHead(401, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify({ error: 'Unauthorized' }));
+// --- Static file serving ---
+
+function serveStaticFile(pathname: string, res: ServerResponse): boolean {
+  if (!uiDistPath) {
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        error:
+          'nanoclaw-ui package not installed. Install it to enable the web UI.',
+      }),
+    );
+    return true;
+  }
+
+  // Strip /ui prefix
+  let filePath = pathname.replace(/^\/ui\/?/, '');
+  if (!filePath) filePath = 'index.html';
+
+  // Resolve and verify within dist directory (prevent path traversal)
+  const resolved = path.resolve(uiDistPath, filePath);
+  if (!resolved.startsWith(uiDistPath)) {
+    res.writeHead(400, { 'Content-Type': 'text/plain' });
+    res.end('Bad request');
+    return true;
+  }
+
+  // Try to serve the file
+  if (fs.existsSync(resolved) && fs.statSync(resolved).isFile()) {
+    const ext = path.extname(resolved);
+    const contentType = MIME_TYPES[ext] || 'application/octet-stream';
+    const filename = path.basename(resolved);
+
+    const headers: Record<string, string> = {
+      'Content-Type': contentType,
+    };
+
+    // Cache headers: immutable for hashed assets, no-cache for index.html
+    if (filename === 'index.html') {
+      headers['Cache-Control'] = 'no-cache';
+    } else if (isHashedAsset(filename)) {
+      headers['Cache-Control'] = 'public, max-age=31536000, immutable';
+    } else {
+      headers['Cache-Control'] = 'public, max-age=3600';
+    }
+
+    res.writeHead(200, headers);
+    fs.createReadStream(resolved).pipe(res);
+    return true;
+  }
+
+  // SPA fallback: serve index.html for unmatched /ui/* paths
+  const indexPath = path.join(uiDistPath, 'index.html');
+  if (fs.existsSync(indexPath)) {
+    res.writeHead(200, {
+      'Content-Type': 'text/html',
+      'Cache-Control': 'no-cache',
+    });
+    fs.createReadStream(indexPath).pipe(res);
+    return true;
+  }
+
+  res.writeHead(404, { 'Content-Type': 'text/plain' });
+  res.end('Not found');
+  return true;
 }
 
-function handleIntervene(
-  req: IncomingMessage,
-  res: ServerResponse,
-  deps: WebUIDeps,
-): void {
-  let body = '';
-  let aborted = false;
-  req.on('error', () => {
-    aborted = true;
-  });
-  req.on('data', (chunk: Buffer) => {
-    if (body.length + chunk.length > 65_536) {
-      aborted = true;
-      req.destroy();
-      res.writeHead(413, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: false, error: 'Body too large' }));
-      return;
-    }
-    body += chunk;
-  });
-  req.on('end', () => {
-    if (aborted) return;
-    try {
-      const { groupJid, threadId, text } = JSON.parse(body);
-      if (!groupJid || !text) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(
-          JSON.stringify({ ok: false, error: 'Missing groupJid or text' }),
-        );
-        return;
-      }
-      const ok = deps.sendMessage(groupJid, threadId, text);
-      res.writeHead(ok ? 200 : 404, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok }));
-    } catch {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: false, error: 'Invalid JSON' }));
-    }
-  });
-}
-
-function handleSend(
-  req: IncomingMessage,
-  res: ServerResponse,
-  deps: WebUIDeps,
-): void {
-  let body = '';
-  let aborted = false;
-  req.on('error', () => {
-    aborted = true;
-  });
-  req.on('data', (chunk: Buffer) => {
-    if (body.length + chunk.length > 65_536) {
-      aborted = true;
-      req.destroy();
-      res.writeHead(413, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: false, error: 'Body too large' }));
-      return;
-    }
-    body += chunk;
-  });
-  req.on('end', () => {
-    if (aborted) return;
-    try {
-      const { groupJid, text } = JSON.parse(body);
-      if (!groupJid || !text) {
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(
-          JSON.stringify({ ok: false, error: 'Missing groupJid or text' }),
-        );
-        return;
-      }
-      const ok = deps.startSession(groupJid, text);
-      res.writeHead(ok ? 200 : 404, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok }));
-    } catch {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: false, error: 'Invalid JSON' }));
-    }
-  });
-}
+// --- Server startup ---
 
 export function startWebUI(
   port: number,
@@ -228,9 +303,60 @@ export function startWebUI(
   deps: WebUIDeps,
   token: string,
 ): Promise<WebUIHandle> {
+  // Build capabilities deps
+  const capDeps: CapabilityDeps = {
+    getRegisteredGroups: deps.getRegisteredGroups,
+  };
+
+  const getCapabilitiesFn = (): Capabilities => getCapabilities(capDeps);
+
+  // WebSocket notification functions (set after initWebSocket)
+  let broadcastWs: (
+    sessionKey: string,
+    group: string,
+    event: unknown,
+  ) => void = () => {};
+  let notifyWsSessionStart: (
+    sessionKey: string,
+    group: string,
+    groupJid: string,
+    threadId?: string,
+  ) => void = () => {};
+  let notifyWsSessionEnd: (sessionKey: string) => void = () => {};
+  let notifyWsSkillInstall: (
+    jobId: string,
+    output: string,
+    status: 'running' | 'completed' | 'failed',
+  ) => void = () => {};
+
+  // Route deps
+  const routeDeps: RouteDeps = {
+    sendMessage: deps.sendMessage,
+    getRegisteredGroups: deps.getRegisteredGroups,
+    startSession: deps.startSession,
+    getCapabilities: getCapabilitiesFn,
+    activeSessions: () => activeSessions,
+    addSseClient,
+    onSkillInstallProgress: (jobId, output) =>
+      notifyWsSkillInstall(jobId, output, 'running'),
+    onSkillInstallComplete: (jobId, success) =>
+      notifyWsSkillInstall(jobId, '', success ? 'completed' : 'failed'),
+  };
+
   const server = createServer((req, res) => {
-    // Strip query params for route matching
-    const pathname = (req.url || '/').split('?')[0];
+    // Security headers on every response
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'DENY');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+
+    const url = new URL(
+      req.url || '/',
+      `http://${req.headers.host || 'localhost'}`,
+    );
+    const pathname = url.pathname;
+
+    // CORS runs first on all requests
+    if (handleCors(req, res)) return; // Was a preflight OPTIONS — already handled
 
     // Serve HTML unauthenticated — login form is handled client-side
     if (pathname === '/' && req.method === 'GET') {
@@ -248,42 +374,39 @@ export function startWebUI(
       return;
     }
 
-    // Auth check on all other endpoints
+    // Static file serving for bundled SPA (unauthenticated, like / )
+    if (pathname === '/ui' || pathname.startsWith('/ui/')) {
+      // Redirect /ui to /ui/
+      if (pathname === '/ui') {
+        res.writeHead(301, { Location: '/ui/' });
+        res.end();
+        return;
+      }
+      serveStaticFile(pathname, res);
+      return;
+    }
+
+    // Auth check on all API endpoints
     if (!checkAuth(req, token)) {
       rejectAuth(res);
       return;
     }
 
-    if (pathname === '/events' && req.method === 'GET') {
-      // SSE endpoint
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        Connection: 'keep-alive',
+    // Route matching
+    handleRoute(pathname, req.method || 'GET', url, req, res, routeDeps)
+      .then((handled) => {
+        if (!handled) {
+          res.writeHead(404, { 'Content-Type': 'text/plain' });
+          res.end('Not found');
+        }
+      })
+      .catch((err) => {
+        logger.error({ err }, 'Route handler error');
+        if (!res.headersSent) {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Internal server error' }));
+        }
       });
-      res.write(
-        `data: ${JSON.stringify({ type: 'sessions', sessions: Object.fromEntries(activeSessions) })}\n\n`,
-      );
-      clients.add(res);
-      req.on('close', () => clients.delete(res));
-    } else if (pathname === '/api/intervene' && req.method === 'POST') {
-      handleIntervene(req, res, deps);
-    } else if (pathname === '/api/groups' && req.method === 'GET') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ groups: deps.getRegisteredGroups() }));
-    } else if (pathname === '/api/send' && req.method === 'POST') {
-      handleSend(req, res, deps);
-    } else if (pathname === '/api/sessions' && req.method === 'GET') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(
-        JSON.stringify({
-          sessions: Object.fromEntries(activeSessions),
-        }),
-      );
-    } else {
-      res.writeHead(404, { 'Content-Type': 'text/plain' });
-      res.end('Not found');
-    }
   });
 
   // Bind publicly when token is set (authenticated), localhost-only otherwise
@@ -292,11 +415,60 @@ export function startWebUI(
   return new Promise((resolve, reject) => {
     server.on('error', reject);
     server.listen(port, bindAddress, () => {
+      // Initialize WebSocket after server is listening
+      const wsDeps: WsDeps = {
+        checkAuth,
+        getCapabilities: getCapabilitiesFn,
+        startSession: deps.startSessionWs,
+      };
+      const wsHandlers = initWebSocket(server, wsDeps, token);
+      broadcastWs = wsHandlers.broadcastWs;
+      notifyWsSessionStart = wsHandlers.notifyWsSessionStart;
+      notifyWsSessionEnd = wsHandlers.notifyWsSessionEnd;
+      notifyWsSkillInstall = wsHandlers.notifyWsSkillInstall;
+
       logger.info(
-        { port, bindAddress, authEnabled: !!token },
+        {
+          port,
+          bindAddress,
+          authEnabled: !!token,
+          bundledUi: !!uiDistPath,
+        },
         'Web UI started',
       );
-      resolve({ broadcast, notifySessionStart, notifySessionEnd });
+
+      // Unified broadcast/notify that forward to both SSE and WS clients
+      const broadcast = (
+        sessionKey: string,
+        group: string,
+        threadId: string | undefined,
+        event: ProgressEvent,
+      ): void => {
+        broadcastSse(sessionKey, group, threadId, event);
+        broadcastWs(sessionKey, group, event);
+      };
+
+      const notifySessionStart = (
+        sessionKey: string,
+        group: string,
+        groupJid: string,
+        threadId?: string,
+      ): void => {
+        notifySessionStartSse(sessionKey, group, groupJid, threadId);
+        notifyWsSessionStart(sessionKey, group, groupJid, threadId);
+      };
+
+      const notifySessionEnd = (sessionKey: string): void => {
+        notifySessionEndSse(sessionKey);
+        notifyWsSessionEnd(sessionKey);
+      };
+
+      resolve({
+        server,
+        broadcast,
+        notifySessionStart,
+        notifySessionEnd,
+      });
     });
   });
 }
