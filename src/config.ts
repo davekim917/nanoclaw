@@ -11,6 +11,8 @@ const envConfig = readEnvFile([
   'ASSISTANT_HAS_OWN_NUMBER',
   'RESIDENTIAL_PROXY_URL',
   'WEB_UI_TOKEN',
+  'WEB_UI_ORIGINS',
+  'WEB_UI_SENDER_NAME',
 ]);
 
 export const ASSISTANT_NAME =
@@ -189,3 +191,15 @@ export const WEB_UI_PORT = parseInt(process.env.WEB_UI_PORT || '3002', 10);
 // Token for web UI access — when set, binds to 0.0.0.0 (public); when unset, binds to 127.0.0.1 (local only)
 export const WEB_UI_TOKEN =
   process.env.WEB_UI_TOKEN || envConfig.WEB_UI_TOKEN || '';
+
+// Allowed CORS origins for the web UI (comma-separated in .env)
+const rawOrigins =
+  process.env.WEB_UI_ORIGINS || envConfig.WEB_UI_ORIGINS || '';
+export const WEB_UI_ORIGINS: string[] = rawOrigins
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+// Sender name used for messages submitted via the web UI
+export const WEB_UI_SENDER_NAME: string =
+  process.env.WEB_UI_SENDER_NAME || envConfig.WEB_UI_SENDER_NAME || 'Web User';

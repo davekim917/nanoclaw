@@ -1153,6 +1153,30 @@ export function logTaskRun(log: TaskRunLog): void {
   );
 }
 
+export interface TaskRunLogRow extends TaskRunLog {
+  id: number;
+}
+
+export function getTaskRunLogs(
+  taskId: string,
+  limit: number = 50,
+  offset: number = 0,
+): { data: TaskRunLogRow[]; total: number } {
+  const total = (
+    db
+      .prepare(
+        'SELECT COUNT(*) AS c FROM task_run_logs WHERE task_id = ?',
+      )
+      .get(taskId) as { c: number }
+  ).c;
+  const data = db
+    .prepare(
+      'SELECT * FROM task_run_logs WHERE task_id = ? ORDER BY run_at DESC LIMIT ? OFFSET ?',
+    )
+    .all(taskId, limit, offset) as TaskRunLogRow[];
+  return { data, total };
+}
+
 // --- Router state accessors ---
 
 export function getRouterState(key: string): string | undefined {
@@ -1203,6 +1227,14 @@ export interface SessionV2Row {
   session_id: string;
   last_activity: string;
   created_at: string;
+}
+
+// Extends SessionV2Row with columns added via ALTER TABLE migrations
+export interface SessionV2Full extends SessionV2Row {
+  model: string | null;
+  effort: string | null;
+  processing: number; // 0 or 1
+  chat_jid: string | null;
 }
 
 export function buildSessionKey(
@@ -1332,6 +1364,26 @@ export function getAllSessionsV2(): Map<string, string> {
     result.set(row.session_key, row.session_id);
   }
   return result;
+}
+
+export function getSessionsV2Full(
+  groupFolder: string,
+  limit: number = 50,
+  offset: number = 0,
+): { data: SessionV2Full[]; total: number } {
+  const total = (
+    db
+      .prepare(
+        'SELECT COUNT(*) AS c FROM sessions_v2 WHERE group_folder = ?',
+      )
+      .get(groupFolder) as { c: number }
+  ).c;
+  const data = db
+    .prepare(
+      'SELECT * FROM sessions_v2 WHERE group_folder = ? ORDER BY last_activity DESC LIMIT ? OFFSET ?',
+    )
+    .all(groupFolder, limit, offset) as SessionV2Full[];
+  return { data, total };
 }
 
 // --- Thread search accessors (Plan C: FTS5 + Haiku reranking) ---
@@ -2106,4 +2158,123 @@ export function recentMemoriesAllGroups(topK = 6): Memory[] {
        FROM memories ORDER BY updated_at DESC, rowid DESC LIMIT ?`,
     )
     .all(topK) as Memory[];
+}
+
+// --- Paginated wrappers for Web UI ---
+
+export function getShipLogPaginated(
+  groupFolder: string,
+  limit: number = 50,
+  offset: number = 0,
+): { data: ShipLogEntry[]; total: number } {
+  const total = (
+    db
+      .prepare(
+        'SELECT COUNT(*) AS c FROM ship_log WHERE group_folder = ?',
+      )
+      .get(groupFolder) as { c: number }
+  ).c;
+  const data = db
+    .prepare(
+      'SELECT * FROM ship_log WHERE group_folder = ? ORDER BY shipped_at DESC LIMIT ? OFFSET ?',
+    )
+    .all(groupFolder, limit, offset) as ShipLogEntry[];
+  return { data, total };
+}
+
+export function getBacklogPaginated(
+  groupFolder: string,
+  status?: string,
+  limit: number = 50,
+  offset: number = 0,
+): { data: BacklogItem[]; total: number } {
+  if (status) {
+    const total = (
+      db
+        .prepare(
+          'SELECT COUNT(*) AS c FROM backlog WHERE group_folder = ? AND status = ?',
+        )
+        .get(groupFolder, status) as { c: number }
+    ).c;
+    const data = db
+      .prepare(
+        `SELECT * FROM backlog WHERE group_folder = ? AND status = ? ORDER BY ${PRIORITY_ORDER}, created_at DESC LIMIT ? OFFSET ?`,
+      )
+      .all(groupFolder, status, limit, offset) as BacklogItem[];
+    return { data, total };
+  }
+  const total = (
+    db
+      .prepare(
+        'SELECT COUNT(*) AS c FROM backlog WHERE group_folder = ?',
+      )
+      .get(groupFolder) as { c: number }
+  ).c;
+  const data = db
+    .prepare(
+      `SELECT * FROM backlog WHERE group_folder = ? ORDER BY
+         CASE status WHEN 'in_progress' THEN 0 WHEN 'open' THEN 1 ELSE 2 END,
+         ${PRIORITY_ORDER},
+         created_at DESC LIMIT ? OFFSET ?`,
+    )
+    .all(groupFolder, limit, offset) as BacklogItem[];
+  return { data, total };
+}
+
+export function listMemoriesPaginated(
+  groupFolder: string,
+  limit: number = 50,
+  offset: number = 0,
+): { data: Memory[]; total: number } {
+  const total = (
+    db
+      .prepare(
+        'SELECT COUNT(*) AS c FROM memories WHERE group_folder = ?',
+      )
+      .get(groupFolder) as { c: number }
+  ).c;
+  const data = db
+    .prepare(
+      `SELECT id, group_folder, type, name, description, content, created_at, updated_at
+       FROM memories WHERE group_folder = ? ORDER BY updated_at DESC, rowid DESC LIMIT ? OFFSET ?`,
+    )
+    .all(groupFolder, limit, offset) as Memory[];
+  return { data, total };
+}
+
+export function getTasksForGroupPaginated(
+  groupFolder: string,
+  limit: number = 50,
+  offset: number = 0,
+): { data: ScheduledTask[]; total: number } {
+  const total = (
+    db
+      .prepare(
+        'SELECT COUNT(*) AS c FROM scheduled_tasks WHERE group_folder = ?',
+      )
+      .get(groupFolder) as { c: number }
+  ).c;
+  const data = db
+    .prepare(
+      'SELECT * FROM scheduled_tasks WHERE group_folder = ? ORDER BY created_at DESC LIMIT ? OFFSET ?',
+    )
+    .all(groupFolder, limit, offset) as ScheduledTask[];
+  return { data, total };
+}
+
+export function getAllTasksPaginated(
+  limit: number = 50,
+  offset: number = 0,
+): { data: ScheduledTask[]; total: number } {
+  const total = (
+    db
+      .prepare('SELECT COUNT(*) AS c FROM scheduled_tasks')
+      .get() as { c: number }
+  ).c;
+  const data = db
+    .prepare(
+      'SELECT * FROM scheduled_tasks ORDER BY created_at DESC LIMIT ? OFFSET ?',
+    )
+    .all(limit, offset) as ScheduledTask[];
+  return { data, total };
 }
