@@ -2305,7 +2305,6 @@ export function getAllTasksPaginated(
 
 // --- Capability detection helpers (used by api/capabilities.ts) ---
 
-
 /** Check if any backlog items exist across all groups. */
 export function countAllBacklog(): boolean {
   const row = db.prepare('SELECT 1 FROM backlog LIMIT 1').get();
