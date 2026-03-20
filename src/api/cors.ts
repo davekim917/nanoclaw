@@ -49,6 +49,7 @@ export function handleCors(
   res.setHeader('Access-Control-Allow-Methods', ALLOWED_METHODS);
   res.setHeader('Access-Control-Allow-Headers', ALLOWED_HEADERS);
   res.setHeader('Access-Control-Max-Age', MAX_AGE);
+  res.setHeader('Vary', 'Origin');
 
   // Handle preflight
   if (req.method === 'OPTIONS') {

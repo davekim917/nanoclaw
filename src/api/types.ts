@@ -37,7 +37,7 @@ export type WsClientMessage =
       senderId?: string;
       threadId?: string;
     }
-  | { type: 'subscribe'; groups?: string[] };
+  | { type: 'subscribe'; groups?: string[]; since?: number };
 
 export type WsServerMessage =
   | { type: 'connected'; capabilities: Capabilities }
@@ -52,6 +52,7 @@ export type WsServerMessage =
       sessionKey: string;
       group: string;
       groupJid: string;
+      threadId?: string;
     }
   | { type: 'session_end'; sessionKey: string }
   | { type: 'message_stored'; id: string }

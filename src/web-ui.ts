@@ -100,7 +100,7 @@ interface WebUIDeps {
     text: string,
     senderName: string,
     senderId: string,
-  ) => boolean;
+  ) => string | false;
 }
 
 export interface WebUIHandle {

@@ -9,6 +9,8 @@ import fs from 'fs';
 import path from 'path';
 
 import { getRegisteredChannelNames } from '../channels/registry.js';
+import { COMMIT_DIGEST_TASK_ID } from '../commit-digest.js';
+import { DAILY_TASK_ID } from '../daily-notifications.js';
 import {
   countAllBacklog,
   countAllMemories,
@@ -57,22 +59,17 @@ export function getCapabilities(deps: CapabilityDeps): Capabilities {
   // Gate protocol: check if pending gates have ever been created
   const gateProtocolAvailable = countPendingGates() > 0;
 
-  // Activity summary / Commit digest: look for system tasks with known identifiers
+  // Activity summary / Commit digest: match by task ID, not prompt content
   let activitySummaryAvailable = false;
   let commitDigestAvailable = false;
   try {
     const allTasks = getAllTasks();
     for (const task of allTasks) {
-      if (task.task_type === 'system') {
-        if (
-          task.prompt.includes('daily-notifications') ||
-          task.prompt.includes('activity-summary')
-        ) {
-          activitySummaryAvailable = true;
-        }
-        if (task.prompt.includes('commit-digest')) {
-          commitDigestAvailable = true;
-        }
+      if (task.id === DAILY_TASK_ID) {
+        activitySummaryAvailable = true;
+      }
+      if (task.id === COMMIT_DIGEST_TASK_ID) {
+        commitDigestAvailable = true;
       }
     }
   } catch {

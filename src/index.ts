@@ -2079,8 +2079,9 @@ async function main(): Promise<void> {
         const assistantName = resolveAssistantName(group.containerConfig);
         const trigger =
           group.requiresTrigger !== false ? `@${assistantName} ` : '';
+        const msgId = `web-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
         storeMessage({
-          id: `web-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`,
+          id: msgId,
           chat_jid: groupJid,
           sender: senderId || 'web-ui',
           sender_name: senderName,
@@ -2089,7 +2090,7 @@ async function main(): Promise<void> {
           is_from_me: false,
         });
         queue.enqueueMessageCheck(groupJid);
-        return true;
+        return msgId;
       },
     },
     WEB_UI_TOKEN,

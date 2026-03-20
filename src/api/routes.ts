@@ -12,6 +12,7 @@ import {
   getBacklogPaginated,
   getRecentMessages,
   getSessionsV2Full,
+  getSessionV2ByKey,
   getShipLogPaginated,
   getTaskById,
   getTaskRunLogs,
@@ -85,19 +86,6 @@ function requireGroup(url: URL, res: ServerResponse): string | null {
     return null;
   }
   return group;
-}
-
-/**
- * Extract a path parameter from a URL pathname.
- * Pattern: /api/resource/:param/... where segmentIndex is the position of :param.
- */
-function extractParam(
-  pathname: string,
-  segmentIndex: number,
-): string | null {
-  const segments = pathname.split('/').filter(Boolean);
-  if (segmentIndex >= segments.length) return null;
-  return decodeURIComponent(segments[segmentIndex]);
 }
 
 // --- Route handler ---
@@ -202,23 +190,26 @@ export async function handleRoute(
   );
   if (sessKeyMsgMatch && method === 'GET') {
     const sessionKey = decodeURIComponent(sessKeyMsgMatch[1]);
-    // Look up session to get chat_jid
     const { limit } = parsePagination(url);
-    // Use the session key to find the session's chat_jid
-    // Session key format is typically "groupFolder" or "groupFolder:threadId"
-    // We need to check active sessions first, then DB
+
+    // Check active sessions first
     const active = deps.activeSessions();
     const session = active.get(sessionKey);
     if (session) {
-      const chatJid = session.groupJid;
-      const messages = getRecentMessages(chatJid, limit);
+      const messages = getRecentMessages(session.groupJid, limit);
       json(res, 200, { data: messages, sessionKey });
-    } else {
-      // Try to get from sessions_v2 via the full session data
-      const result = getSessionsV2Full('', 1000, 0); // This won't work well
-      // Better approach: look up by session key directly
-      json(res, 404, { error: 'Session not found' });
+      return true;
     }
+
+    // Fall back to DB lookup by session_key
+    const dbSession = getSessionV2ByKey(sessionKey);
+    if (dbSession?.chat_jid) {
+      const messages = getRecentMessages(dbSession.chat_jid, limit);
+      json(res, 200, { data: messages, sessionKey });
+      return true;
+    }
+
+    json(res, 404, { error: 'Session not found' });
     return true;
   }
 
@@ -284,7 +275,7 @@ export async function handleRoute(
       json(res, 404, { error: 'Task not found' });
       return true;
     }
-    json(res, 200, task);
+    json(res, 200, { data: task });
     return true;
   }
 
@@ -316,6 +307,60 @@ export async function handleRoute(
         json(res, 400, { error: 'No valid fields to update' });
         return true;
       }
+
+      // BUG 7: Validate field values
+      const VALID_STATUSES = ['active', 'paused', 'completed'];
+      const VALID_SCHEDULE_TYPES = ['cron', 'interval', 'once'];
+
+      if (
+        updates.status !== undefined &&
+        (typeof updates.status !== 'string' ||
+          !VALID_STATUSES.includes(updates.status))
+      ) {
+        json(res, 400, {
+          error: `Invalid status: must be one of ${VALID_STATUSES.join(', ')}`,
+        });
+        return true;
+      }
+      if (
+        updates.schedule_type !== undefined &&
+        (typeof updates.schedule_type !== 'string' ||
+          !VALID_SCHEDULE_TYPES.includes(updates.schedule_type))
+      ) {
+        json(res, 400, {
+          error: `Invalid schedule_type: must be one of ${VALID_SCHEDULE_TYPES.join(', ')}`,
+        });
+        return true;
+      }
+      // Determine the effective schedule_type for cron validation
+      const effectiveScheduleType =
+        (updates.schedule_type as string) || task.schedule_type;
+      if (
+        updates.schedule_value !== undefined &&
+        effectiveScheduleType === 'cron'
+      ) {
+        if (
+          typeof updates.schedule_value !== 'string' ||
+          updates.schedule_value.trim() === ''
+        ) {
+          json(res, 400, {
+            error: 'Invalid schedule_value: cron expression must be a non-empty string',
+          });
+          return true;
+        }
+      }
+      if (updates.schedule_tz !== undefined && updates.schedule_tz !== null) {
+        if (
+          typeof updates.schedule_tz !== 'string' ||
+          updates.schedule_tz.trim() === ''
+        ) {
+          json(res, 400, {
+            error: 'Invalid schedule_tz: must be a non-empty string',
+          });
+          return true;
+        }
+      }
+
       updateTask(
         taskId,
         updates as Parameters<typeof updateTask>[1],
@@ -350,9 +395,11 @@ export async function handleRoute(
       json(res, 400, { error: 'Missing required parameter: q' });
       return true;
     }
-    const { limit } = parsePagination(url);
-    const data = searchMemoriesKeyword(group, q, limit);
-    json(res, 200, { data, total: data.length, limit, offset: 0 });
+    const { limit, offset } = parsePagination(url);
+    // Fetch extra results to support offset, then slice
+    const all = searchMemoriesKeyword(group, q, limit + offset);
+    const data = all.slice(offset);
+    json(res, 200, { data, total: all.length, limit, offset });
     return true;
   }
 
@@ -386,6 +433,7 @@ export async function handleRoute(
       json(res, 400, { error: 'Missing required parameter: q' });
       return true;
     }
+    const { limit, offset } = parsePagination(url);
     try {
       // 10-second timeout via AbortController pattern
       const data = await Promise.race([
@@ -394,18 +442,20 @@ export async function handleRoute(
           setTimeout(() => reject(new Error('Thread search timeout')), 10_000),
         ),
       ]);
-      json(res, 200, { data, total: data.length });
+      json(res, 200, { data, total: data.length, limit, offset });
     } catch (err) {
       logger.warn({ err, group, query: q }, 'Thread search failed/timed out');
-      json(res, 200, { data: [], total: 0, error: 'search_timeout' });
+      json(res, 200, { data: [], total: 0, limit, offset, error: 'search_timeout' });
     }
     return true;
   }
 
   // GET /api/skills/installed
   if (pathname === '/api/skills/installed' && method === 'GET') {
-    const data = getInstalledSkills();
-    json(res, 200, { data, total: data.length });
+    const { limit, offset } = parsePagination(url);
+    const all = getInstalledSkills();
+    const data = all.slice(offset, offset + limit);
+    json(res, 200, { data, total: all.length, limit, offset });
     return true;
   }
 

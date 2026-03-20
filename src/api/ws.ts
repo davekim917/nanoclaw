@@ -27,23 +27,25 @@ interface RateState {
 // --- Ring buffer for reconnection replay ---
 
 const RING_BUFFER_SIZE = 500;
-const ringBuffer: Array<{ data: string; timestamp: number }> = [];
+const ringBuffer: Array<{ data: string; timestamp: number; group: string }> =
+  [];
 let ringHead = 0;
 let ringCount = 0;
 
-function pushToRingBuffer(data: string): void {
+function pushToRingBuffer(data: string, group: string): void {
   if (ringCount < RING_BUFFER_SIZE) {
-    ringBuffer.push({ data, timestamp: Date.now() });
+    ringBuffer.push({ data, timestamp: Date.now(), group });
     ringCount++;
   } else {
-    ringBuffer[ringHead] = { data, timestamp: Date.now() };
+    ringBuffer[ringHead] = { data, timestamp: Date.now(), group };
     ringHead = (ringHead + 1) % RING_BUFFER_SIZE;
   }
 }
 
-/** Get events from the ring buffer after a given timestamp. */
+/** Get events from the ring buffer after a given timestamp, filtered by group. */
 export function getEventsSince(
   since: number,
+  subscribedGroups: Set<string> | null,
 ): Array<{ data: string; timestamp: number }> {
   const results: Array<{ data: string; timestamp: number }> = [];
   const len = ringCount;
@@ -54,22 +56,57 @@ export function getEventsSince(
         : (ringHead + i) % RING_BUFFER_SIZE;
     const entry = ringBuffer[idx];
     if (entry && entry.timestamp > since) {
+      // Filter by subscribed groups if specified.
+      // Empty-group entries (e.g. session_end) always pass through.
+      if (
+        subscribedGroups !== null &&
+        entry.group !== '' &&
+        !subscribedGroups.has(entry.group)
+      ) {
+        continue;
+      }
       results.push(entry);
     }
   }
   return results;
 }
 
+/** Get the timestamp of the oldest entry in the ring buffer, or 0 if empty. */
+function getOldestBufferTimestamp(): number {
+  if (ringCount === 0) return 0;
+  const oldestIdx =
+    ringCount < RING_BUFFER_SIZE ? 0 : ringHead;
+  return ringBuffer[oldestIdx]?.timestamp ?? 0;
+}
+
+// --- Max connections ---
+
+const MAX_WS_CONNECTIONS = 100;
+
 // --- Backpressure threshold ---
 
 const BACKPRESSURE_THRESHOLD = 1_048_576; // 1MB
+
+// --- Module-level rate tracking (survives reconnects) ---
+
+const rateLimitByToken = new Map<string, RateState>();
+
+/** Clean up stale rate-limit entries every 5 minutes. */
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, state] of rateLimitByToken) {
+    if (now - state.windowStart > RATE_LIMIT_WINDOW_MS * 2) {
+      rateLimitByToken.delete(key);
+    }
+  }
+}, 5 * 60_000).unref();
 
 // --- Connection tracking ---
 
 interface WsClient {
   ws: WebSocket;
   subscribedGroups: Set<string> | null; // null = all groups (default)
-  rateState: RateState;
+  tokenHash: string; // first 16 chars of token for rate tracking
 }
 
 const wsClients = new Set<WsClient>();
@@ -84,7 +121,7 @@ export interface WsDeps {
     text: string,
     senderName: string,
     senderId: string,
-  ) => boolean;
+  ) => string | false;
 }
 
 // --- Helpers ---
@@ -95,13 +132,15 @@ function sendJson(ws: WebSocket, msg: WsServerMessage): void {
   }
 }
 
-function checkRateLimit(client: WsClient): boolean {
+function checkRateLimit(tokenHash: string): boolean {
   const now = Date.now();
-  if (now - client.rateState.windowStart > RATE_LIMIT_WINDOW_MS) {
-    client.rateState = { count: 0, windowStart: now };
+  let state = rateLimitByToken.get(tokenHash);
+  if (!state || now - state.windowStart > RATE_LIMIT_WINDOW_MS) {
+    state = { count: 0, windowStart: now };
+    rateLimitByToken.set(tokenHash, state);
   }
-  client.rateState.count++;
-  return client.rateState.count <= RATE_LIMIT_MAX;
+  state.count++;
+  return state.count <= RATE_LIMIT_MAX;
 }
 
 function validateOrigin(req: IncomingMessage): boolean {
@@ -149,10 +188,17 @@ export function initWebSocket(
     status: string,
   ) => void;
 } {
-  const wss = new WebSocketServer({ noServer: true });
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 65_536 });
 
   // Handle HTTP upgrade
   server.on('upgrade', (req, socket, head) => {
+    // BUG 5: Reject if at connection limit (before auth to save work)
+    if (wsClients.size >= MAX_WS_CONNECTIONS) {
+      socket.write('HTTP/1.1 503 Service Unavailable\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+
     // Auth check
     if (!deps.checkAuth(req, token)) {
       socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
@@ -173,11 +219,19 @@ export function initWebSocket(
   });
 
   // Handle new connections
-  wss.on('connection', (ws: WebSocket, _req: IncomingMessage) => {
+  wss.on('connection', (ws: WebSocket, req: IncomingMessage) => {
+    // Extract token hash for rate limiting (survives reconnects)
+    const reqUrl = new URL(
+      req.url || '/',
+      `http://${req.headers.host || 'localhost'}`,
+    );
+    const tokenParam = reqUrl.searchParams.get('token') || '';
+    const tokenHash = tokenParam.slice(0, 16) || 'anonymous';
+
     const client: WsClient = {
       ws,
       subscribedGroups: null, // default: all groups
-      rateState: { count: 0, windowStart: Date.now() },
+      tokenHash,
     };
     wsClients.add(client);
 
@@ -189,7 +243,7 @@ export function initWebSocket(
 
     // Handle incoming messages
     ws.on('message', (raw: Buffer | string) => {
-      let msg: { type: string; [key: string]: unknown };
+      let msg: unknown;
       try {
         msg = JSON.parse(
           typeof raw === 'string' ? raw : raw.toString('utf-8'),
@@ -203,9 +257,25 @@ export function initWebSocket(
         return;
       }
 
-      if (msg.type === 'send_message') {
-        // Rate limit check
-        if (!checkRateLimit(client)) {
+      // BUG 10: Validate parsed message shape
+      if (
+        !msg ||
+        typeof msg !== 'object' ||
+        typeof (msg as Record<string, unknown>).type !== 'string'
+      ) {
+        sendJson(ws, {
+          type: 'error',
+          code: 'invalid_message',
+          message: 'Message must be an object with a string "type" field',
+        });
+        return;
+      }
+
+      const parsed = msg as Record<string, unknown>;
+
+      if (parsed.type === 'send_message') {
+        // Rate limit check (BUG 6: keyed by token hash, not per-connection)
+        if (!checkRateLimit(client.tokenHash)) {
           sendJson(ws, {
             type: 'error',
             code: 'rate_limited',
@@ -214,25 +284,28 @@ export function initWebSocket(
           return;
         }
 
-        const groupJid = msg.groupJid as string | undefined;
-        const text = msg.text as string | undefined;
-        const senderName = (msg.senderName as string) || WEB_UI_SENDER_NAME;
-        const senderId =
-          (msg.senderId as string) || `web-ui-${crypto.randomUUID().slice(0, 8)}`;
-
-        if (!groupJid || !text) {
+        // BUG 10: Validate field types, not just truthiness
+        const groupJid = parsed.groupJid;
+        const text = parsed.text;
+        if (typeof groupJid !== 'string' || typeof text !== 'string') {
           sendJson(ws, {
             type: 'error',
             code: 'invalid_params',
-            message: 'Missing required fields: groupJid, text',
+            message: 'Missing required fields: groupJid (string), text (string)',
           });
           return;
         }
 
-        // startSession applies trigger prefix injection internally
-        const ok = deps.startSession(groupJid, text, senderName, senderId);
-        if (ok) {
-          const msgId = `web-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
+        const senderName =
+          (typeof parsed.senderName === 'string' && parsed.senderName) ||
+          WEB_UI_SENDER_NAME;
+        const senderId =
+          (typeof parsed.senderId === 'string' && parsed.senderId) ||
+          `web-ui-${crypto.randomUUID().slice(0, 8)}`;
+
+        // S3: startSession now returns the real message ID or false
+        const msgId = deps.startSession(groupJid, text, senderName, senderId);
+        if (msgId) {
           sendJson(ws, { type: 'message_stored', id: msgId });
         } else {
           sendJson(ws, {
@@ -241,18 +314,37 @@ export function initWebSocket(
             message: `Group not found: ${groupJid}`,
           });
         }
-      } else if (msg.type === 'subscribe') {
-        const groups = msg.groups as string[] | undefined;
+      } else if (parsed.type === 'subscribe') {
+        const groups = parsed.groups;
         if (groups && Array.isArray(groups)) {
-          client.subscribedGroups = new Set(groups);
+          client.subscribedGroups = new Set(
+            groups.filter((g): g is string => typeof g === 'string'),
+          );
         } else {
           client.subscribedGroups = null; // all groups
+        }
+
+        // BUG 9: Replay missed events on subscribe with since
+        const since = parsed.since;
+        if (typeof since === 'number' && since > 0) {
+          const oldest = getOldestBufferTimestamp();
+          if (oldest > 0 && since < oldest) {
+            // Requested timestamp is older than our buffer — full resync needed
+            sendJson(ws, { type: 'resync' });
+          } else {
+            const missed = getEventsSince(since, client.subscribedGroups);
+            for (const entry of missed) {
+              if (ws.readyState === WebSocket.OPEN) {
+                ws.send(entry.data);
+              }
+            }
+          }
         }
       } else {
         sendJson(ws, {
           type: 'error',
           code: 'unknown_type',
-          message: `Unknown message type: ${msg.type}`,
+          message: `Unknown message type: ${String(parsed.type)}`,
         });
       }
     });
@@ -281,7 +373,7 @@ export function initWebSocket(
       event,
     };
     const data = JSON.stringify(msg);
-    pushToRingBuffer(data);
+    pushToRingBuffer(data, group);
 
     for (const client of wsClients) {
       // Group filter
@@ -314,9 +406,10 @@ export function initWebSocket(
       sessionKey,
       group,
       groupJid,
+      threadId,
     };
     const data = JSON.stringify(msg);
-    pushToRingBuffer(data);
+    pushToRingBuffer(data, group);
 
     for (const client of wsClients) {
       if (
@@ -335,7 +428,7 @@ export function initWebSocket(
   function notifyWsSessionEnd(sessionKey: string): void {
     const msg: WsServerMessage = { type: 'session_end', sessionKey };
     const data = JSON.stringify(msg);
-    pushToRingBuffer(data);
+    pushToRingBuffer(data, '');
 
     for (const client of wsClients) {
       // No group filter — session_end doesn't include group info

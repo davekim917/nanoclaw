@@ -56,6 +56,7 @@ const marketplaceCache = new Map<string, CacheEntry>();
 // --- Install job tracking ---
 
 const installJobs = new Map<string, SkillInstallJob>();
+const MAX_JOBS = 100;
 const MAX_OUTPUT_BYTES = 1_048_576; // 1MB
 
 // --- Installed skills ---
@@ -276,7 +277,7 @@ export async function searchMarketplace(query: string): Promise<{
   return new Promise((resolve) => {
     const child = execFile(
       'npx',
-      ['skills', 'find', query],
+      ['skills', 'find', '--', query],
       { timeout: 10_000, maxBuffer: MAX_OUTPUT_BYTES },
       (error, stdout, stderr) => {
         if (error) {
@@ -319,6 +320,31 @@ export function startSkillInstall(
       error: `Invalid repo format: must match owner/repo pattern`,
       status: 400,
     };
+  }
+
+  // S1: Prune old completed/failed jobs to cap installJobs map
+  if (installJobs.size >= MAX_JOBS) {
+    const oneHourAgo = Date.now() - 60 * 60 * 1000;
+    for (const [id, j] of installJobs) {
+      if (
+        (j.status === 'completed' || j.status === 'failed') &&
+        new Date(j.startedAt).getTime() < oneHourAgo
+      ) {
+        installJobs.delete(id);
+      }
+    }
+    // If still over cap, remove oldest entries
+    if (installJobs.size >= MAX_JOBS) {
+      const sorted = [...installJobs.entries()].sort(
+        (a, b) =>
+          new Date(a[1].startedAt).getTime() -
+          new Date(b[1].startedAt).getTime(),
+      );
+      while (installJobs.size >= MAX_JOBS && sorted.length > 0) {
+        const oldest = sorted.shift()!;
+        installJobs.delete(oldest[0]);
+      }
+    }
   }
 
   const jobId = crypto.randomUUID();

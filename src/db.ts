@@ -1261,6 +1261,15 @@ export function getSessionV2(
     .get(key) as { session_id: string; last_activity: string } | undefined;
 }
 
+/** Get a session_v2 row by session_key, including chat_jid. */
+export function getSessionV2ByKey(
+  key: string,
+): SessionV2Full | undefined {
+  return db
+    .prepare('SELECT * FROM sessions_v2 WHERE session_key = ?')
+    .get(key) as SessionV2Full | undefined;
+}
+
 export function setSessionV2(
   key: string,
   groupFolder: string,
