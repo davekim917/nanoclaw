@@ -34,7 +34,6 @@ import {
 } from './group-folder.js';
 import { logger } from './logger.js';
 import {
-  CONTAINER_HOST_GATEWAY,
   CONTAINER_RUNTIME_BIN,
   hostGatewayArgs,
   readonlyMountArgs,
@@ -1784,6 +1783,10 @@ function buildVolumeMounts(
     // Keys are "commit" and "pr" (singular), empty string hides attribution
     includeCoAuthoredBy: false,
     attribution: { commit: '', pr: '' },
+    // Enable LSP tool (language server integration)
+    ENABLE_LSP_TOOL: '1',
+    // Enable ToolSearch (deferred tool discovery)
+    ENABLE_TOOL_SEARCH: 'true',
   };
   if (!fs.existsSync(settingsFile)) {
     fs.writeFileSync(
@@ -2162,10 +2165,7 @@ function buildVolumeMounts(
             recursive: true,
           })) {
             if (entry.isFile()) {
-              const srcPath = path.join(
-                entry.parentPath || entry.path,
-                entry.name,
-              );
+              const srcPath = path.join(entry.parentPath, entry.name);
               const relPath = path.relative(keysDir, srcPath);
               // Skip key files not referenced by any allowed connection
               if (referencedKeys.size > 0 && !referencedKeys.has(relPath)) {
@@ -3219,7 +3219,7 @@ export function writeGroupsSnapshot(
   groupFolder: string,
   isMain: boolean,
   groups: AvailableGroup[],
-  registeredJids: Set<string>,
+  _registeredJids: Set<string>,
 ): void {
   const groupIpcDir = resolveGroupIpcPath(groupFolder);
   fs.mkdirSync(groupIpcDir, { recursive: true });
