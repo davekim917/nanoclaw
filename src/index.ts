@@ -64,7 +64,6 @@ import {
   getAllSessionsV2,
   getAllTasks,
   getBotResponsesSince,
-  getIdleSessions,
   getMessageById,
   getMessagesSince,
   getRecentMessages,
@@ -1627,76 +1626,19 @@ function recoverPendingMessages(): void {
 }
 
 /**
- * Session sweep: periodically clean up idle sessions.
+ * Periodic housekeeping: prune stale in-memory state, old attachments,
+ * and old thread_origins rows.
+ *
+ * NOTE: Session DB rows are NOT deleted here. Sessions persist
+ * indefinitely so that threads can be resumed across long idle periods.
+ * Sessions are only deleted by explicit user action (/new), topic-change
+ * detection, or prompt_too_long auto-recovery.
+ *
  * Runs every SESSION_SWEEP_INTERVAL (5 min).
  */
 function startSessionSweep(): void {
   const sweep = () => {
     try {
-      // Compute cutoff for group-level sessions
-      const groupCutoff = new Date(
-        Date.now() - SESSION_IDLE_RESET_HOURS * 60 * 60 * 1000,
-      ).toISOString();
-
-      const idleSessions = getIdleSessions(groupCutoff);
-      if (idleSessions.length === 0) return;
-
-      // Collect group folders with active containers (skip ALL their sessions)
-      const activeFolders = new Set<string>();
-      for (const [jid] of Object.entries(registeredGroups)) {
-        if (queue.isActive(jid)) {
-          const group = registeredGroups[jid];
-          if (group) activeFolders.add(group.folder);
-        }
-      }
-
-      // Build folder→group map for O(1) lookups in the sweep loop
-      const folderToGroup = new Map<string, RegisteredGroup>();
-      for (const g of Object.values(registeredGroups)) {
-        folderToGroup.set(g.folder, g);
-      }
-
-      for (const session of idleSessions) {
-        // Skip if any container is active for this group
-        if (activeFolders.has(session.group_folder)) continue;
-
-        const group = folderToGroup.get(session.group_folder);
-
-        // For thread sessions, use thread-specific idle hours if configured
-        if (session.thread_id) {
-          const threadIdleHours =
-            group?.containerConfig?.threadSessionIdleHours ??
-            THREAD_SESSION_IDLE_HOURS;
-          const threadCutoff = new Date(
-            Date.now() - threadIdleHours * 60 * 60 * 1000,
-          ).toISOString();
-          if (session.last_activity >= threadCutoff) continue;
-        }
-
-        // Honor sessionIdleResetHours: 0 as "never auto-reset"
-        if (!session.thread_id) {
-          const idleHours =
-            group?.containerConfig?.sessionIdleResetHours ??
-            SESSION_IDLE_RESET_HOURS;
-          if (idleHours === 0) continue;
-          const specificCutoff = new Date(
-            Date.now() - idleHours * 60 * 60 * 1000,
-          ).toISOString();
-          if (session.last_activity >= specificCutoff) continue;
-        }
-
-        // Delete the session from DB (disk cleanup happens on container close)
-        deleteSessionV2(session.session_key);
-        sessions.delete(session.session_key);
-        logger.info(
-          {
-            sessionKey: session.session_key,
-            reason: 'idle_timeout',
-            lastActivity: session.last_activity,
-          },
-          'Session swept (idle)',
-        );
-      }
       // Prune stale thread entries from lastAgentTimestamp and lastTouchTime.
       // Use the max configured idle hours across all groups so we don't prune
       // timestamps that a group with a longer idle window still needs.
