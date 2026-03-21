@@ -321,10 +321,7 @@ describe('rescue branch helpers', () => {
       mockedExec.mockImplementation(
         (cmd: string, _opts: unknown, cb?: Function) => {
           cmds.push(typeof cmd === 'string' ? cmd : '');
-          if (
-            typeof cmd === 'string' &&
-            cmd.includes('git branch -r --list')
-          ) {
+          if (typeof cmd === 'string' && cmd.includes('git branch -r --list')) {
             if (cb) {
               cb(
                 null,
@@ -377,20 +374,14 @@ describe('rescue branch helpers', () => {
     it('does not throw on push failure', async () => {
       mockedExec.mockImplementation(
         (cmd: string, _opts: unknown, cb?: Function) => {
-          if (
-            typeof cmd === 'string' &&
-            cmd.includes('git branch -r --list')
-          ) {
+          if (typeof cmd === 'string' && cmd.includes('git branch -r --list')) {
             if (cb)
               cb(
                 null,
                 '  origin/rescue/test_group/dc_1234567890/2026-03-18T14-30-45\n',
                 '',
               );
-          } else if (
-            typeof cmd === 'string' &&
-            cmd.includes('git push')
-          ) {
+          } else if (typeof cmd === 'string' && cmd.includes('git push')) {
             if (cb) cb(new Error('push failed'), '', 'error');
           } else if (cb) {
             cb(null, '', '');

@@ -1354,20 +1354,6 @@ export function setSessionEffort(
   );
 }
 
-export function getIdleSessions(cutoffISO: string): SessionV2Row[] {
-  return db
-    .prepare('SELECT * FROM sessions_v2 WHERE last_activity < ?')
-    .all(cutoffISO) as SessionV2Row[];
-}
-
-export function getThreadSessions(groupFolder: string): SessionV2Row[] {
-  return db
-    .prepare(
-      'SELECT * FROM sessions_v2 WHERE group_folder = ? AND thread_id IS NOT NULL',
-    )
-    .all(groupFolder) as SessionV2Row[];
-}
-
 export function getAllSessionsV2(): Map<string, string> {
   const rows = db
     .prepare('SELECT session_key, session_id FROM sessions_v2')

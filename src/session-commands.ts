@@ -165,15 +165,20 @@ export async function handleSessionCommand(opts: {
   await deps.setTyping(true);
 
   let hadCmdError = false;
-  const cmdOutput = await deps.runAgent(command, async (result) => {
-    if (result.status === 'error') hadCmdError = true;
-    const text = resultToText(result.result);
-    if (text) await deps.sendMessage(text);
-  });
+  let cmdOutput: string | undefined;
+  try {
+    cmdOutput = await deps.runAgent(command, async (result) => {
+      if (result.status === 'error') hadCmdError = true;
+      const text = resultToText(result.result);
+      if (text) await deps.sendMessage(text);
+    });
+  } finally {
+    // Always clear typing — even if runAgent throws, the 8s interval must stop.
+    await deps.setTyping(false);
+  }
 
   // Advance cursor to the command — messages AFTER it remain pending for next poll.
   deps.advanceCursor(cmdMsg.timestamp);
-  await deps.setTyping(false);
 
   if (cmdOutput === 'error' || hadCmdError) {
     await deps.sendMessage(`${command} failed. The session is unchanged.`);

@@ -64,7 +64,6 @@ import {
   getAllSessionsV2,
   getAllTasks,
   getBotResponsesSince,
-  getIdleSessions,
   getMessageById,
   getMessagesSince,
   getRecentMessages,
@@ -515,24 +514,27 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       const fullPrompt = `[SYSTEM: Gate "${pendingGate.label}" was approved. Gate ID: ${pendingGate.id}]\n\n${resumePrompt}`;
 
       await channel.setTyping?.(chatJid, true);
-      await runAgent(
-        group,
-        fullPrompt,
-        chatJid,
-        undefined,
-        undefined,
-        undefined,
-        undefined,
-        async (result) => {
-          if (result.result) {
-            const formatted = formatOutbound(result.result);
-            if (formatted) {
-              await channel.sendMessage(chatJid, formatted, triggerMsgId);
+      try {
+        await runAgent(
+          group,
+          fullPrompt,
+          chatJid,
+          undefined,
+          undefined,
+          undefined,
+          undefined,
+          async (result) => {
+            if (result.result) {
+              const formatted = formatOutbound(result.result);
+              if (formatted) {
+                await channel.sendMessage(chatJid, formatted, triggerMsgId);
+              }
             }
-          }
-        },
-      );
-      await channel.setTyping?.(chatJid, false);
+          },
+        );
+      } finally {
+        await channel.setTyping?.(chatJid, false);
+      }
       return true;
     } else if (GATE_CANCEL_PATTERN.test(rawContent)) {
       resolveGate(pendingGate.id, 'cancelled');
@@ -920,121 +922,132 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
   }
 
-  const output = await runAgent(
-    group,
-    prompt,
-    chatJid,
-    model,
-    effort,
-    effectiveThreadId,
-    containerAttachments.length > 0 ? containerAttachments : undefined,
-    async (result) => {
-      // Streaming output callback — called for each agent result.
-      // A single query may produce multiple results when piped messages
-      // create follow-up turns.  Only the between-query session-update
-      // marker carries idle: true — intermediate results do NOT.
-      logger.debug(
-        {
-          group: group.name,
-          status: result.status,
-          hasResult: !!result.result,
-          idle: !!result.idle,
-        },
-        'onOutput callback invoked',
-      );
-      if (result.result) {
-        const raw =
-          typeof result.result === 'string'
-            ? result.result
-            : JSON.stringify(result.result);
-        // Extract thread title before stripping (Discord uses it for thread names).
-        // If the agent didn't include one, fall back to the pre-generated Haiku title.
-        let threadTitle = extractThreadTitle(raw);
-        if (!threadTitle && haikusTitlePromise && !outputSentToUser) {
-          threadTitle = await haikusTitlePromise;
-        }
-        if (threadTitle && 'setPendingThreadTitle' in channel) {
-          (
-            channel as { setPendingThreadTitle(t: string): void }
-          ).setPendingThreadTitle(threadTitle);
-        }
-        // Strip <internal> and <thread-title> blocks
-        const text = stripInternalTags(raw);
-        agentResponseText += text + '\n';
-        logger.info(
-          { group: group.name },
-          `Agent output: ${raw.slice(0, 200)}`,
+  let output: string | undefined;
+  try {
+    output = await runAgent(
+      group,
+      prompt,
+      chatJid,
+      model,
+      effort,
+      effectiveThreadId,
+      containerAttachments.length > 0 ? containerAttachments : undefined,
+      async (result) => {
+        // Streaming output callback — called for each agent result.
+        // A single query may produce multiple results when piped messages
+        // create follow-up turns.  Only the between-query session-update
+        // marker carries idle: true — intermediate results do NOT.
+        logger.debug(
+          {
+            group: group.name,
+            status: result.status,
+            hasResult: !!result.result,
+            idle: !!result.idle,
+          },
+          'onOutput callback invoked',
         );
-        if (text) {
-          await channel.sendMessage(chatJid, text, effectiveThreadId);
-          // Persist bot response so the agent has context of what it said
-          storeMessage({
-            id: `bot-${crypto.randomUUID()}`,
-            chat_jid: chatJid,
-            sender: 'bot',
-            sender_name: groupAssistantName,
-            content: text,
-            timestamp: new Date().toISOString(),
-            is_from_me: true,
-            is_bot_message: true,
-          });
-          await channel.setTyping?.(chatJid, false);
-          // Remove 💭 on first output — the thread now exists as feedback
-          if (!outputSentToUser && thinkingReactionMsg) {
-            thinkingReactionCleared = true;
-            channel
-              .removeReaction?.(chatJid, thinkingReactionMsg, '💭')
-              ?.catch((err: unknown) =>
-                logger.debug(
-                  { chatJid, err },
-                  'Failed to remove thinking reaction',
-                ),
-              );
+        if (result.result) {
+          const raw =
+            typeof result.result === 'string'
+              ? result.result
+              : JSON.stringify(result.result);
+          // Extract thread title before stripping (Discord uses it for thread names).
+          // If the agent didn't include one, fall back to the pre-generated Haiku title.
+          let threadTitle = extractThreadTitle(raw);
+          if (!threadTitle && haikusTitlePromise && !outputSentToUser) {
+            threadTitle = await haikusTitlePromise;
           }
-          outputSentToUser = true;
-        }
-      }
-
-      // Reset idle timer on every result (text or null) so the hard
-      // timeout doesn't kill the container while it's still processing
-      // multi-turn piped messages.
-      resetIdleTimer();
-
-      // Throttled activity touch for session sweep
-      throttledTouchActivity(sessionKey);
-
-      if (result.status === 'success' && result.idle) {
-        // Agent is truly idle (between queries, waiting for new IPC
-        // input).  Safe to mark idle and allow preemption.
-        const ipcSentOutput = ipcOutputSentJids.has(chatJid);
-        if (!outputSentToUser && !ipcSentOutput && !result.result) {
-          logger.warn(
+          if (threadTitle && 'setPendingThreadTitle' in channel) {
+            (
+              channel as { setPendingThreadTitle(t: string): void }
+            ).setPendingThreadTitle(threadTitle);
+          }
+          // Strip <internal> and <thread-title> blocks
+          const text = stripInternalTags(raw);
+          agentResponseText += text + '\n';
+          logger.info(
             { group: group.name },
-            'Agent completed with no text output',
+            `Agent output: ${raw.slice(0, 200)}`,
           );
-          await channel.sendMessage(
-            chatJid,
-            'I finished processing but wasn\u2019t able to produce a response. Please try again.',
-            effectiveThreadId,
-          );
-          outputSentToUser = true;
+          if (text) {
+            await channel.sendMessage(chatJid, text, effectiveThreadId);
+            // Persist bot response so the agent has context of what it said
+            storeMessage({
+              id: `bot-${crypto.randomUUID()}`,
+              chat_jid: chatJid,
+              sender: 'bot',
+              sender_name: groupAssistantName,
+              content: text,
+              timestamp: new Date().toISOString(),
+              is_from_me: true,
+              is_bot_message: true,
+            });
+            await channel.setTyping?.(chatJid, false);
+            // Remove 💭 on first output — the thread now exists as feedback
+            if (!outputSentToUser && thinkingReactionMsg) {
+              thinkingReactionCleared = true;
+              channel
+                .removeReaction?.(chatJid, thinkingReactionMsg, '💭')
+                ?.catch((err: unknown) =>
+                  logger.debug(
+                    { chatJid, err },
+                    'Failed to remove thinking reaction',
+                  ),
+                );
+            }
+            outputSentToUser = true;
+          }
         }
-        await channel.setTyping?.(chatJid, false);
-        queue.notifyIdle(parentJid, slotLookupKey);
-      }
 
-      if (result.status === 'error') {
-        hadError = true;
-      }
-    },
-    webUI
-      ? (event: ProgressEvent) =>
-          webUI!.broadcast(sessionKey, group.name, effectiveThreadId, event)
-      : undefined,
-  );
+        // Reset idle timer on every result (text or null) so the hard
+        // timeout doesn't kill the container while it's still processing
+        // multi-turn piped messages.
+        resetIdleTimer();
 
-  await channel.setTyping?.(chatJid, false);
-  if (idleTimer) clearTimeout(idleTimer);
+        // Throttled activity touch for session sweep
+        throttledTouchActivity(sessionKey);
+
+        if (result.status === 'success' && result.idle) {
+          // Agent is truly idle (between queries, waiting for new IPC
+          // input).  Safe to mark idle and allow preemption.
+          const ipcSentOutput = ipcOutputSentJids.has(chatJid);
+          if (!outputSentToUser && !ipcSentOutput && !result.result) {
+            logger.warn(
+              { group: group.name },
+              'Agent completed with no text output',
+            );
+            await channel.sendMessage(
+              chatJid,
+              'I finished processing but wasn\u2019t able to produce a response. Please try again.',
+              effectiveThreadId,
+            );
+            outputSentToUser = true;
+          }
+          await channel.setTyping?.(chatJid, false);
+          queue.notifyIdle(parentJid, slotLookupKey);
+        }
+
+        if (result.status === 'error') {
+          hadError = true;
+        }
+      },
+      webUI
+        ? (event: ProgressEvent) =>
+            webUI!.broadcast(sessionKey, group.name, effectiveThreadId, event)
+        : undefined,
+    );
+  } finally {
+    // Always clear typing indicator — even if runAgent throws, the 8s
+    // interval must stop to prevent persistent "is typing..." in Discord.
+    await channel.setTyping?.(chatJid, false);
+    if (idleTimer) clearTimeout(idleTimer);
+    // Clean up 💭 if it wasn't already removed (error/no-output paths)
+    if (thinkingReactionMsg && !thinkingReactionCleared) {
+      channel
+        .removeReaction?.(chatJid, thinkingReactionMsg, '💭')
+        ?.catch(() => {});
+    }
+  }
 
   // Safety net: if the container exited without ever sending output to the user
   // (e.g. closedDuringQuery prevented the idle marker, or the SDK produced no
@@ -1060,13 +1073,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       );
     }
   }
-  // Clean up 💭 if it wasn't already removed (error/no-output paths)
-  if (thinkingReactionMsg && !thinkingReactionCleared) {
-    channel
-      .removeReaction?.(chatJid, thinkingReactionMsg, '💭')
-      ?.catch(() => {});
-  }
-  // Clear IPC output tracking for this container run
+  // Clear IPC output tracking after the safety-net check has read it
   ipcOutputSentJids.delete(chatJid);
 
   // Clear stale thread redirect state so the next conversation (or scheduled
@@ -1619,76 +1626,19 @@ function recoverPendingMessages(): void {
 }
 
 /**
- * Session sweep: periodically clean up idle sessions.
+ * Periodic housekeeping: prune stale in-memory state, old attachments,
+ * and old thread_origins rows.
+ *
+ * NOTE: Session DB rows are NOT deleted here. Sessions persist
+ * indefinitely so that threads can be resumed across long idle periods.
+ * Sessions are only deleted by explicit user action (/new), topic-change
+ * detection, or prompt_too_long auto-recovery.
+ *
  * Runs every SESSION_SWEEP_INTERVAL (5 min).
  */
-function startSessionSweep(): void {
+function startHousekeepingSweep(): void {
   const sweep = () => {
     try {
-      // Compute cutoff for group-level sessions
-      const groupCutoff = new Date(
-        Date.now() - SESSION_IDLE_RESET_HOURS * 60 * 60 * 1000,
-      ).toISOString();
-
-      const idleSessions = getIdleSessions(groupCutoff);
-      if (idleSessions.length === 0) return;
-
-      // Collect group folders with active containers (skip ALL their sessions)
-      const activeFolders = new Set<string>();
-      for (const [jid] of Object.entries(registeredGroups)) {
-        if (queue.isActive(jid)) {
-          const group = registeredGroups[jid];
-          if (group) activeFolders.add(group.folder);
-        }
-      }
-
-      // Build folder→group map for O(1) lookups in the sweep loop
-      const folderToGroup = new Map<string, RegisteredGroup>();
-      for (const g of Object.values(registeredGroups)) {
-        folderToGroup.set(g.folder, g);
-      }
-
-      for (const session of idleSessions) {
-        // Skip if any container is active for this group
-        if (activeFolders.has(session.group_folder)) continue;
-
-        const group = folderToGroup.get(session.group_folder);
-
-        // For thread sessions, use thread-specific idle hours if configured
-        if (session.thread_id) {
-          const threadIdleHours =
-            group?.containerConfig?.threadSessionIdleHours ??
-            THREAD_SESSION_IDLE_HOURS;
-          const threadCutoff = new Date(
-            Date.now() - threadIdleHours * 60 * 60 * 1000,
-          ).toISOString();
-          if (session.last_activity >= threadCutoff) continue;
-        }
-
-        // Honor sessionIdleResetHours: 0 as "never auto-reset"
-        if (!session.thread_id) {
-          const idleHours =
-            group?.containerConfig?.sessionIdleResetHours ??
-            SESSION_IDLE_RESET_HOURS;
-          if (idleHours === 0) continue;
-          const specificCutoff = new Date(
-            Date.now() - idleHours * 60 * 60 * 1000,
-          ).toISOString();
-          if (session.last_activity >= specificCutoff) continue;
-        }
-
-        // Delete the session from DB (disk cleanup happens on container close)
-        deleteSessionV2(session.session_key);
-        sessions.delete(session.session_key);
-        logger.info(
-          {
-            sessionKey: session.session_key,
-            reason: 'idle_timeout',
-            lastActivity: session.last_activity,
-          },
-          'Session swept (idle)',
-        );
-      }
       // Prune stale thread entries from lastAgentTimestamp and lastTouchTime.
       // Use the max configured idle hours across all groups so we don't prune
       // timestamps that a group with a longer idle window still needs.
@@ -1939,7 +1889,7 @@ async function main(): Promise<void> {
   }
 
   // Start session sweep (idle session cleanup)
-  startSessionSweep();
+  startHousekeepingSweep();
 
   // Commit digest: scans repos for direct commits to default branch and creates ship log entries.
   // Runs 10 min before daily summary so the notification includes the latest commits.
@@ -2015,6 +1965,29 @@ async function main(): Promise<void> {
       // thread JID and triggerMsgId stays null (send directly to thread).
       const isAlreadyThread = !!parseThreadJid(resolvedJid);
       const triggerMsgId = !isAlreadyThread && threadId ? threadId : null;
+
+      // Stop typing indicator — the response is being delivered. Without
+      // this, typing persists until the agent's streaming output fires
+      // setTyping(false), which is skipped when output is <internal>-tagged
+      // (the common pattern when send_message already delivered the reply).
+      // Clear both resolved (thread) and original (parent) JIDs so the
+      // parent→child cascade covers all active intervals.
+      channel
+        .setTyping?.(resolvedJid, false)
+        ?.catch((err: unknown) =>
+          logger.debug(
+            { jid: resolvedJid, err },
+            'Failed to clear typing on IPC send',
+          ),
+        );
+      if (resolvedJid !== jid) {
+        channel
+          .setTyping?.(jid, false)
+          ?.catch((err: unknown) =>
+            logger.debug({ jid, err }, 'Failed to clear typing on IPC send'),
+          );
+      }
+
       if (sender && channel.sendSwarmMessage) {
         // Swarm messages can't create threads (no triggerMsgId param).
         // If the thread doesn't exist yet, send via regular sendMessage
