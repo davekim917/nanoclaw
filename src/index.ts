@@ -1636,7 +1636,7 @@ function recoverPendingMessages(): void {
  *
  * Runs every SESSION_SWEEP_INTERVAL (5 min).
  */
-function startSessionSweep(): void {
+function startHousekeepingSweep(): void {
   const sweep = () => {
     try {
       // Prune stale thread entries from lastAgentTimestamp and lastTouchTime.
@@ -1889,7 +1889,7 @@ async function main(): Promise<void> {
   }
 
   // Start session sweep (idle session cleanup)
-  startSessionSweep();
+  startHousekeepingSweep();
 
   // Commit digest: scans repos for direct commits to default branch and creates ship log entries.
   // Runs 10 min before daily summary so the notification includes the latest commits.
