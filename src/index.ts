@@ -2015,6 +2015,26 @@ async function main(): Promise<void> {
       // thread JID and triggerMsgId stays null (send directly to thread).
       const isAlreadyThread = !!parseThreadJid(resolvedJid);
       const triggerMsgId = !isAlreadyThread && threadId ? threadId : null;
+
+      // Stop typing indicator — the response is being delivered. Without
+      // this, typing persists until the agent's streaming output fires
+      // setTyping(false), which is skipped when output is <internal>-tagged
+      // (the common pattern when send_message already delivered the reply).
+      // Clear both resolved (thread) and original (parent) JIDs so the
+      // parent→child cascade covers all active intervals.
+      channel
+        .setTyping?.(resolvedJid, false)
+        ?.catch((err: unknown) =>
+          logger.debug({ jid: resolvedJid, err }, 'Failed to clear typing on IPC send'),
+        );
+      if (resolvedJid !== jid) {
+        channel
+          .setTyping?.(jid, false)
+          ?.catch((err: unknown) =>
+            logger.debug({ jid, err }, 'Failed to clear typing on IPC send'),
+          );
+      }
+
       if (sender && channel.sendSwarmMessage) {
         // Swarm messages can't create threads (no triggerMsgId param).
         // If the thread doesn't exist yet, send via regular sendMessage
