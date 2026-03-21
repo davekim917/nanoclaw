@@ -2022,9 +2022,17 @@ async function main(): Promise<void> {
       // (the common pattern when send_message already delivered the reply).
       // Clear both resolved (thread) and original (parent) JIDs so the
       // parent→child cascade covers all active intervals.
-      channel.setTyping?.(resolvedJid, false)?.catch(() => {});
+      channel
+        .setTyping?.(resolvedJid, false)
+        ?.catch((err: unknown) =>
+          logger.debug({ jid: resolvedJid, err }, 'Failed to clear typing on IPC send'),
+        );
       if (resolvedJid !== jid) {
-        channel.setTyping?.(jid, false)?.catch(() => {});
+        channel
+          .setTyping?.(jid, false)
+          ?.catch((err: unknown) =>
+            logger.debug({ jid, err }, 'Failed to clear typing on IPC send'),
+          );
       }
 
       if (sender && channel.sendSwarmMessage) {

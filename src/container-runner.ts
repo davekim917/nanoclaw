@@ -3143,7 +3143,7 @@ export async function runContainerAgent(
             resolve({
               status: 'error',
               result: null,
-              error: 'Output callback error',
+              error: 'Output callback error during container completion',
             });
           });
         return;
