@@ -2025,7 +2025,10 @@ async function main(): Promise<void> {
       channel
         .setTyping?.(resolvedJid, false)
         ?.catch((err: unknown) =>
-          logger.debug({ jid: resolvedJid, err }, 'Failed to clear typing on IPC send'),
+          logger.debug(
+            { jid: resolvedJid, err },
+            'Failed to clear typing on IPC send',
+          ),
         );
       if (resolvedJid !== jid) {
         channel
