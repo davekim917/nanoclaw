@@ -784,7 +784,10 @@ async function rescueWorktreeChanges(
       .toISOString()
       .replace(/[:.]/g, '-')
       .slice(0, 19);
-    const { safeFolderName, safeThreadId } = sanitizeRescueName(groupFolder, threadId);
+    const { safeFolderName, safeThreadId } = sanitizeRescueName(
+      groupFolder,
+      threadId,
+    );
     const threadSuffix = safeThreadId ? `/${safeThreadId}` : '';
     const branchName = `rescue/${safeFolderName}${threadSuffix}/${timestamp}`;
 
@@ -826,13 +829,15 @@ export async function findLatestRescueBranch(
   threadId: string,
 ): Promise<string | null> {
   try {
-    const { safeFolderName, safeThreadId } = sanitizeRescueName(groupFolder, threadId);
+    const { safeFolderName, safeThreadId } = sanitizeRescueName(
+      groupFolder,
+      threadId,
+    );
     const pattern = `origin/rescue/${safeFolderName}/${safeThreadId}/*`;
 
-    const output = await execAsync(
-      `git branch -r --list "${pattern}"`,
-      { cwd: repoDir },
-    );
+    const output = await execAsync(`git branch -r --list "${pattern}"`, {
+      cwd: repoDir,
+    });
     if (!output || !output.trim()) return null;
 
     const branches = output
@@ -861,13 +866,15 @@ export async function deleteRescueBranches(
   threadId: string,
 ): Promise<void> {
   try {
-    const { safeFolderName, safeThreadId } = sanitizeRescueName(groupFolder, threadId);
+    const { safeFolderName, safeThreadId } = sanitizeRescueName(
+      groupFolder,
+      threadId,
+    );
     const pattern = `origin/rescue/${safeFolderName}/${safeThreadId}/*`;
 
-    const output = await execAsync(
-      `git branch -r --list "${pattern}"`,
-      { cwd: repoDir },
-    );
+    const output = await execAsync(`git branch -r --list "${pattern}"`, {
+      cwd: repoDir,
+    });
     if (!output || !output.trim()) return;
 
     const branches = output
@@ -882,7 +889,12 @@ export async function deleteRescueBranches(
     await execAsync(`git push origin ${refspecs}`, { cwd: repoDir });
 
     logger.info(
-      { group: groupFolder, threadId, repo: path.basename(repoDir), count: branches.length },
+      {
+        group: groupFolder,
+        threadId,
+        repo: path.basename(repoDir),
+        count: branches.length,
+      },
       'Cleaned up rescue branches after restoration',
     );
   } catch (err) {
@@ -2452,7 +2464,7 @@ function readSecrets(
     ...(isToolEnabled(tools, 'google-workspace')
       ? ['GOOGLE_OAUTH_CLIENT_ID', 'GOOGLE_OAUTH_CLIENT_SECRET']
       : []),
-    ...(isToolEnabled(tools, 'railway') ? ['RAILWAY_TOKEN'] : []),
+    ...(isToolEnabled(tools, 'railway') ? ['RAILWAY_API_TOKEN'] : []),
   ];
   const secrets = readEnvFile(envKeys);
 

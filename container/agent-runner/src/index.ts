@@ -1091,7 +1091,7 @@ async function main(): Promise<void> {
 
   // CLI tools that authenticate via env vars need secrets exported to process.env
   // so Bash subprocesses inherit them (same reason GITHUB_TOKEN is set in entrypoint.sh).
-  const cliSecrets = ['RAILWAY_TOKEN'];
+  const cliSecrets = ['RAILWAY_API_TOKEN'];
   for (const key of cliSecrets) {
     if (containerInput.secrets?.[key]) {
       process.env[key] = containerInput.secrets[key];
