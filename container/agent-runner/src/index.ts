@@ -1089,6 +1089,15 @@ async function main(): Promise<void> {
     sdkEnv[key] = value;
   }
 
+  // CLI tools that authenticate via env vars need secrets exported to process.env
+  // so Bash subprocesses inherit them (same reason GITHUB_TOKEN is set in entrypoint.sh).
+  const cliSecrets = ['RAILWAY_TOKEN'];
+  for (const key of cliSecrets) {
+    if (containerInput.secrets?.[key]) {
+      process.env[key] = containerInput.secrets[key];
+    }
+  }
+
   // Set model for this container run (per-message flag > session sticky > per-group > global default)
   if (containerInput.model) {
     sdkEnv['CLAUDE_CODE_USE_MODEL'] = containerInput.model;
