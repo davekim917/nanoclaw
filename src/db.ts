@@ -1383,6 +1383,23 @@ export function getSessionsV2Full(
   return { data, total };
 }
 
+export function getAllSessionsV2Full(
+  limit: number = 50,
+  offset: number = 0,
+): { data: SessionV2Full[]; total: number } {
+  const total = (
+    db
+      .prepare('SELECT COUNT(*) AS c FROM sessions_v2')
+      .get() as { c: number }
+  ).c;
+  const data = db
+    .prepare(
+      'SELECT * FROM sessions_v2 ORDER BY last_activity DESC LIMIT ? OFFSET ?',
+    )
+    .all(limit, offset) as SessionV2Full[];
+  return { data, total };
+}
+
 // --- Thread search accessors (Plan C: FTS5 + Haiku reranking) ---
 
 export interface ThreadMetadataRow {
@@ -1468,17 +1485,31 @@ export function getThreadMetadata(
 export function getRecentMessages(
   chatJid: string,
   limit: number,
-): Array<{ content: string; is_from_me: boolean; timestamp: string }> {
+): Array<{
+  id: string;
+  chat_jid: string;
+  sender: string;
+  sender_name: string;
+  text: string;
+  timestamp: string;
+  is_from_me: number;
+}> {
   return db
     .prepare(
-      `SELECT content, is_from_me, timestamp FROM messages
+      `SELECT id, chat_jid, sender AS sender_jid, sender_name,
+              content AS text, timestamp, is_from_me
+       FROM messages
        WHERE chat_jid = ? AND content != '' AND content IS NOT NULL
        ORDER BY timestamp DESC LIMIT ?`,
     )
     .all(chatJid, limit) as Array<{
-    content: string;
-    is_from_me: boolean;
+    id: string;
+    chat_jid: string;
+    sender: string;
+    sender_name: string;
+    text: string;
     timestamp: string;
+    is_from_me: number;
   }>;
 }
 

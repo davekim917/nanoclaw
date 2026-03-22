@@ -9,6 +9,7 @@ import { URL } from 'url';
 
 import {
   countMemoriesKeyword,
+  getAllSessionsV2Full,
   getAllTasksPaginated,
   getBacklogPaginated,
   getRecentMessages,
@@ -184,12 +185,13 @@ export async function handleRoute(
     return true;
   }
 
-  // GET /api/sessions/history?group=
+  // GET /api/sessions/history?group= (group optional — omit for cross-group view)
   if (pathname === '/api/sessions/history' && method === 'GET') {
-    const group = requireGroup(url, res);
-    if (!group) return true;
+    const group = url.searchParams.get('group');
     const { limit, offset } = parsePagination(url);
-    const result = getSessionsV2Full(group, limit, offset);
+    const result = group
+      ? getSessionsV2Full(group, limit, offset)
+      : getAllSessionsV2Full(limit, offset);
     json(res, 200, { ...result, limit, offset });
     return true;
   }

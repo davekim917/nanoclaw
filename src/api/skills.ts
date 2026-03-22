@@ -71,6 +71,44 @@ const INSTALLED_SKILLS_TTL_MS = 60_000;
 // --- Installed skills ---
 
 /**
+ * Recursively scan a directory for .md skill files and subdirectories.
+ * Handles nested directories (e.g. .claude/commands/bootstrap-commands/bootstrap.md).
+ */
+function scanSkillDirectory(
+  dir: string,
+  projectRoot: string,
+  skills: InstalledSkill[],
+  prefix?: string,
+): void {
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  for (const entry of entries) {
+    if (entry.isDirectory()) {
+      // Recurse into subdirectories with a prefix for namespacing
+      const subPrefix = prefix ? `${prefix}/${entry.name}` : entry.name;
+      scanSkillDirectory(
+        path.join(dir, entry.name),
+        projectRoot,
+        skills,
+        subPrefix,
+      );
+    } else if (entry.name.endsWith('.md')) {
+      const mdPath = path.join(dir, entry.name);
+      const content = fs.readFileSync(mdPath, 'utf-8');
+      const frontmatter = parseFrontmatter(content);
+      const baseName = entry.name.replace(/\.md$/, '');
+      const skillName = prefix ? `${prefix}/${baseName}` : baseName;
+
+      skills.push({
+        name: frontmatter.name || skillName,
+        description:
+          frontmatter.description || `Command: /${skillName}`,
+        path: path.relative(projectRoot, mdPath),
+      });
+    }
+  }
+}
+
+/**
  * Parse YAML frontmatter from a markdown file.
  * Returns name and description if found.
  */
@@ -117,23 +155,46 @@ export function getInstalledSkills(): InstalledSkill[] {
     try {
       const entries = fs.readdirSync(globalSkillsDir, { withFileTypes: true });
       for (const entry of entries) {
-        if (!entry.isDirectory()) continue;
-        const skillDir = path.join(globalSkillsDir, entry.name);
-        const mdFiles = fs
-          .readdirSync(skillDir)
-          .filter((f) => f.endsWith('.md'));
-        if (mdFiles.length === 0) continue;
+        if (entry.isDirectory()) {
+          const skillDir = path.join(globalSkillsDir, entry.name);
+          const mdFiles = fs
+            .readdirSync(skillDir)
+            .filter((f) => f.endsWith('.md'));
+          if (mdFiles.length === 0) continue;
 
-        const mdPath = path.join(skillDir, mdFiles[0]);
-        const content = fs.readFileSync(mdPath, 'utf-8');
-        const frontmatter = parseFrontmatter(content);
+          const mdPath = path.join(skillDir, mdFiles[0]);
+          const content = fs.readFileSync(mdPath, 'utf-8');
+          const frontmatter = parseFrontmatter(content);
 
-        skills.push({
-          name: frontmatter.name || entry.name,
-          description: frontmatter.description || `Skill from ${entry.name}`,
-          path: path.relative(projectRoot, skillDir),
-        });
+          skills.push({
+            name: frontmatter.name || entry.name,
+            description: frontmatter.description || `Skill from ${entry.name}`,
+            path: path.relative(projectRoot, skillDir),
+          });
+        } else if (entry.name.endsWith('.md')) {
+          // Standalone .md skill files (e.g. agent-browser.md)
+          const mdPath = path.join(globalSkillsDir, entry.name);
+          const content = fs.readFileSync(mdPath, 'utf-8');
+          const frontmatter = parseFrontmatter(content);
+
+          skills.push({
+            name: frontmatter.name || entry.name.replace(/\.md$/, ''),
+            description:
+              frontmatter.description || `Skill from ${entry.name}`,
+            path: path.relative(projectRoot, mdPath),
+          });
+        }
       }
+    } catch {
+      // Directory read failed
+    }
+  }
+
+  // User-level skills: .claude/commands/ (Claude Code slash commands)
+  const claudeCommandsDir = path.join(projectRoot, '.claude', 'commands');
+  if (fs.existsSync(claudeCommandsDir)) {
+    try {
+      scanSkillDirectory(claudeCommandsDir, projectRoot, skills);
     } catch {
       // Directory read failed
     }
