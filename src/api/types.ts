@@ -32,7 +32,7 @@ export interface Capabilities {
     ollama: boolean;
   };
   channels: string[];
-  groups: Array<{ jid: string; name: string; folder: string }>;
+  groups: Array<{ jid: string; name: string; folder: string; channel: string }>;
 }
 
 // WebSocket protocol types

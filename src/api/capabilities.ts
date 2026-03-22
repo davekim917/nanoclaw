@@ -39,6 +39,15 @@ export interface CapabilityDeps {
   }>;
 }
 
+/** Derive channel type from JID prefix. */
+function channelFromJid(jid: string): string {
+  if (jid.startsWith('dc:')) return 'discord';
+  if (jid.startsWith('slack:')) return 'slack';
+  if (jid.startsWith('tg:')) return 'telegram';
+  if (jid.includes('@s.whatsapp.net') || jid.includes('@g.us')) return 'whatsapp';
+  return 'unknown';
+}
+
 // --- Capabilities cache (30s TTL) ---
 
 let cachedCapabilities: { data: Capabilities; timestamp: number } | null = null;
@@ -112,7 +121,7 @@ export function getCapabilities(deps: CapabilityDeps): Capabilities {
       ollama: ollamaAvailable,
     },
     channels: getRegisteredChannelNames(),
-    groups,
+    groups: groups.map((g) => ({ ...g, channel: channelFromJid(g.jid) })),
   };
 
   cachedCapabilities = { data: result, timestamp: Date.now() };

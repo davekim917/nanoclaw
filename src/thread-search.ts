@@ -312,12 +312,12 @@ export function indexThreadFromMessages(
 
   // Build a compact summary in chronological order (getRecentMessages returns DESC)
   const userMessages = messages
-    .filter((m) => !m.is_from_me && m.content.trim())
+    .filter((m) => !m.is_from_me && m.text.trim())
     .reverse();
   if (userMessages.length === 0) return false;
 
   const snippet = userMessages
-    .map((m) => m.content.trim().slice(0, 150))
+    .map((m) => m.text.trim().slice(0, 150))
     .join(' | ')
     .slice(0, 500);
   const summary = `[auto-indexed] ${snippet}`;

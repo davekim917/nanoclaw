@@ -589,7 +589,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
         const decision = await shouldResetSession(
           recentMsgs.map((m) => ({
-            content: m.content,
+            content: m.text,
             is_from_me: !!m.is_from_me,
           })),
           lastMsg.content,
