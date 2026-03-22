@@ -1388,9 +1388,7 @@ export function getAllSessionsV2Full(
   offset: number = 0,
 ): { data: SessionV2Full[]; total: number } {
   const total = (
-    db
-      .prepare('SELECT COUNT(*) AS c FROM sessions_v2')
-      .get() as { c: number }
+    db.prepare('SELECT COUNT(*) AS c FROM sessions_v2').get() as { c: number }
   ).c;
   const data = db
     .prepare(

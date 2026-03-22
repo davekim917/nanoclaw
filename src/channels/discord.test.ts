@@ -699,7 +699,7 @@ describe('DiscordChannel', () => {
         'dc:1234567890123456',
         expect.objectContaining({
           content:
-            "[Reply to Bob: \"he said 'stop' immediately\"] @Andy really?",
+            '[Reply to Bob: "he said \'stop\' immediately"] @Andy really?',
         }),
       );
     });
