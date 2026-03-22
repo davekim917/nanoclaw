@@ -226,7 +226,15 @@ export class DiscordChannel implements Channel {
         }
       }
 
-      // Handle reply context — include who the user is replying to.
+      // Always trigger on Discord messages — no @mention needed.
+      if (!triggerPattern.test(content)) {
+        content = `@${assistantName} ${content}`;
+      }
+
+      // Handle reply context — include the parent message so the agent
+      // knows what is being replied to (not just who wrote it).
+      // This runs AFTER the trigger check to avoid the reply prefix
+      // pushing the @mention past the anchor and causing a double prefix.
       if (message.reference?.messageId) {
         try {
           const repliedTo = await message.channel.messages.fetch(
@@ -236,15 +244,25 @@ export class DiscordChannel implements Channel {
             repliedTo.member?.displayName ||
             repliedTo.author.displayName ||
             repliedTo.author.username;
-          content = `[Reply to ${replyAuthor}] ${content}`;
-        } catch {
-          // Referenced message may have been deleted
+          const parentContent = repliedTo.content?.trim();
+          if (parentContent) {
+            // Truncate long parent messages. Only spread to code points
+            // when the message is long enough to need truncation (avoids
+            // allocating an array for every short reply).
+            const truncated =
+              parentContent.length > 500
+                ? [...parentContent].slice(0, 500).join('') + '…'
+                : parentContent;
+            // Strip double quotes from parent content to keep the
+            // annotation delimiter unambiguous.
+            const sanitized = truncated.replace(/"/g, "'");
+            content = `[Reply to ${replyAuthor}: "${sanitized}"] ${content}`;
+          } else {
+            content = `[Reply to ${replyAuthor}] ${content}`;
+          }
+        } catch (err) {
+          logger.debug({ err }, 'Failed to fetch replied-to message');
         }
-      }
-
-      // Always trigger on Discord messages — no @mention needed.
-      if (!triggerPattern.test(content)) {
-        content = `@${assistantName} ${content}`;
       }
 
       // Store chat metadata for discovery (always use parent JID)
@@ -821,6 +839,49 @@ export class DiscordChannel implements Channel {
           this.createdThreadJid.delete(key);
         }
       }
+    }
+  }
+
+  async fetchMessage(
+    jid: string,
+    messageId: string,
+  ): Promise<import('../types.js').NewMessage | undefined> {
+    if (!this.client) return undefined;
+    // Resolve the Discord channel ID from the JID (dc:{channelId} or dc:{parentId}:thread:{threadId})
+    const parsed = parseThreadJid(jid);
+    const channelId = parsed ? parsed.parentId : jid.replace(/^dc:/, '');
+    try {
+      // Prefer cache to avoid unnecessary API round-trips.
+      const channel =
+        this.client.channels.cache.get(channelId) ??
+        (await this.client.channels.fetch(channelId));
+      if (!channel?.isTextBased()) return undefined;
+      const textChannel = channel as TextChannel;
+      const msg =
+        textChannel.messages.cache.get(messageId) ??
+        (await textChannel.messages.fetch(messageId));
+      if (!msg) return undefined;
+
+      const botId = this.client.user?.id;
+      const isFromMe = msg.author.id === botId;
+      const senderName =
+        msg.member?.displayName ||
+        msg.author.displayName ||
+        msg.author.username;
+
+      return {
+        id: msg.id,
+        chat_jid: jid,
+        sender: msg.author.id,
+        sender_name: senderName,
+        content: msg.content || '',
+        timestamp: msg.createdAt.toISOString(),
+        is_from_me: isFromMe,
+        is_bot_message: isFromMe,
+      };
+    } catch (err) {
+      logger.warn({ jid, messageId, err }, 'Failed to fetch Discord message');
+      return undefined;
     }
   }
 
