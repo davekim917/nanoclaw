@@ -195,6 +195,7 @@ function createMessage(overrides: {
         fetch: vi.fn().mockResolvedValue({
           author: { username: 'Bob', displayName: 'Bob' },
           member: { displayName: 'Bob' },
+          content: 'Original parent message',
         }),
       },
     },
@@ -601,7 +602,7 @@ describe('DiscordChannel', () => {
   // --- Reply context ---
 
   describe('reply context', () => {
-    it('includes reply author in content', async () => {
+    it('includes reply author and parent content', async () => {
       const opts = createTestOpts();
       const channel = new DiscordChannel('test-token', opts);
       await channel.connect();
@@ -613,10 +614,92 @@ describe('DiscordChannel', () => {
       });
       await triggerMessage(msg);
 
+      // Reply context is appended after trigger check, so reply prefix
+      // wraps the already-triggered content.
       expect(opts.onMessage).toHaveBeenCalledWith(
         'dc:1234567890123456',
         expect.objectContaining({
-          content: '@Andy [Reply to Bob] I agree with that',
+          content:
+            '[Reply to Bob: "Original parent message"] @Andy I agree with that',
+        }),
+      );
+    });
+
+    it('truncates long parent messages at 500 chars', async () => {
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      const longContent = 'x'.repeat(600);
+      const msg = createMessage({
+        content: 'thoughts?',
+        reference: { messageId: 'original_msg_id' },
+        guildName: 'Server',
+      });
+      // Override the fetch mock for this message to return long content
+      msg.channel.messages.fetch = vi.fn().mockResolvedValue({
+        author: { username: 'Bob', displayName: 'Bob' },
+        member: { displayName: 'Bob' },
+        content: longContent,
+      });
+      await triggerMessage(msg);
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'dc:1234567890123456',
+        expect.objectContaining({
+          content: `[Reply to Bob: "${'x'.repeat(500)}…"] @Andy thoughts?`,
+        }),
+      );
+    });
+
+    it('falls back to author-only when parent has no content', async () => {
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      const msg = createMessage({
+        content: 'what was that?',
+        reference: { messageId: 'original_msg_id' },
+        guildName: 'Server',
+      });
+      // Override to return empty content (e.g. image-only message)
+      msg.channel.messages.fetch = vi.fn().mockResolvedValue({
+        author: { username: 'Bob', displayName: 'Bob' },
+        member: { displayName: 'Bob' },
+        content: '',
+      });
+      await triggerMessage(msg);
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'dc:1234567890123456',
+        expect.objectContaining({
+          content: '[Reply to Bob] @Andy what was that?',
+        }),
+      );
+    });
+
+    it('sanitizes double quotes in parent content', async () => {
+      const opts = createTestOpts();
+      const channel = new DiscordChannel('test-token', opts);
+      await channel.connect();
+
+      const msg = createMessage({
+        content: 'really?',
+        reference: { messageId: 'original_msg_id' },
+        guildName: 'Server',
+      });
+      msg.channel.messages.fetch = vi.fn().mockResolvedValue({
+        author: { username: 'Bob', displayName: 'Bob' },
+        member: { displayName: 'Bob' },
+        content: 'he said "stop" immediately',
+      });
+      await triggerMessage(msg);
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'dc:1234567890123456',
+        expect.objectContaining({
+          content:
+            "[Reply to Bob: \"he said 'stop' immediately\"] @Andy really?",
         }),
       );
     });
