@@ -906,6 +906,11 @@ async function runQuery(
   // Poll IPC for follow-up messages and _close sentinel during the query
   let ipcPolling = true;
   let closedDuringQuery = false;
+  // Track whether a user message was piped in since the last writeOutput.
+  // When true, the next assistant text block is treated as a user-facing
+  // response and emitted via writeOutput (so the host sends it to Discord),
+  // not just as a progress event.
+  let hasPipedSinceLastOutput = false;
   const pollIpcDuringQuery = () => {
     if (!ipcPolling) return;
     if (shouldClose()) {
@@ -920,6 +925,7 @@ async function runQuery(
       log(`Piping IPC message into active query (${msg.text.length} chars)`);
       const content = buildPromptContent(msg.text, msg.attachments);
       stream.push(content);
+      hasPipedSinceLastOutput = true;
     }
     setTimeout(pollIpcDuringQuery, IPC_POLL_MS);
   };
@@ -1001,6 +1007,35 @@ async function runQuery(
     if (message.type === 'assistant' && 'message' in message) {
       const content = (message as { message: { content: Array<{ type: string; text?: string; thinking?: string; name?: string; input?: unknown; id?: string }> } }).message.content;
       if (Array.isArray(content)) {
+        // Piped check-in reply: emit text via writeOutput so the host sends
+        // it to Discord now, rather than waiting for the turn's `result`
+        // (which may never come if tool_use continues the turn).
+        // Only emit when tool_use is also present — text-only turns produce
+        // a `result` shortly, so the normal path handles those.
+        if (hasPipedSinceLastOutput) {
+          let hasText = false;
+          let hasToolUse = false;
+          const textParts: string[] = [];
+          for (const b of content) {
+            if (b.type === 'text' && b.text) { textParts.push(b.text); hasText = true; }
+            else if (b.type === 'tool_use') { hasToolUse = true; }
+          }
+          if (hasText && hasToolUse) {
+            const intermediateText = textParts.join('\n');
+            log(`Emitting intermediate text as output (piped reply, ${intermediateText.length} chars)`);
+            writeOutput({
+              status: 'success',
+              result: intermediateText,
+              newSessionId,
+            });
+          }
+          // Reset on any assistant message — text-only will be delivered via
+          // the result path; tool-use-only means the agent chose not to reply.
+          if (hasText || hasToolUse) {
+            hasPipedSinceLastOutput = false;
+          }
+        }
+
         for (const block of content) {
           if (block.type === 'text' && block.text) {
             writeProgress('text', { text: block.text });
@@ -1056,6 +1091,7 @@ async function runQuery(
         result: textResult || null,
         newSessionId
       });
+      hasPipedSinceLastOutput = false;
     }
   }
 
