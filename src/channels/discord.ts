@@ -600,7 +600,10 @@ export class DiscordChannel implements Channel {
       });
       logger.info({ jid, filename: file.filename }, 'Discord file sent');
     } catch (err) {
-      logger.error({ jid, filename: file.filename, err }, 'Failed to send Discord file');
+      logger.error(
+        { jid, filename: file.filename, err },
+        'Failed to send Discord file',
+      );
     }
   }
 

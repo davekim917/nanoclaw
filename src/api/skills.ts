@@ -100,8 +100,7 @@ function scanSkillDirectory(
 
       skills.push({
         name: frontmatter.name || skillName,
-        description:
-          frontmatter.description || `Command: /${skillName}`,
+        description: frontmatter.description || `Command: /${skillName}`,
         path: path.relative(projectRoot, mdPath),
       });
     }
@@ -179,8 +178,7 @@ export function getInstalledSkills(): InstalledSkill[] {
 
           skills.push({
             name: frontmatter.name || entry.name.replace(/\.md$/, ''),
-            description:
-              frontmatter.description || `Skill from ${entry.name}`,
+            description: frontmatter.description || `Skill from ${entry.name}`,
             path: path.relative(projectRoot, mdPath),
           });
         }

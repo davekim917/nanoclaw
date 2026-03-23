@@ -44,7 +44,8 @@ function channelFromJid(jid: string): string {
   if (jid.startsWith('dc:')) return 'discord';
   if (jid.startsWith('slack:')) return 'slack';
   if (jid.startsWith('tg:')) return 'telegram';
-  if (jid.includes('@s.whatsapp.net') || jid.includes('@g.us')) return 'whatsapp';
+  if (jid.includes('@s.whatsapp.net') || jid.includes('@g.us'))
+    return 'whatsapp';
   return 'unknown';
 }
 

@@ -235,7 +235,10 @@ export function cleanupOutboundFiles(): void {
   try {
     for (const groupDir of fs.readdirSync(ipcDir)) {
       const outboundDir = path.join(ipcDir, groupDir, 'outbound_files');
-      if (!fs.existsSync(outboundDir) || !fs.statSync(outboundDir).isDirectory())
+      if (
+        !fs.existsSync(outboundDir) ||
+        !fs.statSync(outboundDir).isDirectory()
+      )
         continue;
 
       for (const uuid of fs.readdirSync(outboundDir)) {

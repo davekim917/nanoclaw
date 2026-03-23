@@ -163,7 +163,12 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   ) {
                     let captionSent = false;
                     const expectedBase =
-                      path.join(DATA_DIR, 'ipc', sourceGroup, 'outbound_files') + '/';
+                      path.join(
+                        DATA_DIR,
+                        'ipc',
+                        sourceGroup,
+                        'outbound_files',
+                      ) + '/';
                     for (const fileRef of data.files) {
                       const hostPath = resolveContainerPath(
                         fileRef.path,
