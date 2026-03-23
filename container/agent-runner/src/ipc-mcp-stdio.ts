@@ -103,7 +103,7 @@ server.tool(
     filename: z.string().optional().describe('Display filename (defaults to basename of file_path)'),
     mime_type: z.string().optional().describe('MIME type (auto-detected from extension if omitted)'),
   },
-  { annotations: { readOnlyHint: false } },
+  { readOnlyHint: false },
   async (args) => {
     const filePath = path.resolve(args.file_path);
 

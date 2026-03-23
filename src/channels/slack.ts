@@ -1,3 +1,5 @@
+import fs from 'fs';
+
 import { App, LogLevel } from '@slack/bolt';
 import type { GenericMessageEvent, BotMessageEvent } from '@slack/types';
 
@@ -430,7 +432,6 @@ export class SlackChannel implements Channel {
         : (triggerMessageId ?? this.replyThreadTs.get(jid));
 
     try {
-      const fs = await import('fs');
       const fileBuffer = fs.readFileSync(file.hostPath);
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const uploadArgs: any = {
