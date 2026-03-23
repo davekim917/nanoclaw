@@ -51,6 +51,10 @@ RUN python3 -m venv /opt/gwmcp-venv \
     && /opt/gwmcp-venv/bin/pip install workspace-mcp \
     && ln -s /opt/gwmcp-venv/bin/workspace-mcp /usr/local/bin/workspace-mcp
 
+# Install Python visualization libraries (matplotlib, seaborn, plotly + kaleido for PNG export)
+# Installed to system python — agents use `python3` directly
+RUN pip install --break-system-packages matplotlib seaborn plotly kaleido
+
 # Set Chromium path for agent-browser
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
@@ -60,15 +64,17 @@ RUN apt-get update && apt-get install -y unzip \
     && curl -fsSL https://bun.sh/install | BUN_INSTALL=/usr/local bash \
     && rm -rf /var/lib/apt/lists/*
 
-# Install agent-browser, claude-code, and MCP server packages globally.
+# Install agent-browser, claude-code, MCP servers, and Mermaid CLI globally.
 # Pre-installing MCP servers avoids npx downloading them at runtime,
 # which is slow and intermittently fails (causing "no Gmail MCP tools" errors).
+# Mermaid CLI uses system Chromium (PUPPETEER_SKIP_DOWNLOAD avoids 300MB download).
 # Pinned versions — build.sh checks for updates automatically.
-RUN npm install -g \
+RUN PUPPETEER_SKIP_DOWNLOAD=true npm install -g \
     agent-browser@0.17.1 \
     @anthropic-ai/claude-code \
     @gongrzhe/server-gmail-autoauth-mcp@1.1.11 \
-    @cocal/google-calendar-mcp@2.6.1
+    @cocal/google-calendar-mcp@2.6.1 \
+    @mermaid-js/mermaid-cli
 
 # Install PostgreSQL client, Redis CLI, and Google Cloud CLI
 RUN curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
@@ -111,6 +117,9 @@ RUN HOME=/home/node curl -fsSL https://ai.snowflake.com/static/cc-scripts/instal
        | HOME=/home/node DOCKER_ENV=1 bash \
     && chown -R node:node /home/node/.local
 ENV PATH="/home/node/.local/bin:${PATH}"
+
+# Puppeteer config for Mermaid CLI (use system Chromium, no sandbox for non-root)
+COPY puppeteer-config.json /app/puppeteer-config.json
 
 # Create app directory
 WORKDIR /app
