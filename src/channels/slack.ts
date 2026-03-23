@@ -410,6 +410,46 @@ export class SlackChannel implements Channel {
     }
   }
 
+  async sendFile(
+    jid: string,
+    file: import('../types.js').OutboundFile,
+    caption?: string,
+    triggerMessageId?: string | null,
+  ): Promise<void> {
+    if (!this.connected) {
+      logger.warn({ jid }, 'Slack disconnected, cannot send file');
+      return;
+    }
+
+    const parsed = parseThreadJid(jid);
+    const channelId = parsed ? parsed.parentId : jid.replace(/^slack:/, '');
+    const threadTs = parsed
+      ? parsed.threadId
+      : triggerMessageId === null
+        ? undefined
+        : (triggerMessageId ?? this.replyThreadTs.get(jid));
+
+    try {
+      const fs = await import('fs');
+      const fileBuffer = fs.readFileSync(file.hostPath);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const uploadArgs: any = {
+        channel_id: channelId,
+        file: fileBuffer,
+        filename: file.filename,
+        initial_comment: caption || undefined,
+      };
+      if (threadTs) uploadArgs.thread_ts = threadTs;
+      await this.app.client.filesUploadV2(uploadArgs);
+      logger.info({ jid, filename: file.filename }, 'Slack file sent');
+    } catch (err) {
+      logger.error(
+        { jid, filename: file.filename, err },
+        'Failed to send Slack file',
+      );
+    }
+  }
+
   /**
    * Send a message with a custom username override (agent swarm).
    * Requires chat:write.customize scope. Falls back to prefixed sendMessage.

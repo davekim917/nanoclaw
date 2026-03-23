@@ -18,6 +18,7 @@ import {
   TextChannel,
   ThreadChannel,
   Webhook,
+  AttachmentBuilder,
 } from 'discord.js';
 
 import {
@@ -493,6 +494,113 @@ export class DiscordChannel implements Channel {
       logger.info({ jid, length: text.length }, 'Discord message sent');
     } catch (err) {
       logger.error({ jid, err }, 'Failed to send Discord message');
+    }
+  }
+
+  async sendFile(
+    jid: string,
+    file: import('../types.js').OutboundFile,
+    caption?: string,
+    triggerMessageId?: string | null,
+  ): Promise<void> {
+    if (!this.client) return;
+
+    const DISCORD_MAX_FILE_SIZE = 25 * 1024 * 1024; // 25MB bot limit
+    try {
+      const stat = fs.statSync(file.hostPath);
+      if (stat.size > DISCORD_MAX_FILE_SIZE) {
+        logger.warn(
+          { jid, filename: file.filename, size: stat.size },
+          'File exceeds Discord 25MB limit, skipping',
+        );
+        const fallback = caption
+          ? `${caption}\n[File "${file.filename}" too large for Discord (${(stat.size / 1024 / 1024).toFixed(1)}MB)]`
+          : `[File "${file.filename}" too large for Discord (${(stat.size / 1024 / 1024).toFixed(1)}MB)]`;
+        await this.sendMessage(jid, fallback, triggerMessageId);
+        return;
+      }
+    } catch {
+      // stat failed — let the send attempt fail naturally
+    }
+
+    try {
+      // Thread redirect check (same pattern as sendMessage)
+      const convKey = triggerMessageId ? `${jid}:${triggerMessageId}` : jid;
+      const redirectJid = this.createdThreadJid.get(convKey);
+      if (redirectJid) {
+        return this.sendFile(redirectJid, file, caption, triggerMessageId);
+      }
+
+      const parsed = parseThreadJid(jid);
+      const isThreadJid = !!parsed;
+      const channelId = parsed ? parsed.threadId : jid.replace(/^dc:/, '');
+
+      // Thread creation: if first response and triggerMessageId is set,
+      // create thread with caption text (or filename as fallback), then
+      // send the file into the new thread.
+      if (!isThreadJid && triggerMessageId) {
+        const threadText = caption || `[File: ${file.filename}]`;
+        const threadId = await this.createThreadAndSend(
+          channelId,
+          triggerMessageId,
+          threadText,
+        );
+        if (threadId) {
+          const threadJid = `dc:${channelId}:thread:${threadId}`;
+          this.createdThreadJid.set(convKey, threadJid);
+          this.threadOriginMessage.set(threadId, triggerMessageId);
+          try {
+            setThreadOrigin(threadId, triggerMessageId, jid);
+          } catch (err) {
+            logger.warn(
+              { threadId, triggerMessageId, jid, err },
+              'Failed to persist thread origin to SQLite',
+            );
+          }
+          // Send file into the new thread (caption already sent as thread starter)
+          const threadChannel = await this.client.channels.fetch(threadId);
+          if (threadChannel && 'send' in threadChannel) {
+            const attachment = new AttachmentBuilder(file.hostPath, {
+              name: file.filename,
+            });
+            await (threadChannel as TextChannel).send({ files: [attachment] });
+          }
+          return;
+        }
+        // Fallback: createThreadAndSend sent caption text to channel,
+        // but the file was not sent. Send the file to the parent channel.
+        const parentChannel = await this.client.channels.fetch(channelId);
+        if (parentChannel && 'send' in parentChannel) {
+          const fallbackAttachment = new AttachmentBuilder(file.hostPath, {
+            name: file.filename,
+          });
+          await (parentChannel as TextChannel).send({
+            files: [fallbackAttachment],
+          });
+          logger.info(
+            { jid, filename: file.filename },
+            'Discord file sent to parent channel (thread creation failed)',
+          );
+        }
+        return;
+      }
+
+      const channel = await this.client.channels.fetch(channelId);
+      if (!channel || !('send' in channel)) {
+        logger.warn({ jid }, 'Discord channel not found or not text-based');
+        return;
+      }
+
+      const attachment = new AttachmentBuilder(file.hostPath, {
+        name: file.filename,
+      });
+      await (channel as TextChannel).send({
+        content: caption || undefined,
+        files: [attachment],
+      });
+      logger.info({ jid, filename: file.filename }, 'Discord file sent');
+    } catch (err) {
+      logger.error({ jid, filename: file.filename, err }, 'Failed to send Discord file');
     }
   }
 

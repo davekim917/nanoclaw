@@ -14,6 +14,36 @@ import { CronExpressionParser } from 'cron-parser';
 const IPC_DIR = '/workspace/ipc';
 const MESSAGES_DIR = path.join(IPC_DIR, 'messages');
 const TASKS_DIR = path.join(IPC_DIR, 'tasks');
+const OUTBOUND_FILES_DIR = path.join(IPC_DIR, 'outbound_files');
+
+const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB
+
+// Allowlisted path prefixes for send_file (prevents staging mounted credentials)
+const ALLOWED_FILE_PREFIXES = ['/tmp/', '/workspace/group/', '/workspace/project/', '/workspace/extra/'];
+
+function isAllowedFilePath(filePath: string): boolean {
+  const resolved = path.resolve(filePath);
+  return ALLOWED_FILE_PREFIXES.some((prefix) => resolved.startsWith(prefix));
+}
+
+function guessMimeType(filename: string): string {
+  const ext = path.extname(filename).toLowerCase();
+  const map: Record<string, string> = {
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.gif': 'image/gif',
+    '.webp': 'image/webp',
+    '.svg': 'image/svg+xml',
+    '.pdf': 'application/pdf',
+    '.csv': 'text/csv',
+    '.json': 'application/json',
+    '.txt': 'text/plain',
+    '.html': 'text/html',
+    '.zip': 'application/zip',
+  };
+  return map[ext] || 'application/octet-stream';
+}
 
 // Context from environment variables (set by the agent runner)
 const chatJid = process.env.NANOCLAW_CHAT_JID!;
@@ -61,6 +91,90 @@ server.tool(
     writeIpcFile(MESSAGES_DIR, data);
 
     return { content: [{ type: 'text' as const, text: 'Message sent.' }] };
+  },
+);
+
+server.tool(
+  'send_file',
+  'Send a file (image, chart, diagram, document) as an attachment to the user or group. The file must exist on disk — e.g. a screenshot from the browser tool, a generated chart, or a rendered diagram. An optional caption is shown alongside the file. For multiple files, call this tool once per file.',
+  {
+    file_path: z.string().describe('Absolute path to the file on disk (e.g. /tmp/diagram.png)'),
+    caption: z.string().optional().describe('Text caption to show with the file'),
+    filename: z.string().optional().describe('Display filename (defaults to basename of file_path)'),
+    mime_type: z.string().optional().describe('MIME type (auto-detected from extension if omitted)'),
+  },
+  { annotations: { readOnlyHint: false } },
+  async (args) => {
+    const filePath = path.resolve(args.file_path);
+
+    // Check existence first (realpathSync requires the file to exist)
+    if (!fs.existsSync(filePath)) {
+      return {
+        content: [{ type: 'text' as const, text: `File not found: ${args.file_path}` }],
+        isError: true,
+      };
+    }
+
+    // Resolve real path (follows symlinks) for allowlist check
+    let resolvedPath: string;
+    try {
+      resolvedPath = fs.realpathSync(filePath);
+    } catch {
+      return {
+        content: [{ type: 'text' as const, text: `Path not allowed for send_file.` }],
+        isError: true,
+      };
+    }
+
+    if (!isAllowedFilePath(resolvedPath)) {
+      return {
+        content: [{ type: 'text' as const, text: `Path not allowed for send_file. Files must be under /tmp/, /workspace/group/, /workspace/project/, or /workspace/extra/.` }],
+        isError: true,
+      };
+    }
+
+    const stat = fs.statSync(resolvedPath);
+    if (stat.size === 0) {
+      return {
+        content: [{ type: 'text' as const, text: 'File is empty.' }],
+        isError: true,
+      };
+    }
+    if (stat.size > MAX_FILE_SIZE) {
+      return {
+        content: [{ type: 'text' as const, text: `File too large (${(stat.size / 1024 / 1024).toFixed(1)}MB). Max 50MB.` }],
+        isError: true,
+      };
+    }
+
+    // Sanitize filename — path.basename() prevents traversal via ../../
+    const filename = path.basename(args.filename || path.basename(resolvedPath));
+    const mimeType = args.mime_type || guessMimeType(filename);
+
+    // Copy to outbound staging dir
+    const uuid = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const stagingDir = path.join(OUTBOUND_FILES_DIR, uuid);
+    fs.mkdirSync(stagingDir, { recursive: true });
+    const stagedPath = path.join(stagingDir, filename);
+    fs.copyFileSync(resolvedPath, stagedPath);
+
+    // Write IPC message with file reference
+    const data = {
+      type: 'message',
+      chatJid,
+      text: args.caption || undefined,
+      groupFolder,
+      threadId,
+      timestamp: new Date().toISOString(),
+      files: [{
+        path: `/workspace/ipc/outbound_files/${uuid}/${filename}`,
+        filename,
+        mimeType,
+      }],
+    };
+
+    writeIpcFile(MESSAGES_DIR, data);
+    return { content: [{ type: 'text' as const, text: `File "${filename}" sent.` }] };
   },
 );
 

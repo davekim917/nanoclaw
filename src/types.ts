@@ -168,6 +168,14 @@ export interface BacklogItem {
   resolved_at: string | null;
 }
 
+// --- Outbound file attachments ---
+
+export interface OutboundFile {
+  hostPath: string;
+  filename: string;
+  mimeType: string;
+}
+
 // --- Channel abstraction ---
 
 export interface SendMessageOptions {
@@ -212,6 +220,14 @@ export interface Channel {
   // Discord uses webhooks, Slack uses username override.
   // Channels that don't implement this fall back to normal sendMessage.
   sendSwarmMessage?(jid: string, text: string, sender: string): Promise<void>;
+  // Optional: send a file (image, document) as a platform-native attachment.
+  // Channels that don't implement this fall back to text-only with [File: name] placeholder.
+  sendFile?(
+    jid: string,
+    file: OutboundFile,
+    caption?: string,
+    triggerMessageId?: string | null,
+  ): Promise<void>;
   // Optional: resolve a parent JID to its active thread JID for IPC routing.
   // When a container sends IPC messages using its NANOCLAW_CHAT_JID (parent),
   // this resolves to the thread JID created by the streaming output path.

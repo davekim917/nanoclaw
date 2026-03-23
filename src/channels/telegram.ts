@@ -292,6 +292,37 @@ export class TelegramChannel implements Channel {
     }
   }
 
+  async sendFile(
+    jid: string,
+    file: import('../types.js').OutboundFile,
+    caption?: string,
+  ): Promise<void> {
+    if (!this.bot) return;
+
+    const numericId = jid.replace(/^tg:/, '');
+
+    try {
+      const { InputFile } = await import('grammy');
+      const inputFile = new InputFile(file.hostPath, file.filename);
+
+      if (file.mimeType.startsWith('image/')) {
+        await this.bot.api.sendPhoto(numericId, inputFile, {
+          caption: caption || undefined,
+        });
+      } else {
+        await this.bot.api.sendDocument(numericId, inputFile, {
+          caption: caption || undefined,
+        });
+      }
+      logger.info({ jid, filename: file.filename }, 'Telegram file sent');
+    } catch (err) {
+      logger.error(
+        { jid, filename: file.filename, err },
+        'Failed to send Telegram file',
+      );
+    }
+  }
+
   isConnected(): boolean {
     return this.bot !== null;
   }

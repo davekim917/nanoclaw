@@ -34,7 +34,10 @@ import {
   getChannelFactory,
   getRegisteredChannelNames,
 } from './channels/registry.js';
-import { cleanupOldAttachments } from './attachment-downloader.js';
+import {
+  cleanupOldAttachments,
+  cleanupOutboundFiles,
+} from './attachment-downloader.js';
 import {
   ContainerAttachment,
   ContainerOutput,
@@ -1693,6 +1696,7 @@ function startHousekeepingSweep(): void {
 
       // Clean up old attachment files
       cleanupOldAttachments();
+      cleanupOutboundFiles();
 
       // Prune old thread_origins rows (7 days — they're immutable mappings,
       // keep longer than sessions so restarts within a week still resolve)
@@ -2022,6 +2026,49 @@ async function main(): Promise<void> {
         return channel.sendSwarmMessage(resolvedJid, text, sender);
       }
       return channel.sendMessage(resolvedJid, text, triggerMsgId);
+    },
+    sendFile: async (jid, file, caption?, _sender?, threadId?) => {
+      const channel = findChannel(channels, jid);
+      if (!channel) throw new Error(`No channel for JID: ${jid}`);
+      const resolvedJid = channel.resolveIpcJid?.(jid) ?? jid;
+      ipcOutputSentJids.add(jid);
+      if (resolvedJid !== jid) ipcOutputSentJids.add(resolvedJid);
+      const isAlreadyThread = !!parseThreadJid(resolvedJid);
+      const triggerMsgId = !isAlreadyThread && threadId ? threadId : null;
+
+      // Stop typing indicator
+      channel
+        .setTyping?.(resolvedJid, false)
+        ?.catch((err: unknown) =>
+          logger.debug(
+            { jid: resolvedJid, err },
+            'Failed to clear typing on IPC sendFile',
+          ),
+        );
+      if (resolvedJid !== jid) {
+        channel
+          .setTyping?.(jid, false)
+          ?.catch((err: unknown) =>
+            logger.debug(
+              { jid, err },
+              'Failed to clear typing on IPC sendFile',
+            ),
+          );
+      }
+
+      if (channel.sendFile) {
+        await channel.sendFile(resolvedJid, file, caption, triggerMsgId);
+      } else {
+        // Fallback: text-only with placeholder
+        const fallbackText = caption
+          ? `${caption}\n[File: ${file.filename}]`
+          : `[File: ${file.filename} — this channel does not support file attachments]`;
+        await channel.sendMessage(resolvedJid, fallbackText, triggerMsgId);
+        logger.warn(
+          { jid, channel: channel.name },
+          'Channel does not support sendFile, sent text fallback',
+        );
+      }
     },
     registeredGroups: () => registeredGroups,
     registerGroup,

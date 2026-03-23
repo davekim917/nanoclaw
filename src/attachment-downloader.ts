@@ -11,6 +11,7 @@ import sharp from 'sharp';
 import {
   ATTACHMENTS_DIR,
   ATTACHMENT_CLEANUP_HOURS,
+  DATA_DIR,
   MAX_DOCUMENT_SIZE,
   MAX_IMAGE_SIZE,
 } from './config.js';
@@ -217,5 +218,44 @@ export function cleanupOldAttachments(
 
   if (cleaned > 0) {
     logger.info({ cleaned }, 'Cleaned up old attachments');
+  }
+}
+
+/**
+ * Remove outbound file staging directories older than 1 hour.
+ * Safety net for files not cleaned up inline (error paths, crashes).
+ */
+export function cleanupOutboundFiles(): void {
+  const ipcDir = path.join(DATA_DIR, 'ipc');
+  if (!fs.existsSync(ipcDir)) return;
+
+  const cutoff = Date.now() - 60 * 60 * 1000; // 1 hour
+  let cleaned = 0;
+
+  try {
+    for (const groupDir of fs.readdirSync(ipcDir)) {
+      const outboundDir = path.join(ipcDir, groupDir, 'outbound_files');
+      if (!fs.existsSync(outboundDir) || !fs.statSync(outboundDir).isDirectory())
+        continue;
+
+      for (const uuid of fs.readdirSync(outboundDir)) {
+        const uuidPath = path.join(outboundDir, uuid);
+        try {
+          const stat = fs.statSync(uuidPath);
+          if (stat.isDirectory() && stat.mtimeMs < cutoff) {
+            fs.rmSync(uuidPath, { recursive: true, force: true });
+            cleaned++;
+          }
+        } catch {
+          // skip
+        }
+      }
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Error during outbound file cleanup');
+  }
+
+  if (cleaned > 0) {
+    logger.info({ cleaned }, 'Cleaned up stale outbound files');
   }
 }

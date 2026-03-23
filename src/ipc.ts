@@ -44,7 +44,7 @@ import { getActivitySummary } from './daily-notifications.js';
 import { searchThreads } from './thread-search.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
-import { Memory, RegisteredGroup } from './types.js';
+import { Memory, OutboundFile, RegisteredGroup } from './types.js';
 
 const BACKLOG_NOT_OWNED_MSG = 'Backlog item not found or not owned by group';
 const VALID_MEMORY_TYPES = [
@@ -61,6 +61,13 @@ export interface IpcDeps {
     sender?: string,
     threadId?: string,
   ) => Promise<void>;
+  sendFile: (
+    jid: string,
+    file: OutboundFile,
+    caption?: string,
+    sender?: string,
+    threadId?: string,
+  ) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   syncGroups: (force: boolean) => Promise<void>;
@@ -71,6 +78,17 @@ export interface IpcDeps {
     availableGroups: AvailableGroup[],
     registeredJids: Set<string>,
   ) => void;
+}
+
+/** Remap a container path under /workspace/ipc/ to the host-side equivalent. */
+function resolveContainerPath(
+  containerPath: string,
+  sourceGroup: string,
+): string {
+  return containerPath.replace(
+    '/workspace/ipc/',
+    path.join(DATA_DIR, 'ipc', sourceGroup) + '/',
+  );
 }
 
 let ipcWatcherRunning = false;
@@ -123,7 +141,11 @@ export function startIpcWatcher(deps: IpcDeps): void {
             const filePath = path.join(messagesDir, file);
             try {
               const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-              if (data.type === 'message' && data.chatJid && data.text) {
+              if (
+                data.type === 'message' &&
+                data.chatJid &&
+                (data.text || data.files)
+              ) {
                 // Authorization: verify this group can send to this chatJid
                 // Handle thread JIDs by checking parent JID for group resolution
                 const targetGroup =
@@ -133,16 +155,86 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   isMain ||
                   (targetGroup && targetGroup.folder === sourceGroup)
                 ) {
-                  await deps.sendMessage(
-                    data.chatJid,
-                    data.text,
-                    data.sender,
-                    data.threadId,
-                  );
-                  logger.info(
-                    { chatJid: data.chatJid, sourceGroup, sender: data.sender },
-                    'IPC message sent',
-                  );
+                  // Handle file attachments
+                  if (
+                    data.files &&
+                    Array.isArray(data.files) &&
+                    data.files.length > 0
+                  ) {
+                    let captionSent = false;
+                    const expectedBase =
+                      path.join(DATA_DIR, 'ipc', sourceGroup, 'outbound_files') + '/';
+                    for (const fileRef of data.files) {
+                      const hostPath = resolveContainerPath(
+                        fileRef.path,
+                        sourceGroup,
+                      );
+                      // Bounds check: prevent path traversal
+                      if (!path.resolve(hostPath).startsWith(expectedBase)) {
+                        logger.warn(
+                          { hostPath, sourceGroup },
+                          'Outbound file path outside expected dir, skipping',
+                        );
+                        continue;
+                      }
+                      if (!fs.existsSync(hostPath)) {
+                        logger.warn(
+                          { hostPath, sourceGroup },
+                          'Outbound file not found on host',
+                        );
+                        continue;
+                      }
+                      // Send caption only with the first file
+                      const caption =
+                        !captionSent && data.text ? data.text : undefined;
+                      captionSent = captionSent || !!data.text;
+                      await deps.sendFile(
+                        data.chatJid,
+                        {
+                          hostPath,
+                          filename: fileRef.filename,
+                          mimeType: fileRef.mimeType,
+                        },
+                        caption,
+                        data.sender,
+                        data.threadId,
+                      );
+                      // Cleanup staging dir
+                      try {
+                        const fileDir = path.dirname(hostPath);
+                        fs.rmSync(fileDir, { recursive: true, force: true });
+                      } catch (cleanupErr) {
+                        logger.warn(
+                          { hostPath, err: cleanupErr },
+                          'Failed to cleanup outbound file',
+                        );
+                      }
+                    }
+                    logger.info(
+                      {
+                        chatJid: data.chatJid,
+                        sourceGroup,
+                        fileCount: data.files.length,
+                      },
+                      'IPC file(s) sent',
+                    );
+                  } else if (data.text) {
+                    // Text-only message (existing path)
+                    await deps.sendMessage(
+                      data.chatJid,
+                      data.text,
+                      data.sender,
+                      data.threadId,
+                    );
+                    logger.info(
+                      {
+                        chatJid: data.chatJid,
+                        sourceGroup,
+                        sender: data.sender,
+                      },
+                      'IPC message sent',
+                    );
+                  }
                 } else {
                   logger.warn(
                     { chatJid: data.chatJid, sourceGroup },

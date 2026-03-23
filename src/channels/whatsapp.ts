@@ -357,6 +357,36 @@ export class WhatsAppChannel implements Channel {
     }
   }
 
+  async sendFile(
+    jid: string,
+    file: import('../types.js').OutboundFile,
+    caption?: string,
+  ): Promise<void> {
+    if (!this.connected || !this.sock) return;
+
+    try {
+      if (file.mimeType.startsWith('image/')) {
+        await this.sock.sendMessage(jid, {
+          image: { url: file.hostPath },
+          caption: caption || undefined,
+        });
+      } else {
+        await this.sock.sendMessage(jid, {
+          document: { url: file.hostPath },
+          mimetype: file.mimeType,
+          fileName: file.filename,
+          caption: caption || undefined,
+        });
+      }
+      logger.info({ jid, filename: file.filename }, 'WhatsApp file sent');
+    } catch (err) {
+      logger.error(
+        { jid, filename: file.filename, err },
+        'Failed to send WhatsApp file',
+      );
+    }
+  }
+
   isConnected(): boolean {
     return this.connected;
   }
