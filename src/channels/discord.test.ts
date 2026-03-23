@@ -864,7 +864,9 @@ describe('DiscordChannel', () => {
       );
     });
 
-    it('uses FIFO queue when no triggerMessageId provided (session command fallback)', async () => {
+    // FIFO queue was removed — callers now pass explicit triggerMessageId.
+    // See discord.ts line 447: "The old FIFO queue fallback has been removed"
+    it('sends directly to channel when no triggerMessageId provided', async () => {
       const opts = createTestOpts();
       const channel = new DiscordChannel('test-token', opts);
       await channel.connect();
@@ -877,15 +879,10 @@ describe('DiscordChannel', () => {
         .spyOn(channel, 'createThreadAndSend')
         .mockResolvedValueOnce('thread_for_A');
 
-      // Session command response: no triggerMessageId supplied
+      // No triggerMessageId → sends directly, no thread creation
       await channel.sendMessage('dc:1234567890123456', 'Switched to GPT-4!');
 
-      // Should pop msgA from the FIFO queue
-      expect(createThreadSpy).toHaveBeenCalledWith(
-        '1234567890123456',
-        'msgA',
-        'Switched to GPT-4!',
-      );
+      expect(createThreadSpy).not.toHaveBeenCalled();
     });
   });
 
