@@ -453,10 +453,16 @@ export function startWebUI(
       return;
     }
 
+    // Auth-exempt endpoints (must be reachable before any user exists)
+    const authExempt =
+      pathname === '/api/auth/setup' ||
+      pathname === '/api/auth/setup-status' ||
+      pathname === '/api/auth/login';
+
     // Auth check on all API endpoints (async — JWT requires async check)
     checkAuth(req, token)
       .then((authResult) => {
-        if (!authResult) {
+        if (!authResult && !authExempt) {
           rejectAuth(res);
           return;
         }
