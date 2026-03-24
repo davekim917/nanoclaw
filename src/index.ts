@@ -86,6 +86,7 @@ import {
   setSessionV2,
   storeChatMetadata,
   storeMessage,
+  getGateById,
   getPendingGateByJid,
   resolveGate,
   touchSessionActivity,
@@ -2114,7 +2115,7 @@ async function main(): Promise<void> {
         queue.enqueueMessageCheck(groupJid);
         return true;
       },
-      startSessionWs: (groupJid, text, senderName, senderId) => {
+      startSessionWs: (groupJid, text, senderName, senderId, _threadId?) => {
         const group = registeredGroups[groupJid];
         if (!group) return false;
         const assistantName = resolveAssistantName(group.containerConfig);
@@ -2132,6 +2133,46 @@ async function main(): Promise<void> {
         });
         queue.enqueueMessageCheck(groupJid);
         return msgId;
+      },
+      resumeGateApproval: async (gateId: string) => {
+        const gate = getGateById(gateId);
+        if (!gate || gate.status !== 'pending') return;
+        const groupEntry = Object.entries(registeredGroups).find(
+          ([jid]) => jid === gate.chat_jid,
+        );
+        if (!groupEntry) {
+          logger.warn({ gateId, chat_jid: gate.chat_jid }, 'Gate group not found for resume');
+          return;
+        }
+        const [chatJid, group] = groupEntry;
+        resolveGate(gate.id, 'approved');
+        const resumePrompt =
+          gate.resume_prompt ||
+          `The user approved gate "${gate.label}". Call read_gate_context with gate_id "${gate.id}" to retrieve the context data, then proceed.`;
+        const fullPrompt = `[SYSTEM: Gate "${gate.label}" was approved. Gate ID: ${gate.id}]\n\n${resumePrompt}`;
+        const channel = findChannel(channels, chatJid);
+        await channel?.setTyping?.(chatJid, true);
+        try {
+          await runAgent(
+            group,
+            fullPrompt,
+            chatJid,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            async (result) => {
+              if (result.result) {
+                const formatted = formatOutbound(result.result);
+                if (formatted) {
+                  await channel?.sendMessage(chatJid, formatted);
+                }
+              }
+            },
+          );
+        } finally {
+          await channel?.setTyping?.(chatJid, false);
+        }
       },
     },
     WEB_UI_TOKEN,

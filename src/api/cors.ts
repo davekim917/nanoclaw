@@ -11,7 +11,7 @@ import { IncomingMessage, ServerResponse } from 'http';
 
 import { WEB_UI_ORIGINS } from '../config.js';
 
-const ALLOWED_METHODS = 'GET, POST, PATCH, OPTIONS';
+const ALLOWED_METHODS = 'GET, POST, PATCH, DELETE, OPTIONS';
 const ALLOWED_HEADERS = 'Authorization, Content-Type';
 const MAX_AGE = '86400'; // 24 hours
 
