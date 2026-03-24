@@ -7,11 +7,22 @@
 import { IncomingMessage, ServerResponse } from 'http';
 import { URL } from 'url';
 
+import crypto from 'crypto';
+
 import {
   countMemoriesKeyword,
+  createMcpServer,
+  createTaskFromApi,
+  createUser,
+  deleteTask,
+  deleteMcpServer,
+  deleteUser,
   getAllSessionsV2Full,
   getAllTasksPaginated,
   getBacklogPaginated,
+  getGatesPaginated,
+  getGateById,
+  getPendingGate,
   getRecentMessages,
   getSessionsV2Full,
   getSessionV2ByKey,
@@ -19,10 +30,29 @@ import {
   getTaskById,
   getTaskRunLogs,
   getTasksForGroupPaginated,
+  getUserById,
+  getUserByUsername,
+  getUserGroups,
+  hasAnyUsers,
+  listMcpServers,
   listMemoriesPaginated,
+  listUsers,
+  resolveGate,
   searchMemoriesKeyword,
+  setUserGroups,
   updateTask,
+  updateUser,
 } from '../db.js';
+import {
+  clearAuthCookie,
+  getOrCreateJwtSecret,
+  hashPassword,
+  parseCookieToken,
+  setAuthCookie,
+  signJwt,
+  verifyJwt,
+  verifyPassword,
+} from '../auth.js';
 import { logger } from '../logger.js';
 import { searchThreads } from '../thread-search.js';
 import { BodyParseError, parseJsonBody } from './cors.js';
@@ -32,7 +62,7 @@ import {
   searchMarketplace,
   startSkillInstall,
 } from './skills.js';
-import type { ActiveSession, Capabilities } from './types.js';
+import type { ActiveSession, AuthUser, Capabilities } from './types.js';
 
 // --- Deps ---
 
@@ -53,6 +83,20 @@ export interface RouteDeps {
   addSseClient: (res: ServerResponse, req: IncomingMessage) => void;
   onSkillInstallProgress: (jobId: string, output: string) => void;
   onSkillInstallComplete: (jobId: string, success: boolean) => void;
+  resumeGateApproval?: (gateId: string) => Promise<void>;
+}
+
+// --- Auth helpers ---
+
+function isAdmin(auth: AuthUser | true): boolean {
+  if (auth === true) return true;
+  return auth.role === 'admin';
+}
+
+function hasGroupAccess(auth: AuthUser | true, groupFolder: string): boolean {
+  if (auth === true) return true;
+  if (auth.role === 'admin') return true;
+  return auth.groups.includes(groupFolder);
 }
 
 // --- Helpers ---
@@ -120,6 +164,7 @@ export async function handleRoute(
   req: IncomingMessage,
   res: ServerResponse,
   deps: RouteDeps,
+  auth: AuthUser | true = true,
 ): Promise<boolean> {
   // --- Existing endpoints (migrated from web-ui.ts) ---
 
@@ -531,6 +576,517 @@ export async function handleRoute(
       return true;
     }
     json(res, 200, job);
+    return true;
+  }
+
+  // --- Auth endpoints (A4) — setup and login do NOT require prior auth ---
+
+  // POST /api/auth/setup — first-user registration (only when no users exist)
+  if (pathname === '/api/auth/setup' && method === 'POST') {
+    if (hasAnyUsers()) {
+      json(res, 409, { error: 'Setup already completed' });
+      return true;
+    }
+    try {
+      const body = await parseJsonBody<{
+        username?: string;
+        password?: string;
+        displayName?: string;
+      }>(req);
+      if (!body.username || !body.password) {
+        json(res, 400, { error: 'Missing required fields: username, password' });
+        return true;
+      }
+      const hash = await hashPassword(body.password);
+      const now = new Date().toISOString();
+      const id = crypto.randomUUID();
+      createUser({
+        id,
+        username: body.username,
+        password_hash: hash,
+        display_name: body.displayName ?? null,
+        role: 'admin',
+        created_at: now,
+        updated_at: now,
+      });
+      const user = getUserById(id)!;
+      const secret = getOrCreateJwtSecret();
+      const token = signJwt({ userId: id, role: 'admin' }, secret);
+      setAuthCookie(res, token);
+      json(res, 201, {
+        id: user.id,
+        username: user.username,
+        display_name: user.display_name,
+        role: user.role,
+      });
+    } catch (err) {
+      handleBodyError(res, err);
+    }
+    return true;
+  }
+
+  // POST /api/auth/login
+  if (pathname === '/api/auth/login' && method === 'POST') {
+    try {
+      const body = await parseJsonBody<{
+        username?: string;
+        password?: string;
+      }>(req);
+      if (!body.username || !body.password) {
+        json(res, 400, { error: 'Missing required fields: username, password' });
+        return true;
+      }
+      const user = getUserByUsername(body.username);
+      if (!user) {
+        json(res, 401, { error: 'Invalid credentials' });
+        return true;
+      }
+      const valid = await verifyPassword(body.password, user.password_hash);
+      if (!valid) {
+        json(res, 401, { error: 'Invalid credentials' });
+        return true;
+      }
+      const secret = getOrCreateJwtSecret();
+      const token = signJwt({ userId: user.id, role: user.role }, secret);
+      setAuthCookie(res, token);
+      json(res, 200, {
+        id: user.id,
+        username: user.username,
+        display_name: user.display_name,
+        role: user.role,
+      });
+    } catch (err) {
+      handleBodyError(res, err);
+    }
+    return true;
+  }
+
+  // POST /api/auth/logout
+  if (pathname === '/api/auth/logout' && method === 'POST') {
+    clearAuthCookie(res);
+    json(res, 200, { ok: true });
+    return true;
+  }
+
+  // GET /api/auth/me — returns current user from JWT cookie
+  if (pathname === '/api/auth/me' && method === 'GET') {
+    const cookieToken = parseCookieToken(req.headers.cookie);
+    if (!cookieToken) {
+      json(res, 401, { error: 'Not authenticated' });
+      return true;
+    }
+    const secret = getOrCreateJwtSecret();
+    const payload = verifyJwt(cookieToken, secret);
+    if (!payload) {
+      json(res, 401, { error: 'Invalid or expired token' });
+      return true;
+    }
+    const user = getUserById(payload.userId);
+    if (!user) {
+      json(res, 401, { error: 'User not found' });
+      return true;
+    }
+    const groups = getUserGroups(user.id);
+    json(res, 200, {
+      id: user.id,
+      username: user.username,
+      display_name: user.display_name,
+      role: user.role,
+      groups,
+    });
+    return true;
+  }
+
+  // Admin-only user management endpoints
+
+  // GET /api/auth/users — list all users
+  if (pathname === '/api/auth/users' && method === 'GET') {
+    if (!isAdmin(auth)) {
+      json(res, 403, { error: 'Admin access required' });
+      return true;
+    }
+    const users = listUsers();
+    json(res, 200, {
+      data: users.map((u) => ({
+        ...u,
+        groups: getUserGroups(u.id),
+      })),
+    });
+    return true;
+  }
+
+  // POST /api/auth/users — create user
+  if (pathname === '/api/auth/users' && method === 'POST') {
+    if (!isAdmin(auth)) {
+      json(res, 403, { error: 'Admin access required' });
+      return true;
+    }
+    try {
+      const body = await parseJsonBody<{
+        username?: string;
+        password?: string;
+        displayName?: string;
+        role?: string;
+        groups?: string[];
+      }>(req);
+      if (!body.username || !body.password) {
+        json(res, 400, { error: 'Missing required fields: username, password' });
+        return true;
+      }
+      const role = body.role === 'admin' ? 'admin' : 'member';
+      const hash = await hashPassword(body.password);
+      const now = new Date().toISOString();
+      const id = crypto.randomUUID();
+      createUser({
+        id,
+        username: body.username,
+        password_hash: hash,
+        display_name: body.displayName ?? null,
+        role,
+        created_at: now,
+        updated_at: now,
+      });
+      if (body.groups && Array.isArray(body.groups)) {
+        setUserGroups(id, body.groups);
+      }
+      const user = getUserById(id)!;
+      json(res, 201, {
+        id: user.id,
+        username: user.username,
+        display_name: user.display_name,
+        role: user.role,
+        groups: getUserGroups(id),
+      });
+    } catch (err) {
+      handleBodyError(res, err);
+    }
+    return true;
+  }
+
+  // PATCH /api/auth/users/:id — update user
+  const userIdMatch = pathname.match(/^\/api\/auth\/users\/([^/]+)$/);
+  if (userIdMatch && method === 'PATCH') {
+    if (!isAdmin(auth)) {
+      json(res, 403, { error: 'Admin access required' });
+      return true;
+    }
+    const userId = decodeURIComponent(userIdMatch[1]);
+    const existing = getUserById(userId);
+    if (!existing) {
+      json(res, 404, { error: 'User not found' });
+      return true;
+    }
+    try {
+      const body = await parseJsonBody<{
+        displayName?: string;
+        role?: string;
+        password?: string;
+        groups?: string[];
+      }>(req);
+      const updates: Parameters<typeof updateUser>[1] = {};
+      if (body.displayName !== undefined) updates.display_name = body.displayName;
+      if (body.role === 'admin' || body.role === 'member') updates.role = body.role;
+      if (body.password) updates.password_hash = await hashPassword(body.password);
+      updateUser(userId, updates);
+      if (body.groups !== undefined && Array.isArray(body.groups)) {
+        setUserGroups(userId, body.groups);
+      }
+      const updated = getUserById(userId)!;
+      json(res, 200, {
+        id: updated.id,
+        username: updated.username,
+        display_name: updated.display_name,
+        role: updated.role,
+        groups: getUserGroups(userId),
+      });
+    } catch (err) {
+      handleBodyError(res, err);
+    }
+    return true;
+  }
+
+  // DELETE /api/auth/users/:id — delete user
+  if (userIdMatch && method === 'DELETE') {
+    if (!isAdmin(auth)) {
+      json(res, 403, { error: 'Admin access required' });
+      return true;
+    }
+    const userId = decodeURIComponent(userIdMatch[1]);
+    const deleted = deleteUser(userId);
+    if (!deleted) {
+      json(res, 404, { error: 'User not found' });
+      return true;
+    }
+    json(res, 200, { ok: true });
+    return true;
+  }
+
+  // --- Gate endpoints (A5) — admin only ---
+
+  // GET /api/gates — list gates with optional ?status= filter, paginated
+  if (pathname === '/api/gates' && method === 'GET') {
+    if (!isAdmin(auth)) {
+      json(res, 403, { error: 'Admin access required' });
+      return true;
+    }
+    const { limit, offset } = parsePagination(url);
+    const status = url.searchParams.get('status') || undefined;
+    const result = getGatesPaginated(status, limit, offset);
+    json(res, 200, { ...result, limit, offset });
+    return true;
+  }
+
+  // GET /api/gates/history — resolved gates, paginated
+  if (pathname === '/api/gates/history' && method === 'GET') {
+    if (!isAdmin(auth)) {
+      json(res, 403, { error: 'Admin access required' });
+      return true;
+    }
+    const { limit, offset } = parsePagination(url);
+    // History = non-pending gates
+    const result = getGatesPaginated('approved', limit, offset);
+    const cancelled = getGatesPaginated('cancelled', 50, 0);
+    // Combine both resolved statuses
+    const combined = [...result.data, ...cancelled.data].sort(
+      (a, b) =>
+        (b.resolved_at ?? b.created_at).localeCompare(
+          a.resolved_at ?? a.created_at,
+        ),
+    );
+    json(res, 200, {
+      data: combined.slice(offset, offset + limit),
+      total: result.total + cancelled.total,
+      limit,
+      offset,
+    });
+    return true;
+  }
+
+  // Gate ID route patterns
+  const gateApproveMatch = pathname.match(/^\/api\/gates\/([^/]+)\/approve$/);
+  const gateCancelMatch = pathname.match(/^\/api\/gates\/([^/]+)\/cancel$/);
+
+  // POST /api/gates/:id/approve
+  if (gateApproveMatch && method === 'POST') {
+    if (!isAdmin(auth)) {
+      json(res, 403, { error: 'Admin access required' });
+      return true;
+    }
+    const gateId = decodeURIComponent(gateApproveMatch[1]);
+    const gate = getGateById(gateId);
+    if (!gate) {
+      json(res, 404, { error: 'Gate not found' });
+      return true;
+    }
+    if (gate.status !== 'pending') {
+      json(res, 409, { error: 'Gate is not pending' });
+      return true;
+    }
+    // Use resumeGateApproval if available (full agent resume), else just resolve
+    if (deps.resumeGateApproval) {
+      try {
+        await deps.resumeGateApproval(gateId);
+        json(res, 200, { ok: true });
+      } catch (err) {
+        logger.error({ err, gateId }, 'resumeGateApproval failed');
+        json(res, 500, { error: 'Failed to resume gate' });
+      }
+    } else {
+      resolveGate(gateId, 'approved');
+      json(res, 200, { ok: true });
+    }
+    return true;
+  }
+
+  // POST /api/gates/:id/cancel
+  if (gateCancelMatch && method === 'POST') {
+    if (!isAdmin(auth)) {
+      json(res, 403, { error: 'Admin access required' });
+      return true;
+    }
+    const gateId = decodeURIComponent(gateCancelMatch[1]);
+    const gate = getGateById(gateId);
+    if (!gate) {
+      json(res, 404, { error: 'Gate not found' });
+      return true;
+    }
+    if (gate.status !== 'pending') {
+      json(res, 409, { error: 'Gate is not pending' });
+      return true;
+    }
+    resolveGate(gateId, 'cancelled');
+    json(res, 200, { ok: true });
+    return true;
+  }
+
+  // --- Dashboard endpoint (A6) ---
+
+  // GET /api/dashboard?group=
+  if (pathname === '/api/dashboard' && method === 'GET') {
+    const groupParam = url.searchParams.get('group') || undefined;
+    if (groupParam && !hasGroupAccess(auth, groupParam)) {
+      json(res, 403, { error: 'Access denied to group' });
+      return true;
+    }
+    const recentSessions = groupParam
+      ? getSessionsV2Full(groupParam, 5, 0).data
+      : getAllSessionsV2Full(5, 0).data;
+    const pendingGatesResult = getGatesPaginated('pending', 50, 0);
+    const activeTasks = groupParam
+      ? getTasksForGroupPaginated(groupParam, 20, 0).data.filter(
+          (t) => t.status === 'active',
+        )
+      : getAllTasksPaginated(20, 0).data.filter((t) => t.status === 'active');
+    const recentShipLog = groupParam
+      ? getShipLogPaginated(groupParam, 5, 0).data
+      : [];
+    json(res, 200, {
+      recentSessions,
+      pendingGates: pendingGatesResult.data,
+      activeTasks,
+      recentShipLog,
+    });
+    return true;
+  }
+
+  // POST /api/tasks — create task from API (A6)
+  if (pathname === '/api/tasks' && method === 'POST') {
+    try {
+      const body = await parseJsonBody<{
+        group?: string;
+        prompt?: string;
+        schedule?: string;
+        schedule_tz?: string;
+        description?: string;
+      }>(req);
+      if (!body.group || !body.prompt || !body.schedule) {
+        json(res, 400, { error: 'Missing required fields: group, prompt, schedule' });
+        return true;
+      }
+      if (!hasGroupAccess(auth, body.group)) {
+        json(res, 403, { error: 'Access denied to group' });
+        return true;
+      }
+      // Resolve group folder to chat_jid
+      const groups = deps.getRegisteredGroups();
+      const groupInfo = groups.find((g) => g.folder === body.group);
+      if (!groupInfo) {
+        json(res, 404, { error: `Group not found: ${body.group}` });
+        return true;
+      }
+      const now = new Date().toISOString();
+      const taskId = crypto.randomUUID();
+      createTaskFromApi({
+        id: taskId,
+        group_folder: body.group,
+        chat_jid: groupInfo.jid,
+        prompt: body.prompt,
+        schedule_type: 'cron',
+        schedule_value: body.schedule,
+        context_mode: 'isolated',
+        task_type: 'container',
+        schedule_tz: body.schedule_tz ?? null,
+        next_run: now,
+        status: 'active',
+        created_at: now,
+      });
+      json(res, 201, { ok: true, task: getTaskById(taskId) });
+    } catch (err) {
+      handleBodyError(res, err);
+    }
+    return true;
+  }
+
+  // DELETE /api/tasks/:id (A6 — override the existing task match pattern for DELETE)
+  // Note: taskIdMatch is already declared above. Re-check here for DELETE.
+  if (taskIdMatch && method === 'DELETE') {
+    const taskId = decodeURIComponent(taskIdMatch[1]);
+    const task = getTaskById(taskId);
+    if (!task) {
+      json(res, 404, { error: 'Task not found' });
+      return true;
+    }
+    if (!hasGroupAccess(auth, task.group_folder)) {
+      json(res, 403, { error: 'Access denied to group' });
+      return true;
+    }
+    deleteTask(taskId);
+    json(res, 200, { ok: true });
+    return true;
+  }
+
+  // --- MCP server endpoints (A8) ---
+
+  // GET /api/mcp-servers?group=
+  if (pathname === '/api/mcp-servers' && method === 'GET') {
+    const group = requireGroup(url, res);
+    if (!group) return true;
+    if (!hasGroupAccess(auth, group)) {
+      json(res, 403, { error: 'Access denied to group' });
+      return true;
+    }
+    const servers = listMcpServers(group);
+    json(res, 200, { data: servers });
+    return true;
+  }
+
+  // POST /api/mcp-servers
+  if (pathname === '/api/mcp-servers' && method === 'POST') {
+    try {
+      const body = await parseJsonBody<{
+        group?: string;
+        name?: string;
+        url?: string;
+        type?: string;
+      }>(req);
+      if (!body.group || !body.name || !body.url) {
+        json(res, 400, { error: 'Missing required fields: group, name, url' });
+        return true;
+      }
+      if (!hasGroupAccess(auth, body.group)) {
+        json(res, 403, { error: 'Access denied to group' });
+        return true;
+      }
+      const serverType =
+        body.type === 'stdio' || body.type === 'streamable-http'
+          ? body.type
+          : 'sse';
+      const id = crypto.randomUUID();
+      createMcpServer({
+        id,
+        group_folder: body.group,
+        name: body.name,
+        url: body.url,
+        server_type: serverType,
+      });
+      json(res, 201, {
+        data: { id, group_folder: body.group, name: body.name, url: body.url, server_type: serverType },
+      });
+    } catch (err) {
+      handleBodyError(res, err);
+    }
+    return true;
+  }
+
+  // DELETE /api/mcp-servers/:id
+  const mcpServerIdMatch = pathname.match(/^\/api\/mcp-servers\/([^/]+)$/);
+  if (mcpServerIdMatch && method === 'DELETE') {
+    const serverId = decodeURIComponent(mcpServerIdMatch[1]);
+    // Find the server first to check group access
+    const allServers = deps.getRegisteredGroups().flatMap((g) =>
+      listMcpServers(g.folder),
+    );
+    const server = allServers.find((s) => s.id === serverId);
+    if (!server) {
+      json(res, 404, { error: 'MCP server not found' });
+      return true;
+    }
+    if (!hasGroupAccess(auth, server.group_folder)) {
+      json(res, 403, { error: 'Access denied to group' });
+      return true;
+    }
+    deleteMcpServer(serverId);
+    json(res, 200, { ok: true });
     return true;
   }
 

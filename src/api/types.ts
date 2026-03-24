@@ -1,6 +1,14 @@
 // Shared API types for the NanoClaw Web UI.
 // Types only — no runtime imports.
 
+/** Authenticated user from JWT (cockpit login). */
+export interface AuthUser {
+  id: string;
+  username: string;
+  role: 'admin' | 'member';
+  groups: string[];
+}
+
 /** Active session state shared between routes.ts and web-ui.ts. */
 export interface ActiveSession {
   group: string;

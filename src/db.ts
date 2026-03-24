@@ -8,6 +8,7 @@ import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import {
   BacklogItem,
+  McpServerConfig,
   Memory,
   NewMessage,
   PendingGate,
@@ -15,6 +16,7 @@ import {
   ScheduledTask,
   ShipLogEntry,
   TaskRunLog,
+  User,
 } from './types.js';
 
 let db: Database.Database;
@@ -286,6 +288,40 @@ function createSchema(database: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_pending_gates_group ON pending_gates(group_folder);
     CREATE INDEX IF NOT EXISTS idx_pending_gates_status ON pending_gates(status);
     CREATE INDEX IF NOT EXISTS idx_pending_gates_chat_jid ON pending_gates(chat_jid, status);
+  `);
+
+  // Cockpit: user accounts, group memberships, JWT config, MCP server configs
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      username TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      display_name TEXT,
+      role TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('admin', 'member')),
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS user_groups (
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      group_folder TEXT NOT NULL,
+      PRIMARY KEY (user_id, group_folder)
+    );
+
+    CREATE TABLE IF NOT EXISTS config (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS mcp_servers (
+      id TEXT PRIMARY KEY,
+      group_folder TEXT NOT NULL,
+      name TEXT NOT NULL,
+      url TEXT NOT NULL,
+      server_type TEXT NOT NULL DEFAULT 'sse',
+      created_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_mcp_servers_group ON mcp_servers(group_folder);
   `);
 
   // Migrate existing sessions into sessions_v2 (skip if already migrated)
@@ -2316,6 +2352,207 @@ export function getAllTasksPaginated(
     )
     .all(limit, offset) as ScheduledTask[];
   return { data, total };
+}
+
+// --- Cockpit: user CRUD ---
+
+export function createUser(
+  user: Omit<User, 'display_name'> & {
+    display_name?: string | null;
+    password_hash: string;
+  },
+): void {
+  db.prepare(
+    `INSERT INTO users (id, username, password_hash, display_name, role, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    user.id,
+    user.username,
+    user.password_hash,
+    user.display_name ?? null,
+    user.role,
+    user.created_at,
+    user.updated_at,
+  );
+}
+
+export function getUserById(id: string): (User & { password_hash: string }) | undefined {
+  return db.prepare('SELECT * FROM users WHERE id = ?').get(id) as
+    | (User & { password_hash: string })
+    | undefined;
+}
+
+export function getUserByUsername(
+  username: string,
+): (User & { password_hash: string }) | undefined {
+  return db.prepare('SELECT * FROM users WHERE username = ?').get(username) as
+    | (User & { password_hash: string })
+    | undefined;
+}
+
+export function listUsers(): User[] {
+  return db
+    .prepare(
+      'SELECT id, username, display_name, role, created_at, updated_at FROM users ORDER BY created_at ASC',
+    )
+    .all() as User[];
+}
+
+export function updateUser(
+  id: string,
+  updates: Partial<
+    Pick<User, 'display_name' | 'role'> & { password_hash?: string }
+  >,
+): boolean {
+  const fields: string[] = [];
+  const values: unknown[] = [];
+
+  if (updates.display_name !== undefined) {
+    fields.push('display_name = ?');
+    values.push(updates.display_name);
+  }
+  if (updates.role !== undefined) {
+    fields.push('role = ?');
+    values.push(updates.role);
+  }
+  if (updates.password_hash !== undefined) {
+    fields.push('password_hash = ?');
+    values.push(updates.password_hash);
+  }
+
+  if (fields.length === 0) return false;
+
+  fields.push('updated_at = ?');
+  values.push(new Date().toISOString());
+  values.push(id);
+
+  const result = db
+    .prepare(`UPDATE users SET ${fields.join(', ')} WHERE id = ?`)
+    .run(...values);
+  return result.changes > 0;
+}
+
+export function deleteUser(id: string): boolean {
+  const result = db.prepare('DELETE FROM users WHERE id = ?').run(id);
+  return result.changes > 0;
+}
+
+export function hasAnyUsers(): boolean {
+  const row = db.prepare('SELECT 1 FROM users LIMIT 1').get();
+  return row !== undefined;
+}
+
+// --- Cockpit: user group membership ---
+
+export function getUserGroups(userId: string): string[] {
+  const rows = db
+    .prepare('SELECT group_folder FROM user_groups WHERE user_id = ?')
+    .all(userId) as Array<{ group_folder: string }>;
+  return rows.map((r) => r.group_folder);
+}
+
+export function setUserGroups(userId: string, groupFolders: string[]): void {
+  const tx = db.transaction(() => {
+    db.prepare('DELETE FROM user_groups WHERE user_id = ?').run(userId);
+    const insert = db.prepare(
+      'INSERT INTO user_groups (user_id, group_folder) VALUES (?, ?)',
+    );
+    for (const folder of groupFolders) {
+      insert.run(userId, folder);
+    }
+  });
+  tx();
+}
+
+// --- Cockpit: config key-value store ---
+
+export function getConfigValue(key: string): string | null {
+  const row = db
+    .prepare('SELECT value FROM config WHERE key = ?')
+    .get(key) as { value: string } | undefined;
+  return row?.value ?? null;
+}
+
+export function setConfigValue(key: string, value: string): void {
+  db.prepare('INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)').run(
+    key,
+    value,
+  );
+}
+
+// --- Cockpit: gate pagination ---
+
+export function getGatesPaginated(
+  status: string | undefined,
+  limit: number = 50,
+  offset: number = 0,
+): { data: PendingGate[]; total: number } {
+  if (status) {
+    const total = (
+      db
+        .prepare(
+          'SELECT COUNT(*) AS c FROM pending_gates WHERE status = ?',
+        )
+        .get(status) as { c: number }
+    ).c;
+    const data = db
+      .prepare(
+        'SELECT * FROM pending_gates WHERE status = ? ORDER BY created_at DESC LIMIT ? OFFSET ?',
+      )
+      .all(status, limit, offset) as PendingGate[];
+    return { data, total };
+  }
+  const total = (
+    db.prepare('SELECT COUNT(*) AS c FROM pending_gates').get() as {
+      c: number;
+    }
+  ).c;
+  const data = db
+    .prepare(
+      'SELECT * FROM pending_gates ORDER BY created_at DESC LIMIT ? OFFSET ?',
+    )
+    .all(limit, offset) as PendingGate[];
+  return { data, total };
+}
+
+// --- Cockpit: task creation from API ---
+
+export function createTaskFromApi(
+  task: Omit<ScheduledTask, 'last_run' | 'last_result'>,
+): void {
+  createTask(task);
+}
+
+// --- Cockpit: MCP server configs ---
+
+export function createMcpServer(
+  server: Omit<McpServerConfig, 'created_at'> & { created_at?: string },
+): void {
+  const now = server.created_at ?? new Date().toISOString();
+  db.prepare(
+    `INSERT INTO mcp_servers (id, group_folder, name, url, server_type, created_at)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  ).run(
+    server.id,
+    server.group_folder,
+    server.name,
+    server.url,
+    server.server_type,
+    now,
+  );
+}
+
+export function listMcpServers(groupFolder: string): McpServerConfig[] {
+  return db
+    .prepare(
+      'SELECT * FROM mcp_servers WHERE group_folder = ? ORDER BY created_at ASC',
+    )
+    .all(groupFolder) as McpServerConfig[];
+}
+
+export function deleteMcpServer(id: string): boolean {
+  const result = db.prepare('DELETE FROM mcp_servers WHERE id = ?').run(id);
+  return result.changes > 0;
 }
 
 // --- Capability detection helpers (used by api/capabilities.ts) ---

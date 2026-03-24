@@ -18,7 +18,17 @@ import { getCapabilities, CapabilityDeps } from './api/capabilities.js';
 import { handleCors } from './api/cors.js';
 import { handleRoute, RouteDeps } from './api/routes.js';
 import { initWebSocket, WsDeps } from './api/ws.js';
-import type { ActiveSession, Capabilities } from './api/types.js';
+import type { ActiveSession, AuthUser, Capabilities } from './api/types.js';
+import {
+  getOrCreateJwtSecret,
+  parseCookieToken,
+  verifyJwt,
+} from './auth.js';
+import {
+  getUserById,
+  getUserGroups,
+  hasAnyUsers,
+} from './db.js';
 import { logger } from './logger.js';
 import type { ProgressEvent } from './container-runner.js';
 
@@ -94,7 +104,9 @@ interface WebUIDeps {
     text: string,
     senderName: string,
     senderId: string,
+    threadId?: string,
   ) => string | false;
+  resumeGateApproval?: (gateId: string) => Promise<void>;
 }
 
 export interface WebUIHandle {
@@ -115,11 +127,47 @@ export interface WebUIHandle {
 }
 
 /**
- * Check token auth. Accepts either:
- *   - ?token=<value> query param (for SSE/EventSource which can't set headers)
- *   - Authorization: Bearer <value> header
+ * Check auth. Returns:
+ *  - AuthUser if a valid JWT cookie is present (cockpit login)
+ *  - true if legacy WEB_UI_TOKEN is valid (only when no users exist in DB)
+ *  - false if no valid auth found
+ *
+ * When users exist in DB, legacy token auth is disabled — JWT only.
  */
-export function checkAuth(req: IncomingMessage, token: string): boolean {
+export async function checkAuth(
+  req: IncomingMessage,
+  token: string,
+): Promise<AuthUser | boolean> {
+  // 1. Try JWT cookie first
+  const cookieHeader = req.headers.cookie;
+  const cookieToken = parseCookieToken(cookieHeader);
+  if (cookieToken) {
+    try {
+      const secret = getOrCreateJwtSecret();
+      const payload = verifyJwt(cookieToken, secret);
+      if (payload) {
+        const user = getUserById(payload.userId);
+        if (user) {
+          const groups = getUserGroups(user.id);
+          return {
+            id: user.id,
+            username: user.username,
+            role: user.role,
+            groups,
+          } satisfies AuthUser;
+        }
+      }
+    } catch {
+      // JWT error — fall through to legacy check
+    }
+  }
+
+  // 2. Legacy token check — disabled once users exist
+  if (hasAnyUsers()) {
+    // Users are configured — require JWT, reject legacy tokens
+    return false;
+  }
+
   if (!token) return true; // No token configured = no auth required (localhost-only mode)
   const url = new URL(
     req.url || '/',
@@ -129,7 +177,25 @@ export function checkAuth(req: IncomingMessage, token: string): boolean {
   if (timingSafeCompare(queryToken, token)) return true;
   const authHeader = req.headers.authorization || '';
   if (timingSafeCompare(authHeader, `Bearer ${token}`)) return true;
+
   return false;
+}
+
+/** Returns true if the auth result represents an admin (JWT user with admin role or legacy true). */
+export function requireAdmin(auth: AuthUser | true): boolean {
+  if (auth === true) return true;
+  return auth.role === 'admin';
+}
+
+/** Returns true if the auth result grants access to the given group folder.
+ *  Admins and legacy-token users bypass group checks. */
+export function requireGroupAccess(
+  auth: AuthUser | true,
+  groupFolder: string,
+): boolean {
+  if (auth === true) return true;
+  if (auth.role === 'admin') return true;
+  return auth.groups.includes(groupFolder);
 }
 
 /** Constant-time string comparison. Uses the expected value's length to avoid leaking length info. */
@@ -341,6 +407,7 @@ export function startWebUI(
       notifyWsSkillInstall(jobId, output, 'running'),
     onSkillInstallComplete: (jobId, success) =>
       notifyWsSkillInstall(jobId, '', success ? 'completed' : 'failed'),
+    resumeGateApproval: deps.resumeGateApproval,
   };
 
   const server = createServer((req, res) => {
@@ -386,16 +453,25 @@ export function startWebUI(
       return;
     }
 
-    // Auth check on all API endpoints
-    if (!checkAuth(req, token)) {
-      rejectAuth(res);
-      return;
-    }
-
-    // Route matching
-    handleRoute(pathname, req.method || 'GET', url, req, res, routeDeps)
+    // Auth check on all API endpoints (async — JWT requires async check)
+    checkAuth(req, token)
+      .then((authResult) => {
+        if (!authResult) {
+          rejectAuth(res);
+          return;
+        }
+        return handleRoute(
+          pathname,
+          req.method || 'GET',
+          url,
+          req,
+          res,
+          routeDeps,
+          authResult,
+        );
+      })
       .then((handled) => {
-        if (!handled) {
+        if (handled === false) {
           res.writeHead(404, { 'Content-Type': 'text/plain' });
           res.end('Not found');
         }
@@ -419,7 +495,8 @@ export function startWebUI(
       const wsDeps: WsDeps = {
         checkAuth,
         getCapabilities: getCapabilitiesFn,
-        startSession: deps.startSessionWs,
+        startSession: (groupJid, text, senderName, senderId, threadId) =>
+          deps.startSessionWs(groupJid, text, senderName, senderId, threadId),
       };
       const wsHandlers = initWebSocket(server, wsDeps, token);
       broadcastWs = wsHandlers.broadcastWs;

@@ -104,6 +104,8 @@ interface WsClient {
   ws: WebSocket;
   subscribedGroups: Set<string> | null; // null = all groups (default)
   tokenHash: string; // first 16 chars of token for rate tracking
+  userId?: string; // set when authenticated via JWT
+  allowedGroups?: Set<string>; // set for non-admin JWT users; undefined = no restriction
 }
 
 const wsClients = new Set<WsClient>();
@@ -111,13 +113,17 @@ const wsClients = new Set<WsClient>();
 // --- WebSocket deps ---
 
 export interface WsDeps {
-  checkAuth: (req: IncomingMessage, token: string) => boolean;
+  checkAuth: (
+    req: IncomingMessage,
+    token: string,
+  ) => Promise<import('./types.js').AuthUser | boolean>;
   getCapabilities: () => Capabilities;
   startSession: (
     groupJid: string,
     text: string,
     senderName: string,
     senderId: string,
+    threadId?: string,
   ) => string | false;
 }
 
@@ -184,22 +190,27 @@ export function initWebSocket(
       return;
     }
 
-    // Auth check
-    if (!deps.checkAuth(req, token)) {
-      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
-      socket.destroy();
-      return;
-    }
-
-    // Origin validation
+    // Origin validation (sync, before async auth)
     if (!validateOrigin(req)) {
       socket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
       socket.destroy();
       return;
     }
 
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      wss.emit('connection', ws, req);
+    // Auth check (async)
+    deps.checkAuth(req, token).then((authResult) => {
+      if (!authResult) {
+        socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+        socket.destroy();
+        return;
+      }
+
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        wss.emit('connection', ws, req);
+      });
+    }).catch(() => {
+      socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
+      socket.destroy();
     });
   });
 
@@ -212,6 +223,23 @@ export function initWebSocket(
     );
     const tokenParam = reqUrl.searchParams.get('token') || '';
     const tokenHash = tokenParam.slice(0, 16) || 'anonymous';
+
+    // Resolve JWT auth from cookie for group isolation
+    let userId: string | undefined;
+    let allowedGroups: Set<string> | undefined;
+    deps.checkAuth(req, token).then((authResult) => {
+      if (authResult && authResult !== true) {
+        userId = authResult.id;
+        // Non-admins get restricted to their allowed groups
+        if (authResult.role !== 'admin') {
+          allowedGroups = new Set(authResult.groups);
+        }
+        client.userId = userId;
+        client.allowedGroups = allowedGroups;
+      }
+    }).catch(() => {
+      // Auth resolution failure is non-fatal for already-connected WS
+    });
 
     const client: WsClient = {
       ws,
@@ -287,8 +315,11 @@ export function initWebSocket(
           (typeof parsed.senderId === 'string' && parsed.senderId) ||
           `web-ui-${crypto.randomUUID().slice(0, 8)}`;
 
+        const threadId =
+          typeof parsed.threadId === 'string' ? parsed.threadId : undefined;
+
         // startSession now returns the real message ID or false
-        const msgId = deps.startSession(groupJid, text, senderName, senderId);
+        const msgId = deps.startSession(groupJid, text, senderName, senderId, threadId);
         if (msgId) {
           sendJson(ws, { type: 'message_stored', id: msgId });
         } else {
@@ -301,9 +332,24 @@ export function initWebSocket(
       } else if (parsed.type === 'subscribe') {
         const groups = parsed.groups;
         if (groups && Array.isArray(groups)) {
-          client.subscribedGroups = new Set(
-            groups.filter((g): g is string => typeof g === 'string'),
+          const requested = groups.filter(
+            (g): g is string => typeof g === 'string',
           );
+          // Enforce group-level isolation for non-admin JWT users
+          if (client.allowedGroups !== undefined) {
+            const unauthorized = requested.filter(
+              (g) => !client.allowedGroups!.has(g),
+            );
+            if (unauthorized.length > 0) {
+              sendJson(ws, {
+                type: 'error',
+                code: 'unauthorized_group',
+                message: `Not authorized to subscribe to groups: ${unauthorized.join(', ')}`,
+              });
+              return;
+            }
+          }
+          client.subscribedGroups = new Set(requested);
         } else {
           client.subscribedGroups = null; // all groups
         }
@@ -347,6 +393,7 @@ export function initWebSocket(
   /**
    * Send data to all matching WS clients, with optional group filtering and backpressure.
    * When skipBackpressure is true, messages are always sent (for lifecycle events).
+   * Respects per-client allowedGroups for JWT non-admin users.
    */
   function broadcastToWsClients(
     data: string,
@@ -355,10 +402,19 @@ export function initWebSocket(
     const group = opts?.group;
     const skipBackpressure = opts?.skipBackpressure ?? false;
     for (const client of wsClients) {
+      // Subscribed-groups filter (client-side subscribe filter)
       if (
         group !== undefined &&
         client.subscribedGroups !== null &&
         !client.subscribedGroups.has(group)
+      ) {
+        continue;
+      }
+      // allowedGroups filter (server-side JWT isolation)
+      if (
+        group !== undefined &&
+        client.allowedGroups !== undefined &&
+        !client.allowedGroups.has(group)
       ) {
         continue;
       }

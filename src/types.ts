@@ -234,6 +234,26 @@ export interface Channel {
   resolveIpcJid?(jid: string): string;
 }
 
+// --- Cockpit user management ---
+
+export interface User {
+  id: string;
+  username: string;
+  display_name: string | null;
+  role: 'admin' | 'member';
+  created_at: string;
+  updated_at: string;
+}
+
+export interface McpServerConfig {
+  id: string;
+  group_folder: string;
+  name: string;
+  url: string;
+  server_type: 'sse' | 'stdio' | 'streamable-http';
+  created_at: string;
+}
+
 // Callback type that channels use to deliver inbound messages
 export type OnInboundMessage = (chatJid: string, message: NewMessage) => void;
 
