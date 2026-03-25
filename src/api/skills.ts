@@ -8,6 +8,7 @@
 import { execFile } from 'child_process';
 import crypto from 'crypto';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import { GROUPS_DIR } from '../config.js';
@@ -20,6 +21,7 @@ export interface InstalledSkill {
   description: string;
   path: string; // relative path from project root
   group?: string; // group folder if per-group skill
+  category: 'nanoclaw' | 'container' | 'global' | 'group'; // skill origin
 }
 
 export interface MarketplaceSkill {
@@ -74,34 +76,52 @@ const INSTALLED_SKILLS_TTL_MS = 60_000;
  * Recursively scan a directory for .md skill files and subdirectories.
  * Handles nested directories (e.g. .claude/commands/bootstrap-commands/bootstrap.md).
  */
+/**
+ * Scan a skill directory (non-recursive). Each top-level entry is one skill:
+ * - Directory with .md files → skill name from frontmatter or dir name
+ * - Standalone .md file → skill name from frontmatter or file name
+ * Subdirectories within a skill dir (references/, resources/) are ignored.
+ */
 function scanSkillDirectory(
   dir: string,
   projectRoot: string,
   skills: InstalledSkill[],
-  prefix?: string,
+  category: InstalledSkill['category'],
+  _prefix?: string,
+  opts?: { group?: string },
 ): void {
   const entries = fs.readdirSync(dir, { withFileTypes: true });
   for (const entry of entries) {
     if (entry.isDirectory()) {
-      // Recurse into subdirectories with a prefix for namespacing
-      const subPrefix = prefix ? `${prefix}/${entry.name}` : entry.name;
-      scanSkillDirectory(
-        path.join(dir, entry.name),
-        projectRoot,
-        skills,
-        subPrefix,
-      );
+      // Skill directory — find the first .md file at the top level only
+      const skillDir = path.join(dir, entry.name);
+      const mdFiles = fs.readdirSync(skillDir).filter((f) => f.endsWith('.md'));
+      if (mdFiles.length === 0) continue;
+
+      const mdPath = path.join(skillDir, mdFiles[0]);
+      const content = fs.readFileSync(mdPath, 'utf-8');
+      const frontmatter = parseFrontmatter(content);
+
+      skills.push({
+        name: frontmatter.name || entry.name,
+        description: frontmatter.description || `Skill: ${entry.name}`,
+        path: path.relative(projectRoot, skillDir),
+        category,
+        ...(opts?.group ? { group: opts.group } : {}),
+      });
     } else if (entry.name.endsWith('.md')) {
+      // Standalone .md skill file
       const mdPath = path.join(dir, entry.name);
       const content = fs.readFileSync(mdPath, 'utf-8');
       const frontmatter = parseFrontmatter(content);
       const baseName = entry.name.replace(/\.md$/, '');
-      const skillName = prefix ? `${prefix}/${baseName}` : baseName;
 
       skills.push({
-        name: frontmatter.name || skillName,
-        description: frontmatter.description || `Command: /${skillName}`,
+        name: frontmatter.name || baseName,
+        description: frontmatter.description || `Skill: ${baseName}`,
         path: path.relative(projectRoot, mdPath),
+        category,
+        ...(opts?.group ? { group: opts.group } : {}),
       });
     }
   }
@@ -148,41 +168,32 @@ export function getInstalledSkills(): InstalledSkill[] {
   const skills: InstalledSkill[] = [];
   const projectRoot = process.cwd();
 
-  // Global skills: container/skills/
+  // Container skills: container/skills/
   const globalSkillsDir = path.join(projectRoot, 'container', 'skills');
   if (fs.existsSync(globalSkillsDir)) {
     try {
-      const entries = fs.readdirSync(globalSkillsDir, { withFileTypes: true });
-      for (const entry of entries) {
-        if (entry.isDirectory()) {
-          const skillDir = path.join(globalSkillsDir, entry.name);
-          const mdFiles = fs
-            .readdirSync(skillDir)
-            .filter((f) => f.endsWith('.md'));
-          if (mdFiles.length === 0) continue;
+      scanSkillDirectory(globalSkillsDir, projectRoot, skills, 'container');
+    } catch {
+      // Directory read failed
+    }
+  }
 
-          const mdPath = path.join(skillDir, mdFiles[0]);
-          const content = fs.readFileSync(mdPath, 'utf-8');
-          const frontmatter = parseFrontmatter(content);
+  // NanoClaw skills: .claude/skills/ (add-whatsapp, add-discord, etc.)
+  const nanoclawSkillsDir = path.join(projectRoot, '.claude', 'skills');
+  if (fs.existsSync(nanoclawSkillsDir)) {
+    try {
+      scanSkillDirectory(nanoclawSkillsDir, projectRoot, skills, 'nanoclaw');
+    } catch {
+      // Directory read failed
+    }
+  }
 
-          skills.push({
-            name: frontmatter.name || entry.name,
-            description: frontmatter.description || `Skill from ${entry.name}`,
-            path: path.relative(projectRoot, skillDir),
-          });
-        } else if (entry.name.endsWith('.md')) {
-          // Standalone .md skill files (e.g. agent-browser.md)
-          const mdPath = path.join(globalSkillsDir, entry.name);
-          const content = fs.readFileSync(mdPath, 'utf-8');
-          const frontmatter = parseFrontmatter(content);
-
-          skills.push({
-            name: frontmatter.name || entry.name.replace(/\.md$/, ''),
-            description: frontmatter.description || `Skill from ${entry.name}`,
-            path: path.relative(projectRoot, mdPath),
-          });
-        }
-      }
+  // Global Claude Code skills: ~/.claude/skills/ (design, dev skills synced to container)
+  const globalClaudeSkillsDir = path.join(os.homedir(), '.claude', 'skills');
+  // Only scan if it's a different directory than the project-level .claude/skills/
+  if (globalClaudeSkillsDir !== nanoclawSkillsDir && fs.existsSync(globalClaudeSkillsDir)) {
+    try {
+      scanSkillDirectory(globalClaudeSkillsDir, projectRoot, skills, 'global');
     } catch {
       // Directory read failed
     }
@@ -192,7 +203,7 @@ export function getInstalledSkills(): InstalledSkill[] {
   const claudeCommandsDir = path.join(projectRoot, '.claude', 'commands');
   if (fs.existsSync(claudeCommandsDir)) {
     try {
-      scanSkillDirectory(claudeCommandsDir, projectRoot, skills);
+      scanSkillDirectory(claudeCommandsDir, projectRoot, skills, 'nanoclaw');
     } catch {
       // Directory read failed
     }
@@ -213,44 +224,7 @@ export function getInstalledSkills(): InstalledSkill[] {
           'skills',
         );
         if (!fs.existsSync(groupSkillsDir)) continue;
-
-        const skillEntries = fs.readdirSync(groupSkillsDir, {
-          withFileTypes: true,
-        });
-        for (const skillEntry of skillEntries) {
-          // Skills can be either directories (with .md files inside) or standalone .md files
-          if (skillEntry.isDirectory()) {
-            const skillDir = path.join(groupSkillsDir, skillEntry.name);
-            const mdFiles = fs
-              .readdirSync(skillDir)
-              .filter((f) => f.endsWith('.md'));
-            if (mdFiles.length === 0) continue;
-
-            const mdPath = path.join(skillDir, mdFiles[0]);
-            const content = fs.readFileSync(mdPath, 'utf-8');
-            const frontmatter = parseFrontmatter(content);
-
-            skills.push({
-              name: frontmatter.name || skillEntry.name,
-              description:
-                frontmatter.description || `Skill from ${skillEntry.name}`,
-              path: path.relative(projectRoot, skillDir),
-              group: groupEntry.name,
-            });
-          } else if (skillEntry.name.endsWith('.md')) {
-            const mdPath = path.join(groupSkillsDir, skillEntry.name);
-            const content = fs.readFileSync(mdPath, 'utf-8');
-            const frontmatter = parseFrontmatter(content);
-
-            skills.push({
-              name: frontmatter.name || skillEntry.name.replace(/\.md$/, ''),
-              description:
-                frontmatter.description || `Skill from ${skillEntry.name}`,
-              path: path.relative(projectRoot, mdPath),
-              group: groupEntry.name,
-            });
-          }
-        }
+        scanSkillDirectory(groupSkillsDir, projectRoot, skills, 'group', undefined, { group: groupEntry.name });
       }
     } catch {
       // Groups directory read failed
