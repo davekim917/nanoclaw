@@ -1804,6 +1804,8 @@ function buildVolumeMounts(
     ENABLE_LSP_TOOL: '1',
     // Enable ToolSearch (deferred tool discovery)
     ENABLE_TOOL_SEARCH: 'true',
+    // Enable background memory consolidation (auto-dream)
+    autoDreamEnabled: true,
   };
   if (!fs.existsSync(settingsFile)) {
     fs.writeFileSync(

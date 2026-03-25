@@ -73,6 +73,10 @@ check_package_updates() {
 
 check_package_updates
 
+# Update agent SDK to latest before building
+echo "Updating @anthropic-ai/claude-agent-sdk to latest..."
+(cd agent-runner && npm install @anthropic-ai/claude-agent-sdk@latest --save 2>&1 | tail -3)
+
 echo "Building NanoClaw agent container image..."
 echo "Image: ${IMAGE_NAME}:${TAG}"
 
