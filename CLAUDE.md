@@ -21,9 +21,20 @@ Single Node.js process with skill-based channel system. Channels (WhatsApp, Tele
 | `src/web-ui.ts` | API gateway: HTTP server, SSE, WebSocket, static file serving |
 | `src/api/` | REST routes, CORS, capabilities, skills, WebSocket handler |
 | `groups/{name}/CLAUDE.md` | Per-group memory (isolated) |
-| `container/skills/agent-browser.md` | Browser automation tool (available to all agents via Bash) |
+| `container/skills/` | Skills loaded inside agent containers (browser, status, formatting) |
+
+## Secrets / Credentials / Proxy (OneCLI)
+
+API keys, secret keys, OAuth tokens, and auth credentials are managed by the OneCLI gateway — which handles secret injection into containers at request time, so no keys or tokens are ever passed to containers directly. Run `onecli --help`.
 
 ## Skills
+
+Four types of skills exist in NanoClaw. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full taxonomy and guidelines.
+
+- **Feature skills** — merge a `skill/*` branch to add capabilities (e.g. `/add-telegram`, `/add-slack`)
+- **Utility skills** — ship code files alongside SKILL.md (e.g. `/claw`)
+- **Operational skills** — instruction-only workflows, always on `main` (e.g. `/setup`, `/debug`)
+- **Container skills** — loaded inside agent containers at runtime (`container/skills/`)
 
 | Skill | When to Use |
 |-------|-------------|
@@ -43,6 +54,10 @@ Single Node.js process with skill-based channel system. Channels (WhatsApp, Tele
 | `WEB_UI_ORIGINS` | Comma-separated allowed CORS origins for the Web UI |
 | `WEB_UI_SENDER_NAME` | Display name for messages sent via the Web UI (default: "Web User") |
 | `OLLAMA_HOST` | Ollama server URL. When set, enables Ollama capability detection in `/api/capabilities`. |
+
+## Contributing
+
+Before creating a PR, adding a skill, or preparing any contribution, you MUST read [CONTRIBUTING.md](CONTRIBUTING.md). It covers accepted change types, the four skill types and their guidelines, SKILL.md format rules, PR requirements, and the pre-submission checklist (searching for existing PRs/issues, testing, description format).
 
 ## Development
 
@@ -73,7 +88,7 @@ Run `/simplify` before every PR or push to main. This reviews changed code for r
 
 ## Troubleshooting
 
-**WhatsApp not connecting after upgrade:** WhatsApp is now a separate channel fork, not bundled in core. Run `/add-whatsapp` (or `git remote add whatsapp https://github.com/qwibitai/nanoclaw-whatsapp.git && git fetch whatsapp main && (git merge whatsapp/main || { git checkout --theirs package-lock.json && git add package-lock.json && git merge --continue; }) && npm run build`) to install it. Existing auth credentials and groups are preserved.
+**WhatsApp not connecting after upgrade:** WhatsApp is now a separate skill, not bundled in core. Run `/add-whatsapp` (or `npx tsx scripts/apply-skill.ts .claude/skills/add-whatsapp && npm run build`) to install it. Existing auth credentials and groups are preserved.
 
 ## Container Build Cache
 
