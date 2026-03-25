@@ -744,14 +744,12 @@ function buildMcpServers(
     };
   }
   if (isToolEnabled(tools, 'granola')) {
-    const granolaToken = containerInput.secrets?.GRANOLA_ACCESS_TOKEN;
-    if (granolaToken) {
-      servers.granola = {
-        type: 'http',
-        url: 'https://mcp.granola.ai/mcp',
-        headers: { Authorization: `Bearer ${granolaToken}` },
-      };
-    }
+    // Auth header is injected by the OneCLI HTTPS proxy at request time.
+    // No explicit token needed — the proxy matches mcp.granola.ai and injects Bearer credentials.
+    servers.granola = {
+      type: 'http',
+      url: 'https://mcp.granola.ai/mcp',
+    };
   }
   if (isToolEnabled(tools, 'google-workspace')) {
     servers['google-workspace'] = {

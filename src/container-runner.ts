@@ -268,6 +268,10 @@ async function getGranolaAccessToken(): Promise<string | null> {
       token: newAccessToken,
       expiresAt: newExpiresAt - 5 * 60 * 1000,
     };
+
+    // Update OneCLI vault so the proxy injects the fresh token
+    updateOneCLIGranolaSecret(newAccessToken);
+
     logger.info('Granola OAuth token refreshed successfully');
     return newAccessToken;
   } catch (err) {
@@ -297,6 +301,27 @@ export function startGranolaTokenRefresh(): void {
   logger.info(
     `Granola proactive token refresh started (every ${GRANOLA_PROACTIVE_REFRESH_MS / 1000 / 60 / 60}h)`,
   );
+}
+
+/** Update the Granola secret in OneCLI vault after a token refresh. */
+function updateOneCLIGranolaSecret(newToken: string): void {
+  // Find the Granola secret by name and update its value
+  fetch(`${ONECLI_URL}/api/secrets`, { signal: AbortSignal.timeout(5000) })
+    .then((r) => r.json() as Promise<Array<{ id: string; name: string }>>)
+    .then((secrets) => {
+      const granola = secrets.find((s) => s.name === 'Granola');
+      if (!granola) return;
+      return fetch(`${ONECLI_URL}/api/secrets/${granola.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ value: newToken }),
+        signal: AbortSignal.timeout(5000),
+      });
+    })
+    .then(() => logger.debug('OneCLI Granola secret updated'))
+    .catch((err) =>
+      logger.debug({ err: String(err) }, 'OneCLI Granola secret update skipped'),
+    );
 }
 
 export function stopGranolaTokenRefresh(): void {
@@ -2617,12 +2642,12 @@ export async function runContainerAgent(
   const groupDir = resolveGroupFolderPath(group.folder);
   fs.mkdirSync(groupDir, { recursive: true });
 
-  // Resolve Granola OAuth access token (refreshes if expired)
+  // Ensure Granola OAuth token is fresh in OneCLI vault before container launch.
+  // The proxy injects the token — we no longer pass it via input.secrets.
   const tools = group.containerConfig?.tools;
-  let granolaAccessToken: string | undefined;
   if (isToolEnabled(tools, 'granola')) {
-    granolaAccessToken = (await getGranolaAccessToken()) || undefined;
-    if (!granolaAccessToken) {
+    const token = await getGranolaAccessToken();
+    if (!token) {
       logger.warn(
         { group: group.name },
         'Granola enabled but no valid token — Granola tools will be unavailable',
@@ -2815,11 +2840,9 @@ export async function runContainerAgent(
     let stdoutTruncated = false;
     let stderrTruncated = false;
 
-    // Pass secrets via stdin (never written to disk or mounted as files)
+    // Pass non-HTTP secrets via stdin (dbt login, gcloud paths, Render PG/Redis).
+    // HTTP API credentials are injected by the OneCLI proxy at request time.
     input.secrets = readSecrets(group.folder, tools);
-    if (granolaAccessToken) {
-      input.secrets.GRANOLA_ACCESS_TOKEN = granolaAccessToken;
-    }
     // Pass tools restriction so agent-runner can gate MCP servers
     input.tools = group.containerConfig?.tools;
     container.stdin.write(JSON.stringify(input));
