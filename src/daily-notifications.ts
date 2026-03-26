@@ -163,6 +163,7 @@ export interface ActivitySummary {
     title: string;
     description: string | null;
     pr_url: string | null;
+    tags: string | null;
     shipped_at: string;
   }>;
   teamPRs: Array<{
@@ -227,6 +228,7 @@ export async function getActivitySummary(
       title: s.title,
       description: s.description,
       pr_url: s.pr_url,
+      tags: s.tags,
       shipped_at: s.shipped_at,
     })),
     teamPRs: teamPRs.map((pr) => ({
@@ -245,6 +247,48 @@ export async function getActivitySummary(
       status: item.status,
     })),
   };
+}
+
+/**
+ * Extract a short repo name from a ship log entry.
+ * Tries pr_url first (e.g. "Illysium-ai/ILLYSE" from the GitHub URL),
+ * then falls back to tags (commit-digest entries tag the repo name),
+ * then falls back to the title prefix ("repoName: ...").
+ */
+function extractRepo(entry: ActivitySummary['shipped'][number]): string {
+  if (entry.pr_url) {
+    const match = entry.pr_url.match(
+      /github\.com\/([^/]+\/[^/]+)\/(?:pull|issues)/,
+    );
+    if (match) return match[1];
+  }
+  if (entry.tags) {
+    try {
+      const tags: string[] = JSON.parse(entry.tags);
+      if (tags.includes('commit-digest') && tags.length > 1) {
+        return tags.find((t) => t !== 'commit-digest') || 'Other';
+      }
+    } catch {
+      /* invalid JSON */
+    }
+  }
+  const colonIdx = entry.title.indexOf(':');
+  if (colonIdx > 0 && colonIdx < 40) {
+    return entry.title.slice(0, colonIdx);
+  }
+  return 'Other';
+}
+
+/** Group an array by a key function, preserving insertion order. */
+function groupBy<T>(items: T[], keyFn: (item: T) => string): Map<string, T[]> {
+  const map = new Map<string, T[]>();
+  for (const item of items) {
+    const key = keyFn(item);
+    const arr = map.get(key);
+    if (arr) arr.push(item);
+    else map.set(key, [item]);
+  }
+  return map;
 }
 
 export async function sendDailySummaries(
@@ -287,16 +331,24 @@ export async function sendDailySummaries(
 
     if (shipped.length > 0) {
       lines.push(`\n🤖 **Agent Shipped** (${shipped.length}):`);
-      for (const entry of shipped) {
-        const prPart = entry.pr_url ? ` — ${entry.pr_url}` : '';
-        lines.push(`• ${entry.title}${prPart}`);
+      const byRepo = groupBy(shipped, extractRepo);
+      for (const [repo, entries] of byRepo) {
+        if (byRepo.size > 1) lines.push(`**${repo}**`);
+        for (const entry of entries) {
+          const prPart = entry.pr_url ? ` — ${entry.pr_url}` : '';
+          lines.push(`• ${entry.title}${prPart}`);
+        }
       }
     }
 
     if (teamPRs.length > 0) {
       lines.push(`\n👥 **Team Shipped** (${teamPRs.length}):`);
-      for (const pr of teamPRs) {
-        lines.push(`• ${pr.title} — ${pr.url} (${pr.author})`);
+      const byRepo = groupBy(teamPRs, (pr) => pr.repo);
+      for (const [repo, prs] of byRepo) {
+        if (byRepo.size > 1) lines.push(`**${repo}**`);
+        for (const pr of prs) {
+          lines.push(`• ${pr.title} — ${pr.url} (${pr.author})`);
+        }
       }
     }
 
