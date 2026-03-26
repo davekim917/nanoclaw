@@ -625,7 +625,13 @@ function buildAllowedTools(tools: string[] | undefined): string[] {
       allowed.push('mcp__gmail-*__*');
     }
   }
+  if (isToolEnabled(tools, 'exa')) {
+    allowed.push('mcp__exa__*');
+    allowed.push('mcp__exa-websets__*');
+  }
   if (isToolEnabled(tools, 'granola')) allowed.push('mcp__granola__*');
+  if (isToolEnabled(tools, 'braintrust')) allowed.push('mcp__braintrust__*');
+  if (isToolEnabled(tools, 'omni')) allowed.push('mcp__omni__*');
   if (isToolEnabled(tools, 'google-workspace')) {
     if (isToolScoped(tools, 'google-workspace')) {
       allowed.push(...GOOGLE_WORKSPACE_READ_TOOLS);
@@ -680,6 +686,12 @@ function buildDisallowedTools(tools: string[] | undefined): string[] {
   }
   return denied;
 }
+
+const EXA_TOOLS = [
+  'web_search_exa', 'web_search_advanced_exa', 'get_code_context_exa',
+  'crawling_exa', 'company_research_exa', 'people_search_exa',
+  'deep_researcher_start', 'deep_researcher_check', 'deep_search_exa',
+] as const;
 
 type StdioServer = { command: string; args: string[]; env?: Record<string, string> };
 type HttpServer = { type: 'http'; url: string; headers?: Record<string, string> };
@@ -745,12 +757,38 @@ function buildMcpServers(
       },
     };
   }
+  if (isToolEnabled(tools, 'exa')) {
+    // Exa uses query-param auth (?exaApiKey=), not HTTP headers,
+    // so the OneCLI proxy can't inject it. Key comes via secrets.
+    const exaKey = containerInput.secrets?.EXA_API_KEY;
+    const exaUrl = new URL('https://mcp.exa.ai/mcp');
+    exaUrl.searchParams.set('tools', EXA_TOOLS.join(','));
+    if (exaKey) exaUrl.searchParams.set('exaApiKey', exaKey);
+    servers.exa = { type: 'http', url: exaUrl.toString() };
+    const websetsUrl = new URL('https://websetsmcp.exa.ai/mcp');
+    if (exaKey) websetsUrl.searchParams.set('exaApiKey', exaKey);
+    servers['exa-websets'] = { type: 'http', url: websetsUrl.toString() };
+  }
   if (isToolEnabled(tools, 'granola')) {
     // Auth header is injected by the OneCLI HTTPS proxy at request time.
     // No explicit token needed — the proxy matches mcp.granola.ai and injects Bearer credentials.
     servers.granola = {
       type: 'http',
       url: 'https://mcp.granola.ai/mcp',
+    };
+  }
+  if (isToolEnabled(tools, 'braintrust')) {
+    // Auth (Bearer) injected by OneCLI HTTPS proxy (matches api.braintrust.dev).
+    servers.braintrust = {
+      type: 'http',
+      url: 'https://api.braintrust.dev/mcp',
+    };
+  }
+  if (isToolEnabled(tools, 'omni')) {
+    // Auth (Bearer) injected by OneCLI HTTPS proxy (matches sunday.omniapp.co).
+    servers.omni = {
+      type: 'http',
+      url: 'https://sunday.omniapp.co/mcp/https',
     };
   }
   if (isToolEnabled(tools, 'google-workspace')) {

@@ -648,18 +648,27 @@ export class SlackChannel implements Channel {
 
   /**
    * Safely add/remove a reaction, ignoring already_reacted/no_reaction errors.
+   * Slack requires emoji short-codes (e.g. 'thought_balloon'), not Unicode.
    */
+  private static readonly UNICODE_TO_SLACK: Record<string, string> = {
+    '💭': 'thought_balloon',
+    '⏳': 'hourglass_flowing_sand',
+    '👀': 'eyes',
+    '✅': 'white_check_mark',
+  };
+
   private async safeReaction(
     method: 'add' | 'remove',
     name: string,
     channelId: string,
     timestamp: string,
   ): Promise<void> {
+    const slackName = SlackChannel.UNICODE_TO_SLACK[name] || name;
     try {
       await this.app.client.reactions[method]({
         channel: channelId,
         timestamp,
-        name,
+        name: slackName,
       });
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -703,7 +712,7 @@ export class SlackChannel implements Channel {
     }
 
     if (!messageTs) {
-      logger.debug({ jid, isTyping }, 'No lastUserMessageTs for reaction');
+      logger.warn({ jid, isTyping, lookupKey }, 'No lastUserMessageTs for Slack reaction swap');
       return;
     }
 

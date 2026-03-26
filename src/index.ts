@@ -719,6 +719,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         // enqueueMessageCheck — without this, the second trigger is never picked up.
         hasMorePendingTriggers = true;
       }
+    } else if (missedMessages.length > 1) {
+      // No trigger required: each parent-channel message is a separate
+      // conversation. Process only the first; re-enqueue for the rest
+      // so each gets its own thread (prevents recovery from batching
+      // unrelated messages into one thread after a restart).
+      missedMessages = missedMessages.slice(0, 1);
+      hasMorePendingTriggers = true;
     }
   }
 

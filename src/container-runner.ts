@@ -1879,17 +1879,12 @@ function buildVolumeMounts(
     }
   }
 
-  // Write .mcp.json — only include tools allowed by group config
+  // Write .mcp.json — MCP servers are now configured in agent-runner's
+  // buildMcpServers() (proxy-injected auth or query-param auth as needed).
+  // Keep the file empty so the SDK doesn't warn about a missing .mcp.json.
   const tools = group.containerConfig?.tools;
   const mcpJsonPath = path.join(groupSessionsDir, '.mcp.json');
-  const mcpServers: Record<string, unknown> = {};
-  if (isToolEnabled(tools, 'exa')) {
-    mcpServers.exa = {
-      type: 'http',
-      url: 'https://mcp.exa.ai/mcp?tools=web_search_exa,web_search_advanced_exa,get_code_context_exa,crawling_exa,company_research_exa,people_search_exa,deep_researcher_start,deep_researcher_check,deep_search_exa',
-    };
-  }
-  fs.writeFileSync(mcpJsonPath, JSON.stringify({ mcpServers }, null, 2) + '\n');
+  fs.writeFileSync(mcpJsonPath, JSON.stringify({ mcpServers: {} }, null, 2) + '\n');
 
   // Sync skills from container/skills/ and ~/.claude/skills/ into each group's .claude/skills/
   const skillsDst = path.join(groupSessionsDir, 'skills');
@@ -2515,6 +2510,9 @@ function readSecrets(
     ...(isToolEnabled(tools, 'google-workspace')
       ? ['GOOGLE_OAUTH_CLIENT_ID', 'GOOGLE_OAUTH_CLIENT_SECRET']
       : []),
+    // Exa API key — MCP auth is via query param, not HTTP header,
+    // so the OneCLI proxy can't inject it. Pass via secrets instead.
+    ...(isToolEnabled(tools, 'exa') ? ['EXA_API_KEY'] : []),
   ];
   const secrets = readEnvFile(envKeys);
 
