@@ -635,6 +635,7 @@ export interface ContainerInput {
   secrets?: Record<string, string>;
   tools?: string[];
   attachments?: ContainerAttachment[];
+  script?: string;
 }
 
 export interface ContainerOutput {
@@ -2438,7 +2439,16 @@ function buildVolumeMounts(
       )
     : path.join(DATA_DIR, 'sessions', group.folder, 'agent-runner-src');
   if (fs.existsSync(agentRunnerSrc)) {
-    fs.cpSync(agentRunnerSrc, agentRunnerBase, { recursive: true });
+    const srcIndex = path.join(agentRunnerSrc, 'index.ts');
+    const cachedIndex = path.join(agentRunnerBase, 'index.ts');
+    const needsCopy =
+      !fs.existsSync(agentRunnerBase) ||
+      !fs.existsSync(cachedIndex) ||
+      (fs.existsSync(srcIndex) &&
+        fs.statSync(srcIndex).mtimeMs > fs.statSync(cachedIndex).mtimeMs);
+    if (needsCopy) {
+      fs.cpSync(agentRunnerSrc, agentRunnerBase, { recursive: true });
+    }
   }
   mounts.push({
     hostPath: agentRunnerBase,
@@ -3267,6 +3277,7 @@ export function writeTasksSnapshot(
     id: string;
     groupFolder: string;
     prompt: string;
+    script?: string | null;
     schedule_type: string;
     schedule_value: string;
     status: string;

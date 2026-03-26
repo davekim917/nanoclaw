@@ -129,10 +129,15 @@ export const EFFORT_FLAG_PATTERN =
 // One-shot flag: "-e1 max" — just this invocation, doesn't stick
 export const EFFORT_ONESHOT_PATTERN = /(?:^|\s)-e1\s+(low|medium|high|max)\b/i;
 
-export const TRIGGER_PATTERN = new RegExp(
-  `^@${escapeRegex(ASSISTANT_NAME)}\\b`,
-  'i',
-);
+export const DEFAULT_TRIGGER = `@${ASSISTANT_NAME}`;
+
+export function getTriggerPattern(trigger?: string): RegExp {
+  const normalizedTrigger = trigger?.trim();
+  const t = normalizedTrigger || DEFAULT_TRIGGER;
+  return new RegExp(`^${escapeRegex(t)}\\b`, 'i');
+}
+
+export const TRIGGER_PATTERN = getTriggerPattern();
 
 /** Build a trigger pattern for a specific assistant name. */
 export function buildTriggerPattern(name: string): RegExp {
