@@ -712,7 +712,10 @@ export class SlackChannel implements Channel {
     }
 
     if (!messageTs) {
-      logger.warn({ jid, isTyping, lookupKey }, 'No lastUserMessageTs for Slack reaction swap');
+      logger.warn(
+        { jid, isTyping, lookupKey },
+        'No lastUserMessageTs for Slack reaction swap',
+      );
       return;
     }
 

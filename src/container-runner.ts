@@ -1884,7 +1884,10 @@ function buildVolumeMounts(
   // Keep the file empty so the SDK doesn't warn about a missing .mcp.json.
   const tools = group.containerConfig?.tools;
   const mcpJsonPath = path.join(groupSessionsDir, '.mcp.json');
-  fs.writeFileSync(mcpJsonPath, JSON.stringify({ mcpServers: {} }, null, 2) + '\n');
+  fs.writeFileSync(
+    mcpJsonPath,
+    JSON.stringify({ mcpServers: {} }, null, 2) + '\n',
+  );
 
   // Sync skills from container/skills/ and ~/.claude/skills/ into each group's .claude/skills/
   const skillsDst = path.join(groupSessionsDir, 'skills');
