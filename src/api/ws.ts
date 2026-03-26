@@ -334,10 +334,7 @@ export function initWebSocket(
         if (typeof parsed.groupFolder === 'string' && parsed.groupFolder) {
           groupFolder = parsed.groupFolder;
           groupJid = makeWebJid(groupFolder);
-        } else if (
-          typeof parsed.groupJid === 'string' &&
-          parsed.groupJid
-        ) {
+        } else if (typeof parsed.groupJid === 'string' && parsed.groupJid) {
           groupJid = parsed.groupJid;
         } else {
           sendJson(ws, {
@@ -354,9 +351,8 @@ export function initWebSocket(
           // Resolve folder: from groupFolder param, or look up via capabilities
           const folder =
             groupFolder ||
-            deps
-              .getCapabilities()
-              .groups?.find((g) => g.jid === groupJid)?.folder;
+            deps.getCapabilities().groups?.find((g) => g.jid === groupJid)
+              ?.folder;
           if (!folder || !client.allowedGroups.has(folder)) {
             sendJson(ws, {
               type: 'error',

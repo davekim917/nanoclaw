@@ -459,7 +459,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   const isMainGroup = group.isMain === true;
   const isWebChannel = isWebJid(parentJid);
-  const needsTrigger = !isMainGroup && !isWebChannel && group.requiresTrigger !== false;
+  const needsTrigger =
+    !isMainGroup && !isWebChannel && group.requiresTrigger !== false;
   const groupAssistantName = resolveAssistantName(group.containerConfig);
   const triggerPattern = buildTriggerPattern(groupAssistantName);
 

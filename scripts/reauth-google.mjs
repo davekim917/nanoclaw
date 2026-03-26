@@ -32,6 +32,18 @@ const CALENDAR_SCOPES = [
   'https://www.googleapis.com/auth/calendar',
   'https://www.googleapis.com/auth/calendar.events',
 ];
+const WORKSPACE_SCOPES = [
+  'https://www.googleapis.com/auth/drive',
+  'https://www.googleapis.com/auth/drive.readonly',
+  'https://www.googleapis.com/auth/drive.file',
+  'https://www.googleapis.com/auth/documents',
+  'https://www.googleapis.com/auth/documents.readonly',
+  'https://www.googleapis.com/auth/spreadsheets',
+  'https://www.googleapis.com/auth/spreadsheets.readonly',
+  'https://www.googleapis.com/auth/presentations',
+  'https://www.googleapis.com/auth/presentations.readonly',
+];
+const WORKSPACE_CREDS_DIR = path.join(HOME, '.google_workspace_mcp', 'credentials');
 
 function readOAuthKeys() {
   const raw = JSON.parse(fs.readFileSync(OAUTH_KEYS_PATH, 'utf-8'));
@@ -181,6 +193,29 @@ async function reauthCalendar(accountId, oauthKeys) {
   console.log(`✓ Calendar ${accountId} re-authed successfully`);
 }
 
+// --- Google Workspace ---
+
+async function reauthWorkspace(email, filePath, oauthKeys) {
+  console.log(`\n=== Workspace: ${email} ===`);
+  const url = generateAuthUrl(oauthKeys.clientId, WORKSPACE_SCOPES, email);
+  console.log(`Open this URL:\n${url}\n`);
+  console.log('After authorizing, copy the FULL URL from the address bar.\n');
+  const input = await ask('Paste URL or code: ');
+  const code = extractCode(input);
+  const tokens = await exchangeCode(code, oauthKeys.clientId, oauthKeys.clientSecret);
+  const fresh = {
+    token: tokens.access_token,
+    refresh_token: tokens.refresh_token,
+    token_uri: TOKEN_ENDPOINT,
+    client_id: oauthKeys.clientId,
+    client_secret: oauthKeys.clientSecret,
+    scopes: WORKSPACE_SCOPES,
+    expiry: new Date(Date.now() + (tokens.expires_in || 3600) * 1000).toISOString(),
+  };
+  fs.writeFileSync(filePath, JSON.stringify(fresh, null, 2) + '\n');
+  console.log(`✓ Workspace ${email} re-authed successfully`);
+}
+
 // --- Main ---
 
 async function main() {
@@ -214,6 +249,23 @@ async function main() {
       } catch { /* re-auth */ }
       await reauthCalendar(acctId, oauthKeys);
     }
+
+    // Google Workspace (Drive/Sheets/Docs/Slides)
+    if (fs.existsSync(WORKSPACE_CREDS_DIR)) {
+      for (const file of fs.readdirSync(WORKSPACE_CREDS_DIR).filter((f) => f.endsWith('.json'))) {
+        const email = file.replace('.json', '');
+        const filePath = path.join(WORKSPACE_CREDS_DIR, file);
+        try {
+          const creds = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+          const expiryMs = creds.expiry ? new Date(creds.expiry).getTime() : 0;
+          if (expiryMs && Date.now() < expiryMs - 5 * 60 * 1000) {
+            console.log(`Workspace ${email}: still valid, skipping`);
+            continue;
+          }
+        } catch { /* re-auth */ }
+        await reauthWorkspace(email, filePath, oauthKeys);
+      }
+    }
     return;
   }
 
@@ -232,13 +284,27 @@ async function main() {
       process.exit(1);
     }
     await reauthCalendar(account, oauthKeys);
+  } else if (type === 'workspace') {
+    const filePath = path.join(WORKSPACE_CREDS_DIR, `${account}.json`);
+    if (!fs.existsSync(filePath)) {
+      const available = fs.existsSync(WORKSPACE_CREDS_DIR)
+        ? fs.readdirSync(WORKSPACE_CREDS_DIR).filter((f) => f.endsWith('.json')).map((f) => f.replace('.json', ''))
+        : [];
+      console.error(`Workspace account "${account}" not found. Available: ${available.join(', ')}`);
+      process.exit(1);
+    }
+    await reauthWorkspace(account, filePath, oauthKeys);
   } else {
     console.log('Usage:');
     console.log('  node scripts/reauth-google.mjs gmail <account>');
     console.log('  node scripts/reauth-google.mjs calendar <account>');
+    console.log('  node scripts/reauth-google.mjs workspace <email>');
     console.log('  node scripts/reauth-google.mjs all    # re-auth all expired tokens');
     console.log('\nGmail accounts:', discoverGmailAccounts().map((a) => a.label).join(', '));
     console.log('Calendar accounts:', discoverCalendarAccounts().join(', '));
+    if (fs.existsSync(WORKSPACE_CREDS_DIR)) {
+      console.log('Workspace accounts:', fs.readdirSync(WORKSPACE_CREDS_DIR).filter((f) => f.endsWith('.json')).map((f) => f.replace('.json', '')).join(', '));
+    }
   }
 }
 
