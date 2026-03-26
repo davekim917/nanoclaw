@@ -778,10 +778,16 @@ function buildMcpServers(
     };
   }
   if (isToolEnabled(tools, 'braintrust')) {
-    // Auth (Bearer) injected by OneCLI HTTPS proxy (matches api.braintrust.dev).
+    // Proxy doesn't reliably inject auth for MCP/SSE endpoints,
+    // so pass the API key directly in the header config.
+    const btKey = containerInput.secrets?.BRAINTRUST_API_KEY;
     servers.braintrust = {
       type: 'http',
       url: 'https://api.braintrust.dev/mcp',
+      headers: {
+        'Accept': 'application/json, text/event-stream',
+        ...(btKey ? { 'Authorization': `Bearer ${btKey}` } : {}),
+      },
     };
   }
   if (isToolEnabled(tools, 'omni')) {

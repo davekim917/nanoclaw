@@ -2518,9 +2518,10 @@ function readSecrets(
     ...(isToolEnabled(tools, 'exa') ? ['EXA_API_KEY'] : []),
     // Omni skills plugin uses env vars in curl commands (REST API).
     // The MCP server auth is handled by the proxy, but the skills need these.
-    ...(isToolEnabled(tools, 'omni')
-      ? ['OMNI_BASE_URL', 'OMNI_API_KEY']
-      : []),
+    ...(isToolEnabled(tools, 'omni') ? ['OMNI_BASE_URL', 'OMNI_API_KEY'] : []),
+    // Braintrust API key — proxy doesn't reliably inject auth for MCP/SSE
+    // endpoints, so pass directly via secrets for the header config.
+    ...(isToolEnabled(tools, 'braintrust') ? ['BRAINTRUST_API_KEY'] : []),
   ];
   const secrets = readEnvFile(envKeys);
 
