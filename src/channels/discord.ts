@@ -73,11 +73,17 @@ export class DiscordChannel implements Channel {
   // cross-conversation state corruption when multiple groups run concurrently.
   private pendingThreadTitle = new Map<string, string>();
   private pendingHaikuTitle = new Map<string, Promise<string | undefined>>();
-  private pendingThreadRename = new Map<string, { threadId: string; appliedTitle: string }>();
+  private pendingThreadRename = new Map<
+    string,
+    { threadId: string; appliedTitle: string }
+  >();
   private static MEMBER_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
   /** Called by index.ts before runAgent to pass the Haiku title promise. */
-  setHaikuTitlePromise(convKey: string, promise: Promise<string | undefined>): void {
+  setHaikuTitlePromise(
+    convKey: string,
+    promise: Promise<string | undefined>,
+  ): void {
     this.pendingHaikuTitle.set(convKey, promise);
   }
 
@@ -809,8 +815,13 @@ export class DiscordChannel implements Channel {
       if (!agentTitle && haikuPromise) {
         let timer: ReturnType<typeof setTimeout>;
         agentTitle = await Promise.race([
-          haikuPromise.then((v) => { clearTimeout(timer); return v; }),
-          new Promise<string | undefined>((resolve) => { timer = setTimeout(() => resolve(undefined), 2000); }),
+          haikuPromise.then((v) => {
+            clearTimeout(timer);
+            return v;
+          }),
+          new Promise<string | undefined>((resolve) => {
+            timer = setTimeout(() => resolve(undefined), 2000);
+          }),
         ]);
         this.pendingHaikuTitle.delete(convKey);
       }
@@ -831,7 +842,10 @@ export class DiscordChannel implements Channel {
 
       // Track this thread for potential retroactive rename if the agent's
       // <thread-title> arrives later via streaming output.
-      this.pendingThreadRename.set(convKey, { threadId: thread.id, appliedTitle: name });
+      this.pendingThreadRename.set(convKey, {
+        threadId: thread.id,
+        appliedTitle: name,
+      });
 
       text = await this.replaceMentions(text, textChannel);
       ({ text } = transformTablesInText('discord', text));
@@ -907,7 +921,10 @@ export class DiscordChannel implements Channel {
         logger.info({ threadId, name: trimmed }, 'Discord thread renamed');
       })
       .catch((err) => {
-        logger.warn({ threadId, name: trimmed, err }, 'Failed to rename Discord thread');
+        logger.warn(
+          { threadId, name: trimmed, err },
+          'Failed to rename Discord thread',
+        );
       });
   }
 

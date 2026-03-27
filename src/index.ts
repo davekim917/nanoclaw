@@ -1048,7 +1048,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     : chatJid;
   if (haikusTitlePromise && 'setHaikuTitlePromise' in channel) {
     (
-      channel as { setHaikuTitlePromise(k: string, p: Promise<string | undefined>): void }
+      channel as {
+        setHaikuTitlePromise(k: string, p: Promise<string | undefined>): void;
+      }
     ).setHaikuTitlePromise(threadTitleConvKey, haikusTitlePromise);
   }
 
