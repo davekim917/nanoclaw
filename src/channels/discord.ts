@@ -1394,12 +1394,23 @@ export class DiscordChannel implements Channel {
    * this resolves to the thread JID created by the streaming output path.
    * Returns the original JID if no thread redirect is found.
    */
-  resolveIpcJid(jid: string): string {
+  resolveIpcJid(jid: string, threadId?: string): string {
     // Already a thread JID — no resolution needed
     if (parseThreadJid(jid)) return jid;
 
-    // Scan for any active thread redirect from this parent channel
-    // Match both bare-JID keys and prefixed keys (consistent with sendSwarmMessage)
+    // When threadId is known, look up the specific conversation key.
+    // This prevents cross-thread misrouting when multiple threads are
+    // active on the same parent channel (each has its own convKey).
+    if (threadId) {
+      const convKey = `${jid}:${threadId}`;
+      const exact = this.createdThreadJid.get(convKey);
+      if (exact) return exact;
+      // Thread not yet created via streaming output — return parent JID
+      // so the caller falls through to triggerMsgId-based thread creation.
+      return jid;
+    }
+
+    // No threadId hint — scan for any active thread redirect (legacy path).
     for (const [key, threadJid] of this.createdThreadJid) {
       if (key === jid || key.startsWith(`${jid}:`)) {
         return threadJid;

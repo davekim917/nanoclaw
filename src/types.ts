@@ -235,7 +235,8 @@ export interface Channel {
   // Optional: resolve a parent JID to its active thread JID for IPC routing.
   // When a container sends IPC messages using its NANOCLAW_CHAT_JID (parent),
   // this resolves to the thread JID created by the streaming output path.
-  resolveIpcJid?(jid: string): string;
+  // threadId narrows to the specific conversation (prevents cross-thread misrouting).
+  resolveIpcJid?(jid: string, threadId?: string): string;
 }
 
 // --- Cockpit user management ---

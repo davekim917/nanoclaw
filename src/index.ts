@@ -2210,7 +2210,9 @@ async function main(): Promise<void> {
       if (!text) return Promise.resolve();
       // Resolve parent JID → thread JID when the container only knows
       // the parent (NANOCLAW_CHAT_JID set before thread was created).
-      const resolvedJid = channel.resolveIpcJid?.(jid) ?? jid;
+      // Pass threadId so the resolver matches the specific conversation
+      // instead of picking an arbitrary thread on the same channel.
+      const resolvedJid = channel.resolveIpcJid?.(jid, threadId) ?? jid;
       // Track that IPC output was sent for this JID so the "finished
       // processing" safety net doesn't fire a false positive.
       // Only track thread-specific JIDs — NOT parentJid, which is shared
@@ -2264,7 +2266,7 @@ async function main(): Promise<void> {
     sendFile: async (jid, file, caption?, _sender?, threadId?) => {
       const channel = findChannel(channels, jid);
       if (!channel) throw new Error(`No channel for JID: ${jid}`);
-      const resolvedJid = channel.resolveIpcJid?.(jid) ?? jid;
+      const resolvedJid = channel.resolveIpcJid?.(jid, threadId) ?? jid;
       ipcOutputSentJids.add(jid);
       if (resolvedJid !== jid) ipcOutputSentJids.add(resolvedJid);
       const isAlreadyThread = !!parseThreadJid(resolvedJid);
