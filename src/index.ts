@@ -1659,9 +1659,16 @@ async function startMessageLoop(): Promise<void> {
                     ? `${pipeModelOverride.model} for this session`
                     : `${pipeModelOverride.model} for this message`;
                 channel
-                  .sendMessage(chatJid, `✅ Switched to ${label}.`, incomingThreadId)
+                  .sendMessage(
+                    chatJid,
+                    `✅ Switched to ${label}.`,
+                    incomingThreadId,
+                  )
                   .catch((err: unknown) =>
-                    logger.warn({ chatJid, err }, 'Failed to send model switch confirmation'),
+                    logger.warn(
+                      { chatJid, err },
+                      'Failed to send model switch confirmation',
+                    ),
                   );
               }
 
