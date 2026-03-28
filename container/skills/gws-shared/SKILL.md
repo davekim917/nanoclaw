@@ -18,7 +18,11 @@ The `gws` binary must be on `$PATH`. See the project README for install options.
 
 ## Authentication (NanoClaw)
 
-This container has pre-converted credentials for each mounted Gmail account. Always set `GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE` before running gws:
+This container has two sets of pre-converted credentials. Always set `GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE` before running gws.
+
+### Gmail credentials (Gmail scopes only)
+
+Use for `gws gmail` commands:
 
 ```bash
 # Primary account
@@ -29,9 +33,23 @@ GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=/home/node/.gmail-mcp-sunday/gws-credentia
 GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=/home/node/.gmail-mcp-illysium/gws-credentials.json gws gmail +triage
 ```
 
-Discover available accounts:
+### Workspace credentials (Drive/Docs/Sheets/Slides scopes)
+
+Use for `gws drive`, `gws docs`, `gws sheets`, `gws slides` commands:
+
+```bash
+# Primary account
+GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=/home/node/.google_workspace_mcp/credentials/david.kim6@gmail.com.json.gws gws docs documents get --params '{"documentId":"..."}'
+
+# Other accounts — pick the email matching the group
+GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=/home/node/.google_workspace_mcp/credentials/david.kim@getsunday.com.json.gws gws sheets +read --spreadsheet ID --range "A1:D10"
+```
+
+### Discover available accounts
+
 ```bash
 ls /home/node/.gmail-mcp*/gws-credentials.json 2>/dev/null
+ls /home/node/.google_workspace_mcp/credentials/*.gws 2>/dev/null
 ```
 
 ## Global Flags

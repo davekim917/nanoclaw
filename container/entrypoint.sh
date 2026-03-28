@@ -63,4 +63,18 @@ for dir in /home/node/.gmail-mcp /home/node/.gmail-mcp-*; do
   ' 2>/dev/null || true
 done
 
+# Convert Google Workspace MCP credentials (Drive/Docs/Sheets/Slides) to gws format.
+# These have broader scopes than Gmail creds. Stored per-email at .google_workspace_mcp/credentials/.
+for f in /home/node/.google_workspace_mcp/credentials/*.json; do
+  [ -f "$f" ] || continue
+  node -e '
+    const fs=require("fs");
+    const creds=JSON.parse(fs.readFileSync("'"$f"'","utf8"));
+    if(!creds.refresh_token||!creds.client_id)process.exit(0);
+    const out=JSON.stringify({type:"authorized_user",client_id:creds.client_id,
+      client_secret:creds.client_secret,refresh_token:creds.refresh_token},null,2)+"\n";
+    fs.writeFileSync("'"$f"'.gws",out);
+  ' 2>/dev/null || true
+done
+
 node /tmp/dist/index.js < /tmp/input.json
