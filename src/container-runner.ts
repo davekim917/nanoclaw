@@ -1927,7 +1927,25 @@ function buildVolumeMounts(
     readonly: false,
   });
 
-  // Gmail credentials — gated by tools config ('gmail', 'gmail:<account>', or 'gmail-readonly:<account>')
+  // Consolidated gws credentials — one file per account at ~/.config/gws/accounts/{name}.json.
+  // Each file has all Google scopes (Gmail, Calendar, Drive, Docs, Sheets, Slides).
+  // Mounted when any Google service is enabled.
+  if (
+    isToolEnabled(tools, 'gmail') || isToolEnabled(tools, 'gmail-readonly') ||
+    isToolEnabled(tools, 'calendar') || isToolEnabled(tools, 'google-workspace')
+  ) {
+    const gwsDir = path.join(homeDir, '.config', 'gws', 'accounts');
+    if (fs.existsSync(gwsDir)) {
+      mounts.push({
+        hostPath: gwsDir,
+        containerPath: '/home/node/.config/gws/accounts',
+        readonly: true,
+      });
+    }
+  }
+
+  // Legacy Gmail credentials — still needed for host-side Gmail channel polling
+  // and for the legacy entrypoint fallback conversion.
   if (isToolEnabled(tools, 'gmail') || isToolEnabled(tools, 'gmail-readonly')) {
     const gmailScopes = extractToolScopes(tools, 'gmail');
     const readonlyScopes = extractToolScopes(tools, 'gmail-readonly');

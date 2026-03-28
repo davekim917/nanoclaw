@@ -45,36 +45,30 @@ fi
 export GOOGLE_WORKSPACE_CLI_CONFIG_DIR=/tmp/.gws
 mkdir -p /tmp/.gws
 
-# Convert Gmail OAuth credentials to gws authorized_user format.
-# gws needs {type,client_id,client_secret,refresh_token};
-# existing creds split these across gcp-oauth.keys.json and credentials.json.
-for dir in /home/node/.gmail-mcp /home/node/.gmail-mcp-*; do
-  [ -f "$dir/credentials.json" ] && [ -f "$dir/gcp-oauth.keys.json" ] || continue
-  node -e '
-    const fs=require("fs"),p=require("path");
-    const oauth=JSON.parse(fs.readFileSync(p.join("'"$dir"'","gcp-oauth.keys.json"),"utf8"));
-    const creds=JSON.parse(fs.readFileSync(p.join("'"$dir"'","credentials.json"),"utf8"));
-    const c=oauth.installed||oauth.web;
-    if(!c||!creds.refresh_token)process.exit(0);
-    fs.writeFileSync(p.join("'"$dir"'","gws-credentials.json"),JSON.stringify({
-      type:"authorized_user",client_id:c.client_id,
-      client_secret:c.client_secret,refresh_token:creds.refresh_token
-    },null,2)+"\n");
-  ' 2>/dev/null || true
-done
-
-# Convert Google Workspace MCP credentials (Drive/Docs/Sheets/Slides) to gws format.
-# These have broader scopes than Gmail creds. Stored per-email at .google_workspace_mcp/credentials/.
-for f in /home/node/.google_workspace_mcp/credentials/*.json; do
-  [ -f "$f" ] || continue
-  node -e '
-    const fs=require("fs");
-    const creds=JSON.parse(fs.readFileSync("'"$f"'","utf8"));
-    if(!creds.refresh_token||!creds.client_id)process.exit(0);
-    const out=JSON.stringify({type:"authorized_user",client_id:creds.client_id,
-      client_secret:creds.client_secret,refresh_token:creds.refresh_token},null,2)+"\n";
-    fs.writeFileSync("'"$f"'.gws",out);
-  ' 2>/dev/null || true
-done
+# Google credentials: consolidated gws authorized_user files at /home/node/.config/gws/accounts/.
+# If consolidated creds exist, use them directly. Otherwise, fall back to converting legacy
+# MCP credentials (gmail-mcp, google-calendar-mcp, google_workspace_mcp) for backward compat.
+if [ -d /home/node/.config/gws/accounts ] && ls /home/node/.config/gws/accounts/*.json >/dev/null 2>&1; then
+  echo "[entrypoint] Using consolidated gws credentials" >&2
+else
+  echo "[entrypoint] No consolidated creds — converting legacy MCP credentials" >&2
+  mkdir -p /home/node/.config/gws/accounts
+  # Convert legacy Gmail credentials
+  for dir in /home/node/.gmail-mcp /home/node/.gmail-mcp-*; do
+    [ -f "$dir/credentials.json" ] && [ -f "$dir/gcp-oauth.keys.json" ] || continue
+    node -e '
+      const fs=require("fs"),p=require("path");
+      const oauth=JSON.parse(fs.readFileSync(p.join("'"$dir"'","gcp-oauth.keys.json"),"utf8"));
+      const creds=JSON.parse(fs.readFileSync(p.join("'"$dir"'","credentials.json"),"utf8"));
+      const c=oauth.installed||oauth.web;
+      if(!c||!creds.refresh_token)process.exit(0);
+      const name=p.basename("'"$dir"'").replace(".gmail-mcp-","").replace(".gmail-mcp","primary");
+      fs.writeFileSync(p.join("/home/node/.config/gws/accounts",name+".json"),JSON.stringify({
+        type:"authorized_user",client_id:c.client_id,
+        client_secret:c.client_secret,refresh_token:creds.refresh_token
+      },null,2)+"\n");
+    ' 2>/dev/null || true
+  done
+fi
 
 node /tmp/dist/index.js < /tmp/input.json

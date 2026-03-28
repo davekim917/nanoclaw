@@ -1,14 +1,17 @@
 #!/usr/bin/env node
 /**
- * Manual Google OAuth re-auth for headless/mobile use.
+ * Google OAuth re-auth for headless/mobile use.
+ * Consolidated credentials — one file per account with all scopes.
  * No SSH tunnel needed — paste the code from the redirect URL.
  *
+ * Credentials are stored at ~/.config/gws/{account}.json in the
+ * gws authorized_user format (type, client_id, client_secret, refresh_token).
+ *
  * Usage:
- *   node scripts/reauth-google.mjs gmail illysium
- *   node scripts/reauth-google.mjs gmail sunday
- *   node scripts/reauth-google.mjs calendar normal
- *   node scripts/reauth-google.mjs calendar illysium
+ *   node scripts/reauth-google.mjs primary
+ *   node scripts/reauth-google.mjs sunday
  *   node scripts/reauth-google.mjs all          # re-auth everything that's expired
+ *   node scripts/reauth-google.mjs list         # show accounts and status
  */
 import fs from 'fs';
 import os from 'os';
@@ -16,34 +19,38 @@ import path from 'path';
 import readline from 'readline';
 
 const HOME = os.homedir();
+const GWS_CREDS_DIR = path.join(HOME, '.config', 'gws', 'accounts');
 const OAUTH_KEYS_PATH = path.join(HOME, '.gmail-mcp', 'gcp-oauth.keys.json');
-const CALENDAR_TOKENS_PATH = path.join(HOME, '.config', 'google-calendar-mcp', 'tokens.json');
 const TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token';
 const AUTH_ENDPOINT = 'https://accounts.google.com/o/oauth2/v2/auth';
-// Use a localhost redirect — Google still allows it for "installed" apps.
-// The browser will fail to connect, but the code is in the URL bar.
 const REDIRECT_URI = 'http://localhost:3000/oauth2callback';
 
-const GMAIL_SCOPES = [
+// Combined scopes — one auth flow covers Gmail, Calendar, Drive, Docs, Sheets, Slides
+const ALL_SCOPES = [
+  // Gmail
   'https://www.googleapis.com/auth/gmail.modify',
   'https://www.googleapis.com/auth/gmail.settings.basic',
-];
-const CALENDAR_SCOPES = [
+  // Calendar
   'https://www.googleapis.com/auth/calendar',
   'https://www.googleapis.com/auth/calendar.events',
-];
-const WORKSPACE_SCOPES = [
+  // Drive
   'https://www.googleapis.com/auth/drive',
-  'https://www.googleapis.com/auth/drive.readonly',
-  'https://www.googleapis.com/auth/drive.file',
+  // Docs
   'https://www.googleapis.com/auth/documents',
-  'https://www.googleapis.com/auth/documents.readonly',
+  // Sheets
   'https://www.googleapis.com/auth/spreadsheets',
-  'https://www.googleapis.com/auth/spreadsheets.readonly',
+  // Slides
   'https://www.googleapis.com/auth/presentations',
-  'https://www.googleapis.com/auth/presentations.readonly',
 ];
-const WORKSPACE_CREDS_DIR = path.join(HOME, '.google_workspace_mcp', 'credentials');
+
+// Account registry: label → email (used as login_hint)
+const ACCOUNTS = {
+  primary: 'david.kim6@gmail.com',
+  personal2: 'dave.kim917@gmail.com',
+  sunday: 'david.kim@getsunday.com',
+  illysium: 'dave@illysium.ai',
+  numberdrinks: 'dave@numberdrinks.com',
+};
 
 function readOAuthKeys() {
   const raw = JSON.parse(fs.readFileSync(OAUTH_KEYS_PATH, 'utf-8'));
@@ -56,24 +63,23 @@ function ask(question) {
   return new Promise((resolve) => rl.question(question, (ans) => { rl.close(); resolve(ans.trim()); }));
 }
 
-function generateAuthUrl(clientId, scopes, loginHint) {
+function generateAuthUrl(clientId, loginHint) {
   const params = new URLSearchParams({
     client_id: clientId,
     redirect_uri: REDIRECT_URI,
     response_type: 'code',
-    scope: scopes.join(' '),
+    scope: ALL_SCOPES.join(' '),
     access_type: 'offline',
-    prompt: 'consent', // force new refresh token
+    prompt: 'consent',
   });
   if (loginHint) params.set('login_hint', loginHint);
   return `${AUTH_ENDPOINT}?${params}`;
 }
 
 function extractCode(input) {
-  // Accept either a bare code or a full URL containing ?code=...
   const match = input.match(/[?&]code=([^&]+)/);
   if (match) return decodeURIComponent(match[1]);
-  return input; // assume bare code
+  return input;
 }
 
 async function exchangeCode(code, clientId, clientSecret) {
@@ -95,36 +101,64 @@ async function exchangeCode(code, clientId, clientSecret) {
   return resp.json();
 }
 
-// --- Gmail ---
-
-function discoverGmailAccounts() {
-  const accounts = [];
-  if (fs.existsSync(path.join(HOME, '.gmail-mcp', 'credentials.json'))) {
-    accounts.push({ label: 'primary', dir: path.join(HOME, '.gmail-mcp') });
-  }
-  for (const entry of fs.readdirSync(HOME)) {
-    if (!entry.startsWith('.gmail-mcp-')) continue;
-    const dir = path.join(HOME, entry);
-    if (!fs.statSync(dir).isDirectory()) continue;
-    if (!fs.existsSync(path.join(dir, 'credentials.json'))) continue;
-    accounts.push({ label: entry.replace('.gmail-mcp-', ''), dir });
-  }
-  return accounts;
+function credPath(account) {
+  return path.join(GWS_CREDS_DIR, `${account}.json`);
 }
 
-const GMAIL_LOGIN_HINTS = {
-  primary: 'david.kim6@gmail.com',
-  illysium: 'dave@illysium.ai',
-  sunday: 'david.kim@getsunday.com',
-  personal2: 'dave.kim917@gmail.com',
-  numberdrinks: 'dave@numberdrinks.com',
-};
+function readCred(account) {
+  try {
+    return JSON.parse(fs.readFileSync(credPath(account), 'utf-8'));
+  } catch {
+    return null;
+  }
+}
 
-async function reauthGmail(account, oauthKeys) {
-  const loginHint = GMAIL_LOGIN_HINTS[account.label];
-  const url = generateAuthUrl(oauthKeys.clientId, GMAIL_SCOPES, loginHint);
+async function checkToken(cred, oauthKeys) {
+  // Refresh to get a fresh access_token, then check its scopes via tokeninfo.
+  // Returns { valid: false } if refresh fails, or { valid: true, scopes: [...] }.
+  if (!cred?.refresh_token) return { valid: false, scopes: [] };
+  try {
+    const resp = await fetch(TOKEN_ENDPOINT, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'refresh_token',
+        client_id: oauthKeys.clientId,
+        client_secret: oauthKeys.clientSecret,
+        refresh_token: cred.refresh_token,
+      }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!resp.ok) return { valid: false, scopes: [] };
+    const tokens = await resp.json();
+    // Check scopes via tokeninfo
+    const infoResp = await fetch(`https://oauth2.googleapis.com/tokeninfo?access_token=${tokens.access_token}`, {
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!infoResp.ok) return { valid: true, scopes: [] }; // can't check scopes but token works
+    const info = await infoResp.json();
+    const scopes = (info.scope || '').split(' ').filter(Boolean);
+    return { valid: true, scopes };
+  } catch {
+    return { valid: false, scopes: [] };
+  }
+}
 
-  console.log(`\n=== Gmail: ${account.label} (${loginHint || 'unknown'}) ===`);
+function missingScopes(currentScopes) {
+  // Check which required scopes are missing. Uses base scope names
+  // (e.g. 'gmail.modify' matches if current has the full URL).
+  return ALL_SCOPES.filter(required => !currentScopes.includes(required));
+}
+
+async function reauthAccount(account, oauthKeys) {
+  const email = ACCOUNTS[account];
+  if (!email) {
+    console.error(`Unknown account "${account}". Available: ${Object.keys(ACCOUNTS).join(', ')}`);
+    process.exit(1);
+  }
+
+  const url = generateAuthUrl(oauthKeys.clientId, email);
+  console.log(`\n=== ${account} (${email}) ===`);
   console.log(`Open this URL:\n${url}\n`);
   console.log('After authorizing, the browser will show "can\'t connect".');
   console.log('Copy the FULL URL from the address bar and paste it here.\n');
@@ -133,188 +167,85 @@ async function reauthGmail(account, oauthKeys) {
   const code = extractCode(input);
   const tokens = await exchangeCode(code, oauthKeys.clientId, oauthKeys.clientSecret);
 
-  const credPath = path.join(account.dir, 'credentials.json');
-  const creds = {
-    access_token: tokens.access_token,
-    refresh_token: tokens.refresh_token,
-    scope: GMAIL_SCOPES.join(' '),
-    token_type: tokens.token_type || 'Bearer',
-    expiry_date: Date.now() + (tokens.expires_in || 3600) * 1000,
-  };
-  fs.writeFileSync(credPath, JSON.stringify(creds, null, 2) + '\n');
-  // Also generate gws CLI credential file (authorized_user format)
-  const gwsCredPath = path.join(account.dir, 'gws-credentials.json');
-  const gwsCreds = {
+  fs.mkdirSync(GWS_CREDS_DIR, { recursive: true });
+  const cred = {
     type: 'authorized_user',
     client_id: oauthKeys.clientId,
     client_secret: oauthKeys.clientSecret,
     refresh_token: tokens.refresh_token,
   };
-  fs.writeFileSync(gwsCredPath, JSON.stringify(gwsCreds, null, 2) + '\n');
-  console.log(`✓ Gmail ${account.label} re-authed successfully (+ gws credentials)`);
-}
+  fs.writeFileSync(credPath(account), JSON.stringify(cred, null, 2) + '\n');
 
-// --- Calendar ---
-
-function discoverCalendarAccounts() {
-  try {
-    const tokens = JSON.parse(fs.readFileSync(CALENDAR_TOKENS_PATH, 'utf-8'));
-    return Object.keys(tokens);
-  } catch {
-    return [];
+  // Also update legacy credential files so the Gmail channel (host-side) keeps working.
+  // Gmail channel reads from ~/.gmail-mcp*/credentials.json directly.
+  const legacyDir = account === 'primary'
+    ? path.join(HOME, '.gmail-mcp')
+    : path.join(HOME, `.gmail-mcp-${account}`);
+  if (fs.existsSync(legacyDir)) {
+    const legacyCred = {
+      access_token: tokens.access_token,
+      refresh_token: tokens.refresh_token,
+      scope: ALL_SCOPES.join(' '),
+      token_type: tokens.token_type || 'Bearer',
+      expiry_date: Date.now() + (tokens.expires_in || 3600) * 1000,
+    };
+    fs.writeFileSync(path.join(legacyDir, 'credentials.json'), JSON.stringify(legacyCred, null, 2) + '\n');
+    // gws-credentials.json (legacy entrypoint conversion format)
+    fs.writeFileSync(path.join(legacyDir, 'gws-credentials.json'), JSON.stringify(cred, null, 2) + '\n');
   }
+
+  console.log(`✓ ${account} (${email}) re-authed with all scopes`);
 }
-
-const CALENDAR_LOGIN_HINTS = {
-  normal: 'david.kim6@gmail.com',
-  sunday: 'david.kim@getsunday.com',
-  personal2: 'dave.kim917@gmail.com',
-  illysium: 'dave@illysium.ai',
-  numberdrinks: 'dave@numberdrinks.com',
-};
-
-async function reauthCalendar(accountId, oauthKeys) {
-  const loginHint = CALENDAR_LOGIN_HINTS[accountId];
-  const url = generateAuthUrl(oauthKeys.clientId, CALENDAR_SCOPES, loginHint);
-
-  console.log(`\n=== Calendar: ${accountId} (${loginHint || 'unknown'}) ===`);
-  console.log(`Open this URL:\n${url}\n`);
-  console.log('After authorizing, copy the FULL URL from the address bar.\n');
-
-  const input = await ask('Paste URL or code: ');
-  const code = extractCode(input);
-  const tokens = await exchangeCode(code, oauthKeys.clientId, oauthKeys.clientSecret);
-
-  // Read existing tokens file, update just this account
-  let allTokens = {};
-  try {
-    allTokens = JSON.parse(fs.readFileSync(CALENDAR_TOKENS_PATH, 'utf-8'));
-  } catch { /* fresh file */ }
-
-  allTokens[accountId] = {
-    access_token: tokens.access_token,
-    refresh_token: tokens.refresh_token,
-    scope: CALENDAR_SCOPES.join(' '),
-    token_type: tokens.token_type || 'Bearer',
-    expiry_date: Date.now() + (tokens.expires_in || 3600) * 1000,
-  };
-  fs.writeFileSync(CALENDAR_TOKENS_PATH, JSON.stringify(allTokens, null, 2) + '\n');
-  console.log(`✓ Calendar ${accountId} re-authed successfully`);
-}
-
-// --- Google Workspace ---
-
-async function reauthWorkspace(email, filePath, oauthKeys) {
-  console.log(`\n=== Workspace: ${email} ===`);
-  const url = generateAuthUrl(oauthKeys.clientId, WORKSPACE_SCOPES, email);
-  console.log(`Open this URL:\n${url}\n`);
-  console.log('After authorizing, copy the FULL URL from the address bar.\n');
-  const input = await ask('Paste URL or code: ');
-  const code = extractCode(input);
-  const tokens = await exchangeCode(code, oauthKeys.clientId, oauthKeys.clientSecret);
-  const fresh = {
-    token: tokens.access_token,
-    refresh_token: tokens.refresh_token,
-    token_uri: TOKEN_ENDPOINT,
-    client_id: oauthKeys.clientId,
-    client_secret: oauthKeys.clientSecret,
-    scopes: WORKSPACE_SCOPES,
-    expiry: new Date(Date.now() + (tokens.expires_in || 3600) * 1000).toISOString(),
-  };
-  fs.writeFileSync(filePath, JSON.stringify(fresh, null, 2) + '\n');
-  console.log(`✓ Workspace ${email} re-authed successfully`);
-}
-
-// --- Main ---
 
 async function main() {
-  const [, , type, account] = process.argv;
+  const [, , command] = process.argv;
   const oauthKeys = readOAuthKeys();
 
-  if (type === 'all') {
-    // Re-auth everything with expired tokens
-    const gmailAccounts = discoverGmailAccounts();
-    for (const acct of gmailAccounts) {
-      const credPath = path.join(acct.dir, 'credentials.json');
-      try {
-        const creds = JSON.parse(fs.readFileSync(credPath, 'utf-8'));
-        if (creds.expiry_date && Date.now() < creds.expiry_date - 5 * 60 * 1000) {
-          console.log(`Gmail ${acct.label}: still valid, skipping`);
-          continue;
-        }
-      } catch { /* re-auth if unreadable */ }
-      await reauthGmail(acct, oauthKeys);
+  if (command === 'list' || !command) {
+    console.log('Google accounts:\n');
+    for (const [account, email] of Object.entries(ACCOUNTS)) {
+      const cred = readCred(account);
+      const status = cred?.refresh_token ? 'configured' : 'not configured';
+      const file = fs.existsSync(credPath(account)) ? credPath(account) : '(missing)';
+      console.log(`  ${account.padEnd(14)} ${email.padEnd(30)} ${status.padEnd(16)} ${file}`);
     }
+    console.log(`\nCredentials dir: ${GWS_CREDS_DIR}`);
+    console.log('Scopes: gmail, calendar, drive, docs, sheets, slides');
+    console.log('\nUsage:');
+    console.log('  node scripts/reauth-google.mjs <account>   # re-auth one account');
+    console.log('  node scripts/reauth-google.mjs all         # re-auth all invalid/missing');
+    return;
+  }
 
-    const calAccounts = discoverCalendarAccounts();
-    for (const acctId of calAccounts) {
-      try {
-        const tokens = JSON.parse(fs.readFileSync(CALENDAR_TOKENS_PATH, 'utf-8'));
-        const entry = tokens[acctId];
-        if (entry?.expiry_date && Date.now() < entry.expiry_date - 5 * 60 * 1000) {
-          console.log(`Calendar ${acctId}: still valid, skipping`);
-          continue;
-        }
-      } catch { /* re-auth */ }
-      await reauthCalendar(acctId, oauthKeys);
-    }
+  const force = process.argv.includes('--force');
 
-    // Google Workspace (Drive/Sheets/Docs/Slides)
-    if (fs.existsSync(WORKSPACE_CREDS_DIR)) {
-      for (const file of fs.readdirSync(WORKSPACE_CREDS_DIR).filter((f) => f.endsWith('.json'))) {
-        const email = file.replace('.json', '');
-        const filePath = path.join(WORKSPACE_CREDS_DIR, file);
-        try {
-          const creds = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-          const expiryMs = creds.expiry ? new Date(creds.expiry).getTime() : 0;
-          if (expiryMs && Date.now() < expiryMs - 5 * 60 * 1000) {
-            console.log(`Workspace ${email}: still valid, skipping`);
-            continue;
+  if (command === 'all') {
+    for (const account of Object.keys(ACCOUNTS)) {
+      if (!force) {
+        const cred = readCred(account);
+        if (cred) {
+          const { valid, scopes } = await checkToken(cred, oauthKeys);
+          if (valid) {
+            const missing = missingScopes(scopes);
+            if (missing.length === 0) {
+              console.log(`${account}: valid with all scopes ✓`);
+              continue;
+            }
+            const short = missing.map(s => s.split('/auth/')[1] || s);
+            console.log(`${account}: valid but missing scopes: ${short.join(', ')}`);
+          } else {
+            console.log(`${account}: token invalid or expired`);
           }
-        } catch { /* re-auth */ }
-        await reauthWorkspace(email, filePath, oauthKeys);
+        } else {
+          console.log(`${account}: no credentials found`);
+        }
       }
+      await reauthAccount(account, oauthKeys);
     }
     return;
   }
 
-  if (type === 'gmail') {
-    const gmailAccounts = discoverGmailAccounts();
-    const acct = gmailAccounts.find((a) => a.label === account);
-    if (!acct) {
-      console.error(`Gmail account "${account}" not found. Available: ${gmailAccounts.map((a) => a.label).join(', ')}`);
-      process.exit(1);
-    }
-    await reauthGmail(acct, oauthKeys);
-  } else if (type === 'calendar') {
-    const calAccounts = discoverCalendarAccounts();
-    if (!calAccounts.includes(account)) {
-      console.error(`Calendar account "${account}" not found. Available: ${calAccounts.join(', ')}`);
-      process.exit(1);
-    }
-    await reauthCalendar(account, oauthKeys);
-  } else if (type === 'workspace') {
-    const filePath = path.join(WORKSPACE_CREDS_DIR, `${account}.json`);
-    if (!fs.existsSync(filePath)) {
-      const available = fs.existsSync(WORKSPACE_CREDS_DIR)
-        ? fs.readdirSync(WORKSPACE_CREDS_DIR).filter((f) => f.endsWith('.json')).map((f) => f.replace('.json', ''))
-        : [];
-      console.error(`Workspace account "${account}" not found. Available: ${available.join(', ')}`);
-      process.exit(1);
-    }
-    await reauthWorkspace(account, filePath, oauthKeys);
-  } else {
-    console.log('Usage:');
-    console.log('  node scripts/reauth-google.mjs gmail <account>');
-    console.log('  node scripts/reauth-google.mjs calendar <account>');
-    console.log('  node scripts/reauth-google.mjs workspace <email>');
-    console.log('  node scripts/reauth-google.mjs all    # re-auth all expired tokens');
-    console.log('\nGmail accounts:', discoverGmailAccounts().map((a) => a.label).join(', '));
-    console.log('Calendar accounts:', discoverCalendarAccounts().join(', '));
-    if (fs.existsSync(WORKSPACE_CREDS_DIR)) {
-      console.log('Workspace accounts:', fs.readdirSync(WORKSPACE_CREDS_DIR).filter((f) => f.endsWith('.json')).map((f) => f.replace('.json', '')).join(', '));
-    }
-  }
+  await reauthAccount(command, oauthKeys);
 }
 
 main().catch((err) => { console.error(err.message); process.exit(1); });

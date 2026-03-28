@@ -18,38 +18,34 @@ The `gws` binary must be on `$PATH`. See the project README for install options.
 
 ## Authentication (NanoClaw)
 
-This container has two sets of pre-converted credentials. Always set `GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE` before running gws.
+Consolidated credentials at `/home/node/.config/gws/accounts/{account}.json`. Each file covers all Google scopes (Gmail, Calendar, Drive, Docs, Sheets, Slides). Always set `GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE` before running gws.
 
-### Gmail credentials (Gmail scopes only)
-
-Use for `gws gmail` commands:
+### Usage
 
 ```bash
-# Primary account
-GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=/home/node/.gmail-mcp/gws-credentials.json gws gmail +triage
+# Primary account — Gmail, Calendar, Drive, Docs, Sheets, Slides all work
+GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=/home/node/.config/gws/accounts/primary.json gws gmail +triage
+GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=/home/node/.config/gws/accounts/primary.json gws calendar +agenda
+GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=/home/node/.config/gws/accounts/primary.json gws docs documents get --params '{"documentId":"..."}'
 
-# Secondary accounts
-GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=/home/node/.gmail-mcp-sunday/gws-credentials.json gws gmail +triage
-GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=/home/node/.gmail-mcp-illysium/gws-credentials.json gws gmail +triage
+# Other accounts
+GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=/home/node/.config/gws/accounts/sunday.json gws gmail +triage
+GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=/home/node/.config/gws/accounts/illysium.json gws calendar +agenda
 ```
 
-### Workspace credentials (Drive/Docs/Sheets/Slides scopes)
+### Available accounts
 
-Use for `gws drive`, `gws docs`, `gws sheets`, `gws slides` commands:
+| Account | Email |
+|---------|-------|
+| `primary` | david.kim6@gmail.com |
+| `personal2` | dave.kim917@gmail.com |
+| `sunday` | david.kim@getsunday.com |
+| `illysium` | dave@illysium.ai |
+| `numberdrinks` | dave@numberdrinks.com |
 
+Pick the account matching your group. Discover what's available:
 ```bash
-# Primary account
-GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=/home/node/.google_workspace_mcp/credentials/david.kim6@gmail.com.json.gws gws docs documents get --params '{"documentId":"..."}'
-
-# Other accounts — pick the email matching the group
-GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=/home/node/.google_workspace_mcp/credentials/david.kim@getsunday.com.json.gws gws sheets +read --spreadsheet ID --range "A1:D10"
-```
-
-### Discover available accounts
-
-```bash
-ls /home/node/.gmail-mcp*/gws-credentials.json 2>/dev/null
-ls /home/node/.google_workspace_mcp/credentials/*.gws 2>/dev/null
+ls /home/node/.config/gws/accounts/*.json 2>/dev/null
 ```
 
 ## Global Flags
