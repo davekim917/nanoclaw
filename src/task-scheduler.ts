@@ -178,9 +178,11 @@ async function runTask(
   );
 
   const groups = deps.registeredGroups();
-  const group = Object.values(groups).find(
-    (g) => g.folder === task.group_folder,
-  );
+  // Prefer exact JID match (preserves the container config the task was
+  // created against), fall back to first folder match for legacy tasks.
+  const group =
+    groups[task.chat_jid] ??
+    Object.values(groups).find((g) => g.folder === task.group_folder);
 
   if (!group) {
     logger.error(
