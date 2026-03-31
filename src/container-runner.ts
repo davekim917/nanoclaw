@@ -2552,6 +2552,9 @@ function readSecrets(
     // Braintrust API key — proxy doesn't reliably inject auth for MCP/SSE
     // endpoints, so pass directly via secrets for the header config.
     ...(isToolEnabled(tools, 'braintrust') ? ['BRAINTRUST_API_KEY'] : []),
+    // Railway CLI reads RAILWAY_API_TOKEN from env. OneCLI proxy handles
+    // HTTP calls to backboard.railway.app, but the CLI needs the token directly.
+    ...(isToolEnabled(tools, 'railway') ? ['RAILWAY_API_TOKEN'] : []),
   ];
   const secrets = readEnvFile(envKeys);
 

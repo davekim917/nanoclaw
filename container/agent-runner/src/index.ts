@@ -738,18 +738,32 @@ function buildPromptContent(
 }
 
 /**
- * Discover SDK plugins from /workspace/plugin/plugins/.
- * Each subdirectory with a .claude-plugin/plugin.json is a valid plugin.
+ * Discover SDK plugins from /workspace/plugins/.
+ * Each mounted repo is checked for:
+ *   - Direct plugin: has .claude-plugin/plugin.json at root (e.g. impeccable, omni-claude-skills)
+ *   - Multi-plugin repo: has plugins/ subdir with individual plugins (e.g. bootstrap)
  */
 function discoverPlugins(): Array<{ type: 'local'; path: string }> {
-  const pluginsDir = '/workspace/plugin/plugins';
-  if (!fs.existsSync(pluginsDir)) return [];
+  const pluginsRoot = process.env.CLAUDE_PLUGINS_ROOT || '/workspace/plugins';
+  if (!fs.existsSync(pluginsRoot)) return [];
   const plugins: Array<{ type: 'local'; path: string }> = [];
-  for (const entry of fs.readdirSync(pluginsDir)) {
-    const pluginPath = path.join(pluginsDir, entry);
-    if (!fs.statSync(pluginPath).isDirectory()) continue;
-    if (fs.existsSync(path.join(pluginPath, '.claude-plugin', 'plugin.json'))) {
-      plugins.push({ type: 'local', path: pluginPath });
+  for (const entry of fs.readdirSync(pluginsRoot)) {
+    const repoPath = path.join(pluginsRoot, entry);
+    if (!fs.statSync(repoPath).isDirectory()) continue;
+    // Direct plugin (has .claude-plugin/plugin.json at root)
+    if (fs.existsSync(path.join(repoPath, '.claude-plugin', 'plugin.json'))) {
+      plugins.push({ type: 'local', path: repoPath });
+      continue;
+    }
+    // Multi-plugin repo (has plugins/ subdir with individual plugins)
+    const subPluginsDir = path.join(repoPath, 'plugins');
+    if (!fs.existsSync(subPluginsDir)) continue;
+    for (const sub of fs.readdirSync(subPluginsDir)) {
+      const subPath = path.join(subPluginsDir, sub);
+      if (!fs.statSync(subPath).isDirectory()) continue;
+      if (fs.existsSync(path.join(subPath, '.claude-plugin', 'plugin.json'))) {
+        plugins.push({ type: 'local', path: subPath });
+      }
     }
   }
   return plugins;
@@ -1068,7 +1082,7 @@ async function main(): Promise<void> {
   // non-HTTP secrets (dbt login, gcloud/gws credential paths) remain in
   // containerInput.secrets. Export these so CLI tools can read them as env vars.
   for (const [key, value] of Object.entries(containerInput.secrets || {})) {
-    if (key.startsWith('DBT_CLOUD_') || key.startsWith('OMNI_') || key === 'GOOGLE_APPLICATION_CREDENTIALS' || key === 'GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE') {
+    if (key.startsWith('DBT_CLOUD_') || key.startsWith('OMNI_') || key === 'GOOGLE_APPLICATION_CREDENTIALS' || key === 'GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE' || key === 'RAILWAY_API_TOKEN') {
       process.env[key] = value;
     }
   }
