@@ -1438,11 +1438,11 @@ export function getSessionsV2Full(
                  WHERE s.thread_id IS NOT NULL AND m.id = s.thread_id AND m.chat_jid = s.chat_jid
                  LIMIT 1),
                 (SELECT m.content FROM messages m
-                 WHERE m.chat_jid = s.chat_jid
+                 WHERE m.chat_jid = (CASE WHEN s.thread_id IS NOT NULL THEN s.chat_jid || ':thread:' || s.thread_id ELSE s.chat_jid END)
                    AND m.sender != 'bot' AND m.is_from_me = 0
                  ORDER BY m.timestamp ASC LIMIT 1),
                 (SELECT m.content FROM messages m
-                 WHERE m.chat_jid = s.chat_jid
+                 WHERE m.chat_jid = (CASE WHEN s.thread_id IS NOT NULL THEN s.chat_jid || ':thread:' || s.thread_id ELSE s.chat_jid END)
                  ORDER BY m.timestamp ASC LIMIT 1)
               ) AS first_message
        FROM sessions_v2 s
@@ -1468,11 +1468,11 @@ export function getAllSessionsV2Full(
                  WHERE s.thread_id IS NOT NULL AND m.id = s.thread_id AND m.chat_jid = s.chat_jid
                  LIMIT 1),
                 (SELECT m.content FROM messages m
-                 WHERE m.chat_jid = s.chat_jid
+                 WHERE m.chat_jid = (CASE WHEN s.thread_id IS NOT NULL THEN s.chat_jid || ':thread:' || s.thread_id ELSE s.chat_jid END)
                    AND m.sender != 'bot' AND m.is_from_me = 0
                  ORDER BY m.timestamp ASC LIMIT 1),
                 (SELECT m.content FROM messages m
-                 WHERE m.chat_jid = s.chat_jid
+                 WHERE m.chat_jid = (CASE WHEN s.thread_id IS NOT NULL THEN s.chat_jid || ':thread:' || s.thread_id ELSE s.chat_jid END)
                  ORDER BY m.timestamp ASC LIMIT 1)
               ) AS first_message
        FROM sessions_v2 s
@@ -2069,7 +2069,7 @@ export function getPendingGateByJid(chatJid: string): PendingGate | null {
   return (
     (db
       .prepare(
-        `SELECT id, group_folder, chat_jid, label, summary, resume_prompt, session_key, status, created_at, resolved_at
+        `SELECT id, group_folder, chat_jid, label, summary, context_data, resume_prompt, session_key, status, created_at, resolved_at
          FROM pending_gates WHERE chat_jid = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1`,
       )
       .get(chatJid) as PendingGate) || null

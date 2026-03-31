@@ -99,7 +99,7 @@ import {
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
-import { startIpcWatcher } from './ipc.js';
+import { startIpcWatcher, writeQueryResponse } from './ipc.js';
 import { extractMemoriesAsync } from './memory-extractor.js';
 import { getMemoryBlock } from './memory-store.js';
 import {
@@ -152,6 +152,11 @@ const GATE_APPROVE_PATTERN =
   /^(approve[d]?|yes|go|proceed|do it|send it|lgtm|ok|confirmed?|ship it)$/;
 const GATE_CANCEL_PATTERN =
   /^(cancel|no|stop|abort|don'?t|reject|nope|nevermind|never mind)$/;
+
+function tryParseJson(s: string | null | undefined): Record<string, unknown> | null {
+  if (!s) return null;
+  try { return JSON.parse(s); } catch { return null; }
+}
 
 let lastTimestamp = '';
 let sessions = new Map<string, string>(); // V2: composite session keys
@@ -580,34 +585,50 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       lastAgentTimestamp[chatJid] = lastMsg.timestamp;
       saveState();
 
-      // Spawn Phase 2 agent with resume prompt
-      const resumePrompt =
-        pendingGate.resume_prompt ||
-        `The user approved gate "${pendingGate.label}". Call read_gate_context with gate_id "${pendingGate.id}" to retrieve the context data, then proceed.`;
-
-      const fullPrompt = `[SYSTEM: Gate "${pendingGate.label}" was approved. Gate ID: ${pendingGate.id}]\n\n${resumePrompt}`;
-
-      await channel.setTyping?.(chatJid, true);
-      try {
-        await runAgent(
-          group,
-          fullPrompt,
-          chatJid,
-          undefined,
-          undefined,
-          undefined,
-          undefined,
-          async (result) => {
-            if (result.result) {
-              const formatted = formatOutbound(result.result);
-              if (formatted) {
-                await channel.sendMessage(chatJid, formatted, triggerMsgId);
-              }
-            }
-          },
+      // Write IPC response so the blocking request_gate tool unblocks
+      const gateMeta = tryParseJson(pendingGate.context_data);
+      const ipc = gateMeta?._ipc as Record<string, string> | undefined;
+      if (ipc?.requestId && ipc?.ipcBaseDir && ipc?.sourceGroup) {
+        writeQueryResponse(
+          ipc.ipcBaseDir,
+          ipc.sourceGroup,
+          ipc.requestId,
+          { status: 'ok', decision: 'approved' },
         );
-      } finally {
-        await channel.setTyping?.(chatJid, false);
+        logger.info(
+          { gateId: pendingGate.id, requestId: ipc.requestId },
+          'Gate IPC response written — container session continues',
+        );
+      } else {
+        // Legacy gate (no IPC metadata) — spawn Phase 2 agent
+        const resumePrompt =
+          pendingGate.resume_prompt ||
+          `The user approved gate "${pendingGate.label}". Call read_gate_context with gate_id "${pendingGate.id}" to retrieve the context data, then proceed.`;
+
+        const fullPrompt = `[SYSTEM: Gate "${pendingGate.label}" was approved. Gate ID: ${pendingGate.id}]\n\n${resumePrompt}`;
+
+        await channel.setTyping?.(chatJid, true);
+        try {
+          await runAgent(
+            group,
+            fullPrompt,
+            chatJid,
+            undefined,
+            undefined,
+            undefined,
+            undefined,
+            async (result) => {
+              if (result.result) {
+                const formatted = formatOutbound(result.result);
+                if (formatted) {
+                  await channel.sendMessage(chatJid, formatted, triggerMsgId);
+                }
+              }
+            },
+          );
+        } finally {
+          await channel.setTyping?.(chatJid, false);
+        }
       }
       return true;
     } else if (GATE_CANCEL_PATTERN.test(rawContent)) {
@@ -620,6 +641,18 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       // Advance cursor past the cancel message
       lastAgentTimestamp[chatJid] = lastMsg.timestamp;
       saveState();
+
+      // Write IPC response so the blocking request_gate tool unblocks
+      const gateMeta = tryParseJson(pendingGate.context_data);
+      const ipc = gateMeta?._ipc as Record<string, string> | undefined;
+      if (ipc?.requestId && ipc?.ipcBaseDir && ipc?.sourceGroup) {
+        writeQueryResponse(
+          ipc.ipcBaseDir,
+          ipc.sourceGroup,
+          ipc.requestId,
+          { status: 'ok', decision: 'cancelled' },
+        );
+      }
 
       await channel.sendMessage(
         chatJid,
@@ -2389,7 +2422,7 @@ async function main(): Promise<void> {
         queue.enqueueMessageCheck(groupJid);
         return true;
       },
-      startSessionWs: (groupJid, text, senderName, senderId) => {
+      startSessionWs: (groupJid, text, senderName, senderId, threadId?) => {
         const group = registeredGroups[groupJid];
         if (!group) return false;
         const assistantName = resolveAssistantName(group.containerConfig);
@@ -2398,16 +2431,22 @@ async function main(): Promise<void> {
         const trigger =
           !isWeb && group.requiresTrigger !== false ? `@${assistantName} ` : '';
         const msgId = `web-${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
+        // Thread continuation: store with thread-specific chat_jid (same as Discord/Slack)
+        const chatJid = threadId ? `${groupJid}:thread:${threadId}` : groupJid;
         storeMessage({
           id: msgId,
-          chat_jid: groupJid,
+          chat_jid: chatJid,
           sender: senderId || 'web-ui',
           sender_name: senderName,
           content: trigger + text,
           timestamp: new Date().toISOString(),
           is_from_me: false,
         });
-        queue.enqueueMessageCheck(groupJid);
+        if (threadId) {
+          queue.enqueueMessageCheck(groupJid, chatJid, threadId);
+        } else {
+          queue.enqueueMessageCheck(groupJid);
+        }
         return msgId;
       },
       resumeGateApproval: async (gateId: string) => {

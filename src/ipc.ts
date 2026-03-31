@@ -7,7 +7,7 @@ import { CronExpressionParser } from 'cron-parser';
 import {
   DATA_DIR,
   IPC_POLL_INTERVAL,
-  PLUGIN_DIR,
+  PLUGINS_DIR,
   TIMEZONE,
   getParentJid,
 } from './config.js';
@@ -319,6 +319,7 @@ export function startIpcWatcher(deps: IpcDeps): void {
                 isMain,
                 ipcBaseDir,
                 registeredGroups,
+                deps,
               );
             } catch (err) {
               logger.error(
@@ -978,57 +979,7 @@ export async function processTaskIpc(
       }
       break;
 
-    case 'request_gate':
-      if (data.label && data.summary) {
-        const gateId = `gate-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-        // Find the chat JID for this group to send the gate message
-        let gateChatJid: string | undefined;
-        for (const [jid, g] of Object.entries(registeredGroups)) {
-          if (g.folder === sourceGroup) {
-            gateChatJid = jid;
-            break;
-          }
-        }
-
-        if (!gateChatJid) {
-          logger.warn(
-            { sourceGroup },
-            'request_gate: could not find chat JID for group',
-          );
-          break;
-        }
-
-        createGate({
-          id: gateId,
-          group_folder: sourceGroup,
-          chat_jid: data.chatJid || gateChatJid,
-          label: data.label,
-          summary: data.summary,
-          context_data: data.context_data || null,
-          resume_prompt: data.resume_prompt || null,
-          session_key: data.session_key || null,
-          status: 'pending',
-          created_at: new Date().toISOString(),
-        });
-
-        // Send gate notification to the group — use threadId so the
-        // approval prompt appears in the same thread as the conversation.
-        const gateMsg = `⚠️ **Gate: ${data.label}**\n${data.summary}\n\nReply \`approve\` or \`cancel\`.`;
-        await deps.sendMessage(
-          data.chatJid || gateChatJid,
-          gateMsg,
-          undefined,
-          data.threadId,
-        );
-
-        logger.info(
-          { gateId, label: data.label, sourceGroup },
-          'Gate created via IPC',
-        );
-      } else {
-        logger.warn({ data }, 'request_gate missing label or summary');
-      }
-      break;
+    // request_gate is now handled as a query (blocking) in processQueryIpc
 
     default:
       logger.warn({ type: data.type }, 'Unknown IPC task type');
@@ -1037,7 +988,7 @@ export async function processTaskIpc(
 
 // --- IPC Query handling (request-response pattern) ---
 
-function writeQueryResponse(
+export function writeQueryResponse(
   ipcBaseDir: string,
   groupFolder: string,
   requestId: string,
@@ -1092,14 +1043,28 @@ function processQueryIpc(
     memoryId?: string;
     // For gate queries
     gateId?: string;
+    // For plugin updates
+    plugin?: string;
+    // For request_gate
+    label?: string;
+    summary?: string;
+    command?: string;
+    context_data?: string;
+    threadId?: string;
   },
   sourceGroup: string,
   isMain: boolean,
   ipcBaseDir: string,
   registeredGroups: Record<string, RegisteredGroup>,
+  deps: IpcDeps,
 ): void {
   if (!data.requestId) {
     logger.warn({ data }, 'IPC query missing requestId');
+    return;
+  }
+  // Sanitize requestId to prevent path traversal (agent-controlled value used in file paths)
+  if (/[/\\]/.test(data.requestId) || data.requestId.includes('..')) {
+    logger.warn({ requestId: data.requestId }, 'IPC query requestId contains path traversal');
     return;
   }
 
@@ -1472,15 +1437,41 @@ function processQueryIpc(
 
     case 'update_plugin': {
       try {
-        const output = execSync('git pull', {
-          cwd: PLUGIN_DIR,
-          encoding: 'utf-8',
-          timeout: 30_000,
-        }).trim();
-        logger.info({ sourceGroup, output }, 'Plugin updated via IPC');
+        if (!fs.existsSync(PLUGINS_DIR)) {
+          throw new Error(`Plugins directory not found: ${PLUGINS_DIR}`);
+        }
+        const targetPlugin = data.plugin as string | undefined;
+        // Sanitize: reject path traversal attempts
+        if (targetPlugin && (/[/\\]/.test(targetPlugin) || targetPlugin === '..' || targetPlugin === '.')) {
+          throw new Error(`Invalid plugin name: ${targetPlugin}`);
+        }
+        const results: Record<string, string> = {};
+        const entries = targetPlugin
+          ? [targetPlugin]
+          : fs
+              .readdirSync(PLUGINS_DIR)
+              .filter((e) => {
+                try { return fs.statSync(path.join(PLUGINS_DIR, e)).isDirectory(); }
+                catch { return false; }
+              });
+        for (const entry of entries) {
+          const pluginPath = path.join(PLUGINS_DIR, entry);
+          if (!fs.existsSync(path.join(pluginPath, '.git'))) continue;
+          try {
+            results[entry] = execSync('git pull', {
+              cwd: pluginPath,
+              encoding: 'utf-8',
+              timeout: 30_000,
+            }).trim();
+          } catch (err) {
+            results[entry] =
+              `error: ${err instanceof Error ? err.message : String(err)}`;
+          }
+        }
+        logger.info({ sourceGroup, results }, 'Plugins updated via IPC');
         writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
           status: 'ok',
-          output,
+          output: JSON.stringify(results, null, 2),
         });
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -1490,6 +1481,81 @@ function processQueryIpc(
           error: message,
         });
       }
+      break;
+    }
+
+    case 'request_gate': {
+      if (!data.label || !data.summary) {
+        writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
+          status: 'error',
+          error: 'Missing label or summary',
+        });
+        break;
+      }
+
+      let gateChatJid: string | undefined;
+      for (const [jid, g] of Object.entries(registeredGroups)) {
+        if (g.folder === sourceGroup) {
+          gateChatJid = jid;
+          break;
+        }
+      }
+
+      if (!gateChatJid) {
+        writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
+          status: 'error',
+          error: 'No channel found for group',
+        });
+        break;
+      }
+
+      const gateId = `gate-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+      // Store IPC routing metadata alongside any user-supplied context_data
+      // so the approval handler can write the IPC response back to the container.
+      // User data is preserved under 'userData' for read_gate_context.
+      const ipcMeta = JSON.stringify({
+        _ipc: { requestId: data.requestId, ipcBaseDir, sourceGroup },
+        ...(data.context_data ? { userData: data.context_data } : {}),
+      });
+
+      createGate({
+        id: gateId,
+        group_folder: sourceGroup,
+        chat_jid: data.chatJid || gateChatJid,
+        label: data.label,
+        summary: data.summary,
+        context_data: ipcMeta,
+        resume_prompt: null,
+        session_key: null,
+        status: 'pending',
+        created_at: new Date().toISOString(),
+      });
+
+      const commandLine = data.command ? `\nCommand: \`${data.command.slice(0, 200)}\`` : '';
+      const gateMsg = `⚠️ **Gate: ${data.label}**\n${data.summary}${commandLine}\n\nReply \`approve\` or \`cancel\`.`;
+      deps.sendMessage(
+        data.chatJid || gateChatJid,
+        gateMsg,
+        undefined,
+        data.threadId,
+      ).catch((err: unknown) => {
+        logger.error(
+          { gateId, sourceGroup, err },
+          'Failed to send gate notification — unblocking container with error',
+        );
+        writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
+          status: 'error',
+          error: 'Failed to send gate notification to channel',
+        });
+      });
+
+      logger.info(
+        { gateId, label: data.label, sourceGroup, requestId: data.requestId },
+        'Gate created via IPC query (blocking — awaiting user response)',
+      );
+      // Do NOT write a response — the container polls until the user approves/cancels.
+      // The approval handler in index.ts writes the response.
       break;
     }
 

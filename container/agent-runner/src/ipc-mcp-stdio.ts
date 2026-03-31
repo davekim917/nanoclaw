@@ -594,9 +594,9 @@ function writeQueryFile(data: object): string {
   return requestId;
 }
 
-async function waitForResponse(requestId: string): Promise<object> {
+async function waitForResponse(requestId: string, timeoutMs?: number): Promise<object> {
   const responsePath = path.join(RESPONSES_DIR, `${requestId}.json`);
-  const deadline = Date.now() + QUERY_TIMEOUT_MS;
+  const deadline = Date.now() + (timeoutMs ?? QUERY_TIMEOUT_MS);
 
   while (Date.now() < deadline) {
     if (fs.existsSync(responsePath)) {
@@ -1198,11 +1198,11 @@ server.tool(
 
 server.tool(
   'update_plugin',
-  'Update the bootstrap plugin by pulling latest changes from its remote repository. Only available to the main group.',
-  {},
-  async () => {
+  'Update plugin repos by pulling latest changes. Pass a plugin name to update one, or omit to update all.',
+  { plugin: z.string().optional().describe('Plugin repo name (e.g. "bootstrap", "impeccable"). Omit to update all.') },
+  async ({ plugin }: { plugin?: string }) => {
     try {
-      const requestId = writeQueryFile({ type: 'update_plugin' });
+      const requestId = writeQueryFile({ type: 'update_plugin', plugin });
       const response = await waitForResponse(requestId) as {
         status: string;
         error?: string;
@@ -1215,7 +1215,7 @@ server.tool(
         };
       }
       return {
-        content: [{ type: 'text' as const, text: `Plugin updated:\n${response.output}` }],
+        content: [{ type: 'text' as const, text: `Plugins updated:\n${response.output}` }],
       };
     } catch (err) {
       return {
@@ -1230,49 +1230,72 @@ server.tool(
 
 server.tool(
   'request_gate',
-  `Pause the current task and ask the user for approval before continuing. The agent session ends cleanly after calling this — a new session resumes when the user approves.
+  `Ask the user for approval before continuing. Blocks until the user approves or cancels — your session stays alive.
 
 Use this when you're about to take an irreversible or high-impact action and need explicit human confirmation first. Examples:
-• Sending emails to customers
 • Deleting data or dropping tables
+• Sending emails to customers
 • Merging PRs or deploying to production
 • Any bulk operation affecting external systems
 
 IMPORTANT: This tool is designed for team leads. If you are a teammate in an agent team, do NOT call this directly — instead, communicate with the lead via SendMessage and let the lead decide whether to gate.
 
 How it works:
-1. You call request_gate with a label, summary, and optionally structured context data
+1. You call request_gate with a label, summary, and the exact command you want to run
 2. The user sees your summary and is asked to approve or cancel
-3. If approved, a new agent session starts with your resume_prompt
-4. The new session calls read_gate_context to retrieve the structured context data you saved
-
-Tips:
-• Put structured data (lists, objects) in context_data — it's stored as JSON and survives across sessions
-• Keep resume_prompt short — it's the starting instruction for Phase 2
-• Include enough detail in summary for the user to make an informed decision`,
+3. This tool BLOCKS until the user responds — your session stays alive
+4. If approved, the tool returns "approved" and you can retry the command
+5. If cancelled, the tool returns "cancelled" — do not proceed`,
   {
-    label: z.string().describe('Short label for the gate (e.g. "Send customer emails", "Drop tables")'),
+    label: z.string().describe('Short label for the gate (e.g. "Drop tables", "Send emails")'),
     summary: z.string().describe('Clear description of what will happen if approved — help the user make an informed decision'),
-    context_data: z.string().optional().describe('JSON string of structured data for Phase 2 (e.g. list of emails to send, tables to drop). Stored in DB, retrieved via read_gate_context.'),
-    resume_prompt: z.string().optional().describe('Instruction for the Phase 2 agent when the user approves (e.g. "User approved. Call read_gate_context to get the email list, then send them.")'),
+    command: z.string().optional().describe('The exact bash command that was gated. When approved, the gate file is created so the hook allows the retry.'),
+    context_data: z.string().optional().describe('JSON string of structured data to store with the gate (retrievable via read_gate_context).'),
   },
   async (args) => {
-    const data = {
+    const requestId = writeQueryFile({
       type: 'request_gate',
       chatJid,
       threadId,
       label: args.label,
       summary: args.summary,
+      command: args.command,
       context_data: args.context_data,
-      resume_prompt: args.resume_prompt,
       timestamp: new Date().toISOString(),
-    };
+    });
 
-    writeIpcFile(TASKS_DIR, data);
+    try {
+      const response = await waitForResponse(requestId, 300_000) as {
+        status: string;
+        decision?: 'approved' | 'cancelled';
+        error?: string;
+      };
 
-    return {
-      content: [{ type: 'text' as const, text: `Gate requested: "${args.label}". The user will be asked to approve or cancel. Your session will end — a new session resumes if approved.` }],
-    };
+      if (response.decision === 'approved') {
+        // Write the gate approval file so the plugin hook allows the retry.
+        // Written via fs (not Bash) to bypass the fallback hook's self-approval block.
+        if (args.command) {
+          const { createHash } = await import('crypto');
+          const hash = createHash('sha256').update(args.command).digest('hex').slice(0, 16);
+          const gateDir = '/tmp/.claude-destructive-gate';
+          fs.mkdirSync(gateDir, { recursive: true });
+          fs.writeFileSync(`${gateDir}/${hash}`, 'approved');
+        }
+
+        return {
+          content: [{ type: 'text' as const, text: `Gate "${args.label}" approved. You may now retry the command.` }],
+        };
+      } else {
+        return {
+          content: [{ type: 'text' as const, text: `Gate "${args.label}" cancelled by user. Do not proceed with the operation.` }],
+        };
+      }
+    } catch {
+      return {
+        content: [{ type: 'text' as const, text: `Gate "${args.label}" timed out waiting for user response. Do not proceed.` }],
+        isError: true,
+      };
+    }
   },
 );
 

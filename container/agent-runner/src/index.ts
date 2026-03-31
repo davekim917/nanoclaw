@@ -342,20 +342,215 @@ function createBlockSnowflakeConnectorHook(): HookCallback {
     if (!command) return {};
 
     if (SNOWFLAKE_CONNECTOR_EXEC_RE.test(command)) {
-      return {
-        systemMessage:
-          'Direct use of Python snowflake.connector is blocked. ' +
-          'Use the `snow sql` CLI for ad-hoc queries. If snow is not working, ' +
-          'report the error to Dave instead of falling back to Python.',
-        hookSpecificOutput: {
-          hookEventName: 'PreToolUse',
-          permissionDecision: 'deny',
-          permissionDecisionReason:
-            'Python snowflake.connector bypasses destructive-operation controls. Use snow CLI instead.',
-        },
-      };
+      return deny(
+        'Direct use of Python snowflake.connector is blocked. ' +
+        'Use the `snow sql` CLI for ad-hoc queries. If snow is not working, ' +
+        'report the error to Dave instead of falling back to Python.',
+      );
     }
     return {};
+  };
+}
+
+// Programmatic fallback for destructive command detection.
+// Zero external dependencies — compiled into the agent-runner binary.
+// When the plugin guard is active (block-destructive.ts from the workflow plugin),
+// this only enforces hard blocks. When the plugin is missing, it also denies
+// destructive operations outright (no gate mechanism available).
+const DESTRUCTIVE_SQL_RE = /(?:DROP\s+(?:TABLE|SCHEMA|DATABASE|VIEW|PROCEDURE|FUNCTION|OWNED|TRIGGER|INDEX)|TRUNCATE\s|DELETE\s+FROM)/i;
+const SQL_CLI_NAMES = new Set(['snow', 'psql', 'mysql', 'duckdb', 'sqlite3', 'sqlite', 'mongosh', 'mongo']);
+const SHELLS = new Set(['bash', 'sh', 'zsh', 'dash', 'ksh', 'fish']);
+
+interface GateContext {
+  chatJid: string;
+  threadId?: string;
+  groupFolder: string;
+}
+
+// IPC gate: write a query file, poll for host response (mirrors ipc-mcp-stdio pattern)
+const IPC_DIR = '/workspace/ipc';
+const GATE_POLL_MS = 500;
+const GATE_TIMEOUT_MS = 300_000; // 5 minutes
+
+async function requestGateApproval(
+  command: string,
+  label: string,
+  summary: string,
+  gateCtx: GateContext,
+): Promise<'approved' | 'cancelled' | 'error'> {
+  const queriesDir = path.join(IPC_DIR, 'queries');
+  const responsesDir = path.join(IPC_DIR, 'query_responses');
+  fs.mkdirSync(queriesDir, { recursive: true });
+  fs.mkdirSync(responsesDir, { recursive: true });
+
+  const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const queryFile = path.join(queriesDir, `${requestId}.json`);
+  const tmpFile = `${queryFile}.tmp`;
+  fs.writeFileSync(tmpFile, JSON.stringify({
+    type: 'request_gate',
+    requestId,
+    chatJid: gateCtx.chatJid,
+    threadId: gateCtx.threadId,
+    label,
+    summary,
+    command,
+    timestamp: new Date().toISOString(),
+  }));
+  fs.renameSync(tmpFile, queryFile);
+
+  // Poll for response
+  const responseFile = path.join(responsesDir, `${requestId}.json`);
+  const deadline = Date.now() + GATE_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    if (fs.existsSync(responseFile)) {
+      try {
+        const content = JSON.parse(fs.readFileSync(responseFile, 'utf-8'));
+        try { fs.unlinkSync(responseFile); } catch { /* ok */ }
+        return content.decision === 'approved' ? 'approved' : 'cancelled';
+      } catch { return 'error'; }
+    }
+    await new Promise(r => setTimeout(r, GATE_POLL_MS));
+  }
+  return 'error'; // timeout
+}
+
+// Platform CLIs → destructive subcommand verbs
+const PLATFORM_DESTRUCTIVE: Record<string, Set<string>> = {
+  render: new Set(['delete', 'down', 'destroy']),
+  railway: new Set(['delete', 'down', 'destroy', 'remove']),
+  fly: new Set(['delete', 'destroy']),
+  flyctl: new Set(['delete', 'destroy']),
+  doctl: new Set(['delete', 'destroy']),
+};
+
+/** Returns a human-readable reason if the command is destructive, null otherwise. */
+function isDestructiveCommand(name: string, args: string[], seg: string): string | null {
+  // ── Databases ──
+  // SQL CLIs — test full segment since split(/\s+/) breaks quoted SQL apart
+  if (name === 'snow' && args[0] === 'sql' && DESTRUCTIVE_SQL_RE.test(seg)) return 'Destructive Snowflake SQL (DROP/TRUNCATE/DELETE)';
+  if (SQL_CLI_NAMES.has(name) && DESTRUCTIVE_SQL_RE.test(seg)) return `Destructive ${name} SQL (DROP/TRUNCATE/DELETE)`;
+  if ((name === 'mongosh' || name === 'mongo') && /(?:\bdropDatabase\b|\.drop\s*\(|\.deleteMany\s*\(|\.remove\s*\()/.test(seg)) return 'Destructive MongoDB command';
+  if (name === 'redis-cli' && args.some(a => /^(?:FLUSHDB|FLUSHALL)$/i.test(a))) return 'Destructive Redis command (FLUSHDB/FLUSHALL)';
+
+  // ── Cloud providers ──
+  if (name === 'aws') {
+    if (args[0] === 's3' && ['rm', 'rb'].includes(args[1])) return 'Destructive AWS S3 command (rm/rb)';
+    if (args.length >= 2 && /^(?:terminate|delete)/.test(args[1] || '')) return 'Destructive AWS CLI command';
+  }
+  if (name === 'gcloud' && args.includes('delete')) return 'Destructive gcloud command';
+  if (name === 'gsutil' && ['rm', 'rb'].includes(args[0])) return 'Destructive gsutil command (rm/rb)';
+  if (name === 'az' && args.includes('delete')) return 'Destructive Azure CLI command';
+
+  // ── Infrastructure as Code ──
+  if (name === 'terraform') {
+    if (args[0] === 'destroy') return 'Terraform destroy';
+    if (args[0] === 'apply' && args.includes('-auto-approve')) return 'Terraform apply -auto-approve';
+  }
+  if (name === 'pulumi' && args[0] === 'destroy') return 'Pulumi destroy';
+  if (name === 'cdk' && args[0] === 'destroy') return 'CDK destroy';
+
+  // ── Containers / orchestration ──
+  if (name === 'kubectl' && ['delete', 'drain', 'cordon'].includes(args[0])) return 'Destructive kubectl command';
+  if (name === 'docker') {
+    if (['rm', 'rmi'].includes(args[0])) return 'Destructive Docker command';
+    if (args[0] === 'system' && args[1] === 'prune') return 'Destructive Docker command (system prune)';
+    if (['volume', 'container', 'image'].includes(args[0]) && args[1] === 'rm') return 'Destructive Docker command';
+  }
+  if (name === 'helm' && ['uninstall', 'delete'].includes(args[0])) return 'Destructive Helm command';
+
+  // ── Platform CLIs ──
+  const platformVerbs = PLATFORM_DESTRUCTIVE[name];
+  if (platformVerbs && args.some(a => platformVerbs.has(a))) return `Destructive ${name} CLI command`;
+  if (name === 'heroku' && args.some(a => a === 'destroy' || a === 'pg:reset' || a.includes(':destroy'))) return 'Destructive Heroku CLI command';
+  if (name === 'vercel' && ['remove', 'rm'].includes(args[0])) return 'Destructive Vercel CLI command';
+  if (name === 'netlify' && args.some(a => a === 'sites:delete')) return 'Destructive Netlify CLI command';
+  if (name === 'supabase') {
+    if (args.includes('delete')) return 'Destructive Supabase CLI command';
+    if (args[0] === 'db' && args[1] === 'reset') return 'Destructive Supabase CLI command (db reset)';
+  }
+
+  // ── Service CLIs ──
+  if (name === 'gh' && args[0] === 'repo' && args[1] === 'delete') return 'Destructive GitHub CLI command (repo delete)';
+  if (name === 'wrangler' && args.includes('delete')) return 'Destructive Cloudflare Wrangler command';
+  if (name === 'firebase' && args.some(a => ['projects:delete', 'firestore:delete', 'hosting:disable'].includes(a))) return 'Destructive Firebase CLI command';
+
+  // ── dbt ──
+  if (name === 'dbt' && ['run', 'build'].includes(args[0]) && args.includes('--full-refresh')) return 'dbt --full-refresh drops and recreates tables';
+
+  // ── dd (disk overwrite) ──
+  if (name === 'dd' && args.some(a => a.startsWith('if='))) return 'dd with input file — potential disk overwrite';
+
+  return null;
+}
+
+function createDestructiveCommandHook(
+  gateCtx: GateContext,
+): HookCallback {
+  return async (input, _toolUseId, _context) => {
+    const preInput = input as PreToolUseHookInput;
+    const command = (preInput.tool_input as { command?: string })?.command;
+    if (!command) return {};
+
+    const segments = command.split(/(?:;|&&|\|\||\||\n)\s*/).map(s => s.trim()).filter(Boolean);
+
+    for (const seg of segments) {
+      const stripped = seg.replace(/^sudo\s+/, '');
+      const parts = stripped.split(/\s+/);
+      const name = parts[0]?.replace(/^\/(?:usr\/(?:local\/)?)?(?:s?bin)\//, '') || '';
+      const args = parts.slice(1);
+
+      // ── Hard blocks (always deny, regardless of plugin state) ──
+      if (name === 'eval') return deny('eval is not allowed. Run commands directly.');
+      if (SHELLS.has(name) && args.includes('-c')) return deny('Shell -c inline execution is not allowed. Run commands directly.');
+      if (name === 'unlink') return deny('unlink permanently deletes files. Use: trash <path>');
+      if (name === 'shred') return deny('shred permanently destroys file content. Use: trash <path>');
+      if (name === 'truncate') return deny('truncate destroys file content.');
+      if (name === 'find' && (args.includes('-delete') || (args.includes('-exec') && args.includes('rm')))) {
+        return deny('find -delete/-exec rm is not allowed. Use trash for file deletion.');
+      }
+      if (name === 'xargs' && args[0] === 'rm') return deny('xargs rm is not allowed. Use trash for file deletion.');
+
+      // Block self-approval of destructive gate files
+      if (/\.claude-destructive-gate/.test(seg)) {
+        return deny('Self-approval of destructive operation gates is not allowed.');
+      }
+
+      // ── Gated operations: request approval via IPC, block until user responds ──
+      const destructiveReason = isDestructiveCommand(name, args, seg);
+      if (destructiveReason) {
+        log(`Destructive command detected: ${destructiveReason}. Requesting gate approval via IPC.`);
+        const decision = await requestGateApproval(
+          command,
+          destructiveReason,
+          destructiveReason,
+          gateCtx,
+        );
+        if (decision === 'approved') {
+          log(`Gate approved for: ${destructiveReason}`);
+          // Write the plugin hook's gate file so the command passes through
+          // the block-destructive.js hook on retry as well
+          const { createHash } = await import('crypto');
+          const hash = createHash('sha256').update(command).digest('hex').slice(0, 16);
+          const gateDir = '/tmp/.claude-destructive-gate';
+          fs.mkdirSync(gateDir, { recursive: true });
+          fs.writeFileSync(`${gateDir}/${hash}`, 'approved');
+          return {}; // allow
+        }
+        return deny(`${destructiveReason} — ${decision === 'cancelled' ? 'cancelled by user' : 'approval timed out'}.`);
+      }
+    }
+    return {};
+  };
+}
+
+function deny(reason: string) {
+  return {
+    systemMessage: reason,
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse' as const,
+      permissionDecision: 'deny' as const,
+      permissionDecisionReason: reason,
+    },
   };
 }
 
@@ -743,30 +938,45 @@ function buildPromptContent(
  *   - Direct plugin: has .claude-plugin/plugin.json at root (e.g. impeccable, omni-claude-skills)
  *   - Multi-plugin repo: has plugins/ subdir with individual plugins (e.g. bootstrap)
  */
-function discoverPlugins(): Array<{ type: 'local'; path: string }> {
+function discoverPlugins(): { plugins: Array<{ type: 'local'; path: string }>; errors: string[] } {
   const pluginsRoot = process.env.CLAUDE_PLUGINS_ROOT || '/workspace/plugins';
-  if (!fs.existsSync(pluginsRoot)) return [];
+  if (!fs.existsSync(pluginsRoot)) return { plugins: [], errors: [] };
   const plugins: Array<{ type: 'local'; path: string }> = [];
-  for (const entry of fs.readdirSync(pluginsRoot)) {
-    const repoPath = path.join(pluginsRoot, entry);
-    if (!fs.statSync(repoPath).isDirectory()) continue;
-    // Direct plugin (has .claude-plugin/plugin.json at root)
-    if (fs.existsSync(path.join(repoPath, '.claude-plugin', 'plugin.json'))) {
-      plugins.push({ type: 'local', path: repoPath });
-      continue;
-    }
-    // Multi-plugin repo (has plugins/ subdir with individual plugins)
-    const subPluginsDir = path.join(repoPath, 'plugins');
-    if (!fs.existsSync(subPluginsDir)) continue;
-    for (const sub of fs.readdirSync(subPluginsDir)) {
-      const subPath = path.join(subPluginsDir, sub);
-      if (!fs.statSync(subPath).isDirectory()) continue;
-      if (fs.existsSync(path.join(subPath, '.claude-plugin', 'plugin.json'))) {
-        plugins.push({ type: 'local', path: subPath });
+  const errors: string[] = [];
+  try {
+    for (const entry of fs.readdirSync(pluginsRoot)) {
+      const repoPath = path.join(pluginsRoot, entry);
+      try {
+        if (!fs.statSync(repoPath).isDirectory()) continue;
+      } catch (e) {
+        errors.push(`${entry}: ${e instanceof Error ? e.message : String(e)}`);
+        continue;
+      }
+      // Direct plugin (has .claude-plugin/plugin.json at root)
+      if (fs.existsSync(path.join(repoPath, '.claude-plugin', 'plugin.json'))) {
+        plugins.push({ type: 'local', path: repoPath });
+        continue;
+      }
+      // Multi-plugin repo (has plugins/ subdir with individual plugins)
+      const subPluginsDir = path.join(repoPath, 'plugins');
+      if (!fs.existsSync(subPluginsDir)) continue;
+      for (const sub of fs.readdirSync(subPluginsDir)) {
+        const subPath = path.join(subPluginsDir, sub);
+        try {
+          if (!fs.statSync(subPath).isDirectory()) continue;
+        } catch (e) {
+          errors.push(`${entry}/plugins/${sub}: ${e instanceof Error ? e.message : String(e)}`);
+          continue;
+        }
+        if (fs.existsSync(path.join(subPath, '.claude-plugin', 'plugin.json'))) {
+          plugins.push({ type: 'local', path: subPath });
+        }
       }
     }
+  } catch (e) {
+    errors.push(`readdir ${pluginsRoot}: ${e instanceof Error ? e.message : String(e)}`);
   }
-  return plugins;
+  return { plugins, errors };
 }
 
 /**
@@ -782,6 +992,7 @@ interface QueryContext {
   sdkEnv: Record<string, string | undefined>;
   systemPromptOption: { type: 'preset'; preset: 'claude_code'; append: string } | undefined;
   plugins: Array<{ type: 'local'; path: string }>;
+  gateCtx: GateContext;
 }
 
 async function runQuery(
@@ -885,7 +1096,7 @@ async function runQuery(
       ...(sdkEnv['CLAUDE_CODE_USE_EFFORT'] || effort ? { effort: (sdkEnv['CLAUDE_CODE_USE_EFFORT'] || effort) as EffortLevel } : {}),
       hooks: {
         PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName, containerInput.threadId)] }],
-        PreToolUse: [{ matcher: 'Bash', hooks: [createBlockSnowflakeConnectorHook(), createSanitizeBashHook()] }],
+        PreToolUse: [{ matcher: 'Bash', hooks: [createDestructiveCommandHook(ctx.gateCtx), createBlockSnowflakeConnectorHook(), createSanitizeBashHook()] }],
       },
     }
   })) {
@@ -964,6 +1175,12 @@ async function runQuery(
     if (message.type === 'system' && message.subtype === 'init') {
       newSessionId = message.session_id;
       log(`Session initialized: ${newSessionId}`);
+
+      // Log SDK-loaded plugins for diagnostics
+      const loadedPlugins = (message as { plugins?: Array<{ name: string; path?: string }> }).plugins || [];
+      if (loadedPlugins.length > 0) {
+        log(`SDK init plugins (${loadedPlugins.length}): ${loadedPlugins.map(p => p.name).join(', ')}`);
+      }
     }
 
     if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
@@ -1100,9 +1317,25 @@ async function main(): Promise<void> {
   const mcpServerPath = path.join(__dirname, 'ipc-mcp-stdio.js');
 
   // Discover SDK plugins from mounted bootstrap directory
-  const plugins = discoverPlugins();
+  const { plugins, errors: pluginErrors } = discoverPlugins();
+  if (pluginErrors.length > 0) {
+    log(`WARNING: Plugin discovery errors: ${pluginErrors.join('; ')}`);
+  }
   if (plugins.length > 0) {
     log(`Discovered ${plugins.length} plugin(s): ${plugins.map(p => path.basename(p.path)).join(', ')}`);
+  }
+
+  // Check if the workflow plugin (block-destructive hook) was discovered.
+  // When missing, the fallback programmatic hook denies destructive operations outright.
+  const pluginGuardState = { active: plugins.some(p => path.basename(p.path) === 'workflow') };
+  if (!pluginGuardState.active) {
+    log('CRITICAL: workflow plugin (block-destructive hook) NOT discovered — fallback guard active');
+    writeOutput({
+      status: 'success',
+      result: '\u26a0\ufe0f Safety notice: The destructive-command guard plugin failed to load. ' +
+        'A fallback guard is active but destructive operations that normally require approval ' +
+        'will be blocked outright until the plugin is restored.',
+    });
   }
 
   // Build systemPrompt once — chatJid and global CLAUDE.md are invariant for the container lifetime.
@@ -1292,7 +1525,12 @@ async function main(): Promise<void> {
   }
 
   // Query loop: run query → wait for IPC message → run new query → repeat
-  const queryCtx: QueryContext = { mcpServerPath, containerInput, sdkEnv, systemPromptOption, plugins };
+  const gateCtx: GateContext = {
+    chatJid: containerInput.chatJid,
+    threadId: containerInput.threadId,
+    groupFolder: containerInput.groupFolder,
+  };
+  const queryCtx: QueryContext = { mcpServerPath, containerInput, sdkEnv, systemPromptOption, plugins, gateCtx };
   let resumeAt: string | undefined;
   try {
     while (true) {

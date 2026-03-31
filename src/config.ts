@@ -190,10 +190,10 @@ export function getParentJid(jid: string): string {
   return parsed ? `${parsed.channel}:${parsed.parentId}` : jid;
 }
 
-// External Claude Code plugin directory (e.g. davekim917/bootstrap)
-// Skills and agents are synced into each group's .claude/ before container runs
-export const PLUGIN_DIR =
-  process.env.PLUGIN_DIR || path.join(HOME_DIR, 'bootstrap');
+// External Claude Code plugin repos directory (e.g. bootstrap, impeccable, omni-claude-skills).
+// Each subdirectory is a separate plugin repo, mounted read-only into containers.
+export const PLUGINS_DIR =
+  process.env.PLUGINS_DIR || path.join(HOME_DIR, 'plugins');
 
 // Timezone for scheduled tasks, message formatting, etc.
 // Validates each candidate is a real IANA identifier before accepting.

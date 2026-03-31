@@ -359,8 +359,6 @@ export class DiscordChannel implements Channel {
           const cmd = interaction as ChatInputCommandInteraction;
           if (cmd.commandName === 'deploy') {
             await this.handleDeployCommand(cmd);
-          } else if (cmd.commandName === 'update-container') {
-            await this.handleUpdateContainerCommand(cmd);
           }
         }
       } catch (err) {
@@ -1114,11 +1112,6 @@ export class DiscordChannel implements Channel {
             name: 'deploy',
             description: 'Pull, build, and restart NanoClaw from latest main',
           },
-          {
-            name: 'update-container',
-            description:
-              'Check for outdated container packages and update selectively',
-          },
         ],
       });
       logger.info('Discord slash commands registered (guild-only)');
@@ -1153,62 +1146,12 @@ export class DiscordChannel implements Channel {
     }
   }
 
-  /** Inject a synthetic message into the inbound pipeline for the agent to process. */
-  private injectMessage(
-    interaction: ButtonInteraction | ChatInputCommandInteraction,
-    prompt: string,
-  ): void {
-    // Resolve JID: if in a thread, use parent channel for group lookup
-    const parentId = DiscordChannel.getInteractionParentId(interaction);
-    const jid = parentId ? `dc:${parentId}` : `dc:${interaction.channelId}`;
-    const msgId = interaction.id;
-    const sender = interaction.user.id;
-    const senderName = interaction.user.username;
-
-    this.opts.onMessage(jid, {
-      id: msgId,
-      chat_jid: jid,
-      sender,
-      sender_name: senderName,
-      content: prompt,
-      timestamp: new Date().toISOString(),
-      is_from_me: false,
-    });
-  }
-
   private async handleDeployCommand(
     interaction: ChatInputCommandInteraction,
   ): Promise<void> {
     await interaction.deferReply();
     await interaction.editReply('Deploying latest main...');
     this.runDetachedDeploy(interaction);
-  }
-
-  private async handleUpdateContainerCommand(
-    interaction: ChatInputCommandInteraction,
-  ): Promise<void> {
-    await interaction.deferReply();
-    await interaction.editReply('Checking for container package updates...');
-
-    const prompt =
-      'Check for container package updates. Read the Dockerfile at ' +
-      '/workspace/nanoclaw/container/Dockerfile and extract every pinned version:\n' +
-      '- npm: packages with @x.y.z in `npm install -g`\n' +
-      '- pip: packages with ==x.y.z in `pip install`\n' +
-      '- ARG: lines like `ARG PACKAGE_VERSION=x.y.z`\n' +
-      '- Snowflake .deb: SNOW_VERSION ARG\n\n' +
-      'For each, check the latest available version:\n' +
-      '- npm: `npm view <pkg> version`\n' +
-      '- pip: `curl -s https://pypi.org/pypi/<pkg>/json | jq -r .info.version`\n' +
-      '- GitHub release ARGs: `gh release view --repo <owner>/<repo> --json tagName -q .tagName` for:\n' +
-      '  RENDER_VERSION → render-oss/cli, RAILWAY_VERSION → railwayapp/cli, SUPABASE_VERSION → supabase/cli\n' +
-      '- SNOW_VERSION: check https://sfc-repo.snowflakecomputing.com/snowflake-cli/linux_aarch64/index.html\n\n' +
-      'Present a table of ALL pinned packages with columns: Package | Current | Latest | Status (✅ or ⬆️).\n' +
-      'If any are outdated, ask Dave which to update: "all", specific package names, or "skip".\n' +
-      'When told which to update, edit the version pins in the Dockerfile at /workspace/nanoclaw/container/Dockerfile, ' +
-      'then run `cd /workspace/nanoclaw && ./container/build.sh` to rebuild.';
-
-    this.injectMessage(interaction, prompt);
   }
 
   private runDetachedDeploy(interaction: ChatInputCommandInteraction): void {
