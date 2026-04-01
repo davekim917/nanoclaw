@@ -1582,7 +1582,7 @@ function processQueryIpc(
       const commandLine = data.command
         ? `\nCommand: \`${data.command.slice(0, 200)}\``
         : '';
-      const gateMsg = `**Gate: ${data.label}**\n${data.summary}${commandLine}\n\nReply \`approve\` or \`cancel\`.`;
+      const gateMsg = `⚠️ **Gate: ${data.label}**\n${data.summary}${commandLine}\n\nReply \`approve\` or \`cancel\`.`;
       deps
         .sendMessage(resolvedChatJid, gateMsg, undefined, data.threadId)
         .catch((err: unknown) => {
