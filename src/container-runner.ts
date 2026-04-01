@@ -17,6 +17,7 @@ import {
   GROUP_THREAD_KEY,
   GROUPS_DIR,
   IDLE_TIMEOUT,
+  OLLAMA_ADMIN_TOOLS,
   ONECLI_URL,
   PLUGINS_DIR,
   RESIDENTIAL_PROXY_URL,
@@ -2714,6 +2715,11 @@ async function buildContainerArgs(
   // Set plugin root so agent-runner can discover mounted plugin repos
   if (fs.existsSync(PLUGINS_DIR)) {
     args.push('-e', 'CLAUDE_PLUGINS_ROOT=/workspace/plugins');
+  }
+
+  // Forward Ollama admin tools flag if enabled
+  if (OLLAMA_ADMIN_TOOLS) {
+    args.push('-e', 'OLLAMA_ADMIN_TOOLS=true');
   }
 
   // OneCLI gateway handles credential injection — containers never see real secrets.
