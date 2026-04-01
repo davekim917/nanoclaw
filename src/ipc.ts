@@ -69,7 +69,10 @@ export function getInMemoryGateByJid(jid: string): InMemoryGate | undefined {
   return undefined;
 }
 
-export function resolveInMemoryGate(gateId: string, decision: 'approved' | 'cancelled'): boolean {
+export function resolveInMemoryGate(
+  gateId: string,
+  decision: 'approved' | 'cancelled',
+): boolean {
   const gate = pendingGates.get(gateId);
   if (!gate) return false;
   writeQueryResponse(gate.ipcBaseDir, gate.sourceGroup, gate.requestId, {
@@ -1021,8 +1024,6 @@ export async function processTaskIpc(
       }
       break;
 
-    // request_gate is now handled as a query (blocking) in processQueryIpc
-
     default:
       logger.warn({ type: data.type }, 'Unknown IPC task type');
   }
@@ -1106,7 +1107,10 @@ function processQueryIpc(
   }
   // Sanitize requestId to prevent path traversal (agent-controlled value used in file paths)
   if (/[/\\]/.test(data.requestId) || data.requestId.includes('..')) {
-    logger.warn({ requestId: data.requestId }, 'IPC query requestId contains path traversal');
+    logger.warn(
+      { requestId: data.requestId },
+      'IPC query requestId contains path traversal',
+    );
     return;
   }
 
@@ -1484,18 +1488,24 @@ function processQueryIpc(
         }
         const targetPlugin = data.plugin as string | undefined;
         // Sanitize: reject path traversal attempts
-        if (targetPlugin && (/[/\\]/.test(targetPlugin) || targetPlugin === '..' || targetPlugin === '.')) {
+        if (
+          targetPlugin &&
+          (/[/\\]/.test(targetPlugin) ||
+            targetPlugin === '..' ||
+            targetPlugin === '.')
+        ) {
           throw new Error(`Invalid plugin name: ${targetPlugin}`);
         }
         const results: Record<string, string> = {};
         const entries = targetPlugin
           ? [targetPlugin]
-          : fs
-              .readdirSync(PLUGINS_DIR)
-              .filter((e) => {
-                try { return fs.statSync(path.join(PLUGINS_DIR, e)).isDirectory(); }
-                catch { return false; }
-              });
+          : fs.readdirSync(PLUGINS_DIR).filter((e) => {
+              try {
+                return fs.statSync(path.join(PLUGINS_DIR, e)).isDirectory();
+              } catch {
+                return false;
+              }
+            });
         for (const entry of entries) {
           const pluginPath = path.join(PLUGINS_DIR, entry);
           if (!fs.existsSync(path.join(pluginPath, '.git'))) continue;

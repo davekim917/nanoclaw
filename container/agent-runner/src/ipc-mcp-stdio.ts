@@ -1227,9 +1227,6 @@ server.tool(
 );
 
 // --- Memory tools ---
-// Gate protocol tools (request_gate, read_gate_context) have been removed.
-// Destructive command gating is now handled by the plugin hook (block-destructive.ts)
-// which uses IPC directly when running in NanoClaw containers.
 
 server.tool(
   'save_memory',

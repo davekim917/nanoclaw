@@ -1712,19 +1712,35 @@ async function startMessageLoop(): Promise<void> {
               : parentJid;
             const pipeGate = getInMemoryGateByJid(gateJid);
             if (pipeGate) {
-              const rawContent = messagesToSend[messagesToSend.length - 1].content;
-              const triggerRe = buildTriggerPattern(resolveAssistantName(group.containerConfig));
-              const lastContent = rawContent.replace(triggerRe, '').trim().toLowerCase();
-              if (GATE_APPROVE_PATTERN.test(lastContent) || GATE_CANCEL_PATTERN.test(lastContent)) {
+              const rawContent =
+                messagesToSend[messagesToSend.length - 1].content;
+              const triggerRe = buildTriggerPattern(
+                resolveAssistantName(group.containerConfig),
+              );
+              const lastContent = rawContent
+                .replace(triggerRe, '')
+                .trim()
+                .toLowerCase();
+              if (
+                GATE_APPROVE_PATTERN.test(lastContent) ||
+                GATE_CANCEL_PATTERN.test(lastContent)
+              ) {
                 const isApprove = GATE_APPROVE_PATTERN.test(lastContent);
-                resolveInMemoryGate(pipeGate.id, isApprove ? 'approved' : 'cancelled');
+                resolveInMemoryGate(
+                  pipeGate.id,
+                  isApprove ? 'approved' : 'cancelled',
+                );
                 logger.info(
-                  { gateId: pipeGate.id, decision: isApprove ? 'approved' : 'cancelled' },
+                  {
+                    gateId: pipeGate.id,
+                    decision: isApprove ? 'approved' : 'cancelled',
+                  },
                   'Gate resolved before pipe — IPC response written',
                 );
                 lastAgentTimestamp[chatJid] =
                   messagesToSend[messagesToSend.length - 1].timestamp;
-                for (const msg of messagesToSend) attachmentCache.delete(msg.id);
+                for (const msg of messagesToSend)
+                  attachmentCache.delete(msg.id);
                 continue;
               }
             }
