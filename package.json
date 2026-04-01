@@ -1,6 +1,6 @@
 {
   "name": "nanoclaw",
-  "version": "1.2.34",
+  "version": "1.2.43",
   "description": "Personal Claude assistant. Lightweight, secure, customizable.",
   "type": "module",
   "main": "dist/index.js",
@@ -39,9 +39,7 @@
     "qrcode-terminal": "^0.12.0",
     "sharp": "^0.34.5",
     "sqlite-vec": "^0.1.7-alpha.2",
-    "ws": "^8.19.0",
-    "yaml": "^2.8.2",
-    "zod": "^4.3.6"
+    "ws": "^8.19.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.35.0",
@@ -51,7 +49,6 @@
     "@types/node": "^22.10.0",
     "@types/sharp": "^0.31.1",
     "@types/ws": "^8.18.1",
-    "@vitest/coverage-v8": "^4.0.18",
     "eslint": "^9.35.0",
     "eslint-plugin-no-catch-all": "^1.1.0",
     "globals": "^15.12.0",
