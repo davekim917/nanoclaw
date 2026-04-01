@@ -22,7 +22,6 @@ import {
   getBacklogPaginated,
   getGatesPaginated,
   getGateById,
-  getPendingGate,
   getRecentMessages,
   getThreadMessagesByTrigger,
   getSessionsV2Full,
