@@ -660,10 +660,12 @@ function buildMcpServers(
     };
   }
   // Google Workspace: no MCP server — agent uses gws CLI via Bash.
-  servers.ollama = {
-    command: 'node',
-    args: [path.join(path.dirname(mcpServerPath), 'ollama-mcp-stdio.js')],
-  };
+  if (isToolEnabled(tools, 'ollama')) {
+    servers.ollama = {
+      command: 'node',
+      args: [path.join(path.dirname(mcpServerPath), 'ollama-mcp-stdio.js')],
+    };
+  }
   return servers;
 }
 
