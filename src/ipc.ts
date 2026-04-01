@@ -15,14 +15,12 @@ import { AvailableGroup } from './container-runner.js';
 import {
   addBacklogItem,
   addShipLogEntry,
-  createGate,
   createTask,
   deleteBacklogItem,
   deleteTask,
   findMessageById,
   getBacklog,
   getBacklogItemById,
-  getGateById,
   getMessagesAroundTimestamp,
   getShipLog,
   getTaskById,
@@ -45,6 +43,50 @@ import { searchThreads } from './thread-search.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
 import { Memory, OutboundFile, RegisteredGroup } from './types.js';
+
+// ── In-memory gate tracking (replaces pending_gates DB table) ───────────────
+// Gates are short-lived (5min timeout). Lost on restart = OK — the container's
+// plugin hook times out too.
+interface InMemoryGate {
+  id: string;
+  chatJid: string;
+  threadJid: string; // full JID with :thread: suffix if applicable
+  label: string;
+  command?: string;
+  requestId: string;
+  ipcBaseDir: string;
+  sourceGroup: string;
+  createdAt: number;
+}
+
+const pendingGates = new Map<string, InMemoryGate>();
+const GATE_TTL_MS = 10 * 60 * 1000; // 10 min cleanup
+
+export function getInMemoryGateByJid(jid: string): InMemoryGate | undefined {
+  for (const gate of pendingGates.values()) {
+    if (gate.threadJid === jid || gate.chatJid === jid) return gate;
+  }
+  return undefined;
+}
+
+export function resolveInMemoryGate(gateId: string, decision: 'approved' | 'cancelled'): boolean {
+  const gate = pendingGates.get(gateId);
+  if (!gate) return false;
+  writeQueryResponse(gate.ipcBaseDir, gate.sourceGroup, gate.requestId, {
+    status: 'ok',
+    decision,
+  });
+  pendingGates.delete(gateId);
+  return true;
+}
+
+// Periodic cleanup of orphaned gates (container crashed / timed out)
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, gate] of pendingGates) {
+    if (now - gate.createdAt > GATE_TTL_MS) pendingGates.delete(id);
+  }
+}, 60_000);
 
 const BACKLOG_NOT_OWNED_MSG = 'Backlog item not found or not owned by group';
 const VALID_MEMORY_TYPES = [
@@ -1510,102 +1552,46 @@ function processQueryIpc(
       }
 
       const gateId = `gate-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const resolvedChatJid = data.chatJid || gateChatJid;
+      const threadJid = data.threadId
+        ? `${resolvedChatJid}:thread:${data.threadId}`
+        : resolvedChatJid;
 
-      // Store IPC routing metadata alongside any user-supplied context_data
-      // so the approval handler can write the IPC response back to the container.
-      // User data is preserved under 'userData' for read_gate_context.
-      const ipcMeta = JSON.stringify({
-        _ipc: { requestId: data.requestId, ipcBaseDir, sourceGroup },
-        ...(data.context_data ? { userData: data.context_data } : {}),
-      });
-
-      createGate({
+      pendingGates.set(gateId, {
         id: gateId,
-        group_folder: sourceGroup,
-        chat_jid: data.chatJid || gateChatJid,
+        chatJid: resolvedChatJid,
+        threadJid,
         label: data.label,
-        summary: data.summary,
-        context_data: ipcMeta,
-        resume_prompt: null,
-        session_key: null,
-        status: 'pending',
-        created_at: new Date().toISOString(),
+        command: data.command,
+        requestId: data.requestId,
+        ipcBaseDir,
+        sourceGroup,
+        createdAt: Date.now(),
       });
 
-      const commandLine = data.command ? `\nCommand: \`${data.command.slice(0, 200)}\`` : '';
-      const gateMsg = `⚠️ **Gate: ${data.label}**\n${data.summary}${commandLine}\n\nReply \`approve\` or \`cancel\`.`;
-      deps.sendMessage(
-        data.chatJid || gateChatJid,
-        gateMsg,
-        undefined,
-        data.threadId,
-      ).catch((err: unknown) => {
-        logger.error(
-          { gateId, sourceGroup, err },
-          'Failed to send gate notification — unblocking container with error',
-        );
-        writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
-          status: 'error',
-          error: 'Failed to send gate notification to channel',
+      const commandLine = data.command
+        ? `\nCommand: \`${data.command.slice(0, 200)}\``
+        : '';
+      const gateMsg = `**Gate: ${data.label}**\n${data.summary}${commandLine}\n\nReply \`approve\` or \`cancel\`.`;
+      deps
+        .sendMessage(resolvedChatJid, gateMsg, undefined, data.threadId)
+        .catch((err: unknown) => {
+          logger.error(
+            { gateId, sourceGroup, err },
+            'Failed to send gate notification — unblocking container with error',
+          );
+          writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
+            status: 'error',
+            error: 'Failed to send gate notification to channel',
+          });
+          pendingGates.delete(gateId);
         });
-      });
 
       logger.info(
         { gateId, label: data.label, sourceGroup, requestId: data.requestId },
-        'Gate created via IPC query (blocking — awaiting user response)',
+        'Gate created (in-memory) — awaiting user response',
       );
-      // Do NOT write a response — the container polls until the user approves/cancels.
-      // The approval handler in index.ts writes the response.
-      break;
-    }
-
-    case 'read_gate_context': {
-      if (!data.gateId) {
-        writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
-          status: 'error',
-          error: 'Missing gateId',
-        });
-        break;
-      }
-
-      const gate = getGateById(data.gateId);
-      if (!gate) {
-        writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
-          status: 'error',
-          error: 'Gate not found',
-        });
-        break;
-      }
-
-      // Authorization: only the group that created the gate can read it
-      if (!isMain && gate.group_folder !== sourceGroup) {
-        logger.warn(
-          { sourceGroup, gateId: data.gateId },
-          'Unauthorized read_gate_context attempt blocked',
-        );
-        writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
-          status: 'error',
-          error: 'Unauthorized: gate not accessible to this group',
-        });
-        break;
-      }
-
-      logger.info(
-        { sourceGroup, gateId: data.gateId, gateStatus: gate.status },
-        'IPC read_gate_context query served',
-      );
-      writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
-        status: 'ok',
-        gate: {
-          id: gate.id,
-          label: gate.label,
-          summary: gate.summary,
-          context_data: gate.context_data,
-          status: gate.status,
-          created_at: gate.created_at,
-          resolved_at: gate.resolved_at,
-        },
-      });
+      // Do NOT write a response — the plugin hook polls until the user approves/cancels.
       break;
     }
 

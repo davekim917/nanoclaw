@@ -92,14 +92,15 @@ import {
   setSessionV2,
   storeChatMetadata,
   storeMessage,
-  getGateById,
-  getPendingGateByJid,
-  resolveGate,
   touchSessionActivity,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
-import { startIpcWatcher, writeQueryResponse } from './ipc.js';
+import {
+  startIpcWatcher,
+  getInMemoryGateByJid,
+  resolveInMemoryGate,
+} from './ipc.js';
 import { extractMemoriesAsync } from './memory-extractor.js';
 import { getMemoryBlock } from './memory-store.js';
 import {
@@ -152,11 +153,6 @@ const GATE_APPROVE_PATTERN =
   /^(approve[d]?|yes|go|proceed|do it|send it|lgtm|ok|confirmed?|ship it)$/;
 const GATE_CANCEL_PATTERN =
   /^(cancel|no|stop|abort|don'?t|reject|nope|nevermind|never mind)$/;
-
-function tryParseJson(s: string | null | undefined): Record<string, unknown> | null {
-  if (!s) return null;
-  try { return JSON.parse(s); } catch { return null; }
-}
 
 let lastTimestamp = '';
 let sessions = new Map<string, string>(); // V2: composite session keys
@@ -563,97 +559,33 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   }
 
   // --- Gate resolution (check before normal agent dispatch) ---
-  // If a gate is pending for this group, check if the user is approving or cancelling.
-  // Gates are resolved by matching the last user message against approve/cancel keywords.
-  const pendingGate = getPendingGateByJid(chatJid);
+  // If a gate is pending for this JID, check if the user is approving or cancelling.
+  // Resolving writes the IPC response file which unblocks the plugin hook in the container.
+  const pendingGate = getInMemoryGateByJid(chatJid);
   if (pendingGate) {
     const lastMsg = missedMessages[missedMessages.length - 1];
-    // Strip trigger pattern from message to get the actual content
     const rawContent = lastMsg.content
       .replace(triggerPattern, '')
       .trim()
       .toLowerCase();
 
     if (GATE_APPROVE_PATTERN.test(rawContent)) {
-      resolveGate(pendingGate.id, 'approved');
+      resolveInMemoryGate(pendingGate.id, 'approved');
       logger.info(
         { gateId: pendingGate.id, label: pendingGate.label },
-        'Gate approved by user',
+        'Gate approved by user — IPC response written',
       );
-
-      // Advance cursor past the approval message
       lastAgentTimestamp[chatJid] = lastMsg.timestamp;
       saveState();
-
-      // Write IPC response so the blocking request_gate tool unblocks
-      const gateMeta = tryParseJson(pendingGate.context_data);
-      const ipc = gateMeta?._ipc as Record<string, string> | undefined;
-      if (ipc?.requestId && ipc?.ipcBaseDir && ipc?.sourceGroup) {
-        writeQueryResponse(
-          ipc.ipcBaseDir,
-          ipc.sourceGroup,
-          ipc.requestId,
-          { status: 'ok', decision: 'approved' },
-        );
-        logger.info(
-          { gateId: pendingGate.id, requestId: ipc.requestId },
-          'Gate IPC response written — container session continues',
-        );
-      } else {
-        // Legacy gate (no IPC metadata) — spawn Phase 2 agent
-        const resumePrompt =
-          pendingGate.resume_prompt ||
-          `The user approved gate "${pendingGate.label}". Call read_gate_context with gate_id "${pendingGate.id}" to retrieve the context data, then proceed.`;
-
-        const fullPrompt = `[SYSTEM: Gate "${pendingGate.label}" was approved. Gate ID: ${pendingGate.id}]\n\n${resumePrompt}`;
-
-        await channel.setTyping?.(chatJid, true);
-        try {
-          await runAgent(
-            group,
-            fullPrompt,
-            chatJid,
-            undefined,
-            undefined,
-            undefined,
-            undefined,
-            async (result) => {
-              if (result.result) {
-                const formatted = formatOutbound(result.result);
-                if (formatted) {
-                  await channel.sendMessage(chatJid, formatted, triggerMsgId);
-                }
-              }
-            },
-          );
-        } finally {
-          await channel.setTyping?.(chatJid, false);
-        }
-      }
       return true;
     } else if (GATE_CANCEL_PATTERN.test(rawContent)) {
-      resolveGate(pendingGate.id, 'cancelled');
+      resolveInMemoryGate(pendingGate.id, 'cancelled');
       logger.info(
         { gateId: pendingGate.id, label: pendingGate.label },
-        'Gate cancelled by user',
+        'Gate cancelled by user — IPC response written',
       );
-
-      // Advance cursor past the cancel message
       lastAgentTimestamp[chatJid] = lastMsg.timestamp;
       saveState();
-
-      // Write IPC response so the blocking request_gate tool unblocks
-      const gateMeta = tryParseJson(pendingGate.context_data);
-      const ipc = gateMeta?._ipc as Record<string, string> | undefined;
-      if (ipc?.requestId && ipc?.ipcBaseDir && ipc?.sourceGroup) {
-        writeQueryResponse(
-          ipc.ipcBaseDir,
-          ipc.sourceGroup,
-          ipc.requestId,
-          { status: 'ok', decision: 'cancelled' },
-        );
-      }
-
       await channel.sendMessage(
         chatJid,
         `Gate "${pendingGate.label}" cancelled.`,
@@ -661,8 +593,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       );
       return true;
     }
-    // If the message doesn't match approve/cancel, fall through to normal processing
-    // (the user might be asking a different question while a gate is pending)
   }
   // --- End gate resolution ---
 
@@ -1773,6 +1703,33 @@ async function startMessageLoop(): Promise<void> {
             }
           }
 
+          // Intercept gate approve/cancel BEFORE piping. The plugin hook is
+          // blocking inside the container — piped messages sit unread in stdin.
+          // Resolve the gate and write the IPC response file here instead.
+          if (canPipe && messagesToSend.length > 0) {
+            const gateJid = incomingThreadId
+              ? `${parentJid}:thread:${incomingThreadId}`
+              : parentJid;
+            const pipeGate = getInMemoryGateByJid(gateJid);
+            if (pipeGate) {
+              const rawContent = messagesToSend[messagesToSend.length - 1].content;
+              const triggerRe = buildTriggerPattern(resolveAssistantName(group.containerConfig));
+              const lastContent = rawContent.replace(triggerRe, '').trim().toLowerCase();
+              if (GATE_APPROVE_PATTERN.test(lastContent) || GATE_CANCEL_PATTERN.test(lastContent)) {
+                const isApprove = GATE_APPROVE_PATTERN.test(lastContent);
+                resolveInMemoryGate(pipeGate.id, isApprove ? 'approved' : 'cancelled');
+                logger.info(
+                  { gateId: pipeGate.id, decision: isApprove ? 'approved' : 'cancelled' },
+                  'Gate resolved before pipe — IPC response written',
+                );
+                lastAgentTimestamp[chatJid] =
+                  messagesToSend[messagesToSend.length - 1].timestamp;
+                for (const msg of messagesToSend) attachmentCache.delete(msg.id);
+                continue;
+              }
+            }
+          }
+
           if (
             canPipe &&
             queue.sendMessage(
@@ -2450,46 +2407,10 @@ async function main(): Promise<void> {
         return msgId;
       },
       resumeGateApproval: async (gateId: string) => {
-        const gate = getGateById(gateId);
-        if (!gate || gate.status !== 'pending') return;
-        const groupEntry = Object.entries(registeredGroups).find(
-          ([jid]) => jid === gate.chat_jid,
-        );
-        if (!groupEntry) {
-          logger.warn(
-            { gateId, chat_jid: gate.chat_jid },
-            'Gate group not found for resume',
-          );
-          return;
-        }
-        const [chatJid, group] = groupEntry;
-        resolveGate(gate.id, 'approved');
-        const resumePrompt =
-          gate.resume_prompt ||
-          `The user approved gate "${gate.label}". Call read_gate_context with gate_id "${gate.id}" to retrieve the context data, then proceed.`;
-        const fullPrompt = `[SYSTEM: Gate "${gate.label}" was approved. Gate ID: ${gate.id}]\n\n${resumePrompt}`;
-        const channel = findChannel(channels, chatJid);
-        await channel?.setTyping?.(chatJid, true);
-        try {
-          await runAgent(
-            group,
-            fullPrompt,
-            chatJid,
-            undefined,
-            undefined,
-            undefined,
-            undefined,
-            async (result) => {
-              if (result.result) {
-                const formatted = formatOutbound(result.result);
-                if (formatted) {
-                  await channel?.sendMessage(chatJid, formatted);
-                }
-              }
-            },
-          );
-        } finally {
-          await channel?.setTyping?.(chatJid, false);
+        // Resolve the in-memory gate — writes IPC response to unblock the plugin hook
+        const resolved = resolveInMemoryGate(gateId, 'approved');
+        if (!resolved) {
+          logger.warn({ gateId }, 'Gate not found in memory for Web UI resume');
         }
       },
     },
