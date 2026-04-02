@@ -986,36 +986,42 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         logger.debug({ chatJid, err }, 'Failed to add thinking reaction'),
       );
   }
-  // Send host-side model switch confirmation so it doesn't depend on agent compliance.
-  if (overrideResult && !overrideResult.reset) {
-    const label = overrideResult.sticky
-      ? 'for this session'
-      : 'for this message';
-    channel
-      .sendMessage(
-        chatJid,
-        `✅ Switched to ${model} ${label}.`,
-        effectiveThreadId,
-      )
-      .catch((err: unknown) =>
-        logger.warn(
-          { chatJid, err },
-          'Failed to send model switch confirmation',
-        ),
-      );
-  } else if (overrideResult?.reset) {
-    channel
-      .sendMessage(
-        chatJid,
-        `✅ Model reverted to default (${model}).`,
-        effectiveThreadId,
-      )
-      .catch((err: unknown) =>
-        logger.warn(
-          { chatJid, err },
-          'Failed to send model reset confirmation',
-        ),
-      );
+  // Send host-side model/effort switch confirmation so it doesn't depend on agent compliance.
+  {
+    const parts: string[] = [];
+
+    if (overrideResult && !overrideResult.reset) {
+      const label = overrideResult.sticky
+        ? 'for this session'
+        : 'for this message';
+      parts.push(`Switched to ${model} ${label}`);
+    } else if (overrideResult?.reset) {
+      parts.push(`Model reverted to default (${model})`);
+    }
+
+    if (effortOverride && !effortOverride.reset) {
+      const label = effortOverride.sticky
+        ? 'for this session'
+        : 'for this message';
+      parts.push(`Effort ${effort} ${label}`);
+    } else if (effortOverride?.reset) {
+      parts.push(`Effort reverted to default (${effort})`);
+    }
+
+    if (parts.length > 0) {
+      channel
+        .sendMessage(
+          chatJid,
+          `✅ ${parts.join(', ')}.`,
+          effectiveThreadId,
+        )
+        .catch((err: unknown) =>
+          logger.warn(
+            { chatJid, err },
+            'Failed to send model/effort switch confirmation',
+          ),
+        );
+    }
   }
 
   await channel.setTyping?.(chatJid, true);
@@ -1687,23 +1693,6 @@ async function startMessageLoop(): Promise<void> {
                     oneshot: !pipeModelOverride.sticky,
                   });
                 }
-                const label = pipeModelOverride.reset
-                  ? `reverted to default (${resolveModel(group)})`
-                  : pipeModelOverride.sticky
-                    ? `${pipeModelOverride.model} for this session`
-                    : `${pipeModelOverride.model} for this message`;
-                channel
-                  .sendMessage(
-                    chatJid,
-                    `✅ Switched to ${label}.`,
-                    incomingThreadId,
-                  )
-                  .catch((err: unknown) =>
-                    logger.warn(
-                      { chatJid, err },
-                      'Failed to send model switch confirmation',
-                    ),
-                  );
               }
 
               if (pipeEffortOverride) {
@@ -1718,6 +1707,50 @@ async function startMessageLoop(): Promise<void> {
                     ? DEFAULT_EFFORT
                     : pipeEffortOverride.effort,
                 });
+              }
+
+              // Combined confirmation for model and/or effort switches
+              const confirmParts: string[] = [];
+              if (pipeModelOverride) {
+                if (pipeModelOverride.reset) {
+                  confirmParts.push(
+                    `Model reverted to default (${resolveModel(group)})`,
+                  );
+                } else {
+                  const label = pipeModelOverride.sticky
+                    ? `${pipeModelOverride.model} for this session`
+                    : `${pipeModelOverride.model} for this message`;
+                  confirmParts.push(`Switched to ${label}`);
+                }
+              }
+              if (pipeEffortOverride) {
+                const effortVal = pipeEffortOverride.reset
+                  ? DEFAULT_EFFORT
+                  : pipeEffortOverride.effort;
+                if (pipeEffortOverride.reset) {
+                  confirmParts.push(
+                    `Effort reverted to default (${effortVal})`,
+                  );
+                } else {
+                  // TODO: oneshot effort (-e! syntax) not yet supported in
+                  // container — no pendingOneshotEffortRevert mechanism exists.
+                  // Always report "for this session" until that's implemented.
+                  confirmParts.push(`Effort ${effortVal} for this session`);
+                }
+              }
+              if (confirmParts.length > 0) {
+                channel
+                  .sendMessage(
+                    chatJid,
+                    `✅ ${confirmParts.join(', ')}.`,
+                    incomingThreadId,
+                  )
+                  .catch((err: unknown) =>
+                    logger.warn(
+                      { chatJid, err },
+                      'Failed to send model/effort switch confirmation',
+                    ),
+                  );
               }
 
               // Strip flags from the piped text so the agent sees clean prompt

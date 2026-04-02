@@ -86,23 +86,18 @@ Do not spawn reviewers with zero overlap to the changes. Zero dynamic reviewers 
 
 Before constructing reviewer prompts, fetch current NanoClaw architecture and patterns from the docs site. This replaces static reference files that can drift.
 
-1. **Fetch docs index** — `WebFetch` `https://docs.nanoclaw.dev/llms.txt` to get the full page list
-2. **Fetch relevant pages** based on what the diff touches. Match pages to reviewer domains:
-   - nanoclaw-reviewer: `concepts/groups`, `advanced/ipc-system`, `concepts/containers`, `api/message-routing`
-   - security-reviewer: `advanced/security-model`, `concepts/security`
-   - arch-reviewer: `concepts/architecture`, `advanced/container-runtime`
-   - agentic-reviewer: `advanced/container-runtime`, `api/skills/*`
-   - contract-reviewer: `advanced/ipc-system`, `api/configuration`
-   - concurrency-reviewer: `concepts/containers`, `advanced/container-runtime`
-   Only fetch pages relevant to the selected reviewers — not all pages every time.
+1. **Fetch docs index** — `WebFetch` `https://docs.nanoclaw.dev/llms.txt` to get the full page list with descriptions. **If the fetch fails** (site down, empty response, malformed content), **stop and tell the user** — do not spawn reviewers without domain context.
+2. **Match pages to reviewers dynamically** — read the page titles and descriptions from the llms.txt index, then select 2-5 pages per reviewer based on topic overlap between the reviewer's focus area and the page descriptions. Do NOT use a hardcoded page-to-reviewer mapping — page names and structure may change. If no pages match a reviewer's domain, note the gap and proceed — that reviewer operates without project-specific criteria for that domain. Only fetch pages relevant to the selected reviewers — not all pages every time.
 3. **Extract review criteria** from the fetched docs — patterns, conventions, security boundaries, IPC contracts. Include these in each reviewer's prompt as their domain knowledge.
 
-**Additional research for unfamiliar libraries/patterns:**
-1. `mcp__plugin_context7_context7__resolve-library-id` + `mcp__plugin_context7_context7__query-docs` — current library docs
-2. `mcp__exa__web_search_exa` — official docs, known pitfalls
-3. `mcp__exa__get_code_context_exa` — real usage patterns in public repos
+**Additional research for unfamiliar libraries/patterns (lead performs once, distributes results to reviewers to avoid rate limits):**
+1. `mcp__plugin_context7_context7__resolve-library-id` + `mcp__plugin_context7_context7__query-docs` — current library docs (preferred, may fail due to rate limits)
+2. `mcp__deepwiki__read_wiki_structure` + `mcp__deepwiki__read_wiki_contents` or `mcp__deepwiki__ask_question` — architecture docs for specific GitHub repos/dependencies (preferred, may fail due to rate limits)
+3. `mcp__exa__web_search_exa` — official docs, known pitfalls (mandatory — always run even if steps 1-2 succeed)
+4. `mcp__exa__get_code_context_exa` — real usage patterns in public repos
+5. `mcp__exa__web_search_advanced_exa` — when filtering by recency or domain is needed
 
-If context7 fails (rate limit, empty result), Exa is mandatory. Do not flag something as wrong without verifying against current docs.
+**Fallback discipline:** Steps 1-2 are preferred but may fail. Step 3 (Exa) is the mandatory floor — it must always run. If all external research fails, stop and tell the user rather than spawning reviewers with no research backing. Do not flag something as wrong without verifying against current docs.
 
 ### Step 4: Reviewer Collaboration
 
