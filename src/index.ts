@@ -1010,11 +1010,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
     if (parts.length > 0) {
       channel
-        .sendMessage(
-          chatJid,
-          `✅ ${parts.join(', ')}.`,
-          effectiveThreadId,
-        )
+        .sendMessage(chatJid, `✅ ${parts.join(', ')}.`, effectiveThreadId)
         .catch((err: unknown) =>
           logger.warn(
             { chatJid, err },
