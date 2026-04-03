@@ -2184,7 +2184,10 @@ async function main(): Promise<void> {
       const rcAssistant = resolveAssistantName(rcGroup?.group.containerConfig);
       const rcTrigger = buildTriggerPattern(rcAssistant);
       const bareContent = trimmed.replace(rcTrigger, '').trim();
-      if (bareContent === '/remote-control' || bareContent === '/remote-control-end') {
+      if (
+        bareContent === '/remote-control' ||
+        bareContent === '/remote-control-end'
+      ) {
         handleRemoteControl(bareContent, chatJid, msg).catch((err) =>
           logger.error({ err, chatJid }, 'Remote control command error'),
         );
