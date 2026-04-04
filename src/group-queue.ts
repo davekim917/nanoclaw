@@ -290,10 +290,7 @@ export class GroupQueue {
   }
 
   /** Get the active thread slot for a group (if any). */
-  getActiveSlot(
-    groupJid: string,
-    threadId?: string,
-  ): ThreadSlot | undefined {
+  getActiveSlot(groupJid: string, threadId?: string): ThreadSlot | undefined {
     const threadKey = this.resolveThreadKey(threadId);
     const state = this.groups.get(groupJid);
     return state?.activeThreads.get(threadKey);
@@ -394,7 +391,12 @@ export class GroupQueue {
     const slot = state.activeThreads.get(threadKey);
     if (!slot || !slot.groupFolder) {
       logger.debug(
-        { groupJid, threadKey, hasSlot: !!slot, groupFolder: slot?.groupFolder },
+        {
+          groupJid,
+          threadKey,
+          hasSlot: !!slot,
+          groupFolder: slot?.groupFolder,
+        },
         'closeStdin: no slot or groupFolder, skipping',
       );
       return;
@@ -406,7 +408,12 @@ export class GroupQueue {
       // Dir already created by runContainerAgent before container launch
       fs.writeFileSync(closePath, '');
       logger.info(
-        { groupJid, threadKey, containerName: slot.containerName, path: closePath },
+        {
+          groupJid,
+          threadKey,
+          containerName: slot.containerName,
+          path: closePath,
+        },
         'closeStdin: wrote _close sentinel',
       );
     } catch (err) {

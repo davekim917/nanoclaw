@@ -818,7 +818,13 @@ async function rescueWorktreeChanges(
     // Wrapped in its own try/catch so a bundle failure (disk full, permissions)
     // never prevents the remote push from being attempted.
     try {
-      await saveRescueBundle(wtPath, groupFolder, repoName, threadId, !!remoteOutput);
+      await saveRescueBundle(
+        wtPath,
+        groupFolder,
+        repoName,
+        threadId,
+        !!remoteOutput,
+      );
     } catch (bundleErr) {
       logger.warn(
         { group: groupFolder, threadId, repo: repoName, err: bundleErr },
@@ -872,7 +878,11 @@ function resolveRescueBundlePath(
   groupFolder: string,
   repoName: string,
   threadId?: string,
-): { bundlePath: string; safeFolderName: string; safeThreadId: string | undefined } {
+): {
+  bundlePath: string;
+  safeFolderName: string;
+  safeThreadId: string | undefined;
+} {
   const { safeFolderName, safeThreadId } = sanitizeRescueName(
     groupFolder,
     threadId,
@@ -894,7 +904,11 @@ async function saveRescueBundle(
   threadId?: string,
   hasRemote?: boolean,
 ): Promise<void> {
-  const { bundlePath } = resolveRescueBundlePath(groupFolder, repoName, threadId);
+  const { bundlePath } = resolveRescueBundlePath(
+    groupFolder,
+    repoName,
+    threadId,
+  );
   fs.mkdirSync(path.dirname(bundlePath), { recursive: true });
 
   const revList = hasRemote ? 'HEAD --not --remotes' : 'HEAD';
@@ -918,8 +932,11 @@ async function restoreRescueBundle(
   repoName: string,
   threadId?: string,
 ): Promise<string | null> {
-  const { bundlePath, safeFolderName, safeThreadId } =
-    resolveRescueBundlePath(groupFolder, repoName, threadId);
+  const { bundlePath, safeFolderName, safeThreadId } = resolveRescueBundlePath(
+    groupFolder,
+    repoName,
+    threadId,
+  );
 
   if (!fs.existsSync(bundlePath)) return null;
 
@@ -946,7 +963,9 @@ async function restoreRescueBundle(
     // Remove corrupt bundle so it doesn't block future attempts
     try {
       fs.unlinkSync(bundlePath);
-    } catch { /* ignore */ }
+    } catch {
+      /* ignore */
+    }
     return null;
   }
 }
@@ -957,10 +976,16 @@ function cleanupRescueBundle(
   repoName: string,
   threadId?: string,
 ): void {
-  const { bundlePath } = resolveRescueBundlePath(groupFolder, repoName, threadId);
+  const { bundlePath } = resolveRescueBundlePath(
+    groupFolder,
+    repoName,
+    threadId,
+  );
   try {
     fs.unlinkSync(bundlePath);
-  } catch { /* ignore */ }
+  } catch {
+    /* ignore */
+  }
 }
 
 /** Sanitize a group folder name for use in rescue branch paths. */

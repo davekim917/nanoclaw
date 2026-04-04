@@ -238,7 +238,10 @@ async function runTask(
   const scheduleClose = () => {
     if (closeTimer) return; // already scheduled
     closeTimer = setTimeout(() => {
-      logger.info({ taskId: task.id }, 'Closing task container after result (writing _close)');
+      logger.info(
+        { taskId: task.id },
+        'Closing task container after result (writing _close)',
+      );
       deps.queue.closeStdin(task.chat_jid);
 
       // Backup: if _close doesn't cause the container to exit within 20s,
