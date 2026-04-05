@@ -49,3 +49,4 @@ data/worktrees/
 # Screenshots (frontend testing artifacts)
 screenshots/
 nanoclaw.db
+.gitnexus
