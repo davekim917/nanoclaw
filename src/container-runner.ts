@@ -2741,6 +2741,10 @@ function readSecrets(
     // Railway CLI reads RAILWAY_API_TOKEN from env. OneCLI proxy handles
     // HTTP calls to backboard.railway.app, but the CLI needs the token directly.
     ...(isToolEnabled(tools, 'railway') ? ['RAILWAY_API_TOKEN'] : []),
+    // Anthropic API key + base URL — passed directly to the SDK via sdkEnv.
+    // When set, these bypass the OneCLI proxy for Claude API calls.
+    'ANTHROPIC_API_KEY',
+    'ANTHROPIC_BASE_URL',
   ];
   const secrets = readEnvFile(envKeys);
 

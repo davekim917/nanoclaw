@@ -71,7 +71,8 @@ RUN PUPPETEER_SKIP_DOWNLOAD=true npm install -g \
     agent-browser@0.22.1 \
     @anthropic-ai/claude-code \
     @googleworkspace/cli@0.22.3 \
-    @mermaid-js/mermaid-cli
+    @mermaid-js/mermaid-cli \
+    gitnexus
 
 # Install PostgreSQL client, Redis CLI, and Google Cloud CLI
 RUN curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \

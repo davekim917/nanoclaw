@@ -578,6 +578,7 @@ function buildAllowedTools(tools: string[] | undefined): string[] {
   if (isToolEnabled(tools, 'omni')) allowed.push('mcp__omni__*');
   // Google Workspace (Drive, Sheets, Docs, Slides): handled by gws CLI via Bash
   allowed.push('mcp__ollama__*');
+  allowed.push('mcp__gitnexus__*');
   return allowed;
 }
 
@@ -666,6 +667,10 @@ function buildMcpServers(
       args: [path.join(path.dirname(mcpServerPath), 'ollama-mcp-stdio.js')],
     };
   }
+  servers.gitnexus = {
+    command: 'gitnexus',
+    args: ['mcp'],
+  };
   return servers;
 }
 

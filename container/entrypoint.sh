@@ -88,4 +88,13 @@ WRAPPER
   export PATH="/tmp/bin:$PATH"
 fi
 
+# Index git repos in workspace for GitNexus code intelligence.
+# gitnexus analyze is fast when up-to-date (~0.5s), re-indexes only if stale.
+# Skip AGENTS.md/CLAUDE.md generation to avoid modifying tracked files.
+# Find both .git dirs (normal repos) and .git files (worktrees).
+for gitdir in $(find /workspace -maxdepth 3 -name .git \( -type d -o -type f \) 2>/dev/null); do
+  repo=$(dirname "$gitdir")
+  [ -w "$repo" ] && (cd "$repo" && gitnexus analyze --skip-agents-md 2>&1 >&2) || true
+done
+
 node /tmp/dist/index.js < /tmp/input.json
