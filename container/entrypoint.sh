@@ -88,11 +88,6 @@ WRAPPER
   export PATH="/tmp/bin:$PATH"
 fi
 
-# GitNexus setup: install hooks (PreToolUse context enrichment, PostToolUse
-# auto-reindex after commits) and skills into the container's Claude config.
-# Safe to re-run — merges into existing settings.json, doesn't touch MCP config.
-gitnexus setup 2>&1 >&2 || true
-
 # Index git repos in workspace for GitNexus code intelligence.
 # gitnexus analyze is fast when up-to-date (~0.5s), re-indexes only if stale.
 # Skip AGENTS.md/CLAUDE.md generation to avoid modifying tracked files.

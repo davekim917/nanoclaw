@@ -2084,6 +2084,76 @@ function buildVolumeMounts(
     }
   }
 
+  // GitNexus hooks: copy hook script into the group's .claude dir and merge
+  // hook entries into settings.json. Gives the agent PreToolUse context
+  // enrichment and PostToolUse auto-reindex after commits. Copied fresh each
+  // run so host-side gitnexus updates propagate automatically.
+  const gitnexusHookSrc = path.join(
+    os.homedir(),
+    '.claude',
+    'hooks',
+    'gitnexus',
+    'gitnexus-hook.cjs',
+  );
+  if (fs.existsSync(gitnexusHookSrc)) {
+    const hookDst = path.join(groupSessionsDir, 'hooks', 'gitnexus');
+    fs.mkdirSync(hookDst, { recursive: true });
+    fs.copyFileSync(gitnexusHookSrc, path.join(hookDst, 'gitnexus-hook.cjs'));
+    try {
+      const settings = JSON.parse(fs.readFileSync(settingsFile, 'utf-8'));
+      if (!settings.hooks) settings.hooks = {};
+      const containerHookCmd =
+        'node "/home/node/.claude/hooks/gitnexus/gitnexus-hook.cjs"';
+      const gnHook = {
+        type: 'command' as const,
+        command: containerHookCmd,
+        timeout: 10,
+      };
+      // PreToolUse: enrich Grep/Glob/Bash with graph context
+      if (!settings.hooks.PreToolUse) settings.hooks.PreToolUse = [];
+      if (
+        !settings.hooks.PreToolUse.some(
+          (e: { hooks?: Array<{ command?: string }> }) =>
+            e.hooks?.some((h) => h.command === containerHookCmd),
+        )
+      ) {
+        settings.hooks.PreToolUse.push({
+          matcher: 'Grep|Glob|Bash',
+          hooks: [
+            {
+              ...gnHook,
+              statusMessage: 'Enriching with GitNexus graph context...',
+            },
+          ],
+        });
+      }
+      // PostToolUse: auto-reindex after git commit/merge
+      if (!settings.hooks.PostToolUse) settings.hooks.PostToolUse = [];
+      if (
+        !settings.hooks.PostToolUse.some(
+          (e: { hooks?: Array<{ command?: string }> }) =>
+            e.hooks?.some((h) => h.command === containerHookCmd),
+        )
+      ) {
+        settings.hooks.PostToolUse.push({
+          matcher: 'Bash',
+          hooks: [
+            {
+              ...gnHook,
+              statusMessage: 'Checking GitNexus index freshness...',
+            },
+          ],
+        });
+      }
+      fs.writeFileSync(
+        settingsFile,
+        JSON.stringify(settings, null, 2) + '\n',
+      );
+    } catch {
+      // Non-fatal: agent works without hooks, just no auto-enrichment
+    }
+  }
+
   // Write .mcp.json — MCP servers are now configured in agent-runner's
   // buildMcpServers() (proxy-injected auth or query-param auth as needed).
   // Keep the file empty so the SDK doesn't warn about a missing .mcp.json.
