@@ -48,7 +48,8 @@ export interface ContainerConfig {
   //            'gcloud', 'gcloud:<scope>' (e.g. 'gcloud:sunday' → mounts key from GCLOUD_KEY_SUNDAY),
   //            'exa' (web search + websets MCP; API key from EXA_API_KEY in .env),
   //            'braintrust' (observability MCP; auth via OneCLI proxy),
-  //            'omni' (analytics MCP; auth via OneCLI proxy)
+  //            'omni' (analytics MCP; auth via OneCLI proxy),
+  //            'browser-auth', 'browser-auth:<scope>' (e.g. 'browser-auth:illyse' → reads BROWSER_AUTH_{URL,EMAIL,PASSWORD}_ILLYSE)
   // Account-specific gmail mounts only that account's credentials as the default.
   // Account-specific calendar stages a filtered tokens.json with only allowed accounts.
   // Account-specific google-workspace stages filtered credential files (email.json) for allowed accounts.

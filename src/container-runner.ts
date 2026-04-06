@@ -2862,6 +2862,22 @@ function readSecrets(
     // Railway CLI reads RAILWAY_API_TOKEN from env. OneCLI proxy handles
     // HTTP calls to backboard.railway.app, but the CLI needs the token directly.
     ...(isToolEnabled(tools, 'railway') ? ['RAILWAY_API_TOKEN'] : []),
+    // Browser auth credentials for Playwright login automation.
+    // Scoped: 'browser-auth:illyse' reads BROWSER_AUTH_{URL,EMAIL,PASSWORD}_ILLYSE.
+    // Unscoped: 'browser-auth' reads BROWSER_AUTH_{URL,EMAIL,PASSWORD}.
+    ...(() => {
+      if (!isToolEnabled(tools, 'browser-auth')) return [];
+      const { scopes: authScopes, isScoped: authScoped } = extractToolScopes(
+        tools,
+        'browser-auth',
+      );
+      const suffix = authScoped ? `_${authScopes[0].toUpperCase()}` : '';
+      return [
+        `BROWSER_AUTH_URL${suffix}`,
+        `BROWSER_AUTH_EMAIL${suffix}`,
+        `BROWSER_AUTH_PASSWORD${suffix}`,
+      ];
+    })(),
     // Anthropic API key + base URL — passed directly to the SDK via sdkEnv.
     // When set, these bypass the OneCLI proxy for Claude API calls.
     'ANTHROPIC_API_KEY',
@@ -2881,6 +2897,28 @@ function readSecrets(
   const { scopes: githubOrgScopes } = extractToolScopes(tools, 'github-orgs');
   if (githubOrgScopes.length > 0) {
     secrets.GITHUB_ALLOWED_ORGS = githubOrgScopes.join(',');
+  }
+
+  // Normalize scoped browser auth keys to generic names
+  {
+    const { scopes: authScopes, isScoped: authScoped } = extractToolScopes(
+      tools,
+      'browser-auth',
+    );
+    if (authScoped) {
+      const suffix = `_${authScopes[0].toUpperCase()}`;
+      for (const base of [
+        'BROWSER_AUTH_URL',
+        'BROWSER_AUTH_EMAIL',
+        'BROWSER_AUTH_PASSWORD',
+      ]) {
+        const scoped = `${base}${suffix}`;
+        if (secrets[scoped]) {
+          secrets[base] = secrets[scoped];
+          delete secrets[scoped];
+        }
+      }
+    }
   }
 
   // Normalize scoped dbt keys to their generic names

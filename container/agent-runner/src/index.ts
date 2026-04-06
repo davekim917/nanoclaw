@@ -1140,7 +1140,7 @@ async function main(): Promise<void> {
   // non-HTTP secrets (dbt login, gcloud/gws credential paths) remain in
   // containerInput.secrets. Export these so CLI tools can read them as env vars.
   for (const [key, value] of Object.entries(containerInput.secrets || {})) {
-    if (key.startsWith('DBT_CLOUD_') || key.startsWith('OMNI_') || key === 'GOOGLE_APPLICATION_CREDENTIALS' || key === 'GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE' || key === 'RAILWAY_API_TOKEN') {
+    if (key.startsWith('DBT_CLOUD_') || key.startsWith('OMNI_') || key.startsWith('BROWSER_AUTH_') || key === 'GOOGLE_APPLICATION_CREDENTIALS' || key === 'GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE' || key === 'RAILWAY_API_TOKEN') {
       process.env[key] = value;
     }
   }
