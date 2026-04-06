@@ -7,6 +7,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { execFileSync } from 'child_process';
@@ -19,6 +20,11 @@ const OUTBOUND_FILES_DIR = path.join(IPC_DIR, 'outbound_files');
 
 const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB
 const CSS_COLOR_RE = /^(#[0-9a-fA-F]{3,8}|[a-zA-Z]+|rgba?\(\s*[\d.,\s%]+\)|hsla?\(\s*[\d.,\s%deg]+\)|transparent)$/;
+
+// Track content hashes of recently sent files to detect duplicates.
+// Prevents sending identical screenshots when the browser hasn't re-rendered
+// between captures (outbound equivalent of the inbound filename-dedup fix).
+const sentFileHashes = new Map<string, string>(); // SHA-256 hash → display filename
 
 // Allowlisted path prefixes for send_file (prevents staging mounted credentials)
 const ALLOWED_FILE_PREFIXES = ['/tmp/', '/workspace/group/', '/workspace/project/', '/workspace/extra/'];
@@ -153,12 +159,27 @@ server.tool(
     const filename = path.basename(args.filename || path.basename(resolvedPath));
     const mimeType = args.mime_type || guessMimeType(filename);
 
-    // Copy to outbound staging dir
+    // Read file content once — used for dedup check, then written to staging
+    const fileContent = fs.readFileSync(resolvedPath);
+
+    // Content-hash dedup: detect identical files being sent multiple times.
+    // Common cause: browser screenshots taken before the page re-renders after
+    // navigation/scroll, producing identical images with different filenames.
+    const contentHash = crypto.createHash('sha256').update(fileContent).digest('hex');
+    const previousFile = sentFileHashes.get(contentHash);
+    if (previousFile) {
+      return {
+        content: [{ type: 'text' as const, text: `Duplicate content: "${filename}" is identical to previously sent "${previousFile}". NOT sent. If this is a screenshot, the page likely hasn't changed — re-navigate or wait for the page to load, then re-capture.` }],
+        isError: true,
+      };
+    }
+
+    // Stage to outbound dir
     const uuid = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const stagingDir = path.join(OUTBOUND_FILES_DIR, uuid);
     fs.mkdirSync(stagingDir, { recursive: true });
     const stagedPath = path.join(stagingDir, filename);
-    fs.copyFileSync(resolvedPath, stagedPath);
+    fs.writeFileSync(stagedPath, fileContent);
 
     // Write IPC message with file reference
     const data = {
@@ -176,6 +197,7 @@ server.tool(
     };
 
     writeIpcFile(MESSAGES_DIR, data);
+    sentFileHashes.set(contentHash, filename);
     return { content: [{ type: 'text' as const, text: `File "${filename}" sent.` }] };
   },
 );
