@@ -182,10 +182,10 @@ server.tool(
 
 server.tool(
   'render_diagram',
-  'Render a Mermaid diagram, HTML page, or SVG graphic as a polished PNG image and send it to the chat. Use this when you want a professional-looking visual instead of ASCII art — flowcharts, architecture diagrams, sequence diagrams, org charts, timelines, or any rich visual. For data charts (bar, line, scatter), prefer Python with plotly/matplotlib and send_file instead.',
+  'Render a diagram or visual as a polished PNG image and send it to chat. IMPORTANT: Always use type "html" — it produces far better visuals than Mermaid. The render-diagram skill has ready-made HTML templates for architecture diagrams, dashboards, timelines, comparisons, org charts, and more. Only use type "mermaid" if the user explicitly asks for it or for sequence/Gantt diagrams. For data charts (bar, line, scatter), prefer Python with plotly/matplotlib and send_file instead.',
   {
     content: z.string().describe('The content to render — Mermaid diagram syntax, a full HTML page, or SVG markup'),
-    type: z.enum(['mermaid', 'html', 'svg']).describe('mermaid: diagram syntax (flowchart, sequence, etc.), html: full HTML page with CSS, svg: raw SVG markup'),
+    type: z.enum(['mermaid', 'html', 'svg']).describe('Prefer "html" — produces polished visuals with full CSS control. Use "mermaid" only for sequence/Gantt or if user requests it. "svg" for precise vector graphics.'),
     caption: z.string().optional().describe('Caption shown alongside the image in chat'),
     title: z.string().optional().describe('Short slug for the filename (e.g. "architecture" produces architecture.png)'),
     theme: z.enum(['default', 'dark', 'forest', 'neutral']).optional().describe('Mermaid color theme. Ignored for html/svg. Default: "default"'),
