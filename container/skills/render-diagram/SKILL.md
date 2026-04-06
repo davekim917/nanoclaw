@@ -11,32 +11,47 @@ You have the `render_diagram` tool. It renders Mermaid diagrams, HTML pages, or 
 ## When to use
 
 - Architecture diagrams, flowcharts, sequence diagrams, org charts, timelines
+- KPI dashboards, status reports, comparison matrices, project roadmaps
 - Any visual where layout, color, or relationships matter more than raw text
-- When the user asks for a diagram, chart, or visual
 
 ## When NOT to use
 
 - Simple lists or hierarchies that read fine as text
 - Quick inline sketches where ASCII is clearer (e.g. `A -> B -> C`)
-- Data charts (bar, line, scatter) — use Python with plotly/matplotlib and `send_file` instead
+- Data charts with real datasets (bar, line, scatter) — use Python with plotly/matplotlib and `send_file`
 
 ## Choosing the right format
 
 | Format | Best for | Limitations |
 |--------|----------|-------------|
 | `mermaid` | Quick flowcharts, sequence diagrams, ERDs, Gantt charts | Limited styling, fixed themes |
-| `html` | Full creative control — dashboards, polished layouts, custom visuals | More verbose, requires CSS knowledge |
+| `html` | Full creative control — dashboards, polished layouts, custom visuals | More verbose |
 | `svg` | Precise vector graphics, icons, geometric art | No interactivity in output |
 
-**Default to Mermaid** for quick structural diagrams. **Use HTML** when the user wants something polished, branded, or visually impressive.
+**Default to Mermaid** for quick structural diagrams. **Use HTML** when the user wants something polished or visually impressive.
+
+---
+
+## Design principles
+
+Follow these when building HTML visuals. Based on established information design practice.
+
+**Typography hierarchy** — use 2-3 typefaces max. Size guide: titles 28-36px bold, section headers 18-22px semibold, body 13-15px, labels/captions 11-12px. Use `-apple-system, 'Segoe UI', system-ui, sans-serif` for clean cross-platform rendering.
+
+**Color discipline** — limit to 4-5 colors plus a neutral. Assign each color a role: one primary accent, one or two secondary, one for backgrounds, one for borders/muted text. Maintain color meaning consistently throughout.
+
+**White space** — generous padding between sections (32-48px), breathing room inside cards (20-28px), and clear margins. Resist filling every pixel.
+
+**Visual hierarchy** — the most important element should be the largest and most prominent. Supporting info should be visually subordinate. Guide attention through size, weight, color, and position — not by making everything bold.
+
+**Data-ink ratio** — every visual element should serve communication. Skip decorative 3D effects, gratuitous gradients, and chartjunk. Design serves content, not the reverse.
 
 ---
 
 ## Mermaid — quick structural diagrams
 
-Good for getting a diagram out fast. Limited styling but clear communication.
+Good for getting a diagram out fast with minimal code.
 
-Architecture:
 ```
 render_diagram(type: "mermaid", title: "architecture", content: `
 graph TD
@@ -45,11 +60,9 @@ graph TD
     B --> D[Order Service]
     D --> E[(PostgreSQL)]
     D --> F[(Redis Cache)]
-    C --> G[OAuth Provider]
 `, theme: "default")
 ```
 
-Sequence:
 ```
 render_diagram(type: "mermaid", title: "auth-flow", content: `
 sequenceDiagram
@@ -63,195 +76,350 @@ sequenceDiagram
 `, theme: "neutral")
 ```
 
-**Mermaid themes**: `default` (blue/gray), `dark` (dark background), `forest` (green), `neutral` (minimal)
+**Themes**: `default` (blue/gray), `dark`, `forest` (green), `neutral` (minimal)
 
 ---
 
-## HTML — full creative control
+## HTML templates by use case
 
-Use HTML when visuals matter. Match the complexity to the request: basic for quick info, polished for presentations and impressive outputs.
+### KPI Dashboard — metrics with context
 
-### Basic — clean and functional
+Stat cards with comparison indicators. Good for status reports, weekly updates, business reviews.
 
-Simple card layout, good for quick overviews:
 ```
-render_diagram(type: "html", title: "overview", width: 1200, height: 600, content: `
+render_diagram(type: "html", title: "metrics", width: 1200, height: 400, content: `
 <!DOCTYPE html>
 <html><head><style>
   * { margin: 0; box-sizing: border-box; }
-  body { font-family: -apple-system, system-ui, sans-serif; background: #0f172a; color: #e2e8f0; padding: 40px; }
-  h1 { font-size: 22px; font-weight: 600; margin-bottom: 24px; }
-  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
-  .card { background: #1e293b; border-radius: 10px; padding: 20px; border: 1px solid #334155; }
-  .card h3 { color: #38bdf8; font-size: 13px; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 6px; }
-  .card p { font-size: 14px; line-height: 1.5; color: #94a3b8; }
+  body { font-family: -apple-system, 'Segoe UI', system-ui, sans-serif; background: #09090b; color: #fafafa; padding: 40px; }
+  h1 { font-size: 20px; font-weight: 600; color: #a1a1aa; margin-bottom: 24px; letter-spacing: -0.01em; }
+  .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
+  .card { background: #18181b; border: 1px solid #27272a; border-radius: 12px; padding: 24px; }
+  .card .label { font-size: 12px; color: #71717a; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 8px; }
+  .card .value { font-size: 32px; font-weight: 700; letter-spacing: -0.02em; margin-bottom: 6px; }
+  .card .delta { font-size: 13px; }
+  .up { color: #4ade80; }
+  .down { color: #f87171; }
+  .neutral { color: #71717a; }
 </style></head>
 <body>
-  <h1>System Overview</h1>
+  <h1>Weekly Performance — Mar 31, 2026</h1>
   <div class="grid">
-    <div class="card"><h3>Frontend</h3><p>React SPA with TypeScript</p></div>
-    <div class="card"><h3>API</h3><p>Node.js + Express</p></div>
-    <div class="card"><h3>Database</h3><p>PostgreSQL + Redis</p></div>
+    <div class="card"><div class="label">Revenue</div><div class="value">$142K</div><div class="delta up">+12.3% vs last week</div></div>
+    <div class="card"><div class="label">Active Users</div><div class="value">8,421</div><div class="delta up">+340 new</div></div>
+    <div class="card"><div class="label">Conversion</div><div class="value">3.2%</div><div class="delta down">-0.4pp from target</div></div>
+    <div class="card"><div class="label">P95 Latency</div><div class="value">142ms</div><div class="delta up">-18ms improved</div></div>
   </div>
 </body></html>
 `)
 ```
 
-### Polished — gradient accents, shadows, depth
+### Architecture — Vercel-style dark layout with mesh gradient
 
-Elevated design with visual hierarchy:
+Uses layered radial gradients (the technique behind Apple, Stripe, and Vercel backgrounds). Nodes with subtle glow effects.
+
 ```
 render_diagram(type: "html", title: "architecture", width: 1400, height: 900, content: `
 <!DOCTYPE html>
 <html><head><style>
   * { margin: 0; box-sizing: border-box; }
-  body { font-family: 'SF Pro Display', -apple-system, system-ui, sans-serif; background: #0a0a1a; color: #e2e8f0; padding: 48px; }
-  h1 { font-size: 28px; font-weight: 700; margin-bottom: 8px; background: linear-gradient(135deg, #60a5fa, #a78bfa); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-  .subtitle { font-size: 14px; color: #64748b; margin-bottom: 36px; }
-  .flow { display: flex; align-items: center; gap: 12px; margin-bottom: 32px; }
-  .node { background: linear-gradient(145deg, #1e293b, #0f172a); border: 1px solid #334155; border-radius: 14px; padding: 20px 28px; box-shadow: 0 4px 24px rgba(0,0,0,0.3), inset 0 1px 0 rgba(255,255,255,0.05); min-width: 160px; text-align: center; }
-  .node.primary { border-color: #3b82f6; box-shadow: 0 4px 24px rgba(59,130,246,0.15), inset 0 1px 0 rgba(255,255,255,0.05); }
+  body {
+    font-family: -apple-system, 'Segoe UI', system-ui, sans-serif;
+    color: #e2e8f0;
+    padding: 48px;
+    background: #050914;
+    background-image:
+      radial-gradient(at 0% 0%, hsla(214, 60%, 16%, 0.8) 0px, transparent 50%),
+      radial-gradient(at 80% 100%, hsla(260, 40%, 12%, 0.6) 0px, transparent 50%);
+  }
+  h1 { font-size: 28px; font-weight: 700; margin-bottom: 6px; letter-spacing: -0.02em; }
+  .sub { font-size: 13px; color: #64748b; margin-bottom: 40px; }
+  .flow { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; justify-content: center; }
+  .node { background: rgba(15, 23, 42, 0.8); border: 1px solid #1e293b; border-radius: 14px; padding: 22px 28px; min-width: 150px; text-align: center; }
+  .node.accent { border-color: rgba(59, 130, 246, 0.4); box-shadow: 0 0 24px rgba(59, 130, 246, 0.08); }
   .node h3 { font-size: 15px; font-weight: 600; margin-bottom: 4px; }
-  .node.primary h3 { color: #60a5fa; }
-  .node p { font-size: 12px; color: #64748b; }
-  .arrow { color: #475569; font-size: 20px; }
-  .details { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-top: 16px; }
-  .detail { background: rgba(30,41,59,0.5); border: 1px solid #1e293b; border-radius: 10px; padding: 16px; }
-  .detail .label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; color: #64748b; margin-bottom: 4px; }
-  .detail .value { font-size: 20px; font-weight: 700; color: #f8fafc; }
-  .detail .sub { font-size: 12px; color: #4ade80; margin-top: 2px; }
+  .node.accent h3 { color: #60a5fa; }
+  .node p { font-size: 12px; color: #475569; }
+  .arrow { color: #334155; font-size: 18px; }
+  .tier { display: flex; gap: 16px; margin-top: 32px; justify-content: center; }
+  .tier .node { flex: 1; max-width: 200px; }
+  .section { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: #334155; margin: 32px 0 12px; text-align: center; }
 </style></head>
 <body>
-  <h1>Request Pipeline</h1>
-  <p class="subtitle">Production architecture — avg 45ms end-to-end</p>
+  <h1>System Architecture</h1>
+  <p class="sub">Production topology — multi-region deployment</p>
   <div class="flow">
-    <div class="node"><h3>Client</h3><p>React SPA</p></div>
-    <span class="arrow">→</span>
-    <div class="node primary"><h3>API Gateway</h3><p>Rate limit · Auth</p></div>
-    <span class="arrow">→</span>
+    <div class="node"><h3>CDN</h3><p>Edge cache</p></div>
+    <span class="arrow">&rarr;</span>
+    <div class="node accent"><h3>Load Balancer</h3><p>TLS termination</p></div>
+    <span class="arrow">&rarr;</span>
+    <div class="node accent"><h3>API Gateway</h3><p>Auth &middot; Rate limit</p></div>
+    <span class="arrow">&rarr;</span>
     <div class="node"><h3>Service Mesh</h3><p>gRPC routing</p></div>
-    <span class="arrow">→</span>
-    <div class="node primary"><h3>Workers</h3><p>Async processing</p></div>
-    <span class="arrow">→</span>
-    <div class="node"><h3>Storage</h3><p>Postgres · S3</p></div>
   </div>
-  <div class="details">
-    <div class="detail"><div class="label">Throughput</div><div class="value">12.4K</div><div class="sub">↑ 18% vs last week</div></div>
-    <div class="detail"><div class="label">P99 Latency</div><div class="value">142ms</div><div class="sub">↓ 23ms improvement</div></div>
-    <div class="detail"><div class="label">Error Rate</div><div class="value">0.02%</div><div class="sub">Within SLO target</div></div>
+  <div class="section">Services</div>
+  <div class="tier">
+    <div class="node"><h3>Users</h3><p>Auth &middot; Profiles</p></div>
+    <div class="node"><h3>Orders</h3><p>Checkout &middot; Payment</p></div>
+    <div class="node"><h3>Catalog</h3><p>Search &middot; Inventory</p></div>
+    <div class="node"><h3>Notifications</h3><p>Email &middot; Push</p></div>
+  </div>
+  <div class="section">Data</div>
+  <div class="tier">
+    <div class="node accent"><h3>PostgreSQL</h3><p>Primary store</p></div>
+    <div class="node"><h3>Redis</h3><p>Cache &middot; Sessions</p></div>
+    <div class="node"><h3>S3</h3><p>Objects &middot; Backups</p></div>
   </div>
 </body></html>
 `)
 ```
 
-### Glassmorphism — modern frosted-glass aesthetic
+### Comparison Matrix — evaluation with clear recommendation
 
-Premium look with blur effects and transparency:
+Professional decision-support visual. Color-coded status indicators, recommended option highlighted.
+
+```
+render_diagram(type: "html", title: "comparison", width: 1200, height: 600, content: `
+<!DOCTYPE html>
+<html><head><style>
+  * { margin: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, 'Segoe UI', system-ui, sans-serif; background: #09090b; color: #e4e4e7; padding: 40px; }
+  h1 { font-size: 22px; font-weight: 700; margin-bottom: 6px; letter-spacing: -0.01em; }
+  .sub { font-size: 13px; color: #52525b; margin-bottom: 24px; }
+  table { width: 100%; border-collapse: separate; border-spacing: 0; background: #18181b; border-radius: 12px; overflow: hidden; border: 1px solid #27272a; }
+  th { font-size: 13px; font-weight: 600; padding: 14px 20px; text-align: left; background: #18181b; border-bottom: 1px solid #27272a; color: #a1a1aa; }
+  th.pick { color: #60a5fa; }
+  td { padding: 13px 20px; font-size: 14px; border-bottom: 1px solid rgba(39,39,42,0.5); }
+  tr:last-child td { border-bottom: none; }
+  .feat { color: #71717a; font-weight: 500; }
+  .y { color: #4ade80; } .n { color: #52525b; } .m { color: #facc15; }
+  .badge { font-size: 10px; padding: 2px 8px; border-radius: 99px; background: rgba(96,165,250,0.12); color: #60a5fa; margin-left: 6px; vertical-align: middle; font-weight: 600; }
+  .rec { background: rgba(96,165,250,0.03); }
+</style></head>
+<body>
+  <h1>Vendor Evaluation</h1>
+  <p class="sub">Scored against production requirements — April 2026</p>
+  <table>
+    <tr><th class="feat">Criteria</th><th class="pick">Vendor A<span class="badge">Pick</span></th><th>Vendor B</th><th>Vendor C</th></tr>
+    <tr class="rec"><td class="feat">Auto-scaling</td><td class="y">Built-in</td><td class="m">Manual config</td><td class="y">Built-in</td></tr>
+    <tr><td class="feat">Cold start</td><td class="y">&lt; 100ms</td><td class="n">2-5s</td><td class="m">~500ms</td></tr>
+    <tr class="rec"><td class="feat">Multi-region</td><td class="y">12 regions</td><td class="y">6 regions</td><td class="n">Single only</td></tr>
+    <tr><td class="feat">Observability</td><td class="y">Native OTel</td><td class="m">Third-party</td><td class="m">Basic logs</td></tr>
+    <tr class="rec"><td class="feat">Monthly cost</td><td class="y">$2.4K</td><td class="m">$4.1K</td><td class="y">$1.8K</td></tr>
+    <tr><td class="feat">Team readiness</td><td class="y">High</td><td class="m">Medium</td><td class="n">Low</td></tr>
+  </table>
+</body></html>
+`)
+```
+
+### Project Roadmap — horizontal timeline with milestones
+
+Phase indicators with status (done/active/pending). Clean connector line using CSS gradient.
+
+```
+render_diagram(type: "html", title: "roadmap", width: 1200, height: 420, content: `
+<!DOCTYPE html>
+<html><head><style>
+  * { margin: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, 'Segoe UI', system-ui, sans-serif; background: #09090b; color: #e4e4e7; padding: 48px; }
+  h1 { font-size: 22px; font-weight: 700; margin-bottom: 36px; letter-spacing: -0.01em; }
+  .timeline { position: relative; display: flex; justify-content: space-between; padding: 0 20px; }
+  .timeline::before { content: ''; position: absolute; top: 20px; left: 50px; right: 50px; height: 2px; background: linear-gradient(90deg, #3b82f6, #8b5cf6, #27272a 70%); }
+  .step { position: relative; text-align: center; flex: 1; }
+  .dot { width: 40px; height: 40px; border-radius: 50%; margin: 0 auto 16px; display: flex; align-items: center; justify-content: center; font-size: 14px; font-weight: 700; position: relative; z-index: 1; }
+  .done { background: #3b82f6; color: white; }
+  .active { background: #8b5cf6; color: white; box-shadow: 0 0 20px rgba(139,92,246,0.4); }
+  .pending { background: #27272a; border: 2px solid #3f3f46; color: #52525b; }
+  .label { font-size: 14px; font-weight: 600; margin-bottom: 4px; }
+  .desc { font-size: 12px; color: #52525b; max-width: 130px; margin: 0 auto; line-height: 1.4; }
+  .date { font-size: 11px; color: #3f3f46; margin-top: 8px; font-variant-numeric: tabular-nums; }
+</style></head>
+<body>
+  <h1>Product Roadmap</h1>
+  <div class="timeline">
+    <div class="step"><div class="dot done">1</div><div class="label">Research</div><div class="desc">User interviews and competitive analysis</div><div class="date">Jan 2026</div></div>
+    <div class="step"><div class="dot done">2</div><div class="label">Design</div><div class="desc">Wireframes, prototypes, design system</div><div class="date">Feb 2026</div></div>
+    <div class="step"><div class="dot active">3</div><div class="label">Build</div><div class="desc">Core features and API integration</div><div class="date">Mar 2026</div></div>
+    <div class="step"><div class="dot pending">4</div><div class="label">Beta</div><div class="desc">Private beta with select partners</div><div class="date">Apr 2026</div></div>
+    <div class="step"><div class="dot pending">5</div><div class="label">Launch</div><div class="desc">GA release and marketing push</div><div class="date">May 2026</div></div>
+  </div>
+</body></html>
+`)
+```
+
+### Glassmorphism Cards — frosted-glass service overview
+
+Uses `backdrop-filter: blur()` with `saturate()` — the technique from Apple's Liquid Glass and macOS. Requires a colorful background behind the cards to show the blur effect.
+
 ```
 render_diagram(type: "html", title: "services", width: 1400, height: 800, content: `
 <!DOCTYPE html>
 <html><head><style>
   * { margin: 0; box-sizing: border-box; }
-  body { font-family: -apple-system, system-ui, sans-serif; background: linear-gradient(135deg, #0c0a2a 0%, #1a0a3e 40%, #0a1628 100%); color: #f0f0ff; padding: 48px; min-height: 100vh; }
-  h1 { font-size: 26px; font-weight: 700; margin-bottom: 32px; }
+  body {
+    font-family: -apple-system, 'Segoe UI', system-ui, sans-serif;
+    color: #f0f0ff;
+    padding: 48px;
+    min-height: 100vh;
+    background: #0c0a2a;
+    background-image:
+      radial-gradient(at 20% 30%, hsla(260, 80%, 40%, 0.4) 0px, transparent 50%),
+      radial-gradient(at 80% 70%, hsla(200, 80%, 30%, 0.3) 0px, transparent 50%),
+      radial-gradient(at 50% 90%, hsla(330, 60%, 30%, 0.2) 0px, transparent 50%);
+  }
+  h1 { font-size: 26px; font-weight: 700; margin-bottom: 8px; letter-spacing: -0.02em; }
+  .sub { font-size: 13px; color: rgba(255,255,255,0.4); margin-bottom: 32px; }
   .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; }
-  .glass { background: rgba(255,255,255,0.06); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,0.1); border-radius: 16px; padding: 28px; }
-  .glass .icon { width: 40px; height: 40px; border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 20px; margin-bottom: 16px; }
+  .glass {
+    background: rgba(255,255,255,0.06);
+    backdrop-filter: blur(12px) saturate(180%);
+    -webkit-backdrop-filter: blur(12px) saturate(180%);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 16px;
+    padding: 28px;
+  }
+  .glass .icon { width: 40px; height: 40px; border-radius: 10px; display: flex; align-items: center; justify-content: center; font-size: 18px; margin-bottom: 16px; color: white; }
   .glass h3 { font-size: 16px; font-weight: 600; margin-bottom: 8px; }
-  .glass p { font-size: 13px; line-height: 1.6; color: rgba(255,255,255,0.6); }
-  .glass .tag { display: inline-block; font-size: 11px; padding: 3px 10px; border-radius: 99px; background: rgba(255,255,255,0.08); color: rgba(255,255,255,0.5); margin-top: 12px; }
-  .i1 { background: linear-gradient(135deg, #3b82f6, #2563eb); }
-  .i2 { background: linear-gradient(135deg, #8b5cf6, #7c3aed); }
-  .i3 { background: linear-gradient(135deg, #06b6d4, #0891b2); }
-  .i4 { background: linear-gradient(135deg, #f59e0b, #d97706); }
-  .i5 { background: linear-gradient(135deg, #10b981, #059669); }
-  .i6 { background: linear-gradient(135deg, #ef4444, #dc2626); }
-  .connector { grid-column: 1 / -1; text-align: center; color: rgba(255,255,255,0.2); font-size: 13px; letter-spacing: 0.3em; text-transform: uppercase; padding: 8px 0; }
+  .glass p { font-size: 13px; line-height: 1.6; color: rgba(255,255,255,0.5); }
+  .glass .tag { display: inline-block; font-size: 11px; padding: 3px 10px; border-radius: 99px; background: rgba(255,255,255,0.08); color: rgba(255,255,255,0.45); margin-top: 14px; }
+  .i1 { background: linear-gradient(135deg, #3b82f6, #1d4ed8); }
+  .i2 { background: linear-gradient(135deg, #8b5cf6, #6d28d9); }
+  .i3 { background: linear-gradient(135deg, #06b6d4, #0e7490); }
+  .i4 { background: linear-gradient(135deg, #f59e0b, #b45309); }
+  .i5 { background: linear-gradient(135deg, #10b981, #047857); }
+  .i6 { background: linear-gradient(135deg, #ef4444, #b91c1c); }
+  .divider { grid-column: 1 / -1; text-align: center; color: rgba(255,255,255,0.15); font-size: 12px; letter-spacing: 0.2em; text-transform: uppercase; padding: 4px 0; }
 </style></head>
 <body>
-  <h1>Microservices Architecture</h1>
+  <h1>Platform Services</h1>
+  <p class="sub">Microservices topology — 6 services, 3 data stores</p>
   <div class="grid">
-    <div class="glass"><div class="icon i1">⚡</div><h3>API Gateway</h3><p>Rate limiting, auth, request routing. Handles 50K req/s.</p><span class="tag">Kong</span></div>
-    <div class="glass"><div class="icon i2">🔐</div><h3>Auth Service</h3><p>OAuth 2.0 + PKCE, JWT issuance, session management.</p><span class="tag">Node.js</span></div>
-    <div class="glass"><div class="icon i3">📦</div><h3>Order Service</h3><p>Order lifecycle, inventory checks, payment orchestration.</p><span class="tag">Go</span></div>
-    <div class="connector">· · · · · · · · · · message bus · · · · · · · · · ·</div>
-    <div class="glass"><div class="icon i4">📊</div><h3>Analytics</h3><p>Real-time metrics, user behavior tracking, funnel analysis.</p><span class="tag">Python</span></div>
-    <div class="glass"><div class="icon i5">🔔</div><h3>Notifications</h3><p>Email, push, SMS delivery. Template rendering engine.</p><span class="tag">Rust</span></div>
-    <div class="glass"><div class="icon i6">🛡️</div><h3>Monitoring</h3><p>Health checks, alerting, distributed tracing.</p><span class="tag">Grafana</span></div>
+    <div class="glass"><div class="icon i1">A</div><h3>API Gateway</h3><p>Rate limiting, auth verification, request routing. Handles 50K req/s peak.</p><span class="tag">Kong + Lua</span></div>
+    <div class="glass"><div class="icon i2">S</div><h3>Auth Service</h3><p>OAuth 2.0 with PKCE, JWT issuance, session lifecycle management.</p><span class="tag">Node.js</span></div>
+    <div class="glass"><div class="icon i3">O</div><h3>Order Engine</h3><p>Order lifecycle, inventory reservation, payment orchestration.</p><span class="tag">Go</span></div>
+    <div class="divider">&middot; &middot; &middot; event bus &middot; &middot; &middot;</div>
+    <div class="glass"><div class="icon i4">A</div><h3>Analytics</h3><p>Real-time metrics pipeline, funnel analysis, cohort tracking.</p><span class="tag">Python + Kafka</span></div>
+    <div class="glass"><div class="icon i5">N</div><h3>Notifications</h3><p>Email, push, and SMS delivery with template rendering.</p><span class="tag">Rust</span></div>
+    <div class="glass"><div class="icon i6">M</div><h3>Monitoring</h3><p>Health checks, distributed tracing, alerting with PagerDuty.</p><span class="tag">Grafana stack</span></div>
   </div>
 </body></html>
 `)
 ```
 
-### Timeline — horizontal or vertical event sequences
+### Process Flow — vertical steps with status
+
+Clean vertical flow with step numbers, descriptions, and owner/status badges. Good for onboarding flows, deployment pipelines, approval workflows.
 
 ```
-render_diagram(type: "html", title: "timeline", width: 1200, height: 500, content: `
+render_diagram(type: "html", title: "process", width: 800, height: 800, content: `
 <!DOCTYPE html>
 <html><head><style>
   * { margin: 0; box-sizing: border-box; }
-  body { font-family: -apple-system, system-ui, sans-serif; background: #0f172a; color: #e2e8f0; padding: 48px; }
-  h1 { font-size: 22px; font-weight: 700; margin-bottom: 36px; }
-  .timeline { position: relative; display: flex; justify-content: space-between; padding: 0 20px; }
-  .timeline::before { content: ''; position: absolute; top: 18px; left: 40px; right: 40px; height: 2px; background: linear-gradient(90deg, #3b82f6, #8b5cf6, #06b6d4); }
-  .step { position: relative; text-align: center; flex: 1; }
-  .dot { width: 36px; height: 36px; border-radius: 50%; margin: 0 auto 16px; display: flex; align-items: center; justify-content: center; font-size: 14px; font-weight: 700; position: relative; z-index: 1; }
-  .dot.done { background: linear-gradient(135deg, #3b82f6, #2563eb); color: white; box-shadow: 0 0 20px rgba(59,130,246,0.3); }
-  .dot.active { background: linear-gradient(135deg, #8b5cf6, #7c3aed); color: white; box-shadow: 0 0 20px rgba(139,92,246,0.4); animation: pulse 2s infinite; }
-  .dot.pending { background: #1e293b; border: 2px solid #334155; color: #64748b; }
-  @keyframes pulse { 0%, 100% { box-shadow: 0 0 20px rgba(139,92,246,0.4); } 50% { box-shadow: 0 0 30px rgba(139,92,246,0.6); } }
-  .label { font-size: 14px; font-weight: 600; margin-bottom: 4px; }
-  .desc { font-size: 12px; color: #64748b; max-width: 140px; margin: 0 auto; }
-  .date { font-size: 11px; color: #475569; margin-top: 8px; }
+  body { font-family: -apple-system, 'Segoe UI', system-ui, sans-serif; background: #09090b; color: #e4e4e7; padding: 40px; }
+  h1 { font-size: 22px; font-weight: 700; margin-bottom: 28px; }
+  .steps { position: relative; padding-left: 40px; }
+  .steps::before { content: ''; position: absolute; left: 15px; top: 0; bottom: 0; width: 2px; background: #27272a; }
+  .step { position: relative; margin-bottom: 28px; }
+  .step:last-child { margin-bottom: 0; }
+  .step .num { position: absolute; left: -40px; top: 0; width: 32px; height: 32px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 13px; font-weight: 700; z-index: 1; }
+  .num.done { background: #3b82f6; color: white; }
+  .num.active { background: #8b5cf6; color: white; box-shadow: 0 0 12px rgba(139,92,246,0.3); }
+  .num.pending { background: #27272a; color: #52525b; border: 2px solid #3f3f46; }
+  .step .content { background: #18181b; border: 1px solid #27272a; border-radius: 10px; padding: 16px 20px; }
+  .step .title { font-size: 15px; font-weight: 600; margin-bottom: 4px; }
+  .step .desc { font-size: 13px; color: #71717a; line-height: 1.5; }
+  .step .meta { display: flex; gap: 8px; margin-top: 10px; }
+  .pill { font-size: 11px; padding: 2px 10px; border-radius: 99px; }
+  .pill.owner { background: rgba(139,92,246,0.1); color: #a78bfa; }
+  .pill.status { background: rgba(74,222,128,0.1); color: #4ade80; }
+  .pill.wait { background: rgba(250,204,21,0.1); color: #facc15; }
 </style></head>
 <body>
-  <h1>Project Roadmap</h1>
-  <div class="timeline">
-    <div class="step"><div class="dot done">1</div><div class="label">Research</div><div class="desc">User interviews and competitive analysis</div><div class="date">Jan 2026</div></div>
-    <div class="step"><div class="dot done">2</div><div class="label">Design</div><div class="desc">Wireframes, prototypes, design system</div><div class="date">Feb 2026</div></div>
-    <div class="step"><div class="dot active">3</div><div class="label">Build</div><div class="desc">Core features and API development</div><div class="date">Mar 2026</div></div>
-    <div class="step"><div class="dot pending">4</div><div class="label">Beta</div><div class="desc">Private beta with select users</div><div class="date">Apr 2026</div></div>
-    <div class="step"><div class="dot pending">5</div><div class="label">Launch</div><div class="desc">Public release and marketing push</div><div class="date">May 2026</div></div>
+  <h1>Deployment Pipeline</h1>
+  <div class="steps">
+    <div class="step"><div class="num done">1</div><div class="content"><div class="title">Code Review</div><div class="desc">PR approved by 2 reviewers, all checks passing.</div><div class="meta"><span class="pill owner">@eng-team</span><span class="pill status">Complete</span></div></div></div>
+    <div class="step"><div class="num done">2</div><div class="content"><div class="title">Build &amp; Test</div><div class="desc">CI pipeline: lint, unit tests, integration tests, Docker image built and pushed.</div><div class="meta"><span class="pill owner">CI/CD</span><span class="pill status">Complete</span></div></div></div>
+    <div class="step"><div class="num active">3</div><div class="content"><div class="title">Staging Deploy</div><div class="desc">Deployed to staging environment. Running smoke tests and load testing.</div><div class="meta"><span class="pill owner">@platform</span><span class="pill wait">In progress</span></div></div></div>
+    <div class="step"><div class="num pending">4</div><div class="content"><div class="title">QA Sign-off</div><div class="desc">Manual testing of critical user flows and edge cases.</div><div class="meta"><span class="pill owner">@qa-team</span></div></div></div>
+    <div class="step"><div class="num pending">5</div><div class="content"><div class="title">Production Release</div><div class="desc">Canary deployment at 5%, promote to 100% after 30m if error rate holds.</div><div class="meta"><span class="pill owner">@sre</span></div></div></div>
   </div>
 </body></html>
 `)
 ```
 
-### Comparison table — side-by-side evaluation
+### Feature Announcement — marketing-style visual
+
+Bold gradient headline, benefit cards. Good for changelogs, release notes, product updates.
 
 ```
-render_diagram(type: "html", title: "comparison", width: 1200, height: 700, content: `
+render_diagram(type: "html", title: "announcement", width: 1200, height: 700, content: `
 <!DOCTYPE html>
 <html><head><style>
   * { margin: 0; box-sizing: border-box; }
-  body { font-family: -apple-system, system-ui, sans-serif; background: #0f172a; color: #e2e8f0; padding: 48px; }
-  h1 { font-size: 22px; font-weight: 700; margin-bottom: 8px; }
-  .sub { font-size: 13px; color: #64748b; margin-bottom: 28px; }
-  table { width: 100%; border-collapse: separate; border-spacing: 0; }
-  th { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: #64748b; padding: 12px 20px; text-align: left; border-bottom: 1px solid #1e293b; }
-  th.rec { color: #3b82f6; }
-  td { padding: 14px 20px; font-size: 14px; border-bottom: 1px solid rgba(30,41,59,0.5); }
-  tr:last-child td { border-bottom: none; }
-  .feature { color: #94a3b8; font-weight: 500; }
-  .yes { color: #4ade80; }
-  .no { color: #64748b; }
-  .partial { color: #fbbf24; }
-  .highlight { background: rgba(59,130,246,0.05); }
-  .highlight td { border-bottom-color: rgba(59,130,246,0.1); }
-  .badge { display: inline-block; font-size: 10px; padding: 2px 8px; border-radius: 99px; background: rgba(59,130,246,0.15); color: #60a5fa; margin-left: 8px; vertical-align: middle; }
+  body {
+    font-family: -apple-system, 'Segoe UI', system-ui, sans-serif;
+    background: #09090b;
+    color: #e4e4e7;
+    padding: 56px 48px;
+    background-image:
+      radial-gradient(at 50% 0%, hsla(250, 80%, 30%, 0.25) 0px, transparent 60%);
+  }
+  .eyebrow { font-size: 12px; text-transform: uppercase; letter-spacing: 0.12em; color: #8b5cf6; font-weight: 600; margin-bottom: 12px; }
+  h1 { font-size: 36px; font-weight: 800; letter-spacing: -0.03em; line-height: 1.15; margin-bottom: 12px; background: linear-gradient(135deg, #e4e4e7 0%, #a1a1aa 100%); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+  .lead { font-size: 16px; color: #71717a; line-height: 1.6; max-width: 560px; margin-bottom: 40px; }
+  .benefits { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; }
+  .benefit { background: #18181b; border: 1px solid #27272a; border-radius: 12px; padding: 24px; }
+  .benefit .num { font-size: 28px; font-weight: 800; margin-bottom: 8px; background: linear-gradient(135deg, #8b5cf6, #3b82f6); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+  .benefit h3 { font-size: 15px; font-weight: 600; margin-bottom: 6px; }
+  .benefit p { font-size: 13px; color: #71717a; line-height: 1.5; }
 </style></head>
 <body>
-  <h1>Solution Comparison</h1>
-  <p class="sub">Evaluated against production requirements — Q1 2026</p>
-  <table>
-    <tr><th class="feature">Feature</th><th class="rec">Option A <span class="badge">Recommended</span></th><th>Option B</th><th>Option C</th></tr>
-    <tr class="highlight"><td class="feature">Auto-scaling</td><td class="yes">✓ Built-in</td><td class="partial">~ Manual config</td><td class="yes">✓ Built-in</td></tr>
-    <tr><td class="feature">Cold start</td><td class="yes">&lt; 100ms</td><td class="no">2-5s</td><td class="partial">500ms</td></tr>
-    <tr class="highlight"><td class="feature">Multi-region</td><td class="yes">✓ 12 regions</td><td class="yes">✓ 6 regions</td><td class="no">✗ Single region</td></tr>
-    <tr><td class="feature">Observability</td><td class="yes">✓ Native tracing</td><td class="partial">~ Third-party</td><td class="partial">~ Basic logs</td></tr>
-    <tr class="highlight"><td class="feature">Cost at scale</td><td class="yes">$2.4K/mo</td><td class="partial">$4.1K/mo</td><td class="yes">$1.8K/mo</td></tr>
-    <tr><td class="feature">Team expertise</td><td class="yes">High</td><td class="partial">Medium</td><td class="no">Low</td></tr>
-  </table>
+  <div class="eyebrow">Now Available</div>
+  <h1>Instant Edge Deployments</h1>
+  <p class="lead">Deploy to 12 global regions in under 30 seconds. Zero-downtime rollouts with automatic rollback on error spike.</p>
+  <div class="benefits">
+    <div class="benefit"><div class="num">30s</div><h3>Deploy Time</h3><p>From git push to live in production across all regions.</p></div>
+    <div class="benefit"><div class="num">99.99%</div><h3>Uptime SLA</h3><p>Rolling deploys with health checks at every stage.</p></div>
+    <div class="benefit"><div class="num">12</div><h3>Edge Regions</h3><p>Automatic routing to the nearest point of presence.</p></div>
+  </div>
+</body></html>
+`)
+```
+
+### Org / Team Chart — hierarchy with roles
+
+```
+render_diagram(type: "html", title: "team", width: 1000, height: 600, content: `
+<!DOCTYPE html>
+<html><head><style>
+  * { margin: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, 'Segoe UI', system-ui, sans-serif; background: #09090b; color: #e4e4e7; padding: 40px; display: flex; flex-direction: column; align-items: center; }
+  h1 { font-size: 22px; font-weight: 700; margin-bottom: 32px; }
+  .row { display: flex; gap: 16px; justify-content: center; margin-bottom: 8px; position: relative; }
+  .connector { width: 2px; height: 24px; background: #27272a; margin: 0 auto; }
+  .branch { display: flex; gap: 16px; justify-content: center; position: relative; }
+  .branch::before { content: ''; position: absolute; top: -12px; left: 25%; right: 25%; height: 2px; background: #27272a; }
+  .person { background: #18181b; border: 1px solid #27272a; border-radius: 12px; padding: 16px 24px; text-align: center; min-width: 140px; }
+  .person.lead { border-color: rgba(139,92,246,0.3); }
+  .person .avatar { width: 36px; height: 36px; border-radius: 50%; margin: 0 auto 10px; display: flex; align-items: center; justify-content: center; font-size: 14px; font-weight: 700; color: white; }
+  .a1 { background: linear-gradient(135deg, #8b5cf6, #6d28d9); }
+  .a2 { background: linear-gradient(135deg, #3b82f6, #1d4ed8); }
+  .a3 { background: linear-gradient(135deg, #06b6d4, #0e7490); }
+  .a4 { background: linear-gradient(135deg, #10b981, #047857); }
+  .a5 { background: linear-gradient(135deg, #f59e0b, #b45309); }
+  .person .name { font-size: 14px; font-weight: 600; margin-bottom: 2px; }
+  .person .role { font-size: 12px; color: #52525b; }
+</style></head>
+<body>
+  <h1>Engineering Organization</h1>
+  <div class="row"><div class="person lead"><div class="avatar a1">VP</div><div class="name">Sarah Chen</div><div class="role">VP Engineering</div></div></div>
+  <div class="connector"></div>
+  <div class="branch">
+    <div class="person"><div class="avatar a2">BE</div><div class="name">Alex Rivera</div><div class="role">Backend Lead</div></div>
+    <div class="person"><div class="avatar a3">FE</div><div class="name">Jordan Park</div><div class="role">Frontend Lead</div></div>
+    <div class="person"><div class="avatar a4">IN</div><div class="name">Morgan Lee</div><div class="role">Infra Lead</div></div>
+    <div class="person"><div class="avatar a5">DA</div><div class="name">Casey Ortiz</div><div class="role">Data Lead</div></div>
+  </div>
 </body></html>
 `)
 ```
@@ -260,36 +428,37 @@ render_diagram(type: "html", title: "comparison", width: 1200, height: 700, cont
 
 ## SVG — precise vector graphics
 
-For geometric diagrams, icons, or custom shapes where pixel-perfect control matters:
+For geometric diagrams where pixel-perfect control matters:
 
 ```
-render_diagram(type: "svg", title: "layers", width: 800, height: 600, background: "white", content: `
-<svg viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+render_diagram(type: "svg", title: "layers", width: 800, height: 500, background: "white", content: `
+<svg viewBox="0 0 400 250" xmlns="http://www.w3.org/2000/svg">
   <defs>
     <linearGradient id="g1" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#3b82f6"/><stop offset="100%" stop-color="#2563eb"/></linearGradient>
     <linearGradient id="g2" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#8b5cf6"/><stop offset="100%" stop-color="#7c3aed"/></linearGradient>
     <linearGradient id="g3" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#06b6d4"/><stop offset="100%" stop-color="#0891b2"/></linearGradient>
-    <filter id="shadow"><feDropShadow dx="0" dy="2" stdDeviation="4" flood-opacity="0.15"/></filter>
+    <filter id="s"><feDropShadow dx="0" dy="2" stdDeviation="4" flood-opacity="0.12"/></filter>
   </defs>
-  <rect x="60" y="20" width="280" height="60" rx="12" fill="url(#g1)" filter="url(#shadow)"/>
-  <text x="200" y="55" text-anchor="middle" fill="white" font-family="system-ui" font-size="15" font-weight="600">Presentation Layer</text>
-  <rect x="60" y="110" width="280" height="60" rx="12" fill="url(#g2)" filter="url(#shadow)"/>
-  <text x="200" y="145" text-anchor="middle" fill="white" font-family="system-ui" font-size="15" font-weight="600">Business Logic</text>
-  <rect x="60" y="200" width="280" height="60" rx="12" fill="url(#g3)" filter="url(#shadow)"/>
-  <text x="200" y="235" text-anchor="middle" fill="white" font-family="system-ui" font-size="15" font-weight="600">Data Access Layer</text>
-  <line x1="200" y1="80" x2="200" y2="110" stroke="#475569" stroke-width="2" stroke-dasharray="4"/>
-  <line x1="200" y1="170" x2="200" y2="200" stroke="#475569" stroke-width="2" stroke-dasharray="4"/>
+  <rect x="60" y="15" width="280" height="54" rx="12" fill="url(#g1)" filter="url(#s)"/>
+  <text x="200" y="48" text-anchor="middle" fill="white" font-family="system-ui" font-size="15" font-weight="600">Presentation</text>
+  <rect x="60" y="95" width="280" height="54" rx="12" fill="url(#g2)" filter="url(#s)"/>
+  <text x="200" y="128" text-anchor="middle" fill="white" font-family="system-ui" font-size="15" font-weight="600">Business Logic</text>
+  <rect x="60" y="175" width="280" height="54" rx="12" fill="url(#g3)" filter="url(#s)"/>
+  <text x="200" y="208" text-anchor="middle" fill="white" font-family="system-ui" font-size="15" font-weight="600">Data Access</text>
+  <line x1="200" y1="69" x2="200" y2="95" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="4"/>
+  <line x1="200" y1="149" x2="200" y2="175" stroke="#94a3b8" stroke-width="1.5" stroke-dasharray="4"/>
 </svg>
 `)
 ```
 
 ---
 
-## Tips
+## Design tips
 
-- **Match complexity to the request**: quick question → Mermaid; presentation-quality → polished HTML
-- **Dark backgrounds** look best in chat — use `#0f172a` or `#0a0a1a` as a base
-- **Sizing**: set `width` and `height` to match content — avoid excess whitespace
-- **Keep it focused**: a clear diagram with 5-10 elements communicates better than a busy one with 30
-- **Color palette**: stick to 2-3 accent colors max. Good combos: blue+purple, cyan+green, amber+rose
-- **Typography**: use `-apple-system, system-ui, sans-serif` for clean cross-platform rendering
+- **Match complexity to request** — quick question gets Mermaid; presentation-quality gets polished HTML
+- **Dark backgrounds** look best in chat apps — use `#09090b` (zinc-950) or `#0f172a` (slate-900) as base
+- **Mesh gradient backgrounds** — layer 2-3 `radial-gradient()` calls with `hsla()` colors at 0.2-0.4 opacity for depth without distraction
+- **Glassmorphism** — requires `backdrop-filter: blur(12px) saturate(180%)` with `-webkit-` prefix, a translucent `rgba()` background, and a colorful element behind the glass to be visible
+- **Sizing** — set `width` and `height` to match content. Common sizes: dashboards 1200x600, architecture 1400x900, timelines 1200x420
+- **Color palette** — stick to 2-3 accent colors. Good combos: blue (#3b82f6) + purple (#8b5cf6), cyan (#06b6d4) + green (#10b981)
+- **Keep it focused** — 5-10 elements communicates better than 30. Tufte's principle: maximize data-ink ratio, minimize chartjunk
