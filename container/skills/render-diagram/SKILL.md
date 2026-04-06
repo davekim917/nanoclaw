@@ -20,15 +20,22 @@ You have the `render_diagram` tool. It renders Mermaid diagrams, HTML pages, or 
 - Quick inline sketches where ASCII is clearer (e.g. `A -> B -> C`)
 - Data charts with real datasets (bar, line, scatter) — use Python with plotly/matplotlib and `send_file`
 
-## Choosing the right format
+## Template selection
 
-| Format | Best for | Limitations |
-|--------|----------|-------------|
-| `mermaid` | Quick flowcharts, sequence diagrams, ERDs, Gantt charts | Limited styling, fixed themes |
-| `html` | Full creative control — dashboards, polished layouts, custom visuals | More verbose |
-| `svg` | Precise vector graphics, icons, geometric art | No interactivity in output |
+Match the user's request to the best template below. Use HTML for all of these — the templates section has ready-made examples for each.
 
-**Default to HTML** for most visuals — it produces far better results. **Use Mermaid only** when the user explicitly asks for a quick/simple diagram or when the diagram type maps directly to a Mermaid chart type (sequence diagrams, Gantt charts, ERDs).
+| Request | Template to use |
+|---------|----------------|
+| Architecture, system design, infrastructure | Architecture (mesh gradient) |
+| Metrics, KPIs, status report, weekly update | KPI Dashboard |
+| Vendor eval, pros/cons, option comparison | Comparison Matrix |
+| Roadmap, milestones, project phases | Project Roadmap (timeline) |
+| Services, microservices, platform overview | Glassmorphism Cards |
+| Pipeline, workflow, approval process, steps | Process Flow (vertical) |
+| Launch, release notes, feature announcement | Feature Announcement |
+| Team structure, org chart, hierarchy | Org Chart |
+
+**Fallback to Mermaid** only when: the user explicitly asks for something quick/simple, or the diagram is a sequence diagram, Gantt chart, or ERD (Mermaid handles these natively and HTML doesn't add much).
 
 ---
 
