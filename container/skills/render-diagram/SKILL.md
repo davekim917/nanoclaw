@@ -20,12 +20,18 @@ You have the `render_diagram` tool. It renders Mermaid diagrams, HTML pages, or 
 - Quick inline sketches where ASCII is clearer (e.g. `A -> B -> C`)
 - Data charts with real datasets (bar, line, scatter) — use Python with plotly/matplotlib and `send_file`
 
-## Template selection
+## IMPORTANT: Always use `type: "html"`
 
-Match the user's request to the best template below. Use HTML for all of these — the templates section has ready-made examples for each.
+**You MUST use `type: "html"` for render_diagram calls.** Do NOT use `type: "mermaid"`. The HTML templates below produce far superior visuals — Mermaid produces basic, unstyled diagrams that look unprofessional.
 
-| Request | Template to use |
-|---------|----------------|
+The ONLY exceptions where Mermaid is acceptable:
+- The user explicitly says "quick", "simple", or "mermaid"
+- Sequence diagrams or Gantt charts (Mermaid handles these well)
+
+For everything else — architecture, flowcharts, dashboards, timelines, comparisons, org charts — use `type: "html"` and adapt the matching template below:
+
+| Request | Template to adapt |
+|---------|-------------------|
 | Architecture, system design, infrastructure | Architecture (mesh gradient) |
 | Metrics, KPIs, status report, weekly update | KPI Dashboard |
 | Vendor eval, pros/cons, option comparison | Comparison Matrix |
@@ -34,8 +40,6 @@ Match the user's request to the best template below. Use HTML for all of these �
 | Pipeline, workflow, approval process, steps | Process Flow (vertical) |
 | Launch, release notes, feature announcement | Feature Announcement |
 | Team structure, org chart, hierarchy | Org Chart |
-
-**Fallback to Mermaid** only when: the user explicitly asks for something quick/simple, or the diagram is a sequence diagram, Gantt chart, or ERD (Mermaid handles these natively and HTML doesn't add much).
 
 ---
 
