@@ -28,7 +28,7 @@ You have the `render_diagram` tool. It renders Mermaid diagrams, HTML pages, or 
 | `html` | Full creative control — dashboards, polished layouts, custom visuals | More verbose |
 | `svg` | Precise vector graphics, icons, geometric art | No interactivity in output |
 
-**Default to Mermaid** for quick structural diagrams. **Use HTML** when the user wants something polished or visually impressive.
+**Default to HTML** for most visuals — it produces far better results. **Use Mermaid only** when the user explicitly asks for a quick/simple diagram or when the diagram type maps directly to a Mermaid chart type (sequence diagrams, Gantt charts, ERDs).
 
 ---
 
