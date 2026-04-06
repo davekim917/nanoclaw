@@ -1161,7 +1161,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           // Responses within the 60s throttle window after a prior extraction
           // are skipped — acceptable since extraction is non-critical.
           try {
-            if (agentResponseText.trim() && !isExtractionThrottled(group.folder)) {
+            if (
+              agentResponseText.trim() &&
+              !isExtractionThrottled(group.folder)
+            ) {
               const recentMsgs = getRecentMessages(chatJid, 10).map((m) => ({
                 id: m.id,
                 chat_jid: m.chat_jid,
@@ -1172,11 +1175,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
                 is_from_me: !!m.is_from_me,
                 is_bot_message: !!m.is_bot_message,
               }));
-              extractMemoriesAsync(
-                group.folder,
-                recentMsgs,
-                agentResponseText,
-              );
+              extractMemoriesAsync(group.folder, recentMsgs, agentResponseText);
               // Reset so the next idle pass only sees new responses
               agentResponseText = '';
             }
