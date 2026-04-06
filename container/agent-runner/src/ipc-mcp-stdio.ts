@@ -9,6 +9,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import fs from 'fs';
 import path from 'path';
+import { execFileSync } from 'child_process';
 import { CronExpressionParser } from 'cron-parser';
 
 const IPC_DIR = '/workspace/ipc';
@@ -17,6 +18,7 @@ const TASKS_DIR = path.join(IPC_DIR, 'tasks');
 const OUTBOUND_FILES_DIR = path.join(IPC_DIR, 'outbound_files');
 
 const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB
+const CSS_COLOR_RE = /^(#[0-9a-fA-F]{3,8}|[a-zA-Z]+|rgba?\(\s*[\d.,\s%]+\)|hsla?\(\s*[\d.,\s%deg]+\)|transparent)$/;
 
 // Allowlisted path prefixes for send_file (prevents staging mounted credentials)
 const ALLOWED_FILE_PREFIXES = ['/tmp/', '/workspace/group/', '/workspace/project/', '/workspace/extra/'];
@@ -175,6 +177,109 @@ server.tool(
 
     writeIpcFile(MESSAGES_DIR, data);
     return { content: [{ type: 'text' as const, text: `File "${filename}" sent.` }] };
+  },
+);
+
+server.tool(
+  'render_diagram',
+  'Render a Mermaid diagram, HTML page, or SVG graphic as a polished PNG image and send it to the chat. Use this when you want a professional-looking visual instead of ASCII art — flowcharts, architecture diagrams, sequence diagrams, org charts, timelines, or any rich visual. For data charts (bar, line, scatter), prefer Python with plotly/matplotlib and send_file instead.',
+  {
+    content: z.string().describe('The content to render — Mermaid diagram syntax, a full HTML page, or SVG markup'),
+    type: z.enum(['mermaid', 'html', 'svg']).describe('mermaid: diagram syntax (flowchart, sequence, etc.), html: full HTML page with CSS, svg: raw SVG markup'),
+    caption: z.string().optional().describe('Caption shown alongside the image in chat'),
+    title: z.string().optional().describe('Short slug for the filename (e.g. "architecture" produces architecture.png)'),
+    theme: z.enum(['default', 'dark', 'forest', 'neutral']).optional().describe('Mermaid color theme. Ignored for html/svg. Default: "default"'),
+    width: z.number().int().min(100).max(4096).optional().describe('Viewport width in pixels. Default: 1200'),
+    height: z.number().int().min(100).max(4096).optional().describe('Viewport height in pixels (html/svg only — Mermaid auto-sizes height). Default: 800'),
+    background: z.string().optional().describe('Background color as CSS value (e.g. "white", "#1a1a2e", "transparent"). Default: "white"'),
+  },
+  { readOnlyHint: false },
+  async (args) => {
+    const id = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const slug = (args.title || 'diagram').replace(/[^a-z0-9-]/gi, '-').toLowerCase().slice(0, 40);
+    const outputPath = `/tmp/${slug}-${id}.png`;
+    const width = args.width || 1200;
+    const height = args.height || 800;
+    const bg = args.background || 'white';
+    const theme = args.theme || 'default';
+
+    if (!CSS_COLOR_RE.test(bg)) {
+      return { content: [{ type: 'text' as const, text: `Invalid background color: "${bg}".` }], isError: true };
+    }
+
+    try {
+      if (args.type === 'mermaid') {
+        const inputPath = `/tmp/mmd-${id}.mmd`;
+        fs.writeFileSync(inputPath, args.content);
+        execFileSync('mmdc', [
+          '-i', inputPath, '-o', outputPath,
+          '-p', '/app/puppeteer-config.json',
+          '-t', theme, '-b', bg, '-w', String(width),
+        ], { timeout: 30000, stdio: 'pipe' });
+        try { fs.unlinkSync(inputPath); } catch {}
+      } else {
+        let html = args.content;
+        if (args.type === 'svg') {
+          html = `<!DOCTYPE html><html><head><style>body{margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh;background:${bg};}</style></head><body>${args.content}</body></html>`;
+        }
+        const inputPath = `/tmp/html-${id}.html`;
+        fs.writeFileSync(inputPath, html);
+        execFileSync('chromium', [
+          '--headless', '--no-sandbox', '--disable-setuid-sandbox', '--disable-gpu',
+          '--disable-file-access-from-files',
+          `--screenshot=${outputPath}`, `--window-size=${width},${height}`,
+          `file://${inputPath}`,
+        ], { timeout: 30000, stdio: 'pipe' });
+        try { fs.unlinkSync(inputPath); } catch {}
+      }
+
+      let stat: fs.Stats;
+      try {
+        stat = fs.statSync(outputPath);
+      } catch {
+        return { content: [{ type: 'text' as const, text: 'Render produced no output file.' }], isError: true };
+      }
+      if (stat.size === 0) {
+        try { fs.unlinkSync(outputPath); } catch {}
+        return { content: [{ type: 'text' as const, text: 'Render produced empty file.' }], isError: true };
+      }
+      if (stat.size > MAX_FILE_SIZE) {
+        try { fs.unlinkSync(outputPath); } catch {}
+        return { content: [{ type: 'text' as const, text: `Rendered file too large (${(stat.size / 1024 / 1024).toFixed(1)}MB). Max ${MAX_FILE_SIZE / 1024 / 1024}MB.` }], isError: true };
+      }
+
+      const filename = `${slug}.png`;
+      const stagingDir = path.join(OUTBOUND_FILES_DIR, id);
+      fs.mkdirSync(stagingDir, { recursive: true });
+      fs.copyFileSync(outputPath, path.join(stagingDir, filename));
+      try { fs.unlinkSync(outputPath); } catch {}
+
+      writeIpcFile(MESSAGES_DIR, {
+        type: 'message',
+        chatJid,
+        text: args.caption || undefined,
+        groupFolder,
+        threadId,
+        timestamp: new Date().toISOString(),
+        files: [{
+          path: `/workspace/ipc/outbound_files/${id}/${filename}`,
+          filename,
+          mimeType: 'image/png',
+        }],
+      });
+
+      return { content: [{ type: 'text' as const, text: `Rendered and sent "${filename}" (${(stat.size / 1024).toFixed(0)}KB).` }] };
+    } catch (err: unknown) {
+      for (const f of [`/tmp/mmd-${id}.mmd`, `/tmp/html-${id}.html`, outputPath]) {
+        try { fs.unlinkSync(f); } catch {}
+      }
+      const msg = err instanceof Error ? err.message : String(err);
+      const stderr = (err as { stderr?: Buffer })?.stderr?.toString().slice(0, 500) || '';
+      return {
+        content: [{ type: 'text' as const, text: `Render failed: ${msg}${stderr ? '\n' + stderr : ''}` }],
+        isError: true,
+      };
+    }
   },
 );
 
