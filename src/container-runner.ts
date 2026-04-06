@@ -28,6 +28,7 @@ import {
   escapeRegex,
 } from './config.js';
 import { readEnvFile, readEnvFileMatching } from './env.js';
+import { registerSecrets } from './secret-scrubber.js';
 import {
   assertValidThreadId,
   resolveGroupFolderPath,
@@ -3324,6 +3325,8 @@ export async function runContainerAgent(
     // Pass non-HTTP secrets via stdin (dbt login, gcloud paths, Render PG/Redis).
     // HTTP API credentials are injected by the OneCLI proxy at request time.
     input.secrets = readSecrets(group.folder, tools);
+    // Register secret values so outbound messages get scrubbed
+    registerSecrets(input.secrets);
     // Pass tools restriction so agent-runner can gate MCP servers
     input.tools = group.containerConfig?.tools;
     container.stdin.write(JSON.stringify(input));

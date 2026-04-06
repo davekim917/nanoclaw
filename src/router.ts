@@ -1,4 +1,5 @@
 import { Channel, NewMessage } from './types.js';
+import { scrubSecrets } from './secret-scrubber.js';
 import { formatLocalTime } from './timezone.js';
 import { parseTextStyles, ChannelType } from './text-styles.js';
 
@@ -43,7 +44,8 @@ export function extractThreadTitle(raw: string): string | undefined {
 export function formatOutbound(rawText: string, channel?: ChannelType): string {
   const text = stripInternalTags(rawText);
   if (!text) return '';
-  return channel ? parseTextStyles(text, channel) : text;
+  const styled = channel ? parseTextStyles(text, channel) : text;
+  return scrubSecrets(styled);
 }
 
 export function routeOutbound(
