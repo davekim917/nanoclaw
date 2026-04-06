@@ -19,6 +19,12 @@ import { Memory, NewMessage } from './types.js';
 const THROTTLE_MS = 60_000;
 const lastExtraction = new Map<string, number>();
 
+/** Check if extraction is throttled for a group (exported for call-site guards). */
+export function isExtractionThrottled(groupFolder: string): boolean {
+  const last = lastExtraction.get(groupFolder) ?? 0;
+  return Date.now() - last < THROTTLE_MS;
+}
+
 // Tunable prompt template — loaded from file if present, otherwise default
 const PROMPT_TEMPLATE_PATH = path.join(
   process.cwd(),

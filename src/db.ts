@@ -1620,11 +1620,12 @@ export function getRecentMessages(
   text: string;
   timestamp: string;
   is_from_me: number;
+  is_bot_message: number;
 }> {
   return db
     .prepare(
-      `SELECT id, chat_jid, sender AS sender_jid, sender_name,
-              content AS text, timestamp, is_from_me
+      `SELECT id, chat_jid, sender, sender_name,
+              content AS text, timestamp, is_from_me, is_bot_message
        FROM messages
        WHERE chat_jid = ? AND content != '' AND content IS NOT NULL
        ORDER BY timestamp DESC LIMIT ?`,
@@ -1637,6 +1638,7 @@ export function getRecentMessages(
     text: string;
     timestamp: string;
     is_from_me: number;
+    is_bot_message: number;
   }>;
 }
 

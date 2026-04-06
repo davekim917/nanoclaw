@@ -103,7 +103,10 @@ import {
   getInMemoryGateByJid,
   resolveInMemoryGate,
 } from './ipc.js';
-import { extractMemoriesAsync } from './memory-extractor.js';
+import {
+  extractMemoriesAsync,
+  isExtractionThrottled,
+} from './memory-extractor.js';
 import { getMemoryBlock } from './memory-store.js';
 import {
   ensureCommitDigestTask,
@@ -1153,6 +1156,37 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         throttledTouchActivity(sessionKey);
 
         if (result.status === 'success' && result.idle) {
+          // Extract memories mid-session so multi-turn IPC conversations
+          // don't defer extraction until the container times out.
+          // Responses within the 60s throttle window after a prior extraction
+          // are skipped — acceptable since extraction is non-critical.
+          try {
+            if (agentResponseText.trim() && !isExtractionThrottled(group.folder)) {
+              const recentMsgs = getRecentMessages(chatJid, 10).map((m) => ({
+                id: m.id,
+                chat_jid: m.chat_jid,
+                sender: m.sender,
+                sender_name: m.sender_name,
+                content: m.text,
+                timestamp: m.timestamp,
+                is_from_me: !!m.is_from_me,
+                is_bot_message: !!m.is_bot_message,
+              }));
+              extractMemoriesAsync(
+                group.folder,
+                recentMsgs,
+                agentResponseText,
+              );
+              // Reset so the next idle pass only sees new responses
+              agentResponseText = '';
+            }
+          } catch (err) {
+            logger.warn(
+              { err, group: group.name },
+              'Mid-session memory extraction setup failed (non-fatal)',
+            );
+          }
+
           // Agent is truly idle (between queries, waiting for new IPC
           // input).  Safe to mark idle and allow preemption.
           const ipcSentOutput = ipcOutputSentJids.has(chatJid);
@@ -1275,8 +1309,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   // Success — persist the cursor advance now that the container has completed.
   saveState();
 
-  // Fire-and-forget memory extraction from the conversation
-  extractMemoriesAsync(group.folder, missedMessages, agentResponseText);
+  // Fire-and-forget memory extraction — catches any final response that
+  // wasn't covered by mid-session extraction (e.g., container exited without
+  // emitting an idle marker). Uses agentResponseText which may be empty if
+  // the mid-session path already reset it; the 60s throttle handles overlap.
+  if (agentResponseText.trim()) {
+    extractMemoriesAsync(group.folder, missedMessages, agentResponseText);
+  }
 
   // If we truncated at a second trigger, re-enqueue so the next trigger gets its
   // own container. Use setImmediate so this runs after runForGroup's finally block
