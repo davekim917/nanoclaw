@@ -2065,8 +2065,6 @@ function buildVolumeMounts(
     CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING: '1',
     // Max thinking budget (Opus ceiling); lower models clamp automatically
     MAX_THINKING_TOKENS: '127999',
-    // Enable LSP tool (language server integration)
-    ENABLE_LSP_TOOL: '1',
     // Enable ToolSearch (deferred tool discovery)
     ENABLE_TOOL_SEARCH: 'true',
   };
