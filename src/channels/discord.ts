@@ -1233,7 +1233,7 @@ export class DiscordChannel implements Channel {
       'to find verbatim copies of files from openai/codex-plugin-cc and their pinned upstream commit SHAs. ' +
       'Pinned SHAs in that file are stored as 7-character prefixes.\n\n' +
       'For each entry, fetch the latest upstream commit SHA (also as a 7-char prefix to match the table format):\n' +
-      "`gh api \"repos/openai/codex-plugin-cc/commits?path=<upstream-path>&per_page=1\" --jq '.[0].sha[0:7]'`\n\n" +
+      '`gh api "repos/openai/codex-plugin-cc/commits?path=<upstream-path>&per_page=1" --jq \'.[0].sha[0:7]\'`\n\n' +
       'If the latest 7-char SHA differs from the pinned 7-char SHA, the file has drifted.\n\n' +
       '## Step 3 — Present a unified audit table\n' +
       'Show ALL items in one table:\n' +
@@ -1257,7 +1257,7 @@ export class DiscordChannel implements Channel {
       '1. /workspace/plugins/codex is mounted with the latest pulled by nanoclaw-plugins-update.timer — ' +
       'read the new file content directly from there ' +
       '(e.g. /workspace/plugins/codex/plugins/codex/prompts/adversarial-review.md).\n' +
-      "2. Get the new 7-char SHA: `gh api \"repos/openai/codex-plugin-cc/commits?path=<path>&per_page=1\" --jq '.[0].sha[0:7]'`\n" +
+      '2. Get the new 7-char SHA: `gh api "repos/openai/codex-plugin-cc/commits?path=<path>&per_page=1" --jq \'.[0].sha[0:7]\'`\n' +
       '3. Clone the bootstrap repo to a writable temp dir (clean any prior state first):\n' +
       '   `rm -rf /tmp/bootstrap-update && gh repo clone davekim917/bootstrap /tmp/bootstrap-update`\n' +
       '4. Copy the new file content into ' +

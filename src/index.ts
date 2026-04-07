@@ -53,6 +53,7 @@ import {
   ProgressEvent,
   cleanupOrphanWorktrees,
   cleanupThreadWorkspace,
+  getSessionTranscriptPath,
   runContainerAgent,
   startGoogleTokenRefresh,
   startGranolaTokenRefresh,
@@ -1738,18 +1739,47 @@ async function runAgent(
 
       // Detect stale/corrupt session — clear it so the next retry starts fresh.
       // The session .jsonl can go missing after a crash mid-write, manual
-      // deletion, or disk-full. The existing backoff in group-queue.ts
-      // handles the retry; we just need to remove the broken session ID.
-      const isStaleSession =
-        sessionId &&
-        output.error &&
-        /no conversation found|ENOENT.*\.jsonl|session.*not found/i.test(
-          output.error,
-        );
+      // deletion, disk-full, or a permission issue on the projects/ dir
+      // (docker creating bind-mount intermediates as root before the host
+      // pre-creates them). The existing backoff in group-queue.ts handles
+      // the retry; we just need to remove the broken session ID.
+      let isStaleSession = false;
+      let staleReason = '';
+      if (sessionId && output.error) {
+        if (
+          /no conversation found|ENOENT.*\.jsonl|session.*not found/i.test(
+            output.error,
+          )
+        ) {
+          isStaleSession = true;
+          staleReason = 'sdk-error-string';
+        } else if (
+          /Query closed before response received/i.test(output.error)
+        ) {
+          // Generic SDK error during a resume request — could be many things
+          // (MCP crash, network blip), but if the transcript file is also
+          // missing on disk, it's almost certainly stale. Verify before
+          // clearing so we don't drop sessions over transient failures.
+          const transcriptPath = getSessionTranscriptPath(
+            group.folder,
+            threadId,
+            sessionId,
+          );
+          if (!fs.existsSync(transcriptPath)) {
+            isStaleSession = true;
+            staleReason = 'generic-error-with-missing-transcript';
+          }
+        }
+      }
 
       if (isStaleSession) {
         logger.warn(
-          { group: group.name, staleSessionId: sessionId, error: output.error },
+          {
+            group: group.name,
+            staleSessionId: sessionId,
+            error: output.error,
+            reason: staleReason,
+          },
           'Stale session detected — clearing for next retry',
         );
         sessions.delete(sessionKey);
