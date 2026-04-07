@@ -110,7 +110,7 @@ The container buildkit caches the build context aggressively. `--no-cache` alone
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **nanoclaw** (1259 symbols, 3385 relationships, 99 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **nanoclaw** (1266 symbols, 3413 relationships, 100 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 
