@@ -56,6 +56,35 @@ const onecli = new OneCLI({ url: ONECLI_URL });
 // If Claude Code changes this convention, update here.
 const CLAUDE_CODE_PROJECTS_DIR = '-workspace-group';
 
+/**
+ * Compute the on-disk path where Claude Code stores a session's transcript jsonl.
+ * Returns the path even if the file doesn't exist — callers should fs.existsSync()
+ * to verify. Used by the stale-session auto-recovery in src/index.ts to confirm
+ * a transcript is genuinely missing before clearing the session row.
+ */
+export function getSessionTranscriptPath(
+  groupFolder: string,
+  threadId: string | undefined,
+  sessionId: string,
+): string {
+  const sessionsBase = threadId
+    ? path.join(
+        DATA_DIR,
+        'sessions',
+        groupFolder,
+        'threads',
+        threadId,
+        '.claude',
+      )
+    : path.join(DATA_DIR, 'sessions', groupFolder, '.claude');
+  return path.join(
+    sessionsBase,
+    'projects',
+    CLAUDE_CODE_PROJECTS_DIR,
+    `${sessionId}.jsonl`,
+  );
+}
+
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
 const PROGRESS_START_MARKER = '---NANOCLAW_PROGRESS_START---';
@@ -2053,6 +2082,23 @@ function buildVolumeMounts(
     'memory',
   );
   fs.mkdirSync(groupMemoryDir, { recursive: true });
+
+  // Pre-create the thread-scoped projects dir before docker mounts the
+  // container. The deeply-nested memory mount below (containerPath
+  // /home/node/.claude/projects/<dir>/memory) requires the intermediate
+  // path to exist inside the container. Since the parent /home/node/.claude
+  // is itself a bind mount from the host, missing intermediates would be
+  // created by the docker daemon as ROOT, locking out the container's uid
+  // 1001 user from writing session jsonls — sessions then appear to "save"
+  // (in-memory state works) but vanish on exit, so resume always fails with
+  // a generic "Query closed before response received" the next time around.
+  if (threadId) {
+    fs.mkdirSync(
+      path.join(groupSessionsDir, 'projects', CLAUDE_CODE_PROJECTS_DIR),
+      { recursive: true },
+    );
+  }
+
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
   const requiredEnv: Record<string, string> = {
     // Enable agent swarms (subagent orchestration)
