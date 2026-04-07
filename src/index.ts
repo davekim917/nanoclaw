@@ -147,6 +147,10 @@ import {
   indexThreadSummaries,
 } from './thread-search.js';
 import { checkUserOverride, shouldResetSession } from './topic-classifier.js';
+import {
+  classifyComplexity,
+  ComplexityResult,
+} from './complexity-classifier.js';
 import { Attachment, Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
 
@@ -287,6 +291,48 @@ function resolveModel(
   const groupModel = group.containerConfig?.model;
   if (groupModel) return resolveAlias(groupModel);
   return DEFAULT_MODEL;
+}
+
+/**
+ * Evaluate whether a batch of incoming messages qualifies for a dynamic
+ * downgrade to Haiku. Shared by both the initial-spawn path
+ * (processGroupMessages) and the piped path (startMessageLoop). Call sites
+ * must gate on `group.containerConfig.dynamicModelDowngrade === true`
+ * before invoking — this helper assumes opt-in and does no guard check of
+ * its own, so the hot path for non-opted-in groups stays cheap.
+ *
+ * Downgrades only when EVERY non-blank message in the batch classifies as
+ * TRIVIAL. Classifying only the last message would let batches like
+ * ["fix the auth bug", "lol"] route the work request to Haiku.
+ *
+ * Uses `getTriggerPattern(group.trigger)` for the trigger strip so groups
+ * with a custom trigger string still benefit from the downgrade.
+ */
+function evaluateDynamicDowngrade(
+  group: RegisteredGroup,
+  messages: NewMessage[],
+  opts: {
+    hasOverride: boolean;
+    hasAttachments: boolean;
+    hasPendingGate: boolean;
+    sessionModel?: string | null;
+  },
+): { downgrade: boolean; reason?: ComplexityResult['reason'] } {
+  if (opts.hasOverride || opts.hasAttachments || opts.hasPendingGate) {
+    return { downgrade: false };
+  }
+  const triggerPattern = getTriggerPattern(group.trigger);
+  let lastReason: ComplexityResult['reason'] | undefined;
+  for (const msg of messages) {
+    const cleaned = msg.content.replace(triggerPattern, '').trim();
+    if (!cleaned) continue;
+    const result = classifyComplexity(cleaned, !!opts.sessionModel);
+    if (result.complexity !== 'TRIVIAL') return { downgrade: false };
+    lastReason = result.reason;
+  }
+  return lastReason
+    ? { downgrade: true, reason: lastReason }
+    : { downgrade: false };
 }
 
 interface EffortOverrideResult {
@@ -822,6 +868,26 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
   } else {
     model = resolveModel(group, undefined, sessionModel);
+  }
+
+  // Dynamic model downgrade — initial-spawn path. Gates are intercepted
+  // upstream so hasPendingGate is always false here.
+  if (group.containerConfig?.dynamicModelDowngrade === true) {
+    const downgrade = evaluateDynamicDowngrade(group, missedMessages, {
+      hasOverride: !!overrideResult,
+      hasAttachments: missedMessages.some(
+        (m) => m.attachments && m.attachments.length > 0,
+      ),
+      hasPendingGate: false,
+      sessionModel,
+    });
+    if (downgrade.downgrade) {
+      logger.info(
+        { group: group.name, reason: downgrade.reason, originalModel: model },
+        'Dynamic downgrade: trivial message batch, switching to Haiku',
+      );
+      model = MODEL_ALIASES.haiku;
+    }
   }
 
   // Effort resolution: per-message flag > session sticky > default
@@ -1826,14 +1892,18 @@ async function startMessageLoop(): Promise<void> {
             }
           }
 
-          // Intercept gate approve/cancel BEFORE piping. The plugin hook is
-          // blocking inside the container — piped messages sit unread in stdin.
-          // Resolve the gate and write the IPC response file here instead.
+          // Pre-pipe intercepts: gate resolution, then dynamic model downgrade.
+          // Order matters: the gate approve/cancel intercept MUST run before
+          // the downgrade check, otherwise gate replies like "ok"/"no"/"nope"
+          // (which are also classifier TRIVIAL words) would fire a spurious
+          // model_switch IPC mid-tool-call, swapping the query to Haiku
+          // before the gate resolves.
+          let pipeGate: ReturnType<typeof getInMemoryGateByJid> = undefined;
           if (canPipe && messagesToSend.length > 0) {
             const gateJid = incomingThreadId
               ? `${parentJid}:thread:${incomingThreadId}`
               : parentJid;
-            const pipeGate = getInMemoryGateByJid(gateJid);
+            pipeGate = getInMemoryGateByJid(gateJid);
             if (pipeGate) {
               const rawContent =
                 messagesToSend[messagesToSend.length - 1].content;
@@ -1866,6 +1936,47 @@ async function startMessageLoop(): Promise<void> {
                   attachmentCache.delete(msg.id);
                 continue;
               }
+            }
+          }
+
+          // Dynamic model downgrade for piped messages. The hasPendingGate
+          // guard catches the "ok looks fine" class: classifier marks it
+          // TRIVIAL via vocab but the exact-match gate regex above doesn't,
+          // so without this guard we'd still send a spurious mid-tool-call
+          // model_switch.
+          if (
+            canPipe &&
+            group.containerConfig?.dynamicModelDowngrade === true
+          ) {
+            const pipeSessionKey = buildSessionKey(
+              group.folder,
+              incomingThreadId,
+            );
+            const pipeSessionModel = getSessionModel(pipeSessionKey);
+            const pipeDowngrade = evaluateDynamicDowngrade(
+              group,
+              messagesToSend,
+              {
+                hasOverride: !!extractModelOverride(messagesToSend),
+                hasAttachments: pipeAttachments.length > 0,
+                hasPendingGate: !!pipeGate,
+                sessionModel: pipeSessionModel,
+              },
+            );
+            if (
+              pipeDowngrade.downgrade &&
+              resolveModel(group, undefined, pipeSessionModel) !==
+                MODEL_ALIASES.haiku
+            ) {
+              queue.sendControlMessage(parentJid, incomingThreadId, {
+                type: 'model_switch',
+                model: MODEL_ALIASES.haiku,
+                oneshot: true,
+              });
+              logger.info(
+                { chatJid, reason: pipeDowngrade.reason },
+                'Dynamic downgrade: trivial piped message batch',
+              );
             }
           }
 

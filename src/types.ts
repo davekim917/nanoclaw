@@ -66,6 +66,7 @@ export interface ContainerConfig {
   notifyJid?: string; // Additional channel for ship log / backlog notifications (sends to this JID in addition to the default)
   watchGithub?: string[]; // GitHub orgs or owner/repo to scan for team PRs in daily summary (e.g. ["Illysium-ai", "davekim917/nanoclaw"])
   plugins?: string[]; // Plugin repos to mount from ~/plugins/ (e.g. ["bootstrap", "omni-claude-skills"]). Undefined = all plugins.
+  dynamicModelDowngrade?: boolean; // Auto-downgrade trivial messages to Haiku (default: false, opt-in per group)
 }
 
 export interface RegisteredGroup {

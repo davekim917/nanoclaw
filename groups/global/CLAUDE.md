@@ -64,7 +64,7 @@ Claiming completion without verification evidence is a rule violation.
 - Read and write files in your workspace
 - Run bash commands in your sandbox
 - Clone repos, create branches, make code changes, and open PRs via `gh` and `git`
-- Read and send emails via Gmail MCP
+- Read and send emails via `gws gmail` CLI
 - Schedule tasks to run later or on a recurring basis
 - Send messages back to the chat
 

@@ -576,6 +576,110 @@ function isToolEnabled(tools: string[] | undefined, name: string): boolean {
 // via Bash + container skills (gws-gmail-*, gws-calendar-*).
 // No MCP tool arrays needed — access is controlled by credential mounting.
 
+/**
+ * Build a runtime capability manifest from the per-group tools list,
+ * for injection into the system prompt.
+ *
+ * `tools === undefined` means "all tools available" (NanoClaw's legacy
+ * default for unrestricted groups) — emit the full manifest in that case.
+ * `tools === []` means "no tools" — return undefined.
+ */
+function buildCapabilityManifest(
+  tools: string[] | undefined,
+): string | undefined {
+  if (tools && tools.length === 0) return undefined;
+
+  const capabilities: string[] = [];
+
+  // Google Workspace services (gws CLI)
+  if (isToolEnabled(tools, 'gmail')) {
+    capabilities.push(
+      '- **Gmail (read + send)** — `gws gmail` CLI. Skills: gws-gmail-read, gws-gmail-send, gws-gmail-reply, gws-gmail-forward, gws-gmail-triage, gws-gmail-watch.',
+    );
+  } else if (isToolEnabled(tools, 'gmail-readonly')) {
+    capabilities.push(
+      '- **Gmail (read-only)** — `gws gmail` CLI. Skills: gws-gmail-read, gws-gmail-triage.',
+    );
+  }
+  if (isToolEnabled(tools, 'calendar')) {
+    capabilities.push(
+      '- **Google Calendar** — `gws calendar` CLI. Skills: gws-calendar-agenda, gws-calendar-insert.',
+    );
+  }
+  if (isToolEnabled(tools, 'google-workspace')) {
+    capabilities.push(
+      '- **Google Drive / Sheets / Docs / Slides** — `gws drive|sheets|docs|slides` CLI.',
+    );
+  }
+
+  // Data tools
+  if (isToolEnabled(tools, 'snowflake')) {
+    capabilities.push('- **Snowflake** — `snowsql` CLI and dbt profiles.');
+  }
+  if (isToolEnabled(tools, 'dbt')) {
+    capabilities.push('- **dbt** — `dbt` CLI with profiles in `~/.dbt/profiles.yml`.');
+  }
+
+  // Cloud
+  if (isToolEnabled(tools, 'aws')) {
+    capabilities.push('- **AWS** — `aws` CLI with configured credentials.');
+  }
+  if (isToolEnabled(tools, 'gcloud')) {
+    capabilities.push('- **Google Cloud** — `gcloud` CLI with configured credentials.');
+  }
+
+  // VCS / code review
+  if (isToolEnabled(tools, 'github')) {
+    capabilities.push(
+      '- **GitHub** — `gh` CLI and `git push` with configured credentials.',
+    );
+  }
+
+  // PaaS / infra
+  if (isToolEnabled(tools, 'render')) {
+    capabilities.push('- **Render** — Render API access via `RENDER_API_KEY`.');
+  }
+  if (isToolEnabled(tools, 'railway')) {
+    capabilities.push(
+      '- **Railway** — Railway API access via `RAILWAY_API_TOKEN`.',
+    );
+  }
+
+  // Observability / analytics
+  if (isToolEnabled(tools, 'braintrust')) {
+    capabilities.push(
+      '- **Braintrust** — evals and experiments via Braintrust API.',
+    );
+  }
+  if (isToolEnabled(tools, 'omni')) {
+    capabilities.push('- **Omni** — dashboards and queries via Omni API.');
+  }
+
+  // Browser automation
+  if (isToolEnabled(tools, 'browser-auth')) {
+    capabilities.push(
+      '- **Browser Auth** — headless browser login flow via Playwright.',
+    );
+  }
+
+  // Search / research
+  if (isToolEnabled(tools, 'exa')) {
+    capabilities.push(
+      '- **Exa** — web search, research, and crawling via MCP tools.',
+    );
+  }
+
+  // Meetings
+  if (isToolEnabled(tools, 'granola')) {
+    capabilities.push(
+      '- **Granola** — meeting transcripts and notes via MCP tools.',
+    );
+  }
+
+  if (capabilities.length === 0) return undefined;
+
+  return `## Runtime Capabilities\n\nThe following tools and services are configured for this session. If a tool fails at runtime (auth error, missing credential, network issue), surface the error rather than retrying blindly.\n\n${capabilities.join('\n')}`;
+}
 
 function buildAllowedTools(tools: string[] | undefined): string[] {
   const allowed = [
@@ -884,7 +988,9 @@ async function runQuery(
       allowedTools: buildAllowedTools(containerInput.tools),
       disallowedTools: buildDisallowedTools(containerInput.tools),
       env: sdkEnv,
-      ...(sdkEnv['CLAUDE_CODE_USE_MODEL'] ? { model: sdkEnv['CLAUDE_CODE_USE_MODEL'] } : {}),
+      // Only pass model on fresh sessions — the SDK rejects model changes on
+      // resumed sessions via the options.  setModel() handles mid-session switches.
+      ...(!sessionId && sdkEnv['CLAUDE_CODE_USE_MODEL'] ? { model: sdkEnv['CLAUDE_CODE_USE_MODEL'] } : {}),
       permissionMode: 'bypassPermissions',
       allowDangerouslySkipPermissions: true,
       settingSources: ['project', 'user'],
@@ -1137,7 +1243,9 @@ async function main(): Promise<void> {
     }
   }
 
-  // Set model for this container run (per-message flag > session sticky > per-group > global default)
+  // Set the per-run model in sdkEnv. drainIpcInput() reads this as the
+  // baseline for one-shot downgrade reverts; runQuery() suppresses the
+  // SDK `model` option on resumed sessions so passing it here is safe.
   if (containerInput.model) {
     sdkEnv['CLAUDE_CODE_USE_MODEL'] = containerInput.model;
     log(`Using model: ${containerInput.model}`);
@@ -1195,8 +1303,13 @@ async function main(): Promise<void> {
       toneNote = `Your default tone profile is "${containerInput.tone}" (no profile file found — use this as a style hint). Use the get_tone_profile tool to load profiles for email drafts or tone overrides.`;
     }
   }
+  // Runtime capability manifest — tells the agent what tools/services are actually
+  // available in this session, derived from containerInput.tools.  Placed last so it
+  // takes precedence over any contradictory static CLAUDE.md claims.
+  const capabilityManifest = buildCapabilityManifest(containerInput.tools);
+
   // Static system prompt parts (everything except model identity, which changes per query)
-  const staticPromptParts = [globalClaudeMd, channelFormatting, identityNote, toneNote].filter(Boolean);
+  const staticPromptParts = [globalClaudeMd, channelFormatting, identityNote, toneNote, capabilityManifest].filter(Boolean);
 
   // Build the full system prompt with the current model identity.
   // Called per runQuery() so the model note reflects IPC model switches.
