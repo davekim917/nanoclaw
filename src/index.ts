@@ -238,6 +238,115 @@ interface ModelOverrideResult {
 }
 
 /**
+ * Reduce a model id (`claude-opus-4-6[1m]`, `claude-haiku-4-5-20251001`, ...)
+ * down to its family — `opus`, `sonnet`, or `haiku`. Used to verify a `-m`
+ * switch by comparing the requested model against the model id(s) the SDK
+ * actually billed for the turn (modelUsage keys vary in suffix). Returns the
+ * raw lowercased input for unrecognised models so unknown ids only match
+ * themselves.
+ */
+function getModelFamily(model: string): string {
+  if (!model) return '';
+  const m = model.toLowerCase();
+  if (m.includes('opus')) return 'opus';
+  if (m.includes('sonnet')) return 'sonnet';
+  if (m.includes('haiku')) return 'haiku';
+  return m;
+}
+
+/**
+ * A `-m`/`-m1` switch the host has applied but not yet confirmed to the user.
+ * The confirmation message is held back until a result message arrives whose
+ * `modelsUsedThisTurn` actually matches the requested family — that's the
+ * only signal proving the SDK honoured the switch (setModel() resolves even
+ * when the SDK silently keeps the prior model).
+ */
+interface PendingModelConfirmation {
+  family: string; // 'opus' | 'sonnet' | 'haiku' (or full id for unknowns)
+  message: string; // the body to send (no leading marker), e.g. "Switched to opus for this session"
+  chatJid: string;
+  threadId?: string;
+  // True after we've already sent a ❌ failure for this entry — guards against
+  // double-firing if multiple results come in before cleanup runs.
+  failed?: boolean;
+}
+
+/**
+ * Sessions with a deferred model-switch confirmation. Keyed by sessionKey
+ * (`buildSessionKey(group.folder, threadId)`) so per-thread switches don't
+ * collide with each other or with parent-level switches in the same group.
+ */
+const pendingModelConfirmations = new Map<string, PendingModelConfirmation>();
+
+/**
+ * Try to confirm a deferred model switch for a session.
+ * - If no pending entry: returns immediately.
+ * - If pending and modelsUsedThisTurn includes the requested family: sends
+ *   ✅ confirmation, deletes the entry.
+ * - If pending and modelsUsedThisTurn is non-empty but does NOT include the
+ *   requested family: sends ❌ failure with the actual model used, deletes
+ *   the entry.
+ * - If modelsUsedThisTurn is undefined/empty: leaves the entry untouched
+ *   so the next result can verify.
+ */
+async function tryConfirmModelSwitch(
+  sessionKey: string,
+  modelsUsedThisTurn: string[] | undefined,
+  channel: {
+    sendMessage: (
+      jid: string,
+      text: string,
+      threadId?: string,
+    ) => Promise<unknown>;
+  },
+): Promise<void> {
+  const pending = pendingModelConfirmations.get(sessionKey);
+  if (!pending || pending.failed) return;
+  if (!modelsUsedThisTurn || modelsUsedThisTurn.length === 0) return;
+
+  const matched = modelsUsedThisTurn.some(
+    (m) => getModelFamily(m) === pending.family,
+  );
+
+  if (matched) {
+    pendingModelConfirmations.delete(sessionKey);
+    try {
+      await channel.sendMessage(
+        pending.chatJid,
+        `✅ ${pending.message}.`,
+        pending.threadId,
+      );
+    } catch (err) {
+      logger.warn(
+        { chatJid: pending.chatJid, err },
+        'Failed to send confirmed model-switch message',
+      );
+    }
+    return;
+  }
+
+  // Mismatch — the SDK ran the turn on a model that doesn't match the requested
+  // family. Tell the user the switch didn't take.
+  pending.failed = true;
+  const actual = Array.from(
+    new Set(modelsUsedThisTurn.map((m) => getModelFamily(m))),
+  ).join(', ');
+  pendingModelConfirmations.delete(sessionKey);
+  try {
+    await channel.sendMessage(
+      pending.chatJid,
+      `❌ Model switch to ${pending.family} did not take effect — agent ran on ${actual}.`,
+      pending.threadId,
+    );
+  } catch (err) {
+    logger.warn(
+      { chatJid: pending.chatJid, err },
+      'Failed to send model-switch failure notice',
+    );
+  }
+}
+
+/**
  * Extract a per-message model override from raw message content.
  * Checks (in priority order):
  *   1. One-shot flag: "-m1 opus" — this invocation only, doesn't persist
@@ -1065,35 +1174,50 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         logger.debug({ chatJid, err }, 'Failed to add thinking reaction'),
       );
   }
-  // Send host-side model/effort switch confirmation so it doesn't depend on agent compliance.
+  // Build host-side model/effort switch confirmation parts. Effort switches
+  // are sent eagerly (no way to verify them from result messages), but model
+  // switches are deferred until the agent's first result message confirms
+  // the SDK actually honoured the switch — see tryConfirmModelSwitch.
   {
-    const parts: string[] = [];
-
+    let modelPart: string | undefined;
     if (overrideResult && !overrideResult.reset) {
       const label = overrideResult.sticky
         ? 'for this session'
         : 'for this message';
-      parts.push(`Switched to ${model} ${label}`);
+      modelPart = `Switched to ${model} ${label}`;
     } else if (overrideResult?.reset) {
-      parts.push(`Model reverted to default (${model})`);
+      modelPart = `Model reverted to default (${model})`;
     }
 
+    let effortPart: string | undefined;
     if (effortOverride && !effortOverride.reset) {
       const label = effortOverride.sticky
         ? 'for this session'
         : 'for this message';
-      parts.push(`Effort ${effort} ${label}`);
+      effortPart = `Effort ${effort} ${label}`;
     } else if (effortOverride?.reset) {
-      parts.push(`Effort reverted to default (${effort})`);
+      effortPart = `Effort reverted to default (${effort})`;
     }
 
-    if (parts.length > 0) {
+    if (modelPart) {
+      // Defer the combined message until the result confirms the switch.
+      // Drop any prior pending entry for this session — the new request
+      // supersedes it.
+      const body = effortPart ? `${modelPart}, ${effortPart}` : modelPart;
+      pendingModelConfirmations.set(sessionKey, {
+        family: getModelFamily(model),
+        message: body,
+        chatJid,
+        threadId: effectiveThreadId,
+      });
+    } else if (effortPart) {
+      // Effort-only switch — send eagerly (no verification needed/available).
       channel
-        .sendMessage(chatJid, `✅ ${parts.join(', ')}.`, effectiveThreadId)
+        .sendMessage(chatJid, `✅ ${effortPart}.`, effectiveThreadId)
         .catch((err: unknown) =>
           logger.warn(
             { chatJid, err },
-            'Failed to send model/effort switch confirmation',
+            'Failed to send effort switch confirmation',
           ),
         );
     }
@@ -1167,9 +1291,19 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             status: result.status,
             hasResult: !!result.result,
             idle: !!result.idle,
+            modelsUsedThisTurn: result.modelsUsedThisTurn,
           },
           'onOutput callback invoked',
         );
+        // Confirm/refute any deferred model-switch as soon as we have ground
+        // truth. Sent BEFORE the agent's text so the user sees ✅ first.
+        if (result.modelsUsedThisTurn && result.modelsUsedThisTurn.length > 0) {
+          await tryConfirmModelSwitch(
+            sessionKey,
+            result.modelsUsedThisTurn,
+            channel,
+          );
+        }
         if (result.result) {
           const raw =
             typeof result.result === 'string'
@@ -1300,6 +1434,20 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       channel
         .removeReaction?.(chatJid, thinkingReactionMsg, '💭')
         ?.catch(() => {});
+    }
+    // Drop any pending model-switch confirmation that never resolved.
+    // We deliberately stay silent here: the only way we land in this branch
+    // with an unconfirmed entry is if the container produced no result with
+    // modelUsage at all (error, timeout, or empty response) — and the user
+    // already sees the agent error or fallback message in those cases.
+    // Sending a separate "could not verify" notice would just add noise.
+    const leftover = pendingModelConfirmations.get(sessionKey);
+    if (leftover) {
+      pendingModelConfirmations.delete(sessionKey);
+      logger.warn(
+        { sessionKey, family: leftover.family },
+        'Model switch could not be verified before runAgent completed — confirmation suppressed',
+      );
     }
   }
 
@@ -1819,46 +1967,61 @@ async function startMessageLoop(): Promise<void> {
                 });
               }
 
-              // Combined confirmation for model and/or effort switches
-              const confirmParts: string[] = [];
+              // Build model/effort confirmation. Effort is sent eagerly (no
+              // way to verify it from result messages), but model is deferred
+              // until the running container's next result confirms the SDK
+              // honoured the switch — see tryConfirmModelSwitch in onOutput.
+              let modelPart: string | undefined;
               if (pipeModelOverride) {
                 if (pipeModelOverride.reset) {
-                  confirmParts.push(
-                    `Model reverted to default (${resolveModel(group)})`,
-                  );
+                  modelPart = `Model reverted to default (${resolveModel(group)})`;
                 } else {
                   const label = pipeModelOverride.sticky
                     ? `${pipeModelOverride.model} for this session`
                     : `${pipeModelOverride.model} for this message`;
-                  confirmParts.push(`Switched to ${label}`);
+                  modelPart = `Switched to ${label}`;
                 }
               }
+
+              let effortPart: string | undefined;
               if (pipeEffortOverride) {
                 const effortVal = pipeEffortOverride.reset
                   ? DEFAULT_EFFORT
                   : pipeEffortOverride.effort;
                 if (pipeEffortOverride.reset) {
-                  confirmParts.push(
-                    `Effort reverted to default (${effortVal})`,
-                  );
+                  effortPart = `Effort reverted to default (${effortVal})`;
                 } else {
                   // TODO: oneshot effort (-e! syntax) not yet supported in
                   // container — no pendingOneshotEffortRevert mechanism exists.
                   // Always report "for this session" until that's implemented.
-                  confirmParts.push(`Effort ${effortVal} for this session`);
+                  effortPart = `Effort ${effortVal} for this session`;
                 }
               }
-              if (confirmParts.length > 0) {
+
+              if (modelPart) {
+                // Defer combined confirmation. The pending entry is keyed by
+                // sessionKey so it's picked up by the running container's
+                // outer onOutput callback on its next result.
+                const requestedModel = pipeModelOverride?.reset
+                  ? resolveModel(group)
+                  : pipeModelOverride!.model;
+                const body = effortPart
+                  ? `${modelPart}, ${effortPart}`
+                  : modelPart;
+                pendingModelConfirmations.set(sessionKey, {
+                  family: getModelFamily(requestedModel),
+                  message: body,
+                  chatJid,
+                  threadId: incomingThreadId,
+                });
+              } else if (effortPart) {
+                // Effort-only switch — send eagerly.
                 channel
-                  .sendMessage(
-                    chatJid,
-                    `✅ ${confirmParts.join(', ')}.`,
-                    incomingThreadId,
-                  )
+                  .sendMessage(chatJid, `✅ ${effortPart}.`, incomingThreadId)
                   .catch((err: unknown) =>
                     logger.warn(
                       { chatJid, err },
-                      'Failed to send model/effort switch confirmation',
+                      'Failed to send effort switch confirmation',
                     ),
                   );
               }
