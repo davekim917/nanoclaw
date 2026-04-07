@@ -90,14 +90,20 @@ fi
 
 # Index git repos in workspace for GitNexus code intelligence.
 # gitnexus analyze is fast when up-to-date (~0.5s), re-indexes only if stale.
-# Skip AGENTS.md/CLAUDE.md generation to avoid modifying tracked files.
+# Default --skip-agents-md (opt-in via GITNEXUS_INJECT_AGENTS_MD=true) — see
+# ContainerConfig.gitnexusInjectAgentsMd in src/types.ts for rationale.
 # Find both .git dirs (normal repos) and .git files (worktrees).
 # Read-only repos with a pre-built .gitnexus/ index are registered directly.
+if [ "${GITNEXUS_INJECT_AGENTS_MD:-}" = "true" ]; then
+  gitnexus_flags=()
+else
+  gitnexus_flags=(--skip-agents-md)
+fi
 mkdir -p /home/node/.gitnexus
 for gitdir in $(find /workspace -maxdepth 3 -name .git \( -type d -o -type f \) 2>/dev/null); do
   repo=$(dirname "$gitdir")
   if [ -w "$repo" ]; then
-    (cd "$repo" && gitnexus analyze 2>&1 >&2) || true
+    (cd "$repo" && gitnexus analyze "${gitnexus_flags[@]}" 2>&1 >&2) || true
   elif [ -d "$repo/.gitnexus" ] && [ -f "$repo/.gitnexus/meta.json" ]; then
     # Read-only mount with pre-built index: register in the container's registry
     # so the MCP server can serve it without needing to write anything.

@@ -3068,6 +3068,7 @@ async function buildContainerArgs(
   containerName: string,
   ipcInputSubdir: string,
   agentIdentifier?: string,
+  gitnexusInjectAgentsMd?: boolean,
 ): Promise<string[]> {
   const args: string[] = [
     'run',
@@ -3097,6 +3098,11 @@ async function buildContainerArgs(
   // Forward Ollama admin tools flag if enabled
   if (OLLAMA_ADMIN_TOOLS) {
     args.push('-e', 'OLLAMA_ADMIN_TOOLS=true');
+  }
+
+  // Forward gitnexusInjectAgentsMd to entrypoint.sh — see ContainerConfig for rationale.
+  if (gitnexusInjectAgentsMd === true) {
+    args.push('-e', 'GITNEXUS_INJECT_AGENTS_MD=true');
   }
 
   // OneCLI gateway handles credential injection — containers never see real secrets.
@@ -3310,6 +3316,7 @@ export async function runContainerAgent(
     containerName,
     ipcInputSubdir,
     agentIdentifier,
+    group.containerConfig?.gitnexusInjectAgentsMd,
   );
 
   logger.debug(

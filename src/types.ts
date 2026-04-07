@@ -67,6 +67,17 @@ export interface ContainerConfig {
   watchGithub?: string[]; // GitHub orgs or owner/repo to scan for team PRs in daily summary (e.g. ["Illysium-ai", "davekim917/nanoclaw"])
   plugins?: string[]; // Plugin repos to mount from ~/plugins/ (e.g. ["bootstrap", "omni-claude-skills"]). Undefined = all plugins.
   dynamicModelDowngrade?: boolean; // Auto-downgrade trivial messages to Haiku (default: false, opt-in per group)
+  /**
+   * Let `gitnexus analyze` write its always-on MUST/NEVER block into each repo's
+   * AGENTS.md and CLAUDE.md (default: false, opt-in per group).
+   *
+   * Default skips because most groups work on third-party repos that don't use
+   * NanoClaw/gitnexus tooling, and the block would pollute them with tool-specific
+   * instructions. Even when skipped, gitnexus still appends `.gitnexus` to each
+   * repo's `.gitignore` (idempotent, commit-safe) and creates `.claude/skills/gitnexus/`
+   * (required for in-container skill wiring) — both intentional and accepted.
+   */
+  gitnexusInjectAgentsMd?: boolean;
 }
 
 export interface RegisteredGroup {
