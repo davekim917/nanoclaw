@@ -1164,15 +1164,23 @@ export class DiscordChannel implements Channel {
   /**
    * Inject a synthetic message into the inbound pipeline so the agent
    * processes a slash-command-originated prompt as if the user had typed it.
+   *
+   * The `messageId` MUST be a real channel message snowflake (e.g. from
+   * `interaction.reply({ fetchReply: true })` or `channel.send(...)`), NOT
+   * an interaction snowflake. Downstream code calls
+   * `textChannel.messages.fetch(messageId)` to anchor the agent's response
+   * thread, and Discord interaction IDs do not exist in the channel messages
+   * namespace — fetching one returns 10008 Unknown Message.
    */
   private injectMessage(
     interaction: ChatInputCommandInteraction,
     prompt: string,
+    messageId: string,
   ): void {
     const parentId = DiscordChannel.getInteractionParentId(interaction);
     const jid = parentId ? `dc:${parentId}` : `dc:${interaction.channelId}`;
     this.opts.onMessage(jid, {
-      id: interaction.id,
+      id: messageId,
       chat_jid: jid,
       sender: interaction.user.id,
       sender_name: interaction.user.username,
@@ -1185,39 +1193,53 @@ export class DiscordChannel implements Channel {
   private async handleUpdateContainerCommand(
     interaction: ChatInputCommandInteraction,
   ): Promise<void> {
-    await interaction.deferReply();
-    await interaction.editReply(
-      'Auditing container packages and synced upstream files...',
-    );
+    // Reject thread invocations: injectMessage routes via the parent channel
+    // JID, so a response triggered from inside a thread would land in the
+    // parent channel rather than the user's thread. Require top-level use.
+    if (interaction.channel?.isThread()) {
+      await interaction.reply({
+        content:
+          'Run /update-container in #general directly, not inside a thread.',
+        ephemeral: true,
+      });
+      return;
+    }
+
+    // After reply() the interaction's response is a real channel Message
+    // whose .id is fetchable via textChannel.messages.fetch — that's what
+    // createThreadAndSend will need to anchor the agent's response thread.
+    // Using .fetchReply() instead of the deprecated `fetchReply: true` flag.
+    await interaction.reply({
+      content: 'Auditing container packages and synced upstream files...',
+    });
+    const reply = await interaction.fetchReply();
 
     const prompt =
-      '@' +
-      resolveAssistantName() +
-      ' Run the container update audit.\n\n' +
+      'Run the container update audit.\n\n' +
       '## Step 1 — Detect Dockerfile package drift\n' +
-      'Read /workspace/project/container/Dockerfile and extract every pinned version:\n' +
-      '- npm: packages with @x.y.z in `npm install -g`\n' +
-      '- pip: packages with ==x.y.z in `pip install`\n' +
-      '- ARG: lines like `ARG PACKAGE_VERSION=x.y.z`\n' +
-      '- Snowflake .deb: SNOW_VERSION ARG\n\n' +
-      'For each, check the latest available version:\n' +
+      'Read /workspace/project/container/Dockerfile and extract every package install:\n' +
+      '- npm: lines in `npm install -g`. Both pinned (`pkg@x.y.z`) AND unpinned (no version) — both must be reported.\n' +
+      '- pip: lines in `pip install`. Both pinned (`pkg==x.y.z`) AND unpinned — both must be reported.\n' +
+      '- ARG: lines like `ARG PACKAGE_VERSION=x.y.z`\n\n' +
+      'For each PINNED package, check the latest available version:\n' +
       '- npm: `npm view <pkg> version`\n' +
       '- pip: `curl -s https://pypi.org/pypi/<pkg>/json | jq -r .info.version`\n' +
       '- GitHub release ARGs: `gh release view --repo <owner>/<repo> --json tagName -q .tagName` for:\n' +
-      '  RENDER_VERSION → render-oss/cli, RAILWAY_VERSION → railwayapp/cli, SUPABASE_VERSION → supabase/cli\n' +
-      '- SNOW_VERSION: check https://sfc-repo.snowflakecomputing.com/snowflake-cli/linux_aarch64/index.html\n\n' +
+      '  RENDER_VERSION → render-oss/cli, RAILWAY_VERSION → railwayapp/cli, SUPABASE_VERSION → supabase/cli\n\n' +
+      'For each UNPINNED package, also check `npm view <pkg> version` (or PyPI for pip) and report the latest version with status ❓ unpinned. ' +
+      'These packages — including @anthropic-ai/claude-code (the agent runtime) — drift on every container rebuild without any version pinning, so they need explicit attention even though no "current" version is recorded in the Dockerfile.\n\n' +
       '## Step 2 — Detect upstream-synced file drift\n' +
       'Read /workspace/plugins/bootstrap/plugins/workflow/skills/team-qa/references/CODEX-SOURCES.md ' +
-      'to find verbatim copies of files from openai/codex-plugin-cc and their pinned upstream commit SHAs ' +
-      '(table format: file | upstream path | pinned SHA | last synced).\n\n' +
-      'For each entry, fetch the latest upstream commit SHA touching that path:\n' +
-      '`gh api "repos/openai/codex-plugin-cc/commits?path=<upstream-path>&per_page=1" --jq ".[0].sha"`\n\n' +
-      'If the latest SHA differs from the pinned SHA, the file has drifted.\n\n' +
+      'to find verbatim copies of files from openai/codex-plugin-cc and their pinned upstream commit SHAs. ' +
+      'Pinned SHAs in that file are stored as 7-character prefixes.\n\n' +
+      'For each entry, fetch the latest upstream commit SHA (also as a 7-char prefix to match the table format):\n' +
+      "`gh api \"repos/openai/codex-plugin-cc/commits?path=<upstream-path>&per_page=1\" --jq '.[0].sha[0:7]'`\n\n" +
+      'If the latest 7-char SHA differs from the pinned 7-char SHA, the file has drifted.\n\n' +
       '## Step 3 — Present a unified audit table\n' +
       'Show ALL items in one table:\n' +
       '| Item | Kind | Current | Latest | Status |\n' +
-      'Status: ✅ up to date, ⬆️ outdated.\n' +
-      'Below the table, summarize: "N items outdated: <names>".\n' +
+      'Status: ✅ up to date, ⬆️ outdated, ❓ unpinned.\n' +
+      'Below the table, summarize: "N outdated, M unpinned: <names>".\n' +
       'Then ask: "Update all, specific ones, or skip?"\n\n' +
       '## Step 4 — Apply updates (after user confirms)\n\n' +
       '### Dockerfile package bumps\n' +
@@ -1227,37 +1249,38 @@ export class DiscordChannel implements Channel {
       '3. git add container/Dockerfile && git commit -m "chore(container): bump <packages> to latest"\n' +
       '4. git push -u origin HEAD\n' +
       '5. gh pr create --title "chore(container): bump <packages>" --body "..." --base main\n' +
-      '6. After review, gh pr merge --squash --delete-branch\n' +
-      'The next nanoclaw-update.timer run (08:00 daily) will pull and rebuild the image (the auto-update ' +
+      '6. STOP. Report the PR URL back to the chat. Do NOT run gh pr merge — Dave reviews and merges manually via the existing /merge button on the PR message or via the GitHub UI. The merge step is intentionally not automated.\n' +
+      'After Dave merges the PR, the next nanoclaw-update.timer run (08:00 daily) will pull and rebuild the image (the auto-update ' +
       'script detects container/ changes and runs ./container/build.sh automatically).\n\n' +
       '### Upstream-synced file resync (Codex prompts/schemas)\n' +
       '/workspace/plugins/bootstrap is mounted READ-ONLY, so you must push via the upstream repo:\n' +
       '1. /workspace/plugins/codex is mounted with the latest pulled by nanoclaw-plugins-update.timer — ' +
       'read the new file content directly from there ' +
       '(e.g. /workspace/plugins/codex/plugins/codex/prompts/adversarial-review.md).\n' +
-      '2. Get the new SHA: `gh api "repos/openai/codex-plugin-cc/commits?path=<path>&per_page=1" --jq ".[0].sha"`\n' +
-      '3. Clone the bootstrap repo to a writable temp dir:\n' +
-      '   `gh repo clone davekim917/bootstrap /tmp/bootstrap-update`\n' +
+      "2. Get the new 7-char SHA: `gh api \"repos/openai/codex-plugin-cc/commits?path=<path>&per_page=1\" --jq '.[0].sha[0:7]'`\n" +
+      '3. Clone the bootstrap repo to a writable temp dir (clean any prior state first):\n' +
+      '   `rm -rf /tmp/bootstrap-update && gh repo clone davekim917/bootstrap /tmp/bootstrap-update`\n' +
       '4. Copy the new file content into ' +
       '/tmp/bootstrap-update/plugins/workflow/skills/team-qa/references/<local-name>\n' +
       '5. CRITICAL — verify the resynced file still contains all template placeholders ' +
       '({{TARGET_LABEL}}, {{USER_FOCUS}}, {{REVIEW_INPUT}}). If any are missing, ABORT and report — ' +
       'Validator E depends on these markers.\n' +
-      "6. Update the SHA pin row in CODEX-SOURCES.md to the new SHA and today's date.\n" +
+      "6. Update the SHA pin row in CODEX-SOURCES.md to the new 7-char SHA and today's date.\n" +
       '7. Bump plugins/workflow/.claude-plugin/plugin.json `version` (patch bump for resync).\n' +
       '8. cd /tmp/bootstrap-update && git checkout -b chore/codex-resync-$(date +%Y%m%d-%H%M)\n' +
       '9. git add -A && git commit -m "chore(team-qa): resync codex <files> to <short-sha>"\n' +
       '10. git push -u origin HEAD && gh pr create --title "..." --body "..." --base main\n' +
-      '11. After merge, nanoclaw-plugins-update.timer will pull within the hour and the resync goes live.\n\n' +
+      '11. STOP. Report the PR URL back to the chat. Do NOT run gh pr merge — Dave reviews and merges manually. After Dave merges, nanoclaw-plugins-update.timer will pull within the hour and the resync goes live.\n\n' +
       '## Important notes\n' +
       '- Show diffs before committing each repo. Ask for explicit approval per repo.\n' +
-      '- The two repos (nanoclaw + bootstrap) are independent — separate PRs, separate merges.\n' +
+      '- The two repos (nanoclaw + bootstrap) are independent — separate PRs, separate manual merges.\n' +
       '- If everything is up to date, say so in one line and stop. Do not create empty PRs.\n' +
-      '- The Dockerfile rebuild happens automatically at next 08:00 — DO NOT manually run ' +
+      '- DO NOT run `gh pr merge` from this audit. Merging is a manual human step.\n' +
+      '- The Dockerfile rebuild happens automatically at next 08:00 after the PR is merged — DO NOT manually run ' +
       './container/build.sh from inside the container (you cannot run docker from inside a container ' +
       'and the host script handles it).';
 
-    this.injectMessage(interaction, prompt);
+    this.injectMessage(interaction, prompt, reply.id);
   }
 
   private runDetachedDeploy(interaction: ChatInputCommandInteraction): void {
