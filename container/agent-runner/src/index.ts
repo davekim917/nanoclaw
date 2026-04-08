@@ -703,9 +703,17 @@ function buildCapabilityManifest(
 function buildWorkspacePersistenceNote(): string {
   return `## Workspace Persistence
 
-Your cwd \`/workspace/group\` behaves differently depending on channel:
+Your cwd is \`/workspace/group\`. Semantics differ by channel.
 
-**Threaded channels (Slack/Discord threads):** per-thread scratch directory. Git clones persist to the host group folder via atomic rename at thread cleanup. Non-repo top-level dirs (\`.context/\`, \`.claude/\`, etc.) are copied in from the host on each message and merged back at cleanup with \`force: false\` — host wins on file-name collision, so agent-created new files land but edits to pre-existing host files are dropped. Loose scratch files at the top level of \`/workspace/group\` that aren't inside a repo or in a merged directory die at cleanup. Sensitive filenames (auth, token, secret, .env, .pem, .key, etc.) are excluded from scratch and invisible to you.
+**Threaded channels (Slack/Discord threads):** \`/workspace/group\` is a per-thread scratch directory. On prepare, every top-level entry from the host group folder is copied in so you can read \`.context/\`, \`.claude/\`, plan files, screenshots, etc. Sensitive filenames (auth, token, secret, .env, .pem, .key, id_rsa, etc.) are excluded and invisible to you.
+
+**Existing group repos in threaded channels** (e.g. \`/workspace/group/XZO-BACKEND\`) are **git worktrees** sharing the host repo's \`.git\`, not fresh clones. They start in **detached HEAD** mode at the tip of origin's default branch. **This is normal — the worktree is NOT broken.** To commit and push, run \`git checkout -b <branch-name>\` first, then \`git push -u origin <branch-name>\`. Tracked and untracked edits are auto-rescued at thread cleanup via rescue branches/bundles, so work is not lost even if you don't push.
+
+**Fresh clones you create** (\`git clone ...\`) are promoted to the host group folder via atomic rename at cleanup. Clone them **inside \`/workspace/group\`** — not elsewhere.
+
+**Write boundary:** only \`/workspace/group\` and \`/workspace/thread\` are writable to you. The rest of \`/workspace/*\` is read-only (owned by a different uid on the host). Don't try to \`mkdir\` or \`git clone\` outside those two paths — it will fail with EACCES.
+
+**Non-repo scratch:** agent-created new files at the top of \`/workspace/group\` land on the host at cleanup. Edits to pre-existing *loose* host files (outside any repo) are DROPPED at cleanup (host wins on collision). Edits to files *inside* any git repo are rescued, not dropped.
 
 **Non-threaded channels (DMs, main group):** direct mount of the host group folder. All writes persist immediately.
 
