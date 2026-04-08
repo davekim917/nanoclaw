@@ -695,6 +695,23 @@ function buildCapabilityManifest(
   return `## Runtime Capabilities\n\nThe following tools and services are configured for this session. If a tool fails at runtime (auth error, missing credential, network issue), surface the error rather than retrying blindly.\n\n${capabilities.join('\n')}`;
 }
 
+/**
+ * Document the per-thread scratch + host-direct-mount workspace semantics
+ * so the agent knows what persists and where to write thread-local state.
+ * Always included regardless of tool config.
+ */
+function buildWorkspacePersistenceNote(): string {
+  return `## Workspace Persistence
+
+Your cwd \`/workspace/group\` behaves differently depending on channel:
+
+**Threaded channels (Slack/Discord threads):** per-thread scratch directory. Git clones persist to the host group folder via atomic rename at thread cleanup. Non-repo top-level dirs (\`.context/\`, \`.claude/\`, etc.) are copied in from the host on each message and merged back at cleanup with \`force: false\` — host wins on file-name collision, so agent-created new files land but edits to pre-existing host files are dropped. Loose scratch files at the top level of \`/workspace/group\` that aren't inside a repo or in a merged directory die at cleanup. Sensitive filenames (auth, token, secret, .env, .pem, .key, etc.) are excluded from scratch and invisible to you.
+
+**Non-threaded channels (DMs, main group):** direct mount of the host group folder. All writes persist immediately.
+
+**\`/workspace/thread/\`** is a per-thread persistent directory for intermediate work, scratch notes, draft documents, and any state you want preserved between user turns in this thread but not published to the group. Survives across messages in the same thread. Use it for plan drafts, scratch analysis, and thread-local state.`;
+}
+
 function buildAllowedTools(tools: string[] | undefined): string[] {
   const allowed = [
     'Bash',
@@ -1346,8 +1363,19 @@ async function main(): Promise<void> {
   // takes precedence over any contradictory static CLAUDE.md claims.
   const capabilityManifest = buildCapabilityManifest(containerInput.tools);
 
+  // Document /workspace/group vs /workspace/thread persistence semantics
+  // so the agent knows where to write thread-local state.
+  const workspacePersistenceNote = buildWorkspacePersistenceNote();
+
   // Static system prompt parts (everything except model identity, which changes per query)
-  const staticPromptParts = [globalClaudeMd, channelFormatting, identityNote, toneNote, capabilityManifest].filter(Boolean);
+  const staticPromptParts = [
+    globalClaudeMd,
+    channelFormatting,
+    identityNote,
+    toneNote,
+    capabilityManifest,
+    workspacePersistenceNote,
+  ].filter(Boolean);
 
   // Build the full system prompt with the current model identity.
   // Called per runQuery() so the model note reflects IPC model switches.

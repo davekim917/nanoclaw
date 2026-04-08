@@ -804,23 +804,258 @@ function execAsync(
   });
 }
 
+/** Per-thread isolated entries populated by prepareThreadWorkspace. */
+const ISOLATED_THREAD_FILES: readonly string[] = ['CLAUDE.md'];
+const ISOLATED_THREAD_DIRS: readonly string[] = ['conversations', 'threads'];
+
+/**
+ * Case-insensitive substring patterns for sensitive top-level filenames
+ * excluded from the scratch dir. Separate from mount-security.ts's
+ * DEFAULT_BLOCKED_PATTERNS because that list governs the additionalMounts
+ * allowlist (operator-declared paths) — widening it would silently block
+ * legitimate mount paths like `~/projects/auth-service`.
+ */
+const SENSITIVE_TOP_LEVEL_PATTERNS = [
+  'auth',
+  'token',
+  'credential',
+  'secret',
+  'password',
+  '.env',
+  '.pem',
+  '.key',
+  'id_rsa',
+  'id_ed25519',
+  'private_key',
+];
+
+function isSensitiveTopLevelFilename(name: string): boolean {
+  const lower = name.toLowerCase();
+  return SENSITIVE_TOP_LEVEL_PATTERNS.some((p) => lower.includes(p));
+}
+
+/**
+ * Validate that a name is safe to use as a filesystem path component for
+ * git worktrees and atomic rename-based promotion. Rejects path-traversal
+ * segments, docker-mount-unsafe characters (colons), shell-unsafe chars,
+ * and control characters. Called both at worktree creation time and at
+ * promotion time so cleanup can't pick up a name prepare would have skipped.
+ */
+function isSafeRepoName(name: string): boolean {
+  if (name === '' || name === '.' || name === '..') return false;
+  return /^[A-Za-z0-9._-]+$/.test(name);
+}
+
 /** Find subdirectories that are git worktrees (contain a `.git` file, not directory). */
 function findGitWorktrees(
   dir: string,
 ): Array<{ name: string; wtPath: string }> {
   const results: Array<{ name: string; wtPath: string }> = [];
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch (err) {
+    logger.warn(
+      { dir, err },
+      'findGitWorktrees: readdirSync failed, treating as no worktrees',
+    );
+    return results;
+  }
+  for (const entry of entries) {
     if (!entry.isDirectory()) continue;
     const wtPath = path.join(dir, entry.name);
     try {
       if (fs.statSync(path.join(wtPath, '.git')).isFile()) {
         results.push({ name: entry.name, wtPath });
       }
-    } catch {
-      /* .git doesn't exist — not a worktree */
+    } catch (err) {
+      // .git doesn't exist → not a worktree (expected, silent).
+      // Any other errno → log so transient FS issues leave a trace.
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') {
+        logger.warn(
+          { wtPath, code, err },
+          'findGitWorktrees: stat .git failed with unexpected error, skipping',
+        );
+      }
     }
   }
   return results;
+}
+
+/**
+ * Promote agent-created top-level git repos (new clones) from a per-thread
+ * scratch dir to a persistent destination dir via atomic rename.
+ * Shared between cleanupThreadWorkspace and cleanupOrphanWorktrees.
+ * First-writer-wins on name collision (EEXIST/ENOTEMPTY).
+ */
+async function promoteAgentCreatedRepos(
+  scratchDir: string,
+  dstDir: string,
+  groupFolder: string,
+  threadId: string | undefined,
+): Promise<void> {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(scratchDir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    if (ISOLATED_THREAD_FILES.includes(entry.name)) continue;
+    if (ISOLATED_THREAD_DIRS.includes(entry.name)) continue;
+
+    if (!isSafeRepoName(entry.name)) {
+      logger.warn(
+        { group: groupFolder, threadId, repo: entry.name },
+        'Skipping promotion: unsafe name',
+      );
+      continue;
+    }
+
+    const srcEntry = path.join(scratchDir, entry.name);
+
+    // lstatSync (not statSync) so an agent-controlled `.git` symlink
+    // can't escape the scratch sandbox by resolving to another repo's
+    // real .git dir during promotion.
+    try {
+      if (!fs.lstatSync(path.join(srcEntry, '.git')).isDirectory()) continue;
+    } catch {
+      continue;
+    }
+
+    // Half-clone detection: HEAD must resolve to a commit. Distinguish
+    // spawn-failure (git missing, timeout) from exit-non-zero (unborn
+    // ref — the expected skip case).
+    try {
+      await execAsync('git rev-parse --verify HEAD^{commit}', {
+        cwd: srcEntry,
+      });
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      const signal = (err as NodeJS.ErrnoException & { signal?: string })
+        .signal;
+      if (code === 'ENOENT') {
+        logger.error(
+          { group: groupFolder, threadId },
+          'Promotion aborted: `git` binary not found in PATH',
+        );
+        return;
+      }
+      if (signal === 'SIGTERM' || code === 'ETIMEDOUT') {
+        logger.error(
+          { group: groupFolder, threadId, repo: entry.name },
+          'Promotion check timed out — skipping',
+        );
+        continue;
+      }
+      logger.warn(
+        { group: groupFolder, threadId, repo: entry.name },
+        'Skipping promotion: git repo is not in a settled state',
+      );
+      continue;
+    }
+
+    // Rescue uncommitted work as a local commit so the rename carries
+    // the agent's in-session edits along. No remote push.
+    try {
+      const status = await execAsync('git status --porcelain', {
+        cwd: srcEntry,
+      });
+      if (status) {
+        await execAsync('git add -A', { cwd: srcEntry });
+        await execAsync(
+          'git -c user.email=agent@nanoclaw.local -c user.name=agent commit --no-verify -m "rescue: auto-save agent edits before clone promotion"',
+          { cwd: srcEntry },
+        );
+        logger.info(
+          { group: groupFolder, threadId, repo: entry.name },
+          'Rescued uncommitted work as local commit before promotion',
+        );
+      }
+    } catch (err) {
+      logger.warn(
+        { group: groupFolder, threadId, repo: entry.name, err },
+        'Rescue commit failed — promotion will proceed without in-session edits',
+      );
+    }
+
+    // Atomic publish via rename(2).
+    const dstEntry = path.join(dstDir, entry.name);
+    try {
+      fs.renameSync(srcEntry, dstEntry);
+      logger.info(
+        { group: groupFolder, threadId, repo: entry.name },
+        'Promoted agent-created repo to host group folder',
+      );
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'EEXIST' || code === 'ENOTEMPTY') {
+        // Prior session (or concurrent-group scratch) beat us. Under
+        // withGroupMutex, concurrent promotions in the same group are
+        // impossible, so this is always the cross-session case.
+        logger.warn(
+          { group: groupFolder, threadId, repo: entry.name },
+          'Promotion collision: destination exists (prior-session writer won)',
+        );
+      } else if (code === 'EXDEV') {
+        logger.error(
+          { group: groupFolder, threadId, repo: entry.name },
+          'Promotion failed: scratch and group folder are on different filesystems',
+        );
+      } else {
+        logger.error(
+          { group: groupFolder, threadId, repo: entry.name, err },
+          'Promotion failed',
+        );
+      }
+    }
+  }
+}
+
+/**
+ * Merge non-repo scratch entries back to the persistent destination after
+ * promotion. Covers per-thread copies of conversations/threads/CLAUDE.md
+ * siblings, visibility-copied host state (.context/, .claude/, plan.md),
+ * and agent-created non-git scratch. Skips CLAUDE.md (merged separately
+ * with length-based conflict resolution) and entries with a `.git` entry
+ * (failed-promotion remnants — merging partial git state into host would
+ * corrupt the persistent repo). Uses `force: false`: host files win on
+ * collision, known lossiness for agent edits to pre-existing host files.
+ * Shared between cleanupThreadWorkspace and cleanupOrphanWorktrees.
+ */
+function mergeBackNonRepoEntries(scratchDir: string, dstDir: string): void {
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(scratchDir, { withFileTypes: true });
+  } catch {
+    return;
+  }
+
+  for (const entry of entries) {
+    if (ISOLATED_THREAD_FILES.includes(entry.name)) continue;
+
+    const srcEntry = path.join(scratchDir, entry.name);
+    if (
+      entry.isDirectory() &&
+      fs.existsSync(path.join(srcEntry, '.git'))
+    ) {
+      continue;
+    }
+
+    const dstEntry = path.join(dstDir, entry.name);
+    try {
+      if (entry.isDirectory()) {
+        fs.cpSync(srcEntry, dstEntry, { recursive: true, force: false });
+      } else if (entry.isFile() && !fs.existsSync(dstEntry)) {
+        fs.copyFileSync(srcEntry, dstEntry);
+      }
+    } catch {
+      /* best-effort */
+    }
+  }
 }
 
 /**
@@ -1345,12 +1580,9 @@ function evictStaleCacheFiles(): void {
 const gcDisabledRepos = new Set<string>();
 
 /**
- * Prepare a per-thread worktree workspace for concurrent container access.
- * Creates git worktrees for repos, copies CLAUDE.md/conversations, symlinks others.
- * Returns the worktree base path to mount as /workspace/group.
- *
- * MUST be called inside withGroupMutex() to prevent concurrent git worktree add
- * on the same repos (git locks .git/worktrees/).
+ * Prepare a per-thread scratch workspace. Returns the worktree base path,
+ * mounted as /workspace/group. MUST run inside withGroupMutex — git locks
+ * .git/worktrees/ and cleanup depends on a stable scratch state.
  */
 export async function prepareThreadWorkspace(
   groupFolder: string,
@@ -1368,37 +1600,57 @@ export async function prepareThreadWorkspace(
     const entries = fs.readdirSync(groupDir, { withFileTypes: true });
     const gitRepos: Array<{ srcPath: string; wtPath: string }> = [];
 
+    // Copy every top-level group-folder entry into scratch so the agent
+    // can see host-side state (.context/ for /team-* workflows, .claude/,
+    // logs/, plan.md, screenshots). Git repos go through `git worktree`
+    // instead (per-thread working tree sharing the host .git). Sensitive
+    // filenames are excluded to preserve the credential boundary — they
+    // never enter the scratch dir so threaded agents can't read them.
     for (const entry of entries) {
       const srcPath = path.join(groupDir, entry.name);
+      const dstPath = path.join(worktreeBase, entry.name);
 
       if (entry.isDirectory()) {
         const gitDir = path.join(srcPath, '.git');
         if (fs.existsSync(gitDir)) {
-          gitRepos.push({
-            srcPath,
-            wtPath: path.join(worktreeBase, entry.name),
-          });
-        } else if (entry.name === 'conversations' || entry.name === 'threads') {
-          // Copy directories that get written to concurrently.
-          // dereference: false preserves symlinks (e.g. node_modules/.bin)
-          // instead of following them, which causes EINVAL on circular refs.
-          const dstPath = path.join(worktreeBase, entry.name);
-          fs.cpSync(srcPath, dstPath, { recursive: true, dereference: false });
+          if (!isSafeRepoName(entry.name)) {
+            logger.warn(
+              { group: groupFolder, threadId, repo: entry.name },
+              'Skipping repo with unsafe name during prepare',
+            );
+            continue;
+          }
+          gitRepos.push({ srcPath, wtPath: dstPath });
         } else {
-          // Symlink other directories (logs, etc.)
-          const dstPath = path.join(worktreeBase, entry.name);
-          if (!fs.existsSync(dstPath)) {
-            fs.symlinkSync(srcPath, dstPath);
+          // dereference: false preserves internal symlinks instead of
+          // following them (causes EINVAL on circular refs).
+          try {
+            fs.cpSync(srcPath, dstPath, {
+              recursive: true,
+              dereference: false,
+            });
+          } catch (err) {
+            logger.warn(
+              { group: groupFolder, threadId, dir: entry.name, err },
+              'Failed to copy host dir into scratch — agent will not see it this session',
+            );
           }
         }
       } else if (entry.isFile()) {
-        if (entry.name === 'CLAUDE.md') {
-          fs.copyFileSync(srcPath, path.join(worktreeBase, entry.name));
-        } else {
-          const dstPath = path.join(worktreeBase, entry.name);
-          if (!fs.existsSync(dstPath)) {
-            fs.symlinkSync(srcPath, dstPath);
-          }
+        if (isSensitiveTopLevelFilename(entry.name)) {
+          logger.warn(
+            { group: groupFolder, threadId, file: entry.name },
+            'Skipping sensitive top-level file (credential boundary)',
+          );
+          continue;
+        }
+        try {
+          fs.copyFileSync(srcPath, dstPath);
+        } catch (err) {
+          logger.warn(
+            { group: groupFolder, threadId, file: entry.name, err },
+            'Failed to copy host file into scratch — agent will not see it this session',
+          );
         }
       }
     }
@@ -1532,8 +1784,9 @@ export async function prepareThreadWorkspace(
 }
 
 /**
- * Clean up a per-thread worktree workspace.
- * Removes git worktrees, merges CLAUDE.md changes back, removes directory.
+ * Clean up a per-thread worktree workspace: merge CLAUDE.md back, rescue
+ * and remove git worktrees, promote agent-created clones via atomic
+ * rename, merge non-git scratch entries back to host, then rmSync.
  */
 export async function cleanupThreadWorkspace(
   groupFolder: string,
@@ -1584,51 +1837,10 @@ export async function cleanupThreadWorkspace(
     // ignore readdir errors
   }
 
-  // Rescue non-git content created or modified by the agent in the worktree.
-  // Git worktrees are already rescued above; symlinks already point to persistent
-  // storage. This catches new directories (e.g. plans/), new files, and copied
-  // directories (conversations/, threads/) that may have new entries.
-  try {
-    const gitWorktreeNames = new Set(
-      findGitWorktrees(worktreeBase).map(({ name }) => name),
-    );
-    for (const entry of fs.readdirSync(worktreeBase, { withFileTypes: true })) {
-      if (entry.name === 'CLAUDE.md') continue; // already merged above
-      if (gitWorktreeNames.has(entry.name)) continue; // already rescued
-
-      const srcEntry = path.join(worktreeBase, entry.name);
-      const dstEntry = path.join(groupDir, entry.name);
-
-      // Skip symlinks — they already point to the persistent group folder
-      try {
-        if (fs.lstatSync(srcEntry).isSymbolicLink()) continue;
-      } catch {
-        continue;
-      }
-
-      try {
-        if (entry.isDirectory()) {
-          // Merge: copy new/modified files into existing group dir
-          fs.cpSync(srcEntry, dstEntry, { recursive: true, force: false });
-        } else {
-          // Copy file if it doesn't exist in group dir, or if worktree version is newer
-          if (!fs.existsSync(dstEntry)) {
-            fs.cpSync(srcEntry, dstEntry);
-          } else {
-            const srcMtime = fs.statSync(srcEntry).mtimeMs;
-            const dstMtime = fs.statSync(dstEntry).mtimeMs;
-            if (srcMtime > dstMtime) {
-              fs.cpSync(srcEntry, dstEntry);
-            }
-          }
-        }
-      } catch {
-        // best-effort — never block cleanup
-      }
-    }
-  } catch {
-    // best-effort
-  }
+  // Promote agent-created git clones via atomic rename, then merge every
+  // other non-git scratch entry back to host.
+  await promoteAgentCreatedRepos(worktreeBase, groupDir, groupFolder, threadId);
+  mergeBackNonRepoEntries(worktreeBase, groupDir);
 
   // Remove worktree directory
   try {
@@ -1850,46 +2062,13 @@ export async function cleanupOrphanWorktrees(): Promise<void> {
           /* best-effort cache + rescue */
         }
 
-        // Rescue non-git content (same logic as cleanupThreadWorkspace)
+        // Recover agent-created clones and non-git content using the
+        // same shared helpers as the happy-path cleanup. Previously the
+        // orphan path used a lossy per-file merge that could produce
+        // chimeric Frankenrepos from interleaved crashed-thread scratches.
         if (fs.existsSync(groupDir)) {
-          try {
-            const gitWtNames = new Set(
-              findGitWorktrees(tdPath).map(({ name }) => name),
-            );
-            for (const entry of fs.readdirSync(tdPath, {
-              withFileTypes: true,
-            })) {
-              if (entry.name === 'CLAUDE.md') continue;
-              if (gitWtNames.has(entry.name)) continue;
-              const srcEntry = path.join(tdPath, entry.name);
-              const dstEntry = path.join(groupDir, entry.name);
-              try {
-                if (fs.lstatSync(srcEntry).isSymbolicLink()) continue;
-              } catch {
-                continue;
-              }
-              try {
-                if (entry.isDirectory()) {
-                  fs.cpSync(srcEntry, dstEntry, {
-                    recursive: true,
-                    force: false,
-                  });
-                } else if (!fs.existsSync(dstEntry)) {
-                  fs.cpSync(srcEntry, dstEntry);
-                } else {
-                  const srcMtime = fs.statSync(srcEntry).mtimeMs;
-                  const dstMtime = fs.statSync(dstEntry).mtimeMs;
-                  if (srcMtime > dstMtime) {
-                    fs.cpSync(srcEntry, dstEntry);
-                  }
-                }
-              } catch {
-                /* best-effort */
-              }
-            }
-          } catch {
-            /* best-effort */
-          }
+          await promoteAgentCreatedRepos(tdPath, groupDir, gf, td);
+          mergeBackNonRepoEntries(tdPath, groupDir);
         }
 
         try {
@@ -1956,8 +2135,15 @@ function buildVolumeMounts(
   const homeDir = os.homedir();
   const groupDir = resolveGroupFolderPath(group.folder);
 
-  // Mount group folder: use worktree path if provided (per-thread isolation),
-  // otherwise mount the main group folder directly.
+  // Mount group folder: use the per-thread worktree base when threaded
+  // (agents in threaded channels get an isolated scratch workspace), or
+  // mount the host group folder directly for non-threaded channels.
+  //
+  // In threaded mode, agent-created top-level entries (e.g. `git clone
+  // NEW-REPO`) land in the scratch dir during the session and are atomically
+  // promoted to the host group folder by cleanupThreadWorkspace on teardown.
+  // This preserves per-thread write isolation at runtime while still making
+  // new clones persist across threads.
   const effectiveGroupDir = worktreePath || groupDir;
 
   if (isMain) {
@@ -2020,6 +2206,28 @@ function buildVolumeMounts(
           readonly: true,
         });
       }
+    }
+  }
+
+  // Non-threaded mode shadow: when the group folder is mounted directly
+  // (no worktree scratch), emit /dev/null shadows for sensitive top-level
+  // files so credentials never reach the container. Threaded mode already
+  // filters these at cpSync time in prepareThreadWorkspace. Mirrors the
+  // existing .env shadow pattern above for the project mount.
+  if (!worktreePath && fs.existsSync(groupDir)) {
+    try {
+      for (const entry of fs.readdirSync(groupDir, { withFileTypes: true })) {
+        if (!entry.isFile()) continue;
+        if (!isSensitiveTopLevelFilename(entry.name)) continue;
+        mounts.push({
+          hostPath: '/dev/null',
+          containerPath: path.posix.join('/workspace/group', entry.name),
+          readonly: true,
+        });
+      }
+    } catch {
+      // best-effort — missing read permission just means no shadow is
+      // applied, which matches the pre-shadow behavior
     }
   }
 
@@ -3330,23 +3538,33 @@ export async function runContainerAgent(
 
   // When running as root (UID 0), writable mount directories are owned by root,
   // but the container runs as `node` (UID 1000). chown them so the container can write.
+  //
+  // NEVER chown paths under GROUPS_DIR — the persistent host group folder
+  // is owned by the operator (typically uid 1000 or 1001 depending on
+  // the deploy), and flipping ownership to a hardcoded 1000 would lock
+  // the operator out of their own files on any host where the user uid
+  // isn't 1000. Latent footgun on Dave's current systemd deploy (uid 1001),
+  // exposed under the deferred-promotion design because groupDir is now
+  // a writable mount path when threaded.
   if (process.getuid?.() === 0) {
     for (const m of mounts) {
-      if (!m.readonly && fs.existsSync(m.hostPath)) {
-        try {
-          fs.chownSync(m.hostPath, 1000, 1000);
-          // Also chown immediate children (e.g. debug/, input/, messages/)
-          for (const child of fs.readdirSync(m.hostPath)) {
-            const childPath = path.join(m.hostPath, child);
-            try {
-              fs.chownSync(childPath, 1000, 1000);
-            } catch {
-              // skip files we can't chown (e.g. read-only)
-            }
+      if (m.readonly || !fs.existsSync(m.hostPath)) continue;
+      if (m.hostPath === GROUPS_DIR || m.hostPath.startsWith(GROUPS_DIR + path.sep)) {
+        continue;
+      }
+      try {
+        fs.chownSync(m.hostPath, 1000, 1000);
+        // Also chown immediate children (e.g. debug/, input/, messages/)
+        for (const child of fs.readdirSync(m.hostPath)) {
+          const childPath = path.join(m.hostPath, child);
+          try {
+            fs.chownSync(childPath, 1000, 1000);
+          } catch {
+            // skip files we can't chown (e.g. read-only)
           }
-        } catch {
-          // best-effort
         }
+      } catch {
+        // best-effort
       }
     }
   }
