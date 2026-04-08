@@ -138,6 +138,20 @@ export const EFFORT_FLAG_PATTERN =
 // One-shot flag: "-e1 max" — just this invocation, doesn't stick
 export const EFFORT_ONESHOT_PATTERN = /(?:^|\s)-e1\s+(low|medium|high|max)\b/i;
 
+/**
+ * Strip all model / effort control flags from a message. Used by the gate
+ * auto-cancel intercepts to decide whether a user reply is a real message
+ * (should auto-cancel the gate) or a bare control switch (should NOT
+ * cancel — the gate stays pending while the flag is forwarded via IPC).
+ */
+export function stripControlFlags(content: string): string {
+  return content
+    .replace(MODEL_ONESHOT_PATTERN, '')
+    .replace(MODEL_FLAG_PATTERN, '')
+    .replace(EFFORT_ONESHOT_PATTERN, '')
+    .replace(EFFORT_FLAG_PATTERN, '');
+}
+
 export const DEFAULT_TRIGGER = `@${ASSISTANT_NAME}`;
 
 export function getTriggerPattern(trigger?: string): RegExp {

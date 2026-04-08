@@ -8,6 +8,7 @@ import {
   MAX_THREADS_PER_GROUP,
 } from './config.js';
 import { ContainerAttachment } from './container-runner.js';
+import { clearGatesForThread } from './ipc.js';
 
 // Monotonic counter for IPC filenames — ensures correct ordering when
 // multiple files are written in the same millisecond (e.g., control + text).
@@ -480,6 +481,25 @@ export class GroupQueue {
       }
       state.activeThreads.delete(slot.currentKey);
       this.activeCount--;
+
+      // Sweep dead gates owned by this slot so the next message in the
+      // thread doesn't trigger auto-cancel on an already-abandoned gate.
+      // Stale buttons left in chat no-op safely via onGateAction → false.
+      try {
+        const swept = clearGatesForThread(processJid, 'teardown');
+        if (swept.length > 0) {
+          logger.info(
+            { groupJid, processJid, sweptCount: swept.length },
+            'Swept dead gates on container teardown',
+          );
+        }
+      } catch (err) {
+        logger.warn(
+          { groupJid, processJid, err },
+          'Failed to sweep dead gates on teardown',
+        );
+      }
+
       this.drainGroup(groupJid);
     }
   }
@@ -517,6 +537,24 @@ export class GroupQueue {
       }
       state.activeThreads.delete(taskThreadKey);
       this.activeCount--;
+
+      // Same teardown sweep as runForGroup, but tasks have no thread
+      // suffix so the sweep jid equals groupJid.
+      try {
+        const swept = clearGatesForThread(groupJid, 'teardown');
+        if (swept.length > 0) {
+          logger.info(
+            { groupJid, taskId: task.id, sweptCount: swept.length },
+            'Swept dead gates on task teardown',
+          );
+        }
+      } catch (err) {
+        logger.warn(
+          { groupJid, taskId: task.id, err },
+          'Failed to sweep dead gates on task teardown',
+        );
+      }
+
       this.drainGroup(groupJid);
     }
   }

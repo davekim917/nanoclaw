@@ -31,9 +31,17 @@ import {
 import { downloadAttachment } from '../attachment-downloader.js';
 import { getThreadOrigin, setThreadOrigin } from '../db.js';
 import { readEnvFile } from '../env.js';
+import { recordGatePostedMessage } from '../ipc.js';
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
-import { Attachment, Channel } from '../types.js';
+import {
+  Attachment,
+  Channel,
+  GateClearReason,
+  GateDecision,
+  GATE_CLEAR_REASON_TEXT,
+  InteractiveGate,
+} from '../types.js';
 import { transformTablesInText } from '../table-renderer.js';
 
 const execAsync = promisify(exec);
@@ -354,6 +362,10 @@ export class DiscordChannel implements Channel {
           const btn = interaction as ButtonInteraction;
           if (btn.customId.startsWith('merge:')) {
             await this.handleMergeButton(btn);
+          } else if (btn.customId.startsWith('gate_approve:')) {
+            await this.handleGateButton(btn, 'approved');
+          } else if (btn.customId.startsWith('gate_cancel:')) {
+            await this.handleGateButton(btn, 'cancelled');
           }
         } else if (interaction.isChatInputCommand() && isNanoclawChannel) {
           const cmd = interaction as ChatInputCommandInteraction;
@@ -526,6 +538,189 @@ export class DiscordChannel implements Channel {
       logger.info({ jid, length: text.length }, 'Discord message sent');
     } catch (err) {
       logger.error({ jid, err }, 'Failed to send Discord message');
+    }
+  }
+
+  /**
+   * Post a destructive-command gate as an interactive message with
+   * Approve / Cancel buttons. Button clicks route back through the
+   * InteractionCreate handler, which calls handleGateButton →
+   * ChannelOpts.onGateAction. Throws on API errors or missing client so
+   * the caller (ipc.ts dispatchGateNotification) can fall back to a
+   * plain-text prompt.
+   */
+  async sendInteractiveGate(
+    jid: string,
+    gate: InteractiveGate,
+    triggerMessageId?: string | null,
+  ): Promise<void> {
+    if (!this.client) {
+      throw new Error(
+        'Discord client not initialized — cannot send interactive gate',
+      );
+    }
+    if (!jid.startsWith('dc:')) {
+      throw new Error(
+        `DiscordChannel.sendInteractiveGate received non-Discord JID: ${jid}`,
+      );
+    }
+
+    // Discord custom_id max is 100 chars; `gate_approve:` prefix is 13 chars.
+    // Our gate IDs are ~25 chars so this is safe, but guard explicitly.
+    const approveId = `gate_approve:${gate.gateId}`;
+    const cancelId = `gate_cancel:${gate.gateId}`;
+    if (approveId.length > 100 || cancelId.length > 100) {
+      throw new Error(
+        `Gate ID too long for Discord button custom_id: ${gate.gateId}`,
+      );
+    }
+
+    // Content: label + summary + optional command preview. Discord's 2000
+    // char message limit is shared with the command block, so truncate.
+    const commandBlock = gate.command
+      ? `\n\`\`\`\n${gate.command.slice(0, 1500)}\n\`\`\``
+      : '';
+    const content = (
+      `:warning: **Gate: ${gate.label}**\n\n${gate.summary}${commandBlock}\n\n` +
+      `_Click **Approve** or **Cancel** to resolve. A text reply auto-cancels the gate — the agent will answer your question but will NOT retry the destructive command on its own. Ask explicitly if you want to proceed._`
+    ).slice(0, 2000);
+
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder()
+        .setCustomId(approveId)
+        .setLabel('Approve')
+        .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId(cancelId)
+        .setLabel('Cancel')
+        .setStyle(ButtonStyle.Danger),
+    );
+
+    // Resolve the target channel. Three cases:
+    // (1) jid is already thread-scoped → send into the thread channel.
+    // (2) jid is top-level AND triggerMessageId is set AND no thread has
+    //     been created yet for this conversation → create a thread on the
+    //     triggering message and post the gate into the new thread. This
+    //     mirrors sendMessage's behaviour so the gate lives alongside the
+    //     agent's subsequent replies.
+    // (3) jid is top-level AND no trigger available → post to the channel
+    //     root (rare; top-level gate).
+    const parsed = parseThreadJid(jid);
+    let sendChannelId: string;
+    let createdThreadId: string | undefined;
+
+    if (parsed) {
+      sendChannelId = parsed.threadId;
+    } else {
+      const parentChannelId = jid.replace(/^dc:/, '');
+      const convKey = triggerMessageId ? `${jid}:${triggerMessageId}` : jid;
+      const existingRedirect = this.createdThreadJid.get(convKey);
+      if (existingRedirect) {
+        // A thread was already created for this conversation (e.g. agent
+        // streamed some text before the destructive call fired). Use it.
+        const existingParsed = parseThreadJid(existingRedirect);
+        sendChannelId = existingParsed
+          ? existingParsed.threadId
+          : parentChannelId;
+      } else if (triggerMessageId) {
+        // No thread yet — create one from the trigger message, then send
+        // the gate into the fresh thread. We bootstrap the thread with a
+        // minimal starter message (the name is computed from the trigger),
+        // then send the full gate components message separately.
+        try {
+          const starterText = `:warning: **${gate.label}** — approval required.`;
+          const newThreadId = await this.createThreadAndSend(
+            parentChannelId,
+            triggerMessageId,
+            starterText,
+          );
+          if (!newThreadId) {
+            throw new Error(
+              `createThreadAndSend returned null for trigger ${triggerMessageId}`,
+            );
+          }
+          createdThreadId = newThreadId;
+          const threadJid = `dc:${parentChannelId}:thread:${newThreadId}`;
+          this.createdThreadJid.set(convKey, threadJid);
+          this.threadOriginMessage.set(newThreadId, triggerMessageId);
+          try {
+            setThreadOrigin(newThreadId, triggerMessageId, jid);
+          } catch (err) {
+            logger.warn(
+              { newThreadId, triggerMessageId, jid, err },
+              'Failed to persist thread origin to SQLite (gate path)',
+            );
+          }
+          sendChannelId = newThreadId;
+        } catch (err) {
+          logger.error(
+            { jid, gateId: gate.gateId, triggerMessageId, err },
+            'Failed to create Discord thread for interactive gate',
+          );
+          throw err;
+        }
+      } else {
+        sendChannelId = parentChannelId;
+      }
+    }
+
+    const channel = await this.client.channels.fetch(sendChannelId);
+    if (!channel || !('send' in channel)) {
+      throw new Error(
+        `Discord channel ${sendChannelId} not found or not sendable for gate ${gate.gateId}`,
+      );
+    }
+
+    const sent = await (channel as TextChannel | ThreadChannel).send({
+      content,
+      components: [row],
+    });
+
+    recordGatePostedMessage(gate.gateId, {
+      channel: 'discord',
+      channelId: sendChannelId,
+      messageId: sent.id,
+    });
+
+    logger.info(
+      {
+        jid,
+        gateId: gate.gateId,
+        sendChannelId,
+        createdThreadId,
+        postedMessageId: sent.id,
+      },
+      'Discord interactive gate sent',
+    );
+  }
+
+  /**
+   * Clear the approve/cancel buttons on a previously-posted gate message.
+   * Non-fatal — the gate state is already resolved; only the UI is stale.
+   */
+  async clearGateButtons(
+    channelId: string,
+    messageId: string,
+    decision: GateDecision,
+    reason: GateClearReason,
+  ): Promise<void> {
+    if (!this.client) return;
+    const icon = decision === 'approved' ? ':white_check_mark:' : ':x:';
+    const reasonText = GATE_CLEAR_REASON_TEXT[reason];
+    try {
+      const channel = await this.client.channels.fetch(channelId);
+      if (!channel || !('messages' in channel)) return;
+      const textChannel = channel as TextChannel | ThreadChannel;
+      const message = await textChannel.messages.fetch(messageId);
+      await message.edit({
+        content: `${icon} **Gate ${decision}** — ${reasonText}`,
+        components: [],
+      });
+    } catch (err) {
+      logger.warn(
+        { channelId, messageId, decision, err },
+        'Failed to clear Discord gate buttons',
+      );
     }
   }
 
@@ -1150,6 +1345,66 @@ export class DiscordChannel implements Channel {
         execErr.stderr?.trim().split('\n')[0] ||
         (err instanceof Error ? err.message.split('\n')[0] : 'Unknown error');
       await interaction.editReply(`Merge failed: ${msg}`).catch(() => {});
+    }
+  }
+
+  /**
+   * Gate button click handler. `deferUpdate()` runs first because Discord
+   * interactions have a 3s response window and resolveInMemoryGate writes
+   * an IPC file, which can exceed 3s on slow filesystems. Stale-click
+   * contract (onGateAction returning false) is documented on OnGateAction
+   * in types.ts.
+   */
+  private async handleGateButton(
+    interaction: ButtonInteraction,
+    decision: GateDecision,
+  ): Promise<void> {
+    const prefix = decision === 'approved' ? 'gate_approve:' : 'gate_cancel:';
+    const gateId = interaction.customId.slice(prefix.length);
+    if (!gateId) {
+      logger.warn({ customId: interaction.customId }, 'Gate button missing ID');
+      await interaction
+        .reply({ content: 'Invalid gate action.', ephemeral: true })
+        .catch(() => {});
+      return;
+    }
+
+    try {
+      await interaction.deferUpdate();
+      const resolved = this.opts.onGateAction?.(gateId, decision) ?? false;
+      const userRef = `<@${interaction.user.id}>`;
+
+      if (!resolved) {
+        // Stale click: gate was already resolved. Render a neutral
+        // indicator — do NOT falsely tell the user a destructive command
+        // was approved/cancelled when it might have been the opposite.
+        await interaction.editReply({
+          content:
+            `:warning: **Gate already resolved** — your click had no effect. ` +
+            `The gate was likely auto-cancelled by your earlier text reply or ` +
+            `expired. If you still want to run the destructive command, ` +
+            `ask the agent to retry explicitly.`,
+          components: [],
+        });
+        logger.info(
+          { gateId, attemptedDecision: decision, userId: interaction.user.id },
+          'Discord gate button: stale click (gate already resolved)',
+        );
+        return;
+      }
+
+      const icon = decision === 'approved' ? ':white_check_mark:' : ':x:';
+      const past = decision === 'approved' ? 'approved' : 'cancelled';
+      await interaction.editReply({
+        content: `${icon} **Gate ${past}** by ${userRef}`,
+        components: [],
+      });
+      logger.info(
+        { gateId, decision, userId: interaction.user.id },
+        'Discord gate button resolved',
+      );
+    } catch (err) {
+      logger.error({ err, gateId, decision }, 'Gate button handler error');
     }
   }
 

@@ -12,7 +12,15 @@ import {
 } from '../config.js';
 import { downloadAttachment } from '../attachment-downloader.js';
 import { getRouterState, setRouterState, updateChatName } from '../db.js';
-import { ContainerConfig, Attachment } from '../types.js';
+import { recordGatePostedMessage } from '../ipc.js';
+import {
+  ContainerConfig,
+  Attachment,
+  InteractiveGate,
+  GateDecision,
+  GateClearReason,
+  GATE_CLEAR_REASON_TEXT,
+} from '../types.js';
 import { readEnvFile, readEnvFileMatching } from '../env.js';
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
@@ -371,6 +379,84 @@ export class SlackChannel implements Channel {
           downloadedAttachments.length > 0 ? downloadedAttachments : undefined,
       });
     });
+
+    // Interactive-gate button clicks. Single regex handler dispatches
+    // both action_ids; resolution is owned by ChannelOpts.onGateAction.
+    // See OnGateAction in types.ts for the stale-click contract.
+    this.app.action(
+      /^gate_(approve|cancel)$/,
+      async ({ ack, action, body, respond }) => {
+        await ack();
+        try {
+          const a = action as { action_id?: string; value?: string };
+          const decision: GateDecision =
+            a.action_id === 'gate_approve' ? 'approved' : 'cancelled';
+          const gateId = a.value;
+          if (!gateId) {
+            logger.warn({ actionId: a.action_id }, 'Gate button missing value');
+            return;
+          }
+
+          const resolved = this.opts.onGateAction?.(gateId, decision) ?? false;
+          const userId =
+            (body as { user?: { id?: string; name?: string } }).user?.id || '';
+          const userRef = userId ? `<@${userId}>` : 'user';
+
+          if (!resolved) {
+            // Stale click: gate was already resolved (auto-cancelled by an
+            // earlier text reply, TTL expired, or duplicate click). Render
+            // a neutral "no longer pending" indicator instead of a success
+            // indicator — the destructive command may have been REJECTED
+            // even though the user clicked Approve.
+            await respond({
+              replace_original: true,
+              text: 'Gate already resolved',
+              blocks: [
+                {
+                  type: 'section',
+                  text: {
+                    type: 'mrkdwn',
+                    text:
+                      `:warning: *Gate already resolved* — your click had no effect. ` +
+                      `The gate was likely auto-cancelled by your earlier text reply or ` +
+                      `expired. If you still want to run the destructive command, ` +
+                      `ask the agent to retry explicitly.`,
+                  },
+                },
+              ],
+            });
+            logger.info(
+              { gateId, attemptedDecision: decision, userId },
+              'Slack gate button: stale click (gate already resolved)',
+            );
+            return;
+          }
+
+          // Happy path: this click is the one that resolved the gate.
+          const icon = decision === 'approved' ? ':white_check_mark:' : ':x:';
+          const past = decision === 'approved' ? 'approved' : 'cancelled';
+          await respond({
+            replace_original: true,
+            text: `${icon} Gate ${past} by ${userRef}`,
+            blocks: [
+              {
+                type: 'section',
+                text: {
+                  type: 'mrkdwn',
+                  text: `${icon} *Gate ${past}* by ${userRef}`,
+                },
+              },
+            ],
+          });
+          logger.info(
+            { gateId, decision, userId },
+            'Slack gate button resolved',
+          );
+        } catch (err) {
+          logger.error({ err }, 'Slack gate button handler error');
+        }
+      },
+    );
   }
 
   async connect(): Promise<void> {
@@ -442,6 +528,126 @@ export class SlackChannel implements Channel {
       logger.warn(
         { jid, err, queueSize: this.outgoingQueue.length },
         'Failed to send Slack message, queued',
+      );
+    }
+  }
+
+  /**
+   * Post a destructive-command gate as an interactive Block Kit message
+   * with Approve / Cancel buttons. Throws on API errors so the caller
+   * (ipc.ts dispatchGateNotification) can fall back to a plain-text prompt.
+   */
+  async sendInteractiveGate(
+    jid: string,
+    gate: InteractiveGate,
+    triggerMessageId?: string | null,
+  ): Promise<void> {
+    if (!jid.startsWith('slack:')) {
+      throw new Error(
+        `SlackChannel.sendInteractiveGate received non-Slack JID: ${jid}`,
+      );
+    }
+    const parsed = parseThreadJid(jid);
+    const channelId = parsed ? parsed.parentId : jid.replace(/^slack:/, '');
+    // Slack threads are anchored by the triggering message ts. Priority:
+    // thread jid > explicit triggerMessageId > last-seen user message ts.
+    const threadTs =
+      parsed?.threadId ??
+      (triggerMessageId === null ? undefined : triggerMessageId) ??
+      this.replyThreadTs.get(jid);
+
+    // Section text: label + summary + optional command preview.
+    // Slack mrkdwn caps at ~3000 chars per section — truncate command defensively.
+    const commandBlock = gate.command
+      ? `\n\n\`\`\`\n${gate.command.slice(0, 1500)}\n\`\`\``
+      : '';
+    const sectionText = `:warning: *Gate: ${gate.label}*\n\n${gate.summary}${commandBlock}\n\n_Click *Approve* or *Cancel* to resolve. A text reply auto-cancels the gate — the agent will answer your question but will NOT retry the destructive command on its own. Ask explicitly if you want to proceed._`;
+
+    const result = await this.app.client.chat.postMessage({
+      channel: channelId,
+      thread_ts: threadTs,
+      text: `Gate: ${gate.label}`, // fallback for notifications
+      blocks: [
+        {
+          type: 'section',
+          text: { type: 'mrkdwn', text: sectionText },
+        },
+        {
+          type: 'actions',
+          block_id: `gate_controls_${gate.gateId}`,
+          elements: [
+            {
+              type: 'button',
+              style: 'primary',
+              text: { type: 'plain_text', text: 'Approve' },
+              action_id: 'gate_approve',
+              value: gate.gateId,
+            },
+            {
+              type: 'button',
+              style: 'danger',
+              text: { type: 'plain_text', text: 'Cancel' },
+              action_id: 'gate_cancel',
+              value: gate.gateId,
+            },
+          ],
+        },
+      ],
+    });
+
+    // Record the posted message identity so the orchestrator can clear the
+    // buttons if the gate is resolved via a path other than a click
+    // (auto-cancel-on-text, TTL expiry, container teardown).
+    const postedTs = (result as { ts?: string }).ts;
+    const postedChannel = (result as { channel?: string }).channel ?? channelId;
+    if (postedTs) {
+      recordGatePostedMessage(gate.gateId, {
+        channel: 'slack',
+        channelId: postedChannel,
+        messageId: postedTs,
+      });
+    }
+
+    logger.info(
+      { jid, gateId: gate.gateId, threadTs, postedTs },
+      'Slack interactive gate sent',
+    );
+  }
+
+  /**
+   * Clear the approve/cancel buttons on a previously-posted gate message.
+   * Non-fatal — the gate state is already resolved; only the UI is stale.
+   */
+  async clearGateButtons(
+    channelId: string,
+    messageTs: string,
+    decision: GateDecision,
+    reason: GateClearReason,
+  ): Promise<void> {
+    const icon =
+      decision === 'approved'
+        ? ':white_check_mark:'
+        : ':heavy_multiplication_x:';
+    const reasonText = GATE_CLEAR_REASON_TEXT[reason];
+    try {
+      await this.app.client.chat.update({
+        channel: channelId,
+        ts: messageTs,
+        text: `Gate ${decision} — ${reasonText}`,
+        blocks: [
+          {
+            type: 'section',
+            text: {
+              type: 'mrkdwn',
+              text: `${icon} *Gate ${decision}* — ${reasonText}`,
+            },
+          },
+        ],
+      });
+    } catch (err) {
+      logger.warn(
+        { channelId, messageTs, decision, err },
+        'Failed to clear Slack gate buttons',
       );
     }
   }

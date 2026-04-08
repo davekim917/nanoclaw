@@ -37,6 +37,7 @@ import {
   makeWebJid,
   parseThreadJid,
   resolveAssistantName,
+  stripControlFlags,
 } from './config.js';
 import './channels/index.js';
 import {
@@ -163,6 +164,16 @@ const GATE_APPROVE_PATTERN =
   /^(approve[d]?|yes|go|proceed|do it|send it|lgtm|ok|confirmed?|ship it)$/;
 const GATE_CANCEL_PATTERN =
   /^(cancel|no|stop|abort|don'?t|reject|nope|nevermind|never mind)$/;
+
+/**
+ * User-facing message sent when auto-cancel-on-text fires. The "will NOT
+ * auto-retry" clause is load-bearing — the plugin hook explicitly blocks
+ * the agent from spontaneously re-issuing the destructive command, so the
+ * user must re-request explicitly.
+ */
+function buildGateAutoCancelNotice(label: string): string {
+  return `↪️ Cancelled gate *"${label}"* to answer your question. The agent will NOT auto-retry — explicitly re-request if you still want to proceed.`;
+}
 
 let lastTimestamp = '';
 let sessions = new Map<string, string>(); // V2: composite session keys
@@ -741,9 +752,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
   }
 
-  // --- Gate resolution (check before normal agent dispatch) ---
-  // If a gate is pending for this JID, check if the user is approving or cancelling.
-  // Resolving writes the IPC response file which unblocks the plugin hook in the container.
+  // --- Gate resolution ---
+  // Check before normal agent dispatch. Interactive channels also
+  // auto-cancel on non-approve/cancel text replies — auto-retry is blocked
+  // at the plugin hook, so the user must re-request explicitly.
   const pendingGate = getInMemoryGateByJid(chatJid);
   if (pendingGate) {
     const lastMsg = missedMessages[missedMessages.length - 1];
@@ -775,6 +787,59 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         triggerMsgId,
       );
       return true;
+    } else if (channel.sendInteractiveGate) {
+      // Auto-cancel-on-text: interactive channels treat non-approve/cancel
+      // replies as clarifying questions. Bare control-flag switches
+      // (e.g. `-m haiku`) must NOT cancel — fall through and let runAgent
+      // apply the override on the next turn.
+      const strippedOfFlags = stripControlFlags(
+        lastMsg.content.replace(triggerPattern, ''),
+      ).trim();
+
+      if (strippedOfFlags.length > 0) {
+        // Snapshot before resolveInMemoryGate deletes the Map entry.
+        const gateLabel = pendingGate.label;
+        const postedRef = pendingGate.postedRef;
+        const cancelled = resolveInMemoryGate(pendingGate.id, 'cancelled');
+        if (cancelled) {
+          logger.info(
+            {
+              gateId: pendingGate.id,
+              label: gateLabel,
+              reason: 'clarifying_question',
+            },
+            'Gate auto-cancelled — clarifying question',
+          );
+          if (postedRef && channel.clearGateButtons) {
+            channel
+              .clearGateButtons(
+                postedRef.channelId,
+                postedRef.messageId,
+                'cancelled',
+                'auto_cancel_text',
+              )
+              .catch((err: unknown) =>
+                logger.warn(
+                  { gateId: pendingGate.id, err },
+                  'Failed to clear gate buttons on auto-cancel',
+                ),
+              );
+          }
+          await channel
+            .sendMessage(
+              chatJid,
+              buildGateAutoCancelNotice(gateLabel),
+              triggerMsgId,
+            )
+            .catch((err: unknown) =>
+              logger.warn(
+                { chatJid, err },
+                'Failed to send gate-auto-cancel notice',
+              ),
+            );
+        }
+      }
+      // Fall through to agent dispatch (runAgent extracts model override).
     }
   }
   // --- End gate resolution ---
@@ -2057,12 +2122,7 @@ async function startMessageLoop(): Promise<void> {
               }
 
               // Strip flags from the piped text so the agent sees clean prompt
-              formatted = formatted
-                .replace(MODEL_ONESHOT_PATTERN, '')
-                .replace(MODEL_FLAG_PATTERN, '')
-                .replace(EFFORT_ONESHOT_PATTERN, '')
-                .replace(EFFORT_FLAG_PATTERN, '')
-                .trim();
+              formatted = stripControlFlags(formatted).trim();
 
               logger.info(
                 {
@@ -2085,13 +2145,13 @@ async function startMessageLoop(): Promise<void> {
             }
           }
 
-          // Pre-pipe intercepts: gate resolution, then dynamic model downgrade.
-          // Order matters: the gate approve/cancel intercept MUST run before
-          // the downgrade check, otherwise gate replies like "ok"/"no"/"nope"
-          // (which are also classifier TRIVIAL words) would fire a spurious
-          // model_switch IPC mid-tool-call, swapping the query to Haiku
-          // before the gate resolves.
+          // Pre-pipe intercepts: gate resolution, then dynamic downgrade.
+          // Gate check MUST run first so gate-vocab words like "ok"/"nope"
+          // don't fire a spurious mid-tool-call model_switch to Haiku.
           let pipeGate: ReturnType<typeof getInMemoryGateByJid> = undefined;
+          // Extend the downgrade guard through the auto-cancel turn so a
+          // clarifying question about a destructive op keeps the larger model.
+          let autoCancelledPipeGate = false;
           if (canPipe && messagesToSend.length > 0) {
             const gateJid = incomingThreadId
               ? `${parentJid}:thread:${incomingThreadId}`
@@ -2128,15 +2188,78 @@ async function startMessageLoop(): Promise<void> {
                 for (const msg of messagesToSend)
                   attachmentCache.delete(msg.id);
                 continue;
+              } else if (channel.sendInteractiveGate) {
+                const strippedOfFlags = stripControlFlags(
+                  rawContent.replace(triggerRe, ''),
+                ).trim();
+                if (strippedOfFlags.length > 0) {
+                  // Snapshot before resolving (delete removes Map entry).
+                  const snapshotGateId = pipeGate.id;
+                  const snapshotLabel = pipeGate.label;
+                  const snapshotPostedRef = pipeGate.postedRef;
+                  const cancelled = resolveInMemoryGate(
+                    snapshotGateId,
+                    'cancelled',
+                  );
+                  if (cancelled) {
+                    autoCancelledPipeGate = true;
+                    logger.info(
+                      {
+                        gateId: snapshotGateId,
+                        label: snapshotLabel,
+                        reason: 'clarifying_question',
+                      },
+                      'Pipe gate auto-cancelled — clarifying question routed to agent',
+                    );
+                    // Clear the original buttons so a later click can't
+                    // misrepresent the outcome.
+                    if (snapshotPostedRef && channel.clearGateButtons) {
+                      channel
+                        .clearGateButtons(
+                          snapshotPostedRef.channelId,
+                          snapshotPostedRef.messageId,
+                          'cancelled',
+                          'auto_cancel_text',
+                        )
+                        .catch((err: unknown) =>
+                          logger.warn(
+                            { gateId: snapshotGateId, err },
+                            'Failed to clear pipe-path gate buttons',
+                          ),
+                        );
+                    }
+                    // Await the notice so it arrives before the agent's
+                    // answer to the clarifying question (otherwise the user
+                    // sees the answer first and the "cancelled gate" notice
+                    // out of order).
+                    try {
+                      await channel.sendMessage(
+                        chatJid,
+                        buildGateAutoCancelNotice(snapshotLabel),
+                        incomingThreadId,
+                      );
+                    } catch (err) {
+                      logger.warn(
+                        { chatJid, err },
+                        'Failed to send pipe-gate-auto-cancel notice',
+                      );
+                    }
+                  }
+                  pipeGate = undefined;
+                }
+                // If strippedOfFlags.length === 0 (bare model/effort switch),
+                // we leave pipeGate set so the downgrade guard below still
+                // treats it as "gate pending" and doesn't fire a spurious
+                // model_switch — the flag intercept earlier already handled
+                // the switch.
               }
             }
           }
 
-          // Dynamic model downgrade for piped messages. The hasPendingGate
-          // guard catches the "ok looks fine" class: classifier marks it
-          // TRIVIAL via vocab but the exact-match gate regex above doesn't,
-          // so without this guard we'd still send a spurious mid-tool-call
-          // model_switch.
+          // Dynamic model downgrade for piped messages. hasPendingGate
+          // absorbs the "ok looks fine" class (TRIVIAL vocab that isn't a
+          // real gate reply); autoCancelledPipeGate extends the guard
+          // through the post-cancel clarifying-question turn.
           if (
             canPipe &&
             group.containerConfig?.dynamicModelDowngrade === true
@@ -2152,7 +2275,7 @@ async function startMessageLoop(): Promise<void> {
               {
                 hasOverride: !!extractModelOverride(messagesToSend),
                 hasAttachments: pipeAttachments.length > 0,
-                hasPendingGate: !!pipeGate,
+                hasPendingGate: !!pipeGate || autoCancelledPipeGate,
                 sessionModel: pipeSessionModel,
               },
             );
@@ -2577,6 +2700,21 @@ async function main(): Promise<void> {
     ) => storeChatMetadata(chatJid, timestamp, name, channel, isGroup),
     registeredGroups: () => registeredGroups,
     registerGroup,
+    // Channel-native interactive gate buttons (Slack Block Kit, Discord
+    // components) route here to resolve the in-memory gate. This writes
+    // the IPC response that unblocks the plugin hook polling inside the
+    // container. Returns `true` when the gate was actually resolved so
+    // channel handlers can distinguish a real click from a stale one.
+    onGateAction: (gateId: string, decision: 'approved' | 'cancelled') => {
+      const resolved = resolveInMemoryGate(gateId, decision);
+      if (!resolved) {
+        logger.warn(
+          { gateId, decision },
+          'Gate button clicked but gate not found (TTL expired or already resolved)',
+        );
+      }
+      return resolved;
+    },
   };
 
   // Create and connect all registered channels.
@@ -2734,6 +2872,28 @@ async function main(): Promise<void> {
         return channel.sendSwarmMessage(resolvedJid, text, sender);
       }
       return channel.sendMessage(resolvedJid, text, triggerMsgId);
+    },
+    sendInteractiveGate: async (jid, gate, threadId?) => {
+      const channel = findChannel(channels, jid);
+      if (!channel) throw new Error(`No channel for JID: ${jid}`);
+      if (!channel.sendInteractiveGate) return false;
+
+      // Mirror the parent→thread JID resolution used by sendMessage so
+      // the interactive gate lands in the correct Slack thread / Discord
+      // thread channel. When the thread hasn't been created yet, pass
+      // `threadId` as `triggerMessageId` so the channel can create the
+      // thread on first post.
+      const resolvedJid = channel.resolveIpcJid?.(jid, threadId) ?? jid;
+      ipcOutputSentJids.add(jid);
+      if (resolvedJid !== jid) ipcOutputSentJids.add(resolvedJid);
+
+      const isAlreadyThread = !!parseThreadJid(resolvedJid);
+      const triggerMsgId = !isAlreadyThread && threadId ? threadId : null;
+
+      // Channels throw on failure; success → return true so the ipc.ts
+      // caller skips the text fallback.
+      await channel.sendInteractiveGate(resolvedJid, gate, triggerMsgId);
+      return true;
     },
     sendFile: async (jid, file, caption?, _sender?, threadId?) => {
       const channel = findChannel(channels, jid);

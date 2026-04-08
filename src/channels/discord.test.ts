@@ -47,6 +47,11 @@ vi.mock('../db.js', () => ({
   updateChatName: vi.fn(),
 }));
 
+// Mock ipc — discord.ts imports recordGatePostedMessage for interactive gates.
+vi.mock('../ipc.js', () => ({
+  recordGatePostedMessage: vi.fn(),
+}));
+
 // --- discord.js mock ---
 
 type Handler = (...args: any[]) => any;

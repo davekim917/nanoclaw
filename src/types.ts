@@ -203,6 +203,77 @@ export interface SendMessageOptions {
   suppressActions?: boolean;
 }
 
+/**
+ * Decision on a destructive-command gate — matches
+ * the in-memory gate state in src/ipc.ts.
+ */
+export type GateDecision = 'approved' | 'cancelled';
+
+/**
+ * Reason a gate's chat-native buttons are being cleared. Used by
+ * Channel.clearGateButtons to render the right explanatory text.
+ * `auto_cancel_text` is only reachable via the orchestrator's
+ * auto-cancel-on-text path, never from the teardown/TTL sweeps.
+ */
+export type GateClearReason =
+  | 'auto_cancel_text'
+  | 'ttl_expired'
+  | 'teardown'
+  | 'other';
+
+/**
+ * User-facing explanation shown when a gate's buttons are cleared via
+ * Channel.clearGateButtons. Single source of truth so Slack and Discord
+ * can't drift on safety-relevant copy.
+ */
+export const GATE_CLEAR_REASON_TEXT: Record<GateClearReason, string> = {
+  auto_cancel_text: 'auto-cancelled by your text reply',
+  ttl_expired: 'expired (no decision within the TTL)',
+  teardown: 'cancelled (session ended)',
+  other: 'resolved via another path',
+};
+
+/**
+ * Payload a channel needs to render an interactive destructive-command gate.
+ * Channels that support interactive components (buttons) render approve/cancel
+ * controls so the user doesn't have to type `approve`/`cancel` as text.
+ */
+export interface InteractiveGate {
+  /**
+   * Opaque gate identifier — round-tripped through button action IDs.
+   * Constraints:
+   * - ASCII alphanumeric + `-` + `_`. Unicode is NOT safe through Slack/Discord button payloads.
+   * - Max ~80 chars so Discord's 100-char custom_id limit (prefixed with `gate_approve:` / `gate_cancel:`) is not exceeded.
+   * - Lifetime bounded by GATE_TTL_MS (10 min); buttons no-op after expiry.
+   */
+  gateId: string;
+  /** Short label (e.g. "Destructive Snowflake SQL (DROP/TRUNCATE/DELETE)"). */
+  label: string;
+  /** Longer description of what the agent is about to do. */
+  summary: string;
+  /** Optional command preview (truncated before display). */
+  command?: string;
+}
+
+/**
+ * Callback a channel invokes when the user resolves a gate via an
+ * interactive component (button/action). The orchestrator wires this to
+ * resolveInMemoryGate so the plugin hook poll unblocks.
+ *
+ * Returns `true` when the gate was found and resolved by this call, `false`
+ * when it was already gone (TTL expired, auto-cancelled by a text reply,
+ * duplicate click, or bot restart). Channels MUST branch on this value and
+ * render an "already resolved" indicator instead of a success/cancel
+ * indicator when it returns false — otherwise a stale button click falsely
+ * tells the user a destructive command was authorised when it was not.
+ *
+ * Synchronous because `resolveInMemoryGate` is synchronous (writes a file via
+ * writeFileSync + Map.delete, no event-loop yield). If gate resolution
+ * becomes async, this signature must change to `Promise<boolean>` and all
+ * button handlers must `await` before rendering UI.
+ */
+export type OnGateAction = (gateId: string, decision: GateDecision) => boolean;
+
 export interface Channel {
   name: string;
   connect(): Promise<void>;
@@ -253,6 +324,40 @@ export interface Channel {
   // this resolves to the thread JID created by the streaming output path.
   // threadId narrows to the specific conversation (prevents cross-thread misrouting).
   resolveIpcJid?(jid: string, threadId?: string): string;
+  /**
+   * Post a destructive-command gate as an interactive message with native
+   * approve/cancel buttons. Channels that implement this MUST also dispatch
+   * button clicks into ChannelOpts.onGateAction. Channels that do NOT
+   * implement it fall back to the plain-text gate prompt handled by ipc.ts.
+   *
+   * Failures (API errors, unsendable channel, missing client) MUST throw —
+   * the IpcDeps wrapper translates throws into a text fallback.
+   *
+   * @param jid chat JID (may be parent or thread-scoped)
+   * @param gate gate payload (see `InteractiveGate` for constraints)
+   * @param triggerMessageId optional trigger message anchor; Discord uses
+   *   this to create a fresh thread when the gate fires before any agent
+   *   text output has created one. Slack threads are anchored by the
+   *   user's triggering message ts (replyThreadTs).
+   */
+  sendInteractiveGate?(
+    jid: string,
+    gate: InteractiveGate,
+    triggerMessageId?: string | null,
+  ): Promise<void>;
+  /**
+   * Clear the approve/cancel buttons on a previously-posted interactive
+   * gate message and replace them with a resolution indicator. Called
+   * when a gate resolves via a non-click path (auto-cancel-on-text, TTL
+   * expiry, container teardown) to keep the chat UI consistent with the
+   * actual gate state. Non-fatal on failure — log and return.
+   */
+  clearGateButtons?(
+    channelId: string,
+    messageId: string,
+    decision: GateDecision,
+    reason: GateClearReason,
+  ): Promise<void>;
 }
 
 // --- Cockpit user management ---

@@ -16,6 +16,14 @@ vi.mock('./group-folder.js', () => ({
     `/tmp/nanoclaw-test-data/ipc/${folder}/input/${threadId}`,
 }));
 
+// Mock ipc.js — runForGroup/runTask finally blocks call clearGatesForThread
+// to sweep dead destructive-command gates on container teardown. The queue
+// tests don't exercise gates, so a no-op stub is sufficient and avoids
+// pulling the full ipc.ts import graph into the test.
+vi.mock('./ipc.js', () => ({
+  clearGatesForThread: vi.fn(() => []),
+}));
+
 // Mock fs operations used by sendMessage/closeStdin
 vi.mock('fs', async () => {
   const actual = await vi.importActual<typeof import('fs')>('fs');

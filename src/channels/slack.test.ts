@@ -43,6 +43,13 @@ vi.mock('../db.js', () => ({
   setRouterState: vi.fn(),
 }));
 
+// Mock ipc — slack.ts imports recordGatePostedMessage for interactive gates.
+// Mocking here avoids pulling in the full ipc.ts graph (container-runner,
+// group-folder, config internals) into the channel test.
+vi.mock('../ipc.js', () => ({
+  recordGatePostedMessage: vi.fn(),
+}));
+
 // --- @slack/bolt mock ---
 
 type Handler = (...args: any[]) => any;
@@ -86,6 +93,12 @@ vi.mock('@slack/bolt', () => ({
     event(name: string, handler: Handler) {
       this.eventHandlers.set(name, handler);
     }
+
+    // Bolt's action() accepts an action_id (string or regex) and a handler.
+    // Tests don't exercise button clicks, but setupEventHandlers (called
+    // from the SlackChannel constructor) registers a gate-button action
+    // handler, so this mock method must exist.
+    action(_actionId: string | RegExp, _handler: Handler) {}
 
     async start() {}
     async stop() {}

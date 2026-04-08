@@ -10,6 +10,7 @@ import {
   PLUGINS_DIR,
   TIMEZONE,
   getParentJid,
+  parseThreadJid,
 } from './config.js';
 import { AvailableGroup } from './container-runner.js';
 import {
@@ -27,6 +28,7 @@ import {
   getThreadMessages,
   getThreadMetadata,
   getThreadOrigin,
+  storeMessage,
   updateBacklogItem,
   updateTask,
 } from './db.js';
@@ -46,8 +48,24 @@ import { logger } from './logger.js';
 import { Memory, OutboundFile, RegisteredGroup } from './types.js';
 
 // ── In-memory gate tracking (replaces pending_gates DB table) ───────────────
-// Gates are short-lived (5min timeout). Lost on restart = OK — the container's
+// Gates are short-lived (10min TTL). Lost on restart = OK — the container's
 // plugin hook times out too.
+//
+// Reference to a posted interactive gate message. Used to clear the approve/
+// cancel buttons when the gate is resolved via a path other than a click
+// (auto-cancel-on-text, TTL expiry, container teardown). Without this,
+// stale buttons can still be clicked and display a misleading
+// "Gate approved" UI for a gate that was actually cancelled — a
+// safety-relevant misrepresentation for destructive commands.
+export interface GatePostedMessageRef {
+  /** Channel name from Channel.name (e.g. "slack", "slack:sunday", "discord"). */
+  channel: string;
+  /** Platform-native channel identifier (Slack channel id, Discord channel id). */
+  channelId: string;
+  /** Platform-native message identifier (Slack ts, Discord message snowflake). */
+  messageId: string;
+}
+
 interface InMemoryGate {
   id: string;
   chatJid: string;
@@ -58,22 +76,78 @@ interface InMemoryGate {
   ipcBaseDir: string;
   sourceGroup: string;
   createdAt: number;
+  /** Delivery timestamp; null while send is in flight. Skipped from
+   * `getInMemoryGateByJid` within the grace window to prevent a user
+   * follow-up from auto-cancelling a gate they haven't seen yet. */
+  notifiedAt: number | null;
+  /** Posted interactive-gate message reference, once sendInteractiveGate succeeds. */
+  postedRef: GatePostedMessageRef | null;
 }
 
 const pendingGates = new Map<string, InMemoryGate>();
 const GATE_TTL_MS = 10 * 60 * 1000; // 10 min cleanup
+// Delivery-race grace: skip auto-cancel-on-text lookups if the gate was
+// created within this window and has not been marked notifiedAt yet. The
+// typical Slack/Discord network round-trip for chat.postMessage is 200-500ms;
+// 2s provides headroom without being noticeable to the user.
+const GATE_DELIVERY_GRACE_MS = 2_000;
 
+/**
+ * Look up a pending gate for a chat JID. Returns undefined if no gate
+ * matches OR if the gate is within its delivery-race grace window (gate
+ * created very recently and notification still in flight — the user can't
+ * have acted on a gate they haven't seen). Exact-match on threadJid only:
+ * the earlier OR-match on chatJid caused cross-thread interference where a
+ * top-level channel message would match any child thread's gate.
+ */
 export function getInMemoryGateByJid(jid: string): InMemoryGate | undefined {
+  const now = Date.now();
   for (const gate of pendingGates.values()) {
-    if (gate.threadJid === jid || gate.chatJid === jid) return gate;
+    if (gate.threadJid !== jid) continue;
+    // Skip gates still in the pre-notification grace window. After the
+    // notification completes the grace check is moot (notifiedAt is set).
+    if (
+      gate.notifiedAt === null &&
+      now - gate.createdAt < GATE_DELIVERY_GRACE_MS
+    ) {
+      continue;
+    }
+    return gate;
   }
   return undefined;
+}
+
+/**
+ * Record the channel-native message reference of a posted interactive gate
+ * so the orchestrator can clear the buttons later when the gate is resolved
+ * via a non-click path. Called by Channel.sendInteractiveGate implementations
+ * immediately after chat.postMessage / channel.send succeeds.
+ */
+export function recordGatePostedMessage(
+  gateId: string,
+  ref: GatePostedMessageRef,
+): void {
+  const gate = pendingGates.get(gateId);
+  if (!gate) return; // gate already resolved or never existed — nothing to do
+  gate.postedRef = ref;
+  gate.notifiedAt = Date.now();
+}
+
+/** Mark a gate as delivered even when we have no posted message ref (text fallback path). */
+export function markGateNotified(gateId: string): void {
+  const gate = pendingGates.get(gateId);
+  if (!gate) return;
+  gate.notifiedAt = Date.now();
 }
 
 export function resolveInMemoryGate(
   gateId: string,
   decision: 'approved' | 'cancelled',
 ): boolean {
+  // MUST stay synchronous — a yield between get() and delete() would open a
+  // double-resolve race with concurrent callers (button click + text reply +
+  // TTL cleanup can all race). writeQueryResponse uses writeFileSync/renameSync
+  // which do not yield.
   const gate = pendingGates.get(gateId);
   if (!gate) return false;
   writeQueryResponse(gate.ipcBaseDir, gate.sourceGroup, gate.requestId, {
@@ -84,11 +158,80 @@ export function resolveInMemoryGate(
   return true;
 }
 
-// Periodic cleanup of orphaned gates (container crashed / timed out)
+/**
+ * Sweep pendingGates for a specific threadJid (e.g. on container teardown)
+ * and resolve each match as cancelled so the plugin hook unblocks even if
+ * the container is already gone. Returns the set of swept gates with their
+ * posted message references so the caller can clear the chat-native
+ * buttons. `auto_cancel_text` is intentionally excluded from the reason
+ * union — that path runs in-process via resolveInMemoryGate directly and
+ * never sweeps.
+ */
+export function clearGatesForThread(
+  threadJid: string,
+  reason: Exclude<
+    import('./types.js').GateClearReason,
+    'auto_cancel_text'
+  > = 'teardown',
+): Array<{
+  gateId: string;
+  label: string;
+  postedRef: GatePostedMessageRef | null;
+}> {
+  const swept: Array<{
+    gateId: string;
+    label: string;
+    postedRef: GatePostedMessageRef | null;
+  }> = [];
+  for (const [id, gate] of pendingGates) {
+    if (gate.threadJid !== threadJid) continue;
+    try {
+      writeQueryResponse(gate.ipcBaseDir, gate.sourceGroup, gate.requestId, {
+        status: 'ok',
+        decision: 'cancelled',
+      });
+    } catch (err) {
+      // Container may already be gone — swallow.
+      logger.debug(
+        { gateId: id, err },
+        'clearGatesForThread: writeQueryResponse failed (container likely gone)',
+      );
+    }
+    swept.push({ gateId: id, label: gate.label, postedRef: gate.postedRef });
+    pendingGates.delete(id);
+    logger.info(
+      { gateId: id, label: gate.label, reason, threadJid },
+      'Gate swept from pending map',
+    );
+  }
+  return swept;
+}
+
+// Periodic cleanup of orphaned gates (container crashed / timed out). MUST
+// write a cancelled response before deleting the Map entry — otherwise the
+// plugin hook polling inside the container hangs indefinitely waiting for
+// a response file that never arrives.
 setInterval(() => {
   const now = Date.now();
   for (const [id, gate] of pendingGates) {
-    if (now - gate.createdAt > GATE_TTL_MS) pendingGates.delete(id);
+    if (now - gate.createdAt <= GATE_TTL_MS) continue;
+    try {
+      writeQueryResponse(gate.ipcBaseDir, gate.sourceGroup, gate.requestId, {
+        status: 'ok',
+        decision: 'cancelled',
+      });
+    } catch (err) {
+      logger.debug(
+        { gateId: id, err },
+        'TTL cleanup: writeQueryResponse failed',
+      );
+    }
+    pendingGates.delete(id);
+    logger.warn(
+      { gateId: id, label: gate.label },
+      'Gate expired (TTL) — auto-cancelled',
+    );
+    // Dangling chat buttons no-op safely — ipc.ts has no Channel reference.
   }
 }, 60_000);
 
@@ -114,6 +257,19 @@ export interface IpcDeps {
     sender?: string,
     threadId?: string,
   ) => Promise<void>;
+  /**
+   * Post a destructive-command gate via the channel's native interactive
+   * components (Slack Block Kit buttons, Discord components). Returns true
+   * when successfully sent via the interactive path; returns false when the
+   * channel does not support interactive gates, so the caller can fall back
+   * to a plain-text prompt. Implementations MUST also persist the gate
+   * prompt to messages.db for thread history.
+   */
+  sendInteractiveGate?: (
+    jid: string,
+    gate: import('./types.js').InteractiveGate,
+    threadId?: string,
+  ) => Promise<boolean>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   syncGroups: (force: boolean) => Promise<void>;
@@ -1553,6 +1709,12 @@ function processQueryIpc(
         });
         break;
       }
+      // Narrow to non-undefined for the async closures below — TypeScript's
+      // flow analysis doesn't carry the `!data.label || !data.summary` guard
+      // through the IIFE passed to dispatchGateNotification.
+      const gateLabel: string = data.label;
+      const gateSummary: string = data.summary;
+      const gateCommand: string | undefined = data.command;
 
       let gateChatJid: string | undefined;
       for (const [jid, g] of Object.entries(registeredGroups)) {
@@ -1572,42 +1734,117 @@ function processQueryIpc(
 
       const gateId = `gate-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const resolvedChatJid = data.chatJid || gateChatJid;
-      const threadJid = data.threadId
-        ? `${resolvedChatJid}:thread:${data.threadId}`
-        : resolvedChatJid;
+      // resolvedChatJid may already be thread-scoped (container's
+      // NANOCLAW_CHAT_JID for thread-session containers). Don't double the
+      // `:thread:` suffix.
+      const isAlreadyThreadScoped = parseThreadJid(resolvedChatJid) !== null;
+      const threadJid =
+        isAlreadyThreadScoped || !data.threadId
+          ? resolvedChatJid
+          : `${resolvedChatJid}:thread:${data.threadId}`;
 
       pendingGates.set(gateId, {
         id: gateId,
         chatJid: resolvedChatJid,
         threadJid,
-        label: data.label,
-        command: data.command,
+        label: gateLabel,
+        command: gateCommand,
         requestId: data.requestId,
         ipcBaseDir,
         sourceGroup,
         createdAt: Date.now(),
+        notifiedAt: null,
+        postedRef: null,
       });
 
-      const commandLine = data.command
-        ? `\nCommand: \`${data.command.slice(0, 200)}\``
+      // Notify the user. Prefer the channel's interactive (button) path when
+      // available — plain-text `approve`/`cancel` is kept as a fallback for
+      // channels that don't implement sendInteractiveGate.
+      //
+      // Fire-and-forget: any failure unblocks the container with an error so
+      // the plugin hook doesn't hang forever.
+      const commandLine = gateCommand
+        ? `\nCommand: \`${gateCommand.slice(0, 200)}\``
         : '';
-      const gateMsg = `⚠️ **Gate: ${data.label}**\n${data.summary}${commandLine}\n\nReply \`approve\` or \`cancel\`.`;
-      deps
-        .sendMessage(resolvedChatJid, gateMsg, undefined, data.threadId)
-        .catch((err: unknown) => {
-          logger.error(
-            { gateId, sourceGroup, err },
-            'Failed to send gate notification — unblocking container with error',
-          );
-          writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
-            status: 'error',
-            error: 'Failed to send gate notification to channel',
+      const gateTextMsg = `⚠️ **Gate: ${gateLabel}**\n${gateSummary}${commandLine}\n\nReply \`approve\` or \`cancel\`. (A non-approve/cancel reply auto-cancels the gate; the agent will answer but will NOT retry the destructive command — explicitly re-request if you want to proceed.)`;
+
+      // Persist a synthesized text representation of the gate prompt so
+      // thread history in messages.db reflects the gate (even on the
+      // interactive path where the rendered message is a Block Kit /
+      // components payload, not plain text). Uses the same thread-scoped
+      // chat_jid that onMessage uses so thread search/resume picks it up.
+      const persistGatePrompt = () => {
+        try {
+          storeMessage({
+            id: gateId,
+            chat_jid: threadJid,
+            sender: 'bot',
+            sender_name: 'gate',
+            content: gateTextMsg,
+            timestamp: new Date().toISOString(),
+            is_from_me: true,
+            is_bot_message: true,
           });
-          pendingGates.delete(gateId);
+        } catch (err) {
+          logger.warn(
+            { gateId, err },
+            'Failed to persist gate prompt to messages.db — continuing',
+          );
+        }
+      };
+
+      const dispatchGateNotification = async () => {
+        if (deps.sendInteractiveGate) {
+          try {
+            const sent = await deps.sendInteractiveGate(
+              resolvedChatJid,
+              {
+                gateId,
+                label: gateLabel,
+                summary: gateSummary,
+                command: gateCommand,
+              },
+              data.threadId,
+            );
+            if (sent) {
+              // sendInteractiveGate implementations call recordGatePostedMessage
+              // which sets notifiedAt — nothing more to do here.
+              persistGatePrompt();
+              return;
+            }
+            // sent === false means the channel intentionally declined the
+            // interactive path. Fall through to the text fallback.
+          } catch (err) {
+            logger.warn(
+              { gateId, sourceGroup, err },
+              'sendInteractiveGate threw — falling back to text prompt',
+            );
+          }
+        }
+        await deps.sendMessage(
+          resolvedChatJid,
+          gateTextMsg,
+          undefined,
+          data.threadId,
+        );
+        markGateNotified(gateId);
+        persistGatePrompt();
+      };
+
+      dispatchGateNotification().catch((err: unknown) => {
+        logger.error(
+          { gateId, sourceGroup, err },
+          'Failed to send gate notification — unblocking container with error',
+        );
+        writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
+          status: 'error',
+          error: 'Failed to send gate notification to channel',
         });
+        pendingGates.delete(gateId);
+      });
 
       logger.info(
-        { gateId, label: data.label, sourceGroup, requestId: data.requestId },
+        { gateId, label: gateLabel, sourceGroup, requestId: data.requestId },
         'Gate created (in-memory) — awaiting user response',
       );
       // Do NOT write a response — the plugin hook polls until the user approves/cancels.
