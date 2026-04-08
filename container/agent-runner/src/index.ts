@@ -326,6 +326,7 @@ function createPreCompactHook(assistantName?: string, threadId?: string): HookCa
 // be visible to commands Kit runs.
 const SECRET_ENV_VARS = [
   'ANTHROPIC_API_KEY',
+  'ANTHROPIC_API_KEY_2',
   'CLAUDE_CODE_OAUTH_TOKEN',
   'GMAIL_OAUTH_PATH',
   'GMAIL_CREDENTIALS_PATH',
@@ -1557,7 +1558,21 @@ async function main(): Promise<void> {
     while (true) {
       log(`Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`);
 
-      const queryResult = await runQuery(prompt, sessionId, queryCtx, resumeAt);
+      let queryResult;
+      try {
+        queryResult = await runQuery(prompt, sessionId, queryCtx, resumeAt);
+      } catch (runErr) {
+        const runErrMsg = runErr instanceof Error ? runErr.message : String(runErr);
+        const is429 = runErrMsg.includes('429') || /rate.?limit/i.test(runErrMsg) || /overloaded/i.test(runErrMsg);
+        const backupKey = sdkEnv['ANTHROPIC_API_KEY_2'];
+        if (is429 && backupKey && sdkEnv['ANTHROPIC_API_KEY'] !== backupKey) {
+          log(`429/rate-limit detected, rotating to ANTHROPIC_API_KEY_2`);
+          sdkEnv['ANTHROPIC_API_KEY'] = backupKey;
+          queryResult = await runQuery(prompt, sessionId, queryCtx, resumeAt);
+        } else {
+          throw runErr;
+        }
+      }
       if (queryResult.newSessionId) {
         sessionId = queryResult.newSessionId;
       }
