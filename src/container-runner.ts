@@ -3339,6 +3339,17 @@ function readSecrets(
     ? `GITHUB_TOKEN_${githubScopes[0].toUpperCase()}`
     : 'GITHUB_TOKEN';
 
+  // Render CLI reads RENDER_API_KEY from env (checks before making HTTP calls,
+  // so the OneCLI proxy can't inject it). Scoped: 'render:illysium' reads
+  // RENDER_API_KEY_ILLYSIUM and normalizes to RENDER_API_KEY after readEnvFile.
+  const { scopes: renderScopes, isScoped: renderScoped } = extractToolScopes(
+    tools,
+    'render',
+  );
+  const renderTokenKey = renderScoped
+    ? `RENDER_API_KEY_${renderScopes[0].toUpperCase()}`
+    : `RENDER_API_KEY_${scope}`;
+
   // dbt Cloud CLI login credentials + API key for run-log queries
   const dbtScopedEmail = `DBT_CLOUD_EMAIL_${scope}`;
   const dbtScopedPassword = `DBT_CLOUD_PASSWORD_${scope}`;
@@ -3368,18 +3379,7 @@ function readSecrets(
     ...(isToolEnabled(tools, 'braintrust') ? ['BRAINTRUST_API_KEY'] : []),
     // Railway CLI reads RAILWAY_API_TOKEN from env directly.
     ...(isToolEnabled(tools, 'railway') ? ['RAILWAY_API_TOKEN'] : []),
-    // Render CLI reads RENDER_API_KEY from env (checks before making HTTP calls,
-    // so the OneCLI proxy can't inject it). Scoped: 'render:illysium' reads
-    // RENDER_API_KEY_ILLYSIUM and normalizes to RENDER_API_KEY below.
-    ...(() => {
-      if (!isToolEnabled(tools, 'render')) return [];
-      const { scopes: rScopes, isScoped: rScoped } = extractToolScopes(
-        tools,
-        'render',
-      );
-      const rScope = rScoped ? rScopes[0].toUpperCase() : scope;
-      return [`RENDER_API_KEY_${rScope}`];
-    })(),
+    ...(isToolEnabled(tools, 'render') ? [renderTokenKey] : []),
     // Browser auth credentials for Playwright login automation.
     // Scoped: 'browser-auth:illyse' reads BROWSER_AUTH_{URL,EMAIL,PASSWORD}_ILLYSE.
     // Unscoped: 'browser-auth' reads BROWSER_AUTH_{URL,EMAIL,PASSWORD}.
@@ -3413,17 +3413,9 @@ function readSecrets(
   }
 
   // Normalize scoped Render API key to RENDER_API_KEY so the CLI finds it
-  if (isToolEnabled(tools, 'render')) {
-    const { scopes: rScopes, isScoped: rScoped } = extractToolScopes(
-      tools,
-      'render',
-    );
-    const rScope = rScoped ? rScopes[0].toUpperCase() : scope;
-    const renderScopedKey = `RENDER_API_KEY_${rScope}`;
-    if (secrets[renderScopedKey]) {
-      secrets.RENDER_API_KEY = secrets[renderScopedKey];
-      delete secrets[renderScopedKey];
-    }
+  if (renderTokenKey !== 'RENDER_API_KEY' && secrets[renderTokenKey]) {
+    secrets.RENDER_API_KEY = secrets[renderTokenKey];
+    delete secrets[renderTokenKey];
   }
 
   // GitHub org restriction: when tools includes 'github-orgs:OrgName', pass
