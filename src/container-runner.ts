@@ -25,6 +25,7 @@ import {
   WORKTREES_DIR,
   WORKTREE_BUNDLE_DIR,
   WORKTREE_CACHE_DIR,
+  WORKTREE_GIT_OVERLAY_DIR,
   escapeRegex,
 } from './config.js';
 import { readEnvFile, readEnvFileMatching } from './env.js';
@@ -846,6 +847,17 @@ function isSafeRepoName(name: string): boolean {
   return /^[A-Za-z0-9._-]+$/.test(name);
 }
 
+/**
+ * Container-side mount destination for a group repo's source `.git` dir.
+ * Single source of truth shared by prepareThreadWorkspace (which writes the
+ * overlay pointer referencing this path) and buildVolumeMounts (which mounts
+ * the source .git at this path). If you change the path template, both
+ * call sites pick up the change and the overlay stays consistent.
+ */
+function containerSourceGitDirPath(repoName: string): string {
+  return `/workspace/.group-git/${repoName}/.git`;
+}
+
 /** Find subdirectories that are git worktrees (contain a `.git` file, not directory). */
 function findGitWorktrees(
   dir: string,
@@ -1364,7 +1376,12 @@ export async function deleteRescueBranches(
 /** Remove a git worktree with fallback to rm + prune. Best-effort, never throws. */
 async function removeWorktree(repoDir: string, wtPath: string): Promise<void> {
   try {
-    await execAsync(`git worktree remove --force "${wtPath}"`, {
+    // `--force --force` (two flags) is required to remove worktrees created
+    // with `--lock` in prepareThreadWorkspace. Single `--force` fails with
+    // "cannot remove a locked working tree, lock reason: <reason>" and git
+    // itself suggests `-f -f`. The lock protects against cross-thread prune
+    // (see comment block in prepareThreadWorkspace for the full rationale).
+    await execAsync(`git worktree remove --force --force "${wtPath}"`, {
       cwd: repoDir,
     });
   } catch {
@@ -1652,6 +1669,15 @@ export async function prepareThreadWorkspace(
       }
     }
 
+    // Overlay dir is the same for every repo in this thread — create once
+    // so the parallel worktree-add loop below can just writeFileSync into it.
+    const overlayDir = path.join(
+      WORKTREE_GIT_OVERLAY_DIR,
+      groupFolder,
+      threadId,
+    );
+    fs.mkdirSync(overlayDir, { recursive: true });
+
     // Create git worktrees in parallel (independent repos, safe within mutex)
     await Promise.all(
       gitRepos.map(async ({ srcPath, wtPath }) => {
@@ -1715,18 +1741,29 @@ export async function prepareThreadWorkspace(
           }
         }
 
+        // Three hardening flags:
+        //   -c worktree.useRelativePaths=false — force absolute gitdirs so
+        //     buildVolumeMounts' pointer parser (strict absolute-path check)
+        //     doesn't silently drop mounts on git ≥2.48 when the user has
+        //     worktree.useRelativePaths=true set.
+        //   --lock --reason — prevent `git worktree prune` in sibling
+        //     containers from removing this worktree's metadata when its
+        //     scratch path isn't visible in their mount namespace.
+        //   --detach — per-thread HEAD (unchanged from pre-hardening).
+        const worktreeAddCmd = `git -c worktree.useRelativePaths=false worktree add --detach --lock --reason "nanoclaw-thread-${threadId}" "${wtPath}" "${ref}"`;
         try {
-          await execAsync(`git worktree add --detach "${wtPath}" "${ref}"`, {
-            cwd: srcPath,
-          });
+          await execAsync(worktreeAddCmd, { cwd: srcPath });
         } catch (addErr) {
           // Stale worktree — prune, clean up directory, and retry once.
           // Git says "already registered" when the .git/worktrees entry exists,
-          // and "already exists" when the directory itself is left over.
+          // "already exists" when the directory itself is left over, and
+          // "missing but locked" when a prior --lock'd worktree's scratch was
+          // removed without going through `worktree remove -f -f`.
           const msg = addErr instanceof Error ? addErr.message : String(addErr);
           if (
             msg.includes('already registered') ||
-            msg.includes('already exists')
+            msg.includes('already exists') ||
+            msg.includes('missing but locked')
           ) {
             logger.warn(
               { repo: path.basename(srcPath), wtPath },
@@ -1739,13 +1776,30 @@ export async function prepareThreadWorkspace(
             } catch {
               /* ignore */
             }
-            await execAsync(`git worktree add --detach "${wtPath}" "${ref}"`, {
-              cwd: srcPath,
-            });
+            await execAsync(worktreeAddCmd, { cwd: srcPath });
           } else {
             throw addErr;
           }
         }
+
+        // Write the container-visible `.git` pointer file to an overlay
+        // directory outside the scratch. buildVolumeMounts bind-mounts this
+        // file over <wtPath>/.git inside the container (file-over-file,
+        // container namespace only), so container git sees a path that
+        // resolves to the ro source .git mount while the host keeps reading
+        // the original host-absolute pointer for rescueWorktreeChanges.
+        // Stored outside the scratch so `git add -A` in rescue doesn't
+        // stage it.
+        const repoName = path.basename(srcPath);
+        const wtName = path.basename(wtPath);
+        const containerPointer = `gitdir: ${containerSourceGitDirPath(
+          repoName,
+        )}/worktrees/${wtName}\n`;
+        fs.writeFileSync(
+          path.join(overlayDir, repoName),
+          containerPointer,
+        );
+
         createdWorktrees.push({ repoDir: srcPath, wtPath });
 
         // Clean up used rescue branches after successful worktree creation
@@ -1844,6 +1898,19 @@ export async function cleanupThreadWorkspace(
     fs.rmSync(worktreeBase, { recursive: true, force: true });
   } catch {
     // best-effort
+  }
+
+  // Clean up container-visible `.git` pointer overlays written by
+  // prepareThreadWorkspace (one file per worktree-backed repo). These
+  // live outside the scratch in WORKTREE_GIT_OVERLAY_DIR so rescue
+  // doesn't stage them; cleanup is separate from worktreeBase removal.
+  try {
+    fs.rmSync(
+      path.join(WORKTREE_GIT_OVERLAY_DIR, groupFolder, threadId),
+      { recursive: true, force: true },
+    );
+  } catch {
+    // best-effort — stale overlay files are harmless, next spawn overwrites
   }
 }
 
@@ -2225,6 +2292,169 @@ function buildVolumeMounts(
     } catch {
       // best-effort — missing read permission just means no shadow is
       // applied, which matches the pre-shadow behavior
+    }
+  }
+
+  // Worktree gitdir passthrough. In threaded mode /workspace/group is a
+  // per-thread scratch of `git worktree add --detach` checkouts, whose
+  // `.git` pointer files reference host-absolute paths not otherwise
+  // mounted inside the container — breaking every git command inside
+  // /workspace/group/<repo>. We resolve this with two mounts per worktree:
+  //   (1) source `.git` mounted READ-ONLY at /workspace/.group-git/<repo>/.git
+  //   (2) a container-only overlay of WORKTREE_GIT_OVERLAY_DIR/<...>/<repo>
+  //       (written by prepareThreadWorkspace) placed over the scratch's
+  //       `.git` pointer file, so container git follows a container-local
+  //       gitdir while the host still sees the original host-absolute pointer
+  //       (needed by rescueWorktreeChanges)
+  // ro is load-bearing: a rw `.git` would let an agent plant `.git/hooks/*`
+  // or `.git/config` [core.sshCommand|credential.helper|...] that then run
+  // on the host as UID 1001 the next time prepareThreadWorkspace or rescue
+  // invokes git against that repo — container-to-host RCE. The ro mount
+  // fails agent writes with EROFS, structurally closing the vector.
+  // Defense in depth: realpathSync + containment check against groupDir +
+  // lstatSync symlink reject (matching the invariant at promoteAgentCreatedRepos)
+  // so a poisoned pointer can't escape the group folder via `..` traversal
+  // or symlink indirection.
+  if (worktreePath) {
+    const resolvedGroupDir = fs.realpathSync(groupDir);
+    const seenSourceGitDirs = new Set<string>();
+    let attempted = 0;
+    let overlaysMounted = 0;
+    for (const { name, wtPath } of findGitWorktrees(worktreePath)) {
+      attempted++;
+      try {
+        const pointer = fs
+          .readFileSync(path.join(wtPath, '.git'), 'utf8')
+          .trim();
+        const match = pointer.match(/^gitdir:\s*(.+)$/m);
+        if (!match) {
+          logger.warn(
+            { group: group.folder, threadId, repo: name, wtPath },
+            'buildVolumeMounts: no gitdir line in scratch .git pointer, skipping',
+          );
+          continue;
+        }
+        const worktreeMetaDir = match[1].trim();
+        // prepareThreadWorkspace forces absolute gitdirs via
+        // `-c worktree.useRelativePaths=false`; a relative match here means
+        // a manual pointer edit or a future git bypassing the flag.
+        if (!path.isAbsolute(worktreeMetaDir)) {
+          logger.warn(
+            { group: group.folder, threadId, repo: name, worktreeMetaDir },
+            'buildVolumeMounts: relative gitdir pointer, skipping',
+          );
+          continue;
+        }
+        // Expected shape: <sourceGitDir>/worktrees/<name>
+        const worktreesParent = path.dirname(worktreeMetaDir);
+        const sourceGitDir = path.dirname(worktreesParent);
+        if (path.basename(worktreesParent) !== 'worktrees') continue;
+        if (path.basename(sourceGitDir) !== '.git') continue;
+
+        // realpath collapses `..` segments (`path.dirname` is string-based
+        // and does NOT) so a poisoned pointer can't traverse out of the
+        // group folder and land on e.g. ~/.aws/.git via kernel path walk.
+        let resolvedGitDir: string;
+        try {
+          resolvedGitDir = fs.realpathSync(sourceGitDir);
+        } catch {
+          continue;
+        }
+        // lstat (not stat) so a symlinked `.git` can't redirect us.
+        let lstat: fs.Stats;
+        try {
+          lstat = fs.lstatSync(resolvedGitDir);
+        } catch {
+          continue;
+        }
+        if (!lstat.isDirectory()) continue;
+
+        // Containment: resolved source .git must live under the current
+        // group folder. path.relative yields a non-dotdot, non-absolute
+        // string iff resolvedGitDir is under resolvedGroupDir.
+        const relFromGroup = path.relative(resolvedGroupDir, resolvedGitDir);
+        if (relFromGroup.startsWith('..') || path.isAbsolute(relFromGroup)) {
+          logger.warn(
+            {
+              group: group.folder,
+              threadId,
+              repo: name,
+              resolvedGitDir,
+              resolvedGroupDir,
+            },
+            'buildVolumeMounts: worktree gitdir resolves outside group folder, refusing to mount',
+          );
+          continue;
+        }
+
+        // Derive the repo-dir basename (one level up from `.git`) and
+        // validate via the same predicate used by prepareThreadWorkspace
+        // and promoteAgentCreatedRepos, so a name that couldn't have been
+        // created by prepare can't slip in here either.
+        const repoBasename = path.basename(path.dirname(resolvedGitDir));
+        if (!isSafeRepoName(repoBasename)) {
+          logger.warn(
+            { group: group.folder, threadId, repo: name, repoBasename },
+            'buildVolumeMounts: unsafe repo basename, skipping',
+          );
+          continue;
+        }
+
+        // Mount (1): source `.git` ro at container-local path. Deduped by
+        // resolved host path so a repo with multiple worktrees only gets
+        // one source mount.
+        if (!seenSourceGitDirs.has(resolvedGitDir)) {
+          seenSourceGitDirs.add(resolvedGitDir);
+          mounts.push({
+            hostPath: resolvedGitDir,
+            containerPath: containerSourceGitDirPath(repoBasename),
+            readonly: true,
+          });
+        }
+
+        // Mount (2): file overlay of the container-visible .git pointer
+        // over the scratch .git, container-only. threadId is guaranteed
+        // defined here: worktreePath is only set for threaded spawns, and
+        // the enclosing `if (worktreePath)` implies that.
+        const overlayPointerFile = path.join(
+          WORKTREE_GIT_OVERLAY_DIR,
+          group.folder,
+          threadId!,
+          name,
+        );
+        const overlayContainerPath = path.posix.join(
+          '/workspace/group',
+          path.basename(wtPath),
+          '.git',
+        );
+        if (fs.existsSync(overlayPointerFile)) {
+          mounts.push({
+            hostPath: overlayPointerFile,
+            containerPath: overlayContainerPath,
+            readonly: true,
+          });
+          overlaysMounted++;
+        } else {
+          logger.error(
+            { group: group.folder, threadId, repo: name, overlayPointerFile },
+            'buildVolumeMounts: missing .git.container overlay, container git will fail for this repo',
+          );
+        }
+      } catch (err) {
+        logger.warn(
+          { group: group.folder, threadId, repo: name, wtPath, err },
+          'buildVolumeMounts: failed to parse worktree .git pointer, skipping',
+        );
+      }
+    }
+    // Catastrophic-case signal: if we scanned worktrees but mounted zero
+    // overlays, the container will start with no git for /workspace/group/*.
+    // One ERROR line beats N per-repo warnings buried in the log.
+    if (attempted > 0 && overlaysMounted === 0) {
+      logger.error(
+        { group: group.folder, threadId, attempted },
+        'buildVolumeMounts: all worktree gitdir pointers failed to mount; container git operations will fail inside /workspace/group/*',
+      );
     }
   }
 

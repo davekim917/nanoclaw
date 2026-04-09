@@ -708,9 +708,18 @@ Your cwd is \`/workspace/group\`. Semantics differ by channel.
 
 **Threaded channels (Slack/Discord threads):** \`/workspace/group\` is a per-thread scratch directory. On prepare, every top-level entry from the host group folder is copied in so you can read \`.context/\`, \`.claude/\`, plan files, screenshots, etc. Sensitive filenames (auth, token, secret, .env, .pem, .key, id_rsa, etc.) are excluded and invisible to you.
 
-**Existing group repos in threaded channels** (e.g. \`/workspace/group/XZO-BACKEND\`) are **git worktrees** sharing the host repo's \`.git\`, not fresh clones. They start in **detached HEAD** mode at the tip of origin's default branch. **This is normal — the worktree is NOT broken.** To commit and push, run \`git checkout -b <branch-name>\` first, then \`git push -u origin <branch-name>\`. Tracked and untracked edits are auto-rescued at thread cleanup via rescue branches/bundles, so work is not lost even if you don't push.
+**Existing group repos in threaded channels** (e.g. \`/workspace/group/XZO-BACKEND\`) are **git worktrees** sharing the host repo's \`.git\`, not fresh clones. They start in **detached HEAD** mode at the tip of origin's default branch. **This is normal — the worktree is NOT broken.**
 
-**Fresh clones you create** (\`git clone ...\`) are promoted to the host group folder via atomic rename at cleanup. Clone them **inside \`/workspace/group\`** — not elsewhere.
+Group worktrees have a **read-only \`.git\` directory** inside the container (the host bind-mount is ro for security — a rw mount would enable agent-planted git hooks to execute on the host). This means:
+
+- ✅ **Read operations work**: \`git status\`, \`git log\`, \`git diff\`, \`git blame\`, \`git show\`, \`gitnexus analyze\`, and any other pure-read git command.
+- ❌ **Write operations will fail with EROFS**: \`git add\`, \`git commit\`, \`git checkout -b\`, \`git branch\`, \`git stash\`, \`git push\`, \`git config --local\`, \`git worktree prune/remove\`. Don't try; git will error.
+- ✅ **Working-tree file edits are preserved**: edit files normally under \`/workspace/group/<repo>/\`. At thread cleanup the host runs \`git add -A && git commit -m "rescue: ..."\` via host-side rescue (which has rw access) and pushes a rescue branch to origin. Your edits survive.
+- 🔀 **If you need multiple in-session commits or branch management** on an existing group repo, \`git clone\` the repo into \`/workspace/thread/<name>\` first. That's a full clone with its own rw \`.git\`, and \`/workspace/thread/\` is writable. Clones inside \`/workspace/thread/\` persist across turns in this thread; they do NOT automatically promote to the host group folder.
+
+**Cross-thread ref namespace:** sibling threads in the same group share the source repo's \`.git/refs\` and \`.git/objects\` via the shared read-only bind mount. Branches and commits from other threads' \`git clone\`-then-commit workflows are visible via \`git log --all\` and \`git branch -a\`, but you can't delete/modify them (ro) and MUST NOT run \`git worktree prune\` or \`git worktree remove\` against sibling thread entries even if the commands were allowed.
+
+**Fresh clones you create in \`/workspace/group/\`** (\`git clone ...\` at the workspace root) are promoted to the host group folder via atomic rename at cleanup. For existing-repo work that needs rw git, prefer \`/workspace/thread/\` instead (see above).
 
 **Write boundary:** only \`/workspace/group\` and \`/workspace/thread\` are writable to you. The rest of \`/workspace/*\` is read-only (owned by a different uid on the host). Don't try to \`mkdir\` or \`git clone\` outside those two paths — it will fail with EACCES.
 

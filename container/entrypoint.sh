@@ -103,7 +103,12 @@ mkdir -p /home/node/.gitnexus
 for gitdir in $(find /workspace -maxdepth 3 -name .git \( -type d -o -type f \) 2>/dev/null); do
   repo=$(dirname "$gitdir")
   if [ -w "$repo" ]; then
-    (cd "$repo" && gitnexus analyze "${gitnexus_flags[@]}" 2>&1 >&2) || true
+    # `>&2` (not `2>&1 >&2`) so both streams land on outer stderr and
+    # stay off the protocol stream on fd1. Surface failures as a single
+    # line without aborting startup so other repos still get indexed.
+    if ! (cd "$repo" && gitnexus analyze "${gitnexus_flags[@]}" >&2); then
+      echo "[entrypoint] GitNexus: analyze failed for $repo (continuing)" >&2
+    fi
   elif [ -d "$repo/.gitnexus" ] && [ -f "$repo/.gitnexus/meta.json" ]; then
     # Read-only mount with pre-built index: register in the container's registry
     # so the MCP server can serve it without needing to write anything.
