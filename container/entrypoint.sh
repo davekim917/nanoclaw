@@ -89,7 +89,9 @@ WRAPPER
 fi
 
 # Index git repos in workspace for GitNexus code intelligence.
-# gitnexus analyze is fast when up-to-date (~0.5s), re-indexes only if stale.
+# Fast-path: if a repo's .gitnexus index exists and lastCommit matches HEAD,
+# just register the existing index — no re-analysis needed. Only runs
+# gitnexus analyze when the index is missing or the committed code changed.
 # Default --skip-agents-md (opt-in via GITNEXUS_INJECT_AGENTS_MD=true) — see
 # ContainerConfig.gitnexusInjectAgentsMd in src/types.ts for rationale.
 # Find both .git dirs (normal repos) and .git files (worktrees).
@@ -103,9 +105,28 @@ mkdir -p /home/node/.gitnexus
 for gitdir in $(find /workspace -maxdepth 3 -name .git \( -type d -o -type f \) 2>/dev/null); do
   repo=$(dirname "$gitdir")
   if [ -w "$repo" ]; then
-    # `>&2` (not `2>&1 >&2`) so both streams land on outer stderr and
-    # stay off the protocol stream on fd1. Surface failures as a single
-    # line without aborting startup so other repos still get indexed.
+    # Fast-path: if index exists and HEAD matches lastCommit, register directly.
+    if [ -f "$repo/.gitnexus/meta.json" ]; then
+      stored=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('lastCommit',''))" "$repo/.gitnexus/meta.json" 2>/dev/null || true)
+      current=$(cd "$repo" && git rev-parse HEAD 2>/dev/null || true)
+      if [ -n "$stored" ] && [ "$stored" = "$current" ]; then
+        node -e '
+          const fs=require("fs"),p=require("path");
+          const repo="'"$repo"'";
+          const meta=JSON.parse(fs.readFileSync(p.join(repo,".gitnexus","meta.json"),"utf8"));
+          const regPath=p.join(process.env.HOME,".gitnexus","registry.json");
+          const reg=fs.existsSync(regPath)?JSON.parse(fs.readFileSync(regPath,"utf8")):[];
+          if(!reg.some(r=>r.path===repo)){
+            reg.push({name:p.basename(repo),path:repo,storagePath:p.join(repo,".gitnexus"),
+              indexedAt:meta.indexedAt,lastCommit:meta.lastCommit,stats:meta.stats});
+            fs.writeFileSync(regPath,JSON.stringify(reg,null,2)+"\n");
+          }
+        ' 2>/dev/null && echo "[entrypoint] GitNexus: index current, registered $repo" >&2 || true
+        continue
+      fi
+    fi
+    # Index is stale or missing — run full analyze.
+    # `>&2` so both streams stay off the protocol stream on fd1.
     if ! (cd "$repo" && gitnexus analyze "${gitnexus_flags[@]}" >&2); then
       echo "[entrypoint] GitNexus: analyze failed for $repo (continuing)" >&2
     fi
