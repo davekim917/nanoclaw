@@ -118,6 +118,10 @@ import {
   ensureDailyNotifierTask,
   registerDailyNotifierHandler,
 } from './daily-notifications.js';
+import {
+  ensurePluginUpdaterTask,
+  registerPluginUpdaterHandler,
+} from './plugin-updater.js';
 import { callHaiku } from './llm.js';
 import {
   extractThreadTitle,
@@ -2765,6 +2769,21 @@ async function main(): Promise<void> {
   ensureCommitDigestTask();
   registerCommitDigestHandler({
     registeredGroups: () => registeredGroups,
+  });
+
+  // Plugin updater: pulls all plugin repos hourly, notifies on updates.
+  // Must be registered BEFORE startSchedulerLoop so the handler exists for the first poll.
+  ensurePluginUpdaterTask();
+  registerPluginUpdaterHandler({
+    notifyJid: process.env.PLUGIN_UPDATE_NOTIFY_JID || null,
+    sendMessage: async (jid, text) => {
+      const channel = findChannel(channels, jid);
+      if (!channel) {
+        logger.warn({ jid }, 'No channel owns JID, cannot send plugin update notification');
+        return;
+      }
+      await channel.sendMessage(jid, text, null, { suppressActions: true });
+    },
   });
 
   // Daily summary: persistent scheduled task (survives restarts, catches up on missed runs)

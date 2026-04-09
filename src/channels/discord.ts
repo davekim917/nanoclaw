@@ -350,13 +350,21 @@ export class DiscordChannel implements Channel {
     });
 
     // Handle button clicks and slash commands.
-    // Deploy is restricted to #general (main group) and its threads.
-    const deployChannelId = '1479489866193571902';
+    // Channels that accept slash commands are configured via DISCORD_SLASH_CHANNEL_IDS
+    // (comma-separated). DISCORD_DEPLOY_CHANNEL_ID sets where deploy status is announced
+    // (defaults to the first slash channel if unset).
+    const slashChannelIds = (process.env.DISCORD_SLASH_CHANNEL_IDS ?? '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const deployChannelId =
+      process.env.DISCORD_DEPLOY_CHANNEL_ID || slashChannelIds[0] || '';
+    const slashCommandChannelIds = new Set(slashChannelIds);
     this.client.on(Events.InteractionCreate, async (interaction) => {
       const parentId = DiscordChannel.getInteractionParentId(interaction);
       const isNanoclawChannel =
-        interaction.channelId === deployChannelId ||
-        parentId === deployChannelId;
+        (interaction.channelId !== null && slashCommandChannelIds.has(interaction.channelId)) ||
+        (parentId !== null && slashCommandChannelIds.has(parentId));
       try {
         if (interaction.isButton()) {
           const btn = interaction as ButtonInteraction;
@@ -373,6 +381,8 @@ export class DiscordChannel implements Channel {
             await this.handleDeployCommand(cmd);
           } else if (cmd.commandName === 'update-container') {
             await this.handleUpdateContainerCommand(cmd);
+          } else if (cmd.commandName === 'update-plugins') {
+            await this.handleUpdatePluginsCommand(cmd);
           }
         }
       } catch (err) {
@@ -399,7 +409,7 @@ export class DiscordChannel implements Channel {
         if (guild) {
           await this.registerSlashCommands(readyClient.user.id, guild.id);
         }
-        await this.announceDeployStatus(deployChannelId);
+        if (deployChannelId) await this.announceDeployStatus(deployChannelId);
         resolve();
       });
 
@@ -1314,6 +1324,10 @@ export class DiscordChannel implements Channel {
             description:
               'Audit container packages and synced upstream files for drift',
           },
+          {
+            name: 'update-plugins',
+            description: 'Run git pull on all plugin repos now',
+          },
         ],
       });
       logger.info('Discord slash commands registered (guild-only)');
@@ -1414,6 +1428,33 @@ export class DiscordChannel implements Channel {
     await interaction.deferReply();
     await interaction.editReply('Deploying latest main...');
     this.runDetachedDeploy(interaction);
+  }
+
+  private async handleUpdatePluginsCommand(
+    interaction: ChatInputCommandInteraction,
+  ): Promise<void> {
+    await interaction.deferReply();
+    await interaction.editReply('Updating plugins...');
+    const scriptPath = path.resolve(
+      process.env.HOME ?? '/home/ubuntu',
+      'scripts/nanoclaw-plugins-update.sh',
+    );
+    const max = DiscordChannel.MAX_MESSAGE_LENGTH;
+    try {
+      const { stdout } = await execAsync(`bash "${scriptPath}"`, {
+        timeout: 60_000,
+      });
+      // code fence overhead: 3 + \n + \n + 3 = 8 chars
+      const body = stdout.trim().slice(0, max - 8);
+      await interaction.followUp(`\`\`\`\n${body}\n\`\`\``);
+    } catch (err) {
+      const execErr = err as { stdout?: string; stderr?: string };
+      const rawDetail =
+        execErr.stdout?.trim() || execErr.stderr?.trim() || String(err);
+      // "Plugin update failed:\n```\n" + detail + "\n```" = detail + 30 chars
+      const detail = rawDetail.slice(0, max - 30);
+      await interaction.followUp(`Plugin update failed:\n\`\`\`\n${detail}\n\`\`\``);
+    }
   }
 
   /**

@@ -55,6 +55,9 @@ Four types of skills exist in NanoClaw. See [CONTRIBUTING.md](CONTRIBUTING.md) f
 | `WEB_UI_ORIGINS` | Comma-separated allowed CORS origins for the Web UI |
 | `WEB_UI_SENDER_NAME` | Display name for messages sent via the Web UI (default: "Web User") |
 | `OLLAMA_HOST` | Ollama server URL. When set, enables Ollama capability detection in `/api/capabilities`. |
+| `DISCORD_SLASH_CHANNEL_IDS` | Comma-separated Discord channel IDs where slash commands (`/deploy`, `/update-container`, `/update-plugins`) are accepted. |
+| `DISCORD_DEPLOY_CHANNEL_ID` | Discord channel ID where deploy status is announced after restart. Defaults to the first `DISCORD_SLASH_CHANNEL_IDS` entry if unset. |
+| `PLUGIN_UPDATE_NOTIFY_JID` | JID to notify when plugin repos are updated by the hourly system task (e.g. `dc:1234567890`). Omit to run silently. |
 
 ## Contributing
 
@@ -110,7 +113,7 @@ The container buildkit caches the build context aggressively. `--no-cache` alone
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **nanoclaw** (1296 symbols, 3508 relationships, 103 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+This project is indexed by GitNexus as **nanoclaw** (1294 symbols, 3504 relationships, 102 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
 
 > If any GitNexus tool warns the index is stale, run `npx gitnexus analyze` in terminal first.
 
