@@ -1428,6 +1428,11 @@ async function main(): Promise<void> {
     toneNote,
     capabilityManifest,
     workspacePersistenceNote,
+    // Guard against system reminders swallowing the agent's actual response.
+    // When the SDK injects a system reminder (e.g. "task tools haven't been used")
+    // after the agent's last tool call, the agent sometimes produces a throwaway
+    // like "No response requested." instead of its real answer.
+    'IMPORTANT: Never produce a meta-response about not having anything to say (e.g. "No response requested", "Nothing to respond to", "No action needed"). If you completed work, report what you did and the outcome. If a system reminder appears after you finished your task, ignore it — your previous output is the answer. Always end with substantive content for the user.',
   ].filter(Boolean);
 
   // Build the full system prompt with the current model identity.
