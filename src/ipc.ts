@@ -2466,7 +2466,7 @@ export function processQueryIpc(
           // Only clean up the UUID subdirectory, never the outbound_files root.
           // Guard: the file must be inside a subdirectory (at least 2 levels deep).
           const cleanupDir = path.dirname(sfHostPath);
-          if (cleanupDir !== sfExpectedBase.replace(/\/$/, '')) {
+          if (path.resolve(cleanupDir) !== path.resolve(sfExpectedBase)) {
             try {
               fs.rmSync(cleanupDir, { recursive: true, force: true });
             } catch {

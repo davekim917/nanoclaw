@@ -479,9 +479,9 @@ function createEmailGateHook(isScheduledTask: boolean): HookCallback {
     const gwsSegment = segments.find((s) => GWS_EMAIL_SEND_RE.test(s)) || command;
     if (EMAIL_NO_GATE_RE.test(gwsSegment)) return {};
 
-    const toMatch = command.match(/--to\s+['"]?([^\s'"]+)/);
-    const subjectMatch = command.match(/--subject\s+['"]([^'"]+)['"]/)
-      || command.match(/--subject\s+(\S+)/);
+    const toMatch = gwsSegment.match(/--to\s+['"]?([^\s'"]+)/);
+    const subjectMatch = gwsSegment.match(/--subject\s+['"]([^'"]+)['"]/)
+      || gwsSegment.match(/--subject\s+(\S+)/);
     const to = toMatch?.[1] || 'unknown recipient';
     const subject = subjectMatch?.[1] || '';
     const action = command.match(/\+(\w[\w-]*)/)?.[1] || 'send';
