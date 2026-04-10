@@ -2394,6 +2394,21 @@ export function processQueryIpc(
         });
         break;
       }
+      // Authorization: same check as fire-and-forget message handler
+      const sfTargetGroup =
+        registeredGroups[data.chatJid] ||
+        registeredGroups[getParentJid(data.chatJid)];
+      if (!isMain && (!sfTargetGroup || sfTargetGroup.folder !== sourceGroup)) {
+        logger.warn(
+          { sourceGroup, chatJid: data.chatJid },
+          'Unauthorized send_file attempt blocked',
+        );
+        writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
+          status: 'error',
+          error: 'Unauthorized: cannot send files to this chat',
+        });
+        break;
+      }
       const sfHostPath = resolveContainerPath(data.file.path, sourceGroup);
       const sfExpectedBase =
         path.join(DATA_DIR, 'ipc', sourceGroup, 'outbound_files') + '/';
@@ -2448,13 +2463,15 @@ export function processQueryIpc(
           });
         })
         .finally(() => {
-          try {
-            fs.rmSync(path.dirname(sfHostPath), {
-              recursive: true,
-              force: true,
-            });
-          } catch {
-            /* best effort */
+          // Only clean up the UUID subdirectory, never the outbound_files root.
+          // Guard: the file must be inside a subdirectory (at least 2 levels deep).
+          const cleanupDir = path.dirname(sfHostPath);
+          if (cleanupDir !== sfExpectedBase.replace(/\/$/, '')) {
+            try {
+              fs.rmSync(cleanupDir, { recursive: true, force: true });
+            } catch {
+              /* best effort */
+            }
           }
         });
       break;

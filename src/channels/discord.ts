@@ -850,6 +850,7 @@ export class DiscordChannel implements Channel {
         { jid, filename: file.filename, err },
         'Failed to send Discord file',
       );
+      throw err;
     }
   }
 

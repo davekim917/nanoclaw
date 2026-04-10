@@ -61,6 +61,14 @@ interface ContainerOutput {
    * "✅ Switched to ..." confirmation message to the user.
    */
   modelsUsedThisTurn?: string[];
+  /**
+   * Set when an effort switch was applied since the last result.
+   * Contains the effort level string (e.g. 'max') if applyFlagSettings
+   * resolved successfully, proving the SDK accepted the change.
+   */
+  effortApplied?: string;
+  /** True if applyFlagSettings rejected — the effort switch did not take. */
+  effortFailed?: boolean;
 }
 
 interface SessionEntry {
@@ -97,6 +105,10 @@ let pendingOneshotRevert: string | null | undefined;
 let activeQuery: Query | null = null;
 // Last model alias sent via setModel() — skip redundant calls when unchanged.
 let lastSetModelAlias: string | undefined;
+// Tracks a pending effort switch acknowledgment. Set when an effort_switch IPC
+// arrives (or on initial invocation with effort), resolved into the next
+// writeOutput so the host can verify the switch took effect.
+let pendingEffortAck: Promise<string | false> | null = null;
 
 /**
  * Convert a full model ID to the CLI alias that setModel() expects.
@@ -460,7 +472,12 @@ function createEmailGateHook(isScheduledTask: boolean): HookCallback {
     if (!GWS_EMAIL_SEND_RE.test(command)) return {};
 
     if (isScheduledTask) return {};
-    if (EMAIL_NO_GATE_RE.test(command)) return {};
+
+    // Extract only the shell segment containing the gws command — bypass flags
+    // in other segments (after ;, &&, ||, |, or newline) must not suppress the gate.
+    const segments = command.split(/[;&|]\s*|\s*&&\s*|\s*\|\|\s*|\n/);
+    const gwsSegment = segments.find((s) => GWS_EMAIL_SEND_RE.test(s)) || command;
+    if (EMAIL_NO_GATE_RE.test(gwsSegment)) return {};
 
     const toMatch = command.match(/--to\s+['"]?([^\s'"]+)/);
     const subjectMatch = command.match(/--subject\s+['"]([^'"]+)['"]/)
@@ -672,9 +689,16 @@ function drainIpcInput(): IpcMessage[] {
         } else if (data.type === 'effort_switch' && data.effort) {
           sdkEnvRef['CLAUDE_CODE_USE_EFFORT'] = data.effort;
           if (activeQuery) {
-            activeQuery.applyFlagSettings({ effortLevel: data.effort }).catch(err =>
-              log(`applyFlagSettings(effort=${data.effort}) failed: ${err instanceof Error ? err.message : String(err)}`),
-            );
+            pendingEffortAck = activeQuery
+              .applyFlagSettings({ effortLevel: data.effort })
+              .then(() => data.effort as string)
+              .catch(err => {
+                log(`applyFlagSettings(effort=${data.effort}) failed: ${err instanceof Error ? err.message : String(err)}`);
+                return false as const;
+              });
+          } else {
+            // No active query — effort will apply on next query via sdkEnvRef
+            pendingEffortAck = Promise.resolve(data.effort as string);
           }
           log(`Effort switched via IPC: ${data.effort}`);
         }
@@ -1181,6 +1205,9 @@ async function runQuery(
     | undefined;
   if (effort) {
     log(`Using effort: ${effort}`);
+    // Signal to the first writeOutput that this effort was applied.
+    // The SDK accepts effort as a query option, so success is immediate.
+    pendingEffortAck = Promise.resolve(effort);
   }
 
   // Capture the Query handle so drainIpcInput() can call setModel() mid-query.
@@ -1368,11 +1395,27 @@ async function runQuery(
           isRetryableError(effectiveResult)) {
         throw new Error(effectiveResult);
       }
+      // Resolve any pending effort switch ack. applyFlagSettings resolves
+      // near-instantly so by the time the SDK produces a result the promise
+      // has settled — the await is effectively a no-op but keeps it correct.
+      let effortApplied: string | undefined;
+      let effortFailed: boolean | undefined;
+      if (pendingEffortAck) {
+        const ackResult = await pendingEffortAck;
+        pendingEffortAck = null;
+        if (ackResult !== false) {
+          effortApplied = ackResult;
+        } else {
+          effortFailed = true;
+        }
+      }
       writeOutput({
         status: 'success',
         result: effectiveResult,
         newSessionId,
-        modelsUsedThisTurn
+        modelsUsedThisTurn,
+        effortApplied,
+        effortFailed,
       });
       lastAssistantText = '';
       hasPipedSinceLastOutput = false;

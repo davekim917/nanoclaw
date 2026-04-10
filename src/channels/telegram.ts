@@ -356,6 +356,7 @@ export class TelegramChannel implements Channel {
         { jid, filename: file.filename, err },
         'Failed to send Telegram file',
       );
+      throw err;
     }
   }
 

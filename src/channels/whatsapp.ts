@@ -384,6 +384,7 @@ export class WhatsAppChannel implements Channel {
         { jid, filename: file.filename, err },
         'Failed to send WhatsApp file',
       );
+      throw err;
     }
   }
 
