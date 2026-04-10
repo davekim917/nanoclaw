@@ -43,6 +43,9 @@ agents-sdk-docs
 # Worktrees (per-thread git worktrees)
 data/worktrees/
 
+# Build worktrees
+.worktrees/
+
 # Playwright MCP (browser automation logs)
 .playwright-mcp/
 
