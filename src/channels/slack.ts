@@ -781,8 +781,6 @@ export class SlackChannel implements Channel {
     text = this.replaceMentions(text);
     // Slack uses *bold* not **bold** (markdown)
     text = text.replace(/\*\*(.+?)\*\*/g, '*$1*');
-    // Collapse --- horizontal rules (and surrounding blank lines) into a single blank line
-    text = text.replace(/\n*^\s*---\s*$\n*/gm, '\n\n');
 
     const { text: transformed, slackAttachmentBlocks } = transformTablesInText(
       'slack',

@@ -330,8 +330,8 @@ function transformSegment(text: string, channel: ChannelType): string {
     t = t.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '$1 ($2)');
   }
 
-  // 5. Horizontal rules: strip them
-  t = t.replace(/^(-{3,}|\*{3,}|_{3,})$/gm, '');
+  // 5. Horizontal rules: collapse rule + surrounding blank lines into single paragraph break
+  t = t.replace(/\n*^(-{3,}|\*{3,}|_{3,})$\n*/gm, '\n\n');
 
   return t;
 }

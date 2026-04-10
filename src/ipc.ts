@@ -879,13 +879,19 @@ export async function processTaskIpc(
         // Preserve isMain from the existing registration so IPC config
         // updates (e.g. adding additionalMounts) don't strip the flag.
         const existingGroup = registeredGroups[data.jid];
+        // Merge containerConfig so re-registering a group (e.g. to update
+        // trigger) doesn't wipe tools, model, mounts, etc.
+        const mergedConfig = data.containerConfig
+          ? { ...existingGroup?.containerConfig, ...data.containerConfig }
+          : existingGroup?.containerConfig;
         deps.registerGroup(data.jid, {
           name: data.name,
           folder: data.folder,
           trigger: data.trigger,
           added_at: new Date().toISOString(),
-          containerConfig: data.containerConfig,
-          requiresTrigger: data.requiresTrigger,
+          containerConfig: mergedConfig,
+          requiresTrigger:
+            data.requiresTrigger ?? existingGroup?.requiresTrigger,
           isMain: existingGroup?.isMain,
         });
       } else {

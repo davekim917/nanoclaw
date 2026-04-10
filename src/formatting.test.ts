@@ -472,6 +472,18 @@ describe('parseTextStyles — horizontal rules', () => {
       'above\n\nbelow',
     );
   });
+
+  it('collapses --- and surrounding blank lines into single paragraph break on slack', () => {
+    expect(parseTextStyles('above\n\n---\n\nbelow', 'slack')).toBe(
+      'above\n\nbelow',
+    );
+  });
+
+  it('does not leave excess blank lines when rule has extra newlines', () => {
+    expect(parseTextStyles('above\n\n\n---\n\n\nbelow', 'slack')).toBe(
+      'above\n\nbelow',
+    );
+  });
 });
 
 describe('parseTextStyles — code block protection', () => {

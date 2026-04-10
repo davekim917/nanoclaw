@@ -445,6 +445,82 @@ function createSelfApprovalBlockHook(): HookCallback {
   };
 }
 
+// Email consent gate. Blocks gws gmail send/reply/reply-all/forward commands
+// and requests user approval via IPC before allowing execution.
+// Scheduled tasks bypass the gate so automated email workflows are unaffected.
+const GWS_EMAIL_SEND_RE = /\bgws\s+gmail\s+\+(?:send|reply|reply-all|forward)\b/;
+const EMAIL_NO_GATE_RE = /\s--(?:dry-run|draft)\b/;
+
+function createEmailGateHook(isScheduledTask: boolean): HookCallback {
+  return async (input, _toolUseId, _context) => {
+    const preInput = input as PreToolUseHookInput;
+    const command = (preInput.tool_input as { command?: string })?.command;
+    if (!command) return {};
+
+    if (!GWS_EMAIL_SEND_RE.test(command)) return {};
+
+    if (isScheduledTask) return {};
+    if (EMAIL_NO_GATE_RE.test(command)) return {};
+
+    const toMatch = command.match(/--to\s+['"]?([^\s'"]+)/);
+    const subjectMatch = command.match(/--subject\s+['"]([^'"]+)['"]/)
+      || command.match(/--subject\s+(\S+)/);
+    const to = toMatch?.[1] || 'unknown recipient';
+    const subject = subjectMatch?.[1] || '';
+    const action = command.match(/\+(\w[\w-]*)/)?.[1] || 'send';
+    const label = subject
+      ? `Email ${action} to ${to}: "${subject}"`
+      : `Email ${action} to ${to}`;
+
+    const ipcDir = process.env.NANOCLAW_IPC_DIR;
+    const chatJid = process.env.NANOCLAW_CHAT_JID;
+    if (!ipcDir || !chatJid) {
+      return deny('Email sending requires user approval but IPC is not available.');
+    }
+
+    const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const queriesDir = path.join(ipcDir, 'queries');
+    fs.mkdirSync(queriesDir, { recursive: true });
+    const queryFile = path.join(queriesDir, `${requestId}.json`);
+    const tmpFile = `${queryFile}.tmp`;
+    fs.writeFileSync(tmpFile, JSON.stringify({
+      type: 'request_gate',
+      requestId,
+      chatJid,
+      threadId: process.env.NANOCLAW_THREAD_ID,
+      label,
+      summary: `Approve email ${action}?`,
+      command: command.slice(0, 300),
+      timestamp: new Date().toISOString(),
+    }));
+    fs.renameSync(tmpFile, queryFile);
+
+    const responsesDir = path.join(ipcDir, 'query_responses');
+    fs.mkdirSync(responsesDir, { recursive: true });
+    const responseFile = path.join(responsesDir, `${requestId}.json`);
+    const deadline = Date.now() + 300_000;
+
+    while (Date.now() < deadline) {
+      try {
+        const content = JSON.parse(fs.readFileSync(responseFile, 'utf-8'));
+        try { fs.unlinkSync(responseFile); } catch { /* ok */ }
+        if (content.decision === 'approved') {
+          return {};
+        }
+        const detail = content.decision === 'cancelled'
+          ? 'User declined. Do not retry — acknowledge the cancellation briefly.'
+          : 'Gate response was not an approval.';
+        return deny(`Email ${action} blocked: ${detail}`);
+      } catch {
+        // ENOENT — keep polling
+      }
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+
+    return deny(`Email ${action} blocked: timed out waiting for user approval. Do not retry.`);
+  };
+}
+
 function deny(reason: string) {
   return {
     systemMessage: reason,
@@ -699,7 +775,9 @@ function buildCapabilityManifest(
 
   // Data tools
   if (isToolEnabled(tools, 'snowflake')) {
-    capabilities.push('- **Snowflake** — `snowsql` CLI and dbt profiles.');
+    capabilities.push(
+      '- **Snowflake** — `snow` CLI (`snow sql -q "..." -c <connection>`). Check `~/.snowflake/connections.toml` for available connections.',
+    );
   }
   if (isToolEnabled(tools, 'dbt')) {
     capabilities.push('- **dbt** — `dbt` CLI with profiles in `~/.dbt/profiles.yml`.');
@@ -805,25 +883,19 @@ open_pr({ repo: "MY-REPO", title: "feat: add places enrichment", body: "## Summa
 **Auto-save:** if you don't commit explicitly, the host auto-commits all dirty worktrees on session exit.`;
 }
 
+// Build the MCP tool allowlist. SDK built-in tools are NOT restricted here —
+// omitting them from allowedTools caused silent breakage every time the SDK
+// added new tools (e.g. TaskCreate/TaskList/TaskUpdate/TaskGet in the
+// 2026-04-08 build stall).  MCP tools still need explicit wildcards because
+// the SDK only exposes MCP tools whose names match an allowed pattern.
+// Per-group access control lives in credential mounting + MCP server
+// registration (container-runner.ts), not here.
 function buildAllowedTools(tools: string[] | undefined): string[] {
   const allowed = [
-    'Bash',
-    'Read', 'Write', 'Edit', 'Glob', 'Grep',
-    'WebSearch', 'WebFetch',
-    'Task', 'TaskOutput', 'TaskStop',
-    // TaskCreate / TaskList / TaskUpdate / TaskGet are required by the
-    // bootstrap workflow plugin (team-build skill registers tasks per
-    // builder group, then polls TaskList for spawn verification). Without
-    // these, the lead agent in /team-build silently fails to register
-    // tasks and the spawn-verification poll cannot run. Confirmed root
-    // cause of the illie 2026-04-08 build stall.
-    'TaskCreate', 'TaskList', 'TaskUpdate', 'TaskGet',
-    'TeamCreate', 'TeamDelete', 'SendMessage',
-    'TodoWrite', 'ToolSearch', 'Skill',
-    'NotebookEdit',
     'mcp__nanoclaw__*',
+    'mcp__ollama__*',
+    'mcp__gitnexus__*',
   ];
-  // Gmail and Calendar: handled by gws CLI via Bash (no MCP tools to allow)
   if (isToolEnabled(tools, 'exa')) {
     allowed.push('mcp__exa__*');
     allowed.push('mcp__exa-websets__*');
@@ -831,9 +903,6 @@ function buildAllowedTools(tools: string[] | undefined): string[] {
   if (isToolEnabled(tools, 'granola')) allowed.push('mcp__granola__*');
   if (isToolEnabled(tools, 'braintrust')) allowed.push('mcp__braintrust__*');
   if (isToolEnabled(tools, 'omni')) allowed.push('mcp__omni__*');
-  // Google Workspace (Drive, Sheets, Docs, Slides): handled by gws CLI via Bash
-  allowed.push('mcp__ollama__*');
-  allowed.push('mcp__gitnexus__*');
   return allowed;
 }
 
@@ -1137,7 +1206,7 @@ async function runQuery(
       ...(sdkEnv['CLAUDE_CODE_USE_EFFORT'] || effort ? { effort: (sdkEnv['CLAUDE_CODE_USE_EFFORT'] || effort) as EffortLevel } : {}),
       hooks: {
         PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName, containerInput.threadId)] }],
-        PreToolUse: [{ matcher: 'Bash', hooks: [createSelfApprovalBlockHook(), createBlockGitCloneHook(), createBlockSnowflakeConnectorHook(), createSanitizeBashHook()] }],
+        PreToolUse: [{ matcher: 'Bash', hooks: [createEmailGateHook(!!containerInput.isScheduledTask), createSelfApprovalBlockHook(), createBlockGitCloneHook(), createBlockSnowflakeConnectorHook(), createSanitizeBashHook()] }],
       },
     },
   });
