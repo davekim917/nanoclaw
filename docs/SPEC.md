@@ -459,7 +459,7 @@ Sessions enable conversation continuity - Claude remembers what you talked about
 
 ### How Sessions Work
 
-1. Each group has a session ID stored in SQLite (`sessions` table, keyed by `group_folder`)
+1. Each group/thread has a session ID stored in SQLite (`sessions` table, keyed by `session_key`)
 2. Session ID is passed to Claude Agent SDK's `resume` option
 3. Claude continues the conversation with full context
 4. Session transcripts are stored as JSONL files in `data/sessions/{group}/.claude/`

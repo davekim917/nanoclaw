@@ -78,9 +78,15 @@ function createSchema(database: Database.Database): void {
       value TEXT NOT NULL
     );
     CREATE TABLE IF NOT EXISTS sessions (
-      group_folder TEXT PRIMARY KEY,
-      session_id TEXT NOT NULL
+      session_key TEXT PRIMARY KEY,
+      group_folder TEXT NOT NULL,
+      thread_id TEXT,
+      session_id TEXT NOT NULL,
+      last_activity TEXT NOT NULL,
+      created_at TEXT NOT NULL
     );
+    CREATE INDEX IF NOT EXISTS idx_sessions_group ON sessions(group_folder);
+    CREATE INDEX IF NOT EXISTS idx_sessions_activity ON sessions(last_activity);
     CREATE TABLE IF NOT EXISTS registered_groups (
       jid TEXT PRIMARY KEY,
       name TEXT NOT NULL,
@@ -92,47 +98,33 @@ function createSchema(database: Database.Database): void {
     );
   `);
 
-  // sessions_v2: thread-aware session management (additive, does NOT drop sessions table)
-  database.exec(`
-    CREATE TABLE IF NOT EXISTS sessions_v2 (
-      session_key TEXT PRIMARY KEY,
-      group_folder TEXT NOT NULL,
-      thread_id TEXT,
-      session_id TEXT NOT NULL,
-      last_activity TEXT NOT NULL,
-      created_at TEXT NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_sessions_v2_group ON sessions_v2(group_folder);
-    CREATE INDEX IF NOT EXISTS idx_sessions_v2_activity ON sessions_v2(last_activity);
-  `);
-
-  // Add model column to sessions_v2 (sticky model override per session)
+  // Add model column to sessions (sticky model override per session)
   try {
-    database.exec(`ALTER TABLE sessions_v2 ADD COLUMN model TEXT DEFAULT NULL`);
+    database.exec(`ALTER TABLE sessions ADD COLUMN model TEXT DEFAULT NULL`);
   } catch {
     // Column already exists — ignore
   }
 
-  // Add processing flag to sessions_v2 (tracks in-flight agent runs)
+  // Add processing flag to sessions (tracks in-flight agent runs)
   try {
     database.exec(
-      `ALTER TABLE sessions_v2 ADD COLUMN processing INTEGER DEFAULT 0`,
+      `ALTER TABLE sessions ADD COLUMN processing INTEGER DEFAULT 0`,
     );
   } catch {
     // Column already exists — ignore
   }
 
-  // Add chat_jid column to sessions_v2 (identifies the channel for recovery notices)
+  // Add chat_jid column to sessions (identifies the channel for recovery notices)
   try {
-    database.exec(`ALTER TABLE sessions_v2 ADD COLUMN chat_jid TEXT`);
+    database.exec(`ALTER TABLE sessions ADD COLUMN chat_jid TEXT`);
   } catch {
     // Column already exists — ignore
   }
 
-  // Add effort column to sessions_v2 (sticky effort override per session)
+  // Add effort column to sessions (sticky effort override per session)
   try {
     database.exec(
-      `ALTER TABLE sessions_v2 ADD COLUMN effort TEXT DEFAULT NULL`,
+      `ALTER TABLE sessions ADD COLUMN effort TEXT DEFAULT NULL`,
     );
   } catch {
     // Column already exists — ignore
@@ -324,37 +316,6 @@ function createSchema(database: Database.Database): void {
     CREATE INDEX IF NOT EXISTS idx_mcp_servers_group ON mcp_servers(group_folder);
   `);
 
-  // Migrate existing sessions into sessions_v2 (skip if already migrated)
-  const v2Count = (
-    database.prepare('SELECT COUNT(*) AS c FROM sessions_v2').get() as {
-      c: number;
-    }
-  ).c;
-  if (v2Count === 0) {
-    const existingSessions = database
-      .prepare('SELECT group_folder, session_id FROM sessions')
-      .all() as Array<{ group_folder: string; session_id: string }>;
-    if (existingSessions.length > 0) {
-      const migrateV2 = database.transaction(() => {
-        const now = new Date().toISOString();
-        const insert = database.prepare(
-          `INSERT OR IGNORE INTO sessions_v2 (session_key, group_folder, thread_id, session_id, last_activity, created_at)
-           VALUES (?, ?, NULL, ?, ?, ?)`,
-        );
-        for (const row of existingSessions) {
-          insert.run(
-            row.group_folder,
-            row.group_folder,
-            row.session_id,
-            now,
-            now,
-          );
-        }
-      });
-      migrateV2();
-    }
-  }
-
   // Add context_mode column if it doesn't exist (migration for existing DBs)
   try {
     database.exec(
@@ -518,6 +479,29 @@ function createSchema(database: Database.Database): void {
   }
 }
 
+/**
+ * One-time migration: rename sessions_v2 → sessions.
+ * Drops the stale v1 sessions table first, then renames v2 in place.
+ * Idempotent: no-op if sessions_v2 doesn't exist (already migrated or fresh install).
+ */
+function migrateSessionsV2ToSessions(database: Database.Database): void {
+  const hasV2 = database
+    .prepare(
+      "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions_v2'",
+    )
+    .get();
+  if (!hasV2) return;
+
+  database.transaction(() => {
+    database.exec('DROP TABLE IF EXISTS sessions');
+    database.exec('ALTER TABLE sessions_v2 RENAME TO sessions');
+    database.exec('DROP INDEX IF EXISTS idx_sessions_v2_group');
+    database.exec('DROP INDEX IF EXISTS idx_sessions_v2_activity');
+    // New indexes are created by createSchema() which runs immediately after.
+  })();
+  logger.info('Migrated sessions_v2 → sessions');
+}
+
 export function initDatabase(): void {
   const dbPath = path.join(STORE_DIR, 'messages.db');
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
@@ -532,6 +516,11 @@ export function initDatabase(): void {
       'sqlite-vec extension failed to load — vector search disabled',
     );
   }
+  // One-time migration: consolidate sessions_v2 → sessions (2026-04-10).
+  // sessions_v2 had the thread-aware schema; the old sessions table was stale.
+  // After this, only the `sessions` table exists with the full schema.
+  migrateSessionsV2ToSessions(db);
+
   createSchema(db);
 
   // Migrate from JSON files if they exist
@@ -896,7 +885,7 @@ export function getMessageById(
     .get(id, chatJid) as NewMessage | undefined;
 }
 
-/** Ensure a sessions_v2 row exists (creates a stub if needed). */
+/** Ensure a sessions row exists (creates a stub if needed). */
 function ensureSessionRow(
   sessionKey: string,
   groupFolder: string,
@@ -904,13 +893,13 @@ function ensureSessionRow(
 ): void {
   const now = new Date().toISOString();
   db.prepare(
-    `INSERT OR IGNORE INTO sessions_v2 (session_key, group_folder, thread_id, session_id, last_activity, created_at)
+    `INSERT OR IGNORE INTO sessions (session_key, group_folder, thread_id, session_id, last_activity, created_at)
      VALUES (?, ?, ?, '', ?, ?)`,
   ).run(sessionKey, groupFolder, threadId || null, now, now);
 }
 
 /** Mark a session as in-flight (processing started).
- *  Creates a stub row if needed (new threads don't have a sessions_v2 row yet).
+ *  Creates a stub row if needed (new threads don't have a sessions row yet).
  *  Stores chat_jid so recovery can send notices to the correct channel. */
 export function setSessionProcessing(
   sessionKey: string,
@@ -920,13 +909,13 @@ export function setSessionProcessing(
 ): void {
   ensureSessionRow(sessionKey, groupFolder, threadId);
   db.prepare(
-    'UPDATE sessions_v2 SET processing = 1, chat_jid = ? WHERE session_key = ?',
+    'UPDATE sessions SET processing = 1, chat_jid = ? WHERE session_key = ?',
   ).run(chatJid, sessionKey);
 }
 
 /** Clear in-flight flag (processing completed or errored). */
 export function clearSessionProcessing(sessionKey: string): void {
-  db.prepare('UPDATE sessions_v2 SET processing = 0 WHERE session_key = ?').run(
+  db.prepare('UPDATE sessions SET processing = 0 WHERE session_key = ?').run(
     sessionKey,
   );
 }
@@ -942,7 +931,7 @@ export function findAllInFlightThreads(): Array<{
 }> {
   return db
     .prepare(
-      `SELECT thread_id, chat_jid, group_folder FROM sessions_v2
+      `SELECT thread_id, chat_jid, group_folder FROM sessions
        WHERE thread_id IS NOT NULL AND processing = 1
          AND chat_jid IS NOT NULL`,
     )
@@ -956,7 +945,7 @@ export function findAllInFlightThreads(): Array<{
 /** Clear all processing flags (safety reset on startup). */
 export function clearAllProcessingFlags(): void {
   db.prepare(
-    'UPDATE sessions_v2 SET processing = 0 WHERE processing = 1',
+    'UPDATE sessions SET processing = 0 WHERE processing = 1',
   ).run();
 }
 
@@ -1309,28 +1298,31 @@ export function setRouterState(key: string, value: string): void {
   ).run(key, value);
 }
 
-// --- Session accessors (V1 — kept for upstream merge safety) ---
+// --- Session accessors (V1 — thin wrappers for upstream merge compatibility) ---
+// Upstream code calls these with group_folder as the key. After the sessions_v2
+// consolidation, the sessions table uses session_key as PK but group_folder is
+// still a column. These wrappers bridge the signature difference.
 
 export function getSession(groupFolder: string): string | undefined {
   const row = db
-    .prepare('SELECT session_id FROM sessions WHERE group_folder = ?')
+    .prepare('SELECT session_id FROM sessions WHERE session_key = ?')
     .get(groupFolder) as { session_id: string } | undefined;
   return row?.session_id;
 }
 
 export function setSession(groupFolder: string, sessionId: string): void {
-  db.prepare(
-    'INSERT OR REPLACE INTO sessions (group_folder, session_id) VALUES (?, ?)',
-  ).run(groupFolder, sessionId);
+  setSessionV2(groupFolder, groupFolder, sessionId, undefined);
 }
 
 export function deleteSession(groupFolder: string): void {
-  db.prepare('DELETE FROM sessions WHERE group_folder = ?').run(groupFolder);
+  db.prepare('DELETE FROM sessions WHERE session_key = ?').run(groupFolder);
 }
 
 export function getAllSessions(): Record<string, string> {
   const rows = db
-    .prepare('SELECT group_folder, session_id FROM sessions')
+    .prepare(
+      "SELECT group_folder, session_id FROM sessions WHERE thread_id IS NULL AND session_id != ''",
+    )
     .all() as Array<{ group_folder: string; session_id: string }>;
   const result: Record<string, string> = {};
   for (const row of rows) {
@@ -1380,15 +1372,15 @@ export function getSessionV2(
 ): { session_id: string; last_activity: string } | undefined {
   return db
     .prepare(
-      'SELECT session_id, last_activity FROM sessions_v2 WHERE session_key = ?',
+      'SELECT session_id, last_activity FROM sessions WHERE session_key = ?',
     )
     .get(key) as { session_id: string; last_activity: string } | undefined;
 }
 
-/** Get a session_v2 row by session_key, including chat_jid. */
+/** Get a session row by session_key, including chat_jid. */
 export function getSessionV2ByKey(key: string): SessionV2Full | undefined {
   return db
-    .prepare('SELECT * FROM sessions_v2 WHERE session_key = ?')
+    .prepare('SELECT * FROM sessions WHERE session_key = ?')
     .get(key) as SessionV2Full | undefined;
 }
 
@@ -1400,7 +1392,7 @@ export function setSessionV2(
 ): void {
   const now = new Date().toISOString();
   db.prepare(
-    `INSERT INTO sessions_v2 (session_key, group_folder, thread_id, session_id, last_activity, created_at)
+    `INSERT INTO sessions (session_key, group_folder, thread_id, session_id, last_activity, created_at)
      VALUES (?, ?, ?, ?, ?, ?)
      ON CONFLICT(session_key) DO UPDATE SET
        session_id = excluded.session_id,
@@ -1412,18 +1404,18 @@ export function setSessionV2(
 export function touchSessionActivity(key: string): void {
   const now = new Date().toISOString();
   db.prepare(
-    'UPDATE sessions_v2 SET last_activity = ? WHERE session_key = ?',
+    'UPDATE sessions SET last_activity = ? WHERE session_key = ?',
   ).run(now, key);
 }
 
 export function deleteSessionV2(key: string): void {
-  db.prepare('DELETE FROM sessions_v2 WHERE session_key = ?').run(key);
+  db.prepare('DELETE FROM sessions WHERE session_key = ?').run(key);
 }
 
 /** Get the sticky model override for a session, if any. */
 export function getSessionModel(key: string): string | undefined {
   const row = db
-    .prepare('SELECT model FROM sessions_v2 WHERE session_key = ?')
+    .prepare('SELECT model FROM sessions WHERE session_key = ?')
     .get(key) as { model: string | null } | undefined;
   return row?.model ?? undefined;
 }
@@ -1440,7 +1432,7 @@ export function setSessionModel(
   if (groupFolder && model !== null) {
     ensureSessionRow(key, groupFolder, threadId);
   }
-  db.prepare('UPDATE sessions_v2 SET model = ? WHERE session_key = ?').run(
+  db.prepare('UPDATE sessions SET model = ? WHERE session_key = ?').run(
     model,
     key,
   );
@@ -1449,7 +1441,7 @@ export function setSessionModel(
 /** Get the sticky effort override for a session, if any. */
 export function getSessionEffort(key: string): string | undefined {
   const row = db
-    .prepare('SELECT effort FROM sessions_v2 WHERE session_key = ?')
+    .prepare('SELECT effort FROM sessions WHERE session_key = ?')
     .get(key) as { effort: string | null } | undefined;
   return row?.effort ?? undefined;
 }
@@ -1464,7 +1456,7 @@ export function setSessionEffort(
   if (groupFolder && effort !== null) {
     ensureSessionRow(key, groupFolder, threadId);
   }
-  db.prepare('UPDATE sessions_v2 SET effort = ? WHERE session_key = ?').run(
+  db.prepare('UPDATE sessions SET effort = ? WHERE session_key = ?').run(
     effort,
     key,
   );
@@ -1472,7 +1464,7 @@ export function setSessionEffort(
 
 export function getAllSessionsV2(): Map<string, string> {
   const rows = db
-    .prepare('SELECT session_key, session_id FROM sessions_v2')
+    .prepare('SELECT session_key, session_id FROM sessions')
     .all() as Array<{ session_key: string; session_id: string }>;
   const result = new Map<string, string>();
   for (const row of rows) {
@@ -1488,7 +1480,7 @@ export function getSessionsV2Full(
 ): { data: SessionV2Full[]; total: number } {
   const total = (
     db
-      .prepare('SELECT COUNT(*) AS c FROM sessions_v2 WHERE group_folder = ?')
+      .prepare('SELECT COUNT(*) AS c FROM sessions WHERE group_folder = ?')
       .get(groupFolder) as { c: number }
   ).c;
   const data = db
@@ -1506,7 +1498,7 @@ export function getSessionsV2Full(
                  WHERE m.chat_jid = (CASE WHEN s.thread_id IS NOT NULL THEN s.chat_jid || ':thread:' || s.thread_id ELSE s.chat_jid END)
                  ORDER BY m.timestamp ASC LIMIT 1)
               ) AS first_message
-       FROM sessions_v2 s
+       FROM sessions s
        WHERE s.group_folder = ?
        ORDER BY s.last_activity DESC LIMIT ? OFFSET ?`,
     )
@@ -1519,7 +1511,7 @@ export function getAllSessionsV2Full(
   offset: number = 0,
 ): { data: SessionV2Full[]; total: number } {
   const total = (
-    db.prepare('SELECT COUNT(*) AS c FROM sessions_v2').get() as { c: number }
+    db.prepare('SELECT COUNT(*) AS c FROM sessions').get() as { c: number }
   ).c;
   const data = db
     .prepare(
@@ -1536,7 +1528,7 @@ export function getAllSessionsV2Full(
                  WHERE m.chat_jid = (CASE WHEN s.thread_id IS NOT NULL THEN s.chat_jid || ':thread:' || s.thread_id ELSE s.chat_jid END)
                  ORDER BY m.timestamp ASC LIMIT 1)
               ) AS first_message
-       FROM sessions_v2 s
+       FROM sessions s
        ORDER BY s.last_activity DESC LIMIT ? OFFSET ?`,
     )
     .all(limit, offset) as SessionV2Full[];
@@ -1725,7 +1717,7 @@ export function getThreadMessagesByTrigger(
 
 /**
  * Fallback: search raw message content for a group's threads when FTS returns 0.
- * Uses a single JOIN across sessions_v2 and messages — one DB round-trip instead of N+1.
+ * Uses a single JOIN across sessions and messages — one DB round-trip instead of N+1.
  * Sessions subquery is capped at 100 to avoid unbounded scans for large groups.
  * Returns at most `limit` matching thread+snippet pairs, one per thread_id.
  */
@@ -1748,7 +1740,7 @@ export function searchMessagesRaw(
     .prepare(
       `SELECT s.thread_id, s.chat_jid, m.content, m.timestamp
        FROM (
-         SELECT DISTINCT thread_id, chat_jid FROM sessions_v2
+         SELECT DISTINCT thread_id, chat_jid FROM sessions
          WHERE group_folder = ? AND thread_id IS NOT NULL AND chat_jid IS NOT NULL
          LIMIT 100
        ) s
