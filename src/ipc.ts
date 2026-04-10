@@ -1714,179 +1714,190 @@ export function processQueryIpc(
       break;
     }
 
-    case 'request_gate': {
-      if (!data.label || !data.summary) {
-        writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
-          status: 'error',
-          error: 'Missing label or summary',
-        });
-        break;
-      }
-      // Narrow to non-undefined for the async closures below — TypeScript's
-      // flow analysis doesn't carry the `!data.label || !data.summary` guard
-      // through the IIFE passed to dispatchGateNotification.
-      const gateLabel: string = data.label;
-      const gateSummary: string = data.summary;
-      const gateCommand: string | undefined = data.command;
-
-      let gateChatJid: string | undefined;
-      for (const [jid, g] of Object.entries(registeredGroups)) {
-        if (g.folder === sourceGroup) {
-          gateChatJid = jid;
+    case 'request_gate':
+      {
+        if (!data.label || !data.summary) {
+          writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
+            status: 'error',
+            error: 'Missing label or summary',
+          });
           break;
         }
-      }
+        // Narrow to non-undefined for the async closures below — TypeScript's
+        // flow analysis doesn't carry the `!data.label || !data.summary` guard
+        // through the IIFE passed to dispatchGateNotification.
+        const gateLabel: string = data.label;
+        const gateSummary: string = data.summary;
+        const gateCommand: string | undefined = data.command;
 
-      if (!gateChatJid) {
-        writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
-          status: 'error',
-          error: 'No channel found for group',
+        let gateChatJid: string | undefined;
+        for (const [jid, g] of Object.entries(registeredGroups)) {
+          if (g.folder === sourceGroup) {
+            gateChatJid = jid;
+            break;
+          }
+        }
+
+        if (!gateChatJid) {
+          writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
+            status: 'error',
+            error: 'No channel found for group',
+          });
+          break;
+        }
+
+        const gateId = `gate-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const resolvedChatJid = data.chatJid || gateChatJid;
+        // resolvedChatJid may already be thread-scoped (container's
+        // NANOCLAW_CHAT_JID for thread-session containers). Don't double the
+        // `:thread:` suffix.
+        const isAlreadyThreadScoped = parseThreadJid(resolvedChatJid) !== null;
+        const threadJid =
+          isAlreadyThreadScoped || !data.threadId
+            ? resolvedChatJid
+            : `${resolvedChatJid}:thread:${data.threadId}`;
+
+        pendingGates.set(gateId, {
+          id: gateId,
+          chatJid: resolvedChatJid,
+          threadJid,
+          label: gateLabel,
+          command: gateCommand,
+          requestId: data.requestId,
+          ipcBaseDir,
+          sourceGroup,
+          createdAt: Date.now(),
+          notifiedAt: null,
+          postedRef: null,
         });
+
+        // Notify the user. Prefer the channel's interactive (button) path when
+        // available — plain-text `approve`/`cancel` is kept as a fallback for
+        // channels that don't implement sendInteractiveGate.
+        //
+        // Fire-and-forget: any failure unblocks the container with an error so
+        // the plugin hook doesn't hang forever.
+        const commandLine = gateCommand
+          ? `\nCommand: \`${gateCommand.slice(0, 200)}\``
+          : '';
+        const gateTextMsg = `⚠️ **Gate: ${gateLabel}**\n${gateSummary}${commandLine}\n\nReply \`approve\` or \`cancel\`. (A non-approve/cancel reply auto-cancels the gate; the agent will answer but will NOT retry the destructive command — explicitly re-request if you want to proceed.)`;
+
+        // Persist a synthesized text representation of the gate prompt so
+        // thread history in messages.db reflects the gate (even on the
+        // interactive path where the rendered message is a Block Kit /
+        // components payload, not plain text). Uses the same thread-scoped
+        // chat_jid that onMessage uses so thread search/resume picks it up.
+        const persistGatePrompt = () => {
+          try {
+            storeMessage({
+              id: gateId,
+              chat_jid: threadJid,
+              sender: 'bot',
+              sender_name: 'gate',
+              content: gateTextMsg,
+              timestamp: new Date().toISOString(),
+              is_from_me: true,
+              is_bot_message: true,
+            });
+          } catch (err) {
+            logger.warn(
+              { gateId, err },
+              'Failed to persist gate prompt to messages.db — continuing',
+            );
+          }
+        };
+
+        const dispatchGateNotification = async () => {
+          if (deps.sendInteractiveGate) {
+            try {
+              const sent = await deps.sendInteractiveGate(
+                resolvedChatJid,
+                {
+                  gateId,
+                  label: gateLabel,
+                  summary: gateSummary,
+                  command: gateCommand,
+                },
+                data.threadId,
+              );
+              if (sent) {
+                // sendInteractiveGate implementations call recordGatePostedMessage
+                // which sets notifiedAt — nothing more to do here.
+                persistGatePrompt();
+                return;
+              }
+              // sent === false means the channel intentionally declined the
+              // interactive path. Fall through to the text fallback.
+            } catch (err) {
+              logger.warn(
+                { gateId, sourceGroup, err },
+                'sendInteractiveGate threw — falling back to text prompt',
+              );
+            }
+          }
+          await deps.sendMessage(
+            resolvedChatJid,
+            gateTextMsg,
+            undefined,
+            data.threadId,
+          );
+          markGateNotified(gateId);
+          persistGatePrompt();
+        };
+
+        dispatchGateNotification().catch((err: unknown) => {
+          logger.error(
+            { gateId, sourceGroup, err },
+            'Failed to send gate notification — unblocking container with error',
+          );
+          writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
+            status: 'error',
+            error: 'Failed to send gate notification to channel',
+          });
+          pendingGates.delete(gateId);
+        });
+
+        logger.info(
+          { gateId, label: gateLabel, sourceGroup, requestId: data.requestId },
+          'Gate created (in-memory) — awaiting user response',
+        );
+        // Do NOT write a response — the plugin hook polls until the user approves/cancels.
         break;
       }
 
-      const gateId = `gate-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      const resolvedChatJid = data.chatJid || gateChatJid;
-      // resolvedChatJid may already be thread-scoped (container's
-      // NANOCLAW_CHAT_JID for thread-session containers). Don't double the
-      // `:thread:` suffix.
-      const isAlreadyThreadScoped = parseThreadJid(resolvedChatJid) !== null;
-      const threadJid =
-        isAlreadyThreadScoped || !data.threadId
-          ? resolvedChatJid
-          : `${resolvedChatJid}:thread:${data.threadId}`;
+      // --- Worktree IPC helpers ---
+      // Shared plumbing for create_worktree, clone_repo, git_commit, git_push, open_pr.
+      // Defined inside processQueryIpc to capture ipcBaseDir and sourceGroup from closure.
 
-      pendingGates.set(gateId, {
-        id: gateId,
-        chatJid: resolvedChatJid,
-        threadJid,
-        label: gateLabel,
-        command: gateCommand,
-        requestId: data.requestId,
-        ipcBaseDir,
-        sourceGroup,
-        createdAt: Date.now(),
-        notifiedAt: null,
-        postedRef: null,
-      });
-
-      // Notify the user. Prefer the channel's interactive (button) path when
-      // available — plain-text `approve`/`cancel` is kept as a fallback for
-      // channels that don't implement sendInteractiveGate.
-      //
-      // Fire-and-forget: any failure unblocks the container with an error so
-      // the plugin hook doesn't hang forever.
-      const commandLine = gateCommand
-        ? `\nCommand: \`${gateCommand.slice(0, 200)}\``
-        : '';
-      const gateTextMsg = `⚠️ **Gate: ${gateLabel}**\n${gateSummary}${commandLine}\n\nReply \`approve\` or \`cancel\`. (A non-approve/cancel reply auto-cancels the gate; the agent will answer but will NOT retry the destructive command — explicitly re-request if you want to proceed.)`;
-
-      // Persist a synthesized text representation of the gate prompt so
-      // thread history in messages.db reflects the gate (even on the
-      // interactive path where the rendered message is a Block Kit /
-      // components payload, not plain text). Uses the same thread-scoped
-      // chat_jid that onMessage uses so thread search/resume picks it up.
-      const persistGatePrompt = () => {
-        try {
-          storeMessage({
-            id: gateId,
-            chat_jid: threadJid,
-            sender: 'bot',
-            sender_name: 'gate',
-            content: gateTextMsg,
-            timestamp: new Date().toISOString(),
-            is_from_me: true,
-            is_bot_message: true,
-          });
-        } catch (err) {
-          logger.warn(
-            { gateId, err },
-            'Failed to persist gate prompt to messages.db — continuing',
-          );
-        }
-      };
-
-      const dispatchGateNotification = async () => {
-        if (deps.sendInteractiveGate) {
-          try {
-            const sent = await deps.sendInteractiveGate(
-              resolvedChatJid,
-              {
-                gateId,
-                label: gateLabel,
-                summary: gateSummary,
-                command: gateCommand,
-              },
-              data.threadId,
-            );
-            if (sent) {
-              // sendInteractiveGate implementations call recordGatePostedMessage
-              // which sets notifiedAt — nothing more to do here.
-              persistGatePrompt();
-              return;
-            }
-            // sent === false means the channel intentionally declined the
-            // interactive path. Fall through to the text fallback.
-          } catch (err) {
-            logger.warn(
-              { gateId, sourceGroup, err },
-              'sendInteractiveGate threw — falling back to text prompt',
-            );
-          }
-        }
-        await deps.sendMessage(
-          resolvedChatJid,
-          gateTextMsg,
-          undefined,
-          data.threadId,
-        );
-        markGateNotified(gateId);
-        persistGatePrompt();
-      };
-
-      dispatchGateNotification().catch((err: unknown) => {
-        logger.error(
-          { gateId, sourceGroup, err },
-          'Failed to send gate notification — unblocking container with error',
-        );
-        writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
+      function ipcError(requestId: string, error: string): void {
+        writeQueryResponse(ipcBaseDir, sourceGroup, requestId, {
           status: 'error',
-          error: 'Failed to send gate notification to channel',
+          error,
         });
-        pendingGates.delete(gateId);
-      });
+      }
 
-      logger.info(
-        { gateId, label: gateLabel, sourceGroup, requestId: data.requestId },
-        'Gate created (in-memory) — awaiting user response',
-      );
-      // Do NOT write a response — the plugin hook polls until the user approves/cancels.
-      break;
-    }
+      function runWithMutex(
+        label: string,
+        requestId: string,
+        fn: () => Promise<void>,
+      ): void {
+        withGroupMutex(sourceGroup, fn).catch((err: unknown) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          logger.error({ sourceGroup, err }, `${label}: mutex error`);
+          ipcError(requestId, msg);
+        });
+      }
 
-    // --- Worktree IPC helpers ---
-    // Shared plumbing for create_worktree, clone_repo, git_commit, git_push, open_pr.
-    // Defined inside processQueryIpc to capture ipcBaseDir and sourceGroup from closure.
+      function getWorktreeDir(threadId: string, repo: string): string {
+        return path.join(WORKTREES_DIR, sourceGroup, threadId, repo);
+      }
 
-    function ipcError(requestId: string, error: string): void {
-      writeQueryResponse(ipcBaseDir, sourceGroup, requestId, { status: 'error', error });
-    }
-
-    function runWithMutex(label: string, requestId: string, fn: () => Promise<void>): void {
-      withGroupMutex(sourceGroup, fn).catch((err: unknown) => {
-        const msg = err instanceof Error ? err.message : String(err);
-        logger.error({ sourceGroup, err }, `${label}: mutex error`);
-        ipcError(requestId, msg);
-      });
-    }
-
-    function getWorktreeDir(threadId: string, repo: string): string {
-      return path.join(WORKTREES_DIR, sourceGroup, threadId, repo);
-    }
-
-    function worktreeExists(worktreeDir: string): boolean {
-      return fs.existsSync(worktreeDir) && fs.existsSync(path.join(worktreeDir, '.git'));
-    }
+      function worktreeExists(worktreeDir: string): boolean {
+        return (
+          fs.existsSync(worktreeDir) &&
+          fs.existsSync(path.join(worktreeDir, '.git'))
+        );
+      }
 
     case 'create_worktree': {
       if (!data.repo || !data.threadId) {
@@ -2183,11 +2194,15 @@ export function processQueryIpc(
           const repoPath = path.join(groupDir, entry.name);
           if (!fs.existsSync(path.join(repoPath, '.git'))) continue;
           try {
-            const remoteUrl = execFileSync('git', ['remote', 'get-url', 'origin'], {
-              cwd: repoPath,
-              stdio: 'pipe',
-              encoding: 'utf-8',
-            }).trim();
+            const remoteUrl = execFileSync(
+              'git',
+              ['remote', 'get-url', 'origin'],
+              {
+                cwd: repoPath,
+                stdio: 'pipe',
+                encoding: 'utf-8',
+              },
+            ).trim();
             const remoteMatch = remoteUrl.match(/github\.com[:/]([^/]+)\//);
             if (remoteMatch) {
               allowedOrg = remoteMatch[1].toLowerCase();
@@ -2274,19 +2289,40 @@ export function processQueryIpc(
         }
 
         // Remove stale index.lock if present
-        try { fs.unlinkSync(path.join(worktreeDir, '.git', 'index.lock')); } catch { /* ignore */ }
+        try {
+          fs.unlinkSync(path.join(worktreeDir, '.git', 'index.lock'));
+        } catch {
+          /* ignore */
+        }
 
         try {
-          execFileSync('git', ['add', '-A'], { cwd: worktreeDir, stdio: 'pipe' });
+          execFileSync('git', ['add', '-A'], {
+            cwd: worktreeDir,
+            stdio: 'pipe',
+          });
           execFileSync(
             'git',
-            ['-c', 'user.email=agent@nanoclaw.local', '-c', 'user.name=agent', 'commit', '--no-verify', '-m', gcMessage],
+            [
+              '-c',
+              'user.email=agent@nanoclaw.local',
+              '-c',
+              'user.name=agent',
+              'commit',
+              '--no-verify',
+              '-m',
+              gcMessage,
+            ],
             { cwd: worktreeDir, stdio: 'pipe' },
           );
           const sha = execFileSync('git', ['rev-parse', '--short', 'HEAD'], {
-            cwd: worktreeDir, stdio: 'pipe', encoding: 'utf-8',
+            cwd: worktreeDir,
+            stdio: 'pipe',
+            encoding: 'utf-8',
           }).trim();
-          writeQueryResponse(ipcBaseDir, sourceGroup, gcRequestId, { status: 'ok', sha });
+          writeQueryResponse(ipcBaseDir, sourceGroup, gcRequestId, {
+            status: 'ok',
+            sha,
+          });
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           logger.error({ worktreeDir, err }, 'git_commit: failed');
@@ -2313,13 +2349,24 @@ export function processQueryIpc(
         }
 
         try {
-          const branch = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], {
-            cwd: worktreeDir, stdio: 'pipe', encoding: 'utf-8',
-          }).trim();
+          const branch = execFileSync(
+            'git',
+            ['rev-parse', '--abbrev-ref', 'HEAD'],
+            {
+              cwd: worktreeDir,
+              stdio: 'pipe',
+              encoding: 'utf-8',
+            },
+          ).trim();
           execFileSync('git', ['push', '-u', 'origin', branch], {
-            cwd: worktreeDir, stdio: 'pipe', timeout: 60_000,
+            cwd: worktreeDir,
+            stdio: 'pipe',
+            timeout: 60_000,
           });
-          writeQueryResponse(ipcBaseDir, sourceGroup, gpRequestId, { status: 'ok', branch });
+          writeQueryResponse(ipcBaseDir, sourceGroup, gpRequestId, {
+            status: 'ok',
+            branch,
+          });
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           ipcError(gpRequestId, `git push failed: ${msg}`);
@@ -2348,10 +2395,19 @@ export function processQueryIpc(
 
         try {
           const url = execFileSync(
-            'gh', ['pr', 'create', '--title', prTitle, '--body', prBody],
-            { cwd: worktreeDir, stdio: 'pipe', encoding: 'utf-8', timeout: 60_000 },
+            'gh',
+            ['pr', 'create', '--title', prTitle, '--body', prBody],
+            {
+              cwd: worktreeDir,
+              stdio: 'pipe',
+              encoding: 'utf-8',
+              timeout: 60_000,
+            },
           ).trim();
-          writeQueryResponse(ipcBaseDir, sourceGroup, prRequestId, { status: 'ok', url });
+          writeQueryResponse(ipcBaseDir, sourceGroup, prRequestId, {
+            status: 'ok',
+            url,
+          });
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           ipcError(prRequestId, `gh pr create failed: ${msg}`);
