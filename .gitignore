@@ -46,6 +46,9 @@ data/worktrees/
 # Build worktrees
 .worktrees/
 
+# Workflow artifacts (specs, retros — kept locally, not pushed upstream)
+.context/
+
 # Playwright MCP (browser automation logs)
 .playwright-mcp/
 
