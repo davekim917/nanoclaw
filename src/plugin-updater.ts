@@ -97,47 +97,62 @@ export function ensurePluginUpdaterTask(): void {
 export function registerPluginUpdaterHandler(deps: PluginUpdaterDeps): void {
   registerSystemTaskHandler(PLUGIN_UPDATER_TASK_ID, async () => {
     if (!fs.existsSync(PLUGINS_DIR)) {
-      logger.warn({ dir: PLUGINS_DIR }, 'Plugins directory not found, skipping update');
+      logger.warn(
+        { dir: PLUGINS_DIR },
+        'Plugins directory not found, skipping update',
+      );
       return;
     }
 
-    const entries = fs.readdirSync(PLUGINS_DIR).filter((e) => {
-      try {
-        return fs.statSync(path.join(PLUGINS_DIR, e)).isDirectory();
-      } catch {
-        return false;
-      }
-    });
+    const repos = fs
+      .readdirSync(PLUGINS_DIR, { withFileTypes: true })
+      .filter(
+        (d) =>
+          d.isDirectory() &&
+          fs.existsSync(path.join(PLUGINS_DIR, d.name, '.git')),
+      )
+      .map((d) => d.name);
 
-    const updated: string[] = [];
-    const failed: string[] = [];
-
-    for (const entry of entries) {
-      const pluginPath = path.join(PLUGINS_DIR, entry);
-      if (!fs.existsSync(path.join(pluginPath, '.git'))) continue;
-
-      try {
-        const { stdout } = await execFileAsync('git', ['pull', '--ff-only'], {
-          cwd: pluginPath,
-          timeout: 30_000,
-          encoding: 'utf-8',
-        });
-        if (!stdout.includes('Already up to date.')) {
-          updated.push(entry);
-          logger.info({ plugin: entry, output: stdout.trim() }, 'Plugin updated');
+    const results = await Promise.all(
+      repos.map(async (entry) => {
+        const pluginPath = path.join(PLUGINS_DIR, entry);
+        try {
+          const { stdout } = await execFileAsync('git', ['pull', '--ff-only'], {
+            cwd: pluginPath,
+            timeout: 30_000,
+            encoding: 'utf-8',
+          });
+          if (!stdout.includes('Already up to date.')) {
+            logger.info(
+              { plugin: entry, output: stdout.trim() },
+              'Plugin updated',
+            );
+            return { entry, status: 'updated' as const };
+          }
+          return { entry, status: 'noop' as const };
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          logger.error({ plugin: entry, error: message }, 'Plugin update failed');
+          return { entry, status: 'failed' as const };
         }
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        failed.push(entry);
-        logger.error({ plugin: entry, error: message }, 'Plugin update failed');
-      }
-    }
+      }),
+    );
 
-    if ((updated.length === 0 && failed.length === 0) || !deps.notifyJid) return;
+    const updated = results
+      .filter((r) => r.status === 'updated')
+      .map((r) => r.entry);
+    const failed = results
+      .filter((r) => r.status === 'failed')
+      .map((r) => r.entry);
+
+    if (updated.length + failed.length === 0 || !deps.notifyJid) return;
 
     const parts: string[] = [];
     if (updated.length > 0) parts.push(`Updated: ${updated.join(', ')}`);
     if (failed.length > 0) parts.push(`Failed: ${failed.join(', ')}`);
-    await deps.sendMessage(deps.notifyJid, `Plugin update: ${parts.join(' | ')}`);
+    await deps.sendMessage(
+      deps.notifyJid,
+      `Plugin update: ${parts.join(' | ')}`,
+    );
   });
 }

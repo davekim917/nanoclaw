@@ -350,9 +350,6 @@ export class DiscordChannel implements Channel {
     });
 
     // Handle button clicks and slash commands.
-    // Channels that accept slash commands are configured via DISCORD_SLASH_CHANNEL_IDS
-    // (comma-separated). DISCORD_DEPLOY_CHANNEL_ID sets where deploy status is announced
-    // (defaults to the first slash channel if unset).
     const slashChannelIds = (process.env.DISCORD_SLASH_CHANNEL_IDS ?? '')
       .split(',')
       .map((s) => s.trim())
@@ -363,7 +360,8 @@ export class DiscordChannel implements Channel {
     this.client.on(Events.InteractionCreate, async (interaction) => {
       const parentId = DiscordChannel.getInteractionParentId(interaction);
       const isNanoclawChannel =
-        (interaction.channelId !== null && slashCommandChannelIds.has(interaction.channelId)) ||
+        (interaction.channelId !== null &&
+          slashCommandChannelIds.has(interaction.channelId)) ||
         (parentId !== null && slashCommandChannelIds.has(parentId));
       try {
         if (interaction.isButton()) {
@@ -1444,16 +1442,16 @@ export class DiscordChannel implements Channel {
       const { stdout } = await execAsync(`bash "${scriptPath}"`, {
         timeout: 60_000,
       });
-      // code fence overhead: 3 + \n + \n + 3 = 8 chars
       const body = stdout.trim().slice(0, max - 8);
       await interaction.followUp(`\`\`\`\n${body}\n\`\`\``);
     } catch (err) {
       const execErr = err as { stdout?: string; stderr?: string };
       const rawDetail =
         execErr.stdout?.trim() || execErr.stderr?.trim() || String(err);
-      // "Plugin update failed:\n```\n" + detail + "\n```" = detail + 30 chars
       const detail = rawDetail.slice(0, max - 30);
-      await interaction.followUp(`Plugin update failed:\n\`\`\`\n${detail}\n\`\`\``);
+      await interaction.followUp(
+        `Plugin update failed:\n\`\`\`\n${detail}\n\`\`\``,
+      );
     }
   }
 

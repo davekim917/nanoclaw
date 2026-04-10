@@ -2771,7 +2771,6 @@ async function main(): Promise<void> {
     registeredGroups: () => registeredGroups,
   });
 
-  // Plugin updater: pulls all plugin repos hourly, notifies on updates.
   // Must be registered BEFORE startSchedulerLoop so the handler exists for the first poll.
   ensurePluginUpdaterTask();
   registerPluginUpdaterHandler({
@@ -2779,7 +2778,10 @@ async function main(): Promise<void> {
     sendMessage: async (jid, text) => {
       const channel = findChannel(channels, jid);
       if (!channel) {
-        logger.warn({ jid }, 'No channel owns JID, cannot send plugin update notification');
+        logger.warn(
+          { jid },
+          'No channel owns JID, cannot send plugin update notification',
+        );
         return;
       }
       await channel.sendMessage(jid, text, null, { suppressActions: true });
