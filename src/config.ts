@@ -28,7 +28,9 @@ export const ASSISTANT_HAS_OWN_NUMBER =
 export const OLLAMA_ADMIN_TOOLS =
   (process.env.OLLAMA_ADMIN_TOOLS || envConfig.OLLAMA_ADMIN_TOOLS) === 'true';
 export const PLUGIN_UPDATE_NOTIFY_JID =
-  process.env.PLUGIN_UPDATE_NOTIFY_JID || envConfig.PLUGIN_UPDATE_NOTIFY_JID || null;
+  process.env.PLUGIN_UPDATE_NOTIFY_JID ||
+  envConfig.PLUGIN_UPDATE_NOTIFY_JID ||
+  null;
 export const POLL_INTERVAL = 2000;
 export const SCHEDULER_POLL_INTERVAL = 60000;
 

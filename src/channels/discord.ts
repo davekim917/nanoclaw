@@ -350,7 +350,10 @@ export class DiscordChannel implements Channel {
     });
 
     // Handle button clicks and slash commands.
-    const slashEnv = readEnvFile(['DISCORD_SLASH_CHANNEL_IDS', 'DISCORD_DEPLOY_CHANNEL_ID']);
+    const slashEnv = readEnvFile([
+      'DISCORD_SLASH_CHANNEL_IDS',
+      'DISCORD_DEPLOY_CHANNEL_ID',
+    ]);
     const slashChannelIds = (
       process.env.DISCORD_SLASH_CHANNEL_IDS ||
       slashEnv.DISCORD_SLASH_CHANNEL_IDS ||
