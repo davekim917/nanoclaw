@@ -748,7 +748,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     if ('restart' in cmdResult && cmdResult.restart) {
       // Wait for container exit + cleanup to complete (closeStdin is async)
       await new Promise((r) => setTimeout(r, 3000));
-      const restartPrompt = 'Session restarted with fresh container mounts. Briefly acknowledge.';
+      const restartPrompt =
+        'Session restarted with fresh container mounts. Briefly acknowledge.';
       await channel.setTyping?.(chatJid, true);
       try {
         const result = await runAgent(
@@ -765,7 +766,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           },
         );
         if (result === 'error') {
-          await channel.sendMessage(chatJid, 'Session restarted but agent failed to initialize.', triggerMsgId);
+          await channel.sendMessage(
+            chatJid,
+            'Session restarted but agent failed to initialize.',
+            triggerMsgId,
+          );
         }
       } finally {
         await channel.setTyping?.(chatJid, false);
