@@ -132,7 +132,10 @@ export function registerPluginUpdaterHandler(deps: PluginUpdaterDeps): void {
           return { entry, status: 'noop' as const };
         } catch (err) {
           const message = err instanceof Error ? err.message : String(err);
-          logger.error({ plugin: entry, error: message }, 'Plugin update failed');
+          logger.error(
+            { plugin: entry, error: message },
+            'Plugin update failed',
+          );
           return { entry, status: 'failed' as const };
         }
       }),
