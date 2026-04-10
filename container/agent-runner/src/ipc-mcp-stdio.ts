@@ -1706,135 +1706,86 @@ server.tool(
   },
 );
 
+// Shared IPC call helper — handles writeQueryFile, waitForResponse, error formatting
+const THREAD_ID = process.env.NANOCLAW_THREAD_ID ?? 'default';
+
+function toolError(msg: string) {
+  return { content: [{ type: 'text' as const, text: msg }], isError: true as const };
+}
+
+async function ipcCall(
+  toolName: string,
+  payload: Record<string, unknown>,
+  timeoutMs: number,
+  onSuccess: (response: Record<string, unknown>) => string,
+): Promise<{ content: { type: 'text'; text: string }[]; isError?: true }> {
+  try {
+    const requestId = writeQueryFile({ ...payload, threadId: THREAD_ID });
+    const response = await waitForResponse(requestId, timeoutMs) as Record<string, unknown>;
+    if (response.status !== 'ok') {
+      return toolError(`${toolName} failed: ${(response.error as string) ?? 'unknown error'}`);
+    }
+    return { content: [{ type: 'text' as const, text: onSuccess(response) }] };
+  } catch (err) {
+    return toolError(`${toolName} error: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
 server.tool(
   'create_worktree',
-  `Get a working directory for a repo in this group. Returns the path to a git worktree under /workspace/worktrees/<repo> with full read-write git access (branch, commit, push).
+  `Get a working directory for a repo in this group. Returns the path to a git worktree under /workspace/worktrees/<repo>.
 
 Use this instead of \`git clone\` — direct cloning is blocked. If the repo has not been cloned for this group yet, use \`clone_repo\` instead.
 
 On thread resume, check /workspace/worktrees/ first — the worktree may already exist from a prior turn.`,
   {
-    repo: z.string().describe('Repo name (e.g. "XZO-BACKEND", "nanoclaw"). Must already be cloned for this group.'),
+    repo: z.string().describe('Repo name (e.g. "MY-REPO", "nanoclaw"). Must already be cloned for this group.'),
     branch: z.string().optional().describe('Branch to check out. Omit to use the default branch.'),
   },
-  async (args) => {
-    try {
-      const currentThreadId = process.env.NANOCLAW_THREAD_ID || 'default';
-      const requestId = writeQueryFile({
-        type: 'create_worktree',
-        repo: args.repo,
-        branch: args.branch,
-        threadId: currentThreadId,
-      });
-      const response = await waitForResponse(requestId, 60_000) as {
-        status: string;
-        error?: string;
-        path?: string;
-      };
-
-      if (response.status !== 'ok') {
-        return {
-          content: [{ type: 'text' as const, text: `Failed to create worktree: ${response.error ?? 'unknown error'}` }],
-          isError: true,
-        };
-      }
-
-      const worktreePath = response.path ?? `[error: no path in response for ${args.repo}]`;
-      return {
-        content: [{ type: 'text' as const, text: `Worktree ready at ${worktreePath}` }],
-      };
-    } catch (err) {
-      return {
-        content: [{ type: 'text' as const, text: `create_worktree error: ${err instanceof Error ? err.message : String(err)}` }],
-        isError: true,
-      };
-    }
-  },
+  (args) => ipcCall(
+    'create_worktree',
+    { type: 'create_worktree', repo: args.repo, branch: args.branch },
+    60_000,
+    (r) => {
+      if (!r.path) return '[error: no path in response]';
+      return `Worktree ready at ${r.path}`;
+    },
+  ),
 );
 
 server.tool(
   'clone_repo',
-  `Clone a new repo into this group's workspace. Use this for repos not yet cloned for the group. Returns the path to the worktree under /workspace/worktrees/<name>.
+  `Clone a new repo into this group. Use for repos not yet cloned. Use /restart after cloning to mount the new repo's git metadata.
 
-NEVER run \`git clone\` directly — it is blocked. Use this tool or \`create_worktree\` for repos already cloned.`,
+NEVER run \`git clone\` directly — it is blocked.`,
   {
     url: z.string().describe('Git URL to clone (e.g. "https://github.com/org/repo.git")'),
     name: z.string().optional().describe('Local name for the repo directory. Defaults to the repo name from the URL.'),
   },
-  async (args) => {
-    try {
-      const currentThreadId = process.env.NANOCLAW_THREAD_ID || 'default';
-      const requestId = writeQueryFile({
-        type: 'clone_repo',
-        url: args.url,
-        name: args.name,
-        threadId: currentThreadId,
-      });
-      const response = await waitForResponse(requestId, 60_000) as {
-        status: string;
-        error?: string;
-        path?: string;
-      };
-
-      if (response.status !== 'ok') {
-        return {
-          content: [{ type: 'text' as const, text: `Failed to clone repo: ${response.error ?? 'unknown error'}` }],
-          isError: true,
-        };
-      }
-
-      const repoPath = response.path ?? `[error: no path in response for ${args.url}]`;
-      return {
-        content: [{ type: 'text' as const, text: `Repo cloned and worktree ready at ${repoPath}` }],
-      };
-    } catch (err) {
-      return {
-        content: [{ type: 'text' as const, text: `clone_repo error: ${err instanceof Error ? err.message : String(err)}` }],
-        isError: true,
-      };
-    }
-  },
+  (args) => ipcCall(
+    'clone_repo',
+    { type: 'clone_repo', url: args.url, name: args.name },
+    60_000,
+    (r) => {
+      if (!r.path) return '[error: no path in response]';
+      return `Repo cloned at ${r.path}. Use /restart then create_worktree to work on it.`;
+    },
+  ),
 );
 
 server.tool(
   'git_commit',
-  'Commit all changes in a worktree. Stages all files with git add -A and commits with the given message. Use after editing files in a worktree.',
+  'Commit all changes in a worktree. Stages all files with git add -A and commits with the given message.',
   {
     repo: z.string().describe('Repo directory name (must match a create_worktree repo)'),
     message: z.string().describe('Commit message'),
   },
-  async (args) => {
-    try {
-      const currentThreadId = process.env.NANOCLAW_THREAD_ID || 'default';
-      const requestId = writeQueryFile({
-        type: 'git_commit',
-        repo: args.repo,
-        message: args.message,
-        threadId: currentThreadId,
-      });
-      const response = await waitForResponse(requestId, 30_000) as {
-        status: string;
-        error?: string;
-        sha?: string;
-      };
-
-      if (response.status !== 'ok') {
-        return {
-          content: [{ type: 'text' as const, text: `Commit failed: ${response.error ?? 'unknown error'}` }],
-          isError: true,
-        };
-      }
-
-      return {
-        content: [{ type: 'text' as const, text: `Committed: ${response.sha}` }],
-      };
-    } catch (err) {
-      return {
-        content: [{ type: 'text' as const, text: `git_commit error: ${err instanceof Error ? err.message : String(err)}` }],
-        isError: true,
-      };
-    }
-  },
+  (args) => ipcCall(
+    'git_commit',
+    { type: 'git_commit', repo: args.repo, message: args.message },
+    60_000,
+    (r) => `Committed: ${r.sha ?? '(unknown sha)'}`,
+  ),
 );
 
 server.tool(
@@ -1843,37 +1794,12 @@ server.tool(
   {
     repo: z.string().describe('Repo directory name (must match a create_worktree repo)'),
   },
-  async (args) => {
-    try {
-      const currentThreadId = process.env.NANOCLAW_THREAD_ID || 'default';
-      const requestId = writeQueryFile({
-        type: 'git_push',
-        repo: args.repo,
-        threadId: currentThreadId,
-      });
-      const response = await waitForResponse(requestId, 60_000) as {
-        status: string;
-        error?: string;
-        branch?: string;
-      };
-
-      if (response.status !== 'ok') {
-        return {
-          content: [{ type: 'text' as const, text: `Push failed: ${response.error ?? 'unknown error'}` }],
-          isError: true,
-        };
-      }
-
-      return {
-        content: [{ type: 'text' as const, text: `Pushed branch ${response.branch} to origin` }],
-      };
-    } catch (err) {
-      return {
-        content: [{ type: 'text' as const, text: `git_push error: ${err instanceof Error ? err.message : String(err)}` }],
-        isError: true,
-      };
-    }
-  },
+  (args) => ipcCall(
+    'git_push',
+    { type: 'git_push', repo: args.repo },
+    60_000,
+    (r) => `Pushed branch ${r.branch ?? '(unknown)'} to origin`,
+  ),
 );
 
 server.tool(
@@ -1884,39 +1810,12 @@ server.tool(
     title: z.string().describe('PR title'),
     body: z.string().optional().describe('PR description body (markdown)'),
   },
-  async (args) => {
-    try {
-      const currentThreadId = process.env.NANOCLAW_THREAD_ID || 'default';
-      const requestId = writeQueryFile({
-        type: 'open_pr',
-        repo: args.repo,
-        title: args.title,
-        body: args.body,
-        threadId: currentThreadId,
-      });
-      const response = await waitForResponse(requestId, 30_000) as {
-        status: string;
-        error?: string;
-        url?: string;
-      };
-
-      if (response.status !== 'ok') {
-        return {
-          content: [{ type: 'text' as const, text: `PR creation failed: ${response.error ?? 'unknown error'}` }],
-          isError: true,
-        };
-      }
-
-      return {
-        content: [{ type: 'text' as const, text: `PR created: ${response.url}` }],
-      };
-    } catch (err) {
-      return {
-        content: [{ type: 'text' as const, text: `open_pr error: ${err instanceof Error ? err.message : String(err)}` }],
-        isError: true,
-      };
-    }
-  },
+  (args) => ipcCall(
+    'open_pr',
+    { type: 'open_pr', repo: args.repo, title: args.title, body: args.body },
+    60_000,
+    (r) => `PR created: ${r.url ?? '(no url)'}`,
+  ),
 );
 
 // Start the stdio transport
