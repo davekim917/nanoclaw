@@ -186,24 +186,35 @@ server.tool(
     const stagedPath = path.join(stagingDir, filename);
     fs.writeFileSync(stagedPath, fileContent);
 
-    // Write IPC message with file reference
-    const data = {
-      type: 'message',
+    // Use query-response so the host can report upload failures back to us.
+    const requestId = writeQueryFile({
+      type: 'send_file',
       chatJid,
-      text: args.caption || undefined,
       groupFolder,
       threadId,
-      timestamp: new Date().toISOString(),
-      files: [{
+      caption: args.caption || undefined,
+      file: {
         path: `/workspace/ipc/outbound_files/${uuid}/${filename}`,
         filename,
         mimeType,
-      }],
-    };
+      },
+    });
 
-    writeIpcFile(MESSAGES_DIR, data);
-    sentFileHashes.set(contentHash, filename);
-    return { content: [{ type: 'text' as const, text: `File "${filename}" sent.` }] };
+    try {
+      const response = await waitForResponse(requestId, 30_000) as { status: string; error?: string };
+      if (response.status === 'ok') {
+        sentFileHashes.set(contentHash, filename);
+        return { content: [{ type: 'text' as const, text: `File "${filename}" sent.` }] };
+      }
+      return {
+        content: [{ type: 'text' as const, text: `File upload failed: ${response.error || 'unknown error'}. The file is on disk at ${args.file_path}` }],
+        isError: true,
+      };
+    } catch {
+      // Timeout — host may still deliver the file, but we can't confirm
+      sentFileHashes.set(contentHash, filename);
+      return { content: [{ type: 'text' as const, text: `File "${filename}" sent (delivery unconfirmed — host did not respond within 30s).` }] };
+    }
   },
 );
 

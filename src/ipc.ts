@@ -1274,6 +1274,9 @@ export function processQueryIpc(
     // For open_pr
     title?: string;
     body?: string;
+    // For send_file
+    file?: { path: string; filename: string; mimeType: string };
+    caption?: string;
   },
   sourceGroup: string,
   isMain: boolean,
@@ -2419,6 +2422,71 @@ export function processQueryIpc(
           ipcError(prRequestId, `gh pr create failed: ${msg}`);
         }
       });
+      break;
+    }
+
+    case 'send_file': {
+      if (!data.chatJid || !data.file) {
+        writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
+          status: 'error',
+          error: 'Missing chatJid or file',
+        });
+        break;
+      }
+      const sfHostPath = resolveContainerPath(data.file.path, sourceGroup);
+      const sfExpectedBase =
+        path.join(DATA_DIR, 'ipc', sourceGroup, 'outbound_files') + '/';
+      if (!path.resolve(sfHostPath).startsWith(sfExpectedBase)) {
+        writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
+          status: 'error',
+          error: 'File path outside expected directory',
+        });
+        break;
+      }
+      if (!fs.existsSync(sfHostPath)) {
+        writeQueryResponse(ipcBaseDir, sourceGroup, data.requestId, {
+          status: 'error',
+          error: 'File not found on host',
+        });
+        break;
+      }
+      const sfFile = data.file;
+      const sfChatJid = data.chatJid;
+      const sfRequestId = data.requestId;
+      deps
+        .sendFile(
+          sfChatJid,
+          { hostPath: sfHostPath, filename: sfFile.filename, mimeType: sfFile.mimeType },
+          data.caption,
+          undefined,
+          data.threadId,
+        )
+        .then(() => {
+          logger.info(
+            { chatJid: sfChatJid, sourceGroup, filename: sfFile.filename },
+            'IPC send_file query: file sent',
+          );
+          writeQueryResponse(ipcBaseDir, sourceGroup, sfRequestId, {
+            status: 'ok',
+          });
+        })
+        .catch((err: unknown) => {
+          const msg =
+            err instanceof Error ? err.message : 'Unknown upload error';
+          logger.error(
+            { chatJid: sfChatJid, sourceGroup, filename: sfFile.filename, err },
+            'IPC send_file query: upload failed',
+          );
+          writeQueryResponse(ipcBaseDir, sourceGroup, sfRequestId, {
+            status: 'error',
+            error: msg,
+          });
+        })
+        .finally(() => {
+          try {
+            fs.rmSync(path.dirname(sfHostPath), { recursive: true, force: true });
+          } catch { /* best effort */ }
+        });
       break;
     }
 

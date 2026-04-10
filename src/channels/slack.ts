@@ -708,6 +708,7 @@ export class SlackChannel implements Channel {
         { jid, filename: file.filename, err },
         'Failed to send Slack file',
       );
+      throw err;
     }
   }
 
