@@ -832,7 +832,7 @@ function buildCapabilityManifest(
   // PaaS / infra
   if (isToolEnabled(tools, 'render')) {
     capabilities.push(
-      '- **Render** — `render` CLI authenticated via `RENDER_API_KEY` env var. Common: `render services -o json` (list services), `render env -o json --service-id srv-XXXX` (list service env vars — service IDs look like `srv-...`), `render deploys list -o json --service-id srv-XXXX`, `render logs --service-id srv-XXXX`, `render psql --service-id <pg-id>`. Scoped PG/Redis connection strings also available as env vars (e.g. `RENDER_PG_URL_*`, `RENDER_REDIS_URL_*`).',
+      '- **Render** — `render` CLI v2.x authenticated via `RENDER_API_KEY` env var. **Workspace setup is required** before service-level commands work: run `render workspaces -o json` to list workspaces, then `render workspace set <id> --confirm` to set the active one (persists to `~/.render/cli.yaml` for the lifetime of the container). After setup: `render services -o json`, `render env -o json --service-id srv-XXXX`, `render deploys list -o json --service-id srv-XXXX`, `render logs --service-id srv-XXXX`, `render psql --service-id <pg-id>`. Scoped PG/Redis connection strings are also available as env vars (e.g. `RENDER_PG_URL_*`, `RENDER_REDIS_URL_*`).',
     );
   }
   if (isToolEnabled(tools, 'railway')) {
@@ -972,10 +972,18 @@ type McpServer = StdioServer | HttpServer;
 
 // Secrets that are consumed only by buildMcpServers as MCP HTTP headers must
 // be denylisted from sdkEnv so they're not visible to Bash tool subprocesses
-// the SDK spawns. GRANOLA_ACCESS_TOKEN is a rotating 6h JWT with full
-// meeting-content access. (EXA_API_KEY and BRAINTRUST_API_KEY have the same
-// property today and should be denylisted in a follow-up hardening pass.)
-const SDK_ENV_DENYLIST: ReadonlySet<string> = new Set(['GRANOLA_ACCESS_TOKEN']);
+// the SDK spawns. None of these are needed by CLI tools or shell commands the
+// agent runs — they're read directly from `containerInput.secrets` when
+// constructing the MCP server config and never need to be in the env at all.
+//
+//   - GRANOLA_ACCESS_TOKEN: rotating 6h OAuth JWT with full meeting-content access
+//   - EXA_API_KEY:          long-lived API key used for the Exa MCP query-param auth
+//   - BRAINTRUST_API_KEY:   long-lived API key used for Braintrust MCP Bearer header
+const SDK_ENV_DENYLIST: ReadonlySet<string> = new Set([
+  'GRANOLA_ACCESS_TOKEN',
+  'EXA_API_KEY',
+  'BRAINTRUST_API_KEY',
+]);
 
 function buildMcpServers(
   containerInput: ContainerInput,
@@ -1053,11 +1061,24 @@ function buildMcpServers(
     };
   }
   if (isToolEnabled(tools, 'omni')) {
-    // Auth (Bearer) injected by OneCLI HTTPS proxy (matches sunday.omniapp.co).
-    servers.omni = {
-      type: 'http',
-      url: 'https://sunday.omniapp.co/mcp/https',
-    };
+    // Pass the API key directly via headers — same reasoning as granola and
+    // braintrust: the OneCLI proxy can't reliably inject auth on MCP/SSE
+    // transports for sunday.omniapp.co (it falls into tunnel mode), so the
+    // SDK would 401 and trigger its OAuth fallback. OMNI_API_KEY stays in
+    // sdkEnv (NOT denylisted) because curl-based skills also need it.
+    const omniKey = containerInput.secrets?.OMNI_API_KEY;
+    if (typeof omniKey === 'string' && omniKey.length > 0) {
+      servers.omni = {
+        type: 'http',
+        url: 'https://sunday.omniapp.co/mcp/https',
+        headers: {
+          Accept: 'application/json, text/event-stream',
+          Authorization: `Bearer ${omniKey}`,
+        },
+      };
+    } else {
+      log('Omni enabled but no OMNI_API_KEY in secrets — skipping MCP server registration');
+    }
   }
   // Google Workspace: no MCP server — agent uses gws CLI via Bash.
   if (isToolEnabled(tools, 'ollama')) {

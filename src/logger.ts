@@ -1,3 +1,5 @@
+import { scrubSecrets } from './secret-scrubber.js';
+
 const LEVELS = { debug: 20, info: 30, warn: 40, error: 50, fatal: 60 } as const;
 type Level = keyof typeof LEVELS;
 
@@ -48,15 +50,17 @@ function log(
   if (LEVELS[level] < threshold) return;
   const tag = `${COLORS[level]}${level.toUpperCase()}${level === 'fatal' ? FULL_RESET : RESET}`;
   const stream = LEVELS[level] >= LEVELS.warn ? process.stderr : process.stdout;
+  let line: string;
   if (typeof dataOrMsg === 'string') {
-    stream.write(
-      `[${ts()}] ${tag} (${process.pid}): ${MSG_COLOR}${dataOrMsg}${RESET}\n`,
-    );
+    line = `[${ts()}] ${tag} (${process.pid}): ${MSG_COLOR}${dataOrMsg}${RESET}\n`;
   } else {
-    stream.write(
-      `[${ts()}] ${tag} (${process.pid}): ${MSG_COLOR}${msg}${RESET}${formatData(dataOrMsg)}\n`,
-    );
+    line = `[${ts()}] ${tag} (${process.pid}): ${MSG_COLOR}${msg}${RESET}${formatData(dataOrMsg)}\n`;
   }
+  // Scrub registered secret values from the fully-formatted line. Catches
+  // tokens in msg, object values (formatData JSON-stringifies them), and
+  // err.message / err.stack (formatErr inlines them). Fast no-op when no
+  // secrets are registered (early return inside scrubSecrets).
+  stream.write(scrubSecrets(line));
 }
 
 export const logger: Record<string, unknown> & {

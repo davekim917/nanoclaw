@@ -739,7 +739,11 @@ export class GroupQueue {
 
     const gracePeriodSec = Math.max(1, Math.floor(gracePeriodMs / 1000));
     logger.info(
-      { count: activeContainers.length, names: activeContainers, gracePeriodSec },
+      {
+        count: activeContainers.length,
+        names: activeContainers,
+        gracePeriodSec,
+      },
       'GroupQueue stopping active containers in parallel',
     );
 
