@@ -3,6 +3,7 @@ import { promisify } from 'util';
 
 import { CronExpressionParser } from 'cron-parser';
 
+import { extractToolScopes } from './container-runner.js';
 import {
   createTask,
   getBacklog,
@@ -13,6 +14,7 @@ import {
 } from './db.js';
 import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
+import { scopedEnvKey } from './scoped-env.js';
 import { registerSystemTaskHandler } from './task-scheduler.js';
 import { ContainerConfig, RegisteredGroup } from './types.js';
 
@@ -23,9 +25,6 @@ const DAILY_NOTIFY_CRON = process.env.DAILY_NOTIFY_CRON || '0 8 * * *';
 const DAILY_NOTIFY_TZ = process.env.DAILY_NOTIFY_TZ || 'America/New_York';
 
 export const DAILY_TASK_ID = '__daily_summary';
-
-// Matches container-runner.ts SAFE_SCOPE_RE — rejects path traversal in tool scopes
-const SAFE_SCOPE_RE = /^[a-zA-Z0-9_-]+$/;
 
 export interface DailyNotificationDeps {
   registeredGroups: () => Record<string, RegisteredGroup>;
@@ -72,22 +71,14 @@ function getContainerConfigForFolder(
 }
 
 /**
- * Resolve the GitHub token env key from tools config.
- * Respects `github:<scope>` — returns GITHUB_TOKEN_<SCOPE>.
- * Falls back to GITHUB_TOKEN.
+ * Resolve the GitHub token env key from tools config. Respects
+ * `github:<scope>` (returns GITHUB_TOKEN_<SCOPE>); falls back to bare
+ * `GITHUB_TOKEN`. Unsafe scope values are rejected by extractToolScopes
+ * with a logged warning.
  */
 function resolveGithubTokenKey(tools?: string[]): string {
-  if (tools) {
-    const githubTool = tools.find((t) => t.startsWith('github:'));
-    if (githubTool) {
-      const scope = githubTool.split(':')[1];
-      if (SAFE_SCOPE_RE.test(scope)) {
-        return `GITHUB_TOKEN_${scope.toUpperCase()}`;
-      }
-      logger.warn({ scope }, 'Rejecting unsafe github tool scope');
-    }
-  }
-  return 'GITHUB_TOKEN';
+  const { scopes, isScoped } = extractToolScopes(tools, 'github');
+  return scopedEnvKey('GITHUB_TOKEN', { scopes, isScoped, fallback: 'bare' });
 }
 
 /**

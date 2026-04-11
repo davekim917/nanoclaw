@@ -27,6 +27,7 @@ import {
 } from './config.js';
 import { readEnvFile, readEnvFileMatching } from './env.js';
 import { registerSecrets } from './secret-scrubber.js';
+import { normalizeScopedSecret, scopedEnvKey } from './scoped-env.js';
 import {
   assertValidGroupFolder,
   assertValidThreadId,
@@ -844,9 +845,9 @@ function isToolEnabled(tools: string[] | undefined, name: string): boolean {
  */
 // Safe scope pattern: alphanumeric, hyphens, underscores only.
 // Rejects path traversal attempts like '../../.ssh' or absolute paths.
-const SAFE_SCOPE_RE = /^[a-zA-Z0-9_-]+$/;
+export const SAFE_SCOPE_RE = /^[a-zA-Z0-9_-]+$/;
 
-function extractToolScopes(
+export function extractToolScopes(
   tools: string[] | undefined,
   toolName: string,
 ): { scopes: string[]; isScoped: boolean } {
@@ -2430,9 +2431,11 @@ function readSecrets(
     tools,
     'github',
   );
-  const githubTokenKey = githubScoped
-    ? `GITHUB_TOKEN_${githubScopes[0].toUpperCase()}`
-    : 'GITHUB_TOKEN';
+  const githubTokenKey = scopedEnvKey('GITHUB_TOKEN', {
+    scopes: githubScopes,
+    isScoped: githubScoped,
+    fallback: 'bare',
+  });
 
   // Render CLI reads RENDER_API_KEY from env (checks before making HTTP calls,
   // so the OneCLI proxy can't inject it). Scoped: 'render:illysium' reads
@@ -2444,12 +2447,18 @@ function readSecrets(
     tools,
     'render',
   );
-  const renderTokenKey = renderScoped
-    ? `RENDER_API_KEY_${renderScopes[0].toUpperCase()}`
-    : `RENDER_API_KEY_${scope}`;
-  const renderWorkspaceKey = renderScoped
-    ? `RENDER_WORKSPACE_ID_${renderScopes[0].toUpperCase()}`
-    : `RENDER_WORKSPACE_ID_${scope}`;
+  const renderTokenKey = scopedEnvKey('RENDER_API_KEY', {
+    scopes: renderScopes,
+    isScoped: renderScoped,
+    fallback: 'group',
+    groupScope: groupFolder,
+  });
+  const renderWorkspaceKey = scopedEnvKey('RENDER_WORKSPACE_ID', {
+    scopes: renderScopes,
+    isScoped: renderScoped,
+    fallback: 'group',
+    groupScope: groupFolder,
+  });
 
   // dbt Cloud CLI login credentials + API key for run-log queries
   const dbtScopedEmail = `DBT_CLOUD_EMAIL_${scope}`;
@@ -2494,11 +2503,15 @@ function readSecrets(
         tools,
         'browser-auth',
       );
-      const suffix = authScoped ? `_${authScopes[0].toUpperCase()}` : '';
+      const opts = {
+        scopes: authScopes,
+        isScoped: authScoped,
+        fallback: 'bare' as const,
+      };
       return [
-        `BROWSER_AUTH_URL${suffix}`,
-        `BROWSER_AUTH_EMAIL${suffix}`,
-        `BROWSER_AUTH_PASSWORD${suffix}`,
+        scopedEnvKey('BROWSER_AUTH_URL', opts),
+        scopedEnvKey('BROWSER_AUTH_EMAIL', opts),
+        scopedEnvKey('BROWSER_AUTH_PASSWORD', opts),
       ];
     })(),
     // Anthropic API key + base URL — passed directly to the SDK via sdkEnv.
@@ -2512,25 +2525,13 @@ function readSecrets(
   const secrets = readEnvFile(envKeys);
 
   // Normalize scoped GitHub token key to GITHUB_TOKEN so entrypoint.sh finds it
-  if (githubTokenKey !== 'GITHUB_TOKEN' && secrets[githubTokenKey]) {
-    secrets.GITHUB_TOKEN = secrets[githubTokenKey];
-    delete secrets[githubTokenKey];
-  }
+  normalizeScopedSecret(secrets, githubTokenKey, 'GITHUB_TOKEN');
 
   // Normalize scoped Render API key to RENDER_API_KEY so the CLI finds it
-  if (renderTokenKey !== 'RENDER_API_KEY' && secrets[renderTokenKey]) {
-    secrets.RENDER_API_KEY = secrets[renderTokenKey];
-    delete secrets[renderTokenKey];
-  }
+  normalizeScopedSecret(secrets, renderTokenKey, 'RENDER_API_KEY');
   // Normalize scoped Render workspace ID — the entrypoint reads
   // RENDER_WORKSPACE_ID and runs `render workspace set` if present.
-  if (
-    renderWorkspaceKey !== 'RENDER_WORKSPACE_ID' &&
-    secrets[renderWorkspaceKey]
-  ) {
-    secrets.RENDER_WORKSPACE_ID = secrets[renderWorkspaceKey];
-    delete secrets[renderWorkspaceKey];
-  }
+  normalizeScopedSecret(secrets, renderWorkspaceKey, 'RENDER_WORKSPACE_ID');
 
   // GitHub org restriction: when tools includes 'github-orgs:OrgName', pass
   // GITHUB_ALLOWED_ORGS to the entrypoint so git credentials are URL-scoped.
@@ -2553,11 +2554,7 @@ function readSecrets(
         'BROWSER_AUTH_EMAIL',
         'BROWSER_AUTH_PASSWORD',
       ]) {
-        const scoped = `${base}${suffix}`;
-        if (secrets[scoped]) {
-          secrets[base] = secrets[scoped];
-          delete secrets[scoped];
-        }
+        normalizeScopedSecret(secrets, `${base}${suffix}`, base);
       }
     }
   }
@@ -2569,10 +2566,7 @@ function readSecrets(
     [dbtScopedApiUrl, 'DBT_CLOUD_API_URL'],
     [dbtScopedApiKey, 'DBT_CLOUD_API_KEY'],
   ] as const) {
-    if (secrets[scoped]) {
-      secrets[generic] = secrets[scoped];
-      delete secrets[scoped];
-    }
+    normalizeScopedSecret(secrets, scoped, generic);
   }
 
   // Google Workspace CLI — set GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE so gws
