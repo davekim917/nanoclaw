@@ -1852,6 +1852,27 @@ async function runAgent(
     }
 
     if (output.status === 'error') {
+      // Mid-turn watchdog kill: the container's onOutput chain may be
+      // stalled (which is partly why the kill fired), so the container
+      // can't flush a user-visible message itself. Synthesize the notice
+      // here and call wrappedOnOutput directly, bypassing the stalled
+      // chain. Runs BEFORE the normal error-path logging so the user
+      // sees the retry prompt even though we ultimately return 'error'.
+      if (output.errorType === 'watchdog_mid_turn' && wrappedOnOutput) {
+        try {
+          await wrappedOnOutput({
+            status: 'error',
+            result: "Your last message didn't complete. Please retry.",
+            errorType: 'watchdog_mid_turn',
+          });
+        } catch (err) {
+          logger.warn(
+            { group: group.name, err },
+            'Failed to flush mid-turn watchdog notice to channel',
+          );
+        }
+      }
+
       // Auto-recovery: if prompt_too_long, delete broken session and retry fresh
       if (output.errorType === 'prompt_too_long' && sessionId) {
         logger.warn(

@@ -50,7 +50,7 @@ interface ContainerOutput {
   result: string | null;
   newSessionId?: string;
   error?: string;
-  errorType?: 'prompt_too_long' | 'general';
+  errorType?: 'prompt_too_long' | 'general' | 'watchdog_mid_turn';
   idle?: boolean;
   /**
    * Models that produced output during the turn this result represents.

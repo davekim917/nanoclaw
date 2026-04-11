@@ -19,6 +19,7 @@ import {
   IDLE_TIMEOUT,
   OLLAMA_ADMIN_TOOLS,
   ONECLI_URL,
+  OUTPUT_CHAIN_SETTLE_DEADLINE_MS,
   PLUGINS_DIR,
   RESIDENTIAL_PROXY_URL,
   TIMEZONE,
@@ -796,7 +797,7 @@ export interface ContainerOutput {
   result: string | null;
   newSessionId?: string;
   error?: string;
-  errorType?: 'prompt_too_long' | 'general';
+  errorType?: 'prompt_too_long' | 'general' | 'watchdog_mid_turn';
   /** True when the agent is idle and waiting for new input.
    *  Only set on the between-query session-update marker.
    *  Intermediate results within a multi-turn query do NOT carry this flag. */
@@ -2965,16 +2966,22 @@ export async function runContainerAgent(
     let progressBuffer = '';
     let newSessionId: string | undefined;
     let outputChain = Promise.resolve();
+    // First rejection from any onOutput step, captured by the inline .catch
+    // where outputChain is extended. `settleOutputChain` inspects this to
+    // decide whether the close handler should resolve as success or error.
+    let chainError: unknown = null;
 
-    // Race outputChain against a bounded deadline so a stuck onOutput consumer
-    // (e.g. a hung channel.sendMessage) can't deadlock the group queue. If the
-    // chain hasn't drained within OUTPUT_CHAIN_SETTLE_DEADLINE_MS after we
-    // decide to resolve, we fall through and resolve anyway. The orphaned
-    // downstream work continues in the background, but the group's next
-    // message becomes processable instead of wedging forever.
-    const OUTPUT_CHAIN_SETTLE_DEADLINE_MS = 10_000;
-    const settleOutputChain = (): Promise<void> =>
-      new Promise<void>((res) => {
+    // Race outputChain against a bounded deadline. Returns a tagged result so
+    // callers can distinguish a clean drain (`settled`) from a stalled chain
+    // (`timeout`) or a rejected onOutput step (`rejected`). Rejection has to
+    // propagate up so a transient channel delivery error becomes status:error
+    // (triggering the host's retry path) instead of silent success.
+    type ChainResult =
+      | { kind: 'settled' }
+      | { kind: 'rejected'; err: unknown }
+      | { kind: 'timeout' };
+    const settleOutputChain = (): Promise<ChainResult> =>
+      new Promise<ChainResult>((res) => {
         let settled = false;
         const fallback = setTimeout(() => {
           if (settled) return;
@@ -2983,25 +2990,20 @@ export async function runContainerAgent(
             { group: group.name, containerName },
             'Output chain did not settle within deadline, force-unblocking queue',
           );
-          res();
+          res({ kind: 'timeout' });
         }, OUTPUT_CHAIN_SETTLE_DEADLINE_MS);
-        outputChain
-          .then(() => {
-            if (settled) return;
-            settled = true;
-            clearTimeout(fallback);
-            res();
-          })
-          .catch((err) => {
-            if (settled) return;
-            settled = true;
-            clearTimeout(fallback);
-            logger.error(
-              { group: group.name, err },
-              'Output chain rejected, force-unblocking queue',
-            );
-            res();
-          });
+        // outputChain itself never rejects: every step is wrapped in .catch
+        // that captures into chainError. We just await the tail.
+        outputChain.then(() => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(fallback);
+          res(
+            chainError !== null
+              ? { kind: 'rejected', err: chainError }
+              : { kind: 'settled' },
+          );
+        });
       });
 
     container.stdout.on('data', (data) => {
@@ -3041,18 +3043,24 @@ export async function runContainerAgent(
               newSessionId = parsed.newSessionId;
             }
             hadStreamingOutput = true;
-            // Track whether a user turn is mid-flight. `idle: true` on the
-            // session-update marker means "query ended, waiting for next IPC
-            // input". Any other output means the agent is actively producing
-            // a response to a pending input. Used by the timeout branch to
-            // distinguish a safe idle-reap from a mid-turn kill the user
-            // needs to know about.
+            // `idle: true` means "query ended, waiting for next IPC input".
+            // Anything else means a turn is mid-flight.
             turnInFlight = parsed.idle !== true;
-            // Activity detected — reset the hard timeout
             resetTimeout();
-            // Call onOutput for all markers (including null results)
-            // so idle timers start even for "silent" query completions.
-            outputChain = outputChain.then(() => onOutput(parsed));
+            // Isolate each onOutput call with its own .catch so one rejected
+            // step doesn't poison the chain for later markers. The chain's
+            // overall status is still observable via settleOutputChain: it
+            // stores the first rejection via chainError so the close handler
+            // can convert it to status:error.
+            outputChain = outputChain
+              .then(() => onOutput(parsed))
+              .catch((err) => {
+                if (!chainError) chainError = err;
+                logger.error(
+                  { group: group.name, err },
+                  'onOutput step failed, continuing chain',
+                );
+              });
           } catch (err) {
             logger.warn(
               { group: group.name, error: err },
@@ -3062,33 +3070,35 @@ export async function runContainerAgent(
         }
       }
 
-      // Stream-parse for progress markers. These do NOT count toward the
-      // stdout size budget (they're observability, not user-facing output),
-      // but they DO reset the inactivity watchdog. Progress events fire on
-      // every SDK stream message: every assistant text chunk, every
-      // tool_use, every thinking block, every system event. If they're
-      // flowing, the SDK is alive and the agent is working, even if the
-      // current turn hasn't emitted a final result yet. Not resetting the
-      // watchdog here was the bug that killed long legitimate turns.
-      if (onProgress) {
-        progressBuffer += chunk;
-        let pIdx: number;
-        while ((pIdx = progressBuffer.indexOf(PROGRESS_START_MARKER)) !== -1) {
-          const pEnd = progressBuffer.indexOf(PROGRESS_END_MARKER, pIdx);
-          if (pEnd === -1) break;
-          const json = progressBuffer
-            .slice(pIdx + PROGRESS_START_MARKER.length, pEnd)
-            .trim();
-          progressBuffer = progressBuffer.slice(
-            pEnd + PROGRESS_END_MARKER.length,
-          );
-          try {
-            const parsed = JSON.parse(json);
-            resetTimeout();
-            onProgress(parsed);
-          } catch {
-            // skip malformed progress events
-          }
+      // Progress markers: proof-of-life for a turn that's still running.
+      // Reset the watchdog and mark the turn as in flight on every event,
+      // whether or not a caller is subscribed to the progress feed. Parsing
+      // lives outside the `onProgress` gate so scheduled tasks / retries /
+      // session commands (which pass no callback) still get the watchdog
+      // reset. The fix was dead on those paths before.
+      progressBuffer += chunk;
+      let pIdx: number;
+      while ((pIdx = progressBuffer.indexOf(PROGRESS_START_MARKER)) !== -1) {
+        const pEnd = progressBuffer.indexOf(PROGRESS_END_MARKER, pIdx);
+        if (pEnd === -1) break;
+        const json = progressBuffer
+          .slice(pIdx + PROGRESS_START_MARKER.length, pEnd)
+          .trim();
+        progressBuffer = progressBuffer.slice(
+          pEnd + PROGRESS_END_MARKER.length,
+        );
+        try {
+          const parsed = JSON.parse(json);
+          // Progress events only fire from inside an active SDK query, so
+          // they unambiguously mean a turn is running. This is the state
+          // fixup for the "idle marker, then new turn with progress only"
+          // gap: otherwise turnInFlight would stay false from the prior
+          // idle marker and misclassify a freeze as idle reap.
+          turnInFlight = true;
+          resetTimeout();
+          onProgress?.(parsed);
+        } catch {
+          // skip malformed progress events
         }
       }
     });
@@ -3117,12 +3127,9 @@ export async function runContainerAgent(
 
     let timedOut = false;
     let hadStreamingOutput = false;
-    // True while a user-initiated query is actively being processed. The
-    // container spawns with the initial prompt already queued, so the first
-    // turn is in-flight from the moment the container starts. Flipped to
-    // false when the agent emits an `idle: true` session-update marker
-    // (meaning "query ended, waiting for next IPC input"); flipped back to
-    // true on any subsequent non-idle output (meaning a new turn started).
+    // Starts true: the container spawns with its initial prompt already
+    // queued. Flipped false on an `idle: true` output marker; flipped true
+    // on any other output marker or any progress event.
     let turnInFlight = true;
     const configTimeout = group.containerConfig?.timeout || CONTAINER_TIMEOUT;
     // Grace period: hard timeout must be at least IDLE_TIMEOUT + 30s so the
@@ -3185,64 +3192,67 @@ export async function runContainerAgent(
           ].join('\n'),
         );
 
-        // Three distinct cases:
-        //
-        //   1. `!hadStreamingOutput`: container never spoke at all. Something
-        //      is badly broken (spawn failure, agent crashed before first
-        //      output, stuck MCP init). Report as a hard error.
-        //
-        //   2. `hadStreamingOutput && !turnInFlight`: idle reap. Agent
-        //      completed its last turn (we saw an `idle: true` marker) and
-        //      was sitting between turns when the watchdog fired. The host's
-        //      normal closeStdin path didn't finish cleanly but the user
-        //      already got their last response. Safe to resolve as success.
-        //
-        //   3. `hadStreamingOutput && turnInFlight`: mid-turn kill. The SDK
-        //      was processing a user input when it stopped emitting events
-        //      (true freeze: no output markers, no progress markers, no SDK
-        //      debug log lines for 30+ min). The user is owed a visible
-        //      error so they know their last message didn't complete.
+        // Three cases:
+        //   1. !hadStreamingOutput: container never spoke. Hard error.
+        //   2. !turnInFlight: idle reap between turns. Success.
+        //   3. turnInFlight: mid-turn kill. Error with errorType marker so
+        //      runAgent can flush a user-visible retry notice via the host
+        //      onOutput pipeline (the container's own chain may be stalled).
+        let timeoutResult: ContainerOutput;
         if (!hadStreamingOutput) {
           logger.error(
             { group: group.name, containerName, duration, code },
             'Container timed out with no output',
           );
-          resolve({
+          timeoutResult = {
             status: 'error',
             result: null,
             error: `Container timed out after ${configTimeout}ms`,
-          });
-          return;
-        }
-
-        if (turnInFlight) {
+          };
+        } else if (turnInFlight) {
           logger.error(
             { group: group.name, containerName, duration, code },
             'Container killed mid-turn by inactivity watchdog',
           );
-          settleOutputChain().then(() =>
+          timeoutResult = {
+            status: 'error',
+            result: null,
+            newSessionId,
+            error: 'Agent killed mid-turn by inactivity watchdog',
+            errorType: 'watchdog_mid_turn',
+          };
+        } else {
+          logger.info(
+            { group: group.name, containerName, duration, code },
+            'Container timed out between turns (idle cleanup)',
+          );
+          timeoutResult = {
+            status: 'success',
+            result: null,
+            newSessionId,
+          };
+        }
+
+        settleOutputChain().then((chainResult) => {
+          // If the onOutput chain rejected on its own AND we were about to
+          // report success, convert to error so the caller's retry path
+          // fires instead of silently advancing the cursor. Preserve an
+          // already-error timeoutResult (mid-turn kill or no-output):
+          // those carry their own semantics the caller needs to see.
+          if (
+            timeoutResult.status === 'success' &&
+            chainResult.kind === 'rejected'
+          ) {
             resolve({
               status: 'error',
               result: null,
               newSessionId,
-              error:
-                'Agent stopped responding mid-turn and was reaped after the inactivity watchdog fired. Your last message did not complete. Please retry.',
-            }),
-          );
-          return;
-        }
-
-        logger.info(
-          { group: group.name, containerName, duration, code },
-          'Container timed out between turns (idle cleanup)',
-        );
-        settleOutputChain().then(() =>
-          resolve({
-            status: 'success',
-            result: null,
-            newSessionId,
-          }),
-        );
+              error: `Output callback error during idle cleanup: ${String(chainResult.err).slice(0, 200)}`,
+            });
+            return;
+          }
+          resolve(timeoutResult);
+        });
         return;
       }
 
@@ -3336,11 +3346,24 @@ export async function runContainerAgent(
       }
 
       // Streaming mode: wait for output chain to settle (bounded), then
-      // resolve the completion marker. The bounded settle guarantees the
-      // group queue unblocks even if a downstream consumer (e.g. a hung
-      // channel.sendMessage) never completes.
+      // resolve. Rejection of any step propagates as status:error so the
+      // host's retry path fires on transient channel delivery failures
+      // instead of advancing the cursor past a lost message.
       if (onOutput) {
-        settleOutputChain().then(() => {
+        settleOutputChain().then((chainResult) => {
+          if (chainResult.kind === 'rejected') {
+            logger.error(
+              { group: group.name, duration, err: chainResult.err },
+              'Container completed but output chain rejected',
+            );
+            resolve({
+              status: 'error',
+              result: null,
+              newSessionId,
+              error: `Output callback error during container completion: ${String(chainResult.err).slice(0, 200)}`,
+            });
+            return;
+          }
           logger.info(
             { group: group.name, duration, newSessionId },
             'Container completed (streaming mode)',

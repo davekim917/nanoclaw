@@ -82,6 +82,13 @@ export const CONTAINER_MAX_OUTPUT_SIZE = parseInt(
   process.env.CONTAINER_MAX_OUTPUT_SIZE || '10485760',
   10,
 ); // 10MB default
+// Max time the host waits for the onOutput callback chain to drain before
+// force-unblocking the group queue. Bounds the deadlock window when a
+// downstream consumer (e.g. channel.sendMessage) stalls.
+export const OUTPUT_CHAIN_SETTLE_DEADLINE_MS = parseInt(
+  process.env.OUTPUT_CHAIN_SETTLE_DEADLINE_MS || '10000',
+  10,
+);
 export const ONECLI_URL = process.env.ONECLI_URL || envConfig.ONECLI_URL;
 export const MAX_MESSAGES_PER_PROMPT = Math.max(
   1,

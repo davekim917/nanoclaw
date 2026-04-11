@@ -23,6 +23,7 @@ vi.mock('./config.js', () => ({
   IDLE_TIMEOUT: 1800000, // 30min
   OLLAMA_ADMIN_TOOLS: false,
   ONECLI_URL: 'http://localhost:10254',
+  OUTPUT_CHAIN_SETTLE_DEADLINE_MS: 10000,
   PLUGINS_DIR: '/tmp/nanoclaw-test-plugins',
   RESIDENTIAL_PROXY_URL: undefined,
   TIMEZONE: 'America/Los_Angeles',
@@ -756,7 +757,7 @@ describe('container-runner timeout behavior', () => {
     );
   });
 
-  it('timeout mid-turn (no idle marker) resolves as error', async () => {
+  it('timeout mid-turn (no idle marker) resolves as error with watchdog_mid_turn errorType', async () => {
     const onOutput = vi.fn(async () => {});
     const resultPromise = runContainerAgent(
       testGroup,
@@ -785,7 +786,131 @@ describe('container-runner timeout behavior', () => {
     const result = await resultPromise;
     expect(result.status).toBe('error');
     expect(result.newSessionId).toBe('session-mid');
-    expect(result.error).toContain('mid-turn');
+    expect(result.errorType).toBe('watchdog_mid_turn');
+  });
+
+  it('new turn after idle with only progress events still classifies freeze as mid-turn kill', async () => {
+    // Regression test for the `turnInFlight` new-turn boundary gap:
+    // after an idle marker, a new turn emits only progress events (no
+    // OUTPUT markers) before freezing. Pre-fix, turnInFlight stayed
+    // false from the prior idle marker and the watchdog misclassified
+    // the freeze as an idle reap, silently dropping the user's message.
+    const onProgress = vi.fn();
+    const onOutput = vi.fn(async () => {});
+    const resultPromise = runContainerAgent(
+      testGroup,
+      testInput,
+      () => {},
+      onOutput,
+      onProgress,
+    );
+
+    // Turn 1: real result, then idle marker (turn ends cleanly).
+    emitOutputMarker(fakeProc, {
+      status: 'success',
+      result: 'Turn 1 response',
+      newSessionId: 'session-turn1',
+    });
+    emitOutputMarker(fakeProc, {
+      status: 'success',
+      result: null,
+      newSessionId: 'session-turn1',
+      idle: true,
+    });
+    await vi.advanceTimersByTimeAsync(10);
+
+    // Turn 2: only progress events, no OUTPUT markers. Advance past the
+    // idle-since-last-output threshold. Progress resets the watchdog so
+    // the container stays alive, and turnInFlight must flip back to true.
+    for (let i = 0; i < 3; i++) {
+      await vi.advanceTimersByTimeAsync(600_000);
+      emitProgressMarker(fakeProc, 'tool_use', { name: 'Read' });
+      await vi.advanceTimersByTimeAsync(10);
+    }
+
+    // Now freeze (no more events of any kind) and let the watchdog fire.
+    await vi.advanceTimersByTimeAsync(1830000);
+    fakeProc.emit('close', 137);
+    await vi.advanceTimersByTimeAsync(10);
+
+    const result = await resultPromise;
+    expect(result.status).toBe('error');
+    expect(result.errorType).toBe('watchdog_mid_turn');
+  });
+
+  it('progress markers reset the watchdog even when no onProgress callback is supplied', async () => {
+    // Regression test for scheduled-task / retry / session-command call
+    // sites that invoke runContainerAgent without onProgress. Pre-fix,
+    // the progress parse loop (and its resetTimeout) was gated on
+    // `if (onProgress)` so the watchdog fired even during active work.
+    const onOutput = vi.fn(async () => {});
+    const resultPromise = runContainerAgent(
+      testGroup,
+      testInput,
+      () => {},
+      onOutput,
+      // onProgress deliberately omitted
+    );
+
+    // 60 minutes of progress-only activity. Watchdog must NOT fire.
+    for (let i = 0; i < 6; i++) {
+      await vi.advanceTimersByTimeAsync(600_000);
+      emitProgressMarker(fakeProc, 'thinking', {
+        text: 'long reasoning chain',
+      });
+      await vi.advanceTimersByTimeAsync(10);
+    }
+
+    // Turn completes and container exits cleanly.
+    emitOutputMarker(fakeProc, {
+      status: 'success',
+      result: 'Done',
+      newSessionId: 'session-noprogress',
+    });
+    emitOutputMarker(fakeProc, {
+      status: 'success',
+      result: null,
+      newSessionId: 'session-noprogress',
+      idle: true,
+    });
+    await vi.advanceTimersByTimeAsync(10);
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    const result = await resultPromise;
+    expect(result.status).toBe('success');
+    expect(result.newSessionId).toBe('session-noprogress');
+  });
+
+  it('onOutput rejection during streaming resolves as error, not silent success', async () => {
+    // Regression test for settleOutputChain error propagation. If an
+    // onOutput step (e.g. channel.sendMessage) throws, the host must
+    // report status:error so the caller's retry path fires instead of
+    // advancing the message cursor past a lost delivery.
+    const onOutput = vi.fn(async () => {
+      throw new Error('channel.sendMessage: network error');
+    });
+    const resultPromise = runContainerAgent(
+      testGroup,
+      testInput,
+      () => {},
+      onOutput,
+    );
+
+    emitOutputMarker(fakeProc, {
+      status: 'success',
+      result: 'Agent response',
+      newSessionId: 'session-reject',
+    });
+    await vi.advanceTimersByTimeAsync(10);
+
+    fakeProc.emit('close', 0);
+    await vi.advanceTimersByTimeAsync(10);
+
+    const result = await resultPromise;
+    expect(result.status).toBe('error');
+    expect(result.error).toContain('Output callback error');
+    expect(onOutput).toHaveBeenCalled();
   });
 
   it('timeout with no output resolves as error', async () => {
