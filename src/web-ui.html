@@ -702,7 +702,6 @@ function chLabel(jid) {
   if (jid.startsWith('dc:')) return 'Discord';
   if (jid.startsWith('slack:')) return 'Slack';
   if (jid.startsWith('tg:')) return 'Telegram';
-  if (jid.startsWith('wa:') || jid.includes('@')) return 'WhatsApp';
   if (jid.startsWith('gmail:')) return 'Gmail';
   return '';
 }

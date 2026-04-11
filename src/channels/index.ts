@@ -15,6 +15,3 @@ import './telegram.js';
 
 // web (always available — no credentials needed)
 import './web.js';
-
-// whatsapp
-import './whatsapp.js';

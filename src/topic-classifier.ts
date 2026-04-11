@@ -1,5 +1,5 @@
 /**
- * Topic Classifier for Threadless Channels (WhatsApp/Telegram)
+ * Topic Classifier for Threadless Channels (Telegram, etc.)
  *
  * Three-tier decision for whether to reset the session on a new message:
  * 1. Short-circuit SAME: last message < 5 min ago → skip classifier

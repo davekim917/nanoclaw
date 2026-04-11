@@ -8,6 +8,7 @@ import {
   MAX_THREADS_PER_GROUP,
 } from './config.js';
 import { ContainerAttachment } from './container-runner.js';
+import { stopContainerAsync } from './container-runtime.js';
 import { clearGatesForThread } from './ipc.js';
 
 // Monotonic counter for IPC filenames — ensures correct ordering when
@@ -704,7 +705,22 @@ export class GroupQueue {
     }
   }
 
-  async shutdown(_gracePeriodMs: number): Promise<void> {
+  /**
+   * Gracefully stop all in-flight container subprocesses in parallel.
+   *
+   * Previously this only logged active containers and returned without killing
+   * them ("detached, not killed") — which left the docker subprocesses orphaned
+   * in the systemd cgroup. systemd then SIGTERMed them via control-group kill
+   * after the Node parent exited, and SIGKILLed any that didn't drain within
+   * TimeoutStopSec (default 90s). For long-running agent tasks that meant a
+   * 90s shutdown stall on every `systemctl restart`.
+   *
+   * The fix is the canonical "service-as-supervisor synchronous stop" pattern
+   * (per systemd.kill(5) and the systemd #31288 maintainer thread): stop the
+   * children synchronously here, BEFORE the Node process exits, so the cgroup
+   * is empty by the time systemd's kill phase runs.
+   */
+  async shutdown(gracePeriodMs: number): Promise<void> {
     this.shuttingDown = true;
 
     const activeContainers: string[] = [];
@@ -716,9 +732,43 @@ export class GroupQueue {
       }
     }
 
+    if (activeContainers.length === 0) {
+      logger.info('GroupQueue shutting down (no active containers)');
+      return;
+    }
+
+    const gracePeriodSec = Math.max(1, Math.floor(gracePeriodMs / 1000));
     logger.info(
-      { activeCount: this.activeCount, detachedContainers: activeContainers },
-      'GroupQueue shutting down (containers detached, not killed)',
+      { count: activeContainers.length, names: activeContainers, gracePeriodSec },
+      'GroupQueue stopping active containers in parallel',
     );
+
+    const results = await Promise.allSettled(
+      activeContainers.map((name) => stopContainerAsync(name, gracePeriodSec)),
+    );
+    // "No such container" rejections are benign: the agent loop finished
+    // naturally during the grace window between enumeration and the docker
+    // stop call. Treat them as success-equivalent so the WARN doesn't cry
+    // wolf on every routine restart.
+    const failed: Array<{ name: string; err: string }> = [];
+    results.forEach((r, i) => {
+      if (r.status !== 'rejected') return;
+      const errMsg =
+        r.reason instanceof Error ? r.reason.message : String(r.reason);
+      if (/no such container/i.test(errMsg)) return;
+      failed.push({ name: activeContainers[i], err: errMsg });
+    });
+
+    if (failed.length > 0) {
+      logger.warn(
+        { failed, total: activeContainers.length },
+        'Some containers did not stop cleanly during shutdown',
+      );
+    } else {
+      logger.info(
+        { count: activeContainers.length },
+        'All active containers stopped cleanly',
+      );
+    }
   }
 }

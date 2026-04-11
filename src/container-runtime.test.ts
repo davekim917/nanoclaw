@@ -15,8 +15,13 @@ vi.mock('./logger.js', () => ({
 
 // Mock child_process — store the mock fn so tests can configure it
 const mockExecSync = vi.fn();
+const mockExecFile = vi.fn();
 vi.mock('child_process', () => ({
   execSync: (...args: unknown[]) => mockExecSync(...args),
+  // execFile is wrapped in promisify() at module load time, so it just needs
+  // to be a callable. Tests that exercise the async code path can configure
+  // mockExecFile directly.
+  execFile: (...args: unknown[]) => mockExecFile(...args),
 }));
 
 import {

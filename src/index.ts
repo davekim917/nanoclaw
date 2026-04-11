@@ -955,7 +955,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   }
   // --- End gate resolution ---
 
-  // Topic classifier for threadless channels (WhatsApp, Telegram)
+  // Topic classifier for threadless channels (Telegram, etc.)
   // Discord/Slack use thread-as-session instead, so skip classifier for them.
   const isThreadChannel =
     chatJid.startsWith('dc:') || chatJid.startsWith('slack:');
@@ -2646,7 +2646,8 @@ function ensureContainerSystemRunning(): void {
 }
 
 async function main(): Promise<void> {
-  // Prevent multiple instances — WhatsApp revokes sessions on conflict
+  // Prevent multiple instances — concurrent NanoClaw processes would race on
+  // SQLite writes, IPC dirs, and channel session state.
   const pidFile = path.join(DATA_DIR, 'nanoclaw.pid');
   if (fs.existsSync(pidFile)) {
     const oldPid = parseInt(fs.readFileSync(pidFile, 'utf-8').trim(), 10);

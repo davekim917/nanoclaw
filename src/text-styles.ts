@@ -2,21 +2,16 @@
  * parseTextStyles — convert Claude's Markdown output to channel-native formatting.
  *
  * Claude outputs standard Markdown. Each channel has its own text style syntax:
- *   - Signal:             passthrough (SignalChannel handles rich text styles natively
- *                         via the signal-cli JSON-RPC textStyle param — see parseSignalStyles)
- *   - WhatsApp / Telegram: *bold*, _italic_, no headings, plain links
- *   - Slack:              *bold*, _italic_, <url|text> links
- *   - Discord:            passthrough (already Markdown)
+ *   - Signal:    passthrough (SignalChannel handles rich text styles natively
+ *                via the signal-cli JSON-RPC textStyle param — see parseSignalStyles)
+ *   - Telegram:  *bold*, _italic_, no headings, plain links
+ *   - Slack:     *bold*, _italic_, <url|text> links
+ *   - Discord:   passthrough (already Markdown)
  *
  * Code blocks (fenced and inline) are NEVER transformed by marker substitution.
  */
 
-export type ChannelType =
-  | 'signal'
-  | 'whatsapp'
-  | 'telegram'
-  | 'slack'
-  | 'discord';
+export type ChannelType = 'signal' | 'telegram' | 'slack' | 'discord';
 
 /** Transform Markdown text for the target channel's native format. */
 export function parseTextStyles(text: string, channel: ChannelType): string {
@@ -267,7 +262,7 @@ function findClosingUnderscore(s: string, from: number): number {
 }
 
 // ---------------------------------------------------------------------------
-// Marker-substitution helpers (WhatsApp / Telegram / Slack)
+// Marker-substitution helpers (Telegram / Slack)
 // ---------------------------------------------------------------------------
 
 interface Segment {
@@ -314,10 +309,10 @@ function transformSegment(text: string, channel: ChannelType): string {
   // first (**bold** → *bold*), the italic step would immediately re-convert *bold*
   // to _bold_, producing wrong output.
 
-  // 1. Italic: *text* → _text_ (whatsapp/telegram/slack use _)
+  // 1. Italic: *text* → _text_ (telegram/slack use _)
   t = t.replace(/(?<!\*)\*(?=[^\s*])([^*\n]+?)(?<=[^\s*])\*(?!\*)/g, '_$1_');
 
-  // 2. Bold: **text** → *text* (whatsapp/telegram/slack use single *)
+  // 2. Bold: **text** → *text* (telegram/slack use single *)
   t = t.replace(/\*\*(?=[^\s*])([^*]+?)(?<=[^\s*])\*\*/g, '*$1*');
 
   // 3. Headings: ## Title → *Title* (any level, line-start only)
