@@ -5,6 +5,15 @@ ln -s /app/node_modules /tmp/dist/node_modules
 chmod -R a-w /tmp/dist
 cat > /tmp/input.json
 
+# Extract a single string field from /tmp/input.json secrets. Returns empty
+# string if the field is missing or input.json is unreadable. Used by the
+# auth/setup blocks below in place of inline `node -e` invocations. The field
+# name is passed as process.argv[1] (NOT shell-interpolated into the JS source)
+# so a metacharacter in the name can never escape into the script body.
+extract_secret() {
+  node -e 'try{const d=JSON.parse(require("fs").readFileSync("/tmp/input.json","utf8"));const v=d.secrets?.[process.argv[1]];if(v)process.stdout.write(v)}catch{}' -- "$1" 2>/dev/null
+}
+
 # Fix Chromium crashpad in containers: crashpad derives its database path from
 # XDG_CONFIG_HOME. If that dir isn't writable (or gets corrupted in long-running
 # containers), chromium crashes with "chrome_crashpad_handler: --database is required".
@@ -18,8 +27,8 @@ if [ -n "$RESIDENTIAL_PROXY_URL" ]; then
 fi
 
 # Configure git/gh auth if GITHUB_TOKEN is present in secrets
-GH_TOKEN=$(node -e 'try{const d=JSON.parse(require("fs").readFileSync("/tmp/input.json","utf8"));if(d.secrets?.GITHUB_TOKEN)process.stdout.write(d.secrets.GITHUB_TOKEN)}catch{}' 2>/dev/null)
-GH_ORGS=$(node -e 'try{const d=JSON.parse(require("fs").readFileSync("/tmp/input.json","utf8"));if(d.secrets?.GITHUB_ALLOWED_ORGS)process.stdout.write(d.secrets.GITHUB_ALLOWED_ORGS)}catch{}' 2>/dev/null)
+GH_TOKEN=$(extract_secret GITHUB_TOKEN)
+GH_ORGS=$(extract_secret GITHUB_ALLOWED_ORGS)
 if [ -n "$GH_TOKEN" ]; then
   if [ -n "$GH_ORGS" ]; then
     # URL-scoped credentials: only provide token for allowed orgs.
@@ -45,8 +54,8 @@ fi
 # When the host passes RENDER_WORKSPACE_ID in secrets (set per-scope via
 # RENDER_WORKSPACE_ID_<SCOPE> in .env, normalized in readSecrets), pre-set
 # it here so the agent doesn't have to learn the `render workspace set` flow.
-RENDER_WS=$(node -e 'try{const d=JSON.parse(require("fs").readFileSync("/tmp/input.json","utf8"));if(d.secrets?.RENDER_WORKSPACE_ID)process.stdout.write(d.secrets.RENDER_WORKSPACE_ID)}catch{}' 2>/dev/null)
-RENDER_KEY=$(node -e 'try{const d=JSON.parse(require("fs").readFileSync("/tmp/input.json","utf8"));if(d.secrets?.RENDER_API_KEY)process.stdout.write(d.secrets.RENDER_API_KEY)}catch{}' 2>/dev/null)
+RENDER_WS=$(extract_secret RENDER_WORKSPACE_ID)
+RENDER_KEY=$(extract_secret RENDER_API_KEY)
 if [ -n "$RENDER_WS" ] && [ -n "$RENDER_KEY" ]; then
   RENDER_API_KEY="$RENDER_KEY" /usr/local/bin/render workspace set "$RENDER_WS" --confirm >/dev/null 2>&1 \
     && echo "[entrypoint] render workspace pre-configured: $RENDER_WS" >&2 \
