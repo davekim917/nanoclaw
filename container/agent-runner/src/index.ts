@@ -841,18 +841,6 @@ function buildCapabilityManifest(
     );
   }
 
-  // Observability / analytics
-  if (isToolEnabled(tools, 'braintrust')) {
-    capabilities.push(
-      '- **Braintrust** — evals and experiments via `mcp__braintrust__*` MCP tools.',
-    );
-  }
-  if (isToolEnabled(tools, 'omni')) {
-    capabilities.push(
-      '- **Omni** — `mcp__omni__*` MCP tools for dashboards and queries. For raw API access, `OMNI_BASE_URL` and `OMNI_API_KEY` are in env: `curl -H "Authorization: Bearer $OMNI_API_KEY" "$OMNI_BASE_URL/api/..."`.',
-    );
-  }
-
   // Browser automation
   if (isToolEnabled(tools, 'browser-auth')) {
     capabilities.push(
@@ -867,18 +855,16 @@ function buildCapabilityManifest(
     );
   }
 
-  // Meetings
-  // Gate on token presence: if granola is enabled but the token is missing,
-  // buildMcpServers will skip registering the server, so claiming the
-  // capability would be a hallucination.
-  if (
-    isToolEnabled(tools, 'granola') &&
-    typeof secrets?.GRANOLA_ACCESS_TOKEN === 'string' &&
-    secrets.GRANOLA_ACCESS_TOKEN.length > 0
-  ) {
-    capabilities.push(
-      '- **Granola** — meeting transcripts and notes via MCP tools.',
-    );
+  // Header-auth MCP servers (granola, braintrust, omni). Gated on secret
+  // presence so the manifest stays in sync with buildMcpServers — when
+  // a secret is missing, the server is skipped there AND its capability
+  // entry is omitted here.
+  for (const cfg of HEADER_AUTH_MCP_SERVERS) {
+    if (!isToolEnabled(tools, cfg.tool)) continue;
+    const secret = secrets?.[cfg.secretKey];
+    if (typeof secret === 'string' && secret.length > 0) {
+      capabilities.push(cfg.capability);
+    }
   }
 
   if (capabilities.length === 0) return undefined;
@@ -948,9 +934,14 @@ function buildAllowedTools(tools: string[] | undefined): string[] {
     allowed.push('mcp__exa__*');
     allowed.push('mcp__exa-websets__*');
   }
-  if (isToolEnabled(tools, 'granola')) allowed.push('mcp__granola__*');
-  if (isToolEnabled(tools, 'braintrust')) allowed.push('mcp__braintrust__*');
-  if (isToolEnabled(tools, 'omni')) allowed.push('mcp__omni__*');
+  // Allowlist is driven by the registry so adding a new header-auth MCP
+  // server is a single-point change (HEADER_AUTH_MCP_SERVERS row → both
+  // registration and allowlist coverage).
+  for (const cfg of HEADER_AUTH_MCP_SERVERS) {
+    if (isToolEnabled(tools, cfg.tool)) {
+      allowed.push(`mcp__${cfg.name}__*`);
+    }
+  }
   return allowed;
 }
 
@@ -1008,10 +999,34 @@ const HEADER_AUTH_MCP_SERVERS: ReadonlyArray<{
   name: string; // servers[name] key + log identifier
   url: string;
   secretKey: string; // containerInput.secrets[secretKey]
+  // Capability manifest entry shown to the agent. Rendered only when the
+  // secret is present — if refresh fails and the MCP server is skipped,
+  // claiming the capability would be a hallucination.
+  capability: string;
 }> = [
-  { tool: 'granola',    name: 'granola',    url: 'https://mcp.granola.ai/mcp',           secretKey: 'GRANOLA_ACCESS_TOKEN' },
-  { tool: 'braintrust', name: 'braintrust', url: 'https://api.braintrust.dev/mcp',       secretKey: 'BRAINTRUST_API_KEY'   },
-  { tool: 'omni',       name: 'omni',       url: 'https://sunday.omniapp.co/mcp/https',  secretKey: 'OMNI_API_KEY'         },
+  {
+    tool: 'granola',
+    name: 'granola',
+    url: 'https://mcp.granola.ai/mcp',
+    secretKey: 'GRANOLA_ACCESS_TOKEN',
+    capability: '- **Granola** — meeting transcripts and notes via MCP tools.',
+  },
+  {
+    tool: 'braintrust',
+    name: 'braintrust',
+    url: 'https://api.braintrust.dev/mcp',
+    secretKey: 'BRAINTRUST_API_KEY',
+    capability:
+      '- **Braintrust** — evals and experiments via `mcp__braintrust__*` MCP tools.',
+  },
+  {
+    tool: 'omni',
+    name: 'omni',
+    url: 'https://sunday.omniapp.co/mcp/https',
+    secretKey: 'OMNI_API_KEY',
+    capability:
+      '- **Omni** — `mcp__omni__*` MCP tools for dashboards and queries. For raw API access, `OMNI_BASE_URL` and `OMNI_API_KEY` are in env: `curl -H "Authorization: Bearer $OMNI_API_KEY" "$OMNI_BASE_URL/api/..."`.',
+  },
 ];
 
 function buildMcpServers(
@@ -1048,8 +1063,6 @@ function buildMcpServers(
     if (exaKey) websetsUrl.searchParams.set('exaApiKey', exaKey);
     servers['exa-websets'] = { type: 'http', url: websetsUrl.toString() };
   }
-  // See HEADER_AUTH_MCP_SERVERS docstring above for the rationale on
-  // explicit-headers vs proxy injection and skip-on-missing semantics.
   for (const cfg of HEADER_AUTH_MCP_SERVERS) {
     if (!isToolEnabled(tools, cfg.tool)) continue;
     const key = containerInput.secrets?.[cfg.secretKey];

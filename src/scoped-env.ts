@@ -1,9 +1,12 @@
 /**
- * Helpers for resolving scoped credential env-var names from .env, used by
- * readSecrets in container-runner.ts and resolveGithubTokenKey-like callers
- * in daily-notifications.ts.
+ * Helpers for parsing scoped tool entries (e.g. `gmail:illysium`) and
+ * resolving the corresponding credential env-var names from .env.
  *
- * Two patterns are supported:
+ * `extractToolScopes` lives here — not in container-runner.ts — so that
+ * smaller modules like daily-notifications.ts can use it without pulling
+ * in the whole container spawn path.
+ *
+ * `scopedEnvKey` supports two fallback modes:
  *   - 'bare':  unscoped → `${PREFIX}`,                  scoped → `${PREFIX}_${SCOPE}`
  *   - 'group': unscoped → `${PREFIX}_${GROUP}`,         scoped → `${PREFIX}_${SCOPE}`
  *
@@ -15,6 +18,39 @@
  * user-defined-suffix pattern do NOT fit either shape — those callers
  * stay open-coded.
  */
+import { logger } from './logger.js';
+
+// Safe scope pattern: alphanumeric, hyphens, underscores only. Rejects path
+// traversal attempts like '../../.ssh' or absolute paths. Enforced inside
+// extractToolScopes — unsafe scopes are dropped with a logged warning.
+export const SAFE_SCOPE_RE = /^[a-zA-Z0-9_-]+$/;
+
+/**
+ * Extract scoped access entries from a tools array (e.g. `gmail:illysium` →
+ * `['illysium']`). Returns the matched scopes and whether the tool is
+ * scope-restricted (true when no bare `gmail` entry coexists alongside the
+ * scoped ones). Unsafe scope values are dropped with a logged warning.
+ */
+export function extractToolScopes(
+  tools: string[] | undefined,
+  toolName: string,
+): { scopes: string[]; isScoped: boolean } {
+  const scopes =
+    tools
+      ?.filter((t) => t.startsWith(`${toolName}:`))
+      .map((t) => t.split(':')[1])
+      .filter((scope) => {
+        if (!SAFE_SCOPE_RE.test(scope)) {
+          logger.warn({ scope, toolName }, 'Rejecting unsafe tool scope value');
+          return false;
+        }
+        return true;
+      }) ?? [];
+  return {
+    scopes,
+    isScoped: scopes.length > 0 && !tools?.includes(toolName),
+  };
+}
 
 export type ScopeFallback = 'bare' | 'group';
 

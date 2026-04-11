@@ -27,7 +27,11 @@ import {
 } from './config.js';
 import { readEnvFile, readEnvFileMatching } from './env.js';
 import { registerSecrets } from './secret-scrubber.js';
-import { normalizeScopedSecret, scopedEnvKey } from './scoped-env.js';
+import {
+  extractToolScopes,
+  normalizeScopedSecret,
+  scopedEnvKey,
+} from './scoped-env.js';
 import {
   assertValidGroupFolder,
   assertValidThreadId,
@@ -837,35 +841,6 @@ interface VolumeMount {
 function isToolEnabled(tools: string[] | undefined, name: string): boolean {
   if (!tools) return true;
   return tools.some((t) => t === name || t.startsWith(name + ':'));
-}
-
-/**
- * Extract scoped access entries from tools array (e.g. 'gmail:illysium' → ['illysium']).
- * Returns scopes and whether the tool is scope-restricted (no bare entry like 'gmail').
- */
-// Safe scope pattern: alphanumeric, hyphens, underscores only.
-// Rejects path traversal attempts like '../../.ssh' or absolute paths.
-export const SAFE_SCOPE_RE = /^[a-zA-Z0-9_-]+$/;
-
-export function extractToolScopes(
-  tools: string[] | undefined,
-  toolName: string,
-): { scopes: string[]; isScoped: boolean } {
-  const scopes =
-    tools
-      ?.filter((t) => t.startsWith(`${toolName}:`))
-      .map((t) => t.split(':')[1])
-      .filter((scope) => {
-        if (!SAFE_SCOPE_RE.test(scope)) {
-          logger.warn({ scope, toolName }, 'Rejecting unsafe tool scope value');
-          return false;
-        }
-        return true;
-      }) ?? [];
-  return {
-    scopes,
-    isScoped: scopes.length > 0 && !tools?.includes(toolName),
-  };
 }
 
 /**
@@ -2466,6 +2441,23 @@ function readSecrets(
   const dbtScopedApiUrl = `DBT_CLOUD_API_URL_${scope}`;
   const dbtScopedApiKey = `DBT_CLOUD_API_KEY_${scope}`;
 
+  // Browser auth: shared between derive (envKeys below) and normalize (further
+  // down). Kept hoisted so extractToolScopes runs once per readSecrets call.
+  const BROWSER_AUTH_KEYS = [
+    'BROWSER_AUTH_URL',
+    'BROWSER_AUTH_EMAIL',
+    'BROWSER_AUTH_PASSWORD',
+  ] as const;
+  const { scopes: authScopes, isScoped: authScoped } = extractToolScopes(
+    tools,
+    'browser-auth',
+  );
+  const browserAuthOpts = {
+    scopes: authScopes,
+    isScoped: authScoped,
+    fallback: 'bare' as const,
+  };
+
   const envKeys = [
     githubTokenKey,
     'DBT_CLOUD_EMAIL',
@@ -2497,23 +2489,9 @@ function readSecrets(
     // Browser auth credentials for Playwright login automation.
     // Scoped: 'browser-auth:illyse' reads BROWSER_AUTH_{URL,EMAIL,PASSWORD}_ILLYSE.
     // Unscoped: 'browser-auth' reads BROWSER_AUTH_{URL,EMAIL,PASSWORD}.
-    ...(() => {
-      if (!isToolEnabled(tools, 'browser-auth')) return [];
-      const { scopes: authScopes, isScoped: authScoped } = extractToolScopes(
-        tools,
-        'browser-auth',
-      );
-      const opts = {
-        scopes: authScopes,
-        isScoped: authScoped,
-        fallback: 'bare' as const,
-      };
-      return [
-        scopedEnvKey('BROWSER_AUTH_URL', opts),
-        scopedEnvKey('BROWSER_AUTH_EMAIL', opts),
-        scopedEnvKey('BROWSER_AUTH_PASSWORD', opts),
-      ];
-    })(),
+    ...(isToolEnabled(tools, 'browser-auth')
+      ? BROWSER_AUTH_KEYS.map((k) => scopedEnvKey(k, browserAuthOpts))
+      : []),
     // Anthropic API key + base URL — passed directly to the SDK via sdkEnv.
     // When set, these bypass the OneCLI proxy for Claude API calls.
     // ANTHROPIC_API_KEY_2/3 are fallbacks cycled through on 429/upstream errors.
@@ -2524,13 +2502,10 @@ function readSecrets(
   ];
   const secrets = readEnvFile(envKeys);
 
-  // Normalize scoped GitHub token key to GITHUB_TOKEN so entrypoint.sh finds it
   normalizeScopedSecret(secrets, githubTokenKey, 'GITHUB_TOKEN');
-
-  // Normalize scoped Render API key to RENDER_API_KEY so the CLI finds it
   normalizeScopedSecret(secrets, renderTokenKey, 'RENDER_API_KEY');
-  // Normalize scoped Render workspace ID — the entrypoint reads
-  // RENDER_WORKSPACE_ID and runs `render workspace set` if present.
+  // Render workspace ID is consumed by the entrypoint which runs
+  // `render workspace set <id> --confirm` if present.
   normalizeScopedSecret(secrets, renderWorkspaceKey, 'RENDER_WORKSPACE_ID');
 
   // GitHub org restriction: when tools includes 'github-orgs:OrgName', pass
@@ -2541,22 +2516,11 @@ function readSecrets(
     secrets.GITHUB_ALLOWED_ORGS = githubOrgScopes.join(',');
   }
 
-  // Normalize scoped browser auth keys to generic names
-  {
-    const { scopes: authScopes, isScoped: authScoped } = extractToolScopes(
-      tools,
-      'browser-auth',
-    );
-    if (authScoped) {
-      const suffix = `_${authScopes[0].toUpperCase()}`;
-      for (const base of [
-        'BROWSER_AUTH_URL',
-        'BROWSER_AUTH_EMAIL',
-        'BROWSER_AUTH_PASSWORD',
-      ]) {
-        normalizeScopedSecret(secrets, `${base}${suffix}`, base);
-      }
-    }
+  // Normalize scoped browser auth keys to generic names. Unconditional —
+  // when browser-auth is unscoped, scopedEnvKey returns the bare key and
+  // normalizeScopedSecret no-ops.
+  for (const base of BROWSER_AUTH_KEYS) {
+    normalizeScopedSecret(secrets, scopedEnvKey(base, browserAuthOpts), base);
   }
 
   // Normalize scoped dbt keys to their generic names

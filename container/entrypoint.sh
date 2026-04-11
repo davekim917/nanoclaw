@@ -5,11 +5,9 @@ ln -s /app/node_modules /tmp/dist/node_modules
 chmod -R a-w /tmp/dist
 cat > /tmp/input.json
 
-# Extract a single string field from /tmp/input.json secrets. Returns empty
-# string if the field is missing or input.json is unreadable. Used by the
-# auth/setup blocks below in place of inline `node -e` invocations. The field
-# name is passed as process.argv[1] (NOT shell-interpolated into the JS source)
-# so a metacharacter in the name can never escape into the script body.
+# Read one secret field from /tmp/input.json. The field name is passed as
+# process.argv[1] (NOT interpolated into the JS source) — a metacharacter in
+# the name can never escape into the script body.
 extract_secret() {
   node -e 'try{const d=JSON.parse(require("fs").readFileSync("/tmp/input.json","utf8"));const v=d.secrets?.[process.argv[1]];if(v)process.stdout.write(v)}catch{}' -- "$1" 2>/dev/null
 }

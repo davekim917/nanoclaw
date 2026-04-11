@@ -3,7 +3,6 @@ import { promisify } from 'util';
 
 import { CronExpressionParser } from 'cron-parser';
 
-import { extractToolScopes } from './container-runner.js';
 import {
   createTask,
   getBacklog,
@@ -14,7 +13,7 @@ import {
 } from './db.js';
 import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
-import { scopedEnvKey } from './scoped-env.js';
+import { extractToolScopes, scopedEnvKey } from './scoped-env.js';
 import { registerSystemTaskHandler } from './task-scheduler.js';
 import { ContainerConfig, RegisteredGroup } from './types.js';
 
