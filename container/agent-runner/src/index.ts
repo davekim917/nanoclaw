@@ -1917,7 +1917,7 @@ async function main(): Promise<void> {
     let resultEmitted = false;
 
     try {
-      for await (const message of query({
+      const slashQuery = query({
         prompt: trimmedPrompt,
         options: {
           cwd: '/workspace/group',
@@ -1934,7 +1934,18 @@ async function main(): Promise<void> {
             PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
           },
         },
-      })) {
+      });
+
+      // Preserve model override across compaction — without this the SDK
+      // defaults to Sonnet after the compact_boundary resets the conversation.
+      const slashModel = sdkEnv['CLAUDE_CODE_USE_MODEL'] || containerInput.model;
+      if (slashModel) {
+        const alias = toCliAlias(slashModel);
+        await slashQuery.setModel(alias);
+        log(`setModel(${alias}) applied for slash command`);
+      }
+
+      for await (const message of slashQuery) {
         const msgType = message.type === 'system'
           ? `system/${(message as { subtype?: string }).subtype}`
           : message.type;
