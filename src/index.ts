@@ -75,6 +75,7 @@ import {
   deleteSessionV2,
   findAllInFlightThreads,
   getAllChats,
+  getInFlightChatJids,
   getAllRegisteredGroups,
   getAllSessionsV2,
   getAllTasks,
@@ -187,6 +188,14 @@ let sessions = new Map<string, string>(); // V2: composite session keys
 let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
+/**
+ * Set by the SIGTERM/SIGINT handler before rolling back in-flight cursors.
+ * The message loop checks this before every poll iteration and bails out,
+ * preventing new cursor advances (via the pipe path at :2452-2453) from
+ * landing during the `queue.shutdown()` grace window — those would
+ * otherwise clobber the rollback that already ran at shutdown entry.
+ */
+let messageLoopShuttingDown = false;
 
 // In-memory cache for message attachments.
 // Attachments are ephemeral (not stored in DB) — they travel through this cache
@@ -1258,11 +1267,20 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     );
   }
 
+  // Mark in-flight BEFORE advancing the cursor and BEFORE any further
+  // awaits. If SIGTERM fires between here and runAgent's own
+  // setSessionProcessing call, the shutdown handler's rollback query
+  // must still see processing=1 for this chat_jid — otherwise it skips
+  // the rollback and saveState() persists the advanced cursor,
+  // stranding the in-flight messages.
+  setSessionProcessing(sessionKey, group.folder, chatJid, effectiveThreadId);
+
   // Advance cursor in-memory so concurrent checks for this group won't
   // re-fetch these messages while the container is running. We deliberately
   // do NOT call saveState() here — persisting happens only after the container
   // completes. This way a SIGTERM/crash mid-run leaves the DB cursor at the
-  // previous value, allowing startup recovery to re-process the messages.
+  // previous value, allowing startup recovery to re-process the messages
+  // (via the shutdown-handler rollback + getOrRecoverCursor on next start).
   const previousCursor = lastAgentTimestamp[chatJid] || '';
   lastAgentTimestamp[chatJid] =
     missedMessages[missedMessages.length - 1].timestamp;
@@ -1497,7 +1515,14 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           }
           // Strip <internal>/<thread-title> blocks and apply channel formatting
           const text = formatOutbound(raw, channel.name as ChannelType);
-          agentResponseText += text + '\n';
+          // Internal notices (e.g. the SDK-drift "_Model fallback: ..._"
+          // message emitted by agent-runner itself) are delivered to the
+          // channel but excluded from agentResponseText so mid-session
+          // memory extraction at line ~1585 doesn't treat runtime
+          // metadata as assistant content.
+          if (!result.isInternalNotice) {
+            agentResponseText += text + '\n';
+          }
           logger.info(
             { group: group.name },
             `Agent output: ${raw.slice(0, 200)}`,
@@ -2001,7 +2026,16 @@ async function runAgent(
     logger.error({ group: group.name, err }, 'Agent error');
     return 'error';
   } finally {
-    clearSessionProcessing(sessionKey);
+    // Skip the processing-flag clear during shutdown so recoverPendingMessages
+    // on next startup can still see this session as in-flight and fire the
+    // thread-recovery notice. Without this gate, runAgent's finally runs
+    // during queue.shutdown's grace window (containers winding down), clears
+    // processing=0, and the startup recovery path finds nothing — stranding
+    // any messages whose cursor was already rolled back by the shutdown
+    // handler. Verified end-to-end via Test C round 2 (2026-04-12).
+    if (!messageLoopShuttingDown) {
+      clearSessionProcessing(sessionKey);
+    }
     webUI?.notifySessionEnd(sessionKey);
   }
 }
@@ -2015,7 +2049,7 @@ async function startMessageLoop(): Promise<void> {
 
   logger.info(`NanoClaw running (default trigger: ${DEFAULT_TRIGGER})`);
 
-  while (true) {
+  while (!messageLoopShuttingDown) {
     try {
       const jids = Object.keys(registeredGroups);
       const { messages, newTimestamp } = getNewMessages(
@@ -2718,6 +2752,50 @@ async function main(): Promise<void> {
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
+    // Stop the message loop from starting new iterations. New pipe-path
+    // advances during the `queue.shutdown()` grace window below would
+    // otherwise overwrite the rollback we're about to perform (the main
+    // loop calls saveState() on every iteration that sees new messages).
+    messageLoopShuttingDown = true;
+    // processGroupMessages (src/index.ts:1266-1268) and the pipe path
+    // (src/index.ts:2452-2453) advance `lastAgentTimestamp[chatJid]`
+    // in-memory BEFORE the container emits anything, relying on the
+    // completion handlers to either persist or roll back the advance.
+    // SIGTERM bypasses those handlers, so blindly calling saveState()
+    // here would strand every in-flight message (next startup's recovery
+    // path reads the advanced cursor, sees no pending user messages, and
+    // skips the resend notice — the exact failure Dave hit on 2026-04-11).
+    //
+    // Before persisting, drop in-memory cursor entries for any chat_jid
+    // whose session is still marked processing=1. saveState() will then
+    // persist the absence, and startup recovery falls back via
+    // getOrRecoverCursor (last-bot-reply timestamp) so the stranded
+    // messages are picked up by the recovery notice path.
+    try {
+      const inFlightChatJids = getInFlightChatJids();
+      for (const jid of inFlightChatJids) {
+        if (jid in lastAgentTimestamp) {
+          logger.info(
+            {
+              chatJid: jid,
+              rolledBackFrom: lastAgentTimestamp[jid],
+              signal,
+            },
+            'Rolling back in-flight cursor advance before shutdown saveState',
+          );
+          delete lastAgentTimestamp[jid];
+        }
+      }
+    } catch (err) {
+      // Escalated from logger.warn so a DB failure during rollback is
+      // visible in ops tooling. Without rollback, the subsequent
+      // `saveState()` silently regresses to the pre-fix stranding
+      // behavior — operators need to see this clearly.
+      logger.error(
+        { err },
+        'Failed to roll back in-flight cursors on shutdown — saveState() will persist advanced cursors (pre-fix behavior)',
+      );
+    }
     // Persist in-memory cursor positions before exiting. Containers that
     // advanced cursors (via processGroupMessages or pipe) but haven't
     // completed yet would otherwise lose those advances, causing message

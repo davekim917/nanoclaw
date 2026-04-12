@@ -819,6 +819,15 @@ export interface ContainerOutput {
   effortApplied?: string;
   /** True if applyFlagSettings rejected — the effort switch did not take. */
   effortFailed?: boolean;
+  /**
+   * Set on writeOutputs the agent-runner emits itself (not produced by
+   * the LLM) — e.g. the SDK-drift "_Model fallback: ..._" notice in
+   * container/agent-runner/src/index.ts. The host delivers these as
+   * normal channel messages but excludes them from `agentResponseText`
+   * so mid-session memory extraction doesn't treat runtime notices
+   * as assistant content.
+   */
+  isInternalNotice?: boolean;
 }
 
 export interface ProgressEvent {

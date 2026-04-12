@@ -943,6 +943,24 @@ export function findAllInFlightThreads(): Array<{
   }>;
 }
 
+/**
+ * Return chat_jids for all sessions currently marked processing=1.
+ * Used by the shutdown handler to roll back in-memory cursor advances
+ * before saveState() persists them — otherwise any chat_jid whose
+ * container hadn't yet emitted an Agent output would have its cursor
+ * advanced past the in-flight user messages, stranding them on the
+ * next startup.
+ */
+export function getInFlightChatJids(): string[] {
+  const rows = db
+    .prepare(
+      `SELECT DISTINCT chat_jid FROM sessions
+       WHERE processing = 1 AND chat_jid IS NOT NULL`,
+    )
+    .all() as Array<{ chat_jid: string }>;
+  return rows.map((r) => r.chat_jid);
+}
+
 /** Clear all processing flags (safety reset on startup). */
 export function clearAllProcessingFlags(): void {
   db.prepare('UPDATE sessions SET processing = 0 WHERE processing = 1').run();

@@ -69,6 +69,14 @@ interface ContainerOutput {
   effortApplied?: string;
   /** True if applyFlagSettings rejected — the effort switch did not take. */
   effortFailed?: boolean;
+  /**
+   * Set on writeOutputs the agent-runner itself emits (not produced by
+   * the LLM) — e.g. the SDK-drift "_Model fallback: ..._" notice below.
+   * The host delivers these as normal channel messages but skips
+   * `agentResponseText` accumulation so runtime notices don't leak
+   * into mid-session memory extraction.
+   */
+  isInternalNotice?: boolean;
 }
 
 interface SessionEntry {
@@ -1246,6 +1254,10 @@ async function runQuery(
   // clean slate — the SDK may or may not reset modelUsage between Query
   // objects, and a stale snapshot would mask growth (curr<prev → no flag).
   const cumulativeOutputTokensByModel = new Map<string, number>();
+  // Latched when any Result surfaces an upstream "API Error:" body.
+  // Gates the SDK-drift detector below to avoid misreading legitimate
+  // plain-sonnet subagent turns as drift.
+  let sawApiErrorThisRun = false;
 
   // Discover additional directories mounted at /workspace/extra/*
   // These are passed to the SDK so their CLAUDE.md files are loaded automatically
@@ -1314,6 +1326,13 @@ async function runQuery(
   });
 
   activeQuery = q;
+
+  // Each query() call spawns a fresh Claude Code CLI subprocess
+  // (anthropics/claude-agent-sdk-typescript#96). `lastSetModelAlias` is
+  // module-scoped and describes the PREVIOUS subprocess, so the guard
+  // below would otherwise skip setModel on a stale match and leave the
+  // new subprocess on the CLI default. Reset forces re-assertion.
+  lastSetModelAlias = undefined;
 
   // Apply model to the subprocess if it changed since the last setModel() call.
   if (currentModel) {
@@ -1458,17 +1477,98 @@ async function runQuery(
         if (grew.length > 0) modelsUsedThisTurn = grew;
       }
       // Claude Code SDK may return result: null when text was only sent via
-      // streaming events. Fall back to the last assistant text block content.
-      // Detect API errors surfaced as result text (SDK returns subtype=success
-      // even when the response body is an upstream error). Throw so the retry
-      // wrapper in main() can rotate keys and re-run the query.
+      // streaming events; fall back to the last assistant text block.
       const effectiveResult = textResult || lastAssistantText || null;
-      // SDK surfaces upstream errors as result text with "API Error:" prefix
-      // (sdk/cli.js internal format -- re-verify on SDK upgrades).
+
+      // The SDK surfaces upstream errors as result text prefixed with
+      // "API Error:" (sdk/cli.js internal format — re-verify on SDK
+      // upgrades). Log unconditionally so silent SDK-internal fallbacks
+      // are filterable in logs, latch `sawApiErrorThisRun` for the drift
+      // detector below, then throw when retryable so main()'s retry loop
+      // can rotate keys.
       if (typeof effectiveResult === 'string' &&
-          effectiveResult.startsWith('API Error:') &&
-          isRetryableError(effectiveResult)) {
-        throw new Error(effectiveResult);
+          effectiveResult.startsWith('API Error:')) {
+        sawApiErrorThisRun = true;
+        log(
+          `WARN: upstream API error surfaced as Result text ` +
+          `(modelsUsedThisTurn=${JSON.stringify(modelsUsedThisTurn)}): ` +
+          `${effectiveResult.slice(0, 500)}`,
+        );
+        if (isRetryableError(effectiveResult)) {
+          throw new Error(effectiveResult);
+        }
+      }
+
+      // Detect SDK-internal model drift: configured `[1m]` model whose
+      // Result only used the non-`[1m]` variant. Observed 2026-04-11 —
+      // opus[1m] silently fell back to plain claude-sonnet-4-6 after an
+      // upstream 400, losing 800K of context. Gated on sawApiErrorThisRun
+      // to avoid misreading legitimate plain-sonnet subagent turns
+      // (e.g. code-review-specialist configured with `model: sonnet`).
+      if (
+        sawApiErrorThisRun &&
+        modelsUsedThisTurn &&
+        modelsUsedThisTurn.length > 0
+      ) {
+        const expectedModelId = sdkEnv['CLAUDE_CODE_USE_MODEL'];
+        if (typeof expectedModelId === 'string' &&
+            expectedModelId.includes('[1m]')) {
+          const droppedSuffixId = expectedModelId.replace('[1m]', '');
+          const driftedToNon1m = modelsUsedThisTurn.includes(droppedSuffixId);
+          const expectedStillUsed = modelsUsedThisTurn.includes(expectedModelId);
+          if (driftedToNon1m && !expectedStillUsed) {
+            // Always recover to sonnet[1m] regardless of which family
+            // drifted: when opus is the failing family, reverting to
+            // opus[1m] would hit the same upstream error; otherwise
+            // sonnet[1m] still preserves the 1M window Dave requires
+            // (plan line 220: "falling back to the tiny-window variant
+            // is not acceptable").
+            const recoveryAlias = 'sonnet[1m]';
+            const recoveryModelId = 'claude-sonnet-4-6[1m]';
+            log(
+              `WARN: SDK drifted from ${expectedModelId} to ` +
+              `${droppedSuffixId} (lost 1M context window). ` +
+              `Forcing ${recoveryAlias} for subsequent turns.`,
+            );
+            sdkEnv['CLAUDE_CODE_USE_MODEL'] = recoveryModelId;
+            // Suppress any pending one-shot revert: it would overwrite
+            // sdkEnv back to the pre-one-shot baseline after the main
+            // Result writeOutput, undoing the drift recovery.
+            if (pendingOneshotRevert !== undefined) {
+              log(
+                `Clearing pendingOneshotRevert=${pendingOneshotRevert || 'default'} ` +
+                `due to drift recovery`,
+              );
+              pendingOneshotRevert = undefined;
+            }
+            try {
+              await q.setModel(recoveryAlias);
+              lastSetModelAlias = recoveryAlias;
+              log(`setModel(${recoveryAlias}) applied after drift detection`);
+            } catch (setErr) {
+              log(
+                `setModel(${recoveryAlias}) failed after drift: ` +
+                  `${setErr instanceof Error ? setErr.message : String(setErr)}`,
+              );
+              // Subprocess state unknown — force next runQuery to re-assert.
+              lastSetModelAlias = undefined;
+            }
+            // Emit BEFORE the main Result so the notice lands first in
+            // the chat. isInternalNotice excludes it from memory
+            // extraction host-side (src/index.ts:1522).
+            // TODO(S2, next PR): add a typed `modelFallback` field so the
+            // host's tryConfirmModelSwitch can merge any pending `-m`
+            // confirmation's ❌ into this notice instead of sending both.
+            writeOutput({
+              status: 'success',
+              result:
+                `_Model fallback: ${expectedModelId} failed upstream, ` +
+                `continuing on ${recoveryModelId} (1M context window preserved)._`,
+              newSessionId,
+              isInternalNotice: true,
+            });
+          }
+        }
       }
       // Resolve any pending effort switch ack. applyFlagSettings resolves
       // near-instantly so by the time the SDK produces a result the promise
