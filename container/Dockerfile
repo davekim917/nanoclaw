@@ -51,8 +51,9 @@ RUN python3 -m venv /opt/dbt-venv \
 # by gws CLI (@googleworkspace/cli), installed via npm below.
 
 # Install Python visualization libraries (matplotlib, seaborn, plotly + kaleido for PNG export)
-# Installed to system python — agents use `python3` directly
-RUN pip install --break-system-packages matplotlib seaborn plotly kaleido
+# and YouTube transcript extraction (youtube-transcript-api CLI for ad-hoc and scripted use)
+# All installed to system python — agents use `python3` directly
+RUN pip install --break-system-packages matplotlib seaborn plotly kaleido youtube-transcript-api
 
 # Set Chromium path for agent-browser
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
