@@ -59,7 +59,6 @@ import {
   runContainerAgent,
   startGoogleTokenRefresh,
   startGranolaTokenRefresh,
-  withGroupMutex,
   writeGroupsSnapshot,
   writeTasksSnapshot,
 } from './container-runner.js';
@@ -1936,12 +1935,11 @@ async function runAgent(
     if (output.newSessionId) persistSession(output.newSessionId);
 
     // Clean up worktree workspace (if one was created).
-    // Must use withGroupMutex to serialize against prepareThreadWorkspace —
-    // both touch .git/worktrees/ and CLAUDE.md merge-back.
+    // cleanupThreadWorkspace acquires withGroupMutex internally —
+    // do NOT wrap in another withGroupMutex here or it deadlocks
+    // (the mutex is a non-reentrant promise chain).
     if (threadId) {
-      withGroupMutex(group.folder, () =>
-        cleanupThreadWorkspace(group.folder, threadId),
-      ).catch((err) =>
+      cleanupThreadWorkspace(group.folder, threadId).catch((err) =>
         logger.warn(
           { group: group.name, threadId, err },
           'Worktree cleanup error',
