@@ -133,6 +133,66 @@ function toCliAlias(model: string): string {
   return model;
 }
 
+/** Session JSONL size (bytes) above which auto-compact fires before the query. */
+const SESSION_SIZE_COMPACT_THRESHOLD = 1_500_000; // 1.5 MB
+
+/** Container-side path to the session project directory. */
+const SESSION_PROJECT_DIR = '/home/node/.claude/projects/-workspace-group';
+
+/**
+ * Run a /compact query against an existing session. Used by both the explicit
+ * /compact slash command and the pre-flight auto-compact size check.
+ * Returns { compacted, newSessionId } so callers can update session tracking.
+ */
+async function runCompactQuery(opts: {
+  sessionId: string;
+  sdkEnv: Record<string, string | undefined>;
+  model?: string;
+  plugins: Array<{ type: 'local'; path: string }>;
+  assistantName?: string;
+}): Promise<{ compacted: boolean; newSessionId?: string }> {
+  let compacted = false;
+  let newSessionId: string | undefined;
+
+  const compactQuery = query({
+    prompt: '/compact',
+    options: {
+      cwd: '/workspace/group',
+      resume: opts.sessionId,
+      systemPrompt: undefined,
+      allowedTools: [],
+      env: opts.sdkEnv,
+      ...(opts.model ? { model: opts.model } : {}),
+      permissionMode: 'bypassPermissions' as const,
+      allowDangerouslySkipPermissions: true,
+      settingSources: ['project', 'user'] as const,
+      ...(opts.plugins.length > 0 ? { plugins: opts.plugins } : {}),
+      hooks: {
+        PreCompact: [{ hooks: [createPreCompactHook(opts.assistantName)] }],
+      },
+    },
+  });
+
+  const compactModel = opts.sdkEnv['CLAUDE_CODE_USE_MODEL'] || opts.model;
+  if (compactModel) {
+    await compactQuery.setModel(toCliAlias(compactModel));
+    log(`setModel(${toCliAlias(compactModel)}) applied for compact`);
+  }
+
+  for await (const message of compactQuery) {
+    if (message.type === 'system' && message.subtype === 'compact_boundary') {
+      compacted = true;
+      log('Compact boundary observed — compaction completed');
+    }
+    if (message.type === 'system' && message.subtype === 'init') {
+      newSessionId = message.session_id;
+      log(`Session after compact: ${newSessionId}`);
+    }
+  }
+
+  return { compacted, newSessionId };
+}
+
 /**
  * Returns channel-type-specific message formatting instructions based on the JID prefix.
  *
@@ -1911,105 +1971,28 @@ async function main(): Promise<void> {
 
   if (isSessionSlashCommand) {
     log(`Handling session command: ${trimmedPrompt}`);
-    let slashSessionId: string | undefined;
-    let compactBoundarySeen = false;
-    let hadError = false;
-    let resultEmitted = false;
-
     try {
-      const slashQuery = query({
-        prompt: trimmedPrompt,
-        options: {
-          cwd: '/workspace/group',
-          resume: sessionId,
-          systemPrompt: undefined,
-          allowedTools: [],
-          env: sdkEnv,
-          ...(containerInput.model ? { model: containerInput.model } : {}),
-          permissionMode: 'bypassPermissions' as const,
-          allowDangerouslySkipPermissions: true,
-          settingSources: ['project', 'user'] as const,
-          ...(plugins.length > 0 ? { plugins } : {}),
-          hooks: {
-            PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
-          },
-        },
+      const result = await runCompactQuery({
+        sessionId: sessionId!,
+        sdkEnv,
+        model: containerInput.model,
+        plugins,
+        assistantName: containerInput.assistantName,
       });
-
-      // Preserve model override across compaction — without this the SDK
-      // defaults to Sonnet after the compact_boundary resets the conversation.
-      const slashModel = sdkEnv['CLAUDE_CODE_USE_MODEL'] || containerInput.model;
-      if (slashModel) {
-        const alias = toCliAlias(slashModel);
-        await slashQuery.setModel(alias);
-        log(`setModel(${alias}) applied for slash command`);
-      }
-
-      for await (const message of slashQuery) {
-        const msgType = message.type === 'system'
-          ? `system/${(message as { subtype?: string }).subtype}`
-          : message.type;
-        log(`[slash-cmd] type=${msgType}`);
-
-        if (message.type === 'system' && message.subtype === 'init') {
-          slashSessionId = message.session_id;
-          log(`Session after slash command: ${slashSessionId}`);
-        }
-
-        // Observe compact_boundary to confirm compaction completed
-        if (message.type === 'system' && (message as { subtype?: string }).subtype === 'compact_boundary') {
-          compactBoundarySeen = true;
-          log('Compact boundary observed — compaction completed');
-        }
-
-        if (message.type === 'result') {
-          const resultSubtype = (message as { subtype?: string }).subtype;
-          const textResult = 'result' in message ? (message as { result?: string }).result : null;
-
-          if (resultSubtype?.startsWith('error')) {
-            hadError = true;
-            writeOutput({
-              status: 'error',
-              result: null,
-              error: textResult || 'Session command failed.',
-              newSessionId: slashSessionId,
-            });
-          } else {
-            writeOutput({
-              status: 'success',
-              result: textResult || 'Conversation compacted.',
-              newSessionId: slashSessionId,
-            });
-          }
-          resultEmitted = true;
-        }
+      writeOutput({
+        status: 'success',
+        result: result.compacted
+          ? 'Conversation compacted.'
+          : 'Compaction requested but compact_boundary was not observed.',
+        newSessionId: result.newSessionId,
+      });
+      if (!result.compacted) {
+        log('WARNING: compact_boundary was not observed. Compaction may not have completed.');
       }
     } catch (err) {
-      hadError = true;
       const errorMsg = err instanceof Error ? err.message : String(err);
       log(`Slash command error: ${errorMsg}`);
       writeOutput({ status: 'error', result: null, error: errorMsg });
-    }
-
-    log(`Slash command done. compactBoundarySeen=${compactBoundarySeen}, hadError=${hadError}`);
-
-    // Warn if compact_boundary was never observed — compaction may not have occurred
-    if (!hadError && !compactBoundarySeen) {
-      log('WARNING: compact_boundary was not observed. Compaction may not have completed.');
-    }
-
-    // Only emit final session marker if no result was emitted yet and no error occurred
-    if (!resultEmitted && !hadError) {
-      writeOutput({
-        status: 'success',
-        result: compactBoundarySeen
-          ? 'Conversation compacted.'
-          : 'Compaction requested but compact_boundary was not observed.',
-        newSessionId: slashSessionId,
-      });
-    } else if (!hadError) {
-      // Emit session-only marker so host updates session tracking
-      writeOutput({ status: 'success', result: null, newSessionId: slashSessionId });
     }
     return;
   }
@@ -2041,6 +2024,40 @@ async function main(): Promise<void> {
     // Script says wake agent — enrich prompt with script data
     log(`Script wakeAgent=true, enriching prompt with data`);
     prompt = `[SCHEDULED TASK]\n\nScript output:\n${JSON.stringify(scriptResult.data, null, 2)}\n\nInstructions:\n${containerInput.prompt}`;
+  }
+
+  // Pre-flight session size check: if the session JSONL exceeds a threshold,
+  // auto-compact before starting the real query. The SDK auto-compacts during
+  // a turn, but if the session is so large that the API rejects the initial
+  // request with 400, compaction never fires — the session is permanently
+  // stuck. Running /compact with no tools and no system prompt has a much
+  // smaller overhead and can succeed where a full query cannot.
+  if (sessionId) {
+    const sessionJsonlPath = path.join(SESSION_PROJECT_DIR, `${sessionId}.jsonl`);
+    try {
+      const stat = fs.statSync(sessionJsonlPath);
+      if (stat.size > SESSION_SIZE_COMPACT_THRESHOLD) {
+        log(
+          `Session JSONL is ${(stat.size / 1_000_000).toFixed(1)}MB ` +
+          `(threshold: ${(SESSION_SIZE_COMPACT_THRESHOLD / 1_000_000).toFixed(1)}MB) — auto-compacting`,
+        );
+        try {
+          const result = await runCompactQuery({
+            sessionId,
+            sdkEnv,
+            model: containerInput.model,
+            plugins,
+            assistantName: containerInput.assistantName,
+          });
+          if (result.newSessionId) sessionId = result.newSessionId;
+          log(result.compacted ? 'Auto-compact succeeded' : 'Auto-compact did not produce compact_boundary');
+        } catch (err) {
+          log(`Auto-compact failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+    } catch {
+      // Session file doesn't exist or can't be read — skip check
+    }
   }
 
   // Query loop: run query → wait for IPC message → run new query → repeat
