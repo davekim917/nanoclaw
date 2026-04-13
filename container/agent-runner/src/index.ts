@@ -1870,7 +1870,7 @@ async function main(): Promise<void> {
   // rule in global CLAUDE.md for Slack/Discord groups. This also ensures globalContext:false groups
   // (no /workspace/global mount) still receive channel-appropriate formatting guidance.
   const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
-  const globalClaudeMd = !containerInput.isMain && fs.existsSync(globalClaudeMdPath)
+  const globalClaudeMd = fs.existsSync(globalClaudeMdPath)
     ? fs.readFileSync(globalClaudeMdPath, 'utf-8')
     : undefined;
   const channelFormatting = getChannelFormattingInstructions(containerInput.chatJid);

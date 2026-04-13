@@ -1387,20 +1387,29 @@ export function buildVolumeMounts(
       });
     }
   } else {
-    // Mount project root read-only when enabled so agents can explore the codebase
-    // and understand NanoClaw's architecture. Shadow .env to prevent credential
-    // leakage (credentials flow via stdin instead).
-    if (group.containerConfig?.readOnlyProjectRoot) {
-      mounts.push({
-        hostPath: projectRoot,
-        containerPath: '/workspace/project',
-        readonly: true,
-      });
-      const envFile = path.join(projectRoot, '.env');
-      if (fs.existsSync(envFile)) {
+    // Mount NanoClaw source directories read-only so all agents can explore
+    // the codebase and answer questions about their own architecture.
+    // Only source dirs are mounted — groups/, store/, data/, .env are excluded
+    // to preserve cross-group isolation.
+    const sourceDirs = ['src', 'container', 'docs', 'prompts', 'scripts'];
+    for (const dir of sourceDirs) {
+      const hostDir = path.join(projectRoot, dir);
+      if (fs.existsSync(hostDir)) {
         mounts.push({
-          hostPath: '/dev/null',
-          containerPath: '/workspace/project/.env',
+          hostPath: hostDir,
+          containerPath: `/workspace/project/${dir}`,
+          readonly: true,
+        });
+      }
+    }
+    // Mount root-level files that provide useful context (version, architecture)
+    const sourceFiles = ['package.json', 'README.md', 'CONTRIBUTING.md', 'CLAUDE.md', 'AGENTS.md', 'tsconfig.json'];
+    for (const file of sourceFiles) {
+      const hostFile = path.join(projectRoot, file);
+      if (fs.existsSync(hostFile)) {
+        mounts.push({
+          hostPath: hostFile,
+          containerPath: `/workspace/project/${file}`,
           readonly: true,
         });
       }
