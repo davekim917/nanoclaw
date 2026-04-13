@@ -2,7 +2,7 @@
  * Container Runner for NanoClaw
  * Spawns agent execution in containers and handles IPC
  */
-import { ChildProcess, exec, spawn } from 'child_process';
+import { ChildProcess, exec, execFileSync, spawn } from 'child_process';
 import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
@@ -939,6 +939,66 @@ function isSensitiveTopLevelFilename(name: string): boolean {
   return SENSITIVE_TOP_LEVEL_PATTERNS.some((p) => lower.includes(p));
 }
 
+/**
+ * Find subdirectories that are git worktrees (contain a `.git` file, not directory).
+ * Returns the worktree path and its resolved canonical repo path.
+ * Git worktrees store a `.git` text file: "gitdir: /path/to/.git/worktrees/<name>"
+ * The canonical .git is two levels up from that entry.
+ */
+function findGitWorktrees(
+  dir: string,
+): Array<{
+  name: string;
+  worktreePath: string;
+  canonicalRepoPath: string;
+  gitdirPath: string;
+}> {
+  const results: Array<{
+    name: string;
+    worktreePath: string;
+    canonicalRepoPath: string;
+    gitdirPath: string;
+  }> = [];
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return results;
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    const wtPath = path.join(dir, entry.name);
+    const gitFile = path.join(wtPath, '.git');
+    try {
+      if (!fs.statSync(gitFile).isFile()) continue;
+      const content = fs.readFileSync(gitFile, 'utf-8').trim();
+      const match = content.match(/^gitdir:\s*(.+)$/);
+      if (!match) continue;
+      // .git/worktrees/<name> → .git is two levels up
+      const worktreesEntry = path.resolve(match[1].trim());
+      const canonicalGit = path.dirname(path.dirname(worktreesEntry));
+      // Canonical repo is the parent of .git
+      const canonicalRepo = path.dirname(canonicalGit);
+      if (!fs.statSync(canonicalGit).isDirectory()) continue;
+      // Containment check: reject crafted .git files pointing outside GROUPS_DIR.
+      // Agent-writable worktree dirs could contain a malicious gitdir pointer
+      // targeting a foreign group or arbitrary host directory.
+      const resolvedCanonical = path.resolve(canonicalRepo);
+      if (!resolvedCanonical.startsWith(path.resolve(GROUPS_DIR) + path.sep))
+        continue;
+      results.push({
+        name: entry.name,
+        worktreePath: wtPath,
+        canonicalRepoPath: resolvedCanonical,
+        gitdirPath: worktreesEntry,
+      });
+    } catch {
+      // Not a worktree — skip
+    }
+  }
+  return results;
+}
+
 /** Find subdirectories that are git repos (contain a `.git` directory). */
 function findGitRepos(dir: string): Array<{ name: string; repoPath: string }> {
   const results: Array<{ name: string; repoPath: string }> = [];
@@ -1078,8 +1138,9 @@ export async function prepareThreadWorkspace(
 
 /**
  * Clean up a per-thread scratch workspace: auto-commit dirty worktrees,
+ * properly remove git worktrees (cleaning both directory and metadata),
  * merge CLAUDE.md back to group folder, merge non-repo scratch entries back,
- * and remove the per-thread scratch dir. Worktree directories are preserved.
+ * and remove the per-thread scratch dir.
  */
 export async function cleanupThreadWorkspace(
   groupFolder: string,
@@ -1094,43 +1155,98 @@ export async function cleanupThreadWorkspace(
   // create_worktree or prepareThreadWorkspace calls on the same group
   await withGroupMutex(groupFolder, async () => {
     // Auto-commit dirty worktrees in data/worktrees/<group>/<threadId>/
+    // Check both standalone repos (.git directory) and git worktrees (.git file).
     const worktreesDir = path.join(WORKTREES_DIR, groupFolder, threadId);
-    if (fs.existsSync(worktreesDir)) {
-      for (const { repoPath } of findGitRepos(worktreesDir)) {
+    const gitWorktrees = findGitWorktrees(worktreesDir);
+    const allRepos: Array<{
+      name: string;
+      repoPath: string;
+      gitdirPath?: string;
+    }> = [
+      ...findGitRepos(worktreesDir),
+      ...gitWorktrees.map((wt) => ({
+        name: wt.name,
+        repoPath: wt.worktreePath,
+        gitdirPath: wt.gitdirPath,
+      })),
+    ];
+    for (const { name: repoName, repoPath, gitdirPath } of allRepos) {
+      try {
+        // Remove stale index.lock before attempting commit.
+        // Worktree index.lock lives in the canonical .git/worktrees/<name>/
+        // (resolved by findGitWorktrees); standalone repos use .git/index.lock.
+        const lockFile = gitdirPath
+          ? path.join(gitdirPath, 'index.lock')
+          : path.join(repoPath, '.git', 'index.lock');
         try {
-          // Remove stale index.lock before attempting commit
-          const lockFile = path.join(repoPath, '.git', 'index.lock');
-          try {
-            fs.unlinkSync(lockFile);
-          } catch {
-            // lock file doesn't exist — fine
-          }
+          fs.unlinkSync(lockFile);
+        } catch {
+          // lock file doesn't exist — fine
+        }
 
-          const status = await execAsync('git status --porcelain', {
-            cwd: repoPath,
-          });
-          if (status) {
-            await execAsync('git add -A', { cwd: repoPath });
-            await execAsync(
-              'git -c user.email=agent@nanoclaw.local -c user.name=agent commit --no-verify -m "auto-save: session exit"',
-              { cwd: repoPath },
-            );
-            logger.info(
-              { group: groupFolder, threadId, repo: path.basename(repoPath) },
-              'Auto-committed dirty worktree on session exit',
-            );
-          }
-        } catch (err) {
-          logger.warn(
-            {
-              group: groupFolder,
-              threadId,
-              repo: path.basename(repoPath),
-              err,
-            },
-            'Failed to auto-commit worktree on session exit',
+        const status = await execAsync('git status --porcelain', {
+          cwd: repoPath,
+        });
+        if (status) {
+          await execAsync('git add -A', { cwd: repoPath });
+          await execAsync(
+            'git -c user.email=agent@nanoclaw.local -c user.name=agent commit --no-verify -m "auto-save: session exit"',
+            { cwd: repoPath },
+          );
+          logger.info(
+            { group: groupFolder, threadId, repo: repoName },
+            'Auto-committed dirty worktree on session exit',
           );
         }
+      } catch (err) {
+        logger.warn(
+          {
+            group: groupFolder,
+            threadId,
+            repo: repoName,
+            err,
+          },
+          'Failed to auto-commit worktree on session exit',
+        );
+      }
+    }
+
+    // Properly remove git worktrees before deleting the scratch directory.
+    // Without this, rmSync leaves dangling metadata in the canonical repo's
+    // .git/worktrees/ — causing "already checked out" errors on the next
+    // session when create_worktree tries to recreate the worktree.
+    // Uses execFileSync with argument arrays — worktree paths originate from
+    // agent-writable directories and must not be interpolated into shell strings.
+    const canonicalReposToClean = new Set<string>();
+    for (const wt of gitWorktrees) {
+      try {
+        execFileSync(
+          'git',
+          ['worktree', 'remove', '--force', wt.worktreePath],
+          { cwd: wt.canonicalRepoPath, stdio: 'pipe', timeout: 30_000 },
+        );
+        logger.debug(
+          { group: groupFolder, threadId, repo: wt.name },
+          'Removed git worktree on session exit',
+        );
+      } catch {
+        // May fail if worktree is already partially broken — prune will
+        // clean up the metadata below
+      }
+      canonicalReposToClean.add(wt.canonicalRepoPath);
+    }
+    // Belt-and-suspenders: prune stale worktree metadata from each
+    // canonical repo in case `git worktree remove` failed or the directory
+    // was already partially deleted.
+    for (const canonicalRepo of canonicalReposToClean) {
+      try {
+        execFileSync('git', ['worktree', 'prune'], {
+          cwd: canonicalRepo,
+          stdio: 'pipe',
+          timeout: 30_000,
+        });
+      } catch {
+        // best-effort
       }
     }
 
@@ -1403,7 +1519,14 @@ export function buildVolumeMounts(
       }
     }
     // Mount root-level files that provide useful context (version, architecture)
-    const sourceFiles = ['package.json', 'README.md', 'CONTRIBUTING.md', 'CLAUDE.md', 'AGENTS.md', 'tsconfig.json'];
+    const sourceFiles = [
+      'package.json',
+      'README.md',
+      'CONTRIBUTING.md',
+      'CLAUDE.md',
+      'AGENTS.md',
+      'tsconfig.json',
+    ];
     for (const file of sourceFiles) {
       const hostFile = path.join(projectRoot, file);
       if (fs.existsSync(hostFile)) {
@@ -1525,55 +1648,16 @@ export function buildVolumeMounts(
 
     // Also scan existing worktrees to find canonical .git dirs for repos
     // cloned mid-session (their worktree .git files point back to the canonical).
-    try {
-      if (fs.existsSync(worktreeDir)) {
-        for (const entry of fs.readdirSync(worktreeDir, {
-          withFileTypes: true,
-        })) {
-          if (!entry.isDirectory()) continue;
-          const wtRepoPath = path.join(worktreeDir, entry.name);
-          const wtGitFile = path.join(wtRepoPath, '.git');
-          if (!fs.existsSync(wtGitFile)) continue;
-          try {
-            if (!fs.statSync(wtGitFile).isFile()) continue;
-            const gitFileContent = fs.readFileSync(wtGitFile, 'utf-8').trim();
-            // Format: "gitdir: <absolute-path-to-.git/worktrees/<name>>"
-            const match = gitFileContent.match(/^gitdir:\s*(.+)$/);
-            if (!match) continue;
-            // Walk up from the worktrees/<name> entry to find the canonical .git
-            const worktreesEntry = path.resolve(match[1].trim());
-            // canonical .git is two levels up: .git/worktrees/<name> -> .git
-            const canonicalGit = path.dirname(path.dirname(worktreesEntry));
-            if (!fs.existsSync(canonicalGit)) continue;
-            try {
-              if (!fs.statSync(canonicalGit).isDirectory()) continue;
-            } catch {
-              continue;
-            }
-            // MF-4: Validate canonicalGit is under GROUPS_DIR to prevent path traversal
-            // via crafted .git files in the writable worktree area
-            const resolvedCanonicalGit = path.resolve(canonicalGit);
-            if (
-              !resolvedCanonicalGit.startsWith(
-                path.resolve(GROUPS_DIR) + path.sep,
-              )
-            )
-              continue;
-            // Skip if already mounted (from the group-folder scan above)
-            if (mounts.some((m) => m.hostPath === resolvedCanonicalGit))
-              continue;
-            mounts.push({
-              hostPath: resolvedCanonicalGit,
-              containerPath: resolvedCanonicalGit,
-              readonly: true,
-            });
-          } catch {
-            // best-effort
-          }
-        }
-      }
-    } catch {
-      // best-effort
+    // Uses findGitWorktrees which includes the MF-4 containment check
+    // (canonicalRepoPath must be under GROUPS_DIR).
+    for (const wt of findGitWorktrees(worktreeDir)) {
+      const canonicalGit = path.join(wt.canonicalRepoPath, '.git');
+      if (mounts.some((m) => m.hostPath === canonicalGit)) continue;
+      mounts.push({
+        hostPath: canonicalGit,
+        containerPath: canonicalGit,
+        readonly: true,
+      });
     }
   }
 

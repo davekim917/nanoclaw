@@ -2070,6 +2070,21 @@ export function processQueryIpc(
 
         fs.mkdirSync(path.dirname(worktreeDir), { recursive: true });
 
+        // Defensive: prune stale worktree metadata before creating.
+        // Handles dangling .git/worktrees/ entries from crashes, OOM kills,
+        // or cleanup that deleted the directory without git worktree remove.
+        // Without this, git worktree add fails with "already checked out"
+        // if the branch was registered in a now-deleted worktree.
+        try {
+          execFileSync('git', ['worktree', 'prune'], {
+            cwd: repoDir,
+            stdio: 'pipe',
+            timeout: 30_000,
+          });
+        } catch {
+          // best-effort — prune failure shouldn't block creation attempt
+        }
+
         try {
           if (branchExists) {
             // Check out the existing branch
