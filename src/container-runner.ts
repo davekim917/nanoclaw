@@ -1533,9 +1533,9 @@ export function buildVolumeMounts(
       readonly: false,
     });
 
-    // Mount global context directory unless explicitly disabled (shared/multi-tenant groups).
-    // When globalContext is false, the container has zero visibility into other projects.
-    if (group.containerConfig?.globalContext !== false) {
+    // Mount global context directory only when explicitly enabled (cross-group groups like main).
+    // Default is isolated — container has zero visibility into other groups' projects.
+    if (group.containerConfig?.globalContext === true) {
       const globalDir = path.join(GROUPS_DIR, 'global');
       if (fs.existsSync(globalDir)) {
         mounts.push({

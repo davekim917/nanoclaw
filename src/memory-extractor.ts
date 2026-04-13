@@ -1,9 +1,9 @@
 /**
  * Automatic Memory Extraction
  *
- * After every agent response, a lightweight Haiku call extracts facts
- * worth remembering and persists them via the memory store. Fire-and-forget
- * — never blocks the user-facing response.
+ * Runs on a 60-second interval while a container is live, extracting facts
+ * worth remembering via a lightweight Haiku call. Fire-and-forget — never
+ * blocks the user-facing response.
  */
 
 import fs from 'fs';
@@ -15,15 +15,14 @@ import { logger } from './logger.js';
 import { saveMemory, updateMemory } from './memory-store.js';
 import { Memory, NewMessage } from './types.js';
 
-// Rate limit: one extraction per group per 60 seconds
+// Rate limit: one extraction per thread (chatJid) per 60 seconds.
+// Keyed by chatJid so concurrent containers for different threads in the
+// same group don't block each other.
 const THROTTLE_MS = 60_000;
 const lastExtraction = new Map<string, number>();
 
-/** Check if extraction is throttled for a group (exported for call-site guards). */
-export function isExtractionThrottled(groupFolder: string): boolean {
-  const last = lastExtraction.get(groupFolder) ?? 0;
-  return Date.now() - last < THROTTLE_MS;
-}
+// Prevent overlapping Haiku calls for the same thread
+const inFlight = new Set<string>();
 
 // Tunable prompt template — loaded from file if present, otherwise default
 const PROMPT_TEMPLATE_PATH = path.join(
@@ -52,39 +51,69 @@ type Extracted = ExtractedSave | ExtractedUpdate | { action: 'skip' };
 
 /**
  * Fire-and-forget entry point. Call after every successful agent response.
+ * @param chatJid Used as throttle/inFlight key so concurrent threads in the
+ *   same group don't block each other.
  */
 export function extractMemoriesAsync(
   groupFolder: string,
+  chatJid: string,
   messages: NewMessage[],
   agentResponseText: string,
 ): void {
-  extractMemories(groupFolder, messages, agentResponseText).catch((err) => {
-    logger.warn({ err, groupFolder }, 'Memory extraction failed (non-fatal)');
-  });
+  extractMemories(groupFolder, chatJid, messages, agentResponseText).catch(
+    (err) => {
+      logger.warn(
+        { err, groupFolder, chatJid },
+        'Memory extraction failed (non-fatal)',
+      );
+    },
+  );
 }
 
 async function extractMemories(
   groupFolder: string,
+  chatJid: string,
   messages: NewMessage[],
   agentResponseText: string,
 ): Promise<void> {
-  // Skip trivial conversations
+  // Need at least one user message for context
   const userMessages = messages.filter(
     (m) => !m.is_from_me && !m.is_bot_message,
   );
   if (userMessages.length === 0) return;
 
-  const totalUserText = userMessages.map((m) => m.content).join(' ');
-  if (totalUserText.trim().length < 20) return;
-
-  // Throttle per group
+  // Throttle per thread
   const now = Date.now();
-  const last = lastExtraction.get(groupFolder) ?? 0;
+  const last = lastExtraction.get(chatJid) ?? 0;
   if (now - last < THROTTLE_MS) return;
 
-  // Build prompt
+  // Prevent overlapping Haiku calls for same thread
+  if (inFlight.has(chatJid)) return;
+  inFlight.add(chatJid);
+
+  try {
+    return await extractMemoriesInner(
+      groupFolder,
+      chatJid,
+      messages,
+      agentResponseText,
+      now,
+    );
+  } finally {
+    inFlight.delete(chatJid);
+  }
+}
+
+async function extractMemoriesInner(
+  groupFolder: string,
+  chatJid: string,
+  messages: NewMessage[],
+  agentResponseText: string,
+  now: number,
+): Promise<void> {
+  // Build prompt — include both user and bot messages for full context
   const existing = listMemories(groupFolder, 30);
-  const prompt = buildPrompt(userMessages, agentResponseText, existing);
+  const prompt = buildPrompt(messages, agentResponseText, existing);
 
   // Call Haiku (30s timeout for structured JSON)
   const raw = await callHaiku(prompt, 30_000);
@@ -134,12 +163,15 @@ async function extractMemories(
   }
 
   if (saved > 0 || updated > 0) {
-    logger.info({ groupFolder, saved, updated }, 'Memory extraction complete');
+    logger.info(
+      { groupFolder, chatJid, saved, updated },
+      'Memory extraction complete',
+    );
   }
 }
 
 function buildPrompt(
-  userMessages: NewMessage[],
+  messages: NewMessage[],
   agentResponse: string,
   existing: Memory[],
 ): string {
@@ -147,8 +179,8 @@ function buildPrompt(
   const template = loadTemplate();
   if (template) {
     const subs: Record<string, string> = {
-      USER_MESSAGES: formatUserMessages(userMessages),
-      AGENT_RESPONSE: agentResponse.slice(0, 2000),
+      USER_MESSAGES: formatMessages(messages),
+      AGENT_RESPONSE: agentResponse.slice(-2000),
       EXISTING_MEMORIES: formatExistingMemories(existing),
     };
     return template.replace(
@@ -166,13 +198,13 @@ function buildPrompt(
   return `You are a memory extraction system. Analyze this conversation and extract facts worth remembering for future conversations with this user/group.
 
 ## Conversation
-<user_messages>
-${formatUserMessages(userMessages)}
-</user_messages>
+<messages>
+${formatMessages(messages)}
+</messages>
 
-<assistant_response>
-${agentResponse.slice(0, 2000)}
-</assistant_response>
+<latest_assistant_response>
+${agentResponse.slice(-2000)}
+</latest_assistant_response>
 ${existingSection}
 ## What to Extract
 
@@ -198,11 +230,14 @@ Reply with ONLY a JSON array (no markdown fences, no explanation):
 If nothing is worth extracting, reply with: []`;
 }
 
-function formatUserMessages(messages: NewMessage[]): string {
+function formatMessages(messages: NewMessage[]): string {
   return messages
-    .map((m) => `${m.sender_name}: ${m.content.slice(0, 500)}`)
+    .map((m) => {
+      const role = m.is_from_me || m.is_bot_message ? '[assistant]' : '[user]';
+      return `${role} ${m.sender_name}: ${m.content.slice(0, 500)}`;
+    })
     .join('\n')
-    .slice(0, 2000);
+    .slice(0, 3000);
 }
 
 function formatExistingMemories(memories: Memory[]): string {

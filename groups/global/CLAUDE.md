@@ -120,20 +120,6 @@ Your output is sent to the user or group.
 
 You also have `mcp__nanoclaw__send_message` which sends a message immediately while you're still working. This is useful when you want to acknowledge a request before starting longer work.
 
-### File Review — Always Send as Attachment
-
-Users cannot access your filesystem. When you save a file and ask the user to review it (briefs, designs, plans, reports, or any document requiring approval), you MUST send it as a file attachment using `send_file`. A path alone is useless — the user has no way to open it.
-
-**Pattern:**
-
-1. Save the file to disk (for your own persistence and downstream skill steps)
-2. Send it to the user with `send_file` (file must be under `/workspace/group/`, `/workspace/project/`, or `/tmp/`)
-3. Include a brief summary or gate prompt in your message text — the file itself carries the detail
-
-**Anti-pattern:** "The design document is ready. Please review it at `.context/specs/feature/design.md`" — this gives the user nothing to review.
-
-This applies to ALL files the user needs to read: workflow artifacts (briefs, designs, plans, reviews), research reports, generated documents, config files for approval. If the user should review it, attach it.
-
 ### Internal thoughts
 
 If part of your output is internal reasoning rather than something for the user, wrap it in `<internal>` tags:

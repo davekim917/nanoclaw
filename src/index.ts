@@ -106,10 +106,7 @@ import {
   getInMemoryGateByJid,
   resolveInMemoryGate,
 } from './ipc.js';
-import {
-  extractMemoriesAsync,
-  isExtractionThrottled,
-} from './memory-extractor.js';
+import { extractMemoriesAsync } from './memory-extractor.js';
 import { getMemoryBlock } from './memory-store.js';
 import {
   ensureCommitDigestTask,
@@ -1264,7 +1261,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   const latestMessageText =
     missedMessages[missedMessages.length - 1]?.content ?? '';
-  const crossGroup = group.containerConfig?.globalContext !== false;
+  const crossGroup = group.containerConfig?.globalContext === true;
   const memoryBlock = await getMemoryBlock(
     group.folder,
     latestMessageText,
@@ -1489,6 +1486,32 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     ).setHaikuTitlePromise(threadTitleConvKey, haikusTitlePromise);
   }
 
+  // Interval-based memory extraction: pull fresh messages from DB every 60s
+  // while the container is live. The throttle inside extractMemories prevents
+  // overlapping calls; the interval ensures extraction doesn't depend on idle
+  // markers or container exit.
+  const memoryExtractionInterval = setInterval(() => {
+    const snapshot = agentResponseText.trim();
+    if (!snapshot) return;
+    // Reset so the next tick only sees new responses. Safe: JS strings are
+    // immutable, so extractMemoriesAsync still holds the snapshot. If the
+    // extraction is throttled or in-flight-guarded, the snapshot is lost for
+    // this tick — but bot responses are already in DB messages, and the next
+    // tick gets fresh accumulation.
+    agentResponseText = '';
+    const recentMsgs = getRecentMessages(chatJid, 20).map((m) => ({
+      id: m.id,
+      chat_jid: m.chat_jid,
+      sender: m.sender,
+      sender_name: m.sender_name,
+      content: m.text,
+      timestamp: m.timestamp,
+      is_from_me: !!m.is_from_me,
+      is_bot_message: !!m.is_bot_message,
+    }));
+    extractMemoriesAsync(group.folder, chatJid, recentMsgs, snapshot);
+  }, 60_000);
+
   let output: string | undefined;
   try {
     output = await runAgent(
@@ -1592,36 +1615,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         throttledTouchActivity(sessionKey);
 
         if (result.status === 'success' && result.idle) {
-          // Extract memories mid-session so multi-turn IPC conversations
-          // don't defer extraction until the container times out.
-          // Responses within the 60s throttle window after a prior extraction
-          // are skipped — acceptable since extraction is non-critical.
-          try {
-            if (
-              agentResponseText.trim() &&
-              !isExtractionThrottled(group.folder)
-            ) {
-              const recentMsgs = getRecentMessages(chatJid, 10).map((m) => ({
-                id: m.id,
-                chat_jid: m.chat_jid,
-                sender: m.sender,
-                sender_name: m.sender_name,
-                content: m.text,
-                timestamp: m.timestamp,
-                is_from_me: !!m.is_from_me,
-                is_bot_message: !!m.is_bot_message,
-              }));
-              extractMemoriesAsync(group.folder, recentMsgs, agentResponseText);
-              // Reset so the next idle pass only sees new responses
-              agentResponseText = '';
-            }
-          } catch (err) {
-            logger.warn(
-              { err, group: group.name },
-              'Mid-session memory extraction setup failed (non-fatal)',
-            );
-          }
-
           // Agent is truly idle (between queries, waiting for new IPC
           // input).  Safe to mark idle and allow preemption.
           const ipcSentOutput = ipcOutputSentJids.has(chatJid);
@@ -1664,6 +1657,27 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       },
     );
   } finally {
+    // Stop memory extraction interval and fire a final extraction to catch
+    // any responses since the last interval tick.
+    clearInterval(memoryExtractionInterval);
+    if (agentResponseText.trim()) {
+      const recentMsgs = getRecentMessages(chatJid, 20).map((m) => ({
+        id: m.id,
+        chat_jid: m.chat_jid,
+        sender: m.sender,
+        sender_name: m.sender_name,
+        content: m.text,
+        timestamp: m.timestamp,
+        is_from_me: !!m.is_from_me,
+        is_bot_message: !!m.is_bot_message,
+      }));
+      extractMemoriesAsync(
+        group.folder,
+        chatJid,
+        recentMsgs,
+        agentResponseText,
+      );
+    }
     // Always clear typing indicator — even if runAgent throws, the 8s
     // interval must stop to prevent persistent "is typing..." in Discord.
     await channel.setTyping?.(chatJid, false);
@@ -1778,14 +1792,6 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   // Success — persist the cursor advance now that the container has completed.
   saveState();
-
-  // Fire-and-forget memory extraction — catches any final response that
-  // wasn't covered by mid-session extraction (e.g., container exited without
-  // emitting an idle marker). Uses agentResponseText which may be empty if
-  // the mid-session path already reset it; the 60s throttle handles overlap.
-  if (agentResponseText.trim()) {
-    extractMemoriesAsync(group.folder, missedMessages, agentResponseText);
-  }
 
   // If we truncated at a second trigger, re-enqueue so the next trigger gets its
   // own container. Use setImmediate so this runs after runForGroup's finally block

@@ -1904,6 +1904,11 @@ async function main(): Promise<void> {
   // so the agent knows where to write thread-local state.
   const workspacePersistenceNote = buildWorkspacePersistenceNote();
 
+  // Users cannot access the container filesystem — files written for review
+  // (briefs, designs, plans, etc.) must be delivered as attachments via send_file.
+  const fileDeliveryNote =
+    'IMPORTANT: Users cannot access your filesystem. When you write a file the user needs to review — briefs, designs, plans, reports, or any approval-gate artifact — you MUST call mcp__nanoclaw__send_file to deliver it as an attachment. Save to disk first (for persistence and downstream skill steps), then call mcp__nanoclaw__send_file with the file_path. A path reference alone gives the user nothing to review.';
+
   // Static system prompt parts (everything except model identity, which changes per query)
   const staticPromptParts = [
     globalClaudeMd,
@@ -1912,6 +1917,7 @@ async function main(): Promise<void> {
     toneNote,
     capabilityManifest,
     workspacePersistenceNote,
+    fileDeliveryNote,
     // Guard against system reminders swallowing the agent's actual response.
     // When the SDK injects a system reminder (e.g. "task tools haven't been used")
     // after the agent's last tool call, the agent sometimes produces a throwaway
