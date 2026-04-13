@@ -585,7 +585,7 @@ function createEmailGateHook(isScheduledTask: boolean): HookCallback {
     const responsesDir = path.join(ipcDir, 'query_responses');
     fs.mkdirSync(responsesDir, { recursive: true });
     const responseFile = path.join(responsesDir, `${requestId}.json`);
-    const deadline = Date.now() + 300_000;
+    const deadline = Date.now() + 1_800_000; // 30 min (matches IDLE_TIMEOUT)
 
     while (Date.now() < deadline) {
       try {

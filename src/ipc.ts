@@ -50,8 +50,9 @@ import { logger } from './logger.js';
 import { Memory, OutboundFile, RegisteredGroup } from './types.js';
 
 // ── In-memory gate tracking (replaces pending_gates DB table) ───────────────
-// Gates are short-lived (10min TTL). Lost on restart = OK — the container's
-// plugin hook times out too.
+// Container-side polls time out at 30min (matching IDLE_TIMEOUT). Host TTL
+// is 60min — headroom so the host never cleans up before the container gives up.
+// Lost on restart = OK.
 //
 // Reference to a posted interactive gate message. Used to clear the approve/
 // cancel buttons when the gate is resolved via a path other than a click
@@ -87,7 +88,7 @@ interface InMemoryGate {
 }
 
 const pendingGates = new Map<string, InMemoryGate>();
-const GATE_TTL_MS = 10 * 60 * 1000; // 10 min cleanup
+const GATE_TTL_MS = 60 * 60 * 1000; // 60 min cleanup
 // Delivery-race grace: skip auto-cancel-on-text lookups if the gate was
 // created within this window and has not been marked notifiedAt yet. The
 // typical Slack/Discord network round-trip for chat.postMessage is 200-500ms;
