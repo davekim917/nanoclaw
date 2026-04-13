@@ -24,6 +24,11 @@ const lastExtraction = new Map<string, number>();
 // Prevent overlapping Haiku calls for the same thread
 const inFlight = new Set<string>();
 
+/** Clean up per-thread state when a container exits. */
+export function clearExtractionState(chatJid: string): void {
+  lastExtraction.delete(chatJid);
+}
+
 // Tunable prompt template — loaded from file if present, otherwise default
 const PROMPT_TEMPLATE_PATH = path.join(
   process.cwd(),
@@ -92,81 +97,62 @@ async function extractMemories(
   inFlight.add(chatJid);
 
   try {
-    return await extractMemoriesInner(
-      groupFolder,
-      chatJid,
-      messages,
-      agentResponseText,
-      now,
-    );
-  } finally {
-    inFlight.delete(chatJid);
-  }
-}
+    const existing = listMemories(groupFolder, 30);
+    const prompt = buildPrompt(messages, agentResponseText, existing);
 
-async function extractMemoriesInner(
-  groupFolder: string,
-  chatJid: string,
-  messages: NewMessage[],
-  agentResponseText: string,
-  now: number,
-): Promise<void> {
-  // Build prompt — include both user and bot messages for full context
-  const existing = listMemories(groupFolder, 30);
-  const prompt = buildPrompt(messages, agentResponseText, existing);
+    const raw = await callHaiku(prompt, 30_000);
+    lastExtraction.set(chatJid, now);
+    const extracted = parseResponse(raw);
 
-  // Call Haiku (30s timeout for structured JSON)
-  const raw = await callHaiku(prompt, 30_000);
-  lastExtraction.set(groupFolder, now); // stamp after success so failures don't waste the window
-  const extracted = parseResponse(raw);
+    if (extracted.length === 0) return;
 
-  if (extracted.length === 0) return;
+    let saved = 0;
+    let updated = 0;
 
-  let saved = 0;
-  let updated = 0;
+    for (const item of extracted) {
+      if (item.action === 'skip') continue;
 
-  for (const item of extracted) {
-    if (item.action === 'skip') continue;
+      if (item.action === 'save') {
+        if (!item.name || !item.content) continue;
+        if (!VALID_TYPES.has(item.type)) item.type = 'reference';
 
-    if (item.action === 'save') {
-      if (!item.name || !item.content) continue;
-      if (!VALID_TYPES.has(item.type)) item.type = 'reference';
-
-      // Name-based dedup safety net
-      const dupe = existing.find(
-        (m) => m.name.toLowerCase() === item.name.toLowerCase(),
-      );
-      if (dupe) {
-        updateMemory(groupFolder, dupe.id, {
-          content: item.content,
-          ...(item.description ? { description: item.description } : {}),
-        });
-        updated++;
-      } else {
-        saveMemory(
-          groupFolder,
-          item.type,
-          item.name,
-          item.description || item.name,
-          item.content,
+        const dupe = existing.find(
+          (m) => m.name.toLowerCase() === item.name.toLowerCase(),
         );
-        saved++;
+        if (dupe) {
+          updateMemory(groupFolder, dupe.id, {
+            content: item.content,
+            ...(item.description ? { description: item.description } : {}),
+          });
+          updated++;
+        } else {
+          saveMemory(
+            groupFolder,
+            item.type,
+            item.name,
+            item.description || item.name,
+            item.content,
+          );
+          saved++;
+        }
+      }
+
+      if (item.action === 'update') {
+        if (!item.id || !item.fields) continue;
+        if (!existing.find((m) => m.id === item.id)) continue;
+        updateMemory(groupFolder, item.id, item.fields);
+        updated++;
       }
     }
 
-    if (item.action === 'update') {
-      if (!item.id || !item.fields) continue;
-      if (!existing.find((m) => m.id === item.id)) continue; // reject IDs not in known list
-      updateMemory(groupFolder, item.id, item.fields);
-      updated++;
+    if (saved > 0 || updated > 0) {
+      logger.info(
+        { groupFolder, chatJid, saved, updated },
+        'Memory extraction complete',
+      );
     }
-  }
-
-  if (saved > 0 || updated > 0) {
-    logger.info(
-      { groupFolder, chatJid, saved, updated },
-      'Memory extraction complete',
-    );
+  } finally {
+    inFlight.delete(chatJid);
   }
 }
 
@@ -179,12 +165,14 @@ function buildPrompt(
   const template = loadTemplate();
   if (template) {
     const subs: Record<string, string> = {
+      MESSAGES: formatMessages(messages),
+      // Backwards compat: old templates may use USER_MESSAGES
       USER_MESSAGES: formatMessages(messages),
       AGENT_RESPONSE: agentResponse.slice(-2000),
       EXISTING_MEMORIES: formatExistingMemories(existing),
     };
     return template.replace(
-      /\{\{(USER_MESSAGES|AGENT_RESPONSE|EXISTING_MEMORIES)\}\}/g,
+      /\{\{(MESSAGES|USER_MESSAGES|AGENT_RESPONSE|EXISTING_MEMORIES)\}\}/g,
       (_, key: string) => subs[key] ?? '',
     );
   }

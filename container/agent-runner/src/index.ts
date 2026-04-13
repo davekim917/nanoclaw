@@ -17,7 +17,15 @@
 import fs from 'fs';
 import path from 'path';
 import { execFile } from 'child_process';
-import { query, Query, HookCallback, PreCompactHookInput, PreToolUseHookInput, EffortLevel, SDKUserMessage } from '@anthropic-ai/claude-agent-sdk';
+import {
+  query,
+  Query,
+  HookCallback,
+  PreCompactHookInput,
+  PreToolUseHookInput,
+  EffortLevel,
+  SDKUserMessage,
+} from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
 
 interface ContainerAttachment {
@@ -92,7 +100,10 @@ interface SessionsIndex {
 
 // Supported image MIME types (used to identify image attachments)
 const IMAGE_MIME_TYPES = new Set([
-  'image/jpeg', 'image/png', 'image/gif', 'image/webp',
+  'image/jpeg',
+  'image/png',
+  'image/gif',
+  'image/webp',
 ]);
 
 const IPC_INPUT_SUBDIR = process.env.IPC_INPUT_SUBDIR;
@@ -126,8 +137,10 @@ let pendingEffortAck: Promise<string | false> | null = null;
  * but may silently ignore full IDs like "claude-opus-4-6[1m]".
  */
 function toCliAlias(model: string): string {
-  if (model.startsWith('claude-opus-4')) return model.includes('[1m]') ? 'opus[1m]' : 'opus';
-  if (model.startsWith('claude-sonnet-4')) return model.includes('[1m]') ? 'sonnet[1m]' : 'sonnet';
+  if (model.startsWith('claude-opus-4'))
+    return model.includes('[1m]') ? 'opus[1m]' : 'opus';
+  if (model.startsWith('claude-sonnet-4'))
+    return model.includes('[1m]') ? 'sonnet[1m]' : 'sonnet';
   if (model.startsWith('claude-haiku')) return 'haiku';
   log(`toCliAlias: unrecognized model "${model}", passing through as-is`);
   return model;
@@ -196,14 +209,13 @@ async function runCompactQuery(opts: {
 /**
  * Returns channel-type-specific message formatting instructions based on the JID prefix.
  *
- * This is injected into the system prompt on every invocation so that even groups with
- * globalContext:false (no /workspace/global mount) get correct formatting guidance.
+ * This is injected into the system prompt on every invocation so all groups get
+ * correct formatting guidance regardless of globalContext setting.
  *
- * Note: All groups (main and non-main) receive global CLAUDE.md via explicit system
- * prompt injection at startup (line ~1873). Groups with globalContext:false do not
- * get the /workspace/global mount, so the injection is a no-op for them. This
- * function covers Slack and Discord explicitly; a future non-MAIN WhatsApp/Telegram
- * group with globalContext:false would need entries added here.
+ * Note: All groups receive /workspace/global mount unconditionally (global CLAUDE.md
+ * contains shared instructions). globalContext only gates cross-group memory search.
+ * This function covers Slack and Discord explicitly; a future non-MAIN WhatsApp/Telegram
+ * group would need entries added here.
  *
  * Returns undefined for unrecognised JID prefixes — no formatting injection.
  */
@@ -312,10 +324,15 @@ function writeOutput(output: ContainerOutput): void {
   console.log(OUTPUT_END_MARKER);
 }
 
-function writeProgress(eventType: string, data: Record<string, string | undefined>): void {
+function writeProgress(
+  eventType: string,
+  data: Record<string, string | undefined>,
+): void {
   progressSeq++;
   console.log(PROGRESS_START_MARKER);
-  console.log(JSON.stringify({ eventType, data, seq: progressSeq, ts: Date.now() }));
+  console.log(
+    JSON.stringify({ eventType, data, seq: progressSeq, ts: Date.now() }),
+  );
   console.log(PROGRESS_END_MARKER);
 }
 
@@ -357,7 +374,10 @@ function getSessionSummary(
  * For thread sessions, also archives to /workspace/thread/conversations/
  * and writes a summary.txt for future Plan C indexing.
  */
-function createPreCompactHook(assistantName?: string, threadId?: string): HookCallback {
+function createPreCompactHook(
+  assistantName?: string,
+  threadId?: string,
+): HookCallback {
   return async (input, _toolUseId, _context) => {
     const preCompact = input as PreCompactHookInput;
     const transcriptPath = preCompact.transcript_path;
@@ -381,7 +401,11 @@ function createPreCompactHook(assistantName?: string, threadId?: string): HookCa
       const name = summary ? sanitizeFilename(summary) : generateFallbackName();
       const date = new Date().toISOString().split('T')[0];
       const filename = `${date}-${name}.md`;
-      const markdown = formatTranscriptMarkdown(messages, summary, assistantName);
+      const markdown = formatTranscriptMarkdown(
+        messages,
+        summary,
+        assistantName,
+      );
 
       // Always archive to group conversations
       const conversationsDir = '/workspace/group/conversations';
@@ -399,10 +423,7 @@ function createPreCompactHook(assistantName?: string, threadId?: string): HookCa
 
         // Write summary.txt for future Plan C FTS5 indexing
         if (summary) {
-          fs.writeFileSync(
-            '/workspace/thread/summary.txt',
-            summary,
-          );
+          fs.writeFileSync('/workspace/thread/summary.txt', summary);
         }
         log(`Archived thread conversation to ${threadFilePath}`);
       }
@@ -429,17 +450,21 @@ const SECRET_ENV_VARS = [
 ];
 
 function isPromptTooLongError(msg: string): boolean {
-  return msg.includes('prompt is too long') ||
+  return (
+    msg.includes('prompt is too long') ||
     msg.includes('prompt_too_long') ||
-    msg.includes('maximum context length');
+    msg.includes('maximum context length')
+  );
 }
 
 function isRetryableError(msg: string): boolean {
-  return msg.includes('429') ||
+  return (
+    msg.includes('429') ||
     /rate.?limit/i.test(msg) ||
     /overloaded/i.test(msg) ||
     msg.includes('upstream_error') ||
-    msg.includes('External provider returned');
+    msg.includes('External provider returned')
+  );
 }
 
 function createSanitizeBashHook(): HookCallback {
@@ -477,8 +502,8 @@ function createBlockSnowflakeConnectorHook(): HookCallback {
     if (SNOWFLAKE_CONNECTOR_EXEC_RE.test(command)) {
       return deny(
         'Direct use of Python snowflake.connector is blocked. ' +
-        'Use the `snow sql` CLI for ad-hoc queries. If snow is not working, ' +
-        'report the error to Dave instead of falling back to Python.',
+          'Use the `snow sql` CLI for ad-hoc queries. If snow is not working, ' +
+          'report the error to Dave instead of falling back to Python.',
       );
     }
     return {};
@@ -503,8 +528,8 @@ function createBlockGitCloneHook(): HookCallback {
 
     return deny(
       '`git clone` is blocked. Use the `create_worktree` MCP tool to get a working directory ' +
-      'for a repo under `/workspace/worktrees/<repo>`. If you need a repo that is not yet in ' +
-      'the group, use the `clone_repo` MCP tool instead.',
+        'for a repo under `/workspace/worktrees/<repo>`. If you need a repo that is not yet in ' +
+        'the group, use the `clone_repo` MCP tool instead.',
     );
   };
 }
@@ -520,7 +545,7 @@ function createSelfApprovalBlockHook(): HookCallback {
     if (/\.claude-destructive-gate/.test(command)) {
       return deny(
         'Self-approval of destructive operation gates is not allowed. ' +
-        'Approval must come from the user via the chat channel.',
+          'Approval must come from the user via the chat channel.',
       );
     }
     return {};
@@ -530,7 +555,8 @@ function createSelfApprovalBlockHook(): HookCallback {
 // Email consent gate. Blocks gws gmail send/reply/reply-all/forward commands
 // and requests user approval via IPC before allowing execution.
 // Scheduled tasks bypass the gate so automated email workflows are unaffected.
-const GWS_EMAIL_SEND_RE = /\bgws\s+gmail\s+\+(?:send|reply|reply-all|forward)\b/;
+const GWS_EMAIL_SEND_RE =
+  /\bgws\s+gmail\s+\+(?:send|reply|reply-all|forward)\b/;
 const EMAIL_NO_GATE_RE = /\s--(?:dry-run|draft)\b/;
 
 function createEmailGateHook(isScheduledTask: boolean): HookCallback {
@@ -546,12 +572,14 @@ function createEmailGateHook(isScheduledTask: boolean): HookCallback {
     // Extract only the shell segment containing the gws command — bypass flags
     // in other segments (after ;, &&, ||, |, or newline) must not suppress the gate.
     const segments = command.split(/[;&|]\s*|\s*&&\s*|\s*\|\|\s*|\n/);
-    const gwsSegment = segments.find((s) => GWS_EMAIL_SEND_RE.test(s)) || command;
+    const gwsSegment =
+      segments.find((s) => GWS_EMAIL_SEND_RE.test(s)) || command;
     if (EMAIL_NO_GATE_RE.test(gwsSegment)) return {};
 
     const toMatch = gwsSegment.match(/--to\s+['"]?([^\s'"]+)/);
-    const subjectMatch = gwsSegment.match(/--subject\s+['"]([^'"]+)['"]/)
-      || gwsSegment.match(/--subject\s+(\S+)/);
+    const subjectMatch =
+      gwsSegment.match(/--subject\s+['"]([^'"]+)['"]/) ||
+      gwsSegment.match(/--subject\s+(\S+)/);
     const to = toMatch?.[1] || 'unknown recipient';
     const subject = subjectMatch?.[1] || '';
     const action = command.match(/\+(\w[\w-]*)/)?.[1] || 'send';
@@ -562,7 +590,9 @@ function createEmailGateHook(isScheduledTask: boolean): HookCallback {
     const ipcDir = process.env.NANOCLAW_IPC_DIR;
     const chatJid = process.env.NANOCLAW_CHAT_JID;
     if (!ipcDir || !chatJid) {
-      return deny('Email sending requires user approval but IPC is not available.');
+      return deny(
+        'Email sending requires user approval but IPC is not available.',
+      );
     }
 
     const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -570,16 +600,19 @@ function createEmailGateHook(isScheduledTask: boolean): HookCallback {
     fs.mkdirSync(queriesDir, { recursive: true });
     const queryFile = path.join(queriesDir, `${requestId}.json`);
     const tmpFile = `${queryFile}.tmp`;
-    fs.writeFileSync(tmpFile, JSON.stringify({
-      type: 'request_gate',
-      requestId,
-      chatJid,
-      threadId: process.env.NANOCLAW_THREAD_ID,
-      label,
-      summary: `Approve email ${action}?`,
-      command: command.slice(0, 300),
-      timestamp: new Date().toISOString(),
-    }));
+    fs.writeFileSync(
+      tmpFile,
+      JSON.stringify({
+        type: 'request_gate',
+        requestId,
+        chatJid,
+        threadId: process.env.NANOCLAW_THREAD_ID,
+        label,
+        summary: `Approve email ${action}?`,
+        command: command.slice(0, 300),
+        timestamp: new Date().toISOString(),
+      }),
+    );
     fs.renameSync(tmpFile, queryFile);
 
     const responsesDir = path.join(ipcDir, 'query_responses');
@@ -590,21 +623,28 @@ function createEmailGateHook(isScheduledTask: boolean): HookCallback {
     while (Date.now() < deadline) {
       try {
         const content = JSON.parse(fs.readFileSync(responseFile, 'utf-8'));
-        try { fs.unlinkSync(responseFile); } catch { /* ok */ }
+        try {
+          fs.unlinkSync(responseFile);
+        } catch {
+          /* ok */
+        }
         if (content.decision === 'approved') {
           return {};
         }
-        const detail = content.decision === 'cancelled'
-          ? 'User declined. Do not retry — acknowledge the cancellation briefly.'
-          : 'Gate response was not an approval.';
+        const detail =
+          content.decision === 'cancelled'
+            ? 'User declined. Do not retry — acknowledge the cancellation briefly.'
+            : 'Gate response was not an approval.';
         return deny(`Email ${action} blocked: ${detail}`);
       } catch {
         // ENOENT — keep polling
       }
-      await new Promise(resolve => setTimeout(resolve, 500));
+      await new Promise((resolve) => setTimeout(resolve, 500));
     }
 
-    return deny(`Email ${action} blocked: timed out waiting for user approval. Do not retry.`);
+    return deny(
+      `Email ${action} blocked: timed out waiting for user approval. Do not retry.`,
+    );
   };
 }
 
@@ -729,8 +769,9 @@ interface IpcMessage {
 function drainIpcInput(): IpcMessage[] {
   try {
     // Dir already created in main() at startup
-    const files = fs.readdirSync(IPC_INPUT_DIR)
-      .filter(f => f.endsWith('.json'))
+    const files = fs
+      .readdirSync(IPC_INPUT_DIR)
+      .filter((f) => f.endsWith('.json'))
       .sort();
 
     const messages: IpcMessage[] = [];
@@ -752,20 +793,28 @@ function drainIpcInput(): IpcMessage[] {
           sdkEnvRef['CLAUDE_CODE_USE_MODEL'] = data.model;
           if (activeQuery) {
             const alias = toCliAlias(data.model);
-            activeQuery.setModel(alias).catch(err =>
-              log(`setModel(${alias}) failed: ${err instanceof Error ? err.message : String(err)}`),
-            );
+            activeQuery
+              .setModel(alias)
+              .catch((err) =>
+                log(
+                  `setModel(${alias}) failed: ${err instanceof Error ? err.message : String(err)}`,
+                ),
+              );
             lastSetModelAlias = alias;
           }
-          log(`Model switched via IPC: ${data.model}${data.oneshot ? ' (one-shot)' : ''}`);
+          log(
+            `Model switched via IPC: ${data.model}${data.oneshot ? ' (one-shot)' : ''}`,
+          );
         } else if (data.type === 'effort_switch' && data.effort) {
           sdkEnvRef['CLAUDE_CODE_USE_EFFORT'] = data.effort;
           if (activeQuery) {
             pendingEffortAck = activeQuery
               .applyFlagSettings({ effortLevel: data.effort })
               .then(() => data.effort as string)
-              .catch(err => {
-                log(`applyFlagSettings(effort=${data.effort}) failed: ${err instanceof Error ? err.message : String(err)}`);
+              .catch((err) => {
+                log(
+                  `applyFlagSettings(effort=${data.effort}) failed: ${err instanceof Error ? err.message : String(err)}`,
+                );
                 return false as const;
               });
           } else {
@@ -774,7 +823,11 @@ function drainIpcInput(): IpcMessage[] {
           }
           log(`Effort switched via IPC: ${data.effort}`);
         }
-        try { fs.unlinkSync(filePath); } catch { /* ignore delete failures */ }
+        try {
+          fs.unlinkSync(filePath);
+        } catch {
+          /* ignore delete failures */
+        }
       } catch (err) {
         log(
           `Failed to process input file ${file}: ${err instanceof Error ? err.message : String(err)}`,
@@ -797,7 +850,11 @@ function drainIpcInput(): IpcMessage[] {
  * Wait for a new IPC message or _close sentinel.
  * Returns the combined content (text + optional attachments), or null if _close.
  */
-function waitForIpcMessage(): Promise<{ text: string; attachments?: ContainerAttachment[]; pipeIds: string[] } | null> {
+function waitForIpcMessage(): Promise<{
+  text: string;
+  attachments?: ContainerAttachment[];
+  pipeIds: string[];
+} | null> {
   return new Promise((resolve) => {
     const poll = () => {
       if (shouldClose()) {
@@ -806,7 +863,7 @@ function waitForIpcMessage(): Promise<{ text: string; attachments?: ContainerAtt
       }
       const messages = drainIpcInput();
       if (messages.length > 0) {
-        const text = messages.map(m => m.text).join('\n');
+        const text = messages.map((m) => m.text).join('\n');
         // Merge attachments from all drained messages
         const allAttachments: ContainerAttachment[] = [];
         const pipeIds: string[] = [];
@@ -829,7 +886,7 @@ function waitForIpcMessage(): Promise<{ text: string; attachments?: ContainerAtt
 
 function isToolEnabled(tools: string[] | undefined, name: string): boolean {
   if (!tools) return true;
-  return tools.some(t => t === name || t.startsWith(name + ':'));
+  return tools.some((t) => t === name || t.startsWith(name + ':'));
 }
 
 // Gmail, Calendar, and Workspace tools are now provided by gws CLI (Google Workspace CLI)
@@ -888,7 +945,7 @@ function buildCapabilityManifest(
   // Cloud
   if (isToolEnabled(tools, 'aws')) {
     capabilities.push(
-      '- **AWS** — `aws` CLI authenticated via `~/.aws/credentials` (already mounted). Common: `aws sts get-caller-identity` to verify auth, `aws s3 ls`, `aws ec2 describe-instances --query \'Reservations[].Instances[].[InstanceId,State.Name]\' --output table`. Multi-account: pass `--profile <name>` (see `aws configure list-profiles`).',
+      "- **AWS** — `aws` CLI authenticated via `~/.aws/credentials` (already mounted). Common: `aws sts get-caller-identity` to verify auth, `aws s3 ls`, `aws ec2 describe-instances --query 'Reservations[].Instances[].[InstanceId,State.Name]' --output table`. Multi-account: pass `--profile <name>` (see `aws configure list-profiles`).",
     );
   }
   if (isToolEnabled(tools, 'gcloud')) {
@@ -1002,11 +1059,7 @@ open_pr({ repo: "MY-REPO", title: "feat: add places enrichment", body: "## Summa
 // Per-group access control lives in credential mounting + MCP server
 // registration (container-runner.ts), not here.
 function buildAllowedTools(tools: string[] | undefined): string[] {
-  const allowed = [
-    'mcp__nanoclaw__*',
-    'mcp__ollama__*',
-    'mcp__gitnexus__*',
-  ];
+  const allowed = ['mcp__nanoclaw__*', 'mcp__ollama__*', 'mcp__gitnexus__*'];
   if (isToolEnabled(tools, 'exa')) {
     allowed.push('mcp__exa__*');
     allowed.push('mcp__exa-websets__*');
@@ -1029,13 +1082,27 @@ function buildDisallowedTools(_tools: string[] | undefined): string[] {
 }
 
 const EXA_TOOLS = [
-  'web_search_exa', 'web_search_advanced_exa', 'get_code_context_exa',
-  'crawling_exa', 'company_research_exa', 'people_search_exa',
-  'deep_researcher_start', 'deep_researcher_check', 'deep_search_exa',
+  'web_search_exa',
+  'web_search_advanced_exa',
+  'get_code_context_exa',
+  'crawling_exa',
+  'company_research_exa',
+  'people_search_exa',
+  'deep_researcher_start',
+  'deep_researcher_check',
+  'deep_search_exa',
 ] as const;
 
-type StdioServer = { command: string; args: string[]; env?: Record<string, string> };
-type HttpServer = { type: 'http'; url: string; headers?: Record<string, string> };
+type StdioServer = {
+  command: string;
+  args: string[];
+  env?: Record<string, string>;
+};
+type HttpServer = {
+  type: 'http';
+  url: string;
+  headers?: Record<string, string>;
+};
 type McpServer = StdioServer | HttpServer;
 
 // Secrets that are consumed only by buildMcpServers as MCP HTTP headers must
@@ -1195,11 +1262,15 @@ function buildPromptContent(
         log(`Attachment file not found: ${att.containerPath}`);
         parts.push(`[Image attachment "${att.filename}" not available]`);
       } else {
-        parts.push(`[Image "${att.filename}" attached at: ${att.containerPath} — use the Read tool to view it]`);
+        parts.push(
+          `[Image "${att.filename}" attached at: ${att.containerPath} — use the Read tool to view it]`,
+        );
       }
     } else {
       // Non-image attachments: reference as file path for agent to read
-      parts.push(`[Attached file "${att.filename}" available at: ${att.containerPath}]`);
+      parts.push(
+        `[Attached file "${att.filename}" available at: ${att.containerPath}]`,
+      );
     }
   }
 
@@ -1212,7 +1283,10 @@ function buildPromptContent(
  *   - Direct plugin: has .claude-plugin/plugin.json at root (e.g. impeccable, omni-claude-skills)
  *   - Multi-plugin repo: has plugins/ subdir with individual plugins (e.g. bootstrap)
  */
-function discoverPlugins(): { plugins: Array<{ type: 'local'; path: string }>; errors: string[] } {
+function discoverPlugins(): {
+  plugins: Array<{ type: 'local'; path: string }>;
+  errors: string[];
+} {
   const pluginsRoot = process.env.CLAUDE_PLUGINS_ROOT || '/workspace/plugins';
   if (!fs.existsSync(pluginsRoot)) return { plugins: [], errors: [] };
   const plugins: Array<{ type: 'local'; path: string }> = [];
@@ -1239,16 +1313,22 @@ function discoverPlugins(): { plugins: Array<{ type: 'local'; path: string }>; e
         try {
           if (!fs.statSync(subPath).isDirectory()) continue;
         } catch (e) {
-          errors.push(`${entry}/plugins/${sub}: ${e instanceof Error ? e.message : String(e)}`);
+          errors.push(
+            `${entry}/plugins/${sub}: ${e instanceof Error ? e.message : String(e)}`,
+          );
           continue;
         }
-        if (fs.existsSync(path.join(subPath, '.claude-plugin', 'plugin.json'))) {
+        if (
+          fs.existsSync(path.join(subPath, '.claude-plugin', 'plugin.json'))
+        ) {
           plugins.push({ type: 'local', path: subPath });
         }
       }
     }
   } catch (e) {
-    errors.push(`readdir ${pluginsRoot}: ${e instanceof Error ? e.message : String(e)}`);
+    errors.push(
+      `readdir ${pluginsRoot}: ${e instanceof Error ? e.message : String(e)}`,
+    );
   }
   return { plugins, errors };
 }
@@ -1264,7 +1344,9 @@ interface QueryContext {
   mcpServerPath: string;
   containerInput: ContainerInput;
   sdkEnv: Record<string, string | undefined>;
-  buildSystemPrompt: (model?: string) => { type: 'preset'; preset: 'claude_code'; append: string } | undefined;
+  buildSystemPrompt: (
+    model?: string,
+  ) => { type: 'preset'; preset: 'claude_code'; append: string } | undefined;
   plugins: Array<{ type: 'local'; path: string }>;
 }
 
@@ -1274,8 +1356,13 @@ async function runQuery(
   ctx: QueryContext,
   resumeAt?: string,
   initialPipeIds?: string[],
-): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean }> {
-  const { mcpServerPath, containerInput, sdkEnv, buildSystemPrompt, plugins } = ctx;
+): Promise<{
+  newSessionId?: string;
+  lastAssistantUuid?: string;
+  closedDuringQuery: boolean;
+}> {
+  const { mcpServerPath, containerInput, sdkEnv, buildSystemPrompt, plugins } =
+    ctx;
   // Rebuild system prompt with current model (may differ from startup if IPC switched it)
   const currentModel = sdkEnv['CLAUDE_CODE_USE_MODEL'] || containerInput.model;
   const systemPromptOption = buildSystemPrompt(currentModel);
@@ -1313,14 +1400,18 @@ async function runQuery(
     }
     const messages = drainIpcInput();
     for (const msg of messages) {
-      log(`Piping IPC message into active query (${msg.text.length} chars, attachments=${msg.attachments?.length ?? 0})`);
+      log(
+        `Piping IPC message into active query (${msg.text.length} chars, attachments=${msg.attachments?.length ?? 0})`,
+      );
       const content = buildPromptContent(msg.text, msg.attachments);
       stream.push(content);
       hasPipedSinceLastOutput = true;
       if (msg.pipeId) pendingAcks.push({ pipeId: msg.pipeId, consumed: false });
       if (postResult && !stallTimer) {
         stallTimer = setTimeout(() => {
-          log('WARN: Stall detected — SDK silent for STALL_DETECT_MS after post-result push. Forcing stream.end() for cold restart.');
+          log(
+            'WARN: Stall detected — SDK silent for STALL_DETECT_MS after post-result push. Forcing stream.end() for cold restart.',
+          );
           stream.end();
           stallTimer = null;
         }, STALL_DETECT_MS);
@@ -1399,16 +1490,42 @@ async function runQuery(
       env: sdkEnv,
       // Only pass model on fresh sessions — the SDK rejects model changes on
       // resumed sessions via the options.  setModel() handles mid-session switches.
-      ...(!sessionId && sdkEnv['CLAUDE_CODE_USE_MODEL'] ? { model: sdkEnv['CLAUDE_CODE_USE_MODEL'] } : {}),
+      ...(!sessionId && sdkEnv['CLAUDE_CODE_USE_MODEL']
+        ? { model: sdkEnv['CLAUDE_CODE_USE_MODEL'] }
+        : {}),
       permissionMode: 'bypassPermissions',
       allowDangerouslySkipPermissions: true,
       settingSources: ['project', 'user'],
       mcpServers: buildMcpServers(containerInput, mcpServerPath),
       ...(plugins.length > 0 ? { plugins } : {}),
-      ...(sdkEnv['CLAUDE_CODE_USE_EFFORT'] || effort ? { effort: (sdkEnv['CLAUDE_CODE_USE_EFFORT'] || effort) as EffortLevel } : {}),
+      ...(sdkEnv['CLAUDE_CODE_USE_EFFORT'] || effort
+        ? {
+            effort: (sdkEnv['CLAUDE_CODE_USE_EFFORT'] || effort) as EffortLevel,
+          }
+        : {}),
       hooks: {
-        PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName, containerInput.threadId)] }],
-        PreToolUse: [{ matcher: 'Bash', hooks: [createEmailGateHook(!!containerInput.isScheduledTask), createSelfApprovalBlockHook(), createBlockGitCloneHook(), createBlockSnowflakeConnectorHook(), createSanitizeBashHook()] }],
+        PreCompact: [
+          {
+            hooks: [
+              createPreCompactHook(
+                containerInput.assistantName,
+                containerInput.threadId,
+              ),
+            ],
+          },
+        ],
+        PreToolUse: [
+          {
+            matcher: 'Bash',
+            hooks: [
+              createEmailGateHook(!!containerInput.isScheduledTask),
+              createSelfApprovalBlockHook(),
+              createBlockGitCloneHook(),
+              createBlockSnowflakeConnectorHook(),
+              createSanitizeBashHook(),
+            ],
+          },
+        ],
       },
     },
   });
@@ -1447,8 +1564,24 @@ async function runQuery(
     // Emit progress events for real-time web UI streaming
     if (message.type === 'assistant' && 'message' in message) {
       postResult = false;
-      if (stallTimer) { clearTimeout(stallTimer); stallTimer = null; }
-      const content = (message as { message: { content: Array<{ type: string; text?: string; thinking?: string; name?: string; input?: unknown; id?: string }> } }).message.content;
+      if (stallTimer) {
+        clearTimeout(stallTimer);
+        stallTimer = null;
+      }
+      const content = (
+        message as {
+          message: {
+            content: Array<{
+              type: string;
+              text?: string;
+              thinking?: string;
+              name?: string;
+              input?: unknown;
+              id?: string;
+            }>;
+          };
+        }
+      ).message.content;
       if (Array.isArray(content)) {
         // Piped check-in reply: emit text via writeOutput so the host sends
         // it to Discord now, rather than waiting for the turn's `result`
@@ -1460,12 +1593,18 @@ async function runQuery(
           let hasToolUse = false;
           const textParts: string[] = [];
           for (const b of content) {
-            if (b.type === 'text' && b.text) { textParts.push(b.text); hasText = true; }
-            else if (b.type === 'tool_use') { hasToolUse = true; }
+            if (b.type === 'text' && b.text) {
+              textParts.push(b.text);
+              hasText = true;
+            } else if (b.type === 'tool_use') {
+              hasToolUse = true;
+            }
           }
           if (hasText && hasToolUse) {
             const intermediateText = textParts.join('\n');
-            log(`Emitting intermediate text as output (piped reply, ${intermediateText.length} chars)`);
+            log(
+              `Emitting intermediate text as output (piped reply, ${intermediateText.length} chars)`,
+            );
             writeOutput({
               status: 'success',
               result: intermediateText,
@@ -1511,12 +1650,16 @@ async function runQuery(
 
     if (message.type === 'system') {
       postResult = false;
-      if (stallTimer) { clearTimeout(stallTimer); stallTimer = null; }
+      if (stallTimer) {
+        clearTimeout(stallTimer);
+        stallTimer = null;
+      }
       const subtype = (message as { subtype?: string }).subtype || 'unknown';
       writeProgress('system', {
         subtype,
-        info: (message as { session_id?: string }).session_id ||
-              (message as { summary?: string }).summary,
+        info:
+          (message as { session_id?: string }).session_id ||
+          (message as { summary?: string }).summary,
       });
     }
 
@@ -1525,9 +1668,13 @@ async function runQuery(
       log(`Session initialized: ${newSessionId}`);
 
       // Log SDK-loaded plugins for diagnostics
-      const loadedPlugins = (message as { plugins?: Array<{ name: string; path?: string }> }).plugins || [];
+      const loadedPlugins =
+        (message as { plugins?: Array<{ name: string; path?: string }> })
+          .plugins || [];
       if (loadedPlugins.length > 0) {
-        log(`SDK init plugins (${loadedPlugins.length}): ${loadedPlugins.map(p => p.name).join(', ')}`);
+        log(
+          `SDK init plugins (${loadedPlugins.length}): ${loadedPlugins.map((p) => p.name).join(', ')}`,
+        );
       }
     }
 
@@ -1548,17 +1695,24 @@ async function runQuery(
     if (message.type === 'result') {
       postResult = true;
       resultCount++;
-      const textResult = 'result' in message ? (message as { result?: string }).result : null;
-      log(`Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
+      const textResult =
+        'result' in message ? (message as { result?: string }).result : null;
+      log(
+        `Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`,
+      );
       // Log full result message keys and modelUsage to discover the actual shape
       const msgAny = message as Record<string, unknown>;
       if (msgAny.modelUsage) {
         log(`Model usage: ${JSON.stringify(msgAny.modelUsage)}`);
       } else {
         // Check all top-level keys for usage-related fields
-        const usageKeys = Object.keys(msgAny).filter(k => k !== 'type' && k !== 'subtype' && k !== 'result');
+        const usageKeys = Object.keys(msgAny).filter(
+          (k) => k !== 'type' && k !== 'subtype' && k !== 'result',
+        );
         if (usageKeys.length > 0) {
-          log(`Result extra keys: ${usageKeys.join(', ')} = ${JSON.stringify(Object.fromEntries(usageKeys.map(k => [k, msgAny[k]])))}`);
+          log(
+            `Result extra keys: ${usageKeys.join(', ')} = ${JSON.stringify(Object.fromEntries(usageKeys.map((k) => [k, msgAny[k]])))}`,
+          );
         }
       }
       // Diff modelUsage against the prior cumulative snapshot to figure out
@@ -1567,7 +1721,10 @@ async function runQuery(
       // confirming to the user.
       let modelsUsedThisTurn: string[] | undefined;
       if (msgAny.modelUsage && typeof msgAny.modelUsage === 'object') {
-        const usage = msgAny.modelUsage as Record<string, { outputTokens?: number }>;
+        const usage = msgAny.modelUsage as Record<
+          string,
+          { outputTokens?: number }
+        >;
         const grew: string[] = [];
         for (const [modelId, m] of Object.entries(usage)) {
           const curr = typeof m?.outputTokens === 'number' ? m.outputTokens : 0;
@@ -1587,13 +1744,15 @@ async function runQuery(
       // are filterable in logs, latch `sawApiErrorThisRun` for the drift
       // detector below, then throw when retryable so main()'s retry loop
       // can rotate keys.
-      if (typeof effectiveResult === 'string' &&
-          effectiveResult.startsWith('API Error:')) {
+      if (
+        typeof effectiveResult === 'string' &&
+        effectiveResult.startsWith('API Error:')
+      ) {
         sawApiErrorThisRun = true;
         log(
           `WARN: upstream API error surfaced as Result text ` +
-          `(modelsUsedThisTurn=${JSON.stringify(modelsUsedThisTurn)}): ` +
-          `${effectiveResult.slice(0, 500)}`,
+            `(modelsUsedThisTurn=${JSON.stringify(modelsUsedThisTurn)}): ` +
+            `${effectiveResult.slice(0, 500)}`,
         );
         if (isRetryableError(effectiveResult)) {
           throw new Error(effectiveResult);
@@ -1612,11 +1771,14 @@ async function runQuery(
         modelsUsedThisTurn.length > 0
       ) {
         const expectedModelId = sdkEnv['CLAUDE_CODE_USE_MODEL'];
-        if (typeof expectedModelId === 'string' &&
-            expectedModelId.includes('[1m]')) {
+        if (
+          typeof expectedModelId === 'string' &&
+          expectedModelId.includes('[1m]')
+        ) {
           const droppedSuffixId = expectedModelId.replace('[1m]', '');
           const driftedToNon1m = modelsUsedThisTurn.includes(droppedSuffixId);
-          const expectedStillUsed = modelsUsedThisTurn.includes(expectedModelId);
+          const expectedStillUsed =
+            modelsUsedThisTurn.includes(expectedModelId);
           if (driftedToNon1m && !expectedStillUsed) {
             // Always recover to sonnet[1m] regardless of which family
             // drifted: when opus is the failing family, reverting to
@@ -1628,8 +1790,8 @@ async function runQuery(
             const recoveryModelId = 'claude-sonnet-4-6[1m]';
             log(
               `WARN: SDK drifted from ${expectedModelId} to ` +
-              `${droppedSuffixId} (lost 1M context window). ` +
-              `Forcing ${recoveryAlias} for subsequent turns.`,
+                `${droppedSuffixId} (lost 1M context window). ` +
+                `Forcing ${recoveryAlias} for subsequent turns.`,
             );
             sdkEnv['CLAUDE_CODE_USE_MODEL'] = recoveryModelId;
             // Suppress any pending one-shot revert: it would overwrite
@@ -1638,7 +1800,7 @@ async function runQuery(
             if (pendingOneshotRevert !== undefined) {
               log(
                 `Clearing pendingOneshotRevert=${pendingOneshotRevert || 'default'} ` +
-                `due to drift recovery`,
+                  `due to drift recovery`,
               );
               pendingOneshotRevert = undefined;
             }
@@ -1707,10 +1869,16 @@ async function runQuery(
       // Revert one-shot model switch after the turn's result is emitted.
       if (pendingOneshotRevert !== undefined) {
         sdkEnvRef['CLAUDE_CODE_USE_MODEL'] = pendingOneshotRevert || undefined;
-        const revertAlias = pendingOneshotRevert ? toCliAlias(pendingOneshotRevert) : 'default';
-        activeQuery?.setModel(revertAlias).catch(err =>
-          log(`setModel revert failed: ${err instanceof Error ? err.message : String(err)}`),
-        );
+        const revertAlias = pendingOneshotRevert
+          ? toCliAlias(pendingOneshotRevert)
+          : 'default';
+        activeQuery
+          ?.setModel(revertAlias)
+          .catch((err) =>
+            log(
+              `setModel revert failed: ${err instanceof Error ? err.message : String(err)}`,
+            ),
+          );
         lastSetModelAlias = revertAlias;
         log(`One-shot model reverted to: ${revertAlias}`);
         pendingOneshotRevert = undefined;
@@ -1720,9 +1888,14 @@ async function runQuery(
 
   ipcPolling = false;
   activeQuery = null;
-  if (stallTimer) { clearTimeout(stallTimer); stallTimer = null; }
+  if (stallTimer) {
+    clearTimeout(stallTimer);
+    stallTimer = null;
+  }
 
-  log(`Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}`);
+  log(
+    `Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}`,
+  );
   return { newSessionId, lastAssistantUuid, closedDuringQuery };
 }
 
@@ -1789,7 +1962,11 @@ async function main(): Promise<void> {
     const stdinData = await readStdin();
     containerInput = JSON.parse(stdinData);
     // Delete the temp file the entrypoint wrote -- it contains secrets
-    try { fs.unlinkSync('/tmp/input.json'); } catch { /* may not exist */ }
+    try {
+      fs.unlinkSync('/tmp/input.json');
+    } catch {
+      /* may not exist */
+    }
     log(`Received input for group: ${containerInput.groupFolder}`);
   } catch (err) {
     writeOutput({
@@ -1827,7 +2004,14 @@ async function main(): Promise<void> {
   // non-HTTP secrets (dbt login, gcloud/gws credential paths) remain in
   // containerInput.secrets. Export these so CLI tools can read them as env vars.
   for (const [key, value] of Object.entries(containerInput.secrets || {})) {
-    if (key.startsWith('DBT_CLOUD_') || key.startsWith('OMNI_') || key.startsWith('BROWSER_AUTH_') || key === 'GOOGLE_APPLICATION_CREDENTIALS' || key === 'GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE' || key === 'RAILWAY_API_TOKEN') {
+    if (
+      key.startsWith('DBT_CLOUD_') ||
+      key.startsWith('OMNI_') ||
+      key.startsWith('BROWSER_AUTH_') ||
+      key === 'GOOGLE_APPLICATION_CREDENTIALS' ||
+      key === 'GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE' ||
+      key === 'RAILWAY_API_TOKEN'
+    ) {
       process.env[key] = value;
     }
   }
@@ -1852,28 +2036,35 @@ async function main(): Promise<void> {
     log(`WARNING: Plugin discovery errors: ${pluginErrors.join('; ')}`);
   }
   if (plugins.length > 0) {
-    log(`Discovered ${plugins.length} plugin(s): ${plugins.map(p => path.basename(p.path)).join(', ')}`);
+    log(
+      `Discovered ${plugins.length} plugin(s): ${plugins.map((p) => path.basename(p.path)).join(', ')}`,
+    );
   }
 
   // Warn if the workflow plugin (block-destructive hook) was not discovered.
-  if (!plugins.some(p => path.basename(p.path) === 'workflow')) {
-    log('WARNING: workflow plugin (block-destructive hook) NOT discovered — destructive commands will not be gated');
+  if (!plugins.some((p) => path.basename(p.path) === 'workflow')) {
+    log(
+      'WARNING: workflow plugin (block-destructive hook) NOT discovered — destructive commands will not be gated',
+    );
     writeOutput({
       status: 'success',
-      result: '\u26a0\ufe0f Safety notice: The destructive-command guard plugin failed to load. ' +
+      result:
+        '\u26a0\ufe0f Safety notice: The destructive-command guard plugin failed to load. ' +
         'Destructive operations (DROP TABLE, terraform destroy, etc.) will not be gated for approval.',
     });
   }
 
   // Build systemPrompt once — chatJid and global CLAUDE.md are invariant for the container lifetime.
-  // All groups (main and non-main) load global CLAUDE.md here; globalContext:false groups
-  // don't have /workspace/global mounted, so fs.existsSync returns false (no-op).
+  // All groups receive /workspace/global mount unconditionally, so global CLAUDE.md is
+  // always available. globalContext only gates cross-group memory search, not this mount.
   // channelFormatting is placed AFTER globalClaudeMd so it overrides formatting rules.
   const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
   const globalClaudeMd = fs.existsSync(globalClaudeMdPath)
     ? fs.readFileSync(globalClaudeMdPath, 'utf-8')
     : undefined;
-  const channelFormatting = getChannelFormattingInstructions(containerInput.chatJid);
+  const channelFormatting = getChannelFormattingInstructions(
+    containerInput.chatJid,
+  );
   // Inject agent identity so the agent knows its own name and can distinguish itself from other bots
   const identityNote = containerInput.assistantName
     ? `Your name is ${containerInput.assistantName}. Messages in the conversation history may include is_from_me="true" (your own previous messages) and is_bot="true" (messages from any bot). A message with is_bot="true" but without is_from_me="true" is from a different bot — not you. When referencing or tagging yourself, always use the name "${containerInput.assistantName}".`
@@ -1933,7 +2124,11 @@ async function main(): Promise<void> {
       : undefined;
     const parts = [...staticPromptParts, ...(modelNote ? [modelNote] : [])];
     return parts.length > 0
-      ? { type: 'preset' as const, preset: 'claude_code' as const, append: parts.join('\n\n') }
+      ? {
+          type: 'preset' as const,
+          preset: 'claude_code' as const,
+          append: parts.join('\n\n'),
+        }
       : undefined;
   }
   let sessionId = containerInput.sessionId;
@@ -1952,16 +2147,22 @@ async function main(): Promise<void> {
     promptText = `[SCHEDULED TASK - The following message was sent automatically and is not coming directly from the user or group.]\n\n${promptText}`;
   }
   // Merge any pending IPC messages (and their attachments) into the initial prompt
-  const allAttachments = containerInput.attachments ? [...containerInput.attachments] : [];
-  log(`Attachments from stdin: ${containerInput.attachments?.length ?? 0}, paths: ${(containerInput.attachments || []).map(a => a.containerPath).join(', ') || 'none'}`);
+  const allAttachments = containerInput.attachments
+    ? [...containerInput.attachments]
+    : [];
+  log(
+    `Attachments from stdin: ${containerInput.attachments?.length ?? 0}, paths: ${(containerInput.attachments || []).map((a) => a.containerPath).join(', ') || 'none'}`,
+  );
   for (const att of allAttachments) {
-    log(`  ${att.filename} (${att.mimeType}) exists=${fs.existsSync(att.containerPath)} path=${att.containerPath}`);
+    log(
+      `  ${att.filename} (${att.mimeType}) exists=${fs.existsSync(att.containerPath)} path=${att.containerPath}`,
+    );
   }
   let initialPipeIds: string[] = [];
   const pending = drainIpcInput();
   if (pending.length > 0) {
     log(`Draining ${pending.length} pending IPC messages into initial prompt`);
-    promptText += '\n' + pending.map(m => m.text).join('\n');
+    promptText += '\n' + pending.map((m) => m.text).join('\n');
     for (const m of pending) {
       if (m.attachments) allAttachments.push(...m.attachments);
       if (m.pipeId) initialPipeIds.push(m.pipeId);
@@ -1993,7 +2194,9 @@ async function main(): Promise<void> {
         newSessionId: result.newSessionId,
       });
       if (!result.compacted) {
-        log('WARNING: compact_boundary was not observed. Compaction may not have completed.');
+        log(
+          'WARNING: compact_boundary was not observed. Compaction may not have completed.',
+        );
       }
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
@@ -2039,13 +2242,16 @@ async function main(): Promise<void> {
   // stuck. Running /compact with no tools and no system prompt has a much
   // smaller overhead and can succeed where a full query cannot.
   if (sessionId) {
-    const sessionJsonlPath = path.join(SESSION_PROJECT_DIR, `${sessionId}.jsonl`);
+    const sessionJsonlPath = path.join(
+      SESSION_PROJECT_DIR,
+      `${sessionId}.jsonl`,
+    );
     try {
       const stat = fs.statSync(sessionJsonlPath);
       if (stat.size > SESSION_SIZE_COMPACT_THRESHOLD) {
         log(
           `Session JSONL is ${(stat.size / 1_000_000).toFixed(1)}MB ` +
-          `(threshold: ${(SESSION_SIZE_COMPACT_THRESHOLD / 1_000_000).toFixed(1)}MB) — auto-compacting`,
+            `(threshold: ${(SESSION_SIZE_COMPACT_THRESHOLD / 1_000_000).toFixed(1)}MB) — auto-compacting`,
         );
         try {
           const result = await runCompactQuery({
@@ -2056,9 +2262,15 @@ async function main(): Promise<void> {
             assistantName: containerInput.assistantName,
           });
           if (result.newSessionId) sessionId = result.newSessionId;
-          log(result.compacted ? 'Auto-compact succeeded' : 'Auto-compact did not produce compact_boundary');
+          log(
+            result.compacted
+              ? 'Auto-compact succeeded'
+              : 'Auto-compact did not produce compact_boundary',
+          );
         } catch (err) {
-          log(`Auto-compact failed: ${err instanceof Error ? err.message : String(err)}`);
+          log(
+            `Auto-compact failed: ${err instanceof Error ? err.message : String(err)}`,
+          );
         }
       }
     } catch {
@@ -2067,13 +2279,19 @@ async function main(): Promise<void> {
   }
 
   // Query loop: run query → wait for IPC message → run new query → repeat
-  const queryCtx: QueryContext = { mcpServerPath, containerInput, sdkEnv, buildSystemPrompt, plugins };
+  const queryCtx: QueryContext = {
+    mcpServerPath,
+    containerInput,
+    sdkEnv,
+    buildSystemPrompt,
+    plugins,
+  };
   let resumeAt: string | undefined;
   // Fallback keys tried in order on retryable errors. Hoisted outside the
   // message loop so rotation position and the active key both persist for
   // the container lifetime — once key N is exhausted, key N+1 stays active.
   const fallbackKeys = (['ANTHROPIC_API_KEY_2', 'ANTHROPIC_API_KEY_3'] as const)
-    .map(k => sdkEnv[k])
+    .map((k) => sdkEnv[k])
     .filter((k): k is string => typeof k === 'string' && k.length > 0);
   let nextFallback = 0;
   try {
@@ -2085,18 +2303,28 @@ async function main(): Promise<void> {
       let queryResult;
       for (;;) {
         try {
-          queryResult = await runQuery(prompt, sessionId, queryCtx, resumeAt, initialPipeIds);
+          queryResult = await runQuery(
+            prompt,
+            sessionId,
+            queryCtx,
+            resumeAt,
+            initialPipeIds,
+          );
           break;
         } catch (runErr) {
-          const runErrMsg = runErr instanceof Error ? runErr.message : String(runErr);
+          const runErrMsg =
+            runErr instanceof Error ? runErr.message : String(runErr);
           const keyIndex = nextFallback;
-          const rotateKey = !isPromptTooLongError(runErrMsg) &&
+          const rotateKey =
+            !isPromptTooLongError(runErrMsg) &&
             isRetryableError(runErrMsg) &&
             keyIndex < fallbackKeys.length
-            ? fallbackKeys[nextFallback++]
-            : undefined;
+              ? fallbackKeys[nextFallback++]
+              : undefined;
           if (rotateKey && sdkEnv['ANTHROPIC_API_KEY'] !== rotateKey) {
-            log(`retryable error (${runErrMsg.slice(0, 80)}), rotating to ANTHROPIC_API_KEY_${keyIndex + 2}`);
+            log(
+              `retryable error (${runErrMsg.slice(0, 80)}), rotating to ANTHROPIC_API_KEY_${keyIndex + 2}`,
+            );
             sdkEnv['ANTHROPIC_API_KEY'] = rotateKey;
           } else {
             throw runErr;
@@ -2130,7 +2358,12 @@ async function main(): Promise<void> {
       // be safely preempted.  Intermediate results (text or null) within a
       // query do NOT carry this flag, preventing premature closeStdin while
       // piped messages are still being processed.
-      writeOutput({ status: 'success', result: null, newSessionId: sessionId, idle: true });
+      writeOutput({
+        status: 'success',
+        result: null,
+        newSessionId: sessionId,
+        idle: true,
+      });
 
       log('Query ended, waiting for next IPC message...');
 
@@ -2141,7 +2374,9 @@ async function main(): Promise<void> {
         break;
       }
 
-      log(`Got new message (${nextMessage.text.length} chars), starting new query`);
+      log(
+        `Got new message (${nextMessage.text.length} chars), starting new query`,
+      );
       prompt = buildPromptContent(nextMessage.text, nextMessage.attachments);
       initialPipeIds = nextMessage.pipeIds;
     }
@@ -2156,7 +2391,12 @@ async function main(): Promise<void> {
     let summary: string | undefined;
     if (promptTooLong && sessionId) {
       const claudeDir = '/home/node/.claude';
-      const indexPath = path.join(claudeDir, 'projects', 'default', 'sessions-index.json');
+      const indexPath = path.join(
+        claudeDir,
+        'projects',
+        'default',
+        'sessions-index.json',
+      );
       summary = getSessionSummary(sessionId, indexPath) || undefined;
     }
 

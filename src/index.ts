@@ -106,7 +106,10 @@ import {
   getInMemoryGateByJid,
   resolveInMemoryGate,
 } from './ipc.js';
-import { extractMemoriesAsync } from './memory-extractor.js';
+import {
+  clearExtractionState,
+  extractMemoriesAsync,
+} from './memory-extractor.js';
 import { getMemoryBlock } from './memory-store.js';
 import {
   ensureCommitDigestTask,
@@ -163,6 +166,22 @@ import { logger } from './logger.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
+
+/** Map DB rows to NewMessage[], chronological order (getRecentMessages returns DESC). */
+function recentMessagesAsNewMessage(chatJid: string, limit = 20): NewMessage[] {
+  return getRecentMessages(chatJid, limit)
+    .map((m) => ({
+      id: m.id,
+      chat_jid: m.chat_jid,
+      sender: m.sender,
+      sender_name: m.sender_name,
+      content: m.text,
+      timestamp: m.timestamp,
+      is_from_me: !!m.is_from_me,
+      is_bot_message: !!m.is_bot_message,
+    }))
+    .reverse();
+}
 
 // Gate protocol: approval/cancel keyword patterns (module-level to avoid recompilation)
 const GATE_APPROVE_PATTERN =
@@ -1493,23 +1512,14 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   const memoryExtractionInterval = setInterval(() => {
     const snapshot = agentResponseText.trim();
     if (!snapshot) return;
-    // Reset so the next tick only sees new responses. Safe: JS strings are
-    // immutable, so extractMemoriesAsync still holds the snapshot. If the
-    // extraction is throttled or in-flight-guarded, the snapshot is lost for
-    // this tick — but bot responses are already in DB messages, and the next
-    // tick gets fresh accumulation.
+    // Reset so next tick accumulates fresh responses only.
     agentResponseText = '';
-    const recentMsgs = getRecentMessages(chatJid, 20).map((m) => ({
-      id: m.id,
-      chat_jid: m.chat_jid,
-      sender: m.sender,
-      sender_name: m.sender_name,
-      content: m.text,
-      timestamp: m.timestamp,
-      is_from_me: !!m.is_from_me,
-      is_bot_message: !!m.is_bot_message,
-    }));
-    extractMemoriesAsync(group.folder, chatJid, recentMsgs, snapshot);
+    extractMemoriesAsync(
+      group.folder,
+      chatJid,
+      recentMessagesAsNewMessage(chatJid),
+      snapshot,
+    );
   }, 60_000);
 
   let output: string | undefined;
@@ -1660,24 +1670,15 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     // Stop memory extraction interval and fire a final extraction to catch
     // any responses since the last interval tick.
     clearInterval(memoryExtractionInterval);
-    if (agentResponseText.trim()) {
-      const recentMsgs = getRecentMessages(chatJid, 20).map((m) => ({
-        id: m.id,
-        chat_jid: m.chat_jid,
-        sender: m.sender,
-        sender_name: m.sender_name,
-        content: m.text,
-        timestamp: m.timestamp,
-        is_from_me: !!m.is_from_me,
-        is_bot_message: !!m.is_bot_message,
-      }));
-      extractMemoriesAsync(
-        group.folder,
-        chatJid,
-        recentMsgs,
-        agentResponseText,
-      );
-    }
+    // Always fire final extraction — even if agentResponseText was reset by
+    // the last interval tick, DB messages still provide context for Haiku.
+    extractMemoriesAsync(
+      group.folder,
+      chatJid,
+      recentMessagesAsNewMessage(chatJid),
+      agentResponseText,
+    );
+    clearExtractionState(chatJid);
     // Always clear typing indicator — even if runAgent throws, the 8s
     // interval must stop to prevent persistent "is typing..." in Discord.
     await channel.setTyping?.(chatJid, false);
