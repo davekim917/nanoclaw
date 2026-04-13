@@ -79,7 +79,7 @@ Create a new file at `tone-profiles/{profile-name}.md` following this template:
 
 ## Emoji Usage
 
-{If agent voice: describe emoji policy. If Dave voice: "No emojis in composed text."}
+{If agent voice: describe emoji policy. If human voice: "No emojis in composed text."}
 
 ## Sample Phrases
 
@@ -97,7 +97,7 @@ Create a new file at `tone-profiles/{profile-name}.md` following this template:
 - {Thing to avoid 3}
 ```
 
-For Dave-voice profiles, omit the Emoji Usage section (no emojis is the default). For agent-voice profiles, include it.
+For human-voice profiles, omit the Emoji Usage section (no emojis is the default). For agent-voice profiles, include it.
 
 For humor/novelty profiles (like medieval), add a note that it's override-only and should not be a group default.
 
@@ -107,7 +107,7 @@ Edit `tone-profiles/selection-guide.md`:
 
 1. **Add to the selection table** (if the profile maps to a specific recipient type or context)
 2. **Add to per-response overrides** — what phrases activate this profile (e.g., "use pirate tone", "make this formal")
-3. **Add to the correct universal rules section** — Dave's Voice or Agent's Voice. If it's a humor/override-only profile, add a note under the Medieval section.
+3. **Add to the correct universal rules section** — Human Voice or Agent's Voice. If it's a humor/override-only profile, add a note under the Medieval section.
 
 ## Phase 5: Update Group Defaults (if applicable)
 
@@ -132,9 +132,9 @@ Open a PR with a summary of the new profile, its intended use, and any group def
 
 | Profile | File | Voice | Formality |
 |---------|------|-------|-----------|
-| Professional | `professional.md` | Dave | 3/5 |
-| Collaborative | `collaborative.md` | Dave | 2/5 |
-| Direct | `direct.md` | Dave | 1/5 |
+| Professional | `professional.md` | Human | 3/5 |
+| Collaborative | `collaborative.md` | Human | 2/5 |
+| Direct | `direct.md` | Human | 1/5 |
 | Engineering | `engineering.md` | Agent | 1.5/5 |
 | Assistant (Jarvis/Friday) | `assistant.md` | Agent | 1.5/5 |
 | Medieval | `medieval.md` | Agent | 5/5 (humor) |

@@ -2,22 +2,22 @@
 
 ## Default Selection Rules
 
-| Recipient / Context | Profile | Voice Owner |
-|---------------------|---------|-------------|
-| External contacts (non-team, non-clients) | professional | User |
-| Company leadership (VP+, board, exec) | professional | User |
-| Vendors or cold contacts | professional | User |
-| Team members | collaborative | User |
-| Direct peers (IC or manager) | collaborative | User |
-| Consulting clients | collaborative | User |
-| Engineers you work with daily | direct | User |
-| Personal contacts | direct | User |
+| Recipient / Context | Profile | Voice |
+|---------------------|---------|-------|
+| External contacts (non-team, non-clients) | professional | Human |
+| Company leadership (VP+, board, exec) | professional | Human |
+| Vendors or cold contacts | professional | Human |
+| Team members | collaborative | Human |
+| Direct peers (IC or manager) | collaborative | Human |
+| Consulting clients | collaborative | Human |
+| Engineers you work with daily | direct | Human |
+| Personal contacts | direct | Human |
 | Slack engineering channels | engineering | Agent |
 | Discord channels (responding to user) | assistant | Agent |
 | Discord channels (responding in group) | assistant | Agent |
 | Automated systems (no-reply) | Do not draft | — |
 | Newsletters or marketing | Do not draft | — |
-| Unknown relationship | professional | User |
+| Unknown relationship | professional | Human |
 
 ## Per-Group Defaults
 
@@ -47,7 +47,7 @@ Medieval is a humor profile — never assigned as a group default. Override only
 
 ## Universal Rules
 
-### User's Voice (professional, collaborative, direct)
+### Human Voice (professional, collaborative, direct)
 
 1. Exclamation marks allowed sparingly — where genuine emphasis fits. Not habitual.
 2. No emojis in composed text.

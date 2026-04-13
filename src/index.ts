@@ -132,6 +132,7 @@ import {
 } from './router.js';
 import { ChannelType } from './text-styles.js';
 import {
+  getActiveSession,
   restoreRemoteControl,
   startRemoteControl,
   stopRemoteControl,
@@ -2916,10 +2917,20 @@ async function main(): Promise<void> {
   ): Promise<void> {
     // Use resolveGroup to handle thread JIDs (threads resolve to parent group)
     const resolved = resolveGroup(chatJid);
-    if (!resolved?.group.isMain) {
+    if (!resolved) {
       logger.warn(
         { chatJid, sender: msg.sender },
-        'Remote control rejected: not main group',
+        'Remote control rejected: unregistered chat',
+      );
+      return;
+    }
+    const allowed =
+      resolved.group.isMain ||
+      resolved.group.containerConfig?.allowRemoteControl;
+    if (!allowed) {
+      logger.warn(
+        { chatJid, sender: msg.sender },
+        'Remote control rejected: not main group and allowRemoteControl not set',
       );
       return;
     }
@@ -2930,6 +2941,17 @@ async function main(): Promise<void> {
     if (!channel) return;
 
     if (command === '/remote-control') {
+      // URL is a live auth credential — only deliver to the chat that owns the session.
+      // No isMain override: main can stop any session but shouldn't receive a URL it didn't request.
+      const existing = getActiveSession();
+      if (existing && existing.startedInChat !== chatJid) {
+        await channel.sendMessage(
+          chatJid,
+          'Remote Control session already active from another channel.',
+          msg.id,
+        );
+        return;
+      }
       const result = await startRemoteControl(
         msg.sender,
         chatJid,
@@ -2945,6 +2967,19 @@ async function main(): Promise<void> {
         );
       }
     } else {
+      // Prevent a non-owning group from terminating another group's session.
+      const active = getActiveSession();
+      if (
+        active &&
+        !resolved.group.isMain &&
+        active.startedInChat !== chatJid
+      ) {
+        logger.warn(
+          { chatJid, sender: msg.sender },
+          'Remote control stop rejected: session started from a different chat',
+        );
+        return;
+      }
       const result = stopRemoteControl();
       if (result.ok) {
         await channel.sendMessage(

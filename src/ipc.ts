@@ -882,8 +882,12 @@ export async function processTaskIpc(
         const existingGroup = registeredGroups[data.jid];
         // Merge containerConfig so re-registering a group (e.g. to update
         // trigger) doesn't wipe tools, model, mounts, etc.
+        // Defense in depth: strip allowRemoteControl from agent-supplied config
+        // (same rationale as isMain — operator-only flag, not agent-settable).
+        const { allowRemoteControl: _arc, ...safeContainerConfig } =
+          data.containerConfig ?? {};
         const mergedConfig = data.containerConfig
-          ? { ...existingGroup?.containerConfig, ...data.containerConfig }
+          ? { ...existingGroup?.containerConfig, ...safeContainerConfig }
           : existingGroup?.containerConfig;
         deps.registerGroup(data.jid, {
           name: data.name,

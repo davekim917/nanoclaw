@@ -77,6 +77,7 @@ export interface ContainerConfig {
    * repo's `.gitignore` (idempotent, commit-safe) and creates `.claude/skills/gitnexus/`
    * (required for in-container skill wiring) — both intentional and accepted.
    */
+  allowRemoteControl?: boolean; // Allow /remote-control from this group (default: false, only main has it implicitly)
   gitnexusInjectAgentsMd?: boolean;
   /**
    * Marks this channel as the canonical auto-register template for its group folder.

@@ -304,13 +304,25 @@ Your workspace is a temporary worktree — it gets cleaned up after your session
 The host has a safety net that rescues unpushed commits to `rescue/` branches, but don't rely on it — push your own work explicitly.
 ## Tone Profiles
 
-Tone profiles define how to write — whether drafting emails as Dave or responding as the agent. Your default tone is set in the system prompt at boot. Use the `get_tone_profile` MCP tool to load the full profile when you need it.
+Two separate concepts live in the tone-profiles system:
 
-### When to load the full profile
+1. **Tone profiles** define voice and personality (formality, structure, greeting style, sample phrases, anti-patterns). Your default conversational tone is injected into the system prompt at boot.
+2. **Writing rules** define how to write like a human, not an AI (banned vocabulary, structural patterns, self-edit rule). These load automatically when you call `get_tone_profile` for any profile.
 
-- **Email drafting** (polish/rewrite, auto-draft replies) — always load via `get_tone_profile`. Use `get_tone_profile("selection-guide")` to pick the right Dave-voice profile based on the recipient.
-- **Tone override** ("use X tone") — load the requested profile via `get_tone_profile`. If no file exists, interpret X as an ad-hoc style hint.
-- **Casual conversation** — the one-liner default in your system prompt is sufficient. Don't load the full profile for every message.
+The default tone in your system prompt is for **talking to the user**. It does NOT apply to content the user's audience will read. Emails, messages drafted on the user's behalf, and written deliverables need a human voice, not the agent voice.
+
+### When to call `get_tone_profile`
+
+**MUST call** (content others will read):
+- **Email drafting** (compose, polish, rewrite, auto-draft replies) — call `get_tone_profile("selection-guide")` first to pick the right profile based on the recipient, then load that profile. The writing rules (banned AI vocabulary, structural patterns) are bundled automatically.
+- **Messages sent as the user** (Slack messages, PR descriptions, written content attributed to the user) — same as email: load the selection guide, pick the right profile, apply the writing rules.
+- **Any written deliverable** (reports, docs, proposals) — load the profile that matches the audience.
+
+**Should call** (optional):
+- **Tone override** ("use X tone") — load the requested profile. If no file exists, interpret X as an ad-hoc style hint.
+
+**Don't call** (conversational):
+- **Casual conversation with the user** — your boot-injected default is sufficient. The user knows they're talking to an AI and doesn't need human-voice treatment for chat.
 
 ### Per-Response vs Per-Session Override
 
