@@ -199,11 +199,11 @@ async function runCompactQuery(opts: {
  * This is injected into the system prompt on every invocation so that even groups with
  * globalContext:false (no /workspace/global mount) get correct formatting guidance.
  *
- * Note: for WhatsApp and Telegram, MAIN groups access the global CLAUDE.md via the
- * /workspace/project SDK auto-load (entire groups/ dir is mounted there). Non-MAIN
- * WhatsApp/Telegram groups with globalContext:true also get it via the /workspace/global
- * mount. This function covers Slack and Discord explicitly; a future non-MAIN
- * WhatsApp/Telegram group with globalContext:false would need entries added here.
+ * Note: All groups (main and non-main) receive global CLAUDE.md via explicit system
+ * prompt injection at startup (line ~1873). Groups with globalContext:false do not
+ * get the /workspace/global mount, so the injection is a no-op for them. This
+ * function covers Slack and Discord explicitly; a future non-MAIN WhatsApp/Telegram
+ * group with globalContext:false would need entries added here.
  *
  * Returns undefined for unrecognised JID prefixes — no formatting injection.
  */
@@ -1866,9 +1866,9 @@ async function main(): Promise<void> {
   }
 
   // Build systemPrompt once — chatJid and global CLAUDE.md are invariant for the container lifetime.
-  // channelFormatting is placed AFTER globalClaudeMd so it overrides the WA/Telegram formatting
-  // rule in global CLAUDE.md for Slack/Discord groups. This also ensures globalContext:false groups
-  // (no /workspace/global mount) still receive channel-appropriate formatting guidance.
+  // All groups (main and non-main) load global CLAUDE.md here; globalContext:false groups
+  // don't have /workspace/global mounted, so fs.existsSync returns false (no-op).
+  // channelFormatting is placed AFTER globalClaudeMd so it overrides formatting rules.
   const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
   const globalClaudeMd = fs.existsSync(globalClaudeMdPath)
     ? fs.readFileSync(globalClaudeMdPath, 'utf-8')

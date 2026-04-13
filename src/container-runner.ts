@@ -1505,19 +1505,10 @@ export function buildVolumeMounts(
     // the codebase and answer questions about their own architecture.
     // Only source dirs are mounted — groups/, store/, data/, .env are excluded
     // to preserve cross-group isolation.
-    const sourceDirs = ['src', 'container', 'docs', 'prompts', 'scripts'];
-    for (const dir of sourceDirs) {
-      const hostDir = path.join(projectRoot, dir);
-      if (fs.existsSync(hostDir)) {
-        mounts.push({
-          hostPath: hostDir,
-          containerPath: `/workspace/project/${dir}`,
-          readonly: true,
-        });
-      }
-    }
-    // Mount root-level files that provide useful context (version, architecture)
-    const sourceFiles = [
+    const sourceEntries = [
+      'src',
+      'container',
+      'docs',
       'package.json',
       'README.md',
       'CONTRIBUTING.md',
@@ -1525,12 +1516,12 @@ export function buildVolumeMounts(
       'AGENTS.md',
       'tsconfig.json',
     ];
-    for (const file of sourceFiles) {
-      const hostFile = path.join(projectRoot, file);
-      if (fs.existsSync(hostFile)) {
+    for (const entry of sourceEntries) {
+      const hostEntry = path.join(projectRoot, entry);
+      if (fs.existsSync(hostEntry)) {
         mounts.push({
-          hostPath: hostFile,
-          containerPath: `/workspace/project/${file}`,
+          hostPath: hostEntry,
+          containerPath: `/workspace/project/${entry}`,
           readonly: true,
         });
       }
