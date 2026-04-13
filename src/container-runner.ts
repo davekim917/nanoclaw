@@ -945,9 +945,7 @@ function isSensitiveTopLevelFilename(name: string): boolean {
  * Git worktrees store a `.git` text file: "gitdir: /path/to/.git/worktrees/<name>"
  * The canonical .git is two levels up from that entry.
  */
-function findGitWorktrees(
-  dir: string,
-): Array<{
+function findGitWorktrees(dir: string): Array<{
   name: string;
   worktreePath: string;
   canonicalRepoPath: string;
