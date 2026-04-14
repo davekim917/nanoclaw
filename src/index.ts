@@ -185,7 +185,41 @@ function recentMessagesAsNewMessage(chatJid: string, limit = 20): NewMessage[] {
 
 // Progress updates: send a brief status every N tool calls during long sessions.
 const PROGRESS_TOOL_INTERVAL = 10;
-const PROGRESS_MIN_GAP_MS = 30_000;
+const PROGRESS_MIN_GAP_MS = 60_000;
+
+/** Extract a short context string from a tool_use progress event. */
+function summarizeToolUse(toolName: string, inputJson?: string): string {
+  if (!inputJson) return toolName;
+  try {
+    const input = JSON.parse(inputJson);
+    switch (toolName) {
+      case 'Read':
+      case 'Write':
+      case 'Edit':
+        return input.file_path
+          ? `${toolName} ${path.basename(input.file_path)}`
+          : toolName;
+      case 'Bash':
+        return input.command
+          ? `Bash: ${input.command.slice(0, 60).split('\n')[0]}`
+          : toolName;
+      case 'Grep':
+        return input.pattern
+          ? `Grep "${input.pattern.slice(0, 40)}"`
+          : toolName;
+      case 'Glob':
+        return input.pattern ? `Glob ${input.pattern}` : toolName;
+      case 'Agent':
+        return input.description
+          ? `Agent: ${input.description.slice(0, 50)}`
+          : toolName;
+      default:
+        return toolName;
+    }
+  } catch {
+    return toolName;
+  }
+}
 
 // Gate protocol: approval/cancel keyword patterns (module-level to avoid recompilation)
 const GATE_APPROVE_PATTERN =
@@ -1536,6 +1570,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   let toolCallCount = 0;
   let lastProgressUpdateTs = 0;
+  const toolBreakdown = new Map<string, number>();
+  let latestToolSummary = '';
 
   let output: string | undefined;
   try {
@@ -1687,17 +1723,29 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
         if (event.eventType === 'tool_use') {
           toolCallCount++;
+          const toolName = event.data?.name || 'unknown';
+          toolBreakdown.set(toolName, (toolBreakdown.get(toolName) || 0) + 1);
+          latestToolSummary = summarizeToolUse(toolName, event.data?.input);
+
           const now = Date.now();
           if (
             toolCallCount % PROGRESS_TOOL_INTERVAL === 0 &&
             now - lastProgressUpdateTs >= PROGRESS_MIN_GAP_MS
           ) {
             lastProgressUpdateTs = now;
-            const toolName = event.data?.name || 'unknown';
+            // Build breakdown: "Read x4, Bash x3, Grep x2"
+            const breakdown = [...toolBreakdown.entries()]
+              .sort((a, b) => b[1] - a[1])
+              .slice(0, 5)
+              .map(([name, count]) => `${name} x${count}`)
+              .join(', ');
+            const latest = latestToolSummary
+              ? `. Last: ${latestToolSummary}`
+              : '';
             channel
               .sendMessage(
                 chatJid,
-                `_Still working - ${toolCallCount} tool calls (latest: ${toolName})_`,
+                `_${toolCallCount} tool calls (${breakdown}${latest})_`,
                 effectiveThreadId,
               )
               ?.catch((err: unknown) =>
