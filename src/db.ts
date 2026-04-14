@@ -478,6 +478,33 @@ function createSchema(database: Database.Database): void {
   } catch {
     /* columns already exist */
   }
+
+  // Migration: strip deprecated 'plugins' allow-list from containerConfig.
+  // All plugins now mount by default; use 'excludePlugins' deny-list instead.
+  try {
+    const rows = database
+      .prepare(
+        `SELECT jid, container_config FROM registered_groups WHERE container_config IS NOT NULL`,
+      )
+      .all() as Array<{ jid: string; container_config: string }>;
+    for (const row of rows) {
+      try {
+        const config = JSON.parse(row.container_config);
+        if (config.plugins) {
+          delete config.plugins;
+          database
+            .prepare(
+              `UPDATE registered_groups SET container_config = ? WHERE jid = ?`,
+            )
+            .run(JSON.stringify(config), row.jid);
+        }
+      } catch {
+        /* malformed JSON, skip */
+      }
+    }
+  } catch {
+    /* table doesn't exist yet or migration already applied */
+  }
 }
 
 /**

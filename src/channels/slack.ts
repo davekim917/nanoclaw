@@ -157,7 +157,7 @@ export class SlackChannel implements Channel {
       );
       const sibling = canonical ?? siblings[0];
 
-      // Deep clone so array fields (tools, additionalMounts, plugins) are not
+      // Deep clone so array fields (tools, additionalMounts, excludePlugins) are not
       // shared with the sibling. Strip notifyJid (per-jid routing; operator clears
       // target only the source jid and silently fail if clones carry the value) and
       // isAutoRegisterTemplate (must not propagate — see ContainerConfig JSDoc).

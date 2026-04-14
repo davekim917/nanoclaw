@@ -1874,13 +1874,13 @@ export function buildVolumeMounts(
   // Mount external plugin repos from ~/plugins/ read-only.
   // Each subdirectory is a separate plugin repo (e.g. bootstrap, impeccable, omni-claude-skills, codex).
   // The SDK loads skills, agents, and hooks via the `plugins` option in agent-runner.
-  // Per-group scoping: if containerConfig.plugins is set, only those repos are mounted.
+  // All plugins mount by default. excludePlugins (deny list) skips listed repos.
   if (fs.existsSync(PLUGINS_DIR)) {
-    const allowedPlugins = group.containerConfig?.plugins;
+    const excluded = group.containerConfig?.excludePlugins;
     for (const entry of fs.readdirSync(PLUGINS_DIR)) {
       const pluginPath = path.join(PLUGINS_DIR, entry);
       if (!fs.statSync(pluginPath).isDirectory()) continue;
-      if (allowedPlugins && !allowedPlugins.includes(entry)) continue;
+      if (excluded?.includes(entry)) continue;
       mounts.push({
         hostPath: pluginPath,
         containerPath: `/workspace/plugins/${entry}`,
@@ -1891,9 +1891,10 @@ export function buildVolumeMounts(
     // Mount host ~/.codex when the codex plugin is mounted, so the Codex CLI
     // can use the host's subscription OAuth session. Read-write so token
     // refreshes in auth.json persist back to the host.
-    const codexPluginAllowed =
-      !allowedPlugins || allowedPlugins.includes('codex');
-    if (codexPluginAllowed && fs.existsSync(path.join(PLUGINS_DIR, 'codex'))) {
+    if (
+      !excluded?.includes('codex') &&
+      fs.existsSync(path.join(PLUGINS_DIR, 'codex'))
+    ) {
       const hostCodexDir = path.join(homeDir, '.codex');
       if (fs.existsSync(hostCodexDir)) {
         mounts.push({
