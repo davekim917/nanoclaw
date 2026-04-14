@@ -23,60 +23,9 @@ ls -1 /home/node/.claude/skills/ 2>/dev/null || echo "No skills found"
 
 Each directory is a skill. The directory name is the skill name (e.g., `agent-browser` → `/agent-browser`).
 
-**Plugin skills** (loaded by the SDK from mounted plugin repos):
+**Plugin skills** (loaded by the SDK from mounted plugins):
 
-```bash
-python3 -c "
-import json, os
-plugins_root = '/workspace/plugins'
-if not os.path.isdir(plugins_root):
-    exit()
-for entry in sorted(os.listdir(plugins_root)):
-    repo = os.path.join(plugins_root, entry)
-    if not os.path.isdir(repo):
-        continue
-    # Collect plugin roots: direct plugin or multi-plugin repo
-    plugin_roots = []
-    if os.path.isfile(os.path.join(repo, '.claude-plugin', 'plugin.json')):
-        plugin_roots.append(repo)
-    else:
-        sub_dir = os.path.join(repo, 'plugins')
-        if os.path.isdir(sub_dir):
-            for sub in sorted(os.listdir(sub_dir)):
-                sp = os.path.join(sub_dir, sub)
-                if os.path.isdir(sp) and os.path.isfile(os.path.join(sp, '.claude-plugin', 'plugin.json')):
-                    plugin_roots.append(sp)
-    for proot in plugin_roots:
-        try:
-            with open(os.path.join(proot, '.claude-plugin', 'plugin.json')) as f:
-                cfg = json.load(f)
-        except Exception:
-            cfg = {}
-        name = cfg.get('name', os.path.basename(proot))
-        # Resolve skill directories: default ./skills/ plus declared paths
-        skill_dirs = []
-        default_skills = os.path.join(proot, 'skills')
-        if os.path.isdir(default_skills):
-            skill_dirs.append(default_skills)
-        declared = cfg.get('skills')
-        if isinstance(declared, str):
-            declared = [declared]
-        if isinstance(declared, list):
-            for d in declared:
-                resolved = os.path.normpath(os.path.join(proot, d))
-                if os.path.isdir(resolved) and resolved not in skill_dirs:
-                    skill_dirs.append(resolved)
-        skills = set()
-        for sd in skill_dirs:
-            for s in os.listdir(sd):
-                if os.path.isdir(os.path.join(sd, s)):
-                    skills.add(s)
-        if skills:
-            print(f'{name}: {", ".join(sorted(skills))}')
-" 2>/dev/null
-```
-
-Plugin skills are prefixed with the plugin name when invoked (e.g., `impeccable:polish` → `/polish`, `bootstrap-workflow:team-build` → `/team-build`). Include both built-in and plugin skills in the report.
+Check your system-reminder for any additional skills not listed in `/home/node/.claude/skills/`. The SDK loads plugin skills from `/workspace/plugins/` and lists them in your available skills context. Include these in the report, grouped by plugin name.
 
 ### 2. Available tools
 
