@@ -8,20 +8,20 @@ Single Node.js process with skill-based channel system. Channels (WhatsApp, Tele
 
 ## Key Files
 
-| File | Purpose |
-|------|---------|
-| `src/index.ts` | Orchestrator: state, message loop, agent invocation |
-| `src/channels/registry.ts` | Channel registry (self-registration at startup) |
-| `src/ipc.ts` | IPC watcher and task processing |
-| `src/router.ts` | Message formatting and outbound routing |
-| `src/config.ts` | Trigger pattern, paths, intervals |
-| `src/container-runner.ts` | Spawns agent containers with mounts |
-| `src/task-scheduler.ts` | Runs scheduled tasks |
-| `src/db.ts` | SQLite operations (schema, queries, paginated API reads) |
-| `src/web-ui.ts` | API gateway: HTTP server, SSE, WebSocket, static file serving |
-| `src/api/` | REST routes, CORS, capabilities, skills, WebSocket handler |
-| `groups/{name}/CLAUDE.md` | Per-group memory (isolated) |
-| `container/skills/` | Skills loaded inside agent containers (browser, status, formatting) |
+| File                       | Purpose                                                             |
+| -------------------------- | ------------------------------------------------------------------- |
+| `src/index.ts`             | Orchestrator: state, message loop, agent invocation                 |
+| `src/channels/registry.ts` | Channel registry (self-registration at startup)                     |
+| `src/ipc.ts`               | IPC watcher and task processing                                     |
+| `src/router.ts`            | Message formatting and outbound routing                             |
+| `src/config.ts`            | Trigger pattern, paths, intervals                                   |
+| `src/container-runner.ts`  | Spawns agent containers with mounts                                 |
+| `src/task-scheduler.ts`    | Runs scheduled tasks                                                |
+| `src/db.ts`                | SQLite operations (schema, queries, paginated API reads)            |
+| `src/web-ui.ts`            | API gateway: HTTP server, SSE, WebSocket, static file serving       |
+| `src/api/`                 | REST routes, CORS, capabilities, skills, WebSocket handler          |
+| `groups/{name}/CLAUDE.md`  | Per-group memory (isolated)                                         |
+| `container/skills/`        | Skills loaded inside agent containers (browser, status, formatting) |
 
 ## Secrets / Credentials / Proxy (OneCLI)
 
@@ -36,28 +36,28 @@ Four types of skills exist in NanoClaw. See [CONTRIBUTING.md](CONTRIBUTING.md) f
 - **Operational skills** — instruction-only workflows, always on `main` (e.g. `/setup`, `/debug`)
 - **Container skills** — loaded inside agent containers at runtime (`container/skills/`)
 
-| Skill | When to Use |
-|-------|-------------|
-| `/setup` | First-time installation, authentication, service configuration |
-| `/customize` | Adding channels, integrations, changing behavior |
-| `/debug` | Container issues, logs, troubleshooting |
-| `/update-nanoclaw` | Bring upstream NanoClaw updates into a customized install |
-| `/init-onecli` | Install OneCLI Agent Vault and migrate `.env` credentials to it |
-| `/qodo-pr-resolver` | Fetch and fix Qodo PR review issues interactively or in batch |
-| `/get-qodo-rules` | Load org- and repo-level coding rules from Qodo before code tasks |
+| Skill               | When to Use                                                       |
+| ------------------- | ----------------------------------------------------------------- |
+| `/setup`            | First-time installation, authentication, service configuration    |
+| `/customize`        | Adding channels, integrations, changing behavior                  |
+| `/debug`            | Container issues, logs, troubleshooting                           |
+| `/update-nanoclaw`  | Bring upstream NanoClaw updates into a customized install         |
+| `/init-onecli`      | Install OneCLI Agent Vault and migrate `.env` credentials to it   |
+| `/qodo-pr-resolver` | Fetch and fix Qodo PR review issues interactively or in batch     |
+| `/get-qodo-rules`   | Load org- and repo-level coding rules from Qodo before code tasks |
 
 ## Environment Variables
 
-| Variable | Purpose |
-|----------|---------|
-| `WEB_UI_TOKEN` | Auth token for the Web UI API. When set, binds to 0.0.0.0 (public). When unset, binds to 127.0.0.1 (no auth). |
-| `WEB_UI_PORT` | Port for the Web UI HTTP server (default: 3002) |
-| `WEB_UI_ORIGINS` | Comma-separated allowed CORS origins for the Web UI |
-| `WEB_UI_SENDER_NAME` | Display name for messages sent via the Web UI (default: "Web User") |
-| `OLLAMA_HOST` | Ollama server URL. When set, enables Ollama capability detection in `/api/capabilities`. |
-| `DISCORD_SLASH_CHANNEL_IDS` | Comma-separated Discord channel IDs where slash commands (`/deploy`, `/update-container`, `/update-plugins`) are accepted. |
+| Variable                    | Purpose                                                                                                                              |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `WEB_UI_TOKEN`              | Auth token for the Web UI API. When set, binds to 0.0.0.0 (public). When unset, binds to 127.0.0.1 (no auth).                        |
+| `WEB_UI_PORT`               | Port for the Web UI HTTP server (default: 3002)                                                                                      |
+| `WEB_UI_ORIGINS`            | Comma-separated allowed CORS origins for the Web UI                                                                                  |
+| `WEB_UI_SENDER_NAME`        | Display name for messages sent via the Web UI (default: "Web User")                                                                  |
+| `OLLAMA_HOST`               | Ollama server URL. When set, enables Ollama capability detection in `/api/capabilities`.                                             |
+| `DISCORD_SLASH_CHANNEL_IDS` | Comma-separated Discord channel IDs where slash commands (`/deploy`, `/update-container`, `/update-plugins`) are accepted.           |
 | `DISCORD_DEPLOY_CHANNEL_ID` | Discord channel ID where deploy status is announced after restart. Defaults to the first `DISCORD_SLASH_CHANNEL_IDS` entry if unset. |
-| `PLUGIN_UPDATE_NOTIFY_JID` | JID to notify when plugin repos are updated by the hourly system task (e.g. `dc:1234567890`). Omit to run silently. |
+| `PLUGIN_UPDATE_NOTIFY_JID`  | JID to notify when plugin repos are updated by the hourly system task (e.g. `dc:1234567890`). Omit to run silently.                  |
 
 ## Contributing
 
@@ -74,6 +74,7 @@ npm run build        # Compile TypeScript
 ```
 
 Service management:
+
 ```bash
 # macOS (launchd)
 launchctl load ~/Library/LaunchAgents/com.nanoclaw.plist
@@ -90,15 +91,15 @@ systemctl --user restart nanoclaw
 
 Every change must pass `npm run build && npm test` before any review gate. Then run gates based on change type:
 
-| Change Type | Example | Gates |
-|-------------|---------|-------|
-| Trivial | Typo, comment, config value, log message | `/simplify` only |
-| Bug fix / normal feature | New IPC command, fix race condition, add config option | `/claw-review-swarm` then `/simplify` |
+| Change Type                   | Example                                                       | Gates                                                             |
+| ----------------------------- | ------------------------------------------------------------- | ----------------------------------------------------------------- |
+| Trivial                       | Typo, comment, config value, log message                      | `/simplify` only                                                  |
+| Bug fix / normal feature      | New IPC command, fix race condition, add config option        | `/claw-review-swarm` then `/simplify`                             |
 | New subsystem / architectural | New channel type, new directory, new dependency, 4+ new files | `/best-practice-check` then `/claw-review-swarm` then `/simplify` |
 
 Run `/best-practice-check` when: 4+ new files, new directory, new dependency, or a pattern not already used in the codebase.
 
-Skip `/claw-review-swarm` only for changes where correctness is self-evident (string literals, comments, config values with no logic impact). Default: when in doubt, run it.
+Skip `/claw-review-swarm` when correctness is self-evident: string literals, comments, config values with no logic impact, or mechanical fixes provable from type signatures / return values alone (e.g., removing a dead boolean check on a `void` return). Default: when in doubt, run it.
 
 Re-run `npm run build && npm test` after fixing any gate findings, before committing.
 
@@ -117,6 +118,7 @@ When mounting host directories read-only into containers, verify that both read 
 The container buildkit caches the build context aggressively. `--no-cache` alone does NOT invalidate COPY steps — the builder's volume retains stale files. To force a truly clean rebuild, prune the builder then re-run `./container/build.sh`.
 
 <!-- gitnexus:start -->
+
 # GitNexus — Code Intelligence
 
 This project is indexed by GitNexus as **nanoclaw**. Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
@@ -153,35 +155,36 @@ This project is indexed by GitNexus as **nanoclaw**. Use the GitNexus MCP tools 
 
 ## Tools Quick Reference
 
-| Tool | When to use | Command |
-|------|-------------|---------|
-| `query` | Find code by concept | `gitnexus_query({query: "auth validation"})` |
-| `context` | 360-degree view of one symbol | `gitnexus_context({name: "validateUser"})` |
-| `impact` | Blast radius before editing | `gitnexus_impact({target: "X", direction: "upstream"})` |
-| `detect_changes` | Pre-commit scope check | `gitnexus_detect_changes({scope: "staged"})` |
-| `rename` | Safe multi-file rename | `gitnexus_rename({symbol_name: "old", new_name: "new", dry_run: true})` |
-| `cypher` | Custom graph queries | `gitnexus_cypher({query: "MATCH ..."})` |
+| Tool             | When to use                   | Command                                                                 |
+| ---------------- | ----------------------------- | ----------------------------------------------------------------------- |
+| `query`          | Find code by concept          | `gitnexus_query({query: "auth validation"})`                            |
+| `context`        | 360-degree view of one symbol | `gitnexus_context({name: "validateUser"})`                              |
+| `impact`         | Blast radius before editing   | `gitnexus_impact({target: "X", direction: "upstream"})`                 |
+| `detect_changes` | Pre-commit scope check        | `gitnexus_detect_changes({scope: "staged"})`                            |
+| `rename`         | Safe multi-file rename        | `gitnexus_rename({symbol_name: "old", new_name: "new", dry_run: true})` |
+| `cypher`         | Custom graph queries          | `gitnexus_cypher({query: "MATCH ..."})`                                 |
 
 ## Impact Risk Levels
 
-| Depth | Meaning | Action |
-|-------|---------|--------|
-| d=1 | WILL BREAK — direct callers/importers | MUST update these |
-| d=2 | LIKELY AFFECTED — indirect deps | Should test |
-| d=3 | MAY NEED TESTING — transitive | Test if critical path |
+| Depth | Meaning                               | Action                |
+| ----- | ------------------------------------- | --------------------- |
+| d=1   | WILL BREAK — direct callers/importers | MUST update these     |
+| d=2   | LIKELY AFFECTED — indirect deps       | Should test           |
+| d=3   | MAY NEED TESTING — transitive         | Test if critical path |
 
 ## Resources
 
-| Resource | Use for |
-|----------|---------|
-| `gitnexus://repo/nanoclaw/context` | Codebase overview, check index freshness |
-| `gitnexus://repo/nanoclaw/clusters` | All functional areas |
-| `gitnexus://repo/nanoclaw/processes` | All execution flows |
-| `gitnexus://repo/nanoclaw/process/{name}` | Step-by-step execution trace |
+| Resource                                  | Use for                                  |
+| ----------------------------------------- | ---------------------------------------- |
+| `gitnexus://repo/nanoclaw/context`        | Codebase overview, check index freshness |
+| `gitnexus://repo/nanoclaw/clusters`       | All functional areas                     |
+| `gitnexus://repo/nanoclaw/processes`      | All execution flows                      |
+| `gitnexus://repo/nanoclaw/process/{name}` | Step-by-step execution trace             |
 
 ## Self-Check Before Finishing
 
 Before completing any code modification task, verify:
+
 1. `gitnexus_impact` was run for all modified symbols
 2. No HIGH/CRITICAL risk warnings were ignored
 3. `gitnexus_detect_changes()` confirms changes match expected scope
@@ -207,13 +210,13 @@ To check whether embeddings exist, inspect `.gitnexus/meta.json` — the `stats.
 
 ## CLI
 
-| Task | Read this skill file |
-|------|---------------------|
-| Understand architecture / "How does X work?" | `.claude/skills/gitnexus/gitnexus-exploring/SKILL.md` |
-| Blast radius / "What breaks if I change X?" | `.claude/skills/gitnexus/gitnexus-impact-analysis/SKILL.md` |
-| Trace bugs / "Why is X failing?" | `.claude/skills/gitnexus/gitnexus-debugging/SKILL.md` |
-| Rename / extract / split / refactor | `.claude/skills/gitnexus/gitnexus-refactoring/SKILL.md` |
-| Tools, resources, schema reference | `.claude/skills/gitnexus/gitnexus-guide/SKILL.md` |
-| Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
+| Task                                         | Read this skill file                                        |
+| -------------------------------------------- | ----------------------------------------------------------- |
+| Understand architecture / "How does X work?" | `.claude/skills/gitnexus/gitnexus-exploring/SKILL.md`       |
+| Blast radius / "What breaks if I change X?"  | `.claude/skills/gitnexus/gitnexus-impact-analysis/SKILL.md` |
+| Trace bugs / "Why is X failing?"             | `.claude/skills/gitnexus/gitnexus-debugging/SKILL.md`       |
+| Rename / extract / split / refactor          | `.claude/skills/gitnexus/gitnexus-refactoring/SKILL.md`     |
+| Tools, resources, schema reference           | `.claude/skills/gitnexus/gitnexus-guide/SKILL.md`           |
+| Index, status, clean, wiki CLI commands      | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md`             |
 
 <!-- gitnexus:end -->

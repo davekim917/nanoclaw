@@ -1824,7 +1824,7 @@ export function processQueryIpc(
         const dispatchGateNotification = async () => {
           if (deps.sendInteractiveGate) {
             try {
-              const sent = await deps.sendInteractiveGate(
+              await deps.sendInteractiveGate(
                 resolvedChatJid,
                 {
                   gateId,
@@ -1834,14 +1834,10 @@ export function processQueryIpc(
                 },
                 data.threadId,
               );
-              if (sent) {
-                // sendInteractiveGate implementations call recordGatePostedMessage
-                // which sets notifiedAt — nothing more to do here.
-                persistGatePrompt();
-                return;
-              }
-              // sent === false means the channel intentionally declined the
-              // interactive path. Fall through to the text fallback.
+              // sendInteractiveGate implementations call recordGatePostedMessage
+              // which sets notifiedAt — nothing more to do here.
+              persistGatePrompt();
+              return;
             } catch (err) {
               logger.warn(
                 { gateId, sourceGroup, err },
