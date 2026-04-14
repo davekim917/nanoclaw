@@ -1572,6 +1572,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let lastProgressUpdateTs = 0;
   const toolBreakdown = new Map<string, number>();
   let latestToolSummary = '';
+  let progressTextBuffer = '';
 
   let output: string | undefined;
   try {
@@ -1721,6 +1722,14 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           }
         }
 
+        // Capture intermediate text for progress updates. These are the
+        // assistant text blocks visible in the Web UI stream — reasoning,
+        // status, findings — that don't reach the channel otherwise.
+        if (event.eventType === 'text' && event.data?.text) {
+          const t = event.data.text.trim();
+          if (t.length > 30) progressTextBuffer = t;
+        }
+
         if (event.eventType === 'tool_use') {
           toolCallCount++;
           const toolName = event.data?.name || 'unknown';
@@ -1733,21 +1742,33 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             now - lastProgressUpdateTs >= PROGRESS_MIN_GAP_MS
           ) {
             lastProgressUpdateTs = now;
-            // Build breakdown: "Read x4, Bash x3, Grep x2"
-            const breakdown = [...toolBreakdown.entries()]
-              .sort((a, b) => b[1] - a[1])
-              .slice(0, 5)
-              .map(([name, count]) => `${name} x${count}`)
-              .join(', ');
-            const latest = latestToolSummary
-              ? `. Last: ${latestToolSummary}`
-              : '';
+
+            let progressMsg: string;
+            if (progressTextBuffer) {
+              // Prefer the agent's own text — truncate to last ~300 chars
+              // and take the last complete sentence or line for readability.
+              let snippet = progressTextBuffer.slice(-300).trim();
+              const lastNewline = snippet.lastIndexOf('\n');
+              if (lastNewline > snippet.length * 0.3) {
+                snippet = snippet.slice(lastNewline + 1).trim();
+              }
+              progressMsg = `_${snippet}_ (${toolCallCount} tool calls)`;
+              progressTextBuffer = '';
+            } else {
+              // No text blocks — fall back to tool breakdown
+              const breakdown = [...toolBreakdown.entries()]
+                .sort((a, b) => b[1] - a[1])
+                .slice(0, 5)
+                .map(([name, count]) => `${name} x${count}`)
+                .join(', ');
+              const latest = latestToolSummary
+                ? `. Last: ${latestToolSummary}`
+                : '';
+              progressMsg = `_${toolCallCount} tool calls (${breakdown}${latest})_`;
+            }
+
             channel
-              .sendMessage(
-                chatJid,
-                `_${toolCallCount} tool calls (${breakdown}${latest})_`,
-                effectiveThreadId,
-              )
+              .sendMessage(chatJid, progressMsg, effectiveThreadId)
               ?.catch((err: unknown) =>
                 logger.debug(
                   { chatJid, err },
