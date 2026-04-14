@@ -50,7 +50,7 @@ for entry in sorted(os.listdir(plugins_root)):
         try:
             with open(os.path.join(proot, '.claude-plugin', 'plugin.json')) as f:
                 cfg = json.load(f)
-        except:
+        except Exception:
             cfg = {}
         name = cfg.get('name', os.path.basename(proot))
         # Resolve skill directories: default ./skills/ plus declared paths
@@ -86,7 +86,7 @@ Read the allowed tools from your SDK configuration. You always have access to:
 - **Web:** WebSearch, WebFetch
 - **Orchestration:** Task, TaskOutput, TaskStop, TeamCreate, TeamDelete, SendMessage
 - **Other:** TodoWrite, ToolSearch, Skill, NotebookEdit
-- **MCP:** mcp**nanoclaw**\* (messaging, tasks, group management)
+- **MCP:** `mcp__nanoclaw__*` (messaging, tasks, group management)
 
 ### 3. MCP server tools
 

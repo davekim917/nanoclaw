@@ -481,29 +481,34 @@ function createSchema(database: Database.Database): void {
 
   // Migration: strip deprecated 'plugins' allow-list from containerConfig.
   // All plugins now mount by default; use 'excludePlugins' deny-list instead.
+  // LIKE filter short-circuits to zero rows once migration has already applied.
   try {
     const rows = database
       .prepare(
-        `SELECT jid, container_config FROM registered_groups WHERE container_config IS NOT NULL`,
+        `SELECT jid, container_config FROM registered_groups
+         WHERE container_config IS NOT NULL AND container_config LIKE '%"plugins"%'`,
       )
       .all() as Array<{ jid: string; container_config: string }>;
-    for (const row of rows) {
-      try {
-        const config = JSON.parse(row.container_config);
-        if (config.plugins) {
-          delete config.plugins;
-          database
-            .prepare(
-              `UPDATE registered_groups SET container_config = ? WHERE jid = ?`,
-            )
-            .run(JSON.stringify(config), row.jid);
+    if (rows.length > 0) {
+      const update = database.prepare(
+        `UPDATE registered_groups SET container_config = ? WHERE jid = ?`,
+      );
+      database.transaction(() => {
+        for (const row of rows) {
+          try {
+            const config = JSON.parse(row.container_config);
+            if (config.plugins) {
+              delete config.plugins;
+              update.run(JSON.stringify(config), row.jid);
+            }
+          } catch {
+            /* malformed JSON, skip */
+          }
         }
-      } catch {
-        /* malformed JSON, skip */
-      }
+      })();
     }
   } catch {
-    /* table doesn't exist yet or migration already applied */
+    /* table doesn't exist yet */
   }
 }
 
