@@ -2690,6 +2690,18 @@ function readSecrets(
         );
       }
     }
+
+    // The manifest builder uses this to render confident auth text instead
+    // of the uncertain "pick an account yourself" fallback.
+    if (!gwsAccount) {
+      const gwsDir = path.join(os.homedir(), '.config', 'gws', 'accounts');
+      if (
+        fs.existsSync(gwsDir) &&
+        fs.readdirSync(gwsDir).some((f) => f.endsWith('.json'))
+      ) {
+        secrets.GWS_CREDENTIALS_MOUNTED = 'true';
+      }
+    }
   }
 
   // Google Cloud credentials — set GOOGLE_APPLICATION_CREDENTIALS for gcloud/gsutil.

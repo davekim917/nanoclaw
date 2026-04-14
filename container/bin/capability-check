@@ -1,0 +1,115 @@
+#!/bin/sh
+# capability-check — verify that a service's credentials are present and usable.
+# Usage: capability-check <service>   OR   capability-check --all
+# Returns structured output the agent can act on.
+# Exit 0 = verified, exit 1 = problem found (with details).
+
+check_gws() {
+  label="$1"
+  if [ -n "$GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE" ] && [ -f "$GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE" ]; then
+    echo "$label: OK — credentials at $GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE"
+  elif ls /home/node/.config/gws/accounts/*.json >/dev/null 2>&1; then
+    accounts=$(for f in /home/node/.config/gws/accounts/*.json; do basename "$f" .json; done | tr '\n' ', ' | sed 's/,$//')
+    echo "$label: OK — accounts available: $accounts"
+    echo "  hint: export GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=/home/node/.config/gws/accounts/<name>.json"
+  else
+    echo "$label: MISSING — no credential files at /home/node/.config/gws/accounts/"
+    return 1
+  fi
+}
+
+check_snowflake() {
+  if [ -f "$HOME/.snowflake/connections.toml" ]; then
+    conns=$(grep '^\[' "$HOME/.snowflake/connections.toml" 2>/dev/null | tr -d '[]' | tr '\n' ', ' | sed 's/,$//' || true)
+    echo "snowflake: OK — connections: $conns"
+  else
+    echo "snowflake: MISSING — no ~/.snowflake/connections.toml"
+    return 1
+  fi
+}
+
+check_dbt() {
+  if [ -f "$HOME/.dbt/profiles.yml" ]; then
+    echo "dbt: OK — profiles at ~/.dbt/profiles.yml"
+  else
+    echo "dbt: MISSING — no ~/.dbt/profiles.yml"
+    return 1
+  fi
+}
+
+check_github() {
+  if [ -n "$GITHUB_TOKEN" ] || [ -n "$GH_TOKEN" ]; then
+    echo "github: OK — token set"
+  else
+    echo "github: MISSING — no GITHUB_TOKEN or GH_TOKEN"
+    return 1
+  fi
+}
+
+check_render() {
+  if [ -n "$RENDER_API_KEY" ]; then
+    echo "render: OK — RENDER_API_KEY set"
+  else
+    echo "render: MISSING — no RENDER_API_KEY"
+    return 1
+  fi
+}
+
+check_railway() {
+  if [ -n "$RAILWAY_API_TOKEN" ]; then
+    echo "railway: OK — RAILWAY_API_TOKEN set"
+  else
+    echo "railway: MISSING — no RAILWAY_API_TOKEN"
+    return 1
+  fi
+}
+
+check_aws() {
+  if [ -f "$HOME/.aws/credentials" ] || [ -n "$AWS_ACCESS_KEY_ID" ]; then
+    echo "aws: OK — credentials available"
+  else
+    echo "aws: MISSING — no ~/.aws/credentials or AWS_ACCESS_KEY_ID"
+    return 1
+  fi
+}
+
+check_gcloud() {
+  if [ -n "$GOOGLE_APPLICATION_CREDENTIALS" ] && [ -f "$GOOGLE_APPLICATION_CREDENTIALS" ]; then
+    echo "gcloud: OK — service account at $GOOGLE_APPLICATION_CREDENTIALS"
+  elif ls "$HOME/.gcloud-keys/"*.json >/dev/null 2>&1; then
+    echo "gcloud: OK — keys at ~/.gcloud-keys/"
+  else
+    echo "gcloud: MISSING — no service account key found"
+    return 1
+  fi
+}
+
+check_one() {
+  case "$1" in
+    gmail|gmail-readonly) check_gws gmail ;;
+    calendar) check_gws calendar ;;
+    google-workspace) check_gws google-workspace ;;
+    snowflake) check_snowflake ;;
+    dbt) check_dbt ;;
+    github) check_github ;;
+    render) check_render ;;
+    railway) check_railway ;;
+    aws) check_aws ;;
+    gcloud) check_gcloud ;;
+    *) echo "unknown service: $1"; return 1 ;;
+  esac
+}
+
+if [ "$1" = "--all" ]; then
+  failed=0
+  for svc in gmail calendar google-workspace snowflake dbt github render railway aws gcloud; do
+    check_one "$svc" || failed=$((failed + 1))
+  done
+  [ $failed -eq 0 ] && exit 0 || exit 1
+elif [ -n "$1" ]; then
+  check_one "$1"
+else
+  echo "Usage: capability-check <service>  or  capability-check --all"
+  echo "Services: gmail, calendar, google-workspace, snowflake, dbt, github, render, railway, aws, gcloud"
+  exit 1
+fi

@@ -910,24 +910,46 @@ function buildCapabilityManifest(
   const capabilities: string[] = [];
 
   // Google Workspace services (gws CLI)
-  if (isToolEnabled(tools, 'gmail')) {
-    capabilities.push(
-      '- **Gmail (read + send)** — `gws gmail` CLI. Skills: gws-gmail-read, gws-gmail-send, gws-gmail-reply, gws-gmail-forward, gws-gmail-triage, gws-gmail-watch.',
-    );
-  } else if (isToolEnabled(tools, 'gmail-readonly')) {
-    capabilities.push(
-      '- **Gmail (read-only)** — `gws gmail` CLI. Skills: gws-gmail-read, gws-gmail-triage.',
-    );
-  }
-  if (isToolEnabled(tools, 'calendar')) {
-    capabilities.push(
-      '- **Google Calendar** — `gws calendar` CLI. Skills: gws-calendar-agenda, gws-calendar-insert.',
-    );
-  }
-  if (isToolEnabled(tools, 'google-workspace')) {
-    capabilities.push(
-      '- **Google Drive / Sheets / Docs / Slides** — `gws drive|sheets|docs|slides` CLI.',
-    );
+  // Auth is pre-wired. For scoped groups, $GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE
+  // is already set. For unscoped groups, GWS_CREDENTIALS_MOUNTED confirms
+  // credential files are present — the agent just picks an account.
+  const hasAnyGws =
+    isToolEnabled(tools, 'gmail') ||
+    isToolEnabled(tools, 'gmail-readonly') ||
+    isToolEnabled(tools, 'calendar') ||
+    isToolEnabled(tools, 'google-workspace');
+
+  if (hasAnyGws) {
+    const gwsPreset = !!secrets?.GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE;
+    const gwsMounted = gwsPreset || secrets?.GWS_CREDENTIALS_MOUNTED === 'true';
+    const gwsAuth = gwsPreset
+      ? `authenticated via \`$GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE\` (already set — credentials are working). Discover all accounts: \`ls /home/node/.config/gws/accounts/*.json\`.`
+      : gwsMounted
+        ? `credentials verified and mounted at \`/home/node/.config/gws/accounts/\`. Before the first call, select an account: \`export GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=/home/node/.config/gws/accounts/<name>.json\` (discover available accounts: \`ls /home/node/.config/gws/accounts/*.json\`).`
+        : `credential files expected at \`/home/node/.config/gws/accounts/\`. Run \`ls /home/node/.config/gws/accounts/*.json\` to check.`;
+
+    // State auth once; per-service entries reference it
+    capabilities.push(`- **Google Workspace auth** — \`gws\` CLI, ${gwsAuth}`);
+
+    if (isToolEnabled(tools, 'gmail')) {
+      capabilities.push(
+        '- **Gmail (read + send)** — `gws gmail` CLI. Common: `gws gmail +triage` (inbox summary), `gws gmail +read --message-id <ID>` (read message), `gws gmail +send --to user@example.com --subject "..." --body "..."` (send), `gws gmail +reply --message-id <ID> --body "..."` (reply). Skills: gws-gmail-read, gws-gmail-send, gws-gmail-reply, gws-gmail-forward, gws-gmail-triage, gws-gmail-watch.',
+      );
+    } else if (isToolEnabled(tools, 'gmail-readonly')) {
+      capabilities.push(
+        "- **Gmail (read-only)** — `gws gmail` CLI. Common: `gws gmail +triage` (inbox summary), `gws gmail +triage --max 5 --query 'from:boss'` (filtered), `gws gmail +read --message-id <ID>`. Skills: gws-gmail-read, gws-gmail-triage.",
+      );
+    }
+    if (isToolEnabled(tools, 'calendar')) {
+      capabilities.push(
+        "- **Google Calendar** — `gws calendar` CLI. Common: `gws calendar +agenda` (upcoming events), `gws calendar +insert --summary 'Meeting' --start '2026-01-15T09:00:00-08:00' --end '2026-01-15T10:00:00-08:00'` (create event), `gws calendar +insert ... --attendee user@example.com --meet` (with attendee + Meet link). Skills: gws-calendar-agenda, gws-calendar-insert.",
+      );
+    }
+    if (isToolEnabled(tools, 'google-workspace')) {
+      capabilities.push(
+        '- **Google Drive / Sheets / Docs / Slides** — `gws drive|sheets|docs|slides` CLI. Common: `gws drive files list --params \'{"pageSize": 5}\'` (list files), `gws sheets +read --spreadsheet <ID> --range "Sheet1!A1:D10"` (read cells), `gws sheets +append --spreadsheet <ID> --range "Sheet1" --values \'[["a","b"]]\'` (append rows), `gws docs documents get --params \'{"documentId":"..."}\'` (read doc).',
+      );
+    }
   }
 
   // Data tools
@@ -1016,6 +1038,8 @@ The following tools and services are configured for this session.
 **Tool-selection rule:** Always try the CLI / MCP / tool listed below FIRST when interacting with any of these services — your credentials are already injected. Use \`agent-browser\` ONLY when (a) no CLI/API exists for what you need, or (b) the CLI returned an explicit auth or capability error you cannot work around. Do NOT navigate to a web dashboard as a first resort — your CLIs are already authenticated and faster than a browser session.
 
 If a tool fails at runtime (auth error, missing credential, network issue), surface the error rather than retrying blindly or silently switching strategies.
+
+**Before claiming any service is unavailable, broken, or not configured, run \`capability-check <service>\` and report the output.** This command verifies credential presence independently — do not skip it. If \`capability-check\` says OK, the service works; try the CLI. If a CLI command returns an error, report the error verbatim — do not infer that the service is unconfigured. Auth errors, network timeouts, and missing credentials are different problems with different solutions. If you previously failed to use a service in this conversation, that does not mean it is broken now — run \`capability-check\` and try again.
 
 **Never request credentials in chat.** If a service needs a credential you don't have (API key, OAuth token, session cookie, dashboard login, service-account JSON), DO NOT ask the user to paste it into the conversation — credentials leak in chat history and the container can't persist them across sessions anyway. Instead: (1) name the exact secret that's missing (env var name, vault entry, or config file), (2) ask the user to configure it **on the host** — add it to NanoClaw's \`.env\` for CLI tokens and non-HTTP secrets, or the OneCLI vault for HTTP API credentials, (3) tell them to restart the container via \`/restart\` once the secret is in place. This applies to browser login pages too: if \`agent-browser\` hits a login screen for a service whose API you could be using with a proper credential, stop and report the missing credential — do not ask for username/password.
 
