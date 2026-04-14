@@ -940,6 +940,14 @@ function buildCapabilityManifest(
     capabilities.push(
       '- **dbt** — `dbt` CLI authenticated via `~/.dbt/profiles.yml`. Common: `dbt run --profile <name> --project-dir <path>`, `dbt test --profile <name> --project-dir <path>`, `dbt compile -s <model> --profile <name> --project-dir <path>`. List available profiles with `cat ~/.dbt/profiles.yml`.',
     );
+    // dbt Cloud REST API — only advertise when API key is present
+    const dbtCloudKey = secrets?.DBT_CLOUD_API_KEY;
+    if (typeof dbtCloudKey === 'string' && dbtCloudKey.length > 0) {
+      const dbtCloudUrl = secrets?.DBT_CLOUD_API_URL || 'cloud.getdbt.com';
+      capabilities.push(
+        `- **dbt Cloud API** — REST API at \`https://${dbtCloudUrl}/api/v2/\` authenticated via \`$DBT_CLOUD_API_KEY\` env var. Common: \`curl -sH "Authorization: Token $DBT_CLOUD_API_KEY" "https://${dbtCloudUrl}/api/v2/accounts/"\` (list accounts), \`.../accounts/{id}/jobs/\` (list jobs), \`.../accounts/{id}/runs/\` (list runs), \`.../accounts/{id}/jobs/{job_id}/\` (get/update job config including steps). Admin API v3 at \`/api/v3/\` for run artifacts and metadata. Login credentials also available: \`$DBT_CLOUD_EMAIL\`, \`$DBT_CLOUD_PASSWORD\`.`,
+      );
+    }
   }
 
   // Cloud
@@ -1426,6 +1434,13 @@ async function runQuery(
   let lastAssistantText = ''; // accumulate text from assistant content blocks
   let messageCount = 0;
   let resultCount = 0;
+
+  // Checkpoint nudge: count tool calls since the agent last called
+  // send_message.  When the count reaches CHECKPOINT_NUDGE_THRESHOLD,
+  // inject a lightweight reminder so the agent considers whether the
+  // user needs a status update.
+  const CHECKPOINT_NUDGE_THRESHOLD = 10;
+  let toolCallsSinceLastCheckpoint = 0;
   // Per-runQuery cumulative outputTokens snapshot, used to detect which
   // model(s) actually produced output in the latest result (we diff against
   // the prior snapshot since `modelUsage` is cumulative across the turns of
@@ -1641,6 +1656,23 @@ async function runQuery(
               input: JSON.stringify(block.input).slice(0, 2000),
               id: block.id,
             });
+            // Checkpoint nudge: track tool calls and reset on send_message
+            if (block.name?.includes('send_message')) {
+              toolCallsSinceLastCheckpoint = 0;
+            } else {
+              toolCallsSinceLastCheckpoint++;
+              if (toolCallsSinceLastCheckpoint === CHECKPOINT_NUDGE_THRESHOLD) {
+                log(
+                  `Checkpoint nudge: ${CHECKPOINT_NUDGE_THRESHOLD} tool calls without send_message — injecting reminder`,
+                );
+                stream.push(
+                  '<system-reminder>You have made ' +
+                    CHECKPOINT_NUDGE_THRESHOLD +
+                    ' tool calls without sending the user a message. Check: has your approach changed? Did something fail? Are you making a decision the user should know about? If so, use send_message to give a brief status update before continuing. If everything is progressing normally on the path the user requested, carry on.</system-reminder>',
+                );
+                toolCallsSinceLastCheckpoint = 0;
+              }
+            }
           } else if (block.type === 'thinking' && block.thinking) {
             writeProgress('thinking', { text: block.thinking.slice(0, 1000) });
           }
