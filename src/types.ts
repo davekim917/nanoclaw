@@ -303,7 +303,7 @@ export interface Channel {
   ownsJid(jid: string): boolean;
   disconnect(): Promise<void>;
   // Optional: typing indicator. Channels that support it implement it.
-  setTyping?(jid: string, isTyping: boolean): Promise<void>;
+  setTyping?(jid: string, isTyping: boolean, error?: boolean): Promise<void>;
   // Optional: snapshot the trigger message ts for emoji reactions.
   // Call before setTyping(true) so reactions target the correct message
   // even when multiple parent messages are processing in parallel.

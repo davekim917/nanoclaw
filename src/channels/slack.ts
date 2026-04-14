@@ -916,6 +916,7 @@ export class SlackChannel implements Channel {
     '⏳': 'hourglass_flowing_sand',
     '👀': 'eyes',
     '✅': 'white_check_mark',
+    '❌': 'x',
   };
 
   private async safeReaction(
@@ -945,7 +946,11 @@ export class SlackChannel implements Channel {
   // Slack doesn't have a typing indicator API for bots.
   // Instead, add/remove a reaction emoji on the triggering message
   // so the user knows the bot is processing.
-  async setTyping(jid: string, isTyping: boolean): Promise<void> {
+  async setTyping(
+    jid: string,
+    isTyping: boolean,
+    error?: boolean,
+  ): Promise<void> {
     const parsedJid = parseThreadJid(jid);
     const channelId = parsedJid
       ? parsedJid.parentId
@@ -983,10 +988,11 @@ export class SlackChannel implements Channel {
     if (isTyping) {
       await this.safeReaction('add', 'eyes', channelId, messageTs);
     } else {
-      // Swap 👀 → ✅ to signal completion (independent calls, run in parallel)
+      // Swap 👀 → ✅ (success) or 👀 → ❌ (error)
+      const doneEmoji = error ? 'x' : 'white_check_mark';
       await Promise.all([
         this.safeReaction('remove', 'eyes', channelId, messageTs),
-        this.safeReaction('add', 'white_check_mark', channelId, messageTs),
+        this.safeReaction('add', doneEmoji, channelId, messageTs),
       ]);
     }
   }

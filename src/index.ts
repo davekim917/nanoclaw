@@ -842,8 +842,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     timezone: TIMEZONE,
     deps: {
       sendMessage: (text) => channel.sendMessage(chatJid, text, triggerMsgId),
-      setTyping: (typing) =>
-        channel.setTyping?.(chatJid, typing) ?? Promise.resolve(),
+      setTyping: (typing, error?) =>
+        channel.setTyping?.(chatJid, typing, error) ?? Promise.resolve(),
       runAgent: (prompt, onOutput) =>
         runAgent(
           group,
@@ -883,8 +883,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       const restartPrompt =
         'Session restarted with fresh container mounts. Briefly acknowledge.';
       await channel.setTyping?.(chatJid, true);
+      let result: 'success' | 'error' | undefined;
       try {
-        const result = await runAgent(
+        result = await runAgent(
           group,
           restartPrompt,
           chatJid,
@@ -905,7 +906,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           );
         }
       } finally {
-        await channel.setTyping?.(chatJid, false);
+        await channel.setTyping?.(chatJid, false, result === 'error');
       }
       return true;
     }
@@ -1599,7 +1600,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               is_from_me: true,
               is_bot_message: true,
             });
-            await channel.setTyping?.(chatJid, false);
+            // Don't call setTyping(false) here — the finally block handles it
+            // with the correct error state. Calling it mid-stream would consume
+            // Slack's idempotency guard, preventing the finally block from
+            // showing ❌ if a later turn errors.
             // Remove 💭 on first output — the thread now exists as feedback
             if (!outputSentToUser && thinkingReactionMsg) {
               thinkingReactionCleared = true;
@@ -1640,7 +1644,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             );
             outputSentToUser = true;
           }
-          await channel.setTyping?.(chatJid, false);
+          // Don't call setTyping(false) here — same reason as above.
+          // The finally block will show ✅ or ❌ based on final error state.
           queue.notifyIdle(parentJid, slotLookupKey);
         }
 
@@ -1681,7 +1686,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     clearExtractionState(chatJid);
     // Always clear typing indicator — even if runAgent throws, the 8s
     // interval must stop to prevent persistent "is typing..." in Discord.
-    await channel.setTyping?.(chatJid, false);
+    // On error, signal failure so Slack shows ❌ instead of ✅.
+    await channel.setTyping?.(chatJid, false, hadError || output === 'error');
     if (idleTimer) clearTimeout(idleTimer);
     // Clean up 💭 if it wasn't already removed (error/no-output paths)
     if (thinkingReactionMsg && !thinkingReactionCleared) {
@@ -1805,14 +1811,19 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   return true;
 }
 
-// Roll back lastAgentTimestamp for any piped messages the container never acked.
+// Roll back lastAgentTimestamp for piped messages the container never responded to.
 // Sorts stranded pipes ascending, rolls back to earliest.priorCursor (the cursor
-// before the first un-acked pipe), and re-enqueues so the next container re-delivers.
-function rollbackStrandedPipes(sessionKey: string): void {
+// before the first stranded pipe), and re-enqueues so the next container re-delivers.
+// When containerErrored is true, ALL pipes (including acked) are treated as stranded
+// because ack only means "received" — a crash after ack means it never responded.
+function rollbackStrandedPipes(
+  sessionKey: string,
+  containerErrored = false,
+): void {
   const pending = pendingPipesBySession.get(sessionKey);
   if (!pending || pending.length === 0) return;
 
-  const stranded = pending.filter((p) => !p.acked);
+  const stranded = containerErrored ? pending : pending.filter((p) => !p.acked);
   if (stranded.length === 0) {
     pendingPipesBySession.delete(sessionKey);
     return;
@@ -1910,6 +1921,7 @@ async function runAgent(
       }
     : undefined;
 
+  let containerErrored = false;
   setSessionProcessing(sessionKey, group.folder, chatJid, threadId);
   try {
     const parentJid = getParentJid(chatJid);
@@ -2041,6 +2053,7 @@ async function runAgent(
               { group: group.name, error: retryOutput.error },
               'Retry after prompt_too_long also failed',
             );
+            containerErrored = true;
             return 'error';
           }
 
@@ -2054,6 +2067,7 @@ async function runAgent(
             { group: group.name, err: retryErr },
             'Retry after prompt_too_long threw',
           );
+          containerErrored = true;
           return 'error';
         }
       }
@@ -2111,12 +2125,14 @@ async function runAgent(
         { group: group.name, error: output.error },
         'Container agent error',
       );
+      containerErrored = true;
       return 'error';
     }
 
     return 'success';
   } catch (err) {
     logger.error({ group: group.name, err }, 'Agent error');
+    containerErrored = true;
     return 'error';
   } finally {
     // Skip the processing-flag clear during shutdown so recoverPendingMessages
@@ -2127,7 +2143,7 @@ async function runAgent(
     // any messages whose cursor was already rolled back by the shutdown
     // handler. Verified end-to-end via Test C round 2 (2026-04-12).
     if (!messageLoopShuttingDown) {
-      rollbackStrandedPipes(sessionKey);
+      rollbackStrandedPipes(sessionKey, containerErrored);
     }
     if (!messageLoopShuttingDown) {
       clearSessionProcessing(sessionKey);

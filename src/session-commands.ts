@@ -40,7 +40,7 @@ export interface AgentResult {
 /** Dependencies injected by the orchestrator. */
 export interface SessionCommandDeps {
   sendMessage: (text: string) => Promise<void>;
-  setTyping: (typing: boolean) => Promise<void>;
+  setTyping: (typing: boolean, error?: boolean) => Promise<void>;
   runAgent: (
     prompt: string,
     onOutput: (result: AgentResult) => Promise<void>,
@@ -186,7 +186,7 @@ export async function handleSessionCommand(opts: {
     });
   } finally {
     // Always clear typing — even if runAgent throws, the 8s interval must stop.
-    await deps.setTyping(false);
+    await deps.setTyping(false, hadCmdError || cmdOutput === 'error');
   }
 
   // Advance cursor to the command — messages AFTER it remain pending for next poll.

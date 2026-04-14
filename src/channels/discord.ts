@@ -1667,7 +1667,11 @@ export class DiscordChannel implements Channel {
     }
   }
 
-  async setTyping(jid: string, isTyping: boolean): Promise<void> {
+  async setTyping(
+    jid: string,
+    isTyping: boolean,
+    _error?: boolean,
+  ): Promise<void> {
     const existing = this.typingIntervals.get(jid);
     if (existing) {
       clearInterval(existing);

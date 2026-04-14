@@ -381,7 +381,11 @@ export class TelegramChannel implements Channel {
     }
   }
 
-  async setTyping(jid: string, isTyping: boolean): Promise<void> {
+  async setTyping(
+    jid: string,
+    isTyping: boolean,
+    _error?: boolean,
+  ): Promise<void> {
     if (!this.bot) return;
 
     const existing = this.typingIntervals.get(jid);
