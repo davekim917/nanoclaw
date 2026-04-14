@@ -76,6 +76,9 @@ export class SlackChannel implements Channel {
   // Snapshot of the message ts that received the 👀 emoji, so the ✅ swap
   // targets the correct message even if new messages arrive while processing.
   private typingMessageTs = new Map<string, string>();
+  // After a normal stop (✅), remember the ts so an error-stop from the
+  // finally block can still swap ✅ → ❌ without re-adding 👀.
+  private doneMessageTs = new Map<string, string>();
 
   private opts: ChannelOpts;
 
@@ -844,17 +847,22 @@ export class SlackChannel implements Channel {
       const threadJid = `${parentJid}:thread:${threadId}`;
       this.lastUserMessageTs.delete(threadJid);
       this.typingMessageTs.delete(threadJid);
+      this.doneMessageTs.delete(threadJid);
     } else {
       // No thread specified: clear parent-level state and all thread entries
       this.replyThreadTs.delete(parentJid);
       this.lastUserMessageTs.delete(parentJid);
       this.typingMessageTs.delete(parentJid);
+      this.doneMessageTs.delete(parentJid);
       const threadPrefix = `${parentJid}:thread:`;
       for (const key of this.lastUserMessageTs.keys()) {
         if (key.startsWith(threadPrefix)) this.lastUserMessageTs.delete(key);
       }
       for (const key of this.typingMessageTs.keys()) {
         if (key.startsWith(threadPrefix)) this.typingMessageTs.delete(key);
+      }
+      for (const key of this.doneMessageTs.keys()) {
+        if (key.startsWith(threadPrefix)) this.doneMessageTs.delete(key);
       }
     }
   }
@@ -968,11 +976,26 @@ export class SlackChannel implements Channel {
         this.lastUserMessageTs.get(lookupKey) ||
         this.lastUserMessageTs.get(baseJid);
       if (messageTs) this.typingMessageTs.set(lookupKey, messageTs);
+      // New conversation — clear stale done marker from previous run.
+      this.doneMessageTs.delete(lookupKey);
     } else {
       // Only clear if we have an active typing indicator (idempotent stop).
       // Without this check, repeated setTyping(false) calls would make
       // redundant Slack API calls on every streaming output chunk.
-      if (!this.typingMessageTs.has(lookupKey)) return;
+      if (!this.typingMessageTs.has(lookupKey)) {
+        // Guard consumed — but if error=true, swap ✅ → ❌ using the saved ts.
+        // This lets the finally block override an optimistic ✅ when a later
+        // turn errors (e.g. container crash after first output).
+        if (error && this.doneMessageTs.has(lookupKey)) {
+          const doneTs = this.doneMessageTs.get(lookupKey)!;
+          this.doneMessageTs.delete(lookupKey);
+          await Promise.all([
+            this.safeReaction('remove', 'white_check_mark', channelId, doneTs),
+            this.safeReaction('add', 'x', channelId, doneTs),
+          ]);
+        }
+        return;
+      }
       messageTs = this.typingMessageTs.get(lookupKey);
       this.typingMessageTs.delete(lookupKey);
     }
@@ -990,6 +1013,9 @@ export class SlackChannel implements Channel {
     } else {
       // Swap 👀 → ✅ (success) or 👀 → ❌ (error)
       const doneEmoji = error ? 'x' : 'white_check_mark';
+      // Must precede the await — a concurrent error-stop needs to find
+      // this entry even while the Slack API calls below are in-flight.
+      if (!error) this.doneMessageTs.set(lookupKey, messageTs);
       await Promise.all([
         this.safeReaction('remove', 'eyes', channelId, messageTs),
         this.safeReaction('add', doneEmoji, channelId, messageTs),

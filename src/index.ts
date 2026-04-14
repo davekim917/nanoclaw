@@ -1600,10 +1600,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
               is_from_me: true,
               is_bot_message: true,
             });
-            // Don't call setTyping(false) here — the finally block handles it
-            // with the correct error state. Calling it mid-stream would consume
-            // Slack's idempotency guard, preventing the finally block from
-            // showing ❌ if a later turn errors.
+            // Stop typing indicator now that we have output. The finally
+            // block may also call setTyping(false, error) later — Discord's
+            // clearInterval is idempotent, and Slack's guard allows error
+            // override (see Slack setTyping).
+            await channel.setTyping?.(chatJid, false);
             // Remove 💭 on first output — the thread now exists as feedback
             if (!outputSentToUser && thinkingReactionMsg) {
               thinkingReactionCleared = true;
@@ -1644,8 +1645,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             );
             outputSentToUser = true;
           }
-          // Don't call setTyping(false) here — same reason as above.
-          // The finally block will show ✅ or ❌ based on final error state.
+          // Stop typing indicator — agent is idle.
+          await channel.setTyping?.(chatJid, false);
           queue.notifyIdle(parentJid, slotLookupKey);
         }
 
