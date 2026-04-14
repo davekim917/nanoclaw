@@ -183,6 +183,10 @@ function recentMessagesAsNewMessage(chatJid: string, limit = 20): NewMessage[] {
     .reverse();
 }
 
+// Progress updates: send a brief status every N tool calls during long sessions.
+const PROGRESS_TOOL_INTERVAL = 10;
+const PROGRESS_MIN_GAP_MS = 30_000;
+
 // Gate protocol: approval/cancel keyword patterns (module-level to avoid recompilation)
 const GATE_APPROVE_PATTERN =
   /^(approve[d]?|yes|go|proceed|do it|send it|lgtm|ok|confirmed?|ship it)$/;
@@ -1523,6 +1527,16 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     );
   }, 60_000);
 
+  // Bot responses must be stored under the thread JID so getBotResponsesSince
+  // on subsequent turns (which query by thread JID) can find them.
+  const storageChatJid =
+    effectiveThreadId && !parseThreadJid(chatJid)
+      ? `${chatJid}:thread:${effectiveThreadId}`
+      : chatJid;
+
+  let toolCallCount = 0;
+  let lastProgressUpdateTs = 0;
+
   let output: string | undefined;
   try {
     output = await runAgent(
@@ -1589,10 +1603,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           );
           if (text) {
             await channel.sendMessage(chatJid, text, effectiveThreadId);
-            // Persist bot response so the agent has context of what it said
+            // Persist under storageChatJid (thread-qualified) so
+            // getBotResponsesSince finds these on subsequent turns.
             storeMessage({
               id: `bot-${crypto.randomUUID()}`,
-              chat_jid: chatJid,
+              chat_jid: storageChatJid,
               sender: 'bot',
               sender_name: groupAssistantName,
               content: text,
@@ -1669,6 +1684,31 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
             }
           }
         }
+
+        if (event.eventType === 'tool_use') {
+          toolCallCount++;
+          const now = Date.now();
+          if (
+            toolCallCount % PROGRESS_TOOL_INTERVAL === 0 &&
+            now - lastProgressUpdateTs >= PROGRESS_MIN_GAP_MS
+          ) {
+            lastProgressUpdateTs = now;
+            const toolName = event.data?.name || 'unknown';
+            channel
+              .sendMessage(
+                chatJid,
+                `_Still working - ${toolCallCount} tool calls (latest: ${toolName})_`,
+                effectiveThreadId,
+              )
+              ?.catch((err: unknown) =>
+                logger.debug(
+                  { chatJid, err },
+                  'Failed to send progress update',
+                ),
+              );
+          }
+        }
+
         webUI?.broadcast(sessionKey, group.folder, effectiveThreadId, event);
       },
     );
