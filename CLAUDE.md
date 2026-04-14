@@ -99,7 +99,7 @@ Every change must pass `npm run build && npm test` before any review gate. Then 
 
 Run `/best-practice-check` when: 4+ new files, new directory, new dependency, or a pattern not already used in the codebase.
 
-Skip `/claw-review-swarm` when correctness is self-evident: string literals, comments, config values with no logic impact, or mechanical fixes provable from type signatures / return values alone (e.g., removing a dead boolean check on a `void` return). Default: when in doubt, run it.
+Skip all review gates when correctness is self-evident: string literals, comments, config values with no logic impact, or mechanical fixes provable from type signatures / return values alone (e.g., removing a dead boolean check on a `void` return). Default: when in doubt, run them.
 
 Re-run `npm run build && npm test` after fixing any gate findings, before committing.
 
