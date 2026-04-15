@@ -1672,28 +1672,13 @@ export function buildVolumeMounts(
   fs.mkdirSync(groupSessionsDir, { recursive: true });
   fs.mkdirSync(path.join(groupSessionsDir, 'debug'), { recursive: true });
 
-  // Share auto-memory across all threads in a group. Claude Code writes to
-  // .claude/projects/{PROJECTS_DIR_NAME}/memory/ based on cwd (/workspace/group).
-  // Without sharing, each thread gets isolated memory lost when the thread ends.
-  // A nested bind mount overlays the thread's memory path with the group-level
-  // dir (symlinks break inside containers — target path doesn't exist).
-  const groupMemoryDir = path.join(
-    groupBaseSessionsDir,
-    'projects',
-    CLAUDE_CODE_PROJECTS_DIR,
-    'memory',
-  );
-  fs.mkdirSync(groupMemoryDir, { recursive: true });
-
   // Pre-create the thread-scoped projects dir before docker mounts the
-  // container. The deeply-nested memory mount below (containerPath
-  // /home/node/.claude/projects/<dir>/memory) requires the intermediate
-  // path to exist inside the container. Since the parent /home/node/.claude
-  // is itself a bind mount from the host, missing intermediates would be
-  // created by the docker daemon as ROOT, locking out the container's uid
-  // 1001 user from writing session jsonls — sessions then appear to "save"
-  // (in-memory state works) but vanish on exit, so resume always fails with
-  // a generic "Query closed before response received" the next time around.
+  // container. Since the parent /home/node/.claude is itself a bind mount
+  // from the host, missing intermediates would be created by the docker
+  // daemon as ROOT, locking out the container's uid 1001 user from writing
+  // session jsonls — sessions then appear to "save" (in-memory state works)
+  // but vanish on exit, so resume always fails with a generic
+  // "Query closed before response received" the next time around.
   if (threadId) {
     fs.mkdirSync(
       path.join(groupSessionsDir, 'projects', CLAUDE_CODE_PROJECTS_DIR),
@@ -1707,8 +1692,11 @@ export function buildVolumeMounts(
     CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
     // Load CLAUDE.md from additional mounted directories
     CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
-    // Enable Claude's memory feature (persists user preferences between sessions)
-    CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
+    // Disable auto-memory — curated group CLAUDE.md is the source of truth.
+    // Auto-memory creates unbounded, unreviewed context (stale project state,
+    // duplicate CLAUDE.md content, credential leaks) that consumes ~9K tokens
+    // per session with diminishing returns.
+    CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1',
     // Disable adaptive thinking — force fixed budget for deeper reasoning
     CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING: '1',
     // Max thinking budget (Opus ceiling); lower models clamp automatically
@@ -1730,8 +1718,8 @@ export function buildVolumeMounts(
     // Keys are "commit" and "pr" (singular), empty string hides attribution
     includeCoAuthoredBy: false,
     attribution: { commit: '', pr: '' },
-    // Enable background memory consolidation (auto-dream)
-    autoDreamEnabled: true,
+    // Disable background memory consolidation (auto-dream) — no auto-memory to consolidate
+    autoDreamEnabled: false,
   };
   if (!fs.existsSync(settingsFile)) {
     fs.writeFileSync(
@@ -1911,17 +1899,6 @@ export function buildVolumeMounts(
     containerPath: '/home/node/.claude',
     readonly: false,
   });
-  // Overlay the thread's memory path with the shared group memory dir.
-  // ORDERING: this MUST come after the parent /home/node/.claude mount above —
-  // Docker gives precedence to more-specific paths, so this overlays the memory
-  // subdirectory while leaving the rest of the session dir thread-scoped.
-  if (threadId) {
-    mounts.push({
-      hostPath: groupMemoryDir,
-      containerPath: `/home/node/.claude/projects/${CLAUDE_CODE_PROJECTS_DIR}/memory`,
-      readonly: false,
-    });
-  }
 
   // Consolidated gws credentials — one file per account at ~/.config/gws/accounts/{name}.json.
   // Each file has all Google scopes (Gmail, Calendar, Drive, Docs, Sheets, Slides).

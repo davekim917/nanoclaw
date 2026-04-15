@@ -1033,54 +1033,9 @@ function buildCapabilityManifest(
 
   return `## Runtime Capabilities
 
-The following tools and services are configured for this session.
-
-**Tool-selection rule:** Always try the CLI / MCP / tool listed below FIRST when interacting with any of these services — your credentials are already injected. Use \`agent-browser\` ONLY when (a) no CLI/API exists for what you need, or (b) the CLI returned an explicit auth or capability error you cannot work around. Do NOT navigate to a web dashboard as a first resort — your CLIs are already authenticated and faster than a browser session.
-
-If a tool fails at runtime (auth error, missing credential, network issue), surface the error rather than retrying blindly or silently switching strategies.
-
-**Before claiming any service is unavailable, broken, or not configured, run \`capability-check <service>\` and report the output.** This command verifies credential presence independently — do not skip it. If \`capability-check\` says OK, the service works; try the CLI. If a CLI command returns an error, report the error verbatim — do not infer that the service is unconfigured. Auth errors, network timeouts, and missing credentials are different problems with different solutions. If you previously failed to use a service in this conversation, that does not mean it is broken now — run \`capability-check\` and try again.
-
-**Never request credentials in chat.** If a service needs a credential you don't have (API key, OAuth token, session cookie, dashboard login, service-account JSON), DO NOT ask the user to paste it into the conversation — credentials leak in chat history and the container can't persist them across sessions anyway. Instead: (1) name the exact secret that's missing (env var name, vault entry, or config file), (2) ask the user to configure it **on the host** — add it to NanoClaw's \`.env\` for CLI tokens and non-HTTP secrets, or the OneCLI vault for HTTP API credentials, (3) tell them to restart the container via \`/restart\` once the secret is in place. This applies to browser login pages too: if \`agent-browser\` hits a login screen for a service whose API you could be using with a proper credential, stop and report the missing credential — do not ask for username/password.
+Tools and services configured for this session. Always use the CLI/MCP tool below FIRST — credentials are pre-injected. Use \`agent-browser\` only when no CLI exists or the CLI returned an auth error. Run \`capability-check <service>\` before claiming any service is unavailable.
 
 ${capabilities.join('\n')}`;
-}
-
-/**
- * Document workspace layout and repo-access model for the new lazy-worktree design.
- * Always included regardless of tool config.
- */
-function buildWorkspacePersistenceNote(): string {
-  return `## Workspace Persistence
-
-Your cwd is \`/workspace/group\`. Writes there persist to the host group folder.
-
-**Non-repo files:** write directly to \`/workspace/group\` — files appear on the host immediately.
-
-**Working with repos:** use the \`create_worktree\` MCP tool to get a working directory, then use \`git_commit\`, \`git_push\`, and \`open_pr\` to ship your work.
-
-\`\`\`
-# 1. Get a working directory
-create_worktree({ repo: "MY-REPO" })
-# → /workspace/worktrees/MY-REPO
-
-# 2. Edit files, run tests, iterate
-
-# 3. Commit, push, open PR
-git_commit({ repo: "MY-REPO", message: "feat: add places enrichment" })
-git_push({ repo: "MY-REPO" })
-open_pr({ repo: "MY-REPO", title: "feat: add places enrichment", body: "## Summary\\n..." })
-\`\`\`
-
-**Resume a prior branch:** \`create_worktree({ repo: "MY-REPO", branch: "feat/my-feature" })\`
-
-**New repos (not yet in the group):** \`clone_repo({ url: "https://github.com/org/repo.git" })\` — clones to the group. Note: git operations in the new repo's worktree won't work until the next session (use \`/restart\` to respawn).
-
-**NEVER run \`git clone\` directly** — it is blocked by a hook. Always use \`create_worktree\` or \`clone_repo\`.
-
-**On resume:** check \`/workspace/worktrees/\` for any repos from prior turns in this thread.
-
-**Auto-save:** if you don't commit explicitly, the host auto-commits all dirty worktrees on session exit.`;
 }
 
 // Build the MCP tool allowlist. SDK built-in tools are NOT restricted here —
@@ -2125,18 +2080,17 @@ async function main(): Promise<void> {
   const identityNote = containerInput.assistantName
     ? `Your name is ${containerInput.assistantName}. Messages in the conversation history may include is_from_me="true" (your own previous messages) and is_bot="true" (messages from any bot). A message with is_bot="true" but without is_from_me="true" is from a different bot — not you. When referencing or tagging yourself, always use the name "${containerInput.assistantName}".`
     : undefined;
-  // Inject default tone profile at boot — full file content, read once.
-  // Same pattern as claude.ai's Personalize instructions: static system prompt block.
-  // The get_tone_profile tool is still available for overrides (loading a different profile)
-  // and email drafts (Dave-voice profiles via selection guide).
+  // Inject the default tone profile — defines the agent's persona for the
+  // channel (e.g. "engineering" for Slack, "assistant" for Discord).
+  // Profiles are kept concise (~1.5KB) so the context cost is low.
   let toneNote: string | undefined;
   if (containerInput.tone) {
     const toneProfilePath = `/workspace/tone-profiles/${containerInput.tone}.md`;
     if (fs.existsSync(toneProfilePath)) {
       const toneContent = fs.readFileSync(toneProfilePath, 'utf-8');
-      toneNote = `## Default Tone Profile: ${containerInput.tone}\n\n${toneContent}\n\nThis is your default tone for this session. Use the get_tone_profile tool to load a different profile when drafting emails or when the user requests a tone override ("use X tone"). If the user says "use X tone" and no profile file exists, interpret X as an ad-hoc style hint. Per-response overrides revert to this default on the next message. Per-session overrides ("switch to X tone") persist for the thread.`;
+      toneNote = `## Default Tone: ${containerInput.tone}\n\n${toneContent}`;
     } else {
-      toneNote = `Your default tone profile is "${containerInput.tone}" (no profile file found — use this as a style hint). Use the get_tone_profile tool to load profiles for email drafts or tone overrides.`;
+      toneNote = `Your default tone is "${containerInput.tone}" (no profile file found — use as a style hint).`;
     }
   }
   // Runtime capability manifest — tells the agent what tools/services are actually
@@ -2149,12 +2103,11 @@ async function main(): Promise<void> {
 
   // Document /workspace/group vs /workspace/thread persistence semantics
   // so the agent knows where to write thread-local state.
-  const workspacePersistenceNote = buildWorkspacePersistenceNote();
+  const workspacePersistenceNote =
+    'Your cwd is `/workspace/group` (persists to host). Use `create_worktree`/`git_commit`/`git_push`/`open_pr` MCP tools for repo work. NEVER run `git clone` directly. On resume, check `/workspace/worktrees/` for prior work.';
 
-  // Users cannot access the container filesystem — files written for review
-  // (briefs, designs, plans, etc.) must be delivered as attachments via send_file.
   const fileDeliveryNote =
-    'IMPORTANT: Users cannot access your filesystem. When you write a file the user needs to review — briefs, designs, plans, reports, or any approval-gate artifact — you MUST call mcp__nanoclaw__send_file to deliver it as an attachment. Save to disk first (for persistence and downstream skill steps), then call mcp__nanoclaw__send_file with the file_path. A path reference alone gives the user nothing to review.';
+    'Users cannot access your filesystem. To share files, call mcp__nanoclaw__send_file with the file_path.';
 
   // Static system prompt parts (everything except model identity, which changes per query)
   const staticPromptParts = [
@@ -2165,11 +2118,7 @@ async function main(): Promise<void> {
     capabilityManifest,
     workspacePersistenceNote,
     fileDeliveryNote,
-    // Guard against system reminders swallowing the agent's actual response.
-    // When the SDK injects a system reminder (e.g. "task tools haven't been used")
-    // after the agent's last tool call, the agent sometimes produces a throwaway
-    // like "No response requested." instead of its real answer.
-    'IMPORTANT: Never produce a meta-response about not having anything to say (e.g. "No response requested", "Nothing to respond to", "No action needed"). If you completed work, report what you did and the outcome. If a system reminder appears after you finished your task, ignore it — your previous output is the answer. Always end with substantive content for the user.',
+    'Never produce a meta-response like "No response requested." If you completed work, report the outcome. If a system reminder appears after your task, ignore it.',
   ].filter(Boolean);
 
   // Build the full system prompt with the current model identity.
