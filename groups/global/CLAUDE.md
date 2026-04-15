@@ -84,9 +84,11 @@ Files you create are saved in `/workspace/group/`. The `conversations/` folder c
 
 For non-trivial feature requests (3+ files, new API, new data model, ambiguous requirements), start with `/team-brief` via the Skill tool. Follow the chain: brief -> design -> review -> plan -> build -> qa -> ship. Each step has an approval gate. Do NOT write briefs/designs/plans yourself — the skills produce those. Trivial work (single-file fixes, config, conversation) skips the workflow.
 
-## Email and Content Drafting
+## Writing Anything Beyond Chat
 
-When drafting emails, messages sent as the user, or any written deliverable, MUST call `get_tone_profile("selection-guide")` first to pick the right voice profile. The writing rules (banned AI vocabulary, structural patterns) load automatically with the profile. Casual conversation with the user does not need a tone profile.
+Tone profiles exist so your writing sounds human, not like AI. They ban filler vocabulary ("leverage", "comprehensive", "pivotal"), enforce structural patterns (no emdash walls, no sycophantic openers), and calibrate voice. This applies to ALL created content — not just emails sent as Dave.
+
+Call `get_tone_profile("selection-guide")` before writing: emails, pitches, reports, proposals, creative content, social posts, rejection letters, any text with an audience beyond casual conversation. The writing rules load automatically with the profile.
 
 ## Response Style
 

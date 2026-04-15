@@ -10,11 +10,11 @@ Two concepts in the system:
 1. **Tone profiles** — voice and personality (formality, structure, greeting style, anti-patterns). Your default is injected at boot.
 2. **Writing rules** — how to write like a human, not an AI (banned vocabulary, structural patterns). Loaded automatically with any profile via `get_tone_profile`.
 
-The boot-injected tone is for talking to the user. Content the user's audience will read (emails, messages on their behalf, deliverables) needs a human voice loaded via `get_tone_profile`.
+The boot-injected tone is for casual conversation. Any created content beyond chat needs human-voice treatment via `get_tone_profile` — the profiles exist so your writing sounds human, not so you impersonate the user.
 
 ## When to call `get_tone_profile`
 
-**Content others will read** — call `get_tone_profile("selection-guide")` first to pick the right profile, then load it. Writing rules bundle automatically. Applies to: email drafting, messages sent as the user, reports, docs, proposals, social media posts.
+**Any created content** — call `get_tone_profile("selection-guide")` first to pick the right profile, then load it. Writing rules (banned AI vocabulary, structural patterns) bundle automatically. Applies to: emails, pitches, reports, proposals, creative content, social posts, rejection letters, any text with an audience beyond casual chat.
 
 **Tone override** — user says "use X tone": load the requested profile. If no file exists, treat X as an ad-hoc style hint.
 
@@ -27,4 +27,4 @@ The boot-injected tone is for talking to the user. Content the user's audience w
 
 ## Available Profiles
 
-`list_tone_profiles` shows current profiles. Known: professional, collaborative, direct, engineering, assistant, medieval.
+`list_tone_profiles` shows current profiles. Known: professional, collaborative, direct, engineering, assistant, spark, reel, medieval.

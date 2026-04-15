@@ -1,148 +1,86 @@
 ---
 name: add-tone-profile
-description: Create a new tone profile for email drafting or agent personality. Guides through writing style analysis, profile creation, and integration with the selection guide and group defaults.
+description: Create a new tone profile for any content type — marketing copy, video scripts, emails, agent personas, or custom voices. Guides through writing style analysis, profile creation, and integration with the selection guide. Use when the user wants a new tone, voice, writing style, or persona added to the system. Also triggers on "create a tone for X", "add a voice for Y", "new writing style".
 ---
 
 # Add Tone Profile
 
-This skill creates a new tone profile by analyzing writing samples, defining voice characteristics, and integrating the profile into the tone system.
+Creates a new tone profile by analyzing writing patterns (optional), defining voice characteristics, and wiring it into the tone system.
 
-## Overview
+Tone profiles exist so generated content sounds human, not AI. They ban fingerprint vocabulary, enforce natural structure, and calibrate voice for the audience. They are NOT about impersonating any specific person — the writing samples are training data for human-sounding output.
 
-Tone profiles live at `tone-profiles/` in the repo root. Each is a markdown file defining voice, structure, sample phrases, and anti-patterns. The selection guide (`tone-profiles/selection-guide.md`) routes agents to the right profile, and group defaults are set in `groups/global/CLAUDE.md`.
+## Where profiles live
+
+- Profile files: `tone-profiles/*.md` in the repo root
+- Selection guide: `tone-profiles/selection-guide.md` (routes agents to the right profile)
+- Group persona defaults: set via `containerConfig.tone` in the registered_groups DB (not in CLAUDE.md)
 
 ## Phase 1: Understand the Profile
 
-Use `AskUserQuestion` to gather requirements:
+Gather requirements:
 
-1. **What is this profile for?** (e.g., "a fun tone for Slack with engineers", "formal tone for investor emails", "a pirate voice for laughs")
-2. **Whose voice is it?** Dave's voice (for emails/messages sent as Dave) or the agent's own voice (for responses in channels)?
-3. **Who is the audience?** (engineers, executives, friends, specific team, etc.)
-4. **Should it be a group default or override-only?** If group default, which groups?
-5. **Any specific traits or constraints?** (e.g., "playful but not silly", "use emojis", "no corporate jargon")
-6. **Do you want me to analyze existing writing samples first?** If yes, ask where to find them (Discord channels, Slack threads, email accounts, or paste examples directly).
+1. **What is this profile for?** (e.g., "LinkedIn posts", "video scripts", "formal investor emails", "a pirate voice for laughs")
+2. **Who is the audience?** (engineers, investors, social media followers, viewers, etc.)
+3. **Agent voice or human voice?** Agent = the bot's personality in a channel. Human = content the bot creates (emails, posts, scripts, deliverables).
+4. **Should it be a group default persona or on-demand only?** Group defaults are injected every session. On-demand profiles load via `get_tone_profile`.
+5. **Any specific traits or constraints?** (e.g., "punchy and hook-driven", "conversational spoken rhythm", "no corporate jargon")
+6. **Analyze existing writing samples?** If yes, ask where to find them.
 
 ## Phase 2: Analyze Writing Samples (Optional)
 
 If the user wants the profile based on real writing patterns:
 
-### From Discord/Slack Messages
-- Use `mcp__nanoclaw__search_threads` and `mcp__nanoclaw__read_thread` to find messages from the target voice
-- Analyze 30-50+ messages for patterns:
-  - Greeting and sign-off style
-  - Sentence structure and length
-  - Formality level (1-5 scale)
-  - Punctuation habits
-  - Common phrases and vocabulary
-  - What they NEVER do (anti-patterns)
+- **Chat history:** Use `mcp__nanoclaw__search_threads` and `mcp__nanoclaw__read_thread` to find 30-50+ messages
+- **Email:** Search `in:sent` via Gmail tools for 20-30 substantive sent emails
+- **Pasted examples:** User provides 5-10 samples directly
 
-### From Email
-- If Gmail MCP tools are available, search `in:sent` for the relevant account
-- Read 20-30 sent emails with substantive content
-- Same pattern analysis as above
+Extract patterns: greeting/sign-off style, sentence structure and length, formality (1-5), punctuation habits, common phrases, and anti-patterns (what they never do).
 
-### From Pasted Examples
-- The user pastes 5-10 sample messages/emails
-- Extract the same patterns
-
-Summarize findings before proceeding to confirm accuracy.
+Summarize findings and confirm accuracy before writing the profile.
 
 ## Phase 3: Write the Profile
 
-Create a new file at `tone-profiles/{profile-name}.md` following this template:
+Create `tone-profiles/{profile-name}.md`. Keep it concise (~30-45 lines). The agent is smart — explain the voice, give structure guidance, show a few examples, and list anti-patterns. No need for exhaustive templates.
 
-```markdown
-# Tone Profile: {Name}
+Key sections:
+- **Voice** — 2-3 sentences describing what the voice sounds like
+- **Formality** — 1-5 scale
+- **Structure** — how sentences and paragraphs should be organized
+- **Personality** — specific traits with brief examples
+- **Anti-Patterns** — what to avoid (the most useful section for preventing AI-sounding output)
+- **Platform Calibration** — if the profile spans multiple platforms (e.g., LinkedIn vs X), note the differences
 
-**Use for:** {When to use this profile — audience, context, channels}
+For agent-voice profiles (channel personas), include emoji and greeting/sign-off guidance.
 
-## Voice
-
-{2-3 sentence description of the voice. What does it sound like? What's the personality?}
-
-## Formality: {1-5}/5
-
-## Structure
-
-- {How sentences are structured}
-- {Paragraph length}
-- {List usage}
-- {Any formatting preferences}
-
-## Greeting
-
-{Default greeting, or "None"}
-
-## Sign-off
-
-{Default sign-off, or "None"}
-
-## Emoji Usage
-
-{If agent voice: describe emoji policy. If human voice: "No emojis in composed text."}
-
-## Sample Phrases
-
-- "{Example 1}"
-- "{Example 2}"
-- "{Example 3}"
-- "{Example 4}"
-- "{Example 5}"
-- "{Example 6}"
-
-## Anti-Patterns (NEVER use)
-
-- {Thing to avoid 1}
-- {Thing to avoid 2}
-- {Thing to avoid 3}
-```
-
-For human-voice profiles, omit the Emoji Usage section (no emojis is the default). For agent-voice profiles, include it.
-
-For humor/novelty profiles (like medieval), add a note that it's override-only and should not be a group default.
+For humor/novelty profiles, note that it's override-only.
 
 ## Phase 4: Update the Selection Guide
 
 Edit `tone-profiles/selection-guide.md`:
 
-1. **Add to the selection table** (if the profile maps to a specific recipient type or context)
-2. **Add to per-response overrides** — what phrases activate this profile (e.g., "use pirate tone", "make this formal")
-3. **Add to the correct universal rules section** — Human Voice or Agent's Voice. If it's a humor/override-only profile, add a note under the Medieval section.
+1. Add a row to the selection table mapping recipient/context to the new profile
+2. Add per-response override phrases (e.g., "use spark tone" / "make this punchy")
+3. Confirm it falls under the correct universal rules section (Human Voice or Agent's Voice)
 
-## Phase 5: Update Group Defaults (if applicable)
+## Phase 5: Set as Group Default (if applicable)
 
-If the profile should be a group default:
+If the profile should be a channel persona (injected at boot):
 
-1. Edit `groups/global/CLAUDE.md`
-2. Find the "Group Defaults" table under "## Tone Profiles"
-3. Update the relevant group rows to point to the new profile
+Group persona defaults are configured via `containerConfig.tone` in the `registered_groups` SQLite table, not in CLAUDE.md. Use the main agent's `register_group` or `update_group` MCP tool, or edit via `/remote-control`.
 
-## Phase 6: Commit and PR
+## Phase 6: Save
 
-```bash
-git add tone-profiles/{profile-name}.md tone-profiles/selection-guide.md
-git add groups/global/CLAUDE.md  # if group defaults changed
-git commit -m "feat: add {profile-name} tone profile"
-git push
-```
+Since tone profiles are git-tracked files in the NanoClaw repo and container agents have read-only access to the project root, use `/remote-control` to commit and push, or use the MCP git tools if available.
 
-Open a PR with a summary of the new profile, its intended use, and any group default changes.
+## Existing Profiles
 
-## Existing Profiles (Reference)
-
-| Profile | File | Voice | Formality |
-|---------|------|-------|-----------|
-| Professional | `professional.md` | Human | 3/5 |
-| Collaborative | `collaborative.md` | Human | 2/5 |
-| Direct | `direct.md` | Human | 1/5 |
-| Engineering | `engineering.md` | Agent | 1.5/5 |
-| Assistant (Jarvis/Friday) | `assistant.md` | Agent | 1.5/5 |
-| Medieval | `medieval.md` | Agent | 5/5 (humor) |
-
-## Key Files
-
-| File | Purpose |
-|------|---------|
-| `tone-profiles/*.md` | Individual profile definitions |
-| `tone-profiles/selection-guide.md` | Routing logic, overrides, universal rules |
-| `groups/global/CLAUDE.md` | Group default assignments |
+| Profile | Voice | Formality | Use Case |
+|---------|:-----:|:---------:|----------|
+| professional | Human | 3/5 | External, leadership, vendors, formal |
+| collaborative | Human | 2/5 | Peers, clients, cross-functional |
+| direct | Human | 1/5 | Daily coworkers, personal |
+| spark | Human | 2/5 | LinkedIn, X, pitches, marketing, launches |
+| reel | Human | 1.5/5 | Video scripts, demos, tutorials, presentations |
+| engineering | Agent | 1.5/5 | Slack engineering channels |
+| assistant | Agent | 1.5/5 | Discord channels (Jarvis/Friday) |
+| medieval | Agent | 5/5 | Humor override only |

@@ -15,8 +15,9 @@
 | Slack engineering channels | engineering | Agent |
 | Discord channels (responding to user) | assistant | Agent |
 | Discord channels (responding in group) | assistant | Agent |
+| LinkedIn, X/Twitter, launch copy, pitches | spark | Human |
+| Video scripts, demos, tutorials, presentations | reel | Human |
 | Automated systems (no-reply) | Do not draft | — |
-| Newsletters or marketing | Do not draft | — |
 | Unknown relationship | professional | Human |
 
 ## Per-Group Defaults
@@ -39,6 +40,8 @@ The user can override the default tone for any single response:
 - "use engineering tone" / "keep it technical" → engineering
 - "use assistant tone" / "be Jarvis" → assistant
 - "use medieval tone" / "make this medieval" / "ye olde" → medieval
+- "use spark tone" / "make this punchy" / "LinkedIn post" → spark
+- "use reel tone" / "video script" / "demo script" → reel
 - "make this casual" → direct
 
 The override applies to the current response only. The group default resumes on the next interaction.
