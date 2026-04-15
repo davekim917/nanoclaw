@@ -437,13 +437,16 @@ function createPreCompactHook(
   };
 }
 
+/** Matches ANTHROPIC_API_KEY and all _N variants (e.g. _2, _5). */
+const ANTHROPIC_KEY_RE = /^ANTHROPIC_API_KEY(_\d+)?$/;
+/** Matches only the _N fallback variants (excludes the base key). */
+const ANTHROPIC_FALLBACK_RE = /^ANTHROPIC_API_KEY_(\d+)$/;
+
 // Secrets to strip from Bash tool subprocess environments.
 // These are needed by claude-code for API auth but should never
 // be visible to commands Kit runs.
 const SECRET_ENV_VARS = [
-  ...Object.keys(process.env).filter((k) =>
-    /^ANTHROPIC_API_KEY(_\d+)?$/.test(k),
-  ),
+  ...Object.keys(process.env).filter((k) => ANTHROPIC_KEY_RE.test(k)),
   'CLAUDE_CODE_OAUTH_TOKEN',
   'GMAIL_OAUTH_PATH',
   'GMAIL_CREDENTIALS_PATH',
@@ -2318,13 +2321,12 @@ async function main(): Promise<void> {
   // message loop so rotation position and the active key both persist for
   // the container lifetime — once key N is exhausted, key N+1 stays active.
   const fallbackKeys = Object.keys(sdkEnv)
-    .filter((k) => /^ANTHROPIC_API_KEY_\d+$/.test(k))
+    .filter((k) => ANTHROPIC_FALLBACK_RE.test(k) && sdkEnv[k]?.length)
     .sort((a, b) => {
-      const numA = parseInt(a.replace('ANTHROPIC_API_KEY_', ''), 10);
-      const numB = parseInt(b.replace('ANTHROPIC_API_KEY_', ''), 10);
+      const numA = Number(a.match(ANTHROPIC_FALLBACK_RE)![1]);
+      const numB = Number(b.match(ANTHROPIC_FALLBACK_RE)![1]);
       return numA - numB;
     })
-    .filter((k) => typeof sdkEnv[k] === 'string' && sdkEnv[k]!.length > 0)
     .map((k) => ({ name: k, value: sdkEnv[k]! }));
   let nextFallback = 0;
   try {

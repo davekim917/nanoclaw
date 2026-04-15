@@ -208,6 +208,7 @@ ${existingSection}
 - Be selective — only save things that would be useful in a future conversation
 - Do NOT extract transient task details (e.g., "user asked me to fix a bug")
 - Do NOT extract information the assistant said — only facts from the user or confirmed decisions
+- Do NOT assume or assign gender/pronouns — use "they" or the person's name unless the user explicitly states pronouns
 
 Reply with ONLY a JSON array (no markdown fences, no explanation):
 [

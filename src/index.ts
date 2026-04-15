@@ -1319,10 +1319,23 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   const latestMessageText =
     missedMessages[missedMessages.length - 1]?.content ?? '';
+  // Include participant names in the memory query so person-specific memories
+  // (pronouns, preferences, roles) surface even when the message topic is
+  // unrelated to the person.
+  const participantNames = [
+    ...new Set(
+      missedMessages
+        .filter((m) => !m.is_from_me && !m.is_bot_message && m.sender_name)
+        .map((m) => m.sender_name),
+    ),
+  ];
+  const memoryQuery = participantNames.length
+    ? `${participantNames.join(' ')} ${latestMessageText}`
+    : latestMessageText;
   const crossGroup = group.containerConfig?.globalContext === true;
   const memoryBlock = await getMemoryBlock(
     group.folder,
-    latestMessageText,
+    memoryQuery,
     crossGroup,
   );
 

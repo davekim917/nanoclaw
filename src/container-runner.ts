@@ -2589,7 +2589,7 @@ function readSecrets(
       : []),
     // Anthropic API key + base URL — passed directly to the SDK via sdkEnv.
     // When set, these bypass the OneCLI proxy for Claude API calls.
-    // ANTHROPIC_API_KEY_N variants are fallbacks cycled on 429/upstream errors.
+    // ANTHROPIC_API_KEY + _N fallback variants, cycled on 429/upstream errors.
     ...Object.keys(
       readEnvFileMatching((k) => /^ANTHROPIC_API_KEY(_\d+)?$/.test(k)),
     ),
