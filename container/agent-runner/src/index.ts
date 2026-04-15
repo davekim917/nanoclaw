@@ -147,7 +147,7 @@ function toCliAlias(model: string): string {
 }
 
 /** Session JSONL size (bytes) above which auto-compact fires before the query. */
-const SESSION_SIZE_COMPACT_THRESHOLD = 3_200_000; // ~3.2 MB ≈ 800K tokens (80% of 1M context)
+const SESSION_SIZE_COMPACT_THRESHOLD = 3_000_000; // 3 MB (~750K tokens)
 
 /** Container-side path to the session project directory. */
 const SESSION_PROJECT_DIR = '/home/node/.claude/projects/-workspace-group';
