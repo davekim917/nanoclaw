@@ -3,9 +3,10 @@
 
 FROM node:22-trixie-slim
 
-# Install system dependencies for Chromium
+# Install system dependencies for Chromium and video rendering (ffmpeg for Remotion)
 RUN apt-get update && apt-get install -y \
     chromium \
+    ffmpeg \
     fonts-liberation \
     fonts-noto-cjk \
     fonts-noto-color-emoji \
