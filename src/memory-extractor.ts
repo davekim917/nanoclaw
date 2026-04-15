@@ -12,7 +12,7 @@ import path from 'path';
 import { listMemories } from './db.js';
 import { callHaiku } from './llm.js';
 import { logger } from './logger.js';
-import { saveMemory, updateMemory } from './memory-store.js';
+import { deleteMemory, saveMemory, updateMemory } from './memory-store.js';
 import { Memory, NewMessage } from './types.js';
 
 // Rate limit: one extraction per thread (chatJid) per 60 seconds.
@@ -37,6 +37,7 @@ const PROMPT_TEMPLATE_PATH = path.join(
 );
 
 const VALID_TYPES = new Set(['user', 'feedback', 'project', 'reference']);
+const MEMORY_CONTENT_PREVIEW_CHARS = 200;
 
 interface ExtractedSave {
   action: 'save';
@@ -52,7 +53,16 @@ interface ExtractedUpdate {
   fields: Partial<Pick<Memory, 'type' | 'name' | 'description' | 'content'>>;
 }
 
-type Extracted = ExtractedSave | ExtractedUpdate | { action: 'skip' };
+interface ExtractedDelete {
+  action: 'delete';
+  id: string;
+}
+
+type Extracted =
+  | ExtractedSave
+  | ExtractedUpdate
+  | ExtractedDelete
+  | { action: 'skip' };
 
 /**
  * Fire-and-forget entry point. Call after every successful agent response.
@@ -108,6 +118,7 @@ async function extractMemories(
 
     let saved = 0;
     let updated = 0;
+    let deleted = 0;
 
     for (const item of extracted) {
       if (item.action === 'skip') continue;
@@ -135,19 +146,22 @@ async function extractMemories(
           );
           saved++;
         }
-      }
-
-      if (item.action === 'update') {
+      } else if (item.action === 'update') {
         if (!item.id || !item.fields) continue;
-        if (!existing.find((m) => m.id === item.id)) continue;
+        if (!existing.some((m) => m.id === item.id)) continue;
         updateMemory(groupFolder, item.id, item.fields);
         updated++;
+      } else if (item.action === 'delete') {
+        if (!item.id) continue;
+        if (!existing.some((m) => m.id === item.id)) continue;
+        deleteMemory(groupFolder, item.id);
+        deleted++;
       }
     }
 
-    if (saved > 0 || updated > 0) {
+    if (saved > 0 || updated > 0 || deleted > 0) {
       logger.info(
-        { groupFolder, chatJid, saved, updated },
+        { groupFolder, chatJid, saved, updated, deleted },
         'Memory extraction complete',
       );
     }
@@ -183,7 +197,9 @@ function buildPrompt(
       ? `\n## Existing Memories (do not duplicate)\n${formatExistingMemories(existing)}\n`
       : '';
 
-  return `You are a memory extraction system. Analyze this conversation and extract facts worth remembering for future conversations with this user/group.
+  return `You are a memory extraction system. Analyze this conversation and decide what to remember, update, or delete for future conversations.
+
+Today's date: ${new Date().toISOString().slice(0, 10)}
 
 ## Conversation
 <messages>
@@ -194,7 +210,7 @@ ${formatMessages(messages)}
 ${agentResponse.slice(-2000)}
 </latest_assistant_response>
 ${existingSection}
-## What to Extract
+## Types
 
 - *user*: Facts about people — name, role, preferences, expertise, relationships, communication style
 - *project*: Company/project info — tech stack, architecture, decisions, deadlines, what's being worked on
@@ -203,17 +219,22 @@ ${existingSection}
 
 ## Rules
 
-- Only extract NEW facts not already covered by existing memories
-- If new info refines an existing memory, return an UPDATE with the memory id
-- Be selective — only save things that would be useful in a future conversation
+- Only extract facts from USER messages or confirmed decisions — never from assistant output alone
+- Attribute facts to the correct person — "I prefer X" said by [user] Alice means Alice prefers X, not anyone else
+- Do NOT assume or infer attributes not explicitly stated (e.g., gender, age, ethnicity) — use "they" or the person's name
+- Be selective — only save things useful in a future conversation
 - Do NOT extract transient task details (e.g., "user asked me to fix a bug")
-- Do NOT extract information the assistant said — only facts from the user or confirmed decisions
-- Do NOT assume or assign gender/pronouns — use "they" or the person's name unless the user explicitly states pronouns
+- When new information CONTRADICTS an existing memory, DELETE the old memory and SAVE the corrected version
+- When new information REFINES an existing memory (adds detail, same direction), UPDATE it
+- If a fact is already covered by an existing memory with no new information, skip it
+
+## Actions
 
 Reply with ONLY a JSON array (no markdown fences, no explanation):
 [
   {"action": "save", "type": "user", "name": "short name", "description": "one-line why this matters", "content": "the fact"},
-  {"action": "update", "id": "mem-xxx", "fields": {"content": "refined fact"}}
+  {"action": "update", "id": "mem-xxx", "fields": {"content": "refined fact"}},
+  {"action": "delete", "id": "mem-xxx"}
 ]
 
 If nothing is worth extracting, reply with: []`;
@@ -231,7 +252,13 @@ function formatMessages(messages: NewMessage[]): string {
 
 function formatExistingMemories(memories: Memory[]): string {
   return memories
-    .map((m) => `[${m.id}] (${m.type}) ${m.name}: ${m.description}`)
+    .map((m) => {
+      const content =
+        m.content.length > MEMORY_CONTENT_PREVIEW_CHARS
+          ? m.content.slice(0, MEMORY_CONTENT_PREVIEW_CHARS) + '…'
+          : m.content;
+      return `[${m.id}] (${m.type}) ${m.name}: ${content}`;
+    })
     .join('\n');
 }
 
@@ -262,6 +289,7 @@ function parseResponse(raw: string): Extracted[] {
         typeof item === 'object' &&
         (item.action === 'save' ||
           item.action === 'update' ||
+          item.action === 'delete' ||
           item.action === 'skip'),
     ) as Extracted[];
   } catch {

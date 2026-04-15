@@ -1686,17 +1686,25 @@ export function buildVolumeMounts(
     );
   }
 
+  // Share auto-memory across all threads in a group. Claude Code writes to
+  // .claude/projects/{PROJECTS_DIR}/memory/ based on cwd (/workspace/group).
+  // Without sharing, each thread gets isolated memory lost when the thread ends.
+  // A nested bind mount (added after the parent .claude mount) overlays the
+  // thread's memory path with the group-level dir.
+  const groupMemoryDir = path.join(
+    groupBaseSessionsDir,
+    'projects',
+    CLAUDE_CODE_PROJECTS_DIR,
+    'memory',
+  );
+  fs.mkdirSync(groupMemoryDir, { recursive: true });
+
   const settingsFile = path.join(groupSessionsDir, 'settings.json');
   const requiredEnv: Record<string, string> = {
     // Enable agent swarms (subagent orchestration)
     CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
     // Load CLAUDE.md from additional mounted directories
     CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
-    // Disable auto-memory — curated group CLAUDE.md is the source of truth.
-    // Auto-memory creates unbounded, unreviewed context (stale project state,
-    // duplicate CLAUDE.md content, credential leaks) that consumes ~9K tokens
-    // per session with diminishing returns.
-    CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1',
     // Disable adaptive thinking — force fixed budget for deeper reasoning
     CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING: '1',
     // Max thinking budget (Opus ceiling); lower models clamp automatically
@@ -1718,8 +1726,10 @@ export function buildVolumeMounts(
     // Keys are "commit" and "pr" (singular), empty string hides attribution
     includeCoAuthoredBy: false,
     attribution: { commit: '', pr: '' },
-    // Disable background memory consolidation (auto-dream) — no auto-memory to consolidate
-    autoDreamEnabled: false,
+    // Enable background memory consolidation (auto-dream) — periodically
+    // prunes stale notes, resolves contradictions, and keeps MEMORY.md
+    // under 200 lines so auto-memory stays useful over time.
+    autoDreamEnabled: true,
   };
   if (!fs.existsSync(settingsFile)) {
     fs.writeFileSync(
@@ -1735,6 +1745,14 @@ export function buildVolumeMounts(
       for (const [key, value] of Object.entries(requiredEnv)) {
         if (settings.env[key] !== value) {
           settings.env[key] = value;
+          changed = true;
+        }
+      }
+      // Clean up env vars that were previously required but are now removed.
+      // CLAUDE_CODE_DISABLE_AUTO_MEMORY was removed to re-enable auto-memory.
+      for (const staleKey of ['CLAUDE_CODE_DISABLE_AUTO_MEMORY']) {
+        if (staleKey in settings.env) {
+          delete settings.env[staleKey];
           changed = true;
         }
       }
@@ -1913,6 +1931,17 @@ export function buildVolumeMounts(
     containerPath: '/home/node/.claude',
     readonly: false,
   });
+  // Overlay the thread's memory path with the shared group memory dir.
+  // ORDERING: MUST come after the parent /home/node/.claude mount above —
+  // Docker gives precedence to more-specific paths, so this overlays the
+  // memory subdirectory while leaving the rest of the session dir thread-scoped.
+  if (threadId) {
+    mounts.push({
+      hostPath: groupMemoryDir,
+      containerPath: `/home/node/.claude/projects/${CLAUDE_CODE_PROJECTS_DIR}/memory`,
+      readonly: false,
+    });
+  }
 
   // Consolidated gws credentials — one file per account at ~/.config/gws/accounts/{name}.json.
   // Each file has all Google scopes (Gmail, Calendar, Drive, Docs, Sheets, Slides).

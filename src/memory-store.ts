@@ -85,7 +85,7 @@ export function formatMemoryBlock(memories: Memory[]): string {
   const items = memories
     .map(
       (m) =>
-        `  <memory type="${escapeXml(m.type)}" name="${escapeXml(m.name)}" updated="${m.updated_at.slice(0, 10)}">\n    ${escapeXml(m.content)}\n  </memory>`,
+        `  <memory id="${escapeXml(m.id)}" type="${escapeXml(m.type)}" name="${escapeXml(m.name)}" updated="${m.updated_at.slice(0, 10)}">\n    ${escapeXml(m.content)}\n  </memory>`,
     )
     .join('\n');
   return `<memories>\n${items}\n</memories>\n`;
