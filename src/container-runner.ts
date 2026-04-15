@@ -1858,8 +1858,23 @@ export function buildVolumeMounts(
     }
   }
 
+  // Mount the built-in nanoclaw plugin (container/nanoclaw-plugin/) which provides
+  // repo-readiness guard and post-commit blast radius verification hooks.
+  const nanoclawPluginPath = path.join(
+    process.cwd(),
+    'container',
+    'nanoclaw-plugin',
+  );
+  if (fs.existsSync(nanoclawPluginPath)) {
+    mounts.push({
+      hostPath: nanoclawPluginPath,
+      containerPath: '/workspace/plugins/nanoclaw-hooks',
+      readonly: true,
+    });
+  }
+
   // Mount external plugin repos from ~/plugins/ read-only.
-  // Each subdirectory is a separate plugin repo (e.g. bootstrap, impeccable, omni-claude-skills, codex).
+  // Each subdirectory is a separate plugin repo (e.g. bootstrap, impeccable, codex).
   // The SDK loads skills, agents, and hooks via the `plugins` option in agent-runner.
   // All plugins mount by default. excludePlugins (deny list) skips listed repos.
   if (fs.existsSync(PLUGINS_DIR)) {
