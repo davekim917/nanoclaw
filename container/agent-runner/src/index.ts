@@ -1292,16 +1292,15 @@ function discoverPlugins(): {
         plugins.push({ type: 'local', path: repoPath });
         continue;
       }
-      // Multi-plugin repo (has plugins/ subdir with individual plugins)
-      const subPluginsDir = path.join(repoPath, 'plugins');
-      if (!fs.existsSync(subPluginsDir)) continue;
-      for (const sub of fs.readdirSync(subPluginsDir)) {
-        const subPath = path.join(subPluginsDir, sub);
+      // Multi-plugin repo: scan all immediate subdirectories for
+      // .claude-plugin/plugin.json (covers plugins/, named subdirs, etc.)
+      for (const sub of fs.readdirSync(repoPath)) {
+        const subPath = path.join(repoPath, sub);
         try {
           if (!fs.statSync(subPath).isDirectory()) continue;
         } catch (e) {
           errors.push(
-            `${entry}/plugins/${sub}: ${e instanceof Error ? e.message : String(e)}`,
+            `${entry}/${sub}: ${e instanceof Error ? e.message : String(e)}`,
           );
           continue;
         }

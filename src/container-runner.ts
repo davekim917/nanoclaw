@@ -1837,12 +1837,11 @@ export function buildVolumeMounts(
     JSON.stringify({ mcpServers: {} }, null, 2) + '\n',
   );
 
-  // Sync skills from container/skills/ and ~/.claude/skills/ into each group's .claude/skills/
+  // Sync built-in container skills into each group's .claude/skills/.
+  // Host skills (~/.claude/skills/) are NOT synced — use ~/plugins/ for
+  // container-level skills (supports per-group excludePlugins gating).
   const skillsDst = path.join(groupSessionsDir, 'skills');
-  const skillsSources = [
-    path.join(process.cwd(), 'container', 'skills'),
-    path.join(os.homedir(), '.claude', 'skills'),
-  ];
+  const skillsSources = [path.join(process.cwd(), 'container', 'skills')];
   for (const skillsSrc of skillsSources) {
     if (!fs.existsSync(skillsSrc)) continue;
     for (const skillDir of fs.readdirSync(skillsSrc)) {
