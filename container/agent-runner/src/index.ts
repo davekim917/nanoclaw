@@ -147,7 +147,7 @@ function toCliAlias(model: string): string {
 }
 
 /** Session JSONL size (bytes) above which auto-compact fires before the query. */
-const SESSION_SIZE_COMPACT_THRESHOLD = 1_500_000; // 1.5 MB
+const SESSION_SIZE_COMPACT_THRESHOLD = 3_200_000; // ~3.2 MB ≈ 800K tokens (80% of 1M context)
 
 /** Container-side path to the session project directory. */
 const SESSION_PROJECT_DIR = '/home/node/.claude/projects/-workspace-group';
@@ -441,9 +441,9 @@ function createPreCompactHook(
 // These are needed by claude-code for API auth but should never
 // be visible to commands Kit runs.
 const SECRET_ENV_VARS = [
-  'ANTHROPIC_API_KEY',
-  'ANTHROPIC_API_KEY_2',
-  'ANTHROPIC_API_KEY_3',
+  ...Object.keys(process.env).filter((k) =>
+    /^ANTHROPIC_API_KEY(_\d+)?$/.test(k),
+  ),
   'CLAUDE_CODE_OAUTH_TOKEN',
   'GMAIL_OAUTH_PATH',
   'GMAIL_CREDENTIALS_PATH',
@@ -2317,9 +2317,15 @@ async function main(): Promise<void> {
   // Fallback keys tried in order on retryable errors. Hoisted outside the
   // message loop so rotation position and the active key both persist for
   // the container lifetime — once key N is exhausted, key N+1 stays active.
-  const fallbackKeys = (['ANTHROPIC_API_KEY_2', 'ANTHROPIC_API_KEY_3'] as const)
-    .map((k) => sdkEnv[k])
-    .filter((k): k is string => typeof k === 'string' && k.length > 0);
+  const fallbackKeys = Object.keys(sdkEnv)
+    .filter((k) => /^ANTHROPIC_API_KEY_\d+$/.test(k))
+    .sort((a, b) => {
+      const numA = parseInt(a.replace('ANTHROPIC_API_KEY_', ''), 10);
+      const numB = parseInt(b.replace('ANTHROPIC_API_KEY_', ''), 10);
+      return numA - numB;
+    })
+    .filter((k) => typeof sdkEnv[k] === 'string' && sdkEnv[k]!.length > 0)
+    .map((k) => ({ name: k, value: sdkEnv[k]! }));
   let nextFallback = 0;
   try {
     while (true) {
@@ -2342,17 +2348,17 @@ async function main(): Promise<void> {
           const runErrMsg =
             runErr instanceof Error ? runErr.message : String(runErr);
           const keyIndex = nextFallback;
-          const rotateKey =
+          const fallbackEntry =
             !isPromptTooLongError(runErrMsg) &&
             isRetryableError(runErrMsg) &&
             keyIndex < fallbackKeys.length
               ? fallbackKeys[nextFallback++]
               : undefined;
-          if (rotateKey && sdkEnv['ANTHROPIC_API_KEY'] !== rotateKey) {
+          if (fallbackEntry && sdkEnv['ANTHROPIC_API_KEY'] !== fallbackEntry.value) {
             log(
-              `retryable error (${runErrMsg.slice(0, 80)}), rotating to ANTHROPIC_API_KEY_${keyIndex + 2}`,
+              `retryable error (${runErrMsg.slice(0, 80)}), rotating to ${fallbackEntry.name}`,
             );
-            sdkEnv['ANTHROPIC_API_KEY'] = rotateKey;
+            sdkEnv['ANTHROPIC_API_KEY'] = fallbackEntry.value;
           } else {
             throw runErr;
           }
