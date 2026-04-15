@@ -61,13 +61,13 @@ Show the top rows to the user and confirm which `platform_id` is theirs (usually
 
 ### 3b. Telegram pair-code path (if the user prefers not to DM first)
 
-For Telegram only, there's an existing pair-code primitive:
+For Telegram only, there's an existing pair-code primitive. When you run this tool, take the output and extract the pairing code. Then show it to the user in plain text and ask the user to send the code in the Telegram chat to complete the pairing.
 
 ```bash
 npx tsx setup/index.ts --step pair-telegram -- --intent new-agent:dm-with-<folder>
 ```
 
-Parse the `PAIR_TELEGRAM_ISSUED` status block for `CODE`. Tell the user to DM the bot with exactly the 4-digit code. Wait for the `PAIR_TELEGRAM` block — read `PLATFORM_ID` and `PAIRED_USER_ID` from it. telegram.ts's interceptor has already upserted the user and granted owner if none existed yet. Use `PLATFORM_ID` and `PAIRED_USER_ID` directly in step 4.
+Parse the `PAIR_TELEGRAM_ISSUED` status block for `CODE` and follow the `REMINDER_TO_ASSISTANT` line in that block. Then wait for the `PAIR_TELEGRAM` block — read `PLATFORM_ID` and `PAIRED_USER_ID` from it. telegram.ts's interceptor has already upserted the user and granted owner if none existed yet. Use `PLATFORM_ID` and `PAIRED_USER_ID` directly in step 4.
 
 ## 4. Run the init script
 
@@ -96,19 +96,17 @@ Show the script's output to the user.
 
 Host sweep runs every ~60s. Within one sweep window the container wakes, the agent processes the system message, and the reply flows through `outbound.db` to the channel.
 
-Tail the log to watch it happen:
+Do not tail the log or poll in a sleep loop. Ask the user in plain text:
 
-```bash
-tail -f logs/nanoclaw.log
-```
+> The welcome DM should arrive within ~60 seconds. Let me know when you've received it (or if it doesn't arrive within two minutes).
 
-If nothing arrives within two minutes:
+Wait for the user's reply. If they confirm receipt, the skill is done.
 
+If they say it didn't arrive, then diagnose using the DB directly (no waiting loops required — the message either delivered or it didn't):
+
+- `sqlite3 data/v2-sessions/<agent-group-id>/sessions/<session-id>/outbound.db "SELECT id, status, created_at FROM messages_out ORDER BY created_at DESC LIMIT 5"` — check for stuck `pending` rows. Replace `<agent-group-id>` and `<session-id>` with the values from the script's output.
 - `grep -E 'Unauthorized channel destination|container.*exited|error' logs/nanoclaw.log | tail -20` — look for ACL rejections or container crashes.
-- `ls data/v2-sessions/<agent-group-id>/sessions/*/outbound.db` — confirm the session exists. Replace `<agent-group-id>` with the value from the script's output.
-- `sqlite3 data/v2-sessions/<agent-group-id>/sessions/<session-id>/outbound.db "SELECT id, status, created_at FROM messages_out ORDER BY created_at DESC LIMIT 5"` — check for stuck `pending` rows.
-
-Once the welcome DM arrives, confirm with the user and the skill is done.
+- `ls data/v2-sessions/<agent-group-id>/sessions/*/outbound.db` — confirm the session exists.
 
 ## Troubleshooting
 

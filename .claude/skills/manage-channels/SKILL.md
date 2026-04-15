@@ -58,7 +58,7 @@ For separate agents, also ask for a folder name and optionally a different assis
 
 When adding another group/chat on an already-configured platform (e.g. a second Telegram group):
 
-1. **Telegram:** ask the isolation question first to determine intent (`wire-to:<folder>` for an existing agent, `new-agent:<folder>` for a fresh one). Run `npx tsx setup/index.ts --step pair-telegram -- --intent <intent>`, the user needs to receive the CODE in print, but Claude runs the step in a bash tool call and Claude Code's UI collapses that output — so the user never sees the code. Your very last message visible to the user at this step MUST be a plain-text print of the pairing code (e.g. "Your pairing code is **1234**"). Then tell the user to post `@<botname> CODE` in the target group (or DM the bot for a private chat). Wait for the `PAIR_TELEGRAM` block. The inbound interceptor has already created the `messaging_groups` row with `unknown_sender_policy = 'strict'` and upserted the paired user — `register` only needs to add the wiring:
+1. **Telegram:** ask the isolation question first to determine intent (`wire-to:<folder>` for an existing agent, `new-agent:<folder>` for a fresh one). Run `npx tsx setup/index.ts --step pair-telegram -- --intent <intent>`, show the CODE (follow the `REMINDER_TO_ASSISTANT` line in the `PAIR_TELEGRAM_ISSUED` block) and tell the user to post `@<botname> CODE` in the target group (or DM the bot for a private chat). Wait for the `PAIR_TELEGRAM` block. The inbound interceptor has already created the `messaging_groups` row with `unknown_sender_policy = 'strict'` and upserted the paired user — `register` only needs to add the wiring:
 
    ```bash
    npx tsx setup/index.ts --step register -- \

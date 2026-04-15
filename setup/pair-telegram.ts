@@ -74,6 +74,7 @@ export async function run(args: string[]): Promise<void> {
     INTENT: intentToString(intent),
     EXPIRES_AT: record.expiresAt,
     INSTRUCTIONS: `Send "${record.code}" from the Telegram chat you want to register (or "@<botname> ${record.code}" in a group with privacy on).`,
+    REMINDER_TO_ASSISTANT: `Your next user-visible message MUST include this CODE in plain text — the bash tool output this block is in gets collapsed in the UI.`,
   });
 
   for (let regen = 0; regen <= MAX_REGENERATIONS; regen++) {
@@ -112,6 +113,7 @@ export async function run(args: string[]): Promise<void> {
           REASON: 'previous code invalidated by wrong attempt',
           REGENERATIONS_LEFT: MAX_REGENERATIONS - regen - 1,
           INSTRUCTIONS: `Send "${record.code}" from the Telegram chat you want to register.`,
+          REMINDER_TO_ASSISTANT: `Your next user-visible message MUST include this CODE in plain text — the bash tool output this block is in gets collapsed in the UI.`,
         });
         continue;
       }
