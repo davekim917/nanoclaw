@@ -1292,8 +1292,10 @@ function discoverPlugins(): {
         plugins.push({ type: 'local', path: repoPath });
         continue;
       }
-      // Multi-plugin repo: scan all immediate subdirectories for
-      // .claude-plugin/plugin.json (covers plugins/, named subdirs, etc.)
+      // Multi-plugin repo: scan up to 2 levels deep for .claude-plugin/plugin.json.
+      // Covers both layouts:
+      //   - Named subdirs:  gitnexus/gitnexus-claude-plugin/.claude-plugin/plugin.json
+      //   - plugins/ subdir: bootstrap/plugins/workflow/.claude-plugin/plugin.json
       for (const sub of fs.readdirSync(repoPath)) {
         const subPath = path.join(repoPath, sub);
         try {
@@ -1308,6 +1310,27 @@ function discoverPlugins(): {
           fs.existsSync(path.join(subPath, '.claude-plugin', 'plugin.json'))
         ) {
           plugins.push({ type: 'local', path: subPath });
+          continue;
+        }
+        // Second level (e.g. bootstrap/plugins/workflow/)
+        try {
+          for (const sub2 of fs.readdirSync(subPath)) {
+            const sub2Path = path.join(subPath, sub2);
+            try {
+              if (!fs.statSync(sub2Path).isDirectory()) continue;
+            } catch {
+              continue;
+            }
+            if (
+              fs.existsSync(
+                path.join(sub2Path, '.claude-plugin', 'plugin.json'),
+              )
+            ) {
+              plugins.push({ type: 'local', path: sub2Path });
+            }
+          }
+        } catch {
+          /* unreadable subdir — skip */
         }
       }
     }
