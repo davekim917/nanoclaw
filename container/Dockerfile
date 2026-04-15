@@ -44,7 +44,7 @@ RUN apt-get update && apt-get install -y python3 python3-pip python3-venv \
 
 # Install dbt-core + dbt-snowflake adapter
 RUN python3 -m venv /opt/dbt-venv \
-    && /opt/dbt-venv/bin/pip install dbt-core==1.11.7 dbt-snowflake==1.11.4 \
+    && /opt/dbt-venv/bin/pip install dbt-core==1.11.8 dbt-snowflake==1.11.4 \
     && ln -s /opt/dbt-venv/bin/dbt /usr/local/bin/dbt \
     && rm -rf /var/lib/apt/lists/*
 
@@ -73,12 +73,12 @@ RUN apt-get update && apt-get install -y unzip \
 # authenticated via the host's ~/.codex mount (read-write, subscription OAuth).
 # Pinned versions — build.sh checks for updates automatically.
 RUN PUPPETEER_SKIP_DOWNLOAD=true npm install -g \
-    agent-browser@0.25.3 \
+    agent-browser@0.25.4 \
     @anthropic-ai/claude-code@2.1.92 \
     @googleworkspace/cli@0.22.5 \
     @mermaid-js/mermaid-cli@11.12.0 \
-    @openai/codex@0.118.0 \
-    gitnexus@1.5.3
+    @openai/codex@0.120.0 \
+    gitnexus@1.6.1
 
 # Install PostgreSQL client, Redis CLI, and Google Cloud CLI
 RUN curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
@@ -100,8 +100,8 @@ RUN ARCH=$(uname -m) \
 
 # Install Render CLI, Railway CLI, and Supabase CLI
 ARG RENDER_VERSION=2.15.1
-ARG RAILWAY_VERSION=4.36.1
-ARG SUPABASE_VERSION=2.84.2
+ARG RAILWAY_VERSION=4.37.3
+ARG SUPABASE_VERSION=2.90.0
 RUN DPKG_ARCH=$(dpkg --print-architecture) && UARCH=$(uname -m) \
     && curl -fsSL "https://github.com/render-oss/cli/releases/download/v${RENDER_VERSION}/cli_${RENDER_VERSION}_linux_${DPKG_ARCH}.zip" \
        -o /tmp/render.zip \
