@@ -18,18 +18,65 @@ const GLOBAL_MEMORY_CONTAINER_PATH = '/workspace/global/CLAUDE.md';
 export const GLOBAL_MEMORY_LINK_NAME = '.claude-global.md';
 export const GLOBAL_CLAUDE_IMPORT = `@./${GLOBAL_MEMORY_LINK_NAME}`;
 
-const DEFAULT_SETTINGS_JSON =
-  JSON.stringify(
-    {
-      env: {
-        CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
-        CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
-        CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
-      },
-    },
-    null,
-    2,
-  ) + '\n';
+// Required env vars for every agent container. Kept in sync with
+// ensureRequiredSettings() below — if you add a key here, it will be
+// auto-applied to existing groups on next init call.
+const REQUIRED_ENV: Record<string, string> = {
+  CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
+  CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
+  CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
+  // Auto-compact at 80% of context window instead of SDK default (~97%).
+  // Prevents sessions from hitting the hard context limit and triggering
+  // silent model fallback on upstream 400 errors.
+  CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: '80',
+};
+
+// Required top-level settings. Merged into existing settings.json
+// additively — never overwrites user-set values.
+const REQUIRED_SETTINGS: Record<string, unknown> = {
+  $schema: 'https://json.schemastore.org/claude-code-settings.json',
+  // Background memory consolidation — prunes stale notes, resolves
+  // contradictions, keeps MEMORY.md concise so auto-memory stays useful.
+  autoDreamEnabled: true,
+};
+
+const DEFAULT_SETTINGS_JSON = JSON.stringify({ env: REQUIRED_ENV, ...REQUIRED_SETTINGS }, null, 2) + '\n';
+
+/**
+ * Merge any missing required env vars + settings into an existing settings.json.
+ * Additive only — user-customized values are preserved. Returns true if the
+ * file was modified.
+ */
+function ensureRequiredSettings(settingsFile: string): boolean {
+  let settings: Record<string, unknown>;
+  try {
+    settings = JSON.parse(fs.readFileSync(settingsFile, 'utf-8'));
+  } catch {
+    return false;
+  }
+  let changed = false;
+  if (!settings.env || typeof settings.env !== 'object') {
+    settings.env = {};
+    changed = true;
+  }
+  const env = settings.env as Record<string, string>;
+  for (const [k, v] of Object.entries(REQUIRED_ENV)) {
+    if (env[k] === undefined) {
+      env[k] = v;
+      changed = true;
+    }
+  }
+  for (const [k, v] of Object.entries(REQUIRED_SETTINGS)) {
+    if (settings[k] === undefined) {
+      settings[k] = v;
+      changed = true;
+    }
+  }
+  if (changed) {
+    fs.writeFileSync(settingsFile, JSON.stringify(settings, null, 2) + '\n');
+  }
+  return changed;
+}
 
 /**
  * Initialize the on-disk filesystem state for an agent group. Idempotent —
@@ -95,6 +142,8 @@ export function initGroupFilesystem(group: AgentGroup, opts?: { instructions?: s
   if (!fs.existsSync(settingsFile)) {
     fs.writeFileSync(settingsFile, DEFAULT_SETTINGS_JSON);
     initialized.push('settings.json');
+  } else if (ensureRequiredSettings(settingsFile)) {
+    initialized.push('settings.json (merged required keys)');
   }
 
   const skillsDst = path.join(claudeDir, 'skills');
