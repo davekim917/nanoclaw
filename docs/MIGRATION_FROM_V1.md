@@ -401,7 +401,13 @@ These features are native in v2 and should work without porting. Verify they do.
 
 ### 2.5 Memory Extraction (Haiku-Based, Interval)
 
-**Effort:** High — largest port item  
+**Effort:** High — largest port item
+
+**Scope clarification (2026-04-16):** Memory extraction stores *curated facts* distilled from conversations ("Dave prefers per-thread sessions"). It does NOT store raw conversation content — that's what Phase 2.9 (thread search) does. The three mechanisms are complementary:
+- **2.5 Memory extraction** — facts, preferences, decisions → cross-thread recall of *what's true*
+- **2.8 Auto-memory** — Claude Code's native shared memory directory across threads in a group
+- **2.9 Thread search** — raw conversation FTS → "find the thread where we discussed X"
+
 **v1 source files:**
 - `~/nanoclaw/src/memory-extractor.ts` — extraction logic, prompt building, response parsing
 - `~/nanoclaw/src/memory-store.ts` — save/update/delete with dedup
@@ -512,6 +518,55 @@ These features are native in v2 and should work without porting. Verify they do.
 
 ---
 
+### 2.9 Cross-Thread Search (PROMOTED FROM T3.5 — 2026-04-16)
+
+**Effort:** Medium-High
+**v1 source:** `~/nanoclaw/src/thread-search.ts` (FTS5 + Haiku rerank + raw LIKE fallback), `~/nanoclaw/src/db.ts` (`searchThreadsFTS`, `searchMessagesRaw`, `thread_index`, `messages` FTS virtual table)
+**v2 target:** new `src/message-archive.ts` (host) + new migration + container-side MCP tool
+
+**Why this is Tier 1 (not 3):** Distinct from memory extraction. Memories store curated *facts* ("Dave prefers X"); thread search stores raw *conversations* so "find the thread where we discussed XYZ, summarize where we left off" works. Dave's daily use pattern depends on this.
+
+**Architecture problem:** v1 has a central `messages` table across all channels. v2 fragments history into per-session `inbound.db`/`outbound.db`. FTS5 can't index across files.
+
+**Solution (central aggregator):** add a central `messages_archive` FTS5 table in `data/v2.db`. Host observes inbound routing + outbound delivery and upserts rows into the archive as a projection. Thread-search logic ports from v1 with minor query changes (group key is `agent_group_id` or `messaging_group_id` in v2, not `group_folder`).
+
+**Port steps:**
+- [ ] New migration: `messages_archive` (id, agent_group_id, messaging_group_id, thread_id, sender_id, sender_display, text, sent_at) + FTS5 virtual table on `text`
+- [ ] Optional: `thread_summaries` table (one-row-per-thread, Haiku-summarized, refreshed on idle) — mirrors v1's `thread_index`
+- [ ] `src/message-archive.ts` — `upsertMessage`, `searchThreadsFTS`, `searchMessagesRaw`
+- [ ] `src/router.ts` `handleInbound`: call `upsertMessage` on chat-kind inbound
+- [ ] `src/delivery.ts` `deliverMessage`: call `upsertMessage` on chat-kind outbound
+- [ ] Container-side MCP tool `search_threads({query, limit})` — delegates to host via IPC or reads v2.db directly (v2 mounts it read-only for agent-runner; confirm)
+- [ ] Port Haiku rerank helper from `~/nanoclaw/src/thread-search.ts`
+- [ ] Optional: background thread summarizer (idle threshold → Haiku summary → `thread_summaries`)
+
+**Checklist:**
+- [ ] Migration applied
+- [ ] Host upserts on inbound/outbound
+- [ ] MCP tool `search_threads` available to container
+- [ ] Agent responds correctly to "find thread where we discussed X"
+
+---
+
+### 2.10 Permalink Resolver (NEW)
+
+**Effort:** Low
+**v1 source:** N/A (new)
+**v2 target:** container-side MCP tool `resolve_thread_link(url)` in `container/agent-runner/src/mcp-tools/`
+
+**What to do:** Parse Slack/Discord/Telegram permalinks to (channel_type, platform_id, thread_id). Look up messages from `messages_archive` (2.9) and return a structured transcript. Enables "reference this thread (link), let's discuss XYZ."
+
+**Port steps:**
+- [ ] URL parser for each supported channel (Slack `*.slack.com/archives/C.../pTIMESTAMP`, Discord `discord.com/channels/G/C/M`, Telegram t.me links if applicable)
+- [ ] MCP tool definition and handler
+- [ ] Hit `messages_archive` for the resolved `(channel_type, platform_id, thread_id)`, return JSON transcript
+
+**Checklist:**
+- [ ] Tool registered in agent-runner
+- [ ] Tested against Slack and Discord permalinks
+
+---
+
 ## Phase 3: Side-by-Side Validation
 
 Run both instances simultaneously. Route test channels to v2, production stays on v1.
@@ -523,6 +578,9 @@ Run both instances simultaneously. Route test channels to v2, production stays o
 - [ ] Long sessions (~50+ tool calls) show progress updates and don't time out
 - [ ] Destructive commands trigger approval flow (Claude Code permission prompts + pending_approvals for self-mod)
 - [ ] Memory extraction captures user preferences and project context
+- [ ] Thread search: "find the thread where we discussed X" returns the correct thread + summary (2.9)
+- [ ] Permalink resolver: pasting a Slack/Discord thread link lets the agent load that thread's content (2.10)
+- [ ] Cross-thread context: a new thread can reference facts mentioned in a prior thread via memory (2.5) OR raw history lookup (2.9)
 - [ ] Agent can use all required tools (dbt, git, gcloud, etc.)
 - [ ] Typing indicators appear and clear correctly
 - [ ] File attachments send successfully (including per-platform size limit validation)
@@ -649,7 +707,7 @@ These features exist in the v1 fork but may not be needed. Evaluate after runnin
 | T3.2 | **Container watchdog** | `src/container-runner.ts` | v2's host sweep detects stale containers via heartbeat (10-min threshold), retries with exponential backoff (5s base, max 5 retries), marks failed after max. Is this enough? | Low |
 | T3.3 | **Complexity classifier** | `src/complexity-classifier.ts` | Was this actually useful in v1? Did it change routing decisions? | Low |
 | T3.4 | **Commit digest / attribution** | `src/commit-digest.ts` | Nice for tracking but not essential. Worth the maintenance? | Low |
-| T3.5 | **Thread search (FTS5 + Haiku)** | `src/thread-search.ts` | v2's DB schema doesn't include FTS. Is conversation search needed? | Medium |
+| ~~T3.5~~ | ~~Thread search (FTS5 + Haiku)~~ | ~~`src/thread-search.ts`~~ | **Promoted to Tier 1 as Phase 2.9 (2026-04-16). Daily-use feature for "find thread where we discussed X".** | ~~Medium~~ |
 | T3.6 | **Worktree management** | `src/ipc.ts`, `src/worktree-cleanup.ts` | v2's per-session container isolation may replace the need. Do agents still need host-side worktrees? | High |
 | T3.7 | **Blueprint workshop** | Multiple files | Was this completed in v1? Is it still relevant? | Medium |
 | T3.8 | **Mermaid rendering** | `container/Dockerfile` | v2 has Chromium in base. Add mermaid-cli to container.json if needed. | Low |
