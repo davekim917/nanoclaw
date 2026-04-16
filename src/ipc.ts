@@ -6,6 +6,7 @@ import { CronExpressionParser } from 'cron-parser';
 
 import {
   DATA_DIR,
+  EFFORT_LEVELS,
   GROUPS_DIR,
   IPC_POLL_INTERVAL,
   PLUGINS_DIR,
@@ -581,6 +582,7 @@ export async function processTaskIpc(
     requiresTrigger?: boolean;
     containerConfig?: RegisteredGroup['containerConfig'];
     model?: string;
+    effort?: string;
     notifyJid?: string;
     tools?: string[] | null;
     // For ship_log / backlog
@@ -910,6 +912,9 @@ export async function processTaskIpc(
     case 'set_group_notify_jid':
     // falls through — notifyJid updates share the same handler as model updates
     // eslint-disable-next-line no-fallthrough
+    case 'set_group_effort':
+    // falls through — effort updates share the same handler
+    // eslint-disable-next-line no-fallthrough
     case 'set_group_model':
       // Only main group can update group model
       if (!isMain) {
@@ -925,16 +930,38 @@ export async function processTaskIpc(
           logger.warn({ jid: data.jid }, 'set_group_model: unknown JID');
           break;
         }
+        // Reject effort values that aren't in the known set (allow empty
+        // string to clear, and allow 'default'/'reset' as clear aliases).
+        if (data.effort !== undefined && data.effort !== '') {
+          const normalized = data.effort.toLowerCase();
+          const isClear = normalized === 'default' || normalized === 'reset';
+          if (!isClear && !EFFORT_LEVELS.has(normalized)) {
+            logger.warn(
+              { jid: data.jid, effort: data.effort },
+              'set_group_effort: invalid effort value, ignoring',
+            );
+            data.effort = undefined;
+          } else if (isClear) {
+            data.effort = '';
+          } else {
+            data.effort = normalized;
+          }
+        }
         const updatedConfig = {
           ...existing.containerConfig,
           ...(data.model ? { model: data.model } : {}),
+          ...(data.effort ? { effort: data.effort } : {}),
           ...(data.notifyJid !== undefined
             ? { notifyJid: data.notifyJid || undefined }
             : {}),
         };
         // If model is null/empty string, remove the key
-        if (!data.model) {
+        if (!data.model && data.model !== undefined) {
           delete updatedConfig.model;
+        }
+        // If effort is empty string, remove the key (revert to global default)
+        if (data.effort === '') {
+          delete updatedConfig.effort;
         }
         // If notifyJid is empty string, remove the key
         if (data.notifyJid === '') {
@@ -949,6 +976,7 @@ export async function processTaskIpc(
           {
             jid: data.jid,
             model: data.model || '(unchanged)',
+            effort: data.effort ?? '(unchanged)',
             notifyJid: data.notifyJid || '(unchanged)',
           },
           'Group config updated',

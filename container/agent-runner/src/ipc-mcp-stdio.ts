@@ -791,6 +791,39 @@ Use this to configure which Claude model a group uses by default (e.g. "opus", "
 );
 
 server.tool(
+  'set_group_effort',
+  `Set the default reasoning effort for a registered group. Main group only.
+
+Use this to configure how hard Claude thinks by default in a group (e.g. "low", "medium", "high", "xhigh", "max"). Pass an empty string (or "default"/"reset") to clear the override and revert to the global default ("xhigh"). Per-message ("-e high") and session-sticky ("-e1 high") flags still override this.`,
+  {
+    jid: z.string().describe('The JID of the group to update (e.g., "dc:1479489865702703155")'),
+    effort: z.string().describe('Effort level ("low", "medium", "high", "xhigh", "max"). Empty string / "default" / "reset" to clear.'),
+  },
+  async (args) => {
+    if (!isMain) {
+      return {
+        content: [{ type: 'text' as const, text: 'Only the main group can update group effort.' }],
+        isError: true,
+      };
+    }
+
+    const data = {
+      type: 'set_group_effort',
+      jid: args.jid,
+      effort: args.effort,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(TASKS_DIR, data);
+
+    const label = args.effort || '(cleared — reverts to global default)';
+    return {
+      content: [{ type: 'text' as const, text: `Group effort set to ${label} for JID ${args.jid}.` }],
+    };
+  },
+);
+
+server.tool(
   'set_group_notify_jid',
   `Set the notification channel JID for a registered group. Main group only.
 

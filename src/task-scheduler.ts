@@ -275,6 +275,7 @@ async function runTask(
           ? MODEL_ALIASES[group.containerConfig.model.toLowerCase()] ||
             group.containerConfig.model
           : DEFAULT_MODEL,
+        effort: group.containerConfig?.effort,
         script: task.script || undefined,
       },
       (proc, containerName) =>

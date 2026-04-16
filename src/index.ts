@@ -668,15 +668,18 @@ function extractEffortOverride(
 
 /**
  * Resolve the effort level for a container run.
- * Priority: per-message override > session sticky > global default.
+ * Priority: per-message override > session sticky > per-group config > global default.
  */
 function resolveEffort(
+  group: RegisteredGroup,
   messageOverride?: string,
   sessionEffort?: string,
 ): string {
   if (messageOverride && EFFORT_LEVELS.has(messageOverride))
     return messageOverride;
   if (sessionEffort && EFFORT_LEVELS.has(sessionEffort)) return sessionEffort;
+  const groupEffort = group.containerConfig?.effort;
+  if (groupEffort && EFFORT_LEVELS.has(groupEffort)) return groupEffort;
   return DEFAULT_EFFORT;
 }
 
@@ -1286,7 +1289,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let effortNotice = '';
   if (effortOverride?.reset) {
     setSessionEffort(sessionKey, null);
-    effort = resolveEffort();
+    effort = resolveEffort(group);
     effortNotice = `\n\n[SYSTEM: Effort level reverted to default (${effort}).]`;
     logger.info(
       { group: group.name, effort, sessionKey },
@@ -1314,7 +1317,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       );
     }
   } else {
-    effort = resolveEffort(undefined, getSessionEffort(sessionKey));
+    effort = resolveEffort(group, undefined, getSessionEffort(sessionKey));
   }
 
   const latestMessageText =
