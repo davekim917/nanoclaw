@@ -1711,6 +1711,9 @@ export function buildVolumeMounts(
     // Prevents sessions from hitting the hard context limit and triggering
     // silent model fallback (opus[1m] → sonnet) on upstream 400 errors.
     CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: '80',
+    // Explicitly keep auto-memory on (0 = not disabled). Locks the behavior
+    // in case any upstream default flips.
+    CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
   };
   const requiredSettings: Record<string, unknown> = {
     // Schema helps Claude Code recognize settings correctly
@@ -1742,14 +1745,6 @@ export function buildVolumeMounts(
       for (const [key, value] of Object.entries(requiredEnv)) {
         if (settings.env[key] !== value) {
           settings.env[key] = value;
-          changed = true;
-        }
-      }
-      // Clean up env vars that were previously required but are now removed.
-      // CLAUDE_CODE_DISABLE_AUTO_MEMORY was removed to re-enable auto-memory.
-      for (const staleKey of ['CLAUDE_CODE_DISABLE_AUTO_MEMORY']) {
-        if (staleKey in settings.env) {
-          delete settings.env[staleKey];
           changed = true;
         }
       }
@@ -2613,28 +2608,22 @@ function readSecrets(
     ...(isToolEnabled(tools, 'browser-auth')
       ? BROWSER_AUTH_KEYS.map((k) => scopedEnvKey(k, browserAuthOpts))
       : []),
-    // Anthropic auth — one of two modes, mutually exclusive.
-    //
-    // Mode 1 (preferred): CLAUDE_CODE_OAUTH_TOKEN in .env. Long-lived Bearer
-    // token from `claude setup-token`, authenticates as a Max subscription.
-    // Works against the real api.anthropic.com; no proxy, no custom base URL.
-    // When present, ANTHROPIC_API_KEY* and ANTHROPIC_BASE_URL are intentionally
-    // NOT forwarded so the SDK doesn't Bearer-auth against a proxy that only
-    // accepts API keys (e.g. openlimits).
-    //
-    // Mode 2 (fallback): ANTHROPIC_API_KEY [+ _N variants cycled on 429s] +
-    // ANTHROPIC_BASE_URL (typically a rate-limiting / routing proxy). Used
-    // automatically whenever CLAUDE_CODE_OAUTH_TOKEN is absent or commented out.
-    //
-    // To switch modes: (un)comment CLAUDE_CODE_OAUTH_TOKEN in .env.
-    ...(readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN']).CLAUDE_CODE_OAUTH_TOKEN
-      ? ['CLAUDE_CODE_OAUTH_TOKEN']
-      : [
+    // Anthropic credential — OneCLI vault owns it (register a `--type anthropic`
+    // secret; see /init-onecli). We do NOT pass API keys through the container
+    // unless ANTHROPIC_BASE_URL is set in .env, which indicates the operator
+    // has explicitly opted into a non-Anthropic routing proxy (e.g. openlimits)
+    // that validates per-key and may require the agent-runner's _N fallback
+    // rotation (see isRetryableError handling) to stay under limits. In that
+    // mode the container gets both the base URL and the rotating key set;
+    // otherwise it gets nothing and the OneCLI proxy injects at request time.
+    ...(readEnvFile(['ANTHROPIC_BASE_URL']).ANTHROPIC_BASE_URL
+      ? [
+          'ANTHROPIC_BASE_URL',
           ...Object.keys(
             readEnvFileMatching((k) => /^ANTHROPIC_API_KEY(_\d+)?$/.test(k)),
           ),
-          'ANTHROPIC_BASE_URL',
-        ]),
+        ]
+      : []),
   ];
   const secrets = readEnvFile(envKeys);
 
