@@ -9,6 +9,57 @@ function log(msg: string): void {
   console.error(`[claude-provider] ${msg}`);
 }
 
+/**
+ * Derive a short human-friendly progress label from an assistant message
+ * that contains a tool_use block. Returns null if the message has no
+ * tool_use (agent is just emitting text), so the caller skips emitting
+ * progress for those.
+ */
+function deriveToolProgressLabel(message: unknown): string | null {
+  const content = (message as { message?: { content?: unknown } }).message?.content;
+  if (!Array.isArray(content)) return null;
+  for (const block of content) {
+    const b = block as { type?: string; name?: string; input?: Record<string, unknown> };
+    if (b.type !== 'tool_use') continue;
+    const name = b.name ?? 'tool';
+    const input = b.input ?? {};
+    switch (name) {
+      case 'Bash': {
+        const cmd = typeof input.command === 'string' ? input.command.split('\n')[0].slice(0, 60) : '';
+        return cmd ? `Running: ${cmd}` : 'Running command';
+      }
+      case 'Read':
+      case 'Glob':
+        return `Reading files`;
+      case 'Grep':
+        return `Searching`;
+      case 'Edit':
+      case 'Write':
+      case 'NotebookEdit':
+        return `Editing files`;
+      case 'WebSearch':
+        return `Web search`;
+      case 'WebFetch':
+        return `Fetching web page`;
+      case 'TodoWrite':
+        return `Planning`;
+      case 'Task':
+        return `Delegating subtask`;
+      case 'ToolSearch':
+        return `Looking up tools`;
+      case 'Skill':
+        return `Invoking skill`;
+      default:
+        if (name.startsWith('mcp__')) {
+          const parts = name.split('__');
+          return `Using ${parts[parts.length - 1] ?? name}`;
+        }
+        return `Using ${name}`;
+    }
+  }
+  return null;
+}
+
 // Deferred SDK builtins that would sidestep nanoclaw's own scheduling.
 // Scheduling goes through mcp__nanoclaw__schedule_task so that tasks are
 // durable across sessions/restarts and gated by our pre-task script hook.
@@ -232,6 +283,12 @@ export class ClaudeProvider implements AgentProvider {
 
     async function* translateEvents(): AsyncGenerator<ProviderEvent> {
       let messageCount = 0;
+      // Throttle tool-call progress so every Bash/Grep doesn't spam status
+      // updates. One tool-call-derived progress per ~1.5s is enough to show
+      // "it's alive and doing something."
+      let lastToolProgressAt = 0;
+      const TOOL_PROGRESS_MIN_INTERVAL_MS = 1500;
+
       for await (const message of sdkResult) {
         if (aborted) return;
         messageCount++;
@@ -255,6 +312,19 @@ export class ClaudeProvider implements AgentProvider {
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
           const tn = message as { summary?: string };
           yield { type: 'progress', message: tn.summary || 'Task notification' };
+        } else if (message.type === 'assistant') {
+          // Fallback progress: SDK task_notification only fires for
+          // multi-step planned tasks, so simple turns (single tool call,
+          // direct answers) never get a status line. Derive a short label
+          // from the first tool_use block on each assistant turn.
+          const now = Date.now();
+          if (now - lastToolProgressAt >= TOOL_PROGRESS_MIN_INTERVAL_MS) {
+            const label = deriveToolProgressLabel(message);
+            if (label) {
+              yield { type: 'progress', message: label };
+              lastToolProgressAt = now;
+            }
+          }
         }
       }
       log(`Query completed after ${messageCount} SDK messages`);
