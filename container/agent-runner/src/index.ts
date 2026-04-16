@@ -794,6 +794,8 @@ function drainIpcInput(): IpcMessage[] {
             pendingOneshotRevert = sdkEnvRef['CLAUDE_CODE_USE_MODEL'] || null;
           }
           sdkEnvRef['CLAUDE_CODE_USE_MODEL'] = data.model;
+          // Keep subagents/teammates aligned with the leader's model.
+          sdkEnvRef['CLAUDE_CODE_SUBAGENT_MODEL'] = data.model;
           if (activeQuery) {
             const alias = toCliAlias(data.model);
             activeQuery
@@ -810,6 +812,8 @@ function drainIpcInput(): IpcMessage[] {
           );
         } else if (data.type === 'effort_switch' && data.effort) {
           sdkEnvRef['CLAUDE_CODE_USE_EFFORT'] = data.effort;
+          // Keep subagents/teammates aligned with the leader's effort.
+          sdkEnvRef['CLAUDE_CODE_EFFORT_LEVEL'] = data.effort;
           if (activeQuery) {
             pendingEffortAck = activeQuery
               .applyFlagSettings({ effortLevel: data.effort })
@@ -1481,11 +1485,12 @@ async function runQuery(
     log(`Additional directories: ${extraDirs.join(', ')}`);
   }
 
-  // Effort level for this run (per-message flag > session sticky > default 'high')
+  // Effort level for this run (per-message flag > session sticky > default 'xhigh')
   const effort = containerInput.effort as
     | 'low'
     | 'medium'
     | 'high'
+    | 'xhigh'
     | 'max'
     | undefined;
   if (effort) {
@@ -1830,6 +1835,7 @@ async function runQuery(
                 `Forcing ${recoveryAlias} for subsequent turns.`,
             );
             sdkEnv['CLAUDE_CODE_USE_MODEL'] = recoveryModelId;
+            sdkEnv['CLAUDE_CODE_SUBAGENT_MODEL'] = recoveryModelId;
             // Suppress any pending one-shot revert: it would overwrite
             // sdkEnv back to the pre-one-shot baseline after the main
             // Result writeOutput, undoing the drift recovery.
@@ -1905,6 +1911,8 @@ async function runQuery(
       // Revert one-shot model switch after the turn's result is emitted.
       if (pendingOneshotRevert !== undefined) {
         sdkEnvRef['CLAUDE_CODE_USE_MODEL'] = pendingOneshotRevert || undefined;
+        sdkEnvRef['CLAUDE_CODE_SUBAGENT_MODEL'] =
+          pendingOneshotRevert || undefined;
         const revertAlias = pendingOneshotRevert
           ? toCliAlias(pendingOneshotRevert)
           : 'default';
@@ -2055,9 +2063,21 @@ async function main(): Promise<void> {
   // Set the per-run model in sdkEnv. drainIpcInput() reads this as the
   // baseline for one-shot downgrade reverts; runQuery() suppresses the
   // SDK `model` option on resumed sessions so passing it here is safe.
+  // Also mirror into CLAUDE_CODE_SUBAGENT_MODEL so Agent-tool subagents and
+  // agent-teams teammates inherit the leader's model instead of defaulting
+  // to the SDK's built-in subagent model (sonnet).
   if (containerInput.model) {
     sdkEnv['CLAUDE_CODE_USE_MODEL'] = containerInput.model;
+    sdkEnv['CLAUDE_CODE_SUBAGENT_MODEL'] = containerInput.model;
     log(`Using model: ${containerInput.model}`);
+  }
+
+  // Mirror the initial effort into CLAUDE_CODE_EFFORT_LEVEL so teammates and
+  // subagents inherit the leader's effort. The per-query `effort` option only
+  // binds the main CLI; env propagation is how spawned subprocesses pick it up.
+  if (containerInput.effort) {
+    sdkEnv['CLAUDE_CODE_USE_EFFORT'] = containerInput.effort;
+    sdkEnv['CLAUDE_CODE_EFFORT_LEVEL'] = containerInput.effort;
   }
 
   // Expose sdkEnv to IPC handlers so model/effort switches can be applied mid-session
@@ -2376,6 +2396,8 @@ async function main(): Promise<void> {
       // Revert one-shot model switch after query completes
       if (pendingOneshotRevert !== undefined) {
         sdkEnvRef['CLAUDE_CODE_USE_MODEL'] = pendingOneshotRevert || undefined;
+        sdkEnvRef['CLAUDE_CODE_SUBAGENT_MODEL'] =
+          pendingOneshotRevert || undefined;
         log(`One-shot model reverted to: ${pendingOneshotRevert || 'default'}`);
         pendingOneshotRevert = undefined;
       }

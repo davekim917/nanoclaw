@@ -119,7 +119,7 @@ export const DEFAULT_MODEL =
 
 // Map short aliases to full model IDs
 export const MODEL_ALIASES: Record<string, string> = {
-  opus: 'claude-opus-4-6[1m]',
+  opus: 'claude-opus-4-7[1m]',
   sonnet: 'claude-sonnet-4-6[1m]',
   haiku: 'claude-haiku-4-5-20251001',
 };
@@ -132,21 +132,24 @@ export const MODEL_FLAG_PATTERN =
 export const MODEL_ONESHOT_PATTERN = /(?:^|\s)-m1\s+(opus|sonnet|haiku)\b/i;
 
 // Effort levels for the agent SDK (controls thinking depth).
-// Default is 'high'; per-message overrides via "-e max" (sticky) or "-e1 max" (one-shot).
-export type EffortLevel = 'low' | 'medium' | 'high' | 'max';
-export const DEFAULT_EFFORT: EffortLevel = 'high';
+// Default is 'xhigh' (Opus 4.7 only; other models fall back to 'high');
+// per-message overrides via "-e max" (sticky) or "-e1 max" (one-shot).
+export type EffortLevel = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+export const DEFAULT_EFFORT: EffortLevel = 'xhigh';
 export const EFFORT_LEVELS: Set<string> = new Set([
   'low',
   'medium',
   'high',
+  'xhigh',
   'max',
 ]);
 
 // Sticky flag: "-e max" — sets effort for rest of session; "-e default" clears
 export const EFFORT_FLAG_PATTERN =
-  /(?:^|\s)-e\s+(low|medium|high|max|default|reset)\b/i;
+  /(?:^|\s)-e\s+(low|medium|high|xhigh|max|default|reset)\b/i;
 // One-shot flag: "-e1 max" — just this invocation, doesn't stick
-export const EFFORT_ONESHOT_PATTERN = /(?:^|\s)-e1\s+(low|medium|high|max)\b/i;
+export const EFFORT_ONESHOT_PATTERN =
+  /(?:^|\s)-e1\s+(low|medium|high|xhigh|max)\b/i;
 
 /**
  * Strip all model / effort control flags from a message. Used by the gate

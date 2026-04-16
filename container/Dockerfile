@@ -74,7 +74,7 @@ RUN apt-get update && apt-get install -y unzip \
 # Pinned versions — build.sh checks for updates automatically.
 RUN PUPPETEER_SKIP_DOWNLOAD=true npm install -g \
     agent-browser@0.25.4 \
-    @anthropic-ai/claude-code@2.1.92 \
+    @anthropic-ai/claude-code@2.1.111 \
     @googleworkspace/cli@0.22.5 \
     @mermaid-js/mermaid-cli@11.12.0 \
     @openai/codex@0.120.0 \
