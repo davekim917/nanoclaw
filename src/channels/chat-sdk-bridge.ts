@@ -63,6 +63,13 @@ export interface ChatSdkBridgeConfig {
    * quirk (e.g. Telegram's legacy Markdown parse mode).
    */
   transformOutboundText?: (text: string) => string;
+  /**
+   * Override the channelType (and webhook path) for this bridge. Defaults to
+   * `adapter.name`. Used by channels that register multiple instances in one
+   * process — e.g. multi-workspace Slack — so each workspace gets a distinct
+   * channelType and a distinct `/webhook/<channelType>` routing path.
+   */
+  channelType?: string;
 }
 
 export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter {
@@ -141,9 +148,11 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
     };
   }
 
+  const channelType = config.channelType ?? adapter.name;
+
   return {
-    name: adapter.name,
-    channelType: adapter.name,
+    name: channelType,
+    channelType,
     supportsThreads: config.supportsThreads,
 
     async setup(hostConfig: ChannelSetup) {
@@ -263,8 +272,11 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         startGateway();
         log.info('Gateway listener started', { adapter: adapter.name });
       } else {
-        // Non-gateway adapters (Slack, Teams, GitHub, etc.) — register on the shared webhook server
-        registerWebhookAdapter(chat, adapter.name);
+        // Non-gateway adapters (Slack, Teams, GitHub, etc.) — register on the shared webhook server.
+        // Use channelType as the routing key so multi-instance channels (e.g. multi-workspace
+        // Slack) get distinct `/webhook/<channelType>` paths even though they share the same
+        // underlying adapter.name for chat.webhooks[] lookup.
+        registerWebhookAdapter(chat, adapter.name, channelType);
       }
 
       log.info('Chat SDK bridge initialized', { adapter: adapter.name });

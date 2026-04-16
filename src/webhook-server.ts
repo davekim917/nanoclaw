@@ -69,11 +69,20 @@ async function fromWebResponse(webRes: Response, nodeRes: http.ServerResponse): 
 /**
  * Register a webhook adapter on the shared server.
  * Starts the server lazily on first call.
+ *
+ * `adapterName` is the key used to look up the webhook handler inside the
+ * Chat instance (`chat.webhooks[adapterName]`). `routingPath` is the path
+ * segment after `/webhook/` that routes inbound requests to this entry.
+ * They're the same by default; pass a distinct `routingPath` when
+ * registering multiple instances of the same adapter type — e.g.
+ * multi-workspace Slack where each workspace needs its own webhook URL but
+ * they all share the adapter name `slack`.
  */
-export function registerWebhookAdapter(chat: Chat, adapterName: string): void {
-  routes.set(adapterName, { chat, adapterName });
+export function registerWebhookAdapter(chat: Chat, adapterName: string, routingPath?: string): void {
+  const key = routingPath ?? adapterName;
+  routes.set(key, { chat, adapterName });
   ensureServer();
-  log.info('Webhook adapter registered', { adapter: adapterName, path: `/webhook/${adapterName}` });
+  log.info('Webhook adapter registered', { adapter: adapterName, path: `/webhook/${key}` });
 }
 
 function ensureServer(): void {
