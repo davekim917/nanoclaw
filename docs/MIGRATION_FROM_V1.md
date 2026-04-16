@@ -696,6 +696,96 @@ v2's `createPreCompactHook` in the Providers cluster fires before Claude Code tr
 
 ---
 
+## Post-Upstream-Launch Fork Maintenance
+
+When upstream officially launches v2 (merges v2 → main, tags a release, or otherwise stabilizes), your fork needs to be reconciled. Two scenarios, depending on when launch happens relative to your migration work.
+
+### Scenario A: You cut over BEFORE upstream launches v2
+
+You've completed Phases 1-4 and `dave/migration` is running in production, but upstream's v2 is still a branch. When upstream finally launches v2 (merges to main):
+
+1. **Sync upstream refs:**
+   ```bash
+   cd ~/nanoclaw-v2
+   git fetch upstream
+   ```
+
+2. **Replace your fork's `main` with the launched v2 work:**
+   ```bash
+   # Rebase your migration branch onto upstream's new main (which is now v2-based)
+   git checkout dave/migration
+   git rebase upstream/main
+   # Resolve any conflicts — likely minimal if you've been syncing regularly
+
+   # Fast-forward your fork's main to match
+   git checkout main
+   git reset --hard dave/migration
+   git push --force-with-lease origin main
+   ```
+
+3. **Your fork's `main` now = upstream/main + your customizations.** Future `/update-nanoclaw` workflows pull from upstream cleanly.
+
+### Scenario B: Upstream launches v2 BEFORE you cut over
+
+You're mid-migration on `dave/migration`. Upstream releases v2:
+
+1. **Sync upstream refs:**
+   ```bash
+   git fetch upstream
+   ```
+
+2. **Rebase `dave/migration` onto upstream's new main:**
+   ```bash
+   git checkout dave/migration
+   git rebase upstream/main
+   # Resolve any conflicts in port work that intersects with upstream changes
+   git push --force-with-lease origin dave/migration
+   ```
+
+3. **Continue port work** on `dave/migration` tracking the stable upstream/main instead of the volatile upstream/v2 branch.
+
+4. **When you're ready to cut over (Phase 4):** promote `dave/migration` to `main` on your fork:
+   ```bash
+   git checkout main
+   git reset --hard dave/migration
+   git push --force-with-lease origin main
+   ```
+
+### Safer Alternative: Merge Instead of Rebase
+
+If you prefer not to rewrite history (especially once `dave/migration` is pushed and others may have pulled), use merge instead:
+
+```bash
+git checkout main
+git merge dave/migration
+git push origin main
+```
+
+Rebase gives a cleaner history; merge preserves the full timeline. For a single-user fork, rebase is usually fine and cleaner.
+
+### Keeping Your Fork's `main` for v1 Rollback
+
+During Phase 4 cutover and for ~2 weeks after (per the rollback window), keep your existing `main` (v1 customizations) untouched. Only promote `dave/migration` → `main` once you're confident v2 is stable.
+
+Option: rename your current `main` to `v1-main` as an archive before overwriting:
+```bash
+git push origin main:v1-main     # Archive v1 customizations as v1-main branch
+# ... then later ...
+git checkout main
+git reset --hard dave/migration
+git push --force-with-lease origin main
+```
+
+That gives you a clean `v1-main` branch on your fork for reference/rollback, and `main` becomes the v2-based production branch.
+
+### Ongoing Upstream Sync
+
+Once settled on v2, pull upstream updates into your fork the same way as v1:
+- Use `/update-nanoclaw` skill when available for v2
+- Or manually: `git fetch upstream && git rebase upstream/main` on your customization branch
+
+---
+
 ## Reference
 
 ### Key v2 Files
