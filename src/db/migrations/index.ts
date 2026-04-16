@@ -8,6 +8,7 @@ import { migration004 } from './004-agent-destinations.js';
 import { migration007 } from './007-pending-approvals-title-options.js';
 import { migration008 } from './008-dropped-messages.js';
 import { migration009 } from './009-drop-pending-credentials.js';
+import { migration010 } from './010-memories.js';
 
 export interface Migration {
   version: number;
@@ -23,6 +24,7 @@ const migrations: Migration[] = [
   migration007,
   migration008,
   migration009,
+  migration010,
 ];
 
 export function runMigrations(db: Database.Database): void {

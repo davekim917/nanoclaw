@@ -166,3 +166,29 @@ export interface AgentDestination {
   target_id: string;
   created_at: string;
 }
+
+// ── Memories (central DB) ──
+
+export type MemoryType = 'user' | 'project' | 'reference' | 'feedback';
+
+/**
+ * Structured memory captured by the Haiku-based extraction system.
+ *
+ * - `user`: facts about people (preferences, roles, expertise)
+ * - `project`: facts about projects/codebases/decisions
+ * - `reference`: external resources (URLs, systems, docs)
+ * - `feedback`: user corrections or preferences about assistant behavior
+ *
+ * Scoped by `agent_group_id`. Cross-agent-group retrieval (if needed) is
+ * a separate concern — each agent sees only its own memories by default.
+ */
+export interface Memory {
+  id: string;
+  agent_group_id: string;
+  type: MemoryType;
+  name: string;
+  description: string;
+  content: string;
+  created_at: string;
+  updated_at: string;
+}
