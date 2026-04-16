@@ -73,11 +73,7 @@ export function getMemory(agentGroupId: string, id: string): Memory | undefined 
  *
  * Phase A: keyword search only. Phase C may add semantic vector search.
  */
-export function getRelevantMemories(
-  agentGroupId: string,
-  queryText: string | null,
-  limit = 6,
-): Memory[] {
+export function getRelevantMemories(agentGroupId: string, queryText: string | null, limit = 6): Memory[] {
   if (queryText && queryText.trim().length > 0) {
     const hits = searchMemoriesKeyword(agentGroupId, queryText, limit);
     if (hits.length > 0) return hits;

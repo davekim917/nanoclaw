@@ -12,9 +12,7 @@ describe('parseSlackWorkspaces', () => {
       SLACK_BOT_TOKEN: 'xoxb-primary',
       SLACK_SIGNING_SECRET: 'sig-primary',
     });
-    expect(ws).toEqual([
-      { channelType: 'slack', botToken: 'xoxb-primary', signingSecret: 'sig-primary' },
-    ]);
+    expect(ws).toEqual([{ channelType: 'slack', botToken: 'xoxb-primary', signingSecret: 'sig-primary' }]);
   });
 
   it('registers suffixed workspaces as channelType "slack-<suffix>" (lowercased)', () => {
@@ -43,9 +41,7 @@ describe('parseSlackWorkspaces', () => {
       SLACK_SIGNING_SECRET: 'sig-p',
       SLACK_BOT_TOKEN_ORPHAN: 'xoxb-orphan',
     });
-    expect(ws).toEqual([
-      { channelType: 'slack', botToken: 'xoxb-p', signingSecret: 'sig-p' },
-    ]);
+    expect(ws).toEqual([{ channelType: 'slack', botToken: 'xoxb-p', signingSecret: 'sig-p' }]);
   });
 
   it('skips workspaces missing a bot token', () => {

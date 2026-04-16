@@ -165,9 +165,7 @@ function buildPrompt(messages: ConversationMessage[], agentResponse: string, exi
   }
 
   const existingSection =
-    existing.length > 0
-      ? `\n## Existing Memories (do not duplicate)\n${formatExistingMemories(existing)}\n`
-      : '';
+    existing.length > 0 ? `\n## Existing Memories (do not duplicate)\n${formatExistingMemories(existing)}\n` : '';
 
   return `You are a memory extraction system. Analyze this conversation and decide what to remember, update, or delete for future conversations.
 
@@ -254,10 +252,7 @@ function parseResponse(raw: string): Extracted[] {
       (item: Record<string, unknown>) =>
         item &&
         typeof item === 'object' &&
-        (item.action === 'save' ||
-          item.action === 'update' ||
-          item.action === 'delete' ||
-          item.action === 'skip'),
+        (item.action === 'save' || item.action === 'update' || item.action === 'delete' || item.action === 'skip'),
     ) as Extracted[];
   } catch {
     log.debug('Memory extraction: failed to parse Haiku JSON', { raw: raw.slice(0, 200) });

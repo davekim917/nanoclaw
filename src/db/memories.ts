@@ -22,9 +22,9 @@ export function insertMemory(memory: Memory): void {
 }
 
 export function getMemoryById(agentGroupId: string, id: string): Memory | undefined {
-  return getDb()
-    .prepare('SELECT * FROM memories WHERE agent_group_id = ? AND id = ?')
-    .get(agentGroupId, id) as Memory | undefined;
+  return getDb().prepare('SELECT * FROM memories WHERE agent_group_id = ? AND id = ?').get(agentGroupId, id) as
+    | Memory
+    | undefined;
 }
 
 export function listMemories(agentGroupId: string, limit = 50): Memory[] {
@@ -34,16 +34,14 @@ export function listMemories(agentGroupId: string, limit = 50): Memory[] {
 }
 
 export function countMemories(agentGroupId: string): number {
-  const row = getDb()
-    .prepare('SELECT COUNT(*) as c FROM memories WHERE agent_group_id = ?')
-    .get(agentGroupId) as { c: number };
+  const row = getDb().prepare('SELECT COUNT(*) as c FROM memories WHERE agent_group_id = ?').get(agentGroupId) as {
+    c: number;
+  };
   return row.c;
 }
 
 export function deleteMemoryById(agentGroupId: string, id: string): boolean {
-  const info = getDb()
-    .prepare('DELETE FROM memories WHERE agent_group_id = ? AND id = ?')
-    .run(agentGroupId, id);
+  const info = getDb().prepare('DELETE FROM memories WHERE agent_group_id = ? AND id = ?').run(agentGroupId, id);
   return info.changes > 0;
 }
 
@@ -64,7 +62,9 @@ export function updateMemoryFields(
   };
 
   const info = getDb()
-    .prepare(`UPDATE memories SET ${setClause}, updated_at = @updated_at WHERE agent_group_id = @agent_group_id AND id = @id`)
+    .prepare(
+      `UPDATE memories SET ${setClause}, updated_at = @updated_at WHERE agent_group_id = @agent_group_id AND id = @id`,
+    )
     .run(params);
   return info.changes > 0;
 }

@@ -62,9 +62,7 @@ export function parseSlackWorkspaces(env: Record<string, string>): SlackWorkspac
   return workspaces;
 }
 
-const workspaces = parseSlackWorkspaces(
-  readEnvFileMatching(/^SLACK_(BOT_TOKEN|SIGNING_SECRET)(_[A-Za-z0-9]+)?$/),
-);
+const workspaces = parseSlackWorkspaces(readEnvFileMatching(/^SLACK_(BOT_TOKEN|SIGNING_SECRET)(_[A-Za-z0-9]+)?$/));
 
 for (const ws of workspaces) {
   registerChannelAdapter(ws.channelType, {

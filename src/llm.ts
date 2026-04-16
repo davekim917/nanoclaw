@@ -53,9 +53,7 @@ export async function callHaiku(
     opts.timeoutMs ? { timeout: opts.timeoutMs } : undefined,
   );
 
-  const text = response.content
-    .map((block) => (block.type === 'text' ? block.text : ''))
-    .join('');
+  const text = response.content.map((block) => (block.type === 'text' ? block.text : '')).join('');
 
   log.debug('callHaiku', {
     promptChars: prompt.length,
