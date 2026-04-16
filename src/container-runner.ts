@@ -1714,6 +1714,15 @@ export function buildVolumeMounts(
     // Explicitly keep auto-memory on (0 = not disabled). Locks the behavior
     // in case any upstream default flips.
     CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
+    // Lock the `opus` alias to 4.7. Model IDs are bundled into each SDK
+    // release, so when a new flagship is released (4.7 → …) but the
+    // installed SDK version doesn't know about it yet, the alias resolver
+    // silently falls back to the newest id it does know about (e.g. 4.6).
+    // `ANTHROPIC_DEFAULT_OPUS_MODEL` is the first-checked branch in the
+    // SDK's opus resolver (cli.js `LE()`), so it short-circuits the alias
+    // map and sends the explicit id to the API — which always knows about
+    // all current models. Keeps "opus" current even when SDK lags.
+    ANTHROPIC_DEFAULT_OPUS_MODEL: 'claude-opus-4-7',
   };
   const requiredSettings: Record<string, unknown> = {
     // Schema helps Claude Code recognize settings correctly
