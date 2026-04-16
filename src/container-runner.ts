@@ -2613,13 +2613,28 @@ function readSecrets(
     ...(isToolEnabled(tools, 'browser-auth')
       ? BROWSER_AUTH_KEYS.map((k) => scopedEnvKey(k, browserAuthOpts))
       : []),
-    // Anthropic API key + base URL — passed directly to the SDK via sdkEnv.
-    // When set, these bypass the OneCLI proxy for Claude API calls.
-    // ANTHROPIC_API_KEY + _N fallback variants, cycled on 429/upstream errors.
-    ...Object.keys(
-      readEnvFileMatching((k) => /^ANTHROPIC_API_KEY(_\d+)?$/.test(k)),
-    ),
-    'ANTHROPIC_BASE_URL',
+    // Anthropic auth — one of two modes, mutually exclusive.
+    //
+    // Mode 1 (preferred): CLAUDE_CODE_OAUTH_TOKEN in .env. Long-lived Bearer
+    // token from `claude setup-token`, authenticates as a Max subscription.
+    // Works against the real api.anthropic.com; no proxy, no custom base URL.
+    // When present, ANTHROPIC_API_KEY* and ANTHROPIC_BASE_URL are intentionally
+    // NOT forwarded so the SDK doesn't Bearer-auth against a proxy that only
+    // accepts API keys (e.g. openlimits).
+    //
+    // Mode 2 (fallback): ANTHROPIC_API_KEY [+ _N variants cycled on 429s] +
+    // ANTHROPIC_BASE_URL (typically a rate-limiting / routing proxy). Used
+    // automatically whenever CLAUDE_CODE_OAUTH_TOKEN is absent or commented out.
+    //
+    // To switch modes: (un)comment CLAUDE_CODE_OAUTH_TOKEN in .env.
+    ...(readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN']).CLAUDE_CODE_OAUTH_TOKEN
+      ? ['CLAUDE_CODE_OAUTH_TOKEN']
+      : [
+          ...Object.keys(
+            readEnvFileMatching((k) => /^ANTHROPIC_API_KEY(_\d+)?$/.test(k)),
+          ),
+          'ANTHROPIC_BASE_URL',
+        ]),
   ];
   const secrets = readEnvFile(envKeys);
 
