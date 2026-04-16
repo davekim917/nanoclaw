@@ -234,6 +234,14 @@ async function buildContainerArgs(
   args.push('-e', `NANOCLAW_AGENT_GROUP_ID=${agentGroup.id}`);
   args.push('-e', `NANOCLAW_AGENT_GROUP_NAME=${agentGroup.name}`);
 
+  // Claude Code behavior locks — duplicated from settings.json env block so
+  // the values are set in the container's process env regardless of the
+  // SDK's settings-loading order. Auto-memory is our cross-thread context
+  // backbone (Phase 2.8); the compact override keeps us below the hard
+  // context limit to avoid silent model-fallback on upstream 400 errors.
+  args.push('-e', 'CLAUDE_CODE_DISABLE_AUTO_MEMORY=0');
+  args.push('-e', 'CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80');
+
   // Users allowed to run admin commands (e.g. /clear) inside this container.
   // Computed at wake time: owners + global admins + admins scoped to this
   // agent group. Role changes take effect on next container spawn.
