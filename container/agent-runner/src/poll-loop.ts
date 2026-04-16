@@ -318,7 +318,7 @@ async function processQuery(query: AgentQuery, routing: RoutingContext, config: 
   return { continuation: queryContinuation };
 }
 
-function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
+function handleEvent(event: ProviderEvent, routing: RoutingContext): void {
   switch (event.type) {
     case 'init':
       log(`Session: ${event.continuation}`);
@@ -331,6 +331,18 @@ function handleEvent(event: ProviderEvent, _routing: RoutingContext): void {
       break;
     case 'progress':
       log(`Progress: ${event.message}`);
+      // Emit a kind='status' message so the host can deliver it as a
+      // post-then-edit progress line. Host tracks the platform_message_id
+      // per session so subsequent progress events edit in place, and the
+      // tracking clears when a real chat message lands.
+      writeMessageOut({
+        id: generateId(),
+        kind: 'status',
+        platform_id: routing.platformId,
+        channel_type: routing.channelType,
+        thread_id: routing.threadId,
+        content: JSON.stringify({ text: event.message }),
+      });
       break;
   }
 }

@@ -9,6 +9,7 @@ import path from 'path';
 import { DATA_DIR } from './config.js';
 import { initDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
+import { registerSecretsFromEnv } from './secret-scrubber.js';
 import { getMessagingGroupsByChannel, getMessagingGroupAgents } from './db/messaging-groups.js';
 import { ensureContainerRuntimeRunning, cleanupOrphans } from './container-runtime.js';
 import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, stopDeliveryPolls } from './delivery.js';
@@ -42,6 +43,11 @@ import { initChannelAdapters, teardownChannelAdapters, getChannelAdapter } from 
 
 async function main(): Promise<void> {
   log.info('NanoClaw v2 starting');
+
+  // 0. Register secret values from .env for outbound scrubbing. Cheap; does
+  //    a no-op if .env is missing. Runs first so subsequent startup logs
+  //    get scrubbed too.
+  registerSecretsFromEnv();
 
   // 1. Init central DB
   const dbPath = path.join(DATA_DIR, 'v2.db');

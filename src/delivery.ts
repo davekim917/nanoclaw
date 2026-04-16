@@ -36,6 +36,7 @@ import {
   updateTask,
 } from './db/session-db.js';
 import { log } from './log.js';
+import { scrubSecrets } from './secret-scrubber.js';
 import { normalizeOptions, type RawOption } from './channels/ask-question.js';
 import {
   heartbeatPath,
@@ -59,6 +60,15 @@ const MAX_DELIVERY_ATTEMPTS = 3;
 
 /** Track delivery attempt counts. Resets on process restart (gives failed messages a fresh chance). */
 const deliveryAttempts = new Map<string, number>();
+
+/**
+ * Per-session tracking of the currently-visible status line's
+ * platform_message_id. First `kind='status'` in a turn posts a fresh
+ * message and caches the returned id here; subsequent status events
+ * in the same turn edit that message in place. Cleared on real chat
+ * delivery so the next turn starts with a fresh status line.
+ */
+const statusTracking = new Map<string, string>();
 
 export interface ChannelDeliveryAdapter {
   deliver(
@@ -532,6 +542,44 @@ async function deliverMessage(
     }
   }
 
+  // Status messages — post-then-edit per session. First status in a turn
+  // posts a fresh line; subsequent statuses edit it in place. The tracking
+  // clears when a real chat message delivers (handled at the end), so the
+  // next turn starts with a new status line instead of clobbering history.
+  if (msg.kind === 'status') {
+    if (!msg.channel_type || !msg.platform_id) {
+      log.warn('Status message missing routing fields, dropping', { id: msg.id });
+      return;
+    }
+    const existingPlatformMsgId = statusTracking.get(session.id);
+    let outbound = scrubSecrets(msg.content);
+    if (existingPlatformMsgId) {
+      const parsed = JSON.parse(outbound);
+      outbound = JSON.stringify({
+        operation: 'edit',
+        messageId: existingPlatformMsgId,
+        text: parsed.text,
+      });
+    }
+    const platformMsgId = await deliveryAdapter.deliver(
+      msg.channel_type,
+      msg.platform_id,
+      msg.thread_id,
+      msg.kind,
+      outbound,
+    );
+    if (platformMsgId && !existingPlatformMsgId) {
+      statusTracking.set(session.id, platformMsgId);
+    }
+    log.info('Status delivered', {
+      id: msg.id,
+      sessionId: session.id,
+      mode: existingPlatformMsgId ? 'edit' : 'post',
+      platformMsgId: platformMsgId ?? existingPlatformMsgId,
+    });
+    return;
+  }
+
   // Track pending questions for ask_user_question flow
   if (content.type === 'ask_question' && content.questionId) {
     const title = content.title as string | undefined;
@@ -578,12 +626,18 @@ async function deliverMessage(
     if (files.length === 0) files = undefined;
   }
 
+  // Scrub any registered secret values out of outbound text before it
+  // reaches the adapter. Defense-in-depth — OneCLI already keeps API keys
+  // away from the agent, but scrub content anyway in case an agent ever
+  // ends up with a secret (e.g. by reading a file) and tries to echo it.
+  const scrubbedContent = scrubSecrets(msg.content);
+
   const platformMsgId = await deliveryAdapter.deliver(
     msg.channel_type,
     msg.platform_id,
     msg.thread_id,
     msg.kind,
-    msg.content,
+    scrubbedContent,
     files,
   );
   log.info('Message delivered', {
@@ -593,6 +647,13 @@ async function deliverMessage(
     platformMsgId,
     fileCount: files?.length,
   });
+
+  // A real chat message supersedes any in-flight progress status — clear
+  // the tracking so the next turn's progress events post a fresh line
+  // instead of editing a now-stale status line above the final answer.
+  if (msg.kind === 'chat') {
+    statusTracking.delete(session.id);
+  }
 
   // Clean up outbox directory after successful delivery
   if (fs.existsSync(outboxDir)) {

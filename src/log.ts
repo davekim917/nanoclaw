@@ -39,11 +39,19 @@ function ts(): string {
   return `${hh}:${mm}:${ss}.${ms}`;
 }
 
+// Pluggable scrubber — the secret-scrubber module wires this on load to
+// avoid a circular import (secret-scrubber itself logs via this module).
+let scrubber: ((s: string) => string) | null = null;
+export function setLogScrubber(fn: (s: string) => string): void {
+  scrubber = fn;
+}
+
 function emit(level: Level, msg: string, data?: Record<string, unknown>): void {
   if (LEVELS[level] < threshold) return;
   const tag = `${COLORS[level]}${level.toUpperCase()}${level === 'fatal' ? FULL_RESET : RESET}`;
   const stream = LEVELS[level] >= LEVELS.warn ? process.stderr : process.stdout;
-  stream.write(`[${ts()}] ${tag} ${MSG_COLOR}${msg}${RESET}${data ? formatData(data) : ''}\n`);
+  const raw = `[${ts()}] ${tag} ${MSG_COLOR}${msg}${RESET}${data ? formatData(data) : ''}\n`;
+  stream.write(scrubber ? scrubber(raw) : raw);
 }
 
 export const log = {
