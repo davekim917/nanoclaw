@@ -595,6 +595,9 @@ Run both instances simultaneously. Route test channels to v2, production stays o
 - [ ] Thread search: "find the thread where we discussed X" returns the correct thread + summary (2.9)
 - [ ] Permalink resolver: pasting a Slack/Discord thread link lets the agent load that thread's content (2.10)
 - [ ] Cross-thread context: a new thread can reference facts mentioned in a prior thread via auto-memory (2.8) OR raw history lookup (2.9)
+- [ ] Repo work: agent can clone a GitHub repo, make a branch via worktree, commit, push, and open a PR end-to-end (2.11)
+- [ ] Concurrent repo work: two threads can work on the same repo simultaneously without index-lock collisions (2.11)
+- [ ] PR-merge GC: after merging a PR on GitHub, the agent's worktree is reaped within one cron cycle (2.11)
 - [ ] Agent can use all required tools (dbt, git, gcloud, etc.)
 - [ ] Typing indicators appear and clear correctly
 - [ ] File attachments send successfully (including per-platform size limit validation)
@@ -722,6 +725,7 @@ These features exist in the v1 fork but may not be needed. Evaluate after runnin
 | T3.3 | **Complexity classifier** | `src/complexity-classifier.ts` | Was this actually useful in v1? Did it change routing decisions? | Low |
 | T3.4 | **Commit digest / attribution** | `src/commit-digest.ts` | Nice for tracking but not essential. Worth the maintenance? | Low |
 | ~~T3.5~~ | ~~Thread search (FTS5 + Haiku)~~ | ~~`src/thread-search.ts`~~ | **Promoted to Tier 1 as Phase 2.9 (2026-04-16). Daily-use feature for "find thread where we discussed X".** | ~~Medium~~ |
+| ~~T3.6~~ | ~~Worktree management~~ | ~~`src/ipc.ts`, `src/worktree-cleanup.ts`~~ | **Promoted to Tier 1 as Phase 2.11 (2026-04-17). Per-thread worktrees off group-level canonical clones. Daily-use — Axie-2 can't do real engineering work without this. See [PHASE_2_11_GIT_WORKTREES.md](PHASE_2_11_GIT_WORKTREES.md).** | ~~High~~ |
 | T3.6 | **Worktree management** | `src/ipc.ts`, `src/worktree-cleanup.ts` | v2's per-session container isolation may replace the need. Do agents still need host-side worktrees? | High |
 | T3.7 | **Blueprint workshop** | Multiple files | Was this completed in v1? Is it still relevant? | Medium |
 | T3.8 | **Mermaid rendering** | `container/Dockerfile` | v2 has Chromium in base. Add mermaid-cli to container.json if needed. | Low |
