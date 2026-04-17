@@ -35,7 +35,14 @@ function openDb(): Database.Database {
   if (_db) return _db;
   fs.mkdirSync(DATA_DIR, { recursive: true });
   const db = new Database(ARCHIVE_PATH);
-  db.pragma('journal_mode = WAL');
+  // TRUNCATE (not WAL). We have one writer (host) and many cross-process
+  // readers (containers reading via a read-only mount of archive.db only).
+  // In WAL mode readers need access to the -wal and -shm sidecar files; we
+  // don't mount those into the container, so WAL writes would be invisible
+  // to the MCP tools. TRUNCATE flushes every write straight to the main
+  // file, which containers see immediately. Write volume is per-chat-
+  // message so the perf delta vs WAL is a non-issue.
+  db.pragma('journal_mode = TRUNCATE');
   db.pragma('synchronous = NORMAL');
   initSchema(db);
   _db = db;
@@ -143,11 +150,7 @@ function sanitizeFtsQuery(q: string): string {
     .join(' ');
 }
 
-export function searchThreadsFTS(
-  agentGroupId: string,
-  query: string,
-  limit = 10,
-): ArchiveSearchHit[] {
+export function searchThreadsFTS(agentGroupId: string, query: string, limit = 10): ArchiveSearchHit[] {
   const sanitized = sanitizeFtsQuery(query);
   if (!sanitized) return [];
   const db = openDb();
