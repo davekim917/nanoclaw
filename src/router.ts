@@ -17,6 +17,7 @@
  * wherever possible so the gate can land on a real user row.
  */
 import { canAccessAgentGroup } from './access.js';
+import { persistInboundAttachments } from './attachment-downloader.js';
 import { upsertArchiveMessage } from './message-archive.js';
 import { getChannelAdapter } from './channels/channel-registry.js';
 import { isMember } from './db/agent-group-members.js';
@@ -157,6 +158,17 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
 
   // 6. Write message to session DB
   const messageId = event.message.id || generateId();
+
+  // Persist any base64-encoded attachments from chat-sdk-bridge onto the
+  // session's workspace disk so the agent can actually Read them. This
+  // mutates the JSON content to drop `data` and add `localPath`.
+  const persistedContent = persistInboundAttachments(
+    session.agent_group_id,
+    session.id,
+    messageId,
+    event.message.content,
+  );
+
   writeSessionMessage(session.agent_group_id, session.id, {
     id: messageId,
     kind: event.message.kind,
@@ -164,7 +176,7 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
     platformId: event.platformId,
     channelType: event.channelType,
     threadId: event.threadId,
-    content: event.message.content,
+    content: persistedContent,
   });
 
   // 6b. Mirror chat-kind inbound into the central archive (2.9). Non-chat
