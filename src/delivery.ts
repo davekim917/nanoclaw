@@ -685,17 +685,15 @@ async function deliverMessage(
       const parsed = JSON.parse(scrubbedContent) as Record<string, unknown>;
       // In edit mode, scrubbedContent was wrapped — unwrap the text.
       const text =
-        typeof parsed.text === 'string'
-          ? parsed.text
-          : typeof parsed.content === 'string'
-            ? parsed.content
-            : '';
+        typeof parsed.text === 'string' ? parsed.text : typeof parsed.content === 'string' ? parsed.content : '';
       if (text && msg.channel_type && msg.platform_id) {
+        const mg = getMessagingGroupByPlatform(msg.channel_type, msg.platform_id);
         upsertArchiveMessage({
           id: msg.id,
           agentGroupId: session.agent_group_id,
           messagingGroupId: session.messaging_group_id,
           channelType: msg.channel_type,
+          channelName: mg?.name ?? null,
           platformId: msg.platform_id,
           threadId: msg.thread_id,
           role: 'assistant',

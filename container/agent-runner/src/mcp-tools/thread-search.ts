@@ -53,6 +53,7 @@ function sanitizeFtsQuery(q: string): string {
 interface SearchHitRow {
   thread_id: string | null;
   channel_type: string;
+  channel_name: string | null;
   platform_id: string | null;
   latest_message_at: string;
   match_count: number;
@@ -94,6 +95,7 @@ export const searchThreadsTool: McpToolDefinition = {
           `SELECT
              a.thread_id,
              a.channel_type,
+             MAX(a.channel_name) AS channel_name,
              a.platform_id,
              MAX(a.sent_at) AS latest_message_at,
              COUNT(*) AS match_count,
@@ -116,7 +118,8 @@ export const searchThreadsTool: McpToolDefinition = {
     if (rows.length === 0) return ok('No threads matched that query.');
 
     const lines = rows.map((r, i) => {
-      const loc = r.thread_id ? `${r.channel_type}:${r.platform_id}:${r.thread_id}` : `${r.channel_type}:${r.platform_id}`;
+      const where = r.channel_name ? `#${r.channel_name}` : `${r.channel_type}:${r.platform_id}`;
+      const loc = r.thread_id ? `${where} thread=${r.thread_id}` : where;
       return `${i + 1}. ${loc}\n   ${r.match_count} match(es), latest ${r.latest_message_at}\n   …${r.first_snippet ?? ''}…`;
     });
     return ok(`Found ${rows.length} thread(s):\n\n${lines.join('\n\n')}`);
@@ -128,6 +131,7 @@ interface TranscriptRow {
   sender_name: string | null;
   text: string;
   sent_at: string;
+  channel_name: string | null;
 }
 
 function parseSlackUrl(url: string): { channel: string; ts: string; threadTs?: string } | null {
@@ -203,7 +207,7 @@ export const resolveThreadLinkTool: McpToolDefinition = {
     try {
       rows = db
         .prepare(
-          `SELECT role, sender_name, text, sent_at
+          `SELECT role, sender_name, text, sent_at, channel_name
            FROM messages_archive
            WHERE agent_group_id = ?
              AND channel_type LIKE ?
@@ -219,10 +223,14 @@ export const resolveThreadLinkTool: McpToolDefinition = {
 
     if (rows.length === 0) return ok('No archived messages found for that link.');
 
+    const channelName = rows.find((r) => r.channel_name)?.channel_name ?? null;
+    const header = channelName
+      ? `Thread transcript from #${channelName} (${rows.length} message(s)):`
+      : `Thread transcript (${rows.length} message(s)):`;
     const transcript = rows
       .map((r) => `[${r.sent_at}] ${r.sender_name ?? r.role}: ${r.text}`)
       .join('\n');
-    return ok(`Thread transcript (${rows.length} message(s)):\n\n${transcript}`);
+    return ok(`${header}\n\n${transcript}`);
   },
 };
 

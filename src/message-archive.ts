@@ -56,6 +56,7 @@ function initSchema(db: Database.Database): void {
       agent_group_id      TEXT NOT NULL,
       messaging_group_id  TEXT,
       channel_type        TEXT NOT NULL,
+      channel_name        TEXT,
       platform_id         TEXT,
       thread_id           TEXT,
       role                TEXT NOT NULL,     -- 'user' | 'assistant' | 'system'
@@ -65,6 +66,16 @@ function initSchema(db: Database.Database): void {
       sent_at             TEXT NOT NULL,
       created_at          TEXT NOT NULL DEFAULT (datetime('now'))
     );
+    -- Additive migration for pre-existing archives that were created
+    -- without the channel_name column. No-op if the column already
+    -- exists (we swallow the SQLITE_ERROR below).
+  `);
+  try {
+    db.exec('ALTER TABLE messages_archive ADD COLUMN channel_name TEXT');
+  } catch {
+    // column already exists
+  }
+  db.exec(`
     CREATE INDEX IF NOT EXISTS idx_archive_ag_sent ON messages_archive(agent_group_id, sent_at);
     CREATE INDEX IF NOT EXISTS idx_archive_thread ON messages_archive(agent_group_id, thread_id, sent_at);
     CREATE INDEX IF NOT EXISTS idx_archive_channel ON messages_archive(channel_type, platform_id, thread_id);
@@ -98,6 +109,7 @@ export interface ArchiveMessage {
   agentGroupId: string;
   messagingGroupId: string | null;
   channelType: string;
+  channelName: string | null;
   platformId: string | null;
   threadId: string | null;
   role: 'user' | 'assistant' | 'system';
@@ -110,11 +122,12 @@ export interface ArchiveMessage {
 const upsertStmt = () =>
   openDb().prepare(
     `INSERT INTO messages_archive
-       (id, agent_group_id, messaging_group_id, channel_type, platform_id, thread_id, role, sender_id, sender_name, text, sent_at)
-     VALUES (@id, @agentGroupId, @messagingGroupId, @channelType, @platformId, @threadId, @role, @senderId, @senderName, @text, @sentAt)
+       (id, agent_group_id, messaging_group_id, channel_type, channel_name, platform_id, thread_id, role, sender_id, sender_name, text, sent_at)
+     VALUES (@id, @agentGroupId, @messagingGroupId, @channelType, @channelName, @platformId, @threadId, @role, @senderId, @senderName, @text, @sentAt)
      ON CONFLICT(id) DO UPDATE SET
        text = excluded.text,
-       sender_name = excluded.sender_name
+       sender_name = excluded.sender_name,
+       channel_name = COALESCE(excluded.channel_name, channel_name)
      WHERE excluded.text IS NOT NULL`,
   );
 

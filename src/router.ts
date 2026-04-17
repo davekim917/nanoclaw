@@ -179,6 +179,7 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
           agentGroupId: session.agent_group_id,
           messagingGroupId: mg.id,
           channelType: event.channelType,
+          channelName: mg.name ?? null,
           platformId: event.platformId,
           threadId: event.threadId,
           role: 'user',
