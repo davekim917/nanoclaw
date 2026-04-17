@@ -175,24 +175,57 @@ instead of `data/worktrees/<group>/<threadId>/<repo>/`. Need to walk
 all sessions. That's already feasible via `getAllAgentGroups()` +
 glob.
 
-### Credentials
+### Credentials — resolved (pre-flight 2026-04-17)
 
-`gh pr create` needs `GITHUB_TOKEN` available inside the container.
-OneCLI already intercepts API calls for Anthropic — needs to do the
-same for `api.github.com`. Two possibilities:
+**Decision: Option 1 (OneCLI transparent proxy) + `GH_TOKEN`
+placeholder.** Validated end-to-end. No real token ever enters the
+container env.
 
-1. **OneCLI transparent proxy** — `gh` talks to `api.github.com`,
-   OneCLI proxy injects the token. Needs OneCLI's `agent-vault` to
-   have a `github` secret assigned to the agent group's OneCLI agent
-   (parallel to how Anthropic secret works).
-2. **Env var injection** — container-runner reads the GitHub token
-   from OneCLI at spawn time and passes it as `GITHUB_TOKEN` in the
-   container env. Simpler. `gh auth status` will pick it up.
+Verified facts:
 
-Dave has `GITHUB_TOKEN` and `GITHUB_TOKEN_ILLYSIUM` in his .env today.
-Per-group scoping in v2 is natural: each agent group's OneCLI agent
-has the right GitHub secret assigned. Need to confirm OneCLI supports
-this pattern out of the box. **Validate before coding.**
+- OneCLI 1.1.0 vault already had `GitHub` (personal) and
+  `GitHub-Illysium` secrets with `hostPattern=api.github.com` and
+  `injectionConfig: { headerName: "Authorization", valueFormat:
+  "token {value}" }`.
+- `GET /api/container-config?agent=<identifier>` returns a per-agent
+  `HTTPS_PROXY` URL (the proxy-side auth uses the agent's own token,
+  not the default agent's). Confirmed by diffing responses for
+  `ag-1776402507183-cf39lq` (Axie-2) vs the no-agent default call.
+- `applyContainerConfig` in the SDK also mounts the gateway CA at
+  `/tmp/onecli-gateway-ca.pem` and sets `NODE_EXTRA_CA_CERTS` — so
+  any TLS client that honors `SSL_CERT_FILE` or that env var
+  transparently trusts the proxy's MITM cert.
+- `curl --cacert /tmp/onecli-gateway-ca.pem https://api.github.com/user`
+  via the proxy returns `200 OK` with no local token present — proves
+  the proxy injection fires for generic HTTPS clients.
+- `gh` short-circuits locally if `GH_TOKEN`/`GITHUB_TOKEN` is unset,
+  so it never hits the proxy at all — OneCLI injection can't help on
+  its own. Fix: set `GH_TOKEN=placeholder-for-proxy-injection` in the
+  container env. `gh` then sends a request (with the placeholder in
+  its `Authorization` header), the OneCLI proxy rewrites the header
+  using the vault secret, and GitHub sees the real token. Confirmed:
+  `gh api user` returned `davekim917` for Axie-2 (assigned to
+  `GitHub`) and the expected Illysium-scoped identity for illie-v2
+  (assigned to `GitHub-Illysium`).
+- Same mechanic OneCLI already uses for `CLAUDE_CODE_OAUTH_TOKEN=placeholder`.
+
+Per-group tokens in v2: each agent_group's OneCLI agent is assigned
+the right GitHub secret. Already done for the first two:
+
+| Agent group | OneCLI agent ID | Assigned GitHub secret |
+|---|---|---|
+| main (Axie-2) | `7c6390f4-78ac-4800-8cb8-fa7c0619a4d1` | `GitHub` (personal) |
+| illie-v2 | `a05be189-187e-48eb-bb79-b40a034eddfb` | `GitHub-Illysium` |
+
+`container-runner.ts` change: add one line —
+`args.push('-e', 'GH_TOKEN=placeholder-for-proxy-injection')`.
+Do **not** add any path to read the real token out of OneCLI and
+into the env.
+
+Open follow-ups (not blockers): the Illysium token returned no orgs
+— likely a user-scoped PAT without `read:org` scope. Fine for cloning
+and PR-opening against specific repos that Dave owns or has been
+added to. Flag for Dave to rotate if we need org listing later.
 
 ### Blocked `git clone` error messaging
 
@@ -217,11 +250,15 @@ group.
 
 ## Order of work
 
-1. **Pre-flight: validate OneCLI can inject `GITHUB_TOKEN`** into the
-   container. `onecli agents secrets` inspection + a test spawn with
-   `gh auth status` inside. If yes → option 1 (proxy). If no → option 2
-   (env var) + wire `container-runner.ts`.
-2. **Build MCP tools** in `container/agent-runner/src/mcp-tools/git-worktrees.ts`.
+1. ~~**Pre-flight: validate OneCLI can inject `GITHUB_TOKEN`**~~ **Done
+   2026-04-17.** Option 1 chosen. See "Credentials — resolved" above.
+   T3.6 is unblocked.
+2. **Wire `container-runner.ts`**: add
+   `args.push('-e', 'GH_TOKEN=placeholder-for-proxy-injection')` in
+   the env-building block alongside the other
+   `CLAUDE_CODE_DISABLE_AUTO_MEMORY`/`CLAUDE_AUTOCOMPACT_PCT_OVERRIDE`
+   lines. One-liner.
+3. **Build MCP tools** in `container/agent-runner/src/mcp-tools/git-worktrees.ts`.
 3. **Register** in `mcp-tools/index.ts`.
 4. **Sync into illysium-v2 group's `agent-runner-src/` mount** (same
    pattern as earlier tool pushes during this migration).
@@ -261,14 +298,12 @@ group.
 
 ## Open questions (to resolve during implementation)
 
-1. **OneCLI GitHub token injection.** See pre-flight above. If
-   OneCLI-proxy doesn't cover `api.github.com`, does `gh`'s
-   `GITHUB_TOKEN` env var trump the `HTTPS_PROXY`? Test empirically.
-2. **Per-group GitHub tokens.** Dave has `GITHUB_TOKEN` (personal)
-   and `GITHUB_TOKEN_ILLYSIUM`. v2's OneCLI agent per agent_group
-   should resolve this — each agent_group gets the right one
-   assigned. Need to verify the assignment UX and that `gh` picks it
-   up.
+1. ~~**OneCLI GitHub token injection.**~~ Resolved — see "Credentials"
+   above. Proxy works for `curl`/raw HTTPS natively; `gh` needs a
+   placeholder `GH_TOKEN` to not short-circuit locally.
+2. ~~**Per-group GitHub tokens.**~~ Resolved — each agent_group's
+   OneCLI agent gets the right secret assigned. Done for Axie-2 and
+   illie-v2.
 3. **`git worktree` inside the container — does it actually resolve
    the `.git` pointer correctly?** Should work because everything's in
    container paths. But verify early — this is the assumption that
