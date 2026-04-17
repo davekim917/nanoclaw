@@ -21,7 +21,6 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.90.0",
     "@beeper/chat-adapter-matrix": "^0.2.0",
     "@bitbasti/chat-adapter-webex": "^0.1.0",
     "@chat-adapter/discord": "^4.24.0",

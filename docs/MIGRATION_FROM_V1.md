@@ -399,14 +399,28 @@ These features are native in v2 and should work without porting. Verify they do.
 - [ ] Tested on Discord
 - [ ] Verified status messages get edited in place, not duplicated
 
-### 2.5 Memory Extraction (Haiku-Based, Interval)
+### 2.5 Memory Extraction (Haiku-Based) — DROPPED 2026-04-17
 
-**Effort:** High — largest port item
+**Outcome:** Dropped in favor of Claude Code's native auto-memory (Phase 2.8).
 
-**Scope clarification (2026-04-16):** Memory extraction stores *curated facts* distilled from conversations ("Dave prefers per-thread sessions"). It does NOT store raw conversation content — that's what Phase 2.9 (thread search) does. The three mechanisms are complementary:
-- **2.5 Memory extraction** — facts, preferences, decisions → cross-thread recall of *what's true*
-- **2.8 Auto-memory** — Claude Code's native shared memory directory across threads in a group
-- **2.9 Thread search** — raw conversation FTS → "find the thread where we discussed X"
+**Why:** Empirical test on illysium-v2 showed native auto-memory already extracts structured facts correctly after a single chat turn (produced `MEMORY.md` + `user_dave_kim.md` with name, role, preferences — matching the v1 Haiku extractor's output shape). v2's native auto-memory is more reliable than v1's was because autoDreamEnabled (2.8) adds background grooming + the shared `.claude-shared` mount gives cross-thread persistence for free.
+
+The Haiku-based layer was originally planned as a *complement* to weaker native support. With native now strong, Haiku extraction became redundant — and it hit a hard blocker anyway: the Anthropic API rejects `CLAUDE_CODE_OAUTH_TOKEN` for direct SDK calls (`OAuth authentication is currently not supported`). Getting it working would require either `ANTHROPIC_API_KEY` in `.env` or routing host-side Haiku through OneCLI's proxy — neither of which was worth the cost once native was proven sufficient.
+
+**What was removed:**
+- `src/memory-extractor.ts`, `src/memory-store.ts`, `src/memory-projection.ts`, `src/conversation-history.ts`, `src/llm.ts`
+- Delivery hook in `src/delivery.ts`
+- `@anthropic-ai/sdk` host dependency
+- `memories.md` injection via CLAUDE.md @-import
+
+**What was kept (as optional infrastructure):**
+- `src/db/migrations/010-memories.ts` + `src/db/memories.ts` — table remains in `v2.db`, unused but available if we ever add embeddings-based semantic retrieval (Phase C, promoted version).
+- `Memory` / `MemoryType` types in `src/types.ts`.
+
+**Cross-reference:**
+- Structured facts → **Phase 2.8** (native auto-memory, done).
+- Raw conversation recall → **Phase 2.9** (thread search FTS, pending).
+- Semantic retrieval (optional future) → Phase C — would vectorize either memories or thread text into sqlite-vec; separate concern from fact extraction.
 
 **v1 source files:**
 - `~/nanoclaw/src/memory-extractor.ts` — extraction logic, prompt building, response parsing
@@ -577,10 +591,10 @@ Run both instances simultaneously. Route test channels to v2, production stays o
 - [ ] Thread isolation works (concurrent threads don't interfere)
 - [ ] Long sessions (~50+ tool calls) show progress updates and don't time out
 - [ ] Destructive commands trigger approval flow (Claude Code permission prompts + pending_approvals for self-mod)
-- [ ] Memory extraction captures user preferences and project context
+- [x] Memory captures user preferences and project context — native auto-memory (2.8) verified writing `MEMORY.md` + linked files from a single chat turn on illysium-v2 (2026-04-17)
 - [ ] Thread search: "find the thread where we discussed X" returns the correct thread + summary (2.9)
 - [ ] Permalink resolver: pasting a Slack/Discord thread link lets the agent load that thread's content (2.10)
-- [ ] Cross-thread context: a new thread can reference facts mentioned in a prior thread via memory (2.5) OR raw history lookup (2.9)
+- [ ] Cross-thread context: a new thread can reference facts mentioned in a prior thread via auto-memory (2.8) OR raw history lookup (2.9)
 - [ ] Agent can use all required tools (dbt, git, gcloud, etc.)
 - [ ] Typing indicators appear and clear correctly
 - [ ] File attachments send successfully (including per-platform size limit validation)

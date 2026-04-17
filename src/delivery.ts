@@ -37,8 +37,6 @@ import {
 } from './db/session-db.js';
 import { log } from './log.js';
 import { scrubSecrets } from './secret-scrubber.js';
-import { gatherRecentConversation } from './conversation-history.js';
-import { extractMemoriesAsync } from './memory-extractor.js';
 import { normalizeOptions, type RawOption } from './channels/ask-question.js';
 import {
   heartbeatPath,
@@ -679,23 +677,6 @@ async function deliverMessage(
   // instead of editing a now-stale status line above the final answer.
   if (msg.kind === 'chat') {
     statusTracking.delete(session.id);
-
-    // Fire-and-forget memory extraction. Throttled inside (60s per session),
-    // deduped via in-flight set, and catches its own errors so a Haiku hiccup
-    // can't break delivery. Uses the session's inbound+outbound history.
-    try {
-      const messages = gatherRecentConversation(session.agent_group_id, session.id, 20);
-      let latestText = '';
-      try {
-        const parsed = JSON.parse(msg.content) as { text?: unknown };
-        if (typeof parsed.text === 'string') latestText = parsed.text;
-      } catch {
-        // ignore
-      }
-      extractMemoriesAsync(session.agent_group_id, session.id, messages, latestText);
-    } catch (err) {
-      log.warn('Failed to schedule memory extraction', { sessionId: session.id, err });
-    }
   }
 
   // Clean up outbox directory after successful delivery
