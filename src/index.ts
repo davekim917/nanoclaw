@@ -14,6 +14,7 @@ import { getMessagingGroupsByChannel, getMessagingGroupAgents } from './db/messa
 import { ensureContainerRuntimeRunning, cleanupOrphans } from './container-runtime.js';
 import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, stopDeliveryPolls } from './delivery.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
+import { startWorktreeCleanup, stopWorktreeCleanup } from './worktree-cleanup.js';
 import {
   ONECLI_ACTION,
   resolveOneCLIApproval,
@@ -128,7 +129,11 @@ async function main(): Promise<void> {
   startHostSweep();
   log.info('Host sweep started');
 
-  // 7. Start OneCLI manual-approval handler
+  // 7. Start worktree cleanup cron (6h, first run 60s after startup)
+  startWorktreeCleanup();
+  log.info('Worktree cleanup started');
+
+  // 8. Start OneCLI manual-approval handler
   startOneCLIApprovalHandler(deliveryAdapter);
 
   log.info('NanoClaw v2 running');
@@ -338,6 +343,7 @@ async function shutdown(signal: string): Promise<void> {
   stopOneCLIApprovalHandler();
   stopDeliveryPolls();
   stopHostSweep();
+  stopWorktreeCleanup();
   await teardownChannelAdapters();
   process.exit(0);
 }
