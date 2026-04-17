@@ -3,8 +3,12 @@
 
 FROM node:22-slim
 
-# Install system dependencies for Chromium
+# Install system dependencies for Chromium + agent tooling
+# (Phase 1.5 base image: Illysium critical-path tools. Niche tools like
+# gcloud, AWS, mermaid-cli, ffmpeg go in per-group container.json via
+# install_packages.)
 RUN apt-get update && apt-get install -y \
+    # Chromium runtime
     chromium \
     fonts-liberation \
     fonts-noto-cjk \
@@ -22,16 +26,52 @@ RUN apt-get update && apt-get install -y \
     libcups2 \
     libdrm2 \
     libxshmfence1 \
+    # Core CLI tooling
     curl \
     git \
+    jq \
+    less \
+    ca-certificates \
+    # Data platform clients
+    postgresql-client \
+    redis-tools \
+    # Python runtime (for dbt, snowflake-cli, data analysis)
+    python3 \
+    python3-pip \
+    python3-venv \
     && rm -rf /var/lib/apt/lists/*
+
+# GitHub CLI (official apt repo)
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update \
+    && apt-get install -y gh \
+    && rm -rf /var/lib/apt/lists/*
+
+# Data tools via isolated venv (PEP 668 — Debian disallows system-wide pip).
+# Exposed on PATH so agents use `dbt` / `snow` without activating the venv.
+ENV DATA_TOOLS_VENV=/opt/data-tools
+ENV PATH="${DATA_TOOLS_VENV}/bin:${PATH}"
+RUN python3 -m venv "${DATA_TOOLS_VENV}" \
+    && "${DATA_TOOLS_VENV}/bin/pip" install --no-cache-dir --upgrade pip setuptools wheel \
+    && "${DATA_TOOLS_VENV}/bin/pip" install --no-cache-dir \
+        dbt-core \
+        dbt-snowflake \
+        snowflake-cli-labs
 
 # Set Chromium path for agent-browser
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 
-# Install agent-browser and claude-code globally
-RUN npm install -g agent-browser @anthropic-ai/claude-code vercel
+# Install agent-browser, claude-code, and platform CLIs globally (npm)
+RUN npm install -g \
+        agent-browser \
+        @anthropic-ai/claude-code \
+        vercel \
+        gitnexus
 
 # Create app directory
 WORKDIR /app
