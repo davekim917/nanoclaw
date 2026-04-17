@@ -251,6 +251,14 @@ async function buildContainerArgs(
   args.push('-e', 'CLAUDE_CODE_DISABLE_AUTO_MEMORY=0');
   args.push('-e', 'CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80');
 
+  // gh CLI placeholder. gh short-circuits locally when no token is set,
+  // never hitting the HTTPS_PROXY where OneCLI would inject the real
+  // Authorization header. With any non-empty GH_TOKEN, gh sends the
+  // request and the proxy rewrites the header using the vault secret
+  // assigned to this agent's OneCLI identity. Same pattern OneCLI uses
+  // for CLAUDE_CODE_OAUTH_TOKEN. Never put a real token here.
+  args.push('-e', 'GH_TOKEN=placeholder-for-proxy-injection');
+
   // Users allowed to run admin commands (e.g. /clear) inside this container.
   // Computed at wake time: owners + global admins + admins scoped to this
   // agent group. Role changes take effect on next container spawn.
