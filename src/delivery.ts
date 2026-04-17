@@ -630,7 +630,31 @@ async function deliverMessage(
   // reaches the adapter. Defense-in-depth — OneCLI already keeps API keys
   // away from the agent, but scrub content anyway in case an agent ever
   // ends up with a secret (e.g. by reading a file) and tries to echo it.
-  const scrubbedContent = scrubSecrets(msg.content);
+  let scrubbedContent = scrubSecrets(msg.content);
+
+  // If this is the first chat-kind reply of a turn AND there's an in-flight
+  // status line we've been editing AND there are no file attachments, edit
+  // the status message with the final answer instead of posting a new one.
+  // v1's UX: one message per turn that starts as "thinking...", becomes
+  // "Searching", and lands as the final answer.
+  //
+  // Attachments bail out — Slack/Discord edits can't add/replace files, so
+  // attachments always go in a fresh message.
+  const existingStatusMsgId = msg.kind === 'chat' ? statusTracking.get(session.id) : undefined;
+  if (existingStatusMsgId && (!files || files.length === 0)) {
+    try {
+      const parsed = JSON.parse(scrubbedContent);
+      if (typeof parsed.text === 'string') {
+        scrubbedContent = JSON.stringify({
+          operation: 'edit',
+          messageId: existingStatusMsgId,
+          text: parsed.text,
+        });
+      }
+    } catch {
+      // Content wasn't the text-shape we expected — leave it alone, post fresh.
+    }
+  }
 
   const platformMsgId = await deliveryAdapter.deliver(
     msg.channel_type,

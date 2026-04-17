@@ -191,12 +191,35 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
 
 /**
  * Pick the matching agent for an inbound event.
- * Currently: highest priority agent. Future: trigger rule matching.
+ *
+ * Rules:
+ *  - Agents are ordered by priority DESC from the DB.
+ *  - `response_scope='all'` (default): match any message.
+ *  - `response_scope='triggered'`: match only if the inbound message is an
+ *    explicit mention of this bot. Lets a channel have the bot present
+ *    without it replying to every message.
+ *  - `response_scope='allowlisted'`: reserved — falls through to 'all'
+ *    until allowlist rules are defined.
+ *
+ * @mention detection: chat-sdk-bridge annotates each inbound with a flat
+ * `isMention` boolean (from chat-sdk's own detection) before JSON-encoding.
  */
-function pickAgent(agents: MessagingGroupAgent[], _event: InboundEvent): MessagingGroupAgent | null {
-  // Agents are already ordered by priority DESC from the DB query
-  // TODO: apply trigger_rules matching (pattern, mentionOnly, etc.)
-  return agents[0] ?? null;
+function pickAgent(agents: MessagingGroupAgent[], event: InboundEvent): MessagingGroupAgent | null {
+  const isMention = extractIsMention(event);
+  for (const agent of agents) {
+    if (agent.response_scope === 'triggered' && !isMention) continue;
+    return agent;
+  }
+  return null;
+}
+
+function extractIsMention(event: InboundEvent): boolean {
+  try {
+    const parsed = JSON.parse(event.message.content) as { isMention?: unknown };
+    return parsed.isMention === true;
+  } catch {
+    return false;
+  }
 }
 
 /**

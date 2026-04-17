@@ -137,6 +137,10 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       serialized.senderName = name;
     }
 
+    // Preserve isMention as an explicit flat field the router can read
+    // without depending on chat-sdk's internal field naming.
+    serialized.isMention = Boolean(serialized.isMention);
+
     // Drop raw to save DB space (can be very large)
     serialized.raw = undefined;
 
