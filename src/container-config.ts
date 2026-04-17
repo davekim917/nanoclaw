@@ -38,6 +38,15 @@ export interface ContainerConfig {
   packages: { apt: string[]; npm: string[] };
   imageTag?: string;
   additionalMounts: AdditionalMountConfig[];
+  /**
+   * Name of the env var on the host that holds this group's GitHub token.
+   * If unset, container-runner derives a name from the folder
+   * (`GITHUB_TOKEN_<FOLDER_UPPER>` with dashes as underscores) and falls
+   * back to `GITHUB_TOKEN`. Set explicitly when the folder name doesn't
+   * map to the env var you want — e.g. `illysium-v2` should reuse v1's
+   * existing `GITHUB_TOKEN_ILLYSIUM` during the migration window.
+   */
+  githubTokenEnv?: string;
 }
 
 function emptyConfig(): ContainerConfig {
@@ -71,6 +80,7 @@ export function readContainerConfig(folder: string): ContainerConfig {
       },
       imageTag: raw.imageTag,
       additionalMounts: raw.additionalMounts ?? [],
+      githubTokenEnv: raw.githubTokenEnv,
     };
   } catch (err) {
     console.error(`[container-config] failed to parse ${p}: ${String(err)}`);

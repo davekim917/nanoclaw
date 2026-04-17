@@ -10,7 +10,11 @@ import path from 'path';
 import { OneCLI } from '@onecli-sh/sdk';
 
 import { CONTAINER_IMAGE, DATA_DIR, GROUPS_DIR, IDLE_TIMEOUT, ONECLI_URL, TIMEZONE } from './config.js';
-import { readContainerConfig, writeContainerConfig } from './container-config.js';
+import {
+  readContainerConfig,
+  writeContainerConfig,
+  type ContainerConfig,
+} from './container-config.js';
 import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainer } from './container-runtime.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getAdminsOfAgentGroup, getGlobalAdmins, getOwners } from './db/user-roles.js';
@@ -166,6 +170,24 @@ export function killContainer(sessionId: string, reason: string): void {
   }
 }
 
+/**
+ * Resolve the host env var that holds this group's GitHub token.
+ * Precedence: container.json `githubTokenEnv` override →
+ * `GITHUB_TOKEN_<FOLDER_UPPER>` (dashes→underscores) →
+ * `GITHUB_TOKEN` (personal default).
+ * Returns `undefined` if none set — caller logs a warning and git push
+ * / PR tools will fail cleanly.
+ */
+function resolveGitHubToken(folder: string, cfg: ContainerConfig): string | undefined {
+  if (cfg.githubTokenEnv) {
+    const v = process.env[cfg.githubTokenEnv];
+    if (v) return v;
+  }
+  const conventionEnv = `GITHUB_TOKEN_${folder.toUpperCase().replace(/-/g, '_')}`;
+  if (process.env[conventionEnv]) return process.env[conventionEnv];
+  return process.env.GITHUB_TOKEN;
+}
+
 function buildMounts(agentGroup: AgentGroup, session: Session): VolumeMount[] {
   // Per-group filesystem state lives forever after first creation. Init is
   // idempotent: it only writes paths that don't already exist, so this call
@@ -229,6 +251,10 @@ async function buildContainerArgs(
 ): Promise<string[]> {
   const args: string[] = ['run', '--rm', '--name', containerName];
 
+  // Read once up-front — used for GitHub token resolution, MCP server
+  // registration, and image tag selection later in this function.
+  const containerConfig = readContainerConfig(agentGroup.folder);
+
   // Environment
   args.push('-e', `TZ=${TIMEZONE}`);
   args.push('-e', `AGENT_PROVIDER=${session.agent_provider || agentGroup.agent_provider || 'claude'}`);
@@ -251,13 +277,22 @@ async function buildContainerArgs(
   args.push('-e', 'CLAUDE_CODE_DISABLE_AUTO_MEMORY=0');
   args.push('-e', 'CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80');
 
-  // gh CLI placeholder. gh short-circuits locally when no token is set,
-  // never hitting the HTTPS_PROXY where OneCLI would inject the real
-  // Authorization header. With any non-empty GH_TOKEN, gh sends the
-  // request and the proxy rewrites the header using the vault secret
-  // assigned to this agent's OneCLI identity. Same pattern OneCLI uses
-  // for CLAUDE_CODE_OAUTH_TOKEN. Never put a real token here.
-  args.push('-e', 'GH_TOKEN=placeholder-for-proxy-injection');
+  // GitHub token for git-over-HTTPS + `gh` CLI. Per-agent-group: resolves
+  // from container.json `githubTokenEnv`, then from
+  // `GITHUB_TOKEN_<FOLDER_UPPER>` (dashes → underscores), then falls back
+  // to `GITHUB_TOKEN`. OneCLI's proxy model doesn't actually fit git
+  // auth (see docs/PHASE_2_11_GIT_WORKTREES.md "Credentials — revised"),
+  // so we pass the real token into the session's container env like v1
+  // did into the host shell. Scope matches v1's per-group tokens.
+  const ghToken = resolveGitHubToken(agentGroup.folder, containerConfig);
+  if (ghToken) {
+    args.push('-e', `GH_TOKEN=${ghToken}`);
+    args.push('-e', `GITHUB_TOKEN=${ghToken}`);
+  } else {
+    log.warn('No GitHub token resolved for agent group — git push/PR will fail', {
+      folder: agentGroup.folder,
+    });
+  }
 
   // Users allowed to run admin commands (e.g. /clear) inside this container.
   // Computed at wake time: owners + global admins + admins scoped to this
@@ -309,7 +344,6 @@ async function buildContainerArgs(
   }
 
   // Pass additional MCP servers from container config (groups/<folder>/container.json)
-  const containerConfig = readContainerConfig(agentGroup.folder);
   if (containerConfig.mcpServers && Object.keys(containerConfig.mcpServers).length > 0) {
     args.push('-e', `NANOCLAW_MCP_SERVERS=${JSON.stringify(containerConfig.mcpServers)}`);
   }
@@ -321,9 +355,13 @@ async function buildContainerArgs(
   const imageTag = containerConfig.imageTag || CONTAINER_IMAGE;
   args.push(imageTag);
 
+  // gh auth setup-git configures git's credential helper to use $GH_TOKEN
+  // for github.com. Idempotent. Best-effort (no-op if gh is missing or
+  // GH_TOKEN is unset). Runs before node so git-based MCP tools authenticate
+  // natively — OneCLI's proxy doesn't cover the github.com host.
   args.push(
     '-c',
-    'cd /app && npx tsc --outDir /tmp/dist 2>&1 >&2 && ln -sf /app/node_modules /tmp/dist/node_modules && node /tmp/dist/index.js',
+    'cd /app && npx tsc --outDir /tmp/dist 2>&1 >&2 && ln -sf /app/node_modules /tmp/dist/node_modules && gh auth setup-git 2>/dev/null; node /tmp/dist/index.js',
   );
 
   return args;
