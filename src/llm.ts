@@ -3,14 +3,18 @@
  * titles, topic classification.
  *
  * Uses the Anthropic SDK directly (not the Claude CLI shell-out that v1
- * used). Requires `ANTHROPIC_API_KEY` in the host env.
+ * used). Accepts either `ANTHROPIC_API_KEY` (API key) or
+ * `CLAUDE_CODE_OAUTH_TOKEN` (Max-plan OAuth token) from the host env.
+ * API key takes precedence when both are set.
  *
  * Keep this module small — it's for fire-and-forget fast calls with Haiku.
  * The agent container uses `@anthropic-ai/claude-agent-sdk` for the full
- * agent loop; this module is intentionally separate.
+ * agent loop and routes through OneCLI; this module is intentionally
+ * separate and host-side.
  */
 import Anthropic from '@anthropic-ai/sdk';
 
+import { readEnvFile } from './env.js';
 import { log } from './log.js';
 
 const HAIKU_MODEL = 'claude-haiku-4-5-20251001';
@@ -21,11 +25,19 @@ let _client: Anthropic | null = null;
 
 function getClient(): Anthropic {
   if (_client) return _client;
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
-    throw new Error('ANTHROPIC_API_KEY is not set — host-side LLM calls unavailable');
+  const env = { ...process.env, ...readEnvFile(['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN']) };
+  const apiKey = env.ANTHROPIC_API_KEY;
+  const oauthToken = env.CLAUDE_CODE_OAUTH_TOKEN;
+  if (apiKey) {
+    _client = new Anthropic({ apiKey, timeout: DEFAULT_TIMEOUT_MS });
+  } else if (oauthToken) {
+    // Max-plan OAuth token. Anthropic SDK accepts it via authToken.
+    _client = new Anthropic({ authToken: oauthToken, timeout: DEFAULT_TIMEOUT_MS });
+  } else {
+    throw new Error(
+      'Neither ANTHROPIC_API_KEY nor CLAUDE_CODE_OAUTH_TOKEN is set — host-side LLM calls unavailable',
+    );
   }
-  _client = new Anthropic({ apiKey, timeout: DEFAULT_TIMEOUT_MS });
   return _client;
 }
 
