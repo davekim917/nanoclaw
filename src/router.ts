@@ -17,6 +17,7 @@
  * wherever possible so the gate can land on a real user row.
  */
 import { canAccessAgentGroup } from './access.js';
+import { upsertArchiveMessage } from './message-archive.js';
 import { getChannelAdapter } from './channels/channel-registry.js';
 import { isMember } from './db/agent-group-members.js';
 import { getMessagingGroupByPlatform, createMessagingGroup, getMessagingGroupAgents } from './db/messaging-groups.js';
@@ -155,8 +156,9 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
   const { session, created } = resolveSession(match.agent_group_id, mg.id, event.threadId, effectiveSessionMode);
 
   // 6. Write message to session DB
+  const messageId = event.message.id || generateId();
   writeSessionMessage(session.agent_group_id, session.id, {
-    id: event.message.id || generateId(),
+    id: messageId,
     kind: event.message.kind,
     timestamp: event.message.timestamp,
     platformId: event.platformId,
@@ -164,6 +166,35 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
     threadId: event.threadId,
     content: event.message.content,
   });
+
+  // 6b. Mirror chat-kind inbound into the central archive (2.9). Non-chat
+  // kinds (system actions, task triggers, etc.) aren't indexed.
+  if (event.message.kind === 'chat' || event.message.kind === 'chat-sdk') {
+    try {
+      const parsed = JSON.parse(event.message.content) as Record<string, unknown>;
+      const text = typeof parsed.text === 'string' ? parsed.text : '';
+      if (text) {
+        upsertArchiveMessage({
+          id: messageId,
+          agentGroupId: session.agent_group_id,
+          messagingGroupId: mg.id,
+          channelType: event.channelType,
+          platformId: event.platformId,
+          threadId: event.threadId,
+          role: 'user',
+          senderId: userId,
+          senderName:
+            (typeof parsed.senderName === 'string' && parsed.senderName) ||
+            (typeof parsed.sender === 'string' && parsed.sender) ||
+            null,
+          text,
+          sentAt: event.message.timestamp,
+        });
+      }
+    } catch {
+      // Skip malformed content silently — archive is best-effort.
+    }
+  }
 
   log.info('Message routed', {
     sessionId: session.id,

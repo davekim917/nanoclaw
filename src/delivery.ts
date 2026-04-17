@@ -37,6 +37,7 @@ import {
 } from './db/session-db.js';
 import { log } from './log.js';
 import { scrubSecrets } from './secret-scrubber.js';
+import { upsertArchiveMessage } from './message-archive.js';
 import { normalizeOptions, type RawOption } from './channels/ask-question.js';
 import {
   heartbeatPath,
@@ -677,6 +678,36 @@ async function deliverMessage(
   // instead of editing a now-stale status line above the final answer.
   if (msg.kind === 'chat') {
     statusTracking.delete(session.id);
+
+    // Mirror agent replies into the central archive (2.9). Scrubbed text
+    // so any accidentally-included secret stays out of searchable history.
+    try {
+      const parsed = JSON.parse(scrubbedContent) as Record<string, unknown>;
+      // In edit mode, scrubbedContent was wrapped — unwrap the text.
+      const text =
+        typeof parsed.text === 'string'
+          ? parsed.text
+          : typeof parsed.content === 'string'
+            ? parsed.content
+            : '';
+      if (text && msg.channel_type && msg.platform_id) {
+        upsertArchiveMessage({
+          id: msg.id,
+          agentGroupId: session.agent_group_id,
+          messagingGroupId: session.messaging_group_id,
+          channelType: msg.channel_type,
+          platformId: msg.platform_id,
+          threadId: msg.thread_id,
+          role: 'assistant',
+          senderId: session.agent_group_id,
+          senderName: 'assistant',
+          text,
+          sentAt: new Date().toISOString(),
+        });
+      }
+    } catch {
+      // best-effort
+    }
   }
 
   // Clean up outbox directory after successful delivery

@@ -196,6 +196,15 @@ function buildMounts(agentGroup: AgentGroup, session: Session): VolumeMount[] {
   const claudeDir = path.join(DATA_DIR, 'v2-sessions', agentGroup.id, '.claude-shared');
   mounts.push({ hostPath: claudeDir, containerPath: '/home/node/.claude', readonly: false });
 
+  // Central message archive at /workspace/archive.db (read-only). Powers
+  // the search_threads + resolve_thread_link MCP tools (Phase 2.9/2.10).
+  // Separate file from v2.db so only message history is exposed — not
+  // privileged central state (pending_approvals, user_roles, etc.).
+  const archivePath = path.join(DATA_DIR, 'archive.db');
+  if (fs.existsSync(archivePath)) {
+    mounts.push({ hostPath: archivePath, containerPath: '/workspace/archive.db', readonly: true });
+  }
+
   // Per-group agent-runner source at /app/src (initialized once at group
   // creation, persistent thereafter — agents can modify their runner)
   const groupRunnerDir = path.join(DATA_DIR, 'v2-sessions', agentGroup.id, 'agent-runner-src');
