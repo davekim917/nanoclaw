@@ -16,6 +16,7 @@ import {
   updateMemoryFields,
 } from './db/memories.js';
 import { log } from './log.js';
+import { projectMemoriesToFile } from './memory-projection.js';
 import type { Memory, MemoryType } from './types.js';
 
 export function saveMemory(
@@ -40,6 +41,7 @@ export function saveMemory(
   });
 
   log.info('Memory saved', { id, agentGroupId, type, name });
+  projectMemoriesToFile(agentGroupId);
   return id;
 }
 
@@ -51,6 +53,7 @@ export function updateMemory(
   const updated = updateMemoryFields(agentGroupId, id, fields);
   if (updated) {
     log.info('Memory updated', { id, agentGroupId, fields: Object.keys(fields) });
+    projectMemoriesToFile(agentGroupId);
   }
   return updated;
 }
@@ -59,6 +62,7 @@ export function deleteMemory(agentGroupId: string, id: string): boolean {
   const deleted = deleteMemoryById(agentGroupId, id);
   if (deleted) {
     log.info('Memory deleted', { id, agentGroupId });
+    projectMemoriesToFile(agentGroupId);
   }
   return deleted;
 }
