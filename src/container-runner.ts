@@ -277,6 +277,18 @@ function buildMounts(agentGroup: AgentGroup, session: Session): VolumeMount[] {
     }
   }
 
+  // Tone profiles — project-relative, shared across all groups. Read-only:
+  // groups select a profile in their CLAUDE.md; the files themselves are
+  // managed via the /add-tone-profile skill on the host.
+  const toneProfilesDir = path.resolve(GROUPS_DIR, '..', 'tone-profiles');
+  if (fs.existsSync(toneProfilesDir)) {
+    mounts.push({
+      hostPath: toneProfilesDir,
+      containerPath: '/workspace/tone-profiles',
+      readonly: true,
+    });
+  }
+
   // Host-side credential dirs — mount RO when present. v2's model differs
   // from v1's: we don't gate these behind a per-group `tools` array because
   // v2 already trusts the container with its OneCLI agent token (which
@@ -292,7 +304,10 @@ function buildMounts(agentGroup: AgentGroup, session: Session): VolumeMount[] {
     // Google Calendar MCP
     { host: path.join(home, '.config', 'google-calendar-mcp'), container: '/home/node/.config/google-calendar-mcp' },
     // Google Workspace MCP alt path
-    { host: path.join(home, '.google_workspace_mcp', 'credentials'), container: '/home/node/.google_workspace_mcp/credentials' },
+    {
+      host: path.join(home, '.google_workspace_mcp', 'credentials'),
+      container: '/home/node/.google_workspace_mcp/credentials',
+    },
     // Snowflake connections + keys
     { host: path.join(home, '.snowflake'), container: '/home/node/.snowflake' },
     // AWS creds
