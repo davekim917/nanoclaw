@@ -15,6 +15,7 @@ import { ensureContainerRuntimeRunning, cleanupOrphans } from './container-runti
 import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, stopDeliveryPolls } from './delivery.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
 import { startWorktreeCleanup, stopWorktreeCleanup } from './worktree-cleanup.js';
+import { startPluginUpdater, stopPluginUpdater } from './plugin-updater.js';
 import {
   ONECLI_ACTION,
   resolveOneCLIApproval,
@@ -133,7 +134,30 @@ async function main(): Promise<void> {
   startWorktreeCleanup();
   log.info('Worktree cleanup started');
 
-  // 8. Start OneCLI manual-approval handler
+  // 8. Start plugin auto-updater (hourly, first run 5min after startup)
+  startPluginUpdater({
+    notify: async (platformId, text) => {
+      // Parse the jid format: <channel_type>:<platform_id>[:<thread_id>]
+      // Example: "dc:1479489866193571902" or "slack-illysium:C0ATLGJ4X60"
+      const parts = platformId.split(':');
+      if (parts.length < 2) {
+        log.warn('Plugin updater notify: malformed jid', { platformId });
+        return;
+      }
+      const channelType = parts[0];
+      const realPlatformId = parts.slice(1).join(':');
+      await deliveryAdapter.deliver(
+        channelType,
+        realPlatformId,
+        null,
+        'chat',
+        JSON.stringify({ text }),
+      );
+    },
+  });
+  log.info('Plugin updater started');
+
+  // 9. Start OneCLI manual-approval handler
   startOneCLIApprovalHandler(deliveryAdapter);
 
   log.info('NanoClaw v2 running');
@@ -344,6 +368,7 @@ async function shutdown(signal: string): Promise<void> {
   stopDeliveryPolls();
   stopHostSweep();
   stopWorktreeCleanup();
+  stopPluginUpdater();
   await teardownChannelAdapters();
   process.exit(0);
 }
