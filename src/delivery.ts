@@ -36,6 +36,7 @@ import {
   updateTask,
 } from './db/session-db.js';
 import { log } from './log.js';
+import { getActiveSession, startRemoteControl, stopRemoteControl } from './remote-control.js';
 import { scrubSecrets } from './secret-scrubber.js';
 import { upsertArchiveMessage } from './message-archive.js';
 import { normalizeOptions, type RawOption } from './channels/ask-question.js';
@@ -976,6 +977,38 @@ async function handleSystemAction(
         'Rebuild Request',
         `Agent "${agentGroup.name}" is attempting to rebuild container.${reason ? `\nReason: ${reason}` : ''}`,
       );
+      break;
+    }
+
+    // Phase 5.7: Remote Control — thin wrappers around the
+    // host-side `claude remote-control` CLI. Response (URL or error)
+    // comes back to the user via a synthesized chat-kind message in
+    // the same session so it appears in the originating chat.
+    case 'start_remote_control': {
+      const sender = (content.sender as string) || 'unknown';
+      const chatJid = (content.chatJid as string) || '';
+      const cwd = (content.cwd as string) || process.cwd();
+      const result = await startRemoteControl(sender, chatJid, cwd);
+      const text = result.ok
+        ? `Remote Control ready: ${result.url}`
+        : `Remote Control failed: ${result.error}`;
+      notifyAgent(session, text);
+      break;
+    }
+
+    case 'stop_remote_control': {
+      const result = stopRemoteControl();
+      const text = result.ok ? 'Remote Control stopped.' : `Remote Control: ${result.error}`;
+      notifyAgent(session, text);
+      break;
+    }
+
+    case 'get_remote_control_status': {
+      const active = getActiveSession();
+      const text = active
+        ? `Remote Control active (pid=${active.pid}): ${active.url}`
+        : 'No active Remote Control session.';
+      notifyAgent(session, text);
       break;
     }
 

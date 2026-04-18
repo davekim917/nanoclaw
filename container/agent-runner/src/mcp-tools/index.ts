@@ -18,6 +18,7 @@ import { selfModTools } from './self-mod.js';
 import { threadSearchTools } from './thread-search.js';
 import { gitWorktreeTools } from './git-worktrees.js';
 import { toneProfileTools } from './tone-profiles.js';
+import { remoteControlTools } from './remote-control.js';
 
 function log(msg: string): void {
   console.error(`[mcp-tools] ${msg}`);
@@ -32,6 +33,7 @@ const allTools: McpToolDefinition[] = [
   ...threadSearchTools,
   ...gitWorktreeTools,
   ...toneProfileTools,
+  ...remoteControlTools,
 ];
 
 const toolMap = new Map<string, McpToolDefinition>();

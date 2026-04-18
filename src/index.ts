@@ -16,6 +16,7 @@ import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, st
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
 import { startWorktreeCleanup, stopWorktreeCleanup } from './worktree-cleanup.js';
 import { startPluginUpdater, stopPluginUpdater } from './plugin-updater.js';
+import { restoreRemoteControl } from './remote-control.js';
 import {
   ONECLI_ACTION,
   resolveOneCLIApproval,
@@ -146,18 +147,15 @@ async function main(): Promise<void> {
       }
       const channelType = parts[0];
       const realPlatformId = parts.slice(1).join(':');
-      await deliveryAdapter.deliver(
-        channelType,
-        realPlatformId,
-        null,
-        'chat',
-        JSON.stringify({ text }),
-      );
+      await deliveryAdapter.deliver(channelType, realPlatformId, null, 'chat', JSON.stringify({ text }));
     },
   });
   log.info('Plugin updater started');
 
-  // 9. Start OneCLI manual-approval handler
+  // 9. Restore any Remote Control session that was running before restart
+  restoreRemoteControl();
+
+  // 10. Start OneCLI manual-approval handler
   startOneCLIApprovalHandler(deliveryAdapter);
 
   log.info('NanoClaw v2 running');
