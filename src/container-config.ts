@@ -47,6 +47,16 @@ export interface ContainerConfig {
    * existing `GITHUB_TOKEN_ILLYSIUM` during the migration window.
    */
   githubTokenEnv?: string;
+
+  /**
+   * Plugin subdir names under `~/plugins/` to NOT mount for this group.
+   * Plugins under `~/plugins/` are mounted into every container by default
+   * (RO at `/workspace/plugins/<name>`). Use this when a group shouldn't
+   * have access to a specific plugin — e.g., security-sensitive agents
+   * excluding the `codex` plugin to avoid handing them a CLI with the
+   * host's Codex OAuth session.
+   */
+  excludePlugins?: string[];
 }
 
 function emptyConfig(): ContainerConfig {
@@ -81,6 +91,7 @@ export function readContainerConfig(folder: string): ContainerConfig {
       imageTag: raw.imageTag,
       additionalMounts: raw.additionalMounts ?? [],
       githubTokenEnv: raw.githubTokenEnv,
+      excludePlugins: raw.excludePlugins,
     };
   } catch (err) {
     console.error(`[container-config] failed to parse ${p}: ${String(err)}`);

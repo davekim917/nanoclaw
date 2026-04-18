@@ -5,6 +5,7 @@
  */
 import { ChildProcess, execSync, spawn } from 'child_process';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import { OneCLI } from '@onecli-sh/sdk';
@@ -235,6 +236,47 @@ function buildMounts(agentGroup: AgentGroup, session: Session): VolumeMount[] {
     mounts.push(...validated);
   }
 
+  // Plugin mounts: every subdir of ~/plugins is mounted RO at
+  // /workspace/plugins/<name>. Claude Code SDK auto-discovers via
+  // CLAUDE_PLUGINS_ROOT (set in buildContainerArgs). Per-group
+  // excludePlugins deny list skips named plugins — useful for limiting
+  // a group's tool surface (e.g. security agents without codex).
+  //
+  // Special case: if codex plugin is mounted and the host's ~/.codex dir
+  // exists, mount that RW so the Codex CLI can use the host's OAuth
+  // session and persist refresh tokens.
+  const pluginsHostDir = path.join(os.homedir(), 'plugins');
+  if (fs.existsSync(pluginsHostDir)) {
+    const excluded = new Set(containerConfig.excludePlugins ?? []);
+    let entries: string[] = [];
+    try {
+      entries = fs.readdirSync(pluginsHostDir);
+    } catch (err) {
+      log.warn('Failed to read ~/plugins directory', { err });
+    }
+    for (const entry of entries) {
+      if (excluded.has(entry)) continue;
+      const pluginHostPath = path.join(pluginsHostDir, entry);
+      try {
+        if (!fs.statSync(pluginHostPath).isDirectory()) continue;
+      } catch {
+        continue;
+      }
+      mounts.push({
+        hostPath: pluginHostPath,
+        containerPath: `/workspace/plugins/${entry}`,
+        readonly: true,
+      });
+    }
+
+    if (!excluded.has('codex') && entries.includes('codex')) {
+      const hostCodex = path.join(os.homedir(), '.codex');
+      if (fs.existsSync(hostCodex)) {
+        mounts.push({ hostPath: hostCodex, containerPath: '/home/node/.codex', readonly: false });
+      }
+    }
+  }
+
   return mounts;
 }
 
@@ -289,6 +331,10 @@ async function buildContainerArgs(
       folder: agentGroup.folder,
     });
   }
+
+  // Claude Code SDK reads this to discover plugins at
+  // /workspace/plugins/<name>/ (mounted by buildMounts from ~/plugins/).
+  args.push('-e', 'CLAUDE_PLUGINS_ROOT=/workspace/plugins');
 
   // Users allowed to run admin commands (e.g. /clear) inside this container.
   // Computed at wake time: owners + global admins + admins scoped to this
