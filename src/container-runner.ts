@@ -168,22 +168,75 @@ export function killContainer(sessionId: string, reason: string): void {
 }
 
 /**
- * Resolve the host env var that holds this group's GitHub token.
- * Precedence: container.json `githubTokenEnv` override →
- * `GITHUB_TOKEN_<FOLDER_UPPER>` (dashes→underscores) →
- * `GITHUB_TOKEN` (personal default).
- * Returns `undefined` if none set — caller logs a warning and git push
- * / PR tools will fail cleanly.
+ * Resolve a host env var value, folder-scoped.
+ *
+ * Lookup order:
+ *   1. `<BASE>_<FOLDER_UPPER>` (dashes→underscores) — scoped variant
+ *   2. `<BASE>` — unscoped default
+ *
+ * Example: `resolveScopedEnv('GITHUB_TOKEN', 'illysium-v2')` checks
+ * `GITHUB_TOKEN_ILLYSIUM_V2` first, then `GITHUB_TOKEN`. Returns
+ * `undefined` if neither is set.
+ */
+function resolveScopedEnv(baseName: string, folder: string): string | undefined {
+  const conv = `${baseName}_${folder.toUpperCase().replace(/-/g, '_')}`;
+  return process.env[conv] ?? process.env[baseName];
+}
+
+/**
+ * GitHub token gets one level of explicit override for the migration
+ * window: `container.json.githubTokenEnv` lets illysium-v2 (folder) map
+ * to `GITHUB_TOKEN_ILLYSIUM` (v1's existing env var) without renaming
+ * anything in the host's `.env`. After cutover this can collapse into
+ * the plain `resolveScopedEnv` convention.
  */
 function resolveGitHubToken(folder: string, cfg: ContainerConfig): string | undefined {
   if (cfg.githubTokenEnv) {
     const v = process.env[cfg.githubTokenEnv];
     if (v) return v;
   }
-  const conventionEnv = `GITHUB_TOKEN_${folder.toUpperCase().replace(/-/g, '_')}`;
-  if (process.env[conventionEnv]) return process.env[conventionEnv];
-  return process.env.GITHUB_TOKEN;
+  return resolveScopedEnv('GITHUB_TOKEN', folder);
 }
+
+/**
+ * Credential env vars auto-forwarded per agent group. For each entry,
+ * container-runner resolves via `<NAME>_<FOLDER>` → `<NAME>` and injects
+ * the value into the container if set. Non-sensitive tool-config vars
+ * (model IDs, endpoints, etc.) belong in the image or container.json,
+ * not here — this list is for things whose *value* differs per group.
+ *
+ * Rationale: v1 had a complex `tools` array + `extractToolScopes` +
+ * `scopedEnvKey` resolver (~200 lines) that implicitly gated which
+ * CLIs got credentials. v2 replaces it with "mount everything the host
+ * has" (5.0-B for dirs) + "forward everything the host has scoped"
+ * (this list, for env vars). Simpler; fits v2's trust model.
+ */
+const SCOPED_CREDENTIAL_VARS = [
+  // Render.com (GH_TOKEN is handled by resolveGitHubToken above)
+  'RENDER_API_KEY',
+  'RENDER_WORKSPACE_ID',
+  // Snowflake
+  'SNOWFLAKE_ACCOUNT',
+  'SNOWFLAKE_USER',
+  'SNOWFLAKE_PASSWORD',
+  'SNOWFLAKE_WAREHOUSE',
+  'SNOWFLAKE_ROLE',
+  'SNOWFLAKE_DATABASE',
+  // dbt Cloud
+  'DBT_CLOUD_ACCOUNT_ID',
+  'DBT_CLOUD_API_TOKEN',
+  // OpenAI (used by voice transcription and other per-group integrations)
+  'OPENAI_API_KEY',
+  // Braintrust (LLM eval)
+  'BRAINTRUST_API_KEY',
+  // Exa (web search)
+  'EXA_API_KEY',
+  // Deepgram / ElevenLabs (audio)
+  'DEEPGRAM_API_KEY',
+  'ELEVENLABS_API_KEY',
+  // Residential browser proxy
+  'RESIDENTIAL_PROXY_URL',
+];
 
 function buildMounts(agentGroup: AgentGroup, session: Session): VolumeMount[] {
   // Per-group filesystem state lives forever after first creation. Init is
@@ -428,6 +481,16 @@ async function buildContainerArgs(
   // Claude Code SDK reads this to discover plugins at
   // /workspace/plugins/<name>/ (mounted by buildMounts from ~/plugins/).
   args.push('-e', 'CLAUDE_PLUGINS_ROOT=/workspace/plugins');
+
+  // Scoped credential env vars: each base name resolves via
+  // `<BASE>_<FOLDER_UPPER>` → `<BASE>` and is injected if found. Lets
+  // a group like `illysium-v2` pick up `SNOWFLAKE_PASSWORD_ILLYSIUM`
+  // automatically and expose it as `SNOWFLAKE_PASSWORD` inside the
+  // container. See SCOPED_CREDENTIAL_VARS for the list.
+  for (const base of SCOPED_CREDENTIAL_VARS) {
+    const v = resolveScopedEnv(base, agentGroup.folder);
+    if (v) args.push('-e', `${base}=${v}`);
+  }
 
   // Users allowed to run admin commands (e.g. /clear) inside this container.
   // Computed at wake time: owners + global admins + admins scoped to this
