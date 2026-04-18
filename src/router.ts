@@ -25,6 +25,7 @@ import { getMessagingGroupByPlatform, createMessagingGroup, getMessagingGroupAge
 import { upsertUser, getUser } from './db/users.js';
 import { startTypingRefresh } from './delivery.js';
 import { log } from './log.js';
+import { maybeRenameNewThread } from './topic-title.js';
 import { resolveSession, writeSessionMessage } from './session-manager.js';
 import { wakeContainer } from './container-runner.js';
 import { getSession } from './db/sessions.js';
@@ -217,6 +218,22 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
     created,
   });
 
+  // 6c. Phase 5.11: when a new session was just created and the inbound
+  // came through a thread-supporting channel (Discord today), kick off
+  // async topic-title generation + thread rename. Fire-and-forget; never
+  // blocks the router's main path.
+  if (created && event.message.kind === 'chat-sdk' && event.threadId) {
+    try {
+      const parsedForTitle = JSON.parse(event.message.content) as Record<string, unknown>;
+      const textForTitle = typeof parsedForTitle.text === 'string' ? parsedForTitle.text : '';
+      if (textForTitle) {
+        maybeRenameNewThread(event.channelType, event.threadId, textForTitle);
+      }
+    } catch {
+      // Malformed content — skip rename. Router continues.
+    }
+  }
+
   // 7. Show typing indicator while the agent processes. Refresh on a short
   // interval so platforms like Discord (which auto-expire typing after
   // ~10s) keep showing it for the full thinking window. Gated on the
@@ -250,6 +267,13 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
  */
 function pickAgent(agents: MessagingGroupAgent[], event: InboundEvent): MessagingGroupAgent | null {
   const isMention = extractIsMention(event);
+  log.debug('pickAgent', {
+    isMention,
+    agentCount: agents.length,
+    scopes: agents.map((a) => a.response_scope),
+    messageKind: event.message.kind,
+    contentPreview: event.message.content.slice(0, 200),
+  });
   for (const agent of agents) {
     if (agent.response_scope === 'triggered' && !isMention) continue;
     return agent;
