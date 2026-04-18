@@ -492,6 +492,16 @@ async function buildContainerArgs(
     if (v) args.push('-e', `${base}=${v}`);
   }
 
+  // Per-group opt-in flags from container.json. Each drives a specific
+  // behavior in the entrypoint or an MCP tool — only set when opted in
+  // so groups that don't want the feature don't carry the env.
+  if (containerConfig.gitnexusInjectAgentsMd) {
+    args.push('-e', 'GITNEXUS_INJECT_AGENTS_MD=true');
+  }
+  if (containerConfig.ollamaAdminTools) {
+    args.push('-e', 'OLLAMA_ADMIN_TOOLS=true');
+  }
+
   // Users allowed to run admin commands (e.g. /clear) inside this container.
   // Computed at wake time: owners + global admins + admins scoped to this
   // agent group. Role changes take effect on next container spawn.

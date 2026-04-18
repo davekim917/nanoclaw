@@ -57,6 +57,19 @@ export interface ContainerConfig {
    * host's Codex OAuth session.
    */
   excludePlugins?: string[];
+
+  /**
+   * When true, sets `GITNEXUS_INJECT_AGENTS_MD=true` in the container so
+   * GitNexus auto-injects AGENTS.md into repos the agent works on.
+   * Opt-in per group; defaults off.
+   */
+  gitnexusInjectAgentsMd?: boolean;
+
+  /**
+   * When true, sets `OLLAMA_ADMIN_TOOLS=true` to enable the Ollama
+   * admin-level MCP tools (model management, etc.). Opt-in per group.
+   */
+  ollamaAdminTools?: boolean;
 }
 
 function emptyConfig(): ContainerConfig {
@@ -92,6 +105,8 @@ export function readContainerConfig(folder: string): ContainerConfig {
       additionalMounts: raw.additionalMounts ?? [],
       githubTokenEnv: raw.githubTokenEnv,
       excludePlugins: raw.excludePlugins,
+      gitnexusInjectAgentsMd: raw.gitnexusInjectAgentsMd,
+      ollamaAdminTools: raw.ollamaAdminTools,
     };
   } catch (err) {
     console.error(`[container-config] failed to parse ${p}: ${String(err)}`);
