@@ -10,6 +10,7 @@ import path from 'path';
 
 import { OneCLI } from '@onecli-sh/sdk';
 
+import { getHostCapabilities } from './capabilities.js';
 import { CONTAINER_IMAGE, DATA_DIR, GROUPS_DIR, IDLE_TIMEOUT, ONECLI_URL, TIMEZONE } from './config.js';
 import { readContainerConfig, writeContainerConfig, type ContainerConfig } from './container-config.js';
 import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainer } from './container-runtime.js';
@@ -92,6 +93,11 @@ async function spawnContainer(session: Session): Promise<void> {
   // changes take effect on wake.
   writeDestinations(agentGroup.id, session.id);
   writeSessionRouting(agentGroup.id, session.id);
+
+  // Snapshot host capabilities into the session dir so the container can
+  // read a static JSON (Phase 5.3). Refreshed every spawn so newly-mounted
+  // credentials / plugins / channel registrations appear immediately.
+  writeCapabilitiesSnapshot(agentGroup.id, session.id);
 
   const mounts = buildMounts(agentGroup, session);
   const containerName = `nanoclaw-v2-${agentGroup.folder}-${Date.now()}`;
@@ -190,6 +196,21 @@ function resolveScopedEnv(baseName: string, folder: string): string | undefined 
  * anything in the host's `.env`. After cutover this can collapse into
  * the plain `resolveScopedEnv` convention.
  */
+/**
+ * Phase 5.3: write a capabilities snapshot into the session dir at
+ * every container spawn. Container's get_capabilities MCP tool reads
+ * this JSON directly — no round-trip, always fresh per spawn.
+ */
+function writeCapabilitiesSnapshot(agentGroupId: string, sessionId: string): void {
+  try {
+    const caps = getHostCapabilities();
+    const outPath = path.join(sessionDir(agentGroupId, sessionId), 'capabilities.json');
+    fs.writeFileSync(outPath, JSON.stringify(caps, null, 2) + '\n');
+  } catch (err) {
+    log.warn('Failed to write capabilities snapshot', { err });
+  }
+}
+
 function resolveGitHubToken(folder: string, cfg: ContainerConfig): string | undefined {
   if (cfg.githubTokenEnv) {
     const v = process.env[cfg.githubTokenEnv];
