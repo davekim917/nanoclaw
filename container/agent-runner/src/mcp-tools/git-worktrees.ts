@@ -109,9 +109,16 @@ export const cloneRepoTool: McpToolDefinition = {
 
     const destDir = path.join(AGENT_DIR, repoName);
 
+    // Idempotent only if it's a *real* clone — a prior failed clone can leave
+    // an empty dir behind, which would silently falsely return success here
+    // and then break create_worktree downstream.
     if (fs.existsSync(destDir)) {
-      log(`clone_repo: ${repoName} already exists at ${destDir} (idempotent)`);
-      return ok(`Repo already present at ${destDir}`);
+      if (fs.existsSync(path.join(destDir, '.git'))) {
+        log(`clone_repo: ${repoName} already exists at ${destDir} (idempotent)`);
+        return ok(`Repo already present at ${destDir}`);
+      }
+      log(`clone_repo: ${destDir} exists but has no .git — removing and re-cloning`);
+      try { fs.rmSync(destDir, { recursive: true, force: true }); } catch { /* ignore */ }
     }
 
     try {
