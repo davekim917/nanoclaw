@@ -93,9 +93,7 @@ async function runOnce(deps: PluginUpdaterDeps): Promise<void> {
   if (repos.length === 0) return;
 
   log.info('Plugin updater: scanning', { count: repos.length });
-  const results = await Promise.all(
-    repos.map((name) => updatePlugin(path.join(pluginsRoot, name), name)),
-  );
+  const results = await Promise.all(repos.map((name) => updatePlugin(path.join(pluginsRoot, name), name)));
 
   const changed = results.filter((r) => r.changed);
   if (changed.length === 0) return;

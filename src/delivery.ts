@@ -989,9 +989,7 @@ async function handleSystemAction(
       const chatJid = (content.chatJid as string) || '';
       const cwd = (content.cwd as string) || process.cwd();
       const result = await startRemoteControl(sender, chatJid, cwd);
-      const text = result.ok
-        ? `Remote Control ready: ${result.url}`
-        : `Remote Control failed: ${result.error}`;
+      const text = result.ok ? `Remote Control ready: ${result.url}` : `Remote Control failed: ${result.error}`;
       notifyAgent(session, text);
       break;
     }

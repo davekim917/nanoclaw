@@ -170,7 +170,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         userName: adapter.userName || 'NanoClaw',
         concurrency: config.concurrency ?? 'concurrent',
         state,
-        logger: 'silent',
+        logger: process.env.CHAT_SDK_DEBUG ? 'debug' : 'silent',
       });
 
       // Subscribed threads — forward all messages

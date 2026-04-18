@@ -48,8 +48,8 @@ export interface HostCapabilities {
 
   /** Which credential dirs the host has mounted (determines agent tool scope). */
   credentials: {
-    gws: boolean;            // Google Workspace (Gmail/Calendar/Drive/Docs)
-    gmailMcp: boolean;       // legacy Gmail MCP creds
+    gws: boolean; // Google Workspace (Gmail/Calendar/Drive/Docs)
+    gmailMcp: boolean; // legacy Gmail MCP creds
     googleCalendarMcp: boolean;
     googleWorkspaceMcp: boolean;
     snowflake: boolean;
@@ -61,8 +61,8 @@ export interface HostCapabilities {
 
   /** Which plugin repos are mounted into containers from ~/plugins/ + the built-in nanoclaw-hooks. */
   plugins: {
-    builtin: string[];       // always-on built-in plugins (nanoclaw-hooks)
-    installed: string[];     // ~/plugins/* subdirs
+    builtin: string[]; // always-on built-in plugins (nanoclaw-hooks)
+    installed: string[]; // ~/plugins/* subdirs
   };
 
   /** Agent groups + their per-group feature flags. */

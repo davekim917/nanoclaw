@@ -65,7 +65,12 @@ async function registerCommands(botToken: string, clientId: string, guildId: str
  */
 function allowedChannels(): Set<string> {
   const raw = process.env.DISCORD_SLASH_CHANNEL_IDS || '';
-  return new Set(raw.split(',').map((s) => s.trim()).filter(Boolean));
+  return new Set(
+    raw
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean),
+  );
 }
 
 function channelIsAllowed(interaction: ChatInputCommandInteraction): boolean {
@@ -142,8 +147,11 @@ async function handleUpdatePlugins(interaction: ChatInputCommandInteraction): Pr
     }
     const entries = fs.readdirSync(pluginsRoot).filter((e) => {
       const p = path.join(pluginsRoot, e);
-      try { return fs.statSync(p).isDirectory() && fs.existsSync(path.join(p, '.git')); }
-      catch { return false; }
+      try {
+        return fs.statSync(p).isDirectory() && fs.existsSync(path.join(p, '.git'));
+      } catch {
+        return false;
+      }
     });
     const results: string[] = [];
     for (const name of entries) {
@@ -192,7 +200,9 @@ async function onInteraction(interaction: Interaction): Promise<void> {
         content: `Handler error: ${err instanceof Error ? err.message : String(err)}`,
         ephemeral: true,
       });
-    } catch { /* already replied / no channel */ }
+    } catch {
+      /* already replied / no channel */
+    }
   }
 }
 
@@ -240,7 +250,11 @@ export async function startDiscordSlashCommands(): Promise<boolean> {
 
 export async function stopDiscordSlashCommands(): Promise<void> {
   if (client) {
-    try { await client.destroy(); } catch { /* ignore */ }
+    try {
+      await client.destroy();
+    } catch {
+      /* ignore */
+    }
     client = null;
   }
 }

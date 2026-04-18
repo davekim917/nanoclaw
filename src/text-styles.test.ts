@@ -55,15 +55,11 @@ describe('parseTextStyles — headings', () => {
 
 describe('parseTextStyles — links', () => {
   it('converts [text](url) to text (url) on telegram', () => {
-    expect(parseTextStyles('[Link](https://example.com)', 'telegram')).toBe(
-      'Link (https://example.com)',
-    );
+    expect(parseTextStyles('[Link](https://example.com)', 'telegram')).toBe('Link (https://example.com)');
   });
 
   it('converts [text](url) to <url|text> on slack', () => {
-    expect(parseTextStyles('[Click here](https://example.com)', 'slack')).toBe(
-      '<https://example.com|Click here>',
-    );
+    expect(parseTextStyles('[Click here](https://example.com)', 'slack')).toBe('<https://example.com|Click here>');
   });
 });
 

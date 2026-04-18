@@ -49,11 +49,7 @@ export async function generateTopicTitle(messageText: string): Promise<string | 
  * off the bare thread ID (last segment) since Discord's REST endpoint
  * just wants that.
  */
-async function renameDiscordThread(
-  threadPlatformId: string,
-  newName: string,
-  botToken: string,
-): Promise<void> {
+async function renameDiscordThread(threadPlatformId: string, newName: string, botToken: string): Promise<void> {
   const parts = threadPlatformId.split(':');
   const threadId = parts[parts.length - 1];
   if (!threadId || !/^\d+$/.test(threadId)) {
@@ -64,7 +60,7 @@ async function renameDiscordThread(
   const res = await fetch(`https://discord.com/api/v10/channels/${threadId}`, {
     method: 'PATCH',
     headers: {
-      'Authorization': `Bot ${botToken}`,
+      Authorization: `Bot ${botToken}`,
       'Content-Type': 'application/json',
       'User-Agent': 'nanoclaw-v2 (topic-title, v2)',
     },

@@ -135,7 +135,11 @@ export async function startRemoteControl(
       }
 
       let content = '';
-      try { content = fs.readFileSync(STDOUT_FILE, 'utf-8'); } catch { /* not ready */ }
+      try {
+        content = fs.readFileSync(STDOUT_FILE, 'utf-8');
+      } catch {
+        /* not ready */
+      }
 
       const match = content.match(URL_REGEX);
       if (match) {
@@ -154,8 +158,15 @@ export async function startRemoteControl(
       }
 
       if (Date.now() - startTime >= URL_TIMEOUT_MS) {
-        try { process.kill(-pid, 'SIGTERM'); }
-        catch { try { process.kill(pid, 'SIGTERM'); } catch { /* already dead */ } }
+        try {
+          process.kill(-pid, 'SIGTERM');
+        } catch {
+          try {
+            process.kill(pid, 'SIGTERM');
+          } catch {
+            /* already dead */
+          }
+        }
         resolve({ ok: false, error: 'Timed out waiting for Remote Control URL' });
         return;
       }
@@ -170,7 +181,11 @@ export function stopRemoteControl(): { ok: true } | { ok: false; error: string }
   if (!activeSession) return { ok: false, error: 'No active Remote Control session' };
 
   const { pid } = activeSession;
-  try { process.kill(pid, 'SIGTERM'); } catch { /* already dead */ }
+  try {
+    process.kill(pid, 'SIGTERM');
+  } catch {
+    /* already dead */
+  }
   activeSession = null;
   clearState();
   log.info('Remote Control session stopped', { pid });

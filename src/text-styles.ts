@@ -24,9 +24,7 @@ export function parseTextStyles(text: string, channel: ChannelType): string {
   // Split into protected (code) and unprotected regions, transform only the latter.
   const segments = splitProtectedRegions(text);
   return segments
-    .map(({ content, protected: isProtected }) =>
-      isProtected ? content : transformSegment(content, channel),
-    )
+    .map(({ content, protected: isProtected }) => (isProtected ? content : transformSegment(content, channel)))
     .join('');
 }
 
@@ -71,11 +69,7 @@ export function parseSignalStyles(rawText: string): {
   const s = rawText;
   const n = s.length;
 
-  function addStyle(
-    style: SignalTextStyle['style'],
-    startOut: number,
-    endOut: number,
-  ): void {
+  function addStyle(style: SignalTextStyle['style'], startOut: number, endOut: number): void {
     const length = endOut - startOut;
     if (length > 0) textStyle.push({ style, start: startOut, length });
   }
@@ -145,12 +139,7 @@ export function parseSignalStyles(rawText: string): {
     }
 
     // ── Italic  *text*  (single star, not part of **) ─────────────────
-    if (
-      s[i] === '*' &&
-      s[i + 1] !== '*' &&
-      s[i + 1] !== ' ' &&
-      s[i + 1] !== undefined
-    ) {
+    if (s[i] === '*' && s[i + 1] !== '*' && s[i + 1] !== ' ' && s[i + 1] !== undefined) {
       const end = findClosingStar(s, i + 1);
       if (end !== -1) {
         const content = s.slice(i + 1, end);
@@ -186,8 +175,7 @@ export function parseSignalStyles(rawText: string): {
       while (j < n && s[j] === '#') j++;
       if (j < n && s[j] === ' ') {
         const lineEnd = s.indexOf('\n', j + 1);
-        const headingText =
-          lineEnd !== -1 ? s.slice(j + 1, lineEnd) : s.slice(j + 1);
+        const headingText = lineEnd !== -1 ? s.slice(j + 1, lineEnd) : s.slice(j + 1);
         const startOut = out.length;
         out += headingText;
         addStyle('BOLD', startOut, out.length);

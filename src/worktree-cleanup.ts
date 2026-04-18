@@ -60,10 +60,7 @@ function getBranchName(worktreePath: string): string | null {
 }
 
 function isPRMerged(branch: string, worktreePath: string): boolean {
-  const out = execSafe(
-    `gh pr list --head ${branch} --state merged --json number --limit 1`,
-    worktreePath,
-  );
+  const out = execSafe(`gh pr list --head ${branch} --state merged --json number --limit 1`, worktreePath);
   if (out === null) return false;
   try {
     const parsed = JSON.parse(out);
@@ -100,7 +97,8 @@ function removeWorktree(canonicalRepoPath: string, worktreePath: string): void {
 
 function safeReaddir(dir: string): string[] {
   try {
-    return fs.readdirSync(dir, { withFileTypes: true })
+    return fs
+      .readdirSync(dir, { withFileTypes: true })
       .filter((e) => e.isDirectory())
       .map((e) => e.name);
   } catch {
@@ -208,7 +206,9 @@ function cleanupOne(target: WorktreeTarget): void {
     const ageDays = getLastModifiedDays(worktreePath);
     if (ageDays > STALE_WARNING_DAYS) {
       log.warn('Worktree cleanup: stale >30d, no merged PR', {
-        ...ctx, branch, ageDays: Math.round(ageDays),
+        ...ctx,
+        branch,
+        ageDays: Math.round(ageDays),
       });
     }
   } catch (err) {
@@ -232,14 +232,28 @@ export function startWorktreeCleanup(): void {
   if (intervalHandle || startupHandle) return;
   startupHandle = setTimeout(() => {
     startupHandle = null;
-    try { runOnce(); } catch (err) { log.error('Worktree cleanup: startup run failed', { err }); }
+    try {
+      runOnce();
+    } catch (err) {
+      log.error('Worktree cleanup: startup run failed', { err });
+    }
   }, STARTUP_DELAY_MS);
   intervalHandle = setInterval(() => {
-    try { runOnce(); } catch (err) { log.error('Worktree cleanup: periodic run failed', { err }); }
+    try {
+      runOnce();
+    } catch (err) {
+      log.error('Worktree cleanup: periodic run failed', { err });
+    }
   }, CLEANUP_INTERVAL_MS);
 }
 
 export function stopWorktreeCleanup(): void {
-  if (startupHandle) { clearTimeout(startupHandle); startupHandle = null; }
-  if (intervalHandle) { clearInterval(intervalHandle); intervalHandle = null; }
+  if (startupHandle) {
+    clearTimeout(startupHandle);
+    startupHandle = null;
+  }
+  if (intervalHandle) {
+    clearInterval(intervalHandle);
+    intervalHandle = null;
+  }
 }
