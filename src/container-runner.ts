@@ -277,6 +277,36 @@ function buildMounts(agentGroup: AgentGroup, session: Session): VolumeMount[] {
     }
   }
 
+  // Project source tree at /workspace/project (RO). Lets agents read the
+  // NanoClaw codebase — useful for self-diagnostic questions ("why did
+  // you do X?"), self-mod context, and understanding their own runtime.
+  // We mount a selective allowlist rather than the whole project root
+  // to exclude .env, data/, groups/, repo-tokens/, node_modules/, dist/,
+  // logs/, and other sensitive or bulky paths.
+  const projectRoot = path.resolve(GROUPS_DIR, '..');
+  const sourceEntries = [
+    'src',
+    'container',
+    'docs',
+    'scripts',
+    'package.json',
+    'README.md',
+    'CONTRIBUTING.md',
+    'CLAUDE.md',
+    'AGENTS.md',
+    'tsconfig.json',
+  ];
+  for (const entry of sourceEntries) {
+    const hostEntry = path.join(projectRoot, entry);
+    if (fs.existsSync(hostEntry)) {
+      mounts.push({
+        hostPath: hostEntry,
+        containerPath: `/workspace/project/${entry}`,
+        readonly: true,
+      });
+    }
+  }
+
   // Tone profiles — project-relative, shared across all groups. Read-only:
   // groups select a profile in their CLAUDE.md; the files themselves are
   // managed via the /add-tone-profile skill on the host.
