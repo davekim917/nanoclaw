@@ -587,24 +587,73 @@ Run both instances simultaneously. Route test channels to v2, production stays o
 
 ### Parity Checklist
 
+**Messaging & sessions:**
 - [ ] Messages send and receive on all configured channels
 - [ ] Thread isolation works (concurrent threads don't interfere)
 - [ ] Long sessions (~50+ tool calls) show progress updates and don't time out
 - [ ] Destructive commands trigger approval flow (Claude Code permission prompts + pending_approvals for self-mod)
-- [x] Memory captures user preferences and project context — native auto-memory (2.8) verified writing `MEMORY.md` + linked files from a single chat turn on illysium-v2 (2026-04-17)
-- [ ] Thread search: "find the thread where we discussed X" returns the correct thread + summary (2.9)
-- [ ] Permalink resolver: pasting a Slack/Discord thread link lets the agent load that thread's content (2.10)
-- [ ] Cross-thread context: a new thread can reference facts mentioned in a prior thread via auto-memory (2.8) OR raw history lookup (2.9)
-- [ ] Repo work: agent can clone a GitHub repo, make a branch via worktree, commit, push, and open a PR end-to-end (2.11)
-- [ ] Concurrent repo work: two threads can work on the same repo simultaneously without index-lock collisions (2.11)
-- [ ] PR-merge GC: after merging a PR on GitHub, the agent's worktree is reaped within one cron cycle (2.11)
-- [ ] Agent can use all required tools (dbt, git, gcloud, etc.)
 - [ ] Typing indicators appear and clear correctly
 - [ ] File attachments send successfully (including per-platform size limit validation)
 - [ ] Error recovery works (agent crash → clean restart via host-sweep stale detection)
 - [ ] Session resumption works across container restarts (continuation token)
-- [ ] Tables render acceptably on Discord and Slack (spot-check)
-- [ ] Can v2 agents make git commits natively? (Claude Code runs inside the container — test whether git write operations work with the mount setup)
+- [x] Memory captures user preferences and project context — native auto-memory (2.8) verified writing `MEMORY.md` + linked files from a single chat turn on illysium-v2 (2026-04-17)
+
+**Cross-thread memory & search (2.8–2.10):**
+- [ ] Thread search: "find the thread where we discussed X" returns the correct thread + summary (2.9)
+- [ ] Permalink resolver: pasting a Slack/Discord thread link lets the agent load that thread's content (2.10)
+- [ ] Cross-thread context: a new thread can reference facts mentioned in a prior thread via auto-memory (2.8) OR raw history lookup (2.9)
+
+**Git + repo workflow (2.11):**
+- [x] Repo work: agent can clone a GitHub repo, make a branch via worktree, commit, push, and open a PR end-to-end — verified via PR #130 on Illysium-ai/apollo-analytics (2026-04-17)
+- [ ] Concurrent repo work: two threads can work on the same repo simultaneously without index-lock collisions
+- [ ] PR-merge GC: after merging a PR on GitHub, the agent's worktree is reaped within one cron cycle
+
+**Container surface-area (5.0):**
+- [ ] `get_capabilities` MCP tool returns expected payload (channels, credentials, plugins, agent groups, feature flags)
+- [ ] Plugin auto-discovery works — spawn a container, verify `ls /workspace/plugins/` shows all of ~/plugins/* plus nanoclaw-hooks
+- [ ] Credential mounts present where expected — `gws accounts list`, `snow --version`, `dbt debug`, `aws sts get-caller-identity` all respond (per-group based on installed tools)
+- [ ] `GH_TOKEN` + `gh auth setup-git` wired correctly — `git clone`, `git push`, `gh pr create` all work inside container
+- [ ] Per-group scoped env: illysium-v2 agents see `SNOWFLAKE_PASSWORD` populated from `SNOWFLAKE_PASSWORD_ILLYSIUM` (same for render / dbt / openai / etc.)
+- [ ] Entrypoint.sh tool setup: XDG dirs for Chromium exist, gws wrapper in $PATH and strips ADC, GitNexus registry populated with mounted repos
+
+**Tone + formatting (5.1 + 5.9):**
+- [ ] `get_tone_profile("engineering")` returns profile content + writing rules appended
+- [ ] `list_tone_profiles` returns available names + selection guide
+- [ ] Slack message with markdown (`**bold**`, `[text](url)`, `## heading`) renders as mrkdwn (bold via `*`, `<url|text>`, `*heading*`)
+- [ ] Slack code blocks preserve literal markdown markers inside (protected regions)
+- [ ] Telegram formatting unchanged — sanitizer already present pre-5.9
+- [ ] Discord passes markdown through natively
+
+**GitNexus hooks (5.2):**
+- [ ] PreToolUse hook: editing a file in a repo without a GitNexus index surfaces a "no index" warning the first time
+- [ ] PostToolUse hook: after a git commit in chat, blast-radius analysis output appears
+
+**Topic-titled threads (5.11):**
+- [ ] New top-level @-mention in Discord auto-creates a thread AND renames it to a 2-5 word topic title (not "thread created …")
+- [ ] DISCORD_BOT_TOKEN permissions include Manage Threads (otherwise rename silently fails — check logs)
+
+**Plugin updater (5.12):**
+- [ ] Every hour, `logs/nanoclaw.log` shows "Plugin updater: scanning" with the right count
+- [ ] Update a plugin repo manually → next cron cycle logs "Plugin updated" for that one
+- [ ] With `PLUGIN_UPDATE_NOTIFY_JID` set, a notification chat message arrives after an update
+
+**Remote control (5.7):**
+- [ ] "Start remote control" via chat → host spawns `claude remote-control`, URL arrives in chat as a follow-up
+- [ ] "Stop remote control" tears it down
+- [ ] Service restart preserves the session (restoreRemoteControl adopts the running pid)
+
+**Service mode (pre-cutover):**
+- [ ] `sudo systemctl status nanoclaw-v2` shows active + enabled
+- [ ] Service restarts cleanly (`sudo systemctl restart nanoclaw-v2`)
+- [ ] Logs land in `logs/nanoclaw.log` and `logs/nanoclaw.error.log`
+- [ ] Service survives a machine reboot (add to post-reboot check)
+
+**Discord slash commands (5.14 — post-cutover only):**
+- [ ] Set `ENABLE_DISCORD_SLASH_COMMANDS=1`, restart service, commands register in guild within ~60s
+- [ ] `/deploy` from a whitelisted channel spawns deploy.sh and restarts the service cleanly
+- [ ] `/update-container` rebuilds the image and reports success
+- [ ] `/update-plugins` git-pulls every plugin and returns a summary
+- [ ] Slash command from a non-whitelisted channel returns "not allowed" reply
 
 ### Spot-Checks
 
@@ -613,6 +662,8 @@ Run both instances simultaneously. Route test channels to v2, production stays o
 - [ ] Trigger a 429 → verify recovery (OneCLI or fallback)
 - [ ] Kill a container mid-session → verify host detects stale heartbeat and retries
 - [ ] Send concurrent messages in different threads → verify isolation
+- [ ] Session with a tone-profile directive — confirm the agent actually loads the profile and writes in that voice
+- [ ] `@illie-v2 what can you do?` — agent calls `get_capabilities` and describes the install accurately (no hallucinated features, no missed mounted creds)
 
 ---
 
