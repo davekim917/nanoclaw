@@ -483,21 +483,13 @@ async function buildContainerArgs(
     args.push('-e', `NANOCLAW_MCP_SERVERS=${JSON.stringify(containerConfig.mcpServers)}`);
   }
 
-  // Override entrypoint: compile agent-runner source, run v2 entry point (no stdin)
-  args.push('--entrypoint', 'bash');
-
-  // Use per-agent-group image if one has been built, otherwise base image
+  // Use per-agent-group image if one has been built, otherwise base image.
+  // The image's default ENTRYPOINT runs /app/entrypoint.sh which compiles
+  // the agent-runner source, sets up tool env (Chromium XDG, gws wrapper,
+  // GitHub git auth, Render workspace, GitNexus repo registration), and
+  // execs node /tmp/dist/index.js.
   const imageTag = containerConfig.imageTag || CONTAINER_IMAGE;
   args.push(imageTag);
-
-  // gh auth setup-git configures git's credential helper to use $GH_TOKEN
-  // for github.com. Idempotent. Best-effort (no-op if gh is missing or
-  // GH_TOKEN is unset). Runs before node so git-based MCP tools authenticate
-  // natively — OneCLI's proxy doesn't cover the github.com host.
-  args.push(
-    '-c',
-    'cd /app && npx tsc --outDir /tmp/dist 2>&1 >&2 && ln -sf /app/node_modules /tmp/dist/node_modules && gh auth setup-git 2>/dev/null; node /tmp/dist/index.js',
-  );
 
   return args;
 }
