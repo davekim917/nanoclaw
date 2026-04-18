@@ -277,6 +277,54 @@ function buildMounts(agentGroup: AgentGroup, session: Session): VolumeMount[] {
     }
   }
 
+  // Host-side credential dirs — mount RO when present. v2's model differs
+  // from v1's: we don't gate these behind a per-group `tools` array because
+  // v2 already trusts the container with its OneCLI agent token (which
+  // unlocks everything that agent has access to anyway). If a group needs
+  // to exclude a CLI surface, do it via container image customization or
+  // explicit deny-mounting, not via implicit tool-list scoping.
+  const home = os.homedir();
+  const credentialMounts: Array<{ host: string; container: string }> = [
+    // Google Workspace — consolidated gws-style (one authorized_user per account)
+    { host: path.join(home, '.config', 'gws', 'accounts'), container: '/home/node/.config/gws/accounts' },
+    // Legacy Gmail MCP creds (primary)
+    { host: path.join(home, '.gmail-mcp'), container: '/home/node/.gmail-mcp' },
+    // Google Calendar MCP
+    { host: path.join(home, '.config', 'google-calendar-mcp'), container: '/home/node/.config/google-calendar-mcp' },
+    // Google Workspace MCP alt path
+    { host: path.join(home, '.google_workspace_mcp', 'credentials'), container: '/home/node/.google_workspace_mcp/credentials' },
+    // Snowflake connections + keys
+    { host: path.join(home, '.snowflake'), container: '/home/node/.snowflake' },
+    // AWS creds
+    { host: path.join(home, '.aws'), container: '/home/node/.aws' },
+    // gcloud service-account JSON keys
+    { host: path.join(home, '.gcloud-keys'), container: '/home/node/.gcloud-keys' },
+    // dbt profiles + secrets
+    { host: path.join(home, '.dbt'), container: '/home/node/.dbt' },
+  ];
+  for (const m of credentialMounts) {
+    if (fs.existsSync(m.host)) {
+      mounts.push({ hostPath: m.host, containerPath: m.container, readonly: true });
+    }
+  }
+
+  // Additional multi-account Gmail MCP dirs (.gmail-mcp-<account>/) —
+  // v1 supported per-account setups. Mount each as-is.
+  try {
+    for (const entry of fs.readdirSync(home)) {
+      if (!entry.startsWith('.gmail-mcp-')) continue;
+      const dir = path.join(home, entry);
+      try {
+        if (!fs.statSync(dir).isDirectory()) continue;
+      } catch {
+        continue;
+      }
+      mounts.push({ hostPath: dir, containerPath: `/home/node/${entry}`, readonly: true });
+    }
+  } catch {
+    // home may not be readable — fine, skip
+  }
+
   return mounts;
 }
 
