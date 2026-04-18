@@ -17,6 +17,7 @@ import { createSlackAdapter } from '@chat-adapter/slack';
 
 import { readEnvFileMatching } from '../env.js';
 import { log } from '../log.js';
+import { parseTextStyles } from '../text-styles.js';
 import { createChatSdkBridge } from './chat-sdk-bridge.js';
 import { registerChannelAdapter } from './channel-registry.js';
 
@@ -76,6 +77,11 @@ for (const ws of workspaces) {
         concurrency: 'concurrent',
         supportsThreads: true,
         channelType: ws.channelType,
+        // Convert Markdown (**bold**, [text](url), ## heading) to Slack's
+        // mrkdwn syntax (*bold*, <url|text>, *heading*) before delivery.
+        // Without this, Claude's Markdown renders literally in Slack
+        // (asterisks shown, headings ignored, links broken).
+        transformOutboundText: (t) => parseTextStyles(t, 'slack'),
       });
     },
   });
