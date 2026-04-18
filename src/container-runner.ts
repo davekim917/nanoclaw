@@ -289,6 +289,20 @@ function buildMounts(agentGroup: AgentGroup, session: Session): VolumeMount[] {
     mounts.push(...validated);
   }
 
+  // Built-in nanoclaw-hooks plugin: project-relative, always mounted.
+  // Provides the GitNexus repo-readiness guard (PreToolUse) and the
+  // post-commit blast-radius verification hook (PostToolUse). Unlike
+  // external plugins, this one ships with NanoClaw itself. Same
+  // discovery path (CLAUDE_PLUGINS_ROOT → /workspace/plugins/*).
+  const builtinPlugin = path.resolve(GROUPS_DIR, '..', 'container', 'nanoclaw-plugin');
+  if (fs.existsSync(builtinPlugin)) {
+    mounts.push({
+      hostPath: builtinPlugin,
+      containerPath: '/workspace/plugins/nanoclaw-hooks',
+      readonly: true,
+    });
+  }
+
   // Plugin mounts: every subdir of ~/plugins is mounted RO at
   // /workspace/plugins/<name>. Claude Code SDK auto-discovers via
   // CLAUDE_PLUGINS_ROOT (set in buildContainerArgs). Per-group

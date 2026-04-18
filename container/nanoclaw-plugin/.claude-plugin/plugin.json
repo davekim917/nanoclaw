@@ -1,0 +1,7 @@
+{
+  "name": "nanoclaw-hooks",
+  "description": "Container-side hooks for NanoClaw: repo readiness guard and post-commit blast radius verification.",
+  "version": "1.0.0",
+  "author": { "name": "NanoClaw" },
+  "hooks": "./hooks/hooks.json"
+}
