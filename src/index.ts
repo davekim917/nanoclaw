@@ -17,6 +17,7 @@ import { startHostSweep, stopHostSweep } from './host-sweep.js';
 import { startWorktreeCleanup, stopWorktreeCleanup } from './worktree-cleanup.js';
 import { startPluginUpdater, stopPluginUpdater } from './plugin-updater.js';
 import { restoreRemoteControl } from './remote-control.js';
+import { startDiscordSlashCommands, stopDiscordSlashCommands } from './channels/discord-slash-commands.js';
 import {
   ONECLI_ACTION,
   resolveOneCLIApproval,
@@ -155,7 +156,14 @@ async function main(): Promise<void> {
   // 9. Restore any Remote Control session that was running before restart
   restoreRemoteControl();
 
-  // 10. Start OneCLI manual-approval handler
+  // 10. Start Discord slash-command client (gated on
+  //     ENABLE_DISCORD_SLASH_COMMANDS=1; no-op while v1 still owns
+  //     the bot token to avoid duplicate INTERACTION_CREATE delivery).
+  startDiscordSlashCommands().catch((err) => {
+    log.error('Discord slash commands failed to start', { err });
+  });
+
+  // 11. Start OneCLI manual-approval handler
   startOneCLIApprovalHandler(deliveryAdapter);
 
   log.info('NanoClaw v2 running');
@@ -367,6 +375,7 @@ async function shutdown(signal: string): Promise<void> {
   stopHostSweep();
   stopWorktreeCleanup();
   stopPluginUpdater();
+  await stopDiscordSlashCommands();
   await teardownChannelAdapters();
   process.exit(0);
 }
