@@ -5,13 +5,13 @@ description: Wire channels to agent groups, manage isolation levels, add new cha
 
 # Manage Channels
 
-Wire messaging channels to agent groups. See `docs/v2-isolation-model.md` for the full isolation model.
+Wire messaging channels to agent groups. See `docs/isolation-model.md` for the full isolation model.
 
 Privilege is a **user-level** concept, not a channel-level one (see `src/db/user-roles.ts`, `src/access.ts`). There is no "main channel" / "main group" — any user can be granted `owner` or `admin` (global or scoped to an agent group) via `grantRole()`, and messages from unknown senders are gated per-messaging-group by `unknown_sender_policy` (`strict` | `request_approval` | `public`).
 
 ## Assess Current State
 
-Read the v2 central DB (`data/v2.db`) — query `agent_groups`, `messaging_groups`, `messaging_group_agents`, `users`, and `user_roles` tables. Also check `.env` for channel tokens and `src/channels/index.ts` for uncommented imports.
+Read the central DB (`data/v2.db`) — query `agent_groups`, `messaging_groups`, `messaging_group_agents`, `users`, and `user_roles` tables. Also check `.env` for channel tokens and `src/channels/index.ts` for uncommented imports.
 
 Categorize channels as: **wired** (has DB entities + messaging_group_agents row), **configured but unwired** (has credentials + barrel import, no DB entities), or **not configured**.
 
@@ -38,12 +38,12 @@ Present a multiple-choice with a contextual recommendation. The three options:
 - **Same agent, separate conversations** (`--session-mode "shared"` + existing folder) — shared workspace/memory, independent threads. Recommend for same user across platforms.
 - **Separate agent** (new `--folder`) — full isolation. Recommend when different people are involved.
 
-Use the channel's `typical-use` and `default-isolation` fields to pick the recommendation. Offer to explain more if the user is unsure — reference `docs/v2-isolation-model.md` for the detailed explanation.
+Use the channel's `typical-use` and `default-isolation` fields to pick the recommendation. Offer to explain more if the user is unsure — reference `docs/isolation-model.md` for the detailed explanation.
 
 ### Register Command
 
 ```bash
-npx tsx setup/index.ts --step register -- \
+pnpm exec tsx setup/index.ts --step register -- \
   --platform-id "<id>" --name "<name>" \
   --folder "<folder>" --channel "<type>" \
   --session-mode "<shared|agent-shared|per-thread>" \
@@ -58,10 +58,10 @@ For separate agents, also ask for a folder name and optionally a different assis
 
 When adding another group/chat on an already-configured platform (e.g. a second Telegram group):
 
-1. **Telegram:** ask the isolation question first to determine intent (`wire-to:<folder>` for an existing agent, `new-agent:<folder>` for a fresh one). Run `npx tsx setup/index.ts --step pair-telegram -- --intent <intent>`, show the CODE (follow the `REMINDER_TO_ASSISTANT` line in the `PAIR_TELEGRAM_ISSUED` block) and tell the user to post `@<botname> CODE` in the target group (or DM the bot for a private chat). Wait for the `PAIR_TELEGRAM` block. The inbound interceptor has already created the `messaging_groups` row with `unknown_sender_policy = 'strict'` and upserted the paired user — `register` only needs to add the wiring:
+1. **Telegram:** ask the isolation question first to determine intent (`wire-to:<folder>` for an existing agent, `new-agent:<folder>` for a fresh one). Run `pnpm exec tsx setup/index.ts --step pair-telegram -- --intent <intent>`, show the CODE (follow the `REMINDER_TO_ASSISTANT` line in the `PAIR_TELEGRAM_ISSUED` block) and tell the user to post `@<botname> CODE` in the target group (or DM the bot for a private chat). Wait for the `PAIR_TELEGRAM` block. The inbound interceptor has already created the `messaging_groups` row with `unknown_sender_policy = 'strict'` and upserted the paired user — `register` only needs to add the wiring:
 
    ```bash
-   npx tsx setup/index.ts --step register -- \
+   pnpm exec tsx setup/index.ts --step register -- \
      --platform-id "<PLATFORM_ID>" --name "<group-name>" \
      --folder "<folder>" --channel "telegram" \
      --session-mode "<shared|agent-shared|per-thread>" \

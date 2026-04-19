@@ -66,7 +66,7 @@ Every frontend task follows this sequence. Do not skip steps.
 Run the build and fix ALL errors:
 
 ```bash
-npm run build 2>&1
+pnpm run build 2>&1
 ```
 
 If it fails, **fix it**. Do not deploy broken builds. Do not disable ESLint rules or TypeScript checks to make it pass.
@@ -76,7 +76,7 @@ If it fails, **fix it**. Do not deploy broken builds. Do not disable ESLint rule
 Start the dev server and test in a real browser:
 
 ```bash
-npm run dev &
+pnpm run dev &
 DEV_PID=$!
 sleep 3
 ```

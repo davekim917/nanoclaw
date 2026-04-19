@@ -9,6 +9,7 @@
  * the host side (defense in depth).
  */
 import { writeMessageOut } from '../db/messages-out.js';
+import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
 function log(msg: string): void {
@@ -140,4 +141,4 @@ export const requestRebuild: McpToolDefinition = {
   },
 };
 
-export const selfModTools: McpToolDefinition[] = [installPackages, addMcpServer, requestRebuild];
+registerTools([installPackages, addMcpServer, requestRebuild]);

@@ -51,12 +51,12 @@ git fetch upstream skill/channel-formatting
 git merge upstream/skill/channel-formatting
 ```
 
-If there are merge conflicts on `package-lock.json`, resolve them by accepting the incoming
+If there are merge conflicts on `pnpm-lock.yaml`, resolve them by accepting the incoming
 version and continuing:
 
 ```bash
-git checkout --theirs package-lock.json
-git add package-lock.json
+git checkout --theirs pnpm-lock.yaml
+git add pnpm-lock.yaml
 git merge --continue
 ```
 
@@ -74,9 +74,9 @@ This merge adds:
 ### Validate
 
 ```bash
-npm install
-npm run build
-npx vitest run src/formatting.test.ts
+pnpm install
+pnpm run build
+pnpm exec vitest run src/formatting.test.ts
 ```
 
 All 73 tests should pass and the build should be clean before continuing.
@@ -86,7 +86,7 @@ All 73 tests should pass and the build should be clean before continuing.
 ### Rebuild and restart
 
 ```bash
-npm run build
+pnpm run build
 launchctl kickstart -k gui/$(id -u)/com.nanoclaw   # macOS
 # Linux: systemctl --user restart nanoclaw
 ```
@@ -133,5 +133,5 @@ git checkout upstream/main -- src/router.ts
 # Revert the index.ts sendMessage call sites to plain formatOutbound(rawText)
 # (edit manually or: git checkout upstream/main -- src/index.ts)
 
-npm run build
+pnpm run build
 ```

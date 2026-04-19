@@ -12,6 +12,7 @@
  */
 import fs from 'fs';
 
+import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
 const CAPABILITIES_PATH = '/workspace/capabilities.json';
@@ -64,3 +65,5 @@ export const getCapabilitiesTool: McpToolDefinition = {
 };
 
 export const capabilitiesTools: McpToolDefinition[] = [getCapabilitiesTool];
+
+registerTools(capabilitiesTools);

@@ -41,7 +41,16 @@ After deploying, verify the live URL:
 vercel inspect <deployment-url> --token placeholder
 ```
 
-If you have `agent-browser` available, open the deployed URL and take a screenshot to visually verify.
+## Pre-Send Checks (do this before sharing the URL)
+
+Don't send the deployment URL to the user until you've confirmed it's actually working. At minimum:
+
+1. **Local build passes** — run `npm run build` (or the project's build command) before `vercel deploy`. If the build fails locally, fix it first; don't deploy broken code.
+2. **Deployment succeeded** — the `vercel deploy` output shows a "Production: https://..." URL and the status is READY (confirm with `vercel inspect`).
+3. **Live URL responds** — `curl -sI <url> | head -1` should return `HTTP/2 200` (or another 2xx/3xx). A 404/500 means something's broken even though Vercel reported success.
+4. **Optional visual check** — if `agent-browser` is loaded, open the URL and eyeball it. Helpful for catching broken layouts that a 200 response wouldn't reveal.
+
+If any check fails, fix the issue and redeploy before reporting to the user.
 
 ## Project Management
 
@@ -85,34 +94,6 @@ echo "value" | vercel env add VAR_NAME production --token placeholder
 | `Error: You have reached your project limit` | User needs to upgrade Vercel plan or delete unused projects |
 | `ENOTFOUND api.vercel.com` | Network issue. Check proxy connectivity |
 | Auth error after `vercel whoami` | Credential may be expired. Ask the user to refresh the Vercel token in OneCLI |
-
-## Building Websites — Delegate to Frontend Engineer
-
-When asked to **build, create, or redesign** a website or web app, do NOT build it yourself. Spin up a dedicated frontend-engineer agent that has full context for the job:
-
-```
-create_agent({
-  name: "Frontend Engineer",
-  instructions: "You are a dedicated frontend engineer. Your frontend-engineer skill has your full workflow. Build what is requested, test it visually with agent-browser, deploy to Vercel, and send back the live URL + screenshots to your parent agent when done."
-})
-```
-
-Then hand off the task:
-
-```
-send_message(to: "Frontend Engineer", text: "<what to build, design requirements, any assets or content>")
-```
-
-The frontend agent will:
-1. Build the site following pro frontend standards
-2. Test visually with `agent-browser` (screenshots as proof)
-3. Deploy to Vercel using `vercel deploy --yes --prod --token placeholder`
-4. Verify the production URL in browser
-5. Send back the live URL + screenshots
-
-**When to delegate vs do it yourself:**
-- **Delegate**: building new sites, redesigns, multi-page apps, anything that needs visual testing
-- **Do yourself**: simple `vercel deploy` of an existing project, checking deployment status, managing domains/env vars
 
 ## Best Practices
 

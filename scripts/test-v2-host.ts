@@ -6,7 +6,7 @@
  * 3. Container runs v2 agent-runner, polls inbound.db, queries Claude, writes outbound.db
  * 4. Poll outbound.db for messages_out response
  *
- * Usage: npx tsx scripts/test-v2-host.ts
+ * Usage: pnpm exec tsx scripts/test-v2-host.ts
  */
 import Database from 'better-sqlite3';
 import fs from 'fs';

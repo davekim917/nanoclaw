@@ -5,8 +5,9 @@
  * /workspace/archive.db. Host writes on every chat inbound/outbound;
  * container reads via these tools.
  */
-import Database from 'better-sqlite3';
+import { Database } from 'bun:sqlite';
 
+import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
 const ARCHIVE_PATH = '/workspace/archive.db';
@@ -23,11 +24,11 @@ function err(text: string) {
   return { content: [{ type: 'text' as const, text: `Error: ${text}` }], isError: true };
 }
 
-let _db: Database.Database | null = null;
-function getDb(): Database.Database | null {
+let _db: Database | null = null;
+function getDb(): Database | null {
   if (_db) return _db;
   try {
-    _db = new Database(ARCHIVE_PATH, { readonly: true, fileMustExist: true });
+    _db = new Database(ARCHIVE_PATH, { readonly: true });
     return _db;
   } catch (e) {
     log(`Archive not available at ${ARCHIVE_PATH}: ${e instanceof Error ? e.message : String(e)}`);
@@ -235,3 +236,5 @@ export const resolveThreadLinkTool: McpToolDefinition = {
 };
 
 export const threadSearchTools: McpToolDefinition[] = [searchThreadsTool, resolveThreadLinkTool];
+
+registerTools(threadSearchTools);

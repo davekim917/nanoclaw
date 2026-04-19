@@ -18,6 +18,7 @@ import { execFileSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
+import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
 const AGENT_DIR = '/workspace/agent';
@@ -354,3 +355,5 @@ export const gitWorktreeTools: McpToolDefinition[] = [
   gitPushTool,
   openPrTool,
 ];
+
+registerTools(gitWorktreeTools);

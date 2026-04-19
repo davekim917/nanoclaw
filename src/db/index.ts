@@ -8,22 +8,6 @@ export {
   updateAgentGroup,
   deleteAgentGroup,
 } from './agent-groups.js';
-export { createUser, upsertUser, getUser, getAllUsers, updateDisplayName, deleteUser } from './users.js';
-export {
-  grantRole,
-  revokeRole,
-  getUserRoles,
-  isOwner,
-  isGlobalAdmin,
-  isAdminOfAgentGroup,
-  hasAdminPrivilege,
-  getOwners,
-  hasAnyOwner,
-  getGlobalAdmins,
-  getAdminsOfAgentGroup,
-} from './user-roles.js';
-export { addMember, removeMember, getMembers, isMember, hasMembershipRow } from './agent-group-members.js';
-export { upsertUserDm, getUserDm, getUserDmsForUser, deleteUserDm } from './user-dms.js';
 export {
   createMessagingGroup,
   getMessagingGroup,

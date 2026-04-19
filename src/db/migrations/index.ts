@@ -3,12 +3,12 @@ import type Database from 'better-sqlite3';
 import { log } from '../../log.js';
 import { migration001 } from './001-initial.js';
 import { migration002 } from './002-chat-sdk-state.js';
-import { migration003 } from './003-pending-approvals.js';
-import { migration004 } from './004-agent-destinations.js';
-import { migration007 } from './007-pending-approvals-title-options.js';
+import { moduleAgentToAgentDestinations } from './module-agent-to-agent-destinations.js';
 import { migration008 } from './008-dropped-messages.js';
 import { migration009 } from './009-drop-pending-credentials.js';
 import { migration010 } from './010-memories.js';
+import { moduleApprovalsPendingApprovals } from './module-approvals-pending-approvals.js';
+import { moduleApprovalsTitleOptions } from './module-approvals-title-options.js';
 
 export interface Migration {
   version: number;
@@ -19,9 +19,9 @@ export interface Migration {
 const migrations: Migration[] = [
   migration001,
   migration002,
-  migration003,
-  migration004,
-  migration007,
+  moduleApprovalsPendingApprovals,
+  moduleAgentToAgentDestinations,
+  moduleApprovalsTitleOptions,
   migration008,
   migration009,
   migration010,
@@ -34,29 +34,34 @@ export function runMigrations(db: Database.Database): void {
       name    TEXT NOT NULL,
       applied TEXT NOT NULL
     );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_schema_version_name ON schema_version(name);
   `);
 
-  const currentVersion =
-    (db.prepare('SELECT MAX(version) as v FROM schema_version').get() as { v: number | null })?.v ?? 0;
-
-  const pending = migrations.filter((m) => m.version > currentVersion);
+  // Uniqueness is keyed on `name`, not `version`. This lets module
+  // migrations (added later by install skills) pick arbitrary version
+  // numbers without coordinating across modules. `version` stays on
+  // the Migration object as an ordering hint within the barrel array;
+  // the stored `version` column is auto-assigned at insert time as an
+  // applied-order number.
+  const applied = new Set<string>(
+    (db.prepare('SELECT name FROM schema_version').all() as { name: string }[]).map((r) => r.name),
+  );
+  const pending = migrations.filter((m) => !applied.has(m.name));
   if (pending.length === 0) return;
 
-  log.info('Running migrations', {
-    from: currentVersion,
-    to: pending[pending.length - 1].version,
-    count: pending.length,
-  });
+  log.info('Running migrations', { count: pending.length });
 
   for (const m of pending) {
     db.transaction(() => {
       m.up(db);
+      const next =
+        (db.prepare('SELECT COALESCE(MAX(version), 0) + 1 AS v FROM schema_version').get() as { v: number }).v;
       db.prepare('INSERT INTO schema_version (version, name, applied) VALUES (?, ?, ?)').run(
-        m.version,
+        next,
         m.name,
         new Date().toISOString(),
       );
     })();
-    log.info('Migration applied', { version: m.version, name: m.name });
+    log.info('Migration applied', { name: m.name });
   }
 }

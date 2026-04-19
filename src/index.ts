@@ -1,5 +1,5 @@
 /**
- * NanoClaw v2 — main entry point.
+ * NanoClaw — main entry point.
  *
  * Thin orchestrator: init DB, run migrations, start channel adapters,
  * start delivery polls, start sweep, handle shutdown.
@@ -12,41 +12,62 @@ import { runMigrations } from './db/migrations/index.js';
 import { registerSecretsFromEnv } from './secret-scrubber.js';
 import { getMessagingGroupsByChannel, getMessagingGroupAgents } from './db/messaging-groups.js';
 import { ensureContainerRuntimeRunning, cleanupOrphans } from './container-runtime.js';
-import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, stopDeliveryPolls } from './delivery.js';
+import {
+  getDeliveryAdapter,
+  setDeliveryAdapter,
+  startActiveDeliveryPoll,
+  startSweepDeliveryPoll,
+  stopDeliveryPolls,
+} from './delivery.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
 import { startWorktreeCleanup, stopWorktreeCleanup } from './worktree-cleanup.js';
 import { startPluginUpdater, stopPluginUpdater } from './plugin-updater.js';
 import { restoreRemoteControl } from './remote-control.js';
 import { startDiscordSlashCommands, stopDiscordSlashCommands } from './channels/discord-slash-commands.js';
-import {
-  ONECLI_ACTION,
-  resolveOneCLIApproval,
-  startOneCLIApprovalHandler,
-  stopOneCLIApprovalHandler,
-} from './onecli-approvals.js';
 import { routeInbound } from './router.js';
-import {
-  getPendingQuestion,
-  deletePendingQuestion,
-  getPendingApproval,
-  deletePendingApproval,
-  getSession,
-} from './db/sessions.js';
-import { getAgentGroup } from './db/agent-groups.js';
-import { updateContainerConfig } from './container-config.js';
-import { writeSessionMessage } from './session-manager.js';
-import { wakeContainer, buildAgentGroupImage, killContainer } from './container-runner.js';
 import { log } from './log.js';
+
+// Response + shutdown registries live in response-registry.ts to break the
+// circular import cycle: src/index.ts imports src/modules/index.js for side
+// effects, and the modules call registerResponseHandler/onShutdown at top
+// level — which would hit a TDZ error if the arrays lived here. Re-exported
+// here so existing callers see the same surface.
+import {
+  registerResponseHandler,
+  getResponseHandlers,
+  onShutdown,
+  getShutdownCallbacks,
+  type ResponsePayload,
+  type ResponseHandler,
+} from './response-registry.js';
+export { registerResponseHandler, onShutdown };
+export type { ResponsePayload, ResponseHandler };
+
+async function dispatchResponse(payload: ResponsePayload): Promise<void> {
+  for (const handler of getResponseHandlers()) {
+    try {
+      const claimed = await handler(payload);
+      if (claimed) return;
+    } catch (err) {
+      log.error('Response handler threw', { questionId: payload.questionId, err });
+    }
+  }
+  log.warn('Unclaimed response', { questionId: payload.questionId, value: payload.value });
+}
 
 // Channel barrel — each enabled channel self-registers on import.
 // Channel skills uncomment lines in channels/index.ts to enable them.
 import './channels/index.js';
 
+// Modules barrel — default modules (typing, mount-security) ship here; skills
+// append registry-based modules. Imported for side effects (registrations).
+import './modules/index.js';
+
 import type { ChannelAdapter, ChannelSetup, ConversationConfig } from './channels/adapter.js';
 import { initChannelAdapters, teardownChannelAdapters, getChannelAdapter } from './channels/channel-registry.js';
 
 async function main(): Promise<void> {
-  log.info('NanoClaw v2 starting');
+  log.info('NanoClaw starting');
 
   // 0. Register secret values from .env for outbound scrubbing. Cheap; does
   //    a no-op if .env is missing. Runs first so subsequent startup logs
@@ -92,7 +113,17 @@ async function main(): Promise<void> {
         });
       },
       onAction(questionId, selectedOption, userId) {
-        handleQuestionResponse(questionId, selectedOption, userId).catch((err) => {
+        dispatchResponse({
+          questionId,
+          value: selectedOption,
+          userId,
+          channelType: adapter.channelType,
+          // platformId/threadId aren't surfaced by the current onAction
+          // signature — registered handlers look them up from the
+          // pending_question / pending_approval row.
+          platformId: '',
+          threadId: null,
+        }).catch((err) => {
           log.error('Failed to handle question response', { questionId, err });
         });
       },
@@ -140,7 +171,6 @@ async function main(): Promise<void> {
   startPluginUpdater({
     notify: async (platformId, text) => {
       // Parse the jid format: <channel_type>:<platform_id>[:<thread_id>]
-      // Example: "dc:1479489866193571902" or "slack-illysium:C0ATLGJ4X60"
       const parts = platformId.split(':');
       if (parts.length < 2) {
         log.warn('Plugin updater notify: malformed jid', { platformId });
@@ -148,7 +178,12 @@ async function main(): Promise<void> {
       }
       const channelType = parts[0];
       const realPlatformId = parts.slice(1).join(':');
-      await deliveryAdapter.deliver(channelType, realPlatformId, null, 'chat', JSON.stringify({ text }));
+      const adapter = getDeliveryAdapter();
+      if (!adapter) {
+        log.warn('Plugin updater notify: no delivery adapter yet', { platformId });
+        return;
+      }
+      await adapter.deliver(channelType, realPlatformId, null, 'chat', JSON.stringify({ text }));
     },
   });
   log.info('Plugin updater started');
@@ -157,16 +192,12 @@ async function main(): Promise<void> {
   restoreRemoteControl();
 
   // 10. Start Discord slash-command client (gated on
-  //     ENABLE_DISCORD_SLASH_COMMANDS=1; no-op while v1 still owns
-  //     the bot token to avoid duplicate INTERACTION_CREATE delivery).
+  //     ENABLE_DISCORD_SLASH_COMMANDS=1).
   startDiscordSlashCommands().catch((err) => {
     log.error('Discord slash commands failed to start', { err });
   });
 
-  // 11. Start OneCLI manual-approval handler
-  startOneCLIApprovalHandler(deliveryAdapter);
-
-  log.info('NanoClaw v2 running');
+  log.info('NanoClaw running');
 }
 
 /** Build ConversationConfig[] for a channel type from the central DB. */
@@ -191,186 +222,16 @@ function buildConversationConfigs(channelType: string): ConversationConfig[] {
   return configs;
 }
 
-/** Handle a user's response to an ask_user_question card or an approval card. */
-async function handleQuestionResponse(questionId: string, selectedOption: string, userId: string): Promise<void> {
-  // OneCLI credential approvals — resolved via in-memory Promise, not session DB
-  if (resolveOneCLIApproval(questionId, selectedOption)) {
-    return;
-  }
-
-  // Check if this is a pending approval (install_packages, request_rebuild)
-  const approval = getPendingApproval(questionId);
-  if (approval) {
-    if (approval.action === ONECLI_ACTION) {
-      // Row exists but the in-memory resolver is gone (timer fired or process
-      // was in a weird state). Nothing to do — just drop the row.
-      deletePendingApproval(questionId);
-      return;
-    }
-    await handleApprovalResponse(approval, selectedOption, userId);
-    return;
-  }
-
-  const pq = getPendingQuestion(questionId);
-  if (!pq) {
-    log.warn('Pending question not found (may have expired)', { questionId });
-    return;
-  }
-
-  const session = getSession(pq.session_id);
-  if (!session) {
-    log.warn('Session not found for pending question', { questionId, sessionId: pq.session_id });
-    deletePendingQuestion(questionId);
-    return;
-  }
-
-  // Write the response to the session DB as a system message
-  writeSessionMessage(session.agent_group_id, session.id, {
-    id: `qr-${questionId}-${Date.now()}`,
-    kind: 'system',
-    timestamp: new Date().toISOString(),
-    platformId: pq.platform_id,
-    channelType: pq.channel_type,
-    threadId: pq.thread_id,
-    content: JSON.stringify({
-      type: 'question_response',
-      questionId,
-      selectedOption,
-      userId,
-    }),
-  });
-
-  deletePendingQuestion(questionId);
-  log.info('Question response routed', { questionId, selectedOption, sessionId: session.id });
-
-  // Wake the container so the MCP tool's poll picks up the response
-  await wakeContainer(session);
-}
-
-/**
- * Handle an admin's response to an approval card.
- * Fire-and-forget model: the agent doesn't poll for this — we write a chat
- * notification to its session DB, and optionally kill the container so the
- * next wake picks up new config/images.
- */
-async function handleApprovalResponse(
-  approval: import('./types.js').PendingApproval,
-  selectedOption: string,
-  userId: string,
-): Promise<void> {
-  if (!approval.session_id) {
-    deletePendingApproval(approval.approval_id);
-    return;
-  }
-  const session = getSession(approval.session_id);
-  if (!session) {
-    deletePendingApproval(approval.approval_id);
-    return;
-  }
-
-  const notify = (text: string): void => {
-    writeSessionMessage(session.agent_group_id, session.id, {
-      id: `appr-note-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      kind: 'chat',
-      timestamp: new Date().toISOString(),
-      platformId: session.agent_group_id,
-      channelType: 'agent',
-      threadId: null,
-      content: JSON.stringify({ text, sender: 'system', senderId: 'system' }),
-    });
-  };
-
-  if (selectedOption !== 'approve') {
-    notify(`Your ${approval.action} request was rejected by admin.`);
-    log.info('Approval rejected', { approvalId: approval.approval_id, action: approval.action, userId });
-    deletePendingApproval(approval.approval_id);
-    await wakeContainer(session);
-    return;
-  }
-
-  const payload = JSON.parse(approval.payload);
-
-  if (approval.action === 'install_packages') {
-    const agentGroup = getAgentGroup(session.agent_group_id);
-    if (!agentGroup) {
-      notify('install_packages approved but agent group missing.');
-      return;
-    }
-    updateContainerConfig(agentGroup.folder, (cfg) => {
-      if (payload.apt) cfg.packages.apt.push(...(payload.apt as string[]));
-      if (payload.npm) cfg.packages.npm.push(...(payload.npm as string[]));
-    });
-
-    const pkgs = [...(payload.apt || []), ...(payload.npm || [])].join(', ');
-    log.info('Package install approved', { approvalId: approval.approval_id, userId });
-    try {
-      await buildAgentGroupImage(session.agent_group_id);
-      killContainer(session.id, 'rebuild applied');
-      // Schedule a follow-up prompt a few seconds after kill so the host sweep
-      // respawns the container on the new image and the agent verifies + reports.
-      writeSessionMessage(session.agent_group_id, session.id, {
-        id: `appr-note-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        kind: 'chat',
-        timestamp: new Date().toISOString(),
-        platformId: session.agent_group_id,
-        channelType: 'agent',
-        threadId: null,
-        content: JSON.stringify({
-          text: `Packages installed (${pkgs}) and container rebuilt. Verify the new packages are available (e.g. run them or check versions) and report the result to the user.`,
-          sender: 'system',
-          senderId: 'system',
-        }),
-        processAfter: new Date(Date.now() + 5000)
-          .toISOString()
-          .replace('T', ' ')
-          .replace(/\.\d+Z$/, ''),
-      });
-      log.info('Container rebuild completed (bundled with install)', { approvalId: approval.approval_id });
-    } catch (e) {
-      notify(
-        `Packages added to config (${pkgs}) but rebuild failed: ${e instanceof Error ? e.message : String(e)}. Call request_rebuild to retry.`,
-      );
-      log.error('Bundled rebuild failed after install approval', { approvalId: approval.approval_id, err: e });
-    }
-  } else if (approval.action === 'request_rebuild') {
-    try {
-      await buildAgentGroupImage(session.agent_group_id);
-      // Kill the container so the next wake uses the new image
-      killContainer(session.id, 'rebuild applied');
-      notify('Container image rebuilt. Your container will restart with the new image on the next message.');
-      log.info('Container rebuild approved and completed', { approvalId: approval.approval_id, userId });
-    } catch (e) {
-      notify(`Rebuild failed: ${e instanceof Error ? e.message : String(e)}`);
-      log.error('Container rebuild failed', { approvalId: approval.approval_id, err: e });
-    }
-  } else if (approval.action === 'add_mcp_server') {
-    const agentGroup = getAgentGroup(session.agent_group_id);
-    if (!agentGroup) {
-      notify('add_mcp_server approved but agent group missing.');
-      return;
-    }
-    updateContainerConfig(agentGroup.folder, (cfg) => {
-      cfg.mcpServers[payload.name as string] = {
-        command: payload.command as string,
-        args: (payload.args as string[]) || [],
-        env: (payload.env as Record<string, string>) || {},
-      };
-    });
-
-    // Kill the container so next wake loads the new MCP server config
-    killContainer(session.id, 'mcp server added');
-    notify(`MCP server "${payload.name}" added. Your container will restart with it on the next message.`);
-    log.info('MCP server add approved', { approvalId: approval.approval_id, userId });
-  }
-
-  deletePendingApproval(approval.approval_id);
-  await wakeContainer(session);
-}
-
 /** Graceful shutdown. */
 async function shutdown(signal: string): Promise<void> {
   log.info('Shutdown signal received', { signal });
-  stopOneCLIApprovalHandler();
+  for (const cb of getShutdownCallbacks()) {
+    try {
+      await cb();
+    } catch (err) {
+      log.error('Shutdown callback threw', { err });
+    }
+  }
   stopDeliveryPolls();
   stopHostSweep();
   stopWorktreeCleanup();

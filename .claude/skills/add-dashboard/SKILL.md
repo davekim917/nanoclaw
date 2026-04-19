@@ -1,6 +1,6 @@
 ---
 name: add-dashboard
-description: Add a monitoring dashboard to NanoClaw v2. Installs @nanoco/nanoclaw-dashboard and a pusher that sends periodic JSON snapshots.
+description: Add a monitoring dashboard to NanoClaw. Installs @nanoco/nanoclaw-dashboard and a pusher that sends periodic JSON snapshots.
 ---
 
 # /add-dashboard — NanoClaw Dashboard
@@ -25,7 +25,7 @@ NanoClaw (pusher)              Dashboard (npm package)
 ### 1. Install the npm package
 
 ```bash
-npm install @nanoco/nanoclaw-dashboard
+pnpm install @nanoco/nanoclaw-dashboard
 ```
 
 ### 2. Copy the pusher module
@@ -65,7 +65,7 @@ Add the `readEnvFile` import at the top if not already present:
 import { readEnvFile } from './env.js';
 ```
 
-Add after step 7 (OneCLI approval handler), before the `log.info('NanoClaw v2 running')` line:
+Add after step 7 (OneCLI approval handler), before the `log.info('NanoClaw running')` line:
 
 ```typescript
   // 8. Dashboard (optional)
@@ -94,7 +94,7 @@ Generate the secret: `node -e "console.log('nc-' + require('crypto').randomBytes
 ### 6. Build and restart
 
 ```bash
-npm run build
+pnpm run build
 systemctl --user restart nanoclaw   # Linux
 # or: launchctl kickstart -k gui/$(id -u)/com.nanoclaw  # macOS
 ```
@@ -130,9 +130,9 @@ Open `http://localhost:3100/dashboard` in a browser.
 ## Removal
 
 ```bash
-npm uninstall @nanoco/nanoclaw-dashboard
+pnpm uninstall @nanoco/nanoclaw-dashboard
 rm src/dashboard-pusher.ts
 # Remove the dashboard block from src/index.ts
 # Remove DASHBOARD_SECRET and DASHBOARD_PORT from .env
-npm run build
+pnpm run build
 ```

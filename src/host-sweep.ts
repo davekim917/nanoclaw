@@ -10,7 +10,7 @@
 import type Database from 'better-sqlite3';
 import fs from 'fs';
 
-import { getActiveSessions, updateSession } from './db/sessions.js';
+import { getActiveSessions } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import {
   countDueMessages,
@@ -19,12 +19,9 @@ import {
   getMessageForRetry,
   markMessageFailed,
   retryWithBackoff,
-  getCompletedRecurring,
-  insertRecurrence,
-  clearRecurrence,
 } from './db/session-db.js';
 import { log } from './log.js';
-import { openInboundDb, openOutboundDb, inboundDbPath, outboundDbPath, heartbeatPath } from './session-manager.js';
+import { openInboundDb, openOutboundDb, inboundDbPath, heartbeatPath } from './session-manager.js';
 import { wakeContainer, isContainerRunning } from './container-runner.js';
 import type { Session } from './types.js';
 
@@ -100,8 +97,11 @@ async function sweepSession(session: Session): Promise<void> {
       detectStaleContainers(inDb, outDb, session, agentGroup.id);
     }
 
-    // 4. Handle recurrence for completed messages
+    // 4. Handle recurrence for completed messages.
+    // MODULE-HOOK:scheduling-recurrence:start
+    const { handleRecurrence } = await import('./modules/scheduling/recurrence.js');
     await handleRecurrence(inDb, session);
+    // MODULE-HOOK:scheduling-recurrence:end
   } finally {
     inDb.close();
     outDb?.close();
@@ -150,24 +150,3 @@ function detectStaleContainers(
   }
 }
 
-/** Insert next occurrence for completed recurring messages. */
-async function handleRecurrence(inDb: Database.Database, session: Session): Promise<void> {
-  const recurring = getCompletedRecurring(inDb);
-
-  for (const msg of recurring) {
-    try {
-      const { CronExpressionParser } = await import('cron-parser');
-      const interval = CronExpressionParser.parse(msg.recurrence);
-      const nextRun = interval.next().toISOString();
-      const prefix = msg.kind === 'task' ? 'task' : 'msg';
-      const newId = `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-
-      insertRecurrence(inDb, msg, newId, nextRun);
-      clearRecurrence(inDb, msg.id);
-
-      log.info('Inserted next recurrence', { originalId: msg.id, newId, seriesId: msg.series_id, nextRun });
-    } catch (err) {
-      log.error('Failed to compute next recurrence', { messageId: msg.id, recurrence: msg.recurrence, err });
-    }
-  }
-}

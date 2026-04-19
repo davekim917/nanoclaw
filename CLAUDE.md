@@ -1,10 +1,8 @@
 # NanoClaw
 
-Personal Claude assistant. See [README.md](README.md) for philosophy and setup. Architecture lives in `docs/v2-*.md`.
+Personal Claude assistant. See [README.md](README.md) for philosophy and setup. Architecture lives in `docs/`.
 
-## Quick Context (v2)
-
-v2 is the current branch and codebase. v1 still exists under `src/v1/` and `container/agent-runner/src/v1/` for reference but is no longer the runtime. If a file mentions v1 in its comments, it is probably stale.
+## Quick Context
 
 The host is a single Node process that orchestrates per-session agent containers. Platform messages land via channel adapters, route through an entity model (users → messaging groups → agent groups → sessions), get written into the session's inbound DB, and wake a container. The agent-runner inside the container polls the DB, calls Claude, and writes back to the outbound DB. The host polls the outbound DB and delivers through the same adapter.
 
@@ -25,7 +23,7 @@ messaging_groups (one chat/channel on one platform; unknown_sender_policy)
 sessions (agent_group_id + messaging_group_id + thread_id → per-session container)
 ```
 
-Privilege is user-level (owner/admin), not agent-group-level. See [docs/v2-isolation-model.md](docs/v2-isolation-model.md) for the three isolation levels (`agent-shared`, `shared`, separate agents).
+Privilege is user-level (owner/admin), not agent-group-level. See [docs/isolation-model.md](docs/isolation-model.md) for the three isolation levels (`agent-shared`, `shared`, separate agents).
 
 ## Two-DB Session Split
 
@@ -56,11 +54,21 @@ Exactly one writer per file — no cross-mount lock contention. Heartbeat is a f
 | `src/user-dm.ts` | Cold-DM resolution + `user_dms` cache |
 | `src/group-init.ts` | Per-agent-group filesystem scaffold (CLAUDE.md, skills, agent-runner-src overlay) |
 | `src/db/` | DB layer — agent_groups, messaging_groups, sessions, user_roles, user_dms, pending_*, migrations |
-| `src/channels/` | Channel adapters + Chat SDK bridge |
+| `src/channels/` | Channel adapter infra (registry, Chat SDK bridge); specific channel adapters are skill-installed from the `channels` branch |
+| `src/providers/` | Host-side provider container-config (`claude` baked in; `opencode` etc. installed from the `providers` branch) |
 | `container/agent-runner/src/` | Agent-runner: poll loop, formatter, provider abstraction, MCP tools, destinations |
 | `container/skills/` | Container skills mounted into every agent session |
 | `groups/<folder>/` | Per-agent-group filesystem (CLAUDE.md, skills, per-group `agent-runner-src/` overlay) |
 | `scripts/init-first-agent.ts` | Bootstrap the first DM-wired agent (used by `/init-first-agent` skill) |
+
+## Channels and Providers (skill-installed)
+
+Trunk does not ship any specific channel adapter or non-default agent provider. The codebase is the registry/infra; the actual adapters and providers live on long-lived sibling branches and get copied in by skills:
+
+- **`channels` branch** — Discord, Slack, Telegram, WhatsApp, Teams, Linear, GitHub, iMessage, Webex, Resend, Matrix, Google Chat, WhatsApp Cloud (+ helpers, tests, channel-specific setup steps). Installed via `/add-<channel>` skills.
+- **`providers` branch** — OpenCode (and any future non-default agent providers). Installed via `/add-opencode`.
+
+Each `/add-<name>` skill is idempotent: `git fetch origin <branch>` → copy module(s) into the standard paths → append a self-registration import to the relevant barrel → `pnpm install <pkg>@<pinned-version>` → build.
 
 ## Self-Modification
 
@@ -78,10 +86,10 @@ API keys, OAuth tokens, and auth credentials are managed by the OneCLI gateway. 
 
 Four types of skills. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full taxonomy.
 
-- **Feature skills** — `skill/*` branches merged via `scripts/apply-skill.ts` (e.g. `/add-discord-v2`, `/add-slack-v2`, `/add-whatsapp-v2`)
-- **Utility skills** — ship code files alongside `SKILL.md` (e.g. `/claw`)
-- **Operational skills** — instruction-only workflows (`/setup`, `/debug`, `/customize`, `/init-first-agent`, `/manage-channels`, `/init-onecli`, `/update-nanoclaw`)
-- **Container skills** — loaded inside agent containers at runtime (`container/skills/`: `welcome`, `self-customize`, `agent-browser`, `slack-formatting`)
+- **Channel/provider install skills** — copy the relevant module(s) in from the `channels` or `providers` branch, wire imports, install pinned deps (e.g. `/add-discord`, `/add-slack`, `/add-whatsapp`, `/add-opencode`).
+- **Utility skills** — ship code files alongside `SKILL.md` (e.g. `/claw`).
+- **Operational skills** — instruction-only workflows (`/setup`, `/debug`, `/customize`, `/init-first-agent`, `/manage-channels`, `/init-onecli`, `/update-nanoclaw`).
+- **Container skills** — loaded inside agent containers at runtime (`container/skills/`: `welcome`, `self-customize`, `agent-browser`, `slack-formatting`).
 
 | Skill | When to Use |
 |-------|-------------|
@@ -102,13 +110,18 @@ Before creating a PR, adding a skill, or preparing any contribution, you MUST re
 Run commands directly — don't tell the user to run them.
 
 ```bash
-npm run dev          # Host with hot reload
-npm run build        # Compile host TypeScript (src/)
-./container/build.sh # Rebuild agent container image (nanoclaw-agent:latest)
-npm test             # Host tests
+# Host (Node + pnpm)
+pnpm run dev          # Host with hot reload
+pnpm run build        # Compile host TypeScript (src/)
+./container/build.sh  # Rebuild agent container image (nanoclaw-agent:latest)
+pnpm test             # Host tests (vitest)
+
+# Agent-runner (Bun — separate package tree under container/agent-runner/)
+cd container/agent-runner && bun install   # After editing agent-runner deps
+cd container/agent-runner && bun test      # Container tests (bun:test)
 ```
 
-Container typecheck is a separate tsconfig — if you edit `container/agent-runner/src/`, run `npx tsc -p container/agent-runner/tsconfig.json --noEmit` to check it.
+Container typecheck is a separate tsconfig — if you edit `container/agent-runner/src/`, run `pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit` from root (or `bun run typecheck` from `container/agent-runner/`).
 
 Service management:
 ```bash
@@ -123,22 +136,64 @@ systemctl --user start|stop|restart nanoclaw
 
 Host logs: `logs/nanoclaw.log` (normal) and `logs/nanoclaw.error.log` (errors only — some delivery/approval failures only show up here).
 
-## v2 Docs Index
+## Supply Chain Security (pnpm)
+
+This project uses pnpm with `minimumReleaseAge: 4320` (3 days) in `pnpm-workspace.yaml`. New package versions must exist on the npm registry for 3 days before pnpm will resolve them.
+
+**Rules — do not bypass without explicit human approval:**
+- **`minimumReleaseAgeExclude`**: Never add entries without human sign-off. If a package must bypass the release age gate, the human must approve and the entry must pin the exact version being excluded (e.g. `package@1.2.3`), never a range.
+- **`onlyBuiltDependencies`**: Never add packages to this list without human approval — build scripts execute arbitrary code during install.
+- **`pnpm install --frozen-lockfile`** should be used in CI, automation, and container builds. Never run bare `pnpm install` in those contexts.
+
+## Docs Index
 
 | Doc | Purpose |
 |-----|---------|
-| [docs/v2-architecture-draft.md](docs/v2-architecture-draft.md) | Full architecture writeup |
-| [docs/v2-api-details.md](docs/v2-api-details.md) | Host API + DB schema details |
-| [docs/v2-agent-runner-details.md](docs/v2-agent-runner-details.md) | Agent-runner internals + MCP tool interface |
-| [docs/v2-isolation-model.md](docs/v2-isolation-model.md) | Three-level channel isolation model |
-| [docs/v2-setup-wiring.md](docs/v2-setup-wiring.md) | What's wired, what's open in the setup flow |
-| [docs/v2-checklist.md](docs/v2-checklist.md) | Rolling status checklist across all subsystems |
-| [docs/v2-architecture-diagram.md](docs/v2-architecture-diagram.md) | Diagram version of the architecture |
+| [docs/architecture.md](docs/architecture.md) | Full architecture writeup |
+| [docs/api-details.md](docs/api-details.md) | Host API + DB schema details |
+| [docs/db.md](docs/db.md) | DB architecture overview: three-DB model, cross-mount rules, readers/writers map |
+| [docs/db-central.md](docs/db-central.md) | Central DB (`data/v2.db`) — every table + migration system |
+| [docs/db-session.md](docs/db-session.md) | Per-session `inbound.db` + `outbound.db` schemas + seq parity |
+| [docs/agent-runner-details.md](docs/agent-runner-details.md) | Agent-runner internals + MCP tool interface |
+| [docs/isolation-model.md](docs/isolation-model.md) | Three-level channel isolation model |
+| [docs/setup-wiring.md](docs/setup-wiring.md) | What's wired, what's open in the setup flow |
+| [docs/checklist.md](docs/checklist.md) | Rolling status checklist across all subsystems |
+| [docs/architecture-diagram.md](docs/architecture-diagram.md) | Diagram version of the architecture |
+| [docs/build-and-runtime.md](docs/build-and-runtime.md) | Runtime split (Node host + Bun container), lockfiles, image build surface, CI, key invariants |
 
 ## Container Build Cache
 
 The container buildkit caches the build context aggressively. `--no-cache` alone does NOT invalidate COPY steps — the builder's volume retains stale files. To force a truly clean rebuild, prune the builder then re-run `./container/build.sh`.
 
+## Container Runtime (Bun)
+
+The agent container runs on **Bun**; the host runs on **Node** (pnpm). They communicate only via session DBs — no shared modules. Details and rationale: [docs/build-and-runtime.md](docs/build-and-runtime.md).
+
+**Gotchas — trigger + action:**
+
+- **Adding or bumping a runtime dep in `container/agent-runner/`** → edit `package.json`, then `cd container/agent-runner && bun install` and commit the updated `bun.lock`. Do not run `pnpm install` there — agent-runner is not a pnpm workspace.
+- **Bumping `@anthropic-ai/claude-agent-sdk`, `@modelcontextprotocol/sdk`, or any agent-runner runtime dep** → no `minimumReleaseAge` policy applies to this tree. Check the release date on npm, pin deliberately, never `bun update` blindly.
+- **Writing a new named-param SQL insert/update in the container** → use `$name` in both SQL and JS keys: `.run({ $id: msg.id })`. `bun:sqlite` does not auto-strip the prefix the way `better-sqlite3` does on the host. Positional `?` params work normally.
+- **Adding a test in `container/agent-runner/src/`** → import from `bun:test`, not `vitest`. Vitest runs on Node and can't load `bun:sqlite`. `vitest.config.ts` excludes this tree.
+- **Adding a Node CLI the agent invokes at runtime** (like `agent-browser`, `claude-code`, `vercel`) → put it in the Dockerfile's pnpm global-install block, pinned to an exact version via a new `ARG`. Don't use `bun install -g` — that bypasses the pnpm supply-chain policy.
+- **Changing the Dockerfile entrypoint or the dynamic-spawn command** (`src/container-runner.ts` line ~301) → keep `exec bun ...` so signals forward cleanly. The image has no `/app/dist`; don't reintroduce a tsc build step.
+- **Changing session-DB pragmas** (`container/agent-runner/src/db/connection.ts`) → `journal_mode=DELETE` is load-bearing for cross-mount visibility. Read the comment block at the top of the file first.
+
+## CJK font support
+
+Agent containers ship without CJK fonts by default (~200MB saved). If you notice signals the user works with Chinese/Japanese/Korean content — conversing in CJK, CJK timezone (e.g., `Asia/Tokyo`, `Asia/Shanghai`, `Asia/Seoul`, `Asia/Taipei`, `Asia/Hong_Kong`), system locale hint, or mentions of needing to render CJK in screenshots/PDFs/scraped pages — offer to enable it:
+
+```bash
+# Ensure .env has INSTALL_CJK_FONTS=true (overwrite or append)
+grep -q '^INSTALL_CJK_FONTS=' .env && sed -i.bak 's/^INSTALL_CJK_FONTS=.*/INSTALL_CJK_FONTS=true/' .env && rm -f .env.bak || echo 'INSTALL_CJK_FONTS=true' >> .env
+
+# Rebuild and restart so new sessions pick up the new image
+./container/build.sh
+launchctl kickstart -k gui/$(id -u)/com.nanoclaw   # macOS
+# systemctl --user restart nanoclaw                # Linux
+```
+
+`container/build.sh` reads `INSTALL_CJK_FONTS` from `.env` and passes it through as a Docker build-arg. Without CJK fonts, Chromium-rendered screenshots and PDFs containing CJK text show tofu (empty rectangles) instead of characters.
 <!-- gitnexus:start -->
 # GitNexus — Code Intelligence
 

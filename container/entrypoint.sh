@@ -1,34 +1,40 @@
 #!/bin/bash
-# NanoClaw v2 container entrypoint.
+# NanoClaw agent container entrypoint.
 #
-# Lean port of v1's entrypoint.sh. Drops the /tmp/input.json + stdin
-# secret-injection path (obsolete — v2 uses env vars for tools, OneCLI
-# proxy for API credentials). Keeps the pieces that are still structural
-# requirements for the agent to function:
+# Runtime: Bun. The host passes initial session parameters via stdin as a
+# single JSON blob; we capture it to /tmp/input.json first so it survives
+# for post-mortem inspection, then exec bun so bun becomes tini's direct
+# child and receives signals cleanly. All further IO flows through the
+# session DBs at /workspace/{inbound,outbound}.db — no stdin pipe during
+# the poll loop.
 #
-# - Chromium XDG workaround (without this, long-running sessions crash)
-# - gws CLI config dir + wrapper (gws falls back to service-account creds
-#   via ADC otherwise, which breaks user-OAuth)
-# - GitHub credential helper setup (via gh; git needs this for push/fetch)
+# Illysium additions on top of upstream/v2:
+# - Chromium XDG workaround (long-running sessions crash without it)
+# - gws (Google Workspace CLI) wrapper that unsets ADC to avoid
+#   service-account override of user-OAuth
+# - GitHub git auth via `gh auth setup-git` when GH_TOKEN is set
 # - Render CLI workspace pre-configuration
-# - GitNexus repo auto-registration (so code-intel MCP tools work)
+# - GitNexus repo auto-registration (so code-intel MCP tools see mounted
+#   repos without the agent having to register them by hand)
 #
 # All steps are idempotent and best-effort. If a tool isn't installed or
 # an env var isn't set, the corresponding step no-ops silently.
+
 set -e
 
-cd /app
-
-# Compile the agent-runner source (mounted from the per-group overlay at
-# /app/src). Errors go to stderr so the host's stderr-capture sees them.
-npx tsc --outDir /tmp/dist 2>&1 >&2
-ln -sf /app/node_modules /tmp/dist/node_modules
+# Capture stdin JSON if any — it's used by upstream's stdin-on-spawn path.
+# Host-spawned sessions in this fork don't pipe stdin (all IO is via the
+# mounted session DBs), so fall through immediately when stdin isn't a pipe.
+if [ ! -t 0 ] && [ -p /dev/stdin ]; then
+  cat > /tmp/input.json
+else
+  : > /tmp/input.json
+fi
 
 # --- Chromium crashpad workaround ---
 # crashpad derives its DB path from XDG_CONFIG_HOME. If that dir isn't
 # writable (or gets corrupted on long-running containers), chromium
-# crashes with "--database is required". Redirect to /tmp so it's
-# always writable and ephemeral.
+# crashes with "--database is required". Redirect to /tmp.
 export XDG_CONFIG_HOME=/tmp/.chromium
 export XDG_CACHE_HOME=/tmp/.chromium
 
@@ -39,17 +45,13 @@ fi
 
 # --- GitHub git auth ---
 # gh auth setup-git configures git's credential helper to return $GH_TOKEN
-# for github.com. Idempotent; runs only when GH_TOKEN is set (container-
-# runner sets it when the host has a GitHub token resolved for this group).
-if [ -n "$GH_TOKEN" ]; then
+# for github.com. Runs only when GH_TOKEN is set (container-runner sets it
+# when the host has a GitHub token resolved for this agent group).
+if [ -n "$GH_TOKEN" ] && command -v gh >/dev/null 2>&1; then
   gh auth setup-git 2>/dev/null || true
 fi
 
 # --- Render CLI workspace pre-config ---
-# Render v2 CLI requires an active workspace for service-level commands.
-# When RENDER_WORKSPACE_ID + RENDER_API_KEY are set in env, pre-configure
-# the workspace so the agent doesn't have to learn the `render workspace
-# set` flow.
 if [ -n "$RENDER_WORKSPACE_ID" ] && [ -n "$RENDER_API_KEY" ] && command -v render >/dev/null 2>&1; then
   RENDER_API_KEY="$RENDER_API_KEY" render workspace set "$RENDER_WORKSPACE_ID" --confirm >/dev/null 2>&1 \
     && echo "[entrypoint] render workspace pre-configured: $RENDER_WORKSPACE_ID" >&2 \
@@ -58,16 +60,13 @@ fi
 
 # --- Google Workspace CLI (gws) ---
 # gws needs a writable config dir for its API discovery cache. Host mount
-# at /home/node/.config/gws/accounts/ is RO (credentials) — can't use it
-# as the config dir too. Point it at /tmp.
+# of the accounts dir is RO — can't use it as the config dir too.
 export GOOGLE_WORKSPACE_CLI_CONFIG_DIR=/tmp/.gws
 mkdir -p /tmp/.gws
 
-# gws wrapper: strips GOOGLE_APPLICATION_CREDENTIALS before exec. When
-# ADC is set (for gcloud/gsutil), gws picks up the service account instead
-# of the user's OAuth token, breaking Gmail/Calendar with
-# FAILED_PRECONDITION. This wrapper ensures gws only uses
-# GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE or per-command overrides.
+# gws wrapper: strips GOOGLE_APPLICATION_CREDENTIALS before exec. When ADC
+# is set (for gcloud/gsutil), gws picks up the service account instead of
+# the user's OAuth token, breaking Gmail/Calendar with FAILED_PRECONDITION.
 GWS_BIN=$(command -v gws 2>/dev/null || true)
 if [ -n "$GWS_BIN" ]; then
   mkdir -p /tmp/bin
@@ -81,9 +80,9 @@ WRAPPER
 fi
 
 # --- GitNexus repo auto-registration ---
-# Scan mounted workspace for git repos that already have a GitNexus index,
+# Scan mounted workspace for git repos that already have a GitNexus index
 # and register them in the container's registry.json so the gitnexus MCP
-# tools can query them. Doesn't run analysis — if a repo is stale, the
+# tools can query them. Doesn't run analysis — a stale index means the
 # agent runs `gitnexus analyze` itself when it needs to.
 mkdir -p /home/node/.gitnexus
 _gitnexus_repos=()
@@ -92,26 +91,30 @@ for gitdir in $(find /workspace -maxdepth 4 -name .git \( -type d -o -type f \) 
   [ -f "$repo/.gitnexus/meta.json" ] && _gitnexus_repos+=("$repo")
 done
 if [ ${#_gitnexus_repos[@]} -gt 0 ]; then
-  node -e '
-    const fs = require("fs"), p = require("path");
-    const regPath = p.join(process.env.HOME, ".gitnexus", "registry.json");
-    const reg = fs.existsSync(regPath) ? JSON.parse(fs.readFileSync(regPath, "utf8")) : [];
-    for (const repo of process.argv.slice(1)) {
-      if (reg.some((r) => r.path === repo)) continue;
-      try {
-        const meta = JSON.parse(fs.readFileSync(p.join(repo, ".gitnexus", "meta.json"), "utf8"));
-        reg.push({
-          name: p.basename(repo), path: repo, storagePath: p.join(repo, ".gitnexus"),
-          indexedAt: meta.indexedAt, lastCommit: meta.lastCommit, stats: meta.stats,
-        });
-      } catch {}
-    }
-    fs.writeFileSync(regPath, JSON.stringify(reg, null, 2) + "\n");
-  ' "${_gitnexus_repos[@]}" 2>/dev/null \
-    && echo "[entrypoint] GitNexus: registered ${#_gitnexus_repos[@]} repo(s)" >&2 || true
+  # Prefer node (always installed), fall back to bun. Both can run this one-liner.
+  _runtime=$(command -v node 2>/dev/null || command -v bun 2>/dev/null || true)
+  if [ -n "$_runtime" ]; then
+    "$_runtime" -e '
+      const fs = require("fs"), p = require("path");
+      const regPath = p.join(process.env.HOME, ".gitnexus", "registry.json");
+      const reg = fs.existsSync(regPath) ? JSON.parse(fs.readFileSync(regPath, "utf8")) : [];
+      for (const repo of process.argv.slice(1)) {
+        if (reg.some((r) => r.path === repo)) continue;
+        try {
+          const meta = JSON.parse(fs.readFileSync(p.join(repo, ".gitnexus", "meta.json"), "utf8"));
+          reg.push({
+            name: p.basename(repo), path: repo, storagePath: p.join(repo, ".gitnexus"),
+            indexedAt: meta.indexedAt, lastCommit: meta.lastCommit, stats: meta.stats,
+          });
+        } catch {}
+      }
+      fs.writeFileSync(regPath, JSON.stringify(reg, null, 2) + "\n");
+    ' "${_gitnexus_repos[@]}" 2>/dev/null \
+      && echo "[entrypoint] GitNexus: registered ${#_gitnexus_repos[@]} repo(s)" >&2 || true
+  fi
 fi
 
 # --- Run the agent-runner ---
-# No stdin pipe (obsolete v1 pattern). Everything is messages via the
-# session DBs.
-exec node /tmp/dist/index.js
+# Bun runs TypeScript directly — no tsc build step. Host remounts source at
+# /app/src via container-runner.ts so edits take effect on next spawn.
+exec bun run /app/src/index.ts < /tmp/input.json

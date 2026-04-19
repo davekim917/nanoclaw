@@ -14,6 +14,7 @@
 import fs from 'fs';
 import path from 'path';
 
+import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
 const TONE_PROFILES_DIR = '/workspace/tone-profiles';
@@ -91,3 +92,5 @@ export const listToneProfilesTool: McpToolDefinition = {
 };
 
 export const toneProfileTools: McpToolDefinition[] = [getToneProfileTool, listToneProfilesTool];
+
+registerTools(toneProfileTools);

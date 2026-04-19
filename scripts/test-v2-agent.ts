@@ -2,7 +2,7 @@
  * Quick integration test: create a session DB, insert a message,
  * run the v2 poll loop with the Claude provider, verify output.
  *
- * Usage: npx tsx scripts/test-v2-agent.ts
+ * Usage: pnpm exec tsx scripts/test-v2-agent.ts
  */
 import Database from 'better-sqlite3';
 import fs from 'fs';

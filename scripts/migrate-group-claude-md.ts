@@ -22,7 +22,7 @@
  *
  * Idempotent — safe to re-run.
  *
- * Usage: npx tsx scripts/migrate-group-claude-md.ts
+ * Usage: pnpm exec tsx scripts/migrate-group-claude-md.ts
  */
 import fs from 'fs';
 import path from 'path';

@@ -4,7 +4,6 @@ import { writeMessageOut } from './db/messages-out.js';
 import { touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
 import { getStoredSessionId, setStoredSessionId, clearStoredSessionId } from './db/session-state.js';
 import { formatMessages, extractRouting, categorizeMessage, type RoutingContext } from './formatter.js';
-import { applyPreTaskScripts } from './task-script.js';
 import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
 
 const POLL_INTERVAL_MS = 1000;
@@ -156,11 +155,20 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // Pre-task scripts: for any task rows with a `script`, run it before the
     // provider call. Scripts returning wakeAgent=false (or erroring) gate
     // their own task row only — surviving messages still go to the agent.
-    const { keep, skipped } = await applyPreTaskScripts(normalMessages);
+    // Without the scheduling module, the marker block is empty, `keep`
+    // falls back to `normalMessages`, and no gating happens.
+    let keep: MessageInRow[] = normalMessages;
+    let skipped: string[] = [];
+    // MODULE-HOOK:scheduling-pre-task:start
+    const { applyPreTaskScripts } = await import('./scheduling/task-script.js');
+    const preTask = await applyPreTaskScripts(normalMessages);
+    keep = preTask.keep;
+    skipped = preTask.skipped;
     if (skipped.length > 0) {
       markCompleted(skipped);
       log(`Pre-task script skipped ${skipped.length} task(s): ${skipped.join(', ')}`);
     }
+    // MODULE-HOOK:scheduling-pre-task:end
 
     if (keep.length === 0) {
       log(`All ${normalMessages.length} non-command message(s) gated by script, skipping query`);
@@ -184,7 +192,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     const skippedSet = new Set(skipped);
     const processingIds = ids.filter((id) => !commandIds.includes(id) && !skippedSet.has(id));
     try {
-      const result = await processQuery(query, routing, config, processingIds);
+      const result = await processQuery(query, routing);
       if (result.continuation && result.continuation !== continuation) {
         continuation = result.continuation;
         setStoredSessionId(continuation);
@@ -256,7 +264,7 @@ interface QueryResult {
   continuation?: string;
 }
 
-async function processQuery(query: AgentQuery, routing: RoutingContext, config: PollLoopConfig, processingIds: string[]): Promise<QueryResult> {
+async function processQuery(query: AgentQuery, routing: RoutingContext): Promise<QueryResult> {
   let queryContinuation: string | undefined;
   let done = false;
   let lastEventTime = Date.now();

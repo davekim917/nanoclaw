@@ -76,8 +76,8 @@ git remote add whatsapp https://github.com/qwibitai/nanoclaw-whatsapp.git
 ```bash
 git fetch whatsapp skill/local-whisper
 git merge whatsapp/skill/local-whisper || {
-  git checkout --theirs package-lock.json
-  git add package-lock.json
+  git checkout --theirs pnpm-lock.yaml
+  git add pnpm-lock.yaml
   git merge --continue
 }
 ```
@@ -87,7 +87,7 @@ This modifies `src/transcription.ts` to use the `whisper-cli` binary instead of 
 ### Validate
 
 ```bash
-npm run build
+pnpm run build
 ```
 
 ## Phase 3: Verify
@@ -110,7 +110,7 @@ launchctl load ~/Library/LaunchAgents/com.nanoclaw.plist
 ### Build and restart
 
 ```bash
-npm run build
+pnpm run build
 launchctl kickstart -k gui/$(id -u)/com.nanoclaw
 ```
 

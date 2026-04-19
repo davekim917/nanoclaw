@@ -12,6 +12,7 @@ import path from 'path';
 import { findByName, getAllDestinations } from '../destinations.js';
 import { getMessageIdBySeq, getRoutingBySeq, writeMessageOut } from '../db/messages-out.js';
 import { getSessionRouting } from '../db/session-routing.js';
+import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
 function log(msg: string): void {
@@ -258,4 +259,4 @@ export const addReaction: McpToolDefinition = {
   },
 };
 
-export const coreTools: McpToolDefinition[] = [sendMessage, sendFile, editMessage, addReaction];
+registerTools([sendMessage, sendFile, editMessage, addReaction]);

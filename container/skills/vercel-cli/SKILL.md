@@ -117,7 +117,7 @@ After sending, tell the user you've handed it off and will share the result when
 
 ## Best Practices
 
-- Run `npm run build` locally before deploying to catch build errors early
+- Run `pnpm run build` locally before deploying to catch build errors early
 - Use `--cwd` instead of `cd` to keep your working directory stable
 - For Next.js projects, `vercel deploy` auto-detects the framework — no extra config needed
 - Use `vercel.json` only when you need custom build settings, rewrites, or headers

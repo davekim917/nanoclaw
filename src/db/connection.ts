@@ -31,3 +31,18 @@ export function closeDb(): void {
   _db?.close();
   _db = null;
 }
+
+/**
+ * Check whether a table exists. Used by core code that touches
+ * module-owned tables so that an uninstalled module degrades silently
+ * instead of raising SQLite errors. Cheap: a single indexed lookup on
+ * sqlite_master. Results are not cached — a module install adds the
+ * table at runtime (next service start), and callers may run before
+ * or after that boundary.
+ */
+export function hasTable(db: Database.Database, name: string): boolean {
+  const row = db.prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name = ? LIMIT 1`).get(name) as
+    | { '1': number }
+    | undefined;
+  return row !== undefined;
+}

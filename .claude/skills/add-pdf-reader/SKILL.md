@@ -31,8 +31,8 @@ git remote add whatsapp https://github.com/qwibitai/nanoclaw-whatsapp.git
 ```bash
 git fetch whatsapp skill/pdf-reader
 git merge whatsapp/skill/pdf-reader || {
-  git checkout --theirs package-lock.json
-  git add package-lock.json
+  git checkout --theirs pnpm-lock.yaml
+  git add pnpm-lock.yaml
   git merge --continue
 }
 ```
@@ -49,8 +49,8 @@ If the merge reports conflicts, resolve them by reading the conflicted files and
 ### Validate
 
 ```bash
-npm run build
-npx vitest run src/channels/whatsapp.test.ts
+pnpm run build
+pnpm exec vitest run src/channels/whatsapp.test.ts
 ```
 
 ### Rebuild container

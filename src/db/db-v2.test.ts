@@ -13,7 +13,6 @@ import {
   createMessagingGroup,
   getMessagingGroup,
   getMessagingGroupByPlatform,
-  getAllMessagingGroups,
   updateMessagingGroup,
   deleteMessagingGroup,
   createMessagingGroupAgent,
@@ -230,7 +229,7 @@ describe('messaging group agents', () => {
   });
 
   it('auto-creates an agent_destinations row for the wiring', async () => {
-    const { getDestinationByTarget, getDestinations } = await import('./agent-destinations.js');
+    const { getDestinationByTarget, getDestinations } = await import('../modules/agent-to-agent/db/agent-destinations.js');
     createMessagingGroupAgent(mga());
 
     const dest = getDestinationByTarget('ag-1', 'channel', 'mg-1');
@@ -240,7 +239,7 @@ describe('messaging group agents', () => {
   });
 
   it('does not duplicate destination row on re-wiring', async () => {
-    const { getDestinations } = await import('./agent-destinations.js');
+    const { getDestinations } = await import('../modules/agent-to-agent/db/agent-destinations.js');
     createMessagingGroupAgent(mga());
     // Re-create the same wiring throws (PK unique), but even if we got the
     // row in some other way (e.g. via createDestination directly followed
@@ -251,7 +250,7 @@ describe('messaging group agents', () => {
   });
 
   it('breaks local_name collisions within an agent group', async () => {
-    const { getDestinations } = await import('./agent-destinations.js');
+    const { getDestinations } = await import('../modules/agent-to-agent/db/agent-destinations.js');
     // Two messaging groups with the same `name` wired to the same agent
     // should get distinct local_names (gen, gen-2).
     createMessagingGroupAgent(mga());

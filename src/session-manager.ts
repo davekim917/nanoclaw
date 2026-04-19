@@ -14,9 +14,8 @@ import type Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
 
+import type { OutboundFile } from './channels/adapter.js';
 import { DATA_DIR } from './config.js';
-import { getAgentGroup } from './db/agent-groups.js';
-import { getDestinations } from './db/agent-destinations.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
 import { createSession, findSession, findSessionByAgentGroup, getSession, updateSession } from './db/sessions.js';
 import {
@@ -24,10 +23,8 @@ import {
   openInboundDb as openInboundDbRaw,
   openOutboundDb as openOutboundDbRaw,
   upsertSessionRouting,
-  replaceDestinations,
   insertMessage,
   migrateMessagesInTable,
-  type DestinationRow,
 } from './db/session-db.js';
 import { log } from './log.js';
 import type { Session } from './types.js';
@@ -130,24 +127,15 @@ export function initSessionFolder(agentGroupId: string, sessionId: string): void
 }
 
 /**
- * Write the session's destination map into its inbound.db `destinations` table.
- *
- * Called before every container wake so admin changes take effect on next start —
- * but the container also re-queries on demand, so mid-session admin changes
- * (e.g. spawning a new child agent) can also call this to push the new map
- * without restarting the container.
- *
- * Uses DELETE + INSERT in a transaction for a clean overwrite.
- */
-/**
  * Write the default reply routing for a session into its inbound.db.
  *
  * The container reads this as the default (channel_type, platform_id, thread_id)
  * for outbound messages when the agent doesn't specify an explicit destination.
  * Derived from session.messaging_group_id → messaging_groups row + session.thread_id.
  *
- * Called on every container wake alongside writeDestinations() so the latest
- * routing is always in place, including after admin rewiring.
+ * Called on every container wake alongside the agent-to-agent module's
+ * writeDestinations() (when installed) so the latest routing is always in
+ * place, including after admin rewiring.
  */
 export function writeSessionRouting(agentGroupId: string, sessionId: string): void {
   const dbPath = inboundDbPath(agentGroupId, sessionId);
@@ -177,48 +165,6 @@ export function writeSessionRouting(agentGroupId: string, sessionId: string): vo
     db.close();
   }
   log.debug('Session routing written', { sessionId, channelType, platformId, threadId: session.thread_id });
-}
-
-export function writeDestinations(agentGroupId: string, sessionId: string): void {
-  const dbPath = inboundDbPath(agentGroupId, sessionId);
-  if (!fs.existsSync(dbPath)) return;
-
-  const rows = getDestinations(agentGroupId);
-  const resolved: DestinationRow[] = [];
-
-  for (const row of rows) {
-    if (row.target_type === 'channel') {
-      const mg = getMessagingGroup(row.target_id);
-      if (!mg) continue;
-      resolved.push({
-        name: row.local_name,
-        display_name: mg.name ?? row.local_name,
-        type: 'channel',
-        channel_type: mg.channel_type,
-        platform_id: mg.platform_id,
-        agent_group_id: null,
-      });
-    } else if (row.target_type === 'agent') {
-      const ag = getAgentGroup(row.target_id);
-      if (!ag) continue;
-      resolved.push({
-        name: row.local_name,
-        display_name: ag.name,
-        type: 'agent',
-        channel_type: null,
-        platform_id: null,
-        agent_group_id: ag.id,
-      });
-    }
-  }
-
-  const db = openInboundDb(agentGroupId, sessionId);
-  try {
-    replaceDestinations(db, resolved);
-  } finally {
-    db.close();
-  }
-  log.debug('Destination map written', { sessionId, count: resolved.length });
 }
 
 /**
@@ -342,6 +288,53 @@ export function writeSystemResponse(
       result,
     }),
   });
+}
+
+/**
+ * Load outbox attachments for a delivered message.
+ *
+ * Symmetric with `extractAttachmentFiles` on the inbound side: the container
+ * writes files into the session's `outbox/<messageId>/` directory alongside
+ * its `messages_out` row, and the host reads them back at delivery time.
+ *
+ * Returns undefined when the outbox dir is missing or no declared file was
+ * actually on disk — delivery continues without attachments rather than
+ * failing the whole message.
+ */
+export function readOutboxFiles(
+  agentGroupId: string,
+  sessionId: string,
+  messageId: string,
+  filenames: string[],
+): OutboundFile[] | undefined {
+  const outboxDir = path.join(sessionDir(agentGroupId, sessionId), 'outbox', messageId);
+  if (!fs.existsSync(outboxDir)) return undefined;
+  const files: OutboundFile[] = [];
+  for (const filename of filenames) {
+    const filePath = path.join(outboxDir, filename);
+    if (fs.existsSync(filePath)) {
+      files.push({ filename, data: fs.readFileSync(filePath) });
+    } else {
+      log.warn('Outbox file not found', { messageId, filename });
+    }
+  }
+  return files.length > 0 ? files : undefined;
+}
+
+/**
+ * Remove a message's outbox directory after successful delivery. Best-effort:
+ * failures log and swallow. A cleanup failure must NOT propagate to the
+ * delivery caller — the message is already on the user's screen, and a
+ * thrown error would trigger the delivery retry path and deliver twice.
+ */
+export function clearOutbox(agentGroupId: string, sessionId: string, messageId: string): void {
+  const outboxDir = path.join(sessionDir(agentGroupId, sessionId), 'outbox', messageId);
+  if (!fs.existsSync(outboxDir)) return;
+  try {
+    fs.rmSync(outboxDir, { recursive: true, force: true });
+  } catch (err) {
+    log.warn('Outbox cleanup failed (message already delivered)', { messageId, err });
+  }
 }
 
 /** Mark a container as running for a session. */

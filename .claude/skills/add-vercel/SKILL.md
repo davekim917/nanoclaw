@@ -115,25 +115,7 @@ If `MISSING`, add `vercel` to the global npm install line in `container/Dockerfi
 
 If `PRESENT`, skip — no rebuild needed.
 
-## Phase 5: Patch Agent CLAUDE.md Files
-
-Append the frontend delegation rule to every existing agent group's CLAUDE.md. This ensures the agent treats delegation as a hard rule, not a suggestion.
-
-```bash
-for claudemd in groups/*/CLAUDE.md; do
-  if ! grep -q "Frontend Delegation" "$claudemd" 2>/dev/null; then
-    cat >> "$claudemd" << 'PATCH'
-
-## Frontend Delegation (Vercel)
-
-You MUST NOT write HTML, CSS, or JavaScript yourself. When asked to build a website or web app, delegate to a Frontend Engineer subagent using create_agent then send_message. Both calls are required before telling the user anything is happening.
-PATCH
-    echo "Patched: $claudemd"
-  fi
-done
-```
-
-## Phase 6: Sync Skills to Running Agent Groups
+## Phase 5: Sync Skills to Running Agent Groups
 
 Container skills are copied once at group creation and not auto-synced. After installing or updating a container skill, sync it to all existing agent groups:
 
@@ -146,9 +128,9 @@ for session_dir in data/v2-sessions/ag-*; do
 done
 ```
 
-## Phase 7: Restart Running Containers
+## Phase 6: Restart Running Containers
 
-Stop all running agent containers so they pick up the new skills and CLAUDE.md changes:
+Stop all running agent containers so they pick up the new skills on next wake:
 
 ```bash
 docker ps --format "{{.ID}} {{.Names}}" | grep nanoclaw-v2 | awk '{print $1}' | xargs -r docker stop

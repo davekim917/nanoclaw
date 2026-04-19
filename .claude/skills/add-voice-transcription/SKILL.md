@@ -42,8 +42,8 @@ git remote add whatsapp https://github.com/qwibitai/nanoclaw-whatsapp.git
 ```bash
 git fetch whatsapp skill/voice-transcription
 git merge whatsapp/skill/voice-transcription || {
-  git checkout --theirs package-lock.json
-  git add package-lock.json
+  git checkout --theirs pnpm-lock.yaml
+  git add pnpm-lock.yaml
   git merge --continue
 }
 ```
@@ -60,9 +60,9 @@ If the merge reports conflicts, resolve them by reading the conflicted files and
 ### Validate code changes
 
 ```bash
-npm install --legacy-peer-deps
-npm run build
-npx vitest run src/channels/whatsapp.test.ts
+pnpm install
+pnpm run build
+pnpm exec vitest run src/channels/whatsapp.test.ts
 ```
 
 All tests must pass and build must be clean before proceeding.
@@ -103,7 +103,7 @@ The container reads environment from `data/env/env`, not `.env` directly.
 ### Build and restart
 
 ```bash
-npm run build
+pnpm run build
 launchctl kickstart -k gui/$(id -u)/com.nanoclaw  # macOS
 # Linux: systemctl --user restart nanoclaw
 ```

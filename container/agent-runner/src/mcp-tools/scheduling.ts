@@ -8,6 +8,7 @@
 import { getInboundDb } from '../db/connection.js';
 import { writeMessageOut } from '../db/messages-out.js';
 import { getSessionRouting } from '../db/session-routing.js';
+import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
 function log(msg: string): void {
@@ -265,4 +266,4 @@ export const updateTask: McpToolDefinition = {
   },
 };
 
-export const schedulingTools: McpToolDefinition[] = [scheduleTask, listTasks, updateTask, cancelTask, pauseTask, resumeTask];
+registerTools([scheduleTask, listTasks, updateTask, cancelTask, pauseTask, resumeTask]);

@@ -10,6 +10,7 @@
  */
 import { writeMessageOut } from '../db/messages-out.js';
 import { getSessionRouting } from '../db/session-routing.js';
+import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
 function genId(prefix: string): string {
@@ -82,3 +83,5 @@ export const remoteControlTools: McpToolDefinition[] = [
   stopRemoteControlTool,
   getRemoteControlStatusTool,
 ];
+
+registerTools(remoteControlTools);

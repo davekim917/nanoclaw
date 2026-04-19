@@ -1,16 +1,16 @@
 ---
 name: init-first-agent
-description: Walk the operator through creating the first NanoClaw v2 agent for a DM channel — resolve the operator's channel identity, wire the DM messaging group to a new agent, and trigger a welcome DM via the normal delivery path. Use after channel credentials are configured and the service is running.
+description: Walk the operator through creating the first NanoClaw agent for a DM channel — resolve the operator's channel identity, wire the DM messaging group to a new agent, and trigger a welcome DM via the normal delivery path. Use after channel credentials are configured and the service is running.
 ---
 
 # Init First Agent
 
-Stand up the first NanoClaw v2 agent for a channel and verify end-to-end delivery by having the agent DM the operator. Everything the skill does is idempotent — rerunning is safe.
+Stand up the first NanoClaw agent for a channel and verify end-to-end delivery by having the agent DM the operator. Everything the skill does is idempotent — rerunning is safe.
 
 ## Prerequisites
 
 - **Service running.** Check: `launchctl list | grep nanoclaw` (macOS) or `systemctl --user status nanoclaw` (Linux). If stopped, tell the user to run `/setup` first.
-- **Target channel installed.** At least one `/add-<channel>-v2` skill has run, credentials are in `.env`, and the adapter is uncommented in `src/channels/index.ts`.
+- **Target channel installed.** At least one `/add-<channel>` skill has run, credentials are in `.env`, and the adapter is uncommented in `src/channels/index.ts`.
 - **Adapter connected.** Tail `logs/nanoclaw.log` — look for a recent `channel setup` / `adapter connected` line for the target channel.
 
 ## 1. Pick the channel
@@ -23,7 +23,7 @@ Record the choice as `CHANNEL` (lowercase, e.g. `discord`).
 
 ## 2. Ask for the operator's identity
 
-Read the channel's own skill for its `## Channel Info > how-to-find-id` section (e.g. `.claude/skills/add-discord-v2/SKILL.md`, `.claude/skills/add-telegram-v2/SKILL.md`). Show those instructions to the user in plain text.
+Read the channel's own skill for its `## Channel Info > how-to-find-id` section (e.g. `.claude/skills/add-discord/SKILL.md`, `.claude/skills/add-telegram/SKILL.md`). Show those instructions to the user in plain text.
 
 Then ask in plain text (NOT `AskUserQuestion` — these are free-form):
 

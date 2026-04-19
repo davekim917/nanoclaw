@@ -4,7 +4,7 @@
  * Mock adapter → onInbound → router → session DB → Docker container →
  * agent-runner → Claude → messages_out → delivery → mock adapter.deliver()
  *
- * Usage: npx tsx scripts/test-v2-channel-e2e.ts
+ * Usage: pnpm exec tsx scripts/test-v2-channel-e2e.ts
  */
 import Database from 'better-sqlite3';
 import fs from 'fs';

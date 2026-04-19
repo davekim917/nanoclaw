@@ -1,6 +1,6 @@
 /**
  * Setup CLI entry point.
- * Usage: npx tsx setup/index.ts --step <name> [args...]
+ * Usage: pnpm exec tsx setup/index.ts --step <name> [args...]
  */
 import { log } from '../src/log.js';
 import { emitStatus } from './status.js';
@@ -12,10 +12,7 @@ const STEPS: Record<
   timezone: () => import('./timezone.js'),
   environment: () => import('./environment.js'),
   container: () => import('./container.js'),
-  groups: () => import('./groups.js'),
   register: () => import('./register.js'),
-  'pair-telegram': () => import('./pair-telegram.js'),
-  'whatsapp-auth': () => import('./whatsapp-auth.js'),
   mounts: () => import('./mounts.js'),
   service: () => import('./service.js'),
   verify: () => import('./verify.js'),
@@ -27,7 +24,7 @@ async function main(): Promise<void> {
 
   if (stepIdx === -1 || !args[stepIdx + 1]) {
     console.error(
-      `Usage: npx tsx setup/index.ts --step <${Object.keys(STEPS).join('|')}> [args...]`,
+      `Usage: pnpm exec tsx setup/index.ts --step <${Object.keys(STEPS).join('|')}> [args...]`,
     );
     process.exit(1);
   }

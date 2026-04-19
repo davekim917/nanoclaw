@@ -1,7 +1,7 @@
 /**
  * Seed the v2 central DB with a Discord agent group + messaging group.
  *
- * Usage: npx tsx scripts/seed-discord.ts
+ * Usage: pnpm exec tsx scripts/seed-discord.ts
  */
 import path from 'path';
 
@@ -73,4 +73,4 @@ try {
   }
 }
 
-console.log('Done! Run: npm run build && node dist/index.js');
+console.log('Done! Run: pnpm run build && node dist/index.js');

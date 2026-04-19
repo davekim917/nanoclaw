@@ -8,7 +8,8 @@
  *   - SESSION_INBOUND_DB_PATH:  path to host-owned inbound DB (default: /workspace/inbound.db)
  *   - SESSION_OUTBOUND_DB_PATH: path to container-owned outbound DB (default: /workspace/outbound.db)
  *   - SESSION_HEARTBEAT_PATH:   heartbeat file path (default: /workspace/.heartbeat)
- *   - AGENT_PROVIDER: 'claude' | 'mock' (default: claude)
+ *   - AGENT_PROVIDER: any registered provider name (default: claude). The
+ *     set of registered providers is whatever `providers/index.ts` imports.
  *   - NANOCLAW_ASSISTANT_NAME: assistant name for transcript archiving
  *   - NANOCLAW_ADMIN_USER_IDS: comma-separated user IDs allowed to run admin commands
  *
@@ -27,6 +28,9 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 import { buildSystemPromptAddendum } from './destinations.js';
+// Providers barrel — each enabled provider self-registers on import.
+// Provider skills append imports to providers/index.ts.
+import './providers/index.js';
 import { createProvider, type ProviderName } from './providers/factory.js';
 import { runPollLoop } from './poll-loop.js';
 
@@ -37,7 +41,7 @@ function log(msg: string): void {
 const CWD = '/workspace/agent';
 
 async function main(): Promise<void> {
-  const providerName = (process.env.AGENT_PROVIDER || 'claude') as ProviderName;
+  const providerName = (process.env.AGENT_PROVIDER || 'claude').toLowerCase() as ProviderName;
   const assistantName = process.env.NANOCLAW_ASSISTANT_NAME;
   const adminUserIds = new Set(
     (process.env.NANOCLAW_ADMIN_USER_IDS || '')
@@ -69,15 +73,15 @@ async function main(): Promise<void> {
     }
   }
 
-  // MCP server path
+  // MCP server path — bun runs TS directly; no tsc build step in-image.
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
-  const mcpServerPath = path.join(__dirname, 'mcp-tools', 'index.js');
+  const mcpServerPath = path.join(__dirname, 'mcp-tools', 'index.ts');
 
   // Build MCP servers config: nanoclaw built-in + any additional from host
   const mcpServers: Record<string, { command: string; args: string[]; env: Record<string, string> }> = {
     nanoclaw: {
-      command: 'node',
-      args: [mcpServerPath],
+      command: 'bun',
+      args: ['run', mcpServerPath],
       env: {
         SESSION_INBOUND_DB_PATH: process.env.SESSION_INBOUND_DB_PATH || '/workspace/inbound.db',
         SESSION_OUTBOUND_DB_PATH: process.env.SESSION_OUTBOUND_DB_PATH || '/workspace/outbound.db',

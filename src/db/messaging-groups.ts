@@ -1,11 +1,20 @@
 import type { MessagingGroup, MessagingGroupAgent } from '../types.js';
+// Transitional tier violation: core imports from optional agent-to-agent module.
+// `createMessagingGroupAgent` auto-creates a destination row on wiring — the
+// two concerns are currently bundled. When agent-to-agent isn't installed,
+// the table doesn't exist and this import chain remains dormant because
+// `createMessagingGroupAgent` is only called from setup/admin paths that
+// also only run when wiring channels to agents (which implicitly requires
+// agent-to-agent for the destination ACL to mean anything). A cleaner split
+// (or making the destination side effect module-owned) is tracked in the
+// refactor plan.
 import {
   createDestination,
   getDestinationByName,
   getDestinationByTarget,
   normalizeName,
-} from './agent-destinations.js';
-import { getDb } from './connection.js';
+} from '../modules/agent-to-agent/db/agent-destinations.js';
+import { getDb, hasTable } from './connection.js';
 
 // ── Messaging Groups ──
 
@@ -84,21 +93,27 @@ export function createMessagingGroupAgent(mga: MessagingGroupAgent): void {
     .run(mga);
 
   // Auto-create an agent_destinations row so delivery's ACL doesn't block
-  // outbound messages that target this chat.
+  // outbound messages that target this chat. Guarded: when the agent-to-agent
+  // module isn't installed the table doesn't exist — skip silently. Without
+  // the module, the ACL check in delivery is also skipped (same guard), so
+  // channel sends still work.
   //
   // ⚠️  DESTINATION PROJECTION NOTE: this function only writes the central
   // `agent_destinations` row. It does NOT project into any running
   // agent's session inbound.db (see top-of-file invariant in
-  // src/db/agent-destinations.ts). In practice this is fine because the
-  // only real callers are one-shot setup scripts (setup/register.ts,
-  // scripts/init-first-agent.ts, /manage-channels skill) that run in a
-  // separate process from the host. Any already-running container for
-  // `mga.agent_group_id` will keep serving the stale projection until
-  // its next wake (idle timeout or next inbound message) at which
-  // point spawnContainer's writeDestinations call refreshes from central.
-  // If you call this from code that runs INSIDE the host process and
-  // need the refresh to happen immediately, explicitly call
-  // `writeDestinations(mga.agent_group_id, <sessionId>)` afterwards.
+  // src/modules/agent-to-agent/db/agent-destinations.ts). In practice this
+  // is fine because the only real callers are one-shot setup scripts
+  // (setup/register.ts, scripts/init-first-agent.ts, /manage-channels
+  // skill) that run in a separate process from the host. Any already-
+  // running container for `mga.agent_group_id` will keep serving the
+  // stale projection until its next wake (idle timeout or next inbound
+  // message) at which point spawnContainer's writeDestinations call
+  // refreshes from central. If you call this from code that runs INSIDE
+  // the host process and need the refresh to happen immediately,
+  // explicitly call the module's `writeDestinations(mga.agent_group_id,
+  // <sessionId>)` afterwards.
+  if (!hasTable(getDb(), 'agent_destinations')) return;
+
   const existing = getDestinationByTarget(mga.agent_group_id, 'channel', mga.messaging_group_id);
   if (existing) return;
 

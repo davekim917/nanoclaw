@@ -87,4 +87,4 @@ User: "Can you transcribe audio?"
 
 - **The change is for a one-off task** — just do it in your workspace, don't modify the container
 - **The request is ambiguous** — ask the user what they actually need before spinning up builders or requesting installs
-- **You don't know if it will work** — prototype in your workspace first (`npm install` in `/workspace/agent/`), then promote to container-level install if it proves useful
+- **You don't know if it will work** — prototype in your workspace first (`pnpm install` in `/workspace/agent/`), then promote to container-level install if it proves useful
