@@ -92,6 +92,28 @@ export function setAccessGate(fn: AccessGateFn): void {
   accessGate = fn;
 }
 
+/**
+ * Unwired-channel resolver hook. Runs only when a messaging group has zero
+ * agents wired. A module can opt-in to auto-wire the first message to a
+ * default agent group (matching upstream's channels-via-skills stance with
+ * one additive escape hatch) — see `src/modules/channel-auto-wire/`. The
+ * resolver is expected to persist a `messaging_group_agents` row as a side
+ * effect so subsequent messages resolve via the normal path; the returned
+ * array is what the current message routes through. Returning an empty
+ * array falls through to the standard "MESSAGE DROPPED — no agent groups
+ * wired" path.
+ */
+export type UnwiredChannelResolverFn = (event: InboundEvent, mg: MessagingGroup) => MessagingGroupAgent[];
+
+let unwiredChannelResolver: UnwiredChannelResolverFn | null = null;
+
+export function setUnwiredChannelResolver(fn: UnwiredChannelResolverFn): void {
+  if (unwiredChannelResolver) {
+    log.warn('Unwired-channel resolver overwritten');
+  }
+  unwiredChannelResolver = fn;
+}
+
 function safeParseContent(raw: string): { text?: string; sender?: string; senderId?: string } {
   try {
     return JSON.parse(raw);
@@ -141,7 +163,13 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
 
   // 3. Resolve agent groups wired to this messaging group. Structural
   //    drops record to dropped_messages for audit.
-  const agents = getMessagingGroupAgents(mg.id);
+  let agents = getMessagingGroupAgents(mg.id);
+  if (agents.length === 0 && unwiredChannelResolver) {
+    // Give the auto-wire module a chance to opt-in a default agent group for
+    // this channel_type. If it wires one, the current message routes through
+    // immediately (no drop); otherwise falls through to the standard drop.
+    agents = unwiredChannelResolver(event, mg);
+  }
   if (agents.length === 0) {
     log.warn('MESSAGE DROPPED — no agent groups wired to this channel. Run setup register step to configure.', {
       messagingGroupId: mg.id,

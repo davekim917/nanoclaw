@@ -29,6 +29,20 @@ const REQUIRED_ENV: Record<string, string> = {
   // Prevents sessions from hitting the hard context limit and triggering
   // silent model fallback on upstream 400 errors.
   CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: '80',
+  // Lock the `opus` alias to 4.7. Model IDs are bundled into each SDK
+  // release, so when a new flagship ships (4.7 → …) before the installed
+  // SDK knows about it, the alias resolver silently falls back to whatever
+  // is newest in its bundled map. This env is the first-checked branch in
+  // the SDK's opus resolver — it short-circuits the alias and passes the
+  // explicit id to the API, keeping "opus" pointed at the real flagship
+  // regardless of SDK lag.
+  ANTHROPIC_DEFAULT_OPUS_MODEL: 'claude-opus-4-7',
+  // Default reasoning effort. Still per-message-overridable via `-e high`
+  // and session-sticky via `-e1 high` flags; per-group override via
+  // container.json `effort` field (planned). `medium` is a cost-balanced
+  // default for general conversational use.
+  CLAUDE_CODE_EFFORT_LEVEL: 'medium',
+  CLAUDE_CODE_USE_EFFORT: 'medium',
 };
 
 // Required top-level settings. Merged into existing settings.json
@@ -38,6 +52,11 @@ const REQUIRED_SETTINGS: Record<string, unknown> = {
   // Background memory consolidation — prunes stale notes, resolves
   // contradictions, keeps MEMORY.md concise so auto-memory stays useful.
   autoDreamEnabled: true,
+  // Default model alias. Combined with ANTHROPIC_DEFAULT_OPUS_MODEL in env
+  // above, this resolves to claude-opus-4-7 at spawn time. Per-group
+  // override via the group's own settings.json (the merge below preserves
+  // existing values, so editing settings.json by hand works).
+  model: 'opus',
 };
 
 const DEFAULT_SETTINGS_JSON = JSON.stringify({ env: REQUIRED_ENV, ...REQUIRED_SETTINGS }, null, 2) + '\n';
