@@ -15,26 +15,55 @@ const FILTERED_COMMANDS = new Set(['/help', '/login', '/logout', '/doctor', '/co
 
 const VALID_EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh']);
 
-// Model values accepted by `-m`/`-m1`. Strict allowlist to:
-// (a) prevent a DoS via `-m1 <nonsense>` that wedges future turns until
-//     an admin clears sticky state
-// (b) keep the surface small and explicit; the SDK accepts arbitrary
-//     strings so we can't rely on it to validate.
-// Aliases (opus/sonnet/haiku/etc.) + specific model IDs. Extend as new
-// Claude models land.
+// Short-alias map for common model pins. Lets the user type `-m opus46`
+// or `-m opus4-6` instead of `-m claude-opus-4-6[1m]` for the models they
+// reach for most often. Resolution runs BEFORE the allowlist check, so the
+// expanded canonical form is what gets stored.
+//
+// Opus short aliases default to the [1m] 1M-context variant because that's
+// the common intent when pinning to a specific Opus version. Sonnet/Haiku
+// variants don't have [1m] today; add when/if they do.
+const MODEL_ALIAS_MAP: Record<string, string> = {
+  'opus46': 'claude-opus-4-6[1m]',
+  'opus4-6': 'claude-opus-4-6[1m]',
+  'opus47': 'claude-opus-4-7',
+  'opus4-7': 'claude-opus-4-7',
+  'sonnet46': 'claude-sonnet-4-6',
+  'sonnet4-6': 'claude-sonnet-4-6',
+  'sonnet47': 'claude-sonnet-4-7',
+  'sonnet4-7': 'claude-sonnet-4-7',
+  'haiku45': 'claude-haiku-4-5',
+  'haiku4-5': 'claude-haiku-4-5',
+};
+
+function resolveModelAlias(value: string): string {
+  return MODEL_ALIAS_MAP[value.toLowerCase()] ?? value;
+}
+
+// Model values accepted by `-m`/`-m1` after alias resolution. Strict
+// allowlist to prevent a DoS via `-m <nonsense>` that wedges future turns
+// until an admin clears sticky state. Bare `opus`/`sonnet`/`haiku`/`default`
+// are SDK-native aliases (current-default for that family).
 const VALID_MODEL_RE = /^(?:opus|sonnet|haiku|default|claude-(?:opus|sonnet|haiku)-\d+-\d+(?:\[\dm\])?)$/;
 
 /**
  * Model/effort flags parsed from the start of an inbound text message.
  *
- *   -m <model>    per-turn model override
- *   -m1 <model>   session-sticky model override (persists until changed)
- *   -e <level>    per-turn effort override (low|medium|high|xhigh)
- *   -e1 <level>   session-sticky effort override
+ *   -m <model>    session-sticky model (persists across turns)
+ *   -m1 <model>   one-shot per-turn model override
+ *   -e <level>    session-sticky effort (low|medium|high|xhigh)
+ *   -e1 <level>   one-shot per-turn effort
+ *
+ * Mnemonic: the `1` suffix means "apply to 1 message". No suffix = default
+ * (all messages in this session).
  *
  * Flags must appear as a contiguous prefix of the text, separated by
  * whitespace. Anything after the flag block is the actual prompt. Empty
- * value on a sticky flag (`-m1 ''` or `-e1 ''`) clears the sticky.
+ * value on a sticky flag (`-m ''` or `-e ''`) clears the sticky state.
+ *
+ * Short aliases for model values: opus46 / opus4-6 / opus47 / opus4-7 /
+ * sonnet46 / sonnet4-6 / sonnet47 / sonnet4-7 / haiku45 / haiku4-5. See
+ * MODEL_ALIAS_MAP.
  *
  * Returns undefined for each field if no corresponding flag was found.
  * `cleanedText` is the prompt with the flag prefix stripped.
@@ -42,7 +71,7 @@ const VALID_MODEL_RE = /^(?:opus|sonnet|haiku|default|claude-(?:opus|sonnet|haik
 export interface ParsedFlags {
   turnModel?: string;
   stickyModel?: string;
-  /** Empty string means "clear sticky"; undefined means "no change". */
+  /** True when `-m ''` was seen (clear the sticky). */
   clearStickyModel?: boolean;
   turnEffort?: string;
   stickyEffort?: string;
@@ -59,22 +88,26 @@ export function parseModelEffortFlags(text: string): ParsedFlags {
     if (!m) break;
     const flag = m[1];
     const rawValue = m[2];
-    const value = rawValue.replace(/^['"]|['"]$/g, ''); // strip surrounding quotes
+    const unquoted = rawValue.replace(/^['"]|['"]$/g, ''); // strip surrounding quotes
     rest = rest.slice(m[0].length);
     switch (flag) {
-      case '-m':
+      case '-m': {
+        const value = unquoted ? resolveModelAlias(unquoted) : unquoted;
+        if (value && VALID_MODEL_RE.test(value)) out.stickyModel = value;
+        else if (!unquoted) out.clearStickyModel = true;
+        break;
+      }
+      case '-m1': {
+        const value = unquoted ? resolveModelAlias(unquoted) : unquoted;
         if (value && VALID_MODEL_RE.test(value)) out.turnModel = value;
         break;
-      case '-m1':
-        if (value && VALID_MODEL_RE.test(value)) out.stickyModel = value;
-        else if (!value) out.clearStickyModel = true;
-        break;
+      }
       case '-e':
-        if (value && VALID_EFFORT_LEVELS.has(value)) out.turnEffort = value;
+        if (unquoted && VALID_EFFORT_LEVELS.has(unquoted)) out.stickyEffort = unquoted;
+        else if (!unquoted) out.clearStickyEffort = true;
         break;
       case '-e1':
-        if (value && VALID_EFFORT_LEVELS.has(value)) out.stickyEffort = value;
-        else if (!value) out.clearStickyEffort = true;
+        if (unquoted && VALID_EFFORT_LEVELS.has(unquoted)) out.turnEffort = unquoted;
         break;
     }
   }
