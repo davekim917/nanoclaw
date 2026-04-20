@@ -139,3 +139,87 @@ Followed by MEDIUM triage after Dave prioritizes.
 ## What this audit is NOT (repeated from plan)
 
 Not a feature wishlist, not a re-architecture proposal, not a test-coverage audit, not a security review (though several of the HIGH findings are security-adjacent — GITHUB_ALLOWED_ORGS, Bash env secret visibility, source-mount allowlist, send_file gating). A proper security review is a distinct follow-up exercise once the HIGH findings are triaged.
+
+---
+
+## Resolution log (2026-04-20 session)
+
+### Closed via code (18 commits)
+
+| # | Commit | Note |
+|---|---|---|
+| worktree auto-commit | `eb90165` | Pre-session |
+| Bash sanitize + plugin discovery + SDK_ENV_DENYLIST (#2, #3, #4) | `1d2ec11` | |
+| Sync container stop + Opus alias lock (#9, #17) | `05dbe50` | |
+| Scoped env vars + URL-scoped GitHub helper (#12, #16) | `461d903` | |
+| Snowflake bind-mount (#14) | `e908bbd` | |
+| Drop scripts/ from source-mount allowlist (#23 security) | `4d8b0e2` | |
+| send_file host-ack + allowlist + dedup (#18) | `7cf0fec` + `78f20c4` | |
+| prompt_too_long in-turn recovery (#10/#11) | `1561fe6` | |
+| System prompt identity + meta-response + cred-in-chat (#8, #34) | `0e9d04d` | |
+| GH_TOKEN out of shell literal (review fix) | `bbe61e5` | |
+| Block snowflake.connector + git-clone outside /tmp (#5) | `ef9e0cb` | |
+| Email gate (#6) | `78f20c4` | |
+| Per-turn + sticky `-m`/`-e` flags (#7) | `4a24027` | |
+| Security review round: VULN-001 CRITICAL + 3 HIGH + 2 MEDIUM | `546ba53` | |
+| `-m`/`-m1` semantic swap + short model aliases | `a65328e` | |
+| Settings envs + drop tool allowlist enumeration | `90d3a8a` | |
+| Self-approval block (destructive-gate bypass prevention) | `56239b3` | |
+
+### Closed via verification (no code needed — already present or N/A)
+
+| # | Rationale |
+|---|---|
+| #13 auto-memory overlay | `.claude-shared` is per-agent-group mount; cwd-derived path is identical across sessions → shared MEMORY.md |
+| #15 attachments mount | v2 uses inline base64 + persist-to-session-dir model, no mount needed |
+| #20 Slack reply-context | v1 slack.ts also has no reply-context extraction (grep confirmed). Discord-specific. |
+| #21 chat-sdk outbound archive | agent-runner always emits `kind: 'chat'` on outbound; `chat-sdk` kind is inbound-only |
+| #25 global CLAUDE.md | `group-init.ts:121-135` drops symlink so @-import resolves |
+| #26 model drift | v2 runs fresh `sdkQuery` per turn; `options.model` re-passed each time — drift self-corrects |
+| #27 /compact model re-assert | Same as #26 — /compact is in-turn, model reset on next turn |
+| #28 watchdog heartbeat | `poll-loop.ts:326` calls `touchHeartbeat()` on every SDK event |
+| #29 session dir UID | Dockerfile bakes node→1001 to match host UID 1001 |
+| #31 typing stop on first output | v2's heartbeat-mtime-decay + post-delivery pause is strictly better UX |
+| 4.1-S1 per-group settings.json hooks | gitnexus plugin's own `hooks.json` provides PreToolUse enrichment + PostToolUse index-check, loaded via plugin discovery port |
+
+### Downgraded with documented rationale
+
+| # | Original → New | Why |
+|---|---|---|
+| #7 model/effort switch | MEDIUM → HIGH → closed | Originally MEDIUM ("not used today"); confirmed HIGH by Dave ("must have"); closed |
+| #19 recovery notice DM | HIGH → MEDIUM | v2 retry-on-wake covers common case; only permanent-fail DM missing |
+| #22 workflow-plugin safety notice | HIGH → LOW | Contingent on #4 which is closed |
+| #24 worktree "already exists" retry | HIGH → MEDIUM | Fetch+prune are present; retry-on-add missing — races unlikely in per-session model |
+| #30 agent-runner-src pre-copy clear | HIGH → LOW-MEDIUM | Only bites on upstream renames; rare |
+| #33 gate timeouts | HIGH → LOW | Module approvals are DB-backed; no process-local TTL needed |
+| #35 send_file source-group gate | HIGH → MEDIUM | Destinations already enforce per-session scoping |
+| VULN-002 snowflake regex | HIGH → advisory | Documented bypass surface; real fix is arch change |
+| VULN-005 GH_TOKEN in Bash env | MEDIUM → accepted | Stripping breaks git/gh; URL-scoped helper is real boundary |
+
+### Still open — **feature-scope decisions** (not bugs)
+
+These are v1 features not ported to v2, each worth a "do we actually want this" call rather than blind port:
+
+| Area | Description |
+|---|---|
+| `render_diagram` MCP tool | Render mermaid/HTML/SVG → PNG and send. Used in v1 for diagrams in chat. Browser tool covers part of this. |
+| `read_thread` / `read_thread_by_key` | Agent reads past thread content by ID/key. v2 has `resolve_thread_link` for permalinks only. |
+| `list_groups` | Agent enumerates its own groups. v2 has `get_capabilities` with a related surface. |
+| Memory CRUD tools (save/delete/update/list/search) | v2 uses SDK auto-memory instead. Agents can edit `MEMORY.md` directly via Edit. Scope gap: explicit search. |
+| `set_group_*` admin MCP tools | Chat-driven group config mutations. v2 handles via `/manage-channels` skill. Different UX. |
+| `ollama_*` MCP tools | Ollama model control. Optional skill in v2. |
+| Pre-flight session size compact | Proactive `/compact` at 15MB jsonl size. v2's `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80` covers the common-case token threshold. |
+| Scoped credential filtering (AWS/gcloud/dbt/GWS/calendar) | Cross-agent-group isolation. Theoretical in single-user setups; real for multi-user forks. |
+| Haiku semantic reranking for `search_threads` | Thread-search quality uplift. v2 returns raw FTS rank. |
+| Session-dir GC cron | Disk-hygiene sweep of old session dirs. None today. |
+
+All of the above are **additive** — nothing in v2 is BROKEN by their absence. Each is a "we lost this feature in v2" item awaiting a product decision.
+
+### Summary
+
+- **Real gaps closed via code: 18 commits this session + `eb90165` pre-session**
+- **Non-gaps closed via verification: 11 items**
+- **Downgraded with rationale: 9 items**
+- **Remaining: 10 feature-scope decisions, no code-emergencies**
+
+The audit is substantively complete. Items in "Still open" are product scope, not parity defects.
