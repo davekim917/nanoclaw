@@ -25,13 +25,7 @@ vi.mock('../approvals/index.js', () => ({
   },
 }));
 
-import {
-  closeDb,
-  createAgentGroup,
-  createMessagingGroup,
-  initTestDb,
-  runMigrations,
-} from '../../db/index.js';
+import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from '../../db/index.js';
 import type { AgentGroup, MessagingGroup, Session } from '../../types.js';
 import { addMember, isMember } from './db/agent-group-members.js';
 import { createUser } from './db/users.js';
@@ -106,9 +100,7 @@ function insertChatInbound(
   content: Record<string, unknown>,
   opts: { channelType?: string; timestamp?: string } = {},
 ): void {
-  db.prepare(
-    `INSERT INTO messages_in (id, kind, timestamp, channel_type, content) VALUES (?, 'chat', ?, ?, ?)`,
-  ).run(
+  db.prepare(`INSERT INTO messages_in (id, kind, timestamp, channel_type, content) VALUES (?, 'chat', ?, ?, ?)`).run(
     `in-${Math.random().toString(36).slice(2, 8)}`,
     opts.timestamp ?? now(),
     opts.channelType ?? 'slack-illysium',
@@ -134,9 +126,27 @@ beforeEach(() => {
   createUser({ id: 'slack-illysium:BOB', kind: 'slack-illysium', display_name: 'Bob', created_at: now() });
   createUser({ id: 'slack-illysium:CAROL', kind: 'slack-illysium', display_name: 'Carol', created_at: now() });
 
-  grantRole({ user_id: 'slack-illysium:OWNER', role: 'owner', agent_group_id: null, granted_by: null, granted_at: now() });
-  grantRole({ user_id: 'slack-illysium:GADMIN', role: 'admin', agent_group_id: null, granted_by: null, granted_at: now() });
-  grantRole({ user_id: 'slack-illysium:SADMIN', role: 'admin', agent_group_id: 'ag-illie', granted_by: null, granted_at: now() });
+  grantRole({
+    user_id: 'slack-illysium:OWNER',
+    role: 'owner',
+    agent_group_id: null,
+    granted_by: null,
+    granted_at: now(),
+  });
+  grantRole({
+    user_id: 'slack-illysium:GADMIN',
+    role: 'admin',
+    agent_group_id: null,
+    granted_by: null,
+    granted_at: now(),
+  });
+  grantRole({
+    user_id: 'slack-illysium:SADMIN',
+    role: 'admin',
+    agent_group_id: 'ag-illie',
+    granted_by: null,
+    granted_at: now(),
+  });
 });
 
 afterEach(() => {
@@ -271,7 +281,13 @@ describe('handleRevokeAccess', () => {
   });
 
   it('scoped admin cannot revoke another admin', async () => {
-    grantRole({ user_id: 'slack-illysium:CAROL', role: 'admin', agent_group_id: 'ag-illie', granted_by: null, granted_at: now() });
+    grantRole({
+      user_id: 'slack-illysium:CAROL',
+      role: 'admin',
+      agent_group_id: 'ag-illie',
+      granted_by: null,
+      granted_at: now(),
+    });
     const db = inboundDb();
     insertChatInbound(db, { senderId: 'SADMIN' });
     await handleRevokeAccess({ user: '<@CAROL>' }, makeSession(), db);

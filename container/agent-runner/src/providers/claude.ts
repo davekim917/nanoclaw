@@ -5,6 +5,7 @@ import { query as sdkQuery, type HookCallback, type PreCompactHookInput } from '
 
 import { registerProvider } from './provider-registry.js';
 import type { AgentProvider, AgentQuery, McpServerConfig, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
+import { autoCommitDirtyWorktrees } from '../worktree-autosave.js';
 
 function log(msg: string): void {
   console.error(`[claude-provider] ${msg}`);
@@ -177,6 +178,23 @@ function createPreCompactHook(assistantName?: string): HookCallback {
   return async (input) => {
     const preCompact = input as PreCompactHookInput;
     const { transcript_path: transcriptPath, session_id: sessionId } = preCompact;
+
+    // Compaction is about to drop the older transcript from context, so
+    // pin any uncommitted worktree edits to git FIRST. Without this, the
+    // agent can lose its memory of having made the edits and subsequently
+    // re-do or undo work that's still in the filesystem but absent from
+    // its compacted context. Runs before transcript archiving so even a
+    // crash during the archive step keeps the safety commits.
+    try {
+      const autosave = await autoCommitDirtyWorktrees('pre-compact');
+      if (autosave.committed.length > 0 || autosave.failed.length > 0) {
+        log(
+          `autosave (pre-compact): committed=[${autosave.committed.join(',')}] failed=[${autosave.failed.join(',')}]`,
+        );
+      }
+    } catch (err) {
+      log(`autosave (pre-compact) threw: ${err instanceof Error ? err.message : String(err)}`);
+    }
 
     if (!transcriptPath || !fs.existsSync(transcriptPath)) {
       log('No transcript found for archiving');

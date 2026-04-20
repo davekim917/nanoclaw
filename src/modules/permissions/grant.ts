@@ -152,7 +152,11 @@ export async function handleGrantAccess(
   const callerIsGlobal = isOwner(callerId) || isGlobalAdmin(callerId);
   const callerIsScopedAdmin = isAdminOfAgentGroup(callerId, targetAgentGroupId);
   if (!callerIsGlobal && !callerIsScopedAdmin) {
-    log.info('grant_access denied', { callerId, targetAgentGroupId, authority: describeAuthority(callerId, targetAgentGroupId) });
+    log.info('grant_access denied', {
+      callerId,
+      targetAgentGroupId,
+      authority: describeAuthority(callerId, targetAgentGroupId),
+    });
     notifyAgent(session, `grant_access denied: you don't have authority over agent group \`${targetAgentGroupId}\`.`);
     return;
   }
@@ -163,7 +167,10 @@ export async function handleGrantAccess(
 
   const targetUserId = resolveTargetUserId(rawUser, session);
   if (!targetUserId) {
-    notifyAgent(session, `grant_access failed: could not resolve \`${rawUser}\` to a user id (needs a namespaced id, a platform mention, or a bare handle).`);
+    notifyAgent(
+      session,
+      `grant_access failed: could not resolve \`${rawUser}\` to a user id (needs a namespaced id, a platform mention, or a bare handle).`,
+    );
     return;
   }
 
@@ -174,7 +181,12 @@ export async function handleGrantAccess(
       notifyAgent(session, `\`${targetUserId}\` already has access to \`${targetAgentGroupId}\`.`);
       return;
     }
-    addMember({ user_id: targetUserId, agent_group_id: targetAgentGroupId, added_by: callerId, added_at: new Date().toISOString() });
+    addMember({
+      user_id: targetUserId,
+      agent_group_id: targetAgentGroupId,
+      added_by: callerId,
+      added_at: new Date().toISOString(),
+    });
     log.info('grant_access: member added', { callerId, targetUserId, targetAgentGroupId });
     notifyAgent(session, `Granted member access: \`${targetUserId}\` → \`${targetAgentGroupId}\`.`);
     return;
@@ -287,9 +299,7 @@ export async function handleListAccess(
   const lines: string[] = [`Access for \`${targetAgentGroupId}\`:`];
   lines.push(`  owners (global): ${owners.length ? owners.map((r) => r.user_id).join(', ') : '(none)'}`);
   lines.push(`  global admins: ${globalAdmins.length ? globalAdmins.map((r) => r.user_id).join(', ') : '(none)'}`);
-  lines.push(
-    `  scoped admins: ${scopedAdmins.length ? scopedAdmins.map((r) => r.user_id).join(', ') : '(none)'}`,
-  );
+  lines.push(`  scoped admins: ${scopedAdmins.length ? scopedAdmins.map((r) => r.user_id).join(', ') : '(none)'}`);
   lines.push(`  members: ${members.length ? members.map((m) => m.user_id).join(', ') : '(none)'}`);
   // Authority + role are distinct — a user with `getUserRoles` that are all
   // global owner/admin shows up in roles above but not members. Document

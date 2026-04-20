@@ -5,6 +5,7 @@ import { touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
 import { getStoredSessionId, setStoredSessionId, clearStoredSessionId } from './db/session-state.js';
 import { formatMessages, extractRouting, categorizeMessage, type RoutingContext } from './formatter.js';
 import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
+import { autoCommitDirtyWorktrees } from './worktree-autosave.js';
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
@@ -219,6 +220,18 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         thread_id: routing.threadId,
         content: JSON.stringify({ text: `Error: ${errMsg}` }),
       });
+    }
+
+    // Per-turn safety net: checkpoint any uncommitted worktree edits so the
+    // agent's work survives compaction or a later container kill even if
+    // the agent forgot to commit. Mirrors v1's turn-end auto-commit pattern
+    // (src/container-runner.ts cleanupThreadWorkspace, pre-fork). Never
+    // throws; logs inside autoCommitDirtyWorktrees.
+    const autosave = await autoCommitDirtyWorktrees('turn end');
+    if (autosave.committed.length > 0 || autosave.failed.length > 0) {
+      log(
+        `autosave: committed=[${autosave.committed.join(',')}] failed=[${autosave.failed.join(',')}] skipped=${autosave.skipped.length}`,
+      );
     }
 
     markCompleted(processingIds);
