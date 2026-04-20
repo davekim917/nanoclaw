@@ -308,6 +308,81 @@ function createBlockSnowflakeConnectorHook(): HookCallback {
   };
 }
 
+// ── Email gate ──
+// Intercept `gws gmail +send|reply|reply-all|forward` and require admin
+// approval before the command runs. Scheduled-task contexts bypass
+// (automated email workflows shouldn't prompt every time). --dry-run /
+// --draft also bypass since nothing actually sends.
+//
+// Approval round-trip uses the existing send_file delivery-ack surface:
+// write a system action with action='request_bash_gate' to outbound.db;
+// host's bash-gate module calls requestApproval and writes the decision
+// back to inbound.db's `delivered` table; we poll it via
+// awaitDeliveryAck. Up to 30 minutes.
+const GWS_EMAIL_SEND_RE = /\bgws\s+gmail\s+\+(?:send|reply|reply-all|forward)\b/;
+const EMAIL_BYPASS_RE = /\s--(?:dry-run|draft)\b/;
+
+function createEmailGateHook(): HookCallback {
+  return async (input) => {
+    const pre = input as PreToolUseHookInput;
+    const command = (pre.tool_input as { command?: string })?.command;
+    if (!command || !GWS_EMAIL_SEND_RE.test(command)) return {};
+
+    // Bypass on --dry-run / --draft, but only in the segment containing
+    // the gws command — a later bypass flag in a piped cleanup step must
+    // not silently suppress the gate for the sending command.
+    const segments = command.split(/[;&|]\s*|\s*&&\s*|\s*\|\|\s*|\n/);
+    const gwsSegment = segments.find((s) => GWS_EMAIL_SEND_RE.test(s)) ?? command;
+    if (EMAIL_BYPASS_RE.test(gwsSegment)) return {};
+
+    // Scheduled tasks intentionally bypass — v1 also did this so
+    // automated email reports aren't prompted every run.
+    if (process.env.NANOCLAW_IS_SCHEDULED_TASK === '1') return {};
+
+    const toMatch = gwsSegment.match(/--to\s+['"]?([^\s'"]+)/);
+    const subjectMatch =
+      gwsSegment.match(/--subject\s+['"]([^'"]+)['"]/) ?? gwsSegment.match(/--subject\s+(\S+)/);
+    const to = toMatch?.[1] ?? 'unknown recipient';
+    const subject = subjectMatch?.[1] ?? '';
+    const action = command.match(/\+(\w[\w-]*)/)?.[1] ?? 'send';
+    const label = subject ? `Email ${action} to ${to}: "${subject}"` : `Email ${action} to ${to}`;
+
+    // Dynamic imports to avoid any risk of circular-import with the DB
+    // module graph during provider init.
+    const { writeMessageOut } = await import('../db/messages-out.js');
+    const { getSessionRouting } = await import('../db/session-routing.js');
+    const { awaitDeliveryAck } = await import('../db/delivery-acks.js');
+
+    const routing = getSessionRouting();
+    const requestId = `gate-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    writeMessageOut({
+      id: requestId,
+      kind: 'system',
+      platform_id: routing?.platform_id ?? null,
+      channel_type: routing?.channel_type ?? null,
+      thread_id: routing?.thread_id ?? null,
+      content: JSON.stringify({
+        action: 'request_bash_gate',
+        requestId,
+        label,
+        summary: `Approve email ${action}?`,
+        command: command.slice(0, 500),
+      }),
+    });
+
+    const ack = await awaitDeliveryAck(requestId, 30 * 60 * 1000);
+    if (!ack) {
+      return denyBash(`Email ${action} blocked: timed out waiting for admin approval. Do not retry — ask the user.`);
+    }
+    if (ack.status === 'delivered') {
+      return {};
+    }
+    return denyBash(
+      `Email ${action} blocked: ${ack.error ?? 'admin declined'}. Do not retry — acknowledge briefly.`,
+    );
+  };
+}
+
 // ── Block ad-hoc `git clone` outside /tmp ──
 // Agents must use the create_worktree / clone_repo MCP tools to land a
 // repo inside the managed worktree tree. Direct `git clone` into
@@ -513,6 +588,7 @@ export class ClaudeProvider implements AgentProvider {
                 createSanitizeBashHook(),
                 createBlockSnowflakeConnectorHook(),
                 createBlockGitCloneHook(),
+                createEmailGateHook(),
               ],
             },
           ],

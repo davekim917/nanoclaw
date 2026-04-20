@@ -24,3 +24,6 @@ import './agent-to-agent/index.js';
 import './self-mod/index.js';
 import './remote-control/index.js';
 import './channel-auto-wire/index.js';
+// Bash-gate depends on approvals (registers an approval handler) and on
+// the delivery action registry being up — both satisfied by the order above.
+import './bash-gate/index.js';
