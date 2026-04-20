@@ -18,6 +18,7 @@ import {
   extractRouting,
   categorizeMessage,
   parseModelEffortFlags,
+  stripInternalTags,
   type RoutingContext,
 } from './formatter.js';
 import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
@@ -25,7 +26,6 @@ import { autoCommitDirtyWorktrees } from './worktree-autosave.js';
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
-const IDLE_END_MS = 20_000; // End stream after 20s with no SDK events
 
 function log(msg: string): void {
   console.error(`[poll-loop] ${msg}`);
@@ -86,6 +86,19 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     }
 
     if (messages.length === 0) {
+      await sleep(POLL_INTERVAL_MS);
+      continue;
+    }
+
+    // Accumulate gate: if the batch contains only trigger=0 rows
+    // (context-only, router-stored under ignored_message_policy='accumulate'),
+    // don't wake the agent. Leave them `pending` — they'll ride along the
+    // next time a real trigger=1 message lands via this same getPendingMessages
+    // query. Without this gate, a warm container keeps processing
+    // (and potentially responding to) every accumulate-only batch, defeating
+    // the "store as context, don't engage" contract. Host-side countDueMessages
+    // gates the same way for wake-from-cold (see src/db/session-db.ts).
+    if (!messages.some((m) => m.trigger === 1)) {
       await sleep(POLL_INTERVAL_MS);
       continue;
     }
@@ -415,9 +428,13 @@ interface QueryResult {
 async function processQuery(query: AgentQuery, routing: RoutingContext): Promise<QueryResult> {
   let queryContinuation: string | undefined;
   let done = false;
-  let lastEventTime = Date.now();
 
-  // Concurrent polling: push follow-ups, checkpoint WAL, detect idle
+  // Concurrent polling: push follow-ups into the active query as they arrive.
+  // We do NOT force-end the stream on silence — keeping the query open is
+  // strictly cheaper than close+reopen (no cold prompt cache, no reconnect).
+  // Stream liveness is decided host-side via the heartbeat file + processing
+  // claim age (see src/host-sweep.ts); if something is truly stuck, the host
+  // will kill the container and messages get reset to pending.
   const pollHandle = setInterval(() => {
     if (done) return;
 
@@ -444,19 +461,11 @@ async function processQuery(query: AgentQuery, routing: RoutingContext): Promise
       query.push(prompt);
 
       markCompleted(newIds);
-      lastEventTime = Date.now(); // new input counts as activity
-    }
-
-    // End stream when agent is idle: no SDK events and no pending messages
-    if (Date.now() - lastEventTime > IDLE_END_MS) {
-      log(`No SDK events for ${IDLE_END_MS / 1000}s, ending query`);
-      query.end();
     }
   }, ACTIVE_POLL_INTERVAL_MS);
 
   try {
     for await (const event of query.events) {
-      lastEventTime = Date.now();
       handleEvent(event, routing);
       touchHeartbeat();
 
@@ -544,10 +553,7 @@ function dispatchResultText(text: string, routing: RoutingContext): void {
     scratchpadParts.push(text.slice(lastIndex));
   }
 
-  const scratchpad = scratchpadParts
-    .join('')
-    .replace(/<internal>[\s\S]*?<\/internal>/g, '')
-    .trim();
+  const scratchpad = stripInternalTags(scratchpadParts.join(''));
 
   // Single-destination shortcut: the agent wrote plain text — send to
   // the session's originating channel (from session_routing) if available,

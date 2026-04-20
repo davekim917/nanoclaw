@@ -11,7 +11,15 @@ import path from 'path';
 import { OneCLI } from '@onecli-sh/sdk';
 
 import { getHostCapabilities } from './capabilities.js';
-import { CONTAINER_IMAGE, DATA_DIR, GROUPS_DIR, IDLE_TIMEOUT, ONECLI_URL, TIMEZONE } from './config.js';
+import {
+  CONTAINER_IMAGE,
+  DATA_DIR,
+  GROUPS_DIR,
+  IDLE_TIMEOUT,
+  MAX_MESSAGES_PER_PROMPT,
+  ONECLI_URL,
+  TIMEZONE,
+} from './config.js';
 import { readContainerConfig, writeContainerConfig, type ContainerConfig } from './container-config.js';
 import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainer } from './container-runtime.js';
 import { getAgentGroup } from './db/agent-groups.js';
@@ -149,22 +157,12 @@ async function spawnContainer(session: Session): Promise<void> {
   // stdout is unused in v2 (all IO is via session DB)
   container.stdout?.on('data', () => {});
 
-  // Idle timeout: kill container after IDLE_TIMEOUT of no activity
-  let idleTimer = setTimeout(() => killContainer(session.id, 'idle timeout'), IDLE_TIMEOUT);
-
-  const resetIdle = () => {
-    clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => killContainer(session.id, 'idle timeout'), IDLE_TIMEOUT);
-  };
-
-  // Reset idle timer when the host detects new messages_out (called by delivery.ts)
-  const entry = activeContainers.get(session.id);
-  if (entry) {
-    (entry as { resetIdle?: () => void }).resetIdle = resetIdle;
-  }
+  // No host-side idle timeout. Stale/stuck detection is driven by the host
+  // sweep reading heartbeat mtime + processing_ack claim age + container_state
+  // (see src/host-sweep.ts). This avoids killing long-running legitimate work
+  // on a wall-clock timer.
 
   container.on('close', (code) => {
-    clearTimeout(idleTimer);
     activeContainers.delete(session.id);
     markContainerStopped(session.id);
     stopTypingRefresh(session.id);
@@ -172,18 +170,11 @@ async function spawnContainer(session: Session): Promise<void> {
   });
 
   container.on('error', (err) => {
-    clearTimeout(idleTimer);
     activeContainers.delete(session.id);
     markContainerStopped(session.id);
     stopTypingRefresh(session.id);
     log.error('Container spawn error', { sessionId: session.id, err });
   });
-}
-
-/** Reset the idle timer for a session's container (called when messages_out are delivered). */
-export function resetContainerIdleTimer(sessionId: string): void {
-  const entry = activeContainers.get(sessionId) as { resetIdle?: () => void } | undefined;
-  entry?.resetIdle?.();
 }
 
 /** Kill a container for a session. */
@@ -753,9 +744,7 @@ function buildMounts(
 
       const origConfig = path.join(snowflakeDir, 'config.toml');
       if (fs.existsSync(origConfig)) {
-        const configContent = fs
-          .readFileSync(origConfig, 'utf-8')
-          .replace(homePattern, '/home/node/.snowflake/');
+        const configContent = fs.readFileSync(origConfig, 'utf-8').replace(homePattern, '/home/node/.snowflake/');
         fs.writeFileSync(path.join(dest, 'config.toml'), configContent, { mode: 0o600 });
       }
 
@@ -935,6 +924,9 @@ async function buildContainerArgs(
   }
   args.push('-e', `NANOCLAW_AGENT_GROUP_ID=${agentGroup.id}`);
   args.push('-e', `NANOCLAW_AGENT_GROUP_NAME=${agentGroup.name}`);
+  // Cap on how many pending messages reach one prompt. Accumulated context
+  // (trigger=0 rows) rides along with wake-eligible rows up to this cap.
+  args.push('-e', `NANOCLAW_MAX_MESSAGES_PER_PROMPT=${MAX_MESSAGES_PER_PROMPT}`);
 
   // Claude Code behavior locks — duplicated from settings.json env block so
   // the values are set regardless of the SDK's settings-loading order.

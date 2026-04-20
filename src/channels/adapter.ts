@@ -5,20 +5,8 @@
  * Two patterns: native adapters (implement directly) or Chat SDK bridge (wrap a Chat SDK adapter).
  */
 
-/** Configuration for a registered conversation (messaging group + agent wiring). */
-export interface ConversationConfig {
-  platformId: string;
-  agentGroupId: string;
-  triggerPattern?: string; // regex string (for native channels)
-  requiresTrigger: boolean;
-  sessionMode: 'shared' | 'per-thread' | 'agent-shared';
-}
-
 /** Passed to the adapter at setup time. */
 export interface ChannelSetup {
-  /** Known conversations from central DB. */
-  conversations: ConversationConfig[];
-
   /** Called when an inbound message arrives from the platform. */
   onInbound(platformId: string, threadId: string | null, message: InboundMessage): void | Promise<void>;
 
@@ -35,6 +23,21 @@ export interface InboundMessage {
   kind: 'chat' | 'chat-sdk';
   content: unknown; // JS object — host will JSON.stringify before writing to session DB
   timestamp: string;
+  /**
+   * Platform-confirmed signal that this message is a mention of the bot.
+   *
+   * Set by adapters that know the platform's own mention semantics — e.g.
+   * the Chat SDK bridge sets it true from `onNewMention` / `onDirectMessage`
+   * and forwards `message.isMention` from `onSubscribedMessage`. Use this
+   * in the router instead of agent-name regex matching, which breaks on
+   * platforms where the mention text is the bot's platform username (e.g.
+   * Telegram's `@nanoclaw_v2_refactr_1_bot`) rather than the agent_group
+   * display name (e.g. `@Andy`).
+   *
+   * Adapters that don't set it (native / legacy) leave it undefined — the
+   * router falls back to text-match against agent_group_name.
+   */
+  isMention?: boolean;
 }
 
 /** A file attachment to deliver alongside a message. */
@@ -85,7 +88,17 @@ export interface ChannelAdapter {
   // Optional
   setTyping?(platformId: string, threadId: string | null): Promise<void>;
   syncConversations?(): Promise<ConversationInfo[]>;
-  updateConversations?(conversations: ConversationConfig[]): void;
+
+  /**
+   * Subscribe the bot to a thread so follow-up messages route via the
+   * platform's "subscribed message" path (onSubscribedMessage in Chat SDK).
+   * Called by the router when a mention-sticky wiring first engages in a
+   * thread. Idempotent: calling twice on the same thread is a no-op.
+   *
+   * Platforms without a subscription concept can omit this; the router
+   * treats absence as a no-op.
+   */
+  subscribe?(platformId: string, threadId: string): Promise<void>;
 
   /**
    * Open (or fetch) a DM with this user, returning the platform_id of the

@@ -64,7 +64,7 @@ import './channels/index.js';
 // append registry-based modules. Imported for side effects (registrations).
 import './modules/index.js';
 
-import type { ChannelAdapter, ChannelSetup, ConversationConfig } from './channels/adapter.js';
+import type { ChannelAdapter, ChannelSetup } from './channels/adapter.js';
 import { initChannelAdapters, teardownChannelAdapters, getChannelAdapter } from './channels/channel-registry.js';
 
 async function main(): Promise<void> {
@@ -87,9 +87,7 @@ async function main(): Promise<void> {
 
   // 3. Channel adapters
   await initChannelAdapters((adapter: ChannelAdapter): ChannelSetup => {
-    const conversations = buildConversationConfigs(adapter.channelType);
     return {
-      conversations,
       onInbound(platformId, threadId, message) {
         routeInbound({
           channelType: adapter.channelType,
@@ -100,6 +98,7 @@ async function main(): Promise<void> {
             kind: message.kind,
             content: JSON.stringify(message.content),
             timestamp: message.timestamp,
+            isMention: message.isMention,
           },
         }).catch((err) => {
           log.error('Failed to route inbound message', { channelType: adapter.channelType, err });
@@ -199,28 +198,6 @@ async function main(): Promise<void> {
   });
 
   log.info('NanoClaw running');
-}
-
-/** Build ConversationConfig[] for a channel type from the central DB. */
-function buildConversationConfigs(channelType: string): ConversationConfig[] {
-  const groups = getMessagingGroupsByChannel(channelType);
-  const configs: ConversationConfig[] = [];
-
-  for (const mg of groups) {
-    const agents = getMessagingGroupAgents(mg.id);
-    for (const agent of agents) {
-      const triggerRules = agent.trigger_rules ? JSON.parse(agent.trigger_rules) : null;
-      configs.push({
-        platformId: mg.platform_id,
-        agentGroupId: agent.agent_group_id,
-        triggerPattern: triggerRules?.pattern,
-        requiresTrigger: triggerRules?.requiresTrigger ?? false,
-        sessionMode: agent.session_mode,
-      });
-    }
-  }
-
-  return configs;
 }
 
 /** Graceful shutdown. */

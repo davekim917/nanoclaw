@@ -72,9 +72,20 @@ install_deps() {
 
   cd "$PROJECT_ROOT"
 
-  # Enable corepack for pnpm
+  # Enable corepack so `pnpm` shim lands on PATH.
   log "Enabling corepack"
   corepack enable >> "$LOG_FILE" 2>&1 || true
+
+  # On Linux/WSL with system-wide Node (e.g. apt-installed to /usr/bin),
+  # corepack needs root to symlink /usr/bin/pnpm. Retry with sudo when pnpm
+  # isn't on PATH. macOS Homebrew installs land in a user-writable prefix,
+  # and a sudo retry there would create root-owned shims inside /opt/homebrew
+  # that later break brew — so the retry is Linux-only.
+  if ! command -v pnpm >/dev/null 2>&1 && [ "$PLATFORM" = "linux" ] \
+      && command -v sudo >/dev/null 2>&1; then
+    log "pnpm not on PATH after corepack enable — retrying with sudo"
+    sudo corepack enable >> "$LOG_FILE" 2>&1 || true
+  fi
 
   log "Running pnpm install --frozen-lockfile"
   if pnpm install --frozen-lockfile >> "$LOG_FILE" 2>&1; then

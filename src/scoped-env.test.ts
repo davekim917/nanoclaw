@@ -75,9 +75,9 @@ describe('scopedEnvKey', () => {
   });
 
   it('group fallback: throws when groupScope missing', () => {
-    expect(() =>
-      scopedEnvKey('RENDER_API_KEY', { scopes: [], isScoped: false, fallback: 'group' }),
-    ).toThrow(/groupScope required/);
+    expect(() => scopedEnvKey('RENDER_API_KEY', { scopes: [], isScoped: false, fallback: 'group' })).toThrow(
+      /groupScope required/,
+    );
   });
 });
 

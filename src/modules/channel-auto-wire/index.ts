@@ -119,6 +119,11 @@ export const resolver: UnwiredChannelResolverFn = (event, mg) => {
     return [];
   }
 
+  // v2 engage model: DMs (threadId=null) use pattern='.' (always respond);
+  // group chats are always @mentions, use mention mode.
+  const engageMode: MessagingGroupAgent['engage_mode'] = event.threadId === null ? 'pattern' : 'mention';
+  const engagePattern = engageMode === 'pattern' ? '.' : null;
+
   const sessionMode = resolveDefaultSessionMode(event.channelType);
 
   // Relax the unknown_sender_policy if one is configured for this
@@ -144,8 +149,10 @@ export const resolver: UnwiredChannelResolverFn = (event, mg) => {
     id: newId(),
     messaging_group_id: mg.id,
     agent_group_id: agentGroup.id,
-    trigger_rules: null,
-    response_scope: 'all',
+    engage_mode: engageMode,
+    engage_pattern: engagePattern,
+    sender_scope: 'all',
+    ignored_message_policy: 'drop',
     session_mode: sessionMode,
     priority: 0,
     default_model: null,

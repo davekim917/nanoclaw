@@ -13,8 +13,8 @@ import type { Migration } from './index.js';
  * Both nullable — absence falls through to per-agent-group
  * (container.json) → host env → hardcoded default.
  */
-export const migration011: Migration = {
-  version: 11,
+export const migration014: Migration = {
+  version: 14,
   name: 'channel-defaults',
   up: (db: Database.Database) => {
     const cols = new Set(

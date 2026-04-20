@@ -88,11 +88,7 @@ export function scopedEnvKey(
   return `${prefix}_${opts.groupScope.toUpperCase()}`;
 }
 
-export function normalizeScopedSecret(
-  secrets: Record<string, string>,
-  scopedKey: string,
-  genericKey: string,
-): void {
+export function normalizeScopedSecret(secrets: Record<string, string>, scopedKey: string, genericKey: string): void {
   if (scopedKey !== genericKey && secrets[scopedKey]) {
     secrets[genericKey] = secrets[scopedKey];
     delete secrets[scopedKey];

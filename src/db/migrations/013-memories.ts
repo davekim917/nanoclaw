@@ -1,8 +1,8 @@
 import type Database from 'better-sqlite3';
 import type { Migration } from './index.js';
 
-export const migration010: Migration = {
-  version: 10,
+export const migration013: Migration = {
+  version: 13,
   name: 'memories',
   up: (db: Database.Database) => {
     db.exec(`

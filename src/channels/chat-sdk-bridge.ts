@@ -21,7 +21,7 @@ import { SqliteStateAdapter } from '../state-sqlite.js';
 import { registerWebhookAdapter } from '../webhook-server.js';
 import { getAskQuestionRender } from '../db/sessions.js';
 import { normalizeOptions, type NormalizedOption } from './ask-question.js';
-import type { ChannelAdapter, ChannelSetup, ConversationConfig, InboundMessage } from './adapter.js';
+import type { ChannelAdapter, ChannelSetup, InboundMessage } from './adapter.js';
 
 /** Adapter with optional gateway support (e.g., Discord). */
 interface GatewayAdapter extends Adapter {
@@ -78,18 +78,9 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
   let chat: Chat;
   let state: SqliteStateAdapter;
   let setupConfig: ChannelSetup;
-  let conversations: Map<string, ConversationConfig>;
   let gatewayAbort: AbortController | null = null;
 
-  function buildConversationMap(configs: ConversationConfig[]): Map<string, ConversationConfig> {
-    const map = new Map<string, ConversationConfig>();
-    for (const conv of configs) {
-      map.set(conv.platformId, conv);
-    }
-    return map;
-  }
-
-  async function messageToInbound(message: ChatMessage): Promise<InboundMessage> {
+  async function messageToInbound(message: ChatMessage, isMention: boolean): Promise<InboundMessage> {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const serialized = message.toJSON() as Record<string, any>;
 
@@ -149,6 +140,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       kind: 'chat-sdk',
       content: serialized,
       timestamp: message.metadata.dateSent.toISOString(),
+      isMention,
     };
   }
 
@@ -161,7 +153,6 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
 
     async setup(hostConfig: ChannelSetup) {
       setupConfig = hostConfig;
-      conversations = buildConversationMap(hostConfig.conversations);
 
       state = new SqliteStateAdapter();
 
@@ -173,23 +164,31 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         logger: process.env.CHAT_SDK_DEBUG ? 'debug' : 'silent',
       });
 
-      // Subscribed threads — forward all messages
+      // Four SDK dispatch paths — bridge just forwards. All per-wiring
+      // engage / accumulate / drop / subscribe decisions live in the host
+      // router (src/router.ts routeInbound / evaluateEngage). The bridge
+      // only resolves channel ids and sets the platform-confirmed isMention
+      // flag that routeInbound evaluates; the router calls back into
+      // bridge.subscribe(...) when a mention-sticky wiring engages.
+
+      // Subscribed threads — every message in a thread we've previously
+      // engaged. Carry the SDK's `message.isMention` through so mention-mode
+      // wirings still fire on in-thread mentions.
       chat.onSubscribedMessage(async (thread, message) => {
         const channelId = adapter.channelIdFromThreadId(thread.id);
-        await setupConfig.onInbound(channelId, thread.id, await messageToInbound(message));
+        await setupConfig.onInbound(channelId, thread.id, await messageToInbound(message, message.isMention === true));
       });
 
-      // @mention in unsubscribed thread — forward + subscribe
+      // @mention in an unsubscribed thread — SDK-confirmed bot mention.
       chat.onNewMention(async (thread, message) => {
         const channelId = adapter.channelIdFromThreadId(thread.id);
-        await setupConfig.onInbound(channelId, thread.id, await messageToInbound(message));
-        await thread.subscribe();
+        await setupConfig.onInbound(channelId, thread.id, await messageToInbound(message, true));
       });
 
-      // DMs — always forward + subscribe. Pass thread.id so sub-thread
-      // context carries through to delivery (Slack users can open threads
-      // inside a DM). The router collapses DM sub-threads to one session
-      // (is_group=0 short-circuits the per-thread escalation).
+      // DMs — by definition addressed to the bot. Thread id flows through
+      // so sub-thread context reaches delivery (Slack users can open threads
+      // inside a DM). Router collapses DM sub-threads to one session via
+      // is_group=0 short-circuit.
       chat.onDirectMessage(async (thread, message) => {
         const channelId = adapter.channelIdFromThreadId(thread.id);
         log.info('Inbound DM received', {
@@ -198,8 +197,22 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           sender: (message.author as any)?.fullName ?? (message.author as any)?.userId ?? 'unknown',
           threadId: thread.id,
         });
-        await setupConfig.onInbound(channelId, thread.id, await messageToInbound(message));
-        await thread.subscribe();
+        await setupConfig.onInbound(channelId, thread.id, await messageToInbound(message, true));
+      });
+
+      // Plain messages in unsubscribed threads.
+      //
+      // Chat SDK dispatch (handling-events.mdx §"Handler dispatch order") is
+      // exclusive: subscribed → onSubscribedMessage; unsubscribed+mention →
+      // onNewMention; unsubscribed+pattern-match → onNewMessage. Registering
+      // with `/./` lets the router see every plain message on every
+      // unsubscribed thread the bot can see. The router short-circuits via
+      // getMessagingGroupWithAgentCount (~1 DB read) for unwired channels,
+      // so forwarding every one is cheap enough to not need a bridge-side
+      // flood gate.
+      chat.onNewMessage(/./, async (thread, message) => {
+        const channelId = adapter.channelIdFromThreadId(thread.id);
+        await setupConfig.onInbound(channelId, thread.id, await messageToInbound(message, false));
       });
 
       // Handle button clicks (ask_user_question)
@@ -374,8 +387,13 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       return true;
     },
 
-    updateConversations(configs: ConversationConfig[]) {
-      conversations = buildConversationMap(configs);
+    async subscribe(_platformId: string, threadId: string) {
+      // Chat SDK's subscription state lives on the StateAdapter (not on the
+      // Chat instance itself). SqliteStateAdapter.subscribe is idempotent —
+      // a second call on an already-subscribed thread is a no-op. threadId
+      // is the SDK's thread id, which is what the router already has from
+      // the original inbound event.
+      await state.subscribe(threadId);
     },
   };
 
