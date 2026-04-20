@@ -15,6 +15,15 @@ const FILTERED_COMMANDS = new Set(['/help', '/login', '/logout', '/doctor', '/co
 
 const VALID_EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh']);
 
+// Model values accepted by `-m`/`-m1`. Strict allowlist to:
+// (a) prevent a DoS via `-m1 <nonsense>` that wedges future turns until
+//     an admin clears sticky state
+// (b) keep the surface small and explicit; the SDK accepts arbitrary
+//     strings so we can't rely on it to validate.
+// Aliases (opus/sonnet/haiku/etc.) + specific model IDs. Extend as new
+// Claude models land.
+const VALID_MODEL_RE = /^(?:opus|sonnet|haiku|default|claude-(?:opus|sonnet|haiku)-\d+-\d+(?:\[\dm\])?)$/;
+
 /**
  * Model/effort flags parsed from the start of an inbound text message.
  *
@@ -54,11 +63,11 @@ export function parseModelEffortFlags(text: string): ParsedFlags {
     rest = rest.slice(m[0].length);
     switch (flag) {
       case '-m':
-        if (value) out.turnModel = value;
+        if (value && VALID_MODEL_RE.test(value)) out.turnModel = value;
         break;
       case '-m1':
-        if (value) out.stickyModel = value;
-        else out.clearStickyModel = true;
+        if (value && VALID_MODEL_RE.test(value)) out.stickyModel = value;
+        else if (!value) out.clearStickyModel = true;
         break;
       case '-e':
         if (value && VALID_EFFORT_LEVELS.has(value)) out.turnEffort = value;

@@ -342,8 +342,28 @@ function buildMounts(
   const sessDir = sessionDir(agentGroup.id, session.id);
   const groupDir = path.resolve(GROUPS_DIR, agentGroup.folder);
 
-  // Session folder at /workspace (contains inbound.db, outbound.db, outbox/, .claude/)
+  // Session folder at /workspace (contains inbound.db, outbound.db, outbox/, .claude/).
+  //
+  // The session dir parent is mounted RW because the container legitimately
+  // writes: outbound.db (its own), outbox/<id>/ (file deliveries), and
+  // .heartbeat (liveness touch).
+  //
+  // inbound.db, however, is host-owned and MUST be unwritable from the
+  // container. Without this, a compromised agent could forge admin
+  // approvals by directly INSERT-ing into the `delivered` table, trivially
+  // bypassing the email-gate, send_file ack, and any future host→container
+  // signaling that rides on inbound.db. The file-level RO overlay below
+  // reuses the same host file; Docker applies mount rules in order, so the
+  // `:ro` on inbound.db overrides the parent mount's RW permission for
+  // that specific path.
+  //
+  // The SDK-level `readonly: true` open in container/agent-runner/src/db/
+  // connection.ts is belt and suspenders. The mount is the real boundary.
   mounts.push({ hostPath: sessDir, containerPath: '/workspace', readonly: false });
+  const inboundDbFile = path.join(sessDir, 'inbound.db');
+  if (fs.existsSync(inboundDbFile)) {
+    mounts.push({ hostPath: inboundDbFile, containerPath: '/workspace/inbound.db', readonly: true });
+  }
 
   // Agent group folder at /workspace/agent
   mounts.push({ hostPath: groupDir, containerPath: '/workspace/agent', readonly: false });

