@@ -286,6 +286,30 @@ function denyBash(reason: string) {
   };
 }
 
+// ── Self-approval block ──
+// The bootstrap/plugins/workflow plugin's block-destructive hook gates
+// destructive filesystem ops behind a file-based approval at
+// `.claude-destructive-gate`. This hook prevents the agent from bypassing
+// that gate by writing the approval file itself via Bash (`touch
+// .claude-destructive-gate`, `echo … > .claude-destructive-gate`, etc.).
+// Admin approval must come through the chat channel, not the agent's own
+// filesystem writes. v1 `createSelfApprovalBlockHook` equivalent.
+const SELF_APPROVAL_RE = /\.claude-destructive-gate/;
+
+function createSelfApprovalBlockHook(): HookCallback {
+  return async (input) => {
+    const pre = input as PreToolUseHookInput;
+    const command = (pre.tool_input as { command?: string })?.command;
+    if (!command) return {};
+    if (SELF_APPROVAL_RE.test(command)) {
+      return denyBash(
+        'Self-approval of destructive operation gates is not allowed. Approval must come from the user via the chat channel, not by writing .claude-destructive-gate yourself.',
+      );
+    }
+    return {};
+  };
+}
+
 // ── Block ad-hoc Python snowflake.connector ──
 // `snow` CLI is gated by destructive-operation controls (and scoped
 // credential mounts); the Python connector bypasses those. Only blocks
@@ -618,6 +642,7 @@ export class ClaudeProvider implements AgentProvider {
               // hooks run after and return deny if they match.
               hooks: [
                 createSanitizeBashHook(),
+                createSelfApprovalBlockHook(),
                 createBlockSnowflakeConnectorHook(),
                 createBlockGitCloneHook(),
                 createEmailGateHook(),
