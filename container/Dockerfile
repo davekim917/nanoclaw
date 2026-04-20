@@ -136,8 +136,19 @@ COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
 # ---- Workspace + permissions -------------------------------------------------
-RUN mkdir -p /workspace/group /workspace/global /workspace/extra && \
-    chown -R node:node /workspace && \
+# Remap the `node` user+group to UID/GID 1001 before any chowns so the
+# container's runtime UID matches the host's non-root user. Host-side
+# processes (setup scripts, group-init, systemd unit user) run as UID 1001,
+# and host-owned bind mounts — notably `.claude-shared/` at /home/node/.claude
+# — arrive in the container at UID 1001. Without this remap, the container's
+# `node` (UID 1000) can *read* those dirs under 755 perms but can't *write*,
+# which silently freezes Claude Code auto-memory and autodream pruning. The
+# base image's UID 1000 is arbitrary; no baked dir hard-codes it.
+ARG HOST_UID=1001
+ARG HOST_GID=1001
+RUN groupmod -g ${HOST_GID} node && usermod -u ${HOST_UID} -g ${HOST_GID} node && \
+    mkdir -p /workspace/group /workspace/global /workspace/extra && \
+    chown -R ${HOST_UID}:${HOST_GID} /workspace /home/node && \
     chmod 755 /home/node
 
 USER node
