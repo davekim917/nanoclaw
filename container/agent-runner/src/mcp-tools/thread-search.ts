@@ -7,6 +7,8 @@
  */
 import { Database } from 'bun:sqlite';
 
+import { findByName } from '../destinations.js';
+import { getSessionRouting } from '../db/session-routing.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
@@ -235,6 +237,144 @@ export const resolveThreadLinkTool: McpToolDefinition = {
   },
 };
 
-export const threadSearchTools: McpToolDefinition[] = [searchThreadsTool, resolveThreadLinkTool];
+/**
+ * Shared routing resolution: a caller can address a thread either by a
+ * destination name ("channel key") from the agent's destinations map, or
+ * by raw (channel_type, platform_id). If neither is given, fall back to
+ * the session's own routing — so the agent can say "read this thread"
+ * and get the current conversation's transcript.
+ */
+function resolveRouting(args: {
+  channel?: unknown;
+  channel_type?: unknown;
+  platform_id?: unknown;
+}): { channelType: string; platformId: string; channelName: string | null } | string {
+  const channelName = typeof args.channel === 'string' ? args.channel.trim() : '';
+  if (channelName) {
+    const dest = findByName(channelName);
+    if (!dest) return `destination ${JSON.stringify(channelName)} not found in this session's map`;
+    if (dest.type !== 'channel' || !dest.channelType || !dest.platformId) {
+      return `destination ${JSON.stringify(channelName)} is not a channel (type=${dest.type})`;
+    }
+    return { channelType: dest.channelType, platformId: dest.platformId, channelName: dest.displayName };
+  }
+  const ct = typeof args.channel_type === 'string' ? args.channel_type : '';
+  const pid = typeof args.platform_id === 'string' ? args.platform_id : '';
+  if (ct && pid) return { channelType: ct, platformId: pid, channelName: null };
+  // Fall back to current session routing.
+  try {
+    const r = getSessionRouting();
+    if (!r.channel_type || !r.platform_id) {
+      return 'session routing incomplete (missing channel_type or platform_id)';
+    }
+    return { channelType: r.channel_type, platformId: r.platform_id, channelName: null };
+  } catch {
+    return 'no channel/channel_type+platform_id provided and session routing unavailable';
+  }
+}
+
+function renderTranscript(rows: TranscriptRow[], header: string): string {
+  if (rows.length === 0) return 'No archived messages found.';
+  const transcript = rows
+    .map((r) => `[${r.sent_at}] ${r.sender_name ?? r.role}: ${r.text}`)
+    .join('\n');
+  return `${header}\n\n${transcript}`;
+}
+
+export const readThreadTool: McpToolDefinition = {
+  tool: {
+    name: 'read_thread',
+    description:
+      'Read the archived transcript of a specific thread. Pass either `channel` (a destination name from your destinations map) or `channel_type` + `platform_id` to scope the lookup. Omit both to read from the current session. Pass `thread_id` to pin a specific thread, otherwise the most recent thread in that channel is returned.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        channel: { type: 'string', description: 'Destination name from the agent\'s destinations map.' },
+        channel_type: { type: 'string', description: 'Raw channel_type (e.g. "slack", "discord"). Used with platform_id.' },
+        platform_id: { type: 'string', description: 'Raw platform id. Used with channel_type.' },
+        thread_id: { type: 'string', description: 'Specific thread id to load. If omitted, loads the most recent thread in the channel.' },
+        limit: { type: 'number', description: 'Max messages to return (default 200, max 500).' },
+      },
+    },
+  },
+  handler: async (args: Record<string, unknown>) => {
+    const routing = resolveRouting(args);
+    if (typeof routing === 'string') return err(routing);
+    const threadId = typeof args.thread_id === 'string' && args.thread_id.trim() ? args.thread_id.trim() : null;
+    const limit = typeof args.limit === 'number' ? Math.min(Math.max(1, args.limit), 500) : 200;
+
+    const db = getDb();
+    if (!db) return err('archive database not mounted');
+    const ag = currentAgentGroupId();
+    if (!ag) return err('agent group id unavailable');
+
+    let resolvedThreadId = threadId;
+    if (!resolvedThreadId) {
+      try {
+        const latest = db
+          .prepare(
+            `SELECT thread_id FROM messages_archive
+             WHERE agent_group_id = ? AND channel_type = ? AND platform_id = ?
+             ORDER BY sent_at DESC LIMIT 1`,
+          )
+          .get(ag, routing.channelType, routing.platformId) as { thread_id: string | null } | undefined;
+        resolvedThreadId = latest?.thread_id ?? null;
+      } catch (e) {
+        return err(`thread lookup failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    }
+
+    let rows: TranscriptRow[];
+    try {
+      rows = db
+        .prepare(
+          `SELECT role, sender_name, text, sent_at, channel_name
+           FROM messages_archive
+           WHERE agent_group_id = ?
+             AND channel_type = ?
+             AND platform_id = ?
+             AND (thread_id = ? OR (thread_id IS NULL AND ? IS NULL))
+           ORDER BY sent_at ASC
+           LIMIT ?`,
+        )
+        .all(ag, routing.channelType, routing.platformId, resolvedThreadId, resolvedThreadId, limit) as TranscriptRow[];
+    } catch (e) {
+      return err(`lookup failed: ${e instanceof Error ? e.message : String(e)}`);
+    }
+
+    const channelLabel = routing.channelName ?? `${routing.channelType}:${routing.platformId}`;
+    const threadLabel = resolvedThreadId ? ` thread=${resolvedThreadId}` : '';
+    const header = `Thread transcript from ${channelLabel}${threadLabel} (${rows.length} message(s)):`;
+    return ok(renderTranscript(rows, header));
+  },
+};
+
+export const readThreadByKeyTool: McpToolDefinition = {
+  tool: {
+    name: 'read_thread_by_key',
+    description:
+      'Read the most recent thread from a channel, addressed by its destination name (the `name` field in the agent\'s destinations map — e.g. "eng-ops"). Convenience wrapper around read_thread when you only know the human name of the channel.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        key: { type: 'string', description: 'Destination name (key) from the destinations map.' },
+        limit: { type: 'number', description: 'Max messages to return (default 200, max 500).' },
+      },
+      required: ['key'],
+    },
+  },
+  handler: async (args: Record<string, unknown>) => {
+    const key = typeof args.key === 'string' ? args.key.trim() : '';
+    if (!key) return err('key is required');
+    return readThreadTool.handler({ channel: key, limit: args.limit });
+  },
+};
+
+export const threadSearchTools: McpToolDefinition[] = [
+  searchThreadsTool,
+  resolveThreadLinkTool,
+  readThreadTool,
+  readThreadByKeyTool,
+];
 
 registerTools(threadSearchTools);
