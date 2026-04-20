@@ -15,6 +15,7 @@ import { migration012 } from './012-channel-registration.js';
 // Dave's migrations (renamed to 013/014 to avoid collisions):
 import { migration013 } from './013-memories.js';
 import { migration014 } from './014-channel-defaults.js';
+import { migration015 } from './015-backlog.js';
 
 export interface Migration {
   version: number;
@@ -35,6 +36,7 @@ const migrations: Migration[] = [
   migration012,
   migration013,
   migration014,
+  migration015,
 ];
 
 export function runMigrations(db: Database.Database): void {

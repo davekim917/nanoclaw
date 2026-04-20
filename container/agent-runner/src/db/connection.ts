@@ -233,3 +233,17 @@ export function closeSessionDb(): void {
 export function getSessionDb(): Database {
   return getInboundDb();
 }
+
+/** Central DB — read-only from the container. Mounted at /workspace/central.db. */
+let _central: Database | null = null;
+const CENTRAL_DB_PATH = '/workspace/central.db';
+
+export function getCentralDb(): Database | null {
+  if (_central) return _central;
+  try {
+    _central = new Database(CENTRAL_DB_PATH, { readonly: true });
+    return _central;
+  } catch {
+    return null;
+  }
+}

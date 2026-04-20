@@ -27,6 +27,8 @@ import './channel-auto-wire/index.js';
 // Bash-gate depends on approvals (registers an approval handler) and on
 // the delivery action registry being up — both satisfied by the order above.
 import './bash-gate/index.js';
+// Backlog + ship-log delivery action handlers (add_ship_log, add/update/delete_backlog_item).
+import './backlog/index.js';
 // Channel-config registers delivery actions for set_channel_model /
 // set_channel_effort. Depends on permissions (for isAdminOfAgentGroup).
 import './channel-config/index.js';

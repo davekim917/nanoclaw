@@ -402,6 +402,14 @@ function buildMounts(
     mounts.push({ hostPath: archivePath, containerPath: '/workspace/archive.db', readonly: true });
   }
 
+  // Central DB at /workspace/central.db (read-only). Powers backlog + ship-log
+  // MCP tools so the container can list/query without going through delivery.
+  // Never write from the container — use system actions for mutations.
+  const centralDbPath = path.join(DATA_DIR, 'v2.db');
+  if (fs.existsSync(centralDbPath)) {
+    mounts.push({ hostPath: centralDbPath, containerPath: '/workspace/central.db', readonly: true });
+  }
+
   // Per-group agent-runner source at /app/src (initialized once at group
   // creation, persistent thereafter — agents can modify their runner)
   const groupRunnerDir = path.join(DATA_DIR, 'v2-sessions', agentGroup.id, 'agent-runner-src');

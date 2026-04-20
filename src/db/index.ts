@@ -42,3 +42,21 @@ export {
   deletePendingApproval,
   getPendingApprovalsByAction,
 } from './sessions.js';
+export {
+  addShipLogEntry,
+  getShipLog,
+  getShipLogPaginated,
+  getShipLogSince,
+  getBacklogItemById,
+  addBacklogItem,
+  updateBacklogItem,
+  deleteBacklogItem,
+  getBacklog,
+  getBacklogPaginated,
+  getBacklogResolvedSince,
+  getCommitDigestState,
+  upsertCommitDigestState,
+  type ShipLogEntry,
+  type BacklogItem,
+  type CommitDigestState,
+} from './backlog.js';

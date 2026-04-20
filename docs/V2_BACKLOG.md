@@ -8,11 +8,13 @@ All items already have `tools` config precedent in v1 and are feature-scope
 (not correctness regressions). The migration is operational without them.
 
 When the sqlite-backed backlog MCP ships (item 2 below), migrate these rows
-into it and delete the file.
+into it. The file is kept as an onboarding reference for future agents.
 
 ---
 
-## 1. `render_diagram` MCP tool
+## 1. `render_diagram` MCP tool ✅
+
+**SHIPPED** (2026-04-20). Run `./container/build.sh` to install mmdc in the agent image.
 
 **What v1 did:** accepted Mermaid / HTML / SVG input, rendered to PNG via
 headless chromium inside the container, delivered via `send_file`.
@@ -38,30 +40,19 @@ into chat today; only affects image-output channels.
 
 ---
 
-## 2. Ship-log + backlog tracker (sqlite-backed)
+## 2. Ship-log + backlog tracker (sqlite-backed) ✅
 
-**What v1 did:** two tables (`ship_log`, `backlog_items`) + MCP tools for
-add/update/delete/list/activity summary + commit scanner. Dave's daily-driver
-for scheduled tasks. See v1 `src/db.ts`, `src/ipc.ts` for schema + handlers.
+**SHIPPED** (2026-04-20).
 
-**Why deferred:** new subsystem (schema + 7 MCP tools). Isolated though —
-doesn't touch any existing code path.
-
-**How to implement:**
-1. New central DB tables in `src/db/schema.ts` + migration under
-   `src/db/migrations/`:
-   - `ship_log(id, agent_group_id, title, body, commit_sha, shipped_at, created_at)`
-   - `backlog_items(id, agent_group_id, title, body, status, priority, created_at, updated_at, completed_at)`
-2. Accessors in `src/db/` (mirror v1 patterns).
-3. MCP tools in `container/agent-runner/src/mcp-tools/backlog.ts`:
-   `add_ship_log`, `add_backlog_item`, `update_backlog_item`,
-   `delete_backlog_item`, `list_backlog`, `get_activity_summary`,
-   `scan_commits` (reads git log in /workspace/agent). Each emits a system
-   action to outbound.db; host-side delivery-action handler mutates the DB.
-4. Host-side module at `src/modules/backlog/index.ts` that registers the
-   delivery actions (pattern: channel-config module).
-
-**Est:** ~2hr.
+Files:
+- `src/db/backlog.ts` — all accessors for ship_log, backlog_items, commit_digest_state
+- `src/db/migrations/015-backlog.ts` — central DB tables
+- `src/modules/backlog/index.ts` — delivery action handlers (add_ship_log, add/update/delete_backlog_item)
+- `container/agent-runner/src/mcp-tools/backlog.ts` — 7 MCP tools
+- `container/agent-runner/src/db/connection.ts` — added `getCentralDb()` for read access
+- `src/container-runner.ts` — mounts v2.db read-only at `/workspace/central.db`
+- `scripts/migrate-backlog-shiplog.ts` — v1 data migration script
+- `scripts/migrate-backlog-shiplog.ts` run: 26 backlog + 146 ship_log + 53 digest state rows migrated
 
 ---
 

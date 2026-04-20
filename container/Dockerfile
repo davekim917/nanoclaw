@@ -25,6 +25,7 @@ ARG AGENT_BROWSER_VERSION=latest
 ARG VERCEL_VERSION=latest
 ARG GITNEXUS_VERSION=latest
 ARG BUN_VERSION=1.3.12
+ARG MMDC_VERSION=2.16.0
 
 # ---- System dependencies -----------------------------------------------------
 # tini: correct PID 1 / signal forwarding so outbound.db writes finalize on
@@ -86,12 +87,15 @@ RUN python3 -m venv "${DATA_TOOLS_VENV}" \
         dbt-snowflake \
         snowflake-cli-labs
 
-# Chromium path for agent-browser / Playwright consumers
+# Chromium path for agent-browser / Playwright / mmdc consumers
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 # Belt-and-braces: prevent Playwright's postinstall from downloading its own
 # ~300MB Chromium. We've already installed the system one above.
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+# mmdc reuses the system Chromium instead of downloading its own.
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+ENV PUPPETEER_SKIP_DOWNLOAD=1
 
 # ---- Bun runtime -------------------------------------------------------------
 # Install via the official script (handles multi-arch detection), then move
@@ -114,7 +118,8 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
         "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
         "agent-browser@${AGENT_BROWSER_VERSION}" \
         "vercel@${VERCEL_VERSION}" \
-        "gitnexus@${GITNEXUS_VERSION}"
+        "gitnexus@${GITNEXUS_VERSION}" \
+        "@mermaid-js/mermaid-cli@${MMDC_VERSION}"
 
 # ---- agent-runner ------------------------------------------------------------
 WORKDIR /app
