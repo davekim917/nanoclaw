@@ -12,6 +12,7 @@ import { runMigrations } from './db/migrations/index.js';
 import { registerSecretsFromEnv } from './secret-scrubber.js';
 import { getMessagingGroupsByChannel, getMessagingGroupAgents } from './db/messaging-groups.js';
 import { ensureContainerRuntimeRunning, cleanupOrphans } from './container-runtime.js';
+import { stopAllContainers } from './container-runner.js';
 import {
   getDeliveryAdapter,
   setDeliveryAdapter,
@@ -238,6 +239,14 @@ async function shutdown(signal: string): Promise<void> {
   stopPluginUpdater();
   await stopDiscordSlashCommands();
   await teardownChannelAdapters();
+  // Synchronously stop agent containers before exit. Without this, child
+  // subprocesses linger in the cgroup and systemd TimeoutStopSec stalls
+  // every restart. Matches v1's GroupQueue.shutdown semantics.
+  try {
+    await stopAllContainers();
+  } catch (err) {
+    log.error('stopAllContainers threw', { err });
+  }
   process.exit(0);
 }
 

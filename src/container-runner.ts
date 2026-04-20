@@ -178,6 +178,63 @@ export function killContainer(sessionId: string, reason: string): void {
 }
 
 /**
+ * Stop every active container synchronously at host shutdown.
+ *
+ * Load-bearing: without this, child container subprocesses linger in the
+ * cgroup after the parent exits and systemd stalls for `TimeoutStopSec`
+ * (default 90s) on every restart before SIGKILLing them. v1 wired this
+ * into `GroupQueue.shutdown`; v2 lost it during the v1→v2 rewrite and the
+ * host lingers similarly.
+ *
+ * Issues `docker stop` (SIGTERM then docker's own timeout → SIGKILL) to
+ * every tracked container in parallel, waits for their close events up
+ * to `gracePeriodMs`, then hard-kills anything still alive.
+ */
+export async function stopAllContainers(gracePeriodMs: number = 10_000): Promise<void> {
+  const entries = Array.from(activeContainers.entries());
+  if (entries.length === 0) return;
+  log.info('Stopping all containers', { count: entries.length, gracePeriodMs });
+  const exits = entries.map(([sessionId, entry]) => {
+    const exited = new Promise<void>((resolve) => {
+      if (entry.process.exitCode !== null) {
+        resolve();
+        return;
+      }
+      entry.process.once('close', () => resolve());
+    });
+    try {
+      stopContainer(entry.containerName);
+    } catch (err) {
+      log.warn('stopContainer threw; falling back to SIGKILL', { sessionId, err });
+      try {
+        entry.process.kill('SIGKILL');
+      } catch {
+        // process already gone — ignore
+      }
+    }
+    return exited;
+  });
+  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<void>((resolve) => {
+    timeoutHandle = setTimeout(resolve, gracePeriodMs);
+  });
+  await Promise.race([Promise.all(exits).then(() => undefined), timeout]);
+  if (timeoutHandle) clearTimeout(timeoutHandle);
+  // Hard-kill anything still tracked after the grace period.
+  for (const [sessionId, entry] of activeContainers.entries()) {
+    log.warn('Container did not exit within grace period; SIGKILL', {
+      sessionId,
+      containerName: entry.containerName,
+    });
+    try {
+      entry.process.kill('SIGKILL');
+    } catch {
+      // already gone
+    }
+  }
+}
+
+/**
  * Resolve a host env var value, folder-scoped.
  *
  * Lookup order:
@@ -496,6 +553,10 @@ async function buildContainerArgs(
   // the values are set regardless of the SDK's settings-loading order.
   args.push('-e', 'CLAUDE_CODE_DISABLE_AUTO_MEMORY=0');
   args.push('-e', 'CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80');
+  // Lock the `opus` alias to 4.7 so SDK-lag can't silently downgrade a
+  // session to 4.6 (or whatever the upstream default happens to be). v1
+  // set this in the per-session settings.json env block; v2 bakes it here.
+  args.push('-e', 'ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-7');
 
   // GitHub token for git-over-HTTPS + `gh` CLI. Per-agent-group: resolves
   // from container.json `githubTokenEnv`, then from
