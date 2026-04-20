@@ -70,6 +70,23 @@ export interface ContainerConfig {
    * admin-level MCP tools (model management, etc.). Opt-in per group.
    */
   ollamaAdminTools?: boolean;
+
+  /**
+   * Per-group default model when the agent uses the bare `opus` alias.
+   * Resolves the SDK's opus-alias short-circuit ANTHROPIC_DEFAULT_OPUS_MODEL.
+   * Overrides the host-env / hardcoded default. Per-session `-m <model>`
+   * flags still take precedence. Example: `claude-opus-4-7` for a group
+   * that wants 4.7 while the install-wide default is 4.6.
+   */
+  defaultModel?: string;
+
+  /**
+   * Per-group default reasoning effort when the agent doesn't pass
+   * `-e <level>`. One of 'low' | 'medium' | 'high' | 'xhigh'. Overrides
+   * the host-env / hardcoded default. Per-session `-e <level>` flags
+   * still take precedence.
+   */
+  defaultEffort?: 'low' | 'medium' | 'high' | 'xhigh';
 }
 
 function emptyConfig(): ContainerConfig {
@@ -107,6 +124,8 @@ export function readContainerConfig(folder: string): ContainerConfig {
       excludePlugins: raw.excludePlugins,
       gitnexusInjectAgentsMd: raw.gitnexusInjectAgentsMd,
       ollamaAdminTools: raw.ollamaAdminTools,
+      defaultModel: raw.defaultModel,
+      defaultEffort: raw.defaultEffort,
     };
   } catch (err) {
     console.error(`[container-config] failed to parse ${p}: ${String(err)}`);

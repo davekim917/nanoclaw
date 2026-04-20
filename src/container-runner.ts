@@ -615,15 +615,18 @@ async function buildContainerArgs(
   // override. Short aliases (opus46, opus4-7, etc.) are in the flag
   // parser's MODEL_ALIAS_MAP — independent of these defaults.
   //
+  // Precedence: per-group container.json → host env → hardcoded fallback.
   // ANTHROPIC_DEFAULT_OPUS_MODEL is the SDK's opus-alias resolver
   // short-circuit: whatever string is here gets sent to the API
   // verbatim when the agent or a subagent uses the bare `opus` alias.
-  // Fallback default 'claude-opus-4-6[1m]' keeps sessions on the 1M
-  // context variant rather than letting SDK-lag silently downgrade.
-  const defaultOpusModel = process.env.ANTHROPIC_DEFAULT_OPUS_MODEL ?? 'claude-opus-4-6[1m]';
+  // Fallback 'claude-opus-4-6[1m]' keeps sessions on the 1M context
+  // variant rather than letting SDK-lag silently downgrade.
+  const defaultOpusModel =
+    containerConfig.defaultModel ?? process.env.ANTHROPIC_DEFAULT_OPUS_MODEL ?? 'claude-opus-4-6[1m]';
   args.push('-e', `ANTHROPIC_DEFAULT_OPUS_MODEL=${defaultOpusModel}`);
 
-  const defaultEffort = process.env.NANOCLAW_DEFAULT_EFFORT ?? 'high';
+  const defaultEffort =
+    containerConfig.defaultEffort ?? process.env.NANOCLAW_DEFAULT_EFFORT ?? 'high';
   args.push('-e', `CLAUDE_CODE_USE_EFFORT=${defaultEffort}`);
   args.push('-e', `CLAUDE_CODE_EFFORT_LEVEL=${defaultEffort}`);
   // v1 settings.json env block (src/container-runner.ts:1703-1709): SDK
