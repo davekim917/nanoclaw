@@ -108,7 +108,26 @@ async function spawnContainer(session: Session): Promise<void> {
   // OneCLI agent identifier is always the agent group id — stable across
   // sessions and reversible via getAgentGroup() for approval routing.
   const agentIdentifier = agentGroup.id;
-  const args = await buildContainerArgs(mounts, containerName, agentGroup, provider, contribution, agentIdentifier);
+
+  // Resolve per-channel (messaging_group_agents) default_model / default_effort
+  // so buildContainerArgs can apply them ABOVE the per-agent container.json
+  // defaults. Null/missing falls through. Agent-spawned sessions without a
+  // messaging_group (e.g. pure agent-to-agent) skip this lookup.
+  let channelDefaultModel: string | null = null;
+  let channelDefaultEffort: string | null = null;
+  if (session.messaging_group_id) {
+    const { getMessagingGroupAgentByPair } = await import('./db/messaging-groups.js');
+    const wiring = getMessagingGroupAgentByPair(session.messaging_group_id, agentGroup.id);
+    if (wiring) {
+      channelDefaultModel = wiring.default_model;
+      channelDefaultEffort = wiring.default_effort;
+    }
+  }
+
+  const args = await buildContainerArgs(mounts, containerName, agentGroup, provider, contribution, agentIdentifier, {
+    channelDefaultModel,
+    channelDefaultEffort,
+  });
 
   log.info('Spawning container', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
 
@@ -582,6 +601,7 @@ async function buildContainerArgs(
   provider: string,
   providerContribution: ProviderContainerContribution,
   agentIdentifier?: string,
+  channelDefaults?: { channelDefaultModel: string | null; channelDefaultEffort: string | null },
 ): Promise<string[]> {
   const args: string[] = ['run', '--rm', '--name', containerName];
 
@@ -615,18 +635,31 @@ async function buildContainerArgs(
   // override. Short aliases (opus46, opus4-7, etc.) are in the flag
   // parser's MODEL_ALIAS_MAP — independent of these defaults.
   //
-  // Precedence: per-group container.json → host env → hardcoded fallback.
+  // Precedence (most specific wins):
+  //   1. Per-session flag in chat (-m / -m1 / -e / -e1) — handled inside
+  //      the agent-runner's flag parser, not here.
+  //   2. Per-channel wiring (messaging_group_agents.default_model/effort)
+  //      — passed via channelDefaults when session has a messaging_group.
+  //   3. Per-agent container.json (defaultModel / defaultEffort) —
+  //      applies to every channel wired to this agent unless (2) overrides.
+  //   4. Host env (ANTHROPIC_DEFAULT_OPUS_MODEL / NANOCLAW_DEFAULT_EFFORT).
+  //   5. Hardcoded fallback 'claude-opus-4-6[1m]' / 'high'.
+  //
   // ANTHROPIC_DEFAULT_OPUS_MODEL is the SDK's opus-alias resolver
   // short-circuit: whatever string is here gets sent to the API
   // verbatim when the agent or a subagent uses the bare `opus` alias.
-  // Fallback 'claude-opus-4-6[1m]' keeps sessions on the 1M context
-  // variant rather than letting SDK-lag silently downgrade.
   const defaultOpusModel =
-    containerConfig.defaultModel ?? process.env.ANTHROPIC_DEFAULT_OPUS_MODEL ?? 'claude-opus-4-6[1m]';
+    channelDefaults?.channelDefaultModel ??
+    containerConfig.defaultModel ??
+    process.env.ANTHROPIC_DEFAULT_OPUS_MODEL ??
+    'claude-opus-4-6[1m]';
   args.push('-e', `ANTHROPIC_DEFAULT_OPUS_MODEL=${defaultOpusModel}`);
 
   const defaultEffort =
-    containerConfig.defaultEffort ?? process.env.NANOCLAW_DEFAULT_EFFORT ?? 'high';
+    channelDefaults?.channelDefaultEffort ??
+    containerConfig.defaultEffort ??
+    process.env.NANOCLAW_DEFAULT_EFFORT ??
+    'high';
   args.push('-e', `CLAUDE_CODE_USE_EFFORT=${defaultEffort}`);
   args.push('-e', `CLAUDE_CODE_EFFORT_LEVEL=${defaultEffort}`);
   // v1 settings.json env block (src/container-runner.ts:1703-1709): SDK

@@ -148,6 +148,8 @@ export const resolver: UnwiredChannelResolverFn = (event, mg) => {
     response_scope: 'all',
     session_mode: sessionMode,
     priority: 0,
+    default_model: null,
+    default_effort: null,
     created_at: new Date().toISOString(),
   };
 

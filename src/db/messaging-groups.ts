@@ -160,7 +160,12 @@ export function getMessagingGroupAgent(id: string): MessagingGroupAgent | undefi
 
 export function updateMessagingGroupAgent(
   id: string,
-  updates: Partial<Pick<MessagingGroupAgent, 'trigger_rules' | 'response_scope' | 'session_mode' | 'priority'>>,
+  updates: Partial<
+    Pick<
+      MessagingGroupAgent,
+      'trigger_rules' | 'response_scope' | 'session_mode' | 'priority' | 'default_model' | 'default_effort'
+    >
+  >,
 ): void {
   const fields: string[] = [];
   const values: Record<string, unknown> = { id };

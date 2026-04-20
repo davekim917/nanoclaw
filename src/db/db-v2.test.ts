@@ -182,6 +182,8 @@ describe('messaging group agents', () => {
     response_scope: 'all' as const,
     session_mode: 'shared' as const,
     priority: 0,
+    default_model: null,
+    default_effort: null,
     created_at: now(),
   });
 

@@ -204,6 +204,8 @@ describe('router', () => {
       response_scope: 'all',
       session_mode: 'shared',
       priority: 0,
+      default_model: null,
+      default_effort: null,
       created_at: now(),
     });
   });

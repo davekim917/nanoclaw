@@ -39,6 +39,10 @@ CREATE TABLE messaging_group_agents (
   response_scope     TEXT DEFAULT 'all',
   session_mode       TEXT DEFAULT 'shared',
   priority           INTEGER DEFAULT 0,
+  -- Per-channel defaults (migration 011). Nullable — absence falls
+  -- through to agent-group container.json → host env → hardcoded.
+  default_model      TEXT,
+  default_effort     TEXT,
   created_at         TEXT NOT NULL,
   UNIQUE(messaging_group_id, agent_group_id)
 );

@@ -75,6 +75,17 @@ export interface MessagingGroupAgent {
   response_scope: 'all' | 'triggered' | 'allowlisted';
   session_mode: 'shared' | 'per-thread' | 'agent-shared';
   priority: number;
+  /**
+   * Per-channel model override (this channel's conversations with this
+   * agent use this model by default). Null = fall through to the agent's
+   * container.json defaultModel, then host env, then hardcoded fallback.
+   */
+  default_model: string | null;
+  /**
+   * Per-channel effort override. One of 'low' | 'medium' | 'high' | 'xhigh'.
+   * Null = fall through to agent container.json → host env → hardcoded.
+   */
+  default_effort: string | null;
   created_at: string;
 }
 
