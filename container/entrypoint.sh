@@ -56,14 +56,31 @@ fi
 # gh CLI auth is skipped when org-scoping is active because gh's own auth
 # store (~/.config/gh/) is independent of git credential helpers and would
 # bypass the URL-scoped restriction.
+#
+# Implementation: the credential value is written to a standalone helper
+# script that reads the token from an env var at invocation time, NOT
+# interpolated into the shell/git-config literal. Prevents any injection
+# path via the token value (e.g. a token containing a single quote
+# breaking out of the shell string — unusual for GitHub PATs but defense
+# in depth is cheap).
 if [ -n "$GH_TOKEN" ]; then
   if [ -n "$GITHUB_ALLOWED_ORGS" ]; then
+    mkdir -p /tmp/bin
+    # Quoted heredoc — no expansion happens here; the script reads
+    # NANOCLAW_GH_TOKEN from the env when git invokes it.
+    cat > /tmp/bin/nanoclaw-git-creds <<'CREDS'
+#!/bin/bash
+echo "username=x-access-token"
+echo "password=${NANOCLAW_GH_TOKEN}"
+CREDS
+    chmod 0700 /tmp/bin/nanoclaw-git-creds
+    export NANOCLAW_GH_TOKEN="$GH_TOKEN"
+
     IFS=',' read -ra _gh_orgs <<< "$GITHUB_ALLOWED_ORGS"
     for _org in "${_gh_orgs[@]}"; do
       _org=$(echo "$_org" | tr -d ' ')
       [ -z "$_org" ] && continue
-      git config --global "credential.https://github.com/${_org}/.helper" \
-        '!f() { echo username=x-access-token; echo password='"$GH_TOKEN"'; }; f'
+      git config --global "credential.https://github.com/${_org}/.helper" '!/tmp/bin/nanoclaw-git-creds'
     done
     echo "[entrypoint] GitHub credentials scoped to orgs: $GITHUB_ALLOWED_ORGS" >&2
   elif command -v gh >/dev/null 2>&1; then

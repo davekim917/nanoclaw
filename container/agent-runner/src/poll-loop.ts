@@ -207,9 +207,18 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // Context-window recovery: session grew past the model's limit.
       // Clear the continuation AND retry the same prompt once with a
       // fresh session, mirroring v1's silent prompt_too_long auto-
-      // recovery. Without the in-turn retry, every future turn on this
-      // session would fail with the same error until the user manually
-      // /clear'd. Marker prefix tells the agent why it's starting blank.
+      // recovery (src/index.ts:2132-2199 — v1 also retried exactly once;
+      // a second failure surfaced to the user same as we do here).
+      //
+      // Gated on `continuation` because a freshly-started session can't
+      // be "too long" — if a user's first message is already over the
+      // limit (e.g. a huge paste), the error falls through to the
+      // isSessionInvalid branch (no retry) and lands as an error chat.
+      // Not ideal for that edge case, but the alternative (retrying
+      // without continuation) is what we'd do anyway, and the chat-error
+      // pattern makes the failure explicit to the user.
+      //
+      // Marker prefix tells the agent why it's starting blank.
       if (continuation && config.provider.isContextTooLong?.(err)) {
         log(`Context-too-long detected — clearing session and retrying once with fresh continuation`);
         continuation = undefined;
