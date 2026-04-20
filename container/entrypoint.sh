@@ -44,11 +44,31 @@ if [ -n "$RESIDENTIAL_PROXY_URL" ]; then
 fi
 
 # --- GitHub git auth ---
-# gh auth setup-git configures git's credential helper to return $GH_TOKEN
-# for github.com. Runs only when GH_TOKEN is set (container-runner sets it
-# when the host has a GitHub token resolved for this agent group).
-if [ -n "$GH_TOKEN" ] && command -v gh >/dev/null 2>&1; then
-  gh auth setup-git 2>/dev/null || true
+# When GITHUB_ALLOWED_ORGS is set, configure git's credential helper ONLY
+# for the listed orgs (comma-separated). Prevents a container with a broad
+# token from cloning/pushing outside the allowlisted organizations. v1's
+# URL-scoped credential-helper pattern, adapted to v2's env-driven config.
+#
+# Without GITHUB_ALLOWED_ORGS: fall back to `gh auth setup-git`, which
+# configures the helper globally for github.com. Matches v2's previous
+# behavior for installs that haven't opted into org-scoping yet.
+#
+# gh CLI auth is skipped when org-scoping is active because gh's own auth
+# store (~/.config/gh/) is independent of git credential helpers and would
+# bypass the URL-scoped restriction.
+if [ -n "$GH_TOKEN" ]; then
+  if [ -n "$GITHUB_ALLOWED_ORGS" ]; then
+    IFS=',' read -ra _gh_orgs <<< "$GITHUB_ALLOWED_ORGS"
+    for _org in "${_gh_orgs[@]}"; do
+      _org=$(echo "$_org" | tr -d ' ')
+      [ -z "$_org" ] && continue
+      git config --global "credential.https://github.com/${_org}/.helper" \
+        '!f() { echo username=x-access-token; echo password='"$GH_TOKEN"'; }; f'
+    done
+    echo "[entrypoint] GitHub credentials scoped to orgs: $GITHUB_ALLOWED_ORGS" >&2
+  elif command -v gh >/dev/null 2>&1; then
+    gh auth setup-git 2>/dev/null || true
+  fi
 fi
 
 # --- Render CLI workspace pre-config ---

@@ -286,12 +286,28 @@ const SCOPED_CREDENTIAL_VARS = [
   'SNOWFLAKE_DATABASE',
   'DBT_CLOUD_ACCOUNT_ID',
   'DBT_CLOUD_API_TOKEN',
+  // dbt Cloud email/password login path — v1 carried these; skills that
+  // use the email+password flow (not just Account-ID/API-Token) need them.
+  'DBT_CLOUD_EMAIL',
+  'DBT_CLOUD_PASSWORD',
+  'DBT_CLOUD_API_URL',
   'OPENAI_API_KEY',
   'BRAINTRUST_API_KEY',
   'EXA_API_KEY',
   'DEEPGRAM_API_KEY',
   'ELEVENLABS_API_KEY',
   'RESIDENTIAL_PROXY_URL',
+  // Omni API — required by the omni skill; absent → first call fails 401.
+  'OMNI_BASE_URL',
+  'OMNI_API_KEY',
+  // Railway CLI / API — `railway login` uses this token; absent → CLI hangs
+  // on interactive auth inside the container.
+  'RAILWAY_API_TOKEN',
+  // Browser-auth skill (Playwright geo-fenced login flows) — absent → login
+  // form can't be filled and the skill times out on the first call.
+  'BROWSER_AUTH_URL',
+  'BROWSER_AUTH_EMAIL',
+  'BROWSER_AUTH_PASSWORD',
 ];
 
 function resolveProviderContribution(
@@ -566,6 +582,14 @@ async function buildContainerArgs(
   if (ghToken) {
     args.push('-e', `GH_TOKEN=${ghToken}`);
     args.push('-e', `GITHUB_TOKEN=${ghToken}`);
+    // Optional URL-scoped credential allowlist. When set, entrypoint.sh
+    // configures git's credential helper to only return the token for the
+    // listed orgs (comma-separated), and skips the global `gh auth login`
+    // so gh's own auth store can't bypass the URL scope. Without this,
+    // a container with a broad GitHub token can clone/push to any org
+    // the token grants. Per-agent-group via GITHUB_ALLOWED_ORGS_<FOLDER>.
+    const ghOrgs = resolveScopedEnv('GITHUB_ALLOWED_ORGS', agentGroup.folder);
+    if (ghOrgs) args.push('-e', `GITHUB_ALLOWED_ORGS=${ghOrgs}`);
   } else {
     log.warn('No GitHub token resolved for agent group — git push/PR will fail', {
       folder: agentGroup.folder,
