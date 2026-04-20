@@ -1,7 +1,13 @@
 import fs from 'fs';
 import path from 'path';
 
-import { query as sdkQuery, type HookCallback, type PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
+import {
+  query as sdkQuery,
+  type HookCallback,
+  type PreCompactHookInput,
+  type PreToolUseHookInput,
+  type SdkPluginConfig,
+} from '@anthropic-ai/claude-agent-sdk';
 
 import { registerProvider } from './provider-registry.js';
 import type { AgentProvider, AgentQuery, McpServerConfig, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
@@ -234,6 +240,131 @@ function createPreCompactHook(assistantName?: string): HookCallback {
   };
 }
 
+// ── Bash secret sanitization hook ──
+
+// ANTHROPIC_API_KEY and its _N fallback variants (_2, _5, ...).
+const ANTHROPIC_KEY_RE = /^ANTHROPIC_API_KEY(_\d+)?$/;
+
+// Secrets the SDK needs for API auth but that Bash subprocesses must not see.
+// Built lazily inside the hook so late-bound env additions are covered.
+function buildSecretEnvVarList(): string[] {
+  return [
+    ...Object.keys(process.env).filter((k) => ANTHROPIC_KEY_RE.test(k)),
+    'CLAUDE_CODE_OAUTH_TOKEN',
+    'GMAIL_OAUTH_PATH',
+    'GMAIL_CREDENTIALS_PATH',
+  ];
+}
+
+function createSanitizeBashHook(): HookCallback {
+  return async (input) => {
+    const pre = input as PreToolUseHookInput;
+    const command = (pre.tool_input as { command?: string })?.command;
+    if (!command) return {};
+    const vars = buildSecretEnvVarList();
+    if (vars.length === 0) return {};
+    const unsetPrefix = `unset ${vars.join(' ')} 2>/dev/null; `;
+    return {
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        updatedInput: {
+          ...(pre.tool_input as Record<string, unknown>),
+          command: unsetPrefix + command,
+        },
+      },
+    };
+  };
+}
+
+// ── SDK env denylist ──
+
+// These secrets are either rotating short-lived tokens (Granola) or
+// HTTP-header-only auth values (Exa, Braintrust MCP). They are intentionally
+// passed as MCP server headers at registration time, not as Bash-visible env.
+// Forwarding them into the SDK's child-process env defeats that isolation.
+const SDK_ENV_DENYLIST: ReadonlySet<string> = new Set([
+  'GRANOLA_ACCESS_TOKEN',
+  'EXA_API_KEY',
+  'BRAINTRUST_API_KEY',
+]);
+
+function filterSdkEnv(env: Record<string, string | undefined>): Record<string, string | undefined> {
+  const out: Record<string, string | undefined> = {};
+  for (const [k, v] of Object.entries(env)) {
+    if (SDK_ENV_DENYLIST.has(k)) continue;
+    out[k] = v;
+  }
+  return out;
+}
+
+// ── Plugin discovery ──
+
+/**
+ * Walk /workspace/plugins/<repo>/(<sub>/(<sub2>/)?).claude-plugin/plugin.json
+ * and return them as SDK `plugins:` entries. Without this pass-through, the
+ * SDK doesn't load plugin-declared hooks (hooks.json) even if the plugins
+ * directory is mounted and CLAUDE_PLUGINS_ROOT is set. Mirrors v1
+ * `container/agent-runner/src/index.ts:discoverPlugins`.
+ */
+function discoverPlugins(): SdkPluginConfig[] {
+  const pluginsRoot = process.env.CLAUDE_PLUGINS_ROOT || '/workspace/plugins';
+  if (!fs.existsSync(pluginsRoot)) return [];
+  const plugins: SdkPluginConfig[] = [];
+  const hasManifest = (p: string) => fs.existsSync(path.join(p, '.claude-plugin', 'plugin.json'));
+  let entries: string[] = [];
+  try {
+    entries = fs.readdirSync(pluginsRoot);
+  } catch {
+    return [];
+  }
+  for (const entry of entries) {
+    const repoPath = path.join(pluginsRoot, entry);
+    try {
+      if (!fs.statSync(repoPath).isDirectory()) continue;
+    } catch {
+      continue;
+    }
+    if (hasManifest(repoPath)) {
+      plugins.push({ type: 'local', path: repoPath });
+      continue;
+    }
+    let subs: string[] = [];
+    try {
+      subs = fs.readdirSync(repoPath);
+    } catch {
+      continue;
+    }
+    for (const sub of subs) {
+      const subPath = path.join(repoPath, sub);
+      try {
+        if (!fs.statSync(subPath).isDirectory()) continue;
+      } catch {
+        continue;
+      }
+      if (hasManifest(subPath)) {
+        plugins.push({ type: 'local', path: subPath });
+        continue;
+      }
+      let sub2s: string[] = [];
+      try {
+        sub2s = fs.readdirSync(subPath);
+      } catch {
+        continue;
+      }
+      for (const sub2 of sub2s) {
+        const sub2Path = path.join(subPath, sub2);
+        try {
+          if (!fs.statSync(sub2Path).isDirectory()) continue;
+        } catch {
+          continue;
+        }
+        if (hasManifest(sub2Path)) plugins.push({ type: 'local', path: sub2Path });
+      }
+    }
+  }
+  return plugins;
+}
+
 // ── Provider ──
 
 /**
@@ -261,10 +392,10 @@ export class ClaudeProvider implements AgentProvider {
     this.assistantName = options.assistantName;
     this.mcpServers = options.mcpServers ?? {};
     this.additionalDirectories = options.additionalDirectories;
-    this.env = {
+    this.env = filterSdkEnv({
       ...(options.env ?? {}),
       CLAUDE_CODE_AUTO_COMPACT_WINDOW,
-    };
+    });
   }
 
   isSessionInvalid(err: unknown): boolean {
@@ -277,6 +408,14 @@ export class ClaudeProvider implements AgentProvider {
     stream.push(input.prompt);
 
     const instructions = input.systemContext?.instructions;
+
+    // Discover plugins each query so hot-mounted plugin drops are picked up
+    // without a container restart. Cheap (just fs.readdir under
+    // /workspace/plugins); if it grows expensive, hoist to constructor.
+    const plugins = discoverPlugins();
+    if (plugins.length > 0) {
+      log(`Loaded ${plugins.length} plugin(s): ${plugins.map((p) => path.basename(p.path)).join(', ')}`);
+    }
 
     const sdkResult = sdkQuery({
       prompt: stream,
@@ -292,7 +431,9 @@ export class ClaudeProvider implements AgentProvider {
         allowDangerouslySkipPermissions: true,
         settingSources: ['project', 'user'],
         mcpServers: this.mcpServers,
+        plugins: plugins.length > 0 ? plugins : undefined,
         hooks: {
+          PreToolUse: [{ matcher: 'Bash', hooks: [createSanitizeBashHook()] }],
           PreCompact: [{ hooks: [createPreCompactHook(this.assistantName)] }],
         },
       },

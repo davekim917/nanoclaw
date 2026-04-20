@@ -96,6 +96,8 @@ Scan the full v1 history (~2 years). For each matching commit:
 
 Expected volume: likely 100–300 matching commits. Most will be trivial (typo, dep bump). The load-bearing ones will cluster around: delivery, session lifecycle, cursor management, approval flows, container spawning, signal handling.
 
+**Execution mode: cluster scan** (per 2026-04-20 scope decision). Group matching commits by touched file/subsystem. Spot-check the load-bearing clusters (delivery, session lifecycle, cursor mgmt, approvals, container spawn, signals). Skip trivial clusters (deps, typos, logs). Trades ~20% coverage loss on low-value commits for ~70% time savings.
+
 ### 6. Chat transcript self-check
 
 Scan the current conversation's transcripts at `/home/ubuntu/.claude/projects/-home-ubuntu-nanoclaw/*.jsonl` for specific capability names Dave mentioned to me. For each: did I claim to port it? If so, verify against v2 code. This catches the class of miss where I said "done" but was actually shallow.
