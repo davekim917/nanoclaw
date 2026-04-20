@@ -512,6 +512,18 @@ function buildMounts(
     }
   }
 
+  // Snowflake-specific: if the host home isn't /home/node (i.e. always, on
+  // Linux /home/ubuntu or macOS /Users/<user>), also bind `~/.snowflake`
+  // at the HOST's absolute path. Snowflake `connections.toml` commonly uses
+  // absolute paths for `private_key_path` (Snow CLI supports `~` but
+  // snowflake-connector-python historically does not), so the same string
+  // needs to resolve both in-container and on the host. Two mounts of one
+  // source, both RO — no data copy, no file rewrite.
+  const hostSnowflake = path.join(home, '.snowflake');
+  if (fs.existsSync(hostSnowflake) && hostSnowflake !== '/home/node/.snowflake') {
+    mounts.push({ hostPath: hostSnowflake, containerPath: hostSnowflake, readonly: true });
+  }
+
   // Additional multi-account Gmail MCP dirs (.gmail-mcp-<account>/) —
   // v1 supported per-account setups. Mount each as-is.
   try {
