@@ -28,12 +28,7 @@ import {
   type ProviderContainerContribution,
   type VolumeMount,
 } from './providers/provider-container-registry.js';
-import {
-  markContainerRunning,
-  markContainerStopped,
-  sessionDir,
-  writeSessionRouting,
-} from './session-manager.js';
+import { markContainerRunning, markContainerStopped, sessionDir, writeSessionRouting } from './session-manager.js';
 import type { AgentGroup, Session } from './types.js';
 
 const onecli = new OneCLI({ url: ONECLI_URL });

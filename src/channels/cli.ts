@@ -27,12 +27,7 @@ import path from 'path';
 
 import { DATA_DIR } from '../config.js';
 import { log } from '../log.js';
-import type {
-  ChannelAdapter,
-  ChannelSetup,
-  InboundMessage,
-  OutboundMessage,
-} from './adapter.js';
+import type { ChannelAdapter, ChannelSetup, InboundMessage, OutboundMessage } from './adapter.js';
 import { registerChannelAdapter } from './channel-registry.js';
 
 const PLATFORM_ID = 'local';

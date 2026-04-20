@@ -15,6 +15,7 @@ import './git-worktrees.js';
 import './tone-profiles.js';
 import './remote-control.js';
 import './capabilities.js';
+import './permissions.js';
 import { startMcpServer } from './server.js';
 
 function log(msg: string): void {

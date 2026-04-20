@@ -21,6 +21,7 @@ import { log } from '../../log.js';
 import type { MessagingGroup } from '../../types.js';
 import { canAccessAgentGroup } from './access.js';
 import { getUser, upsertUser } from './db/users.js';
+import './grant.js';
 
 function extractAndUpsertUser(event: InboundEvent): string | null {
   let content: Record<string, unknown>;

@@ -229,7 +229,8 @@ describe('messaging group agents', () => {
   });
 
   it('auto-creates an agent_destinations row for the wiring', async () => {
-    const { getDestinationByTarget, getDestinations } = await import('../modules/agent-to-agent/db/agent-destinations.js');
+    const { getDestinationByTarget, getDestinations } =
+      await import('../modules/agent-to-agent/db/agent-destinations.js');
     createMessagingGroupAgent(mga());
 
     const dest = getDestinationByTarget('ag-1', 'channel', 'mg-1');
