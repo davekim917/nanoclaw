@@ -87,6 +87,24 @@ export interface ContainerConfig {
    * still take precedence.
    */
   defaultEffort?: 'low' | 'medium' | 'high' | 'xhigh';
+
+  /**
+   * Per-agent credential/tool allowlist. Each entry is either a bare tool
+   * name (`snowflake`) or scoped (`snowflake:sunday`, `aws:apollo`).
+   *
+   * **Omit this field entirely** and the agent gets every credential surface
+   * mounted (v2 default — backwards-compatible with existing installs).
+   *
+   * **Include it** and scoping kicks in — the container-runner filters and
+   * stages host credentials per-tool before mount, so one agent wired to
+   * `snowflake:sunday` can't cat another connection's key file. See
+   * `src/scoped-env.ts` for the helpers; `src/container-runner.ts`
+   * buildMounts for the per-tool staging logic.
+   *
+   * Supported tool names: gmail, gmail-readonly, calendar, google-workspace,
+   * snowflake, aws, gcloud, dbt, github, render, browser-auth.
+   */
+  tools?: string[];
 }
 
 function emptyConfig(): ContainerConfig {
@@ -126,6 +144,7 @@ export function readContainerConfig(folder: string): ContainerConfig {
       ollamaAdminTools: raw.ollamaAdminTools,
       defaultModel: raw.defaultModel,
       defaultEffort: raw.defaultEffort,
+      tools: raw.tools,
     };
   } catch (err) {
     console.error(`[container-config] failed to parse ${p}: ${String(err)}`);

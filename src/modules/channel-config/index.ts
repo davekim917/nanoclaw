@@ -113,7 +113,11 @@ interface ChannelConfigArgs {
   effort?: unknown;
 }
 
-async function handleSetChannelModel(content: Record<string, unknown>, session: Session, inDb: Database.Database): Promise<void> {
+async function handleSetChannelModel(
+  content: Record<string, unknown>,
+  session: Session,
+  inDb: Database.Database,
+): Promise<void> {
   const args = content as ChannelConfigArgs;
   const channelName = typeof args.channel === 'string' ? args.channel : undefined;
   // model: string = set, null = clear, anything else = reject
@@ -134,28 +138,19 @@ async function handleSetChannelModel(content: Record<string, unknown>, session: 
     return;
   }
   if (!hasMutateAuthority(callerId, agent.id)) {
-    notifyAgent(
-      session,
-      `set_channel_model denied: ${callerId} is not an owner / admin of ${agent.name}.`,
-    );
+    notifyAgent(session, `set_channel_model denied: ${callerId} is not an owner / admin of ${agent.name}.`);
     return;
   }
 
   const mgId = resolveChannelMessagingGroupId(session, inDb, channelName);
   if (!mgId) {
-    notifyAgent(
-      session,
-      `set_channel_model failed: channel ${channelName ?? '(current)'} not resolvable.`,
-    );
+    notifyAgent(session, `set_channel_model failed: channel ${channelName ?? '(current)'} not resolvable.`);
     return;
   }
 
   const wiring = getMessagingGroupAgentByPair(mgId, agent.id);
   if (!wiring) {
-    notifyAgent(
-      session,
-      `set_channel_model failed: channel ${channelName ?? mgId} is not wired to this agent.`,
-    );
+    notifyAgent(session, `set_channel_model failed: channel ${channelName ?? mgId} is not wired to this agent.`);
     return;
   }
 
@@ -174,7 +169,11 @@ async function handleSetChannelModel(content: Record<string, unknown>, session: 
   );
 }
 
-async function handleSetChannelEffort(content: Record<string, unknown>, session: Session, inDb: Database.Database): Promise<void> {
+async function handleSetChannelEffort(
+  content: Record<string, unknown>,
+  session: Session,
+  inDb: Database.Database,
+): Promise<void> {
   const args = content as ChannelConfigArgs;
   const channelName = typeof args.channel === 'string' ? args.channel : undefined;
   const effort = args.effort === null ? null : typeof args.effort === 'string' ? args.effort : undefined;
@@ -198,28 +197,19 @@ async function handleSetChannelEffort(content: Record<string, unknown>, session:
     return;
   }
   if (!hasMutateAuthority(callerId, agent.id)) {
-    notifyAgent(
-      session,
-      `set_channel_effort denied: ${callerId} is not an owner / admin of ${agent.name}.`,
-    );
+    notifyAgent(session, `set_channel_effort denied: ${callerId} is not an owner / admin of ${agent.name}.`);
     return;
   }
 
   const mgId = resolveChannelMessagingGroupId(session, inDb, channelName);
   if (!mgId) {
-    notifyAgent(
-      session,
-      `set_channel_effort failed: channel ${channelName ?? '(current)'} not resolvable.`,
-    );
+    notifyAgent(session, `set_channel_effort failed: channel ${channelName ?? '(current)'} not resolvable.`);
     return;
   }
 
   const wiring = getMessagingGroupAgentByPair(mgId, agent.id);
   if (!wiring) {
-    notifyAgent(
-      session,
-      `set_channel_effort failed: channel ${channelName ?? mgId} is not wired to this agent.`,
-    );
+    notifyAgent(session, `set_channel_effort failed: channel ${channelName ?? mgId} is not wired to this agent.`);
     return;
   }
 

@@ -20,6 +20,9 @@ import { initGroupFilesystem } from './group-init.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
+import YAML from 'yaml';
+
+import { extractToolScopes, filterConfigSections, isToolEnabled } from './scoped-env.js';
 // Provider host-side config barrel — each provider that needs host-side
 // container setup self-registers on import.
 import './providers/index.js';
@@ -523,67 +526,377 @@ function buildMounts(
     });
   }
 
-  // Host-side credential dirs — mount RO when present. v2's model differs
-  // from v1's: we don't gate these behind a per-group `tools` array because
-  // v2 already trusts the container with its OneCLI agent token (which
-  // unlocks everything that agent has access to anyway). If a group needs
-  // to exclude a CLI surface, do it via container image customization or
-  // explicit deny-mounting, not via implicit tool-list scoping.
+  // Host-side credential dirs — gated by the per-agent `tools` allowlist in
+  // container.json. Two modes:
+  //
+  //   tools = undefined  → legacy behavior, mount every credential surface.
+  //                        Preserves the pre-v2-tools-port default.
+  //   tools = [...]      → filter + stage per-tool. E.g. `snowflake:sunday`
+  //                        stages only the [connections.sunday] section of
+  //                        connections.toml and its referenced private
+  //                        keys; `aws:work` stages [default] + [work] from
+  //                        ~/.aws/credentials; `dbt:snowflake-db` stages a
+  //                        profiles.yml containing only that profile.
+  //
+  // Rationale for the gate (see docs/V2_BACKLOG.md → scoped credentials):
+  //   OneCLI's proxy covers API-level secrets (keys flowing through
+  //   HTTPS_PROXY). Filesystem credentials — private keys, INI/TOML with
+  //   raw passwords, service-account JSONs — are *not* OneCLI-mediated.
+  //   Without per-agent scoping every agent can `cat` every other agent's
+  //   creds. v1 enforced this at mount time; v2 now does too when `tools`
+  //   is set.
   const home = os.homedir();
-  const credentialMounts: Array<{ host: string; container: string }> = [
-    // Google Workspace — consolidated gws-style (one authorized_user per account)
-    { host: path.join(home, '.config', 'gws', 'accounts'), container: '/home/node/.config/gws/accounts' },
-    // Legacy Gmail MCP creds (primary)
-    { host: path.join(home, '.gmail-mcp'), container: '/home/node/.gmail-mcp' },
-    // Google Calendar MCP
-    { host: path.join(home, '.config', 'google-calendar-mcp'), container: '/home/node/.config/google-calendar-mcp' },
-    // Google Workspace MCP alt path
-    {
-      host: path.join(home, '.google_workspace_mcp', 'credentials'),
-      container: '/home/node/.google_workspace_mcp/credentials',
-    },
-    // Snowflake connections + keys
-    { host: path.join(home, '.snowflake'), container: '/home/node/.snowflake' },
-    // AWS creds
-    { host: path.join(home, '.aws'), container: '/home/node/.aws' },
-    // gcloud service-account JSON keys
-    { host: path.join(home, '.gcloud-keys'), container: '/home/node/.gcloud-keys' },
-    // dbt profiles + secrets
-    { host: path.join(home, '.dbt'), container: '/home/node/.dbt' },
-  ];
-  for (const m of credentialMounts) {
-    if (fs.existsSync(m.host)) {
-      mounts.push({ hostPath: m.host, containerPath: m.container, readonly: true });
-    }
-  }
+  const tools = containerConfig.tools;
+  const stagingRoot = path.join(sessDir, 'creds');
 
-  // Snowflake-specific: if the host home isn't /home/node (i.e. always, on
-  // Linux /home/ubuntu or macOS /Users/<user>), also bind `~/.snowflake`
-  // at the HOST's absolute path. Snowflake `connections.toml` commonly uses
-  // absolute paths for `private_key_path` (Snow CLI supports `~` but
-  // snowflake-connector-python historically does not), so the same string
-  // needs to resolve both in-container and on the host. Two mounts of one
-  // source, both RO — no data copy, no file rewrite.
-  const hostSnowflake = path.join(home, '.snowflake');
-  if (fs.existsSync(hostSnowflake) && hostSnowflake !== '/home/node/.snowflake') {
-    mounts.push({ hostPath: hostSnowflake, containerPath: hostSnowflake, readonly: true });
-  }
+  // Prepare a clean per-cred staging subdir. Caller passes the dir name;
+  // returns the absolute path. We rm+mkdir to avoid stale files leaking
+  // between spawns of the same session (e.g. after an agent re-scope).
+  const stageDir = (name: string): string => {
+    const p = path.join(stagingRoot, name);
+    if (fs.existsSync(p)) fs.rmSync(p, { recursive: true });
+    fs.mkdirSync(p, { recursive: true });
+    return p;
+  };
 
-  // Additional multi-account Gmail MCP dirs (.gmail-mcp-<account>/) —
-  // v1 supported per-account setups. Mount each as-is.
-  try {
-    for (const entry of fs.readdirSync(home)) {
-      if (!entry.startsWith('.gmail-mcp-')) continue;
-      const dir = path.join(home, entry);
-      try {
-        if (!fs.statSync(dir).isDirectory()) continue;
-      } catch {
-        continue;
+  const escapeRegex = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+  // ---- Gmail MCP (legacy per-account dirs) --------------------------------
+  if (isToolEnabled(tools, 'gmail') || isToolEnabled(tools, 'gmail-readonly')) {
+    const g = extractToolScopes(tools, 'gmail');
+    const r = extractToolScopes(tools, 'gmail-readonly');
+    const scopedAccounts = [...new Set([...g.scopes, ...r.scopes])];
+    const anyScoped = scopedAccounts.length > 0 && !tools?.includes('gmail');
+
+    if (anyScoped) {
+      // First scoped account gets the primary path; extras mounted at named paths.
+      const primary = scopedAccounts[0];
+      const primaryDir = path.join(home, `.gmail-mcp-${primary}`);
+      if (fs.existsSync(primaryDir)) {
+        mounts.push({ hostPath: primaryDir, containerPath: '/home/node/.gmail-mcp', readonly: true });
       }
-      mounts.push({ hostPath: dir, containerPath: `/home/node/${entry}`, readonly: true });
+      for (let i = 1; i < scopedAccounts.length; i++) {
+        const acctDir = path.join(home, `.gmail-mcp-${scopedAccounts[i]}`);
+        if (fs.existsSync(acctDir)) {
+          mounts.push({
+            hostPath: acctDir,
+            containerPath: `/home/node/.gmail-mcp-${scopedAccounts[i]}`,
+            readonly: true,
+          });
+        }
+      }
+    } else {
+      // Unscoped (or tools undefined): mount primary + every .gmail-mcp-*/
+      const primaryDir = path.join(home, '.gmail-mcp');
+      if (fs.existsSync(primaryDir)) {
+        mounts.push({ hostPath: primaryDir, containerPath: '/home/node/.gmail-mcp', readonly: true });
+      }
+      try {
+        for (const entry of fs.readdirSync(home)) {
+          if (!entry.startsWith('.gmail-mcp-')) continue;
+          const dir = path.join(home, entry);
+          try {
+            if (!fs.statSync(dir).isDirectory()) continue;
+          } catch {
+            continue;
+          }
+          mounts.push({ hostPath: dir, containerPath: `/home/node/${entry}`, readonly: true });
+        }
+      } catch {
+        // home may not be readable — skip
+      }
     }
-  } catch {
-    // home may not be readable — fine, skip
+  }
+
+  // ---- Google Calendar MCP ------------------------------------------------
+  if (isToolEnabled(tools, 'calendar')) {
+    const calDir = path.join(home, '.config', 'google-calendar-mcp');
+    const { scopes: calAccts, isScoped: calScoped } = extractToolScopes(tools, 'calendar');
+    if (fs.existsSync(calDir)) {
+      if (calScoped) {
+        // Filter tokens.json to allowed accounts; fail CLOSED on parse error
+        // (do NOT fall back to the full dir — that defeats the scope).
+        const tokensPath = path.join(calDir, 'tokens.json');
+        if (fs.existsSync(tokensPath)) {
+          try {
+            const all = JSON.parse(fs.readFileSync(tokensPath, 'utf-8')) as Record<string, unknown>;
+            const filtered: Record<string, unknown> = {};
+            for (const a of calAccts) if (all[a]) filtered[a] = all[a];
+            const dest = stageDir('google-calendar-mcp');
+            fs.writeFileSync(path.join(dest, 'tokens.json'), JSON.stringify(filtered, null, 2), { mode: 0o600 });
+            // Copy non-token files (settings etc.) as-is.
+            for (const entry of fs.readdirSync(calDir)) {
+              if (entry === 'tokens.json') continue;
+              const src = path.join(calDir, entry);
+              try {
+                if (fs.statSync(src).isFile()) fs.copyFileSync(src, path.join(dest, entry));
+              } catch {
+                continue;
+              }
+            }
+            mounts.push({
+              hostPath: dest,
+              containerPath: '/home/node/.config/google-calendar-mcp',
+              readonly: true,
+            });
+          } catch (err) {
+            log.warn('Calendar tokens filter failed — skipping mount (fail closed)', {
+              agent: agentGroup.folder,
+              err: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
+      } else {
+        mounts.push({ hostPath: calDir, containerPath: '/home/node/.config/google-calendar-mcp', readonly: true });
+      }
+    }
+
+    // Calendar reuses the Gmail OAuth app keys. If gmail isn't enabled for
+    // this agent, mount JUST the keys file (not the full gmail dir, which
+    // would leak Gmail tokens to a calendar-only scope).
+    if (!isToolEnabled(tools, 'gmail')) {
+      const oauthKeys = path.join(home, '.gmail-mcp', 'gcp-oauth.keys.json');
+      if (fs.existsSync(oauthKeys)) {
+        mounts.push({
+          hostPath: oauthKeys,
+          containerPath: '/home/node/.gmail-mcp/gcp-oauth.keys.json',
+          readonly: true,
+        });
+      }
+    }
+  }
+
+  // ---- Google Workspace (gws-style accounts dir) --------------------------
+  if (isToolEnabled(tools, 'google-workspace')) {
+    const gwsAccountsDir = path.join(home, '.config', 'gws', 'accounts');
+    if (fs.existsSync(gwsAccountsDir)) {
+      const { scopes: gwsAccts, isScoped: gwsScoped } = extractToolScopes(tools, 'google-workspace');
+      if (gwsScoped) {
+        // Each account has its own JSON file under accounts/. Stage only
+        // the allowed ones. Entries can be files (<acct>.json) or dirs.
+        const dest = stageDir('gws-accounts');
+        for (const acct of gwsAccts) {
+          const fileCandidate = path.join(gwsAccountsDir, `${acct}.json`);
+          const dirCandidate = path.join(gwsAccountsDir, acct);
+          try {
+            if (fs.existsSync(fileCandidate) && fs.statSync(fileCandidate).isFile()) {
+              fs.copyFileSync(fileCandidate, path.join(dest, `${acct}.json`));
+              fs.chmodSync(path.join(dest, `${acct}.json`), 0o600);
+            } else if (fs.existsSync(dirCandidate) && fs.statSync(dirCandidate).isDirectory()) {
+              fs.cpSync(dirCandidate, path.join(dest, acct), { recursive: true });
+            } else {
+              log.warn('google-workspace account not found in gws dir', { acct, agent: agentGroup.folder });
+            }
+          } catch (err) {
+            log.warn('google-workspace scoped copy failed', {
+              acct,
+              err: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
+        mounts.push({ hostPath: dest, containerPath: '/home/node/.config/gws/accounts', readonly: true });
+      } else {
+        mounts.push({ hostPath: gwsAccountsDir, containerPath: '/home/node/.config/gws/accounts', readonly: true });
+      }
+    }
+
+    // Legacy google_workspace_mcp/credentials/ — same pattern.
+    const gwCredsDir = path.join(home, '.google_workspace_mcp', 'credentials');
+    if (fs.existsSync(gwCredsDir)) {
+      const { scopes: gwAccts, isScoped: gwScoped } = extractToolScopes(tools, 'google-workspace');
+      if (gwScoped) {
+        const dest = stageDir('google-workspace-mcp-credentials');
+        for (const entry of fs.readdirSync(gwCredsDir)) {
+          // match entries that START with an allowed account name (allows
+          // <acct>.json, <acct>_token.json, etc. — v1 pattern).
+          if (!gwAccts.some((a) => entry.startsWith(a))) continue;
+          const src = path.join(gwCredsDir, entry);
+          try {
+            if (fs.statSync(src).isFile()) {
+              fs.copyFileSync(src, path.join(dest, entry));
+              fs.chmodSync(path.join(dest, entry), 0o600);
+            }
+          } catch {
+            continue;
+          }
+        }
+        mounts.push({
+          hostPath: dest,
+          containerPath: '/home/node/.google_workspace_mcp/credentials',
+          readonly: true,
+        });
+      } else {
+        mounts.push({
+          hostPath: gwCredsDir,
+          containerPath: '/home/node/.google_workspace_mcp/credentials',
+          readonly: true,
+        });
+      }
+    }
+  }
+
+  // ---- Snowflake (connections.toml + keys) --------------------------------
+  if (isToolEnabled(tools, 'snowflake')) {
+    const snowflakeDir = path.join(home, '.snowflake');
+    const origToml = path.join(snowflakeDir, 'connections.toml');
+    if (fs.existsSync(snowflakeDir) && fs.existsSync(origToml)) {
+      const { scopes: allowedConns, isScoped: filterConns } = extractToolScopes(tools, 'snowflake');
+      const dest = stageDir('snowflake');
+
+      // Rewrite host paths → /home/node paths so in-container CLIs find
+      // their own keys. snowflake-connector-python historically doesn't
+      // expand `~`, so we normalize to absolute /home/node/... paths.
+      const homePattern = new RegExp(escapeRegex(snowflakeDir) + '/', 'g');
+      let tomlContent = fs.readFileSync(origToml, 'utf-8').replace(homePattern, '/home/node/.snowflake/');
+      if (filterConns) tomlContent = filterConfigSections(tomlContent, allowedConns);
+      fs.writeFileSync(path.join(dest, 'connections.toml'), tomlContent, { mode: 0o600 });
+
+      const origConfig = path.join(snowflakeDir, 'config.toml');
+      if (fs.existsSync(origConfig)) {
+        const configContent = fs
+          .readFileSync(origConfig, 'utf-8')
+          .replace(homePattern, '/home/node/.snowflake/');
+        fs.writeFileSync(path.join(dest, 'config.toml'), configContent, { mode: 0o600 });
+      }
+
+      // Copy only key files that the (possibly filtered) toml actually
+      // references — never the whole keys/ dir under scoping.
+      const keysDir = path.join(snowflakeDir, 'keys');
+      if (fs.existsSync(keysDir)) {
+        const referenced = new Set<string>();
+        for (const m of tomlContent.matchAll(/private_key_path\s*=\s*"[^"]*\/keys\/([^"]+)"/g)) {
+          referenced.add(m[1]);
+        }
+        const destKeys = path.join(dest, 'keys');
+        fs.mkdirSync(destKeys, { recursive: true });
+        for (const entry of fs.readdirSync(keysDir, { withFileTypes: true, recursive: true })) {
+          if (!entry.isFile()) continue;
+          const srcPath = path.join(entry.parentPath, entry.name);
+          const relPath = path.relative(keysDir, srcPath);
+          // When filtering, skip any key not referenced by allowed conns.
+          // When not filtering, copy everything.
+          if (filterConns && referenced.size > 0 && !referenced.has(relPath)) continue;
+          const destPath = path.join(destKeys, relPath);
+          fs.mkdirSync(path.dirname(destPath), { recursive: true });
+          fs.copyFileSync(srcPath, destPath);
+          fs.chmodSync(destPath, 0o600);
+        }
+      }
+
+      // Mount RW: snow CLI writes to ~/.snowflake/logs/.
+      mounts.push({ hostPath: dest, containerPath: '/home/node/.snowflake', readonly: false });
+
+      // Dual-mount at host absolute path too — some snowflake libs record
+      // the originally-resolved absolute path in session state and retry
+      // reads at that path. The container sees the same staging dir.
+      if (snowflakeDir !== '/home/node/.snowflake') {
+        mounts.push({ hostPath: dest, containerPath: snowflakeDir, readonly: false });
+      }
+    }
+  }
+
+  // ---- AWS (~/.aws/{credentials,config}) ----------------------------------
+  if (isToolEnabled(tools, 'aws')) {
+    const awsDir = path.join(home, '.aws');
+    if (fs.existsSync(awsDir)) {
+      const { scopes: allowedProfiles, isScoped: filterProfiles } = extractToolScopes(tools, 'aws');
+      const dest = stageDir('aws');
+      const alwaysInclude = new Set(['default']);
+
+      const origCreds = path.join(awsDir, 'credentials');
+      if (fs.existsSync(origCreds)) {
+        let content = fs.readFileSync(origCreds, 'utf-8');
+        if (filterProfiles) content = filterConfigSections(content, allowedProfiles, { alwaysInclude });
+        fs.writeFileSync(path.join(dest, 'credentials'), content, { mode: 0o600 });
+      }
+      const origConfig = path.join(awsDir, 'config');
+      if (fs.existsSync(origConfig)) {
+        let content = fs.readFileSync(origConfig, 'utf-8');
+        if (filterProfiles) {
+          // AWS config uses `[profile foo]` rather than `[foo]` — transform
+          // to compare raw name against the allowlist.
+          content = filterConfigSections(content, allowedProfiles, {
+            headerTransform: (h) => h.replace(/^profile\s+/, ''),
+            alwaysInclude,
+          });
+        }
+        fs.writeFileSync(path.join(dest, 'config'), content, { mode: 0o600 });
+      }
+      mounts.push({ hostPath: dest, containerPath: '/home/node/.aws', readonly: true });
+    }
+  }
+
+  // ---- gcloud (~/.gcloud-keys/*.json) -------------------------------------
+  if (isToolEnabled(tools, 'gcloud')) {
+    const gcloudKeysDir = path.join(home, '.gcloud-keys');
+    if (fs.existsSync(gcloudKeysDir)) {
+      const { scopes: gcloudScopes, isScoped: gcloudScoped } = extractToolScopes(tools, 'gcloud');
+      const dest = stageDir('gcloud-keys');
+
+      if (gcloudScoped) {
+        // v1 convention: GCLOUD_KEY_<SCOPE>=<filename.json> env var in the
+        // host process env maps scope → key file. Keep the same contract.
+        for (const s of gcloudScopes) {
+          const envKey = `GCLOUD_KEY_${s.toUpperCase()}`;
+          const keyFile = process.env[envKey];
+          if (!keyFile) {
+            log.warn('gcloud scope has no GCLOUD_KEY_<SCOPE> mapping in env', { scope: s, envKey });
+            continue;
+          }
+          const srcPath = path.join(gcloudKeysDir, keyFile);
+          if (!fs.existsSync(srcPath)) {
+            log.warn('gcloud key file not found', { srcPath, scope: s });
+            continue;
+          }
+          const destPath = path.join(dest, keyFile);
+          fs.copyFileSync(srcPath, destPath);
+          fs.chmodSync(destPath, 0o600);
+        }
+      } else {
+        // Unscoped: copy every .json under the keys dir.
+        for (const entry of fs.readdirSync(gcloudKeysDir)) {
+          if (!entry.endsWith('.json')) continue;
+          const srcPath = path.join(gcloudKeysDir, entry);
+          try {
+            if (fs.statSync(srcPath).isFile()) {
+              const destPath = path.join(dest, entry);
+              fs.copyFileSync(srcPath, destPath);
+              fs.chmodSync(destPath, 0o600);
+            }
+          } catch {
+            continue;
+          }
+        }
+      }
+      mounts.push({ hostPath: dest, containerPath: '/home/node/.gcloud-keys', readonly: true });
+    }
+  }
+
+  // ---- dbt (~/.dbt/profiles.yml) ------------------------------------------
+  if (isToolEnabled(tools, 'dbt')) {
+    const dbtDir = path.join(home, '.dbt');
+    const origProfiles = path.join(dbtDir, 'profiles.yml');
+    if (fs.existsSync(origProfiles)) {
+      const { scopes, isScoped } = extractToolScopes(tools, 'dbt');
+      const dest = stageDir('dbt');
+      try {
+        let profiles = YAML.parse(fs.readFileSync(origProfiles, 'utf-8')) as Record<string, unknown>;
+        if (isScoped) {
+          const filtered: Record<string, unknown> = {};
+          for (const name of scopes) {
+            if (profiles[name] !== undefined) filtered[name] = profiles[name];
+          }
+          profiles = filtered;
+        }
+        fs.writeFileSync(path.join(dest, 'profiles.yml'), YAML.stringify(profiles), { mode: 0o600 });
+        mounts.push({ hostPath: dest, containerPath: '/home/node/.dbt', readonly: true });
+      } catch (err) {
+        log.warn('dbt profiles stage failed — skipping mount (fail closed)', {
+          agent: agentGroup.folder,
+          err: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
   }
 
   // Provider-contributed mounts (e.g. opencode-xdg)
