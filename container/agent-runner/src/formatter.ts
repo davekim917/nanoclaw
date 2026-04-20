@@ -13,6 +13,66 @@ export type CommandCategory = 'admin' | 'filtered' | 'passthrough' | 'none';
 const ADMIN_COMMANDS = new Set(['/remote-control', '/clear', '/compact', '/context', '/cost', '/files']);
 const FILTERED_COMMANDS = new Set(['/help', '/login', '/logout', '/doctor', '/config']);
 
+const VALID_EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh']);
+
+/**
+ * Model/effort flags parsed from the start of an inbound text message.
+ *
+ *   -m <model>    per-turn model override
+ *   -m1 <model>   session-sticky model override (persists until changed)
+ *   -e <level>    per-turn effort override (low|medium|high|xhigh)
+ *   -e1 <level>   session-sticky effort override
+ *
+ * Flags must appear as a contiguous prefix of the text, separated by
+ * whitespace. Anything after the flag block is the actual prompt. Empty
+ * value on a sticky flag (`-m1 ''` or `-e1 ''`) clears the sticky.
+ *
+ * Returns undefined for each field if no corresponding flag was found.
+ * `cleanedText` is the prompt with the flag prefix stripped.
+ */
+export interface ParsedFlags {
+  turnModel?: string;
+  stickyModel?: string;
+  /** Empty string means "clear sticky"; undefined means "no change". */
+  clearStickyModel?: boolean;
+  turnEffort?: string;
+  stickyEffort?: string;
+  clearStickyEffort?: boolean;
+  cleanedText: string;
+}
+
+export function parseModelEffortFlags(text: string): ParsedFlags {
+  const out: ParsedFlags = { cleanedText: text };
+  let rest = text;
+  // Walk flags greedily; stop at the first non-flag token.
+  for (;;) {
+    const m = rest.match(/^\s*(-[me]1?)\s+(\S*)\s*/);
+    if (!m) break;
+    const flag = m[1];
+    const rawValue = m[2];
+    const value = rawValue.replace(/^['"]|['"]$/g, ''); // strip surrounding quotes
+    rest = rest.slice(m[0].length);
+    switch (flag) {
+      case '-m':
+        if (value) out.turnModel = value;
+        break;
+      case '-m1':
+        if (value) out.stickyModel = value;
+        else out.clearStickyModel = true;
+        break;
+      case '-e':
+        if (value && VALID_EFFORT_LEVELS.has(value)) out.turnEffort = value;
+        break;
+      case '-e1':
+        if (value && VALID_EFFORT_LEVELS.has(value)) out.stickyEffort = value;
+        else if (!value) out.clearStickyEffort = true;
+        break;
+    }
+  }
+  out.cleanedText = rest;
+  return out;
+}
+
 export interface CommandInfo {
   category: CommandCategory;
   command: string; // the command name (e.g., '/clear')

@@ -562,16 +562,29 @@ export class ClaudeProvider implements AgentProvider {
       log(`Loaded ${plugins.length} plugin(s): ${plugins.map((p) => path.basename(p.path)).join(', ')}`);
     }
 
+    // Effort level rides in env (SDK surfaces it via settings, not query
+    // options). CLAUDE_CODE_SUBAGENT_MODEL propagates the same model to
+    // subagents so teams/sub-queries don't silently downgrade.
+    const perQueryEnv: Record<string, string | undefined> = { ...this.env };
+    if (input.effort) {
+      perQueryEnv.CLAUDE_CODE_USE_EFFORT = input.effort;
+      perQueryEnv.CLAUDE_CODE_EFFORT_LEVEL = input.effort;
+    }
+    if (input.model) {
+      perQueryEnv.CLAUDE_CODE_SUBAGENT_MODEL = input.model;
+    }
+
     const sdkResult = sdkQuery({
       prompt: stream,
       options: {
         cwd: input.cwd,
         additionalDirectories: this.additionalDirectories,
         resume: input.continuation,
+        model: input.model,
         systemPrompt: instructions ? { type: 'preset' as const, preset: 'claude_code' as const, append: instructions } : undefined,
         allowedTools: TOOL_ALLOWLIST,
         disallowedTools: SDK_DISALLOWED_TOOLS,
-        env: this.env,
+        env: perQueryEnv,
         permissionMode: 'bypassPermissions',
         allowDangerouslySkipPermissions: true,
         settingSources: ['project', 'user'],

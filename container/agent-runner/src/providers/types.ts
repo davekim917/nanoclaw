@@ -59,6 +59,21 @@ export interface QueryInput {
   systemContext?: {
     instructions?: string;
   };
+
+  /**
+   * Per-turn model override. Passed to the SDK as the query's `model`
+   * option. Providers that don't support per-query model selection should
+   * ignore this. Effective model is: turn override → sticky override →
+   * provider default.
+   */
+  model?: string;
+
+  /**
+   * Per-turn effort level override (low | medium | high | xhigh). Passed
+   * via provider-specific env (Claude: CLAUDE_CODE_USE_EFFORT). Providers
+   * without an effort concept should ignore.
+   */
+  effort?: string;
 }
 
 export interface McpServerConfig {

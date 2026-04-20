@@ -2,8 +2,24 @@ import { findByName, getAllDestinations, type DestinationEntry } from './destina
 import { getPendingMessages, markProcessing, markCompleted, type MessageInRow } from './db/messages-in.js';
 import { writeMessageOut } from './db/messages-out.js';
 import { touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
-import { getStoredSessionId, setStoredSessionId, clearStoredSessionId } from './db/session-state.js';
-import { formatMessages, extractRouting, categorizeMessage, type RoutingContext } from './formatter.js';
+import {
+  getStoredSessionId,
+  setStoredSessionId,
+  clearStoredSessionId,
+  getStickyModel,
+  setStickyModel,
+  clearStickyModel,
+  getStickyEffort,
+  setStickyEffort,
+  clearStickyEffort,
+} from './db/session-state.js';
+import {
+  formatMessages,
+  extractRouting,
+  categorizeMessage,
+  parseModelEffortFlags,
+  type RoutingContext,
+} from './formatter.js';
 import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
 import { autoCommitDirtyWorktrees } from './worktree-autosave.js';
 
@@ -176,16 +192,40 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       continue;
     }
 
+    // Model/effort flag parse — applied to the FIRST chat-kind message's
+    // text. Only chat-like inbounds carry user-typed flags; task-script
+    // outputs and system rows don't. Mutates the message content in place
+    // so the flag prefix never reaches the agent's prompt. Side-effects:
+    // updates sticky state in session_state and emits a confirmation chat
+    // so the user sees the switch took effect.
+    const { model: effectiveModel, effort: effectiveEffort, notice } = applyFlagBatch(keep, routing);
+    if (notice) {
+      writeMessageOut({
+        id: generateId(),
+        kind: 'chat',
+        platform_id: routing.platformId,
+        channel_type: routing.channelType,
+        thread_id: routing.threadId,
+        content: JSON.stringify({ text: notice }),
+      });
+    }
+
     // Format messages: passthrough commands get raw text (only if the
     // provider natively handles slash commands), others get XML.
     const prompt = formatMessagesWithCommands(keep, config.provider.supportsNativeSlashCommands);
 
-    log(`Processing ${keep.length} message(s), kinds: ${[...new Set(keep.map((m) => m.kind))].join(',')}`);
+    log(
+      `Processing ${keep.length} message(s), kinds: ${[...new Set(keep.map((m) => m.kind))].join(',')}` +
+        (effectiveModel ? ` model=${effectiveModel}` : '') +
+        (effectiveEffort ? ` effort=${effectiveEffort}` : ''),
+    );
 
     const query = config.provider.query({
       prompt,
       continuation,
       cwd: config.cwd,
+      model: effectiveModel,
+      effort: effectiveEffort,
       systemContext: config.systemContext,
     });
 
@@ -509,4 +549,84 @@ function sendToDestination(dest: DestinationEntry, body: string, routing: Routin
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Parse -m/-m1/-e/-e1 flags from the first chat-kind message in the batch,
+ * update sticky session_state, mutate the message content to drop the flag
+ * prefix, and compute the effective (model, effort) for this query.
+ *
+ * Effective precedence: turn override (`-m`/`-e`) → sticky (`-m1`/`-e1`) →
+ * undefined (provider default).
+ *
+ * Returns a notice string to post back to the user when ANY flag landed, so
+ * the switch is visible in chat. Returns undefined notice otherwise.
+ */
+function applyFlagBatch(
+  messages: MessageInRow[],
+  _routing: RoutingContext,
+): { model?: string; effort?: string; notice?: string } {
+  // Only flags on the first chat-kind message are considered — follow-ups
+  // in the same batch already share context.
+  const first = messages.find((m) => m.kind === 'chat' || m.kind === 'chat-sdk');
+  if (!first) {
+    return { model: getStickyModel(), effort: getStickyEffort() };
+  }
+
+  let content: { text?: string };
+  try {
+    content = JSON.parse(first.content) as { text?: string };
+  } catch {
+    return { model: getStickyModel(), effort: getStickyEffort() };
+  }
+
+  const text = content.text ?? '';
+  const flags = parseModelEffortFlags(text);
+  const noticeParts: string[] = [];
+
+  // Apply sticky changes first; they persist beyond this turn.
+  if (flags.clearStickyModel) {
+    clearStickyModel();
+    noticeParts.push('sticky model cleared');
+  } else if (flags.stickyModel) {
+    setStickyModel(flags.stickyModel);
+    noticeParts.push(`sticky model → ${flags.stickyModel}`);
+  }
+  if (flags.clearStickyEffort) {
+    clearStickyEffort();
+    noticeParts.push('sticky effort cleared');
+  } else if (flags.stickyEffort) {
+    setStickyEffort(flags.stickyEffort);
+    noticeParts.push(`sticky effort → ${flags.stickyEffort}`);
+  }
+  if (flags.turnModel) noticeParts.push(`turn model → ${flags.turnModel}`);
+  if (flags.turnEffort) noticeParts.push(`turn effort → ${flags.turnEffort}`);
+
+  // If any flag was parsed, rewrite the message text to drop the prefix.
+  if (flags.cleanedText !== text) {
+    content.text = flags.cleanedText;
+    first.content = JSON.stringify(content);
+  }
+
+  const stickyModel = getStickyModel();
+  const stickyEffort = getStickyEffort();
+  const model = flags.turnModel ?? (flags.stickyModel || stickyModel);
+  const effort = flags.turnEffort ?? (flags.stickyEffort || stickyEffort);
+
+  // If the cleaned text is empty AND the only thing the user typed was a
+  // flag line, the prompt would otherwise be an empty chat message. Drop
+  // the message from `messages` implicitly by emptying it — the outer
+  // loop still runs formatMessagesWithCommands over the batch, and an
+  // empty content reduces to a no-op prompt. Simpler: swap to an
+  // acknowledgement so the turn is meaningful.
+  if (content.text === '' && noticeParts.length > 0) {
+    content.text = '(switch acknowledged)';
+    first.content = JSON.stringify(content);
+  }
+
+  return {
+    model,
+    effort,
+    notice: noticeParts.length > 0 ? `⚙️ ${noticeParts.join(', ')}` : undefined,
+  };
 }

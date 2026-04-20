@@ -8,6 +8,8 @@
 import { getOutboundDb } from './connection.js';
 
 const SDK_SESSION_KEY = 'sdk_session_id';
+const STICKY_MODEL_KEY = 'sticky_model';
+const STICKY_EFFORT_KEY = 'sticky_effort';
 
 function getValue(key: string): string | undefined {
   const row = getOutboundDb()
@@ -38,4 +40,34 @@ export function setStoredSessionId(sessionId: string): void {
 
 export function clearStoredSessionId(): void {
   deleteValue(SDK_SESSION_KEY);
+}
+
+/**
+ * Session-sticky model/effort overrides. Set by `-m1 <model>` and
+ * `-e1 <level>` flags on an inbound message; cleared by explicit
+ * `-m1 ''` / `-e1 ''` (or /clear which wipes the row on session reset).
+ * Survives container restart via session_state.
+ */
+export function getStickyModel(): string | undefined {
+  return getValue(STICKY_MODEL_KEY);
+}
+
+export function setStickyModel(model: string): void {
+  setValue(STICKY_MODEL_KEY, model);
+}
+
+export function clearStickyModel(): void {
+  deleteValue(STICKY_MODEL_KEY);
+}
+
+export function getStickyEffort(): string | undefined {
+  return getValue(STICKY_EFFORT_KEY);
+}
+
+export function setStickyEffort(effort: string): void {
+  setValue(STICKY_EFFORT_KEY, effort);
+}
+
+export function clearStickyEffort(): void {
+  deleteValue(STICKY_EFFORT_KEY);
 }
