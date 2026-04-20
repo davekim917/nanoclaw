@@ -73,28 +73,18 @@ function deriveToolProgressLabel(message: unknown): string | null {
 // durable across sessions/restarts and gated by our pre-task script hook.
 const SDK_DISALLOWED_TOOLS = ['CronCreate', 'CronDelete', 'CronList', 'ScheduleWakeup'];
 
-// Tool allowlist for NanoClaw agent containers
-const TOOL_ALLOWLIST = [
-  'Bash',
-  'Read',
-  'Write',
-  'Edit',
-  'Glob',
-  'Grep',
-  'WebSearch',
-  'WebFetch',
-  'Task',
-  'TaskOutput',
-  'TaskStop',
-  'TeamCreate',
-  'TeamDelete',
-  'SendMessage',
-  'TodoWrite',
-  'ToolSearch',
-  'Skill',
-  'NotebookEdit',
-  'mcp__nanoclaw__*',
-];
+// No explicit `allowedTools` list is set. The SDK's `allowedTools` is
+// "auto-allow without a permission prompt" (not an include-filter). Since
+// we already run with `permissionMode: 'bypassPermissions'` +
+// `allowDangerouslySkipPermissions: true`, every tool that the SDK
+// surfaces is auto-allowed — enumerating them added zero protection and
+// created a silent-regression risk: when the SDK added a new built-in
+// (Task, TaskOutput, TeamCreate, ScheduleWakeup, etc.) and we forgot
+// to append it here, the tool's user-visible command prompt would
+// surface despite bypassPermissions — inconsistent UX. Omitting the
+// enumeration keeps the surface open-by-default and relies on
+// `disallowedTools` above for explicit blocks. v1 reached the same
+// conclusion (src/agent-runner/index.ts:1056-1077 comment).
 
 interface SDKUserMessage {
   type: 'user';
@@ -612,7 +602,6 @@ export class ClaudeProvider implements AgentProvider {
         resume: input.continuation,
         model: input.model,
         systemPrompt: instructions ? { type: 'preset' as const, preset: 'claude_code' as const, append: instructions } : undefined,
-        allowedTools: TOOL_ALLOWLIST,
         disallowedTools: SDK_DISALLOWED_TOOLS,
         env: perQueryEnv,
         permissionMode: 'bypassPermissions',

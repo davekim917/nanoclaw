@@ -610,7 +610,15 @@ async function buildContainerArgs(
   // Lock the `opus` alias to 4.7 so SDK-lag can't silently downgrade a
   // session to 4.6 (or whatever the upstream default happens to be). v1
   // set this in the per-session settings.json env block; v2 bakes it here.
+  // Explicit -m1 claude-opus-4-6[1m] (via the agent-runner flag parser)
+  // still overrides when a session wants an older version.
   args.push('-e', 'ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-7');
+  // v1 settings.json env block (src/container-runner.ts:1703-1709): SDK
+  // capabilities that need explicit opt-in. Porting as plain env since
+  // v2's container reads env, not a settings.json mount point.
+  args.push('-e', 'CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1');
+  args.push('-e', 'CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1');
+  args.push('-e', 'ENABLE_TOOL_SEARCH=true');
 
   // GitHub token for git-over-HTTPS + `gh` CLI. Per-agent-group: resolves
   // from container.json `githubTokenEnv`, then from
