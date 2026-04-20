@@ -234,6 +234,11 @@ function createPreCompactHook(assistantName?: string): HookCallback {
 
 // ANTHROPIC_API_KEY and its _N fallback variants (_2, _5, ...).
 const ANTHROPIC_KEY_RE = /^ANTHROPIC_API_KEY(_\d+)?$/;
+const ANTHROPIC_FALLBACK_RE = /^ANTHROPIC_API_KEY_(\d+)$/;
+
+// Retryable upstream errors. v1's list — see
+// container/agent-runner/src/index.ts:470-478.
+const RETRYABLE_ERROR_RE = /429|rate[\s_-]?limit|overloaded|upstream_error|External provider returned/i;
 
 // Secrets the SDK needs for API auth but that Bash subprocesses must not see.
 // Built lazily inside the hook so late-bound env additions are covered.
@@ -572,6 +577,17 @@ export class ClaudeProvider implements AgentProvider {
   private env: Record<string, string | undefined>;
   private additionalDirectories?: string[];
 
+  /**
+   * Ordered fallback API keys from ANTHROPIC_API_KEY_N env vars (sorted by
+   * N). Used when an upstream error suggests the current key is blocked
+   * and rotation would help. Only populated when the user has configured
+   * a non-Anthropic routing proxy via ANTHROPIC_BASE_URL; under the
+   * default OneCLI path, key selection happens at the proxy and this
+   * array stays empty.
+   */
+  private fallbackKeys: Array<{ name: string; value: string }>;
+  private nextFallback = 0;
+
   constructor(options: ProviderOptions = {}) {
     this.assistantName = options.assistantName;
     this.mcpServers = options.mcpServers ?? {};
@@ -580,6 +596,17 @@ export class ClaudeProvider implements AgentProvider {
       ...(options.env ?? {}),
       CLAUDE_CODE_AUTO_COMPACT_WINDOW,
     });
+    this.fallbackKeys = Object.entries(this.env)
+      .filter(([k, v]) => ANTHROPIC_FALLBACK_RE.test(k) && typeof v === 'string' && v.length > 0)
+      .sort(([a], [b]) => {
+        const na = Number(a.match(ANTHROPIC_FALLBACK_RE)![1]);
+        const nb = Number(b.match(ANTHROPIC_FALLBACK_RE)![1]);
+        return na - nb;
+      })
+      .map(([k, v]) => ({ name: k, value: v as string }));
+    if (this.fallbackKeys.length > 0) {
+      log(`Loaded ${this.fallbackKeys.length} ANTHROPIC_API_KEY fallback(s): ${this.fallbackKeys.map((k) => k.name).join(', ')}`);
+    }
   }
 
   isSessionInvalid(err: unknown): boolean {
@@ -590,6 +617,32 @@ export class ClaudeProvider implements AgentProvider {
   isContextTooLong(err: unknown): boolean {
     const msg = err instanceof Error ? err.message : String(err);
     return PROMPT_TOO_LONG_RE.test(msg);
+  }
+
+  isRetryable(err: unknown): boolean {
+    const msg = err instanceof Error ? err.message : String(err);
+    return RETRYABLE_ERROR_RE.test(msg);
+  }
+
+  /**
+   * Advance ANTHROPIC_API_KEY to the next fallback in the configured list.
+   * Position persists for the container lifetime — once key N fires a
+   * retryable error, key N+1 stays active for all subsequent queries. We
+   * don't walk backwards; re-starting the container is the reset. Returns
+   * false when no more fallbacks remain (caller should surface the error
+   * to the user).
+   */
+  rotateApiKey(): boolean {
+    if (this.nextFallback >= this.fallbackKeys.length) return false;
+    const next = this.fallbackKeys[this.nextFallback++];
+    if (this.env.ANTHROPIC_API_KEY === next.value) {
+      // Already rotated to this one (e.g. base key already matched a
+      // fallback by coincidence). Try the next one instead.
+      return this.rotateApiKey();
+    }
+    this.env.ANTHROPIC_API_KEY = next.value;
+    log(`Rotated ANTHROPIC_API_KEY → ${next.name} (${this.nextFallback}/${this.fallbackKeys.length})`);
+    return true;
   }
 
   query(input: QueryInput): AgentQuery {

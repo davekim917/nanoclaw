@@ -620,6 +620,27 @@ async function buildContainerArgs(
   args.push('-e', 'CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1');
   args.push('-e', 'ENABLE_TOOL_SEARCH=true');
 
+  // Optional non-Anthropic routing: when ANTHROPIC_BASE_URL is set on the
+  // host, forward it + ANTHROPIC_API_KEY + any ANTHROPIC_API_KEY_N
+  // fallbacks to the container so the SDK talks to that endpoint instead
+  // of going through the OneCLI proxy. The container's claude provider
+  // rotates through the _N keys on retryable errors (429, rate_limit,
+  // overloaded, upstream_error, External provider returned).
+  //
+  // Gated on ANTHROPIC_BASE_URL: without it, keys aren't forwarded and
+  // OneCLI's HTTPS proxy injects credentials at request time (default path).
+  if (process.env.ANTHROPIC_BASE_URL) {
+    args.push('-e', `ANTHROPIC_BASE_URL=${process.env.ANTHROPIC_BASE_URL}`);
+    if (process.env.ANTHROPIC_API_KEY) {
+      args.push('-e', `ANTHROPIC_API_KEY=${process.env.ANTHROPIC_API_KEY}`);
+    }
+    for (const [k, v] of Object.entries(process.env)) {
+      if (/^ANTHROPIC_API_KEY_\d+$/.test(k) && v) {
+        args.push('-e', `${k}=${v}`);
+      }
+    }
+  }
+
   // GitHub token for git-over-HTTPS + `gh` CLI. Per-agent-group: resolves
   // from container.json `githubTokenEnv`, then from
   // `GITHUB_TOKEN_<FOLDER_UPPER>`, then falls back to `GITHUB_TOKEN`.

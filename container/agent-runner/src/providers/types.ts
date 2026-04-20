@@ -26,6 +26,22 @@ export interface AgentProvider {
    * the error-write path).
    */
   isContextTooLong?(err: unknown): boolean;
+
+  /**
+   * True if the given error is a transient upstream failure (429, rate
+   * limit, overloaded, upstream_error, External provider returned).
+   * Providers with credential rotation (multiple API keys) can use this
+   * to trigger `rotateApiKey` before in-turn retry.
+   */
+  isRetryable?(err: unknown): boolean;
+
+  /**
+   * Advance to the next configured fallback API key. Returns true if a
+   * rotation happened, false if no more fallbacks are available. Poll-loop
+   * pairs this with `isRetryable` to auto-recover from upstream flakiness
+   * without dead-turning the user.
+   */
+  rotateApiKey?(): boolean;
 }
 
 /**

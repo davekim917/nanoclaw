@@ -244,6 +244,35 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
       let recovered = false;
 
+      // Retryable-upstream recovery: 429 / rate limit / overloaded /
+      // upstream_error. If the provider has fallback API keys configured
+      // (ANTHROPIC_API_KEY_N), rotate and retry once in-turn. Without
+      // fallbacks OR once they're exhausted, fall through to the error
+      // write. Ordered before isContextTooLong because prompt-too-long can
+      // LOOK retryable in some error shapes, and the rotation cost is low.
+      if (config.provider.isRetryable?.(err) && config.provider.rotateApiKey?.()) {
+        log(`Upstream transient error — rotated key, retrying same prompt in-turn`);
+        try {
+          const retryQuery = config.provider.query({
+            prompt,
+            continuation,
+            cwd: config.cwd,
+            systemContext: config.systemContext,
+            model: effectiveModel,
+            effort: effectiveEffort,
+          });
+          const retryResult = await processQuery(retryQuery, routing);
+          if (retryResult.continuation && retryResult.continuation !== continuation) {
+            continuation = retryResult.continuation;
+            setStoredSessionId(continuation);
+          }
+          recovered = true;
+        } catch (retryErr) {
+          const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
+          log(`Retry after key rotation also failed: ${retryMsg}`);
+        }
+      }
+
       // Context-window recovery: session grew past the model's limit.
       // Clear the continuation AND retry the same prompt once with a
       // fresh session, mirroring v1's silent prompt_too_long auto-
@@ -259,7 +288,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // pattern makes the failure explicit to the user.
       //
       // Marker prefix tells the agent why it's starting blank.
-      if (continuation && config.provider.isContextTooLong?.(err)) {
+      if (!recovered && continuation && config.provider.isContextTooLong?.(err)) {
         log(`Context-too-long detected — clearing session and retrying once with fresh continuation`);
         continuation = undefined;
         clearStoredSessionId();
@@ -283,7 +312,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
           log(`Retry after context-too-long also failed: ${retryMsg}`);
         }
-      } else if (continuation && config.provider.isSessionInvalid(err)) {
+      } else if (!recovered && continuation && config.provider.isSessionInvalid(err)) {
         // Stale/corrupt continuation — clearing lets the next poll start
         // fresh. No in-turn retry; the message's markCompleted below
         // means the user must re-send. Matches prior v2 behavior.
