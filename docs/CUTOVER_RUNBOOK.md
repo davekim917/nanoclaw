@@ -107,6 +107,49 @@ Verify:
 sqlite3 data/v2.db "SELECT agent_group_id, COUNT(*) FROM memories GROUP BY agent_group_id"
 ```
 
+### 4b. Import v1 Claude Code auto-memory
+
+Step 4 above imports the explicit `memories` MCP-tool rows. Claude Code
+*also* maintains its own auto-memory (a `MEMORY.md` + per-topic notes)
+under each group's `.claude/projects/<cwd-hash>/memory/`. That data is
+separate from the SQLite table and needs its own import.
+
+Dry-run first — lists each v1 group that has auto-memory to copy:
+
+```bash
+cd /home/ubuntu/nanoclaw-v2
+npx tsx scripts/import-v1-claude-memory.ts
+```
+
+Then commit with the same `--map` list as step 4 (add any v2-side
+folder remaps):
+
+```bash
+npx tsx scripts/import-v1-claude-memory.ts \
+  --map illysium=illysium \
+  --map main=main \
+  --map madison-reed=madison-reed \
+  --map number-drinks=number-drinks \
+  --commit
+```
+
+The script:
+- Copies v1's `-workspace-group/memory/*` → v2's `-workspace-agent/memory/*`
+  (the project-hash differs because v1's SDK cwd was `/workspace/group`
+  and v2's is `/workspace/agent` — same content, different filename).
+- Backs up any existing v2 file to `<name>.pre-import` before overwrite.
+  v2 auto-memory was frozen Apr 17–present due to the UID-remap bug, so
+  v2's existing files are essentially empty and overwrite is safe, but
+  the backup gives a trivial rollback path.
+- `chown -R 1001:1001` the target `.claude-shared/` so the post-UID-remap
+  container can write new memories into the dirs. Uses `sudo -n` if not
+  already privileged; logs a warning if it can't escalate.
+
+Verify:
+```bash
+ls -lt /home/ubuntu/nanoclaw-v2/data/v2-sessions/<ag-id>/.claude-shared/projects/-workspace-agent/memory/ | head
+```
+
 ### 5. Hand off the bot tokens
 
 The `.env` already has the correct tokens — v1 and v2 share the
