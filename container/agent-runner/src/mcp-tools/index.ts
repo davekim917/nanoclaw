@@ -16,6 +16,7 @@ import './tone-profiles.js';
 import './remote-control.js';
 import './capabilities.js';
 import './permissions.js';
+import './channel-config.js';
 import { startMcpServer } from './server.js';
 
 function log(msg: string): void {
