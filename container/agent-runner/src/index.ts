@@ -52,11 +52,12 @@ async function main(): Promise<void> {
 
   log(`Starting v2 agent-runner (provider: ${providerName})`);
 
-  // Destinations addendum is the only runtime-generated context we inject.
-  // Global CLAUDE.md is loaded by Claude Code from /workspace/agent/CLAUDE.md
-  // (which imports /workspace/global/CLAUDE.md via @-syntax) — no need to
-  // read it manually anymore.
-  const instructions = buildSystemPromptAddendum();
+  // System-prompt addendum: identity + communication invariants + runtime
+  // destination map. Global CLAUDE.md is ALSO loaded by Claude Code via the
+  // @-import from /workspace/agent/CLAUDE.md, but the invariants here (name,
+  // meta-response prohibition, credential-in-chat rule) are duplicated in
+  // the addendum so a CLAUDE.md load failure can't silently drop them.
+  const instructions = buildSystemPromptAddendum(assistantName);
 
   // Discover additional directories mounted at /workspace/extra/*
   const additionalDirectories: string[] = [];

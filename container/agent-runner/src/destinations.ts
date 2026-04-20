@@ -73,45 +73,82 @@ export function findByRouting(
 }
 
 /** Generate the system-prompt addendum describing destinations and syntax. */
-export function buildSystemPromptAddendum(): string {
+export function buildSystemPromptAddendum(assistantName?: string): string {
+  const sections: string[] = [];
+
+  // Identity first — without this, the SDK defaults to "Claude" framing
+  // which drifts the agent out of the NanoClaw persona the user expects.
+  // v1 always included this as part of system-prompt assembly.
+  if (assistantName) {
+    sections.push(`## Your identity\n\nYour name is ${assistantName}. Introduce yourself as ${assistantName} when asked, not as Claude.`);
+  }
+
+  // Communication conventions. These are invariants the NanoClaw harness
+  // relies on across every session regardless of destination count — must
+  // land in the appended system prompt, not just the mounted CLAUDE.md
+  // files, because the CLAUDE.md path is sometimes unreliable (see
+  // V1_BEHAVIOR_AUDIT #25 history).
+  sections.push(
+    [
+      '## Communication conventions',
+      '',
+      // Meta-response prohibition. Mirrors v1's system-prompt assembly
+      // (container/agent-runner/src/index.ts:2123 region). Without it the
+      // agent occasionally emits "No response requested." or "The user\'s',
+      // 'message does not require a response." as its entire turn, which',
+      // 'reaches the user as garbage.
+      'If a user message does not seem to call for a reply, send a brief acknowledgment or ask a clarifying question — do not produce meta-responses like "No response requested." or "The user\'s message does not require a response." Those are internal judgments, not content to deliver.',
+      '',
+      // Credential-in-chat hard rule. V1 commits ff24bd9 / 4e6c12b added
+      // this after incidents where agents asked users to paste API keys
+      // directly into the chat.
+      'Never ask a user to paste API keys, OAuth tokens, passwords, or other credentials into chat. If a capability is unavailable due to missing credentials, say so and stop — do not suggest the user share the credential with you.',
+    ].join('\n'),
+  );
+
+  // Destinations section.
   const all = getAllDestinations();
 
   if (all.length === 0) {
-    return [
-      '## Sending messages',
-      '',
-      'You currently have no configured destinations. You cannot send messages until an admin wires one up.',
-    ].join('\n');
-  }
-
-  // Single-destination shortcut: the agent just writes its response normally.
-  if (all.length === 1) {
+    sections.push(
+      [
+        '## Sending messages',
+        '',
+        'You currently have no configured destinations. You cannot send messages until an admin wires one up.',
+      ].join('\n'),
+    );
+  } else if (all.length === 1) {
+    // Single-destination shortcut: the agent just writes its response normally.
     const d = all[0];
     const label = d.displayName && d.displayName !== d.name ? ` (${d.displayName})` : '';
-    return [
-      '## Sending messages',
-      '',
-      `Your messages are delivered to \`${d.name}\`${label}. Just write your response directly — no special wrapping needed.`,
-      '',
-      'To mark something as scratchpad (logged but not sent), wrap it in `<internal>...</internal>`.',
-      '',
-      'To send a message mid-response (e.g., an acknowledgment before a long task), call the `send_message` MCP tool.',
-    ].join('\n');
+    sections.push(
+      [
+        '## Sending messages',
+        '',
+        `Your messages are delivered to \`${d.name}\`${label}. Just write your response directly — no special wrapping needed.`,
+        '',
+        'To mark something as scratchpad (logged but not sent), wrap it in `<internal>...</internal>`.',
+        '',
+        'To send a message mid-response (e.g., an acknowledgment before a long task), call the `send_message` MCP tool.',
+      ].join('\n'),
+    );
+  } else {
+    const lines = ['## Sending messages', '', 'You can send messages to the following destinations:', ''];
+    for (const d of all) {
+      const label = d.displayName && d.displayName !== d.name ? ` (${d.displayName})` : '';
+      lines.push(`- \`${d.name}\`${label}`);
+    }
+    lines.push('');
+    lines.push('To send a message, wrap it in a `<message to="name">...</message>` block.');
+    lines.push('You can include multiple `<message>` blocks in one response to send to multiple destinations.');
+    lines.push('Text outside of `<message>` blocks is scratchpad — logged but not sent anywhere.');
+    lines.push('Use `<internal>...</internal>` to make scratchpad intent explicit.');
+    lines.push('');
+    lines.push(
+      'To send a message mid-response (e.g., an acknowledgment before a long task), call the `send_message` MCP tool with the `to` parameter set to a destination name.',
+    );
+    sections.push(lines.join('\n'));
   }
 
-  const lines = ['## Sending messages', '', 'You can send messages to the following destinations:', ''];
-  for (const d of all) {
-    const label = d.displayName && d.displayName !== d.name ? ` (${d.displayName})` : '';
-    lines.push(`- \`${d.name}\`${label}`);
-  }
-  lines.push('');
-  lines.push('To send a message, wrap it in a `<message to="name">...</message>` block.');
-  lines.push('You can include multiple `<message>` blocks in one response to send to multiple destinations.');
-  lines.push('Text outside of `<message>` blocks is scratchpad — logged but not sent anywhere.');
-  lines.push('Use `<internal>...</internal>` to make scratchpad intent explicit.');
-  lines.push('');
-  lines.push(
-    'To send a message mid-response (e.g., an acknowledgment before a long task), call the `send_message` MCP tool with the `to` parameter set to a destination name.',
-  );
-  return lines.join('\n');
+  return sections.join('\n\n');
 }
