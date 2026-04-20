@@ -202,24 +202,58 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       const errMsg = err instanceof Error ? err.message : String(err);
       log(`Query error: ${errMsg}`);
 
-      // Stale/corrupt continuation recovery: ask the provider whether
-      // this error means the stored continuation is unusable, and clear
-      // it so the next attempt starts fresh.
-      if (continuation && config.provider.isSessionInvalid(err)) {
+      let recovered = false;
+
+      // Context-window recovery: session grew past the model's limit.
+      // Clear the continuation AND retry the same prompt once with a
+      // fresh session, mirroring v1's silent prompt_too_long auto-
+      // recovery. Without the in-turn retry, every future turn on this
+      // session would fail with the same error until the user manually
+      // /clear'd. Marker prefix tells the agent why it's starting blank.
+      if (continuation && config.provider.isContextTooLong?.(err)) {
+        log(`Context-too-long detected — clearing session and retrying once with fresh continuation`);
+        continuation = undefined;
+        clearStoredSessionId();
+        try {
+          const retryPrompt =
+            '[The prior session exceeded the model context window and was reset. Continuing fresh from here.]\n\n' +
+            prompt;
+          const retryQuery = config.provider.query({
+            prompt: retryPrompt,
+            continuation: undefined,
+            cwd: config.cwd,
+            systemContext: config.systemContext,
+          });
+          const retryResult = await processQuery(retryQuery, routing);
+          if (retryResult.continuation) {
+            continuation = retryResult.continuation;
+            setStoredSessionId(continuation);
+          }
+          recovered = true;
+        } catch (retryErr) {
+          const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
+          log(`Retry after context-too-long also failed: ${retryMsg}`);
+        }
+      } else if (continuation && config.provider.isSessionInvalid(err)) {
+        // Stale/corrupt continuation — clearing lets the next poll start
+        // fresh. No in-turn retry; the message's markCompleted below
+        // means the user must re-send. Matches prior v2 behavior.
         log(`Stale session detected (${continuation}) — clearing for next retry`);
         continuation = undefined;
         clearStoredSessionId();
       }
 
-      // Write error response so the user knows something went wrong
-      writeMessageOut({
-        id: generateId(),
-        kind: 'chat',
-        platform_id: routing.platformId,
-        channel_type: routing.channelType,
-        thread_id: routing.threadId,
-        content: JSON.stringify({ text: `Error: ${errMsg}` }),
-      });
+      // Only surface the error to the user if we couldn't recover inline.
+      if (!recovered) {
+        writeMessageOut({
+          id: generateId(),
+          kind: 'chat',
+          platform_id: routing.platformId,
+          channel_type: routing.channelType,
+          thread_id: routing.threadId,
+          content: JSON.stringify({ text: `Error: ${errMsg}` }),
+        });
+      }
     }
 
     // Per-turn safety net: checkpoint any uncommitted worktree edits so the

@@ -202,11 +202,7 @@ export function markDelivered(db: Database.Database, messageOutId: string, platf
   ).run(messageOutId, platformMessageId ?? null);
 }
 
-export function markDeliveryFailed(
-  db: Database.Database,
-  messageOutId: string,
-  errorMessage?: string,
-): void {
+export function markDeliveryFailed(db: Database.Database, messageOutId: string, errorMessage?: string): void {
   db.prepare(
     "INSERT OR IGNORE INTO delivered (message_out_id, platform_message_id, status, error, delivered_at) VALUES (?, NULL, 'failed', ?, datetime('now'))",
   ).run(messageOutId, errorMessage ?? null);

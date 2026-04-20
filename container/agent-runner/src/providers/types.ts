@@ -14,6 +14,18 @@ export interface AgentProvider {
    * (missing transcript, unknown session, etc.) and should be cleared.
    */
   isSessionInvalid(err: unknown): boolean;
+
+  /**
+   * True if the given error indicates the session has grown past the model's
+   * context window. Poll-loop uses this to trigger in-turn recovery: clear
+   * the continuation AND retry the same user message once with a fresh
+   * session, so long-lived sessions don't dead-turn the user.
+   *
+   * Optional because not every provider has a distinct prompt-too-long
+   * signal; those that don't should return false (poll-loop falls back to
+   * the error-write path).
+   */
+  isContextTooLong?(err: unknown): boolean;
 }
 
 /**

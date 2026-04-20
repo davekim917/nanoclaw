@@ -380,6 +380,16 @@ const CLAUDE_CODE_AUTO_COMPACT_WINDOW = '165000';
  */
 const STALE_SESSION_RE = /no conversation found|ENOENT.*\.jsonl|session.*not found/i;
 
+/**
+ * Prompt-too-long detection. Matches the text variations Anthropic has
+ * used across SDK versions when the cumulative session prompt exceeds
+ * the model's context window. Distinct from STALE_SESSION_RE because the
+ * recovery strategy differs: stale-session just needs a cleared
+ * continuation; prompt-too-long needs that PLUS an in-turn retry with a
+ * fresh session, otherwise the same message fails on the next poll too.
+ */
+const PROMPT_TOO_LONG_RE = /prompt is too long|prompt_too_long|maximum context length|context[_ ]length.*exceed/i;
+
 export class ClaudeProvider implements AgentProvider {
   readonly supportsNativeSlashCommands = true;
 
@@ -401,6 +411,11 @@ export class ClaudeProvider implements AgentProvider {
   isSessionInvalid(err: unknown): boolean {
     const msg = err instanceof Error ? err.message : String(err);
     return STALE_SESSION_RE.test(msg);
+  }
+
+  isContextTooLong(err: unknown): boolean {
+    const msg = err instanceof Error ? err.message : String(err);
+    return PROMPT_TOO_LONG_RE.test(msg);
   }
 
   query(input: QueryInput): AgentQuery {
