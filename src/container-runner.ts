@@ -607,12 +607,16 @@ async function buildContainerArgs(
   // the values are set regardless of the SDK's settings-loading order.
   args.push('-e', 'CLAUDE_CODE_DISABLE_AUTO_MEMORY=0');
   args.push('-e', 'CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80');
-  // Lock the `opus` alias to 4.7 so SDK-lag can't silently downgrade a
-  // session to 4.6 (or whatever the upstream default happens to be). v1
-  // set this in the per-session settings.json env block; v2 bakes it here.
-  // Explicit -m1 claude-opus-4-6[1m] (via the agent-runner flag parser)
-  // still overrides when a session wants an older version.
-  args.push('-e', 'ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-7');
+  // Default `opus` alias resolution. The SDK's opus-alias resolver reads
+  // this first and sends the explicit id to the API — avoids SDK-lag
+  // silently downgrading sessions when a new flagship ships but the
+  // installed SDK doesn't know its id yet. Explicit -m1 claude-opus-4-7
+  // (or any model the allowlist accepts) overrides per session.
+  args.push('-e', 'ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-6[1m]');
+  // Default effort level when the agent doesn't pass -e/-e1 itself.
+  // Container provider's per-query env will override with user flags.
+  args.push('-e', 'CLAUDE_CODE_USE_EFFORT=high');
+  args.push('-e', 'CLAUDE_CODE_EFFORT_LEVEL=high');
   // v1 settings.json env block (src/container-runner.ts:1703-1709): SDK
   // capabilities that need explicit opt-in. Porting as plain env since
   // v2's container reads env, not a settings.json mount point.
@@ -722,18 +726,29 @@ async function buildContainerArgs(
   // are routed through the agent vault for credential injection.
   // Must ensureAgent first for non-admin groups, otherwise applyContainerConfig
   // rejects the unknown agent identifier and returns false.
-  try {
-    if (agentIdentifier) {
-      await onecli.ensureAgent({ name: agentGroup.name, identifier: agentIdentifier });
+  //
+  // Skipped entirely when the operator is running a non-Anthropic routing
+  // proxy via ANTHROPIC_BASE_URL. The two paths are mutually exclusive:
+  // OneCLI intercepts outbound HTTPS at the TCP layer, which would
+  // interfere with openlimits / custom-proxy auth. In the BASE_URL path,
+  // ANTHROPIC_API_KEY (+ _N fallbacks) forwarded directly by the
+  // env-forwarding block above provide auth without OneCLI.
+  if (process.env.ANTHROPIC_BASE_URL) {
+    log.info('Skipping OneCLI gateway — ANTHROPIC_BASE_URL set, using direct proxy', { containerName });
+  } else {
+    try {
+      if (agentIdentifier) {
+        await onecli.ensureAgent({ name: agentGroup.name, identifier: agentIdentifier });
+      }
+      const onecliApplied = await onecli.applyContainerConfig(args, { addHostMapping: false, agent: agentIdentifier });
+      if (onecliApplied) {
+        log.info('OneCLI gateway applied', { containerName });
+      } else {
+        log.warn('OneCLI gateway not applied — container will have no credentials', { containerName });
+      }
+    } catch (err) {
+      log.warn('OneCLI gateway error — container will have no credentials', { containerName, err });
     }
-    const onecliApplied = await onecli.applyContainerConfig(args, { addHostMapping: false, agent: agentIdentifier });
-    if (onecliApplied) {
-      log.info('OneCLI gateway applied', { containerName });
-    } else {
-      log.warn('OneCLI gateway not applied — container will have no credentials', { containerName });
-    }
-  } catch (err) {
-    log.warn('OneCLI gateway error — container will have no credentials', { containerName, err });
   }
 
   // Host gateway
