@@ -276,6 +276,61 @@ function createSanitizeBashHook(): HookCallback {
   };
 }
 
+function denyBash(reason: string) {
+  return {
+    systemMessage: reason,
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse' as const,
+      permissionDecision: 'deny' as const,
+      permissionDecisionReason: reason,
+    },
+  };
+}
+
+// ── Block ad-hoc Python snowflake.connector ──
+// `snow` CLI is gated by destructive-operation controls (and scoped
+// credential mounts); the Python connector bypasses those. Only blocks
+// direct python execution — grep, echo, pip install, and existing
+// scripts that happen to contain the string are unaffected.
+const SNOWFLAKE_CONNECTOR_EXEC_RE = /\bpython[23]?\b.*\bsnowflake[._]connector\b/i;
+
+function createBlockSnowflakeConnectorHook(): HookCallback {
+  return async (input) => {
+    const pre = input as PreToolUseHookInput;
+    const command = (pre.tool_input as { command?: string })?.command;
+    if (!command) return {};
+    if (SNOWFLAKE_CONNECTOR_EXEC_RE.test(command)) {
+      return denyBash(
+        'Direct use of Python snowflake.connector is blocked. Use `snow sql` for ad-hoc queries. If `snow` isn\'t working, report the error rather than falling back to the Python connector.',
+      );
+    }
+    return {};
+  };
+}
+
+// ── Block ad-hoc `git clone` outside /tmp ──
+// Agents must use the create_worktree / clone_repo MCP tools to land a
+// repo inside the managed worktree tree. Direct `git clone` into
+// /workspace/agent or /workspace/worktrees skips auto-commit safety,
+// credential scoping, and the index registration that downstream tools
+// rely on. /tmp clones (ephemeral, sometimes needed for tool installs)
+// are allowed.
+const GIT_CLONE_RE = /\bgit\s+clone\b/;
+const GIT_CLONE_TMP_RE = /\bgit\s+clone\b[^;|&\n]*\s+\/tmp\//;
+
+function createBlockGitCloneHook(): HookCallback {
+  return async (input) => {
+    const pre = input as PreToolUseHookInput;
+    const command = (pre.tool_input as { command?: string })?.command;
+    if (!command) return {};
+    if (!GIT_CLONE_RE.test(command)) return {};
+    if (GIT_CLONE_TMP_RE.test(command)) return {};
+    return denyBash(
+      '`git clone` is blocked outside /tmp. Use the `create_worktree` MCP tool to get a working directory for a repo under `/workspace/worktrees/<repo>`. If the repo is not yet in the agent group, use `clone_repo` first.',
+    );
+  };
+}
+
 // ── SDK env denylist ──
 
 // These secrets are either rotating short-lived tokens (Granola) or
@@ -448,7 +503,19 @@ export class ClaudeProvider implements AgentProvider {
         mcpServers: this.mcpServers,
         plugins: plugins.length > 0 ? plugins : undefined,
         hooks: {
-          PreToolUse: [{ matcher: 'Bash', hooks: [createSanitizeBashHook()] }],
+          PreToolUse: [
+            {
+              matcher: 'Bash',
+              // Order matters: sanitize runs first so blocked commands
+              // also get the unset prefix stripped from logs. Block
+              // hooks run after and return deny if they match.
+              hooks: [
+                createSanitizeBashHook(),
+                createBlockSnowflakeConnectorHook(),
+                createBlockGitCloneHook(),
+              ],
+            },
+          ],
           PreCompact: [{ hooks: [createPreCompactHook(this.assistantName)] }],
         },
       },
