@@ -72,32 +72,22 @@ doesn't touch any existing code path.
 `delete_memory`, `update_memory`, `list_memories`, `search_memories`.
 Agents used this for "remember that X" / "what do we know about Y?".
 
-**Why deferred:** biggest remaining item. Requires (a) embedding-provider
-decision, (b) new virtual-table subsystem, (c) host-side writer. v2 currently
-has `src/db/memories.ts` as a Phase-A **keyword-only** scaffold — NOT a
-functional replacement. The scaffold exists so migrations line up; do NOT
-rely on it as equivalent to v1's retrieval.
+**v2 status — ON HOLD:** Claude Code's built-in auto-memory writes to
+`~/.claude/projects/{project}/memory/MEMORY.md` and is verified working
+in v2 (2026-04-20). Shared via `.claude-shared` mount at `~/.claude/`
+so all sessions in an agent group read/write the same memory index.
+`autoDreamEnabled: true` in `settings.json` handles pruning/consolidation.
+Dave wants to evaluate whether this suffices before adding sqlite-vec
+complexity.
 
-**Open decision for Dave before starting:**
-- Embedding provider: OpenAI (v1's choice), Voyage, or host-side via the
-  Anthropic Haiku prompt-embedding trick? Choice affects cost + latency +
-  whether we need a new env var.
+**When to revisit:** if auto-memory + autoDream proves insufficient for
+cross-thread recall, resume from here.
 
-**How to implement (after decision):**
-1. `pnpm add sqlite-vec` on host. Load extension at DB-open time.
-2. Extend `src/db/memories.ts`:
-   - `CREATE VIRTUAL TABLE vec_memories USING vec0(embedding FLOAT[N])` where
-     N = embedding dim of chosen provider.
-   - Writer path calls provider → writes both the plaintext row and the
-     vector row (same rowid).
-3. MCP tools in `container/agent-runner/src/mcp-tools/memory.ts` — five
-   tools listed above. `search_memories` emits a query → host embeds →
-   host runs vec MATCH + keyword fallback → returns ranked results via
-   outbound ack. (Container doesn't call the embedding API directly;
-   keeps API key out of the container.)
-4. Scope every query by `agent_group_id` (same isolation as archive/search).
+**If revisiting:** requires an embedding-provider decision (OpenAI,
+Voyage, or host-side Haiku trick), sqlite-vec setup, and the full
+MCP tool chain. See v1 `src/memory-store.ts` for the full feature.
 
-**Est:** ~3hr after provider decision.
+**Est:** ~3hr after decision to proceed.
 
 ---
 
@@ -108,4 +98,5 @@ For context — not active work:
 - `/kill` admin command (cdb8f65)
 - `read_thread` / `read_thread_by_key` MCP tools (76e654e)
 - Haiku semantic rerank on `search_threads` (5128baa)
-- Scoped credential filtering (IN PROGRESS — not this file's scope)
+- Per-agent scoped credential filtering (6578be1)
+- Upstream v2 merge (c2b163d)
