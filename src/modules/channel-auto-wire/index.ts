@@ -17,13 +17,26 @@
  * Config (optional, per channel_type). Keys are the channel_type
  * uppercased with dashes replaced by underscores:
  *
- *   NANOCLAW_DEFAULT_AGENT_GROUP_<CHANNEL_TYPE>   agent_groups.folder
- *   NANOCLAW_DEFAULT_SESSION_MODE_<CHANNEL_TYPE>  per-thread | shared |
- *                                                 agent-shared (default: per-thread)
+ *   NANOCLAW_DEFAULT_AGENT_GROUP_<CHANNEL_TYPE>     agent_groups.folder
+ *   NANOCLAW_DEFAULT_SESSION_MODE_<CHANNEL_TYPE>    per-thread | shared |
+ *                                                   agent-shared (default: per-thread)
+ *   NANOCLAW_DEFAULT_SENDER_POLICY_<CHANNEL_TYPE>   strict | request_approval |
+ *                                                   public (default: strict — the
+ *                                                   safe v2 upstream default)
+ *
+ * Why sender policy is part of auto-wire. Router creates new messaging
+ * groups with `unknown_sender_policy='strict'`, which is the right safe
+ * default when wiring is manual (you explicitly grant access per user).
+ * For channel-types where the platform's own membership is the gate —
+ * Slack workspace membership for the Illysium bot — v1 behavior is
+ * effectively `public` (anyone in the workspace can invoke). Setting
+ * this env matches that behavior per channel_type without widening it
+ * for channel_types where you do want strict.
  *
  * Example:
  *   NANOCLAW_DEFAULT_AGENT_GROUP_SLACK_ILLYSIUM=illysium-v2
  *   NANOCLAW_DEFAULT_SESSION_MODE_SLACK_ILLYSIUM=per-thread
+ *   NANOCLAW_DEFAULT_SENDER_POLICY_SLACK_ILLYSIUM=public
  *
  * When a Slack message arrives from a channel in the Illysium workspace
  * that's not yet wired, this module creates a `messaging_group_agents`
@@ -39,13 +52,16 @@
  * module matches upstream exactly. Candidate for upstreaming later.
  */
 import { getAgentGroupByFolder } from '../../db/agent-groups.js';
-import { createMessagingGroupAgent } from '../../db/messaging-groups.js';
+import { createMessagingGroupAgent, updateMessagingGroup } from '../../db/messaging-groups.js';
 import { log } from '../../log.js';
 import { setUnwiredChannelResolver, type UnwiredChannelResolverFn } from '../../router.js';
-import type { MessagingGroupAgent } from '../../types.js';
+import type { MessagingGroup, MessagingGroupAgent } from '../../types.js';
 
 const VALID_SESSION_MODES = new Set(['shared', 'per-thread', 'agent-shared'] as const);
 type SessionMode = 'shared' | 'per-thread' | 'agent-shared';
+
+const VALID_SENDER_POLICIES = new Set(['strict', 'request_approval', 'public'] as const);
+type SenderPolicy = MessagingGroup['unknown_sender_policy'];
 
 function envKey(prefix: string, channelType: string): string {
   return `${prefix}_${channelType.toUpperCase().replace(/-/g, '_')}`;
@@ -71,6 +87,20 @@ function resolveDefaultSessionMode(channelType: string): SessionMode {
   return 'per-thread';
 }
 
+function resolveDefaultSenderPolicy(channelType: string): SenderPolicy | null {
+  const raw = process.env[envKey('NANOCLAW_DEFAULT_SENDER_POLICY', channelType)];
+  const trimmed = raw?.trim();
+  if (!trimmed) return null;
+  if (VALID_SENDER_POLICIES.has(trimmed as SenderPolicy)) {
+    return trimmed as SenderPolicy;
+  }
+  log.warn('channel-auto-wire: invalid sender_policy in env, leaving mg at strict default', {
+    channelType,
+    value: trimmed,
+  });
+  return null;
+}
+
 function newId(): string {
   return `mga-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -90,6 +120,26 @@ export const resolver: UnwiredChannelResolverFn = (event, mg) => {
   }
 
   const sessionMode = resolveDefaultSessionMode(event.channelType);
+
+  // Relax the unknown_sender_policy if one is configured for this
+  // channel_type. Router created the mg with `strict` (v2's safe default);
+  // for channel_types where the platform's own membership is the gate
+  // (e.g. Slack workspace), `public` restores v1 parity. We mutate `mg`
+  // in-place because the router holds a reference to this same object
+  // and passes it to the access gate immediately after us — the DB
+  // update is what persists the change for subsequent messages.
+  const senderPolicy = resolveDefaultSenderPolicy(event.channelType);
+  if (senderPolicy && senderPolicy !== mg.unknown_sender_policy) {
+    updateMessagingGroup(mg.id, { unknown_sender_policy: senderPolicy });
+    mg.unknown_sender_policy = senderPolicy;
+    log.info('channel-auto-wire: relaxed unknown_sender_policy', {
+      messagingGroupId: mg.id,
+      channelType: event.channelType,
+      from: 'strict',
+      to: senderPolicy,
+    });
+  }
+
   const mga: MessagingGroupAgent = {
     id: newId(),
     messaging_group_id: mg.id,

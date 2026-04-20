@@ -8,7 +8,7 @@
 import { beforeEach, afterEach, describe, expect, it } from 'vitest';
 
 import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from '../../db/index.js';
-import { getMessagingGroupAgents } from '../../db/messaging-groups.js';
+import { getMessagingGroupAgents, getMessagingGroupByPlatform } from '../../db/messaging-groups.js';
 import type { InboundEvent } from '../../router.js';
 import type { AgentGroup, MessagingGroup } from '../../types.js';
 import { resolver } from './index.js';
@@ -50,6 +50,7 @@ function makeAgentGroup(id: string, folder: string, name: string): AgentGroup {
 
 const ENV_FOLDER_KEY = 'NANOCLAW_DEFAULT_AGENT_GROUP_SLACK_ILLYSIUM';
 const ENV_MODE_KEY = 'NANOCLAW_DEFAULT_SESSION_MODE_SLACK_ILLYSIUM';
+const ENV_POLICY_KEY = 'NANOCLAW_DEFAULT_SENDER_POLICY_SLACK_ILLYSIUM';
 const ENV_DISCORD_KEY = 'NANOCLAW_DEFAULT_AGENT_GROUP_DISCORD';
 
 let saved: Record<string, string | undefined> = {};
@@ -60,10 +61,12 @@ beforeEach(() => {
   saved = {
     [ENV_FOLDER_KEY]: process.env[ENV_FOLDER_KEY],
     [ENV_MODE_KEY]: process.env[ENV_MODE_KEY],
+    [ENV_POLICY_KEY]: process.env[ENV_POLICY_KEY],
     [ENV_DISCORD_KEY]: process.env[ENV_DISCORD_KEY],
   };
   delete process.env[ENV_FOLDER_KEY];
   delete process.env[ENV_MODE_KEY];
+  delete process.env[ENV_POLICY_KEY];
   delete process.env[ENV_DISCORD_KEY];
 });
 
@@ -137,6 +140,52 @@ describe('channel-auto-wire resolver', () => {
     const result = resolver(makeEvent('slack-illysium', 'slack:C5'), mg);
 
     expect(result[0].session_mode).toBe('per-thread');
+  });
+
+  it('leaves unknown_sender_policy at strict when not configured', () => {
+    const ag = makeAgentGroup('ag-auto', 'illysium-v2', 'illie');
+    createAgentGroup(ag);
+    process.env[ENV_FOLDER_KEY] = 'illysium-v2';
+
+    const mg = makeMg('mg-policy-1', 'slack-illysium', 'slack:CP1');
+    createMessagingGroup(mg);
+    resolver(makeEvent('slack-illysium', 'slack:CP1'), mg);
+
+    const persisted = getMessagingGroupByPlatform('slack-illysium', 'slack:CP1');
+    expect(persisted?.unknown_sender_policy).toBe('strict');
+    expect(mg.unknown_sender_policy).toBe('strict');
+  });
+
+  it('relaxes unknown_sender_policy when configured (public) — persists + mutates in-place', () => {
+    const ag = makeAgentGroup('ag-auto', 'illysium-v2', 'illie');
+    createAgentGroup(ag);
+    process.env[ENV_FOLDER_KEY] = 'illysium-v2';
+    process.env[ENV_POLICY_KEY] = 'public';
+
+    const mg = makeMg('mg-policy-2', 'slack-illysium', 'slack:CP2');
+    createMessagingGroup(mg);
+    resolver(makeEvent('slack-illysium', 'slack:CP2'), mg);
+
+    // Mutated in-place so router's current-message access gate sees it.
+    expect(mg.unknown_sender_policy).toBe('public');
+    // Persisted so subsequent messages skip the mutation path entirely.
+    const persisted = getMessagingGroupByPlatform('slack-illysium', 'slack:CP2');
+    expect(persisted?.unknown_sender_policy).toBe('public');
+  });
+
+  it('ignores invalid sender_policy values (stays strict, logs warning)', () => {
+    const ag = makeAgentGroup('ag-auto', 'illysium-v2', 'illie');
+    createAgentGroup(ag);
+    process.env[ENV_FOLDER_KEY] = 'illysium-v2';
+    process.env[ENV_POLICY_KEY] = 'yolo';
+
+    const mg = makeMg('mg-policy-3', 'slack-illysium', 'slack:CP3');
+    createMessagingGroup(mg);
+    resolver(makeEvent('slack-illysium', 'slack:CP3'), mg);
+
+    expect(mg.unknown_sender_policy).toBe('strict');
+    const persisted = getMessagingGroupByPlatform('slack-illysium', 'slack:CP3');
+    expect(persisted?.unknown_sender_policy).toBe('strict');
   });
 
   it('is scoped per channel_type — `discord` config does not wire `slack-illysium`', () => {
