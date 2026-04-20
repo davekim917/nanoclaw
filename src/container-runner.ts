@@ -607,16 +607,25 @@ async function buildContainerArgs(
   // the values are set regardless of the SDK's settings-loading order.
   args.push('-e', 'CLAUDE_CODE_DISABLE_AUTO_MEMORY=0');
   args.push('-e', 'CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80');
-  // Default `opus` alias resolution. The SDK's opus-alias resolver reads
-  // this first and sends the explicit id to the API — avoids SDK-lag
-  // silently downgrading sessions when a new flagship ships but the
-  // installed SDK doesn't know its id yet. Explicit -m1 claude-opus-4-7
-  // (or any model the allowlist accepts) overrides per session.
-  args.push('-e', 'ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-6[1m]');
-  // Default effort level when the agent doesn't pass -e/-e1 itself.
-  // Container provider's per-query env will override with user flags.
-  args.push('-e', 'CLAUDE_CODE_USE_EFFORT=high');
-  args.push('-e', 'CLAUDE_CODE_EFFORT_LEVEL=high');
+
+  // Default `opus` alias resolution and default effort — both
+  // configurable via host env so the install can upgrade to a newer
+  // model or change default effort without a code change. Per-session
+  // flags (-m / -m1 / -e / -e1 in the agent-runner flag parser) still
+  // override. Short aliases (opus46, opus4-7, etc.) are in the flag
+  // parser's MODEL_ALIAS_MAP — independent of these defaults.
+  //
+  // ANTHROPIC_DEFAULT_OPUS_MODEL is the SDK's opus-alias resolver
+  // short-circuit: whatever string is here gets sent to the API
+  // verbatim when the agent or a subagent uses the bare `opus` alias.
+  // Fallback default 'claude-opus-4-6[1m]' keeps sessions on the 1M
+  // context variant rather than letting SDK-lag silently downgrade.
+  const defaultOpusModel = process.env.ANTHROPIC_DEFAULT_OPUS_MODEL ?? 'claude-opus-4-6[1m]';
+  args.push('-e', `ANTHROPIC_DEFAULT_OPUS_MODEL=${defaultOpusModel}`);
+
+  const defaultEffort = process.env.NANOCLAW_DEFAULT_EFFORT ?? 'high';
+  args.push('-e', `CLAUDE_CODE_USE_EFFORT=${defaultEffort}`);
+  args.push('-e', `CLAUDE_CODE_EFFORT_LEVEL=${defaultEffort}`);
   // v1 settings.json env block (src/container-runner.ts:1703-1709): SDK
   // capabilities that need explicit opt-in. Porting as plain env since
   // v2's container reads env, not a settings.json mount point.
