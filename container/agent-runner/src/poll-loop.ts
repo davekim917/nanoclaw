@@ -146,6 +146,29 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           continue;
         }
 
+        if (cmdInfo.command === '/kill') {
+          // Graceful shutdown: stored sdk session_id is preserved so the
+          // NEXT wake resumes the same agent transcript — this exits the
+          // container, not the agent's memory. Host env/mounts refresh on
+          // the next spawn, so /kill is also the way to pick up host-side
+          // config changes (new mounts, new .env, new defaults).
+          log('Kill requested — shutting down container gracefully');
+          writeMessageOut({
+            id: generateId(),
+            kind: 'chat',
+            platform_id: routing.platformId,
+            channel_type: routing.channelType,
+            thread_id: routing.threadId,
+            content: JSON.stringify({
+              text: 'Container shutting down. Next message will spawn a fresh container with refreshed host config.',
+            }),
+          });
+          markCompleted([msg.id, ...commandIds]);
+          // Give outbound a moment to flush to disk before exit.
+          await sleep(250);
+          process.exit(0);
+        }
+
         // Other admin commands — pass through to agent
         normalMessages.push(msg);
         continue;

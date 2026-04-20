@@ -10,7 +10,7 @@ import type { MessageInRow } from './db/messages-in.js';
  */
 export type CommandCategory = 'admin' | 'filtered' | 'passthrough' | 'none';
 
-const ADMIN_COMMANDS = new Set(['/remote-control', '/clear', '/compact', '/context', '/cost', '/files']);
+const ADMIN_COMMANDS = new Set(['/remote-control', '/clear', '/compact', '/context', '/cost', '/files', '/kill']);
 const FILTERED_COMMANDS = new Set(['/help', '/login', '/logout', '/doctor', '/config']);
 
 const VALID_EFFORT_LEVELS = new Set(['low', 'medium', 'high', 'xhigh']);
