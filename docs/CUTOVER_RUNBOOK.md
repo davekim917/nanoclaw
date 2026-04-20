@@ -18,22 +18,32 @@ Verify everything's green before committing to a cutover window:
    docker inspect nanoclaw-agent:v2 --format '{{.Created}}'
    # Should be after the last `./container/build.sh v2` run
    ```
-3. **Phase 3 parity checklist** — at minimum, the pre-cutover sections
+3. **v2 image runs as UID 1001** (matches host `ubuntu` user — prerequisite
+   for Claude Code auto-memory + autodream writes to succeed; see the
+   `fix(container): remap node UID` commit):
+   ```bash
+   docker run --rm --entrypoint id nanoclaw-agent:v2
+   # Expect: uid=1001(node) gid=1001(node)
+   ```
+   If this reports `uid=1000`, rebuild: `./container/build.sh v2`.
+4. **Phase 3 parity checklist** — at minimum, the pre-cutover sections
    should all be green (`docs/MIGRATION_FROM_V1.md` → Parity Checklist).
-4. **Backup v1 data**:
+5. **Backup v1 data**:
    ```bash
    cp /home/ubuntu/nanoclaw/store/messages.db \
       /home/ubuntu/nanoclaw/store/messages.db.pre-cutover.$(date -u +%Y%m%d)
    cp -r /home/ubuntu/nanoclaw/groups \
       /home/ubuntu/nanoclaw/groups.pre-cutover.$(date -u +%Y%m%d)
    ```
-5. **Dry-run the memory import** so the plan is known:
+6. **Dry-run both memory imports** so the plan is known:
    ```bash
    cd /home/ubuntu/nanoclaw-v2
-   npx tsx scripts/import-v1-memories.ts
+   npx tsx scripts/import-v1-memories.ts        # SQLite memories table
+   npx tsx scripts/import-v1-claude-memory.ts   # Claude Code auto-memory
    ```
    Note which v1 folders don't yet have a v2 agent group — either wire
-   them now (step 4 below) or decide to retire them.
+   them now (step 4 below) or decide to retire them. Both importers use
+   the same `--map` syntax and must be given the same map at commit time.
 
 ## Cutover sequence
 
@@ -150,7 +160,7 @@ Verify:
 ls -lt /home/ubuntu/nanoclaw-v2/data/v2-sessions/<ag-id>/.claude-shared/projects/-workspace-agent/memory/ | head
 ```
 
-### 5. Hand off the bot tokens
+### 5. Hand off the bot tokens + channel-policy env
 
 The `.env` already has the correct tokens — v1 and v2 share the
 same bot identities. Just make sure:
@@ -160,6 +170,30 @@ same bot identities. Just make sure:
   variants) — unchanged.
 - Discord slash commands: set `ENABLE_DISCORD_SLASH_COMMANDS=1` in
   `.env` now that v1 isn't competing for the Gateway.
+
+Channel auto-wire defaults (already in `.env` for `slack-illysium`;
+add entries for other channel-types as needed):
+
+```bash
+# Per channel_type (uppercased, dashes → underscores):
+NANOCLAW_DEFAULT_AGENT_GROUP_SLACK_ILLYSIUM=illysium
+NANOCLAW_DEFAULT_SESSION_MODE_SLACK_ILLYSIUM=per-thread
+NANOCLAW_DEFAULT_SENDER_POLICY_SLACK_ILLYSIUM=public
+```
+
+Setting `NANOCLAW_DEFAULT_AGENT_GROUP_<TYPE>` opts that channel type
+into auto-wire: new channels the bot joins auto-create a
+`messaging_group_agents` row pointing at the configured agent group,
+so the first message routes immediately without a `/manage-channels`
+pass. `_SENDER_POLICY_<TYPE>=public` matches v1 behavior for channel-
+types where the platform's own membership is the gate (Slack
+workspace membership for Illysium). Leave unset to preserve v2's
+safe `strict` default. See `src/modules/channel-auto-wire/index.ts`.
+
+**NOTE — illysium agent_group folder rename in step 2:** if you ran
+step 2's `illysium-v2` → `illysium` rename, update the env value above
+from `illysium-v2` to `illysium` to match. The current value (pre-
+rename) is whatever folder `illie-v2-test` was wired to.
 
 ### 6. Point the Slack webhook URL at v2
 
@@ -214,6 +248,30 @@ mv /home/ubuntu/nanoclaw /home/ubuntu/nanoclaw.retired-<date>
 # Optionally nuke v1 containers image:
 docker rmi nanoclaw-agent:latest
 ```
+
+## Post-cutover operational notes
+
+A few fork-specific primitives that change day-to-day operation vs v1:
+
+- **Chat-invokable access grants.** `@illie grant @alice access` grants
+  member access to the current agent group (owner/admin-gated —
+  caller is derived from the latest inbound message, not from anything
+  the agent can fake). Also: `revoke_access`, `list_access`. Eliminates
+  SQL-to-grant-access for adding teammates to strict channels. Host
+  module: `src/modules/permissions/grant.ts`; container tools:
+  `container/agent-runner/src/mcp-tools/permissions.ts`.
+- **Auto-wire on bot invite.** New Slack channels in the Illysium
+  workspace route immediately after invite — no manual
+  `/manage-channels` pass. Controlled by the env block in step 5.
+- **Default model + effort.** v2 starts every container with `model=opus`
+  (locked to `claude-opus-4-7` via `ANTHROPIC_DEFAULT_OPUS_MODEL`) and
+  `CLAUDE_CODE_EFFORT_LEVEL=medium`. Per-group override by editing the
+  group's `.claude-shared/settings.json` — the merge in
+  `src/group-init.ts` is additive and preserves user-set values.
+- **Auto-memory writes.** Claude Code's `MEMORY.md` + per-topic notes
+  now persist across sessions of the same agent group (post-UID-remap
+  fix). Path: `data/v2-sessions/<ag-id>/.claude-shared/projects/-workspace-agent/memory/`.
+  autodream prune runs inside the container on its own schedule.
 
 ## What to NOT migrate
 
