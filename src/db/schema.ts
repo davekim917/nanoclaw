@@ -147,10 +147,15 @@ CREATE INDEX IF NOT EXISTS idx_messages_in_series ON messages_in(series_id);
 
 -- Host tracks delivery outcomes for messages_out IDs.
 -- Avoids writing to outbound.db (container-owned).
+-- The error column carries the adapter's error message on permanent failure
+-- so the container's send_file tool can surface it to the agent (Slack
+-- missing_scope, file-size rejection, etc.) instead of reporting
+-- fire-and-forget success.
 CREATE TABLE IF NOT EXISTS delivered (
   message_out_id      TEXT PRIMARY KEY,
   platform_message_id TEXT,
   status              TEXT NOT NULL DEFAULT 'delivered',
+  error               TEXT,
   delivered_at        TEXT NOT NULL
 );
 

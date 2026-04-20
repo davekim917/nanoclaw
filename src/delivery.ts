@@ -222,7 +222,8 @@ async function drainSession(session: Session): Promise<void> {
             attempts,
             err,
           });
-          markDeliveryFailed(inDb, msg.id);
+          const errMsg = err instanceof Error ? err.message : String(err);
+          markDeliveryFailed(inDb, msg.id, errMsg);
           deliveryAttempts.delete(msg.id);
         } else {
           log.warn('Message delivery failed, will retry', {

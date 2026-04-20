@@ -202,10 +202,14 @@ export function markDelivered(db: Database.Database, messageOutId: string, platf
   ).run(messageOutId, platformMessageId ?? null);
 }
 
-export function markDeliveryFailed(db: Database.Database, messageOutId: string): void {
+export function markDeliveryFailed(
+  db: Database.Database,
+  messageOutId: string,
+  errorMessage?: string,
+): void {
   db.prepare(
-    "INSERT OR IGNORE INTO delivered (message_out_id, platform_message_id, status, delivered_at) VALUES (?, NULL, 'failed', datetime('now'))",
-  ).run(messageOutId);
+    "INSERT OR IGNORE INTO delivered (message_out_id, platform_message_id, status, error, delivered_at) VALUES (?, NULL, 'failed', ?, datetime('now'))",
+  ).run(messageOutId, errorMessage ?? null);
 }
 
 /** Ensure the delivered table has columns added after initial schema. */
@@ -218,6 +222,9 @@ export function migrateDeliveredTable(db: Database.Database): void {
   }
   if (!cols.has('status')) {
     db.prepare("ALTER TABLE delivered ADD COLUMN status TEXT NOT NULL DEFAULT 'delivered'").run();
+  }
+  if (!cols.has('error')) {
+    db.prepare('ALTER TABLE delivered ADD COLUMN error TEXT').run();
   }
 }
 

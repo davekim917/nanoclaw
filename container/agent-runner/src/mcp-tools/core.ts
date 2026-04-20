@@ -6,14 +6,37 @@
  * translates name → routing tuple. Permission enforcement happens on
  * the host side in delivery.ts via the agent_destinations table.
  */
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
+import { awaitDeliveryAck } from '../db/delivery-acks.js';
 import { findByName, getAllDestinations } from '../destinations.js';
 import { getMessageIdBySeq, getRoutingBySeq, writeMessageOut } from '../db/messages-out.js';
 import { getSessionRouting } from '../db/session-routing.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
+
+// send_file safety constants — mirror v1's ipc-mcp-stdio.ts behavior.
+const SEND_FILE_MAX_BYTES = 50 * 1024 * 1024; // Slack's own cap is 1GB but most adapters fail long before
+const SEND_FILE_ALLOWED_PREFIXES = [
+  '/workspace/agent',
+  '/workspace/worktrees',
+  '/workspace/extra',
+  '/tmp/',
+];
+const SEND_FILE_ACK_TIMEOUT_MS = 30_000;
+
+// Content-hash dedup for send_file. Browser-driver agents often take
+// snapshots of the same rendered page multiple times — without dedup the
+// user gets flooded with identical images. Map is per-container, resets
+// on restart; that's fine since the dedup window only needs to cover the
+// lifespan of a turn-chain on the same topic.
+const sentFileHashes = new Map<string, string>();
+
+function isAllowedFilePath(p: string): boolean {
+  return SEND_FILE_ALLOWED_PREFIXES.some((prefix) => p === prefix || p.startsWith(prefix));
+}
 
 function log(msg: string): void {
   console.error(`[mcp-tools] ${msg}`);
@@ -156,12 +179,44 @@ export const sendFile: McpToolDefinition = {
     const resolvedPath = path.isAbsolute(filePath) ? filePath : path.resolve('/workspace/agent', filePath);
     if (!fs.existsSync(resolvedPath)) return err(`File not found: ${filePath}`);
 
-    const id = generateId();
-    const filename = (args.filename as string) || path.basename(resolvedPath);
+    // Follow symlinks for the allowlist check so a link inside /workspace
+    // pointing to a host-sensitive file can't sneak out via send_file.
+    let realPath: string;
+    try {
+      realPath = fs.realpathSync(resolvedPath);
+    } catch {
+      return err('Path not allowed for send_file.');
+    }
+    if (!isAllowedFilePath(realPath)) {
+      return err(
+        `Path not allowed for send_file. Files must be under ${SEND_FILE_ALLOWED_PREFIXES.join(', ')}.`,
+      );
+    }
 
+    const stat = fs.statSync(realPath);
+    if (stat.size === 0) return err('File is empty.');
+    if (stat.size > SEND_FILE_MAX_BYTES) {
+      return err(`File too large (${(stat.size / 1024 / 1024).toFixed(1)}MB). Max ${SEND_FILE_MAX_BYTES / 1024 / 1024}MB.`);
+    }
+
+    // path.basename strips any traversal in the optional display name.
+    const filename = path.basename((args.filename as string) || path.basename(realPath));
+
+    // SHA-256 dedup — browser-driver agents frequently snapshot the same
+    // page, producing identical images the user doesn't need twice.
+    const fileContent = fs.readFileSync(realPath);
+    const contentHash = crypto.createHash('sha256').update(fileContent).digest('hex');
+    const prior = sentFileHashes.get(contentHash);
+    if (prior) {
+      return err(
+        `Duplicate content: "${filename}" is identical to previously sent "${prior}". NOT sent. If this is a browser screenshot, the page likely hasn't changed — navigate or wait for re-render, then re-capture.`,
+      );
+    }
+
+    const id = generateId();
     const outboxDir = path.join('/workspace/outbox', id);
     fs.mkdirSync(outboxDir, { recursive: true });
-    fs.copyFileSync(resolvedPath, path.join(outboxDir, filename));
+    fs.writeFileSync(path.join(outboxDir, filename), fileContent);
 
     writeMessageOut({
       id,
@@ -172,8 +227,34 @@ export const sendFile: McpToolDefinition = {
       content: JSON.stringify({ text: (args.text as string) || '', files: [filename] }),
     });
 
-    log(`send_file: ${id} → ${routing.resolvedName} (${filename})`);
-    return ok(`File sent to ${routing.resolvedName} (id: ${id}, filename: ${filename})`);
+    log(`send_file: ${id} → ${routing.resolvedName} (${filename}), awaiting host ack`);
+
+    // Wait for the host to actually deliver. Without this, the agent would
+    // report success for Slack uploads that silently failed (missing OAuth
+    // scope, size limit, adapter transient error past retry count). v2's
+    // host-owned `delivered` table carries the outcome (migration adds the
+    // `error` column).
+    const ack = await awaitDeliveryAck(id, SEND_FILE_ACK_TIMEOUT_MS);
+    if (!ack) {
+      // Treat timeout as "sent — delivery unconfirmed". Record the hash
+      // anyway so a retry with the same content is deduped.
+      sentFileHashes.set(contentHash, filename);
+      return ok(
+        `File "${filename}" sent to ${routing.resolvedName} (id: ${id}) — delivery unconfirmed (host did not respond within ${SEND_FILE_ACK_TIMEOUT_MS / 1000}s).`,
+      );
+    }
+    if (ack.status === 'delivered') {
+      sentFileHashes.set(contentHash, filename);
+      return ok(
+        `File "${filename}" delivered to ${routing.resolvedName} (id: ${id}${ack.platformMessageId ? `, platform_message_id: ${ack.platformMessageId}` : ''}).`,
+      );
+    }
+    // Failed — surface the host's error to the agent. Do not record the
+    // hash: a corrected retry (different file, or after fixing the scope)
+    // should be allowed through.
+    return err(
+      `File upload failed for "${filename}" to ${routing.resolvedName}: ${ack.error ?? 'unknown error'}. The file is staged at ${realPath}.`,
+    );
   },
 };
 
