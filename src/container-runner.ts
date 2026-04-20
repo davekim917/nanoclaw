@@ -442,12 +442,18 @@ function buildMounts(
   // We mount a selective allowlist rather than the whole project root
   // to exclude .env, data/, groups/, repo-tokens/, node_modules/, dist/,
   // logs/, and other sensitive or bulky paths.
+  //
+  // scripts/ and prompts/ are INTENTIONALLY excluded: v1 commit 3a31f9d
+  // removed them from the allowlist after noting that scripts/ exposes
+  // credential path topology (wire-*, migrate-*, init-* scripts reference
+  // host paths) and prompts/ was unused agent-facing content. Keep them
+  // out unless there's a specific capability that needs them and a clear
+  // review of what's in them.
   const projectRoot = path.resolve(GROUPS_DIR, '..');
   const sourceEntries = [
     'src',
     'container',
     'docs',
-    'scripts',
     'package.json',
     'README.md',
     'CONTRIBUTING.md',
