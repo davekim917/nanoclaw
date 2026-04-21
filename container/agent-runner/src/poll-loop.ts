@@ -471,6 +471,13 @@ async function processQuery(query: AgentQuery, routing: RoutingContext): Promise
 
       if (event.type === 'init') {
         queryContinuation = event.continuation;
+        // Persist immediately so a mid-turn container crash still lets the
+        // next wake resume the conversation. Without this, the session id
+        // was only written after the full stream completed — if the
+        // container died between `init` and `result`, the SDK session was
+        // effectively orphaned and the next message started a blank
+        // Claude session with no prior context.
+        setStoredSessionId(event.continuation);
       } else if (event.type === 'result' && event.text) {
         dispatchResultText(event.text, routing);
       }

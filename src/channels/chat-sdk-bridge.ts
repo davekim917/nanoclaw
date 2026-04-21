@@ -70,6 +70,38 @@ export interface ChatSdkBridgeConfig {
    * channelType and a distinct `/webhook/<channelType>` routing path.
    */
   channelType?: string;
+  /**
+   * Maximum text length the underlying adapter accepts in a single message.
+   * When set, the bridge splits outbound text longer than this on paragraph
+   * → line → hard-char boundaries and posts multiple messages. Without this,
+   * adapters like Discord (2000) and Telegram (4096) silently truncate
+   * mid-response. The returned id is the first chunk's id so subsequent edits
+   * and reactions still target the head of the reply.
+   */
+  maxTextLength?: number;
+}
+
+/**
+ * Split `text` into chunks no larger than `limit`, preferring paragraph
+ * breaks, then line breaks, then a hard character cut as a last resort.
+ * Preserves code fences only structurally — a fenced block that straddles a
+ * chunk boundary will render as two independent blocks on the receiving
+ * platform, which is the same behavior as manually re-opening a fence.
+ */
+export function splitForLimit(text: string, limit: number): string[] {
+  if (text.length <= limit) return [text];
+  const chunks: string[] = [];
+  let remaining = text;
+  while (remaining.length > limit) {
+    let cut = remaining.lastIndexOf('\n\n', limit);
+    if (cut <= 0) cut = remaining.lastIndexOf('\n', limit);
+    if (cut <= 0) cut = remaining.lastIndexOf(' ', limit);
+    if (cut <= 0) cut = limit;
+    chunks.push(remaining.slice(0, cut).trimEnd());
+    remaining = remaining.slice(cut).trimStart();
+  }
+  if (remaining.length > 0) chunks.push(remaining);
+  return chunks;
 }
 
 export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter {
@@ -354,13 +386,23 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           data: f.data,
           filename: f.filename,
         }));
-        if (fileUploads && fileUploads.length > 0) {
-          const result = await adapter.postMessage(tid, { markdown: text, files: fileUploads });
-          return result?.id;
-        } else {
-          const result = await adapter.postMessage(tid, { markdown: text });
-          return result?.id;
+        // Split if over the adapter's max length. Files ride on the first
+        // chunk so the head of the reply still carries them.
+        const chunks =
+          config.maxTextLength && text.length > config.maxTextLength
+            ? splitForLimit(text, config.maxTextLength)
+            : [text];
+        let firstId: string | undefined;
+        for (let i = 0; i < chunks.length; i++) {
+          const chunk = chunks[i];
+          const attachFiles = i === 0 && fileUploads && fileUploads.length > 0;
+          const result = await adapter.postMessage(
+            tid,
+            attachFiles ? { markdown: chunk, files: fileUploads } : { markdown: chunk },
+          );
+          if (i === 0) firstId = result?.id;
         }
+        return firstId;
       } else if (message.files && message.files.length > 0) {
         // Files only, no text
         const fileUploads = message.files.map((f: { data: Buffer; filename: string }) => ({
