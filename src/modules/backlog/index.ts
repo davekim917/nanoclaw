@@ -13,21 +13,13 @@
 import { registerDeliveryAction } from '../../delivery.js';
 import { log } from '../../log.js';
 import type { Session } from '../../types.js';
-import {
-  addShipLogEntry,
-  addBacklogItem,
-  updateBacklogItem,
-  deleteBacklogItem,
-} from '../../db/backlog.js';
+import { addShipLogEntry, addBacklogItem, updateBacklogItem, deleteBacklogItem } from '../../db/backlog.js';
 
 function resolveAgentGroupId(session: Session): string | null {
   return session.agent_group_id;
 }
 
-async function handleAddShipLog(
-  content: Record<string, unknown>,
-  session: Session,
-): Promise<void> {
+async function handleAddShipLog(content: Record<string, unknown>, session: Session): Promise<void> {
   const agentGroupId = resolveAgentGroupId(session);
   if (!agentGroupId) return;
 
@@ -52,10 +44,7 @@ async function handleAddShipLog(
   log.info('Ship log entry added', { id, title, agentGroupId });
 }
 
-async function handleAddBacklogItem(
-  content: Record<string, unknown>,
-  session: Session,
-): Promise<void> {
+async function handleAddBacklogItem(content: Record<string, unknown>, session: Session): Promise<void> {
   const agentGroupId = resolveAgentGroupId(session);
   if (!agentGroupId) return;
 
@@ -84,10 +73,7 @@ async function handleAddBacklogItem(
   log.info('Backlog item added', { id, title, agentGroupId });
 }
 
-async function handleUpdateBacklogItem(
-  content: Record<string, unknown>,
-  session: Session,
-): Promise<void> {
+async function handleUpdateBacklogItem(content: Record<string, unknown>, session: Session): Promise<void> {
   const itemId = content.itemId as string;
   if (!itemId) {
     log.warn('update_backlog_item missing itemId');
@@ -119,10 +105,7 @@ async function handleUpdateBacklogItem(
   }
 }
 
-async function handleDeleteBacklogItem(
-  content: Record<string, unknown>,
-  session: Session,
-): Promise<void> {
+async function handleDeleteBacklogItem(content: Record<string, unknown>, session: Session): Promise<void> {
   const itemId = content.itemId as string;
   if (!itemId) {
     log.warn('delete_backlog_item missing itemId');

@@ -83,9 +83,11 @@ export function getShipLogPaginated(
   offset = 0,
 ): { data: ShipLogEntry[]; total: number } {
   const db = getDb();
-  const total = (db
-    .prepare('SELECT COUNT(*) AS c FROM ship_log WHERE agent_group_id = $agent_group_id')
-    .get({ $agent_group_id: agentGroupId }) as { c: number }).c;
+  const total = (
+    db
+      .prepare('SELECT COUNT(*) AS c FROM ship_log WHERE agent_group_id = $agent_group_id')
+      .get({ $agent_group_id: agentGroupId }) as { c: number }
+  ).c;
   const data = db
     .prepare(
       `SELECT * FROM ship_log
@@ -111,9 +113,7 @@ export function getShipLogSince(agentGroupId: string, since: string): ShipLogEnt
 
 export function getBacklogItemById(id: string): BacklogItem | null {
   const db = getDb();
-  return (
-    (db.prepare('SELECT * FROM backlog_items WHERE id = $id').get({ $id: id }) as BacklogItem) || null
-  );
+  return (db.prepare('SELECT * FROM backlog_items WHERE id = $id').get({ $id: id }) as BacklogItem) || null;
 }
 
 export function addBacklogItem(item: BacklogItem): void {
@@ -150,27 +150,45 @@ export function updateBacklogItem(
   const fields: string[] = [];
   const values: Record<string, unknown> = { $id: id };
 
-  if (updates.title !== undefined) { fields.push('title = $title'); values.$title = updates.title; }
-  if (updates.description !== undefined) { fields.push('description = $description'); values.$description = updates.description; }
-  if (updates.status !== undefined) { fields.push('status = $status'); values.$status = updates.status; }
-  if (updates.priority !== undefined) { fields.push('priority = $priority'); values.$priority = updates.priority; }
-  if (updates.tags !== undefined) { fields.push('tags = $tags'); values.$tags = updates.tags; }
-  if (updates.notes !== undefined) { fields.push('notes = $notes'); values.$notes = updates.notes; }
-  if (updates.resolved_at !== undefined) { fields.push('resolved_at = $resolved_at'); values.$resolved_at = updates.resolved_at; }
+  if (updates.title !== undefined) {
+    fields.push('title = $title');
+    values.$title = updates.title;
+  }
+  if (updates.description !== undefined) {
+    fields.push('description = $description');
+    values.$description = updates.description;
+  }
+  if (updates.status !== undefined) {
+    fields.push('status = $status');
+    values.$status = updates.status;
+  }
+  if (updates.priority !== undefined) {
+    fields.push('priority = $priority');
+    values.$priority = updates.priority;
+  }
+  if (updates.tags !== undefined) {
+    fields.push('tags = $tags');
+    values.$tags = updates.tags;
+  }
+  if (updates.notes !== undefined) {
+    fields.push('notes = $notes');
+    values.$notes = updates.notes;
+  }
+  if (updates.resolved_at !== undefined) {
+    fields.push('resolved_at = $resolved_at');
+    values.$resolved_at = updates.resolved_at;
+  }
 
   if (fields.length === 0) return false;
 
   fields.push('updated_at = $updated_at');
   values.$updated_at = new Date().toISOString();
 
-  const whereClause = agentGroupId !== undefined
-    ? 'WHERE id = $id AND agent_group_id = $agent_group_id'
-    : 'WHERE id = $id';
+  const whereClause =
+    agentGroupId !== undefined ? 'WHERE id = $id AND agent_group_id = $agent_group_id' : 'WHERE id = $id';
   if (agentGroupId !== undefined) values.$agent_group_id = agentGroupId;
 
-  const result = db
-    .prepare(`UPDATE backlog_items SET ${fields.join(', ')} ${whereClause}`)
-    .run(values);
+  const result = db.prepare(`UPDATE backlog_items SET ${fields.join(', ')} ${whereClause}`).run(values);
   return result.changes > 0;
 }
 
@@ -184,11 +202,7 @@ export function deleteBacklogItem(id: string, agentGroupId: string): boolean {
 
 const PRIORITY_ORDER = `CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END`;
 
-export function getBacklog(
-  agentGroupId: string,
-  status?: string,
-  limit = 100,
-): BacklogItem[] {
+export function getBacklog(agentGroupId: string, status?: string, limit = 100): BacklogItem[] {
   const db = getDb();
   let rows;
   if (status) {
@@ -221,9 +235,11 @@ export function getBacklogPaginated(
   let total: number;
   let rows: BacklogItem[];
   if (status) {
-    total = (db
-      .prepare('SELECT COUNT(*) AS c FROM backlog_items WHERE agent_group_id = $agent_group_id AND status = $status')
-      .get({ $agent_group_id: agentGroupId, $status: status }) as { c: number }).c;
+    total = (
+      db
+        .prepare('SELECT COUNT(*) AS c FROM backlog_items WHERE agent_group_id = $agent_group_id AND status = $status')
+        .get({ $agent_group_id: agentGroupId, $status: status }) as { c: number }
+    ).c;
     rows = db
       .prepare(
         `SELECT * FROM backlog_items
@@ -232,9 +248,11 @@ export function getBacklogPaginated(
       )
       .all({ $agent_group_id: agentGroupId, $status: status, $limit: limit, $offset: offset }) as BacklogItem[];
   } else {
-    total = (db
-      .prepare('SELECT COUNT(*) AS c FROM backlog_items WHERE agent_group_id = $agent_group_id')
-      .get({ $agent_group_id: agentGroupId }) as { c: number }).c;
+    total = (
+      db
+        .prepare('SELECT COUNT(*) AS c FROM backlog_items WHERE agent_group_id = $agent_group_id')
+        .get({ $agent_group_id: agentGroupId }) as { c: number }
+    ).c;
     rows = db
       .prepare(
         `SELECT * FROM backlog_items
@@ -264,8 +282,9 @@ export function getBacklogResolvedSince(agentGroupId: string, since: string): Ba
 export function getCommitDigestState(repoPath: string): CommitDigestState | null {
   const db = getDb();
   return (
-    (db.prepare('SELECT * FROM commit_digest_state WHERE repo_path = $repo_path').get({ $repo_path: repoPath }) as CommitDigestState) ||
-    null
+    (db
+      .prepare('SELECT * FROM commit_digest_state WHERE repo_path = $repo_path')
+      .get({ $repo_path: repoPath }) as CommitDigestState) || null
   );
 }
 
