@@ -62,6 +62,128 @@ export function heartbeatPath(agentGroupId: string, sessionId: string): string {
 }
 
 /**
+ * Claude Code's project-dir name hash for the container cwd (`/workspace/group`).
+ * Matches v1's constant — same cwd, same hash. If the container WORKDIR ever
+ * changes, regenerate this by running `claude-code` once in the new cwd and
+ * reading the created `~/.claude/projects/<dir>/` name.
+ */
+export const CLAUDE_CODE_PROJECTS_DIR = '-workspace-group';
+
+/**
+ * Per-session `projects/<hash>/` dir on the host. Mounted INTO each container's
+ * `/home/node/.claude/projects/<hash>/` as a nested bind mount on top of the
+ * group-shared `.claude` parent. Isolates the SDK's per-session state —
+ * `<session_id>.jsonl` transcripts, `sessions-index.json`, and any other files
+ * the SDK writes under its active project dir — so concurrent sessions in the
+ * same agent group don't race and silently clobber each other's resume state.
+ */
+export function sessionClaudeProjectsDir(agentGroupId: string, sessionId: string): string {
+  return path.join(sessionDir(agentGroupId, sessionId), '.claude-projects', CLAUDE_CODE_PROJECTS_DIR);
+}
+
+/**
+ * Group-level auto-memory dir. Overlay-mounted at
+ * `/home/node/.claude/projects/<hash>/memory` INSIDE the per-session projects
+ * mount so Claude Code's auto-memory stays shared across every thread in the
+ * agent group even though transcripts are per-session.
+ */
+export function groupClaudeMemoryDir(agentGroupId: string): string {
+  return path.join(DATA_DIR, 'v2-sessions', agentGroupId, '.claude-memory');
+}
+
+/**
+ * Pre-create the per-session `projects/<hash>/` dir on the host with uid 1001
+ * ownership BEFORE docker mounts it.
+ *
+ * This is load-bearing — v1 learned it the hard way (comment at v1
+ * container-runner.ts:1675-1681). The parent `/home/node/.claude` is a bind
+ * mount; if the inner `projects/<hash>/` path doesn't already exist on the host
+ * when docker starts the container, the daemon creates the missing
+ * intermediates AS ROOT. The container runs as uid 1001 and can't write inside
+ * a root-owned dir, so SDK session jsonls appear to save in-memory but vanish
+ * on exit. The next `resume: <session_id>` then fails silently (no file found)
+ * and the agent starts fresh with no prior context.
+ *
+ * chown is best-effort — on platforms that can't chown (or when the process
+ * isn't root) we log and continue; the subsequent write attempt will fail
+ * loudly if ownership is wrong, which beats the silent-amnesia failure mode.
+ */
+export function prepareSessionClaudeDir(agentGroupId: string, sessionId: string): void {
+  const projectsDir = sessionClaudeProjectsDir(agentGroupId, sessionId);
+  const alreadyExisted = fs.existsSync(projectsDir);
+  fs.mkdirSync(projectsDir, { recursive: true });
+  const memoryDir = groupClaudeMemoryDir(agentGroupId);
+  fs.mkdirSync(memoryDir, { recursive: true });
+
+  // One-time migration from the pre-per-session layout. Older sessions
+  // wrote their transcripts into the group-shared
+  // `.claude-shared/projects/<hash>/` dir alongside every other session's
+  // files. The per-session overlay can't see those unless we copy them
+  // forward — otherwise the first wake on the new layout loses all prior
+  // thread context and the agent appears to have amnesia.
+  //
+  // Heuristic: only migrate on first creation of the per-session dir (when
+  // `alreadyExisted` is false). We copy the single `<sessionId>.jsonl` and
+  // the full `sessions-index.json` from the group-shared projects dir;
+  // side-tables like `shell-snapshots` can rebuild themselves. If there's
+  // no group-shared transcript for this session_id, migrate is a no-op.
+  if (!alreadyExisted) {
+    try {
+      const sharedProjects = path.join(
+        DATA_DIR,
+        'v2-sessions',
+        agentGroupId,
+        '.claude-shared',
+        'projects',
+        CLAUDE_CODE_PROJECTS_DIR,
+      );
+      if (fs.existsSync(sharedProjects)) {
+        // Best-effort copy — any .jsonl that exists in shared lands in the
+        // per-session dir. We don't filter by session_id because the SDK's
+        // sdk_session_id in outbound.db may not match the on-disk filename
+        // after compact-boundary rotations; copying all jsonls for this
+        // agent group is safe since only the session's own resume id will
+        // be passed as `resume`.
+        for (const entry of fs.readdirSync(sharedProjects)) {
+          if (!entry.endsWith('.jsonl')) continue;
+          const src = path.join(sharedProjects, entry);
+          const dst = path.join(projectsDir, entry);
+          if (fs.existsSync(dst)) continue;
+          fs.copyFileSync(src, dst);
+        }
+        const idxSrc = path.join(sharedProjects, 'sessions-index.json');
+        const idxDst = path.join(projectsDir, 'sessions-index.json');
+        if (fs.existsSync(idxSrc) && !fs.existsSync(idxDst)) {
+          fs.copyFileSync(idxSrc, idxDst);
+        }
+        log.info('Migrated session transcripts from shared .claude dir', {
+          agentGroupId,
+          sessionId,
+        });
+      }
+    } catch (err) {
+      log.warn('Shared-to-per-session .claude migration failed — session may start without prior context', {
+        agentGroupId,
+        sessionId,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  try {
+    fs.chownSync(projectsDir, 1001, 1001);
+    fs.chownSync(path.dirname(projectsDir), 1001, 1001);
+    fs.chownSync(memoryDir, 1001, 1001);
+  } catch (err) {
+    log.debug('Could not chown session .claude dir to uid 1001 — continuing', {
+      agentGroupId,
+      sessionId,
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+/**
  * @deprecated Use inboundDbPath / outboundDbPath instead.
  * Kept temporarily for test compatibility during migration.
  */
@@ -133,6 +255,11 @@ export function initSessionFolder(agentGroupId: string, sessionId: string): void
 
   ensureSchema(inboundDbPath(agentGroupId, sessionId), 'inbound');
   ensureSchema(outboundDbPath(agentGroupId, sessionId), 'outbound');
+
+  // Pre-create per-session Claude Code projects dir with container-uid
+  // ownership. See prepareSessionClaudeDir docstring for why this is
+  // load-bearing.
+  prepareSessionClaudeDir(agentGroupId, sessionId);
 }
 
 /**
