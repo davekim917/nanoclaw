@@ -107,7 +107,10 @@ async function main(): Promise<void> {
       response_scope: 'all',
       session_mode: 'shared',
       priority: 0,
-      created_at: now,
+      default_model: null,
+    default_effort: null,
+    default_tone: null,
+    created_at: now,
     });
     console.log(`Wired ${mg.id} -> ${ag.id}`);
   } else {

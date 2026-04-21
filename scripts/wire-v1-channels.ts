@@ -92,7 +92,7 @@ function wireChannel(
       id: wiringId, messaging_group_id: mgId, agent_group_id: agentGroupId,
       engage_mode: 'mention', engage_pattern: null, sender_scope: 'all',
       ignored_message_policy: 'drop', session_mode: 'per-thread',
-      priority: 0, default_model: null, default_effort: null, created_at: now(),
+      priority: 0, default_model: null, default_effort: null, default_tone: null, created_at: now(),
     });
     console.log(`  [wiring] created: ${mgId} → ${agentGroupId}`);
   }

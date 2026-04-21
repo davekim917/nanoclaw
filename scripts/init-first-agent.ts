@@ -203,6 +203,9 @@ function wireIfMissing(mg: MessagingGroup, ag: AgentGroup, now: string, label: s
     ignored_message_policy: 'drop',
     session_mode: 'shared',
     priority: 0,
+    default_model: null,
+    default_effort: null,
+    default_tone: null,
     created_at: now,
   });
   console.log(`Wired ${label}: ${mg.id} -> ${ag.id}`);
