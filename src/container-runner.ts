@@ -261,6 +261,20 @@ function resolveScopedEnv(baseName: string, folder: string): string | undefined 
 }
 
 /**
+ * Remove every `-e <key>=...` pair from args whose key matches. Used to
+ * delete placeholder values OneCLI injects for credentials we plan to
+ * substitute with the real value ourselves. Mutates args in place.
+ */
+function stripEnvEntry(args: string[], key: string): void {
+  const prefix = `${key}=`;
+  for (let i = args.length - 2; i >= 0; i--) {
+    if (args[i] === '-e' && args[i + 1].startsWith(prefix)) {
+      args.splice(i, 2);
+    }
+  }
+}
+
+/**
  * Append a host to the container's NO_PROXY / no_proxy env entries,
  * merging with any value OneCLI (or an earlier step) already set. Mutates
  * args in place. If neither form is present, adds both uppercase and
@@ -1184,8 +1198,25 @@ async function buildContainerArgs(
     // defeating the provider-level rotation across CLAUDE_CODE_OAUTH_TOKEN_N.
     // We merge with any existing NO_PROXY rather than overwrite so localhost /
     // onecli internal bypasses that OneCLI added stay intact.
+    //
+    // Also re-append the real OAuth token values AFTER OneCLI applied,
+    // because OneCLI injects `-e CLAUDE_CODE_OAUTH_TOKEN=placeholder` to
+    // make the SDK happy while relying on its proxy to substitute the real
+    // token at request time. Under the bypass path the proxy never fires
+    // for api.anthropic.com, so the placeholder would be sent verbatim and
+    // the API would reject it as an invalid bearer. Docker's `-e` duplicate-
+    // key semantics: last entry wins, so pushing our real values after
+    // OneCLI's placeholder is all we need.
     if (oauthBypassAnthropic) {
       mergeNoProxy(args, 'api.anthropic.com');
+      stripEnvEntry(args, 'CLAUDE_CODE_OAUTH_TOKEN');
+      args.push('-e', `CLAUDE_CODE_OAUTH_TOKEN=${hostOauth}`);
+      for (const [k, v] of Object.entries(process.env)) {
+        if (/^CLAUDE_CODE_OAUTH_TOKEN_\d+$/.test(k) && v) {
+          stripEnvEntry(args, k);
+          args.push('-e', `${k}=${v}`);
+        }
+      }
     }
   }
 
