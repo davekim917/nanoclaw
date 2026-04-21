@@ -603,12 +603,6 @@ function discoverPlugins(): SdkPluginConfig[] {
 // ── Provider ──
 
 /**
- * Claude Code auto-compacts context at this window (tokens). Kept here so
- * the generic bootstrap doesn't need to know about Claude-specific env vars.
- */
-const CLAUDE_CODE_AUTO_COMPACT_WINDOW = '165000';
-
-/**
  * Stale-session detection. Matches Claude Code's error text when a
  * resumed session can't be found — missing transcript .jsonl, unknown
  * session ID, etc.
@@ -648,10 +642,7 @@ export class ClaudeProvider implements AgentProvider {
     this.assistantName = options.assistantName;
     this.mcpServers = options.mcpServers ?? {};
     this.additionalDirectories = options.additionalDirectories;
-    this.env = filterSdkEnv({
-      ...(options.env ?? {}),
-      CLAUDE_CODE_AUTO_COMPACT_WINDOW,
-    });
+    this.env = filterSdkEnv({ ...(options.env ?? {}) });
     this.fallbackKeys = Object.entries(this.env)
       .filter(([k, v]) => ANTHROPIC_FALLBACK_RE.test(k) && typeof v === 'string' && v.length > 0)
       .sort(([a], [b]) => {

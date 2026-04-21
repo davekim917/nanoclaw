@@ -37,6 +37,11 @@ const REQUIRED_ENV: Record<string, string> = {
   // explicit id to the API, keeping "opus" pointed at the real flagship
   // regardless of SDK lag.
   ANTHROPIC_DEFAULT_OPUS_MODEL: 'claude-opus-4-7',
+  // Lock the `sonnet` alias to 4.6 (explicit id, no [1m] extended-context
+  // suffix — extended context is opt-in per query). Same reason as the opus
+  // pin above: prevents silent fallback when the SDK's bundled alias map
+  // lags behind a new Sonnet release.
+  ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-sonnet-4-6',
   // Default reasoning effort. Still per-message-overridable via `-e high`
   // and session-sticky via `-e1 high` flags; per-group override via
   // container.json `effort` field (planned). `medium` is a cost-balanced

@@ -39,6 +39,7 @@ import {
   type ProviderContainerContribution,
   type VolumeMount,
 } from './providers/provider-container-registry.js';
+import { getSessionClaudeMounts } from './session-claude-mounts.js';
 import { markContainerRunning, markContainerStopped, sessionDir, writeSessionRouting } from './session-manager.js';
 import type { AgentGroup, Session } from './types.js';
 
@@ -388,10 +389,10 @@ function buildMounts(
     mounts.push({ hostPath: globalDir, containerPath: '/workspace/global', readonly: true });
   }
 
-  // Per-group .claude-shared at /home/node/.claude (Claude state, settings,
-  // skills — initialized once at group creation, persistent thereafter)
-  const claudeDir = path.join(DATA_DIR, 'v2-sessions', agentGroup.id, '.claude-shared');
-  mounts.push({ hostPath: claudeDir, containerPath: '/home/node/.claude', readonly: false });
+  // .claude mount triple (group-shared parent + per-session projects overlay
+  // + group-shared memory overlay). See session-claude-mounts.ts for the
+  // ordering invariant and the race it prevents.
+  mounts.push(...getSessionClaudeMounts(agentGroup, session));
 
   // Central message archive at /workspace/archive.db (read-only). Powers
   // the search_threads + resolve_thread_link MCP tools (Phase 2.9/2.10).
@@ -967,6 +968,10 @@ async function buildContainerArgs(
     process.env.ANTHROPIC_DEFAULT_OPUS_MODEL ??
     'claude-opus-4-6[1m]';
   args.push('-e', `ANTHROPIC_DEFAULT_OPUS_MODEL=${defaultOpusModel}`);
+  // Sonnet alias pin — same short-circuit path as opus. Bare 4-6 id (no
+  // [1m] extended-context suffix); extended context is opt-in per query.
+  const defaultSonnetModel = process.env.ANTHROPIC_DEFAULT_SONNET_MODEL ?? 'claude-sonnet-4-6';
+  args.push('-e', `ANTHROPIC_DEFAULT_SONNET_MODEL=${defaultSonnetModel}`);
 
   const defaultEffort =
     channelDefaults?.channelDefaultEffort ??
