@@ -34,36 +34,37 @@ export function registerSecrets(secrets: Record<string, string>): void {
 }
 
 /**
- * Parse `.env` at `cwd/.env` and register every value that looks
- * credential-ish. Keys that explicitly flag themselves as non-secrets
- * (WEB_UI_ORIGINS, *_URL, *_PORT, *_ID where length is small, etc.) are
- * skipped — registering them would over-redact innocuous text.
+ * Parse `.env` at `cwd/.env` and register values whose keys match known
+ * credential-name patterns. Previously this used a blacklist (register
+ * everything except a few hand-picked non-secrets) but that caused
+ * over-redaction as new NANOCLAW_DEFAULT_* config knobs and per-workspace
+ * identifier keys were added — e.g. NANOCLAW_DEFAULT_AGENT_GROUP_SLACK_*
+ * values are short config strings like "illysium" that the scrubber then
+ * wiped out of every message. Allowlist is safer here: defense-in-depth
+ * only (OneCLI is the primary isolation), and every real credential in
+ * the canonical .env template follows one of these naming patterns.
  */
-const NON_SECRET_KEY_PATTERNS: RegExp[] = [
-  /_URL$/,
-  /_URI$/,
-  /_PORT$/,
-  /_ORIGINS$/,
-  /_DIR$/,
-  /_PATH$/,
-  /^NODE_ENV$/,
-  /^LOG_LEVEL$/,
-  /_SENDER_NAME$/,
-  /_JID$/,
-  /_CHANNEL_ID$/,
-  /_CHANNEL_IDS$/,
-  /_NOTIFY_JID$/,
-  /_IDLE_RESET_HOURS$/,
-  /^ASSISTANT_NAME$/,
-  /^TZ$/,
+const SECRET_KEY_PATTERNS: RegExp[] = [
+  /_TOKEN(_|$)/,
+  /_KEY(_|$)/,
+  /_SECRET(_|$)/,
+  /_PASSWORD(_|$)/,
+  /_CREDENTIALS(_|$)/,
+  /_OAUTH/,
+  /_SIGNING/,
+  /_PG_/,
+  /_POSTGRES/,
+  /_REDIS_URL/,
+  /_DB_URL/,
+  /_DATABASE_URL/,
 ];
 
 function isLikelySecretKey(key: string): boolean {
   if (key.length === 0) return false;
-  for (const pattern of NON_SECRET_KEY_PATTERNS) {
-    if (pattern.test(key)) return false;
+  for (const pattern of SECRET_KEY_PATTERNS) {
+    if (pattern.test(key)) return true;
   }
-  return true;
+  return false;
 }
 
 export function registerSecretsFromEnv(envPath?: string): number {
