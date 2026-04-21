@@ -1036,6 +1036,20 @@ async function buildContainerArgs(
     if (v) args.push('-e', `${base}=${v}`);
   }
 
+  // Folder-scoped verbatim env vars: pass through env vars whose name starts
+  // with a known prefix AND whose name includes the folder token. These are
+  // raw connection strings (RENDER_PG_URL_ILLYSIUM_ILLYSE_MAIN, etc.) that
+  // don't collapse to a base name — the agent uses the full name as-is.
+  // Gate on folder to keep cross-group data access from leaking.
+  const folderTok = agentGroup.folder.toUpperCase().replace(/-/g, '_');
+  const verbatimPrefixes = ['RENDER_PG_', 'RENDER_REDIS_URL_'];
+  for (const [k, v] of Object.entries(process.env)) {
+    if (!v) continue;
+    if (!verbatimPrefixes.some((p) => k.startsWith(p))) continue;
+    if (!k.includes(`_${folderTok}_`) && !k.endsWith(`_${folderTok}`)) continue;
+    args.push('-e', `${k}=${v}`);
+  }
+
   // Per-group opt-in flags from container.json.
   if (containerConfig.gitnexusInjectAgentsMd) {
     args.push('-e', 'GITNEXUS_INJECT_AGENTS_MD=true');
