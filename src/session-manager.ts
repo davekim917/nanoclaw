@@ -62,12 +62,15 @@ export function heartbeatPath(agentGroupId: string, sessionId: string): string {
 }
 
 /**
- * Claude Code's project-dir name hash for the container cwd (`/workspace/group`).
- * Matches v1's constant — same cwd, same hash. If the container WORKDIR ever
- * changes, regenerate this by running `claude-code` once in the new cwd and
- * reading the created `~/.claude/projects/<dir>/` name.
+ * Claude Code's project-dir name hash for the container cwd. v2's cwd is
+ * `/workspace/agent` (set in container/agent-runner/src/index.ts:42 as `CWD`
+ * and passed to the SDK via poll-loop), which hashes to `-workspace-agent`.
+ * v1 used `/workspace/group` → `-workspace-group`; do not copy-paste that
+ * constant without verifying the current cwd. If the cwd ever changes,
+ * regenerate by launching claude-code once in the new cwd and reading the
+ * created `~/.claude/projects/<dir>/` name.
  */
-export const CLAUDE_CODE_PROJECTS_DIR = '-workspace-group';
+export const CLAUDE_CODE_PROJECTS_DIR = '-workspace-agent';
 
 /**
  * Per-session `projects/<hash>/` dir on the host. Mounted INTO each container's
@@ -84,11 +87,29 @@ export function sessionClaudeProjectsDir(agentGroupId: string, sessionId: string
 /**
  * Group-level auto-memory dir. Overlay-mounted at
  * `/home/node/.claude/projects/<hash>/memory` INSIDE the per-session projects
- * mount so Claude Code's auto-memory stays shared across every thread in the
- * agent group even though transcripts are per-session.
+ * mount so Claude Code's auto-memory (MEMORY.md + autodream pruning) stays
+ * shared across every session in the agent group regardless of channel or
+ * thread.
+ *
+ * Points at the same physical path the SDK has been using under the outer
+ * `.claude-shared` mount (`.claude-shared/projects/<hash>/memory/`). That way:
+ *   - Existing MEMORY.md carries forward when the per-session projects
+ *     overlay first engages — no migration step needed.
+ *   - Auto-dream pruning from any session lands in the same file every other
+ *     session sees.
+ *   - If a future migration ever moves session transcripts elsewhere, memory
+ *     stays put.
  */
 export function groupClaudeMemoryDir(agentGroupId: string): string {
-  return path.join(DATA_DIR, 'v2-sessions', agentGroupId, '.claude-memory');
+  return path.join(
+    DATA_DIR,
+    'v2-sessions',
+    agentGroupId,
+    '.claude-shared',
+    'projects',
+    CLAUDE_CODE_PROJECTS_DIR,
+    'memory',
+  );
 }
 
 /**
