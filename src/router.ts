@@ -23,9 +23,11 @@ import { getAgentGroup } from './db/agent-groups.js';
 import { recordDroppedMessage } from './db/dropped-messages.js';
 import {
   createMessagingGroup,
+  createMessagingGroupAgent,
   getMessagingGroupAgents,
   getMessagingGroupWithAgentCount,
 } from './db/messaging-groups.js';
+import { getDb } from './db/connection.js';
 import { findSessionForAgent } from './db/sessions.js';
 import { startTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
@@ -35,6 +37,65 @@ import { wakeContainer } from './container-runner.js';
 import { getSession } from './db/sessions.js';
 import type { AgentGroup, MessagingGroup, MessagingGroupAgent } from './types.js';
 
+/**
+ * Resolve "what agent group should a new messaging_group in this workspace
+ * inherit from?" for workspace-trust auto-wire. Returns null when the
+ * workspace/guild has no prior wiring — those stay on the approval-gate path.
+ *
+ * Scope key:
+ *   Slack: channel_type (e.g. "slack-illysium") — already includes the workspace.
+ *   Discord: guild id (first segment of "discord:<guildId>:<channelId>") — channel_type
+ *     is just "discord" and doesn't differentiate guilds.
+ *   Other: channel_type.
+ *
+ * Picks the agent_group with the most wirings in-scope (breaks ties by first
+ * match). The caller creates the messaging_group_agents row using this id.
+ */
+function inheritedAgentGroupFor(mg: MessagingGroup): { id: string; sourceMessagingGroupId: string } | null {
+  const db = getDb();
+  let row: { agent_group_id: string; messaging_group_id: string } | undefined;
+
+  if (mg.channel_type === 'discord' && mg.platform_id.startsWith('discord:')) {
+    const guildId = mg.platform_id.split(':')[1];
+    if (!guildId) return null;
+    // Scope by guild — match any messaging_group in this Discord guild that
+    // already has a wired agent. LIKE prefix is safe here because guildId is
+    // a Discord snowflake (digits-only) and the prefix is fully anchored.
+    row = db
+      .prepare(
+        `SELECT mga.agent_group_id, mga.messaging_group_id
+         FROM messaging_group_agents mga
+         JOIN messaging_groups m ON m.id = mga.messaging_group_id
+         WHERE m.channel_type = 'discord'
+           AND m.platform_id LIKE ?
+           AND m.id != ?
+         GROUP BY mga.agent_group_id
+         ORDER BY COUNT(*) DESC, MIN(m.created_at) ASC
+         LIMIT 1`,
+      )
+      .get(`discord:${guildId}:%`, mg.id) as typeof row;
+  } else {
+    // Slack's channel_type already carries the workspace suffix (e.g.
+    // "slack-illysium"); bare match is enough. Same for any other adapter
+    // that embeds workspace identity in channel_type.
+    row = db
+      .prepare(
+        `SELECT mga.agent_group_id, mga.messaging_group_id
+         FROM messaging_group_agents mga
+         JOIN messaging_groups m ON m.id = mga.messaging_group_id
+         WHERE m.channel_type = ?
+           AND m.id != ?
+         GROUP BY mga.agent_group_id
+         ORDER BY COUNT(*) DESC, MIN(m.created_at) ASC
+         LIMIT 1`,
+      )
+      .get(mg.channel_type, mg.id) as typeof row;
+  }
+
+  if (!row) return null;
+  return { id: row.agent_group_id, sourceMessagingGroupId: row.messaging_group_id };
+}
+
 function generateId(): string {
   return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -43,6 +104,13 @@ export interface InboundEvent {
   channelType: string;
   platformId: string;
   threadId: string | null;
+  /**
+   * Platform-confirmed "this is a DM, not a group/channel" signal. When the
+   * adapter sets false, auto-created messaging_groups are marked is_group=1.
+   * undefined means the adapter didn't tell us; router defaults to is_group=0
+   * (DM-style collapse) to preserve existing behavior.
+   */
+  isDM?: boolean;
   message: {
     id: string;
     kind: 'chat' | 'chat-sdk';
@@ -214,7 +282,11 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
       channel_type: event.channelType,
       platform_id: event.platformId,
       name: null,
-      is_group: 0,
+      // Adapter tells us whether this is a DM (isDM=true) or a group chat
+      // (isDM=false). When unknown, default to 0 (DM-style) to preserve
+      // legacy behavior; the approval card's wording and the
+      // mention-sticky short-circuit both key off this value.
+      is_group: event.isDM === false ? 1 : 0,
       unknown_sender_policy: 'request_approval',
       denied_at: null,
       created_at: new Date().toISOString(),
@@ -241,6 +313,46 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
         deniedAt: mg.denied_at,
       });
       return;
+    }
+
+    // Workspace-trust auto-wire: if the workspace (Slack channel_type suffix)
+    // or Discord guild already has at least one wired channel, we know the
+    // owner trusts the bot in that workspace — wire the new channel to the
+    // incumbent agent group without an approval card. Matches v1 behavior
+    // where adding the bot to a new channel in an already-installed workspace
+    // "just worked." First channel in a new workspace/guild still escalates.
+    const inheritedAgent = inheritedAgentGroupFor(mg);
+    if (inheritedAgent) {
+      try {
+        createMessagingGroupAgent({
+          id: `mga-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          messaging_group_id: mg.id,
+          agent_group_id: inheritedAgent.id,
+          engage_mode: 'mention-sticky',
+          engage_pattern: null,
+          session_mode: 'per-thread',
+          priority: 0,
+          sender_scope: 'known',
+          ignored_message_policy: 'accumulate',
+          default_model: null,
+          default_effort: null,
+          created_at: new Date().toISOString(),
+        });
+        log.info('Workspace-trust auto-wire', {
+          messagingGroupId: mg.id,
+          inheritedFrom: inheritedAgent.sourceMessagingGroupId,
+          agentGroupId: inheritedAgent.id,
+          channelType: event.channelType,
+          platformId: event.platformId,
+        });
+        // Re-enter routing with the fresh wiring in place.
+        return routeInbound(event);
+      } catch (err) {
+        log.warn('Workspace-trust auto-wire failed — falling through to approval', {
+          messagingGroupId: mg.id,
+          err: err instanceof Error ? err.message : String(err),
+        });
+      }
     }
 
     const parsed = safeParseContent(event.message.content);

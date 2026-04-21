@@ -129,6 +129,7 @@ async function main(): Promise<void> {
           channelType: adapter.channelType,
           platformId,
           threadId,
+          isDM: message.isDM,
           message: {
             id: message.id,
             kind: message.kind,

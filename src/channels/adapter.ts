@@ -38,6 +38,15 @@ export interface InboundMessage {
    * router falls back to text-match against agent_group_name.
    */
   isMention?: boolean;
+  /**
+   * Platform-confirmed "this is a DM, not a group/channel" signal.
+   * Adapters set false explicitly for group/channel messages so the router's
+   * auto-created messaging_groups get is_group=1 (vs the legacy is_group=0
+   * default). Chat SDK bridge sets this from the SDK's onDirectMessage vs
+   * channel handlers. undefined means the adapter didn't tell us → router
+   * defaults to is_group=0 for backwards compatibility.
+   */
+  isDM?: boolean;
 }
 
 /** A file attachment to deliver alongside a message. */

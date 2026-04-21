@@ -112,7 +112,17 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
   let setupConfig: ChannelSetup;
   let gatewayAbort: AbortController | null = null;
 
-  async function messageToInbound(message: ChatMessage, isMention: boolean): Promise<InboundMessage> {
+  /**
+   * Ask the SDK adapter whether a given thread id represents a DM.
+   * Some adapters don't expose isDM (older plugin builds); returns undefined
+   * so the router keeps its legacy is_group=0 default rather than guessing.
+   */
+  function adapterIsDM(a: typeof adapter, threadId: string): boolean | undefined {
+    const fn = (a as unknown as { isDM?: (t: string) => boolean }).isDM;
+    return typeof fn === 'function' ? fn.call(a, threadId) : undefined;
+  }
+
+  async function messageToInbound(message: ChatMessage, isMention: boolean, isDM?: boolean): Promise<InboundMessage> {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const serialized = message.toJSON() as Record<string, any>;
 
@@ -173,6 +183,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       content: serialized,
       timestamp: message.metadata.dateSent.toISOString(),
       isMention,
+      isDM,
     };
   }
 
@@ -208,13 +219,19 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // wirings still fire on in-thread mentions.
       chat.onSubscribedMessage(async (thread, message) => {
         const channelId = adapter.channelIdFromThreadId(thread.id);
-        await setupConfig.onInbound(channelId, thread.id, await messageToInbound(message, message.isMention === true));
+        const isDM = adapterIsDM(adapter, thread.id);
+        await setupConfig.onInbound(
+          channelId,
+          thread.id,
+          await messageToInbound(message, message.isMention === true, isDM),
+        );
       });
 
       // @mention in an unsubscribed thread — SDK-confirmed bot mention.
       chat.onNewMention(async (thread, message) => {
         const channelId = adapter.channelIdFromThreadId(thread.id);
-        await setupConfig.onInbound(channelId, thread.id, await messageToInbound(message, true));
+        const isDM = adapterIsDM(adapter, thread.id);
+        await setupConfig.onInbound(channelId, thread.id, await messageToInbound(message, true, isDM));
       });
 
       // DMs — by definition addressed to the bot. Thread id flows through
@@ -229,7 +246,8 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           sender: (message.author as any)?.fullName ?? (message.author as any)?.userId ?? 'unknown',
           threadId: thread.id,
         });
-        await setupConfig.onInbound(channelId, thread.id, await messageToInbound(message, true));
+        // onDirectMessage only fires for real DMs — isDM=true unconditionally.
+        await setupConfig.onInbound(channelId, thread.id, await messageToInbound(message, true, true));
       });
 
       // Plain messages in unsubscribed threads.
@@ -244,7 +262,8 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // flood gate.
       chat.onNewMessage(/./, async (thread, message) => {
         const channelId = adapter.channelIdFromThreadId(thread.id);
-        await setupConfig.onInbound(channelId, thread.id, await messageToInbound(message, false));
+        const isDM = adapterIsDM(adapter, thread.id);
+        await setupConfig.onInbound(channelId, thread.id, await messageToInbound(message, false, isDM));
       });
 
       // Handle button clicks (ask_user_question)

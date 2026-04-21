@@ -37,13 +37,42 @@
  *   - Delivery adapter missing.
  */
 import { normalizeOptions, type RawOption } from '../../channels/ask-question.js';
-import { getAllAgentGroups } from '../../db/agent-groups.js';
+import { getAllAgentGroups, getAgentGroup } from '../../db/agent-groups.js';
+import { getDb } from '../../db/connection.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getDeliveryAdapter } from '../../delivery.js';
 import { log } from '../../log.js';
 import type { InboundEvent } from '../../router.js';
 import { pickApprovalDelivery, pickApprover } from '../approvals/primitive.js';
 import { createPendingChannelApproval, hasInFlightChannelApproval } from './db/pending-channel-approvals.js';
+
+/**
+ * Pick the best-fit agent group for a new messaging_group on this channel_type.
+ * Heuristic: if any existing messaging_group on the same channel_type is
+ * already wired, reuse that agent group. This keeps new Slack channels in the
+ * `slack-illysium` workspace pointing at `illysium` rather than whichever
+ * agent sorts first by name. Falls back to the alphabetically first agent
+ * group when no prior wiring on this channel_type exists.
+ */
+function pickTargetAgentGroup(channelType: string): { id: string; name: string } | null {
+  const db = getDb();
+  const row = db
+    .prepare(
+      `SELECT mga.agent_group_id, COUNT(*) AS n
+       FROM messaging_group_agents mga
+       JOIN messaging_groups mg ON mg.id = mga.messaging_group_id
+       WHERE mg.channel_type = ?
+       GROUP BY mga.agent_group_id
+       ORDER BY n DESC LIMIT 1`,
+    )
+    .get(channelType) as { agent_group_id: string; n: number } | undefined;
+  if (row) {
+    const ag = getAgentGroup(row.agent_group_id);
+    if (ag) return { id: ag.id, name: ag.name };
+  }
+  const all = getAllAgentGroups();
+  return all.length > 0 ? { id: all[0].id, name: all[0].name } : null;
+}
 
 const APPROVAL_OPTIONS: RawOption[] = [
   { label: 'Approve', selectedLabel: '✅ Wired', value: 'approve' },
@@ -67,16 +96,17 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
     return;
   }
 
-  // MVP: pick the first agent group by name. Multi-agent systems will get
-  // a richer card later (user picks the target from a list).
-  const agentGroups = getAllAgentGroups();
-  if (agentGroups.length === 0) {
+  // Prefer the agent group that's already handling other channels on the
+  // same channel_type (workspace). Keeps Slack/Discord new-channel additions
+  // in the expected agent's group. Falls back to first-by-name when nothing
+  // is wired yet on this channel_type.
+  const target = pickTargetAgentGroup(event.channelType);
+  if (!target) {
     log.warn('Channel registration skipped — no agent groups configured. Run /init-first-agent.', {
       messagingGroupId,
     });
     return;
   }
-  const target = agentGroups[0];
 
   // pickApprover takes the target agent group's id — gets scoped admins +
   // global admins + owners. For fresh installs with only an owner, the
