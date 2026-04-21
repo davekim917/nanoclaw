@@ -30,6 +30,7 @@ import { findSessionForAgent } from './db/sessions.js';
 import { startTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { resolveSession, writeSessionMessage } from './session-manager.js';
+import { maybeRenameNewThread } from './topic-title.js';
 import { wakeContainer } from './container-runner.js';
 import { getSession } from './db/sessions.js';
 import type { AgentGroup, MessagingGroup, MessagingGroupAgent } from './types.js';
@@ -431,6 +432,14 @@ async function deliverToAgent(
   }
 
   const { session, created } = resolveSession(agent.agent_group_id, mg.id, event.threadId, effectiveSessionMode);
+
+  // Rename freshly-created Discord threads to a Haiku-derived topic title.
+  // Fire-and-forget; failures log and move on. See src/topic-title.ts for
+  // the why and the platform-gating (Discord only).
+  if (created) {
+    const firstText = safeParseContent(event.message.content).text ?? '';
+    if (firstText) maybeRenameNewThread(event.channelType, event.threadId, firstText);
+  }
 
   // Persist any base64-encoded attachments from chat-sdk-bridge onto the
   // filesystem and replace their inline data URLs with file:// paths. The

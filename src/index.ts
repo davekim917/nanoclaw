@@ -4,6 +4,7 @@
  * Thin orchestrator: init DB, run migrations, start channel adapters,
  * start delivery polls, start sweep, handle shutdown.
  */
+import fs from 'fs';
 import path from 'path';
 
 import { DATA_DIR } from './config.js';
@@ -56,6 +57,37 @@ async function dispatchResponse(payload: ResponsePayload): Promise<void> {
   log.warn('Unclaimed response', { questionId: payload.questionId, value: payload.value });
 }
 
+/**
+ * Load .env file values into process.env, without overriding vars already set.
+ * Mirrors V1's readEnvFile behavior — needed so ANTHROPIC_BASE_URL,
+ * ANTHROPIC_API_KEY, and other env-driven config flows work even when
+ * the host is started without those vars in the shell environment.
+ */
+function loadEnvIntoProcess(): void {
+  const envPath = path.join(process.cwd(), '.env');
+  let content: string;
+  try {
+    content = fs.readFileSync(envPath, 'utf-8');
+  } catch {
+    return; // .env not present — fine
+  }
+
+  for (const line of content.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eqIdx = trimmed.indexOf('=');
+    if (eqIdx === -1) continue;
+    const key = trimmed.slice(0, eqIdx).trim();
+    const value = trimmed
+      .slice(eqIdx + 1)
+      .trim()
+      .replace(/^["']|["']$/g, '');
+    if (key && !Object.prototype.hasOwnProperty.call(process.env, key)) {
+      process.env[key] = value;
+    }
+  }
+}
+
 // Channel barrel — each enabled channel self-registers on import.
 // Channel skills uncomment lines in channels/index.ts to enable them.
 import './channels/index.js';
@@ -70,9 +102,13 @@ import { initChannelAdapters, teardownChannelAdapters, getChannelAdapter } from 
 async function main(): Promise<void> {
   log.info('NanoClaw starting');
 
-  // 0. Register secret values from .env for outbound scrubbing. Cheap; does
-  //    a no-op if .env is missing. Runs first so subsequent startup logs
-  //    get scrubbed too.
+  // 0. Load .env into process.env (for secrets not injected by the shell,
+  //    like ANTHROPIC_BASE_URL and ANTHROPIC_API_KEY which determine whether
+  //    we use direct proxy or OneCLI gateway). Does NOT override vars already
+  //    in the process environment — shell-set values take precedence.
+  loadEnvIntoProcess();
+
+  // 1. Register secret values from .env for outbound scrubbing.
   registerSecretsFromEnv();
 
   // 1. Init central DB
