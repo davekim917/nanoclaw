@@ -26,6 +26,7 @@ ARG VERCEL_VERSION=latest
 ARG GITNEXUS_VERSION=latest
 ARG BUN_VERSION=1.3.12
 ARG MMDC_VERSION=11.12.0
+ARG GWS_VERSION=0.22.5
 
 # ---- System dependencies -----------------------------------------------------
 # tini: correct PID 1 / signal forwarding so outbound.db writes finalize on
@@ -76,16 +77,55 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
-# Data tools via isolated venv (PEP 668 — Debian disallows system-wide pip).
-# Exposed on PATH so agents use `dbt` / `snow` without activating the venv.
-ENV DATA_TOOLS_VENV=/opt/data-tools
-ENV PATH="${DATA_TOOLS_VENV}/bin:${PATH}"
-RUN python3 -m venv "${DATA_TOOLS_VENV}" \
-    && "${DATA_TOOLS_VENV}/bin/pip" install --no-cache-dir --upgrade pip setuptools wheel \
-    && "${DATA_TOOLS_VENV}/bin/pip" install --no-cache-dir \
-        dbt-core \
-        dbt-snowflake \
-        snowflake-cli-labs
+# Data tools via isolated venvs (PEP 668 — Debian disallows system-wide pip).
+# snow and dbt have conflicting transitive deps (notably on click + urllib3),
+# so they live in separate venvs with symlinks on PATH. Layout mirrors v1:
+#   /opt/snow-venv/bin/snow → /usr/local/bin/snow
+#   /opt/dbt-venv/bin/dbt → /usr/local/bin/dbt
+RUN python3 -m venv /opt/snow-venv \
+    && /opt/snow-venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel \
+    && /opt/snow-venv/bin/pip install --no-cache-dir snowflake-cli==3.16.0 \
+    && ln -sf /opt/snow-venv/bin/snow /usr/local/bin/snow
+
+RUN python3 -m venv /opt/dbt-venv \
+    && /opt/dbt-venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel \
+    && /opt/dbt-venv/bin/pip install --no-cache-dir dbt-core==1.11.8 dbt-snowflake==1.11.4 \
+    && ln -sf /opt/dbt-venv/bin/dbt /usr/local/bin/dbt
+
+# AWS CLI v2 (isolated from pip to avoid version churn)
+RUN ARCH=$(uname -m) \
+    && curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-${ARCH}.zip" -o /tmp/awscli.zip \
+    && unzip -q /tmp/awscli.zip -d /tmp \
+    && /tmp/aws/install \
+    && rm -rf /tmp/awscli.zip /tmp/aws
+
+# Google Cloud SDK (gcloud, gsutil) — needs gpg to verify apt repo signature
+RUN apt-get update && apt-get install -y --no-install-recommends gnupg \
+    && curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+      | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" \
+      > /etc/apt/sources.list.d/google-cloud-sdk.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends google-cloud-cli \
+    && rm -rf /var/lib/apt/lists/*
+
+# Render / Railway / Supabase CLIs (released as prebuilt binaries)
+ARG RENDER_VERSION=2.15.1
+ARG RAILWAY_VERSION=4.37.3
+ARG SUPABASE_VERSION=2.90.0
+RUN DPKG_ARCH=$(dpkg --print-architecture) && UARCH=$(uname -m) \
+    && curl -fsSL "https://github.com/render-oss/cli/releases/download/v${RENDER_VERSION}/cli_${RENDER_VERSION}_linux_${DPKG_ARCH}.zip" \
+       -o /tmp/render.zip \
+    && unzip -q /tmp/render.zip -d /tmp/render \
+    && mv /tmp/render/cli_v${RENDER_VERSION} /usr/local/bin/render \
+    && chmod +x /usr/local/bin/render \
+    && curl -fsSL "https://github.com/railwayapp/cli/releases/download/v${RAILWAY_VERSION}/railway-v${RAILWAY_VERSION}-${UARCH}-unknown-linux-musl.tar.gz" \
+       | tar xz -C /usr/local/bin railway \
+    && chmod +x /usr/local/bin/railway \
+    && curl -fsSL "https://github.com/supabase/cli/releases/download/v${SUPABASE_VERSION}/supabase_${SUPABASE_VERSION}_linux_${DPKG_ARCH}.deb" \
+       -o /tmp/supabase.deb \
+    && dpkg -i /tmp/supabase.deb \
+    && rm -rf /tmp/render.zip /tmp/render /tmp/supabase.deb
 
 # Chromium path for agent-browser / Playwright / mmdc consumers
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
@@ -114,12 +154,14 @@ RUN corepack enable
 # package. Pinned versions so every rebuild is reproducible.
 RUN --mount=type=cache,target=/root/.cache/pnpm \
     echo "only-built-dependencies[]=agent-browser" > /root/.npmrc && \
+    echo "only-built-dependencies[]=@googleworkspace/cli" >> /root/.npmrc && \
     pnpm install -g \
         "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
         "agent-browser@${AGENT_BROWSER_VERSION}" \
         "vercel@${VERCEL_VERSION}" \
         "gitnexus@${GITNEXUS_VERSION}" \
-        "@mermaid-js/mermaid-cli@${MMDC_VERSION}"
+        "@mermaid-js/mermaid-cli@${MMDC_VERSION}" \
+        "@googleworkspace/cli@${GWS_VERSION}"
 
 # ---- agent-runner ------------------------------------------------------------
 WORKDIR /app
