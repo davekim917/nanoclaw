@@ -348,11 +348,40 @@ export const resolveThreadLinkTool: McpToolDefinition = {
  * the session's own routing — so the agent can say "read this thread"
  * and get the current conversation's transcript.
  */
+/**
+ * Resolve the channel the caller wants to read from, plus — importantly —
+ * the default `thread_id` to use when the caller didn't pin one.
+ *
+ * The default-thread rule exists because `read_thread` without a thread_id
+ * used to fall back to "most recent thread in the channel", which is wrong
+ * when the agent is already mid-conversation inside a specific thread: the
+ * "most recent" row may well be a different thread that happened to get a
+ * message 30 seconds ago. This led to hallucinated cross-thread answers
+ * (see the apollo/xzo incident). Now: if the resolved channel is the same
+ * channel as the current session, the session's own thread_id is returned
+ * as the default. Callers that want a different thread must pass
+ * `thread_id` explicitly.
+ */
 function resolveRouting(args: {
   channel?: unknown;
   channel_type?: unknown;
   platform_id?: unknown;
-}): { channelType: string; platformId: string; channelName: string | null } | string {
+}):
+  | { channelType: string; platformId: string; channelName: string | null; sessionThreadId: string | null }
+  | string {
+  let sessionRouting: { channel_type: string | null; platform_id: string | null; thread_id: string | null } = {
+    channel_type: null,
+    platform_id: null,
+    thread_id: null,
+  };
+  try {
+    sessionRouting = getSessionRouting();
+  } catch {
+    // best-effort — session routing is only used to default thread_id
+  }
+  const sessionThreadIdForChannel = (ct: string, pid: string): string | null =>
+    sessionRouting.channel_type === ct && sessionRouting.platform_id === pid ? sessionRouting.thread_id : null;
+
   const channelName = typeof args.channel === 'string' ? args.channel.trim() : '';
   if (channelName) {
     const dest = findByName(channelName);
@@ -360,21 +389,33 @@ function resolveRouting(args: {
     if (dest.type !== 'channel' || !dest.channelType || !dest.platformId) {
       return `destination ${JSON.stringify(channelName)} is not a channel (type=${dest.type})`;
     }
-    return { channelType: dest.channelType, platformId: dest.platformId, channelName: dest.displayName };
+    return {
+      channelType: dest.channelType,
+      platformId: dest.platformId,
+      channelName: dest.displayName,
+      sessionThreadId: sessionThreadIdForChannel(dest.channelType, dest.platformId),
+    };
   }
   const ct = typeof args.channel_type === 'string' ? args.channel_type : '';
   const pid = typeof args.platform_id === 'string' ? args.platform_id : '';
-  if (ct && pid) return { channelType: ct, platformId: pid, channelName: null };
-  // Fall back to current session routing.
-  try {
-    const r = getSessionRouting();
-    if (!r.channel_type || !r.platform_id) {
-      return 'session routing incomplete (missing channel_type or platform_id)';
-    }
-    return { channelType: r.channel_type, platformId: r.platform_id, channelName: null };
-  } catch {
+  if (ct && pid) {
+    return {
+      channelType: ct,
+      platformId: pid,
+      channelName: null,
+      sessionThreadId: sessionThreadIdForChannel(ct, pid),
+    };
+  }
+  // Fall back to current session routing entirely.
+  if (!sessionRouting.channel_type || !sessionRouting.platform_id) {
     return 'no channel/channel_type+platform_id provided and session routing unavailable';
   }
+  return {
+    channelType: sessionRouting.channel_type,
+    platformId: sessionRouting.platform_id,
+    channelName: null,
+    sessionThreadId: sessionRouting.thread_id,
+  };
 }
 
 function renderTranscript(rows: TranscriptRow[], header: string): string {
@@ -389,7 +430,7 @@ export const readThreadTool: McpToolDefinition = {
   tool: {
     name: 'read_thread',
     description:
-      'Read the archived transcript of a specific past thread. ONLY call this when the user explicitly asks to review, resume, or reference a prior conversation (e.g. "what did we discuss in X", "pull up the thread about Y"). Do NOT call this to gather context on a new incoming message — the current session\'s history is already in your context window. Pass either `channel` (destination name) or `channel_type` + `platform_id` to scope the lookup; pass `thread_id` to pin a specific thread, otherwise the most recent thread in that channel is returned.',
+      'Cross-thread lookup: read the archived transcript of a PAST thread in a DIFFERENT channel/thread from the one you are currently in. Intended for user-driven references ("what did we decide in #other-channel", "pull up the thread about Y"). The tool refuses to read the current session\'s own thread — if you are missing context for the thread you are in, tell the user directly instead of silently guessing. When `thread_id` is omitted, returns the single most recent thread in the resolved channel; pass `thread_id` explicitly when the user is pointing at a specific one.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -411,6 +452,18 @@ export const readThreadTool: McpToolDefinition = {
     if (!db) return err('archive database not mounted');
     const ag = currentAgentGroupId();
     if (!ag) return err('agent group id unavailable');
+
+    // Refuse to read the CURRENT session's own thread. This tool is for
+    // cross-thread lookups only — if you're missing context for the thread
+    // you're in, tell the user; don't paper over it by re-reading your own
+    // archive. Matches the tool description's "PAST thread in ANOTHER
+    // channel" framing.
+    if (!threadId && routing.sessionThreadId) {
+      return err(
+        'this tool is for cross-thread lookups, not current-session hydration — ' +
+          'if you are missing context for the thread you are in, tell the user so directly instead',
+      );
+    }
 
     let resolvedThreadId = threadId;
     if (!resolvedThreadId) {
@@ -457,7 +510,7 @@ export const readThreadByKeyTool: McpToolDefinition = {
   tool: {
     name: 'read_thread_by_key',
     description:
-      'Read the most recent archived thread from a named channel. ONLY call this when the user explicitly asks to review or resume the most recent conversation in that channel (e.g. "catch me up on #eng-ops", "what was the last thing in Y"). Do NOT call this speculatively on an initial user message to gather context — the current session\'s history is already available. Convenience wrapper around read_thread keyed on a destination name.',
+      'Read the most recent archived thread in another named channel. ONLY call this when the user explicitly asks to review the most recent conversation in a DIFFERENT channel (e.g. "catch me up on #eng-ops"). Do NOT call this to recover context for the thread you are currently in — if history is missing, say so to the user rather than guessing with "most recent in channel", which will often be a different thread than the one the user is referencing.',
     inputSchema: {
       type: 'object' as const,
       properties: {
