@@ -45,4 +45,4 @@ agents-sdk-docs
 
 # Local env backups
 .env.pre-*
-.env.bak
+.env.bak*

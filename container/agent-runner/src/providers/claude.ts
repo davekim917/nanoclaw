@@ -292,6 +292,12 @@ function createPreCompactHook(assistantName?: string): HookCallback {
 const ANTHROPIC_KEY_RE = /^ANTHROPIC_API_KEY(_\d+)?$/;
 const ANTHROPIC_FALLBACK_RE = /^ANTHROPIC_API_KEY_(\d+)$/;
 
+// CLAUDE_CODE_OAUTH_TOKEN (Claude Max subscription) + _N fallback variants.
+// Parallel rotation list to API-key fallbacks — when the host operates on
+// OAuth (no ANTHROPIC_API_KEY), retryable errors advance through these.
+const OAUTH_KEY_RE = /^CLAUDE_CODE_OAUTH_TOKEN(_\d+)?$/;
+const OAUTH_FALLBACK_RE = /^CLAUDE_CODE_OAUTH_TOKEN_(\d+)$/;
+
 // Retryable upstream errors. v1's list — see
 // container/agent-runner/src/index.ts:470-478.
 const RETRYABLE_ERROR_RE = /429|rate[\s_-]?limit|overloaded|upstream_error|External provider returned/i;
@@ -310,7 +316,7 @@ const RETRYABLE_ERROR_RE = /429|rate[\s_-]?limit|overloaded|upstream_error|Exter
 function buildSecretEnvVarList(): string[] {
   return [
     ...Object.keys(process.env).filter((k) => ANTHROPIC_KEY_RE.test(k)),
-    'CLAUDE_CODE_OAUTH_TOKEN',
+    ...Object.keys(process.env).filter((k) => OAUTH_KEY_RE.test(k)),
     'GMAIL_OAUTH_PATH',
     'GMAIL_CREDENTIALS_PATH',
   ];
@@ -638,6 +644,17 @@ export class ClaudeProvider implements AgentProvider {
   private fallbackKeys: Array<{ name: string; value: string }>;
   private nextFallback = 0;
 
+  /**
+   * Parallel fallback list for OAuth (Claude Max subscription) tokens.
+   * Host forwards CLAUDE_CODE_OAUTH_TOKEN + CLAUDE_CODE_OAUTH_TOKEN_N and
+   * adds api.anthropic.com to NO_PROXY so OneCLI's proxy doesn't substitute
+   * the token mid-flight. Rotation is keyed on OAuth being the active auth
+   * path — if ANTHROPIC_API_KEY is also set we prefer API-key rotation
+   * (it's the only thing the SDK actually uses in that case).
+   */
+  private fallbackOauth: Array<{ name: string; value: string }>;
+  private nextOauthFallback = 0;
+
   constructor(options: ProviderOptions = {}) {
     this.assistantName = options.assistantName;
     this.mcpServers = options.mcpServers ?? {};
@@ -653,6 +670,17 @@ export class ClaudeProvider implements AgentProvider {
       .map(([k, v]) => ({ name: k, value: v as string }));
     if (this.fallbackKeys.length > 0) {
       log(`Loaded ${this.fallbackKeys.length} ANTHROPIC_API_KEY fallback(s): ${this.fallbackKeys.map((k) => k.name).join(', ')}`);
+    }
+    this.fallbackOauth = Object.entries(this.env)
+      .filter(([k, v]) => OAUTH_FALLBACK_RE.test(k) && typeof v === 'string' && v.length > 0)
+      .sort(([a], [b]) => {
+        const na = Number(a.match(OAUTH_FALLBACK_RE)![1]);
+        const nb = Number(b.match(OAUTH_FALLBACK_RE)![1]);
+        return na - nb;
+      })
+      .map(([k, v]) => ({ name: k, value: v as string }));
+    if (this.fallbackOauth.length > 0) {
+      log(`Loaded ${this.fallbackOauth.length} CLAUDE_CODE_OAUTH_TOKEN fallback(s): ${this.fallbackOauth.map((k) => k.name).join(', ')}`);
     }
   }
 
@@ -672,14 +700,28 @@ export class ClaudeProvider implements AgentProvider {
   }
 
   /**
-   * Advance ANTHROPIC_API_KEY to the next fallback in the configured list.
-   * Position persists for the container lifetime — once key N fires a
-   * retryable error, key N+1 stays active for all subsequent queries. We
-   * don't walk backwards; re-starting the container is the reset. Returns
-   * false when no more fallbacks remain (caller should surface the error
-   * to the user).
+   * Advance the active Anthropic credential to the next fallback. Prefers
+   * OAuth rotation (Claude Max) when OAuth is the active auth path — that
+   * is, when CLAUDE_CODE_OAUTH_TOKEN is set and ANTHROPIC_API_KEY is not.
+   * Otherwise rotates ANTHROPIC_API_KEY through its _N fallbacks. Returns
+   * false when no more fallbacks of either kind remain.
+   *
+   * Position persists for the container lifetime — once slot N fires a
+   * retryable error, slot N+1 stays active for all subsequent queries.
+   * Restarting the container is the only reset.
    */
   rotateApiKey(): boolean {
+    const usingOauth = !this.env.ANTHROPIC_API_KEY && Boolean(this.env.CLAUDE_CODE_OAUTH_TOKEN);
+    if (usingOauth) {
+      if (this.nextOauthFallback >= this.fallbackOauth.length) return false;
+      const next = this.fallbackOauth[this.nextOauthFallback++];
+      if (this.env.CLAUDE_CODE_OAUTH_TOKEN === next.value) {
+        return this.rotateApiKey();
+      }
+      this.env.CLAUDE_CODE_OAUTH_TOKEN = next.value;
+      log(`Rotated CLAUDE_CODE_OAUTH_TOKEN → ${next.name} (${this.nextOauthFallback}/${this.fallbackOauth.length})`);
+      return true;
+    }
     if (this.nextFallback >= this.fallbackKeys.length) return false;
     const next = this.fallbackKeys[this.nextFallback++];
     if (this.env.ANTHROPIC_API_KEY === next.value) {

@@ -261,6 +261,36 @@ function resolveScopedEnv(baseName: string, folder: string): string | undefined 
 }
 
 /**
+ * Append a host to the container's NO_PROXY / no_proxy env entries,
+ * merging with any value OneCLI (or an earlier step) already set. Mutates
+ * args in place. If neither form is present, adds both uppercase and
+ * lowercase entries — Node respects uppercase, many Python/Go tools only
+ * read lowercase.
+ */
+function mergeNoProxy(args: string[], host: string): void {
+  const keys = ['NO_PROXY', 'no_proxy'];
+  let touchedAny = false;
+  for (const key of keys) {
+    const prefix = `${key}=`;
+    for (let i = 0; i < args.length - 1; i++) {
+      if (args[i] !== '-e' || !args[i + 1].startsWith(prefix)) continue;
+      const existing = args[i + 1].slice(prefix.length);
+      const parts = existing
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+      if (!parts.includes(host)) parts.push(host);
+      args[i + 1] = `${key}=${parts.join(',')}`;
+      touchedAny = true;
+    }
+  }
+  if (!touchedAny) {
+    args.push('-e', `NO_PROXY=${host}`);
+    args.push('-e', `no_proxy=${host}`);
+  }
+}
+
+/**
  * Phase 5.3: write a capabilities snapshot into the session dir at
  * every container spawn. Container's get_capabilities MCP tool reads
  * this JSON directly — no round-trip, always fresh per spawn.
@@ -1008,6 +1038,26 @@ async function buildContainerArgs(
     }
   }
 
+  // OAuth path (Claude Max subscription). When CLAUDE_CODE_OAUTH_TOKEN is
+  // set on the host we forward it + any CLAUDE_CODE_OAUTH_TOKEN_N fallbacks
+  // so the provider can rotate through multiple Max accounts on retryable
+  // errors (weekly cap, 429, rate_limit). The OneCLI proxy is still applied
+  // below, but we add api.anthropic.com to NO_PROXY so Anthropic traffic
+  // bypasses OneCLI's credential-injection layer — otherwise the proxy
+  // overwrites whatever OAuth the SDK sent with the single vault entry,
+  // defeating in-process rotation. Everything else (Gmail, GitHub, Exa,
+  // Braintrust, etc.) still routes through OneCLI.
+  const hostOauth = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  const oauthBypassAnthropic = Boolean(hostOauth);
+  if (hostOauth) {
+    args.push('-e', `CLAUDE_CODE_OAUTH_TOKEN=${hostOauth}`);
+    for (const [k, v] of Object.entries(process.env)) {
+      if (/^CLAUDE_CODE_OAUTH_TOKEN_\d+$/.test(k) && v) {
+        args.push('-e', `${k}=${v}`);
+      }
+    }
+  }
+
   // GitHub token for git-over-HTTPS + `gh` CLI. Per-agent-group: resolves
   // from container.json `githubTokenEnv`, then from
   // `GITHUB_TOKEN_<FOLDER_UPPER>`, then falls back to `GITHUB_TOKEN`.
@@ -1125,6 +1175,17 @@ async function buildContainerArgs(
       }
     } catch (err) {
       log.warn('OneCLI gateway error — container will have no credentials', { containerName, err });
+    }
+
+    // OAuth bypass: when a host OAuth token is forwarded, tell the
+    // in-container HTTPS_PROXY (just configured by OneCLI) to skip
+    // api.anthropic.com. Without this, OneCLI's proxy would intercept the
+    // Anthropic request and substitute the single vault credential,
+    // defeating the provider-level rotation across CLAUDE_CODE_OAUTH_TOKEN_N.
+    // We merge with any existing NO_PROXY rather than overwrite so localhost /
+    // onecli internal bypasses that OneCLI added stay intact.
+    if (oauthBypassAnthropic) {
+      mergeNoProxy(args, 'api.anthropic.com');
     }
   }
 
