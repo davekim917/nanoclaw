@@ -39,3 +39,10 @@ groups/global/*
 
 agents-sdk-docs
 .gitnexus
+
+# Runtime lock files
+.claude/scheduled_tasks.lock
+
+# Local env backups
+.env.pre-*
+.env.bak
