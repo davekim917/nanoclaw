@@ -246,9 +246,7 @@ function resetStuckProcessingRows(
   reason: string,
 ): void {
   const claims = getProcessingClaims(outDb);
-  const respondedStmt = outDb.prepare(
-    'SELECT 1 FROM messages_out WHERE in_reply_to = ? LIMIT 1',
-  );
+  const respondedStmt = outDb.prepare('SELECT 1 FROM messages_out WHERE in_reply_to = ? LIMIT 1');
   const markCompletedInAckStmt = outDb.prepare(
     "INSERT OR REPLACE INTO processing_ack (message_id, status, status_changed) VALUES (?, 'completed', datetime('now'))",
   );
