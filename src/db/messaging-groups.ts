@@ -135,13 +135,13 @@ export function createMessagingGroupAgent(mga: MessagingGroupAgent): void {
       `INSERT INTO messaging_group_agents (
          id, messaging_group_id, agent_group_id,
          engage_mode, engage_pattern, sender_scope, ignored_message_policy,
-         session_mode, priority, default_model, default_effort,
+         session_mode, priority, default_model, default_effort, default_tone,
          created_at
        )
        VALUES (
          @id, @messaging_group_id, @agent_group_id,
          @engage_mode, @engage_pattern, @sender_scope, @ignored_message_policy,
-         @session_mode, @priority, @default_model, @default_effort,
+         @session_mode, @priority, @default_model, @default_effort, @default_tone,
          @created_at
        )`,
     )
@@ -226,6 +226,7 @@ export function updateMessagingGroupAgent(
       | 'priority'
       | 'default_model'
       | 'default_effort'
+      | 'default_tone'
     >
   >,
 ): void {

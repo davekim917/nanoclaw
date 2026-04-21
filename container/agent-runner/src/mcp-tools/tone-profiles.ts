@@ -29,7 +29,7 @@ export const getToneProfileTool: McpToolDefinition = {
   tool: {
     name: 'get_tone_profile',
     description:
-      'Load a tone profile and writing quality rules. ALWAYS call this before drafting any email, message, or written content that will be sent to someone. Returns the full profile plus universal writing rules (banned AI vocabulary, structural patterns to avoid). Also use for tone overrides ("use X tone").',
+      'Load a specific tone profile for a one-off override. The session\'s default tone is already injected into your system prompt at spawn time — you do NOT need to call this for every response. ONLY call this when: (a) the user explicitly asks for a different tone ("use professional tone", "make this medieval"), or (b) you need the writing-rules file for a long-form drafting task that benefits from an explicit refresher.',
     inputSchema: {
       type: 'object' as const,
       properties: {

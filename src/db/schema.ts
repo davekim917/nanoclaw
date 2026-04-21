@@ -55,6 +55,7 @@ CREATE TABLE messaging_group_agents (
   -- through to agent-group container.json → host env → hardcoded.
   default_model          TEXT,
   default_effort         TEXT,
+  default_tone           TEXT,          -- migration 016: per-channel tone profile name
   created_at             TEXT NOT NULL,
   UNIQUE(messaging_group_id, agent_group_id)
 );

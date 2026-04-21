@@ -127,18 +127,21 @@ async function spawnContainer(session: Session): Promise<void> {
   // messaging_group (e.g. pure agent-to-agent) skip this lookup.
   let channelDefaultModel: string | null = null;
   let channelDefaultEffort: string | null = null;
+  let channelDefaultTone: string | null = null;
   if (session.messaging_group_id) {
     const { getMessagingGroupAgentByPair } = await import('./db/messaging-groups.js');
     const wiring = getMessagingGroupAgentByPair(session.messaging_group_id, agentGroup.id);
     if (wiring) {
       channelDefaultModel = wiring.default_model;
       channelDefaultEffort = wiring.default_effort;
+      channelDefaultTone = wiring.default_tone;
     }
   }
 
   const args = await buildContainerArgs(mounts, containerName, agentGroup, provider, contribution, agentIdentifier, {
     channelDefaultModel,
     channelDefaultEffort,
+    channelDefaultTone,
   });
 
   log.info('Spawning container', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
@@ -956,7 +959,11 @@ async function buildContainerArgs(
   provider: string,
   providerContribution: ProviderContainerContribution,
   agentIdentifier?: string,
-  channelDefaults?: { channelDefaultModel: string | null; channelDefaultEffort: string | null },
+  channelDefaults?: {
+    channelDefaultModel: string | null;
+    channelDefaultEffort: string | null;
+    channelDefaultTone: string | null;
+  },
 ): Promise<string[]> {
   const args: string[] = ['run', '--rm', '--name', containerName];
 
@@ -1024,6 +1031,16 @@ async function buildContainerArgs(
     'high';
   args.push('-e', `CLAUDE_CODE_USE_EFFORT=${defaultEffort}`);
   args.push('-e', `CLAUDE_CODE_EFFORT_LEVEL=${defaultEffort}`);
+
+  // Per-channel default tone profile — ports v1's "always-on tone" feature.
+  // Precedence: per-channel wiring (messaging_group_agents.default_tone) →
+  // per-agent container.json `tone` → unset (agent falls back to the
+  // get_tone_profile MCP tool for on-demand selection). Profile content
+  // injection happens container-side in agent-runner/src/index.ts.
+  const defaultTone = channelDefaults?.channelDefaultTone ?? containerConfig.tone ?? null;
+  if (defaultTone) {
+    args.push('-e', `NANOCLAW_DEFAULT_TONE=${defaultTone}`);
+  }
   // v1 settings.json env block (src/container-runner.ts:1703-1709): SDK
   // capabilities that need explicit opt-in. Porting as plain env since
   // v2's container reads env, not a settings.json mount point.

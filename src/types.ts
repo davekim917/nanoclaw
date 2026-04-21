@@ -107,6 +107,14 @@ export interface MessagingGroupAgent {
    * Null = fall through to agent container.json → host env → hardcoded.
    */
   default_effort: string | null;
+  /**
+   * Per-channel default tone profile name (matches a file under
+   * `tone-profiles/<name>.md`). When set, the host injects the full profile
+   * into the container's system prompt on spawn — always-on, not gated by an
+   * MCP call. Null = no tone injected; agent falls back to the
+   * get_tone_profile MCP tool for on-demand overrides.
+   */
+  default_tone: string | null;
   created_at: string;
 }
 

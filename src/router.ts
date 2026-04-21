@@ -336,6 +336,7 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
           ignored_message_policy: 'accumulate',
           default_model: null,
           default_effort: null,
+          default_tone: null,
           created_at: new Date().toISOString(),
         });
         log.info('Workspace-trust auto-wire', {

@@ -109,6 +109,15 @@ export interface ContainerConfig {
   defaultEffort?: 'low' | 'medium' | 'high' | 'xhigh';
 
   /**
+   * Per-agent-group default tone profile name (matches a file under
+   * `tone-profiles/<name>.md`). Acts as the fallback when a per-channel
+   * wiring doesn't set `default_tone` on `messaging_group_agents`. When
+   * neither is set, no tone is injected — agent uses the get_tone_profile
+   * MCP tool for on-demand selection.
+   */
+  tone?: string;
+
+  /**
    * Per-agent credential/tool allowlist. Each entry is either a bare tool
    * name (`snowflake`) or scoped (`snowflake:sunday`, `aws:apollo`).
    *
@@ -164,6 +173,7 @@ export function readContainerConfig(folder: string): ContainerConfig {
       ollamaAdminTools: raw.ollamaAdminTools,
       defaultModel: raw.defaultModel,
       defaultEffort: raw.defaultEffort,
+      tone: raw.tone,
       tools: raw.tools,
     };
   } catch (err) {

@@ -58,7 +58,28 @@ async function main(): Promise<void> {
   // @-import from /workspace/agent/CLAUDE.md, but the invariants here (name,
   // meta-response prohibition, credential-in-chat rule) are duplicated in
   // the addendum so a CLAUDE.md load failure can't silently drop them.
-  const instructions = buildSystemPromptAddendum(assistantName);
+  const addendum = buildSystemPromptAddendum(assistantName);
+
+  // Always-on tone profile injection. Host resolves per-channel tone (via
+  // messaging_group_agents.default_tone → container.json `tone`) and forwards
+  // the name in NANOCLAW_DEFAULT_TONE. When set, read the corresponding
+  // tone-profiles/<name>.md and prepend it to the system prompt so every
+  // response — chat or drafted content — picks up the voice. Mirrors v1's
+  // behavior (v1 index.ts:2138-2147).
+  let toneBlock: string | undefined;
+  const toneName = process.env.NANOCLAW_DEFAULT_TONE;
+  if (toneName) {
+    const toneProfilePath = `/workspace/tone-profiles/${toneName}.md`;
+    try {
+      const toneContent = fs.readFileSync(toneProfilePath, 'utf-8');
+      toneBlock = `## Default Tone: ${toneName}\n\nApply this voice to every response in this session — chat replies AND any content you draft (emails, documents, messages). Per-response overrides from the user ("use X tone") take precedence.\n\n${toneContent}`;
+      log(`Loaded default tone profile: ${toneName}`);
+    } catch {
+      log(`NANOCLAW_DEFAULT_TONE=${toneName} but ${toneProfilePath} not found — skipping injection`);
+    }
+  }
+
+  const instructions = toneBlock ? `${toneBlock}\n\n${addendum}` : addendum;
 
   // Discover additional directories mounted at /workspace/extra/*
   const additionalDirectories: string[] = [];
