@@ -40,6 +40,23 @@ const COMMANDS = [
   { name: 'deploy', description: 'Pull, build, and restart NanoClaw v2 from dave/migration' },
   { name: 'update-container', description: 'Rebuild the v2 agent container image now' },
   { name: 'update-plugins', description: 'Run git pull on all ~/plugins repos now' },
+  {
+    name: 'sync-groups',
+    description: 'Inspect / sync per-group agent-runner-src overlays against trunk',
+    options: [
+      {
+        name: 'mode',
+        description: 'inspect (default) | apply | apply-force',
+        type: 3, // STRING
+        required: false,
+        choices: [
+          { name: 'inspect', value: 'inspect' },
+          { name: 'apply', value: 'apply' },
+          { name: 'apply-force', value: 'apply-force' },
+        ],
+      },
+    ],
+  },
 ];
 
 let client: Client | null = null;
@@ -175,6 +192,44 @@ async function handleUpdatePlugins(interaction: ChatInputCommandInteraction): Pr
   }
 }
 
+async function handleSyncGroups(interaction: ChatInputCommandInteraction): Promise<void> {
+  const mode = interaction.options.getString('mode') ?? 'inspect';
+  const { runInspect, runSync, formatInspectReport } = await import('../sync-groups-runner.js');
+
+  await interaction.reply({ content: `Running /sync-groups (${mode})…` });
+
+  try {
+    const report = await runInspect();
+    if (mode === 'inspect') {
+      await interaction.followUp({ content: formatInspectReport(report, { includeRecommendation: true }) });
+      return;
+    }
+
+    const force = mode === 'apply-force';
+    const result = await runSync(report, { force });
+    const lines: string[] = [formatInspectReport(report, { includeRecommendation: false })];
+    if (result.synced.length > 0) lines.push(`✅ Synced: ${result.synced.join(', ')}`);
+    if (result.skipped.length > 0)
+      lines.push(`⏭️ Skipped (self-mods, needs apply-force): ${result.skipped.join(', ')}`);
+    if (result.failed.length > 0)
+      lines.push(
+        `❌ Failed: ${result.failed.map((f: { group: string; error: string }) => `${f.group} (${f.error})`).join(', ')}`,
+      );
+    if (result.killedContainers.length > 0) {
+      lines.push(
+        `🔄 Stopped ${result.killedContainers.length} running container(s); they'll respawn on next message with new code.`,
+      );
+    } else if (result.synced.length > 0) {
+      lines.push(`ℹ️ No running containers for synced groups — changes apply on next spawn.`);
+    }
+    await interaction.followUp({ content: lines.join('\n') });
+  } catch (err) {
+    await interaction.followUp({
+      content: `❌ sync-groups failed: ${err instanceof Error ? err.message : String(err)}`,
+    });
+  }
+}
+
 async function onInteraction(interaction: Interaction): Promise<void> {
   if (!interaction.isChatInputCommand()) return;
 
@@ -190,6 +245,7 @@ async function onInteraction(interaction: Interaction): Promise<void> {
     if (interaction.commandName === 'deploy') await handleDeploy(interaction);
     else if (interaction.commandName === 'update-container') await handleUpdateContainer(interaction);
     else if (interaction.commandName === 'update-plugins') await handleUpdatePlugins(interaction);
+    else if (interaction.commandName === 'sync-groups') await handleSyncGroups(interaction);
     else {
       await interaction.reply({ content: `Unknown command: ${interaction.commandName}`, ephemeral: true });
     }
