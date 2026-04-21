@@ -170,14 +170,10 @@ export function initGroupFilesystem(group: AgentGroup, opts?: { instructions?: s
     initialized.push('settings.json (merged required keys)');
   }
 
-  const skillsDst = path.join(claudeDir, 'skills');
-  if (!fs.existsSync(skillsDst)) {
-    const skillsSrc = path.join(projectRoot, 'container', 'skills');
-    if (fs.existsSync(skillsSrc)) {
-      fs.cpSync(skillsSrc, skillsDst, { recursive: true });
-      initialized.push('skills/');
-    }
-  }
+  // Note: container skills are no longer copied here. They're bind-mounted
+  // directly from trunk (`container/skills/`) in session-claude-mounts.ts,
+  // so trunk fixes reach every group on the next container spawn. See the
+  // mount ordering comment there for why this is a nested RO mount.
 
   // 3. data/v2-sessions/<id>/agent-runner-src/ — per-group source copy
   const groupRunnerDir = path.join(DATA_DIR, 'v2-sessions', group.id, 'agent-runner-src');
