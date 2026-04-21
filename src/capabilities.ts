@@ -23,8 +23,9 @@ import path from 'path';
 import { GROUPS_DIR } from './config.js';
 import { getRegisteredChannelNames } from './channels/channel-registry.js';
 import { readContainerConfig } from './container-config.js';
-import { getAllAgentGroups } from './db/agent-groups.js';
+import { getAllAgentGroups, getAgentGroup } from './db/agent-groups.js';
 import { getAllMessagingGroups } from './db/messaging-groups.js';
+import { extractToolScopes } from './scoped-env.js';
 
 // Read version once at module load.
 let cachedVersion = '0.0.0';
@@ -81,6 +82,35 @@ export interface HostCapabilities {
 
   /** Which host-side credential env vars are set (for per-tool scoping). Values are never returned — only which names are populated. */
   credentialEnvSet: string[];
+
+  /**
+   * Per-service snapshot scoped to the agent_group that owns this session.
+   * Lists the accounts/scopes actually wired in for this container and —
+   * critically — the exact activation step (e.g. which env var to export)
+   * that most CLIs require. Without this, the agent sees `credentials.gws:
+   * true` and `gws auth status → auth_method: none` and concludes (wrongly)
+   * that it isn't authenticated. Populated only when `forAgentGroupId` is
+   * passed to getHostCapabilities.
+   */
+  session?: SessionServicesSnapshot;
+}
+
+export interface SessionServicesSnapshot {
+  agentGroupId: string;
+  services: Array<{
+    /** Human label, e.g. "Google Workspace". */
+    name: string;
+    /** CLI binary the agent invokes. */
+    cli?: string;
+    /** Tool names in container.json.tools that imply this service. */
+    declaredTools: string[];
+    /** Scope names parsed from tool entries (e.g. ['illysium','support-illysium']). */
+    scopes: string[];
+    /** What files / paths the container sees. Container path, not host path. */
+    credentialPaths: string[];
+    /** Concise activation instruction for the CLI, if any. */
+    activation?: string;
+  }>;
 }
 
 function hostDirExists(...parts: string[]): boolean {
@@ -129,7 +159,62 @@ function builtinPlugins(): string[] {
   return fs.existsSync(builtinPluginDir) ? ['nanoclaw-hooks'] : [];
 }
 
-export function getHostCapabilities(): HostCapabilities {
+/**
+ * Per-service scoped view for a specific agent group. Consumed by the
+ * get_capabilities MCP tool (via writeCapabilitiesSnapshot) so the agent can
+ * see exactly which accounts / connections / profiles apply to the session
+ * it's running in — and how to activate the CLI when the CLI's own
+ * auth-status check is blind (gws is the classic case).
+ */
+function buildSessionServicesSnapshot(agentGroupId: string): SessionServicesSnapshot {
+  const ag = getAgentGroup(agentGroupId);
+  const tools = ag ? readContainerConfig(ag.folder).tools : undefined;
+
+  const listAccounts = (absDir: string): string[] => {
+    try {
+      return fs
+        .readdirSync(absDir)
+        .filter((e) => e.endsWith('.json'))
+        .map((e) => e.replace(/\.json$/, ''))
+        .sort();
+    } catch {
+      return [];
+    }
+  };
+
+  const services: SessionServicesSnapshot['services'] = [];
+
+  // Google Workspace — the headline case this exists for.
+  const gwsToolNames = ['gmail', 'gmail-readonly', 'calendar', 'google-workspace'];
+  const gwsDeclared = gwsToolNames.filter((n) => {
+    if (!tools) return true; // undefined tools = unrestricted
+    return tools.some((t) => t === n || t.startsWith(`${n}:`));
+  });
+  if (gwsDeclared.length > 0) {
+    const scopes = new Set<string>();
+    for (const n of gwsToolNames) {
+      for (const s of extractToolScopes(tools, n).scopes) scopes.add(s);
+    }
+    const hostDir = path.join(os.homedir(), '.config', 'gws', 'accounts');
+    const accounts = listAccounts(hostDir);
+    const effective = scopes.size > 0 ? accounts.filter((a) => scopes.has(a)) : accounts;
+    services.push({
+      name: 'Google Workspace (Gmail / Calendar / Drive / Docs / Sheets / Slides)',
+      cli: 'gws',
+      declaredTools: gwsDeclared,
+      scopes: [...scopes].sort(),
+      credentialPaths: effective.map((a) => `/home/node/.config/gws/accounts/${a}.json`),
+      activation:
+        effective.length > 0
+          ? `export GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=/home/node/.config/gws/accounts/<name>.json (valid names: ${effective.join(', ')}). Verify with \`gws auth status\` — WITHOUT this env var gws reports auth_method: none even though creds are mounted.`
+          : 'no authenticated account files found in /home/node/.config/gws/accounts/',
+    });
+  }
+
+  return { agentGroupId, services };
+}
+
+export function getHostCapabilities(forAgentGroupId?: string): HostCapabilities {
   const registered = getRegisteredChannelNames();
 
   const messagingGroups = getAllMessagingGroups();
@@ -182,5 +267,6 @@ export function getHostCapabilities(): HostCapabilities {
     agentGroups,
     messagingGroupsByChannel: byChannel,
     credentialEnvSet,
+    session: forAgentGroupId ? buildSessionServicesSnapshot(forAgentGroupId) : undefined,
   };
 }

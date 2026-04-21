@@ -207,7 +207,7 @@ describe('router', () => {
       priority: 0,
       default_model: null,
       default_effort: null,
-          default_tone: null,
+      default_tone: null,
       created_at: now(),
     });
   });
@@ -342,7 +342,7 @@ describe('router', () => {
       priority: 0,
       default_model: null,
       default_effort: null,
-          default_tone: null,
+      default_tone: null,
       created_at: now(),
     });
 

@@ -314,7 +314,7 @@ function mergeNoProxy(args: string[], host: string): void {
  */
 function writeCapabilitiesSnapshot(agentGroupId: string, sessionId: string): void {
   try {
-    const caps = getHostCapabilities();
+    const caps = getHostCapabilities(agentGroupId);
     const outPath = path.join(sessionDir(agentGroupId, sessionId), 'capabilities.json');
     fs.writeFileSync(outPath, JSON.stringify(caps, null, 2) + '\n');
   } catch (err) {

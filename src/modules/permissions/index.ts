@@ -354,7 +354,7 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
     priority: 0,
     default_model: null,
     default_effort: null,
-          default_tone: null,
+    default_tone: null,
     created_at: new Date().toISOString(),
   });
   log.info('Channel registration approved — wiring created', {

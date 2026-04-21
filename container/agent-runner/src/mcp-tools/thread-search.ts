@@ -169,6 +169,11 @@ export const searchThreadsTool: McpToolDefinition = {
     try {
       rows = db
         .prepare(
+          // bun:sqlite named params: both the SQL placeholder AND the JS
+          // object keys must carry the `$` prefix (unlike better-sqlite3 on
+          // the host, which auto-strips). Using `@name` here produced a
+          // "datatype mismatch" at runtime because bun left the params
+          // unbound. See CLAUDE.md container-runtime gotchas.
           `SELECT
              a.thread_id,
              a.channel_type,
@@ -178,16 +183,16 @@ export const searchThreadsTool: McpToolDefinition = {
              COUNT(*) AS match_count,
              (SELECT snippet(messages_archive_fts, 0, '[', ']', '…', 12)
               FROM messages_archive_fts
-              WHERE messages_archive_fts MATCH @q AND rowid = a.rowid) AS first_snippet
+              WHERE messages_archive_fts MATCH $q AND rowid = a.rowid) AS first_snippet
            FROM messages_archive a
            JOIN messages_archive_fts f ON f.rowid = a.rowid
-           WHERE a.agent_group_id = @ag
-             AND messages_archive_fts MATCH @q
+           WHERE a.agent_group_id = $ag
+             AND messages_archive_fts MATCH $q
            GROUP BY a.thread_id, a.channel_type, a.platform_id
            ORDER BY latest_message_at DESC
-           LIMIT @limit`,
+           LIMIT $limit`,
         )
-        .all({ ag, q: sanitized, limit: ftsLimit }) as SearchHitRow[];
+        .all({ $ag: ag, $q: sanitized, $limit: ftsLimit }) as SearchHitRow[];
     } catch (e) {
       return err(`FTS search failed: ${e instanceof Error ? e.message : String(e)}`);
     }

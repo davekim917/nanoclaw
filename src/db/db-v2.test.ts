@@ -186,7 +186,7 @@ describe('messaging group agents', () => {
     priority: 0,
     default_model: null,
     default_effort: null,
-          default_tone: null,
+    default_tone: null,
     created_at: now(),
   });
 

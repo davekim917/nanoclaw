@@ -29,7 +29,7 @@ export const getCapabilitiesTool: McpToolDefinition = {
   tool: {
     name: 'get_capabilities',
     description:
-      'Return a structured snapshot of what this NanoClaw install can do right now: registered channels, mounted credential dirs (Gmail/Calendar/Snowflake/dbt/AWS/gcloud/codex), loaded plugins, per-group feature flags (gitnexus AGENTS.md injection, Ollama admin, exclude-plugins, GitHub token env override), and counts of messaging groups per channel type. Use before declaring an integration "not available" — you may have the creds.',
+      'Live snapshot of what THIS session can actually do — what credentials and CLIs are wired in, and how to activate each one. Section `session.services` is the one that matters most for answering "do I have access?": lists per-service scoped accounts (gws accounts, snowflake connections, aws profiles, …) and the exact activation step (which env var to export) for CLIs whose own auth-status reports are blind without it. Call before saying a service is unavailable — the CLI may report `auth_method: none` even when the accounts are sitting right there on disk. Filter with `section: "session"` for the most relevant slice; omit `section` for the full install + session snapshot.',
     inputSchema: {
       type: 'object' as const,
       properties: {

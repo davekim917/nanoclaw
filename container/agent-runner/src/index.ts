@@ -79,7 +79,17 @@ async function main(): Promise<void> {
     }
   }
 
-  const instructions = toneBlock ? `${toneBlock}\n\n${addendum}` : addendum;
+  // Capability-awareness note — short and always-on. Instead of statically
+  // listing every CLI/auth detail (v1 pattern, drifts from reality), we point
+  // the agent at the existing `get_capabilities` MCP tool + the actual source
+  // of truth (credential mounts on disk).
+  const capabilityNote = [
+    '## Capability Awareness',
+    '',
+    "Before saying you don't have access to a service, VERIFY. Call `mcp__nanoclaw__get_capabilities` with `section: \"session\"` for a live per-service snapshot — it lists the scoped accounts/connections actually wired in this session AND the exact activation step (e.g. which env var to export). Gmail/Calendar/Drive/Docs/Sheets/Slides go through the `gws` CLI via Bash in v2 — there are NO `mcp__gmail__*` / `mcp__calendar__*` tools. Note: `gws auth status` reports `auth_method: none` until you `export GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=/home/node/.config/gws/accounts/<name>.json`; that's the CLI's default-path probe missing the mounted files, not the creds being absent.",
+  ].join('\n');
+
+  const instructions = [toneBlock, capabilityNote, addendum].filter(Boolean).join('\n\n');
 
   // Discover additional directories mounted at /workspace/extra/*
   const additionalDirectories: string[] = [];
