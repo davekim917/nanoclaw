@@ -496,6 +496,10 @@ function handleEvent(event: ProviderEvent, routing: RoutingContext): void {
       break;
     case 'progress':
       log(`Progress: ${event.message}`);
+      // Skip internal MCP tool descriptions ("Using <mcp-tool-name>") — these
+      // are implementation details not useful to end users. Only surface
+      // substantive progress messages (Bash output, search results, etc.).
+      if (event.message.startsWith('Using ')) break;
       // Emit a kind='status' message so the host can deliver it as a
       // post-then-edit progress line. Host tracks the platform_message_id
       // per session so subsequent progress events edit in place, and the

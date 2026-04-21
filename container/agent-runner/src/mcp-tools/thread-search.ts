@@ -389,7 +389,7 @@ export const readThreadTool: McpToolDefinition = {
   tool: {
     name: 'read_thread',
     description:
-      'Read the archived transcript of a specific thread. Pass either `channel` (a destination name from your destinations map) or `channel_type` + `platform_id` to scope the lookup. Omit both to read from the current session. Pass `thread_id` to pin a specific thread, otherwise the most recent thread in that channel is returned.',
+      'Read the archived transcript of a specific past thread. ONLY call this when the user explicitly asks to review, resume, or reference a prior conversation (e.g. "what did we discuss in X", "pull up the thread about Y"). Do NOT call this to gather context on a new incoming message — the current session\'s history is already in your context window. Pass either `channel` (destination name) or `channel_type` + `platform_id` to scope the lookup; pass `thread_id` to pin a specific thread, otherwise the most recent thread in that channel is returned.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -457,7 +457,7 @@ export const readThreadByKeyTool: McpToolDefinition = {
   tool: {
     name: 'read_thread_by_key',
     description:
-      'Read the most recent thread from a channel, addressed by its destination name (the `name` field in the agent\'s destinations map — e.g. "eng-ops"). Convenience wrapper around read_thread when you only know the human name of the channel.',
+      'Read the most recent archived thread from a named channel. ONLY call this when the user explicitly asks to review or resume the most recent conversation in that channel (e.g. "catch me up on #eng-ops", "what was the last thing in Y"). Do NOT call this speculatively on an initial user message to gather context — the current session\'s history is already available. Convenience wrapper around read_thread keyed on a destination name.',
     inputSchema: {
       type: 'object' as const,
       properties: {

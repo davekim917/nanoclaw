@@ -25,7 +25,7 @@ ARG AGENT_BROWSER_VERSION=latest
 ARG VERCEL_VERSION=latest
 ARG GITNEXUS_VERSION=latest
 ARG BUN_VERSION=1.3.12
-ARG MMDC_VERSION=2.16.0
+ARG MMDC_VERSION=11.12.0
 
 # ---- System dependencies -----------------------------------------------------
 # tini: correct PID 1 / signal forwarding so outbound.db writes finalize on
@@ -129,7 +129,8 @@ WORKDIR /app
 COPY agent-runner/package.json agent-runner/bun.lock ./
 
 RUN --mount=type=cache,target=/root/.bun/install/cache \
-    bun install --frozen-lockfile
+    bun install --frozen-lockfile \
+    && chmod +x /app/node_modules/@anthropic-ai/claude-agent-sdk/cli.js
 
 # Source. Bun runs TS directly — no tsc build step. The host remounts this
 # path at runtime via `src/container-runner.ts` so source edits on the host
