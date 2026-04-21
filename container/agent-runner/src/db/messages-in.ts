@@ -69,9 +69,26 @@ export function getPendingMessages(): MessageInRow[] {
     ),
   );
 
+  // Idempotency guard: a message that already has a response in messages_out
+  // has been handled — even if processing_ack was wiped by clearStaleProcessingAcks
+  // or messages_in.status never got synced to 'completed' because the previous
+  // container died between writing messages_out and calling markCompleted.
+  // Without this, a mid-turn container death after the reply was written but
+  // before mark-completed re-processes the same input on next wake and the user
+  // gets duplicate replies. messages_out.in_reply_to is set to the originating
+  // input id for every response the agent writes; presence of that row is the
+  // authoritative "this input has been answered" signal.
+  const respondedIds = new Set(
+    (
+      outbound
+        .prepare('SELECT DISTINCT in_reply_to AS id FROM messages_out WHERE in_reply_to IS NOT NULL')
+        .all() as Array<{ id: string }>
+    ).map((r) => r.id),
+  );
+
   // Reverse: we fetched DESC to take the most recent N, but the agent
   // should see them in chronological order (oldest first).
-  return pending.filter((m) => !ackedIds.has(m.id)).reverse();
+  return pending.filter((m) => !ackedIds.has(m.id) && !respondedIds.has(m.id)).reverse();
 }
 
 /** Mark messages as processing — writes to processing_ack in outbound.db. */

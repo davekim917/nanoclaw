@@ -21,10 +21,30 @@ import path from 'path';
 
 import { GROUPS_DIR } from './config.js';
 
-export interface McpServerConfig {
+/**
+ * Per-MCP-server config. Stdio (default) runs a subprocess inside the
+ * container; http/sse hit a remote URL with credentials injected at the
+ * HTTPS_PROXY layer by OneCLI — the container never sees the token.
+ */
+export type McpServerConfig = StdioMcpServerConfig | HttpMcpServerConfig | SseMcpServerConfig;
+
+export interface StdioMcpServerConfig {
+  type?: 'stdio';
   command: string;
   args?: string[];
   env?: Record<string, string>;
+}
+
+export interface HttpMcpServerConfig {
+  type: 'http';
+  url: string;
+  headers?: Record<string, string>;
+}
+
+export interface SseMcpServerConfig {
+  type: 'sse';
+  url: string;
+  headers?: Record<string, string>;
 }
 
 export interface AdditionalMountConfig {

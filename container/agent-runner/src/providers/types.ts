@@ -92,10 +92,31 @@ export interface QueryInput {
   effort?: string;
 }
 
-export interface McpServerConfig {
+export type McpServerConfig = StdioMcpServerConfig | HttpMcpServerConfig | SseMcpServerConfig;
+
+export interface StdioMcpServerConfig {
+  /** Omitted `type` defaults to stdio for backward compat with the older config shape. */
+  type?: 'stdio';
   command: string;
-  args: string[];
-  env: Record<string, string>;
+  args?: string[];
+  env?: Record<string, string>;
+}
+
+/**
+ * Remote MCP server over HTTP(S). Used for OAuth-gated services where the
+ * host's OneCLI gateway injects credentials via HTTPS_PROXY — the container
+ * never sees the token. See `granola` wiring in the host container-runner.
+ */
+export interface HttpMcpServerConfig {
+  type: 'http';
+  url: string;
+  headers?: Record<string, string>;
+}
+
+export interface SseMcpServerConfig {
+  type: 'sse';
+  url: string;
+  headers?: Record<string, string>;
 }
 
 export interface AgentQuery {

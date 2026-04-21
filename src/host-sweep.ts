@@ -246,9 +246,36 @@ function resetStuckProcessingRows(
   reason: string,
 ): void {
   const claims = getProcessingClaims(outDb);
+  const respondedStmt = outDb.prepare(
+    'SELECT 1 FROM messages_out WHERE in_reply_to = ? LIMIT 1',
+  );
+  const markCompletedInAckStmt = outDb.prepare(
+    "INSERT OR REPLACE INTO processing_ack (message_id, status, status_changed) VALUES (?, 'completed', datetime('now'))",
+  );
+  const markCompletedInboundStmt = inDb.prepare(
+    "UPDATE messages_in SET status = 'completed' WHERE id = ? AND status = 'pending'",
+  );
+
   for (const { message_id } of claims) {
     const msg = getMessageForRetry(inDb, message_id, 'pending');
     if (!msg) continue;
+
+    // Idempotency guard: if this input already has a response in
+    // messages_out, the previous container death happened after the reply
+    // was written but before the mark-completed step. Retrying would
+    // re-invoke the agent on an input it has already answered → duplicate
+    // replies to the user. Backfill the completed state and move on.
+    const responded = respondedStmt.get(msg.id);
+    if (responded) {
+      markCompletedInAckStmt.run(msg.id);
+      markCompletedInboundStmt.run(msg.id);
+      log.info('Reset skipped — response already written; marking completed', {
+        messageId: msg.id,
+        sessionId: session.id,
+        reason,
+      });
+      continue;
+    }
 
     if (msg.tries >= MAX_TRIES) {
       markMessageFailed(inDb, msg.id);

@@ -1148,9 +1148,19 @@ async function buildContainerArgs(
     }
   }
 
-  // Pass additional MCP servers from container config (groups/<folder>/container.json)
-  if (containerConfig.mcpServers && Object.keys(containerConfig.mcpServers).length > 0) {
-    args.push('-e', `NANOCLAW_MCP_SERVERS=${JSON.stringify(containerConfig.mcpServers)}`);
+  // Assemble additional MCP servers: container.json's mcpServers (stdio
+  // subprocesses the group declares) plus tool-driven remote servers
+  // wired here when the tool is enabled (container.json `tools` array).
+  // Tool-driven HTTP MCP servers rely on the container's HTTPS_PROXY
+  // pointing at OneCLI's gateway — the container never sees the token;
+  // OneCLI injects the appropriate header per its registered secret
+  // (e.g. `Authorization: Bearer <granola-token>` for mcp.granola.ai).
+  const mcpServers: Record<string, unknown> = { ...(containerConfig.mcpServers ?? {}) };
+  if (isToolEnabled(containerConfig.tools, 'granola') && !mcpServers.granola) {
+    mcpServers.granola = { type: 'http', url: 'https://mcp.granola.ai/mcp' };
+  }
+  if (Object.keys(mcpServers).length > 0) {
+    args.push('-e', `NANOCLAW_MCP_SERVERS=${JSON.stringify(mcpServers)}`);
   }
 
   // Override entrypoint so we skip tini's stdin-read wait (host-spawned

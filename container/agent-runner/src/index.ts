@@ -32,6 +32,7 @@ import { buildSystemPromptAddendum } from './destinations.js';
 // Provider skills append imports to providers/index.ts.
 import './providers/index.js';
 import { createProvider, type ProviderName } from './providers/factory.js';
+import type { McpServerConfig } from './providers/types.js';
 import { runPollLoop } from './poll-loop.js';
 
 function log(msg: string): void {
@@ -78,9 +79,12 @@ async function main(): Promise<void> {
   const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const mcpServerPath = path.join(__dirname, 'mcp-tools', 'index.ts');
 
-  // Build MCP servers config: nanoclaw built-in + any additional from host
-  const mcpServers: Record<string, { command: string; args: string[]; env: Record<string, string> }> = {
+  // Build MCP servers config: nanoclaw built-in + any additional from host.
+  // Host config may inject stdio or http MCP servers — http servers rely on
+  // the container's HTTPS_PROXY pointing at the OneCLI gateway for auth.
+  const mcpServers: Record<string, McpServerConfig> = {
     nanoclaw: {
+      type: 'stdio',
       command: 'bun',
       args: ['run', mcpServerPath],
       env: {
@@ -94,10 +98,11 @@ async function main(): Promise<void> {
   // Merge additional MCP servers from host configuration
   if (process.env.NANOCLAW_MCP_SERVERS) {
     try {
-      const additional = JSON.parse(process.env.NANOCLAW_MCP_SERVERS) as Record<string, { command: string; args: string[]; env: Record<string, string> }>;
+      const additional = JSON.parse(process.env.NANOCLAW_MCP_SERVERS) as Record<string, McpServerConfig>;
       for (const [name, config] of Object.entries(additional)) {
         mcpServers[name] = config;
-        log(`Additional MCP server: ${name} (${config.command})`);
+        const summary = config.type === 'http' || config.type === 'sse' ? config.url : config.command;
+        log(`Additional MCP server: ${name} (${config.type ?? 'stdio'}: ${summary})`);
       }
     } catch (e) {
       log(`Failed to parse NANOCLAW_MCP_SERVERS: ${e}`);
