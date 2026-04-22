@@ -1268,6 +1268,41 @@ async function buildContainerArgs(
   if (isToolEnabled(containerConfig.tools, 'granola') && !mcpServers.granola) {
     mcpServers.granola = { type: 'http', url: 'https://mcp.granola.ai/mcp' };
   }
+  // DeepWiki — always-on. Public docs for any GitHub repo; no auth.
+  if (!mcpServers.deepwiki) {
+    mcpServers.deepwiki = { type: 'http', url: 'https://mcp.deepwiki.com/mcp' };
+  }
+  // Context7 — always-on. Fetches up-to-date library docs (React, Next,
+  // Prisma, …). Stdio via `npx @upstash/context7-mcp`; npx is already on
+  // PATH in the container image.
+  if (!mcpServers.context7) {
+    mcpServers.context7 = {
+      type: 'stdio',
+      command: 'npx',
+      args: ['-y', '@upstash/context7-mcp'],
+      env: {},
+    };
+  }
+  // Exa — gated on `exa` tool + host EXA_API_KEY (loaded from .env at host
+  // startup). Header-auth: `x-api-key: <key>`. The URL carries the explicit
+  // tool subset so the agent sees the intended Exa surface.
+  if (isToolEnabled(containerConfig.tools, 'exa') && process.env.EXA_API_KEY && !mcpServers.exa) {
+    mcpServers.exa = {
+      type: 'http',
+      url:
+        'https://mcp.exa.ai/mcp?tools=web_search_exa,web_search_advanced_exa,get_code_context_exa,crawling_exa,company_research_exa,people_search_exa,deep_researcher_start,deep_researcher_check,deep_search_exa',
+      headers: { 'x-api-key': process.env.EXA_API_KEY },
+    };
+  }
+  // Pocket — gated on `pocket` tool + POCKET_API_KEY in host env (.env).
+  // Header-auth: `Authorization: Bearer pk_...`.
+  if (isToolEnabled(containerConfig.tools, 'pocket') && process.env.POCKET_API_KEY && !mcpServers.pocket) {
+    mcpServers.pocket = {
+      type: 'http',
+      url: 'https://public.heypocketai.com/mcp',
+      headers: { Authorization: `Bearer ${process.env.POCKET_API_KEY}` },
+    };
+  }
   if (Object.keys(mcpServers).length > 0) {
     args.push('-e', `NANOCLAW_MCP_SERVERS=${JSON.stringify(mcpServers)}`);
   }

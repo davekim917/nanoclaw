@@ -334,9 +334,10 @@ function buildSessionServicesSnapshot(agentGroupId: string): SessionServicesSnap
   // have picked.
   if (declared(['github'])) {
     const tokenEnvName = cfg?.githubTokenEnv ?? null;
-    const resolved = tokenEnvName && process.env[tokenEnvName]
-      ? { name: tokenEnvName, set: true }
-      : resolveScopedEnvVar('GITHUB_TOKEN', folder);
+    const resolved =
+      tokenEnvName && process.env[tokenEnvName]
+        ? { name: tokenEnvName, set: true }
+        : resolveScopedEnvVar('GITHUB_TOKEN', folder);
     const scopeList = extractToolScopes(tools, 'github').scopes;
     services.push({
       name: 'GitHub',
@@ -383,6 +384,45 @@ function buildSessionServicesSnapshot(agentGroupId: string): SessionServicesSnap
       credentialPaths: [],
       useFor:
         'Web search, research, and code context. Prefer exa over ad-hoc WebSearch/WebFetch for: web search (`mcp__exa__web_search_exa`), company research (`mcp__exa__company_research_exa`), people search (`mcp__exa__people_search_exa`), deep research (`mcp__exa__deep_researcher_start` then `_check`), code context from public repos (`mcp__exa__get_code_context_exa`), crawling specific URLs (`mcp__exa__crawling_exa`).',
+    });
+  }
+
+  // DeepWiki — always-on. No tool gate; host injects the MCP server unconditionally.
+  services.push({
+    name: 'DeepWiki',
+    mcpNamespace: 'mcp__deepwiki__*',
+    declaredTools: [],
+    scopes: [],
+    credentialPaths: [],
+    useFor:
+      'AI-powered documentation for any public GitHub repo. Use when the user asks "how does repo X work", for reading wiki structure, fetching wiki contents, or asking free-form questions about a repo. Tools: `mcp__deepwiki__read_wiki_structure`, `mcp__deepwiki__read_wiki_contents`, `mcp__deepwiki__ask_question`.',
+  });
+
+  // Context7 — always-on. Fetches up-to-date library docs; useful when the
+  // agent would otherwise rely on stale training knowledge.
+  services.push({
+    name: 'Context7',
+    mcpNamespace: 'mcp__context7__*',
+    declaredTools: [],
+    scopes: [],
+    credentialPaths: [],
+    useFor:
+      'Live library / framework / SDK / API docs — React, Next.js, Prisma, Tailwind, Claude SDKs, Stripe, etc. Prefer Context7 over training-memory for: library-specific debugging, API syntax, config options, version migrations, CLI usage. Do NOT use for refactoring, business logic, or general concepts.',
+  });
+
+  // Pocket — gated on `pocket` tool + POCKET_API_KEY. Personal knowledge
+  // base / memory layer accessible via MCP.
+  if (declared(['pocket'])) {
+    const hasKey = typeof process.env.POCKET_API_KEY === 'string' && process.env.POCKET_API_KEY.length > 0;
+    services.push({
+      name: 'Pocket',
+      mcpNamespace: 'mcp__pocket__*',
+      declaredTools: declaredMatchingTools(['pocket']),
+      scopes: [],
+      credentialPaths: [],
+      useFor: hasKey
+        ? 'Personal knowledge / memory via https://public.heypocketai.com/mcp. Auth already injected via POCKET_API_KEY env (Authorization: Bearer). Use Pocket tools to save references, recall prior context, search personal knowledge.'
+        : 'pocket tool declared but POCKET_API_KEY not set at host — ask Dave.',
     });
   }
 
