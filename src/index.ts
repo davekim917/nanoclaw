@@ -25,7 +25,6 @@ import {
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
 import { startWorktreeCleanup, stopWorktreeCleanup } from './worktree-cleanup.js';
 import { startPluginUpdater, stopPluginUpdater } from './plugin-updater.js';
-import { startSyncGroupsCheck, stopSyncGroupsCheck } from './sync-groups-check.js';
 import { restoreRemoteControl } from './remote-control.js';
 import { startDiscordSlashCommands, stopDiscordSlashCommands } from './channels/discord-slash-commands.js';
 import { routeInbound } from './router.js';
@@ -239,29 +238,6 @@ async function main(): Promise<void> {
   });
   log.info('Plugin updater started');
 
-  // 8b. Daily agent-runner-src drift check. Reuses the plugin-updater notify
-  //     wiring — same Jid-string format, same adapter delegation. Posts a
-  //     report to SYNC_GROUPS_NOTIFY_JID (or PLUGIN_UPDATE_NOTIFY_JID as
-  //     fallback) whenever any per-group overlay has drifted from trunk.
-  startSyncGroupsCheck({
-    notify: async (platformId, text) => {
-      const parts = platformId.split(':');
-      if (parts.length < 2) {
-        log.warn('sync-groups-check notify: malformed jid', { platformId });
-        return;
-      }
-      const channelType = parts[0];
-      const realPlatformId = parts.slice(1).join(':');
-      const adapter = getDeliveryAdapter();
-      if (!adapter) {
-        log.warn('sync-groups-check notify: no delivery adapter yet', { platformId });
-        return;
-      }
-      await adapter.deliver(channelType, realPlatformId, null, 'chat', JSON.stringify({ text }));
-    },
-  });
-  log.info('Sync-groups drift check started');
-
   // 9. Restore any Remote Control session that was running before restart
   restoreRemoteControl();
 
@@ -288,7 +264,6 @@ async function shutdown(signal: string): Promise<void> {
   stopHostSweep();
   stopWorktreeCleanup();
   stopPluginUpdater();
-  stopSyncGroupsCheck();
   await stopDiscordSlashCommands();
   await teardownChannelAdapters();
   // Synchronously stop agent containers before exit. Without this, child

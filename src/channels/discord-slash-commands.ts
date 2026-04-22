@@ -1,21 +1,13 @@
 /**
- * Discord slash commands (Phase 5.14).
- *
- * Dave's administrative Discord surface for managing nanoclaw itself:
+ * Discord slash commands — administrative surface for managing nanoclaw:
  *   /deploy           — pull main, build, rebuild image if needed, restart
  *   /update-container — rebuild the container image on its own
  *   /update-plugins   — git pull every ~/plugins/<name>
  *
  * Runs a dedicated discord.js Client parallel to @chat-adapter/discord's
- * chat client. Gated on ENABLE_DISCORD_SLASH_COMMANDS=1 so it stays off
- * until cutover — having two Gateway sessions with the same bot token
- * would double-deliver INTERACTION_CREATE events, breaking v1's own
- * slash-command handler while both are running.
- *
- * After cutover (v1 off), flip the env and this takes over.
- *
- * Scoped via DISCORD_SLASH_CHANNEL_IDS (comma-separated channel ids) so
- * accidental invocations in random channels don't run deploy commands.
+ * chat client, gated on ENABLE_DISCORD_SLASH_COMMANDS=1. Scoped via
+ * DISCORD_SLASH_CHANNEL_IDS (comma-separated channel ids) so accidental
+ * invocations in random channels don't run deploy commands.
  */
 import { execFile } from 'child_process';
 import fs from 'fs';
@@ -40,23 +32,6 @@ const COMMANDS = [
   { name: 'deploy', description: 'Pull, build, and restart NanoClaw v2 from dave/migration' },
   { name: 'update-container', description: 'Rebuild the v2 agent container image now' },
   { name: 'update-plugins', description: 'Run git pull on all ~/plugins repos now' },
-  {
-    name: 'sync-groups',
-    description: 'Inspect / sync per-group agent-runner-src overlays against trunk',
-    options: [
-      {
-        name: 'mode',
-        description: 'inspect (default) | apply | apply-force',
-        type: 3, // STRING
-        required: false,
-        choices: [
-          { name: 'inspect', value: 'inspect' },
-          { name: 'apply', value: 'apply' },
-          { name: 'apply-force', value: 'apply-force' },
-        ],
-      },
-    ],
-  },
 ];
 
 let client: Client | null = null;
@@ -192,44 +167,6 @@ async function handleUpdatePlugins(interaction: ChatInputCommandInteraction): Pr
   }
 }
 
-async function handleSyncGroups(interaction: ChatInputCommandInteraction): Promise<void> {
-  const mode = interaction.options.getString('mode') ?? 'inspect';
-  const { runInspect, runSync, formatInspectReport } = await import('../sync-groups-runner.js');
-
-  await interaction.reply({ content: `Running /sync-groups (${mode})…` });
-
-  try {
-    const report = await runInspect();
-    if (mode === 'inspect') {
-      await interaction.followUp({ content: formatInspectReport(report, { includeRecommendation: true }) });
-      return;
-    }
-
-    const force = mode === 'apply-force';
-    const result = await runSync(report, { force });
-    const lines: string[] = [formatInspectReport(report, { includeRecommendation: false })];
-    if (result.synced.length > 0) lines.push(`✅ Synced: ${result.synced.join(', ')}`);
-    if (result.skipped.length > 0)
-      lines.push(`⏭️ Skipped (self-mods, needs apply-force): ${result.skipped.join(', ')}`);
-    if (result.failed.length > 0)
-      lines.push(
-        `❌ Failed: ${result.failed.map((f: { group: string; error: string }) => `${f.group} (${f.error})`).join(', ')}`,
-      );
-    if (result.killedContainers.length > 0) {
-      lines.push(
-        `🔄 Stopped ${result.killedContainers.length} running container(s); they'll respawn on next message with new code.`,
-      );
-    } else if (result.synced.length > 0) {
-      lines.push(`ℹ️ No running containers for synced groups — changes apply on next spawn.`);
-    }
-    await interaction.followUp({ content: lines.join('\n') });
-  } catch (err) {
-    await interaction.followUp({
-      content: `❌ sync-groups failed: ${err instanceof Error ? err.message : String(err)}`,
-    });
-  }
-}
-
 async function onInteraction(interaction: Interaction): Promise<void> {
   if (!interaction.isChatInputCommand()) return;
 
@@ -245,7 +182,6 @@ async function onInteraction(interaction: Interaction): Promise<void> {
     if (interaction.commandName === 'deploy') await handleDeploy(interaction);
     else if (interaction.commandName === 'update-container') await handleUpdateContainer(interaction);
     else if (interaction.commandName === 'update-plugins') await handleUpdatePlugins(interaction);
-    else if (interaction.commandName === 'sync-groups') await handleSyncGroups(interaction);
     else {
       await interaction.reply({ content: `Unknown command: ${interaction.commandName}`, ephemeral: true });
     }
