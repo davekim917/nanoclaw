@@ -765,6 +765,7 @@ export class ClaudeProvider implements AgentProvider {
         additionalDirectories: this.additionalDirectories,
         resume: input.continuation,
         model: input.model,
+        pathToClaudeCodeExecutable: '/pnpm/claude',
         systemPrompt: instructions ? { type: 'preset' as const, preset: 'claude_code' as const, append: instructions } : undefined,
         disallowedTools: SDK_DISALLOWED_TOOLS,
         env: perQueryEnv,

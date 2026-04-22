@@ -428,6 +428,34 @@ export function openOutboundDb(agentGroupId: string, sessionId: string): Databas
 }
 
 /**
+ * Write a message directly to a session's outbound DB so the host delivery
+ * loop picks it up. Used by the command gate to send denial responses
+ * without waking a container.
+ */
+export function writeOutboundDirect(
+  agentGroupId: string,
+  sessionId: string,
+  message: {
+    id: string;
+    kind: string;
+    platformId: string | null;
+    channelType: string | null;
+    threadId: string | null;
+    content: string;
+  },
+): void {
+  const db = openOutboundDb(agentGroupId, sessionId);
+  try {
+    db.prepare(
+      `INSERT OR IGNORE INTO messages_out (id, seq, timestamp, kind, platform_id, channel_type, thread_id, content)
+       VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 2 FROM messages_out), datetime('now'), ?, ?, ?, ?, ?)`,
+    ).run(message.id, message.kind, message.platformId, message.channelType, message.threadId, message.content);
+  } finally {
+    db.close();
+  }
+}
+
+/**
  * @deprecated Use openInboundDb / openOutboundDb instead.
  */
 export function openSessionDb(agentGroupId: string, sessionId: string): Database.Database {

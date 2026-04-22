@@ -24,8 +24,8 @@ import {
   setSenderResolver,
   setSenderScopeGate,
   type AccessGateResult,
-  type InboundEvent,
 } from '../../router.js';
+import type { InboundEvent } from '../../channels/adapter.js';
 import { registerResponseHandler, type ResponsePayload } from '../../response-registry.js';
 import { log } from '../../log.js';
 import type { MessagingGroup, MessagingGroupAgent } from '../../types.js';

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Setup helper: install-whatsapp — bundles the preflight + install commands
-# from the /add-whatsapp skill into one idempotent script so /new-setup-2 can
+# from the /add-whatsapp skill into one idempotent script so /new-setup can
 # run them programmatically before continuing to QR/pairing-code auth.
 #
 # Copies the native Baileys WhatsApp adapter, its whatsapp-auth and groups

@@ -1,15 +1,8 @@
 /**
  * Per-group container config, stored as a plain JSON file at
- * `groups/<folder>/container.json`. Replaces the former
- * `agent_groups.container_config` DB column.
- *
- * Shape:
- *   {
- *     mcpServers:      { [name]: { command, args, env } }
- *     packages:        { apt: string[], npm: string[] }
- *     imageTag?:       string                    // set by buildAgentGroupImage on rebuild
- *     additionalMounts?: Array<{hostPath, containerPath, readonly}>
- *   }
+ * `groups/<folder>/container.json`. Mounted read-only inside the container
+ * at `/workspace/agent/container.json` — the runner reads it at startup but
+ * cannot modify it. Config changes go through the self-mod approval flow.
  *
  * All fields are optional — a missing file or a partial file both resolve
  * to sensible defaults. Writes are atomic-enough (write-then-rename is not
@@ -33,18 +26,26 @@ export interface StdioMcpServerConfig {
   command: string;
   args?: string[];
   env?: Record<string, string>;
+  // Optional always-in-context guidance. When set, the host writes the
+  // content to `.claude-fragments/mcp-<name>.md` at spawn and imports it
+  // into the composed CLAUDE.md.
+  instructions?: string;
 }
 
 export interface HttpMcpServerConfig {
   type: 'http';
   url: string;
   headers?: Record<string, string>;
+  // Optional always-in-context guidance; host imports into composed CLAUDE.md.
+  instructions?: string;
 }
 
 export interface SseMcpServerConfig {
   type: 'sse';
   url: string;
   headers?: Record<string, string>;
+  // Optional always-in-context guidance; host imports into composed CLAUDE.md.
+  instructions?: string;
 }
 
 export interface AdditionalMountConfig {
@@ -58,13 +59,24 @@ export interface ContainerConfig {
   packages: { apt: string[]; npm: string[] };
   imageTag?: string;
   additionalMounts: AdditionalMountConfig[];
+  /** Which skills to enable — array of skill names or "all" (default). */
+  skills: string[] | 'all';
+  /** Agent provider name (e.g. "claude", "opencode"). Default: "claude". */
+  provider?: string;
+  /** Agent group display name (used in transcript archiving). */
+  groupName?: string;
+  /** Assistant display name (used in system prompt / responses). */
+  assistantName?: string;
+  /** Agent group ID — set by the host, read by the runner. */
+  agentGroupId?: string;
+  /** Max messages per prompt. Falls back to code default if unset. */
+  maxMessagesPerPrompt?: number;
+
   /**
    * Name of the env var on the host that holds this group's GitHub token.
    * If unset, container-runner derives a name from the folder
    * (`GITHUB_TOKEN_<FOLDER_UPPER>` with dashes as underscores) and falls
-   * back to `GITHUB_TOKEN`. Set explicitly when the folder name doesn't
-   * map to the env var you want — e.g. `illysium-v2` should reuse v1's
-   * existing `GITHUB_TOKEN_ILLYSIUM` during the migration window.
+   * back to `GITHUB_TOKEN`.
    */
   githubTokenEnv?: string;
 
@@ -81,23 +93,19 @@ export interface ContainerConfig {
   /**
    * Named MCP servers to suppress for this group. Universal MCPs
    * (granola, deepwiki, context7, exa, pocket) are injected by default
-   * in every container; add entries here to opt OUT per group — e.g. a
-   * client-scoped group that shouldn't see the operator's personal
-   * pocket knowledge base: `excludeMcpServers: ["pocket"]`. Names must
-   * match the MCP server key (granola/deepwiki/context7/exa/pocket).
+   * in every container; add entries here to opt OUT per group.
    */
   excludeMcpServers?: string[];
 
   /**
    * When true, sets `GITNEXUS_INJECT_AGENTS_MD=true` in the container so
    * GitNexus auto-injects AGENTS.md into repos the agent works on.
-   * Opt-in per group; defaults off.
    */
   gitnexusInjectAgentsMd?: boolean;
 
   /**
    * When true, sets `OLLAMA_ADMIN_TOOLS=true` to enable the Ollama
-   * admin-level MCP tools (model management, etc.). Opt-in per group.
+   * admin-level MCP tools (model management, etc.).
    */
   ollamaAdminTools?: boolean;
 
@@ -105,43 +113,31 @@ export interface ContainerConfig {
    * Per-group default model when the agent uses the bare `opus` alias.
    * Resolves the SDK's opus-alias short-circuit ANTHROPIC_DEFAULT_OPUS_MODEL.
    * Overrides the host-env / hardcoded default. Per-session `-m <model>`
-   * flags still take precedence. Example: `claude-opus-4-7` for a group
-   * that wants 4.7 while the install-wide default is 4.6.
+   * flags still take precedence.
    */
   defaultModel?: string;
 
   /**
    * Per-group default reasoning effort when the agent doesn't pass
    * `-e <level>`. One of 'low' | 'medium' | 'high' | 'xhigh'. Overrides
-   * the host-env / hardcoded default. Per-session `-e <level>` flags
-   * still take precedence.
+   * the host-env / hardcoded default.
    */
   defaultEffort?: 'low' | 'medium' | 'high' | 'xhigh';
 
   /**
    * Per-agent-group default tone profile name (matches a file under
    * `tone-profiles/<name>.md`). Acts as the fallback when a per-channel
-   * wiring doesn't set `default_tone` on `messaging_group_agents`. When
-   * neither is set, no tone is injected — agent uses the get_tone_profile
-   * MCP tool for on-demand selection.
+   * wiring doesn't set `default_tone` on `messaging_group_agents`.
    */
   tone?: string;
 
   /**
    * Per-agent credential/tool allowlist. Each entry is either a bare tool
    * name (`snowflake`) or scoped (`snowflake:sunday`, `aws:apollo`).
-   *
-   * **Omit this field entirely** and the agent gets every credential surface
-   * mounted (v2 default — backwards-compatible with existing installs).
-   *
-   * **Include it** and scoping kicks in — the container-runner filters and
-   * stages host credentials per-tool before mount, so one agent wired to
-   * `snowflake:sunday` can't cat another connection's key file. See
-   * `src/scoped-env.ts` for the helpers; `src/container-runner.ts`
-   * buildMounts for the per-tool staging logic.
-   *
-   * Supported tool names: gmail, gmail-readonly, calendar, google-workspace,
-   * snowflake, aws, gcloud, dbt, github, render, browser-auth.
+   * Omit to grant every credential surface; include to filter per-tool
+   * before mount. Supported tool names: gmail, gmail-readonly, calendar,
+   * google-workspace, snowflake, aws, gcloud, dbt, github, render,
+   * browser-auth.
    */
   tools?: string[];
 }
@@ -151,6 +147,7 @@ function emptyConfig(): ContainerConfig {
     mcpServers: {},
     packages: { apt: [], npm: [] },
     additionalMounts: [],
+    skills: 'all',
   };
 }
 
@@ -177,6 +174,12 @@ export function readContainerConfig(folder: string): ContainerConfig {
       },
       imageTag: raw.imageTag,
       additionalMounts: raw.additionalMounts ?? [],
+      skills: raw.skills ?? 'all',
+      provider: raw.provider,
+      groupName: raw.groupName,
+      assistantName: raw.assistantName,
+      agentGroupId: raw.agentGroupId,
+      maxMessagesPerPrompt: raw.maxMessagesPerPrompt,
       githubTokenEnv: raw.githubTokenEnv,
       excludePlugins: raw.excludePlugins,
       excludeMcpServers: raw.excludeMcpServers,

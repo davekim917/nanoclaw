@@ -13,6 +13,9 @@
   <a href="https://discord.gg/VDdww8qS42"><img src="https://img.shields.io/discord/1470188214710046894?label=Discord&logo=discord&v=2" alt="Discord" valign="middle"></a>&nbsp; • &nbsp;
   <a href="repo-tokens"><img src="repo-tokens/badge.svg" alt="34.9k tokens, 17% of context window" valign="middle"></a>
 </p>
+
+> **注意：** 此中文翻译对应 v1 版本，已不反映最新的 v2 架构。请参考 [README.md](README.md) 获取最新内容。
+
 通过 Claude Code，NanoClaw 可以动态重写自身代码，根据您的需求定制功能。
 
 **新功能：** 首个支持 [Agent Swarms（智能体集群）](https://code.claude.com/docs/en/agent-teams) 的 AI 助手。可轻松组建智能体团队，在您的聊天中高效协作。

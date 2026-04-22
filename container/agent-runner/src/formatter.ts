@@ -157,6 +157,17 @@ export function categorizeMessage(msg: MessageInRow): CommandInfo {
   return { category: 'passthrough', command, text, senderId };
 }
 
+/**
+ * Narrow check for /clear — the only command the runner handles directly.
+ * All other command gating (filtered, admin) is done by the host router
+ * before messages reach the container.
+ */
+export function isClearCommand(msg: MessageInRow): boolean {
+  const content = parseContent(msg.content);
+  const text = (content.text || '').trim();
+  return text.toLowerCase().startsWith('/clear');
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function extractSenderId(msg: MessageInRow, content: any): string | null {
   const raw: string | null = content?.senderId || content?.author?.userId || null;

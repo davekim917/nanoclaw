@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Setup helper: install-telegram — bundles the preflight + install commands
-# from the /add-telegram skill into one idempotent script so /new-setup-2 can
+# from the /add-telegram skill into one idempotent script so /new-setup can
 # run them programmatically before continuing to credentials and pairing.
 #
 # Copies the Telegram adapter, helpers, tests, and the pair-telegram setup

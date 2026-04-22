@@ -9,7 +9,7 @@ import { beforeEach, afterEach, describe, expect, it } from 'vitest';
 
 import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from '../../db/index.js';
 import { getMessagingGroupAgents, getMessagingGroupByPlatform } from '../../db/messaging-groups.js';
-import type { InboundEvent } from '../../router.js';
+import type { InboundEvent } from '../../channels/adapter.js';
 import type { AgentGroup, MessagingGroup } from '../../types.js';
 import { resolver } from './index.js';
 

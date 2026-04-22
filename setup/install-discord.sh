@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Setup helper: install-discord — bundles the preflight + install commands
-# from the /add-discord skill into one idempotent script so /new-setup-2 can
+# from the /add-discord skill into one idempotent script so /new-setup can
 # run them programmatically before continuing to credentials.
 #
 # Copies the Discord adapter in from the `channels` branch; appends the

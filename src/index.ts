@@ -8,6 +8,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { DATA_DIR } from './config.js';
+import { migrateGroupsToClaudeLocal } from './claude-md-compose.js';
 import { initDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
 import { registerSecretsFromEnv } from './secret-scrubber.js';
@@ -118,6 +119,9 @@ async function main(): Promise<void> {
   runMigrations(db);
   log.info('Central DB ready', { path: dbPath });
 
+  // 1b. One-time filesystem cutover — idempotent, no-op after first run.
+  migrateGroupsToClaudeLocal();
+
   // 2. Container runtime
   ensureContainerRuntimeRunning();
   cleanupOrphans();
@@ -140,6 +144,15 @@ async function main(): Promise<void> {
           },
         }).catch((err) => {
           log.error('Failed to route inbound message', { channelType: adapter.channelType, err });
+        });
+      },
+      onInboundEvent(event) {
+        routeInbound(event).catch((err) => {
+          log.error('Failed to route inbound event', {
+            sourceAdapter: adapter.channelType,
+            targetChannelType: event.channelType,
+            err,
+          });
         });
       },
       onMetadata(platformId, name, isGroup) {

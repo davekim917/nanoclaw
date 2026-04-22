@@ -25,7 +25,7 @@ import {
   outboundDbPath,
 } from './session-manager.js';
 import { getSession, findSession } from './db/sessions.js';
-import type { InboundEvent } from './router.js';
+import type { InboundEvent } from './channels/adapter.js';
 
 // Mock container runner to prevent actual Docker spawning
 vi.mock('./container-runner.js', () => ({

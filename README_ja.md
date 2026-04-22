@@ -14,6 +14,8 @@
   <a href="repo-tokens"><img src="repo-tokens/badge.svg" alt="34.9k tokens, 17% of context window" valign="middle"></a>
 </p>
 
+> **注意:** この日本語訳は v1 時点のもので、最新の v2 アーキテクチャは反映されていません。最新の内容は [README.md](README.md) をご覧ください。
+
 ---
 
 <h2 align="center">🐳 Dockerサンドボックスで動作</h2>

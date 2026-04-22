@@ -89,41 +89,47 @@ function sanitizeDisplayName(name: string): string {
   return name.replace(/[\r\n\t\x00-\x1f]+/g, ' ').replace(/[`#*_~]/g, '').slice(0, 80);
 }
 
-/** Generate the system-prompt addendum describing destinations and syntax. */
+/**
+ * Generate the system-prompt addendum: agent identity + communication
+ * invariants + destination map.
+ *
+ * Identity is injected here (not in the shared CLAUDE.md) because it's
+ * per-agent-group and changes when the operator renames an agent, while
+ * the shared base is identical across all agents.
+ */
 export function buildSystemPromptAddendum(assistantName?: string): string {
   const sections: string[] = [];
 
-  // Identity first — without this, the SDK defaults to "Claude" framing
-  // which drifts the agent out of the NanoClaw persona the user expects.
-  // v1 always included this as part of system-prompt assembly.
   if (assistantName) {
-    sections.push(`## Your identity\n\nYour name is ${assistantName}. Introduce yourself as ${assistantName} when asked, not as Claude.`);
+    sections.push(['# You are ' + assistantName, '', `Your name is **${assistantName}**. Use it when the channel asks who you are, when introducing yourself, and when signing any message that explicitly calls for a signature.`].join('\n'));
   }
 
-  // Communication conventions. These are invariants the NanoClaw harness
-  // relies on across every session regardless of destination count — must
-  // land in the appended system prompt, not just the mounted CLAUDE.md
-  // files, because the CLAUDE.md path is sometimes unreliable (see
-  // V1_BEHAVIOR_AUDIT #25 history).
+  // Communication invariants the NanoClaw harness relies on across every
+  // session regardless of destination count — must land in the appended
+  // system prompt, not just the mounted CLAUDE.md files, because the
+  // CLAUDE.md path is sometimes unreliable (see V1_BEHAVIOR_AUDIT #25).
   sections.push(
     [
       '## Communication conventions',
       '',
-      // Meta-response prohibition. Mirrors v1's system-prompt assembly
-      // (container/agent-runner/src/index.ts:2123 region). Without it the
-      // agent occasionally emits "No response requested." or "The user\'s',
-      // 'message does not require a response." as its entire turn, which',
-      // 'reaches the user as garbage.
+      // Meta-response prohibition: without it the agent occasionally emits
+      // "No response requested." as its entire turn, which reaches the
+      // user as garbage.
       'If a user message does not seem to call for a reply, send a brief acknowledgment or ask a clarifying question — do not produce meta-responses like "No response requested." or "The user\'s message does not require a response." Those are internal judgments, not content to deliver.',
       '',
-      // Credential-in-chat hard rule. V1 commits ff24bd9 / 4e6c12b added
-      // this after incidents where agents asked users to paste API keys
-      // directly into the chat.
+      // Credential-in-chat hard rule (v1 ff24bd9 / 4e6c12b): prevents
+      // agents asking users to paste API keys / tokens into chat.
       'Never ask a user to paste API keys, OAuth tokens, passwords, or other credentials into chat. If a capability is unavailable due to missing credentials, say so and stop — do not suggest the user share the credential with you.',
     ].join('\n'),
   );
 
-  // Destinations section.
+  sections.push(buildDestinationsSection());
+
+  return sections.join('\n\n');
+}
+
+function buildDestinationsSection(): string {
+  const sections: string[] = [];
   const all = getAllDestinations();
 
   if (all.length === 0) {

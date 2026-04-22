@@ -7,6 +7,7 @@
  * The container never writes to inbound.db — all status tracking goes through
  * processing_ack. The host reads processing_ack to sync message lifecycle.
  */
+import { getConfig } from '../config.js';
 import { getInboundDb, getOutboundDb } from './connection.js';
 
 export interface MessageInRow {
@@ -26,14 +27,16 @@ export interface MessageInRow {
   content: string;
 }
 
-// Cap on how many messages reach the agent in one prompt, including any
-// accumulated-but-not-triggered context. Host controls the cap via the
-// NANOCLAW_MAX_MESSAGES_PER_PROMPT env var; default mirrors the host's
-// config.ts default of 10.
-const MAX_MESSAGES_PER_PROMPT = Math.max(
-  1,
-  parseInt(process.env.NANOCLAW_MAX_MESSAGES_PER_PROMPT || '10', 10) || 10,
-);
+// Cap on how many messages reach the agent in one prompt. Read from
+// container.json; falls back to 10.
+function getMaxMessagesPerPrompt(): number {
+  try {
+    return getConfig().maxMessagesPerPrompt;
+  } catch {
+    // Config not loaded yet (e.g. test harness) — use default
+    return 10;
+  }
+}
 
 /**
  * Fetch pending messages that are due for processing.
@@ -58,7 +61,7 @@ export function getPendingMessages(): MessageInRow[] {
        ORDER BY seq DESC
        LIMIT ?`,
     )
-    .all(MAX_MESSAGES_PER_PROMPT) as MessageInRow[];
+    .all(getMaxMessagesPerPrompt()) as MessageInRow[];
 
   if (pending.length === 0) return [];
 

@@ -17,6 +17,7 @@ import {
   formatMessages,
   extractRouting,
   categorizeMessage,
+  isClearCommand,
   parseModelEffortFlags,
   stripInternalTags,
   type RoutingContext,
@@ -41,12 +42,6 @@ export interface PollLoopConfig {
   systemContext?: {
     instructions?: string;
   };
-  /**
-   * Set of user IDs allowed to run admin commands (e.g. /clear) in this
-   * agent group. Host populates from owners + global admins + scoped admins
-   * at container wake time, so role changes take effect on next spawn.
-   */
-  adminUserIds?: Set<string>;
 }
 
 /**
@@ -108,97 +103,36 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
     const routing = extractRouting(messages);
 
-    // Handle commands: categorize chat messages
-    const adminUserIds = config.adminUserIds ?? new Set<string>();
-    const normalMessages = [];
+    // Command handling: the host router gates filtered and unauthorized
+    // admin commands before they reach the container. The only command
+    // the runner handles directly is /clear (session reset).
+    const normalMessages: MessageInRow[] = [];
     const commandIds: string[] = [];
 
     for (const msg of messages) {
-      if (msg.kind !== 'chat' && msg.kind !== 'chat-sdk') {
-        normalMessages.push(msg);
-        continue;
-      }
-
-      const cmdInfo = categorizeMessage(msg);
-
-      if (cmdInfo.category === 'filtered') {
-        // Silently drop — mark completed, don't process
-        log(`Filtered command: ${cmdInfo.command} (msg: ${msg.id})`);
+      if ((msg.kind === 'chat' || msg.kind === 'chat-sdk') && isClearCommand(msg)) {
+        log('Clearing session (resetting continuation)');
+        continuation = undefined;
+        clearStoredSessionId();
+        writeMessageOut({
+          id: generateId(),
+          kind: 'chat',
+          platform_id: routing.platformId,
+          channel_type: routing.channelType,
+          thread_id: routing.threadId,
+          content: JSON.stringify({ text: 'Session cleared.' }),
+        });
         commandIds.push(msg.id);
         continue;
       }
-
-      if (cmdInfo.category === 'admin') {
-        if (!cmdInfo.senderId || !adminUserIds.has(cmdInfo.senderId)) {
-          log(`Admin command denied: ${cmdInfo.command} from ${cmdInfo.senderId} (msg: ${msg.id})`);
-          writeMessageOut({
-            id: generateId(),
-            kind: 'chat',
-            platform_id: routing.platformId,
-            channel_type: routing.channelType,
-            thread_id: routing.threadId,
-            content: JSON.stringify({ text: `Permission denied: ${cmdInfo.command} requires admin access.` }),
-          });
-          commandIds.push(msg.id);
-          continue;
-        }
-        // Handle admin commands directly
-        if (cmdInfo.command === '/clear') {
-          log('Clearing session (resetting continuation)');
-          continuation = undefined;
-          clearStoredSessionId();
-          writeMessageOut({
-            id: generateId(),
-            kind: 'chat',
-            platform_id: routing.platformId,
-            channel_type: routing.channelType,
-            thread_id: routing.threadId,
-            content: JSON.stringify({ text: 'Session cleared.' }),
-          });
-          commandIds.push(msg.id);
-          continue;
-        }
-
-        if (cmdInfo.command === '/kill') {
-          // Graceful shutdown: stored sdk session_id is preserved so the
-          // NEXT wake resumes the same agent transcript — this exits the
-          // container, not the agent's memory. Host env/mounts refresh on
-          // the next spawn, so /kill is also the way to pick up host-side
-          // config changes (new mounts, new .env, new defaults).
-          log('Kill requested — shutting down container gracefully');
-          writeMessageOut({
-            id: generateId(),
-            kind: 'chat',
-            platform_id: routing.platformId,
-            channel_type: routing.channelType,
-            thread_id: routing.threadId,
-            content: JSON.stringify({
-              text: 'Container shutting down. Next message will spawn a fresh container with refreshed host config.',
-            }),
-          });
-          markCompleted([msg.id, ...commandIds]);
-          // Give outbound a moment to flush to disk before exit.
-          await sleep(250);
-          process.exit(0);
-        }
-
-        // Other admin commands — pass through to agent
-        normalMessages.push(msg);
-        continue;
-      }
-
-      // passthrough or none
       normalMessages.push(msg);
     }
 
-    // Mark filtered/denied command messages as completed immediately
     if (commandIds.length > 0) {
       markCompleted(commandIds);
     }
 
-    // If all messages were filtered commands, skip processing
     if (normalMessages.length === 0) {
-      // Mark remaining processing IDs as completed
       const remainingIds = ids.filter((id) => !commandIds.includes(id));
       if (remainingIds.length > 0) markCompleted(remainingIds);
       log(`All ${messages.length} message(s) were commands, skipping query`);
@@ -269,7 +203,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     const skippedSet = new Set(skipped);
     const processingIds = ids.filter((id) => !commandIds.includes(id) && !skippedSet.has(id));
     try {
-      const result = await processQuery(query, routing);
+      const result = await processQuery(query, routing, processingIds);
       if (result.continuation && result.continuation !== continuation) {
         continuation = result.continuation;
         setStoredSessionId(continuation);
@@ -297,7 +231,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             model: effectiveModel,
             effort: effectiveEffort,
           });
-          const retryResult = await processQuery(retryQuery, routing);
+          const retryResult = await processQuery(retryQuery, routing, processingIds);
           if (retryResult.continuation && retryResult.continuation !== continuation) {
             continuation = retryResult.continuation;
             setStoredSessionId(continuation);
@@ -338,7 +272,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             cwd: config.cwd,
             systemContext: config.systemContext,
           });
-          const retryResult = await processQuery(retryQuery, routing);
+          const retryResult = await processQuery(retryQuery, routing, processingIds);
           if (retryResult.continuation) {
             continuation = retryResult.continuation;
             setStoredSessionId(continuation);
@@ -382,6 +316,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       );
     }
 
+    // Ensure completed even if processQuery ended without a result event
+    // (e.g. stream closed unexpectedly).
     markCompleted(processingIds);
     log(`Completed ${ids.length} message(s)`);
   }
@@ -425,7 +361,11 @@ interface QueryResult {
   continuation?: string;
 }
 
-async function processQuery(query: AgentQuery, routing: RoutingContext): Promise<QueryResult> {
+async function processQuery(
+  query: AgentQuery,
+  routing: RoutingContext,
+  initialBatchIds: string[],
+): Promise<QueryResult> {
   let queryContinuation: string | undefined;
   let done = false;
 
@@ -438,18 +378,16 @@ async function processQuery(query: AgentQuery, routing: RoutingContext): Promise
   const pollHandle = setInterval(() => {
     if (done) return;
 
-    // Skip system messages (MCP tool responses) and admin commands (need fresh query).
-    // Also defer messages whose thread_id differs from the active turn's routing
-    // — mixing threads into one streaming turn would send the reply to the wrong
-    // thread because `routing` is captured at turn start. The next turn will pick
-    // them up with fresh routing.
+    // Skip system messages (MCP tool responses) and /clear (needs fresh query).
+    // Thread routing is the router's concern — if a message landed in this
+    // session, the agent should see it. Per-thread sessions already isolate
+    // threads into separate containers; shared sessions intentionally merge
+    // everything. Filtering on thread_id here caused deadlocks when the
+    // initial batch and follow-ups had mismatched thread_ids (e.g. a
+    // host-generated welcome trigger with null thread vs a Discord DM reply).
     const newMessages = getPendingMessages().filter((m) => {
       if (m.kind === 'system') return false;
-      if (m.kind === 'chat' || m.kind === 'chat-sdk') {
-        const cmd = categorizeMessage(m);
-        if (cmd.category === 'admin') return false;
-      }
-      if ((m.thread_id ?? null) !== (routing.threadId ?? null)) return false;
+      if ((m.kind === 'chat' || m.kind === 'chat-sdk') && isClearCommand(m)) return false;
       return true;
     });
     if (newMessages.length > 0) {
@@ -478,8 +416,17 @@ async function processQuery(query: AgentQuery, routing: RoutingContext): Promise
         // effectively orphaned and the next message started a blank
         // Claude session with no prior context.
         setStoredSessionId(event.continuation);
-      } else if (event.type === 'result' && event.text) {
-        dispatchResultText(event.text, routing);
+      } else if (event.type === 'result') {
+        // A result — with or without text — means the turn is done. Mark
+        // the initial batch completed now so the host sweep doesn't see
+        // stale 'processing' claims while the query stays open for
+        // follow-up pushes. The agent may have responded via MCP
+        // (send_message) mid-turn, or the message may not need a response
+        // at all — either way the turn is finished.
+        markCompleted(initialBatchIds);
+        if (event.text) {
+          dispatchResultText(event.text, routing);
+        }
       }
     }
   } finally {

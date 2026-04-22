@@ -64,6 +64,7 @@ async function mountMockAdapter(
   await initChannelAdapters(() => ({
     conversations: [],
     onInbound: () => {},
+    onInboundEvent: () => {},
     onMetadata: () => {},
     onAction: () => {},
   }));
