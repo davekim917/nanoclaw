@@ -17,11 +17,32 @@ SESSIONS="$REPO_ROOT/data/v2-sessions"
 
 GROUP="${1:-}"
 FORCE=0
-[ "${2:-}" = "--force" ] && FORCE=1
+ALLOW_DIRTY=0
+for arg in "${@:2}"; do
+  case "$arg" in
+    --force) FORCE=1 ;;
+    --allow-dirty) ALLOW_DIRTY=1 ;;
+  esac
+done
 
 if [ -z "$GROUP" ]; then
-  echo "usage: sync.sh <group-id> [--force]" >&2
+  echo "usage: sync.sh <group-id> [--force] [--allow-dirty]" >&2
   exit 2
+fi
+
+# Commit-first guard: refuse to copy uncommitted trunk WIP into every group's
+# overlay. The sync fans out to every agent, so uncommitted half-finished
+# edits would propagate broadly and silently. --allow-dirty is the escape
+# hatch for operator-local testing (e.g. iterating on a host-side edit
+# before pushing).
+if [ $ALLOW_DIRTY -eq 0 ]; then
+  dirty="$(cd "$REPO_ROOT" && git status --porcelain -- container/agent-runner/src 2>/dev/null || true)"
+  if [ -n "$dirty" ]; then
+    echo "refusing to sync — uncommitted changes in container/agent-runner/src:" >&2
+    echo "$dirty" >&2
+    echo "Commit first, or re-run with --allow-dirty to propagate WIP to all groups." >&2
+    exit 4
+  fi
 fi
 
 OVERLAY="$SESSIONS/$GROUP/agent-runner-src"
