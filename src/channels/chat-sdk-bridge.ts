@@ -228,6 +228,14 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // flag that routeInbound evaluates; the router calls back into
       // bridge.subscribe(...) when a mention-sticky wiring engages.
 
+      // Normalize channel-root threads to null — Chat SDK's thread.id equals
+      // the channel id for messages posted at channel root (Discord format
+      // `discord:{g}:{c}`, Slack `slack:{C}`). Router's engage logic wants
+      // "real sub-thread or null"; without this normalization mention-sticky
+      // treats every channel message as an in-thread follow-up.
+      const resolveThreadId = (rawThreadId: string, channelId: string): string | null =>
+        rawThreadId === channelId ? null : rawThreadId;
+
       // Subscribed threads — every message in a thread we've previously
       // engaged. Carry the SDK's `message.isMention` through so mention-mode
       // wirings still fire on in-thread mentions.
@@ -236,7 +244,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         const isDM = adapterIsDM(adapter, thread.id);
         await setupConfig.onInbound(
           channelId,
-          thread.id,
+          resolveThreadId(thread.id, channelId),
           await messageToInbound(message, message.isMention === true, isDM),
         );
       });
@@ -245,7 +253,11 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       chat.onNewMention(async (thread, message) => {
         const channelId = adapter.channelIdFromThreadId(thread.id);
         const isDM = adapterIsDM(adapter, thread.id);
-        await setupConfig.onInbound(channelId, thread.id, await messageToInbound(message, true, isDM));
+        await setupConfig.onInbound(
+          channelId,
+          resolveThreadId(thread.id, channelId),
+          await messageToInbound(message, true, isDM),
+        );
       });
 
       // DMs — by definition addressed to the bot. Thread id flows through
@@ -277,7 +289,11 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       chat.onNewMessage(/./, async (thread, message) => {
         const channelId = adapter.channelIdFromThreadId(thread.id);
         const isDM = adapterIsDM(adapter, thread.id);
-        await setupConfig.onInbound(channelId, thread.id, await messageToInbound(message, false, isDM));
+        await setupConfig.onInbound(
+          channelId,
+          resolveThreadId(thread.id, channelId),
+          await messageToInbound(message, false, isDM),
+        );
       });
 
       // Handle button clicks (ask_user_question)
