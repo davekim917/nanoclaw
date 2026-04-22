@@ -61,6 +61,7 @@ const REQUIRED_SETTINGS: Record<string, unknown> = {
   // override via the group's own settings.json (the merge below preserves
   // existing values, so editing settings.json by hand works).
   model: 'opus',
+  advisorModel: 'opus',
 };
 
 const DEFAULT_SETTINGS_JSON = JSON.stringify({ env: REQUIRED_ENV, ...REQUIRED_SETTINGS }, null, 2) + '\n';
