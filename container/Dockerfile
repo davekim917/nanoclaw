@@ -179,6 +179,11 @@ RUN --mount=type=cache,target=/root/.bun/install/cache \
 # take effect without rebuilding the image; the baked copy is the fallback.
 COPY agent-runner/ ./
 
+# Puppeteer config used by mmdc — points at the system Chromium and passes
+# --no-sandbox, without which mmdc launches and silently exits 0 producing no
+# output on Debian containers that lack unprivileged user namespaces.
+COPY puppeteer-config.json /app/puppeteer-config.json
+
 # ---- Entrypoint --------------------------------------------------------------
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh

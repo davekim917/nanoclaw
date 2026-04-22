@@ -546,16 +546,33 @@ export const renderDiagramTool: McpToolDefinition = {
       const tmpInput = `/tmp/mmd-${id}.mmd`;
       const tmpOut = `/tmp/out-${id}.png`;
       fs.writeFileSync(tmpInput, src);
+      // Capture stderr so a sandbox/launch failure surfaces a real error —
+      // mmdc swallows puppeteer failures and exits 0 with no PNG, so we
+      // can't rely on the exit code alone.
+      let mmdcStderr = '';
       try {
-        execFileSync('mmdc', [
-          '-i', tmpInput,
-          '-o', tmpOut,
-          '-t', (args.mermaidTheme as string) || 'default',
-          '-b', theme === 'dark' ? '#1e1e1e' : '#ffffff',
-          '-w', String(width),
-        ], { timeout: 30_000, stdio: 'pipe' });
+        const out = execFileSync(
+          'mmdc',
+          [
+            '-i', tmpInput,
+            '-o', tmpOut,
+            '-t', (args.mermaidTheme as string) || 'default',
+            '-b', theme === 'dark' ? '#1e1e1e' : '#ffffff',
+            '-w', String(width),
+            '-p', '/app/puppeteer-config.json',
+          ],
+          { timeout: 30_000, stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf8' },
+        );
+        void out;
+      } catch (e) {
+        const anyE = e as { stderr?: Buffer | string; message?: string };
+        mmdcStderr = String(anyE?.stderr ?? anyE?.message ?? e);
       } finally {
         try { fs.unlinkSync(tmpInput); } catch {}
+      }
+      if (!fs.existsSync(tmpOut)) {
+        const hint = mmdcStderr && mmdcStderr.length > 0 ? ` ${mmdcStderr.slice(0, 400)}` : '';
+        return err(`mermaid render failed (no output from mmdc).${hint}`);
       }
       // Mermaid output is already a PNG — copy to outDir
       fs.mkdirSync(outDir, { recursive: true });
