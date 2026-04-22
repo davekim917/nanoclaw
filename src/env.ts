@@ -1,26 +1,25 @@
 import fs from 'fs';
 import path from 'path';
-import { logger } from './logger.js';
+import { log } from './log.js';
 
 /**
- * Parse the .env file and return all key-value pairs where predicate(key) is true.
+ * Parse the .env file and return values for the requested keys.
  * Does NOT load anything into process.env — callers decide what to
  * do with the values. This keeps secrets out of the process environment
  * so they don't leak to child processes.
  */
-export function readEnvFileMatching(
-  predicate: (key: string) => boolean,
-): Record<string, string> {
+export function readEnvFile(keys: string[]): Record<string, string> {
   const envFile = path.join(process.cwd(), '.env');
   let content: string;
   try {
     content = fs.readFileSync(envFile, 'utf-8');
   } catch (err) {
-    logger.debug({ err }, '.env file not found, using defaults');
+    log.debug('.env file not found, using defaults', { err });
     return {};
   }
 
   const result: Record<string, string> = {};
+  const wanted = new Set(keys);
 
   for (const line of content.split('\n')) {
     const trimmed = line.trim();
@@ -28,12 +27,11 @@ export function readEnvFileMatching(
     const eqIdx = trimmed.indexOf('=');
     if (eqIdx === -1) continue;
     const key = trimmed.slice(0, eqIdx).trim();
-    if (!predicate(key)) continue;
+    if (!wanted.has(key)) continue;
     let value = trimmed.slice(eqIdx + 1).trim();
     if (
       value.length >= 2 &&
-      ((value.startsWith('"') && value.endsWith('"')) ||
-        (value.startsWith("'") && value.endsWith("'")))
+      ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'")))
     ) {
       value = value.slice(1, -1);
     }
@@ -44,9 +42,36 @@ export function readEnvFileMatching(
 }
 
 /**
- * Parse the .env file and return values for the requested keys.
+ * Return all .env keys that match a regex, as a map of full-key → value.
+ * Useful for scanning variable-suffix patterns like `SLACK_BOT_TOKEN(_<SUFFIX>)?`.
  */
-export function readEnvFile(keys: string[]): Record<string, string> {
-  const wanted = new Set(keys);
-  return readEnvFileMatching((key) => wanted.has(key));
+export function readEnvFileMatching(pattern: RegExp): Record<string, string> {
+  const envFile = path.join(process.cwd(), '.env');
+  let content: string;
+  try {
+    content = fs.readFileSync(envFile, 'utf-8');
+  } catch (err) {
+    log.debug('.env file not found, using defaults', { err });
+    return {};
+  }
+
+  const result: Record<string, string> = {};
+  for (const line of content.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const eqIdx = trimmed.indexOf('=');
+    if (eqIdx === -1) continue;
+    const key = trimmed.slice(0, eqIdx).trim();
+    if (!pattern.test(key)) continue;
+    let value = trimmed.slice(eqIdx + 1).trim();
+    if (
+      value.length >= 2 &&
+      ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'")))
+    ) {
+      value = value.slice(1, -1);
+    }
+    if (value) result[key] = value;
+  }
+
+  return result;
 }

@@ -49,6 +49,7 @@ const ACCOUNTS = {
   personal2: 'dave.kim917@gmail.com',
   sunday: 'david.kim@getsunday.com',
   illysium: 'dave@illysium.ai',
+  'support-illysium': 'support@illysium.ai',
   numberdrinks: 'dave@numberdrinks.com',
   'madison-reed': 'dave.kim@madison-reed.com',
 };

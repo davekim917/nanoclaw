@@ -1,6 +1,8 @@
 # Dependencies
 node_modules/
 .npm-cache/
+# pnpm content-addressable store (created when running in sandbox mode)
+.pnpm-store/
 # Build output
 dist/
 
@@ -9,18 +11,19 @@ store/
 data/
 logs/
 
-# Groups - only track base structure and specific CLAUDE.md files
+# Groups - per-installation state, not tracked
 groups/*
-!groups/main/
-!groups/global/
-groups/main/*
-groups/global/*
-!groups/main/CLAUDE.md
-!groups/global/CLAUDE.md
+
+# Composer-managed CLAUDE.md artifacts (regenerated every spawn) and
+# per-group memory (CLAUDE.local.md) must never be committed.
+**/CLAUDE.local.md
+**/.claude-shared.md
+**/.claude-fragments/
 
 # Secrets
 *.keys.json
 .env
+.env*
 
 # Temp files
 .tmp-*
@@ -32,32 +35,15 @@ groups/global/*
 .idea/
 .vscode/
 
-# Claude Code local settings (per-machine)
-.claude/settings.local.json
-# Claude Code session transcripts — per-machine, never committed
-.claude/projects/
-# Claude Code temp artifacts
-.claude/tmp/
-
 # Skills system (local per-installation state)
 .nanoclaw/
 
 agents-sdk-docs
-
-# Worktrees (per-thread git worktrees)
-data/worktrees/
-
-# Build worktrees
-.worktrees/
-
-# Workflow artifacts (specs, retros — kept locally, not pushed upstream)
-.context/
-
-# Playwright MCP (browser automation logs)
-.playwright-mcp/
-
-# Screenshots (frontend testing artifacts)
-screenshots/
-nanoclaw.db
 .gitnexus
-AGENTS.md
+
+# Runtime lock files
+.claude/scheduled_tasks.lock
+
+# Local env backups
+.env.pre-*
+.env.bak*

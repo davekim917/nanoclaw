@@ -332,8 +332,6 @@ Configuration constants are in `src/config.ts`:
 import path from 'path';
 
 export const ASSISTANT_NAME = process.env.ASSISTANT_NAME || 'Andy';
-export const POLL_INTERVAL = 2000;
-export const SCHEDULER_POLL_INTERVAL = 60000;
 
 // Paths are absolute (required for container mounts)
 const PROJECT_ROOT = process.cwd();
@@ -344,7 +342,6 @@ export const DATA_DIR = path.resolve(PROJECT_ROOT, 'data');
 // Container configuration
 export const CONTAINER_IMAGE = process.env.CONTAINER_IMAGE || 'nanoclaw-agent:latest';
 export const CONTAINER_TIMEOUT = parseInt(process.env.CONTAINER_TIMEOUT || '1800000', 10); // 30min default
-export const IPC_POLL_INTERVAL = 1000;
 export const IDLE_TIMEOUT = parseInt(process.env.IDLE_TIMEOUT || '1800000', 10); // 30min — keep container alive after last result
 export const MAX_CONCURRENT_CONTAINERS = Math.max(1, parseInt(process.env.MAX_CONCURRENT_CONTAINERS || '5', 10) || 5);
 
@@ -404,7 +401,7 @@ Only the authentication variables (`CLAUDE_CODE_OAUTH_TOKEN` and `ANTHROPIC_API_
 Set the `ASSISTANT_NAME` environment variable:
 
 ```bash
-ASSISTANT_NAME=Bot npm start
+ASSISTANT_NAME=Bot pnpm start
 ```
 
 Or edit the default in `src/config.ts`. This changes:
@@ -459,7 +456,7 @@ Sessions enable conversation continuity - Claude remembers what you talked about
 
 ### How Sessions Work
 
-1. Each group/thread has a session ID stored in SQLite (`sessions` table, keyed by `session_key`)
+1. Each group has a session ID stored in SQLite (`sessions` table, keyed by `group_folder`)
 2. Session ID is passed to Claude Agent SDK's `resume` option
 3. Claude continues the conversation with full context
 4. Session transcripts are stored as JSONL files in `data/sessions/{group}/.claude/`
@@ -764,7 +761,7 @@ chmod 700 groups/
 |-------|-------|----------|
 | No response to messages | Service not running | Check `launchctl list | grep nanoclaw` |
 | "Claude Code process exited with code 1" | Container runtime failed to start | Check logs; NanoClaw auto-starts container runtime but may fail |
-| "Claude Code process exited with code 1" | Session mount path wrong | Ensure mount is to `/home/node/.claude/` not `/home/ubuntu/.claude/` |
+| "Claude Code process exited with code 1" | Session mount path wrong | Ensure mount is to `/home/node/.claude/` not `/root/.claude/` |
 | Session not continuing | Session ID not saved | Check SQLite: `sqlite3 store/messages.db "SELECT * FROM sessions"` |
 | Session not continuing | Mount path mismatch | Container user is `node` with HOME=/home/node; sessions must be at `/home/node/.claude/` |
 | "QR code expired" | WhatsApp session expired | Delete store/auth/ and restart |
@@ -779,7 +776,7 @@ chmod 700 groups/
 
 Run manually for verbose output:
 ```bash
-npm run dev
+pnpm run dev
 # or
 node dist/index.js
 ```

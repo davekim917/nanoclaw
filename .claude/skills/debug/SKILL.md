@@ -24,7 +24,7 @@ src/container-runner.ts               container/agent-runner/
     └── (main only) project root ──> /workspace/project
 ```
 
-**Important:** The container runs as user `node` with `HOME=/home/node`. Session files must be mounted to `/home/node/.claude/` (not `/home/ubuntu/.claude/`) for session resumption to work.
+**Important:** The container runs as user `node` with `HOME=/home/node`. Session files must be mounted to `/home/node/.claude/` (not `/root/.claude/`) for session resumption to work.
 
 ## Log Locations
 
@@ -41,7 +41,7 @@ Set `LOG_LEVEL=debug` for verbose output:
 
 ```bash
 # For development
-LOG_LEVEL=debug npm run dev
+LOG_LEVEL=debug pnpm run dev
 
 # For launchd service (macOS), add to plist EnvironmentVariables:
 <key>LOG_LEVEL</key>
@@ -148,7 +148,7 @@ If sessions aren't being resumed (new session ID every time), or Claude Code exi
 
 **Check the mount path:**
 ```bash
-# In container-runner.ts, verify mount is to /home/node/.claude/, NOT /home/ubuntu/.claude/
+# In container-runner.ts, verify mount is to /home/node/.claude/, NOT /root/.claude/
 grep -A3 "Claude sessions" src/container-runner.ts
 ```
 
@@ -166,7 +166,7 @@ ls -la $HOME/.claude/projects/ 2>&1 | head -5
 ```typescript
 mounts.push({
   hostPath: claudeDir,
-  containerPath: '/home/node/.claude',  // NOT /home/ubuntu/.claude
+  containerPath: '/home/node/.claude',  // NOT /root/.claude
   readonly: false
 });
 ```
@@ -231,7 +231,7 @@ query({
 
 ```bash
 # Rebuild main app
-npm run build
+pnpm run build
 
 # Rebuild container (use --no-cache for clean rebuild)
 ./container/build.sh
@@ -267,7 +267,7 @@ Claude sessions are stored per-group in `data/sessions/{group}/.claude/` for sec
 **Critical:** The mount path must match the container user's HOME directory:
 - Container user: `node`
 - Container HOME: `/home/node`
-- Mount target: `/home/node/.claude/` (NOT `/home/ubuntu/.claude/`)
+- Mount target: `/home/node/.claude/` (NOT `/root/.claude/`)
 
 To clear sessions:
 
@@ -279,7 +279,7 @@ rm -rf data/sessions/
 rm -rf data/sessions/{groupFolder}/.claude/
 
 # Also clear the session ID from NanoClaw's tracking (stored in SQLite)
-sqlite3 store/messages.db "DELETE FROM sessions WHERE session_key = '{groupFolder}'"
+sqlite3 store/messages.db "DELETE FROM sessions WHERE group_folder = '{groupFolder}'"
 ```
 
 To verify session resumption is working, check the logs for the same session ID across messages:
@@ -335,7 +335,7 @@ echo -e "\n4. Container image exists?"
 echo '{}' | docker run -i --entrypoint /bin/echo nanoclaw-agent:latest "OK" 2>/dev/null || echo "MISSING - run ./container/build.sh"
 
 echo -e "\n5. Session mount path correct?"
-grep -q "/home/node/.claude" src/container-runner.ts 2>/dev/null && echo "OK" || echo "WRONG - should mount to /home/node/.claude/, not /home/ubuntu/.claude/"
+grep -q "/home/node/.claude" src/container-runner.ts 2>/dev/null && echo "OK" || echo "WRONG - should mount to /home/node/.claude/, not /root/.claude/"
 
 echo -e "\n6. Groups directory?"
 ls -la groups/ 2>/dev/null || echo "MISSING - run setup"

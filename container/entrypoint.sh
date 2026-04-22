@@ -1,101 +1,109 @@
 #!/bin/bash
+# NanoClaw agent container entrypoint.
+#
+# Runtime: Bun. The host passes initial session parameters via stdin as a
+# single JSON blob; we capture it to /tmp/input.json first so it survives
+# for post-mortem inspection, then exec bun so bun becomes tini's direct
+# child and receives signals cleanly. All further IO flows through the
+# session DBs at /workspace/{inbound,outbound}.db — no stdin pipe during
+# the poll loop.
+#
+# Illysium additions on top of upstream/v2:
+# - Chromium XDG workaround (long-running sessions crash without it)
+# - gws (Google Workspace CLI) wrapper that unsets ADC to avoid
+#   service-account override of user-OAuth
+# - GitHub git auth via `gh auth setup-git` when GH_TOKEN is set
+# - Render CLI workspace pre-configuration
+# - GitNexus repo auto-registration (so code-intel MCP tools see mounted
+#   repos without the agent having to register them by hand)
+#
+# All steps are idempotent and best-effort. If a tool isn't installed or
+# an env var isn't set, the corresponding step no-ops silently.
+
 set -e
-cd /app && npx tsc --outDir /tmp/dist 2>&1 >&2
-ln -s /app/node_modules /tmp/dist/node_modules
-chmod -R a-w /tmp/dist
-cat > /tmp/input.json
 
-# Read one secret field from /tmp/input.json. The field name is passed as
-# process.argv[1] (NOT interpolated into the JS source) — a metacharacter in
-# the name can never escape into the script body.
-extract_secret() {
-  node -e 'try{const d=JSON.parse(require("fs").readFileSync("/tmp/input.json","utf8"));const v=d.secrets?.[process.argv[1]];if(v)process.stdout.write(v)}catch{}' -- "$1" 2>/dev/null
-}
+# Capture stdin JSON if any — it's used by upstream's stdin-on-spawn path.
+# Host-spawned sessions in this fork don't pipe stdin (all IO is via the
+# mounted session DBs), so fall through immediately when stdin isn't a pipe.
+if [ ! -t 0 ] && [ -p /dev/stdin ]; then
+  cat > /tmp/input.json
+else
+  : > /tmp/input.json
+fi
 
-# Fix Chromium crashpad in containers: crashpad derives its database path from
-# XDG_CONFIG_HOME. If that dir isn't writable (or gets corrupted in long-running
-# containers), chromium crashes with "chrome_crashpad_handler: --database is required".
-# Pointing XDG dirs to /tmp ensures a writable, ephemeral location.
-# See: https://github.com/microsoft/playwright/issues/34031
+# --- Chromium crashpad workaround ---
+# crashpad derives its DB path from XDG_CONFIG_HOME. If that dir isn't
+# writable (or gets corrupted on long-running containers), chromium
+# crashes with "--database is required". Redirect to /tmp.
 export XDG_CONFIG_HOME=/tmp/.chromium
 export XDG_CACHE_HOME=/tmp/.chromium
-# Route browser through residential proxy for geo-fenced sites
+
+# --- Residential proxy for geo-fenced browser automation ---
 if [ -n "$RESIDENTIAL_PROXY_URL" ]; then
   export AGENT_BROWSER_PROXY="$RESIDENTIAL_PROXY_URL"
 fi
 
-# Configure git/gh auth if GITHUB_TOKEN is present in secrets
-GH_TOKEN=$(extract_secret GITHUB_TOKEN)
-GH_ORGS=$(extract_secret GITHUB_ALLOWED_ORGS)
+# --- GitHub git auth ---
+# When GITHUB_ALLOWED_ORGS is set, configure git's credential helper ONLY
+# for the listed orgs (comma-separated). Prevents a container with a broad
+# token from cloning/pushing outside the allowlisted organizations. v1's
+# URL-scoped credential-helper pattern, adapted to v2's env-driven config.
+#
+# Without GITHUB_ALLOWED_ORGS: fall back to `gh auth setup-git`, which
+# configures the helper globally for github.com. Matches v2's previous
+# behavior for installs that haven't opted into org-scoping yet.
+#
+# gh CLI auth is skipped when org-scoping is active because gh's own auth
+# store (~/.config/gh/) is independent of git credential helpers and would
+# bypass the URL-scoped restriction.
+#
+# Implementation: the credential value is written to a standalone helper
+# script that reads the token from an env var at invocation time, NOT
+# interpolated into the shell/git-config literal. Prevents any injection
+# path via the token value (e.g. a token containing a single quote
+# breaking out of the shell string — unusual for GitHub PATs but defense
+# in depth is cheap).
 if [ -n "$GH_TOKEN" ]; then
-  if [ -n "$GH_ORGS" ]; then
-    # URL-scoped credentials: only provide token for allowed orgs.
-    # Prevents cloning repos outside the allowed organizations.
-    IFS=',' read -ra ORGS <<< "$GH_ORGS"
-    for org in "${ORGS[@]}"; do
-      git config --global "credential.https://github.com/${org}/.helper" \
-        '!f() { echo username=x-access-token; echo password='"$GH_TOKEN"'; }; f'
+  if [ -n "$GITHUB_ALLOWED_ORGS" ]; then
+    mkdir -p /tmp/bin
+    # Quoted heredoc — no expansion happens here; the script reads
+    # NANOCLAW_GH_TOKEN from the env when git invokes it.
+    cat > /tmp/bin/nanoclaw-git-creds <<'CREDS'
+#!/bin/bash
+echo "username=x-access-token"
+echo "password=${NANOCLAW_GH_TOKEN}"
+CREDS
+    chmod 0700 /tmp/bin/nanoclaw-git-creds
+    export NANOCLAW_GH_TOKEN="$GH_TOKEN"
+
+    IFS=',' read -ra _gh_orgs <<< "$GITHUB_ALLOWED_ORGS"
+    for _org in "${_gh_orgs[@]}"; do
+      _org=$(echo "$_org" | tr -d ' ')
+      [ -z "$_org" ] && continue
+      git config --global "credential.https://github.com/${_org}/.helper" '!/tmp/bin/nanoclaw-git-creds'
     done
-  else
-    # Global credential helper — all github.com repos get the token
-    git config --global credential.helper '!f() { echo username=x-access-token; echo password='"$GH_TOKEN"'; }; f'
-  fi
-  # Only give gh CLI global auth when org-scoping is NOT active.
-  # gh uses its own auth store (~/.config/gh/) independent of git credential helpers,
-  # which would bypass the URL-scoped credential restriction.
-  if [ -z "$GH_ORGS" ]; then
-    echo "$GH_TOKEN" | gh auth login --with-token 2>/dev/null || true
+    echo "[entrypoint] GitHub credentials scoped to orgs: $GITHUB_ALLOWED_ORGS" >&2
+  elif command -v gh >/dev/null 2>&1; then
+    gh auth setup-git 2>/dev/null || true
   fi
 fi
 
-# Render CLI v2 requires an active workspace for service-level commands.
-# When the host passes RENDER_WORKSPACE_ID in secrets (set per-scope via
-# RENDER_WORKSPACE_ID_<SCOPE> in .env, normalized in readSecrets), pre-set
-# it here so the agent doesn't have to learn the `render workspace set` flow.
-RENDER_WS=$(extract_secret RENDER_WORKSPACE_ID)
-RENDER_KEY=$(extract_secret RENDER_API_KEY)
-if [ -n "$RENDER_WS" ] && [ -n "$RENDER_KEY" ]; then
-  RENDER_API_KEY="$RENDER_KEY" /usr/local/bin/render workspace set "$RENDER_WS" --confirm >/dev/null 2>&1 \
-    && echo "[entrypoint] render workspace pre-configured: $RENDER_WS" >&2 \
-    || echo "[entrypoint] render workspace set failed (workspace=$RENDER_WS)" >&2
+# --- Render CLI workspace pre-config ---
+if [ -n "$RENDER_WORKSPACE_ID" ] && [ -n "$RENDER_API_KEY" ] && command -v render >/dev/null 2>&1; then
+  RENDER_API_KEY="$RENDER_API_KEY" render workspace set "$RENDER_WORKSPACE_ID" --confirm >/dev/null 2>&1 \
+    && echo "[entrypoint] render workspace pre-configured: $RENDER_WORKSPACE_ID" >&2 \
+    || echo "[entrypoint] render workspace set failed (workspace=$RENDER_WORKSPACE_ID)" >&2
 fi
 
-# gws (Google Workspace CLI) needs a writable config dir for API discovery cache.
-# /home/node/.config/ may be owned by root from calendar MCP setup in Dockerfile.
+# --- Google Workspace CLI (gws) ---
+# gws needs a writable config dir for its API discovery cache. Host mount
+# of the accounts dir is RO — can't use it as the config dir too.
 export GOOGLE_WORKSPACE_CLI_CONFIG_DIR=/tmp/.gws
 mkdir -p /tmp/.gws
 
-# Google credentials: consolidated gws authorized_user files at /home/node/.config/gws/accounts/.
-# If consolidated creds exist, use them directly. Otherwise, fall back to converting legacy
-# MCP credentials (gmail-mcp, google-calendar-mcp, google_workspace_mcp) for backward compat.
-if [ -d /home/node/.config/gws/accounts ] && ls /home/node/.config/gws/accounts/*.json >/dev/null 2>&1; then
-  echo "[entrypoint] Using consolidated gws credentials" >&2
-else
-  echo "[entrypoint] No consolidated creds — converting legacy MCP credentials" >&2
-  mkdir -p /home/node/.config/gws/accounts
-  # Convert legacy Gmail credentials
-  for dir in /home/node/.gmail-mcp /home/node/.gmail-mcp-*; do
-    [ -f "$dir/credentials.json" ] && [ -f "$dir/gcp-oauth.keys.json" ] || continue
-    node -e '
-      const fs=require("fs"),p=require("path");
-      const oauth=JSON.parse(fs.readFileSync(p.join("'"$dir"'","gcp-oauth.keys.json"),"utf8"));
-      const creds=JSON.parse(fs.readFileSync(p.join("'"$dir"'","credentials.json"),"utf8"));
-      const c=oauth.installed||oauth.web;
-      if(!c||!creds.refresh_token)process.exit(0);
-      const name=p.basename("'"$dir"'").replace(".gmail-mcp-","").replace(".gmail-mcp","primary");
-      fs.writeFileSync(p.join("/home/node/.config/gws/accounts",name+".json"),JSON.stringify({
-        type:"authorized_user",client_id:c.client_id,
-        client_secret:c.client_secret,refresh_token:creds.refresh_token
-      },null,2)+"\n");
-    ' 2>/dev/null || true
-  done
-fi
-
-# Prevent gws from falling back to service account credentials via ADC.
-# When GOOGLE_APPLICATION_CREDENTIALS is set (for gcloud/gsutil), gws picks
-# up the service account instead of the user's OAuth token — causing
-# FAILED_PRECONDITION on Gmail/Calendar. This wrapper strips it so gws
-# only uses GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE or per-command overrides.
+# gws wrapper: strips GOOGLE_APPLICATION_CREDENTIALS before exec. When ADC
+# is set (for gcloud/gsutil), gws picks up the service account instead of
+# the user's OAuth token, breaking Gmail/Calendar with FAILED_PRECONDITION.
 GWS_BIN=$(command -v gws 2>/dev/null || true)
 if [ -n "$GWS_BIN" ]; then
   mkdir -p /tmp/bin
@@ -108,35 +116,42 @@ WRAPPER
   export PATH="/tmp/bin:$PATH"
 fi
 
-# Register git repos for GitNexus code intelligence.
-# Startup only registers existing indexes — no analysis runs at boot.
-# Repos without an index are skipped; the agent runs `gitnexus analyze`
-# in whichever repo it actually needs when the session starts work.
-# This avoids re-analyzing all repos (typically 20+) when a thread only
-# touches 1-2, and avoids stale-index re-analysis caused by prior commits.
+# --- GitNexus repo auto-registration ---
+# Scan mounted workspace for git repos that already have a GitNexus index
+# and register them in the container's registry.json so the gitnexus MCP
+# tools can query them. Doesn't run analysis — a stale index means the
+# agent runs `gitnexus analyze` itself when it needs to.
 mkdir -p /home/node/.gitnexus
-# Collect all repos with an existing index, then register in one Node process.
 _gitnexus_repos=()
-for gitdir in $(find /workspace -maxdepth 3 -name .git \( -type d -o -type f \) 2>/dev/null); do
+for gitdir in $(find /workspace -maxdepth 4 -name .git \( -type d -o -type f \) 2>/dev/null); do
   repo=$(dirname "$gitdir")
   [ -f "$repo/.gitnexus/meta.json" ] && _gitnexus_repos+=("$repo")
 done
 if [ ${#_gitnexus_repos[@]} -gt 0 ]; then
-  node -e '
-    const fs=require("fs"),p=require("path");
-    const regPath=p.join(process.env.HOME,".gitnexus","registry.json");
-    const reg=fs.existsSync(regPath)?JSON.parse(fs.readFileSync(regPath,"utf8")):[];
-    for(const repo of process.argv.slice(1)){
-      if(reg.some(r=>r.path===repo)) continue;
-      try{
-        const meta=JSON.parse(fs.readFileSync(p.join(repo,".gitnexus","meta.json"),"utf8"));
-        reg.push({name:p.basename(repo),path:repo,storagePath:p.join(repo,".gitnexus"),
-          indexedAt:meta.indexedAt,lastCommit:meta.lastCommit,stats:meta.stats});
-      }catch{}
-    }
-    fs.writeFileSync(regPath,JSON.stringify(reg,null,2)+"\n");
-  ' "${_gitnexus_repos[@]}" 2>/dev/null \
-    && echo "[entrypoint] GitNexus: registered ${#_gitnexus_repos[@]} repo(s)" >&2 || true
+  # Prefer node (always installed), fall back to bun. Both can run this one-liner.
+  _runtime=$(command -v node 2>/dev/null || command -v bun 2>/dev/null || true)
+  if [ -n "$_runtime" ]; then
+    "$_runtime" -e '
+      const fs = require("fs"), p = require("path");
+      const regPath = p.join(process.env.HOME, ".gitnexus", "registry.json");
+      const reg = fs.existsSync(regPath) ? JSON.parse(fs.readFileSync(regPath, "utf8")) : [];
+      for (const repo of process.argv.slice(1)) {
+        if (reg.some((r) => r.path === repo)) continue;
+        try {
+          const meta = JSON.parse(fs.readFileSync(p.join(repo, ".gitnexus", "meta.json"), "utf8"));
+          reg.push({
+            name: p.basename(repo), path: repo, storagePath: p.join(repo, ".gitnexus"),
+            indexedAt: meta.indexedAt, lastCommit: meta.lastCommit, stats: meta.stats,
+          });
+        } catch {}
+      }
+      fs.writeFileSync(regPath, JSON.stringify(reg, null, 2) + "\n");
+    ' "${_gitnexus_repos[@]}" 2>/dev/null \
+      && echo "[entrypoint] GitNexus: registered ${#_gitnexus_repos[@]} repo(s)" >&2 || true
+  fi
 fi
 
-node /tmp/dist/index.js < /tmp/input.json
+# --- Run the agent-runner ---
+# Bun runs TypeScript directly — no tsc build step. Host remounts source at
+# /app/src via container-runner.ts so edits take effect on next spawn.
+exec bun run /app/src/index.ts < /tmp/input.json

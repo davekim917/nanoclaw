@@ -5,263 +5,56 @@ import { readEnvFile } from './env.js';
 import { isValidTimezone } from './timezone.js';
 
 // Read config values from .env (falls back to process.env).
-// Secrets are NOT read here — they stay on disk and are loaded only
-// where needed (container-runner.ts) to avoid leaking to child processes.
-const envConfig = readEnvFile([
-  'ASSISTANT_NAME',
-  'ASSISTANT_HAS_OWN_NUMBER',
-  'OLLAMA_ADMIN_TOOLS',
-  'ONECLI_URL',
-  'RESIDENTIAL_PROXY_URL',
-  'TZ',
-  'WEB_UI_TOKEN',
-  'WEB_UI_ORIGINS',
-  'WEB_UI_SENDER_NAME',
-  'PLUGIN_UPDATE_NOTIFY_JID',
-]);
+const envConfig = readEnvFile(['ASSISTANT_NAME', 'ASSISTANT_HAS_OWN_NUMBER', 'ONECLI_URL', 'ONECLI_API_KEY', 'TZ']);
 
-export const ASSISTANT_NAME =
-  process.env.ASSISTANT_NAME || envConfig.ASSISTANT_NAME || 'Andy';
+export const ASSISTANT_NAME = process.env.ASSISTANT_NAME || envConfig.ASSISTANT_NAME || 'Andy';
 export const ASSISTANT_HAS_OWN_NUMBER =
-  (process.env.ASSISTANT_HAS_OWN_NUMBER ||
-    envConfig.ASSISTANT_HAS_OWN_NUMBER) === 'true';
-export const OLLAMA_ADMIN_TOOLS =
-  (process.env.OLLAMA_ADMIN_TOOLS || envConfig.OLLAMA_ADMIN_TOOLS) === 'true';
-export const PLUGIN_UPDATE_NOTIFY_JID =
-  process.env.PLUGIN_UPDATE_NOTIFY_JID ||
-  envConfig.PLUGIN_UPDATE_NOTIFY_JID ||
-  null;
-export const POLL_INTERVAL = 2000;
-export const SCHEDULER_POLL_INTERVAL = 60000;
-
-// Session management
-export const SESSION_IDLE_RESET_HOURS = parseInt(
-  process.env.SESSION_IDLE_RESET_HOURS || '2',
-  10,
-);
-export const THREAD_SESSION_IDLE_HOURS = parseInt(
-  process.env.THREAD_SESSION_IDLE_HOURS || '2',
-  10,
-);
-export const SESSION_SWEEP_INTERVAL = 5 * 60 * 1000; // 5 min
-export const THREAD_DEBOUNCE_MS = 1000; // 1s batch window for rapid messages
+  (process.env.ASSISTANT_HAS_OWN_NUMBER || envConfig.ASSISTANT_HAS_OWN_NUMBER) === 'true';
 
 // Absolute paths needed for container mounts
 const PROJECT_ROOT = process.cwd();
 const HOME_DIR = process.env.HOME || os.homedir();
 
 // Mount security: allowlist stored OUTSIDE project root, never mounted into containers
-export const MOUNT_ALLOWLIST_PATH = path.join(
-  HOME_DIR,
-  '.config',
-  'nanoclaw',
-  'mount-allowlist.json',
-);
-export const SENDER_ALLOWLIST_PATH = path.join(
-  HOME_DIR,
-  '.config',
-  'nanoclaw',
-  'sender-allowlist.json',
-);
+export const MOUNT_ALLOWLIST_PATH = path.join(HOME_DIR, '.config', 'nanoclaw', 'mount-allowlist.json');
+export const SENDER_ALLOWLIST_PATH = path.join(HOME_DIR, '.config', 'nanoclaw', 'sender-allowlist.json');
 export const STORE_DIR = path.resolve(PROJECT_ROOT, 'store');
 export const GROUPS_DIR = path.resolve(PROJECT_ROOT, 'groups');
 export const DATA_DIR = path.resolve(PROJECT_ROOT, 'data');
 
-export const ATTACHMENTS_DIR = path.resolve(DATA_DIR, 'attachments');
-export const MAX_IMAGE_SIZE = 5 * 1024 * 1024; // 5MB
-export const MAX_DOCUMENT_SIZE = 50 * 1024 * 1024; // 50MB
-export const ATTACHMENT_CLEANUP_HOURS = 72;
-
-export const CONTAINER_IMAGE =
-  process.env.CONTAINER_IMAGE || 'nanoclaw-agent:latest';
-export const CONTAINER_TIMEOUT = parseInt(
-  process.env.CONTAINER_TIMEOUT || '1800000',
-  10,
-);
-export const CONTAINER_MAX_OUTPUT_SIZE = parseInt(
-  process.env.CONTAINER_MAX_OUTPUT_SIZE || '10485760',
-  10,
-); // 10MB default
-// Max time the host waits for the onOutput callback chain to drain before
-// force-unblocking the group queue. Bounds the deadlock window when a
-// downstream consumer (e.g. channel.sendMessage) stalls.
-export const OUTPUT_CHAIN_SETTLE_DEADLINE_MS = parseInt(
-  process.env.OUTPUT_CHAIN_SETTLE_DEADLINE_MS || '10000',
-  10,
-);
+export const CONTAINER_IMAGE = process.env.CONTAINER_IMAGE || 'nanoclaw-agent:latest';
+export const CONTAINER_TIMEOUT = parseInt(process.env.CONTAINER_TIMEOUT || '1800000', 10);
+export const CONTAINER_MAX_OUTPUT_SIZE = parseInt(process.env.CONTAINER_MAX_OUTPUT_SIZE || '10485760', 10); // 10MB default
 export const ONECLI_URL = process.env.ONECLI_URL || envConfig.ONECLI_URL;
-export const MAX_MESSAGES_PER_PROMPT = Math.max(
-  1,
-  parseInt(process.env.MAX_MESSAGES_PER_PROMPT || '10', 10) || 10,
-);
-export const IPC_POLL_INTERVAL = 1000;
+export const ONECLI_API_KEY = process.env.ONECLI_API_KEY || envConfig.ONECLI_API_KEY;
+export const MAX_MESSAGES_PER_PROMPT = Math.max(1, parseInt(process.env.MAX_MESSAGES_PER_PROMPT || '10', 10) || 10);
 export const IDLE_TIMEOUT = parseInt(process.env.IDLE_TIMEOUT || '1800000', 10); // 30min default — how long to keep container alive after last result
-export const MAX_CONCURRENT_CONTAINERS = Math.max(
-  1,
-  parseInt(process.env.MAX_CONCURRENT_CONTAINERS || '18', 10) || 18,
-);
-export const MAX_THREADS_PER_GROUP = Math.max(
-  1,
-  parseInt(process.env.MAX_THREADS_PER_GROUP || '6', 10) || 6,
-);
-export const WORKTREES_DIR = path.resolve(DATA_DIR, 'worktrees');
-// Migration note: delete data/worktree-cache/ and data/worktree-git-overlays/ directories on the host if they exist.
-export const GROUP_THREAD_KEY = '__group__';
+export const MAX_CONCURRENT_CONTAINERS = Math.max(1, parseInt(process.env.MAX_CONCURRENT_CONTAINERS || '5', 10) || 5);
 
-export function escapeRegex(str: string): string {
+function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-// Default model for the agent container. Per-group overrides live in
-// ContainerConfig.model; per-message overrides via "-m opus" (sticky) or "-m1 opus" (one-shot).
-export const DEFAULT_MODEL = process.env.DEFAULT_MODEL || 'claude-opus-4-7[1m]';
-
-// Map short aliases to full model IDs
-export const MODEL_ALIASES: Record<string, string> = {
-  opus: 'claude-opus-4-7[1m]',
-  sonnet: 'claude-sonnet-4-6[1m]',
-  haiku: 'claude-haiku-4-5-20251001',
-};
-
-// Patterns to detect model override in a message.
-// Sticky flag: "-m opus" — sets model for rest of session; "-m default" clears
-export const MODEL_FLAG_PATTERN =
-  /(?:^|\s)-m\s+(opus|sonnet|haiku|default|reset)\b/i;
-// One-shot flag: "-m1 opus" — just this invocation, doesn't stick
-export const MODEL_ONESHOT_PATTERN = /(?:^|\s)-m1\s+(opus|sonnet|haiku)\b/i;
-
-// Effort levels for the agent SDK (controls thinking depth).
-// Default is 'xhigh' (Opus 4.7 only; other models fall back to 'high');
-// per-message overrides via "-e max" (sticky) or "-e1 max" (one-shot).
-export type EffortLevel = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
-export const DEFAULT_EFFORT: EffortLevel = 'xhigh';
-export const EFFORT_LEVELS: Set<string> = new Set([
-  'low',
-  'medium',
-  'high',
-  'xhigh',
-  'max',
-]);
-
-// Sticky flag: "-e max" — sets effort for rest of session; "-e default" clears
-export const EFFORT_FLAG_PATTERN =
-  /(?:^|\s)-e\s+(low|medium|high|xhigh|max|default|reset)\b/i;
-// One-shot flag: "-e1 max" — just this invocation, doesn't stick
-export const EFFORT_ONESHOT_PATTERN =
-  /(?:^|\s)-e1\s+(low|medium|high|xhigh|max)\b/i;
-
-/**
- * Strip all model / effort control flags from a message. Used by the gate
- * auto-cancel intercepts to decide whether a user reply is a real message
- * (should auto-cancel the gate) or a bare control switch (should NOT
- * cancel — the gate stays pending while the flag is forwarded via IPC).
- */
-export function stripControlFlags(content: string): string {
-  return content
-    .replace(MODEL_ONESHOT_PATTERN, '')
-    .replace(MODEL_FLAG_PATTERN, '')
-    .replace(EFFORT_ONESHOT_PATTERN, '')
-    .replace(EFFORT_FLAG_PATTERN, '');
+export function buildTriggerPattern(trigger: string): RegExp {
+  return new RegExp(`^${escapeRegex(trigger.trim())}\\b`, 'i');
 }
 
 export const DEFAULT_TRIGGER = `@${ASSISTANT_NAME}`;
 
 export function getTriggerPattern(trigger?: string): RegExp {
   const normalizedTrigger = trigger?.trim();
-  const t = normalizedTrigger || DEFAULT_TRIGGER;
-  return new RegExp(`^${escapeRegex(t)}\\b`, 'i');
+  return buildTriggerPattern(normalizedTrigger || DEFAULT_TRIGGER);
 }
 
-export const TRIGGER_PATTERN = getTriggerPattern();
-
-/** Build a trigger pattern for a specific assistant name. */
-export function buildTriggerPattern(name: string): RegExp {
-  return new RegExp(`^@${escapeRegex(name)}\\b`, 'i');
-}
-
-/** Resolve per-group assistant name, falling back to global default. */
-export function resolveAssistantName(containerConfig?: {
-  assistantName?: string;
-}): string {
-  return containerConfig?.assistantName || ASSISTANT_NAME;
-}
-
-// --- Web channel JID utilities ---
-
-/** Check if a JID belongs to the web channel. */
-export function isWebJid(jid: string): boolean {
-  return jid.startsWith('web:');
-}
-
-/** Construct a web channel JID from a group folder name. */
-export function makeWebJid(folder: string): string {
-  return `web:${folder}`;
-}
-
-// --- Thread JID parsing utilities ---
-
-export interface ParsedThreadJid {
-  channel: 'dc' | 'slack' | 'web';
-  parentId: string;
-  threadId: string;
-}
-
-const THREAD_JID_RE = /^(dc|slack|web):([^:]+):thread:(.+)$/;
-
-/** Parse a thread JID into its components, or return null for non-thread JIDs. */
-export function parseThreadJid(jid: string): ParsedThreadJid | null {
-  const match = jid.match(THREAD_JID_RE);
-  if (!match) return null;
-  return {
-    channel: match[1] as 'dc' | 'slack' | 'web',
-    parentId: match[2],
-    threadId: match[3],
-  };
-}
-
-/** Extract parent JID from a thread JID, or return the JID unchanged. */
-export function getParentJid(jid: string): string {
-  const parsed = parseThreadJid(jid);
-  return parsed ? `${parsed.channel}:${parsed.parentId}` : jid;
-}
-
-// External Claude Code plugin repos directory (e.g. bootstrap, impeccable, omni-claude-skills).
-// Each subdirectory is a separate plugin repo, mounted read-only into containers.
-export const PLUGINS_DIR =
-  process.env.PLUGINS_DIR || path.join(HOME_DIR, 'plugins');
+export const TRIGGER_PATTERN = buildTriggerPattern(DEFAULT_TRIGGER);
 
 // Timezone for scheduled tasks, message formatting, etc.
 // Validates each candidate is a real IANA identifier before accepting.
 function resolveConfigTimezone(): string {
-  const candidates = [
-    process.env.TZ,
-    envConfig.TZ,
-    Intl.DateTimeFormat().resolvedOptions().timeZone,
-  ];
+  const candidates = [process.env.TZ, envConfig.TZ, Intl.DateTimeFormat().resolvedOptions().timeZone];
   for (const tz of candidates) {
     if (tz && isValidTimezone(tz)) return tz;
   }
   return 'UTC';
 }
 export const TIMEZONE = resolveConfigTimezone();
-
-// Residential proxy for browser automation (bypasses datacenter IP geo-fencing)
-export const RESIDENTIAL_PROXY_URL =
-  process.env.RESIDENTIAL_PROXY_URL || envConfig.RESIDENTIAL_PROXY_URL;
-
-// Web UI port for real-time agent activity monitor
-export const WEB_UI_PORT = parseInt(process.env.WEB_UI_PORT || '3002', 10);
-// Token for web UI access — when set, binds to 0.0.0.0 (public); when unset, binds to 127.0.0.1 (local only)
-export const WEB_UI_TOKEN =
-  process.env.WEB_UI_TOKEN || envConfig.WEB_UI_TOKEN || '';
-
-// Allowed CORS origins for the web UI (comma-separated in .env)
-const rawOrigins = process.env.WEB_UI_ORIGINS || envConfig.WEB_UI_ORIGINS || '';
-export const WEB_UI_ORIGINS: string[] = rawOrigins
-  .split(',')
-  .map((s) => s.trim())
-  .filter(Boolean);
-
-// Sender name used for messages submitted via the web UI
-export const WEB_UI_SENDER_NAME: string =
-  process.env.WEB_UI_SENDER_NAME || envConfig.WEB_UI_SENDER_NAME || 'Web User';

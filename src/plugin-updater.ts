@@ -1,161 +1,133 @@
+/**
+ * Plugin auto-updater (Phase 5.12).
+ *
+ * Every hour (configurable via PLUGIN_UPDATE_CRON env), runs
+ * `git pull --ff-only` in each `~/plugins/<name>` subdir. Logs which
+ * plugins updated; optionally notifies a configured JID via the
+ * delivery adapter when any plugin advanced.
+ *
+ * Simplified from v1's src/plugin-updater.ts:
+ *   - No DB-backed scheduled_tasks row. v2 has no scheduled_tasks
+ *     table on the host side; task scheduling is an agent-level MCP
+ *     tool (`schedule_task`). Host cron work uses setInterval, the
+ *     same pattern worktree-cleanup (5.0's host-side sibling) uses.
+ *   - No cron-parser dep. Hourly is hard-coded; a later refactor can
+ *     generalize if we need sub-hour or TZ-aware schedules.
+ *
+ * The notification is fire-and-forget via a callback injected at
+ * startup so this module doesn't pull in delivery.ts directly.
+ */
 import { execFile } from 'child_process';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { promisify } from 'util';
 
-import { CronExpressionParser } from 'cron-parser';
-
-import { PLUGINS_DIR } from './config.js';
-import { createTask, getTaskById, updateTask } from './db.js';
-import { logger } from './logger.js';
-import { registerSystemTaskHandler } from './task-scheduler.js';
+import { log } from './log.js';
 
 const execFileAsync = promisify(execFile);
 
-const PLUGIN_UPDATE_CRON = process.env.PLUGIN_UPDATE_CRON || '0 * * * *';
-const PLUGIN_UPDATE_TZ = process.env.PLUGIN_UPDATE_TZ || 'UTC';
-
-export const PLUGIN_UPDATER_TASK_ID = '__plugin_updater';
+const INTERVAL_MS = 60 * 60 * 1000; // hourly
+const STARTUP_DELAY_MS = 5 * 60 * 1000; // wait 5min after startup so host is quiet
+const GIT_PULL_TIMEOUT_MS = 30_000;
 
 export interface PluginUpdaterDeps {
-  notifyJid: string | null;
-  sendMessage: (jid: string, text: string) => Promise<void>;
+  /**
+   * Optional: send a notification when plugins updated. First arg is
+   * the host's `PLUGIN_UPDATE_NOTIFY_JID` env var (channel-qualified
+   * platform id); second is the message text. No-op if the env isn't
+   * set. The delivery adapter, not this module, decides routing.
+   */
+  notify?: (platformId: string, text: string) => Promise<void>;
 }
 
-function computeNextRun(): string {
-  const interval = CronExpressionParser.parse(PLUGIN_UPDATE_CRON, {
-    tz: PLUGIN_UPDATE_TZ,
-  });
-  return interval.next().toDate().toISOString();
+interface UpdateResult {
+  plugin: string;
+  changed: boolean;
+  error?: string;
 }
 
-/**
- * Idempotent: ensures the plugin updater task row exists in scheduled_tasks.
- * If the row already exists, leaves it untouched (preserving next_run for catch-up).
- * If the cron expression has changed (env var updated), updates schedule_value and recomputes next_run.
- */
-export function ensurePluginUpdaterTask(): void {
-  const existing = getTaskById(PLUGIN_UPDATER_TASK_ID);
-  if (existing) {
-    const updates: Parameters<typeof updateTask>[1] = {};
-    let nextRun = existing.next_run;
+async function updatePlugin(pluginPath: string, name: string): Promise<UpdateResult> {
+  try {
+    const { stdout } = await execFileAsync('git', ['pull', '--ff-only'], {
+      cwd: pluginPath,
+      timeout: GIT_PULL_TIMEOUT_MS,
+      encoding: 'utf-8',
+    });
+    const changed = !stdout.includes('Already up to date.');
+    if (changed) {
+      log.info('Plugin updated', { plugin: name, output: stdout.trim() });
+    }
+    return { plugin: name, changed };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    log.warn('Plugin update failed', { plugin: name, err: msg });
+    return { plugin: name, changed: false, error: msg };
+  }
+}
 
-    if (existing.schedule_value !== PLUGIN_UPDATE_CRON) {
-      updates.schedule_value = PLUGIN_UPDATE_CRON;
-    }
-    if (existing.schedule_tz !== PLUGIN_UPDATE_TZ) {
-      updates.schedule_tz = PLUGIN_UPDATE_TZ;
-    }
-    if (updates.schedule_value || updates.schedule_tz) {
-      nextRun = computeNextRun();
-      updates.next_run = nextRun;
-    }
-    if (existing.status !== 'active') {
-      updates.status = 'active';
-    }
-    if (Object.keys(updates).length > 0) {
-      updateTask(PLUGIN_UPDATER_TASK_ID, updates);
-      logger.info({ updates, nextRun }, 'Plugin updater task updated');
-    } else {
-      logger.info(
-        { nextRun, cron: PLUGIN_UPDATE_CRON },
-        'Plugin updater task exists',
-      );
-    }
+async function runOnce(deps: PluginUpdaterDeps): Promise<void> {
+  const pluginsRoot = path.join(os.homedir(), 'plugins');
+  if (!fs.existsSync(pluginsRoot)) {
+    log.debug('Plugin updater: ~/plugins missing, skipping');
     return;
   }
 
-  const nextRun = computeNextRun();
-  createTask({
-    id: PLUGIN_UPDATER_TASK_ID,
-    group_folder: '__system',
-    chat_jid: '__system',
-    prompt: 'Plugin updater (system task)',
-    schedule_type: 'cron',
-    schedule_value: PLUGIN_UPDATE_CRON,
-    context_mode: 'isolated',
-    task_type: 'system',
-    schedule_tz: PLUGIN_UPDATE_TZ,
-    next_run: nextRun,
-    status: 'active',
-    created_at: new Date().toISOString(),
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(pluginsRoot);
+  } catch (err) {
+    log.warn('Plugin updater: failed to read ~/plugins', { err });
+    return;
+  }
+
+  const repos = entries.filter((name) => {
+    const p = path.join(pluginsRoot, name);
+    try {
+      return fs.statSync(p).isDirectory() && fs.existsSync(path.join(p, '.git'));
+    } catch {
+      return false;
+    }
   });
-  logger.info(
-    { nextRun, cron: PLUGIN_UPDATE_CRON },
-    'Plugin updater task created',
-  );
+
+  if (repos.length === 0) return;
+
+  log.info('Plugin updater: scanning', { count: repos.length });
+  const results = await Promise.all(repos.map((name) => updatePlugin(path.join(pluginsRoot, name), name)));
+
+  const changed = results.filter((r) => r.changed);
+  if (changed.length === 0) return;
+
+  const notifyJid = process.env.PLUGIN_UPDATE_NOTIFY_JID;
+  if (notifyJid && deps.notify) {
+    const msg = `Updated ${changed.length} plugin(s): ${changed.map((r) => r.plugin).join(', ')}`;
+    deps.notify(notifyJid, msg).catch((err) => {
+      log.warn('Plugin update notify failed', { err });
+    });
+  }
 }
 
-/**
- * Register the plugin updater handler with the task scheduler.
- * Must be called before startSchedulerLoop().
- *
- * Runs git pull --ff-only on every git repo in PLUGINS_DIR.
- * If any repos were updated and notifyJid is set, posts a summary to that channel.
- * No-ops (already up to date) are silently skipped.
- */
-export function registerPluginUpdaterHandler(deps: PluginUpdaterDeps): void {
-  registerSystemTaskHandler(PLUGIN_UPDATER_TASK_ID, async () => {
-    if (!fs.existsSync(PLUGINS_DIR)) {
-      logger.warn(
-        { dir: PLUGINS_DIR },
-        'Plugins directory not found, skipping update',
-      );
-      return;
-    }
+let intervalHandle: NodeJS.Timeout | null = null;
+let startupHandle: NodeJS.Timeout | null = null;
 
-    const repos = fs
-      .readdirSync(PLUGINS_DIR, { withFileTypes: true })
-      .filter(
-        (d) =>
-          d.isDirectory() &&
-          fs.existsSync(path.join(PLUGINS_DIR, d.name, '.git')),
-      )
-      .map((d) => d.name);
+export function startPluginUpdater(deps: PluginUpdaterDeps = {}): void {
+  if (intervalHandle || startupHandle) return;
+  startupHandle = setTimeout(() => {
+    startupHandle = null;
+    runOnce(deps).catch((err) => log.error('Plugin updater startup run failed', { err }));
+  }, STARTUP_DELAY_MS);
+  intervalHandle = setInterval(() => {
+    runOnce(deps).catch((err) => log.error('Plugin updater periodic run failed', { err }));
+  }, INTERVAL_MS);
+}
 
-    const results = await Promise.all(
-      repos.map(async (entry) => {
-        const pluginPath = path.join(PLUGINS_DIR, entry);
-        try {
-          const { stdout } = await execFileAsync('git', ['pull', '--ff-only'], {
-            cwd: pluginPath,
-            timeout: 30_000,
-            encoding: 'utf-8',
-          });
-          if (!stdout.includes('Already up to date.')) {
-            logger.info(
-              { plugin: entry, output: stdout.trim() },
-              'Plugin updated',
-            );
-            return { entry, status: 'updated' as const };
-          }
-          return { entry, status: 'noop' as const };
-        } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          logger.error(
-            { plugin: entry, error: message },
-            'Plugin update failed',
-          );
-          return { entry, status: 'failed' as const };
-        }
-      }),
-    );
-
-    const updated = results
-      .filter((r) => r.status === 'updated')
-      .map((r) => r.entry);
-    const failed = results
-      .filter((r) => r.status === 'failed')
-      .map((r) => r.entry);
-
-    if (updated.length + failed.length === 0 || !deps.notifyJid) return;
-
-    const parts: string[] = [];
-    if (updated.length > 0) parts.push(`Updated: ${updated.join(', ')}`);
-    if (failed.length > 0) parts.push(`Failed: ${failed.join(', ')}`);
-    await deps.sendMessage(
-      deps.notifyJid,
-      `Plugin update: ${parts.join(' | ')}`,
-    );
-  });
+export function stopPluginUpdater(): void {
+  if (startupHandle) {
+    clearTimeout(startupHandle);
+    startupHandle = null;
+  }
+  if (intervalHandle) {
+    clearInterval(intervalHandle);
+    intervalHandle = null;
+  }
 }

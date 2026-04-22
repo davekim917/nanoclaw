@@ -1,5 +1,10 @@
 #!/bin/bash
-# Build the NanoClaw agent container image
+# Build the NanoClaw agent container image.
+#
+# Reads one optional build flag from ../.env:
+#   INSTALL_CJK_FONTS=true   — add Chinese/Japanese/Korean fonts (~200MB)
+# setup/container.ts reads the same file, so both build paths stay in sync.
+# Callers can also override by exporting INSTALL_CJK_FONTS directly.
 
 set -e
 
@@ -10,77 +15,21 @@ IMAGE_NAME="nanoclaw-agent"
 TAG="${1:-latest}"
 CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-docker}"
 
-# Check for package updates by comparing pinned Dockerfile versions to latest
-check_package_updates() {
-  local outdated=()
+# Caller's env takes precedence; fall back to .env.
+if [ -z "${INSTALL_CJK_FONTS:-}" ] && [ -f "../.env" ]; then
+    INSTALL_CJK_FONTS="$(grep '^INSTALL_CJK_FONTS=' ../.env | tail -n1 | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d '[:space:]')"
+fi
 
-  # npm packages: match @scope/pkg@1.2.3 or pkg@1.2.3
-  while IFS= read -r line; do
-    if [[ "$line" =~ ([a-zA-Z@/._-]+)@([0-9]+\.[0-9]+\.[0-9]+) ]]; then
-      local pkg="${BASH_REMATCH[1]}"
-      local pinned="${BASH_REMATCH[2]}"
-      local latest
-      latest=$(npm view "$pkg" version 2>/dev/null) || continue
-      if [ "$pinned" != "$latest" ]; then
-        outdated+=("  $pkg: $pinned -> $latest (npm)")
-      fi
-    fi
-  done < <(grep -E '@[0-9]+\.[0-9]+\.[0-9]+' Dockerfile | grep -v '^#')
-
-  # pip packages: match pkg==1.2.3
-  while IFS= read -r line; do
-    if [[ "$line" =~ ([a-zA-Z_-]+)==([0-9]+\.[0-9]+\.[0-9]+) ]]; then
-      local pkg="${BASH_REMATCH[1]}"
-      local pinned="${BASH_REMATCH[2]}"
-      local latest
-      latest=$(pip index versions "$pkg" 2>/dev/null | head -1 | grep -oP '\((\K[0-9.]+)') || continue
-      if [ "$pinned" != "$latest" ]; then
-        outdated+=("  $pkg: $pinned -> $latest (pip)")
-      fi
-    fi
-  done < <(grep -E '==[0-9]+\.[0-9]+\.[0-9]+' Dockerfile | grep -v '^#')
-
-  # GitHub release packages: match ARG TOOL_VERSION=1.2.3
-  declare -A gh_repos=(
-    ["RENDER"]="render-oss/cli"
-    ["RAILWAY"]="railwayapp/cli"
-    ["SUPABASE"]="supabase/cli"
-  )
-  while IFS= read -r line; do
-    if [[ "$line" =~ ARG[[:space:]]+([A-Z]+)_VERSION=([0-9]+\.[0-9]+\.[0-9]+) ]]; then
-      local name="${BASH_REMATCH[1]}"
-      local pinned="${BASH_REMATCH[2]}"
-      local repo="${gh_repos[$name]}"
-      [ -z "$repo" ] && continue
-      local latest
-      latest=$(gh release list --repo "$repo" --limit 1 --json tagName --jq '.[0].tagName' 2>/dev/null | sed 's/^v//') || continue
-      if [ "$pinned" != "$latest" ]; then
-        outdated+=("  $name: $pinned -> $latest (gh:$repo)")
-      fi
-    fi
-  done < <(grep -E '^ARG [A-Z]+_VERSION=' Dockerfile)
-
-  if [ ${#outdated[@]} -gt 0 ]; then
-    echo ""
-    echo "Package updates available:"
-    for line in "${outdated[@]}"; do
-      echo "$line"
-    done
-    echo "   Update versions in container/Dockerfile, then rebuild."
-    echo ""
-  fi
-}
-
-check_package_updates
-
-# Update agent SDK to latest before building
-echo "Updating @anthropic-ai/claude-agent-sdk to latest..."
-(cd agent-runner && npm install @anthropic-ai/claude-agent-sdk@latest --save 2>&1 | tail -3)
+BUILD_ARGS=()
+if [ "${INSTALL_CJK_FONTS:-false}" = "true" ]; then
+    echo "CJK fonts: enabled (adds ~200MB)"
+    BUILD_ARGS+=(--build-arg INSTALL_CJK_FONTS=true)
+fi
 
 echo "Building NanoClaw agent container image..."
 echo "Image: ${IMAGE_NAME}:${TAG}"
 
-${CONTAINER_RUNTIME} build -t "${IMAGE_NAME}:${TAG}" .
+${CONTAINER_RUNTIME} build "${BUILD_ARGS[@]}" -t "${IMAGE_NAME}:${TAG}" .
 
 echo ""
 echo "Build complete!"

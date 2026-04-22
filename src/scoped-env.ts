@@ -1,35 +1,48 @@
 /**
- * Helpers for parsing scoped tool entries (e.g. `gmail:illysium`) and
- * resolving the corresponding credential env-var names from .env.
+ * Scoped tool + credential env helpers (ported from v1).
  *
- * `extractToolScopes` lives here — not in container-runner.ts — so that
- * smaller modules like daily-notifications.ts can use it without pulling
- * in the whole container spawn path.
+ * Container-runner reads a per-agent-group `tools` array from container.json.
+ * Each entry is either bare (`snowflake`) or scoped (`snowflake:sunday`).
+ * Scoping gates which credentials the agent's mounts expose — e.g.
+ * `snowflake:sunday` stages a filtered `connections.toml` containing only
+ * the `[connections.sunday]` section and its referenced private keys.
  *
- * `scopedEnvKey` supports two fallback modes:
- *   - 'bare':  unscoped → `${PREFIX}`,                  scoped → `${PREFIX}_${SCOPE}`
- *   - 'group': unscoped → `${PREFIX}_${GROUP}`,         scoped → `${PREFIX}_${SCOPE}`
+ * Fallback modes for `scopedEnvKey`:
+ *   - 'bare':  unscoped → `${PREFIX}`,           scoped → `${PREFIX}_${SCOPE}`
+ *   - 'group': unscoped → `${PREFIX}_${GROUP}`,  scoped → `${PREFIX}_${SCOPE}`
  *
- * GitHub uses 'bare' (legacy: no group suffix when unscoped). Render and
- * browser-auth use either pattern depending on whether the unscoped form
- * should fall back to a group-folder suffix or stay bare.
- *
- * gcloud's multi-scope mapping (one env key per scope) and slack's
- * user-defined-suffix pattern do NOT fit either shape — those callers
- * stay open-coded.
+ * GitHub uses 'bare' (no group-folder suffix when unscoped). Render / browser
+ * auth use either pattern depending on whether the unscoped form should fall
+ * back to a group-folder-keyed secret. Gcloud's multi-scope mapping and
+ * Slack's user-defined-suffix pattern don't fit either shape and stay
+ * open-coded at their call sites.
  */
-import { logger } from './logger.js';
+import { log } from './log.js';
 
-// Safe scope pattern: alphanumeric, hyphens, underscores only. Rejects path
-// traversal attempts like '../../.ssh' or absolute paths. Enforced inside
-// extractToolScopes — unsafe scopes are dropped with a logged warning.
+/**
+ * Safe scope pattern: alphanumeric + dashes + underscores only. Rejects
+ * anything that could traverse out of the expected credential dir (path
+ * separators, parent refs, shell metachars). Enforced inside
+ * `extractToolScopes` — unsafe values are dropped with a warning.
+ */
 export const SAFE_SCOPE_RE = /^[a-zA-Z0-9_-]+$/;
 
 /**
- * Extract scoped access entries from a tools array (e.g. `gmail:illysium` →
- * `['illysium']`). Returns the matched scopes and whether the tool is
- * scope-restricted (true when no bare `gmail` entry coexists alongside the
- * scoped ones). Unsafe scope values are dropped with a logged warning.
+ * Check whether a tool is enabled for a group, by bare name or by any scope.
+ * Returns true when `tools` is undefined (no filter configured → all on)
+ * so existing installs without a `tools` field keep working unchanged.
+ */
+export function isToolEnabled(tools: string[] | undefined, name: string): boolean {
+  if (!tools) return true;
+  return tools.some((t) => t === name || t.startsWith(name + ':'));
+}
+
+/**
+ * Pull scope values for a tool out of a `tools` array. A tools entry like
+ * `gmail:illysium` contributes the scope `illysium`. Scopes failing
+ * SAFE_SCOPE_RE are dropped (logged). `isScoped` is true when the caller
+ * listed ONLY scoped forms (no bare entry) — i.e. the agent does not have
+ * access to every scope.
  */
 export function extractToolScopes(
   tools: string[] | undefined,
@@ -41,7 +54,7 @@ export function extractToolScopes(
       .map((t) => t.split(':')[1])
       .filter((scope) => {
         if (!SAFE_SCOPE_RE.test(scope)) {
-          logger.warn({ scope, toolName }, 'Rejecting unsafe tool scope value');
+          log.warn('Rejecting unsafe tool scope value', { scope, toolName });
           return false;
         }
         return true;
@@ -54,14 +67,6 @@ export function extractToolScopes(
 
 export type ScopeFallback = 'bare' | 'group';
 
-/**
- * Build a scoped credential env-var name.
- *
- * - When `isScoped` is true: returns `${prefix}_${scopes[0].toUpperCase()}`.
- * - When `isScoped` is false and `fallback === 'bare'`: returns `prefix`.
- * - When `isScoped` is false and `fallback === 'group'`: returns
- *   `${prefix}_${groupScope.toUpperCase()}` (and `groupScope` is required).
- */
 export function scopedEnvKey(
   prefix: string,
   opts: {
@@ -78,25 +83,45 @@ export function scopedEnvKey(
     return prefix;
   }
   if (!opts.groupScope) {
-    throw new Error(
-      `scopedEnvKey: groupScope required when fallback='group' (prefix=${prefix})`,
-    );
+    throw new Error(`scopedEnvKey: groupScope required when fallback='group' (prefix=${prefix})`);
   }
   return `${prefix}_${opts.groupScope.toUpperCase()}`;
 }
 
-/**
- * Move a scoped secret value to its canonical generic key, deleting the
- * scoped entry. No-op when the scoped key equals the generic key (already
- * canonical) or when the scoped key is missing/empty.
- */
-export function normalizeScopedSecret(
-  secrets: Record<string, string>,
-  scopedKey: string,
-  genericKey: string,
-): void {
+export function normalizeScopedSecret(secrets: Record<string, string>, scopedKey: string, genericKey: string): void {
   if (scopedKey !== genericKey && secrets[scopedKey]) {
     secrets[genericKey] = secrets[scopedKey];
     delete secrets[scopedKey];
   }
+}
+
+/**
+ * Filter INI/TOML-style config sections. Splits on section headers (`[name]`)
+ * and keeps only allowed ones. Used for AWS `~/.aws/{credentials,config}` and
+ * Snowflake `connections.toml`.
+ *
+ * `headerTransform` lets AWS config strip the `profile ` prefix from
+ * `[profile foo]` so `foo` can be matched against the allowlist.
+ * `alwaysInclude` keeps structural sections like `[default]` that the CLI
+ * needs even when the agent is scoped to specific profiles.
+ */
+export function filterConfigSections(
+  content: string,
+  allowed: string[],
+  opts?: {
+    headerTransform?: (header: string) => string;
+    alwaysInclude?: Set<string>;
+  },
+): string {
+  const sections = content.split(/^(?=\[)/m);
+  return sections
+    .filter((section) => {
+      const match = section.match(/^\[([^\]]+)\]/);
+      if (!match) return !section.trim(); // keep blank preamble only
+      const header = match[1].trim();
+      if (opts?.alwaysInclude?.has(header)) return true;
+      const name = opts?.headerTransform?.(header) ?? header;
+      return allowed.includes(name);
+    })
+    .join('');
 }

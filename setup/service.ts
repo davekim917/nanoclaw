@@ -9,8 +9,9 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { logger } from '../src/logger.js';
+import { log } from '../src/log.js';
 import {
+  commandExists,
   getPlatform,
   getNodePath,
   getServiceManager,
@@ -26,18 +27,18 @@ export async function run(_args: string[]): Promise<void> {
   const nodePath = getNodePath();
   const homeDir = os.homedir();
 
-  logger.info({ platform, nodePath, projectRoot }, 'Setting up service');
+  log.info('Setting up service', { platform, nodePath, projectRoot });
 
   // Build first
-  logger.info('Building TypeScript');
+  log.info('Building TypeScript');
   try {
-    execSync('npm run build', {
+    execSync('pnpm run build', {
       cwd: projectRoot,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
-    logger.info('Build succeeded');
+    log.info('Build succeeded');
   } catch {
-    logger.error('Build failed');
+    log.error('Build failed');
     emitStatus('SETUP_SERVICE', {
       SERVICE_TYPE: 'unknown',
       NODE_PATH: nodePath,
@@ -113,15 +114,32 @@ function setupLaunchd(
 </plist>`;
 
   fs.writeFileSync(plistPath, plist);
-  logger.info({ plistPath }, 'Wrote launchd plist');
+  log.info('Wrote launchd plist', { plistPath });
+
+  // Unload first to force launchd to drop any cached plist and re-read from
+  // disk. Bare `launchctl load` on an already-loaded plist errors with
+  // "already loaded" and keeps the ORIGINAL plist's ProgramArguments /
+  // WorkingDirectory in memory — even if the file on disk changed. That
+  // bit us when the plist target shifted between installs: kickstart kept
+  // relaunching the old binary and the CLI socket landed in the wrong dir.
+  // unload succeeds whether or not the service was previously loaded; the
+  // failure case is "Could not find specified service" which is harmless.
+  try {
+    execSync(`launchctl unload ${JSON.stringify(plistPath)}`, {
+      stdio: 'ignore',
+    });
+    log.info('launchctl unload succeeded');
+  } catch {
+    log.info('launchctl unload noop (plist was not previously loaded)');
+  }
 
   try {
     execSync(`launchctl load ${JSON.stringify(plistPath)}`, {
       stdio: 'ignore',
     });
-    logger.info('launchctl load succeeded');
-  } catch {
-    logger.warn('launchctl load failed (may already be loaded)');
+    log.info('launchctl load succeeded');
+  } catch (err) {
+    log.error('launchctl load failed', { err });
   }
 
   // Verify
@@ -168,7 +186,7 @@ function killOrphanedProcesses(projectRoot: string): void {
     execSync(`pkill -f '${projectRoot}/dist/index\\.js' || true`, {
       stdio: 'ignore',
     });
-    logger.info('Stopped any orphaned nanoclaw processes');
+    log.info('Stopped any orphaned nanoclaw processes');
   } catch {
     // pkill not available or no orphans
   }
@@ -215,13 +233,13 @@ function setupSystemd(
   if (runningAsRoot) {
     unitPath = '/etc/systemd/system/nanoclaw.service';
     systemctlPrefix = 'systemctl';
-    logger.info('Running as root — installing system-level systemd unit');
+    log.info('Running as root — installing system-level systemd unit');
   } else {
     // Check if user-level systemd session is available
     try {
       execSync('systemctl --user daemon-reload', { stdio: 'pipe' });
     } catch {
-      logger.warn(
+      log.warn(
         'systemd user session not available — falling back to nohup wrapper',
       );
       setupNohupFallback(projectRoot, nodePath, homeDir);
@@ -253,14 +271,36 @@ StandardError=append:${projectRoot}/logs/nanoclaw.error.log
 WantedBy=${runningAsRoot ? 'multi-user.target' : 'default.target'}`;
 
   fs.writeFileSync(unitPath, unit);
-  logger.info({ unitPath }, 'Wrote systemd unit');
+  log.info('Wrote systemd unit', { unitPath });
 
-  // Detect stale docker group before starting (user systemd only)
-  const dockerGroupStale = !runningAsRoot && checkDockerGroupStale();
+  // Detect stale docker group before starting (user systemd only). The user
+  // systemd manager is a long-running process whose group list is frozen at
+  // login, so `usermod -aG docker` mid-session doesn't reach it. Rather than
+  // require the user to log out + back in, punch a POSIX ACL onto the socket
+  // that grants the current user rw directly. This is temporary — the socket
+  // is recreated by dockerd on restart (and by then the user has relogged, so
+  // normal group perms apply again).
+  let dockerGroupStale = !runningAsRoot && checkDockerGroupStale();
   if (dockerGroupStale) {
-    logger.warn(
+    log.warn(
       'Docker group not active in systemd session — user was likely added to docker group mid-session',
     );
+    if (commandExists('setfacl')) {
+      const user = execSync('whoami', { encoding: 'utf-8' }).trim();
+      try {
+        execSync(`sudo setfacl -m u:${user}:rw /var/run/docker.sock`, {
+          stdio: 'inherit',
+        });
+        log.info(
+          'Applied temporary ACL to /var/run/docker.sock (resets on docker restart or reboot)',
+        );
+        dockerGroupStale = false;
+      } catch (err) {
+        log.warn('Failed to apply setfacl workaround', { err });
+      }
+    } else {
+      log.warn('setfacl not installed — cannot apply automatic workaround');
+    }
   }
 
   // Kill orphaned nanoclaw processes to avoid channel connection conflicts
@@ -271,11 +311,11 @@ WantedBy=${runningAsRoot ? 'multi-user.target' : 'default.target'}`;
   if (!runningAsRoot) {
     try {
       execSync('loginctl enable-linger', { stdio: 'ignore' });
-      logger.info('Enabled loginctl linger for current user');
+      log.info('Enabled loginctl linger for current user');
     } catch (err) {
-      logger.warn(
-        { err },
+      log.warn(
         'loginctl enable-linger failed — service may stop on SSH logout',
+        { err },
       );
     }
   }
@@ -284,19 +324,24 @@ WantedBy=${runningAsRoot ? 'multi-user.target' : 'default.target'}`;
   try {
     execSync(`${systemctlPrefix} daemon-reload`, { stdio: 'ignore' });
   } catch (err) {
-    logger.error({ err }, 'systemctl daemon-reload failed');
+    log.error('systemctl daemon-reload failed', { err });
   }
 
   try {
     execSync(`${systemctlPrefix} enable nanoclaw`, { stdio: 'ignore' });
   } catch (err) {
-    logger.error({ err }, 'systemctl enable failed');
+    log.error('systemctl enable failed', { err });
   }
 
+  // restart (not start) so a previously-running instance picks up edits to
+  // the unit file. `start` on an active unit is a no-op, which would leave
+  // the old ExecStart / WorkingDirectory in effect even after daemon-reload.
+  // `restart` on a stopped unit is equivalent to `start`, so this is safe
+  // as a first-install path too.
   try {
-    execSync(`${systemctlPrefix} start nanoclaw`, { stdio: 'ignore' });
+    execSync(`${systemctlPrefix} restart nanoclaw`, { stdio: 'ignore' });
   } catch (err) {
-    logger.error({ err }, 'systemctl start failed');
+    log.error('systemctl restart failed', { err });
   }
 
   // Verify
@@ -326,7 +371,7 @@ function setupNohupFallback(
   nodePath: string,
   homeDir: string,
 ): void {
-  logger.warn('No systemd detected — generating nohup wrapper script');
+  log.warn('No systemd detected — generating nohup wrapper script');
 
   const wrapperPath = path.join(projectRoot, 'start-nanoclaw.sh');
   const pidFile = path.join(projectRoot, 'nanoclaw.pid');
@@ -362,7 +407,7 @@ function setupNohupFallback(
   const wrapper = lines.join('\n') + '\n';
 
   fs.writeFileSync(wrapperPath, wrapper, { mode: 0o755 });
-  logger.info({ wrapperPath }, 'Wrote nohup wrapper script');
+  log.info('Wrote nohup wrapper script', { wrapperPath });
 
   emitStatus('SETUP_SERVICE', {
     SERVICE_TYPE: 'nohup',

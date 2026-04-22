@@ -1,276 +1,106 @@
 /**
- * Attachment downloader — central utility for all channels.
- * Downloads attachments to data/attachments/{groupFolder}/{messageId}/,
- * resizes images for Claude vision, enforces size limits, and handles cleanup.
+ * Persist attachments that chat-sdk-bridge has already downloaded+base64'd
+ * onto the session workspace so the container agent can actually read
+ * them (via Read/Bash tools) instead of seeing only the filename.
+ *
+ * Chat SDK stores attachments with a base64 `data` field in the inbound
+ * content JSON. That's bloated in the session DB and invisible to
+ * Claude. This module decodes `data` → file under
+ * `data/v2-sessions/<ag>/<sess>/attachments/<msgId>/<filename>` and
+ * rewrites the attachment entry with a relative `localPath` that the
+ * agent-runner's formatter resolves to `/workspace/<localPath>`.
+ *
+ * Phase 2.6 minimum: text/document attachments land on disk for
+ * Read/Bash access. Image vision (base64 → content blocks passed to
+ * Claude directly) is a separate formatter change if we want inline
+ * image reading rather than tool-based reads.
  */
 import fs from 'fs';
 import path from 'path';
 
-import sharp from 'sharp';
+import { sessionDir } from './session-manager.js';
+import { log } from './log.js';
 
-import {
-  ATTACHMENTS_DIR,
-  ATTACHMENT_CLEANUP_HOURS,
-  DATA_DIR,
-  MAX_DOCUMENT_SIZE,
-  MAX_IMAGE_SIZE,
-} from './config.js';
-import { logger } from './logger.js';
-import { Attachment } from './types.js';
+const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024; // 25MB per file — Slack's own limit
 
-// Claude's max processing resolution — images larger than this are resized
-const MAX_IMAGE_DIMENSION = 1568;
-
-export interface DownloadRequest {
-  messageId: string;
-  groupFolder: string;
-  filename: string;
-  mimeType: string;
-  expectedSize?: number; // Pre-download size check (from platform metadata)
-  fetchFn: () => Promise<Buffer>;
-}
-
-/** Sanitize a path segment to prevent path traversal and problematic characters. */
-function sanitizePathSegment(segment: string): string {
-  const sanitized = segment
+function sanitizeSegment(segment: string, fallback: string): string {
+  const cleaned = segment
     .replace(/[/\\:*?"<>|]/g, '_')
     .replace(/\.\./g, '_')
-    .replace(/^\.+/, '_') // strip leading dots
+    .replace(/^\.+/, '_')
     .slice(0, 200);
-  return sanitized || 'unnamed';
+  return cleaned || fallback;
 }
 
-function isImageMime(mimeType: string): boolean {
-  return mimeType.startsWith('image/');
-}
-
-function isAudioMime(mimeType: string): boolean {
-  return mimeType.startsWith('audio/');
-}
-
-/**
- * Resize an image if it exceeds Claude's processing resolution.
- * Returns the resized buffer, or the original if already within limits.
- */
-async function resizeImageIfNeeded(buffer: Buffer): Promise<Buffer> {
-  try {
-    const metadata = await sharp(buffer).metadata();
-    const { width, height } = metadata;
-    if (!width || !height) return buffer;
-
-    if (width <= MAX_IMAGE_DIMENSION && height <= MAX_IMAGE_DIMENSION) {
-      return buffer;
-    }
-
-    const resized = await sharp(buffer)
-      .resize(MAX_IMAGE_DIMENSION, MAX_IMAGE_DIMENSION, { fit: 'inside' })
-      .toBuffer();
-
-    logger.debug(
-      { original: `${width}x${height}`, resizedSize: resized.length },
-      'Image resized for Claude vision',
-    );
-    return resized;
-  } catch (err) {
-    logger.warn({ err }, 'Failed to resize image, using original');
-    return buffer;
-  }
+interface AttachmentEntry {
+  type?: string;
+  name?: string;
+  filename?: string;
+  mimeType?: string;
+  size?: number;
+  data?: string; // base64
+  url?: string;
+  localPath?: string;
 }
 
 /**
- * Download an attachment and save it to the attachments directory.
- * Never throws — returns null on failure so attachment errors don't block messages.
+ * Inspect content JSON, persist any base64 attachments to disk, and
+ * mutate the content in place to replace `data` with `localPath`.
+ * Returns the new content string. Idempotent if called twice (skips
+ * entries that already have a localPath).
  */
-export async function downloadAttachment(
-  req: DownloadRequest,
-): Promise<Attachment | null> {
+export function persistInboundAttachments(
+  agentGroupId: string,
+  sessionId: string,
+  messageId: string,
+  rawContent: string,
+): string {
+  let content: Record<string, unknown>;
   try {
-    // Skip audio files (handled by voice transcription skill)
-    if (isAudioMime(req.mimeType)) {
-      logger.debug(
-        { filename: req.filename, mimeType: req.mimeType },
-        'Skipping audio attachment',
-      );
-      return null;
-    }
-
-    const maxSize = isImageMime(req.mimeType)
-      ? MAX_IMAGE_SIZE
-      : MAX_DOCUMENT_SIZE;
-
-    // Reject oversized files before downloading (prevents OOM from large uploads)
-    if (req.expectedSize && req.expectedSize > maxSize) {
-      logger.warn(
-        {
-          filename: req.filename,
-          expectedSize: req.expectedSize,
-          maxSize,
-          mimeType: req.mimeType,
-        },
-        'Attachment exceeds size limit (pre-download check), skipping',
-      );
-      return null;
-    }
-
-    let buffer = await req.fetchFn();
-
-    // Post-download size check (catches cases where expectedSize was unavailable)
-    if (buffer.length > maxSize) {
-      logger.warn(
-        {
-          filename: req.filename,
-          size: buffer.length,
-          maxSize,
-          mimeType: req.mimeType,
-        },
-        'Attachment exceeds size limit, skipping',
-      );
-      return null;
-    }
-
-    // Resize images that exceed Claude's processing resolution
-    if (isImageMime(req.mimeType)) {
-      buffer = await resizeImageIfNeeded(buffer);
-    }
-
-    // Save to data/attachments/{groupFolder}/{messageId}/
-    const safeFilename = sanitizePathSegment(req.filename);
-    const safeMessageId = sanitizePathSegment(req.messageId);
-    const dir = path.join(ATTACHMENTS_DIR, req.groupFolder, safeMessageId);
-    fs.mkdirSync(dir, { recursive: true });
-
-    // Deduplicate filenames within the same message directory.
-    // Multiple attachments can share the same name (e.g. Discord screenshots
-    // all named "image.png"). Without this, concurrent downloads overwrite
-    // each other and only the last one survives.
-    let actualFilename = safeFilename;
-    let localPath = path.join(dir, actualFilename);
-    if (fs.existsSync(localPath)) {
-      const ext = path.extname(safeFilename);
-      const base = ext ? safeFilename.slice(0, -ext.length) : safeFilename;
-      let counter = 1;
-      do {
-        actualFilename = `${base}_${counter}${ext}`;
-        localPath = path.join(dir, actualFilename);
-        counter++;
-      } while (fs.existsSync(localPath));
-    }
-    fs.writeFileSync(localPath, buffer);
-
-    // Ensure container user (uid 1000) can read the file
-    if (process.getuid?.() === 0) {
-      try {
-        fs.chownSync(dir, 1000, 1000);
-        fs.chownSync(localPath, 1000, 1000);
-      } catch {
-        // best-effort
-      }
-    }
-
-    logger.info(
-      {
-        filename: actualFilename,
-        size: buffer.length,
-        mimeType: req.mimeType,
-        group: req.groupFolder,
-      },
-      'Attachment downloaded',
-    );
-
-    return {
-      filename: actualFilename,
-      mimeType: req.mimeType,
-      localPath,
-      size: buffer.length,
-    };
-  } catch (err) {
-    logger.error(
-      { filename: req.filename, group: req.groupFolder, err },
-      'Failed to download attachment',
-    );
-    return null;
-  }
-}
-
-/**
- * Remove attachment directories older than maxAgeHours.
- * Called periodically from the session sweep.
- */
-export function cleanupOldAttachments(
-  maxAgeHours: number = ATTACHMENT_CLEANUP_HOURS,
-): void {
-  if (!fs.existsSync(ATTACHMENTS_DIR)) return;
-
-  const cutoff = Date.now() - maxAgeHours * 60 * 60 * 1000;
-  let cleaned = 0;
-
-  try {
-    for (const groupDir of fs.readdirSync(ATTACHMENTS_DIR)) {
-      const groupPath = path.join(ATTACHMENTS_DIR, groupDir);
-      if (!fs.statSync(groupPath).isDirectory()) continue;
-
-      for (const msgDir of fs.readdirSync(groupPath)) {
-        const msgPath = path.join(groupPath, msgDir);
-        if (!fs.statSync(msgPath).isDirectory()) continue;
-
-        const stat = fs.statSync(msgPath);
-        if (stat.mtimeMs < cutoff) {
-          fs.rmSync(msgPath, { recursive: true, force: true });
-          cleaned++;
-        }
-      }
-
-      // Note: do NOT remove empty group directories here.
-      // They are bind-mounted into running containers; removing and
-      // recreating them changes the inode, breaking the mount.
-    }
-  } catch (err) {
-    logger.warn({ err }, 'Error during attachment cleanup');
+    content = JSON.parse(rawContent);
+  } catch {
+    return rawContent;
   }
 
-  if (cleaned > 0) {
-    logger.info({ cleaned }, 'Cleaned up old attachments');
-  }
-}
+  const attachments = content.attachments;
+  if (!Array.isArray(attachments) || attachments.length === 0) return rawContent;
 
-/**
- * Remove outbound file staging directories older than 1 hour.
- * Safety net for files not cleaned up inline (error paths, crashes).
- */
-export function cleanupOutboundFiles(): void {
-  const ipcDir = path.join(DATA_DIR, 'ipc');
-  if (!fs.existsSync(ipcDir)) return;
+  const safeMessageId = sanitizeSegment(messageId, 'msg');
+  const baseDir = path.join(sessionDir(agentGroupId, sessionId), 'attachments', safeMessageId);
+  let anyPersisted = false;
 
-  const cutoff = Date.now() - 60 * 60 * 1000; // 1 hour
-  let cleaned = 0;
-
-  try {
-    for (const groupDir of fs.readdirSync(ipcDir)) {
-      const outboundDir = path.join(ipcDir, groupDir, 'outbound_files');
-      if (
-        !fs.existsSync(outboundDir) ||
-        !fs.statSync(outboundDir).isDirectory()
-      )
+  for (const raw of attachments as AttachmentEntry[]) {
+    if (raw.localPath || !raw.data) continue; // already saved or nothing to save
+    try {
+      const buffer = Buffer.from(raw.data, 'base64');
+      if (buffer.length === 0) continue;
+      if (buffer.length > MAX_ATTACHMENT_BYTES) {
+        log.warn('Attachment exceeds size limit, skipping', {
+          messageId,
+          name: raw.name,
+          bytes: buffer.length,
+        });
+        delete raw.data;
         continue;
-
-      for (const uuid of fs.readdirSync(outboundDir)) {
-        const uuidPath = path.join(outboundDir, uuid);
-        try {
-          const stat = fs.statSync(uuidPath);
-          if (stat.isDirectory() && stat.mtimeMs < cutoff) {
-            fs.rmSync(uuidPath, { recursive: true, force: true });
-            cleaned++;
-          }
-        } catch {
-          // skip
-        }
       }
+      fs.mkdirSync(baseDir, { recursive: true });
+      const filename = sanitizeSegment(raw.name || raw.filename || 'file', 'file');
+      const absPath = path.join(baseDir, filename);
+      fs.writeFileSync(absPath, buffer);
+      // Relative to the session root (which the container mounts as /workspace)
+      raw.localPath = path.posix.join('attachments', safeMessageId, filename);
+      delete raw.data;
+      anyPersisted = true;
+    } catch (err) {
+      log.warn('Failed to persist attachment', { messageId, name: raw.name, err });
     }
-  } catch (err) {
-    logger.warn({ err }, 'Error during outbound file cleanup');
   }
 
-  if (cleaned > 0) {
-    logger.info({ cleaned }, 'Cleaned up stale outbound files');
-  }
+  if (!anyPersisted) return rawContent;
+  log.info('Persisted attachments', {
+    sessionId,
+    messageId,
+    count: attachments.filter((a: AttachmentEntry) => a.localPath).length,
+  });
+  return JSON.stringify(content);
 }

@@ -1,9 +1,23 @@
+/**
+ * Remote Control (Phase 5.7).
+ *
+ * Thin wrapper around Claude Code's OOTB `claude remote-control` CLI.
+ * NanoClaw doesn't build anything novel here — just spawns the CLI,
+ * captures the URL it prints, and tracks the session so we can tell
+ * users "already running" on repeat requests and restore state on
+ * restart.
+ *
+ * Ported from v1 with minor v2-idiom adjustments:
+ * - logger → log
+ * - exported startRemoteControl / stopRemoteControl / getActiveSession
+ *   so the host-side system-action handler can drive them
+ */
 import { spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
 import { DATA_DIR } from './config.js';
-import { logger } from './logger.js';
+import { log } from './log.js';
 
 interface RemoteControlSession {
   pid: number;
@@ -44,10 +58,7 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
-/**
- * Restore session from disk on startup.
- * If the process is still alive, adopt it. Otherwise, clean up.
- */
+/** Restore session from disk on startup. If the process is still alive, adopt it. Otherwise clean up. */
 export function restoreRemoteControl(): void {
   let data: string;
   try {
@@ -55,15 +66,11 @@ export function restoreRemoteControl(): void {
   } catch {
     return;
   }
-
   try {
     const session: RemoteControlSession = JSON.parse(data);
     if (session.pid && isProcessAlive(session.pid)) {
       activeSession = session;
-      logger.info(
-        { pid: session.pid, url: session.url },
-        'Restored Remote Control session from previous run',
-      );
+      log.info('Restored Remote Control session', { pid: session.pid, url: session.url });
     } else {
       clearState();
     }
@@ -76,33 +83,19 @@ export function getActiveSession(): RemoteControlSession | null {
   return activeSession;
 }
 
-/** @internal — exported for testing only */
-export function _resetForTesting(): void {
-  activeSession = null;
-}
-
-/** @internal — exported for testing only */
-export function _getStateFilePath(): string {
-  return STATE_FILE;
-}
-
 export async function startRemoteControl(
   sender: string,
   chatJid: string,
   cwd: string,
 ): Promise<{ ok: true; url: string } | { ok: false; error: string }> {
   if (activeSession) {
-    // Verify the process is still alive
     if (isProcessAlive(activeSession.pid)) {
       return { ok: true, url: activeSession.url };
     }
-    // Process died — clean up and start a new one
     activeSession = null;
     clearState();
   }
 
-  // Redirect stdout/stderr to files so the process has no pipes to the parent.
-  // This prevents SIGPIPE when NanoClaw restarts.
   fs.mkdirSync(DATA_DIR, { recursive: true });
   const stdoutFd = fs.openSync(STDOUT_FILE, 'w');
   const stderrFd = fs.openSync(STDERR_FILE, 'w');
@@ -114,47 +107,38 @@ export async function startRemoteControl(
       stdio: ['pipe', stdoutFd, stderrFd],
       detached: true,
     });
-  } catch (err: any) {
+  } catch (err) {
     fs.closeSync(stdoutFd);
     fs.closeSync(stderrFd);
-    return { ok: false, error: `Failed to start: ${err.message}` };
+    const msg = err instanceof Error ? err.message : String(err);
+    return { ok: false, error: `Failed to start: ${msg}` };
   }
 
-  // Auto-accept the "Enable Remote Control?" prompt
   if (proc.stdin) {
     proc.stdin.write('y\n');
     proc.stdin.end();
   }
 
-  // Close FDs in the parent — the child inherited copies
   fs.closeSync(stdoutFd);
   fs.closeSync(stderrFd);
-
-  // Fully detach from parent
   proc.unref();
 
   const pid = proc.pid;
-  if (!pid) {
-    return { ok: false, error: 'Failed to get process PID' };
-  }
+  if (!pid) return { ok: false, error: 'Failed to get process PID' };
 
-  // Poll the stdout file for the URL
   return new Promise((resolve) => {
     const startTime = Date.now();
-
     const poll = () => {
-      // Check if process died
       if (!isProcessAlive(pid)) {
         resolve({ ok: false, error: 'Process exited before producing URL' });
         return;
       }
 
-      // Check for URL in stdout file
       let content = '';
       try {
         content = fs.readFileSync(STDOUT_FILE, 'utf-8');
       } catch {
-        // File might not have content yet
+        /* not ready */
       }
 
       const match = content.match(URL_REGEX);
@@ -168,16 +152,11 @@ export async function startRemoteControl(
         };
         activeSession = session;
         saveState(session);
-
-        logger.info(
-          { url: match[0], pid, sender, chatJid },
-          'Remote Control session started',
-        );
+        log.info('Remote Control session started', { url: match[0], pid, sender, chatJid });
         resolve({ ok: true, url: match[0] });
         return;
       }
 
-      // Timeout check
       if (Date.now() - startTime >= URL_TIMEOUT_MS) {
         try {
           process.kill(-pid, 'SIGTERM');
@@ -185,40 +164,30 @@ export async function startRemoteControl(
           try {
             process.kill(pid, 'SIGTERM');
           } catch {
-            // already dead
+            /* already dead */
           }
         }
-        resolve({
-          ok: false,
-          error: 'Timed out waiting for Remote Control URL',
-        });
+        resolve({ ok: false, error: 'Timed out waiting for Remote Control URL' });
         return;
       }
 
       setTimeout(poll, URL_POLL_MS);
     };
-
     poll();
   });
 }
 
-export function stopRemoteControl():
-  | {
-      ok: true;
-    }
-  | { ok: false; error: string } {
-  if (!activeSession) {
-    return { ok: false, error: 'No active Remote Control session' };
-  }
+export function stopRemoteControl(): { ok: true } | { ok: false; error: string } {
+  if (!activeSession) return { ok: false, error: 'No active Remote Control session' };
 
   const { pid } = activeSession;
   try {
     process.kill(pid, 'SIGTERM');
   } catch {
-    // already dead
+    /* already dead */
   }
   activeSession = null;
   clearState();
-  logger.info({ pid }, 'Remote Control session stopped');
+  log.info('Remote Control session stopped', { pid });
   return { ok: true };
 }
