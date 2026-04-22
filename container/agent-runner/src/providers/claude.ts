@@ -752,7 +752,6 @@ export class ClaudeProvider implements AgentProvider {
     // subagents so teams/sub-queries don't silently downgrade.
     const perQueryEnv: Record<string, string | undefined> = { ...this.env };
     if (input.effort) {
-      perQueryEnv.CLAUDE_CODE_USE_EFFORT = input.effort;
       perQueryEnv.CLAUDE_CODE_EFFORT_LEVEL = input.effort;
     }
     if (input.model) {

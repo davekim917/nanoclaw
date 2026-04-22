@@ -69,18 +69,6 @@ Use the `mcp__nanoclaw__send_message` tool to send a message mid-work (before yo
 
 **Outcomes, not play-by-play.** When the work is done, the final message should be about the result, not a transcript of what you did.
 
-### Internal thoughts
-
-Wrap reasoning in `<internal>...</internal>` tags to mark it as scratchpad — logged but not sent. With multiple destinations, any text outside of `<message>` blocks is also treated as scratchpad. With a single destination, only explicit `<internal>` tags are scratchpad; the rest of your response is sent.
-
-**No Recaps:** Never send the same information twice. If you already delivered content via `send_message`, wrap your final output in `<internal>` tags so it isn't re-sent.
-
-```
-<internal>Compiled all three reports, ready to summarize.</internal>
-
-Here are the key findings from the research…
-```
-
 ### Sub-agents and teammates
 
 When working as a sub-agent or teammate, only use `send_message` if instructed to by the main agent.

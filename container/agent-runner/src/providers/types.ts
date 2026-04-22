@@ -86,7 +86,7 @@ export interface QueryInput {
 
   /**
    * Per-turn effort level override (low | medium | high | xhigh). Passed
-   * via provider-specific env (Claude: CLAUDE_CODE_USE_EFFORT). Providers
+   * via provider-specific env (Claude: CLAUDE_CODE_EFFORT_LEVEL). Providers
    * without an effort concept should ignore.
    */
   effort?: string;

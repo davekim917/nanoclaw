@@ -100,12 +100,25 @@ const SECRET_SHAPE_PATTERNS: ReadonlyArray<[RegExp, string]> = [
   [/\bglpat-[A-Za-z0-9_-]+\b/g, '<redacted>'],
   // JWTs (three base64url segments joined by dots)
   [/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, '<redacted>'],
-  // High-entropy opaque tokens: ≥40 chars of alphanumeric + token punctuation.
-  // Threshold above UUID length (36) to avoid redacting OpenTelemetry trace
-  // IDs and dbt node uuids that agents legitimately display.
-  [/\b[A-Za-z0-9_+/=-]{40,}\b/g, '<redacted>'],
 ];
 
+/**
+ * No high-entropy catch-all. Previous iterations used length thresholds
+ * (±composition heuristics) to catch unknown opaque tokens — but every
+ * variant destroyed legitimate long identifiers (dbt model names,
+ * Snowflake table names, content-addressed digests, trace IDs). The
+ * false-positive rate is inherent to pattern-matching against natural
+ * language, and tightening the heuristic only shifted which identifiers
+ * get eaten.
+ *
+ * Accepted residual risk: a token from a vendor we haven't added a
+ * prefix pattern for may slip through. The fix when that happens is a
+ * one-line prefix rule here + in src/secret-scrubber.ts, NOT a heuristic.
+ * OneCLI proxy (Layer 1) + vendor prefixes (above) + contextual patterns
+ * (Authorization:, -u, ?api_key=) + .env-value registry on the host are
+ * the real defenses. Re-adding any form of length-only catch-all is a
+ * regression.
+ */
 function scrubSecretShapes(s: string): string {
   let out = s;
   for (const [re, repl] of SECRET_SHAPE_PATTERNS) {

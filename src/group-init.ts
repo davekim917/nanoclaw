@@ -47,7 +47,6 @@ const REQUIRED_ENV: Record<string, string> = {
   // container.json `effort` field (planned). `medium` is a cost-balanced
   // default for general conversational use.
   CLAUDE_CODE_EFFORT_LEVEL: 'medium',
-  CLAUDE_CODE_USE_EFFORT: 'medium',
 };
 
 // Required top-level settings. Merged into existing settings.json

@@ -20,14 +20,24 @@ describe('secret-scrubber', () => {
     expect(scrubSecrets(`jwt ${jwt} end`)).toBe('jwt [REDACTED] end');
   });
 
-  it('scrubs high-entropy opaque tokens ≥40 chars', () => {
-    const fakeToken = 'A'.repeat(45);
-    expect(scrubSecrets(`tok ${fakeToken} end`)).toBe('tok [REDACTED] end');
+  // No length-based catch-all: identifiers are preserved even when long.
+  // Novel-vendor opaque tokens without a prefix pattern are accepted
+  // residual risk; the fix when one shows up is a one-line prefix rule.
+  it('does NOT scrub long snake_case identifiers (dbt/table names)', () => {
+    const tbl = 'fct_customer_breakback_allocation_by_market_parent_sku_customer';
+    expect(scrubSecrets(`Building ${tbl} as a hybrid table`)).toBe(`Building ${tbl} as a hybrid table`);
   });
 
-  it('does NOT scrub UUIDs (36 chars) — below the entropy threshold', () => {
+  it('does NOT scrub long SCREAMING_SNAKE identifiers', () => {
+    const tbl = 'CUSTOMER_BREAKBACK_ALLOCATION_BY_MARKET_PARENT_SKU';
+    expect(scrubSecrets(`Target: ${tbl} done`)).toBe(`Target: ${tbl} done`);
+  });
+
+  it('does NOT scrub UUIDs, SHAs, digests, or random mixed-case identifiers', () => {
     const uuid = '550e8400-e29b-41d4-a716-446655440000';
-    expect(scrubSecrets(`uuid ${uuid} end`)).toBe(`uuid ${uuid} end`);
+    const sha = 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2';
+    const digest = 'sha256:aB3cD4eF5gH6iJ7kL8mN9oP0qR1sT2uV3wX4yZ';
+    expect(scrubSecrets(`${uuid} ${sha} ${digest}`)).toBe(`${uuid} ${sha} ${digest}`);
   });
 
   it('scrubs URL query param secrets', () => {

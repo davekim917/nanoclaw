@@ -71,6 +71,12 @@ describe('sanitizeBashLabel', () => {
     expect(sanitizeBashLabel('jq -r .text sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789')).toContain('<redacted>');
   });
 
+  test('long identifiers (digests, random mixed-case) are NOT redacted', () => {
+    expect(sanitizeBashLabel('dbt build --select sha256_aB3cD4eF5gH6iJ7kL8mN9oP0qR1sT2uV3wX4yZ5a')).toContain(
+      'sha256_aB3cD4eF5gH6iJ7kL8mN9oP0qR1sT2uV3wX4yZ5a',
+    );
+  });
+
   test('URL query param secrets', () => {
     // curl is risky, so this becomes binary only anyway; but the scrub still runs if it ever escapes.
     expect(sanitizeBashLabel('curl https://api.example.com/foo?api_key=xxx&other=ok')).toBe('Running: curl');
@@ -83,6 +89,18 @@ describe('sanitizeBashLabel', () => {
     expect(out.endsWith('…')).toBe(true);
     expect(out.length).toBeLessThanOrEqual(110);
     expect(out.startsWith('Running: dbt build')).toBe(true);
+  });
+
+  test('long snake_case dbt model names are NOT redacted', () => {
+    expect(
+      sanitizeBashLabel('dbt build --select fct_customer_breakback_allocation_by_market_parent_sku'),
+    ).toContain('fct_customer_breakback_allocation_by_market_parent_sku');
+  });
+
+  test('long SCREAMING_SNAKE table names are NOT redacted', () => {
+    expect(sanitizeBashLabel('dbt run --vars TABLE=CUSTOMER_BREAKBACK_ALLOCATION_BY_MARKET_PARENT_SKU')).toContain(
+      'CUSTOMER_BREAKBACK_ALLOCATION_BY_MARKET_PARENT_SKU',
+    );
   });
 
   test('unknown binary: conservative binary + subcommand only', () => {

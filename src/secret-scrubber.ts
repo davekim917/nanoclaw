@@ -116,18 +116,22 @@ const SECRET_SHAPE_PATTERNS: ReadonlyArray<[RegExp, string]> = [
   [/Authorization:\s*(?:Bearer|Basic|Digest)\s+[^\s'"]+/gi, 'Authorization: [REDACTED]'],
   [/-H\s+['"]?(?:X-API-Key|X-Auth-Token|X-Access-Token|Api-Key|X-Token)[:=]\s*[^'"\s]+['"]?/gi, '-H [REDACTED]'],
   [/(?:-u|--user)\s+[^:\s]+:[^\s]+/g, '-u [REDACTED]'],
-  [
-    /([?&])(api[_-]?key|token|access[_-]?token|password|passwd|pwd|auth|sig|signature)=[^&\s"'`]+/gi,
-    '$1$2=[REDACTED]',
-  ],
+  [/([?&])(api[_-]?key|token|access[_-]?token|password|passwd|pwd|auth|sig|signature)=[^&\s"'`]+/gi, '$1$2=[REDACTED]'],
   [/\bsk-(?:ant-)?[A-Za-z0-9_-]{20,}\b/g, '[REDACTED]'],
   [/\bxox[abpr]-[A-Za-z0-9-]+\b/g, '[REDACTED]'],
   [/\bghp_[A-Za-z0-9]+\b/g, '[REDACTED]'],
   [/\bglpat-[A-Za-z0-9_-]+\b/g, '[REDACTED]'],
   [/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, '[REDACTED]'],
-  [/\b[A-Za-z0-9_+/=-]{40,}\b/g, '[REDACTED]'],
 ];
 
+/**
+ * No high-entropy catch-all — every iteration of length/composition
+ * heuristics destroyed legitimate identifiers (dbt models, Snowflake
+ * tables, content-addressed digests, trace IDs). Scrubbing is
+ * structural: prefixes + contextual patterns + .env values. Novel-vendor
+ * tokens are an accepted residual risk; the fix is a one-line prefix
+ * addition, not a heuristic. See bash-label.ts for the mirrored rationale.
+ */
 function scrubSecretShapes(text: string): string {
   let out = text;
   for (const [re, repl] of SECRET_SHAPE_PATTERNS) {
