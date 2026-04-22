@@ -100,8 +100,10 @@ export interface SessionServicesSnapshot {
   services: Array<{
     /** Human label, e.g. "Google Workspace". */
     name: string;
-    /** CLI binary the agent invokes. */
+    /** CLI binary the agent invokes. Omitted for MCP-only services. */
     cli?: string;
+    /** MCP tool namespace (e.g. `mcp__exa__*`). Used for usage-guided entries. */
+    mcpNamespace?: string;
     /** Tool names in container.json.tools that imply this service. */
     declaredTools: string[];
     /** Scope names parsed from tool entries (e.g. ['illysium','support-illysium']). */
@@ -110,6 +112,12 @@ export interface SessionServicesSnapshot {
     credentialPaths: string[];
     /** Concise activation instruction for the CLI, if any. */
     activation?: string;
+    /**
+     * When-to-use guidance for services where the gap is "agent doesn't
+     * reach for the tool" rather than "agent can't authenticate". Populated
+     * for exa, granola, etc. where there's no scope/account choice.
+     */
+    useFor?: string;
   }>;
 }
 
@@ -166,9 +174,49 @@ function builtinPlugins(): string[] {
  * it's running in — and how to activate the CLI when the CLI's own
  * auth-status check is blind (gws is the classic case).
  */
+/** Mirror of container-runner.ts resolveScopedEnv — duplicated to avoid cross-module coupling. */
+function resolveScopedEnvVar(baseName: string, folder: string): { name: string; set: boolean } {
+  const conv = `${baseName}_${folder.toUpperCase().replace(/-/g, '_')}`;
+  if (process.env[conv]) return { name: conv, set: true };
+  if (process.env[baseName]) return { name: baseName, set: true };
+  return { name: baseName, set: false };
+}
+
+/** Extract section headers from an INI-like file. Used for aws credentials + snowflake connections.toml. */
+function iniSections(absPath: string): string[] {
+  try {
+    const content = fs.readFileSync(absPath, 'utf-8');
+    const names: string[] = [];
+    for (const line of content.split('\n')) {
+      const m = line.match(/^\s*\[([^\]]+)\]/);
+      if (m) names.push(m[1].trim());
+    }
+    return names;
+  } catch {
+    return [];
+  }
+}
+
+/** Top-level keys in a dbt profiles.yml (or any simple YAML keyed at col 0). */
+function yamlTopLevelKeys(absPath: string): string[] {
+  try {
+    const content = fs.readFileSync(absPath, 'utf-8');
+    const names: string[] = [];
+    for (const line of content.split('\n')) {
+      const m = line.match(/^([a-zA-Z0-9_-]+):\s*$/);
+      if (m) names.push(m[1]);
+    }
+    return names;
+  } catch {
+    return [];
+  }
+}
+
 function buildSessionServicesSnapshot(agentGroupId: string): SessionServicesSnapshot {
   const ag = getAgentGroup(agentGroupId);
-  const tools = ag ? readContainerConfig(ag.folder).tools : undefined;
+  const folder = ag?.folder ?? '';
+  const cfg = ag ? readContainerConfig(ag.folder) : undefined;
+  const tools = cfg?.tools;
 
   const listAccounts = (absDir: string): string[] => {
     try {
@@ -180,6 +228,19 @@ function buildSessionServicesSnapshot(agentGroupId: string): SessionServicesSnap
     } catch {
       return [];
     }
+  };
+
+  const declared = (names: string[]): boolean => {
+    if (!tools) return false; // unrestricted → don't speculate per-service
+    return tools.some((t) => names.includes(t) || names.some((n) => t.startsWith(`${n}:`)));
+  };
+  const declaredMatchingTools = (names: string[]): string[] => {
+    if (!tools) return [];
+    return names.filter((n) => tools.some((t) => t === n || t.startsWith(`${n}:`)));
+  };
+  const scopeIntersect = (toolName: string, available: string[]): string[] => {
+    const scopes = extractToolScopes(tools, toolName).scopes;
+    return scopes.length === 0 ? available : available.filter((a) => scopes.includes(a));
   };
 
   const services: SessionServicesSnapshot['services'] = [];
@@ -208,6 +269,120 @@ function buildSessionServicesSnapshot(agentGroupId: string): SessionServicesSnap
         effective.length > 0
           ? `export GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=/home/node/.config/gws/accounts/<name>.json (valid names: ${effective.join(', ')}). Verify with \`gws auth status\` — WITHOUT this env var gws reports auth_method: none even though creds are mounted.`
           : 'no authenticated account files found in /home/node/.config/gws/accounts/',
+    });
+  }
+
+  // Snowflake — connection names live in connections.toml; scope suffix is the
+  // connection the agent passes to `snow -c <name>`.
+  if (declared(['snowflake'])) {
+    const connsPath = path.join(os.homedir(), '.snowflake', 'connections.toml');
+    const all = iniSections(connsPath);
+    const effective = scopeIntersect('snowflake', all);
+    services.push({
+      name: 'Snowflake',
+      cli: 'snow',
+      declaredTools: declaredMatchingTools(['snowflake']),
+      scopes: effective,
+      credentialPaths: ['/home/node/.snowflake/connections.toml'],
+      activation:
+        effective.length > 0
+          ? `snow sql -q "SELECT ..." -c <connection>. Valid connections in this session: ${effective.join(', ')}.`
+          : 'no matching connections found in connections.toml',
+    });
+  }
+
+  // AWS — profile names from ~/.aws/credentials; scope suffix is --profile.
+  if (declared(['aws'])) {
+    const credsPath = path.join(os.homedir(), '.aws', 'credentials');
+    const all = iniSections(credsPath).filter((n) => n !== 'default');
+    const effective = scopeIntersect('aws', all);
+    services.push({
+      name: 'AWS',
+      cli: 'aws',
+      declaredTools: declaredMatchingTools(['aws']),
+      scopes: effective,
+      credentialPaths: ['/home/node/.aws/credentials'],
+      activation:
+        effective.length > 0
+          ? `aws --profile <name> <command>. Valid profiles in this session: ${effective.join(', ')}. Verify with \`aws sts get-caller-identity --profile <name>\`.`
+          : 'aws credentials mounted but no matching scoped profiles found',
+    });
+  }
+
+  // dbt — profile names from ~/.dbt/profiles.yml top-level keys; scope suffix
+  // is --profile.
+  if (declared(['dbt'])) {
+    const profilesPath = path.join(os.homedir(), '.dbt', 'profiles.yml');
+    const all = yamlTopLevelKeys(profilesPath);
+    const effective = scopeIntersect('dbt', all);
+    services.push({
+      name: 'dbt',
+      cli: 'dbt',
+      declaredTools: declaredMatchingTools(['dbt']),
+      scopes: effective,
+      credentialPaths: ['/home/node/.dbt/profiles.yml'],
+      activation:
+        effective.length > 0
+          ? `dbt run --profile <name> --project-dir <path> (also compile/test/build). Valid profiles in this session: ${effective.join(', ')}.`
+          : 'profiles.yml mounted but no matching scoped profiles found',
+    });
+  }
+
+  // GitHub — env-var-scoped. Host resolves GITHUB_TOKEN_<FOLDER> at spawn and
+  // forwards as GITHUB_TOKEN; the scoped var may also be visible in-container
+  // depending on the forwarding loop. We report which env name the host would
+  // have picked.
+  if (declared(['github'])) {
+    const tokenEnvName = cfg?.githubTokenEnv ?? null;
+    const resolved = tokenEnvName && process.env[tokenEnvName]
+      ? { name: tokenEnvName, set: true }
+      : resolveScopedEnvVar('GITHUB_TOKEN', folder);
+    const scopeList = extractToolScopes(tools, 'github').scopes;
+    services.push({
+      name: 'GitHub',
+      cli: 'gh',
+      declaredTools: declaredMatchingTools(['github']),
+      scopes: scopeList,
+      credentialPaths: [],
+      activation: resolved.set
+        ? `\`gh\` and \`git\` both pre-authenticated via \`GITHUB_TOKEN\` (resolved from host env \`${resolved.name}\`). \`gh repo view\`, \`gh pr create\`, \`git push\` all work directly. DO NOT run \`gh auth login\`.`
+        : `GitHub scoped tool declared but no token set at host env ${tokenEnvName ?? 'GITHUB_TOKEN_<folder>'} or fallback GITHUB_TOKEN — ask Dave.`,
+    });
+  }
+
+  // Render — env-var-scoped (RENDER_API_KEY + RENDER_WORKSPACE_ID); also lists
+  // the scoped PG/Redis URL env vars the host has forwarded.
+  if (declared(['render'])) {
+    const apiKey = resolveScopedEnvVar('RENDER_API_KEY', folder);
+    const workspace = resolveScopedEnvVar('RENDER_WORKSPACE_ID', folder);
+    const folderTok = folder.toUpperCase().replace(/-/g, '_');
+    const scopedDbEnv = Object.keys(process.env)
+      .filter((k) => (k.startsWith('RENDER_PG_') || k.startsWith('RENDER_REDIS_URL_')) && k.includes(`_${folderTok}_`))
+      .sort();
+    const scopeList = extractToolScopes(tools, 'render').scopes;
+    services.push({
+      name: 'Render',
+      cli: 'render',
+      declaredTools: declaredMatchingTools(['render']),
+      scopes: scopeList,
+      credentialPaths: [],
+      activation: apiKey.set
+        ? `\`render\` CLI authenticated via \`RENDER_API_KEY\` (from host env \`${apiKey.name}\`${workspace.set ? `, workspace via \`${workspace.name}\`` : ''}). Common: \`render services -o json\`, \`render logs --service-id <id>\`, \`render psql --service-id <pg-id>\`.${scopedDbEnv.length > 0 ? ` Scoped DB URLs also injected as env vars: ${scopedDbEnv.join(', ')}.` : ''}`
+        : `render tool declared but RENDER_API_KEY not set at host — ask Dave.`,
+    });
+  }
+
+  // Exa — usage-guided, not auth-probed. Single EXA_API_KEY, no scope picker;
+  // the gap is "agent doesn't reach for exa", not "agent can't authenticate".
+  if (declared(['exa'])) {
+    services.push({
+      name: 'Exa',
+      mcpNamespace: 'mcp__exa__*',
+      declaredTools: declaredMatchingTools(['exa']),
+      scopes: [],
+      credentialPaths: [],
+      useFor:
+        'Web search, research, and code context. Prefer exa over ad-hoc WebSearch/WebFetch for: web search (`mcp__exa__web_search_exa`), company research (`mcp__exa__company_research_exa`), people search (`mcp__exa__people_search_exa`), deep research (`mcp__exa__deep_researcher_start` then `_check`), code context from public repos (`mcp__exa__get_code_context_exa`), crawling specific URLs (`mcp__exa__crawling_exa`).',
     });
   }
 
