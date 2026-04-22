@@ -120,13 +120,21 @@ export function stopHostSweep(): void {
 async function sweep(): Promise<void> {
   if (!running) return;
 
+  let sessions: Session[] = [];
   try {
-    const sessions = getActiveSessions();
-    for (const session of sessions) {
-      await sweepSession(session);
-    }
+    sessions = getActiveSessions();
   } catch (err) {
-    log.error('Host sweep error', { err });
+    log.error('Host sweep: failed to load active sessions', { err });
+  }
+
+  // Isolate failures per-session — a throw from one stuck session's
+  // cleanup must not skip every later session for the rest of the tick.
+  for (const session of sessions) {
+    try {
+      await sweepSession(session);
+    } catch (err) {
+      log.error('Host sweep error', { err, sessionId: session.id });
+    }
   }
 
   setTimeout(sweep, SWEEP_INTERVAL_MS);
@@ -247,9 +255,6 @@ function resetStuckProcessingRows(
 ): void {
   const claims = getProcessingClaims(outDb);
   const respondedStmt = outDb.prepare('SELECT 1 FROM messages_out WHERE in_reply_to = ? LIMIT 1');
-  const markCompletedInAckStmt = outDb.prepare(
-    "INSERT OR REPLACE INTO processing_ack (message_id, status, status_changed) VALUES (?, 'completed', datetime('now'))",
-  );
   const markCompletedInboundStmt = inDb.prepare(
     "UPDATE messages_in SET status = 'completed' WHERE id = ? AND status = 'pending'",
   );
@@ -262,10 +267,15 @@ function resetStuckProcessingRows(
     // messages_out, the previous container death happened after the reply
     // was written but before the mark-completed step. Retrying would
     // re-invoke the agent on an input it has already answered → duplicate
-    // replies to the user. Backfill the completed state and move on.
+    // replies to the user. Backfill the completed state on the host-owned
+    // inbound.db and move on. The matching processing_ack row in outbound.db
+    // stays 'processing' — harmless, because getPendingMessages on next wake
+    // filters pending inputs against messages_out.in_reply_to too, so it
+    // won't re-dispatch an already-answered input. Writing to outbound.db
+    // here would violate the one-writer invariant (host reads outbound,
+    // container writes) and the readonly handle would throw.
     const responded = respondedStmt.get(msg.id);
     if (responded) {
-      markCompletedInAckStmt.run(msg.id);
       markCompletedInboundStmt.run(msg.id);
       log.info('Reset skipped — response already written; marking completed', {
         messageId: msg.id,
