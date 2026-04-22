@@ -371,9 +371,20 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       const content = message.content as Record<string, unknown>;
 
       if (content.operation === 'edit' && content.messageId) {
-        await adapter.editMessage(tid, content.messageId as string, {
-          markdown: transformText((content.text as string) || (content.markdown as string) || ''),
-        });
+        const editText = transformText((content.text as string) || (content.markdown as string) || '');
+        // If the edit replaces a status-in-place with a long final answer
+        // (delivery.ts morphs the first chat reply of a turn into an edit of
+        // the in-flight progress message), split the same way as a fresh post:
+        // first chunk edits the existing bubble, remaining chunks post as new
+        // messages so nothing silently truncates at the adapter's limit.
+        const chunks =
+          config.maxTextLength && editText.length > config.maxTextLength
+            ? splitForLimit(editText, config.maxTextLength)
+            : [editText];
+        await adapter.editMessage(tid, content.messageId as string, { markdown: chunks[0] });
+        for (let i = 1; i < chunks.length; i++) {
+          await adapter.postMessage(tid, { markdown: chunks[i] });
+        }
         return;
       }
 
