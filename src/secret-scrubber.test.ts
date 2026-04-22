@@ -8,8 +8,32 @@ import { _clearSecretsForTest, registerSecrets, registerSecretsFromEnv, scrubSec
 describe('secret-scrubber', () => {
   beforeEach(() => _clearSecretsForTest());
 
-  it('returns text unchanged when nothing is registered', () => {
-    expect(scrubSecrets('My API key is xoxb-secretvalue')).toBe('My API key is xoxb-secretvalue');
+  it('returns text unchanged when nothing is registered AND no secret shapes match', () => {
+    expect(scrubSecrets('My regular sentence with no secrets.')).toBe('My regular sentence with no secrets.');
+  });
+
+  it('scrubs secret shapes even when .env registry is empty', () => {
+    expect(scrubSecrets('Authorization: Bearer abcdefghijklmnop ok')).toBe('Authorization: [REDACTED] ok');
+    expect(scrubSecrets('tok ghp_1234567890abcdefghij end')).toBe('tok [REDACTED] end');
+    expect(scrubSecrets('tok xoxb-1234-abcd-efgh end')).toBe('tok [REDACTED] end');
+    const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abc123def456';
+    expect(scrubSecrets(`jwt ${jwt} end`)).toBe('jwt [REDACTED] end');
+  });
+
+  it('scrubs high-entropy opaque tokens ≥40 chars', () => {
+    const fakeToken = 'A'.repeat(45);
+    expect(scrubSecrets(`tok ${fakeToken} end`)).toBe('tok [REDACTED] end');
+  });
+
+  it('does NOT scrub UUIDs (36 chars) — below the entropy threshold', () => {
+    const uuid = '550e8400-e29b-41d4-a716-446655440000';
+    expect(scrubSecrets(`uuid ${uuid} end`)).toBe(`uuid ${uuid} end`);
+  });
+
+  it('scrubs URL query param secrets', () => {
+    expect(scrubSecrets('https://api.example.com/v1?api_key=xxx&other=ok')).toBe(
+      'https://api.example.com/v1?api_key=[REDACTED]&other=ok',
+    );
   });
 
   it('redacts a registered value', () => {

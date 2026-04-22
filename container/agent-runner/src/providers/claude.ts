@@ -13,6 +13,7 @@ import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/conn
 import { registerProvider } from './provider-registry.js';
 import type { AgentProvider, AgentQuery, McpServerConfig, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
 import { autoCommitDirtyWorktrees } from '../worktree-autosave.js';
+import { sanitizeBashLabel } from './bash-label.js';
 
 function log(msg: string): void {
   console.error(`[claude-provider] ${msg}`);
@@ -31,9 +32,10 @@ function deriveToolProgressLabel(message: unknown): string | null {
     const b = block as { type?: string; name?: string; input?: Record<string, unknown> };
     if (b.type !== 'tool_use') continue;
     const name = b.name ?? 'tool';
+    const input = b.input ?? {};
     switch (name) {
       case 'Bash':
-        return 'Running command';
+        return sanitizeBashLabel(typeof input.command === 'string' ? input.command : '');
       case 'Read':
       case 'Glob':
         return `Reading files`;

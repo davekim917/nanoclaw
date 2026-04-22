@@ -101,17 +101,57 @@ export function registerSecretsFromEnv(envPath?: string): number {
 }
 
 /**
- * Replace any registered secret values in text with `[REDACTED]`.
- * Fast no-op when nothing is registered.
+ * Secret-shape patterns. Catches tokens that aren't in `.env`:
+ * OneCLI-injected API tokens (never touch disk), runtime-fetched OAuth,
+ * bearer tokens appearing in response bodies that an agent echoes back,
+ * literal secrets inlined into SQL/URL strings.
+ *
+ * Mirrored in container/agent-runner/src/providers/bash-label.ts
+ * (the container is Bun and can't import host code). When updating one
+ * list, update the other — the two form the label-vs-outbound defense
+ * pair: bash-label sanitizes at the source, scrubSecrets backstops at
+ * delivery.
+ */
+const SECRET_SHAPE_PATTERNS: ReadonlyArray<[RegExp, string]> = [
+  [/Authorization:\s*(?:Bearer|Basic|Digest)\s+[^\s'"]+/gi, 'Authorization: [REDACTED]'],
+  [/-H\s+['"]?(?:X-API-Key|X-Auth-Token|X-Access-Token|Api-Key|X-Token)[:=]\s*[^'"\s]+['"]?/gi, '-H [REDACTED]'],
+  [/(?:-u|--user)\s+[^:\s]+:[^\s]+/g, '-u [REDACTED]'],
+  [
+    /([?&])(api[_-]?key|token|access[_-]?token|password|passwd|pwd|auth|sig|signature)=[^&\s"'`]+/gi,
+    '$1$2=[REDACTED]',
+  ],
+  [/\bsk-(?:ant-)?[A-Za-z0-9_-]{20,}\b/g, '[REDACTED]'],
+  [/\bxox[abpr]-[A-Za-z0-9-]+\b/g, '[REDACTED]'],
+  [/\bghp_[A-Za-z0-9]+\b/g, '[REDACTED]'],
+  [/\bglpat-[A-Za-z0-9_-]+\b/g, '[REDACTED]'],
+  [/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\b/g, '[REDACTED]'],
+  [/\b[A-Za-z0-9_+/=-]{40,}\b/g, '[REDACTED]'],
+];
+
+function scrubSecretShapes(text: string): string {
+  let out = text;
+  for (const [re, repl] of SECRET_SHAPE_PATTERNS) {
+    out = out.replace(re, repl);
+  }
+  return out;
+}
+
+/**
+ * Replace registered .env secrets AND generic secret-shaped tokens
+ * (bearer headers, known vendor prefixes, JWTs, high-entropy opaque
+ * tokens). Fast no-op when text is empty.
  */
 export function scrubSecrets(text: string): string {
-  if (secretValues.size === 0 || !text) return text;
+  if (!text) return text;
   let result = text;
-  for (const secret of secretValues) {
-    if (result.includes(secret)) {
-      result = result.replaceAll(secret, '[REDACTED]');
+  if (secretValues.size > 0) {
+    for (const secret of secretValues) {
+      if (result.includes(secret)) {
+        result = result.replaceAll(secret, '[REDACTED]');
+      }
     }
   }
+  result = scrubSecretShapes(result);
   return result;
 }
 
