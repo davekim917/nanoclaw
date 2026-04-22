@@ -393,7 +393,14 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
     const agentGroup = getAgentGroup(agent.agent_group_id);
     if (!agentGroup) continue;
 
-    const engages = evaluateEngage(agent, messageText, isMention, mg, event.threadId);
+    const engages = evaluateEngage(
+      agent,
+      messageText,
+      isMention,
+      mg,
+      event.threadId,
+      adapter?.supportsThreads === true,
+    );
 
     const accessOk = engages && (!accessGate || accessGate(event, userId, mg, agent.agent_group_id).allowed);
     const scopeOk = engages && (!senderScopeGate || senderScopeGate(event, userId, mg, agent).allowed);
@@ -475,6 +482,7 @@ function evaluateEngage(
   isMention: boolean,
   mg: MessagingGroup,
   threadId: string | null,
+  adapterSupportsThreads: boolean,
 ): boolean {
   switch (agent.engage_mode) {
     case 'pattern': {
@@ -491,9 +499,13 @@ function evaluateEngage(
       return isMention;
     case 'mention-sticky': {
       if (isMention) return true;
-      // Sticky follow-up: session already exists for this (agent, mg, thread)
-      // — the thread was activated before, keep firing.
       if (mg.is_group === 0) return false; // DMs never use mention-sticky sensibly
+      // Threaded adapters (Discord, Slack): channel-root messages have
+      // threadId=null and must not stick — we require a fresh @mention to
+      // start a new thread. Only messages inside an existing thread carry
+      // the sticky session. Non-threaded adapters (Telegram group chat etc.)
+      // always have threadId=null; for them, session-existence IS the stick.
+      if (adapterSupportsThreads && threadId === null) return false;
       const existing = findSessionForAgent(agent.agent_group_id, mg.id, threadId);
       return existing !== undefined;
     }
