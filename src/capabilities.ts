@@ -373,9 +373,10 @@ function buildSessionServicesSnapshot(agentGroupId: string): SessionServicesSnap
     });
   }
 
-  // Exa — usage-guided, not auth-probed. Single EXA_API_KEY, no scope picker;
-  // the gap is "agent doesn't reach for exa", not "agent can't authenticate".
-  if (declared(['exa'])) {
+  // Exa — universal. Always shown (gated only on EXA_API_KEY for accurate
+  // status); container-runner injects the MCP unconditionally when the key
+  // is set, so the agent has it in every group unless excluded.
+  if (process.env.EXA_API_KEY) {
     services.push({
       name: 'Exa',
       mcpNamespace: 'mcp__exa__*',
@@ -410,21 +411,29 @@ function buildSessionServicesSnapshot(agentGroupId: string): SessionServicesSnap
       'Live library / framework / SDK / API docs — React, Next.js, Prisma, Tailwind, Claude SDKs, Stripe, etc. Prefer Context7 over training-memory for: library-specific debugging, API syntax, config options, version migrations, CLI usage. Do NOT use for refactoring, business logic, or general concepts.',
   });
 
-  // Pocket — gated on `pocket` tool + POCKET_API_KEY. Personal knowledge
-  // base / memory layer accessible via MCP.
-  if (declared(['pocket'])) {
-    const hasKey = typeof process.env.POCKET_API_KEY === 'string' && process.env.POCKET_API_KEY.length > 0;
+  // Pocket — universal. Gated only on POCKET_API_KEY presence.
+  if (process.env.POCKET_API_KEY) {
     services.push({
       name: 'Pocket',
       mcpNamespace: 'mcp__pocket__*',
       declaredTools: declaredMatchingTools(['pocket']),
       scopes: [],
       credentialPaths: [],
-      useFor: hasKey
-        ? 'Personal knowledge / memory via https://public.heypocketai.com/mcp. Auth already injected via POCKET_API_KEY env (Authorization: Bearer). Use Pocket tools to save references, recall prior context, search personal knowledge.'
-        : 'pocket tool declared but POCKET_API_KEY not set at host — ask Dave.',
+      useFor:
+        'Personal knowledge / memory via https://public.heypocketai.com/mcp. Auth pre-injected (Authorization: Bearer). Use Pocket tools to save references, recall prior context, search personal knowledge.',
     });
   }
+
+  // Granola — universal. Always shown; container-runner injects unconditionally.
+  services.push({
+    name: 'Granola',
+    mcpNamespace: 'mcp__granola__*',
+    declaredTools: declaredMatchingTools(['granola']),
+    scopes: [],
+    credentialPaths: [],
+    useFor:
+      'Meeting transcripts + notes. Auth injected at the OneCLI gateway; no token visible in-container. Tools: `mcp__granola__read_meeting`, `mcp__granola__list_meetings`, etc.',
+  });
 
   return { agentGroupId, services };
 }

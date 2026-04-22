@@ -79,6 +79,16 @@ export interface ContainerConfig {
   excludePlugins?: string[];
 
   /**
+   * Named MCP servers to suppress for this group. Universal MCPs
+   * (granola, deepwiki, context7, exa, pocket) are injected by default
+   * in every container; add entries here to opt OUT per group — e.g. a
+   * client-scoped group that shouldn't see the operator's personal
+   * pocket knowledge base: `excludeMcpServers: ["pocket"]`. Names must
+   * match the MCP server key (granola/deepwiki/context7/exa/pocket).
+   */
+  excludeMcpServers?: string[];
+
+  /**
    * When true, sets `GITNEXUS_INJECT_AGENTS_MD=true` in the container so
    * GitNexus auto-injects AGENTS.md into repos the agent works on.
    * Opt-in per group; defaults off.
@@ -169,6 +179,7 @@ export function readContainerConfig(folder: string): ContainerConfig {
       additionalMounts: raw.additionalMounts ?? [],
       githubTokenEnv: raw.githubTokenEnv,
       excludePlugins: raw.excludePlugins,
+      excludeMcpServers: raw.excludeMcpServers,
       gitnexusInjectAgentsMd: raw.gitnexusInjectAgentsMd,
       ollamaAdminTools: raw.ollamaAdminTools,
       defaultModel: raw.defaultModel,

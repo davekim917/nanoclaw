@@ -1264,18 +1264,24 @@ async function buildContainerArgs(
   // pointing at OneCLI's gateway — the container never sees the token;
   // OneCLI injects the appropriate header per its registered secret
   // (e.g. `Authorization: Bearer <granola-token>` for mcp.granola.ai).
+  // Universal HTTP/stdio MCPs (deepwiki, context7, granola, exa, pocket) are
+  // ungated — always injected when the relevant key is present on the host.
+  // Per-group mcpServers from container.json are merged on top so groups can
+  // still override or add extras.
   const mcpServers: Record<string, unknown> = { ...(containerConfig.mcpServers ?? {}) };
-  if (isToolEnabled(containerConfig.tools, 'granola') && !mcpServers.granola) {
+  // Opt-out denylist. Default behavior: universal MCPs are injected in every
+  // container. A group drops any of them by naming them here in container.json:
+  //   "excludeMcpServers": ["pocket", "granola"]
+  const mcpExcluded = new Set(containerConfig.excludeMcpServers ?? []);
+  const canInject = (name: string): boolean => !mcpExcluded.has(name) && !mcpServers[name];
+
+  if (canInject('granola')) {
     mcpServers.granola = { type: 'http', url: 'https://mcp.granola.ai/mcp' };
   }
-  // DeepWiki — always-on. Public docs for any GitHub repo; no auth.
-  if (!mcpServers.deepwiki) {
+  if (canInject('deepwiki')) {
     mcpServers.deepwiki = { type: 'http', url: 'https://mcp.deepwiki.com/mcp' };
   }
-  // Context7 — always-on. Fetches up-to-date library docs (React, Next,
-  // Prisma, …). Stdio via `npx @upstash/context7-mcp`; npx is already on
-  // PATH in the container image.
-  if (!mcpServers.context7) {
+  if (canInject('context7')) {
     mcpServers.context7 = {
       type: 'stdio',
       command: 'npx',
@@ -1283,20 +1289,14 @@ async function buildContainerArgs(
       env: {},
     };
   }
-  // Exa — gated on `exa` tool + host EXA_API_KEY (loaded from .env at host
-  // startup). Header-auth: `x-api-key: <key>`. The URL carries the explicit
-  // tool subset so the agent sees the intended Exa surface.
-  if (isToolEnabled(containerConfig.tools, 'exa') && process.env.EXA_API_KEY && !mcpServers.exa) {
+  if (process.env.EXA_API_KEY && canInject('exa')) {
     mcpServers.exa = {
       type: 'http',
-      url:
-        'https://mcp.exa.ai/mcp?tools=web_search_exa,web_search_advanced_exa,get_code_context_exa,crawling_exa,company_research_exa,people_search_exa,deep_researcher_start,deep_researcher_check,deep_search_exa',
+      url: 'https://mcp.exa.ai/mcp?tools=web_search_exa,web_search_advanced_exa,get_code_context_exa,crawling_exa,company_research_exa,people_search_exa,deep_researcher_start,deep_researcher_check,deep_search_exa',
       headers: { 'x-api-key': process.env.EXA_API_KEY },
     };
   }
-  // Pocket — gated on `pocket` tool + POCKET_API_KEY in host env (.env).
-  // Header-auth: `Authorization: Bearer pk_...`.
-  if (isToolEnabled(containerConfig.tools, 'pocket') && process.env.POCKET_API_KEY && !mcpServers.pocket) {
+  if (process.env.POCKET_API_KEY && canInject('pocket')) {
     mcpServers.pocket = {
       type: 'http',
       url: 'https://public.heypocketai.com/mcp',
