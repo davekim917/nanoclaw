@@ -31,6 +31,7 @@ import {
   openOutboundDb as openOutboundDbRaw,
   upsertSessionRouting,
   insertMessage,
+  insertMessageIfAbsent,
   migrateMessagesInTable,
 } from './db/session-db.js';
 import { log } from './log.js';
@@ -374,6 +375,43 @@ export function writeSessionMessage(
     db.close();
   }
 
+  updateSession(sessionId, { last_active: new Date().toISOString() });
+}
+
+/**
+ * Batch-insert context messages into a session's inbound DB with a single
+ * open/close cycle and INSERT OR IGNORE semantics.
+ *
+ * Exists solely for thread-context injection: per-wake this can write up to
+ * 20 rows, and doing that one-at-a-time through `writeSessionMessage` means
+ * 20 separate opens, 20 transactions, and 20 central-DB last_active updates.
+ * Host-only, host-side batch — safe to coalesce because the container isn't
+ * woken until after the subsequent trigger-row write returns.
+ */
+export function writeContextMessagesBatch(
+  agentGroupId: string,
+  sessionId: string,
+  messages: Array<{
+    id: string;
+    kind: string;
+    timestamp: string;
+    platformId: string | null;
+    channelType: string | null;
+    threadId: string | null;
+    content: string;
+    trigger?: 0 | 1;
+  }>,
+): void {
+  if (messages.length === 0) return;
+  const db = openInboundDb(agentGroupId, sessionId);
+  try {
+    const tx = db.transaction((rows: typeof messages) => {
+      for (const m of rows) insertMessageIfAbsent(db, m);
+    });
+    tx(messages);
+  } finally {
+    db.close();
+  }
   updateSession(sessionId, { last_active: new Date().toISOString() });
 }
 
