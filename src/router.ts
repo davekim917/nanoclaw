@@ -33,6 +33,8 @@ import { findSessionForAgent } from './db/sessions.js';
 import { startTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { resolveSession, writeSessionMessage, writeOutboundDirect } from './session-manager.js';
+import { upsertArchiveMessage } from './message-archive.js';
+import { injectThreadContext } from './thread-context.js';
 import { maybeRenameNewThread } from './topic-title.js';
 import { wakeContainer } from './container-runner.js';
 import { getSession } from './db/sessions.js';
@@ -397,7 +399,7 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
     const scopeOk = engages && (!senderScopeGate || senderScopeGate(event, userId, mg, agent).allowed);
 
     if (engages && accessOk && scopeOk) {
-      await deliverToAgent(agent, agentGroup, mg, event, userId, adapter?.supportsThreads === true, true);
+      await deliverToAgent(agent, agentGroup, mg, event, userId, adapter?.supportsThreads === true, true, parsed);
       engagedCount++;
 
       // Mention-sticky: ask the adapter to subscribe the thread so the
@@ -421,7 +423,7 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
         });
       }
     } else if (agent.ignored_message_policy === 'accumulate') {
-      await deliverToAgent(agent, agentGroup, mg, event, userId, adapter?.supportsThreads === true, false);
+      await deliverToAgent(agent, agentGroup, mg, event, userId, adapter?.supportsThreads === true, false, parsed);
       accumulatedCount++;
     } else {
       log.debug('Message not engaged for agent (drop policy)', {
@@ -508,6 +510,7 @@ async function deliverToAgent(
   userId: string | null,
   adapterSupportsThreads: boolean,
   wake: boolean,
+  parsedContent: { text?: string; sender?: string; senderId?: string },
 ): Promise<void> {
   // Apply the adapter thread policy: threaded adapter in a group chat →
   // per-thread session regardless of wiring. agent-shared preserved (it's
@@ -524,7 +527,7 @@ async function deliverToAgent(
   // Fire-and-forget; failures log and move on. See src/topic-title.ts for
   // the why and the platform-gating (Discord only).
   if (created) {
-    const firstText = safeParseContent(event.message.content).text ?? '';
+    const firstText = parsedContent.text ?? '';
     if (firstText) maybeRenameNewThread(event.channelType, event.threadId, firstText);
   }
 
@@ -571,6 +574,33 @@ async function deliverToAgent(
     }
   }
 
+  // Gated to per-thread sessions on threaded adapters with a real thread id:
+  // shared / agent-shared already have cross-thread continuity via their
+  // session DB, and DMs / non-threaded adapters have no "prior thread"
+  // concept. Only on wake — accumulated rows are themselves context.
+  if (
+    wake &&
+    effectiveSessionMode === 'per-thread' &&
+    event.threadId !== null &&
+    adapterSupportsThreads
+  ) {
+    try {
+      injectThreadContext(
+        session,
+        {
+          channelType: deliveryAddr.channelType ?? event.channelType,
+          platformId: deliveryAddr.platformId ?? event.platformId,
+          threadId: deliveryAddr.threadId ?? event.threadId,
+        },
+        event.message.timestamp,
+      );
+    } catch (err) {
+      log.warn('Thread-context injection threw', {
+        sessionId: session.id,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
 
   writeSessionMessage(session.agent_group_id, session.id, {
     id: messageIdForAgent(event.message.id, agent.agent_group_id),
@@ -582,6 +612,36 @@ async function deliverToAgent(
     content: persistedContent,
     trigger: wake ? 1 : 0,
   });
+
+  // Mirror inbound user messages into archive.db for future-wake thread
+  // context replay. Scoped per-agent-group to match the archive's PK
+  // slicing; assistant replies are archived on delivery.ts's path.
+  if (
+    (event.message.kind === 'chat' || event.message.kind === 'chat-sdk') &&
+    parsedContent.text
+  ) {
+    try {
+      upsertArchiveMessage({
+        id: messageIdForAgent(event.message.id, agent.agent_group_id),
+        agentGroupId: agent.agent_group_id,
+        messagingGroupId: mg.id,
+        channelType: event.channelType,
+        channelName: mg.name ?? null,
+        platformId: event.platformId,
+        threadId: event.threadId,
+        role: 'user',
+        senderId: userId,
+        senderName: parsedContent.sender ?? null,
+        text: parsedContent.text,
+        sentAt: event.message.timestamp,
+      });
+    } catch (err) {
+      log.warn('Failed to archive inbound user message', {
+        sessionId: session.id,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
 
   log.info('Message routed', {
     sessionId: session.id,

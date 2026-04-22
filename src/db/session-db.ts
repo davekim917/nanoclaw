@@ -112,6 +112,34 @@ export function insertMessage(
   });
 }
 
+/**
+ * Idempotent variant: silently skips on PK collision. Used by thread-context
+ * injection where the same archive row may be re-queried across wakes if a
+ * prior watermark advance failed mid-flight.
+ */
+export function insertMessageIfAbsent(
+  db: Database.Database,
+  message: {
+    id: string;
+    kind: string;
+    timestamp: string;
+    platformId: string | null;
+    channelType: string | null;
+    threadId: string | null;
+    content: string;
+    trigger?: 0 | 1;
+  },
+): void {
+  db.prepare(
+    `INSERT OR IGNORE INTO messages_in (id, seq, kind, timestamp, status, platform_id, channel_type, thread_id, content, process_after, recurrence, series_id, trigger)
+     VALUES (@id, @seq, @kind, @timestamp, 'pending', @platformId, @channelType, @threadId, @content, NULL, NULL, @id, @trigger)`,
+  ).run({
+    ...message,
+    trigger: message.trigger ?? 1,
+    seq: nextEvenSeq(db),
+  });
+}
+
 export function countDueMessages(db: Database.Database): number {
   return (
     db

@@ -91,6 +91,17 @@ export function updateSession(
     .run(values);
 }
 
+/**
+ * Monotonic advance of the thread-context watermark. A concurrent wake that
+ * finished with an older max would otherwise clobber a newer value — the
+ * `last_archive_at < ?` guard makes the update a no-op in that case.
+ */
+export function advanceSessionArchiveWatermark(id: string, iso: string): void {
+  getDb()
+    .prepare('UPDATE sessions SET last_archive_at = ? WHERE id = ? AND (last_archive_at IS NULL OR last_archive_at < ?)')
+    .run(iso, id, iso);
+}
+
 export function deleteSession(id: string): void {
   getDb().prepare('DELETE FROM sessions WHERE id = ?').run(id);
 }

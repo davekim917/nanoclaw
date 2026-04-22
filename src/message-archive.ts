@@ -30,9 +30,21 @@ import { log } from './log.js';
 const ARCHIVE_PATH = path.join(DATA_DIR, 'archive.db');
 
 let _db: Database.Database | null = null;
+let _dbPath: string | null = null;
 
 function openDb(): Database.Database {
-  if (_db) return _db;
+  // Re-key the cache on the archive path. Under test, beforeEach wipes
+  // DATA_DIR and the previously-cached connection points at an unlinked fd;
+  // comparing paths catches the swap without requiring a test-only close API.
+  if (_db && _dbPath === ARCHIVE_PATH && fs.existsSync(ARCHIVE_PATH)) return _db;
+  if (_db) {
+    try {
+      _db.close();
+    } catch {
+      // swallow — stale handle
+    }
+    _db = null;
+  }
   fs.mkdirSync(DATA_DIR, { recursive: true });
   const db = new Database(ARCHIVE_PATH);
   // TRUNCATE (not WAL). We have one writer (host) and many cross-process
@@ -46,6 +58,7 @@ function openDb(): Database.Database {
   db.pragma('synchronous = NORMAL');
   initSchema(db);
   _db = db;
+  _dbPath = ARCHIVE_PATH;
   return db;
 }
 
@@ -223,6 +236,52 @@ export function getThreadMessages(
        LIMIT ?`,
     )
     .all(agentGroupId, channelType, platformId, threadId, threadId, limit) as Array<{
+    id: string;
+    role: string;
+    sender_name: string | null;
+    text: string;
+    sent_at: string;
+  }>;
+}
+
+/**
+ * Load thread messages that landed in a bounded window, ordered oldest-first.
+ * Used by thread-context injection to fill a session's prior-conversation
+ * context on wake. `sinceIso` is the exclusive lower bound (the session's
+ * last_archive_at watermark, or a floor-of-now-minus-window on first wake).
+ * `beforeIso` is the exclusive upper bound (the current trigger's timestamp)
+ * so we don't re-inject the trigger itself.
+ */
+export function getThreadMessagesInWindow(params: {
+  agentGroupId: string;
+  channelType: string;
+  platformId: string;
+  threadId: string | null;
+  sinceIso: string;
+  beforeIso: string;
+  limit: number;
+}): Array<{
+  id: string;
+  role: string;
+  sender_name: string | null;
+  text: string;
+  sent_at: string;
+}> {
+  const db = openDb();
+  return db
+    .prepare(
+      `SELECT id, role, sender_name, text, sent_at
+       FROM messages_archive
+       WHERE agent_group_id = @agentGroupId
+         AND channel_type = @channelType
+         AND platform_id = @platformId
+         AND (thread_id = @threadId OR (thread_id IS NULL AND @threadId IS NULL))
+         AND sent_at > @sinceIso
+         AND sent_at < @beforeIso
+       ORDER BY sent_at ASC
+       LIMIT @limit`,
+    )
+    .all(params) as Array<{
     id: string;
     role: string;
     sender_name: string | null;

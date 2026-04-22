@@ -128,6 +128,8 @@ export interface Session {
   container_status: 'running' | 'idle' | 'stopped';
   last_active: string | null;
   created_at: string;
+  /** ISO timestamp of the most recent archive row injected into this session's inbound.db. */
+  last_archive_at?: string | null;
 }
 
 // ── Session DB entities ──

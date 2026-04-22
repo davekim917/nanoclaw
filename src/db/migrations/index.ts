@@ -17,6 +17,7 @@ import { migration013 } from './013-memories.js';
 import { migration014 } from './014-channel-defaults.js';
 import { migration015 } from './015-backlog.js';
 import { migration016 } from './016-channel-tone.js';
+import { migration017 } from './017-session-last-archive-at.js';
 
 export interface Migration {
   version: number;
@@ -39,6 +40,7 @@ const migrations: Migration[] = [
   migration014,
   migration015,
   migration016,
+  migration017,
 ];
 
 export function runMigrations(db: Database.Database): void {
