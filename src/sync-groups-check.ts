@@ -65,7 +65,10 @@ function msUntilNextSchedule(hoursEt: readonly number[]): number {
     minute: '2-digit',
     second: '2-digit',
   });
-  const parts = fmt.format(now).split(':').map((p) => Number(p));
+  const parts = fmt
+    .format(now)
+    .split(':')
+    .map((p) => Number(p));
   const [h, m, s] = parts;
   const secondsNow = h * 3600 + m * 60 + s;
   let best = Number.POSITIVE_INFINITY;
