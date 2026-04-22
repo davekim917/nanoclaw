@@ -35,16 +35,10 @@ export interface ThreadContextTarget {
  * messages are strictly older so the agent sees chronological order and the
  * trigger remains the only row wearing trigger=1.
  */
-export function injectThreadContext(
-  session: Session,
-  target: ThreadContextTarget,
-  triggerTimestamp: string,
-): number {
+export function injectThreadContext(session: Session, target: ThreadContextTarget, triggerTimestamp: string): number {
   // On first wake there's no watermark — bound the look-back window so we
   // don't dump arbitrarily old history into a fresh session.
-  const sinceIso =
-    session.last_archive_at ??
-    new Date(Date.now() - FIRST_WAKE_WINDOW_MIN * 60_000).toISOString();
+  const sinceIso = session.last_archive_at ?? new Date(Date.now() - FIRST_WAKE_WINDOW_MIN * 60_000).toISOString();
 
   let rows;
   try {

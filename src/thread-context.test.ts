@@ -226,7 +226,7 @@ describe('injectThreadContext', () => {
 
     // Simulate watermark-advance failure by forcing the session's watermark
     // back to null and re-running — should INSERT OR IGNORE, not throw.
-    getDb().prepare("UPDATE sessions SET last_archive_at = NULL WHERE id = ?").run(session.id);
+    getDb().prepare('UPDATE sessions SET last_archive_at = NULL WHERE id = ?').run(session.id);
     const refreshed = getSession(session.id)!;
     expect(refreshed.last_archive_at).toBeNull();
 

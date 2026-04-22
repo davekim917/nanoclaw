@@ -578,12 +578,7 @@ async function deliverToAgent(
   // shared / agent-shared already have cross-thread continuity via their
   // session DB, and DMs / non-threaded adapters have no "prior thread"
   // concept. Only on wake — accumulated rows are themselves context.
-  if (
-    wake &&
-    effectiveSessionMode === 'per-thread' &&
-    event.threadId !== null &&
-    adapterSupportsThreads
-  ) {
+  if (wake && effectiveSessionMode === 'per-thread' && event.threadId !== null && adapterSupportsThreads) {
     try {
       injectThreadContext(
         session,
@@ -616,10 +611,7 @@ async function deliverToAgent(
   // Mirror inbound user messages into archive.db for future-wake thread
   // context replay. Scoped per-agent-group to match the archive's PK
   // slicing; assistant replies are archived on delivery.ts's path.
-  if (
-    (event.message.kind === 'chat' || event.message.kind === 'chat-sdk') &&
-    parsedContent.text
-  ) {
+  if ((event.message.kind === 'chat' || event.message.kind === 'chat-sdk') && parsedContent.text) {
     try {
       upsertArchiveMessage({
         id: messageIdForAgent(event.message.id, agent.agent_group_id),

@@ -98,7 +98,9 @@ export function updateSession(
  */
 export function advanceSessionArchiveWatermark(id: string, iso: string): void {
   getDb()
-    .prepare('UPDATE sessions SET last_archive_at = ? WHERE id = ? AND (last_archive_at IS NULL OR last_archive_at < ?)')
+    .prepare(
+      'UPDATE sessions SET last_archive_at = ? WHERE id = ? AND (last_archive_at IS NULL OR last_archive_at < ?)',
+    )
     .run(iso, id, iso);
 }
 
