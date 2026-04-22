@@ -65,6 +65,8 @@ Assign each color a role — "headings", "arrows", "emphasized box", "de-emphasi
 
 **Labels.** Short. Noun phrases, not sentences. "Worktree pruned" beats "The worktree is pruned". If you need a sentence, it's a caption, not a label.
 
+**Every visual element must explain itself.** If you draw a dot, a dashed line, a colored bar, an icon — the reader has to know what it means without squinting. Either label it directly ("`git worktree add`" next to the line it represents), or put the key in a subtitle/legend at the top or bottom. An unlabeled dot is noise, not data.
+
 **No dead zones.** Every pixel inside the canvas should earn its place. If a column is empty, the layout is wrong — re-flow, don't pad.
 
 ## Concrete anti-patterns

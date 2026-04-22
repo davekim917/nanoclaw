@@ -112,7 +112,6 @@ function wrapHtml(vars: TemplateVars): string {
     font-size: 0.85rem;
     color: ${c.muted};
   }
-  ${vars.content}
   .caption {
     margin-top: 16px;
     font-size: 0.8rem;
