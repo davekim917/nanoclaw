@@ -473,6 +473,36 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       return true;
     },
 
+    async fetchThreadHistory(
+      threadId: string,
+      opts?: { limit?: number; excludeMessageId?: string },
+    ): Promise<Array<{ sender: string; text: string; timestamp: string }>> {
+      const limit = opts?.limit ?? 50;
+      try {
+        const result = await adapter.fetchMessages(threadId, { limit });
+        const msgs = (result?.messages ?? []) as Array<{
+          id: string;
+          text: string;
+          author: { fullName: string; userName: string; isMe: boolean };
+          metadata: { dateSent: Date };
+        }>;
+        return msgs
+          .filter((m) => m.id !== opts?.excludeMessageId && (m.text?.length ?? 0) > 0)
+          .map((m) => ({
+            sender: m.author.isMe ? 'assistant' : m.author.fullName || m.author.userName || 'unknown',
+            text: m.text,
+            timestamp: m.metadata.dateSent.toISOString(),
+          }));
+      } catch (err) {
+        log.warn('fetchThreadHistory failed', {
+          adapter: adapter.name,
+          threadId,
+          err: err instanceof Error ? err.message : String(err),
+        });
+        return [];
+      }
+    },
+
     async subscribe(_platformId: string, threadId: string) {
       // Chat SDK's subscription state lives on the StateAdapter (not on the
       // Chat instance itself). SqliteStateAdapter.subscribe is idempotent —

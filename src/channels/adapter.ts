@@ -160,6 +160,22 @@ export interface ChannelAdapter {
   subscribe?(platformId: string, threadId: string): Promise<void>;
 
   /**
+   * Fetch the recent message history of a thread so the agent has full
+   * conversational context on engagement — including messages from other
+   * bots and from the user that never reached our own pipeline (bots don't
+   * trigger us, and plain user messages in a thread don't engage us either).
+   *
+   * v1 did this via `conversations.replies` on every mention inside a
+   * thread (src/channels/slack.ts fetchThreadHistory in the ~/nanoclaw
+   * reference); v2's adapter contract surfaces it as an optional hook.
+   * Adapters without thread semantics (Telegram 1:1 DMs, etc.) omit it.
+   */
+  fetchThreadHistory?(
+    threadId: string,
+    opts?: { limit?: number; excludeMessageId?: string },
+  ): Promise<Array<{ sender: string; text: string; timestamp: string }>>;
+
+  /**
    * Open (or fetch) a DM with this user, returning the platform_id of the
    * resulting DM channel. Called by the host on demand to initiate cold
    * DMs — approvals, pairing handshakes, host-initiated notifications — to

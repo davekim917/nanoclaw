@@ -34,7 +34,6 @@ import { startTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { resolveSession, writeSessionMessage, writeOutboundDirect } from './session-manager.js';
 import { upsertArchiveMessage } from './message-archive.js';
-import { injectThreadContext } from './thread-context.js';
 import { maybeRenameNewThread } from './topic-title.js';
 import { wakeContainer } from './container-runner.js';
 import { getSession } from './db/sessions.js';
@@ -406,7 +405,17 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
     const scopeOk = engages && (!senderScopeGate || senderScopeGate(event, userId, mg, agent).allowed);
 
     if (engages && accessOk && scopeOk) {
-      await deliverToAgent(agent, agentGroup, mg, event, userId, adapter?.supportsThreads === true, true, parsed);
+      await deliverToAgent(
+        agent,
+        agentGroup,
+        mg,
+        event,
+        userId,
+        adapter?.supportsThreads === true,
+        true,
+        parsed,
+        adapter,
+      );
       engagedCount++;
 
       // Mention-sticky: ask the adapter to subscribe the thread so the
@@ -430,7 +439,17 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
         });
       }
     } else if (agent.ignored_message_policy === 'accumulate') {
-      await deliverToAgent(agent, agentGroup, mg, event, userId, adapter?.supportsThreads === true, false, parsed);
+      await deliverToAgent(
+        agent,
+        agentGroup,
+        mg,
+        event,
+        userId,
+        adapter?.supportsThreads === true,
+        false,
+        parsed,
+        adapter,
+      );
       accumulatedCount++;
     } else {
       log.debug('Message not engaged for agent (drop policy)', {
@@ -523,6 +542,7 @@ async function deliverToAgent(
   adapterSupportsThreads: boolean,
   wake: boolean,
   parsedContent: { text?: string; sender?: string; senderId?: string },
+  adapter: ReturnType<typeof getChannelAdapter>,
 ): Promise<void> {
   // Apply the adapter thread policy: threaded adapter in a group chat →
   // per-thread session regardless of wiring. agent-shared preserved (it's
@@ -586,23 +606,38 @@ async function deliverToAgent(
     }
   }
 
-  // Gated to per-thread sessions on threaded adapters with a real thread id:
-  // shared / agent-shared already have cross-thread continuity via their
-  // session DB, and DMs / non-threaded adapters have no "prior thread"
-  // concept. Only on wake — accumulated rows are themselves context.
-  if (wake && effectiveSessionMode === 'per-thread' && event.threadId !== null && adapterSupportsThreads) {
+  // Thread-context parity with v1: on engaged mentions inside a thread,
+  // fetch recent thread history from the platform (covers messages from
+  // other bots and plain user messages that never engaged us) and prepend
+  // it to the trigger. First wake: include everything (up to 50). Later
+  // wakes: only messages newer than the session's last_active — the agent's
+  // own prior turns are already in the SDK continuation, so re-prepending
+  // them would just bloat context.
+  let contentForWrite = persistedContent;
+  if (
+    wake &&
+    adapterSupportsThreads &&
+    event.threadId !== null &&
+    adapter?.fetchThreadHistory &&
+    (event.message.kind === 'chat' || event.message.kind === 'chat-sdk')
+  ) {
     try {
-      injectThreadContext(
-        session,
-        {
-          channelType: deliveryAddr.channelType ?? event.channelType,
-          platformId: deliveryAddr.platformId ?? event.platformId,
-          threadId: deliveryAddr.threadId ?? event.threadId,
-        },
-        event.message.timestamp,
-      );
+      const history = await adapter.fetchThreadHistory(event.threadId, {
+        limit: 50,
+        excludeMessageId: event.message.id,
+      });
+      const sinceIso = created ? null : session.last_active;
+      const relevant = sinceIso ? history.filter((m) => m.timestamp > sinceIso) : history;
+      if (relevant.length > 0) {
+        const header = created ? 'Thread context' : 'New in thread since last response';
+        const transcript = relevant.map((m) => `${m.sender}: ${m.text}`).join('\n');
+        const parsed = JSON.parse(contentForWrite) as Record<string, unknown>;
+        const originalText = typeof parsed.text === 'string' ? parsed.text : '';
+        parsed.text = `[${header}]\n${transcript}\n[Latest message]\n${originalText}`;
+        contentForWrite = JSON.stringify(parsed);
+      }
     } catch (err) {
-      log.warn('Thread-context injection threw', {
+      log.warn('Thread-context fetch failed — proceeding without context', {
         sessionId: session.id,
         err: err instanceof Error ? err.message : String(err),
       });
@@ -616,7 +651,7 @@ async function deliverToAgent(
     platformId: deliveryAddr.platformId,
     channelType: deliveryAddr.channelType,
     threadId: deliveryAddr.threadId,
-    content: persistedContent,
+    content: contentForWrite,
     trigger: wake ? 1 : 0,
   });
 
