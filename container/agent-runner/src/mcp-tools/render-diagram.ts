@@ -536,7 +536,7 @@ export const renderDiagramTool: McpToolDefinition = {
         platform_id: routing.platform_id,
         channel_type: routing.channel_type,
         thread_id: routing.thread_id,
-        content: JSON.stringify({ text: caption || title || '' }),
+        content: JSON.stringify({ text: caption || title || '', files: [filename] }),
       });
 
       const ack = await awaitDeliveryAck(id, ACK_TIMEOUT_MS);
@@ -551,7 +551,8 @@ export const renderDiagramTool: McpToolDefinition = {
       return err(`Render failed: ${msg}`);
     } finally {
       if (htmlPath) try { fs.unlinkSync(htmlPath); } catch {}
-      try { fs.unlinkSync(outputPath); } catch {}
+      // Do NOT unlink outputPath — the host reads it from outbox/<id>/ during
+      // delivery and removes the whole dir itself (session-manager removeOutboxDir).
     }
   },
 };
