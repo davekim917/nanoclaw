@@ -139,12 +139,26 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           width: (att as unknown as Record<string, unknown>).width,
           height: (att as unknown as Record<string, unknown>).height,
         };
+        const attUrl = (att as unknown as { url?: string }).url;
+        if (attUrl) entry.url = attUrl;
         if (att.fetchData) {
           try {
             const buffer = await att.fetchData();
             entry.data = buffer.toString('base64');
           } catch (err) {
-            log.warn('Failed to download attachment', { type: att.type, err });
+            log.warn('Failed to download attachment via fetchData', { type: att.type, err });
+          }
+        } else if (attUrl) {
+          // Fallback for adapters that don't supply fetchData (e.g. @chat-adapter/discord
+          // as of 4.26.0). Discord CDN URLs are signed+public, so a bare fetch works —
+          // but the signature expires, so we must pull bytes now while the URL is fresh.
+          try {
+            const response = await fetch(attUrl);
+            if (!response.ok) throw new Error(`HTTP ${response.status} ${response.statusText}`);
+            const buffer = Buffer.from(await response.arrayBuffer());
+            entry.data = buffer.toString('base64');
+          } catch (err) {
+            log.warn('Failed to download attachment via url fallback', { type: att.type, url: attUrl, err });
           }
         }
         enriched.push(entry);
