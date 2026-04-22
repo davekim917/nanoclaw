@@ -31,12 +31,9 @@ function deriveToolProgressLabel(message: unknown): string | null {
     const b = block as { type?: string; name?: string; input?: Record<string, unknown> };
     if (b.type !== 'tool_use') continue;
     const name = b.name ?? 'tool';
-    const input = b.input ?? {};
     switch (name) {
-      case 'Bash': {
-        const cmd = typeof input.command === 'string' ? input.command.split('\n')[0].slice(0, 60) : '';
-        return cmd ? `Running: ${cmd}` : 'Running command';
-      }
+      case 'Bash':
+        return 'Running command';
       case 'Read':
       case 'Glob':
         return `Reading files`;
