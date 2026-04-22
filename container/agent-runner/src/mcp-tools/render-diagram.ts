@@ -85,6 +85,7 @@ function wrapHtml(vars: TemplateVars): string {
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { overflow: hidden; }
   body {
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
     background: ${c.bg};
@@ -93,7 +94,6 @@ function wrapHtml(vars: TemplateVars): string {
     display: flex;
     flex-direction: column;
     align-items: center;
-    min-height: 100vh;
   }
   .container { max-width: 1100px; width: 100%; }
   .header {
@@ -130,6 +130,11 @@ ${vars.subtitle ? `<div class="subtitle">${vars.subtitle}</div>` : ''}
 ${vars.content}
 ${vars.caption ? `<div class="caption">${vars.caption}</div>` : ''}
 </div>
+<script>
+  // Expose rendered content height so a second pass can size the viewport
+  // tightly. Chromium --dump-dom prints the post-JS DOM; we grep the title.
+  document.title = '__NC_DIAG_H__:' + document.documentElement.scrollHeight;
+</script>
 </body>
 </html>`;
 }
@@ -180,18 +185,27 @@ function renderArchitecture(
   content: Record<string, unknown>,
   theme: 'light' | 'dark',
 ): string {
+  const raw = typeof content === 'object' && content !== null ? content : {};
   const layers: Array<{ label: string; items: Array<[string, string, string]> }> = [];
-  // Try to extract layers from the content
-  const raw = typeof content === 'object' ? content : {};
-  const layerNames = ['Frontend', 'API', 'Data', 'Infra', 'External'];
-  for (const ln of layerNames) {
-    if ((raw as Record<string, unknown>)[ln.toLowerCase()]) {
-      layers.push({
-        label: ln,
-        items: ((raw as Record<string, unknown>)[ln.toLowerCase()] as Array<[string, string, string]>) || [],
-      });
+
+  // Primary: documented `layers: [{ label, items: [[name, desc, style?], ...] }]`.
+  if (Array.isArray((raw as Record<string, unknown>).layers)) {
+    for (const l of (raw as Record<string, unknown>).layers as Array<Record<string, unknown>>) {
+      const label = typeof l.label === 'string' ? l.label : '';
+      const items = Array.isArray(l.items) ? (l.items as Array<[string, string, string]>) : [];
+      if (label || items.length) layers.push({ label, items });
     }
   }
+
+  // Back-compat: loose top-level keys (`frontend`, `api`, `data`, `infra`, `external`).
+  if (layers.length === 0) {
+    const layerNames = ['Frontend', 'API', 'Data', 'Infra', 'External'];
+    for (const ln of layerNames) {
+      const v = (raw as Record<string, unknown>)[ln.toLowerCase()];
+      if (Array.isArray(v)) layers.push({ label: ln, items: v as Array<[string, string, string]> });
+    }
+  }
+
   if (layers.length === 0) {
     // Generic fallback
     return archFlex(
@@ -344,18 +358,48 @@ function buildHtmlPage(args: {
 
 // ---- Chromium screenshot ----
 
+const CHROMIUM_BASE_ARGS = [
+  '--headless',
+  '--no-sandbox',
+  '--disable-setuid-sandbox',
+  '--disable-gpu',
+  '--disable-dev-shm-usage',
+  '--disable-file-access-from-files',
+];
+
 function chromiumScreenshot(inputPath: string, outputPath: string, width: number, height: number): void {
   execFileSync('chromium', [
-    '--headless',
-    '--no-sandbox',
-    '--disable-setuid-sandbox',
-    '--disable-gpu',
-    '--disable-dev-shm-usage',
-    '--disable-file-access-from-files',
+    ...CHROMIUM_BASE_ARGS,
     `--screenshot=${outputPath}`,
     `--window-size=${width},${height}`,
     `file://${inputPath}`,
   ], { timeout: 30_000, stdio: 'pipe' });
+}
+
+/**
+ * Two-pass render helper: dump the post-JS DOM at the target width and parse
+ * the `__NC_DIAG_H__:<px>` hint the template script writes into <title>. Used
+ * to tight-crop the screenshot to content rather than the full window.
+ */
+function measureContentHeight(inputPath: string, width: number): number | null {
+  try {
+    const dom = execFileSync(
+      'chromium',
+      [
+        ...CHROMIUM_BASE_ARGS,
+        `--window-size=${width},100`,
+        '--dump-dom',
+        `file://${inputPath}`,
+      ],
+      { timeout: 15_000, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] },
+    );
+    const m = dom.match(/__NC_DIAG_H__:(\d+)/);
+    if (!m) return null;
+    const h = parseInt(m[1], 10);
+    return Number.isFinite(h) && h > 0 ? h : null;
+  } catch {
+    return null;
+  }
 }
 
 // ---- Mermaid rendering ----
@@ -378,8 +422,14 @@ export const renderDiagramTool: McpToolDefinition = {
       'Render a diagram as a polished PNG and send it to chat. ' +
       'Templates produce beautiful HTML diagrams with zero CSS from the user. ' +
       'Custom HTML/SVG accepted. Mermaid is supported if mmdc is installed. ' +
-      'Architecture templates take structured content; flowchart takes steps array; ' +
-      'timeline takes items with date/title/desc; comparison takes headers + rows.',
+      'For architecture: pass content as { layers: [{ label, items: [[name, desc, style?], ...] }] } — ' +
+      'each layer becomes a labeled row of connected boxes. Include every layer you describe; ' +
+      'if the text mentions 5 layers, the diagram should show 5 rows. ' +
+      'style is one of: primary | secondary | accent | data | external. ' +
+      'flowchart takes { steps: [...] }; timeline { items: [{date,title,desc?}] }; ' +
+      'comparison { headers, rows }; org-chart { nodes: [{name,role,children?}] }. ' +
+      'Default theme is "light" — only pass "dark" when the user explicitly asked for it. ' +
+      'Leave width/height unset unless you need a specific size; the renderer auto-crops to content.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -512,7 +562,17 @@ export const renderDiagramTool: McpToolDefinition = {
     try {
       if (type !== 'mermaid') {
         fs.mkdirSync(outDir, { recursive: true });
-        chromiumScreenshot(htmlPath!, outputPath, width, height);
+        // Measure content height in a first pass so the screenshot crops
+        // tightly to what was actually rendered. A generous ceiling prevents
+        // runaway templates; the floor avoids odd 50px strips on empty content.
+        const measured = measureContentHeight(htmlPath!, width);
+        const userSetHeight = typeof args.height === 'number';
+        const shotHeight = userSetHeight
+          ? height
+          : measured != null
+            ? Math.min(Math.max(measured + 24, 240), 2400)
+            : height;
+        chromiumScreenshot(htmlPath!, outputPath, width, shotHeight);
       }
 
       const stat = fs.statSync(outputPath);
