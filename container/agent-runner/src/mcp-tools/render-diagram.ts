@@ -237,11 +237,15 @@ function renderFlowchart(
     const label = typeof step === 'string' ? step : (step as Record<string, unknown>).label as string;
     const bg = isEnd ? '#dc2626' : isDecision ? '#f59e0b' : c.card;
     const border = isEnd ? '#dc2626' : isDecision ? '#f59e0b' : c.accent;
+    // Decision (amber) / end (red) boxes use colored backgrounds so white text
+    // works. Regular step boxes use c.card which is #fff in light mode — the
+    // label must use the theme's body text color or it disappears.
+    const labelColor = isEnd || isDecision ? '#fff' : c.text;
     const rad = isEnd || isDecision ? '999px' : '8px';
     const num = i + 1;
     return `<div style="display:flex;align-items:center;gap:16px">
   <div style="width:28px;height:28px;border-radius:50%;background:${c.accent};color:#fff;display:flex;align-items:center;justify-content:center;font-size:0.75rem;font-weight:700;flex-shrink:0">${num}</div>
-  <div style="flex:1;background:${bg};border:1.5px solid ${border};border-radius:${rad};padding:12px 16px;font-size:0.85rem;color:#fff;font-weight:500">${label}</div>
+  <div style="flex:1;background:${bg};border:1.5px solid ${border};border-radius:${rad};padding:12px 16px;font-size:0.85rem;color:${labelColor};font-weight:500">${label}</div>
 </div>
 ${i < steps.length - 1 ? `<div style="margin-left:14px;border-left:2px solid ${c.border};height:16px;margin-bottom:4px"></div>` : ''}`;
   });
