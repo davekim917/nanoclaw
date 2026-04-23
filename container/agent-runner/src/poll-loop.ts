@@ -201,6 +201,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       }
       if (switchIntent) {
         const notice = buildPostQueryNotice(switchIntent, result.modelIds);
+        log(
+          `Switch intent: ${JSON.stringify(switchIntent)} | modelIds: ${JSON.stringify(result.modelIds)} | notice: ${notice ?? '(none)'}`,
+        );
         if (notice) {
           writeMessageOut({
             id: generateId(),
