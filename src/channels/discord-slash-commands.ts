@@ -1,15 +1,23 @@
 /**
  * Discord slash commands — administrative surface for managing nanoclaw:
  *   /deploy           — pull main, build, rebuild image if needed, restart
- *   /update-container — rebuild the container image on its own
+ *   /update-container — audit Dockerfile package drift, agent opens PR
  *   /update-plugins   — git pull every ~/plugins/<name>
  *
  * Runs a dedicated discord.js Client parallel to @chat-adapter/discord's
  * chat client, gated on ENABLE_DISCORD_SLASH_COMMANDS=1. Scoped via
  * DISCORD_SLASH_CHANNEL_IDS (comma-separated channel ids) so accidental
  * invocations in random channels don't run deploy commands.
+ *
+ * /update-container injects a synthetic chat message into the router
+ * (routeInbound) carrying an audit prompt. The agent (running in a
+ * container for the receiving messaging group) runs the audit, presents
+ * the drift table, asks which packages to bump, clones the repo to a
+ * writable temp dir, edits the Dockerfile, opens a PR, and stops. The
+ * container-rebuild watcher picks up the PR on merge and rebuilds the
+ * image automatically.
  */
-import { execFile } from 'child_process';
+import { execFile, spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { promisify } from 'util';
@@ -21,25 +29,30 @@ import {
   Routes,
   type ChatInputCommandInteraction,
   type Interaction,
+  type TextChannel,
 } from 'discord.js';
 
 import { GROUPS_DIR } from '../config.js';
+import { startContainerRebuildWatcher, stopContainerRebuildWatcher } from '../container-rebuild-watcher.js';
 import { log } from '../log.js';
+import { routeInbound } from '../router.js';
 
 const execFileAsync = promisify(execFile);
 
 const COMMANDS = [
-  { name: 'deploy', description: 'Pull, build, and restart NanoClaw v2 from dave/migration' },
-  { name: 'update-container', description: 'Rebuild the v2 agent container image now' },
+  { name: 'deploy', description: 'Pull, build, and restart NanoClaw v2 from main' },
+  { name: 'update-container', description: 'Audit container package drift and open a bump PR' },
   { name: 'update-plugins', description: 'Run git pull on all ~/plugins repos now' },
 ];
 
+const REPO_ROOT = path.resolve(GROUPS_DIR, '..');
+const DEPLOY_SCRIPT = path.resolve(REPO_ROOT, 'scripts', 'deploy.sh');
+const DEPLOY_LOG = path.resolve(REPO_ROOT, 'logs', 'deploy.log');
+const DEPLOY_STATUS = path.resolve(REPO_ROOT, 'logs', 'deploy-status.json');
+const PLUGINS_UPDATE_SCRIPT = path.resolve(process.env.HOME ?? '/home/ubuntu', 'scripts', 'nanoclaw-plugins-update.sh');
+
 let client: Client | null = null;
 
-/**
- * Register guild-scoped slash commands with Discord.
- * Idempotent — re-running just overwrites the set.
- */
 async function registerCommands(botToken: string, clientId: string, guildId: string): Promise<void> {
   const rest = new REST({ version: '10' }).setToken(botToken);
   try {
@@ -50,11 +63,6 @@ async function registerCommands(botToken: string, clientId: string, guildId: str
   }
 }
 
-/**
- * Whitelist of channel ids where /deploy, /update-container,
- * /update-plugins are allowed. Gate keeps accidental deploys out of
- * random channels. Parent channels of threads are also honored.
- */
 function allowedChannels(): Set<string> {
   const raw = process.env.DISCORD_SLASH_CHANNEL_IDS || '';
   return new Set(
@@ -69,7 +77,6 @@ function channelIsAllowed(interaction: ChatInputCommandInteraction): boolean {
   const ids = allowedChannels();
   if (ids.size === 0) return false;
   if (interaction.channelId && ids.has(interaction.channelId)) return true;
-  // Thread: allow if the parent channel is whitelisted
   const ch = interaction.channel;
   if (ch && 'isThread' in ch && typeof ch.isThread === 'function' && ch.isThread()) {
     const parentId = (ch as { parentId?: string | null }).parentId;
@@ -78,92 +85,282 @@ function channelIsAllowed(interaction: ChatInputCommandInteraction): boolean {
   return false;
 }
 
+function deployChannelId(): string | null {
+  const explicit = process.env.DISCORD_DEPLOY_CHANNEL_ID?.trim();
+  if (explicit) return explicit;
+  const ids = allowedChannels();
+  const first = ids.values().next().value;
+  return first ?? null;
+}
+
 /**
- * Spawn a detached script so it survives the service restart. Caller
- * is expected to deferReply first and post completion separately — we
- * cannot wait for the script because it restarts our own process.
+ * Get the parent channel id for thread interactions, or the channel id
+ * itself when not in a thread. Injected synthetic messages must route to
+ * the parent channel (threads on the Discord side aren't first-class to
+ * the router today — messages land on the parent messaging_group).
  */
-function spawnDetached(script: string): void {
-  // Using child_process.spawn for detachment. `execFile` doesn't accept
-  // `detached` in its options signature the same way.
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const { spawn } = require('child_process') as typeof import('child_process');
-  const proc = spawn('bash', [script], {
-    cwd: path.resolve(GROUPS_DIR, '..'),
+function getInteractionParentId(interaction: ChatInputCommandInteraction): string | null {
+  const ch = interaction.channel;
+  if (ch && 'isThread' in ch && typeof ch.isThread === 'function' && ch.isThread()) {
+    return (ch as { parentId?: string | null }).parentId ?? null;
+  }
+  return interaction.channelId ?? null;
+}
+
+/** Spawn a detached script so it survives our own restart. */
+function spawnDetachedLogged(script: string): void {
+  const logFd = fs.openSync(DEPLOY_LOG, 'a');
+  const child = spawn('bash', [script], {
+    cwd: REPO_ROOT,
     detached: true,
-    stdio: 'ignore',
+    stdio: ['ignore', logFd, logFd],
   });
-  proc.unref();
+  child.unref();
+  fs.closeSync(logFd);
+  log.info('Detached deploy spawned', { pid: child.pid });
+}
+
+/**
+ * Poll deploy-status.json for pre-restart failures. If deploy succeeds,
+ * the service restarts mid-poll — announceDeployStatus on the next boot
+ * picks up the "ok" status and posts success.
+ */
+function pollDeployStatus(interaction: ChatInputCommandInteraction): void {
+  const startTime = Date.now();
+  let stopped = false;
+  const stop = () => {
+    stopped = true;
+  };
+  const poll = async (): Promise<void> => {
+    if (stopped) return;
+    try {
+      if (fs.existsSync(DEPLOY_STATUS)) {
+        const stat = fs.statSync(DEPLOY_STATUS);
+        if (stat.mtimeMs >= startTime) {
+          const status = JSON.parse(fs.readFileSync(DEPLOY_STATUS, 'utf-8')) as {
+            status?: string;
+            step?: string;
+            error?: string;
+          };
+          if (status.status === 'failed') {
+            stop();
+            await interaction.followUp({
+              content: `Deploy failed at **${status.step ?? 'unknown'}**: ${status.error ?? 'no detail'}`,
+            });
+            try {
+              fs.unlinkSync(DEPLOY_STATUS);
+            } catch {
+              /* ignore */
+            }
+            return;
+          }
+          if (status.status === 'ok') {
+            stop();
+            return;
+          }
+        }
+      }
+    } catch {
+      /* mid-write — retry next tick */
+    }
+    if (Date.now() - startTime > 120_000) {
+      stop();
+      return;
+    }
+    setTimeout(() => void poll(), 2_000);
+  };
+  setTimeout(() => void poll(), 2_000);
+}
+
+/**
+ * Post deploy success/failure once after startup if deploy-status.json is
+ * fresh. Paired with `pollDeployStatus` — the poll catches pre-restart
+ * failures, this catches post-restart success.
+ */
+async function announceDeployStatus(): Promise<void> {
+  try {
+    if (!fs.existsSync(DEPLOY_STATUS)) return;
+    const stat = fs.statSync(DEPLOY_STATUS);
+    if (Date.now() - stat.mtimeMs > 300_000) return; // >5 min old, stale
+    const status = JSON.parse(fs.readFileSync(DEPLOY_STATUS, 'utf-8')) as {
+      status?: string;
+      step?: string;
+      error?: string;
+    };
+    const channelId = deployChannelId();
+    if (!channelId) return;
+    const textChannel = await getTextChannel(channelId);
+    if (!textChannel) return;
+    if (status.status === 'ok') {
+      await textChannel.send('Deploy complete — service is up.');
+    } else if (status.status === 'failed') {
+      await textChannel.send(`Deploy failed at **${status.step ?? 'unknown'}**: ${status.error ?? 'no detail'}`);
+    }
+    try {
+      fs.unlinkSync(DEPLOY_STATUS);
+    } catch {
+      /* ignore */
+    }
+  } catch (err) {
+    log.warn('announceDeployStatus failed', { err });
+  }
+}
+
+async function getTextChannel(channelId: string): Promise<TextChannel | null> {
+  if (!client) return null;
+  try {
+    const ch = await client.channels.fetch(channelId);
+    if (!ch || !('send' in ch)) return null;
+    return ch as TextChannel;
+  } catch {
+    return null;
+  }
 }
 
 async function handleDeploy(interaction: ChatInputCommandInteraction): Promise<void> {
-  await interaction.reply({
-    content: 'Deploying v2: pulling main, building, restarting…',
-  });
-  const script = path.resolve(GROUPS_DIR, '..', 'scripts', 'deploy.sh');
-  if (!fs.existsSync(script)) {
-    await interaction.followUp({ content: `Deploy script missing at ${script}` });
+  await interaction.reply({ content: 'Deploying v2: pulling main, building, restarting…' });
+  if (!fs.existsSync(DEPLOY_SCRIPT)) {
+    await interaction.followUp({ content: `Deploy script missing at ${DEPLOY_SCRIPT}` });
     return;
   }
-  spawnDetached(script);
-}
-
-async function handleUpdateContainer(interaction: ChatInputCommandInteraction): Promise<void> {
-  await interaction.reply({ content: 'Rebuilding v2 container image…' });
-  try {
-    await execFileAsync('bash', [path.resolve(GROUPS_DIR, '..', 'container', 'build.sh'), 'v2'], {
-      cwd: path.resolve(GROUPS_DIR, '..'),
-      timeout: 600_000,
-    });
-    await interaction.followUp({ content: '✅ Container image rebuilt. New spawns will use nanoclaw-agent:v2.' });
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    await interaction.followUp({ content: `❌ Image rebuild failed: ${msg.slice(0, 500)}` });
-  }
+  spawnDetachedLogged(DEPLOY_SCRIPT);
+  pollDeployStatus(interaction);
 }
 
 async function handleUpdatePlugins(interaction: ChatInputCommandInteraction): Promise<void> {
   await interaction.reply({ content: 'Running git pull on all ~/plugins…' });
-  try {
-    // Dynamic import to avoid pulling plugin-updater into this module's
-    // load path when the slash-command client is disabled.
-    const mod = await import('../plugin-updater.js');
-    // Trigger a one-off run via the same code path as the cron.
-    // No public runOnce; emulate by starting + stopping with a 0-ms delay.
-    // Simpler: just shell out directly — same behavior.
-    const home = process.env.HOME || '/home/ubuntu';
-    const pluginsRoot = path.join(home, 'plugins');
-    if (!fs.existsSync(pluginsRoot)) {
-      await interaction.followUp({ content: '~/plugins not found.' });
-      return;
-    }
-    const entries = fs.readdirSync(pluginsRoot).filter((e) => {
-      const p = path.join(pluginsRoot, e);
-      try {
-        return fs.statSync(p).isDirectory() && fs.existsSync(path.join(p, '.git'));
-      } catch {
-        return false;
-      }
+  if (!fs.existsSync(PLUGINS_UPDATE_SCRIPT)) {
+    await interaction.followUp({
+      content: `Plugins update script missing at ${PLUGINS_UPDATE_SCRIPT}`,
     });
-    const results: string[] = [];
-    for (const name of entries) {
-      try {
-        const { stdout } = await execFileAsync('git', ['pull', '--ff-only'], {
-          cwd: path.join(pluginsRoot, name),
-          timeout: 30_000,
-          encoding: 'utf-8',
-        });
-        results.push(stdout.includes('Already up to date.') ? `${name}: up to date` : `${name}: updated`);
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        results.push(`${name}: FAILED — ${msg.slice(0, 100)}`);
-      }
-    }
-    void mod; // import is kept for side-effects / module discovery only
-    await interaction.followUp({ content: '```\n' + results.join('\n') + '\n```' });
+    return;
+  }
+  try {
+    const { stdout } = await execFileAsync('bash', [PLUGINS_UPDATE_SCRIPT], { timeout: 120_000 });
+    const MAX = 1900; // Discord msg limit minus fence
+    const body = stdout.trim().slice(0, MAX);
+    await interaction.followUp({ content: `\`\`\`\n${body || '(no output)'}\n\`\`\`` });
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    await interaction.followUp({ content: `❌ Plugin update failed: ${msg}` });
+    const e = err as { stdout?: string; stderr?: string };
+    const raw = e.stdout?.trim() || e.stderr?.trim() || String(err);
+    await interaction.followUp({ content: `Plugin update failed:\n\`\`\`\n${raw.slice(0, 1800)}\n\`\`\`` });
+  }
+}
+
+const UPDATE_CONTAINER_PROMPT = [
+  'Run the container update audit.',
+  '',
+  '## Step 1 — Detect Dockerfile package drift',
+  'Read /workspace/project/container/Dockerfile and extract every package install. /workspace/project is READ-ONLY — you cannot edit it in place (see Step 4).',
+  '- npm/pnpm: lines in `npm install -g` or `pnpm install -g`. Both pinned (`pkg@x.y.z` or `pkg@${ARG}`) AND unpinned (no version) — report both.',
+  '- pip: lines in `pip install`. Both pinned (`pkg==x.y.z`) AND unpinned — report both.',
+  '- ARG: lines like `ARG PACKAGE_VERSION=x.y.z` (many pins in v2 are indirected via ARG — resolve to the package name by looking at which install line references the ARG).',
+  '',
+  'For each PINNED package, check the latest available version:',
+  '- npm: `npm view <pkg> version`',
+  '- pip: `curl -s https://pypi.org/pypi/<pkg>/json | jq -r .info.version`',
+  '- GitHub release ARGs: `gh release view --repo <owner>/<repo> --json tagName -q .tagName` for RENDER_VERSION → render-oss/cli, RAILWAY_VERSION → railwayapp/cli, SUPABASE_VERSION → supabase/cli.',
+  '',
+  'For each UNPINNED package, also check the latest version and report with status ❓ unpinned. These drift on every rebuild without attention.',
+  '',
+  '## Step 2 — Detect upstream-synced file drift',
+  'Read /workspace/plugins/bootstrap/plugins/workflow/skills/team-qa/references/CODEX-SOURCES.md to find verbatim copies of files from openai/codex-plugin-cc and their pinned upstream commit SHAs (stored as 7-char prefixes).',
+  '',
+  'For each entry, fetch the latest upstream 7-char SHA:',
+  '`gh api "repos/openai/codex-plugin-cc/commits?path=<upstream-path>&per_page=1" --jq \'.[0].sha[0:7]\'`',
+  '',
+  'If it differs from the pinned SHA, the file has drifted.',
+  '',
+  '## Step 3 — Present a unified audit table',
+  '| Item | Kind | Current | Latest | Status |',
+  'Status: ✅ up to date, ⬆️ outdated, ❓ unpinned.',
+  'Below the table, summarize: "N outdated, M unpinned: <names>".',
+  'Then ask: "Update all, specific ones, or skip?"',
+  '',
+  '## Step 4 — Apply updates (after user confirms)',
+  '',
+  '### Dockerfile package bumps',
+  '/workspace/project is READ-ONLY. Clone the repo to a writable temp dir:',
+  '1. `rm -rf /tmp/nanoclaw-update && gh repo clone davekim917/nanoclaw /tmp/nanoclaw-update`',
+  '2. Edit /tmp/nanoclaw-update/container/Dockerfile in place — update the pinned ARGs / package versions. For ARG-indirected pins, bump the `ARG ...=x.y.z` line. For inline pins, bump `pkg@x.y.z`.',
+  '3. `cd /tmp/nanoclaw-update && git checkout -b chore/container-pins-$(date +%Y%m%d-%H%M)`',
+  '4. `git add container/Dockerfile && git commit -m "chore(container): bump <packages> to latest"`',
+  '5. `git push -u origin HEAD`',
+  '6. `gh pr create --title "chore(container): bump <packages>" --body "..." --base main`',
+  '7. STOP. Report the PR URL back to the chat. Do NOT run `gh pr merge` — Dave reviews and merges manually via the GitHub UI.',
+  '',
+  "After Dave merges, the host's container-rebuild watcher (src/container-rebuild-watcher.ts) will detect the merge within ~60s, run `git pull && container/build.sh v2`, and post the rebuild result to Discord. No timer wait, no manual step.",
+  '',
+  '### Upstream-synced file resync (Codex prompts/schemas)',
+  '/workspace/plugins/bootstrap is mounted READ-ONLY, so push via the upstream repo:',
+  '1. /workspace/plugins/codex is mounted with the latest pulled by nanoclaw-plugins-update.timer — read the new file content directly from there (e.g. /workspace/plugins/codex/plugins/codex/prompts/adversarial-review.md).',
+  '2. Get the new 7-char SHA: `gh api "repos/openai/codex-plugin-cc/commits?path=<path>&per_page=1" --jq \'.[0].sha[0:7]\'`',
+  '3. `rm -rf /tmp/bootstrap-update && gh repo clone davekim917/bootstrap /tmp/bootstrap-update`',
+  '4. Copy the new file content into /tmp/bootstrap-update/plugins/workflow/skills/team-qa/references/<local-name>',
+  '5. CRITICAL — verify the resynced file still contains all template placeholders ({{TARGET_LABEL}}, {{USER_FOCUS}}, {{REVIEW_INPUT}}). If any are missing, ABORT and report — Validator E depends on these markers.',
+  "6. Update the SHA pin row in CODEX-SOURCES.md to the new 7-char SHA and today's date.",
+  '7. Bump plugins/workflow/.claude-plugin/plugin.json `version` (patch bump for resync).',
+  '8. `cd /tmp/bootstrap-update && git checkout -b chore/codex-resync-$(date +%Y%m%d-%H%M)`',
+  '9. `git add -A && git commit -m "chore(team-qa): resync codex <files> to <short-sha>"`',
+  '10. `git push -u origin HEAD && gh pr create --title "..." --body "..." --base main`',
+  '11. STOP. Report the PR URL. Do NOT run `gh pr merge` — Dave reviews and merges. After merge, nanoclaw-plugins-update.timer pulls within the hour and the resync goes live.',
+  '',
+  '## Important notes',
+  '- Show diffs before committing each repo. Ask for explicit approval per repo.',
+  '- The two repos (nanoclaw + bootstrap) are independent — separate PRs, separate manual merges.',
+  '- If everything is up to date, say so in one line and stop. Do not create empty PRs.',
+  '- DO NOT run `gh pr merge` — merging is a manual human step.',
+  '- DO NOT run `./container/build.sh` from inside the container (you cannot run docker from inside a container, and the host watcher handles rebuild automatically post-merge).',
+].join('\n');
+
+async function handleUpdateContainer(interaction: ChatInputCommandInteraction): Promise<void> {
+  if (interaction.channel && 'isThread' in interaction.channel && interaction.channel.isThread()) {
+    await interaction.reply({
+      content: 'Run /update-container in the parent channel, not inside a thread.',
+      ephemeral: true,
+    });
+    return;
+  }
+
+  await interaction.reply({ content: 'Auditing container packages and synced upstream files…' });
+  const reply = await interaction.fetchReply();
+
+  const parentChannelId = getInteractionParentId(interaction);
+  if (!parentChannelId) {
+    await interaction.followUp({ content: 'Could not resolve channel id for injection.' });
+    return;
+  }
+
+  const syntheticId = `slash-update-container-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const content = {
+    text: UPDATE_CONTAINER_PROMPT,
+    sender: interaction.user.username,
+    senderId: interaction.user.id,
+    senderName: interaction.user.username,
+    isMention: true,
+    // Anchor the agent's reply thread to the slash-command's own reply
+    // message so the audit lands in a visible place.
+    anchorMessageId: reply.id,
+  };
+
+  try {
+    await routeInbound({
+      channelType: 'discord',
+      platformId: parentChannelId,
+      threadId: null,
+      message: {
+        id: syntheticId,
+        kind: 'chat-sdk',
+        content: JSON.stringify(content),
+        timestamp: new Date().toISOString(),
+        isMention: true,
+      },
+    });
+  } catch (err) {
+    log.error('/update-container injection failed', { err });
+    await interaction.followUp({
+      content: `Failed to start audit: ${err instanceof Error ? err.message : String(err)}`,
+    });
   }
 }
 
@@ -201,7 +398,8 @@ async function onInteraction(interaction: Interaction): Promise<void> {
 /**
  * Start the slash-command client. No-op unless
  * ENABLE_DISCORD_SLASH_COMMANDS=1 AND DISCORD_BOT_TOKEN is set.
- * Returns whether the client started.
+ * Also boots the container-rebuild watcher (which pushes rebuild-complete
+ * notifications into the deploy channel).
  */
 export async function startDiscordSlashCommands(): Promise<boolean> {
   if (process.env.ENABLE_DISCORD_SLASH_COMMANDS !== '1') {
@@ -214,20 +412,25 @@ export async function startDiscordSlashCommands(): Promise<boolean> {
     return false;
   }
 
-  // Minimal intents — no GuildMessages / MessageContent — so we don't
-  // duplicate chat events that @chat-adapter/discord's client already
-  // handles. Interactions are delivered on Guilds intent alone.
   client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
   client.once('clientReady', async () => {
     log.info('Discord slash-command client ready', { username: client?.user?.username });
     const clientId = client?.user?.id;
-    if (!clientId) return;
-    // Register commands for every guild the bot is in. Guild-scoped so
-    // updates propagate in ~seconds (global commands take up to 1h).
-    for (const [guildId] of client?.guilds?.cache ?? new Map()) {
-      await registerCommands(botToken, clientId, guildId);
+    if (clientId) {
+      for (const [guildId] of client?.guilds?.cache ?? new Map()) {
+        await registerCommands(botToken, clientId, guildId);
+      }
     }
+    await announceDeployStatus();
+    startContainerRebuildWatcher(async (message: string) => {
+      const channelId = deployChannelId();
+      if (!channelId) return;
+      const textChannel = await getTextChannel(channelId);
+      if (textChannel) {
+        await textChannel.send(message);
+      }
+    });
   });
 
   client.on('interactionCreate', (interaction) => {
@@ -241,6 +444,7 @@ export async function startDiscordSlashCommands(): Promise<boolean> {
 }
 
 export async function stopDiscordSlashCommands(): Promise<void> {
+  stopContainerRebuildWatcher();
   if (client) {
     try {
       await client.destroy();
