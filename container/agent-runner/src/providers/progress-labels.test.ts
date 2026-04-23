@@ -23,16 +23,29 @@ describe('deriveProgressLabels', () => {
     expect(deriveProgressLabels({ message: { content: 'text' } })).toEqual([]);
   });
 
-  test('forwards thinking block wrapped in italic markers + emoji prefix', () => {
+  test('forwards thinking block as blockquote with emoji prefix on first line', () => {
     const msg = assistantMessage([{ type: 'thinking', thinking: 'Let me check the schema.', signature: 'sig' }]);
-    expect(deriveProgressLabels(msg)).toEqual(['💭 _Let me check the schema._']);
+    expect(deriveProgressLabels(msg)).toEqual(['> 💭 Let me check the schema.']);
   });
 
-  test('escapes underscores in thinking text so italic run does not close early', () => {
+  test('multi-line thinking renders as multi-line blockquote (emoji on first line only)', () => {
+    const msg = assistantMessage([
+      {
+        type: 'thinking',
+        thinking: 'First paragraph.\n\nSecond paragraph.\nThird line.',
+        signature: 'sig',
+      },
+    ]);
+    expect(deriveProgressLabels(msg)).toEqual([
+      '> 💭 First paragraph.\n> \n> Second paragraph.\n> Third line.',
+    ]);
+  });
+
+  test('underscores in thinking text pass through (no italic markers to break)', () => {
     const msg = assistantMessage([
       { type: 'thinking', thinking: 'Looking at fct_orders and dim_customers.', signature: 'sig' },
     ]);
-    expect(deriveProgressLabels(msg)).toEqual(['💭 _Looking at fct\\_orders and dim\\_customers._']);
+    expect(deriveProgressLabels(msg)).toEqual(['> 💭 Looking at fct_orders and dim_customers.']);
   });
 
   test('truncates long thinking text on word boundary at 2000 chars (pre-format)', () => {
@@ -41,11 +54,8 @@ describe('deriveProgressLabels', () => {
       assistantMessage([{ type: 'thinking', thinking: long, signature: 'sig' }]),
     );
     expect(labels).toHaveLength(1);
-    // Label is `💭 _<prose>…_`. The prose inside italic wrappers is capped to
-    // LABEL_MAX=2000; the emoji+space prefix + italic markers add ~6 chars.
-    expect(labels[0].startsWith('💭 _')).toBe(true);
-    expect(labels[0].endsWith('…_')).toBe(true);
-    expect(labels[0].length).toBeLessThanOrEqual(2010);
+    expect(labels[0].startsWith('> 💭 ')).toBe(true);
+    expect(labels[0].endsWith('…')).toBe(true);
   });
 
   test('short thinking not truncated', () => {
@@ -53,7 +63,7 @@ describe('deriveProgressLabels', () => {
       { type: 'thinking', thinking: 'Short reasoning here.', signature: 's' },
     ]);
     const labels = deriveProgressLabels(msg);
-    expect(labels).toEqual(['💭 _Short reasoning here._']);
+    expect(labels).toEqual(['> 💭 Short reasoning here.']);
   });
 
   test('NANOCLAW_HIDE_THINKING=1 suppresses all progress', () => {
@@ -72,7 +82,7 @@ describe('deriveProgressLabels', () => {
       { type: 'tool_use', name: 'Skill', input: { skill: 'team-brief' } },
       { type: 'tool_use', name: 'mcp__gitnexus__query', input: { query: 'auth' } },
     ]);
-    expect(deriveProgressLabels(msg)).toEqual(['💭 _Looking up the schema._']);
+    expect(deriveProgressLabels(msg)).toEqual(['> 💭 Looking up the schema.']);
   });
 
   test('tool_use alone (no thinking) produces no labels', () => {
@@ -85,7 +95,7 @@ describe('deriveProgressLabels', () => {
       { type: 'thinking', thinking: 'First thought.', signature: 's1' },
       { type: 'thinking', thinking: 'Second thought.', signature: 's2' },
     ]);
-    expect(deriveProgressLabels(msg)).toEqual(['💭 _First thought._', '💭 _Second thought._']);
+    expect(deriveProgressLabels(msg)).toEqual(['> 💭 First thought.', '> 💭 Second thought.']);
   });
 
   test('empty thinking blocks are skipped (signature-only)', () => {
@@ -94,6 +104,6 @@ describe('deriveProgressLabels', () => {
       { type: 'thinking', thinking: '   ', signature: 'whitespace' },
       { type: 'thinking', thinking: 'Real content.', signature: 'good' },
     ]);
-    expect(deriveProgressLabels(msg)).toEqual(['💭 _Real content._']);
+    expect(deriveProgressLabels(msg)).toEqual(['> 💭 Real content.']);
   });
 });

@@ -50,17 +50,21 @@ function truncate(s: string): string {
  * NANOCLAW_HIDE_THINKING=1 suppresses all progress forwarding.
  */
 /**
- * Format a thinking block for chat. Wraps the prose in markdown italics with
- * a 💭 prefix so users can tell at a glance that the message is the agent's
- * reasoning, not its final answer. `parseTextStyles` in the host's channel
- * adapters converts `_italic_` to each platform's native syntax at delivery
- * time (Slack `_x_`, Discord `*x*`, WhatsApp `_x_`, Telegram Markdown). Any
- * embedded `_` in the prose itself is escaped to `\_` so it doesn't close
- * the italic run early.
+ * Format a thinking block for chat. Prefixes every line with `> ` so it
+ * renders as a blockquote — indented with a vertical accent bar on Slack
+ * and Discord, visually distinct from a real agent response. Italic `_..._`
+ * doesn't work here because Slack mrkdwn doesn't span italic across newlines,
+ * and thinking prose is routinely multi-paragraph; the literal underscores
+ * would show through.
+ *
+ * The 💭 emoji leads the first line as a visual cue. On Slack clients that
+ * auto-shortcode unicode emoji to `:name:` the shortcode form is still
+ * clearly a "thinking" affordance.
  */
 function formatThinkingLabel(prose: string): string {
-  const escaped = prose.replace(/_/g, '\\_');
-  return `💭 _${escaped}_`;
+  const lines = prose.split('\n');
+  lines[0] = `💭 ${lines[0]}`;
+  return lines.map((line) => `> ${line}`).join('\n');
 }
 
 export function deriveProgressLabels(message: unknown): string[] {
@@ -424,7 +428,7 @@ function createBlockSnowflakeConnectorHook(): HookCallback {
 // write a system action with action='request_bash_gate' to outbound.db;
 // host's bash-gate module calls requestApproval and writes the decision
 // back to inbound.db's `delivered` table; we poll it via
-// awaitDeliveryAck. Up to 30 minutes.
+// awaitDeliveryAck. Up to 60 minutes (must match host-side BASH_GATE_TIMEOUT_MS).
 const GWS_EMAIL_SEND_RE = /\bgws\s+gmail\s+\+(?:send|reply|reply-all|forward)\b/;
 // `(?:\s|$)` anchor prevents `--dry-run=false` from matching. The prior
 // `\b` alone was satisfied by `=`, which turned the guard into a trivial
@@ -480,7 +484,7 @@ function createEmailGateHook(): HookCallback {
       }),
     });
 
-    const ack = await awaitDeliveryAck(requestId, 30 * 60 * 1000);
+    const ack = await awaitDeliveryAck(requestId, 60 * 60 * 1000);
     if (!ack) {
       return denyBash(`Email ${action} blocked: timed out waiting for admin approval. Do not retry — ask the user.`);
     }
