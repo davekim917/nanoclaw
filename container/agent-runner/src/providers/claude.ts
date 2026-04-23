@@ -21,52 +21,92 @@ function log(msg: string): void {
 }
 
 /**
- * Derive a short human-friendly progress label from an assistant message
- * that contains a tool_use block. Returns null if the message has no
- * tool_use (agent is just emitting text), so the caller skips emitting
- * progress for those.
+ * Maximum characters of thinking-block text to forward as a progress
+ * event. Thinking can run thousands of tokens; a full dump would flood
+ * the chat surface. Truncate on word boundary with an ellipsis.
  */
-function deriveToolProgressLabel(message: unknown): string | null {
+const THINKING_SNIPPET_MAX = 400;
+
+/** Env gate: set NANOCLAW_HIDE_THINKING=1 to suppress thinking-block forwarding. */
+function thinkingForwardingEnabled(): boolean {
+  const v = process.env.NANOCLAW_HIDE_THINKING;
+  return !v || v === '0' || v.toLowerCase() === 'false';
+}
+
+function truncateThinking(s: string): string {
+  const trimmed = s.trim();
+  if (trimmed.length <= THINKING_SNIPPET_MAX) return trimmed;
+  return trimmed.slice(0, THINKING_SNIPPET_MAX - 1).replace(/\s+\S*$/, '') + '…';
+}
+
+function toolUseLabel(b: { name?: string; input?: Record<string, unknown> }): string | null {
+  const name = b.name ?? 'tool';
+  const input = b.input ?? {};
+  switch (name) {
+    case 'Bash':
+      return sanitizeBashLabel(typeof input.command === 'string' ? input.command : '');
+    case 'Read':
+    case 'Glob':
+      return 'Reading files';
+    case 'Grep':
+      return 'Searching';
+    case 'Edit':
+    case 'Write':
+    case 'NotebookEdit':
+      return 'Editing files';
+    case 'WebSearch':
+      return 'Web search';
+    case 'WebFetch':
+      return 'Fetching web page';
+    case 'TodoWrite':
+      return 'Planning';
+    case 'Task':
+      return 'Delegating subtask';
+    case 'ToolSearch':
+      return 'Looking up tools';
+    case 'Skill': {
+      // The Skill tool's input shape varies across SDK versions; try the two
+      // documented shapes (`skill` and `name`) before falling back to the
+      // generic label. Plugin-namespaced form "plugin:skill" is kept intact —
+      // the colon is meaningful and users recognize the namespace.
+      const raw = typeof input.skill === 'string' ? input.skill : typeof input.name === 'string' ? input.name : '';
+      const skill = raw.trim();
+      return skill ? `Invoking skill: ${skill}` : 'Invoking skill';
+    }
+    default:
+      if (name.startsWith('mcp__')) {
+        const parts = name.split('__');
+        return `Using ${parts[parts.length - 1] ?? name}`;
+      }
+      return `Using ${name}`;
+  }
+}
+
+/**
+ * Derive ordered progress labels from an assistant message. A single turn can
+ * carry both a thinking block (the model's reasoning) and a tool_use block;
+ * both are surfaced as progress events so users see *why* the agent is doing
+ * something, not just what.
+ *
+ * Thinking forwarding can be disabled with NANOCLAW_HIDE_THINKING=1 for groups
+ * that prefer a tighter UI. Tool-use labels always surface.
+ */
+export function deriveProgressLabels(message: unknown): string[] {
+  if (!message || typeof message !== 'object') return [];
   const content = (message as { message?: { content?: unknown } }).message?.content;
-  if (!Array.isArray(content)) return null;
+  if (!Array.isArray(content)) return [];
+  const labels: string[] = [];
+  const forwardThinking = thinkingForwardingEnabled();
   for (const block of content) {
-    const b = block as { type?: string; name?: string; input?: Record<string, unknown> };
-    if (b.type !== 'tool_use') continue;
-    const name = b.name ?? 'tool';
-    const input = b.input ?? {};
-    switch (name) {
-      case 'Bash':
-        return sanitizeBashLabel(typeof input.command === 'string' ? input.command : '');
-      case 'Read':
-      case 'Glob':
-        return `Reading files`;
-      case 'Grep':
-        return `Searching`;
-      case 'Edit':
-      case 'Write':
-      case 'NotebookEdit':
-        return `Editing files`;
-      case 'WebSearch':
-        return `Web search`;
-      case 'WebFetch':
-        return `Fetching web page`;
-      case 'TodoWrite':
-        return `Planning`;
-      case 'Task':
-        return `Delegating subtask`;
-      case 'ToolSearch':
-        return `Looking up tools`;
-      case 'Skill':
-        return `Invoking skill`;
-      default:
-        if (name.startsWith('mcp__')) {
-          const parts = name.split('__');
-          return `Using ${parts[parts.length - 1] ?? name}`;
-        }
-        return `Using ${name}`;
+    const b = block as { type?: string; name?: string; input?: Record<string, unknown>; thinking?: unknown };
+    if (b.type === 'thinking' && forwardThinking && typeof b.thinking === 'string' && b.thinking.trim().length > 0) {
+      labels.push(truncateThinking(b.thinking));
+    } else if (b.type === 'tool_use') {
+      const label = toolUseLabel(b);
+      if (label) labels.push(label);
     }
   }
-  return null;
+  return labels;
 }
 
 // Deferred SDK builtins that either sidestep nanoclaw's own scheduling or
@@ -828,15 +868,21 @@ export class ClaudeProvider implements AgentProvider {
           const tn = message as { summary?: string };
           yield { type: 'progress', message: tn.summary || 'Task notification' };
         } else if (message.type === 'assistant') {
-          // Fallback progress: SDK task_notification only fires for
-          // multi-step planned tasks, so simple turns (single tool call,
-          // direct answers) never get a status line. Derive a short label
-          // from the first tool_use block on each assistant turn.
-          const now = Date.now();
-          if (now - lastToolProgressAt >= TOOL_PROGRESS_MIN_INTERVAL_MS) {
-            const label = deriveToolProgressLabel(message);
-            if (label) {
-              yield { type: 'progress', message: label };
+          // SDK task_notification only fires for multi-step planned tasks, so
+          // simple turns (single tool call, direct answers) never get a
+          // status line. Derive labels from thinking + tool_use blocks on
+          // each assistant turn. Thinking forwarding gives the user visibility
+          // into the reasoning process; the tool_use label shows what the
+          // agent chose to do next. Both honor TOOL_PROGRESS_MIN_INTERVAL_MS
+          // across the whole label group — throttling is a per-turn floor,
+          // not a per-label rate limit.
+          const labels = deriveProgressLabels(message);
+          if (labels.length > 0) {
+            const now = Date.now();
+            if (now - lastToolProgressAt >= TOOL_PROGRESS_MIN_INTERVAL_MS) {
+              for (const label of labels) {
+                yield { type: 'progress', message: label };
+              }
               lastToolProgressAt = now;
             }
           }
