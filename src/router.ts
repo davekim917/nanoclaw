@@ -635,9 +635,12 @@ async function deliverToAgent(
         const originalText = typeof parsed.text === 'string' ? parsed.text : '';
         // Preserve any leading platform bot-mention + flag prefix at text
         // start so the container-side flag parser still sees flags after
-        // the [Thread context] prepend. Covers both Discord `<@BOTID>` and
-        // Slack `<@UXXX>` mention tokens, optionally followed by flags.
-        const prefixMatch = originalText.match(/^(\s*<@!?[^>]+>\s*)?((?:\s*-[me]1?\s+\S*\s*)+)?/);
+        // the [Thread context] prepend. Covers `<@BOTID>` (Discord + raw
+        // Slack) AND `@BOTID` (Slack post chat-sdk angle-bracket strip),
+        // optionally followed by -m/-e flags.
+        const prefixMatch = originalText.match(
+          /^(\s*(?:<@!?[^>]+>|@[\w.-]+)\s*)?((?:\s*-[me]1?\s+\S*\s*)+)?/,
+        );
         const prefix = prefixMatch ? prefixMatch[0] : '';
         const rest = originalText.slice(prefix.length);
         parsed.text = `${prefix}[${header}]\n${transcript}\n[Latest message]\n${rest}`;

@@ -638,7 +638,10 @@ function applyFlagBatch(
   // the opening @-mention of any new Discord thread. Mention info is
   // already carried by event.isMention; the agent doesn't need the literal
   // token in its prompt, so we drop it entirely from cleanedText too.
-  const mentionMatch = text.match(/^\s*<@!?[^>]+>\s*/);
+  // Matches both Discord/raw-Slack `<@UID>` and Slack-post-strip `@UID`.
+  // chat-adapter/slack strips the angle brackets before landing text in
+  // messages_in, so the container sees a bare @-mention on Slack inbounds.
+  const mentionMatch = text.match(/^\s*(?:<@!?[^>]+>|@[\w.-]+)\s*/);
   const textAfterMention = mentionMatch ? text.slice(mentionMatch[0].length) : text;
   const flags = parseModelEffortFlags(textAfterMention);
   const intent: FlagSwitchIntent = {};
