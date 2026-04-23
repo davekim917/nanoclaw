@@ -170,6 +170,12 @@ function createGateHandler(category: GateCategory) {
       payload: payload as unknown as Record<string, unknown>,
       title: label,
       question: command ? `${summary}\n\n\`${command}\`` : summary,
+      // Gates deliver in-thread so teammates using the agent can approve
+      // their own work-level requests without waiting on the bot owner.
+      // response-handler.ts doesn't check clicker identity — thread access
+      // IS the authority for work-level gates. Self-mod / credential
+      // approvals stay admin-DM (their defaults).
+      deliveryTarget: 'thread',
     });
 
     // Defer the ack — the container polls `delivered` keyed on requestId

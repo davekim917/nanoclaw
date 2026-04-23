@@ -153,6 +153,22 @@ export interface RequestApprovalOptions {
   title: string;
   /** Card body shown to the admin. */
   question: string;
+  /**
+   * Where to deliver the approval card.
+   *
+   * - `'admin'` (default) — DM the first reachable admin from pickApprover.
+   *   Use for bot-config / system-level actions that only admins should
+   *   decide (self-mod package installs, MCP server changes, new-sender
+   *   acceptance, credential releases).
+   * - `'thread'` — post into the originating conversation (session's own
+   *   messaging_group, threaded reply if the session has a thread_id).
+   *   Use for work-level gates where the requesting teammate or anyone
+   *   in the channel should be able to self-approve (bash/email gates,
+   *   destructive-command gates). Response-handler.ts does NOT check
+   *   clicker identity against pickApprover — thread access IS the
+   *   approval authority for this target.
+   */
+  deliveryTarget?: 'thread' | 'admin';
 }
 
 /**
@@ -162,22 +178,48 @@ export interface RequestApprovalOptions {
  * approval handler for this action via the response dispatcher.
  */
 export async function requestApproval(opts: RequestApprovalOptions): Promise<void> {
-  const { session, action, payload, title, question, agentName } = opts;
+  const { session, action, payload, title, question, agentName, deliveryTarget = 'admin' } = opts;
 
-  const approvers = pickApprover(session.agent_group_id);
-  if (approvers.length === 0) {
-    notifyAgent(session, `${action} failed: no owner or admin configured to approve.`);
-    return;
-  }
-
-  const originChannelType = session.messaging_group_id
-    ? (getMessagingGroup(session.messaging_group_id)?.channel_type ?? '')
-    : '';
-
-  const target = await pickApprovalDelivery(approvers, originChannelType);
-  if (!target) {
-    notifyAgent(session, `${action} failed: no DM channel found for any eligible approver.`);
-    return;
+  // Resolve delivery destination based on target policy.
+  // thread: originating messaging_group + session's thread_id.
+  // admin:  first reachable admin's DM (v1/v2 default behavior).
+  let destination: { channelType: string; platformId: string; threadId: string | null; label: string };
+  if (deliveryTarget === 'thread') {
+    if (!session.messaging_group_id) {
+      notifyAgent(session, `${action} failed: session has no originating channel to post approval in.`);
+      return;
+    }
+    const mg = getMessagingGroup(session.messaging_group_id);
+    if (!mg) {
+      notifyAgent(session, `${action} failed: originating channel not found.`);
+      return;
+    }
+    destination = {
+      channelType: mg.channel_type,
+      platformId: mg.platform_id,
+      threadId: session.thread_id,
+      label: `thread ${mg.channel_type}/${mg.platform_id}${session.thread_id ? ':' + session.thread_id : ''}`,
+    };
+  } else {
+    const approvers = pickApprover(session.agent_group_id);
+    if (approvers.length === 0) {
+      notifyAgent(session, `${action} failed: no owner or admin configured to approve.`);
+      return;
+    }
+    const originChannelType = session.messaging_group_id
+      ? (getMessagingGroup(session.messaging_group_id)?.channel_type ?? '')
+      : '';
+    const target = await pickApprovalDelivery(approvers, originChannelType);
+    if (!target) {
+      notifyAgent(session, `${action} failed: no DM channel found for any eligible approver.`);
+      return;
+    }
+    destination = {
+      channelType: target.messagingGroup.channel_type,
+      platformId: target.messagingGroup.platform_id,
+      threadId: null,
+      label: `admin DM ${target.userId}`,
+    };
   }
 
   const approvalId = `appr-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -197,9 +239,9 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<voi
   if (adapter) {
     try {
       await adapter.deliver(
-        target.messagingGroup.channel_type,
-        target.messagingGroup.platform_id,
-        null,
+        destination.channelType,
+        destination.platformId,
+        destination.threadId,
         'chat-sdk',
         JSON.stringify({
           type: 'ask_question',
@@ -210,11 +252,11 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<voi
         }),
       );
     } catch (err) {
-      log.error('Failed to deliver approval card', { action, approvalId, err });
-      notifyAgent(session, `${action} failed: could not deliver approval request to ${target.userId}.`);
+      log.error('Failed to deliver approval card', { action, approvalId, target: destination.label, err });
+      notifyAgent(session, `${action} failed: could not deliver approval request to ${destination.label}.`);
       return;
     }
   }
 
-  log.info('Approval requested', { action, approvalId, agentName, approver: target.userId });
+  log.info('Approval requested', { action, approvalId, agentName, target: destination.label, deliveryTarget });
 }
