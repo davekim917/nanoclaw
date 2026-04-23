@@ -633,7 +633,14 @@ async function deliverToAgent(
         const transcript = relevant.map((m) => `${m.sender}: ${m.text}`).join('\n');
         const parsed = JSON.parse(contentForWrite) as Record<string, unknown>;
         const originalText = typeof parsed.text === 'string' ? parsed.text : '';
-        parsed.text = `[${header}]\n${transcript}\n[Latest message]\n${originalText}`;
+        // Preserve any leading -m/-e/-m1/-e1 flag prefix at text start so the
+        // container-side flag parser (parseModelEffortFlags) still sees them.
+        // Without this, prepending `[Thread context]` pushes the flags into
+        // mid-text and the parser's ^-anchored regex silently fails.
+        const flagMatch = originalText.match(/^((?:\s*-[me]1?\s+\S*\s*)+)/);
+        const flagPrefix = flagMatch ? flagMatch[1] : '';
+        const rest = flagMatch ? originalText.slice(flagMatch[0].length) : originalText;
+        parsed.text = `${flagPrefix}[${header}]\n${transcript}\n[Latest message]\n${rest}`;
         contentForWrite = JSON.stringify(parsed);
       }
     } catch (err) {
