@@ -50,7 +50,6 @@ const REQUIRED_SETTINGS: Record<string, unknown> = {
   // Default model alias. Combined with ANTHROPIC_DEFAULT_OPUS_MODEL in env
   // above, this resolves to claude-opus-4-7 at spawn time.
   model: 'opus',
-  advisorModel: 'opus',
 };
 
 const DEFAULT_SETTINGS_JSON = JSON.stringify({ env: REQUIRED_ENV, ...REQUIRED_SETTINGS }, null, 2) + '\n';
