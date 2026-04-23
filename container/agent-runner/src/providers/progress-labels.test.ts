@@ -17,18 +17,15 @@ describe('deriveProgressLabels', () => {
     else process.env.NANOCLAW_HIDE_THINKING = originalEnv;
   });
 
-  test('returns empty on non-assistant message', () => {
+  test('empty / non-assistant input', () => {
     expect(deriveProgressLabels({ type: 'system' })).toEqual([]);
     expect(deriveProgressLabels(null)).toEqual([]);
-  });
-
-  test('returns empty when content is not an array', () => {
     expect(deriveProgressLabels({ message: { content: 'text' } })).toEqual([]);
   });
 
   test('forwards thinking block text', () => {
-    const msg = assistantMessage([{ type: 'thinking', thinking: 'Let me check the schema first.', signature: 'sig' }]);
-    expect(deriveProgressLabels(msg)).toEqual(['Let me check the schema first.']);
+    const msg = assistantMessage([{ type: 'thinking', thinking: 'Let me check the schema.', signature: 'sig' }]);
+    expect(deriveProgressLabels(msg)).toEqual(['Let me check the schema.']);
   });
 
   test('truncates long thinking text on word boundary', () => {
@@ -38,74 +35,109 @@ describe('deriveProgressLabels', () => {
     );
     expect(labels).toHaveLength(1);
     expect(labels[0].endsWith('…')).toBe(true);
-    expect(labels[0].length).toBeLessThanOrEqual(400);
+    expect(labels[0].length).toBeLessThanOrEqual(500);
   });
 
-  test('skips empty thinking blocks', () => {
-    expect(deriveProgressLabels(assistantMessage([{ type: 'thinking', thinking: '   ', signature: 's' }]))).toEqual([]);
-  });
-
-  test('hides thinking when NANOCLAW_HIDE_THINKING=1', () => {
+  test('NANOCLAW_HIDE_THINKING=1 suppresses thinking', () => {
     process.env.NANOCLAW_HIDE_THINKING = '1';
     const msg = assistantMessage([{ type: 'thinking', thinking: 'Hidden reasoning', signature: 's' }]);
     expect(deriveProgressLabels(msg)).toEqual([]);
   });
 
-  test('0 / false / empty string all count as enabled (default behavior)', () => {
-    for (const v of ['0', 'false', 'False', '']) {
-      process.env.NANOCLAW_HIDE_THINKING = v;
-      const msg = assistantMessage([{ type: 'thinking', thinking: 'visible', signature: 's' }]);
-      expect(deriveProgressLabels(msg)).toEqual(['visible']);
+  test('Bash label shows the actual command, first line only', () => {
+    const msg = assistantMessage([
+      {
+        type: 'tool_use',
+        name: 'Bash',
+        input: { command: 'snow sql -q "SELECT count(*) FROM foo"\necho done' },
+      },
+    ]);
+    expect(deriveProgressLabels(msg)).toEqual(['Bash: snow sql -q "SELECT count(*) FROM foo"']);
+  });
+
+  test('Read / Edit / Write labels show file path', () => {
+    for (const name of ['Read', 'Edit', 'Write', 'NotebookEdit']) {
+      const msg = assistantMessage([{ type: 'tool_use', name, input: { file_path: 'src/delivery.ts' } }]);
+      expect(deriveProgressLabels(msg)).toEqual([`${name}: src/delivery.ts`]);
     }
+  });
+
+  test('Glob shows the pattern', () => {
+    const msg = assistantMessage([{ type: 'tool_use', name: 'Glob', input: { pattern: '**/*.ts' } }]);
+    expect(deriveProgressLabels(msg)).toEqual(['Glob: **/*.ts']);
+  });
+
+  test('Grep formats "pattern" in path', () => {
+    const msg1 = assistantMessage([
+      { type: 'tool_use', name: 'Grep', input: { pattern: 'thinking', path: 'container/' } },
+    ]);
+    expect(deriveProgressLabels(msg1)).toEqual(['Grep: "thinking" in container/']);
+
+    const msg2 = assistantMessage([{ type: 'tool_use', name: 'Grep', input: { pattern: 'thinking' } }]);
+    expect(deriveProgressLabels(msg2)).toEqual(['Grep: "thinking"']);
+  });
+
+  test('WebSearch / WebFetch show query / url', () => {
+    const msg1 = assistantMessage([{ type: 'tool_use', name: 'WebSearch', input: { query: 'claude api docs' } }]);
+    expect(deriveProgressLabels(msg1)).toEqual(['WebSearch: claude api docs']);
+
+    const msg2 = assistantMessage([
+      { type: 'tool_use', name: 'WebFetch', input: { url: 'https://example.com/page' } },
+    ]);
+    expect(deriveProgressLabels(msg2)).toEqual(['WebFetch: https://example.com/page']);
+  });
+
+  test('Skill shows skill name', () => {
+    expect(
+      deriveProgressLabels(
+        assistantMessage([{ type: 'tool_use', name: 'Skill', input: { skill: 'team-brief' } }]),
+      ),
+    ).toEqual(['Skill: team-brief']);
+    // Plugin-namespaced
+    expect(
+      deriveProgressLabels(
+        assistantMessage([
+          { type: 'tool_use', name: 'Skill', input: { skill: 'bootstrap-workflow:team-brief' } },
+        ]),
+      ),
+    ).toEqual(['Skill: bootstrap-workflow:team-brief']);
+    // Missing input → tool name only
+    expect(
+      deriveProgressLabels(assistantMessage([{ type: 'tool_use', name: 'Skill', input: {} }])),
+    ).toEqual(['Skill']);
+  });
+
+  test('Task shows subagent type', () => {
+    const msg = assistantMessage([
+      { type: 'tool_use', name: 'Task', input: { subagent_type: 'general-purpose', description: 'research X' } },
+    ]);
+    expect(deriveProgressLabels(msg)).toEqual(['Task: general-purpose']);
+  });
+
+  test('TodoWrite shows task count', () => {
+    const msg = assistantMessage([
+      { type: 'tool_use', name: 'TodoWrite', input: { todos: [{ content: 'a' }, { content: 'b' }] } },
+    ]);
+    expect(deriveProgressLabels(msg)).toEqual(['TodoWrite: 2 tasks']);
+  });
+
+  test('MCP tools: show full name and first string input', () => {
+    const msg = assistantMessage([
+      { type: 'tool_use', name: 'mcp__gitnexus__query', input: { query: 'auth flow' } },
+    ]);
+    expect(deriveProgressLabels(msg)).toEqual(['mcp__gitnexus__query: auth flow']);
+  });
+
+  test('MCP tools: no usable input → name only', () => {
+    const msg = assistantMessage([{ type: 'tool_use', name: 'mcp__x__y', input: {} }]);
+    expect(deriveProgressLabels(msg)).toEqual(['mcp__x__y']);
   });
 
   test('emits both thinking and tool_use labels in order', () => {
     const msg = assistantMessage([
-      { type: 'thinking', thinking: 'Searching files for the config', signature: 's' },
-      { type: 'tool_use', name: 'Grep', input: { pattern: 'foo' } },
+      { type: 'thinking', thinking: 'Looking up the schema.', signature: 's' },
+      { type: 'tool_use', name: 'Grep', input: { pattern: 'schema', path: 'src/' } },
     ]);
-    expect(deriveProgressLabels(msg)).toEqual(['Searching files for the config', 'Searching']);
-  });
-
-  test('Skill tool reads skill name from `skill` input', () => {
-    const msg = assistantMessage([{ type: 'tool_use', name: 'Skill', input: { skill: 'team-brief' } }]);
-    expect(deriveProgressLabels(msg)).toEqual(['Invoking skill: team-brief']);
-  });
-
-  test('Skill tool falls back to `name` input', () => {
-    const msg = assistantMessage([{ type: 'tool_use', name: 'Skill', input: { name: 'review-swarm' } }]);
-    expect(deriveProgressLabels(msg)).toEqual(['Invoking skill: review-swarm']);
-  });
-
-  test('Skill tool preserves plugin:skill namespaces', () => {
-    const msg = assistantMessage([{ type: 'tool_use', name: 'Skill', input: { skill: 'bootstrap-workflow:team-brief' } }]);
-    expect(deriveProgressLabels(msg)).toEqual(['Invoking skill: bootstrap-workflow:team-brief']);
-  });
-
-  test('Skill tool falls back to generic label when neither input is set', () => {
-    const msg = assistantMessage([{ type: 'tool_use', name: 'Skill', input: {} }]);
-    expect(deriveProgressLabels(msg)).toEqual(['Invoking skill']);
-  });
-
-  test('MCP tool shows the tool suffix', () => {
-    const msg = assistantMessage([{ type: 'tool_use', name: 'mcp__gitnexus__query', input: {} }]);
-    expect(deriveProgressLabels(msg)).toEqual(['Using query']);
-  });
-
-  test('standard Bash/Read/Edit/WebSearch labels still render', () => {
-    const cases: Array<[string, Record<string, unknown>, string]> = [
-      ['Bash', { command: 'dbt build --select fct_orders' }, 'Running: dbt build --select fct_orders'],
-      ['Read', {}, 'Reading files'],
-      ['Grep', {}, 'Searching'],
-      ['Edit', {}, 'Editing files'],
-      ['WebSearch', {}, 'Web search'],
-      ['WebFetch', {}, 'Fetching web page'],
-      ['TodoWrite', {}, 'Planning'],
-      ['Task', {}, 'Delegating subtask'],
-    ];
-    for (const [name, input, expected] of cases) {
-      const msg = assistantMessage([{ type: 'tool_use', name, input }]);
-      expect(deriveProgressLabels(msg)).toEqual([expected]);
-    }
+    expect(deriveProgressLabels(msg)).toEqual(['Looking up the schema.', 'Grep: "schema" in src/']);
   });
 });

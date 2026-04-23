@@ -14,18 +14,13 @@ import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/conn
 import { registerProvider } from './provider-registry.js';
 import type { AgentProvider, AgentQuery, McpServerConfig, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
 import { autoCommitDirtyWorktrees } from '../worktree-autosave.js';
-import { sanitizeBashLabel } from './bash-label.js';
 
 function log(msg: string): void {
   console.error(`[claude-provider] ${msg}`);
 }
 
-/**
- * Maximum characters of thinking-block text to forward as a progress
- * event. Thinking can run thousands of tokens; a full dump would flood
- * the chat surface. Truncate on word boundary with an ellipsis.
- */
-const THINKING_SNIPPET_MAX = 400;
+/** Max chars per label. Long thinking prose and long commands both cap here. */
+const LABEL_MAX = 500;
 
 /** Env gate: set NANOCLAW_HIDE_THINKING=1 to suppress thinking-block forwarding. */
 function thinkingForwardingEnabled(): boolean {
@@ -33,63 +28,85 @@ function thinkingForwardingEnabled(): boolean {
   return !v || v === '0' || v.toLowerCase() === 'false';
 }
 
-function truncateThinking(s: string): string {
+function truncate(s: string): string {
   const trimmed = s.trim();
-  if (trimmed.length <= THINKING_SNIPPET_MAX) return trimmed;
-  return trimmed.slice(0, THINKING_SNIPPET_MAX - 1).replace(/\s+\S*$/, '') + '…';
-}
-
-function toolUseLabel(b: { name?: string; input?: Record<string, unknown> }): string | null {
-  const name = b.name ?? 'tool';
-  const input = b.input ?? {};
-  switch (name) {
-    case 'Bash':
-      return sanitizeBashLabel(typeof input.command === 'string' ? input.command : '');
-    case 'Read':
-    case 'Glob':
-      return 'Reading files';
-    case 'Grep':
-      return 'Searching';
-    case 'Edit':
-    case 'Write':
-    case 'NotebookEdit':
-      return 'Editing files';
-    case 'WebSearch':
-      return 'Web search';
-    case 'WebFetch':
-      return 'Fetching web page';
-    case 'TodoWrite':
-      return 'Planning';
-    case 'Task':
-      return 'Delegating subtask';
-    case 'ToolSearch':
-      return 'Looking up tools';
-    case 'Skill': {
-      // The Skill tool's input shape varies across SDK versions; try the two
-      // documented shapes (`skill` and `name`) before falling back to the
-      // generic label. Plugin-namespaced form "plugin:skill" is kept intact —
-      // the colon is meaningful and users recognize the namespace.
-      const raw = typeof input.skill === 'string' ? input.skill : typeof input.name === 'string' ? input.name : '';
-      const skill = raw.trim();
-      return skill ? `Invoking skill: ${skill}` : 'Invoking skill';
-    }
-    default:
-      if (name.startsWith('mcp__')) {
-        const parts = name.split('__');
-        return `Using ${parts[parts.length - 1] ?? name}`;
-      }
-      return `Using ${name}`;
-  }
+  if (trimmed.length <= LABEL_MAX) return trimmed;
+  return trimmed.slice(0, LABEL_MAX - 1).replace(/\s+\S*$/, '') + '…';
 }
 
 /**
- * Derive ordered progress labels from an assistant message. A single turn can
- * carry both a thinking block (the model's reasoning) and a tool_use block;
- * both are surfaced as progress events so users see *why* the agent is doing
- * something, not just what.
+ * Pick the most meaningful input field for a tool call. Each tool has a
+ * primary input (command, file_path, pattern, query, url, skill, etc.);
+ * we surface that field in the progress label. Secrets in the value are
+ * handled by the host-side scrubber at delivery time (src/secret-scrubber.ts).
+ */
+function toolDetail(name: string, input: Record<string, unknown>): string | null {
+  const asStr = (k: string): string | null => {
+    const v = input[k];
+    return typeof v === 'string' && v.trim().length > 0 ? v.trim() : null;
+  };
+  switch (name) {
+    case 'Bash': {
+      const cmd = asStr('command');
+      // First line only; the progress surface is a single-line status.
+      return cmd ? cmd.split('\n')[0] : null;
+    }
+    case 'Read':
+    case 'Edit':
+    case 'Write':
+    case 'NotebookEdit':
+      return asStr('file_path') ?? asStr('path');
+    case 'Glob':
+      return asStr('pattern') ?? asStr('path');
+    case 'Grep': {
+      const pattern = asStr('pattern');
+      const path = asStr('path');
+      if (pattern && path) return `"${pattern}" in ${path}`;
+      if (pattern) return `"${pattern}"`;
+      return path;
+    }
+    case 'WebSearch':
+    case 'ToolSearch':
+      return asStr('query');
+    case 'WebFetch':
+      return asStr('url');
+    case 'Task':
+      return asStr('subagent_type') ?? asStr('description');
+    case 'TodoWrite': {
+      const todos = Array.isArray(input.todos) ? input.todos : [];
+      return todos.length > 0 ? `${todos.length} tasks` : null;
+    }
+    case 'Skill':
+      return asStr('skill') ?? asStr('name');
+    default: {
+      // MCP / unknown tools: surface the first non-empty string-ish input.
+      for (const v of Object.values(input)) {
+        if (typeof v === 'string' && v.trim().length > 0) return v.trim();
+        if (typeof v === 'number') return String(v);
+      }
+      return null;
+    }
+  }
+}
+
+function toolUseLabel(b: { name?: string; input?: Record<string, unknown> }): string {
+  const name = b.name ?? 'tool';
+  const detail = toolDetail(name, b.input ?? {});
+  return detail ? `${name}: ${detail}` : name;
+}
+
+/**
+ * Derive ordered progress labels from an assistant message. Each tool_use
+ * block becomes `<ToolName>: <primary input>` — intentionally minimal
+ * interpretation so users see what the agent is actually doing. Thinking
+ * blocks are forwarded as their raw prose (truncated to LABEL_MAX chars).
  *
- * Thinking forwarding can be disabled with NANOCLAW_HIDE_THINKING=1 for groups
- * that prefer a tighter UI. Tool-use labels always surface.
+ * Secret scrubbing happens host-side in delivery.ts (scrubSecrets catches
+ * Bearer tokens, vendor-prefix keys, registered .env values) — the
+ * container emits raw input and trusts the outbound filter.
+ *
+ * NANOCLAW_HIDE_THINKING=1 suppresses thinking forwarding for groups that
+ * prefer a tighter UI. Tool-use labels always surface.
  */
 export function deriveProgressLabels(message: unknown): string[] {
   if (!message || typeof message !== 'object') return [];
@@ -100,10 +117,9 @@ export function deriveProgressLabels(message: unknown): string[] {
   for (const block of content) {
     const b = block as { type?: string; name?: string; input?: Record<string, unknown>; thinking?: unknown };
     if (b.type === 'thinking' && forwardThinking && typeof b.thinking === 'string' && b.thinking.trim().length > 0) {
-      labels.push(truncateThinking(b.thinking));
+      labels.push(truncate(b.thinking));
     } else if (b.type === 'tool_use') {
-      const label = toolUseLabel(b);
-      if (label) labels.push(label);
+      labels.push(truncate(toolUseLabel(b)));
     }
   }
   return labels;
@@ -802,6 +818,11 @@ export class ClaudeProvider implements AgentProvider {
         resume: input.continuation,
         model: input.model,
         ...(input.effort ? { effort: input.effort as EffortLevel } : {}),
+        // Enable extended thinking so the SDK emits `thinking` content blocks
+        // into the response stream. deriveProgressLabels forwards those as
+        // progress events so users see the agent's reasoning, not just its
+        // tool calls. Budget convention: max_output − 1 (Opus 4.7 = 128000).
+        thinking: { type: 'enabled', budgetTokens: 127999 },
         pathToClaudeCodeExecutable: '/pnpm/claude',
         systemPrompt: instructions ? { type: 'preset' as const, preset: 'claude_code' as const, append: instructions } : undefined,
         disallowedTools: SDK_DISALLOWED_TOOLS,
