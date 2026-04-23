@@ -633,14 +633,14 @@ async function deliverToAgent(
         const transcript = relevant.map((m) => `${m.sender}: ${m.text}`).join('\n');
         const parsed = JSON.parse(contentForWrite) as Record<string, unknown>;
         const originalText = typeof parsed.text === 'string' ? parsed.text : '';
-        // Preserve any leading -m/-e/-m1/-e1 flag prefix at text start so the
-        // container-side flag parser (parseModelEffortFlags) still sees them.
-        // Without this, prepending `[Thread context]` pushes the flags into
-        // mid-text and the parser's ^-anchored regex silently fails.
-        const flagMatch = originalText.match(/^((?:\s*-[me]1?\s+\S*\s*)+)/);
-        const flagPrefix = flagMatch ? flagMatch[1] : '';
-        const rest = flagMatch ? originalText.slice(flagMatch[0].length) : originalText;
-        parsed.text = `${flagPrefix}[${header}]\n${transcript}\n[Latest message]\n${rest}`;
+        // Preserve any leading platform bot-mention + flag prefix at text
+        // start so the container-side flag parser still sees flags after
+        // the [Thread context] prepend. Covers both Discord `<@BOTID>` and
+        // Slack `<@UXXX>` mention tokens, optionally followed by flags.
+        const prefixMatch = originalText.match(/^(\s*<@!?[^>]+>\s*)?((?:\s*-[me]1?\s+\S*\s*)+)?/);
+        const prefix = prefixMatch ? prefixMatch[0] : '';
+        const rest = originalText.slice(prefix.length);
+        parsed.text = `${prefix}[${header}]\n${transcript}\n[Latest message]\n${rest}`;
         contentForWrite = JSON.stringify(parsed);
       }
     } catch (err) {

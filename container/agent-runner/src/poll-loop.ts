@@ -623,7 +623,15 @@ function applyFlagBatch(
   }
 
   const text = content.text ?? '';
-  const flags = parseModelEffortFlags(text);
+  // Strip a leading platform bot-mention token (Discord `<@BOTID>`, Slack
+  // `<@UXXX>`) before flag parsing — the raw text from chat-sdk preserves
+  // the mention at text start, which breaks the ^-anchored flag regex on
+  // the opening @-mention of any new Discord thread. Mention info is
+  // already carried by event.isMention; the agent doesn't need the literal
+  // token in its prompt, so we drop it entirely from cleanedText too.
+  const mentionMatch = text.match(/^\s*<@!?[^>]+>\s*/);
+  const textAfterMention = mentionMatch ? text.slice(mentionMatch[0].length) : text;
+  const flags = parseModelEffortFlags(textAfterMention);
   const intent: FlagSwitchIntent = {};
 
   // Apply sticky changes first; they persist beyond this turn.
@@ -644,8 +652,10 @@ function applyFlagBatch(
   if (flags.turnModel) intent.requestedModel = flags.turnModel;
   if (flags.turnEffort) intent.requestedEffort = flags.turnEffort;
 
-  // If any flag was parsed, rewrite the message text to drop the prefix.
-  if (flags.cleanedText !== text) {
+  // If any flag was parsed, rewrite the message text to drop the flag
+  // prefix (and the mention token, if one was stripped). No flag → leave
+  // the original content intact so the agent still sees any mention.
+  if (flags.cleanedText !== textAfterMention) {
     content.text = flags.cleanedText;
     first.content = JSON.stringify(content);
   }
