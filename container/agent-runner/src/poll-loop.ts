@@ -165,20 +165,11 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // Model/effort flag parse — applied to the FIRST chat-kind message's
     // text. Only chat-like inbounds carry user-typed flags; task-script
     // outputs and system rows don't. Mutates the message content in place
-    // so the flag prefix never reaches the agent's prompt. Side-effects:
-    // updates sticky state in session_state and emits a confirmation chat
-    // so the user sees the switch took effect.
-    const { model: effectiveModel, effort: effectiveEffort, notice } = applyFlagBatch(keep, routing);
-    if (notice) {
-      writeMessageOut({
-        id: generateId(),
-        kind: 'chat',
-        platform_id: routing.platformId,
-        channel_type: routing.channelType,
-        thread_id: routing.threadId,
-        content: JSON.stringify({ text: notice }),
-      });
-    }
+    // so the flag prefix never reaches the agent's prompt. Sticky state is
+    // written to session_state here; the user-visible confirmation is
+    // deferred until AFTER the query so it can reflect the SDK's actual
+    // modelUsage (distinguishes real switch from silent fallback).
+    const { model: effectiveModel, effort: effectiveEffort, switchIntent } = applyFlagBatch(keep, routing);
 
     // Format messages: passthrough commands get raw text (only if the
     // provider natively handles slash commands), others get XML.
@@ -207,6 +198,19 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       if (result.continuation && result.continuation !== continuation) {
         continuation = result.continuation;
         setStoredSessionId(continuation);
+      }
+      if (switchIntent) {
+        const notice = buildPostQueryNotice(switchIntent, result.modelIds);
+        if (notice) {
+          writeMessageOut({
+            id: generateId(),
+            kind: 'chat',
+            platform_id: routing.platformId,
+            channel_type: routing.channelType,
+            thread_id: routing.threadId,
+            content: JSON.stringify({ text: notice }),
+          });
+        }
       }
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
@@ -359,6 +363,12 @@ function formatMessagesWithCommands(messages: MessageInRow[], nativeSlashCommand
 
 interface QueryResult {
   continuation?: string;
+  /**
+   * Model IDs the SDK actually used for this turn. Set from the last
+   * `result` event's `modelIds`; undefined when no result event arrived or
+   * the provider didn't populate it.
+   */
+  modelIds?: string[];
 }
 
 async function processQuery(
@@ -367,6 +377,7 @@ async function processQuery(
   initialBatchIds: string[],
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
+  let queryModelIds: string[] | undefined;
   let done = false;
 
   // Concurrent polling: push follow-ups into the active query as they arrive.
@@ -424,6 +435,9 @@ async function processQuery(
         // (send_message) mid-turn, or the message may not need a response
         // at all — either way the turn is finished.
         markCompleted(initialBatchIds);
+        if (event.modelIds && event.modelIds.length > 0) {
+          queryModelIds = event.modelIds;
+        }
         if (event.text) {
           dispatchResultText(event.text, routing);
         }
@@ -434,7 +448,7 @@ async function processQuery(
     clearInterval(pollHandle);
   }
 
-  return { continuation: queryContinuation };
+  return { continuation: queryContinuation, modelIds: queryModelIds };
 }
 
 function handleEvent(event: ProviderEvent, routing: RoutingContext): void {
@@ -568,20 +582,32 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
+ * Describes a model/effort switch requested on the current turn. Emitted by
+ * `applyFlagBatch` and consumed post-query to build a confirmation notice
+ * that reflects the SDK's actual result — see `buildPostQueryNotice`.
+ */
+interface FlagSwitchIntent {
+  /** Model the user asked for this turn (sticky or one-shot). */
+  requestedModel?: string;
+  /** True when `-m ''` was seen — user wants sticky model cleared. */
+  clearedModel?: boolean;
+  /** Effort the user asked for this turn (sticky or one-shot). */
+  requestedEffort?: string;
+  clearedEffort?: boolean;
+}
+
+/**
  * Parse -m/-m1/-e/-e1 flags from the first chat-kind message in the batch,
  * update sticky session_state, mutate the message content to drop the flag
  * prefix, and compute the effective (model, effort) for this query.
  *
- * Effective precedence: turn override (`-m`/`-e`) → sticky (`-m1`/`-e1`) →
+ * Effective precedence: turn override (`-m1`/`-e1`) → sticky (`-m`/`-e`) →
  * undefined (provider default).
- *
- * Returns a notice string to post back to the user when ANY flag landed, so
- * the switch is visible in chat. Returns undefined notice otherwise.
  */
 function applyFlagBatch(
   messages: MessageInRow[],
   _routing: RoutingContext,
-): { model?: string; effort?: string; notice?: string } {
+): { model?: string; effort?: string; switchIntent?: FlagSwitchIntent } {
   // Only flags on the first chat-kind message are considered — follow-ups
   // in the same batch already share context.
   const first = messages.find((m) => m.kind === 'chat' || m.kind === 'chat-sdk');
@@ -598,25 +624,25 @@ function applyFlagBatch(
 
   const text = content.text ?? '';
   const flags = parseModelEffortFlags(text);
-  const noticeParts: string[] = [];
+  const intent: FlagSwitchIntent = {};
 
   // Apply sticky changes first; they persist beyond this turn.
   if (flags.clearStickyModel) {
     clearStickyModel();
-    noticeParts.push('sticky model cleared');
+    intent.clearedModel = true;
   } else if (flags.stickyModel) {
     setStickyModel(flags.stickyModel);
-    noticeParts.push(`sticky model → ${flags.stickyModel}`);
+    intent.requestedModel = flags.stickyModel;
   }
   if (flags.clearStickyEffort) {
     clearStickyEffort();
-    noticeParts.push('sticky effort cleared');
+    intent.clearedEffort = true;
   } else if (flags.stickyEffort) {
     setStickyEffort(flags.stickyEffort);
-    noticeParts.push(`sticky effort → ${flags.stickyEffort}`);
+    intent.requestedEffort = flags.stickyEffort;
   }
-  if (flags.turnModel) noticeParts.push(`turn model → ${flags.turnModel}`);
-  if (flags.turnEffort) noticeParts.push(`turn effort → ${flags.turnEffort}`);
+  if (flags.turnModel) intent.requestedModel = flags.turnModel;
+  if (flags.turnEffort) intent.requestedEffort = flags.turnEffort;
 
   // If any flag was parsed, rewrite the message text to drop the prefix.
   if (flags.cleanedText !== text) {
@@ -629,13 +655,12 @@ function applyFlagBatch(
   const model = flags.turnModel ?? (flags.stickyModel || stickyModel);
   const effort = flags.turnEffort ?? (flags.stickyEffort || stickyEffort);
 
-  // If the cleaned text is empty AND the only thing the user typed was a
-  // flag line, the prompt would otherwise be an empty chat message. Drop
-  // the message from `messages` implicitly by emptying it — the outer
-  // loop still runs formatMessagesWithCommands over the batch, and an
-  // empty content reduces to a no-op prompt. Simpler: swap to an
-  // acknowledgement so the turn is meaningful.
-  if (content.text === '' && noticeParts.length > 0) {
+  // If cleaned text is empty AND a flag was the whole message, swap to a
+  // placeholder so formatMessagesWithCommands still renders something for
+  // the SDK to respond to. The post-query notice is the real acknowledgment.
+  const switchRequested =
+    intent.requestedModel || intent.clearedModel || intent.requestedEffort || intent.clearedEffort;
+  if (content.text === '' && switchRequested) {
     content.text = '(switch acknowledged)';
     first.content = JSON.stringify(content);
   }
@@ -643,6 +668,50 @@ function applyFlagBatch(
   return {
     model,
     effort,
-    notice: noticeParts.length > 0 ? `⚙️ ${noticeParts.join(', ')}` : undefined,
+    switchIntent: switchRequested ? intent : undefined,
   };
+}
+
+/**
+ * Build a post-query notice confirming what actually changed. Uses the SDK's
+ * reported modelIds (from `SDKResultSuccess.modelUsage` keys) to verify the
+ * model switch took effect — distinguishes true confirmation from silent
+ * fallback. Effort has no runtime echo in the Anthropic API; we emit it as
+ * "applied" based on the Promise-resolving SDK option pass-through.
+ */
+function buildPostQueryNotice(intent: FlagSwitchIntent, modelIds: string[] | undefined): string | undefined {
+  const parts: string[] = [];
+
+  if (intent.clearedModel) {
+    parts.push('sticky model cleared');
+  } else if (intent.requestedModel) {
+    const requested = intent.requestedModel;
+    const actuals = (modelIds ?? []).filter((m) => m.length > 0);
+    const matched =
+      actuals.length > 0 &&
+      actuals.some((m) => {
+        if (m === requested) return true;
+        // `-m haiku` resolves to the current default haiku id via SDK alias;
+        // accept a prefix match so bare alias requests confirm cleanly.
+        return m.toLowerCase().startsWith(`claude-${requested.toLowerCase()}-`);
+      });
+    if (matched) {
+      parts.push(`model → ${actuals.join(', ')}`);
+    } else if (actuals.length > 0) {
+      parts.push(`requested model ${requested}, got ${actuals.join(', ')}`);
+    } else {
+      // No modelIds reported (older provider, error path). Honest ack.
+      parts.push(`model → ${requested} (applied)`);
+    }
+  }
+
+  if (intent.clearedEffort) {
+    parts.push('sticky effort cleared');
+  } else if (intent.requestedEffort) {
+    parts.push(`effort → ${intent.requestedEffort} (applied)`);
+  }
+
+  if (parts.length === 0) return undefined;
+  const warn = intent.requestedModel && modelIds && modelIds.length > 0 && !parts[0].startsWith('model → ');
+  return `${warn ? '⚠️' : '⚙️'} ${parts.join(', ')}`;
 }
