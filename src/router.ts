@@ -34,6 +34,7 @@ import { startTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { resolveSession, writeSessionMessage, writeOutboundDirect } from './session-manager.js';
 import { upsertArchiveMessage } from './message-archive.js';
+import { parseMessageFlags, formatFlagConfirmation } from './flag-parser.js';
 import { maybeRenameNewThread } from './topic-title.js';
 import { wakeContainer } from './container-runner.js';
 import { getSession } from './db/sessions.js';
@@ -606,6 +607,34 @@ async function deliverToAgent(
     }
   }
 
+  // Model/effort flag parse — run once at the router boundary. Strips any
+  // leading mention + flag prefix (or `/switch` command) from the message
+  // text and produces a structured FlagIntent. Downstream code never
+  // re-parses text for flags; the container reads `content.flagIntent`
+  // directly. Host emits an immediate confirmation via outbound so the
+  // user sees the switch land without waiting for the next agent turn.
+  let flagIntent: import('./flag-parser.js').FlagIntent | undefined;
+  let flagCleanedText: string | null = null;
+  if (event.message.kind === 'chat' || event.message.kind === 'chat-sdk') {
+    const rawText = parsedContent.text ?? '';
+    const parsed = parseMessageFlags(rawText);
+    if (parsed.intent || parsed.errors.length > 0 || parsed.warnings.length > 0) {
+      flagIntent = parsed.intent;
+      flagCleanedText = parsed.cleanedText;
+      const notice = formatFlagConfirmation(parsed.intent ?? {}, parsed.warnings, parsed.errors);
+      if (notice) {
+        writeOutboundDirect(session.agent_group_id, session.id, {
+          id: `flag-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          kind: 'chat',
+          platformId: deliveryAddr.platformId,
+          channelType: deliveryAddr.channelType,
+          threadId: deliveryAddr.threadId,
+          content: JSON.stringify({ text: notice }),
+        });
+      }
+    }
+  }
+
   // Thread-context parity with v1: on engaged mentions inside a thread,
   // fetch recent thread history from the platform (covers messages from
   // other bots and plain user messages that never engaged us) and prepend
@@ -613,7 +642,17 @@ async function deliverToAgent(
   // wakes: only messages newer than the session's last_active — the agent's
   // own prior turns are already in the SDK continuation, so re-prepending
   // them would just bloat context.
+  //
+  // Also folds in the flag parse result: cleanedText (mention + flags
+  // stripped) replaces content.text, and flagIntent is attached as
+  // structured metadata so the container never re-parses text for flags.
   let contentForWrite = persistedContent;
+  if (flagIntent || flagCleanedText !== null) {
+    const parsed = JSON.parse(contentForWrite) as Record<string, unknown>;
+    if (flagCleanedText !== null) parsed.text = flagCleanedText;
+    if (flagIntent) parsed.flagIntent = flagIntent;
+    contentForWrite = JSON.stringify(parsed);
+  }
   if (
     wake &&
     adapterSupportsThreads &&
@@ -633,17 +672,11 @@ async function deliverToAgent(
         const transcript = relevant.map((m) => `${m.sender}: ${m.text}`).join('\n');
         const parsed = JSON.parse(contentForWrite) as Record<string, unknown>;
         const originalText = typeof parsed.text === 'string' ? parsed.text : '';
-        // Preserve any leading platform bot-mention + flag prefix at text
-        // start so the container-side flag parser still sees flags after
-        // the [Thread context] prepend. Covers `<@BOTID>` (Discord + raw
-        // Slack) AND `@BOTID` (Slack post chat-sdk angle-bracket strip),
-        // optionally followed by -m/-e flags.
-        const prefixMatch = originalText.match(
-          /^(\s*(?:<@!?[^>]+>|@[\w.-]+)\s*)?((?:\s*-[me]1?\s+\S*\s*)+)?/,
-        );
-        const prefix = prefixMatch ? prefixMatch[0] : '';
-        const rest = originalText.slice(prefix.length);
-        parsed.text = `${prefix}[${header}]\n${transcript}\n[Latest message]\n${rest}`;
+        // Text is already flag- and mention-free at this point (flag parser
+        // ran above, cleanedText replaces content.text). Prepending the
+        // thread-context block is a straight string concat; no preservation
+        // hack needed.
+        parsed.text = `[${header}]\n${transcript}\n[Latest message]\n${originalText}`;
         contentForWrite = JSON.stringify(parsed);
       }
     } catch (err) {

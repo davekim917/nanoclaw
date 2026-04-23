@@ -18,7 +18,6 @@ import {
   extractRouting,
   categorizeMessage,
   isClearCommand,
-  parseModelEffortFlags,
   stripInternalTags,
   type RoutingContext,
 } from './formatter.js';
@@ -162,14 +161,11 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       continue;
     }
 
-    // Model/effort flag parse — applied to the FIRST chat-kind message's
-    // text. Only chat-like inbounds carry user-typed flags; task-script
-    // outputs and system rows don't. Mutates the message content in place
-    // so the flag prefix never reaches the agent's prompt. Sticky state is
-    // written to session_state here; the user-visible confirmation is
-    // deferred until AFTER the query so it can reflect the SDK's actual
-    // modelUsage (distinguishes real switch from silent fallback).
-    const { model: effectiveModel, effort: effectiveEffort, switchIntent } = applyFlagBatch(keep, routing);
+    // Read structured flag intent attached by the host router and apply
+    // sticky state. Host emits the user-visible confirmation at the router
+    // boundary (see src/router.ts + src/flag-parser.ts), so no notice is
+    // written from here.
+    const { model: effectiveModel, effort: effectiveEffort } = applyFlagBatch(keep, routing);
 
     // Format messages: passthrough commands get raw text (only if the
     // provider natively handles slash commands), others get XML.
@@ -194,7 +190,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     const skippedSet = new Set(skipped);
     const processingIds = ids.filter((id) => !commandIds.includes(id) && !skippedSet.has(id));
     try {
-      const result = await processQuery(query, routing, processingIds, switchIntent);
+      const result = await processQuery(query, routing, processingIds);
       if (result.continuation && result.continuation !== continuation) {
         continuation = result.continuation;
         setStoredSessionId(continuation);
@@ -222,7 +218,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             model: effectiveModel,
             effort: effectiveEffort,
           });
-          const retryResult = await processQuery(retryQuery, routing, processingIds, switchIntent);
+          const retryResult = await processQuery(retryQuery, routing, processingIds);
           if (retryResult.continuation && retryResult.continuation !== continuation) {
             continuation = retryResult.continuation;
             setStoredSessionId(continuation);
@@ -263,7 +259,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             cwd: config.cwd,
             systemContext: config.systemContext,
           });
-          const retryResult = await processQuery(retryQuery, routing, processingIds, switchIntent);
+          const retryResult = await processQuery(retryQuery, routing, processingIds);
           if (retryResult.continuation) {
             continuation = retryResult.continuation;
             setStoredSessionId(continuation);
@@ -362,11 +358,9 @@ async function processQuery(
   query: AgentQuery,
   routing: RoutingContext,
   initialBatchIds: string[],
-  switchIntent?: FlagSwitchIntent,
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
   let queryModelIds: string[] | undefined;
-  let noticeEmitted = false;
   let done = false;
 
   // Concurrent polling: push follow-ups into the active query as they arrive.
@@ -426,26 +420,6 @@ async function processQuery(
         markCompleted(initialBatchIds);
         if (event.modelIds && event.modelIds.length > 0) {
           queryModelIds = event.modelIds;
-        }
-        // Emit the switch-confirmation notice on the FIRST result of this
-        // query. processQuery stays open across follow-up pushes so awaiting
-        // its return to emit is effectively dead — the stream only closes
-        // on container shutdown. Gate with `noticeEmitted` so a second
-        // result (from a concurrent-poll follow-up that pushed while the
-        // initial turn was still streaming) doesn't duplicate the notice.
-        if (switchIntent && !noticeEmitted) {
-          noticeEmitted = true;
-          const notice = buildPostQueryNotice(switchIntent, event.modelIds);
-          if (notice) {
-            writeMessageOut({
-              id: generateId(),
-              kind: 'chat',
-              platform_id: routing.platformId,
-              channel_type: routing.channelType,
-              thread_id: routing.threadId,
-              content: JSON.stringify({ text: notice }),
-            });
-          }
         }
         if (event.text) {
           dispatchResultText(event.text, routing);
@@ -591,149 +565,77 @@ function sleep(ms: number): Promise<void> {
 }
 
 /**
- * Describes a model/effort switch requested on the current turn. Emitted by
- * `applyFlagBatch` and consumed post-query to build a confirmation notice
- * that reflects the SDK's actual result — see `buildPostQueryNotice`.
+ * Structured flag intent written by the host router on `messages_in.content`.
+ * Mirrors `FlagIntent` in src/flag-parser.ts — same shape, same semantics.
+ * Container reads this directly; no text-level parsing here anymore.
  */
-interface FlagSwitchIntent {
-  /** Model the user asked for this turn (sticky or one-shot). */
-  requestedModel?: string;
-  /** True when `-m ''` was seen — user wants sticky model cleared. */
-  clearedModel?: boolean;
-  /** Effort the user asked for this turn (sticky or one-shot). */
-  requestedEffort?: string;
-  clearedEffort?: boolean;
+interface FlagIntentFromRouter {
+  stickyModel?: string;
+  turnModel?: string;
+  clearStickyModel?: boolean;
+  stickyEffort?: string;
+  turnEffort?: string;
+  clearStickyEffort?: boolean;
 }
 
 /**
- * Parse -m/-m1/-e/-e1 flags from the first chat-kind message in the batch,
- * update sticky session_state, mutate the message content to drop the flag
- * prefix, and compute the effective (model, effort) for this query.
+ * Read the structured flag intent attached to any message in the batch by
+ * the host router, apply sticky state changes, and compute the effective
+ * (model, effort) for this turn.
  *
- * Effective precedence: turn override (`-m1`/`-e1`) → sticky (`-m`/`-e`) →
- * undefined (provider default).
+ * Effective precedence: turn override → sticky (just set or pre-existing) →
+ * provider default.
+ *
+ * Confirmation notices are emitted at the router boundary, not here — the
+ * host knows what it parsed and writes the canned confirmation directly to
+ * outbound.db so the user sees it without waiting for the turn.
  */
 function applyFlagBatch(
   messages: MessageInRow[],
   _routing: RoutingContext,
-): { model?: string; effort?: string; switchIntent?: FlagSwitchIntent } {
-  // Only flags on the first chat-kind message are considered — follow-ups
-  // in the same batch already share context.
-  const first = messages.find((m) => m.kind === 'chat' || m.kind === 'chat-sdk');
-  if (!first) {
-    return { model: getStickyModel(), effort: getStickyEffort() };
+): { model?: string; effort?: string } {
+  // Find any message in the batch carrying a flagIntent. Router attaches it
+  // to the specific inbound that had flags, which is typically the first
+  // chat message; scanning all covers the case where flag+prompt landed
+  // alongside accumulated rows.
+  let intent: FlagIntentFromRouter | undefined;
+  for (const m of messages) {
+    if (m.kind !== 'chat' && m.kind !== 'chat-sdk') continue;
+    try {
+      const parsed = JSON.parse(m.content) as { flagIntent?: FlagIntentFromRouter };
+      if (parsed.flagIntent) {
+        intent = parsed.flagIntent;
+        break;
+      }
+    } catch {
+      // Skip malformed rows.
+    }
   }
 
-  let content: { text?: string };
-  try {
-    content = JSON.parse(first.content) as { text?: string };
-  } catch {
-    return { model: getStickyModel(), effort: getStickyEffort() };
-  }
-
-  const text = content.text ?? '';
-  // Strip a leading platform bot-mention token (Discord `<@BOTID>`, Slack
-  // `<@UXXX>`) before flag parsing — the raw text from chat-sdk preserves
-  // the mention at text start, which breaks the ^-anchored flag regex on
-  // the opening @-mention of any new Discord thread. Mention info is
-  // already carried by event.isMention; the agent doesn't need the literal
-  // token in its prompt, so we drop it entirely from cleanedText too.
-  // Matches both Discord/raw-Slack `<@UID>` and Slack-post-strip `@UID`.
-  // chat-adapter/slack strips the angle brackets before landing text in
-  // messages_in, so the container sees a bare @-mention on Slack inbounds.
-  const mentionMatch = text.match(/^\s*(?:<@!?[^>]+>|@[\w.-]+)\s*/);
-  const textAfterMention = mentionMatch ? text.slice(mentionMatch[0].length) : text;
-  const flags = parseModelEffortFlags(textAfterMention);
-  const intent: FlagSwitchIntent = {};
-
-  // Apply sticky changes first; they persist beyond this turn.
-  if (flags.clearStickyModel) {
-    clearStickyModel();
-    intent.clearedModel = true;
-  } else if (flags.stickyModel) {
-    setStickyModel(flags.stickyModel);
-    intent.requestedModel = flags.stickyModel;
-  }
-  if (flags.clearStickyEffort) {
-    clearStickyEffort();
-    intent.clearedEffort = true;
-  } else if (flags.stickyEffort) {
-    setStickyEffort(flags.stickyEffort);
-    intent.requestedEffort = flags.stickyEffort;
-  }
-  if (flags.turnModel) intent.requestedModel = flags.turnModel;
-  if (flags.turnEffort) intent.requestedEffort = flags.turnEffort;
-
-  // If any flag was parsed, rewrite the message text to drop the flag
-  // prefix (and the mention token, if one was stripped). No flag → leave
-  // the original content intact so the agent still sees any mention.
-  if (flags.cleanedText !== textAfterMention) {
-    content.text = flags.cleanedText;
-    first.content = JSON.stringify(content);
+  if (intent) {
+    if (intent.clearStickyModel) {
+      clearStickyModel();
+    } else if (intent.stickyModel) {
+      setStickyModel(intent.stickyModel);
+    }
+    if (intent.clearStickyEffort) {
+      clearStickyEffort();
+    } else if (intent.stickyEffort) {
+      setStickyEffort(intent.stickyEffort);
+    }
   }
 
   const stickyModel = getStickyModel();
   const stickyEffort = getStickyEffort();
-  const model = flags.turnModel ?? (flags.stickyModel || stickyModel);
-  const effort = flags.turnEffort ?? (flags.stickyEffort || stickyEffort);
+  const model = intent?.turnModel ?? stickyModel;
+  const effort = intent?.turnEffort ?? stickyEffort;
 
-  // If cleaned text is empty AND a flag was the whole message, swap to a
-  // placeholder so formatMessagesWithCommands still renders something for
-  // the SDK to respond to. The post-query notice is the real acknowledgment.
-  const switchRequested =
-    intent.requestedModel || intent.clearedModel || intent.requestedEffort || intent.clearedEffort;
-  if (content.text === '' && switchRequested) {
-    content.text = '(switch acknowledged)';
-    first.content = JSON.stringify(content);
-  }
-
-  return {
-    model,
-    effort,
-    switchIntent: switchRequested ? intent : undefined,
-  };
+  return { model, effort };
 }
 
-/**
- * Build a post-query notice confirming what actually changed. Uses the SDK's
- * reported modelIds (from `SDKResultSuccess.modelUsage` keys) to verify the
- * model switch took effect — distinguishes true confirmation from silent
- * fallback. Effort has no runtime echo in the Anthropic API; we emit it as
- * "applied" based on the Promise-resolving SDK option pass-through.
- */
-function buildPostQueryNotice(intent: FlagSwitchIntent, modelIds: string[] | undefined): string | undefined {
-  const parts: string[] = [];
-
-  if (intent.clearedModel) {
-    parts.push('sticky model cleared');
-  } else if (intent.requestedModel) {
-    const requested = intent.requestedModel;
-    const actuals = (modelIds ?? []).filter((m) => m.length > 0);
-    const matched =
-      actuals.length > 0 &&
-      actuals.some((m) => {
-        if (m === requested) return true;
-        // `-m haiku` resolves to the current default haiku id via SDK alias;
-        // accept a prefix match so bare alias requests confirm cleanly.
-        return m.toLowerCase().startsWith(`claude-${requested.toLowerCase()}-`);
-      });
-    if (matched) {
-      parts.push(`model → ${actuals.join(', ')}`);
-    } else if (actuals.length > 0) {
-      parts.push(`requested model ${requested}, got ${actuals.join(', ')}`);
-    } else {
-      // No modelIds reported (older provider, error path). Honest ack.
-      parts.push(`model → ${requested} (applied)`);
-    }
-  }
-
-  if (intent.clearedEffort) {
-    parts.push('sticky effort cleared');
-  } else if (intent.requestedEffort) {
-    parts.push(`effort → ${intent.requestedEffort} (applied)`);
-  }
-
-  if (parts.length === 0) return undefined;
-  const warn = intent.requestedModel && modelIds && modelIds.length > 0 && !parts[0].startsWith('model → ');
-  return `${warn ? '⚠️' : '⚙️'} ${parts.join(', ')}`;
-}
+// buildPostQueryNotice removed: the SDK-verified confirmation had a whole
+// set of timing problems (the query stream never closes, modelUsage only
+// available in result events, result emission collides with follow-up
+// pushes). The router emits a canned confirmation directly to outbound the
+// moment it parses the flags — simpler, instant, and no risk of drift
+// between what the user asked for and what we echo back.
