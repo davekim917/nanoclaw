@@ -30,6 +30,7 @@ import {
 } from './db/messaging-groups.js';
 import { getDb } from './db/connection.js';
 import { findSessionForAgent } from './db/sessions.js';
+import { cancelPendingGatesForSession } from './modules/bash-gate/index.js';
 import { startTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { resolveSession, writeSessionMessage, writeOutboundDirect } from './session-manager.js';
@@ -555,6 +556,20 @@ async function deliverToAgent(
   }
 
   const { session, created } = resolveSession(agent.agent_group_id, mg.id, event.threadId, effectiveSessionMode);
+
+  // v1 behavior: a follow-up message to a session with a pending
+  // bash/destructive gate implicitly rejects the gate. The agent is
+  // blocked inside PreToolUse's awaitDeliveryAck waiting on that gate,
+  // so without this the new message would queue forever and the user
+  // sees "Typing…" with no response. Cancelling unblocks the hook
+  // (command denied), ends the current turn, and lets the next turn
+  // process this new message normally. Fire-and-forget — any failure
+  // logs internally and won't block the inbound flow.
+  if (!created) {
+    cancelPendingGatesForSession(session.id, 'Cancelled — user sent a follow-up message.').catch((err) => {
+      log.warn('cancelPendingGatesForSession failed', { sessionId: session.id, err });
+    });
+  }
 
   // Rename freshly-created Discord threads to a Haiku-derived topic title.
   // Fire-and-forget; failures log and move on. See src/topic-title.ts for

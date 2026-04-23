@@ -434,7 +434,11 @@ const GWS_EMAIL_SEND_RE = /\bgws\s+gmail\s+\+(?:send|reply|reply-all|forward)\b/
 // `\b` alone was satisfied by `=`, which turned the guard into a trivial
 // bypass: `gws gmail +send --dry-run=false --to attacker@…` skipped the
 // approval while still sending.
-const EMAIL_BYPASS_RE = /\s--(?:dry-run|draft)(?:\s|$)/;
+//
+// `--help` / `-h` are also exempt — they never send, they just print the
+// CLI manpage. Without this bypass every agent exploration of the gws
+// gmail surface ("gws gmail +send --help") lights up an approval card.
+const EMAIL_BYPASS_RE = /\s(?:--(?:dry-run|draft|help)|-h)(?:\s|$)/;
 
 function createEmailGateHook(): HookCallback {
   return async (input) => {
@@ -453,13 +457,45 @@ function createEmailGateHook(): HookCallback {
     // automated email reports aren't prompted every run.
     if (process.env.NANOCLAW_IS_SCHEDULED_TASK === '1') return {};
 
-    const toMatch = gwsSegment.match(/--to\s+['"]?([^\s'"]+)/);
-    const subjectMatch =
-      gwsSegment.match(/--subject\s+['"]([^'"]+)['"]/) ?? gwsSegment.match(/--subject\s+(\S+)/);
-    const to = toMatch?.[1] ?? 'unknown recipient';
-    const subject = subjectMatch?.[1] ?? '';
+    // Parse the email envelope from the gws command so the approval card
+    // shows who's sending what, instead of a raw shell invocation. Each
+    // matcher supports both --flag 'quoted value' and --flag unquoted_value.
+    const matchFlag = (flag: string): string | undefined => {
+      const quoted = gwsSegment.match(new RegExp(`${flag}\\s+['"]([^'"]+)['"]`));
+      if (quoted) return quoted[1];
+      const bare = gwsSegment.match(new RegExp(`${flag}\\s+(\\S+)`));
+      return bare?.[1];
+    };
+    const to = matchFlag('--to') ?? 'unknown recipient';
+    const subject = matchFlag('--subject') ?? '';
+    const body = matchFlag('--body') ?? '';
+    const cc = matchFlag('--cc');
+    const bcc = matchFlag('--bcc');
+    const isHtml = /\s--html(?:\s|$)/.test(gwsSegment);
+    // Parse the sending identity from GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE.
+    // Path convention: /home/node/.config/gws/accounts/<slug>.json.
+    // The slug is the human-facing account name the user configured.
+    const credsMatch = command.match(
+      /GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=\S*?\/accounts\/([\w.-]+)\.json/,
+    );
+    const fromAccount = credsMatch?.[1] ?? 'default';
     const action = command.match(/\+(\w[\w-]*)/)?.[1] ?? 'send';
     const label = subject ? `Email ${action} to ${to}: "${subject}"` : `Email ${action} to ${to}`;
+
+    // Build a structured card body: From/To/Cc/Bcc/Subject/Body preview.
+    // The host's buildCardBody wraps this with a footer, so don't add one
+    // here. No `command` field on the payload → host skips the code-block
+    // branch entirely. Full raw command is still in the agent's tool-call
+    // history for audit; we just don't surface shell noise to the approver.
+    const lines: string[] = [`*From:* ${fromAccount}`, `*To:* ${to}`];
+    if (cc) lines.push(`*Cc:* ${cc}`);
+    if (bcc) lines.push(`*Bcc:* ${bcc}`);
+    if (subject) lines.push(`*Subject:* ${subject}`);
+    if (body) {
+      const bodyPreview = body.length > 400 ? body.slice(0, 400) + '…' : body;
+      lines.push('', isHtml ? '*Body* (HTML):' : '*Body:*', `> ${bodyPreview.replace(/\n/g, '\n> ')}`);
+    }
+    const summary = lines.join('\n');
 
     // Dynamic imports to avoid any risk of circular-import with the DB
     // module graph during provider init.
@@ -479,8 +515,11 @@ function createEmailGateHook(): HookCallback {
         action: 'request_bash_gate',
         requestId,
         label,
-        summary: `Approve email ${action}?`,
-        command: command.slice(0, 500),
+        summary,
+        // Empty command → host omits the raw-bash code block in the card.
+        // The command is still captured by the SDK's tool-call history
+        // and log stream, so we keep audit coverage without showing noise.
+        command: '',
       }),
     });
 

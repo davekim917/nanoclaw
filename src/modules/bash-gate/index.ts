@@ -49,13 +49,18 @@
 import type Database from 'better-sqlite3';
 
 import { registerDeliveryAction } from '../../delivery.js';
-import { markDelivered, markDeliveryFailed } from '../../db/session-db.js';
+import { markDelivered, markDeliveryFailed, markPending } from '../../db/session-db.js';
 import { openInboundDb } from '../../session-manager.js';
 import { log } from '../../log.js';
-import type { Session } from '../../types.js';
-import { getSession } from '../../db/sessions.js';
+import type { PendingApproval, Session } from '../../types.js';
+import {
+  deletePendingApproval,
+  getPendingApprovalsBySession,
+  getSession,
+} from '../../db/sessions.js';
 
 import {
+  editApprovalCard,
   registerApprovalHandler,
   requestApproval,
   notifyAgent,
@@ -120,6 +125,44 @@ interface GateCategory {
   defaultSummary: string;
   /** Log prefix for this category. */
   logPrefix: string;
+  /** Emoji shown in the card title (⚠️ for soft gates, 🛑 for destructive). */
+  titleEmoji: string;
+  /** Short category word rendered in the card body header (e.g. "Email send", "Destructive command"). */
+  kindNoun: string;
+}
+
+/**
+ * Build the card body shown to the approver. Structure:
+ *
+ *   **<title-label>**
+ *
+ *   <summary sentence>
+ *
+ *   ```
+ *   <truncated command>
+ *   ```
+ *
+ *   _Approve to run. Reject to cancel. Times out in 60 min._
+ *
+ * Keeps the Slack/Discord rendering readable: title stays short, the
+ * command lives in its own code block instead of being inlined with
+ * the summary, and the footer tells the approver what each outcome
+ * means and what the timeout is. Matches v1's richer card layout.
+ */
+function buildCardBody(category: GateCategory, summary: string, command: string): string {
+  const parts: string[] = [summary];
+  if (command) {
+    // Multi-line fenced code block renders nicely on both Slack and
+    // Discord (mrkdwn + markdown). Truncate to keep the card readable —
+    // the full command is persisted in the approval payload for audit.
+    const trimmed = command.length > 800 ? command.slice(0, 800) + '\n…[truncated]' : command;
+    parts.push('```\n' + trimmed + '\n```');
+  }
+  const timeoutMinutes = BASH_GATE_TIMEOUT_MS / 60_000;
+  parts.push(
+    `_Approve runs this ${category.kindNoun.toLowerCase()}. Reject cancels it. Times out in ${timeoutMinutes} min._`,
+  );
+  return parts.join('\n\n');
 }
 
 function createGateHandler(category: GateCategory) {
@@ -142,7 +185,7 @@ function createGateHandler(category: GateCategory) {
 
     // Schedule the timeout before we dispatch the approval, so if anything
     // below throws we still auto-resolve on the container side.
-    const timer = setTimeout(() => {
+    const timer = setTimeout(async () => {
       pendingTimeouts.delete(requestId);
       log.warn(`${category.logPrefix} gate timed out`, { requestId, agentGroupId: session.agent_group_id });
       writeGateAck(
@@ -151,6 +194,17 @@ function createGateHandler(category: GateCategory) {
         'timeout',
         `${category.logPrefix} gate timed out after ${BASH_GATE_TIMEOUT_MS / 60_000} minutes.`,
       );
+      // Edit the card in-place to show the timeout. Without this the
+      // buttons stay live in Slack/Discord and a user clicking 59 min
+      // late would hit a no-op handler.
+      const pending = getPendingApprovalsBySession(session.id).find((p) => p.request_id === requestId);
+      if (pending) {
+        await editApprovalCard(
+          pending,
+          `🕒 *${pending.title}* — timed out\n\nNo approval received within ${BASH_GATE_TIMEOUT_MS / 60_000} minutes. The ${category.kindNoun} was not run.`,
+        );
+        deletePendingApproval(pending.approval_id);
+      }
     }, BASH_GATE_TIMEOUT_MS);
     timer.unref(); // don't block process shutdown on a pending gate
     pendingTimeouts.set(requestId, timer);
@@ -168,8 +222,8 @@ function createGateHandler(category: GateCategory) {
       agentName: session.agent_group_id,
       action: category.approvalAction,
       payload: payload as unknown as Record<string, unknown>,
-      title: label,
-      question: command ? `${summary}\n\n\`${command}\`` : summary,
+      title: `${category.titleEmoji} ${label}`,
+      question: buildCardBody(category, summary, command),
       // Gates deliver in-thread so teammates using the agent can approve
       // their own work-level requests without waiting on the bot owner.
       // response-handler.ts doesn't check clicker identity — thread access
@@ -178,10 +232,23 @@ function createGateHandler(category: GateCategory) {
       deliveryTarget: 'thread',
     });
 
+    // Write a 'pending' row to `delivered` so the delivery loop's
+    // getDeliveredIds dedup filter skips this message on the next poll
+    // tick. Without this, every poll re-dispatches the gate → one
+    // approval card per poll interval (~500ms) until the human acts.
+    // The bash-gate approval handler (or timeout path) later UPSERTs
+    // this to 'delivered' or 'failed' — both outcomes supersede 'pending'.
+    const inDb = openInboundDb(session.agent_group_id, session.id);
+    try {
+      markPending(inDb, requestId);
+    } finally {
+      inDb.close();
+    }
+
     // Defer the ack — the container polls `delivered` keyed on requestId
     // (which is messages_out.id). Marking delivered now would short-circuit
     // the gate; the approval handler (or the 60-min timeout above) is the
-    // only writer for this row.
+    // only writer for the final 'delivered'/'failed' state.
     return { deferAck: true };
   };
 }
@@ -222,18 +289,76 @@ const BASH_GATE: GateCategory = {
   deliveryAction: 'request_bash_gate',
   approvalAction: 'bash-gate',
   defaultLabel: 'Bash command',
-  defaultSummary: 'Approve this Bash command?',
+  defaultSummary: 'The agent wants to run a sensitive command.',
   logPrefix: 'Bash',
+  titleEmoji: '⚠️',
+  kindNoun: 'command',
 };
 const DESTRUCTIVE_GATE: GateCategory = {
   deliveryAction: 'request_destructive_gate',
   approvalAction: 'destructive-gate',
   defaultLabel: 'Destructive command',
-  defaultSummary: 'Approve this destructive command?',
+  defaultSummary: 'The agent wants to run a destructive command.',
   logPrefix: 'Destructive',
+  titleEmoji: '🛑',
+  kindNoun: 'destructive command',
 };
 
 registerDeliveryAction(BASH_GATE.deliveryAction, createGateHandler(BASH_GATE));
 registerApprovalHandler(BASH_GATE.approvalAction, createApprovalHandler(BASH_GATE.logPrefix));
 registerDeliveryAction(DESTRUCTIVE_GATE.deliveryAction, createGateHandler(DESTRUCTIVE_GATE));
 registerApprovalHandler(DESTRUCTIVE_GATE.approvalAction, createApprovalHandler(DESTRUCTIVE_GATE.logPrefix));
+
+/**
+ * Auto-cancel every in-flight gate for `sessionId`. Called from the
+ * router when a new inbound message arrives for a session that has
+ * pending gates — v1 behavior: sending a follow-up implicitly rejects
+ * the open gate so the agent can answer the new question instead of
+ * staying blocked on awaitDeliveryAck.
+ *
+ * For each pending bash-gate or destructive-gate row:
+ *   1. Clear the in-memory 60-min timeout (no-op if the handler was
+ *      registered on a previous host run).
+ *   2. Edit the card in Slack/Discord to show "cancelled by follow-up"
+ *      and drop the buttons. Best-effort — failures just leave the
+ *      card live but that's recoverable by the user clicking anyway
+ *      (the pending_approvals row is deleted below, so clicks become
+ *      no-ops rather than firing the stale gate).
+ *   3. Write 'failed' to the session's inbound.db delivered table so
+ *      the container's awaitDeliveryAck returns → PreToolUse hook
+ *      denies the Bash command → current turn ends → next turn picks
+ *      up the new inbound message cleanly.
+ *   4. Delete the pending_approvals row so a late click can't
+ *      retroactively approve a cancelled gate.
+ *
+ * Safe to call with no pending gates — returns immediately.
+ */
+export async function cancelPendingGatesForSession(sessionId: string, reason: string): Promise<void> {
+  const pending: PendingApproval[] = getPendingApprovalsBySession(sessionId).filter(
+    (p) => p.action === BASH_GATE.approvalAction || p.action === DESTRUCTIVE_GATE.approvalAction,
+  );
+  if (pending.length === 0) return;
+
+  const session = getSession(sessionId);
+  if (!session) {
+    log.warn('cancelPendingGatesForSession called for unknown session', { sessionId });
+    return;
+  }
+
+  log.info('Auto-cancelling in-flight gates', {
+    sessionId,
+    count: pending.length,
+    approvalIds: pending.map((p) => p.approval_id),
+  });
+
+  for (const p of pending) {
+    clearPending(p.request_id);
+    try {
+      await editApprovalCard(p, `❌ *${p.title}* — cancelled\n\n${reason}`);
+    } catch (err) {
+      log.warn('Failed to edit cancelled approval card', { approvalId: p.approval_id, err });
+    }
+    writeGateAck(session, p.request_id, 'rejected', reason);
+    deletePendingApproval(p.approval_id);
+  }
+}

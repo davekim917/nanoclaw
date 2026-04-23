@@ -33,9 +33,18 @@ interface DeliveredRow {
 const POLL_INTERVAL_MS = 300;
 
 function readRow(messageId: string): DeliveredRow | undefined {
-  return getInboundDb()
+  const row = getInboundDb()
     .prepare('SELECT status, platform_message_id, error FROM delivered WHERE message_out_id = ?')
     .get(messageId) as DeliveredRow | undefined;
+  // Host writes status='pending' to stop the delivery loop from
+  // re-dispatching a gate on every poll. From the container's
+  // perspective a pending row is "not yet resolved" — keep polling until
+  // the host upgrades it to 'delivered' (approved) or 'failed'
+  // (rejected/timeout). Without this filter, toAck() below would treat
+  // pending as failed (its catch-all branch) and deny the command before
+  // the human even saw the card.
+  if (row && row.status === 'pending') return undefined;
+  return row;
 }
 
 function toAck(row: DeliveredRow): DeliveryAck {

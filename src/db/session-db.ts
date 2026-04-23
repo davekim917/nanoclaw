@@ -254,15 +254,46 @@ export function getDeliveredIds(db: Database.Database): Set<string> {
   );
 }
 
-export function markDelivered(db: Database.Database, messageOutId: string, platformMessageId: string | null): void {
+/**
+ * Mark a dispatched-but-not-resolved gate row. Lets the delivery loop's
+ * getDeliveredIds dedup filter see that the gate request has been handed
+ * off to an approval handler, so the loop won't re-dispatch on every
+ * poll tick while we wait for the human. The container side's
+ * awaitDeliveryAck treats 'pending' as "keep polling" — only 'delivered'
+ * or 'failed' resolve.
+ *
+ * Idempotent: INSERT OR IGNORE means repeated calls during the same
+ * dispatch window are harmless.
+ */
+export function markPending(db: Database.Database, messageOutId: string): void {
   db.prepare(
-    "INSERT OR IGNORE INTO delivered (message_out_id, platform_message_id, status, delivered_at) VALUES (?, ?, 'delivered', datetime('now'))",
+    "INSERT OR IGNORE INTO delivered (message_out_id, platform_message_id, status, delivered_at) VALUES (?, NULL, 'pending', datetime('now'))",
+  ).run(messageOutId);
+}
+
+export function markDelivered(db: Database.Database, messageOutId: string, platformMessageId: string | null): void {
+  // ON CONFLICT overwrite so a prior 'pending' row flips to 'delivered'
+  // when the admin approves. Without this the gate would stay pending
+  // forever from the container's perspective.
+  db.prepare(
+    `INSERT INTO delivered (message_out_id, platform_message_id, status, delivered_at)
+     VALUES (?, ?, 'delivered', datetime('now'))
+     ON CONFLICT(message_out_id) DO UPDATE SET
+       platform_message_id = excluded.platform_message_id,
+       status = 'delivered',
+       error = NULL,
+       delivered_at = datetime('now')`,
   ).run(messageOutId, platformMessageId ?? null);
 }
 
 export function markDeliveryFailed(db: Database.Database, messageOutId: string, errorMessage?: string): void {
   db.prepare(
-    "INSERT OR IGNORE INTO delivered (message_out_id, platform_message_id, status, error, delivered_at) VALUES (?, NULL, 'failed', ?, datetime('now'))",
+    `INSERT INTO delivered (message_out_id, platform_message_id, status, error, delivered_at)
+     VALUES (?, NULL, 'failed', ?, datetime('now'))
+     ON CONFLICT(message_out_id) DO UPDATE SET
+       status = 'failed',
+       error = excluded.error,
+       delivered_at = datetime('now')`,
   ).run(messageOutId, errorMessage ?? null);
 }
 

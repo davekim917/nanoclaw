@@ -142,11 +142,11 @@ export function createPendingApproval(
     .prepare(
       `INSERT INTO pending_approvals
          (approval_id, session_id, request_id, action, payload, created_at,
-          agent_group_id, channel_type, platform_id, platform_message_id, expires_at, status,
+          agent_group_id, channel_type, platform_id, thread_id, platform_message_id, expires_at, status,
           title, options_json)
        VALUES
          (@approval_id, @session_id, @request_id, @action, @payload, @created_at,
-          @agent_group_id, @channel_type, @platform_id, @platform_message_id, @expires_at, @status,
+          @agent_group_id, @channel_type, @platform_id, @thread_id, @platform_message_id, @expires_at, @status,
           @title, @options_json)`,
     )
     .run({
@@ -154,11 +154,33 @@ export function createPendingApproval(
       agent_group_id: null,
       channel_type: null,
       platform_id: null,
+      thread_id: null,
       platform_message_id: null,
       expires_at: null,
       status: 'pending',
       ...pa,
     });
+}
+
+/**
+ * Used by bash-gate's auto-cancel path: when a user sends a follow-up
+ * message to a session that already has a pending gate, we cancel all
+ * in-flight gates for that session so the agent can process the new
+ * message instead of staying blocked on `awaitDeliveryAck`.
+ */
+export function getPendingApprovalsBySession(sessionId: string): PendingApproval[] {
+  return getDb()
+    .prepare('SELECT * FROM pending_approvals WHERE session_id = ? AND status = ?')
+    .all(sessionId, 'pending') as PendingApproval[];
+}
+
+export function updatePendingApprovalMessageId(
+  approvalId: string,
+  platformMessageId: string | null,
+): void {
+  getDb()
+    .prepare('UPDATE pending_approvals SET platform_message_id = ? WHERE approval_id = ?')
+    .run(platformMessageId, approvalId);
 }
 
 export function getPendingApproval(approvalId: string): PendingApproval | undefined {

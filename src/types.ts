@@ -190,6 +190,7 @@ export interface PendingApproval {
   agent_group_id: string | null;
   channel_type: string | null;
   platform_id: string | null;
+  thread_id: string | null;
   platform_message_id: string | null;
   expires_at: string | null;
   status: 'pending' | 'approved' | 'rejected' | 'expired';

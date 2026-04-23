@@ -18,6 +18,7 @@ import { migration014 } from './014-channel-defaults.js';
 import { migration015 } from './015-backlog.js';
 import { migration016 } from './016-channel-tone.js';
 import { migration017 } from './017-session-last-archive-at.js';
+import { pendingApprovalsThreadId } from './018-pending-approvals-thread-id.js';
 
 export interface Migration {
   version: number;
@@ -41,6 +42,7 @@ const migrations: Migration[] = [
   migration015,
   migration016,
   migration017,
+  pendingApprovalsThreadId,
 ];
 
 export function runMigrations(db: Database.Database): void {

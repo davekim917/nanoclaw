@@ -23,12 +23,12 @@
  */
 import { normalizeOptions, type RawOption } from '../../channels/ask-question.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
-import { createPendingApproval, getSession } from '../../db/sessions.js';
+import { createPendingApproval, getSession, updatePendingApprovalMessageId } from '../../db/sessions.js';
 import { getDeliveryAdapter } from '../../delivery.js';
 import { wakeContainer } from '../../container-runner.js';
 import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
-import type { MessagingGroup, Session } from '../../types.js';
+import type { MessagingGroup, PendingApproval, Session } from '../../types.js';
 import { getAdminsOfAgentGroup, getGlobalAdmins, getOwners } from '../permissions/db/user-roles.js';
 import { ensureUserDm } from '../permissions/user-dm.js';
 
@@ -227,18 +227,26 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<voi
   createPendingApproval({
     approval_id: approvalId,
     session_id: session.id,
+    agent_group_id: session.agent_group_id,
     request_id: approvalId,
     action,
     payload: JSON.stringify(payload),
     created_at: new Date().toISOString(),
     title,
     options_json: JSON.stringify(normalizedOptions),
+    // Populate the routing columns so the host can edit the card later
+    // — cancel-on-follow-up (bash-gate), timeout, or other resolutions
+    // that fire after the click path. platform_message_id gets backfilled
+    // from adapter.deliver's return value immediately below.
+    channel_type: destination.channelType,
+    platform_id: destination.platformId,
+    thread_id: destination.threadId,
   });
 
   const adapter = getDeliveryAdapter();
   if (adapter) {
     try {
-      await adapter.deliver(
+      const platformMsgId = await adapter.deliver(
         destination.channelType,
         destination.platformId,
         destination.threadId,
@@ -251,6 +259,9 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<voi
           options: APPROVAL_OPTIONS,
         }),
       );
+      if (platformMsgId) {
+        updatePendingApprovalMessageId(approvalId, platformMsgId);
+      }
     } catch (err) {
       log.error('Failed to deliver approval card', { action, approvalId, target: destination.label, err });
       notifyAgent(session, `${action} failed: could not deliver approval request to ${destination.label}.`);
@@ -259,4 +270,37 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<voi
   }
 
   log.info('Approval requested', { action, approvalId, agentName, target: destination.label, deliveryTarget });
+}
+
+/**
+ * Edit an approval card in-place (e.g. to show "cancelled" or "timed out").
+ * Looks up the card's platform routing from its pending_approvals row. If
+ * the row is missing any of { channel_type, platform_id, platform_message_id }
+ * we skip silently — those fields are only populated for cards dispatched
+ * via the current `requestApproval` code path; legacy rows or cards that
+ * failed to deliver won't have them.
+ *
+ * The `tid` passed to editMessage mirrors what was passed to deliver:
+ * `threadId ?? platformId` (the Chat SDK bridge's convention — see
+ * chat-sdk-bridge.ts `deliver`).
+ */
+export async function editApprovalCard(approval: PendingApproval, newBody: string): Promise<void> {
+  if (!approval.channel_type || !approval.platform_id || !approval.platform_message_id) return;
+  const adapter = getDeliveryAdapter();
+  if (!adapter) return;
+  try {
+    await adapter.deliver(
+      approval.channel_type,
+      approval.platform_id,
+      approval.thread_id,
+      'chat-sdk',
+      JSON.stringify({
+        operation: 'edit',
+        messageId: approval.platform_message_id,
+        text: newBody,
+      }),
+    );
+  } catch (err) {
+    log.warn('Failed to edit approval card', { approvalId: approval.approval_id, err });
+  }
 }
