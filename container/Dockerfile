@@ -24,14 +24,14 @@ ARG INSTALL_CJK_FONTS=false
 # Pin CLI versions for reproducibility. Bump deliberately — unpinned installs
 # mean every rebuild silently picks up the latest and can break in lockstep
 # across all users.
-ARG CLAUDE_CODE_VERSION=2.1.116
+ARG CLAUDE_CODE_VERSION=2.1.119
 ARG AGENT_BROWSER_VERSION=latest
 ARG VERCEL_VERSION=latest
 ARG GITNEXUS_VERSION=latest
-ARG BUN_VERSION=1.3.12
+ARG BUN_VERSION=1.3.13
 ARG MMDC_VERSION=11.12.0
 ARG GWS_VERSION=0.22.5
-ARG CODEX_VERSION=0.120.0
+ARG CODEX_VERSION=0.124.0
 
 # ---- System dependencies -----------------------------------------------------
 # tini: correct PID 1 / signal forwarding so outbound.db writes finalize on
@@ -116,7 +116,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends gnupg \
 
 # Render / Railway / Supabase CLIs (released as prebuilt binaries)
 ARG RENDER_VERSION=2.15.1
-ARG RAILWAY_VERSION=4.37.3
+ARG RAILWAY_VERSION=4.42.0
 ARG SUPABASE_VERSION=2.90.0
 RUN DPKG_ARCH=$(dpkg --print-architecture) && UARCH=$(uname -m) \
     && curl -fsSL "https://github.com/render-oss/cli/releases/download/v${RENDER_VERSION}/cli_${RENDER_VERSION}_linux_${DPKG_ARCH}.zip" \
