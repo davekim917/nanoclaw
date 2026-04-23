@@ -31,6 +31,7 @@ ARG GITNEXUS_VERSION=latest
 ARG BUN_VERSION=1.3.12
 ARG MMDC_VERSION=11.12.0
 ARG GWS_VERSION=0.22.5
+ARG CODEX_VERSION=0.120.0
 
 # ---- System dependencies -----------------------------------------------------
 # tini: correct PID 1 / signal forwarding so outbound.db writes finalize on
@@ -184,11 +185,15 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
     pnpm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
 
 # Illysium additions: code-intelligence + diagram + Google Workspace CLIs.
+# Codex CLI (@openai/codex) is invoked by /team-qa Validator E for
+# cross-model adversarial review; authenticated via the host's ~/.codex
+# mount (see src/container-runner.ts:581).
 RUN --mount=type=cache,target=/root/.cache/pnpm \
     pnpm install -g \
         "gitnexus@${GITNEXUS_VERSION}" \
         "@mermaid-js/mermaid-cli@${MMDC_VERSION}" \
-        "@googleworkspace/cli@${GWS_VERSION}"
+        "@googleworkspace/cli@${GWS_VERSION}" \
+        "@openai/codex@${CODEX_VERSION}"
 
 # Puppeteer config used by mmdc — points at the system Chromium and passes
 # --no-sandbox, without which mmdc launches and silently exits 0 producing no

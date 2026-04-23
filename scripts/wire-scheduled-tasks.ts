@@ -255,7 +255,7 @@ Keep the tone concise and professional. If there are no meetings today, send a b
 Read /workspace/project/container/Dockerfile and extract every pinned version. Do NOT hardcode package names — parse them dynamically so new packages are automatically included.
 
 For each pinned package:
-- npm: lines like package@x.y.z in npm install -g
+- npm/pnpm: lines like package@x.y.z in npm install -g or pnpm install -g
 - pip: lines like package==x.y.z in pip install
 - ARG: lines like ARG PACKAGE_VERSION=x.y.z (Render, Railway, Supabase, etc.)
 - Snowflake .deb: SNOW_VERSION ARG
