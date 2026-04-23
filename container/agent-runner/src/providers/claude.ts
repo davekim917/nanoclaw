@@ -818,13 +818,15 @@ export class ClaudeProvider implements AgentProvider {
         resume: input.continuation,
         model: input.model,
         ...(input.effort ? { effort: input.effort as EffortLevel } : {}),
-        // Thinking is NOT explicitly configured: for supported models (Opus
-        // 4.7+) the SDK's default (`alwaysThinkingEnabled` absent) enables
-        // adaptive thinking automatically. Setting `{type: 'enabled',
-        // budgetTokens: N}` is for older fixed-budget models — passing it
-        // here was incorrect for 4.7. If thinking blocks don't surface in
-        // the content stream with defaults, add `thinking: {type: 'adaptive',
-        // display: 'summarized'}` explicitly.
+        // Opus 4.7 uses adaptive thinking; without `display: 'summarized'`,
+        // thinking content blocks arrive with an empty `thinking` field and
+        // only the cryptographic signature populated — so our
+        // deriveProgressLabels forwarder has nothing to surface. Explicitly
+        // opt into summarized thinking text. The SDK docs: "When set to
+        // 'summarized', thinking is returned normally. When set to 'omitted',
+        // thinking content is [not returned]." Default behavior appears to
+        // be omitted-equivalent for 4.7.
+        thinking: { type: 'adaptive', display: 'summarized' },
         pathToClaudeCodeExecutable: '/pnpm/claude',
         systemPrompt: instructions ? { type: 'preset' as const, preset: 'claude_code' as const, append: instructions } : undefined,
         disallowedTools: SDK_DISALLOWED_TOOLS,
