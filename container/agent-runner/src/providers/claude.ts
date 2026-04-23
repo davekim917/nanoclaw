@@ -818,14 +818,8 @@ export class ClaudeProvider implements AgentProvider {
         resume: input.continuation,
         model: input.model,
         ...(input.effort ? { effort: input.effort as EffortLevel } : {}),
-        // Opus 4.7 uses adaptive thinking; without `display: 'summarized'`,
-        // thinking content blocks arrive with an empty `thinking` field and
-        // only the cryptographic signature populated — so our
-        // deriveProgressLabels forwarder has nothing to surface. Explicitly
-        // opt into summarized thinking text. The SDK docs: "When set to
-        // 'summarized', thinking is returned normally. When set to 'omitted',
-        // thinking content is [not returned]." Default behavior appears to
-        // be omitted-equivalent for 4.7.
+        // `display: 'summarized'` makes thinking text visible in content
+        // blocks; default is empty-text + signature only.
         thinking: { type: 'adaptive', display: 'summarized' },
         pathToClaudeCodeExecutable: '/pnpm/claude',
         systemPrompt: instructions ? { type: 'preset' as const, preset: 'claude_code' as const, append: instructions } : undefined,
