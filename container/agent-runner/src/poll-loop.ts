@@ -194,26 +194,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     const skippedSet = new Set(skipped);
     const processingIds = ids.filter((id) => !commandIds.includes(id) && !skippedSet.has(id));
     try {
-      const result = await processQuery(query, routing, processingIds);
+      const result = await processQuery(query, routing, processingIds, switchIntent);
       if (result.continuation && result.continuation !== continuation) {
         continuation = result.continuation;
         setStoredSessionId(continuation);
-      }
-      if (switchIntent) {
-        const notice = buildPostQueryNotice(switchIntent, result.modelIds);
-        log(
-          `Switch intent: ${JSON.stringify(switchIntent)} | modelIds: ${JSON.stringify(result.modelIds)} | notice: ${notice ?? '(none)'}`,
-        );
-        if (notice) {
-          writeMessageOut({
-            id: generateId(),
-            kind: 'chat',
-            platform_id: routing.platformId,
-            channel_type: routing.channelType,
-            thread_id: routing.threadId,
-            content: JSON.stringify({ text: notice }),
-          });
-        }
       }
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
@@ -238,7 +222,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             model: effectiveModel,
             effort: effectiveEffort,
           });
-          const retryResult = await processQuery(retryQuery, routing, processingIds);
+          const retryResult = await processQuery(retryQuery, routing, processingIds, switchIntent);
           if (retryResult.continuation && retryResult.continuation !== continuation) {
             continuation = retryResult.continuation;
             setStoredSessionId(continuation);
@@ -279,7 +263,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             cwd: config.cwd,
             systemContext: config.systemContext,
           });
-          const retryResult = await processQuery(retryQuery, routing, processingIds);
+          const retryResult = await processQuery(retryQuery, routing, processingIds, switchIntent);
           if (retryResult.continuation) {
             continuation = retryResult.continuation;
             setStoredSessionId(continuation);
@@ -378,9 +362,11 @@ async function processQuery(
   query: AgentQuery,
   routing: RoutingContext,
   initialBatchIds: string[],
+  switchIntent?: FlagSwitchIntent,
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
   let queryModelIds: string[] | undefined;
+  let noticeEmitted = false;
   let done = false;
 
   // Concurrent polling: push follow-ups into the active query as they arrive.
@@ -440,6 +426,26 @@ async function processQuery(
         markCompleted(initialBatchIds);
         if (event.modelIds && event.modelIds.length > 0) {
           queryModelIds = event.modelIds;
+        }
+        // Emit the switch-confirmation notice on the FIRST result of this
+        // query. processQuery stays open across follow-up pushes so awaiting
+        // its return to emit is effectively dead — the stream only closes
+        // on container shutdown. Gate with `noticeEmitted` so a second
+        // result (from a concurrent-poll follow-up that pushed while the
+        // initial turn was still streaming) doesn't duplicate the notice.
+        if (switchIntent && !noticeEmitted) {
+          noticeEmitted = true;
+          const notice = buildPostQueryNotice(switchIntent, event.modelIds);
+          if (notice) {
+            writeMessageOut({
+              id: generateId(),
+              kind: 'chat',
+              platform_id: routing.platformId,
+              channel_type: routing.channelType,
+              thread_id: routing.threadId,
+              content: JSON.stringify({ text: notice }),
+            });
+          }
         }
         if (event.text) {
           dispatchResultText(event.text, routing);
