@@ -49,6 +49,20 @@ function truncate(s: string): string {
  *
  * NANOCLAW_HIDE_THINKING=1 suppresses all progress forwarding.
  */
+/**
+ * Format a thinking block for chat. Wraps the prose in markdown italics with
+ * a 💭 prefix so users can tell at a glance that the message is the agent's
+ * reasoning, not its final answer. `parseTextStyles` in the host's channel
+ * adapters converts `_italic_` to each platform's native syntax at delivery
+ * time (Slack `_x_`, Discord `*x*`, WhatsApp `_x_`, Telegram Markdown). Any
+ * embedded `_` in the prose itself is escaped to `\_` so it doesn't close
+ * the italic run early.
+ */
+function formatThinkingLabel(prose: string): string {
+  const escaped = prose.replace(/_/g, '\\_');
+  return `💭 _${escaped}_`;
+}
+
 export function deriveProgressLabels(message: unknown): string[] {
   if (!message || typeof message !== 'object') return [];
   const content = (message as { message?: { content?: unknown } }).message?.content;
@@ -58,7 +72,7 @@ export function deriveProgressLabels(message: unknown): string[] {
   for (const block of content) {
     const b = block as { type?: string; thinking?: unknown };
     if (b.type === 'thinking' && typeof b.thinking === 'string' && b.thinking.trim().length > 0) {
-      labels.push(truncate(b.thinking));
+      labels.push(formatThinkingLabel(truncate(b.thinking)));
     }
   }
   return labels;
