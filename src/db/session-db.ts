@@ -32,6 +32,18 @@ export function openOutboundDb(dbPath: string): Database.Database {
   return db;
 }
 
+/**
+ * Open the outbound DB writable. Normal host path is read-only (the container
+ * owns writes); this exists for the narrow pre-wake case where the host emits
+ * a deny/flag-confirmation directly to outbound.
+ */
+export function openOutboundDbWritable(dbPath: string): Database.Database {
+  const db = new Database(dbPath);
+  db.pragma('journal_mode = DELETE');
+  db.pragma('busy_timeout = 5000');
+  return db;
+}
+
 export function upsertSessionRouting(
   db: Database.Database,
   routing: { channel_type: string | null; platform_id: string | null; thread_id: string | null },

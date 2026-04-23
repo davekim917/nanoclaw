@@ -84,11 +84,7 @@ export interface QueryInput {
    */
   model?: string;
 
-  /**
-   * Per-turn effort level override (low | medium | high | xhigh | max).
-   * Passed as the SDK's `effort` option (first-class since Opus 4.6).
-   * Providers without an effort concept should ignore.
-   */
+  /** Per-turn effort level override (SDK option `effort`, first-class since Opus 4.6). */
   effort?: string;
 }
 
@@ -138,13 +134,6 @@ export type ProviderEvent =
   | {
       type: 'result';
       text: string | null;
-      /**
-       * Model IDs the SDK actually invoked for this turn, from the SDK's
-       * `SDKResultSuccess.modelUsage` map (keyed by model id). Lets callers
-       * verify a per-turn `model` override landed on the expected model and
-       * detect silent fallbacks. Absent on error results.
-       */
-      modelIds?: string[];
     }
   | { type: 'error'; message: string; retryable: boolean; classification?: string }
   | { type: 'progress'; message: string }

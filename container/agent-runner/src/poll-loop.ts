@@ -161,10 +161,6 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       continue;
     }
 
-    // Read structured flag intent attached by the host router and apply
-    // sticky state. Host emits the user-visible confirmation at the router
-    // boundary (see src/router.ts + src/flag-parser.ts), so no notice is
-    // written from here.
     const { model: effectiveModel, effort: effectiveEffort } = applyFlagBatch(keep, routing);
 
     // Format messages: passthrough commands get raw text (only if the
@@ -346,12 +342,6 @@ function formatMessagesWithCommands(messages: MessageInRow[], nativeSlashCommand
 
 interface QueryResult {
   continuation?: string;
-  /**
-   * Model IDs the SDK actually used for this turn. Set from the last
-   * `result` event's `modelIds`; undefined when no result event arrived or
-   * the provider didn't populate it.
-   */
-  modelIds?: string[];
 }
 
 async function processQuery(
@@ -360,7 +350,6 @@ async function processQuery(
   initialBatchIds: string[],
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
-  let queryModelIds: string[] | undefined;
   let done = false;
 
   // Concurrent polling: push follow-ups into the active query as they arrive.
@@ -418,9 +407,6 @@ async function processQuery(
         // (send_message) mid-turn, or the message may not need a response
         // at all — either way the turn is finished.
         markCompleted(initialBatchIds);
-        if (event.modelIds && event.modelIds.length > 0) {
-          queryModelIds = event.modelIds;
-        }
         if (event.text) {
           dispatchResultText(event.text, routing);
         }
@@ -431,7 +417,7 @@ async function processQuery(
     clearInterval(pollHandle);
   }
 
-  return { continuation: queryContinuation, modelIds: queryModelIds };
+  return { continuation: queryContinuation };
 }
 
 function handleEvent(event: ProviderEvent, routing: RoutingContext): void {
@@ -564,12 +550,9 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/**
- * Structured flag intent written by the host router on `messages_in.content`.
- * Mirrors `FlagIntent` in src/flag-parser.ts — same shape, same semantics.
- * Container reads this directly; no text-level parsing here anymore.
- */
-interface FlagIntentFromRouter {
+// Mirror of FlagIntent in src/flag-parser.ts. Can't share a module across
+// the host/container boundary (separate package trees).
+interface FlagIntent {
   stickyModel?: string;
   turnModel?: string;
   clearStickyModel?: boolean;
@@ -578,37 +561,22 @@ interface FlagIntentFromRouter {
   clearStickyEffort?: boolean;
 }
 
-/**
- * Read the structured flag intent attached to any message in the batch by
- * the host router, apply sticky state changes, and compute the effective
- * (model, effort) for this turn.
- *
- * Effective precedence: turn override → sticky (just set or pre-existing) →
- * provider default.
- *
- * Confirmation notices are emitted at the router boundary, not here — the
- * host knows what it parsed and writes the canned confirmation directly to
- * outbound.db so the user sees it without waiting for the turn.
- */
+// Precedence: turn override → sticky → host-injected default (NANOCLAW_DEFAULT_EFFORT).
 function applyFlagBatch(
   messages: MessageInRow[],
   _routing: RoutingContext,
 ): { model?: string; effort?: string } {
-  // Find any message in the batch carrying a flagIntent. Router attaches it
-  // to the specific inbound that had flags, which is typically the first
-  // chat message; scanning all covers the case where flag+prompt landed
-  // alongside accumulated rows.
-  let intent: FlagIntentFromRouter | undefined;
+  let intent: FlagIntent | undefined;
   for (const m of messages) {
     if (m.kind !== 'chat' && m.kind !== 'chat-sdk') continue;
     try {
-      const parsed = JSON.parse(m.content) as { flagIntent?: FlagIntentFromRouter };
+      const parsed = JSON.parse(m.content) as { flagIntent?: FlagIntent };
       if (parsed.flagIntent) {
         intent = parsed.flagIntent;
         break;
       }
     } catch {
-      // Skip malformed rows.
+      // malformed content row
     }
   }
 
@@ -625,17 +593,8 @@ function applyFlagBatch(
     }
   }
 
-  const stickyModel = getStickyModel();
-  const stickyEffort = getStickyEffort();
-  const model = intent?.turnModel ?? stickyModel;
-  const effort = intent?.turnEffort ?? stickyEffort;
+  const model = intent?.turnModel ?? getStickyModel();
+  const effort = intent?.turnEffort ?? getStickyEffort() ?? process.env.NANOCLAW_DEFAULT_EFFORT;
 
   return { model, effort };
 }
-
-// buildPostQueryNotice removed: the SDK-verified confirmation had a whole
-// set of timing problems (the query stream never closes, modelUsage only
-// available in result events, result emission collides with follow-up
-// pushes). The router emits a canned confirmation directly to outbound the
-// moment it parses the flags — simpler, instant, and no risk of drift
-// between what the user asked for and what we echo back.

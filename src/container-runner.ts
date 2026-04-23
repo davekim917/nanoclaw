@@ -1165,7 +1165,7 @@ async function buildContainerArgs(
     containerConfig.defaultEffort ??
     process.env.NANOCLAW_DEFAULT_EFFORT ??
     'medium';
-  args.push('-e', `CLAUDE_CODE_EFFORT_LEVEL=${defaultEffort}`);
+  args.push('-e', `NANOCLAW_DEFAULT_EFFORT=${defaultEffort}`);
 
   // Per-channel default tone profile — ports v1's "always-on tone" feature.
   // Precedence: per-channel wiring (messaging_group_agents.default_tone) →

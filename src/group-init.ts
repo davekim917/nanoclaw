@@ -14,9 +14,9 @@ import type { AgentGroup } from './types.js';
 export const GLOBAL_MEMORY_LINK_NAME = '.claude-global.md';
 export const GLOBAL_CLAUDE_IMPORT = `@./${GLOBAL_MEMORY_LINK_NAME}`;
 
-// Required env vars for every agent container. Kept in sync with
-// ensureRequiredSettings() below — if you add a key here, it will be
-// auto-applied to existing groups on next init call.
+// Nanoclaw-managed env vars. Reconciled to trunk on every container spawn:
+// values here always win over what's on disk, keys in DEPRECATED_ENV get
+// deleted, anything outside both lists is user-owned and left alone.
 const REQUIRED_ENV: Record<string, string> = {
   CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
   CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
@@ -35,13 +35,17 @@ const REQUIRED_ENV: Record<string, string> = {
   // Lock the `sonnet` alias to 4.6 (explicit id, no [1m] suffix — extended
   // context is opt-in per query). Same reason as opus pin above.
   ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-sonnet-4-6',
-  // Default reasoning effort. Per-message-overridable via `-e high` and
-  // session-sticky via `-e1 high` flags.
-  CLAUDE_CODE_EFFORT_LEVEL: 'medium',
+  // Default reasoning effort. Per-message-overridable via `-e1 high` and
+  // session-sticky via `-e high` flags.
+  NANOCLAW_DEFAULT_EFFORT: 'medium',
 };
 
-// Required top-level settings. Merged into existing settings.json
-// additively — never overwrites user-set values.
+// Env keys whose meaning moved or got dropped. Removed from existing
+// settings.json on next init so stale values can't leak into the SDK.
+const DEPRECATED_ENV: readonly string[] = ['CLAUDE_CODE_EFFORT_LEVEL', 'CLAUDE_CODE_USE_EFFORT'];
+
+// Nanoclaw-managed top-level settings. Same reconciliation semantics as
+// REQUIRED_ENV above.
 const REQUIRED_SETTINGS: Record<string, unknown> = {
   $schema: 'https://json.schemastore.org/claude-code-settings.json',
   // Background memory consolidation — prunes stale notes, resolves
@@ -55,9 +59,13 @@ const REQUIRED_SETTINGS: Record<string, unknown> = {
 const DEFAULT_SETTINGS_JSON = JSON.stringify({ env: REQUIRED_ENV, ...REQUIRED_SETTINGS }, null, 2) + '\n';
 
 /**
- * Merge any missing required env vars + settings into an existing settings.json.
- * Additive only — user-customized values are preserved. Returns true if the
- * file was modified.
+ * Reconcile an existing settings.json against trunk.
+ *
+ * For keys in REQUIRED_ENV / REQUIRED_SETTINGS: overwrite to trunk value
+ * (so `/update-nanoclaw` pushes model/effort/alias changes out to every
+ * existing group without a manual pass). For keys in DEPRECATED_ENV:
+ * delete. Anything outside all three lists is user-owned and untouched.
+ * Returns true if the file was modified.
  */
 function ensureRequiredSettings(settingsFile: string): boolean {
   let settings: Record<string, unknown>;
@@ -72,14 +80,20 @@ function ensureRequiredSettings(settingsFile: string): boolean {
     changed = true;
   }
   const env = settings.env as Record<string, string>;
+  for (const k of DEPRECATED_ENV) {
+    if (k in env) {
+      delete env[k];
+      changed = true;
+    }
+  }
   for (const [k, v] of Object.entries(REQUIRED_ENV)) {
-    if (env[k] === undefined) {
+    if (env[k] !== v) {
       env[k] = v;
       changed = true;
     }
   }
   for (const [k, v] of Object.entries(REQUIRED_SETTINGS)) {
-    if (settings[k] === undefined) {
+    if (settings[k] !== v) {
       settings[k] = v;
       changed = true;
     }

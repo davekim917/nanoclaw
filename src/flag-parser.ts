@@ -1,28 +1,20 @@
 /**
- * Model/effort flag parser — single source of truth.
+ * Model/effort flag parser. Called at the router boundary; the result is
+ * attached to inbound content as structured metadata, so downstream code
+ * never re-parses text.
  *
- * Replaces the sync-burden of parallel regex-based parsers in router.ts and
- * container/agent-runner. Called once at the router boundary; the result is
- * attached to the inbound message as structured metadata so no downstream
- * code has to re-parse text.
- *
- * Supports two invocation shapes:
- *   1. Inline prefix: `-m haiku -e low <prompt>` — flags strip away, prompt
- *      flows to the agent with clean text.
- *   2. Standalone `/switch` command: `/switch -m haiku -e low` — no prompt,
- *      host emits a canned confirmation directly, no agent turn runs.
- *
- * Flag vocabulary (matches prior parseModelEffortFlags behavior):
- *   -m   <value>   sticky model (persists across turns in this session)
- *   -m1  <value>   one-turn model (overrides sticky for this turn only)
+ * Flag vocabulary:
+ *   -m   <value>   sticky model (persists across turns)
+ *   -m1  <value>   one-turn model override
  *   -e   <value>   sticky effort
- *   -e1  <value>   one-turn effort
- *   -m   ''         clear sticky model (explicit empty value)
- *   -e   ''         clear sticky effort
+ *   -e1  <value>   one-turn effort override
+ *   -m   ''        clear sticky model
+ *   -e   ''        clear sticky effort
  *
- * Platform mentions are stripped before parsing so Discord `<@BOTID>`,
- * Discord nickname `<@!BOTID>`, raw-Slack `<@UID>`, and chat-sdk-stripped
- * `@UID` all behave the same.
+ * Invocation shapes:
+ *   Inline prefix: `-m haiku <prompt>` — flags stripped, prompt flows on.
+ *   Standalone:    `/switch -m haiku`  — no prompt; caller emits the
+ *                                        confirmation directly.
  */
 
 /** Normalized effort values accepted by the SDK's Options.effort. */
@@ -47,8 +39,7 @@ const MODEL_ALIAS_MAP: Record<string, string> = {
   'haiku4-5': 'claude-haiku-4-5',
 };
 
-const VALID_MODEL_RE =
-  /^(?:opus|sonnet|haiku|default|claude-(?:opus|sonnet|haiku)-\d+-\d+(?:\[\dm\])?)$/;
+const VALID_MODEL_RE = /^(?:opus|sonnet|haiku|default|claude-(?:opus|sonnet|haiku)-\d+-\d+(?:\[\dm\])?)$/;
 
 function resolveModelAlias(raw: string): string {
   return MODEL_ALIAS_MAP[raw.toLowerCase()] ?? raw;
@@ -112,20 +103,12 @@ const FLAG_TOKEN_RE = /^\s*(-[me]1?)\s+("([^"]*)"|'([^']*)'|(\S*))\s*/;
  * result — callers inspect `intent`, `warnings`, `errors` to decide behavior.
  */
 export function parseMessageFlags(rawText: string): FlagParseResult {
-  // Strip any leading platform mention token. Mentions never carry semantic
-  // flag info; keeping them would re-introduce the ^-anchor fragility.
-  let cursor = rawText.replace(MENTION_PREFIX_RE, '');
-  // Accept an optional `/switch` prefix so the same parser drives both the
-  // inline form (`-m haiku <prompt>`) and the standalone form
-  // (`/switch -m haiku`). Stripping it here means downstream code doesn't
-  // need a separate command-dispatch path.
-  cursor = cursor.replace(SWITCH_COMMAND_RE, '');
+  let cursor = rawText.replace(MENTION_PREFIX_RE, '').replace(SWITCH_COMMAND_RE, '');
 
   const intent: FlagIntent = {};
   const warnings: string[] = [];
   const errors: string[] = [];
 
-  // Consume flags greedily until the next non-flag token.
   for (;;) {
     const m = cursor.match(FLAG_TOKEN_RE);
     if (!m) break;
@@ -178,31 +161,24 @@ export function parseMessageFlags(rawText: string): FlagParseResult {
     }
   }
 
-  // Validate compatibility: haiku doesn't support effort. If the user asked
-  // for model=haiku + effort=anything, drop the effort and warn.
   const modelForValidation = intent.turnModel ?? intent.stickyModel;
   const effortForValidation = intent.turnEffort ?? intent.stickyEffort;
   if (modelForValidation && effortForValidation) {
     const supported = MODEL_EFFORT_SUPPORT[modelForValidation];
     if (supported && !supported.has(effortForValidation as EffortLevel)) {
       if (supported.size === 0) {
-        warnings.push(
-          `${modelForValidation} doesn't support effort — applied model, skipped effort`,
-        );
+        warnings.push(`${modelForValidation} doesn't support effort — applied model, skipped effort`);
       } else {
         warnings.push(
           `${modelForValidation} doesn't support effort=${effortForValidation} (supported: ${[...supported].join(', ')}) — skipped effort`,
         );
       }
-      // Drop the effort directive so downstream doesn't try to apply it.
       delete intent.stickyEffort;
       delete intent.turnEffort;
       delete intent.clearStickyEffort;
     }
   }
 
-  // Empty-intent check: if nothing was actually set, return undefined so
-  // the caller skips all the flag-handling plumbing.
   const hasIntent =
     intent.stickyModel !== undefined ||
     intent.turnModel !== undefined ||

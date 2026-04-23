@@ -150,29 +150,17 @@ describe('parseMessageFlags', () => {
 
 describe('formatFlagConfirmation', () => {
   it('formats a plain sticky switch', () => {
-    const out = formatFlagConfirmation(
-      { stickyModel: 'haiku' },
-      [],
-      [],
-    );
+    const out = formatFlagConfirmation({ stickyModel: 'haiku' }, [], []);
     expect(out).toBe('⚙️ model → haiku');
   });
 
   it('combines model + effort on one line', () => {
-    const out = formatFlagConfirmation(
-      { stickyModel: 'opus', stickyEffort: 'high' },
-      [],
-      [],
-    );
+    const out = formatFlagConfirmation({ stickyModel: 'opus', stickyEffort: 'high' }, [], []);
     expect(out).toBe('⚙️ model → opus, effort → high');
   });
 
   it('appends warnings on their own line', () => {
-    const out = formatFlagConfirmation(
-      { stickyModel: 'haiku' },
-      ['haiku doesn\'t support effort — skipped effort'],
-      [],
-    );
+    const out = formatFlagConfirmation({ stickyModel: 'haiku' }, ["haiku doesn't support effort — skipped effort"], []);
     expect(out).toContain('⚙️ model → haiku');
     expect(out).toContain('⚠️');
   });

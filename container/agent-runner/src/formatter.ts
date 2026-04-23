@@ -14,10 +14,6 @@ export type CommandCategory = 'admin' | 'filtered' | 'passthrough' | 'none';
 const ADMIN_COMMANDS = new Set(['/remote-control', '/clear', '/compact', '/context', '/cost', '/files', '/kill']);
 const FILTERED_COMMANDS = new Set(['/help', '/login', '/logout', '/doctor', '/config', '/start']);
 
-// Flag parsing lives on the host at src/flag-parser.ts. The container reads
-// the structured `flagIntent` the router attaches to `messages_in.content`;
-// no text-level parsing happens here anymore.
-
 export interface CommandInfo {
   category: CommandCategory;
   command: string; // the command name (e.g., '/clear')

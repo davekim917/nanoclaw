@@ -3,6 +3,7 @@ import path from 'path';
 
 import {
   query as sdkQuery,
+  type EffortLevel,
   type HookCallback,
   type PreCompactHookInput,
   type PreToolUseHookInput,
@@ -747,11 +748,7 @@ export class ClaudeProvider implements AgentProvider {
       log(`Loaded ${plugins.length} plugin(s): ${plugins.map((p) => path.basename(p.path)).join(', ')}`);
     }
 
-    // CLAUDE_CODE_SUBAGENT_MODEL propagates the same model to subagents so
-    // teams/sub-queries don't silently downgrade. Effort is first-class on
-    // the SDK options (since Opus 4.6); we pass it there instead of through
-    // env, so the SDK treats it as a typed query parameter not a settings
-    // override, and silent typos surface as validation errors at call time.
+    // Propagate model to subagents so teams/sub-queries don't silently downgrade.
     const perQueryEnv: Record<string, string | undefined> = { ...this.env };
     if (input.model) {
       perQueryEnv.CLAUDE_CODE_SUBAGENT_MODEL = input.model;
@@ -764,9 +761,7 @@ export class ClaudeProvider implements AgentProvider {
         additionalDirectories: this.additionalDirectories,
         resume: input.continuation,
         model: input.model,
-        ...(input.effort
-          ? { effort: input.effort as 'low' | 'medium' | 'high' | 'xhigh' | 'max' }
-          : {}),
+        ...(input.effort ? { effort: input.effort as EffortLevel } : {}),
         pathToClaudeCodeExecutable: '/pnpm/claude',
         systemPrompt: instructions ? { type: 'preset' as const, preset: 'claude_code' as const, append: instructions } : undefined,
         disallowedTools: SDK_DISALLOWED_TOOLS,
@@ -820,9 +815,7 @@ export class ClaudeProvider implements AgentProvider {
           yield { type: 'init', continuation: message.session_id };
         } else if (message.type === 'result') {
           const text = 'result' in message ? (message as { result?: string }).result ?? null : null;
-          const modelUsage = (message as { modelUsage?: Record<string, unknown> }).modelUsage;
-          const modelIds = modelUsage ? Object.keys(modelUsage) : undefined;
-          yield { type: 'result', text, modelIds };
+          yield { type: 'result', text };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'api_retry') {
           yield { type: 'error', message: 'API retry', retryable: true };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'rate_limit_event') {

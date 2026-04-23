@@ -265,7 +265,7 @@ A few fork-specific primitives that change day-to-day operation vs v1:
   `/manage-channels` pass. Controlled by the env block in step 5.
 - **Default model + effort.** v2 starts every container with `model=opus`
   (locked to `claude-opus-4-7` via `ANTHROPIC_DEFAULT_OPUS_MODEL`) and
-  `CLAUDE_CODE_EFFORT_LEVEL=medium`. Per-group override by editing the
+  `NANOCLAW_DEFAULT_EFFORT=medium`. Per-group override by editing the
   group's `.claude-shared/settings.json` — the merge in
   `src/group-init.ts` is additive and preserves user-set values.
 - **Auto-memory writes.** Claude Code's `MEMORY.md` + per-topic notes
