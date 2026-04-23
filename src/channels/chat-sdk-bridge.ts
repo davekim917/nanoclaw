@@ -236,12 +236,39 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       const resolveThreadId = (rawThreadId: string, channelId: string): string | null =>
         rawThreadId === channelId ? null : rawThreadId;
 
+      // One-shot channel metadata discovery: on first inbound we've seen for
+      // a given channel, fetch its name via the Chat SDK and forward via
+      // onMetadata so the host can populate messaging_groups.name. Without
+      // this, auto-created mgs stay nameless forever (Slack xzo-ops etc.).
+      const reportedChannels = new Set<string>();
+      const reportChannelMetadata = (channelId: string): void => {
+        if (reportedChannels.has(channelId)) return;
+        reportedChannels.add(channelId);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const fetchInfo = (adapter as any).fetchChannelInfo;
+        if (typeof fetchInfo !== 'function') return;
+        void fetchInfo
+          .call(adapter, channelId)
+          .then((info: { name?: string; isDM?: boolean }) => {
+            if (!info) return;
+            setupConfig.onMetadata(channelId, info.name, info.isDM === undefined ? undefined : !info.isDM);
+          })
+          .catch((err: unknown) => {
+            reportedChannels.delete(channelId);
+            log.debug('fetchChannelInfo failed', {
+              channelId,
+              err: err instanceof Error ? err.message : String(err),
+            });
+          });
+      };
+
       // Subscribed threads — every message in a thread we've previously
       // engaged. Carry the SDK's `message.isMention` through so mention-mode
       // wirings still fire on in-thread mentions.
       chat.onSubscribedMessage(async (thread, message) => {
         const channelId = adapter.channelIdFromThreadId(thread.id);
         const isDM = adapterIsDM(adapter, thread.id);
+        reportChannelMetadata(channelId);
         await setupConfig.onInbound(
           channelId,
           resolveThreadId(thread.id, channelId),
@@ -253,6 +280,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       chat.onNewMention(async (thread, message) => {
         const channelId = adapter.channelIdFromThreadId(thread.id);
         const isDM = adapterIsDM(adapter, thread.id);
+        reportChannelMetadata(channelId);
         await setupConfig.onInbound(
           channelId,
           resolveThreadId(thread.id, channelId),
@@ -289,6 +317,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       chat.onNewMessage(/./, async (thread, message) => {
         const channelId = adapter.channelIdFromThreadId(thread.id);
         const isDM = adapterIsDM(adapter, thread.id);
+        reportChannelMetadata(channelId);
         await setupConfig.onInbound(
           channelId,
           resolveThreadId(thread.id, channelId),

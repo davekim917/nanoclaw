@@ -12,7 +12,12 @@ import { migrateGroupsToClaudeLocal } from './claude-md-compose.js';
 import { initDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
 import { registerSecretsFromEnv } from './secret-scrubber.js';
-import { getMessagingGroupsByChannel, getMessagingGroupAgents } from './db/messaging-groups.js';
+import {
+  getMessagingGroupsByChannel,
+  getMessagingGroupAgents,
+  getMessagingGroupByPlatform,
+  updateMessagingGroup,
+} from './db/messaging-groups.js';
 import { ensureContainerRuntimeRunning, cleanupOrphans } from './container-runtime.js';
 import { stopAllContainers } from './container-runner.js';
 import {
@@ -155,11 +160,21 @@ async function main(): Promise<void> {
         });
       },
       onMetadata(platformId, name, isGroup) {
-        log.info('Channel metadata discovered', {
+        const mg = getMessagingGroupByPlatform(adapter.channelType, platformId);
+        if (!mg) return; // router hasn't auto-created it yet — next inbound will
+        const updates: Parameters<typeof updateMessagingGroup>[1] = {};
+        if (name && mg.name !== name) updates.name = name;
+        if (isGroup !== undefined) {
+          const isGroupFlag = isGroup ? 1 : 0;
+          if (mg.is_group !== isGroupFlag) updates.is_group = isGroupFlag;
+        }
+        if (Object.keys(updates).length === 0) return;
+        updateMessagingGroup(mg.id, updates);
+        log.info('Channel metadata persisted', {
           channelType: adapter.channelType,
           platformId,
-          name,
-          isGroup,
+          mgId: mg.id,
+          updates,
         });
       },
       onAction(questionId, selectedOption, userId) {
