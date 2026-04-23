@@ -454,7 +454,16 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
             CardText(question),
             Actions(
               options.map((opt) =>
-                Button({ id: `ncq:${questionId}:${opt.value}`, label: opt.label, value: opt.value }),
+                Button({
+                  id: `ncq:${questionId}:${opt.value}`,
+                  label: opt.label,
+                  value: opt.value,
+                  // Chat SDK maps 'primary' / 'danger' to each platform's
+                  // native button color (Slack primary/danger, Discord
+                  // primary/danger, Teams positive/destructive). Unset →
+                  // platform default (grey/neutral).
+                  ...(opt.style ? { style: opt.style } : {}),
+                }),
               ),
             ),
           ],

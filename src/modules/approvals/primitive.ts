@@ -34,8 +34,8 @@ import { ensureUserDm } from '../permissions/user-dm.js';
 
 /** Two-button approval UI — the only options the primitive supports today. */
 const APPROVAL_OPTIONS: RawOption[] = [
-  { label: 'Approve', selectedLabel: '✅ Approved', value: 'approve' },
-  { label: 'Reject', selectedLabel: '❌ Rejected', value: 'reject' },
+  { label: 'Approve', selectedLabel: '✅ Approved', value: 'approve', style: 'primary' },
+  { label: 'Reject', selectedLabel: '❌ Rejected', value: 'reject', style: 'danger' },
 ];
 
 // ── Approval handler registry ──

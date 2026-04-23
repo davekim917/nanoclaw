@@ -7,10 +7,19 @@
  * and rendering.
  */
 
+/**
+ * Button style hint passed down to the Chat SDK → platform adapter.
+ * The SDK maps these to each platform's native button style (Slack:
+ * primary/danger, Teams: positive/destructive, Discord: primary/danger).
+ * `undefined` renders as the platform's neutral/default button.
+ */
+export type OptionStyle = 'primary' | 'danger';
+
 export interface OptionInput {
   label: string;
   selectedLabel?: string;
   value?: string;
+  style?: OptionStyle;
 }
 
 export type RawOption = string | OptionInput;
@@ -19,6 +28,7 @@ export interface NormalizedOption {
   label: string;
   selectedLabel: string;
   value: string;
+  style?: OptionStyle;
 }
 
 export function normalizeOption(raw: RawOption): NormalizedOption {
@@ -30,6 +40,7 @@ export function normalizeOption(raw: RawOption): NormalizedOption {
     label,
     selectedLabel: raw.selectedLabel ?? label,
     value: raw.value ?? label,
+    style: raw.style,
   };
 }
 
