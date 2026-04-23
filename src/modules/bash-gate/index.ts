@@ -53,11 +53,7 @@ import { markDelivered, markDeliveryFailed, markPending } from '../../db/session
 import { openInboundDb } from '../../session-manager.js';
 import { log } from '../../log.js';
 import type { PendingApproval, Session } from '../../types.js';
-import {
-  deletePendingApproval,
-  getPendingApprovalsBySession,
-  getSession,
-} from '../../db/sessions.js';
+import { deletePendingApproval, getPendingApprovalsBySession, getSession } from '../../db/sessions.js';
 
 import {
   editApprovalCard,
@@ -352,13 +348,32 @@ export async function cancelPendingGatesForSession(sessionId: string, reason: st
   });
 
   for (const p of pending) {
-    clearPending(p.request_id);
+    // The container polls `delivered` keyed on the GATE's requestId
+    // (the gate-* messages_out row it wrote), NOT on pending_approvals'
+    // `request_id` field — those are different identifiers. The gate
+    // requestId lives in the serialized payload that the original
+    // `handleGateRequest` stored when it called createPendingApproval.
+    // Parse it back out here so writeGateAck targets the row the
+    // container is actually waiting on.
+    let gateRequestId: string | undefined;
+    try {
+      const payload = JSON.parse(p.payload) as BashGatePayload;
+      gateRequestId = payload.requestId;
+    } catch {
+      log.warn('Pending gate payload unparseable; skipping cancel', { approvalId: p.approval_id });
+      continue;
+    }
+    if (!gateRequestId) {
+      log.warn('Pending gate payload missing requestId; skipping cancel', { approvalId: p.approval_id });
+      continue;
+    }
+    clearPending(gateRequestId);
     try {
       await editApprovalCard(p, `❌ *${p.title}* — cancelled\n\n${reason}`);
     } catch (err) {
       log.warn('Failed to edit cancelled approval card', { approvalId: p.approval_id, err });
     }
-    writeGateAck(session, p.request_id, 'rejected', reason);
+    writeGateAck(session, gateRequestId, 'rejected', reason);
     deletePendingApproval(p.approval_id);
   }
 }
