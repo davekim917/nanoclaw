@@ -197,8 +197,14 @@ async function drainSession(session: Session): Promise<void> {
 
     for (const msg of undelivered) {
       try {
-        const platformMsgId = await deliverMessage(msg, session, inDb);
-        markDelivered(inDb, msg.id, platformMsgId ?? null);
+        const result = await deliverMessage(msg, session, inDb);
+        // System actions like request_bash_gate return deferAck:true — the
+        // handler owns the `delivered` row lifecycle and writes it later
+        // (on admin approval or timeout). Auto-acking here would race
+        // ahead of the human and silently unblock a gated command.
+        if (!result.deferAck) {
+          markDelivered(inDb, msg.id, result.platformMsgId ?? null);
+        }
         deliveryAttempts.delete(msg.id);
 
         // Pause the typing indicator after a real user-facing message
@@ -251,18 +257,19 @@ async function deliverMessage(
   },
   session: Session,
   inDb: Database.Database,
-): Promise<string | undefined> {
+): Promise<{ platformMsgId?: string; deferAck?: true }> {
   if (!deliveryAdapter) {
     log.warn('No delivery adapter configured, dropping message', { id: msg.id });
-    return;
+    return {};
   }
 
   const content = JSON.parse(msg.content);
 
   // System actions — handle internally (schedule_task, cancel_task, etc.)
   if (msg.kind === 'system') {
-    await handleSystemAction(content, session, inDb);
-    return;
+    const result = await handleSystemAction(content, session, inDb);
+    if (result && result.deferAck) return { deferAck: true };
+    return {};
   }
 
   // Agent-to-agent — route to target session via the agent-to-agent module.
@@ -275,7 +282,7 @@ async function deliverMessage(
     }
     const { routeAgentMessage } = await import('./modules/agent-to-agent/agent-route.js');
     await routeAgentMessage(msg, session);
-    return;
+    return {};
   }
 
   // Permission check: the source agent must be allowed to deliver to this
@@ -325,7 +332,7 @@ async function deliverMessage(
   if (msg.kind === 'status') {
     if (!msg.channel_type || !msg.platform_id) {
       log.warn('Status message missing routing fields, dropping', { id: msg.id });
-      return;
+      return {};
     }
     const existingPlatformMsgId = statusTracking.get(session.id);
     let outbound = scrubSecrets(msg.content);
@@ -353,7 +360,7 @@ async function deliverMessage(
       mode: existingPlatformMsgId ? 'edit' : 'post',
       platformMsgId: platformMsgId ?? existingPlatformMsgId,
     });
-    return;
+    return { platformMsgId: platformMsgId ?? undefined };
   }
 
   // Track pending questions for ask_user_question flow.
@@ -386,7 +393,7 @@ async function deliverMessage(
   // Channel delivery
   if (!msg.channel_type || !msg.platform_id) {
     log.warn('Message missing routing fields', { id: msg.id });
-    return;
+    return {};
   }
 
   // Read file attachments from outbox if the content declares files.
@@ -479,7 +486,7 @@ async function deliverMessage(
 
   clearOutbox(session.agent_group_id, session.id, msg.id);
 
-  return platformMsgId;
+  return { platformMsgId: platformMsgId ?? undefined };
 }
 
 /**
@@ -495,11 +502,24 @@ async function deliverMessage(
  * Default when no handler registered and the switch doesn't match: log
  * "Unknown system action" and return.
  */
+/**
+ * Return value for a system-action delivery handler.
+ *
+ * - `undefined` / `void` — default: the outer delivery loop marks the
+ *   message as delivered in inbound.db after the handler returns.
+ * - `{ deferAck: true }` — handler takes ownership of the `delivered` row
+ *   for this message. The outer loop must NOT call markDelivered — the
+ *   handler will mark delivered/failed itself later (e.g. after an async
+ *   admin approval). Required for bash-gate: the gate's requestId IS the
+ *   msg.id, and the container polls `delivered` for that id as its ack
+ *   signal, so a premature auto-ack would short-circuit the gate.
+ */
+export type DeliveryActionResult = void | { deferAck: true };
 export type DeliveryActionHandler = (
   content: Record<string, unknown>,
   session: Session,
   inDb: Database.Database,
-) => Promise<void>;
+) => Promise<DeliveryActionResult>;
 
 const actionHandlers = new Map<string, DeliveryActionHandler>();
 
@@ -519,17 +539,17 @@ async function handleSystemAction(
   content: Record<string, unknown>,
   session: Session,
   inDb: Database.Database,
-): Promise<void> {
+): Promise<DeliveryActionResult> {
   const action = content.action as string;
   log.info('System action from agent', { sessionId: session.id, action });
 
   const registered = actionHandlers.get(action);
   if (registered) {
-    await registered(content, session, inDb);
-    return;
+    return registered(content, session, inDb);
   }
 
   log.warn('Unknown system action', { action });
+  return undefined;
 }
 
 export function stopDeliveryPolls(): void {
