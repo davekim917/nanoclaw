@@ -1128,6 +1128,15 @@ async function buildContainerArgs(
   // the values are set regardless of the SDK's settings-loading order.
   args.push('-e', 'CLAUDE_CODE_DISABLE_AUTO_MEMORY=0');
   args.push('-e', 'CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80');
+  // Claude Code 2.1+ has a built-in auto-compact window default that is well
+  // under 200k even when the session uses a 1M-context model (claude-opus-4-7[1m]).
+  // Without this override, CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80 fires against the
+  // CLI's small default window — sessions compact far earlier than the model's
+  // actual capacity. Setting 1_000_000 matches the [1m] capacity so 80% fires
+  // around 800k tokens. For non-[1m] sessions the percentage-based trigger still
+  // fires at 80% of the model's own context window before this override matters.
+  // The CLI itself hints at this value: "override with CLAUDE_CODE_AUTO_COMPACT_WINDOW=1000000".
+  args.push('-e', 'CLAUDE_CODE_AUTO_COMPACT_WINDOW=1000000');
 
   // Default `opus` alias resolution and default effort — both
   // configurable via host env so the install can upgrade to a newer

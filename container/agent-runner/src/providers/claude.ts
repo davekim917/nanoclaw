@@ -818,11 +818,13 @@ export class ClaudeProvider implements AgentProvider {
         resume: input.continuation,
         model: input.model,
         ...(input.effort ? { effort: input.effort as EffortLevel } : {}),
-        // Enable extended thinking so the SDK emits `thinking` content blocks
-        // into the response stream. deriveProgressLabels forwards those as
-        // progress events so users see the agent's reasoning, not just its
-        // tool calls. Budget convention: max_output − 1 (Opus 4.7 = 128000).
-        thinking: { type: 'enabled', budgetTokens: 127999 },
+        // Thinking is NOT explicitly configured: for supported models (Opus
+        // 4.7+) the SDK's default (`alwaysThinkingEnabled` absent) enables
+        // adaptive thinking automatically. Setting `{type: 'enabled',
+        // budgetTokens: N}` is for older fixed-budget models — passing it
+        // here was incorrect for 4.7. If thinking blocks don't surface in
+        // the content stream with defaults, add `thinking: {type: 'adaptive',
+        // display: 'summarized'}` explicitly.
         pathToClaudeCodeExecutable: '/pnpm/claude',
         systemPrompt: instructions ? { type: 'preset' as const, preset: 'claude_code' as const, append: instructions } : undefined,
         disallowedTools: SDK_DISALLOWED_TOOLS,
