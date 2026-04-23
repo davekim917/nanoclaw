@@ -19,8 +19,9 @@ function log(msg: string): void {
   console.error(`[claude-provider] ${msg}`);
 }
 
-/** Max chars per label. Long thinking prose and long commands both cap here. */
-const LABEL_MAX = 500;
+/** Max chars per thinking label. Bumped from 500 — thinking prose is usually
+ * multi-paragraph and the aggressive cap was cutting off useful reasoning. */
+const LABEL_MAX = 2000;
 
 /** Env gate: set NANOCLAW_HIDE_THINKING=1 to suppress thinking-block forwarding. */
 function thinkingForwardingEnabled(): boolean {
@@ -35,91 +36,29 @@ function truncate(s: string): string {
 }
 
 /**
- * Pick the most meaningful input field for a tool call. Each tool has a
- * primary input (command, file_path, pattern, query, url, skill, etc.);
- * we surface that field in the progress label. Secrets in the value are
- * handled by the host-side scrubber at delivery time (src/secret-scrubber.ts).
- */
-function toolDetail(name: string, input: Record<string, unknown>): string | null {
-  const asStr = (k: string): string | null => {
-    const v = input[k];
-    return typeof v === 'string' && v.trim().length > 0 ? v.trim() : null;
-  };
-  switch (name) {
-    case 'Bash': {
-      const cmd = asStr('command');
-      // First line only; the progress surface is a single-line status.
-      return cmd ? cmd.split('\n')[0] : null;
-    }
-    case 'Read':
-    case 'Edit':
-    case 'Write':
-    case 'NotebookEdit':
-      return asStr('file_path') ?? asStr('path');
-    case 'Glob':
-      return asStr('pattern') ?? asStr('path');
-    case 'Grep': {
-      const pattern = asStr('pattern');
-      const path = asStr('path');
-      if (pattern && path) return `"${pattern}" in ${path}`;
-      if (pattern) return `"${pattern}"`;
-      return path;
-    }
-    case 'WebSearch':
-    case 'ToolSearch':
-      return asStr('query');
-    case 'WebFetch':
-      return asStr('url');
-    case 'Task':
-      return asStr('subagent_type') ?? asStr('description');
-    case 'TodoWrite': {
-      const todos = Array.isArray(input.todos) ? input.todos : [];
-      return todos.length > 0 ? `${todos.length} tasks` : null;
-    }
-    case 'Skill':
-      return asStr('skill') ?? asStr('name');
-    default: {
-      // MCP / unknown tools: surface the first non-empty string-ish input.
-      for (const v of Object.values(input)) {
-        if (typeof v === 'string' && v.trim().length > 0) return v.trim();
-        if (typeof v === 'number') return String(v);
-      }
-      return null;
-    }
-  }
-}
-
-function toolUseLabel(b: { name?: string; input?: Record<string, unknown> }): string {
-  const name = b.name ?? 'tool';
-  const detail = toolDetail(name, b.input ?? {});
-  return detail ? `${name}: ${detail}` : name;
-}
-
-/**
- * Derive ordered progress labels from an assistant message. Each tool_use
- * block becomes `<ToolName>: <primary input>` — intentionally minimal
- * interpretation so users see what the agent is actually doing. Thinking
- * blocks are forwarded as their raw prose (truncated to LABEL_MAX chars).
+ * Derive ordered progress labels from an assistant message. Only thinking
+ * blocks are forwarded — tool_use labels were dropped because the post-then-
+ * edit chat UX shows one progress message at a time, so a tool_use label
+ * emitted immediately after thinking would overwrite the reasoning text
+ * within a second. Users wanted to read the thinking; the tool action is
+ * implied by the context.
  *
  * Secret scrubbing happens host-side in delivery.ts (scrubSecrets catches
  * Bearer tokens, vendor-prefix keys, registered .env values) — the
- * container emits raw input and trusts the outbound filter.
+ * container emits raw text and trusts the outbound filter.
  *
- * NANOCLAW_HIDE_THINKING=1 suppresses thinking forwarding for groups that
- * prefer a tighter UI. Tool-use labels always surface.
+ * NANOCLAW_HIDE_THINKING=1 suppresses all progress forwarding.
  */
 export function deriveProgressLabels(message: unknown): string[] {
   if (!message || typeof message !== 'object') return [];
   const content = (message as { message?: { content?: unknown } }).message?.content;
   if (!Array.isArray(content)) return [];
+  if (!thinkingForwardingEnabled()) return [];
   const labels: string[] = [];
-  const forwardThinking = thinkingForwardingEnabled();
   for (const block of content) {
-    const b = block as { type?: string; name?: string; input?: Record<string, unknown>; thinking?: unknown };
-    if (b.type === 'thinking' && forwardThinking && typeof b.thinking === 'string' && b.thinking.trim().length > 0) {
+    const b = block as { type?: string; thinking?: unknown };
+    if (b.type === 'thinking' && typeof b.thinking === 'string' && b.thinking.trim().length > 0) {
       labels.push(truncate(b.thinking));
-    } else if (b.type === 'tool_use') {
-      labels.push(truncate(toolUseLabel(b)));
     }
   }
   return labels;
