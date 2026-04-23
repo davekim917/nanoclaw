@@ -25,13 +25,29 @@ const REQUIRED_ENV: Record<string, string> = {
   // Prevents sessions from hitting the hard context limit and triggering
   // silent model fallback on upstream 400 errors.
   CLAUDE_AUTOCOMPACT_PCT_OVERRIDE: '80',
-  // Lock the `opus` alias to 4.7. Model IDs are bundled into each SDK
-  // release, so when a new flagship ships before the installed SDK knows
-  // about it, the alias resolver silently falls back to whatever is newest
-  // in its bundled map. This env short-circuits the alias and passes the
-  // explicit id to the API, keeping "opus" pointed at the real flagship
-  // regardless of SDK lag.
-  ANTHROPIC_DEFAULT_OPUS_MODEL: 'claude-opus-4-7',
+  // Paired with the percentage above: Claude Code 2.1+ has an internal
+  // auto-compact window default well under 200k regardless of model. For
+  // [1m] sessions that default triggers compaction at ~165k instead of at
+  // 80% of 1M. Forcing the window to 1_000_000 aligns the percentage with
+  // the [1m] capacity. Non-[1m] sessions still hit their own window first.
+  CLAUDE_CODE_AUTO_COMPACT_WINDOW: '1000000',
+  // Disable adaptive thinking so the CLI emits visible `thinking` content
+  // blocks (the older fixed-budget mode). The CLI's internal gate only
+  // applies this to model ids containing "opus-4-6" or "sonnet-4-6"; for
+  // 4-7 it's a benign no-op but keeps 4-6 sessions consistent.
+  CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING: '1',
+  // Fixed thinking token budget. 127999 = max_output − 1 (Opus 4.7 max is
+  // 128000). Deprecated in the SDK query option surface but still honored
+  // by the CLI as an env-var knob that pairs with the disabled-adaptive
+  // mode above — gives us a large budget on fixed-budget model variants.
+  MAX_THINKING_TOKENS: '127999',
+  // Lock the `opus` alias to 4.7 with the [1m] extended-context suffix so
+  // the alias matches the Docker-e default and compaction-window math
+  // (1M context). Without [1m], the bare `opus` call lands on a 200k
+  // variant and CLAUDE_CODE_AUTO_COMPACT_WINDOW=1000000 mis-shoots.
+  // Model IDs are bundled into each SDK release, so the env short-circuit
+  // also protects against SDK-alias-map lag when a new flagship ships.
+  ANTHROPIC_DEFAULT_OPUS_MODEL: 'claude-opus-4-7[1m]',
   // Lock the `sonnet` alias to 4.6 (explicit id, no [1m] suffix — extended
   // context is opt-in per query). Same reason as opus pin above.
   ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-sonnet-4-6',
@@ -51,8 +67,13 @@ const REQUIRED_SETTINGS: Record<string, unknown> = {
   // Background memory consolidation — prunes stale notes, resolves
   // contradictions, keeps MEMORY.md concise so auto-memory stays useful.
   autoDreamEnabled: true,
+  // Explicit opt-in to thinking for supported models. The SDK treats
+  // absent-or-true as "enabled automatically" but we keep this explicit
+  // so `/update-nanoclaw` can never leave a group with thinking disabled
+  // after a settings.json drift.
+  alwaysThinkingEnabled: true,
   // Default model alias. Combined with ANTHROPIC_DEFAULT_OPUS_MODEL in env
-  // above, this resolves to claude-opus-4-7 at spawn time.
+  // above, this resolves to claude-opus-4-7[1m] at spawn time.
   model: 'opus',
 };
 

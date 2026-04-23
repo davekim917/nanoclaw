@@ -1137,6 +1137,16 @@ async function buildContainerArgs(
   // fires at 80% of the model's own context window before this override matters.
   // The CLI itself hints at this value: "override with CLAUDE_CODE_AUTO_COMPACT_WINDOW=1000000".
   args.push('-e', 'CLAUDE_CODE_AUTO_COMPACT_WINDOW=1000000');
+  // Disable adaptive thinking so the CLI uses the older fixed-budget mode that
+  // emits visible `thinking` content blocks (what our deriveProgressLabels
+  // forwards). The CLI's own gate only actually flips modes when the model id
+  // contains "opus-4-6" or "sonnet-4-6"; for 4-7 this is a benign no-op. Keeps
+  // behavior consistent when a session explicitly selects 4-6.
+  args.push('-e', 'CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1');
+  // Fixed thinking budget (pairs with disable-adaptive above). max_output − 1
+  // for Opus 4.7 = 127999. Deprecated in the SDK query option but still
+  // honored as a CLI env knob.
+  args.push('-e', 'MAX_THINKING_TOKENS=127999');
 
   // Default `opus` alias resolution and default effort — both
   // configurable via host env so the install can upgrade to a newer
