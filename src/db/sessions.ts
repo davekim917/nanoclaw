@@ -162,22 +162,19 @@ export function createPendingApproval(
     });
 }
 
-/**
- * Used by bash-gate's auto-cancel path: when a user sends a follow-up
- * message to a session that already has a pending gate, we cancel all
- * in-flight gates for that session so the agent can process the new
- * message instead of staying blocked on `awaitDeliveryAck`.
- */
 export function getPendingApprovalsBySession(sessionId: string): PendingApproval[] {
   return getDb()
     .prepare('SELECT * FROM pending_approvals WHERE session_id = ? AND status = ?')
     .all(sessionId, 'pending') as PendingApproval[];
 }
 
-export function updatePendingApprovalMessageId(
-  approvalId: string,
-  platformMessageId: string | null,
-): void {
+export function getPendingApprovalByRequestId(requestId: string): PendingApproval | undefined {
+  return getDb()
+    .prepare('SELECT * FROM pending_approvals WHERE request_id = ? AND status = ?')
+    .get(requestId, 'pending') as PendingApproval | undefined;
+}
+
+export function updatePendingApprovalMessageId(approvalId: string, platformMessageId: string | null): void {
   getDb()
     .prepare('UPDATE pending_approvals SET platform_message_id = ? WHERE approval_id = ?')
     .run(platformMessageId, approvalId);

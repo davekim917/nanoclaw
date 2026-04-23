@@ -457,9 +457,9 @@ function createEmailGateHook(): HookCallback {
     // automated email reports aren't prompted every run.
     if (process.env.NANOCLAW_IS_SCHEDULED_TASK === '1') return {};
 
-    // Parse the email envelope from the gws command so the approval card
-    // shows who's sending what, instead of a raw shell invocation. Each
-    // matcher supports both --flag 'quoted value' and --flag unquoted_value.
+    // Parse the email envelope so the card shows structured fields
+    // instead of raw shell. Each matcher handles both --flag 'quoted'
+    // and --flag unquoted.
     const matchFlag = (flag: string): string | undefined => {
       const quoted = gwsSegment.match(new RegExp(`${flag}\\s+['"]([^'"]+)['"]`));
       if (quoted) return quoted[1];
@@ -482,11 +482,10 @@ function createEmailGateHook(): HookCallback {
     const action = command.match(/\+(\w[\w-]*)/)?.[1] ?? 'send';
     const label = subject ? `Email ${action} to ${to}: "${subject}"` : `Email ${action} to ${to}`;
 
-    // Build a structured card body: From/To/Cc/Bcc/Subject/Body preview.
-    // The host's buildCardBody wraps this with a footer, so don't add one
-    // here. No `command` field on the payload → host skips the code-block
-    // branch entirely. Full raw command is still in the agent's tool-call
-    // history for audit; we just don't surface shell noise to the approver.
+    // No `command` field on the payload → host's buildCardBody skips
+    // its code-block branch entirely. Full raw command is still in the
+    // SDK tool-call log for audit; we just don't surface shell noise
+    // to the approver.
     const lines: string[] = [`*From:* ${fromAccount}`, `*To:* ${to}`];
     if (cc) lines.push(`*Cc:* ${cc}`);
     if (bcc) lines.push(`*Bcc:* ${bcc}`);

@@ -147,6 +147,14 @@ export interface RequestApprovalOptions {
   agentName: string;
   /** Free-form action identifier. Must match the key the consumer registered via registerApprovalHandler. */
   action: string;
+  /**
+   * Caller-supplied stable identifier stored in `pending_approvals.request_id`.
+   * Lets consumers look up their row later by something they already know
+   * (e.g. the gate's outbound-message id for bash-gate). When omitted, the
+   * auto-generated approvalId is used — preserves back-compat for callers
+   * that don't need the direct lookup (self-mod, onecli).
+   */
+  requestId?: string;
   /** JSON-serializable opaque payload. Carried on the pending_approvals row, handed to the handler on approve. */
   payload: Record<string, unknown>;
   /** Card title shown to the admin. */
@@ -228,7 +236,7 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<voi
     approval_id: approvalId,
     session_id: session.id,
     agent_group_id: session.agent_group_id,
-    request_id: approvalId,
+    request_id: opts.requestId ?? approvalId,
     action,
     payload: JSON.stringify(payload),
     created_at: new Date().toISOString(),

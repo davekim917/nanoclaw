@@ -255,15 +255,15 @@ export function getDeliveredIds(db: Database.Database): Set<string> {
 }
 
 /**
- * Mark a dispatched-but-not-resolved gate row. Lets the delivery loop's
- * getDeliveredIds dedup filter see that the gate request has been handed
- * off to an approval handler, so the loop won't re-dispatch on every
- * poll tick while we wait for the human. The container side's
- * awaitDeliveryAck treats 'pending' as "keep polling" — only 'delivered'
- * or 'failed' resolve.
+ * UPSERT the `delivered` row for a message_out id. Three flavors:
+ *   - 'pending'   — gate dispatched, awaiting human. INSERT-only (idempotent).
+ *   - 'delivered' — gate approved / message sent successfully.
+ *   - 'failed'    — gate rejected/timed out / delivery threw.
  *
- * Idempotent: INSERT OR IGNORE means repeated calls during the same
- * dispatch window are harmless.
+ * `delivered` and `failed` must overwrite an earlier 'pending' row so the
+ * container's awaitDeliveryAck sees the final decision instead of staying
+ * stuck on 'pending'. 'pending' uses INSERT OR IGNORE because once a row
+ * exists (pending or resolved) we don't want to clobber it by accident.
  */
 export function markPending(db: Database.Database, messageOutId: string): void {
   db.prepare(
@@ -272,9 +272,6 @@ export function markPending(db: Database.Database, messageOutId: string): void {
 }
 
 export function markDelivered(db: Database.Database, messageOutId: string, platformMessageId: string | null): void {
-  // ON CONFLICT overwrite so a prior 'pending' row flips to 'delivered'
-  // when the admin approves. Without this the gate would stay pending
-  // forever from the container's perspective.
   db.prepare(
     `INSERT INTO delivered (message_out_id, platform_message_id, status, delivered_at)
      VALUES (?, ?, 'delivered', datetime('now'))

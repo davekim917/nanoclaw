@@ -53,7 +53,12 @@ import { markDelivered, markDeliveryFailed, markPending } from '../../db/session
 import { openInboundDb } from '../../session-manager.js';
 import { log } from '../../log.js';
 import type { PendingApproval, Session } from '../../types.js';
-import { deletePendingApproval, getPendingApprovalsBySession, getSession } from '../../db/sessions.js';
+import {
+  deletePendingApproval,
+  getPendingApprovalByRequestId,
+  getPendingApprovalsBySession,
+  getSession,
+} from '../../db/sessions.js';
 
 import {
   editApprovalCard,
@@ -68,12 +73,22 @@ import {
 // on approvers who were in a call when the card landed.
 const BASH_GATE_TIMEOUT_MS = 60 * 60 * 1000;
 
-/**
- * Map from pending approval gateId (which is also the messages_out id
- * the container is polling on) → scheduled-timeout handle. Lets the
- * approval handler clear the timer when the admin responds in time.
- */
 const pendingTimeouts = new Map<string, NodeJS.Timeout>();
+
+/**
+ * Session IDs with at least one in-flight gate. The router checks this
+ * Set before calling `cancelPendingGatesForSession` so the common case
+ * (no gate, no cancel needed) skips the DB query entirely.
+ *
+ * Not persisted — on host restart all container gates are already stale
+ * (awaitDeliveryAck will hit the container-side timeout either way), so
+ * losing this set on restart is the right behavior.
+ */
+const sessionsWithActiveGates = new Set<string>();
+
+export function sessionHasActiveGates(sessionId: string): boolean {
+  return sessionsWithActiveGates.has(sessionId);
+}
 
 interface BashGatePayload {
   requestId: string;
@@ -179,10 +194,13 @@ function createGateHandler(category: GateCategory) {
       return { deferAck: true };
     }
 
+    sessionsWithActiveGates.add(session.id);
+
     // Schedule the timeout before we dispatch the approval, so if anything
     // below throws we still auto-resolve on the container side.
     const timer = setTimeout(async () => {
       pendingTimeouts.delete(requestId);
+      sessionsWithActiveGates.delete(session.id);
       log.warn(`${category.logPrefix} gate timed out`, { requestId, agentGroupId: session.agent_group_id });
       writeGateAck(
         session,
@@ -190,10 +208,7 @@ function createGateHandler(category: GateCategory) {
         'timeout',
         `${category.logPrefix} gate timed out after ${BASH_GATE_TIMEOUT_MS / 60_000} minutes.`,
       );
-      // Edit the card in-place to show the timeout. Without this the
-      // buttons stay live in Slack/Discord and a user clicking 59 min
-      // late would hit a no-op handler.
-      const pending = getPendingApprovalsBySession(session.id).find((p) => p.request_id === requestId);
+      const pending = getPendingApprovalByRequestId(requestId);
       if (pending) {
         await editApprovalCard(
           pending,
@@ -217,6 +232,7 @@ function createGateHandler(category: GateCategory) {
       session,
       agentName: session.agent_group_id,
       action: category.approvalAction,
+      requestId,
       payload: payload as unknown as Record<string, unknown>,
       title: `${category.titleEmoji} ${label}`,
       question: buildCardBody(category, summary, command),
@@ -241,10 +257,6 @@ function createGateHandler(category: GateCategory) {
       inDb.close();
     }
 
-    // Defer the ack — the container polls `delivered` keyed on requestId
-    // (which is messages_out.id). Marking delivered now would short-circuit
-    // the gate; the approval handler (or the 60-min timeout above) is the
-    // only writer for the final 'delivered'/'failed' state.
     return { deferAck: true };
   };
 }
@@ -258,6 +270,7 @@ function createApprovalHandler(logPrefix: string) {
       return;
     }
     clearPending(p.requestId);
+    sessionsWithActiveGates.delete(p.sessionId);
 
     const session = getSession(p.sessionId);
     if (!session) {
@@ -265,13 +278,9 @@ function createApprovalHandler(logPrefix: string) {
       return;
     }
 
-    // The approval handler signals decision by calling ctx.notify OR by the
-    // act of being called at all. response-handler.ts only invokes us on
-    // approve; reject calls markDeliveryFailed via ctx.notify being skipped.
-    // We don't have direct access to the decision value here — primitive's
-    // interface collapses it. However, response-handler.ts currently ONLY
-    // calls the registered handler on approve (reject just notifies). So
-    // reaching this function means approved.
+    // response-handler.ts only invokes registered handlers on Approve —
+    // Reject is handled directly there via markDeliveryFailed. So
+    // reaching this function always means approved.
     writeGateAck(session, p.requestId, 'approved');
     log.info(`${logPrefix} gate approved`, { requestId: p.requestId, userId });
     notifyAgent(session, `${logPrefix} gate approved: ${p.label}`);
@@ -348,32 +357,17 @@ export async function cancelPendingGatesForSession(sessionId: string, reason: st
   });
 
   for (const p of pending) {
-    // The container polls `delivered` keyed on the GATE's requestId
-    // (the gate-* messages_out row it wrote), NOT on pending_approvals'
-    // `request_id` field — those are different identifiers. The gate
-    // requestId lives in the serialized payload that the original
-    // `handleGateRequest` stored when it called createPendingApproval.
-    // Parse it back out here so writeGateAck targets the row the
-    // container is actually waiting on.
-    let gateRequestId: string | undefined;
-    try {
-      const payload = JSON.parse(p.payload) as BashGatePayload;
-      gateRequestId = payload.requestId;
-    } catch {
-      log.warn('Pending gate payload unparseable; skipping cancel', { approvalId: p.approval_id });
-      continue;
-    }
-    if (!gateRequestId) {
-      log.warn('Pending gate payload missing requestId; skipping cancel', { approvalId: p.approval_id });
-      continue;
-    }
-    clearPending(gateRequestId);
+    // p.request_id is the gate's own outbound message id (bash-gate
+    // passes it through requestApproval's requestId option) — that's
+    // what the container's awaitDeliveryAck polls on.
+    clearPending(p.request_id);
     try {
       await editApprovalCard(p, `❌ *${p.title}* — cancelled\n\n${reason}`);
     } catch (err) {
       log.warn('Failed to edit cancelled approval card', { approvalId: p.approval_id, err });
     }
-    writeGateAck(session, gateRequestId, 'rejected', reason);
+    writeGateAck(session, p.request_id, 'rejected', reason);
     deletePendingApproval(p.approval_id);
   }
+  sessionsWithActiveGates.delete(sessionId);
 }

@@ -32,7 +32,7 @@ import {
   type TextChannel,
 } from 'discord.js';
 
-import { GROUPS_DIR } from '../config.js';
+import { REPO_ROOT } from '../config.js';
 import { startContainerRebuildWatcher, stopContainerRebuildWatcher } from '../container-rebuild-watcher.js';
 import { log } from '../log.js';
 import { routeInbound } from '../router.js';
@@ -45,7 +45,6 @@ const COMMANDS = [
   { name: 'update-plugins', description: 'Run git pull on all ~/plugins repos now' },
 ];
 
-const REPO_ROOT = path.resolve(GROUPS_DIR, '..');
 const DEPLOY_SCRIPT = path.resolve(REPO_ROOT, 'scripts', 'deploy.sh');
 const DEPLOY_LOG = path.resolve(REPO_ROOT, 'logs', 'deploy.log');
 const DEPLOY_STATUS = path.resolve(REPO_ROOT, 'logs', 'deploy-status.json');
@@ -107,7 +106,6 @@ function getInteractionParentId(interaction: ChatInputCommandInteraction): strin
   return interaction.channelId ?? null;
 }
 
-/** Spawn a detached script so it survives our own restart. */
 function spawnDetachedLogged(script: string): void {
   const logFd = fs.openSync(DEPLOY_LOG, 'a');
   const child = spawn('bash', [script], {
@@ -120,6 +118,35 @@ function spawnDetachedLogged(script: string): void {
   log.info('Detached deploy spawned', { pid: child.pid });
 }
 
+interface DeployStatus {
+  status?: 'ok' | 'failed';
+  step?: string;
+  error?: string;
+  mtimeMs: number;
+}
+
+function readDeployStatus(): DeployStatus | null {
+  try {
+    const raw = fs.readFileSync(DEPLOY_STATUS, 'utf-8');
+    const { mtimeMs } = fs.statSync(DEPLOY_STATUS);
+    return { ...(JSON.parse(raw) as Omit<DeployStatus, 'mtimeMs'>), mtimeMs };
+  } catch {
+    return null;
+  }
+}
+
+function consumeDeployStatus(): void {
+  try {
+    fs.unlinkSync(DEPLOY_STATUS);
+  } catch {
+    /* ignore — racy unlink is fine */
+  }
+}
+
+function formatFailure(status: DeployStatus): string {
+  return `Deploy failed at **${status.step ?? 'unknown'}**: ${status.error ?? 'no detail'}`;
+}
+
 /**
  * Poll deploy-status.json for pre-restart failures. If deploy succeeds,
  * the service restarts mid-poll — announceDeployStatus on the next boot
@@ -128,43 +155,24 @@ function spawnDetachedLogged(script: string): void {
 function pollDeployStatus(interaction: ChatInputCommandInteraction): void {
   const startTime = Date.now();
   let stopped = false;
-  const stop = () => {
-    stopped = true;
-  };
+
   const poll = async (): Promise<void> => {
     if (stopped) return;
-    try {
-      if (fs.existsSync(DEPLOY_STATUS)) {
-        const stat = fs.statSync(DEPLOY_STATUS);
-        if (stat.mtimeMs >= startTime) {
-          const status = JSON.parse(fs.readFileSync(DEPLOY_STATUS, 'utf-8')) as {
-            status?: string;
-            step?: string;
-            error?: string;
-          };
-          if (status.status === 'failed') {
-            stop();
-            await interaction.followUp({
-              content: `Deploy failed at **${status.step ?? 'unknown'}**: ${status.error ?? 'no detail'}`,
-            });
-            try {
-              fs.unlinkSync(DEPLOY_STATUS);
-            } catch {
-              /* ignore */
-            }
-            return;
-          }
-          if (status.status === 'ok') {
-            stop();
-            return;
-          }
-        }
+    const status = readDeployStatus();
+    if (status && status.mtimeMs >= startTime) {
+      if (status.status === 'failed') {
+        stopped = true;
+        await interaction.followUp({ content: formatFailure(status) });
+        consumeDeployStatus();
+        return;
       }
-    } catch {
-      /* mid-write — retry next tick */
+      if (status.status === 'ok') {
+        stopped = true;
+        return;
+      }
     }
     if (Date.now() - startTime > 120_000) {
-      stop();
+      stopped = true;
       return;
     }
     setTimeout(() => void poll(), 2_000);
@@ -173,37 +181,24 @@ function pollDeployStatus(interaction: ChatInputCommandInteraction): void {
 }
 
 /**
- * Post deploy success/failure once after startup if deploy-status.json is
- * fresh. Paired with `pollDeployStatus` — the poll catches pre-restart
- * failures, this catches post-restart success.
+ * One-shot at boot: if deploy-status.json was written in the last 5 min,
+ * post the outcome (paired with pollDeployStatus which catches failures
+ * *before* restart).
  */
 async function announceDeployStatus(): Promise<void> {
-  try {
-    if (!fs.existsSync(DEPLOY_STATUS)) return;
-    const stat = fs.statSync(DEPLOY_STATUS);
-    if (Date.now() - stat.mtimeMs > 300_000) return; // >5 min old, stale
-    const status = JSON.parse(fs.readFileSync(DEPLOY_STATUS, 'utf-8')) as {
-      status?: string;
-      step?: string;
-      error?: string;
-    };
-    const channelId = deployChannelId();
-    if (!channelId) return;
-    const textChannel = await getTextChannel(channelId);
-    if (!textChannel) return;
-    if (status.status === 'ok') {
-      await textChannel.send('Deploy complete — service is up.');
-    } else if (status.status === 'failed') {
-      await textChannel.send(`Deploy failed at **${status.step ?? 'unknown'}**: ${status.error ?? 'no detail'}`);
-    }
-    try {
-      fs.unlinkSync(DEPLOY_STATUS);
-    } catch {
-      /* ignore */
-    }
-  } catch (err) {
-    log.warn('announceDeployStatus failed', { err });
+  const status = readDeployStatus();
+  if (!status) return;
+  if (Date.now() - status.mtimeMs > 300_000) return;
+  const channelId = deployChannelId();
+  if (!channelId) return;
+  const textChannel = await getTextChannel(channelId);
+  if (!textChannel) return;
+  if (status.status === 'ok') {
+    await textChannel.send('Deploy complete — service is up.');
+  } else if (status.status === 'failed') {
+    await textChannel.send(formatFailure(status));
   }
+  consumeDeployStatus();
 }
 
 async function getTextChannel(channelId: string): Promise<TextChannel | null> {
