@@ -432,7 +432,7 @@ function buildSessionServicesSnapshot(agentGroupId: string): SessionServicesSnap
     scopes: [],
     credentialPaths: [],
     useFor:
-      'Meeting transcripts + notes via Granola REST API. Auth injected by OneCLI on api.granola.ai; no token visible in-container. Tools: `mcp__granola__list_meetings`, `mcp__granola__get_meeting` (set include_transcript=true for raw transcript).',
+      'Meeting transcripts + notes via Granola REST API. Auth injected by OneCLI on public-api.granola.ai; no token visible in-container. Tools: `mcp__granola__list_meetings`, `mcp__granola__get_meeting` (set include_transcript=true for raw transcript).',
   });
 
   return { agentGroupId, services };
