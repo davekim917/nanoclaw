@@ -47,3 +47,6 @@ agents-sdk-docs
 # Local env backups
 .env.pre-*
 .env.bak*
+
+# Codex plugin marker
+.codex
