@@ -81,10 +81,7 @@ async function oneCLIPut(path: string, body: unknown): Promise<void> {
  *
  * Pure apart from logging; exported for unit tests.
  */
-export function resolveUniversalSecrets(
-  configuredNames: string[],
-  allSecrets: OneCLISecret[],
-): OneCLISecret[] {
+export function resolveUniversalSecrets(configuredNames: string[], allSecrets: OneCLISecret[]): OneCLISecret[] {
   if (configuredNames.length === 0) return [];
   const byName = new Map<string, OneCLISecret[]>();
   for (const s of allSecrets) {
@@ -200,7 +197,10 @@ async function syncAgentById(agentId: string, displayName: string | null = null)
     // does use `{secretIds: [...]}`, so the asymmetry is deliberate API
     // shape, not an oversight here.
     const current = await oneCLIGet<string[]>(`/api/agents/${encodeURIComponent(agentId)}/secrets`);
-    const merged = computeMerge(current, resolved.map((s) => s.id));
+    const merged = computeMerge(
+      current,
+      resolved.map((s) => s.id),
+    );
     if (!merged) return;
     await oneCLIPut(`/api/agents/${encodeURIComponent(agentId)}/secrets`, { secretIds: merged });
     const currentSet = new Set(current);

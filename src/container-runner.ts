@@ -1426,16 +1426,30 @@ async function buildContainerArgs(
 
   // Assemble additional MCP servers: container.json's mcpServers (stdio
   // subprocesses the group declares) plus universal HTTP/stdio MCPs
-  // (deepwiki, context7, granola, exa, pocket) injected when the relevant
+  // (granola, deepwiki, context7, exa, pocket) injected when the relevant
   // key is present on the host. Per-group mcpServers from container.json
   // merged on top so groups can override. Use excludeMcpServers in
   // container.json to opt OUT of specific universals per-group.
+  //
+  // Granola is a local stdio wrapper around the Granola REST API — replaces
+  // the hosted mcp.granola.ai/mcp endpoint (OAuth-only, tokens expired every
+  // few hours) with a static-key REST client auto-authed by OneCLI.
   const mcpServers: Record<string, unknown> = { ...(containerConfig.mcpServers ?? {}) };
   const mcpExcluded = new Set(containerConfig.excludeMcpServers ?? []);
   const canInject = (name: string): boolean => !mcpExcluded.has(name) && !mcpServers[name];
 
   if (canInject('granola')) {
-    mcpServers.granola = { type: 'http', url: 'https://mcp.granola.ai/mcp' };
+    // Local stdio MCP wrapping Granola's REST API. Replaces the hosted
+    // mcp.granola.ai/mcp endpoint whose OAuth session tokens expired silently
+    // every few hours and left agents stuck on "Session expired. Please sign
+    // in again." OneCLI injects the static `grn_*` bearer token at the HTTPS
+    // proxy based on the `api.granola.ai` host pattern — see the `GranolaAPI`
+    // vault secret. No refresh worker needed.
+    mcpServers.granola = {
+      type: 'stdio',
+      command: 'bun',
+      args: ['/app/src/granola-mcp-server.ts'],
+    };
   }
   if (canInject('deepwiki')) {
     mcpServers.deepwiki = { type: 'http', url: 'https://mcp.deepwiki.com/mcp' };
