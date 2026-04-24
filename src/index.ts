@@ -30,6 +30,7 @@ import {
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
 import { startWorktreeCleanup, stopWorktreeCleanup } from './worktree-cleanup.js';
 import { startPluginUpdater, stopPluginUpdater } from './plugin-updater.js';
+import { syncAllAgentsUniversalSecrets } from './onecli-universal-secrets.js';
 import { restoreRemoteControl } from './remote-control.js';
 import { startDiscordSlashCommands, stopDiscordSlashCommands } from './channels/discord-slash-commands.js';
 import { routeInbound } from './router.js';
@@ -253,6 +254,15 @@ async function main(): Promise<void> {
     },
   });
   log.info('Plugin updater started');
+
+  // 8b. Backfill OneCLI universal secrets across every agent. Fire-and-forget:
+  //     agents that were provisioned before the universal list existed (or before
+  //     a new name was added) get the top-up here without waiting for their next
+  //     container spawn. Safe no-op when NANOCLAW_UNIVERSAL_SECRETS is empty or
+  //     when OneCLI isn't configured.
+  syncAllAgentsUniversalSecrets().catch((err) => {
+    log.warn('Universal-secrets startup backfill threw', { err });
+  });
 
   // 9. Restore any Remote Control session that was running before restart
   restoreRemoteControl();

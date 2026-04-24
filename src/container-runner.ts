@@ -32,6 +32,7 @@ import { initGroupFilesystem } from './group-init.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
+import { syncAgentUniversalSecretsByIdentifier } from './onecli-universal-secrets.js';
 import YAML from 'yaml';
 
 import { extractToolScopes, filterConfigSections, isToolEnabled } from './scoped-env.js';
@@ -1359,6 +1360,10 @@ async function buildContainerArgs(
     try {
       if (agentIdentifier) {
         await onecli.ensureAgent({ name: agentGroup.name, identifier: agentIdentifier });
+        // Top up the agent's OneCLI allow-list with any universal secrets
+        // configured via NANOCLAW_UNIVERSAL_SECRETS. Idempotent, cheap, and
+        // self-contained: errors are logged inside and never block spawn.
+        await syncAgentUniversalSecretsByIdentifier(agentIdentifier);
       }
       const onecliApplied = await onecli.applyContainerConfig(args, { addHostMapping: false, agent: agentIdentifier });
       if (onecliApplied) {

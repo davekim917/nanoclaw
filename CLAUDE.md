@@ -125,6 +125,21 @@ onecli secrets list                                    # all vault secrets (with
 
 If you've just enabled `mode all`, no container restart is needed — the gateway looks up secrets per request, so the next API call from the running container will see the new credentials.
 
+### Universal secrets (stay selective, auto-assign a named subset)
+
+OneCLI itself only supports `selective` or `all` — there's no native "selective + a pool of globals." NanoClaw layers that on top via `NANOCLAW_UNIVERSAL_SECRETS` in `.env`:
+
+```env
+# Comma-separated OneCLI secret *names* to auto-assign to every agent.
+# Missing names are logged and skipped (so you can pre-declare future globals
+# like Exa/Pocket before migrating them off raw API-key env vars).
+NANOCLAW_UNIVERSAL_SECRETS=Granola,Exa,Pocket
+```
+
+`src/onecli-universal-secrets.ts` tops up each agent's allow-list with these on every `ensureAgent` call and during a startup backfill across all existing agents. Selective mode stays intact; the listed secrets are merged in alongside whatever's explicitly assigned. Idempotent — re-running is a no-op.
+
+If a configured name matches multiple OneCLI secrets (e.g., two entries both named `GitHub`), the resolver picks the *first* match and logs a warning — check `logs/nanoclaw.log` for `Universal secret name is ambiguous` if a wrong credential appears to be reaching an agent.
+
 ### Requiring approval for credential use
 
 Approval-gating credentialed actions is a **two-sided** flow:
