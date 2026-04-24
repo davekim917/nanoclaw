@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 
+import { z } from 'zod';
 import {
   query as sdkQuery,
   type EffortLevel,
@@ -11,9 +12,17 @@ import {
 } from '@anthropic-ai/claude-agent-sdk';
 
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/connection.js';
-import { registerProvider } from './provider-registry.js';
+import { registerProvider, registerProviderConfigSchema } from './provider-registry.js';
 import type { AgentProvider, AgentQuery, McpServerConfig, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
 import { autoCommitDirtyWorktrees } from '../worktree-autosave.js';
+
+// Per D9 / D7 / A6: 5-value enum matching EffortLevel at
+// node_modules/@anthropic-ai/claude-agent-sdk/sdk.d.ts:462
+// (low | medium | high | xhigh | max). Keep in sync with SDK.
+export const claudeConfigSchema = z.strictObject({
+  model: z.string().min(1).optional(),
+  effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).optional(),
+});
 
 function log(msg: string): void {
   console.error(`[claude-provider] ${msg}`);
@@ -683,6 +692,7 @@ export class ClaudeProvider implements AgentProvider {
   private mcpServers: Record<string, McpServerConfig>;
   private env: Record<string, string | undefined>;
   private additionalDirectories?: string[];
+  private readonly stickyConfig: z.infer<typeof claudeConfigSchema>;
 
   /**
    * Ordered fallback API keys from ANTHROPIC_API_KEY_N env vars (sorted by
@@ -711,6 +721,7 @@ export class ClaudeProvider implements AgentProvider {
     this.mcpServers = options.mcpServers ?? {};
     this.additionalDirectories = options.additionalDirectories;
     this.env = filterSdkEnv({ ...(options.env ?? {}) });
+    this.stickyConfig = claudeConfigSchema.parse(options.providerConfig ?? {});
     this.fallbackKeys = Object.entries(this.env)
       .filter(([k, v]) => ANTHROPIC_FALLBACK_RE.test(k) && typeof v === 'string' && v.length > 0)
       .sort(([a], [b]) => {
@@ -791,6 +802,10 @@ export class ClaudeProvider implements AgentProvider {
 
     const instructions = input.systemContext?.instructions;
 
+    // Per-turn input takes precedence over sticky config (A3).
+    const model = input.model ?? this.stickyConfig.model;
+    const effort = input.effort ?? this.stickyConfig.effort;
+
     // Discover plugins each query so hot-mounted plugin drops are picked up
     // without a container restart. Cheap (just fs.readdir under
     // /workspace/plugins); if it grows expensive, hoist to constructor.
@@ -804,14 +819,14 @@ export class ClaudeProvider implements AgentProvider {
     // the family env vars handle bare-alias frontmatter (`model: opus` etc.)
     // which the SDK otherwise resolves via the container's spawn-time default.
     const perQueryEnv: Record<string, string | undefined> = { ...this.env };
-    if (input.model) {
-      perQueryEnv.CLAUDE_CODE_SUBAGENT_MODEL = input.model;
+    if (model) {
+      perQueryEnv.CLAUDE_CODE_SUBAGENT_MODEL = model;
       // Guard: a bare alias here would create an alias→alias loop in the SDK.
-      if (!/^(opus|sonnet|haiku|default)$/i.test(input.model)) {
-        const family = /^claude-(opus|sonnet|haiku)-/i.exec(input.model)?.[1]?.toLowerCase();
-        if (family === 'opus') perQueryEnv.ANTHROPIC_DEFAULT_OPUS_MODEL = input.model;
-        if (family === 'sonnet') perQueryEnv.ANTHROPIC_DEFAULT_SONNET_MODEL = input.model;
-        if (family === 'haiku') perQueryEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL = input.model;
+      if (!/^(opus|sonnet|haiku|default)$/i.test(model)) {
+        const family = /^claude-(opus|sonnet|haiku)-/i.exec(model)?.[1]?.toLowerCase();
+        if (family === 'opus') perQueryEnv.ANTHROPIC_DEFAULT_OPUS_MODEL = model;
+        if (family === 'sonnet') perQueryEnv.ANTHROPIC_DEFAULT_SONNET_MODEL = model;
+        if (family === 'haiku') perQueryEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL = model;
       }
     }
 
@@ -821,8 +836,8 @@ export class ClaudeProvider implements AgentProvider {
         cwd: input.cwd,
         additionalDirectories: this.additionalDirectories,
         resume: input.continuation,
-        model: input.model,
-        ...(input.effort ? { effort: input.effort as EffortLevel } : {}),
+        model: model,
+        ...(effort ? { effort: effort as EffortLevel } : {}),
         // `display: 'summarized'` makes thinking text visible in content
         // blocks; default is empty-text + signature only.
         thinking: { type: 'adaptive', display: 'summarized' },
@@ -928,3 +943,4 @@ export class ClaudeProvider implements AgentProvider {
 }
 
 registerProvider('claude', (opts) => new ClaudeProvider(opts));
+registerProviderConfigSchema('claude', claudeConfigSchema);

@@ -5,6 +5,7 @@
  * agent_destinations rows, projects the new destination into the parent's
  * running container, and notifies the parent.
  */
+import fs from 'fs';
 import path from 'path';
 
 import { GROUPS_DIR } from '../../config.js';
@@ -12,6 +13,7 @@ import { createAgentGroup, getAgentGroup, getAgentGroupByFolder } from '../../db
 import { getSession } from '../../db/sessions.js';
 import { wakeContainer } from '../../container-runner.js';
 import { initGroupFilesystem } from '../../group-init.js';
+import { updateContainerConfig } from '../../container-config.js';
 import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import type { AgentGroup, Session } from '../../types.js';
@@ -34,10 +36,51 @@ function notifyAgent(session: Session, text: string): void {
   }
 }
 
+/**
+ * Best-effort folder rollback. Returns true on clean removal, false when
+ * fs.rmSync itself failed — in which case an orphan directory persists on
+ * disk and the caller should surface that to the user via notifyAgent so
+ * they know manual cleanup may be needed.
+ */
+function safeRemoveFolder(folder: string): boolean {
+  const groupPath = path.resolve(GROUPS_DIR, folder);
+  try {
+    fs.rmSync(groupPath, { recursive: true, force: true });
+    return true;
+  } catch (rollbackErr) {
+    log.error('create_agent: rollback fs.rmSync failed — orphan folder', {
+      folder,
+      groupPath,
+      err: rollbackErr,
+    });
+    return false;
+  }
+}
+
+function orphanSuffix(folder: string, cleaned: boolean): string {
+  return cleaned ? '' : ` (orphan folder at groups/${folder} — manual cleanup may be needed)`;
+}
+
 export async function handleCreateAgent(content: Record<string, unknown>, session: Session): Promise<void> {
   const requestId = content.requestId as string;
   const name = content.name as string;
   const instructions = content.instructions as string | null;
+  const provider = content.provider as string | undefined;
+  const providerConfig = content.provider_config as Record<string, unknown> | undefined;
+
+  // Envelope guard — defense in depth; full per-provider validation already
+  // happened in the container-side MCP handler.
+  if (provider !== undefined && (typeof provider !== 'string' || provider.trim() === '')) {
+    notifyAgent(session, 'create_agent failed: provider must be a non-empty string.');
+    return;
+  }
+  if (
+    providerConfig !== undefined &&
+    (typeof providerConfig !== 'object' || providerConfig === null || Array.isArray(providerConfig))
+  ) {
+    notifyAgent(session, 'create_agent failed: provider_config must be a plain object.');
+    return;
+  }
 
   const sourceGroup = getAgentGroup(session.agent_group_id);
   if (!sourceGroup) {
@@ -78,11 +121,45 @@ export async function handleCreateAgent(content: Record<string, unknown>, sessio
     id: agentGroupId,
     name,
     folder,
-    agent_provider: null,
+    agent_provider: provider ?? null,
     created_at: now,
   };
-  createAgentGroup(newGroup);
+
+  // STEP 1: Create folder + baseline container.json + CLAUDE.local.md + skills
+  //         symlinks. initGroupFilesystem is idempotent; writes an empty
+  //         container.json via initContainerConfig.
   initGroupFilesystem(newGroup, { instructions: instructions ?? undefined });
+
+  // STEP 2: Mutate container.json to set provider + providerConfig. Both
+  //         fields written here so the container's config picks up the right
+  //         provider factory on spawn.
+  if (provider !== undefined || providerConfig !== undefined) {
+    try {
+      updateContainerConfig(folder, (c) => {
+        if (provider !== undefined) c.provider = provider;
+        if (providerConfig !== undefined) c.providerConfig = providerConfig;
+      });
+    } catch (err) {
+      log.error('create_agent: updateContainerConfig failed, rolling back folder', { err, folder });
+      const cleaned = safeRemoveFolder(folder);
+      notifyAgent(
+        session,
+        `create_agent failed: could not write config for "${name}".${orphanSuffix(folder, cleaned)}`,
+      );
+      return;
+    }
+  }
+
+  // STEP 3: DB INSERT. On failure, rollback the folder from step 1
+  //         (including the provider config written in step 2).
+  try {
+    createAgentGroup(newGroup);
+  } catch (err) {
+    log.error('create_agent: createAgentGroup failed, rolling back folder', { err, folder });
+    const cleaned = safeRemoveFolder(folder);
+    notifyAgent(session, `create_agent failed: database insert failed for "${name}".${orphanSuffix(folder, cleaned)}`);
+    return;
+  }
 
   // Insert bidirectional destination rows (= ACL grants).
   // Creator refers to child by the name it chose; child refers to creator as "parent".

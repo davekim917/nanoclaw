@@ -53,6 +53,15 @@ export interface ProviderOptions {
   mcpServers?: Record<string, McpServerConfig>;
   env?: Record<string, string | undefined>;
   additionalDirectories?: string[];
+
+  /**
+   * Per-provider sticky config from container.json.providerConfig.
+   * Validated by the create_agent MCP handler against the provider's
+   * configSchema before it reaches the host for persistence (container is
+   * the validation authority — see decision D4 / C11). Each provider reads
+   * only its own slice in its constructor or query() method.
+   */
+  providerConfig?: Record<string, unknown>;
 }
 
 export interface QueryInput {

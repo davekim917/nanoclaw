@@ -119,10 +119,10 @@ export interface ContainerConfig {
 
   /**
    * Per-group default reasoning effort when the agent doesn't pass
-   * `-e <level>`. One of 'low' | 'medium' | 'high' | 'xhigh'. Overrides
-   * the host-env / hardcoded default.
+   * `-e <level>`. One of 'low' | 'medium' | 'high' | 'xhigh' | 'max'.
+   * Overrides the host-env / hardcoded default.
    */
-  defaultEffort?: 'low' | 'medium' | 'high' | 'xhigh';
+  defaultEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
   /**
    * Per-agent-group default tone profile name (matches a file under
@@ -140,6 +140,23 @@ export interface ContainerConfig {
    * browser-auth.
    */
   tools?: string[];
+
+  /**
+   * Per-provider sticky config for the agent that runs in this group.
+   * Populated by `create_agent`'s host handler after container-side Zod
+   * validation (decision D4 — container is the validation authority).
+   * Each provider reads only its own slice.
+   *
+   * Source of truth for valid keys per provider:
+   *   container/agent-runner/src/providers/<name>.ts — see the exported
+   *   `<name>ConfigSchema`. Currently:
+   *     - 'claude': { model?: string, effort?: 'low'|'medium'|'high'|'xhigh'|'max' }
+   *     - 'codex':  { model?: string, reasoning_effort?: 'low'|'medium'|'high' }
+   *     - Others (e.g. opencode, mock): no configSchema — must be empty {}.
+   *
+   * See decision D4 / D11 in .context/specs/create-agent-provider/decisions.yaml.
+   */
+  providerConfig?: Record<string, unknown>;
 }
 
 function emptyConfig(): ContainerConfig {
@@ -189,6 +206,7 @@ export function readContainerConfig(folder: string): ContainerConfig {
       defaultEffort: raw.defaultEffort,
       tone: raw.tone,
       tools: raw.tools,
+      providerConfig: raw.providerConfig,
     };
   } catch (err) {
     console.error(`[container-config] failed to parse ${p}: ${String(err)}`);
