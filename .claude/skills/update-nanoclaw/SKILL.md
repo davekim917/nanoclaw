@@ -32,7 +32,14 @@ Run `/update-nanoclaw` in Claude Code.
 
 **Validation**: runs `pnpm run build` and `pnpm test`.
 
-**Breaking changes check**: after validation, reads CHANGELOG.md for any `[BREAKING]` entries introduced by the update. If found, shows each breaking change and offers to run the recommended skill to migrate.
+**Post-merge audit**: five checks that go beyond build + tests (details in `audit.md`):
+- **A. Silent drops** — exports or individual lines your pre-merge HEAD had that the auto-merge dropped without firing a conflict marker.
+- **B. Container rebuild requirement** — flags when `container/`, `src/config.ts`, or `src/install-slug.ts` changes mean the built agent-container image is stale; the final restart is gated on this.
+- **C. Live migration preflight** — scans pending migrations against the real `data/v2.db` for `ALTER ... NOT NULL`, `DROP`, or destructive `UPDATE` that tests (scratch DB) miss.
+- **D. Env var drift** — finds `.env` keys no source file reads anymore and new required keys the user hasn't set.
+- **E. Supply-chain policy drift** — hard-fails if upstream silently added `minimumReleaseAgeExclude` or `onlyBuiltDependencies` entries.
+
+**Breaking changes check**: after the audit, reads CHANGELOG.md for any `[BREAKING]` entries introduced by the update. If found, shows each breaking change and offers to run the recommended skill to migrate.
 
 ## Rollback
 
@@ -184,8 +191,29 @@ If build fails:
 - Do not refactor unrelated code.
 - If unclear, ask the user before making changes.
 
-# Step 6: Breaking changes check
-After validation succeeds, check if the update introduced any breaking changes.
+# Step 6: Post-merge audit
+
+After validation passes, run the full audit defined in `.claude/skills/update-nanoclaw/audit.md`:
+
+1. Read `.claude/skills/update-nanoclaw/audit.md` with the Read tool.
+2. Follow every sub-audit (A–E) in order, passing `BACKUP=<backup-tag-from-step-1>` through the environment.
+3. Collect findings into the consolidated report format at the end of `audit.md`.
+4. Apply the decision rules:
+   - Any `BLOCK` → stop here; require user resolution before continuing.
+   - `FLAG` items → show the details, ask the user whether to accept them or rollback. Default to proceed on acceptance.
+   - All `PASS` → continue silently.
+5. Persist the audit verdict. Step 9 needs:
+   - `REBUILD_REQUIRED` (from sub-audit B) — whether the final restart must be gated on `./container/build.sh`.
+   - `DB_BACKUP_RECOMMENDED` (from sub-audit C) — whether the user should back up `data/v2.db` before restart.
+
+Rollback recipe (for BLOCK or user-rejected FLAG):
+
+```bash
+git reset --hard <backup-tag-from-step-1>
+```
+
+# Step 7: Breaking changes check
+After the audit clears, check if the update introduced any breaking changes.
 
 Determine which CHANGELOG entries are new by diffing against the backup tag:
 - `git diff <backup-tag-from-step-1>..HEAD -- CHANGELOG.md`
@@ -196,7 +224,7 @@ Parse the diff output for lines that contain `[BREAKING]` anywhere in the line. 
 ```
 
 If no `[BREAKING]` lines are found:
-- Skip this step silently. Proceed to Step 7 (skill updates check).
+- Skip this step silently. Proceed to Step 8 (skill updates check).
 
 If one or more `[BREAKING]` lines are found:
 - Display a warning header to the user: "This update includes breaking changes that may require action:"
@@ -207,9 +235,9 @@ If one or more `[BREAKING]` lines are found:
   - "Skip — I'll handle these manually"
 - Set `multiSelect: true` so the user can pick multiple skills if there are several breaking changes.
 - For each skill the user selects, invoke it using the Skill tool.
-- After all selected skills complete (or if user chose Skip), proceed to Step 7 (skill updates check).
+- After all selected skills complete (or if user chose Skip), proceed to Step 8 (skill updates check).
 
-# Step 7: Check for skill updates
+# Step 8: Check for skill updates
 After the summary, check if skills are distributed as branches in this repo:
 - `git branch -r --list 'upstream/skill/*'`
 
@@ -218,22 +246,30 @@ If any `upstream/skill/*` branches exist:
   - Option 1: "Yes, check for updates" (description: "Runs /update-skills to check for and apply skill branch updates")
   - Option 2: "No, skip" (description: "You can run /update-skills later any time")
 - If user selects yes, invoke `/update-skills` using the Skill tool.
-- After the skill completes (or if user selected no), proceed to Step 8.
+- After the skill completes (or if user selected no), proceed to Step 9.
 
-# Step 8: Summary + rollback instructions
+# Step 9: Summary + rollback instructions
 Show:
 - Backup tag: the tag name created in Step 1
 - New HEAD: `git rev-parse --short HEAD`
 - Upstream HEAD: `git rev-parse --short upstream/$UPSTREAM_BRANCH`
 - Conflicts resolved (list files, if any)
+- Audit findings (A–E verdicts from Step 6)
 - Breaking changes applied (list skills run, if any)
 - Remaining local diff vs upstream: `git diff --name-only upstream/$UPSTREAM_BRANCH..HEAD`
+
+Apply audit-driven gating before suggesting the restart:
+
+- If `REBUILD_REQUIRED=yes` (from audit sub-B): the restart command MUST be preceded by `./container/build.sh`. State this as a required pre-step, not optional. If sub-B also noted buildx cache staleness, add `docker buildx prune -f` before the build.
+- If `DB_BACKUP_RECOMMENDED=yes` (from audit sub-C): suggest `cp data/v2.db data/v2.db.pre-update-$(date +%s)` before restart.
 
 Tell the user:
 - To rollback: `git reset --hard <backup-tag-from-step-1>`
 - Backup branch also exists: `backup/pre-update-<HASH>-<TIMESTAMP>`
-- Restart the service to apply changes:
+- Restart the service to apply changes (after rebuild/backup if flagged above):
   - If using launchd: `launchctl unload ~/Library/LaunchAgents/com.nanoclaw.plist && launchctl load ~/Library/LaunchAgents/com.nanoclaw.plist`
+  - If using systemd user: `systemctl --user restart nanoclaw-v2`
+  - If using systemd system: `sudo systemctl restart nanoclaw-v2`
   - If running manually: restart `pnpm run dev`
 
 
