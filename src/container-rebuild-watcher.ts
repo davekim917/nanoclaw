@@ -23,11 +23,14 @@ import { log } from './log.js';
 const execFileAsync = promisify(execFile);
 
 const POLL_MS = 60_000;
-// Tag is always `v2` in this codebase; the base (including install-slug) is
-// per-install — use the same full reference container-runner.ts spawns from,
-// otherwise we end up inspecting a stale legacy tag that never rebuilds.
-const IMAGE_TAG = 'v2';
+// Use the same full reference container-runner.ts spawns from — CONTAINER_IMAGE
+// resolves to `<install-slug-base>:<tag>` (default `:latest`). Pre-fix the
+// watcher hardcoded `nanoclaw-agent:v2` (wrong base) and built with tag `v2`
+// (wrong tag), so inspect + build targets + spawn target were all different
+// images. Extract the tag from CONTAINER_IMAGE so build.sh gets the same one.
 const IMAGE_REF = CONTAINER_IMAGE;
+const tagColon = IMAGE_REF.lastIndexOf(':');
+const IMAGE_TAG = tagColon >= 0 ? IMAGE_REF.slice(tagColon + 1) : 'latest';
 
 type Notifier = (message: string) => Promise<void>;
 
