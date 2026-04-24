@@ -5,7 +5,7 @@
  * Replaces the hosted MCP at mcp.granola.ai/mcp — that one uses OAuth session
  * tokens which silently expire (~hours/days). This server uses the static
  * `grn_*` API key vended by Granola's REST API, auto-injected at request time
- * by the OneCLI gateway based on the `api.granola.ai` host pattern. No token
+ * by the OneCLI gateway based on the `public-api.granola.ai` host pattern. No token
  * rotation, no refresh worker, no in-container secret handling.
  *
  * Runs as a standalone process (not folded into the `nanoclaw` MCP) so tools
@@ -18,7 +18,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema, type Tool } from '@modelcontextprotocol/sdk/types.js';
 
-const BASE = 'https://api.granola.ai/v1';
+const BASE = 'https://public-api.granola.ai/v1';
 
 function log(msg: string): void {
   // MCP protocol uses stdout; logs go to stderr.
@@ -27,7 +27,7 @@ function log(msg: string): void {
 
 async function granolaGet(path: string): Promise<unknown> {
   const url = `${BASE}${path}`;
-  // OneCLI's HTTPS proxy intercepts requests to api.granola.ai and injects
+  // OneCLI's HTTPS proxy intercepts requests to public-api.granola.ai and injects
   // `Authorization: Bearer grn_...` from the vault. We never see the key.
   const res = await fetch(url);
   if (!res.ok) {

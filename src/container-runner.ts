@@ -1443,8 +1443,8 @@ async function buildContainerArgs(
     // mcp.granola.ai/mcp endpoint whose OAuth session tokens expired silently
     // every few hours and left agents stuck on "Session expired. Please sign
     // in again." OneCLI injects the static `grn_*` bearer token at the HTTPS
-    // proxy based on the `api.granola.ai` host pattern — see the `GranolaAPI`
-    // vault secret. No refresh worker needed.
+    // proxy based on the `public-api.granola.ai` host pattern — see the
+    // `GranolaAPI` vault secret. No refresh worker needed.
     mcpServers.granola = {
       type: 'stdio',
       command: 'bun',

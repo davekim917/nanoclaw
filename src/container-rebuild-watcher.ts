@@ -41,15 +41,26 @@ async function git(...args: string[]): Promise<string> {
 const short = (sha: string): string => sha.slice(0, 7);
 
 /**
- * Returns the running image's `Created` timestamp (ISO, no fractional secs)
- * suitable for `git log --before`, or null when the image doesn't exist.
+ * Returns the running image's `nanoclaw.commit` label (stamped by
+ * `container/build.sh`), or null when the image doesn't exist or wasn't
+ * built by a version of build.sh that stamps the label.
+ *
+ * Previously we compared `Created` timestamps against `git log --before=...`,
+ * but Docker's build cache reuses an existing image (same Created timestamp)
+ * whenever all COPY'd inputs match — so a rebuild triggered by an
+ * agent-runner/src change (mounted at runtime, not COPY'd) would succeed
+ * quietly with the old timestamp and trap the watcher in a rebuild loop.
+ * Commit labels advance with every successful build regardless of cache.
  */
-async function imageCreatedAt(): Promise<string | null> {
+async function imageCommitLabel(): Promise<string | null> {
   try {
-    const { stdout } = await execFileAsync(CONTAINER_RUNTIME_BIN, ['inspect', '--format', '{{.Created}}', IMAGE_REF], {
-      timeout: 10_000,
-    });
-    return stdout.trim().split('.')[0].replace('T', ' ');
+    const { stdout } = await execFileAsync(
+      CONTAINER_RUNTIME_BIN,
+      ['inspect', '--format', '{{index .Config.Labels "nanoclaw.commit"}}', IMAGE_REF],
+      { timeout: 10_000 },
+    );
+    const label = stdout.trim();
+    return label && label !== '<no value>' ? label : null;
   } catch {
     return null;
   }
@@ -62,17 +73,16 @@ interface StalenessCheck {
 
 /**
  * Decide whether the image needs a rebuild. Always rebuilds when the image
- * doesn't exist or its build commit can't be located. Otherwise compares
- * `imageCommit..origin/main` for files under `container/`. A failed
- * `git diff` is logged and treated as "stale" (fail-open) so a transient
- * git error doesn't silently suppress rebuilds.
+ * doesn't exist or wasn't stamped with a commit label (old image from before
+ * label support — treat as stale to force a fresh build that IS labeled).
+ * Otherwise compares `imageCommit..origin/main` for files under `container/`.
+ * A failed `git diff` is logged and treated as "stale" (fail-open) so a
+ * transient git error doesn't silently suppress rebuilds.
  */
 async function checkStaleness(): Promise<StalenessCheck> {
-  const [toSha, created] = await Promise.all([git('rev-parse', 'origin/main'), imageCreatedAt()]);
-  if (!created) return { stale: true, reason: 'no image present' };
-  const imageCommit = await git('log', '-1', `--before=${created}`, '--format=%H', 'origin/main').catch(() => '');
-  if (!imageCommit) return { stale: true, reason: `no commit found before image ts ${created}` };
-  if (imageCommit === toSha) return { stale: false, reason: 'image at HEAD' };
+  const [toSha, imageCommit] = await Promise.all([git('rev-parse', 'origin/main'), imageCommitLabel()]);
+  if (!imageCommit) return { stale: true, reason: 'no image or missing nanoclaw.commit label' };
+  if (imageCommit === toSha) return { stale: false, reason: `image at HEAD (${short(imageCommit)})` };
   let changed: string;
   try {
     changed = await git('diff', '--name-only', imageCommit, toSha, '--', 'container/');
@@ -80,7 +90,7 @@ async function checkStaleness(): Promise<StalenessCheck> {
     log.warn('git diff failed in staleness check — treating as stale', { err });
     return { stale: true, reason: `git diff failed (range ${short(imageCommit)}..${short(toSha)})` };
   }
-  if (!changed) return { stale: false, reason: 'no container/ changes since image' };
+  if (!changed) return { stale: false, reason: `no container/ changes since ${short(imageCommit)}` };
   return { stale: true, reason: `container/ changed in ${short(imageCommit)}..${short(toSha)}` };
 }
 
