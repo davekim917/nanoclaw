@@ -46,11 +46,18 @@ function parseUniversalNames(raw: string | undefined): string[] {
     .filter(Boolean);
 }
 
+/**
+ * OneCLI's admin API accepts unauthed requests on 127.0.0.1 — `ONECLI_API_KEY`
+ * is optional. Mirror the @onecli-sh/sdk behavior: only send the Authorization
+ * header when a key is configured.
+ */
+function authHeaders(extra: Record<string, string> = {}): Record<string, string> {
+  if (ONECLI_API_KEY) return { Authorization: `Bearer ${ONECLI_API_KEY}`, ...extra };
+  return { ...extra };
+}
+
 async function oneCLIGet<T>(path: string): Promise<T> {
-  if (!ONECLI_API_KEY) throw new Error('ONECLI_API_KEY not set');
-  const res = await fetch(`${baseUrl()}${path}`, {
-    headers: { Authorization: `Bearer ${ONECLI_API_KEY}` },
-  });
+  const res = await fetch(`${baseUrl()}${path}`, { headers: authHeaders() });
   if (!res.ok) {
     const body = await res.text().catch(() => '');
     throw new Error(`OneCLI GET ${path} ${res.status}: ${body}`);
@@ -59,13 +66,9 @@ async function oneCLIGet<T>(path: string): Promise<T> {
 }
 
 async function oneCLIPut(path: string, body: unknown): Promise<void> {
-  if (!ONECLI_API_KEY) throw new Error('ONECLI_API_KEY not set');
   const res = await fetch(`${baseUrl()}${path}`, {
     method: 'PUT',
-    headers: {
-      Authorization: `Bearer ${ONECLI_API_KEY}`,
-      'Content-Type': 'application/json',
-    },
+    headers: authHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify(body),
   });
   if (!res.ok) {
@@ -221,7 +224,6 @@ async function syncAgentById(agentId: string, displayName: string | null = null)
  */
 export async function syncAgentUniversalSecretsByIdentifier(identifier: string): Promise<void> {
   if (!parseUniversalNames(NANOCLAW_UNIVERSAL_SECRETS).length) return;
-  if (!ONECLI_API_KEY) return;
   try {
     const agentId = await resolveAgentIdByIdentifier(identifier);
     if (!agentId) {
@@ -241,7 +243,6 @@ export async function syncAgentUniversalSecretsByIdentifier(identifier: string):
 export async function syncAllAgentsUniversalSecrets(): Promise<void> {
   const names = parseUniversalNames(NANOCLAW_UNIVERSAL_SECRETS);
   if (names.length === 0) return;
-  if (!ONECLI_API_KEY) return;
   try {
     const agents = await getAllAgents();
     for (const agent of agents) {
