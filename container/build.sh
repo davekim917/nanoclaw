@@ -32,17 +32,20 @@ if [ "${INSTALL_CJK_FONTS:-false}" = "true" ]; then
     BUILD_ARGS+=(--build-arg INSTALL_CJK_FONTS=true)
 fi
 
-# Stamp the repo's current commit SHA as an image label so the rebuild watcher
-# can compare it against origin/main. Needed because Docker's `Created`
-# timestamp doesn't advance on cache-hit rebuilds — a pure agent-runner/src
-# source change triggers a rebuild but produces an image with the old
-# timestamp, causing an infinite "stale → rebuild → still stale" loop.
+# Stamp the repo's current commit SHA into the image as a LABEL driven by
+# ARG. Lets the rebuild watcher compare the running image against origin/main
+# via `docker inspect ... Labels.nanoclaw.commit`. Must be ARG+LABEL (a real
+# Dockerfile layer) rather than a bare `docker build --label`, because when
+# all previous layers are cache-hits Docker skips applying `--label` to the
+# resulting image — trapping the watcher in an infinite rebuild loop on any
+# runtime-mounted source edit (container/agent-runner/src/**).
 NANOCLAW_COMMIT="$(cd "$PROJECT_ROOT" && git rev-parse HEAD 2>/dev/null || echo unknown)"
+BUILD_ARGS+=(--build-arg "NANOCLAW_COMMIT=${NANOCLAW_COMMIT}")
 
 echo "Building NanoClaw agent container image..."
 echo "Image: ${IMAGE_NAME}:${TAG} (commit ${NANOCLAW_COMMIT})"
 
-${CONTAINER_RUNTIME} build "${BUILD_ARGS[@]}" --label "nanoclaw.commit=${NANOCLAW_COMMIT}" -t "${IMAGE_NAME}:${TAG}" .
+${CONTAINER_RUNTIME} build "${BUILD_ARGS[@]}" -t "${IMAGE_NAME}:${TAG}" .
 
 echo ""
 echo "Build complete!"
