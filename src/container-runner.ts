@@ -1211,6 +1211,10 @@ async function buildContainerArgs(
   // [1m] extended-context suffix); extended context is opt-in per query.
   const defaultSonnetModel = process.env.ANTHROPIC_DEFAULT_SONNET_MODEL ?? 'claude-sonnet-4-6';
   args.push('-e', `ANTHROPIC_DEFAULT_SONNET_MODEL=${defaultSonnetModel}`);
+  // Haiku alias pin — parallel to opus/sonnet for symmetry so bare-alias
+  // haiku subagents resolve to a known id rather than the SDK's default.
+  const defaultHaikuModel = process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL ?? 'claude-haiku-4-5-20251001';
+  args.push('-e', `ANTHROPIC_DEFAULT_HAIKU_MODEL=${defaultHaikuModel}`);
 
   const defaultEffort =
     channelDefaults?.channelDefaultEffort ??

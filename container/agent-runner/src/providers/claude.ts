@@ -800,9 +800,19 @@ export class ClaudeProvider implements AgentProvider {
     }
 
     // Propagate model to subagents so teams/sub-queries don't silently downgrade.
+    // CLAUDE_CODE_SUBAGENT_MODEL handles `model: inherit` / missing frontmatter;
+    // the family env vars handle bare-alias frontmatter (`model: opus` etc.)
+    // which the SDK otherwise resolves via the container's spawn-time default.
     const perQueryEnv: Record<string, string | undefined> = { ...this.env };
     if (input.model) {
       perQueryEnv.CLAUDE_CODE_SUBAGENT_MODEL = input.model;
+      // Guard: a bare alias here would create an alias→alias loop in the SDK.
+      if (!/^(opus|sonnet|haiku|default)$/i.test(input.model)) {
+        const family = /^claude-(opus|sonnet|haiku)-/i.exec(input.model)?.[1]?.toLowerCase();
+        if (family === 'opus') perQueryEnv.ANTHROPIC_DEFAULT_OPUS_MODEL = input.model;
+        if (family === 'sonnet') perQueryEnv.ANTHROPIC_DEFAULT_SONNET_MODEL = input.model;
+        if (family === 'haiku') perQueryEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL = input.model;
+      }
     }
 
     const sdkResult = sdkQuery({

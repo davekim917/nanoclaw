@@ -51,6 +51,10 @@ const REQUIRED_ENV: Record<string, string> = {
   // Lock the `sonnet` alias to 4.6 (explicit id, no [1m] suffix — extended
   // context is opt-in per query). Same reason as opus pin above.
   ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-sonnet-4-6',
+  // Lock the `haiku` alias. Same rationale as opus/sonnet — short-circuits
+  // SDK alias-map lag so bare-alias subagents (`model: haiku`) resolve
+  // deterministically. Matches the id hardcoded in thread-search.ts.
+  ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-haiku-4-5-20251001',
   // Default reasoning effort. Per-message-overridable via `-e1 medium` and
   // session-sticky via `-e medium` flags.
   NANOCLAW_DEFAULT_EFFORT: 'high',
