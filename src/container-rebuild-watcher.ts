@@ -16,16 +16,18 @@ import { execFile } from 'child_process';
 import path from 'path';
 import { promisify } from 'util';
 
-import { REPO_ROOT } from './config.js';
+import { CONTAINER_IMAGE, REPO_ROOT } from './config.js';
 import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';
 import { log } from './log.js';
 
 const execFileAsync = promisify(execFile);
 
 const POLL_MS = 60_000;
-const IMAGE_NAME = 'nanoclaw-agent';
+// Tag is always `v2` in this codebase; the base (including install-slug) is
+// per-install — use the same full reference container-runner.ts spawns from,
+// otherwise we end up inspecting a stale legacy tag that never rebuilds.
 const IMAGE_TAG = 'v2';
-const IMAGE_REF = `${IMAGE_NAME}:${IMAGE_TAG}`;
+const IMAGE_REF = CONTAINER_IMAGE;
 
 type Notifier = (message: string) => Promise<void>;
 
