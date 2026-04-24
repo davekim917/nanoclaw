@@ -21,6 +21,13 @@ IMAGE_NAME="$(container_image_base)"
 TAG="${1:-latest}"
 CONTAINER_RUNTIME="${CONTAINER_RUNTIME:-docker}"
 
+# Full image ref. When the rebuild watcher invokes us it passes
+# CONTAINER_IMAGE_REF so the image we build matches the one container-runner
+# spawns from (src/config.ts::CONTAINER_IMAGE). Without that, build.sh would
+# derive its own `<base>:<tag>` and drift if CONTAINER_IMAGE is overridden.
+# Standalone CLI callers (no env var) fall back to derived $IMAGE_NAME:$TAG.
+IMAGE_REF="${CONTAINER_IMAGE_REF:-${IMAGE_NAME}:${TAG}}"
+
 # Caller's env takes precedence; fall back to .env.
 if [ -z "${INSTALL_CJK_FONTS:-}" ] && [ -f "../.env" ]; then
     INSTALL_CJK_FONTS="$(grep '^INSTALL_CJK_FONTS=' ../.env | tail -n1 | cut -d= -f2- | tr -d '"' | tr -d "'" | tr -d '[:space:]')"
@@ -43,13 +50,13 @@ NANOCLAW_COMMIT="$(cd "$PROJECT_ROOT" && git rev-parse HEAD 2>/dev/null || echo 
 BUILD_ARGS+=(--build-arg "NANOCLAW_COMMIT=${NANOCLAW_COMMIT}")
 
 echo "Building NanoClaw agent container image..."
-echo "Image: ${IMAGE_NAME}:${TAG} (commit ${NANOCLAW_COMMIT})"
+echo "Image: ${IMAGE_REF} (commit ${NANOCLAW_COMMIT})"
 
-${CONTAINER_RUNTIME} build "${BUILD_ARGS[@]}" -t "${IMAGE_NAME}:${TAG}" .
+${CONTAINER_RUNTIME} build "${BUILD_ARGS[@]}" -t "${IMAGE_REF}" .
 
 echo ""
 echo "Build complete!"
-echo "Image: ${IMAGE_NAME}:${TAG}"
+echo "Image: ${IMAGE_REF}"
 echo ""
 echo "Test with:"
-echo "  echo '{\"prompt\":\"What is 2+2?\",\"groupFolder\":\"test\",\"chatJid\":\"test@g.us\",\"isMain\":false}' | ${CONTAINER_RUNTIME} run -i ${IMAGE_NAME}:${TAG}"
+echo "  echo '{\"prompt\":\"What is 2+2?\",\"groupFolder\":\"test\",\"chatJid\":\"test@g.us\",\"isMain\":false}' | ${CONTAINER_RUNTIME} run -i ${IMAGE_REF}"

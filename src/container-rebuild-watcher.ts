@@ -1,13 +1,17 @@
 /**
  * Container rebuild watcher.
  *
- * Polls every minute and rebuilds `nanoclaw-agent:v2` whenever the running
- * image is older than any commit on origin/main that touches `container/`.
- * Posts a completion message to an optional Discord channel.
+ * Polls every minute and rebuilds CONTAINER_IMAGE (from src/config.ts)
+ * whenever the running image's commit label lags origin/main on files
+ * under `container/`. Posts a completion message to an optional Discord
+ * channel.
  *
- * State-driven (image timestamp + git diff), not GitHub-event-driven —
- * catches PR squash-merges, direct pushes, force-pushes, hand-edits, and
- * first runs where no image exists yet. No GitHub API dependency.
+ * Label-driven, not GitHub-event-driven — container/build.sh stamps the
+ * repo HEAD SHA into the image as `nanoclaw.commit`, and we compare that
+ * label against `git rev-parse origin/main`. Catches PR squash-merges,
+ * direct pushes, force-pushes, hand-edits, and first runs where no image
+ * exists yet. Timestamps were the old approach but Docker cache-hit
+ * rebuilds don't advance them — labels do.
  *
  * If origin/main has new commits but none touch `container/`, the watcher
  * leaves the working tree alone — the user pulls when they want.
@@ -110,9 +114,10 @@ async function runStep(
   args: string[],
   timeoutMs: number,
   maxErrChars: number,
+  env?: NodeJS.ProcessEnv,
 ): Promise<StepResult> {
   try {
-    await execFileAsync(bin, args, { cwd: REPO_ROOT, timeout: timeoutMs });
+    await execFileAsync(bin, args, { cwd: REPO_ROOT, timeout: timeoutMs, env: env ?? process.env });
     return { ok: true, detail: label };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -123,7 +128,14 @@ async function runStep(
 async function pullAndBuild(): Promise<StepResult> {
   const pull = await runStep('git pull', 'git', ['pull', '--ff-only', 'origin', 'main'], 60_000, 300);
   if (!pull.ok) return pull;
-  return runStep('image rebuild', 'bash', [path.join(REPO_ROOT, 'container', 'build.sh'), IMAGE_TAG], 900_000, 500);
+  // Pass the exact image reference container-runner.ts spawns from. build.sh
+  // honors CONTAINER_IMAGE_REF when set — without this, build.sh derives its
+  // own base via container_image_base() and can drift from what we inspect if
+  // CONTAINER_IMAGE is overridden (env var, custom install slug, etc.).
+  return runStep('image rebuild', 'bash', [path.join(REPO_ROOT, 'container', 'build.sh'), IMAGE_TAG], 900_000, 500, {
+    ...process.env,
+    CONTAINER_IMAGE_REF: IMAGE_REF,
+  });
 }
 
 async function tick(): Promise<void> {
