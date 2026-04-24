@@ -27,6 +27,7 @@ import * as p from '@clack/prompts';
 import k from 'kleur';
 
 import * as setupLog from '../logs.js';
+import { brightSelect } from '../lib/bright-select.js';
 import { confirmThenOpen } from '../lib/browser.js';
 import { askOperatorRole } from '../lib/role-prompt.js';
 import { ensureAnswer, fail, runQuietChild } from '../lib/runner.js';
@@ -46,15 +47,27 @@ interface AppInfo {
 }
 
 export async function runDiscordChannel(displayName: string): Promise<void> {
-  if (!(await askHasBotToken())) {
+  const hasBot = await askHasBotToken();
+  if (!hasBot) {
     await walkThroughBotCreation();
   }
+  // Even users who said "yes" often can't find the token on demand — the
+  // Dev Portal resets it if you don't store it, and people forget which
+  // app it belongs to. A quick reminder before the paste prompt is cheap.
+  showTokenLocationReminder(hasBot);
 
   const token = await collectDiscordToken();
   const botUsername = await validateDiscordToken(token);
   const app = await fetchApplicationInfo(token);
 
   const ownerUserId = await resolveOwnerUserId(app.owner);
+
+  // Before inviting: do they have a server to invite into? Walkthrough if
+  // not — a fresh Discord account without a server makes the invite page a
+  // dead end.
+  if (!(await askHasDiscordServer())) {
+    await walkThroughServerCreation();
+  }
 
   await promptInviteBot(app.applicationId, botUsername);
 
@@ -129,7 +142,7 @@ export async function runDiscordChannel(displayName: string): Promise<void> {
 
 async function askHasBotToken(): Promise<boolean> {
   const answer = ensureAnswer(
-    await p.select({
+    await brightSelect({
       message: 'Do you already have a Discord bot?',
       options: [
         { value: 'yes', label: 'Yes, I have a bot token ready' },
@@ -160,6 +173,66 @@ async function walkThroughBotCreation(): Promise<void> {
   ensureAnswer(
     await p.confirm({
       message: "Got your bot token?",
+      initialValue: true,
+    }),
+  );
+}
+
+function showTokenLocationReminder(hasExistingBot: boolean): void {
+  // If we just walked them through creating a bot, they're staring at the
+  // token. If they came in with an existing one, they may still need a nudge
+  // to find it — tokens in the Dev Portal aren't visible after first reveal,
+  // and "Reset Token" issues a new one.
+  if (hasExistingBot) {
+    p.note(
+      [
+        "Where to find your bot token:",
+        '',
+        '  1. discord.com/developers/applications → pick your app',
+        '  2. "Bot" tab → "Reset Token" (the old one stops working)',
+        '  3. Copy the new token',
+      ].join('\n'),
+      'Reminder',
+    );
+  }
+}
+
+async function askHasDiscordServer(): Promise<boolean> {
+  const answer = ensureAnswer(
+    await brightSelect({
+      message: 'Do you have a Discord server you can add the bot to?',
+      options: [
+        { value: 'yes', label: 'Yes, I have a server' },
+        { value: 'no', label: "No, walk me through creating one" },
+      ],
+    }),
+  );
+  setupLog.userInput('discord_has_server', String(answer));
+  return answer === 'yes';
+}
+
+async function walkThroughServerCreation(): Promise<void> {
+  // Discord doesn't have a stable deep-link for "create server" so we open
+  // the web client and rely on the + button being visible. The steps below
+  // are the same whether they're in the desktop app or the browser.
+  const url = 'https://discord.com/channels/@me';
+  p.note(
+    [
+      "A Discord server is just a private space for you and the bot. Free and takes 30 seconds.",
+      '',
+      '  1. In Discord, click the "+" at the bottom of the server list',
+      '  2. Choose "Create My Own" → "For me and my friends"',
+      '  3. Give it any name (e.g. "NanoClaw")',
+      '',
+      k.dim(url),
+    ].join('\n'),
+    'Create a Discord server',
+  );
+  await confirmThenOpen(url, 'Press Enter to open Discord');
+
+  ensureAnswer(
+    await p.confirm({
+      message: "Server created?",
       initialValue: true,
     }),
   );

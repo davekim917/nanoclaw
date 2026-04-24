@@ -245,6 +245,17 @@ fi
 # wipe it.
 export NANOCLAW_BOOTSTRAPPED=1
 
+# setup.sh may have just installed pnpm via npm into a prefix that's not on
+# our PATH (custom `npm config set prefix`, or the default prefix missing
+# from the shell's login PATH). Its PATH mutation doesn't propagate back
+# to us — so replay the same lookup here before the exec.
+if ! command -v pnpm >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
+  NPM_PREFIX="$(npm config get prefix 2>/dev/null)"
+  if [ -n "$NPM_PREFIX" ] && [ -x "$NPM_PREFIX/bin/pnpm" ]; then
+    export PATH="$NPM_PREFIX/bin:$PATH"
+  fi
+fi
+
 # --silent suppresses pnpm's `> nanoclaw@2.0.0 setup:auto / > tsx setup/auto.ts`
 # preamble so the flow continues visually from "Basics installed" straight
 # into setup:auto's spinner. exec so signals (Ctrl-C) propagate directly.

@@ -64,6 +64,10 @@ const STEP_FILES: Record<string, string[]> = {
   'telegram-validate': ['setup/channels/telegram.ts'],
   'pair-telegram': ['setup/pair-telegram.ts', 'setup/channels/telegram.ts'],
   'discord-install': ['setup/add-discord.sh', 'setup/channels/discord.ts'],
+  'slack-install': ['setup/add-slack.sh', 'setup/channels/slack.ts'],
+  'slack-validate': ['setup/channels/slack.ts'],
+  'imessage-install': ['setup/add-imessage.sh', 'setup/channels/imessage.ts'],
+  'imessage': ['setup/channels/imessage.ts'],
   'teams-install': ['setup/add-teams.sh', 'setup/channels/teams.ts'],
   'teams-manifest': ['setup/lib/teams-manifest.ts', 'setup/channels/teams.ts'],
   'init-first-agent': [
@@ -115,7 +119,7 @@ export async function offerClaudeAssist(
   const run = ensureAnswer(
     await p.confirm({
       message: 'Run this command? (you can edit it before executing)',
-      initialValue: false,
+      initialValue: true,
     }),
   );
   if (!run) return false;
@@ -279,18 +283,24 @@ async function queryClaudeUnderSpinner(
     // No hard timeout — debugging can take a long time, and the cost of
     // cutting Claude off mid-investigation is worse than letting the
     // spinner run. The user can Ctrl-C if they want to abort.
-    const child = spawn(
-      'claude',
-      [
-        '-p',
-        '--output-format',
-        'stream-json',
-        '--verbose',
-        '--permission-mode',
-        'bypassPermissions',
-      ],
-      { cwd: projectRoot, stdio: ['pipe', 'pipe', 'pipe'] },
-    );
+    //
+    // Resume the same session on repeat invocations so Claude carries
+    // context across failures in one setup run.
+    const claudeArgs = [
+      '-p',
+      '--output-format',
+      'stream-json',
+      '--verbose',
+      '--permission-mode',
+      'bypassPermissions',
+    ];
+    if (claudeSessionId) {
+      claudeArgs.push('--resume', claudeSessionId);
+    }
+    const child = spawn('claude', claudeArgs, {
+      cwd: projectRoot,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
 
     child.stdout.on('data', (c: Buffer) => {
       lineBuf += c.toString('utf-8');
@@ -301,6 +311,16 @@ async function queryClaudeUnderSpinner(
         if (!line.trim()) continue;
         try {
           const event = JSON.parse(line) as StreamEvent;
+          // Capture the session id on the very first claude invocation of
+          // this process so later calls can --resume it.
+          if (
+            !claudeSessionId &&
+            event.type === 'system' &&
+            event.subtype === 'init' &&
+            typeof event.session_id === 'string'
+          ) {
+            claudeSessionId = event.session_id;
+          }
           handleStreamEvent(event, {
             setAction: (a) => {
               actions.push(a);
@@ -335,10 +355,14 @@ async function queryClaudeUnderSpinner(
 }
 
 // Minimal shape of the stream-json events we care about. Claude emits
-// many more, but we only read tool_use blocks (for breadcrumbs) and text
-// blocks (to reassemble the final REASON/COMMAND answer).
+// many more, but we only read tool_use blocks (for breadcrumbs), text
+// blocks (to reassemble the final REASON/COMMAND answer), and the
+// session_id on the init event so follow-up invocations can resume the
+// same conversation.
 interface StreamEvent {
   type: string;
+  subtype?: string;
+  session_id?: string;
   message?: {
     content?: Array<
       | { type: 'text'; text: string }
@@ -346,6 +370,11 @@ interface StreamEvent {
     >;
   };
 }
+
+// The session id from the first claude-assist invocation in this process.
+// Subsequent invocations pass `--resume <id>` so Claude sees prior failures
+// as conversation history instead of treating each failure in isolation.
+let claudeSessionId: string | null = null;
 
 function handleStreamEvent(
   event: StreamEvent,

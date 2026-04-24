@@ -16,7 +16,13 @@ cd "$PROJECT_ROOT"
 
 # Keep in sync with .claude/skills/add-discord/SKILL.md.
 ADAPTER_VERSION="@chat-adapter/discord@4.26.0"
-CHANNELS_BRANCH="origin/channels"
+
+# Resolve which remote carries the channels branch — handles forks where
+# upstream lives on a different remote than `origin`.
+# shellcheck source=setup/lib/channels-remote.sh
+source "$PROJECT_ROOT/setup/lib/channels-remote.sh"
+CHANNELS_REMOTE=$(resolve_channels_remote)
+CHANNELS_BRANCH="${CHANNELS_REMOTE}/channels"
 
 emit_status() {
   local status=$1 error=${2:-}
@@ -54,8 +60,8 @@ ADAPTER_ALREADY_INSTALLED=true
 if need_install; then
   ADAPTER_ALREADY_INSTALLED=false
   log "Fetching channels branch…"
-  git fetch origin channels >&2 2>/dev/null || {
-    emit_status failed "git fetch origin channels failed"
+  git fetch "$CHANNELS_REMOTE" channels >&2 2>/dev/null || {
+    emit_status failed "git fetch ${CHANNELS_REMOTE} channels failed"
     exit 1
   }
 
@@ -104,13 +110,15 @@ mkdir -p data/env
 cp .env data/env/env
 
 log "Restarting service so the new adapter picks up the credentials…"
+# shellcheck source=setup/lib/install-slug.sh
+source "$PROJECT_ROOT/setup/lib/install-slug.sh"
 case "$(uname -s)" in
   Darwin)
-    launchctl kickstart -k "gui/$(id -u)/com.nanoclaw" >&2 2>/dev/null || true
+    launchctl kickstart -k "gui/$(id -u)/$(launchd_label)" >&2 2>/dev/null || true
     ;;
   Linux)
-    systemctl --user restart nanoclaw >&2 2>/dev/null \
-      || sudo systemctl restart nanoclaw >&2 2>/dev/null \
+    systemctl --user restart "$(systemd_unit)" >&2 2>/dev/null \
+      || sudo systemctl restart "$(systemd_unit)" >&2 2>/dev/null \
       || true
     ;;
 esac

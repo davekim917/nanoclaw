@@ -15,6 +15,7 @@ import { DATA_DIR } from '../src/config.js';
 import { readEnvFile } from '../src/env.js';
 import { log } from '../src/log.js';
 import { pingCliAgent } from './lib/agent-ping.js';
+import { getLaunchdLabel, getSystemdUnit } from '../src/install-slug.js';
 import {
   getPlatform,
   getServiceManager,
@@ -45,10 +46,13 @@ export async function run(_args: string[]): Promise<void> {
   let runningFromPath: string | null = null;
   const mgr = getServiceManager();
 
+  const launchdLabel = getLaunchdLabel(projectRoot);
+  const systemdUnit = getSystemdUnit(projectRoot);
+
   if (mgr === 'launchd') {
     try {
       const output = execSync('launchctl list', { encoding: 'utf-8' });
-      const line = output.split('\n').find((l) => l.includes('com.nanoclaw'));
+      const line = output.split('\n').find((l) => l.includes(launchdLabel));
       if (line) {
         const pidField = line.trim().split(/\s+/)[0];
         if (pidField !== '-' && pidField) {
@@ -67,11 +71,11 @@ export async function run(_args: string[]): Promise<void> {
   } else if (mgr === 'systemd') {
     const prefix = isRoot() ? 'systemctl' : 'systemctl --user';
     try {
-      execSync(`${prefix} is-active nanoclaw`, { stdio: 'ignore' });
+      execSync(`${prefix} is-active ${systemdUnit}`, { stdio: 'ignore' });
       service = 'running';
       try {
         const pidStr = execSync(
-          `${prefix} show nanoclaw -p MainPID --value`,
+          `${prefix} show ${systemdUnit} -p MainPID --value`,
           { encoding: 'utf-8' },
         ).trim();
         const pid = Number(pidStr);
@@ -86,7 +90,7 @@ export async function run(_args: string[]): Promise<void> {
         const output = execSync(`${prefix} list-unit-files`, {
           encoding: 'utf-8',
         });
-        if (output.includes('nanoclaw')) {
+        if (output.includes(systemdUnit)) {
           service = 'stopped';
         }
       } catch {

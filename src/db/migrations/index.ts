@@ -12,8 +12,12 @@ import { migration009 } from './009-drop-pending-credentials.js';
 import { migration010 } from './010-engage-modes.js';
 import { migration011 } from './011-pending-sender-approvals.js';
 import { migration012 } from './012-channel-registration.js';
-// Dave's migrations (renamed to 013/014 to avoid collisions):
+// Dave's migrations (custom) and upstream's 013 live side-by-side; both files
+// happen to be numbered 013 but carry distinct `name` fields (names are the
+// uniqueness key for schema_version). Import-alias upstream's to dodge the
+// JS identifier collision with `013-memories.js`.
 import { migration013 } from './013-memories.js';
+import { migration013 as approvalRenderMetadata } from './013-approval-render-metadata.js';
 import { migration014 } from './014-channel-defaults.js';
 import { migration015 } from './015-backlog.js';
 import { migration016 } from './016-channel-tone.js';
@@ -38,6 +42,7 @@ const migrations: Migration[] = [
   migration011,
   migration012,
   migration013,
+  approvalRenderMetadata,
   migration014,
   migration015,
   migration016,

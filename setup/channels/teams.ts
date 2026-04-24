@@ -30,6 +30,7 @@ import path from 'path';
 import * as p from '@clack/prompts';
 import k from 'kleur';
 
+import { brightSelect } from '../lib/bright-select.js';
 import { confirmThenOpen } from '../lib/browser.js';
 import {
   isHelpEscape,
@@ -223,7 +224,7 @@ async function askAppType(args: {
 }): Promise<'SingleTenant' | 'MultiTenant'> {
   while (true) {
     const choice = ensureAnswer(
-      await p.select({
+      await brightSelect({
         message: 'Which account type did you pick?',
         options: [
           {
@@ -515,7 +516,7 @@ async function finishWithHandoff(
   );
 
   const choice = ensureAnswer(
-    await p.select({
+    await brightSelect({
       message: 'Ready to finish?',
       options: [
         {
@@ -571,7 +572,7 @@ async function stepGate(args: {
 }): Promise<void> {
   while (true) {
     const choice = ensureAnswer(
-      await p.select({
+      await brightSelect({
         message: 'How did that go?',
         options: [
           { value: 'done', label: "Done — let's continue" },

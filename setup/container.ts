@@ -7,6 +7,7 @@ import path from 'path';
 import { setTimeout as sleep } from 'timers/promises';
 
 import { log } from '../src/log.js';
+import { getDefaultContainerImage } from '../src/install-slug.js';
 import { commandExists, getPlatform } from './platform.js';
 import { emitStatus } from './status.js';
 
@@ -81,7 +82,7 @@ function parseArgs(args: string[]): { runtime: string } {
 export async function run(args: string[]): Promise<void> {
   const projectRoot = process.cwd();
   const { runtime } = parseArgs(args);
-  const image = 'nanoclaw-agent:latest';
+  const image = getDefaultContainerImage(projectRoot);
   const logFile = path.join(projectRoot, 'logs', 'setup.log');
 
   if (runtime !== 'docker') {
@@ -174,19 +175,31 @@ export async function run(args: string[]): Promise<void> {
     // .env is optional; absence is normal on a fresh checkout
   }
 
-  // Build
+  // Build — stdio inherit so the parent setup runner can tail docker's
+  // per-step output and render it in a rolling window. Previously we used
+  // execSync which buffered everything; users couldn't tell whether a
+  // 3–10 minute build was making progress or hung.
   let buildOk = false;
   log.info('Building container', { runtime, buildArgs });
-  try {
-    const argsStr = buildArgs.length > 0 ? ' ' + buildArgs.join(' ') : '';
-    execSync(`${buildCmd}${argsStr} -t ${image} .`, {
+  const buildRes = spawnSync(
+    buildCmd.split(' ')[0],
+    [
+      ...buildCmd.split(' ').slice(1),
+      ...buildArgs.flatMap((a) => a.split(' ')),
+      '-t',
+      image,
+      '.',
+    ],
+    {
       cwd: path.join(projectRoot, 'container'),
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
+      stdio: 'inherit',
+    },
+  );
+  if (buildRes.status === 0) {
     buildOk = true;
     log.info('Container build succeeded');
-  } catch (err) {
-    log.error('Container build failed', { err });
+  } else {
+    log.error('Container build failed', { exitCode: buildRes.status });
   }
 
   // Test

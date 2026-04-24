@@ -63,6 +63,8 @@ export interface InboundEvent {
      * See InboundMessage.isMention for the full explanation.
      */
     isMention?: boolean;
+    /** True when the source is a group/channel thread, false for DMs. */
+    isGroup?: boolean;
   };
   replyTo?: DeliveryAddress;
 }
@@ -97,6 +99,8 @@ export interface InboundMessage {
    * defaults to is_group=0 for backwards compatibility.
    */
   isDM?: boolean;
+  /** Inverse of isDM. Kept alongside for upstream code paths that key off isGroup. */
+  isGroup?: boolean;
 }
 
 /** A file attachment to deliver alongside a message. */

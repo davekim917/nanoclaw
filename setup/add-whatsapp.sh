@@ -20,7 +20,13 @@ BAILEYS_VERSION="@whiskeysockets/baileys@6.17.16"
 QRCODE_VERSION="qrcode@1.5.4"
 QRCODE_TYPES_VERSION="@types/qrcode@1.5.6"
 PINO_VERSION="pino@9.6.0"
-CHANNELS_BRANCH="origin/channels"
+
+# Resolve which remote carries the channels branch — handles forks where
+# upstream lives on a different remote than `origin`.
+# shellcheck source=setup/lib/channels-remote.sh
+source "$PROJECT_ROOT/setup/lib/channels-remote.sh"
+CHANNELS_REMOTE=$(resolve_channels_remote)
+CHANNELS_BRANCH="${CHANNELS_REMOTE}/channels"
 
 emit_status() {
   local status=$1 error=${2:-}
@@ -47,8 +53,8 @@ ADAPTER_ALREADY_INSTALLED=true
 if need_install; then
   ADAPTER_ALREADY_INSTALLED=false
   log "Fetching channels branch…"
-  git fetch origin channels >&2 2>/dev/null || {
-    emit_status failed "git fetch origin channels failed"
+  git fetch "$CHANNELS_REMOTE" channels >&2 2>/dev/null || {
+    emit_status failed "git fetch ${CHANNELS_REMOTE} channels failed"
     exit 1
   }
 

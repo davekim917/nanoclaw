@@ -27,11 +27,17 @@ import * as p from '@clack/prompts';
 import k from 'kleur';
 
 import { runDiscordChannel } from './channels/discord.js';
+import { runIMessageChannel } from './channels/imessage.js';
+import { runSignalChannel } from './channels/signal.js';
+import { runSlackChannel } from './channels/slack.js';
 import { runTeamsChannel } from './channels/teams.js';
 import { runTelegramChannel } from './channels/telegram.js';
 import { runWhatsAppChannel } from './channels/whatsapp.js';
 import { pingCliAgent, type PingResult } from './lib/agent-ping.js';
+import { brightSelect } from './lib/bright-select.js';
 import { offerClaudeAssist } from './lib/claude-assist.js';
+import { runWindowedStep } from './lib/windowed-runner.js';
+import { getLaunchdLabel, getSystemdUnit } from '../src/install-slug.js';
 import {
   claudeCliAvailable,
   resolveTimezoneViaClaude,
@@ -44,6 +50,16 @@ import { isValidTimezone } from '../src/timezone.js';
 
 const CLI_AGENT_NAME = 'Terminal Agent';
 const RUN_START = Date.now();
+
+type ChannelChoice =
+  | 'telegram'
+  | 'discord'
+  | 'whatsapp'
+  | 'signal'
+  | 'teams'
+  | 'slack'
+  | 'imessage'
+  | 'skip';
 
 async function main(): Promise<void> {
   printIntro();
@@ -78,7 +94,13 @@ async function main(): Promise<void> {
         4,
       ),
     );
-    const res = await runQuietStep('container', {
+    p.log.message(
+      dimWrap(
+        'The first build pulls a base image and installs a few tools. On a fresh machine this usually takes 3–10 minutes.',
+        4,
+      ),
+    );
+    const res = await runWindowedStep('container', {
       running: "Preparing your assistant's sandbox…",
       done: 'Sandbox ready.',
       failed: "Couldn't prepare the sandbox.",
@@ -115,10 +137,44 @@ async function main(): Promise<void> {
         4,
       ),
     );
-    const res = await runQuietStep('onecli', {
-      running: "Setting up OneCLI, your agent's vault…",
-      done: 'OneCLI vault ready.',
-    });
+
+    // Respect an existing OneCLI install. Re-running the installer would
+    // rebind the listener and knock any other app using that gateway
+    // offline — confirm with the user before doing that.
+    const existing = detectExistingOnecli();
+    let reuse = false;
+    if (existing) {
+      const choice = ensureAnswer(
+        await brightSelect({
+          message: `Found an existing OneCLI at ${existing.apiHost}. What would you like to do?`,
+          options: [
+            {
+              value: 'reuse',
+              label: 'Use the existing instance',
+              hint: 'recommended — keeps other apps bound to this vault working',
+            },
+            {
+              value: 'fresh',
+              label: 'Install a fresh instance for NanoClaw',
+              hint: 'reinstalls onecli; other apps may need to reconnect',
+            },
+          ],
+        }),
+      ) as 'reuse' | 'fresh';
+      setupLog.userInput('onecli_choice', choice);
+      reuse = choice === 'reuse';
+    }
+
+    const res = await runQuietStep(
+      'onecli',
+      {
+        running: reuse
+          ? 'Hooking up to your existing OneCLI…'
+          : "Setting up OneCLI, your agent's vault…",
+        done: 'OneCLI vault ready.',
+      },
+      reuse ? ['--reuse'] : [],
+    );
     if (!res.ok) {
       const err = res.terminal?.fields.ERROR;
       if (err === 'onecli_not_on_path_after_install') {
@@ -172,10 +228,8 @@ async function main(): Promise<void> {
         "NanoClaw's permissions need a tweak before it can reach Docker.",
       );
       p.log.message(
-        k.dim(
-          '  sudo setfacl -m u:$(whoami):rw /var/run/docker.sock\n' +
-            '  systemctl --user restart nanoclaw',
-        ),
+        '  sudo setfacl -m u:$(whoami):rw /var/run/docker.sock\n' +
+          `  systemctl --user restart ${getSystemdUnit()}`,
       );
     }
   }
@@ -205,10 +259,33 @@ async function main(): Promise<void> {
       );
     }
     if (!skip.has('first-chat')) {
+      p.log.message(
+        dimWrap(
+          "Your assistant runs in an isolated sandbox. I'm going to send it a quick test message (ping) and wait for a reply (pong) to confirm it's responding. First startup typically takes 30–60 seconds while the sandbox warms up.",
+          4,
+        ),
+      );
       const ping = await confirmAssistantResponds();
       if (ping === 'ok') {
         phEmit('first_chat_ready');
-        await runFirstChat();
+        const next = ensureAnswer(
+          await p.select({
+            message: 'What next?',
+            options: [
+              {
+                value: 'continue',
+                label: 'Continue with setup',
+                hint: 'recommended',
+              },
+              {
+                value: 'chat',
+                label: 'Pause here and chat with your agent from the terminal',
+              },
+            ],
+          }),
+        ) as 'continue' | 'chat';
+        setupLog.userInput('first_chat_choice', next);
+        if (next === 'chat') await runFirstChat();
       } else {
         phEmit('first_chat_failed', { reason: ping });
         renderPingFailureNote(ping);
@@ -231,20 +308,27 @@ async function main(): Promise<void> {
     await runTimezoneStep();
   }
 
+  let channelChoice: ChannelChoice = 'skip';
   if (!skip.has('channel')) {
-    const choice = await askChannelChoice();
-    if (choice === 'telegram') {
+    channelChoice = await askChannelChoice();
+    if (channelChoice === 'telegram') {
       await runTelegramChannel(displayName!);
-    } else if (choice === 'discord') {
+    } else if (channelChoice === 'discord') {
       await runDiscordChannel(displayName!);
-    } else if (choice === 'whatsapp') {
+    } else if (channelChoice === 'whatsapp') {
       await runWhatsAppChannel(displayName!);
-    } else if (choice === 'teams') {
+    } else if (channelChoice === 'signal') {
+      await runSignalChannel(displayName!);
+    } else if (channelChoice === 'teams') {
       await runTeamsChannel(displayName!);
+    } else if (channelChoice === 'slack') {
+      await runSlackChannel(displayName!);
+    } else if (channelChoice === 'imessage') {
+      await runIMessageChannel(displayName!);
     } else {
       p.log.info(
         wrapForGutter(
-          'No messaging app for now. You can add one later (like Telegram, Discord, WhatsApp, Teams, or Slack).',
+          'No messaging app for now. You can add one later (like Telegram, Discord, WhatsApp, Teams, Slack, or iMessage).',
           4,
         ),
       );
@@ -264,13 +348,14 @@ async function main(): Promise<void> {
       }
       const service = res.terminal?.fields.SERVICE;
       if (service === 'running_other_checkout') {
+        const label = getLaunchdLabel();
         notes.push(
           wrapForGutter(
             [
               '• Your NanoClaw service is running from a different folder on this machine.',
               '  Point it at this checkout with:',
-              '    launchctl bootout gui/$(id -u)/com.nanoclaw',
-              '    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.nanoclaw.plist',
+              `    launchctl bootout gui/$(id -u)/${label}`,
+              `    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/${label}.plist`,
             ].join('\n'),
             6,
           ),
@@ -323,9 +408,58 @@ async function main(): Promise<void> {
     .map(([l, c]) => `${k.cyan(l.padEnd(labelWidth))}  ${c}`)
     .join('\n');
   p.note(nextSteps, 'Try these');
+
+  // Always-on warning goes before the "check your DMs" directive so the
+  // caveat doesn't land after the user's already looked away at their phone.
+  p.note(
+    wrapForGutter(
+      "NanoClaw runs on this machine. It's only reachable while this computer is on and connected to the internet. For always-on availability, run it on a cloud VM — or keep this machine awake.",
+      6,
+    ),
+    'Heads up',
+  );
+
   setupLog.complete(Date.now() - RUN_START);
   phEmit('setup_completed', { duration_ms: Date.now() - RUN_START });
-  p.outro(k.green("You're ready! Enjoy NanoClaw."));
+
+  const dmTarget = channelDmLabel(channelChoice);
+  if (dmTarget) {
+    // Bright framed banner (not dim) — the whole point of the feedback was
+    // that the welcome-message signal was too easy to miss. Use p.note so it
+    // renders with a visible box, cyan-bold the directive line, and put it
+    // as the last thing before outro.
+    p.note(
+      `${brandBold('→')} ${k.bold(`Check your ${dmTarget} — your assistant is saying hi.`)}`,
+      'Go say hi',
+    );
+    p.outro(k.green("You're set."));
+  } else {
+    p.outro(k.green("You're ready! Chat with `pnpm run chat hi`."));
+  }
+}
+
+function channelDmLabel(choice: ChannelChoice): string | null {
+  switch (choice) {
+    case 'telegram':
+      return 'Telegram';
+    case 'discord':
+      return 'Discord DMs';
+    case 'whatsapp':
+      return 'WhatsApp';
+    case 'signal':
+      return 'Signal';
+    case 'teams':
+      return 'Teams';
+    case 'imessage':
+      return 'iMessage';
+    case 'slack':
+      // Slack install doesn't wire an agent or send a welcome DM — the
+      // driver prints its own "finish in your Slack app" note. Falling
+      // through to null avoids a misleading "check your Slack DMs" banner.
+      return null;
+    default:
+      return null;
+  }
 }
 
 // ─── first-chat step ───────────────────────────────────────────────────
@@ -354,13 +488,13 @@ async function confirmAssistantResponds(): Promise<PingResult> {
   const elapsed = Math.round((Date.now() - start) / 1000);
   const suffix = ` (${elapsed}s)`;
   if (result === 'ok') {
-    s.stop(`${fitToWidth('Your assistant is ready.', suffix)}${k.dim(suffix)}`);
+    s.stop(`${k.bold(fitToWidth('Your assistant is ready.', suffix))}${k.dim(suffix)}`);
   } else {
     const msg =
       result === 'socket_error'
         ? "Couldn't reach the NanoClaw service."
         : "Your assistant didn't reply in time.";
-    s.stop(`${fitToWidth(msg, suffix)}${k.dim(suffix)}`, 1);
+    s.stop(`${k.bold(fitToWidth(msg, suffix))}${k.dim(suffix)}`, 1);
   }
   return result;
 }
@@ -374,8 +508,8 @@ function renderPingFailureNote(result: PingResult): void {
             6,
           ),
           '',
-          k.dim('  macOS:  launchctl kickstart -k gui/$(id -u)/com.nanoclaw'),
-          k.dim('  Linux:  systemctl --user restart nanoclaw'),
+          `  macOS:  launchctl kickstart -k gui/$(id -u)/${getLaunchdLabel()}`,
+          `  Linux:  systemctl --user restart ${getSystemdUnit()}`,
         ].join('\n')
       : wrapForGutter(
           'No reply from your assistant within 30 seconds. Check `logs/nanoclaw.log` for clues, then try `pnpm run chat hi`.',
@@ -388,15 +522,39 @@ function renderPingFailureNote(result: PingResult): void {
  * Chat loop. Each message is piped through `pnpm run chat`, which uses
  * the same Unix-socket path the ping just exercised, so output streams
  * back inline as the agent replies. An empty input ends the loop.
+ *
+ * The intro note teaches the sandbox mental model — users reported being
+ * confused about what the terminal chat *is* (vs the phone channel they'd
+ * set up next) and what happens to the agent when they walk away. We
+ * explain once, then offer "message or Enter to continue" so the chat is
+ * clearly optional.
  */
 async function runFirstChat(): Promise<void> {
+  p.note(
+    wrapForGutter(
+      [
+        'Your assistant runs in a sandbox on this machine.',
+        'It wakes up when you send a message and goes back to sleep when',
+        "you're not talking — so it isn't burning resources in the background.",
+        'Its memory and environment persist between conversations.',
+      ].join(' '),
+      6,
+    ),
+    'How this works',
+  );
+  let first = true;
   while (true) {
     const answer = ensureAnswer(
       await p.text({
-        message: 'Say something to your assistant',
-        placeholder: 'press Enter with nothing to continue',
+        message: first
+          ? 'Try a quick hello — or press Enter to continue setup'
+          : 'Another message? Press Enter to continue setup',
+        placeholder: first
+          ? 'e.g. "hi, what can you do?"'
+          : 'press Enter to continue',
       }),
     );
+    first = false;
     const text = ((answer as string | undefined) ?? '').trim();
     if (!text) return;
     await sendChatMessage(text);
@@ -429,7 +587,7 @@ async function runAuthStep(): Promise<void> {
   }
 
   const method = ensureAnswer(
-    await p.select({
+    await brightSelect({
       message: 'How would you like to connect to Claude?',
       options: [
         {
@@ -557,31 +715,49 @@ async function runTimezoneStep(): Promise<void> {
     resolvedTz === 'Etc/UTC' ||
     resolvedTz === 'Universal';
 
+  // Three branches:
+  //   - no TZ detected: ask where they are (or leave as UTC)
+  //   - detected UTC: confirm (likely VPS, but worth checking)
+  //   - detected specific zone: confirm explicitly rather than silently
+  //     persisting — users shouldn't be surprised the agent "already knew"
+  //     their timezone from system settings they didn't think about.
   if (!needsInput && !isUtc && resolvedTz && resolvedTz !== 'none') {
-    return;
+    const confirmed = ensureAnswer(
+      await p.confirm({
+        message: `I detected ${resolvedTz} from your computer settings. Is that right?`,
+        initialValue: true,
+      }),
+    );
+    setupLog.userInput('timezone_confirm_detected', String(confirmed));
+    if (confirmed) return;
   }
 
-  // Either autodetect failed outright, or it landed on UTC and we should
-  // check that's really what the user wants before leaving it there.
   const message = needsInput
     ? "Your system didn't expose a timezone. Which one are you in?"
-    : "Your system reports UTC as the timezone. Is that right, or are you somewhere else?";
+    : !isUtc
+      ? "Where are you, then?"
+      : "Your system reports UTC as the timezone. Is that right, or are you somewhere else?";
 
-  const choice = ensureAnswer(
-    await p.select({
-      message,
-      options: needsInput
-        ? [
-            { value: 'answer', label: "I'll tell you where I am" },
-            { value: 'keep', label: 'Leave it as UTC' },
-          ]
-        : [
-            { value: 'keep', label: 'Keep UTC', hint: 'remote server / happy with UTC' },
-            { value: 'answer', label: "I'm somewhere else" },
-          ],
-    }),
-  ) as 'keep' | 'answer';
-  setupLog.userInput('timezone_choice', choice);
+  // For the non-UTC "detected-but-wrong" branch we skip the select and jump
+  // straight to the free-text prompt — the user already said "not that".
+  let choice: 'keep' | 'answer' = 'answer';
+  if (needsInput || isUtc) {
+    choice = ensureAnswer(
+      await brightSelect({
+        message,
+        options: needsInput
+          ? [
+              { value: 'answer', label: "I'll tell you where I am" },
+              { value: 'keep', label: 'Leave it as UTC' },
+            ]
+          : [
+              { value: 'keep', label: 'Keep UTC', hint: 'remote server / happy with UTC' },
+              { value: 'answer', label: "I'm somewhere else" },
+            ],
+      }),
+    ) as 'keep' | 'answer';
+    setupLog.userInput('timezone_choice', choice);
+  }
 
   if (choice === 'keep') return;
 
@@ -656,16 +832,30 @@ async function askDisplayName(fallback: string): Promise<string> {
   return value;
 }
 
-async function askChannelChoice(): Promise<
-  'telegram' | 'discord' | 'whatsapp' | 'teams' | 'skip'
-> {
+async function askChannelChoice(): Promise<ChannelChoice> {
+  const isMac = process.platform === 'darwin';
   const choice = ensureAnswer(
-    await p.select({
+    await brightSelect<ChannelChoice>({
       message: 'Want to chat with your assistant from your phone?',
       options: [
         { value: 'telegram', label: 'Yes, connect Telegram', hint: 'recommended' },
         { value: 'discord', label: 'Yes, connect Discord' },
         { value: 'whatsapp', label: 'Yes, connect WhatsApp' },
+        {
+          value: 'signal',
+          label: 'Yes, connect Signal',
+          hint: 'needs signal-cli installed',
+        },
+        {
+          value: 'imessage',
+          label: 'Yes, connect iMessage (experimental)',
+          hint: isMac ? 'local macOS mode' : 'remote Photon only',
+        },
+        {
+          value: 'slack',
+          label: 'Yes, connect Slack (experimental)',
+          hint: 'needs public URL',
+        },
         { value: 'teams', label: 'Yes, connect Microsoft Teams', hint: 'complex setup' },
         { value: 'skip', label: 'Skip for now', hint: "I'll just use the terminal" },
       ],
@@ -673,7 +863,7 @@ async function askChannelChoice(): Promise<
   );
   setupLog.userInput('channel_choice', String(choice));
   phEmit('channel_chosen', { channel: String(choice) });
-  return choice as 'telegram' | 'discord' | 'whatsapp' | 'teams' | 'skip';
+  return choice;
 }
 
 // ─── interactive / env helpers ─────────────────────────────────────────
@@ -688,6 +878,46 @@ function anthropicSecretExists(): boolean {
     return /anthropic/i.test(res.stdout ?? '');
   } catch {
     return false;
+  }
+}
+
+/**
+ * Probe the host for a working OneCLI install so we can offer to reuse it
+ * instead of re-running the installer (which rebinds the listener and breaks
+ * any other app already using that gateway).
+ */
+function detectExistingOnecli(): { version: string; apiHost: string } | null {
+  try {
+    const ver = spawnSync('onecli', ['version'], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    if (ver.status !== 0) return null;
+    const version = (ver.stdout ?? '').trim();
+    if (!version) return null;
+
+    const host = spawnSync('onecli', ['config', 'get', 'api-host'], {
+      encoding: 'utf-8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    if (host.status !== 0) return null;
+    const raw = (host.stdout ?? '').trim();
+    if (!raw) return null;
+
+    // onecli 1.3+ emits JSON by default. Older versions would print raw text.
+    try {
+      const parsed = JSON.parse(raw) as { data?: unknown; value?: unknown };
+      const val = parsed.data ?? parsed.value;
+      if (typeof val === 'string' && val.trim()) {
+        return { version, apiHost: val.trim() };
+      }
+    } catch {
+      // not JSON — try to extract a URL directly
+    }
+    const m = raw.match(/https?:\/\/[\w.\-]+(?::\d+)?/);
+    return m ? { version, apiHost: m[0] } : null;
+  } catch {
+    return null;
   }
 }
 

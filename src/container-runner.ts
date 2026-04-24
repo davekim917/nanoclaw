@@ -13,6 +13,8 @@ import { OneCLI } from '@onecli-sh/sdk';
 import { getHostCapabilities } from './capabilities.js';
 import {
   CONTAINER_IMAGE,
+  CONTAINER_IMAGE_BASE,
+  CONTAINER_INSTALL_LABEL,
   DATA_DIR,
   GROUPS_DIR,
   IDLE_TIMEOUT,
@@ -42,7 +44,13 @@ import {
   type VolumeMount,
 } from './providers/provider-container-registry.js';
 import { getSessionClaudeMounts } from './session-claude-mounts.js';
-import { markContainerRunning, markContainerStopped, sessionDir, writeSessionRouting } from './session-manager.js';
+import {
+  heartbeatPath,
+  markContainerRunning,
+  markContainerStopped,
+  sessionDir,
+  writeSessionRouting,
+} from './session-manager.js';
 import type { AgentGroup, Session } from './types.js';
 
 const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
@@ -163,6 +171,12 @@ async function spawnContainer(session: Session): Promise<void> {
   );
 
   log.info('Spawning container', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
+
+  // Clear any orphan heartbeat from a previous container instance — the
+  // sweep's ceiling check treats a missing file as "fresh spawn, give grace"
+  // (host-sweep.ts line 87). Without this, the stale mtime can trigger an
+  // immediate kill before the new container touches the file itself.
+  fs.rmSync(heartbeatPath(agentGroup.id, session.id), { force: true });
 
   const container = spawn(CONTAINER_RUNTIME_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
@@ -389,12 +403,31 @@ const SCOPED_CREDENTIAL_VARS = [
   'BROWSER_AUTH_PASSWORD',
 ];
 
+/**
+ * Resolve the provider name for a session using the precedence documented in
+ * the provider-install skills:
+ *
+ *   sessions.agent_provider
+ *     → agent_groups.agent_provider
+ *     → container.json `provider`
+ *     → 'claude'
+ *
+ * Pure so the precedence can be unit-tested without a DB or filesystem.
+ */
+export function resolveProviderName(
+  sessionProvider: string | null | undefined,
+  agentGroupProvider: string | null | undefined,
+  containerConfigProvider: string | null | undefined,
+): string {
+  return (sessionProvider || agentGroupProvider || containerConfigProvider || 'claude').toLowerCase();
+}
+
 function resolveProviderContribution(
   session: Session,
   agentGroup: AgentGroup,
   containerConfig: import('./container-config.js').ContainerConfig,
 ): { provider: string; contribution: ProviderContainerContribution } {
-  const provider = (containerConfig.provider || 'claude').toLowerCase();
+  const provider = resolveProviderName(session.agent_provider, agentGroup.agent_provider, containerConfig.provider);
   const fn = getProviderContainerConfig(provider);
   const contribution = fn
     ? fn({
@@ -1118,7 +1151,7 @@ async function buildContainerArgs(
     channelDefaultTone: string | null;
   },
 ): Promise<string[]> {
-  const args: string[] = ['run', '--rm', '--name', containerName];
+  const args: string[] = ['run', '--rm', '--name', containerName, '--label', CONTAINER_INSTALL_LABEL];
 
   // Environment — only vars read by code we don't own.
   // Everything NanoClaw-specific is in container.json (read by runner at startup).
@@ -1465,7 +1498,7 @@ export async function buildAgentGroupImage(agentGroupId: string): Promise<void> 
   }
   dockerfile += 'USER node\n';
 
-  const imageTag = `nanoclaw-agent:${agentGroupId}`;
+  const imageTag = `${CONTAINER_IMAGE_BASE}:${agentGroupId}`;
 
   log.info('Building per-agent-group image', { agentGroupId, imageTag, apt: aptPackages, npm: npmPackages });
 

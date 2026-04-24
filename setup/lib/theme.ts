@@ -58,17 +58,14 @@ export function wrapForGutter(text: string, gutter: number): string {
 }
 
 /**
- * Wrap + dim together. Needed instead of `k.dim(wrapForGutter(...))`
- * because clack resets styling at each line break when rendering
- * multi-line log content — a single outer dim envelope only colors the
- * first line. Applying dim per-line gives each wrapped row its own
- * `\x1b[2m…\x1b[0m` envelope so the whole block reads as one block.
+ * Wrap multi-line explanatory prose to the clack gutter. Previously
+ * dimmed its output (hence the name) — that made body copy hard to read
+ * against dark terminals. Dim is now reserved for preview/debug blocks
+ * (failure transcript tails, claude-assist streams); prose renders at
+ * the terminal's regular weight.
  */
 export function dimWrap(text: string, gutter: number): string {
-  return wrapForGutter(text, gutter)
-    .split('\n')
-    .map((line) => k.dim(line))
-    .join('\n');
+  return wrapForGutter(text, gutter);
 }
 
 const ANSI_RE = /\x1b\[[0-9;]*m/g;

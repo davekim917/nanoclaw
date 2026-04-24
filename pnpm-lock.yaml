@@ -14,6 +14,9 @@ importers:
       '@chat-adapter/slack':
         specifier: 4.26.0
         version: 4.26.0
+      '@clack/core':
+        specifier: ^1.2.0
+        version: 1.2.0
       '@clack/prompts':
         specifier: ^1.2.0
         version: 1.2.0

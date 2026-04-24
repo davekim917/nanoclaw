@@ -167,4 +167,4 @@ Otherwise, restart the service to pick up the new channel and wiring.
 - **supports-threads**: no (WeChat has no reply threads)
 - **typical-use**: Long-poll — the adapter holds a persistent connection to Tencent's iLink API and receives messages in real time. No webhook URL needed.
 - **default-isolation**: `shared` session mode per messaging group (DM or room). Use `strict` sender policy if you want only specific users to reach the agent; `public` opens it to anyone who messages the bot.
-- **post-install-wiring**: Use the `wire-dm.ts` helper (see the "Wire your first DM" section above) if running this skill standalone. If running inside `/new-setup`, `init-first-agent.ts` handles wiring — just pass the `platform-id` and `admin-user-id` captured above.
+- **post-install-wiring**: Use the `wire-dm.ts` helper (see the "Wire your first DM" section above) if running this skill standalone. If running as part of `bash nanoclaw.sh`, `init-first-agent.ts` handles wiring — just pass the `platform-id` and `admin-user-id` captured above.
