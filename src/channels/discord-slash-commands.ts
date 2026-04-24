@@ -325,6 +325,28 @@ async function handleUpdateContainer(interaction: ChatInputCommandInteraction): 
     await interaction.followUp({ content: 'Could not resolve channel id for injection.' });
     return;
   }
+  const guildId = interaction.guildId;
+  if (!guildId) {
+    await interaction.followUp({ content: '/update-container must be run in a guild channel, not a DM.' });
+    return;
+  }
+  // Discord chat-sdk adapter format: bare snowflakes fail downstream with
+  // "Invalid Discord thread ID".
+  const encodeId = (...parts: string[]): string => ['discord', guildId, parentChannelId, ...parts].join(':');
+  const platformId = encodeId();
+
+  // In-thread mention-sticky engages without @mention, so the user can just
+  // reply "yes" inside the audit thread.
+  const AUTO_ARCHIVE_24H = 1440;
+  let threadId: string | null = null;
+  try {
+    const thread = await reply.startThread({ name: 'Container update', autoArchiveDuration: AUTO_ARCHIVE_24H });
+    threadId = encodeId(thread.id);
+  } catch (err) {
+    log.warn('Failed to open audit thread, falling back to channel root', {
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
 
   const syntheticId = `slash-update-container-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const content = {
@@ -333,16 +355,13 @@ async function handleUpdateContainer(interaction: ChatInputCommandInteraction): 
     senderId: interaction.user.id,
     senderName: interaction.user.username,
     isMention: true,
-    // Anchor the agent's reply thread to the slash-command's own reply
-    // message so the audit lands in a visible place.
-    anchorMessageId: reply.id,
   };
 
   try {
     await routeInbound({
       channelType: 'discord',
-      platformId: parentChannelId,
-      threadId: null,
+      platformId,
+      threadId,
       message: {
         id: syntheticId,
         kind: 'chat-sdk',
