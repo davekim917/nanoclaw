@@ -44,8 +44,13 @@ describe('parseMessageFlags', () => {
     });
 
     it('accepts full concrete model ids', () => {
+      const r = parseMessageFlags('-m claude-sonnet-4-6 hi');
+      expect(r.intent).toEqual({ stickyModel: 'claude-sonnet-4-6' });
+    });
+
+    it('auto-appends [1m] to bare opus ids (1M-context only in this fork)', () => {
       const r = parseMessageFlags('-m claude-opus-4-7 hi');
-      expect(r.intent).toEqual({ stickyModel: 'claude-opus-4-7' });
+      expect(r.intent).toEqual({ stickyModel: 'claude-opus-4-7[1m]' });
     });
 
     it('leaves bare alias unresolved (SDK handles current-default lookup)', () => {

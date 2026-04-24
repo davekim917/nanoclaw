@@ -29,8 +29,8 @@ const VALID_EFFORT: ReadonlySet<string> = new Set<EffortLevel>(['low', 'medium',
 const MODEL_ALIAS_MAP: Record<string, string> = {
   opus46: 'claude-opus-4-6[1m]',
   'opus4-6': 'claude-opus-4-6[1m]',
-  opus47: 'claude-opus-4-7',
-  'opus4-7': 'claude-opus-4-7',
+  opus47: 'claude-opus-4-7[1m]',
+  'opus4-7': 'claude-opus-4-7[1m]',
   sonnet46: 'claude-sonnet-4-6',
   'sonnet4-6': 'claude-sonnet-4-6',
   sonnet47: 'claude-sonnet-4-7',
@@ -42,7 +42,13 @@ const MODEL_ALIAS_MAP: Record<string, string> = {
 const VALID_MODEL_RE = /^(?:opus|sonnet|haiku|default|claude-(?:opus|sonnet|haiku)-\d+-\d+(?:\[\dm\])?)$/;
 
 function resolveModelAlias(raw: string): string {
-  return MODEL_ALIAS_MAP[raw.toLowerCase()] ?? raw;
+  const mapped = MODEL_ALIAS_MAP[raw.toLowerCase()] ?? raw;
+  // Opus is only supported in its 1M-context form in this fork — auto-append
+  // [1m] when a caller passes a bare `claude-opus-*` id without a context
+  // suffix so ANTHROPIC_DEFAULT_OPUS_MODEL math and compaction-window math
+  // line up.
+  if (/^claude-opus-\d+-\d+$/i.test(mapped)) return `${mapped}[1m]`;
+  return mapped;
 }
 
 /**
@@ -61,12 +67,13 @@ const MODEL_EFFORT_SUPPORT: Record<string, ReadonlySet<EffortLevel>> = {
   sonnet: new Set(['low', 'medium', 'high', 'max']),
   'claude-sonnet-4-6': new Set(['low', 'medium', 'high', 'max']),
   'claude-sonnet-4-7': new Set(['low', 'medium', 'high', 'max']),
-  // Opus 4.6: low | medium | high | max.
+  // Opus 4.6: low | medium | high | max. Only the 1M-context variant is
+  // supported in this fork — bare `claude-opus-4-6` gets auto-promoted to
+  // `[1m]` in resolveModelAlias.
   'claude-opus-4-6[1m]': new Set(['low', 'medium', 'high', 'max']),
-  'claude-opus-4-6': new Set(['low', 'medium', 'high', 'max']),
-  // Opus 4.7: adds xhigh.
+  // Opus 4.7: adds xhigh. Same 1M-only policy as 4.6.
   opus: new Set(['low', 'medium', 'high', 'xhigh', 'max']),
-  'claude-opus-4-7': new Set(['low', 'medium', 'high', 'xhigh', 'max']),
+  'claude-opus-4-7[1m]': new Set(['low', 'medium', 'high', 'xhigh', 'max']),
 };
 
 /** Structured representation of a parsed flag set. Empty object = no flags. */

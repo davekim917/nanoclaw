@@ -54,7 +54,7 @@ export const setChannelModelTool: McpToolDefinition = {
   tool: {
     name: 'set_channel_model',
     description:
-      'Set the default model for a specific channel (messaging group) wired to this agent. Applies to every future turn on that channel unless the user passes `-m <model>` explicitly. Mutates messaging_group_agents.default_model. Pass `model` as a short alias (opus46, opus4-7, sonnet46, haiku45) or a full SDK id (claude-opus-4-7[1m]). Pass model=null to clear the per-channel override and fall back to the agent / host defaults. Admin-only.',
+      'Set the default model for a specific channel (messaging group) wired to this agent. Applies to every future turn on that channel unless the user passes `-m <model>` explicitly. Mutates messaging_group_agents.default_model. Pass `model` as a short alias (opus46, opus47, sonnet46, haiku45) or a full SDK id (e.g. claude-sonnet-4-6). Opus runs in 1M-context mode only — `[1m]` is auto-appended if omitted. Pass model=null to clear the per-channel override and fall back to the agent / host defaults. Admin-only.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -64,7 +64,7 @@ export const setChannelModelTool: McpToolDefinition = {
         },
         model: {
           type: ['string', 'null'],
-          description: 'Model to pin (e.g. `opus47`, `claude-opus-4-6[1m]`). Pass null to clear the per-channel override.',
+          description: 'Model to pin (e.g. `opus47`, `claude-sonnet-4-6`). Pass null to clear the per-channel override.',
         },
       },
       required: ['model'],
