@@ -41,19 +41,19 @@ const REQUIRED_ENV: Record<string, string> = {
   // by the CLI as an env-var knob that pairs with the disabled-adaptive
   // mode above — gives us a large budget on fixed-budget model variants.
   MAX_THINKING_TOKENS: '127999',
-  // Lock the `opus` alias to 4.7 with the [1m] extended-context suffix so
+  // Lock the `opus` alias to 4.6 with the [1m] extended-context suffix so
   // the alias matches the Docker-e default and compaction-window math
   // (1M context). Without [1m], the bare `opus` call lands on a 200k
   // variant and CLAUDE_CODE_AUTO_COMPACT_WINDOW=1000000 mis-shoots.
   // Model IDs are bundled into each SDK release, so the env short-circuit
   // also protects against SDK-alias-map lag when a new flagship ships.
-  ANTHROPIC_DEFAULT_OPUS_MODEL: 'claude-opus-4-7[1m]',
+  ANTHROPIC_DEFAULT_OPUS_MODEL: 'claude-opus-4-6[1m]',
   // Lock the `sonnet` alias to 4.6 (explicit id, no [1m] suffix — extended
   // context is opt-in per query). Same reason as opus pin above.
   ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-sonnet-4-6',
-  // Default reasoning effort. Per-message-overridable via `-e1 high` and
-  // session-sticky via `-e high` flags.
-  NANOCLAW_DEFAULT_EFFORT: 'medium',
+  // Default reasoning effort. Per-message-overridable via `-e1 medium` and
+  // session-sticky via `-e medium` flags.
+  NANOCLAW_DEFAULT_EFFORT: 'high',
 };
 
 // Env keys whose meaning moved or got dropped. Removed from existing
@@ -73,7 +73,7 @@ const REQUIRED_SETTINGS: Record<string, unknown> = {
   // after a settings.json drift.
   alwaysThinkingEnabled: true,
   // Default model alias. Combined with ANTHROPIC_DEFAULT_OPUS_MODEL in env
-  // above, this resolves to claude-opus-4-7[1m] at spawn time.
+  // above, this resolves to claude-opus-4-6[1m] at spawn time.
   model: 'opus',
 };
 

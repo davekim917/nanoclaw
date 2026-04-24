@@ -1163,7 +1163,7 @@ async function buildContainerArgs(
   //   3. Per-agent container.json (defaultModel / defaultEffort) —
   //      applies to every channel wired to this agent unless (2) overrides.
   //   4. Host env (ANTHROPIC_DEFAULT_OPUS_MODEL / NANOCLAW_DEFAULT_EFFORT).
-  //   5. Hardcoded fallback 'claude-opus-4-7[1m]' / 'medium'.
+  //   5. Hardcoded fallback 'claude-opus-4-6[1m]' / 'high'.
   //
   // ANTHROPIC_DEFAULT_OPUS_MODEL is the SDK's opus-alias resolver
   // short-circuit: whatever string is here gets sent to the API
@@ -1172,7 +1172,7 @@ async function buildContainerArgs(
     channelDefaults?.channelDefaultModel ??
     containerConfig.defaultModel ??
     process.env.ANTHROPIC_DEFAULT_OPUS_MODEL ??
-    'claude-opus-4-7[1m]';
+    'claude-opus-4-6[1m]';
   args.push('-e', `ANTHROPIC_DEFAULT_OPUS_MODEL=${defaultOpusModel}`);
   // Sonnet alias pin — same short-circuit path as opus. Bare 4-6 id (no
   // [1m] extended-context suffix); extended context is opt-in per query.
@@ -1183,7 +1183,7 @@ async function buildContainerArgs(
     channelDefaults?.channelDefaultEffort ??
     containerConfig.defaultEffort ??
     process.env.NANOCLAW_DEFAULT_EFFORT ??
-    'medium';
+    'high';
   args.push('-e', `NANOCLAW_DEFAULT_EFFORT=${defaultEffort}`);
 
   // Per-channel default tone profile — ports v1's "always-on tone" feature.
