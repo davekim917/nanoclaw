@@ -149,6 +149,146 @@ constraints_added_in_design:
     source: code (src/providers/index.ts:1-7, container/agent-runner/src/providers/index.ts:1-6)
     material_to_decision: D4
 
+  - id: D5
+    question: "M2 from /team-review — admin-only gate (C2) described in agents.ts:8 does not exist in code. Fix in scope or waive?"
+    options_considered:
+      - "(a) Fix in scope — add user_roles check in handleCreateAgent (mirror command-gate.ts pattern); ~20 lines; removes the comment/code mismatch"
+      - "(b) Waive — note in design that C2 is unenforced today, this PR does not fix it"
+    chosen: "(b) Waive"
+    rationale: |
+      User explicitly elected to waive rather than fix in scope, keeping the PR focused on the provider+config
+      extension. Risk accepted: qualitative attack surface ("any agent can spawn arbitrary sub-agents") is
+      pre-existing, unchanged by this PR. Quantitative cost widens — a non-admin agent can now spawn agents
+      that consume Codex/OpenAI/OpenRouter API budget, not just Claude tokens. User accepts this widening.
+      Follow-up responsibility: file a separate issue to add the gate and update the stale comment at
+      agents.ts:8. Do NOT do that in this PR.
+    constraint_refs: [C2]
+    asked_at: 2026-04-24
+    waiver_risk_level: medium
+    waiver_acknowledged_by: user
+    investigation: |
+      Verified during /team-review fact-check: grep confirmed mcp-tools/index.ts:11 unconditionally imports
+      agents.js (no admin conditional); create-agent.ts has no canAccessAgentGroup or user_roles query.
+
+  - id: D6
+    question: "M1 from /team-review — how to prevent the split-brain where agent_groups.agent_provider is set but container.json.provider is not?"
+    options_considered:
+      - "(a) handleCreateAgent writes both agent_groups.agent_provider and container.json.provider in one updateContainerConfig call"
+      - "(b) ensureRuntimeFields (container-runner.ts:1118) reconciles container.json.provider against resolveProviderName() on every spawn"
+      - "(c) Both"
+    chosen: "(a) handleCreateAgent writes both atomically"
+    rationale: |
+      Keeps the write at the single point where both values are known — the create-agent handler. Option (b)
+      alone would work but reconciles on every spawn (many writes), and papers over the same bug upstream
+      of the fix. Option (c) is belt-and-suspenders — low cost, but adds spawn-path complexity for a problem
+      that only matters at creation time. (a) is the minimum-diff, minimum-semantic-change fix. A future PR
+      could add (b) as a defense-in-depth check if other creation paths surface.
+    constraint_refs: [C1, C3]
+    asked_at: 2026-04-24
+    investigation: |
+      Verified that container-side index.ts:45 reads config.provider from container.json (defaults to 'claude')
+      and passes it to createProvider(). ensureRuntimeFields at container-runner.ts:1118-1138 currently syncs
+      agentGroupId/groupName/assistantName only — never provider.
+
+  - id: D7
+    question: "M3 from /team-review — schema is structural-only (effort: z.string().optional()). Accepts invalid values. Fix?"
+    options_considered:
+      - "(a) Tighten effort to z.enum(['low','medium','high','xhigh']); model stays string().min(1)"
+      - "(b) Leave as string; accept that invalid values fail at first wake"
+      - "(c) Full enum everywhere including model"
+    chosen: "(a) Tighten effort to enum; model stays string().min(1)"
+    rationale: |
+      effort has a closed, known enum that matches ContainerConfig.defaultEffort at container-config.ts:125.
+      Not constraining it violates HARD C1 — arbitrary effort values create persistent state then fail at first
+      wake. model is open-ended (model names proliferate across provider versions); full enum is impractical
+      and brittle. min(1) is the minimum viable guard on model. Also: use z.strictObject over z.object().strict()
+      (Zod 4 idiom, flagged as W1 in review).
+      Codex's reasoning_effort gets the same treatment with enum ['low','medium','high'].
+    constraint_refs: [C1]
+    asked_at: 2026-04-24
+
+  - id: D8
+    question: "S2 from /team-review — behavior when a provider is registered but exports no configSchema?"
+    options_considered:
+      - "(a) Silent pass — no validation when no schema"
+      - "(b) Permit empty, reject non-empty (substitute z.strictObject({}))"
+      - "(c) Require every provider to declare at least z.strictObject({}) — reject calls when missing"
+    chosen: "(b) Permit empty, reject non-empty"
+    rationale: |
+      (a) defeats the point of validation; an agent could pass any shape and it would silently land in
+      container.json. (c) is cleaner long-term but makes the registry contract stricter than it is today
+      (existing providers like claude/mock predate this work). (b) is the pragmatic middle: uniform "empty is
+      always safe" contract; non-empty provider_config requires an explicit schema, preventing silent accept.
+      When new providers register, they get zero-config behavior for free and can opt in to config later by
+      declaring a schema.
+      Important: D8's strict fallback is safe because D11 ships the Codex configSchema in the same PR — there
+      is no rollout window where a registered provider lacks its schema. See M7 / D11.
+    constraint_refs: [C1, C5]
+    asked_at: 2026-04-24
+
+  - id: D9
+    question: "M5 from /team-review pass 2 — effort enum missing 'max'. Fix?"
+    options_considered:
+      - "(a) Widen the enum to include 'max' and widen ContainerConfig.defaultEffort to match"
+      - "(b) Keep 4 values and document 'max' exclusion as intentional (cost control)"
+      - "(c) Leave as-is (accept the regression)"
+    chosen: "(a) Widen both"
+    rationale: |
+      Previous revision (r1) anchored Claude's effort enum to ContainerConfig.defaultEffort (four values:
+      low/medium/high/xhigh) — which itself is stale vs the SDK's EffortLevel type (sdk.d.ts:462 has five
+      values including 'max'). The result: the M3 fix rejected a valid SDK input that the pre-PR code path
+      silently accepted. That's a new regression violating C3 ("existing callers keep behavior").
+      (b) was considered as a cost-control measure but would need a stated rationale and a user decision —
+      the user has not expressed that preference and the SDK reserves 'max' for Opus 4.6/4.7 which is what
+      the user is already running. Correct fix: match the SDK.
+      Also widen ContainerConfig.defaultEffort at container-config.ts:125 so the existing per-group and
+      per-channel defaults can use 'max' too. One-line type widening.
+    constraint_refs: [C1, C3]
+    asked_at: 2026-04-24
+    investigation: |
+      Verified EffortLevel type at container/agent-runner/node_modules/@anthropic-ai/claude-agent-sdk/sdk.d.ts:462
+      ('low' | 'medium' | 'high' | 'xhigh' | 'max'). Verified ContainerConfig.defaultEffort at src/container-config.ts:125
+      missing 'max' (4 values).
+
+  - id: D10
+    question: "M6 from /team-review pass 2 — D6 says 'atomic' but DB and filesystem cannot transact together. Fix?"
+    options_considered:
+      - "(a) Specify ordering + rollback: write container.json first, then DB insert, rollback FS on DB failure"
+      - "(b) Accept the gap and document it explicitly (no rollback; orphan state possible on mid-sequence failure)"
+      - "(c) Add an abstraction layer that simulates atomicity (stage directory, two-phase commit style)"
+    chosen: "(a) Specify ordering + rollback"
+    rationale: |
+      (c) is over-engineering for a fire-and-forget creation path that is already idempotent-enough at the
+      destination layer. (b) accepts real split-brain failure modes that D6 was supposed to prevent.
+      (a) is the minimum-viable fix: write the immutable config first, then the DB row (the "pointer"),
+      and rollback the FS on a DB failure. This makes the only failure mode "orphan config directory with
+      no DB pointer" — discoverable and cleanable, not a silent wrong-provider split-brain.
+      D6 wording "atomically" is misleading and must be corrected in the design; "sequenced-write-with-rollback"
+      is the accurate term.
+    constraint_refs: [C1, C3]
+    asked_at: 2026-04-24
+
+  - id: D11
+    question: "M7 from /team-review pass 2 — D8's strictObject({}) fallback blocks legitimate Codex usage in rollout window. Fix?"
+    options_considered:
+      - "(a) Ship Codex configSchema as paired commit on upstream/providers in the same PR scope"
+      - "(b) Soften D8 fallback to z.record(z.unknown()) (accept any shape when no schema)"
+      - "(c) Release-gate the Codex schema commit and document the rollout window as a known gap"
+    chosen: "(a) Ship paired commit"
+    rationale: |
+      (b) reintroduces silent-accept risk B warned about — defeats the point of D8.
+      (c) leaves the brief's Success Criterion #1 unreachable during the gap — violates the spirit of M7
+      being a blocker at all.
+      (a) spans the PR across two branches (trunk + providers) which is less tidy but materially cleaner:
+      one coherent change, reviewable end-to-end, no window where schema is missing. The user's workflow
+      already has the /add-codex skill pulling from origin/providers; shipping the schema with the provider
+      files on that branch is the natural place for it.
+      A5's previous "schema ships as follow-up" framing is superseded by D11 — the schema is now part of
+      this PR.
+      Also addresses Reviewer C finding #3 (re-raise of M4).
+    constraint_refs: [C1, C5]
+    asked_at: 2026-04-24
+
 assumptions:
   - id: A1
     text: "Adding providerConfig?: Record<string, unknown> to RunnerConfig and reading it in loadConfig() is sufficient for container-side consumers — no host env-var plumbing needed."
@@ -175,9 +315,20 @@ assumptions:
     validated: true
 
   - id: A5
-    text: "The Codex provider, when added by /add-codex, will export a configSchema matching z.object({ model: z.string().optional(), reasoning_effort: z.string().optional() }).strict()."
-    impact_if_wrong: medium
-    validation: "Codex provider doesn't exist on this branch; this PR specifies the contract but the schema actually ships with /add-codex. After this PR merges, update /add-codex skill to add the schema export."
-    validated: false
+    text: "[SUPERSEDED by D11] Codex configSchema ships as the M7 paired commit on upstream/providers in this PR scope, not as a follow-up."
+    impact_if_wrong: "n/a — no longer an assumption"
+    validation: "Schema is part of PR deliverable. Reviewed during PR review alongside the Codex provider's existing config-translation code."
+    validated: true
+    superseded_by: D11
+
+  - id: A6
+    text: "z.enum(['low','medium','high','xhigh','max']) on Claude's effort field catches all invalid values the SDK would reject. Five values match EffortLevel at sdk.d.ts:462."
+    impact_if_wrong: low
+    validation: |
+      Verified against container/agent-runner/node_modules/@anthropic-ai/claude-agent-sdk/sdk.d.ts:462
+      (five values: 'low' | 'medium' | 'high' | 'xhigh' | 'max'). If a future SDK release adds a new tier,
+      the schema rejects valid input until updated — add a line-cite in a comment above the enum so future
+      drift is traceable.
+    validated: true
 
 forced_defaults: []

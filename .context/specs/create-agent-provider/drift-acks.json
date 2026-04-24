@@ -1,0 +1,14 @@
+{
+  "acknowledgments": [
+    {
+      "id": "B1",
+      "reason": "Plan's step-2 (updateContainerConfig) error handling is tighter than design's 'propagate' — catches the failure, calls safeRemoveFolder, notifyAgent's the caller, and returns. This is a consistent application of review finding S14's 'full-folder rollback' invariant to step-2 failures, matching the behavior the design already mandates for step-3 failures. Rationale: without this, a step-2 failure would leave groups/<folder>/CLAUDE.local.md (user-supplied prompt content) on disk indefinitely, which is exactly what S14 was supposed to prevent. The plan is correct; the design's step-2 treatment was underspecified. Accepting the divergence rather than reverting the plan to match the design's weaker spec.",
+      "expires_at": "2026-07-24"
+    },
+    {
+      "id": "B2",
+      "reason": "The /add-codex SKILL.md update belongs to Group C (providers-branch codex schema work), which is scoped OUT of this trunk build per the user's fork-first policy (see feedback_fork_first.md memory) and the plan's S15 merge-gating note. The current build is Groups A+B only (trunk PR on davekim917/nanoclaw); Group C is a separate future PR on davekim917/providers after syncing from upstream. The SKILL.md update documents consumers of the schema Group C ships, so it logically follows Group C's work. Deferring the SKILL.md update to the Group C follow-up PR rather than trying to bundle it into this trunk build.",
+      "expires_at": "2026-07-24"
+    }
+  ]
+}
