@@ -28,11 +28,19 @@ function log(msg: string): void {
 async function granolaGet(path: string): Promise<unknown> {
   const url = `${BASE}${path}`;
   // OneCLI's HTTPS proxy intercepts requests to public-api.granola.ai and injects
-  // `Authorization: Bearer grn_...` from the vault. We never see the key.
+  // `Authorization: Bearer grn_...` from the vault. If HTTPS_PROXY isn't set
+  // (container spawned with OneCLI skipped/failed), the request goes out
+  // unauthenticated — Granola returns 401/403. Surface that hint in the error
+  // so the agent doesn't blame "expired token" when the real issue is proxy
+  // wiring.
   const res = await fetch(url);
   if (!res.ok) {
     const body = await res.text().catch(() => '');
-    throw new Error(`Granola API ${res.status} ${res.statusText}: ${body.slice(0, 400)}`);
+    const authHint =
+      (res.status === 401 || res.status === 403) && !process.env.HTTPS_PROXY
+        ? ' (HTTPS_PROXY not set — OneCLI proxy likely missing; check `onecli agents secrets` for GranolaAPI assignment)'
+        : '';
+    throw new Error(`Granola API ${res.status} ${res.statusText}${authHint}: ${body.slice(0, 400)}`);
   }
   return res.json();
 }
@@ -120,6 +128,12 @@ async function main(): Promise<void> {
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  // Warn on boot if HTTPS_PROXY is absent — calls will fail with 401, and
+  // without this log operators have no cue that proxy wiring is the root
+  // cause. Don't exit: valid test/dev setups can wire the key directly.
+  if (!process.env.HTTPS_PROXY) {
+    log('WARN: HTTPS_PROXY not set — Granola calls will go out unauthenticated and fail with 401');
+  }
   log(`granola MCP ready (${tools.length} tools: ${tools.map((t) => t.name).join(', ')})`);
 }
 
