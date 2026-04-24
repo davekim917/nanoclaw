@@ -1,0 +1,183 @@
+# Decision record for: create-agent-provider
+# Initialized by /team-brief on 2026-04-24
+# Format: see skills/shared/decision-record-schema.md
+
+constraints:
+  - id: C1
+    text: "Validation must occur before any persistent state is created (no orphan agent_groups row, agent_destinations rows, or groups/<folder>/ directory)."
+    classification: HARD
+    source: brief Step 2
+
+  - id: C2
+    text: "create_agent remains admin-only — existing gating in agents.ts must not be weakened."
+    classification: HARD
+    source: brief Step 2 (carried from existing constraint)
+
+  - id: C3
+    text: "Existing create_agent callers (no provider, no provider_config) must keep current behavior."
+    classification: HARD
+    source: brief Step 2
+
+  - id: C4
+    text: "Per-provider provider_config schemas live alongside each provider in src/providers/<name>.ts. No central enum / parallel registry."
+    classification: HARD
+    source: brief Step 2
+
+  - id: C5
+    text: "Initial scope: Claude + Codex provider_config schemas. OpenCode accepts provider but empty provider_config. Each future provider is a one-file follow-up PR."
+    classification: HARD
+    source: brief Step 2 (refined after Q3)
+
+  - id: C6
+    text: "Fire-and-forget MCP semantics preserved: handler returns synchronously; validation outcomes surface via notifyAgent system message."
+    classification: HARD
+    source: brief Step 2 (carried from existing pattern)
+
+  - id: C7
+    text: "Supply-chain rules apply (minimumReleaseAge: 4320, frozen-lockfile in CI). No new package deps expected; any new deps require human approval."
+    classification: HARD
+    source: project CLAUDE.md "Supply Chain Security (pnpm)"
+
+  - id: C8
+    text: "Module is registry-based (src/modules/agent-to-agent/index.ts). New code fits that pattern; tests use vitest (host) / bun:test (container)."
+    classification: SOFT
+    source: brief Step 2 (codebase convention)
+
+  - id: C9
+    text: "Per-provider config persistence mechanism is design's call but must satisfy HARD persistence (every container wake reflects spawn-time config)."
+    classification: SOFT
+    source: brief Step 2
+
+decisions:
+  - id: D1
+    question: "MCP API shape — flat params (model + reasoning_effort), just model, or nested provider_config object?"
+    options_considered:
+      - "(a) Flat params: { model, reasoning_effort }"
+      - "(b) Just model — reasoning_effort host-wide via .env or ~/.codex/config.toml"
+      - "(c) Nested provider_config object — each provider owns its schema"
+    chosen: "(c) Nested provider_config object"
+    rationale: |
+      User correctly pointed out that flat reasoning_effort leaks Codex's vocabulary into a tool that
+      should be provider-agnostic — Claude uses 'effort', OpenCode doesn't expose it at all. Flat
+      params for model are fine (universal concept), but every other knob is provider-shaped, and
+      flat fields would accumulate "ignored unless provider X" semantics. (c) keeps the surface
+      polymorphic and lets each provider grow its own schema independently. (b) was rejected because
+      it forces every Codex agent on the host to share the same reasoning_effort — defeats the point
+      of mixed-provider swarms.
+    asked_at: 2026-04-24
+
+  - id: D2
+    question: "Scope for this iteration — Codex only, Codex + Claude, or all three (Codex + Claude + OpenCode)?"
+    options_considered:
+      - "(a) Codex config only — Claude/OpenCode accept provider but no provider_config keys"
+      - "(b) Codex + Claude — both schemas defined; OpenCode deferred"
+      - "(c) All three providers"
+    chosen: "(b) Codex + Claude"
+    rationale: |
+      User clarified that 'just adding codex' meant Codex as a new option alongside Claude, not
+      Codex-only scope. Both providers should support per-spawn config since the user wants to spawn
+      either type from chat (e.g., 'a Codex coder + a Claude reviewer'). OpenCode deferred because
+      its add-skill is more complex (SDK pinning, ANTHROPIC_BASE_URL, OneCLI x-api-key quirks) and
+      adding it doubles the test matrix without serving a current need. Each future provider is a
+      one-file follow-up PR — the registry-per-provider design (C4) makes that cheap.
+    asked_at: 2026-04-24
+
+  - id: D3
+    question: "What knobs does Claude's provider_config schema expose?"
+    options_considered:
+      - "model only"
+      - "model + effort (Opus 4.6+ first-class SDK option)"
+      - "model + effort + thinking_budget"
+      - "everything in QueryInput"
+    chosen: "model + effort"
+    rationale: |
+      Verified against container/agent-runner/src/providers/claude.ts and types.ts (QueryInput
+      interface). The Claude SDK exposes 'model' and 'effort' as the per-query knobs the host
+      currently honors. Other QueryInput fields (cwd, continuation, systemContext) are driven by
+      session machinery, not user choice. SDK options like permissionMode and disallowedTools are
+      intentionally fixed by the host as security baselines. thinking_budget is not currently wired
+      and adding it is out of scope for this iteration.
+    asked_at: 2026-04-24
+    investigation: "Read container/agent-runner/src/providers/types.ts (QueryInput) and grep'd claude.ts for SDK option assignments."
+
+  - id: D4
+    question: "Where do provider_config schemas live and where does validation execute?"
+    options_considered:
+      - "(A) Host-side: schemas in src/providers/<name>.ts, validation in src/modules/agent-to-agent/create-agent.ts"
+      - "(B) Container-side: schemas in container/agent-runner/src/providers/<name>.ts, validation in container/agent-runner/src/mcp-tools/agents.ts"
+      - "(C) Hybrid: container-side validation; persistence path special-cases Claude into existing container.json defaultModel/defaultEffort fields, others into new providerConfig blob"
+    chosen: "(B) Container-side"
+    rationale: |
+      Resolves the validation-surface mismatch surfaced as C11 — the host has no central registry of
+      'valid provider names' (src/providers/index.ts only lists providers needing host-side mounts/env;
+      Claude/mock are absent by design). The container's provider-registry.ts is the actual source of
+      truth for what providers can run. Container-side validation also means: zero new host deps
+      (zod@^4 already in container/agent-runner/package.json), synchronous error feedback via MCP
+      isError (no fire-and-forget back-channel for the error path — C1 satisfied trivially because no
+      system message is ever written for a failed validation), and a single symmetric persistence
+      model (every provider's config rides on a new container.json.providerConfig blob).
+      Rejected (A) — adds zod to host (subject to minimumReleaseAge gate), creates dual-registry
+      drift, and pushes errors into the asynchronous notifyAgent channel ("Creating agent…" then
+      separate error message — confusing).
+      Rejected (C) — asymmetric persistence creates two paths to maintain. Existing defaultModel
+      field has documented semantics ("for the bare opus alias") that don't cleanly cover arbitrary
+      model strings; broadening the field is a separate change of intent.
+      This refines brief constraint C4: schemas live with the provider runtime
+      (container/agent-runner/src/providers/<name>.ts) instead of the host path the brief literally
+      named. The brief's "or co-located there" leaves room; the spirit (schema with provider, no
+      central enum) is preserved.
+    constraint_refs: [C1, C4, C7, C11]
+    asked_at: 2026-04-24
+    investigation: |
+      Read src/providers/index.ts, src/providers/provider-container-registry.ts,
+      container/agent-runner/src/providers/index.ts, container/agent-runner/src/providers/provider-registry.ts,
+      container/agent-runner/src/config.ts (RunnerConfig surface),
+      src/container-config.ts (ContainerConfig schema + read/write helpers, defaultModel/defaultEffort
+      semantics), src/container-runner.ts:1196-1224 (Claude env-var plumbing),
+      src/modules/agent-to-agent/create-agent.ts (current handler), and grep'd for zod usage in container
+      (already a dep, not yet imported anywhere).
+
+constraints_added_in_design:
+  - id: C10
+    text: "container.json is mounted read-only inside the container; only the host writes it."
+    classification: HARD
+    source: code (src/container-config.ts:5, mount setup in container-runner.ts)
+
+  - id: C11
+    text: "Host has no central registry of 'valid provider names.' src/providers/index.ts only registers providers needing host-side mounts/env; Claude/mock are absent by design. The container's provider-registry.ts is the source of truth."
+    classification: HARD
+    source: code (src/providers/index.ts:1-7, container/agent-runner/src/providers/index.ts:1-6)
+    material_to_decision: D4
+
+assumptions:
+  - id: A1
+    text: "Adding providerConfig?: Record<string, unknown> to RunnerConfig and reading it in loadConfig() is sufficient for container-side consumers — no host env-var plumbing needed."
+    impact_if_wrong: low
+    validation: "Read container/agent-runner/src/config.ts:29-49 — already done; matches the existing per-field map pattern."
+    validated: true
+
+  - id: A2
+    text: "Setting agent_groups.agent_provider to a non-null value does not break any existing read path."
+    impact_if_wrong: medium
+    validation: "Read resolveProviderName (src/container-runner.ts:417-423) — already done; null-safe and falls through correctly. Existing OpenCode/Codex flows already set this value."
+    validated: true
+
+  - id: A3
+    text: "zod@^4.0.0 (already in container deps) is API-compatible with the simple .object().strict() schemas this design uses."
+    impact_if_wrong: low
+    validation: "Confirmed by package.json version pin; basic schema usage is identical across Zod 3.x and 4.x."
+    validated: true
+
+  - id: A4
+    text: "agent_destinations table and ACL flow are unchanged by this work (provider choice is orthogonal to addressing)."
+    impact_if_wrong: low
+    validation: "Read src/modules/agent-to-agent/agent-route.ts:32-43 — already done; routing checks destinations only."
+    validated: true
+
+  - id: A5
+    text: "The Codex provider, when added by /add-codex, will export a configSchema matching z.object({ model: z.string().optional(), reasoning_effort: z.string().optional() }).strict()."
+    impact_if_wrong: medium
+    validation: "Codex provider doesn't exist on this branch; this PR specifies the contract but the schema actually ships with /add-codex. After this PR merges, update /add-codex skill to add the schema export."
+    validated: false
+
+forced_defaults: []
