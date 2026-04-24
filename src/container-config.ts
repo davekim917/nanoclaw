@@ -112,15 +112,18 @@ export interface ContainerConfig {
   /**
    * Per-group default model when the agent uses the bare `opus` alias.
    * Resolves the SDK's opus-alias short-circuit ANTHROPIC_DEFAULT_OPUS_MODEL.
-   * Overrides the host-env / hardcoded default. Per-session `-m <model>`
-   * flags still take precedence.
+   * Overrides the install-wide DEFAULT_OPUS_MODEL constant in
+   * container-runner.ts. Per-channel wiring overrides this; per-session
+   * `-m <model>` flags override on top of that.
    */
   defaultModel?: string;
 
   /**
    * Per-group default reasoning effort when the agent doesn't pass
    * `-e <level>`. One of 'low' | 'medium' | 'high' | 'xhigh' | 'max'.
-   * Overrides the host-env / hardcoded default.
+   * Overrides the install-wide DEFAULT_EFFORT constant in
+   * container-runner.ts. Per-channel wiring overrides this; per-session
+   * `-e <level>` flags override on top of that.
    */
   defaultEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 

@@ -99,12 +99,14 @@ export interface MessagingGroupAgent {
   /**
    * Per-channel model override (this channel's conversations with this
    * agent use this model by default). Null = fall through to the agent's
-   * container.json defaultModel, then host env, then hardcoded fallback.
+   * container.json defaultModel, then the install-wide DEFAULT_OPUS_MODEL
+   * constant in container-runner.ts.
    */
   default_model: string | null;
   /**
    * Per-channel effort override. One of 'low' | 'medium' | 'high' | 'xhigh'.
-   * Null = fall through to agent container.json → host env → hardcoded.
+   * Null = fall through to agent container.json → install-wide DEFAULT_EFFORT
+   * constant in container-runner.ts.
    */
   default_effort: string | null;
   /**

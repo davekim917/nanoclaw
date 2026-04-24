@@ -55,6 +55,19 @@ import type { AgentGroup, Session } from './types.js';
 
 const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
 
+// Default model + effort. SINGLE source of truth for what containers
+// resolve `opus` / `sonnet` / `haiku` aliases to and what reasoning
+// effort they use when the user hasn't specified anything.
+//
+// To change the install-wide default, edit these constants. Per-channel
+// (messaging_group_agents.default_model/effort) and per-group
+// (container.json defaultModel/defaultEffort) layers can still override.
+// Per-session flags (-m / -e) and sticky config override on top of those.
+const DEFAULT_OPUS_MODEL = 'claude-opus-4-7[1m]';
+const DEFAULT_SONNET_MODEL = 'claude-sonnet-4-6';
+const DEFAULT_HAIKU_MODEL = 'claude-haiku-4-5-20251001';
+const DEFAULT_EFFORT = 'high';
+
 /** Active containers tracked by session ID. */
 const activeContainers = new Map<string, { process: ChildProcess; containerName: string }>();
 
@@ -1181,12 +1194,12 @@ async function buildContainerArgs(
   // honored as a CLI env knob.
   args.push('-e', 'MAX_THINKING_TOKENS=127999');
 
-  // Default `opus` alias resolution and default effort — both
-  // configurable via host env so the install can upgrade to a newer
-  // model or change default effort without a code change. Per-session
-  // flags (-m / -m1 / -e / -e1 in the agent-runner flag parser) still
-  // override. Short aliases (opus46, opus4-7, etc.) are in the flag
-  // parser's MODEL_ALIAS_MAP — independent of these defaults.
+  // Default `opus` alias resolution and default effort. The constants
+  // at the top of this file (DEFAULT_OPUS_MODEL etc.) are the single
+  // source of truth — they're the only "default" surface. Per-channel
+  // and per-group layers can override; per-session flags override on
+  // top of those. Short aliases (opus46, opus47, etc.) live in the
+  // agent-runner flag parser's MODEL_ALIAS_MAP, independent of these.
   //
   // Precedence (most specific wins):
   //   1. Per-session flag in chat (-m / -m1 / -e / -e1) — handled inside
@@ -1195,32 +1208,19 @@ async function buildContainerArgs(
   //      — passed via channelDefaults when session has a messaging_group.
   //   3. Per-agent container.json (defaultModel / defaultEffort) —
   //      applies to every channel wired to this agent unless (2) overrides.
-  //   4. Host env (ANTHROPIC_DEFAULT_OPUS_MODEL / NANOCLAW_DEFAULT_EFFORT).
-  //   5. Hardcoded fallback 'claude-opus-4-6[1m]' / 'high'.
+  //   4. The DEFAULT_* constants above.
   //
-  // ANTHROPIC_DEFAULT_OPUS_MODEL is the SDK's opus-alias resolver
-  // short-circuit: whatever string is here gets sent to the API
-  // verbatim when the agent or a subagent uses the bare `opus` alias.
+  // ANTHROPIC_DEFAULT_<FAMILY>_MODEL is the SDK's alias resolver
+  // short-circuit: whatever string is in that env var gets sent to the
+  // API verbatim when the agent or a subagent uses the bare alias.
   const defaultOpusModel =
-    channelDefaults?.channelDefaultModel ??
-    containerConfig.defaultModel ??
-    process.env.ANTHROPIC_DEFAULT_OPUS_MODEL ??
-    'claude-opus-4-6[1m]';
+    channelDefaults?.channelDefaultModel ?? containerConfig.defaultModel ?? DEFAULT_OPUS_MODEL;
   args.push('-e', `ANTHROPIC_DEFAULT_OPUS_MODEL=${defaultOpusModel}`);
-  // Sonnet alias pin — same short-circuit path as opus. Bare 4-6 id (no
-  // [1m] extended-context suffix); extended context is opt-in per query.
-  const defaultSonnetModel = process.env.ANTHROPIC_DEFAULT_SONNET_MODEL ?? 'claude-sonnet-4-6';
-  args.push('-e', `ANTHROPIC_DEFAULT_SONNET_MODEL=${defaultSonnetModel}`);
-  // Haiku alias pin — parallel to opus/sonnet for symmetry so bare-alias
-  // haiku subagents resolve to a known id rather than the SDK's default.
-  const defaultHaikuModel = process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL ?? 'claude-haiku-4-5-20251001';
-  args.push('-e', `ANTHROPIC_DEFAULT_HAIKU_MODEL=${defaultHaikuModel}`);
+  args.push('-e', `ANTHROPIC_DEFAULT_SONNET_MODEL=${DEFAULT_SONNET_MODEL}`);
+  args.push('-e', `ANTHROPIC_DEFAULT_HAIKU_MODEL=${DEFAULT_HAIKU_MODEL}`);
 
   const defaultEffort =
-    channelDefaults?.channelDefaultEffort ??
-    containerConfig.defaultEffort ??
-    process.env.NANOCLAW_DEFAULT_EFFORT ??
-    'high';
+    channelDefaults?.channelDefaultEffort ?? containerConfig.defaultEffort ?? DEFAULT_EFFORT;
   args.push('-e', `NANOCLAW_DEFAULT_EFFORT=${defaultEffort}`);
 
   // Per-channel default tone profile — ports v1's "always-on tone" feature.

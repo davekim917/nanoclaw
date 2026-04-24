@@ -15,8 +15,8 @@
  *   1. Per-session flag in chat: -m / -m1 / -e / -e1
  *   2. Per-channel wiring: messaging_group_agents.default_model / _effort  ← this module
  *   3. Per-agent container.json: defaultModel / defaultEffort
- *   4. Host env: ANTHROPIC_DEFAULT_OPUS_MODEL / NANOCLAW_DEFAULT_EFFORT
- *   5. Hardcoded: claude-opus-4-6[1m] / high
+ *   4. Install-wide DEFAULT_OPUS_MODEL / DEFAULT_EFFORT constants in
+ *      container-runner.ts (single source of truth for "default")
  *
  * Authorization (trust-minimal, mirrors permissions/grant.ts):
  *   1. Caller identity derived from session's latest inbound chat message.
