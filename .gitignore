@@ -38,6 +38,9 @@ groups/*
 # Skills system (local per-installation state)
 .nanoclaw/
 
+# Workflow skill scratch (team-brief / team-design / team-plan drafts)
+.context/
+
 agents-sdk-docs
 .gitnexus
 
