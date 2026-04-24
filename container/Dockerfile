@@ -226,3 +226,13 @@ WORKDIR /workspace/group
 # tini is PID 1, reaps zombies, forwards signals cleanly. entrypoint.sh does
 # `exec bun ...` so bun runs as tini's direct child.
 ENTRYPOINT ["/usr/bin/tini", "--", "/app/entrypoint.sh"]
+
+# Stamp the source repo's HEAD commit as an image label so the rebuild
+# watcher (src/container-rebuild-watcher.ts) can tell whether the image
+# reflects the latest origin/main. Must be a LABEL instruction driven by
+# ARG — not a `docker build --label` flag — because `--label` is silently
+# dropped on fully-cached rebuilds, but a LABEL layer tied to a changing
+# ARG invalidates and re-stamps. Upstream layers stay cached (ARG not
+# referenced earlier), so the rebuild is near-instant.
+ARG NANOCLAW_COMMIT=unknown
+LABEL nanoclaw.commit=$NANOCLAW_COMMIT
