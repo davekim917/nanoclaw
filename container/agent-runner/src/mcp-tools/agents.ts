@@ -9,6 +9,7 @@
  * (see mcp-tools/index.ts). The host re-checks permission on receive.
  */
 import { writeMessageOut } from '../db/messages-out.js';
+import { listProviderNames, validateProviderConfig } from '../providers/provider-registry.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
@@ -38,6 +39,22 @@ export const createAgent: McpToolDefinition = {
       properties: {
         name: { type: 'string', description: 'Human-readable name (also becomes your destination name for this agent)' },
         instructions: { type: 'string', description: 'CLAUDE.md content for the new agent (personality, role, instructions)' },
+        provider: {
+          type: 'string',
+          description:
+            "Agent provider backend. Default: the host's default (currently 'claude'). " +
+            "Valid values depend on what's installed on this host — e.g. 'claude', 'codex' (via /add-codex), 'opencode' (via /add-opencode).",
+        },
+        provider_config: {
+          type: 'object',
+          additionalProperties: true,
+          description:
+            "Provider-specific config. Shape depends on 'provider'. " +
+            "Claude: { model?: string, effort?: 'low'|'medium'|'high'|'xhigh'|'max' }. " +
+            "Codex: { model?: string, reasoning_effort?: 'low'|'medium'|'high' }. " +
+            "Unknown keys are rejected. Keep this in sync with each provider's configSchema — " +
+            "see R6 in the design for the future z.toJSONSchema() migration.",
+        },
       },
       required: ['name'],
     },
@@ -45,6 +62,25 @@ export const createAgent: McpToolDefinition = {
   async handler(args) {
     const name = args.name as string;
     if (!name) return err('name is required');
+
+    const provider = (args.provider as string | undefined) ?? undefined;
+    const providerConfig = args.provider_config as Record<string, unknown> | undefined;
+
+    if (provider !== undefined) {
+      const registered = listProviderNames();
+      if (!registered.includes(provider)) {
+        return err(
+          `Provider '${provider}' is not registered. Registered: [${registered.join(', ')}]. Run /add-${provider} on the host first.`,
+        );
+      }
+    }
+
+    if (providerConfig !== undefined) {
+      const result = validateProviderConfig(provider ?? 'claude', providerConfig);
+      if (!result.ok) {
+        return err(`Invalid provider_config: ${result.error}`);
+      }
+    }
 
     const requestId = generateId();
     writeMessageOut({
@@ -55,6 +91,8 @@ export const createAgent: McpToolDefinition = {
         requestId,
         name,
         instructions: (args.instructions as string) || null,
+        ...(provider !== undefined ? { provider } : {}),
+        ...(providerConfig !== undefined ? { provider_config: providerConfig } : {}),
       }),
     });
 

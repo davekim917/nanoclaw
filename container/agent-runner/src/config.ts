@@ -16,6 +16,9 @@ export interface RunnerConfig {
   agentGroupId: string;
   maxMessagesPerPrompt: number;
   mcpServers: Record<string, { command: string; args: string[]; env: Record<string, string> }>;
+
+  // ADDED: per-provider sticky config from container.json.providerConfig
+  providerConfig: Record<string, unknown>;
 }
 
 const DEFAULT_MAX_MESSAGES = 10;
@@ -43,6 +46,7 @@ export function loadConfig(): RunnerConfig {
     agentGroupId: (raw.agentGroupId as string) || '',
     maxMessagesPerPrompt: (raw.maxMessagesPerPrompt as number) || DEFAULT_MAX_MESSAGES,
     mcpServers: (raw.mcpServers as RunnerConfig['mcpServers']) || {},
+    providerConfig: (raw.providerConfig as Record<string, unknown>) ?? {},
   };
 
   return _config;
@@ -52,4 +56,9 @@ export function loadConfig(): RunnerConfig {
 export function getConfig(): RunnerConfig {
   if (!_config) throw new Error('Config not loaded — call loadConfig() first');
   return _config;
+}
+
+/** Reset cached config — for use in tests only. */
+export function _resetConfig(): void {
+  _config = null;
 }
