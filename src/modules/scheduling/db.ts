@@ -119,9 +119,12 @@ export interface RecurringMessage {
   series_id: string;
 }
 
+// Includes 'failed' so a single bad fire doesn't strand the cron series.
+// The failed historical row stays in place for audit; the next slot is
+// inserted as a fresh pending row by handleRecurrence.
 export function getCompletedRecurring(db: Database.Database): RecurringMessage[] {
   return db
-    .prepare("SELECT * FROM messages_in WHERE status = 'completed' AND recurrence IS NOT NULL")
+    .prepare("SELECT * FROM messages_in WHERE status IN ('completed', 'failed') AND recurrence IS NOT NULL")
     .all() as RecurringMessage[];
 }
 

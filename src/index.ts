@@ -30,6 +30,7 @@ import {
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
 import { startWorktreeCleanup, stopWorktreeCleanup } from './worktree-cleanup.js';
 import { startPluginUpdater, stopPluginUpdater } from './plugin-updater.js';
+import { startCommitScan, stopCommitScan } from './commit-scan.js';
 import { restoreRemoteControl } from './remote-control.js';
 import { startDiscordSlashCommands, stopDiscordSlashCommands } from './channels/discord-slash-commands.js';
 import { routeInbound } from './router.js';
@@ -254,7 +255,13 @@ async function main(): Promise<void> {
   });
   log.info('Plugin updater started');
 
-  // 9. Restore any Remote Control session that was running before restart
+  // 9. Start commit-digest scanner (10min interval, first run 90s after
+  //    startup) — records direct commits + external PRs to default branch
+  //    as ship_log entries, complementing the agent-driven add_ship_log.
+  startCommitScan();
+  log.info('Commit scan started');
+
+  // 10. Restore any Remote Control session that was running before restart
   restoreRemoteControl();
 
   // 10. Start Discord slash-command client (gated on
@@ -280,6 +287,7 @@ async function shutdown(signal: string): Promise<void> {
   stopHostSweep();
   stopWorktreeCleanup();
   stopPluginUpdater();
+  stopCommitScan();
   await stopDiscordSlashCommands();
   await teardownChannelAdapters();
   // Synchronously stop agent containers before exit. Without this, child

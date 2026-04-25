@@ -7,6 +7,7 @@
  */
 import { Database } from 'bun:sqlite';
 
+import { getConfig } from '../config.js';
 import { findByName } from '../destinations.js';
 import { getSessionRouting } from '../db/session-routing.js';
 import { registerTools } from './server.js';
@@ -39,7 +40,7 @@ function getDb(): Database | null {
 }
 
 function currentAgentGroupId(): string | undefined {
-  return process.env.NANOCLAW_AGENT_GROUP_ID || undefined;
+  return getConfig().agentGroupId || undefined;
 }
 
 /**

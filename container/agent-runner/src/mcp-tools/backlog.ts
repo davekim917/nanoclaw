@@ -8,13 +8,14 @@
  * Read operations (list_backlog, get_activity_summary) read directly from
  * /workspace/central.db (mounted read-only).
  *
- * scan_commits runs git log locally and sends the result as a ship_log entry.
+ * Note: a container-side `scan_commits` tool used to live here. It was
+ * removed once the host-side commit scanner (src/commit-scan.ts) took over
+ * the "discover external commits" job — the host fetches origin and walks
+ * every group's repos every 10 min. The agent's own shipping flow uses
+ * `add_ship_log` after `open_pr`; if it ever needs an ad-hoc commit list
+ * it can call `git log` via Bash.
  */
-import { Database } from 'bun:sqlite';
-import { execFileSync } from 'child_process';
-import fs from 'fs';
-import path from 'path';
-
+import { getConfig } from '../config.js';
 import { getCentralDb } from '../db/connection.js';
 import { writeMessageOut } from '../db/messages-out.js';
 import { getSessionRouting } from '../db/session-routing.js';
@@ -43,7 +44,7 @@ function routing() {
 }
 
 function getAgentGroupId(): string | null {
-  return process.env.NANOCLAW_AGENT_GROUP_ID ?? null;
+  return getConfig().agentGroupId || null;
 }
 
 function sendAction(action: string, data: Record<string, unknown>): void {
@@ -375,230 +376,4 @@ export const getActivitySummary: McpToolDefinition = {
   },
 };
 
-export const scanCommits: McpToolDefinition = {
-  tool: {
-    name: 'scan_commits',
-    description:
-      'Scan git repos in the current workspace for new commits and create ship log entries. ' +
-      'Discovers repos by checking /workspace/agent and its immediate subdirectories.',
-    inputSchema: {
-      type: 'object' as const,
-      properties: {
-        repoPath: {
-          type: 'string',
-          description: 'Specific repo path to scan. Default: auto-discover all repos under /workspace/agent',
-        },
-      },
-    },
-  },
-  handler: async (args) => {
-    const agentGroupId = getAgentGroupId();
-    if (!agentGroupId) return err('No agent group ID');
-
-    const root = '/workspace/agent';
-    let repos: string[];
-
-    if (args.repoPath) {
-      if (!isGitRepo(args.repoPath as string)) return err(`Not a git repo: ${args.repoPath}`);
-      repos = [args.repoPath as string];
-    } else {
-      repos = discoverRepos(root);
-    }
-
-    if (repos.length === 0) return ok('No git repos found.');
-
-    const results: string[] = [];
-    let totalCommits = 0;
-
-    for (const repoDir of repos) {
-      const repoName = path.basename(repoDir);
-      const scanned = await scanRepo(repoDir, agentGroupId);
-      results.push(`  ${repoName}: ${scanned} new commits`);
-      totalCommits += scanned;
-    }
-
-    log(`scan_commits: ${totalCommits} commits across ${repos.length} repos`);
-    return ok(`Commit scan complete (${repos.length} repos, ${totalCommits} new commits):\n${results.join('\n')}`);
-  },
-};
-
-function isGitRepo(dir: string): boolean {
-  try {
-    return fs.existsSync(path.join(dir, '.git'));
-  } catch {
-    return false;
-  }
-}
-
-function discoverRepos(root: string): string[] {
-  const repos: string[] = [];
-  try {
-    if (isGitRepo(root)) repos.push(root);
-    const entries = fs.readdirSync(root, { withFileTypes: true });
-    for (const entry of entries) {
-      if (entry.isDirectory()) {
-        const subDir = path.join(root, entry.name);
-        if (isGitRepo(subDir)) repos.push(subDir);
-      }
-    }
-  } catch {
-    // Root doesn't exist or is unreadable
-  }
-  return repos;
-}
-
-async function scanRepo(repoDir: string, agentGroupId: string): Promise<number> {
-  const defaultBranch = getDefaultBranch(repoDir);
-  if (!defaultBranch) return 0;
-
-  const latestSha = getLatestCommitSha(repoDir, defaultBranch);
-  if (!latestSha) return 0;
-
-  const db = getCentralDb();
-  if (!db) return 0;
-
-  // Get last scanned SHA for this repo
-  let lastSha: string | null = null;
-  try {
-    const state = db
-      .prepare('SELECT last_commit_sha FROM commit_digest_state WHERE repo_path = ?')
-      .get(repoDir) as { last_commit_sha: string } | undefined;
-    lastSha = state?.last_commit_sha ?? null;
-  } catch {
-    lastSha = null;
-  }
-
-  if (lastSha === latestSha) return 0;
-
-  let commits: CommitInfo[];
-  if (lastSha) {
-    commits = getDirectCommitsSince(repoDir, defaultBranch, lastSha);
-  } else {
-    // First scan: last 24h of commits (capped at 100)
-    commits = getRecentCommits(repoDir, defaultBranch, 100);
-  }
-
-  // Update digest state
-  upsertDigestState(db, repoDir, agentGroupId, latestSha);
-  if (commits.length === 0) return 0;
-
-  const repoName = path.basename(repoDir);
-  const commitCount = commits.length;
-  const title =
-    commitCount === 1
-      ? `${repoName}: ${commits[0].subject}`
-      : `${repoName}: ${commitCount} direct commits to ${defaultBranch}`;
-
-  const description = commits
-    .map((c) => `• \`${c.shortSha}\` ${c.subject} (${c.authorName})`)
-    .join('\n');
-
-  sendAction('add_ship_log', {
-    id: generateId('ship'),
-    title,
-    description,
-    pr_url: null,
-    branch: defaultBranch,
-    tags: `commit-digest,${repoName}`,
-    shipped_at: new Date().toISOString(),
-  });
-
-  log(`scan_repo ${repoName}: ${commitCount} commits`);
-  return commitCount;
-}
-
-interface CommitInfo {
-  sha: string;
-  shortSha: string;
-  subject: string;
-  authorName: string;
-  date: string;
-}
-
-function parseCommitLine(line: string): CommitInfo {
-  const [sha, shortSha, subject, authorName, date] = line.split('\0');
-  return { sha, shortSha, subject, authorName, date };
-}
-
-function getDefaultBranch(repoDir: string): string | null {
-  try {
-    const stdout = execFileSync('git', ['symbolic-ref', 'refs/remotes/origin/HEAD'], {
-      cwd: repoDir,
-      encoding: 'utf-8',
-      timeout: 5000,
-    }).toString();
-    const ref = stdout.trim();
-    const match = ref.match(/^refs\/remotes\/origin\/(.+)$/);
-    if (match) return match[1];
-  } catch {
-    // Fallback: check common branch names
-    for (const branch of ['main', 'master', 'develop']) {
-      try {
-        execFileSync('git', ['rev-parse', '--verify', `refs/heads/${branch}`], {
-          cwd: repoDir,
-          encoding: 'utf-8',
-          timeout: 5000,
-        });
-        return branch;
-      } catch {
-        continue;
-      }
-    }
-  }
-  return null;
-}
-
-function getLatestCommitSha(repoDir: string, branch: string): string | null {
-  try {
-    const stdout = execFileSync('git', ['rev-parse', branch], { cwd: repoDir, encoding: 'utf-8', timeout: 5000 }).toString();
-    return stdout.trim() || null;
-  } catch {
-    return null;
-  }
-}
-
-function getDirectCommitsSince(repoDir: string, branch: string, sinceSha: string): CommitInfo[] {
-  try {
-    const stdout = execFileSync(
-      'git',
-      ['log', '--no-merges', '--first-parent', '--format=%H%x00%h%x00%s%x00%an%x00%aI', `${sinceSha}..${branch}`],
-      { cwd: repoDir, encoding: 'utf-8', timeout: 10000 },
-    ).toString();
-    if (!stdout.trim()) return [];
-    return stdout.trim().split('\n').map(parseCommitLine).reverse();
-  } catch {
-    return [];
-  }
-}
-
-function getRecentCommits(repoDir: string, branch: string, limit: number): CommitInfo[] {
-  try {
-    const stdout = execFileSync(
-      'git',
-      [
-        'log',
-        '--no-merges',
-        '--first-parent',
-        '-n',
-        String(limit),
-        '--format=%H%x00%h%x00%s%x00%an%x00%aI',
-        '--since=24 hours ago',
-        branch,
-      ],
-      { cwd: repoDir, encoding: 'utf-8', timeout: 10000 },
-    ).toString();
-    if (!stdout.trim()) return [];
-    return stdout.trim().split('\n').map(parseCommitLine).reverse();
-  } catch {
-    return [];
-  }
-}
-
-function upsertDigestState(db: Database, repoPath: string, agentGroupId: string, lastSha: string): void {
-  db.prepare(
-    `INSERT OR REPLACE INTO commit_digest_state (repo_path, agent_group_id, last_commit_sha, last_scan)
-     VALUES (?, ?, ?, ?)`,
-  ).run(repoPath, agentGroupId, lastSha, new Date().toISOString());
-}
-
-registerTools([addShipLog, addBacklogItem, updateBacklogItem, deleteBacklogItem, listBacklog, getActivitySummary, scanCommits]);
+registerTools([addShipLog, addBacklogItem, updateBacklogItem, deleteBacklogItem, listBacklog, getActivitySummary]);

@@ -109,6 +109,17 @@ describe('cancelTask / pauseTask / resumeTask series matching', () => {
     db.close();
   });
 
+  it('failed recurring task is picked up so the cron series advances', () => {
+    const db = freshDb();
+    insertBasicTask(db, 'task-fail', '0 9 * * *');
+    db.prepare("UPDATE messages_in SET status = 'failed' WHERE id = 'task-fail'").run();
+
+    const recurring = getCompletedRecurring(db);
+    expect(recurring).toHaveLength(1);
+    expect(recurring[0].id).toBe('task-fail');
+    db.close();
+  });
+
   it('pause by original id pauses the live follow-up', () => {
     const db = freshDb();
     seedRecurringChain(db);

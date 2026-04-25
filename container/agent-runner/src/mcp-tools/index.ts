@@ -5,6 +5,7 @@
  * Adding a new tool module: create the file, call `registerTools([...])`
  * at module scope, and append the import here. No central list.
  */
+import { loadConfig } from '../config.js';
 import './core.js';
 import './scheduling.js';
 import './interactive.js';
@@ -24,6 +25,13 @@ import { startMcpServer } from './server.js';
 function log(msg: string): void {
   console.error(`[mcp-tools] ${msg}`);
 }
+
+// MCP server runs in its own child process (spawned by the SDK over stdio),
+// so the config cache populated by the agent-runner entry point isn't here.
+// Tool handlers like backlog/thread-search read agentGroupId via getConfig(),
+// which throws if loadConfig() hasn't been called — populate it before tools
+// can be invoked.
+loadConfig();
 
 startMcpServer().catch((err) => {
   log(`MCP server error: ${err instanceof Error ? err.message : String(err)}`);
