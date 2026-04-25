@@ -36,12 +36,19 @@ export interface AgentProvider {
   isRetryable?(err: unknown): boolean;
 
   /**
-   * Advance to the next configured fallback API key. Returns true if a
-   * rotation happened, false if no more fallbacks are available. Poll-loop
-   * pairs this with `isRetryable` to auto-recover from upstream flakiness
-   * without dead-turning the user.
+   * Advance to the next configured fallback credential (API key or OAuth
+   * token). Returns `rotated: true` if a rotation happened, false if no
+   * more fallbacks remain. The stored continuation is preserved across
+   * rotations: the Claude Code SDK's `resume:` reads a LOCAL `.jsonl`
+   * transcript (`~/.claude/projects/<hash>/<session>.jsonl`), and the
+   * Anthropic API has no server-side session object that's bound to an
+   * account — replaying the prior history under a new token works the
+   * same as a `/login` mid-conversation in interactive Claude Code.
+   *
+   * Poll-loop pairs this with `isRetryable` to auto-recover from upstream
+   * flakiness without dead-turning the user.
    */
-  rotateApiKey?(): boolean;
+  rotateApiKey?(): { rotated: boolean };
 }
 
 /**

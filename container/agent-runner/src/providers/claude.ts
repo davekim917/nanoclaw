@@ -322,7 +322,20 @@ const OAUTH_FALLBACK_RE = /^CLAUDE_CODE_OAUTH_TOKEN_(\d+)$/;
 
 // Retryable upstream errors. v1's list — see
 // container/agent-runner/src/index.ts:470-478.
-const RETRYABLE_ERROR_RE = /429|rate[\s_-]?limit|overloaded|upstream_error|External provider returned/i;
+// `subscription_quota_exhausted` is our own marker (see QUOTA_RESULT_RE
+// below) — when the SDK returns the Claude Max quota message as a
+// normal result text instead of throwing, we re-throw with this prefix
+// so the existing rotation+retry path picks it up.
+const RETRYABLE_ERROR_RE = /429|rate[\s_-]?limit|overloaded|upstream_error|External provider returned|subscription_quota_exhausted/i;
+
+// Claude Max subscription quota exhaustion. The Agent SDK delivers this
+// as a plain result-text string ("You're out of extra usage · resets …")
+// rather than a thrown error or a `rate_limit_event` system message, so
+// neither the catch-block rotation nor the in-stream rate_limit_event
+// path triggers. Detect the text and re-throw to engage rotation.
+// Strict-anchored to avoid false-positives on agent prose that mentions
+// "usage" in passing.
+const QUOTA_RESULT_RE = /^\s*You'?re out of (extra |daily |weekly )?usage\b/i;
 
 // Secrets the SDK needs for API auth but that Bash subprocesses must not see.
 // Built lazily inside the hook so late-bound env additions are covered.
@@ -766,25 +779,32 @@ export class ClaudeProvider implements AgentProvider {
    * OAuth rotation (Claude Max) when OAuth is the active auth path — that
    * is, when CLAUDE_CODE_OAUTH_TOKEN is set and ANTHROPIC_API_KEY is not.
    * Otherwise rotates ANTHROPIC_API_KEY through its _N fallbacks. Returns
-   * false when no more fallbacks of either kind remain.
+   * `rotated: false` when no more fallbacks of either kind remain.
+   *
+   * The stored continuation is preserved on every rotation. The SDK's
+   * `resume:` loads conversation history from a local `.jsonl` file
+   * (`~/.claude/projects/<hash>/<session>.jsonl`), and the Anthropic API
+   * has no server-side session object that's account-bound — the next
+   * turn just replays the prior messages under whichever token signs the
+   * request. Same shape as `/login`-mid-session in interactive Claude Code.
    *
    * Position persists for the container lifetime — once slot N fires a
    * retryable error, slot N+1 stays active for all subsequent queries.
    * Restarting the container is the only reset.
    */
-  rotateApiKey(): boolean {
+  rotateApiKey(): { rotated: boolean } {
     const usingOauth = !this.env.ANTHROPIC_API_KEY && Boolean(this.env.CLAUDE_CODE_OAUTH_TOKEN);
     if (usingOauth) {
-      if (this.nextOauthFallback >= this.fallbackOauth.length) return false;
+      if (this.nextOauthFallback >= this.fallbackOauth.length) return { rotated: false };
       const next = this.fallbackOauth[this.nextOauthFallback++];
       if (this.env.CLAUDE_CODE_OAUTH_TOKEN === next.value) {
         return this.rotateApiKey();
       }
       this.env.CLAUDE_CODE_OAUTH_TOKEN = next.value;
       log(`Rotated CLAUDE_CODE_OAUTH_TOKEN → ${next.name} (${this.nextOauthFallback}/${this.fallbackOauth.length})`);
-      return true;
+      return { rotated: true };
     }
-    if (this.nextFallback >= this.fallbackKeys.length) return false;
+    if (this.nextFallback >= this.fallbackKeys.length) return { rotated: false };
     const next = this.fallbackKeys[this.nextFallback++];
     if (this.env.ANTHROPIC_API_KEY === next.value) {
       // Already rotated to this one (e.g. base key already matched a
@@ -793,7 +813,7 @@ export class ClaudeProvider implements AgentProvider {
     }
     this.env.ANTHROPIC_API_KEY = next.value;
     log(`Rotated ANTHROPIC_API_KEY → ${next.name} (${this.nextFallback}/${this.fallbackKeys.length})`);
-    return true;
+    return { rotated: true };
   }
 
   query(input: QueryInput): AgentQuery {
@@ -894,6 +914,12 @@ export class ClaudeProvider implements AgentProvider {
           yield { type: 'init', continuation: message.session_id };
         } else if (message.type === 'result') {
           const text = 'result' in message ? (message as { result?: string }).result ?? null : null;
+          if (text && QUOTA_RESULT_RE.test(text)) {
+            // Throw so poll-loop's catch path can rotate to the next OAuth
+            // fallback and retry instead of dispatching the quota message
+            // to the user.
+            throw new Error(`subscription_quota_exhausted: ${text}`);
+          }
           yield { type: 'result', text };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'api_retry') {
           yield { type: 'error', message: 'API retry', retryable: true };

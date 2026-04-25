@@ -23,6 +23,7 @@ import {
 } from './formatter.js';
 import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
 import { autoCommitDirtyWorktrees } from './worktree-autosave.js';
+import { buildSessionRecap, wrapRecap } from './session-recap.js';
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
@@ -198,13 +199,20 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       let recovered = false;
 
       // Retryable-upstream recovery: 429 / rate limit / overloaded /
-      // upstream_error. If the provider has fallback API keys configured
-      // (ANTHROPIC_API_KEY_N), rotate and retry once in-turn. Without
+      // upstream_error / subscription quota exhausted. If the provider has
+      // fallback credentials configured (ANTHROPIC_API_KEY_N or
+      // CLAUDE_CODE_OAUTH_TOKEN_N), rotate and retry once in-turn. Without
       // fallbacks OR once they're exhausted, fall through to the error
       // write. Ordered before isContextTooLong because prompt-too-long can
       // LOOK retryable in some error shapes, and the rotation cost is low.
-      if (config.provider.isRetryable?.(err) && config.provider.rotateApiKey?.()) {
-        log(`Upstream transient error — rotated key, retrying same prompt in-turn`);
+      const rotation = config.provider.isRetryable?.(err)
+        ? config.provider.rotateApiKey?.()
+        : undefined;
+      if (rotation?.rotated) {
+        // Continuation is preserved across rotations: the SDK's `resume:`
+        // reads a local .jsonl, and the Anthropic API has no account-bound
+        // session object — the new credential just signs the next request.
+        log(`Upstream transient error — rotated credential, retrying same prompt in-turn`);
         try {
           const retryQuery = config.provider.query({
             prompt,
@@ -222,7 +230,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           recovered = true;
         } catch (retryErr) {
           const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
-          log(`Retry after key rotation also failed: ${retryMsg}`);
+          log(`Retry after credential rotation also failed: ${retryMsg}`);
         }
       }
 
@@ -240,14 +248,19 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // without continuation) is what we'd do anyway, and the chat-error
       // pattern makes the failure explicit to the user.
       //
-      // Marker prefix tells the agent why it's starting blank.
+      // Recap from the per-session DB tells the agent what was just
+      // discussed so it doesn't lose the thread. The marker is for the
+      // case where there's no recap (no completed messages yet).
       if (!recovered && continuation && config.provider.isContextTooLong?.(err)) {
         log(`Context-too-long detected — clearing session and retrying once with fresh continuation`);
         continuation = undefined;
         clearStoredSessionId();
         try {
+          const recap = buildSessionRecap();
           const retryPrompt =
-            '[The prior session exceeded the model context window and was reset. Continuing fresh from here.]\n\n' +
+            (recap
+              ? wrapRecap(recap, 'context-window-exceeded')
+              : '[The prior session exceeded the model context window and was reset. Continuing fresh from here.]\n\n') +
             prompt;
           const retryQuery = config.provider.query({
             prompt: retryPrompt,
@@ -266,12 +279,40 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           log(`Retry after context-too-long also failed: ${retryMsg}`);
         }
       } else if (!recovered && continuation && config.provider.isSessionInvalid(err)) {
-        // Stale/corrupt continuation — clearing lets the next poll start
-        // fresh. No in-turn retry; the message's markCompleted below
-        // means the user must re-send. Matches prior v2 behavior.
-        log(`Stale session detected (${continuation}) — clearing for next retry`);
+        // Stale/corrupt continuation — most often a transcript .jsonl
+        // that got pruned out from under us, or a session id that was
+        // valid in a prior container but doesn't exist in this one's
+        // ~/.claude/projects/. Clear and retry once with a recap from
+        // the per-session DB so the user doesn't have to re-send and
+        // doesn't lose conversational context.
+        log(`Stale session detected (${continuation}) — clearing and retrying with recap`);
         continuation = undefined;
         clearStoredSessionId();
+        try {
+          const recap = buildSessionRecap();
+          const retryPrompt =
+            (recap
+              ? wrapRecap(recap, 'stale-session-recovered')
+              : '[The prior agent session transcript was unavailable and could not be resumed. Starting a fresh session.]\n\n') +
+            prompt;
+          const retryQuery = config.provider.query({
+            prompt: retryPrompt,
+            continuation: undefined,
+            cwd: config.cwd,
+            systemContext: config.systemContext,
+            model: effectiveModel,
+            effort: effectiveEffort,
+          });
+          const retryResult = await processQuery(retryQuery, routing, processingIds);
+          if (retryResult.continuation) {
+            continuation = retryResult.continuation;
+            setStoredSessionId(continuation);
+          }
+          recovered = true;
+        } catch (retryErr) {
+          const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
+          log(`Retry after stale-session recovery also failed: ${retryMsg}`);
+        }
       }
 
       // Only surface the error to the user if we couldn't recover inline.

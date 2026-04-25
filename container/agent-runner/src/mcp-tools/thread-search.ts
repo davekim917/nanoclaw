@@ -435,14 +435,14 @@ export const readThreadTool: McpToolDefinition = {
   tool: {
     name: 'read_thread',
     description:
-      'Cross-thread lookup: read the archived transcript of a PAST thread in a DIFFERENT channel/thread from the one you are currently in. Intended for user-driven references ("what did we decide in #other-channel", "pull up the thread about Y"). The tool refuses to read the current session\'s own thread — if you are missing context for the thread you are in, tell the user directly instead of silently guessing. When `thread_id` is omitted, returns the single most recent thread in the resolved channel; pass `thread_id` explicitly when the user is pointing at a specific one.',
+      'Read the archived transcript of a thread. Designed for cross-thread lookups ("what did we decide in #other-channel", "pull up the thread about Y") AND for recovering deep context inside the current thread when recent history isn\'t enough. When `thread_id` is omitted the tool returns the single most recent thread in the resolved channel — and refuses if the resolved channel is the same as the current session, because "most recent" is unreliable in busy channels (it could pick a sibling thread). To read the current thread, pass `thread_id` explicitly.',
     inputSchema: {
       type: 'object' as const,
       properties: {
         channel: { type: 'string', description: 'Destination name from the agent\'s destinations map.' },
         channel_type: { type: 'string', description: 'Raw channel_type (e.g. "slack", "discord"). Used with platform_id.' },
         platform_id: { type: 'string', description: 'Raw platform id. Used with channel_type.' },
-        thread_id: { type: 'string', description: 'Specific thread id to load. If omitted, loads the most recent thread in the channel.' },
+        thread_id: { type: 'string', description: 'Specific thread id to load. If omitted, loads the most recent thread in the channel — refused when that channel is the current session\'s channel (pass thread_id explicitly).' },
         limit: { type: 'number', description: 'Max messages to return (default 200, max 500).' },
       },
     },
@@ -458,15 +458,16 @@ export const readThreadTool: McpToolDefinition = {
     const ag = currentAgentGroupId();
     if (!ag) return err('agent group id unavailable');
 
-    // Refuse to read the CURRENT session's own thread. This tool is for
-    // cross-thread lookups only — if you're missing context for the thread
-    // you're in, tell the user; don't paper over it by re-reading your own
-    // archive. Matches the tool description's "PAST thread in ANOTHER
-    // channel" framing.
+    // Apollo/xzo guard: refuse the current channel's "most recent thread"
+    // fallback. The bug it prevents is silently picking a sibling thread
+    // when the channel has many concurrent ones. Passing `thread_id`
+    // explicitly is allowed — including for the current session — so the
+    // agent can pull deep history when the per-session recap window is
+    // too short.
     if (!threadId && routing.sessionThreadId) {
       return err(
-        'this tool is for cross-thread lookups, not current-session hydration — ' +
-          'if you are missing context for the thread you are in, tell the user so directly instead',
+        'no thread_id provided and the resolved channel matches the current session — ' +
+          'pass thread_id explicitly (use the current session\'s thread_id to read this thread\'s archive)',
       );
     }
 
@@ -515,7 +516,7 @@ export const readThreadByKeyTool: McpToolDefinition = {
   tool: {
     name: 'read_thread_by_key',
     description:
-      'Read the most recent archived thread in another named channel. ONLY call this when the user explicitly asks to review the most recent conversation in a DIFFERENT channel (e.g. "catch me up on #eng-ops"). Do NOT call this to recover context for the thread you are currently in — if history is missing, say so to the user rather than guessing with "most recent in channel", which will often be a different thread than the one the user is referencing.',
+      'Read the most recent archived thread in another named channel. ONLY call this when the user explicitly asks to review the most recent conversation in a DIFFERENT channel (e.g. "catch me up on #eng-ops"). Do NOT call this to recover context for the thread you are currently in — for that, use `read_current_thread`.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -532,11 +533,48 @@ export const readThreadByKeyTool: McpToolDefinition = {
   },
 };
 
+export const readCurrentThreadTool: McpToolDefinition = {
+  tool: {
+    name: 'read_current_thread',
+    description:
+      'Read the archived transcript of the THREAD YOU ARE IN. Use when the user asks you to review history beyond what you already have in context — e.g. after a session reset, after compaction, or when they reference messages from earlier in the same conversation that you no longer remember. Pulls from the host-maintained archive (host writes every chat in/out), so it contains the full thread regardless of how the SDK\'s session state evolved.',
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        limit: { type: 'number', description: 'Max messages to return (default 200, max 500).' },
+      },
+    },
+  },
+  handler: async (args: Record<string, unknown>) => {
+    let session: { channel_type: string | null; platform_id: string | null; thread_id: string | null };
+    try {
+      session = getSessionRouting();
+    } catch (e) {
+      return err(`session routing unavailable: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    if (!session.channel_type || !session.platform_id) {
+      return err('session routing unavailable — no current thread to read');
+    }
+    if (!session.thread_id) {
+      return err(
+        'this session has no thread_id (the channel adapter does not use threads) — there is no separate thread archive to read',
+      );
+    }
+    return readThreadTool.handler({
+      channel_type: session.channel_type,
+      platform_id: session.platform_id,
+      thread_id: session.thread_id,
+      limit: args.limit,
+    });
+  },
+};
+
 export const threadSearchTools: McpToolDefinition[] = [
   searchThreadsTool,
   resolveThreadLinkTool,
   readThreadTool,
   readThreadByKeyTool,
+  readCurrentThreadTool,
 ];
 
 registerTools(threadSearchTools);
