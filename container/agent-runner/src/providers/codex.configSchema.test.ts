@@ -43,16 +43,19 @@ describe('codexConfigSchema', () => {
     expect(result.success).toBe(false);
   });
 
-  it('test_codexConfigSchema_empty_object_passes', () => {
+  it('test_codexConfigSchema_empty_object_defaults_to_high', () => {
     const parsed = codexConfigSchema.parse({});
-    expect(parsed).toEqual({});
+    expect(parsed).toEqual({ reasoning_effort: 'high' });
+  });
+
+  it('test_codexConfigSchema_explicit_low_overrides_default', () => {
+    const parsed = codexConfigSchema.parse({ reasoning_effort: 'low' });
+    expect(parsed).toEqual({ reasoning_effort: 'low' });
   });
 
   it('test_codexConfigSchema_registered_after_barrel_import', () => {
     const schema = getProviderConfigSchema('codex');
     expect(schema).toBeDefined();
-    // Round-trip through the registered instance to confirm it's the same
-    // schema (not an unrelated default like z.strictObject({})).
     const parsed = schema!.parse({ reasoning_effort: 'medium' });
     expect(parsed).toEqual({ reasoning_effort: 'medium' });
   });
@@ -70,9 +73,25 @@ describe('CodexProvider sticky config + override propagation', () => {
     expect(overrides).toContain('model_reasoning_effort="high"');
   });
 
-  it('test_stickyConfig_no_effort_no_override', () => {
+  it('test_stickyConfig_explicit_undefined_no_override', () => {
+    // Constructing CodexProvider with an empty providerConfig schema-defaults
+    // to 'high', so this case is hit only when stickyConfig is genuinely
+    // undefined (not parsed through the schema).
     const overrides = createCodexConfigOverrides({});
     expect(overrides.find((o) => o.startsWith('model_reasoning_effort'))).toBeUndefined();
+  });
+
+  it('test_stickyConfig_default_high_emits_override', () => {
+    // CodexProvider's constructor parses providerConfig through the schema,
+    // which defaults reasoning_effort to 'high'. This covers the production
+    // path: every codex agent gets high effort unless explicitly overridden.
+    const p = new CodexProvider();
+    const sticky = (p as unknown as {
+      stickyConfig: { reasoning_effort?: 'low' | 'medium' | 'high' };
+    }).stickyConfig;
+    expect(sticky.reasoning_effort).toBe('high');
+    const overrides = createCodexConfigOverrides(sticky);
+    expect(overrides).toContain('model_reasoning_effort="high"');
   });
 
   it('test_stickyConfig_model_overrides_default_and_env', () => {
