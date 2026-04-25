@@ -48,7 +48,7 @@ const TURN_TIMEOUT_MS = 5 * 60 * 1000;
 // fields are not currently exposed by Codex's `thread/start` shape.
 export const codexConfigSchema = z.strictObject({
   model: z.string().min(1).optional(),
-  reasoning_effort: z.enum(['low', 'medium', 'high']).optional(),
+  reasoning_effort: z.enum(['low', 'medium', 'high']).optional().default('high'),
 });
 
 registerProviderConfigSchema('codex', codexConfigSchema);
