@@ -16,10 +16,13 @@
 import fs from 'fs';
 import path from 'path';
 
-import { registerProvider } from './provider-registry.js';
+import { z } from 'zod';
+
+import { registerProvider, registerProviderConfigSchema } from './provider-registry.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
 import {
   type AppServer,
+  type CodexMcpServer,
   type JsonRpcNotification,
   STALE_THREAD_RE,
   attachCodexAutoApproval,
@@ -34,6 +37,21 @@ import {
 
 /** Hard ceiling for a single turn. Guards against app-server wedging. */
 const TURN_TIMEOUT_MS = 5 * 60 * 1000;
+
+// ── Provider config schema ──────────────────────────────────────────────────
+// Mirrors the `claudeConfigSchema` pattern but with Codex-native vocabulary:
+// `reasoning_effort` instead of Claude's `effort`, and a 3-value enum
+// (low | medium | high) — Codex has no `'xhigh'` or `'max'` tier.
+//
+// Sticky-only: `model` and `reasoning_effort` are applied at thread-start /
+// codex-spawn time and persist for the session. Per-turn overrides for these
+// fields are not currently exposed by Codex's `thread/start` shape.
+export const codexConfigSchema = z.strictObject({
+  model: z.string().min(1).optional(),
+  reasoning_effort: z.enum(['low', 'medium', 'high']).optional(),
+});
+
+registerProviderConfigSchema('codex', codexConfigSchema);
 
 // ── System-prompt assembly ──────────────────────────────────────────────────
 // Codex's app-server doesn't expand Claude Code's `@-import` syntax in
@@ -101,12 +119,23 @@ function composeBaseInstructions(promptAddendum: string | undefined): string | u
 export class CodexProvider implements AgentProvider {
   readonly supportsNativeSlashCommands = false;
 
-  private readonly mcpServers: Record<string, { command: string; args: string[]; env: Record<string, string> }>;
+  private readonly mcpServers: Record<string, CodexMcpServer>;
   private readonly model: string;
+  private readonly stickyConfig: z.infer<typeof codexConfigSchema>;
 
   constructor(options: ProviderOptions = {}) {
     this.mcpServers = options.mcpServers ?? {};
-    this.model = (options.env?.CODEX_MODEL as string | undefined) ?? 'gpt-5.4-mini';
+
+    // Defensive re-parse (R8): catches hand-edited container.json or self-mod
+    // mutations on startup before they reach codex.
+    this.stickyConfig = codexConfigSchema.parse(options.providerConfig ?? {});
+
+    // Model precedence: stickyConfig (per-agent) > CODEX_MODEL env (host
+    // default) > built-in default.
+    this.model =
+      this.stickyConfig.model ??
+      (options.env?.CODEX_MODEL as string | undefined) ??
+      'gpt-5.5';
   }
 
   isSessionInvalid(err: unknown): boolean {
@@ -132,7 +161,7 @@ export class CodexProvider implements AgentProvider {
       // query active per batch of pending messages and ends it on idle, so
       // spawn-per-query matches that cadence naturally.
       writeCodexMcpConfigToml(self.mcpServers);
-      const server = spawnCodexAppServer(createCodexConfigOverrides());
+      const server = spawnCodexAppServer(createCodexConfigOverrides(self.stickyConfig));
       attachCodexAutoApproval(server);
 
       let threadId: string | undefined = input.continuation;

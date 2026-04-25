@@ -388,6 +388,22 @@ export function writeCodexMcpConfigToml(servers: Record<string, CodexMcpServer>)
   log(`Wrote MCP config.toml (${Object.keys(servers).length} server(s))`);
 }
 
-export function createCodexConfigOverrides(): string[] {
-  return ['features.use_linux_sandbox_bwrap=false'];
+/**
+ * Build the `-c key=value` overrides passed to `codex app-server`. The
+ * `stickyConfig` argument is the validated per-agent provider config slice
+ * (see `codexConfigSchema` in `./codex.ts`). When set, `reasoning_effort`
+ * propagates as `model_reasoning_effort=<value>` — Codex's native config key.
+ *
+ * The `model` field is NOT applied here because thread/start carries it as a
+ * first-class JSON-RPC parameter; emitting it via `-c model=...` would
+ * shadow but not improve precedence.
+ */
+export function createCodexConfigOverrides(stickyConfig?: {
+  reasoning_effort?: 'low' | 'medium' | 'high';
+}): string[] {
+  const overrides = ['features.use_linux_sandbox_bwrap=false'];
+  if (stickyConfig?.reasoning_effort) {
+    overrides.push(`model_reasoning_effort="${stickyConfig.reasoning_effort}"`);
+  }
+  return overrides;
 }
