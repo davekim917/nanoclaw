@@ -5,7 +5,7 @@
  */
 import { describe, expect, it } from 'vitest';
 
-import { ABSOLUTE_CEILING_MS, CLAIM_STUCK_MS, decideStuckAction } from './host-sweep.js';
+import { ABSOLUTE_CEILING_MS, CLAIM_STUCK_MS, SPAWN_GRACE_MS, decideStuckAction } from './host-sweep.js';
 
 const BASE = Date.parse('2026-04-20T12:00:00.000Z');
 
@@ -142,5 +142,53 @@ describe('decideStuckAction', () => {
       claims: [{ message_id: 'x', status_changed: 'not-a-date' }],
     });
     expect(res.action).toBe('ok');
+  });
+
+  it('does not kill a fresh container for a claim made before it spawned', () => {
+    // Pre-existing claim from a long-dead prior container; new one just
+    // spawned and hasn't reached its agent-runner startup cleanup hook
+    // yet. Without the grace window, every recovery attempt would be
+    // killed within ms of spawn — the deadlock that stranded the
+    // plugin-updater session for 4 days post-cutover.
+    const res = decideStuckAction({
+      now: BASE,
+      heartbeatMtimeMs: 0, // fresh container, no heartbeat yet
+      containerState: null,
+      claims: [claim('msg-stale', CLAIM_STUCK_MS + 10_000 + SPAWN_GRACE_MS)],
+      spawnedAtMs: BASE - 10_000, // spawned 10s ago, well within grace
+    });
+    expect(res.action).toBe('ok');
+  });
+
+  it('still kills for a fresh-container claim that aged past tolerance during the grace window', () => {
+    // Claim was made AFTER spawn (so it's the current container's own work)
+    // and has aged past tolerance with no heartbeat. The grace window only
+    // covers pre-existing claims, not new ones produced by the live
+    // container — those still need to be enforced normally.
+    const claimedAgeMs = CLAIM_STUCK_MS + 5_000;
+    const spawnedAtMs = BASE - claimedAgeMs - 1_000; // spawn predates the claim
+    const res = decideStuckAction({
+      now: BASE,
+      heartbeatMtimeMs: 0,
+      containerState: null,
+      claims: [claim('msg-1', claimedAgeMs)],
+      spawnedAtMs,
+    });
+    expect(res.action).toBe('kill-claim');
+  });
+
+  it('kills for a pre-existing claim once the grace window has elapsed', () => {
+    // Container spawned > SPAWN_GRACE_MS ago and the stale claim is still
+    // there — startup cleanup either failed to run or didn't cover this
+    // row. After the grace window, the kill path runs as before so a
+    // permanently-broken container can't camp on a session forever.
+    const res = decideStuckAction({
+      now: BASE,
+      heartbeatMtimeMs: 0,
+      containerState: null,
+      claims: [claim('msg-stale', CLAIM_STUCK_MS + 10_000 + SPAWN_GRACE_MS)],
+      spawnedAtMs: BASE - SPAWN_GRACE_MS - 5_000,
+    });
+    expect(res.action).toBe('kill-claim');
   });
 });

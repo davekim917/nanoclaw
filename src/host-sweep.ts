@@ -43,7 +43,12 @@ import {
 } from './db/session-db.js';
 import { log } from './log.js';
 import { openInboundDb, openOutboundDb, inboundDbPath, heartbeatPath } from './session-manager.js';
-import { isContainerRunning, killContainer, wakeContainer } from './container-runner.js';
+import {
+  getContainerSpawnedAt,
+  isContainerRunning,
+  killContainer,
+  wakeContainer,
+} from './container-runner.js';
 import type { Session } from './types.js';
 
 const SWEEP_INTERVAL_MS = 60_000;
@@ -54,6 +59,14 @@ export const ABSOLUTE_CEILING_MS = 30 * 60 * 1000;
 // Stuck tolerance window applied per 'processing' claim — "did we see any
 // signs of life since this message was claimed?"
 export const CLAIM_STUCK_MS = 60 * 1000;
+// Grace window after a fresh spawn during which the SLA enforcer ignores
+// pre-existing claims (claims made before this container started). Lets
+// the new container's startup hook in agent-runner clean its own orphan
+// processing_ack rows. Without this, a session whose previous container
+// crashed mid-task gets stuck in a wake → kill loop forever — the new
+// container is killed within ms of spawn for a 4-day-old claim it hadn't
+// had a chance to clear.
+export const SPAWN_GRACE_MS = 60 * 1000;
 const MAX_TRIES = 5;
 const BACKOFF_BASE_MS = 5000;
 
@@ -72,8 +85,14 @@ export function decideStuckAction(args: {
   heartbeatMtimeMs: number; // 0 when heartbeat file absent
   containerState: ContainerState | null;
   claims: Array<{ message_id: string; status_changed: string }>;
+  // Wall-clock when the host spawned the current container. Optional;
+  // omit (or pass 0) to disable the grace check. Used to gate the
+  // kill-claim path so a fresh container has SPAWN_GRACE_MS to clean its
+  // own pre-existing claims before being killed for them.
+  spawnedAtMs?: number;
 }): StuckDecision {
   const { now, heartbeatMtimeMs, containerState, claims } = args;
+  const spawnedAtMs = args.spawnedAtMs ?? 0;
   const declaredBashMs = bashTimeoutMs(containerState);
 
   // Ceiling check only applies when we have an actual heartbeat timestamp.
@@ -93,12 +112,17 @@ export function decideStuckAction(args: {
   }
 
   const tolerance = Math.max(CLAIM_STUCK_MS, declaredBashMs ?? 0);
+  // True only for claims this container could have produced itself; older
+  // claims are leftovers from a prior crashed container and the fresh one
+  // gets SPAWN_GRACE_MS to clean them on startup before we kill for them.
+  const inGrace = spawnedAtMs > 0 && now - spawnedAtMs < SPAWN_GRACE_MS;
   for (const claim of claims) {
     const claimedAt = Date.parse(claim.status_changed);
     if (Number.isNaN(claimedAt)) continue;
     const claimAge = now - claimedAt;
     if (claimAge <= tolerance) continue;
     if (heartbeatMtimeMs > claimedAt) continue;
+    if (inGrace && claimedAt < spawnedAtMs) continue;
     return { action: 'kill-claim', messageId: claim.message_id, claimAgeMs: claimAge, toleranceMs: tolerance };
   }
 
@@ -230,6 +254,7 @@ function enforceRunningContainerSla(
     heartbeatMtimeMs: heartbeatMtimeMs(agentGroupId, session.id),
     containerState: getContainerState(outDb),
     claims: getProcessingClaims(outDb),
+    spawnedAtMs: getContainerSpawnedAt(session.id),
   });
 
   if (decision.action === 'ok') return;

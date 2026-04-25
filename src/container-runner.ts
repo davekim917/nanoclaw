@@ -69,7 +69,17 @@ const DEFAULT_HAIKU_MODEL = 'claude-haiku-4-5-20251001';
 const DEFAULT_EFFORT = 'high';
 
 /** Active containers tracked by session ID. */
-const activeContainers = new Map<string, { process: ChildProcess; containerName: string }>();
+const activeContainers = new Map<string, { process: ChildProcess; containerName: string; spawnedAt: number }>();
+
+/**
+ * Wall-clock time the host spawned the container for this session, or 0 if
+ * no container is tracked. Read by the host-sweep stuck-claim guard so a
+ * fresh container gets a grace window to clear its own pre-existing
+ * processing_ack rows before the SLA enforcer kills it.
+ */
+export function getContainerSpawnedAt(sessionId: string): number {
+  return activeContainers.get(sessionId)?.spawnedAt ?? 0;
+}
 
 /**
  * In-flight wake promises, keyed by session id. Deduplicates concurrent
@@ -193,7 +203,7 @@ async function spawnContainer(session: Session): Promise<void> {
 
   const container = spawn(CONTAINER_RUNTIME_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
-  activeContainers.set(session.id, { process: container, containerName });
+  activeContainers.set(session.id, { process: container, containerName, spawnedAt: Date.now() });
   markContainerRunning(session.id);
 
   // Log stderr
@@ -1213,14 +1223,12 @@ async function buildContainerArgs(
   // ANTHROPIC_DEFAULT_<FAMILY>_MODEL is the SDK's alias resolver
   // short-circuit: whatever string is in that env var gets sent to the
   // API verbatim when the agent or a subagent uses the bare alias.
-  const defaultOpusModel =
-    channelDefaults?.channelDefaultModel ?? containerConfig.defaultModel ?? DEFAULT_OPUS_MODEL;
+  const defaultOpusModel = channelDefaults?.channelDefaultModel ?? containerConfig.defaultModel ?? DEFAULT_OPUS_MODEL;
   args.push('-e', `ANTHROPIC_DEFAULT_OPUS_MODEL=${defaultOpusModel}`);
   args.push('-e', `ANTHROPIC_DEFAULT_SONNET_MODEL=${DEFAULT_SONNET_MODEL}`);
   args.push('-e', `ANTHROPIC_DEFAULT_HAIKU_MODEL=${DEFAULT_HAIKU_MODEL}`);
 
-  const defaultEffort =
-    channelDefaults?.channelDefaultEffort ?? containerConfig.defaultEffort ?? DEFAULT_EFFORT;
+  const defaultEffort = channelDefaults?.channelDefaultEffort ?? containerConfig.defaultEffort ?? DEFAULT_EFFORT;
   args.push('-e', `NANOCLAW_DEFAULT_EFFORT=${defaultEffort}`);
 
   // Per-channel default tone profile — ports v1's "always-on tone" feature.
