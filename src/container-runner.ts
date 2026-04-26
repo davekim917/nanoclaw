@@ -424,6 +424,11 @@ const SCOPED_CREDENTIAL_VARS = [
   'BROWSER_AUTH_URL',
   'BROWSER_AUTH_EMAIL',
   'BROWSER_AUTH_PASSWORD',
+  // Supabase CLI: project ref + DB password for `supabase link`, access token
+  // for management API (`supabase projects list`, etc.).
+  'SUPABASE_PROJECT_REF',
+  'SUPABASE_ACCESS_TOKEN',
+  'SUPABASE_DB_PASSWORD',
 ];
 
 /**
@@ -635,9 +640,19 @@ function buildMounts(
     }
 
     if (!excluded.has('codex') && entries.includes('codex')) {
-      const hostCodex = path.join(os.homedir(), '.codex');
-      if (fs.existsSync(hostCodex)) {
-        mounts.push({ hostPath: hostCodex, containerPath: '/home/node/.codex', readonly: false });
+      // Skip if the active provider's container-config already mounts
+      // /home/node/.codex (e.g., the codex agent provider mounts a per-session
+      // copy of auth.json). Otherwise Docker errors with "Duplicate mount
+      // point: /home/node/.codex" and the container fails to start with
+      // exit code 125.
+      const providerHasCodexMount = providerContribution.mounts?.some(
+        (m) => m.containerPath === '/home/node/.codex',
+      );
+      if (!providerHasCodexMount) {
+        const hostCodex = path.join(os.homedir(), '.codex');
+        if (fs.existsSync(hostCodex)) {
+          mounts.push({ hostPath: hostCodex, containerPath: '/home/node/.codex', readonly: false });
+        }
       }
     }
   }
