@@ -645,9 +645,7 @@ function buildMounts(
       // copy of auth.json). Otherwise Docker errors with "Duplicate mount
       // point: /home/node/.codex" and the container fails to start with
       // exit code 125.
-      const providerHasCodexMount = providerContribution.mounts?.some(
-        (m) => m.containerPath === '/home/node/.codex',
-      );
+      const providerHasCodexMount = providerContribution.mounts?.some((m) => m.containerPath === '/home/node/.codex');
       if (!providerHasCodexMount) {
         const hostCodex = path.join(os.homedir(), '.codex');
         if (fs.existsSync(hostCodex)) {

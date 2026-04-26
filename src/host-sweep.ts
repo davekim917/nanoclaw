@@ -43,12 +43,7 @@ import {
 } from './db/session-db.js';
 import { log } from './log.js';
 import { openInboundDb, openOutboundDb, inboundDbPath, heartbeatPath } from './session-manager.js';
-import {
-  getContainerSpawnedAt,
-  isContainerRunning,
-  killContainer,
-  wakeContainer,
-} from './container-runner.js';
+import { getContainerSpawnedAt, isContainerRunning, killContainer, wakeContainer } from './container-runner.js';
 import type { Session } from './types.js';
 
 const SWEEP_INTERVAL_MS = 60_000;
