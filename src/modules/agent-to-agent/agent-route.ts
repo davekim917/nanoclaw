@@ -44,7 +44,24 @@ export async function routeAgentMessage(msg: RoutableAgentMessage, session: Sess
   if (!getAgentGroup(targetAgentGroupId)) {
     throw new Error(`target agent group ${targetAgentGroupId} not found for message ${msg.id}`);
   }
-  const { session: targetSession } = resolveSession(targetAgentGroupId, null, null, 'agent-shared');
+  // Inherit the calling agent's threading context so cross-agent sessions
+  // are scoped per-thread (when the caller is per-thread) instead of
+  // collapsed to a single session per target agent. Memory and workspace
+  // remain shared at the agent level — only the conversation history is
+  // partitioned per-thread, matching how the user-facing channel agents
+  // behave by default. When the caller has no mg context (caller is itself
+  // in agent-shared mode), fall back to agent-shared on the target so we
+  // still find/reuse the existing session instead of leaking a fresh one
+  // per call.
+  const callerMgId = session.messaging_group_id;
+  const callerThreadId = session.thread_id;
+  const targetMode: 'per-thread' | 'agent-shared' = callerMgId ? 'per-thread' : 'agent-shared';
+  const { session: targetSession } = resolveSession(
+    targetAgentGroupId,
+    callerMgId,
+    callerThreadId,
+    targetMode,
+  );
   writeSessionMessage(targetAgentGroupId, targetSession.id, {
     id: `a2a-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     kind: 'chat',
