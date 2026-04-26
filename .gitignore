@@ -44,6 +44,9 @@ agents-sdk-docs
 # Runtime lock files
 .claude/scheduled_tasks.lock
 
+# Skill scratch dir (drift sots/targets, /team-* working files, etc.) — pure transient state
+.claude/tmp/
+
 # Local env backups
 .env.pre-*
 .env.bak*
