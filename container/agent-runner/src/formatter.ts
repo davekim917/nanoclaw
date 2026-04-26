@@ -1,3 +1,4 @@
+import { getSessionRouting } from './db/session-routing.js';
 import { findByRouting } from './destinations.js';
 import type { MessageInRow } from './db/messages-in.js';
 import { TIMEZONE, formatLocalTime } from './timezone.js';
@@ -90,14 +91,24 @@ export interface RoutingContext {
 
 /**
  * Extract routing context from a batch of messages.
- * Uses the first message's routing fields.
+ * Uses the first message's routing fields, with fallback to the session's
+ * default routing (`session_routing` table written by the host on each
+ * wake) for any missing field.
+ *
+ * Why the fallback matters: agent-to-agent inbounds (channel_type='agent')
+ * carry no thread_id — the agent-route module writes them with thread_id=null
+ * because the message is conceptually from another agent, not from a Slack
+ * thread. Without the fallback, when an agent wakes purely on an a-to-a
+ * inbound and replies to its origin channel, outbound thread_id is null
+ * and the reply lands in the channel root instead of the originating thread.
  */
 export function extractRouting(messages: MessageInRow[]): RoutingContext {
   const first = messages[0];
+  const sessionRouting = getSessionRouting();
   return {
-    platformId: first?.platform_id ?? null,
-    channelType: first?.channel_type ?? null,
-    threadId: first?.thread_id ?? null,
+    platformId: first?.platform_id ?? sessionRouting.platform_id ?? null,
+    channelType: first?.channel_type ?? sessionRouting.channel_type ?? null,
+    threadId: first?.thread_id ?? sessionRouting.thread_id ?? null,
     inReplyTo: first?.id ?? null,
   };
 }
