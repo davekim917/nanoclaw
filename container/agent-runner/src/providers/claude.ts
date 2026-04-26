@@ -441,17 +441,36 @@ function createBlockSnowflakeConnectorHook(): HookCallback {
 }
 
 // ── Email gate ──
-// Intercept `gws gmail +send|reply|reply-all|forward` and require admin
-// approval before the command runs. Scheduled-task contexts bypass
-// (automated email workflows shouldn't prompt every time). --dry-run /
-// --draft also bypass since nothing actually sends.
+// Intercept agent-initiated outbound Gmail sends and require admin approval
+// before the command runs. Two surfaces matter, both via the gws CLI:
+//   1. Helper verbs:   gws gmail +send | +reply | +reply-all | +forward
+//   2. Raw API form:   gws gmail users (messages|drafts) send …
+// The raw form takes the same code path as the helper verbs and produces an
+// identical send — an earlier version of this hook only matched (1), and an
+// agent reaching for the raw API surface bypassed the gate entirely.
+//
+// Drafts are intentionally NOT gated when only being created
+// (`gws gmail users drafts create`) — drafts never deliver until separately
+// sent. The helper-verb `--draft` flag and `--dry-run` likewise bypass.
+//
+// Out of scope (cannot be caught at this layer reliably):
+//   • Direct REST calls (curl/wget to gmail.googleapis.com).
+//   • Python/Node SDK calls (`users.messages().send()`, nodemailer, etc.).
+//   • SMTP CLIs (sendmail, swaks, msmtp) — none ship in the container image,
+//     and `install_packages` is itself admin-gated.
+//   • eval / alias / variable-indirection / base64-decoded subshells.
+// The only sound place to catch all of those is the egress proxy. OneCLI
+// 1.x's gateway only supports `block`/`rate_limit` rule actions today; when
+// it grows an `approve` action this hook should become a UX-fast-path on top
+// of the gateway rule rather than the source of truth.
 //
 // Approval round-trip uses the existing send_file delivery-ack surface:
 // write a system action with action='request_bash_gate' to outbound.db;
 // host's bash-gate module calls requestApproval and writes the decision
 // back to inbound.db's `delivered` table; we poll it via
 // awaitDeliveryAck. Up to 60 minutes (must match host-side BASH_GATE_TIMEOUT_MS).
-const GWS_EMAIL_SEND_RE = /\bgws\s+gmail\s+\+(?:send|reply|reply-all|forward)\b/;
+export const GWS_EMAIL_SEND_RE =
+  /\bgws\s+gmail\s+(?:\+(?:send|reply|reply-all|forward)|users\s+(?:messages|drafts)\s+send)\b/;
 // `(?:\s|$)` anchor prevents `--dry-run=false` from matching. The prior
 // `\b` alone was satisfied by `=`, which turned the guard into a trivial
 // bypass: `gws gmail +send --dry-run=false --to attacker@…` skipped the
@@ -461,6 +480,55 @@ const GWS_EMAIL_SEND_RE = /\bgws\s+gmail\s+\+(?:send|reply|reply-all|forward)\b/
 // CLI manpage. Without this bypass every agent exploration of the gws
 // gmail surface ("gws gmail +send --help") lights up an approval card.
 const EMAIL_BYPASS_RE = /\s(?:--(?:dry-run|draft|help)|-h)(?:\s|$)/;
+
+/**
+ * Decode the RFC 822 envelope from `--json '{"raw":"<base64url>"}'` so the
+ * approval card shows real recipient/subject when the agent uses the raw API
+ * form. Returns {} on any failure — caller falls back to "unknown recipient".
+ */
+export function envelopeFromJsonRaw(segment: string): {
+  to?: string;
+  from?: string;
+  subject?: string;
+  cc?: string;
+  bcc?: string;
+} {
+  const m = segment.match(/--json\s+(['"])((?:(?!\1).)*)\1/);
+  if (!m) return {};
+  let payload: unknown;
+  try {
+    payload = JSON.parse(m[2]);
+  } catch {
+    return {};
+  }
+  const raw =
+    (payload as { raw?: unknown })?.raw ??
+    (payload as { message?: { raw?: unknown } })?.message?.raw;
+  if (typeof raw !== 'string') return {};
+  let decoded: string;
+  try {
+    let b = raw.replace(/-/g, '+').replace(/_/g, '/');
+    while (b.length % 4) b += '=';
+    decoded = Buffer.from(b, 'base64').toString('utf-8');
+  } catch {
+    return {};
+  }
+  const blankIdx = decoded.search(/\r?\n\r?\n/);
+  const headerBlock = blankIdx === -1 ? decoded : decoded.slice(0, blankIdx);
+  const unfolded = headerBlock.replace(/\r?\n[ \t]+/g, ' ');
+  const out: { to?: string; from?: string; subject?: string; cc?: string; bcc?: string } = {};
+  for (const line of unfolded.split(/\r?\n/)) {
+    const hm = line.match(/^([A-Za-z-]+)\s*:\s*(.+)$/);
+    if (!hm) continue;
+    const k = hm[1].toLowerCase();
+    if (k === 'to') out.to = hm[2].trim();
+    else if (k === 'from') out.from = hm[2].trim();
+    else if (k === 'subject') out.subject = hm[2].trim();
+    else if (k === 'cc') out.cc = hm[2].trim();
+    else if (k === 'bcc') out.bcc = hm[2].trim();
+  }
+  return out;
+}
 
 function createEmailGateHook(): HookCallback {
   return async (input) => {
@@ -481,18 +549,21 @@ function createEmailGateHook(): HookCallback {
 
     // Parse the email envelope so the card shows structured fields
     // instead of raw shell. Each matcher handles both --flag 'quoted'
-    // and --flag unquoted.
+    // and --flag unquoted. Helper-verb sends carry envelope as flags;
+    // raw-API sends carry it as base64url RFC 822 inside `--json '{"raw":…}'`.
     const matchFlag = (flag: string): string | undefined => {
       const quoted = gwsSegment.match(new RegExp(`${flag}\\s+['"]([^'"]+)['"]`));
       if (quoted) return quoted[1];
       const bare = gwsSegment.match(new RegExp(`${flag}\\s+(\\S+)`));
       return bare?.[1];
     };
-    const to = matchFlag('--to') ?? 'unknown recipient';
-    const subject = matchFlag('--subject') ?? '';
+    const flagTo = matchFlag('--to');
+    const env = !flagTo ? envelopeFromJsonRaw(gwsSegment) : {};
+    const to = flagTo ?? env.to ?? 'unknown recipient';
+    const subject = matchFlag('--subject') ?? env.subject ?? '';
     const body = matchFlag('--body') ?? '';
-    const cc = matchFlag('--cc');
-    const bcc = matchFlag('--bcc');
+    const cc = matchFlag('--cc') ?? env.cc;
+    const bcc = matchFlag('--bcc') ?? env.bcc;
     const isHtml = /\s--html(?:\s|$)/.test(gwsSegment);
     // Parse the sending identity from GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE.
     // Path convention: /home/node/.config/gws/accounts/<slug>.json.
@@ -501,7 +572,10 @@ function createEmailGateHook(): HookCallback {
       /GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=\S*?\/accounts\/([\w.-]+)\.json/,
     );
     const fromAccount = credsMatch?.[1] ?? 'default';
-    const action = command.match(/\+(\w[\w-]*)/)?.[1] ?? 'send';
+    // Anchor to the four allowed helper verbs only — the prior `\+(\w[\w-]*)`
+    // could capture spurious `+ABC` substrings from a base64 payload in the
+    // raw-API form. Falls back to "send" for the raw form (which has no +verb).
+    const action = gwsSegment.match(/\+(send|reply|reply-all|forward)\b/)?.[1] ?? 'send';
     const label = subject ? `Email ${action} to ${to}: "${subject}"` : `Email ${action} to ${to}`;
 
     // No `command` field on the payload → host's buildCardBody skips
