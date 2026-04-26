@@ -9,6 +9,12 @@
  * (see mcp-tools/index.ts). The host re-checks permission on receive.
  */
 import { writeMessageOut } from '../db/messages-out.js';
+// Side-effect import: the MCP server runs as a separate subprocess
+// (see container-runner.ts mcp-config "nanoclaw" entry). Without this,
+// the provider registry stays empty in this process and explicit
+// `provider:` calls fail with "not registered" even when the main
+// agent-runner process sees them fine.
+import '../providers/index.js';
 import { listProviderNames, validateProviderConfig } from '../providers/provider-registry.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
