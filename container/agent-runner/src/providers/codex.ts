@@ -307,8 +307,22 @@ async function* runOneTurn(
         break;
       }
       case 'thread/status/changed': {
-        const status = params.status as string | undefined;
-        if (status) buffer.push({ type: 'progress', message: `status: ${status}` });
+        // Codex's thread/status/changed payload shape varies by app-server
+        // version. Some versions emit params.status as a plain string;
+        // others emit a structured object (e.g. { state: 'thinking',
+        // detail: '...' }). Extract the most useful human-readable label;
+        // never let template coercion produce "[object Object]".
+        const raw = params.status;
+        let label: string | null = null;
+        if (typeof raw === 'string') {
+          label = raw;
+        } else if (raw && typeof raw === 'object') {
+          const obj = raw as Record<string, unknown>;
+          const candidate =
+            obj.label ?? obj.state ?? obj.status ?? obj.kind ?? obj.type ?? obj.message ?? obj.text;
+          label = typeof candidate === 'string' ? candidate : JSON.stringify(raw);
+        }
+        if (label) buffer.push({ type: 'progress', message: `status: ${label}` });
         break;
       }
       default:
