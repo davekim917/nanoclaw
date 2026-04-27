@@ -29,6 +29,7 @@ import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
 import { initGroupFilesystem } from './group-init.js';
+import { applyMnemonMounts, applyMnemonEnv } from './modules/mnemon/index.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
@@ -591,6 +592,9 @@ function buildMounts(
     const validated = validateAdditionalMounts(containerConfig.additionalMounts, agentGroup.name);
     mounts.push(...validated);
   }
+
+  // Mnemon data dir + rollout state (no-op when mnemon not enabled for this group)
+  applyMnemonMounts({ mounts, agentGroup, containerConfig });
 
   // Built-in nanoclaw-hooks plugin: project-relative, always mounted.
   // Provides the GitNexus repo-readiness guard (PreToolUse) and the
@@ -1355,6 +1359,10 @@ async function buildContainerArgs(
   if (containerConfig.ollamaAdminTools) {
     args.push('-e', 'OLLAMA_ADMIN_TOOLS=true');
   }
+
+  // Mnemon env vars: MNEMON_STORE, MNEMON_EMBED_ENDPOINT, MNEMON_EMBED_MODEL
+  // (no-op when mnemon not enabled for this group)
+  applyMnemonEnv({ args, agentGroup, containerConfig });
 
   // Provider-contributed env vars (e.g. XDG_DATA_HOME, OPENCODE_*, NO_PROXY).
   if (providerContribution.env) {

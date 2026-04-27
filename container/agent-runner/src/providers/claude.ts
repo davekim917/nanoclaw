@@ -15,6 +15,8 @@ import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/conn
 import { registerProvider, registerProviderConfigSchema } from './provider-registry.js';
 import type { AgentProvider, AgentQuery, McpServerConfig, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
 import { autoCommitDirtyWorktrees } from '../worktree-autosave.js';
+import { createMnemonPrimeHook, createMnemonRemindHook, createMnemonNudgeHook } from '../modules/mnemon/hooks.js';
+import { createBlockMnemonRealHook } from '../modules/mnemon/block-mnemon-real-hook.js';
 
 // Per D9 / D7 / A6: 5-value enum matching EffortLevel at
 // node_modules/@anthropic-ai/claude-agent-sdk/sdk.d.ts:462
@@ -803,6 +805,8 @@ export class ClaudeProvider implements AgentProvider {
   private fallbackOauth: Array<{ name: string; value: string }>;
   private nextOauthFallback = 0;
 
+  private mnemonStore: string | undefined;
+
   constructor(options: ProviderOptions = {}) {
     this.assistantName = options.assistantName;
     this.mcpServers = options.mcpServers ?? {};
@@ -831,6 +835,7 @@ export class ClaudeProvider implements AgentProvider {
     if (this.fallbackOauth.length > 0) {
       log(`Loaded ${this.fallbackOauth.length} CLAUDE_CODE_OAUTH_TOKEN fallback(s): ${this.fallbackOauth.map((k) => k.name).join(', ')}`);
     }
+    this.mnemonStore = process.env.MNEMON_STORE; // undefined when mnemon disabled for this group
   }
 
   isSessionInvalid(err: unknown): boolean {
@@ -957,12 +962,20 @@ export class ClaudeProvider implements AgentProvider {
                 createBlockSnowflakeConnectorHook(),
                 createBlockGitCloneHook(),
                 createEmailGateHook(),
+                // cycle 3 F5 — deny direct mnemon-real invocation
+                ...(this.mnemonStore ? [createBlockMnemonRealHook()] : []),
               ],
             },
           ],
           PostToolUse: [{ hooks: [postToolUseHook] }],
           PostToolUseFailure: [{ hooks: [postToolUseHook] }],
           PreCompact: [{ hooks: [createPreCompactHook(this.assistantName)] }],
+          // mnemon hooks — only attached when MNEMON_STORE env is set
+          ...(this.mnemonStore ? {
+            SessionStart: [{ hooks: [createMnemonPrimeHook(this.mnemonStore)] }],
+            UserPromptSubmit: [{ hooks: [createMnemonRemindHook(this.mnemonStore)] }],
+            Stop: [{ hooks: [createMnemonNudgeHook(this.mnemonStore)] }],
+          } : {}),
         },
       },
     });

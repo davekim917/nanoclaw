@@ -54,6 +54,11 @@ export interface AdditionalMountConfig {
   readonly?: boolean;
 }
 
+export interface MnemonConfig {
+  enabled: boolean;
+  embeddings: boolean;
+}
+
 export interface ContainerConfig {
   mcpServers: Record<string, McpServerConfig>;
   packages: { apt: string[]; npm: string[] };
@@ -160,6 +165,15 @@ export interface ContainerConfig {
    * See decision D4 / D11 in .context/specs/create-agent-provider/decisions.yaml.
    */
   providerConfig?: Record<string, unknown>;
+
+  /**
+   * Mnemon persistent-memory integration. When enabled, the host mounts
+   * ~/.mnemon RW into the container, sets MNEMON_STORE env, and the
+   * container hooks (SessionStart/UserPromptSubmit/Stop) become active.
+   * embeddings: when true, also passes MNEMON_EMBED_ENDPOINT/MODEL env
+   * for hybrid recall (BM25 + vector + graph) via host Ollama.
+   */
+  mnemon?: MnemonConfig;
 }
 
 function emptyConfig(): ContainerConfig {
@@ -210,6 +224,7 @@ export function readContainerConfig(folder: string): ContainerConfig {
       tone: raw.tone,
       tools: raw.tools,
       providerConfig: raw.providerConfig,
+      mnemon: raw.mnemon,
     };
   } catch (err) {
     console.error(`[container-config] failed to parse ${p}: ${String(err)}`);

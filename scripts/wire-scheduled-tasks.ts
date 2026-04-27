@@ -2,37 +2,22 @@
  * Migrate V1 scheduled tasks to V2.
  *
  * V2 stores tasks as rows in per-session inbound.db (messages_in, kind='task').
- * Tasks are scoped to a specific agent group + messaging group. Each task needs:
- *   - A session in central v2.db that matches the agent_group + Discord main channel
- *   - The task row inserted into that session's inbound.db
- *
- * For groups with no Discord main session yet, we create one (the session will
- * be created on demand when the first task fires via host-sweep → wake).
+ * Tasks are routed through the scheduleTask API which resolves sessions by
+ * agent_group_id only (no messaging-group filter).
  *
  * System tasks (__daily_summary, __commit_digest, __plugin_updater) are skipped —
  * v2 handles these natively.
  */
 import path from 'path';
 import { fileURLToPath } from 'url';
-import Database from 'better-sqlite3';
-import { initDb, getDb } from '../src/db/connection.js';
-import { createSession } from '../src/db/sessions.js';
+import { initDb } from '../src/db/connection.js';
+import { scheduleTask } from '../src/db/scheduled-tasks.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PROJECT_ROOT = path.join(__dirname, '..');
-const DATA_DIR = path.join(PROJECT_ROOT, 'data');
-const SESSIONS_DIR = path.join(DATA_DIR, 'v2-sessions');
+const DB_PATH = path.join(PROJECT_ROOT, 'data', 'v2.db');
 
-function now(): string {
-  return new Date().toISOString();
-}
-
-function generateId(prefix: string): string {
-  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
-}
-
-// Agent group → Discord main messaging group mapping
-const DISCORD_MAIN_MG = 'mg-1776404343731-7041k0';
+// Historical V1 platform context — kept for reference but not passed to scheduleTask.
 const DISCORD_MAIN_PLATFORM_ID = 'discord:1479489865702703155:1479489866193571902';
 
 interface V1Task {
@@ -267,6 +252,7 @@ Check the latest available version:
   - RENDER_VERSION → render-oss/cli
   - RAILWAY_VERSION → railwayapp/cli
   - SUPABASE_VERSION → supabase/cli
+  - MNEMON_VERSION → mnemon-dev/mnemon
 - SNOW_VERSION: check https://sfc-repo.snowflakecomputing.com/snowflake-cli/linux_aarch64/index.html for the latest version listed
 
 ## Part 2 — Upstream-synced file drift (verbatim copies in bootstrap-workflow)
@@ -277,6 +263,10 @@ For each row in that table, check the latest upstream SHA touching that path:
   gh api "repos/openai/codex-plugin-cc/commits?path=<upstream-path>&per_page=1" --jq ".[0].sha[0:7]"
 
 Compare against the pinned SHA in the table. If different, the file has drifted.
+
+## Part 3 — Schema migration verification (if MNEMON_VERSION bumps)
+
+Spin up a temp copy of one enabled mnemon store's DB against the new binary, run \`mnemon status --store <store>\` as a smoke query. If it errors with schema incompatibility, ABORT the bump and report the diagnostic. Gate the PR on this check.
 
 ## Reporting
 
@@ -452,192 +442,54 @@ Always send a message with the result so Dave knows the review happened.`,
   },
 ];
 
-// ── Helpers ────────────────────────────────────────────────────────────────
+const TASK_HOST_DEPS_UPDATES_PROMPT = `
+Check host-side dependencies (Ollama + nomic-embed-text model digest).
 
-function openInboundDb(sessDir: string): Database.Database {
-  const db = new Database(path.join(sessDir, 'inbound.db'));
-  db.pragma('journal_mode = DELETE');
-  return db;
-}
-
-function nextEvenSeq(db: Database.Database): number {
-  const row = db.prepare('SELECT COALESCE(MAX(seq), 0) as maxSeq FROM messages_in').get() as { maxSeq: number };
-  let seq = row.maxSeq + 2;
-  // Ensure even
-  if (seq % 2 !== 0) seq++;
-  return seq;
-}
-
-function insertTask(
-  db: Database.Database,
-  task: V1Task,
-  sessionId: string,
-): void {
-  db.prepare(
-    `INSERT INTO messages_in (id, seq, timestamp, status, tries, process_after, recurrence, kind, platform_id, channel_type, thread_id, content, series_id)
-     VALUES (?, ?, datetime('now'), 'pending', 0, ?, ?, 'task', ?, ?, NULL, ?, ?)`,
-  ).run(
-    task.id,
-    nextEvenSeq(db),
-    task.processAfter,
-    task.cron,
-    task.platformId,
-    task.channelType,
-    JSON.stringify({ prompt: task.prompt, script: task.script ?? null }),
-    task.seriesId,
-  );
-}
-
-function createSessionRow(agentGroupId: string, sessionId: string): void {
-  const db = getDb();
-  db.prepare(
-    `INSERT OR IGNORE INTO sessions (id, agent_group_id, messaging_group_id, thread_id, agent_provider, status, container_status, last_active, created_at)
-     VALUES (?, ?, ?, NULL, NULL, 'active', 'stopped', ?, ?)`,
-  ).run(sessionId, agentGroupId, DISCORD_MAIN_MG, now(), now());
-}
-
-function createSessionDir(agentGroupId: string, sessionId: string): string {
-  const sessDir = path.join(SESSIONS_DIR, agentGroupId, sessionId);
-  fs.mkdirSync(sessDir, { recursive: true });
-
-  // Create inbound.db with schema
-  const inboundDb = openInboundDb(sessDir);
-  inboundDb.exec(`
-    CREATE TABLE IF NOT EXISTS messages_in (
-      id             TEXT PRIMARY KEY,
-      seq            INTEGER UNIQUE,
-      kind           TEXT NOT NULL,
-      timestamp      TEXT NOT NULL,
-      status         TEXT NOT NULL,
-      status_changed TEXT,
-      process_after  TEXT,
-      recurrence     TEXT,
-      tries          INTEGER NOT NULL DEFAULT 0,
-      platform_id    TEXT,
-      channel_type   TEXT,
-      thread_id      TEXT,
-      content        TEXT NOT NULL,
-      series_id      TEXT
-    );
-    CREATE TABLE IF NOT EXISTS session_routing (
-      id INTEGER PRIMARY KEY CHECK (id = 1),
-      channel_type TEXT,
-      platform_id  TEXT,
-      thread_id    TEXT
-    );
-  `);
-  inboundDb.close();
-
-  // Write session routing for this Discord main channel
-  const routingDb = new Database(path.join(sessDir, 'routing.db'));
-  routingDb.pragma('journal_mode = DELETE');
-  routingDb.exec(`
-    CREATE TABLE IF NOT EXISTS routing (
-      id INTEGER PRIMARY KEY CHECK (id = 1),
-      channel_type TEXT,
-      platform_id  TEXT,
-      thread_id    TEXT
-    );
-    INSERT OR REPLACE INTO routing (id, channel_type, platform_id, thread_id) VALUES (1, 'discord', '${DISCORD_MAIN_PLATFORM_ID}', NULL);
-  `);
-  routingDb.close();
-
-  // Create empty outbound.db
-  const outboundDb = new Database(path.join(sessDir, 'outbound.db'));
-  outboundDb.pragma('journal_mode = DELETE');
-  outboundDb.exec(`
-    CREATE TABLE IF NOT EXISTS messages_out (
-      id             TEXT PRIMARY KEY,
-      in_reply_to    TEXT,
-      timestamp      TEXT NOT NULL,
-      delivered      INTEGER NOT NULL DEFAULT 0,
-      deliver_after  TEXT,
-      recurrence     TEXT,
-      kind           TEXT NOT NULL,
-      platform_id    TEXT,
-      channel_type   TEXT,
-      thread_id      TEXT,
-      content        TEXT NOT NULL
-    );
-  `);
-  outboundDb.close();
-
-  console.log(`  [session] created: ${sessDir}`);
-  return sessDir;
-}
-
-function findExistingSession(agentGroupId: string): string | null {
-  const db = getDb();
-  const row = db.prepare(
-    "SELECT id FROM sessions WHERE agent_group_id = ? AND messaging_group_id = ? AND status = 'active' LIMIT 1"
-  ).get(agentGroupId, DISCORD_MAIN_MG) as { id: string } | undefined;
-  return row?.id ?? null;
-}
-
-function sessionDirExists(agentGroupId: string, sessionId: string): boolean {
-  return fs.existsSync(path.join(SESSIONS_DIR, agentGroupId, sessionId, 'inbound.db'));
-}
-
-import fs from 'fs';
+1. Run \`ollama --version\` and check against latest at https://ollama.com/download.
+2. Run \`ollama show nomic-embed-text --json | jq -r .digest\` and compare against latest at https://ollama.com/library/nomic-embed-text.
+3. Aggregate any unhealthy mnemon events from data/mnemon-health.json.
+4. If anything is outdated or unhealthy, send Dave a message listing what needs attention.
+5. If everything is up to date and healthy, say so in one line.
+`;
 
 // ── Main ──────────────────────────────────────────────────────────────────
 
 async function main() {
   console.log('\n=== V1 → V2 Scheduled Tasks Migration ===\n');
 
-  const dbPath = path.join(PROJECT_ROOT, 'data', 'v2.db');
-  initDb(dbPath);
+  initDb(DB_PATH);
   console.log('[db] central initialized\n');
 
-  // Group tasks by agent group
-  const byAgent = new Map<string, V1Task[]>();
+  let inserted = 0;
+  let skipped = 0;
+
   for (const task of TASKS) {
-    const existing = byAgent.get(task.agentGroupId) ?? [];
-    existing.push(task);
-    byAgent.set(task.agentGroupId, existing);
+    console.log(`  [task] scheduling: ${task.id} (cron: ${task.cron})`);
+    await scheduleTask({
+      id: task.id,
+      agentGroupId: task.agentGroupId,
+      cron: task.cron,
+      processAfter: task.processAfter,
+      seriesId: task.seriesId,
+      prompt: task.prompt,
+    });
+    console.log(`  [task] done: ${task.id}`);
+    inserted++;
   }
 
-  for (const [agentGroupId, tasks] of byAgent) {
-    console.log(`--- Agent group: ${agentGroupId} (${tasks.length} tasks) ---`);
+  // New: host-side dependency check task
+  await scheduleTask({
+    id: 'task-host-deps-updates',
+    agentGroupId: 'ag-1776402507183-cf39lq',
+    cron: '0 15 * * 1',
+    processAfter: '2026-04-27T19:00:00.000Z',
+    seriesId: 'task-host-deps-updates',
+    prompt: TASK_HOST_DEPS_UPDATES_PROMPT,
+  });
+  console.log('  [task] done: task-host-deps-updates');
+  inserted++;
 
-    // Find or create a Discord main session
-    let sessionId = findExistingSession(agentGroupId);
-    let sessDir: string;
-
-    if (sessionId && sessionDirExists(agentGroupId, sessionId)) {
-      console.log(`  [session] using existing: ${sessionId}`);
-      sessDir = path.join(SESSIONS_DIR, agentGroupId, sessionId);
-    } else {
-      sessionId = generateId('sess');
-      createSessionRow(agentGroupId, sessionId);
-      sessDir = createSessionDir(agentGroupId, sessionId);
-    }
-
-    const inboundDb = openInboundDb(sessDir);
-
-    // Check for existing tasks with same series_id to avoid duplicates
-    const existingSeries = new Set(
-      (inboundDb.prepare("SELECT series_id FROM messages_in WHERE kind = 'task'").all() as { series_id: string }[]).map(r => r.series_id)
-    );
-
-    let inserted = 0;
-    for (const task of tasks) {
-      if (existingSeries.has(task.seriesId)) {
-        console.log(`  [task] already exists: ${task.seriesId} — skipping`);
-        continue;
-      }
-      insertTask(inboundDb, task, sessionId!);
-      console.log(`  [task] inserted: ${task.id} (cron: ${task.cron})`);
-      inserted++;
-    }
-
-    inboundDb.close();
-    console.log(`  [done] ${inserted}/${tasks.length} tasks inserted\n`);
-  }
-
-  console.log('=== Migration Complete ===\n');
-  console.log('Note: processAfter dates are set to today (2026-04-21).');
-  console.log('The host sweep will fire these at the next cron interval.\n');
+  console.log(`\n=== Migration Complete — ${inserted} tasks scheduled, ${skipped} skipped ===\n`);
 }
 
 main().catch(console.error);
