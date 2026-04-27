@@ -56,12 +56,7 @@ export async function routeAgentMessage(msg: RoutableAgentMessage, session: Sess
   const callerMgId = session.messaging_group_id;
   const callerThreadId = session.thread_id;
   const targetMode: 'per-thread' | 'agent-shared' = callerMgId ? 'per-thread' : 'agent-shared';
-  const { session: targetSession } = resolveSession(
-    targetAgentGroupId,
-    callerMgId,
-    callerThreadId,
-    targetMode,
-  );
+  const { session: targetSession } = resolveSession(targetAgentGroupId, callerMgId, callerThreadId, targetMode);
   writeSessionMessage(targetAgentGroupId, targetSession.id, {
     id: `a2a-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     kind: 'chat',

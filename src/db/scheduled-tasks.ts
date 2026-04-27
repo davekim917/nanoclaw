@@ -41,10 +41,7 @@ function initStubSessionFolder(dataDir: string, agentGroupId: string, sessionId:
   ensureSchema(outboundPath, 'outbound');
 }
 
-async function resolveActiveSession(
-  agentGroupId: string,
-  dataDir: string,
-): Promise<{ id: string }> {
+async function resolveActiveSession(agentGroupId: string, dataDir: string): Promise<{ id: string }> {
   const existing = findSessionByAgentGroup(agentGroupId);
   if (existing) return { id: existing.id };
 
@@ -67,13 +64,7 @@ async function resolveActiveSession(
 export async function scheduleTask(def: TaskDef, _dataDir?: string): Promise<void> {
   const dataDir = _dataDir ?? DATA_DIR;
   const session = await resolveActiveSession(def.agentGroupId, dataDir);
-  const inboundDbPath = path.join(
-    dataDir,
-    'v2-sessions',
-    def.agentGroupId,
-    session.id,
-    'inbound.db',
-  );
+  const inboundDbPath = path.join(dataDir, 'v2-sessions', def.agentGroupId, session.id, 'inbound.db');
 
   const db = new Database(inboundDbPath);
   db.pragma('journal_mode = DELETE');

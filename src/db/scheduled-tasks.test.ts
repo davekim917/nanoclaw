@@ -214,7 +214,7 @@ describe('test_scheduleTask_does_not_resurrect_completed_row', () => {
 
     const db = openInboundDb(inboundPath());
     const rows = db
-      .prepare("SELECT id, status, process_after FROM messages_in WHERE series_id = ? ORDER BY status")
+      .prepare('SELECT id, status, process_after FROM messages_in WHERE series_id = ? ORDER BY status')
       .all('s-completed-history') as Array<{ id: string; status: string; process_after: string }>;
     db.close();
 
@@ -272,7 +272,7 @@ describe('test_scheduleTask_re_enable_after_cancel', () => {
 
     const db = openInboundDb(inboundPath());
     const rows = db
-      .prepare("SELECT id, status FROM messages_in WHERE series_id = ? ORDER BY status")
+      .prepare('SELECT id, status FROM messages_in WHERE series_id = ? ORDER BY status')
       .all('s-cancel-reenable') as Array<{ id: string; status: string }>;
     db.close();
 

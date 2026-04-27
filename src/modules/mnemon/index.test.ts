@@ -123,7 +123,9 @@ describe('ensureStore', () => {
     // First call succeeds; second call throws "store already exists" but ensureStore swallows it
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (mockExecFile as any)
-      .mockImplementationOnce((_cmd: any, _args: any, cb: any) => { cb(null, '', ''); })
+      .mockImplementationOnce((_cmd: any, _args: any, cb: any) => {
+        cb(null, '', '');
+      })
       .mockImplementationOnce((_cmd: any, _args: any, cb: any) => {
         cb(Object.assign(new Error('store already exists'), { code: 1 }), '', '');
       });
