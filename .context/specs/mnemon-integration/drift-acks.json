@@ -1,0 +1,12 @@
+{
+  "acknowledgments": [
+    {
+      "id": "B3",
+      "reason": "design.md's container module structure section lists `flock.ts` as a container-side module file, but cycle 2 MF8 superseded that approach by moving locking into the bash wrapper script (`container/mnemon-wrapper.sh`). The plan correctly omits `flock.ts` from the container module file list — locking is now wrapper-internal. The design's own module listing has stale residue from before MF8 and was not updated. The plan reflects the current architectural intent (D3 selected = wrapper-script flock); reverting the plan to add a `flock.ts` file would re-introduce the rejected hook-callback locking approach."
+    },
+    {
+      "id": "PB2",
+      "reason": "Phase2 (scripts/mnemon-phase2.ts:59) reads data/mnemon-metrics/stores/<store>.json (object with derived fields p95LatencyMs, dbSizeMb*, insightsCount), but the collector (scripts/mnemon-metrics-collector.ts:39) writes data/mnemon-metrics/stores/<store>.jsonl (append-only raw mnemon-status rows). Plan Task C5 was vague about the metrics format — builder-C and builder-D each filled the gap differently. This is a Phase 2 graduation tool used one week after Phase 1 deployment, not on the Phase 1 critical path. The 4 manual operator gates (recallSpotcheckPassed, visualReviewPassed, healthOk via mnemon-health.json which IS correctly wired, and the sanity-only insightsCount which doesn't block) are sufficient for an operator graduation decision; missing automated metric gates degrade gracefully to default 0 values that pass the thresholds. Track follow-up before Phase 2 graduation: implement collector → phase2 metric aggregation OR rewrite phase2 to aggregate from JSONL rows directly. Reverting either side to satisfy the gate would (a) require choosing one of two valid plan interpretations without spec clarity, and (b) block Phase 1 deployment for a week-out concern."
+    }
+  ]
+}

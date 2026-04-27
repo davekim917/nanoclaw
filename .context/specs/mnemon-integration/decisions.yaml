@@ -1,0 +1,601 @@
+feature: mnemon-integration
+created_by: /team-brief
+last_updated_by: /team-review (cycle 3 - final, 3 waivers)
+
+constraints:
+  - id: C1
+    type: HARD
+    text: "Hook delivery via SDK programmatic chain at container/agent-runner/src/providers/claude.ts:947. Do not use mnemon setup's settings.json patching."
+    source: brief
+    verified: true
+    affects_groups: []
+
+  - id: C2
+    type: HARD
+    text: "Mnemon binary baked into container image via ARG MNEMON_VERSION + per-arch SHA256 ARGs. Do not bind-mount the host binary."
+    source: brief
+    verified: true
+    affects_groups: []
+
+  - id: C3
+    type: HARD
+    text: "ContainerConfig zod schema must explicitly add the mnemon block; unknown keys silently drop on round-trip."
+    source: brief
+    verified: true
+    affects_groups: []
+
+  - id: C4
+    type: HARD
+    text: "Per-store isolation via MNEMON_STORE env var; no cross-group memory leakage."
+    source: brief
+    verified: true
+    affects_groups: []
+
+  - id: C5
+    type: HARD
+    text: "Module path is src/modules/mnemon/ matching src/modules/agent-to-agent/ convention."
+    source: brief
+    verified: true
+    affects_groups: []
+
+  - id: C6
+    type: HARD
+    text: "Rollout scripts in TypeScript (enable-mnemon.ts, disable-mnemon.ts) calling the same TS config-mutation path used by self-mod flows."
+    source: brief
+    verified: true
+    affects_groups: []
+
+  - id: C7
+    type: HARD
+    text: "Phase 1 = exactly one week of shadow mode before Phase 2 full enable. Phase 2 transition gated on the success criteria gates."
+    source: brief
+    verified: true
+    affects_groups: []
+
+  - id: C8
+    type: HARD
+    text: "No PreCompact integration in this scope. Mnemon v0.1.2 does not expose a Compact handler. Defer until upstream ships one."
+    source: brief
+    verified: true
+    affects_groups: []
+
+  - id: C9
+    type: HARD
+    text: "No fictional config fields. The mnemon block in container.json is exactly { enabled, embeddings }."
+    source: brief
+    verified: true
+    affects_groups: []
+
+  - id: C10
+    type: HARD
+    text: "Multi-arch SHA256 verification required in Dockerfile despite being stricter than RENDER/RAILWAY/SUPABASE precedent."
+    source: brief
+    verified: true
+    affects_groups: []
+
+  - id: C11
+    type: HARD
+    text: "Ollama runs on host (not in container, not as sidecar). Port 11434 firewalled to Docker bridge subnet."
+    source: brief
+    verified: true
+    affects_groups: []
+
+  - id: C12
+    type: HARD
+    text: "Wiki canonical role inverts when mnemon is enabled: sources -> mnemon -> wiki. Wiki becomes derived synthesis."
+    source: brief
+    verified: true
+    affects_groups: []
+
+  - id: C13
+    type: HARD
+    text: "Backup mechanism uses sqlite3 .backup or WAL-checkpoint-then-copy. Do not use bare rsync against live DB file."
+    source: brief
+    verified: true
+    affects_groups: []
+
+  - id: C14
+    type: HARD
+    text: "Schema migration verification on MNEMON_VERSION bump: spin up temp DB copy against new binary, run smoke query, gate bump on success."
+    source: brief
+    verified: true
+    affects_groups: []
+
+  - id: C15
+    type: HARD
+    text: "Day 1 deliverable: scripts/mnemon-restore.sh written and tested with verifiable restore output before Illysium goes live."
+    source: brief
+    verified: true
+    affects_groups: []
+
+  - id: C16
+    type: HARD
+    text: "Per-store flock serialization wraps mnemon writes (host-side) to mitigate SQLite multi-writer contention."
+    source: brief
+    verified: true
+    affects_groups: []
+
+  - id: C17
+    type: SOFT
+    text: "Ollama-down: degrade gracefully (skip vector signal), log WARN, surface in weekly task-host-deps-updates report. Never fail the agent's turn."
+    source: brief
+    verified: true
+    affects_groups: []
+
+  - id: C18
+    type: SOFT
+    text: "Default schedules: synthesise daily 03:00 ET, GC Sunday 04:00 ET, reconcile Sunday 05:00 ET. Operator can override per-group."
+    source: brief
+    verified: true
+    affects_groups: []
+
+  - id: C19
+    type: SOFT
+    text: "Backup retention: 7 daily + 4 weekly snapshots. Operator can adjust if disk constraints change."
+    source: brief
+    verified: true
+    affects_groups: []
+
+decisions:
+  - id: D1
+    stage: brief
+    description: "Phase 1 → Phase 2 transition gates"
+    chosen: "6-gate matrix with 5 pass/fail gates and 1 sanity-only signal (insights count). Latency phrased as 'p95 added hook wall-clock < 200ms'. Insights gate (≥50/week) is sanity-only — quiet week does not block Phase 2."
+    rejected:
+      - option: "Original ≥50 insights as pass/fail gate"
+        reason: "Codex review: a quiet operator week should not block Phase 2 if other gates pass."
+      - option: "Latency gate phrased loosely as 'avg latency'"
+        reason: "Codex review: 'p95 added hook wall-clock' is precise about what is measured."
+    constraint_refs: [C7]
+    affects_groups: []
+
+  - id: D2
+    stage: brief
+    description: "Shadow-mode mechanics"
+    chosen: "Recall runs normally; hook captures stdout and writes to ~/.mnemon/data/<store>/shadow.log INSTEAD of returning as additionalContext. Day 8 = boolean flip to inject."
+    rejected:
+      - option: "Disable recall entirely during shadow week"
+        reason: "Blind to recall quality until Phase 2 starts; weaker validation signal."
+    constraint_refs: [C7]
+    affects_groups: []
+
+  - id: D3
+    stage: brief
+    description: "Ollama-down fallback behavior"
+    chosen: "Degrade gracefully: skip vector signal, return keyword + entity + graph results. WARN logged. Surfaced in weekly task-host-deps-updates report."
+    rejected:
+      - option: "Fail the recall (return error to hook)"
+        reason: "Masks no real issue; degrades validation signal during outages without operational benefit."
+      - option: "Fail the agent's turn"
+        reason: "Never degrade UX over an embedding service blip."
+    constraint_refs: [C17]
+    affects_groups: []
+
+  - id: D4
+    stage: brief
+    description: "Observability landing surface"
+    chosen: "JSON Lines at data/mnemon-metrics.jsonl, rotated daily, written by host-side periodic script. Ad-hoc query CLI: pnpm exec tsx scripts/mnemon-metrics.ts."
+    rejected:
+      - option: "Extend data/v2.db with mnemon_metrics table"
+        reason: "Couples metrics to central DB which is meant for orchestration state, not metrics."
+      - option: "Log lines only, grep when needed"
+        reason: "Too lossy; no historical aggregation."
+      - option: "Wire into /add-dashboard"
+        reason: "Conditional on a skill the operator hasn't installed; not yet a dependency we can rely on."
+    constraint_refs: []
+    affects_groups: []
+
+  - id: D5
+    stage: brief
+    description: "Backup mechanism"
+    chosen: "sqlite3 .backup (or WAL checkpoint + copy) for consistency. NOT bare rsync against live DB file."
+    rejected:
+      - option: "Bare rsync of ~/.mnemon"
+        reason: "Codex review: captures inconsistent DB state mid-write; restoring a torn write is not recoverable."
+    constraint_refs: [C13, C19]
+    affects_groups: []
+
+  - id: D6
+    stage: brief
+    description: "Schema migration verification mechanism"
+    chosen: "On MNEMON_VERSION bump, spin up a temp copy of one enabled store's DB against the new binary, run a smoke query, gate the bump on success."
+    rejected:
+      - option: "CLI-based schema-version check"
+        reason: "Codex review: mnemon v0.1.2 has no verified schema-version command. Smoke-query against temp DB is the right shape until upstream ships one."
+    constraint_refs: [C14]
+    affects_groups: []
+
+  - id: D7
+    stage: brief
+    description: "Deletion/reconciliation workflow"
+    chosen: "New dedicated scheduled task task-mnemon-wiki-reconcile (Sunday 05:00 ET default) that cross-checks mnemon's entity graph against wiki pages, flags orphans for operator review. Separate from wiki-lint."
+    rejected:
+      - option: "Extend the existing weekly wiki-lint task"
+        reason: "Codex review: no existing wiki-lint scheduled task was found in the codebase. Bolting onto a non-existent task is wrong shape. Also: wiki-lint checks wiki internal consistency; reconciliation checks wiki/mnemon alignment — different concerns deserve different tasks."
+    constraint_refs: [C12]
+    affects_groups: []
+
+  - id: D8
+    stage: brief
+    description: "Module location for host-side mnemon integration"
+    chosen: "src/modules/mnemon/ matching src/modules/agent-to-agent/ convention."
+    rejected:
+      - option: "Colocate inside container-runner.ts as inline blocks"
+        reason: "Bloats container-runner.ts; makes /update-nanoclaw merge surface large."
+      - option: "Top-level src/mnemon.ts"
+        reason: "Doesn't match the modules/ convention the codebase already uses."
+    constraint_refs: [C5]
+    affects_groups: []
+
+  - id: D9
+    stage: brief
+    description: "Hook channel"
+    chosen: "Translate mnemon's Prime/Remind/Nudge reminders into entries in NanoClaw's existing programmatic SDK hook chain at claude.ts:947."
+    rejected:
+      - option: "Use mnemon setup's settings.json patching"
+        reason: "Mixes hook channels with NanoClaw's existing programmatic injection. Codex review: HIGH severity drift."
+      - option: "Wrap mnemon as an MCP server, no hook integration"
+        reason: "MCP cannot cover SessionStart/Stop events. Splits hook channel and loses lifecycle coverage."
+    constraint_refs: [C1]
+    affects_groups: []
+
+  - id: D10
+    stage: brief
+    description: "Mnemon binary delivery into containers"
+    chosen: "Bake into container image via ARG MNEMON_VERSION + per-arch SHA256 ARGs in container/Dockerfile. Auto-tracked by /update-container."
+    rejected:
+      - option: "Bind-mount host binary into containers"
+        reason: "Bypasses /update-container audit loop; binary version drift goes undetected."
+    constraint_refs: [C2, C10]
+    affects_groups: []
+
+  - id: D11
+    stage: brief
+    description: "Per-group toggle location"
+    chosen: "container.json with { mnemon: { enabled, embeddings } } block."
+    rejected:
+      - option: "Central DB column on agent_groups"
+        reason: "Splits config model. Repo convention is filesystem-tracked container config (verified in container-config.ts and db-central.md)."
+    constraint_refs: [C3, C9]
+    affects_groups: []
+
+  - id: D12
+    stage: brief
+    description: "Ollama deployment shape"
+    chosen: "Host systemd service. Port 11434 firewalled to Docker bridge subnet only. Containers reach via host.docker.internal:host-gateway."
+    rejected:
+      - option: "Ollama in each container"
+        reason: "274MB model per container × N containers; multiplicative cost; version proliferation."
+      - option: "Dedicated Ollama sidecar container"
+        reason: "Adds infra; not justified at single-operator scale."
+    constraint_refs: [C11]
+    affects_groups: []
+
+  - id: D13
+    stage: brief
+    description: "SQLite concurrency mitigation"
+    chosen: "Per-store host-side flock wrapping mnemon writes; serializes concurrent writers across N session containers per agent_group. Upstream issue filed for busy_timeout."
+    rejected:
+      - option: "Trust mnemon's WAL alone"
+        reason: "Codex verified: mnemon's DSN sets WAL but no busy_timeout; WAL alone does not prevent contention from concurrent containers."
+      - option: "Single host-side daemon serializes ALL mnemon writes globally"
+        reason: "Single point of failure across all groups; per-store flock is finer-grained and survives one bad store."
+    constraint_refs: [C16]
+    affects_groups: []
+
+  - id: D14
+    stage: brief
+    description: "PreCompact hook integration"
+    chosen: "Drop entirely from this scope. Mnemon v0.1.2 does not expose a Compact handler; mnemon setup deploys only Prime/Remind/Nudge. Defer until upstream ships a real handler."
+    rejected:
+      - option: "Slot mnemon into v2's existing PreCompact chain anyway"
+        reason: "v0.1.2 has no CLI-callable compact entry point. The compact.sh string in the binary is not executable as a hook."
+    constraint_refs: [C8]
+    affects_groups: []
+
+  - id: D15
+    stage: brief
+    description: "Synthesis and GC cadence delivery"
+    chosen: "Per-group scheduled tasks created by enable-mnemon.ts (synthesise daily 03:00 ET, GC Sunday 04:00 ET, reconcile Sunday 05:00 ET). Defaults overridable per-group at enable time."
+    rejected:
+      - option: "synthesiseCron / gcCron fields in container.json"
+        reason: "Couples scheduling config to container shape. Cadences belong in NanoClaw's scheduled-task system, which is the established home."
+      - option: "Mnemon CLI synthesise command"
+        reason: "No such command exists in v0.1.2 — that was fictional in earlier drafts."
+    constraint_refs: [C9, C18]
+    affects_groups: []
+
+  - id: D16
+    stage: design
+    description: "Hook script translation strategy"
+    chosen: "TS hook callbacks invoking mnemon CLI directly, no .sh wrappers (Option C). Cleanest TS-native shape, easiest to test, easiest to add NanoClaw-specific logic (shadow.log routing, flock acquisition, structured metrics emission)."
+    rejected:
+      - option: "Bake mnemon's .sh hook scripts into image, SDK hooks shell out to them"
+        reason: "Bash layer adds latency and a script-tracking burden without value once we're already in TS for hook composition."
+      - option: "Full TS reimplementation including faithful copy of mnemon's prime.sh formatting"
+        reason: "Same upstream-drift risk as Option C without the benefit; v0.1.2's scripts are too thin to warrant strict mimicry."
+    constraint_refs: [C1]
+    affects_groups: []
+
+  - id: D17
+    stage: design
+    description: "Shadow-mode toggle mechanism"
+    chosen: "Filesystem flag at ~/.mnemon/data/<store>/.shadow_mode (Option B). Hook function checks fs.existsSync. enable-mnemon.ts creates it; operator removes it on Day 8 after gates pass."
+    rejected:
+      - option: "container.json field mnemon.shadow"
+        reason: "Violates C9 (mnemon block must be exactly { enabled, embeddings })."
+      - option: "Auto-graduation by enable-time timestamp + 7d"
+        reason: "Bypasses the success-criteria gate (C7). Operator must consciously decide to graduate."
+    constraint_refs: [C7, C9]
+    affects_groups: []
+
+  - id: D18
+    stage: design
+    description: "flock serialization shape"
+    chosen: "TS hook acquires per-store lock via proper-lockfile (Option A). Fine-grained, TS-native, testable, matches v2's existing lock patterns."
+    rejected:
+      - option: "Shell flock(1) command in front of every mnemon CLI call"
+        reason: "Less testable; introduces a non-TS lock pattern."
+      - option: "Single host-side mnemon-write daemon serializing all writes globally"
+        reason: "SPOF for cross-store ordering we don't actually need; per-store granularity sufficient."
+    constraint_refs: [C16]
+    affects_groups: []
+
+  - id: D19
+    stage: design
+    description: "Scheduled task creation by enable-mnemon.ts"
+    chosen: "Direct insert into the agent_group's session inbound.db with recurrence (Option A). Mirrors scripts/wire-scheduled-tasks.ts:243-285 pattern. Idempotent via series_id upsert."
+    rejected:
+      - option: "Wake the agent with a synthetic message asking it to call schedule_task MCP tool"
+        reason: "Costs an LLM turn per task. Indirect; harder to debug failures."
+    constraint_refs: [C6]
+    affects_groups: []
+
+  - id: D20
+    stage: design
+    description: "Observability emit cadence"
+    chosen: "Both: per-turn metrics from container Stop hook + periodic store-level metrics from host every 5 min, written to per-source files (data/mnemon-metrics-turns.jsonl and data/mnemon-metrics-stores.jsonl) merged at query time."
+    rejected:
+      - option: "Host-only periodic emit (Option A)"
+        reason: "Loses per-turn signal (hook latency, per-turn failure count) — essential for the latency gate."
+      - option: "Container-only per-Stop emit (Option B)"
+        reason: "Container can't see store-level facts (db_size_bytes, edge counts, embedding success rate) without invoking mnemon CLI on every Stop, which is wasteful."
+    constraint_refs: []
+    affects_groups: []
+
+  - id: D21
+    stage: design
+    description: "Backup script implementation language"
+    chosen: "TypeScript using better-sqlite3 backup API (Option B). Retention logic cleaner in TS; better-sqlite3 already a v2 dependency."
+    rejected:
+      - option: "Bash + sqlite3 CLI .backup command"
+        reason: "Bash retention pruning is messy (date arithmetic). Both methods are equally consistent for the actual snapshot."
+    constraint_refs: [C13, C19]
+    affects_groups: []
+
+  - id: D22
+    stage: design
+    description: "Shadow-mode recall capture mechanism"
+    chosen: "Single hook function with shadow-flag branch (Option A). If shadow flag present: append recall result to ~/.mnemon/data/<store>/shadow.log, return empty additionalContext. If absent: return result as additionalContext."
+    rejected: []
+    constraint_refs: [C7]
+    affects_groups: []
+    superseded_by: D29
+    superseded_reason: "Cycle 1 review (MF1) revealed mnemon's hook doesn't call recall; LLM does. Shadow mode reframed as phase-controlled reminder text — see D29."
+
+  - id: D23
+    stage: review
+    description: "Cycle 1 revision — D1 hook implementation strategy"
+    chosen: "Option A (pure TS callbacks; reminder text only — no recall invocation from hook). Revised after fact-check confirmed mnemon's UserPromptSubmit hook is a 5-line static reminder; LLM does recall via Bash."
+    rejected:
+      - option: "Option C (TS callbacks call mnemon CLI directly)"
+        reason: "Cycle 1 finding MF1 — based on false premise that hook ran recall. Hook never calls recall in v0.1.2."
+    constraint_refs: [C1]
+    affects_groups: []
+    supersedes: D16
+
+  - id: D24
+    stage: review
+    description: "Cycle 1 revision — module structure split across build boundary"
+    chosen: "Two modules: src/modules/mnemon/ (host-side Node, package nanoclaw) and container/agent-runner/src/modules/mnemon/ (container-side Bun, package nanoclaw-agent-runner). Cannot share code due to separate package trees."
+    rejected:
+      - option: "Single src/modules/mnemon/ used by both host and container"
+        reason: "Cycle 1 finding MF2 — verified separate packages; host modules cannot import into Bun container."
+    constraint_refs: [C5]
+    affects_groups: []
+
+  - id: D25
+    stage: review
+    description: "Cycle 1 revision — Stop hook is side-effect-only (no additionalContext)"
+    chosen: "Stop (Nudge) hook emits per-turn metric row only. SDK StopHookSpecificOutput does not include additionalContext. Nudge reminder content delivered via SessionStart instead."
+    rejected:
+      - option: "Nudge hook returns reminder text via additionalContext"
+        reason: "Cycle 1 finding MF3 — SDK doesn't support it; would TypeScript-error or silently drop."
+    constraint_refs: [C1]
+    affects_groups: []
+
+  - id: D26
+    stage: review
+    description: "Cycle 1 revision — D6 backup switched to Bash sqlite3"
+    chosen: "Option A (Bash + sqlite3 CLI .backup). Matches C13 literal phrasing and eliminates cross-SQLite-library risk between mnemon's Go SQLite and better-sqlite3's bundled SQLite."
+    rejected:
+      - option: "Option B (better-sqlite3 db.backup() API)"
+        reason: "Cycle 1 finding MF5 — A9 admitted unvalidated; subtle WAL frame format mismatch risk. Defaulting to safer path."
+    constraint_refs: [C13]
+    affects_groups: []
+    supersedes: D21
+
+  - id: D27
+    stage: review
+    description: "Cycle 1 revision — D4 refactor wire-scheduled-tasks.ts to expose scheduleTask API"
+    chosen: "Extract insert logic from wire-scheduled-tasks.ts into reusable function in src/db/scheduled-tasks.ts. Both wire-scheduled-tasks.ts and enable-mnemon.ts call it. Idempotency lives in one implementation."
+    rejected:
+      - option: "Direct duplicated insert into inbound.db from enable-mnemon.ts"
+        reason: "Cycle 1 finding MF6 — duplicates the storage-shape contract; if v2's scheduling internals change, both sites drift."
+    constraint_refs: [C6]
+    affects_groups: []
+    supersedes: D19
+
+  - id: D28
+    stage: review
+    description: "Cycle 1 SHOULD-FIX bundle"
+    chosen: |
+      SF1: Per-container metrics files at data/mnemon-metrics/turns/<agent_group_id>__<session_id>.jsonl + per-store at data/mnemon-metrics/stores/<store>.jsonl. One writer per file.
+      SF2: Shadow flag replaced with data/mnemon-rollout.json — { phase, enabled_at, graduated_at } per store. Host-mounted RO into containers.
+      SF3: flock wraps writes only (recall/search/related/status are read-only).
+      SF4: Use shell flock(1) instead of proper-lockfile npm dep.
+      SF5: --add-host=host.docker.internal:host-gateway added unconditionally to container-runner.ts spawn args.
+      SF6: Hook errors classified as recoverable (degrade + WARN) vs blocking (mark store unhealthy in rollout.json; gate Phase 2 graduation).
+      SF7: busy_timeout limitation documented in docs/mnemon.md; upstream issue tracked.
+    rejected: []
+    constraint_refs: [C16, C17]
+    affects_groups: []
+
+  - id: D29
+    stage: review
+    description: "Cycle 1 revision — D7 shadow-mode delivery via phase-controlled reminder text"
+    chosen: "Phase 1 Remind hook returns explicit 'Phase 1 shadow — only consider remember; recall not yet active' prompt. Phase 2 returns standard recall+remember prompt. LLM compliance with prompt is the shadow-mode mechanism (no Bash interception). Operator validates Phase 1 by querying live mnemon DB directly (mnemon recall <query> from shell)."
+    rejected:
+      - option: "Original D7 (capture recall stdout to shadow.log)"
+        reason: "Cycle 1 MF1 — false premise; the hook never produces recall stdout."
+      - option: "PreToolUse Bash gate intercepts mnemon recall calls and routes to shadow.log"
+        reason: "Defense-in-depth for weak threat (LLM disobedience). Adds complexity; Phase 1 prompt is sufficient."
+    constraint_refs: [C7]
+    affects_groups: []
+    supersedes: D22
+
+  - id: D30
+    stage: review
+    description: "Cycle 1 revision — flock acquisition site (SUPERSEDED by D31)"
+    chosen: "Bash gate at PreToolUse intercepts LLM-initiated mnemon write commands."
+    rejected:
+      - option: "Hook callback acquires flock around its own mnemon invocations"
+        reason: "Hook callbacks no longer invoke mnemon CLI directly (per D23). LLM does."
+    constraint_refs: [C16]
+    affects_groups: []
+    supersedes: D18
+    superseded_by: D31
+    superseded_reason: "Cycle 2 finding MF8: PreToolUse hooks are advisory (allow/deny), cannot mutate Bash commands. Wrapper script approach replaces this."
+
+  - id: D31
+    stage: review
+    description: "Cycle 2 — /usr/local/bin/mnemon wrapper script for locking + phase gating + observability"
+    chosen: "Bash wrapper at /usr/local/bin/mnemon (baked into image), shadows real binary at /usr/local/bin/mnemon-real. Three concerns centralized: (1) phase-gated recall block during shadow mode (returns empty results regardless of LLM compliance with reminder); (2) shell flock(1) on host-shared lock at ~/.mnemon/data/<store>/.write.lock for write commands; (3) per-command observability events to /workspace/agent/.mnemon-metrics.jsonl."
+    rejected:
+      - option: "Per-container /tmp/mnemon-<store>.lock + PreToolUse hook gate"
+        reason: "Cycle 2 MF8: PreToolUse cannot mutate commands. Cycle 2 MF10: /tmp lock is per-container, doesn't serialize across containers writing the same SQLite DB."
+      - option: "Phase enforcement via reminder text alone"
+        reason: "Cycle 2 MF11: skill.md content tells LLM to recall by default; per-turn reminder is contradictory instruction. Need deterministic enforcement."
+    constraint_refs: [C7, C16]
+    affects_groups: []
+    supersedes: D30
+
+  - id: D32
+    stage: review
+    description: "Cycle 2 — host-gateway flag (SF5) determined to be already wired"
+    chosen: "No code change needed. --add-host=host.docker.internal:host-gateway is already wired via hostGatewayArgs() at src/container-runtime.ts:15-21 and called at src/container-runner.ts:1424. Confirmed by Reviewer A in cycle 2."
+    rejected:
+      - option: "Add unconditionally to container-runner.ts"
+        reason: "Already there; SF5 was a no-op fix."
+    constraint_refs: [C11]
+    affects_groups: []
+
+  - id: D33
+    stage: review
+    description: "Cycle 2 — health state writability"
+    chosen: "Rollout JSON stays host-mounted RO into containers (single source of truth for phase). Container-side hooks emit unhealthy events to per-container metrics file (/workspace/agent/.mnemon-metrics.jsonl + data/mnemon-metrics/turns/<id>.jsonl). Host metrics-collector aggregates events and writes derived data/mnemon-health.json per store. Phase 2 graduation gate reads health file."
+    rejected:
+      - option: "Container hooks write phase=unhealthy directly to mnemon-rollout.json"
+        reason: "Cycle 2 MF9: file is RO-mounted into container; container can't write back. Splitting into rollout (host-owned) vs health (host-derived from container events) preserves the one-writer rule."
+    constraint_refs: []
+    affects_groups: []
+
+waivers:
+  - id: W1
+    stage: review
+    finding: "Cycle 3 F4 — wrapper writes to /workspace/agent/.mnemon-metrics.jsonl (per-agent-group, multi-writer if concurrent sessions). Violates SF1 'one writer per file' invariant."
+    reason: "Reviewer B research confirms POSIX O_APPEND is atomic for writes <= PIPE_BUF (4096B) on Linux; design's metric rows are well under. Will fix at build time if observed line interleaving (per-session path via MNEMON_SESSION_ID env). Doesn't block correctness."
+    risk_level: low
+
+  - id: W2
+    stage: review
+    finding: "Cycle 3 F6 — wrapper script set -euo pipefail may hard-exit on transient mkdir/flock failures."
+    reason: "Failure mode is non-zero wrapper exit -> agent sees mnemon failure -> hook's failure-class.ts catches it via SF6 discipline. Wrapper doesn't need separate classification. Bash polish during build if needed."
+    risk_level: low
+
+  - id: W3
+    stage: review
+    finding: "Cycle 3 Codex#5 — Phase 2 graduation gate requires absence of unhealthy events, not positive heartbeat from each enabled session. Missing metrics could be invisible vs unhealthy."
+    reason: "At single-operator Illysium scale (few concurrent sessions), absence-of-unhealthy is sufficient. Positive freshness gate is additional design work; defer to post-Phase-1 observability iteration if scale expands. Operator weekly review (visual gate) catches systemic missing-metrics issues."
+    risk_level: medium
+
+assumptions:
+  - id: A1
+    stage: brief
+    text: "Mnemon's keyword/entity/graph recall (without vector embeddings) is good enough that Ollama-down degradation does not significantly degrade agent quality."
+    validation: "Phase 1 shadow.log spot-check: compare hybrid vs keyword-only recall on the same 5+ queries; if quality difference is significant, reconsider C17."
+    validated: false
+    invalidated_at: null
+
+  - id: A2
+    stage: brief
+    text: "Per-store flock serialization is sufficient for current Illysium concurrency volume (N concurrent session containers per agent_group) without measurable latency impact."
+    validation: "Phase 1 latency gate (p95 added hook wall-clock < 200ms) catches if flock contention adds material delay."
+    validated: false
+    invalidated_at: null
+
+  - id: A3
+    stage: brief
+    text: "Mnemon's `mnemon status` JSON output (default format) is stable across patch versions and provides the metrics needed for observability."
+    validation: "Smoke test with ad-hoc CLI wrapper; review on each MNEMON_VERSION bump."
+    validated: false
+    invalidated_at: null
+
+  - id: A4
+    stage: brief
+    text: "Daily synthesise cadence (03:00 ET) is appropriate for Illysium's Slack traffic volume; not so frequent it churns wiki pages with noise, not so infrequent that wiki staleness becomes a concern."
+    validation: "Phase 1 operator review: are wiki pages reflecting reality at end of week? If too stale, increase to twice-daily; if too churny, reduce to weekly."
+    validated: false
+    invalidated_at: null
+
+  - id: A5
+    stage: design
+    text: "Mnemon's prime.sh/user_prompt.sh/stop.sh logic is small enough that re-implementing equivalent behavior in TS (D16 Option C) is ~50 lines."
+    validation: "Read the three scripts before build phase. Verified earlier they're 5-20 lines each; total within budget."
+    validated: false
+    invalidated_at: null
+
+  - id: A6
+    stage: design
+    text: "Linux Docker host-gateway works in v2's container spawn config (`--add-host=host.docker.internal:host-gateway` either already passed or addable in container-runner.ts)."
+    validation: "Smoke test in Phase 1 day 1: docker exec into Illysium, run `curl -s http://host.docker.internal:11434/api/version` — should return Ollama version."
+    validated: false
+    invalidated_at: null
+
+  - id: A7
+    stage: design
+    text: "Mnemon `mnemon status` JSON output schema is stable across patch versions."
+    validation: "Schema version check in metrics-collector.ts on each MNEMON_VERSION bump (part of /update-container schema migration smoke check)."
+    validated: false
+    invalidated_at: null
+
+  - id: A8
+    stage: design
+    text: "Per-store flock contention adds <5ms typical to write hooks at current Illysium concurrent-session scale."
+    validation: "Phase 1 latency gate (p95 < 200ms) catches material regression."
+    validated: false
+    invalidated_at: null
+
+  - id: A9
+    stage: design
+    text: "better-sqlite3's db.backup() works with WAL-mode SQLite databases written by another process (the mnemon binary)."
+    validation: "Day 1 restore drill — backup mnemon DB while a session is active, restore, verify no torn writes."
+    validated: false
+    invalidated_at: null
+
+  - id: A10
+    stage: design
+    text: "Two-file metrics scheme (data/mnemon-metrics-turns.jsonl per-turn + data/mnemon-metrics-stores.jsonl per-store) doesn't introduce query-time complexity that hurts operator usability."
+    validation: "Operator usability check at end of Phase 1 review. If painful, fall back to single periodic-from-host emit shape."
+    validated: false
+    invalidated_at: null

@@ -132,6 +132,27 @@ RUN DPKG_ARCH=$(dpkg --print-architecture) && UARCH=$(uname -m) \
     && dpkg -i /tmp/supabase.deb \
     && rm -rf /tmp/render.zip /tmp/render /tmp/supabase.deb
 
+# Pinned mnemon binary — auto-tracked by /update-container audit.
+# Per-arch SHA256 from https://github.com/mnemon-dev/mnemon/releases/download/v0.1.2/checksums.txt
+ARG MNEMON_VERSION=0.1.2
+ARG MNEMON_SHA256_arm64=e9acb178843605a813520dacce10f8f3b3608df65841c238f0b3b768b74cd025
+ARG MNEMON_SHA256_amd64=a18aa4304e4d904cb80e46a099efbd95bf0b1486381757be89cd234844603347
+
+RUN ARCH=$(dpkg --print-architecture) \
+    && SHA=$(if [ "$ARCH" = "arm64" ]; then echo "$MNEMON_SHA256_arm64"; else echo "$MNEMON_SHA256_amd64"; fi) \
+    && curl -fsSL "https://github.com/mnemon-dev/mnemon/releases/download/v${MNEMON_VERSION}/mnemon_${MNEMON_VERSION}_linux_${ARCH}.tar.gz" -o /tmp/mnemon.tar.gz \
+    && echo "$SHA  /tmp/mnemon.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/mnemon.tar.gz -C /tmp mnemon \
+    && mv /tmp/mnemon /usr/local/bin/mnemon-real \
+    && chmod +x /usr/local/bin/mnemon-real \
+    && rm -rf /tmp/mnemon*
+
+# Wrapper script (created in Task A2). Symlinked to canonical PATH location.
+COPY mnemon-wrapper.sh /usr/local/bin/mnemon-wrapper.sh
+RUN chmod +x /usr/local/bin/mnemon-wrapper.sh \
+    && ln -s /usr/local/bin/mnemon-wrapper.sh /usr/local/bin/mnemon \
+    && /usr/local/bin/mnemon --version
+
 # Chromium path for agent-browser / Playwright / mmdc consumers
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
 ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
