@@ -4,7 +4,197 @@ Mnemon is a host-side graph fact store for NanoClaw agent groups. Each agent gro
 
 ---
 
-## Rollout (per group)
+## Operator runbooks
+
+These three runbooks cover the full operational surface. Reference material (gates, reindex policy, backup/restore, troubleshooting) lives below.
+
+### Runbook 1 — Add mnemon to a new (or existing) agent group
+
+Replay pattern from the Apr-2026 7-group bulk enable. Works for a single group or many.
+
+**When to run:** new agent group created and you want it on mnemon, or an existing group missing the wiki+mnemon stack.
+
+**Prerequisites (verify on host):**
+```bash
+mnemon --version              # binary present (~/.local/bin or /usr/local/bin)
+ollama list | grep nomic      # nomic-embed-text:latest model pulled
+systemctl is-active ollama    # ollama service running
+crontab -l | grep mnemon      # cron entries present (autopush + backup + collector)
+```
+If any fails, fix the prereq first. Ollama install: `curl -fsSL https://ollama.com/install.sh | sh && sudo systemctl enable --now ollama && ollama pull nomic-embed-text`.
+
+**Step-by-step (per group):**
+
+1. **Survey state** — what does this group already have?
+    ```bash
+    g=<folder>     # e.g. axie-dev
+    echo "container.json:"; jq '{agentGroupId, skills, mnemon}' "groups/$g/container.json"
+    [ -d "groups/$g/wiki" ]    && echo "wiki/: present" || echo "wiki/: MISSING"
+    [ -d "groups/$g/sources" ] && echo "sources/: present" || echo "sources/: MISSING"
+    ```
+
+2. **Fix prereqs in `container.json` if needed.** The agent group must have `agentGroupId` set and `skills: "all"` (otherwise `mnemon-companion/SKILL.md` won't auto-mount). If either is missing:
+    ```bash
+    g=<folder>
+    cfg="groups/$g/container.json"
+    agentId=$(sqlite3 data/v2.db "SELECT id FROM agent_groups WHERE folder='$g';")
+    jq --arg id "$agentId" '. + {agentGroupId: $id, skills: "all"}' "$cfg" > "$cfg.tmp" && mv "$cfg.tmp" "$cfg"
+    ```
+
+3. **Scaffold wiki + sources** (skip if `wiki/` already exists from a prior `/add-karpathy-llm-wiki` run):
+    ```bash
+    g=<folder>
+    mkdir -p "groups/$g/wiki/entities" "groups/$g/wiki/concepts" "groups/$g/wiki/timelines"
+    mkdir -p "groups/$g/sources/articles" "groups/$g/sources/docs" "groups/$g/sources/threads"
+    ```
+    Then write `groups/$g/wiki/index.md` and `groups/$g/wiki/log.md` (templates: copy any existing group's wiki/index.md and adapt the scope description). And append the wiki+mnemon section to `groups/$g/CLAUDE.local.md` — copy from any other enabled group (e.g. `groups/illysium/CLAUDE.local.md`'s "## Wiki + mnemon — persistent memory layer" block).
+
+4. **Enable mnemon** (writes container.json mnemon block, creates store, schedules synth/gc/reconcile tasks, writes rollout JSON in shadow phase):
+    ```bash
+    pnpm exec tsx scripts/enable-mnemon.ts <folder>
+    ```
+    No service restart needed for the new group's first container spawn — `applyMnemonMounts` and `applyMnemonEnv` read `container.json` per spawn.
+
+5. **Create wiki sync repo** (private GitHub repo for Obsidian/teammate access):
+    ```bash
+    g=<folder>
+    gh repo create "davekim917/$g-wiki" --private --description "$g knowledge base — synced from NanoClaw"
+    cd "groups/$g/wiki"
+    git init -b main
+    git remote add origin "https://github.com/davekim917/$g-wiki.git"
+    cat > .gitignore <<'EOF'
+    .obsidian/workspace*
+    .obsidian/cache
+    .obsidian/workspaces.json
+    .trash/
+    EOF
+    git add -A
+    git -c user.email='YOUR_EMAIL' -c user.name='YOUR_NAME' commit -m "init: empty $g wiki scaffold"
+    git push -u origin main
+    cd /home/ubuntu/nanoclaw-v2
+    ```
+    The cron-installed `wiki-autopush.sh` iterates `groups/*/wiki/.git` automatically — no script edit needed.
+
+    For groups under a different org (e.g. `Illysium-ai/illysium-wiki` was used for the Illysium consulting workspace), substitute the org in `gh repo create` and the remote URL.
+
+6. **Verify everything wired up:**
+    ```bash
+    g=<folder>
+    agentId=$(jq -r '.agentGroupId' "groups/$g/container.json")
+    echo "rollout entry:"; jq ".[\"$agentId\"]" data/mnemon-rollout.json
+    echo "store created:"; mnemon store list | grep "$agentId"
+    echo "scheduled tasks:" 
+    session=$(sqlite3 data/v2.db "SELECT id FROM sessions WHERE agent_group_id='$agentId' AND status='active' ORDER BY created_at DESC LIMIT 1;")
+    sqlite3 "data/v2-sessions/$agentId/$session/inbound.db" "SELECT series_id, status, datetime(process_after) FROM messages_in WHERE kind='task' AND series_id LIKE 'mnemon%';"
+    ```
+    Expected: rollout entry with `phase: "shadow"` + `enabled_at`; mnemon store ID listed; 3 pending mnemon tasks (synth/gc/reconcile).
+
+7. **(Optional) Clone wiki on Mac for Obsidian access:**
+    ```bash
+    cd ~/Documents/Vaults/all-wikis
+    git clone "https://github.com/davekim917/<folder>-wiki.git" <folder>
+    ```
+    Reload Obsidian — the new group appears as a top-level folder in the unified vault.
+
+**Bulk enable (multiple groups in one shot):** wrap steps 1-6 in a `for g in main number-drinks ...; do ... done` loop. The 5-group bulk on 2026-04-27 took ~5 minutes total.
+
+---
+
+### Runbook 2 — Graduate a group from Phase 1 (shadow) to Phase 2 (live)
+
+**When to run:** at least 7 days after the group's `enabled_at` timestamp in `data/mnemon-rollout.json`. Phase 2 turns recall on — the agent's responses start being shaped by stored facts.
+
+**Pre-graduation review (always do this first):**
+
+1. **Check telemetry health for the group:**
+    ```bash
+    g=<folder>
+    agentId=$(jq -r '.agentGroupId' "groups/$g/container.json")
+    echo "Health record:"; jq ".[\"$agentId\"]" data/mnemon-health.json
+    echo "Recent unhealthy events:"; tail -20 "groups/$g/.mnemon-metrics.jsonl" | grep '"event_type":"unhealthy"' || echo "(none — good)"
+    echo "Total turns observed:"; grep -c '"event_type":"turn"' "groups/$g/.mnemon-metrics.jsonl"
+    echo "Insights stored so far:"; mnemon embed --status --store "$agentId" 2>&1 | grep -E "embedded|total"
+    ```
+
+2. **Inspect what the agent has remembered.** Open the wiki (in Obsidian or `cat groups/$g/wiki/log.md`) and scan recent entries. Browse mnemon directly:
+    ```bash
+    g=<folder>
+    agentId=$(jq -r '.agentGroupId' "groups/$g/container.json")
+    mnemon recall "" --store "$agentId" --limit 20  # shows recent insights ranked by importance
+    ```
+    Spot-check: are the facts atomic? Coherent? Free of garbage? If many facts look hallucinated or off-topic, do NOT graduate — investigate why the agent is over-storing.
+
+3. **Run the graduation gate script.** It evaluates 6 gates: hook failure rate < 1%, p95 latency < 200ms, DB growth < 10MB, recall spot-check (manual), visual wiki review (manual), store health = ok. **Fail-closed on missing telemetry** — graduation is refused if data sources are empty/missing.
+    ```bash
+    pnpm exec tsx scripts/mnemon-phase2.ts <folder>
+    ```
+    Two manual prompts will appear: "Did the recall spot-check pass?" and "Did the visual wiki review pass?" Answer based on step 2's review.
+
+4. **Outcomes:**
+    - **All gates pass** → script writes `phase: "live"` + `graduated_at` to `data/mnemon-rollout.json`. Recall starts injecting on the next container spawn for this group. No service restart needed; `rollout-reader.ts` re-reads on every hook invocation.
+    - **One or more gates fail** → script exits non-zero with a list of failing gates. Address the failures, then re-run after another observation window.
+    - **`telemetry unavailable —` errors** → metrics pipeline is broken. Check the cron's `logs/mnemon-metrics.log` and `groups/<folder>/.mnemon-metrics.jsonl` first. Don't graduate until telemetry is real.
+
+5. **(Optional) Bulk graduate** if you've reviewed multiple groups together:
+    ```bash
+    for g in illysium madison-reed main number-drinks axie-dev axis-labs dirt-market; do
+      echo "=== $g ==="
+      pnpm exec tsx scripts/mnemon-phase2.ts "$g" --skip-visual  # bypass manual prompts (use only if you've pre-reviewed)
+    done
+    ```
+
+**Kill switch (any phase):** if a group misbehaves after graduation:
+```bash
+pnpm exec tsx scripts/disable-mnemon.ts <folder>
+sudo systemctl restart nanoclaw-v2
+```
+Removes the mnemon block from container.json, removes the rollout entry, cancels the 3 scheduled tasks. **Store data is preserved** at `~/.mnemon/data/<store>/` — re-enabling later resumes from the same fact graph.
+
+---
+
+### Runbook 3 — Routine health checks
+
+**Daily (~30 sec):**
+```bash
+# Any unhealthy events in the last hour?
+jq 'to_entries[] | select(.value.phase == "unhealthy") | {store: .key, events: .value.recent_unhealthy_events}' data/mnemon-health.json
+# Should be empty. If anything shows up, drill in: tail -50 "groups/<group-with-issue>/.mnemon-metrics.jsonl"
+```
+
+**Weekly (~5 min):**
+```bash
+# Backup ran nightly?
+ls -lt ~/backups/.mnemon-* | head -7
+# Latest should be from today/yesterday; total count under 11 (7 daily + 4 weekly retention)
+
+# Wiki autopush working?
+tail -20 logs/wiki-autopush.log
+
+# Storage growth trends per group
+for s in $(mnemon store list 2>&1 | awk '/^  ag-/ {print $1}'); do
+  size_mb=$(du -sm ~/.mnemon/data/"$s"/ 2>/dev/null | awk '{print $1}')
+  insights=$(mnemon embed --status --store "$s" 2>&1 | jq -r '.total_insights // 0')
+  echo "  $s: ${size_mb}MB, $insights insights"
+done
+
+# Phase 2 candidates (groups in shadow > 7 days)
+jq -r 'to_entries[] | select(.value.phase == "shadow") | "\(.key): enabled \(.value.enabled_at)"' data/mnemon-rollout.json
+```
+
+**Monthly (~10 min):**
+- Spot-check 3-5 wiki pages in Obsidian per active group. Look for: contradictions, stale entries, orphan pages, gaps.
+- Review `crontab -l` and `logs/mnemon-*.log` for silent failures.
+- Verify `mnemon` binary version against `MNEMON_VERSION` ARG in `container/Dockerfile`. If upstream has a new release, decide whether to bump (see "## Embedding model reindex" and "## Schema migration" reference sections below for migration discipline).
+
+**Failure modes to watch for** (see "## Troubleshooting" reference section below for full diagnostics):
+- `event_type: "unhealthy"` events with `reason: "ollama-unavailable"` → Ollama service stopped; recall degrades to keyword-only
+- `event_type: "unhealthy"` with `reason: "schema-mismatch"` → mnemon binary version diverged from store schema; do NOT bump binary without running the migration drill
+- `event_type: "unhealthy"` with `reason: "flock-timeout"` → stale write lock; check for crashed containers or remove `~/.mnemon/data/<store>/.write.lock` manually after confirming no live writers
+- Wiki autopush log shows repeated push failures → likely auth issue; check `gh auth status`
+
+---
+
+
 
 ### Step 1: Enable
 
