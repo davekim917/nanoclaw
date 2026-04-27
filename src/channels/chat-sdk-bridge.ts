@@ -64,6 +64,14 @@ export interface ChatSdkBridgeConfig {
    */
   transformOutboundText?: (text: string) => string;
   /**
+   * Optional filter applied to inbound Chat SDK messages before they reach
+   * the host router. Return false to drop. Used by channels that need to
+   * suppress platform-emitted system messages the SDK doesn't filter (e.g.
+   * Discord MESSAGE_CREATE events for thread renames, member joins, etc.)
+   * which would otherwise reach the agent as ordinary user messages.
+   */
+  inboundFilter?: (message: ChatMessage) => boolean;
+  /**
    * Override the channelType (and webhook path) for this bridge. Defaults to
    * `adapter.name`. Used by channels that register multiple instances in one
    * process — e.g. multi-workspace Slack — so each workspace gets a distinct
@@ -127,6 +135,13 @@ export function splitForLimit(text: string, limit: number): string[] {
 export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter {
   const { adapter } = config;
   const transformText = (t: string): string => (config.transformOutboundText ? config.transformOutboundText(t) : t);
+  // When transformOutboundText is set, the returned text is already in the
+  // adapter's native format (e.g. Slack mrkdwn). Send it as `raw` so the
+  // adapter doesn't re-parse it as standard Markdown — that double-conversion
+  // mangles links: `<https://x|https://x>` round-trips through CommonMark as
+  // an autolink whose URL contains the pipe, producing malformed mrkdwn.
+  const wrapBody = (text: string): { markdown: string } | { raw: string } =>
+    config.transformOutboundText ? { raw: text } : { markdown: text };
   let chat: Chat;
   let state: SqliteStateAdapter;
   let setupConfig: ChannelSetup;
@@ -283,10 +298,14 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           });
       };
 
+      const passesFilter = (message: ChatMessage): boolean =>
+        config.inboundFilter ? config.inboundFilter(message) : true;
+
       // Subscribed threads — every message in a thread we've previously
       // engaged. Carry the SDK's `message.isMention` through so mention-mode
       // wirings still fire on in-thread mentions.
       chat.onSubscribedMessage(async (thread, message) => {
+        if (!passesFilter(message)) return;
         const channelId = adapter.channelIdFromThreadId(thread.id);
         const isDM = adapterIsDM(adapter, thread.id);
         reportChannelMetadata(channelId);
@@ -299,6 +318,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
 
       // @mention in an unsubscribed thread — SDK-confirmed bot mention.
       chat.onNewMention(async (thread, message) => {
+        if (!passesFilter(message)) return;
         const channelId = adapter.channelIdFromThreadId(thread.id);
         const isDM = adapterIsDM(adapter, thread.id);
         reportChannelMetadata(channelId);
@@ -314,6 +334,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // inside a DM). Router collapses DM sub-threads to one session via
       // is_group=0 short-circuit.
       chat.onDirectMessage(async (thread, message) => {
+        if (!passesFilter(message)) return;
         const channelId = adapter.channelIdFromThreadId(thread.id);
         log.info('Inbound DM received', {
           adapter: adapter.name,
@@ -336,6 +357,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // so forwarding every one is cheap enough to not need a bridge-side
       // flood gate.
       chat.onNewMessage(/./, async (thread, message) => {
+        if (!passesFilter(message)) return;
         const channelId = adapter.channelIdFromThreadId(thread.id);
         const isDM = adapterIsDM(adapter, thread.id);
         reportChannelMetadata(channelId);
@@ -451,9 +473,9 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           config.maxTextLength && editText.length > config.maxTextLength
             ? splitForLimit(editText, config.maxTextLength)
             : [editText];
-        await adapter.editMessage(tid, content.messageId as string, { markdown: chunks[0] });
+        await adapter.editMessage(tid, content.messageId as string, wrapBody(chunks[0]));
         for (let i = 1; i < chunks.length; i++) {
-          await adapter.postMessage(tid, { markdown: chunks[i] });
+          await adapter.postMessage(tid, wrapBody(chunks[i]));
         }
         return;
       }
@@ -524,10 +546,8 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         for (let i = 0; i < chunks.length; i++) {
           const chunk = chunks[i];
           const attachFiles = i === 0 && fileUploads && fileUploads.length > 0;
-          const result = await adapter.postMessage(
-            tid,
-            attachFiles ? { markdown: chunk, files: fileUploads } : { markdown: chunk },
-          );
+          const body = wrapBody(chunk);
+          const result = await adapter.postMessage(tid, attachFiles ? { ...body, files: fileUploads } : body);
           if (i === 0) firstId = result?.id;
         }
         return firstId;
