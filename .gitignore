@@ -53,3 +53,5 @@ agents-sdk-docs
 
 # Codex plugin marker
 .codex
+.migrations/
+.env.pre-migration.*

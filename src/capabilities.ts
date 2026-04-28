@@ -413,20 +413,18 @@ function buildSessionServicesSnapshot(agentGroupId: string): SessionServicesSnap
     }
   }
 
-  // Exa — universal. Always shown (gated only on EXA_API_KEY for accurate
-  // status); container-runner injects the MCP unconditionally when the key
-  // is set, so the agent has it in every group unless excluded.
-  if (process.env.EXA_API_KEY) {
-    services.push({
-      name: 'Exa',
-      mcpNamespace: 'mcp__exa__*',
-      declaredTools: declaredMatchingTools(['exa']),
-      scopes: [],
-      credentialPaths: [],
-      useFor:
-        'Web search, research, and code context. Prefer exa over ad-hoc WebSearch/WebFetch for: web search (`mcp__exa__web_search_exa`), company research (`mcp__exa__company_research_exa`), people search (`mcp__exa__people_search_exa`), deep research (`mcp__exa__deep_researcher_start` then `_check`), code context from public repos (`mcp__exa__get_code_context_exa`), crawling specific URLs (`mcp__exa__crawling_exa`).',
-    });
-  }
+  // Exa — universal. Always shown; container-runner injects the MCP
+  // unconditionally and the OneCLI gateway proxy injects auth at request
+  // time (vault entry "Exa-MCP" → mcp.exa.ai).
+  services.push({
+    name: 'Exa',
+    mcpNamespace: 'mcp__exa__*',
+    declaredTools: declaredMatchingTools(['exa']),
+    scopes: [],
+    credentialPaths: [],
+    useFor:
+      'Web search, research, and code context. Prefer exa over ad-hoc WebSearch/WebFetch for: web search (`mcp__exa__web_search_exa`), company research (`mcp__exa__company_research_exa`), people search (`mcp__exa__people_search_exa`), deep research (`mcp__exa__deep_researcher_start` then `_check`), code context from public repos (`mcp__exa__get_code_context_exa`), crawling specific URLs (`mcp__exa__crawling_exa`).',
+  });
 
   // DeepWiki — always-on. No tool gate; host injects the MCP server unconditionally.
   services.push({
@@ -451,18 +449,18 @@ function buildSessionServicesSnapshot(agentGroupId: string): SessionServicesSnap
       'Live library / framework / SDK / API docs — React, Next.js, Prisma, Tailwind, Claude SDKs, Stripe, etc. Prefer Context7 over training-memory for: library-specific debugging, API syntax, config options, version migrations, CLI usage. Do NOT use for refactoring, business logic, or general concepts.',
   });
 
-  // Pocket — universal. Gated only on POCKET_API_KEY presence.
-  if (process.env.POCKET_API_KEY) {
-    services.push({
-      name: 'Pocket',
-      mcpNamespace: 'mcp__pocket__*',
-      declaredTools: declaredMatchingTools(['pocket']),
-      scopes: [],
-      credentialPaths: [],
-      useFor:
-        'Personal knowledge / memory via https://public.heypocketai.com/mcp. Auth pre-injected (Authorization: Bearer). Use Pocket tools to save references, recall prior context, search personal knowledge.',
-    });
-  }
+  // Pocket — universal. Always shown; container-runner injects the MCP
+  // unconditionally and the OneCLI gateway proxy injects auth at request
+  // time (vault entry "Pocket" → public.heypocketai.com).
+  services.push({
+    name: 'Pocket',
+    mcpNamespace: 'mcp__pocket__*',
+    declaredTools: declaredMatchingTools(['pocket']),
+    scopes: [],
+    credentialPaths: [],
+    useFor:
+      'Personal knowledge / memory via https://public.heypocketai.com/mcp. Auth pre-injected (Authorization: Bearer). Use Pocket tools to save references, recall prior context, search personal knowledge.',
+  });
 
   // Granola — universal. Always shown; container-runner injects unconditionally.
   services.push({

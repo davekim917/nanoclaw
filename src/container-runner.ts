@@ -1493,18 +1493,20 @@ async function buildContainerArgs(
       env: {},
     };
   }
-  if (process.env.EXA_API_KEY && canInject('exa')) {
+  if (canInject('exa')) {
+    // Auth header injected by the OneCLI gateway proxy at request time
+    // (vault entry "Exa-MCP" → mcp.exa.ai).
     mcpServers.exa = {
       type: 'http',
       url: 'https://mcp.exa.ai/mcp?tools=web_search_exa,web_search_advanced_exa,get_code_context_exa,crawling_exa,company_research_exa,people_search_exa,deep_researcher_start,deep_researcher_check,deep_search_exa',
-      headers: { 'x-api-key': process.env.EXA_API_KEY },
     };
   }
-  if (process.env.POCKET_API_KEY && canInject('pocket')) {
+  if (canInject('pocket')) {
+    // Auth header injected by the OneCLI gateway proxy at request time
+    // (vault entry "Pocket" → public.heypocketai.com).
     mcpServers.pocket = {
       type: 'http',
       url: 'https://public.heypocketai.com/mcp',
-      headers: { Authorization: `Bearer ${process.env.POCKET_API_KEY}` },
     };
   }
   if (Object.keys(mcpServers).length > 0) {
