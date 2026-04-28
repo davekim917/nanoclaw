@@ -1430,6 +1430,14 @@ async function buildContainerArgs(
     if (ghToken) {
       mergeNoProxy(args, 'github.com');
     }
+    // Codex / ChatGPT bypass — codex streams via WebSocket to
+    // wss://chatgpt.com/backend-api/codex/responses. OneCLI's MITM doesn't
+    // speak WS Upgrade and returns 405 Method Not Allowed, so codex retries
+    // five times before falling back to HTTP polling. That retry storm can
+    // also stall the codex AppServer enough that getCodexAuthStatus times
+    // out and reports loggedIn:false even when auth.json is valid. Bypass
+    // is unconditional — non-codex agents don't talk to chatgpt.com.
+    mergeNoProxy(args, 'chatgpt.com');
 
     // OAuth bypass: when a host OAuth token is forwarded, tell the
     // in-container HTTPS_PROXY (just configured by OneCLI) to skip
