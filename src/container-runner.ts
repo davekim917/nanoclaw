@@ -1406,6 +1406,18 @@ async function buildContainerArgs(
       log.warn('OneCLI gateway error — container will have no credentials', { containerName, err });
     }
 
+    // CA bundle env vars for bundled-CA clients. OneCLI's SDK sets
+    // SSL_CERT_FILE / NODE_EXTRA_CA_CERTS / DENO_CERT, but each tool below
+    // checks its own var instead. Pointing them at the combined bundle
+    // makes future Python/curl/AWS clients trust OneCLI's MITM CA without
+    // bespoke NO_PROXY entries. The bypasses below stay as the faster path
+    // for hosts where MITM is gratuitous.
+    args.push('-e', 'REQUESTS_CA_BUNDLE=/tmp/onecli-combined-ca.pem');
+    args.push('-e', 'PIP_CERT=/tmp/onecli-combined-ca.pem');
+    args.push('-e', 'CURL_CA_BUNDLE=/tmp/onecli-combined-ca.pem');
+    args.push('-e', 'AWS_CA_BUNDLE=/tmp/onecli-combined-ca.pem');
+    args.push('-e', 'GIT_SSL_CAINFO=/tmp/onecli-combined-ca.pem');
+
     // Proxy bypasses for hosts where OneCLI's MITM either breaks the client
     // (bundled CA) or hijacks the auth path with provider routing.
     //
