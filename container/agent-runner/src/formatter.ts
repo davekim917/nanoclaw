@@ -87,6 +87,14 @@ export interface RoutingContext {
   channelType: string | null;
   threadId: string | null;
   inReplyTo: string | null;
+  /**
+   * When true, suppress streaming status writes (`> 💭 ...`) for this turn.
+   * Final chat messages still go out — the agent decides whether to write
+   * one. Set when any task in the inbound batch carries `quietStatus: true`
+   * in its content JSON. Used by background maintenance tasks where only
+   * notable findings should reach chat.
+   */
+  quietStatus: boolean;
 }
 
 /**
@@ -105,11 +113,27 @@ export interface RoutingContext {
 export function extractRouting(messages: MessageInRow[]): RoutingContext {
   const first = messages[0];
   const sessionRouting = getSessionRouting();
+  // Quiet-status mode: any task in the batch carrying `quietStatus: true`
+  // in its content JSON suppresses streaming status writes for the turn.
+  // Tasks rarely batch with chat messages, but if they did the chat
+  // shouldn't get silenced — so this is conservative: only quiet when
+  // ALL non-task messages would also be no-op (currently: when the batch
+  // is task-only).
+  const quietStatus = messages.every((m) => {
+    if (m.kind !== 'task') return false;
+    try {
+      const c = JSON.parse(m.content);
+      return c?.quietStatus === true;
+    } catch {
+      return false;
+    }
+  });
   return {
     platformId: first?.platform_id ?? sessionRouting.platform_id ?? null,
     channelType: first?.channel_type ?? sessionRouting.channel_type ?? null,
     threadId: first?.thread_id ?? sessionRouting.thread_id ?? null,
     inReplyTo: first?.id ?? null,
+    quietStatus,
   };
 }
 

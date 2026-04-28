@@ -26,6 +26,25 @@ export interface TaskDef {
   seriesId: string;
   prompt: string;
   tz?: string;
+  /**
+   * Where the task's chat output should land. Without this, the agent
+   * runner falls back to the session's home thread — which for
+   * non-DM agent groups is whichever thread happened to spawn the session.
+   * Pass the agent group's primary messaging-group platform_id with
+   * threadId=null to post in the parent channel.
+   */
+  destination?: {
+    platformId: string;
+    channelType: string;
+    threadId: string | null;
+  };
+  /**
+   * Suppress streaming status updates ("> 💭 ...") for the task's turn.
+   * Final chat messages still deliver normally — the agent decides whether
+   * to write one. Use for background maintenance tasks where the only
+   * interesting output is "I did N things" or nothing at all.
+   */
+  quietStatus?: boolean;
 }
 
 function generateSessionId(): string {
@@ -70,12 +89,19 @@ export async function scheduleTask(def: TaskDef, _dataDir?: string): Promise<voi
   db.pragma('journal_mode = DELETE');
   db.pragma('busy_timeout = 5000');
   try {
-    const content = JSON.stringify({ prompt: def.prompt });
+    const content = JSON.stringify({
+      prompt: def.prompt,
+      ...(def.quietStatus ? { quietStatus: true } : {}),
+    });
     // Idempotency: active series (pending/paused) → UPDATE; terminal rows (completed/failed/cancelled)
     // are treated as absent so a fresh row is inserted, enabling re-scheduling after cancellation.
     const activeRow = db
       .prepare("SELECT id FROM messages_in WHERE series_id = ? AND status IN ('pending', 'paused')")
       .get(def.seriesId) as { id: string } | undefined;
+
+    const platformId = def.destination?.platformId ?? null;
+    const channelType = def.destination?.channelType ?? null;
+    const threadId = def.destination?.threadId ?? null;
 
     if (activeRow) {
       db.prepare(
@@ -83,16 +109,19 @@ export async function scheduleTask(def: TaskDef, _dataDir?: string): Promise<voi
             SET process_after = ?,
                 recurrence    = ?,
                 content       = ?,
+                platform_id   = ?,
+                channel_type  = ?,
+                thread_id     = ?,
                 tries         = 0
           WHERE id = ?`,
-      ).run(def.processAfter, def.cron, content, activeRow.id);
+      ).run(def.processAfter, def.cron, content, platformId, channelType, threadId, activeRow.id);
     } else {
       const seq = nextEvenSeq(db);
       db.prepare(
         `INSERT INTO messages_in
-           (id, seq, kind, timestamp, status, tries, process_after, recurrence, series_id, content)
-         VALUES (?, ?, 'task', datetime('now'), 'pending', 0, ?, ?, ?, ?)`,
-      ).run(def.id, seq, def.processAfter, def.cron, def.seriesId, content);
+           (id, seq, kind, timestamp, status, tries, process_after, recurrence, series_id, content, platform_id, channel_type, thread_id)
+         VALUES (?, ?, 'task', datetime('now'), 'pending', 0, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(def.id, seq, def.processAfter, def.cron, def.seriesId, content, platformId, channelType, threadId);
     }
   } finally {
     db.close();

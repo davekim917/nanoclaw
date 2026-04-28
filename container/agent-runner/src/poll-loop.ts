@@ -478,6 +478,10 @@ function handleEvent(event: ProviderEvent, routing: RoutingContext): void {
       // are implementation details not useful to end users. Only surface
       // substantive progress messages (Bash output, search results, etc.).
       if (event.message.startsWith('Using ')) break;
+      // Quiet-status mode (set by tasks with quietStatus: true): suppress
+      // all streaming status writes. The agent's final chat message — if
+      // any — still goes out via dispatchResultText.
+      if (routing.quietStatus) break;
       // Emit a kind='status' message so the host can deliver it as a
       // post-then-edit progress line. Host tracks the platform_message_id
       // per session so subsequent progress events edit in place, and the
