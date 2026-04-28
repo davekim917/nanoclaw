@@ -1406,6 +1406,21 @@ async function buildContainerArgs(
       log.warn('OneCLI gateway error — container will have no credentials', { containerName, err });
     }
 
+    // Bundled-CA bypass. OneCLI's HTTPS proxy MITMs every CONNECT, even for
+    // hosts it has no vault entry for — so injections_applied=0 but it still
+    // re-signs the cert with its local CA. Clients that ship their own CA
+    // bundle (certifi, AWS CRT) reject this and emit "Could not connect to
+    // <backend>" with no auth context. Skipping the proxy for those hosts
+    // costs nothing (no credentials to inject) and restores the real chain.
+    //   - snowflake-connector-python (snowflake MCP + dbt-snowflake) → certifi
+    //   - boto3 / aws-sdk, especially STS → bundled cacerts
+    if (isToolEnabled(containerConfig.tools, 'snowflake') || isToolEnabled(containerConfig.tools, 'dbt')) {
+      mergeNoProxy(args, 'snowflakecomputing.com');
+    }
+    if (isToolEnabled(containerConfig.tools, 'aws')) {
+      mergeNoProxy(args, 'amazonaws.com');
+    }
+
     // OAuth bypass: when a host OAuth token is forwarded, tell the
     // in-container HTTPS_PROXY (just configured by OneCLI) to skip
     // api.anthropic.com. Without this, OneCLI's proxy would intercept the
