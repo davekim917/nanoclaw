@@ -177,17 +177,43 @@ export function formatMessages(messages: MessageInRow[]): string {
   return header + parts.join('\n\n');
 }
 
+/**
+ * Render a chat batch, splitting by trigger flag: trigger=1 are messages the
+ * bot was addressed in (need a reply); trigger=0 are accumulated context
+ * (`ignored_message_policy='accumulate'` on a non-engaging message). Both
+ * reach the prompt — the bot needs surrounding thread context to answer
+ * well — but only the addressed rows call for a response.
+ *
+ * Context is emitted first so the agent reads the backdrop before the
+ * message it's expected to act on.
+ */
 function formatChatMessages(messages: MessageInRow[]): string {
-  if (messages.length === 1) {
-    return formatSingleChat(messages[0]);
+  const triggers = messages.filter((m) => m.trigger === 1);
+  const context = messages.filter((m) => m.trigger !== 1);
+
+  if (context.length === 0) {
+    if (messages.length === 1) return formatSingleChat(messages[0]);
+    const lines = ['<messages>'];
+    for (const msg of messages) lines.push(formatSingleChat(msg));
+    lines.push('</messages>');
+    return lines.join('\n');
   }
 
-  const lines = ['<messages>'];
-  for (const msg of messages) {
-    lines.push(formatSingleChat(msg));
+  const parts: string[] = [];
+  parts.push(
+    '<thread_context note="Other people in this thread sent these. You were NOT addressed in them — they are here so you have the conversation up to now. Do not respond to or reason about them as if they were directed at you.">',
+  );
+  for (const m of context) parts.push(formatSingleChat(m));
+  parts.push('</thread_context>');
+
+  if (triggers.length > 0) {
+    const note = triggers.length === 1 ? 'Respond to this.' : 'Respond to these.';
+    parts.push(`<addressed_to_you note="${note}">`);
+    for (const m of triggers) parts.push(formatSingleChat(m));
+    parts.push('</addressed_to_you>');
   }
-  lines.push('</messages>');
-  return lines.join('\n');
+
+  return parts.join('\n');
 }
 
 function formatSingleChat(msg: MessageInRow): string {

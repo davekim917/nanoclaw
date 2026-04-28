@@ -27,7 +27,7 @@ import { createSlackAdapter } from '@chat-adapter/slack';
 
 import { readEnvFileMatching } from '../env.js';
 import { log } from '../log.js';
-import { parseTextStyles } from '../text-styles.js';
+import { markdownHeadingsToBold } from '../text-styles.js';
 import { createChatSdkBridge } from './chat-sdk-bridge.js';
 import { registerChannelAdapter } from './channel-registry.js';
 
@@ -87,11 +87,10 @@ for (const ws of workspaces) {
         concurrency: 'concurrent',
         supportsThreads: true,
         channelType: ws.channelType,
-        // Convert Markdown (**bold**, [text](url), ## heading) to Slack's
-        // mrkdwn syntax (*bold*, <url|text>, *heading*) before delivery.
-        // Without this, Claude's Markdown renders literally in Slack
-        // (asterisks shown, headings ignored, links broken).
-        transformOutboundText: (t) => parseTextStyles(t, 'slack'),
+        // ATX headings → bold so Block Kit table delivery stays on the
+        // `markdown` path (table-block conversion only fires for markdown/ast
+        // input). The adapter handles bold/italic/links/lists/tables natively.
+        transformOutboundMarkdown: markdownHeadingsToBold,
       });
     },
   });

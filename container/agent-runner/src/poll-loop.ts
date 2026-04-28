@@ -410,16 +410,19 @@ async function processQuery(
   const pollHandle = setInterval(() => {
     if (done) return;
 
-    // Skip system messages (MCP tool responses) and /clear (needs fresh query).
-    // Thread routing is the router's concern — if a message landed in this
-    // session, the agent should see it. Per-thread sessions already isolate
-    // threads into separate containers; shared sessions intentionally merge
-    // everything. Filtering on thread_id here caused deadlocks when the
-    // initial batch and follow-ups had mismatched thread_ids (e.g. a
-    // host-generated welcome trigger with null thread vs a Discord DM reply).
+    // Filtering on thread_id here caused deadlocks when the initial batch
+    // and follow-ups had mismatched thread_ids (e.g. a host-generated welcome
+    // trigger with null thread vs a Discord DM reply); per-thread sessions
+    // already isolate threads, so the router's routing is sufficient.
+    //
+    // The trigger gate mirrors the cold-start gate at the top of runPollLoop:
+    // trigger=0 rows ride the next wake's batch (where the formatter renders
+    // them inside <thread_context>). Letting them through here would feed
+    // Claude a non-mention as a follow-up user message mid-turn.
     const newMessages = getPendingMessages().filter((m) => {
       if (m.kind === 'system') return false;
       if ((m.kind === 'chat' || m.kind === 'chat-sdk') && isClearCommand(m)) return false;
+      if (m.trigger !== 1) return false;
       return true;
     });
     if (newMessages.length > 0) {

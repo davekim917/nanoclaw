@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 
-import { parseTextStyles, parseSignalStyles } from './text-styles.js';
+import { parseTextStyles, parseSignalStyles, markdownHeadingsToBold } from './text-styles.js';
 
 describe('parseTextStyles — passthrough channels', () => {
   it('passes text through unchanged on discord', () => {
@@ -133,5 +133,52 @@ describe('parseSignalStyles — mixed + snake_case guard', () => {
     const { text, textStyle } = parseSignalStyles('use snake_case_here');
     expect(text).toBe('use snake_case_here');
     expect(textStyle).toHaveLength(0);
+  });
+});
+
+describe('markdownHeadingsToBold', () => {
+  it('rewrites a single H2 to **bold**', () => {
+    expect(markdownHeadingsToBold('## Hello')).toBe('**Hello**');
+  });
+
+  it('rewrites all heading levels (H1–H6)', () => {
+    const input = ['# one', '## two', '### three', '#### four', '##### five', '###### six'].join('\n');
+    const expected = ['**one**', '**two**', '**three**', '**four**', '**five**', '**six**'].join('\n');
+    expect(markdownHeadingsToBold(input)).toBe(expected);
+  });
+
+  it('strips closing # markers (ATX-style)', () => {
+    expect(markdownHeadingsToBold('## Hello ##')).toBe('**Hello**');
+    expect(markdownHeadingsToBold('### Hello ###')).toBe('**Hello**');
+  });
+
+  it('only matches at the start of a line', () => {
+    expect(markdownHeadingsToBold('inline #not a heading')).toBe('inline #not a heading');
+    expect(markdownHeadingsToBold('value = 1 ## add one')).toBe('value = 1 ## add one');
+  });
+
+  it('leaves headings inside fenced code blocks alone', () => {
+    const input = ['## real heading', '', '```md', '## fake heading in code', '```'].join('\n');
+    const expected = ['**real heading**', '', '```md', '## fake heading in code', '```'].join('\n');
+    expect(markdownHeadingsToBold(input)).toBe(expected);
+  });
+
+  it('leaves headings inside inline code alone', () => {
+    expect(markdownHeadingsToBold('see `## not a heading`')).toBe('see `## not a heading`');
+  });
+
+  it('preserves surrounding paragraph text', () => {
+    const input = ['Lead paragraph.', '', '## Section title', '', 'Body paragraph.'].join('\n');
+    const expected = ['Lead paragraph.', '', '**Section title**', '', 'Body paragraph.'].join('\n');
+    expect(markdownHeadingsToBold(input)).toBe(expected);
+  });
+
+  it('returns empty / null-ish input untouched', () => {
+    expect(markdownHeadingsToBold('')).toBe('');
+  });
+
+  it('does not double-wrap an already-bolded heading', () => {
+    // Already bold — leaving it as **Heading** is the desired no-op.
+    expect(markdownHeadingsToBold('**already bold**')).toBe('**already bold**');
   });
 });

@@ -16,8 +16,13 @@ import { getPendingMessages } from './db/messages-in.js';
 import { formatMessages, stripInternalTags } from './formatter.js';
 import { TIMEZONE } from './timezone.js';
 
+// seq is NULL-allowed in the schema; assign monotonically per test so
+// `getPendingMessages` ORDER BY seq is deterministic.
+let nextSeq = 1;
+
 beforeEach(() => {
   initTestSessionDb();
+  nextSeq = 1;
 });
 
 afterEach(() => {
@@ -28,15 +33,17 @@ function insertMessage(
   id: string,
   kind: string,
   content: object,
-  opts?: { timestamp?: string },
+  opts?: { timestamp?: string; trigger?: number; seq?: number },
 ) {
   const timestamp = opts?.timestamp ?? new Date().toISOString();
+  const trigger = opts?.trigger ?? 1;
+  const seq = opts?.seq ?? nextSeq++;
   getInboundDb()
     .prepare(
-      `INSERT INTO messages_in (id, kind, timestamp, status, content)
-       VALUES (?, ?, ?, 'pending', ?)`,
+      `INSERT INTO messages_in (id, kind, timestamp, status, trigger, seq, content)
+       VALUES (?, ?, ?, 'pending', ?, ?, ?)`,
     )
-    .run(id, kind, timestamp, JSON.stringify(content));
+    .run(id, kind, timestamp, trigger, seq, JSON.stringify(content));
 }
 
 describe('context timezone header', () => {
@@ -133,6 +140,100 @@ describe('XML escaping', () => {
     const result = formatMessages(getPendingMessages());
     expect(result).toContain('sender="A &amp; B &lt;Co&gt;"');
     expect(result).toContain('&lt;script&gt;alert(&quot;xss&quot;)&lt;/script&gt;');
+  });
+});
+
+describe('trigger-flag split', () => {
+  it('all-trigger-1 batch renders as the legacy single <message> (one row)', () => {
+    insertMessage('m1', 'chat', { sender: 'Alice', text: 'hi' }, { trigger: 1 });
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('<message');
+    expect(result).not.toContain('<thread_context');
+    expect(result).not.toContain('<addressed_to_you');
+    expect(result).not.toContain('<messages>');
+  });
+
+  it('all-trigger-1 batch renders as the legacy <messages> group (multiple rows)', () => {
+    insertMessage('m1', 'chat', { sender: 'Alice', text: 'one' }, { trigger: 1 });
+    insertMessage('m2', 'chat', { sender: 'Bob', text: 'two' }, { trigger: 1 });
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('<messages>');
+    expect(result).toContain('</messages>');
+    expect(result).not.toContain('<thread_context');
+    expect(result).not.toContain('<addressed_to_you');
+  });
+
+  it('mixed batch wraps trigger=0 in <thread_context> and trigger=1 in <addressed_to_you>', () => {
+    insertMessage('ctx', 'chat', { sender: 'James', text: '@dae' }, { trigger: 0 });
+    insertMessage('ask', 'chat', { sender: 'Dave', text: 'where are we?' }, { trigger: 1 });
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('<thread_context');
+    expect(result).toContain('</thread_context>');
+    expect(result).toContain('<addressed_to_you');
+    expect(result).toContain('</addressed_to_you>');
+    // The context must come BEFORE the addressed block so the agent reads
+    // background first and arrives at the addressed message with full context.
+    const ctxIdx = result.indexOf('<thread_context');
+    const addrIdx = result.indexOf('<addressed_to_you');
+    expect(ctxIdx).toBeGreaterThanOrEqual(0);
+    expect(addrIdx).toBeGreaterThan(ctxIdx);
+    // Each block contains the right message.
+    const ctxBlock = result.slice(ctxIdx, addrIdx);
+    const addrBlock = result.slice(addrIdx);
+    expect(ctxBlock).toContain('@dae');
+    expect(ctxBlock).not.toContain('where are we?');
+    expect(addrBlock).toContain('where are we?');
+    expect(addrBlock).not.toContain('@dae');
+  });
+
+  it('multiple context messages preserve order inside <thread_context>', () => {
+    insertMessage('c1', 'chat', { sender: 'A', text: 'first ctx' }, { trigger: 0 });
+    insertMessage('c2', 'chat', { sender: 'B', text: 'second ctx' }, { trigger: 0 });
+    insertMessage('m1', 'chat', { sender: 'C', text: 'addressed' }, { trigger: 1 });
+    const result = formatMessages(getPendingMessages());
+    const firstIdx = result.indexOf('first ctx');
+    const secondIdx = result.indexOf('second ctx');
+    // Match the message body, not the surrounding `<addressed_to_you ...>` tag.
+    const addrIdx = result.indexOf('>addressed</');
+    expect(firstIdx).toBeGreaterThanOrEqual(0);
+    expect(secondIdx).toBeGreaterThan(firstIdx);
+    expect(addrIdx).toBeGreaterThan(secondIdx);
+  });
+
+  it('multiple addressed messages render unwrapped inside <addressed_to_you>', () => {
+    insertMessage('c1', 'chat', { sender: 'A', text: 'ctx' }, { trigger: 0 });
+    insertMessage('m1', 'chat', { sender: 'B', text: 'one' }, { trigger: 1 });
+    insertMessage('m2', 'chat', { sender: 'C', text: 'two' }, { trigger: 1 });
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('<addressed_to_you');
+    // Both addressed messages appear inside the addressed block (no inner
+    // <messages> wrapper — the parent block already groups them).
+    const addrStart = result.indexOf('<addressed_to_you');
+    const addrEnd = result.indexOf('</addressed_to_you>');
+    const addrBlock = result.slice(addrStart, addrEnd);
+    expect(addrBlock).toContain('one');
+    expect(addrBlock).toContain('two');
+  });
+
+  it('context-only batch (no trigger=1) still emits <thread_context> with no <addressed_to_you>', () => {
+    // This shape can hit the formatter via the mid-turn pollHandle push when
+    // a batch of accumulated rows arrives with no fresh trigger=1. The agent
+    // reads them as background and continues whatever it was doing.
+    insertMessage('c1', 'chat', { sender: 'A', text: 'just context' }, { trigger: 0 });
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('<thread_context');
+    expect(result).toContain('just context');
+    expect(result).not.toContain('<addressed_to_you');
+  });
+
+  it('preserves the timezone header before the trigger-split blocks', () => {
+    insertMessage('c1', 'chat', { sender: 'A', text: 'ctx' }, { trigger: 0 });
+    insertMessage('m1', 'chat', { sender: 'B', text: 'addressed' }, { trigger: 1 });
+    const result = formatMessages(getPendingMessages());
+    const ctxHeaderIdx = result.indexOf('<context timezone');
+    const threadIdx = result.indexOf('<thread_context');
+    expect(ctxHeaderIdx).toBeGreaterThanOrEqual(0);
+    expect(threadIdx).toBeGreaterThan(ctxHeaderIdx);
   });
 });
 

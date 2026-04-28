@@ -5,6 +5,7 @@
 import { createDiscordAdapter } from '@chat-adapter/discord';
 
 import { readEnvFile } from '../env.js';
+import { transformOutsideProtectedRegions } from '../text-styles.js';
 import { createChatSdkBridge, type ReplyContext } from './chat-sdk-bridge.js';
 import { registerChannelAdapter } from './channel-registry.js';
 
@@ -42,26 +43,11 @@ function isUserMessage(message: { raw?: any }): boolean {
  * Code regions are protected so URLs inside fenced/inline code stay literal.
  */
 function rewriteDiscordLinks(text: string): string {
-  if (!text) return text;
-  return splitProtectedAndTransform(text, (segment) =>
-    segment.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (match, linkText: string, url: string) => {
-      return /https?:\/\//.test(linkText) ? url : match;
-    }),
+  return transformOutsideProtectedRegions(text, (segment) =>
+    segment.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (match, linkText: string, url: string) =>
+      /https?:\/\//.test(linkText) ? url : match,
+    ),
   );
-}
-
-function splitProtectedAndTransform(text: string, transform: (s: string) => string): string {
-  const CODE_PATTERN = /```[\s\S]*?```|`[^`\n]+`/g;
-  const out: string[] = [];
-  let lastIndex = 0;
-  let match: RegExpExecArray | null;
-  while ((match = CODE_PATTERN.exec(text)) !== null) {
-    if (match.index > lastIndex) out.push(transform(text.slice(lastIndex, match.index)));
-    out.push(match[0]);
-    lastIndex = match.index + match[0].length;
-  }
-  if (lastIndex < text.length) out.push(transform(text.slice(lastIndex)));
-  return out.join('');
 }
 
 registerChannelAdapter('discord', {
@@ -80,7 +66,10 @@ registerChannelAdapter('discord', {
       extractReplyContext,
       supportsThreads: true,
       maxTextLength: 1900,
-      transformOutboundText: rewriteDiscordLinks,
+      // Markdown delivery (not raw) keeps the chat-adapter's tableToAscii
+      // conversion in play; without it, Markdown tables would render as raw
+      // `|`-pipe text in Discord (no native table block).
+      transformOutboundMarkdown: rewriteDiscordLinks,
       inboundFilter: isUserMessage,
     });
   },

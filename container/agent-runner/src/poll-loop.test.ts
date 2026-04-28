@@ -115,6 +115,25 @@ describe('accumulate gate (trigger column)', () => {
     expect(messages.map((m) => m.id).sort()).toEqual(['m1', 'm2']);
   });
 
+  it('mid-turn push predicate excludes trigger=0 rows (mirrors active-query filter)', () => {
+    // The active-query helper inside processQuery (poll-loop.ts ~line 410)
+    // pushes follow-up messages into the in-flight Claude query every 500ms.
+    // Without a trigger gate, a non-mention arriving while the agent is still
+    // working on an earlier mention reaches the agent mid-turn — and Claude's
+    // extended thinking would emit a streaming thinking-block status about a
+    // message the bot wasn't even addressed in. The mid-turn filter must
+    // mirror the cold-start gate at the top of runPollLoop: only trigger=1
+    // rows count as wake-eligible follow-ups; trigger=0 rows wait for the
+    // next real wake (where the formatter renders them inside <thread_context>).
+    insertMessage('m1', 'chat', { sender: 'A', text: 'noise during active turn' }, { trigger: 0 });
+    insertMessage('m2', 'chat', { sender: 'B', text: 'mid-turn mention' }, { trigger: 1 });
+    const messages = getPendingMessages();
+    // Replicate the exact filter used in processQuery's pollHandle (excluding
+    // the kind=system / /clear filters which are tested elsewhere).
+    const eligibleForMidTurnPush = messages.filter((m) => m.trigger === 1);
+    expect(eligibleForMidTurnPush.map((m) => m.id)).toEqual(['m2']);
+  });
+
   it('trigger column defaults to 1 for legacy inserts without explicit value', () => {
     // The schema default is 1 (see src/db/schema.ts INBOUND_SCHEMA) — existing
     // rows / tests without the column set are effectively wake-eligible.

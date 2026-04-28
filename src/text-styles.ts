@@ -287,6 +287,34 @@ function splitProtectedRegions(text: string): Segment[] {
   return segments.length > 0 ? segments : [{ content: text, protected: false }];
 }
 
+/**
+ * Apply `transform` to every region of `text` that is NOT inside a fenced
+ * (```...```) or inline (`...`) code block. Code regions are passed through
+ * unchanged. Returns the recombined string.
+ *
+ * Use this for Markdown→Markdown rewrites that should never touch code
+ * (link rewriting, heading bumping, marker substitution).
+ */
+export function transformOutsideProtectedRegions(text: string, transform: (segment: string) => string): string {
+  if (!text) return text;
+  return splitProtectedRegions(text)
+    .map(({ content, protected: isProtected }) => (isProtected ? content : transform(content)))
+    .join('');
+}
+
+/**
+ * Markdown→Markdown: `## Heading` → `**Heading**`. For chat-adapters that
+ * render ATX headings as plain text but bold natively — pre-bumping keeps
+ * heading emphasis without leaving the `markdown` delivery path (which is
+ * where rich-block features like Slack Block Kit tables live). Code regions
+ * are passed through untouched.
+ */
+export function markdownHeadingsToBold(text: string): string {
+  return transformOutsideProtectedRegions(text, (s) =>
+    s.replace(/^[ \t]*#{1,6}[ \t]+(.+?)[ \t]*#*[ \t]*$/gm, '**$1**'),
+  );
+}
+
 /** Apply marker-substitution transformations to a non-code segment. */
 function transformSegment(text: string, channel: ChannelType): string {
   let t = text;

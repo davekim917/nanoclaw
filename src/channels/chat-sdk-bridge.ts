@@ -59,10 +59,24 @@ export interface ChatSdkBridgeConfig {
   supportsThreads: boolean;
   /**
    * Optional transform applied to outbound text/markdown before it reaches the
-   * adapter. Used by channels that need to sanitize for a platform-specific
-   * quirk (e.g. Telegram's legacy Markdown parse mode).
+   * adapter. Used by channels that pre-render to the platform's native syntax
+   * (e.g. Telegram's legacy Markdown parse mode). Setting this forces `raw`
+   * delivery, which bypasses the chat-adapter's own markdown→native conversion
+   * (and any rich-block features like Slack's Block Kit table rendering).
+   * Use `transformOutboundMarkdown` instead when the transform preserves
+   * standard Markdown semantics.
    */
   transformOutboundText?: (text: string) => string;
+  /**
+   * Optional Markdown→Markdown transform. Unlike `transformOutboundText`,
+   * the result is still standard Markdown, so the bridge keeps `markdown`
+   * delivery — the chat-adapter does its own native conversion AND any
+   * rich-block rendering it supports (e.g. Slack Block Kit tables). Set at
+   * most one of `transformOutboundText` / `transformOutboundMarkdown` per
+   * adapter; if both are set, `transformOutboundText` wins (preserves the
+   * pre-existing raw-delivery contract).
+   */
+  transformOutboundMarkdown?: (markdown: string) => string;
   /**
    * Optional filter applied to inbound Chat SDK messages before they reach
    * the host router. Return false to drop. Used by channels that need to
@@ -134,12 +148,15 @@ export function splitForLimit(text: string, limit: number): string[] {
 
 export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter {
   const { adapter } = config;
-  const transformText = (t: string): string => (config.transformOutboundText ? config.transformOutboundText(t) : t);
-  // When transformOutboundText is set, the returned text is already in the
-  // adapter's native format (e.g. Slack mrkdwn). Send it as `raw` so the
-  // adapter doesn't re-parse it as standard Markdown — that double-conversion
-  // mangles links: `<https://x|https://x>` round-trips through CommonMark as
-  // an autolink whose URL contains the pipe, producing malformed mrkdwn.
+  const transformText = (t: string): string => {
+    if (config.transformOutboundText) return config.transformOutboundText(t);
+    if (config.transformOutboundMarkdown) return config.transformOutboundMarkdown(t);
+    return t;
+  };
+  // Native-syntax transforms (e.g. Telegram mrkdwn) round-trip as `raw` so
+  // the adapter doesn't re-parse them as CommonMark and mangle links.
+  // Markdown-preserving transforms keep `markdown` delivery so adapter
+  // rich-block features (Slack Block Kit tables, etc.) still fire.
   const wrapBody = (text: string): { markdown: string } | { raw: string } =>
     config.transformOutboundText ? { raw: text } : { markdown: text };
   let chat: Chat;
