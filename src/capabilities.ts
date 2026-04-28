@@ -345,7 +345,9 @@ function buildSessionServicesSnapshot(agentGroupId: string): SessionServicesSnap
       scopes: [],
       credentialPaths: [],
       activation: `Authenticated via \`DBT_CLOUD_API_TOKEN\` (resolved from host env \`${dbtCloudToken.name}\`)${
-        dbtCloudUrl.set ? `, base URL via \`${dbtCloudUrl.name}\`` : ' — no API URL var set, default to https://cloud.getdbt.com'
+        dbtCloudUrl.set
+          ? `, base URL via \`${dbtCloudUrl.name}\``
+          : ' — no API URL var set, default to https://cloud.getdbt.com'
       }${dbtCloudAccount.set ? `, account id via \`${dbtCloudAccount.name}\`` : ' — no account id var set, required by most endpoints'}. Example: \`curl -H "Authorization: Token $DBT_CLOUD_API_TOKEN" "$DBT_CLOUD_API_URL/api/v2/accounts/$DBT_CLOUD_ACCOUNT_ID/"\`. Do NOT ask the user for the token — it's already in your env.`,
     });
   }
@@ -393,7 +395,9 @@ function buildSessionServicesSnapshot(agentGroupId: string): SessionServicesSnap
       const workspace = resolveScopedEnvVar('RENDER_WORKSPACE_ID', folder);
       const folderTok = folder.toUpperCase().replace(/-/g, '_');
       const scopedDbEnv = Object.keys(process.env)
-        .filter((k) => (k.startsWith('RENDER_PG_') || k.startsWith('RENDER_REDIS_URL_')) && k.includes(`_${folderTok}_`))
+        .filter(
+          (k) => (k.startsWith('RENDER_PG_') || k.startsWith('RENDER_REDIS_URL_')) && k.includes(`_${folderTok}_`),
+        )
         .sort();
       const scopeList = extractToolScopes(tools, 'render').scopes;
       services.push({
