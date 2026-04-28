@@ -331,49 +331,82 @@ function buildSessionServicesSnapshot(agentGroupId: string): SessionServicesSnap
     });
   }
 
+  // dbt Cloud — env-var-scoped (no `tools` declaration needed; surfaced
+  // whenever the host can resolve a token for this folder). DBT_CLOUD_API_TOKEN
+  // is the load-bearing var; URL/ACCOUNT_ID are useful context if also set.
+  const dbtCloudToken = resolveScopedEnvVar('DBT_CLOUD_API_TOKEN', folder);
+  if (dbtCloudToken.set) {
+    const dbtCloudUrl = resolveScopedEnvVar('DBT_CLOUD_API_URL', folder);
+    const dbtCloudAccount = resolveScopedEnvVar('DBT_CLOUD_ACCOUNT_ID', folder);
+    services.push({
+      name: 'dbt Cloud',
+      cli: 'curl / dbt-cloud-cli',
+      declaredTools: [],
+      scopes: [],
+      credentialPaths: [],
+      activation: `Authenticated via \`DBT_CLOUD_API_TOKEN\` (resolved from host env \`${dbtCloudToken.name}\`)${
+        dbtCloudUrl.set ? `, base URL via \`${dbtCloudUrl.name}\`` : ' — no API URL var set, default to https://cloud.getdbt.com'
+      }${dbtCloudAccount.set ? `, account id via \`${dbtCloudAccount.name}\`` : ' — no account id var set, required by most endpoints'}. Example: \`curl -H "Authorization: Token $DBT_CLOUD_API_TOKEN" "$DBT_CLOUD_API_URL/api/v2/accounts/$DBT_CLOUD_ACCOUNT_ID/"\`. Do NOT ask the user for the token — it's already in your env.`,
+    });
+  }
+
   // GitHub — env-var-scoped. Host resolves GITHUB_TOKEN_<FOLDER> at spawn and
   // forwards as GITHUB_TOKEN; the scoped var may also be visible in-container
   // depending on the forwarding loop. We report which env name the host would
   // have picked.
-  if (declared(['github'])) {
+  // Gated on env-var presence OR explicit tools declaration: the host
+  // injects GITHUB_TOKEN unconditionally based on folder-name resolution,
+  // so credential availability — not the tools array — is what determines
+  // whether the agent actually has GitHub access. The `declared` arm
+  // preserves the old "configured but token missing" diagnostic.
+  {
     const tokenEnvName = cfg?.githubTokenEnv ?? null;
     const resolved =
       tokenEnvName && process.env[tokenEnvName]
         ? { name: tokenEnvName, set: true }
         : resolveScopedEnvVar('GITHUB_TOKEN', folder);
-    const scopeList = extractToolScopes(tools, 'github').scopes;
-    services.push({
-      name: 'GitHub',
-      cli: 'gh',
-      declaredTools: declaredMatchingTools(['github']),
-      scopes: scopeList,
-      credentialPaths: [],
-      activation: resolved.set
-        ? `\`gh\` and \`git\` both pre-authenticated via \`GITHUB_TOKEN\` (resolved from host env \`${resolved.name}\`). \`gh repo view\`, \`gh pr create\`, \`git push\` all work directly. DO NOT run \`gh auth login\`.`
-        : `GitHub scoped tool declared but no token set at host env ${tokenEnvName ?? 'GITHUB_TOKEN_<folder>'} or fallback GITHUB_TOKEN — ask Dave.`,
-    });
+    if (resolved.set || declared(['github'])) {
+      const scopeList = extractToolScopes(tools, 'github').scopes;
+      const allowedOrgs = resolveScopedEnvVar('GITHUB_ALLOWED_ORGS', folder);
+      services.push({
+        name: 'GitHub',
+        cli: 'gh',
+        declaredTools: declaredMatchingTools(['github']),
+        scopes: scopeList,
+        credentialPaths: [],
+        activation: resolved.set
+          ? `\`gh\` and \`git\` both pre-authenticated via \`GITHUB_TOKEN\` (resolved from host env \`${resolved.name}\`)${
+              allowedOrgs.set ? `, restricted to orgs: \`${process.env[allowedOrgs.name]}\`` : ''
+            }. \`gh repo view\`, \`gh pr create\`, \`git push\` all work directly. DO NOT run \`gh auth login\`. DO NOT ask the user for a token — it's already in your env.`
+          : `GitHub tool declared but no token set at host env ${tokenEnvName ?? 'GITHUB_TOKEN_<folder>'} or fallback GITHUB_TOKEN — ask Dave.`,
+      });
+    }
   }
 
   // Render — env-var-scoped (RENDER_API_KEY + RENDER_WORKSPACE_ID); also lists
   // the scoped PG/Redis URL env vars the host has forwarded.
-  if (declared(['render'])) {
+  // Gated on env-var presence OR explicit tools declaration (same rationale
+  // as GitHub above).
+  {
     const apiKey = resolveScopedEnvVar('RENDER_API_KEY', folder);
-    const workspace = resolveScopedEnvVar('RENDER_WORKSPACE_ID', folder);
-    const folderTok = folder.toUpperCase().replace(/-/g, '_');
-    const scopedDbEnv = Object.keys(process.env)
-      .filter((k) => (k.startsWith('RENDER_PG_') || k.startsWith('RENDER_REDIS_URL_')) && k.includes(`_${folderTok}_`))
-      .sort();
-    const scopeList = extractToolScopes(tools, 'render').scopes;
-    services.push({
-      name: 'Render',
-      cli: 'render',
-      declaredTools: declaredMatchingTools(['render']),
-      scopes: scopeList,
-      credentialPaths: [],
-      activation: apiKey.set
-        ? `\`render\` CLI authenticated via \`RENDER_API_KEY\` (from host env \`${apiKey.name}\`${workspace.set ? `, workspace via \`${workspace.name}\`` : ''}). Common: \`render services -o json\`, \`render logs --service-id <id>\`, \`render psql --service-id <pg-id>\`.${scopedDbEnv.length > 0 ? ` Scoped DB URLs also injected as env vars: ${scopedDbEnv.join(', ')}.` : ''}`
-        : `render tool declared but RENDER_API_KEY not set at host — ask Dave.`,
-    });
+    if (apiKey.set || declared(['render'])) {
+      const workspace = resolveScopedEnvVar('RENDER_WORKSPACE_ID', folder);
+      const folderTok = folder.toUpperCase().replace(/-/g, '_');
+      const scopedDbEnv = Object.keys(process.env)
+        .filter((k) => (k.startsWith('RENDER_PG_') || k.startsWith('RENDER_REDIS_URL_')) && k.includes(`_${folderTok}_`))
+        .sort();
+      const scopeList = extractToolScopes(tools, 'render').scopes;
+      services.push({
+        name: 'Render',
+        cli: 'render',
+        declaredTools: declaredMatchingTools(['render']),
+        scopes: scopeList,
+        credentialPaths: [],
+        activation: apiKey.set
+          ? `\`render\` CLI authenticated via \`RENDER_API_KEY\` (from host env \`${apiKey.name}\`${workspace.set ? `, workspace via \`${workspace.name}\`` : ''}). Common: \`render services -o json\`, \`render logs --service-id <id>\`, \`render psql --service-id <pg-id>\`.${scopedDbEnv.length > 0 ? ` Scoped DB URLs also injected as env vars: ${scopedDbEnv.join(', ')}.` : ''} DO NOT ask the user for the API key — it's already in your env.`
+          : `render tool declared but RENDER_API_KEY not set at host — ask Dave.`,
+      });
+    }
   }
 
   // Exa — universal. Always shown (gated only on EXA_API_KEY for accurate
