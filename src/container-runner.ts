@@ -430,6 +430,13 @@ const SCOPED_CREDENTIAL_VARS = [
   'SUPABASE_PROJECT_REF',
   'SUPABASE_ACCESS_TOKEN',
   'SUPABASE_DB_PASSWORD',
+  // Git commit identity. Env vars take precedence over `git -c user.name=...`
+  // overrides used by the in-container git_commit MCP tool, so setting these
+  // per-group attributes commits to the human, not "agent".
+  'GIT_AUTHOR_NAME',
+  'GIT_AUTHOR_EMAIL',
+  'GIT_COMMITTER_NAME',
+  'GIT_COMMITTER_EMAIL',
 ];
 
 /**
