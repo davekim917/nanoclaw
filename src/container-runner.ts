@@ -1438,6 +1438,13 @@ async function buildContainerArgs(
     // out and reports loggedIn:false even when auth.json is valid. Bypass
     // is unconditional — non-codex agents don't talk to chatgpt.com.
     mergeNoProxy(args, 'chatgpt.com');
+    // pip / Python package install bypass — pip uses certifi and rejects
+    // OneCLI's CA with "SSL: CERTIFICATE_VERIFY_FAILED, self-signed
+    // certificate in certificate chain". Breaks `install_packages` self-mod
+    // and any Python tool that pip-installs at runtime (dbt extensions,
+    // ad-hoc packages). Wheels live on files.pythonhosted.org.
+    mergeNoProxy(args, 'pypi.org');
+    mergeNoProxy(args, 'pythonhosted.org');
 
     // OAuth bypass: when a host OAuth token is forwarded, tell the
     // in-container HTTPS_PROXY (just configured by OneCLI) to skip
