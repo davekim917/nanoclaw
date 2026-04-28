@@ -1406,12 +1406,12 @@ async function buildContainerArgs(
       log.warn('OneCLI gateway error — container will have no credentials', { containerName, err });
     }
 
-    // Bundled-CA bypass. OneCLI's HTTPS proxy MITMs every CONNECT, even for
-    // hosts it has no vault entry for — so injections_applied=0 but it still
-    // re-signs the cert with its local CA. Clients that ship their own CA
-    // bundle (certifi, AWS CRT) reject this and emit "Could not connect to
-    // <backend>" with no auth context. Skipping the proxy for those hosts
-    // costs nothing (no credentials to inject) and restores the real chain.
+    // Proxy bypasses for hosts where OneCLI's MITM either breaks the client
+    // (bundled CA) or hijacks the auth path with provider routing.
+    //
+    // Bundled-CA bypass — OneCLI re-signs every CONNECT with its local CA
+    // even when injections_applied=0. Clients that ship their own CA bundle
+    // reject this and emit "Could not connect to <backend>".
     //   - snowflake-connector-python (snowflake MCP + dbt-snowflake) → certifi
     //   - boto3 / aws-sdk, especially STS → bundled cacerts
     if (isToolEnabled(containerConfig.tools, 'snowflake') || isToolEnabled(containerConfig.tools, 'dbt')) {
@@ -1419,6 +1419,16 @@ async function buildContainerArgs(
     }
     if (isToolEnabled(containerConfig.tools, 'aws')) {
       mergeNoProxy(args, 'amazonaws.com');
+    }
+    // GitHub bypass — git's smart-HTTP protocol uses Basic auth
+    // (base64(user:GH_TOKEN)). OneCLI v1.18.6+ recognizes github.com as a
+    // known provider and tries to strip+replace that header with its
+    // connected-app credential, returning 401 "app not connected
+    // provider=github" for any agent without a vault link. Sending the
+    // forwarded GH_TOKEN directly to GitHub authenticates both git protocol
+    // and api.github.com (gh CLI) equivalently.
+    if (ghToken) {
+      mergeNoProxy(args, 'github.com');
     }
 
     // OAuth bypass: when a host OAuth token is forwarded, tell the
