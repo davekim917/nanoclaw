@@ -1561,6 +1561,16 @@ async function buildContainerArgs(
       url: 'https://public.heypocketai.com/mcp',
     };
   }
+  if (canInject('linear') && isToolEnabled(containerConfig.tools, 'linear')) {
+    // Auth header injected by the OneCLI gateway proxy at request time
+    // (vault entry "Linear" → mcp.linear.app). Linear's hosted MCP accepts
+    // a Personal API Key or OAuth access token as `Authorization: Bearer`.
+    // Gated by `tools: ["linear"]` in container.json so groups opt in.
+    mcpServers.linear = {
+      type: 'http',
+      url: 'https://mcp.linear.app/mcp',
+    };
+  }
   if (Object.keys(mcpServers).length > 0) {
     args.push('-e', `NANOCLAW_MCP_SERVERS=${JSON.stringify(mcpServers)}`);
   }

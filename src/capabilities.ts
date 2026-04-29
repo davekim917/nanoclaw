@@ -473,6 +473,19 @@ function buildSessionServicesSnapshot(agentGroupId: string): SessionServicesSnap
       'Meeting transcripts + notes via Granola REST API. Auth injected by OneCLI on public-api.granola.ai; no token visible in-container. Tools: `mcp__granola__list_meetings`, `mcp__granola__get_meeting` (set include_transcript=true for raw transcript).',
   });
 
+  // Linear — gated by tool entry. Container-runner injects when 'linear' is in
+  // container.json.tools and the OneCLI gateway proxy injects auth at request
+  // time (vault entry "Linear" → mcp.linear.app).
+  services.push({
+    name: 'Linear',
+    mcpNamespace: 'mcp__linear__*',
+    declaredTools: declaredMatchingTools(['linear']),
+    scopes: [],
+    credentialPaths: [],
+    useFor:
+      'Linear issue tracker via https://mcp.linear.app/mcp. Auth pre-injected (Authorization: Bearer). Use for: list/search/create/update issues, comments, projects, cycles, teams, users. Tools: `mcp__linear__*`.',
+  });
+
   return { agentGroupId, services };
 }
 
