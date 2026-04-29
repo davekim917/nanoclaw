@@ -475,16 +475,20 @@ function buildSessionServicesSnapshot(agentGroupId: string): SessionServicesSnap
 
   // Linear — gated by tool entry. Container-runner injects when 'linear' is in
   // container.json.tools and the OneCLI gateway proxy injects auth at request
-  // time (vault entry "Linear" → mcp.linear.app).
-  services.push({
-    name: 'Linear',
-    mcpNamespace: 'mcp__linear__*',
-    declaredTools: declaredMatchingTools(['linear']),
-    scopes: [],
-    credentialPaths: [],
-    useFor:
-      'Linear issue tracker via https://mcp.linear.app/mcp. Auth pre-injected (Authorization: Bearer). Use for: list/search/create/update issues, comments, projects, cycles, teams, users. Tools: `mcp__linear__*`.',
-  });
+  // time (vault entry "Linear" → mcp.linear.app). Only surface in the
+  // capabilities snapshot for groups that opted in, so other groups don't
+  // claim Linear access they don't actually have.
+  if (declared(['linear'])) {
+    services.push({
+      name: 'Linear',
+      mcpNamespace: 'mcp__linear__*',
+      declaredTools: declaredMatchingTools(['linear']),
+      scopes: [],
+      credentialPaths: [],
+      useFor:
+        'Linear issue tracker via https://mcp.linear.app/mcp. Auth pre-injected (Authorization: Bearer). Use for: list/search/create/update issues, comments, projects, cycles, teams, users. Tools: `mcp__linear__*`.',
+    });
+  }
 
   return { agentGroupId, services };
 }
