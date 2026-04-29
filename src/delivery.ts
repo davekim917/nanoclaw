@@ -37,13 +37,22 @@ const MAX_DELIVERY_ATTEMPTS = 3;
 const deliveryAttempts = new Map<string, number>();
 
 /**
- * Per-session tracking of the currently-visible status line's
- * platform_message_id. First `kind='status'` in a turn posts a fresh
- * message and caches the returned id here; subsequent status events
- * in the same turn edit that message in place. Cleared on real chat
- * delivery so the next turn starts with a fresh status line.
+ * Per-session tracking of the currently-visible status line. First
+ * `kind='status'` in a turn posts a fresh message and caches the route
+ * + platform message id here; subsequent status events in the same turn
+ * edit that message in place. On real chat delivery the orphan is
+ * deleted via `deleteMessage` (using the *stored* route, not the chat
+ * delivery's route — `send_message` can target a different
+ * channel/thread than the session's status was posted to) and tracking
+ * is cleared.
  */
-const statusTracking = new Map<string, string>();
+interface StatusTrack {
+  channelType: string;
+  platformId: string;
+  threadId: string | null;
+  messageId: string;
+}
+const statusTracking = new Map<string, StatusTrack>();
 
 /**
  * Sessions whose outbound queue is currently being drained.
@@ -67,6 +76,12 @@ export interface ChannelDeliveryAdapter {
     files?: OutboundFile[],
   ): Promise<string | undefined>;
   setTyping?(channelType: string, platformId: string, threadId: string | null): Promise<void>;
+  deleteMessage?(
+    channelType: string,
+    platformId: string,
+    threadId: string | null,
+    messageId: string,
+  ): Promise<void>;
 }
 
 let deliveryAdapter: ChannelDeliveryAdapter | null = null;
@@ -334,13 +349,13 @@ async function deliverMessage(
       log.warn('Status message missing routing fields, dropping', { id: msg.id });
       return {};
     }
-    const existingPlatformMsgId = statusTracking.get(session.id);
+    const existing = statusTracking.get(session.id);
     let outbound = scrubSecrets(msg.content);
-    if (existingPlatformMsgId) {
+    if (existing) {
       const parsed = JSON.parse(outbound);
       outbound = JSON.stringify({
         operation: 'edit',
-        messageId: existingPlatformMsgId,
+        messageId: existing.messageId,
         text: parsed.text,
       });
     }
@@ -351,14 +366,24 @@ async function deliverMessage(
       msg.kind,
       outbound,
     );
-    if (platformMsgId && !existingPlatformMsgId) {
-      statusTracking.set(session.id, platformMsgId);
+    if (platformMsgId && !existing) {
+      // Pin the route at post-time. The cleanup branch on chat delivery uses
+      // *this* route to delete the orphan, NOT the chat-final's route — the
+      // agent's send_message MCP tool can target a different channel/thread,
+      // and using the wrong (channel, ts) pair on Slack's chat.delete could
+      // delete an unrelated message if the timestamps happened to collide.
+      statusTracking.set(session.id, {
+        channelType: msg.channel_type,
+        platformId: msg.platform_id,
+        threadId: msg.thread_id,
+        messageId: platformMsgId,
+      });
     }
     log.info('Status delivered', {
       id: msg.id,
       sessionId: session.id,
-      mode: existingPlatformMsgId ? 'edit' : 'post',
-      platformMsgId: platformMsgId ?? existingPlatformMsgId,
+      mode: existing ? 'edit' : 'post',
+      platformMsgId: platformMsgId ?? existing?.messageId,
     });
     return { platformMsgId: platformMsgId ?? undefined };
   }
@@ -436,10 +461,38 @@ async function deliverMessage(
     fileCount: files?.length,
   });
 
-  // A real chat message supersedes any in-flight progress status — clear
-  // the tracking so the next turn's progress events post a fresh line
-  // instead of editing a now-stale status line above the final answer.
+  // A real chat message supersedes any in-flight progress status. Delete
+  // the orphan thinking-block message so it doesn't linger in the thread,
+  // then clear the tracking entry. Uses the *stored* route (pinned when
+  // the status was first posted) — `send_message` can deliver this chat
+  // reply to a different channel/thread than the status was posted to,
+  // and using the chat reply's route to call `chat.delete` would target
+  // the wrong channel.
+  //
+  // Errors are swallowed: a delete failure (network, permission revoked,
+  // message already gone) leaves the orphan visible but must NOT block
+  // markDelivered for the chat reply itself — that would cause retry/
+  // duplicate of the real answer.
   if (msg.kind === 'chat') {
+    const orphan = statusTracking.get(session.id);
+    if (orphan && deliveryAdapter.deleteMessage) {
+      try {
+        await deliveryAdapter.deleteMessage(
+          orphan.channelType,
+          orphan.platformId,
+          orphan.threadId,
+          orphan.messageId,
+        );
+      } catch (err) {
+        log.warn('Failed to delete orphan thinking-block status — leaving as-is', {
+          sessionId: session.id,
+          channelType: orphan.channelType,
+          platformId: orphan.platformId,
+          messageId: orphan.messageId,
+          err: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
     statusTracking.delete(session.id);
 
     // Mirror agent replies into the central archive (2.9). Scrubbed text

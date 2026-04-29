@@ -62,6 +62,24 @@ function insertOutbound(agentGroupId: string, sessionId: string, msgId: string):
   db.close();
 }
 
+function insertOutboundKind(
+  agentGroupId: string,
+  sessionId: string,
+  msgId: string,
+  kind: string,
+  channelType: string,
+  platformId: string,
+  content: object,
+  threadId: string | null = null,
+): void {
+  const db = new Database(outboundDbPath(agentGroupId, sessionId));
+  db.prepare(
+    `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, thread_id, content)
+     VALUES (?, datetime('now'), ?, ?, ?, ?, ?)`,
+  ).run(msgId, kind, platformId, channelType, threadId, JSON.stringify(content));
+  db.close();
+}
+
 beforeEach(() => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
@@ -119,6 +137,94 @@ describe('deliverSessionMessages — concurrent invocations', () => {
     insertOutbound('ag-1', session.id, 'out-second');
     await deliverSessionMessages(session);
     expect(calls).toHaveLength(2);
+  });
+
+  it('deletes the orphan thinking-block on chat-final delivery, using the stored route', async () => {
+    // Status posts to (telegram, telegram:123). Then a kind='chat' delivers.
+    // Cleanup must fire deleteMessage with the SAME route the status was
+    // posted to — even if the chat reply hypothetically targeted a different
+    // route, we must not delete via the chat reply's route.
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+
+    // First insert a status row.
+    insertOutboundKind('ag-1', session.id, 'status-1', 'status', 'telegram', 'telegram:123', {
+      text: '> 💭 thinking...',
+    });
+
+    type DeleteCall = { channelType: string; platformId: string; threadId: string | null; messageId: string };
+    const delivers: Array<{ kind: string; channelType: string; platformId: string }> = [];
+    const deletes: DeleteCall[] = [];
+    setDeliveryAdapter({
+      async deliver(channelType, platformId, _threadId, kind) {
+        delivers.push({ kind, channelType, platformId });
+        return 'plat-status-id';
+      },
+      async deleteMessage(channelType, platformId, threadId, messageId) {
+        deletes.push({ channelType, platformId, threadId, messageId });
+      },
+    });
+
+    await deliverSessionMessages(session);
+    expect(delivers).toHaveLength(1);
+    expect(delivers[0].kind).toBe('status');
+    expect(deletes).toHaveLength(0); // No chat yet, no orphan delete.
+
+    // Now insert the chat-final reply on the SAME route. Cleanup should fire.
+    insertOutboundKind('ag-1', session.id, 'chat-1', 'chat', 'telegram', 'telegram:123', {
+      text: 'final answer',
+    });
+    await deliverSessionMessages(session);
+
+    expect(delivers).toHaveLength(2);
+    expect(delivers[1].kind).toBe('chat');
+    expect(deletes).toHaveLength(1);
+    expect(deletes[0]).toEqual({
+      channelType: 'telegram',
+      platformId: 'telegram:123',
+      threadId: null,
+      messageId: 'plat-status-id',
+    });
+  });
+
+  it('swallows deleteMessage failures so chat reply still completes', async () => {
+    // If the platform delete fails (network, permission, message-not-found),
+    // the chat reply must still mark delivered. Otherwise the reply gets
+    // retried and the user sees a duplicate.
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+
+    insertOutboundKind('ag-1', session.id, 'status-1', 'status', 'telegram', 'telegram:123', {
+      text: '> 💭 thinking...',
+    });
+
+    let deliverCount = 0;
+    let deleteAttempts = 0;
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind) {
+        deliverCount++;
+        return 'plat-id';
+      },
+      async deleteMessage() {
+        deleteAttempts++;
+        throw new Error('simulated delete failure');
+      },
+    });
+
+    await deliverSessionMessages(session);
+    insertOutboundKind('ag-1', session.id, 'chat-1', 'chat', 'telegram', 'telegram:123', {
+      text: 'final answer',
+    });
+    await deliverSessionMessages(session);
+
+    // Delete was attempted and failed (swallowed), but the chat still delivered.
+    expect(deleteAttempts).toBe(1);
+    expect(deliverCount).toBe(2); // status + chat both delivered
+
+    // A second invocation must not re-deliver the chat (idempotency preserved
+    // despite the delete failure).
+    await deliverSessionMessages(session);
+    expect(deliverCount).toBe(2);
   });
 
   it('does not re-deliver when retried after a successful send (cleanup-after-send safety)', async () => {

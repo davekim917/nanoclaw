@@ -150,6 +150,13 @@ export interface ChannelAdapter {
 
   // Optional
   setTyping?(platformId: string, threadId: string | null): Promise<void>;
+  /**
+   * Delete a previously-posted message via the platform's API. Optional —
+   * adapters whose platform doesn't allow bot-message deletion (or which
+   * don't expose the capability) omit this. Used by delivery to clean up
+   * orphan thinking-block status messages once the final chat reply lands.
+   */
+  deleteMessage?(platformId: string, threadId: string | null, messageId: string): Promise<void>;
   syncConversations?(): Promise<ConversationInfo[]>;
 
   /**

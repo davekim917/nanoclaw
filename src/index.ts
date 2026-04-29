@@ -218,6 +218,15 @@ async function main(): Promise<void> {
       const adapter = getChannelAdapter(channelType);
       await adapter?.setTyping?.(platformId, threadId);
     },
+    async deleteMessage(
+      channelType: string,
+      platformId: string,
+      threadId: string | null,
+      messageId: string,
+    ): Promise<void> {
+      const adapter = getChannelAdapter(channelType);
+      await adapter?.deleteMessage?.(platformId, threadId, messageId);
+    },
   };
   setDeliveryAdapter(deliveryAdapter);
 
