@@ -61,21 +61,19 @@ function truncate(s: string): string {
  * NANOCLAW_HIDE_THINKING=1 suppresses all progress forwarding.
  */
 /**
- * Format a thinking block for chat. Prefixes every line with `> ` so it
- * renders as a blockquote — indented with a vertical accent bar on Slack
- * and Discord, visually distinct from a real agent response. Italic `_..._`
- * doesn't work here because Slack mrkdwn doesn't span italic across newlines,
- * and thinking prose is routinely multi-paragraph; the literal underscores
- * would show through.
+ * Format a thinking block for chat. Wrapped in a fenced code block so Slack
+ * auto-collapses long reasoning behind a "Show more" toggle (5–7 lines /
+ * ~700 chars threshold). Visually distinct from the final answer (monospace),
+ * and lets the user opt in to reading the reasoning instead of being walled.
  *
- * The 💭 emoji leads the first line as a visual cue. On Slack clients that
- * auto-shortcode unicode emoji to `:name:` the shortcode form is still
- * clearly a "thinking" affordance.
+ * The 💭 emoji leads the first line as a visual cue. Slack auto-shortcodes
+ * unicode emoji inside code blocks to `:name:` — still recognizable.
+ *
+ * On Discord/Telegram, code blocks render as monospace without auto-collapse
+ * — slightly different look but still distinct from a real reply.
  */
 function formatThinkingLabel(prose: string): string {
-  const lines = prose.split('\n');
-  lines[0] = `💭 ${lines[0]}`;
-  return lines.map((line) => `> ${line}`).join('\n');
+  return `\`\`\`\n💭 ${prose}\n\`\`\``;
 }
 
 export function deriveProgressLabels(message: unknown): string[] {
