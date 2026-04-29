@@ -50,10 +50,10 @@ The `conversations/` folder in your workspace holds searchable transcripts of pa
 
 ## Working with Repos
 
-1. `create_worktree({ repo: "REPO-NAME" })` — get a working directory at `/workspace/worktrees/<repo>`
+1. `create_worktree({ repo: "REPO-NAME" })` — get a working directory at `/workspace/worktrees/<repo>`. Fetches origin and rebases the thread branch onto fresh `origin/HEAD` so resumed threads start from the latest default branch. Passing an explicit `branch: "..."` opts out of the rebase (use this for deliberate stale checkouts: bisect, rollback, working off an existing feature branch). If the response includes `next git_push must use force: true`, the branch was rewritten — pass `force: true` on the next push. If a rebase conflict is reported, resolve it manually before continuing.
 2. Edit files, run tests, iterate
 3. `git_commit({ repo: "REPO-NAME", message: "feat: description" })` — stage + commit
-4. `git_push({ repo: "REPO-NAME" })` — push branch to origin
+4. `git_push({ repo: "REPO-NAME" })` — push branch to origin. Pass `force: true` only when `create_worktree` warned about a rewrite.
 5. `open_pr({ repo: "REPO-NAME", title: "...", body: "..." })` — create a GitHub PR
 6. NEVER run `git clone` — it is blocked. Use `create_worktree` for existing repos or `clone_repo` for new ones.
 7. On thread resume, check `/workspace/worktrees/` for prior work from this session.

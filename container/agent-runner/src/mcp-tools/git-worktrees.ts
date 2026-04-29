@@ -70,6 +70,90 @@ function defaultBranchName(repo: string): string {
   return `thread-${sanitizeBranchSegment(sess)}-${sanitizeBranchSegment(repo)}`;
 }
 
+/**
+ * Rebase the currently-checked-out branch in `worktreeDir` onto `origin/HEAD`.
+ *
+ * Called when a thread resumes against a pre-existing worktree or pre-existing
+ * local branch — both paths can otherwise leave the agent on a stale tip while
+ * origin/main has moved on (the worktree-cleanup cron explicitly skips branches
+ * with unpushed work, so dormant threads accumulate stale state).
+ *
+ * Safety:
+ * - `git status --porcelain` must be clean. Autosave runs at turn-end but is
+ *   not guaranteed (status failures are treated as clean upstream; commit
+ *   failures only log; container kills mid-rebase skip it entirely). If the
+ *   tree is dirty, return the worktree as-is with a note — never rewrite over
+ *   uncommitted changes.
+ * - Detached HEAD: skip silently (no branch to rebase).
+ * - Fetch/origin-HEAD freshness: caller passes `fetchOk` and `originHeadOk`.
+ *   If either is false, we can't trust the rebase target; return as-is with a
+ *   note instead of rebasing onto stale state.
+ * - On rebase failure: `git rebase --abort` to restore pre-rebase state, then
+ *   return an error. The agent gets a clear message and decides how to resolve.
+ *
+ * Force-push exposure: if the branch already has an `origin/<branch>` ref, the
+ * rebase rewrites already-pushed commits, so the next `git_push` will be
+ * non-fast-forward. The success message warns the agent to pass `force: true`
+ * to `git_push`.
+ */
+function rebaseOntoOriginHead(
+  worktreeDir: string,
+  repoDir: string,
+  fetchOk: boolean,
+  originHeadOk: boolean,
+): { kind: 'ok'; text: string } | { kind: 'err'; text: string } {
+  const branch = tryGit(worktreeDir, ['rev-parse', '--abbrev-ref', 'HEAD']);
+  if (!branch || branch === 'HEAD') {
+    return { kind: 'ok', text: `Worktree ready at ${worktreeDir} (detached HEAD; no rebase)` };
+  }
+
+  if (!fetchOk || !originHeadOk) {
+    log(`rebase: skipping for ${branch} — fetch=${fetchOk} originHead=${originHeadOk}`);
+    return {
+      kind: 'ok',
+      text: `Worktree ready at ${worktreeDir} (branch ${branch}; could not refresh — fetch or origin/HEAD lookup failed, branch may be stale)`,
+    };
+  }
+
+  const status = tryGit(worktreeDir, ['status', '--porcelain']);
+  if (status === null) {
+    return { kind: 'err', text: `Cannot determine worktree state at ${worktreeDir} (git status failed)` };
+  }
+  if (status.length > 0) {
+    log(`rebase: dirty worktree at ${worktreeDir}, leaving branch ${branch} as-is`);
+    return {
+      kind: 'ok',
+      text: `Worktree ready at ${worktreeDir} (branch ${branch}; uncommitted changes present — not rebased, may be stale relative to origin)`,
+    };
+  }
+
+  const behind = tryGit(worktreeDir, ['rev-list', '--count', 'HEAD..origin/HEAD']);
+  if (behind === '0') {
+    return { kind: 'ok', text: `Worktree ready at ${worktreeDir} (branch ${branch}, already at origin/HEAD)` };
+  }
+
+  const hasRemoteTracking = tryGit(repoDir, ['rev-parse', '--verify', `refs/remotes/origin/${branch}`]) !== null;
+
+  try {
+    runGit(worktreeDir, ['rebase', 'origin/HEAD'], 60_000);
+  } catch (e) {
+    tryGit(worktreeDir, ['rebase', '--abort'], 30_000);
+    const msg = e instanceof Error ? e.message : String(e);
+    return {
+      kind: 'err',
+      text: `Rebase onto origin/HEAD failed for branch ${branch}: ${msg}. Worktree restored to pre-rebase state. Inspect conflicts with \`git status\` and resolve manually before continuing.`,
+    };
+  }
+
+  const tip = tryGit(worktreeDir, ['rev-parse', '--short', 'HEAD']) ?? '';
+  let text = `Worktree ready at ${worktreeDir} (branch ${branch}, rebased onto origin/HEAD${tip ? `; tip ${tip}` : ''})`;
+  if (hasRemoteTracking) {
+    text += `. NOTE: branch was previously pushed; next \`git_push\` must use \`force: true\` because history was rewritten.`;
+  }
+  log(`rebase: ${branch} rebased onto origin/HEAD${hasRemoteTracking ? ' (force-push needed)' : ''}`);
+  return { kind: 'ok', text };
+}
+
 // -----------------------------------------------------------------------------
 // clone_repo
 // -----------------------------------------------------------------------------
@@ -164,33 +248,51 @@ export const createWorktreeTool: McpToolDefinition = {
 
     const worktreeDir = path.join(WORKTREES_DIR, repo);
 
-    // Fetch + set origin HEAD (best-effort)
-    tryGit(repoDir, ['fetch', 'origin'], 60_000);
+    // Validate branch name shape early — same value is needed by both paths
+    // below, and we don't want to discover an invalid name only after fetch +
+    // worktree-existence checks.
+    const branchName = branchArg ?? defaultBranchName(repo);
+    if (tryGit(repoDir, ['check-ref-format', '--branch', branchName]) === null) {
+      return err(`Invalid branch name: ${branchName}`);
+    }
+
+    // Only auto-rebase the default thread branch. If the agent explicitly
+    // passed `branch: "..."`, treat it as a deliberate checkout (e.g. bisect,
+    // rollback, working off a feature branch) and leave it at whatever tip the
+    // local ref points to. The agent can rebase manually if it wants to.
+    const shouldRebase = branchArg === undefined;
+
+    // Fetch + set origin HEAD. Capture fetch outcome — if it failed, the rebase
+    // step has to skip rather than rebase onto stale local origin/HEAD.
+    const fetchOk = tryGit(repoDir, ['fetch', 'origin'], 60_000) !== null;
     tryGit(repoDir, ['remote', 'set-head', 'origin', '--auto']);
 
     const originHeadOk = tryGit(repoDir, ['rev-parse', '--verify', 'origin/HEAD']) !== null;
 
-    // Idempotent: if worktree already exists and has a .git pointer, return it.
+    // Idempotent: if worktree already exists and has a .git pointer, rebase its
+    // branch onto fresh origin/HEAD (when applicable) and return. A dormant
+    // thread that resumes weeks later would otherwise pick up a stale branch
+    // tip — the worktree-cleanup cron explicitly skips unpushed/unmerged
+    // branches, so this is the only path that closes that gap.
     if (fs.existsSync(worktreeDir)) {
       if (!fs.existsSync(path.join(worktreeDir, '.git'))) {
         log(`create_worktree: corrupt worktree at ${worktreeDir}, removing`);
         try { fs.rmSync(worktreeDir, { recursive: true, force: true }); } catch { /* ignore */ }
       } else {
-        const current = tryGit(worktreeDir, ['rev-parse', '--abbrev-ref', 'HEAD']) ?? branchArg ?? defaultBranchName(repo);
-        return ok(`Worktree ready at ${worktreeDir} (branch ${current})`);
+        if (!shouldRebase) {
+          const current = tryGit(worktreeDir, ['rev-parse', '--abbrev-ref', 'HEAD']) ?? branchName;
+          return ok(`Worktree ready at ${worktreeDir} (branch ${current}; explicit branch — not rebased)`);
+        }
+        const result = rebaseOntoOriginHead(worktreeDir, repoDir, fetchOk, originHeadOk);
+        return result.kind === 'ok' ? ok(result.text) : err(result.text);
       }
     }
 
-    const branchName = branchArg ?? defaultBranchName(repo);
-
-    // MF-1: validate branch name shape
-    if (tryGit(repoDir, ['check-ref-format', '--branch', branchName]) === null) {
-      return err(`Invalid branch name: ${branchName}`);
-    }
-
+    // Use fully-qualified refs to avoid ambiguity with tags or other refs that
+    // share the branch name (e.g. a tag and branch both named "release-1.0").
     const branchExists =
-      tryGit(repoDir, ['rev-parse', '--verify', branchName]) !== null ||
-      tryGit(repoDir, ['rev-parse', '--verify', `origin/${branchName}`]) !== null;
+      tryGit(repoDir, ['rev-parse', '--verify', `refs/heads/${branchName}`]) !== null ||
+      tryGit(repoDir, ['rev-parse', '--verify', `refs/remotes/origin/${branchName}`]) !== null;
 
     fs.mkdirSync(WORKTREES_DIR, { recursive: true });
 
@@ -199,14 +301,24 @@ export const createWorktreeTool: McpToolDefinition = {
 
     try {
       if (branchExists) {
+        // Pre-existing local branch from a prior session may be stale. Check it
+        // out, then rebase onto fresh origin/HEAD (when applicable).
         runGit(repoDir, ['worktree', 'add', worktreeDir, branchName]);
+        log(`create_worktree: ${worktreeDir} on existing branch ${branchName}`);
+        if (!shouldRebase) {
+          return ok(`Worktree created at ${worktreeDir} on branch ${branchName} (explicit branch — not rebased)`);
+        }
+        const result = rebaseOntoOriginHead(worktreeDir, repoDir, fetchOk, originHeadOk);
+        return result.kind === 'ok' ? ok(result.text) : err(result.text);
       } else if (originHeadOk) {
+        // Fresh branch off freshly-fetched origin/HEAD — already at the latest,
+        // no rebase needed.
         runGit(repoDir, ['worktree', 'add', '-b', branchName, worktreeDir, 'origin/HEAD']);
+        log(`create_worktree: ${worktreeDir} on new branch ${branchName}`);
+        return ok(`Worktree created at ${worktreeDir} on branch ${branchName}`);
       } else {
         return err('Cannot create worktree: origin/HEAD not resolved (fetch may have failed)');
       }
-      log(`create_worktree: ${worktreeDir} on ${branchName}`);
-      return ok(`Worktree created at ${worktreeDir} on branch ${branchName}`);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       return err(`git worktree add failed: ${msg}`);
@@ -271,17 +383,22 @@ export const gitPushTool: McpToolDefinition = {
   tool: {
     name: 'git_push',
     description:
-      'Push the worktree branch for <repo> to origin (sets upstream). Returns the pushed branch name.',
+      'Push the worktree branch for <repo> to origin (sets upstream). Returns the pushed branch name. Set force: true to use --force-with-lease — required when create_worktree rebased a previously-pushed branch (the response will say so).',
     inputSchema: {
       type: 'object' as const,
       properties: {
         repo: { type: 'string', description: 'Repo directory name.' },
+        force: {
+          type: 'boolean',
+          description: 'Use --force-with-lease. Set this when create_worktree warned that the branch was rewritten by a rebase.',
+        },
       },
       required: ['repo'],
     },
   },
   handler: async (args: Record<string, unknown>) => {
     const repo = typeof args.repo === 'string' ? args.repo : '';
+    const force = args.force === true;
     const nameErr = validateRepoName(repo);
     if (nameErr) return err(nameErr);
 
@@ -292,8 +409,11 @@ export const gitPushTool: McpToolDefinition = {
 
     try {
       const branch = runGit(worktreeDir, ['rev-parse', '--abbrev-ref', 'HEAD']);
-      runGit(worktreeDir, ['push', '-u', 'origin', branch], 60_000);
-      return ok(`Pushed ${branch} to origin`);
+      const pushArgs = force
+        ? ['push', '--force-with-lease', '-u', 'origin', branch]
+        : ['push', '-u', 'origin', branch];
+      runGit(worktreeDir, pushArgs, 60_000);
+      return ok(`Pushed ${branch} to origin${force ? ' (force-with-lease)' : ''}`);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       return err(`git push failed: ${msg}`);
