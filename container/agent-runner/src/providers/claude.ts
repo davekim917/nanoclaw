@@ -61,17 +61,24 @@ function truncate(s: string): string {
  * NANOCLAW_HIDE_THINKING=1 suppresses all progress forwarding.
  */
 /**
- * Format a thinking block for chat. Prefixes every line with `> ` so it
- * renders as a blockquote — indented with a vertical accent bar on Slack
- * and Discord, visually distinct from a real agent response. The orphan
- * is deleted on final-chat delivery, so it only ever lives mid-turn;
- * blockquote reads more naturally than monospace for live prose.
+ * Format a status label as a blockquote with a leading emoji. Prefixes
+ * every line with `> ` so it renders as a blockquote — indented with a
+ * vertical accent bar on Slack and Discord, visually distinct from a
+ * real agent response. The orphan is deleted on final-chat delivery, so
+ * it only ever lives mid-turn; blockquote reads more naturally than
+ * monospace for live prose.
  */
-function formatThinkingLabel(prose: string): string {
+function formatBlockquoteLabel(emoji: string, prose: string): string {
   const lines = prose.split('\n');
-  lines[0] = `💭 ${lines[0]}`;
+  lines[0] = `${emoji} ${lines[0]}`;
   return lines.map((line) => `> ${line}`).join('\n');
 }
+
+const TASK_NOTIFICATION_EMOJI: Record<string, string> = {
+  completed: '✅',
+  failed: '❌',
+  stopped: '⏹',
+};
 
 export function deriveProgressLabels(message: unknown): string[] {
   if (!message || typeof message !== 'object') return [];
@@ -82,7 +89,7 @@ export function deriveProgressLabels(message: unknown): string[] {
   for (const block of content) {
     const b = block as { type?: string; thinking?: unknown };
     if (b.type === 'thinking' && typeof b.thinking === 'string' && b.thinking.trim().length > 0) {
-      labels.push(formatThinkingLabel(truncate(b.thinking)));
+      labels.push(formatBlockquoteLabel('💭', truncate(b.thinking)));
     }
   }
   return labels;
@@ -1012,8 +1019,10 @@ export class ClaudeProvider implements AgentProvider {
           const detail = meta?.pre_tokens ? ` (${meta.pre_tokens.toLocaleString()} tokens compacted)` : '';
           yield { type: 'result', text: `Context compacted${detail}.` };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
-          const tn = message as { summary?: string };
-          yield { type: 'progress', message: tn.summary || 'Task notification' };
+          const tn = message as { summary?: string; status?: string };
+          const summary = tn.summary || 'Task notification';
+          const emoji = (tn.status && TASK_NOTIFICATION_EMOJI[tn.status]) || '🔧';
+          yield { type: 'progress', message: formatBlockquoteLabel(emoji, summary) };
         } else if (message.type === 'assistant') {
           // SDK task_notification only fires for multi-step planned tasks, so
           // simple turns (single tool call, direct answers) never get a
