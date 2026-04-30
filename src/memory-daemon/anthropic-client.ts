@@ -19,7 +19,12 @@ export const CLASSIFIER_MODEL = 'claude-haiku-4-5-20251001';
 let _envProxyDispatcher: Dispatcher | null | undefined;
 function getProxyDispatcher(): Dispatcher | null {
   if (_envProxyDispatcher !== undefined) return _envProxyDispatcher;
-  const hasProxyEnv = !!(process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy);
+  const hasProxyEnv = !!(
+    process.env.HTTPS_PROXY ||
+    process.env.https_proxy ||
+    process.env.HTTP_PROXY ||
+    process.env.http_proxy
+  );
   _envProxyDispatcher = hasProxyEnv ? new EnvHttpProxyAgent() : null;
   return _envProxyDispatcher;
 }

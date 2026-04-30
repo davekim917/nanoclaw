@@ -16,10 +16,7 @@ const BLOCK_PATTERNS: ReadonlyArray<[RegExp, string]> = [
   // Authorization headers (mirrored from scrubber)
   [/Authorization:\s*(?:Bearer|Basic|Digest)\s+[^\s'"]+/gi, 'authorization_header'],
   // X-API-Key / X-Auth-Token / X-Access-Token / Api-Key / X-Token headers (mirrored from scrubber)
-  [
-    /-H\s+['"]?(?:X-API-Key|X-Auth-Token|X-Access-Token|Api-Key|X-Token)[:=]\s*[^'"\s]+['"]?/gi,
-    'api_header',
-  ],
+  [/-H\s+['"]?(?:X-API-Key|X-Auth-Token|X-Access-Token|Api-Key|X-Token)[:=]\s*[^'"\s]+['"]?/gi, 'api_header'],
   // Bearer tokens in prose (broader than header form)
   [/\bBearer\s+[A-Za-z0-9._\-+/]{16,}/g, 'bearer_token'],
   // OpenAI / Anthropic / X.AI / Google API keys (sk- prefix family)
@@ -60,9 +57,8 @@ const BLOCK_PATTERNS: ReadonlyArray<[RegExp, string]> = [
 const MAX_REDACTOR_INPUT_LENGTH = 8192;
 
 export function redactSecrets(fact: FactInput): RedactionResult {
-  const content = fact.content.length > MAX_REDACTOR_INPUT_LENGTH
-    ? fact.content.slice(0, MAX_REDACTOR_INPUT_LENGTH)
-    : fact.content;
+  const content =
+    fact.content.length > MAX_REDACTOR_INPUT_LENGTH ? fact.content.slice(0, MAX_REDACTOR_INPUT_LENGTH) : fact.content;
 
   // Pass 1: known-shape patterns (fast, deterministic)
   for (const [pattern, reason] of BLOCK_PATTERNS) {

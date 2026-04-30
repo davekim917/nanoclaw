@@ -40,7 +40,13 @@ export function setMnemonStoreIngestDb(db: Database.Database | null): void {
 }
 
 const MNEMON_BIN = path.join(homedir(), '.local', 'bin', 'mnemon');
-const DEFAULT_TIMEOUT_MS = 1500;
+// 3000ms reflects measured mnemon CLI runtime: ~1.1s for short queries, ~1.85s
+// for 800-char queries on Ampere ARM. The original spec C5 budget of 1500ms was
+// derived from the embed-only number (60-216ms warm) and didn't account for CLI
+// spawn + DB open + graph traversal. 3000ms gives ~60% headroom over the worst
+// observed case while keeping perceived latency under the typing-indicator
+// reveal window. If mnemon ever moves to a long-lived daemon, this can drop.
+const DEFAULT_TIMEOUT_MS = 3000;
 const SIGKILL_GRACE_MS = 500;
 
 interface MnemonRecallResult {
@@ -188,14 +194,10 @@ export class MnemonStore implements MemoryStore {
           // idempotency-key semantics: same input → same output, exactly
           // one side effect.
           const row = db
-            .prepare(
-              'SELECT action, fact_id FROM idempotency_keys WHERE agent_group_id = ? AND idempotency_key = ?',
-            )
+            .prepare('SELECT action, fact_id FROM idempotency_keys WHERE agent_group_id = ? AND idempotency_key = ?')
             .get(agentGroupId, idempotencyKey) as { action: string; fact_id: string } | undefined;
           if (row) {
-            const replayAction = (['added', 'updated', 'replaced', 'skipped'] as const).includes(
-              row.action as 'added',
-            )
+            const replayAction = (['added', 'updated', 'replaced', 'skipped'] as const).includes(row.action as 'added')
               ? (row.action as RememberResult['action'])
               : 'skipped';
             return { action: replayAction, factId: row.fact_id ?? '' };
@@ -217,15 +219,7 @@ export class MnemonStore implements MemoryStore {
       return { action: 'skipped', factId: '' };
     }
 
-    const args = [
-      'remember',
-      '--store',
-      agentGroupId,
-      '--cat',
-      fact.category,
-      '--imp',
-      String(fact.importance),
-    ];
+    const args = ['remember', '--store', agentGroupId, '--cat', fact.category, '--imp', String(fact.importance)];
 
     if (fact.entities && fact.entities.length > 0) {
       args.push('--entities', fact.entities.join(','));
@@ -262,8 +256,7 @@ export class MnemonStore implements MemoryStore {
       // cache an operational 'skipped' (CLI failure / parse error / empty
       // stdout) because callers route that to dead_letters and the retry
       // needs to run against an unprimed cache.
-      const isRealSuccess =
-        result.action === 'added' || result.action === 'updated' || result.action === 'replaced';
+      const isRealSuccess = result.action === 'added' || result.action === 'updated' || result.action === 'replaced';
       if (isRealSuccess) {
         try {
           const db = getIngestDb();

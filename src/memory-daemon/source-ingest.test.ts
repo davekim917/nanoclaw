@@ -39,11 +39,13 @@ function stubProcessInboxFileValidation(filePath: string, folder: string, fileCo
     return stubbedRealPath;
   }) as unknown as typeof fs.realpathSync);
   vi.spyOn(fs, 'openSync').mockImplementation(((..._args: unknown[]) => FAKE_FD) as unknown as typeof fs.openSync);
-  vi.spyOn(fs, 'fstatSync').mockImplementation(((..._args: unknown[]) =>
-    ({
-      isFile: () => true,
-      size: contentBuf.length,
-    }) as fs.Stats) as unknown as typeof fs.fstatSync);
+  vi.spyOn(fs, 'fstatSync').mockImplementation(
+    ((..._args: unknown[]) =>
+      ({
+        isFile: () => true,
+        size: contentBuf.length,
+      }) as fs.Stats) as unknown as typeof fs.fstatSync,
+  );
   vi.spyOn(fs, 'readlinkSync').mockImplementation(((p: fs.PathLike) => {
     const s = String(p);
     if (s === `/proc/self/fd/${FAKE_FD}`) return stubbedRealPath;

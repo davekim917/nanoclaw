@@ -18,7 +18,6 @@ export interface IngestSweepResult {
   failures: number;
 }
 
-
 const EXTRACTOR_SYSTEM_PROMPT = `You are a memory extraction assistant. Your job is to read a source document and extract atomic, reusable facts worth storing in a long-term memory system.
 
 Output ONLY valid JSON matching this exact schema:
@@ -148,13 +147,7 @@ export class SourceIngester {
           // back silently — the 60s sweep in index.ts catches the file and
           // processes it via the runtime path.
           if (!this.store) return;
-          void this.processInboxFile(
-            group.agentGroupId,
-            group.folder,
-            realPath,
-            this.store,
-            this.health ?? undefined,
-          );
+          void this.processInboxFile(group.agentGroupId, group.folder, realPath, this.store, this.health ?? undefined);
         });
       });
 

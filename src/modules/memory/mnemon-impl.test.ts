@@ -232,7 +232,9 @@ describe('MnemonStore', () => {
   it('test_idempotency_no_db_available_falls_open', async () => {
     // Inject a broken DB object whose prepare() always throws — simulates DB unavailable.
     const brokenDb = {
-      prepare: () => { throw new Error('DB unavailable'); },
+      prepare: () => {
+        throw new Error('DB unavailable');
+      },
     } as unknown as Database.Database;
     setMnemonStoreIngestDb(brokenDb);
 

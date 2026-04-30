@@ -100,7 +100,8 @@ describe('anthropic-client', () => {
 
   it('test_classifier_extracts_object_from_prose_prefix', async () => {
     // Fallback path: no fence, but the model wrote "Here is the JSON: {...}".
-    const proseWrapped = "Sure, here's the JSON: " + JSON.stringify(validOutput) + " — let me know if you need anything else.";
+    const proseWrapped =
+      "Sure, here's the JSON: " + JSON.stringify(validOutput) + ' — let me know if you need anything else.';
     mockFetchOk(proseWrapped);
     const result = await callClassifier('sys', 'user');
     expect(result.worth_storing).toBe(true);

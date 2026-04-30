@@ -424,9 +424,7 @@ async function processGroup(
   // Hoist getDueRetries out of the per-pair loop. Inside the loop it ran O(N×M)
   // (N pairs × M dead_letter rows), which is quadratic under retry pressure.
   // Compute once per group sweep and look up via Set for O(1) per pair.
-  const dueRetryItemKeys = new Set(
-    getDueRetries(agentGroupId, new Date()).map((r) => r.itemKey),
-  );
+  const dueRetryItemKeys = new Set(getDueRetries(agentGroupId, new Date()).map((r) => r.itemKey));
 
   // Track sent_ats of pairs with UNRESOLVED dead_letters (non-poisoned and
   // either not yet due, OR newly failed in this sweep). Used at end of loop to

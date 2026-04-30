@@ -80,7 +80,8 @@ export function runMnemonIngestMigrations(db: Database.Database): void {
           ON dead_letters(next_retry_at) WHERE poisoned_at IS NULL;
       `);
 
-      const next = (db.prepare('SELECT COALESCE(MAX(version), 0) + 1 AS v FROM schema_version').get() as { v: number }).v;
+      const next = (db.prepare('SELECT COALESCE(MAX(version), 0) + 1 AS v FROM schema_version').get() as { v: number })
+        .v;
       db.prepare('INSERT INTO schema_version (version, name, applied) VALUES (?, ?, ?)').run(
         next,
         'mnemon-ingest-db-v1',
@@ -111,7 +112,8 @@ export function runMnemonIngestMigrations(db: Database.Database): void {
           ON idempotency_keys(created_at);
       `);
 
-      const next = (db.prepare('SELECT COALESCE(MAX(version), 0) + 1 AS v FROM schema_version').get() as { v: number }).v;
+      const next = (db.prepare('SELECT COALESCE(MAX(version), 0) + 1 AS v FROM schema_version').get() as { v: number })
+        .v;
       db.prepare('INSERT INTO schema_version (version, name, applied) VALUES (?, ?, ?)').run(
         next,
         'mnemon-idempotency-keys-v1',

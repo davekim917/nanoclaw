@@ -205,10 +205,31 @@ export async function maybeInjectRecall(params: {
   routing: RoutingAddr;
 }): Promise<void> {
   const { agentGroupId, sessionId, inboundMessage, routing } = params;
+  log.info('recall-injection: entered', {
+    agentGroupId,
+    sessionId,
+    kind: inboundMessage.kind,
+    channelType: routing.channelType,
+    trigger: inboundMessage.trigger,
+  });
   try {
-    if (inboundMessage.trigger === 0) return;
-    if (!shouldRecallForKind(inboundMessage.kind, routing.channelType)) return;
-    if (!memoryEnabledForGroup(agentGroupId)) return;
+    if (inboundMessage.trigger === 0) {
+      log.info('recall-injection: skipped (trigger=0)', { agentGroupId, sessionId });
+      return;
+    }
+    if (!shouldRecallForKind(inboundMessage.kind, routing.channelType)) {
+      log.info('recall-injection: skipped (kind/channel not recall-eligible)', {
+        agentGroupId,
+        sessionId,
+        kind: inboundMessage.kind,
+        channelType: routing.channelType,
+      });
+      return;
+    }
+    if (!memoryEnabledForGroup(agentGroupId)) {
+      log.info('recall-injection: skipped (memory disabled for group)', { agentGroupId, sessionId });
+      return;
+    }
 
     let priorUserTexts: string[] = [];
     const db = openInboundDb(agentGroupId, sessionId);
@@ -219,20 +240,35 @@ export async function maybeInjectRecall(params: {
     }
 
     const queryText = extractRecallQueryText(inboundMessage, sessionId, priorUserTexts);
-    if (!shouldRecall(queryText)) return;
+    if (!shouldRecall(queryText)) {
+      log.info('recall-injection: skipped (queryText too short)', {
+        agentGroupId,
+        sessionId,
+        queryLen: queryText.length,
+      });
+      return;
+    }
 
+    log.info('recall-injection: calling mnemon recall', { agentGroupId, sessionId, queryLen: queryText.length });
     const result = await store.recall(agentGroupId, queryText, {
-      timeoutMs: 1500,
+      timeoutMs: 3000,
+    });
+    log.info('recall-injection: mnemon returned', {
+      agentGroupId,
+      sessionId,
+      factCount: result.facts.length,
+      latencyMs: result.latencyMs,
     });
     if (!result.facts.length) return;
 
     const recallContent = JSON.stringify({ subtype: 'recall_context', text: formatRecallContext(result.facts) });
 
     // Write recall context directly — NOT via writeSessionMessage to avoid recursion
+    const recallId = `recall-${inboundMessage.id}`;
     const writeDb = openInboundDb(agentGroupId, sessionId);
     try {
       insertMessage(writeDb, {
-        id: `recall-${inboundMessage.id}`,
+        id: recallId,
         kind: 'system',
         timestamp: new Date().toISOString(),
         platformId: null,
@@ -246,6 +282,7 @@ export async function maybeInjectRecall(params: {
     } finally {
       writeDb.close();
     }
+    log.info('recall-injection: row inserted', { agentGroupId, sessionId, recallId, factCount: result.facts.length });
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
     log.warn('recall-injection: recall failed, continuing without context', { agentGroupId, sessionId, err: reason });

@@ -12,7 +12,9 @@ import type { MemoryStore } from '../modules/memory/store.js';
 
 const SWEEP_INTERVAL_MS = 60_000;
 
-function discoverMemoryGroups(health?: HealthRecorder): Array<{ agentGroupId: string; folder: string; enabled: boolean }> {
+function discoverMemoryGroups(
+  health?: HealthRecorder,
+): Array<{ agentGroupId: string; folder: string; enabled: boolean }> {
   const groups: Array<{ agentGroupId: string; folder: string; enabled: boolean }> = [];
 
   let entries: string[];
@@ -71,11 +73,7 @@ function discoverMemoryGroups(health?: HealthRecorder): Array<{ agentGroupId: st
   return groups;
 }
 
-async function runSweep(
-  ingester: SourceIngester,
-  health: HealthRecorder,
-  store: MemoryStore,
-): Promise<void> {
+async function runSweep(ingester: SourceIngester, health: HealthRecorder, store: MemoryStore): Promise<void> {
   const allGroups = discoverMemoryGroups(health);
   const enabledGroups = allGroups.filter((g) => g.enabled);
 
