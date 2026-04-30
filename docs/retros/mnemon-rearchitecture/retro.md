@@ -44,41 +44,49 @@ All three documented in `docs/specs/mnemon-rearchitecture/follow-up-items.md` (I
 
 ## Recommended Updates
 
+> Reviewed via Codex (cross-model) against the criterion: "skill changes must be feature-agnostic process improvements (rule survives the 80% test for unrelated future features), NOT patches encoding specific failure modes." First-pass list was 8; revised list is **9 generic rules** after merge + reword + 2 missed adds. Wording in this section is the post-Codex-review version.
+
 ### CLAUDE.md
 
-- **Section:** § Quick Context (or new § Performance Discipline subsection)
-- **Change:** Add line: "Numeric HARD constraints (latency budgets, throughput targets, memory ceilings) must be validated empirically against the real artifact during `/team-design`, not against component benchmarks. The constraint isn't HARD until a measured run confirms the budget."
-- **Reason:** Learning #1 — C5's 1500ms budget was assumed from embed-only benchmark; real mnemon CLI broke it on every recall.
+No CLAUDE.md addition — the constraint-evidence rule lives at `/team-design` (rule R1 below). CLAUDE.md only needs a one-liner pointer if the workflow skill becomes hard to find; defer until a second feature trips on the same gap.
 
 ### Workflow Skills
 
-- **Skill:** `bootstrap-workflow:team-design` § Constraint Validation
-- **Change:** Add a step before exiting design: "For each HARD constraint with a numeric budget (timing, throughput, size), run a one-shot empirical check against the actual artifact and record `actual: Xms` next to the constraint. If actual exceeds budget, the constraint is provisional and must be reconciled before `/team-plan`."
-- **Reason:** Learning #1 — design.md:24 cited "60-216ms warm" but the artifact-level reality (mnemon CLI) was 10-25× slower.
+- **R1 — `bootstrap-workflow:team-design` § Constraint Validation** *(merge of original REC 1 + REC 2)*
+  - **Change:** Add a step before exiting design: "Every numeric HARD constraint must cite empirical evidence from the most representative executable path available, in a unit appropriate to the constraint type (ms for latency, MB/GB for memory, RPS for throughput, %/p99 for accuracy, $/call for cost, count for capacity). If unmeasured or over budget, mark the constraint provisional and add an explicit reconciliation gate before build/ship."
+  - **Reason:** C5 budgeted 1500ms based on Ollama embed-only benchmark (60-216ms warm); real mnemon CLI took 1.1-1.85s. Generic rule: numeric budgets validated against the artifact, not a component, in the right unit.
 
-- **Skill:** `bootstrap-workflow:team-design` § Pseudocode Discipline
-- **Change:** Add a primitives audit step: "Every named function/file/symbol referenced in pseudocode must either (a) exist in the codebase verifiable via grep, OR (b) carry a `[NEW]` tag pointing to the task in the plan that creates it. Pseudocode that names primitives without grounding is rejected back to design."
-- **Reason:** Cycle-3 review M2 (writeSessionMessageRaw), M8 (getAgentGroupFolder), B2/B3 drift (should-recall.ts, modules/memory/index.ts) — all the same pattern, and the prior PR #68 retro flagged the same root cause.
+- **R2 — `bootstrap-workflow:team-design` § Pseudocode Discipline**
+  - **Change:** "Every implementation-relevant primitive (function, file path, interface) named in design pseudocode must be verified against the repo or tool index, OR tagged `[NEW]` with an owner/creation step before planning. Pseudocode without grounding is rejected back to design."
+  - **Reason:** Cycle-3 review found 4 fictional symbols (M2 writeSessionMessageRaw, M8 getAgentGroupFolder, B2 should-recall.ts, B3 modules/memory/index.ts) — same root cause as PR #68's wrapper-jq path bug. Pattern has now bitten **twice** across separate features.
 
-- **Skill:** `bootstrap-workflow:team-build` § Lead Fix Discipline
-- **Change:** Add to the section on lead-directed fixes: "When a fix changes a function's contract (sync→async, signature, return type), the fix is incomplete until: (1) all caller sites are updated in the same iteration, verified via `grep -rn '<name>' --include='*.{ts,js}'`; (2) the verification command and result are recorded in build-state.md as part of the fix-loop entry. Single-call-site fixes for contract changes are flagged suspicious and require explicit lead approval."
-- **Reason:** Learning #2 — Group D's writeSessionMessage async fix updated 1 of 9 callers; QA caught it but the cascade should have been part of the same iteration.
+- **R3 — `bootstrap-workflow:team-design` § SOT Consolidation** *(NEW — Codex caught this miss)*
+  - **Change:** "After review-cycle resolutions, the design/spec body must be updated to reflect the resolution OR the superseded text must be explicitly marked stale. A resolution table at the top alongside contradictory unchanged prose blocks planning until consolidated."
+  - **Reason:** Pre-build drift surfaced multiple PARTIAL findings where cycle-2/cycle-3 corrections lived in the resolution table but the original body text remained unchanged (C3 wording, C13 PK shape, agent-to-agent inclusion). Build correctly followed the most-specific spec, but the contradiction was a process smell.
 
-- **Skill:** `bootstrap-workflow:team-review` § Recommendations vs Spec
-- **Change:** Add gate at end of cycle 3: "Any reviewer 'recommendation' that hasn't been promoted to concrete spec text by cycle-3 close becomes a `[NEEDS SPEC]` tag carried into `/team-plan` as a task-level decision. Recommendations cannot ship as un-resolved design text."
-- **Reason:** Learning #3 — M7's "recommend native fetch via OneCLI proxy" propagated as text, never became spec, broke at QA round 3 with 4 separate corrections needed.
+- **R4 — `bootstrap-workflow:team-build` § Lead Fix Discipline (Contract Changes)**
+  - **Change:** "When a lead-directed fix changes a function's contract (sync→async, signature change, return-type change), the fix is incomplete until caller coverage is proven via a language-aware reference search (LSP, ts-morph, IDE 'find references', or `grep` if no better tool available). The search command + result is recorded in build-state.md. A single caller is acceptable only if the search confirms it is the only caller."
+  - **Reason:** Group D's writeSessionMessage async fix updated 1 of 9 callers; the remaining 8 fired-and-forget. The original wording ("single-call-site is suspicious") was a 1-of-9 scar — the durable rule is "prove caller coverage."
 
-- **Skill:** `bootstrap-workflow:team-ship` (or new `team-go-live`)
-- **Change:** Either add to `/team-ship` Step X, or create a new `/team-go-live` skill: "For features with an observable user-facing behavior, exercise the headline path once after deploy and before declaring done. Capture the actual user-facing output (Discord screenshot, API response, log line showing the feature firing). Tests pass ≠ feature works."
-- **Reason:** Learning #4 — recall injection was 0% functional in production despite all tests passing. Bug surfaced only on manual user test.
+- **R5 — `bootstrap-workflow:team-build` § Behavioral Tests** *(NEW — Codex caught this miss)*
+  - **Change:** "When behavior is exercisable (function output, state mutation, event emission, log assertion), tests must assert behavior — not source-text contents. Tests of the form `expect(src).toContain('...')` are flagged suspect: they verify the implementation was written, not that it works."
+  - **Reason:** Group F builder initially wrote 5 of 7 classifier tests as source-grep. Lead caught and directed full behavioral rewrites with archive.db injection seam. Generic anti-pattern across all stacks (frontend, backend, infra, data).
 
-- **Skill:** `bootstrap-workflow:team-qa` § Out-of-Scope Findings
-- **Change:** Add to the validator-result review: "When any cross-model adversarial finding is tagged 'out of scope, defer' but its description states the finding blocks the feature path from working at all (vs. an isolated edge case), the lead must override the scoping and fix inline. Codex's scoping discipline is conservative; correctness blockers ≠ scope creep."
-- **Reason:** Learning #5 — F3 daemon endpoint marked "out of scope for cleanup PR" but the daemon literally couldn't make an Anthropic call as configured.
+- **R6 — `bootstrap-workflow:team-review` § Recommendations vs Spec**
+  - **Change:** "Cycle-3 close gate: any reviewer 'recommendation' not yet promoted to concrete spec text becomes a `[NEEDS SPEC]` tag carried into `/team-plan` as a task-level decision. Recommendations cannot ship as un-resolved design text."
+  - **Reason:** M7 said "recommend native fetch via OneCLI proxy" — propagated as design text, never became concrete spec. Broke at QA round 3 with 4 corrections needed.
 
-- **Skill:** `bootstrap-workflow:team-brief` § Source Coverage Tables
-- **Change:** When the brief enumerates sources, surfaces, or capabilities (e.g., "capture from: Granola, Pocket, gws Docs, Exa, Linear, GitHub..."), produce a coverage table in `brief.md` that the plan can mechanically map against. The table is referenced by name in `/team-plan` Step 4 (named test cases) and `/team-qa` Step 1 (file routing).
-- **Reason:** Learning #6 — Exa was in brief.md:44 but missed throughout plan/build/QA. A formal table would have caught the gap mechanically.
+- **R7 — `bootstrap-workflow:team-qa` § Deferred Findings**
+  - **Change:** "Any QA finding deferred to follow-up must be re-scoped immediately if it prevents the feature's primary acceptance path from working. Scope discipline is valuable; correctness blockers are not scope creep."
+  - **Reason:** F3 (daemon endpoint URL) was tagged "out of scope for cleanup PR" by Codex round 3 — the daemon literally couldn't make an Anthropic call as configured. User pushback forced inline fix. The original wording specifically named Codex; the durable rule applies to any deferral mechanism.
+
+- **R8 — `bootstrap-workflow:team-ship` (or new `team-go-live`)**
+  - **Change:** "For features with an observable user-facing behavior (UI, API, deployable service, scheduled job, integration), exercise the headline path once after deploy and capture the actual user-facing output (screenshot, API response, log line showing the feature firing) before declaring done. Tests pass ≠ feature works."
+  - **Reason:** Recall injection was 0% functional in production despite all 423 tests passing — every gate cleared but the headline UX silently never fired. Generic for any user-observable feature.
+
+- **R9 — `bootstrap-workflow:team-brief` § Coverage Matrix**
+  - **Change:** "When a brief enumerates a closed set of required integrations, inputs, surfaces, or capabilities, produce a coverage matrix in the brief. `/team-plan` Step 4 and `/team-qa` Step 1 mechanically verify each item appears in the spec/build."
+  - **Reason:** Exa listed at brief.md:44 — survived 3 review cycles + design + plan + build + QA — shipped without `mcp__exa__*` in `MCP_CAPTURE_TOOLS`. Discovered only via post-ship user audit. Generic for any brief that names a closed set of dependencies/sources/integrations.
 
 ### Project Skills
 
