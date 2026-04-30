@@ -158,7 +158,7 @@ export async function routeAgentMessage(msg: RoutableAgentMessage, session: Sess
   // read the bytes — they live in a session dir it doesn't mount.
   const forwardedContent = forwardFileAttachments(msg, a2aMsgId, session, targetAgentGroupId, targetSession.id);
 
-  writeSessionMessage(targetAgentGroupId, targetSession.id, {
+  await writeSessionMessage(targetAgentGroupId, targetSession.id, {
     id: a2aMsgId,
     kind: 'chat',
     timestamp: new Date().toISOString(),

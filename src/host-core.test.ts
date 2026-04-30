@@ -130,10 +130,10 @@ describe('session manager', () => {
     expect(s2.id).toBe(s1.id);
   });
 
-  it('should write message to inbound DB', () => {
+  it('should write message to inbound DB', async () => {
     const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
 
-    writeSessionMessage('ag-1', session.id, {
+    await writeSessionMessage('ag-1', session.id, {
       id: 'msg-1',
       kind: 'chat',
       timestamp: now(),
@@ -160,11 +160,11 @@ describe('session manager', () => {
     expect(JSON.parse(rows[0].content).text).toBe('Hello');
   });
 
-  it('should update last_active on message write', () => {
+  it('should update last_active on message write', async () => {
     const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
     expect(getSession(session.id)!.last_active).toBeNull();
 
-    writeSessionMessage('ag-1', session.id, {
+    await writeSessionMessage('ag-1', session.id, {
       id: 'msg-1',
       kind: 'chat',
       timestamp: now(),

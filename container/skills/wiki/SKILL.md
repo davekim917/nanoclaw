@@ -1,9 +1,9 @@
 ---
 name: wiki
-description: Maintain the persistent wiki knowledge base for this group. Use when a source is dropped into sources/, when answering questions that should compound into knowledge, when the user says "ingest", "remember this", "add to wiki", or when running periodic lint passes. The wiki holds compounding domain knowledge — Snowflake/dbt patterns, multi-tenant decisions, client/product context, refactor playbooks. Its role depends on whether `mnemon` is enabled for this group (see Layering principle below).
+description: Maintain the persistent wiki knowledge base for this group. Use when a source is dropped into sources/, when answering questions that should compound into knowledge, when the user says "ingest", "remember this", "add to wiki", or when running periodic lint passes. The wiki holds compounding domain knowledge — Snowflake/dbt patterns, multi-tenant decisions, client/product context, refactor playbooks. Its role depends on whether the persistent memory layer is enabled for this group (see Layering principle below).
 ---
 
-> **If `mnemon-companion` is also mounted** (i.e., this group has mnemon enabled), defer to it for memory writes. Wiki becomes derived synthesis surface only; the daily synthesise scheduled task writes wiki pages from mnemon. Do not directly write to wiki/ during conversation in mnemon-enabled groups. The direct-write flow described below still applies for non-mnemon groups.
+> **If the memory layer is enabled** for this group (the operator ran `scripts/enable-memory.ts`), the wiki becomes a derived synthesis surface only. The daily synthesise scheduled task reads mnemon and writes wiki pages from it. Do not directly write to wiki/ during conversation in memory-enabled groups. The direct-write flow described below still applies for groups without the memory layer.
 
 # Wiki Maintenance
 
@@ -11,10 +11,10 @@ description: Maintain the persistent wiki knowledge base for this group. Use whe
 
 The wiki's role depends on this group's setup:
 
-- **If `mnemon-companion/SKILL.md` does NOT exist for this group** (mnemon not yet wired): the wiki *is* the canonical store for compounding domain knowledge. Follow the direct-write flow described below — agent reads sources, writes wiki pages, updates index/log.
-- **If `mnemon-companion/SKILL.md` exists for this group** (mnemon is wired): the wiki becomes a *derived synthesis* of mnemon facts, NOT the canonical store. Flow inverts: agent writes atomic facts to mnemon first; wiki pages are compiled from mnemon on a schedule. **In that mode, follow `mnemon-companion/SKILL.md` instead of this skill's direct-write flow.** The page conventions, index/log discipline, and source handling below still apply — only the entry point changes.
+- **Memory layer NOT enabled**: the wiki *is* the canonical store for compounding domain knowledge. Follow the direct-write flow described below — agent reads sources, writes wiki pages, updates index/log.
+- **Memory layer enabled** (host daemon active for this group, container.json has `memory.enabled: true`): the wiki becomes a *derived synthesis* of mnemon facts, NOT the canonical store. The mnemon daemon extracts atomic facts from chat turn-pairs and curated source files automatically; wiki pages are compiled from mnemon on a schedule by the daily synthesise task. **In that mode, do NOT do direct writes during chat** — defer to the synthesise task. The page conventions, index/log discipline, and source handling below still apply — only the entry point changes.
 
-Today's flow (direct-write) is described below. Don't preemptively invert it; mnemon-companion will explicitly take over when it ships.
+How to tell which mode you're in: check `/app/container/CLAUDE.md` § Memory — if Recall context arrives as `[Recalled context]` system messages, the memory layer is enabled.
 
 ## What this skill maintains
 
@@ -97,7 +97,15 @@ Report findings to the user. Offer to fix; don't fix silently.
 
 When in doubt: if you'd want it in front of you on every single message, it goes in `CLAUDE.local.md`. If you'd want to look it up when a related question comes up, it goes in the wiki.
 
-> **When mnemon ships for this group:** atomic facts go into mnemon (canonical), wiki pages become a derived synthesis, and the table above narrows to "rules vs facts" (CLAUDE.local.md vs mnemon). Wiki pages stop being a destination for primary writes and become a compiled output. Defer to `mnemon-companion/SKILL.md` at that point.
+> **When the memory layer is enabled for this group:** the wiki becomes a compiled output of the mnemon graph. Wiki pages stop being a destination for primary writes. Defer to the daily synthesise scheduled task at that point — do not write to wiki/ from chat.
+
+## Reading from mnemon (synthesise only)
+
+When this group has the memory layer enabled (i.e. `container.json` has `memory.enabled: true` and the host daemon is active), the wiki's content is produced by the **daily synthesise scheduled task**, not by the agent during chat. The synthesise task reads the mnemon fact graph and compiles wiki pages from it.
+
+**During chat:** you do not read from mnemon directly, and you do not call any mnemon tool. Recalled context from mnemon arrives automatically as `[Recalled context]` system messages before each user turn — that is the only mnemon surface accessible during conversation.
+
+**During the daily synthesise task:** the task queries the mnemon graph and writes or updates wiki pages under `wiki/{entities,concepts,timelines}/`, refreshes `wiki/index.md`, and appends to `wiki/log.md`. This is the only time wiki pages are written in a mnemon-enabled group.
 
 ## Source handling
 

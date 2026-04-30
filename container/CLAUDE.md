@@ -40,9 +40,12 @@ The file `CLAUDE.local.md` in your workspace is your per-group memory. Record th
 
 ## Memory
 
-When the user shares any substantive information with you, it must be stored somewhere you can retrieve it when relevant. If it's information that is pertinent to every single conversation turn it should be put into CLAUDE.local.md. Otherwise, create a system for storing the information depending on its type — e.g. create a file of people that the user mentions so you can keep track or a file of projects. For every file you create, add a concise reference in your CLAUDE.local.md so you'll be able to find it in future conversations.
+Two memory surfaces, both effectively read-only from the agent's perspective during chat:
 
-A core part of your job and the main thing that defines how useful you are to the user is how well you do in creating these systems for organizing information. These are your systems that help you do your job well. Evolve them over time as needed.
+- **CLAUDE.local.md** (your per-group file) — operator-curated behavioral rules and high-frequency preferences. The operator edits this; you read it on every session start. Do not write to it during chat unless the user explicitly asks you to update it.
+- **mnemon graph** (auto-curated facts) — atomic facts extracted from chat turn-pairs and curated source files (articles, transcripts, attachments) by an async host-side daemon. Recall context arrives as a `[Recalled context]` system message before each user turn. You do not call `mnemon remember` directly — the daemon handles all writes.
+
+When the user shares substantive information you'd want to remember, you don't need to do anything explicit — the daemon's classifier picks it up on its next 60s sweep. If a fact is critical and time-sensitive (the user just stated a deadline you'll need to honor mid-session), use scratch context (worktree files, conversation memory) for immediate use; the daemon's eventual extraction handles long-term persistence.
 
 ## Conversation history
 

@@ -49,7 +49,7 @@ export interface ApprovalHandlerContext {
   /** User ID of the admin who approved. Empty string if unknown. */
   userId: string;
   /** Send a system chat message to the requesting agent's session. */
-  notify: (text: string) => void;
+  notify: (text: string) => Promise<void>;
 }
 
 export type ApprovalHandler = (ctx: ApprovalHandlerContext) => Promise<void>;
@@ -126,8 +126,8 @@ function channelTypeOf(userId: string): string {
 // ── Request API ──
 
 /** Send a system chat to the agent's session. Used by callers and by the response handler. */
-export function notifyAgent(session: Session, text: string): void {
-  writeSessionMessage(session.agent_group_id, session.id, {
+export async function notifyAgent(session: Session, text: string): Promise<void> {
+  await writeSessionMessage(session.agent_group_id, session.id, {
     id: `sys-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     kind: 'chat',
     timestamp: new Date().toISOString(),

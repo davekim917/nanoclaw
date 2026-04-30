@@ -29,7 +29,6 @@ import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
 import { initGroupFilesystem } from './group-init.js';
-import { applyMnemonMounts, applyMnemonEnv } from './modules/mnemon/index.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
@@ -600,8 +599,17 @@ function buildMounts(
     mounts.push(...validated);
   }
 
-  // Mnemon data dir + rollout state (no-op when mnemon not enabled for this group)
-  applyMnemonMounts({ mounts, agentGroup, containerConfig });
+  // Memory store: per-group RW mount so sqlite can create journal/lock files.
+  // Scoped to agentGroupId (C20 cross-tenant narrowing — never mount whole ~/.mnemon/).
+  if (containerConfig.memory?.enabled === true) {
+    const mnemonDataDir = path.join(os.homedir(), '.mnemon', 'data', agentGroup.id);
+    fs.mkdirSync(mnemonDataDir, { recursive: true });
+    mounts.push({
+      hostPath: mnemonDataDir,
+      containerPath: `/home/node/.mnemon/data/${agentGroup.id}`,
+      readonly: false,
+    });
+  }
 
   // Built-in nanoclaw-hooks plugin: project-relative, always mounted.
   // Provides the GitNexus repo-readiness guard (PreToolUse) and the
@@ -1180,7 +1188,29 @@ function ensureRuntimeFields(
     dirty = true;
   }
   if (dirty) {
-    writeContainerConfig(agentGroup.folder, containerConfig);
+    // Race-safe write: re-read container.json immediately before persisting
+    // and merge our identity fields onto the freshest disk state. Without
+    // this, a concurrent writer (e.g. enable-memory.ts flipping
+    // memory.enabled, or any future config-mutating script) can have its
+    // update silently clobbered when our write lands later in the spawn
+    // flow with a stale in-memory containerConfig.
+    //
+    // Real-world incident: bulk-enable-memory across 11 groups left 2
+    // (video-agent, xerus — the two without a pre-existing agentGroupId
+    // in container.json) with memory.enabled=false on disk despite the
+    // bulk script writing memory.enabled=true, because the spawn flow's
+    // ensureRuntimeFields write-back lost the race.
+    const fresh = readContainerConfig(agentGroup.folder);
+    fresh.agentGroupId = agentGroup.id;
+    fresh.groupName = agentGroup.name;
+    fresh.assistantName = agentGroup.name;
+    writeContainerConfig(agentGroup.folder, fresh);
+    // Sync the in-memory copy with anything the concurrent writer may have
+    // added between our read and write — downstream spawn code reads other
+    // fields from containerConfig and would otherwise miss those updates.
+    if (fresh.memory !== undefined) containerConfig.memory = fresh.memory;
+    if (fresh.tools !== undefined) containerConfig.tools = fresh.tools;
+    if (fresh.mcpServers !== undefined) containerConfig.mcpServers = fresh.mcpServers;
   }
 }
 
@@ -1367,9 +1397,13 @@ async function buildContainerArgs(
     args.push('-e', 'OLLAMA_ADMIN_TOOLS=true');
   }
 
-  // Mnemon env vars: MNEMON_STORE, MNEMON_EMBED_ENDPOINT, MNEMON_EMBED_MODEL
-  // (no-op when mnemon not enabled for this group)
-  applyMnemonEnv({ args, agentGroup, containerConfig });
+  // Memory env vars: injected only when memory is enabled for this group.
+  if (containerConfig.memory?.enabled === true) {
+    args.push('-e', `MNEMON_STORE=${agentGroup.id}`);
+    args.push('-e', 'MNEMON_READ_ONLY=1');
+    args.push('-e', 'MNEMON_EMBED_ENDPOINT=http://host.docker.internal:11434');
+    args.push('-e', 'MNEMON_EMBED_MODEL=nomic-embed-text');
+  }
 
   // Provider-contributed env vars (e.g. XDG_DATA_HOME, OPENCODE_*, NO_PROXY).
   if (providerContribution.env) {

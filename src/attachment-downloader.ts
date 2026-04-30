@@ -15,9 +15,13 @@
  * Claude directly) is a separate formatter change if we want inline
  * image reading rather than tool-based reads.
  */
+import { createHash } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
+import { GROUPS_DIR } from './config.js';
+import { getAgentGroup } from './db/agent-groups.js';
+import { readContainerConfig } from './container-config.js';
 import { sessionDir } from './session-manager.js';
 import { log } from './log.js';
 
@@ -87,6 +91,30 @@ export function persistInboundAttachments(
       const filename = sanitizeSegment(raw.name || raw.filename || 'file', 'file');
       const absPath = path.join(baseDir, filename);
       fs.writeFileSync(absPath, buffer);
+
+      // Memory sources mirror — additive, only when memory is enabled for this group.
+      try {
+        const ag = getAgentGroup(agentGroupId);
+        if (ag) {
+          const cfg = readContainerConfig(ag.folder);
+          if (cfg.memory?.enabled === true) {
+            const sourcesInbox = path.join(GROUPS_DIR, ag.folder, 'sources', 'inbox');
+            fs.mkdirSync(sourcesInbox, { recursive: true });
+            const sha = createHash('sha256').update(buffer).digest('hex').slice(0, 8);
+            const ext = path.extname(filename) || '.bin';
+            const finalName = `attachment-${sha}${ext}`;
+            const tmpPath = path.join(sourcesInbox, finalName + '.tmp');
+            const finalPath = path.join(sourcesInbox, finalName);
+            if (!fs.existsSync(finalPath)) {
+              fs.writeFileSync(tmpPath, buffer);
+              fs.renameSync(tmpPath, finalPath);
+            }
+          }
+        }
+      } catch (mirrorErr) {
+        log.warn('Failed to mirror attachment to memory sources inbox', { messageId, name: raw.name, err: mirrorErr });
+      }
+
       // Relative to the session root (which the container mounts as /workspace)
       raw.localPath = path.posix.join('attachments', safeMessageId, filename);
       delete raw.data;

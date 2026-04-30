@@ -57,8 +57,8 @@ async function handleRegisteredApproval(
     return;
   }
 
-  const notify = (text: string): void => {
-    writeSessionMessage(session.agent_group_id, session.id, {
+  const notify = async (text: string): Promise<void> => {
+    await writeSessionMessage(session.agent_group_id, session.id, {
       id: `appr-note-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       kind: 'chat',
       timestamp: new Date().toISOString(),
@@ -70,7 +70,7 @@ async function handleRegisteredApproval(
   };
 
   if (selectedOption !== 'approve') {
-    notify(`Your ${approval.action} request was rejected by admin.`);
+    await notify(`Your ${approval.action} request was rejected by admin.`);
     log.info('Approval rejected', { approvalId: approval.approval_id, action: approval.action, userId });
     deletePendingApproval(approval.approval_id);
     await wakeContainer(session);
@@ -84,7 +84,7 @@ async function handleRegisteredApproval(
       approvalId: approval.approval_id,
       action: approval.action,
     });
-    notify(`Your ${approval.action} was approved, but no handler is installed to apply it.`);
+    await notify(`Your ${approval.action} was approved, but no handler is installed to apply it.`);
     deletePendingApproval(approval.approval_id);
     await wakeContainer(session);
     return;
@@ -96,7 +96,7 @@ async function handleRegisteredApproval(
     log.info('Approval handled', { approvalId: approval.approval_id, action: approval.action, userId });
   } catch (err) {
     log.error('Approval handler threw', { approvalId: approval.approval_id, action: approval.action, err });
-    notify(
+    await notify(
       `Your ${approval.action} was approved, but applying it failed: ${err instanceof Error ? err.message : String(err)}.`,
     );
   }

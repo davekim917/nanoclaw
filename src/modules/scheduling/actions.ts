@@ -90,7 +90,7 @@ export async function handleUpdateTask(
     // Notify the agent that update_task matched nothing. Replicates the
     // old notifyAgent helper that used to live in delivery.ts — inlined
     // here so scheduling doesn't depend on delivery's private helpers.
-    writeSessionMessage(session.agent_group_id, session.id, {
+    await writeSessionMessage(session.agent_group_id, session.id, {
       id: `sys-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       kind: 'chat',
       timestamp: new Date().toISOString(),

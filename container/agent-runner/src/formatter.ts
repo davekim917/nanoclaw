@@ -111,7 +111,11 @@ export interface RoutingContext {
  * and the reply lands in the channel root instead of the originating thread.
  */
 export function extractRouting(messages: MessageInRow[]): RoutingContext {
-  const first = messages[0];
+  // Skip system rows when picking the routing anchor — recall_context system
+  // messages (id `recall-<targetId>`) are inserted before their paired inbound
+  // message and would otherwise hijack `inReplyTo`, making outbound replies
+  // attach to `recall-X` instead of the real user message X.
+  const first = messages.find((m) => m.kind !== 'system') ?? messages[0];
   const sessionRouting = getSessionRouting();
   // Quiet-status mode: any task in the batch carrying `quietStatus: true`
   // in its content JSON suppresses streaming status writes for the turn.
@@ -259,6 +263,9 @@ function formatWebhookMessage(msg: MessageInRow): string {
 
 function formatSystemMessage(msg: MessageInRow): string {
   const content = parseContent(msg.content);
+  if (content.subtype === 'recall_context') {
+    return `[Recalled context]\n${content.text}`;
+  }
   return `[SYSTEM RESPONSE]\n\nAction: ${content.action || 'unknown'}\nStatus: ${content.status || 'unknown'}\nResult: ${JSON.stringify(content.result || null)}`;
 }
 

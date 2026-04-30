@@ -237,6 +237,22 @@ describe('trigger-flag split', () => {
   });
 });
 
+describe('formatSystemMessage', () => {
+  it('test_formatSystemMessage_recall_context_subtype', () => {
+    insertMessage('sys1', 'system', { subtype: 'recall_context', text: 'Apollo uses Snowflake' });
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('[Recalled context]\nApollo uses Snowflake');
+  });
+
+  it('test_formatSystemMessage_legacy_action_result', () => {
+    insertMessage('sys2', 'system', { action: 'register_group', status: 'success', result: { id: 'ag-1' } });
+    const result = formatMessages(getPendingMessages());
+    expect(result).toMatch(/\[SYSTEM RESPONSE\]/);
+    expect(result).toContain('Action: register_group');
+    expect(result).toContain('Status: success');
+  });
+});
+
 describe('stripInternalTags', () => {
   it('strips single-line internal tags and trims', () => {
     expect(stripInternalTags('hello <internal>secret</internal> world')).toBe('hello  world');

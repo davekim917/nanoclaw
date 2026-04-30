@@ -54,9 +54,8 @@ export interface AdditionalMountConfig {
   readonly?: boolean;
 }
 
-export interface MnemonConfig {
+export interface MemoryConfig {
   enabled: boolean;
-  embeddings: boolean;
 }
 
 export interface ContainerConfig {
@@ -167,21 +166,28 @@ export interface ContainerConfig {
   providerConfig?: Record<string, unknown>;
 
   /**
-   * Mnemon persistent-memory integration. When enabled, the host mounts
-   * ~/.mnemon RW into the container, sets MNEMON_STORE env, and the
-   * container hooks (SessionStart/UserPromptSubmit/Stop) become active.
-   * embeddings: when true, also passes MNEMON_EMBED_ENDPOINT/MODEL env
-   * for hybrid recall (BM25 + vector + graph) via host Ollama.
+   * Memory integration. When enabled, the host mounts the per-group mnemon store
+   * filesystem-RW into the container (sqlite needs journal/lock files) but sets
+   * `MNEMON_READ_ONLY=1` so the wrapper rejects write subcommands. Container can
+   * `mnemon recall` (read), but writes go through the host daemon. See
+   * `docs/memory.md` § Architecture and `data/systemd/nanoclaw-memory-daemon.service`.
    */
-  mnemon?: MnemonConfig;
+  memory?: MemoryConfig;
 }
 
 function emptyConfig(): ContainerConfig {
+  // memory.enabled defaults to true for new groups — operator opt-out via
+  // `disable-memory.ts <group>` for surfaces that shouldn't accumulate
+  // facts (e.g., one-shot service accounts, ephemeral test groups). The
+  // initial container.json carries the flag so the daemon picks it up on
+  // its next 60s sweep, and the container's MNEMON_STORE env gets set on
+  // first spawn so memory-capture hooks are wired without an extra step.
   return {
     mcpServers: {},
     packages: { apt: [], npm: [] },
     additionalMounts: [],
     skills: 'all',
+    memory: { enabled: true },
   };
 }
 
@@ -224,7 +230,7 @@ export function readContainerConfig(folder: string): ContainerConfig {
       tone: raw.tone,
       tools: raw.tools,
       providerConfig: raw.providerConfig,
-      mnemon: raw.mnemon,
+      memory: (raw as Record<string, unknown>).memory as MemoryConfig | undefined,
     };
   } catch (err) {
     console.error(`[container-config] failed to parse ${p}: ${String(err)}`);

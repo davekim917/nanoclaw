@@ -164,6 +164,32 @@ describe('routing', () => {
     expect(routing.threadId).toBe('thread-456');
     expect(routing.inReplyTo).toBe('m1');
   });
+
+  it('skips system rows (recall_context) when picking the routing anchor', () => {
+    // recall_context is inserted before its paired inbound message and would
+    // otherwise hijack inReplyTo, making outbound replies attach to recall-X
+    // instead of the real user message X.
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, kind, timestamp, status, platform_id, channel_type, thread_id, content)
+       VALUES ('recall-m1', 'system', datetime('now', '-1 second'), 'pending', NULL, NULL, NULL,
+               '{"subtype":"recall_context","facts":[]}')`,
+      )
+      .run();
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, kind, timestamp, status, platform_id, channel_type, thread_id, content)
+       VALUES ('m1', 'chat', datetime('now'), 'pending', 'chan-123', 'discord', 'thread-456', '{"text":"hi"}')`,
+      )
+      .run();
+
+    const messages = getPendingMessages();
+    const routing = extractRouting(messages);
+    expect(routing.inReplyTo).toBe('m1');
+    expect(routing.platformId).toBe('chan-123');
+    expect(routing.channelType).toBe('discord');
+    expect(routing.threadId).toBe('thread-456');
+  });
 });
 
 describe('mock provider', () => {

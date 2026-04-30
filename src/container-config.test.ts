@@ -3,7 +3,7 @@ import os from 'os';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import { readContainerConfig, writeContainerConfig } from './container-config.js';
+import { readContainerConfig, type MemoryConfig } from './container-config.js';
 
 let tmpDir: string;
 
@@ -34,10 +34,9 @@ function writeGroupConfig(folder: string, content: object): void {
   fs.writeFileSync(path.join(dir, 'container.json'), JSON.stringify(content, null, 2) + '\n');
 }
 
-describe('readContainerConfig — mnemon block', () => {
-  it('test_mnemon_block_round_trips', () => {
+describe('readContainerConfig — memory block', () => {
+  it('test_readContainerConfig_no_memory', () => {
     writeGroupConfig('test-group', {
-      mnemon: { enabled: true, embeddings: true },
       mcpServers: {},
       packages: { apt: [], npm: [] },
       additionalMounts: [],
@@ -46,11 +45,12 @@ describe('readContainerConfig — mnemon block', () => {
 
     const result = readContainerConfig('test-group');
 
-    expect(result.mnemon).toEqual({ enabled: true, embeddings: true });
+    expect(result.memory).toBeUndefined();
   });
 
-  it('test_no_mnemon_block_reads_undefined', () => {
+  it('test_readContainerConfig_memory_enabled', () => {
     writeGroupConfig('test-group2', {
+      memory: { enabled: true },
       mcpServers: {},
       packages: { apt: [], npm: [] },
       additionalMounts: [],
@@ -59,12 +59,13 @@ describe('readContainerConfig — mnemon block', () => {
 
     const result = readContainerConfig('test-group2');
 
-    expect(result.mnemon).toBeUndefined();
+    expect(result.memory).toEqual({ enabled: true } satisfies MemoryConfig);
   });
 
-  it('test_partial_mnemon_block_drops', () => {
+  it('test_readContainerConfig_drops_legacy_mnemon_field', () => {
+    // Legacy mnemon field with embeddings — should be silently dropped (not mapped to memory)
     writeGroupConfig('test-group3', {
-      mnemon: { enabled: true },
+      mnemon: { enabled: true, embeddings: true },
       mcpServers: {},
       packages: { apt: [], npm: [] },
       additionalMounts: [],
@@ -73,23 +74,7 @@ describe('readContainerConfig — mnemon block', () => {
 
     const result = readContainerConfig('test-group3');
 
-    expect(result.mnemon).toEqual({ enabled: true });
-  });
-
-  it('round-trip: writeContainerConfig then readContainerConfig preserves mnemon block', () => {
-    const folder = 'test-group4';
-    fs.mkdirSync(path.join(GROUPS_DIR, folder), { recursive: true });
-
-    writeContainerConfig(folder, {
-      mcpServers: {},
-      packages: { apt: [], npm: [] },
-      additionalMounts: [],
-      skills: 'all',
-      mnemon: { enabled: true, embeddings: false },
-    });
-
-    const result = readContainerConfig(folder);
-
-    expect(result.mnemon).toEqual({ enabled: true, embeddings: false });
+    expect(result.memory).toBeUndefined();
+    expect((result as unknown as Record<string, unknown>).mnemon).toBeUndefined();
   });
 });

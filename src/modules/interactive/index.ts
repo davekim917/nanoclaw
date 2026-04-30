@@ -30,7 +30,7 @@ async function handleInteractiveResponse(payload: ResponsePayload): Promise<bool
     return true; // claimed — we owned this questionId even though the session is gone
   }
 
-  writeSessionMessage(session.agent_group_id, session.id, {
+  await writeSessionMessage(session.agent_group_id, session.id, {
     id: `qr-${payload.questionId}-${Date.now()}`,
     kind: 'system',
     timestamp: new Date().toISOString(),

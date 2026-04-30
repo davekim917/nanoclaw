@@ -45,6 +45,24 @@ export interface TaskDef {
    * interesting output is "I did N things" or nothing at all.
    */
   quietStatus?: boolean;
+  /**
+   * Per-task model + effort override. The container's poll-loop applyFlagBatch
+   * reads this and pins model/effort for the wake-turn without changing the
+   * agent group's sticky config. Used by daily wiki-synthesise to run on Opus
+   * with reasoning_effort=high while keeping normal chat on the group's
+   * default (typically Sonnet).
+   *
+   * Schema mirrors the chat-side FlagIntent contract — turnModel/turnEffort
+   * apply for this fire only; sticky variants would persist across fires.
+   */
+  flagIntent?: {
+    turnModel?: string;
+    turnEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+    stickyModel?: string;
+    stickyEffort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+    clearStickyModel?: boolean;
+    clearStickyEffort?: boolean;
+  };
 }
 
 function generateSessionId(): string {
@@ -92,6 +110,7 @@ export async function scheduleTask(def: TaskDef, _dataDir?: string): Promise<voi
     const content = JSON.stringify({
       prompt: def.prompt,
       ...(def.quietStatus ? { quietStatus: true } : {}),
+      ...(def.flagIntent ? { flagIntent: def.flagIntent } : {}),
     });
     // Idempotency: active series (pending/paused) → UPDATE; terminal rows (completed/failed/cancelled)
     // are treated as absent so a fresh row is inserted, enabling re-scheduling after cancellation.

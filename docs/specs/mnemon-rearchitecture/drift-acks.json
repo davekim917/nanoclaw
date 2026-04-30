@@ -1,0 +1,18 @@
+{
+  "feature": "mnemon-rearchitecture",
+  "stage": "pre-build",
+  "acknowledgments": [
+    {
+      "id": "B2",
+      "reason": "should-recall.ts consolidated into recall-injection.ts. Both helpers are small (≤30 lines each) and tightly coupled — shouldRecall is only ever called from maybeInjectRecall. Co-locating reduces module count without losing test coverage (recall-injection.test.ts covers both paths via test_shouldRecall_filters_acks and the maybeInjectRecall integration tests). Design's separate-file listing was aspirational; plan optimized for fewer files in the module."
+    },
+    {
+      "id": "B3",
+      "reason": "Memory module barrel src/modules/memory/index.ts skipped. Callers import named exports directly (MemoryStore from store.ts, MnemonStore from mnemon-impl.ts, redactSecrets from secret-redactor.ts, maybeInjectRecall from recall-injection.ts). No public API surface to maintain — the module is internal to the host. Other internal modules (e.g., src/modules/scheduling/) follow the same no-barrel pattern."
+    },
+    {
+      "id": "B4",
+      "reason": "Plan systemd Requires=nanoclaw-v2.service ollama.service is correct per cycle-2 S1 'fate-share with parents' resolution recorded in design review-resolutions table at line ~210. The literal unit-block snippet in design §Detailed Design 3 (line 848) shows only Requires=ollama.service because that snippet wasn't refreshed when S1 was applied — the constraint table and the plan are aligned; the design body text is the lagging artifact. Plan is the corrected version."
+    }
+  ]
+}

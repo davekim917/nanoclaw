@@ -13,15 +13,16 @@ import { createAgentGroup, getAgentGroup, getAgentGroupByFolder } from '../../db
 import { getSession } from '../../db/sessions.js';
 import { wakeContainer } from '../../container-runner.js';
 import { initGroupFilesystem } from '../../group-init.js';
-import { updateContainerConfig } from '../../container-config.js';
+import { readContainerConfig, updateContainerConfig } from '../../container-config.js';
 import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import type { AgentGroup, Session } from '../../types.js';
 import { createDestination, getDestinationByName, normalizeName } from './db/agent-destinations.js';
 import { writeDestinations } from './write-destinations.js';
+import { bootstrapMemoryForGroup } from '../memory/bootstrap.js';
 
-function notifyAgent(session: Session, text: string): void {
-  writeSessionMessage(session.agent_group_id, session.id, {
+async function notifyAgent(session: Session, text: string): Promise<void> {
+  await writeSessionMessage(session.agent_group_id, session.id, {
     id: `sys-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     kind: 'chat',
     timestamp: new Date().toISOString(),
@@ -130,28 +131,32 @@ export async function handleCreateAgent(content: Record<string, unknown>, sessio
   //         container.json via initContainerConfig.
   initGroupFilesystem(newGroup, { instructions: instructions ?? undefined });
 
-  // STEP 2: Mutate container.json to set provider + providerConfig. Both
-  //         fields written here so the container's config picks up the right
-  //         provider factory on spawn.
-  if (provider !== undefined || providerConfig !== undefined) {
-    try {
-      updateContainerConfig(folder, (c) => {
-        if (provider !== undefined) c.provider = provider;
-        if (providerConfig !== undefined) c.providerConfig = providerConfig;
-      });
-    } catch (err) {
-      log.error('create_agent: updateContainerConfig failed, rolling back folder', { err, folder });
-      const cleaned = safeRemoveFolder(folder);
-      notifyAgent(
-        session,
-        `create_agent failed: could not write config for "${name}".${orphanSuffix(folder, cleaned)}`,
-      );
-      return;
-    }
+  // STEP 2: Mutate container.json to set provider + providerConfig +
+  //         agentGroupId. Persisting agentGroupId BEFORE the DB insert
+  //         (rather than after) means a downstream failure can't leave us
+  //         in the awkward state where the DB has the row but container.json
+  //         lacks the ID — recovery from that state currently isn't supported
+  //         by enable-memory.ts (Codex F9). Doing it before DB-insert keeps
+  //         the rollback story clean: any failure here also rolls back the
+  //         folder via safeRemoveFolder.
+  try {
+    updateContainerConfig(folder, (c) => {
+      c.agentGroupId = agentGroupId;
+      if (provider !== undefined) c.provider = provider;
+      if (providerConfig !== undefined) c.providerConfig = providerConfig;
+    });
+  } catch (err) {
+    log.error('create_agent: updateContainerConfig failed, rolling back folder', { err, folder });
+    const cleaned = safeRemoveFolder(folder);
+    notifyAgent(
+      session,
+      `create_agent failed: could not write config for "${name}".${orphanSuffix(folder, cleaned)}`,
+    );
+    return;
   }
 
   // STEP 3: DB INSERT. On failure, rollback the folder from step 1
-  //         (including the provider config written in step 2).
+  //         (including the agentGroupId / provider config written in step 2).
   try {
     createAgentGroup(newGroup);
   } catch (err) {
@@ -192,8 +197,41 @@ export async function handleCreateAgent(content: Record<string, unknown>, sessio
   // tries to send to the newly-created child.
   writeDestinations(session.agent_group_id, session.id);
 
-  // Fire-and-forget notification back to the creator
-  notifyAgent(
+  // Memory bootstrap (Codex F5). New groups default to memory.enabled = true
+  // via emptyConfig(); a child group born here without an explicit override
+  // therefore gets the flag flipped on but never has its sources/ subdirs,
+  // mnemon store, or synth task scaffolded — leaving the container with
+  // MNEMON_STORE set but the daemon with nothing to write into. Run the
+  // shared bootstrap here so default-on groups are fully functional from
+  // first message. (agentGroupId was persisted into container.json in
+  // step 2, so the daemon's discoverMemoryGroups can read it directly.)
+  try {
+    const cfg = readContainerConfig(folder);
+    if (cfg.memory?.enabled === true) {
+      const bs = await bootstrapMemoryForGroup(folder, agentGroupId);
+      log.info('Memory bootstrap completed for new agent group', {
+        agentGroupId,
+        folder,
+        sourcesDirs: bs.step1_sourcesDirsCreated,
+        mnemonStore: bs.step2_mnemonStoreStatus,
+        synthTask: bs.step3_synthTaskScheduled,
+      });
+    }
+  } catch (err) {
+    // Don't fail the agent creation — the group is fully created in the DB
+    // and container.json already has agentGroupId, so enable-memory.ts CAN
+    // retry recovery. Log loud so the gap is visible.
+    log.error('create_agent: memory bootstrap failed (group still created, run enable-memory.ts to retry)', {
+      err,
+      agentGroupId,
+      folder,
+    });
+  }
+
+  // notifyAgent is async since the writeSessionMessage signature change.
+  // Awaiting ensures the notification (and its recall_context, if any) commits
+  // and the container wakes only after both rows are written.
+  await notifyAgent(
     session,
     `Agent "${localName}" created. You can now message it with <message to="${localName}">...</message>.`,
   );

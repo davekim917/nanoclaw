@@ -76,12 +76,7 @@ export interface ChannelDeliveryAdapter {
     files?: OutboundFile[],
   ): Promise<string | undefined>;
   setTyping?(channelType: string, platformId: string, threadId: string | null): Promise<void>;
-  deleteMessage?(
-    channelType: string,
-    platformId: string,
-    threadId: string | null,
-    messageId: string,
-  ): Promise<void>;
+  deleteMessage?(channelType: string, platformId: string, threadId: string | null, messageId: string): Promise<void>;
 }
 
 let deliveryAdapter: ChannelDeliveryAdapter | null = null;
@@ -477,12 +472,7 @@ async function deliverMessage(
     const orphan = statusTracking.get(session.id);
     if (orphan && deliveryAdapter.deleteMessage) {
       try {
-        await deliveryAdapter.deleteMessage(
-          orphan.channelType,
-          orphan.platformId,
-          orphan.threadId,
-          orphan.messageId,
-        );
+        await deliveryAdapter.deleteMessage(orphan.channelType, orphan.platformId, orphan.threadId, orphan.messageId);
       } catch (err) {
         log.warn('Failed to delete orphan thinking-block status — leaving as-is', {
           sessionId: session.id,

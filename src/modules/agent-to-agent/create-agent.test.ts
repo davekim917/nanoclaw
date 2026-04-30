@@ -232,7 +232,19 @@ describe('write sequence ordering', () => {
       session,
     );
 
-    expect(callOrder).toEqual(['initGroupFilesystem', 'updateContainerConfig', 'createAgentGroup']);
+    // Expected ordering (Codex F9 fix — single updateContainerConfig that
+    // persists agentGroupId + provider + providerConfig in one shot,
+    // BEFORE the DB insert, so a DB failure rolls back via safeRemoveFolder
+    // and we never end up with a DB row whose container.json lacks
+    // agentGroupId):
+    //   1. initGroupFilesystem  — creates folder + writes empty container.json
+    //   2. updateContainerConfig — writes agentGroupId + provider/providerConfig
+    //   3. createAgentGroup     — DB insert (failure rolls back via safeRemoveFolder)
+    expect(callOrder).toEqual([
+      'initGroupFilesystem',
+      'updateContainerConfig',
+      'createAgentGroup',
+    ]);
 
     initSpy.mockRestore();
     updateSpy.mockRestore();

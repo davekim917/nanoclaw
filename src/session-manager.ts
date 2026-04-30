@@ -16,6 +16,7 @@ import path from 'path';
 
 import type { OutboundFile } from './channels/adapter.js';
 import { DATA_DIR } from './config.js';
+import { maybeInjectRecall } from './modules/memory/recall-injection.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
 import {
   createSession,
@@ -332,7 +333,7 @@ export function writeSessionRouting(agentGroupId: string, sessionId: string): vo
  * long-lived connection — see the "Cross-mount visibility invariants" note
  * at the top of this file.
  */
-export function writeSessionMessage(
+export async function writeSessionMessage(
   agentGroupId: string,
   sessionId: string,
   message: {
@@ -353,9 +354,26 @@ export function writeSessionMessage(
      */
     trigger?: 0 | 1;
   },
-): void {
+): Promise<void> {
   // Extract base64 attachment data, save to inbox, replace with file paths
   const content = extractAttachmentFiles(agentGroupId, sessionId, message.id, message.content);
+
+  // Inject recall context BEFORE the inbound message so recall_context gets a
+  // lower seq and the container reads it first. maybeInjectRecall fails open.
+  await maybeInjectRecall({
+    agentGroupId,
+    sessionId,
+    inboundMessage: {
+      ...message,
+      content,
+      trigger: message.trigger ?? 1,
+    },
+    routing: {
+      channelType: message.channelType ?? null,
+      platformId: message.platformId ?? null,
+      threadId: message.threadId ?? null,
+    },
+  });
 
   const db = openInboundDb(agentGroupId, sessionId);
   try {
@@ -464,14 +482,14 @@ export function openSessionDb(agentGroupId: string, sessionId: string): Database
 }
 
 /** Write a system response to a session's inbound.db so the container's findQuestionResponse() picks it up. */
-export function writeSystemResponse(
+export async function writeSystemResponse(
   agentGroupId: string,
   sessionId: string,
   requestId: string,
   status: string,
   result: Record<string, unknown>,
-): void {
-  writeSessionMessage(agentGroupId, sessionId, {
+): Promise<void> {
+  await writeSessionMessage(agentGroupId, sessionId, {
     id: `sys-resp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     kind: 'system',
     timestamp: new Date().toISOString(),

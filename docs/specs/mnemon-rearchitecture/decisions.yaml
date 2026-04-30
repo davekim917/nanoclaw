@@ -1,0 +1,425 @@
+feature: mnemon-rearchitecture
+created_by: /team-brief
+last_updated_by: /team-review cycle 3 + cycle-3 mechanical fixes applied inline (cap-reached path 1)
+
+constraints:
+  # Architectural
+  - id: C1
+    type: HARD
+    text: "Memory writes are async and must never interrupt the main conversation."
+    source: brief
+    verified: true
+  - id: C2
+    type: HARD
+    text: "Agent never decides what to remember. Classifier (host-side daemon) is the only fact-write decider."
+    source: brief
+    verified: true
+  - id: C3
+    type: HARD
+    text: "Recall is automatic system-reminder push on every agent invocation, with noise pre-filter (length, single-emoji, ack-only)."
+    source: brief
+    verified: true
+  - id: C4
+    type: HARD
+    text: "Recall fail-open: if mnemon or Ollama is unavailable, no facts injected, agent responds normally."
+    source: brief
+    verified: true
+  - id: C5
+    type: HARD
+    text: "Recall p50 latency target ≤ 750ms warm; hard timeout 1500ms."
+    source: brief
+    verified: true
+  - id: C6
+    type: HARD
+    text: "No phase gating, no shadow/live distinction. Memory is on or off per group."
+    source: brief
+    verified: true
+  - id: C7
+    type: HARD
+    text: "Memory layer accessed through MemoryStore interface; no direct mnemon CLI dependency outside the implementation file."
+    source: brief
+    verified: true
+  - id: C8
+    type: HARD
+    text: "Cross-provider portable: recall injection lives above provider abstraction, not inside Claude SDK hooks."
+    source: brief
+    verified: true
+
+  # Cleanup discipline
+  - id: C9
+    type: HARD
+    text: "Surgical removal of all PR #68 broken pieces: TS hooks module, host module, mnemon-companion skill, phase gating in wrapper, mnemon-phase2.ts, rollout/health JSONs, metrics jsonl files. No dead code."
+    source: brief
+    verified: true
+  - id: C10
+    type: HARD
+    text: "Existing wiki repos under groups/*/wiki/ and scripts/wiki-autopush.sh cron must remain operational throughout rebuild."
+    source: brief
+    verified: true
+  - id: C11
+    type: HARD
+    text: "Existing Ollama systemd unit on host must remain unmodified."
+    source: brief
+    verified: true
+
+  # Ingestion + dedup
+  - id: C12
+    type: HARD
+    text: "Chat-stream classifier batches turn pairs (user input(s) + assistant response(s) within thread, within poll window). Single-message classification forbidden."
+    source: brief
+    verified: true
+  - id: C13
+    type: HARD
+    text: "Chat-stream classifier idempotency keyed on (message_archive_id, classifier_version)."
+    source: brief
+    verified: true
+  - id: C14
+    type: HARD
+    text: "Source ingestion idempotency keyed on sha256(canonicalized_content) + extractor_version + prompt_version."
+    source: brief
+    verified: true
+  - id: C15
+    type: HARD
+    text: "Substantive-message pre-filter: skip trivial turns (under N chars, single-emoji, ack-only). Threshold tunable."
+    source: brief
+    verified: true
+  - id: C16
+    type: HARD
+    text: "Classifier output must include worth_storing: boolean field; defaults to false."
+    source: brief
+    verified: true
+  - id: C17
+    type: HARD
+    text: "Classifier must refuse to extract secrets, credentials, tokens, or transient session state."
+    source: brief
+    verified: true
+
+  # Polling + watermarking
+  - id: C18
+    type: HARD
+    text: "Chat-stream daemon polls data/archive.db every 60s."
+    source: brief
+    verified: true
+  - id: C19
+    type: HARD
+    text: "Per-group, per-thread watermark on sent_at tracks last classified message. Advances only on classifier success."
+    source: brief
+    verified: true
+
+  # Storage + isolation
+  - id: C20
+    type: HARD
+    text: "Per-group local mnemon stores, no cross-group access. Cross-tenant isolation enforced at filesystem and CLI levels."
+    source: brief
+    verified: true
+  - id: C21
+    type: HARD
+    text: "No global store in this build. MemoryStore interface leaves room for future global tier without breaking changes."
+    source: brief
+    verified: true
+
+  # Operational
+  - id: C22
+    type: HARD
+    text: "Single PR, end-to-end working build, demonstrated on all 7 production groups before merge gate."
+    source: brief
+    verified: true
+  - id: C23
+    type: HARD
+    text: "Pre-merge smoke test: send substantive message; within next 60s sweep, verify chat-stream classifier ran, fact landed, recall injected on next message."
+    source: brief
+    verified: true
+  - id: C24
+    type: HARD
+    text: "Host-prerequisite verification at build start: Ollama active, nomic-embed-text pulled, mnemon binary at expected version, host disk space adequate."
+    source: brief
+    verified: true
+  - id: C25
+    type: SOFT
+    text: "Daemon should be observable in real time (memory-health.json updated within seconds of state change)."
+    source: brief
+    verified: true
+
+  # Supply chain
+  - id: C26
+    type: HARD
+    text: "No additions to pnpm-workspace.yaml minimumReleaseAgeExclude without operator approval."
+    source: CLAUDE.md
+    verified: true
+  - id: C27
+    type: HARD
+    text: "Anthropic SDK version pinning preserved; Haiku model version pinned (current claude-haiku-4-5-20251001)."
+    source: brief
+    verified: true
+
+  # Brief Q7 follow-up — turn-pair definition
+  - id: C28
+    type: HARD
+    text: "Turn pair = consecutive user messages within a thread + immediately-following consecutive assistant messages. Can span poll windows. Single-message classification forbidden."
+    source: brief
+    verified: true
+  - id: C29
+    type: HARD
+    text: "Turn-pair stability threshold: 120s. A pair is classifiable only when last assistant message is older than 120s."
+    source: brief
+    verified: true
+  - id: C30
+    type: HARD
+    text: "Turn-pair orphan threshold: 10 minutes. User-only run classifiable on its own after 10min with is_orphan: true provenance."
+    source: brief
+    verified: true
+  - id: C31
+    type: HARD
+    text: "Turn-pair classification fires on the next 60s sweep after stability is reached, not event-driven."
+    source: brief
+    verified: true
+
+  # Implicit constraints surfaced during /team-design from CLAUDE.md
+  - id: C33
+    type: HARD
+    text: "Container/host runtime split (Bun container, Node host) means MemoryStore implementation cannot be shared across runtimes."
+    source: CLAUDE.md
+    verified: true
+  - id: C34
+    type: HARD
+    text: "Adding new agent-runner runtime dep requires `cd container/agent-runner && bun install` and committing `bun.lock`."
+    source: CLAUDE.md
+    verified: true
+  - id: C35
+    type: HARD
+    text: "Container tests use `bun:test`, not vitest."
+    source: CLAUDE.md
+    verified: true
+  - id: C36
+    type: HARD
+    text: "Session DB pragma `journal_mode=DELETE` is load-bearing for cross-mount visibility (does not affect this design directly but constraints any mount changes)."
+    source: CLAUDE.md
+    verified: true
+
+decisions:
+  - id: D1
+    stage: brief
+    description: "Source ingestion mechanism"
+    chosen: "Tool-output capture (primary) + chat-stream classifier (primary, equal weight) + manual drops to groups/<g>/sources/inbox/ (tertiary)"
+    rejected:
+      - option: "iCloud → Mac Mini → rsync → Linux host (Vivian's reference setup)"
+        reason: "Platform-specific to Pi 5 + Mac Mini bridge; Dave's Linux server has different curation surfaces (Slack, Granola, Pocket, gws integrations)"
+      - option: "Slack-direct upload only (operator drags files into chat)"
+        reason: "Chat is primary memory source per Dave; tool-output captures the same content more naturally without manual curation step"
+      - option: "Per-group source GitHub repos with cron pull"
+        reason: "Adds 7+ new repos and ~5min ingest latency; tool-output capture is more aligned with Dave's actual workflow"
+    constraint_refs: [C12, C13, C14]
+  - id: D2
+    stage: brief
+    description: "Global vs local store strategy"
+    chosen: "Local stores only this build; main-reads-across-all-groups deferred to next phase"
+    rejected:
+      - option: "Implement global tier now per Vivian's gist"
+        reason: "Adds mount permission complexity, wrapper changes, recall merge logic — not needed for v1-parity baseline. MemoryStore interface accommodates future tier without breaking changes."
+    constraint_refs: [C7, C20, C21]
+  - id: D3
+    stage: brief
+    description: "Migration of 2 existing illysium store insights from PR #68 sanity tests"
+    chosen: "Discard. Clean slate."
+    rejected:
+      - option: "Migrate to new local store"
+        reason: "Both are debris (smoke-test fact + trivial client fact). Will be re-extracted from any chat about Illysium clients. Clean slate is cleaner."
+    constraint_refs: []
+  - id: D4
+    stage: brief
+    description: "Recall scope per turn"
+    chosen: "Auto-recall on every user message with noise pre-filter (length under N, single-emoji, ack-only)"
+    rejected:
+      - option: "Always run, no pre-filter"
+        reason: "Wastes recall budget on trivial turns; mnemon recall + Ollama embedding for ack-only messages produces no useful context."
+      - option: "Only on substantive messages with full LLM-rephrasing of query"
+        reason: "Adds LLM call to hot path; gist says use raw user message as input."
+    constraint_refs: [C3, C5, C15]
+  - id: D5
+    stage: brief
+    description: "Wiki synthesis path"
+    chosen: "Agent-driven daily scheduled task per group (Path A)"
+    rejected:
+      - option: "Host-side daemon synthesis with templated Haiku prompt (Path B)"
+        reason: "Cheaper and more deterministic but lacks group domain context. Agent-driven preserves voice, cross-references, and existing operator hand-edits in Obsidian. Cost difference (~$3-5/month at 7 groups) is small relative to wiki output quality."
+    constraint_refs: []
+  - id: D6
+    stage: brief
+    description: "Per-group rollout strategy"
+    chosen: "All 7 groups enabled at ship time; smoke-test on illysium pre-merge"
+    rejected:
+      - option: "Enable one group first, observe for N days, then enable rest"
+        reason: "Dave-stated no-phasing constraint; previous attempt's shadow phase failure was the catalyst for this rebuild. End-to-end working build demonstrated in production at merge."
+    constraint_refs: [C6, C22]
+  - id: D7
+    stage: brief
+    description: "Classifier scope (user-only vs both user + assistant)"
+    chosen: "Both user + assistant turns, batched by turn pair"
+    rejected:
+      - option: "User messages only"
+        reason: "Misses agent's analytical conclusions which are often the most valuable durable insights, especially in technical groups"
+      - option: "Single-message classification (one classifier call per message)"
+        reason: "Loses cross-message context; v1's batching pattern preserved facts that span multiple messages in quick succession"
+    constraint_refs: [C12]
+  - id: D11
+    stage: brief
+    description: "Turn-pair definition + stability + orphan thresholds"
+    chosen: "Turn pair = consecutive user messages within a thread + immediately-following consecutive assistant messages. Bounded by role-flip + response stability, not thread closure. Stability threshold: 120s (last agent msg older than this). Orphan threshold: 10min (user-only run classified alone with is_orphan provenance). Classification fires on next 60s sweep after stability."
+    rejected:
+      - option: "Wait for thread to end before classifying"
+        reason: "Threads can span days; would produce zero extraction during active multi-day conversations"
+      - option: "Event-driven classification (fire immediately when pair stabilizes)"
+        reason: "Adds non-uniform code path mixing event + poll triggers; up to 60s next-sweep latency is acceptable for the consistency win"
+      - option: "Single-message classification ignoring role boundaries"
+        reason: "Loses user/agent context distinction critical for fact attribution and provenance"
+    constraint_refs: [C12, C18, C19]
+  - id: D8
+    stage: brief
+    description: "Storage primitive"
+    chosen: "mnemon, behind a MemoryStore interface; no codebase dependency on mnemon CLI shape outside the implementation"
+    rejected:
+      - option: "Replace mnemon with sqlite-vec now"
+        reason: "mnemon's graph layer (entity/temporal/causal/semantic edges) plus dedup and decay are useful primitives; replaceability via interface is sufficient. Swap is a separate decision once we see how the graph layer earns its keep."
+      - option: "Couple recall + ingestion directly to mnemon CLI"
+        reason: "Dave constraint: must be replaceable without touching the recall injector or daemon."
+    constraint_refs: [C7]
+  - id: D9
+    stage: brief
+    description: "Recall injection placement"
+    chosen: "Provider-agnostic injector before provider.query() in the agent-runner poll loop"
+    rejected:
+      - option: "Implement as Claude SDK UserPromptSubmit hook (PR #68 pattern)"
+        reason: "Locks recall to Claude. NanoClaw v2 has provider abstraction (Codex, OpenCode planned). Codex review explicitly flagged this as the design flaw to fix early, not later."
+    constraint_refs: [C8]
+  - id: D10
+    stage: brief
+    description: "Polling cadence + control plane"
+    chosen: "Host systemd daemon polling data/archive.db every 60s; per-group/thread watermark on sent_at"
+    rejected:
+      - option: "Per-container worker"
+        reason: "Dies with container, duplicates work across container restarts, not provider-neutral"
+      - option: "File-watch + pub/sub mechanism"
+        reason: "Doesn't exist in NanoClaw today; archive.db is the already-deduplicated, already-delivered view of conversation"
+      - option: "Real-time event stream"
+        reason: "Adds infrastructure (eventbus/MQ) for marginal latency benefit; 60s poll matches Dave's v1 pattern and is fine for this use case"
+    constraint_refs: [C18, C19]
+
+  # Design-stage decisions (added 2026-04-30)
+  - id: D12
+    stage: design
+    description: "Recall injection placement"
+    chosen: "Option B — Host-side recall via system-message injection in router. MemoryStore lives on host as a single Node module; container has zero recall code during chat. Container retains mnemon binary access only for daily synthesise task."
+    rejected:
+      - option: "Option A — Container-side recall hook via QueryInput.systemReminder field with per-provider implementation"
+        reason: "Each provider must implement the new field correctly; same drift surface as PR #68's Claude-only hooks. Violates C7 (MemoryStore interface) by spreading memory awareness across the provider abstraction."
+      - option: "Option C — In-container recall via local mnemon binary (PR #68-shaped)"
+        reason: "Couples agent-runner to mnemon CLI shape. Violates C7. Two writers (host daemon + container) on same SQLite via flock adds operational complexity. Inherits PR #68's coupling failure modes."
+    constraint_refs: [C1, C4, C7, C8, C9]
+  - id: D13
+    stage: design
+    description: "Memory daemon process model"
+    chosen: "Single systemd unit with two responsibilities (chat-stream classifier + source-ingestion). Shared health JSON, shared state DB, single Node process."
+    rejected:
+      - option: "Two separate systemd units (one per responsibility)"
+        reason: "Higher operational complexity; per-component process split is a follow-up if fault isolation becomes an issue. Single process is sufficient for the MVP."
+    constraint_refs: [C18, C25]
+  - id: D14
+    stage: design
+    description: "Recall message kind"
+    chosen: "Reuse `kind: 'system'` with `subtype: 'recall_context'` in content JSON"
+    rejected:
+      - option: "Add new top-level `kind: 'recall'`"
+        reason: "Larger surface change; agent-runner formatter already handles `kind: 'system'` natively. Subtype-based discrimination is smaller and equally clean."
+    constraint_refs: [C8]
+  - id: D15
+    stage: design
+    description: "Tool-output capture mechanism"
+    chosen: "Configurable list of MCP tool names with explicit hash-key logic per tool. Initial list: WebFetch, granola, pocket, gws docs, attachments, Linear/GitHub thread readers."
+    rejected:
+      - option: "Generic 'capture all tool results' middleware"
+        reason: "Tool result schemas vary widely; generic capture would need per-tool deserialization anyway. Reviewable list is more honest."
+      - option: "captureForMemory: true flag on tool definitions"
+        reason: "Adds metadata to every MCP tool; equivalent to the configurable list but more invasive."
+    constraint_refs: [C14, C17]
+  - id: D16
+    stage: design
+    description: "Telemetry location"
+    chosen: "Single host-side `data/memory-health.json`; remove all per-group `.mnemon-metrics.jsonl` files"
+    rejected:
+      - option: "Keep per-group jsonl files alongside host health"
+        reason: "Per-container telemetry was a PR #68 artifact (hooks emitting from inside container). Host-side daemon owns telemetry now; per-group files become orphans."
+    constraint_refs: [C9, C25]
+
+assumptions:
+  - id: A1
+    stage: design
+    text: "Router hot-path latency tolerates 100-750ms recall typical (1500ms hard timeout)"
+    validation: "Build smoke test: send 20 substantive messages, measure recall latency and full pipeline platform_msg → first_agent_response"
+    validated: false
+  - id: A2
+    stage: design
+    text: "kind: 'system' with subtype: 'recall_context' doesn't conflict with existing system action result handling"
+    validation: "Read formatter.ts to verify subtype branching; add explicit collision test"
+    validated: false
+  - id: A3
+    stage: design
+    text: "mnemon CLI is stable enough to be the implementation behind MemoryStore"
+    validation: "Periodic dep-durability check (per retro learning #4); MemoryStore interface preserves swap path to sqlite-vec"
+    validated: false
+  - id: A4
+    stage: design
+    text: "Tool-output capture for the named tools list covers most curation actually wanted"
+    validation: "Operator review during build smoke; revise list per Dave's actual usage"
+    validated: false
+  - id: A5
+    stage: design
+    text: "Single writer model: host daemon is sole mnemon writer. Container synthesise reads via wrapper enforcing MNEMON_READ_ONLY=1. Wrapper flock retained for the rare admin-command case (operator running mnemon via wrapper concurrent with daemon). Q3 cycle-2 = b: RW mount, wrapper RO enforcement, block-mnemon-real-hook retained."
+    validation: "Smoke test: confirm wrapper rejects write subcommands when MNEMON_READ_ONLY=1; confirm block-mnemon-real-hook denies direct mnemon-real Bash invocation"
+    validated: false
+  - id: A6
+    stage: design
+    text: "systemd unit + Type=simple + Restart=on-failure handles daemon crashes adequately"
+    validation: "Operational; if daemon crashes repeatedly, escalate to per-component process split"
+    validated: false
+  - id: A7
+    stage: design
+    text: "Haiku 4.5 classifier output (JSON with worth_storing) is reliably parseable"
+    validation: "Schema-validated parsing with retry; structured-output prompt + low temperature"
+    validated: false
+  - id: A8
+    stage: design
+    text: "groups/<g>/sources/inbox/ inotify watch scales to all 7 groups simultaneously"
+    validation: "Verify host /proc/sys/fs/inotify/max_user_watches at build start (host-prereq check)"
+    validated: false
+
+waivers: []
+
+review_cycles:
+  - iteration: 1
+    must_fix_count: 12
+    should_fix_count: 10
+    wont_fix_count: 6
+    completed_at: 2026-04-30T20:45:00Z
+  - iteration: 2
+    must_fix_count: 13
+    should_fix_count: 7
+    wont_fix_count: 4
+    completed_at: 2026-04-30T22:30:00Z
+    note: |
+      Cycle 1 fixes closed but introduced 8 new MUST-FIX. Pace not converging.
+      Of 13 MUST-FIX: 5 mechanical, 5 non-trivial design revisions, 3 user-decision items
+      (M1 scheduled-task scope, M2 system-reminder authority level, M3 RO sqlite architecture).
+      Escalated to user. Q1=b (narrower scope), Q2=b (transcript-level), Q3=b (RW + wrapper RO).
+  - iteration: 3
+    must_fix_count: 9
+    should_fix_count: 7
+    wont_fix_count: 5
+    completed_at: 2026-04-30T23:45:00Z
+    note: |
+      FINAL CYCLE. Reviewer B (best-practice-check) verdict: design architecturally validated —
+      "on the right track and well-aligned with dominant industry pattern; novel choices deliberate
+      and well-justified; known drifts are Phase-2 deferrals." 11 T1/T2/T3 sources corroborate.
+
+      All 9 cycle-3 MUST-FIX are SPEC-TEXT errors (fictional function names, signature mismatches,
+      inventory contradictions) — mechanical fixes, not architectural decisions. Convergence
+      achieved on architecture; spec polish is the residual.

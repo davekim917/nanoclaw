@@ -588,9 +588,11 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       const tid = threadId ?? platformId;
       // Optional on the underlying chat-adapter — Slack/Discord expose it,
       // CLI/Telegram/etc. may not. Skip silently when absent.
-      const fn = (adapter as unknown as {
-        deleteMessage?: (t: string, m: string) => Promise<void>;
-      }).deleteMessage;
+      const fn = (
+        adapter as unknown as {
+          deleteMessage?: (t: string, m: string) => Promise<void>;
+        }
+      ).deleteMessage;
       if (typeof fn !== 'function') return;
       await fn.call(adapter, tid, messageId);
     },

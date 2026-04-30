@@ -692,7 +692,13 @@ async function deliverToAgent(
     }
   }
 
-  writeSessionMessage(session.agent_group_id, session.id, {
+  // Start typing indicator before writeSessionMessage so recall injection
+  // latency doesn't delay visible feedback on chat/chat-sdk paths.
+  if (wake && (event.message.kind === 'chat' || event.message.kind === 'chat-sdk')) {
+    startTypingRefresh(session.id, session.agent_group_id, event.channelType, event.platformId, event.threadId);
+  }
+
+  await writeSessionMessage(session.agent_group_id, session.id, {
     id: messageIdForAgent(event.message.id, agent.agent_group_id),
     kind: event.message.kind,
     timestamp: event.message.timestamp,
@@ -742,9 +748,10 @@ async function deliverToAgent(
   });
 
   if (wake) {
-    // Typing indicator + wake are only for the engaged branch; accumulated
-    // messages sit silently until a real trigger fires.
-    startTypingRefresh(session.id, session.agent_group_id, event.channelType, event.platformId, event.threadId);
+    // For non-chat kinds, typing indicator fires here (after write) as before.
+    if (event.message.kind !== 'chat' && event.message.kind !== 'chat-sdk') {
+      startTypingRefresh(session.id, session.agent_group_id, event.channelType, event.platformId, event.threadId);
+    }
     const freshSession = getSession(session.id);
     if (freshSession) {
       await wakeContainer(freshSession);

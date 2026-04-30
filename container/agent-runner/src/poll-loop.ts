@@ -78,8 +78,17 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
   let pollCount = 0;
   while (true) {
-    // Skip system messages — they're responses for MCP tools (e.g., ask_user_question)
-    const messages = getPendingMessages().filter((m) => m.kind !== 'system');
+    // Skip system messages — they're responses for MCP tools (e.g., ask_user_question).
+    // Exception: recall_context system messages must reach the prompt path so the agent sees recalled facts.
+    const messages = getPendingMessages().filter((m) => {
+      if (m.kind !== 'system') return true;
+      try {
+        const parsed = JSON.parse(m.content) as { subtype?: string };
+        return parsed.subtype === 'recall_context';
+      } catch {
+        return false;
+      }
+    });
     pollCount++;
 
     // Periodic heartbeat so we know the loop is alive
@@ -419,8 +428,33 @@ async function processQuery(
     // trigger=0 rows ride the next wake's batch (where the formatter renders
     // them inside <thread_context>). Letting them through here would feed
     // Claude a non-mention as a follow-up user message mid-turn.
-    const newMessages = getPendingMessages().filter((m) => {
-      if (m.kind === 'system') return false;
+    const allPending = getPendingMessages();
+    // The host writes recall_context first, then the paired inbound message,
+    // both within a single async writeSessionMessage call but with a microtask
+    // boundary in between. A mid-turn poll firing in that window would observe
+    // the recall_context alone, push it as a follow-up to the WRONG turn, and
+    // leave the inbound message to arrive next poll without its recall context.
+    // To preserve ordering, only admit a recall_context if its paired trigger
+    // message (id == recall_context.id minus 'recall-' prefix) is in the same
+    // batch — otherwise hold it for the next poll where the inbound has landed.
+    const triggerIdsInBatch = new Set(
+      allPending.filter((m) => m.trigger === 1).map((m) => m.id),
+    );
+    const newMessages = allPending.filter((m) => {
+      if (m.kind === 'system') {
+        // Exception: recall_context system messages should ride along as
+        // additional context for the in-flight turn — but only when the
+        // paired trigger message is in this same poll batch.
+        try {
+          const parsed = JSON.parse(m.content) as { subtype?: string };
+          if (parsed.subtype !== 'recall_context') return false;
+        } catch {
+          return false;
+        }
+        const pairedTriggerId = m.id.startsWith('recall-') ? m.id.slice('recall-'.length) : null;
+        if (!pairedTriggerId || !triggerIdsInBatch.has(pairedTriggerId)) return false;
+        return true;
+      }
       if ((m.kind === 'chat' || m.kind === 'chat-sdk') && isClearCommand(m)) return false;
       if (m.trigger !== 1) return false;
       return true;
@@ -624,7 +658,10 @@ function applyFlagBatch(
 ): { model?: string; effort?: string } {
   let intent: FlagIntent | undefined;
   for (const m of messages) {
-    if (m.kind !== 'chat' && m.kind !== 'chat-sdk') continue;
+    // Tasks carry flagIntent the same way chat messages do — used by scheduled
+    // wake tasks (e.g. wiki synthesis) to pin model+effort per fire without a
+    // global agent-group config change.
+    if (m.kind !== 'chat' && m.kind !== 'chat-sdk' && m.kind !== 'task') continue;
     try {
       const parsed = JSON.parse(m.content) as { flagIntent?: FlagIntent };
       if (parsed.flagIntent) {
