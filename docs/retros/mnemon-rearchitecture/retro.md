@@ -1,0 +1,99 @@
+# Retro: mnemon-rearchitecture
+
+**Date:** 2026-04-30
+**Feature:** mnemon-rearchitecture (per-group fact store + automatic recall + multi-source capture; rebuild after PR #68 failure)
+**Branch:** `main` (linear history; commits `8ae875f` feature + `81ed5a6` post-soak hardening)
+**Artifacts location:** `docs/specs/mnemon-rearchitecture/`
+**Prior retro referenced:** `.context/retros/mnemon-integration/retro.md` (PR #68)
+
+## Stage-by-Stage Findings
+
+| Stage | Worked Well | Missed / Wrong | Root Cause |
+|-------|-------------|----------------|------------|
+| /team-brief | Grounded every architectural claim in literal quotes from Vivian's gist (brief.md:11–47). 30+ HARD constraints in `decisions.yaml`. Explicitly tied to PR #68 retro and named what would diverge from canonical (5-row deviation table at brief.md:41–47). Capture sources enumerated incl. Granola, Pocket, gws, Linear, GitHub, Exa, attachments, WebFetch (brief.md:44, 88). | `mcp__exa__*` listed in brief but **missed in plan's MCP_CAPTURE_TOOLS allowlist** — only Granola, Pocket, Linear, GitHub were covered in the plan/build. Caught **post-ship** in user audit, not by any earlier stage (qa-report.md "Gap 1"). | Brief's source enumeration was prose, not a formal spec table the plan could mechanically map against. The plan covered "what's been seen used in this codebase" rather than enumerating from the brief. |
+| /team-design | 33 decisions logged with rejected alternatives. 3 review cycles ran. External pattern validation by Reviewer B citing 11 sources (Mem0, Letta, Aura, Signet, Anthropic engineering, etc.) gave architecture confidence. Cycle-2 + cycle-3 review-resolutions tracked at top of design.md. | (1) **C5 recall budget (1500ms HARD)** was based on Ollama embed-only benchmark (60-216ms warm; design.md:24) — didn't account for full mnemon CLI runtime. Reality: 1.1s short queries / 1.85s long queries (CLI spawn + DB open + 15K-edge graph traversal). Live-discovered post-ship: every passive recall returned 0 facts because the timeout fired mid-flight. (2) Multiple **fictional symbols** in pseudocode caught only at cycle-3 review: `writeSessionMessageRaw` (M2), `getAgentGroupFolder` (M8), `should-recall.ts` as a separate file (B2 drift), `src/modules/memory/index.ts` barrel (B3 drift), unreachable 1800s backoff entry (post-build P1). (3) **Internal SOT contradictions** between cycle-2/3 resolution table at top and unchanged body text — caused multiple PARTIAL findings in pre-build drift. (4) systemd unit ExecStart pointed at `dist/scripts/memory-daemon.js` but tsconfig `rootDir: ./src` wouldn't compile that path (M9). | (1) HARD constraints with numeric budgets weren't validated against the actual implementation pathway, only against a benchmark of one component. (2) Pseudocode treated as authoritative without a primitives audit — same root cause as PR #68's wrapper-jq path bug per review.md M2. (3) Layered cycle-resolution table is a structural compromise — corrections never propagate cleanly to body text. (4) Path-vs-build-pipeline assumption never reconciled. |
+| /team-review | 3 cycles converged. Reviewer A (architecture-advisor with code-level grep) caught the fictional symbols. Reviewer B (best-practice-check) validated novel choices. Reviewer C (Codex adversarial) converged with A. `/team-auto` correctly paused at cycle-3 cap with `auto-pause.md` documenting all 9 mechanical fixes — none required user judgment. | (1) **None of the 3 reviewers caught the C5 budget being wrong**, despite quantitative claim being in the design. (2) M7's "recommend native fetch via OneCLI proxy" was kicked downstream as a recommendation rather than a concrete spec. The actual endpoint (`http://127.0.0.1:10254/api/anthropic`) wasn't validated and turned out to be the wrong port (10254 = dashboard returning 404; gateway = 10255). (3) The 1800s backoff entry conflicted with the count=3 poison ASSERT in the same review cycle and wasn't flagged by any reviewer. | (1) Reviewer B's external-pattern check is qualitative (does the pattern fit industry norms?) not quantitative (does the budget match measured runtime?). (2) Reviewer recommendations propagated as design text without being upgraded to spec; the gap between "recommend" and "specified" is where M7 fell through. (3) Cycle-3 was the cap; reviewers were focused on bugs explicitly named, not orthogonal contradictions. |
+| /team-plan | File ownership map covered ~60 files. Constraint-traceability table mapped HARD constraints to tasks. Pre-build drift found 4 DIVERGED + 2 PARTIAL — 1 fixed inline (B1 stale skeleton footer), 3 acked legitimately (B2/B3/B4 cycle-2 corrections), 2 PARTIAL non-blocking. Plan's literal interface inlining (vs PR #68's "see design") generally held. | (1) Brief's Exa enumeration didn't propagate into MCP_CAPTURE_TOOLS coverage. (2) **Per-task model wiring not specified** — wiki synthesis ran on whatever model the agent group used (typically Sonnet) when the high-leverage low-frequency reasoning task warranted Opus + high effort. Caught only post-ship in user audit (qa-report.md "Gap 2"). (3) `scripts/mnemon-restore.sh` was PR #68 debris not in the plan's delete list — ate a post-build drift fix (Fix 1). | (1) Plan derived MCP coverage from existing code patterns, not from the brief's source taxonomy. (2) Provider already supported per-call model+effort (`claude.ts:904`); nobody asked "should THIS task use a different model?" during planning. (3) Plan's delete list was hand-curated; no mechanical sweep for orphaned `mnemon-*` scripts. |
+| /team-build | 7 groups, 2 fix loops (D + F, both iteration 1). All escalations resolved without user intervention. Builder-E correctly identified arithmetic bug in `test_recallTopKDistribution_buckets` spec values. Build-state.md tracked decisions cleanly. Both pre-build and post-build drift gates passed cleanly. | (1) **Group D's recall-ordering fix was incomplete** — lead directed `writeSessionMessage` to become async to preserve recall ordering. Builder-D updated the function signature and `router.ts:701` but **left 8 of 9 production callers fire-and-forget**. QA's swarm caught the await cascade (`approvals/primitive.ts`, `create-agent.ts`, `response-handler.ts`, `interactive/index.ts`, `self-mod/apply.ts`, `agent-to-agent/agent-route.ts`, `scheduling/actions.ts` + `ApprovalHandlerContext.notify` type signature). (2) Builder-F initially wrote 5 of 7 classifier tests as source-grep (`expect(src).toContain(...)`) — needed full behavioral rewrite with archive.db injection seam. (3) Group A had `scripts/mnemon-restore.sh` PR #68 debris escape into the build. | (1) When changing a function's contract (sync→async), the lead's directive didn't include a verify-all-callers step. The 1-of-9 fix shipped to QA. (2) Builders defaulted to source-grep tests when behavioral assertions were possible — needs explicit instruction. (3) Pre-existing-debris detection happens in QA, not build. |
+| /team-qa | Caught the writeSessionMessage await cascade (8 callers). Caught the SourceIngester silent watcher no-op. Recall content boundary added (`<recall-data>` framing) per OWASP ASI06. **4 rounds** of Codex adversarial caught second-order issues: idempotency replay invariant, daemon endpoint URL, MemoryDenyWriteExecute crashing Node JIT, TOCTOU residual in processInboxFile, recall_context picked as reply anchor in formatter. Cross-model (swarm catches Codex blind spots, Codex catches swarm blind spots) demonstrably worked. | (1) **C5 budget wrong** — never tested under load with real mnemon traversal. Live-discovered. (2) **F3 (daemon endpoint URL)** was tagged "REAL bug, OUT OF SCOPE for cleanup, defer to follow-up PR" by Codex round 3. User pushed back; lead investigated and found 4 separate issues end-to-end (wrong port, no `onecli run` wrapper, Node 20 fetch ignores HTTPS_PROXY, OAuth Bearer auth path). All fixed in same session. (3) `mcp__exa__*` and per-task model wiring caught only after user audit, not by any swarm reviewer. | (1) QA validates correctness against spec, not performance against reality — no validator runs the system under realistic load. (2) "Out of scope, defer" classification was respected even though the daemon literally couldn't make an Anthropic call as configured. The lead should have flagged "this blocks the feature working at all" against Codex's scoping judgment. (3) Reviewers fact-check the diff against the diff; they don't reconcile against the brief's source taxonomy or "should THIS run a different model" product questions. |
+| /team-drift | Pre-build caught 4 DIVERGED + 2 PARTIAL — 3 acked legitimately, 1 fixed inline. Post-build caught 2 DIVERGED + 2 PARTIAL — both DIVERGED fixed by lead at Step 7 (mnemon-restore.sh deletion, MnemonStore.recordRedaction wiring), PARTIAL non-blocking. 2-extractor (Claude + Codex) convergence pattern produced agreed-upon findings. | The internal SOT contradictions surfaced as PARTIAL findings rather than blocking — and the build correctly followed the test/ASSERT versions over the prose versions. Worked, but is a process smell: cycle-2/3 review resolutions never propagated into the design body. | The "resolution table at the top, unchanged body" pattern lets corrections accumulate without cleanly invalidating the older content. Drift extractors flag the conflict but lack a way to force consolidation. |
+
+## Live-discovered post-ship issues (NEW)
+
+This feature shipped via `/team-auto` ending at `/team-ship`, but the headline UX (passive recall) was broken in production for hours before live testing surfaced it. Three issues only discovered by direct user @mention testing in Discord:
+
+1. **C5 timeout (1500ms) was too tight for actual mnemon CLI** — every passive recall returned 0 facts because the timeout fired mid-traversal. Bumped to 3000ms; real fix is mnemon-as-daemon.
+2. **Ollama embedding model unloaded after 5 min idle** — first recall after a quiet period caught a 3-5s cold load. Fixed via systemd drop-in `OLLAMA_KEEP_ALIVE=-1`.
+3. **Container absolute-ceiling sweep starves recall budget** — when killing 9+ stale containers in parallel, host CPU/IO contention pushes mnemon CLI from 1.1s solo to >3s. One-off (8-day cohort), but the sweep should be paced.
+
+All three documented in `docs/specs/mnemon-rearchitecture/follow-up-items.md` (Items 4-6).
+
+## Key Learnings
+
+1. **Quantitative HARD constraints need empirical floor checks before becoming HARD.** C5's 1500ms budget was based on Ollama embed-only benchmark (60-216ms warm). The actual mnemon CLI takes 1.1-1.85s — even short queries cross 1500ms under load. The constraint shipped to production untested against the real artifact. Next time: any HARD constraint pinning a numeric budget must include a one-line empirical timing run during `/team-design` against the actual implementation pathway, not against one component.
+
+2. **Async-contract fixes need a caller-cascade verification step in the same iteration.** Group D's `writeSessionMessage` async fix updated the function and 1 of 9 callers; QA's swarm caught the remaining 8 fire-and-forget callers. Same iteration costs nothing; surfacing it 2 stages later costs an entire QA cycle. Next time: lead-directed contract changes (sync→async, return-type changes, signature changes) must include `grep -rn '<name>' --include='*.ts'` verification and update all matches in the same fix.
+
+3. **Reviewer "recommendations" must be upgraded to spec edits before /team-plan.** M7 said "recommend native fetch via OneCLI proxy" — that recommendation propagated as design text but never became a concrete spec for the daemon endpoint, auth path, or proxy dispatcher. The actual implementation needed 4 corrections (port 10254→10255, ExecStart `onecli run` wrapper, Node 20 HTTPS_PROXY ignored, OAuth Bearer auth) caught only at QA round 3. Next time: cycle-3 review's "recommended" findings either get promoted to spec text in the same cycle, or get explicit `[NEEDS SPEC]` tags carried into `/team-plan` Step 4 as task-level decisions.
+
+4. **`/team-ship`'s "tests pass" gate doesn't validate end-to-end live behavior.** All 423 tests passed; build clean; deployed across 11 groups. Yet recall injection was 0% functional in production for hours — the headline UX silently never fired. Surfaced only when Dave manually tested. Next time: features with an observable user-facing behavior need a manual-smoke gate AFTER deploy and BEFORE declaring done — exercise the headline path once and visually verify. This is `/team-go-live`'s territory, not `/team-ship`'s, but it's currently nobody's territory.
+
+5. **"Out of scope, defer" on a finding that blocks the feature working should be a hard re-evaluate, not soft defer.** Codex round 3 tagged F3 (daemon endpoint URL) as "REAL bug, OUT OF SCOPE for cleanup PR." Honest classification by Codex's scoping discipline. But the daemon literally couldn't make an Anthropic call as configured — the feature didn't work. User pushback fixed it in the same session. Next time: the lead applies a stricter rule than Codex's scoping — if a flagged "out-of-scope" finding blocks the headline feature path from working, override the scoping and fix it inline.
+
+6. **Brief's source enumeration must produce a coverage table the plan mechanically maps against.** Brief listed Exa among capture sources at `brief.md:44, 88` — it survived 3 review cycles, design, plan, build, QA, and shipped without `mcp__exa__*` in `MCP_CAPTURE_TOOLS`. Discovered only when user asked "did Exa get covered?" Next time: `/team-brief` Step X produces a `coverage-checklist.md` enumerating sources, surfaces, or capabilities with checkboxes. `/team-plan` and `/team-qa` mechanically verify each item appears in the spec/build.
+
+## Recommended Updates
+
+### CLAUDE.md
+
+- **Section:** § Quick Context (or new § Performance Discipline subsection)
+- **Change:** Add line: "Numeric HARD constraints (latency budgets, throughput targets, memory ceilings) must be validated empirically against the real artifact during `/team-design`, not against component benchmarks. The constraint isn't HARD until a measured run confirms the budget."
+- **Reason:** Learning #1 — C5's 1500ms budget was assumed from embed-only benchmark; real mnemon CLI broke it on every recall.
+
+### Workflow Skills
+
+- **Skill:** `bootstrap-workflow:team-design` § Constraint Validation
+- **Change:** Add a step before exiting design: "For each HARD constraint with a numeric budget (timing, throughput, size), run a one-shot empirical check against the actual artifact and record `actual: Xms` next to the constraint. If actual exceeds budget, the constraint is provisional and must be reconciled before `/team-plan`."
+- **Reason:** Learning #1 — design.md:24 cited "60-216ms warm" but the artifact-level reality (mnemon CLI) was 10-25× slower.
+
+- **Skill:** `bootstrap-workflow:team-design` § Pseudocode Discipline
+- **Change:** Add a primitives audit step: "Every named function/file/symbol referenced in pseudocode must either (a) exist in the codebase verifiable via grep, OR (b) carry a `[NEW]` tag pointing to the task in the plan that creates it. Pseudocode that names primitives without grounding is rejected back to design."
+- **Reason:** Cycle-3 review M2 (writeSessionMessageRaw), M8 (getAgentGroupFolder), B2/B3 drift (should-recall.ts, modules/memory/index.ts) — all the same pattern, and the prior PR #68 retro flagged the same root cause.
+
+- **Skill:** `bootstrap-workflow:team-build` § Lead Fix Discipline
+- **Change:** Add to the section on lead-directed fixes: "When a fix changes a function's contract (sync→async, signature, return type), the fix is incomplete until: (1) all caller sites are updated in the same iteration, verified via `grep -rn '<name>' --include='*.{ts,js}'`; (2) the verification command and result are recorded in build-state.md as part of the fix-loop entry. Single-call-site fixes for contract changes are flagged suspicious and require explicit lead approval."
+- **Reason:** Learning #2 — Group D's writeSessionMessage async fix updated 1 of 9 callers; QA caught it but the cascade should have been part of the same iteration.
+
+- **Skill:** `bootstrap-workflow:team-review` § Recommendations vs Spec
+- **Change:** Add gate at end of cycle 3: "Any reviewer 'recommendation' that hasn't been promoted to concrete spec text by cycle-3 close becomes a `[NEEDS SPEC]` tag carried into `/team-plan` as a task-level decision. Recommendations cannot ship as un-resolved design text."
+- **Reason:** Learning #3 — M7's "recommend native fetch via OneCLI proxy" propagated as text, never became spec, broke at QA round 3 with 4 separate corrections needed.
+
+- **Skill:** `bootstrap-workflow:team-ship` (or new `team-go-live`)
+- **Change:** Either add to `/team-ship` Step X, or create a new `/team-go-live` skill: "For features with an observable user-facing behavior, exercise the headline path once after deploy and before declaring done. Capture the actual user-facing output (Discord screenshot, API response, log line showing the feature firing). Tests pass ≠ feature works."
+- **Reason:** Learning #4 — recall injection was 0% functional in production despite all tests passing. Bug surfaced only on manual user test.
+
+- **Skill:** `bootstrap-workflow:team-qa` § Out-of-Scope Findings
+- **Change:** Add to the validator-result review: "When any cross-model adversarial finding is tagged 'out of scope, defer' but its description states the finding blocks the feature path from working at all (vs. an isolated edge case), the lead must override the scoping and fix inline. Codex's scoping discipline is conservative; correctness blockers ≠ scope creep."
+- **Reason:** Learning #5 — F3 daemon endpoint marked "out of scope for cleanup PR" but the daemon literally couldn't make an Anthropic call as configured.
+
+- **Skill:** `bootstrap-workflow:team-brief` § Source Coverage Tables
+- **Change:** When the brief enumerates sources, surfaces, or capabilities (e.g., "capture from: Granola, Pocket, gws Docs, Exa, Linear, GitHub..."), produce a coverage table in `brief.md` that the plan can mechanically map against. The table is referenced by name in `/team-plan` Step 4 (named test cases) and `/team-qa` Step 1 (file routing).
+- **Reason:** Learning #6 — Exa was in brief.md:44 but missed throughout plan/build/QA. A formal table would have caught the gap mechanically.
+
+### Project Skills
+
+No project-specific skill changes — all updates are to bootstrap-workflow skills shared across features. Project lessons captured in `docs/specs/mnemon-rearchitecture/follow-up-items.md` (Items 4-6 for the live-discovered issues).
+
+## Comparison to PR #68 retro
+
+The prior `mnemon-integration` retro (`.context/retros/mnemon-integration/retro.md`) flagged 5 learnings. Three apply to this rebuild:
+
+| Prior learning | This feature |
+|---|---|
+| 1. Verify host prereqs at `/team-build` start | ✓ APPLIED — `scripts/verify-memory-prereqs.sh` ran in build, ollama daemon validated |
+| 2. Plan should inline structurally-critical literals | ✓ APPLIED — interface signatures, schemas, jq paths inlined; pre-build drift caught remaining "see design" gaps |
+| 3. Builder prompt: no cross-task TaskUpdate / SendMessage | ✓ APPLIED — no phantom builder coordination this time |
+| 4. `/best-practice-check` should include dependency durability | ⚠ NOT APPLIED — same mnemon-dev dependency reused without re-evaluation. Worth re-doing per major feature, not just at first introduction. |
+| 5. `/team-ship` Step 1 should check main CI baseline | ⚠ N/A — work merged directly to main, no PR/CI surface to check |
+
+New learnings (1-6 above) extend the prior retro: budget validation (C5), async-cascade discipline, recommendations-must-become-spec, end-to-end live verification, out-of-scope override discipline, and brief-coverage-table mechanism.
