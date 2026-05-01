@@ -59,8 +59,11 @@ export const MEMORY_SOURCE_SUBDIRS = [
 export const SYNTH_CRON_DEFAULT = '0 3 * * *';
 export const SYNTH_SERIES_PREFIX = 'memory-synth-';
 
-const SYNTH_PROMPT =
-  'Run wiki synthesise per /app/container/skills/wiki/SKILL.md — read mnemon facts and update wiki pages.';
+const SYNTH_PROMPT = `Run wiki synthesise per /app/container/skills/wiki/SKILL.md.
+
+READ FACTS IN FULL — DO NOT SKIM. Before writing or updating any wiki page, run \`mnemon recall <query>\` for the entity/concept/timeline at hand and read every returned fact end-to-end. Claude 4 models have a known tendency to partial-read or truncate long inputs and then apologize after the fact when the user notices missing context. For wiki synthesis that pattern produces silently-wrong pages: the fact you skipped is often the one correcting an earlier error or providing disambiguating detail. There is no time pressure on this task — favor completeness over speed.
+
+If two facts contradict, surface both rather than silently picking one. If a fact contains a parenthetical alias or definition not corroborated in other facts, treat it skeptically — it may be a classifier confabulation that should not be promoted into the wiki.`;
 
 export interface BootstrapResult {
   step1_sourcesDirsCreated: boolean;
