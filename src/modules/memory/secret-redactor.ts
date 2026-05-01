@@ -50,14 +50,24 @@ const BLOCK_PATTERNS: ReadonlyArray<[RegExp, string]> = [
   [/(?:-u|--user)\s+[^:\s]+:[^\s]+/g, 'curl_credentials'],
 ];
 
-// Bound the regex engine's per-call input. The /g patterns above are fast in
-// the common case but quantifiers like `{20,}` and `[^\s]+` can degrade on
-// adversarial inputs. 8KB chunks bound worst-case execution per call while
-// still covering full content via sliding window. Overlap (2KB) covers any
-// secret pattern that crosses a chunk boundary — comfortably exceeds the
-// length of every pattern we detect (bearer/JWT/sk-keys/AWS/etc., all <2KB).
-const REDACTOR_CHUNK_SIZE = 8192;
-const REDACTOR_CHUNK_OVERLAP = 2048;
+// Bound the regex engine's per-call input. The /g patterns above use only
+// linear-time quantifiers (`{N,}`, `[^...]+`), so they don't backtrack
+// catastrophically on long inputs — but bigger chunks still mean more work
+// per call, so we keep a window. 32KB chunks with 16KB overlap.
+//
+// Overlap sets the upper bound on secret-pattern length we can reliably
+// catch when it straddles a chunk boundary. Several BLOCK_PATTERNS have
+// unbounded match length: `Authorization: Bearer <token>`, JWTs
+// (`eyJ[…]{10,}.[…]+.[…]+`), URL secret params, `secret_assignment`.
+// Microsoft Graph access tokens and OIDC id_tokens with rich claims
+// routinely run 2-4KB; JWEs reach 8KB. 16KB overlap covers that range with
+// margin while keeping CPU cost reasonable.
+//
+// Ultrareview merged_bug_001 caught that the prior 2KB overlap was
+// insufficient — a 4KB JWT at offset 5000 in a 14KB doc was contained in
+// neither chunk 0=[0..8192) nor chunk 1=[6144..14336).
+const REDACTOR_CHUNK_SIZE = 32_768;
+const REDACTOR_CHUNK_OVERLAP = 16_384;
 
 function* slidingChunks(content: string): Iterable<string> {
   if (content.length <= REDACTOR_CHUNK_SIZE) {
@@ -74,9 +84,9 @@ function* slidingChunks(content: string): Iterable<string> {
 
 export function redactSecrets(fact: FactInput): RedactionResult {
   // Pass 1: known-shape patterns (fast, deterministic). Scan full content via
-  // sliding window so secrets past offset 8KB don't pass through unredacted
-  // (regression caught by ultrareview F18 — the prior single-pass truncation
-  // silently allowed secrets in long source-ingest documents).
+  // sliding window so secrets past the chunk boundary don't pass through
+  // unredacted (regression caught by ultrareview F18 — the prior single-pass
+  // truncation silently allowed secrets in long source-ingest documents).
   for (const chunk of slidingChunks(fact.content)) {
     for (const [pattern, reason] of BLOCK_PATTERNS) {
       pattern.lastIndex = 0;
@@ -86,11 +96,18 @@ export function redactSecrets(fact: FactInput): RedactionResult {
     }
   }
 
-  // Pass 2: registered .env secret values — scrubSecrets handles its own input
-  // length and is not regex-vulnerable (substring matching against registered
-  // values), so scan the full content directly.
+  // Pass 2: defense-in-depth via scrubSecrets. Despite the name, this does
+  // BOTH substring matching against registered .env values (linear-time)
+  // AND a second pass of secret-shape regexes from secret-scrubber.ts:115
+  // (`scrubSecretShapes` — 9 patterns, all linear-time today). Pass 1's
+  // BLOCK_PATTERNS is currently a strict superset of those shape patterns,
+  // so a Pass 2 hit reaching here is most likely a registered-env-value
+  // catch — but if Pass 1 and Pass 2's shape lists ever diverge (e.g.
+  // someone adds a pattern to scrubSecretShapes without mirroring it into
+  // BLOCK_PATTERNS), this lane catches it. The reason label reflects that
+  // the catch could be either source.
   if (scrubSecrets(fact.content) !== fact.content) {
-    return { shouldStore: false, reason: 'registered_env_secret' };
+    return { shouldStore: false, reason: 'env_or_shape_match' };
   }
 
   return { shouldStore: true };
