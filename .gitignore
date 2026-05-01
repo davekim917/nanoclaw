@@ -32,6 +32,7 @@ groups/*
 
 # Temp files
 .tmp-*
+.playwright-mcp/
 
 # OS
 .DS_Store
