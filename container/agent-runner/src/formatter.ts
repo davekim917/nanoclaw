@@ -99,16 +99,26 @@ export interface RoutingContext {
 
 /**
  * Extract routing context from a batch of messages.
- * Uses the first message's routing fields, with fallback to the session's
- * default routing (`session_routing` table written by the host on each
- * wake) for any missing field.
  *
- * Why the fallback matters: agent-to-agent inbounds (channel_type='agent')
- * carry no thread_id — the agent-route module writes them with thread_id=null
- * because the message is conceptually from another agent, not from a Slack
- * thread. Without the fallback, when an agent wakes purely on an a-to-a
- * inbound and replies to its origin channel, outbound thread_id is null
- * and the reply lands in the channel root instead of the originating thread.
+ * Routing rule: if the first non-system message has `platform_id` set,
+ * treat its three routing fields (platform_id, channel_type, thread_id) as
+ * an authoritative atomic unit — including `thread_id=null`, which means
+ * "post to the channel root, no thread". Only when the message itself has
+ * no platform_id (e.g. agent-to-agent inbounds with channel_type='agent'
+ * and no platform info) do we fall back to session_routing.
+ *
+ * Why the unit-fallback matters:
+ *   - Daily background tasks like wiki-synthesise are scheduled with
+ *     destination={platformId:..., channelType:..., threadId:null} so the
+ *     report posts to the channel root. Without unit-fallback, the
+ *     null-coalescing operator treats the explicit-null thread_id as
+ *     "missing" and falls back to session_routing.thread_id — which is
+ *     whatever thread last woke the session — and the report lands in
+ *     that thread instead of the channel root.
+ *   - Agent-to-agent inbounds have channel_type='agent' and no platform
+ *     info; the reply needs to route to the originating session's
+ *     channel/thread, so per-field session_routing fallback is correct
+ *     for that case (gated by `platform_id == null`).
  */
 export function extractRouting(messages: MessageInRow[]): RoutingContext {
   // Skip system rows when picking the routing anchor — recall_context system
@@ -132,10 +142,14 @@ export function extractRouting(messages: MessageInRow[]): RoutingContext {
       return false;
     }
   });
+  // Treat (platform_id, channel_type, thread_id) as a unit. `platform_id`
+  // is the discriminator — when set, the message itself specifies WHERE
+  // to go and we respect even an explicit null thread_id (= channel root).
+  const useOwnRouting = first?.platform_id != null;
   return {
-    platformId: first?.platform_id ?? sessionRouting.platform_id ?? null,
-    channelType: first?.channel_type ?? sessionRouting.channel_type ?? null,
-    threadId: first?.thread_id ?? sessionRouting.thread_id ?? null,
+    platformId: useOwnRouting ? first.platform_id : (sessionRouting.platform_id ?? null),
+    channelType: useOwnRouting ? (first.channel_type ?? null) : (sessionRouting.channel_type ?? null),
+    threadId: useOwnRouting ? (first.thread_id ?? null) : (sessionRouting.thread_id ?? null),
     inReplyTo: first?.id ?? null,
     quietStatus,
   };
