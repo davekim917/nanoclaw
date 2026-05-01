@@ -326,7 +326,10 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
           id: `mga-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           messaging_group_id: mg.id,
           agent_group_id: inheritedAgent.id,
-          engage_mode: 'mention',
+          // Discord defaults to mention-sticky (in-thread auto-reply matches
+          // Discord conversational norms); every other platform defaults to
+          // plain mention so each invocation is intentional.
+          engage_mode: event.channelType === 'discord' ? 'mention-sticky' : 'mention',
           engage_pattern: null,
           session_mode: 'per-thread',
           priority: 0,

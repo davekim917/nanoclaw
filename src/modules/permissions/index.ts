@@ -454,7 +454,14 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
   }
 
   const isGroup = event.threadId !== null;
-  const engageMode: MessagingGroupAgent['engage_mode'] = isGroup ? 'mention' : 'pattern';
+  // Discord defaults to mention-sticky (in-thread auto-reply matches Discord
+  // conversational norms); every other group platform defaults to plain
+  // mention so each invocation is intentional. DMs always use pattern='.'.
+  const engageMode: MessagingGroupAgent['engage_mode'] = !isGroup
+    ? 'pattern'
+    : event.channelType === 'discord'
+      ? 'mention-sticky'
+      : 'mention';
   const engagePattern = isGroup ? null : '.';
 
   const mgaId = `mga-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -557,7 +564,13 @@ setMessageInterceptor(async (event: InboundEvent): Promise<boolean> => {
   }
 
   const isGroup = originalEvent.threadId !== null;
-  const engageMode: MessagingGroupAgent['engage_mode'] = isGroup ? 'mention' : 'pattern';
+  // Discord defaults to mention-sticky; every other group platform defaults
+  // to plain mention. DMs always use pattern='.'.
+  const engageMode: MessagingGroupAgent['engage_mode'] = !isGroup
+    ? 'pattern'
+    : originalEvent.channelType === 'discord'
+      ? 'mention-sticky'
+      : 'mention';
   const engagePattern = isGroup ? null : '.';
 
   const mgaId = `mga-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
