@@ -44,13 +44,15 @@ function currentAgentGroupId(): string | undefined {
 }
 
 /**
- * Semantic rerank of FTS candidates via Haiku. v1 did this — the FTS
- * ranks by token overlap which is noisy for conversational queries; a
- * quick LLM pass ("which of these threads is actually about X?") gives
- * much better top-K. We call the Anthropic messages API directly via
- * fetch rather than pulling the SDK into MCP tools; it's one prompt,
- * one response, ~1s latency. Returns original order on any failure or
- * when no API key is configured — never blocks the search.
+ * Semantic rerank of FTS candidates via Haiku. The FTS layer hands us a
+ * BM25-ranked candidate pool; this LLM pass ("which of these threads is
+ * actually about X?") tightens the top-K. Direct fetch (no SDK) — one
+ * prompt, one response, ~1s latency. Falls back to BM25 order on any
+ * failure or when no Anthropic credential is configured.
+ *
+ * Auth: prefers ANTHROPIC_API_KEY (x-api-key); falls back to
+ * CLAUDE_CODE_OAUTH_TOKEN (Authorization: Bearer + oauth-2025-04-20
+ * beta header) for Claude Max subscription deployments.
  */
 const HAIKU_MODEL = 'claude-haiku-4-5-20251001';
 const RERANK_CAP = 20; // at most this many candidates go to the LLM
@@ -62,9 +64,25 @@ interface RerankCandidate {
   channel: string;
 }
 
-async function haikuRerank(query: string, candidates: RerankCandidate[]): Promise<number[] | null> {
+function buildAnthropicAuthHeaders(): Record<string, string> | null {
   const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) return null;
+  if (apiKey) {
+    return { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' };
+  }
+  const oauth = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  if (oauth) {
+    return {
+      authorization: `Bearer ${oauth}`,
+      'anthropic-version': '2023-06-01',
+      'anthropic-beta': 'oauth-2025-04-20',
+    };
+  }
+  return null;
+}
+
+async function haikuRerank(query: string, candidates: RerankCandidate[]): Promise<number[] | null> {
+  const auth = buildAnthropicAuthHeaders();
+  if (!auth) return null;
   const baseUrl = (process.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com').replace(/\/+$/, '');
   const prompt =
     `You are reranking chat thread search results by relevance to the user's query.\n\n` +
@@ -79,8 +97,7 @@ async function haikuRerank(query: string, candidates: RerankCandidate[]): Promis
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': '2023-06-01',
+        ...auth,
       },
       body: JSON.stringify({
         model: HAIKU_MODEL,
@@ -109,14 +126,18 @@ async function haikuRerank(query: string, candidates: RerankCandidate[]): Promis
 }
 
 function sanitizeFtsQuery(q: string): string {
-  return q
+  // FTS5 treats space-separated terms as implicit AND. For chat-sized
+  // messages that's far too strict — "docker container build" almost
+  // never appears all-three-in-one-message. Join with OR so any term
+  // matches; BM25 then ranks rows by how many rare terms they hit.
+  const terms = q
     .replace(/[^\w\s-]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim()
     .split(' ')
     .filter((w) => w.length > 1)
-    .map((w) => `"${w}"`)
-    .join(' ');
+    .map((w) => `"${w}"`);
+  return terms.join(' OR ');
 }
 
 interface SearchHitRow {
@@ -133,7 +154,7 @@ export const searchThreadsTool: McpToolDefinition = {
   tool: {
     name: 'search_threads',
     description:
-      'Full-text search of past conversations in this agent group. Returns threads that match the query, most recent first, with a snippet around each match. Use when the user asks things like "find the thread where we discussed X" or "what did we decide about Y last week".',
+      'Full-text search of past conversations in this agent group. Returns threads ranked by relevance (BM25, then optional Haiku semantic rerank), with a snippet around each match. Use when the user asks things like "find the thread where we discussed X" or "what did we decide about Y last week".',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -175,22 +196,35 @@ export const searchThreadsTool: McpToolDefinition = {
           // the host, which auto-strips). Using `@name` here produced a
           // "datatype mismatch" at runtime because bun left the params
           // unbound. See CLAUDE.md container-runtime gotchas.
-          `SELECT
+          // BM25 ordering. bm25() returns a negative score, lower = better.
+          // The MATERIALIZED hint is load-bearing: without it SQLite inlines
+          // the CTE and rewrites the query into a shape where bm25() runs
+          // outside its FTS5 MATCH context — the vtab then errors with
+          // "unable to use function bm25 in the requested context". Forcing
+          // materialization computes scores in the FTS-only block, then the
+          // outer query joins on rowid and aggregates per thread.
+          `WITH matches AS MATERIALIZED (
+             SELECT rowid, bm25(messages_archive_fts) AS score
+             FROM messages_archive_fts
+             WHERE messages_archive_fts MATCH $q
+           )
+           SELECT
              a.thread_id,
              a.channel_type,
              MAX(a.channel_name) AS channel_name,
              a.platform_id,
              MAX(a.sent_at) AS latest_message_at,
              COUNT(*) AS match_count,
+             MIN(m.score) AS best_score,
              (SELECT snippet(messages_archive_fts, 0, '[', ']', '…', 12)
               FROM messages_archive_fts
-              WHERE messages_archive_fts MATCH $q AND rowid = a.rowid) AS first_snippet
+              WHERE messages_archive_fts MATCH $q AND rowid = a.rowid
+              LIMIT 1) AS first_snippet
            FROM messages_archive a
-           JOIN messages_archive_fts f ON f.rowid = a.rowid
+           JOIN matches m ON m.rowid = a.rowid
            WHERE a.agent_group_id = $ag
-             AND messages_archive_fts MATCH $q
            GROUP BY a.thread_id, a.channel_type, a.platform_id
-           ORDER BY latest_message_at DESC
+           ORDER BY best_score ASC
            LIMIT $limit`,
         )
         .all({ $ag: ag, $q: sanitized, $limit: ftsLimit }) as SearchHitRow[];
