@@ -190,6 +190,75 @@ describe('routing', () => {
     expect(routing.channelType).toBe('discord');
     expect(routing.threadId).toBe('thread-456');
   });
+
+  it('treats platform_id-set + thread_id-null as authoritative (no session_routing fallback)', () => {
+    // Daily background tasks (wiki-synthesise) are scheduled with
+    // destination={platformId, channelType, threadId:null} so the report
+    // posts to the channel root. A wake triggered by a thread chat earlier
+    // populates session_routing with that thread, but the task's explicit
+    // null thread_id MUST NOT be overridden by the session's thread.
+    // (Real-world manifestation: madison-reed synth on 2026-05-01 scheduled
+    // for discord channel root, landed in a stale session thread because
+    // the prior `??` fallback treated null as "missing".)
+    const db = getInboundDb();
+    // session_routing isn't part of initTestSessionDb's schema; create it
+    // inline with the same structure src/session-manager.ts writes in
+    // production (CREATE TABLE happens on first writeSessionRouting call).
+    db.prepare(
+      `CREATE TABLE IF NOT EXISTS session_routing (
+         id INTEGER PRIMARY KEY,
+         channel_type TEXT,
+         platform_id TEXT,
+         thread_id TEXT
+       )`,
+    ).run();
+    db.prepare(
+      `INSERT OR REPLACE INTO session_routing (id, channel_type, platform_id, thread_id)
+       VALUES (1, 'slack', 'slack:C123', 'slack:C123:thread-from-prior-wake')`,
+    ).run();
+    db.prepare(
+      `INSERT INTO messages_in (id, kind, timestamp, status, platform_id, channel_type, thread_id, content)
+       VALUES ('synth-1', 'task', datetime('now'), 'pending', 'discord:G:C', 'discord', NULL,
+               '{"prompt":"synth","quietStatus":true}')`,
+    ).run();
+
+    const messages = getPendingMessages();
+    const routing = extractRouting(messages);
+    expect(routing.platformId).toBe('discord:G:C');
+    expect(routing.channelType).toBe('discord');
+    expect(routing.threadId).toBeNull(); // NOT 'slack:C123:thread-from-prior-wake'
+  });
+
+  it('falls back to session_routing per-field when message has no platform_id (a-to-a case)', () => {
+    // Agent-to-agent inbounds carry channel_type='agent' but no platform_id
+    // (the message originates from another agent, not a Slack/Discord
+    // channel). The reply still needs to route to the session's home
+    // channel/thread, so fall back to session_routing for all three fields.
+    const db = getInboundDb();
+    db.prepare(
+      `CREATE TABLE IF NOT EXISTS session_routing (
+         id INTEGER PRIMARY KEY,
+         channel_type TEXT,
+         platform_id TEXT,
+         thread_id TEXT
+       )`,
+    ).run();
+    db.prepare(
+      `INSERT OR REPLACE INTO session_routing (id, channel_type, platform_id, thread_id)
+       VALUES (1, 'slack', 'slack:C123', 'slack:C123:home-thread')`,
+    ).run();
+    db.prepare(
+      `INSERT INTO messages_in (id, kind, timestamp, status, platform_id, channel_type, thread_id, content)
+       VALUES ('a2a-1', 'chat', datetime('now'), 'pending', NULL, 'agent', NULL,
+               '{"sender":"sibling-agent","text":"hi"}')`,
+    ).run();
+
+    const messages = getPendingMessages();
+    const routing = extractRouting(messages);
+    expect(routing.platformId).toBe('slack:C123');
+    expect(routing.channelType).toBe('slack');
+    expect(routing.threadId).toBe('slack:C123:home-thread');
+  });
 });
 
 describe('mock provider', () => {
