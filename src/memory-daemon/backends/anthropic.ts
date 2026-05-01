@@ -99,8 +99,14 @@ export function makeAnthropicBackend(opts: AnthropicBackendOpts): ClassifierBack
     const controller = new AbortController();
     let timeoutId: ReturnType<typeof setTimeout> | undefined;
 
+    // Stash the listener fn so we can remove it in finally. `once: true`
+    // self-cleans after firing; the explicit removeEventListener handles the
+    // no-fire case (request completes / times out before outer abort).
+    let onOuterAbort: (() => void) | undefined;
     if (callOpts?.signal) {
-      callOpts.signal.addEventListener('abort', () => controller.abort(callOpts.signal!.reason));
+      const outer = callOpts.signal;
+      onOuterAbort = () => controller.abort(outer.reason);
+      outer.addEventListener('abort', onOuterAbort, { once: true });
     }
 
     timeoutId = setTimeout(
@@ -156,6 +162,9 @@ export function makeAnthropicBackend(opts: AnthropicBackendOpts): ClassifierBack
       })) as Response;
     } finally {
       clearTimeout(timeoutId);
+      if (onOuterAbort && callOpts?.signal) {
+        callOpts.signal.removeEventListener('abort', onOuterAbort);
+      }
     }
 
     if (!response.ok) {

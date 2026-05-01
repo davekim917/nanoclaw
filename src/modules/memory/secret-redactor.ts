@@ -50,29 +50,46 @@ const BLOCK_PATTERNS: ReadonlyArray<[RegExp, string]> = [
   [/(?:-u|--user)\s+[^:\s]+:[^\s]+/g, 'curl_credentials'],
 ];
 
-// Bound the input length sent to the regex engine. The /g patterns above are
-// fast in the common case but `.{8,}` and similar can exhibit superlinear
-// backtracking on adversarial inputs. 8KB is well above any plausible fact
-// content length and bounds worst-case regex execution time.
-const MAX_REDACTOR_INPUT_LENGTH = 8192;
+// Bound the regex engine's per-call input. The /g patterns above are fast in
+// the common case but quantifiers like `{20,}` and `[^\s]+` can degrade on
+// adversarial inputs. 8KB chunks bound worst-case execution per call while
+// still covering full content via sliding window. Overlap (2KB) covers any
+// secret pattern that crosses a chunk boundary — comfortably exceeds the
+// length of every pattern we detect (bearer/JWT/sk-keys/AWS/etc., all <2KB).
+const REDACTOR_CHUNK_SIZE = 8192;
+const REDACTOR_CHUNK_OVERLAP = 2048;
+
+function* slidingChunks(content: string): Iterable<string> {
+  if (content.length <= REDACTOR_CHUNK_SIZE) {
+    yield content;
+    return;
+  }
+  const step = REDACTOR_CHUNK_SIZE - REDACTOR_CHUNK_OVERLAP;
+  for (let start = 0; start < content.length; start += step) {
+    const end = Math.min(start + REDACTOR_CHUNK_SIZE, content.length);
+    yield content.slice(start, end);
+    if (end === content.length) break;
+  }
+}
 
 export function redactSecrets(fact: FactInput): RedactionResult {
-  const content =
-    fact.content.length > MAX_REDACTOR_INPUT_LENGTH ? fact.content.slice(0, MAX_REDACTOR_INPUT_LENGTH) : fact.content;
-
-  // Pass 1: known-shape patterns (fast, deterministic)
-  for (const [pattern, reason] of BLOCK_PATTERNS) {
-    // Reset lastIndex for global regexes
-    pattern.lastIndex = 0;
-    if (pattern.test(content)) {
-      return { shouldStore: false, reason };
+  // Pass 1: known-shape patterns (fast, deterministic). Scan full content via
+  // sliding window so secrets past offset 8KB don't pass through unredacted
+  // (regression caught by ultrareview F18 — the prior single-pass truncation
+  // silently allowed secrets in long source-ingest documents).
+  for (const chunk of slidingChunks(fact.content)) {
+    for (const [pattern, reason] of BLOCK_PATTERNS) {
+      pattern.lastIndex = 0;
+      if (pattern.test(chunk)) {
+        return { shouldStore: false, reason };
+      }
     }
   }
 
-  // Pass 2: registered .env secret values — scrubSecrets returns text with
-  // [REDACTED] markers when any registered credential is found. Block storage
-  // when the scrubber detects an actual env-registered secret.
-  if (scrubSecrets(content) !== content) {
+  // Pass 2: registered .env secret values — scrubSecrets handles its own input
+  // length and is not regex-vulnerable (substring matching against registered
+  // values), so scan the full content directly.
+  if (scrubSecrets(fact.content) !== fact.content) {
     return { shouldStore: false, reason: 'registered_env_secret' };
   }
 

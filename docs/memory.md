@@ -172,6 +172,24 @@ sudo journalctl -u nanoclaw-memory-daemon -n 50
 ls dist/memory-daemon/index.js  # must exist — run pnpm run build if missing
 ```
 
+**After bumping CLASSIFIER_VERSION / PROMPT_VERSION:**
+
+The chat-stream sweep advances `scan_cursor` past each successfully-classified pair's `sent_at` timestamp. On subsequent sweeps it only reads rows AFTER the cursor — so when `CLASSIFIER_VERSION` or `PROMPT_VERSION` is bumped (e.g., to roll out a smarter grounding prompt), already-classified pairs stay under the OLD version and never get re-extracted. Reset watermarks to force re-classification of historical chat pairs:
+
+```bash
+# Dry-run (default): preview which groups would be reset
+pnpm exec tsx scripts/reset-classifier-watermarks.ts
+
+# Apply: actually delete watermarks for all groups (triggers re-classify)
+pnpm exec tsx scripts/reset-classifier-watermarks.ts --apply
+
+# Single-group variants:
+pnpm exec tsx scripts/reset-classifier-watermarks.ts <agentGroupId>          # dry-run
+pnpm exec tsx scripts/reset-classifier-watermarks.ts <agentGroupId> --apply  # execute
+```
+
+The script preserves `processed_pairs` (the PK includes both versions, so v1 and v2 rows coexist) and `dead_letters`. The next 60s sweep replays the archive end-to-end for affected groups. Expect a one-time spike in Anthropic/Codex API calls proportional to historical chat volume — plan cost before running on busy groups. Old-version facts in `~/.mnemon/data/<agentGroupId>/` are NOT deleted; if the old prompt produced confabulations (e.g. "WG → William Grant" before the grounding-discipline bump), use `mnemon forget <fact-id>` to remove specific facts after the new sweep adds correct versions.
+
 ---
 
 ## Rollback
@@ -209,6 +227,7 @@ Relevant paths:
 - `scripts/enable-memory.ts` — enable per group
 - `scripts/disable-memory.ts` — disable per group
 - `scripts/verify-memory-prereqs.sh` — check prereqs before enabling
+- `scripts/reset-classifier-watermarks.ts` — re-classify historical pairs after a CLASSIFIER_VERSION/PROMPT_VERSION bump
 - `data/memory-health.json` — per-group health snapshot
 - `data/mnemon-ingest.db` — watermarks + dead_letters
 - `logs/memory-daemon.log` — daemon stdout

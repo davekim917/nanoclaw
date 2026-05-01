@@ -406,7 +406,7 @@ async function classifyPair(
       new Date().toISOString(),
       factsWritten,
     );
-    db.prepare(`DELETE FROM dead_letters WHERE item_key = ?`).run(pair.pairKey);
+    db.prepare(`DELETE FROM dead_letters WHERE item_key = ? AND agent_group_id = ?`).run(pair.pairKey, agentGroupId);
     upsertWatermarks(db, agentGroupId, lastSentAt, lastSentAt);
   })();
   health.recordTurnClassified(agentGroupId, factsWritten, 0);
