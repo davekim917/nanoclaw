@@ -148,7 +148,10 @@ export async function handleCreateAgent(content: Record<string, unknown>, sessio
   } catch (err) {
     log.error('create_agent: updateContainerConfig failed, rolling back folder', { err, folder });
     const cleaned = safeRemoveFolder(folder);
-    await notifyAgent(session, `create_agent failed: could not write config for "${name}".${orphanSuffix(folder, cleaned)}`);
+    await notifyAgent(
+      session,
+      `create_agent failed: could not write config for "${name}".${orphanSuffix(folder, cleaned)}`,
+    );
     return;
   }
 
@@ -159,7 +162,10 @@ export async function handleCreateAgent(content: Record<string, unknown>, sessio
   } catch (err) {
     log.error('create_agent: createAgentGroup failed, rolling back folder', { err, folder });
     const cleaned = safeRemoveFolder(folder);
-    await notifyAgent(session, `create_agent failed: database insert failed for "${name}".${orphanSuffix(folder, cleaned)}`);
+    await notifyAgent(
+      session,
+      `create_agent failed: database insert failed for "${name}".${orphanSuffix(folder, cleaned)}`,
+    );
     return;
   }
 
