@@ -1,0 +1,13 @@
+[Unit]
+Description=Fire merge-soak-check.service once, 14:00 UTC on 2026-05-15
+Documentation=file:///home/ubuntu/nanoclaw-v2/scripts/check-merge-soak.sh
+
+[Timer]
+# Single calendar moment — fires once, never again.
+OnCalendar=2026-05-15 14:00:00 UTC
+# If the host is down at the scheduled moment, fire on next boot instead of skipping.
+Persistent=true
+Unit=merge-soak-check.service
+
+[Install]
+WantedBy=timers.target

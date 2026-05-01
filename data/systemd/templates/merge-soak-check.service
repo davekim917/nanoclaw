@@ -1,0 +1,14 @@
+[Unit]
+Description=One-shot post-merge soak verification (b407a10, 2026-05-01 -> 2026-05-15)
+After=docker.service network-online.target nanoclaw-v2.service
+Documentation=file:///home/ubuntu/nanoclaw-v2/scripts/check-merge-soak.sh
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/nanoclaw-v2
+ExecStart=/bin/bash /home/ubuntu/nanoclaw-v2/scripts/check-merge-soak.sh
+StandardOutput=journal
+StandardError=journal
+# No automatic restart — failures surface in journalctl.
