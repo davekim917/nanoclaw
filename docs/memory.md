@@ -214,3 +214,62 @@ Relevant paths:
 - `logs/memory-daemon.log` — daemon stdout
 - `logs/memory-daemon.error.log` — daemon stderr
 - `data/systemd/nanoclaw-memory-daemon.service` — systemd unit (copy to `/etc/systemd/system/` to install)
+- `data/systemd/templates/ollama-keep-alive.conf` — drop-in pinning Ollama embed model (operator-installed; see Operator Configuration below)
+- `data/systemd/templates/memory-daemon-backend.conf.example` — drop-in for switching classifier backend (operator-customized; see Operator Configuration below)
+
+## Operator Configuration
+
+Two systemd drop-ins live as templates in `data/systemd/templates/`. They're operator-installed because they hold per-host operational choices, not feature defaults.
+
+### Pin the Ollama embed model (recommended)
+
+Without this, Ollama unloads `nomic-embed-text` after 5 minutes of idle and the next mnemon recall catches a 3-5s cold load that times out the recall path. Pinning is essentially free (~565MB RAM):
+
+```bash
+sudo mkdir -p /etc/systemd/system/ollama.service.d
+sudo cp data/systemd/templates/ollama-keep-alive.conf \
+  /etc/systemd/system/ollama.service.d/keep-alive.conf
+sudo systemctl daemon-reload && sudo systemctl restart ollama
+
+# Optional one-time warmup
+curl -s http://127.0.0.1:11434/api/embeddings \
+  -d '{"model":"nomic-embed-text","prompt":"warmup"}' >/dev/null
+
+# Verify (expires_at year 2318 = "never" sentinel)
+curl -s http://127.0.0.1:11434/api/ps | python3 -m json.tool
+```
+
+### Switch the classifier backend (optional)
+
+Default (no drop-in) is Anthropic Haiku 4.5. To switch to a smarter Anthropic model, an entirely different provider, or a different effort level:
+
+```bash
+sudo mkdir -p /etc/systemd/system/nanoclaw-memory-daemon.service.d
+sudo cp data/systemd/templates/memory-daemon-backend.conf.example \
+  /etc/systemd/system/nanoclaw-memory-daemon.service.d/backend.conf
+
+# Edit /etc/.../backend.conf to your chosen backend, e.g.:
+#   anthropic:sonnet-4-6:high   (paid per-token, extended thinking)
+#   codex:gpt-5.5:medium        (codex subscription, uncorrelated failure mode vs. claude synth)
+#   anthropic:haiku-4-5:default (the default)
+
+sudo systemctl daemon-reload
+sudo systemctl restart nanoclaw-memory-daemon
+
+# Verify env loaded
+systemctl show nanoclaw-memory-daemon -p Environment --no-pager
+```
+
+The format is `<provider>:<model>:<effort>`:
+- `provider`: `anthropic` | `codex`
+- `model`: short alias mapped per-backend (`haiku-4-5`, `sonnet-4-6`, `opus-4-7` for Anthropic; `gpt-5.5`, `gpt-5-codex`, etc. for Codex)
+- `effort`: `default` | `low` | `medium` | `high`
+
+If using `codex` and the binary isn't on the daemon's narrow PATH (`/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin`), set `CODEX_BIN=/absolute/path/to/codex` in the same drop-in. The example file shows both env vars.
+
+To revert to default:
+
+```bash
+sudo rm /etc/systemd/system/nanoclaw-memory-daemon.service.d/backend.conf
+sudo systemctl daemon-reload && sudo systemctl restart nanoclaw-memory-daemon
+```
