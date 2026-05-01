@@ -41,6 +41,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { DATA_DIR, GROUPS_DIR } from '../../config.js';
+import { getPrimaryMessagingGroupByAgentGroup } from '../../db/messaging-groups.js';
 import { scheduleTask } from '../../db/scheduled-tasks.js';
 
 export const MEMORY_SOURCE_SUBDIRS = [
@@ -63,7 +64,9 @@ const SYNTH_PROMPT = `Run wiki synthesise per /app/container/skills/wiki/SKILL.m
 
 READ FACTS IN FULL — DO NOT SKIM. Before writing or updating any wiki page, run \`mnemon recall <query>\` for the entity/concept/timeline at hand and read every returned fact end-to-end. Claude 4 models have a known tendency to partial-read or truncate long inputs and then apologize after the fact when the user notices missing context. For wiki synthesis that pattern produces silently-wrong pages: the fact you skipped is often the one correcting an earlier error or providing disambiguating detail. There is no time pressure on this task — favor completeness over speed.
 
-If two facts contradict, surface both rather than silently picking one. If a fact contains a parenthetical alias or definition not corroborated in other facts, treat it skeptically — it may be a classifier confabulation that should not be promoted into the wiki.`;
+If two facts contradict, surface both rather than silently picking one. If a fact contains a parenthetical alias or definition not corroborated in other facts, treat it skeptically — it may be a classifier confabulation that should not be promoted into the wiki.
+
+REPORT DISCIPLINE: at the end of the task, if you made ZERO new pages and ZERO updates to existing pages, do not send any chat reply — complete the turn silently. Otherwise, send ONE concise line summarising what changed (e.g. "Updated 2 entity pages, created 1 timeline page."). Do not narrate the work, do not list every page touched, and do not send a status update if nothing meaningful happened.`;
 
 export interface BootstrapResult {
   step1_sourcesDirsCreated: boolean;
@@ -149,6 +152,23 @@ export async function bootstrapMemoryForGroup(
   const processAfter = new Date().toISOString();
   const taskId = `task-${result.step3_synthSeriesId}-${Date.now()}`;
 
+  // Route the synth task's chat reply to the agent group's primary messaging
+  // group's parent channel (threadId=null) instead of inheriting whichever
+  // thread happened to spawn the session. Without this, every synth report
+  // landed inside the most recent chat thread — burying chat with the agent
+  // and getting lost. If the agent has no wired channel yet (brand-new
+  // groups from create_agent), skip destination — falls back to the legacy
+  // session-routing behavior which the operator can fix by re-running
+  // enable-memory.ts after wiring channels.
+  const primaryMg = getPrimaryMessagingGroupByAgentGroup(agentGroupId);
+  const destination = primaryMg
+    ? {
+        platformId: primaryMg.platform_id,
+        channelType: primaryMg.channel_type,
+        threadId: null,
+      }
+    : undefined;
+
   try {
     await scheduleTask(
       {
@@ -159,6 +179,7 @@ export async function bootstrapMemoryForGroup(
         seriesId: result.step3_synthSeriesId,
         prompt: SYNTH_PROMPT,
         quietStatus: true,
+        ...(destination ? { destination } : {}),
         // Wiki synthesis is a high-leverage low-frequency reasoning task —
         // read N mnemon facts, dedupe, organize across multiple wiki pages,
         // update index. Run on Opus with reasoning_effort=high once a day;
