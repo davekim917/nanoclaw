@@ -33,21 +33,60 @@ function isUserMessage(message: { raw?: any }): boolean {
   return type === undefined || type === 0;
 }
 
+const MARKDOWN_LINK_PATTERN = /\[([^\]]+)\]\(([^)]+)\)/g;
+const BARE_URL_PATTERN = new RegExp(String.raw`https?:\/\/[^\s<>()\[\]]+`, 'g');
+const URL_SHAPED_TEXT_PATTERN = /https?:\/\//;
+
+function discordSafeLinkLabel(url: string): string {
+  if (!URL.canParse(url)) return 'Open link';
+
+  const parsed = new URL(url);
+  const host = parsed.hostname.replace(/^www\./, '');
+  if (host === 'docs.google.com') {
+    if (parsed.pathname.startsWith('/document/')) return 'Open Google Doc';
+    if (parsed.pathname.startsWith('/presentation/')) return 'Open Google Slides';
+    if (parsed.pathname.startsWith('/spreadsheets/')) return 'Open Google Sheet';
+    return 'Open Google file';
+  }
+  return 'Open link';
+}
+
+function safeDiscordLink(url: string): string {
+  return `[${discordSafeLinkLabel(url)}](${url})`;
+}
+
+function rewriteBareDiscordUrl(urlWithPossiblePunctuation: string): string {
+  const trailing = /[.,!?;:]+$/.exec(urlWithPossiblePunctuation)?.[0] ?? '';
+  const url = trailing ? urlWithPossiblePunctuation.slice(0, -trailing.length) : urlWithPossiblePunctuation;
+  return `${safeDiscordLink(url)}${trailing}`;
+}
+
 /**
- * Strip masked-link syntax `[text](url)` to a bare URL when the link text
- * itself contains a URL. Discord's anti-phishing filter blocks masked links
- * with URL-shaped text, leaving the user to see literal `[url](url)`. Bare
- * URLs auto-link cleanly. Masked links whose text is not a URL (e.g.
- * `[Districts Day 1](...)`) render correctly and are left alone.
+ * Rewrite URL-shaped links into labels Discord will render.
+ *
+ * The Discord Chat SDK adapter parses GFM autolinks, then renders every link
+ * node as `[label](url)`. For bare URLs, that makes `label === url`, and
+ * Discord's anti-phishing filter leaves the literal `[url](url)` text visible.
+ * Descriptive masked links render correctly and are left alone.
  *
  * Code regions are protected so URLs inside fenced/inline code stay literal.
  */
-function rewriteDiscordLinks(text: string): string {
-  return transformOutsideProtectedRegions(text, (segment) =>
-    segment.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (match, linkText: string, url: string) =>
-      /https?:\/\//.test(linkText) ? url : match,
-    ),
-  );
+export function rewriteDiscordLinks(text: string): string {
+  return transformOutsideProtectedRegions(text, (segment) => {
+    const protectedLinks: string[] = [];
+    const withoutMarkdownLinks = segment.replace(MARKDOWN_LINK_PATTERN, (match, linkText: string, url: string) => {
+      const replacement = URL_SHAPED_TEXT_PATTERN.test(linkText) ? safeDiscordLink(url) : match;
+      const token = `DISCORD_LINK_PLACEHOLDER_${protectedLinks.length}`;
+      protectedLinks.push(replacement);
+      return token;
+    });
+
+    const withoutBareUrls = withoutMarkdownLinks.replace(BARE_URL_PATTERN, rewriteBareDiscordUrl);
+    return withoutBareUrls.replace(
+      /DISCORD_LINK_PLACEHOLDER_(\d+)/g,
+      (match, index: string) => protectedLinks[Number(index)] ?? match,
+    );
+  });
 }
 
 registerChannelAdapter('discord', {
