@@ -152,4 +152,3 @@ export function upsertArchiveMessage(msg: ArchiveMessage): void {
     log.warn('Failed to upsert archive message', { id: msg.id, err });
   }
 }
-
