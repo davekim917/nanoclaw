@@ -15,10 +15,13 @@ import {
   CONTAINER_IMAGE,
   CONTAINER_IMAGE_BASE,
   CONTAINER_INSTALL_LABEL,
+  CONTAINER_MEMORY_LIMIT,
+  CONTAINER_MEMORY_RESERVATION,
+  CONTAINER_MEMORY_SWAP_LIMIT,
+  CONTAINER_PIDS_LIMIT,
   DATA_DIR,
   GROUPS_DIR,
-  IDLE_TIMEOUT,
-  MAX_MESSAGES_PER_PROMPT,
+  MAX_CONCURRENT_CONTAINERS,
   ONECLI_API_KEY,
   ONECLI_URL,
   TIMEZONE,
@@ -120,6 +123,17 @@ export function wakeContainer(session: Session): Promise<boolean> {
   if (existing) {
     log.debug('Container wake already in-flight — joining existing promise', { sessionId: session.id });
     return existing;
+  }
+  const activeCount = activeContainers.size;
+  const inFlightWakes = wakePromises.size;
+  if (MAX_CONCURRENT_CONTAINERS > 0 && activeCount + inFlightWakes >= MAX_CONCURRENT_CONTAINERS) {
+    log.warn('Container wake deferred — concurrency cap reached', {
+      sessionId: session.id,
+      activeCount,
+      inFlightWakes,
+      maxConcurrentContainers: MAX_CONCURRENT_CONTAINERS,
+    });
+    return Promise.resolve(false);
   }
   const promise = spawnContainer(session)
     .then(() => true)
@@ -1241,6 +1255,7 @@ async function buildContainerArgs(
   },
 ): Promise<string[]> {
   const args: string[] = ['run', '--rm', '--name', containerName, '--label', CONTAINER_INSTALL_LABEL];
+  args.push(...dockerResourceLimitArgs());
 
   // Environment — only vars read by code we don't own.
   // Everything NanoClaw-specific is in container.json (read by runner at startup).
@@ -1633,6 +1648,23 @@ async function buildContainerArgs(
   args.push('-c', 'exec /app/entrypoint.sh');
 
   return args;
+}
+
+export function dockerResourceLimitArgs(): string[] {
+  const args: string[] = [];
+  pushDockerLimit(args, '--memory', CONTAINER_MEMORY_LIMIT);
+  pushDockerLimit(args, '--memory-reservation', CONTAINER_MEMORY_RESERVATION);
+  pushDockerLimit(args, '--memory-swap', CONTAINER_MEMORY_SWAP_LIMIT);
+  if (CONTAINER_PIDS_LIMIT > 0) {
+    args.push('--pids-limit', String(CONTAINER_PIDS_LIMIT));
+  }
+  return args;
+}
+
+function pushDockerLimit(args: string[], flag: string, value: string): void {
+  const trimmed = value.trim();
+  if (!trimmed || trimmed === '0') return;
+  args.push(flag, trimmed);
 }
 
 /** Build a per-agent-group Docker image with custom packages. */

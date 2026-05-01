@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { resolveProviderName } from './container-runner.js';
+import { dockerResourceLimitArgs, resolveProviderName } from './container-runner.js';
 
 describe('resolveProviderName', () => {
   it('prefers session over group and container.json', () => {
@@ -28,5 +28,20 @@ describe('resolveProviderName', () => {
   it('treats empty string as unset (falls through)', () => {
     expect(resolveProviderName('', 'codex', null)).toBe('codex');
     expect(resolveProviderName(null, '', 'opencode')).toBe('opencode');
+  });
+});
+
+describe('dockerResourceLimitArgs', () => {
+  it('adds install-wide default resource ceilings', () => {
+    expect(dockerResourceLimitArgs()).toEqual([
+      '--memory',
+      '3g',
+      '--memory-reservation',
+      '2g',
+      '--memory-swap',
+      '3g',
+      '--pids-limit',
+      '512',
+    ]);
   });
 });
