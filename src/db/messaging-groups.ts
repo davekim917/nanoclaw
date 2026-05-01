@@ -260,3 +260,24 @@ export function getMessagingGroupsByAgentGroup(agentGroupId: string): MessagingG
     )
     .all(agentGroupId) as MessagingGroup[];
 }
+
+/**
+ * Pick the "primary" messaging group for an agent group — the one a background
+ * task (e.g. daily wiki synthesise) should post its findings to. Ranks by
+ * messaging_group_agents.priority DESC, with messaging_groups.created_at ASC
+ * as a stable tiebreaker (older wiring wins). Returns null when the agent
+ * group has no wired channels yet (e.g. brand-new agents from create_agent
+ * before any wiring); callers must handle that case.
+ */
+export function getPrimaryMessagingGroupByAgentGroup(agentGroupId: string): MessagingGroup | null {
+  const row = getDb()
+    .prepare(
+      `SELECT mg.* FROM messaging_groups mg
+       JOIN messaging_group_agents mga ON mga.messaging_group_id = mg.id
+       WHERE mga.agent_group_id = ?
+       ORDER BY mga.priority DESC, mg.created_at ASC
+       LIMIT 1`,
+    )
+    .get(agentGroupId);
+  return (row as MessagingGroup | undefined) ?? null;
+}
