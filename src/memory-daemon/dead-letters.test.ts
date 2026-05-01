@@ -111,9 +111,25 @@ describe('dead-letters', () => {
     const before = db.prepare(`SELECT COUNT(*) AS c FROM dead_letters WHERE item_key = 'k1'`).get() as { c: number };
     expect(before.c).toBe(1);
 
-    deleteAfterSuccess('k1');
+    deleteAfterSuccess('k1', 'ag-1');
 
     const after = db.prepare(`SELECT COUNT(*) AS c FROM dead_letters WHERE item_key = 'k1'`).get() as { c: number };
     expect(after.c).toBe(0);
+  });
+
+  it('test_deleteAfterSuccess_does_not_delete_other_group_row_with_same_item_key', () => {
+    // Two groups can collide on item_key (pair_key for chat or file path for
+    // source). A success on one group must not delete the other group's row.
+    recordOrIncrementFailure({ itemType: 'turn-pair', itemKey: 'shared-key', agentGroupId: 'ag-1', error: 'err-1' });
+    recordOrIncrementFailure({ itemType: 'turn-pair', itemKey: 'shared-key', agentGroupId: 'ag-2', error: 'err-2' });
+
+    deleteAfterSuccess('shared-key', 'ag-1');
+
+    const remaining = db
+      .prepare(`SELECT agent_group_id, last_error FROM dead_letters WHERE item_key = 'shared-key'`)
+      .all() as Array<{ agent_group_id: string; last_error: string }>;
+    expect(remaining).toHaveLength(1);
+    expect(remaining[0].agent_group_id).toBe('ag-2');
+    expect(remaining[0].last_error).toBe('err-2');
   });
 });

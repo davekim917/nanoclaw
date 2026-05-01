@@ -50,30 +50,64 @@ const BLOCK_PATTERNS: ReadonlyArray<[RegExp, string]> = [
   [/(?:-u|--user)\s+[^:\s]+:[^\s]+/g, 'curl_credentials'],
 ];
 
-// Bound the input length sent to the regex engine. The /g patterns above are
-// fast in the common case but `.{8,}` and similar can exhibit superlinear
-// backtracking on adversarial inputs. 8KB is well above any plausible fact
-// content length and bounds worst-case regex execution time.
-const MAX_REDACTOR_INPUT_LENGTH = 8192;
+// Bound the regex engine's per-call input. The /g patterns above use only
+// linear-time quantifiers (`{N,}`, `[^...]+`), so they don't backtrack
+// catastrophically on long inputs — but bigger chunks still mean more work
+// per call, so we keep a window. 32KB chunks with 16KB overlap.
+//
+// Overlap sets the upper bound on secret-pattern length we can reliably
+// catch when it straddles a chunk boundary. Several BLOCK_PATTERNS have
+// unbounded match length: `Authorization: Bearer <token>`, JWTs
+// (`eyJ[…]{10,}.[…]+.[…]+`), URL secret params, `secret_assignment`.
+// Microsoft Graph access tokens and OIDC id_tokens with rich claims
+// routinely run 2-4KB; JWEs reach 8KB. 16KB overlap covers that range with
+// margin while keeping CPU cost reasonable.
+//
+// Ultrareview merged_bug_001 caught that the prior 2KB overlap was
+// insufficient — a 4KB JWT at offset 5000 in a 14KB doc was contained in
+// neither chunk 0=[0..8192) nor chunk 1=[6144..14336).
+const REDACTOR_CHUNK_SIZE = 32_768;
+const REDACTOR_CHUNK_OVERLAP = 16_384;
+
+function* slidingChunks(content: string): Iterable<string> {
+  if (content.length <= REDACTOR_CHUNK_SIZE) {
+    yield content;
+    return;
+  }
+  const step = REDACTOR_CHUNK_SIZE - REDACTOR_CHUNK_OVERLAP;
+  for (let start = 0; start < content.length; start += step) {
+    const end = Math.min(start + REDACTOR_CHUNK_SIZE, content.length);
+    yield content.slice(start, end);
+    if (end === content.length) break;
+  }
+}
 
 export function redactSecrets(fact: FactInput): RedactionResult {
-  const content =
-    fact.content.length > MAX_REDACTOR_INPUT_LENGTH ? fact.content.slice(0, MAX_REDACTOR_INPUT_LENGTH) : fact.content;
-
-  // Pass 1: known-shape patterns (fast, deterministic)
-  for (const [pattern, reason] of BLOCK_PATTERNS) {
-    // Reset lastIndex for global regexes
-    pattern.lastIndex = 0;
-    if (pattern.test(content)) {
-      return { shouldStore: false, reason };
+  // Pass 1: known-shape patterns (fast, deterministic). Scan full content via
+  // sliding window so secrets past the chunk boundary don't pass through
+  // unredacted (regression caught by ultrareview F18 — the prior single-pass
+  // truncation silently allowed secrets in long source-ingest documents).
+  for (const chunk of slidingChunks(fact.content)) {
+    for (const [pattern, reason] of BLOCK_PATTERNS) {
+      pattern.lastIndex = 0;
+      if (pattern.test(chunk)) {
+        return { shouldStore: false, reason };
+      }
     }
   }
 
-  // Pass 2: registered .env secret values — scrubSecrets returns text with
-  // [REDACTED] markers when any registered credential is found. Block storage
-  // when the scrubber detects an actual env-registered secret.
-  if (scrubSecrets(content) !== content) {
-    return { shouldStore: false, reason: 'registered_env_secret' };
+  // Pass 2: defense-in-depth via scrubSecrets. Despite the name, this does
+  // BOTH substring matching against registered .env values (linear-time)
+  // AND a second pass of secret-shape regexes from secret-scrubber.ts:115
+  // (`scrubSecretShapes` — 9 patterns, all linear-time today). Pass 1's
+  // BLOCK_PATTERNS is currently a strict superset of those shape patterns,
+  // so a Pass 2 hit reaching here is most likely a registered-env-value
+  // catch — but if Pass 1 and Pass 2's shape lists ever diverge (e.g.
+  // someone adds a pattern to scrubSecretShapes without mirroring it into
+  // BLOCK_PATTERNS), this lane catches it. The reason label reflects that
+  // the catch could be either source.
+  if (scrubSecrets(fact.content) !== fact.content) {
+    return { shouldStore: false, reason: 'env_or_shape_match' };
   }
 
   return { shouldStore: true };

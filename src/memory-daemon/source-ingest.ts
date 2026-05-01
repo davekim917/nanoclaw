@@ -314,7 +314,7 @@ export class SourceIngester {
              (agent_group_id, content_sha256, extractor_version, prompt_version, source_path, ingested_at, facts_written)
            VALUES (?, ?, ?, ?, ?, ?, ?)`,
         ).run(agentGroupId, contentHash, EXTRACTOR_VERSION, PROMPT_VERSION, filePath, new Date().toISOString(), 0);
-        db.prepare(`DELETE FROM dead_letters WHERE item_key = ?`).run(filePath);
+        db.prepare(`DELETE FROM dead_letters WHERE item_key = ? AND agent_group_id = ?`).run(filePath, agentGroupId);
       })();
 
       const processedDir = path.join(GROUPS_DIR, folder, 'sources', 'processed', dateFolder());
@@ -411,7 +411,7 @@ export class SourceIngester {
         new Date().toISOString(),
         factsWritten,
       );
-      db.prepare(`DELETE FROM dead_letters WHERE item_key = ?`).run(filePath);
+      db.prepare(`DELETE FROM dead_letters WHERE item_key = ? AND agent_group_id = ?`).run(filePath, agentGroupId);
     })();
 
     if (health) {

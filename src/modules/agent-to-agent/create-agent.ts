@@ -72,20 +72,20 @@ export async function handleCreateAgent(content: Record<string, unknown>, sessio
   // Envelope guard — defense in depth; full per-provider validation already
   // happened in the container-side MCP handler.
   if (provider !== undefined && (typeof provider !== 'string' || provider.trim() === '')) {
-    notifyAgent(session, 'create_agent failed: provider must be a non-empty string.');
+    await notifyAgent(session, 'create_agent failed: provider must be a non-empty string.');
     return;
   }
   if (
     providerConfig !== undefined &&
     (typeof providerConfig !== 'object' || providerConfig === null || Array.isArray(providerConfig))
   ) {
-    notifyAgent(session, 'create_agent failed: provider_config must be a plain object.');
+    await notifyAgent(session, 'create_agent failed: provider_config must be a plain object.');
     return;
   }
 
   const sourceGroup = getAgentGroup(session.agent_group_id);
   if (!sourceGroup) {
-    notifyAgent(session, `create_agent failed: source agent group not found.`);
+    await notifyAgent(session, `create_agent failed: source agent group not found.`);
     log.warn('create_agent failed: missing source group', { sessionAgentGroup: session.agent_group_id, name });
     return;
   }
@@ -94,7 +94,7 @@ export async function handleCreateAgent(content: Record<string, unknown>, sessio
 
   // Collision in the creator's destination namespace
   if (getDestinationByName(sourceGroup.id, localName)) {
-    notifyAgent(session, `Cannot create agent "${name}": you already have a destination named "${localName}".`);
+    await notifyAgent(session, `Cannot create agent "${name}": you already have a destination named "${localName}".`);
     return;
   }
 
@@ -110,7 +110,7 @@ export async function handleCreateAgent(content: Record<string, unknown>, sessio
   const resolvedPath = path.resolve(groupPath);
   const resolvedGroupsDir = path.resolve(GROUPS_DIR);
   if (!resolvedPath.startsWith(resolvedGroupsDir + path.sep)) {
-    notifyAgent(session, `Cannot create agent "${name}": invalid folder path.`);
+    await notifyAgent(session, `Cannot create agent "${name}": invalid folder path.`);
     log.error('create_agent path traversal attempt', { folder, resolvedPath });
     return;
   }
@@ -148,7 +148,10 @@ export async function handleCreateAgent(content: Record<string, unknown>, sessio
   } catch (err) {
     log.error('create_agent: updateContainerConfig failed, rolling back folder', { err, folder });
     const cleaned = safeRemoveFolder(folder);
-    notifyAgent(session, `create_agent failed: could not write config for "${name}".${orphanSuffix(folder, cleaned)}`);
+    await notifyAgent(
+      session,
+      `create_agent failed: could not write config for "${name}".${orphanSuffix(folder, cleaned)}`,
+    );
     return;
   }
 
@@ -159,7 +162,10 @@ export async function handleCreateAgent(content: Record<string, unknown>, sessio
   } catch (err) {
     log.error('create_agent: createAgentGroup failed, rolling back folder', { err, folder });
     const cleaned = safeRemoveFolder(folder);
-    notifyAgent(session, `create_agent failed: database insert failed for "${name}".${orphanSuffix(folder, cleaned)}`);
+    await notifyAgent(
+      session,
+      `create_agent failed: database insert failed for "${name}".${orphanSuffix(folder, cleaned)}`,
+    );
     return;
   }
 

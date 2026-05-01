@@ -172,6 +172,43 @@ sudo journalctl -u nanoclaw-memory-daemon -n 50
 ls dist/memory-daemon/index.js  # must exist — run pnpm run build if missing
 ```
 
+**After bumping CLASSIFIER_VERSION / PROMPT_VERSION:**
+
+The chat-stream sweep advances `scan_cursor` past each successfully-classified pair's `sent_at` timestamp. On subsequent sweeps it only reads rows AFTER the cursor — so when `CLASSIFIER_VERSION` or `PROMPT_VERSION` is bumped (e.g., to roll out a smarter grounding prompt), already-classified pairs stay under the OLD version and never get re-extracted. Reset watermarks to force re-classification of historical chat pairs.
+
+**Required runbook (in order):**
+
+```bash
+# 1. Stop the daemon FIRST. An in-flight sweep can re-INSERT a watermark
+#    row at the in-flight pair's lastSentAt mid-cleanup, silently undoing
+#    the replay (ultrareview bug_012).
+sudo systemctl stop nanoclaw-memory-daemon
+
+# 2. Dry-run (default): preview which groups would be reset
+pnpm exec tsx scripts/reset-classifier-watermarks.ts
+
+# 3. Apply: actually delete watermarks for all groups (triggers re-classify)
+pnpm exec tsx scripts/reset-classifier-watermarks.ts --apply
+
+# 4. Restart the daemon so the next sweep picks up cleared watermarks
+sudo systemctl start nanoclaw-memory-daemon
+```
+
+Single-group variants:
+
+```bash
+pnpm exec tsx scripts/reset-classifier-watermarks.ts <agentGroupId>          # dry-run
+pnpm exec tsx scripts/reset-classifier-watermarks.ts <agentGroupId> --apply  # execute
+```
+
+**`--include-poisoned`** (ultrareview bug_013): without this flag, `dead_letters` rows are preserved. By design, `classifier.ts` short-circuits any pair with `poisoned_at IS NOT NULL` — so a pair that got poisoned under the OLD prompt (e.g., 3 strikes from `validateFactsAgainstSource` dropping all confabulated facts) will NOT retry under the new prompt, defeating the watermark reset for that pair. When the goal is "reclassify EVERYTHING under the new prompt", add `--include-poisoned` to also clear poisoned rows:
+
+```bash
+pnpm exec tsx scripts/reset-classifier-watermarks.ts --apply --include-poisoned
+```
+
+The script preserves `processed_pairs` (the PK includes both versions, so v1 and v2 rows coexist). The next 60s sweep after restart replays the archive end-to-end for affected groups. Expect a one-time spike in Anthropic/Codex API calls proportional to historical chat volume — plan cost before running on busy groups. Old-version facts in `~/.mnemon/data/<agentGroupId>/` are NOT deleted; if the old prompt produced confabulations (e.g. "WG → William Grant" before the grounding-discipline bump), use `mnemon forget <fact-id>` to remove specific facts after the new sweep adds correct versions.
+
 ---
 
 ## Rollback
@@ -209,6 +246,7 @@ Relevant paths:
 - `scripts/enable-memory.ts` — enable per group
 - `scripts/disable-memory.ts` — disable per group
 - `scripts/verify-memory-prereqs.sh` — check prereqs before enabling
+- `scripts/reset-classifier-watermarks.ts` — re-classify historical pairs after a CLASSIFIER_VERSION/PROMPT_VERSION bump
 - `data/memory-health.json` — per-group health snapshot
 - `data/mnemon-ingest.db` — watermarks + dead_letters
 - `logs/memory-daemon.log` — daemon stdout

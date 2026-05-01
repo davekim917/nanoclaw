@@ -116,9 +116,9 @@ export function getDueRetries(agentGroupId: string, now: Date): DeadLetterRow[] 
   return rows.map(toRow);
 }
 
-export function deleteAfterSuccess(itemKey: string): void {
+export function deleteAfterSuccess(itemKey: string, agentGroupId: string): void {
   const db = getDb();
-  db.prepare(`DELETE FROM dead_letters WHERE item_key = ?`).run(itemKey);
+  db.prepare(`DELETE FROM dead_letters WHERE item_key = ? AND agent_group_id = ?`).run(itemKey, agentGroupId);
 }
 
 export function getPoisonedSummary(agentGroupId: string): {
