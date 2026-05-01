@@ -8,7 +8,7 @@ import type { MemoryStore, RememberResult } from '../modules/memory/store.js';
 import type { HealthRecorder } from './health.js';
 import { setDeadLettersDb } from './dead-letters.js';
 
-vi.mock('./anthropic-client.js', () => ({
+vi.mock('./classifier-client.js', () => ({
   callClassifier: vi.fn(),
   CLASSIFIER_VERSION: 'v1',
   PROMPT_VERSION: 'v1',
@@ -68,7 +68,7 @@ function stubProcessInboxFileValidation(filePath: string, folder: string, fileCo
   return stubbedRealPath;
 }
 
-import { callClassifier } from './anthropic-client.js';
+import { callClassifier } from './classifier-client.js';
 
 function makeIngestDb(): Database.Database {
   const db = new Database(':memory:');

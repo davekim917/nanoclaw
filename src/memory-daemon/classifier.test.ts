@@ -5,13 +5,13 @@ import type { MemoryStore, FactInput, RememberResult } from '../modules/memory/s
 import type { HealthRecorder } from './health.js';
 import { setDeadLettersDb } from './dead-letters.js';
 
-vi.mock('./anthropic-client.js', () => ({
+vi.mock('./classifier-client.js', () => ({
   callClassifier: vi.fn(),
   CLASSIFIER_VERSION: 'v1',
   PROMPT_VERSION: 'v1',
 }));
 
-import { callClassifier } from './anthropic-client.js';
+import { callClassifier } from './classifier-client.js';
 
 function makeArchiveDb(): Database.Database {
   const db = new Database(':memory:');

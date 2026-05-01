@@ -6,7 +6,8 @@ import { openMnemonIngestDb } from '../db/migrations/019-mnemon-ingest-db.js';
 import { GROUPS_DIR } from '../config.js';
 import type { MemoryStore, FactInput } from '../modules/memory/store.js';
 import { redactSecrets } from '../modules/memory/secret-redactor.js';
-import { callClassifier, EXTRACTOR_VERSION, PROMPT_VERSION } from './anthropic-client.js';
+import { callClassifier, EXTRACTOR_VERSION, PROMPT_VERSION } from './classifier-client.js';
+import { validateFactsAgainstSource } from './classifier-validator.js';
 import { recordOrIncrementFailure } from './dead-letters.js';
 import type { HealthRecorder } from './health.js';
 
@@ -286,6 +287,24 @@ export class SourceIngester {
         error: String(err),
       });
       return { factsWritten: 0, failed: true };
+    }
+
+    // Confabulation defense: drop facts whose content contains a parenthetical
+    // alias that the extractor invented (not present in the source document).
+    // Same rule as the chat-pair classifier — see classifier-validator.ts.
+    {
+      const validation = validateFactsAgainstSource(output, canonical);
+      if (validation.rejected.length > 0) {
+        for (const r of validation.rejected) {
+          console.warn('[source-ingest] dropped confabulated fact', {
+            agentGroupId,
+            filePath,
+            reason: r.reason,
+            content: r.fact.content.slice(0, 200),
+          });
+        }
+        output = { ...output, facts: validation.accepted };
+      }
     }
 
     if (!output.worth_storing || output.facts.length === 0) {

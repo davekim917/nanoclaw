@@ -5,7 +5,8 @@ import { DATA_DIR } from '../config.js';
 import { openMnemonIngestDb } from '../db/migrations/019-mnemon-ingest-db.js';
 import type { MemoryStore, FactInput } from '../modules/memory/store.js';
 import { redactSecrets } from '../modules/memory/secret-redactor.js';
-import { callClassifier, CLASSIFIER_VERSION, PROMPT_VERSION } from './anthropic-client.js';
+import { callClassifier, CLASSIFIER_VERSION, PROMPT_VERSION } from './classifier-client.js';
+import { validateFactsAgainstSource } from './classifier-validator.js';
 import { recordOrIncrementFailure, getDueRetries } from './dead-letters.js';
 import type { HealthRecorder } from './health.js';
 
@@ -257,9 +258,29 @@ async function classifyPair(
     upsertWatermarks(db, agentGroupId, lastSentAt, lastSentAt);
     return { factsWritten: 0, poisoned: false, failed: false };
   }
+  // Confabulation defense: drop facts whose content contains a parenthetical
+  // alias that the classifier invented (not present in the source chat-pair).
+  // This is the surgical fix for the WG → "(Whisky Gauge)" / SF → "(Salesforce)"
+  // pattern. Provider-agnostic — runs against whichever backend produced the
+  // output. See classifier-validator.ts for the full rationale.
+  const validation = validateFactsAgainstSource(output, pairText);
+  if (validation.rejected.length > 0) {
+    for (const r of validation.rejected) {
+      console.warn('[classifier] dropped confabulated fact', {
+        agentGroupId,
+        pairKey: pair.pairKey,
+        reason: r.reason,
+        content: r.fact.content.slice(0, 200),
+      });
+    }
+    output = { ...output, facts: validation.accepted };
+  }
+
   // Model contradiction: worth_storing=true but no facts. Don't mark as
   // success-classified; route to dead_letters for one retry, then poison.
-  // A clean skip would silently swallow a possible model glitch.
+  // A clean skip would silently swallow a possible model glitch. Note: this
+  // also fires when ALL facts were dropped by confabulation defense above —
+  // a fully-poisoned extraction is treated the same as a model glitch.
   if (output.facts.length === 0) {
     console.warn('[classifier] model returned worth_storing=true with empty facts array', {
       agentGroupId,
