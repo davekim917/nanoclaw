@@ -8,6 +8,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { DATA_DIR } from './config.js';
+import { enforceStartupBackoff, resetCircuitBreaker } from './circuit-breaker.js';
 import { migrateGroupsToClaudeLocal } from './claude-md-compose.js';
 import { initDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
@@ -109,13 +110,16 @@ import { initChannelAdapters, teardownChannelAdapters, getChannelAdapter } from 
 async function main(): Promise<void> {
   log.info('NanoClaw starting');
 
-  // 0. Load .env into process.env (for secrets not injected by the shell,
-  //    like ANTHROPIC_BASE_URL and ANTHROPIC_API_KEY which determine whether
-  //    we use direct proxy or OneCLI gateway). Does NOT override vars already
-  //    in the process environment — shell-set values take precedence.
+  // 0. Circuit breaker — backoff on rapid restarts
+  await enforceStartupBackoff();
+
+  // 0a. Load .env into process.env (for secrets not injected by the shell,
+  //     like ANTHROPIC_BASE_URL and ANTHROPIC_API_KEY which determine whether
+  //     we use direct proxy or OneCLI gateway). Does NOT override vars already
+  //     in the process environment — shell-set values take precedence.
   loadEnvIntoProcess();
 
-  // 1. Register secret values from .env for outbound scrubbing.
+  // 0b. Register secret values from .env for outbound scrubbing.
   registerSecretsFromEnv();
 
   // 1. Init central DB
@@ -298,16 +302,23 @@ async function shutdown(signal: string): Promise<void> {
   stopPluginUpdater();
   stopCommitScan();
   await stopDiscordSlashCommands();
-  await teardownChannelAdapters();
-  // Synchronously stop agent containers before exit. Without this, child
-  // subprocesses linger in the cgroup and systemd TimeoutStopSec stalls
-  // every restart. Matches v1's GroupQueue.shutdown semantics.
   try {
-    await stopAllContainers();
-  } catch (err) {
-    log.error('stopAllContainers threw', { err });
+    await teardownChannelAdapters();
+    // Synchronously stop agent containers before exit. Without this, child
+    // subprocesses linger in the cgroup and systemd TimeoutStopSec stalls
+    // every restart. Matches v1's GroupQueue.shutdown semantics.
+    try {
+      await stopAllContainers();
+    } catch (err) {
+      log.error('stopAllContainers threw', { err });
+    }
+  } finally {
+    // Always reset on graceful shutdown — even if teardown threw, we got here
+    // via SIGTERM/SIGINT, not a crash, so the next start shouldn't be counted
+    // as one.
+    resetCircuitBreaker();
+    process.exit(0);
   }
-  process.exit(0);
 }
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));

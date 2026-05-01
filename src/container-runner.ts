@@ -89,7 +89,7 @@ export function getContainerSpawnedAt(sessionId: string): number {
  * a duplicate container against the same session directory, producing
  * racy double-replies.
  */
-const wakePromises = new Map<string, Promise<void>>();
+const wakePromises = new Map<string, Promise<boolean>>();
 
 export function getActiveContainerCount(): number {
   return activeContainers.size;
@@ -104,20 +104,32 @@ export function isContainerRunning(sessionId: string): boolean {
  * (the in-flight wake promise is reused).
  *
  * The container runs the v2 agent-runner which polls the session DB.
+ *
+ * Contract: never throws. Returns `true` on successful spawn, `false` on
+ * transient spawn failure (e.g. OneCLI gateway unreachable). Callers don't
+ * need to wrap — the inbound row stays pending and host-sweep retries on
+ * its next tick. Callers that care (e.g. the router's typing indicator)
+ * can branch on the boolean.
  */
-export function wakeContainer(session: Session): Promise<void> {
+export function wakeContainer(session: Session): Promise<boolean> {
   if (activeContainers.has(session.id)) {
     log.debug('Container already running', { sessionId: session.id });
-    return Promise.resolve();
+    return Promise.resolve(true);
   }
   const existing = wakePromises.get(session.id);
   if (existing) {
     log.debug('Container wake already in-flight — joining existing promise', { sessionId: session.id });
     return existing;
   }
-  const promise = spawnContainer(session).finally(() => {
-    wakePromises.delete(session.id);
-  });
+  const promise = spawnContainer(session)
+    .then(() => true)
+    .catch((err) => {
+      log.warn('wakeContainer failed — host-sweep will retry', { sessionId: session.id, err });
+      return false;
+    })
+    .finally(() => {
+      wakePromises.delete(session.id);
+    });
   wakePromises.set(session.id, promise);
   return promise;
 }

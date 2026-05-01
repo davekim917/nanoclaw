@@ -416,59 +416,97 @@ async function processQuery(
   // Stream liveness is decided host-side via the heartbeat file + processing
   // claim age (see src/host-sweep.ts); if something is truly stuck, the host
   // will kill the container and messages get reset to pending.
+  let pollInFlight = false;
   const pollHandle = setInterval(() => {
-    if (done) return;
+    if (done || pollInFlight) return;
+    pollInFlight = true;
 
-    // Filtering on thread_id here caused deadlocks when the initial batch
-    // and follow-ups had mismatched thread_ids (e.g. a host-generated welcome
-    // trigger with null thread vs a Discord DM reply); per-thread sessions
-    // already isolate threads, so the router's routing is sufficient.
-    //
-    // The trigger gate mirrors the cold-start gate at the top of runPollLoop:
-    // trigger=0 rows ride the next wake's batch (where the formatter renders
-    // them inside <thread_context>). Letting them through here would feed
-    // Claude a non-mention as a follow-up user message mid-turn.
-    const allPending = getPendingMessages();
-    // The host writes recall_context first, then the paired inbound message,
-    // both within a single async writeSessionMessage call but with a microtask
-    // boundary in between. A mid-turn poll firing in that window would observe
-    // the recall_context alone, push it as a follow-up to the WRONG turn, and
-    // leave the inbound message to arrive next poll without its recall context.
-    // To preserve ordering, only admit a recall_context if its paired trigger
-    // message (id == recall_context.id minus 'recall-' prefix) is in the same
-    // batch — otherwise hold it for the next poll where the inbound has landed.
-    const triggerIdsInBatch = new Set(
-      allPending.filter((m) => m.trigger === 1).map((m) => m.id),
-    );
-    const newMessages = allPending.filter((m) => {
-      if (m.kind === 'system') {
-        // Exception: recall_context system messages should ride along as
-        // additional context for the in-flight turn — but only when the
-        // paired trigger message is in this same poll batch.
-        try {
-          const parsed = JSON.parse(m.content) as { subtype?: string };
-          if (parsed.subtype !== 'recall_context') return false;
-        } catch {
-          return false;
+    void (async () => {
+      try {
+        // Filtering on thread_id here caused deadlocks when the initial batch
+        // and follow-ups had mismatched thread_ids (e.g. a host-generated welcome
+        // trigger with null thread vs a Discord DM reply); per-thread sessions
+        // already isolate threads, so the router's routing is sufficient.
+        //
+        // The trigger gate mirrors the cold-start gate at the top of runPollLoop:
+        // trigger=0 rows ride the next wake's batch (where the formatter renders
+        // them inside <thread_context>). Letting them through here would feed
+        // Claude a non-mention as a follow-up user message mid-turn.
+        const allPending = getPendingMessages();
+        // The host writes recall_context first, then the paired inbound message,
+        // both within a single async writeSessionMessage call but with a microtask
+        // boundary in between. A mid-turn poll firing in that window would observe
+        // the recall_context alone, push it as a follow-up to the WRONG turn, and
+        // leave the inbound message to arrive next poll without its recall context.
+        // To preserve ordering, only admit a recall_context if its paired trigger
+        // message (id == recall_context.id minus 'recall-' prefix) is in the same
+        // batch — otherwise hold it for the next poll where the inbound has landed.
+        const triggerIdsInBatch = new Set(
+          allPending.filter((m) => m.trigger === 1).map((m) => m.id),
+        );
+        const newMessages = allPending.filter((m) => {
+          if (m.kind === 'system') {
+            // Exception: recall_context system messages should ride along as
+            // additional context for the in-flight turn — but only when the
+            // paired trigger message is in this same poll batch.
+            try {
+              const parsed = JSON.parse(m.content) as { subtype?: string };
+              if (parsed.subtype !== 'recall_context') return false;
+            } catch {
+              return false;
+            }
+            const pairedTriggerId = m.id.startsWith('recall-') ? m.id.slice('recall-'.length) : null;
+            if (!pairedTriggerId || !triggerIdsInBatch.has(pairedTriggerId)) return false;
+            return true;
+          }
+          if ((m.kind === 'chat' || m.kind === 'chat-sdk') && isClearCommand(m)) return false;
+          if (m.trigger !== 1) return false;
+          return true;
+        });
+        if (newMessages.length === 0) return;
+
+        const newIds = newMessages.map((m) => m.id);
+        markProcessing(newIds);
+
+        // Run pre-task scripts on follow-ups too — without this, a task that
+        // arrives during an active query (e.g. a */10 monitoring cron) bypasses
+        // its script gate and always wakes the agent, defeating the gate.
+        // Mirrors the initial-batch hook above.
+        let keep = newMessages;
+        let skipped: string[] = [];
+        // MODULE-HOOK:scheduling-pre-task-followup:start
+        const { applyPreTaskScripts } = await import('./scheduling/task-script.js');
+        const preTask = await applyPreTaskScripts(newMessages);
+        keep = preTask.keep;
+        skipped = preTask.skipped;
+        if (skipped.length > 0) {
+          markCompleted(skipped);
+          log(`Pre-task script skipped ${skipped.length} follow-up task(s): ${skipped.join(', ')}`);
         }
-        const pairedTriggerId = m.id.startsWith('recall-') ? m.id.slice('recall-'.length) : null;
-        if (!pairedTriggerId || !triggerIdsInBatch.has(pairedTriggerId)) return false;
-        return true;
+        // MODULE-HOOK:scheduling-pre-task-followup:end
+
+        if (keep.length === 0) return;
+        // Re-check done — the outer query may have finished while the script
+        // was awaited. Pushing into a closed stream is wasted work; the
+        // claimed messages get released by the host's processing-claim sweep.
+        if (done) return;
+
+        const keptIds = keep.map((m) => m.id);
+        const prompt = formatMessages(keep);
+        log(`Pushing ${keep.length} follow-up message(s) into active query`);
+        query.push(prompt);
+        markCompleted(keptIds);
+      } catch (err) {
+        // Without this catch the rejection escapes the void IIFE and Node
+        // terminates the container on unhandled-rejection. The initial-batch
+        // path is wrapped by processQuery's outer try/catch; the follow-up
+        // path is not, so it needs its own.
+        const errMsg = err instanceof Error ? err.message : String(err);
+        log(`Follow-up poll error: ${errMsg}`);
+      } finally {
+        pollInFlight = false;
       }
-      if ((m.kind === 'chat' || m.kind === 'chat-sdk') && isClearCommand(m)) return false;
-      if (m.trigger !== 1) return false;
-      return true;
-    });
-    if (newMessages.length > 0) {
-      const newIds = newMessages.map((m) => m.id);
-      markProcessing(newIds);
-
-      const prompt = formatMessages(newMessages);
-      log(`Pushing ${newMessages.length} follow-up message(s) into active query`);
-      query.push(prompt);
-
-      markCompleted(newIds);
-    }
+    })();
   }, ACTIVE_POLL_INTERVAL_MS);
 
   try {
