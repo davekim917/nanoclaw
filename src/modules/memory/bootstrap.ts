@@ -40,7 +40,7 @@ import { spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
-import { DATA_DIR, GROUPS_DIR } from '../../config.js';
+import { DATA_DIR, GROUPS_DIR, TIMEZONE } from '../../config.js';
 import { getPrimaryMessagingGroupByAgentGroup } from '../../db/messaging-groups.js';
 import { scheduleTask } from '../../db/scheduled-tasks.js';
 
@@ -60,6 +60,12 @@ export const MEMORY_SOURCE_SUBDIRS = [
 export const SYNTH_CRON_DEFAULT = '0 3 * * *';
 export const SYNTH_SERIES_PREFIX = 'memory-synth-';
 
+// Default cron: Sundays 10:00 local. Bulk-enable passes a per-group staggered
+// minute offset so 11+ groups don't all hit Opus simultaneously at 10:00 every
+// Sunday — same F6 reasoning as synth, except weekly instead of daily.
+export const LINT_CRON_DEFAULT = '0 10 * * 0';
+export const LINT_SERIES_PREFIX = 'memory-lint-';
+
 const SYNTH_PROMPT = `Run wiki synthesise per /app/container/skills/wiki/SKILL.md.
 
 READ FACTS IN FULL — DO NOT SKIM. Before writing or updating any wiki page, run \`mnemon recall <query>\` for the entity/concept/timeline at hand and read every returned fact end-to-end. Claude 4 models have a known tendency to partial-read or truncate long inputs and then apologize after the fact when the user notices missing context. For wiki synthesis that pattern produces silently-wrong pages: the fact you skipped is often the one correcting an earlier error or providing disambiguating detail. There is no time pressure on this task — favor completeness over speed.
@@ -68,6 +74,18 @@ If two facts contradict, surface both rather than silently picking one. If a fac
 
 REPORT DISCIPLINE: at the end of the task, if you made ZERO new pages and ZERO updates to existing pages, do not send any chat reply — complete the turn silently. Otherwise, send ONE concise line summarising what changed (e.g. "Updated 2 entity pages, created 1 timeline page."). Do not narrate the work, do not list every page touched, and do not send a status update if nothing meaningful happened.`;
 
+const LINT_PROMPT = `Run wiki lint per the lint section of /app/container/skills/wiki/SKILL.md.
+
+Walk wiki/ and check for:
+- Contradictions (page A says X, page B says ¬X)
+- Stale claims (superseded by newer sources/decisions in log.md)
+- Orphan pages (no inbound links from index.md or other pages)
+- Missing cross-references (page mentions an entity that has its own page but doesn't link to it)
+- Concept gaps (repeated topic across multiple pages with no dedicated concept page)
+- Index drift (pages on disk not in index.md, or index entries pointing at deleted files)
+
+REPORT DISCIPLINE: report findings to the parent channel FIRST and wait for the user's go-ahead before fixing anything. Do not fix silently. If zero findings, complete the turn silently — no chat reply. If findings exist, post ONE structured summary listing the categories with counts and a brief example of each, then wait. Once the user approves, fix the findings and append a single audit entry to wiki/log.md.`;
+
 export interface BootstrapResult {
   step1_sourcesDirsCreated: boolean;
   step2_mnemonStoreStatus: 'created' | 'exists' | 'failed' | 'binary-missing';
@@ -75,6 +93,9 @@ export interface BootstrapResult {
   step3_synthTaskScheduled: boolean;
   step3_synthSeriesId: string;
   step3_synthCron: string;
+  step4_lintTaskScheduled: boolean;
+  step4_lintSeriesId: string;
+  step4_lintCron: string;
 }
 
 export interface BootstrapOptions {
@@ -87,9 +108,16 @@ export interface BootstrapOptions {
    */
   synthCron?: string;
   /**
-   * If true, synth task scheduling failures throw rather than warning. Default
-   * false — single-group enable wants to keep going even if scheduling failed
-   * (operator can re-run); bulk-enable wants the same.
+   * Cron expression for the weekly wiki-lint task. Defaults to
+   * LINT_CRON_DEFAULT ("0 10 * * 0" — Sundays 10:00 local). Bulk-enable
+   * passes a per-group staggered minute offset across the 10:00 hour for the
+   * same F6 reasoning that applies to synth.
+   */
+  lintCron?: string;
+  /**
+   * If true, synth/lint task scheduling failures throw rather than warning.
+   * Default false — single-group enable wants to keep going even if
+   * scheduling failed (operator can re-run); bulk-enable wants the same.
    */
   strict?: boolean;
 }
@@ -108,12 +136,16 @@ export async function bootstrapMemoryForGroup(
   opts: BootstrapOptions = {},
 ): Promise<BootstrapResult> {
   const synthCron = opts.synthCron ?? SYNTH_CRON_DEFAULT;
+  const lintCron = opts.lintCron ?? LINT_CRON_DEFAULT;
   const result: BootstrapResult = {
     step1_sourcesDirsCreated: false,
     step2_mnemonStoreStatus: 'failed',
     step3_synthTaskScheduled: false,
     step3_synthSeriesId: `${SYNTH_SERIES_PREFIX}${agentGroupId}`,
     step3_synthCron: synthCron,
+    step4_lintTaskScheduled: false,
+    step4_lintSeriesId: `${LINT_SERIES_PREFIX}${agentGroupId}`,
+    step4_lintCron: lintCron,
   };
 
   // Step 1: sources subdirs
@@ -193,6 +225,48 @@ export async function bootstrapMemoryForGroup(
       DATA_DIR,
     );
     result.step3_synthTaskScheduled = true;
+  } catch (err) {
+    if (opts.strict) throw err;
+    // else: caller decides whether to log
+  }
+
+  // Step 4: weekly wiki-lint task (idempotent via seriesId UPDATE). Cron is
+  // weekly so processAfter must be the NEXT cron fire (not "now") — otherwise
+  // a re-bootstrap fires lint immediately, ahead of the user's expected
+  // "Sundays at 10am" cadence. Same destination as synth (parent channel,
+  // threadId=null), same Opus+high config, same quietStatus:true.
+  let lintProcessAfter: string;
+  try {
+    const { CronExpressionParser } = await import('cron-parser');
+    // .toISOString() is typed `string | null` (CronDate accepts invalid
+    // dates); coalesce to "now" for the same fallback as the catch branch.
+    lintProcessAfter =
+      CronExpressionParser.parse(lintCron, { tz: TIMEZONE }).next().toISOString() ?? new Date().toISOString();
+  } catch {
+    // Fallback: schedule for "now" if cron parsing fails — daemon will fire
+    // immediately, recurrence handler then computes a proper next fire.
+    lintProcessAfter = new Date().toISOString();
+  }
+  const lintTaskId = `task-${result.step4_lintSeriesId}-${Date.now()}`;
+  try {
+    await scheduleTask(
+      {
+        id: lintTaskId,
+        agentGroupId,
+        cron: lintCron,
+        processAfter: lintProcessAfter,
+        seriesId: result.step4_lintSeriesId,
+        prompt: LINT_PROMPT,
+        quietStatus: true,
+        ...(destination ? { destination } : {}),
+        flagIntent: {
+          turnModel: 'claude-opus-4-7',
+          turnEffort: 'high',
+        },
+      },
+      DATA_DIR,
+    );
+    result.step4_lintTaskScheduled = true;
   } catch (err) {
     if (opts.strict) throw err;
     // else: caller decides whether to log
