@@ -170,6 +170,9 @@ async function main(): Promise<void> {
 
   let inFlight = false;
   let shutdownRequested = false;
+  // Wake-up handle so SIGTERM can exit the inter-sweep wait without burning
+  // up to SWEEP_INTERVAL_MS of TimeoutStopSec budget.
+  let wakeWait: (() => void) | null = null;
 
   async function sweepLoop(): Promise<void> {
     while (!shutdownRequested) {
@@ -185,10 +188,22 @@ async function main(): Promise<void> {
       if (shutdownRequested) break;
 
       await new Promise<void>((resolve) => {
-        const timer = setTimeout(resolve, SWEEP_INTERVAL_MS);
-        timer.unref();
-
-        process.once('_memory_daemon_sweep_now', resolve);
+        // The timer is intentionally NOT unref'd — it's the daemon's primary
+        // event-loop anchor between sweeps. With it unref'd, Node would see
+        // no active handles and exit cleanly the moment a sweep returns.
+        // This was a long-standing bug: the daemon was exiting after every
+        // sweep cycle, surviving only as long as a sweep took to complete.
+        // shutdown() wakes this wait early via wakeWait() so SIGTERM still
+        // exits within a few hundred ms.
+        const timer = setTimeout(() => {
+          wakeWait = null;
+          resolve();
+        }, SWEEP_INTERVAL_MS);
+        wakeWait = () => {
+          clearTimeout(timer);
+          wakeWait = null;
+          resolve();
+        };
       });
     }
   }
@@ -196,6 +211,8 @@ async function main(): Promise<void> {
   async function shutdown(): Promise<void> {
     console.log('[memory-daemon] SIGTERM received — waiting for in-flight sweep to complete');
     shutdownRequested = true;
+    // Wake the inter-sweep wait so we don't burn up to 60s on TimeoutStopSec.
+    if (wakeWait) wakeWait();
 
     while (inFlight) {
       await new Promise((resolve) => setTimeout(resolve, 100));
