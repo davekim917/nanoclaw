@@ -873,6 +873,17 @@ export class ClaudeProvider implements AgentProvider {
    * Position persists for the container lifetime — once slot N fires a
    * retryable error, slot N+1 stays active for all subsequent queries.
    * Restarting the container is the only reset.
+   *
+   * Process-wide propagation: rotations are mirrored to `process.env` so
+   * other in-process consumers that issue direct Anthropic calls — the
+   * thread-search Haiku rerank, future MCP tools, anything reading
+   * process.env — pick up the active credential without their own
+   * rotation logic. Safe because (a) container code reads env fresh at
+   * call time (no module-load captures), (b) the bash sanitize hook
+   * filters by key name not value so its scrub list is unchanged, and
+   * (c) host-side container-runner.ts adds api.anthropic.com to NO_PROXY
+   * and re-injects the real token values, so direct callers bypass the
+   * OneCLI proxy and use process.env directly.
    */
   rotateApiKey(): { rotated: boolean } {
     const usingOauth = !this.env.ANTHROPIC_API_KEY && Boolean(this.env.CLAUDE_CODE_OAUTH_TOKEN);
@@ -883,6 +894,7 @@ export class ClaudeProvider implements AgentProvider {
         return this.rotateApiKey();
       }
       this.env.CLAUDE_CODE_OAUTH_TOKEN = next.value;
+      process.env.CLAUDE_CODE_OAUTH_TOKEN = next.value;
       log(`Rotated CLAUDE_CODE_OAUTH_TOKEN → ${next.name} (${this.nextOauthFallback}/${this.fallbackOauth.length})`);
       return { rotated: true };
     }
@@ -894,6 +906,7 @@ export class ClaudeProvider implements AgentProvider {
       return this.rotateApiKey();
     }
     this.env.ANTHROPIC_API_KEY = next.value;
+    process.env.ANTHROPIC_API_KEY = next.value;
     log(`Rotated ANTHROPIC_API_KEY → ${next.name} (${this.nextFallback}/${this.fallbackKeys.length})`);
     return { rotated: true };
   }
