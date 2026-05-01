@@ -190,8 +190,7 @@ describe('codex backend', () => {
     // again) gets a fresh EventEmitter that fires 'close' once. mockReturnValue
     // would give the same child to both calls and the second hangs.
     mockSpawn.mockImplementation(
-      () =>
-        makeChildMock({ exitCode: 1, stderr: 'codex auth required' }) as unknown as ReturnType<typeof spawn>,
+      () => makeChildMock({ exitCode: 1, stderr: 'codex auth required' }) as unknown as ReturnType<typeof spawn>,
     );
 
     const backend = makeCodexBackend({ model: 'gpt-5.5', effort: 'medium' });

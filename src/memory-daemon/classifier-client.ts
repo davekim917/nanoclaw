@@ -83,9 +83,7 @@ export function parseBackendConfig(envVal: string | undefined): BackendConfig {
   if (!envVal || !envVal.trim()) return DEFAULT_BACKEND;
   const parts = envVal.split(':');
   if (parts.length !== 3) {
-    throw new Error(
-      `MEMORY_CLASSIFIER_BACKEND format must be "<provider>:<model>:<effort>" — got "${envVal}"`,
-    );
+    throw new Error(`MEMORY_CLASSIFIER_BACKEND format must be "<provider>:<model>:<effort>" — got "${envVal}"`);
   }
   const [provider, model, effort] = parts.map((s) => s.trim());
   if (!VALID_PROVIDERS.has(provider as Provider)) {
@@ -95,9 +93,7 @@ export function parseBackendConfig(envVal: string | undefined): BackendConfig {
     throw new Error(`MEMORY_CLASSIFIER_BACKEND: model alias must be non-empty`);
   }
   if (!VALID_EFFORTS.has(effort as Effort)) {
-    throw new Error(
-      `MEMORY_CLASSIFIER_BACKEND: unknown effort "${effort}" (valid: default, low, medium, high)`,
-    );
+    throw new Error(`MEMORY_CLASSIFIER_BACKEND: unknown effort "${effort}" (valid: default, low, medium, high)`);
   }
   return { provider: provider as Provider, model, effort: effort as Effort };
 }

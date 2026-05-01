@@ -1,0 +1,53 @@
+# Drop-in EXAMPLE for
+# /etc/systemd/system/nanoclaw-memory-daemon.service.d/backend.conf
+#
+# Configures which LLM backend the memory daemon uses for chat-pair
+# classification + source-document extraction. Default (no drop-in) is
+# Anthropic Haiku 4.5. This file is operator-customized — copy and edit.
+#
+# Format: <provider>:<model>:<effort>
+#   provider: "anthropic" | "codex"
+#   model:    short alias — anthropic recognizes haiku-4-5, sonnet-4-6,
+#             opus-4-7; codex recognizes gpt-5.5, gpt-5-codex, gpt-5,
+#             gpt-5-mini (whatever your codex CLI accepts via --model)
+#   effort:   "default" | "low" | "medium" | "high"
+#             Anthropic backend maps medium/high to extended-thinking
+#             budget_tokens (5K/16K). Codex backend maps to
+#             --config model_reasoning_effort=<level>.
+#
+# Trade-offs at a glance:
+#   anthropic:haiku-4-5:default  — fastest, cheapest, weakest. Default.
+#   anthropic:sonnet-4-6:high    — better reasoning, paid per-token, with
+#                                  extended thinking + ephemeral cache_control.
+#   codex:gpt-5.5:medium         — different provider (uncorrelated failure
+#                                  vs. claude synth), free against codex
+#                                  subscription, no prompt caching.
+#
+# CODEX_BIN: only required if codex isn't on the daemon's narrow PATH.
+# The systemd unit's PATH is /home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
+# — codex installed via npm typically lives outside that. Set the absolute
+# path to skip PATH munging.
+#
+# Install:
+#   sudo mkdir -p /etc/systemd/system/nanoclaw-memory-daemon.service.d
+#   sudo cp data/systemd/templates/memory-daemon-backend.conf.example \
+#     /etc/systemd/system/nanoclaw-memory-daemon.service.d/backend.conf
+#   # Edit /etc/.../backend.conf to your chosen backend
+#   sudo systemctl daemon-reload
+#   sudo systemctl restart nanoclaw-memory-daemon
+#
+# Verify the env var loaded (look for MEMORY_CLASSIFIER_BACKEND in output):
+#   systemctl show nanoclaw-memory-daemon -p Environment --no-pager
+#
+# Watch classifier activity:
+#   tail -f logs/memory-daemon.error.log
+#   # Look for "[classifier] dropped confabulated fact" lines (validator)
+#   # or "codex exec exited with code N" (codex backend health)
+#
+# To revert to default Anthropic Haiku:
+#   sudo rm /etc/systemd/system/nanoclaw-memory-daemon.service.d/backend.conf
+#   sudo systemctl daemon-reload && sudo systemctl restart nanoclaw-memory-daemon
+
+[Service]
+Environment="MEMORY_CLASSIFIER_BACKEND=codex:gpt-5.5:medium"
+Environment="CODEX_BIN=/home/ubuntu/.npm-global/bin/codex"

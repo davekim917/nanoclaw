@@ -1,0 +1,91 @@
+[Unit]
+Description=NanoClaw Memory Daemon (chat-stream classifier + source ingestion)
+After=nanoclaw-v2.service ollama.service
+# Hard-require the host service. Ollama is only needed for mnemon recall
+# (embeddings); the classifier path uses the Anthropic API and works even if
+# Ollama is down. Use Wants= so an Ollama outage degrades recall but doesn't
+# block classifier writes.
+Requires=nanoclaw-v2.service
+Wants=ollama.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/nanoclaw-v2
+# Wrapped in `onecli run` so the daemon's classifier calls go through the
+# OneCLI gateway. The wrapper injects HTTPS_PROXY + NODE_USE_ENV_PROXY +
+# CA cert env vars; the gateway MITMs api.anthropic.com and injects the API
+# key from the operator's default OneCLI agent vault. This matches the
+# host-process security model in CLAUDE.md (no plaintext API keys in
+# Environment= or .env).
+#
+# Operator prerequisite: the default OneCLI agent must have an Anthropic
+# secret assigned with a host pattern matching api.anthropic.com. Verify
+# with `onecli agents secrets --id <default-agent-id>`. If absent, run
+# `onecli secrets create --type anthropic` and assign with
+# `onecli agents set-secrets --id <agent-id> --secret-ids <secret-id>`,
+# OR flip the agent to `--mode all` for any matching host pattern.
+#
+# To bypass OneCLI for a specific endpoint (non-default deployments such as
+# openlimits or a direct Anthropic key path), set ANTHROPIC_BASE_URL AND
+# NO_PROXY=<that-host> via Environment=. The client uses undici's
+# EnvHttpProxyAgent which honors NO_PROXY — without it, every request still
+# routes through the OneCLI gateway because `onecli run` injects HTTPS_PROXY
+# unconditionally. To bypass OneCLI entirely, override ExecStart to drop
+# `onecli run --` and provide ANTHROPIC_API_KEY via Environment= or
+# EnvironmentFile=.
+ExecStart=/home/ubuntu/.local/bin/onecli run -- /usr/bin/env node dist/memory-daemon/index.js
+Restart=on-failure
+RestartSec=10s
+# Bound graceful shutdown: SIGTERM polls in-flight sweep completion then drains
+# watchers + flushes health. A stuck Anthropic call could otherwise hold the
+# slot for the systemd default (90s).
+TimeoutStopSec=30s
+Environment=NODE_ENV=production
+StandardOutput=append:/home/ubuntu/nanoclaw-v2/logs/memory-daemon.log
+StandardError=append:/home/ubuntu/nanoclaw-v2/logs/memory-daemon.error.log
+Environment=PATH=/home/ubuntu/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+# Hardening — narrow the daemon's filesystem write surface and reduce kernel
+# attack surface. The daemon processes untrusted source files; a path-traversal
+# or symlink bug should not give it arbitrary user-write access, and a deserialization
+# or classifier-output exploit should not be able to spawn unrelated namespaces or
+# write+exec a shellcode page.
+#
+# Filesystem narrowing
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ReadWritePaths=/home/ubuntu/nanoclaw-v2/data /home/ubuntu/nanoclaw-v2/groups /home/ubuntu/nanoclaw-v2/logs /home/ubuntu/.mnemon
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+PrivateDevices=yes
+# Network narrowing — daemon only needs IPv4/IPv6 for the OneCLI proxy + Ollama
+# loopback calls. AF_UNIX is needed for systemd notify and bun:sqlite has no
+# socket use, but allow it for safety. Reject everything else (AF_PACKET,
+# AF_NETLINK, AF_BLUETOOTH, etc.).
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+# Capability narrowing
+# (MemoryDenyWriteExecute=yes is intentionally NOT set — V8 JIT requires
+# writable+executable pages and Node SIGTRAPs without --jitless. The other
+# hardening directives plus mount narrowing already cover the threat surface.)
+CapabilityBoundingSet=
+AmbientCapabilities=
+# Syscall filter — block @debug @mount @swap @reboot @raw-io @cpu-emulation @obsolete @privileged
+# Allow normal system calls + tcpip. Subtract the dangerous classes.
+SystemCallFilter=@system-service
+SystemCallFilter=~@debug @mount @swap @reboot @raw-io @cpu-emulation @obsolete @privileged
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

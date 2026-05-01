@@ -142,11 +142,7 @@ function runCodex(args: string[], opts: { signal?: AbortSignal; timeoutMs: numbe
 export function makeCodexBackend(opts: CodexBackendOpts): ClassifierBackend {
   const codexEffort = effortToCodexFlag(opts.effort);
 
-  return async function callClassifierCodex(
-    systemPrompt: string,
-    userPrompt: string,
-    callOpts?: CallClassifierOpts,
-  ) {
+  return async function callClassifierCodex(systemPrompt: string, userPrompt: string, callOpts?: CallClassifierOpts) {
     const timeoutMs = callOpts?.timeoutMs ?? 30_000;
 
     // Each call gets its own tempdir so concurrent sweeps don't trample each
@@ -207,9 +203,7 @@ export function makeCodexBackend(opts: CodexBackendOpts): ClassifierBackend {
       try {
         parsed = JSON.parse(cleaned);
       } catch {
-        throw new ClassifierParseError(
-          `codex output is not valid JSON: ${cleaned.slice(0, 200)}`,
-        );
+        throw new ClassifierParseError(`codex output is not valid JSON: ${cleaned.slice(0, 200)}`);
       }
 
       return validateClassifierOutput(parsed);

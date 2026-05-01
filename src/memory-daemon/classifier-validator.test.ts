@@ -3,7 +3,10 @@ import { describe, expect, it } from 'vitest';
 import type { ClassifierOutput } from './classifier-client.js';
 import { validateFactsAgainstSource } from './classifier-validator.js';
 
-function fact(content: string, overrides: Partial<ClassifierOutput['facts'][number]> = {}): ClassifierOutput['facts'][number] {
+function fact(
+  content: string,
+  overrides: Partial<ClassifierOutput['facts'][number]> = {},
+): ClassifierOutput['facts'][number] {
   return {
     content,
     category: 'fact',
@@ -74,10 +77,7 @@ describe('validateFactsAgainstSource', () => {
     const source = 'WG production is fine. Dave prefers TypeScript.';
     const output: ClassifierOutput = {
       worth_storing: true,
-      facts: [
-        fact('WG (Whisky Gauge) production is fine'),
-        fact('Dave prefers TypeScript'),
-      ],
+      facts: [fact('WG (Whisky Gauge) production is fine'), fact('Dave prefers TypeScript')],
     };
     const result = validateFactsAgainstSource(output, source);
     expect(result.accepted).toHaveLength(1);
@@ -106,10 +106,7 @@ describe('validateFactsAgainstSource', () => {
     const source = 'Steps include: setup, run, verify.';
     const output: ClassifierOutput = {
       worth_storing: true,
-      facts: [
-        fact('Steps: (1) setup, (2) run, (3) verify'),
-        fact('Items (a) and (b) require approval'),
-      ],
+      facts: [fact('Steps: (1) setup, (2) run, (3) verify'), fact('Items (a) and (b) require approval')],
     };
     const result = validateFactsAgainstSource(output, source);
     expect(result.accepted).toHaveLength(2);
@@ -146,7 +143,7 @@ describe('validateFactsAgainstSource', () => {
   it('test_whitespace_tolerant_match', () => {
     // Source has parenthetical with weird internal whitespace; fact is
     // normalized. Both should be treated as the same.
-    const source = "Database (Stored  Procedures) live in /db.";
+    const source = 'Database (Stored  Procedures) live in /db.';
     const output: ClassifierOutput = {
       worth_storing: true,
       facts: [fact('SP (Stored Procedures) live in /db')],

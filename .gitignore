@@ -8,7 +8,12 @@ dist/
 
 # Local data & auth
 store/
-data/
+# data/* (not data/) so the !data/systemd/ exception can re-include the
+# tracked subdirectory. Per-install runtime state (SQLite DBs, health
+# JSON, lockfiles, archive) lives directly under data/ and stays excluded.
+data/*
+!data/systemd/
+!data/systemd/**
 logs/
 
 # Groups - per-installation state, not tracked
