@@ -454,7 +454,7 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
   }
 
   const isGroup = event.threadId !== null;
-  const engageMode: MessagingGroupAgent['engage_mode'] = isGroup ? 'mention-sticky' : 'pattern';
+  const engageMode: MessagingGroupAgent['engage_mode'] = isGroup ? 'mention' : 'pattern';
   const engagePattern = isGroup ? null : '.';
 
   const mgaId = `mga-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -464,9 +464,9 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
     agent_group_id: targetAgentGroupId,
     engage_mode: engageMode,
     engage_pattern: engagePattern,
-    sender_scope: 'known',
+    sender_scope: 'all',
     ignored_message_policy: 'accumulate',
-    session_mode: 'shared',
+    session_mode: 'per-thread',
     priority: 0,
     default_model: null,
     default_effort: null,
@@ -557,7 +557,7 @@ setMessageInterceptor(async (event: InboundEvent): Promise<boolean> => {
   }
 
   const isGroup = originalEvent.threadId !== null;
-  const engageMode: MessagingGroupAgent['engage_mode'] = isGroup ? 'mention-sticky' : 'pattern';
+  const engageMode: MessagingGroupAgent['engage_mode'] = isGroup ? 'mention' : 'pattern';
   const engagePattern = isGroup ? null : '.';
 
   const mgaId = `mga-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -567,9 +567,9 @@ setMessageInterceptor(async (event: InboundEvent): Promise<boolean> => {
     agent_group_id: ag.id,
     engage_mode: engageMode,
     engage_pattern: engagePattern,
-    sender_scope: 'known',
+    sender_scope: 'all',
     ignored_message_policy: 'accumulate',
-    session_mode: 'shared',
+    session_mode: 'per-thread',
     priority: 0,
     default_model: null,
     default_effort: null,

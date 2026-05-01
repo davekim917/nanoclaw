@@ -282,7 +282,10 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
       // legacy behavior; the approval card's wording and the
       // mention-sticky short-circuit both key off this value.
       is_group: event.isDM === false ? 1 : 0,
-      unknown_sender_policy: 'request_approval',
+      // Public-by-default: any sender in the channel can mention the bot
+      // without a separate sender-approval cascade. Operator can lock
+      // individual channels down later by updating messaging_groups.unknown_sender_policy.
+      unknown_sender_policy: 'public',
       denied_at: null,
       created_at: new Date().toISOString(),
     };
@@ -323,11 +326,11 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
           id: `mga-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           messaging_group_id: mg.id,
           agent_group_id: inheritedAgent.id,
-          engage_mode: 'mention-sticky',
+          engage_mode: 'mention',
           engage_pattern: null,
           session_mode: 'per-thread',
           priority: 0,
-          sender_scope: 'known',
+          sender_scope: 'all',
           ignored_message_policy: 'accumulate',
           default_model: null,
           default_effort: null,
