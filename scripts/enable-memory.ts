@@ -84,6 +84,11 @@ async function main(): Promise<void> {
   } else {
     console.warn(`      Warning: synth task scheduling failed (re-run to retry)`);
   }
+  if (r.step4_lintTaskScheduled) {
+    console.log(`      weekly lint task scheduled (Opus + effort=high, cron='${r.step4_lintCron}', seriesId: ${r.step4_lintSeriesId})`);
+  } else {
+    console.warn(`      Warning: lint task scheduling failed (re-run to retry)`);
+  }
 
   // Step 3: restart any running container — see Codex F4 / F3 deferral notes
   // in scripts/lib/restart-group-containers.ts header.

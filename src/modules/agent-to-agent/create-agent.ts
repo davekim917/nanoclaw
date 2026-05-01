@@ -218,6 +218,7 @@ export async function handleCreateAgent(content: Record<string, unknown>, sessio
         sourcesDirs: bs.step1_sourcesDirsCreated,
         mnemonStore: bs.step2_mnemonStoreStatus,
         synthTask: bs.step3_synthTaskScheduled,
+        lintTask: bs.step4_lintTaskScheduled,
       });
     }
   } catch (err) {

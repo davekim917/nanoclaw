@@ -52,6 +52,13 @@ function synthCronForIndex(i: number): string {
   return `${minute} 3 * * *`;
 }
 
+function lintCronForIndex(i: number): string {
+  // Same stagger pattern as synth, except weekly: Sundays 10:03–10:53 ET.
+  // Avoids 11+ Opus calls firing simultaneously every Sunday morning.
+  const minute = STAGGER_FIRST_MINUTE + (i % 11) * STAGGER_INTERVAL_MINUTES;
+  return `${minute} 10 * * 0`;
+}
+
 function atomicWriteJson(filePath: string, data: unknown): void {
   const tmp = `${filePath}.tmp`;
   fs.writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', 'utf8');
@@ -132,8 +139,11 @@ async function main(): Promise<void> {
   for (let i = 0; i < groups.length; i++) {
     const g = groups[i];
     const synthCron = synthCronForIndex(i);
+    const lintCron = lintCronForIndex(i);
     const tag = g.alreadyEnabled ? 'reconcile' : 'enable';
-    console.log(`\n[${i + 1}/${groups.length}] ${g.folder} (${tag}, agentGroupId=${g.agentGroupId}, cron='${synthCron}')`);
+    console.log(
+      `\n[${i + 1}/${groups.length}] ${g.folder} (${tag}, agentGroupId=${g.agentGroupId}, synth='${synthCron}', lint='${lintCron}')`,
+    );
 
     // Step 1: container.json — write memory.enabled=true (idempotent: re-write
     // is a no-op when already true). Persist agentGroupId here too in case
@@ -145,11 +155,12 @@ async function main(): Promise<void> {
     atomicWriteJson(containerJsonPath, raw);
     console.log(`  • memory.enabled = true`);
 
-    // Step 2: shared bootstrap (sources subdirs, mnemon store, synth task with per-group cron)
-    const bs = await bootstrapMemoryForGroup(g.folder, g.agentGroupId, { synthCron });
+    // Step 2: shared bootstrap (sources subdirs, mnemon store, synth + lint tasks with per-group crons)
+    const bs = await bootstrapMemoryForGroup(g.folder, g.agentGroupId, { synthCron, lintCron });
     console.log(`  • sources subdirs: ok`);
     console.log(`  • mnemon store: ${bs.step2_mnemonStoreStatus}${bs.step2_mnemonStoreError ? ` (${bs.step2_mnemonStoreError.trim()})` : ''}`);
     console.log(`  • synth task: ${bs.step3_synthTaskScheduled ? `scheduled (cron='${bs.step3_synthCron}')` : 'FAILED — re-run to retry'}`);
+    console.log(`  • lint task:  ${bs.step4_lintTaskScheduled ? `scheduled (cron='${bs.step4_lintCron}')` : 'FAILED — re-run to retry'}`);
 
     // Step 3: first-pass docker stop
     const r1 = restartGroupContainers(g.folder);
