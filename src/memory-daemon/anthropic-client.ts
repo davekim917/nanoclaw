@@ -34,13 +34,20 @@ export function _resetProxyDispatcherForTest(): void {
   _envProxyDispatcher = undefined;
 }
 export const CLASSIFIER_VERSION = 'v1';
-export const PROMPT_VERSION = 'v1';
+// v2 — added grounding-discipline section to CLASSIFIER_SYSTEM_PROMPT and
+// EXTRACTOR_SYSTEM_PROMPT to prevent confabulation (acronym expansion,
+// invented aliases, unsourced parentheticals). Bumping invalidates the
+// processed_pairs / processed_sources idempotency cache so prior turns get
+// re-classified under the new rules. Underlying extractor schema unchanged
+// (Plan B span-grounding is a separate follow-up).
+export const PROMPT_VERSION = 'v2';
 // EXTRACTOR_VERSION lives here alongside the other version constants so a
 // reviewer bumping CLASSIFIER_VERSION on a prompt change will see this and
 // know to bump it too if the source-ingest extractor prompt also changes.
 // processed_sources rows are scoped by EXTRACTOR_VERSION; failing to bump it
 // on a prompt change causes silent re-processing skips.
-export const EXTRACTOR_VERSION = 'v1';
+// v2 — same grounding-discipline addition as PROMPT_VERSION above.
+export const EXTRACTOR_VERSION = 'v2';
 
 export interface ClassifierOutput {
   worth_storing: boolean;

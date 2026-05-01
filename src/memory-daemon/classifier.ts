@@ -39,7 +39,15 @@ Rules:
 - Preferred categories: preference, decision, insight, fact, context.
 - Importance: 5 = critical/high-signal, 1 = low-signal background detail.
 - NEVER extract secrets, credentials, API keys, tokens, passwords, or transient state (e.g. error messages with stack traces, temporary values).
-- Return empty facts array for chitchat, greetings, or short filler messages.`;
+- Return empty facts array for chitchat, greetings, or short filler messages.
+
+GROUNDING DISCIPLINE (critical — confabulation hazard):
+- Do NOT introduce names, acronyms, aliases, expansions, dates, owners, statuses, or causal claims that are not LITERALLY present in the source text.
+- Acronyms are especially dangerous: if the source says "WG", write "WG". Do NOT expand it to "(William Grant)" or any other parenthetical unless that exact parenthetical appears verbatim in the source.
+- Do NOT add definitions, descriptions, or context that "would help" the reader unless that information is in the source.
+- The fact's "content" field may compress phrasing or fix grammar, but it must not introduce a single word's worth of meaning that isn't in the source.
+- Every entity in "entities[]" must be a string the source explicitly used.
+- If a fact cannot be stated using only information present in the source, do not emit it.`;
 
 interface ArchiveRow {
   id: string;
