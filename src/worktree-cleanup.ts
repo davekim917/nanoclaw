@@ -34,6 +34,10 @@ import { log } from './log.js';
 const CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const STARTUP_DELAY_MS = 60_000;
 const STALE_WARNING_DAYS = 30;
+// Detached HEAD with clean tree + everything pushed is safe to evict
+// (create_worktree on resume re-checks out off origin/HEAD). Wait this many
+// days idle before evicting so brief pauses don't trigger churn.
+const IDLE_DETACHED_EVICT_DAYS = 7;
 
 function execSafe(cmd: string, cwd: string): string | null {
   try {
@@ -179,12 +183,10 @@ function cleanupOne(target: WorktreeTarget): void {
       return;
     }
 
-    const branch = getBranchName(worktreePath);
-    if (!branch || branch === 'HEAD') {
-      log.debug('Worktree cleanup: detached HEAD, skipping', ctx);
-      return;
-    }
-
+    // Run unpushed-commits check before branch-name check. `git log HEAD --not
+    // --remotes` works on detached HEAD too, and unpushed-commits is the
+    // load-bearing work-loss guard — branch state below only decides which
+    // signal (PR merged / remote branch gone / age) we use to evict.
     const unpushed = hasUnpushedCommits(worktreePath);
     if (unpushed === null) {
       log.warn('Worktree cleanup: git log failed, skipping', ctx);
@@ -192,6 +194,28 @@ function cleanupOne(target: WorktreeTarget): void {
     }
     if (unpushed) {
       log.debug('Worktree cleanup: unpushed commits, skipping', ctx);
+      return;
+    }
+
+    const branch = getBranchName(worktreePath);
+    if (!branch || branch === 'HEAD') {
+      // Detached HEAD with clean tree + everything pushed: no work to lose.
+      // No branch ref to query a PR/remote status against, so evict on idle
+      // age. Resumed sessions get a fresh worktree off origin/HEAD via
+      // create_worktree.
+      const ageDays = getLastModifiedDays(worktreePath);
+      if (ageDays > IDLE_DETACHED_EVICT_DAYS) {
+        log.info('Worktree cleanup: removing idle detached HEAD', {
+          ...ctx,
+          ageDays: Math.round(ageDays),
+        });
+        removeWorktree(canonicalRepoPath, worktreePath);
+      } else {
+        log.debug('Worktree cleanup: detached HEAD recently active, skipping', {
+          ...ctx,
+          ageDays: Math.round(ageDays),
+        });
+      }
       return;
     }
 
