@@ -185,9 +185,28 @@ Any added entry under either key → BLOCK. Ask via AskUserQuestion, one questio
 
 ---
 
+## F. Merge ancestry check
+
+Only relevant when the user picked path A (Full update). Verifies the merge actually produced a 2-parent merge commit. A single-parent commit at HEAD whose subject claims to be a merge means `MERGE_HEAD` was discarded during conflict resolution (typically by `git stash`, `git reset`, or `git checkout`) and the upstream commits are orphaned from ancestry. The user functionally has the content but `gh api compare` and `git rev-list origin..upstream` will keep reporting "behind upstream" forever.
+
+Step 4A's pre-commit and post-commit guards should already catch this at the source. Sub-audit F is the late-bound integration check — if a hook, build script, or any side-effect between Step 4A and here reset HEAD, only F catches it.
+
+```bash
+PARENT_COUNT=$(git rev-list --parents -1 HEAD | awk '{print NF-1}')
+SUBJECT=$(git log -1 --format=%s)
+if [ "$PARENT_COUNT" -lt 2 ] && echo "$SUBJECT" | grep -qiE "^Merge "; then
+  echo "F: BLOCK — HEAD has $PARENT_COUNT parent(s) but subject claims merge: $SUBJECT"
+fi
+```
+
+- 2+ parents OR subject doesn't claim merge → PASS
+- Single-parent commit with merge-subject → BLOCK. Recovery: `git reset --hard $BACKUP` and re-run `/update-nanoclaw`. Avoid `git stash`, `git reset`, `git checkout` during conflict resolution.
+
+---
+
 ## Final audit report
 
-After running A–E, present a single report:
+After running A–F, present a single report:
 
 ```
 Audit findings
@@ -197,6 +216,7 @@ B. Container rebuild required: [no  | YES — see Step 9]
 C. Risky pending migrations:   [PASS | FLAG (N migrations)]
 D. Env var drift:              [PASS | FLAG (N unused / N new-required)]
 E. Supply-chain policy:        [PASS | BLOCK (N entries)]
+F. Merge ancestry:             [PASS | BLOCK (single-parent merge)]
 ```
 
 Decision rules:
