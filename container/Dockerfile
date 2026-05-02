@@ -15,6 +15,14 @@
 #   - PostgreSQL + Redis clients, Python + dbt + snowflake-cli — data-team tooling
 #   - gitnexus CLI (global) — code intelligence used by agents
 
+# ---- mcp-toolbox alias stage -------------------------------------------------
+# Google publishes the toolbox as a multi-arch distroless image but does NOT
+# publish a linux/arm64 prebuilt at storage.googleapis.com. The alias FROM
+# lets us pull the binary via COPY --from below while keeping the version
+# pinned via build-arg.
+ARG MCP_TOOLBOX_VERSION=1.1.0
+FROM us-central1-docker.pkg.dev/database-toolbox/toolbox/toolbox:${MCP_TOOLBOX_VERSION} AS mcp-toolbox-src
+
 FROM node:22-slim
 
 # ---- Build-time arguments ----------------------------------------------------
@@ -62,6 +70,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         less \
         tini \
         unzip \
+        xz-utils \
         postgresql-client \
         redis-tools \
         python3 \
@@ -132,6 +141,10 @@ RUN DPKG_ARCH=$(dpkg --print-architecture) && UARCH=$(uname -m) \
     && dpkg -i /tmp/supabase.deb \
     && rm -rf /tmp/render.zip /tmp/render /tmp/supabase.deb
 
+# Google MCP Toolbox for Databases — provides --prebuilt looker stdio MCP.
+# Binary copied from the alias stage declared at the top of this Dockerfile.
+COPY --from=mcp-toolbox-src /toolbox /usr/local/bin/toolbox
+
 # Pinned mnemon binary — auto-tracked by /update-container audit.
 # Per-arch SHA256 from https://github.com/mnemon-dev/mnemon/releases/download/v0.1.2/checksums.txt
 ARG MNEMON_VERSION=0.1.2
@@ -152,6 +165,35 @@ COPY mnemon-wrapper.sh /usr/local/bin/mnemon-wrapper.sh
 RUN chmod +x /usr/local/bin/mnemon-wrapper.sh \
     && ln -s /usr/local/bin/mnemon-wrapper.sh /usr/local/bin/mnemon \
     && /usr/local/bin/mnemon --version
+
+# Hex CLI — closed-source Rust binary released as multi-arch tarballs at
+# https://github.com/hex-inc/hex-cli/releases. Auth is OAuth-only (no static
+# token env var); the real `hex` binary reads XDG_CONFIG_HOME, and the
+# wrapper at /usr/local/bin/hex points it at the mount staging path. SHA256s
+# pinned per-arch — bump the version + recompute both via:
+#   curl -sL https://github.com/hex-inc/hex-cli/releases/download/v$V/hex-aarch64-unknown-linux-gnu.tar.xz | sha256sum
+#   curl -sL https://github.com/hex-inc/hex-cli/releases/download/v$V/hex-x86_64-unknown-linux-gnu.tar.xz  | sha256sum
+ARG HEX_CLI_VERSION=1.2.2
+ARG HEX_CLI_SHA256_arm64=d560af1ac9f8b2cc8f1729d02fe900be3db7a412482fd960d9097f03719de14a
+ARG HEX_CLI_SHA256_amd64=5ab71cecc3da7ee5a5e290f9bf96ed87c49792ac70ecac56335238c95d66186b
+
+RUN ARCH=$(dpkg --print-architecture) \
+    && case "$ARCH" in \
+         arm64) RARCH=aarch64; SHA="$HEX_CLI_SHA256_arm64" ;; \
+         amd64) RARCH=x86_64;  SHA="$HEX_CLI_SHA256_amd64" ;; \
+         *) echo "Unsupported arch for hex CLI: $ARCH" >&2; exit 1 ;; \
+       esac \
+    && curl -fsSL "https://github.com/hex-inc/hex-cli/releases/download/v${HEX_CLI_VERSION}/hex-${RARCH}-unknown-linux-gnu.tar.xz" \
+       -o /tmp/hex.tar.xz \
+    && echo "$SHA  /tmp/hex.tar.xz" | sha256sum -c - \
+    && tar -xf /tmp/hex.tar.xz -C /tmp \
+    && install -m 0755 "/tmp/hex-${RARCH}-unknown-linux-gnu/hex" /usr/local/bin/hex-real \
+    && rm -rf /tmp/hex*
+
+COPY hex-wrapper.sh /usr/local/bin/hex-wrapper.sh
+RUN chmod +x /usr/local/bin/hex-wrapper.sh \
+    && ln -s /usr/local/bin/hex-wrapper.sh /usr/local/bin/hex \
+    && /usr/local/bin/hex-real --version
 
 # Chromium path for agent-browser / Playwright / mmdc consumers
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium

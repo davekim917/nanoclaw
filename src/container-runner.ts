@@ -1637,6 +1637,49 @@ async function buildContainerArgs(
       url: 'https://mcp.linear.app/mcp',
     };
   }
+  if (canInject('atlassian') && isToolEnabled(containerConfig.tools, 'atlassian')) {
+    // Atlassian Rovo MCP — covers Jira + Confluence + Compass in one
+    // server. Auth via OneCLI vault entry "Atlassian" → mcp.atlassian.com,
+    // header `Authorization: Basic base64(email:api-token)`. API-token
+    // mode is preview as of 2026-02-24 and requires the org admin to enable
+    // it at Atlassian Admin → Rovo → Rovo MCP server → Authentication →
+    // API token. Gated by `tools: ["atlassian"]` in container.json.
+    mcpServers.atlassian = {
+      type: 'http',
+      url: 'https://mcp.atlassian.com/v1/mcp',
+    };
+  }
+  if (canInject('looker') && isToolEnabled(containerConfig.tools, 'looker')) {
+    // Google's MCP Toolbox for Databases (--prebuilt looker). The toolbox
+    // binary is baked into the image (see container/Dockerfile). Credentials
+    // are resolved per-group via LOOKER_*_<FOLDER> → LOOKER_* and embedded
+    // in the env block here because the MCP SDK's stdio transport only
+    // inherits HOME/LOGNAME/PATH/SHELL/TERM/USER by default — container env
+    // vars don't reach the child process unless explicitly passed.
+    const baseUrl = resolveScopedEnv('LOOKER_BASE_URL', agentGroup.folder);
+    const clientId = resolveScopedEnv('LOOKER_CLIENT_ID', agentGroup.folder);
+    const clientSecret = resolveScopedEnv('LOOKER_CLIENT_SECRET', agentGroup.folder);
+    if (baseUrl && clientId && clientSecret) {
+      mcpServers.looker = {
+        type: 'stdio',
+        command: 'toolbox',
+        args: ['--stdio', '--prebuilt', 'looker'],
+        env: {
+          LOOKER_BASE_URL: baseUrl,
+          LOOKER_CLIENT_ID: clientId,
+          LOOKER_CLIENT_SECRET: clientSecret,
+          LOOKER_VERIFY_SSL: resolveScopedEnv('LOOKER_VERIFY_SSL', agentGroup.folder) ?? 'true',
+        },
+      };
+    } else {
+      log.warn('Looker tool enabled but credentials missing', {
+        folder: agentGroup.folder,
+        hasBaseUrl: !!baseUrl,
+        hasClientId: !!clientId,
+        hasClientSecret: !!clientSecret,
+      });
+    }
+  }
   if (Object.keys(mcpServers).length > 0) {
     args.push('-e', `NANOCLAW_MCP_SERVERS=${JSON.stringify(mcpServers)}`);
   }

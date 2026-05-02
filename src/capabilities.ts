@@ -147,6 +147,9 @@ const SCOPED_ENV_NAMES = [
   'SUPABASE_PROJECT_REF',
   'SUPABASE_ACCESS_TOKEN',
   'SUPABASE_DB_PASSWORD',
+  'LOOKER_BASE_URL',
+  'LOOKER_CLIENT_ID',
+  'LOOKER_CLIENT_SECRET',
 ];
 
 function listHostPlugins(): string[] {
@@ -487,6 +490,71 @@ function buildSessionServicesSnapshot(agentGroupId: string): SessionServicesSnap
       credentialPaths: [],
       useFor:
         'Linear issue tracker via https://mcp.linear.app/mcp. Auth pre-injected (Authorization: Bearer). Use for: list/search/create/update issues, comments, projects, cycles, teams, users. Tools: `mcp__linear__*`.',
+    });
+  }
+
+  // Atlassian Rovo MCP — gated by tool entry. Covers Jira + Confluence +
+  // Compass in one server. OneCLI gateway injects `Authorization: Basic
+  // base64(email:api-token)` at request time (vault entry "Atlassian" →
+  // mcp.atlassian.com). The Teamwork Graph tools (getTeamworkGraphContext /
+  // getTeamworkGraphObject) are for relationship queries — use them for
+  // reasoning about connections between work items, people, teams, goals,
+  // projects. Use the standard Jira/Confluence/Compass tools for CRUD.
+  if (declared(['atlassian'])) {
+    services.push({
+      name: 'Atlassian (Jira + Confluence + Compass)',
+      mcpNamespace: 'mcp__atlassian__*',
+      declaredTools: declaredMatchingTools(['atlassian']),
+      scopes: [],
+      credentialPaths: [],
+      useFor:
+        'Atlassian Rovo MCP via https://mcp.atlassian.com/v1/mcp. Auth pre-injected (Authorization: Basic). Covers Jira (issues, projects, sprints, search, transitions, bulk ops), Confluence (pages, spaces, search, summaries), and Compass (components, scorecards). Use Teamwork Graph tools (`getTeamworkGraphContext`, then `getTeamworkGraphObject` on key linked entities) when reasoning about relationships between Atlassian entities — work items, people, teams, goals, projects. Use standard CRUD tools for direct reads/writes. Tools: `mcp__atlassian__*`.',
+    });
+  }
+
+  // Looker — gated by tool entry. Google's MCP Toolbox (--prebuilt looker) is
+  // baked into the image; container-runner wires the stdio MCP server with
+  // credentials resolved per-group from LOOKER_*_<FOLDER> env vars. The
+  // toolbox exchanges client_id/client_secret for a session token via
+  // /api/4.0/login on first call.
+  if (declared(['looker'])) {
+    const baseUrl = resolveScopedEnvVar('LOOKER_BASE_URL', folder);
+    const clientId = resolveScopedEnvVar('LOOKER_CLIENT_ID', folder);
+    const clientSecret = resolveScopedEnvVar('LOOKER_CLIENT_SECRET', folder);
+    const credsReady = baseUrl.set && clientId.set && clientSecret.set;
+    services.push({
+      name: 'Looker',
+      mcpNamespace: 'mcp__looker__*',
+      declaredTools: declaredMatchingTools(['looker']),
+      scopes: [],
+      credentialPaths: [],
+      useFor: credsReady
+        ? `Looker via Google's MCP Toolbox (--prebuilt looker), instance \`${process.env[baseUrl.name]}\`. Auth via API3 client_id/client_secret (resolved from host env \`${clientId.name}\`). Use for: LookML inspection (\`mcp__looker__get_projects\`, \`get_project_files\`, \`get_project_file\`), inline queries against explores (\`mcp__looker__query\`), raw SQL (\`mcp__looker__query_sql\`), rerunning a UI URL (\`mcp__looker__query_url\`), browsing models/explores/dimensions/measures, listing/running saved Looks and dashboards, warehouse schema introspection (\`get_connection_*\`). Gaps: scheduled plans, alerts, user/role admin, PDT controls — fall back to direct Looker REST API via \`curl\` if needed.`
+        : `Looker tool declared but credentials missing: ${[!baseUrl.set && 'LOOKER_BASE_URL', !clientId.set && 'LOOKER_CLIENT_ID', !clientSecret.set && 'LOOKER_CLIENT_SECRET'].filter(Boolean).join(', ')} not set on host (looked for \`*_${folder.toUpperCase().replace(/-/g, '_')}\` then unscoped fallback). Ask Dave.`,
+    });
+  }
+
+  // Hex — gated by tool entry. The `hex` CLI is baked into the image and
+  // wrapped to read XDG_DATA_HOME=/workspace/extra/.local/share so it picks
+  // up the mounted host data dir. Auth is OAuth-only (no static-token mode);
+  // operator runs `hex auth login` once on host, tokens land in
+  // ~/.local/share/hex/default-credentials.json which mounts RW so the CLI's
+  // refresh flow can update access tokens. The container-skill at
+  // /app/skills/hex/SKILL.md (Hex-authored, regenerated via `hex install
+  // agent-skill --claude`) covers the full surface including CLI-only
+  // features (cell run, project export/import, suggestion triage, guide
+  // preview/publish) that REST does not expose.
+  if (declared(['hex'])) {
+    const credsExist = hostDirExists('.local', 'share', 'hex');
+    services.push({
+      name: 'Hex',
+      cli: 'hex',
+      declaredTools: declaredMatchingTools(['hex']),
+      scopes: [],
+      credentialPaths: ['/workspace/extra/.local/share/hex/default-credentials.json'],
+      activation: credsExist
+        ? `\`hex\` CLI ready. Skill at \`/app/skills/hex/SKILL.md\` documents the full command surface. Common verbs: \`hex projects list --json\`, \`hex project get <id> --json\`, \`hex cell list --project-id <id> --json\`, \`hex cell run <cell-id>\`, \`hex project run <id> --watch\`, \`hex suggestion list --json\` (Context Studio), \`hex guide preview\` then \`hex guide publish <preview-id>\`, \`hex project export <id> > project.yaml\`. Always pass \`--json\` when parsing programmatically. If \`hex auth status\` reports not authenticated, the host operator needs to re-run \`hex auth login\` — do NOT attempt OAuth from inside the container.`
+        : `Hex tool declared but \`~/.local/share/hex/\` is empty on the host. Ask Dave to run \`hex auth login\` on the host once. Mount allowlist: \`/home/ubuntu\` is already covered (no /manage-mounts call needed).`,
     });
   }
 

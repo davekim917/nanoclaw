@@ -261,6 +261,9 @@ Check the latest available version:
   - RAILWAY_VERSION → railwayapp/cli
   - SUPABASE_VERSION → supabase/cli
   - MNEMON_VERSION → mnemon-dev/mnemon
+  - HEX_CLI_VERSION → hex-inc/hex-cli
+  - MCP_TOOLBOX_VERSION → googleapis/mcp-toolbox
+- HEX_CLI_VERSION: when bumping, recompute BOTH per-arch SHA256s pinned in the Dockerfile (HEX_CLI_SHA256_arm64 and HEX_CLI_SHA256_amd64). Curl each release tarball and pipe through sha256sum. Also re-run "hex install agent-skill --claude" and diff container/skills/hex/SKILL.md — frontmatter changes (especially allowed-tools) are load-bearing and must be reviewed before commit.
 - SNOW_VERSION: check https://sfc-repo.snowflakecomputing.com/snowflake-cli/linux_aarch64/index.html for the latest version listed
 
 ## Part 2 — Upstream-synced file drift (verbatim copies in bootstrap-workflow)
