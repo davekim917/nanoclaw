@@ -19,6 +19,14 @@ const DB_PATH = path.join(PROJECT_ROOT, 'data', 'v2.db');
 
 // Historical V1 platform context — kept for reference but not passed to scheduleTask.
 const DISCORD_MAIN_PLATFORM_ID = 'discord:1479489865702703155:1479489866193571902';
+// Per-tenant Discord channels under Dave's personal server. Recap tasks for a tenant
+// MUST post to that tenant's own channel, not main, and the agentGroupId MUST match
+// the tenant — otherwise the recap fires inside a different agent group's session and
+// can leak into a different chat surface (cross-tenant exposure). See lessons learned
+// 2026-05-02 (numberdrinks recap leaked into Illysium #agents-xzo Slack).
+const DISCORD_ILLYSIUM_PLATFORM_ID = 'discord:1479489865702703155:1479516831168593974';
+const DISCORD_NUMBERDRINKS_PLATFORM_ID = 'discord:1479489865702703155:1479517050249412739';
+const DISCORD_MADISON_REED_PLATFORM_ID = 'discord:1479489865702703155:1491825196087377960';
 
 interface V1Task {
   id: string;
@@ -85,8 +93,8 @@ Sections (in order):
   {
     id: 'task-email-recap-illysium',
     groupFolder: 'illysium',
-    agentGroupId: 'ag-1776402507183-cf39lq', // Axie-2 → Discord main
-    platformId: DISCORD_MAIN_PLATFORM_ID,
+    agentGroupId: 'ag-1776377699463-2axxhg', // illysium agent (NOT main — illysium creds live here)
+    platformId: DISCORD_ILLYSIUM_PLATFORM_ID,
     channelType: 'discord',
     cron: '0 12 * * *',
     processAfter: '2026-04-21T16:00:00.000Z',
@@ -119,8 +127,8 @@ Sections (in order):
   {
     id: 'task-email-recap-numberdrinks',
     groupFolder: 'number-drinks',
-    agentGroupId: 'ag-1776377699463-2axxhg', // illie-v2 → Discord main
-    platformId: DISCORD_MAIN_PLATFORM_ID,
+    agentGroupId: 'ag-1776735605479-6p0461m', // number-drinks agent (NOT illysium — numberdrinks creds live here)
+    platformId: DISCORD_NUMBERDRINKS_PLATFORM_ID,
     channelType: 'discord',
     cron: '0 12 * * *',
     processAfter: '2026-04-21T16:00:00.000Z',
@@ -152,8 +160,8 @@ Sections (in order):
   {
     id: 'task-email-recap-madison-reed',
     groupFolder: 'madison-reed',
-    agentGroupId: 'ag-1776402507183-cf39lq', // Axie-2 → Discord main
-    platformId: DISCORD_MAIN_PLATFORM_ID,
+    agentGroupId: 'ag-1776735605480-vosgej2', // madison-reed agent (NOT main — madison-reed creds live here)
+    platformId: DISCORD_MADISON_REED_PLATFORM_ID,
     channelType: 'discord',
     cron: '0 12 * * *',
     processAfter: '2026-04-21T16:00:00.000Z',
@@ -472,6 +480,11 @@ async function main() {
       processAfter: task.processAfter,
       seriesId: task.seriesId,
       prompt: task.prompt,
+      destination: {
+        platformId: task.platformId,
+        channelType: task.channelType,
+        threadId: null,
+      },
     });
     console.log(`  [task] done: ${task.id}`);
     inserted++;
@@ -485,6 +498,11 @@ async function main() {
     processAfter: '2026-04-27T19:00:00.000Z',
     seriesId: 'task-host-deps-updates',
     prompt: TASK_HOST_DEPS_UPDATES_PROMPT,
+    destination: {
+      platformId: DISCORD_MAIN_PLATFORM_ID,
+      channelType: 'discord',
+      threadId: null,
+    },
   });
   console.log('  [task] done: task-host-deps-updates');
   inserted++;

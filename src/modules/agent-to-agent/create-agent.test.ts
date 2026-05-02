@@ -69,11 +69,45 @@ vi.mock('../../session-manager.js', () => ({
   openInboundDb: vi.fn(),
 }));
 
+// Capture requestApproval calls so each test can choose to trigger the
+// post-approval execution path. handleCreateAgent now requests approval
+// instead of executing directly; envelope guards still run before the
+// requestApproval call, so "rejected before creating any state" tests
+// continue to assert correctly via capturedApprovalRequests.length.
+const capturedApprovalRequests: Array<{ payload: Record<string, unknown>; session: unknown }> = [];
+
+vi.mock('../approvals/index.js', () => ({
+  requestApproval: vi.fn(async (opts: { session: unknown; payload: Record<string, unknown> }) => {
+    capturedApprovalRequests.push({ payload: opts.payload, session: opts.session });
+  }),
+  registerApprovalHandler: vi.fn(),
+  notifyAgent: vi.fn(),
+}));
+
 // ── Imports after mocks ───────────────────────────────────────────────────────
 import { initTestDb, closeDb, runMigrations, createAgentGroup } from '../../db/index.js';
 import { getAgentGroupByFolder } from '../../db/agent-groups.js';
-import { handleCreateAgent } from './create-agent.js';
+import { applyCreateAgent, handleCreateAgent } from './create-agent.js';
 import type { Session } from '../../types.js';
+
+/**
+ * Test helper: invokes handleCreateAgent (envelope guards), then if a
+ * requestApproval was queued, drives the apply path with that payload.
+ * Mirrors the production flow: request → admin approves → apply runs.
+ */
+async function runCreateAgent(content: Record<string, unknown>, session: Session): Promise<void> {
+  capturedApprovalRequests.length = 0;
+  await handleCreateAgent(content, session);
+  if (capturedApprovalRequests.length > 0) {
+    const req = capturedApprovalRequests[0];
+    await applyCreateAgent({
+      session: req.session as Session,
+      payload: req.payload,
+      userId: 'test-admin',
+      notify: async () => {},
+    });
+  }
+}
 
 function now(): string {
   return new Date().toISOString();
@@ -130,7 +164,7 @@ describe('S4 fixture assertion', () => {
 describe('legacy call — no provider, no provider_config', () => {
   it('test_create_agent_legacy_no_provider: creates agent with agent_provider null and no provider/providerConfig keys in container.json', async () => {
     const session = makeSession();
-    await handleCreateAgent({ requestId: 'r1', name: 'Legacy', instructions: 'be helpful' }, session);
+    await runCreateAgent({ requestId: 'r1', name: 'Legacy', instructions: 'be helpful' }, session);
 
     const row = getAgentGroupByFolder('legacy');
     expect(row).toBeDefined();
@@ -148,7 +182,7 @@ describe('legacy call — no provider, no provider_config', () => {
 describe('create with claude provider', () => {
   it('test_create_agent_with_claude_config_three_writes_consistent: writes agent_provider, container.json provider, and providerConfig consistently', async () => {
     const session = makeSession();
-    await handleCreateAgent(
+    await runCreateAgent(
       {
         requestId: 'r2',
         name: 'Coder',
@@ -174,7 +208,7 @@ describe('create with claude provider', () => {
 describe('create with codex provider', () => {
   it('test_create_agent_with_codex_config_three_writes_consistent: writes agent_provider codex, container.json provider codex, and providerConfig', async () => {
     const session = makeSession();
-    await handleCreateAgent(
+    await runCreateAgent(
       {
         requestId: 'r3',
         name: 'CodexCoder',
@@ -222,7 +256,7 @@ describe('write sequence ordering', () => {
     });
 
     const session = makeSession();
-    await handleCreateAgent(
+    await runCreateAgent(
       {
         requestId: 'r-order',
         name: 'OrderTest',
@@ -260,7 +294,7 @@ describe('DB failure rollback', () => {
     const session = makeSession();
 
     await expect(
-      handleCreateAgent(
+      runCreateAgent(
         {
           requestId: 'r-dbfail',
           name: 'DbFail',
@@ -300,7 +334,7 @@ describe('updateContainerConfig failure rollback', () => {
     const session = makeSession();
 
     await expect(
-      handleCreateAgent(
+      runCreateAgent(
         {
           requestId: 'r-fsfail',
           name: 'FsFail',
@@ -343,7 +377,7 @@ describe('rollback failure — orphan notification', () => {
     const session = makeSession();
 
     await expect(
-      handleCreateAgent(
+      runCreateAgent(
         {
           requestId: 'r-orphan',
           name: 'OrphanTest',
@@ -380,7 +414,7 @@ describe('envelope guard — non-string provider', () => {
     const { writeSessionMessage } = await import('../../session-manager.js');
     const session = makeSession();
 
-    await handleCreateAgent({ requestId: 'r4', name: 'X', provider: 123 as unknown as string }, session);
+    await runCreateAgent({ requestId: 'r4', name: 'X', provider: 123 as unknown as string }, session);
 
     const calls = (writeSessionMessage as ReturnType<typeof vi.fn>).mock.calls;
     const notifyCall = calls.find((c) => {
@@ -400,7 +434,7 @@ describe('envelope guard — array provider_config', () => {
     const { writeSessionMessage } = await import('../../session-manager.js');
     const session = makeSession();
 
-    await handleCreateAgent(
+    await runCreateAgent(
       {
         requestId: 'r5',
         name: 'X',
@@ -428,7 +462,7 @@ describe('envelope guard — null provider_config', () => {
     const { writeSessionMessage } = await import('../../session-manager.js');
     const session = makeSession();
 
-    await handleCreateAgent(
+    await runCreateAgent(
       { requestId: 'r6', name: 'X', provider: 'claude', provider_config: null as unknown as Record<string, unknown> },
       session,
     );
@@ -449,7 +483,7 @@ describe('envelope guard — null provider_config', () => {
 describe('envelope guard — undefined provider_config is OK', () => {
   it('accepts absent provider_config and creates agent normally', async () => {
     const session = makeSession();
-    await handleCreateAgent({ requestId: 'r7', name: 'ValidProviderOnly', provider: 'claude' }, session);
+    await runCreateAgent({ requestId: 'r7', name: 'ValidProviderOnly', provider: 'claude' }, session);
 
     const row = getAgentGroupByFolder('validprovideronly');
     expect(row).toBeDefined();

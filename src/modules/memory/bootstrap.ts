@@ -185,21 +185,28 @@ export async function bootstrapMemoryForGroup(
   const taskId = `task-${result.step3_synthSeriesId}-${Date.now()}`;
 
   // Route the synth task's chat reply to the agent group's primary messaging
-  // group's parent channel (threadId=null) instead of inheriting whichever
-  // thread happened to spawn the session. Without this, every synth report
-  // landed inside the most recent chat thread — burying chat with the agent
-  // and getting lost. If the agent has no wired channel yet (brand-new
-  // groups from create_agent), skip destination — falls back to the legacy
-  // session-routing behavior which the operator can fix by re-running
-  // enable-memory.ts after wiring channels.
+  // group's parent channel (threadId=null). scheduleTask now requires
+  // destination, so a brand-new agent with no wired channels cannot have
+  // wiki-synth scheduled — re-run enable-memory.ts after wiring at least one
+  // channel.
   const primaryMg = getPrimaryMessagingGroupByAgentGroup(agentGroupId);
-  const destination = primaryMg
-    ? {
-        platformId: primaryMg.platform_id,
-        channelType: primaryMg.channel_type,
-        threadId: null,
-      }
-    : undefined;
+  if (!primaryMg) {
+    // Brand-new agent with no wired channel — synth/lint tasks need a chat
+    // destination to deliver their report into. Skip and surface a non-fatal
+    // status. Operator re-runs enable-memory.ts after wiring at least one
+    // channel.
+    if (opts.strict) {
+      throw new Error(
+        `memory bootstrap: agent ${agentGroupId} has no primary messaging group; cannot schedule wiki-synth/lint tasks. Wire a channel first.`,
+      );
+    }
+    return result;
+  }
+  const destination = {
+    platformId: primaryMg.platform_id,
+    channelType: primaryMg.channel_type,
+    threadId: null as string | null,
+  };
 
   try {
     await scheduleTask(
@@ -211,7 +218,7 @@ export async function bootstrapMemoryForGroup(
         seriesId: result.step3_synthSeriesId,
         prompt: SYNTH_PROMPT,
         quietStatus: true,
-        ...(destination ? { destination } : {}),
+        destination,
         // Wiki synthesis is a high-leverage low-frequency reasoning task —
         // read N mnemon facts, dedupe, organize across multiple wiki pages,
         // update index. Run on Opus with reasoning_effort=high once a day;
@@ -258,7 +265,7 @@ export async function bootstrapMemoryForGroup(
         seriesId: result.step4_lintSeriesId,
         prompt: LINT_PROMPT,
         quietStatus: true,
-        ...(destination ? { destination } : {}),
+        destination,
         flagIntent: {
           turnModel: 'claude-opus-4-7',
           turnEffort: 'high',

@@ -1,9 +1,13 @@
 /**
  * `create_agent` delivery-action handler.
  *
- * Spawns a new agent group on demand from the parent agent, wires bidirectional
- * agent_destinations rows, projects the new destination into the parent's
- * running container, and notifies the parent.
+ * SECURITY: spawning a new agent group is a host-level state change (creates
+ * a directory under groups/, inserts an agent_groups row, opens bidirectional
+ * agent_destinations grants, schedules memory tasks). Any tenant agent can
+ * call this — but allowing direct execution lets prompt injection in any
+ * tenant chat fan out unbounded child groups, each with its own credentials
+ * and recurring tasks. This handler now requests an owner/admin approval and
+ * the actual creation runs only on click via `applyCreateAgent`.
  */
 import fs from 'fs';
 import path from 'path';
@@ -17,6 +21,7 @@ import { readContainerConfig, updateContainerConfig } from '../../container-conf
 import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import type { AgentGroup, Session } from '../../types.js';
+import { requestApproval, type ApprovalHandler } from '../approvals/index.js';
 import { createDestination, getDestinationByName, normalizeName } from './db/agent-destinations.js';
 import { writeDestinations } from './write-destinations.js';
 import { bootstrapMemoryForGroup } from '../memory/bootstrap.js';
@@ -63,7 +68,7 @@ function orphanSuffix(folder: string, cleaned: boolean): string {
 }
 
 export async function handleCreateAgent(content: Record<string, unknown>, session: Session): Promise<void> {
-  const requestId = content.requestId as string;
+  const requestId = (content.requestId as string) || '';
   const name = content.name as string;
   const instructions = content.instructions as string | null;
   const provider = content.provider as string | undefined;
@@ -82,11 +87,53 @@ export async function handleCreateAgent(content: Record<string, unknown>, sessio
     await notifyAgent(session, 'create_agent failed: provider_config must be a plain object.');
     return;
   }
+  if (typeof name !== 'string' || name.trim() === '') {
+    await notifyAgent(session, 'create_agent failed: name must be a non-empty string.');
+    return;
+  }
 
   const sourceGroup = getAgentGroup(session.agent_group_id);
   if (!sourceGroup) {
     await notifyAgent(session, `create_agent failed: source agent group not found.`);
     log.warn('create_agent failed: missing source group', { sessionAgentGroup: session.agent_group_id, name });
+    return;
+  }
+
+  // SECURITY GATE: route through approval. The actual create runs in
+  // `applyCreateAgent` only after an owner/admin clicks Approve. Without
+  // this gate, prompt injection in any tenant chat could spawn unbounded
+  // child agent groups, each with its own credentials and recurring tasks.
+  const localPreview = normalizeName(name);
+  await requestApproval({
+    session,
+    agentName: sourceGroup.name,
+    action: 'create_agent',
+    payload: {
+      name,
+      localPreview,
+      instructions: instructions ?? null,
+      provider: provider ?? null,
+      providerConfig: providerConfig ?? null,
+      requestId,
+    },
+    title: 'Create New Agent',
+    question:
+      `Agent "${sourceGroup.name}" is requesting to create a new agent group "${name}". ` +
+      `This creates a new groups/ directory, inserts an agent_groups DB row, opens bidirectional ` +
+      `agent_destinations grants, and schedules memory tasks for the child. ` +
+      `Approve only if you initiated this — prompt injection in chat can otherwise spawn unbounded child groups.`,
+  });
+}
+
+export const applyCreateAgent: ApprovalHandler = async ({ session, payload, notify }) => {
+  const name = payload.name as string;
+  const instructions = (payload.instructions as string | null) ?? null;
+  const provider = (payload.provider as string | null) ?? undefined;
+  const providerConfig = (payload.providerConfig as Record<string, unknown> | null) ?? undefined;
+
+  const sourceGroup = getAgentGroup(session.agent_group_id);
+  if (!sourceGroup) {
+    await notify('create_agent approved but source agent group not found.');
     return;
   }
 
@@ -240,6 +287,4 @@ export async function handleCreateAgent(content: Record<string, unknown>, sessio
     `Agent "${localName}" created. You can now message it with <message to="${localName}">...</message>.`,
   );
   log.info('Agent group created', { agentGroupId, name, localName, folder, parent: sourceGroup.id });
-  // Note: requestId is unused — this is fire-and-forget, not request/response.
-  void requestId;
-}
+};

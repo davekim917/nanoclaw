@@ -59,6 +59,29 @@ export function findSessionByAgentGroup(agentGroupId: string): Session | undefin
     .get(agentGroupId) as Session | undefined;
 }
 
+/**
+ * Find an active threadless session scoped to a (agent_group_id,
+ * messaging_group_id) pair. Used by scheduleTask: tasks must run in the
+ * channel-root session, never inside a chat thread session — otherwise the
+ * task fires inside a thread container with that thread's history as context
+ * (and possibly a stopped container that never wakes for cron).
+ *
+ * `thread_id IS NULL` is the load-bearing filter. Without it, an existing
+ * chat-thread session for the same (agent, MG) pair will outrank the
+ * channel-root session because it's likely newer, and the task gets inserted
+ * into the wrong inbound.db.
+ */
+export function findSessionByAgentGroupAndMessagingGroup(
+  agentGroupId: string,
+  messagingGroupId: string,
+): Session | undefined {
+  return getDb()
+    .prepare(
+      "SELECT * FROM sessions WHERE agent_group_id = ? AND messaging_group_id = ? AND thread_id IS NULL AND status = 'active' ORDER BY created_at DESC LIMIT 1",
+    )
+    .get(agentGroupId, messagingGroupId) as Session | undefined;
+}
+
 export function getSessionsByAgentGroup(agentGroupId: string): Session[] {
   return getDb().prepare('SELECT * FROM sessions WHERE agent_group_id = ?').all(agentGroupId) as Session[];
 }

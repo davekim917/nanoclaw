@@ -31,6 +31,7 @@ import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContaine
 import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
+import { buildArchiveProjection, buildCentralProjection } from './db/per-agent-projections.js';
 import { initGroupFilesystem } from './group-init.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
@@ -592,22 +593,26 @@ function buildMounts(
     mounts.push({ hostPath: sharedClaudeMd, containerPath: '/app/CLAUDE.md', readonly: true });
   }
 
-  // Central message archive at /workspace/archive.db (read-only). Powers
-  // the search_threads + resolve_thread_link MCP tools (Phase 2.9/2.10).
-  // Separate file from v2.db so only message history is exposed — not
-  // privileged central state (pending_approvals, user_roles, etc.).
-  const archivePath = path.join(DATA_DIR, 'archive.db');
-  if (fs.existsSync(archivePath)) {
-    mounts.push({ hostPath: archivePath, containerPath: '/workspace/archive.db', readonly: true });
-  }
+  // Per-agent archive + central projections (NOT the global files).
+  //
+  // Mounting the global archive.db / v2.db cross-exposed every tenant's
+  // chat history and topology to every container — the container has shell +
+  // raw SQLite access at /workspace, so MCP filter-by-agent_group_id was
+  // advisory-only. A compromised agent could `sqlite3 /workspace/archive.db
+  // 'SELECT text FROM messages_archive WHERE agent_group_id = X'` for any X.
+  //
+  // Each container now gets a freshly-built projection containing ONLY rows
+  // for its own agent_group_id, regenerated on every spawn at
+  // data/v2-sessions/<ag>/<sess>/{archive,central}.db.
+  const archiveSrc = path.join(DATA_DIR, 'archive.db');
+  const archiveDst = path.join(sessionDir(agentGroup.id, session.id), 'archive.db');
+  buildArchiveProjection(archiveSrc, archiveDst, agentGroup.id);
+  mounts.push({ hostPath: archiveDst, containerPath: '/workspace/archive.db', readonly: true });
 
-  // Central DB at /workspace/central.db (read-only). Powers backlog + ship-log
-  // MCP tools so the container can list/query without going through delivery.
-  // Never write from the container — use system actions for mutations.
-  const centralDbPath = path.join(DATA_DIR, 'v2.db');
-  if (fs.existsSync(centralDbPath)) {
-    mounts.push({ hostPath: centralDbPath, containerPath: '/workspace/central.db', readonly: true });
-  }
+  const centralSrc = path.join(DATA_DIR, 'v2.db');
+  const centralDst = path.join(sessionDir(agentGroup.id, session.id), 'central.db');
+  buildCentralProjection(centralSrc, centralDst, agentGroup.id);
+  mounts.push({ hostPath: centralDst, containerPath: '/workspace/central.db', readonly: true });
 
   // Shared agent-runner source — read-only, same code for all groups.
   const agentRunnerSrc = path.join(projectRoot, 'container', 'agent-runner', 'src');

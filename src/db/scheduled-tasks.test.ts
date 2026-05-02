@@ -16,6 +16,14 @@ import { scheduleTask } from './scheduled-tasks.js';
 const TEST_DIR = '/tmp/nanoclaw-scheduled-tasks-test';
 const AGENT_GROUP_ID = 'ag-test-c1';
 const SESSION_ID = 'sess-test-c1';
+const MESSAGING_GROUP_ID = 'mg-test-c1';
+const TEST_PLATFORM_ID = 'discord:test:c1';
+const TEST_CHANNEL_TYPE = 'discord';
+const TEST_DESTINATION = {
+  platformId: TEST_PLATFORM_ID,
+  channelType: TEST_CHANNEL_TYPE,
+  threadId: null,
+};
 
 function agentSessionDir(sessionId = SESSION_ID): string {
   return path.join(TEST_DIR, 'v2-sessions', AGENT_GROUP_ID, sessionId);
@@ -37,6 +45,11 @@ function setupCentralDb(): void {
       name TEXT, is_group INTEGER DEFAULT 0, unknown_sender_policy TEXT NOT NULL DEFAULT 'strict',
       created_at TEXT NOT NULL, UNIQUE(channel_type, platform_id)
     );
+    CREATE TABLE IF NOT EXISTS messaging_group_agents (
+      id TEXT PRIMARY KEY, messaging_group_id TEXT NOT NULL, agent_group_id TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      UNIQUE(messaging_group_id, agent_group_id)
+    );
     CREATE TABLE IF NOT EXISTS sessions (
       id TEXT PRIMARY KEY, agent_group_id TEXT NOT NULL,
       messaging_group_id TEXT, thread_id TEXT, agent_provider TEXT,
@@ -45,14 +58,24 @@ function setupCentralDb(): void {
     );
     CREATE INDEX IF NOT EXISTS idx_sessions_agent_group ON sessions(agent_group_id);
   `);
+  // Seed the messaging group + wiring required by scheduleTask's destination
+  // validation. Each test runs with a clean DB via beforeEach.
+  db.prepare(
+    `INSERT INTO messaging_groups (id, channel_type, platform_id, name, created_at)
+     VALUES (?, ?, ?, 'test', datetime('now'))`,
+  ).run(MESSAGING_GROUP_ID, TEST_CHANNEL_TYPE, TEST_PLATFORM_ID);
+  db.prepare(
+    `INSERT INTO messaging_group_agents (id, messaging_group_id, agent_group_id, created_at)
+     VALUES ('mga-test-c1', ?, ?, datetime('now'))`,
+  ).run(MESSAGING_GROUP_ID, AGENT_GROUP_ID);
 }
 
 function seedActiveSession(sessionId = SESSION_ID): void {
   const db = getDb();
   db.prepare(
     `INSERT OR IGNORE INTO sessions (id, agent_group_id, messaging_group_id, thread_id, agent_provider, status, container_status, last_active, created_at)
-     VALUES (?, ?, NULL, NULL, NULL, 'active', 'stopped', NULL, datetime('now'))`,
-  ).run(sessionId, AGENT_GROUP_ID);
+     VALUES (?, ?, ?, NULL, NULL, 'active', 'stopped', NULL, datetime('now'))`,
+  ).run(sessionId, AGENT_GROUP_ID, MESSAGING_GROUP_ID);
 }
 
 function seedInboundDb(sessionId = SESSION_ID): void {
@@ -71,26 +94,63 @@ afterEach(() => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
 });
 
-// ── test_scheduleTask_no_messaging_group_param ──────────────────────────────
-describe('test_scheduleTask_no_messaging_group_param', () => {
-  it('TaskDef interface has no platformId or channelType field', () => {
-    // Compile-time check: if the TypeScript interface had platformId or
-    // channelType as required fields, this assignment would fail tsc.
-    // At runtime we verify the function is callable with a minimal def
-    // that has no platform fields.
-    const minimalDef = {
-      id: 'check',
-      agentGroupId: AGENT_GROUP_ID,
-      cron: '0 3 * * *',
-      processAfter: new Date(Date.now() + 86400000).toISOString(),
-      seriesId: 'check-series',
-      prompt: 'test',
-    };
-    // If TaskDef required platformId/channelType, TS would error here.
-    // We document this by confirming the keys are absent from the shape.
-    expect('platformId' in minimalDef).toBe(false);
-    expect('channelType' in minimalDef).toBe(false);
-    expect(scheduleTask).toBeTypeOf('function');
+// ── test_scheduleTask_rejects_unwired_destination ──────────────────────────
+describe('test_scheduleTask_rejects_unwired_destination', () => {
+  it('refuses to schedule when the agent group is not wired to the destination messaging group', async () => {
+    seedActiveSession();
+    seedInboundDb();
+
+    // Seed a messaging group that exists but is NOT wired to AGENT_GROUP_ID.
+    // This simulates the 2026-05-02 cross-tenant leak: a typo in agentGroupId
+    // would route the task into a chat the agent isn't authorized for.
+    const db = getDb();
+    db.prepare(
+      `INSERT INTO messaging_groups (id, channel_type, platform_id, name, created_at)
+       VALUES ('mg-unwired', 'discord', 'discord:test:unwired', 'unwired', datetime('now'))`,
+    ).run();
+
+    await expect(
+      scheduleTask(
+        {
+          id: 't-unwired',
+          agentGroupId: AGENT_GROUP_ID,
+          cron: '0 3 * * *',
+          processAfter: new Date(Date.now() + 86400000).toISOString(),
+          seriesId: 's-unwired',
+          prompt: 'should not schedule',
+          destination: {
+            platformId: 'discord:test:unwired',
+            channelType: 'discord',
+            threadId: null,
+          },
+        },
+        TEST_DIR,
+      ),
+    ).rejects.toThrow(/not wired/);
+  });
+
+  it('refuses to schedule when the destination messaging group does not exist', async () => {
+    seedActiveSession();
+    seedInboundDb();
+
+    await expect(
+      scheduleTask(
+        {
+          id: 't-missing-mg',
+          agentGroupId: AGENT_GROUP_ID,
+          cron: '0 3 * * *',
+          processAfter: new Date(Date.now() + 86400000).toISOString(),
+          seriesId: 's-missing-mg',
+          prompt: 'should not schedule',
+          destination: {
+            platformId: 'discord:test:does-not-exist',
+            channelType: 'discord',
+            threadId: null,
+          },
+        },
+        TEST_DIR,
+      ),
+    ).rejects.toThrow(/no messaging group/);
   });
 });
 
@@ -109,6 +169,7 @@ describe('test_scheduleTask_inserts_new', () => {
         processAfter,
         seriesId: 's1',
         prompt: 'do thing',
+        destination: TEST_DESTINATION,
       },
       TEST_DIR,
     );
@@ -144,6 +205,7 @@ describe('test_scheduleTask_idempotent', () => {
         cron: '0 3 * * *',
         processAfter: processAfter1,
         seriesId: 's-idempotent',
+        destination: TEST_DESTINATION,
         prompt: 'do thing',
       },
       TEST_DIR,
@@ -154,6 +216,7 @@ describe('test_scheduleTask_idempotent', () => {
         agentGroupId: AGENT_GROUP_ID,
         cron: '0 3 * * *',
         processAfter: processAfter2,
+        destination: TEST_DESTINATION,
         seriesId: 's-idempotent',
         prompt: 'do thing updated',
       },
@@ -187,6 +250,7 @@ describe('test_scheduleTask_does_not_resurrect_completed_row', () => {
         id: 'tcompleted',
         agentGroupId: AGENT_GROUP_ID,
         cron: '0 3 * * *',
+        destination: TEST_DESTINATION,
         processAfter: processAfter1,
         seriesId: 's-completed-history',
         prompt: 'first',
@@ -204,6 +268,7 @@ describe('test_scheduleTask_does_not_resurrect_completed_row', () => {
       {
         id: 'tnew',
         agentGroupId: AGENT_GROUP_ID,
+        destination: TEST_DESTINATION,
         cron: '0 4 * * *',
         processAfter: processAfter2,
         seriesId: 's-completed-history',
@@ -239,6 +304,7 @@ describe('test_scheduleTask_re_enable_after_cancel', () => {
     await scheduleTask(
       {
         id: 'tc1',
+        destination: TEST_DESTINATION,
         agentGroupId: AGENT_GROUP_ID,
         cron: '0 3 * * *',
         processAfter: new Date(Date.now() + 86400000).toISOString(),
@@ -260,6 +326,7 @@ describe('test_scheduleTask_re_enable_after_cancel', () => {
     const newProcessAfter = new Date(Date.now() + 172800000).toISOString();
     await scheduleTask(
       {
+        destination: TEST_DESTINATION,
         id: 'tc2',
         agentGroupId: AGENT_GROUP_ID,
         cron: '0 3 * * *',
@@ -295,15 +362,19 @@ describe('test_scheduleTask_resolves_session_when_missing', () => {
         processAfter,
         seriesId: 's3',
         prompt: 'created session',
+        destination: TEST_DESTINATION,
       },
       TEST_DIR,
     );
 
-    // A session row should now exist in the central DB.
+    // A session row should now exist in the central DB, scoped to the
+    // wired (agent_group_id, messaging_group_id) pair.
     const centralDb = getDb();
     const sessionRow = centralDb
-      .prepare("SELECT id FROM sessions WHERE agent_group_id = ? AND status = 'active' LIMIT 1")
-      .get(AGENT_GROUP_ID) as { id: string } | undefined;
+      .prepare(
+        "SELECT id FROM sessions WHERE agent_group_id = ? AND messaging_group_id = ? AND status = 'active' LIMIT 1",
+      )
+      .get(AGENT_GROUP_ID, MESSAGING_GROUP_ID) as { id: string } | undefined;
     expect(sessionRow).toBeDefined();
 
     // The inbound.db in the created session dir should have the task row.

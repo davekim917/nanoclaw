@@ -17,6 +17,8 @@
  * throw because the module isn't installed.
  */
 import { registerDeliveryAction } from '../../delivery.js';
-import { handleCreateAgent } from './create-agent.js';
+import { registerApprovalHandler } from '../approvals/index.js';
+import { applyCreateAgent, handleCreateAgent } from './create-agent.js';
 
 registerDeliveryAction('create_agent', handleCreateAgent);
+registerApprovalHandler('create_agent', applyCreateAgent);

@@ -1,8 +1,18 @@
 /**
  * scheduleTask — public API for inserting recurring tasks into a session's
- * inbound.db. Resolves the active session by agent_group_id only (drops the
- * messaging-group filter that was historically hard-coded to Discord MG).
- * Tasks belong to the agent group, not a specific messaging surface.
+ * inbound.db.
+ *
+ * Security model (post-2026-05-02 cross-tenant leak):
+ *   - `destination` is REQUIRED. A task with no chat destination would fall
+ *     back to "newest active session" of the agent group, which can land in
+ *     any messaging group wired to that agent — i.e., a typo in agentGroupId
+ *     or a misrouted task can silently leak into a different chat surface.
+ *   - The destination's messaging_group MUST be wired to the agent_group via
+ *     `messaging_group_agents`. If it isn't, scheduleTask refuses — this
+ *     catches the case where a task is wired to the wrong agent group (the
+ *     credential boundary).
+ *   - The session is resolved by (agent_group_id, messaging_group_id), never
+ *     by agent_group_id alone.
  *
  * Idempotent via series_id: re-running with the same seriesId UPDATEs the
  * existing row's cron + processAfter + content rather than inserting a
@@ -14,7 +24,8 @@ import path from 'path';
 import Database from 'better-sqlite3';
 
 import { DATA_DIR } from '../config.js';
-import { createSession, findSessionByAgentGroup } from './sessions.js';
+import { createSession, findSessionByAgentGroupAndMessagingGroup } from './sessions.js';
+import { getDb } from './connection.js';
 import { ensureSchema } from './session-db.js';
 import { nextEvenSeq } from './session-db.js';
 
@@ -27,13 +38,16 @@ export interface TaskDef {
   prompt: string;
   tz?: string;
   /**
-   * Where the task's chat output should land. Without this, the agent
-   * runner falls back to the session's home thread — which for
-   * non-DM agent groups is whichever thread happened to spawn the session.
-   * Pass the agent group's primary messaging-group platform_id with
-   * threadId=null to post in the parent channel.
+   * REQUIRED. Where the task's chat output lands AND the messaging group
+   * whose session the task is inserted into. The (agent_group_id,
+   * messaging_group_id) pair must already be wired via
+   * `messaging_group_agents` — scheduleTask refuses unwired pairs to prevent
+   * a misconfigured task from silently leaking into a chat the operator
+   * didn't authorize for that agent.
+   *
+   * Pass `threadId=null` to post in the parent channel.
    */
-  destination?: {
+  destination: {
     platformId: string;
     channelType: string;
     threadId: string | null;
@@ -78,15 +92,19 @@ function initStubSessionFolder(dataDir: string, agentGroupId: string, sessionId:
   ensureSchema(outboundPath, 'outbound');
 }
 
-async function resolveActiveSession(agentGroupId: string, dataDir: string): Promise<{ id: string }> {
-  const existing = findSessionByAgentGroup(agentGroupId);
+async function resolveActiveSession(
+  agentGroupId: string,
+  messagingGroupId: string,
+  dataDir: string,
+): Promise<{ id: string }> {
+  const existing = findSessionByAgentGroupAndMessagingGroup(agentGroupId, messagingGroupId);
   if (existing) return { id: existing.id };
 
   const sessionId = generateSessionId();
   createSession({
     id: sessionId,
     agent_group_id: agentGroupId,
-    messaging_group_id: null,
+    messaging_group_id: messagingGroupId,
     thread_id: null,
     agent_provider: null,
     status: 'active',
@@ -98,9 +116,42 @@ async function resolveActiveSession(agentGroupId: string, dataDir: string): Prom
   return { id: sessionId };
 }
 
+/**
+ * Resolve the messaging group from the task's destination and validate that
+ * the agent group is wired to it via `messaging_group_agents`. Throws if:
+ *   - no messaging group exists with that (platform_id, channel_type)
+ *   - the agent group is not wired to that messaging group (catches
+ *     misrouted tasks at the credential boundary)
+ *
+ * `destination` is required by `TaskDef`'s type — TypeScript prevents
+ * callers from omitting it; no runtime guard needed.
+ */
+function resolveAndValidateDestination(def: TaskDef): { messagingGroupId: string } {
+  const { platformId, channelType } = def.destination;
+  const db = getDb();
+  const mg = db
+    .prepare('SELECT id FROM messaging_groups WHERE platform_id = ? AND channel_type = ?')
+    .get(platformId, channelType) as { id: string } | undefined;
+  if (!mg) {
+    throw new Error(
+      `scheduleTask: no messaging group found for ${channelType}:${platformId} (task ${def.id}). The destination must reference an existing messaging group.`,
+    );
+  }
+  const wired = db
+    .prepare('SELECT 1 AS ok FROM messaging_group_agents WHERE agent_group_id = ? AND messaging_group_id = ?')
+    .get(def.agentGroupId, mg.id) as { ok: number } | undefined;
+  if (!wired) {
+    throw new Error(
+      `scheduleTask: agent group ${def.agentGroupId} is not wired to messaging group ${mg.id} (${channelType}:${platformId}). Refusing to schedule task ${def.id} — this would route output to a chat the agent isn't authorized for. Wire the messaging group via messaging_group_agents first, or correct the agentGroupId.`,
+    );
+  }
+  return { messagingGroupId: mg.id };
+}
+
 export async function scheduleTask(def: TaskDef, _dataDir?: string): Promise<void> {
   const dataDir = _dataDir ?? DATA_DIR;
-  const session = await resolveActiveSession(def.agentGroupId, dataDir);
+  const { messagingGroupId } = resolveAndValidateDestination(def);
+  const session = await resolveActiveSession(def.agentGroupId, messagingGroupId, dataDir);
   const inboundDbPath = path.join(dataDir, 'v2-sessions', def.agentGroupId, session.id, 'inbound.db');
 
   const db = new Database(inboundDbPath);
@@ -118,9 +169,9 @@ export async function scheduleTask(def: TaskDef, _dataDir?: string): Promise<voi
       .prepare("SELECT id FROM messages_in WHERE series_id = ? AND status IN ('pending', 'paused')")
       .get(def.seriesId) as { id: string } | undefined;
 
-    const platformId = def.destination?.platformId ?? null;
-    const channelType = def.destination?.channelType ?? null;
-    const threadId = def.destination?.threadId ?? null;
+    const platformId = def.destination.platformId;
+    const channelType = def.destination.channelType;
+    const threadId = def.destination.threadId;
 
     if (activeRow) {
       db.prepare(
