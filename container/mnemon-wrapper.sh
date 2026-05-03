@@ -16,15 +16,32 @@ fi
 
 SUBCOMMAND="${1:-}"
 
+# `gc` is dual-mode: default suggest mode reads the store and lists candidates,
+# while `--keep` boosts an insight's retention (a write). Detect once and reuse
+# below for both the read-only gate and the dispatch path.
+GC_IS_WRITE=0
+if [[ "$SUBCOMMAND" == "gc" ]]; then
+  for arg in "$@"; do
+    if [[ "$arg" == "--keep" || "$arg" == --keep=* ]]; then
+      GC_IS_WRITE=1
+      break
+    fi
+  done
+fi
+
 # MNEMON_READ_ONLY=1: reject write subcommands so daemon-only writes are enforced.
-# Read-path subcommands (recall, status, etc.) pass through unaffected.
+# Read-path subcommands (recall, status, gc-suggest, etc.) pass through unaffected.
 if [[ "${MNEMON_READ_ONLY:-}" == "1" ]]; then
   case "$SUBCOMMAND" in
-    remember|forget|link|embed|gc|store|setup)
+    remember|forget|link|embed|store|setup)
       echo "mnemon-wrapper: write subcommand '${SUBCOMMAND}' is rejected in read-only mode (MNEMON_READ_ONLY=1)" >&2
       exit 2
       ;;
   esac
+  if [[ "$SUBCOMMAND" == "gc" && "$GC_IS_WRITE" == "1" ]]; then
+    echo "mnemon-wrapper: 'gc --keep' is rejected in read-only mode (MNEMON_READ_ONLY=1); 'mnemon gc' suggest mode is allowed" >&2
+    exit 2
+  fi
 fi
 
 # Reject any user-supplied --store argument that doesn't match MNEMON_STORE. Combined with the
@@ -56,7 +73,23 @@ case "$SUBCOMMAND" in
     exec /usr/local/bin/mnemon-real "$@"
     ;;
 
-  remember|link|forget|embed|gc)
+  gc)
+    if [[ "$GC_IS_WRITE" == "1" ]]; then
+      LOCK_PATH="${HOME}/.mnemon/data/${STORE}/.write.lock"
+      mkdir -p "$(dirname "$LOCK_PATH")"
+      if ! flock -w "$FLOCK_TIMEOUT" "$LOCK_PATH" /usr/local/bin/mnemon-real "$@"; then
+        rc=$?
+        if [[ "$rc" == "1" ]]; then
+          echo "mnemon-wrapper: flock timeout after ${FLOCK_TIMEOUT}s on ${LOCK_PATH}" >&2
+        fi
+        exit "$rc"
+      fi
+    else
+      exec /usr/local/bin/mnemon-real "$@"
+    fi
+    ;;
+
+  remember|link|forget|embed)
     LOCK_PATH="${HOME}/.mnemon/data/${STORE}/.write.lock"
     mkdir -p "$(dirname "$LOCK_PATH")"
     if ! flock -w "$FLOCK_TIMEOUT" "$LOCK_PATH" /usr/local/bin/mnemon-real "$@"; then
