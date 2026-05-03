@@ -84,7 +84,9 @@ Walk wiki/ and check for:
 - Concept gaps (repeated topic across multiple pages with no dedicated concept page)
 - Index drift (pages on disk not in index.md, or index entries pointing at deleted files)
 
-REPORT DISCIPLINE: report findings to the parent channel FIRST and wait for the user's go-ahead before fixing anything. Do not fix silently. If zero findings, complete the turn silently — no chat reply. If findings exist, post ONE structured summary listing the categories with counts and a brief example of each, then wait. Once the user approves, fix the findings and append a single audit entry to wiki/log.md.`;
+FIX-FIRST DISCIPLINE: do not ask permission. Fix every finding you discover in this pass, then report what you fixed. Do not split the work into "small portion now, more later" — the operator has standing approval for full cleanup. Append a single audit entry to wiki/log.md covering everything fixed.
+
+REPORT DISCIPLINE: if zero findings, complete the turn silently — no chat reply. If you fixed findings, post ONE concise summary line listing what was fixed (e.g. "Fixed 3 contradictions, removed 2 orphan pages, added 4 missing cross-references, reconciled index drift on 1 page."). Do not narrate, do not list every page individually, do not ask for further approval.`;
 
 export interface BootstrapResult {
   step1_sourcesDirsCreated: boolean;
