@@ -102,6 +102,17 @@ export interface ContainerConfig {
   excludeMcpServers?: string[];
 
   /**
+   * When true, mount the host `~/.codex` directory into the container as
+   * read-only so the Codex CLI can use the host's OAuth session. SECURITY:
+   * any in-container code with shell access can read the OAuth token; a
+   * compromised agent could exfiltrate it. Default OFF — opt in only for
+   * groups that specifically need Codex host auth (e.g., the Codex agent
+   * provider, /codex:rescue use cases). Pre-2026-05-03 the mount was
+   * unconditional and RW; the cross-tenant audit forced it opt-in + RO.
+   */
+  codexHostAuth?: boolean;
+
+  /**
    * When true, sets `GITNEXUS_INJECT_AGENTS_MD=true` in the container so
    * GitNexus auto-injects AGENTS.md into repos the agent works on.
    */
@@ -182,11 +193,19 @@ function emptyConfig(): ContainerConfig {
   // initial container.json carries the flag so the daemon picks it up on
   // its next 60s sweep, and the container's MNEMON_STORE env gets set on
   // first spawn so memory-capture hooks are wired without an extra step.
+  //
+  // tools defaults to `[]` (default-deny) for new groups so a child
+  // spawned via create_agent doesn't inherit every credential surface
+  // (snowflake, gws, aws, dbt, etc.). Operators add tool entries to
+  // explicitly grant credential access. Pre-2026-05-03 this field was
+  // omitted, which made `isToolEnabled()` allow every tool — pairing
+  // dangerously with create_agent. See cross-tenant audit.
   return {
     mcpServers: {},
     packages: { apt: [], npm: [] },
     additionalMounts: [],
     skills: 'all',
+    tools: [],
     memory: { enabled: true },
   };
 }
@@ -222,6 +241,7 @@ export function readContainerConfig(folder: string): ContainerConfig {
       maxMessagesPerPrompt: raw.maxMessagesPerPrompt,
       githubTokenEnv: raw.githubTokenEnv,
       excludePlugins: raw.excludePlugins,
+      codexHostAuth: raw.codexHostAuth,
       excludeMcpServers: raw.excludeMcpServers,
       gitnexusInjectAgentsMd: raw.gitnexusInjectAgentsMd,
       ollamaAdminTools: raw.ollamaAdminTools,

@@ -13,17 +13,33 @@
  * core iterates handlers and the first one to return `true` claims the response.
  */
 import { wakeContainer } from '../../container-runner.js';
+import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { deletePendingApproval, getPendingApproval, getSession } from '../../db/sessions.js';
 import type { ResponsePayload } from '../../response-registry.js';
 import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
-import type { PendingApproval } from '../../types.js';
+import type { PendingApproval, Session } from '../../types.js';
 import { ONECLI_ACTION, resolveOneCLIApproval } from './onecli-approvals.js';
-import { getApprovalHandler } from './primitive.js';
+import { getApprovalHandler, pickApprover } from './primitive.js';
+
+/**
+ * Detect whether this approval was delivered into the session's own thread/
+ * channel (deliveryTarget='thread') vs DM'd to an admin (deliveryTarget='admin').
+ * Compares the approval row's stored destination against the session's
+ * messaging group. Thread-target cards live in the originating chat, where
+ * thread access IS the approval authority — see primitive.ts. Admin-target
+ * cards require clicker-identity verification against pickApprover.
+ */
+function isThreadDelivery(approval: PendingApproval, session: Session): boolean {
+  if (!session.messaging_group_id) return false;
+  const mg = getMessagingGroup(session.messaging_group_id);
+  if (!mg) return false;
+  return approval.channel_type === mg.channel_type && approval.platform_id === mg.platform_id;
+}
 
 export async function handleApprovalsResponse(payload: ResponsePayload): Promise<boolean> {
   // OneCLI credential approvals — resolved via in-memory Promise first.
-  if (resolveOneCLIApproval(payload.questionId, payload.value)) {
+  if (resolveOneCLIApproval(payload.questionId, payload.value, payload.userId ?? '')) {
     return true;
   }
 
@@ -68,6 +84,28 @@ async function handleRegisteredApproval(
       content: JSON.stringify({ text, sender: 'system', senderId: 'system' }),
     });
   };
+
+  // SECURITY (cross-tenant audit 2026-05-03): for admin-target cards, verify
+  // the clicker is in pickApprover's set. The card is DM'd to a specific
+  // admin so practically only they see it, but defense-in-depth: reject any
+  // click from outside the approver set (handles DM cache poisoning,
+  // unintended forwards, multi-admin compromise where one admin's session
+  // is stolen). For thread-target cards, thread access IS the approval
+  // authority — see primitive.ts comment block.
+  if (!isThreadDelivery(approval, session)) {
+    const approvers = pickApprover(session.agent_group_id);
+    if (userId && !approvers.includes(userId)) {
+      log.warn('Approval click rejected: clicker not in approver set', {
+        approvalId: approval.approval_id,
+        action: approval.action,
+        userId,
+        approvers,
+      });
+      await notify(`Your ${approval.action} click was rejected — clicker is not an authorized approver.`);
+      // Don't delete the row; let it expire or another approver retry.
+      return;
+    }
+  }
 
   if (selectedOption !== 'approve') {
     await notify(`Your ${approval.action} request was rejected by admin.`);

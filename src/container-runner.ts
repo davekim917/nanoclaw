@@ -689,17 +689,18 @@ function buildMounts(
       });
     }
 
-    if (!excluded.has('codex') && entries.includes('codex')) {
-      // Skip if the active provider's container-config already mounts
-      // /home/node/.codex (e.g., the codex agent provider mounts a per-session
-      // copy of auth.json). Otherwise Docker errors with "Duplicate mount
-      // point: /home/node/.codex" and the container fails to start with
-      // exit code 125.
+    // Host ~/.codex mount: opt-in via container.json `codexHostAuth: true`.
+    // Token-theft surface — any in-container shell can read the OAuth token
+    // from the mounted directory. Default OFF since 2026-05-03 audit. RO
+    // when enabled (Codex CLI's token-refresh path requires RW; if a group
+    // needs RW for refresh, add the mount via additionalMounts under the
+    // operator's explicit allowlist instead).
+    if (containerConfig.codexHostAuth === true && !excluded.has('codex') && entries.includes('codex')) {
       const providerHasCodexMount = providerContribution.mounts?.some((m) => m.containerPath === '/home/node/.codex');
       if (!providerHasCodexMount) {
         const hostCodex = path.join(os.homedir(), '.codex');
         if (fs.existsSync(hostCodex)) {
-          mounts.push({ hostPath: hostCodex, containerPath: '/home/node/.codex', readonly: false });
+          mounts.push({ hostPath: hostCodex, containerPath: '/home/node/.codex', readonly: true });
         }
       }
     }
@@ -1408,16 +1409,25 @@ async function buildContainerArgs(
   }
 
   // Folder-scoped verbatim env vars: pass through env vars whose name starts
-  // with a known prefix AND whose name includes the folder token. These are
-  // raw connection strings (RENDER_PG_URL_ILLYSIUM_ILLYSE_MAIN, etc.) that
-  // don't collapse to a base name — the agent uses the full name as-is.
-  // Gate on folder to keep cross-group data access from leaking.
+  // with a known prefix AND whose post-prefix tail starts with the folder
+  // token followed by `_` or end-of-string. These are raw connection strings
+  // (RENDER_PG_URL_ILLYSIUM_ILLYSE_MAIN, etc.) that don't collapse to a base
+  // name — the agent uses the full name as-is. Gate on folder to keep
+  // cross-group data access from leaking.
+  //
+  // SECURITY (cross-tenant audit 2026-05-03): the previous check used
+  // `includes('_<TOK>_')`, which let folder=axie inherit AXIE_DEV_* vars
+  // (substring overlap with axie-dev). The strict prefix-anchored match
+  // here, combined with the folder-name collision check at create_agent
+  // time, eliminates the ambiguity.
   const folderTok = agentGroup.folder.toUpperCase().replace(/-/g, '_');
   const verbatimPrefixes = ['RENDER_PG_', 'RENDER_REDIS_URL_'];
   for (const [k, v] of Object.entries(process.env)) {
     if (!v) continue;
-    if (!verbatimPrefixes.some((p) => k.startsWith(p))) continue;
-    if (!k.includes(`_${folderTok}_`) && !k.endsWith(`_${folderTok}`)) continue;
+    const matchedPrefix = verbatimPrefixes.find((p) => k.startsWith(p));
+    if (!matchedPrefix) continue;
+    const tail = k.slice(matchedPrefix.length);
+    if (tail !== folderTok && !tail.startsWith(`${folderTok}_`)) continue;
     args.push('-e', `${k}=${v}`);
   }
 

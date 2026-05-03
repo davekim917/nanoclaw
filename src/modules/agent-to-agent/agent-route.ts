@@ -23,6 +23,7 @@ import path from 'path';
 
 import { isSafeAttachmentName } from '../../attachment-safety.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
+import { getDb } from '../../db/connection.js';
 import { getSession } from '../../db/sessions.js';
 import { wakeContainer } from '../../container-runner.js';
 import { log } from '../../log.js';
@@ -128,10 +129,45 @@ export async function routeAgentMessage(msg: RoutableAgentMessage, session: Sess
   // in agent-shared mode), fall back to agent-shared on the target so we
   // still find/reuse the existing session instead of leaking a fresh one
   // per call.
+  //
+  // SECURITY (cross-tenant audit 2026-05-03): only inherit the caller's
+  // messaging_group_id when the target agent is ALSO wired to it via
+  // messaging_group_agents. Without this gate, an A2A message from tenant A
+  // would create a target-side session linked to A's chat, and a default
+  // `send_message` from the target (no `to` argument) would post into A's
+  // chat — bypassing the wiring ACL. When the target isn't wired, fall back
+  // to agent-shared mode so the target session has no inherited chat
+  // surface. Self-sends (target == source) are exempt from this check.
   const callerMgId = session.messaging_group_id;
   const callerThreadId = session.thread_id;
-  const targetMode: 'per-thread' | 'agent-shared' = callerMgId ? 'per-thread' : 'agent-shared';
-  const { session: targetSession } = resolveSession(targetAgentGroupId, callerMgId, callerThreadId, targetMode);
+  let inheritMg = false;
+  if (callerMgId && targetAgentGroupId !== session.agent_group_id) {
+    const wired = getDb()
+      .prepare(
+        'SELECT 1 AS ok FROM messaging_group_agents WHERE agent_group_id = ? AND messaging_group_id = ?',
+      )
+      .get(targetAgentGroupId, callerMgId) as { ok: number } | undefined;
+    inheritMg = !!wired;
+    if (!inheritMg) {
+      log.info('agent-route: target not wired to caller mg — using agent-shared session', {
+        from: session.agent_group_id,
+        to: targetAgentGroupId,
+        callerMgId,
+      });
+    }
+  } else if (targetAgentGroupId === session.agent_group_id) {
+    // Self-send: keep caller's threading.
+    inheritMg = !!callerMgId;
+  }
+  const effectiveMgId = inheritMg ? callerMgId : null;
+  const effectiveThreadId = inheritMg ? callerThreadId : null;
+  const targetMode: 'per-thread' | 'agent-shared' = effectiveMgId ? 'per-thread' : 'agent-shared';
+  const { session: targetSession } = resolveSession(
+    targetAgentGroupId,
+    effectiveMgId,
+    effectiveThreadId,
+    targetMode,
+  );
   const a2aMsgId = `a2a-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
   // If the source message references files (via `send_file`), forward the

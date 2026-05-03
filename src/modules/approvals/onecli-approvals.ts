@@ -41,6 +41,8 @@ const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
 interface PendingState {
   resolve: (decision: Decision) => void;
   timer: NodeJS.Timeout;
+  /** User IDs allowed to approve/deny this card. Empty = legacy / no check. */
+  approverUserIds: string[];
 }
 
 const pending = new Map<string, PendingState>();
@@ -65,9 +67,26 @@ function shortApprovalId(): string {
 }
 
 /** Called from the approvals response handler when a card button is clicked. */
-export function resolveOneCLIApproval(approvalId: string, selectedOption: string): boolean {
+export function resolveOneCLIApproval(approvalId: string, selectedOption: string, userId: string): boolean {
   const state = pending.get(approvalId);
   if (!state) return false;
+
+  // SECURITY (cross-tenant audit 2026-05-03): require the clicker to be in
+  // the approver set for the originating agent group. OneCLI credential
+  // approvals are gated material — without this check, anyone whose userId
+  // arrives via a forwarded/poisoned DM could approve a tenant's
+  // credentialed call. Empty userId (legacy adapters that don't carry it)
+  // falls through with a warning rather than blocking, since legacy
+  // installs predate userId propagation.
+  if (state.approverUserIds.length > 0 && userId && !state.approverUserIds.includes(userId)) {
+    log.warn('OneCLI approval click rejected: clicker not in approver set', {
+      approvalId,
+      userId,
+      approvers: state.approverUserIds,
+    });
+    return false;
+  }
+
   pending.delete(approvalId);
   clearTimeout(state.timer);
 
@@ -78,7 +97,7 @@ export function resolveOneCLIApproval(approvalId: string, selectedOption: string
   deletePendingApproval(approvalId);
 
   state.resolve(decision);
-  log.info('OneCLI approval resolved', { approvalId, decision });
+  log.info('OneCLI approval resolved', { approvalId, decision, userId });
   return true;
 }
 
@@ -210,7 +229,7 @@ async function handleRequest(request: ApprovalRequest): Promise<Decision> {
       resolve('deny');
     }, timeoutMs);
 
-    pending.set(approvalId, { resolve, timer });
+    pending.set(approvalId, { resolve, timer, approverUserIds: approvers });
   });
 }
 

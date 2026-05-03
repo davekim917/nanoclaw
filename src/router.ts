@@ -56,49 +56,81 @@ import type { InboundEvent } from './channels/adapter.js';
  * Picks the agent_group with the most wirings in-scope (breaks ties by first
  * match). The caller creates the messaging_group_agents row using this id.
  */
+/**
+ * Channel types that embed a workspace/guild identifier strong enough to make
+ * "first agent wired in this scope wins" auto-wire safe. Other adapters
+ * (Telegram, WhatsApp, Webex, etc.) don't have a tenant-scoped identifier
+ * baked into the channel_type, so a fresh chat from an unrelated tenant
+ * would auto-claim the wrong agent. Those fall through to the approval gate.
+ */
+function adapterHasWorkspaceIdentity(channelType: string): boolean {
+  // Discord: handled separately (guild id parsed from platform_id).
+  if (channelType === 'discord') return true;
+  // Slack channel types are stamped with the workspace suffix
+  // ("slack-<workspace>"); bare "slack" without suffix is ambiguous.
+  if (channelType.startsWith('slack-')) return true;
+  // GitHub repo and Linear team are workspace-scoped via their adapter's
+  // channel_type suffix convention (`github-<owner>-<repo>`, `linear-<team>`).
+  if (channelType.startsWith('github-')) return true;
+  if (channelType.startsWith('linear-')) return true;
+  return false;
+}
+
 function inheritedAgentGroupFor(mg: MessagingGroup): { id: string; sourceMessagingGroupId: string } | null {
   const db = getDb();
-  let row: { agent_group_id: string; messaging_group_id: string } | undefined;
+  let rows: Array<{ agent_group_id: string; messaging_group_id: string; cnt: number }>;
 
   if (mg.channel_type === 'discord' && mg.platform_id.startsWith('discord:')) {
     const guildId = mg.platform_id.split(':')[1];
     if (!guildId) return null;
-    // Scope by guild — match any messaging_group in this Discord guild that
-    // already has a wired agent. LIKE prefix is safe here because guildId is
-    // a Discord snowflake (digits-only) and the prefix is fully anchored.
-    row = db
+    rows = db
       .prepare(
-        `SELECT mga.agent_group_id, mga.messaging_group_id
+        `SELECT mga.agent_group_id, MIN(mga.messaging_group_id) AS messaging_group_id, COUNT(*) AS cnt
          FROM messaging_group_agents mga
          JOIN messaging_groups m ON m.id = mga.messaging_group_id
          WHERE m.channel_type = 'discord'
            AND m.platform_id LIKE ?
            AND m.id != ?
          GROUP BY mga.agent_group_id
-         ORDER BY COUNT(*) DESC, MIN(m.created_at) ASC
-         LIMIT 1`,
+         ORDER BY COUNT(*) DESC, MIN(m.created_at) ASC`,
       )
-      .get(`discord:${guildId}:%`, mg.id) as typeof row;
-  } else {
-    // Slack's channel_type already carries the workspace suffix (e.g.
-    // "slack-illysium"); bare match is enough. Same for any other adapter
-    // that embeds workspace identity in channel_type.
-    row = db
+      .all(`discord:${guildId}:%`, mg.id) as typeof rows;
+  } else if (adapterHasWorkspaceIdentity(mg.channel_type)) {
+    rows = db
       .prepare(
-        `SELECT mga.agent_group_id, mga.messaging_group_id
+        `SELECT mga.agent_group_id, MIN(mga.messaging_group_id) AS messaging_group_id, COUNT(*) AS cnt
          FROM messaging_group_agents mga
          JOIN messaging_groups m ON m.id = mga.messaging_group_id
          WHERE m.channel_type = ?
            AND m.id != ?
          GROUP BY mga.agent_group_id
-         ORDER BY COUNT(*) DESC, MIN(m.created_at) ASC
-         LIMIT 1`,
+         ORDER BY COUNT(*) DESC, MIN(m.created_at) ASC`,
       )
-      .get(mg.channel_type, mg.id) as typeof row;
+      .all(mg.channel_type, mg.id) as typeof rows;
+  } else {
+    // Adapter without workspace identity — refuse auto-wire. Falls through
+    // to the operator approval gate (channel-registration). Without this
+    // guard, the first Telegram chat from any tenant would auto-claim the
+    // agent already wired for a different Telegram chat (cross-tenant).
+    log.info('auto-wire refused: adapter has no workspace identity', { channelType: mg.channel_type });
+    return null;
   }
 
-  if (!row) return null;
-  return { id: row.agent_group_id, sourceMessagingGroupId: row.messaging_group_id };
+  if (rows.length === 0) return null;
+  // SECURITY: refuse auto-wire when the workspace/guild has wirings to
+  // multiple distinct agent groups. The original "most existing wirings
+  // wins" heuristic would let the wrong tenant's agent claim a freshly
+  // created channel intended for another tenant — falls through to the
+  // operator approval gate instead.
+  if (rows.length > 1) {
+    log.info('auto-wire refused: workspace has wirings to multiple agent groups', {
+      channelType: mg.channel_type,
+      platformId: mg.platform_id,
+      candidates: rows.map((r) => r.agent_group_id),
+    });
+    return null;
+  }
+  return { id: rows[0].agent_group_id, sourceMessagingGroupId: rows[0].messaging_group_id };
 }
 
 function generateId(): string {

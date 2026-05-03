@@ -13,7 +13,8 @@ import fs from 'fs';
 import path from 'path';
 
 import { GROUPS_DIR } from '../../config.js';
-import { createAgentGroup, getAgentGroup, getAgentGroupByFolder } from '../../db/agent-groups.js';
+import { createAgentGroup, getAgentGroup, getAgentGroupByFolder, getAllAgentGroups } from '../../db/agent-groups.js';
+import { getDb } from '../../db/connection.js';
 import { getSession } from '../../db/sessions.js';
 import { wakeContainer } from '../../container-runner.js';
 import { initGroupFilesystem } from '../../group-init.js';
@@ -145,12 +146,58 @@ export const applyCreateAgent: ApprovalHandler = async ({ session, payload, noti
     return;
   }
 
-  // Derive a safe folder name, deduplicated globally across agent_groups.folder
+  // SECURITY (cross-tenant audit 2026-05-03): cap children per parent. Even
+  // with admin approval, an attacker can social-engineer one approval per
+  // request — bounding total children per parent prevents resource
+  // exhaustion + persistent-foothold accumulation.
+  const CHILDREN_PER_PARENT_CAP = 10;
+  const childCount = (
+    getDb()
+      .prepare("SELECT COUNT(*) AS c FROM agent_destinations WHERE agent_group_id = ? AND target_type = 'agent'")
+      .get(sourceGroup.id) as { c: number }
+  ).c;
+  if (childCount >= CHILDREN_PER_PARENT_CAP) {
+    await notifyAgent(
+      session,
+      `Cannot create agent "${name}": parent agent "${sourceGroup.name}" has reached the child-agent cap (${CHILDREN_PER_PARENT_CAP}). Manually delete unused children before creating more.`,
+    );
+    log.warn('create_agent: child cap reached', { parent: sourceGroup.id, childCount });
+    return;
+  }
+
+  // Derive a safe folder name, deduplicated globally across agent_groups.folder.
+  // Name-squatting is mitigated by the approval gate (operator sees the
+  // requested name in the card) rather than by mandatory parent prefix —
+  // forcing a parent-folder prefix breaks scoped-env token boundaries
+  // (e.g. PARENT_FOLDER__CHILD's tokens overlap with PARENT_FOLDER_*).
   let folder = localName;
   let suffix = 2;
   while (getAgentGroupByFolder(folder)) {
     folder = `${localName}-${suffix}`;
     suffix++;
+  }
+
+  // SECURITY (cross-tenant audit 2026-05-03): folder-name prefix collision
+  // would let scoped-env env-var matching cross-leak (e.g. folder=axie
+  // inheriting AXIE_DEV_* vars from folder=axie-dev). Normalize tokens and
+  // refuse if any existing folder's token is a prefix of this one or vice
+  // versa.
+  const newTok = folder.toUpperCase().replace(/-/g, '_');
+  for (const existing of getAllAgentGroups()) {
+    if (existing.folder === folder) continue;
+    const existTok = existing.folder.toUpperCase().replace(/-/g, '_');
+    if (
+      newTok === existTok ||
+      newTok.startsWith(existTok + '_') ||
+      existTok.startsWith(newTok + '_')
+    ) {
+      await notifyAgent(
+        session,
+        `Cannot create agent "${name}": folder "${folder}" collides with existing folder "${existing.folder}" under scoped-env token boundaries. Pick a different name.`,
+      );
+      log.warn('create_agent: folder token collision', { newFolder: folder, existing: existing.folder });
+      return;
+    }
   }
 
   const groupPath = path.join(GROUPS_DIR, folder);
