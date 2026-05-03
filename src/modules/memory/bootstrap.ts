@@ -72,7 +72,7 @@ READ FACTS IN FULL — DO NOT SKIM. Before writing or updating any wiki page, ru
 
 If two facts contradict, surface both rather than silently picking one. If a fact contains a parenthetical alias or definition not corroborated in other facts, treat it skeptically — it may be a classifier confabulation that should not be promoted into the wiki.
 
-REPORT DISCIPLINE: at the end of the task, if you made ZERO new pages and ZERO updates to existing pages, do not send any chat reply — complete the turn silently. Otherwise, send ONE concise line summarising what changed (e.g. "Updated 2 entity pages, created 1 timeline page."). Do not narrate the work, do not list every page touched, and do not send a status update if nothing meaningful happened.`;
+REPORT DISCIPLINE: if you made ZERO new pages and ZERO updates to existing pages, the chat reply is EMPTY. Send nothing. Produce no text. Do not announce that you are being silent. Do not post "no-op logged", "mnemon empty", "nothing to compile", "wiki directories are empty", "per discipline completing silently", or any other meta-explanation of why nothing happened — those are still chat messages and they are noise. The wiki/log.md entry is the only record of the no-op run. Posting any meta-comment is a rule violation. Otherwise (if real changes were made), send ONE concise line summarising what changed (e.g. "Updated 2 entity pages, created 1 timeline page."). Do not narrate the work, do not list every page touched.`;
 
 const LINT_PROMPT = `Run wiki lint per the lint section of /app/container/skills/wiki/SKILL.md.
 
@@ -86,7 +86,7 @@ Walk wiki/ and check for:
 
 FIX-FIRST DISCIPLINE: do not ask permission. Fix every finding you discover in this pass, then report what you fixed. Do not split the work into "small portion now, more later" — the operator has standing approval for full cleanup. Append a single audit entry to wiki/log.md covering everything fixed.
 
-REPORT DISCIPLINE: if zero findings, complete the turn silently — no chat reply. If you fixed findings, post ONE concise summary line listing what was fixed (e.g. "Fixed 3 contradictions, removed 2 orphan pages, added 4 missing cross-references, reconciled index drift on 1 page."). Do not narrate, do not list every page individually, do not ask for further approval.`;
+REPORT DISCIPLINE: if zero findings, the chat reply is EMPTY. Send nothing. Produce no text. Do not announce that you are being silent. Do not post "no findings", "wiki is clean", "nothing to fix", "per discipline completing silently", or any other meta-explanation of why nothing happened — those are still chat messages and they are noise. Posting any meta-comment is a rule violation. If you fixed findings, post ONE concise summary line listing what was fixed (e.g. "Fixed 3 contradictions, removed 2 orphan pages, added 4 missing cross-references, reconciled index drift on 1 page."). Do not narrate, do not list every page individually, do not ask for further approval.`;
 
 export interface BootstrapResult {
   step1_sourcesDirsCreated: boolean;
