@@ -143,9 +143,7 @@ export async function routeAgentMessage(msg: RoutableAgentMessage, session: Sess
   let inheritMg = false;
   if (callerMgId && targetAgentGroupId !== session.agent_group_id) {
     const wired = getDb()
-      .prepare(
-        'SELECT 1 AS ok FROM messaging_group_agents WHERE agent_group_id = ? AND messaging_group_id = ?',
-      )
+      .prepare('SELECT 1 AS ok FROM messaging_group_agents WHERE agent_group_id = ? AND messaging_group_id = ?')
       .get(targetAgentGroupId, callerMgId) as { ok: number } | undefined;
     inheritMg = !!wired;
     if (!inheritMg) {
@@ -162,12 +160,7 @@ export async function routeAgentMessage(msg: RoutableAgentMessage, session: Sess
   const effectiveMgId = inheritMg ? callerMgId : null;
   const effectiveThreadId = inheritMg ? callerThreadId : null;
   const targetMode: 'per-thread' | 'agent-shared' = effectiveMgId ? 'per-thread' : 'agent-shared';
-  const { session: targetSession } = resolveSession(
-    targetAgentGroupId,
-    effectiveMgId,
-    effectiveThreadId,
-    targetMode,
-  );
+  const { session: targetSession } = resolveSession(targetAgentGroupId, effectiveMgId, effectiveThreadId, targetMode);
   const a2aMsgId = `a2a-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
   // If the source message references files (via `send_file`), forward the

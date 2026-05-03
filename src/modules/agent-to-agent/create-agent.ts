@@ -186,11 +186,7 @@ export const applyCreateAgent: ApprovalHandler = async ({ session, payload, noti
   for (const existing of getAllAgentGroups()) {
     if (existing.folder === folder) continue;
     const existTok = existing.folder.toUpperCase().replace(/-/g, '_');
-    if (
-      newTok === existTok ||
-      newTok.startsWith(existTok + '_') ||
-      existTok.startsWith(newTok + '_')
-    ) {
+    if (newTok === existTok || newTok.startsWith(existTok + '_') || existTok.startsWith(newTok + '_')) {
       await notifyAgent(
         session,
         `Cannot create agent "${name}": folder "${folder}" collides with existing folder "${existing.folder}" under scoped-env token boundaries. Pick a different name.`,

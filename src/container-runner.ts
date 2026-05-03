@@ -690,17 +690,18 @@ function buildMounts(
     }
 
     // Host ~/.codex mount: opt-in via container.json `codexHostAuth: true`.
-    // Token-theft surface — any in-container shell can read the OAuth token
-    // from the mounted directory. Default OFF since 2026-05-03 audit. RO
-    // when enabled (Codex CLI's token-refresh path requires RW; if a group
-    // needs RW for refresh, add the mount via additionalMounts under the
-    // operator's explicit allowlist instead).
+    // RW because the Codex CLI rewrites auth.json on token refresh — RO
+    // breaks long-running sessions when access tokens expire. Token-theft
+    // risk is unchanged regardless of RO/RW (read access alone is enough),
+    // so the security improvement is the OPT-IN itself: pre-2026-05-03 the
+    // mount fired on every group that had the codex plugin available;
+    // now operators must explicitly grant Codex host auth per group.
     if (containerConfig.codexHostAuth === true && !excluded.has('codex') && entries.includes('codex')) {
       const providerHasCodexMount = providerContribution.mounts?.some((m) => m.containerPath === '/home/node/.codex');
       if (!providerHasCodexMount) {
         const hostCodex = path.join(os.homedir(), '.codex');
         if (fs.existsSync(hostCodex)) {
-          mounts.push({ hostPath: hostCodex, containerPath: '/home/node/.codex', readonly: true });
+          mounts.push({ hostPath: hostCodex, containerPath: '/home/node/.codex', readonly: false });
         }
       }
     }
