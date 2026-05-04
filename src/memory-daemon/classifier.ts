@@ -312,6 +312,16 @@ async function classifyPair(
 
   let factsWritten = 0;
   let anyFactFailed = false;
+  // Gate accounting (Codex Finding F1, 2026-05-04). The pair-level success
+  // path advances scan_cursor and inserts processed_pairs even when factsWritten
+  // is 0, which is correct for "classifier returned no facts" but historically
+  // meant "every fact was dropped for low importance" was indistinguishable
+  // from "classifier had nothing to say". Counting drops here gives operators
+  // a denominator to spot the difference; pairs where 100% of emitted facts
+  // were dropped for low importance get an extra sentinel counter so we can
+  // see when threshold tuning would matter.
+  let factsEmittedNonRedacted = 0;
+  let factsDroppedForImportance = 0;
 
   for (let factIndex = 0; factIndex < output.facts.length; factIndex++) {
     const rawFact = output.facts[factIndex];
@@ -336,12 +346,24 @@ async function classifyPair(
       continue;
     }
 
+    factsEmittedNonRedacted++;
+
     // Importance gate — drop low-signal facts before they pollute the store.
     // Empirically (illysium store, 2026-05-04 sample of 50 recall results) ~50%
     // of stored facts came in at importance=3 — useful tactical context but not
     // durable enough to keep forever. importance=4-5 is decisions, key facts,
     // and high-signal insights. The classifier emits 1-5 per its prompt.
+    //
+    // Note: pair still gets inserted into processed_pairs and watermark advances
+    // even if EVERY fact gets dropped here. That's a deliberate trade-off — the
+    // alternative (re-classify every sweep) would burn the classifier API on
+    // already-decided pairs. To replay dropped pairs, bump PROMPT_VERSION or
+    // CLASSIFIER_VERSION in classifier-client.ts; the (group, pair_key, classifier_version,
+    // prompt_version, is_orphan) PK on processed_pairs means new-version rows
+    // coexist with old.
     if (rawFact.importance < MIN_FACT_IMPORTANCE) {
+      factsDroppedForImportance++;
+      health.recordLowImportanceDropped(agentGroupId);
       continue;
     }
 
@@ -354,6 +376,7 @@ async function classifyPair(
       // marking durable data loss as permanent. Only count actually-stored facts.
       if (result.action === 'added' || result.action === 'updated' || result.action === 'replaced') {
         factsWritten++;
+        health.recordFactAccepted(agentGroupId);
       } else if (result.action === 'skipped' && !result.factId) {
         // Operational failure (CLI/parse error) masquerading as 'skipped'.
         // The redactor-blocked path returns 'skipped' too but with an explicit
@@ -374,6 +397,27 @@ async function classifyPair(
       health.recordClassifierFailure(agentGroupId, err instanceof Error ? err : new Error(String(err)));
       break;
     }
+  }
+
+  // All-low-importance sentinel: every non-redacted fact in this pair was
+  // dropped for low importance (no facts written, no failures). Without this
+  // signal, the operator can't distinguish "classifier said nothing useful"
+  // from "every emitted fact was below threshold". Emit a metric + warn log
+  // so operators can spot the rate and decide whether to lower MIN_FACT_IMPORTANCE
+  // or bump PROMPT_VERSION/CLASSIFIER_VERSION to replay.
+  if (
+    !anyFactFailed &&
+    factsEmittedNonRedacted > 0 &&
+    factsDroppedForImportance === factsEmittedNonRedacted &&
+    factsWritten === 0
+  ) {
+    health.recordPairAllLowImportance(agentGroupId);
+    console.warn('[classifier] pair processed with 0 facts — all dropped for low importance', {
+      agentGroupId,
+      pairKey: pair.pairKey,
+      factsEmittedNonRedacted,
+      factsDroppedForImportance,
+    });
   }
 
   if (anyFactFailed) {

@@ -22,6 +22,17 @@ interface PerGroupState {
   recallResults: number[];
   lastSynthesiseSucceededAt: string | null;
   redactionCount: number;
+  // Per-fact counters for the importance gate (MIN_FACT_IMPORTANCE in
+  // classifier.ts). These are the denominator Codex flagged as missing — without
+  // them, a classifier shift that emits mostly importance=3 facts looks like
+  // ordinary low activity in the dashboard while pairs are silently marked
+  // processed with factsWritten=0 (and thus non-retriable until version bump).
+  factsAccepted24h: number;
+  factsDroppedLowImportance24h: number;
+  // Number of pairs in the last 24h where 100% of emitted facts were dropped
+  // for importance — useful as a sentinel for "operator should consider
+  // lowering threshold or bumping PROMPT_VERSION to replay".
+  pairsAllLowImportance24h: number;
   classifierFalsePositiveSignal24h: number;
   lagSec: number | null;
 }
@@ -38,6 +49,9 @@ function emptyGroupState(): PerGroupState {
     recallResults: [],
     lastSynthesiseSucceededAt: null,
     redactionCount: 0,
+    factsAccepted24h: 0,
+    factsDroppedLowImportance24h: 0,
+    pairsAllLowImportance24h: 0,
     classifierFalsePositiveSignal24h: 0,
     lagSec: null,
   };
@@ -85,6 +99,9 @@ function buildGroupJson(state: PerGroupState): Record<string, unknown> {
     lastSynthesiseSucceededAt: state.lastSynthesiseSucceededAt,
     synthesiseStaleHours,
     redactionCount: state.redactionCount,
+    factsAccepted24h: state.factsAccepted24h,
+    factsDroppedLowImportance24h: state.factsDroppedLowImportance24h,
+    pairsAllLowImportance24h: state.pairsAllLowImportance24h,
     classifierFalsePositiveSignal24h: state.classifierFalsePositiveSignal24h,
   };
 }
@@ -137,6 +154,36 @@ export class HealthRecorder {
   recordRedaction(agentGroupId: string, _reason: string): void {
     const g = this.group(agentGroupId);
     g.redactionCount++;
+  }
+
+  /**
+   * One fact survived the importance gate and was sent to MnemonStore.remember.
+   * Pair with recordLowImportanceDropped to compute the acceptance rate.
+   */
+  recordFactAccepted(agentGroupId: string): void {
+    const g = this.group(agentGroupId);
+    g.factsAccepted24h++;
+  }
+
+  /**
+   * One fact was dropped because its classifier-emitted importance was below
+   * MIN_FACT_IMPORTANCE. Codex flagged the missing denominator — without this
+   * counter the gate could swallow 95% of facts invisibly.
+   */
+  recordLowImportanceDropped(agentGroupId: string): void {
+    const g = this.group(agentGroupId);
+    g.factsDroppedLowImportance24h++;
+  }
+
+  /**
+   * A whole pair finished classification with 100% of emitted facts dropped
+   * for low importance. The pair will still be marked processed (so we don't
+   * re-classify on every sweep, which is expensive), but operators should be
+   * able to spot the rate. To replay, bump PROMPT_VERSION or CLASSIFIER_VERSION.
+   */
+  recordPairAllLowImportance(agentGroupId: string): void {
+    const g = this.group(agentGroupId);
+    g.pairsAllLowImportance24h++;
   }
 
   recordSynthesiseSucceeded(agentGroupId: string, at: Date): void {
