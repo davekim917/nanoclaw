@@ -22,6 +22,14 @@ const path = require('path');
 const crypto = require('crypto');
 
 const INBOX = '/home/ubuntu/nanoclaw-v2/groups/host-claude-code/sources/inbox';
+// Sibling staging dir OUTSIDE the watched inbox. The daemon's inotify
+// watcher fires on every CLOSE_WRITE in INBOX, so the original pattern
+// (writeFileSync to <inbox>/foo.tmp then renameSync to <inbox>/foo) made the
+// daemon enqueue the .tmp path for processing; by the time setImmediate ran
+// processInboxFile, the rename had moved the file and the read failed →
+// dead-letter row. Staging the .tmp HERE then renaming into INBOX means the
+// daemon only sees the IN_MOVED_TO event for the final filename.
+const STAGING = '/home/ubuntu/nanoclaw-v2/groups/host-claude-code/sources/.tmp';
 const MAX_BYTES = 50_000;
 const TRUNCATION_NOTICE = '\n\n[Truncated by cc-mnemon capture: exceeded 50KB cap.]\n';
 const MIN_USER_LEN = 20;
@@ -117,7 +125,8 @@ function main() {
   const dest = path.join(INBOX, `cc-${hash}.txt`);
   if (fs.existsSync(dest)) process.exit(0);
 
-  const tmp = `${dest}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+  fs.mkdirSync(STAGING, { recursive: true });
+  const tmp = path.join(STAGING, `cc-${hash}.${crypto.randomBytes(4).toString('hex')}.tmp`);
   try {
     fs.writeFileSync(tmp, bounded, { encoding: 'utf-8', flag: 'wx' });
     fs.renameSync(tmp, dest);

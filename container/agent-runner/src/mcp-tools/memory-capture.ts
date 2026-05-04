@@ -5,6 +5,14 @@ import crypto from 'crypto';
 import type { HookCallback } from '@anthropic-ai/claude-agent-sdk';
 
 const INBOX_DIR = '/workspace/agent/sources/inbox';
+// Sibling staging directory for atomic-write temp files. MUST live OUTSIDE
+// INBOX_DIR — the host memory daemon's inotify watcher fires on every
+// IN_CLOSE_WRITE inside the inbox, including .tmp files. Writing the tmp here
+// then linking into INBOX_DIR means the daemon only sees the final filename's
+// IN_CREATE event, not the transient .tmp. Keeps the atomic semantics
+// (link + unlink for no-clobber) while eliminating dead-letter rows for
+// already-renamed-away .tmp paths.
+const STAGING_DIR = '/workspace/agent/sources/.tmp';
 // Cap captured content size. A large web page or a `gws gmail search` returning
 // hundreds of items could otherwise write a multi-MB file. The classifier reads
 // captured files via readFileSync and sends them to the Anthropic API; an
@@ -70,8 +78,12 @@ function atomicWrite(finalPath: string, content: string): void {
   if (fs.existsSync(finalPath)) return;
   const bounded = truncateToBytes(content, MAX_CAPTURE_BYTES);
   const tmpSuffix = crypto.randomBytes(4).toString('hex');
-  const tmpPath = `${finalPath}.${tmpSuffix}.tmp`;
+  // Stage the tmp OUTSIDE the watched inbox so the daemon's watcher only
+  // fires on the final filename. Same random suffix to keep concurrent
+  // distinct-target writes from colliding on tmp name.
+  const tmpPath = path.join(STAGING_DIR, `${path.basename(finalPath)}.${tmpSuffix}.tmp`);
   fs.mkdirSync(path.dirname(finalPath), { recursive: true });
+  fs.mkdirSync(STAGING_DIR, { recursive: true });
   try {
     fs.writeFileSync(tmpPath, bounded, { encoding: 'utf-8', flag: 'wx' });
   } catch (err) {
