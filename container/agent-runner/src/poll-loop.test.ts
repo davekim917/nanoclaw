@@ -241,6 +241,61 @@ describe('accumulate gate (trigger column)', () => {
     expect(ids).toEqual(['real-mention', 'recall-real-mention']);
   });
 
+  it('getPendingMessages: orphan recall-X is dropped when paired trigger X is in processing_ack', () => {
+    // The host writes recall-X paired to inbound row X. If X is a /clear
+    // (handled and markCompleted'd inline by the runner) or a task gated
+    // by pre-task script, X gets a 'completed' processing_ack but recall-X
+    // never does. Without the orphan drain, recall-X would surface as a
+    // standalone "[Recalled context]" prompt with no user message on the
+    // next cold-start iteration.
+    insertMessage('X', 'chat', { sender: 'A', text: '/clear' }, { trigger: 1 });
+    insertMessage('recall-X', 'system', { subtype: 'recall_context', text: 'facts' }, { trigger: 0 });
+    insertMessage('Y', 'chat', { sender: 'B', text: 'hey @bot' }, { trigger: 1 });
+    // Simulate X being completed (as the /clear handler would do).
+    markCompleted(['X']);
+    const ids = getPendingMessages()
+      .map((m) => m.id)
+      .sort();
+    // recall-X must be gone; Y is still pending.
+    expect(ids).toEqual(['Y']);
+  });
+
+  it('getPendingMessages: orphan recall-X is dropped when paired trigger X has a messages_out reply', () => {
+    // The respondedIds idempotency guard treats X as completed if the
+    // agent already wrote a reply. recall-X must drain on this signal too.
+    insertMessage('X', 'chat', { sender: 'A', text: 'old mention' }, { trigger: 1 });
+    insertMessage('recall-X', 'system', { subtype: 'recall_context', text: 'facts' }, { trigger: 0 });
+    getInboundDb()
+      // Use raw INSERT so we don't trigger the markCompleted helper here.
+      .prepare(
+        `INSERT INTO messages_in (id, kind, timestamp, status, trigger, content)
+         VALUES ('Y', 'chat', datetime('now'), 'pending', 1, '{"text":"hi"}')`,
+      )
+      .run();
+    // Simulate the agent having replied to X already.
+    getOutboundDb()
+      .prepare(
+        `INSERT INTO messages_out (id, kind, timestamp, in_reply_to, content)
+         VALUES ('out-1', 'chat', datetime('now'), 'X', '{"text":"replied"}')`,
+      )
+      .run();
+    const ids = getPendingMessages()
+      .map((m) => m.id)
+      .sort();
+    expect(ids).toEqual(['Y']);
+  });
+
+  it('getPendingMessages: legitimate paired recall-X + X both still returned (no false positive drain)', () => {
+    // The drain only fires when X is acked or replied-to. A normal pair
+    // with both rows still pending must come through untouched.
+    insertMessage('X', 'chat', { sender: 'B', text: 'hey @bot' }, { trigger: 1 });
+    insertMessage('recall-X', 'system', { subtype: 'recall_context', text: 'facts' }, { trigger: 0 });
+    const ids = getPendingMessages()
+      .map((m) => m.id)
+      .sort();
+    expect(ids).toEqual(['X', 'recall-X']);
+  });
+
   it('trigger column defaults to 1 for legacy inserts without explicit value', () => {
     // The schema default is 1 (see src/db/schema.ts INBOUND_SCHEMA) — existing
     // rows / tests without the column set are effectively wake-eligible.

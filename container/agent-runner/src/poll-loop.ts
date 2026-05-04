@@ -114,14 +114,18 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       continue;
     }
 
-    const ids = messages.map((m) => m.id);
-    markProcessing(ids);
-
     const routing = extractRouting(messages);
 
     // Command handling: the host router gates filtered and unauthorized
     // admin commands before they reach the container. The only command
     // the runner handles directly is /clear (session reset).
+    //
+    // Note on claim ordering: we used to markProcessing(ids) up front,
+    // then run pre-task scripts. If a script gated all non-command rows,
+    // any trigger=0 chat in the batch would stay 'processing' until the
+    // host stale-claim sweep cleared it (~60s). Now we claim only the
+    // rows that will actually reach the prompt — same pattern as the
+    // in-turn helper.
     const normalMessages: MessageInRow[] = [];
     const commandIds: string[] = [];
 
@@ -149,8 +153,6 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     }
 
     if (normalMessages.length === 0) {
-      const remainingIds = ids.filter((id) => !commandIds.includes(id));
-      if (remainingIds.length > 0) markCompleted(remainingIds);
       log(`All ${messages.length} message(s) were commands, skipping query`);
       continue;
     }
@@ -173,10 +175,18 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     }
     // MODULE-HOOK:scheduling-pre-task:end
 
-    if (keep.length === 0) {
-      log(`All ${normalMessages.length} non-command message(s) gated by script, skipping query`);
+    // Re-validate post-script: if no admissible trigger survives, defer
+    // the surviving trigger=0 context rows for the next iteration. Don't
+    // claim them — leaving rows pending is the correct signal that they
+    // weren't consumed. (Mirrors selectInTurnFollowUps' deferral logic.)
+    if (!keep.some(isAdmissibleTrigger)) {
+      log(`All ${normalMessages.length} non-command message(s) gated by script or no admissible trigger, skipping query`);
       continue;
     }
+
+    // Claim only the rows that will actually reach the prompt.
+    const keptIds = keep.map((m) => m.id);
+    markProcessing(keptIds);
 
     const { model: effectiveModel, effort: effectiveEffort } = applyFlagBatch(keep, routing);
 
@@ -199,9 +209,11 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       systemContext: config.systemContext,
     });
 
-    // Process the query while concurrently polling for new messages
-    const skippedSet = new Set(skipped);
-    const processingIds = ids.filter((id) => !commandIds.includes(id) && !skippedSet.has(id));
+    // Process the query while concurrently polling for new messages.
+    // processingIds == keptIds now: commands were marked completed inline,
+    // skipped task rows were marked completed by the pre-task block, and
+    // we only claimed the rows that actually reach the prompt.
+    const processingIds = keptIds;
     try {
       const result = await processQuery(query, routing, processingIds, config.providerName);
       if (result.continuation && result.continuation !== continuation) {
@@ -359,7 +371,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // Ensure completed even if processQuery ended without a result event
     // (e.g. stream closed unexpectedly).
     markCompleted(processingIds);
-    log(`Completed ${ids.length} message(s)`);
+    log(`Completed ${processingIds.length} message(s) (commands=${commandIds.length}, skipped=${skipped.length})`);
   }
 }
 
@@ -416,6 +428,13 @@ export function selectInTurnFollowUps(allPending: MessageInRow[]): MessageInRow[
     return m.trigger === 1;
   });
 }
+
+// Invariant: the `recall-` prefix is reserved for host-side recall-injection
+// (src/modules/memory/recall-injection.ts). Platform message ids written by
+// router.ts always carry the shape `<platform-baseId>:<agentGroupId>`; no
+// adapter produces baseIds starting with `recall-`, so the strip below
+// cannot collide with a real inbound id. Keep this contract — adding an
+// adapter that breaks it would silently corrupt recall pairing.
 
 /**
  * Format messages, handling passthrough commands differently.
@@ -561,9 +580,19 @@ async function processQuery(
         // Claude session with no prior context.
         setContinuation(providerName, event.continuation);
       } else if (event.type === 'result') {
-        // A result — with or without text — means the turn is done. Mark
-        // the initial batch completed now so the host sweep doesn't see
-        // stale 'processing' claims while the query stays open for
+        // A result — with or without text — means the turn is done. Flip
+        // `done` SYNCHRONOUSLY before any further async work so an in-flight
+        // setInterval tick that fires while the for-await yields between
+        // `result` and the iterator's return cannot pass the `if (done)
+        // return` guard above. Without this, a follow-up poll resolving
+        // its `await applyPreTaskScripts` in that window would
+        // markProcessing → query.push → markCompleted into a stream the
+        // SDK has already finalized — silencing the pushed message
+        // permanently (clearStaleProcessingAcks only deletes 'processing'
+        // rows, and getPendingMessages filters 'completed' acks).
+        done = true;
+        // Mark the initial batch completed now so the host sweep doesn't
+        // see stale 'processing' claims while the query stays open for
         // follow-up pushes. The agent may have responded via MCP
         // (send_message) mid-turn, or the message may not need a response
         // at all — either way the turn is finished.

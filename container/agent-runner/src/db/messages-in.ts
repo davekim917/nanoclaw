@@ -90,9 +90,28 @@ export function getPendingMessages(): MessageInRow[] {
       ).map((r) => r.id),
     );
 
+    // Orphan recall_context drain: a `recall-<X>` row is paired to inbound
+    // row `<X>` by the host's recall-injection (it strips the prefix to
+    // pair). When `<X>` finishes (status='completed' in processing_ack, or
+    // a messages_out row exists) but `recall-<X>` was never claimed —
+    // happens when X is a /clear command (handled+completed inline at
+    // poll-loop.ts:148) or a task gated by pre-task script — the orphan
+    // recall sits pending. Without this filter, the cold-start path's
+    // accept-any-recall_context filter would later turn the orphan into a
+    // standalone "[Recalled context]" prompt with no user message; the
+    // in-turn helper drops it but it stays pending forever and gets
+    // re-evaluated every poll. Drop it here so both paths see a clean view.
+    const isOrphanRecall = (m: MessageInRow): boolean => {
+      if (!m.id.startsWith('recall-')) return false;
+      const pairedId = m.id.slice('recall-'.length);
+      return ackedIds.has(pairedId) || respondedIds.has(pairedId);
+    };
+
     // Reverse: we fetched DESC to take the most recent N, but the agent
     // should see them in chronological order (oldest first).
-    return pending.filter((m) => !ackedIds.has(m.id) && !respondedIds.has(m.id)).reverse();
+    return pending
+      .filter((m) => !ackedIds.has(m.id) && !respondedIds.has(m.id) && !isOrphanRecall(m))
+      .reverse();
   } finally {
     closeInboundDb(inbound);
   }
