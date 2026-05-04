@@ -542,8 +542,7 @@ describe('canonicalize null-byte stripping (Codex Finding F2)', () => {
 
     // Re-implement the production canonicalize in-test rather than exporting
     // it just for this assertion. If production changes, this test fails loud.
-    const canonicalize = (content: string): string =>
-      content.trim().replace(/\r\n/g, '\n').replace(/\0/g, '');
+    const canonicalize = (content: string): string => content.trim().replace(/\r\n/g, '\n').replace(/\0/g, '');
 
     const withNull = 'hello\0world';
     const withoutNull = 'helloworld';
