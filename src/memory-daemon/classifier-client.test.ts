@@ -95,6 +95,17 @@ describe('callClassifier facade', () => {
     expect(backendSpy.mock.calls[0][2]).toEqual({ signal: ctrl.signal });
   });
 
+  it('strips null bytes from both prompts before invoking backend', async () => {
+    // Node child_process.spawn throws TypeError on any \0 in args. Source
+    // archives occasionally contain null bytes; stripping at the facade
+    // protects every backend uniformly.
+    const backendSpy = vi.fn().mockResolvedValue({ worth_storing: false, facts: [] });
+    setBackendForTest(backendSpy);
+
+    await callClassifier('clean system\0prompt', 'user\0content with\0nulls');
+    expect(backendSpy).toHaveBeenCalledWith('clean systemprompt', 'usercontent withnulls', undefined);
+  });
+
   it('reads MEMORY_CLASSIFIER_BACKEND env on first call when no test backend set', async () => {
     // Don't actually invoke a real backend — set an invalid env so loadBackend
     // throws, then assert the parse error surfaces. This proves the env is

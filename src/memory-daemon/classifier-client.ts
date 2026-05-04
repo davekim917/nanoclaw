@@ -145,8 +145,18 @@ export async function callClassifier(
   userPrompt: string,
   opts?: CallClassifierOpts,
 ): Promise<ClassifierOutput> {
+  // Strip null bytes from both prompts. Node `child_process.spawn` rejects
+  // any string arg containing `\0` with TypeError [ERR_INVALID_ARG_VALUE],
+  // which the codex backend hits when chat archive content (rare but real)
+  // includes a null byte. Confirmed 2026-05-04: 7+ chat pairs poisoned by
+  // this in axie-dev/illysium/cf39lq archives. Anthropic backend is
+  // unaffected (HTTP body transmits \0 fine), but stripping at this layer
+  // protects every current and future backend uniformly. Lossy by intent —
+  // dropping one unprintable char is preferable to losing the whole pair.
+  const safeSystem = systemPrompt.replace(/\0/g, '');
+  const safeUser = userPrompt.replace(/\0/g, '');
   const backend = await loadBackend();
-  return backend(systemPrompt, userPrompt, opts);
+  return backend(safeSystem, safeUser, opts);
 }
 
 // ---- shared helpers exported for backends + tests ----
