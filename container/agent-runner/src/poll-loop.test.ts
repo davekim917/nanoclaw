@@ -4,6 +4,7 @@ import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from '
 import { getPendingMessages, markCompleted } from './db/messages-in.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { formatMessages, extractRouting } from './formatter.js';
+import { isAdmissibleTrigger, selectInTurnFollowUps } from './poll-loop.js';
 import { MockProvider } from './providers/mock.js';
 
 beforeEach(() => {
@@ -115,23 +116,129 @@ describe('accumulate gate (trigger column)', () => {
     expect(messages.map((m) => m.id).sort()).toEqual(['m1', 'm2']);
   });
 
-  it('mid-turn push predicate excludes trigger=0 rows (mirrors active-query filter)', () => {
-    // The active-query helper inside processQuery (poll-loop.ts ~line 410)
-    // pushes follow-up messages into the in-flight Claude query every 500ms.
-    // Without a trigger gate, a non-mention arriving while the agent is still
-    // working on an earlier mention reaches the agent mid-turn — and Claude's
-    // extended thinking would emit a streaming thinking-block status about a
-    // message the bot wasn't even addressed in. The mid-turn filter must
-    // mirror the cold-start gate at the top of runPollLoop: only trigger=1
-    // rows count as wake-eligible follow-ups; trigger=0 rows wait for the
-    // next real wake (where the formatter renders them inside <thread_context>).
+  it('selectInTurnFollowUps: pure trigger=0 batch defers (no push)', () => {
+    // The agent is mid-stream on an earlier turn — a non-mention shouldn't
+    // interrupt thinking-blocks with content the bot wasn't addressed in.
     insertMessage('m1', 'chat', { sender: 'A', text: 'noise during active turn' }, { trigger: 0 });
+    insertMessage('m2', 'chat', { sender: 'C', text: 'more noise' }, { trigger: 0 });
+    expect(selectInTurnFollowUps(getPendingMessages())).toEqual([]);
+  });
+
+  it('selectInTurnFollowUps: trigger=0 chat rides along when batch contains a chat trigger=1', () => {
+    // Warm-container regression: prior implementation dropped trigger=0
+    // unconditionally in the in-turn filter, stranding accumulated context
+    // whenever the next mention also arrived in-turn (long-lived container
+    // that never cold-restarts). Agent saw the mention but lost prior context.
+    insertMessage('m1', 'chat', { sender: 'A', text: 'earlier non-mention' }, { trigger: 0 });
     insertMessage('m2', 'chat', { sender: 'B', text: 'mid-turn mention' }, { trigger: 1 });
-    const messages = getPendingMessages();
-    // Replicate the exact filter used in processQuery's pollHandle (excluding
-    // the kind=system / /clear filters which are tested elsewhere).
-    const eligibleForMidTurnPush = messages.filter((m) => m.trigger === 1);
-    expect(eligibleForMidTurnPush.map((m) => m.id)).toEqual(['m2']);
+    const ids = selectInTurnFollowUps(getPendingMessages())
+      .map((m) => m.id)
+      .sort();
+    expect(ids).toEqual(['m1', 'm2']);
+  });
+
+  it('selectInTurnFollowUps: /clear is not a real trigger — does not unlock trigger=0 ride-along', () => {
+    // /clear is trigger=1 but excluded later in the loop (resets the
+    // session). It must not gate trigger=0 context into the prompt — the
+    // prompt would render only the context block and the /clear would be
+    // handled separately. Defer until a real trigger arrives.
+    insertMessage('m1', 'chat', { sender: 'A', text: 'old non-mention' }, { trigger: 0 });
+    insertMessage('m2', 'chat', { sender: 'B', text: '/clear' }, { trigger: 1 });
+    expect(selectInTurnFollowUps(getPendingMessages())).toEqual([]);
+  });
+
+  it('selectInTurnFollowUps: non-recall system row trigger=1 does not unlock trigger=0', () => {
+    // System rows (other than recall_context) are dropped by the filter —
+    // they should not gate trigger=0 ride-along either.
+    insertMessage('m1', 'chat', { sender: 'A', text: 'context' }, { trigger: 0 });
+    insertMessage('s1', 'system', { subtype: 'something_else' }, { trigger: 1 });
+    expect(selectInTurnFollowUps(getPendingMessages())).toEqual([]);
+  });
+
+  it('selectInTurnFollowUps: trigger=0 task rows do NOT ride along — only chat/chat-sdk do', () => {
+    // The original `m.trigger !== 1` guard rejected trigger=0 of any kind.
+    // The new ride-along is restricted to chat/chat-sdk; tasks and webhooks
+    // still gate on their own trigger=1.
+    insertMessage('m1', 'chat', { sender: 'B', text: 'mention' }, { trigger: 1 });
+    insertMessage('t1', 'task', { script: 'noop', wakeAgent: false }, { trigger: 0 });
+    const ids = selectInTurnFollowUps(getPendingMessages()).map((m) => m.id);
+    expect(ids).toEqual(['m1']);
+  });
+
+  it('selectInTurnFollowUps: chat-sdk parity — trigger=0 chat-sdk rides along like chat', () => {
+    insertMessage('m1', 'chat-sdk', { sender: 'A', text: 'context' }, { trigger: 0 });
+    insertMessage('m2', 'chat-sdk', { sender: 'B', text: 'mention' }, { trigger: 1 });
+    const ids = selectInTurnFollowUps(getPendingMessages())
+      .map((m) => m.id)
+      .sort();
+    expect(ids).toEqual(['m1', 'm2']);
+  });
+
+  it('selectInTurnFollowUps: trigger=0 webhook does NOT ride — only chat/chat-sdk do', () => {
+    insertMessage('m1', 'chat', { sender: 'B', text: 'mention' }, { trigger: 1 });
+    insertMessage('w1', 'webhook', { url: '/x' }, { trigger: 0 });
+    const ids = selectInTurnFollowUps(getPendingMessages()).map((m) => m.id);
+    expect(ids).toEqual(['m1']);
+  });
+
+  it('selectInTurnFollowUps: malformed recall content/id is dropped, not crashed on', () => {
+    insertMessage('m1', 'chat', { sender: 'B', text: 'mention' }, { trigger: 1 });
+    // Not JSON
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, kind, timestamp, status, trigger, content)
+         VALUES ('s-bad', 'system', datetime('now'), 'pending', 0, 'not-json')`,
+      )
+      .run();
+    // Recall-shaped but no recall- prefix
+    insertMessage('s-noprefix', 'system', { subtype: 'recall_context', text: 'x' }, { trigger: 0 });
+    const ids = selectInTurnFollowUps(getPendingMessages()).map((m) => m.id);
+    expect(ids).toEqual(['m1']);
+  });
+
+  it('selectInTurnFollowUps: /clear alongside a real mention — /clear excluded, real batch admitted', () => {
+    insertMessage('clr', 'chat', { sender: 'A', text: '/clear' }, { trigger: 1 });
+    insertMessage('ctx', 'chat', { sender: 'B', text: 'old context' }, { trigger: 0 });
+    insertMessage('real', 'chat', { sender: 'C', text: 'hey @bot' }, { trigger: 1 });
+    const ids = selectInTurnFollowUps(getPendingMessages())
+      .map((m) => m.id)
+      .sort();
+    // /clear stays out; the real batch (real + ctx) goes through.
+    expect(ids).toEqual(['ctx', 'real']);
+  });
+
+  it('isAdmissibleTrigger: returns true only for non-system, non-/clear, trigger=1 rows', () => {
+    insertMessage('a', 'chat', { sender: 'A', text: 'hi' }, { trigger: 1 });
+    insertMessage('b', 'chat', { sender: 'A', text: '/clear' }, { trigger: 1 });
+    insertMessage('c', 'chat', { sender: 'A', text: 'ctx' }, { trigger: 0 });
+    insertMessage('d', 'system', { subtype: 'something' }, { trigger: 1 });
+    insertMessage('e', 'task', { name: 'cron' }, { trigger: 1 });
+    const byId = Object.fromEntries(getPendingMessages().map((m) => [m.id, m]));
+    expect(isAdmissibleTrigger(byId.a)).toBe(true);
+    expect(isAdmissibleTrigger(byId.b)).toBe(false);
+    expect(isAdmissibleTrigger(byId.c)).toBe(false);
+    expect(isAdmissibleTrigger(byId.d)).toBe(false);
+    expect(isAdmissibleTrigger(byId.e)).toBe(true);
+  });
+
+  it('selectInTurnFollowUps: recall_context only rides when paired trigger is admitted', () => {
+    // Pair admission must be checked against the post-filter trigger set,
+    // not the raw snapshot. /clear's id should NOT satisfy a recall pair.
+    insertMessage('clear-id', 'chat', { sender: 'B', text: '/clear' }, { trigger: 1 });
+    insertMessage('recall-clear-id', 'system', { subtype: 'recall_context', text: 'facts' }, {
+      trigger: 0,
+    });
+    expect(selectInTurnFollowUps(getPendingMessages())).toEqual([]);
+
+    // But a recall paired with a real trigger does ride along.
+    insertMessage('real-mention', 'chat', { sender: 'B', text: 'hey @bot' }, { trigger: 1 });
+    insertMessage('recall-real-mention', 'system', { subtype: 'recall_context', text: 'facts' }, {
+      trigger: 0,
+    });
+    const ids = selectInTurnFollowUps(getPendingMessages())
+      .map((m) => m.id)
+      .sort();
+    expect(ids).toEqual(['real-mention', 'recall-real-mention']);
   });
 
   it('trigger column defaults to 1 for legacy inserts without explicit value', () => {
