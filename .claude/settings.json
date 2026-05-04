@@ -1,5 +1,27 @@
 {
   "sandbox": {
     "enabled": false
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"/home/ubuntu/nanoclaw-v2/.claude/hooks/cc-mnemon/capture-turn.cjs\""
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"/home/ubuntu/nanoclaw-v2/.claude/hooks/cc-mnemon/inject-recall.cjs\""
+          }
+        ]
+      }
+    ]
   }
 }
