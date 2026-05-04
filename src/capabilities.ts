@@ -493,22 +493,25 @@ function buildSessionServicesSnapshot(agentGroupId: string): SessionServicesSnap
     });
   }
 
-  // Atlassian Rovo MCP — gated by tool entry. Covers Jira + Confluence +
-  // Compass in one server. OneCLI gateway injects `Authorization: Basic
-  // base64(email:api-token)` at request time (vault entry "Atlassian" →
-  // mcp.atlassian.com). The Teamwork Graph tools (getTeamworkGraphContext /
-  // getTeamworkGraphObject) are for relationship queries — use them for
-  // reasoning about connections between work items, people, teams, goals,
-  // projects. Use the standard Jira/Confluence/Compass tools for CRUD.
+  // Atlassian via sooperset/mcp-atlassian (stdio Python MCP, ~72 tools).
+  // Gated by tool entry. Hits the direct Atlassian REST API at
+  // <site>.atlassian.net — NOT Rovo MCP, which requires an org admin to
+  // grant per-user API token access. OneCLI gateway injects
+  // `Authorization: Basic base64(email:api-token)` at request time (vault
+  // entry "Atlassian" → madison-reed.atlassian.net). Covers Jira (issues,
+  // projects, sprints, JQL search, transitions, comments, attachments,
+  // bulk ops) and Confluence (pages, spaces, search, comments, content
+  // creation/editing). Compass and Teamwork Graph are NOT available via
+  // this surface — they're Rovo-only.
   if (declared(['atlassian'])) {
     services.push({
-      name: 'Atlassian (Jira + Confluence + Compass)',
+      name: 'Atlassian (Jira + Confluence)',
       mcpNamespace: 'mcp__atlassian__*',
       declaredTools: declaredMatchingTools(['atlassian']),
       scopes: [],
       credentialPaths: [],
       useFor:
-        'Atlassian Rovo MCP via https://mcp.atlassian.com/v1/mcp. Auth pre-injected (Authorization: Basic). Covers Jira (issues, projects, sprints, search, transitions, bulk ops), Confluence (pages, spaces, search, summaries), and Compass (components, scorecards). Use Teamwork Graph tools (`getTeamworkGraphContext`, then `getTeamworkGraphObject` on key linked entities) when reasoning about relationships between Atlassian entities — work items, people, teams, goals, projects. Use standard CRUD tools for direct reads/writes. Tools: `mcp__atlassian__*`.',
+        'Jira + Confluence via sooperset/mcp-atlassian (direct REST against madison-reed.atlassian.net). Auth pre-injected (Authorization: Basic). ~72 typed tools — Jira: `mcp__atlassian__jira_search`, `jira_get_issue`, `jira_create_issue`, `jira_update_issue`, `jira_add_comment`, `jira_get_transitions`, `jira_transition_issue`, project/sprint/board ops, attachments. Confluence: `mcp__atlassian__confluence_search`, `confluence_get_page`, `confluence_create_page`, `confluence_update_page`, `confluence_get_comments`. Use JQL for Jira search (`assignee = currentUser() AND status != Done` etc.) and CQL for Confluence search. NOT available via this surface: Compass, Teamwork Graph (those are Rovo MCP only).',
     });
   }
 

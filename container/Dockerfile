@@ -106,6 +106,14 @@ RUN python3 -m venv /opt/dbt-venv \
     && /opt/dbt-venv/bin/pip install --no-cache-dir dbt-core==1.11.8 dbt-snowflake==1.11.4 \
     && ln -sf /opt/dbt-venv/bin/dbt /usr/local/bin/dbt
 
+# sooperset/mcp-atlassian — stdio MCP server for Jira + Confluence (72 tools).
+# Isolated venv to avoid clashing with snow/dbt transitive deps.
+ARG MCP_ATLASSIAN_VERSION=0.21.1
+RUN python3 -m venv /opt/atlassian-venv \
+    && /opt/atlassian-venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel \
+    && /opt/atlassian-venv/bin/pip install --no-cache-dir "mcp-atlassian==${MCP_ATLASSIAN_VERSION}" \
+    && ln -sf /opt/atlassian-venv/bin/mcp-atlassian /usr/local/bin/mcp-atlassian
+
 # AWS CLI v2 (isolated from pip to avoid version churn)
 RUN ARCH=$(uname -m) \
     && curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-${ARCH}.zip" -o /tmp/awscli.zip \

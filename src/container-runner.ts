@@ -1649,15 +1649,36 @@ async function buildContainerArgs(
     };
   }
   if (canInject('atlassian') && isToolEnabled(containerConfig.tools, 'atlassian')) {
-    // Atlassian Rovo MCP — covers Jira + Confluence + Compass in one
-    // server. Auth via OneCLI vault entry "Atlassian" → mcp.atlassian.com,
-    // header `Authorization: Basic base64(email:api-token)`. API-token
-    // mode is preview as of 2026-02-24 and requires the org admin to enable
-    // it at Atlassian Admin → Rovo → Rovo MCP server → Authentication →
-    // API token. Gated by `tools: ["atlassian"]` in container.json.
+    // sooperset/mcp-atlassian — stdio Python MCP server (72 tools across
+    // Jira + Confluence). Installed via /opt/atlassian-venv in the
+    // Dockerfile, symlinked to /usr/local/bin/mcp-atlassian.
+    //
+    // Why direct REST instead of Rovo MCP: the official Rovo MCP requires
+    // a per-user permission grant from an Atlassian org admin to expose
+    // Jira/Confluence tools — without it, the user only sees 2 Teamwork
+    // Graph tools and even those error. Direct REST against
+    // <site>.atlassian.net works with any user's standard product seats.
+    //
+    // The MCP server constructs `Authorization: Basic base64(USERNAME:
+    // API_TOKEN)` from env vars at request time. Placeholder values here
+    // satisfy the server's startup validation; OneCLI's gateway overrides
+    // the constructed header with the real Basic from the vault entry
+    // "Atlassian" (hostPattern: madison-reed.atlassian.net) before the
+    // request leaves the container. Site URLs are non-secret config and
+    // stay literal. Hard-coded to madison-reed today; if other groups
+    // ever wire Atlassian we'd resolve site per-folder.
     mcpServers.atlassian = {
-      type: 'http',
-      url: 'https://mcp.atlassian.com/v1/mcp',
+      type: 'stdio',
+      command: 'mcp-atlassian',
+      args: [],
+      env: {
+        JIRA_URL: 'https://madison-reed.atlassian.net',
+        JIRA_USERNAME: 'onecli-managed',
+        JIRA_API_TOKEN: 'onecli-managed',
+        CONFLUENCE_URL: 'https://madison-reed.atlassian.net/wiki',
+        CONFLUENCE_USERNAME: 'onecli-managed',
+        CONFLUENCE_API_TOKEN: 'onecli-managed',
+      },
     };
   }
   if (canInject('looker') && isToolEnabled(containerConfig.tools, 'looker')) {
