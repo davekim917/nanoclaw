@@ -3,7 +3,6 @@ import path from 'path';
 import { createHash } from 'crypto';
 import Database from 'better-sqlite3';
 import { openMnemonIngestDb } from '../db/migrations/019-mnemon-ingest-db.js';
-import { GROUPS_DIR } from '../config.js';
 import type { MemoryStore, FactInput } from '../modules/memory/store.js';
 import { redactSecrets } from '../modules/memory/secret-redactor.js';
 import { callClassifier, EXTRACTOR_VERSION, PROMPT_VERSION } from './classifier-client.js';
@@ -127,7 +126,9 @@ export class SourceIngester {
     this.health = health;
   }
 
-  reconcileWatchers(groups: ReadonlyArray<{ agentGroupId: string; folder: string; enabled: boolean }>): {
+  reconcileWatchers(
+    groups: ReadonlyArray<{ agentGroupId: string; folder: string; sourcesBasePath: string; enabled: boolean }>,
+  ): {
     opened: number;
     closed: number;
   } {
@@ -148,7 +149,7 @@ export class SourceIngester {
       if (!group.enabled) continue;
       if (this.watchers.has(group.agentGroupId)) continue;
 
-      const inboxPath = path.join(GROUPS_DIR, group.folder, 'sources', 'inbox');
+      const inboxPath = path.join(group.sourcesBasePath, 'sources', 'inbox');
       try {
         fs.mkdirSync(inboxPath, { recursive: true });
       } catch {
@@ -190,7 +191,13 @@ export class SourceIngester {
           // back silently — the 60s sweep in index.ts catches the file and
           // processes it via the runtime path.
           if (!this.store) return;
-          void this.processInboxFile(group.agentGroupId, group.folder, realPath, this.store, this.health ?? undefined);
+          void this.processInboxFile(
+            group.agentGroupId,
+            group.sourcesBasePath,
+            realPath,
+            this.store,
+            this.health ?? undefined,
+          );
         });
       });
 
@@ -203,7 +210,7 @@ export class SourceIngester {
 
   async processInboxFile(
     agentGroupId: string,
-    folder: string,
+    sourcesBasePath: string,
     filePath: string,
     store: MemoryStore | Database.Database,
     health?: HealthRecorder,
@@ -211,7 +218,7 @@ export class SourceIngester {
 
   async processInboxFile(
     agentGroupId: string,
-    folder: string,
+    sourcesBasePath: string,
     filePath: string,
     storeOrDb: MemoryStore | Database.Database,
     health?: HealthRecorder,
@@ -223,7 +230,7 @@ export class SourceIngester {
     // swap the regular file for a symlink. Reading by path after re-validation
     // (Codex finding #5 round 1) still has a residual race; openSync with
     // O_NOFOLLOW + fstat eliminates it (Codex finding #2 round 2).
-    const inboxPath = path.join(GROUPS_DIR, folder, 'sources', 'inbox');
+    const inboxPath = path.join(sourcesBasePath, 'sources', 'inbox');
     let content: string;
     try {
       // Resolve the inbox root for the prefix check below. openSync with
@@ -276,7 +283,7 @@ export class SourceIngester {
     // and clear any dead_letter row so a stuck file from before this guard
     // existed gets retired cleanly.
     if (looksBinary(content)) {
-      const processedDir = path.join(GROUPS_DIR, folder, 'sources', 'processed', dateFolder());
+      const processedDir = path.join(sourcesBasePath, 'sources', 'processed', dateFolder());
       try {
         fs.mkdirSync(processedDir, { recursive: true });
         fs.renameSync(filePath, path.join(processedDir, path.basename(filePath)));
@@ -314,7 +321,7 @@ export class SourceIngester {
       // otherwise zombie forever. Scoped by agent_group_id + item_key.
       db.prepare(`DELETE FROM dead_letters WHERE item_key = ? AND agent_group_id = ?`).run(filePath, agentGroupId);
 
-      const processedDir = path.join(GROUPS_DIR, folder, 'sources', 'processed', dateFolder());
+      const processedDir = path.join(sourcesBasePath, 'sources', 'processed', dateFolder());
       fs.mkdirSync(processedDir, { recursive: true });
       const dest = path.join(processedDir, path.basename(filePath));
       try {
@@ -376,7 +383,7 @@ export class SourceIngester {
         db.prepare(`DELETE FROM dead_letters WHERE item_key = ? AND agent_group_id = ?`).run(filePath, agentGroupId);
       })();
 
-      const processedDir = path.join(GROUPS_DIR, folder, 'sources', 'processed', dateFolder());
+      const processedDir = path.join(sourcesBasePath, 'sources', 'processed', dateFolder());
       fs.mkdirSync(processedDir, { recursive: true });
       const dest = path.join(processedDir, path.basename(filePath));
       try {
@@ -477,7 +484,7 @@ export class SourceIngester {
       health.recordSourceIngest(agentGroupId, factsWritten, contentHash);
     }
 
-    const processedDir = path.join(GROUPS_DIR, folder, 'sources', 'processed', dateFolder());
+    const processedDir = path.join(sourcesBasePath, 'sources', 'processed', dateFolder());
     fs.mkdirSync(processedDir, { recursive: true });
     const dest = path.join(processedDir, path.basename(filePath));
     try {

@@ -2,7 +2,6 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
-import { GROUPS_DIR } from '../config.js';
 import { SourceIngester, setIngestDb, looksBinary } from './source-ingest.js';
 import type { MemoryStore, RememberResult } from '../modules/memory/store.js';
 import type { HealthRecorder } from './health.js';
@@ -26,8 +25,8 @@ vi.mock('./classifier-client.js', () => ({
  * Returns the resolved path the test should use for subsequent assertions
  * (since the production code reassigns filePath = fdRealPath).
  */
-function stubProcessInboxFileValidation(filePath: string, folder: string, fileContent: string): string {
-  const inboxPath = path.join(GROUPS_DIR, folder, 'sources', 'inbox');
+function stubProcessInboxFileValidation(filePath: string, sourcesBasePath: string, fileContent: string): string {
+  const inboxPath = path.join(sourcesBasePath, 'sources', 'inbox');
   const fileName = path.basename(filePath);
   const stubbedRealPath = path.join(inboxPath, fileName);
   const FAKE_FD = 999;
@@ -166,8 +165,8 @@ describe('SourceIngester', () => {
 
     // Open watchers for A and B
     const result1 = ingester.reconcileWatchers([
-      { agentGroupId: 'A', folder: 'group-a', enabled: true },
-      { agentGroupId: 'B', folder: 'group-b', enabled: true },
+      { agentGroupId: 'A', folder: 'group-a', sourcesBasePath: '/test/group-a', enabled: true },
+      { agentGroupId: 'B', folder: 'group-b', sourcesBasePath: '/test/group-b', enabled: true },
     ]);
 
     expect(result1.opened).toBe(2);
@@ -176,9 +175,9 @@ describe('SourceIngester', () => {
 
     // Reconcile: A=enabled, B=disabled, C=enabled (new)
     const result2 = ingester.reconcileWatchers([
-      { agentGroupId: 'A', folder: 'group-a', enabled: true },
-      { agentGroupId: 'B', folder: 'group-b', enabled: false },
-      { agentGroupId: 'C', folder: 'group-c', enabled: true },
+      { agentGroupId: 'A', folder: 'group-a', sourcesBasePath: '/test/group-a', enabled: true },
+      { agentGroupId: 'B', folder: 'group-b', sourcesBasePath: '/test/group-b', enabled: false },
+      { agentGroupId: 'C', folder: 'group-c', sourcesBasePath: '/test/group-c', enabled: true },
     ]);
 
     expect(result2.opened).toBe(1); // C opened
@@ -198,7 +197,7 @@ describe('SourceIngester', () => {
     setDeadLettersDb(ingestDb);
 
     const agentGroupId = 'ag-test-idempotency';
-    const folder = 'test-group';
+    const sourcesBasePath = '/test/test-group';
     const fileContent = 'This is the test file content for idempotency checking.';
     const canonical = fileContent.trim().replace(/\r\n/g, '\n');
     const { createHash } = await import('crypto');
@@ -215,7 +214,7 @@ describe('SourceIngester', () => {
       )
       .run(agentGroupId, contentHash, new Date().toISOString());
 
-    stubProcessInboxFileValidation('/tmp/test.txt', folder, fileContent);
+    stubProcessInboxFileValidation('/tmp/test.txt', sourcesBasePath, fileContent);
     const mkdirSpy = vi.spyOn(fs, 'mkdirSync').mockImplementation(() => undefined);
     const renameSpy = vi.spyOn(fs, 'renameSync').mockImplementation(() => undefined);
 
@@ -223,7 +222,7 @@ describe('SourceIngester', () => {
     const store = makeStore();
     const health = makeHealth();
 
-    const result = await ingester.processInboxFile(agentGroupId, folder, '/tmp/test.txt', store, health);
+    const result = await ingester.processInboxFile(agentGroupId, sourcesBasePath, '/tmp/test.txt', store, health);
 
     expect(result.factsWritten).toBe(0);
     expect(result.failed).toBe(false);
@@ -262,11 +261,11 @@ describe('SourceIngester', () => {
     });
 
     const agentGroupId = 'ag-test-success';
-    const folder = 'test-group';
+    const sourcesBasePath = '/test/test-group';
     const fileContent =
       'The project uses TypeScript with strict mode. Dave prefers pnpm over npm for the host package manager. This is a detailed source document with substantial information.';
 
-    const resolvedPath = stubProcessInboxFileValidation('/tmp/new-doc.txt', folder, fileContent);
+    const resolvedPath = stubProcessInboxFileValidation('/tmp/new-doc.txt', sourcesBasePath, fileContent);
     const mkdirSpy = vi.spyOn(fs, 'mkdirSync').mockImplementation(() => undefined);
     const renameSpy = vi.spyOn(fs, 'renameSync').mockImplementation(() => undefined);
 
@@ -274,7 +273,7 @@ describe('SourceIngester', () => {
     const store = makeStore();
     const health = makeHealth();
 
-    const result = await ingester.processInboxFile(agentGroupId, folder, '/tmp/new-doc.txt', store, health);
+    const result = await ingester.processInboxFile(agentGroupId, sourcesBasePath, '/tmp/new-doc.txt', store, health);
 
     expect(result.factsWritten).toBe(2);
     expect(result.failed).toBe(false);
@@ -317,11 +316,11 @@ describe('SourceIngester', () => {
     });
 
     const agentGroupId = 'ag-test-dl-cleanup';
-    const folder = 'test-group';
+    const sourcesBasePath = '/test/test-group';
     const fileContent = 'Source document that was previously dead-lettered and is now re-processed.';
     const filePath = '/tmp/previously-dead.txt';
 
-    const resolvedPath = stubProcessInboxFileValidation(filePath, folder, fileContent);
+    const resolvedPath = stubProcessInboxFileValidation(filePath, sourcesBasePath, fileContent);
 
     // Pre-insert a dead_letters row for this file (simulating a prior failure)
     ingestDb
@@ -344,7 +343,7 @@ describe('SourceIngester', () => {
     const store = makeStore();
     const health = makeHealth();
 
-    const result = await ingester.processInboxFile(agentGroupId, folder, filePath, store, health);
+    const result = await ingester.processInboxFile(agentGroupId, sourcesBasePath, filePath, store, health);
 
     expect(result.factsWritten).toBe(1);
     expect(result.failed).toBe(false);
@@ -378,11 +377,11 @@ describe('SourceIngester', () => {
     });
 
     const agentGroupId = 'ag-test-dl-cleanup-no-facts';
-    const folder = 'test-group';
+    const sourcesBasePath = '/test/test-group';
     const fileContent = 'A trivial document with no extractable facts.';
     const filePath = '/tmp/no-facts.txt';
 
-    const resolvedPath = stubProcessInboxFileValidation(filePath, folder, fileContent);
+    const resolvedPath = stubProcessInboxFileValidation(filePath, sourcesBasePath, fileContent);
 
     // Pre-insert a dead_letters row for this file
     ingestDb
@@ -400,7 +399,7 @@ describe('SourceIngester', () => {
     const store = makeStore();
     const health = makeHealth();
 
-    const result = await ingester.processInboxFile(agentGroupId, folder, filePath, store, health);
+    const result = await ingester.processInboxFile(agentGroupId, sourcesBasePath, filePath, store, health);
 
     expect(result.factsWritten).toBe(0);
     expect(result.failed).toBe(false);
@@ -424,18 +423,18 @@ describe('SourceIngester', () => {
     vi.mocked(callClassifier).mockRejectedValue(new Error('Anthropic API error 500: internal error'));
 
     const agentGroupId = 'ag-test-failure';
-    const folder = 'test-group';
+    const sourcesBasePath = '/test/test-group';
     const fileContent = 'Source document that will fail to classify due to API error.';
     const filePath = '/tmp/failing-doc.txt';
 
-    const resolvedPath = stubProcessInboxFileValidation(filePath, folder, fileContent);
+    const resolvedPath = stubProcessInboxFileValidation(filePath, sourcesBasePath, fileContent);
     const renameSpy = vi.spyOn(fs, 'renameSync').mockImplementation(() => undefined);
 
     const ingester = new SourceIngester();
     const store = makeStore();
     const health = makeHealth();
 
-    const result = await ingester.processInboxFile(agentGroupId, folder, filePath, store, health);
+    const result = await ingester.processInboxFile(agentGroupId, sourcesBasePath, filePath, store, health);
 
     expect(result.factsWritten).toBe(0);
     expect(result.failed).toBe(true);

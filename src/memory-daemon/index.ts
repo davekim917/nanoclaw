@@ -7,15 +7,24 @@ import { setDeadLettersDb, getDueRetries, deleteAfterSuccess } from './dead-lett
 import { runChatStreamSweep, setIngestDb } from './classifier.js';
 import { SourceIngester, setIngestDb as setSourceIngestDb } from './source-ingest.js';
 import { readContainerConfig } from '../container-config.js';
-import { GROUPS_DIR } from '../config.js';
+import { GROUPS_DIR, CC_PROJECTS_DIR, CC_MEMORY_MARKER } from '../config.js';
 import type { MemoryStore } from '../modules/memory/store.js';
 
 const SWEEP_INTERVAL_MS = 60_000;
 
-function discoverMemoryGroups(
-  health?: HealthRecorder,
-): Array<{ agentGroupId: string; folder: string; enabled: boolean }> {
-  const groups: Array<{ agentGroupId: string; folder: string; enabled: boolean }> = [];
+export interface DiscoveredGroup {
+  agentGroupId: string;
+  folder: string;
+  // Absolute path to the directory that contains `sources/`. For
+  // GROUPS_DIR-discovered groups this is `<GROUPS_DIR>/<folder>`. For
+  // CC-discovered groups this is `<CC_PROJECTS_DIR>/<slug>`. Consumers compute
+  // inbox / processed paths from this base.
+  sourcesBasePath: string;
+  enabled: boolean;
+}
+
+function discoverMemoryGroups(health?: HealthRecorder): DiscoveredGroup[] {
+  const groups: DiscoveredGroup[] = [];
 
   let entries: string[];
   try {
@@ -62,6 +71,7 @@ function discoverMemoryGroups(
     groups.push({
       agentGroupId,
       folder: entry,
+      sourcesBasePath: fullPath,
       enabled: config.memory?.enabled === true,
     });
   }
@@ -69,6 +79,36 @@ function discoverMemoryGroups(
   // Drop stale entries for groups that no longer exist on disk. The per-loop
   // clear above doesn't fire for deleted entries (the loop never visits them).
   health?.pruneMemoryEnabledCheckFailures(new Set(entries));
+
+  // CC-side discovery: walk ~/.claude/projects/<slug>/ for `.memory-enabled`
+  // markers. Each marked project becomes a discovered group with agentGroupId
+  // `cc-<slug>` and per-project store at the same name. CC sessions opt in by
+  // dropping the marker (the CC hooks at ~/.claude/hooks/cc-mnemon/ create it
+  // on first turn for default-on behavior). Discovery is best-effort — a
+  // missing CC_PROJECTS_DIR is normal on hosts that don't run CC.
+  let ccEntries: string[] = [];
+  try {
+    ccEntries = fs.readdirSync(CC_PROJECTS_DIR);
+  } catch {
+    return groups;
+  }
+  for (const entry of ccEntries) {
+    const projectPath = path.join(CC_PROJECTS_DIR, entry);
+    try {
+      const stat = fs.statSync(projectPath);
+      if (!stat.isDirectory()) continue;
+    } catch {
+      continue;
+    }
+    const markerPath = path.join(projectPath, CC_MEMORY_MARKER);
+    if (!fs.existsSync(markerPath)) continue;
+    groups.push({
+      agentGroupId: `cc-${entry}`,
+      folder: entry,
+      sourcesBasePath: projectPath,
+      enabled: true,
+    });
+  }
 
   return groups;
 }
@@ -82,7 +122,7 @@ async function runSweep(ingester: SourceIngester, health: HealthRecorder, store:
   await runChatStreamSweep(enabledGroups, store, health);
 
   for (const group of enabledGroups) {
-    const inboxPath = path.join(GROUPS_DIR, group.folder, 'sources', 'inbox');
+    const inboxPath = path.join(group.sourcesBasePath, 'sources', 'inbox');
     let files: string[];
     let inboxRealPath: string;
     try {
@@ -114,7 +154,7 @@ async function runSweep(ingester: SourceIngester, health: HealthRecorder, store:
         continue;
       }
       if (!realPath.startsWith(inboxRealPath + path.sep)) continue;
-      await ingester.processInboxFile(group.agentGroupId, group.folder, realPath, store, health);
+      await ingester.processInboxFile(group.agentGroupId, group.sourcesBasePath, realPath, store, health);
     }
   }
 
@@ -126,7 +166,7 @@ async function runSweep(ingester: SourceIngester, health: HealthRecorder, store:
         break;
       } else if (retry.itemType === 'source-file') {
         if (fs.existsSync(retry.itemKey)) {
-          await ingester.processInboxFile(group.agentGroupId, group.folder, retry.itemKey, store, health);
+          await ingester.processInboxFile(group.agentGroupId, group.sourcesBasePath, retry.itemKey, store, health);
         } else {
           // File no longer exists at the recorded path — already moved to
           // processed/ (success or binary-guard skip) or manually removed.

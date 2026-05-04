@@ -23,6 +23,13 @@ export const STORE_DIR = path.resolve(PROJECT_ROOT, 'store');
 export const GROUPS_DIR = path.resolve(PROJECT_ROOT, 'groups');
 export const DATA_DIR = path.resolve(PROJECT_ROOT, 'data');
 export const REPO_ROOT = PROJECT_ROOT;
+// Per-CC-project mnemon discovery root. The memory daemon walks this in
+// addition to GROUPS_DIR; any subdir containing a `.memory-enabled` marker
+// becomes a discovered group with agentGroupId = `cc-<slug>` and a
+// per-project mnemon store at ~/.mnemon/data/cc-<slug>/. Slug is the CC
+// project directory name (e.g. `-home-ubuntu-nanoclaw-v2`).
+export const CC_PROJECTS_DIR = path.join(HOME_DIR, '.claude', 'projects');
+export const CC_MEMORY_MARKER = '.memory-enabled';
 
 // Per-checkout image tag so two installs on the same host don't share
 // `nanoclaw-agent:latest` and clobber each other on rebuild.
