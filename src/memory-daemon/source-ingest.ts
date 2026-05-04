@@ -54,14 +54,38 @@ function sha256(content: string): string {
   return createHash('sha256').update(content).digest('hex');
 }
 
+/**
+ * Canonicalize for stable hashing. Strip null bytes here as well as in the
+ * classifier-client facade so processed_sources.content_sha256 and
+ * idempotency_keys reference the SAME string the model receives. Without this
+ * the hash references bytes the model never saw, which silently breaks dedup
+ * (two files identical modulo \0 would have different hashes) and idempotency
+ * round-trips. The binary-detection pass (looksBinary) already rejects any
+ * file containing a null byte, but stripping in canonicalize is defense in
+ * depth for unfamiliar edge cases.
+ */
 function canonicalize(content: string): string {
-  return content.trim().replace(/\r\n/g, '\n');
+  return content.trim().replace(/\r\n/g, '\n').replace(/\0/g, '');
 }
 
 /**
- * Heuristic binary detection on the first 8KB of a buffer. Returns true if the
- * content is binary (PNG, GIF, ZIP, etc.) and should not be fed to the
- * classifier as text.
+ * Heuristic binary detection. Returns true if the input is binary (PNG, GIF,
+ * ZIP, etc.) and should not be fed to the classifier as text.
+ *
+ * Two-pass design (Codex Finding F2, 2026-05-04):
+ * - Pass 1: FULL scan for null bytes. Any \0 anywhere in the buffer flags
+ *   the file as binary. The earlier 8KB-sample-only version let
+ *   text-prefix-then-binary files slip through (a 9KB-clean text header
+ *   followed by binary payload would not trip the guard); Codex correctly
+ *   called that out. Full-scan is O(N) bytewise — cheap enough.
+ * - Pass 2: density check on the first 8KB. If >5% of sample bytes are
+ *   non-printable control bytes (excluding tab/LF/CR), flag as binary.
+ *   Catches binary headers without flagging long UTF-8 docs that happen to
+ *   contain occasional control chars (BOM, NEL, etc.).
+ *
+ * Accepts Buffer (preferred — runs before UTF-8 decode) or string. Buffer
+ * input avoids the surprise of `String.charCodeAt` returning UTF-16 code
+ * units for multibyte sequences instead of raw bytes.
  *
  * Two failure modes this prevents:
  * 1. Node `spawn()` rejects args containing `\0` with TypeError [ERR_INVALID_ARG_VALUE].
@@ -70,26 +94,30 @@ function canonicalize(content: string): string {
  * 2. Codex CLI exits 0 without writing `--output-last-message` when the model
  *    sees garbage input and emits no final message. Looks like a transient
  *    failure but is deterministic for binary content; retries always poison.
- *
- * The 5% non-printable threshold catches PDFs/binaries while tolerating a
- * realistic amount of UTF-8 content with stray control chars (BOM, NEL, etc.).
- * Any null byte alone is sufficient to reject — null bytes are never legal in
- * UTF-8 text and they're the trigger for failure mode 1.
  */
-export function looksBinary(content: string): boolean {
-  const sample = content.length > 8192 ? content.slice(0, 8192) : content;
-  if (sample.length === 0) return false;
+export function looksBinary(input: Buffer | string): boolean {
+  const data = typeof input === 'string' ? Buffer.from(input, 'utf8') : input;
+  if (data.length === 0) return false;
+
+  // Pass 1: full scan for null bytes — never let one through, regardless of
+  // file size. This is the load-bearing change vs the old 8KB-only version.
+  for (let i = 0; i < data.length; i++) {
+    if (data[i] === 0) return true;
+  }
+
+  // Pass 2: density check on first 8KB. The threshold is calibrated for
+  // catching binary file headers without flagging realistic text.
+  const sampleEnd = Math.min(8192, data.length);
   let nonPrintable = 0;
-  for (let i = 0; i < sample.length; i++) {
-    const c = sample.charCodeAt(i);
-    if (c === 0) return true;
-    // Allow tab, LF, CR, common whitespace; flag other ASCII control bytes.
-    // High-bit (>=0x80) is fine — it's UTF-8 multibyte continuation.
+  for (let i = 0; i < sampleEnd; i++) {
+    const c = data[i];
+    // Allow tab (9), LF (10), CR (13), and any high-bit byte (>=0x80) which
+    // is a UTF-8 multibyte continuation. Flag other ASCII control bytes.
     if (c < 32 && c !== 9 && c !== 10 && c !== 13) {
       nonPrintable++;
     }
   }
-  return nonPrintable / sample.length > 0.05;
+  return nonPrintable / sampleEnd > 0.05;
 }
 
 function dateFolder(): string {
@@ -267,37 +295,43 @@ export class SourceIngester {
           if (r === 0) break;
           bytesRead += r;
         }
-        content = buf.subarray(0, bytesRead).toString('utf8');
+        const rawBuf = buf.subarray(0, bytesRead);
+
+        // Reject binary content BEFORE UTF-8 decode (Codex Finding F2).
+        // Running the heuristic on the raw Buffer (a) catches null bytes
+        // anywhere in the file, not just the first 8KB, and (b) avoids the
+        // surprise of charCodeAt returning UTF-16 code units instead of
+        // raw bytes. PNG/GIF/PDF attachments produce strings with null
+        // bytes that crash spawn() in the codex backend, or all-binary
+        // sequences that make codex exit 0 without writing output (looks
+        // like a transient failure but is deterministic; retries always
+        // poison). Move the file to processed/ and clear any dead_letter
+        // row so a stuck file from before this guard existed retires
+        // cleanly.
+        if (looksBinary(rawBuf)) {
+          const processedDir = path.join(sourcesBasePath, 'sources', 'processed', dateFolder());
+          try {
+            fs.mkdirSync(processedDir, { recursive: true });
+            fs.renameSync(filePath, path.join(processedDir, path.basename(filePath)));
+          } catch {
+            // best-effort; if move fails the next sweep will just re-detect
+            // and re-skip it — no work loss.
+          }
+          // Clear dead_letter row keyed on the resolved file path so the
+          // retry loop doesn't keep finding it. Without this, files that
+          // were poisoned before the binary guard existed would stay in
+          // dead_letters forever (they'd retry, the path wouldn't exist,
+          // and the daemon would skip without ever clearing the row).
+          deleteAfterSuccess(filePath, agentGroupId);
+          return { factsWritten: 0, failed: false };
+        }
+
+        content = rawBuf.toString('utf8');
       } finally {
         fs.closeSync(fd);
       }
     } catch {
       return { factsWritten: 0, failed: true };
-    }
-
-    // Reject binary content before it reaches the classifier. PNG/GIF
-    // attachments, PDFs, etc. read as UTF-8 produce strings with null bytes
-    // (which crash spawn() in the codex backend) or all-binary sequences
-    // (which make codex exit 0 without writing output, looking like a
-    // transient failure but deterministic). Move the file to processed/
-    // and clear any dead_letter row so a stuck file from before this guard
-    // existed gets retired cleanly.
-    if (looksBinary(content)) {
-      const processedDir = path.join(sourcesBasePath, 'sources', 'processed', dateFolder());
-      try {
-        fs.mkdirSync(processedDir, { recursive: true });
-        fs.renameSync(filePath, path.join(processedDir, path.basename(filePath)));
-      } catch {
-        // best-effort; if move fails the next sweep will just re-detect and
-        // re-skip it — no work loss.
-      }
-      // Clear dead_letter row keyed on the resolved file path so the retry
-      // loop doesn't keep finding it. Without this, files that were poisoned
-      // before the binary guard existed would stay in dead_letters forever
-      // (they'd retry, the path wouldn't exist, and the daemon would skip
-      // without ever clearing the row).
-      deleteAfterSuccess(filePath, agentGroupId);
-      return { factsWritten: 0, failed: false };
     }
 
     const canonical = canonicalize(content);
