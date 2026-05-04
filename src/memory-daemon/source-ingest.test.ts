@@ -3,7 +3,7 @@ import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
 import { GROUPS_DIR } from '../config.js';
-import { SourceIngester, setIngestDb } from './source-ingest.js';
+import { SourceIngester, setIngestDb, looksBinary } from './source-ingest.js';
 import type { MemoryStore, RememberResult } from '../modules/memory/store.js';
 import type { HealthRecorder } from './health.js';
 import { setDeadLettersDb } from './dead-letters.js';
@@ -450,5 +450,59 @@ describe('SourceIngester', () => {
 
     renameSpy.mockRestore();
     ingestDb.close();
+  });
+});
+
+describe('looksBinary', () => {
+  it('returns false for plain UTF-8 text', () => {
+    expect(looksBinary('Hello, world. This is a normal sentence.\nWith a newline.\n')).toBe(false);
+  });
+
+  it('returns false for empty string', () => {
+    expect(looksBinary('')).toBe(false);
+  });
+
+  it('returns false for UTF-8 with multibyte chars', () => {
+    expect(looksBinary('café — naïve résumé 你好 🎉')).toBe(false);
+  });
+
+  it('returns true on any null byte', () => {
+    expect(looksBinary('valid text \0 with embedded null')).toBe(true);
+  });
+
+  it('returns true for PNG magic bytes', () => {
+    // PNG file header: 0x89 0x50 0x4E 0x47 0x0D 0x0A 0x1A 0x0A then chunks
+    // The IHDR chunk and beyond contain plenty of low-byte garbage.
+    const pngHeader = '\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR' + '\x01\x02\x03\x04'.repeat(100);
+    expect(looksBinary(pngHeader)).toBe(true);
+  });
+
+  it('returns true when >5% of sample is non-printable control bytes', () => {
+    // 100 chars, 6 non-printable (excluding tab/LF/CR which are allowed)
+    const mixed = 'a'.repeat(94) + '\x01\x02\x03\x04\x05\x06';
+    expect(looksBinary(mixed)).toBe(true);
+  });
+
+  it('returns false at exactly 5% threshold', () => {
+    // 100 chars, 5 non-printable — should NOT trigger (must be > 5%)
+    const mixed = 'a'.repeat(95) + '\x01\x02\x03\x04\x05';
+    expect(looksBinary(mixed)).toBe(false);
+  });
+
+  it('only samples first 8KB for the percentage calc', () => {
+    // 16KB of clean text + some control bytes after the 8KB cap — those
+    // should not contribute to the ratio because they're outside the sample.
+    const clean = 'a'.repeat(8192);
+    const trailingGarbage = '\x01\x02\x03'.repeat(1000);
+    expect(looksBinary(clean + trailingGarbage)).toBe(false);
+  });
+
+  it('finds null bytes outside the 8KB sample? No — null check is sample-only too', () => {
+    // The sample is the first 8KB; null bytes after that are not detected.
+    // Documenting current behavior: a 16KB file with a null byte at 9KB is
+    // not flagged. This is a deliberate trade-off (8KB is enough for header
+    // detection of common binary formats; full-scan would be O(N) per file).
+    const sample = 'a'.repeat(8192) + '\0extra';
+    expect(looksBinary(sample)).toBe(false);
   });
 });

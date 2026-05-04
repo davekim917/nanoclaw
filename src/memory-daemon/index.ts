@@ -3,7 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import { openMnemonIngestDb, runMnemonIngestMigrations } from '../db/migrations/019-mnemon-ingest-db.js';
 import { HealthRecorder } from './health.js';
-import { setDeadLettersDb, getDueRetries } from './dead-letters.js';
+import { setDeadLettersDb, getDueRetries, deleteAfterSuccess } from './dead-letters.js';
 import { runChatStreamSweep, setIngestDb } from './classifier.js';
 import { SourceIngester, setIngestDb as setSourceIngestDb } from './source-ingest.js';
 import { readContainerConfig } from '../container-config.js';
@@ -127,6 +127,12 @@ async function runSweep(ingester: SourceIngester, health: HealthRecorder, store:
       } else if (retry.itemType === 'source-file') {
         if (fs.existsSync(retry.itemKey)) {
           await ingester.processInboxFile(group.agentGroupId, group.folder, retry.itemKey, store, health);
+        } else {
+          // File no longer exists at the recorded path — already moved to
+          // processed/ (success or binary-guard skip) or manually removed.
+          // Without this clear, the dead_letter row sits forever and the
+          // retry loop keeps finding it on every sweep, doing nothing.
+          deleteAfterSuccess(retry.itemKey, group.agentGroupId);
         }
       }
     }

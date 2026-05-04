@@ -8,7 +8,7 @@ import type { MemoryStore, FactInput } from '../modules/memory/store.js';
 import { redactSecrets } from '../modules/memory/secret-redactor.js';
 import { callClassifier, EXTRACTOR_VERSION, PROMPT_VERSION } from './classifier-client.js';
 import { validateFactsAgainstSource } from './classifier-validator.js';
-import { recordOrIncrementFailure } from './dead-letters.js';
+import { recordOrIncrementFailure, deleteAfterSuccess } from './dead-letters.js';
 import type { HealthRecorder } from './health.js';
 
 export interface IngestSweepResult {
@@ -57,6 +57,40 @@ function sha256(content: string): string {
 
 function canonicalize(content: string): string {
   return content.trim().replace(/\r\n/g, '\n');
+}
+
+/**
+ * Heuristic binary detection on the first 8KB of a buffer. Returns true if the
+ * content is binary (PNG, GIF, ZIP, etc.) and should not be fed to the
+ * classifier as text.
+ *
+ * Two failure modes this prevents:
+ * 1. Node `spawn()` rejects args containing `\0` with TypeError [ERR_INVALID_ARG_VALUE].
+ *    Codex backend pushes the prompt as a positional arg, so a null byte
+ *    anywhere in the source content kills the whole spawn.
+ * 2. Codex CLI exits 0 without writing `--output-last-message` when the model
+ *    sees garbage input and emits no final message. Looks like a transient
+ *    failure but is deterministic for binary content; retries always poison.
+ *
+ * The 5% non-printable threshold catches PDFs/binaries while tolerating a
+ * realistic amount of UTF-8 content with stray control chars (BOM, NEL, etc.).
+ * Any null byte alone is sufficient to reject — null bytes are never legal in
+ * UTF-8 text and they're the trigger for failure mode 1.
+ */
+export function looksBinary(content: string): boolean {
+  const sample = content.length > 8192 ? content.slice(0, 8192) : content;
+  if (sample.length === 0) return false;
+  let nonPrintable = 0;
+  for (let i = 0; i < sample.length; i++) {
+    const c = sample.charCodeAt(i);
+    if (c === 0) return true;
+    // Allow tab, LF, CR, common whitespace; flag other ASCII control bytes.
+    // High-bit (>=0x80) is fine — it's UTF-8 multibyte continuation.
+    if (c < 32 && c !== 9 && c !== 10 && c !== 13) {
+      nonPrintable++;
+    }
+  }
+  return nonPrintable / sample.length > 0.05;
 }
 
 function dateFolder(): string {
@@ -232,6 +266,31 @@ export class SourceIngester {
       }
     } catch {
       return { factsWritten: 0, failed: true };
+    }
+
+    // Reject binary content before it reaches the classifier. PNG/GIF
+    // attachments, PDFs, etc. read as UTF-8 produce strings with null bytes
+    // (which crash spawn() in the codex backend) or all-binary sequences
+    // (which make codex exit 0 without writing output, looking like a
+    // transient failure but deterministic). Move the file to processed/
+    // and clear any dead_letter row so a stuck file from before this guard
+    // existed gets retired cleanly.
+    if (looksBinary(content)) {
+      const processedDir = path.join(GROUPS_DIR, folder, 'sources', 'processed', dateFolder());
+      try {
+        fs.mkdirSync(processedDir, { recursive: true });
+        fs.renameSync(filePath, path.join(processedDir, path.basename(filePath)));
+      } catch {
+        // best-effort; if move fails the next sweep will just re-detect and
+        // re-skip it — no work loss.
+      }
+      // Clear dead_letter row keyed on the resolved file path so the retry
+      // loop doesn't keep finding it. Without this, files that were poisoned
+      // before the binary guard existed would stay in dead_letters forever
+      // (they'd retry, the path wouldn't exist, and the daemon would skip
+      // without ever clearing the row).
+      deleteAfterSuccess(filePath, agentGroupId);
+      return { factsWritten: 0, failed: false };
     }
 
     const canonical = canonicalize(content);
