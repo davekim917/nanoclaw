@@ -135,7 +135,7 @@ describe('classifier', () => {
         {
           content: 'TypeScript generics allow reusable components',
           category: 'fact',
-          importance: 3,
+          importance: 4,
           entities: ['TypeScript'],
           source_role: 'assistant',
         },
@@ -267,14 +267,14 @@ describe('classifier', () => {
         {
           content: 'Atomicity means all ops succeed or all fail',
           category: 'fact',
-          importance: 3,
+          importance: 4,
           entities: [],
           source_role: 'assistant',
         },
         {
           content: 'Isolation prevents concurrent transactions from interfering',
           category: 'fact',
-          importance: 3,
+          importance: 4,
           entities: [],
           source_role: 'assistant',
         },

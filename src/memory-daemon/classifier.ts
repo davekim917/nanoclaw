@@ -18,6 +18,14 @@ export interface SweepResult {
   poisoned: number;
 }
 
+// Minimum importance required for a classifier-emitted fact to be persisted.
+// Facts below this score are dropped silently. Tuned 2026-05-04 from default-
+// off (every fact stored) to 4 after an audit showed ~50% of stored facts
+// were importance=3 noise. The classifier's 1-5 scale: 5=critical, 4=durable
+// signal, 3=tactical context, 1-2=trivial. Bumping to 4 keeps decisions/key
+// facts/insights, drops the context bag.
+const MIN_FACT_IMPORTANCE = 4;
+
 const CLASSIFIER_SYSTEM_PROMPT = `You are a memory extraction assistant. Your job is to read a conversation turn (a user message and an optional assistant response) and extract atomic, reusable facts worth storing in a long-term memory system.
 
 Output ONLY valid JSON matching this exact schema:
@@ -319,9 +327,21 @@ async function classifyPair(
       },
     };
 
+    // Redaction runs BEFORE the importance gate so secret-shaped content is
+    // always counted in health.recordRedaction, even when the fact would have
+    // been dropped for being low-signal. Audit signal > store-write savings.
     const redactionResult = redactSecrets(factInput);
     if (!redactionResult.shouldStore) {
       health.recordRedaction(agentGroupId, redactionResult.reason ?? 'unknown');
+      continue;
+    }
+
+    // Importance gate — drop low-signal facts before they pollute the store.
+    // Empirically (illysium store, 2026-05-04 sample of 50 recall results) ~50%
+    // of stored facts came in at importance=3 — useful tactical context but not
+    // durable enough to keep forever. importance=4-5 is decisions, key facts,
+    // and high-signal insights. The classifier emits 1-5 per its prompt.
+    if (rawFact.importance < MIN_FACT_IMPORTANCE) {
       continue;
     }
 
