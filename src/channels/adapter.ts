@@ -185,7 +185,7 @@ export interface ChannelAdapter {
   fetchThreadHistory?(
     threadId: string,
     opts?: { limit?: number; excludeMessageId?: string },
-  ): Promise<Array<{ sender: string; text: string; timestamp: string }>>;
+  ): Promise<Array<{ sender: string; text: string; timestamp: string; isAnchor?: boolean }>>;
 
   /**
    * Open (or fetch) a DM with this user, returning the platform_id of the

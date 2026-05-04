@@ -101,6 +101,30 @@ export interface ChatSdkBridgeConfig {
    * and reactions still target the head of the reply.
    */
   maxTextLength?: number;
+  /**
+   * Optional fetch for the thread's anchor/starter message(s) — context
+   * that seeded the thread but lives outside `fetchMessages(threadId)`.
+   *
+   * Discord's chat-adapter auto-creates a thread when an inbound channel-
+   * root message @mentions the bot, anchored on that mention. If the
+   * mention was also a Reply to another message, *that* parent (M0) is the
+   * thing the user actually wants the agent to act on — "fix stale claims"
+   * means nothing without the wiki-lint findings it referenced. So the
+   * adapter returns up to two messages: M0 (the replied-to parent) first,
+   * then M1 (the @mention itself). Both are tagged `isAnchor: true` so
+   * the router can exempt them from the `last_active` filter on follow-up
+   * wakes (anchors don't decay; they're load-bearing thread context).
+   *
+   * `excludeMessageId` is the id of the inbound trigger so the
+   * implementation can drop the anchor when `thread.id == trigger.id`
+   * (the first wake, where anchor and trigger are the same message).
+   *
+   * Return null on no anchor, error, or when the anchor IS the trigger.
+   */
+  fetchThreadAnchor?: (
+    threadId: string,
+    opts?: { excludeMessageId?: string },
+  ) => Promise<Array<{ sender: string; text: string; timestamp: string; isAnchor: true }> | null>;
 }
 
 /**
@@ -610,8 +634,9 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
     async fetchThreadHistory(
       threadId: string,
       opts?: { limit?: number; excludeMessageId?: string },
-    ): Promise<Array<{ sender: string; text: string; timestamp: string }>> {
+    ): Promise<Array<{ sender: string; text: string; timestamp: string; isAnchor?: boolean }>> {
       const limit = opts?.limit ?? 50;
+      const inThread: Array<{ sender: string; text: string; timestamp: string; isAnchor?: boolean }> = [];
       try {
         const result = await adapter.fetchMessages(threadId, { limit });
         const msgs = (result?.messages ?? []) as Array<{
@@ -620,21 +645,56 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           author: { fullName: string; userName: string; isMe: boolean };
           metadata: { dateSent: Date };
         }>;
-        return msgs
-          .filter((m) => m.id !== opts?.excludeMessageId && (m.text?.length ?? 0) > 0)
-          .map((m) => ({
+        for (const m of msgs) {
+          if (m.id === opts?.excludeMessageId) continue;
+          if (!m.text || m.text.length === 0) continue;
+          inThread.push({
             sender: m.author.isMe ? 'assistant' : m.author.fullName || m.author.userName || 'unknown',
             text: m.text,
             timestamp: m.metadata.dateSent.toISOString(),
-          }));
+          });
+        }
       } catch (err) {
         log.warn('fetchThreadHistory failed', {
           adapter: adapter.name,
           threadId,
           err: err instanceof Error ? err.message : String(err),
         });
-        return [];
       }
+
+      // Discord auto-creates threads from a parent channel message; the parent
+      // sits outside `fetchMessages(threadId)` (which only sees in-thread
+      // messages). The hook may return up to two messages — M0 (the message
+      // the mention replied to) and M1 (the mention itself) — chronologically
+      // ordered. Both are tagged isAnchor so the router exempts them from
+      // the last_active filter on follow-up wakes.
+      //
+      // De-dupe on (sender, text) against the in-thread set — for forum
+      // threads the anchor is already the first in-thread message, and
+      // timestamps from the message-by-id endpoint and the channel-messages
+      // endpoint don't always round-trip to the same ISO string.
+      if (config.fetchThreadAnchor) {
+        try {
+          const anchors = await config.fetchThreadAnchor(threadId, { excludeMessageId: opts?.excludeMessageId });
+          if (anchors && anchors.length > 0) {
+            // Iterate in reverse so unshift preserves the hook's chronological order.
+            for (let i = anchors.length - 1; i >= 0; i--) {
+              const a = anchors[i];
+              if (!a.text || a.text.length === 0) continue;
+              const alreadyPresent = inThread.some((m) => m.sender === a.sender && m.text === a.text);
+              if (!alreadyPresent) inThread.unshift(a);
+            }
+          }
+        } catch (err) {
+          log.warn('fetchThreadAnchor failed', {
+            adapter: adapter.name,
+            threadId,
+            err: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+
+      return inThread;
     },
 
     async subscribe(_platformId: string, threadId: string) {

@@ -734,7 +734,13 @@ async function deliverToAgent(
         excludeMessageId: event.message.id,
       });
       const sinceIso = created ? null : session.last_active;
-      const relevant = sinceIso ? history.filter((m) => m.timestamp > sinceIso) : history;
+      // Anchor messages (Discord thread parents — what the @mention was
+      // replying to, plus the @mention itself) are load-bearing context
+      // that doesn't decay. The agent's prior turns ARE in the SDK
+      // continuation, but the original ask isn't — it lived outside the
+      // thread. Exempt anchors from the last_active filter so follow-up
+      // wakes still see "what is this thread actually about?"
+      const relevant = sinceIso ? history.filter((m) => m.isAnchor || m.timestamp > sinceIso) : history;
       if (relevant.length > 0) {
         const header = created ? 'Thread context' : 'New in thread since last response';
         const transcript = relevant.map((m) => `${m.sender}: ${m.text}`).join('\n');

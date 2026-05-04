@@ -5,6 +5,7 @@
 import { createDiscordAdapter } from '@chat-adapter/discord';
 
 import { readEnvFile } from '../env.js';
+import { log } from '../log.js';
 import { transformOutsideProtectedRegions } from '../text-styles.js';
 import { createChatSdkBridge, type ReplyContext } from './chat-sdk-bridge.js';
 import { registerChannelAdapter } from './channel-registry.js';
@@ -16,6 +17,92 @@ function extractReplyContext(raw: Record<string, any>): ReplyContext | null {
   return {
     text: reply.content || '',
     sender: reply.author?.global_name || reply.author?.username || 'Unknown',
+  };
+}
+
+/**
+ * Fetch the parent/anchor message that seeded a Discord thread.
+ *
+ * The Chat SDK encodes thread ids as `discord:{guildId}:{channelId}:{threadId}`
+ * where `channelId` is the parent channel and `threadId` (when present) is the
+ * Discord thread id. For threads created from a message (the common case for
+ * "Reply" auto-thread or right-click → Create Thread), the thread id equals
+ * the parent message id, and that message lives in the parent channel — not
+ * inside the thread. So `GET /channels/{thread_id}/messages` (what
+ * `fetchMessages` calls) skips the anchor entirely.
+ *
+ * Without this lookup the agent's first wake inside an auto-thread sees only
+ * the user's reply, with no idea what they're replying to.
+ *
+ * Returns null for channel-root messages (no thread part), forum-style
+ * threads where the anchor is already the first in-thread message (404), or
+ * any error — callers fall through to the normal in-thread history.
+ */
+interface DiscordRawMessage {
+  content?: string;
+  timestamp?: string;
+  author?: { global_name?: string; username?: string };
+  referenced_message?: DiscordRawMessage | null;
+}
+
+function parseAnchorMessage(
+  msg: DiscordRawMessage,
+): { sender: string; text: string; timestamp: string; isAnchor: true } | null {
+  const text = msg.content ?? '';
+  if (!text) return null;
+  const sender = msg.author?.global_name || msg.author?.username || 'unknown';
+  const timestamp = msg.timestamp ? new Date(msg.timestamp).toISOString() : new Date().toISOString();
+  return { sender, text, timestamp, isAnchor: true };
+}
+
+function makeFetchThreadAnchor(
+  botToken: string,
+): (
+  encodedThreadId: string,
+  opts?: { excludeMessageId?: string },
+) => Promise<Array<{ sender: string; text: string; timestamp: string; isAnchor: true }> | null> {
+  return async (encodedThreadId, opts) => {
+    const parts = encodedThreadId.split(':');
+    if (parts.length < 4 || parts[0] !== 'discord') return null;
+    const channelId = parts[2];
+    const threadId = parts[3];
+    if (!channelId || !threadId) return null;
+
+    // Discord's chat-adapter auto-creates a thread anchored on the user's
+    // @mention message — `thread.id == mention.id`. On the first wake the
+    // trigger IS the anchor, so the hook bails out: prepending it would
+    // duplicate the current turn into the prepended thread context.
+    if (opts?.excludeMessageId && opts.excludeMessageId === threadId) return null;
+
+    const url = `https://discord.com/api/v10/channels/${channelId}/messages/${threadId}`;
+    let response: Response;
+    try {
+      response = await fetch(url, { headers: { Authorization: `Bot ${botToken}` } });
+    } catch (err) {
+      log.debug('Discord anchor fetch network error', {
+        encodedThreadId,
+        err: err instanceof Error ? err.message : String(err),
+      });
+      return null;
+    }
+    if (response.status === 404) return null;
+    if (!response.ok) {
+      log.debug('Discord anchor fetch non-OK', { encodedThreadId, status: response.status });
+      return null;
+    }
+    const m1 = (await response.json()) as DiscordRawMessage;
+
+    // M0: the message M1 was Reply-ing to. Discord inlines `referenced_message`
+    // on the GET response when the parent is recent enough (~2 weeks), so no
+    // second round-trip is needed. This is the message the user actually
+    // wants the agent to act on — the anchor (M1) by itself is often a bare
+    // imperative like "fix this" that's meaningless without M0.
+    const out: Array<{ sender: string; text: string; timestamp: string; isAnchor: true }> = [];
+    const m0 = m1.referenced_message ? parseAnchorMessage(m1.referenced_message) : null;
+    if (m0) out.push(m0);
+    const m1Parsed = parseAnchorMessage(m1);
+    if (m1Parsed) out.push(m1Parsed);
+    return out.length > 0 ? out : null;
   };
 }
 
@@ -110,6 +197,7 @@ registerChannelAdapter('discord', {
       // `|`-pipe text in Discord (no native table block).
       transformOutboundMarkdown: rewriteDiscordLinks,
       inboundFilter: isUserMessage,
+      fetchThreadAnchor: makeFetchThreadAnchor(env.DISCORD_BOT_TOKEN),
     });
   },
 });

@@ -109,6 +109,113 @@ describe('createChatSdkBridge', () => {
   });
 });
 
+describe('createChatSdkBridge — fetchThreadHistory anchor', () => {
+  // Discord auto-creates a thread when a user replies to a channel-root
+  // message; the parent message lives in the parent channel, outside what
+  // `fetchMessages(threadId)` returns. The fetchThreadAnchor hook prepends
+  // that anchor so the agent's first wake inside the thread sees what the
+  // user is replying to.
+
+  function adapterWithFetchMessages(msgs: Array<{ id: string; text: string; sender: string; iso: string }>) {
+    return stubAdapter({
+      fetchMessages: async () => ({
+        messages: msgs.map((m) => ({
+          id: m.id,
+          text: m.text,
+          author: { fullName: m.sender, userName: m.sender, isMe: false },
+          metadata: { dateSent: new Date(m.iso) },
+        })),
+      }),
+    } as unknown as Partial<Adapter>);
+  }
+
+  it('prepends the anchor messages returned by fetchThreadAnchor (M0 + M1, in chronological order)', async () => {
+    const bridge = createChatSdkBridge({
+      adapter: adapterWithFetchMessages([
+        { id: 'in-1', text: 'reply inside thread', sender: 'Dave', iso: '2026-05-03T13:00:00Z' },
+      ]),
+      supportsThreads: true,
+      fetchThreadAnchor: async () => [
+        {
+          sender: 'Axie',
+          text: 'wiki lint findings — 3 categories',
+          timestamp: '2026-05-03T10:00:00Z',
+          isAnchor: true,
+        },
+        {
+          sender: 'Dave',
+          text: '@Axie fix stale claims',
+          timestamp: '2026-05-03T10:30:00Z',
+          isAnchor: true,
+        },
+      ],
+    });
+    const history = await bridge.fetchThreadHistory!('discord:g:c:t', { limit: 50 });
+    expect(history).toHaveLength(3);
+    expect(history[0].text).toBe('wiki lint findings — 3 categories');
+    expect(history[0].isAnchor).toBe(true);
+    expect(history[1].text).toBe('@Axie fix stale claims');
+    expect(history[1].isAnchor).toBe(true);
+    expect(history[2].sender).toBe('Dave');
+    expect(history[2].isAnchor).toBeUndefined();
+  });
+
+  it('skips the anchor when fetchThreadAnchor returns null (forum threads, channel root, errors)', async () => {
+    const bridge = createChatSdkBridge({
+      adapter: adapterWithFetchMessages([
+        { id: 'in-1', text: 'reply inside thread', sender: 'Dave', iso: '2026-05-03T12:00:00Z' },
+      ]),
+      supportsThreads: true,
+      fetchThreadAnchor: async () => null,
+    });
+    const history = await bridge.fetchThreadHistory!('discord:g:c:t', { limit: 50 });
+    expect(history).toHaveLength(1);
+    expect(history[0].sender).toBe('Dave');
+  });
+
+  it('does not duplicate when the anchor is already in the in-thread results (forum threads)', async () => {
+    const sharedIso = '2026-05-03T10:00:00Z';
+    const sharedText = 'forum starter post';
+    const bridge = createChatSdkBridge({
+      adapter: adapterWithFetchMessages([
+        { id: 'starter', text: sharedText, sender: 'Axie', iso: sharedIso },
+        { id: 'in-1', text: 'reply', sender: 'Dave', iso: '2026-05-03T12:00:00Z' },
+      ]),
+      supportsThreads: true,
+      fetchThreadAnchor: async () => [{ sender: 'Axie', text: sharedText, timestamp: sharedIso, isAnchor: true }],
+    });
+    const history = await bridge.fetchThreadHistory!('discord:g:c:t', { limit: 50 });
+    expect(history.filter((m) => m.text === sharedText)).toHaveLength(1);
+  });
+
+  it('still returns in-thread history when fetchThreadAnchor throws', async () => {
+    const bridge = createChatSdkBridge({
+      adapter: adapterWithFetchMessages([{ id: 'in-1', text: 'reply', sender: 'Dave', iso: '2026-05-03T12:00:00Z' }]),
+      supportsThreads: true,
+      fetchThreadAnchor: async () => {
+        throw new Error('network down');
+      },
+    });
+    const history = await bridge.fetchThreadHistory!('discord:g:c:t', { limit: 50 });
+    expect(history).toHaveLength(1);
+    expect(history[0].sender).toBe('Dave');
+  });
+
+  it('forwards excludeMessageId to fetchThreadAnchor (so adapters can skip when anchor == trigger)', async () => {
+    let receivedExclude: string | undefined;
+    const bridge = createChatSdkBridge({
+      adapter: adapterWithFetchMessages([]),
+      supportsThreads: true,
+      fetchThreadAnchor: async (_t, opts) => {
+        receivedExclude = opts?.excludeMessageId;
+        return null;
+      },
+    });
+    await bridge.fetchThreadHistory!('discord:g:c:t', { limit: 50, excludeMessageId: 'mention-msg-id' });
+    expect(receivedExclude).toBe('mention-msg-id');
+  });
+});
+
 describe('createChatSdkBridge — outbound transform path', () => {
   // The transform mode determines whether the adapter sees `markdown` or `raw`.
   // `markdown` is required for adapters that emit rich blocks (Slack Block Kit
