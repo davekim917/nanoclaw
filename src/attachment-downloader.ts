@@ -15,7 +15,7 @@
  * Claude directly) is a separate formatter change if we want inline
  * image reading rather than tool-based reads.
  */
-import { createHash } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
@@ -114,10 +114,43 @@ export function persistInboundAttachments(
               const sha = createHash('sha256').update(buffer).digest('hex').slice(0, 8);
               const ext = path.extname(filename) || '.bin';
               const finalName = `attachment-${sha}${ext}`;
-              const tmpPath = path.join(sourcesInbox, finalName + '.tmp');
               const finalPath = path.join(sourcesInbox, finalName);
+              // Codex F11 round 4 (2026-05-05): the prior tmpPath was
+              // `<finalName>.tmp` — fully predictable from attacker-supplied
+              // attachment bytes and extension. An attacker with write
+              // access to the inbox can pre-place that tmp path as a
+              // symlink to /etc/passwd or another group's inbox file;
+              // default writeFileSync follows symlinks and the host
+              // truncates/writes the symlink target. Defense:
+              //   1. Randomize tmp name so it can't be pre-placed
+              //   2. Open with O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW —
+              //      O_EXCL refuses to clobber existing entries, O_NOFOLLOW
+              //      refuses to traverse if the final path component is a
+              //      symlink. Together they bound the write to a fresh,
+              //      regular-file fd that we control.
+              const tmpName = `${finalName}.${randomBytes(8).toString('hex')}.tmp`;
+              const tmpPath = path.join(sourcesInbox, tmpName);
               if (!fs.existsSync(finalPath)) {
-                fs.writeFileSync(tmpPath, buffer);
+                let fd: number | undefined;
+                try {
+                  fd = fs.openSync(
+                    tmpPath,
+                    fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
+                    0o600,
+                  );
+                  fs.writeSync(fd, buffer);
+                } finally {
+                  if (fd !== undefined) {
+                    try {
+                      fs.closeSync(fd);
+                    } catch {
+                      /* best-effort */
+                    }
+                  }
+                }
+                // renameSync moves the directory entry; if finalPath was
+                // pre-placed as a symlink the rename replaces the symlink
+                // with the regular file (the symlink target is untouched).
                 fs.renameSync(tmpPath, finalPath);
               }
             } else {

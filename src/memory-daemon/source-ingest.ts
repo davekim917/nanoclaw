@@ -190,12 +190,25 @@ function dateFolder(): string {
  * inbox and re-processes via the existing dedup path. No work is lost.
  */
 function moveFileToProcessed(filePath: string, sourcesBasePath: string): boolean {
-  if (!isNonSymlinkChain(sourcesBasePath, 'sources', 'processed')) {
+  // Codex F10 round 4 (2026-05-05): also validate the date subdir.
+  // moveFileToProcessed previously chain-checked `sources/processed` but then
+  // appended dateFolder() unchecked. An attacker with write access to
+  // `sources/processed` can pre-create today's date dir as a symlink;
+  // mkdirSync({ recursive: true }) accepts the existing dir as-is and
+  // renameSync follows the link. Validate the full 3-component chain.
+  const date = dateFolder();
+  if (!isNonSymlinkChain(sourcesBasePath, 'sources', 'processed', date)) {
     return false;
   }
   try {
-    const processedDir = path.join(sourcesBasePath, 'sources', 'processed', dateFolder());
+    const processedDir = path.join(sourcesBasePath, 'sources', 'processed', date);
     fs.mkdirSync(processedDir, { recursive: true });
+    // Re-lstat the date dir AFTER mkdir to catch a race where the attacker
+    // turned the dir into a symlink between the chain check and now. mkdir
+    // is a no-op on an existing symlink-to-dir, so rename would still
+    // follow without this guard.
+    const dateStat = fs.lstatSync(processedDir);
+    if (dateStat.isSymbolicLink() || !dateStat.isDirectory()) return false;
     fs.renameSync(filePath, path.join(processedDir, path.basename(filePath)));
     return true;
   } catch {
