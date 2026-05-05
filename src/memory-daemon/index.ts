@@ -5,17 +5,27 @@ import { openMnemonIngestDb, runMnemonIngestMigrations } from '../db/migrations/
 import { HealthRecorder } from './health.js';
 import { setDeadLettersDb, getDueRetries, deleteAfterSuccess } from './dead-letters.js';
 import { runChatStreamSweep, setIngestDb } from './classifier.js';
-import { SourceIngester, setIngestDb as setSourceIngestDb } from './source-ingest.js';
+import { SourceIngester, setIngestDb as setSourceIngestDb, isNonSymlinkChain } from './source-ingest.js';
 import { readContainerConfig } from '../container-config.js';
-import { GROUPS_DIR } from '../config.js';
+import { GROUPS_DIR, CC_PROJECTS_DIR, CC_MEMORY_MARKER } from '../config.js';
 import type { MemoryStore } from '../modules/memory/store.js';
 
 const SWEEP_INTERVAL_MS = 60_000;
 
-function discoverMemoryGroups(
-  health?: HealthRecorder,
-): Array<{ agentGroupId: string; folder: string; enabled: boolean }> {
-  const groups: Array<{ agentGroupId: string; folder: string; enabled: boolean }> = [];
+export interface DiscoveredGroup {
+  agentGroupId: string;
+  folder: string;
+  // Absolute path to the directory that contains `sources/`. For
+  // GROUPS_DIR-discovered groups this is `<GROUPS_DIR>/<folder>`. For
+  // CC-discovered groups this is `<CC_PROJECTS_DIR>/<slug>`. Consumers compute
+  // inbox / processed paths from this base.
+  sourcesBasePath: string;
+  enabled: boolean;
+}
+
+// Exported for unit tests. Production code calls it from runSweep below.
+export function discoverMemoryGroups(health?: HealthRecorder): DiscoveredGroup[] {
+  const groups: DiscoveredGroup[] = [];
 
   let entries: string[];
   try {
@@ -59,9 +69,16 @@ function discoverMemoryGroups(
     // necessarily mean the file is recovered — it could just be empty.
     health?.clearMemoryEnabledCheckFailure(entry);
 
+    // Codex F6 round 2 (2026-05-05): legacy agent groups have the same
+    // bypass surface as CC projects — `<group>/sources/inbox` could be a
+    // symlink to another group's inbox, breaking cross-tenant isolation.
+    // Skip the group entirely on intermediate-symlink detection.
+    if (!isNonSymlinkChain(fullPath, 'sources', 'inbox')) continue;
+
     groups.push({
       agentGroupId,
       folder: entry,
+      sourcesBasePath: fullPath,
       enabled: config.memory?.enabled === true,
     });
   }
@@ -69,6 +86,75 @@ function discoverMemoryGroups(
   // Drop stale entries for groups that no longer exist on disk. The per-loop
   // clear above doesn't fire for deleted entries (the loop never visits them).
   health?.pruneMemoryEnabledCheckFailures(new Set(entries));
+
+  // CC-side discovery: walk ~/.claude/projects/<slug>/ for `.memory-enabled`
+  // markers. Each marked project becomes a discovered group with agentGroupId
+  // `cc-<slug>` and per-project store at the same name. CC sessions opt in by
+  // dropping the marker (the CC hooks at ~/.claude/hooks/cc-mnemon/ create it
+  // on first turn for default-on behavior). Discovery is best-effort — a
+  // missing CC_PROJECTS_DIR is normal on hosts that don't run CC.
+  // Codex F6 (2026-05-05): a previous version used fs.statSync + fs.existsSync
+  // which both follow symlinks. A symlink under CC_PROJECTS_DIR pointing at
+  // another marked project would be discovered as a new cc-<slug> group with
+  // sourcesBasePath set to the symlink path; downstream realpath checks
+  // validate against the inbox path (not the project root), so files from one
+  // project could be ingested into another's store, breaking cross-tenant
+  // isolation. Hardening:
+  //   1. readdirSync with withFileTypes:true → reject Dirents that ARE symlinks
+  //   2. realpath project root, require it to be a direct child of realpath(CC_PROJECTS_DIR)
+  //   3. lstat the marker (not existsSync) and require it to be a regular file
+  let ccDirents: fs.Dirent[];
+  try {
+    ccDirents = fs.readdirSync(CC_PROJECTS_DIR, { withFileTypes: true });
+  } catch {
+    return groups;
+  }
+  let ccRootReal: string;
+  try {
+    ccRootReal = fs.realpathSync(CC_PROJECTS_DIR);
+  } catch {
+    return groups;
+  }
+  for (const dirent of ccDirents) {
+    const entry = dirent.name;
+    const projectPath = path.join(CC_PROJECTS_DIR, entry);
+    // Reject symlinks at the readdir level — Dirent.isSymbolicLink() reflects
+    // the lstat type, so we don't follow the link before classifying it.
+    if (dirent.isSymbolicLink()) continue;
+    if (!dirent.isDirectory()) continue;
+    // Realpath the project to defend against bind-mounts or hard-link tricks
+    // that bypass the Dirent symlink check, and require it to be a direct
+    // child of CC_PROJECTS_DIR's realpath.
+    let projectReal: string;
+    try {
+      projectReal = fs.realpathSync(projectPath);
+    } catch {
+      continue;
+    }
+    if (path.dirname(projectReal) !== ccRootReal) continue;
+    // Marker must be a regular file (not a symlink, not a directory).
+    const markerPath = path.join(projectPath, CC_MEMORY_MARKER);
+    let markerStat: fs.Stats;
+    try {
+      markerStat = fs.lstatSync(markerPath);
+    } catch {
+      continue;
+    }
+    if (!markerStat.isFile()) continue;
+    // Codex F6 round 2 (2026-05-05): also reject if `sources` or
+    // `sources/inbox` are symlinks. A project with a non-symlink root and
+    // marker can still symlink an intermediate dir to another project's
+    // inbox; readdirSync/realpathSync at sweep time would follow the link
+    // and ingest victim files into this group's store. The chain check
+    // closes that bypass at discovery (and is re-checked at use time).
+    if (!isNonSymlinkChain(projectPath, 'sources', 'inbox')) continue;
+    groups.push({
+      agentGroupId: `cc-${entry}`,
+      folder: entry,
+      sourcesBasePath: projectPath,
+      enabled: true,
+    });
+  }
 
   return groups;
 }
@@ -82,7 +168,11 @@ async function runSweep(ingester: SourceIngester, health: HealthRecorder, store:
   await runChatStreamSweep(enabledGroups, store, health);
 
   for (const group of enabledGroups) {
-    const inboxPath = path.join(GROUPS_DIR, group.folder, 'sources', 'inbox');
+    // Codex F6 round 2: re-validate the chain at use time. Discovery
+    // already filtered, but a symlink swap between sweeps could TOCTOU
+    // around the discovery-time check. Cheap to re-run; closes the window.
+    if (!isNonSymlinkChain(group.sourcesBasePath, 'sources', 'inbox')) continue;
+    const inboxPath = path.join(group.sourcesBasePath, 'sources', 'inbox');
     let files: string[];
     let inboxRealPath: string;
     try {
@@ -114,7 +204,7 @@ async function runSweep(ingester: SourceIngester, health: HealthRecorder, store:
         continue;
       }
       if (!realPath.startsWith(inboxRealPath + path.sep)) continue;
-      await ingester.processInboxFile(group.agentGroupId, group.folder, realPath, store, health);
+      await ingester.processInboxFile(group.agentGroupId, group.sourcesBasePath, realPath, store, health);
     }
   }
 
@@ -126,7 +216,7 @@ async function runSweep(ingester: SourceIngester, health: HealthRecorder, store:
         break;
       } else if (retry.itemType === 'source-file') {
         if (fs.existsSync(retry.itemKey)) {
-          await ingester.processInboxFile(group.agentGroupId, group.folder, retry.itemKey, store, health);
+          await ingester.processInboxFile(group.agentGroupId, group.sourcesBasePath, retry.itemKey, store, health);
         } else {
           // File no longer exists at the recorded path — already moved to
           // processed/ (success or binary-guard skip) or manually removed.

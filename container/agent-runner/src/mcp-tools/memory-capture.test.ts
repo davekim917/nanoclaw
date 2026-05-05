@@ -41,6 +41,10 @@ function sha8(input: string): string {
 }
 
 const INBOX_DIR = '/workspace/agent/sources/inbox';
+// Sibling staging dir — atomic-write tmp lives outside the inbox to keep the
+// host daemon's inotify watcher from firing on transient .tmp paths. See
+// commit 52be6df. Tests assert tmp under STAGING_DIR, not INBOX_DIR.
+const STAGING_DIR = '/workspace/agent/sources/.tmp';
 
 beforeEach(() => {
   mockWriteFileSync.mockClear();
@@ -96,21 +100,22 @@ describe('test_mcp_hook_writes_tmp_then_rename', () => {
 
     const hash = sha8('meet-abc123|notes');
     const finalPath = path.join(INBOX_DIR, `granola-meeting-${hash}.md`);
-    const tmpPathPrefix = finalPath + '.';
+    const tmpStagedPath = path.join(STAGING_DIR, `granola-meeting-${hash}.md`);
 
-    // atomicWrite uses a randomized tmp suffix to avoid collisions on the
-    // tmp filename under concurrent writers; assert on prefix + .tmp shape
-    // and final-path link, not exact temp path.
+    // atomicWrite stages the tmp under STAGING_DIR (sibling of INBOX_DIR) so
+    // the daemon's inotify watcher only fires on the final filename's link.
+    // Randomized .<rand>.tmp suffix avoids collisions under concurrent writers;
+    // assert on STAGING_DIR prefix + .tmp shape, then link from staged tmp to
+    // the final inbox path.
     expect(mockWriteFileSync).toHaveBeenCalledWith(
-      expect.stringMatching(new RegExp(`^${finalPath.replace(/[/.]/g, '\\$&')}\\.[0-9a-f]+\\.tmp$`)),
+      expect.stringMatching(new RegExp(`^${tmpStagedPath.replace(/[/.]/g, '\\$&')}\\.[0-9a-f]+\\.tmp$`)),
       expect.any(String),
       expect.objectContaining({ flag: 'wx' }),
     );
     expect(mockLinkSync).toHaveBeenCalledWith(
-      expect.stringMatching(new RegExp(`^${finalPath.replace(/[/.]/g, '\\$&')}\\.[0-9a-f]+\\.tmp$`)),
+      expect.stringMatching(new RegExp(`^${tmpStagedPath.replace(/[/.]/g, '\\$&')}\\.[0-9a-f]+\\.tmp$`)),
       finalPath,
     );
-    void tmpPathPrefix;
   });
 });
 
@@ -158,7 +163,8 @@ describe('test_webfetch_hook_writes_url_content', () => {
 
     const hash = sha8(url);
     const finalPath = path.join(INBOX_DIR, `web-${hash}.md`);
-    const tmpRe = new RegExp(`^${finalPath.replace(/[/.]/g, '\\$&')}\\.[0-9a-f]+\\.tmp$`);
+    const tmpStagedPath = path.join(STAGING_DIR, `web-${hash}.md`);
+    const tmpRe = new RegExp(`^${tmpStagedPath.replace(/[/.]/g, '\\$&')}\\.[0-9a-f]+\\.tmp$`);
 
     expect(mockWriteFileSync).toHaveBeenCalledWith(
       expect.stringMatching(tmpRe),
@@ -180,7 +186,8 @@ describe('test_bash_hook_matches_gws_docs_read', () => {
 
     const hash = sha8(command);
     const finalPath = path.join(INBOX_DIR, `gws-${hash}.md`);
-    const tmpRe = new RegExp(`^${finalPath.replace(/[/.]/g, '\\$&')}\\.[0-9a-f]+\\.tmp$`);
+    const tmpStagedPath = path.join(STAGING_DIR, `gws-${hash}.md`);
+    const tmpRe = new RegExp(`^${tmpStagedPath.replace(/[/.]/g, '\\$&')}\\.[0-9a-f]+\\.tmp$`);
 
     expect(mockWriteFileSync).toHaveBeenCalledWith(
       expect.stringMatching(tmpRe),

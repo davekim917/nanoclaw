@@ -21,7 +21,8 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-const INBOX = '/home/ubuntu/nanoclaw-v2/groups/host-claude-code/sources/inbox';
+const GROUP_ROOT = '/home/ubuntu/nanoclaw-v2/groups/host-claude-code';
+const INBOX = `${GROUP_ROOT}/sources/inbox`;
 // Sibling staging dir OUTSIDE the watched inbox. The daemon's inotify
 // watcher fires on every CLOSE_WRITE in INBOX, so the original pattern
 // (writeFileSync to <inbox>/foo.tmp then renameSync to <inbox>/foo) made the
@@ -29,7 +30,39 @@ const INBOX = '/home/ubuntu/nanoclaw-v2/groups/host-claude-code/sources/inbox';
 // processInboxFile, the rename had moved the file and the read failed →
 // dead-letter row. Staging the .tmp HERE then renaming into INBOX means the
 // daemon only sees the IN_MOVED_TO event for the final filename.
-const STAGING = '/home/ubuntu/nanoclaw-v2/groups/host-claude-code/sources/.tmp';
+const STAGING = `${GROUP_ROOT}/sources/.tmp`;
+
+/**
+ * Codex F12 round 4 (2026-05-05): mirror the daemon's chain validation here.
+ * If sources/inbox or sources/.tmp is replaced with a symlink, the hook
+ * could publish CC turn captures into another group's inbox or any other
+ * host path. Walk each component with lstat; reject on missing parent,
+ * symlink, or non-directory. Components that don't exist yet pass — first
+ * use mkdir's them as regular dirs.
+ */
+function isNonSymlinkChain(parent, ...components) {
+  let parentSt;
+  try {
+    parentSt = fs.lstatSync(parent);
+  } catch {
+    return false;
+  }
+  if (parentSt.isSymbolicLink()) return false;
+  if (!parentSt.isDirectory()) return false;
+  let current = parent;
+  for (const comp of components) {
+    current = path.join(current, comp);
+    let st;
+    try {
+      st = fs.lstatSync(current);
+    } catch {
+      return true;
+    }
+    if (st.isSymbolicLink()) return false;
+    if (!st.isDirectory()) return false;
+  }
+  return true;
+}
 const MAX_BYTES = 50_000;
 const TRUNCATION_NOTICE = '\n\n[Truncated by cc-mnemon capture: exceeded 50KB cap.]\n';
 const MIN_USER_LEN = 20;
@@ -125,10 +158,35 @@ function main() {
   const dest = path.join(INBOX, `cc-${hash}.txt`);
   if (fs.existsSync(dest)) process.exit(0);
 
+  // Codex F12 round 4: validate inbox + staging chains before any writer
+  // call. Skip the capture (vs. corrupting the wrong store) if either path
+  // has been replaced with a symlink.
+  if (!isNonSymlinkChain(GROUP_ROOT, 'sources', 'inbox')) process.exit(0);
+  if (!isNonSymlinkChain(GROUP_ROOT, 'sources', '.tmp')) process.exit(0);
+
   fs.mkdirSync(STAGING, { recursive: true });
   const tmp = path.join(STAGING, `cc-${hash}.${crypto.randomBytes(4).toString('hex')}.tmp`);
   try {
-    fs.writeFileSync(tmp, bounded, { encoding: 'utf-8', flag: 'wx' });
+    // O_NOFOLLOW + O_EXCL guards against a pre-placed symlink at the tmp
+    // path even though staging is "host-only" (defense in depth — same
+    // pattern the attachment mirror uses for codex F11).
+    let fd;
+    try {
+      fd = fs.openSync(
+        tmp,
+        fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
+        0o600,
+      );
+      fs.writeSync(fd, Buffer.from(bounded, 'utf-8'));
+    } finally {
+      if (fd !== undefined) {
+        try {
+          fs.closeSync(fd);
+        } catch {
+          /* best-effort */
+        }
+      }
+    }
     fs.renameSync(tmp, dest);
   } catch {
     try {

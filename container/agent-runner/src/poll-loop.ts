@@ -114,14 +114,18 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       continue;
     }
 
-    const ids = messages.map((m) => m.id);
-    markProcessing(ids);
-
     const routing = extractRouting(messages);
 
     // Command handling: the host router gates filtered and unauthorized
     // admin commands before they reach the container. The only command
     // the runner handles directly is /clear (session reset).
+    //
+    // Note on claim ordering: we used to markProcessing(ids) up front,
+    // then run pre-task scripts. If a script gated all non-command rows,
+    // any trigger=0 chat in the batch would stay 'processing' until the
+    // host stale-claim sweep cleared it (~60s). Now we claim only the
+    // rows that will actually reach the prompt — same pattern as the
+    // in-turn helper.
     const normalMessages: MessageInRow[] = [];
     const commandIds: string[] = [];
 
@@ -149,8 +153,6 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     }
 
     if (normalMessages.length === 0) {
-      const remainingIds = ids.filter((id) => !commandIds.includes(id));
-      if (remainingIds.length > 0) markCompleted(remainingIds);
       log(`All ${messages.length} message(s) were commands, skipping query`);
       continue;
     }
@@ -173,10 +175,18 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     }
     // MODULE-HOOK:scheduling-pre-task:end
 
-    if (keep.length === 0) {
-      log(`All ${normalMessages.length} non-command message(s) gated by script, skipping query`);
+    // Re-validate post-script: if no admissible trigger survives, defer
+    // the surviving trigger=0 context rows for the next iteration. Don't
+    // claim them — leaving rows pending is the correct signal that they
+    // weren't consumed. (Mirrors selectInTurnFollowUps' deferral logic.)
+    if (!keep.some(isAdmissibleTrigger)) {
+      log(`All ${normalMessages.length} non-command message(s) gated by script or no admissible trigger, skipping query`);
       continue;
     }
+
+    // Claim only the rows that will actually reach the prompt.
+    const keptIds = keep.map((m) => m.id);
+    markProcessing(keptIds);
 
     const { model: effectiveModel, effort: effectiveEffort } = applyFlagBatch(keep, routing);
 
@@ -199,9 +209,11 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       systemContext: config.systemContext,
     });
 
-    // Process the query while concurrently polling for new messages
-    const skippedSet = new Set(skipped);
-    const processingIds = ids.filter((id) => !commandIds.includes(id) && !skippedSet.has(id));
+    // Process the query while concurrently polling for new messages.
+    // processingIds == keptIds now: commands were marked completed inline,
+    // skipped task rows were marked completed by the pre-task block, and
+    // we only claimed the rows that actually reach the prompt.
+    const processingIds = keptIds;
     try {
       const result = await processQuery(query, routing, processingIds, config.providerName);
       if (result.continuation && result.continuation !== continuation) {
@@ -359,9 +371,70 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // Ensure completed even if processQuery ended without a result event
     // (e.g. stream closed unexpectedly).
     markCompleted(processingIds);
-    log(`Completed ${ids.length} message(s)`);
+    log(`Completed ${processingIds.length} message(s) (commands=${commandIds.length}, skipped=${skipped.length})`);
   }
 }
+
+/**
+ * Predicate for "this row is a real wake trigger" — non-system, trigger=1,
+ * not a /clear chat command. Used by both the in-turn admission helper and
+ * the post-pre-task re-validation step.
+ */
+export function isAdmissibleTrigger(m: MessageInRow): boolean {
+  if (m.trigger !== 1) return false;
+  if (m.kind === 'system') return false;
+  if ((m.kind === 'chat' || m.kind === 'chat-sdk') && isClearCommand(m)) return false;
+  return true;
+}
+
+/**
+ * Decide which pending rows to admit as a mid-turn follow-up push to an
+ * in-flight query. Pure function — no DB writes — so tests can exercise
+ * it directly without spinning a poll loop.
+ *
+ * Rules:
+ * - Defer entirely (return []) when no row would survive admission as a
+ *   real wake trigger. Survivors are trigger=1 chat/chat-sdk that aren't
+ *   /clear, plus trigger=1 of other non-system kinds (task, webhook).
+ *   /clear and non-recall system rows are NOT real triggers — letting
+ *   them gate ride-along would push trigger=0 context with no actual
+ *   user message in the prompt.
+ * - When at least one survivor exists, admit:
+ *     - chat / chat-sdk (any trigger; formatter wraps trigger=0 in
+ *       <thread_context>; /clear excluded)
+ *     - non-system other kinds, trigger=1 only
+ *     - recall_context system rows whose paired trigger id is in the
+ *       surviving-triggers set
+ * - All other system rows are dropped.
+ */
+export function selectInTurnFollowUps(allPending: MessageInRow[]): MessageInRow[] {
+  const isChatRow = (m: MessageInRow): boolean => m.kind === 'chat' || m.kind === 'chat-sdk';
+  const triggerIds = new Set(allPending.filter(isAdmissibleTrigger).map((m) => m.id));
+  if (triggerIds.size === 0) return [];
+
+  return allPending.filter((m) => {
+    if (m.kind === 'system') {
+      try {
+        const parsed = JSON.parse(m.content) as { subtype?: string };
+        if (parsed.subtype !== 'recall_context') return false;
+      } catch {
+        return false;
+      }
+      const pairedTriggerId = m.id.startsWith('recall-') ? m.id.slice('recall-'.length) : null;
+      return pairedTriggerId !== null && triggerIds.has(pairedTriggerId);
+    }
+    if (isChatRow(m) && isClearCommand(m)) return false;
+    if (isChatRow(m)) return true;
+    return m.trigger === 1;
+  });
+}
+
+// Invariant: the `recall-` prefix is reserved for host-side recall-injection
+// (src/modules/memory/recall-injection.ts). Platform message ids written by
+// router.ts always carry the shape `<platform-baseId>:<agentGroupId>`; no
+// adapter produces baseIds starting with `recall-`, so the strip below
+// cannot collide with a real inbound id. Keep this contract — adding an
+// adapter that breaks it would silently corrupt recall pairing.
 
 /**
  * Format messages, handling passthrough commands differently.
@@ -428,70 +501,53 @@ async function processQuery(
         // trigger with null thread vs a Discord DM reply); per-thread sessions
         // already isolate threads, so the router's routing is sufficient.
         //
-        // The trigger gate mirrors the cold-start gate at the top of runPollLoop:
-        // trigger=0 rows ride the next wake's batch (where the formatter renders
-        // them inside <thread_context>). Letting them through here would feed
-        // Claude a non-mention as a follow-up user message mid-turn.
+        // Admission rules live in selectInTurnFollowUps so they can be unit-
+        // tested. Defers (returns []) when no admissible trigger=1 row is
+        // present in the snapshot; otherwise admits accumulated trigger=0
+        // chat context plus paired recall_context. See helper for details.
         const allPending = getPendingMessages();
-        // The host writes recall_context first, then the paired inbound message,
-        // both within a single async writeSessionMessage call but with a microtask
-        // boundary in between. A mid-turn poll firing in that window would observe
-        // the recall_context alone, push it as a follow-up to the WRONG turn, and
-        // leave the inbound message to arrive next poll without its recall context.
-        // To preserve ordering, only admit a recall_context if its paired trigger
-        // message (id == recall_context.id minus 'recall-' prefix) is in the same
-        // batch — otherwise hold it for the next poll where the inbound has landed.
-        const triggerIdsInBatch = new Set(
-          allPending.filter((m) => m.trigger === 1).map((m) => m.id),
-        );
-        const newMessages = allPending.filter((m) => {
-          if (m.kind === 'system') {
-            // Exception: recall_context system messages should ride along as
-            // additional context for the in-flight turn — but only when the
-            // paired trigger message is in this same poll batch.
-            try {
-              const parsed = JSON.parse(m.content) as { subtype?: string };
-              if (parsed.subtype !== 'recall_context') return false;
-            } catch {
-              return false;
-            }
-            const pairedTriggerId = m.id.startsWith('recall-') ? m.id.slice('recall-'.length) : null;
-            if (!pairedTriggerId || !triggerIdsInBatch.has(pairedTriggerId)) return false;
-            return true;
-          }
-          if ((m.kind === 'chat' || m.kind === 'chat-sdk') && isClearCommand(m)) return false;
-          if (m.trigger !== 1) return false;
-          return true;
-        });
-        if (newMessages.length === 0) return;
+        const candidates = selectInTurnFollowUps(allPending);
+        if (candidates.length === 0) return;
 
-        const newIds = newMessages.map((m) => m.id);
-        markProcessing(newIds);
-
-        // Run pre-task scripts on follow-ups too — without this, a task that
-        // arrives during an active query (e.g. a */10 monitoring cron) bypasses
-        // its script gate and always wakes the agent, defeating the gate.
-        // Mirrors the initial-batch hook above.
-        let keep = newMessages;
-        let skipped: string[] = [];
+        // Run pre-task scripts BEFORE claiming rows. A scripted task with
+        // wakeAgent=false can drop the only admissible trigger from the
+        // batch; if we'd already markProcessing'd the trigger=0 chat
+        // context, those rows would be hidden behind processing acks even
+        // though they were never sent to the agent. Deferring the claim
+        // lets us walk away cleanly when no real trigger survives.
         // MODULE-HOOK:scheduling-pre-task-followup:start
         const { applyPreTaskScripts } = await import('./scheduling/task-script.js');
-        const preTask = await applyPreTaskScripts(newMessages);
-        keep = preTask.keep;
-        skipped = preTask.skipped;
+        const preTask = await applyPreTaskScripts(candidates);
+        const keep: MessageInRow[] = preTask.keep;
+        const skipped: string[] = preTask.skipped;
+        // MODULE-HOOK:scheduling-pre-task-followup:end
+
+        // Re-validate post-script: if the only admissible trigger was a
+        // task that the script gated, keep would be trigger=0 chat (and
+        // possibly orphaned recall_context). Don't push context-only into
+        // an active stream — defer it for the next real wake. Skipped task
+        // IDs still get marked completed so the script is not re-run.
+        if (!keep.some(isAdmissibleTrigger)) {
+          if (skipped.length > 0) {
+            markCompleted(skipped);
+            log(`Pre-task script skipped ${skipped.length} follow-up task(s); no admissible trigger remained, deferring context rows`);
+          }
+          return;
+        }
+
+        // Re-check done — the outer query may have finished while the script
+        // was awaited. Pushing into a closed stream is wasted work.
+        if (done) {
+          if (skipped.length > 0) markCompleted(skipped);
+          return;
+        }
+
+        const keptIds = keep.map((m) => m.id);
+        markProcessing(keptIds);
         if (skipped.length > 0) {
           markCompleted(skipped);
           log(`Pre-task script skipped ${skipped.length} follow-up task(s): ${skipped.join(', ')}`);
         }
-        // MODULE-HOOK:scheduling-pre-task-followup:end
-
-        if (keep.length === 0) return;
-        // Re-check done — the outer query may have finished while the script
-        // was awaited. Pushing into a closed stream is wasted work; the
-        // claimed messages get released by the host's processing-claim sweep.
-        if (done) return;
-
-        const keptIds = keep.map((m) => m.id);
         const prompt = formatMessages(keep);
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
         query.push(prompt);
@@ -524,12 +580,23 @@ async function processQuery(
         // Claude session with no prior context.
         setContinuation(providerName, event.continuation);
       } else if (event.type === 'result') {
-        // A result — with or without text — means the turn is done. Mark
-        // the initial batch completed now so the host sweep doesn't see
-        // stale 'processing' claims while the query stays open for
-        // follow-up pushes. The agent may have responded via MCP
-        // (send_message) mid-turn, or the message may not need a response
-        // at all — either way the turn is finished.
+        // A `result` event signals the assistant's turn is complete, but the
+        // provider's events generator stays open for follow-up `push()` calls
+        // (see container/agent-runner/src/providers/claude.ts:1080 — the
+        // generator only exits on `stream.end()`/abort). We must NOT flip
+        // the `done` flag here; the polling interval depends on `done` to
+        // gate follow-up admission, and stopping it after the first result
+        // would
+        // starve every subsequent inbound trigger=1 row in this session
+        // (codex F4, 2026-05-05). The race the prior synchronous flip
+        // claimed to fix was illusory: pushes into an open multi-turn stream
+        // become the next turn, they're not eaten by the SDK.
+        //
+        // Mark the initial batch completed now so the host sweep doesn't see
+        // stale 'processing' claims while the query stays open for follow-up
+        // pushes. The agent may have responded via MCP (send_message)
+        // mid-turn, or the message may not need a response at all — either
+        // way the per-turn work for these rows is finished.
         markCompleted(initialBatchIds);
         if (event.text) {
           dispatchResultText(event.text, routing);

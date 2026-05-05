@@ -3,7 +3,6 @@ import path from 'path';
 import { createHash } from 'crypto';
 import Database from 'better-sqlite3';
 import { openMnemonIngestDb } from '../db/migrations/019-mnemon-ingest-db.js';
-import { GROUPS_DIR } from '../config.js';
 import type { MemoryStore, FactInput } from '../modules/memory/store.js';
 import { redactSecrets } from '../modules/memory/secret-redactor.js';
 import { callClassifier, EXTRACTOR_VERSION, PROMPT_VERSION } from './classifier-client.js';
@@ -55,14 +54,38 @@ function sha256(content: string): string {
   return createHash('sha256').update(content).digest('hex');
 }
 
+/**
+ * Canonicalize for stable hashing. Strip null bytes here as well as in the
+ * classifier-client facade so processed_sources.content_sha256 and
+ * idempotency_keys reference the SAME string the model receives. Without this
+ * the hash references bytes the model never saw, which silently breaks dedup
+ * (two files identical modulo \0 would have different hashes) and idempotency
+ * round-trips. The binary-detection pass (looksBinary) already rejects any
+ * file containing a null byte, but stripping in canonicalize is defense in
+ * depth for unfamiliar edge cases.
+ */
 function canonicalize(content: string): string {
-  return content.trim().replace(/\r\n/g, '\n');
+  return content.trim().replace(/\r\n/g, '\n').replace(/\0/g, '');
 }
 
 /**
- * Heuristic binary detection on the first 8KB of a buffer. Returns true if the
- * content is binary (PNG, GIF, ZIP, etc.) and should not be fed to the
- * classifier as text.
+ * Heuristic binary detection. Returns true if the input is binary (PNG, GIF,
+ * ZIP, etc.) and should not be fed to the classifier as text.
+ *
+ * Two-pass design (Codex Finding F2, 2026-05-04):
+ * - Pass 1: FULL scan for null bytes. Any \0 anywhere in the buffer flags
+ *   the file as binary. The earlier 8KB-sample-only version let
+ *   text-prefix-then-binary files slip through (a 9KB-clean text header
+ *   followed by binary payload would not trip the guard); Codex correctly
+ *   called that out. Full-scan is O(N) bytewise — cheap enough.
+ * - Pass 2: density check on the first 8KB. If >5% of sample bytes are
+ *   non-printable control bytes (excluding tab/LF/CR), flag as binary.
+ *   Catches binary headers without flagging long UTF-8 docs that happen to
+ *   contain occasional control chars (BOM, NEL, etc.).
+ *
+ * Accepts Buffer (preferred — runs before UTF-8 decode) or string. Buffer
+ * input avoids the surprise of `String.charCodeAt` returning UTF-16 code
+ * units for multibyte sequences instead of raw bytes.
  *
  * Two failure modes this prevents:
  * 1. Node `spawn()` rejects args containing `\0` with TypeError [ERR_INVALID_ARG_VALUE].
@@ -71,30 +94,126 @@ function canonicalize(content: string): string {
  * 2. Codex CLI exits 0 without writing `--output-last-message` when the model
  *    sees garbage input and emits no final message. Looks like a transient
  *    failure but is deterministic for binary content; retries always poison.
- *
- * The 5% non-printable threshold catches PDFs/binaries while tolerating a
- * realistic amount of UTF-8 content with stray control chars (BOM, NEL, etc.).
- * Any null byte alone is sufficient to reject — null bytes are never legal in
- * UTF-8 text and they're the trigger for failure mode 1.
  */
-export function looksBinary(content: string): boolean {
-  const sample = content.length > 8192 ? content.slice(0, 8192) : content;
-  if (sample.length === 0) return false;
+/**
+ * Codex F6 hardening (round 2, 2026-05-05): walk a chain of path components
+ * starting from `parent`, lstat each level, and reject if any intermediate
+ * component is a symlink (or a non-directory). Components that don't exist
+ * yet pass — the daemon mkdir's them as regular dirs at need, and the next
+ * sweep re-validates.
+ *
+ * Why this exists despite the existing realpath-on-file check in runSweep:
+ * `fs.readdirSync(inboxPath)` and `fs.realpathSync(inboxPath)` BOTH follow
+ * symlinks silently. If `<project>/sources/inbox` is a symlink to another
+ * project's inbox, then realpath resolves to the OTHER project's path and
+ * the file's startsWith check passes — but every ingested file lands in
+ * the WRONG store, breaking cross-tenant isolation. This walks the chain
+ * with lstat to catch the dir-symlink before it traverses.
+ *
+ * Use at every entry point that reads or writes within a group's
+ * sources/inbox tree: discoverMemoryGroups (cheap up-front filter),
+ * reconcileWatchers (before opening fs.watch), runSweep (before
+ * readdirSync), and processInboxFile (before opening the FD).
+ */
+export function isNonSymlinkChain(parent: string, ...components: string[]): boolean {
+  // Codex F9 round 3 (2026-05-05): validate `parent` itself first. The
+  // earlier version started at `parent/components[0]`, leaving the parent
+  // free to be replaced with a symlink between discovery and use — a
+  // post-discovery root-swap bypass. Failing closed if parent is missing,
+  // a symlink, or not a directory closes that window.
+  let parentSt: fs.Stats;
+  try {
+    parentSt = fs.lstatSync(parent);
+  } catch {
+    return false;
+  }
+  if (parentSt.isSymbolicLink()) return false;
+  if (!parentSt.isDirectory()) return false;
+
+  let current = parent;
+  for (const comp of components) {
+    current = path.join(current, comp);
+    let st: fs.Stats;
+    try {
+      st = fs.lstatSync(current);
+    } catch {
+      // Component doesn't exist yet — fine. Daemon will mkdir as a regular
+      // directory; next sweep re-validates.
+      return true;
+    }
+    if (st.isSymbolicLink()) return false;
+    if (!st.isDirectory()) return false;
+  }
+  return true;
+}
+
+export function looksBinary(input: Buffer | string): boolean {
+  const data = typeof input === 'string' ? Buffer.from(input, 'utf8') : input;
+  if (data.length === 0) return false;
+
+  // Pass 1: full scan for null bytes — never let one through, regardless of
+  // file size. This is the load-bearing change vs the old 8KB-only version.
+  for (let i = 0; i < data.length; i++) {
+    if (data[i] === 0) return true;
+  }
+
+  // Pass 2: density check on first 8KB. The threshold is calibrated for
+  // catching binary file headers without flagging realistic text.
+  const sampleEnd = Math.min(8192, data.length);
   let nonPrintable = 0;
-  for (let i = 0; i < sample.length; i++) {
-    const c = sample.charCodeAt(i);
-    if (c === 0) return true;
-    // Allow tab, LF, CR, common whitespace; flag other ASCII control bytes.
-    // High-bit (>=0x80) is fine — it's UTF-8 multibyte continuation.
+  for (let i = 0; i < sampleEnd; i++) {
+    const c = data[i];
+    // Allow tab (9), LF (10), CR (13), and any high-bit byte (>=0x80) which
+    // is a UTF-8 multibyte continuation. Flag other ASCII control bytes.
     if (c < 32 && c !== 9 && c !== 10 && c !== 13) {
       nonPrintable++;
     }
   }
-  return nonPrintable / sample.length > 0.05;
+  return nonPrintable / sampleEnd > 0.05;
 }
 
 function dateFolder(): string {
   return new Date().toISOString().slice(0, 10);
+}
+
+/**
+ * Move a successfully-processed inbox file into <sourcesBasePath>/sources/processed/<date>/.
+ * Re-runs the chain validation immediately before mkdir + rename — codex F8
+ * round 3 (2026-05-05) flagged that processInboxFile validates once at the
+ * top, then does async classifier work, then moves files much later. A
+ * tenant could swap `sources/processed` for a symlink in that window. This
+ * helper closes the use-time window: chain check, then the IO sequence,
+ * with no async gap between.
+ *
+ * Returns true on success, false if the chain check fails or any IO step
+ * throws. Failure is best-effort: the next sweep re-detects the file in the
+ * inbox and re-processes via the existing dedup path. No work is lost.
+ */
+function moveFileToProcessed(filePath: string, sourcesBasePath: string): boolean {
+  // Codex F10 round 4 (2026-05-05): also validate the date subdir.
+  // moveFileToProcessed previously chain-checked `sources/processed` but then
+  // appended dateFolder() unchecked. An attacker with write access to
+  // `sources/processed` can pre-create today's date dir as a symlink;
+  // mkdirSync({ recursive: true }) accepts the existing dir as-is and
+  // renameSync follows the link. Validate the full 3-component chain.
+  const date = dateFolder();
+  if (!isNonSymlinkChain(sourcesBasePath, 'sources', 'processed', date)) {
+    return false;
+  }
+  try {
+    const processedDir = path.join(sourcesBasePath, 'sources', 'processed', date);
+    fs.mkdirSync(processedDir, { recursive: true });
+    // Re-lstat the date dir AFTER mkdir to catch a race where the attacker
+    // turned the dir into a symlink between the chain check and now. mkdir
+    // is a no-op on an existing symlink-to-dir, so rename would still
+    // follow without this guard.
+    const dateStat = fs.lstatSync(processedDir);
+    if (dateStat.isSymbolicLink() || !dateStat.isDirectory()) return false;
+    fs.renameSync(filePath, path.join(processedDir, path.basename(filePath)));
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 let _db: Database.Database | null = null;
@@ -127,7 +246,9 @@ export class SourceIngester {
     this.health = health;
   }
 
-  reconcileWatchers(groups: ReadonlyArray<{ agentGroupId: string; folder: string; enabled: boolean }>): {
+  reconcileWatchers(
+    groups: ReadonlyArray<{ agentGroupId: string; folder: string; sourcesBasePath: string; enabled: boolean }>,
+  ): {
     opened: number;
     closed: number;
   } {
@@ -148,7 +269,15 @@ export class SourceIngester {
       if (!group.enabled) continue;
       if (this.watchers.has(group.agentGroupId)) continue;
 
-      const inboxPath = path.join(GROUPS_DIR, group.folder, 'sources', 'inbox');
+      // Codex F6 round 2: re-validate the chain before opening the watcher.
+      // fs.watch follows symlinks silently; if `sources/inbox` is symlinked
+      // to another group's inbox, the watcher fires on victim writes and the
+      // setImmediate processInboxFile call ingests them into THIS group's
+      // store. Re-validating closes the TOCTOU window between discovery and
+      // watch-open, even though discovery already filtered.
+      if (!isNonSymlinkChain(group.sourcesBasePath, 'sources', 'inbox')) continue;
+
+      const inboxPath = path.join(group.sourcesBasePath, 'sources', 'inbox');
       try {
         fs.mkdirSync(inboxPath, { recursive: true });
       } catch {
@@ -190,7 +319,13 @@ export class SourceIngester {
           // back silently — the 60s sweep in index.ts catches the file and
           // processes it via the runtime path.
           if (!this.store) return;
-          void this.processInboxFile(group.agentGroupId, group.folder, realPath, this.store, this.health ?? undefined);
+          void this.processInboxFile(
+            group.agentGroupId,
+            group.sourcesBasePath,
+            realPath,
+            this.store,
+            this.health ?? undefined,
+          );
         });
       });
 
@@ -203,7 +338,7 @@ export class SourceIngester {
 
   async processInboxFile(
     agentGroupId: string,
-    folder: string,
+    sourcesBasePath: string,
     filePath: string,
     store: MemoryStore | Database.Database,
     health?: HealthRecorder,
@@ -211,7 +346,7 @@ export class SourceIngester {
 
   async processInboxFile(
     agentGroupId: string,
-    folder: string,
+    sourcesBasePath: string,
     filePath: string,
     storeOrDb: MemoryStore | Database.Database,
     health?: HealthRecorder,
@@ -223,7 +358,21 @@ export class SourceIngester {
     // swap the regular file for a symlink. Reading by path after re-validation
     // (Codex finding #5 round 1) still has a residual race; openSync with
     // O_NOFOLLOW + fstat eliminates it (Codex finding #2 round 2).
-    const inboxPath = path.join(GROUPS_DIR, folder, 'sources', 'inbox');
+    //
+    // Codex F6 round 2 (2026-05-05): also re-validate the dir chain. If
+    // `sources` or `sources/inbox` is a symlink to another group's inbox,
+    // the realpath resolves to the OTHER group's path and every file's
+    // startsWith check passes — but each ingested file lands in the WRONG
+    // store. Same applies to `sources/processed` for the post-classification
+    // move (codex called out that processed moves can relocate victim files
+    // out of their own inbox). Reject before opening or moving anything.
+    if (
+      !isNonSymlinkChain(sourcesBasePath, 'sources', 'inbox') ||
+      !isNonSymlinkChain(sourcesBasePath, 'sources', 'processed')
+    ) {
+      return { factsWritten: 0, failed: false };
+    }
+    const inboxPath = path.join(sourcesBasePath, 'sources', 'inbox');
     let content: string;
     try {
       // Resolve the inbox root for the prefix check below. openSync with
@@ -260,37 +409,38 @@ export class SourceIngester {
           if (r === 0) break;
           bytesRead += r;
         }
-        content = buf.subarray(0, bytesRead).toString('utf8');
+        const rawBuf = buf.subarray(0, bytesRead);
+
+        // Reject binary content BEFORE UTF-8 decode (Codex Finding F2).
+        // Running the heuristic on the raw Buffer (a) catches null bytes
+        // anywhere in the file, not just the first 8KB, and (b) avoids the
+        // surprise of charCodeAt returning UTF-16 code units instead of
+        // raw bytes. PNG/GIF/PDF attachments produce strings with null
+        // bytes that crash spawn() in the codex backend, or all-binary
+        // sequences that make codex exit 0 without writing output (looks
+        // like a transient failure but is deterministic; retries always
+        // poison). Move the file to processed/ and clear any dead_letter
+        // row so a stuck file from before this guard existed retires
+        // cleanly.
+        if (looksBinary(rawBuf)) {
+          // Codex F8 round 3: re-validate chain right before the move. The
+          // top-of-function check is stale by now (we just did blocking IO).
+          moveFileToProcessed(filePath, sourcesBasePath);
+          // Clear dead_letter row keyed on the resolved file path so the
+          // retry loop doesn't keep finding it. Without this, files that
+          // were poisoned before the binary guard existed would stay in
+          // dead_letters forever (they'd retry, the path wouldn't exist,
+          // and the daemon would skip without ever clearing the row).
+          deleteAfterSuccess(filePath, agentGroupId);
+          return { factsWritten: 0, failed: false };
+        }
+
+        content = rawBuf.toString('utf8');
       } finally {
         fs.closeSync(fd);
       }
     } catch {
       return { factsWritten: 0, failed: true };
-    }
-
-    // Reject binary content before it reaches the classifier. PNG/GIF
-    // attachments, PDFs, etc. read as UTF-8 produce strings with null bytes
-    // (which crash spawn() in the codex backend) or all-binary sequences
-    // (which make codex exit 0 without writing output, looking like a
-    // transient failure but deterministic). Move the file to processed/
-    // and clear any dead_letter row so a stuck file from before this guard
-    // existed gets retired cleanly.
-    if (looksBinary(content)) {
-      const processedDir = path.join(GROUPS_DIR, folder, 'sources', 'processed', dateFolder());
-      try {
-        fs.mkdirSync(processedDir, { recursive: true });
-        fs.renameSync(filePath, path.join(processedDir, path.basename(filePath)));
-      } catch {
-        // best-effort; if move fails the next sweep will just re-detect and
-        // re-skip it — no work loss.
-      }
-      // Clear dead_letter row keyed on the resolved file path so the retry
-      // loop doesn't keep finding it. Without this, files that were poisoned
-      // before the binary guard existed would stay in dead_letters forever
-      // (they'd retry, the path wouldn't exist, and the daemon would skip
-      // without ever clearing the row).
-      deleteAfterSuccess(filePath, agentGroupId);
-      return { factsWritten: 0, failed: false };
     }
 
     const canonical = canonicalize(content);
@@ -314,14 +464,7 @@ export class SourceIngester {
       // otherwise zombie forever. Scoped by agent_group_id + item_key.
       db.prepare(`DELETE FROM dead_letters WHERE item_key = ? AND agent_group_id = ?`).run(filePath, agentGroupId);
 
-      const processedDir = path.join(GROUPS_DIR, folder, 'sources', 'processed', dateFolder());
-      fs.mkdirSync(processedDir, { recursive: true });
-      const dest = path.join(processedDir, path.basename(filePath));
-      try {
-        fs.renameSync(filePath, dest);
-      } catch {
-        // best-effort move
-      }
+      moveFileToProcessed(filePath, sourcesBasePath);
       return { factsWritten: 0, failed: false };
     }
 
@@ -376,14 +519,7 @@ export class SourceIngester {
         db.prepare(`DELETE FROM dead_letters WHERE item_key = ? AND agent_group_id = ?`).run(filePath, agentGroupId);
       })();
 
-      const processedDir = path.join(GROUPS_DIR, folder, 'sources', 'processed', dateFolder());
-      fs.mkdirSync(processedDir, { recursive: true });
-      const dest = path.join(processedDir, path.basename(filePath));
-      try {
-        fs.renameSync(filePath, dest);
-      } catch {
-        // best-effort
-      }
+      moveFileToProcessed(filePath, sourcesBasePath);
       return { factsWritten: 0, failed: false };
     }
 
@@ -477,15 +613,7 @@ export class SourceIngester {
       health.recordSourceIngest(agentGroupId, factsWritten, contentHash);
     }
 
-    const processedDir = path.join(GROUPS_DIR, folder, 'sources', 'processed', dateFolder());
-    fs.mkdirSync(processedDir, { recursive: true });
-    const dest = path.join(processedDir, path.basename(filePath));
-    try {
-      fs.renameSync(filePath, dest);
-    } catch {
-      // best-effort
-    }
-
+    moveFileToProcessed(filePath, sourcesBasePath);
     return { factsWritten, failed: false };
   }
 

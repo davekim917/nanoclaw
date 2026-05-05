@@ -85,6 +85,9 @@ function makeHealth(): HealthRecorder {
     recordRecallLatency: vi.fn(),
     recordRecallFailOpen: vi.fn(),
     recordRedaction: vi.fn(),
+    recordFactAccepted: vi.fn(),
+    recordLowImportanceDropped: vi.fn(),
+    recordPairAllLowImportance: vi.fn(),
     recordSynthesiseSucceeded: vi.fn(),
     setPrereqVerification: vi.fn(),
     flush: vi.fn().mockResolvedValue(undefined),
@@ -474,6 +477,99 @@ describe('classifier', () => {
     const result = redactSecrets(factInput);
     expect(result.shouldStore).toBe(false);
 
+    archiveDb.close();
+    ingestDb.close();
+  });
+
+  it('test_all_low_importance_pair — every emitted fact dropped for importance fires sentinel + per-fact metric', async () => {
+    // Codex Finding F1 (2026-05-04): with MIN_FACT_IMPORTANCE=4 silently
+    // dropping facts, a pair where 100% of emitted facts are imp<4 produces
+    // factsWritten=0, no failures, and gets marked processed forever. This
+    // test locks the metric/log signals that make the case observable.
+    const archiveDb = makeArchiveDb();
+    const ingestDb = makeIngestDb();
+    setArchiveDbForTest(archiveDb);
+    setIngestDb(ingestDb);
+    setDeadLettersDb(ingestDb);
+
+    archiveDb
+      .prepare(`INSERT INTO messages_archive VALUES (?, ?, 'slack', 'user', 'tell me about ACID', ?)`)
+      .run('u1', GROUP_ID, pastIso(200));
+    archiveDb
+      .prepare(
+        `INSERT INTO messages_archive VALUES (?, ?, 'slack', 'assistant', 'Atomicity Consistency Isolation Durability are the four ACID properties', ?)`,
+      )
+      .run('a1', GROUP_ID, pastIso(130));
+
+    vi.mocked(callClassifier).mockResolvedValue({
+      worth_storing: true,
+      facts: [
+        {
+          content: 'ACID stands for Atomicity Consistency Isolation Durability',
+          category: 'fact',
+          importance: 3,
+          entities: ['ACID'],
+          source_role: 'assistant',
+        },
+        {
+          content: 'Atomicity means all-or-nothing',
+          category: 'fact',
+          importance: 2,
+          entities: [],
+          source_role: 'assistant',
+        },
+        {
+          content: 'Isolation prevents concurrent interference',
+          category: 'fact',
+          importance: 3,
+          entities: [],
+          source_role: 'assistant',
+        },
+      ],
+    });
+
+    const store = makeStore();
+    const health = makeHealth();
+
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const result = await runChatStreamSweep([GROUP], store, health);
+
+    // No facts written, no failures
+    expect(result.factsWritten).toBe(0);
+    expect(result.failures).toBe(0);
+    expect(result.poisoned).toBe(0);
+    expect(store.remember).not.toHaveBeenCalled();
+
+    // Per-fact drop metric fired 3 times (once per emitted fact)
+    expect(health.recordLowImportanceDropped).toHaveBeenCalledTimes(3);
+    expect(health.recordLowImportanceDropped).toHaveBeenCalledWith(GROUP_ID);
+
+    // No facts were accepted
+    expect(health.recordFactAccepted).not.toHaveBeenCalled();
+
+    // Pair-level sentinel fired exactly once
+    expect(health.recordPairAllLowImportance).toHaveBeenCalledOnce();
+    expect(health.recordPairAllLowImportance).toHaveBeenCalledWith(GROUP_ID);
+
+    // Warn log fired so operators can grep it
+    expect(warnSpy).toHaveBeenCalledWith(
+      '[classifier] pair processed with 0 facts — all dropped for low importance',
+      expect.objectContaining({
+        agentGroupId: GROUP_ID,
+        factsEmittedNonRedacted: 3,
+        factsDroppedForImportance: 3,
+      }),
+    );
+
+    // Pair IS still inserted into processed_pairs (deliberate trade-off — see
+    // classifier.ts comment). Replay path is via PROMPT_VERSION/CLASSIFIER_VERSION bump.
+    const processedRow = ingestDb
+      .prepare(`SELECT facts_written FROM processed_pairs WHERE agent_group_id = ?`)
+      .get(GROUP_ID) as { facts_written: number } | undefined;
+    expect(processedRow).toBeDefined();
+    expect(processedRow!.facts_written).toBe(0);
+
+    warnSpy.mockRestore();
     archiveDb.close();
     ingestDb.close();
   });
