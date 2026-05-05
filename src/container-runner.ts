@@ -434,6 +434,15 @@ const SCOPED_CREDENTIAL_VARS = [
   'DBT_CLOUD_EMAIL',
   'DBT_CLOUD_PASSWORD',
   'DBT_CLOUD_API_URL',
+  // dbt-mcp (dbt-labs/dbt-mcp) — Discovery + Semantic Layer + Admin API.
+  // Token reuses DBT_CLOUD_API_TOKEN; these are the additional vars dbt-mcp
+  // requires that the raw REST flow does not.
+  'DBT_HOST',
+  'DBT_MULTICELL_ACCOUNT_PREFIX',
+  'DBT_PROD_ENV_ID',
+  'DBT_DEV_ENV_ID',
+  'DBT_USER_ID',
+  'DBT_MCP_DISABLE_TOOLS',
   'OPENAI_API_KEY',
   'BRAINTRUST_API_KEY',
   'EXA_API_KEY',
@@ -1709,6 +1718,47 @@ async function buildContainerArgs(
         hasBaseUrl: !!baseUrl,
         hasClientId: !!clientId,
         hasClientSecret: !!clientSecret,
+      });
+    }
+  }
+  if (canInject('dbt-mcp') && isToolEnabled(containerConfig.tools, 'dbt-mcp')) {
+    // dbt-labs/dbt-mcp — Discovery + Semantic Layer + Admin API for dbt Cloud.
+    // Binary baked into image via uv (Python 3.12). Token reuses the existing
+    // DBT_CLOUD_API_TOKEN_<FOLDER> as DBT_TOKEN. Read-only by default: CLI
+    // and LSP toolsets disabled (no local dbt project mounted), and the three
+    // mutating Admin tools disabled. Override via DBT_MCP_DISABLE_TOOLS_<FOLDER>.
+    const host = resolveScopedEnv('DBT_HOST', agentGroup.folder);
+    const token = resolveScopedEnv('DBT_CLOUD_API_TOKEN', agentGroup.folder);
+    const prodEnvId = resolveScopedEnv('DBT_PROD_ENV_ID', agentGroup.folder);
+    if (host && token && prodEnvId) {
+      const env: Record<string, string> = {
+        DBT_HOST: host,
+        DBT_TOKEN: token,
+        DBT_PROD_ENV_ID: prodEnvId,
+        DBT_MCP_ENABLE_DBT_CLI: 'false',
+        DBT_MCP_ENABLE_LSP: 'false',
+        DISABLE_TOOLS:
+          resolveScopedEnv('DBT_MCP_DISABLE_TOOLS', agentGroup.folder) ??
+          'trigger_job_run,cancel_job_run,retry_job_run',
+      };
+      const devEnvId = resolveScopedEnv('DBT_DEV_ENV_ID', agentGroup.folder);
+      if (devEnvId) env.DBT_DEV_ENV_ID = devEnvId;
+      const userId = resolveScopedEnv('DBT_USER_ID', agentGroup.folder);
+      if (userId) env.DBT_USER_ID = userId;
+      const multicell = resolveScopedEnv('DBT_MULTICELL_ACCOUNT_PREFIX', agentGroup.folder);
+      if (multicell) env.MULTICELL_ACCOUNT_PREFIX = multicell;
+      mcpServers['dbt-mcp'] = {
+        type: 'stdio',
+        command: 'dbt-mcp',
+        args: [],
+        env,
+      };
+    } else {
+      log.warn('dbt-mcp tool enabled but credentials missing', {
+        folder: agentGroup.folder,
+        hasHost: !!host,
+        hasToken: !!token,
+        hasProdEnvId: !!prodEnvId,
       });
     }
   }

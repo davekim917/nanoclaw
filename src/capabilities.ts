@@ -515,6 +515,30 @@ function buildSessionServicesSnapshot(agentGroupId: string): SessionServicesSnap
     });
   }
 
+  // dbt-mcp — gated by tool entry. dbt-labs/dbt-mcp baked into image via uv
+  // (Python 3.12, isolated venv). Container-runner wires the stdio MCP server
+  // with credentials resolved per-group: DBT_HOST_<FOLDER>, reuses
+  // DBT_CLOUD_API_TOKEN_<FOLDER> as DBT_TOKEN, plus DBT_PROD_ENV_ID/
+  // DBT_DEV_ENV_ID/DBT_USER_ID/DBT_MULTICELL_ACCOUNT_PREFIX. Read-only by
+  // default: CLI/LSP toolsets disabled, mutating Admin tools (trigger/cancel/
+  // retry job_run) blocked via DISABLE_TOOLS.
+  if (declared(['dbt-mcp'])) {
+    const host = resolveScopedEnvVar('DBT_HOST', folder);
+    const token = resolveScopedEnvVar('DBT_CLOUD_API_TOKEN', folder);
+    const prodEnvId = resolveScopedEnvVar('DBT_PROD_ENV_ID', folder);
+    const credsReady = host.set && token.set && prodEnvId.set;
+    services.push({
+      name: 'dbt Cloud (dbt-mcp)',
+      mcpNamespace: 'mcp__dbt-mcp__*',
+      declaredTools: declaredMatchingTools(['dbt-mcp']),
+      scopes: [],
+      credentialPaths: [],
+      useFor: credsReady
+        ? `dbt Cloud via dbt-labs/dbt-mcp on \`${process.env[host.name]}\` (prod env \`${process.env[prodEnvId.name]}\`). Discovery API (project intelligence): \`mcp__dbt-mcp__get_all_models\`, \`get_mart_models\`, \`get_model_details\`, \`get_model_parents\`, \`get_model_children\`, \`get_lineage\`, \`get_model_health\`, \`get_model_performance\`, \`get_related_models\`, \`get_exposures\`, \`get_all_macros\`, \`get_all_sources\`, \`search\`. Semantic Layer: \`list_metrics\`, \`query_metrics\`, \`list_saved_queries\`, \`get_dimensions\`, \`get_entities\`, \`get_metrics_compiled_sql\`. SQL on dbt Platform: \`execute_sql\`, \`text_to_sql\`. Admin API (read-only by default — \`trigger_job_run\`, \`cancel_job_run\`, \`retry_job_run\` are disabled): \`list_projects\`, \`list_jobs\`, \`get_job_details\`, \`list_jobs_runs\`, \`get_job_run_details\`, \`get_job_run_error\`, \`list_job_run_artifacts\`. dbt CLI and LSP toolsets are disabled (no local project mounted). For ad-hoc Cloud REST not exposed here, fall back to \`curl -H "Authorization: Token $DBT_CLOUD_API_TOKEN_${folder.toUpperCase().replace(/-/g, '_')}"\`.`
+        : `dbt-mcp tool declared but credentials missing: ${[!host.set && 'DBT_HOST', !token.set && 'DBT_CLOUD_API_TOKEN', !prodEnvId.set && 'DBT_PROD_ENV_ID'].filter(Boolean).join(', ')} not set on host (looked for \`*_${folder.toUpperCase().replace(/-/g, '_')}\` then unscoped fallback). Ask Dave.`,
+    });
+  }
+
   // Looker — gated by tool entry. Google's MCP Toolbox (--prebuilt looker) is
   // baked into the image; container-runner wires the stdio MCP server with
   // credentials resolved per-group from LOOKER_*_<FOLDER> env vars. The

@@ -40,6 +40,7 @@ ARG BUN_VERSION=1.3.13
 ARG MMDC_VERSION=11.12.0
 ARG GWS_VERSION=0.22.5
 ARG CODEX_VERSION=0.124.0
+ARG DBT_MCP_VERSION=1.15.0
 
 # ---- System dependencies -----------------------------------------------------
 # tini: correct PID 1 / signal forwarding so outbound.db writes finalize on
@@ -113,6 +114,22 @@ RUN python3 -m venv /opt/atlassian-venv \
     && /opt/atlassian-venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel \
     && /opt/atlassian-venv/bin/pip install --no-cache-dir "mcp-atlassian==${MCP_ATLASSIAN_VERSION}" \
     && ln -sf /opt/atlassian-venv/bin/mcp-atlassian /usr/local/bin/mcp-atlassian
+
+# dbt-labs/dbt-mcp — stdio MCP server for dbt Cloud (Discovery + Semantic Layer
+# + Admin API + dbt CLI/LSP). Requires Python >=3.12; node:22-slim (bookworm)
+# only ships 3.11, so we use uv to install a managed Python 3.12 and isolate
+# dbt-mcp's deps. uv lives in its own venv to match the snow/dbt/atlassian
+# isolation pattern.
+RUN python3 -m venv /opt/uv-venv \
+    && /opt/uv-venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel \
+    && /opt/uv-venv/bin/pip install --no-cache-dir uv \
+    && ln -sf /opt/uv-venv/bin/uv /usr/local/bin/uv \
+    && ln -sf /opt/uv-venv/bin/uvx /usr/local/bin/uvx \
+    && UV_TOOL_DIR=/opt/uv-tools \
+       UV_TOOL_BIN_DIR=/usr/local/bin \
+       UV_PYTHON_INSTALL_DIR=/opt/uv-python \
+       uv tool install --python 3.12 "dbt-mcp==${DBT_MCP_VERSION}" \
+    && chmod -R a+rX /opt/uv-tools /opt/uv-python
 
 # AWS CLI v2 (isolated from pip to avoid version churn)
 RUN ARCH=$(uname -m) \
