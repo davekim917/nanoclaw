@@ -6,6 +6,7 @@ import { openMnemonIngestDb } from '../db/migrations/019-mnemon-ingest-db.js';
 import type { MemoryStore, FactInput } from '../modules/memory/store.js';
 import { redactSecrets } from '../modules/memory/secret-redactor.js';
 import { callClassifier, EXTRACTOR_VERSION, PROMPT_VERSION } from './classifier-client.js';
+import { MIN_FACT_IMPORTANCE } from './classifier.js';
 import { validateFactsAgainstSource } from './classifier-validator.js';
 import { recordOrIncrementFailure, deleteAfterSuccess } from './dead-letters.js';
 import type { HealthRecorder } from './health.js';
@@ -528,6 +529,15 @@ export class SourceIngester {
 
     for (let factIndex = 0; factIndex < output.facts.length; factIndex++) {
       const rawFact = output.facts[factIndex];
+      // Mirror the chat-pair classifier's importance gate (classifier.ts:364)
+      // so source-ingested facts (CC turn-pair captures, container-agent tool
+      // fetches: web/Granola/Pocket/attachments/etc.) get the same retention
+      // bar as message-stream facts. Without this filter, source paths stored
+      // 1-5 while chat stored only 4-5, polluting recall with low-signal noise.
+      if (rawFact.importance < MIN_FACT_IMPORTANCE) {
+        if (health) health.recordLowImportanceDropped(agentGroupId);
+        continue;
+      }
       const factInput: FactInput = {
         content: rawFact.content,
         category: rawFact.category,

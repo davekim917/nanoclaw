@@ -24,7 +24,7 @@ export interface SweepResult {
 // were importance=3 noise. The classifier's 1-5 scale: 5=critical, 4=durable
 // signal, 3=tactical context, 1-2=trivial. Bumping to 4 keeps decisions/key
 // facts/insights, drops the context bag.
-const MIN_FACT_IMPORTANCE = 4;
+export const MIN_FACT_IMPORTANCE = 4;
 
 const CLASSIFIER_SYSTEM_PROMPT = `You are a memory extraction assistant. Your job is to read a conversation turn (a user message and an optional assistant response) and extract atomic, reusable facts worth storing in a long-term memory system.
 

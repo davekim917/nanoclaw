@@ -117,6 +117,7 @@ function makeHealth(): HealthRecorder {
     recordRecallLatency: vi.fn(),
     recordRecallFailOpen: vi.fn(),
     recordRedaction: vi.fn(),
+    recordLowImportanceDropped: vi.fn(),
     recordSynthesiseSucceeded: vi.fn(),
     recordMemoryEnabledCheckFailure: vi.fn(),
     setPrereqVerification: vi.fn(),
@@ -261,7 +262,7 @@ describe('SourceIngester', () => {
         {
           content: 'The project uses TypeScript with strict mode enabled',
           category: 'fact',
-          importance: 3,
+          importance: 5,
           entities: ['TypeScript'],
           source_role: 'external',
         },
@@ -312,6 +313,59 @@ describe('SourceIngester', () => {
     ingestDb.close();
   });
 
+  it('test_processInboxFile_drops_low_importance_facts — facts below MIN_FACT_IMPORTANCE skip store.remember and increment health counter', async () => {
+    const ingestDb = makeIngestDb();
+    setIngestDb(ingestDb);
+    setDeadLettersDb(ingestDb);
+
+    // Mix of below-threshold (1, 2, 3) and at/above-threshold (4, 5) facts.
+    // Mirrors the chat-pair classifier's importance gate at classifier.ts:364
+    // so source-ingest paths (CC turn-pair captures, container-agent tool
+    // fetches) get the same retention bar as message-stream facts.
+    vi.mocked(callClassifier).mockResolvedValue({
+      worth_storing: true,
+      facts: [
+        { content: 'low signal A', category: 'fact', importance: 1, entities: [], source_role: 'external' },
+        { content: 'low signal B', category: 'fact', importance: 2, entities: [], source_role: 'external' },
+        { content: 'low signal C', category: 'fact', importance: 3, entities: [], source_role: 'external' },
+        { content: 'kept fact D', category: 'fact', importance: 4, entities: [], source_role: 'external' },
+        { content: 'kept fact E', category: 'fact', importance: 5, entities: [], source_role: 'external' },
+      ],
+    });
+
+    const agentGroupId = 'ag-test-importance-filter';
+    const sourcesBasePath = '/test/test-group';
+    const fileContent = 'A source document with mixed-importance facts to test the threshold gate.';
+    const filePath = '/tmp/mixed-importance.txt';
+
+    stubProcessInboxFileValidation(filePath, sourcesBasePath, fileContent);
+    const mkdirSpy = vi.spyOn(fs, 'mkdirSync').mockImplementation(() => undefined);
+    const renameSpy = vi.spyOn(fs, 'renameSync').mockImplementation(() => undefined);
+
+    const ingester = new SourceIngester();
+    const store = makeStore();
+    const health = makeHealth();
+
+    const result = await ingester.processInboxFile(agentGroupId, sourcesBasePath, filePath, store, health);
+
+    // Only the importance >= 4 facts get written.
+    expect(result.factsWritten).toBe(2);
+    expect(result.failed).toBe(false);
+    expect(store.remember).toHaveBeenCalledTimes(2);
+
+    // Per-drop health counter fires once per below-threshold fact.
+    expect(health.recordLowImportanceDropped).toHaveBeenCalledTimes(3);
+    expect(health.recordLowImportanceDropped).toHaveBeenCalledWith(agentGroupId);
+
+    // File still moves to processed/ — pipeline succeeded, even though some
+    // facts were filtered.
+    expect(renameSpy).toHaveBeenCalled();
+
+    mkdirSpy.mockRestore();
+    renameSpy.mockRestore();
+    ingestDb.close();
+  });
+
   it('test_processInboxFile_success_clears_dead_letters — pre-existing dead_letters row is deleted in same txn as processed_sources INSERT', async () => {
     const ingestDb = makeIngestDb();
     setIngestDb(ingestDb);
@@ -323,7 +377,7 @@ describe('SourceIngester', () => {
         {
           content: 'Fact from previously dead-lettered file',
           category: 'fact',
-          importance: 3,
+          importance: 4,
           entities: [],
           source_role: 'external',
         },
