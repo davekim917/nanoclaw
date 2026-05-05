@@ -7,67 +7,115 @@ import * as containerConfig from '../container-config.js';
 
 /**
  * Tests for discoverMemoryGroups — the dual-source group discovery introduced
- * in step 2 (commit 6c72037). Walks GROUPS_DIR (legacy agent groups) AND
- * CC_PROJECTS_DIR (host CC sessions), returning a unified list. The CC walk
- * was untested by the refactor's mechanical test updates; these tests cover
- * the new path explicitly.
+ * in step 2 (commit 6c72037) and hardened against symlink traversal in
+ * codex F6 (2026-05-05). Walks GROUPS_DIR (legacy agent groups) AND
+ * CC_PROJECTS_DIR (host CC sessions), returning a unified list.
  */
 
 afterEach(() => {
   vi.restoreAllMocks();
 });
 
+interface CcEntry {
+  name: string;
+  /** Defaults to false — entry is a regular directory. */
+  symlink?: boolean;
+  /** Defaults to true — Dirent.isDirectory() returns this. */
+  directory?: boolean;
+}
+
+interface MarkerSpec {
+  /** Defaults to 'file'. 'missing' means the marker doesn't exist. */
+  kind?: 'file' | 'symlink' | 'dir' | 'missing';
+}
+
 /**
- * Create fs spies that route directory reads, stat, and existsSync to a
- * fixture map. Any path not in the map falls through to default behavior
- * (typically rejecting via thrown ENOENT for readdir/stat).
+ * Mock fs for discoverMemoryGroups testing. Supports:
+ *   - GROUPS_DIR readdir (string entries, treated as legacy groups)
+ *   - CC_PROJECTS_DIR readdir with withFileTypes:true (Dirent fixtures)
+ *   - realpathSync (defaults to identity unless overridden)
+ *   - statSync for legacy group entries (for the GROUPS_DIR walk's isDirectory check)
+ *   - lstatSync for markers (codex F6 — must be regular file, not symlink/dir)
  */
 function mockFs(opts: {
   groupsDirEntries?: string[];
-  ccDirEntries?: string[];
-  // Map of "path → exists" for fs.existsSync. Used to express marker presence.
-  existing?: Record<string, boolean>;
-  // Set of paths whose stat should report isDirectory=true. All others throw.
-  directories?: Set<string>;
+  ccEntries?: CcEntry[];
+  /** Per-entry marker spec. Key = slug. Default = 'file' (marker exists, regular file). */
+  markers?: Record<string, MarkerSpec>;
+  /** Override realpath. Default = identity. */
+  realpaths?: Record<string, string>;
+  /** Set of paths whose statSync reports isDirectory=true (for GROUPS_DIR walk). */
+  groupDirectories?: Set<string>;
 }): void {
-  const dirs = opts.directories ?? new Set<string>();
+  const groupDirs = opts.groupDirectories ?? new Set<string>();
+  const realpaths = opts.realpaths ?? {};
 
-  vi.spyOn(fs, 'readdirSync').mockImplementation(((p: fs.PathLike) => {
+  vi.spyOn(fs, 'readdirSync').mockImplementation(((p: fs.PathLike, options?: { withFileTypes?: boolean }) => {
     const s = String(p);
     if (s === GROUPS_DIR) return (opts.groupsDirEntries ?? []) as unknown as fs.Dirent[];
     if (s === CC_PROJECTS_DIR) {
-      if (opts.ccDirEntries === undefined) {
+      if (opts.ccEntries === undefined) {
         const err = new Error('ENOENT') as NodeJS.ErrnoException;
         err.code = 'ENOENT';
         throw err;
       }
-      return opts.ccDirEntries as unknown as fs.Dirent[];
+      if (options?.withFileTypes) {
+        return opts.ccEntries.map(
+          (e) =>
+            ({
+              name: e.name,
+              isDirectory: () => e.directory ?? true,
+              isSymbolicLink: () => Boolean(e.symlink),
+            }) as unknown as fs.Dirent,
+        ) as unknown as fs.Dirent[];
+      }
+      return opts.ccEntries.map((e) => e.name) as unknown as fs.Dirent[];
     }
     return [] as unknown as fs.Dirent[];
   }) as unknown as typeof fs.readdirSync);
 
   vi.spyOn(fs, 'statSync').mockImplementation(((p: fs.PathLike) => {
     const s = String(p);
-    if (dirs.has(s)) return { isDirectory: () => true } as fs.Stats;
+    if (groupDirs.has(s)) return { isDirectory: () => true } as fs.Stats;
     const err = new Error('ENOENT') as NodeJS.ErrnoException;
     err.code = 'ENOENT';
     throw err;
   }) as unknown as typeof fs.statSync);
 
-  vi.spyOn(fs, 'existsSync').mockImplementation(((p: fs.PathLike) => {
-    return Boolean(opts.existing?.[String(p)]);
-  }) as unknown as typeof fs.existsSync);
+  vi.spyOn(fs, 'realpathSync').mockImplementation(((p: fs.PathLike) => {
+    const s = String(p);
+    return realpaths[s] ?? s;
+  }) as unknown as typeof fs.realpathSync);
+
+  vi.spyOn(fs, 'lstatSync').mockImplementation(((p: fs.PathLike) => {
+    const s = String(p);
+    // Marker lookup: path ends with '/.memory-enabled' under a CC project.
+    const segs = s.split(path.sep);
+    if (segs[segs.length - 1] === '.memory-enabled') {
+      const slug = segs[segs.length - 2];
+      const spec = opts.markers?.[slug] ?? { kind: 'file' };
+      if (spec.kind === 'missing') {
+        const err = new Error('ENOENT') as NodeJS.ErrnoException;
+        err.code = 'ENOENT';
+        throw err;
+      }
+      return {
+        isFile: () => spec.kind === 'file',
+        isSymbolicLink: () => spec.kind === 'symlink',
+        isDirectory: () => spec.kind === 'dir',
+      } as fs.Stats;
+    }
+    const err = new Error('ENOENT') as NodeJS.ErrnoException;
+    err.code = 'ENOENT';
+    throw err;
+  }) as unknown as typeof fs.lstatSync);
 }
 
 describe('discoverMemoryGroups', () => {
   it('returns CC project as cc-<slug> group when .memory-enabled marker is present', () => {
     const slug = '-home-ubuntu-test-project';
-    const projectPath = path.join(CC_PROJECTS_DIR, slug);
     mockFs({
-      groupsDirEntries: [],
-      ccDirEntries: [slug],
-      directories: new Set([projectPath]),
-      existing: { [path.join(projectPath, '.memory-enabled')]: true },
+      ccEntries: [{ name: slug }],
     });
 
     const groups = discoverMemoryGroups();
@@ -76,56 +124,43 @@ describe('discoverMemoryGroups', () => {
     expect(groups[0]).toEqual({
       agentGroupId: `cc-${slug}`,
       folder: slug,
-      sourcesBasePath: projectPath,
+      sourcesBasePath: path.join(CC_PROJECTS_DIR, slug),
       enabled: true,
     });
   });
 
   it('skips CC projects without the .memory-enabled marker', () => {
-    const slug = '-home-ubuntu-unmarked';
-    const projectPath = path.join(CC_PROJECTS_DIR, slug);
     mockFs({
-      groupsDirEntries: [],
-      ccDirEntries: [slug],
-      directories: new Set([projectPath]),
-      existing: {}, // no marker file
+      ccEntries: [{ name: '-home-ubuntu-unmarked' }],
+      markers: { '-home-ubuntu-unmarked': { kind: 'missing' } },
     });
 
     expect(discoverMemoryGroups()).toEqual([]);
   });
 
-  it('skips non-directory CC entries even with marker (defensive against stray files)', () => {
-    const slug = 'not-a-dir';
+  it('skips non-directory CC entries even with marker', () => {
     mockFs({
-      groupsDirEntries: [],
-      ccDirEntries: [slug],
-      directories: new Set(), // entry not in directories set → statSync throws
-      existing: { [path.join(CC_PROJECTS_DIR, slug, '.memory-enabled')]: true },
+      ccEntries: [{ name: 'not-a-dir', directory: false }],
     });
 
     expect(discoverMemoryGroups()).toEqual([]);
   });
 
   it('returns empty when CC_PROJECTS_DIR does not exist (best-effort behavior)', () => {
-    mockFs({
-      groupsDirEntries: [],
-      ccDirEntries: undefined, // makes readdirSync throw ENOENT for CC_PROJECTS_DIR
-    });
+    mockFs({});
 
     expect(discoverMemoryGroups()).toEqual([]);
   });
 
   it('discovers CC and GROUPS_DIR groups together', () => {
     const ccSlug = '-home-ubuntu-cc-side';
-    const ccPath = path.join(CC_PROJECTS_DIR, ccSlug);
     const groupFolder = 'illysium';
     const groupPath = path.join(GROUPS_DIR, groupFolder);
 
     mockFs({
       groupsDirEntries: [groupFolder],
-      ccDirEntries: [ccSlug],
-      directories: new Set([ccPath, groupPath]),
-      existing: { [path.join(ccPath, '.memory-enabled')]: true },
+      ccEntries: [{ name: ccSlug }],
+      groupDirectories: new Set([groupPath]),
     });
     vi.spyOn(containerConfig, 'readContainerConfig').mockReturnValue({
       agentGroupId: 'ag-1234-illysium',
@@ -148,19 +183,80 @@ describe('discoverMemoryGroups', () => {
     expect(groups).toContainEqual({
       agentGroupId: `cc-${ccSlug}`,
       folder: ccSlug,
-      sourcesBasePath: ccPath,
+      sourcesBasePath: path.join(CC_PROJECTS_DIR, ccSlug),
       enabled: true,
     });
   });
 
-  it('CC group sourcesBasePath stays under CC_PROJECTS_DIR (path containment)', () => {
-    const slug = '-home-ubuntu-path-check';
+  // === Codex F6 hardening (symlink traversal) ===
+
+  it('rejects CC project entries that are symlinks (Dirent.isSymbolicLink)', () => {
+    mockFs({
+      ccEntries: [{ name: '-home-ubuntu-symlinked', symlink: true }],
+    });
+
+    expect(discoverMemoryGroups()).toEqual([]);
+  });
+
+  it('rejects CC entries whose realpath escapes CC_PROJECTS_DIR (cross-tenant defense)', () => {
+    const slug = '-home-ubuntu-bind-mount';
     const projectPath = path.join(CC_PROJECTS_DIR, slug);
     mockFs({
-      groupsDirEntries: [],
-      ccDirEntries: [slug],
-      directories: new Set([projectPath]),
-      existing: { [path.join(projectPath, '.memory-enabled')]: true },
+      ccEntries: [{ name: slug }],
+      realpaths: {
+        [projectPath]: '/var/some-other-mount/sneaky-target',
+        [CC_PROJECTS_DIR]: CC_PROJECTS_DIR,
+      },
+    });
+
+    expect(discoverMemoryGroups()).toEqual([]);
+  });
+
+  it('rejects entries whose .memory-enabled marker is itself a symlink', () => {
+    const slug = '-home-ubuntu-symlinked-marker';
+    mockFs({
+      ccEntries: [{ name: slug }],
+      markers: { [slug]: { kind: 'symlink' } },
+    });
+
+    expect(discoverMemoryGroups()).toEqual([]);
+  });
+
+  it('rejects entries whose .memory-enabled marker is a directory', () => {
+    const slug = '-home-ubuntu-dir-marker';
+    mockFs({
+      ccEntries: [{ name: slug }],
+      markers: { [slug]: { kind: 'dir' } },
+    });
+
+    expect(discoverMemoryGroups()).toEqual([]);
+  });
+
+  it('rejects entries whose realpath fails (broken symlink target, ENOENT, EACCES)', () => {
+    const slug = '-home-ubuntu-broken-link';
+    const projectPath = path.join(CC_PROJECTS_DIR, slug);
+    mockFs({
+      ccEntries: [{ name: slug }],
+    });
+    // Override realpath to throw for this specific path (simulating broken link).
+    const realpathSpy = vi.spyOn(fs, 'realpathSync');
+    realpathSpy.mockImplementation(((p: fs.PathLike) => {
+      const s = String(p);
+      if (s === projectPath) {
+        const err = new Error('ENOENT') as NodeJS.ErrnoException;
+        err.code = 'ENOENT';
+        throw err;
+      }
+      return s;
+    }) as unknown as typeof fs.realpathSync);
+
+    expect(discoverMemoryGroups()).toEqual([]);
+  });
+
+  it('CC group sourcesBasePath stays under CC_PROJECTS_DIR (path containment)', () => {
+    const slug = '-home-ubuntu-path-check';
+    mockFs({
+      ccEntries: [{ name: slug }],
     });
 
     const [group] = discoverMemoryGroups();

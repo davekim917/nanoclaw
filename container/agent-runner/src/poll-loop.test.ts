@@ -522,3 +522,39 @@ describe('end-to-end with mock provider', () => {
     expect(outMessages[0].in_reply_to).toBe('m1');
   });
 });
+
+describe('processQuery done-flag invariant (codex F4 regression guard)', () => {
+  it('result handler does NOT flip done — provider stream stays open across turns', async () => {
+    // Codex F4 (2026-05-05): a prior commit set `done = true` synchronously
+    // inside the `event.type === 'result'` branch. The polling interval
+    // gates on `done`, so flipping it after the first result starved every
+    // follow-up trigger=1 row in the session — the host wouldn't wake a
+    // second container (this one was still running) and there was no
+    // processing claim, so recovery fell back to the 30-min absolute
+    // heartbeat ceiling. The provider's events generator stays open until
+    // explicit `query.end()`/abort (see container/agent-runner/src/providers/
+    // claude.ts:1080); only the outer for-await returning should flip
+    // `done`. This guard catches re-introduction of the synchronous flip.
+    const fs = await import('fs');
+    const src = fs.readFileSync(new URL('./poll-loop.ts', import.meta.url), 'utf8');
+    const lines = src.split('\n');
+    // Anchor on `markCompleted(initialBatchIds);` — the only call site is
+    // inside the result handler (other completion paths use `markCompleted(skipped)`
+    // or `markCompleted(keptIds)`). The 20 lines BEFORE this anchor are
+    // the result-handler body up to the `} else if (event.type === 'result') {`
+    // line. Anywhere in that window flipping `done` is the regression.
+    const anchorIdx = lines.findIndex((l) => l.includes('markCompleted(initialBatchIds)'));
+    expect(anchorIdx).toBeGreaterThan(-1);
+    const handlerWindow = lines.slice(Math.max(0, anchorIdx - 20), anchorIdx + 1).join('\n');
+    // Strip line comments before the regression check so the explanatory
+    // comment naming the prohibited code doesn't itself trip the assertion.
+    const codeOnly = handlerWindow
+      .split('\n')
+      .map((l) => {
+        const i = l.indexOf('//');
+        return i >= 0 ? l.slice(0, i) : l;
+      })
+      .join('\n');
+    expect(codeOnly).not.toContain('done = true');
+  });
+});

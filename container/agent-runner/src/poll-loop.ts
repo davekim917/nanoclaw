@@ -580,22 +580,23 @@ async function processQuery(
         // Claude session with no prior context.
         setContinuation(providerName, event.continuation);
       } else if (event.type === 'result') {
-        // A result — with or without text — means the turn is done. Flip
-        // `done` SYNCHRONOUSLY before any further async work so an in-flight
-        // setInterval tick that fires while the for-await yields between
-        // `result` and the iterator's return cannot pass the `if (done)
-        // return` guard above. Without this, a follow-up poll resolving
-        // its `await applyPreTaskScripts` in that window would
-        // markProcessing → query.push → markCompleted into a stream the
-        // SDK has already finalized — silencing the pushed message
-        // permanently (clearStaleProcessingAcks only deletes 'processing'
-        // rows, and getPendingMessages filters 'completed' acks).
-        done = true;
-        // Mark the initial batch completed now so the host sweep doesn't
-        // see stale 'processing' claims while the query stays open for
-        // follow-up pushes. The agent may have responded via MCP
-        // (send_message) mid-turn, or the message may not need a response
-        // at all — either way the turn is finished.
+        // A `result` event signals the assistant's turn is complete, but the
+        // provider's events generator stays open for follow-up `push()` calls
+        // (see container/agent-runner/src/providers/claude.ts:1080 — the
+        // generator only exits on `stream.end()`/abort). We must NOT flip
+        // the `done` flag here; the polling interval depends on `done` to
+        // gate follow-up admission, and stopping it after the first result
+        // would
+        // starve every subsequent inbound trigger=1 row in this session
+        // (codex F4, 2026-05-05). The race the prior synchronous flip
+        // claimed to fix was illusory: pushes into an open multi-turn stream
+        // become the next turn, they're not eaten by the SDK.
+        //
+        // Mark the initial batch completed now so the host sweep doesn't see
+        // stale 'processing' claims while the query stays open for follow-up
+        // pushes. The agent may have responded via MCP (send_message)
+        // mid-turn, or the message may not need a response at all — either
+        // way the per-turn work for these rows is finished.
         markCompleted(initialBatchIds);
         if (event.text) {
           dispatchResultText(event.text, routing);

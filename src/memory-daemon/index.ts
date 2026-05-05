@@ -87,22 +87,54 @@ export function discoverMemoryGroups(health?: HealthRecorder): DiscoveredGroup[]
   // dropping the marker (the CC hooks at ~/.claude/hooks/cc-mnemon/ create it
   // on first turn for default-on behavior). Discovery is best-effort — a
   // missing CC_PROJECTS_DIR is normal on hosts that don't run CC.
-  let ccEntries: string[] = [];
+  // Codex F6 (2026-05-05): a previous version used fs.statSync + fs.existsSync
+  // which both follow symlinks. A symlink under CC_PROJECTS_DIR pointing at
+  // another marked project would be discovered as a new cc-<slug> group with
+  // sourcesBasePath set to the symlink path; downstream realpath checks
+  // validate against the inbox path (not the project root), so files from one
+  // project could be ingested into another's store, breaking cross-tenant
+  // isolation. Hardening:
+  //   1. readdirSync with withFileTypes:true → reject Dirents that ARE symlinks
+  //   2. realpath project root, require it to be a direct child of realpath(CC_PROJECTS_DIR)
+  //   3. lstat the marker (not existsSync) and require it to be a regular file
+  let ccDirents: fs.Dirent[];
   try {
-    ccEntries = fs.readdirSync(CC_PROJECTS_DIR);
+    ccDirents = fs.readdirSync(CC_PROJECTS_DIR, { withFileTypes: true });
   } catch {
     return groups;
   }
-  for (const entry of ccEntries) {
+  let ccRootReal: string;
+  try {
+    ccRootReal = fs.realpathSync(CC_PROJECTS_DIR);
+  } catch {
+    return groups;
+  }
+  for (const dirent of ccDirents) {
+    const entry = dirent.name;
     const projectPath = path.join(CC_PROJECTS_DIR, entry);
+    // Reject symlinks at the readdir level — Dirent.isSymbolicLink() reflects
+    // the lstat type, so we don't follow the link before classifying it.
+    if (dirent.isSymbolicLink()) continue;
+    if (!dirent.isDirectory()) continue;
+    // Realpath the project to defend against bind-mounts or hard-link tricks
+    // that bypass the Dirent symlink check, and require it to be a direct
+    // child of CC_PROJECTS_DIR's realpath.
+    let projectReal: string;
     try {
-      const stat = fs.statSync(projectPath);
-      if (!stat.isDirectory()) continue;
+      projectReal = fs.realpathSync(projectPath);
     } catch {
       continue;
     }
+    if (path.dirname(projectReal) !== ccRootReal) continue;
+    // Marker must be a regular file (not a symlink, not a directory).
     const markerPath = path.join(projectPath, CC_MEMORY_MARKER);
-    if (!fs.existsSync(markerPath)) continue;
+    let markerStat: fs.Stats;
+    try {
+      markerStat = fs.lstatSync(markerPath);
+    } catch {
+      continue;
+    }
+    if (!markerStat.isFile()) continue;
     groups.push({
       agentGroupId: `cc-${entry}`,
       folder: entry,
