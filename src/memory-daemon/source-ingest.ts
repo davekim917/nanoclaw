@@ -95,6 +95,44 @@ function canonicalize(content: string): string {
  *    sees garbage input and emits no final message. Looks like a transient
  *    failure but is deterministic for binary content; retries always poison.
  */
+/**
+ * Codex F6 hardening (round 2, 2026-05-05): walk a chain of path components
+ * starting from `parent`, lstat each level, and reject if any intermediate
+ * component is a symlink (or a non-directory). Components that don't exist
+ * yet pass — the daemon mkdir's them as regular dirs at need, and the next
+ * sweep re-validates.
+ *
+ * Why this exists despite the existing realpath-on-file check in runSweep:
+ * `fs.readdirSync(inboxPath)` and `fs.realpathSync(inboxPath)` BOTH follow
+ * symlinks silently. If `<project>/sources/inbox` is a symlink to another
+ * project's inbox, then realpath resolves to the OTHER project's path and
+ * the file's startsWith check passes — but every ingested file lands in
+ * the WRONG store, breaking cross-tenant isolation. This walks the chain
+ * with lstat to catch the dir-symlink before it traverses.
+ *
+ * Use at every entry point that reads or writes within a group's
+ * sources/inbox tree: discoverMemoryGroups (cheap up-front filter),
+ * reconcileWatchers (before opening fs.watch), runSweep (before
+ * readdirSync), and processInboxFile (before opening the FD).
+ */
+export function isNonSymlinkChain(parent: string, ...components: string[]): boolean {
+  let current = parent;
+  for (const comp of components) {
+    current = path.join(current, comp);
+    let st: fs.Stats;
+    try {
+      st = fs.lstatSync(current);
+    } catch {
+      // Component doesn't exist yet — fine. Daemon will mkdir as a regular
+      // directory; next sweep re-validates.
+      return true;
+    }
+    if (st.isSymbolicLink()) return false;
+    if (!st.isDirectory()) return false;
+  }
+  return true;
+}
+
 export function looksBinary(input: Buffer | string): boolean {
   const data = typeof input === 'string' ? Buffer.from(input, 'utf8') : input;
   if (data.length === 0) return false;
@@ -177,6 +215,14 @@ export class SourceIngester {
       if (!group.enabled) continue;
       if (this.watchers.has(group.agentGroupId)) continue;
 
+      // Codex F6 round 2: re-validate the chain before opening the watcher.
+      // fs.watch follows symlinks silently; if `sources/inbox` is symlinked
+      // to another group's inbox, the watcher fires on victim writes and the
+      // setImmediate processInboxFile call ingests them into THIS group's
+      // store. Re-validating closes the TOCTOU window between discovery and
+      // watch-open, even though discovery already filtered.
+      if (!isNonSymlinkChain(group.sourcesBasePath, 'sources', 'inbox')) continue;
+
       const inboxPath = path.join(group.sourcesBasePath, 'sources', 'inbox');
       try {
         fs.mkdirSync(inboxPath, { recursive: true });
@@ -258,6 +304,20 @@ export class SourceIngester {
     // swap the regular file for a symlink. Reading by path after re-validation
     // (Codex finding #5 round 1) still has a residual race; openSync with
     // O_NOFOLLOW + fstat eliminates it (Codex finding #2 round 2).
+    //
+    // Codex F6 round 2 (2026-05-05): also re-validate the dir chain. If
+    // `sources` or `sources/inbox` is a symlink to another group's inbox,
+    // the realpath resolves to the OTHER group's path and every file's
+    // startsWith check passes — but each ingested file lands in the WRONG
+    // store. Same applies to `sources/processed` for the post-classification
+    // move (codex called out that processed moves can relocate victim files
+    // out of their own inbox). Reject before opening or moving anything.
+    if (
+      !isNonSymlinkChain(sourcesBasePath, 'sources', 'inbox') ||
+      !isNonSymlinkChain(sourcesBasePath, 'sources', 'processed')
+    ) {
+      return { factsWritten: 0, failed: false };
+    }
     const inboxPath = path.join(sourcesBasePath, 'sources', 'inbox');
     let content: string;
     try {

@@ -5,7 +5,7 @@ import { openMnemonIngestDb, runMnemonIngestMigrations } from '../db/migrations/
 import { HealthRecorder } from './health.js';
 import { setDeadLettersDb, getDueRetries, deleteAfterSuccess } from './dead-letters.js';
 import { runChatStreamSweep, setIngestDb } from './classifier.js';
-import { SourceIngester, setIngestDb as setSourceIngestDb } from './source-ingest.js';
+import { SourceIngester, setIngestDb as setSourceIngestDb, isNonSymlinkChain } from './source-ingest.js';
 import { readContainerConfig } from '../container-config.js';
 import { GROUPS_DIR, CC_PROJECTS_DIR, CC_MEMORY_MARKER } from '../config.js';
 import type { MemoryStore } from '../modules/memory/store.js';
@@ -68,6 +68,12 @@ export function discoverMemoryGroups(health?: HealthRecorder): DiscoveredGroup[]
     // and returns an empty config, so a clean throwless return doesn't
     // necessarily mean the file is recovered — it could just be empty.
     health?.clearMemoryEnabledCheckFailure(entry);
+
+    // Codex F6 round 2 (2026-05-05): legacy agent groups have the same
+    // bypass surface as CC projects — `<group>/sources/inbox` could be a
+    // symlink to another group's inbox, breaking cross-tenant isolation.
+    // Skip the group entirely on intermediate-symlink detection.
+    if (!isNonSymlinkChain(fullPath, 'sources', 'inbox')) continue;
 
     groups.push({
       agentGroupId,
@@ -135,6 +141,13 @@ export function discoverMemoryGroups(health?: HealthRecorder): DiscoveredGroup[]
       continue;
     }
     if (!markerStat.isFile()) continue;
+    // Codex F6 round 2 (2026-05-05): also reject if `sources` or
+    // `sources/inbox` are symlinks. A project with a non-symlink root and
+    // marker can still symlink an intermediate dir to another project's
+    // inbox; readdirSync/realpathSync at sweep time would follow the link
+    // and ingest victim files into this group's store. The chain check
+    // closes that bypass at discovery (and is re-checked at use time).
+    if (!isNonSymlinkChain(projectPath, 'sources', 'inbox')) continue;
     groups.push({
       agentGroupId: `cc-${entry}`,
       folder: entry,
@@ -155,6 +168,10 @@ async function runSweep(ingester: SourceIngester, health: HealthRecorder, store:
   await runChatStreamSweep(enabledGroups, store, health);
 
   for (const group of enabledGroups) {
+    // Codex F6 round 2: re-validate the chain at use time. Discovery
+    // already filtered, but a symlink swap between sweeps could TOCTOU
+    // around the discovery-time check. Cheap to re-run; closes the window.
+    if (!isNonSymlinkChain(group.sourcesBasePath, 'sources', 'inbox')) continue;
     const inboxPath = path.join(group.sourcesBasePath, 'sources', 'inbox');
     let files: string[];
     let inboxRealPath: string;

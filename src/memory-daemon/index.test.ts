@@ -29,6 +29,15 @@ interface MarkerSpec {
   kind?: 'file' | 'symlink' | 'dir' | 'missing';
 }
 
+interface ChainSpec {
+  /** lstat type for `<project>/sources`. Default: 'missing' (passes the chain check). */
+  sources?: 'dir' | 'symlink' | 'file' | 'missing';
+  /** lstat type for `<project>/sources/inbox`. Default: 'missing'. */
+  inbox?: 'dir' | 'symlink' | 'file' | 'missing';
+  /** lstat type for `<project>/sources/processed`. Default: 'missing'. */
+  processed?: 'dir' | 'symlink' | 'file' | 'missing';
+}
+
 /**
  * Mock fs for discoverMemoryGroups testing. Supports:
  *   - GROUPS_DIR readdir (string entries, treated as legacy groups)
@@ -42,6 +51,8 @@ function mockFs(opts: {
   ccEntries?: CcEntry[];
   /** Per-entry marker spec. Key = slug. Default = 'file' (marker exists, regular file). */
   markers?: Record<string, MarkerSpec>;
+  /** Per-entry chain spec for sources/inbox/processed lstat behavior. Key = slug. */
+  chains?: Record<string, ChainSpec>;
   /** Override realpath. Default = identity. */
   realpaths?: Record<string, string>;
   /** Set of paths whose statSync reports isDirectory=true (for GROUPS_DIR walk). */
@@ -89,9 +100,11 @@ function mockFs(opts: {
 
   vi.spyOn(fs, 'lstatSync').mockImplementation(((p: fs.PathLike) => {
     const s = String(p);
-    // Marker lookup: path ends with '/.memory-enabled' under a CC project.
     const segs = s.split(path.sep);
-    if (segs[segs.length - 1] === '.memory-enabled') {
+    const last = segs[segs.length - 1];
+
+    // Marker lookup: path ends with '/.memory-enabled' under a CC project.
+    if (last === '.memory-enabled') {
       const slug = segs[segs.length - 2];
       const spec = opts.markers?.[slug] ?? { kind: 'file' };
       if (spec.kind === 'missing') {
@@ -105,6 +118,34 @@ function mockFs(opts: {
         isDirectory: () => spec.kind === 'dir',
       } as fs.Stats;
     }
+
+    // Chain lstat for `sources` / `sources/inbox` / `sources/processed` under
+    // a CC project (codex F6 round 2 — isNonSymlinkChain walks each level).
+    // Default = 'missing' so chain check passes (daemon would mkdir later).
+    function chainLookup(slug: string, kind: 'sources' | 'inbox' | 'processed'): fs.Stats {
+      const spec = opts.chains?.[slug] ?? {};
+      const t = spec[kind] ?? 'missing';
+      if (t === 'missing') {
+        const err = new Error('ENOENT') as NodeJS.ErrnoException;
+        err.code = 'ENOENT';
+        throw err;
+      }
+      return {
+        isFile: () => t === 'file',
+        isSymbolicLink: () => t === 'symlink',
+        isDirectory: () => t === 'dir',
+      } as fs.Stats;
+    }
+    if (last === 'sources' && segs.length >= 2) {
+      return chainLookup(segs[segs.length - 2], 'sources');
+    }
+    if (last === 'inbox' && segs[segs.length - 2] === 'sources' && segs.length >= 3) {
+      return chainLookup(segs[segs.length - 3], 'inbox');
+    }
+    if (last === 'processed' && segs[segs.length - 2] === 'sources' && segs.length >= 3) {
+      return chainLookup(segs[segs.length - 3], 'processed');
+    }
+
     const err = new Error('ENOENT') as NodeJS.ErrnoException;
     err.code = 'ENOENT';
     throw err;
@@ -249,6 +290,78 @@ describe('discoverMemoryGroups', () => {
       }
       return s;
     }) as unknown as typeof fs.realpathSync);
+
+    expect(discoverMemoryGroups()).toEqual([]);
+  });
+
+  // === Codex F6 round 2 (intermediate-dir symlink bypass) ===
+
+  it('rejects entries whose <project>/sources is a symlink', () => {
+    const slug = '-home-ubuntu-symlinked-sources';
+    mockFs({
+      ccEntries: [{ name: slug }],
+      chains: { [slug]: { sources: 'symlink' } },
+    });
+
+    expect(discoverMemoryGroups()).toEqual([]);
+  });
+
+  it('rejects entries whose <project>/sources/inbox is a symlink', () => {
+    const slug = '-home-ubuntu-symlinked-inbox';
+    mockFs({
+      ccEntries: [{ name: slug }],
+      // sources must exist as a real dir for the inbox-symlink case to be
+      // physically possible; the chain helper short-circuits at the first
+      // missing component otherwise.
+      chains: { [slug]: { sources: 'dir', inbox: 'symlink' } },
+    });
+
+    expect(discoverMemoryGroups()).toEqual([]);
+  });
+
+  it('rejects entries whose <project>/sources is a regular file (not a directory)', () => {
+    const slug = '-home-ubuntu-file-sources';
+    mockFs({
+      ccEntries: [{ name: slug }],
+      chains: { [slug]: { sources: 'file' } },
+    });
+
+    expect(discoverMemoryGroups()).toEqual([]);
+  });
+
+  it('accepts entries where sources/inbox does not exist yet (daemon will mkdir)', () => {
+    const slug = '-home-ubuntu-fresh-project';
+    mockFs({
+      ccEntries: [{ name: slug }],
+      // chains undefined → all components default to 'missing' → chain check passes
+    });
+
+    const groups = discoverMemoryGroups();
+    expect(groups).toHaveLength(1);
+    expect(groups[0].agentGroupId).toBe(`cc-${slug}`);
+  });
+
+  it('GROUPS_DIR groups also rejected on intermediate-symlink (legacy parity)', () => {
+    // Codex F6 round 2 explicitly notes legacy agent groups have the same
+    // bypass surface — symlinking <group>/sources or <group>/sources/inbox
+    // to another group's matching path would cross-ingest.
+    const groupFolder = 'illysium';
+    const groupPath = path.join(GROUPS_DIR, groupFolder);
+    mockFs({
+      groupsDirEntries: [groupFolder],
+      groupDirectories: new Set([groupPath]),
+      // Reuse the chains map keyed by folder name (groupFolder is the
+      // last segment of <GROUPS_DIR>/<groupFolder>, same as the slug slot).
+      chains: { [groupFolder]: { sources: 'dir', inbox: 'symlink' } },
+    });
+    vi.spyOn(containerConfig, 'readContainerConfig').mockReturnValue({
+      agentGroupId: 'ag-legacy',
+      memory: { enabled: true },
+      mcpServers: {},
+      packages: { apt: [], npm: [] },
+      additionalMounts: [],
+      skills: [],
+    });
 
     expect(discoverMemoryGroups()).toEqual([]);
   });
