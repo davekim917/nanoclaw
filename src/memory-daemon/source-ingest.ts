@@ -514,9 +514,20 @@ export class SourceIngester {
       db.transaction(() => {
         db.prepare(
           `INSERT OR IGNORE INTO processed_sources
-             (agent_group_id, content_sha256, extractor_version, prompt_version, source_path, ingested_at, facts_written)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        ).run(agentGroupId, contentHash, EXTRACTOR_VERSION, PROMPT_VERSION, filePath, new Date().toISOString(), 0);
+             (agent_group_id, content_sha256, extractor_version, prompt_version, source_path, ingested_at,
+              facts_written, facts_emitted, facts_dropped_low_importance)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).run(
+          agentGroupId,
+          contentHash,
+          EXTRACTOR_VERSION,
+          PROMPT_VERSION,
+          filePath,
+          new Date().toISOString(),
+          0,
+          output.facts.length,
+          0,
+        );
         db.prepare(`DELETE FROM dead_letters WHERE item_key = ? AND agent_group_id = ?`).run(filePath, agentGroupId);
       })();
 
@@ -525,6 +536,7 @@ export class SourceIngester {
     }
 
     let factsWritten = 0;
+    let factsDroppedForImportance = 0;
     let anyFailed = false;
 
     for (let factIndex = 0; factIndex < output.facts.length; factIndex++) {
@@ -535,6 +547,7 @@ export class SourceIngester {
       // bar as message-stream facts. Without this filter, source paths stored
       // 1-5 while chat stored only 4-5, polluting recall with low-signal noise.
       if (rawFact.importance < MIN_FACT_IMPORTANCE) {
+        factsDroppedForImportance++;
         if (health) health.recordLowImportanceDropped(agentGroupId);
         continue;
       }
@@ -605,8 +618,9 @@ export class SourceIngester {
     db.transaction(() => {
       db.prepare(
         `INSERT OR IGNORE INTO processed_sources
-           (agent_group_id, content_sha256, extractor_version, prompt_version, source_path, ingested_at, facts_written)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+           (agent_group_id, content_sha256, extractor_version, prompt_version, source_path, ingested_at,
+            facts_written, facts_emitted, facts_dropped_low_importance)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         agentGroupId,
         contentHash,
@@ -615,6 +629,8 @@ export class SourceIngester {
         filePath,
         new Date().toISOString(),
         factsWritten,
+        output.facts.length,
+        factsDroppedForImportance,
       );
       db.prepare(`DELETE FROM dead_letters WHERE item_key = ? AND agent_group_id = ?`).run(filePath, agentGroupId);
     })();

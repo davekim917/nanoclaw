@@ -456,8 +456,9 @@ async function classifyPair(
     db.prepare(
       `INSERT OR IGNORE INTO processed_pairs
          (agent_group_id, user_run_first_id, classifier_version, prompt_version, is_orphan,
-          user_run_last_id, assistant_run_first_id, assistant_run_last_id, classified_at, facts_written)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          user_run_last_id, assistant_run_first_id, assistant_run_last_id, classified_at, facts_written,
+          facts_emitted, facts_dropped_low_importance)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       agentGroupId,
       pair.pairKey,
@@ -469,6 +470,8 @@ async function classifyPair(
       assistantRunLastId,
       new Date().toISOString(),
       factsWritten,
+      output.facts.length,
+      factsDroppedForImportance,
     );
     db.prepare(`DELETE FROM dead_letters WHERE item_key = ? AND agent_group_id = ?`).run(pair.pairKey, agentGroupId);
     upsertWatermarks(db, agentGroupId, lastSentAt, lastSentAt);

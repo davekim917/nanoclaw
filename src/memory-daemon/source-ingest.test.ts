@@ -80,6 +80,8 @@ function makeIngestDb(): Database.Database {
       source_path TEXT NOT NULL,
       ingested_at TEXT NOT NULL,
       facts_written INTEGER NOT NULL,
+      facts_emitted INTEGER NOT NULL DEFAULT 0,
+      facts_dropped_low_importance INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (agent_group_id, content_sha256, extractor_version, prompt_version)
     );
     CREATE TABLE dead_letters (
@@ -360,6 +362,17 @@ describe('SourceIngester', () => {
     // File still moves to processed/ — pipeline succeeded, even though some
     // facts were filtered.
     expect(renameSpy).toHaveBeenCalled();
+
+    // Per-source counters land in processed_sources so operators can see the
+    // drop rate by group. This is the F1 follow-up — without these columns
+    // the threshold is invisible after the fact.
+    const psRow = ingestDb
+      .prepare(`SELECT facts_written, facts_emitted, facts_dropped_low_importance FROM processed_sources`)
+      .get() as { facts_written: number; facts_emitted: number; facts_dropped_low_importance: number };
+    expect(psRow).toBeTruthy();
+    expect(psRow.facts_written).toBe(2);
+    expect(psRow.facts_emitted).toBe(5);
+    expect(psRow.facts_dropped_low_importance).toBe(3);
 
     mkdirSpy.mockRestore();
     renameSpy.mockRestore();

@@ -42,6 +42,8 @@ function makeIngestDb(): Database.Database {
       assistant_run_last_id TEXT,
       classified_at TEXT NOT NULL,
       facts_written INTEGER NOT NULL,
+      facts_emitted INTEGER NOT NULL DEFAULT 0,
+      facts_dropped_low_importance INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (agent_group_id, user_run_first_id, classifier_version, prompt_version, is_orphan)
     );
     CREATE TABLE watermarks (

@@ -90,6 +90,33 @@ export function runMnemonIngestMigrations(db: Database.Database): void {
     })();
   }
 
+  if (!applied.has('mnemon-ingest-counters-v2')) {
+    db.transaction(() => {
+      // Per-pair / per-source instrumentation columns. The chat-pair filter
+      // (classifier.ts:364) and source-ingest filter (source-ingest.ts) both
+      // gate at importance >= MIN_FACT_IMPORTANCE; without these counters the
+      // operator can't see the drop rate by group/path. Codex F1 follow-up:
+      // emitted = total facts the classifier produced (pre any filter);
+      // dropped_low_importance = facts filtered by the threshold; the existing
+      // facts_written column = facts actually stored. Redaction drops can be
+      // derived as emitted - facts_written - dropped_low_importance.
+      db.exec(`
+        ALTER TABLE processed_pairs ADD COLUMN facts_emitted INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE processed_pairs ADD COLUMN facts_dropped_low_importance INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE processed_sources ADD COLUMN facts_emitted INTEGER NOT NULL DEFAULT 0;
+        ALTER TABLE processed_sources ADD COLUMN facts_dropped_low_importance INTEGER NOT NULL DEFAULT 0;
+      `);
+
+      const next = (db.prepare('SELECT COALESCE(MAX(version), 0) + 1 AS v FROM schema_version').get() as { v: number })
+        .v;
+      db.prepare('INSERT INTO schema_version (version, name, applied) VALUES (?, ?, ?)').run(
+        next,
+        'mnemon-ingest-counters-v2',
+        new Date().toISOString(),
+      );
+    })();
+  }
+
   if (!applied.has('mnemon-idempotency-keys-v1')) {
     db.transaction(() => {
       // action + fact_id are stored so an idempotent replay returns the

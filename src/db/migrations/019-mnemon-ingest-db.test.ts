@@ -43,6 +43,39 @@ describe('migration 019: mnemon-ingest-db', () => {
     expect(tables).toContain('dead_letters');
   });
 
+  it('test_v2_adds_emitted_and_dropped_low_importance_columns', () => {
+    const db = tracked(freshDb());
+    runMnemonIngestMigrations(db);
+
+    const pairCols = (
+      db.prepare(`PRAGMA table_info(processed_pairs)`).all() as { name: string; dflt_value: string | null }[]
+    ).reduce<Record<string, string | null>>((acc, c) => ((acc[c.name] = c.dflt_value), acc), {});
+    expect(pairCols).toHaveProperty('facts_emitted');
+    expect(pairCols).toHaveProperty('facts_dropped_low_importance');
+
+    const sourceCols = (
+      db.prepare(`PRAGMA table_info(processed_sources)`).all() as { name: string; dflt_value: string | null }[]
+    ).reduce<Record<string, string | null>>((acc, c) => ((acc[c.name] = c.dflt_value), acc), {});
+    expect(sourceCols).toHaveProperty('facts_emitted');
+    expect(sourceCols).toHaveProperty('facts_dropped_low_importance');
+
+    // Counters apply to BOTH paths — chat-pair AND source-ingest. Default 0
+    // means pre-existing rows (and any caller still using legacy INSERT shape)
+    // get clean zero values rather than NULL.
+    expect(pairCols.facts_emitted).toBe('0');
+    expect(pairCols.facts_dropped_low_importance).toBe('0');
+    expect(sourceCols.facts_emitted).toBe('0');
+    expect(sourceCols.facts_dropped_low_importance).toBe('0');
+  });
+
+  it('test_v2_idempotent — running migration twice does not duplicate columns', () => {
+    const db = tracked(freshDb());
+    runMnemonIngestMigrations(db);
+    // ALTER TABLE ADD COLUMN is not idempotent in SQLite — running twice would
+    // throw "duplicate column name". The schema_version guard must prevent that.
+    expect(() => runMnemonIngestMigrations(db)).not.toThrow();
+  });
+
   it('test_processed_pairs_pk_orphan_distinction', () => {
     const db = tracked(freshDb());
     runMnemonIngestMigrations(db);
