@@ -23,7 +23,8 @@ export interface DiscoveredGroup {
   enabled: boolean;
 }
 
-function discoverMemoryGroups(health?: HealthRecorder): DiscoveredGroup[] {
+// Exported for unit tests. Production code calls it from runSweep below.
+export function discoverMemoryGroups(health?: HealthRecorder): DiscoveredGroup[] {
   const groups: DiscoveredGroup[] = [];
 
   let entries: string[];
