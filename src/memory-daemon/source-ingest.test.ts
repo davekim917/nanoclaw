@@ -134,7 +134,12 @@ beforeEach(() => {
   // stubProcessInboxFileValidation helper for inbox-file inspection) still
   // win because vi.spyOn replaces this default.
   vi.spyOn(fs, 'lstatSync').mockImplementation(
-    (() => ({ isDirectory: () => true, isSymbolicLink: () => false, isFile: () => false }) as fs.Stats) as unknown as typeof fs.lstatSync,
+    (() =>
+      ({
+        isDirectory: () => true,
+        isSymbolicLink: () => false,
+        isFile: () => false,
+      }) as fs.Stats) as unknown as typeof fs.lstatSync,
   );
 });
 
