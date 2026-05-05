@@ -22,6 +22,7 @@ import path from 'path';
 import { GROUPS_DIR } from './config.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { readContainerConfig } from './container-config.js';
+import { isNonSymlinkChain } from './memory-daemon/source-ingest.js';
 import { sessionDir } from './session-manager.js';
 import { log } from './log.js';
 
@@ -98,16 +99,32 @@ export function persistInboundAttachments(
         if (ag) {
           const cfg = readContainerConfig(ag.folder);
           if (cfg.memory?.enabled === true) {
-            const sourcesInbox = path.join(GROUPS_DIR, ag.folder, 'sources', 'inbox');
-            fs.mkdirSync(sourcesInbox, { recursive: true });
-            const sha = createHash('sha256').update(buffer).digest('hex').slice(0, 8);
-            const ext = path.extname(filename) || '.bin';
-            const finalName = `attachment-${sha}${ext}`;
-            const tmpPath = path.join(sourcesInbox, finalName + '.tmp');
-            const finalPath = path.join(sourcesInbox, finalName);
-            if (!fs.existsSync(finalPath)) {
-              fs.writeFileSync(tmpPath, buffer);
-              fs.renameSync(tmpPath, finalPath);
+            // Codex F7 round 3 (2026-05-05): the daemon hardens its sweep
+            // path against intermediate-symlink bypasses (sources or
+            // sources/inbox symlinked to another group's matching path
+            // would cross-ingest victim files). The host attachment mirror
+            // writes directly into the same tree and was bypassing the
+            // chain check — an attachment routed to group A could land in
+            // group B's inbox and become B's facts. Apply the same chain
+            // validation here.
+            const groupRoot = path.join(GROUPS_DIR, ag.folder);
+            if (isNonSymlinkChain(groupRoot, 'sources', 'inbox')) {
+              const sourcesInbox = path.join(groupRoot, 'sources', 'inbox');
+              fs.mkdirSync(sourcesInbox, { recursive: true });
+              const sha = createHash('sha256').update(buffer).digest('hex').slice(0, 8);
+              const ext = path.extname(filename) || '.bin';
+              const finalName = `attachment-${sha}${ext}`;
+              const tmpPath = path.join(sourcesInbox, finalName + '.tmp');
+              const finalPath = path.join(sourcesInbox, finalName);
+              if (!fs.existsSync(finalPath)) {
+                fs.writeFileSync(tmpPath, buffer);
+                fs.renameSync(tmpPath, finalPath);
+              }
+            } else {
+              log.warn('Skipped attachment mirror — sources/inbox chain failed validation', {
+                messageId,
+                folder: ag.folder,
+              });
             }
           }
         }

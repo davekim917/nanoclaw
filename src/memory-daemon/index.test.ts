@@ -103,6 +103,24 @@ function mockFs(opts: {
     const segs = s.split(path.sep);
     const last = segs[segs.length - 1];
 
+    // Project-root lookup (codex F9 round 3 — isNonSymlinkChain now lstat's
+    // parent first to catch post-discovery root swaps). Match against
+    // CC_PROJECTS_DIR/<slug> from ccEntries and GROUPS_DIR/<folder> from
+    // groupsDirEntries; default to a regular directory.
+    if (path.dirname(s) === CC_PROJECTS_DIR) {
+      const ccEntry = opts.ccEntries?.find((e) => e.name === last);
+      if (ccEntry) {
+        return {
+          isFile: () => false,
+          isSymbolicLink: () => Boolean(ccEntry.symlink),
+          isDirectory: () => ccEntry.directory ?? true,
+        } as fs.Stats;
+      }
+    }
+    if (path.dirname(s) === GROUPS_DIR && opts.groupsDirEntries?.includes(last)) {
+      return { isFile: () => false, isSymbolicLink: () => false, isDirectory: () => true } as fs.Stats;
+    }
+
     // Marker lookup: path ends with '/.memory-enabled' under a CC project.
     if (last === '.memory-enabled') {
       const slug = segs[segs.length - 2];

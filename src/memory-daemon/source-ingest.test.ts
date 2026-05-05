@@ -126,6 +126,16 @@ function makeHealth(): HealthRecorder {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  // Default-permissive lstat: synthetic test paths (`/test/group-a`,
+  // `/tmp/test.txt`, etc.) don't exist on disk; the F9 round-3 chain check
+  // (isNonSymlinkChain) lstat's the parent first and fails closed on
+  // ENOENT. Stub lstat to claim "regular directory" for any path that the
+  // test doesn't explicitly override. Per-test mocks (e.g. the
+  // stubProcessInboxFileValidation helper for inbox-file inspection) still
+  // win because vi.spyOn replaces this default.
+  vi.spyOn(fs, 'lstatSync').mockImplementation(
+    (() => ({ isDirectory: () => true, isSymbolicLink: () => false, isFile: () => false }) as fs.Stats) as unknown as typeof fs.lstatSync,
+  );
 });
 
 describe('SourceIngester', () => {
@@ -547,5 +557,64 @@ describe('canonicalize null-byte stripping (Codex Finding F2)', () => {
     const withNull = 'hello\0world';
     const withoutNull = 'helloworld';
     expect(sha(canonicalize(withNull))).toBe(sha(canonicalize(withoutNull)));
+  });
+});
+
+describe('isNonSymlinkChain (Codex F9 round 3 — parent validation)', () => {
+  // The earlier round-2 helper started lstat at parent/components[0],
+  // leaving the parent itself free to be replaced with a symlink between
+  // discovery and use. These tests exercise the round-3 fix that lstat's
+  // parent first and fails closed on missing/symlink/non-directory parents.
+
+  function mockLstatTypes(types: Record<string, 'dir' | 'symlink' | 'file' | 'missing'>): void {
+    vi.spyOn(fs, 'lstatSync').mockImplementation(((p: fs.PathLike) => {
+      const t = types[String(p)] ?? 'missing';
+      if (t === 'missing') {
+        const err = new Error('ENOENT') as NodeJS.ErrnoException;
+        err.code = 'ENOENT';
+        throw err;
+      }
+      return {
+        isDirectory: () => t === 'dir',
+        isSymbolicLink: () => t === 'symlink',
+        isFile: () => t === 'file',
+      } as fs.Stats;
+    }) as unknown as typeof fs.lstatSync);
+  }
+
+  it('rejects when parent is a symlink (post-discovery root swap)', async () => {
+    const { isNonSymlinkChain } = await import('./source-ingest.js');
+    mockLstatTypes({ '/p': 'symlink' });
+    expect(isNonSymlinkChain('/p', 'sources', 'inbox')).toBe(false);
+  });
+
+  it('rejects when parent does not exist', async () => {
+    const { isNonSymlinkChain } = await import('./source-ingest.js');
+    mockLstatTypes({});
+    expect(isNonSymlinkChain('/missing-parent', 'sources', 'inbox')).toBe(false);
+  });
+
+  it('rejects when parent is a regular file (not a directory)', async () => {
+    const { isNonSymlinkChain } = await import('./source-ingest.js');
+    mockLstatTypes({ '/p': 'file' });
+    expect(isNonSymlinkChain('/p', 'sources', 'inbox')).toBe(false);
+  });
+
+  it('accepts when parent is a real dir and intermediate components are missing', async () => {
+    const { isNonSymlinkChain } = await import('./source-ingest.js');
+    mockLstatTypes({ '/p': 'dir' });
+    // sources and sources/inbox don't exist — daemon will mkdir them as
+    // regular dirs; chain check passes (and the next sweep re-validates).
+    expect(isNonSymlinkChain('/p', 'sources', 'inbox')).toBe(true);
+  });
+
+  it('rejects when intermediate component is a symlink', async () => {
+    const { isNonSymlinkChain } = await import('./source-ingest.js');
+    mockLstatTypes({
+      '/p': 'dir',
+      '/p/sources': 'dir',
+      '/p/sources/inbox': 'symlink',
+    });
+    expect(isNonSymlinkChain('/p', 'sources', 'inbox')).toBe(false);
   });
 });

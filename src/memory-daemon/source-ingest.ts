@@ -116,6 +116,20 @@ function canonicalize(content: string): string {
  * readdirSync), and processInboxFile (before opening the FD).
  */
 export function isNonSymlinkChain(parent: string, ...components: string[]): boolean {
+  // Codex F9 round 3 (2026-05-05): validate `parent` itself first. The
+  // earlier version started at `parent/components[0]`, leaving the parent
+  // free to be replaced with a symlink between discovery and use — a
+  // post-discovery root-swap bypass. Failing closed if parent is missing,
+  // a symlink, or not a directory closes that window.
+  let parentSt: fs.Stats;
+  try {
+    parentSt = fs.lstatSync(parent);
+  } catch {
+    return false;
+  }
+  if (parentSt.isSymbolicLink()) return false;
+  if (!parentSt.isDirectory()) return false;
+
   let current = parent;
   for (const comp of components) {
     current = path.join(current, comp);
@@ -160,6 +174,33 @@ export function looksBinary(input: Buffer | string): boolean {
 
 function dateFolder(): string {
   return new Date().toISOString().slice(0, 10);
+}
+
+/**
+ * Move a successfully-processed inbox file into <sourcesBasePath>/sources/processed/<date>/.
+ * Re-runs the chain validation immediately before mkdir + rename — codex F8
+ * round 3 (2026-05-05) flagged that processInboxFile validates once at the
+ * top, then does async classifier work, then moves files much later. A
+ * tenant could swap `sources/processed` for a symlink in that window. This
+ * helper closes the use-time window: chain check, then the IO sequence,
+ * with no async gap between.
+ *
+ * Returns true on success, false if the chain check fails or any IO step
+ * throws. Failure is best-effort: the next sweep re-detects the file in the
+ * inbox and re-processes via the existing dedup path. No work is lost.
+ */
+function moveFileToProcessed(filePath: string, sourcesBasePath: string): boolean {
+  if (!isNonSymlinkChain(sourcesBasePath, 'sources', 'processed')) {
+    return false;
+  }
+  try {
+    const processedDir = path.join(sourcesBasePath, 'sources', 'processed', dateFolder());
+    fs.mkdirSync(processedDir, { recursive: true });
+    fs.renameSync(filePath, path.join(processedDir, path.basename(filePath)));
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 let _db: Database.Database | null = null;
@@ -369,14 +410,9 @@ export class SourceIngester {
         // row so a stuck file from before this guard existed retires
         // cleanly.
         if (looksBinary(rawBuf)) {
-          const processedDir = path.join(sourcesBasePath, 'sources', 'processed', dateFolder());
-          try {
-            fs.mkdirSync(processedDir, { recursive: true });
-            fs.renameSync(filePath, path.join(processedDir, path.basename(filePath)));
-          } catch {
-            // best-effort; if move fails the next sweep will just re-detect
-            // and re-skip it — no work loss.
-          }
+          // Codex F8 round 3: re-validate chain right before the move. The
+          // top-of-function check is stale by now (we just did blocking IO).
+          moveFileToProcessed(filePath, sourcesBasePath);
           // Clear dead_letter row keyed on the resolved file path so the
           // retry loop doesn't keep finding it. Without this, files that
           // were poisoned before the binary guard existed would stay in
@@ -415,14 +451,7 @@ export class SourceIngester {
       // otherwise zombie forever. Scoped by agent_group_id + item_key.
       db.prepare(`DELETE FROM dead_letters WHERE item_key = ? AND agent_group_id = ?`).run(filePath, agentGroupId);
 
-      const processedDir = path.join(sourcesBasePath, 'sources', 'processed', dateFolder());
-      fs.mkdirSync(processedDir, { recursive: true });
-      const dest = path.join(processedDir, path.basename(filePath));
-      try {
-        fs.renameSync(filePath, dest);
-      } catch {
-        // best-effort move
-      }
+      moveFileToProcessed(filePath, sourcesBasePath);
       return { factsWritten: 0, failed: false };
     }
 
@@ -477,14 +506,7 @@ export class SourceIngester {
         db.prepare(`DELETE FROM dead_letters WHERE item_key = ? AND agent_group_id = ?`).run(filePath, agentGroupId);
       })();
 
-      const processedDir = path.join(sourcesBasePath, 'sources', 'processed', dateFolder());
-      fs.mkdirSync(processedDir, { recursive: true });
-      const dest = path.join(processedDir, path.basename(filePath));
-      try {
-        fs.renameSync(filePath, dest);
-      } catch {
-        // best-effort
-      }
+      moveFileToProcessed(filePath, sourcesBasePath);
       return { factsWritten: 0, failed: false };
     }
 
@@ -578,15 +600,7 @@ export class SourceIngester {
       health.recordSourceIngest(agentGroupId, factsWritten, contentHash);
     }
 
-    const processedDir = path.join(sourcesBasePath, 'sources', 'processed', dateFolder());
-    fs.mkdirSync(processedDir, { recursive: true });
-    const dest = path.join(processedDir, path.basename(filePath));
-    try {
-      fs.renameSync(filePath, dest);
-    } catch {
-      // best-effort
-    }
-
+    moveFileToProcessed(filePath, sourcesBasePath);
     return { factsWritten, failed: false };
   }
 
