@@ -346,6 +346,85 @@ function resolveScopedEnv(baseName: string, folder: string): string | undefined 
 }
 
 /**
+ * Resolved Anthropic credentials for a single agent group. Forwarded
+ * inside the container under their unscoped names so the agent-runner's
+ * existing rotation regex (`/^CLAUDE_CODE_OAUTH_TOKEN_(\d+)$/`,
+ * `/^ANTHROPIC_API_KEY_(\d+)$/`) matches verbatim.
+ */
+export interface ResolvedAnthropicAuth {
+  oauthPrimary?: string;
+  oauthFallbacks: { index: number; value: string }[];
+  apiKeyPrimary?: string;
+  apiKeyFallbacks: { index: number; value: string }[];
+}
+
+/**
+ * Per-group Anthropic credentials. Default behaviour: every container
+ * receives the global `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` (and
+ * their `_N` rotation siblings). To pin a workplace account to a single
+ * agent group, set `<BASE>_<FOLDER_UPPER>` (and optional rotation
+ * siblings `<BASE>_<FOLDER_UPPER>_<N>`) in `.env` — when the per-group
+ * primary is present, the *entire* rotation set comes from the per-group
+ * variant and the global tokens are not forwarded. This prevents a
+ * workplace account from ever falling back to a personal one (or vice
+ * versa) on retryable errors.
+ *
+ * Folder names are uppercased and hyphens are normalised to underscores,
+ * matching `resolveScopedEnv`. Folder names that match `^\d+$` collide
+ * with the rotation suffix and per-group resolution is skipped for them.
+ */
+export function resolveAnthropicAuth(
+  folder: string,
+  env: NodeJS.ProcessEnv = process.env,
+): ResolvedAnthropicAuth {
+  const oauth = resolveScopedRotationSet('CLAUDE_CODE_OAUTH_TOKEN', folder, env);
+  const apiKey = resolveScopedRotationSet('ANTHROPIC_API_KEY', folder, env);
+  return {
+    oauthPrimary: oauth.primary,
+    oauthFallbacks: oauth.fallbacks,
+    apiKeyPrimary: apiKey.primary,
+    apiKeyFallbacks: apiKey.fallbacks,
+  };
+}
+
+function resolveScopedRotationSet(
+  base: string,
+  folder: string,
+  env: NodeJS.ProcessEnv,
+): { primary?: string; fallbacks: { index: number; value: string }[] } {
+  const folderTok = folder.toUpperCase().replace(/-/g, '_');
+  const isPureDigits = /^\d+$/.test(folderTok);
+  const scopedPrimaryKey = `${base}_${folderTok}`;
+  const scopedPrimary = !isPureDigits ? env[scopedPrimaryKey] : undefined;
+
+  if (scopedPrimary) {
+    const fallbacks: { index: number; value: string }[] = [];
+    const fallbackPrefix = `${scopedPrimaryKey}_`;
+    for (const [k, v] of Object.entries(env)) {
+      if (!v) continue;
+      if (!k.startsWith(fallbackPrefix)) continue;
+      const tail = k.slice(fallbackPrefix.length);
+      if (!/^\d+$/.test(tail)) continue;
+      fallbacks.push({ index: Number(tail), value: v });
+    }
+    fallbacks.sort((a, b) => a.index - b.index);
+    return { primary: scopedPrimary, fallbacks };
+  }
+
+  const primary = env[base];
+  const fallbacks: { index: number; value: string }[] = [];
+  const fallbackRe = new RegExp(`^${base}_(\\d+)$`);
+  for (const [k, v] of Object.entries(env)) {
+    if (!v) continue;
+    const m = k.match(fallbackRe);
+    if (!m) continue;
+    fallbacks.push({ index: Number(m[1]), value: v });
+  }
+  fallbacks.sort((a, b) => a.index - b.index);
+  return { primary, fallbacks };
+}
+
+/**
  * Remove every `-e <key>=...` pair from args whose key matches. Used to
  * delete placeholder values OneCLI injects for credentials we plan to
  * substitute with the real value ourselves. Mutates args in place.
@@ -1344,6 +1423,14 @@ async function buildContainerArgs(
   args.push('-e', 'CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1');
   args.push('-e', 'ENABLE_TOOL_SEARCH=true');
 
+  // Per-group Anthropic credentials. Default behaviour reads the global
+  // `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` (and `_N` rotation
+  // siblings); the per-group form `<BASE>_<FOLDER_UPPER>` overrides the
+  // global and pins the *entire* rotation set to the workplace/account
+  // tokens for this group only — preventing fallback onto a different
+  // account on retryable errors.
+  const auth = resolveAnthropicAuth(agentGroup.folder);
+
   // Optional non-Anthropic routing: when ANTHROPIC_BASE_URL is set on the
   // host, forward it + ANTHROPIC_API_KEY + any ANTHROPIC_API_KEY_N
   // fallbacks to the container so the SDK talks to that endpoint instead
@@ -1355,13 +1442,11 @@ async function buildContainerArgs(
   // OneCLI's HTTPS proxy injects credentials at request time (default path).
   if (process.env.ANTHROPIC_BASE_URL) {
     args.push('-e', `ANTHROPIC_BASE_URL=${process.env.ANTHROPIC_BASE_URL}`);
-    if (process.env.ANTHROPIC_API_KEY) {
-      args.push('-e', `ANTHROPIC_API_KEY=${process.env.ANTHROPIC_API_KEY}`);
+    if (auth.apiKeyPrimary) {
+      args.push('-e', `ANTHROPIC_API_KEY=${auth.apiKeyPrimary}`);
     }
-    for (const [k, v] of Object.entries(process.env)) {
-      if (/^ANTHROPIC_API_KEY_\d+$/.test(k) && v) {
-        args.push('-e', `${k}=${v}`);
-      }
+    for (const fb of auth.apiKeyFallbacks) {
+      args.push('-e', `ANTHROPIC_API_KEY_${fb.index}=${fb.value}`);
     }
   }
 
@@ -1374,14 +1459,12 @@ async function buildContainerArgs(
   // overwrites whatever OAuth the SDK sent with the single vault entry,
   // defeating in-process rotation. Everything else (Gmail, GitHub, Exa,
   // Braintrust, etc.) still routes through OneCLI.
-  const hostOauth = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  const hostOauth = auth.oauthPrimary;
   const oauthBypassAnthropic = Boolean(hostOauth);
   if (hostOauth) {
     args.push('-e', `CLAUDE_CODE_OAUTH_TOKEN=${hostOauth}`);
-    for (const [k, v] of Object.entries(process.env)) {
-      if (/^CLAUDE_CODE_OAUTH_TOKEN_\d+$/.test(k) && v) {
-        args.push('-e', `${k}=${v}`);
-      }
+    for (const fb of auth.oauthFallbacks) {
+      args.push('-e', `CLAUDE_CODE_OAUTH_TOKEN_${fb.index}=${fb.value}`);
     }
   }
 
@@ -1564,11 +1647,10 @@ async function buildContainerArgs(
       mergeNoProxy(args, 'api.anthropic.com');
       stripEnvEntry(args, 'CLAUDE_CODE_OAUTH_TOKEN');
       args.push('-e', `CLAUDE_CODE_OAUTH_TOKEN=${hostOauth}`);
-      for (const [k, v] of Object.entries(process.env)) {
-        if (/^CLAUDE_CODE_OAUTH_TOKEN_\d+$/.test(k) && v) {
-          stripEnvEntry(args, k);
-          args.push('-e', `${k}=${v}`);
-        }
+      for (const fb of auth.oauthFallbacks) {
+        const key = `CLAUDE_CODE_OAUTH_TOKEN_${fb.index}`;
+        stripEnvEntry(args, key);
+        args.push('-e', `${key}=${fb.value}`);
       }
     }
   }
