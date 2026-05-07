@@ -236,4 +236,3 @@ export function initGroupFilesystem(group: AgentGroup, opts?: { instructions?: s
     });
   }
 }
-

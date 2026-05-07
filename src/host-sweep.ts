@@ -43,19 +43,8 @@ import {
   type ContainerState,
 } from './db/session-db.js';
 import { log } from './log.js';
-import {
-  openInboundDb,
-  openOutboundDb,
-  openOutboundDbRw,
-  inboundDbPath,
-  heartbeatPath,
-} from './session-manager.js';
-import {
-  getContainerSpawnedAt,
-  isContainerRunning,
-  killContainer,
-  wakeContainer,
-} from './container-runner.js';
+import { openInboundDb, openOutboundDb, openOutboundDbRw, inboundDbPath, heartbeatPath } from './session-manager.js';
+import { getContainerSpawnedAt, isContainerRunning, killContainer, wakeContainer } from './container-runner.js';
 import type { Session } from './types.js';
 
 /**

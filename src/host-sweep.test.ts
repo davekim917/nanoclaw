@@ -243,6 +243,14 @@ function makeSessionDbs(): { inDb: Database.Database; outDb: Database.Database }
       status         TEXT NOT NULL,
       status_changed TEXT NOT NULL
     );
+    CREATE TABLE messages_out (
+      id          TEXT PRIMARY KEY,
+      seq         INTEGER UNIQUE,
+      in_reply_to TEXT,
+      timestamp   TEXT NOT NULL,
+      kind        TEXT NOT NULL,
+      content     TEXT NOT NULL
+    );
   `);
   return { inDb, outDb };
 }
