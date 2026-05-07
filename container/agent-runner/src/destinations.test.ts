@@ -33,14 +33,19 @@ describe('buildSystemPromptAddendum — multi-destination routing guidance', () 
     expect(prompt).toContain('`whatsapp-mg-17780`');
   });
 
-  it('omits the default-routing nudge for a single destination (short-circuited)', () => {
+  it('still includes the default-routing nudge for a single destination', () => {
     seedDestination('casa', 'Casa', 'whatsapp', 'group-1@g.us');
 
     const prompt = buildSystemPromptAddendum('Casa');
 
-    // Single-destination path uses the simpler "no special wrapping needed" copy
-    expect(prompt).toContain('no special wrapping needed');
-    expect(prompt).not.toContain('Default routing');
+    // PR #2329 ("require explicit destination addressing") removed the
+    // single-dest short-circuit; every response now has to be wrapped and
+    // the default-routing guidance applies to single-dest too. The single-
+    // dest copy still differs ("Your destination is `casa`.") from the
+    // multi-dest list.
+    expect(prompt).toContain('Your destination is `casa`');
+    expect(prompt).toContain('Every response must be wrapped');
+    expect(prompt).toContain('Default routing');
   });
 
   it('handles the no-destination case without crashing', () => {
