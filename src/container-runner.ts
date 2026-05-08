@@ -646,10 +646,7 @@ function buildMounts(
   // current session IS the channel-root — duplicate bind-mount of the same
   // file is harmless and keeps `getChannelInboundDb()` uniform.
   if (session.messaging_group_id) {
-    const channelSession = findSessionByAgentGroupAndMessagingGroup(
-      agentGroup.id,
-      session.messaging_group_id,
-    );
+    const channelSession = findSessionByAgentGroupAndMessagingGroup(agentGroup.id, session.messaging_group_id);
     if (channelSession) {
       const channelInboundFile = path.join(sessionDir(agentGroup.id, channelSession.id), 'inbound.db');
       if (fs.existsSync(channelInboundFile)) {

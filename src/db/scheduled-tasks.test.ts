@@ -453,9 +453,7 @@ describe('test_resolveActiveSession_unique_index_handles_race', () => {
     migration024.up(getDb());
 
     const rows = getDb()
-      .prepare(
-        "SELECT id, status FROM sessions WHERE agent_group_id = ? AND messaging_group_id = ? ORDER BY id",
-      )
+      .prepare('SELECT id, status FROM sessions WHERE agent_group_id = ? AND messaging_group_id = ? ORDER BY id')
       .all(AGENT_GROUP_ID, MESSAGING_GROUP_ID) as Array<{ id: string; status: string }>;
     const active = rows.filter((r) => r.status === 'active');
     const archived = rows.filter((r) => r.status === 'archived');

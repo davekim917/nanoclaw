@@ -204,10 +204,8 @@ export async function handleUpdateTask(
   if (content.script === null || typeof content.script === 'string') {
     update.script = content.script as string | null;
   }
-  const touched = await withChannelInbound(
-    session.agent_group_id,
-    session.messaging_group_id,
-    (channelInDb) => updateTask(channelInDb, taskId, update),
+  const touched = await withChannelInbound(session.agent_group_id, session.messaging_group_id, (channelInDb) =>
+    updateTask(channelInDb, taskId, update),
   );
   log.info('Task updated', { taskId, touched, fields: Object.keys(update) });
   if (touched === 0) {
