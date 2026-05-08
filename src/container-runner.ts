@@ -31,6 +31,7 @@ import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContaine
 import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
+import { findSessionByAgentGroupAndMessagingGroup } from './db/sessions.js';
 import { buildArchiveProjection, buildCentralProjection } from './db/per-agent-projections.js';
 import { initGroupFilesystem } from './group-init.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
@@ -632,6 +633,33 @@ function buildMounts(
   const inboundDbFile = path.join(sessDir, 'inbound.db');
   if (fs.existsSync(inboundDbFile)) {
     mounts.push({ hostPath: inboundDbFile, containerPath: '/workspace/inbound.db', readonly: true });
+  }
+
+  // Channel-root inbound.db at /workspace/channel-inbound.db (read-only).
+  // Scheduled tasks live in the channel-root session for this (agent, MG)
+  // pair, not in the calling thread's session. The container's `list_tasks`
+  // MCP tool reads from this mount so any thread can list/inspect tasks
+  // scoped to the channel. Writes still go through the host system-action
+  // path, which routes to the same channel-root inbound.db.
+  //
+  // Always mount when a channel-root session exists, including when the
+  // current session IS the channel-root — duplicate bind-mount of the same
+  // file is harmless and keeps `getChannelInboundDb()` uniform.
+  if (session.messaging_group_id) {
+    const channelSession = findSessionByAgentGroupAndMessagingGroup(
+      agentGroup.id,
+      session.messaging_group_id,
+    );
+    if (channelSession) {
+      const channelInboundFile = path.join(sessionDir(agentGroup.id, channelSession.id), 'inbound.db');
+      if (fs.existsSync(channelInboundFile)) {
+        mounts.push({
+          hostPath: channelInboundFile,
+          containerPath: '/workspace/channel-inbound.db',
+          readonly: true,
+        });
+      }
+    }
   }
 
   // Agent group folder at /workspace/agent (RW for working files + CLAUDE.local.md)

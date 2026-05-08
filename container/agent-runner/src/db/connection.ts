@@ -23,6 +23,7 @@ import fs from 'fs';
 const DEFAULT_INBOUND_PATH = '/workspace/inbound.db';
 const DEFAULT_OUTBOUND_PATH = '/workspace/outbound.db';
 const DEFAULT_HEARTBEAT_PATH = '/workspace/.heartbeat';
+const DEFAULT_CHANNEL_INBOUND_PATH = '/workspace/channel-inbound.db';
 
 let _inbound: Database | null = null;
 let _outbound: Database | null = null;
@@ -55,6 +56,27 @@ export function openInboundDb(): Database {
     } as unknown as Database;
   }
   const db = new Database(DEFAULT_INBOUND_PATH, { readonly: true });
+  db.exec('PRAGMA busy_timeout = 5000');
+  db.exec('PRAGMA mmap_size = 0');
+  return db;
+}
+
+/**
+ * Channel-root inbound.db — host mounts the channel-root session's
+ * inbound.db here so any thread container can list scheduled tasks scoped
+ * to its (agent_group, messaging_group) pair.
+ *
+ * Open-per-call (mirrors `openInboundDb` above) — tasks mutate while the
+ * host writes new schedules from any thread; a cached handle would freeze
+ * the view.
+ *
+ * Returns null if the mount doesn't exist (no channel-root session yet,
+ * or `messaging_group_id` was null at spawn). Callers degrade gracefully:
+ * `list_tasks` returns "No tasks found." when null.
+ */
+export function openChannelInboundDb(): Database | null {
+  if (!fs.existsSync(DEFAULT_CHANNEL_INBOUND_PATH)) return null;
+  const db = new Database(DEFAULT_CHANNEL_INBOUND_PATH, { readonly: true });
   db.exec('PRAGMA busy_timeout = 5000');
   db.exec('PRAGMA mmap_size = 0');
   return db;
