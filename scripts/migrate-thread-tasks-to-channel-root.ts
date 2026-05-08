@@ -93,31 +93,32 @@ async function migrateOnce(dryRun: boolean): Promise<MigrationResult> {
     .all() as SessionRow[];
 
   for (const sess of threadSessions) {
-    const inboundPath = path.join(DATA_DIR, 'v2-sessions', sess.agent_group_id, sess.id, 'inbound.db');
-    if (!fs.existsSync(inboundPath)) continue;
+    const sourceInboundPath = path.join(DATA_DIR, 'v2-sessions', sess.agent_group_id, sess.id, 'inbound.db');
+    if (!fs.existsSync(sourceInboundPath)) continue;
     result.scanned_sessions += 1;
 
-    const sourceDb = new Database(inboundPath);
-    sourceDb.pragma('journal_mode = DELETE');
-    sourceDb.pragma('busy_timeout = 5000');
+    // Phase 1 — read live tasks from source (read-only; closes immediately).
     let liveTasks: SourceTask[];
-    try {
-      liveTasks = sourceDb
-        .prepare(
-          `SELECT id, series_id, status, process_after, recurrence, content, platform_id, channel_type
-             FROM messages_in
-            WHERE kind = 'task' AND status IN ('pending', 'paused')`,
-        )
-        .all() as SourceTask[];
-    } catch (err) {
-      result.errors.push(`Failed to read live tasks from ${inboundPath}: ${(err as Error).message}`);
-      sourceDb.close();
-      continue;
+    {
+      const sourceDb = new Database(sourceInboundPath, { readonly: true });
+      try {
+        liveTasks = sourceDb
+          .prepare(
+            `SELECT id, series_id, status, process_after, recurrence, content, platform_id, channel_type
+               FROM messages_in
+              WHERE kind = 'task' AND status IN ('pending', 'paused')`,
+          )
+          .all() as SourceTask[];
+      } catch (err) {
+        result.errors.push(`Failed to read live tasks from ${sourceInboundPath}: ${(err as Error).message}`);
+        sourceDb.close();
+        continue;
+      } finally {
+        sourceDb.close();
+      }
     }
-    if (liveTasks.length === 0) {
-      sourceDb.close();
-      continue;
-    }
+
+    if (liveTasks.length === 0) continue;
     result.thread_sessions_with_live_tasks += 1;
 
     if (!sess.messaging_group_id) {
@@ -125,15 +126,12 @@ async function migrateOnce(dryRun: boolean): Promise<MigrationResult> {
       console.warn(
         `[skip] thread session ${sess.id} has no messaging_group_id — ${liveTasks.length} live task(s) cannot be routed to a channel-root session. Manual review required.`,
       );
-      sourceDb.close();
       continue;
     }
 
     let channelSessionId: string;
     let channelSessionPreexisting: boolean;
     if (dryRun) {
-      // Find-only — never create a session in dry-run, otherwise inspecting
-      // the migration plan has side effects.
       const existing = findSessionByAgentGroupAndMessagingGroup(sess.agent_group_id, sess.messaging_group_id);
       channelSessionPreexisting = !!existing;
       channelSessionId = existing ? existing.id : `(would-create-new)`;
@@ -141,12 +139,11 @@ async function migrateOnce(dryRun: boolean): Promise<MigrationResult> {
       try {
         const channel = await resolveActiveSession(sess.agent_group_id, sess.messaging_group_id);
         channelSessionId = channel.id;
-        channelSessionPreexisting = true; // already created or just resolved
+        channelSessionPreexisting = true;
       } catch (err) {
         result.errors.push(
           `Failed to resolve channel-root for (${sess.agent_group_id}, ${sess.messaging_group_id}): ${(err as Error).message}`,
         );
-        sourceDb.close();
         continue;
       }
     }
@@ -155,77 +152,104 @@ async function migrateOnce(dryRun: boolean): Promise<MigrationResult> {
       !dryRun || channelSessionPreexisting
         ? path.join(DATA_DIR, 'v2-sessions', sess.agent_group_id, channelSessionId, 'inbound.db')
         : null;
-    let channelDb: Database.Database | null = null;
-    if (channelInboundPath) {
-      ensureSchema(channelInboundPath, 'inbound');
-      channelDb = new Database(channelInboundPath);
-      channelDb.pragma('journal_mode = DELETE');
-      channelDb.pragma('busy_timeout = 5000');
+
+    // ── DRY RUN ─────────────────────────────────────────────────────────────
+    // Read-only path: no ensureSchema, no writable opens, no ATTACH. Just
+    // probe the destination for idempotency and report planned moves.
+    if (dryRun) {
+      let channelDbRO: Database.Database | null = null;
+      if (channelInboundPath && fs.existsSync(channelInboundPath)) {
+        channelDbRO = new Database(channelInboundPath, { readonly: true });
+      }
+      try {
+        for (const task of liveTasks) {
+          const existing = channelDbRO
+            ? (channelDbRO
+                .prepare(
+                  `SELECT id FROM messages_in
+                    WHERE series_id = ? AND kind = 'task' AND status IN ('pending', 'paused')`,
+                )
+                .get(task.series_id) as { id: string } | undefined)
+            : undefined;
+          if (existing) {
+            result.tasks_skipped_already_migrated += 1;
+            console.log(`[dry-run skip-already] series=${task.series_id} (channel-root has live row ${existing.id})`);
+            continue;
+          }
+          console.log(
+            `[dry-run] migrate series=${task.series_id} from session=${sess.id} → ${channelSessionId}${channelSessionPreexisting ? '' : ' (channel-root would be created)'}`,
+          );
+        }
+      } finally {
+        channelDbRO?.close();
+      }
+      continue;
     }
 
+    // ── LIVE RUN ────────────────────────────────────────────────────────────
+    // ATTACH the source DB onto the channel-root connection so the UPDATE-
+    // source + INSERT-destination pair runs in a single SQLite transaction.
+    // SQLite's master-journal coordinates rollback across attached DBs, so a
+    // crash mid-transaction leaves both files unchanged — no lost task.
+    ensureSchema(channelInboundPath!, 'inbound');
+    const channelDb = new Database(channelInboundPath!);
+    channelDb.pragma('journal_mode = DELETE');
+    channelDb.pragma('busy_timeout = 5000');
+    // Path is locally generated, not user input. Escape single quotes
+    // defensively anyway.
+    const attachPath = sourceInboundPath.replace(/'/g, "''");
+    channelDb.exec(`ATTACH DATABASE '${attachPath}' AS source_db`);
     try {
       for (const task of liveTasks) {
-        // Idempotent: skip if channel-root already has a live row for this
-        // series. (Only checkable when channelDb is open — dry-run with no
-        // pre-existing channel session has no DB to query, so we just report
-        // a planned migrate.)
         const existing = channelDb
-          ? (channelDb
-              .prepare(
-                `SELECT id FROM messages_in
-                  WHERE series_id = ? AND kind = 'task' AND status IN ('pending', 'paused')`,
-              )
-              .get(task.series_id) as { id: string } | undefined)
-          : undefined;
+          .prepare(
+            `SELECT id FROM messages_in
+              WHERE series_id = ? AND kind = 'task' AND status IN ('pending', 'paused')`,
+          )
+          .get(task.series_id) as { id: string } | undefined;
         if (existing) {
+          // Channel-root already has a live row for this series. Mark the
+          // source row migrated so a subsequent run skips it. Single-statement
+          // so atomicity is trivial.
+          channelDb
+            .prepare(
+              `UPDATE source_db.messages_in SET status = 'migrated', recurrence = NULL WHERE id = ?`,
+            )
+            .run(task.id);
           result.tasks_skipped_already_migrated += 1;
-          if (!dryRun) {
-            // Belt and suspenders: still mark the source as migrated so we
-            // don't repeat-process on subsequent runs.
-            sourceDb
-              .prepare(
-                "UPDATE messages_in SET status = 'migrated', recurrence = NULL WHERE id = ?",
-              )
-              .run(task.id);
-          }
           console.log(
             `[skip-already] series=${task.series_id} (channel-root already has live row ${existing.id})`,
           );
           continue;
         }
 
-        if (dryRun) {
-          console.log(
-            `[dry-run] migrate series=${task.series_id} from session=${sess.id} → ${channelSessionId}${channelSessionPreexisting ? '' : ' (channel-root would be created)'}`,
-          );
-          continue;
-        }
-
-        // CRITICAL ORDER: clear recurrence on source FIRST so a crash now
-        // can't be re-cloned by handleRecurrence.
-        sourceDb
-          .prepare("UPDATE messages_in SET status = 'migrated', recurrence = NULL WHERE id = ?")
-          .run(task.id);
-
         const newId = generateTaskId();
-        const seq = nextEvenSeq(channelDb!);
-        channelDb!
-          .prepare(
-            `INSERT INTO messages_in
-               (id, seq, kind, timestamp, status, tries, process_after, recurrence, series_id, content, platform_id, channel_type, thread_id)
-             VALUES (?, ?, 'task', datetime('now'), ?, 0, ?, ?, ?, ?, ?, ?, NULL)`,
-          )
-          .run(
-            newId,
-            seq,
-            task.status, // preserve pending/paused
-            task.process_after,
-            task.recurrence,
-            task.series_id,
-            task.content,
-            task.platform_id,
-            task.channel_type,
-          );
+        const seq = nextEvenSeq(channelDb);
+        const tx = channelDb.transaction(() => {
+          channelDb
+            .prepare(
+              `INSERT INTO messages_in
+                 (id, seq, kind, timestamp, status, tries, process_after, recurrence, series_id, content, platform_id, channel_type, thread_id)
+               VALUES (?, ?, 'task', datetime('now'), ?, 0, ?, ?, ?, ?, ?, ?, NULL)`,
+            )
+            .run(
+              newId,
+              seq,
+              task.status,
+              task.process_after,
+              task.recurrence,
+              task.series_id,
+              task.content,
+              task.platform_id,
+              task.channel_type,
+            );
+          channelDb
+            .prepare(
+              `UPDATE source_db.messages_in SET status = 'migrated', recurrence = NULL WHERE id = ?`,
+            )
+            .run(task.id);
+        });
+        tx();
 
         result.tasks_migrated += 1;
         console.log(
@@ -233,8 +257,12 @@ async function migrateOnce(dryRun: boolean): Promise<MigrationResult> {
         );
       }
     } finally {
-      channelDb?.close();
-      sourceDb.close();
+      try {
+        channelDb.exec('DETACH DATABASE source_db');
+      } catch {
+        // DETACH after a failed transaction is best-effort.
+      }
+      channelDb.close();
     }
   }
 
