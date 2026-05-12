@@ -14,10 +14,7 @@ import { authChildTaskAction } from './db/tasks.js';
  * The flag is cleared on the next successful steer write — see
  * `src/dashboard/steer.ts:applySteer`.
  */
-export async function applySpawnNeedsInput(
-  content: Record<string, unknown>,
-  callerSession: Session,
-): Promise<void> {
+export async function applySpawnNeedsInput(content: Record<string, unknown>, callerSession: Session): Promise<void> {
   const auth = authChildTaskAction(content, callerSession, 'applySpawnNeedsInput');
   if (!auth) return;
   const { task, taskId } = auth;

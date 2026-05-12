@@ -106,10 +106,7 @@ describe('applySpawnNeedsInput', () => {
     seedGroups();
     makeTask();
 
-    await applySpawnNeedsInput(
-      { task_id: 'task-1', question: 'Repo path A or B?' },
-      makeChildSession(),
-    );
+    await applySpawnNeedsInput({ task_id: 'task-1', question: 'Repo path A or B?' }, makeChildSession());
 
     const task = getTaskById('task-1');
     expect(task!.needs_input).toBe(1);
@@ -121,10 +118,7 @@ describe('applySpawnNeedsInput', () => {
     seedGroups();
     makeTask();
 
-    await applySpawnNeedsInput(
-      { task_id: 'task-1', question: 'X'.repeat(1000) },
-      makeChildSession(),
-    );
+    await applySpawnNeedsInput({ task_id: 'task-1', question: 'X'.repeat(1000) }, makeChildSession());
 
     const task = getTaskById('task-1');
     expect(task!.steer_question!.length).toBe(500);
@@ -148,10 +142,7 @@ describe('applySpawnNeedsInput', () => {
     makeTask();
     getDb().prepare(`UPDATE tasks SET status = 'completed' WHERE task_id = 'task-1'`).run();
 
-    await applySpawnNeedsInput(
-      { task_id: 'task-1', question: 'too late' },
-      makeChildSession(),
-    );
+    await applySpawnNeedsInput({ task_id: 'task-1', question: 'too late' }, makeChildSession());
 
     const task = getTaskById('task-1');
     expect(task!.needs_input).toBe(0);
@@ -174,8 +165,6 @@ describe('applySpawnNeedsInput', () => {
   it('silently skips when task_id missing', async () => {
     setupDb();
     seedGroups();
-    await expect(
-      applySpawnNeedsInput({ question: 'x' }, makeChildSession()),
-    ).resolves.not.toThrow();
+    await expect(applySpawnNeedsInput({ question: 'x' }, makeChildSession())).resolves.not.toThrow();
   });
 });
