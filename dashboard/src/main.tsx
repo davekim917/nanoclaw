@@ -9,7 +9,10 @@ import { startSSE } from './lib/sse.ts';
 import type { AuthMe } from './lib/api.js';
 import './styles.css';
 
-function parseHash(): { route: string; taskId?: string } {
+// Design-tool tweak variant. Switchable classes documented in styles.css.
+const TWEAK_CLASS = 'tw-no-heat tw-no-phasebar';
+
+function parseHash(): { route: 'board' | 'sessions' | 'task'; taskId?: string } {
   const hash = location.hash.slice(1) || '/board';
   if (hash.startsWith('/task/')) return { route: 'task', taskId: hash.slice(6) };
   if (hash === '/sessions') return { route: 'sessions' };
@@ -17,28 +20,24 @@ function parseHash(): { route: string; taskId?: string } {
 }
 
 function App() {
-  const [authState, setAuthState] = useState<'loading' | 'unauthenticated' | 'authenticated'>('loading');
+  const [authState, setAuthState] = useState<
+    'loading' | 'unauthenticated' | 'authenticated'
+  >('loading');
   const [me, setMe] = useState<AuthMe | null>(null);
   const [hashState, setHashState] = useState(parseHash);
 
   useEffect(() => {
-    // Wipe ?token= from URL before any network call (cycle-1 fix M33)
     if (location.search.includes('token')) {
       history.replaceState(null, '', location.pathname + location.hash);
     }
-
     fetchAuthMe()
       .then((m) => {
         setMe(m);
         setAuthState('authenticated');
         startSSE();
       })
-      .catch((err: { status?: number }) => {
-        if (err.status === 401) {
-          setAuthState('unauthenticated');
-        } else {
-          setAuthState('unauthenticated');
-        }
+      .catch(() => {
+        setAuthState('unauthenticated');
       });
   }, []);
 
@@ -54,45 +53,48 @@ function App() {
     startSSE();
   }, []);
 
+  const navigate = useCallback((r: 'board' | 'sessions') => {
+    location.hash = r === 'sessions' ? '#/sessions' : '#/board';
+  }, []);
+
   if (authState === 'loading') {
-    return <div style={{ padding: 32, color: 'var(--text-secondary)' }}>Loading…</div>;
+    return (
+      <div className={TWEAK_CLASS}>
+        <div
+          style={{
+            padding: 32,
+            color: 'var(--fg-3)',
+            fontFamily: 'var(--font-mono)',
+            fontSize: 12,
+            letterSpacing: '0.08em',
+            textTransform: 'uppercase',
+          }}
+        >
+          Loading…
+        </div>
+      </div>
+    );
   }
 
   if (authState === 'unauthenticated') {
-    return <AuthGate onAuthenticated={handleAuthenticated} />;
+    return (
+      <div className={TWEAK_CLASS}>
+        <AuthGate onAuthenticated={handleAuthenticated} />
+      </div>
+    );
   }
 
-  // Mobile-first: the app's root is a natural document. Body scrolls; no
-  // `height: 100vh` lock, no nested `overflow: hidden` chain (those clipped
-  // content past the fold on phone viewports — only the inner divs could
-  // scroll, and only the desktop split-pane layout exposed those scroll
-  // boundaries with visible chrome). Nav uses `position: sticky` so it
-  // stays accessible while the page scrolls. Views opt into desktop-style
-  // fixed-pane layouts themselves via media queries.
   return (
-    <div style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column' }}>
-      <nav
-        style={{
-          padding: '10px 16px',
-          borderBottom: '1px solid var(--border)',
-          display: 'flex',
-          gap: 16,
-          background: 'var(--bg-card)',
-          position: 'sticky',
-          top: 0,
-          zIndex: 10,
-        }}
-      >
-        <a href="#/board" style={{ fontSize: 14, fontWeight: hashState.route === 'board' ? 600 : 400 }}>Board</a>
-        <a href="#/sessions" style={{ fontSize: 14, fontWeight: hashState.route === 'sessions' ? 600 : 400 }}>Sessions</a>
-      </nav>
-      <div style={{ flex: 1 }}>
-        {hashState.route === 'board' && me && <KanbanBoard authMe={me} />}
-        {hashState.route === 'task' && hashState.taskId && me && (
-          <TaskDetail authMe={me} taskId={hashState.taskId} />
-        )}
-        {hashState.route === 'sessions' && me && <SessionList authMe={me} />}
-      </div>
+    <div className={TWEAK_CLASS} style={{ minHeight: '100vh' }}>
+      {hashState.route === 'board' && me && (
+        <KanbanBoard authMe={me} route="board" onRouteChange={navigate} />
+      )}
+      {hashState.route === 'task' && hashState.taskId && me && (
+        <TaskDetail authMe={me} taskId={hashState.taskId} />
+      )}
+      {hashState.route === 'sessions' && me && (
+        <SessionList authMe={me} route="sessions" onRouteChange={navigate} />
+      )}
     </div>
   );
 }

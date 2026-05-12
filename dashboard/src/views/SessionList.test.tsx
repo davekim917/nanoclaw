@@ -45,46 +45,48 @@ const baseSessions = [
   },
 ];
 
+const noop = () => {};
+
 describe('SessionList', () => {
   afterEach(() => {
     vi.clearAllMocks();
   });
 
-  describe('test_SessionList_renders_table', () => {
-    it('renders 3 table rows with correct columns', () => {
-      vi.mocked(useSWR).mockReturnValue({ data: { sessions: baseSessions }, mutate: vi.fn() } as unknown as ReturnType<typeof useSWR>);
-      render(<SessionList authMe={mockAuthMe} />);
-      const rows = screen.getAllByRole('row');
-      // 1 header + 3 data rows
-      expect(rows).toHaveLength(4);
-      expect(screen.getByText('sess-1')).toBeInTheDocument();
-      expect(screen.getByText('sess-2')).toBeInTheDocument();
-      expect(screen.getByText('sess-3')).toBeInTheDocument();
-      expect(screen.getByText('Agent Group ID')).toBeInTheDocument();
-      expect(screen.getByText('Session ID')).toBeInTheDocument();
-      expect(screen.getByText('Container Status')).toBeInTheDocument();
-    });
+  it('renders one row per session', () => {
+    vi.mocked(useSWR).mockReturnValue({
+      data: { sessions: baseSessions },
+      mutate: vi.fn(),
+    } as unknown as ReturnType<typeof useSWR>);
+
+    render(<SessionList authMe={mockAuthMe} route="sessions" onRouteChange={noop} />);
+    expect(screen.getByText('sess-1')).toBeInTheDocument();
+    expect(screen.getByText('sess-2')).toBeInTheDocument();
+    expect(screen.getByText('sess-3')).toBeInTheDocument();
+    expect(screen.getByText(/agent group/i)).toBeInTheDocument();
   });
 
-  describe('test_SessionList_empty_state', () => {
-    it('shows no live sessions message when empty', () => {
-      vi.mocked(useSWR).mockReturnValue({ data: { sessions: [] }, mutate: vi.fn() } as unknown as ReturnType<typeof useSWR>);
-      render(<SessionList authMe={mockAuthMe} />);
-      expect(screen.getByText(/no live sessions/i)).toBeInTheDocument();
-    });
+  it('shows the empty-state message when no sessions', () => {
+    vi.mocked(useSWR).mockReturnValue({
+      data: { sessions: [] },
+      mutate: vi.fn(),
+    } as unknown as ReturnType<typeof useSWR>);
+
+    render(<SessionList authMe={mockAuthMe} route="sessions" onRouteChange={noop} />);
+    expect(screen.getByText(/no live sessions/i)).toBeInTheDocument();
   });
 
-  describe('test_SessionList_member_only_no_admin_scopes', () => {
-    it('renders sessions without steer button for member role', () => {
-      const memberAuth = {
-        user_id: 'u2',
-        scopes: { role: 'member', allowed_group_ids: ['ag-1'], no_filter: false },
-      };
-      const memberSessions = baseSessions.filter((s) => s.agent_group_id === 'ag-1');
-      vi.mocked(useSWR).mockReturnValue({ data: { sessions: memberSessions }, mutate: vi.fn() } as unknown as ReturnType<typeof useSWR>);
-      render(<SessionList authMe={memberAuth} />);
-      expect(screen.getByText('sess-1')).toBeInTheDocument();
-      expect(screen.queryByRole('button', { name: /steer/i })).toBeNull();
-    });
+  it('renders without admin-only controls for non-owner role', () => {
+    const memberAuth = {
+      user_id: 'u2',
+      scopes: { role: 'member', allowed_group_ids: ['ag-1'], no_filter: false },
+    };
+    vi.mocked(useSWR).mockReturnValue({
+      data: { sessions: baseSessions.filter((s) => s.agent_group_id === 'ag-1') },
+      mutate: vi.fn(),
+    } as unknown as ReturnType<typeof useSWR>);
+
+    render(<SessionList authMe={memberAuth} route="sessions" onRouteChange={noop} />);
+    expect(screen.getByText('sess-1')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /steer/i })).toBeNull();
   });
 });

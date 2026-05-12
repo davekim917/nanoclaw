@@ -11,6 +11,10 @@ export interface TaskSummary {
   admitted_at: string;
   last_progress_message?: string;
   fail_reason?: string;
+  /** 0/1 boolean — worker has stopped and is waiting for operator steer. */
+  needs_input?: number;
+  /** Optional one-line summary of what the worker is asking for. */
+  steer_question?: string | null;
 }
 
 // Matches backend src/dashboard/api/tasks.ts TranscriptEntry exactly.

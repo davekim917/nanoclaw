@@ -25,7 +25,7 @@ export interface InboundMessagePayload {
 
 export interface TaskEventPayload {
   task_id: string;
-  kind: 'admit' | 'status_change' | 'progress' | 'complete' | 'failed' | 'cancel';
+  kind: 'admit' | 'status_change' | 'progress' | 'complete' | 'failed' | 'cancel' | 'needs_input';
   agent_group_id: string;
   [key: string]: unknown;
 }

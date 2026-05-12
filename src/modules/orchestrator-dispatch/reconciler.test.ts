@@ -112,7 +112,7 @@ describe('runReconcilerSweep', () => {
 });
 
 describe('index.ts — ASSERT registered actions', () => {
-  it('test_index_registers_five_actions without cancel_task', async () => {
+  it('test_index_registers_expected_spawn_actions without cancel_task', async () => {
     const { readFileSync } = await import('fs');
     const { fileURLToPath } = await import('url');
     const { dirname, join } = await import('path');
@@ -121,15 +121,22 @@ describe('index.ts — ASSERT registered actions', () => {
     const dir = dirname(fileURLToPath(import.meta.url));
     const indexSrc = readFileSync(join(dir, 'index.ts'), 'utf-8');
 
-    // ASSERT: exactly 5 registerDeliveryAction calls
-    const matches = indexSrc.match(/registerDeliveryAction\(/g) ?? [];
-    expect(matches.length).toBe(5);
-
-    // ASSERT: all 5 expected actions present (renamed dispatch_* → spawn_*)
-    const expectedActions = ['spawn_task', 'spawn_complete', 'spawn_failed', 'spawn_cancel', 'spawn_progress'];
+    // ASSERT: all expected actions present (renamed dispatch_* → spawn_*)
+    const expectedActions = [
+      'spawn_task',
+      'spawn_complete',
+      'spawn_failed',
+      'spawn_cancel',
+      'spawn_progress',
+      'spawn_request_steer',
+    ];
     for (const action of expectedActions) {
       expect(indexSrc).toContain(`'${action}'`);
     }
+
+    // ASSERT: exactly one registerDeliveryAction call per expected action
+    const matches = indexSrc.match(/registerDeliveryAction\(/g) ?? [];
+    expect(matches.length).toBe(expectedActions.length);
 
     // ASSERT: legacy dispatch_* names are NOT registered
     expect(indexSrc).not.toContain("'dispatch_task'");

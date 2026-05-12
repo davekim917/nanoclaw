@@ -25,6 +25,7 @@ import {
   claimEchoAttempted,
   IdempotencyConflict,
 } from './db/steer-idempotency.js';
+import { clearNeedsInput } from '../modules/orchestrator-dispatch/db/tasks.js';
 import { emitDashboardEvent } from './api/events.js';
 import type { AuthHandler, AuthedRequestContext } from './router.js';
 
@@ -219,6 +220,15 @@ export async function applySteer(
         throw err;
       }
     }
+  }
+
+  // Operator has answered — flag clears under the partial-index guard,
+  // skipped entirely on idempotency replay since this branch only runs
+  // after the inbound write commits.
+  try {
+    clearNeedsInput(taskId);
+  } catch (err) {
+    log.warn('steer: failed to clear needs_input — non-fatal', { taskId, err });
   }
 
   // Emit SSE after inbound write commits

@@ -16,6 +16,7 @@ import { applySpawnTask } from './dispatch.js';
 import { applySpawnComplete, applySpawnFailed } from './completion.js';
 import { applySpawnProgress } from './progress.js';
 import { applySpawnCancel } from './cancellation.js';
+import { applySpawnNeedsInput } from './needs-input.js';
 
 // NOTE: registerDeliveryAction is side-effect-only and safe at module-import time
 // (it just adds to an in-memory map). The reconciler startup scan, however, queries
@@ -27,5 +28,6 @@ registerDeliveryAction('spawn_complete', applySpawnComplete);
 registerDeliveryAction('spawn_failed', applySpawnFailed);
 registerDeliveryAction('spawn_cancel', applySpawnCancel);
 registerDeliveryAction('spawn_progress', applySpawnProgress);
+registerDeliveryAction('spawn_request_steer', applySpawnNeedsInput);
 
 export { runReconcilerOnStartup } from './reconciler.js';

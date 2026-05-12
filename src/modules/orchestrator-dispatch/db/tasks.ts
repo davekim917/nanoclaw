@@ -1,4 +1,6 @@
 import { getDb } from '../../../db/connection.js';
+import { log } from '../../../log.js';
+import type { Session } from '../../../types.js';
 
 export interface Task {
   task_id: string;
@@ -26,6 +28,8 @@ export interface Task {
   dispatch_completion_attempts: number;
   completion_lease_at: string | null;
   surface_mode: 'pending' | 'native_thread' | 'headless';
+  needs_input: number;
+  steer_question: string | null;
   created_at: string;
 }
 
@@ -39,8 +43,17 @@ const ALLOWED_ARTIFACT_COLUMNS = new Set([
   'started_at',
 ]);
 
-export function insertTaskAtomic(row: Omit<Task, 'created_at'>): Task | null {
+type TaskInsert = Omit<Task, 'created_at' | 'needs_input' | 'steer_question'> &
+  Partial<Pick<Task, 'needs_input' | 'steer_question'>>;
+
+export function insertTaskAtomic(row: TaskInsert): Task | null {
   const createdAt = new Date().toISOString();
+  const params = {
+    ...row,
+    needs_input: row.needs_input ?? 0,
+    steer_question: row.steer_question ?? null,
+    created_at: createdAt,
+  };
   const result = getDb()
     .prepare(
       `INSERT INTO tasks (
@@ -50,7 +63,8 @@ export function insertTaskAtomic(row: Omit<Task, 'created_at'>): Task | null {
         child_platform_thread_id, child_messaging_group_id, admitted_at,
         started_at, completed_at, failed_at, cancelled_at, last_progress_at,
         last_progress_message, fail_reason, result_summary,
-        dispatch_completion_attempts, completion_lease_at, surface_mode, created_at
+        dispatch_completion_attempts, completion_lease_at, surface_mode,
+        needs_input, steer_question, created_at
       ) VALUES (
         @task_id, @idempotency_key, @parent_session_id, @parent_agent_group_id,
         @parent_messaging_group_id, @child_session_id,
@@ -58,12 +72,13 @@ export function insertTaskAtomic(row: Omit<Task, 'created_at'>): Task | null {
         @child_platform_thread_id, @child_messaging_group_id, @admitted_at,
         @started_at, @completed_at, @failed_at, @cancelled_at, @last_progress_at,
         @last_progress_message, @fail_reason, @result_summary,
-        @dispatch_completion_attempts, @completion_lease_at, @surface_mode, @created_at
+        @dispatch_completion_attempts, @completion_lease_at, @surface_mode,
+        @needs_input, @steer_question, @created_at
       )
       ON CONFLICT(parent_session_id, idempotency_key) DO NOTHING
       RETURNING *`,
     )
-    .get({ ...row, created_at: createdAt }) as Task | undefined;
+    .get(params) as Task | undefined;
 
   return result ?? null;
 }
@@ -176,6 +191,58 @@ export function getTaskByChildSession(childSessionId: string): Task | null {
 
 export function getActiveTasks(): Task[] {
   return getDb().prepare(`SELECT * FROM tasks WHERE status IN ('pending', 'running')`).all() as Task[];
+}
+
+/**
+ * Two-column auth for child→host action handlers (spawn_progress,
+ * spawn_complete, spawn_failed, spawn_request_steer). Resolves task_id from
+ * the action content, looks up the task, and verifies the calling session
+ * owns it (`task.child_session_id === callerSession.id`). Logs and returns
+ * null on any failure — never throws. `actionLabel` is the prefix used in
+ * log lines so the originating handler stays greppable.
+ */
+export function authChildTaskAction(
+  content: Record<string, unknown>,
+  callerSession: Session,
+  actionLabel: string,
+): { task: Task; taskId: string } | null {
+  const taskId = content.task_id as string | undefined;
+  if (!taskId) {
+    log.warn(`${actionLabel}: missing task_id — silently skipping`, { sessionId: callerSession.id });
+    return null;
+  }
+  const task = getTaskById(taskId);
+  if (!task) {
+    log.warn(`${actionLabel}: task not found — silently skipping`, { taskId });
+    return null;
+  }
+  if (task.child_session_id !== callerSession.id) {
+    log.warn(`${actionLabel}: auth mismatch — silently skipping`, {
+      taskId,
+      expected: task.child_session_id,
+      got: callerSession.id,
+    });
+    return null;
+  }
+  return { task, taskId };
+}
+
+/**
+ * Clear the needs_input flag and the optional steer_question text. Invoked
+ * by the steer write path so the operator's reply transparently unblocks
+ * the worker. Guarded `WHERE needs_input = 1` so the partial index drives
+ * the lookup and rows that weren't waiting on steer don't trigger writes.
+ */
+export function clearNeedsInput(taskId: string): void {
+  getDb()
+    .prepare(
+      `UPDATE tasks
+          SET needs_input = 0,
+              steer_question = NULL
+        WHERE task_id = ?
+          AND needs_input = 1`,
+    )
+    .run(taskId);
 }
 
 export function countActiveByParent(parentSessionId: string): number {

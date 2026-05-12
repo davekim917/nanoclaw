@@ -24,6 +24,8 @@ interface TaskSummary {
   surface_mode: string;
   parent_agent_group_id: string;
   task_content: string;
+  needs_input: number;
+  steer_question: string | null;
 }
 
 interface TranscriptEntry {
@@ -190,8 +192,10 @@ export const tasksListHandler: AuthHandler = async (req, _params, ctx) => {
 
   // task_content is required by the KanbanBoard card render (post-build QA fix MF-5);
   // omitting it caused TypeError on truncate(undefined.length) in the SPA.
+  // needs_input + steer_question drive the "Needs you" lane on the dashboard.
   const sql = `SELECT task_id, status, parent_session_id, parent_agent_group_id, admitted_at,
-                      last_progress_message, fail_reason, surface_mode, task_content
+                      last_progress_message, fail_reason, surface_mode, task_content,
+                      needs_input, steer_question
                FROM tasks
                WHERE ${conditions.join(' AND ')}
                ORDER BY admitted_at DESC

@@ -65,9 +65,9 @@ export async function mountSpawnTools(): Promise<void> {
 
   if (spawnTaskId !== null) {
     // Child session — mount child tools
-    const { spawnProgress, spawnComplete, spawnFailed } = await import('./dispatch-child.js');
-    registerTools([spawnProgress, spawnComplete, spawnFailed]);
-    log('Spawn: mounted child tools (spawn_progress, spawn_complete, spawn_failed)');
+    const { spawnProgress, spawnComplete, spawnFailed, spawnRequestSteer } = await import('./dispatch-child.js');
+    registerTools([spawnProgress, spawnComplete, spawnFailed, spawnRequestSteer]);
+    log('Spawn: mounted child tools (spawn_progress, spawn_complete, spawn_failed, spawn_request_steer)');
     return;
   }
 

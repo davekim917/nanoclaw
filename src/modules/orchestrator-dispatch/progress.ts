@@ -1,34 +1,14 @@
 import { getDb } from '../../db/connection.js';
 import { log } from '../../log.js';
 import type { Session } from '../../types.js';
-import { getTaskById } from './db/tasks.js';
+import { authChildTaskAction } from './db/tasks.js';
 
 export async function applySpawnProgress(content: Record<string, unknown>, callerSession: Session): Promise<void> {
-  const taskId = content.task_id as string | undefined;
+  const auth = authChildTaskAction(content, callerSession, 'applySpawnProgress');
+  if (!auth) return;
+  const { task, taskId } = auth;
+
   const message = (content.message as string | undefined) ?? '';
-
-  if (!taskId) {
-    log.warn('applySpawnProgress: missing task_id — silently skipping', { sessionId: callerSession.id });
-    return;
-  }
-
-  const task = getTaskById(taskId);
-  if (!task) {
-    log.warn('applySpawnProgress: task not found — silently skipping', { taskId });
-    return;
-  }
-
-  // Two-column auth: task_id + child_session_id (fire-and-forget — auth mismatch logged, not thrown)
-  if (task.child_session_id !== callerSession.id) {
-    log.warn('applySpawnProgress: auth mismatch — silently skipping', {
-      taskId,
-      expected: task.child_session_id,
-      got: callerSession.id,
-    });
-    return;
-  }
-
-  // Truncate to ≤500 chars
   const truncated = message.slice(0, 500);
   const now = new Date().toISOString();
 
@@ -42,7 +22,6 @@ export async function applySpawnProgress(content: Record<string, unknown>, calle
       )
       .run(now, truncated, taskId);
 
-    // Dashboard SSE emit only on actual UPDATE (skip late-progress no-ops)
     if (result.changes > 0) {
       void import('../../dashboard/api/events.js')
         .then((mod) =>

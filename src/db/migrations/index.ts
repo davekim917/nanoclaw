@@ -28,6 +28,7 @@ import { migration025 } from './025-agent-group-capabilities.js';
 import { migration026 } from './026-tasks-and-dispatch-routing.js';
 import { migration027 } from './027-drop-tasks-target-agent-group-id.js';
 import { migration028 } from './028-dashboard-tables.js';
+import { migration029 } from './029-tasks-needs-input.js';
 
 export interface Migration {
   version: number;
@@ -58,6 +59,7 @@ const migrations: Migration[] = [
   migration026,
   migration027,
   migration028,
+  migration029,
 ];
 
 export function runMigrations(db: Database.Database): void {

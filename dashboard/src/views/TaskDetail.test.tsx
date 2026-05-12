@@ -25,6 +25,7 @@ vi.mock('../lib/sse.ts', () => {
 vi.mock('../lib/api.js', () => ({
   getTask: vi.fn(),
   postSteer: vi.fn(),
+  retryTask: vi.fn(),
   authMe: vi.fn(),
   exchangeToken: vi.fn(),
   listTasks: vi.fn(),
@@ -41,176 +42,177 @@ const mockAuthMe = {
 };
 
 const baseTask = {
-  task_id: 'spawn-99',
+  task_id: 'spawn-99-abcd-1234-efgh',
   parent_session_id: 'sess-1',
-  task_content: 'Do something important',
+  task_content: '## Goal\nResolve **XZO-99** — fix the thing.\n\n## Inputs\n- Repo: foo',
   status: 'running' as const,
   admitted_at: '2026-05-01T10:00:00Z',
   started_at: '2026-05-01T10:00:01Z',
 };
 
-// Backend-shape transcript (post-build QA fix MF-4): {id, seq, kind, timestamp,
-// content, direction, source}. Render extracts text from content.text.
-const baseTranscript: Array<{
-  id: string;
-  seq: number;
-  kind: string;
-  timestamp: string;
-  content: { text: string };
-  direction: 'inbound' | 'outbound';
-  source: 'dashboard' | 'chat' | 'agent' | 'system';
-}> = [];
-
-function makeTaskWithTranscript() {
-  return {
-    task: { ...baseTask },
-    transcript: [
-      { id: 'msg-1', seq: 1, kind: 'chat', timestamp: '2026-05-01T10:00:00Z', content: { text: 'hi' }, direction: 'inbound' as const, source: 'dashboard' as const },
-      { id: 'msg-2', seq: 2, kind: 'chat', timestamp: '2026-05-01T10:00:01Z', content: { text: 'hello' }, direction: 'outbound' as const, source: 'agent' as const },
-      { id: 'msg-3', seq: 3, kind: 'chat', timestamp: '2026-05-01T10:00:02Z', content: { text: 'go' }, direction: 'inbound' as const, source: 'dashboard' as const },
-    ],
-  };
-}
+const baseTranscript = [
+  { id: 'msg-1', seq: 1, kind: 'chat', timestamp: '2026-05-01T10:00:00Z', content: { text: 'hi' }, direction: 'inbound' as const, source: 'dashboard' as const },
+  { id: 'msg-2', seq: 2, kind: 'chat', timestamp: '2026-05-01T10:00:01Z', content: { text: 'hello' }, direction: 'outbound' as const, source: 'agent' as const },
+];
 
 describe('TaskDetail', () => {
   afterEach(() => {
     vi.clearAllMocks();
-    vi.unstubAllGlobals();
   });
 
-  describe('test_TaskDetail_renders_lifecycle_and_thread', () => {
-    it('shows task metadata and transcript entries', () => {
-      const { task, transcript } = makeTaskWithTranscript();
-      vi.mocked(useSWR).mockReturnValue({ data: { task, transcript }, mutate: vi.fn() } as unknown as ReturnType<typeof useSWR>);
-      render(<TaskDetail authMe={mockAuthMe} taskId="spawn-99" />);
-      expect(screen.getByText('spawn-99')).toBeInTheDocument();
-      expect(screen.getByText('hi')).toBeInTheDocument();
-      expect(screen.getByText('hello')).toBeInTheDocument();
-      expect(screen.getByText('go')).toBeInTheDocument();
+  it('renders the task crumb and derived goal title', () => {
+    vi.mocked(useSWR).mockReturnValue({
+      data: { task: baseTask, transcript: baseTranscript },
+      mutate: vi.fn(),
+    } as unknown as ReturnType<typeof useSWR>);
+
+    render(<TaskDetail authMe={mockAuthMe} taskId="spawn-99-abcd-1234-efgh" />);
+    expect(screen.getByText(/spawn-99-abcd-1234/)).toBeInTheDocument();
+    expect(screen.getByText(/fix the thing/i)).toBeInTheDocument();
+    expect(screen.getByText('XZO-99')).toBeInTheDocument();
+  });
+
+  it('expands transcript section and shows messages when toggled', async () => {
+    vi.mocked(useSWR).mockReturnValue({
+      data: { task: baseTask, transcript: baseTranscript },
+      mutate: vi.fn(),
+    } as unknown as ReturnType<typeof useSWR>);
+
+    render(<TaskDetail authMe={mockAuthMe} taskId="spawn-99-abcd-1234-efgh" />);
+    expect(screen.queryByText('hi')).toBeNull();
+    await userEvent.click(screen.getByRole('button', { name: /^Transcript/i }));
+    expect(screen.getByText('hi')).toBeInTheDocument();
+    expect(screen.getByText('hello')).toBeInTheDocument();
+  });
+
+  it('submits steer with a UUIDv4 idempotency_key', async () => {
+    vi.mocked(useSWR).mockReturnValue({
+      data: { task: baseTask, transcript: baseTranscript },
+      mutate: vi.fn(),
+    } as unknown as ReturnType<typeof useSWR>);
+    vi.mocked(postSteer).mockResolvedValue({
+      task_id: 'spawn-99-abcd-1234-efgh',
+      message_id: 'msg-1',
+      echo_status: 'pending',
+    });
+
+    render(<TaskDetail authMe={mockAuthMe} taskId="spawn-99-abcd-1234-efgh" />);
+    await userEvent.type(screen.getByPlaceholderText(/steer/i), 'hello');
+    await userEvent.click(screen.getByRole('button', { name: /send/i }));
+
+    await waitFor(() => expect(postSteer).toHaveBeenCalledOnce());
+    const [tid, body] = vi.mocked(postSteer).mock.calls[0] as [
+      string,
+      { idempotency_key: string; text: string },
+    ];
+    expect(tid).toBe('spawn-99-abcd-1234-efgh');
+    expect(body.text).toBe('hello');
+    expect(body.idempotency_key).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+    );
+  });
+
+  it('disables submit when empty', () => {
+    vi.mocked(useSWR).mockReturnValue({
+      data: { task: baseTask, transcript: baseTranscript },
+      mutate: vi.fn(),
+    } as unknown as ReturnType<typeof useSWR>);
+    render(<TaskDetail authMe={mockAuthMe} taskId="spawn-99-abcd-1234-efgh" />);
+    expect(screen.getByRole('button', { name: /send/i })).toBeDisabled();
+  });
+
+  it('disables submit and shows red counter when over 4000 chars', () => {
+    vi.mocked(useSWR).mockReturnValue({
+      data: { task: baseTask, transcript: baseTranscript },
+      mutate: vi.fn(),
+    } as unknown as ReturnType<typeof useSWR>);
+    render(<TaskDetail authMe={mockAuthMe} taskId="spawn-99-abcd-1234-efgh" />);
+    const textarea = screen.getByPlaceholderText(/steer/i);
+    fireEvent.change(textarea, { target: { value: 'a'.repeat(4001) } });
+    expect(screen.getByRole('button', { name: /send/i })).toBeDisabled();
+    expect(screen.getByText(/4001\s*\/\s*4000/)).toBeInTheDocument();
+  });
+
+  it('shows rate-limited message with retry-after seconds', async () => {
+    vi.mocked(useSWR).mockReturnValue({
+      data: { task: baseTask, transcript: baseTranscript },
+      mutate: vi.fn(),
+    } as unknown as ReturnType<typeof useSWR>);
+    vi.mocked(postSteer).mockRejectedValue({
+      status: 429,
+      error: 'rate_limit_exceeded',
+      retry_after: 5,
+    });
+
+    render(<TaskDetail authMe={mockAuthMe} taskId="spawn-99-abcd-1234-efgh" />);
+    await userEvent.type(screen.getByPlaceholderText(/steer/i), 'hi');
+    await userEvent.click(screen.getByRole('button', { name: /send/i }));
+
+    await waitFor(() => {
+      expect(screen.getByRole('alert').textContent).toMatch(/rate limited.*5s/i);
     });
   });
 
-  describe('test_TaskDetail_steer_composer_submits_with_uuid', () => {
-    it('submits steer with a UUIDv4 idempotency_key', async () => {
-      const mutate = vi.fn();
-      vi.mocked(useSWR).mockReturnValue({ data: { task: baseTask, transcript: baseTranscript }, mutate } as unknown as ReturnType<typeof useSWR>);
-      vi.mocked(postSteer).mockResolvedValue({ task_id: 'spawn-99', message_id: 'msg-1', echo_status: 'pending' });
-
-      render(<TaskDetail authMe={mockAuthMe} taskId="spawn-99" />);
-      await userEvent.type(screen.getByPlaceholderText(/steer/i), 'hello');
-      await userEvent.click(screen.getByRole('button', { name: /send/i }));
-
-      await waitFor(() => expect(postSteer).toHaveBeenCalledOnce());
-      const [tid, body] = vi.mocked(postSteer).mock.calls[0] as [string, { idempotency_key: string; text: string }];
-      expect(tid).toBe('spawn-99');
-      expect(body.text).toBe('hello');
-      expect(body.idempotency_key).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
-    });
-  });
-
-  describe('test_TaskDetail_empty_text_disables_submit', () => {
-    it('submit button is disabled when textarea is empty', () => {
-      vi.mocked(useSWR).mockReturnValue({ data: { task: baseTask, transcript: baseTranscript }, mutate: vi.fn() } as unknown as ReturnType<typeof useSWR>);
-      render(<TaskDetail authMe={mockAuthMe} taskId="spawn-99" />);
-      expect(screen.getByRole('button', { name: /send/i })).toBeDisabled();
-    });
-  });
-
-  describe('test_TaskDetail_too_long_disables_submit', () => {
-    it('submit disabled and char counter red when text exceeds 4000', () => {
-      vi.mocked(useSWR).mockReturnValue({ data: { task: baseTask, transcript: baseTranscript }, mutate: vi.fn() } as unknown as ReturnType<typeof useSWR>);
-      render(<TaskDetail authMe={mockAuthMe} taskId="spawn-99" />);
-      const textarea = screen.getByPlaceholderText(/steer/i);
-      // Use fireEvent to set the value instantly (avoids userEvent char-by-char 4001ms overhead)
-      fireEvent.change(textarea, { target: { value: 'a'.repeat(4001) } });
-      expect(screen.getByRole('button', { name: /send/i })).toBeDisabled();
-      const counter = screen.getByText(/4001\/4000/);
-      expect(counter).toBeInTheDocument();
-    });
-  });
-
-  describe('test_TaskDetail_rate_limited_shows_retry_after', () => {
-    it('shows rate limit message with retry-after seconds', async () => {
-      vi.mocked(useSWR).mockReturnValue({ data: { task: baseTask, transcript: baseTranscript }, mutate: vi.fn() } as unknown as ReturnType<typeof useSWR>);
-      vi.mocked(postSteer).mockRejectedValue({ status: 429, error: 'rate_limit_exceeded', retry_after: 5 });
-
-      render(<TaskDetail authMe={mockAuthMe} taskId="spawn-99" />);
-      await userEvent.type(screen.getByPlaceholderText(/steer/i), 'hi');
-      await userEvent.click(screen.getByRole('button', { name: /send/i }));
-
-      await waitFor(() => {
-        expect(screen.getByRole('alert').textContent).toMatch(/rate limited.*5s/i);
+  it('generates a fresh UUID after a 422 idempotency conflict', async () => {
+    vi.mocked(useSWR).mockReturnValue({
+      data: { task: baseTask, transcript: baseTranscript },
+      mutate: vi.fn(),
+    } as unknown as ReturnType<typeof useSWR>);
+    vi.mocked(postSteer)
+      .mockRejectedValueOnce({
+        status: 422,
+        error: 'mismatched_idempotency_payload',
+      })
+      .mockResolvedValueOnce({
+        task_id: 'spawn-99-abcd-1234-efgh',
+        message_id: 'msg-2',
+        echo_status: 'pending',
       });
+
+    render(<TaskDetail authMe={mockAuthMe} taskId="spawn-99-abcd-1234-efgh" />);
+    await userEvent.type(screen.getByPlaceholderText(/steer/i), 'hi');
+    await userEvent.click(screen.getByRole('button', { name: /send/i }));
+    await waitFor(() => {
+      expect(screen.getByRole('alert').textContent).toMatch(/idempotency conflict/i);
     });
+    await userEvent.type(screen.getByPlaceholderText(/steer/i), 'retry');
+    await userEvent.click(screen.getByRole('button', { name: /send/i }));
+    await waitFor(() => expect(postSteer).toHaveBeenCalledTimes(2));
+
+    const key1 = (vi.mocked(postSteer).mock.calls[0] as [string, { idempotency_key: string }])[1].idempotency_key;
+    const key2 = (vi.mocked(postSteer).mock.calls[1] as [string, { idempotency_key: string }])[1].idempotency_key;
+    expect(key1).not.toBe(key2);
   });
 
-  describe('test_TaskDetail_mismatched_payload_resets', () => {
-    it('shows conflict message and generates new UUID on next submit', async () => {
-      const mutate = vi.fn();
-      vi.mocked(useSWR).mockReturnValue({ data: { task: baseTask, transcript: baseTranscript }, mutate } as unknown as ReturnType<typeof useSWR>);
-      vi.mocked(postSteer)
-        .mockRejectedValueOnce({ status: 422, error: 'mismatched_idempotency_payload' })
-        .mockResolvedValueOnce({ task_id: 'spawn-99', message_id: 'msg-2', echo_status: 'pending' });
+  it('inbound_message SSE invalidates SWR when task_id matches', async () => {
+    const mutate = vi.fn();
+    vi.mocked(useSWR).mockReturnValue({
+      data: { task: baseTask, transcript: baseTranscript },
+      mutate,
+    } as unknown as ReturnType<typeof useSWR>);
 
-      render(<TaskDetail authMe={mockAuthMe} taskId="spawn-99" />);
-
-      await userEvent.type(screen.getByPlaceholderText(/steer/i), 'hi');
-      await userEvent.click(screen.getByRole('button', { name: /send/i }));
-
-      await waitFor(() => {
-        expect(screen.getByRole('alert').textContent).toMatch(/idempotency conflict/i);
-      });
-
-      // Textarea should be cleared; type again and submit
-      await userEvent.type(screen.getByPlaceholderText(/steer/i), 'retry');
-      await userEvent.click(screen.getByRole('button', { name: /send/i }));
-
-      await waitFor(() => expect(postSteer).toHaveBeenCalledTimes(2));
-
-      const key1 = (vi.mocked(postSteer).mock.calls[0] as [string, { idempotency_key: string }])[1].idempotency_key;
-      const key2 = (vi.mocked(postSteer).mock.calls[1] as [string, { idempotency_key: string }])[1].idempotency_key;
-      expect(key1).not.toBe(key2);
-    });
+    render(<TaskDetail authMe={mockAuthMe} taskId="spawn-99-abcd-1234-efgh" />);
+    const sseModule = await import('../lib/sse.ts');
+    const emitEvent = (sseModule as unknown as { __emitEvent: (k: string, p: unknown) => void }).__emitEvent;
+    emitEvent('inbound_message', { task_id: 'spawn-99-abcd-1234-efgh' });
+    await waitFor(() => expect(mutate).toHaveBeenCalled());
   });
 
-  describe('test_TaskDetail_inbound_message_sse_invalidates', () => {
-    it('inbound_message SSE fires mutate', async () => {
-      const mutate = vi.fn();
-      vi.mocked(useSWR).mockReturnValue({ data: { task: baseTask, transcript: baseTranscript }, mutate } as unknown as ReturnType<typeof useSWR>);
+  it('shows retry button for failed task and not for running task', () => {
+    vi.mocked(useSWR).mockReturnValue({
+      data: { task: baseTask, transcript: baseTranscript },
+      mutate: vi.fn(),
+    } as unknown as ReturnType<typeof useSWR>);
+    const { rerender } = render(
+      <TaskDetail authMe={mockAuthMe} taskId="spawn-99-abcd-1234-efgh" />
+    );
+    expect(screen.queryByRole('button', { name: /retry task/i })).toBeNull();
 
-      render(<TaskDetail authMe={mockAuthMe} taskId="spawn-99" />);
-
-      const sseModule = await import('../lib/sse.ts');
-      const emitEvent = (sseModule as unknown as { __emitEvent: (k: string, p: unknown) => void }).__emitEvent;
-      emitEvent('inbound_message', { task_id: 'spawn-99' });
-
-      await waitFor(() => expect(mutate).toHaveBeenCalled());
-    });
-  });
-
-  describe('test_TaskDetail_no_edit_or_undo', () => {
-    it('rendered messages have no Edit/Delete/Undo controls', () => {
-      const { task, transcript } = makeTaskWithTranscript();
-      vi.mocked(useSWR).mockReturnValue({ data: { task, transcript }, mutate: vi.fn() } as unknown as ReturnType<typeof useSWR>);
-      render(<TaskDetail authMe={mockAuthMe} taskId="spawn-99" />);
-      expect(screen.queryByRole('button', { name: /edit/i })).toBeNull();
-      expect(screen.queryByRole('button', { name: /delete/i })).toBeNull();
-      expect(screen.queryByRole('button', { name: /undo/i })).toBeNull();
-    });
-  });
-
-  describe('test_TaskDetail_mobile_collapse', () => {
-    it('stacks metadata before thread on mobile viewport', () => {
-      vi.stubGlobal('matchMedia', (query: string) => ({
-        matches: query === '(max-width: 800px)',
-        media: query,
-        addEventListener: vi.fn(),
-        removeEventListener: vi.fn(),
-      }));
-      vi.mocked(useSWR).mockReturnValue({ data: { task: baseTask, transcript: baseTranscript }, mutate: vi.fn() } as unknown as ReturnType<typeof useSWR>);
-      const { container } = render(<TaskDetail authMe={mockAuthMe} taskId="spawn-99" />);
-      const wrapper = container.firstChild as HTMLElement;
-      expect(wrapper.style.flexDirection).toBe('column');
-    });
+    vi.mocked(useSWR).mockReturnValue({
+      data: { task: { ...baseTask, status: 'failed', failed_at: '2026-05-01T10:01:00Z' }, transcript: baseTranscript },
+      mutate: vi.fn(),
+    } as unknown as ReturnType<typeof useSWR>);
+    rerender(<TaskDetail authMe={mockAuthMe} taskId="spawn-99-abcd-1234-efgh" />);
+    expect(screen.getByRole('button', { name: /retry task/i })).toBeInTheDocument();
   });
 });

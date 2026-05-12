@@ -5,33 +5,14 @@ import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import { wakeContainer } from '../../container-runner.js';
 import type { Session } from '../../types.js';
-import { getTaskById, transitionToTerminal } from './db/tasks.js';
+import { authChildTaskAction, transitionToTerminal } from './db/tasks.js';
 
 export async function applySpawnComplete(content: Record<string, unknown>, callerSession: Session): Promise<void> {
-  const taskId = content.task_id as string | undefined;
+  const auth = authChildTaskAction(content, callerSession, 'applySpawnComplete');
+  if (!auth) return;
+  const { task, taskId } = auth;
+
   const summary = (content.summary as string | undefined) ?? '';
-
-  if (!taskId) {
-    log.warn('applySpawnComplete: missing task_id', { sessionId: callerSession.id });
-    return;
-  }
-
-  const task = getTaskById(taskId);
-  if (!task) {
-    log.warn('applySpawnComplete: task not found', { taskId });
-    return;
-  }
-
-  // Two-column auth: task_id + child_session_id must match caller
-  if (task.child_session_id !== callerSession.id) {
-    log.warn('applySpawnComplete: auth failed — child_session_id mismatch', {
-      taskId,
-      expected: task.child_session_id,
-      got: callerSession.id,
-    });
-    return;
-  }
-
   const now = new Date().toISOString();
   const transitioned = transitionToTerminal(taskId, 'completed', {
     completed_at: now,
@@ -80,31 +61,12 @@ export async function applySpawnComplete(content: Record<string, unknown>, calle
 }
 
 export async function applySpawnFailed(content: Record<string, unknown>, callerSession: Session): Promise<void> {
-  const taskId = content.task_id as string | undefined;
+  const auth = authChildTaskAction(content, callerSession, 'applySpawnFailed');
+  if (!auth) return;
+  const { task, taskId } = auth;
+
   const summary = (content.summary as string | undefined) ?? '';
   const failReason = (content.fail_reason as string | undefined) ?? 'agent_error';
-
-  if (!taskId) {
-    log.warn('applySpawnFailed: missing task_id', { sessionId: callerSession.id });
-    return;
-  }
-
-  const task = getTaskById(taskId);
-  if (!task) {
-    log.warn('applySpawnFailed: task not found', { taskId });
-    return;
-  }
-
-  // Two-column auth: task_id + child_session_id must match caller
-  if (task.child_session_id !== callerSession.id) {
-    log.warn('applySpawnFailed: auth failed — child_session_id mismatch', {
-      taskId,
-      expected: task.child_session_id,
-      got: callerSession.id,
-    });
-    return;
-  }
-
   const now = new Date().toISOString();
   const transitioned = transitionToTerminal(taskId, 'failed', {
     failed_at: now,

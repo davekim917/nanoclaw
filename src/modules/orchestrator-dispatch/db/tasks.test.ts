@@ -59,6 +59,8 @@ function makeTask(overrides: Partial<Omit<Task, 'created_at'>> = {}): Omit<Task,
     dispatch_completion_attempts: 0,
     completion_lease_at: null,
     surface_mode: 'pending',
+    needs_input: 0,
+    steer_question: null,
     ...overrides,
   };
 }
