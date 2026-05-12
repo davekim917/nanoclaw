@@ -19,12 +19,12 @@ write_status() {
 echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Deploy started" >> "$LOG"
 write_status "running" "git pull" ""
 
-if ! git checkout dave/migration >> "$LOG" 2>&1; then
+if ! git checkout main >> "$LOG" 2>&1; then
   write_status "failed" "git checkout" "checkout failed — check deploy.log"
   exit 1
 fi
 
-if ! git pull origin dave/migration >> "$LOG" 2>&1; then
+if ! git pull origin main >> "$LOG" 2>&1; then
   write_status "failed" "git pull" "pull failed — local changes or merge conflict"
   exit 1
 fi
