@@ -26,7 +26,16 @@ import { log } from './log.js';
 
 const execFileAsync = promisify(execFile);
 
-const POLL_MS = 60_000;
+export const POLL_MS = 60_000;
+// Repeated failures back off exponentially up to MAX_BACKOFF_MS — at 1h the
+// watcher is still checking often enough that recovery is noticed promptly,
+// without hammering on a persistent fault.
+export const MAX_BACKOFF_MS = 3_600_000;
+// While the same failure persists, surface one "still failing" reminder every
+// REMINDER_MS so the operator doesn't forget about a broken state once dedup
+// goes quiet.
+export const REMINDER_MS = 14_400_000;
+
 // Use the same full reference container-runner.ts spawns from — CONTAINER_IMAGE
 // resolves to `<install-slug-base>:<tag>` (default `:latest`). Pre-fix the
 // watcher hardcoded `nanoclaw-agent:v2` (wrong base) and built with tag `v2`
@@ -41,6 +50,37 @@ type Notifier = (message: string) => Promise<void>;
 let timer: NodeJS.Timeout | null = null;
 let running = false;
 let notify: Notifier | null = null;
+
+// Failure-state tracking. The watcher's tick is loud by default: every run
+// that hits the same error would Discord-spam without dedup. lastNotifiedDetail
+// tracks the most recent message we sent; consecutiveFailures drives backoff;
+// firstFailureAt + lastReminderAt drive the periodic "still failing" reminder.
+let lastNotifiedDetail: string | null = null;
+let consecutiveFailures = 0;
+let firstFailureAt: number | null = null;
+let lastReminderAt: number | null = null;
+
+export function _resetWatcherStateForTest(): void {
+  lastNotifiedDetail = null;
+  consecutiveFailures = 0;
+  firstFailureAt = null;
+  lastReminderAt = null;
+}
+
+/** Pure: next-tick delay given a failure count. Capped at MAX_BACKOFF_MS. */
+export function nextDelayMs(failures: number): number {
+  if (failures <= 0) return POLL_MS;
+  const exp = Math.min(failures - 1, 20); // guard against 2**huge
+  const backoff = POLL_MS * 2 ** exp;
+  return Math.min(backoff, MAX_BACKOFF_MS);
+}
+
+/** Pure: human-friendly elapsed-time label for reminders. */
+export function formatElapsed(ms: number): string {
+  if (ms < 3_600_000) return `${Math.max(1, Math.round(ms / 60_000))}m`;
+  const h = ms / 3_600_000;
+  return h >= 10 ? `${Math.round(h)}h` : `${h.toFixed(1).replace(/\.0$/, '')}h`;
+}
 
 async function git(...args: string[]): Promise<string> {
   const { stdout } = await execFileAsync('git', args, { cwd: REPO_ROOT, timeout: 30_000 });
@@ -154,6 +194,21 @@ async function pullAndBuild(): Promise<StepResult> {
   });
 }
 
+async function clearFailureState(reason: string): Promise<void> {
+  if (consecutiveFailures > 0 && notify) {
+    const prevFailures = consecutiveFailures;
+    try {
+      await notify(`✅ Container rebuild recovered (${reason} after ${prevFailures} failed attempts)`);
+    } catch (err) {
+      log.warn('Container-rebuild watcher recovery notify failed', { err });
+    }
+  }
+  lastNotifiedDetail = null;
+  consecutiveFailures = 0;
+  firstFailureAt = null;
+  lastReminderAt = null;
+}
+
 async function tick(): Promise<void> {
   if (running) return;
   running = true;
@@ -162,6 +217,7 @@ async function tick(): Promise<void> {
     const check = await checkStaleness();
     if (!check.stale) {
       log.debug('Container image up to date', { reason: check.reason });
+      await clearFailureState('image up to date');
       return;
     }
 
@@ -173,17 +229,47 @@ async function tick(): Promise<void> {
       detail: result.detail,
       head: short(headSha),
     });
-    // Notify only on failure. Successful auto-rebuilds are routine: the operator
-    // already knows about their own commits, and the previous "✅ Container image
-    // rebuilt (HEAD <sha>)" notification is mostly noise. Failures are surprising
-    // and need attention (every new spawn would otherwise inherit the broken or
-    // stale image).
-    if (!result.ok && notify) {
-      try {
-        await notify(`❌ Container rebuild failed: ${result.detail}`);
-      } catch (err) {
-        log.warn('Container-rebuild watcher notify failed', { err });
+
+    if (result.ok) {
+      await clearFailureState('rebuild succeeded');
+      return;
+    }
+
+    // Failure path — dedup, backoff, reminder.
+    consecutiveFailures++;
+    const now = Date.now();
+    if (firstFailureAt === null) firstFailureAt = now;
+    const detail = result.detail;
+    const errorChanged = detail !== lastNotifiedDetail;
+    const reminderAnchor = lastReminderAt ?? firstFailureAt;
+    const reminderDue = !errorChanged && now - reminderAnchor >= REMINDER_MS;
+
+    if (errorChanged) {
+      lastNotifiedDetail = detail;
+      firstFailureAt = now;
+      lastReminderAt = null;
+      if (notify) {
+        try {
+          await notify(`❌ Container rebuild failed: ${detail}`);
+        } catch (err) {
+          log.warn('Container-rebuild watcher notify failed', { err });
+        }
       }
+    } else if (reminderDue) {
+      lastReminderAt = now;
+      const since = formatElapsed(now - firstFailureAt);
+      if (notify) {
+        try {
+          await notify(`⏳ Container rebuild still failing (${consecutiveFailures} attempts over ${since}): ${detail}`);
+        } catch (err) {
+          log.warn('Container-rebuild watcher reminder notify failed', { err });
+        }
+      }
+    } else {
+      log.debug('Container-rebuild watcher: duplicate failure suppressed', {
+        consecutiveFailures,
+        detail,
+      });
     }
   } catch (err) {
     log.error('Container-rebuild watcher tick failed', { err });
@@ -195,10 +281,11 @@ async function tick(): Promise<void> {
 export function startContainerRebuildWatcher(notifier?: Notifier): void {
   if (timer) return;
   notify = notifier ?? null;
-  // First tick in 30s (let the service finish booting), then every POLL_MS.
+  // First tick in 30s (let the service finish booting), then on a dynamic
+  // schedule: POLL_MS while healthy, exponential backoff while failing.
   timer = setTimeout(function loop() {
     void tick().finally(() => {
-      timer = setTimeout(loop, POLL_MS);
+      timer = setTimeout(loop, nextDelayMs(consecutiveFailures));
     });
   }, 30_000);
   log.info('Container-rebuild watcher started', { pollMs: POLL_MS, image: IMAGE_REF });
