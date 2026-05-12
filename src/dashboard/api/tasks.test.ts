@@ -141,11 +141,7 @@ describe('tasksListHandler — D3', () => {
     insertTask('t1', 'ag-1', 'sess-1');
     insertTask('t2', 'ag-2', 'sess-2');
     const ctx = makeCtx('u1', { no_filter: true });
-    const resp = await tasksListHandler(
-      makeReq('http://localhost/dashboard/api/tasks?group_id=ag-2'),
-      {},
-      ctx,
-    );
+    const resp = await tasksListHandler(makeReq('http://localhost/dashboard/api/tasks?group_id=ag-2'), {}, ctx);
     const body = (await resp!.json()) as { tasks: Array<{ task_id: string }> };
     expect(body.tasks.length).toBe(1);
     expect(body.tasks[0].task_id).toBe('t2');
@@ -156,11 +152,7 @@ describe('tasksListHandler — D3', () => {
     insertTask('t2', 'ag-2', 'sess-2');
     // member of ag-1 only — requesting ag-2 should disclose-as-not-found (empty)
     const ctx = makeCtx('u1', { allowed_group_ids: ['ag-1'] });
-    const resp = await tasksListHandler(
-      makeReq('http://localhost/dashboard/api/tasks?group_id=ag-2'),
-      {},
-      ctx,
-    );
+    const resp = await tasksListHandler(makeReq('http://localhost/dashboard/api/tasks?group_id=ag-2'), {}, ctx);
     expect(resp!.status).toBe(200);
     const body = (await resp!.json()) as { tasks: unknown[]; cursor: string | null };
     expect(body.tasks).toEqual([]);

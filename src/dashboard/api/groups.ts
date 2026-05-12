@@ -22,9 +22,7 @@ export const groupsListHandler: AuthHandler = async (_req, _params, ctx) => {
   let rows: GroupRow[];
   try {
     if (ctx.scopes.no_filter) {
-      rows = getDb()
-        .prepare('SELECT id, name FROM agent_groups ORDER BY name')
-        .all() as GroupRow[];
+      rows = getDb().prepare('SELECT id, name FROM agent_groups ORDER BY name').all() as GroupRow[];
     } else if (ctx.scopes.allowed_group_ids.length === 0) {
       rows = [];
     } else {
