@@ -208,12 +208,14 @@ RUN chmod +x /usr/local/bin/mnemon-wrapper.sh \
 # https://github.com/hex-inc/hex-cli/releases. Auth is OAuth-only (no static
 # token env var); the real `hex` binary reads XDG_CONFIG_HOME, and the
 # wrapper at /usr/local/bin/hex points it at the mount staging path. SHA256s
-# pinned per-arch — bump the version + recompute both via:
-#   curl -sL https://github.com/hex-inc/hex-cli/releases/download/v$V/hex-aarch64-unknown-linux-gnu.tar.xz | sha256sum
-#   curl -sL https://github.com/hex-inc/hex-cli/releases/download/v$V/hex-x86_64-unknown-linux-gnu.tar.xz  | sha256sum
+# pinned per-arch — read the canonical .sha256 sidecar files (NOT a direct
+# pipe-to-sha256sum, which has been observed to read partial bytes off a
+# stale CDN edge):
+#   curl -sL https://github.com/hex-inc/hex-cli/releases/download/v$V/hex-aarch64-unknown-linux-gnu.tar.xz.sha256
+#   curl -sL https://github.com/hex-inc/hex-cli/releases/download/v$V/hex-x86_64-unknown-linux-gnu.tar.xz.sha256
 ARG HEX_CLI_VERSION=1.3.0
-ARG HEX_CLI_SHA256_arm64=d45c4f70d2a36da2af0d99139265f0d2409b7a2ba15a5e9ad66b9bc8d4fcb79d
-ARG HEX_CLI_SHA256_amd64=dc6ed4d0a367472387aae0f36198d92a13a5b8431aeeda1202393bced7df0de6
+ARG HEX_CLI_SHA256_arm64=284743e6a58d4a98ec7b457673ddd948c54069fcbd67826cde34b4cd4b48d8ae
+ARG HEX_CLI_SHA256_amd64=375d08789afec2529d71373a6326ba638720031e44a094cb7f10538a60ca31a3
 
 RUN ARCH=$(dpkg --print-architecture) \
     && case "$ARCH" in \
