@@ -29,8 +29,14 @@ if ! git pull origin dave/migration >> "$LOG" 2>&1; then
   exit 1
 fi
 
+write_status "running" "install" ""
+if ! pnpm install --frozen-lockfile >> "$LOG" 2>&1; then
+  write_status "failed" "install" "pnpm install failed — check deploy.log"
+  exit 1
+fi
+
 write_status "running" "build" ""
-if ! npm run build >> "$LOG" 2>&1; then
+if ! pnpm run build >> "$LOG" 2>&1; then
   write_status "failed" "build" "TypeScript build failed"
   exit 1
 fi
