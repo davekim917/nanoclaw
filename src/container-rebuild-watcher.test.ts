@@ -7,16 +7,16 @@ describe('nextDelayMs', () => {
   });
 
   it('doubles each subsequent failure', () => {
-    expect(nextDelayMs(1)).toBe(POLL_MS);          // 60s
-    expect(nextDelayMs(2)).toBe(POLL_MS * 2);      // 2m
-    expect(nextDelayMs(3)).toBe(POLL_MS * 4);      // 4m
-    expect(nextDelayMs(4)).toBe(POLL_MS * 8);      // 8m
-    expect(nextDelayMs(5)).toBe(POLL_MS * 16);     // 16m
-    expect(nextDelayMs(6)).toBe(POLL_MS * 32);     // 32m
+    expect(nextDelayMs(1)).toBe(POLL_MS); // 60s
+    expect(nextDelayMs(2)).toBe(POLL_MS * 2); // 2m
+    expect(nextDelayMs(3)).toBe(POLL_MS * 4); // 4m
+    expect(nextDelayMs(4)).toBe(POLL_MS * 8); // 8m
+    expect(nextDelayMs(5)).toBe(POLL_MS * 16); // 16m
+    expect(nextDelayMs(6)).toBe(POLL_MS * 32); // 32m
   });
 
   it('caps at MAX_BACKOFF_MS for high failure counts', () => {
-    expect(nextDelayMs(7)).toBe(MAX_BACKOFF_MS);   // would be 64m, capped at 60m
+    expect(nextDelayMs(7)).toBe(MAX_BACKOFF_MS); // would be 64m, capped at 60m
     expect(nextDelayMs(100)).toBe(MAX_BACKOFF_MS);
     expect(nextDelayMs(1000)).toBe(MAX_BACKOFF_MS);
   });
