@@ -146,6 +146,89 @@ a:hover { color: var(--fg); }
   border-radius: 50%;
   box-shadow: 0 0 8px var(--brand);
 }
+/* Group title — the brand-line slot that morphs to the active group's
+   name when filtered. Renders inline next to the diamond brand mark. */
+.nc-group-title { position: relative; display: inline-block; }
+.nc-group-title-static {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--fg-2);
+  white-space: nowrap;
+}
+.nc-group-title-trigger {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--fg-2);
+  white-space: nowrap;
+}
+.nc-group-title-trigger:hover { color: var(--fg); }
+.nc-group-title-chev {
+  font-size: 10px;
+  color: var(--fg-3);
+  transition: transform 0.15s ease;
+}
+.nc-group-title-trigger[aria-expanded='true'] .nc-group-title-chev {
+  transform: rotate(180deg);
+  color: var(--fg-2);
+}
+.nc-group-title-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 20;
+  min-width: 180px;
+  margin: 0;
+  padding: 4px;
+  list-style: none;
+  background: var(--bg-card-2);
+  border: 1px solid var(--line-2);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px oklch(0% 0 0 / 0.4);
+}
+.nc-group-title-menu li {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 12px;
+  padding: 8px 10px;
+  font-family: var(--font-sans);
+  font-size: 13px;
+  color: var(--fg);
+  cursor: pointer;
+  border-radius: 4px;
+  letter-spacing: 0;
+  text-transform: none;
+}
+.nc-group-title-menu li .hint {
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--fg-4);
+}
+.nc-group-title-menu li:hover { background: var(--bg-deep); }
+.nc-group-title-menu li.active {
+  background: var(--bg-inset);
+  color: var(--fg);
+}
+.nc-group-title-menu li.active::after {
+  content: '✓';
+  color: var(--st-running);
+  margin-left: auto;
+}
+.nc-group-title-menu li.active .hint { color: var(--fg-3); }
+
 .nc-pulse-actions { display: flex; gap: 14px; align-items: center; }
 .nc-pulse-actions .nav-link {
   font-family: var(--font-mono);

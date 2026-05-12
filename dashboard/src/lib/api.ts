@@ -113,14 +113,28 @@ export async function exchangeToken(token: string): Promise<ExchangeResponse> {
 }
 
 export async function listTasks(
-  filter?: { status?: string; limit?: number; before?: string }
+  filter?: { status?: string; limit?: number; before?: string; group_id?: string }
 ): Promise<TaskListResponse> {
   const params = new URLSearchParams();
   if (filter?.status) params.set('status', filter.status);
   if (filter?.limit != null) params.set('limit', String(filter.limit));
   if (filter?.before) params.set('before', filter.before);
+  if (filter?.group_id) params.set('group_id', filter.group_id);
   const qs = params.toString();
   return apiFetch<TaskListResponse>(`/dashboard/api/tasks${qs ? `?${qs}` : ''}`);
+}
+
+export interface GroupSummary {
+  id: string;
+  name: string;
+}
+
+export interface GroupListResponse {
+  groups: GroupSummary[];
+}
+
+export async function listGroups(): Promise<GroupListResponse> {
+  return apiFetch<GroupListResponse>('/dashboard/api/groups');
 }
 
 export async function getTask(id: string): Promise<TaskDetailResponse> {

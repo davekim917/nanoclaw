@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useCallback } from 'react';
 import useSWR from 'swr';
-import { listTasks } from '../lib/api.js';
+import { listTasks, listGroups } from '../lib/api.js';
 import { subscribe, startSSE } from '../lib/sse.ts';
 import {
   extractGoal,
@@ -12,7 +12,9 @@ import {
   streamGroups,
   type Counts,
 } from '../lib/derive.js';
-import type { AuthMe, TaskSummary } from '../lib/api.js';
+import { useGroupFilter, type GroupFilter } from '../lib/use-group-filter.js';
+import { GroupTitle } from './GroupTitle.js';
+import type { AuthMe, GroupSummary, TaskSummary } from '../lib/api.js';
 
 interface KanbanBoardProps {
   authMe: AuthMe;
@@ -24,13 +26,29 @@ type FilterId = 'all' | 'needs' | 'run' | 'done';
 const MOBILE_QUERY = '(max-width: 899px)';
 
 export const KanbanBoard: React.FC<KanbanBoardProps> = ({
-  authMe: _authMe,
+  authMe,
   route,
   onRouteChange,
 }) => {
-  const { data, mutate } = useSWR('/dashboard/api/tasks', () => listTasks(), {
+  const [groupFilter, setGroupFilter] = useGroupFilter(
+    authMe.user_id,
+    authMe.scopes.allowed_group_ids,
+    authMe.scopes.no_filter,
+  );
+
+  // SWR key includes the group filter so switching groups triggers a refetch
+  // through the existing cache instead of muting+remounting.
+  const tasksKey = ['/dashboard/api/tasks', groupFilter] as const;
+  const { data, mutate } = useSWR(
+    tasksKey,
+    () => listTasks(groupFilter === 'all' ? {} : { group_id: groupFilter }),
+    { refreshInterval: 0 },
+  );
+  const { data: groupsData } = useSWR('/dashboard/api/groups', () => listGroups(), {
     refreshInterval: 0,
   });
+  const groups: GroupSummary[] = groupsData?.groups ?? [];
+
   const invalidate = useCallback(() => { void mutate(); }, [mutate]);
   useEffect(() => subscribe('task_event', invalidate), [invalidate]);
 
@@ -70,6 +88,9 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
       route={route}
       onRouteChange={onRouteChange}
       lastActivityIso={lastActivityIso}
+      groups={groups}
+      groupFilter={groupFilter}
+      onGroupFilter={setGroupFilter}
     />
   ) : (
     <DesktopBoard
@@ -78,6 +99,9 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
       route={route}
       onRouteChange={onRouteChange}
       lastActivityIso={lastActivityIso}
+      groups={groups}
+      groupFilter={groupFilter}
+      onGroupFilter={setGroupFilter}
     />
   );
 };
@@ -91,18 +115,29 @@ function PulseHeader({
   lastActivityIso,
   route,
   onRouteChange,
+  groups,
+  groupFilter,
+  onGroupFilter,
 }: {
   counts: Counts;
   lastActivityIso: string;
   route: 'board' | 'sessions';
   onRouteChange: (r: 'board' | 'sessions') => void;
+  groups: GroupSummary[];
+  groupFilter: GroupFilter;
+  onGroupFilter: (next: GroupFilter) => void;
 }) {
   return (
     <header className="nc-pulse">
       <div className="nc-pulse-top">
         <div className="nc-brand">
           <span className="mark" aria-hidden="true"></span>
-          <span>NanoClaw</span>
+          <GroupTitle
+            groups={groups}
+            selectedId={groupFilter}
+            onChange={onGroupFilter}
+            fallback="Agent Board"
+          />
         </div>
         <nav className="nc-pulse-actions">
           <button
@@ -313,6 +348,9 @@ function MobileBoard({
   route,
   onRouteChange,
   lastActivityIso,
+  groups,
+  groupFilter,
+  onGroupFilter,
 }: {
   tasks: TaskSummary[];
   visible: TaskSummary[];
@@ -322,6 +360,9 @@ function MobileBoard({
   route: 'board' | 'sessions';
   onRouteChange: (r: 'board' | 'sessions') => void;
   lastActivityIso: string;
+  groups: GroupSummary[];
+  groupFilter: GroupFilter;
+  onGroupFilter: (next: GroupFilter) => void;
 }) {
   const g = streamGroups(visible);
   const [foldOpen, setFoldOpen] = useState(false);
@@ -336,6 +377,9 @@ function MobileBoard({
         lastActivityIso={lastActivityIso}
         route={route}
         onRouteChange={onRouteChange}
+        groups={groups}
+        groupFilter={groupFilter}
+        onGroupFilter={onGroupFilter}
       />
       <FilterChips value={filter} onChange={onFilter} counts={counts} />
 
@@ -426,12 +470,18 @@ function DesktopBoard({
   route,
   onRouteChange,
   lastActivityIso,
+  groups,
+  groupFilter,
+  onGroupFilter,
 }: {
   tasks: TaskSummary[];
   counts: Counts;
   route: 'board' | 'sessions';
   onRouteChange: (r: 'board' | 'sessions') => void;
   lastActivityIso: string;
+  groups: GroupSummary[];
+  groupFilter: GroupFilter;
+  onGroupFilter: (next: GroupFilter) => void;
 }) {
   const needsMe = tasks.filter((t) => t.status === 'failed');
   const working = tasks.filter((t) => t.status === 'running');
@@ -448,7 +498,12 @@ function DesktopBoard({
         <div className="nc-desktop-pulse">
           <div className="nc-brand">
             <span className="mark" aria-hidden="true"></span>
-            <span>NanoClaw · Spawn Board</span>
+            <GroupTitle
+              groups={groups}
+              selectedId={groupFilter}
+              onChange={onGroupFilter}
+              fallback="Agent Board"
+            />
           </div>
           <div className="bigcount">
             <span>{counts.total}</span>

@@ -25,6 +25,7 @@ vi.mock('../lib/sse.ts', () => {
 
 vi.mock('../lib/api.js', () => ({
   listTasks: vi.fn(),
+  listGroups: vi.fn(),
   authMe: vi.fn(),
   exchangeToken: vi.fn(),
   listSessions: vi.fn(),
@@ -175,5 +176,39 @@ describe('KanbanBoard', () => {
     expect(container.querySelector('.nc-col-head.attention')).toBeTruthy();
     expect(container.querySelector('.nc-col-head.working')).toBeTruthy();
     expect(container.querySelector('.nc-col-head.done')).toBeTruthy();
+  });
+
+  it('group title shows "Agent Board" by default and the group name when filter is selected', async () => {
+    localStorage.clear();
+    // Two-key SWR mock: tasks vs groups. Cache keys are the first arg to useSWR.
+    vi.mocked(useSWR).mockImplementation((key) => {
+      const tag = Array.isArray(key) ? key[0] : key;
+      if (tag === '/dashboard/api/groups') {
+        return {
+          data: { groups: [{ id: 'ag-1', name: 'illysium' }, { id: 'ag-2', name: 'axie-dev' }] },
+          mutate: vi.fn(),
+        } as unknown as ReturnType<typeof useSWR>;
+      }
+      return {
+        data: { tasks: [] },
+        mutate: vi.fn(),
+      } as unknown as ReturnType<typeof useSWR>;
+    });
+
+    render(<KanbanBoard authMe={mockAuthMe} route="board" onRouteChange={noop} />);
+    // Default: brand label reads the fallback
+    expect(screen.getByText('Agent Board')).toBeInTheDocument();
+
+    // Open menu, pick illysium
+    await userEvent.click(screen.getByRole('button', { name: /Agent Board/i }));
+    await userEvent.click(screen.getByRole('option', { name: /^illysium$/i }));
+
+    // Header morphs to the group name, fallback no longer in the doc (or only
+    // in the menu, which is now closed)
+    expect(screen.getByRole('button', { name: /illysium/i })).toBeInTheDocument();
+
+    // localStorage was written
+    expect(localStorage.getItem('nc:dash:group_filter:u1')).toBe('ag-1');
+    localStorage.clear();
   });
 });

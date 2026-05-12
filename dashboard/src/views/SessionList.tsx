@@ -1,8 +1,10 @@
 import React from 'react';
 import useSWR from 'swr';
-import { listSessions } from '../lib/api.js';
+import { listSessions, listGroups } from '../lib/api.js';
 import { relAge } from '../lib/derive.js';
-import type { AuthMe } from '../lib/api.js';
+import { useGroupFilter } from '../lib/use-group-filter.js';
+import { GroupTitle } from './GroupTitle.js';
+import type { AuthMe, GroupSummary } from '../lib/api.js';
 
 interface SessionListProps {
   authMe: AuthMe;
@@ -11,12 +13,19 @@ interface SessionListProps {
 }
 
 export const SessionList: React.FC<SessionListProps> = ({
-  authMe: _authMe,
+  authMe,
   route,
   onRouteChange,
 }) => {
   const { data } = useSWR('/dashboard/api/sessions', () => listSessions());
+  const { data: groupsData } = useSWR('/dashboard/api/groups', () => listGroups());
   const sessions = data?.sessions ?? [];
+  const groups: GroupSummary[] = groupsData?.groups ?? [];
+  const [groupFilter, setGroupFilter] = useGroupFilter(
+    authMe.user_id,
+    authMe.scopes.allowed_group_ids,
+    authMe.scopes.no_filter,
+  );
 
   return (
     <div className="nc-frame">
@@ -24,7 +33,12 @@ export const SessionList: React.FC<SessionListProps> = ({
         <div className="nc-pulse-top">
           <div className="nc-brand">
             <span className="mark" aria-hidden="true"></span>
-            <span>NanoClaw</span>
+            <GroupTitle
+              groups={groups}
+              selectedId={groupFilter}
+              onChange={setGroupFilter}
+              fallback="Agent Board"
+            />
           </div>
           <nav className="nc-pulse-actions">
             <button

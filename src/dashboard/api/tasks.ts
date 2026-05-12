@@ -171,6 +171,7 @@ export const tasksListHandler: AuthHandler = async (req, _params, ctx) => {
   const statusFilter = url.searchParams.get('status');
   const limit = Math.min(parseInt(url.searchParams.get('limit') ?? '50', 10) || 50, 200);
   const before = url.searchParams.get('before');
+  const groupIdFilter = url.searchParams.get('group_id');
 
   const { where: scopeWhere, groupIds } = buildScopeFilter(ctx);
 
@@ -180,6 +181,19 @@ export const tasksListHandler: AuthHandler = async (req, _params, ctx) => {
   if (scopeWhere) {
     conditions.push(`parent_agent_group_id IN (${groupIds.map(() => '?').join(', ')})`);
     values.push(...groupIds);
+  }
+  // Operator-facing group filter (one group at a time). Out-of-scope ids are
+  // silently dropped to empty results — §2a disclose-as-not-found, same
+  // contract as `tasksDetailHandler`'s scope check below.
+  if (groupIdFilter) {
+    if (!ctx.scopes.no_filter && !ctx.scopes.allowed_group_ids.includes(groupIdFilter)) {
+      return new Response(JSON.stringify({ tasks: [], cursor: null }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+    conditions.push('parent_agent_group_id = ?');
+    values.push(groupIdFilter);
   }
   if (statusFilter) {
     conditions.push('status = ?');

@@ -11,6 +11,7 @@ import { startSSEFeed, stopSSEFeed, eventsHandler } from './api/events.js';
 import { indexHtmlHandler, staticHandler } from './static.js';
 import { tasksListHandler, tasksDetailHandler } from './api/tasks.js';
 import { sessionsHandler } from './api/sessions.js';
+import { groupsListHandler } from './api/groups.js';
 import { steerHandler } from './steer.js';
 import { retryHandler } from './api/retry.js';
 
@@ -43,6 +44,7 @@ export function startDashboard(): void {
   register('GET', '/dashboard/api/tasks', requireAuth(tasksListHandler));
   register('GET', '/dashboard/api/tasks/:id', requireAuth(tasksDetailHandler));
   register('GET', '/dashboard/api/sessions', requireAuth(sessionsHandler));
+  register('GET', '/dashboard/api/groups', requireAuth(groupsListHandler));
   register('POST', '/dashboard/api/tasks/:id/message', requireAuth(steerHandler));
   register('POST', '/dashboard/api/tasks/:id/retry', requireAuth(retryHandler));
 
