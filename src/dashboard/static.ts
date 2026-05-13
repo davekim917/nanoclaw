@@ -12,7 +12,10 @@ import { createHash } from 'crypto';
 
 import type { Handler } from './router.js';
 
-export const STATIC_ROOT = path.resolve(process.cwd(), 'dist/dashboard');
+// SPA assets live in `dist/dashboard-spa/` (sibling of the host's compiled
+// API handlers at `dist/dashboard/`). They used to share the directory but
+// Vite's emptyOutDir wiped the host's index.js on every dashboard build.
+export const STATIC_ROOT = path.resolve(process.cwd(), 'dist/dashboard-spa');
 
 const MIME: Record<string, string> = {
   '.js': 'application/javascript',
