@@ -484,11 +484,26 @@ a:hover { color: var(--fg); }
   background: var(--surface-2);
   color: var(--fg);
 }
+/* Dim archived cards with filter (no opacity — that bleeds onto child
+   action buttons and made the unarchive control invisible on mobile). */
 .nc-card.archived {
-  opacity: 0.55;
-  filter: saturate(0.6);
+  filter: saturate(0.45) brightness(0.78);
 }
-.nc-card.archived .nc-card-dismiss { opacity: 1; }
+/* The unarchive button needs to be obvious, not an opacity-on-hover
+   secret. Always visible on archived cards, with a labeled affordance. */
+.nc-card.archived .nc-card-dismiss {
+  opacity: 1;
+  background: var(--surface-2);
+  color: var(--fg);
+  font-size: 12px;
+  font-weight: 500;
+  padding: 4px 10px;
+  letter-spacing: 0.04em;
+}
+.nc-card.archived .nc-card-dismiss:hover {
+  background: var(--surface-3, var(--surface-2));
+  filter: brightness(1.15);
+}
 
 .nc-archive-toolbar {
   display: flex;

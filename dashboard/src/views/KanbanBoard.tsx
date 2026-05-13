@@ -119,7 +119,12 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
 
   const [filter, setFilter] = useState<FilterId>('all');
   const tasks = data?.tasks ?? [];
-  const counts = countTasks(tasks);
+  // Counts represent actionable work — archived cards are excluded even
+  // when `showArchived` is on, so the pulse breakdown ("11 Failed") matches
+  // the rebuilt state after a bulk dismiss. Rendered card lists still use
+  // the raw `tasks` array so archived cards remain visible when toggled on.
+  const activeTasks = tasks.filter((t) => t.archived_at == null);
+  const counts = countTasks(activeTasks);
 
   let visible: TaskSummary[];
   if (filter === 'needs') visible = tasks.filter((t) => t.status === 'failed');
@@ -133,10 +138,10 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
       .sort()
       .pop() ?? new Date().toISOString();
 
-  // Server-side bulk-archive only touches `archived_at IS NULL`, so when
-  // showArchived is on, counts.failed can include rows the button cannot
-  // act on. Count actionable separately so the button hides at zero.
-  const failedActionableCount = tasks.filter((t) => t.status === 'failed' && t.archived_at == null).length;
+  // counts.failed is now the actionable-failed count (archived excluded);
+  // the bulk-clear button reads it directly. Alias kept for clarity at
+  // the callsite that drives "Clear failed (N)".
+  const failedActionableCount = counts.failed;
 
   // Memoize so future `React.memo`-wrapped descendants don't churn on
   // identity alone — callbacks are already stable via useCallback.
@@ -463,7 +468,7 @@ function TaskCard({
             onClick={handleUnarchive}
             title="Restore to board"
           >
-            ↩
+            ↩ Unarchive
           </button>
         )}
         {!isArchived && isTerminal && onArchive && (
@@ -779,7 +784,7 @@ function DesktopBoard({
           <div className="nc-col-head attention">
             <div className="ttl">
               <span className="swatch" aria-hidden="true"></span>Needs you
-              <span className="cnt">{needsMe.length}</span>
+              <span className="cnt">{counts.failed}</span>
             </div>
             <span className="hint">↑ act first</span>
           </div>
@@ -804,7 +809,7 @@ function DesktopBoard({
           <div className="nc-col-head working">
             <div className="ttl">
               <span className="swatch" aria-hidden="true"></span>Working
-              <span className="cnt">{working.length}</span>
+              <span className="cnt">{counts.running}</span>
             </div>
             <span className="hint">auto · live</span>
           </div>
@@ -847,7 +852,7 @@ function DesktopBoard({
           <div className="nc-col-head done">
             <div className="ttl">
               <span className="swatch" aria-hidden="true"></span>Done
-              <span className="cnt">{done.length}</span>
+              <span className="cnt">{counts.done}</span>
             </div>
             <span className="hint">last 24h</span>
           </div>
