@@ -420,14 +420,30 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       chat.onDirectMessage(async (thread, message) => {
         if (!passesFilter(message)) return;
         const channelId = adapter.channelIdFromThreadId(thread.id);
+
+        // Slack DM threading default: when the Slack "Agent or Assistant"
+        // toggle is OFF, Slack delivers channel-root DM messages with no
+        // `thread_ts` field, and the chat-sdk hands us a thread.id like
+        // `slack:D…:` (empty suffix). That makes downstream sessions+outbounds
+        // inherit an empty thread_id, and Bot replies post at channel root
+        // instead of threading under the user's message — fragmenting the
+        // conversation visually. Treat the originating message as its own
+        // thread root so replies thread under it. Same behavior the Agent UX
+        // provides, but driven by us rather than depending on a Slack-side
+        // toggle. Scoped to Slack DMs to avoid affecting other adapters.
+        let normalizedThreadId = thread.id;
+        if (adapter.name === 'slack' && normalizedThreadId.endsWith(':')) {
+          normalizedThreadId = `${normalizedThreadId}${message.id}`;
+        }
+
         log.info('Inbound DM received', {
           adapter: adapter.name,
           channelId,
           sender: (message.author as any)?.fullName ?? (message.author as any)?.userId ?? 'unknown',
-          threadId: thread.id,
+          threadId: normalizedThreadId,
         });
         // onDirectMessage only fires for real DMs — isDM=true unconditionally.
-        await setupConfig.onInbound(channelId, thread.id, await messageToInbound(message, true, true));
+        await setupConfig.onInbound(channelId, normalizedThreadId, await messageToInbound(message, true, true));
       });
 
       // Plain messages in unsubscribed threads.
