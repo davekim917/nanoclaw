@@ -169,7 +169,9 @@ describe('runSessionTitleSweep', () => {
     const dir = path.join(TMP_DIR, 'v2-sessions', 'ag-1', 'sess-stale-but-quiet');
     fs.mkdirSync(dir, { recursive: true });
     const db = new Database(path.join(dir, 'inbound.db'));
-    db.exec(`CREATE TABLE messages_in (id TEXT PRIMARY KEY, seq INTEGER, kind TEXT, timestamp TEXT, status TEXT, content TEXT);`);
+    db.exec(
+      `CREATE TABLE messages_in (id TEXT PRIMARY KEY, seq INTEGER, kind TEXT, timestamp TEXT, status TEXT, content TEXT);`,
+    );
     db.prepare(`INSERT INTO messages_in VALUES ('m1', 54, 'chat', ?, 'pending', '{"text":"hi"}')`).run(now());
     db.close();
 
@@ -190,7 +192,9 @@ describe('runSessionTitleSweep', () => {
     const dir = path.join(TMP_DIR, 'v2-sessions', 'ag-1', 'sess-busy');
     fs.mkdirSync(dir, { recursive: true });
     const db = new Database(path.join(dir, 'inbound.db'));
-    db.exec(`CREATE TABLE messages_in (id TEXT PRIMARY KEY, seq INTEGER, kind TEXT, timestamp TEXT, status TEXT, content TEXT);`);
+    db.exec(
+      `CREATE TABLE messages_in (id TEXT PRIMARY KEY, seq INTEGER, kind TEXT, timestamp TEXT, status TEXT, content TEXT);`,
+    );
     // Seed messages at seqs that include rows ≥10 past basis_seq=10
     for (let i = 1; i <= 12; i++) {
       db.prepare(`INSERT INTO messages_in VALUES (?, ?, 'chat', ?, 'pending', ?)`).run(
