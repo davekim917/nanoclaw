@@ -26,7 +26,8 @@ import { upsertArchiveMessage } from './message-archive.js';
 import { normalizeOptions } from './channels/ask-question.js';
 import { clearOutbox, openInboundDb, openOutboundDb, readOutboxFiles } from './session-manager.js';
 import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
-import { getTaskByChildSession } from './modules/orchestrator-dispatch/db/tasks.js';
+import { flagNeedsInput, getTaskByChildSession } from './modules/orchestrator-dispatch/db/tasks.js';
+import { emitDashboardEvent } from './dashboard/api/events.js';
 import type { OutboundFile } from './channels/adapter.js';
 import type { Session } from './types.js';
 
@@ -353,6 +354,37 @@ async function deliverMessage(
   }
 
   const content = JSON.parse(msg.content);
+
+  // Spawn-child workers sometimes ask via chat-sdk's `ask_question` instead
+  // of calling `spawn_request_steer`. Both signal "operator attention
+  // wanted" — light up the dashboard's Needs You lane for either. Worker
+  // continuing autonomously is fine; the flag clears on the next steer
+  // write per src/dashboard/steer.ts.
+  if (msg.kind === 'chat-sdk' && content && typeof content === 'object') {
+    const c = content as Record<string, unknown>;
+    if (c.type === 'ask_question') {
+      const task = getTaskByChildSession(session.id);
+      if (task && task.status === 'running') {
+        const title = typeof c.title === 'string' ? c.title : null;
+        const questionText = typeof c.question === 'string' ? c.question : null;
+        const summary = title ?? questionText ?? null;
+        try {
+          if (flagNeedsInput(task.task_id, summary ? summary.slice(0, 500) : null)) {
+            emitDashboardEvent('task_event', {
+              task_id: task.task_id,
+              kind: 'needs_input',
+              agent_group_id: task.parent_agent_group_id,
+            });
+          }
+        } catch (err) {
+          log.warn('delivery: ask_question → flagNeedsInput failed', {
+            taskId: task.task_id,
+            err: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+    }
+  }
 
   // System actions — handle internally (schedule_task, cancel_task, etc.)
   if (msg.kind === 'system') {

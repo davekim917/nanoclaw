@@ -1,9 +1,8 @@
 import { getChannelAdapter } from '../../channels/channel-registry.js';
-import { getDb } from '../../db/connection.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { log } from '../../log.js';
 import type { Session } from '../../types.js';
-import { authChildTaskAction } from './db/tasks.js';
+import { authChildTaskAction, flagNeedsInput } from './db/tasks.js';
 
 /**
  * Spawned child reports it's blocked waiting on operator input.
@@ -37,17 +36,7 @@ export async function applySpawnNeedsInput(content: Record<string, unknown>, cal
 
   let flipped = false;
   try {
-    const result = getDb()
-      .prepare(
-        `UPDATE tasks
-            SET needs_input = 1,
-                steer_question = ?
-          WHERE task_id = ?
-            AND status = 'running'
-            AND (needs_input = 0 OR steer_question IS NOT ?)`,
-      )
-      .run(question, taskId, question);
-    flipped = result.changes > 0;
+    flipped = flagNeedsInput(taskId, question);
   } catch (err) {
     log.warn('applySpawnNeedsInput: DB update failed — silently swallowing', { taskId, err });
     return;

@@ -232,6 +232,28 @@ export function authChildTaskAction(
 }
 
 /**
+ * Flip `needs_input=1` on a running task with the optional question text.
+ * Returns true when the row actually changed — callers gate SSE emits on
+ * this so a no-op (already-flagged with same question) doesn't trigger
+ * dashboard refetches. Shared by `applySpawnNeedsInput` (child MCP path)
+ * and the host-side delivery hook that catches `ask_question` outbound
+ * messages from spawn-child sessions.
+ */
+export function flagNeedsInput(taskId: string, question: string | null): boolean {
+  const result = getDb()
+    .prepare(
+      `UPDATE tasks
+          SET needs_input = 1,
+              steer_question = ?
+        WHERE task_id = ?
+          AND status = 'running'
+          AND (needs_input = 0 OR steer_question IS NOT ?)`,
+    )
+    .run(question, taskId, question);
+  return result.changes > 0;
+}
+
+/**
  * Clear the needs_input flag and the optional steer_question text. Invoked
  * by the steer write path so the operator's reply transparently unblocks
  * the worker. Guarded `WHERE needs_input = 1` so the partial index drives
