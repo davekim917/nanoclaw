@@ -10,7 +10,7 @@ import type { AuthMe } from './lib/api.js';
 import './styles.css';
 
 // Design-tool tweak variant. Switchable classes documented in styles.css.
-const TWEAK_CLASS = 'tw-no-heat tw-no-phasebar';
+const TWEAK_CLASS = 'tw-no-heat tw-no-phasebar tw-no-grid';
 
 function parseHash(): { route: 'board' | 'sessions' | 'task'; taskId?: string } {
   const hash = location.hash.slice(1) || '/board';

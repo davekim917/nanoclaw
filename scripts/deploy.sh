@@ -41,6 +41,15 @@ if ! pnpm run build >> "$LOG" 2>&1; then
   exit 1
 fi
 
+# Dashboard SPA is a separate Vite project — top-level `pnpm run build` is
+# tsc-only. Without this step `/deploy` ships server code with stale SPA
+# assets (browser keeps loading the previous bundle hash).
+write_status "running" "dashboard build" ""
+if ! pnpm run build:dashboard >> "$LOG" 2>&1; then
+  write_status "failed" "dashboard build" "Vite SPA build failed"
+  exit 1
+fi
+
 # Rebuild container image if any container/ files changed since the image
 # was last built. Compare image creation time to git history for container/.
 IMAGE_CREATED=$(docker inspect nanoclaw-agent:v2 --format '{{.Created}}' 2>/dev/null | cut -d. -f1 | tr 'T' ' ')

@@ -10,7 +10,7 @@
      .tw-no-grid     — hide hair-grid background
      .tw-compact     — denser card padding
      .tw-accent-{amber|violet|green} — recolor the "live" cyan
-   Dave's current variant: .tw-no-heat .tw-no-phasebar
+   Dave's current variant: .tw-no-heat .tw-no-phasebar .tw-no-grid
    ──────────────────────────────────────────────────────────── */
 @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap');
 
