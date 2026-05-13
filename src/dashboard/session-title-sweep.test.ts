@@ -274,6 +274,29 @@ describe('runSessionTitleSweep', () => {
     expect(backend).not.toHaveBeenCalled();
   });
 
+  it('no-op when no backend is configured (key missing AND no test override)', async () => {
+    // Production mode: ANTHROPIC_API_KEY is unset (OneCLI vault path) and
+    // the test override has been reset. Sweep must short-circuit without
+    // doing DB writes or candidate picks.
+    seedSession('sess-no-backend', 'ag-1');
+    writeInboundMessages('ag-1', 'sess-no-backend', [{ kind: 'chat', content: '{"text":"x"}' }]);
+    _resetTitleBackendForTest();
+    const originalKey = process.env['ANTHROPIC_API_KEY'];
+    delete process.env['ANTHROPIC_API_KEY'];
+    try {
+      const result = await runSessionTitleSweep();
+      expect(result).toEqual({ generated: 0, skipped: 0 });
+      // No row should be stamped — gate runs BEFORE pickCandidates.
+      const row = getDb()
+        .prepare('SELECT title, title_generated_at FROM sessions WHERE id = ?')
+        .get('sess-no-backend') as { title: string | null; title_generated_at: string | null };
+      expect(row.title).toBeNull();
+      expect(row.title_generated_at).toBeNull();
+    } finally {
+      if (originalKey !== undefined) process.env['ANTHROPIC_API_KEY'] = originalKey;
+    }
+  });
+
   it('re-entrancy guard: a second concurrent sweep call is a no-op (Q3)', async () => {
     seedSession('sess-1', 'ag-1');
     seedSession('sess-2', 'ag-1');

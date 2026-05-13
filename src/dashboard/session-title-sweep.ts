@@ -73,6 +73,22 @@ export function _resetTitleBackendForTest(): void {
   _backendOverride = null;
 }
 
+/**
+ * Returns true when the host process has a viable path to Anthropic. The
+ * production deploy migrates keys to the OneCLI vault and runs the service
+ * WITHOUT `ANTHROPIC_API_KEY` set; in that mode the title sweep can't
+ * reach Anthropic directly, so it no-ops until a follow-up wires the
+ * OneCLI gateway path (HTTPS_PROXY + CLAUDE_CODE_OAUTH_TOKEN, mirroring
+ * `src/memory-daemon/backends/anthropic.ts`). The test backend override
+ * is always considered configured.
+ */
+export function isBackendConfigured(): boolean {
+  if (_backendOverride !== null) return true;
+  return !!process.env['ANTHROPIC_API_KEY'];
+}
+
+let _missingBackendLogged = false;
+
 async function callTitleBackend(system: string, user: string, signal: AbortSignal): Promise<string> {
   if (_backendOverride !== null) {
     return await Promise.race([
@@ -317,6 +333,21 @@ export async function runSessionTitleSweep(): Promise<{ generated: number; skipp
 }
 
 async function _runSessionTitleSweepLocked(): Promise<{ generated: number; skipped: number }> {
+  // Fail-closed early when no viable Anthropic backend is wired. Without
+  // this gate every tick burns 3 doomed Haiku calls and stamps 3 failure
+  // backoffs, churning ~150 wasted attempts/hour for nothing. Log once
+  // per process lifetime so the operator sees it but the log doesn't
+  // flood every 60s.
+  if (!isBackendConfigured()) {
+    if (!_missingBackendLogged) {
+      _missingBackendLogged = true;
+      log.info(
+        'session-title: no Anthropic backend configured — sweep is a no-op. Set ANTHROPIC_API_KEY or wire HTTPS_PROXY + CLAUDE_CODE_OAUTH_TOKEN (OneCLI gateway).',
+      );
+    }
+    return { generated: 0, skipped: 0 };
+  }
+
   const candidates = pickCandidates(CONCURRENCY_CAP);
   if (candidates.length === 0) return { generated: 0, skipped: 0 };
 
