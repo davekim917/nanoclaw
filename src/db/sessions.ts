@@ -126,6 +126,26 @@ export function deleteSession(id: string): void {
   getDb().prepare('DELETE FROM sessions WHERE id = ?').run(id);
 }
 
+/**
+ * Bump `last_outbound_at` to now and stamp the kind tag for inbox attention-
+ * state derivation. Called from delivery.ts after a successful host→platform
+ * send so the central row doesn't fall behind the per-session outbound.db.
+ *
+ * `kind` is the granular tag — for `chat-sdk` messages the caller passes
+ * `chat-sdk:<content.type>` (e.g., `chat-sdk:ask_question`) so the inbox
+ * can distinguish question-prompts from ordinary chat without re-parsing.
+ */
+export function bumpLastOutbound(id: string, kind: string): void {
+  getDb()
+    .prepare(
+      `UPDATE sessions
+          SET last_outbound_at = datetime('now'),
+              last_outbound_kind = ?
+        WHERE id = ?`,
+    )
+    .run(kind, id);
+}
+
 // ── Pending Questions ──
 
 /**

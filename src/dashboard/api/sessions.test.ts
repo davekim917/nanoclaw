@@ -72,6 +72,53 @@ function insertSession(sessId: string, agId: string, mgId: string | null = null)
     .run(sessId, agId, mgId, now());
 }
 
+function setSessionFields(
+  sessId: string,
+  fields: Partial<{
+    last_active: string;
+    last_outbound_at: string;
+    last_outbound_kind: string;
+    title: string;
+    archived_at: string;
+  }>,
+): void {
+  const pairs = Object.keys(fields)
+    .map((k) => `${k} = ?`)
+    .join(', ');
+  const values = Object.values(fields);
+  getDb()
+    .prepare(`UPDATE sessions SET ${pairs} WHERE id = ?`)
+    .run(...values, sessId);
+}
+
+function insertAttachedTask(opts: {
+  taskId: string;
+  childSessId: string;
+  parentSessId: string;
+  agentGroupId: string;
+  status: 'pending' | 'running' | 'completed' | 'failed';
+  needsInput?: 0 | 1;
+}): void {
+  getDb()
+    .prepare(
+      `INSERT INTO tasks
+         (task_id, idempotency_key, parent_session_id, parent_agent_group_id, child_session_id,
+          status, task_content, request_hash, admitted_at, surface_mode, needs_input, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, '## Goal\nx', 'h', ?, 'native_thread', ?, ?)`,
+    )
+    .run(
+      opts.taskId,
+      `key-${opts.taskId}`,
+      opts.parentSessId,
+      opts.agentGroupId,
+      opts.childSessId,
+      opts.status,
+      now(),
+      opts.needsInput ?? 0,
+      now(),
+    );
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 describe('sessionsHandler — D4', () => {
@@ -143,5 +190,137 @@ describe('sessionsHandler — D4', () => {
     const resp = await sessionsHandler(makeReq(), {}, ctx);
     const body = (await resp!.json()) as { sessions: unknown[] };
     expect(body.sessions.length).toBe(1);
+  });
+
+  it('group_id filter narrows to one agent group', async () => {
+    insertSession('sess-1', 'ag-1');
+    insertSession('sess-2', 'ag-2');
+    const ctx = makeCtx('u1', { no_filter: true });
+    const resp = await sessionsHandler(makeReq('http://localhost/dashboard/api/sessions?group_id=ag-2'), {}, ctx);
+    const body = (await resp!.json()) as { sessions: Array<{ agent_group_id: string }> };
+    expect(body.sessions.length).toBe(1);
+    expect(body.sessions[0]!.agent_group_id).toBe('ag-2');
+  });
+
+  it('group_id outside scope returns empty (§2a disclose-as-not-found)', async () => {
+    insertSession('sess-1', 'ag-1');
+    insertSession('sess-2', 'ag-2');
+    const ctx = makeCtx('u1', { allowed_group_ids: ['ag-1'] });
+    const resp = await sessionsHandler(makeReq('http://localhost/dashboard/api/sessions?group_id=ag-2'), {}, ctx);
+    const body = (await resp!.json()) as { sessions: unknown[] };
+    expect(body.sessions.length).toBe(0);
+  });
+
+  it('archived sessions hidden by default, surfaced with include_archived=1', async () => {
+    insertSession('sess-live', 'ag-1');
+    insertSession('sess-old', 'ag-1');
+    setSessionFields('sess-old', { archived_at: now() });
+    const ctx = makeCtx('u1', { no_filter: true });
+
+    const respHidden = await sessionsHandler(makeReq(), {}, ctx);
+    const bodyHidden = (await respHidden!.json()) as { sessions: Array<{ session_id: string }> };
+    expect(bodyHidden.sessions.map((s) => s.session_id)).toEqual(['sess-live']);
+
+    const respShown = await sessionsHandler(
+      makeReq('http://localhost/dashboard/api/sessions?include_archived=1'),
+      {},
+      ctx,
+    );
+    const bodyShown = (await respShown!.json()) as { sessions: Array<{ session_id: string }> };
+    expect(bodyShown.sessions.map((s) => s.session_id).sort()).toEqual(['sess-live', 'sess-old']);
+  });
+
+  it('attention_state: needs_me when attached task has needs_input=1', async () => {
+    insertSession('parent-sess', 'ag-1');
+    insertSession('child-sess', 'ag-1');
+    insertAttachedTask({
+      taskId: 'task-1',
+      childSessId: 'child-sess',
+      parentSessId: 'parent-sess',
+      agentGroupId: 'ag-1',
+      status: 'running',
+      needsInput: 1,
+    });
+    const ctx = makeCtx('u1', { no_filter: true });
+    const resp = await sessionsHandler(
+      makeReq('http://localhost/dashboard/api/sessions?group_id=ag-1'),
+      {},
+      ctx,
+    );
+    const body = (await resp!.json()) as {
+      sessions: Array<{ session_id: string; attention_state: string; attached_task_id: string | null }>;
+    };
+    const child = body.sessions.find((s) => s.session_id === 'child-sess');
+    expect(child?.attention_state).toBe('needs_me');
+    expect(child?.attached_task_id).toBe('task-1');
+  });
+
+  it('attention_state: needs_me when last outbound was chat-sdk:ask_question with no inbound since', async () => {
+    insertSession('sess-q', 'ag-1');
+    setSessionFields('sess-q', {
+      last_active: '2026-05-01T00:00:00Z', // older
+      last_outbound_at: '2026-05-13T00:00:00Z', // newer
+      last_outbound_kind: 'chat-sdk:ask_question',
+    });
+    const ctx = makeCtx('u1', { no_filter: true });
+    const resp = await sessionsHandler(makeReq(), {}, ctx);
+    const body = (await resp!.json()) as { sessions: Array<{ session_id: string; attention_state: string }> };
+    expect(body.sessions[0]?.attention_state).toBe('needs_me');
+  });
+
+  it('attention_state: active when container heartbeat is running', async () => {
+    insertSession('sess-run', 'ag-1');
+    setSessionFields('sess-run', {
+      last_active: '2026-05-01T00:00:00Z',
+      last_outbound_at: '2026-05-01T00:00:00Z',
+    });
+    const nowMs = Date.now();
+    vi.mocked(fs.statSync).mockImplementation(() => ({ mtimeMs: nowMs - 10_000 }) as fs.Stats);
+    const ctx = makeCtx('u1', { no_filter: true });
+    const resp = await sessionsHandler(makeReq(), {}, ctx);
+    const body = (await resp!.json()) as {
+      sessions: Array<{ session_id: string; attention_state: string; container_status: string }>;
+    };
+    expect(body.sessions[0]?.attention_state).toBe('active');
+    expect(body.sessions[0]?.container_status).toBe('running');
+  });
+
+  it('attention_state: stale when container down and no activity for 24h+', async () => {
+    insertSession('sess-cold', 'ag-1');
+    setSessionFields('sess-cold', {
+      last_active: '2026-05-01T00:00:00Z',
+      last_outbound_at: '2026-05-01T00:00:00Z',
+    });
+    // heartbeat is ENOENT (no container)
+    vi.mocked(fs.statSync).mockImplementation(() => {
+      throw new Error('ENOENT');
+    });
+    const ctx = makeCtx('u1', { no_filter: true });
+    const resp = await sessionsHandler(makeReq(), {}, ctx);
+    const body = (await resp!.json()) as { sessions: Array<{ session_id: string; attention_state: string }> };
+    expect(body.sessions[0]?.attention_state).toBe('stale');
+  });
+
+  it('includes title, last_outbound_at, last_outbound_kind in response', async () => {
+    insertSession('sess-t', 'ag-1');
+    setSessionFields('sess-t', {
+      title: 'XZO-71 — rollout fix',
+      last_outbound_at: '2026-05-13T12:00:00Z',
+      last_outbound_kind: 'chat-sdk:chat_message',
+    });
+    const ctx = makeCtx('u1', { no_filter: true });
+    const resp = await sessionsHandler(makeReq(), {}, ctx);
+    const body = (await resp!.json()) as {
+      sessions: Array<{
+        session_id: string;
+        title: string | null;
+        last_outbound_at: string | null;
+        last_outbound_kind: string | null;
+      }>;
+    };
+    const row = body.sessions[0]!;
+    expect(row.title).toBe('XZO-71 — rollout fix');
+    expect(row.last_outbound_at).toBe('2026-05-13T12:00:00Z');
+    expect(row.last_outbound_kind).toBe('chat-sdk:chat_message');
   });
 });

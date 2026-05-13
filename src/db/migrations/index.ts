@@ -31,6 +31,7 @@ import { migration028 } from './028-dashboard-tables.js';
 import { migration029 } from './029-tasks-needs-input.js';
 import { migration030 } from './030-tasks-archived-at.js';
 import { migration031 } from './031-inbox-board-foundations.js';
+import { migration032 } from './032-sessions-last-outbound.js';
 
 export interface Migration {
   version: number;
@@ -64,6 +65,7 @@ const migrations: Migration[] = [
   migration029,
   migration030,
   migration031,
+  migration032,
 ];
 
 export function runMigrations(db: Database.Database): void {

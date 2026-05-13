@@ -9,7 +9,7 @@
  */
 import type Database from 'better-sqlite3';
 
-import { getRunningSessions, getActiveSessions, createPendingQuestion } from './db/sessions.js';
+import { bumpLastOutbound, getRunningSessions, getActiveSessions, createPendingQuestion } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
 import { getMessagingGroupByPlatform } from './db/messaging-groups.js';
@@ -220,6 +220,29 @@ async function pollSweep(): Promise<void> {
   setTimeout(pollSweep, SWEEP_POLL_MS);
 }
 
+/**
+ * Granular kind tag for the inbox board. For `chat-sdk` messages, the raw
+ * `messages_out.kind` is just `chat-sdk` — too coarse for the dashboard to
+ * tell "agent asked you a question" from "agent posted a streaming status".
+ * Returning `chat-sdk:<content.type>` (or plain `chat-sdk` if the payload
+ * doesn't carry a type) gives the inbox a single string to compare against.
+ *
+ * Anything that fails to parse falls back to the raw `msg.kind` — the inbox
+ * treats unknown tags as plain outbound activity, which is the safe default.
+ */
+function outboundKindTag(msg: { kind: string; content: string }): string {
+  if (msg.kind !== 'chat-sdk') return msg.kind;
+  try {
+    const parsed = JSON.parse(msg.content) as unknown;
+    if (parsed && typeof parsed === 'object' && typeof (parsed as { type?: unknown }).type === 'string') {
+      return `chat-sdk:${(parsed as { type: string }).type}`;
+    }
+  } catch {
+    /* malformed JSON — fall through */
+  }
+  return 'chat-sdk';
+}
+
 export async function deliverSessionMessages(session: Session): Promise<void> {
   // Reject re-entry from a concurrent poll on the same session — see the
   // comment on inflightDeliveries above.
@@ -291,6 +314,19 @@ async function drainSession(session: Session): Promise<void> {
         // ahead of the human and silently unblock a gated command.
         if (!result.deferAck) {
           markDelivered(inDb, msg.id, result.platformMsgId ?? null);
+          // Mirror the outbound timestamp into the central sessions row so
+          // the inbox board can compute attention-state without opening
+          // every per-session outbound.db. The `kind` tag is granular for
+          // chat-sdk so the "needs me without an attached task" rule
+          // (ask_question → no inbound since) reduces to a column compare.
+          try {
+            bumpLastOutbound(session.id, outboundKindTag(msg));
+          } catch (err) {
+            log.warn('bumpLastOutbound failed', {
+              sessionId: session.id,
+              err: err instanceof Error ? err.message : String(err),
+            });
+          }
         }
         deliveryAttempts.delete(msg.id);
 
