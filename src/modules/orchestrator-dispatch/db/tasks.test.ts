@@ -61,6 +61,7 @@ function makeTask(overrides: Partial<Omit<Task, 'created_at'>> = {}): Omit<Task,
     surface_mode: 'pending',
     needs_input: 0,
     steer_question: null,
+    archived_at: null,
     ...overrides,
   };
 }

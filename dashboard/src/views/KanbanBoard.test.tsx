@@ -32,6 +32,9 @@ vi.mock('../lib/api.js', () => ({
   getTask: vi.fn(),
   postSteer: vi.fn(),
   retryTask: vi.fn(),
+  archiveTask: vi.fn().mockResolvedValue({ task_id: 'spawn-1' }),
+  unarchiveTask: vi.fn().mockResolvedValue({ task_id: 'spawn-1' }),
+  bulkArchive: vi.fn().mockResolvedValue({ archived: 0 }),
 }));
 
 import { KanbanBoard } from './KanbanBoard.js';
@@ -172,10 +175,51 @@ describe('KanbanBoard', () => {
     const { container } = render(
       <KanbanBoard authMe={mockAuthMe} route="board" onRouteChange={noop} />
     );
-    expect(screen.getByRole('heading', { name: /spawn board/i })).toBeInTheDocument();
     expect(container.querySelector('.nc-col-head.attention')).toBeTruthy();
     expect(container.querySelector('.nc-col-head.working')).toBeTruthy();
     expect(container.querySelector('.nc-col-head.done')).toBeTruthy();
+  });
+
+  it('renders a dismiss button on terminal cards that calls archiveTask', async () => {
+    const { archiveTask } = await import('../lib/api.js');
+    vi.mocked(useSWR).mockReturnValue({
+      data: { tasks: [task({ task_id: 'spawn-fail', status: 'failed' })] },
+      mutate: vi.fn(),
+    } as unknown as ReturnType<typeof useSWR>);
+
+    render(<KanbanBoard authMe={mockAuthMe} route="board" onRouteChange={noop} />);
+    const dismiss = screen.getByRole('button', { name: /dismiss task/i });
+    await userEvent.click(dismiss);
+    expect(vi.mocked(archiveTask)).toHaveBeenCalledWith('spawn-fail');
+  });
+
+  it('does not render dismiss button on running tasks', () => {
+    vi.mocked(useSWR).mockReturnValue({
+      data: { tasks: [task({ status: 'running' })] },
+      mutate: vi.fn(),
+    } as unknown as ReturnType<typeof useSWR>);
+
+    render(<KanbanBoard authMe={mockAuthMe} route="board" onRouteChange={noop} />);
+    expect(screen.queryByRole('button', { name: /dismiss task/i })).toBeNull();
+  });
+
+  it('Show archived toggle flips SWR fetch to include_archived=1', async () => {
+    const { listTasks } = await import('../lib/api.js');
+    vi.mocked(useSWR).mockImplementation((_key, fetcher) => {
+      // call the fetcher so we can assert what listTasks was invoked with
+      if (typeof fetcher === 'function') {
+        void (fetcher as () => Promise<unknown>)();
+      }
+      return { data: { tasks: [] }, mutate: vi.fn() } as unknown as ReturnType<typeof useSWR>;
+    });
+
+    render(<KanbanBoard authMe={mockAuthMe} route="board" onRouteChange={noop} />);
+    vi.mocked(listTasks).mockClear();
+    await userEvent.click(screen.getByRole('checkbox', { name: /show archived/i }));
+    // After the toggle, the SWR key change re-invokes the fetcher with include_archived
+    expect(vi.mocked(listTasks)).toHaveBeenCalledWith(
+      expect.objectContaining({ include_archived: true }),
+    );
   });
 
   it('group title shows "Agent Board" by default and the group name when filter is selected', async () => {

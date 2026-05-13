@@ -15,6 +15,8 @@ export interface TaskSummary {
   needs_input?: number;
   /** Optional one-line summary of what the worker is asking for. */
   steer_question?: string | null;
+  /** ISO timestamp when an operator dismissed this task from the board; null = visible. */
+  archived_at?: string | null;
 }
 
 // Matches backend src/dashboard/api/tasks.ts TranscriptEntry exactly.
@@ -113,13 +115,14 @@ export async function exchangeToken(token: string): Promise<ExchangeResponse> {
 }
 
 export async function listTasks(
-  filter?: { status?: string; limit?: number; before?: string; group_id?: string }
+  filter?: { status?: string; limit?: number; before?: string; group_id?: string; include_archived?: boolean }
 ): Promise<TaskListResponse> {
   const params = new URLSearchParams();
   if (filter?.status) params.set('status', filter.status);
   if (filter?.limit != null) params.set('limit', String(filter.limit));
   if (filter?.before) params.set('before', filter.before);
   if (filter?.group_id) params.set('group_id', filter.group_id);
+  if (filter?.include_archived) params.set('include_archived', '1');
   const qs = params.toString();
   return apiFetch<TaskListResponse>(`/dashboard/api/tasks${qs ? `?${qs}` : ''}`);
 }
@@ -170,4 +173,41 @@ export async function retryTask(taskId: string): Promise<RetryResponse> {
     `/dashboard/api/tasks/${encodeURIComponent(taskId)}/retry`,
     { method: 'POST' }
   );
+}
+
+export interface ArchiveResponse {
+  task_id: string;
+  archived_at?: string;
+}
+
+export async function archiveTask(taskId: string): Promise<ArchiveResponse> {
+  return apiFetch<ArchiveResponse>(
+    `/dashboard/api/tasks/${encodeURIComponent(taskId)}/archive`,
+    { method: 'POST' },
+  );
+}
+
+export async function unarchiveTask(taskId: string): Promise<ArchiveResponse> {
+  return apiFetch<ArchiveResponse>(
+    `/dashboard/api/tasks/${encodeURIComponent(taskId)}/unarchive`,
+    { method: 'POST' },
+  );
+}
+
+export interface BulkArchiveResponse {
+  archived: number;
+}
+
+/** Mirrors backend `TerminalTaskStatus` in `src/modules/orchestrator-dispatch/db/tasks.ts`. */
+export type TerminalTaskStatus = 'failed' | 'completed' | 'cancelled';
+
+export async function bulkArchive(
+  status: TerminalTaskStatus,
+  group_id: string,
+): Promise<BulkArchiveResponse> {
+  return apiFetch<BulkArchiveResponse>('/dashboard/api/tasks/bulk-archive', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ status, group_id }),
+  });
 }

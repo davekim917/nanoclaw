@@ -158,6 +158,34 @@ describe('tasksListHandler — D3', () => {
     expect(body.tasks).toEqual([]);
     expect(body.cursor).toBeNull();
   });
+
+  it('default view excludes archived tasks', async () => {
+    insertTask('t1', 'ag-1', 'sess-1', 'completed');
+    insertTask('t2', 'ag-1', 'sess-1', 'completed');
+    getDb().prepare(`UPDATE tasks SET archived_at = ? WHERE task_id = 't2'`).run(now());
+
+    const ctx = makeCtx('u1', { no_filter: true });
+    const resp = await tasksListHandler(makeReq(), {}, ctx);
+    const body = (await resp!.json()) as { tasks: Array<{ task_id: string }> };
+    expect(body.tasks.map((t) => t.task_id)).toEqual(['t1']);
+  });
+
+  it('include_archived=1 surfaces dismissed tasks', async () => {
+    insertTask('t1', 'ag-1', 'sess-1', 'completed');
+    insertTask('t2', 'ag-1', 'sess-1', 'completed');
+    getDb().prepare(`UPDATE tasks SET archived_at = ? WHERE task_id = 't2'`).run(now());
+
+    const ctx = makeCtx('u1', { no_filter: true });
+    const resp = await tasksListHandler(
+      makeReq('http://localhost/dashboard/api/tasks?include_archived=1'),
+      {},
+      ctx,
+    );
+    const body = (await resp!.json()) as { tasks: Array<{ task_id: string; archived_at: string | null }> };
+    expect(body.tasks.length).toBe(2);
+    const t2 = body.tasks.find((t) => t.task_id === 't2');
+    expect(t2!.archived_at).not.toBeNull();
+  });
 });
 
 describe('tasksDetailHandler — D3', () => {

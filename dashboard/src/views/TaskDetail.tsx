@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import useSWR from 'swr';
-import { getTask, postSteer, retryTask } from '../lib/api.js';
+import { getTask, postSteer, retryTask, archiveTask, unarchiveTask } from '../lib/api.js';
 import { subscribe } from '../lib/sse.ts';
 import { renderMarkdown } from '../lib/markdown.js';
 import {
@@ -207,6 +207,28 @@ export const TaskDetail: React.FC<TaskDetailProps> = ({
               {retrying ? 'Re-spawning…' : '↻ Retry task'}
             </button>
           )}
+          {(task.status === 'failed' ||
+            task.status === 'completed' ||
+            task.status === 'cancelled') &&
+            (task.archived_at ? (
+              <button
+                className="nc-btn ghost"
+                onClick={() => {
+                  void unarchiveTask(taskId).finally(() => void mutate());
+                }}
+              >
+                ↩ Unarchive
+              </button>
+            ) : (
+              <button
+                className="nc-btn ghost"
+                onClick={() => {
+                  void archiveTask(taskId).finally(() => void mutate());
+                }}
+              >
+                × Dismiss
+              </button>
+            ))}
         </div>
         {retryAdmittedKey && (
           <div className="nc-success">

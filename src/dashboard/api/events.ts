@@ -24,8 +24,21 @@ export interface InboundMessagePayload {
 }
 
 export interface TaskEventPayload {
-  task_id: string;
-  kind: 'admit' | 'status_change' | 'progress' | 'complete' | 'failed' | 'cancel' | 'needs_input';
+  // null for whole-group events (e.g., bulk_archived) where there's no
+  // single task id worth singling out — SWR consumers should treat null as
+  // "invalidate the whole list, this group changed."
+  task_id: string | null;
+  kind:
+    | 'admit'
+    | 'status_change'
+    | 'progress'
+    | 'complete'
+    | 'failed'
+    | 'cancel'
+    | 'needs_input'
+    | 'archived'
+    | 'unarchived'
+    | 'bulk_archived';
   agent_group_id: string;
   [key: string]: unknown;
 }

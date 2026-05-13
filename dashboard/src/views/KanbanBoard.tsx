@@ -1,6 +1,6 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState, useCallback, useMemo } from 'react';
 import useSWR from 'swr';
-import { listTasks, listGroups } from '../lib/api.js';
+import { listTasks, listGroups, archiveTask, unarchiveTask, bulkArchive } from '../lib/api.js';
 import { subscribe, startSSE } from '../lib/sse.ts';
 import {
   extractGoal,
@@ -25,6 +25,17 @@ interface KanbanBoardProps {
 type FilterId = 'all' | 'needs' | 'run' | 'done';
 const MOBILE_QUERY = '(max-width: 899px)';
 
+interface BoardActions {
+  onArchive: (taskId: string) => void;
+  onUnarchive: (taskId: string) => void;
+  onBulkClearFailed: () => void;
+  showArchived: boolean;
+  setShowArchived: (v: boolean) => void;
+  // Bulk endpoint requires a concrete group_id — the button hides when the
+  // operator is looking across all visible groups.
+  canBulkClearFailed: boolean;
+}
+
 export const KanbanBoard: React.FC<KanbanBoardProps> = ({
   authMe,
   route,
@@ -35,14 +46,21 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
     authMe.scopes.allowed_group_ids,
     authMe.scopes.no_filter,
   );
+  const [showArchived, setShowArchived] = useState(false);
 
-  // SWR key includes the group filter so switching groups triggers a refetch
-  // through the existing cache instead of muting+remounting.
-  const tasksKey = ['/dashboard/api/tasks', groupFilter] as const;
+  // SWR key includes the group filter + archive toggle so toggling either
+  // triggers a refetch through the existing cache instead of muting+remounting.
+  const tasksKey = ['/dashboard/api/tasks', groupFilter, showArchived] as const;
   const { data, mutate } = useSWR(
     tasksKey,
-    () => listTasks(groupFilter === 'all' ? {} : { group_id: groupFilter }),
-    { refreshInterval: 0 },
+    () =>
+      listTasks({
+        ...(groupFilter === 'all' ? {} : { group_id: groupFilter }),
+        ...(showArchived ? { include_archived: true } : {}),
+      }),
+    // dedupingInterval caps refetch storm from rapid SSE bursts (e.g.,
+    // dismissing 5 cards in 2 seconds emits 5 task_events → 1 refetch).
+    { refreshInterval: 0, dedupingInterval: 500 },
   );
   const { data: groupsData } = useSWR('/dashboard/api/groups', () => listGroups(), {
     refreshInterval: 0,
@@ -51,6 +69,43 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
 
   const invalidate = useCallback(() => { void mutate(); }, [mutate]);
   useEffect(() => subscribe('task_event', invalidate), [invalidate]);
+
+  const onArchive = useCallback(
+    async (taskId: string) => {
+      try {
+        await archiveTask(taskId);
+      } catch {
+        // soft failure — next refetch will reconcile, no toast lib in tree yet
+      } finally {
+        void mutate();
+      }
+    },
+    [mutate],
+  );
+  const onUnarchive = useCallback(
+    async (taskId: string) => {
+      try {
+        await unarchiveTask(taskId);
+      } catch {
+        // ignore
+      } finally {
+        void mutate();
+      }
+    },
+    [mutate],
+  );
+  const onBulkClearFailed = useCallback(async () => {
+    if (groupFilter === 'all') return;
+    const ok = window.confirm('Archive every failed task in this group?');
+    if (!ok) return;
+    try {
+      await bulkArchive('failed', groupFilter);
+    } catch {
+      // ignore
+    } finally {
+      void mutate();
+    }
+  }, [groupFilter, mutate]);
 
   const [isMobile, setIsMobile] = useState(
     () => window.matchMedia(MOBILE_QUERY).matches
@@ -78,6 +133,20 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
       .sort()
       .pop() ?? new Date().toISOString();
 
+  // Memoize so future `React.memo`-wrapped descendants don't churn on
+  // identity alone — callbacks are already stable via useCallback.
+  const boardActions: BoardActions = useMemo(
+    () => ({
+      onArchive,
+      onUnarchive,
+      onBulkClearFailed,
+      showArchived,
+      setShowArchived,
+      canBulkClearFailed: groupFilter !== 'all',
+    }),
+    [onArchive, onUnarchive, onBulkClearFailed, showArchived, groupFilter],
+  );
+
   return isMobile ? (
     <MobileBoard
       tasks={tasks}
@@ -91,6 +160,7 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
       groups={groups}
       groupFilter={groupFilter}
       onGroupFilter={setGroupFilter}
+      actions={boardActions}
     />
   ) : (
     <DesktopBoard
@@ -102,6 +172,7 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
       groups={groups}
       groupFilter={groupFilter}
       onGroupFilter={setGroupFilter}
+      actions={boardActions}
     />
   );
 };
@@ -198,6 +269,55 @@ function BreakdownCell({
   );
 }
 
+function ShowArchivedToggle({ actions }: { actions: BoardActions }) {
+  return (
+    <label className="nc-archive-toggle">
+      <input
+        type="checkbox"
+        checked={actions.showArchived}
+        onChange={(e) => actions.setShowArchived(e.target.checked)}
+      />
+      <span>Show archived</span>
+    </label>
+  );
+}
+
+function BulkClearFailedButton({
+  actions,
+  failedCount,
+  label = `Clear failed (${failedCount})`,
+}: {
+  actions: BoardActions;
+  failedCount: number;
+  label?: string;
+}) {
+  if (!actions.canBulkClearFailed || failedCount <= 0) return null;
+  return (
+    <button type="button" className="nc-btn ghost" onClick={() => actions.onBulkClearFailed()}>
+      {label}
+    </button>
+  );
+}
+
+function ArchiveToolbar({
+  filter,
+  actions,
+  failedCount,
+}: {
+  filter: FilterId;
+  actions: BoardActions;
+  failedCount: number;
+}) {
+  return (
+    <div className="nc-archive-toolbar">
+      <ShowArchivedToggle actions={actions} />
+      {filter === 'needs' && (
+        <BulkClearFailedButton actions={actions} failedCount={failedCount} label={`Clear all failed (${failedCount})`} />
+      )}
+    </div>
+  );
+}
+
 function FilterChips({
   value,
   onChange,
@@ -270,17 +390,30 @@ function StatusGlyph({
   );
 }
 
-function TaskCard({ task }: { task: TaskSummary }) {
+function TaskCard({
+  task,
+  onArchive,
+  onUnarchive,
+}: {
+  task: TaskSummary;
+  onArchive?: ((taskId: string) => void) | undefined;
+  onUnarchive?: ((taskId: string) => void) | undefined;
+}) {
   const goal = extractGoal(task.task_content);
   const linearId = extractLinearId(task.task_content);
   const phase = extractPhase(task.last_progress_message);
   const needsInput = !!task.needs_input;
+  const isArchived = task.archived_at != null;
   const heat = heatOf({
     status: task.status,
     admitted_at: task.admitted_at,
     needs_input: task.needs_input,
   });
   const colourClass = needsInput ? 'needs' : task.status;
+  // Terminal states can be archived; pending/running cannot (operator would
+  // be hiding an in-flight task from themselves).
+  const isTerminal =
+    task.status === 'failed' || task.status === 'completed' || task.status === 'cancelled';
 
   const onClick = () => {
     location.hash = `#/task/${task.task_id}`;
@@ -292,9 +425,18 @@ function TaskCard({ task }: { task: TaskSummary }) {
     }
   };
 
+  const handleArchive = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (onArchive) onArchive(task.task_id);
+  };
+  const handleUnarchive = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (onUnarchive) onUnarchive(task.task_id);
+  };
+
   return (
     <div
-      className={`nc-card ${colourClass} heat-${heat}`}
+      className={`nc-card ${colourClass} heat-${heat}${isArchived ? ' archived' : ''}`}
       role="button"
       tabIndex={0}
       onClick={onClick}
@@ -306,6 +448,28 @@ function TaskCard({ task }: { task: TaskSummary }) {
         <span className="sep">·</span>
         <span className="age">{relAge(task.admitted_at)} ago</span>
         {linearId && <span className="linear-id">{linearId}</span>}
+        {isArchived && onUnarchive && (
+          <button
+            type="button"
+            className="nc-card-dismiss"
+            aria-label="Unarchive task"
+            onClick={handleUnarchive}
+            title="Restore to board"
+          >
+            ↩
+          </button>
+        )}
+        {!isArchived && isTerminal && onArchive && (
+          <button
+            type="button"
+            className="nc-card-dismiss"
+            aria-label="Dismiss task"
+            onClick={handleArchive}
+            title="Dismiss from board"
+          >
+            ×
+          </button>
+        )}
       </div>
       <div className="nc-card-goal">{goal}</div>
       {task.status === 'running' && !needsInput && phase !== null && (
@@ -351,6 +515,7 @@ function MobileBoard({
   groups,
   groupFilter,
   onGroupFilter,
+  actions,
 }: {
   tasks: TaskSummary[];
   visible: TaskSummary[];
@@ -363,6 +528,7 @@ function MobileBoard({
   groups: GroupSummary[];
   groupFilter: GroupFilter;
   onGroupFilter: (next: GroupFilter) => void;
+  actions: BoardActions;
 }) {
   const g = streamGroups(visible);
   const [foldOpen, setFoldOpen] = useState(false);
@@ -382,21 +548,54 @@ function MobileBoard({
         onGroupFilter={onGroupFilter}
       />
       <FilterChips value={filter} onChange={onFilter} counts={counts} />
+      <ArchiveToolbar
+        filter={filter}
+        actions={actions}
+        failedCount={counts.failed}
+      />
 
       <div className="nc-stream">
         {filter === 'all' && (
           <>
-            <Section title="Needs you" tasks={g.needsMe} hideWhenEmpty />
-            <Section title="Working" tasks={g.running} hideWhenEmpty />
-            <Section title="Queued" tasks={g.pending} hideWhenEmpty />
+            <Section
+              title="Needs you"
+              tasks={g.needsMe}
+              hideWhenEmpty
+              onArchive={actions.onArchive}
+              onUnarchive={actions.onUnarchive}
+            />
+            <Section
+              title="Working"
+              tasks={g.running}
+              hideWhenEmpty
+              onArchive={actions.onArchive}
+              onUnarchive={actions.onUnarchive}
+            />
+            <Section
+              title="Queued"
+              tasks={g.pending}
+              hideWhenEmpty
+              onArchive={actions.onArchive}
+              onUnarchive={actions.onUnarchive}
+            />
             {g.done.length > 0 && (
               <>
                 <SectionLabel title="Done · last 24h" count={g.done.length} />
                 {doneVisible.map((t) => (
-                  <TaskCard key={t.task_id} task={t} />
+                  <TaskCard
+                    key={t.task_id}
+                    task={t}
+                    onArchive={actions.onArchive}
+                    onUnarchive={actions.onUnarchive}
+                  />
                 ))}
                 {coldVisible.map((t) => (
-                  <TaskCard key={t.task_id} task={t} />
+                  <TaskCard
+                    key={t.task_id}
+                    task={t}
+                    onArchive={actions.onArchive}
+                    onUnarchive={actions.onUnarchive}
+                  />
                 ))}
                 {moreCount > 0 && (
                   <button
@@ -415,7 +614,14 @@ function MobileBoard({
         )}
 
         {filter !== 'all' && visible.length > 0 &&
-          visible.map((t) => <TaskCard key={t.task_id} task={t} />)}
+          visible.map((t) => (
+            <TaskCard
+              key={t.task_id}
+              task={t}
+              onArchive={actions.onArchive}
+              onUnarchive={actions.onUnarchive}
+            />
+          ))}
 
         {filter !== 'all' && visible.length === 0 && (
           <div className="nc-empty">no tasks match this filter</div>
@@ -436,17 +642,21 @@ function Section({
   title,
   tasks,
   hideWhenEmpty,
+  onArchive,
+  onUnarchive,
 }: {
   title: string;
   tasks: TaskSummary[];
   hideWhenEmpty?: boolean;
+  onArchive?: ((taskId: string) => void) | undefined;
+  onUnarchive?: ((taskId: string) => void) | undefined;
 }) {
   if (hideWhenEmpty && tasks.length === 0) return null;
   return (
     <>
       <SectionLabel title={title} count={tasks.length} />
       {tasks.map((t) => (
-        <TaskCard key={t.task_id} task={t} />
+        <TaskCard key={t.task_id} task={t} onArchive={onArchive} onUnarchive={onUnarchive} />
       ))}
     </>
   );
@@ -467,12 +677,12 @@ function SectionLabel({ title, count }: { title: string; count: number }) {
 function DesktopBoard({
   tasks,
   counts,
-  route,
   onRouteChange,
   lastActivityIso,
   groups,
   groupFilter,
   onGroupFilter,
+  actions,
 }: {
   tasks: TaskSummary[];
   counts: Counts;
@@ -482,6 +692,7 @@ function DesktopBoard({
   groups: GroupSummary[];
   groupFilter: GroupFilter;
   onGroupFilter: (next: GroupFilter) => void;
+  actions: BoardActions;
 }) {
   const needsMe = tasks.filter((t) => t.status === 'failed');
   const working = tasks.filter((t) => t.status === 'running');
@@ -531,13 +742,11 @@ function DesktopBoard({
         </div>
         <div>
           <div className="nc-desktop-toolbar">
-            <div style={{ display: 'flex', alignItems: 'baseline' }}>
-              <h1>Spawn Board</h1>
-              <span className="sub">/dashboard/board</span>
-            </div>
+            <ShowArchivedToggle actions={actions} />
             <div className="right">
+              <BulkClearFailedButton actions={actions} failedCount={counts.failed} />
               <button
-                className={`nc-btn ghost ${route === 'sessions' ? '' : ''}`}
+                className="nc-btn ghost"
                 onClick={() => onRouteChange('sessions')}
               >
                 Sessions
@@ -570,7 +779,12 @@ function DesktopBoard({
               </div>
             )}
             {needsMe.map((t) => (
-              <TaskCard key={t.task_id} task={t} />
+              <TaskCard
+                key={t.task_id}
+                task={t}
+                onArchive={actions.onArchive}
+                onUnarchive={actions.onUnarchive}
+              />
             ))}
           </div>
         </div>
@@ -590,12 +804,22 @@ function DesktopBoard({
               </div>
             )}
             {working.map((t) => (
-              <TaskCard key={t.task_id} task={t} />
+              <TaskCard
+                key={t.task_id}
+                task={t}
+                onArchive={actions.onArchive}
+                onUnarchive={actions.onUnarchive}
+              />
             ))}
             {pending.length > 0 && (
               <>
                 {pendingOpen && pending.map((t) => (
-                  <TaskCard key={t.task_id} task={t} />
+                  <TaskCard
+                    key={t.task_id}
+                    task={t}
+                    onArchive={actions.onArchive}
+                    onUnarchive={actions.onUnarchive}
+                  />
                 ))}
                 <button
                   className="nc-fold"
@@ -623,12 +847,22 @@ function DesktopBoard({
               </div>
             )}
             {done.map((t) => (
-              <TaskCard key={t.task_id} task={t} />
+              <TaskCard
+                key={t.task_id}
+                task={t}
+                onArchive={actions.onArchive}
+                onUnarchive={actions.onUnarchive}
+              />
             ))}
             {cancelled.length > 0 && (
               <>
                 {cancelledOpen && cancelled.map((t) => (
-                  <TaskCard key={t.task_id} task={t} />
+                  <TaskCard
+                    key={t.task_id}
+                    task={t}
+                    onArchive={actions.onArchive}
+                    onUnarchive={actions.onUnarchive}
+                  />
                 ))}
                 <button
                   className="nc-fold"

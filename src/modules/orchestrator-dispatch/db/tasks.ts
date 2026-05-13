@@ -2,6 +2,8 @@ import { getDb } from '../../../db/connection.js';
 import { log } from '../../../log.js';
 import type { Session } from '../../../types.js';
 
+export type TerminalTaskStatus = 'completed' | 'failed' | 'cancelled';
+
 export interface Task {
   task_id: string;
   idempotency_key: string;
@@ -30,6 +32,7 @@ export interface Task {
   surface_mode: 'pending' | 'native_thread' | 'headless';
   needs_input: number;
   steer_question: string | null;
+  archived_at: string | null;
   created_at: string;
 }
 
@@ -43,8 +46,8 @@ const ALLOWED_ARTIFACT_COLUMNS = new Set([
   'started_at',
 ]);
 
-type TaskInsert = Omit<Task, 'created_at' | 'needs_input' | 'steer_question'> &
-  Partial<Pick<Task, 'needs_input' | 'steer_question'>>;
+type TaskInsert = Omit<Task, 'created_at' | 'needs_input' | 'steer_question' | 'archived_at'> &
+  Partial<Pick<Task, 'needs_input' | 'steer_question' | 'archived_at'>>;
 
 export function insertTaskAtomic(row: TaskInsert): Task | null {
   const createdAt = new Date().toISOString();
@@ -52,6 +55,7 @@ export function insertTaskAtomic(row: TaskInsert): Task | null {
     ...row,
     needs_input: row.needs_input ?? 0,
     steer_question: row.steer_question ?? null,
+    archived_at: row.archived_at ?? null,
     created_at: createdAt,
   };
   const result = getDb()
@@ -64,7 +68,7 @@ export function insertTaskAtomic(row: TaskInsert): Task | null {
         started_at, completed_at, failed_at, cancelled_at, last_progress_at,
         last_progress_message, fail_reason, result_summary,
         dispatch_completion_attempts, completion_lease_at, surface_mode,
-        needs_input, steer_question, created_at
+        needs_input, steer_question, archived_at, created_at
       ) VALUES (
         @task_id, @idempotency_key, @parent_session_id, @parent_agent_group_id,
         @parent_messaging_group_id, @child_session_id,
@@ -73,7 +77,7 @@ export function insertTaskAtomic(row: TaskInsert): Task | null {
         @started_at, @completed_at, @failed_at, @cancelled_at, @last_progress_at,
         @last_progress_message, @fail_reason, @result_summary,
         @dispatch_completion_attempts, @completion_lease_at, @surface_mode,
-        @needs_input, @steer_question, @created_at
+        @needs_input, @steer_question, @archived_at, @created_at
       )
       ON CONFLICT(parent_session_id, idempotency_key) DO NOTHING
       RETURNING *`,
@@ -133,7 +137,7 @@ export function updateArtifactColumn(taskId: string, columnName: string, value: 
 
 export function transitionToTerminal(
   taskId: string,
-  terminalStatus: 'completed' | 'failed' | 'cancelled',
+  terminalStatus: TerminalTaskStatus,
   extraCols: Record<string, unknown>,
 ): boolean {
   const sets: string[] = [`status = ?`];
@@ -243,6 +247,68 @@ export function clearNeedsInput(taskId: string): void {
           AND needs_input = 1`,
     )
     .run(taskId);
+}
+
+/**
+ * Soft-delete a task from the dashboard's default view. Returns true when
+ * the row actually flipped (was not already archived) — callers gate SSE
+ * emits on this so a no-op archive doesn't trigger refetches.
+ */
+export function archiveTaskById(taskId: string, archivedAt: string = new Date().toISOString()): boolean {
+  const result = getDb()
+    .prepare(`UPDATE tasks SET archived_at = ? WHERE task_id = ? AND archived_at IS NULL`)
+    .run(archivedAt, taskId);
+  return result.changes > 0;
+}
+
+export function unarchiveTaskById(taskId: string): void {
+  getDb().prepare(`UPDATE tasks SET archived_at = NULL WHERE task_id = ?`).run(taskId);
+}
+
+/**
+ * Bulk archive: every non-archived task in `groupId` with the given
+ * terminal status. Returns the row count. Callers (dashboard bulk endpoint,
+ * scope-checked by the handler) are responsible for verifying the caller
+ * is admin-of `groupId` before invoking.
+ */
+export function bulkArchiveByGroupAndStatus(
+  groupId: string,
+  status: TerminalTaskStatus,
+  archivedAt: string = new Date().toISOString(),
+): number {
+  const result = getDb()
+    .prepare(
+      `UPDATE tasks
+          SET archived_at = ?
+        WHERE parent_agent_group_id = ?
+          AND status = ?
+          AND archived_at IS NULL`,
+    )
+    .run(archivedAt, groupId, status);
+  return result.changes;
+}
+
+/**
+ * Sweep helper used by `host-sweep.ts:autoArchiveOldCompleted`. Archives
+ * every completed task whose `completed_at < cutoffIso` and isn't already
+ * archived. Failed tasks are intentionally excluded — operator must
+ * dismiss those explicitly.
+ */
+export function autoArchiveCompletedBefore(
+  cutoffIso: string,
+  archivedAt: string = new Date().toISOString(),
+): number {
+  const result = getDb()
+    .prepare(
+      `UPDATE tasks
+          SET archived_at = ?
+        WHERE status = 'completed'
+          AND archived_at IS NULL
+          AND completed_at IS NOT NULL
+          AND completed_at < ?`,
+    )
+    .run(archivedAt, cutoffIso);
+  return result.changes;
 }
 
 export function countActiveByParent(parentSessionId: string): number {

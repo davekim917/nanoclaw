@@ -26,6 +26,7 @@ interface TaskSummary {
   task_content: string;
   needs_input: number;
   steer_question: string | null;
+  archived_at: string | null;
 }
 
 interface TranscriptEntry {
@@ -172,6 +173,9 @@ export const tasksListHandler: AuthHandler = async (req, _params, ctx) => {
   const limit = Math.min(parseInt(url.searchParams.get('limit') ?? '50', 10) || 50, 200);
   const before = url.searchParams.get('before');
   const groupIdFilter = url.searchParams.get('group_id');
+  // Default board hides archived rows; toggle to see operator-dismissed
+  // history. `=0` and `=` both fall back to the default-hide behavior.
+  const includeArchived = url.searchParams.get('include_archived') === '1';
 
   const { where: scopeWhere, groupIds } = buildScopeFilter(ctx);
 
@@ -203,13 +207,18 @@ export const tasksListHandler: AuthHandler = async (req, _params, ctx) => {
     conditions.push('admitted_at < ?');
     values.push(before);
   }
+  if (!includeArchived) {
+    conditions.push('archived_at IS NULL');
+  }
 
   // task_content is required by the KanbanBoard card render (post-build QA fix MF-5);
   // omitting it caused TypeError on truncate(undefined.length) in the SPA.
   // needs_input + steer_question drive the "Needs you" lane on the dashboard.
+  // archived_at is included so the SPA can render an "Archived" badge when
+  // viewing with `include_archived=1`.
   const sql = `SELECT task_id, status, parent_session_id, parent_agent_group_id, admitted_at,
                       last_progress_message, fail_reason, surface_mode, task_content,
-                      needs_input, steer_question
+                      needs_input, steer_question, archived_at
                FROM tasks
                WHERE ${conditions.join(' AND ')}
                ORDER BY admitted_at DESC

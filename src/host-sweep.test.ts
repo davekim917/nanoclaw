@@ -16,6 +16,7 @@ import {
   SPAWN_GRACE_MS,
   _resetStuckProcessingRowsForTesting,
   _sweepTaskWatchdogForTesting,
+  autoArchiveOldCompleted,
   decideStuckAction,
   parseSqliteUtc,
   pruneSteerIdempotency,
@@ -39,11 +40,15 @@ const mockHasContainerEverRun = vi.fn();
 const mockGetSession = vi.fn();
 const mockRunReconcilerSweep = vi.fn();
 
-vi.mock('./modules/orchestrator-dispatch/db/tasks.js', () => ({
-  getActiveTasks: (...args: unknown[]) => mockGetActiveTasks(...args),
-  transitionToTerminal: (...args: unknown[]) => mockTransitionToTerminal(...args),
-  getOrphanedTasks: vi.fn().mockReturnValue([]),
-}));
+vi.mock('./modules/orchestrator-dispatch/db/tasks.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('./modules/orchestrator-dispatch/db/tasks.js')>();
+  return {
+    ...real,
+    getActiveTasks: (...args: unknown[]) => mockGetActiveTasks(...args),
+    transitionToTerminal: (...args: unknown[]) => mockTransitionToTerminal(...args),
+    getOrphanedTasks: vi.fn().mockReturnValue([]),
+  };
+});
 
 vi.mock('./modules/orchestrator-dispatch/db/agent-group-capabilities.js', () => ({
   getCapabilityConfig: (...args: unknown[]) => mockGetCapabilityConfig(...args),
@@ -867,5 +872,85 @@ describe('pruneSteerIdempotency — D7', () => {
   it('test_sweep_calls_prune: pruneSteerIdempotency is exported and callable', () => {
     // Verify the function is exported and can be called without error on an empty table
     expect(() => pruneSteerIdempotency()).not.toThrow();
+  });
+});
+
+describe('autoArchiveOldCompleted', () => {
+  beforeEach(() => {
+    const db = initTestDb();
+    db.pragma('foreign_keys = ON');
+    runMigrations(db);
+    // Seed agent_group + session so task FKs hold
+    getDb()
+      .prepare(
+        "INSERT INTO agent_groups (id, name, folder, agent_provider, created_at) VALUES ('ag-1', 'ag-1', 'ag-1', NULL, datetime('now'))",
+      )
+      .run();
+    getDb()
+      .prepare("INSERT INTO sessions (id, agent_group_id, created_at) VALUES ('sess-1', 'ag-1', datetime('now'))")
+      .run();
+  });
+  afterEach(() => {
+    closeDb();
+  });
+
+  function insertCompletedTask(taskId: string, completedAt: string): void {
+    getDb()
+      .prepare(
+        `INSERT INTO tasks (
+          task_id, idempotency_key, parent_session_id, parent_agent_group_id,
+          status, task_content, request_hash, admitted_at, completed_at,
+          dispatch_completion_attempts, surface_mode, needs_input, created_at
+        ) VALUES (?, ?, 'sess-1', 'ag-1', 'completed', '{}', 'h', ?, ?, 0, 'headless', 0, ?)`,
+      )
+      .run(taskId, taskId, completedAt, completedAt, completedAt);
+  }
+
+  it('archives completed tasks older than 24 hours', () => {
+    insertCompletedTask('old', new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString());
+    insertCompletedTask('fresh', new Date(Date.now() - 1 * 60 * 60 * 1000).toISOString());
+
+    autoArchiveOldCompleted();
+
+    const rows = getDb()
+      .prepare('SELECT task_id, archived_at FROM tasks ORDER BY task_id')
+      .all() as Array<{ task_id: string; archived_at: string | null }>;
+    const byId = Object.fromEntries(rows.map((r) => [r.task_id, r.archived_at]));
+    expect(byId['old']).not.toBeNull();
+    expect(byId['fresh']).toBeNull();
+  });
+
+  it('does not re-archive already-archived rows', () => {
+    const original = '2026-05-01T00:00:00.000Z';
+    insertCompletedTask('t1', new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString());
+    getDb().prepare(`UPDATE tasks SET archived_at = ? WHERE task_id = 't1'`).run(original);
+
+    autoArchiveOldCompleted();
+
+    const row = getDb().prepare('SELECT archived_at FROM tasks WHERE task_id = ?').get('t1') as { archived_at: string };
+    expect(row.archived_at).toBe(original);
+  });
+
+  it('leaves failed tasks alone regardless of age', () => {
+    getDb()
+      .prepare(
+        `INSERT INTO tasks (
+          task_id, idempotency_key, parent_session_id, parent_agent_group_id,
+          status, task_content, request_hash, admitted_at, failed_at,
+          dispatch_completion_attempts, surface_mode, needs_input, created_at
+        ) VALUES ('f1', 'f1', 'sess-1', 'ag-1', 'failed', '{}', 'h', ?, ?, 0, 'headless', 0, ?)`,
+      )
+      .run(
+        new Date(Date.now() - 72 * 60 * 60 * 1000).toISOString(),
+        new Date(Date.now() - 72 * 60 * 60 * 1000).toISOString(),
+        new Date(Date.now() - 72 * 60 * 60 * 1000).toISOString(),
+      );
+
+    autoArchiveOldCompleted();
+
+    const row = getDb().prepare('SELECT archived_at FROM tasks WHERE task_id = ?').get('f1') as {
+      archived_at: string | null;
+    };
+    expect(row.archived_at).toBeNull();
   });
 });

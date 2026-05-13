@@ -45,6 +45,7 @@ function baseTask(overrides: Partial<Task> = {}): Task {
     surface_mode: 'headless',
     needs_input: 0,
     steer_question: null,
+    archived_at: null,
     created_at: new Date(BASE - 5 * 60 * 1000).toISOString(),
     ...overrides,
   };

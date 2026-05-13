@@ -33,7 +33,7 @@ export const AuthGate: React.FC<AuthGateProps> = ({ onAuthenticated }) => {
 
   return (
     <div role="main" style={{ maxWidth: 400, margin: '80px auto', padding: '0 16px' }}>
-      <h1 style={{ fontSize: 22, marginBottom: 8, marginTop: 0 }}>Spawn Board</h1>
+      <h1 style={{ fontSize: 22, marginBottom: 8, marginTop: 0 }}>Agent Board</h1>
       <p style={{ marginBottom: 20, color: 'var(--text-secondary)' }}>
         Paste your one-time access token to continue.
       </p>
