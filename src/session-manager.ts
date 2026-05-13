@@ -425,6 +425,22 @@ export async function writeSessionMessage(
   }
 
   updateSession(sessionId, { last_active: new Date().toISOString() });
+
+  // Push an inbox-board SSE notification — the session's last_inbound_at and
+  // attention_state just changed. Lazy-imported because the dashboard module
+  // can't be loaded eagerly here (init order between session-manager and the
+  // dashboard wiring), and a missing module must not break message routing.
+  void import('./dashboard/api/events.js')
+    .then((mod) =>
+      mod.emitSessionEvent({
+        session_id: sessionId,
+        agent_group_id: agentGroupId,
+        kind: 'inbound',
+      }),
+    )
+    .catch(() => {
+      /* dashboard module not initialized — tests + early boot */
+    });
 }
 
 /**
@@ -705,17 +721,43 @@ export function clearOutbox(agentGroupId: string, sessionId: string, messageId: 
   }
 }
 
+/**
+ * Push an inbox-board `session_event` for a container-state transition.
+ * Looks up agent_group_id by sessionId because the three markContainer*
+ * helpers are called from places that don't all carry that context.
+ * Best-effort: lookup miss or unavailable dashboard module → no emit.
+ */
+function _emitContainerStateEvent(sessionId: string, containerStatus: 'running' | 'idle' | 'stopped'): void {
+  const sess = getSession(sessionId);
+  if (!sess) return;
+  void import('./dashboard/api/events.js')
+    .then((mod) =>
+      mod.emitSessionEvent({
+        session_id: sessionId,
+        agent_group_id: sess.agent_group_id,
+        kind: 'container_state',
+        container_status: containerStatus,
+      }),
+    )
+    .catch(() => {
+      /* dashboard module not initialized */
+    });
+}
+
 /** Mark a container as running for a session. */
 export function markContainerRunning(sessionId: string): void {
   updateSession(sessionId, { container_status: 'running', last_active: new Date().toISOString() });
+  _emitContainerStateEvent(sessionId, 'running');
 }
 
 /** Mark a container as idle for a session. */
 export function markContainerIdle(sessionId: string): void {
   updateSession(sessionId, { container_status: 'idle' });
+  _emitContainerStateEvent(sessionId, 'idle');
 }
 
 /** Mark a container as stopped for a session. */
 export function markContainerStopped(sessionId: string): void {
   updateSession(sessionId, { container_status: 'stopped' });
+  _emitContainerStateEvent(sessionId, 'stopped');
 }

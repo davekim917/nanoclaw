@@ -5,10 +5,21 @@ import { getChannelAdapter } from '../../channels/channel-registry.js';
 import { getDb } from '../../db/connection.js';
 // Lazy import to avoid module-init cycle (events.ts imports nothing from dispatch.ts).
 // The import() call is memoized by Node's module cache after the first resolution.
+//
+// TS quirk: `Parameters<typeof emitDashboardEvent>` only resolves to the LAST
+// overload of an overloaded function, so a rest-spread signature here would
+// silently force callers into one specific event kind. Re-declare each
+// overload explicitly so the type-system honors all of them.
+import type {
+  InboundMessagePayload as _IMP,
+  TaskEventPayload as _TEP,
+  SessionEventPayload as _SEP,
+} from '../../dashboard/api/events.js';
 let _emitDashboardEvent: (typeof import('../../dashboard/api/events.js'))['emitDashboardEvent'] | null = null;
-async function lazyEmit(
-  ...args: Parameters<(typeof import('../../dashboard/api/events.js'))['emitDashboardEvent']>
-): Promise<void> {
+async function lazyEmit(kind: 'inbound_message', payload: _IMP): Promise<void>;
+async function lazyEmit(kind: 'task_event', payload: _TEP): Promise<void>;
+async function lazyEmit(kind: 'session_event', payload: _SEP): Promise<void>;
+async function lazyEmit(kind: string, payload: _IMP | _TEP | _SEP): Promise<void> {
   if (!_emitDashboardEvent) {
     try {
       const mod = await import('../../dashboard/api/events.js');
@@ -18,7 +29,7 @@ async function lazyEmit(
     }
   }
   try {
-    (_emitDashboardEvent as (...a: typeof args) => void)(...args);
+    (_emitDashboardEvent as (k: string, p: unknown) => void)(kind, payload);
   } catch {
     // non-fatal
   }

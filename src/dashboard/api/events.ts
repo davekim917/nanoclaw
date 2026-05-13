@@ -14,7 +14,7 @@ import Database from 'better-sqlite3';
 import type { AuthedRequestContext, AuthHandler } from '../router.js';
 import { log } from '../../log.js';
 
-export type DashboardEventKind = 'inbound_message' | 'task_event';
+export type DashboardEventKind = 'inbound_message' | 'task_event' | 'session_event';
 
 export interface InboundMessagePayload {
   task_id: string;
@@ -43,23 +43,72 @@ export interface TaskEventPayload {
   [key: string]: unknown;
 }
 
+/**
+ * Push-channel signal that something on the inbox-board surface changed for
+ * one session. Consumers treat it as "invalidate this session's row" — they
+ * re-fetch /dashboard/api/sessions to get the new attention_state. The
+ * granular `kind` tag is here so a future client can refresh a single card
+ * instead of the whole list, but the v1 inbox just invalidates SWR.
+ *
+ *   - inbound          — router wrote a new row into the session's
+ *                        inbound.db. The session's last_inbound_at moved.
+ *   - outbound         — host successfully delivered an outbound row;
+ *                        last_outbound_at + kind moved. `outbound_kind`
+ *                        carries the granular tag from delivery.ts so a
+ *                        chat-sdk:ask_question fan-out can be detected
+ *                        without re-fetching.
+ *   - container_state  — heartbeat-derived state transition (running→idle,
+ *                        idle→stopped, etc.). `container_status` carries
+ *                        the new state.
+ */
+export interface SessionEventPayload {
+  session_id: string;
+  agent_group_id: string;
+  kind: 'inbound' | 'outbound' | 'container_state';
+  outbound_kind?: string;
+  container_status?: 'running' | 'idle' | 'stopped';
+}
+
 export function emitDashboardEvent(kind: 'inbound_message', payload: InboundMessagePayload): void;
 export function emitDashboardEvent(kind: 'task_event', payload: TaskEventPayload): void;
-export function emitDashboardEvent(kind: DashboardEventKind, payload: InboundMessagePayload | TaskEventPayload): void {
+export function emitDashboardEvent(kind: 'session_event', payload: SessionEventPayload): void;
+export function emitDashboardEvent(
+  kind: DashboardEventKind,
+  payload: InboundMessagePayload | TaskEventPayload | SessionEventPayload,
+): void {
   const frame = `event: ${kind}\ndata: ${JSON.stringify(payload)}\n\n`;
   for (const conns of connectionsByUser.values()) {
     for (const conn of conns) {
-      const parentGroupId =
-        kind === 'inbound_message'
-          ? (payload as InboundMessagePayload).parent_agent_group_id
-          : (payload as TaskEventPayload).agent_group_id;
-      if (!_scopeAllows(conn.scopes, parentGroupId)) continue;
+      let groupId: string;
+      if (kind === 'inbound_message') {
+        groupId = (payload as InboundMessagePayload).parent_agent_group_id;
+      } else if (kind === 'task_event') {
+        groupId = (payload as TaskEventPayload).agent_group_id;
+      } else {
+        groupId = (payload as SessionEventPayload).agent_group_id;
+      }
+      if (!_scopeAllows(conn.scopes, groupId)) continue;
       try {
         conn.res.write(frame);
       } catch {
         // ignore write errors — close handler cleans up
       }
     }
+  }
+}
+
+/**
+ * Convenience wrapper for the three session-event emit sites (inbound write,
+ * outbound delivery, container-state change). Wraps the emit in a try/catch
+ * because the dashboard module isn't always initialized in unit tests, and a
+ * thrown SSE error from a hot delivery loop is far worse than a missed
+ * push (clients poll every 30s as a backstop).
+ */
+export function emitSessionEvent(payload: SessionEventPayload): void {
+  try {
+    emitDashboardEvent('session_event', payload);
+  } catch {
+    // never let a push failure bubble up into the core message path
   }
 }
 

@@ -27,7 +27,7 @@ import { normalizeOptions } from './channels/ask-question.js';
 import { clearOutbox, openInboundDb, openOutboundDb, readOutboxFiles } from './session-manager.js';
 import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typing/index.js';
 import { flagNeedsInput, getTaskByChildSession } from './modules/orchestrator-dispatch/db/tasks.js';
-import { emitDashboardEvent } from './dashboard/api/events.js';
+import { emitDashboardEvent, emitSessionEvent } from './dashboard/api/events.js';
 import type { OutboundFile } from './channels/adapter.js';
 import type { Session } from './types.js';
 
@@ -319,14 +319,23 @@ async function drainSession(session: Session): Promise<void> {
           // every per-session outbound.db. The `kind` tag is granular for
           // chat-sdk so the "needs me without an attached task" rule
           // (ask_question → no inbound since) reduces to a column compare.
+          const tag = outboundKindTag(msg);
           try {
-            bumpLastOutbound(session.id, outboundKindTag(msg));
+            bumpLastOutbound(session.id, tag);
           } catch (err) {
             log.warn('bumpLastOutbound failed', {
               sessionId: session.id,
               err: err instanceof Error ? err.message : String(err),
             });
           }
+          // Push the inbox-board SSE so an operator watching the inbox
+          // sees the new last_outbound_at without waiting for poll.
+          emitSessionEvent({
+            session_id: session.id,
+            agent_group_id: session.agent_group_id,
+            kind: 'outbound',
+            outbound_kind: tag,
+          });
         }
         deliveryAttempts.delete(msg.id);
 

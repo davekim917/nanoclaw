@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import http from 'http';
 
-import { startSSEFeed, stopSSEFeed, emitDashboardEvent, eventsHandler } from './events.js';
+import { startSSEFeed, stopSSEFeed, emitDashboardEvent, emitSessionEvent, eventsHandler } from './events.js';
 import type { AuthedRequestContext } from '../router.js';
 
 // ── chokidar mock ────────────────────────────────────────────────────────────
@@ -212,5 +212,55 @@ describe('SSE feed — D1', () => {
     const req = new Request('http://localhost/dashboard/api/events');
     const result = await eventsHandler(req, {}, ctx);
     expect(result).toBeNull();
+  });
+
+  it('emits session_event scoped by agent_group_id', async () => {
+    startSSEFeed();
+    const { nodeRes: res1 } = await openConnection('u1', { allowed_group_ids: ['ag-1'] });
+    const { nodeRes: res2 } = await openConnection('u2', { allowed_group_ids: ['ag-2'] });
+    const { nodeRes: res3 } = await openConnection('u3', { no_filter: true });
+
+    emitDashboardEvent('session_event', {
+      session_id: 'sess-1',
+      agent_group_id: 'ag-1',
+      kind: 'outbound',
+      outbound_kind: 'chat-sdk:ask_question',
+    });
+
+    expect(vi.mocked(res1.write)).toHaveBeenCalledWith(expect.stringContaining('session_event'));
+    expect(vi.mocked(res2.write)).not.toHaveBeenCalled();
+    expect(vi.mocked(res3.write)).toHaveBeenCalledWith(expect.stringContaining('chat-sdk:ask_question'));
+  });
+
+  it('emitSessionEvent helper forwards container_state events', async () => {
+    startSSEFeed();
+    const { nodeRes } = await openConnection('u1', { no_filter: true });
+
+    emitSessionEvent({
+      session_id: 'sess-running',
+      agent_group_id: 'ag-x',
+      kind: 'container_state',
+      container_status: 'stopped',
+    });
+
+    const calls = vi.mocked(nodeRes.write).mock.calls;
+    expect(calls.some((c) => String(c[0]).includes('container_state'))).toBe(true);
+    expect(calls.some((c) => String(c[0]).includes('"container_status":"stopped"'))).toBe(true);
+  });
+
+  it('emitSessionEvent swallows downstream errors so the helper never throws', async () => {
+    startSSEFeed();
+    const { nodeRes } = await openConnection('u1', { no_filter: true });
+    vi.mocked(nodeRes.write).mockImplementation(() => {
+      throw new Error('socket closed');
+    });
+    // Must not throw — the helper guards against this in hot paths
+    expect(() =>
+      emitSessionEvent({
+        session_id: 'sess-err',
+        agent_group_id: 'ag-x',
+        kind: 'inbound',
+      }),
+    ).not.toThrow();
   });
 });
