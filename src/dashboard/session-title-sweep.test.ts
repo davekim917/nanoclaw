@@ -309,9 +309,9 @@ describe('runSessionTitleSweep', () => {
     // The failure stamps a recent `title_generated_at`; the candidate
     // query filters out rows with title_generated_at within the cooldown
     // window. Next sweep tick should not pick this session.
-    const row = getDb()
-      .prepare('SELECT title_generated_at FROM sessions WHERE id = ?')
-      .get('sess-fail') as { title_generated_at: string | null };
+    const row = getDb().prepare('SELECT title_generated_at FROM sessions WHERE id = ?').get('sess-fail') as {
+      title_generated_at: string | null;
+    };
     expect(row.title_generated_at).toBeTruthy();
 
     const backendSecond = vi.fn(async () => 'should not run');

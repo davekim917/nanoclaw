@@ -377,11 +377,7 @@ describe('sessionsHandler — D4', () => {
       throw new Error('ENOENT');
     });
     const ctx = makeCtx('u1', { no_filter: true });
-    const resp = await sessionsHandler(
-      makeReq('http://localhost/dashboard/api/sessions?group_id=ag-1'),
-      {},
-      ctx,
-    );
+    const resp = await sessionsHandler(makeReq('http://localhost/dashboard/api/sessions?group_id=ag-1'), {}, ctx);
     const body = (await resp!.json()) as {
       sessions: Array<{ session_id: string; attention_state: string }>;
     };
