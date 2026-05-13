@@ -13,17 +13,23 @@ import {
   type Counts,
 } from '../lib/derive.js';
 import { useGroupFilter, type GroupFilter } from '../lib/use-group-filter.js';
-import { GroupTitle } from './GroupTitle.js';
+import {
+  BoardBrand,
+  BoardFrame,
+  MobileRouteNav,
+  ShowArchivedToggle as ShellShowArchivedToggle,
+  useIsMobile,
+  type BoardRoute,
+} from './BoardShell.js';
 import type { AuthMe, GroupSummary, TaskSummary } from '../lib/api.js';
 
 interface KanbanBoardProps {
   authMe: AuthMe;
-  route: 'board' | 'sessions';
-  onRouteChange: (r: 'board' | 'sessions') => void;
+  route: BoardRoute;
+  onRouteChange: (r: BoardRoute) => void;
 }
 
 type FilterId = 'all' | 'needs' | 'run' | 'done';
-const MOBILE_QUERY = '(max-width: 899px)';
 
 interface BoardActions {
   onArchive: (taskId: string) => void;
@@ -107,15 +113,7 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
     }
   }, [groupFilter, mutate]);
 
-  const [isMobile, setIsMobile] = useState(
-    () => window.matchMedia(MOBILE_QUERY).matches
-  );
-  useEffect(() => {
-    const mq = window.matchMedia(MOBILE_QUERY);
-    const handler = (e: MediaQueryListEvent) => setIsMobile(e.matches);
-    mq.addEventListener('change', handler);
-    return () => mq.removeEventListener('change', handler);
-  }, []);
+  const isMobile = useIsMobile();
 
   const [filter, setFilter] = useState<FilterId>('all');
   const tasks = data?.tasks ?? [];
@@ -213,29 +211,8 @@ function PulseHeader({
   return (
     <header className="nc-pulse">
       <div className="nc-pulse-top">
-        <div className="nc-brand">
-          <span className="mark" aria-hidden="true"></span>
-          <GroupTitle
-            groups={groups}
-            selectedId={groupFilter}
-            onChange={onGroupFilter}
-            fallback="Agent Board"
-          />
-        </div>
-        <nav className="nc-pulse-actions">
-          <button
-            className={`nav-link ${route === 'board' ? 'active' : ''}`}
-            onClick={() => onRouteChange('board')}
-          >
-            Board
-          </button>
-          <button
-            className={`nav-link ${route === 'sessions' ? 'active' : ''}`}
-            onClick={() => onRouteChange('sessions')}
-          >
-            Sessions
-          </button>
-        </nav>
+        <BoardBrand groups={groups} groupFilter={groupFilter} onGroupFilter={onGroupFilter} />
+        <MobileRouteNav route={route} onRouteChange={onRouteChange} />
       </div>
       <div className="nc-pulse-grid">
         <div className="nc-pulse-bigcount">
@@ -282,16 +259,7 @@ function BreakdownCell({
 }
 
 function ShowArchivedToggle({ actions }: { actions: BoardActions }) {
-  return (
-    <label className="nc-archive-toggle">
-      <input
-        type="checkbox"
-        checked={actions.showArchived}
-        onChange={(e) => actions.setShowArchived(e.target.checked)}
-      />
-      <span>Show archived</span>
-    </label>
-  );
+  return <ShellShowArchivedToggle showArchived={actions.showArchived} onChange={actions.setShowArchived} />;
 }
 
 function BulkClearFailedButton({
@@ -551,7 +519,7 @@ function MobileBoard({
   const moreCount = g.done.length - doneVisible.length + (foldOpen ? 0 : g.cold.length);
 
   return (
-    <div className="nc-frame nc-mobile">
+    <BoardFrame isMobile={true}>
       <PulseHeader
         counts={counts}
         lastActivityIso={lastActivityIso}
@@ -648,7 +616,7 @@ function MobileBoard({
           </div>
         )}
       </div>
-    </div>
+    </BoardFrame>
   );
 }
 
@@ -720,18 +688,10 @@ function DesktopBoard({
   const [cancelledOpen, setCancelledOpen] = useState(false);
 
   return (
-    <div className="nc-frame nc-desktop">
+    <BoardFrame isMobile={false}>
       <div className="nc-desktop-top">
         <div className="nc-desktop-pulse">
-          <div className="nc-brand">
-            <span className="mark" aria-hidden="true"></span>
-            <GroupTitle
-              groups={groups}
-              selectedId={groupFilter}
-              onChange={onGroupFilter}
-              fallback="Agent Board"
-            />
-          </div>
+          <BoardBrand groups={groups} groupFilter={groupFilter} onGroupFilter={onGroupFilter} />
           <div className="bigcount">
             <span>{counts.total}</span>
             <span className="lbl">
@@ -891,7 +851,7 @@ function DesktopBoard({
           </div>
         </div>
       </div>
-    </div>
+    </BoardFrame>
   );
 }
 
