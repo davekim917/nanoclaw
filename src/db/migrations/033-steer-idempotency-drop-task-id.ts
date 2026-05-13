@@ -22,6 +22,16 @@ export const migration033: Migration = {
   name: 'steer-idempotency-drop-task-id',
   up: (db: Database.Database) => {
     db.exec(`
+      -- Defensive backfill before DROP. Migration 031 ran the same UPDATE
+      -- but if 031 deployed standalone for any window and the old DAO
+      -- kept writing task_id without target_type, those rows would land
+      -- with target_type/target_id NULL and the rebuild INSERT below
+      -- would silently lose them. A second UPDATE is cheap and idempotent.
+      UPDATE steer_idempotency
+         SET target_type = COALESCE(target_type, 'task'),
+             target_id   = COALESCE(target_id, task_id)
+       WHERE target_type IS NULL OR target_id IS NULL;
+
       ALTER TABLE steer_idempotency DROP COLUMN task_id;
 
       -- Rebuild to enforce NOT NULL on target_type/target_id. This pattern

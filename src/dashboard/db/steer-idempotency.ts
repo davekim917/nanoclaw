@@ -72,9 +72,17 @@ export function reserveIdempotency(
       throw new IdempotencyConflict('target');
     }
     if (existing.request_hash !== requestHash) throw new IdempotencyConflict('request_hash');
+    // Row truth for target_type/target_id wins over whatever shape the
+    // legacy cached_response JSON used — pre-C5 deploys persisted
+    // `{task_id, message_id, echo_status}` only. Overriding from the
+    // existing row fixes those replays without a JSON migration sweep.
     const cached =
       existing.status === 'applied' && existing.cached_response
-        ? (JSON.parse(existing.cached_response) as SteerResponse)
+        ? ({
+            ...(JSON.parse(existing.cached_response) as Record<string, unknown>),
+            target_type: existing.target_type,
+            target_id: existing.target_id,
+          } as SteerResponse)
         : undefined;
     return {
       id: existing.id,

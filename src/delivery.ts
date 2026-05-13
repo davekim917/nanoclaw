@@ -240,7 +240,9 @@ function outboundKindTag(msg: { kind: string; content: string }): string {
   } catch {
     /* malformed JSON — fall through */
   }
-  return 'chat-sdk';
+  // Keep the `chat-sdk:*` namespace contract so inbox consumers can
+  // pattern-match by prefix; a bare `chat-sdk` would split the schema.
+  return 'chat-sdk:unknown';
 }
 
 export async function deliverSessionMessages(session: Session): Promise<void> {
@@ -316,26 +318,30 @@ async function drainSession(session: Session): Promise<void> {
           markDelivered(inDb, msg.id, result.platformMsgId ?? null);
           // Mirror the outbound timestamp into the central sessions row so
           // the inbox board can compute attention-state without opening
-          // every per-session outbound.db. The `kind` tag is granular for
-          // chat-sdk so the "needs me without an attached task" rule
-          // (ask_question → no inbound since) reduces to a column compare.
-          const tag = outboundKindTag(msg);
-          try {
-            bumpLastOutbound(session.id, tag);
-          } catch (err) {
-            log.warn('bumpLastOutbound failed', {
-              sessionId: session.id,
-              err: err instanceof Error ? err.message : String(err),
+          // every per-session outbound.db. Only bump for messages that
+          // actually went to a platform — system actions handled in-host
+          // and agent-to-agent internal traffic aren't operator-visible
+          // and would otherwise keep dormant sessions out of the stale
+          // lane forever. Mirrors the typing-indicator gate below.
+          if (msg.kind !== 'system' && msg.channel_type !== 'agent') {
+            const tag = outboundKindTag(msg);
+            try {
+              bumpLastOutbound(session.id, tag);
+            } catch (err) {
+              log.warn('bumpLastOutbound failed', {
+                sessionId: session.id,
+                err: err instanceof Error ? err.message : String(err),
+              });
+            }
+            // Push the inbox-board SSE so an operator watching the inbox
+            // sees the new last_outbound_at without waiting for poll.
+            emitSessionEvent({
+              session_id: session.id,
+              agent_group_id: session.agent_group_id,
+              kind: 'outbound',
+              outbound_kind: tag,
             });
           }
-          // Push the inbox-board SSE so an operator watching the inbox
-          // sees the new last_outbound_at without waiting for poll.
-          emitSessionEvent({
-            session_id: session.id,
-            agent_group_id: session.agent_group_id,
-            kind: 'outbound',
-            outbound_kind: tag,
-          });
         }
         deliveryAttempts.delete(msg.id);
 

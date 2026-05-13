@@ -182,6 +182,21 @@ async function _writeAndEchoSteer(
   }
 
   if (reserved.status === 'applied' && reserved.cached) {
+    // Echo-recovery on idempotent replay. If the original run crashed
+    // between `applyIdempotency` and the setImmediate echo schedule,
+    // `echo_attempted` stays 0 and the operator's Slack/Discord thread
+    // never sees the message. claim+fire here closes that window —
+    // single CAS guarantees we don't double-echo if the original
+    // setImmediate already ran.
+    if (!reserved.echoAttempted && claimEchoAttempted(reserved.id)) {
+      setImmediate(async () => {
+        try {
+          await _fireEchoAsync(exec, trimmedText, ctx);
+        } catch {
+          // outer catch covers sync throws — claim already committed
+        }
+      });
+    }
     return { status: 202, body: _responseShapeForTarget(reserved.cached) };
   }
 

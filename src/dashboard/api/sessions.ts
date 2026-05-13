@@ -164,22 +164,28 @@ function deriveAttentionState(
   const nowMs = Date.now();
   const lastInboundMs = row.last_active ? Date.parse(row.last_active) : 0;
   const lastOutboundMs = row.last_outbound_at ? Date.parse(row.last_outbound_at) : 0;
-  const lastActivityMs = Math.max(lastInboundMs, lastOutboundMs);
 
-  // 1) needs_me
+  // 1) needs_me — task-driven or chat-sdk question waiting on operator.
   if (row.attached_task_needs_input === 1) return 'needs_me';
   if (row.last_outbound_kind === 'chat-sdk:ask_question' && lastInboundMs < lastOutboundMs) {
     return 'needs_me';
   }
 
-  // 2) active
+  // 2) active — current heartbeat or in-flight task; otherwise fall back to
+  // "any activity within 5min" using the broader timestamp so a recent
+  // outbound flush keeps the session in `active`.
   if (containerStatus === 'running') return 'active';
   if (row.attached_task_status === 'running') return 'active';
   if (hasRecurrence) return 'active';
+  const lastActivityMs = Math.max(lastInboundMs, lastOutboundMs);
   if (lastActivityMs && nowMs - lastActivityMs < FIVE_MIN_MS) return 'active';
 
-  // 3) idle vs stale
-  const ageMs = lastActivityMs ? nowMs - lastActivityMs : Infinity;
+  // 3) idle vs stale — the boundary is operator engagement, not agent
+  // activity, so `last_inbound_at` (== `sessions.last_active`) is the
+  // authoritative timestamp. An agent that's posting status messages into
+  // a dormant thread should still surface as `stale` for the operator
+  // after 24h of silence on their side.
+  const ageMs = lastInboundMs ? nowMs - lastInboundMs : Infinity;
   if (ageMs >= ONE_DAY_MS) return 'stale';
   return 'idle';
 }
@@ -241,10 +247,14 @@ export const sessionsHandler: AuthHandler = async (req, _params, ctx) => {
            t.needs_input      AS attached_task_needs_input
       FROM sessions s
  LEFT JOIN (
+              -- Only in-flight tasks count as "attached" for the inbox.
+              -- A long-completed task should not keep its child session
+              -- forever pinned to its status / needs_input fields.
               SELECT task_id, child_session_id, status, needs_input, admitted_at,
                      ROW_NUMBER() OVER (PARTITION BY child_session_id ORDER BY admitted_at DESC) AS rn
                 FROM tasks
                WHERE child_session_id IS NOT NULL
+                 AND status IN ('pending', 'running')
             ) t ON t.child_session_id = s.id AND t.rn = 1
      WHERE ${conditions.join(' AND ')}
   ORDER BY COALESCE(s.last_outbound_at, s.last_active, s.created_at) DESC
@@ -266,16 +276,14 @@ export const sessionsHandler: AuthHandler = async (req, _params, ctx) => {
 
   const sessions: SessionSummary[] = rows.map((row) => {
     const containerStatus = deriveContainerStatus(row.agent_group_id, row.id);
-    // Only probe inbound.db for would-be-stale rows. The recurrence check is
-    // purely a stale-false-positive guard, so paying the SQLite-open cost on
-    // every row in a 33-session list would dwarf the value.
+    // Only probe inbound.db for would-be-stale rows. Stale boundary is now
+    // operator-engagement (last_inbound) not max(in,out) — matches
+    // deriveAttentionState below.
     const lastInboundMs = row.last_active ? Date.parse(row.last_active) : 0;
-    const lastOutboundMs = row.last_outbound_at ? Date.parse(row.last_outbound_at) : 0;
-    const lastActivityMs = Math.max(lastInboundMs, lastOutboundMs);
     const couldBeStale =
       containerStatus !== 'running' &&
       row.attached_task_status !== 'running' &&
-      (!lastActivityMs || Date.now() - lastActivityMs >= ONE_DAY_MS);
+      (!lastInboundMs || Date.now() - lastInboundMs >= ONE_DAY_MS);
     const hasRecurrence = couldBeStale ? hasPendingRecurrence(row.agent_group_id, row.id, DATA_DIR) : false;
     const attentionState = deriveAttentionState(row, containerStatus, hasRecurrence);
     return {

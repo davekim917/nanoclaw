@@ -251,6 +251,56 @@ describe('sessionsHandler — D4', () => {
     expect(child?.attached_task_id).toBe('task-1');
   });
 
+  it('attached_task is null when the most recent task is terminal (completed/failed/cancelled)', async () => {
+    insertSession('parent-sess-old', 'ag-1');
+    insertSession('child-sess-old', 'ag-1');
+    insertAttachedTask({
+      taskId: 'task-done',
+      childSessId: 'child-sess-old',
+      parentSessId: 'parent-sess-old',
+      agentGroupId: 'ag-1',
+      status: 'completed',
+    });
+    const ctx = makeCtx('u1', { no_filter: true });
+    const resp = await sessionsHandler(makeReq('http://localhost/dashboard/api/sessions?group_id=ag-1'), {}, ctx);
+    const body = (await resp!.json()) as {
+      sessions: Array<{ session_id: string; attached_task_id: string | null }>;
+    };
+    const child = body.sessions.find((s) => s.session_id === 'child-sess-old');
+    expect(child?.attached_task_id).toBeNull();
+  });
+
+  it('stale boundary uses inbound timestamp only (recent outbound alone does NOT prevent stale)', async () => {
+    insertSession('sess-out-only', 'ag-1');
+    const longAgo = new Date(Date.now() - 48 * 3600_000).toISOString();
+    const recent = new Date(Date.now() - 60_000).toISOString();
+    setSessionFields('sess-out-only', { last_active: longAgo, last_outbound_at: recent });
+    vi.mocked(fs.statSync).mockImplementation(() => {
+      throw new Error('ENOENT');
+    });
+    const ctx = makeCtx('u1', { no_filter: true });
+    const resp = await sessionsHandler(makeReq(), {}, ctx);
+    const body = (await resp!.json()) as { sessions: Array<{ session_id: string; attention_state: string }> };
+    // Recent outbound (1 min) trips the 5-min "active" fallback even
+    // though inbound is 48h old. Active wins; stale is gated on inbound.
+    expect(body.sessions[0]?.attention_state).toBe('active');
+
+    // Now move outbound back too — both timestamps 48h old. Stale wins.
+    setSessionFields('sess-out-only', { last_outbound_at: longAgo });
+    const resp2 = await sessionsHandler(makeReq(), {}, ctx);
+    const body2 = (await resp2!.json()) as { sessions: Array<{ session_id: string; attention_state: string }> };
+    expect(body2.sessions[0]?.attention_state).toBe('stale');
+
+    // Outbound 23h old + inbound 48h old: outbound doesn't reset the
+    // 24h stale boundary (only inbound does), so this should fall back
+    // to `stale` rather than `idle`.
+    const outbound23h = new Date(Date.now() - 23 * 3600_000).toISOString();
+    setSessionFields('sess-out-only', { last_outbound_at: outbound23h });
+    const resp3 = await sessionsHandler(makeReq(), {}, ctx);
+    const body3 = (await resp3!.json()) as { sessions: Array<{ session_id: string; attention_state: string }> };
+    expect(body3.sessions[0]?.attention_state).toBe('stale');
+  });
+
   it('attention_state: needs_me when last outbound was chat-sdk:ask_question with no inbound since', async () => {
     insertSession('sess-q', 'ag-1');
     setSessionFields('sess-q', {
