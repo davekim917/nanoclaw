@@ -317,6 +317,23 @@ a:hover { color: var(--fg); }
   50% { opacity: 1; }
 }
 
+/* Sessions raw-list debug link in the pulse-meta strip. Demoted from
+   primary nav in C8 — kept as a small affordance for ops/debug. */
+.nc-debug-link {
+  background: transparent;
+  border: 1px solid var(--bd-2);
+  color: var(--fg-3);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+  text-transform: lowercase;
+  padding: 2px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.nc-debug-link:hover { color: var(--fg-2); border-color: var(--bd-1); }
+.nc-debug-link.active { color: var(--fg-1); border-color: var(--st-running); }
+
 /* ─── Filter chips */
 .nc-chips {
   display: flex; gap: 6px;

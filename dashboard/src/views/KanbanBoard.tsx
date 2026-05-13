@@ -202,8 +202,8 @@ function PulseHeader({
 }: {
   counts: Counts;
   lastActivityIso: string;
-  route: 'board' | 'sessions';
-  onRouteChange: (r: 'board' | 'sessions') => void;
+  route: BoardRoute;
+  onRouteChange: (r: BoardRoute) => void;
   groups: GroupSummary[];
   groupFilter: GroupFilter;
   onGroupFilter: (next: GroupFilter) => void;
@@ -504,8 +504,8 @@ function MobileBoard({
   failedActionableCount: number;
   filter: FilterId;
   onFilter: (v: FilterId) => void;
-  route: 'board' | 'sessions';
-  onRouteChange: (r: 'board' | 'sessions') => void;
+  route: BoardRoute;
+  onRouteChange: (r: BoardRoute) => void;
   lastActivityIso: string;
   groups: GroupSummary[];
   groupFilter: GroupFilter;
@@ -670,8 +670,8 @@ function DesktopBoard({
   tasks: TaskSummary[];
   counts: Counts;
   failedActionableCount: number;
-  route: 'board' | 'sessions';
-  onRouteChange: (r: 'board' | 'sessions') => void;
+  route: BoardRoute;
+  onRouteChange: (r: BoardRoute) => void;
   lastActivityIso: string;
   groups: GroupSummary[];
   groupFilter: GroupFilter;

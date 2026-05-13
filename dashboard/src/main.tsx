@@ -2,27 +2,28 @@ import { useState, useEffect, useCallback } from 'react';
 import { createRoot } from 'react-dom/client';
 import { AuthGate } from './auth/AuthGate.js';
 import { KanbanBoard } from './views/KanbanBoard.js';
+import { InboxBoard } from './views/InboxBoard.js';
 import { TaskDetail } from './views/TaskDetail.js';
 import { SessionList } from './views/SessionList.js';
 import { authMe as fetchAuthMe } from './lib/api.js';
 import { startSSE } from './lib/sse.ts';
 import type { AuthMe } from './lib/api.js';
+import type { BoardRoute } from './views/BoardShell.js';
 import './styles.css';
 
 // Design-tool tweak variant. Switchable classes documented in styles.css.
 const TWEAK_CLASS = 'tw-no-heat tw-no-phasebar tw-no-grid';
 
-function parseHash(): { route: 'board' | 'sessions' | 'task'; taskId?: string } {
+function parseHash(): { route: BoardRoute | 'task'; taskId?: string } {
   const hash = location.hash.slice(1) || '/board';
   if (hash.startsWith('/task/')) return { route: 'task', taskId: hash.slice(6) };
+  if (hash === '/inbox') return { route: 'inbox' };
   if (hash === '/sessions') return { route: 'sessions' };
   return { route: 'board' };
 }
 
 function App() {
-  const [authState, setAuthState] = useState<
-    'loading' | 'unauthenticated' | 'authenticated'
-  >('loading');
+  const [authState, setAuthState] = useState<'loading' | 'unauthenticated' | 'authenticated'>('loading');
   const [me, setMe] = useState<AuthMe | null>(null);
   const [hashState, setHashState] = useState(parseHash);
 
@@ -53,8 +54,10 @@ function App() {
     startSSE();
   }, []);
 
-  const navigate = useCallback((r: 'board' | 'sessions') => {
-    location.hash = r === 'sessions' ? '#/sessions' : '#/board';
+  const navigate = useCallback((r: BoardRoute) => {
+    if (r === 'inbox') location.hash = '#/inbox';
+    else if (r === 'sessions') location.hash = '#/sessions';
+    else location.hash = '#/board';
   }, []);
 
   if (authState === 'loading') {
@@ -86,12 +89,9 @@ function App() {
 
   return (
     <div className={TWEAK_CLASS} style={{ minHeight: '100vh' }}>
-      {hashState.route === 'board' && me && (
-        <KanbanBoard authMe={me} route="board" onRouteChange={navigate} />
-      )}
-      {hashState.route === 'task' && hashState.taskId && me && (
-        <TaskDetail authMe={me} taskId={hashState.taskId} />
-      )}
+      {hashState.route === 'board' && me && <KanbanBoard authMe={me} route="board" onRouteChange={navigate} />}
+      {hashState.route === 'inbox' && me && <InboxBoard authMe={me} route="inbox" onRouteChange={navigate} />}
+      {hashState.route === 'task' && hashState.taskId && me && <TaskDetail authMe={me} taskId={hashState.taskId} />}
       {hashState.route === 'sessions' && me && (
         <SessionList authMe={me} route="sessions" onRouteChange={navigate} />
       )}

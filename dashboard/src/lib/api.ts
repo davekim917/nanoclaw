@@ -45,13 +45,33 @@ export interface TaskDetail extends TaskSummary {
   result_summary?: string | null;
 }
 
+export type AttentionState = 'needs_me' | 'active' | 'idle' | 'stale';
+
 export interface SessionSummary {
   session_id: string;
   agent_group_id: string;
   messaging_group_id: string | null;
   thread_id: string | null;
-  last_active: string | null;
+  // Existing
   container_status: 'idle' | 'running' | 'stale' | 'unknown';
+  // Enriched by the C3 sessions handler — fields are absent on older
+  // backends, hence `?`. The inbox view defaults missing fields to null.
+  title?: string | null;
+  last_inbound_at?: string | null;
+  last_outbound_at?: string | null;
+  last_outbound_kind?: string | null;
+  archived_at?: string | null;
+  has_pending_recurrence?: boolean;
+  attached_task_id?: string | null;
+  attached_task_status?: string | null;
+  attached_task_needs_input?: boolean | null;
+  attention_state?: AttentionState;
+  /**
+   * Legacy alias — pre-C3 SessionList consumers read this directly. The
+   * enriched response still ships it (= last_inbound_at) for back-compat;
+   * new code should prefer `last_inbound_at`.
+   */
+  last_active: string | null;
 }
 
 export interface TaskListResponse {
@@ -144,8 +164,17 @@ export async function getTask(id: string): Promise<TaskDetailResponse> {
   return apiFetch<TaskDetailResponse>(`/dashboard/api/tasks/${encodeURIComponent(id)}`);
 }
 
-export async function listSessions(): Promise<SessionsResponse> {
-  return apiFetch<SessionsResponse>('/dashboard/api/sessions');
+export async function listSessions(filter?: {
+  group_id?: string;
+  include_archived?: boolean;
+  limit?: number;
+}): Promise<SessionsResponse> {
+  const params = new URLSearchParams();
+  if (filter?.group_id) params.append('group_id', filter.group_id);
+  if (filter?.include_archived) params.append('include_archived', '1');
+  if (filter?.limit) params.append('limit', String(filter.limit));
+  const qs = params.toString();
+  return apiFetch<SessionsResponse>(`/dashboard/api/sessions${qs ? `?${qs}` : ''}`);
 }
 
 export async function postSteer(

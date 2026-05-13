@@ -16,7 +16,7 @@ import type { GroupFilter } from '../lib/use-group-filter.js';
  * reordered children. C8 reuses the same primitives without forking them.
  */
 
-export type BoardRoute = 'board' | 'sessions';
+export type BoardRoute = 'board' | 'inbox' | 'sessions';
 
 const MOBILE_QUERY = '(max-width: 899px)';
 
@@ -70,9 +70,13 @@ export function BoardBrand({
 }
 
 /**
- * The Board / Sessions nav rendered in the mobile pulse header. Desktop's
- * "Sessions" affordance lives in the toolbar's right slot today and stays
- * there for this refactor; C8 widens the union to include 'inbox'.
+ * Primary nav (Board / Inbox) for the mobile pulse header. Sessions has
+ * been demoted to a small debug link in the desktop pulse-meta strip;
+ * mobile only surfaces the two primary routes to keep the header tight.
+ *
+ * Active-route highlighting still drives off `route === ...` so the same
+ * component renders correctly on the SessionList route (neither button
+ * active) and on /dashboard/board or /dashboard/inbox.
  */
 export function MobileRouteNav({
   route,
@@ -86,10 +90,35 @@ export function MobileRouteNav({
       <button className={`nav-link ${route === 'board' ? 'active' : ''}`} onClick={() => onRouteChange('board')}>
         Board
       </button>
-      <button className={`nav-link ${route === 'sessions' ? 'active' : ''}`} onClick={() => onRouteChange('sessions')}>
-        Sessions
+      <button className={`nav-link ${route === 'inbox' ? 'active' : ''}`} onClick={() => onRouteChange('inbox')}>
+        Inbox
       </button>
     </nav>
+  );
+}
+
+/**
+ * The "debug → sessions" footer link rendered in the pulse-meta strip on
+ * both layouts. Sessions is the raw row-by-row table view; the inbox board
+ * supersedes it for normal use but the raw view stays accessible for
+ * debugging (e.g., spotting orphaned sessions with no recent activity).
+ */
+export function SessionsDebugLink({
+  route,
+  onRouteChange,
+}: {
+  route: BoardRoute;
+  onRouteChange: (r: BoardRoute) => void;
+}) {
+  return (
+    <button
+      type="button"
+      className={`nc-debug-link ${route === 'sessions' ? 'active' : ''}`}
+      onClick={() => onRouteChange('sessions')}
+      title="Raw sessions table — debug view"
+    >
+      debug · sessions
+    </button>
   );
 }
 

@@ -1,4 +1,4 @@
-export type EventKind = 'task_event' | 'inbound_message';
+export type EventKind = 'task_event' | 'inbound_message' | 'session_event';
 type Handler<T = unknown> = (payload: T) => void;
 
 const subscribers = new Map<EventKind, Set<Handler>>();
@@ -27,6 +27,11 @@ function connect(): void {
   es.addEventListener('inbound_message', (e: MessageEvent) => {
     retryDelay = 1000;
     try { dispatchEvent('inbound_message', JSON.parse(e.data as string)); } catch { /* ignore */ }
+  });
+
+  es.addEventListener('session_event', (e: MessageEvent) => {
+    retryDelay = 1000;
+    try { dispatchEvent('session_event', JSON.parse(e.data as string)); } catch { /* ignore */ }
   });
 
   es.addEventListener('open', () => { retryDelay = 1000; });

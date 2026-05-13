@@ -143,7 +143,9 @@ describe('KanbanBoard', () => {
     await waitFor(() => expect(mutate).toHaveBeenCalled());
   });
 
-  it('nav link click invokes onRouteChange', async () => {
+  it('mobile nav (Board / Inbox) invokes onRouteChange', async () => {
+    // C8: mobile primary nav is now Board + Inbox (Sessions demoted to a
+    // small debug link rendered from the InboxBoard pulse-meta strip).
     const onRouteChange = vi.fn();
     vi.mocked(useSWR).mockReturnValue({
       data: { tasks: [] },
@@ -151,8 +153,8 @@ describe('KanbanBoard', () => {
     } as unknown as ReturnType<typeof useSWR>);
 
     render(<KanbanBoard authMe={mockAuthMe} route="board" onRouteChange={onRouteChange} />);
-    await userEvent.click(screen.getByRole('button', { name: /^Sessions$/i }));
-    expect(onRouteChange).toHaveBeenCalledWith('sessions');
+    await userEvent.click(screen.getByRole('button', { name: /^Inbox$/i }));
+    expect(onRouteChange).toHaveBeenCalledWith('inbox');
   });
 
   it('renders the empty state when no tasks', () => {
