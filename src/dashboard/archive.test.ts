@@ -3,7 +3,13 @@ import http from 'http';
 
 import { closeDb, initTestDb, runMigrations, createAgentGroup, getDb } from '../db/index.js';
 import { insertTaskAtomic } from '../modules/orchestrator-dispatch/db/tasks.js';
-import { archiveHandler, unarchiveHandler, bulkArchiveHandler } from './archive.js';
+import {
+  archiveHandler,
+  unarchiveHandler,
+  bulkArchiveHandler,
+  sessionArchiveHandler,
+  sessionUnarchiveHandler,
+} from './archive.js';
 import type { AuthedRequestContext } from './router.js';
 
 vi.mock('./api/events.js', () => ({
@@ -282,5 +288,122 @@ describe('bulkArchiveHandler', () => {
       ctx,
     );
     expect(resp!.status).toBe(400);
+  });
+});
+
+describe('sessionArchiveHandler / sessionUnarchiveHandler', () => {
+  beforeEach(() => {
+    setupDb();
+    seedAgentGroup('ag-1');
+    seedAgentGroup('ag-2');
+    seedSession();
+    // Seed a second session in a different group for scope tests.
+    getDb()
+      .prepare(
+        "INSERT OR IGNORE INTO sessions (id, agent_group_id, messaging_group_id, status, created_at) VALUES ('sess-other', 'ag-2', NULL, 'active', ?)",
+      )
+      .run(now());
+  });
+
+  afterEach(() => {
+    closeDb();
+    vi.clearAllMocks();
+  });
+
+  it('archives a session, returns archived_at, emits session_event', async () => {
+    const { emitDashboardEvent } = await import('./api/events.js');
+    const ctx = makeCtx({ no_filter: true });
+    const resp = await sessionArchiveHandler(
+      makeReq('http://localhost/dashboard/api/sessions/sess-1/archive'),
+      { id: 'sess-1' },
+      ctx,
+    );
+    expect(resp!.status).toBe(200);
+    const body = (await resp!.json()) as { session_id: string; archived_at: string };
+    expect(body.session_id).toBe('sess-1');
+    expect(body.archived_at).toBeTruthy();
+
+    const row = getDb().prepare('SELECT archived_at FROM sessions WHERE id = ?').get('sess-1') as {
+      archived_at: string | null;
+    };
+    expect(row.archived_at).not.toBeNull();
+
+    expect(vi.mocked(emitDashboardEvent)).toHaveBeenCalledWith(
+      'session_event',
+      expect.objectContaining({ session_id: 'sess-1', kind: 'archived', agent_group_id: 'ag-1' }),
+    );
+  });
+
+  it('§2a — session in another group returns 404 not 403', async () => {
+    const ctx = makeCtx({ allowed_group_ids: ['ag-1'] });
+    const resp = await sessionArchiveHandler(
+      makeReq('http://localhost/dashboard/api/sessions/sess-other/archive'),
+      { id: 'sess-other' },
+      ctx,
+    );
+    expect(resp!.status).toBe(404);
+    const body = (await resp!.json()) as { error: string };
+    expect(body.error).toBe('session_not_found');
+  });
+
+  it('non-admin gets 404 (member role disclose-as-not-found)', async () => {
+    const userRoles = await import('../modules/permissions/db/user-roles.js');
+    vi.mocked(userRoles.hasAdminPrivilege).mockReturnValueOnce(false);
+    const ctx = makeCtx({ allowed_group_ids: ['ag-1'] });
+    const resp = await sessionArchiveHandler(
+      makeReq('http://localhost/dashboard/api/sessions/sess-1/archive'),
+      { id: 'sess-1' },
+      ctx,
+    );
+    expect(resp!.status).toBe(404);
+  });
+
+  it('archiving an already-archived row suppresses the SSE emit', async () => {
+    const { emitDashboardEvent } = await import('./api/events.js');
+    getDb().prepare("UPDATE sessions SET archived_at = ? WHERE id = 'sess-1'").run(now());
+    vi.mocked(emitDashboardEvent).mockClear();
+
+    const ctx = makeCtx({ no_filter: true });
+    const resp = await sessionArchiveHandler(
+      makeReq('http://localhost/dashboard/api/sessions/sess-1/archive'),
+      { id: 'sess-1' },
+      ctx,
+    );
+    expect(resp!.status).toBe(200);
+    expect(vi.mocked(emitDashboardEvent)).not.toHaveBeenCalled();
+  });
+
+  it('unarchives a session, emits session_event with kind=unarchived', async () => {
+    getDb().prepare("UPDATE sessions SET archived_at = ? WHERE id = 'sess-1'").run(now());
+    const { emitDashboardEvent } = await import('./api/events.js');
+    vi.mocked(emitDashboardEvent).mockClear();
+
+    const ctx = makeCtx({ no_filter: true });
+    const resp = await sessionUnarchiveHandler(
+      makeReq('http://localhost/dashboard/api/sessions/sess-1/unarchive'),
+      { id: 'sess-1' },
+      ctx,
+    );
+    expect(resp!.status).toBe(200);
+
+    const row = getDb().prepare('SELECT archived_at FROM sessions WHERE id = ?').get('sess-1') as {
+      archived_at: string | null;
+    };
+    expect(row.archived_at).toBeNull();
+
+    expect(vi.mocked(emitDashboardEvent)).toHaveBeenCalledWith(
+      'session_event',
+      expect.objectContaining({ session_id: 'sess-1', kind: 'unarchived', agent_group_id: 'ag-1' }),
+    );
+  });
+
+  it('unarchive on nonexistent session returns 404', async () => {
+    const ctx = makeCtx({ no_filter: true });
+    const resp = await sessionUnarchiveHandler(
+      makeReq('http://localhost/dashboard/api/sessions/sess-NOPE/unarchive'),
+      { id: 'sess-NOPE' },
+      ctx,
+    );
+    expect(resp!.status).toBe(404);
   });
 });

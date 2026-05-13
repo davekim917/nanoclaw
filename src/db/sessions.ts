@@ -127,6 +127,24 @@ export function deleteSession(id: string): void {
 }
 
 /**
+ * Soft-dismiss a session from the inbox's default view. Returns true when
+ * the row flipped from visible→archived (mirrors `archiveTaskById`'s
+ * change-only contract so callers can gate SSE emits without doing a
+ * second read). Archived sessions still process inbound traffic and run
+ * their containers; archiving is purely an operator-side display flag.
+ */
+export function archiveSessionById(id: string, archivedAt: string = new Date().toISOString()): boolean {
+  const result = getDb()
+    .prepare(`UPDATE sessions SET archived_at = ? WHERE id = ? AND archived_at IS NULL`)
+    .run(archivedAt, id);
+  return result.changes > 0;
+}
+
+export function unarchiveSessionById(id: string): void {
+  getDb().prepare(`UPDATE sessions SET archived_at = NULL WHERE id = ?`).run(id);
+}
+
+/**
  * Bump `last_outbound_at` to now and stamp the kind tag for inbox attention-
  * state derivation. Called from delivery.ts after a successful host→platform
  * send so the central row doesn't fall behind the per-session outbound.db.

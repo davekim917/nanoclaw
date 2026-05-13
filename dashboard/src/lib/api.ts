@@ -176,6 +176,20 @@ export async function postSessionMessage(
   );
 }
 
+export async function archiveSession(sessionId: string): Promise<{ session_id: string; archived_at: string }> {
+  return apiFetch<{ session_id: string; archived_at: string }>(
+    `/dashboard/api/sessions/${encodeURIComponent(sessionId)}/archive`,
+    { method: 'POST' }
+  );
+}
+
+export async function unarchiveSession(sessionId: string): Promise<{ session_id: string }> {
+  return apiFetch<{ session_id: string }>(
+    `/dashboard/api/sessions/${encodeURIComponent(sessionId)}/unarchive`,
+    { method: 'POST' }
+  );
+}
+
 export interface RetryResponse {
   status: 'admitted';
   original_task_id: string;

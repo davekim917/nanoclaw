@@ -14,7 +14,13 @@ import { sessionsHandler } from './api/sessions.js';
 import { groupsListHandler } from './api/groups.js';
 import { steerHandler, sessionMessageHandler } from './steer.js';
 import { retryHandler } from './api/retry.js';
-import { archiveHandler, unarchiveHandler, bulkArchiveHandler } from './archive.js';
+import {
+  archiveHandler,
+  unarchiveHandler,
+  bulkArchiveHandler,
+  sessionArchiveHandler,
+  sessionUnarchiveHandler,
+} from './archive.js';
 
 // Side-effect imports — these files register their routes/handlers at module load
 import './auth/exchange.js'; // POST /dashboard/api/auth/exchange
@@ -52,6 +58,8 @@ export function startDashboard(): void {
   register('POST', '/dashboard/api/tasks/bulk-archive', requireAuth(bulkArchiveHandler));
   register('POST', '/dashboard/api/tasks/:id/archive', requireAuth(archiveHandler));
   register('POST', '/dashboard/api/tasks/:id/unarchive', requireAuth(unarchiveHandler));
+  register('POST', '/dashboard/api/sessions/:id/archive', requireAuth(sessionArchiveHandler));
+  register('POST', '/dashboard/api/sessions/:id/unarchive', requireAuth(sessionUnarchiveHandler));
 
   // Static assets — public, no auth (design §6). Splat must be LAST.
   register('GET', '/dashboard/', indexHtmlHandler);

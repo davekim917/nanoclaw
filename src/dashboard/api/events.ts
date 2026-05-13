@@ -62,9 +62,11 @@ export interface TaskEventPayload {
  *                        the new state.
  */
 export interface SessionEventPayload {
-  session_id: string;
+  // null for whole-group bulk events; the inbox treats null as "invalidate
+  // the visible list for this group". Matches the TaskEventPayload contract.
+  session_id: string | null;
   agent_group_id: string;
-  kind: 'inbound' | 'outbound' | 'container_state';
+  kind: 'inbound' | 'outbound' | 'container_state' | 'archived' | 'unarchived';
   outbound_kind?: string;
   container_status?: 'running' | 'idle' | 'stopped';
 }
