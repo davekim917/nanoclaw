@@ -1,22 +1,29 @@
 /**
- * Steer write path — POST /dashboard/api/tasks/:id/message.
+ * Steer write path — shared by `POST /dashboard/api/tasks/:id/message` and
+ * `POST /dashboard/api/sessions/:id/message`.
  *
- * Implements design §4 cycle-3 revised: input validation, §2a scope check,
- * member-role guard, rate-limit (30/min per user:session), reserve-before-write
- * idempotency (B4), partial-write recovery, SSE emit, wakeContainer, and
- * fire-and-forget echo via setImmediate.
+ * Both endpoints share the same flow:
+ *   - input validation, §2a scope filter, role gate, per-(user, child)
+ *     rate-limit, reserve-before-write idempotency, partial-write recovery,
+ *     SSE emit, wakeContainer, fire-and-forget echo to the originating
+ *     Slack/Discord thread via setImmediate.
+ *
+ * The only differences are: where we look up the destination (task row vs
+ * session row), which idempotency target_type we record, and one optional
+ * post-write hook (clearNeedsInput is task-only). `_writeAndEchoSteer` is
+ * the unified core; `applySteer` and `applySessionSteer` are thin loaders.
  */
 import { randomUUID } from 'crypto';
 import { createHash } from 'crypto';
 
 import { getDb } from '../db/connection.js';
 import { getSession } from '../db/sessions.js';
+import { getMessagingGroup } from '../db/messaging-groups.js';
 import { log } from '../log.js';
 import { writeSessionMessage } from '../session-manager.js';
 import { sessionInboundHasMessage } from '../db/session-db.js';
 import { wakeContainer } from '../container-runner.js';
 import { getChannelAdapter } from '../channels/channel-registry.js';
-import { getMessagingGroup } from '../db/messaging-groups.js';
 import { isOwner, isGlobalAdmin, isAdminOfAgentGroup } from '../modules/permissions/db/user-roles.js';
 import { isMember } from '../modules/permissions/db/agent-group-members.js';
 import {
@@ -24,6 +31,8 @@ import {
   applyIdempotency,
   claimEchoAttempted,
   IdempotencyConflict,
+  type SteerResponse,
+  type SteerTarget,
 } from './db/steer-idempotency.js';
 import { clearNeedsInput } from '../modules/orchestrator-dispatch/db/tasks.js';
 import { emitDashboardEvent } from './api/events.js';
@@ -44,8 +53,7 @@ const RATE_LIMIT_WINDOW_MS = 60_000;
 // per-(user, child_session) — entries accumulate over time as new sessions are
 // created. Without eviction the map grows unbounded over the host's lifetime
 // (post-build QA fix SF-7). When size crosses this threshold we sweep stale
-// entries (those whose windows have fully expired). Threshold chosen well above
-// realistic concurrent session count to keep the sweep cost amortized.
+// entries (those whose windows have fully expired).
 const RATE_LIMIT_MAP_SOFT_CAP = 1024;
 
 function _sweepExpiredRateWindows(now: number): void {
@@ -92,29 +100,249 @@ function canSteer(userId: string, agentGroupId: string): { ok: boolean; reason?:
   if (isMember(userId, agentGroupId)) {
     return { ok: false, reason: 'member_role_cannot_steer' };
   }
-  return { ok: false, reason: 'task_not_found' };
+  return { ok: false, reason: 'not_found' };
 }
 
-// ── applySteer ────────────────────────────────────────────────────────────────
+// ── Shared executor ───────────────────────────────────────────────────────────
+
+type SteerStatus = 202 | 400 | 403 | 404 | 409 | 422 | 429 | 503;
+type SteerResult = { status: SteerStatus; body: Record<string, unknown> };
+
+interface EchoConfig {
+  kind: 'thread' | 'headless';
+  messagingGroupId?: string;
+  platformThreadId?: string;
+}
+
+interface SteerExecution {
+  target: SteerTarget;
+  // Agent group the target lives under — used for both the scope check and
+  // SSE routing. For tasks: parent_agent_group_id. For sessions: agent_group_id.
+  agentGroupId: string;
+  // Where the inbound write lands. For tasks: task.child_session_id. For
+  // sessions: the session itself.
+  childAgentGroupId: string;
+  childSessionId: string;
+  // Where the echo posts. For tasks: child_messaging_group_id +
+  // child_platform_thread_id + surface_mode. For sessions: the session's own
+  // messaging_group_id + thread_id (or headless when MG is null).
+  echo: EchoConfig;
+  // Optional task-only side effect after the inbound write commits.
+  onWrite?: () => void;
+  // What goes into the inbound message envelope's `_steer` block. Lets
+  // session-targeted writes carry a different attribution payload.
+  envelope: Record<string, unknown>;
+}
+
+async function _writeAndEchoSteer(
+  exec: SteerExecution,
+  body: { idempotency_key: string; text: string },
+  ctx: AuthedRequestContext,
+): Promise<SteerResult> {
+  const userId = ctx.user.id;
+  const text = body.text;
+  const idempotencyKey = body.idempotency_key;
+
+  if (!text || !text.trim()) return { status: 400, body: { error: 'empty_message' } };
+  if (text.length > 4000) return { status: 400, body: { error: 'message_too_long' } };
+
+  // §2a scope filter — disclose-as-not-found.
+  if (!ctx.scopes.no_filter && !ctx.scopes.allowed_group_ids.includes(exec.agentGroupId)) {
+    return { status: 404, body: { error: 'not_found' } };
+  }
+
+  // Role gate — same disclose-as-not-found pattern.
+  const roleCheck = canSteer(userId, exec.agentGroupId);
+  if (!roleCheck.ok) {
+    return { status: 404, body: { error: 'not_found' } };
+  }
+
+  const rateLimitKey = `${userId}:${exec.childSessionId}`;
+  const rateCheck = checkRateLimit(rateLimitKey);
+  if (!rateCheck.allowed) {
+    return { status: 429, body: { error: 'rate_limit_exceeded', retry_after: rateCheck.retryAfter } };
+  }
+
+  const trimmedText = text.trim();
+  const requestHash = createHash('sha256').update(trimmedText).digest('hex');
+  const messageId = randomUUID();
+
+  let reserved: ReturnType<typeof reserveIdempotency>;
+  try {
+    reserved = reserveIdempotency(userId, idempotencyKey, exec.target, messageId, trimmedText, requestHash);
+  } catch (err) {
+    if (err instanceof IdempotencyConflict) {
+      refundRateLimit(rateLimitKey);
+      return {
+        status: 422,
+        body: { error: 'mismatched_idempotency_payload', conflict_kind: err.conflictKind },
+      };
+    }
+    throw err;
+  }
+
+  if (reserved.status === 'applied' && reserved.cached) {
+    return { status: 202, body: _responseShapeForTarget(reserved.cached) };
+  }
+
+  const resolvedMessageId = reserved.messageId;
+  const inboundExists = sessionInboundHasMessage(exec.childAgentGroupId, exec.childSessionId, resolvedMessageId);
+
+  if (!inboundExists) {
+    const now = new Date().toISOString();
+    try {
+      await writeSessionMessage(exec.childAgentGroupId, exec.childSessionId, {
+        id: resolvedMessageId,
+        kind: 'chat',
+        timestamp: now,
+        content: JSON.stringify({
+          text: trimmedText,
+          _via: 'dashboard',
+          _steer: exec.envelope,
+        }),
+        trigger: 1,
+      });
+    } catch (err: unknown) {
+      const code = (err as { code?: string }).code;
+      if (code === 'SQLITE_CONSTRAINT_PRIMARYKEY' || code === 'SQLITE_CONSTRAINT_UNIQUE') {
+        // Concurrent-retry race (PK on id, UNIQUE on seq) — treat as success.
+      } else if (code === 'SQLITE_BUSY') {
+        refundRateLimit(rateLimitKey);
+        return { status: 503, body: { error: 'db_busy', retry_after: 2 } };
+      } else {
+        refundRateLimit(rateLimitKey);
+        throw err;
+      }
+    }
+  }
+
+  if (exec.onWrite) {
+    try {
+      exec.onWrite();
+    } catch (err) {
+      log.warn('steer: onWrite hook failed — non-fatal', {
+        target: exec.target,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  try {
+    emitDashboardEvent('inbound_message', {
+      task_id: exec.target.type === 'task' ? exec.target.id : '',
+      child_session_id: exec.childSessionId,
+      parent_agent_group_id: exec.agentGroupId,
+      message_id: resolvedMessageId,
+    });
+  } catch {
+    // non-fatal
+  }
+
+  const childSession = getSession(exec.childSessionId);
+  if (childSession) {
+    void wakeContainer(childSession).catch((err) =>
+      log.warn('steer: wakeContainer failed', { target: exec.target, err }),
+    );
+  }
+
+  const steerResponse: SteerResponse = {
+    target_type: exec.target.type,
+    target_id: exec.target.id,
+    message_id: resolvedMessageId,
+    echo_status: 'pending',
+  };
+  applyIdempotency(userId, idempotencyKey, steerResponse);
+
+  if (claimEchoAttempted(reserved.id)) {
+    setImmediate(async () => {
+      try {
+        await _fireEchoAsync(exec, trimmedText, ctx);
+      } catch {
+        // outer catch covers sync throws — claim already committed; nothing to roll back
+      }
+    });
+  }
+
+  return { status: 202, body: _responseShapeForTarget(steerResponse) };
+}
+
+/**
+ * Re-shape the generic `SteerResponse` for HTTP. The task endpoint has
+ * carried `task_id` in the body since v1; the session endpoint exposes
+ * `session_id`. `target_type`/`target_id` are also included so future
+ * clients can stay generic.
+ */
+function _responseShapeForTarget(r: SteerResponse): Record<string, unknown> {
+  const base: Record<string, unknown> = {
+    target_type: r.target_type,
+    target_id: r.target_id,
+    message_id: r.message_id,
+    echo_status: r.echo_status,
+  };
+  if (r.target_type === 'task') base['task_id'] = r.target_id;
+  else base['session_id'] = r.target_id;
+  return base;
+}
+
+async function _fireEchoAsync(exec: SteerExecution, text: string, ctx: AuthedRequestContext): Promise<void> {
+  if (exec.echo.kind !== 'thread' || !exec.echo.messagingGroupId || !exec.echo.platformThreadId) {
+    await _emitEchoStatus('skipped_headless', exec);
+    return;
+  }
+
+  const mg = getMessagingGroup(exec.echo.messagingGroupId);
+  if (!mg) {
+    await _emitEchoStatus('adapter_unavailable', exec);
+    return;
+  }
+
+  const adapter = getChannelAdapter(mg.channel_type);
+  if (!adapter || typeof adapter.deliver !== 'function') {
+    await _emitEchoStatus('adapter_unavailable', exec);
+    return;
+  }
+
+  const displayName = ctx.user.display_name ?? ctx.user.id;
+  try {
+    await adapter.deliver(mg.platform_id, exec.echo.platformThreadId, {
+      kind: 'chat',
+      content: { text: `[via dashboard] ${text} — ${displayName}` },
+    });
+    await _emitEchoStatus('echoed', exec);
+  } catch {
+    await _emitEchoStatus('echo_failed', exec);
+  }
+}
+
+async function _emitEchoStatus(
+  echoStatus: 'echoed' | 'echo_failed' | 'adapter_unavailable' | 'skipped_headless',
+  exec: SteerExecution,
+): Promise<void> {
+  log.debug('steer: echo_status', { echoStatus, target: exec.target });
+  if (exec.target.type === 'task') {
+    emitDashboardEvent('task_event', {
+      task_id: exec.target.id,
+      kind: 'progress',
+      agent_group_id: exec.agentGroupId,
+      echo_status: echoStatus,
+    });
+  } else {
+    emitDashboardEvent('session_event', {
+      session_id: exec.target.id,
+      agent_group_id: exec.agentGroupId,
+      kind: 'outbound',
+      outbound_kind: `dashboard-echo:${echoStatus}`,
+    });
+  }
+}
+
+// ── Task steer ────────────────────────────────────────────────────────────────
 
 export async function applySteer(
   taskId: string,
   body: { idempotency_key: string; text: string },
   ctx: AuthedRequestContext,
-): Promise<{ status: 202 | 400 | 403 | 404 | 409 | 422 | 429 | 503; body: Record<string, unknown> }> {
-  const userId = ctx.user.id;
-  const text = body.text;
-  const idempotencyKey = body.idempotency_key;
-
-  // C7 input validation
-  if (!text || !text.trim()) {
-    return { status: 400, body: { error: 'empty_message' } };
-  }
-  if (text.length > 4000) {
-    return { status: 400, body: { error: 'message_too_long' } };
-  }
-
-  // Load task
+): Promise<SteerResult> {
   const task = getDb().prepare('SELECT * FROM tasks WHERE task_id = ?').get(taskId) as
     | {
         task_id: string;
@@ -127,233 +355,123 @@ export async function applySteer(
       }
     | undefined;
 
-  // §2a scope check — disclose-as-not-found
-  if (!task) {
-    return { status: 404, body: { error: 'task_not_found' } };
-  }
+  if (!task) return { status: 404, body: { error: 'task_not_found' } };
 
   if (!ctx.scopes.no_filter && !ctx.scopes.allowed_group_ids.includes(task.parent_agent_group_id)) {
     return { status: 404, body: { error: 'task_not_found' } };
   }
 
-  // C2 member-role check. Disclose-as-not-found per §2a (post-build QA fix SF-2):
-  // returning 403 here would confirm task existence to members and enable enumeration.
-  const roleCheck = canSteer(userId, task.parent_agent_group_id);
-  if (!roleCheck.ok) {
+  if (!task.child_session_id) return { status: 409, body: { error: 'task_has_no_child_session' } };
+
+  const childSession = getSession(task.child_session_id);
+  if (!childSession) return { status: 404, body: { error: 'task_not_found' } };
+
+  const echo: EchoConfig =
+    task.surface_mode === 'native_thread' && task.child_messaging_group_id && task.child_platform_thread_id
+      ? {
+          kind: 'thread',
+          messagingGroupId: task.child_messaging_group_id,
+          platformThreadId: task.child_platform_thread_id,
+        }
+      : { kind: 'headless' };
+
+  const result = await _writeAndEchoSteer(
+    {
+      target: { type: 'task', id: taskId },
+      agentGroupId: task.parent_agent_group_id,
+      childAgentGroupId: childSession.agent_group_id,
+      childSessionId: task.child_session_id,
+      echo,
+      onWrite: () => {
+        try {
+          clearNeedsInput(taskId);
+        } catch (err) {
+          log.warn('steer: failed to clear needs_input — non-fatal', { taskId, err });
+        }
+      },
+      envelope: { task_id: taskId, user_id: ctx.user.id },
+    },
+    body,
+    ctx,
+  );
+
+  // `not_found` → `task_not_found` for backwards compatibility with task callers.
+  if (result.status === 404 && result.body['error'] === 'not_found') {
     return { status: 404, body: { error: 'task_not_found' } };
   }
-
-  // No child session → 409
-  if (!task.child_session_id) {
-    return { status: 409, body: { error: 'task_has_no_child_session' } };
-  }
-
-  const childSessionId = task.child_session_id;
-  const rateLimitKey = `${userId}:${childSessionId}`;
-
-  // Rate limit
-  const rateCheck = checkRateLimit(rateLimitKey);
-  if (!rateCheck.allowed) {
-    return { status: 429, body: { error: 'rate_limit_exceeded', retry_after: rateCheck.retryAfter } };
-  }
-
-  // Idempotency reservation
-  const trimmedText = text.trim();
-  const requestHash = createHash('sha256').update(trimmedText).digest('hex');
-  const messageId = randomUUID();
-
-  let reserved: ReturnType<typeof reserveIdempotency>;
-  try {
-    reserved = reserveIdempotency(userId, idempotencyKey, taskId, messageId, trimmedText, requestHash);
-  } catch (err) {
-    if (err instanceof IdempotencyConflict) {
-      refundRateLimit(rateLimitKey);
-      return {
-        status: 422,
-        body: {
-          error: 'mismatched_idempotency_payload',
-          conflict_kind: err.conflictKind,
-        },
-      };
-    }
-    throw err;
-  }
-
-  // Replay with applied cached response
-  if (reserved.status === 'applied' && reserved.cached) {
-    return { status: 202, body: reserved.cached as unknown as Record<string, unknown> };
-  }
-
-  const resolvedMessageId = reserved.messageId;
-  const childSession = getSession(childSessionId);
-  if (!childSession) {
-    refundRateLimit(rateLimitKey);
-    return { status: 404, body: { error: 'task_not_found' } };
-  }
-
-  // Partial-write recovery: check if inbound write already happened
-  const inboundExists = sessionInboundHasMessage(childSession.agent_group_id, childSessionId, resolvedMessageId);
-
-  if (!inboundExists) {
-    const now = new Date().toISOString();
-    try {
-      await writeSessionMessage(childSession.agent_group_id, childSessionId, {
-        id: resolvedMessageId,
-        kind: 'chat',
-        timestamp: now,
-        content: JSON.stringify({
-          text: trimmedText,
-          _via: 'dashboard',
-          _steer: { task_id: taskId, user_id: userId },
-        }),
-        trigger: 1,
-      });
-    } catch (err: unknown) {
-      const code = (err as { code?: string }).code;
-      if (code === 'SQLITE_CONSTRAINT_PRIMARYKEY' || code === 'SQLITE_CONSTRAINT_UNIQUE') {
-        // Concurrent retry race (PK on id, UNIQUE on seq) — treat as success
-      } else if (code === 'SQLITE_BUSY') {
-        refundRateLimit(rateLimitKey);
-        return { status: 503, body: { error: 'db_busy', retry_after: 2 } };
-      } else {
-        refundRateLimit(rateLimitKey);
-        throw err;
-      }
-    }
-  }
-
-  // Operator has answered — flag clears under the partial-index guard,
-  // skipped entirely on idempotency replay since this branch only runs
-  // after the inbound write commits.
-  try {
-    clearNeedsInput(taskId);
-  } catch (err) {
-    log.warn('steer: failed to clear needs_input — non-fatal', { taskId, err });
-  }
-
-  // Emit SSE after inbound write commits
-  try {
-    emitDashboardEvent('inbound_message', {
-      task_id: taskId,
-      child_session_id: childSessionId,
-      parent_agent_group_id: task.parent_agent_group_id,
-      message_id: resolvedMessageId,
-    });
-  } catch {
-    // non-fatal
-  }
-
-  // Wake container
-  void wakeContainer(childSession).catch((err) => log.warn('steer: wakeContainer failed', { taskId, err }));
-
-  const steerResponse = {
-    task_id: taskId,
-    message_id: resolvedMessageId,
-    echo_status: 'pending',
-  };
-
-  // Apply idempotency AFTER successful inbound write
-  applyIdempotency(userId, idempotencyKey, steerResponse);
-
-  // Fire-and-forget echo via setImmediate (C3 — 202 returns before echo settles).
-  // Atomic CAS via claimEchoAttempted prevents the echo-duplication race where two
-  // concurrent retries with the same idempotency_key both see echo_attempted=0 at
-  // reservation time and both schedule adapter.deliver. Post-build QA fix SF-1.
-  if (claimEchoAttempted(reserved.id)) {
-    setImmediate(async () => {
-      try {
-        await _fireEchoAsync(taskId, task.parent_agent_group_id, task, childSessionId, trimmedText, ctx);
-      } catch {
-        // outer catch covers sync throws — claim already committed; nothing to roll back
-      }
-    });
-  }
-
-  return { status: 202, body: steerResponse };
+  return result;
 }
 
-async function _fireEchoAsync(
-  taskId: string,
-  agentGroupId: string,
-  task: {
-    surface_mode: string;
-    child_messaging_group_id: string | null;
-    child_platform_thread_id: string | null;
-  },
-  _childSessionId: string,
-  text: string,
+// ── Session steer ─────────────────────────────────────────────────────────────
+
+export async function applySessionSteer(
+  sessionId: string,
+  body: { idempotency_key: string; text: string },
   ctx: AuthedRequestContext,
-): Promise<void> {
-  if (task.surface_mode !== 'native_thread' || !task.child_platform_thread_id) {
-    await _emitEchoStatus('skipped_headless', taskId, agentGroupId);
-    return;
+): Promise<SteerResult> {
+  const session = getSession(sessionId);
+  if (!session) return { status: 404, body: { error: 'session_not_found' } };
+
+  if (!ctx.scopes.no_filter && !ctx.scopes.allowed_group_ids.includes(session.agent_group_id)) {
+    return { status: 404, body: { error: 'session_not_found' } };
   }
 
-  const mgId = task.child_messaging_group_id;
-  if (!mgId) {
-    await _emitEchoStatus('adapter_unavailable', taskId, agentGroupId);
-    return;
-  }
+  // Session lives in chat when messaging_group_id is set. Agent-shared
+  // sessions (mg=null) have no chat surface to echo into — analogous to a
+  // task in `headless` surface mode.
+  const echo: EchoConfig = session.messaging_group_id
+    ? {
+        kind: 'thread',
+        messagingGroupId: session.messaging_group_id,
+        ...(session.thread_id ? { platformThreadId: session.thread_id } : {}),
+      }
+    : { kind: 'headless' };
 
-  const mg = getMessagingGroup(mgId);
-  if (!mg) {
-    await _emitEchoStatus('adapter_unavailable', taskId, agentGroupId);
-    return;
-  }
+  const result = await _writeAndEchoSteer(
+    {
+      target: { type: 'session', id: sessionId },
+      agentGroupId: session.agent_group_id,
+      childAgentGroupId: session.agent_group_id,
+      childSessionId: sessionId,
+      echo,
+      envelope: { session_id: sessionId, user_id: ctx.user.id },
+    },
+    body,
+    ctx,
+  );
 
-  const adapter = getChannelAdapter(mg.channel_type);
-  if (!adapter || typeof adapter.deliver !== 'function') {
-    await _emitEchoStatus('adapter_unavailable', taskId, agentGroupId);
-    return;
+  if (result.status === 404 && result.body['error'] === 'not_found') {
+    return { status: 404, body: { error: 'session_not_found' } };
   }
-
-  const displayName = ctx.user.display_name ?? ctx.user.id;
-  try {
-    await adapter.deliver(mg.platform_id, task.child_platform_thread_id, {
-      kind: 'chat',
-      content: { text: `[via dashboard] ${text} — ${displayName}` },
-    });
-    await _emitEchoStatus('echoed', taskId, agentGroupId);
-  } catch {
-    await _emitEchoStatus('echo_failed', taskId, agentGroupId);
-  }
+  return result;
 }
 
-async function _emitEchoStatus(
-  echoStatus: 'echoed' | 'echo_failed' | 'adapter_unavailable' | 'skipped_headless',
-  taskId: string,
-  agentGroupId: string,
-): Promise<void> {
-  log.debug('steer: echo_status', { echoStatus });
-  emitDashboardEvent('task_event', {
-    task_id: taskId,
-    kind: 'progress',
-    agent_group_id: agentGroupId,
-    echo_status: echoStatus,
-  });
-}
+// ── Handlers ──────────────────────────────────────────────────────────────────
 
-export const steerHandler: AuthHandler = async (req, params, ctx) => {
+async function _readSteerBody(req: Request): Promise<{ idempotency_key: string; text: string } | { error: Response }> {
   let body: { idempotency_key?: string; text?: string };
   try {
     body = (await req.json()) as typeof body;
   } catch {
-    return new Response(JSON.stringify({ error: 'invalid_request' }), {
-      status: 400,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return {
+      error: new Response(JSON.stringify({ error: 'invalid_request' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    };
   }
-
   if (!body.idempotency_key) {
-    return new Response(JSON.stringify({ error: 'invalid_request' }), {
-      status: 400,
-      headers: { 'Content-Type': 'application/json' },
-    });
+    return {
+      error: new Response(JSON.stringify({ error: 'invalid_request' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    };
   }
+  return { idempotency_key: body.idempotency_key, text: body.text ?? '' };
+}
 
-  const taskId = params['id'] ?? '';
-  const result = await applySteer(taskId, { idempotency_key: body.idempotency_key, text: body.text ?? '' }, ctx);
-
+function _httpStatusOf(status: SteerStatus): number {
   const statusMap: Record<number, number> = {
     202: 202,
     400: 400,
@@ -364,10 +482,29 @@ export const steerHandler: AuthHandler = async (req, params, ctx) => {
     429: 429,
     503: 503,
   };
-  const httpStatus = statusMap[result.status] ?? 500;
+  return statusMap[status] ?? 500;
+}
 
+export const steerHandler: AuthHandler = async (req, params, ctx) => {
+  const body = await _readSteerBody(req);
+  if ('error' in body) return body.error;
+
+  const taskId = params['id'] ?? '';
+  const result = await applySteer(taskId, body, ctx);
   return new Response(JSON.stringify(result.body), {
-    status: httpStatus,
+    status: _httpStatusOf(result.status),
+    headers: { 'Content-Type': 'application/json' },
+  });
+};
+
+export const sessionMessageHandler: AuthHandler = async (req, params, ctx) => {
+  const body = await _readSteerBody(req);
+  if ('error' in body) return body.error;
+
+  const sessionId = params['id'] ?? '';
+  const result = await applySessionSteer(sessionId, body, ctx);
+  return new Response(JSON.stringify(result.body), {
+    status: _httpStatusOf(result.status),
     headers: { 'Content-Type': 'application/json' },
   });
 };

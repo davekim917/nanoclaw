@@ -12,7 +12,7 @@ import { indexHtmlHandler, staticHandler } from './static.js';
 import { tasksListHandler, tasksDetailHandler } from './api/tasks.js';
 import { sessionsHandler } from './api/sessions.js';
 import { groupsListHandler } from './api/groups.js';
-import { steerHandler } from './steer.js';
+import { steerHandler, sessionMessageHandler } from './steer.js';
 import { retryHandler } from './api/retry.js';
 import { archiveHandler, unarchiveHandler, bulkArchiveHandler } from './archive.js';
 
@@ -47,6 +47,7 @@ export function startDashboard(): void {
   register('GET', '/dashboard/api/sessions', requireAuth(sessionsHandler));
   register('GET', '/dashboard/api/groups', requireAuth(groupsListHandler));
   register('POST', '/dashboard/api/tasks/:id/message', requireAuth(steerHandler));
+  register('POST', '/dashboard/api/sessions/:id/message', requireAuth(sessionMessageHandler));
   register('POST', '/dashboard/api/tasks/:id/retry', requireAuth(retryHandler));
   register('POST', '/dashboard/api/tasks/bulk-archive', requireAuth(bulkArchiveHandler));
   register('POST', '/dashboard/api/tasks/:id/archive', requireAuth(archiveHandler));

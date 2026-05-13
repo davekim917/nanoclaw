@@ -1,7 +1,15 @@
 import { getDb } from '../../db/connection.js';
 
+export type SteerTargetType = 'task' | 'session';
+
+export interface SteerTarget {
+  type: SteerTargetType;
+  id: string;
+}
+
 export interface SteerResponse {
-  task_id: string;
+  target_type: SteerTargetType;
+  target_id: string;
   message_id: string;
   echo_status: string;
 }
@@ -16,17 +24,23 @@ export interface ReservedSteer {
 }
 
 export class IdempotencyConflict extends Error {
-  readonly conflictKind: 'task_id' | 'request_hash';
-  constructor(kind: 'task_id' | 'request_hash') {
+  readonly conflictKind: 'target' | 'request_hash';
+  constructor(kind: 'target' | 'request_hash') {
     super(`Idempotency conflict: ${kind} mismatch`);
     this.conflictKind = kind;
   }
 }
 
+/**
+ * Reserve (or replay) a steer slot for the given (user, idempotency_key). The
+ * `target` ties the key to a specific (task or session) — replay with a
+ * mismatched target raises `IdempotencyConflict('target')` rather than
+ * silently letting one key write to two destinations.
+ */
 export function reserveIdempotency(
   userId: string,
   idempotencyKey: string,
-  taskId: string,
+  target: SteerTarget,
   messageId: string,
   text: string,
   requestHash: string,
@@ -35,7 +49,7 @@ export function reserveIdempotency(
 
   const existing = db
     .prepare(
-      `SELECT id, message_id, task_id, request_hash, status, echo_attempted, text, cached_response
+      `SELECT id, message_id, target_type, target_id, request_hash, status, echo_attempted, text, cached_response
        FROM steer_idempotency
        WHERE user_id = ? AND idempotency_key = ?`,
     )
@@ -43,7 +57,8 @@ export function reserveIdempotency(
     | {
         id: number;
         message_id: string;
-        task_id: string;
+        target_type: SteerTargetType;
+        target_id: string;
         request_hash: string;
         status: 'pending' | 'applied';
         echo_attempted: number;
@@ -53,7 +68,9 @@ export function reserveIdempotency(
     | undefined;
 
   if (existing) {
-    if (existing.task_id !== taskId) throw new IdempotencyConflict('task_id');
+    if (existing.target_type !== target.type || existing.target_id !== target.id) {
+      throw new IdempotencyConflict('target');
+    }
     if (existing.request_hash !== requestHash) throw new IdempotencyConflict('request_hash');
     const cached =
       existing.status === 'applied' && existing.cached_response
@@ -72,14 +89,15 @@ export function reserveIdempotency(
   const row = db
     .prepare(
       `INSERT INTO steer_idempotency
-         (user_id, idempotency_key, task_id, message_id, text, request_hash, reserved_at, status, echo_attempted)
-       VALUES (@user_id, @idempotency_key, @task_id, @message_id, @text, @request_hash, datetime('now'), 'pending', 0)
+         (user_id, idempotency_key, target_type, target_id, message_id, text, request_hash, reserved_at, status, echo_attempted)
+       VALUES (@user_id, @idempotency_key, @target_type, @target_id, @message_id, @text, @request_hash, datetime('now'), 'pending', 0)
        RETURNING id, message_id, status, echo_attempted, text`,
     )
     .get({
       user_id: userId,
       idempotency_key: idempotencyKey,
-      task_id: taskId,
+      target_type: target.type,
+      target_id: target.id,
       message_id: messageId,
       text,
       request_hash: requestHash,

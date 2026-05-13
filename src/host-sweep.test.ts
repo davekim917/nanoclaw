@@ -818,15 +818,15 @@ describe('pruneSteerIdempotency — D7', () => {
     // applied row 2 min ago — should be deleted
     getDb()
       .prepare(
-        `INSERT INTO steer_idempotency (user_id, idempotency_key, task_id, message_id, text, request_hash, reserved_at, status, echo_attempted, applied_at)
-       VALUES ('u1', 'key-old', 'task-1', 'msg-1', 'hi', 'h1', datetime('now', '-3 minutes'), 'applied', 1, datetime('now', '-2 minutes'))`,
+        `INSERT INTO steer_idempotency (user_id, idempotency_key, target_type, target_id, message_id, text, request_hash, reserved_at, status, echo_attempted, applied_at)
+       VALUES ('u1', 'key-old', 'task', 'task-1', 'msg-1', 'hi', 'h1', datetime('now', '-3 minutes'), 'applied', 1, datetime('now', '-2 minutes'))`,
       )
       .run();
     // applied row 30 sec ago — should remain
     getDb()
       .prepare(
-        `INSERT INTO steer_idempotency (user_id, idempotency_key, task_id, message_id, text, request_hash, reserved_at, status, echo_attempted, applied_at)
-       VALUES ('u1', 'key-fresh', 'task-1', 'msg-2', 'hi', 'h2', datetime('now', '-31 seconds'), 'applied', 1, datetime('now', '-30 seconds'))`,
+        `INSERT INTO steer_idempotency (user_id, idempotency_key, target_type, target_id, message_id, text, request_hash, reserved_at, status, echo_attempted, applied_at)
+       VALUES ('u1', 'key-fresh', 'task', 'task-1', 'msg-2', 'hi', 'h2', datetime('now', '-31 seconds'), 'applied', 1, datetime('now', '-30 seconds'))`,
       )
       .run();
 
@@ -842,8 +842,8 @@ describe('pruneSteerIdempotency — D7', () => {
   it('test_prune_removes_old_pending', () => {
     getDb()
       .prepare(
-        `INSERT INTO steer_idempotency (user_id, idempotency_key, task_id, message_id, text, request_hash, reserved_at, status, echo_attempted)
-       VALUES ('u1', 'pend-old', 'task-2', 'msg-3', 'hi', 'h3', datetime('now', '-10 minutes'), 'pending', 0)`,
+        `INSERT INTO steer_idempotency (user_id, idempotency_key, target_type, target_id, message_id, text, request_hash, reserved_at, status, echo_attempted)
+       VALUES ('u1', 'pend-old', 'task', 'task-2', 'msg-3', 'hi', 'h3', datetime('now', '-10 minutes'), 'pending', 0)`,
       )
       .run();
 
@@ -856,8 +856,8 @@ describe('pruneSteerIdempotency — D7', () => {
   it('test_prune_preserves_recent_pending', () => {
     getDb()
       .prepare(
-        `INSERT INTO steer_idempotency (user_id, idempotency_key, task_id, message_id, text, request_hash, reserved_at, status, echo_attempted)
-       VALUES ('u1', 'pend-new', 'task-3', 'msg-4', 'hi', 'h4', datetime('now', '-1 minute'), 'pending', 0)`,
+        `INSERT INTO steer_idempotency (user_id, idempotency_key, target_type, target_id, message_id, text, request_hash, reserved_at, status, echo_attempted)
+       VALUES ('u1', 'pend-new', 'task', 'task-3', 'msg-4', 'hi', 'h4', datetime('now', '-1 minute'), 'pending', 0)`,
       )
       .run();
 

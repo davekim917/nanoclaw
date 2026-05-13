@@ -162,6 +162,20 @@ export async function postSteer(
   );
 }
 
+export async function postSessionMessage(
+  sessionId: string,
+  body: { idempotency_key: string; text: string }
+): Promise<SteerResponse> {
+  return apiFetch<SteerResponse>(
+    `/dashboard/api/sessions/${encodeURIComponent(sessionId)}/message`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }
+  );
+}
+
 export interface RetryResponse {
   status: 'admitted';
   original_task_id: string;

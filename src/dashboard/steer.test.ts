@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import http from 'http';
 
 import { closeDb, initTestDb, runMigrations, createAgentGroup, getDb } from '../db/index.js';
-import { applySteer, _resetRateLimitForTesting } from './steer.js';
+import { applySteer, applySessionSteer, _resetRateLimitForTesting } from './steer.js';
 import type { AuthedRequestContext } from './router.js';
 
 // These imports resolve AFTER vi.mock hoisting — they are the vi.fn() instances.
@@ -355,8 +355,8 @@ describe('applySteer — D5', () => {
     const hash = createHash('sha256').update(trimmed).digest('hex');
     getDb()
       .prepare(
-        `INSERT INTO steer_idempotency (user_id, idempotency_key, task_id, message_id, text, request_hash, reserved_at, status, echo_attempted)
-         VALUES (?, ?, ?, ?, ?, ?, datetime('now'), 'pending', 0)`,
+        `INSERT INTO steer_idempotency (user_id, idempotency_key, target_type, target_id, message_id, text, request_hash, reserved_at, status, echo_attempted)
+         VALUES (?, ?, 'task', ?, ?, ?, ?, datetime('now'), 'pending', 0)`,
       )
       .run('owner-2', VALID_IKEY, 'spawn-abc', preMessageId, trimmed, hash);
 
@@ -526,5 +526,131 @@ describe('applySteer — D5', () => {
         }),
       }),
     );
+  });
+});
+
+describe('applySessionSteer — C5', () => {
+  beforeEach(() => {
+    _resetRateLimitForTesting();
+    mockWriteSessionMessage.mockReset();
+    mockWriteSessionMessage.mockResolvedValue(undefined);
+    mockSessionInboundHasMessage.mockReset();
+    mockSessionInboundHasMessage.mockReturnValue(false);
+    mockWakeContainer.mockReset();
+    mockWakeContainer.mockResolvedValue(true);
+    mockGetChannelAdapter.mockReset();
+    mockGetChannelAdapter.mockReturnValue(undefined);
+    mockGetMessagingGroup.mockReset();
+    mockGetMessagingGroup.mockReturnValue(undefined);
+    mockEmitDashboardEvent.mockReset();
+    setupDb();
+    seedAgentGroup('ag-1');
+    seedAgentGroup('ag-2');
+    seedSession('sess-direct', 'ag-1'); // direct conversation session, no MG
+    seedUser('owner-s');
+    grantOwner('owner-s');
+    seedUser('member-s');
+    grantMember('member-s', 'ag-1');
+    seedUser('admin-s');
+    grantAdmin('admin-s', 'ag-1');
+  });
+
+  afterEach(() => {
+    closeDb();
+    vi.clearAllMocks();
+  });
+
+  it('writes to the session inbound DB and returns 202 with session_id', async () => {
+    const ctx = makeCtx('owner-s', { no_filter: true });
+    const r = await applySessionSteer('sess-direct', { idempotency_key: VALID_IKEY, text: 'hi' }, ctx);
+    expect(r.status).toBe(202);
+    expect(r.body['target_type']).toBe('session');
+    expect(r.body['target_id']).toBe('sess-direct');
+    expect(r.body['session_id']).toBe('sess-direct');
+    expect(r.body['task_id']).toBeUndefined();
+    expect(mockWriteSessionMessage).toHaveBeenCalledTimes(1);
+    const writeCall = mockWriteSessionMessage.mock.calls[0]!;
+    expect(writeCall[0]).toBe('ag-1');
+    expect(writeCall[1]).toBe('sess-direct');
+    const payload = JSON.parse((writeCall[2] as { content: string }).content) as Record<string, unknown>;
+    expect(payload['_via']).toBe('dashboard');
+    expect((payload['_steer'] as Record<string, unknown>)['session_id']).toBe('sess-direct');
+  });
+
+  it('returns 404 session_not_found for non-existent session', async () => {
+    const ctx = makeCtx('owner-s', { no_filter: true });
+    const r = await applySessionSteer('sess-NOPE', { idempotency_key: VALID_IKEY, text: 'hi' }, ctx);
+    expect(r.status).toBe(404);
+    expect(r.body['error']).toBe('session_not_found');
+  });
+
+  it('§2a: returns 404 not 403 for sessions outside scope', async () => {
+    seedSession('sess-other', 'ag-2');
+    const ctx = makeCtx('admin-s', { allowed_group_ids: ['ag-1'] });
+    const r = await applySessionSteer('sess-other', { idempotency_key: VALID_IKEY, text: 'hi' }, ctx);
+    expect(r.status).toBe(404);
+    expect(r.body['error']).toBe('session_not_found');
+  });
+
+  it('member role cannot steer a session — 404 disclose-as-not-found', async () => {
+    const ctx = makeCtx('member-s', { allowed_group_ids: ['ag-1'] });
+    const r = await applySessionSteer('sess-direct', { idempotency_key: VALID_IKEY, text: 'hi' }, ctx);
+    expect(r.status).toBe(404);
+    expect(r.body['error']).toBe('session_not_found');
+  });
+
+  it('echoes to the session messaging group + thread when present', async () => {
+    // Re-seed the session WITH a messaging_group + thread_id so the echo
+    // picks up the thread-mode branch.
+    getDb()
+      .prepare(
+        `INSERT OR IGNORE INTO messaging_groups
+           (id, channel_type, platform_id, name, is_group, unknown_sender_policy, created_at)
+         VALUES ('mg-s', 'slack', 'C-s', 'echo-ch', 1, 'public', datetime('now'))`,
+      )
+      .run();
+    getDb()
+      .prepare(
+        `INSERT OR REPLACE INTO sessions
+           (id, agent_group_id, messaging_group_id, thread_id, status, created_at)
+         VALUES ('sess-echo', 'ag-1', 'mg-s', 'thread-42', 'active', ?)`,
+      )
+      .run(now());
+
+    const deliverMock = vi.fn().mockResolvedValue(undefined);
+    mockGetMessagingGroup.mockReturnValue({
+      id: 'mg-s',
+      channel_type: 'slack',
+      platform_id: 'C-s',
+      name: 'echo-ch',
+      is_group: 1,
+      unknown_sender_policy: 'public',
+      created_at: now(),
+    });
+    mockGetChannelAdapter.mockReturnValue({ deliver: deliverMock } as unknown as ReturnType<typeof _gcaRaw>);
+
+    const ctx = makeCtx('owner-s', { no_filter: true });
+    const r = await applySessionSteer('sess-echo', { idempotency_key: VALID_IKEY, text: 'check in' }, ctx);
+    expect(r.status).toBe(202);
+    // Echo fires via setImmediate
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(deliverMock).toHaveBeenCalledWith(
+      'C-s',
+      'thread-42',
+      expect.objectContaining({
+        kind: 'chat',
+        content: expect.objectContaining({ text: expect.stringContaining('check in') }),
+      }),
+    );
+  });
+
+  it('agent-shared sessions (no MG) skip echo as headless', async () => {
+    const deliverMock = vi.fn().mockResolvedValue(undefined);
+    mockGetChannelAdapter.mockReturnValue({ deliver: deliverMock } as unknown as ReturnType<typeof _gcaRaw>);
+    const ctx = makeCtx('owner-s', { no_filter: true });
+    const r = await applySessionSteer('sess-direct', { idempotency_key: VALID_IKEY, text: 'hi' }, ctx);
+    expect(r.status).toBe(202);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(deliverMock).not.toHaveBeenCalled();
   });
 });
