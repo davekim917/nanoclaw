@@ -23,7 +23,7 @@ describe('cookie sign/verify', () => {
     expect(setCookie).toContain('HttpOnly');
     expect(setCookie).toContain('Secure'); // default secure: true
     expect(setCookie).toContain('SameSite=Strict');
-    expect(setCookie).toContain('Max-Age=43200');
+    expect(setCookie).toContain('Max-Age=2592000');
     expect(setCookie).toContain('Path=/dashboard');
   });
 
@@ -37,7 +37,7 @@ describe('cookie sign/verify', () => {
     expect(setCookie).toContain('HttpOnly');
     expect(setCookie).not.toContain('Secure');
     expect(setCookie).toContain('SameSite=Strict');
-    expect(setCookie).toContain('Max-Age=43200');
+    expect(setCookie).toContain('Max-Age=2592000');
     expect(setCookie).toContain('Path=/dashboard');
   });
 

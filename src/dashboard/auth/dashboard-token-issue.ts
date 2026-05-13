@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import { getDeliveryAdapter } from '../../delivery.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { issueDashboardToken } from '../db/dashboard-tokens.js';
-import { resolveServerKey } from './cookie.js';
+import { dashboardSessionTtlHours, resolveServerKey } from './cookie.js';
 import { registerInterceptHandler } from '../../command-gate.js';
 import type { InterceptContext } from '../../command-gate.js';
 import { log } from '../../log.js';
@@ -18,9 +18,11 @@ export async function dashboardTokenIssue(ctx: InterceptContext): Promise<void> 
   const serverKey = resolveServerKey();
   const tokenHmac = crypto.createHmac('sha256', serverKey).update(rawToken).digest('hex');
 
-  // 12h TTL matches cookie Max-Age (post-build QA fix MF-2). Both server-side cookie
-  // expiry and client-side cookie deletion must end at the same wall-clock time.
-  issueDashboardToken(ctx.userId, tokenHmac, 12);
+  // Token TTL must match cookie Max-Age (post-build QA fix MF-2). Both
+  // server-side cookie expiry and client-side cookie deletion end at the
+  // same wall-clock time — both read from `dashboardSessionTtlHours()`.
+  const ttlHours = dashboardSessionTtlHours();
+  issueDashboardToken(ctx.userId, tokenHmac, ttlHours);
 
   // Build the URL to send to the user. Three env vars give precise control:
   //   NANOCLAW_DASHBOARD_URL      — full URL (e.g. https://dash.example.com); takes precedence
@@ -46,12 +48,20 @@ export async function dashboardTokenIssue(ctx: InterceptContext): Promise<void> 
       null,
       'chat',
       JSON.stringify({
-        text: `Your dashboard token (valid 12h):\n${rawToken}\n\nOpen ${dashboardUrl}`,
+        text: `Your dashboard token (valid ${formatTtl(ttlHours)}):\n${rawToken}\n\nOpen ${dashboardUrl}`,
       }),
     );
   } else {
     log.warn('dashboardTokenIssue: no delivery adapter available');
   }
+}
+
+function formatTtl(hours: number): string {
+  if (hours >= 24 && hours % 24 === 0) {
+    const days = hours / 24;
+    return days === 1 ? '1 day' : `${days} days`;
+  }
+  return `${hours}h`;
 }
 
 // Side-effect registration — importing this file registers the handler.

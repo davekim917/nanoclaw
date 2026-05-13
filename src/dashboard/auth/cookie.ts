@@ -8,6 +8,21 @@ export interface CookiePayload {
   expires_at: string;
 }
 
+/**
+ * Shared TTL used by both the dashboard-token issuer and the cookie's
+ * Max-Age. Env-overridable via NANOCLAW_DASHBOARD_SESSION_TTL_HOURS so an
+ * operator can shorten it on a shared host. Default 30 days (720h) — the
+ * SPA forced a re-token every 12h before this, which Dave (sole user on
+ * his deployment) found needlessly annoying.
+ */
+export function dashboardSessionTtlHours(): number {
+  const raw = process.env.NANOCLAW_DASHBOARD_SESSION_TTL_HOURS;
+  if (!raw) return 720;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return 720;
+  return parsed;
+}
+
 let _serverKey: Buffer | null = null;
 
 export function _resetServerKeyForTest(): void {
@@ -58,7 +73,8 @@ export function buildSetCookie(payload: CookiePayload, serverKey: Buffer, option
   const encoded = `${payloadB64}.${hmac}`;
   const secure = options.secure !== false; // default true
   const secureAttr = secure ? 'Secure; ' : '';
-  return `spawn_board=${encoded}; HttpOnly; ${secureAttr}SameSite=Strict; Max-Age=43200; Path=/dashboard`;
+  const maxAgeSec = Math.floor(dashboardSessionTtlHours() * 3600);
+  return `spawn_board=${encoded}; HttpOnly; ${secureAttr}SameSite=Strict; Max-Age=${maxAgeSec}; Path=/dashboard`;
 }
 
 export function parseAndVerifyCookie(cookieHeader: string | null, serverKey: Buffer): CookiePayload | null {

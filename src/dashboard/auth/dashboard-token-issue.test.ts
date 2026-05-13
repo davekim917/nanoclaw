@@ -14,6 +14,7 @@ vi.mock('../db/dashboard-tokens.js', () => ({
 
 vi.mock('./cookie.js', () => ({
   resolveServerKey: vi.fn(() => Buffer.from('a'.repeat(64), 'hex')),
+  dashboardSessionTtlHours: vi.fn(() => 720),
 }));
 
 vi.mock('../../log.js', () => ({
@@ -88,7 +89,7 @@ describe('dashboardTokenIssue', () => {
       number,
     ];
     expect(calledUserId).toBe('u1');
-    expect(calledTtl).toBe(12); // 12h matches Set-Cookie Max-Age=43200 (post-build QA fix MF-2)
+    expect(calledTtl).toBe(720); // hours; mirrors dashboardSessionTtlHours() default + Set-Cookie Max-Age
 
     // Verify HMAC matches what we'd compute from the raw token in the deliver call
     expect(deliverMock).toHaveBeenCalledOnce();

@@ -133,6 +133,11 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
       .sort()
       .pop() ?? new Date().toISOString();
 
+  // Server-side bulk-archive only touches `archived_at IS NULL`, so when
+  // showArchived is on, counts.failed can include rows the button cannot
+  // act on. Count actionable separately so the button hides at zero.
+  const failedActionableCount = tasks.filter((t) => t.status === 'failed' && t.archived_at == null).length;
+
   // Memoize so future `React.memo`-wrapped descendants don't churn on
   // identity alone — callbacks are already stable via useCallback.
   const boardActions: BoardActions = useMemo(
@@ -152,6 +157,7 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
       tasks={tasks}
       visible={visible}
       counts={counts}
+      failedActionableCount={failedActionableCount}
       filter={filter}
       onFilter={setFilter}
       route={route}
@@ -166,6 +172,7 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
     <DesktopBoard
       tasks={tasks}
       counts={counts}
+      failedActionableCount={failedActionableCount}
       route={route}
       onRouteChange={onRouteChange}
       lastActivityIso={lastActivityIso}
@@ -507,6 +514,7 @@ function MobileBoard({
   tasks,
   visible,
   counts,
+  failedActionableCount,
   filter,
   onFilter,
   route,
@@ -520,6 +528,7 @@ function MobileBoard({
   tasks: TaskSummary[];
   visible: TaskSummary[];
   counts: Counts;
+  failedActionableCount: number;
   filter: FilterId;
   onFilter: (v: FilterId) => void;
   route: 'board' | 'sessions';
@@ -551,7 +560,7 @@ function MobileBoard({
       <ArchiveToolbar
         filter={filter}
         actions={actions}
-        failedCount={counts.failed}
+        failedCount={failedActionableCount}
       />
 
       <div className="nc-stream">
@@ -677,6 +686,7 @@ function SectionLabel({ title, count }: { title: string; count: number }) {
 function DesktopBoard({
   tasks,
   counts,
+  failedActionableCount,
   onRouteChange,
   lastActivityIso,
   groups,
@@ -686,6 +696,7 @@ function DesktopBoard({
 }: {
   tasks: TaskSummary[];
   counts: Counts;
+  failedActionableCount: number;
   route: 'board' | 'sessions';
   onRouteChange: (r: 'board' | 'sessions') => void;
   lastActivityIso: string;
@@ -744,7 +755,7 @@ function DesktopBoard({
           <div className="nc-desktop-toolbar">
             <ShowArchivedToggle actions={actions} />
             <div className="right">
-              <BulkClearFailedButton actions={actions} failedCount={counts.failed} />
+              <BulkClearFailedButton actions={actions} failedCount={failedActionableCount} />
               <button
                 className="nc-btn ghost"
                 onClick={() => onRouteChange('sessions')}
