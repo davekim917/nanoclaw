@@ -91,6 +91,35 @@ describe('resolveAnthropicAuth', () => {
     ]);
   });
 
+  it('filters the OneCLI "placeholder" sentinel from globals', () => {
+    // When the host service is wrapped in `onecli run --`, the wrapper
+    // injects CLAUDE_CODE_OAUTH_TOKEN=placeholder as a sentinel that its
+    // own proxy substitutes at request time. The literal string is never
+    // a real bearer credential — forwarding it into a container that
+    // takes the Claude Max OAuth-bypass path strips OneCLI's
+    // container-side substitution and emits `401 Invalid bearer token`.
+    const env = {
+      CLAUDE_CODE_OAUTH_TOKEN: 'placeholder',
+      ANTHROPIC_API_KEY: 'placeholder',
+      // Real fallback that's NOT the sentinel — should survive.
+      CLAUDE_CODE_OAUTH_TOKEN_2: 'real-rotation-token',
+    };
+    const auth = resolveAnthropicAuth('any-folder', env);
+    expect(auth.oauthPrimary).toBeUndefined();
+    expect(auth.apiKeyPrimary).toBeUndefined();
+    expect(auth.oauthFallbacks).toEqual([{ index: 2, value: 'real-rotation-token' }]);
+  });
+
+  it('placeholder in a scoped slot is also filtered', () => {
+    const env = {
+      CLAUDE_CODE_OAUTH_TOKEN: 'global-oauth',
+      CLAUDE_CODE_OAUTH_TOKEN_AXIE_DEV: 'placeholder',
+    };
+    const auth = resolveAnthropicAuth('axie-dev', env);
+    // Scoped primary is sentinel → falls back to the global, which is real.
+    expect(auth.oauthPrimary).toBe('global-oauth');
+  });
+
   it('per-group token does not leak to other groups', () => {
     const env = {
       CLAUDE_CODE_OAUTH_TOKEN: 'global-oauth',

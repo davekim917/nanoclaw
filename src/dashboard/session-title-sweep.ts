@@ -150,7 +150,11 @@ async function callTitleBackend(system: string, user: string, signal: AbortSigna
   // `src/memory-daemon/backends/anthropic.ts`.
   const dispatcher = getProxyDispatcher();
   const fetchImpl: typeof fetch = dispatcher
-    ? ((url, init) => undiciFetch(url as string, { ...init, dispatcher } as Parameters<typeof undiciFetch>[1]) as unknown as Promise<Response>)
+    ? (url, init) =>
+        undiciFetch(
+          url as string,
+          { ...init, dispatcher } as Parameters<typeof undiciFetch>[1],
+        ) as unknown as Promise<Response>
     : fetch;
 
   const authHeaders: Record<string, string> = useOauth

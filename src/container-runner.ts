@@ -411,6 +411,22 @@ export function resolveAnthropicAuth(folder: string, env: NodeJS.ProcessEnv = pr
   };
 }
 
+/**
+ * Sentinel value injected by `onecli run --` as the host service's
+ * CLAUDE_CODE_OAUTH_TOKEN. The wrapper's own proxy substitutes it for a
+ * real vault token at request time — but the literal string is never a
+ * usable bearer credential. If we read it as the "host primary" and
+ * forward it to a container, the container's Claude Max OAuth bypass
+ * path strips OneCLI's container-side substitution and sends
+ * "placeholder" verbatim to api.anthropic.com, producing
+ * `401 Invalid bearer token`. Treat it as absent.
+ */
+const PLACEHOLDER_SENTINEL = 'placeholder';
+
+function _filterPlaceholder(v: string | undefined): string | undefined {
+  return v === PLACEHOLDER_SENTINEL ? undefined : v;
+}
+
 function resolveScopedRotationSet(
   base: string,
   folder: string,
@@ -419,7 +435,7 @@ function resolveScopedRotationSet(
   const folderTok = folder.toUpperCase().replace(/-/g, '_');
   const isPureDigits = /^\d+$/.test(folderTok);
   const scopedPrimaryKey = `${base}_${folderTok}`;
-  const scopedPrimary = !isPureDigits ? env[scopedPrimaryKey] : undefined;
+  const scopedPrimary = !isPureDigits ? _filterPlaceholder(env[scopedPrimaryKey]) : undefined;
 
   if (scopedPrimary) {
     const fallbacks: { index: number; value: string }[] = [];
@@ -435,11 +451,12 @@ function resolveScopedRotationSet(
     return { primary: scopedPrimary, fallbacks };
   }
 
-  const primary = env[base];
+  const primary = _filterPlaceholder(env[base]);
   const fallbacks: { index: number; value: string }[] = [];
   const fallbackRe = new RegExp(`^${base}_(\\d+)$`);
   for (const [k, v] of Object.entries(env)) {
     if (!v) continue;
+    if (v === PLACEHOLDER_SENTINEL) continue;
     const m = k.match(fallbackRe);
     if (!m) continue;
     fallbacks.push({ index: Number(m[1]), value: v });
