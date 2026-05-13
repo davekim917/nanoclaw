@@ -462,6 +462,19 @@ function resolveScopedRotationSet(
     fallbacks.push({ index: Number(m[1]), value: v });
   }
   fallbacks.sort((a, b) => a.index - b.index);
+
+  // When `onecli run --` wraps the host service it injects
+  // CLAUDE_CODE_OAUTH_TOKEN=placeholder into the global slot, which the
+  // filter above strips to undefined. If real rotation siblings exist in
+  // `.env` (e.g., CLAUDE_CODE_OAUTH_TOKEN_2/_3), promote the first one to
+  // primary so the container's in-SDK rotation pool stays the same size.
+  // Without this, container-runner's `if (hostOauth)` gate (line ~1528)
+  // skips forwarding fallbacks entirely → non-scoped groups silently lose
+  // their rotation pool and fall back to OneCLI vault single-token mode.
+  if (!primary && fallbacks.length > 0) {
+    const promoted = fallbacks.shift()!;
+    return { primary: promoted.value, fallbacks };
+  }
   return { primary, fallbacks };
 }
 

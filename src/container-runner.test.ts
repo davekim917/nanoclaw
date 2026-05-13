@@ -101,13 +101,29 @@ describe('resolveAnthropicAuth', () => {
     const env = {
       CLAUDE_CODE_OAUTH_TOKEN: 'placeholder',
       ANTHROPIC_API_KEY: 'placeholder',
-      // Real fallback that's NOT the sentinel — should survive.
-      CLAUDE_CODE_OAUTH_TOKEN_2: 'real-rotation-token',
     };
     const auth = resolveAnthropicAuth('any-folder', env);
+    // Placeholder filtered; nothing real to promote → both fully empty.
     expect(auth.oauthPrimary).toBeUndefined();
     expect(auth.apiKeyPrimary).toBeUndefined();
-    expect(auth.oauthFallbacks).toEqual([{ index: 2, value: 'real-rotation-token' }]);
+    expect(auth.oauthFallbacks).toEqual([]);
+    expect(auth.apiKeyFallbacks).toEqual([]);
+  });
+
+  it('promotes first real fallback to primary when global slot is placeholder', () => {
+    // Production layout when host service is wrapped in `onecli run --`:
+    // the wrapper sets CLAUDE_CODE_OAUTH_TOKEN=placeholder; real values
+    // for `_2`/`_3` come from .env. Without promotion, container-runner's
+    // `if (hostOauth)` gate would skip forwarding the fallbacks entirely,
+    // collapsing non-scoped groups' rotation pool to zero.
+    const env = {
+      CLAUDE_CODE_OAUTH_TOKEN: 'placeholder',
+      CLAUDE_CODE_OAUTH_TOKEN_2: 'real-rotation-2',
+      CLAUDE_CODE_OAUTH_TOKEN_3: 'real-rotation-3',
+    };
+    const auth = resolveAnthropicAuth('illysium', env);
+    expect(auth.oauthPrimary).toBe('real-rotation-2');
+    expect(auth.oauthFallbacks).toEqual([{ index: 3, value: 'real-rotation-3' }]);
   });
 
   it('placeholder in a scoped slot is also filtered', () => {
