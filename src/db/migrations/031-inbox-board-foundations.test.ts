@@ -55,7 +55,9 @@ describe('migration031', () => {
   it('new session columns are nullable (existing rows survive)', () => {
     const db = makeDb();
     migration031.up(db);
-    const row = db.prepare('SELECT archived_at, title, title_generated_at, title_basis_seq FROM sessions WHERE id = ?').get('s1') as {
+    const row = db
+      .prepare('SELECT archived_at, title, title_generated_at, title_basis_seq FROM sessions WHERE id = ?')
+      .get('s1') as {
       archived_at: string | null;
       title: string | null;
       title_generated_at: string | null;
@@ -100,7 +102,9 @@ describe('migration031', () => {
 
     migration031.up(db);
 
-    const row = db.prepare('SELECT target_type, target_id FROM steer_idempotency WHERE idempotency_key = ?').get('k-old') as {
+    const row = db
+      .prepare('SELECT target_type, target_id FROM steer_idempotency WHERE idempotency_key = ?')
+      .get('k-old') as {
       target_type: string;
       target_id: string;
     };
