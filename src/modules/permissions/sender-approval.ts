@@ -76,10 +76,17 @@ export async function requestSenderApproval(input: RequestSenderApprovalInput): 
 
   const originMg = getMessagingGroup(messagingGroupId);
   const originChannelType = originMg?.channel_type ?? '';
-  const target = await pickApprovalDelivery(approvers, originChannelType);
+  // Same-channel-type only: the card contains the sender's user-originated
+  // identity and (often) message body from this workspace — don't fall
+  // back cross-workspace to a different surface where the same owner
+  // happens to be registered. If nobody on this channel_type can be
+  // notified, the pending_sender_approvals row stays in DB for dashboard
+  // review and the dedup gate prevents card spam on retries.
+  const target = await pickApprovalDelivery(approvers, originChannelType, { sameChannelTypeOnly: true });
   if (!target) {
-    log.warn('Unknown-sender approval skipped — no DM channel for any approver', {
+    log.warn('Unknown-sender approval skipped — no in-workspace approver reachable on origin channel_type', {
       messagingGroupId,
+      originChannelType,
       agentGroupId,
       senderIdentity,
     });

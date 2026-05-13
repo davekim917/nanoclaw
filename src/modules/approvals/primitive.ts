@@ -99,10 +99,22 @@ export function pickApprover(agentGroupId: string | null): string[] {
  * Tie-break: prefer approvers reachable on the same channel kind as the
  * origin; else first in list. Resolution uses ensureUserDm, which may
  * trigger a platform openDM call on cache miss.
+ *
+ * `sameChannelTypeOnly` (default false): when true, the cross-channel-type
+ * fallback loop is disabled — if no approver is reachable on the origin's
+ * channel_type the function returns null instead of falling back to a
+ * different workspace/platform. Callers carrying user-originated message
+ * bodies (channel-registration, unknown-sender approval) set this to avoid
+ * leaking a message body from workspace A into workspace B just because
+ * the same human owner is registered in both. Agent-originated approvals
+ * (self-mod, onecli, bash-gate) leave it false: the card content is
+ * system/agent-owned, not external-user-owned, so cross-workspace fallback
+ * is safe and ensures the owner is reachable.
  */
 export async function pickApprovalDelivery(
   approvers: string[],
   originChannelType: string,
+  options: { sameChannelTypeOnly?: boolean } = {},
 ): Promise<{ userId: string; messagingGroup: MessagingGroup } | null> {
   if (originChannelType) {
     for (const userId of approvers) {
@@ -111,6 +123,7 @@ export async function pickApprovalDelivery(
       if (mg) return { userId, messagingGroup: mg };
     }
   }
+  if (options.sameChannelTypeOnly) return null;
   for (const userId of approvers) {
     const mg = await ensureUserDm(userId);
     if (mg) return { userId, messagingGroup: mg };

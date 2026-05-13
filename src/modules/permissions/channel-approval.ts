@@ -172,11 +172,19 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
     }
   }
 
-  const delivery = await pickApprovalDelivery(approvers, originChannelType);
+  // Same-channel-type only: refuse to deliver an approval card carrying
+  // a user's message body into a different workspace/platform than the
+  // one it originated in, even if the same human owner is reachable
+  // there. The dropped_messages row written by the router (reason
+  // 'no_agent_wired') already preserves operator visibility; the owner
+  // can review pending registrations via the dashboard.
+  const delivery = await pickApprovalDelivery(approvers, originChannelType, { sameChannelTypeOnly: true });
   if (!delivery) {
-    log.warn('Channel registration skipped — no DM channel for any approver', {
+    log.warn('Channel registration skipped — no in-workspace approver reachable on origin channel_type', {
       messagingGroupId,
+      originChannelType,
       targetAgentGroupId: referenceGroup.id,
+      approverCount: approvers.length,
     });
     return;
   }

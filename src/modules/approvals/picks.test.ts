@@ -143,4 +143,31 @@ describe('pickApprovalDelivery', () => {
     seedUser('telegram:111', 'telegram');
     expect(await pickApprovalDelivery(['telegram:111'], 'telegram')).toBeNull();
   });
+
+  it('sameChannelTypeOnly=true: refuses cross-channel-type fallback', async () => {
+    // Approver registered on telegram only; origin is discord. Default
+    // behavior falls back to telegram; strict mode returns null instead.
+    await mountMockAdapter('telegram');
+    seedUser('telegram:111', 'telegram');
+
+    const defaultResult = await pickApprovalDelivery(['telegram:111'], 'discord');
+    expect(defaultResult?.userId).toBe('telegram:111');
+
+    const strictResult = await pickApprovalDelivery(['telegram:111'], 'discord', {
+      sameChannelTypeOnly: true,
+    });
+    expect(strictResult).toBeNull();
+  });
+
+  it('sameChannelTypeOnly=true: still returns in-workspace approver when one exists', async () => {
+    await mountMockAdapter('discord', async (h) => `dm-${h}`);
+    await mountMockAdapter('telegram');
+    seedUser('discord:222', 'discord');
+    seedUser('telegram:111', 'telegram');
+
+    const result = await pickApprovalDelivery(['telegram:111', 'discord:222'], 'discord', {
+      sameChannelTypeOnly: true,
+    });
+    expect(result?.userId).toBe('discord:222');
+  });
 });
