@@ -17,6 +17,8 @@ import { getDb } from '../../db/connection.js';
 import { getSession } from '../../db/sessions.js';
 import { log } from '../../log.js';
 import { applySpawnTask } from '../../modules/orchestrator-dispatch/dispatch.js';
+import { archiveTaskById } from '../../modules/orchestrator-dispatch/db/tasks.js';
+import { emitDashboardEvent } from '../api/events.js';
 import type { AuthHandler } from '../router.js';
 
 interface FailedTaskRow {
@@ -109,6 +111,24 @@ export const retryHandler: AuthHandler = async (_req, params, ctx) => {
     return new Response(JSON.stringify({ error: 'spawn_failed', message: 'Could not admit the retry task.' }), {
       status: 500,
       headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  // Auto-archive the original so retry doesn't double up the board.
+  // Failure here is non-fatal — the retry already landed, and operator
+  // can dismiss manually. The SSE emit keeps the dashboard fresh either
+  // way (admit event from applySpawnTask + archived event from us).
+  try {
+    archiveTaskById(task.task_id);
+    emitDashboardEvent('task_event', {
+      task_id: task.task_id,
+      kind: 'archived',
+      agent_group_id: task.parent_agent_group_id,
+    });
+  } catch (err) {
+    log.warn('retryHandler: failed to archive original on retry', {
+      originalTaskId: task.task_id,
+      err: err instanceof Error ? err.message : String(err),
     });
   }
 
