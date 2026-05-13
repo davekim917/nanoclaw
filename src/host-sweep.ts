@@ -203,6 +203,13 @@ async function sweep(): Promise<void> {
   // representative of recent work; failed tasks are intentionally skipped.
   autoArchiveOldCompleted();
 
+  // Inbox: generate Haiku titles for sessions that don't have one (or
+  // whose existing title is ≥1h old AND has ≥10 new messages since).
+  // Concurrency-capped at 3 per tick — keeps the API spend bounded.
+  void import('./dashboard/session-title-sweep.js')
+    .then((mod) => mod.runSessionTitleSweep())
+    .catch((err) => log.warn('session-title sweep failed', { err }));
+
   // Prune dashboard_tokens rows past expiry + 1d grace (post-build QA fix SF-6).
   void import('./dashboard/db/dashboard-tokens.js')
     .then((mod) => mod.pruneDashboardTokens())
