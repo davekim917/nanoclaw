@@ -347,6 +347,48 @@ describe('sessionsHandler — D4', () => {
     expect(body.sessions[0]?.attention_state).toBe('stale');
   });
 
+  it('newly-created session with NULL last_active falls back to created_at (not stale)', async () => {
+    // A session created moments ago with no inbound traffic yet (e.g.,
+    // agent-shared session waiting for its first wake) should land in
+    // `idle`, not `stale`. Before Q4 fix, last_active=NULL → ageMs=Infinity
+    // → stale immediately on the first inbox refresh.
+    insertSession('sess-fresh', 'ag-1');
+    // last_active stays NULL by default
+    vi.mocked(fs.statSync).mockImplementation(() => {
+      throw new Error('ENOENT');
+    });
+    const ctx = makeCtx('u1', { no_filter: true });
+    const resp = await sessionsHandler(makeReq(), {}, ctx);
+    const body = (await resp!.json()) as { sessions: Array<{ session_id: string; attention_state: string }> };
+    expect(body.sessions[0]?.attention_state).toBe('idle');
+  });
+
+  it('pending attached task keeps session in `active` (Q4 from codex checkpoint #3)', async () => {
+    insertSession('p-sess', 'ag-1');
+    insertSession('c-sess-pending', 'ag-1');
+    insertAttachedTask({
+      taskId: 'task-pending',
+      childSessId: 'c-sess-pending',
+      parentSessId: 'p-sess',
+      agentGroupId: 'ag-1',
+      status: 'pending',
+    });
+    vi.mocked(fs.statSync).mockImplementation(() => {
+      throw new Error('ENOENT');
+    });
+    const ctx = makeCtx('u1', { no_filter: true });
+    const resp = await sessionsHandler(
+      makeReq('http://localhost/dashboard/api/sessions?group_id=ag-1'),
+      {},
+      ctx,
+    );
+    const body = (await resp!.json()) as {
+      sessions: Array<{ session_id: string; attention_state: string }>;
+    };
+    const child = body.sessions.find((s) => s.session_id === 'c-sess-pending');
+    expect(child?.attention_state).toBe('active');
+  });
+
   it('includes title, last_outbound_at, last_outbound_kind in response', async () => {
     insertSession('sess-t', 'ag-1');
     setSessionFields('sess-t', {

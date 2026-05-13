@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 
 vi.mock('swr', () => {
@@ -114,7 +114,7 @@ describe('InboxBoard', () => {
     expect(breadcells[1]!.querySelector('.n')!.textContent).toBe('1'); // active
   });
 
-  it('subscribes to session_event and invalidates on emit', async () => {
+  it('subscribes to session_event and invalidates on emit (debounced)', async () => {
     const mutate = vi.fn();
     vi.mocked(useSWR).mockReturnValue({
       data: { sessions: [] },
@@ -124,8 +124,12 @@ describe('InboxBoard', () => {
     render(<InboxBoard authMe={mockAuthMe} route="inbox" onRouteChange={noop} />);
     const sseModule = await import('../lib/sse.ts');
     const emitEvent = (sseModule as unknown as { __emitEvent: (k: string, p: unknown) => void }).__emitEvent;
+    // Emit a small burst — debounce should coalesce to a single mutate.
     emitEvent('session_event', { kind: 'inbound', session_id: 'sess-1', agent_group_id: 'ag-1' });
-    expect(mutate).toHaveBeenCalled();
+    emitEvent('session_event', { kind: 'outbound', session_id: 'sess-1', agent_group_id: 'ag-1' });
+    emitEvent('session_event', { kind: 'container_state', session_id: 'sess-1', agent_group_id: 'ag-1' });
+    await waitFor(() => expect(mutate).toHaveBeenCalled(), { timeout: 1000 });
+    expect(mutate.mock.calls.length).toBe(1);
   });
 
   it('clicking a session with attached_task navigates to TaskDetail', async () => {

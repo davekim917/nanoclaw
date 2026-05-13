@@ -273,4 +273,51 @@ describe('runSessionTitleSweep', () => {
     expect(result.generated).toBe(0);
     expect(backend).not.toHaveBeenCalled();
   });
+
+  it('re-entrancy guard: a second concurrent sweep call is a no-op (Q3)', async () => {
+    seedSession('sess-1', 'ag-1');
+    seedSession('sess-2', 'ag-1');
+    writeInboundMessages('ag-1', 'sess-1', [{ kind: 'chat', content: '{"text":"a"}' }]);
+    writeInboundMessages('ag-1', 'sess-2', [{ kind: 'chat', content: '{"text":"b"}' }]);
+    const backend = vi.fn(async () => {
+      // Hold the backend mid-flight so the second sweep starts before the
+      // first finishes — without the re-entrancy guard this would double-
+      // batch the same candidates.
+      await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      return 'title';
+    });
+    setTitleBackendForTest(backend);
+
+    const [a, b] = await Promise.all([runSessionTitleSweep(), runSessionTitleSweep()]);
+    // Exactly one of the calls did the work; the other returned 0/0.
+    const totals = [a.generated + a.skipped, b.generated + b.skipped];
+    expect(totals).toContain(0);
+    expect(totals.some((n) => n > 0)).toBe(true);
+  });
+
+  it('failure backoff stamps title_generated_at so the row is skipped next tick (Q3)', async () => {
+    seedSession('sess-fail', 'ag-1');
+    writeInboundMessages('ag-1', 'sess-fail', [{ kind: 'chat', content: '{"text":"x"}' }]);
+    setTitleBackendForTest(async () => {
+      throw new Error('boom');
+    });
+
+    const first = await runSessionTitleSweep();
+    expect(first.generated).toBe(0);
+    expect(first.skipped).toBe(1);
+
+    // The failure stamps a recent `title_generated_at`; the candidate
+    // query filters out rows with title_generated_at within the cooldown
+    // window. Next sweep tick should not pick this session.
+    const row = getDb()
+      .prepare('SELECT title_generated_at FROM sessions WHERE id = ?')
+      .get('sess-fail') as { title_generated_at: string | null };
+    expect(row.title_generated_at).toBeTruthy();
+
+    const backendSecond = vi.fn(async () => 'should not run');
+    setTitleBackendForTest(backendSecond);
+    const second = await runSessionTitleSweep();
+    expect(second.generated).toBe(0);
+    expect(backendSecond).not.toHaveBeenCalled();
+  });
 });

@@ -37,6 +37,7 @@ import { log } from '../log.js';
 export const CONCURRENCY_CAP = 3;
 export const COOLDOWN_HOURS = 1;
 export const REFRESH_MIN_NEW_MESSAGES = 10;
+const FAILURE_BACKOFF_MINUTES = 15;
 const MAX_MESSAGES_PER_SLICE = 12;
 const HAIKU_MAX_TITLE_CHARS = 60;
 const HAIKU_TIMEOUT_MS = 6000;
@@ -140,15 +141,16 @@ export function postProcessTitle(raw: string): string {
  */
 function pickCandidates(cap: number): CandidateRow[] {
   const cooldownIso = new Date(Date.now() - COOLDOWN_HOURS * 3600_000).toISOString();
+  // Gate purely on `title_generated_at` — a stamped failure-backoff row
+  // (see `stampFailureBackoff`) shouldn't slip back into the candidate
+  // set just because its `title` column is still NULL. The refresh case
+  // (title present + new messages) is gated in JS by `shouldGenerate`.
   const rows = getDb()
     .prepare(
       `SELECT id, agent_group_id, title, title_generated_at, title_basis_seq
          FROM sessions
         WHERE status = 'active'
-          AND (
-                title IS NULL
-             OR (title_generated_at IS NULL OR title_generated_at < ?)
-          )
+          AND (title_generated_at IS NULL OR title_generated_at < ?)
         ORDER BY COALESCE(title_generated_at, '0000') ASC
         LIMIT ?`,
     )
@@ -258,6 +260,24 @@ function persistTitle(sessionId: string, title: string, basisSeq: number, genera
 }
 
 /**
+ * Stamp `title_generated_at` to a near-future timestamp so the same row
+ * doesn't re-enter the candidate set on the next sweep tick. Without this,
+ * a session whose Haiku call keeps failing (network flake, content too
+ * short to summarize) would be picked 3-per-tick on every 60s tick,
+ * starving fresher sessions.
+ *
+ * Backoff is calibrated to {@link FAILURE_BACKOFF_MINUTES} from "now" so
+ * the cooldown predicate (`title_generated_at < now-1h`) hides the row
+ * for at least one quarter-hour. We do NOT write a fake `title` because
+ * a NULL title is still the operator-visible truth (the inbox falls back
+ * to the session id).
+ */
+function stampFailureBackoff(sessionId: string): void {
+  const stamp = new Date(Date.now() - (COOLDOWN_HOURS * 60 - FAILURE_BACKOFF_MINUTES) * 60_000).toISOString();
+  getDb().prepare(`UPDATE sessions SET title_generated_at = ? WHERE id = ?`).run(stamp, sessionId);
+}
+
+/**
  * Decide whether a candidate's existing title is still fresh enough to skip
  * regeneration this tick. Returns true if we should generate. The "≥10 new
  * messages since last basis seq" rule is implemented here using the slice's
@@ -279,7 +299,24 @@ function shouldGenerate(row: CandidateRow, sliceMaxSeq: number): boolean {
  *
  * Returns a small status struct for tests + logs.
  */
+// Re-entrancy guard: prevents a 60s tick from kicking off a second batch
+// while the previous batch's Haiku calls are still mid-flight. Without this
+// a slow Anthropic response (5-6s near the timeout) overlapped with a fast
+// `pickCandidates` query could trigger a second concurrent batch on the
+// next tick, exceeding the documented concurrency cap of 3.
+let sweepInProgress = false;
+
 export async function runSessionTitleSweep(): Promise<{ generated: number; skipped: number }> {
+  if (sweepInProgress) return { generated: 0, skipped: 0 };
+  sweepInProgress = true;
+  try {
+    return await _runSessionTitleSweepLocked();
+  } finally {
+    sweepInProgress = false;
+  }
+}
+
+async function _runSessionTitleSweepLocked(): Promise<{ generated: number; skipped: number }> {
   const candidates = pickCandidates(CONCURRENCY_CAP);
   if (candidates.length === 0) return { generated: 0, skipped: 0 };
 
@@ -316,6 +353,11 @@ export async function runSessionTitleSweep(): Promise<{ generated: number; skipp
             sessionId: row.id,
             err: err instanceof Error ? err.message : String(err),
           });
+          try {
+            stampFailureBackoff(row.id);
+          } catch {
+            /* stamp failure is non-fatal — next tick will retry */
+          }
           skipped++;
         } finally {
           clearTimeout(timer);

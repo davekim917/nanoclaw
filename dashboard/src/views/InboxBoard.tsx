@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import useSWR from 'swr';
 import {
   archiveSession,
@@ -74,10 +74,30 @@ export const InboxBoard: React.FC<InboxBoardProps> = ({ authMe, route, onRouteCh
   const { data: groupsData } = useSWR('/dashboard/api/groups', () => listGroups(), { refreshInterval: 0 });
   const groups: GroupSummary[] = groupsData?.groups ?? [];
 
+  // Debounce SSE-triggered refetches. A streaming-status burst (50
+  // outbound rows in 5s under a heavy agent turn) emits 50 session_event
+  // frames; without a trailing-edge debounce SWR fires 50 mutate() calls
+  // even with its built-in 500ms dedupe (each is a distinct cache key
+  // boundary if other state changed). One refetch at 300ms is enough
+  // for the operator to see the new state.
+  const debounceRef = useRef<number | null>(null);
   const invalidate = useCallback(() => {
-    void mutate();
+    if (debounceRef.current !== null) return;
+    debounceRef.current = window.setTimeout(() => {
+      debounceRef.current = null;
+      void mutate();
+    }, 300);
   }, [mutate]);
-  useEffect(() => subscribe('session_event', invalidate), [invalidate]);
+  useEffect(() => {
+    const unsubscribe = subscribe('session_event', invalidate);
+    return () => {
+      unsubscribe();
+      if (debounceRef.current !== null) {
+        window.clearTimeout(debounceRef.current);
+        debounceRef.current = null;
+      }
+    };
+  }, [invalidate]);
 
   const onArchive = useCallback(
     async (sessionId: string) => {

@@ -151,6 +151,7 @@ interface SessionJoinRow {
   last_outbound_kind: string | null;
   title: string | null;
   archived_at: string | null;
+  created_at: string;
   attached_task_id: string | null;
   attached_task_status: string | null;
   attached_task_needs_input: number | null;
@@ -173,19 +174,22 @@ function deriveAttentionState(
 
   // 2) active — current heartbeat or in-flight task; otherwise fall back to
   // "any activity within 5min" using the broader timestamp so a recent
-  // outbound flush keeps the session in `active`.
+  // outbound flush keeps the session in `active`. `pending` and `running`
+  // attached-task statuses both count as in-flight from the operator's
+  // POV — a queued task is still "this session is doing something".
   if (containerStatus === 'running') return 'active';
-  if (row.attached_task_status === 'running') return 'active';
+  if (row.attached_task_status === 'running' || row.attached_task_status === 'pending') return 'active';
   if (hasRecurrence) return 'active';
   const lastActivityMs = Math.max(lastInboundMs, lastOutboundMs);
   if (lastActivityMs && nowMs - lastActivityMs < FIVE_MIN_MS) return 'active';
 
-  // 3) idle vs stale — the boundary is operator engagement, not agent
-  // activity, so `last_inbound_at` (== `sessions.last_active`) is the
-  // authoritative timestamp. An agent that's posting status messages into
-  // a dormant thread should still surface as `stale` for the operator
-  // after 24h of silence on their side.
-  const ageMs = lastInboundMs ? nowMs - lastInboundMs : Infinity;
+  // 3) idle vs stale — the boundary is operator engagement. `last_active`
+  // is inbound-only by schema. Newly created sessions can have no inbound
+  // yet (e.g., agent-shared session that hasn't received its first wake
+  // message) — for those we fall back to `created_at` so a 1-minute-old
+  // session doesn't get classified `stale` on its first inbox refresh.
+  const baselineMs = lastInboundMs || Date.parse(row.created_at);
+  const ageMs = baselineMs ? nowMs - baselineMs : Infinity;
   if (ageMs >= ONE_DAY_MS) return 'stale';
   return 'idle';
 }
@@ -242,6 +246,7 @@ export const sessionsHandler: AuthHandler = async (req, _params, ctx) => {
            s.last_outbound_kind,
            s.title,
            s.archived_at,
+           s.created_at,
            t.task_id          AS attached_task_id,
            t.status           AS attached_task_status,
            t.needs_input      AS attached_task_needs_input
@@ -276,14 +281,17 @@ export const sessionsHandler: AuthHandler = async (req, _params, ctx) => {
 
   const sessions: SessionSummary[] = rows.map((row) => {
     const containerStatus = deriveContainerStatus(row.agent_group_id, row.id);
-    // Only probe inbound.db for would-be-stale rows. Stale boundary is now
-    // operator-engagement (last_inbound) not max(in,out) — matches
-    // deriveAttentionState below.
+    // Only probe inbound.db for would-be-stale rows. Stale boundary uses
+    // last_inbound (fallback created_at for never-inbounded sessions) so a
+    // brand-new session-shared session doesn't trip the recurrence probe
+    // on every refresh.
     const lastInboundMs = row.last_active ? Date.parse(row.last_active) : 0;
+    const baselineMs = lastInboundMs || Date.parse(row.created_at);
     const couldBeStale =
       containerStatus !== 'running' &&
       row.attached_task_status !== 'running' &&
-      (!lastInboundMs || Date.now() - lastInboundMs >= ONE_DAY_MS);
+      row.attached_task_status !== 'pending' &&
+      (!baselineMs || Date.now() - baselineMs >= ONE_DAY_MS);
     const hasRecurrence = couldBeStale ? hasPendingRecurrence(row.agent_group_id, row.id, DATA_DIR) : false;
     const attentionState = deriveAttentionState(row, containerStatus, hasRecurrence);
     return {
