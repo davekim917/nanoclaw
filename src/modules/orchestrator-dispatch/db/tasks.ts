@@ -294,10 +294,7 @@ export function bulkArchiveByGroupAndStatus(
  * archived. Failed tasks are intentionally excluded — operator must
  * dismiss those explicitly.
  */
-export function autoArchiveCompletedBefore(
-  cutoffIso: string,
-  archivedAt: string = new Date().toISOString(),
-): number {
+export function autoArchiveCompletedBefore(cutoffIso: string, archivedAt: string = new Date().toISOString()): number {
   const result = getDb()
     .prepare(
       `UPDATE tasks

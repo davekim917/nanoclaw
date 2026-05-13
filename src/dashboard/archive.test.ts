@@ -174,7 +174,11 @@ describe('unarchiveHandler', () => {
     getDb().prepare(`UPDATE tasks SET archived_at = ? WHERE task_id = 't1'`).run(now());
 
     const ctx = makeCtx({ no_filter: true });
-    const resp = await unarchiveHandler(makeReq('http://localhost/dashboard/api/tasks/t1/unarchive'), { id: 't1' }, ctx);
+    const resp = await unarchiveHandler(
+      makeReq('http://localhost/dashboard/api/tasks/t1/unarchive'),
+      { id: 't1' },
+      ctx,
+    );
     expect(resp!.status).toBe(200);
 
     const row = getDb().prepare('SELECT archived_at FROM tasks WHERE task_id = ?').get('t1') as {
@@ -186,7 +190,11 @@ describe('unarchiveHandler', () => {
   it('returns 404 for out-of-scope task', async () => {
     insertTask('t1', 'ag-1', 'failed');
     const ctx = makeCtx({ allowed_group_ids: ['ag-9'] });
-    const resp = await unarchiveHandler(makeReq('http://localhost/dashboard/api/tasks/t1/unarchive'), { id: 't1' }, ctx);
+    const resp = await unarchiveHandler(
+      makeReq('http://localhost/dashboard/api/tasks/t1/unarchive'),
+      { id: 't1' },
+      ctx,
+    );
     expect(resp!.status).toBe(404);
   });
 });

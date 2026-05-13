@@ -912,9 +912,10 @@ describe('autoArchiveOldCompleted', () => {
 
     autoArchiveOldCompleted();
 
-    const rows = getDb()
-      .prepare('SELECT task_id, archived_at FROM tasks ORDER BY task_id')
-      .all() as Array<{ task_id: string; archived_at: string | null }>;
+    const rows = getDb().prepare('SELECT task_id, archived_at FROM tasks ORDER BY task_id').all() as Array<{
+      task_id: string;
+      archived_at: string | null;
+    }>;
     const byId = Object.fromEntries(rows.map((r) => [r.task_id, r.archived_at]));
     expect(byId['old']).not.toBeNull();
     expect(byId['fresh']).toBeNull();
