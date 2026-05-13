@@ -390,6 +390,25 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
       }
     }
 
+    // Env-var auto-wire: when the operator pre-declared a default agent
+    // for this channel_type via NANOCLAW_DEFAULT_AGENT_GROUP_<TYPE>, the
+    // channel-auto-wire module's resolver persists a messaging_group_agents
+    // row as a side effect; we re-enter routing with the fresh wiring in
+    // place. Resolver returns [] when no env var is set / folder is missing
+    // / the wiring insert raced — falls through to the approval gate below.
+    if (unwiredChannelResolver) {
+      const wirings = unwiredChannelResolver(event, mg);
+      if (wirings.length > 0) {
+        log.info('Env-var auto-wire', {
+          messagingGroupId: mg.id,
+          channelType: event.channelType,
+          platformId: event.platformId,
+          agentGroupIds: wirings.map((w) => w.agent_group_id),
+        });
+        return routeInbound(event);
+      }
+    }
+
     const parsed = safeParseContent(event.message.content);
     recordDroppedMessage({
       channel_type: event.channelType,
