@@ -16,7 +16,7 @@ import type { GroupFilter } from '../lib/use-group-filter.js';
  * reordered children. C8 reuses the same primitives without forking them.
  */
 
-export type BoardRoute = 'board' | 'inbox' | 'sessions';
+export type BoardRoute = 'board' | 'inbox';
 
 const MOBILE_QUERY = '(max-width: 899px)';
 
@@ -70,15 +70,11 @@ export function BoardBrand({
 }
 
 /**
- * Primary nav (Board / Inbox) for the mobile pulse header. Sessions has
- * been demoted to a small debug link in the desktop pulse-meta strip;
- * mobile only surfaces the two primary routes to keep the header tight.
- *
- * Active-route highlighting still drives off `route === ...` so the same
- * component renders correctly on the SessionList route (neither button
- * active) and on /dashboard/board or /dashboard/inbox.
+ * Primary nav (Board / Inbox) for the pulse header — rendered on both
+ * mobile and desktop. Active-route highlighting drives off `route === ...`
+ * so the component is layout-agnostic; positioning is up to the consumer.
  */
-export function MobileRouteNav({
+export function RouteNav({
   route,
   onRouteChange,
 }: {
@@ -94,31 +90,6 @@ export function MobileRouteNav({
         Inbox
       </button>
     </nav>
-  );
-}
-
-/**
- * The "debug → sessions" footer link rendered in the pulse-meta strip on
- * both layouts. Sessions is the raw row-by-row table view; the inbox board
- * supersedes it for normal use but the raw view stays accessible for
- * debugging (e.g., spotting orphaned sessions with no recent activity).
- */
-export function SessionsDebugLink({
-  route,
-  onRouteChange,
-}: {
-  route: BoardRoute;
-  onRouteChange: (r: BoardRoute) => void;
-}) {
-  return (
-    <button
-      type="button"
-      className={`nc-debug-link ${route === 'sessions' ? 'active' : ''}`}
-      onClick={() => onRouteChange('sessions')}
-      title="Raw sessions table — debug view"
-    >
-      debug · sessions
-    </button>
   );
 }
 

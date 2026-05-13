@@ -143,9 +143,9 @@ describe('KanbanBoard', () => {
     await waitFor(() => expect(mutate).toHaveBeenCalled());
   });
 
-  it('mobile nav (Board / Inbox) invokes onRouteChange', async () => {
-    // C8: mobile primary nav is now Board + Inbox (Sessions demoted to a
-    // small debug link rendered from the InboxBoard pulse-meta strip).
+  it('nav (Board / Inbox) invokes onRouteChange', async () => {
+    // Primary nav is Board + Inbox on both viewports; the old "Sessions"
+    // debug route was removed entirely.
     const onRouteChange = vi.fn();
     vi.mocked(useSWR).mockReturnValue({
       data: { tasks: [] },

@@ -16,7 +16,7 @@ import { useGroupFilter, type GroupFilter } from '../lib/use-group-filter.js';
 import {
   BoardBrand,
   BoardFrame,
-  MobileRouteNav,
+  RouteNav,
   ShowArchivedToggle as ShellShowArchivedToggle,
   useIsMobile,
   type BoardRoute,
@@ -212,7 +212,7 @@ function PulseHeader({
     <header className="nc-pulse">
       <div className="nc-pulse-top">
         <BoardBrand groups={groups} groupFilter={groupFilter} onGroupFilter={onGroupFilter} />
-        <MobileRouteNav route={route} onRouteChange={onRouteChange} />
+        <RouteNav route={route} onRouteChange={onRouteChange} />
       </div>
       <div className="nc-pulse-grid">
         <div className="nc-pulse-bigcount">
@@ -660,6 +660,7 @@ function DesktopBoard({
   tasks,
   counts,
   failedActionableCount,
+  route,
   onRouteChange,
   lastActivityIso,
   groups,
@@ -691,7 +692,10 @@ function DesktopBoard({
     <BoardFrame isMobile={false}>
       <div className="nc-desktop-top">
         <div className="nc-desktop-pulse">
-          <BoardBrand groups={groups} groupFilter={groupFilter} onGroupFilter={onGroupFilter} />
+          <div className="nc-desktop-headerrow">
+            <BoardBrand groups={groups} groupFilter={groupFilter} onGroupFilter={onGroupFilter} />
+            <RouteNav route={route} onRouteChange={onRouteChange} />
+          </div>
           <div className="bigcount">
             <span>{counts.total}</span>
             <span className="lbl">
@@ -721,12 +725,6 @@ function DesktopBoard({
             <ShowArchivedToggle actions={actions} />
             <div className="right">
               <BulkClearFailedButton actions={actions} failedCount={failedActionableCount} />
-              <button
-                className="nc-btn ghost"
-                onClick={() => onRouteChange('sessions')}
-              >
-                Sessions
-              </button>
             </div>
           </div>
           <div className="nc-desktop-summary">

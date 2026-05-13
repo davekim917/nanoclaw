@@ -183,14 +183,15 @@ describe('InboxBoard', () => {
     expect(vi.mocked(archiveSession)).toHaveBeenCalledWith('sess-arch');
   });
 
-  it('clicking the Board button (toolbar right) fires onRouteChange', async () => {
+  it('clicking the Board nav button fires onRouteChange', async () => {
     vi.mocked(useSWR).mockReturnValue({
       data: { sessions: [] },
       mutate: vi.fn(),
     } as unknown as ReturnType<typeof useSWR>);
     const onRouteChange = vi.fn();
     render(<InboxBoard authMe={mockAuthMe} route="inbox" onRouteChange={onRouteChange} />);
-    await userEvent.click(screen.getByRole('button', { name: /← Board/i }));
+    // The primary RouteNav renders "Board" + "Inbox" on both layouts.
+    await userEvent.click(screen.getByRole('button', { name: /^Board$/i }));
     expect(onRouteChange).toHaveBeenCalledWith('board');
   });
 });

@@ -16,8 +16,7 @@ import { useGroupFilter } from '../lib/use-group-filter.js';
 import {
   BoardBrand,
   BoardFrame,
-  MobileRouteNav,
-  SessionsDebugLink,
+  RouteNav,
   ShowArchivedToggle,
   useIsMobile,
   type BoardRoute,
@@ -264,7 +263,7 @@ function MobileInboxHeader({
       <header className="nc-pulse">
         <div className="nc-pulse-top">
           <BoardBrand groups={groups} groupFilter={groupFilter} onGroupFilter={onGroupFilter} />
-          <MobileRouteNav route={route} onRouteChange={onRouteChange} />
+          <RouteNav route={route} onRouteChange={onRouteChange} />
         </div>
         <div className="nc-pulse-grid">
           <div className="nc-pulse-bigcount">
@@ -287,7 +286,6 @@ function MobileInboxHeader({
             <span className="dot" aria-hidden="true"></span>
             LIVE · last event {relAge(lastActivityIso)} ago
           </span>
-          <SessionsDebugLink route={route} onRouteChange={onRouteChange} />
         </div>
       </header>
       <div className="nc-archive-toolbar">
@@ -323,7 +321,10 @@ function DesktopInboxHeader({
   return (
     <div className="nc-desktop-top">
       <div className="nc-desktop-pulse">
-        <BoardBrand groups={groups} groupFilter={groupFilter} onGroupFilter={onGroupFilter} />
+        <div className="nc-desktop-headerrow">
+          <BoardBrand groups={groups} groupFilter={groupFilter} onGroupFilter={onGroupFilter} />
+          <RouteNav route={route} onRouteChange={onRouteChange} />
+        </div>
         <div className="bigcount">
           <span>{counts.total}</span>
           <span className="lbl">
@@ -343,21 +344,11 @@ function DesktopInboxHeader({
             <span className="dot" aria-hidden="true"></span>
             LIVE · last event {relAge(lastActivityIso)} ago
           </span>
-          <SessionsDebugLink route={route} onRouteChange={onRouteChange} />
         </div>
       </div>
       <div>
         <div className="nc-desktop-toolbar">
           <ShowArchivedToggle showArchived={showArchived} onChange={onShowArchivedChange} />
-          <div className="right">
-            <button
-              type="button"
-              className={`nc-btn ${route === 'board' ? '' : 'ghost'}`}
-              onClick={() => onRouteChange('board')}
-            >
-              ← Board
-            </button>
-          </div>
         </div>
         <div className="nc-desktop-summary">
           Operator inbox · <strong>{counts.total} sessions</strong>.{' '}

@@ -5,7 +5,6 @@ import { KanbanBoard } from './views/KanbanBoard.js';
 import { InboxBoard } from './views/InboxBoard.js';
 import { TaskDetail } from './views/TaskDetail.js';
 import { SessionDetail } from './views/SessionDetail.js';
-import { SessionList } from './views/SessionList.js';
 import { authMe as fetchAuthMe } from './lib/api.js';
 import { startSSE } from './lib/sse.ts';
 import type { AuthMe } from './lib/api.js';
@@ -20,7 +19,6 @@ function parseHash(): { route: BoardRoute | 'task' | 'session'; taskId?: string;
   if (hash.startsWith('/task/')) return { route: 'task', taskId: hash.slice(6) };
   if (hash.startsWith('/session/')) return { route: 'session', sessionId: hash.slice(9) };
   if (hash === '/inbox') return { route: 'inbox' };
-  if (hash === '/sessions') return { route: 'sessions' };
   return { route: 'board' };
 }
 
@@ -57,9 +55,7 @@ function App() {
   }, []);
 
   const navigate = useCallback((r: BoardRoute) => {
-    if (r === 'inbox') location.hash = '#/inbox';
-    else if (r === 'sessions') location.hash = '#/sessions';
-    else location.hash = '#/board';
+    location.hash = r === 'inbox' ? '#/inbox' : '#/board';
   }, []);
 
   if (authState === 'loading') {
@@ -96,9 +92,6 @@ function App() {
       {hashState.route === 'task' && hashState.taskId && me && <TaskDetail authMe={me} taskId={hashState.taskId} />}
       {hashState.route === 'session' && hashState.sessionId && me && (
         <SessionDetail authMe={me} sessionId={hashState.sessionId} />
-      )}
-      {hashState.route === 'sessions' && me && (
-        <SessionList authMe={me} route="sessions" onRouteChange={navigate} />
       )}
     </div>
   );
