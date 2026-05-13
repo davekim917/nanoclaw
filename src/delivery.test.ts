@@ -195,6 +195,50 @@ describe('deliverSessionMessages — concurrent invocations', () => {
     });
   });
 
+  it('suppresses status messages in chat for spawn-child sessions', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+
+    // Mark this session as a spawn-child by inserting a task row with
+    // child_session_id = session.id. `isSpawnChildSession` queries the
+    // central tasks table and caches per-process.
+    const { getDb } = await import('./db/connection.js');
+    getDb()
+      .prepare(
+        `INSERT INTO tasks
+           (task_id, idempotency_key, parent_session_id, parent_agent_group_id,
+            child_session_id, status, task_content, request_hash, admitted_at,
+            surface_mode, created_at)
+         VALUES (?, ?, ?, 'ag-1', ?, 'running', 'x', 'h', ?, 'native_thread', ?)`,
+      )
+      .run('task-spawn-1', 'key-1', session.id, session.id, now(), now());
+
+    // Insert a status row that WOULD post to the channel for a normal
+    // session. For a spawn-child session, delivery should suppress it.
+    insertOutboundKind('ag-1', session.id, 'thinking-1', 'status', 'telegram', 'telegram:123', {
+      text: '> 💭 reading the brief...',
+    });
+
+    const calls: Array<{ kind: string }> = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, kind) {
+        calls.push({ kind });
+        return 'plat-msg-id';
+      },
+    });
+
+    await deliverSessionMessages(session);
+
+    // No platform send happened for the status row.
+    expect(calls.filter((c) => c.kind === 'status')).toHaveLength(0);
+
+    // The row should still be markDelivered'd so it doesn't reprocess.
+    const inDb = openInboundDb('ag-1', session.id);
+    const delivered = getDeliveredIds(inDb);
+    inDb.close();
+    expect(delivered.has('thinking-1')).toBe(true);
+  });
+
   it('swallows deleteMessage failures so chat reply still completes', async () => {
     // If the platform delete fails (network, permission, message-not-found),
     // the chat reply must still mark delivered. Otherwise the reply gets

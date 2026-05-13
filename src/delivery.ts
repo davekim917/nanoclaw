@@ -512,7 +512,25 @@ async function deliverMessage(
       return {};
     }
     const appendMode = isSpawnChildSession(session.id);
-    const existing = appendMode ? undefined : statusTracking.get(session.id);
+    if (appendMode) {
+      // Spawn-task child sessions used to render every thinking block as a
+      // durable message in the worker's Slack/Discord thread — a "durable
+      // work log" pattern. Operator feedback after the inbox board
+      // shipped: the 💭 stream is just noise in chat, and SessionDetail
+      // already surfaces thinking blocks as a collapsible group in the
+      // dashboard. Suppress channel delivery for spawn-child status only;
+      // the outbound.db row stays (so SessionDetail still sees the
+      // thinking), markDelivered fires in the caller, and the
+      // last_outbound bump + SSE downstream of this branch still notify
+      // the inbox. Final spawn_progress / spawn_complete / spawn_failed
+      // messages flow through their own MCP handlers, not this branch.
+      log.info('Status suppressed in chat for spawn-child session', {
+        id: msg.id,
+        sessionId: session.id,
+      });
+      return {};
+    }
+    const existing = statusTracking.get(session.id);
     let outbound = scrubSecrets(msg.content);
     if (existing) {
       const parsed = JSON.parse(outbound);
@@ -529,7 +547,7 @@ async function deliverMessage(
       msg.kind,
       outbound,
     );
-    if (platformMsgId && !existing && !appendMode) {
+    if (platformMsgId && !existing) {
       // Pin the route at post-time. The cleanup branch on chat delivery uses
       // *this* route to delete the orphan, NOT the chat-final's route — the
       // agent's send_message MCP tool can target a different channel/thread,
