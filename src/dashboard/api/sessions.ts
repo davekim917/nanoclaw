@@ -318,3 +318,149 @@ export const sessionsHandler: AuthHandler = async (req, _params, ctx) => {
     headers: { 'Content-Type': 'application/json' },
   });
 };
+
+/* ─── Session detail (GET /dashboard/api/sessions/:id) ─────────────────────── */
+
+export interface SessionTranscriptEntry {
+  direction: 'in' | 'out';
+  kind: string;
+  seq: number;
+  timestamp: string;
+  text: string;
+}
+
+const TRANSCRIPT_TAIL = 50;
+
+/**
+ * Best-effort transcript reader. Opens the session's inbound + outbound DBs
+ * read-only, pulls the last {@link TRANSCRIPT_TAIL} entries from each, and
+ * merges them by seq so the operator sees the most-recent interleaved
+ * conversation. Failures (DB missing, file corrupted) return an empty
+ * array — the page renders the meta header either way.
+ */
+function readSessionTranscript(agentGroupId: string, sessionId: string): SessionTranscriptEntry[] {
+  const out: SessionTranscriptEntry[] = [];
+
+  function readSide(side: 'in' | 'out'): void {
+    const file = side === 'in' ? 'inbound.db' : 'outbound.db';
+    const table = side === 'in' ? 'messages_in' : 'messages_out';
+    const p = path.join(DATA_DIR, 'v2-sessions', agentGroupId, sessionId, file);
+    if (!fs.existsSync(p)) return;
+    let db: Database.Database | null = null;
+    try {
+      db = new Database(p, { readonly: true });
+      db.pragma('busy_timeout = 1000');
+      const rows = db
+        .prepare(
+          `SELECT seq, kind, timestamp, content
+             FROM ${table}
+            WHERE content IS NOT NULL AND content <> ''
+            ORDER BY seq DESC
+            LIMIT ?`,
+        )
+        .all(TRANSCRIPT_TAIL) as Array<{ seq: number; kind: string; timestamp: string; content: string }>;
+      for (const r of rows) {
+        let text: string;
+        try {
+          const parsed = JSON.parse(r.content) as { text?: unknown; prompt?: unknown; question?: unknown };
+          text = String(parsed.text ?? parsed.prompt ?? parsed.question ?? r.content).trim();
+        } catch {
+          text = r.content;
+        }
+        out.push({ direction: side, kind: r.kind, seq: r.seq, timestamp: r.timestamp, text });
+      }
+    } catch (err) {
+      log.warn('sessionsDetailHandler: transcript read failed', {
+        side,
+        sessionId,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    } finally {
+      db?.close();
+    }
+  }
+
+  readSide('in');
+  readSide('out');
+  // Newest first by seq; tail-trim the merged stream so we don't return >100
+  // when both sides have full TRANSCRIPT_TAIL rows.
+  out.sort((a, b) => b.seq - a.seq);
+  return out.slice(0, TRANSCRIPT_TAIL);
+}
+
+export const sessionsDetailHandler: AuthHandler = async (_req, params, ctx) => {
+  const sessionId = params['id'] ?? '';
+  // Re-use the same SELECT shape from the list handler so the detail row
+  // carries every field the inbox card already shows — saves the SPA from
+  // round-tripping through the list endpoint just to render the header.
+  const row = getDb()
+    .prepare(
+      `SELECT s.id, s.agent_group_id, s.messaging_group_id, s.thread_id,
+              s.last_active, s.last_outbound_at, s.last_outbound_kind,
+              s.title, s.archived_at, s.created_at,
+              t.task_id          AS attached_task_id,
+              t.status           AS attached_task_status,
+              t.needs_input      AS attached_task_needs_input
+         FROM sessions s
+    LEFT JOIN (
+                  SELECT task_id, child_session_id, status, needs_input, admitted_at,
+                         ROW_NUMBER() OVER (PARTITION BY child_session_id ORDER BY admitted_at DESC) AS rn
+                    FROM tasks
+                   WHERE child_session_id IS NOT NULL
+                     AND status IN ('pending', 'running')
+                ) t ON t.child_session_id = s.id AND t.rn = 1
+        WHERE s.id = ?`,
+    )
+    .get(sessionId) as SessionJoinRow | undefined;
+
+  // §2a: nonexistent and out-of-scope both 404 with the same body. Same
+  // collapse the steer + archive handlers use.
+  if (!row) {
+    return new Response(JSON.stringify({ error: 'session_not_found' }), {
+      status: 404,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+  if (!ctx.scopes.no_filter && !ctx.scopes.allowed_group_ids.includes(row.agent_group_id)) {
+    return new Response(JSON.stringify({ error: 'session_not_found' }), {
+      status: 404,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }
+
+  const containerStatus = deriveContainerStatus(row.agent_group_id, row.id);
+  const lastInboundMs = row.last_active ? Date.parse(row.last_active) : 0;
+  const baselineMs = lastInboundMs || Date.parse(row.created_at);
+  const couldBeStale =
+    containerStatus !== 'running' &&
+    row.attached_task_status !== 'running' &&
+    row.attached_task_status !== 'pending' &&
+    (!baselineMs || Date.now() - baselineMs >= ONE_DAY_MS);
+  const hasRecurrence = couldBeStale ? hasPendingRecurrence(row.agent_group_id, row.id, DATA_DIR) : false;
+  const attentionState = deriveAttentionState(row, containerStatus, hasRecurrence);
+
+  const session: SessionSummary = {
+    agent_group_id: row.agent_group_id,
+    session_id: row.id,
+    messaging_group_id: row.messaging_group_id,
+    thread_id: row.thread_id,
+    title: row.title,
+    last_inbound_at: row.last_active,
+    last_outbound_at: row.last_outbound_at,
+    last_outbound_kind: row.last_outbound_kind,
+    archived_at: row.archived_at,
+    container_status: containerStatus,
+    has_pending_recurrence: hasRecurrence,
+    attached_task_id: row.attached_task_id,
+    attached_task_status: row.attached_task_status,
+    attached_task_needs_input: row.attached_task_needs_input === null ? null : row.attached_task_needs_input === 1,
+    attention_state: attentionState,
+  };
+
+  const transcript = readSessionTranscript(row.agent_group_id, row.id);
+
+  return new Response(JSON.stringify({ session, transcript }), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json' },
+  });
+};

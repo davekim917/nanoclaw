@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import http from 'http';
 
 import { closeDb, initTestDb, runMigrations, createAgentGroup, getDb } from '../../db/index.js';
-import { sessionsHandler } from './sessions.js';
+import { sessionsHandler, sessionsDetailHandler } from './sessions.js';
 import type { AuthedRequestContext } from '../router.js';
 
 // ── Mocks ────────────────────────────────────────────────────────────────────
@@ -406,5 +406,67 @@ describe('sessionsHandler — D4', () => {
     expect(row.title).toBe('XZO-71 — rollout fix');
     expect(row.last_outbound_at).toBe('2026-05-13T12:00:00Z');
     expect(row.last_outbound_kind).toBe('chat-sdk:chat_message');
+  });
+});
+
+describe('sessionsDetailHandler', () => {
+  beforeEach(() => {
+    vi.mocked(fs.statSync).mockReset();
+    vi.mocked(fs.statSync).mockImplementation(() => {
+      throw new Error('ENOENT');
+    });
+    setupDb();
+    seedAgentGroup('ag-1');
+    seedAgentGroup('ag-2');
+  });
+
+  afterEach(() => {
+    closeDb();
+    vi.clearAllMocks();
+  });
+
+  it('returns 200 with enriched session payload + empty transcript when no DBs present', async () => {
+    insertSession('sess-detail', 'ag-1');
+    setSessionFields('sess-detail', { title: 'meeting prep' });
+    const ctx = makeCtx('u1', { no_filter: true });
+    const resp = await sessionsDetailHandler(
+      makeReq('http://localhost/dashboard/api/sessions/sess-detail'),
+      { id: 'sess-detail' },
+      ctx,
+    );
+    expect(resp!.status).toBe(200);
+    const body = (await resp!.json()) as {
+      session: { session_id: string; title: string | null; attention_state: string };
+      transcript: unknown[];
+    };
+    expect(body.session.session_id).toBe('sess-detail');
+    expect(body.session.title).toBe('meeting prep');
+    expect(body.session.attention_state).toBeTruthy();
+    expect(body.transcript).toEqual([]);
+  });
+
+  it('returns 404 session_not_found for nonexistent session', async () => {
+    const ctx = makeCtx('u1', { no_filter: true });
+    const resp = await sessionsDetailHandler(
+      makeReq('http://localhost/dashboard/api/sessions/sess-NOPE'),
+      { id: 'sess-NOPE' },
+      ctx,
+    );
+    expect(resp!.status).toBe(404);
+    const body = (await resp!.json()) as { error: string };
+    expect(body.error).toBe('session_not_found');
+  });
+
+  it('§2a — out-of-scope session returns 404, same body as nonexistent', async () => {
+    insertSession('sess-other-group', 'ag-2');
+    const ctx = makeCtx('u1', { allowed_group_ids: ['ag-1'] });
+    const resp = await sessionsDetailHandler(
+      makeReq('http://localhost/dashboard/api/sessions/sess-other-group'),
+      { id: 'sess-other-group' },
+      ctx,
+    );
+    expect(resp!.status).toBe(404);
+    const body = (await resp!.json()) as { error: string };
+    expect(body.error).toBe('session_not_found');
   });
 });

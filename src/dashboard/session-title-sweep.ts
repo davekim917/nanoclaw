@@ -29,6 +29,7 @@ import path from 'path';
 import fs from 'fs';
 
 import Database from 'better-sqlite3';
+import { EnvHttpProxyAgent, fetch as undiciFetch, type Dispatcher } from 'undici';
 
 import { DATA_DIR } from '../config.js';
 import { getDb } from '../db/connection.js';
@@ -74,17 +75,50 @@ export function _resetTitleBackendForTest(): void {
 }
 
 /**
- * Returns true when the host process has a viable path to Anthropic. The
- * production deploy migrates keys to the OneCLI vault and runs the service
- * WITHOUT `ANTHROPIC_API_KEY` set; in that mode the title sweep can't
- * reach Anthropic directly, so it no-ops until a follow-up wires the
- * OneCLI gateway path (HTTPS_PROXY + CLAUDE_CODE_OAUTH_TOKEN, mirroring
- * `src/memory-daemon/backends/anthropic.ts`). The test backend override
- * is always considered configured.
+ * Returns true when the host process has a viable path to Anthropic. Two
+ * supported modes:
+ *
+ *   1. Direct API key — `ANTHROPIC_API_KEY` is set on the process.
+ *   2. OneCLI gateway proxy — `HTTPS_PROXY` (or HTTP_PROXY) is set AND
+ *      `CLAUDE_CODE_OAUTH_TOKEN` is non-empty. The gateway substitutes
+ *      the literal "placeholder" Bearer with the vault token at request
+ *      time. This is the production path; the systemd unit wires
+ *      HTTPS_PROXY=http://127.0.0.1:10255 + CLAUDE_CODE_OAUTH_TOKEN
+ *      =placeholder.
+ *
+ * The test backend override is always considered configured so unit
+ * tests don't need to set any env vars.
  */
 export function isBackendConfigured(): boolean {
   if (_backendOverride !== null) return true;
-  return !!process.env['ANTHROPIC_API_KEY'];
+  if (process.env['ANTHROPIC_API_KEY']) return true;
+  const hasProxy = !!(
+    process.env['HTTPS_PROXY'] ||
+    process.env['https_proxy'] ||
+    process.env['HTTP_PROXY'] ||
+    process.env['http_proxy']
+  );
+  return hasProxy && !!process.env['CLAUDE_CODE_OAUTH_TOKEN'];
+}
+
+// Lazy-init proxy dispatcher — mirrors src/memory-daemon/backends/anthropic.ts.
+// Resolved on first call so tests don't pick up stale state from earlier
+// proxy env, and a service restart after env changes Just Works.
+let _envProxyDispatcher: Dispatcher | null | undefined;
+function getProxyDispatcher(): Dispatcher | null {
+  if (_envProxyDispatcher !== undefined) return _envProxyDispatcher;
+  const hasProxyEnv = !!(
+    process.env['HTTPS_PROXY'] ||
+    process.env['https_proxy'] ||
+    process.env['HTTP_PROXY'] ||
+    process.env['http_proxy']
+  );
+  _envProxyDispatcher = hasProxyEnv ? new EnvHttpProxyAgent() : null;
+  return _envProxyDispatcher;
+}
+
+export function _resetProxyDispatcherForTest(): void {
+  _envProxyDispatcher = undefined;
 }
 
 let _missingBackendLogged = false;
@@ -100,15 +134,34 @@ async function callTitleBackend(system: string, user: string, signal: AbortSigna
     ]);
   }
 
-  const apiKey = process.env['ANTHROPIC_API_KEY'];
-  if (!apiKey) throw new Error('session-title: ANTHROPIC_API_KEY not set');
+  const directApiKey = process.env['ANTHROPIC_API_KEY'] ?? '';
+  const oauthToken = process.env['CLAUDE_CODE_OAUTH_TOKEN'] ?? '';
+  const useOauth = !directApiKey && oauthToken;
+  if (!directApiKey && !useOauth) {
+    throw new Error('session-title: no Anthropic credentials available');
+  }
+
   const baseUrl = process.env['ANTHROPIC_BASE_URL'] ?? 'https://api.anthropic.com';
   const model = process.env['NANOCLAW_SESSION_TITLE_MODEL'] ?? DEFAULT_MODEL;
-  const resp = await fetch(`${baseUrl}/v1/messages`, {
+
+  // When a proxy is configured, route through undici with EnvHttpProxyAgent
+  // so the OneCLI gateway can swap the placeholder OAuth token for the
+  // real vault token at request time. Same pattern as
+  // `src/memory-daemon/backends/anthropic.ts`.
+  const dispatcher = getProxyDispatcher();
+  const fetchImpl: typeof fetch = dispatcher
+    ? ((url, init) => undiciFetch(url as string, { ...init, dispatcher } as Parameters<typeof undiciFetch>[1]) as unknown as Promise<Response>)
+    : fetch;
+
+  const authHeaders: Record<string, string> = useOauth
+    ? { authorization: `Bearer ${oauthToken}`, 'anthropic-beta': 'oauth-2025-04-20' }
+    : { 'x-api-key': directApiKey };
+
+  const resp = await fetchImpl(`${baseUrl}/v1/messages`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'x-api-key': apiKey,
+      ...authHeaders,
       'anthropic-version': '2023-06-01',
     },
     body: JSON.stringify({

@@ -87,6 +87,19 @@ export interface SessionsResponse {
   sessions: SessionSummary[];
 }
 
+export interface SessionTranscriptEntry {
+  direction: 'in' | 'out';
+  kind: string;
+  seq: number;
+  timestamp: string;
+  text: string;
+}
+
+export interface SessionDetailResponse {
+  session: SessionSummary;
+  transcript: SessionTranscriptEntry[];
+}
+
 export interface SteerResponse {
   task_id: string;
   message_id: string;
@@ -162,6 +175,10 @@ export async function listGroups(): Promise<GroupListResponse> {
 
 export async function getTask(id: string): Promise<TaskDetailResponse> {
   return apiFetch<TaskDetailResponse>(`/dashboard/api/tasks/${encodeURIComponent(id)}`);
+}
+
+export async function getSessionDetail(sessionId: string): Promise<SessionDetailResponse> {
+  return apiFetch<SessionDetailResponse>(`/dashboard/api/sessions/${encodeURIComponent(sessionId)}`);
 }
 
 export async function listSessions(filter?: {

@@ -10,7 +10,7 @@ import { ensureServerStarted } from '../webhook-server.js';
 import { startSSEFeed, stopSSEFeed, eventsHandler } from './api/events.js';
 import { indexHtmlHandler, staticHandler } from './static.js';
 import { tasksListHandler, tasksDetailHandler } from './api/tasks.js';
-import { sessionsHandler } from './api/sessions.js';
+import { sessionsHandler, sessionsDetailHandler } from './api/sessions.js';
 import { groupsListHandler } from './api/groups.js';
 import { steerHandler, sessionMessageHandler } from './steer.js';
 import { retryHandler } from './api/retry.js';
@@ -51,6 +51,7 @@ export function startDashboard(): void {
   register('GET', '/dashboard/api/tasks', requireAuth(tasksListHandler));
   register('GET', '/dashboard/api/tasks/:id', requireAuth(tasksDetailHandler));
   register('GET', '/dashboard/api/sessions', requireAuth(sessionsHandler));
+  register('GET', '/dashboard/api/sessions/:id', requireAuth(sessionsDetailHandler));
   register('GET', '/dashboard/api/groups', requireAuth(groupsListHandler));
   register('POST', '/dashboard/api/tasks/:id/message', requireAuth(steerHandler));
   register('POST', '/dashboard/api/sessions/:id/message', requireAuth(sessionMessageHandler));

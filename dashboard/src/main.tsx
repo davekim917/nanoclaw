@@ -4,6 +4,7 @@ import { AuthGate } from './auth/AuthGate.js';
 import { KanbanBoard } from './views/KanbanBoard.js';
 import { InboxBoard } from './views/InboxBoard.js';
 import { TaskDetail } from './views/TaskDetail.js';
+import { SessionDetail } from './views/SessionDetail.js';
 import { SessionList } from './views/SessionList.js';
 import { authMe as fetchAuthMe } from './lib/api.js';
 import { startSSE } from './lib/sse.ts';
@@ -14,9 +15,10 @@ import './styles.css';
 // Design-tool tweak variant. Switchable classes documented in styles.css.
 const TWEAK_CLASS = 'tw-no-heat tw-no-phasebar tw-no-grid';
 
-function parseHash(): { route: BoardRoute | 'task'; taskId?: string } {
+function parseHash(): { route: BoardRoute | 'task' | 'session'; taskId?: string; sessionId?: string } {
   const hash = location.hash.slice(1) || '/board';
   if (hash.startsWith('/task/')) return { route: 'task', taskId: hash.slice(6) };
+  if (hash.startsWith('/session/')) return { route: 'session', sessionId: hash.slice(9) };
   if (hash === '/inbox') return { route: 'inbox' };
   if (hash === '/sessions') return { route: 'sessions' };
   return { route: 'board' };
@@ -92,6 +94,9 @@ function App() {
       {hashState.route === 'board' && me && <KanbanBoard authMe={me} route="board" onRouteChange={navigate} />}
       {hashState.route === 'inbox' && me && <InboxBoard authMe={me} route="inbox" onRouteChange={navigate} />}
       {hashState.route === 'task' && hashState.taskId && me && <TaskDetail authMe={me} taskId={hashState.taskId} />}
+      {hashState.route === 'session' && hashState.sessionId && me && (
+        <SessionDetail authMe={me} sessionId={hashState.sessionId} />
+      )}
       {hashState.route === 'sessions' && me && (
         <SessionList authMe={me} route="sessions" onRouteChange={navigate} />
       )}

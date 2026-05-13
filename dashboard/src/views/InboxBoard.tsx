@@ -417,14 +417,15 @@ function SessionCard({
   const lastInbound = session.last_inbound_at ?? session.last_active;
   const lastOutbound = session.last_outbound_at;
 
-  // Sessions with an attached task open in TaskDetail (existing UX). Direct
-  // conversation sessions have no detail view yet — clicking is a no-op
-  // until a follow-up adds SessionDetail.
+  // Cards with an attached_task short-circuit to TaskDetail (existing UX
+  // for spawn workers). Every other card opens its own SessionDetail at
+  // `#/session/:id`, where the operator can read recent messages and
+  // send a steer via the C5 session-message endpoint.
   const onClick = () => {
     if (isAttachedTask) location.hash = `#/task/${session.attached_task_id}`;
+    else location.hash = `#/session/${session.session_id}`;
   };
   const onKey = (e: React.KeyboardEvent) => {
-    if (!isAttachedTask) return;
     if (e.key === 'Enter' || e.key === ' ') {
       e.preventDefault();
       onClick();
@@ -442,8 +443,8 @@ function SessionCard({
   return (
     <div
       className={`nc-card ${colourClass}${isArchived ? ' archived' : ''}`}
-      role={isAttachedTask ? 'button' : undefined}
-      tabIndex={isAttachedTask ? 0 : -1}
+      role="button"
+      tabIndex={0}
       onClick={onClick}
       onKeyDown={onKey}
       data-session-id={session.session_id}

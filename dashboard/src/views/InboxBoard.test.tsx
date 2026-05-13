@@ -151,6 +151,25 @@ describe('InboxBoard', () => {
     expect(location.hash).toBe('#/task/task-99');
   });
 
+  it('clicking a direct-conversation session navigates to SessionDetail', async () => {
+    vi.mocked(useSWR).mockReturnValue({
+      data: {
+        sessions: [
+          session({ session_id: 'sess-direct', attention_state: 'idle', attached_task_id: null }),
+        ],
+      },
+      mutate: vi.fn(),
+    } as unknown as ReturnType<typeof useSWR>);
+
+    location.hash = '';
+    render(<InboxBoard authMe={mockAuthMe} route="inbox" onRouteChange={noop} />);
+    const cards = screen.getAllByRole('button', { name: /idle/i });
+    const card = cards.find((el) => (el as HTMLElement).dataset.sessionId === 'sess-direct');
+    expect(card).toBeTruthy();
+    await userEvent.click(card!);
+    expect(location.hash).toBe('#/session/sess-direct');
+  });
+
   it('archive button calls archiveSession', async () => {
     const { archiveSession } = await import('../lib/api.js');
     vi.mocked(useSWR).mockReturnValue({

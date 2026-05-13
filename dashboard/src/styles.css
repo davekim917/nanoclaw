@@ -334,6 +334,26 @@ a:hover { color: var(--fg); }
 .nc-debug-link:hover { color: var(--fg-2); border-color: var(--bd-1); }
 .nc-debug-link.active { color: var(--fg-1); border-color: var(--st-running); }
 
+/* SessionDetail layout (sibling to TaskDetail's nc-detail-*) */
+.nc-task-detail { padding: 16px 18px 32px; max-width: 880px; margin: 0 auto; }
+.nc-task-detail h2 { margin: 12px 0 6px; font-size: 18px; }
+.nc-task-detail h3 { margin: 16px 0 8px; font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--fg-3); }
+.nc-meta-row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 6px 0 10px; }
+.nc-meta-row button.nc-pill { cursor: pointer; }
+.nc-composer-meta {
+  display: flex; gap: 12px; align-items: center; justify-content: flex-end;
+  margin-top: 6px; font-family: var(--font-mono); font-size: 10.5px;
+}
+.nc-transcript { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.nc-transcript-row {
+  padding: 8px 10px; border-radius: 6px; border: 1px solid var(--bd-2);
+  background: oklch(0.18 0.005 60);
+}
+.nc-transcript-row.inbound { border-left: 2px solid var(--st-running); }
+.nc-transcript-row.outbound { border-left: 2px solid var(--fg-3); }
+.nc-transcript-meta { display: flex; gap: 8px; align-items: center; margin-bottom: 4px; }
+.nc-transcript-text { font-size: 13px; line-height: 1.4; white-space: pre-wrap; word-break: break-word; }
+
 /* ─── Filter chips */
 .nc-chips {
   display: flex; gap: 6px;
