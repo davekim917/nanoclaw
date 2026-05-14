@@ -491,7 +491,7 @@ export function writeCodexHooksJson(opts?: { emailGateTimeoutSec?: number }): vo
  * shadow but not improve precedence.
  */
 export function createCodexConfigOverrides(stickyConfig?: {
-  reasoning_effort?: 'low' | 'medium' | 'high';
+  reasoning_effort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
 }): string[] {
   const overrides = ['features.use_linux_sandbox_bwrap=false'];
   if (stickyConfig?.reasoning_effort) {

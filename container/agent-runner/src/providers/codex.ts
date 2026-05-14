@@ -62,15 +62,21 @@ const COLLAB_TOOL_VERB: Record<string, string> = {
 
 // ── Provider config schema ──────────────────────────────────────────────────
 // Mirrors the `claudeConfigSchema` pattern but with Codex-native vocabulary:
-// `reasoning_effort` instead of Claude's `effort`, and a 3-value enum
-// (low | medium | high) — Codex has no `'xhigh'` or `'max'` tier.
+// `reasoning_effort` instead of Claude's `effort`. Enum mirrors the
+// `ReasoningEffort` definition exposed by `codex app-server generate-json-schema`
+// (none | minimal | low | medium | high | xhigh) — gpt-5.2-codex and gpt-5.5
+// both support xhigh per OpenAI's model docs.
+//
+// Default is `xhigh` for the production model (gpt-5.5); operators can dial
+// down per-agent via container.json when cost/latency matters more than
+// reasoning depth.
 //
 // Sticky-only: `model` and `reasoning_effort` are applied at thread-start /
 // codex-spawn time and persist for the session. Per-turn overrides for these
 // fields are not currently exposed by Codex's `thread/start` shape.
 export const codexConfigSchema = z.strictObject({
   model: z.string().min(1).optional(),
-  reasoning_effort: z.enum(['low', 'medium', 'high']).optional().default('high'),
+  reasoning_effort: z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh']).optional().default('xhigh'),
 });
 
 registerProviderConfigSchema('codex', codexConfigSchema);
