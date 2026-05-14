@@ -708,7 +708,15 @@ function buildMounts(
   // lose access on container restart after this deploy. Set the env var to
   // opt in (required for sibling-agent collaboration to share code state).
   if (session.messaging_group_id && process.env.NANOCLAW_THREAD_WORKTREES === '1') {
-    const tDir = threadWorktreeDir(session.messaging_group_id, session.thread_id, session.id);
+    // Pass `null` (not session.id) as the surrogate for the null-thread case.
+    // Sibling agents in the same MG have different session ids — using
+    // session.id here would give them different mount paths and defeat the
+    // whole point of sibling worktree sharing in DMs. With `null`, the helper
+    // falls back to the literal 'none' segment and ALL sibling sessions in
+    // this MG share `<base>/<mg>/none/worktrees/`. For DMs this collapses
+    // every conversation to one shared store, which is correct: there's only
+    // ever one ongoing DM with one user per MG.
+    const tDir = threadWorktreeDir(session.messaging_group_id, session.thread_id);
     fs.mkdirSync(tDir, { recursive: true });
     mounts.push({ hostPath: tDir, containerPath: '/workspace/worktrees', readonly: false });
   }

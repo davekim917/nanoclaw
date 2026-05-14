@@ -24,35 +24,45 @@ Create `groups/<name>-codex/` from `groups/<name>/`. The codex sibling shares:
 
 ## Steps
 
-### 1. Resolve the source group
+### 1. Resolve the source group (capture `agent_groups.id`!)
 
 ```bash
 pnpm exec tsx scripts/q.ts data/v2.db "select id, folder, name from agent_groups where folder='<name>'"
 ```
 
-Confirm the row exists. If the agent_group's `name` column needs to differ from the source (e.g., source is "illie", sibling should be "Axie-codex" for display), capture the source's display name now — you'll re-use it.
+Confirm the row exists. **Capture the `id` column value — it's an `ag-...` string, not the folder name.** Every later SQL statement that touches `messaging_group_agents.agent_group_id` or `agent_destinations.agent_group_id` MUST use this id, not the folder. Storing folder names there silently matches zero rows and leaves the existing wiring untouched.
+
+```bash
+SOURCE_FOLDER=<name>             # e.g. illie
+SOURCE_ID=$(pnpm exec tsx scripts/q.ts data/v2.db "select id from agent_groups where folder='${SOURCE_FOLDER}'" | tr -d '\n')
+test -n "${SOURCE_ID}" || { echo "ERROR: source group '${SOURCE_FOLDER}' not found"; exit 1; }
+echo "Source folder: ${SOURCE_FOLDER}"
+echo "Source ag-id:  ${SOURCE_ID}"
+```
+
+If the agent_group's `name` column needs to differ from the source (e.g., source folder is "illie", sibling should display as "Axie-codex"), capture the source's display name now too.
 
 ### 2. Create the sibling group directory
 
 ```bash
-SOURCE=<name>
-SIBLING=${SOURCE}-codex
-mkdir -p groups/${SIBLING}
+SIBLING_FOLDER=${SOURCE_FOLDER}-codex
+SIBLING_ID=${SIBLING_FOLDER}              # we use the folder name as the new ag-id; convenient + matches NanoClaw's existing host-default groups (main, axie-dev) that do the same
+mkdir -p groups/${SIBLING_FOLDER}
 ```
 
 ### 3. Symlink shared assets
 
 ```bash
-cd groups/${SIBLING}
-ln -sfn ../${SOURCE}/CLAUDE.md CLAUDE.md
-ln -sfn ../${SOURCE}/sources sources
-ln -sfn ../${SOURCE}/conversations conversations
+cd groups/${SIBLING_FOLDER}
+ln -sfn ../${SOURCE_FOLDER}/CLAUDE.md CLAUDE.md
+ln -sfn ../${SOURCE_FOLDER}/sources sources
+ln -sfn ../${SOURCE_FOLDER}/conversations conversations
 
 # Repos: symlink every dir in the source group that contains a .git/.
-for repo in ../${SOURCE}/*/; do
+for repo in ../${SOURCE_FOLDER}/*/; do
   if [ -d "${repo}.git" ]; then
     name=$(basename "${repo%/}")
-    ln -sfn "../${SOURCE}/${name}" "${name}"
+    ln -sfn "../${SOURCE_FOLDER}/${name}" "${name}"
   fi
 done
 cd -
@@ -61,7 +71,7 @@ cd -
 ### 4. Write container.json
 
 ```bash
-cat > groups/${SIBLING}/container.json <<'EOF'
+cat > groups/${SIBLING_FOLDER}/container.json <<'EOF'
 {
   "provider": "codex",
   "memory": { "enabled": true },
@@ -70,35 +80,41 @@ cat > groups/${SIBLING}/container.json <<'EOF'
 EOF
 ```
 
-Operator should manually copy any `mcpServers` from `groups/${SOURCE}/container.json` that should also be available to the codex sibling — most should.
+Operator should manually copy any `mcpServers` from `groups/${SOURCE_FOLDER}/container.json` that should also be available to the codex sibling — most should.
 
 ### 5. Wire scoped MNEMON_STORE override
 
-Replace dashes with underscores in the sibling folder name for the env key:
+The override value must be the source group's **ag-id** (not folder), because `container-runner.ts` defaults `MNEMON_STORE` to `agentGroup.id`, and we want both siblings to write to the same store.
 
 ```bash
-ENV_KEY=MNEMON_STORE_$(echo "${SIBLING}" | tr '-' '_')
-# Idempotent: append if not already present.
-grep -q "^${ENV_KEY}=" .env || echo "${ENV_KEY}=${SOURCE}" >> .env
+ENV_KEY=MNEMON_STORE_$(echo "${SIBLING_FOLDER}" | tr '-' '_')
+# Idempotent: replace existing line or append.
+if grep -q "^${ENV_KEY}=" .env; then
+  sed -i.bak "s|^${ENV_KEY}=.*|${ENV_KEY}=${SOURCE_ID}|" .env
+else
+  echo "${ENV_KEY}=${SOURCE_ID}" >> .env
+fi
+grep "^${ENV_KEY}=" .env
 ```
 
 After this, the host's container-runner.ts reads `process.env.${ENV_KEY}` at spawn time and uses its value (the source group id) as the container's `MNEMON_STORE`, so both Claude and Codex sessions write to the same mnemon store.
 
 ### 6. Insert the agent_groups row
 
+`agent_groups.created_at` is `NOT NULL` with no default — must be supplied.
+
 ```bash
-SIBLING_ID=$(pnpm exec tsx scripts/q.ts data/v2.db "select id from agent_groups where folder='${SIBLING}'" 2>/dev/null)
-if [ -z "${SIBLING_ID}" ]; then
-  # NB: the agent_group id is a generated identifier; the host has a helper
-  # for this. Easiest path: use the host's createAgentGroup() via a
-  # one-shot tsx script. Below shows the SQL form for the rare case the
-  # host helper isn't available — folder is unique so re-running is safe.
+NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+DISPLAY_NAME=<display_name>     # what users see in the dashboard, e.g. "illie-codex"
+
+EXISTING=$(pnpm exec tsx scripts/q.ts data/v2.db "select id from agent_groups where folder='${SIBLING_FOLDER}'" 2>/dev/null | tr -d '\n')
+if [ -z "${EXISTING}" ]; then
   pnpm exec tsx scripts/q.ts data/v2.db \
-    "insert into agent_groups (id, folder, name, agent_provider) values ('${SIBLING}', '${SIBLING}', '<display_name>-codex', 'codex')"
+    "insert into agent_groups (id, folder, name, agent_provider, created_at) values ('${SIBLING_ID}', '${SIBLING_FOLDER}', '${DISPLAY_NAME}', 'codex', '${NOW}')"
 fi
 ```
 
-> **Operator: replace `<display_name>` with whatever you want users to see in the dashboard.** This is independent of the source group's display name.
+> **Operator: set `DISPLAY_NAME` above** to whatever you want users to see in the dashboard. This is independent of the source group's display name.
 
 ### 7. Wire mention disambiguation per channel (Stage 6 — see also `/manage-channels`)
 
@@ -124,33 +140,34 @@ Why each side uses a different engage mode:
 MG_ID=<messaging-group-id>
 
 # Source agent: any real @-mention of the bot fires it. No pattern.
+# IMPORTANT: agent_group_id is the ag-id captured in step 1, not the folder.
 pnpm exec tsx scripts/q.ts data/v2.db \
   "update messaging_group_agents
    set engage_mode='mention', engage_pattern=NULL
-   where messaging_group_id='${MG_ID}' and agent_group_id='${SOURCE}'"
+   where messaging_group_id='${MG_ID}' and agent_group_id='${SOURCE_ID}'"
 
 # Sibling agent: text contains literal '@codex' (no real @-mention needed).
+# session_mode='per-thread' so each thread gets its own session; matches the
+# source's default behavior for threaded channels.
 pnpm exec tsx scripts/q.ts data/v2.db \
-  "insert into messaging_group_agents (messaging_group_id, agent_group_id, engage_mode, engage_pattern, session_mode, priority)
-   values ('${MG_ID}', '${SIBLING}', 'pattern', '@codex', 'persistent', 100)"
+  "insert into messaging_group_agents (messaging_group_id, agent_group_id, engage_mode, engage_pattern, session_mode, priority, created_at)
+   values ('${MG_ID}', '${SIBLING_ID}', 'pattern', '@codex', 'per-thread', 100, '${NOW}')"
 ```
 
 ### 7b. Wire bi-directional agent_destinations for walkie-talkie peer-wake
 
-For `[over]` to actually wake the peer (rather than just decoratively appearing in the message), each agent needs an `agent_destinations` row authorizing it to send to the other. Idempotent — re-running is safe.
+For `[over]` to actually wake the peer (rather than just decoratively appearing in the message), each agent needs an `agent_destinations` row authorizing it to send to the other. Idempotent — re-running is safe. All four columns key on the ag-id, not folder.
 
 ```bash
-NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-
 # Source → sibling
 pnpm exec tsx scripts/q.ts data/v2.db \
   "insert or ignore into agent_destinations (agent_group_id, local_name, target_type, target_id, created_at)
-   values ('${SOURCE}', 'codex', 'agent', '${SIBLING}', '${NOW}')"
+   values ('${SOURCE_ID}', 'codex', 'agent', '${SIBLING_ID}', '${NOW}')"
 
 # Sibling → source
 pnpm exec tsx scripts/q.ts data/v2.db \
   "insert or ignore into agent_destinations (agent_group_id, local_name, target_type, target_id, created_at)
-   values ('${SIBLING}', '${SOURCE}', 'agent', '${SOURCE}', '${NOW}')"
+   values ('${SIBLING_ID}', '${SOURCE_FOLDER}', 'agent', '${SOURCE_ID}', '${NOW}')"
 ```
 
 > **Why both directions?** Either agent can emit `[over]` to hand off; the peer-wake helper in `delivery.ts` calls `routeAgentMessage(target=sibling, originator=session)`, which permission-checks against `agent_destinations`. Missing rows → "unauthorized agent-to-agent" error in the host log + the hand-off silently drops.
@@ -169,25 +186,25 @@ Open the channel from step 7 and send `@${SIBLING} hello`. The Codex container s
 
 ## Reverting
 
-To undo a clone-as-codex run:
+To undo a clone-as-codex run (assumes you still have `SOURCE_FOLDER`, `SOURCE_ID`, `SIBLING_FOLDER`, `SIBLING_ID` from the install):
 
 ```bash
 sudo systemctl stop nanoclaw-v2
-SOURCE=<name>
-SIBLING=${SOURCE}-codex
 
-# Drop wiring + agent_groups row.
-pnpm exec tsx scripts/q.ts data/v2.db "delete from messaging_group_agents where agent_group_id='${SIBLING}'"
-pnpm exec tsx scripts/q.ts data/v2.db "delete from agent_groups where folder='${SIBLING}'"
+# Drop wiring + agent_destinations + agent_groups row (by ag-id).
+pnpm exec tsx scripts/q.ts data/v2.db "delete from messaging_group_agents where agent_group_id='${SIBLING_ID}'"
+pnpm exec tsx scripts/q.ts data/v2.db "delete from agent_destinations where agent_group_id='${SIBLING_ID}' or target_id='${SIBLING_ID}'"
+pnpm exec tsx scripts/q.ts data/v2.db "delete from agent_destinations where agent_group_id='${SOURCE_ID}' and target_id='${SIBLING_ID}'"
+pnpm exec tsx scripts/q.ts data/v2.db "delete from agent_groups where id='${SIBLING_ID}'"
 
 # Restore source wiring to plain 'mention' (or 'mention-sticky' for Discord).
-pnpm exec tsx scripts/q.ts data/v2.db "update messaging_group_agents set engage_mode='mention', engage_pattern=null where agent_group_id='${SOURCE}'"
+pnpm exec tsx scripts/q.ts data/v2.db "update messaging_group_agents set engage_mode='mention', engage_pattern=null where agent_group_id='${SOURCE_ID}'"
 
 # Drop the symlink tree.
-rm -rf groups/${SIBLING}
+rm -rf groups/${SIBLING_FOLDER}
 
 # Drop the scoped-env line.
-ENV_KEY=MNEMON_STORE_$(echo "${SIBLING}" | tr '-' '_')
+ENV_KEY=MNEMON_STORE_$(echo "${SIBLING_FOLDER}" | tr '-' '_')
 sed -i.bak "/^${ENV_KEY}=/d" .env
 
 sudo systemctl start nanoclaw-v2
@@ -195,9 +212,21 @@ sudo systemctl start nanoclaw-v2
 
 ## Notes
 
-- The composeGroupClaudeMd flow (host-side, runs every container spawn) regenerates `groups/${SIBLING}/AGENTS.md` from the same CLAUDE.md the source group uses, with `@-includes` resolved inline for Codex. No manual AGENTS.md authoring.
+- The composeGroupClaudeMd flow (host-side, runs every container spawn) regenerates `groups/${SIBLING_FOLDER}/AGENTS.md` from the same CLAUDE.md the source group uses, with `@-includes` resolved inline for Codex. No manual AGENTS.md authoring.
 - The codex container reads MCP server config from `~/.codex/config.toml` (regenerated each session by `writeCodexMcpConfigToml`) and hook config from `~/.codex/hooks.json` (regenerated each session by `writeCodexHooksJson`).
-- Worktrees are thread-scoped when `NANOCLAW_THREAD_WORKTREES=1` is in `.env` — both siblings in the same thread share `data/v2-threads/<mg>:<thread>/worktrees/<repo>/`, so uncommitted edits from one agent are visible to the other via `git status`.
+- Worktrees are thread-scoped when `NANOCLAW_THREAD_WORKTREES=1` is in `.env` — both siblings in the same thread share `data/v2-threads/<mg>/<thread>/worktrees/<repo>/`, so uncommitted edits from one agent are visible to the other via `git status`. For DMs / non-threaded channels the share key collapses to `data/v2-threads/<mg>/none/worktrees/<repo>/`.
+- Concurrent git operations across siblings: the shared worktree has standard git internal locks (`.git/index.lock`). The walkie-talkie turn-taking protocol mitigates by design — only one sibling is active per turn under `[over]` hand-off. If two siblings happen to fire on the same user message (`@illie @codex collab`), git ops can race; in practice failures are loud (`fatal: Unable to create '.git/index.lock'`) and the agent retries.
+
+### Known limitation: Codex Bash secret sanitization is a no-op
+
+The Claude provider's `createSanitizeBashHook` returns `hookSpecificOutput.updatedInput` with an `unset ANTHROPIC_API_KEY ...` prefix before every Bash command. Per the Codex hooks docs (developers.openai.com/codex/hooks), Codex parses `updatedInput` but does **not** apply it — the hook fails open. So a Codex container can `printenv` and see the OAuth tokens / API keys passed to it.
+
+Mitigations in place that do work for Codex:
+- Host-side `scrubSecrets` on outbound delivery filters registered secret values out of chat replies.
+- OneCLI proxy intercepts most HTTPS egress; secrets in headers/URLs that route through it get logged + gated.
+- The container is single-tenant — only Dave's own agents run in it, no adversarial workloads.
+
+Not mitigated: an agent that bypasses the proxy (NO_PROXY) and exfiltrates via direct HTTP to a remote it controls. Proper fix is to rewrite the Codex container's env before launch — out of scope for this pilot. Track if it becomes a real concern.
 
 ## Future work — captured for later, not in scope today
 

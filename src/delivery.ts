@@ -732,10 +732,24 @@ async function deliverMessage(
       try {
         const mg = getMessagingGroupByPlatform(msg.channel_type, msg.platform_id);
         if (mg) {
-          const { setWalkieStatus, findSiblingAgentIds } = await import('./modules/walkie-talkie/state.js');
-          // [over] = sibling please continue (re-opens / keeps the convo active)
-          // [out]  = we're done (close the convo until user re-engages)
-          setWalkieStatus(mg.id, msg.thread_id, walkieTrailer === 'out' ? 'closed' : 'active');
+          const { setWalkieStatus, getWalkieStatus, findSiblingAgentIds } = await import('./modules/walkie-talkie/state.js');
+          // Check the PRE-update state so [over] honors an earlier [out]:
+          // if the thread is already closed (someone said [out] earlier and
+          // the user hasn't re-engaged), don't reopen on an agent's solo
+          // [over] — that would let one agent reanimate a loop the operator
+          // ended.
+          const priorStatus = getWalkieStatus(mg.id, msg.thread_id);
+
+          // [over] = sibling please continue (re-opens / keeps the convo active),
+          //          but only if not already closed by a prior [out].
+          // [out]  = we're done (close the convo until user re-engages).
+          const nextStatus =
+            walkieTrailer === 'out'
+              ? 'closed'
+              : priorStatus === 'closed'
+                ? 'closed' // keep closed — agent can't reopen what the operator closed
+                : 'active';
+          setWalkieStatus(mg.id, msg.thread_id, nextStatus);
 
           // Peer-wake: on [over], forward the cleaned message text to every
           // sibling agent_group in the same messaging group. We bypass Slack's
@@ -744,7 +758,11 @@ async function deliverMessage(
           // routing module. [out] suppresses the wake — siblings stay quiet
           // until the user types in the thread (which resets walkie state in
           // router.ts).
-          if (walkieTrailer === 'over') {
+          //
+          // Gate peer-wake on the resolved state: a thread that's `closed`
+          // (either because this turn was [out] or because a prior [out] is
+          // still in effect and the user hasn't typed) does NOT fire peer-wake.
+          if (walkieTrailer === 'over' && nextStatus === 'active') {
             const siblings = findSiblingAgentIds(mg.id, session.agent_group_id);
             if (siblings.length > 0) {
               const { routeAgentMessage } = await import('./modules/agent-to-agent/agent-route.js');
