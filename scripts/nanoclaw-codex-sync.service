@@ -1,0 +1,27 @@
+[Unit]
+Description=NanoClaw Codex sync watcher (mirrors ~/.claude rules + ~/plugins skills into ~/.codex + ~/.agents/skills/)
+After=network.target
+
+[Service]
+User=ubuntu
+Group=ubuntu
+Type=simple
+ExecStart=/usr/bin/env pnpm exec tsx src/codex-sync-watcher.ts
+WorkingDirectory=/home/ubuntu/nanoclaw-v2
+Restart=on-failure
+RestartSec=10
+Environment=HOME=/home/ubuntu
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:/home/ubuntu/.local/bin:/home/ubuntu/.npm-global/bin
+
+# Constrain resource use. tsx + esbuild + chokidar + spawned sync scripts
+# eat ~250-400M baseline (each spawned tsx is its own Node + esbuild). The
+# cap protects against runaway leaks, not against normal operation.
+MemoryMax=512M
+TasksMax=256
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nanoclaw-codex-sync
+
+[Install]
+WantedBy=multi-user.target

@@ -1,36 +1,23 @@
 #!/usr/bin/env tsx
 /**
- * Sync `~/plugins/*` skills into `~/.agents/skills/`.
+ * CLI shim — sync `~/plugins/*` skills into `~/.agents/skills/`.
  *
- * Targets the runtime-agnostic `.agents/skills/` convention rather than
- * Codex-specific `$CODEX_HOME/skills/`. Verified empirically: Codex
- * auto-discovers from `~/.agents/skills/` (as root `r1` in `codex debug
- * prompt-input`). Other compliant agent runtimes follow the same path.
- *
- * Tool-native installs always win: tools with first-class Codex support
- * (e.g. `gitnexus setup`) write real directories under `~/.agents/skills/`.
- * `syncSkillSymlinks` defers to those — it only writes symlinks at names
- * where nothing else exists.
- *
- * Auto-update story: the symlinks point at the plugin source dirs, so
- * whenever Claude's marketplace pulls an update for a plugin (which
- * rewrites files inside `~/plugins/<plugin>/...`), Codex sees the new
- * content immediately via the symlink — no separate sync step needed.
+ * Real work lives in `src/codex-sync.ts:syncCodexPluginSkills()` so the
+ * watcher daemon can call it in-process without spawn overhead.
  *
  * Usage:
  *   pnpm exec tsx scripts/sync-codex-plugin-skills.ts
- *
- * Use `--dry-run` to preview without writing.
+ *   pnpm exec tsx scripts/sync-codex-plugin-skills.ts --dry-run
  */
 import os from 'os';
 import path from 'path';
 
-import { discoverPortableSkills, syncSkillSymlinks } from '../src/plugin-skill-discovery.js';
+import { discoverPortableSkills } from '../src/plugin-skill-discovery.js';
+import { syncCodexPluginSkills } from '../src/codex-sync.js';
 
 function main(): void {
   const dryRun = process.argv.includes('--dry-run');
   const pluginsRoot = path.join(os.homedir(), 'plugins');
-  const agentsSkills = path.join(os.homedir(), '.agents', 'skills');
 
   const discovered = discoverPortableSkills(pluginsRoot);
   console.log(`Discovered ${discovered.length} portable skill(s) under ${pluginsRoot}:`);
@@ -43,8 +30,8 @@ function main(): void {
     return;
   }
 
-  const result = syncSkillSymlinks(agentsSkills, discovered);
-  console.log(`\nSync result for ${agentsSkills}:`);
+  const result = syncCodexPluginSkills();
+  console.log(`\nSync result for ${result.target}:`);
   console.log(`  created:   ${result.created.length}`);
   console.log(`  removed:   ${result.removed.length}`);
   console.log(`  unchanged: ${result.unchanged.length}`);

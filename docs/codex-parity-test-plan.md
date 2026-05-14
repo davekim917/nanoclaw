@@ -93,6 +93,19 @@ deliverable changes and the verification steps so future drift can be caught.
     bundled NanoClaw skills (agent-browser, vercel-cli, slack-formatting,
     etc.). Total per container: 41 skills.
 
+14. **Host filesystem watcher daemon** (`src/codex-sync-watcher.ts` +
+    `scripts/nanoclaw-codex-sync.service`) — closes the host-side drift
+    gap with event-driven sync. Watches `~/.claude/*.md` and `~/plugins/`
+    (recursive, `node_modules`/`.git` ignored). On 5s-debounced change,
+    runs `syncCodexAgentsMd()` + `syncCodexPluginSkills()` in-process
+    (`src/codex-sync.ts` extracts the shared functions). File lock at
+    `~/.codex/.sync.lock` with stale-PID detection. Heartbeat file at
+    `~/.codex/.sync-heartbeat` for future healthcheck timer. Installed
+    as `nanoclaw-codex-sync.service` (system unit, User=ubuntu, 512MB
+    cap). Typical resource use: ~120MB resident, ~12-30ms per sync. No
+    spawned tsx per fire — Codex's review flagged that spawn overhead
+    was the original bottleneck.
+
 ### Critical empirical finding (2026-05-14)
 
 Codex's skill auto-discovery has TWO constraints I verified live before
