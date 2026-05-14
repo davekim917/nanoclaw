@@ -40,6 +40,26 @@ import {
 /** Hard ceiling for a single turn. Guards against app-server wedging. */
 const TURN_TIMEOUT_MS = 5 * 60 * 1000;
 
+/**
+ * Lookup tables for translating Codex's `collabAgentToolCall` tool names
+ * into human-readable progress labels. See the schema
+ * `definitions/CollabAgentTool` in `codex_app_server_protocol.schemas.json`.
+ */
+const COLLAB_TOOL_EMOJI: Record<string, string> = {
+  spawnAgent: '🌱',
+  sendInput: '📨',
+  resumeAgent: '▶️',
+  wait: '⏳',
+  closeAgent: '🛑',
+};
+const COLLAB_TOOL_VERB: Record<string, string> = {
+  spawnAgent: 'spawned',
+  sendInput: 'sent input to',
+  resumeAgent: 'resumed',
+  wait: 'waiting on',
+  closeAgent: 'closed',
+};
+
 // ── Provider config schema ──────────────────────────────────────────────────
 // Mirrors the `claudeConfigSchema` pattern but with Codex-native vocabulary:
 // `reasoning_effort` instead of Claude's `effort`, and a 3-value enum
@@ -331,6 +351,30 @@ async function* runOneTurn(
       case 'item/agentMessage/delta': {
         const delta = params.delta as string;
         if (delta) resultText += delta;
+        break;
+      }
+      case 'item/started': {
+        // Surface subagent activity (spawn/wait/close) as progress events
+        // so the dashboard + Slack status messages show the same kind of
+        // signal Claude sessions emit via parent_tool_use_id rendering.
+        // Codex shape (per codex_app_server_protocol schema):
+        //   { type: 'collabAgentToolCall', tool: <spawnAgent|sendInput|
+        //     resumeAgent|wait|closeAgent>, senderThreadId, receiverThreadIds }
+        const item = params.item as
+          | {
+              type?: string;
+              tool?: 'spawnAgent' | 'sendInput' | 'resumeAgent' | 'wait' | 'closeAgent';
+              receiverThreadIds?: string[];
+            }
+          | undefined;
+        if (item?.type === 'collabAgentToolCall' && item.tool) {
+          const emoji = COLLAB_TOOL_EMOJI[item.tool] ?? '🔧';
+          const verb = COLLAB_TOOL_VERB[item.tool] ?? item.tool;
+          const recv = item.receiverThreadIds?.length
+            ? ` (${item.receiverThreadIds.length} agent${item.receiverThreadIds.length === 1 ? '' : 's'})`
+            : '';
+          buffer.push({ type: 'progress', message: `${emoji} subagent: ${verb}${recv}` });
+        }
         break;
       }
       case 'item/completed': {
