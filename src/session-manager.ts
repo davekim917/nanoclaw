@@ -77,25 +77,26 @@ function fsSlug(s: string): string {
  * `/workspace/worktrees` inside their containers so they collaborate on
  * the same checkout.
  *
- * Path shape: `<base>/<mg-id>/<thread-id-or-synthetic>/worktrees/`. When
- * `threadId` is null (DM channels, channel-root sessions), use the
- * originatingMessageId as a stable thread surrogate so every conversation
- * still gets a deterministic worktree identity. Without that, every spawn
- * in a non-threaded channel would share the same `<mg>/none/` dir and
- * step on each other.
+ * Key derivation: `<thread-id>` (preferred) or `dm-<platform-id>` fallback.
+ * Slack thread ids encode `slack:<channel>:<ts>` and Discord encodes
+ * `discord:<guild>:<channel>:<thread>` — both globally unique, including
+ * the platform prefix. So just using the thread_id alone is enough.
  *
- * Nested dirs (not a `<mg>:<thread>` flat key) because Docker's `-v`
- * flag uses `:` as the field separator between source:target:options.
- * A colon in the host path turns `-v src:dst` into a three-part `src:dst:opts`
- * which Docker rejects with exit 125 — see the bug from earlier deploy.
+ * For DM / non-threaded channels (thread_id=null), `dm-<platform_id>` keeps
+ * the dir stable per conversation. Critically, when TWO sibling agents are
+ * wired to the same channel via TWO Slack apps (`slack-illysium` +
+ * `slack-illiecodex` both seeing `slack:C0AJA89MN2E`), they share the same
+ * platform_id and therefore the same worktree path — that's what makes
+ * cross-bot collaboration work.
+ *
+ * Nested dirs (not a flat `<mg>:<thread>` key) because Docker's `-v` flag
+ * uses `:` as the field separator between source:target:options. A colon in
+ * the host path turns `-v src:dst` into a three-part `src:dst:opts` which
+ * Docker rejects with exit 125. fsSlug strips any embedded colons too.
  */
-export function threadWorktreeDir(
-  messagingGroupId: string,
-  threadId: string | null,
-  originatingMessageId?: string | null,
-): string {
-  const tid = threadId ?? (originatingMessageId ? `msg-${originatingMessageId}` : 'none');
-  return path.join(threadsBaseDir(), fsSlug(messagingGroupId), fsSlug(tid), 'worktrees');
+export function threadWorktreeDir(platformId: string, threadId: string | null): string {
+  const tid = threadId ?? `dm-${platformId}`;
+  return path.join(threadsBaseDir(), fsSlug(tid), 'worktrees');
 }
 
 /** Path to the host-owned inbound DB (messages_in + delivered). */

@@ -79,32 +79,28 @@ When the user shares substantive information you'd want to remember, you don't n
 ## Working with peer agents in the same thread
 
 When the operator wires two agents to the same channel (Claude + Codex
-siblings, or any two NanoClaw agents), both can post in the same thread
-and address each other. Use these trailers at the very end of your reply
-to coordinate hand-offs — the host strips them from the user-visible
-message before posting.
+siblings, or any two NanoClaw agents), each agent has its own Slack
+bot user. Every message in the thread reaches both agents as inbound —
+including each other's replies — so collaboration is just standard
+chat:
 
-- `[over]` — "I'm passing the baton; sibling please continue."
-  The host actually wakes the peer agent with your cleaned message text
-  (via `agent_destinations` routing), so this is real auto-routing, not
-  just a hint. Use when you want the other agent to pick up where you
-  left off — e.g. you wrote a function, ask the sibling to write tests.
+- To hand off to the sibling, end your reply by `@`-mentioning their
+  Slack username (e.g. `@illie-codex can you write the tests?`). The
+  platform mention fires the peer's `engage_mode='mention'` rule and
+  wakes it for the next turn. No special trailer needed; the @-mention
+  itself is the signal.
 
-- `[out]` — "We're done here. Don't auto-fire on each other's echoes
-  until the user re-engages." The host marks the thread as `closed`
-  and skips peer-wake until the user types in the thread. Default to
-  `[out]` after ~3–4 back-and-forth exchanges with no forward progress
-  — runaway peer-to-peer loops waste the user's tokens.
+- To end the back-and-forth, simply STOP `@`-mentioning the peer in
+  your reply. The peer won't fire on subsequent messages unless the
+  user re-tags it. Default to dropping the @-mention after ~3–4
+  back-and-forth exchanges with no forward progress — runaway loops
+  waste the user's tokens.
 
-When you receive a peer-wake message, you'll see it inbound as text
-prefixed with `[walkie-talkie from @<peer-agent-id>]`. Treat it as a
-real conversational turn from the peer — read the content, decide if
-you have something useful to add, and respond. If you have nothing
-new to contribute, end your reply with `[out]` instead of `[over]`.
-
-Neither trailer is needed for normal user-facing replies. Only emit
-them when you are explicitly collaborating with another agent in the
-thread.
+- Slack's self-echo filter (`isMessageFromSelf` in the chat-adapter)
+  drops messages whose `event.user` matches your own bot user_id, so
+  you will never re-trigger on your own message. Cross-sibling @-mentions
+  work because each sibling is a distinct Slack bot user — the filter
+  catches only echoes of your own, not the peer's.
 
 ## Conversation history
 

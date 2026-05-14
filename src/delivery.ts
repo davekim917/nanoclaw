@@ -406,27 +406,6 @@ async function deliverMessage(
 
   const content = JSON.parse(msg.content);
 
-  // Walkie-talkie protocol: agents may end chat replies with `[over]` (pass
-  // the baton to a sibling agent) or `[out]` (end the back-and-forth, don't
-  // auto-reengage). Strip the trailer from the user-visible text and persist
-  // thread-level state so peer agents can choose to step back. See
-  // docs/walkie-talkie.md (Stage 7 of codex-parity plan).
-  let walkieTrailer: 'over' | 'out' | null = null;
-  if (msg.kind === 'chat' && content && typeof content === 'object') {
-    const c = content as { text?: unknown; content?: unknown };
-    const sourceField: 'text' | 'content' | null =
-      typeof c.text === 'string' ? 'text' : typeof c.content === 'string' ? 'content' : null;
-    if (sourceField) {
-      const { parseTrailer } = await import('./modules/walkie-talkie/state.js');
-      const parsed = parseTrailer(c[sourceField] as string);
-      if (parsed.trailer) {
-        walkieTrailer = parsed.trailer;
-        c[sourceField] = parsed.text;
-        msg.content = JSON.stringify(content);
-      }
-    }
-  }
-
   // Spawn-child workers sometimes ask via chat-sdk's `ask_question` instead
   // of calling `spawn_request_steer`. Both signal "operator attention
   // wanted" — light up the dashboard's Needs You lane for either. Worker
@@ -725,102 +704,6 @@ async function deliverMessage(
       // best-effort
     }
 
-    // Walkie-talkie state update — runs only after successful chat delivery
-    // so a failed send doesn't poison the thread state. The thread key
-    // collapses to mg-only when there's no thread context (DM channels).
-    if (walkieTrailer && msg.channel_type && msg.platform_id) {
-      try {
-        const mg = getMessagingGroupByPlatform(msg.channel_type, msg.platform_id);
-        if (mg) {
-          const { setWalkieStatus, getWalkieStatus, findSiblingAgentIds } =
-            await import('./modules/walkie-talkie/state.js');
-          // Check the PRE-update state so [over] honors an earlier [out]:
-          // if the thread is already closed (someone said [out] earlier and
-          // the user hasn't re-engaged), don't reopen on an agent's solo
-          // [over] — that would let one agent reanimate a loop the operator
-          // ended.
-          const priorStatus = getWalkieStatus(mg.id, msg.thread_id);
-
-          // [over] = sibling please continue (re-opens / keeps the convo active),
-          //          but only if not already closed by a prior [out].
-          // [out]  = we're done (close the convo until user re-engages).
-          const nextStatus =
-            walkieTrailer === 'out'
-              ? 'closed'
-              : priorStatus === 'closed'
-                ? 'closed' // keep closed — agent can't reopen what the operator closed
-                : 'active';
-          setWalkieStatus(mg.id, msg.thread_id, nextStatus);
-
-          // Peer-wake: on [over], forward the cleaned message text to every
-          // sibling agent_group in the same messaging group. We bypass Slack's
-          // bot-echo filter (which would otherwise block cross-sibling visibility)
-          // by writing directly to each sibling's inbound via the agent-to-agent
-          // routing module. [out] suppresses the wake — siblings stay quiet
-          // until the user types in the thread (which resets walkie state in
-          // router.ts).
-          //
-          // Gate peer-wake on the resolved state: a thread that's `closed`
-          // (either because this turn was [out] or because a prior [out] is
-          // still in effect and the user hasn't typed) does NOT fire peer-wake.
-          if (walkieTrailer === 'over' && nextStatus === 'active') {
-            const siblings = findSiblingAgentIds(mg.id, session.agent_group_id);
-            if (siblings.length > 0) {
-              const { routeAgentMessage } = await import('./modules/agent-to-agent/agent-route.js');
-              if (hasTable(getDb(), 'agent_destinations')) {
-                // Parse the cleaned text so we can wrap it with an originator
-                // tag. Sibling sees who said what.
-                let cleanText: string | null = null;
-                try {
-                  const parsed = JSON.parse(scrubbedContent) as Record<string, unknown>;
-                  cleanText =
-                    typeof parsed.text === 'string'
-                      ? parsed.text
-                      : typeof parsed.content === 'string'
-                        ? parsed.content
-                        : null;
-                } catch {
-                  /* swallow */
-                }
-                if (cleanText) {
-                  const peerText = `[walkie-talkie from @${session.agent_group_id}]\n\n${cleanText}`;
-                  for (const siblingId of siblings) {
-                    try {
-                      await routeAgentMessage(
-                        {
-                          id: `walkie-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-                          platform_id: siblingId,
-                          content: JSON.stringify({ text: peerText }),
-                          in_reply_to: null,
-                        },
-                        session,
-                      );
-                    } catch (err) {
-                      log.warn('walkie-talkie peer-wake failed for sibling', {
-                        from: session.agent_group_id,
-                        to: siblingId,
-                        err: err instanceof Error ? err.message : String(err),
-                      });
-                    }
-                  }
-                }
-              } else {
-                log.debug('walkie-talkie [over]: agent-to-agent module not installed, peer-wake skipped', {
-                  from: session.agent_group_id,
-                  mgId: mg.id,
-                });
-              }
-            }
-          }
-        }
-      } catch (err) {
-        log.warn('Failed to persist walkie-talkie state', {
-          id: msg.id,
-          trailer: walkieTrailer,
-          err: err instanceof Error ? err.message : String(err),
-        });
-      }
-    }
   }
 
   clearOutbox(session.agent_group_id, session.id, msg.id);

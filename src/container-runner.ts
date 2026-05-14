@@ -31,6 +31,7 @@ import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContaine
 import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
+import { getMessagingGroup } from './db/messaging-groups.js';
 import { findSessionByAgentGroupAndMessagingGroup } from './db/sessions.js';
 import { buildArchiveProjection, buildCentralProjection } from './db/per-agent-projections.js';
 import { initGroupFilesystem } from './group-init.js';
@@ -708,17 +709,18 @@ function buildMounts(
   // lose access on container restart after this deploy. Set the env var to
   // opt in (required for sibling-agent collaboration to share code state).
   if (session.messaging_group_id && process.env.NANOCLAW_THREAD_WORKTREES === '1') {
-    // Pass `null` (not session.id) as the surrogate for the null-thread case.
-    // Sibling agents in the same MG have different session ids — using
-    // session.id here would give them different mount paths and defeat the
-    // whole point of sibling worktree sharing in DMs. With `null`, the helper
-    // falls back to the literal 'none' segment and ALL sibling sessions in
-    // this MG share `<base>/<mg>/none/worktrees/`. For DMs this collapses
-    // every conversation to one shared store, which is correct: there's only
-    // ever one ongoing DM with one user per MG.
-    const tDir = threadWorktreeDir(session.messaging_group_id, session.thread_id);
-    fs.mkdirSync(tDir, { recursive: true });
-    mounts.push({ hostPath: tDir, containerPath: '/workspace/worktrees', readonly: false });
+    // Two-bot sibling design: illie (slack-illysium) and illie-codex
+    // (slack-illiecodex) each have their own MG row in this channel,
+    // but they share the same platform_id (the Slack channel id) and the
+    // same thread_id from chat-sdk-bridge. Keying threadWorktreeDir on
+    // platform_id + thread_id resolves both bots to the same worktree dir,
+    // so collaborative code edits in a thread are visible across siblings.
+    const mg = getMessagingGroup(session.messaging_group_id);
+    if (mg) {
+      const tDir = threadWorktreeDir(mg.platform_id, session.thread_id);
+      fs.mkdirSync(tDir, { recursive: true });
+      mounts.push({ hostPath: tDir, containerPath: '/workspace/worktrees', readonly: false });
+    }
   }
 
   // Channel-root inbound.db at /workspace/channel-inbound.db (read-only).
