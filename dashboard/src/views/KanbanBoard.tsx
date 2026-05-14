@@ -29,7 +29,10 @@ interface KanbanBoardProps {
   onRouteChange: (r: BoardRoute) => void;
 }
 
-type FilterId = 'all' | 'needs' | 'run' | 'done';
+// Mobile-only filter, driven by tapping the header breakdown cells. Each
+// cell maps 1:1 to a filter slice; `all` is the unfiltered default that
+// re-renders when the user taps the active cell to deselect.
+type FilterId = 'all' | 'failed' | 'needs' | 'run' | 'done';
 
 interface BoardActions {
   onArchive: (taskId: string) => void;
@@ -124,8 +127,13 @@ export const KanbanBoard: React.FC<KanbanBoardProps> = ({
   const activeTasks = tasks.filter((t) => t.archived_at == null);
   const counts = countTasks(activeTasks);
 
+  // Filter slices map 1:1 to the four header cells. The pre-cell version
+  // had `needs` filter on status=failed (a latent bug from when the chip
+  // labeled "Needs me" combined failed + needs_input); now each cell has
+  // its own honest predicate.
   let visible: TaskSummary[];
-  if (filter === 'needs') visible = tasks.filter((t) => t.status === 'failed');
+  if (filter === 'failed') visible = tasks.filter((t) => t.status === 'failed');
+  else if (filter === 'needs') visible = tasks.filter((t) => !!t.needs_input);
   else if (filter === 'run') visible = tasks.filter((t) => t.status === 'running');
   else if (filter === 'done') visible = tasks.filter((t) => t.status === 'completed');
   else visible = tasks;
@@ -199,6 +207,8 @@ function PulseHeader({
   groups,
   groupFilter,
   onGroupFilter,
+  filter,
+  onFilter,
 }: {
   counts: Counts;
   lastActivityIso: string;
@@ -207,7 +217,14 @@ function PulseHeader({
   groups: GroupSummary[];
   groupFilter: GroupFilter;
   onGroupFilter: (next: GroupFilter) => void;
+  filter: FilterId;
+  onFilter: (next: FilterId) => void;
 }) {
+  // Tap-toggle pattern: clicking the active cell clears the filter; a
+  // different cell switches the filter. The header counts already display
+  // each status' size, so the cells doubling as the filter UI removes the
+  // old filter-chip row's redundancy.
+  const toggle = (k: Exclude<FilterId, 'all'>) => () => onFilter(filter === k ? 'all' : k);
   return (
     <header className="nc-pulse">
       <div className="nc-pulse-top">
@@ -224,10 +241,10 @@ function PulseHeader({
           </span>
         </div>
         <div className="nc-pulse-breakdown">
-          <BreakdownCell n={counts.failed} label="Failed" tone="failed" />
-          <BreakdownCell n={counts.needs} label="Needs you" tone="needs" />
-          <BreakdownCell n={counts.running} label="Running" tone="running" />
-          <BreakdownCell n={counts.done} label="Done" tone="done" />
+          <BreakdownCell n={counts.failed} label="Failed" tone="failed" active={filter === 'failed'} onClick={toggle('failed')} />
+          <BreakdownCell n={counts.needs} label="Needs you" tone="needs" active={filter === 'needs'} onClick={toggle('needs')} />
+          <BreakdownCell n={counts.running} label="Running" tone="running" active={filter === 'run'} onClick={toggle('run')} />
+          <BreakdownCell n={counts.done} label="Done" tone="done" active={filter === 'done'} onClick={toggle('done')} />
         </div>
       </div>
       <div className="nc-pulse-meta">
@@ -245,11 +262,28 @@ function BreakdownCell({
   n,
   label,
   tone,
+  active,
+  onClick,
 }: {
   n: number;
   label: string;
   tone: 'failed' | 'needs' | 'running' | 'done';
+  active?: boolean;
+  onClick?: () => void;
 }) {
+  if (onClick) {
+    return (
+      <button
+        type="button"
+        className={`nc-pulse-cell ${tone}${active ? ' active' : ''}`}
+        onClick={onClick}
+        aria-pressed={!!active}
+      >
+        <span className="n">{n}</span>
+        <span className="lbl">{label}</span>
+      </button>
+    );
+  }
   return (
     <div className={`nc-pulse-cell ${tone}`}>
       <span className="n">{n}</span>
@@ -294,48 +328,6 @@ function ArchiveToolbar({
       {filter === 'needs' && (
         <BulkClearFailedButton actions={actions} failedCount={failedCount} label={`Clear all failed (${failedCount})`} />
       )}
-    </div>
-  );
-}
-
-function FilterChips({
-  value,
-  onChange,
-  counts,
-}: {
-  value: FilterId;
-  onChange: (v: FilterId) => void;
-  counts: Counts;
-}) {
-  const chips: { id: FilterId; label: string; count: number; attn: boolean }[] = [
-    { id: 'all', label: 'All', count: counts.total, attn: false },
-    {
-      id: 'needs',
-      label: 'Needs me',
-      count: counts.failed + counts.needs,
-      attn: true,
-    },
-    { id: 'run', label: 'Running', count: counts.running, attn: false },
-    { id: 'done', label: 'Done', count: counts.done, attn: false },
-  ];
-  return (
-    <div className="nc-chips" role="tablist" aria-label="Task filter">
-      {chips.map((c) => {
-        const active = value === c.id;
-        return (
-          <button
-            key={c.id}
-            role="tab"
-            aria-selected={active}
-            className={
-              'nc-chip' + (active ? ' active' : '') + (c.attn ? ' attn' : '')
-            }
-            onClick={() => onChange(c.id)}
-          >
-            {c.label} <span className="count">{c.count}</span>
-          </button>
-        );
-      })}
     </div>
   );
 }
@@ -519,8 +511,9 @@ function MobileBoard({
         groups={groups}
         groupFilter={groupFilter}
         onGroupFilter={onGroupFilter}
+        filter={filter}
+        onFilter={onFilter}
       />
-      <FilterChips value={filter} onChange={onFilter} counts={counts} />
       <ArchiveToolbar
         filter={filter}
         actions={actions}

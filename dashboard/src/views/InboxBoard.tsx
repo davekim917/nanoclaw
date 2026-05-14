@@ -59,6 +59,10 @@ export const InboxBoard: React.FC<InboxBoardProps> = ({ authMe, route, onRouteCh
     authMe.scopes.no_filter,
   );
   const [showArchived, setShowArchived] = useState(false);
+  // Mobile-only lane filter. Tapping a header breakdown cell sets this;
+  // tapping the active cell again clears it. The desktop view shows all
+  // four lanes as columns, so the filter doesn't apply there.
+  const [laneFilter, setLaneFilter] = useState<AttentionState | null>(null);
   const isMobile = useIsMobile();
 
   const sessionsKey = ['/dashboard/api/sessions', groupFilter, showArchived] as const;
@@ -150,6 +154,11 @@ export const InboxBoard: React.FC<InboxBoardProps> = ({ authMe, route, onRouteCh
     idle: lanes.idle.length,
     stale: lanes.stale.length,
     total: sessions.length,
+    // "Live" sessions = anything in flight from the operator's POV. Idle
+    // and stale are by definition not — idle = no activity in 24h; stale
+    // = >24h and the container is down. Big-count headline reads `live`
+    // so the number matches the lanes the operator actually acts on.
+    live: lanes.needs_me.length + lanes.active.length,
   };
 
   const lastActivityIso =
@@ -172,6 +181,8 @@ export const InboxBoard: React.FC<InboxBoardProps> = ({ authMe, route, onRouteCh
           onGroupFilter={setGroupFilter}
           showArchived={showArchived}
           onShowArchivedChange={setShowArchived}
+          laneFilter={laneFilter}
+          onLaneFilter={setLaneFilter}
         />
       ) : (
         <DesktopInboxHeader
@@ -189,7 +200,7 @@ export const InboxBoard: React.FC<InboxBoardProps> = ({ authMe, route, onRouteCh
 
       {isMobile ? (
         <div className="nc-stream">
-          {LANES.map(({ key, label }) => {
+          {LANES.filter(({ key }) => laneFilter == null || laneFilter === key).map(({ key, label }) => {
             const rows = lanes[key];
             if (rows.length === 0) return null;
             return (
@@ -206,6 +217,9 @@ export const InboxBoard: React.FC<InboxBoardProps> = ({ authMe, route, onRouteCh
             );
           })}
           {sessions.length === 0 && <div className="nc-empty">no sessions yet</div>}
+          {laneFilter != null && lanes[laneFilter].length === 0 && (
+            <div className="nc-empty">no sessions in {laneFilter.replace('_', ' ')}</div>
+          )}
         </div>
       ) : (
         <div className="nc-desktop-body">
@@ -248,8 +262,10 @@ function MobileInboxHeader({
   onGroupFilter,
   showArchived,
   onShowArchivedChange,
+  laneFilter,
+  onLaneFilter,
 }: {
-  counts: { needs_me: number; active: number; idle: number; stale: number; total: number };
+  counts: { needs_me: number; active: number; idle: number; stale: number; total: number; live: number };
   lastActivityIso: string;
   route: BoardRoute;
   onRouteChange: (r: BoardRoute) => void;
@@ -258,7 +274,14 @@ function MobileInboxHeader({
   onGroupFilter: (g: string) => void;
   showArchived: boolean;
   onShowArchivedChange: (v: boolean) => void;
+  laneFilter: AttentionState | null;
+  onLaneFilter: (next: AttentionState | null) => void;
 }) {
+  // Tap-toggle: clicking the active filter clears back to "all"; clicking
+  // a different cell switches the filter. Replaces the old filter-chip row
+  // — the header counts already show the breakdown, so making the cells
+  // themselves the filter UI is one fewer redundant control.
+  const toggle = (k: AttentionState) => () => onLaneFilter(laneFilter === k ? null : k);
   return (
     <>
       <header className="nc-pulse">
@@ -268,7 +291,7 @@ function MobileInboxHeader({
         </div>
         <div className="nc-pulse-grid">
           <div className="nc-pulse-bigcount">
-            <span>{counts.total}</span>
+            <span>{counts.live}</span>
             <span className="lbl">
               sessions
               <br />
@@ -276,10 +299,10 @@ function MobileInboxHeader({
             </span>
           </div>
           <div className="nc-pulse-breakdown">
-            <InboxCell n={counts.needs_me} label="Needs me" tone="needs" />
-            <InboxCell n={counts.active} label="Active" tone="running" />
-            <InboxCell n={counts.idle} label="Idle" tone="done" />
-            <InboxCell n={counts.stale} label="Stale" tone="failed" />
+            <InboxCell n={counts.needs_me} label="Needs me" tone="needs" active={laneFilter === 'needs_me'} onClick={toggle('needs_me')} />
+            <InboxCell n={counts.active} label="Active" tone="running" active={laneFilter === 'active'} onClick={toggle('active')} />
+            <InboxCell n={counts.idle} label="Idle" tone="done" active={laneFilter === 'idle'} onClick={toggle('idle')} />
+            <InboxCell n={counts.stale} label="Stale" tone="failed" active={laneFilter === 'stale'} onClick={toggle('stale')} />
           </div>
         </div>
         <div className="nc-pulse-meta">
@@ -309,7 +332,7 @@ function DesktopInboxHeader({
   showArchived,
   onShowArchivedChange,
 }: {
-  counts: { needs_me: number; active: number; idle: number; stale: number; total: number };
+  counts: { needs_me: number; active: number; idle: number; stale: number; total: number; live: number };
   lastActivityIso: string;
   route: BoardRoute;
   onRouteChange: (r: BoardRoute) => void;
@@ -327,7 +350,7 @@ function DesktopInboxHeader({
           <RouteNav route={route} onRouteChange={onRouteChange} />
         </div>
         <div className="bigcount">
-          <span>{counts.total}</span>
+          <span>{counts.live}</span>
           <span className="lbl">
             sessions live
             <br />
@@ -365,7 +388,32 @@ function DesktopInboxHeader({
 
 /* ─── Cells ─── */
 
-function InboxCell({ n, label, tone }: { n: number; label: string; tone: 'needs' | 'running' | 'done' | 'failed' }) {
+function InboxCell({
+  n,
+  label,
+  tone,
+  active,
+  onClick,
+}: {
+  n: number;
+  label: string;
+  tone: 'needs' | 'running' | 'done' | 'failed';
+  active?: boolean;
+  onClick?: () => void;
+}) {
+  if (onClick) {
+    return (
+      <button
+        type="button"
+        className={`nc-pulse-cell ${tone}${active ? ' active' : ''}`}
+        onClick={onClick}
+        aria-pressed={!!active}
+      >
+        <span className="n">{n}</span>
+        <span className="lbl">{label}</span>
+      </button>
+    );
+  }
   return (
     <div className={`nc-pulse-cell ${tone}`}>
       <span className="n">{n}</span>

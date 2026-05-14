@@ -295,6 +295,31 @@ a:hover { color: var(--fg); }
 .nc-pulse-cell.needs .n   { color: var(--st-needs); }
 .nc-pulse-cell.running .n { color: var(--st-running); }
 .nc-pulse-cell.done .n    { color: var(--st-done); }
+/* Tap-to-filter affordance when the cell is rendered as a <button>.
+   Reset native button chrome, add a hover hint, and surface the active
+   filter with a colored ring + brighter label text. */
+button.nc-pulse-cell {
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 6px 8px;
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  margin: -6px -8px;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+button.nc-pulse-cell:hover { background: oklch(0.18 0.005 60); }
+button.nc-pulse-cell.active {
+  background: oklch(0.20 0.008 60);
+  border-color: var(--bd-1);
+}
+button.nc-pulse-cell.active.failed  { border-color: var(--st-failed); }
+button.nc-pulse-cell.active.needs   { border-color: var(--st-needs); }
+button.nc-pulse-cell.active.running { border-color: var(--st-running); }
+button.nc-pulse-cell.active.done    { border-color: var(--st-done); }
+button.nc-pulse-cell.active .lbl { color: var(--fg); }
 
 .nc-pulse-meta {
   display: flex; justify-content: space-between; align-items: center;

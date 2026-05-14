@@ -101,18 +101,27 @@ describe('KanbanBoard', () => {
     expect(screen.getByText('Done', { selector: '.lbl' })).toBeInTheDocument();
   });
 
-  it('renders filter chips and switches active chip on click', async () => {
+  it('tapping a header breakdown cell sets it as the active filter', async () => {
+    // The old filter-chip row was removed — header breakdown cells are
+    // now the filter UI. Each cell is a <button aria-pressed> and
+    // toggles its own filter when tapped.
     vi.mocked(useSWR).mockReturnValue({
       data: { tasks: [task({ status: 'failed' })] },
       mutate: vi.fn(),
     } as unknown as ReturnType<typeof useSWR>);
 
-    render(<KanbanBoard authMe={mockAuthMe} route="board" onRouteChange={noop} />);
-    const allChip = screen.getByRole('tab', { name: /^all/i });
-    expect(allChip.getAttribute('aria-selected')).toBe('true');
-    const needsChip = screen.getByRole('tab', { name: /needs me/i });
-    await userEvent.click(needsChip);
-    expect(needsChip.getAttribute('aria-selected')).toBe('true');
+    const { container } = render(<KanbanBoard authMe={mockAuthMe} route="board" onRouteChange={noop} />);
+    // Selector targets the cell directly (the failed task card is also a
+    // `<button name=/failed/>` because it's a clickable card with a
+    // FAILED status glyph — name-based queries match both).
+    const failedCell = container.querySelector<HTMLButtonElement>('button.nc-pulse-cell.failed')!;
+    expect(failedCell).toBeTruthy();
+    expect(failedCell.getAttribute('aria-pressed')).toBe('false');
+    await userEvent.click(failedCell);
+    expect(failedCell.getAttribute('aria-pressed')).toBe('true');
+    // Tap again to clear back to "all".
+    await userEvent.click(failedCell);
+    expect(failedCell.getAttribute('aria-pressed')).toBe('false');
   });
 
   it('clicking a task card navigates to /task/<id>', async () => {
