@@ -790,6 +790,22 @@ function buildMounts(
     mounts.push({ hostPath: skillsSrc, containerPath: '/app/skills', readonly: true });
   }
 
+  // Spawn-task template — host-shared, not per-group. Overlays the
+  // group folder so the worker contract path `/workspace/agent/
+  // spawn-template.md` stays stable while the canonical content lives
+  // at repo root. Spawning is a host-level primitive (`spawn_task` MCP
+  // is registered for every container that opts in), so the template
+  // should be too — not buried in a single agent group's folder where
+  // it can drift per-install.
+  const spawnTemplateSrc = path.join(projectRoot, 'container', 'spawn-template.md');
+  if (fs.existsSync(spawnTemplateSrc)) {
+    mounts.push({
+      hostPath: spawnTemplateSrc,
+      containerPath: '/workspace/agent/spawn-template.md',
+      readonly: true,
+    });
+  }
+
   // Additional mounts from container config
   if (containerConfig.additionalMounts && containerConfig.additionalMounts.length > 0) {
     const validated = validateAdditionalMounts(containerConfig.additionalMounts, agentGroup.name);

@@ -274,14 +274,32 @@ export const createWorktreeTool: McpToolDefinition = {
     // thread that resumes weeks later would otherwise pick up a stale branch
     // tip — the worktree-cleanup cron explicitly skips unpushed/unmerged
     // branches, so this is the only path that closes that gap.
+    //
+    // Branch-mismatch guard (the XZO-40 / XZO-42 fix): the prior turn could
+    // have `git checkout`-ed onto an arbitrary branch (e.g., bisecting,
+    // inspecting an existing PR, or rebasing). On the NEXT call, blindly
+    // rebasing whatever's currently checked out would silently land the new
+    // work on the wrong branch — and a subsequent `git_push` could then
+    // force-overwrite an unrelated PR's HEAD. Refuse instead, with an
+    // actionable error: the caller can either (a) pass `branch: "<the
+    // current branch>"` if it really wants to resume that work, or (b)
+    // `git switch -c thread-...` to a fresh branch before retrying.
     if (fs.existsSync(worktreeDir)) {
       if (!fs.existsSync(path.join(worktreeDir, '.git'))) {
         log(`create_worktree: corrupt worktree at ${worktreeDir}, removing`);
         try { fs.rmSync(worktreeDir, { recursive: true, force: true }); } catch { /* ignore */ }
       } else {
+        const current = tryGit(worktreeDir, ['rev-parse', '--abbrev-ref', 'HEAD']);
+        if (current && current !== branchName) {
+          return err(
+            `Worktree at ${worktreeDir} is currently on branch '${current}', not the requested '${branchName}'. ` +
+              `To resume work on '${current}', pass branch: "${current}" explicitly. ` +
+              `To start fresh, run \`git -C ${worktreeDir} switch -c ${branchName} origin/HEAD\` first, ` +
+              `then retry create_worktree.`,
+          );
+        }
         if (!shouldRebase) {
-          const current = tryGit(worktreeDir, ['rev-parse', '--abbrev-ref', 'HEAD']) ?? branchName;
-          return ok(`Worktree ready at ${worktreeDir} (branch ${current}; explicit branch — not rebased)`);
+          return ok(`Worktree ready at ${worktreeDir} (branch ${current ?? branchName}; explicit branch — not rebased)`);
         }
         const result = rebaseOntoOriginHead(worktreeDir, repoDir, fetchOk, originHeadOk);
         return result.kind === 'ok' ? ok(result.text) : err(result.text);
