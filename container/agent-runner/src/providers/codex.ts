@@ -32,6 +32,7 @@ import {
   spawnCodexAppServer,
   startCodexTurn,
   startOrResumeCodexThread,
+  steerCodexTurn,
   writeCodexHooksJson,
   writeCodexMcpConfigToml,
 } from './codex-app-server.js';
@@ -160,6 +161,15 @@ export class CodexProvider implements AgentProvider {
       waiting?.();
     };
 
+    // Mid-turn input plumbing: when the agent is mid-turn we steer the
+    // active turn instead of queueing the message. `runOneTurn` updates
+    // `currentTurnId` on turn/started + clears it on turn/completed.
+    const turnTracker: { server: AppServer | null; threadId: string | null; currentTurnId: string | null } = {
+      server: null,
+      threadId: null,
+      currentTurnId: null,
+    };
+
     pending.push(input.prompt);
 
     const self = this;
@@ -171,6 +181,7 @@ export class CodexProvider implements AgentProvider {
       writeCodexMcpConfigToml(self.mcpServers);
       writeCodexHooksJson();
       const server = spawnCodexAppServer(createCodexConfigOverrides(self.stickyConfig));
+      turnTracker.server = server;
       attachCodexAutoApproval(server);
 
       let threadId: string | undefined = input.continuation;
@@ -189,6 +200,7 @@ export class CodexProvider implements AgentProvider {
         };
 
         threadId = await startOrResumeCodexThread(server, threadId, threadParams);
+        turnTracker.threadId = threadId ?? null;
 
         while (!aborted) {
           while (pending.length === 0 && !ended && !aborted) {
@@ -216,15 +228,35 @@ export class CodexProvider implements AgentProvider {
             () => {
               initYielded = true;
             },
+            turnTracker,
           );
         }
       } finally {
+        turnTracker.server = null;
+        turnTracker.threadId = null;
+        turnTracker.currentTurnId = null;
         killCodexAppServer(server);
       }
     }
 
     return {
       push: (message: string) => {
+        // If a turn is in flight, steer it instead of queueing — the agent's
+        // response can then reference the late-arriving content. Falls back
+        // to queueing on RPC error (e.g. the turn just ended between our
+        // check and the call) and on missing handles.
+        if (turnTracker.server && turnTracker.threadId && turnTracker.currentTurnId) {
+          const expectedTurnId = turnTracker.currentTurnId;
+          void steerCodexTurn(turnTracker.server, {
+            threadId: turnTracker.threadId,
+            expectedTurnId,
+            inputText: message,
+          }).catch(() => {
+            pending.push(message);
+            kick();
+          });
+          return;
+        }
         pending.push(message);
         kick();
       },
@@ -254,6 +286,7 @@ async function* runOneTurn(
   cwd: string,
   hasInit: () => boolean,
   markInit: () => void,
+  turnTracker?: { currentTurnId: string | null },
 ): AsyncGenerator<ProviderEvent> {
   // Mutable refs via object properties — TS can't track closure assignments
   // for narrowing, but property access keeps the declared type visible.
@@ -289,6 +322,12 @@ async function* runOneTurn(
         }
         break;
       }
+      case 'turn/started': {
+        const tid = (params as { turnId?: string }).turnId
+          ?? ((params as { turn?: { id?: string } }).turn?.id);
+        if (turnTracker && typeof tid === 'string') turnTracker.currentTurnId = tid;
+        break;
+      }
       case 'item/agentMessage/delta': {
         const delta = params.delta as string;
         if (delta) resultText += delta;
@@ -300,11 +339,13 @@ async function* runOneTurn(
         break;
       }
       case 'turn/completed':
+        if (turnTracker) turnTracker.currentTurnId = null;
         turnDone = true;
         break;
       case 'turn/failed': {
         const e = params.error as { message?: string } | undefined;
         turnState.error = new Error(e?.message || 'Turn failed');
+        if (turnTracker) turnTracker.currentTurnId = null;
         turnDone = true;
         break;
       }

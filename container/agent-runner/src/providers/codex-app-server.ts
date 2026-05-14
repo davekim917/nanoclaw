@@ -350,6 +350,34 @@ export async function startCodexTurn(server: AppServer, params: TurnParams): Pro
   if (resp.error) throw new Error(`turn/start failed: ${resp.error.message}`);
 }
 
+/**
+ * Append text input to a turn that is currently in flight. Codex's app-server
+ * routes the new input to the running turn (rather than queuing it for the
+ * next turn), so the agent's response can reference late-arriving content
+ * without ending the turn first.
+ *
+ * `expectedTurnId` is a precondition the server checks — if it doesn't match
+ * the active turn, the request fails. The caller has to pass the turnId
+ * observed from a prior `turn/started` notification.
+ *
+ * Throws on RPC error so the caller can fall back to queuing the message
+ * for the next turn (e.g. if the active turn has just ended).
+ */
+export async function steerCodexTurn(
+  server: AppServer,
+  params: { threadId: string; expectedTurnId: string; inputText: string },
+): Promise<{ turnId: string }> {
+  const resp = await sendCodexRequest(server, 'turn/steer', {
+    threadId: params.threadId,
+    expectedTurnId: params.expectedTurnId,
+    input: [{ type: 'text', text: params.inputText }],
+  });
+  if (resp.error) throw new Error(`turn/steer failed: ${resp.error.message}`);
+  const turnId = (resp.result as { turnId?: string } | undefined)?.turnId;
+  if (!turnId) throw new Error('turn/steer returned no turnId');
+  return { turnId };
+}
+
 // ── MCP config.toml ─────────────────────────────────────────────────────────
 // Codex discovers MCP servers by reading ~/.codex/config.toml at startup.
 // We rewrite it on every spawn from whatever mcpServers the agent-runner
