@@ -106,29 +106,32 @@ Two agents sharing one Slack bot user need a way to route `@bot ...` messages to
 
 **Trigger syntax** that this wiring enables (assuming the bot's Slack username is `${SOURCE}`):
 
-- `@${SOURCE} do X` → source agent fires (real `@`-mention, no "codex" keyword)
-- `@${SOURCE} codex do Y` → sibling agent fires (real `@`-mention + "codex" keyword)
-- `@${SOURCE}-codex do Z` → ⚠️ does NOT fire — `${SOURCE}-codex` isn't a real Slack user, so Slack treats it as literal text and `isMention=false`. Use `@${SOURCE} codex ...` instead.
+- `@${SOURCE} do X` → source agent fires (real `@`-mention, no `@codex` keyword)
+- `@${SOURCE} @codex do Y` → sibling agent fires (real `@`-mention + literal `@codex` keyword)
+- `@${SOURCE} use codex as a subagent` → source agent fires — the bare word `codex` is fine. Only the literal string `@codex` routes to the sibling. This is deliberate: prevents false-fires when the source agent is asked to *use* codex as a subagent.
+- `@${SOURCE}-codex do Z` → ⚠️ does NOT fire — `${SOURCE}-codex` isn't a real Slack user, so Slack treats it as literal text and `isMention=false`. Use `@${SOURCE} @codex ...` instead.
 
 ```bash
 # Replace MG_ID with the messaging_group id you want both siblings on.
 MG_ID=<messaging-group-id>
 
-# Source agent: @-mention required + must NOT contain "codex" keyword.
-# Negative-lookahead anchors at the start of the text and bans the word
-# "codex" anywhere in the message.
+# Source agent: @-mention required + must NOT contain literal "@codex".
+# Negative-lookahead anchors at the start of the text and bans "@codex"
+# anywhere in the message. Bare "codex" (without @) is allowed — the
+# source agent can still be asked to "use codex as a subagent" without
+# accidentally routing the message to the sibling.
 pnpm exec tsx scripts/q.ts data/v2.db \
   "update messaging_group_agents
-   set engage_mode='mention-pattern', engage_pattern='^(?!.*\bcodex\b)'
+   set engage_mode='mention-pattern', engage_pattern='^(?!.*@codex)'
    where messaging_group_id='${MG_ID}' and agent_group_id='${SOURCE}'"
 
-# Sibling agent: @-mention required + MUST contain "codex" keyword.
+# Sibling agent: @-mention required + MUST contain literal "@codex".
 pnpm exec tsx scripts/q.ts data/v2.db \
   "insert into messaging_group_agents (messaging_group_id, agent_group_id, engage_mode, engage_pattern, session_mode, priority)
-   values ('${MG_ID}', '${SIBLING}', 'mention-pattern', '\bcodex\b', 'persistent', 100)"
+   values ('${MG_ID}', '${SIBLING}', 'mention-pattern', '@codex', 'persistent', 100)"
 ```
 
-> **Why "codex" as the disambiguator?** The bot's Slack username is fixed (whatever you configured the existing app to display as — usually `${SOURCE}`). You can only `@`-mention real Slack users, so the bot can only be hit via `@${SOURCE}`. The keyword `codex` is the cheapest disambiguator that works without admin-installing a second Slack app. If you'd rather use a different keyword, swap `codex` in both regexes.
+> **Why literal `@codex` (not bare `codex`)?** When you ask the source agent to "use codex as a subagent" or "ask codex to check your work", the bare word `codex` shouldn't route to the sibling — that's intentional source-side delegation, not a hand-off. Anchoring on the literal `@` prefix gives a clean separation: `codex` = something the source agent uses, `@codex` = the sibling agent. Slack won't autocomplete `@codex` to a real mention (no user by that name), but the literal text is still in the message body, so the pattern matches.
 
 > **Self-echo loops are prevented at the adapter layer.** The Slack adapter (via `@chat-adapter/slack`'s `isMessageFromSelf` + `@chat`'s `handleIncomingMessage`) drops events where `event.user === bot_user_id` before they reach the router. So `${SIBLING}` posting in a thread will NOT trigger `${SOURCE}` (or itself) on the echo. Verified at `node_modules/chat/dist/index.js:2943`.
 
@@ -172,4 +175,34 @@ sudo systemctl start nanoclaw-v2
 
 - The composeGroupClaudeMd flow (host-side, runs every container spawn) regenerates `groups/${SIBLING}/AGENTS.md` from the same CLAUDE.md the source group uses, with `@-includes` resolved inline for Codex. No manual AGENTS.md authoring.
 - The codex container reads MCP server config from `~/.codex/config.toml` (regenerated each session by `writeCodexMcpConfigToml`) and hook config from `~/.codex/hooks.json` (regenerated each session by `writeCodexHooksJson`).
-- Worktrees become thread-scoped once Stage 8 of the codex-parity work ships (`/team-ship` it via the spawn-board). Until then, each session (Claude or Codex) gets its own worktree — collaborative code-edit-in-one-thread requires Stage 8.
+- Worktrees are thread-scoped when `NANOCLAW_THREAD_WORKTREES=1` is in `.env` — both siblings in the same thread share `data/v2-threads/<mg>:<thread>/worktrees/<repo>/`, so uncommitted edits from one agent are visible to the other via `git status`.
+
+## Future work — captured for later, not in scope today
+
+### 1. Flip primary provider (Claude-nerf resilience)
+
+The Claude-as-canonical / Codex-as-sibling split is just symlink direction. Three escape hatches if the Claude Max subscription gets squeezed:
+
+- **Flip canonical**: `mv groups/illie groups/illie.tmp && mv groups/illie-codex groups/illie && ...` — relink symlinks the other way. ~10 min of mechanical work.
+- **Drop Claude side**: delete the source `agent_groups` row, leave the codex sibling as the sole agent for that messaging group. Shared store + repos stay put. `@illie` in Slack still wakes the same bot; it routes only to the codex agent now.
+- **Inverse skill**: a `clone-as-claude` skill that takes a codex-backed source group and creates a Claude-backed sibling. Currently a copy of `/clone-as-codex` with provider strings flipped.
+
+Decision criteria for picking the right path when the time comes: cost trajectory of each provider, parity quality of the codex-side guardrails (Stage 2 should hold up), whether you want to keep both for redundancy or commit to one. Don't pre-build any of this — flipping is cheaper than the abstraction.
+
+### 2. Generalize this skill → `/clone-agent-as-provider <source> <provider>`
+
+Today `/clone-as-codex` hardcodes `provider: "codex"` and the `@codex` keyword. A generalized version would take both as arguments:
+
+```
+/clone-agent-as-provider illie opencode    # creates illie-opencode with @opencode keyword
+/clone-agent-as-provider illie claude      # for codex-canonical → claude sibling
+```
+
+Implementation when it's worth doing:
+
+- Parameterize the keyword (default to the provider name).
+- Parameterize the sibling folder suffix (default to `-<provider>`).
+- Wrap the existing seven steps in a single skill that takes `(source, provider)` and emits the parameterized SQL + symlink commands.
+- Migrate the existing `/clone-as-codex` to be a thin alias.
+
+Punt this until you have a second non-Claude provider in production. With only Codex today, the generalization is solving for a future that may not happen.
