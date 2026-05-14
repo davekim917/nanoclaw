@@ -119,6 +119,14 @@ interface WorktreeTarget {
 }
 
 function discoverWorktrees(): WorktreeTarget[] {
+  // TODO (Stage 8 follow-up): also walk data/v2-threads/<key>/worktrees/
+  // when NANOCLAW_THREAD_WORKTREES=1. Thread-scoped worktrees are shared
+  // across sibling sessions in a thread; the cleanup gate needs to skip
+  // when ANY active session referencing the thread has a live container,
+  // and the canonical-repo lookup needs to pick one of the participating
+  // agent groups (any works — siblings symlink the same source-group repo).
+  // Until that lands, thread-scoped worktrees are GC'd manually:
+  //   rm -rf data/v2-threads/<key>/worktrees/<repo>
   const sessionsRoot = path.join(DATA_DIR, 'v2-sessions');
   if (!fs.existsSync(sessionsRoot)) return [];
 

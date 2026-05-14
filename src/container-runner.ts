@@ -54,6 +54,7 @@ import {
   markContainerRunning,
   markContainerStopped,
   sessionDir,
+  threadWorktreeDir,
   writeSessionRouting,
 } from './session-manager.js';
 import type { AgentGroup, Session } from './types.js';
@@ -689,6 +690,27 @@ function buildMounts(
   const inboundDbFile = path.join(sessDir, 'inbound.db');
   if (fs.existsSync(inboundDbFile)) {
     mounts.push({ hostPath: inboundDbFile, containerPath: '/workspace/inbound.db', readonly: true });
+  }
+
+  // Thread-scoped worktrees: shared bind-mount across all sibling agents
+  // (Claude + Codex) in the same thread, so collaborative code edits land
+  // in one repo checkout regardless of which agent ran them. The session
+  // dir mount above provides `/workspace/worktrees` by default; this layered
+  // mount overrides it with the thread-keyed path. Docker applies mounts
+  // in declaration order — inner overrides outer for the subpath.
+  //
+  // The thread key collapses to `<mg>:msg-<first-msg-id>` when threadId is
+  // null (DM channels) so every conversation still gets a deterministic
+  // worktree identity rather than sharing one global `<mg>:none` dir.
+  //
+  // Gated on NANOCLAW_THREAD_WORKTREES=1 for backward-compat: existing
+  // single-agent deployments keep their session-scoped worktrees and don't
+  // lose access on container restart after this deploy. Set the env var to
+  // opt in (required for sibling-agent collaboration to share code state).
+  if (session.messaging_group_id && process.env.NANOCLAW_THREAD_WORKTREES === '1') {
+    const tDir = threadWorktreeDir(session.messaging_group_id, session.thread_id, session.id);
+    fs.mkdirSync(tDir, { recursive: true });
+    mounts.push({ hostPath: tDir, containerPath: '/workspace/worktrees', readonly: false });
   }
 
   // Channel-root inbound.db at /workspace/channel-inbound.db (read-only).

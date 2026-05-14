@@ -56,6 +56,43 @@ export function sessionDir(agentGroupId: string, sessionId: string): string {
   return path.join(sessionsBaseDir(), agentGroupId, sessionId);
 }
 
+/** Root directory for all thread-scoped worktrees. */
+export function threadsBaseDir(): string {
+  return path.join(DATA_DIR, 'v2-threads');
+}
+
+/**
+ * Sanitize a thread-id (or messaging-group-id) into a filesystem-safe slug.
+ * Slack uses `1234567890.123456` (period), Discord uses `123456789012345678`
+ * (digits), and platform-internal ids may have other separators. Keep it
+ * minimal — replace anything not [A-Za-z0-9._-] with `_`.
+ */
+function fsSlug(s: string): string {
+  return s.replace(/[^A-Za-z0-9._-]/g, '_');
+}
+
+/**
+ * Thread-scoped worktree directory. All sibling agents in the same thread
+ * (e.g. illie + illie-codex) bind-mount this same host path at
+ * `/workspace/worktrees` inside their containers so they collaborate on
+ * the same checkout.
+ *
+ * Key shape: `<mg-id>:<thread-id-or-synthetic>`. When `threadId` is null
+ * (DM channels, channel-root sessions), use the originatingMessageId as a
+ * stable thread surrogate so every conversation still gets a deterministic
+ * worktree identity. Without that, every spawn in a non-threaded channel
+ * would share the same `<mg>:none` dir and step on each other.
+ */
+export function threadWorktreeDir(
+  messagingGroupId: string,
+  threadId: string | null,
+  originatingMessageId?: string | null,
+): string {
+  const tid = threadId ?? (originatingMessageId ? `msg-${originatingMessageId}` : 'none');
+  const key = `${fsSlug(messagingGroupId)}:${fsSlug(tid)}`;
+  return path.join(threadsBaseDir(), key, 'worktrees');
+}
+
 /** Path to the host-owned inbound DB (messages_in + delivered). */
 export function inboundDbPath(agentGroupId: string, sessionId: string): string {
   return path.join(sessionDir(agentGroupId, sessionId), 'inbound.db');
