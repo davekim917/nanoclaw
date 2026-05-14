@@ -76,6 +76,32 @@ Two memory surfaces, both effectively read-only from the agent's perspective dur
 
 When the user shares substantive information you'd want to remember, you don't need to do anything explicit — the daemon's classifier picks it up on its next 60s sweep. If a fact is critical and time-sensitive, use scratch context (worktree files, conversation memory) for immediate use; the daemon's eventual extraction handles long-term persistence.
 
+## Working with peer agents in the same thread
+
+When the operator wires two agents to the same channel (Claude + Codex
+siblings, or any two NanoClaw agents), both can post in the same thread
+and address each other. Use these trailers at the very end of your reply
+to coordinate hand-offs — the host strips them from the user-visible
+message before posting.
+
+- `[over]` — "I'm passing the baton; sibling please continue."
+  Use after you've made progress and want the other agent to pick up.
+  The host marks the thread as `active` (the default state).
+
+- `[out]` — "We're done here. Don't auto-fire on each other's echoes
+  until the user re-engages." Use to close a loop cleanly. Default to
+  `[out]` after ~3–4 fruitless back-and-forth exchanges with no forward
+  progress — runaway peer-to-peer loops waste the user's tokens.
+
+Neither trailer is needed for normal user-facing replies. Only emit
+them when you are explicitly collaborating with another agent in the
+thread.
+
+When you see another agent's message in the thread but the user hasn't
+asked for collaboration, you can quote / acknowledge it without
+responding to it. Don't auto-fire on every peer message — you'll spam
+the thread.
+
 ## Conversation history
 
 The `conversations/` folder in your workspace holds searchable transcripts of past sessions with this group. Use it to recall prior context when a request references something that happened before. For structured long-lived data, prefer dedicated files (`customers.md`, `preferences.md`, etc.); split any file over ~500 lines into a folder with an index.

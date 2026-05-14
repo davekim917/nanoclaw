@@ -406,6 +406,27 @@ async function deliverMessage(
 
   const content = JSON.parse(msg.content);
 
+  // Walkie-talkie protocol: agents may end chat replies with `[over]` (pass
+  // the baton to a sibling agent) or `[out]` (end the back-and-forth, don't
+  // auto-reengage). Strip the trailer from the user-visible text and persist
+  // thread-level state so peer agents can choose to step back. See
+  // docs/walkie-talkie.md (Stage 7 of codex-parity plan).
+  let walkieTrailer: 'over' | 'out' | null = null;
+  if (msg.kind === 'chat' && content && typeof content === 'object') {
+    const c = content as { text?: unknown; content?: unknown };
+    const sourceField: 'text' | 'content' | null =
+      typeof c.text === 'string' ? 'text' : typeof c.content === 'string' ? 'content' : null;
+    if (sourceField) {
+      const { parseTrailer } = await import('./modules/walkie-talkie/state.js');
+      const parsed = parseTrailer(c[sourceField] as string);
+      if (parsed.trailer) {
+        walkieTrailer = parsed.trailer;
+        c[sourceField] = parsed.text;
+        msg.content = JSON.stringify(content);
+      }
+    }
+  }
+
   // Spawn-child workers sometimes ask via chat-sdk's `ask_question` instead
   // of calling `spawn_request_steer`. Both signal "operator attention
   // wanted" — light up the dashboard's Needs You lane for either. Worker
@@ -702,6 +723,27 @@ async function deliverMessage(
       }
     } catch {
       // best-effort
+    }
+
+    // Walkie-talkie state update — runs only after successful chat delivery
+    // so a failed send doesn't poison the thread state. The thread key
+    // collapses to mg-only when there's no thread context (DM channels).
+    if (walkieTrailer && msg.channel_type && msg.platform_id) {
+      try {
+        const mg = getMessagingGroupByPlatform(msg.channel_type, msg.platform_id);
+        if (mg) {
+          const { setWalkieStatus } = await import('./modules/walkie-talkie/state.js');
+          // [over] = sibling please continue (re-opens / keeps the convo active)
+          // [out]  = we're done (close the convo until user re-engages)
+          setWalkieStatus(mg.id, msg.thread_id, walkieTrailer === 'out' ? 'closed' : 'active');
+        }
+      } catch (err) {
+        log.warn('Failed to persist walkie-talkie state', {
+          id: msg.id,
+          trailer: walkieTrailer,
+          err: err instanceof Error ? err.message : String(err),
+        });
+      }
     }
   }
 
