@@ -6,7 +6,6 @@ import { renderMarkdown } from '../lib/markdown.js';
 import {
   extractGoal,
   extractLinearId,
-  buildPhaseTimeline,
   relAge,
   textOfEntry,
 } from '../lib/derive.js';
@@ -152,16 +151,12 @@ export const TaskDetail: React.FC<TaskDetailProps> = ({
   const transcript = data.transcript ?? [];
   const goal = extractGoal(task.task_content);
   const linearId = extractLinearId(task.task_content);
-  const phases = buildPhaseTimeline(task, transcript);
-  const currentPhase = phases.findIndex((p) => p.status === 'active') + 1;
-  const lastDonePhase = phases.filter((p) => p.status === 'done').length;
-  const displayPhase = task.status === 'running' ? Math.max(currentPhase, 1) : lastDonePhase || 1;
-  // Hide the phase tracker entirely when the worker never emitted a
-  // `Phase N …` marker. Without data the row would render "Phase 1 of 5"
-  // with every step "pending" — misleading for tasks that shipped without
-  // explicit phase markers. The status pill + result_summary already
-  // communicate the outcome in that case.
-  const hasPhaseData = phases.some((p) => p.message !== '');
+  // The 5-phase template (Setup/Implement/Verify/Ship/Report) was tied to
+  // the spawn-template's ticket-shipping flow. Most spawn tasks today
+  // don't fit that shape (Linear updates, data investigations, ad-hoc
+  // SQL), so the tracker was empty more often than not. Removed — the
+  // status pill + last_progress_message + result_summary + transcript
+  // already cover everything the timeline tried to add.
 
   const startedAge = task.started_at ? relAge(task.started_at) : null;
   const needsInput = !!task.needs_input;
@@ -183,9 +178,6 @@ export const TaskDetail: React.FC<TaskDetailProps> = ({
             ● {needsInput ? 'NEEDS YOU · STEER REQUESTED' : task.status.toUpperCase()}
           </span>
           {startedAge && <span>started {startedAge} ago</span>}
-          {task.status === 'running' && !needsInput && (
-            <span>phase {displayPhase} / 5</span>
-          )}
           {linearId && (
             <a
               className="meta-link"
@@ -273,23 +265,17 @@ export const TaskDetail: React.FC<TaskDetailProps> = ({
           )}
         </div>
 
-        {/* Progress — rendered only when the worker actually emitted phase
-            markers, OR when there's a result_summary/fail_reason to show.
-            Without phase data AND without a result, the section would be
-            empty noise. */}
-        {(hasPhaseData || task.result_summary || task.fail_reason) && (
+        {/* Result section — only when there's a result_summary or
+            fail_reason to render. The old phase-timeline view was tied to
+            the spawn-template's ticket-shipping shape and most tasks
+            don't fit it. */}
+        {(task.result_summary || task.fail_reason) && (
           <div className="nc-section">
             <div className="nc-section-head open" style={{ cursor: 'default' }}>
-              <span>
-                {hasPhaseData ? 'Progress' : 'Result'}
-                {hasPhaseData && (
-                  <span className="meta"> · phase {displayPhase} of 5</span>
-                )}
-              </span>
+              <span>Result</span>
               <span className="chev">›</span>
             </div>
             <div className="nc-section-body">
-              {hasPhaseData && <PhaseTimeline phases={phases} />}
               {task.result_summary && (
                 <div className={`nc-result ${task.status === 'failed' ? 'failed' : ''}`}>
                   <div
@@ -376,37 +362,6 @@ export const TaskDetail: React.FC<TaskDetailProps> = ({
     </div>
   );
 };
-
-function PhaseTimeline({
-  phases,
-}: {
-  phases: ReturnType<typeof buildPhaseTimeline>;
-}) {
-  return (
-    <div className="nc-timeline">
-      {phases.map((p) => (
-        <div key={p.phase} className={`step ${p.status}`}>
-          <div className="phase-label">
-            Phase {p.phase} · {p.label}
-            {p.timestamp && (
-              <span className="phase-time"> · {relAge(p.timestamp)} ago</span>
-            )}
-          </div>
-          {p.message ? (
-            <div className="phase-msg">{p.message}</div>
-          ) : (
-            <div
-              className="phase-msg"
-              style={{ color: 'var(--fg-4)', fontStyle: 'italic' }}
-            >
-              {p.status === 'active' ? 'in progress' : 'pending'}
-            </div>
-          )}
-        </div>
-      ))}
-    </div>
-  );
-}
 
 function TranscriptBubble({ entry }: { entry: TranscriptEntry }) {
   const text = textOfEntry(entry);

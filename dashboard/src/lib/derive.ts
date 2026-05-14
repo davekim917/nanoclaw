@@ -13,10 +13,9 @@
  * it explicitly via the spawn_request_steer MCP tool, the host clears it
  * on the next successful steer write.
  */
-import type { TaskSummary, TaskDetail, TranscriptEntry } from './api.js';
+import type { TaskSummary, TranscriptEntry } from './api.js';
 
 const LINEAR_RE = /\b([A-Z]{2,5}-\d+)\b/;
-const PHASE_RE = /\bphase\s+([1-5])\b/i;
 
 /**
  * Extract the goal line from a markdown brief.
@@ -70,19 +69,6 @@ export function extractGoal(taskContent: string, maxLen = 140): string {
 export function extractLinearId(taskContent: string): string | null {
   const m = taskContent.match(LINEAR_RE);
   return m ? m[1] : null;
-}
-
-/**
- * Parse the active worker phase from the last spawn_progress message.
- * "Phase 1 setup complete: …" → 1. "Phase 2 implement complete: …" → 2.
- * Returns null when unparseable (older completed tasks with stale messages).
- */
-export function extractPhase(lastProgressMessage?: string): number | null {
-  if (!lastProgressMessage) return null;
-  const m = lastProgressMessage.match(PHASE_RE);
-  if (!m) return null;
-  const n = parseInt(m[1], 10);
-  return Number.isFinite(n) && n >= 1 && n <= 5 ? n : null;
 }
 
 export type Heat = 'hot' | 'warm' | 'cold';
@@ -176,73 +162,6 @@ export function streamGroups(tasks: TaskSummary[]): StreamGroups {
     else if (t.status === 'cancelled') g.cold.push(t);
   }
   return g;
-}
-
-/**
- * Build a phase timeline for the task detail view by mining spawn_progress
- * messages out of the transcript. Falls back to task.last_progress_message
- * when transcript hasn't loaded yet.
- */
-export interface PhaseStep {
-  phase: number;
-  label: string;
-  message: string;
-  timestamp: string;
-  status: 'done' | 'active' | 'pending' | 'failed';
-}
-
-const PHASE_LABELS: Record<number, string> = {
-  1: 'Setup',
-  2: 'Implement',
-  3: 'Verify',
-  4: 'Ship',
-  5: 'Report',
-};
-
-export function buildPhaseTimeline(
-  task: TaskDetail,
-  transcript: TranscriptEntry[]
-): PhaseStep[] {
-  const progressByPhase = new Map<number, { msg: string; ts: string }>();
-  for (const entry of transcript) {
-    if (entry.direction !== 'outbound') continue;
-    const text = textOfEntry(entry);
-    if (!text) continue;
-    const phase = extractPhase(text);
-    if (phase !== null) {
-      progressByPhase.set(phase, { msg: text, ts: entry.timestamp });
-    }
-  }
-  if (progressByPhase.size === 0 && task.last_progress_message) {
-    const p = extractPhase(task.last_progress_message);
-    if (p !== null) {
-      progressByPhase.set(p, {
-        msg: task.last_progress_message,
-        ts: task.admitted_at,
-      });
-    }
-  }
-
-  const currentPhase = Math.max(0, ...Array.from(progressByPhase.keys()));
-  const isTerminal = task.status === 'completed' || task.status === 'failed' || task.status === 'cancelled';
-  const failedAt = task.status === 'failed' ? currentPhase || 1 : null;
-
-  return [1, 2, 3, 4, 5].map((p): PhaseStep => {
-    const got = progressByPhase.get(p);
-    let status: PhaseStep['status'];
-    if (failedAt !== null && p === failedAt) status = 'failed';
-    else if (p < currentPhase) status = 'done';
-    else if (p === currentPhase && !isTerminal) status = 'active';
-    else if (p === currentPhase && task.status === 'completed') status = 'done';
-    else status = 'pending';
-    return {
-      phase: p,
-      label: PHASE_LABELS[p],
-      message: got?.msg ?? '',
-      timestamp: got?.ts ?? '',
-      status,
-    };
-  });
 }
 
 export function textOfEntry(entry: TranscriptEntry): string {

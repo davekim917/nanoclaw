@@ -1,14 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import {
-  extractGoal,
-  extractLinearId,
-  extractPhase,
-  heatOf,
-  countTasks,
-  streamGroups,
-  buildPhaseTimeline,
-} from './derive.js';
-import type { TaskSummary, TaskDetail, TranscriptEntry } from './api.js';
+import { extractGoal, extractLinearId, heatOf, countTasks, streamGroups } from './derive.js';
+import type { TaskSummary } from './api.js';
 
 describe('extractGoal', () => {
   it('pulls the line under "## Goal"', () => {
@@ -38,18 +30,6 @@ describe('extractLinearId', () => {
   });
 });
 
-describe('extractPhase', () => {
-  it('parses "Phase 2 implement complete: …"', () => {
-    expect(extractPhase('Phase 2 implement complete: 3 files changed')).toBe(2);
-  });
-  it('case-insensitive', () => {
-    expect(extractPhase('phase 3 verify')).toBe(3);
-  });
-  it('returns null for unparseable', () => {
-    expect(extractPhase('working on it…')).toBeNull();
-    expect(extractPhase(undefined)).toBeNull();
-  });
-});
 
 describe('heatOf', () => {
   const NOW = Date.parse('2026-05-12T12:00:00Z');
@@ -170,34 +150,3 @@ describe('heatOf', () => {
   });
 });
 
-describe('buildPhaseTimeline', () => {
-  it('marks the highest progress-message phase as active for a running task', () => {
-    const task = {
-      task_id: 't', parent_session_id: 's', task_content: '', status: 'running' as const,
-      admitted_at: '2026-05-12T11:00:00Z',
-      last_progress_message: 'Phase 2 implement complete',
-    } as TaskDetail;
-    const transcript: TranscriptEntry[] = [
-      { id: '1', seq: 1, kind: 'chat', timestamp: '2026-05-12T11:01:00Z',
-        content: { text: 'Phase 1 setup complete' },
-        direction: 'outbound', source: 'agent' },
-      { id: '2', seq: 2, kind: 'chat', timestamp: '2026-05-12T11:02:00Z',
-        content: { text: 'Phase 2 implement complete: 3 files' },
-        direction: 'outbound', source: 'agent' },
-    ];
-    const phases = buildPhaseTimeline(task, transcript);
-    expect(phases[0].status).toBe('done');
-    expect(phases[1].status).toBe('active');
-    expect(phases[2].status).toBe('pending');
-  });
-
-  it('marks the failing phase when status=failed', () => {
-    const task = {
-      task_id: 't', parent_session_id: 's', task_content: '', status: 'failed' as const,
-      admitted_at: '2026-05-12T11:00:00Z',
-      last_progress_message: 'Phase 3 verify',
-    } as TaskDetail;
-    const phases = buildPhaseTimeline(task, []);
-    expect(phases[2].status).toBe('failed');
-  });
-});

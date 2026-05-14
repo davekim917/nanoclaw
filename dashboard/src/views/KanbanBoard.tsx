@@ -5,7 +5,6 @@ import { subscribe, startSSE } from '../lib/sse.ts';
 import {
   extractGoal,
   extractLinearId,
-  extractPhase,
   heatOf,
   relAge,
   countTasks,
@@ -382,7 +381,6 @@ function TaskCard({
 }) {
   const goal = extractGoal(task.task_content);
   const linearId = extractLinearId(task.task_content);
-  const phase = extractPhase(task.last_progress_message);
   const needsInput = !!task.needs_input;
   const isArchived = task.archived_at != null;
   const heat = heatOf({
@@ -458,19 +456,6 @@ function TaskCard({
         )}
       </div>
       <div className="nc-card-goal">{goal}</div>
-      {task.status === 'running' && !needsInput && phase !== null && (
-        <div className="nc-phasebar" aria-hidden="true">
-          {[1, 2, 3, 4, 5].map((p) => (
-            <div
-              key={p}
-              className={
-                'seg ' +
-                (p < phase ? 'done' : p === phase ? 'active' : '')
-              }
-            ></div>
-          ))}
-        </div>
-      )}
       {needsInput && task.steer_question && (
         <div className="nc-card-progress">{task.steer_question}</div>
       )}

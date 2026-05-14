@@ -12,7 +12,7 @@ import type { BoardRoute } from './views/BoardShell.js';
 import './styles.css';
 
 // Design-tool tweak variant. Switchable classes documented in styles.css.
-const TWEAK_CLASS = 'tw-no-heat tw-no-phasebar tw-no-grid';
+const TWEAK_CLASS = 'tw-no-heat tw-no-grid';
 
 function parseHash(): { route: BoardRoute | 'task' | 'session'; taskId?: string; sessionId?: string } {
   const hash = location.hash.slice(1) || '/board';

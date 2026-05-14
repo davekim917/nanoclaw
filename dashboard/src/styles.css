@@ -583,7 +583,6 @@ a:hover { color: var(--fg); }
 .tw-no-heat .nc-card.heat-cold { opacity: 1; }
 .tw-no-heat .nc-card.heat-hot  { background: var(--bg-card); }
 
-.tw-no-phasebar .nc-phasebar { display: none; }
 
 .tw-accent-amber  { --st-running: oklch(0.82 0.16 75); --brand: oklch(0.82 0.16 75); }
 .tw-accent-violet { --st-running: oklch(0.78 0.16 295); --brand: oklch(0.78 0.16 295); }
@@ -733,24 +732,6 @@ a:hover { color: var(--fg); }
 .nc-pill.needs  { background: var(--st-needs-bg);  color: var(--st-needs); }
 .nc-pill.phase  { background: oklch(0.30 0.008 60); color: var(--fg-2); }
 .nc-pill.linear { background: oklch(0.30 0.008 60); color: var(--fg); font-weight: 600; letter-spacing: 0.04em; }
-
-/* Phase progress micro-bar */
-.nc-phasebar {
-  display: grid;
-  grid-template-columns: repeat(5, 1fr);
-  gap: 3px;
-  margin-top: 4px;
-}
-.nc-phasebar .seg {
-  height: 3px;
-  background: oklch(0.30 0.008 60);
-  border-radius: 2px;
-}
-.nc-phasebar .seg.done   { background: var(--st-running); }
-.nc-phasebar .seg.active {
-  background: var(--st-running);
-  animation: nc-pulse 1.2s ease-in-out infinite;
-}
 
 /* Collapsed older section */
 .nc-fold {
@@ -968,58 +949,6 @@ a:hover { color: var(--fg); }
 .md-preview p { margin: 0.1em 0; }
 .md-preview ul, .md-preview ol { padding-left: 1.2em; margin: 0.1em 0; }
 .md-preview pre, .md-preview blockquote { display: none; }
-
-/* Progress timeline */
-.nc-timeline {
-  position: relative;
-  padding-left: 18px;
-  margin-top: 4px;
-}
-.nc-timeline::before {
-  content: "";
-  position: absolute;
-  left: 5px; top: 6px; bottom: 6px;
-  width: 1px;
-  background: var(--line);
-}
-.nc-timeline .step { position: relative; padding: 6px 0 10px; }
-.nc-timeline .step::before {
-  content: "";
-  position: absolute;
-  left: -16px; top: 9px;
-  width: 9px; height: 9px;
-  border-radius: 50%;
-  background: var(--bg-deep);
-  border: 2px solid var(--line-2);
-  box-sizing: border-box;
-}
-.nc-timeline .step.done::before   { border-color: var(--st-done); background: var(--st-done); }
-.nc-timeline .step.active::before {
-  border-color: var(--st-running);
-  background: var(--st-running);
-  box-shadow: 0 0 0 3px var(--st-running-bg);
-  animation: nc-pulse 1.4s ease-in-out infinite;
-}
-.nc-timeline .step.failed::before { border-color: var(--st-failed); background: var(--st-failed); }
-.nc-timeline .step .phase-label {
-  font-family: var(--font-mono);
-  font-size: 10.5px;
-  letter-spacing: 0.14em;
-  text-transform: uppercase;
-  color: var(--fg-3);
-}
-.nc-timeline .step .phase-msg {
-  font-size: 13px;
-  color: var(--fg);
-  line-height: 1.4;
-  margin-top: 2px;
-}
-.nc-timeline .step .phase-time {
-  font-family: var(--font-mono);
-  font-size: 10px;
-  color: var(--fg-4);
-  letter-spacing: 0.06em;
-}
 
 /* Result card */
 .nc-result {
