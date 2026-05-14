@@ -77,11 +77,17 @@ function fsSlug(s: string): string {
  * `/workspace/worktrees` inside their containers so they collaborate on
  * the same checkout.
  *
- * Key shape: `<mg-id>:<thread-id-or-synthetic>`. When `threadId` is null
- * (DM channels, channel-root sessions), use the originatingMessageId as a
- * stable thread surrogate so every conversation still gets a deterministic
- * worktree identity. Without that, every spawn in a non-threaded channel
- * would share the same `<mg>:none` dir and step on each other.
+ * Path shape: `<base>/<mg-id>/<thread-id-or-synthetic>/worktrees/`. When
+ * `threadId` is null (DM channels, channel-root sessions), use the
+ * originatingMessageId as a stable thread surrogate so every conversation
+ * still gets a deterministic worktree identity. Without that, every spawn
+ * in a non-threaded channel would share the same `<mg>/none/` dir and
+ * step on each other.
+ *
+ * Nested dirs (not a `<mg>:<thread>` flat key) because Docker's `-v`
+ * flag uses `:` as the field separator between source:target:options.
+ * A colon in the host path turns `-v src:dst` into a three-part `src:dst:opts`
+ * which Docker rejects with exit 125 — see the bug from earlier deploy.
  */
 export function threadWorktreeDir(
   messagingGroupId: string,
@@ -89,8 +95,7 @@ export function threadWorktreeDir(
   originatingMessageId?: string | null,
 ): string {
   const tid = threadId ?? (originatingMessageId ? `msg-${originatingMessageId}` : 'none');
-  const key = `${fsSlug(messagingGroupId)}:${fsSlug(tid)}`;
-  return path.join(threadsBaseDir(), key, 'worktrees');
+  return path.join(threadsBaseDir(), fsSlug(messagingGroupId), fsSlug(tid), 'worktrees');
 }
 
 /** Path to the host-owned inbound DB (messages_in + delivered). */

@@ -754,7 +754,12 @@ async function deliverMessage(
                 let cleanText: string | null = null;
                 try {
                   const parsed = JSON.parse(scrubbedContent) as Record<string, unknown>;
-                  cleanText = typeof parsed.text === 'string' ? parsed.text : typeof parsed.content === 'string' ? parsed.content : null;
+                  cleanText =
+                    typeof parsed.text === 'string'
+                      ? parsed.text
+                      : typeof parsed.content === 'string'
+                        ? parsed.content
+                        : null;
                 } catch {
                   /* swallow */
                 }
