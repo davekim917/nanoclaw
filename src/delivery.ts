@@ -732,7 +732,8 @@ async function deliverMessage(
       try {
         const mg = getMessagingGroupByPlatform(msg.channel_type, msg.platform_id);
         if (mg) {
-          const { setWalkieStatus, getWalkieStatus, findSiblingAgentIds } = await import('./modules/walkie-talkie/state.js');
+          const { setWalkieStatus, getWalkieStatus, findSiblingAgentIds } =
+            await import('./modules/walkie-talkie/state.js');
           // Check the PRE-update state so [over] honors an earlier [out]:
           // if the thread is already closed (someone said [out] earlier and
           // the user hasn't re-engaged), don't reopen on an agent's solo

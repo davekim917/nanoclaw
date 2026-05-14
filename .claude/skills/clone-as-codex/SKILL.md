@@ -120,20 +120,26 @@ fi
 
 Two agents sharing one Slack bot user need a way to route `@bot ...` messages to the right sibling. The router supports `engage_mode='mention-pattern'`: requires both an `@`-mention of the bot AND a text-pattern match. Reduces noise (random "codex" in chat won't wake the bot) while still letting one bot serve both siblings.
 
-**Trigger syntax** that this wiring enables (assuming the bot's Slack username is `${SOURCE}`):
+**Pick a disambiguator keyword that's unique to this workspace.** A bare `@codex` is a common Slack-app name (OpenAI ships a "Codex" Slack app of its own), and if that app is installed in the workspace, your typed `@codex` would resolve to the *other* bot via Slack's autocomplete — and your sibling agent would never fire. Use a workspace-unique suffix like `@codex-${SOURCE_FOLDER}` (e.g. `@codex-illie`). Throughout the rest of this section, `KEYWORD` is the chosen disambiguator.
+
+```bash
+KEYWORD="@codex-${SOURCE_FOLDER}"        # e.g. @codex-illie. Pick anything that's not an actual Slack user.
+```
+
+**Trigger syntax** that this wiring enables (assuming the source bot's Slack username is `${SOURCE_FOLDER}` and the keyword is `${KEYWORD}`):
 
 | You type | What fires |
 |---|---|
-| `@${SOURCE} do X` | source only |
-| `@${SOURCE} use codex as a subagent` | source only (bare `codex` doesn't route to sibling) |
-| `@${SOURCE} @codex do Y` | **both** (source on real `@`-mention, sibling on literal `@codex` text) |
-| `@codex do Z` | sibling only (no real `@`-mention; sibling uses pattern-only mode) |
-| `@${SOURCE}-codex do W` | ⚠️ nothing — `${SOURCE}-codex` isn't a real Slack user, just literal text; doesn't match either pattern |
+| `@${SOURCE_FOLDER} do X` | source only |
+| `@${SOURCE_FOLDER} use codex as a subagent` | source only (bare word `codex` ≠ literal `${KEYWORD}`) |
+| `@${SOURCE_FOLDER} ${KEYWORD} do Y` | **both** (source on real `@`-mention, sibling on literal `${KEYWORD}` text) |
+| `${KEYWORD} do Z` | sibling only (no real `@`-mention; sibling uses pattern-only mode) |
+| `@${SIBLING_FOLDER} do W` | ⚠️ nothing — sibling folder isn't a real Slack user, just literal text |
 
 Why each side uses a different engage mode:
 
 - **source** uses `mention` (plain platform `@`-mention). Always fires when the bot is mentioned. The sibling firing alongside is additive, not exclusive — siblings can collaborate when both are addressed.
-- **sibling** uses `pattern` (text contains literal `@codex`, no platform `@`-mention required). This makes the sibling addressable alone via `@codex …` even though no Slack user exists by that name. Random chatter saying `@codex` would also fire it; tighten the regex if that becomes noisy in this channel.
+- **sibling** uses `pattern` (text contains `${KEYWORD}`, no platform `@`-mention required). This makes the sibling addressable alone via `${KEYWORD} …` even though no Slack user exists by that name.
 
 ```bash
 # Replace MG_ID with the messaging_group id you want both siblings on.
@@ -146,12 +152,12 @@ pnpm exec tsx scripts/q.ts data/v2.db \
    set engage_mode='mention', engage_pattern=NULL
    where messaging_group_id='${MG_ID}' and agent_group_id='${SOURCE_ID}'"
 
-# Sibling agent: text contains literal '@codex' (no real @-mention needed).
-# session_mode='per-thread' so each thread gets its own session; matches the
-# source's default behavior for threaded channels.
+# Sibling agent: text contains the chosen disambiguator keyword (literal text,
+# no real @-mention required). session_mode='per-thread' so each thread gets
+# its own session; matches the source's default behavior for threaded channels.
 pnpm exec tsx scripts/q.ts data/v2.db \
   "insert into messaging_group_agents (messaging_group_id, agent_group_id, engage_mode, engage_pattern, session_mode, priority, created_at)
-   values ('${MG_ID}', '${SIBLING_ID}', 'pattern', '@codex', 'per-thread', 100, '${NOW}')"
+   values ('${MG_ID}', '${SIBLING_ID}', 'pattern', '${KEYWORD}', 'per-thread', 100, '${NOW}')"
 ```
 
 ### 7b. Wire bi-directional agent_destinations for walkie-talkie peer-wake
