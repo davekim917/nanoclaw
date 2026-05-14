@@ -102,25 +102,35 @@ fi
 
 ### 7. Wire mention disambiguation per channel (Stage 6 — see also `/manage-channels`)
 
-For each messaging_group that the source agent is wired to, add a sibling wiring with an `engage_pattern` regex that matches only the sibling's name. Critical: the source's wiring also needs updating to match only its own name, otherwise the source agent fires on EVERY mention — including `@${SIBLING}`.
+Two agents sharing one Slack bot user need a way to route `@bot ...` messages to the right sibling. The router supports `engage_mode='mention-pattern'`: requires both an `@`-mention of the bot AND a text-pattern match. Reduces noise (random "codex" in chat won't wake the bot) while still letting one bot serve both siblings.
+
+**Trigger syntax** that this wiring enables (assuming the bot's Slack username is `${SOURCE}`):
+
+- `@${SOURCE} do X` → source agent fires (real `@`-mention, no "codex" keyword)
+- `@${SOURCE} codex do Y` → sibling agent fires (real `@`-mention + "codex" keyword)
+- `@${SOURCE}-codex do Z` → ⚠️ does NOT fire — `${SOURCE}-codex` isn't a real Slack user, so Slack treats it as literal text and `isMention=false`. Use `@${SOURCE} codex ...` instead.
 
 ```bash
 # Replace MG_ID with the messaging_group id you want both siblings on.
 MG_ID=<messaging-group-id>
 
-# Source agent: restrict to its own name (not preceded/followed by hyphen).
+# Source agent: @-mention required + must NOT contain "codex" keyword.
+# Negative-lookahead anchors at the start of the text and bans the word
+# "codex" anywhere in the message.
 pnpm exec tsx scripts/q.ts data/v2.db \
   "update messaging_group_agents
-   set engage_mode='pattern', engage_pattern='(?<!-)${SOURCE}(?!-)'
+   set engage_mode='mention-pattern', engage_pattern='^(?!.*\bcodex\b)'
    where messaging_group_id='${MG_ID}' and agent_group_id='${SOURCE}'"
 
-# Sibling agent: insert new wiring + restrict to sibling name.
+# Sibling agent: @-mention required + MUST contain "codex" keyword.
 pnpm exec tsx scripts/q.ts data/v2.db \
   "insert into messaging_group_agents (messaging_group_id, agent_group_id, engage_mode, engage_pattern, session_mode, priority)
-   values ('${MG_ID}', '${SIBLING}', 'pattern', '${SIBLING}', 'persistent', 100)"
+   values ('${MG_ID}', '${SIBLING}', 'mention-pattern', '\bcodex\b', 'persistent', 100)"
 ```
 
-> **Edge case** — when the user `@`-mentions a Slack bot user (not the display name), platform `isMention` fires but the text may not contain `${SOURCE}` or `${SIBLING}`. In that case the regex doesn't match either agent and neither responds. The operator workflow is: address agents by name in the message text (`@${SOURCE} hi` or `@${SIBLING} hi`), not by Slack mention alone.
+> **Why "codex" as the disambiguator?** The bot's Slack username is fixed (whatever you configured the existing app to display as — usually `${SOURCE}`). You can only `@`-mention real Slack users, so the bot can only be hit via `@${SOURCE}`. The keyword `codex` is the cheapest disambiguator that works without admin-installing a second Slack app. If you'd rather use a different keyword, swap `codex` in both regexes.
+
+> **Self-echo loops are prevented at the adapter layer.** The Slack adapter (via `@chat-adapter/slack`'s `isMessageFromSelf` + `@chat`'s `handleIncomingMessage`) drops events where `event.user === bot_user_id` before they reach the router. So `${SIBLING}` posting in a thread will NOT trigger `${SOURCE}` (or itself) on the echo. Verified at `node_modules/chat/dist/index.js:2943`.
 
 ### 8. Restart the host so the new agent_groups row + .env scoped-env is picked up
 

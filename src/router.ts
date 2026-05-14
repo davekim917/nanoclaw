@@ -648,6 +648,23 @@ function evaluateEngage(
     }
     case 'mention':
       return isMention;
+    case 'mention-pattern': {
+      // Hybrid: requires both a platform @-mention AND a text-pattern match.
+      // Use when two sibling agents share one bot user (e.g. illie + illie-codex
+      // on the same Slack app) and a keyword in the message text decides
+      // which sibling fires. Without isMention, random chatter mentioning
+      // the keyword would wake the bot; without the pattern, both siblings
+      // would fire on every @-mention.
+      if (!isMention) return false;
+      const pat = agent.engage_pattern ?? '.';
+      if (pat === '.') return true;
+      try {
+        return new RegExp(pat).test(text);
+      } catch {
+        // Bad regex: fail open so admin sees the agent responding + can fix.
+        return true;
+      }
+    }
     case 'mention-sticky': {
       if (isMention) return true;
       if (mg.is_group === 0) return false; // DMs never use mention-sticky sensibly
