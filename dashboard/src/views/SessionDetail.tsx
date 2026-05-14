@@ -253,18 +253,19 @@ function SessionComposer({
 }
 
 /**
- * Returns true when an outbound entry is one of the agent's "thinking"
- * status updates — kind=status with the `> 💭` block-quote prefix that
- * Claude Code emits between tool calls. These pile up between real chat
- * responses and clutter the transcript when reviewing past sessions; the
- * inbox UX collapses contiguous runs of them into one expandable block.
+ * Returns true when an outbound entry is "agent internal work" rather
+ * than a real chat response. Claude Code emits TWO status patterns
+ * between actual replies:
+ *   - `> 💭 …`  reasoning/thinking blocks
+ *   - `> ✅ …`  tool-result checkpoints (e.g., "✅ Run dbt test")
+ * Both are noise from the operator's POV — they want the surrounding
+ * chat messages, not the working-out in between. We coalesce any
+ * contiguous run of `kind=status` outbound entries into one collapsed
+ * block regardless of the emoji prefix.
  */
 function isThinking(entry: SessionTranscriptEntry): boolean {
   if (entry.direction !== 'out') return false;
-  if (entry.kind !== 'status') return false;
-  // The leading `> 💭` quote prefix is the canonical thinking marker the
-  // agent-runner emits. Match leniently in case of trailing whitespace.
-  return /^>\s*💭/.test(entry.text.trim());
+  return entry.kind === 'status';
 }
 
 type TranscriptGroup =
@@ -344,7 +345,7 @@ function TranscriptRow({ entry }: { entry: SessionTranscriptEntry }) {
  * messages.
  */
 function ThinkingGroupRow({ entries }: { entries: SessionTranscriptEntry[] }) {
-  const label = entries.length === 1 ? '1 thinking step' : `${entries.length} thinking steps`;
+  const label = entries.length === 1 ? '1 agent step' : `${entries.length} agent steps`;
   return (
     <li className="nc-transcript-row outbound nc-transcript-thinking">
       <details>
