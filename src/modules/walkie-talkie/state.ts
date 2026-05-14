@@ -71,3 +71,19 @@ export function parseTrailer(content: string): TrailerParse {
   const text = trimmed.slice(0, -m[0].length).trimEnd();
   return { text, trailer };
 }
+
+/**
+ * Find sibling agent_groups wired to the same messaging group, excluding
+ * the originator. Used by the `[over]` peer-wake path to know who to
+ * forward the hand-off to. Empty array when the originator has no
+ * siblings in the channel (the common case for solo agents).
+ */
+export function findSiblingAgentIds(messagingGroupId: string, excludingAgentGroupId: string): string[] {
+  const rows = getDb()
+    .prepare(
+      `SELECT DISTINCT agent_group_id FROM messaging_group_agents
+       WHERE messaging_group_id = ? AND agent_group_id != ?`,
+    )
+    .all(messagingGroupId, excludingAgentGroupId) as { agent_group_id: string }[];
+  return rows.map((r) => r.agent_group_id);
+}

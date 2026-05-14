@@ -732,10 +732,62 @@ async function deliverMessage(
       try {
         const mg = getMessagingGroupByPlatform(msg.channel_type, msg.platform_id);
         if (mg) {
-          const { setWalkieStatus } = await import('./modules/walkie-talkie/state.js');
+          const { setWalkieStatus, findSiblingAgentIds } = await import('./modules/walkie-talkie/state.js');
           // [over] = sibling please continue (re-opens / keeps the convo active)
           // [out]  = we're done (close the convo until user re-engages)
           setWalkieStatus(mg.id, msg.thread_id, walkieTrailer === 'out' ? 'closed' : 'active');
+
+          // Peer-wake: on [over], forward the cleaned message text to every
+          // sibling agent_group in the same messaging group. We bypass Slack's
+          // bot-echo filter (which would otherwise block cross-sibling visibility)
+          // by writing directly to each sibling's inbound via the agent-to-agent
+          // routing module. [out] suppresses the wake — siblings stay quiet
+          // until the user types in the thread (which resets walkie state in
+          // router.ts).
+          if (walkieTrailer === 'over') {
+            const siblings = findSiblingAgentIds(mg.id, session.agent_group_id);
+            if (siblings.length > 0) {
+              const { routeAgentMessage } = await import('./modules/agent-to-agent/agent-route.js');
+              if (hasTable(getDb(), 'agent_destinations')) {
+                // Parse the cleaned text so we can wrap it with an originator
+                // tag. Sibling sees who said what.
+                let cleanText: string | null = null;
+                try {
+                  const parsed = JSON.parse(scrubbedContent) as Record<string, unknown>;
+                  cleanText = typeof parsed.text === 'string' ? parsed.text : typeof parsed.content === 'string' ? parsed.content : null;
+                } catch {
+                  /* swallow */
+                }
+                if (cleanText) {
+                  const peerText = `[walkie-talkie from @${session.agent_group_id}]\n\n${cleanText}`;
+                  for (const siblingId of siblings) {
+                    try {
+                      await routeAgentMessage(
+                        {
+                          id: `walkie-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+                          platform_id: siblingId,
+                          content: JSON.stringify({ text: peerText }),
+                          in_reply_to: null,
+                        },
+                        session,
+                      );
+                    } catch (err) {
+                      log.warn('walkie-talkie peer-wake failed for sibling', {
+                        from: session.agent_group_id,
+                        to: siblingId,
+                        err: err instanceof Error ? err.message : String(err),
+                      });
+                    }
+                  }
+                }
+              } else {
+                log.debug('walkie-talkie [over]: agent-to-agent module not installed, peer-wake skipped', {
+                  from: session.agent_group_id,
+                  mgId: mg.id,
+                });
+              }
+            }
+          }
         }
       } catch (err) {
         log.warn('Failed to persist walkie-talkie state', {

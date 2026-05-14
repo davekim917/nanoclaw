@@ -106,34 +106,56 @@ Two agents sharing one Slack bot user need a way to route `@bot ...` messages to
 
 **Trigger syntax** that this wiring enables (assuming the bot's Slack username is `${SOURCE}`):
 
-- `@${SOURCE} do X` → source agent fires (real `@`-mention, no `@codex` keyword)
-- `@${SOURCE} @codex do Y` → sibling agent fires (real `@`-mention + literal `@codex` keyword)
-- `@${SOURCE} use codex as a subagent` → source agent fires — the bare word `codex` is fine. Only the literal string `@codex` routes to the sibling. This is deliberate: prevents false-fires when the source agent is asked to *use* codex as a subagent.
-- `@${SOURCE}-codex do Z` → ⚠️ does NOT fire — `${SOURCE}-codex` isn't a real Slack user, so Slack treats it as literal text and `isMention=false`. Use `@${SOURCE} @codex ...` instead.
+| You type | What fires |
+|---|---|
+| `@${SOURCE} do X` | source only |
+| `@${SOURCE} use codex as a subagent` | source only (bare `codex` doesn't route to sibling) |
+| `@${SOURCE} @codex do Y` | **both** (source on real `@`-mention, sibling on literal `@codex` text) |
+| `@codex do Z` | sibling only (no real `@`-mention; sibling uses pattern-only mode) |
+| `@${SOURCE}-codex do W` | ⚠️ nothing — `${SOURCE}-codex` isn't a real Slack user, just literal text; doesn't match either pattern |
+
+Why each side uses a different engage mode:
+
+- **source** uses `mention` (plain platform `@`-mention). Always fires when the bot is mentioned. The sibling firing alongside is additive, not exclusive — siblings can collaborate when both are addressed.
+- **sibling** uses `pattern` (text contains literal `@codex`, no platform `@`-mention required). This makes the sibling addressable alone via `@codex …` even though no Slack user exists by that name. Random chatter saying `@codex` would also fire it; tighten the regex if that becomes noisy in this channel.
 
 ```bash
 # Replace MG_ID with the messaging_group id you want both siblings on.
 MG_ID=<messaging-group-id>
 
-# Source agent: @-mention required + must NOT contain literal "@codex".
-# Negative-lookahead anchors at the start of the text and bans "@codex"
-# anywhere in the message. Bare "codex" (without @) is allowed — the
-# source agent can still be asked to "use codex as a subagent" without
-# accidentally routing the message to the sibling.
+# Source agent: any real @-mention of the bot fires it. No pattern.
 pnpm exec tsx scripts/q.ts data/v2.db \
   "update messaging_group_agents
-   set engage_mode='mention-pattern', engage_pattern='^(?!.*@codex)'
+   set engage_mode='mention', engage_pattern=NULL
    where messaging_group_id='${MG_ID}' and agent_group_id='${SOURCE}'"
 
-# Sibling agent: @-mention required + MUST contain literal "@codex".
+# Sibling agent: text contains literal '@codex' (no real @-mention needed).
 pnpm exec tsx scripts/q.ts data/v2.db \
   "insert into messaging_group_agents (messaging_group_id, agent_group_id, engage_mode, engage_pattern, session_mode, priority)
-   values ('${MG_ID}', '${SIBLING}', 'mention-pattern', '@codex', 'persistent', 100)"
+   values ('${MG_ID}', '${SIBLING}', 'pattern', '@codex', 'persistent', 100)"
 ```
 
-> **Why literal `@codex` (not bare `codex`)?** When you ask the source agent to "use codex as a subagent" or "ask codex to check your work", the bare word `codex` shouldn't route to the sibling — that's intentional source-side delegation, not a hand-off. Anchoring on the literal `@` prefix gives a clean separation: `codex` = something the source agent uses, `@codex` = the sibling agent. Slack won't autocomplete `@codex` to a real mention (no user by that name), but the literal text is still in the message body, so the pattern matches.
+### 7b. Wire bi-directional agent_destinations for walkie-talkie peer-wake
 
-> **Self-echo loops are prevented at the adapter layer.** The Slack adapter (via `@chat-adapter/slack`'s `isMessageFromSelf` + `@chat`'s `handleIncomingMessage`) drops events where `event.user === bot_user_id` before they reach the router. So `${SIBLING}` posting in a thread will NOT trigger `${SOURCE}` (or itself) on the echo. Verified at `node_modules/chat/dist/index.js:2943`.
+For `[over]` to actually wake the peer (rather than just decoratively appearing in the message), each agent needs an `agent_destinations` row authorizing it to send to the other. Idempotent — re-running is safe.
+
+```bash
+NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+# Source → sibling
+pnpm exec tsx scripts/q.ts data/v2.db \
+  "insert or ignore into agent_destinations (agent_group_id, local_name, target_type, target_id, created_at)
+   values ('${SOURCE}', 'codex', 'agent', '${SIBLING}', '${NOW}')"
+
+# Sibling → source
+pnpm exec tsx scripts/q.ts data/v2.db \
+  "insert or ignore into agent_destinations (agent_group_id, local_name, target_type, target_id, created_at)
+   values ('${SIBLING}', '${SOURCE}', 'agent', '${SOURCE}', '${NOW}')"
+```
+
+> **Why both directions?** Either agent can emit `[over]` to hand off; the peer-wake helper in `delivery.ts` calls `routeAgentMessage(target=sibling, originator=session)`, which permission-checks against `agent_destinations`. Missing rows → "unauthorized agent-to-agent" error in the host log + the hand-off silently drops.
+
+> **Self-echo loops are prevented at the adapter layer.** The Slack adapter (via `@chat-adapter/slack`'s `isMessageFromSelf` + `@chat`'s `handleIncomingMessage`) drops events where `event.user === bot_user_id` before they reach the router. So `${SIBLING}` posting in a thread will NOT trigger `${SOURCE}` (or itself) on the echo. Verified at `node_modules/chat/dist/index.js:2943`. The walkie-talkie peer-wake path bypasses this by writing directly to the sibling's session inbound DB — it doesn't go through Slack or the router.
 
 ### 8. Restart the host so the new agent_groups row + .env scoped-env is picked up
 

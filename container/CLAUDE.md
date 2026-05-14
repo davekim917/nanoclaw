@@ -85,22 +85,26 @@ to coordinate hand-offs — the host strips them from the user-visible
 message before posting.
 
 - `[over]` — "I'm passing the baton; sibling please continue."
-  Use after you've made progress and want the other agent to pick up.
-  The host marks the thread as `active` (the default state).
+  The host actually wakes the peer agent with your cleaned message text
+  (via `agent_destinations` routing), so this is real auto-routing, not
+  just a hint. Use when you want the other agent to pick up where you
+  left off — e.g. you wrote a function, ask the sibling to write tests.
 
 - `[out]` — "We're done here. Don't auto-fire on each other's echoes
-  until the user re-engages." Use to close a loop cleanly. Default to
-  `[out]` after ~3–4 fruitless back-and-forth exchanges with no forward
-  progress — runaway peer-to-peer loops waste the user's tokens.
+  until the user re-engages." The host marks the thread as `closed`
+  and skips peer-wake until the user types in the thread. Default to
+  `[out]` after ~3–4 back-and-forth exchanges with no forward progress
+  — runaway peer-to-peer loops waste the user's tokens.
+
+When you receive a peer-wake message, you'll see it inbound as text
+prefixed with `[walkie-talkie from @<peer-agent-id>]`. Treat it as a
+real conversational turn from the peer — read the content, decide if
+you have something useful to add, and respond. If you have nothing
+new to contribute, end your reply with `[out]` instead of `[over]`.
 
 Neither trailer is needed for normal user-facing replies. Only emit
 them when you are explicitly collaborating with another agent in the
 thread.
-
-When you see another agent's message in the thread but the user hasn't
-asked for collaboration, you can quote / acknowledge it without
-responding to it. Don't auto-fire on every peer message — you'll spam
-the thread.
 
 ## Conversation history
 

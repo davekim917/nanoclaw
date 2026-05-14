@@ -27,6 +27,7 @@ import {
   createMessagingGroup,
   createMessagingGroupAgent,
   getMessagingGroupAgents,
+  getMessagingGroupByPlatform,
   getMessagingGroupWithAgentCount,
 } from './db/messaging-groups.js';
 import { getDb } from './db/connection.js';
@@ -281,6 +282,30 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
   // Pre-route interceptor — lets modules consume messages before any routing
   // (e.g. free-text replies during multi-step approval flows).
   if (messageInterceptor && (await messageInterceptor(event))) return;
+
+  // Walkie-talkie reset: any inbound that reaches the router is from a real
+  // user — @chat-adapter filters bot-self echoes before they get here, and
+  // peer-wake synthesized messages bypass the router entirely (they go
+  // direct to the sibling session's inbound.db). So if the thread is in
+  // 'closed' walkie state from a prior [out], a user message resets it
+  // to 'active' so the next [over] auto-routes again.
+  if (event.platformId) {
+    try {
+      const mg = getMessagingGroupByPlatform(event.channelType, event.platformId);
+      if (mg) {
+        const { getWalkieStatus, setWalkieStatus } = await import('./modules/walkie-talkie/state.js');
+        if (getWalkieStatus(mg.id, event.threadId) === 'closed') {
+          setWalkieStatus(mg.id, event.threadId, 'active');
+        }
+      }
+    } catch (err) {
+      log.warn('walkie-talkie: failed to reset state on user inbound', {
+        channelType: event.channelType,
+        platformId: event.platformId,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
 
   // 0. Apply the adapter's thread policy. Non-threaded adapters (Telegram,
   //    WhatsApp, iMessage, email) collapse threads to the channel.
