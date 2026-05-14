@@ -3,20 +3,17 @@ import useSWR from 'swr';
 import { getTask, postSteer, retryTask, archiveTask, unarchiveTask } from '../lib/api.js';
 import { subscribe } from '../lib/sse.ts';
 import { renderMarkdown } from '../lib/markdown.js';
-import {
-  extractGoal,
-  extractLinearId,
-  relAge,
-  textOfEntry,
-} from '../lib/derive.js';
-import type { AuthMe, TranscriptEntry } from '../lib/api.js';
+import { extractGoal, extractLinearId, relAge } from '../lib/derive.js';
+import { TranscriptList, normalizeTaskEntry } from './TranscriptList.js';
+import { SteerComposer, MAX_STEER_CHARS } from './SteerComposer.js';
+import type { AuthMe } from '../lib/api.js';
 
 interface TaskDetailProps {
   authMe: AuthMe;
   taskId: string;
 }
 
-const MAX_CHARS = 4000;
+const MAX_CHARS = MAX_STEER_CHARS;
 
 export const TaskDetail: React.FC<TaskDetailProps> = ({
   authMe: _authMe,
@@ -96,12 +93,6 @@ export const TaskDetail: React.FC<TaskDetailProps> = ({
       }
     } finally {
       setSubmitting(false);
-    }
-  };
-
-  const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
-      void handleSubmit();
     }
   };
 
@@ -314,80 +305,28 @@ export const TaskDetail: React.FC<TaskDetailProps> = ({
                   no transcript yet
                 </div>
               )}
-              {transcript.map((entry) => (
-                <TranscriptBubble key={entry.id} entry={entry} />
-              ))}
+              <TranscriptList entries={transcript.map(normalizeTaskEntry)} />
             </div>
           )}
         </div>
       </div>
 
       {/* Sticky composer */}
-      <form
-        className="nc-composer"
-        onSubmit={(e) => void handleSubmit(e)}
-        aria-label="Steer the task"
-      >
-        {needsInput && task.steer_question && (
-          <div role="note" className="nc-needs-prompt">
-            <div className="nc-needs-prompt-label">Worker is asking</div>
-            {task.steer_question}
-          </div>
-        )}
-        <div className={'field' + (tooLong ? ' over' : '')}>
-          <textarea
-            ref={composerRef}
-            value={text}
-            onChange={(e) => setText(e.target.value)}
-            onKeyDown={handleKeyDown}
-            maxLength={MAX_CHARS + 100}
-            placeholder={needsInput ? 'Answer the worker… (⌘↵ to send)' : 'Steer the worker… (⌘↵ to send)'}
-            rows={3}
-          />
-          <div className="row">
-            <span className={tooLong ? 'over' : ''}>
-              {text.length} / {MAX_CHARS}
-            </span>
-            <button type="submit" className="send" disabled={!canSubmit}>
-              ↪ Send steer
-            </button>
-          </div>
-        </div>
-        {submitError && (
-          <div className="nc-error" role="alert">
-            {submitError}
-          </div>
-        )}
-      </form>
-    </div>
-  );
-};
-
-function TranscriptBubble({ entry }: { entry: TranscriptEntry }) {
-  const text = textOfEntry(entry);
-  const who: 'agent' | 'dashboard' | 'system' =
-    entry.source === 'dashboard'
-      ? 'dashboard'
-      : entry.source === 'system'
-        ? 'system'
-        : 'agent';
-  const ts = (() => {
-    const ms = Date.parse(entry.timestamp);
-    if (Number.isNaN(ms)) return entry.timestamp;
-    return relAge(entry.timestamp) + ' ago';
-  })();
-  return (
-    <div className={`nc-msg ${who}`}>
-      <div className="who">
-        <span className="name">{entry.source}</span>
-        <span>{entry.direction}</span>
-        <span className="when">{ts}</span>
-      </div>
-      <div
-        className="md"
-        dangerouslySetInnerHTML={{ __html: renderMarkdown(text) }}
+      <SteerComposer
+        text={text}
+        onChange={setText}
+        onSubmit={handleSubmit}
+        submitting={false}
+        canSubmit={canSubmit}
+        tooLong={tooLong}
+        submitError={submitError}
+        needsInputPrompt={needsInput ? task.steer_question ?? null : null}
+        placeholder={needsInput ? 'Answer the worker… (⌘↵ to send)' : 'Steer the worker… (⌘↵ to send)'}
+        textareaRef={composerRef}
+        sendLabel="↪ Send steer"
+        ariaLabel="Steer the task"
       />
     </div>
   );
-}
+};
 
