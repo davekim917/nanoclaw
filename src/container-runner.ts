@@ -1627,8 +1627,19 @@ async function buildContainerArgs(
   }
 
   // Memory env vars: injected only when memory is enabled for this group.
+  //
+  // MNEMON_STORE default = the agent_group id, so each group is isolated.
+  // Sibling agents that should SHARE a memory store (e.g. illie + illie-codex
+  // pointing at the same Illysium memory) override via the scoped-env
+  // convention used elsewhere for per-group settings (GIT_AUTHOR_NAME_<group>):
+  //
+  //   MNEMON_STORE_illie_codex=illie
+  //
+  // Folder name → env key: replace '-' with '_' (so illie-codex → illie_codex).
   if (containerConfig.memory?.enabled === true) {
-    args.push('-e', `MNEMON_STORE=${agentGroup.id}`);
+    const scopedKey = `MNEMON_STORE_${agentGroup.folder.replace(/-/g, '_')}`;
+    const mnemonStore = process.env[scopedKey] ?? agentGroup.id;
+    args.push('-e', `MNEMON_STORE=${mnemonStore}`);
     args.push('-e', 'MNEMON_READ_ONLY=1');
     args.push('-e', 'MNEMON_EMBED_ENDPOINT=http://host.docker.internal:11434');
     args.push('-e', 'MNEMON_EMBED_MODEL=nomic-embed-text');
