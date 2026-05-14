@@ -317,6 +317,36 @@ a:hover { color: var(--fg); }
   50% { opacity: 1; }
 }
 
+/* Swipe-to-dismiss wrapper. The card sits on top of a `.nc-swipe-reveal`
+   layer that's hidden at rest (opacity 0) and fades up as the card
+   translates left during a touch gesture. Desktop is unaffected — the
+   touch handlers never fire and the wrapper renders as a transparent
+   pass-through. */
+.nc-swipeable {
+  position: relative;
+  /* Disable browser-native horizontal pan so the card translate isn't
+     fighting a scroll gesture. Vertical scroll is preserved. */
+  touch-action: pan-y;
+}
+.nc-swipe-reveal {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  padding-right: 22px;
+  background: oklch(0.30 0.10 25);
+  color: oklch(0.92 0.05 25);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  border-radius: 8px;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+
 /* Desktop pulse header row — brand on the left, Board/Inbox primary nav
    pinned to the right. Mirrors the mobile `.nc-pulse-top` flex layout so
    the two viewports stay symmetric. */

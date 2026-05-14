@@ -33,6 +33,7 @@ import './providers/index.js';
 import { createProvider, type ProviderName } from './providers/factory.js';
 import type { McpServerConfig } from './providers/types.js';
 import { runPollLoop } from './poll-loop.js';
+import { setupCodexRuntime } from './codex-companion-setup.js';
 
 function log(msg: string): void {
   console.error(`[agent-runner] ${msg}`);
@@ -134,6 +135,18 @@ async function main(): Promise<void> {
       }
     } catch (e) {
       log(`Failed to parse NANOCLAW_MCP_SERVERS: ${e}`);
+    }
+  }
+
+  // Container-local CODEX_HOME so Codex-as-peer (invoked by Claude via the
+  // codex-companion script) sees the same MCP servers Claude does — most
+  // importantly the in-container `nanoclaw` server. No-op when Codex auth
+  // isn't mounted or when Codex is the primary provider (its own writer
+  // handles ~/.codex/config.toml directly).
+  if (providerName !== 'codex') {
+    const codexHome = setupCodexRuntime(mcpServers);
+    if (codexHome) {
+      process.env.CODEX_HOME = codexHome;
     }
   }
 

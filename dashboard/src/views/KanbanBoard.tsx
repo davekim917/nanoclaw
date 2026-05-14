@@ -21,6 +21,7 @@ import {
   useIsMobile,
   type BoardRoute,
 } from './BoardShell.js';
+import { SwipeableCard } from './SwipeableCard.js';
 import type { AuthMe, GroupSummary, TaskSummary } from '../lib/api.js';
 
 interface KanbanBoardProps {
@@ -216,7 +217,7 @@ function PulseHeader({
       </div>
       <div className="nc-pulse-grid">
         <div className="nc-pulse-bigcount">
-          <span>{counts.total}</span>
+          <span>{counts.live}</span>
           <span className="lbl">
             tasks
             <br />
@@ -414,12 +415,17 @@ function TaskCard({
     if (onUnarchive) onUnarchive(task.task_id);
   };
 
+  // Swipe-to-archive is only enabled when the card is in a state that can
+  // actually archive — terminal task with onArchive bound, non-archived.
+  const swipeEnabled = !isArchived && isTerminal && !!onArchive;
   return (
-    <div
+    <SwipeableCard
       className={`nc-card ${colourClass} heat-${heat}${isArchived ? ' archived' : ''}`}
+      enabled={swipeEnabled}
+      onArchive={() => onArchive?.(task.task_id)}
+      onClick={onClick}
       role="button"
       tabIndex={0}
-      onClick={onClick}
       onKeyDown={onKey}
       data-task-id={task.task_id}
     >
@@ -477,7 +483,7 @@ function TaskCard({
           {needsInput && <span className="nc-pill needs">steer requested</span>}
         </div>
       )}
-    </div>
+    </SwipeableCard>
   );
 }
 
@@ -697,7 +703,7 @@ function DesktopBoard({
             <RouteNav route={route} onRouteChange={onRouteChange} />
           </div>
           <div className="bigcount">
-            <span>{counts.total}</span>
+            <span>{counts.live}</span>
             <span className="lbl">
               tasks live
               <br />

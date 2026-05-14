@@ -21,6 +21,7 @@ import {
   useIsMobile,
   type BoardRoute,
 } from './BoardShell.js';
+import { SwipeableCard } from './SwipeableCard.js';
 
 /**
  * Operator inbox at `/dashboard/inbox`. Sister route to the existing
@@ -432,11 +433,13 @@ function SessionCard({
   };
 
   return (
-    <div
+    <SwipeableCard
       className={`nc-card ${colourClass}${isArchived ? ' archived' : ''}`}
+      enabled={!isArchived}
+      onArchive={() => onArchive(session.session_id)}
+      onClick={onClick}
       role="button"
       tabIndex={0}
-      onClick={onClick}
       onKeyDown={onKey}
       data-session-id={session.session_id}
     >
@@ -483,6 +486,6 @@ function SessionCard({
           {session.attached_task_needs_input && <span className="nc-pill needs">needs steer</span>}
         </div>
       )}
-    </div>
+    </SwipeableCard>
   );
 }

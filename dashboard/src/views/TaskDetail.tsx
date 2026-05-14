@@ -156,6 +156,12 @@ export const TaskDetail: React.FC<TaskDetailProps> = ({
   const currentPhase = phases.findIndex((p) => p.status === 'active') + 1;
   const lastDonePhase = phases.filter((p) => p.status === 'done').length;
   const displayPhase = task.status === 'running' ? Math.max(currentPhase, 1) : lastDonePhase || 1;
+  // Hide the phase tracker entirely when the worker never emitted a
+  // `Phase N …` marker. Without data the row would render "Phase 1 of 5"
+  // with every step "pending" — misleading for tasks that shipped without
+  // explicit phase markers. The status pill + result_summary already
+  // communicate the outcome in that case.
+  const hasPhaseData = phases.some((p) => p.message !== '');
 
   const startedAge = task.started_at ? relAge(task.started_at) : null;
   const needsInput = !!task.needs_input;
@@ -267,36 +273,41 @@ export const TaskDetail: React.FC<TaskDetailProps> = ({
           )}
         </div>
 
-        {/* Progress — always open */}
-        <div className="nc-section">
-          <div className="nc-section-head open" style={{ cursor: 'default' }}>
-            <span>
-              Progress{' '}
-              <span className="meta">
-                · phase {displayPhase} of 5
+        {/* Progress — rendered only when the worker actually emitted phase
+            markers, OR when there's a result_summary/fail_reason to show.
+            Without phase data AND without a result, the section would be
+            empty noise. */}
+        {(hasPhaseData || task.result_summary || task.fail_reason) && (
+          <div className="nc-section">
+            <div className="nc-section-head open" style={{ cursor: 'default' }}>
+              <span>
+                {hasPhaseData ? 'Progress' : 'Result'}
+                {hasPhaseData && (
+                  <span className="meta"> · phase {displayPhase} of 5</span>
+                )}
               </span>
-            </span>
-            <span className="chev">›</span>
+              <span className="chev">›</span>
+            </div>
+            <div className="nc-section-body">
+              {hasPhaseData && <PhaseTimeline phases={phases} />}
+              {task.result_summary && (
+                <div className={`nc-result ${task.status === 'failed' ? 'failed' : ''}`}>
+                  <div
+                    className="md"
+                    dangerouslySetInnerHTML={{
+                      __html: renderMarkdown(task.result_summary),
+                    }}
+                  />
+                </div>
+              )}
+              {task.fail_reason && (
+                <div className="nc-card-pillrow" style={{ marginTop: 8 }}>
+                  <span className="nc-pill failed">{task.fail_reason}</span>
+                </div>
+              )}
+            </div>
           </div>
-          <div className="nc-section-body">
-            <PhaseTimeline phases={phases} />
-            {task.result_summary && (
-              <div className={`nc-result ${task.status === 'failed' ? 'failed' : ''}`}>
-                <div
-                  className="md"
-                  dangerouslySetInnerHTML={{
-                    __html: renderMarkdown(task.result_summary),
-                  }}
-                />
-              </div>
-            )}
-            {task.fail_reason && (
-              <div className="nc-card-pillrow" style={{ marginTop: 8 }}>
-                <span className="nc-pill failed">{task.fail_reason}</span>
-              </div>
-            )}
-          </div>
-        </div>
+        )}
 
         {/* Transcript — collapsed by default */}
         <div className="nc-section">

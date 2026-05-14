@@ -1,0 +1,110 @@
+/**
+ * Tests for the CLAUDE.md → AGENTS.md flattener.
+ */
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+
+import { flattenClaudeMd } from './agents-md-flatten.js';
+
+let tmpDir: string;
+
+beforeEach(() => {
+  tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'flatten-test-'));
+});
+
+afterEach(() => {
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+function write(name: string, content: string): string {
+  const p = path.join(tmpDir, name);
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, content);
+  return p;
+}
+
+describe('flattenClaudeMd', () => {
+  it('returns content unchanged when no @-includes', () => {
+    const file = write('CLAUDE.md', '# Title\n\nBody text\n');
+    expect(flattenClaudeMd(file)).toBe('# Title\n\nBody text\n');
+  });
+
+  it('inlines a relative @-include', () => {
+    write('included.md', 'INCLUDED_CONTENT_LINE\n');
+    const file = write('CLAUDE.md', '# Top\n@./included.md\nAfter\n');
+    const out = flattenClaudeMd(file);
+    expect(out).toContain('INCLUDED_CONTENT_LINE');
+    expect(out).toContain('# Top');
+    expect(out).toContain('After');
+    expect(out).not.toContain('@./included.md');
+  });
+
+  it('inlines an absolute @-include', () => {
+    const inc = write('inc-abs.md', 'ABS_INCLUDE\n');
+    const file = write('CLAUDE.md', `# Top\n@${inc}\n`);
+    const out = flattenClaudeMd(file);
+    expect(out).toContain('ABS_INCLUDE');
+  });
+
+  it('inlines recursively (include-of-include)', () => {
+    write('inner.md', 'INNER\n');
+    write('middle.md', 'MIDDLE_START\n@./inner.md\nMIDDLE_END\n');
+    const file = write('CLAUDE.md', 'TOP\n@./middle.md\n');
+    const out = flattenClaudeMd(file);
+    expect(out).toContain('TOP');
+    expect(out).toContain('MIDDLE_START');
+    expect(out).toContain('INNER');
+    expect(out).toContain('MIDDLE_END');
+  });
+
+  it('detects cycles and emits a marker comment', () => {
+    const a = path.join(tmpDir, 'a.md');
+    const b = path.join(tmpDir, 'b.md');
+    fs.writeFileSync(a, 'A\n@./b.md\n');
+    fs.writeFileSync(b, 'B\n@./a.md\n');
+    const out = flattenClaudeMd(a);
+    expect(out).toContain('A');
+    expect(out).toContain('B');
+    expect(out).toMatch(/cycle detected/);
+  });
+
+  it('emits marker comment for missing include (no silent drop)', () => {
+    const file = write('CLAUDE.md', 'TOP\n@./does-not-exist.md\nEND\n');
+    const out = flattenClaudeMd(file);
+    expect(out).toMatch(/failed to read/);
+    expect(out).toContain('TOP');
+    expect(out).toContain('END');
+  });
+
+  it('ignores email-like patterns and bare @identifier', () => {
+    const file = write('CLAUDE.md', 'Contact me at alice@example.com.\n@param foo\nNormal line.\n');
+    const out = flattenClaudeMd(file);
+    expect(out).toContain('alice@example.com');
+    expect(out).toContain('@param foo');
+  });
+
+  it('translates container paths via the prefix map', () => {
+    fs.mkdirSync(path.join(tmpDir, 'container'));
+    fs.writeFileSync(path.join(tmpDir, 'container', 'global.md'), 'CONTAINER_GLOBAL\n');
+    const file = write('CLAUDE.md', '@/app/global.md\n');
+    const out = flattenClaudeMd(file, {
+      containerToHost: { '/app': path.join(tmpDir, 'container') },
+    });
+    expect(out).toContain('CONTAINER_GLOBAL');
+  });
+
+  it('follows symlinks (after translation) to read target file', () => {
+    const realFile = write('real.md', 'VIA_SYMLINK\n');
+    const linkPath = path.join(tmpDir, 'link.md');
+    fs.symlinkSync(realFile, linkPath);
+    const file = write('CLAUDE.md', '@./link.md\n');
+    expect(flattenClaudeMd(file)).toContain('VIA_SYMLINK');
+  });
+
+  it('preserves leading whitespace on non-@ lines', () => {
+    const file = write('CLAUDE.md', '  - bullet\n    - nested\n');
+    expect(flattenClaudeMd(file)).toBe('  - bullet\n    - nested\n');
+  });
+});

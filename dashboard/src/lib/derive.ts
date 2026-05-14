@@ -120,6 +120,11 @@ export function relAge(iso: string, now = Date.now()): string {
 
 export interface Counts {
   total: number;
+  // In-flight only: excludes `completed` and `cancelled`. Used by the
+  // "tasks live" headline. The operator's mental model: "live" = "things
+  // I still need to think about or that are still doing work" — a task
+  // that shipped or was cancelled is no longer live.
+  live: number;
   failed: number;
   needs: number;
   running: number;
@@ -131,6 +136,7 @@ export interface Counts {
 export function countTasks(tasks: TaskSummary[]): Counts {
   const c: Counts = {
     total: tasks.length,
+    live: 0,
     failed: 0, needs: 0, running: 0, done: 0, cancelled: 0, pending: 0,
   };
   for (const t of tasks) {
@@ -143,6 +149,7 @@ export function countTasks(tasks: TaskSummary[]): Counts {
       case 'pending': c.pending++; break;
     }
   }
+  c.live = c.total - c.done - c.cancelled;
   return c;
 }
 
