@@ -68,10 +68,7 @@ function translateContainerPath(target: string, containerToHost: Record<string, 
  * intermediate links and translating container paths via the provided map.
  * Returns null if the chain dangles or hits a non-readable target.
  */
-function resolveSymlinkChain(
-  start: string,
-  containerToHost: Record<string, string>,
-): string | null {
+function resolveSymlinkChain(start: string, containerToHost: Record<string, string>): string | null {
   let current = start;
   for (let i = 0; i < 16; i++) {
     let stat: fs.Stats;
@@ -98,12 +95,7 @@ function resolveSymlinkChain(
   return null; // too many hops — treat as cycle
 }
 
-function flattenInner(
-  filePath: string,
-  visited: Set<string>,
-  depth: number,
-  opts: Required<FlattenOptions>,
-): string {
+function flattenInner(filePath: string, visited: Set<string>, depth: number, opts: Required<FlattenOptions>): string {
   if (depth > opts.maxDepth) {
     return `<!-- agents-md-flatten: max depth ${opts.maxDepth} exceeded at ${filePath} -->`;
   }

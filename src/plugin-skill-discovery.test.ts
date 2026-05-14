@@ -78,10 +78,7 @@ describe('discoverPortableSkills', () => {
   });
 
   it('gitnexus-style <plugin>-claude-plugin/skills/<name>/ as last-resort fallback', () => {
-    writeSkill(
-      path.join(tmpDir, 'plug-gn', 'plug-gn-claude-plugin', 'skills', 'gn-sub'),
-      { name: 'gn-sub' },
-    );
+    writeSkill(path.join(tmpDir, 'plug-gn', 'plug-gn-claude-plugin', 'skills', 'gn-sub'), { name: 'gn-sub' });
     const out = discoverPortableSkills(tmpDir);
     expect(out.map((s) => s.name)).toEqual(['gn-sub']);
   });
@@ -109,18 +106,11 @@ describe('discoverPortableSkills', () => {
   });
 
   it('bootstrap multi-plugin: workflow skills denied, domain skills included', () => {
-    writeSkill(
-      path.join(tmpDir, 'bootstrap', 'plugins', 'workflow', 'skills', 'team-build'),
-      { name: 'team-build' },
-    );
-    writeSkill(
-      path.join(tmpDir, 'bootstrap', 'plugins', 'domain', 'skills', 'software-engineering'),
-      { name: 'software-engineering' },
-    );
-    writeSkill(
-      path.join(tmpDir, 'bootstrap', 'plugins', 'tools', 'skills', 'cortex-code'),
-      { name: 'cortex-code' },
-    );
+    writeSkill(path.join(tmpDir, 'bootstrap', 'plugins', 'workflow', 'skills', 'team-build'), { name: 'team-build' });
+    writeSkill(path.join(tmpDir, 'bootstrap', 'plugins', 'domain', 'skills', 'software-engineering'), {
+      name: 'software-engineering',
+    });
+    writeSkill(path.join(tmpDir, 'bootstrap', 'plugins', 'tools', 'skills', 'cortex-code'), { name: 'cortex-code' });
     const out = discoverPortableSkills(tmpDir);
     const names = out.map((s) => s.name);
     expect(names).toContain('software-engineering');
@@ -143,22 +133,45 @@ describe('discoverPortableSkills', () => {
   });
 });
 
-describe('syncSkillSymlinks', () => {
-  it('creates symlinks for each discovered skill', () => {
-    const src = path.join(tmpDir, 'src-a');
-    fs.mkdirSync(src, { recursive: true });
+describe('syncSkillSymlinks (mirror-dir mode)', () => {
+  function makeSourceSkill(dir: string, children: Record<string, 'file' | 'dir'> = { 'SKILL.md': 'file' }): string {
+    fs.mkdirSync(dir, { recursive: true });
+    for (const [name, kind] of Object.entries(children)) {
+      const p = path.join(dir, name);
+      if (kind === 'file') fs.writeFileSync(p, `content-${name}`);
+      else fs.mkdirSync(p, { recursive: true });
+    }
+    return dir;
+  }
+
+  it('materializes <dst>/<name>/ as a REAL DIR (Codex requires real dirs)', () => {
+    const src = makeSourceSkill(path.join(tmpDir, 'src-a'));
     const dst = path.join(tmpDir, 'dst');
-    const skills = [
-      { name: 'a', skillDir: src, plugin: 'p' },
-    ];
-    const result = syncSkillSymlinks(dst, skills);
+    const result = syncSkillSymlinks(dst, [{ name: 'a', skillDir: src, plugin: 'p' }]);
     expect(result.created).toEqual(['a']);
-    expect(fs.readlinkSync(path.join(dst, 'a'))).toBe(src);
+    const stat = fs.lstatSync(path.join(dst, 'a'));
+    expect(stat.isSymbolicLink()).toBe(false);
+    expect(stat.isDirectory()).toBe(true);
   });
 
-  it('idempotent on rerun (no churn)', () => {
-    const src = path.join(tmpDir, 'src-a');
-    fs.mkdirSync(src, { recursive: true });
+  it('children of the skill dir are symlinks back to source (auto-update)', () => {
+    const src = makeSourceSkill(path.join(tmpDir, 'src-imp'), {
+      'SKILL.md': 'file',
+      scripts: 'dir',
+      reference: 'dir',
+    });
+    const dst = path.join(tmpDir, 'dst');
+    syncSkillSymlinks(dst, [{ name: 'imp', skillDir: src, plugin: 'p' }]);
+    const mirror = path.join(dst, 'imp');
+    expect(fs.lstatSync(path.join(mirror, 'SKILL.md')).isFile()).toBe(true);
+    expect(fs.lstatSync(path.join(mirror, 'SKILL.md')).isSymbolicLink()).toBe(false);
+    expect(fs.readFileSync(path.join(mirror, 'SKILL.md'), 'utf-8')).toBe('content-SKILL.md');
+    expect(fs.lstatSync(path.join(mirror, 'scripts')).isSymbolicLink()).toBe(true);
+    expect(fs.readlinkSync(path.join(mirror, 'scripts'))).toBe(path.join(src, 'scripts'));
+  });
+
+  it('idempotent: re-run with same input reports unchanged', () => {
+    const src = makeSourceSkill(path.join(tmpDir, 'src-a'));
     const dst = path.join(tmpDir, 'dst');
     syncSkillSymlinks(dst, [{ name: 'a', skillDir: src, plugin: 'p' }]);
     const result = syncSkillSymlinks(dst, [{ name: 'a', skillDir: src, plugin: 'p' }]);
@@ -166,11 +179,9 @@ describe('syncSkillSymlinks', () => {
     expect(result.unchanged).toEqual(['a']);
   });
 
-  it('removes stale links not in current desired set', () => {
-    const srcA = path.join(tmpDir, 'src-a');
-    const srcB = path.join(tmpDir, 'src-b');
-    fs.mkdirSync(srcA, { recursive: true });
-    fs.mkdirSync(srcB, { recursive: true });
+  it('removes managed mirror dirs when name leaves desired set', () => {
+    const srcA = makeSourceSkill(path.join(tmpDir, 'src-a'));
+    const srcB = makeSourceSkill(path.join(tmpDir, 'src-b'));
     const dst = path.join(tmpDir, 'dst');
     syncSkillSymlinks(dst, [
       { name: 'a', skillDir: srcA, plugin: 'p' },
@@ -181,24 +192,52 @@ describe('syncSkillSymlinks', () => {
     expect(fs.existsSync(path.join(dst, 'b'))).toBe(false);
   });
 
-  it('preserves non-symlink entries (operator-placed dirs)', () => {
+  it('defers to native install (real files in mirror) — gitnexus setup case', () => {
+    const src = makeSourceSkill(path.join(tmpDir, 'src'));
     const dst = path.join(tmpDir, 'dst');
     fs.mkdirSync(dst, { recursive: true });
-    fs.mkdirSync(path.join(dst, 'manual'));
-    const result = syncSkillSymlinks(dst, []);
-    expect(result.removed).toEqual([]);
-    expect(fs.existsSync(path.join(dst, 'manual'))).toBe(true);
+    fs.mkdirSync(path.join(dst, 'collide'), { recursive: true });
+    fs.writeFileSync(path.join(dst, 'collide', 'SKILL.md'), 'NATIVE_INSTALL');
+    const result = syncSkillSymlinks(dst, [{ name: 'collide', skillDir: src, plugin: 'p' }]);
+    expect(result.skipped).toEqual(['collide']);
+    expect(fs.readFileSync(path.join(dst, 'collide', 'SKILL.md'), 'utf-8')).toBe('NATIVE_INSTALL');
   });
 
-  it('updates link when target changes', () => {
-    const srcOld = path.join(tmpDir, 'old');
-    const srcNew = path.join(tmpDir, 'new');
-    fs.mkdirSync(srcOld, { recursive: true });
-    fs.mkdirSync(srcNew, { recursive: true });
+  it('preserves operator-placed dirs at the top level', () => {
     const dst = path.join(tmpDir, 'dst');
-    syncSkillSymlinks(dst, [{ name: 'a', skillDir: srcOld, plugin: 'p' }]);
-    const result = syncSkillSymlinks(dst, [{ name: 'a', skillDir: srcNew, plugin: 'p' }]);
-    expect(result.created).toEqual(['a']);
-    expect(fs.readlinkSync(path.join(dst, 'a'))).toBe(srcNew);
+    fs.mkdirSync(path.join(dst, 'manual'), { recursive: true });
+    fs.writeFileSync(path.join(dst, 'manual', 'real-file.txt'), '');
+    const result = syncSkillSymlinks(dst, []);
+    expect(result.removed).toEqual([]);
+    expect(fs.existsSync(path.join(dst, 'manual', 'real-file.txt'))).toBe(true);
+  });
+
+  it('updates child symlinks when source adds a file between runs', () => {
+    const src = makeSourceSkill(path.join(tmpDir, 'src'), { 'SKILL.md': 'file' });
+    const dst = path.join(tmpDir, 'dst');
+    syncSkillSymlinks(dst, [{ name: 'a', skillDir: src, plugin: 'p' }]);
+    fs.writeFileSync(path.join(src, 'NEW.md'), '');
+    syncSkillSymlinks(dst, [{ name: 'a', skillDir: src, plugin: 'p' }]);
+    expect(fs.lstatSync(path.join(dst, 'a', 'NEW.md')).isSymbolicLink()).toBe(true);
+  });
+
+  it('removes stale child symlinks when source removes a file', () => {
+    const src = makeSourceSkill(path.join(tmpDir, 'src'), { 'SKILL.md': 'file', 'OLD.md': 'file' });
+    const dst = path.join(tmpDir, 'dst');
+    syncSkillSymlinks(dst, [{ name: 'a', skillDir: src, plugin: 'p' }]);
+    fs.unlinkSync(path.join(src, 'OLD.md'));
+    syncSkillSymlinks(dst, [{ name: 'a', skillDir: src, plugin: 'p' }]);
+    expect(fs.existsSync(path.join(dst, 'a', 'OLD.md'))).toBe(false);
+  });
+
+  it('migrates legacy top-level symlinks into mirror dirs', () => {
+    const src = makeSourceSkill(path.join(tmpDir, 'src'));
+    const dst = path.join(tmpDir, 'dst');
+    fs.mkdirSync(dst, { recursive: true });
+    fs.symlinkSync(src, path.join(dst, 'legacy'));
+    syncSkillSymlinks(dst, [{ name: 'legacy', skillDir: src, plugin: 'p' }]);
+    expect(fs.lstatSync(path.join(dst, 'legacy')).isSymbolicLink()).toBe(false);
+    expect(fs.lstatSync(path.join(dst, 'legacy')).isDirectory()).toBe(true);
+    expect(fs.lstatSync(path.join(dst, 'legacy', 'SKILL.md')).isFile()).toBe(true);
   });
 });

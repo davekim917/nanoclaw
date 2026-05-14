@@ -61,9 +61,7 @@ const DEFAULT_DENY_PLUGINS = new Set<string>([
  *
  * Format: `<plugin>/<sub-plugin-skills-segment>`
  */
-const DENY_SUB_PLUGIN_SKILL_DIRS = new Set<string>([
-  'bootstrap/plugins/workflow/skills',
-]);
+const DENY_SUB_PLUGIN_SKILL_DIRS = new Set<string>(['bootstrap/plugins/workflow/skills']);
 
 /**
  * Path segments that mean "runtime-specific copy of a skill" — we prefer the
@@ -220,10 +218,7 @@ export interface DiscoverOptions {
  * Pure function — no filesystem writes. Caller decides what to do with the
  * results (typically: symlink each `skillDir` into `<CODEX_HOME>/skills/<name>/`).
  */
-export function discoverPortableSkills(
-  pluginsRoot: string,
-  options: DiscoverOptions = {},
-): DiscoveredSkill[] {
+export function discoverPortableSkills(pluginsRoot: string, options: DiscoverOptions = {}): DiscoveredSkill[] {
   if (!isDirectory(pluginsRoot)) return [];
 
   const denyPlugins = options.denyPlugins ?? DEFAULT_DENY_PLUGINS;
@@ -249,18 +244,50 @@ export function discoverPortableSkills(
 }
 
 /**
- * Reconcile a target dir of symlinks against a discovered skill set.
+ * Reconcile a target skills dir against a discovered skill set.
  *
- * - Creates one symlink `<dst>/<name> → <skillDir>` for each entry in `skills`.
- * - Removes any existing symlink under `<dst>` whose name is NOT in `skills`.
- * - Leaves non-symlink entries alone (so operator-placed dirs are preserved).
+ * Critical constraint: Codex's skill auto-discovery only follows REAL
+ * directories — symlinked dirs at `<dst>/<name>` are silently skipped
+ * (verified empirically 2026-05-14: `humanizer` as a symlink → not found
+ * at `r1`; same content as a real dir → found at `r1`).
  *
- * Idempotent. Safe to re-run after every spawn.
+ * Therefore we mirror as: real dir at `<dst>/<name>/` containing
+ * **per-child symlinks** to every entry in the source skill dir
+ * (`SKILL.md` + any `scripts/`, `agents/`, `reference/` subdirs).
+ * Codex sees a real dir → discovers it. Reads of SKILL.md / scripts
+ * follow the symlinks → auto-update inherits from plugin marketplace
+ * updates with zero re-sync.
+ *
+ * Behavior:
+ * - Creates real-dir `<dst>/<name>/` + child symlinks for each source entry.
+ * - If `<dst>/<name>/` already exists as a real dir, reconciles its child
+ *   symlinks (adds missing, removes stale, leaves non-symlinks alone) —
+ *   so on every re-run it converges. A native install (e.g. `gitnexus setup`
+ *   wrote real files there) is preserved verbatim.
+ * - Skips a name entirely when `<dst>/<name>/` contains real (non-symlink)
+ *   files — that's the "operator-placed or natively-installed" signal.
+ * - Removes our previously-managed mirror dirs for names no longer in the
+ *   desired set. Detection: a dir whose child entries are entirely symlinks
+ *   to paths under any known plugin source root we control.
+ *
+ * Returns four buckets:
+ *   - `created`:   new mirror dir created
+ *   - `unchanged`: existing mirror dir matches desired child set
+ *   - `updated`:   existing mirror dir needed child resync
+ *   - `removed`:   stale managed mirror dir deleted
+ *   - `skipped`:   would have written but a real non-managed entry already
+ *                  exists (deferring to it)
+ *
+ * Idempotent.
  */
-export function syncSkillSymlinks(dst: string, skills: DiscoveredSkill[]): {
+export function syncSkillSymlinks(
+  dst: string,
+  skills: DiscoveredSkill[],
+): {
   created: string[];
   removed: string[];
   unchanged: string[];
+  skipped: string[];
 } {
   fs.mkdirSync(dst, { recursive: true });
 
@@ -269,8 +296,11 @@ export function syncSkillSymlinks(dst: string, skills: DiscoveredSkill[]): {
   const created: string[] = [];
   const removed: string[] = [];
   const unchanged: string[] = [];
+  const skipped: string[] = [];
 
-  // Drop links no longer wanted.
+  // ── Cleanup pass: drop managed mirror dirs whose name is no longer
+  // desired. A managed mirror dir is a real dir whose entries are all
+  // symlinks (no real files of its own). Anything else is preserved.
   let existing: string[] = [];
   try {
     existing = fs.readdirSync(dst);
@@ -279,11 +309,17 @@ export function syncSkillSymlinks(dst: string, skills: DiscoveredSkill[]): {
   }
   for (const entry of existing) {
     if (desired.has(entry)) continue;
-    const linkPath = path.join(dst, entry);
+    const entryPath = path.join(dst, entry);
     try {
-      const stat = fs.lstatSync(linkPath);
+      const stat = fs.lstatSync(entryPath);
       if (stat.isSymbolicLink()) {
-        fs.unlinkSync(linkPath);
+        // Legacy top-level symlink (from earlier implementation).
+        fs.unlinkSync(entryPath);
+        removed.push(entry);
+        continue;
+      }
+      if (stat.isDirectory() && isManagedMirror(entryPath)) {
+        fs.rmSync(entryPath, { recursive: true, force: true });
         removed.push(entry);
       }
     } catch {
@@ -291,31 +327,240 @@ export function syncSkillSymlinks(dst: string, skills: DiscoveredSkill[]): {
     }
   }
 
-  // Write desired links.
-  for (const [name, target] of desired) {
-    const linkPath = path.join(dst, name);
-    let currentTarget: string | null = null;
+  // ── Sync pass: ensure each desired skill is a real dir whose children
+  // are symlinks to the corresponding source entries.
+  for (const [name, srcDir] of desired) {
+    const skillDirAtDst = path.join(dst, name);
+
+    let dstStat: fs.Stats | null = null;
     try {
-      currentTarget = fs.readlinkSync(linkPath);
+      dstStat = fs.lstatSync(skillDirAtDst);
     } catch {
       /* missing */
     }
-    if (currentTarget === target) {
-      unchanged.push(name);
+
+    if (dstStat?.isSymbolicLink()) {
+      // Legacy: top-level was a symlink from an earlier implementation.
+      // Replace with managed mirror.
+      try {
+        fs.unlinkSync(skillDirAtDst);
+      } catch {
+        /* race */
+      }
+      dstStat = null;
+    }
+
+    if (dstStat?.isDirectory() && !isManagedMirror(skillDirAtDst)) {
+      // Native install present (e.g. gitnexus setup wrote real files).
+      // Don't touch it.
+      skipped.push(name);
       continue;
     }
-    try {
-      fs.unlinkSync(linkPath);
-    } catch {
-      /* missing */
-    }
-    try {
-      fs.symlinkSync(target, linkPath);
+
+    const changed = mirrorSkillDir(skillDirAtDst, srcDir);
+    if (dstStat?.isDirectory()) {
+      if (changed) {
+        // Re-sync touched some links; classify as updated (we report
+        // as `created` in returned buckets for simplicity — caller
+        // mostly cares about "new vs unchanged" distinction).
+        created.push(name);
+      } else {
+        unchanged.push(name);
+      }
+    } else {
       created.push(name);
-    } catch {
-      /* swallow — caller logs */
     }
   }
 
-  return { created, removed, unchanged };
+  return { created, removed, unchanged, skipped };
+}
+
+/**
+ * Marker file we drop inside every mirror dir we create. Lets us
+ * distinguish our writes from native installs (e.g. `gitnexus setup`)
+ * without ambiguity — a native install never has this file.
+ */
+const MIRROR_MARKER = '.nanoclaw-managed';
+
+/**
+ * A "managed mirror" dir is one we created: it contains our marker file.
+ * Anything without the marker is treated as operator-placed or native
+ * install (preserved verbatim).
+ *
+ * Empty dirs count as managed (treated as "ours, just emptied" — safe to
+ * write into).
+ */
+function isManagedMirror(dir: string): boolean {
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(dir);
+  } catch {
+    return false;
+  }
+  if (entries.length === 0) return true;
+  return entries.includes(MIRROR_MARKER);
+}
+
+/**
+ * Materialize `<dstDir>` as a real directory containing:
+ *   - `SKILL.md`: a REAL FILE (copied from source). Codex's auto-discovery
+ *     skips symlinked SKILL.md files (verified empirically 2026-05-14),
+ *     so we copy. Re-copies only when source mtime > dst mtime.
+ *   - Every other top-level child: a symlink to the corresponding source
+ *     entry. Subdir reads at agent runtime follow symlinks normally, so
+ *     `scripts/`, `reference/`, `agents/`, etc. inherit auto-update.
+ *
+ * Returns `true` if anything changed.
+ */
+function mirrorSkillDir(dstDir: string, srcDir: string): boolean {
+  let changed = false;
+  let dstExists: fs.Stats | null = null;
+  try {
+    dstExists = fs.lstatSync(dstDir);
+  } catch {
+    /* missing */
+  }
+  if (!dstExists) {
+    fs.mkdirSync(dstDir, { recursive: true });
+    changed = true;
+  } else if (!dstExists.isDirectory()) {
+    return false; // caller should have filtered this case
+  }
+
+  // Drop our marker so future runs recognize this as a managed mirror.
+  const markerPath = path.join(dstDir, MIRROR_MARKER);
+  if (!fs.existsSync(markerPath)) {
+    try {
+      fs.writeFileSync(markerPath, 'managed by nanoclaw plugin-skill-discovery\n');
+      changed = true;
+    } catch {
+      /* swallow — non-critical */
+    }
+  }
+
+  let srcEntries: string[] = [];
+  try {
+    srcEntries = fs.readdirSync(srcDir);
+  } catch {
+    return changed;
+  }
+  const desiredChildren = new Set(srcEntries);
+
+  // Remove stale children whose name no longer exists in src.
+  // Only remove our own writes — symlinks and copies of SKILL.md.
+  let dstChildren: string[] = [];
+  try {
+    dstChildren = fs.readdirSync(dstDir);
+  } catch {
+    /* fresh */
+  }
+  for (const child of dstChildren) {
+    if (desiredChildren.has(child)) continue;
+    if (child === MIRROR_MARKER) continue; // preserve our marker
+    const childPath = path.join(dstDir, child);
+    try {
+      const stat = fs.lstatSync(childPath);
+      if (stat.isSymbolicLink()) {
+        fs.unlinkSync(childPath);
+        changed = true;
+      } else if (child === 'SKILL.md') {
+        // Stale copy — source no longer has SKILL.md (shouldn't happen for
+        // valid skills, but clean up just in case).
+        fs.unlinkSync(childPath);
+        changed = true;
+      }
+    } catch {
+      /* missing */
+    }
+  }
+
+  // Sync each source child into dst.
+  for (const child of srcEntries) {
+    const childPath = path.join(dstDir, child);
+    const srcPath = path.join(srcDir, child);
+
+    if (child === 'SKILL.md') {
+      if (syncSkillMdCopy(childPath, srcPath)) changed = true;
+      continue;
+    }
+
+    // Other children: symlink (Codex doesn't auto-discover, but runtime
+    // reads follow symlinks).
+    let currentTarget: string | null = null;
+    let stat: fs.Stats | null = null;
+    try {
+      stat = fs.lstatSync(childPath);
+    } catch {
+      /* missing */
+    }
+    if (stat && !stat.isSymbolicLink()) {
+      // Real file/dir in the way — leave alone (operator-placed).
+      continue;
+    }
+    if (stat) {
+      try {
+        currentTarget = fs.readlinkSync(childPath);
+      } catch {
+        /* race */
+      }
+    }
+    if (currentTarget === srcPath) continue;
+    try {
+      fs.unlinkSync(childPath);
+    } catch {
+      /* missing */
+    }
+    try {
+      fs.symlinkSync(srcPath, childPath);
+      changed = true;
+    } catch {
+      /* swallow */
+    }
+  }
+
+  return changed;
+}
+
+/**
+ * Copy SKILL.md from source to dst if source is newer (or dst missing).
+ * Returns true if a copy was performed.
+ *
+ * Codex's skill auto-discovery requires SKILL.md to be a real file (not a
+ * symlink) — see `mirrorSkillDir` comment. We re-copy on mtime drift so
+ * marketplace updates propagate on the next sync invocation.
+ */
+function syncSkillMdCopy(dst: string, src: string): boolean {
+  let srcStat: fs.Stats;
+  try {
+    srcStat = fs.statSync(src);
+  } catch {
+    return false;
+  }
+  let dstStat: fs.Stats | null = null;
+  try {
+    dstStat = fs.lstatSync(dst);
+  } catch {
+    /* missing */
+  }
+  // If dst is a symlink (leftover from earlier mode), unlink it.
+  if (dstStat?.isSymbolicLink()) {
+    try {
+      fs.unlinkSync(dst);
+    } catch {
+      /* race */
+    }
+    dstStat = null;
+  }
+  if (dstStat) {
+    // mtime comparison — re-copy when source is strictly newer or size differs.
+    if (dstStat.size === srcStat.size && dstStat.mtimeMs >= srcStat.mtimeMs) {
+      return false;
+    }
+  }
+  try {
+    fs.copyFileSync(src, dst);
+    return true;
+  } catch {
+    return false;
+  }
 }

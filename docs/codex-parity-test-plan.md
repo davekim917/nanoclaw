@@ -62,7 +62,7 @@ deliverable changes and the verification steps so future drift can be caught.
 
 12. **Plugin-skill discovery + sync** (`src/plugin-skill-discovery.ts`,
     `scripts/sync-codex-plugin-skills.ts`) — walks `~/plugins/*/` and
-    creates `~/.codex/skills/<name>` symlinks for every portable skill
+    materializes mirror dirs at `~/.agents/skills/<name>/` for every portable skill
     using this preference order:
 
     1. `<plugin>/.agents/skills/<name>/` — the runtime-agnostic canonical
@@ -81,16 +81,46 @@ deliverable changes and the verification steps so future drift can be caught.
     `user-invocable: false`.
 
     Result: 31 portable skills wired (8 bootstrap-domain, 12 taste-skill,
-    7 gitnexus, plus humanizer, impeccable, remotion-best-practices,
-    cortex-code). Auto-update inherits from Claude's marketplace —
-    `~/plugins/<plugin>/` updates are immediately visible to Codex via
-    the symlink.
+    7 gitnexus via `gitnexus setup`, plus humanizer, impeccable,
+    remotion-best-practices, cortex-code). Auto-update inherits from
+    Claude's marketplace — `~/plugins/<plugin>/` updates propagate to
+    Codex via symlinked subdirs; `SKILL.md` is re-copied on next sync
+    if source mtime advances.
 
 13. **Container plugin-skill sync** — `setupCodexRuntime` runs the same
-    discovery against `/workspace/plugins/` and writes symlinks to
-    `/home/node/.codex-runtime/skills/`, layered on top of the 10
-    container-bundled NanoClaw skills (agent-browser, vercel-cli,
-    slack-formatting, etc.). Total per container: ~41 skills.
+    discovery against `/workspace/plugins/` and writes mirror dirs to
+    `/home/node/.agents/skills/`, layered on top of the 10 container-
+    bundled NanoClaw skills (agent-browser, vercel-cli, slack-formatting,
+    etc.). Total per container: 41 skills.
+
+### Critical empirical finding (2026-05-14)
+
+Codex's skill auto-discovery has TWO constraints I verified live before
+landing the final design:
+
+- **Top-level skill dir must be a real directory.** Symlinked
+  `~/.agents/skills/<name>` → source path is silently ignored. Probe:
+  rename humanizer from symlink → real dir; Codex's `r1` discovery
+  picked it up immediately.
+- **`SKILL.md` inside that dir must be a real file** (not a symlink).
+  Probe: same dir, made SKILL.md a symlink → not in `r1`. Made it a real
+  file → found at `r1`.
+
+Subdirs and other top-level files (scripts/, reference/, assets/) CAN
+be symlinks — Codex follows them at agent runtime (standard fs reads).
+That's the asymmetry the mirror logic exploits: real dir + real SKILL.md
+copy + symlinked everything else. A `.nanoclaw-managed` marker
+distinguishes our writes from native installs (`gitnexus setup`,
+operator-placed) so we never overwrite them.
+
+### Editing flow: where skills come from
+
+| Source | Lives at | Auto-update path |
+|--------|----------|-----------------|
+| Tools with native Codex install (e.g. gitnexus) | `~/.agents/skills/<tool>/` (real install) | run the tool's setup command again |
+| `~/plugins/<plugin>/` (Claude marketplace) | `~/.agents/skills/<name>/` (mirror dir) | symlinked subdirs auto-update; SKILL.md re-copied when sync re-runs |
+| Manually installed | `~/.agents/skills/<name>/` (real install) | edit in place |
+| Container-bundled NanoClaw (in-container only) | `/home/node/.agents/skills/<name>/` (mirror dir) | regenerated on every container spawn |
 
 ## Verification matrix
 

@@ -39,6 +39,11 @@ const HOST_CODEX_DIR = '/home/node/.codex';
 const RUNTIME_CODEX_DIR = '/home/node/.codex-runtime';
 const CONTAINER_CLAUDE_SKILLS_DIR = '/home/node/.claude/skills';
 const CONTAINER_PLUGINS_DIR = '/workspace/plugins';
+// Runtime-agnostic skill discovery path. Codex auto-scans this in addition
+// to $CODEX_HOME/skills/ — verified empirically via `codex debug
+// prompt-input` (~/.agents/skills/ appears as discovery root `r1`).
+// Other compliant agent runtimes (OpenCode, etc.) read here too.
+const CONTAINER_AGENTS_SKILLS_DIR = '/home/node/.agents/skills';
 
 function log(msg: string): void {
   console.error(`[codex-companion-setup] ${msg}`);
@@ -145,12 +150,17 @@ function parseHostMcpServers(toml: string): Record<string, McpServerConfig> {
 
   const flush = () => {
     if (!currentName) return;
-    const type = (partial.type as string | undefined) ?? 'stdio';
-    if (type === 'http' || type === 'sse') {
-      const url = partial.url as string | undefined;
-      if (url) result[currentName] = { type, url };
-    } else {
-      const command = partial.command as string | undefined;
+    // Type inference: explicit `type =` wins, else derive from url/command
+    // shape. `gitnexus setup` (and other tools) write entries with no
+    // `type` field, relying on Codex's auto-detection from url vs command.
+    const explicitType = partial.type as string | undefined;
+    const url = partial.url as string | undefined;
+    const command = partial.command as string | undefined;
+    const inferredType =
+      explicitType ?? (url ? 'http' : command ? 'stdio' : undefined);
+    if (inferredType === 'http' || inferredType === 'sse') {
+      if (url) result[currentName] = { type: inferredType, url };
+    } else if (inferredType === 'stdio') {
       if (command) {
         result[currentName] = {
           type: 'stdio',
@@ -342,135 +352,57 @@ export function setupCodexRuntime(mcpServers: Record<string, McpServerConfig>): 
     hostConfig = '';
   }
 
-  const merged = buildMergedConfig(hostConfig, mcpServers);
+  const mergedConfig = buildMergedConfig(hostConfig, mcpServers);
   const runtimeConfigPath = path.join(RUNTIME_CODEX_DIR, 'config.toml');
   try {
-    fs.writeFileSync(runtimeConfigPath, merged);
+    fs.writeFileSync(runtimeConfigPath, mergedConfig);
   } catch (err) {
     log(`Failed to write merged config.toml: ${err instanceof Error ? err.message : String(err)}`);
     return null;
   }
 
-  // Skills parity: symlink every skill Claude has into CODEX_HOME/skills/
-  // so Codex auto-discovers them. Two sources:
+  // Skills parity: write into /home/node/.agents/skills/ — the runtime-
+  // agnostic location Codex auto-scans (verified). Two sources contribute:
   //   1. Container-bundled NanoClaw skills at /home/node/.claude/skills/
-  //      (agent-browser, vercel-cli, slack-formatting, etc.) — these are
-  //      operationally tied to the container; runtime-agnostic enough.
-  //   2. Host plugin tree mounted RO at /workspace/plugins/ — discovers
-  //      every plugin-bundled portable skill using the same rules the
-  //      host script applies (`.agents/skills/` canonical preferred,
+  //      (agent-browser, vercel-cli, slack-formatting, etc.)
+  //   2. Host plugin tree mounted RO at /workspace/plugins/, discovered via
+  //      the same rules the host script applies (`.agents/skills/` preferred,
   //      Claude-only sub-plugins denied).
-  // Codex's user skills (.system/) live under HOST_CODEX_DIR mounted at
-  // /home/node/.codex/skills/.system — those don't conflict because
-  // /home/node/.codex-runtime/skills/ is a fresh dir.
-  const runtimeSkillsDir = path.join(RUNTIME_CODEX_DIR, 'skills');
-  syncSkillSymlinks(runtimeSkillsDir, CONTAINER_CLAUDE_SKILLS_DIR);
-
-  // Layer plugin-discovered skills on top. Reconcile inside this dir so
-  // both sources coexist; container-bundled skills get added first, then
-  // plugin skills are layered (plugin-source wins on name collision —
-  // matches what Codex would see on the host).
-  const pluginSkills = discoverPortableSkills(CONTAINER_PLUGINS_DIR);
-  if (pluginSkills.length > 0) {
-    // syncDiscoveredSkillSymlinks reconciles against the whole dir, so
-    // call it with the UNION of plugin skills + already-linked container
-    // skills to avoid wiping the container-bundled set.
-    const containerSkillEntries: Array<{ name: string; skillDir: string; plugin: string }> = [];
-    try {
-      for (const entry of fs.readdirSync(CONTAINER_CLAUDE_SKILLS_DIR)) {
-        const sd = path.join(CONTAINER_CLAUDE_SKILLS_DIR, entry);
+  // Defers to any pre-existing non-symlink content (host-side mounts, or
+  // anything an in-container `gitnexus setup` would later write).
+  const containerSkillEntries: Array<{ name: string; skillDir: string; plugin: string }> = [];
+  try {
+    for (const entry of fs.readdirSync(CONTAINER_CLAUDE_SKILLS_DIR)) {
+      const sd = path.join(CONTAINER_CLAUDE_SKILLS_DIR, entry);
+      try {
         if (fs.statSync(sd).isDirectory() && fs.existsSync(path.join(sd, 'SKILL.md'))) {
           containerSkillEntries.push({ name: entry, skillDir: sd, plugin: 'container-bundled' });
         }
+      } catch {
+        continue;
       }
-    } catch {
-      /* container skills dir missing */
     }
-    // Plugin skills first, then container-bundled — first occurrence wins,
-    // so plugin sources override on collision.
-    const merged = new Map<string, { name: string; skillDir: string; plugin: string }>();
-    for (const s of pluginSkills) merged.set(s.name, s);
-    for (const s of containerSkillEntries) if (!merged.has(s.name)) merged.set(s.name, s);
-
-    const result = syncDiscoveredSkillSymlinks(runtimeSkillsDir, [...merged.values()]);
-    log(
-      `Plugin skills: ${pluginSkills.length} discovered under ${CONTAINER_PLUGINS_DIR}; ` +
-        `synced ${result.created.length}+${result.unchanged.length} (+${result.removed.length} removed)`,
-    );
+  } catch {
+    /* container skills dir missing */
   }
+
+  const pluginSkills = discoverPortableSkills(CONTAINER_PLUGINS_DIR);
+
+  // Plugin skills first (preferred source), then container-bundled —
+  // first occurrence wins by name.
+  const merged = new Map<string, { name: string; skillDir: string; plugin: string }>();
+  for (const s of pluginSkills) merged.set(s.name, s);
+  for (const s of containerSkillEntries) if (!merged.has(s.name)) merged.set(s.name, s);
+
+  const result = syncDiscoveredSkillSymlinks(CONTAINER_AGENTS_SKILLS_DIR, [...merged.values()]);
+  log(
+    `~/.agents/skills/: ${merged.size} desired ` +
+      `(${containerSkillEntries.length} container + ${pluginSkills.length} plugin) — ` +
+      `created=${result.created.length} unchanged=${result.unchanged.length} ` +
+      `removed=${result.removed.length} skipped=${result.skipped.length}`,
+  );
 
   log(`CODEX_HOME runtime ready at ${RUNTIME_CODEX_DIR} (${Object.keys(mcpServers).length} MCP servers merged)`);
   return RUNTIME_CODEX_DIR;
 }
 
-/**
- * Populate `dst` with a symlink for each subdirectory of `src` that
- * contains a SKILL.md. Reconciles on each spawn: links to skills no
- * longer present in `src` are removed; new skills get fresh links.
- *
- * Idempotent — re-running produces the same end state.
- */
-function syncSkillSymlinks(dst: string, src: string): void {
-  fs.mkdirSync(dst, { recursive: true });
-
-  // Discover desired skills: each subdir of src with a SKILL.md.
-  const desired = new Set<string>();
-  let entries: string[] = [];
-  try {
-    entries = fs.readdirSync(src);
-  } catch {
-    return; // src doesn't exist (e.g. before container skills mount)
-  }
-  for (const entry of entries) {
-    const skillPath = path.join(src, entry);
-    try {
-      if (!fs.statSync(skillPath).isDirectory()) continue;
-      const skillMd = path.join(skillPath, 'SKILL.md');
-      if (!fs.existsSync(skillMd)) continue;
-      desired.add(entry);
-    } catch {
-      continue;
-    }
-  }
-
-  // Reconcile against existing entries in dst.
-  let existing: string[] = [];
-  try {
-    existing = fs.readdirSync(dst);
-  } catch {
-    /* fresh dir */
-  }
-  for (const entry of existing) {
-    if (desired.has(entry)) continue;
-    const linkPath = path.join(dst, entry);
-    try {
-      const stat = fs.lstatSync(linkPath);
-      // Only remove our own symlinks — preserve any directories the
-      // operator placed here manually.
-      if (stat.isSymbolicLink()) fs.unlinkSync(linkPath);
-    } catch {
-      /* missing — fine */
-    }
-  }
-  for (const entry of desired) {
-    const linkPath = path.join(dst, entry);
-    const target = path.join(src, entry);
-    let currentTarget: string | null = null;
-    try {
-      currentTarget = fs.readlinkSync(linkPath);
-    } catch {
-      /* missing */
-    }
-    if (currentTarget === target) continue;
-    try {
-      fs.unlinkSync(linkPath);
-    } catch {
-      /* missing */
-    }
-    try {
-      fs.symlinkSync(target, linkPath);
-    } catch (err) {
-      log(`Failed to symlink skill ${entry}: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  }
-}

@@ -1,11 +1,16 @@
 #!/usr/bin/env tsx
 /**
- * Sync `~/plugins/*` skills into `~/.codex/skills/`.
+ * Sync `~/plugins/*` skills into `~/.agents/skills/`.
  *
- * Mirrors what `composeGroupClaudeMd` does for AGENTS.md, but for skills.
- * Walks the host's plugin tree, applies the discovery rules in
- * `plugin-skill-discovery.ts`, and creates a symlink per skill so Codex's
- * `$CODEX_HOME/skills/<name>/` auto-discovery picks them up.
+ * Targets the runtime-agnostic `.agents/skills/` convention rather than
+ * Codex-specific `$CODEX_HOME/skills/`. Verified empirically: Codex
+ * auto-discovers from `~/.agents/skills/` (as root `r1` in `codex debug
+ * prompt-input`). Other compliant agent runtimes follow the same path.
+ *
+ * Tool-native installs always win: tools with first-class Codex support
+ * (e.g. `gitnexus setup`) write real directories under `~/.agents/skills/`.
+ * `syncSkillSymlinks` defers to those — it only writes symlinks at names
+ * where nothing else exists.
  *
  * Auto-update story: the symlinks point at the plugin source dirs, so
  * whenever Claude's marketplace pulls an update for a plugin (which
@@ -25,7 +30,7 @@ import { discoverPortableSkills, syncSkillSymlinks } from '../src/plugin-skill-d
 function main(): void {
   const dryRun = process.argv.includes('--dry-run');
   const pluginsRoot = path.join(os.homedir(), 'plugins');
-  const codexSkills = path.join(os.homedir(), '.codex', 'skills');
+  const agentsSkills = path.join(os.homedir(), '.agents', 'skills');
 
   const discovered = discoverPortableSkills(pluginsRoot);
   console.log(`Discovered ${discovered.length} portable skill(s) under ${pluginsRoot}:`);
@@ -38,16 +43,20 @@ function main(): void {
     return;
   }
 
-  const result = syncSkillSymlinks(codexSkills, discovered);
-  console.log(`\nSync result for ${codexSkills}:`);
+  const result = syncSkillSymlinks(agentsSkills, discovered);
+  console.log(`\nSync result for ${agentsSkills}:`);
   console.log(`  created:   ${result.created.length}`);
   console.log(`  removed:   ${result.removed.length}`);
   console.log(`  unchanged: ${result.unchanged.length}`);
+  console.log(`  skipped:   ${result.skipped.length} (existing non-symlink content preserved)`);
   if (result.created.length > 0) {
     console.log(`  + ${result.created.join(', ')}`);
   }
   if (result.removed.length > 0) {
     console.log(`  - ${result.removed.join(', ')}`);
+  }
+  if (result.skipped.length > 0) {
+    console.log(`  ~ skipped: ${result.skipped.join(', ')}`);
   }
 }
 
