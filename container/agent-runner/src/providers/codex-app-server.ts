@@ -388,6 +388,70 @@ export function writeCodexMcpConfigToml(servers: Record<string, CodexMcpServer>)
   log(`Wrote MCP config.toml (${Object.keys(servers).length} server(s))`);
 }
 
+// ── hooks.json (NanoClaw guardrails + memory-capture) ───────────────────────
+// Codex app-server reads ~/.codex/hooks.json at session start and fires
+// shell-command hooks on PreToolUse / PostToolUse / etc. We point each
+// event at `bun /app/src/codex-hooks/cli.ts <event>` which dispatches to
+// the same hook decisions the Claude provider uses as SDK callbacks
+// (see ../codex-hooks/runner.ts).
+
+/**
+ * Build the hooks.json content (in-memory). Split out from the filesystem
+ * write so tests can assert on the structure without depending on `fs`
+ * mocks set by sibling test files.
+ */
+export function buildCodexHooksJson(opts?: { emailGateTimeoutSec?: number }): {
+  hooks: {
+    PreToolUse: { hooks: { type: 'command'; command: string; timeout: number }[] }[];
+    PostToolUse: { hooks: { type: 'command'; command: string; timeout: number }[] }[];
+  };
+} {
+  const cliPath = '/app/src/codex-hooks/cli.ts';
+  const preTimeoutSec = opts?.emailGateTimeoutSec ?? 3600;
+  return {
+    hooks: {
+      PreToolUse: [
+        {
+          hooks: [
+            {
+              type: 'command' as const,
+              command: `bun ${cliPath} PreToolUse`,
+              timeout: preTimeoutSec,
+            },
+          ],
+        },
+      ],
+      PostToolUse: [
+        {
+          hooks: [
+            {
+              type: 'command' as const,
+              command: `bun ${cliPath} PostToolUse`,
+              timeout: 30,
+            },
+          ],
+        },
+      ],
+    },
+  };
+}
+
+/**
+ * Generate `~/.codex/hooks.json` for the current container. Mirrors the
+ * Claude SDK hooks block in `claude.ts` for PreToolUse / PostToolUse
+ * coverage. Email-gate is on the PreToolUse chain — its 60-minute admin
+ * approval wait requires a long timeout (`emailGateTimeoutSec`), so this
+ * event gets the longest timeout in the file.
+ */
+export function writeCodexHooksJson(opts?: { emailGateTimeoutSec?: number }): void {
+  const codexConfigDir = path.join(process.env.HOME || '/home/node', '.codex');
+  fs.mkdirSync(codexConfigDir, { recursive: true });
+  const hooksJsonPath = path.join(codexConfigDir, 'hooks.json');
+  const hooks = buildCodexHooksJson(opts);
+  fs.writeFileSync(hooksJsonPath, JSON.stringify(hooks, null, 2));
+  log(`Wrote hooks.json (PreToolUse timeout=${hooks.hooks.PreToolUse[0].hooks[0].timeout}s)`);
+}
+
 /**
  * Build the `-c key=value` overrides passed to `codex app-server`. The
  * `stickyConfig` argument is the validated per-agent provider config slice

@@ -110,7 +110,7 @@ export function deriveProgressLabels(message: unknown): string[] {
 //   the question and blocks on the real reply.
 // - EnterPlanMode / ExitPlanMode / EnterWorktree / ExitWorktree: Claude
 //   Code UI affordances; in a headless container they'd appear stuck.
-const SDK_DISALLOWED_TOOLS = [
+export const SDK_DISALLOWED_TOOLS = [
   'CronCreate',
   'CronDelete',
   'CronList',
@@ -232,7 +232,7 @@ function formatTranscriptMarkdown(messages: ParsedMessage[], title?: string | nu
  * script. Defense-in-depth: if SDK_DISALLOWED_TOOLS slips through somehow,
  * block the call here instead of letting the agent hang.
  */
-const preToolUseHook: HookCallback = async (input) => {
+export const preToolUseHook: HookCallback = async (input) => {
   const i = input as { tool_name?: string; tool_input?: Record<string, unknown> };
   const toolName = i.tool_name ?? '';
   if (SDK_DISALLOWED_TOOLS.includes(toolName)) {
@@ -254,7 +254,7 @@ const preToolUseHook: HookCallback = async (input) => {
 };
 
 /** Clear in-flight tool on PostToolUse / PostToolUseFailure. */
-const postToolUseHook: HookCallback = async () => {
+export const postToolUseHook: HookCallback = async () => {
   try {
     clearContainerToolInFlight();
   } catch (err) {
@@ -263,7 +263,7 @@ const postToolUseHook: HookCallback = async () => {
   return { continue: true };
 };
 
-function createPreCompactHook(assistantName?: string): HookCallback {
+export function createPreCompactHook(assistantName?: string): HookCallback {
   return async (input) => {
     const preCompact = input as PreCompactHookInput;
     const { transcript_path: transcriptPath, session_id: sessionId } = preCompact;
@@ -372,7 +372,7 @@ function buildSecretEnvVarList(): string[] {
   ];
 }
 
-function createSanitizeBashHook(): HookCallback {
+export function createSanitizeBashHook(): HookCallback {
   return async (input) => {
     const pre = input as PreToolUseHookInput;
     const command = (pre.tool_input as { command?: string })?.command;
@@ -413,7 +413,7 @@ function denyBash(reason: string) {
 // filesystem writes. v1 `createSelfApprovalBlockHook` equivalent.
 const SELF_APPROVAL_RE = /\.claude-destructive-gate/;
 
-function createSelfApprovalBlockHook(): HookCallback {
+export function createSelfApprovalBlockHook(): HookCallback {
   return async (input) => {
     const pre = input as PreToolUseHookInput;
     const command = (pre.tool_input as { command?: string })?.command;
@@ -441,7 +441,7 @@ function createSelfApprovalBlockHook(): HookCallback {
 // sql` for normal cases and raises the friction for unintended paths.
 const SNOWFLAKE_CONNECTOR_EXEC_RE = /\bpython[23]?\b.*\bsnowflake[._]connector\b/i;
 
-function createBlockSnowflakeConnectorHook(): HookCallback {
+export function createBlockSnowflakeConnectorHook(): HookCallback {
   return async (input) => {
     const pre = input as PreToolUseHookInput;
     const command = (pre.tool_input as { command?: string })?.command;
@@ -545,7 +545,7 @@ export function envelopeFromJsonRaw(segment: string): {
   return out;
 }
 
-function createEmailGateHook(): HookCallback {
+export function createEmailGateHook(): HookCallback {
   return async (input) => {
     const pre = input as PreToolUseHookInput;
     const command = (pre.tool_input as { command?: string })?.command;
@@ -663,7 +663,7 @@ function createEmailGateHook(): HookCallback {
 const GIT_CLONE_RE = /\bgit\s+clone\b/;
 const MANAGED_DIR_RE = /\/workspace\/(?:agent|worktrees|global|extra|thread|plugins)\b/;
 
-function createBlockGitCloneHook(): HookCallback {
+export function createBlockGitCloneHook(): HookCallback {
   return async (input) => {
     const pre = input as PreToolUseHookInput;
     const command = (pre.tool_input as { command?: string })?.command;

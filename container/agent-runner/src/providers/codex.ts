@@ -32,6 +32,7 @@ import {
   spawnCodexAppServer,
   startCodexTurn,
   startOrResumeCodexThread,
+  writeCodexHooksJson,
   writeCodexMcpConfigToml,
 } from './codex-app-server.js';
 
@@ -168,6 +169,7 @@ export class CodexProvider implements AgentProvider {
       // query active per batch of pending messages and ends it on idle, so
       // spawn-per-query matches that cadence naturally.
       writeCodexMcpConfigToml(self.mcpServers);
+      writeCodexHooksJson();
       const server = spawnCodexAppServer(createCodexConfigOverrides(self.stickyConfig));
       attachCodexAutoApproval(server);
 
