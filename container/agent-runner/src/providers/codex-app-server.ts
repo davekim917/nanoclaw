@@ -497,5 +497,12 @@ export function createCodexConfigOverrides(stickyConfig?: {
   if (stickyConfig?.reasoning_effort) {
     overrides.push(`model_reasoning_effort="${stickyConfig.reasoning_effort}"`);
   }
+  // Force reasoning-summary notifications on. Without this, gpt-5.x runs in
+  // xhigh effort still produce zero `item/reasoning/summaryTextDelta` events
+  // — verified empirically via per-method debug logging. "detailed" gives
+  // the richest stream; "auto" was insufficient even with high effort.
+  // Container chat-UX surfaces these as 💭 thinking labels (see codex.ts
+  // runOneTurn's item/reasoning/* cases).
+  overrides.push('model_reasoning_summary="detailed"');
   return overrides;
 }
