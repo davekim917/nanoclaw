@@ -7,7 +7,8 @@ description: Create a Codex-backed sibling agent for an existing Claude group. T
 
 Create `groups/<source>-codex/` from `groups/<source>/`. The codex sibling shares:
 
-- **CLAUDE.md** — symlinked; composeGroupClaudeMd regenerates AGENTS.md flat-include from it on every spawn.
+- **CLAUDE.md** — regenerated per-group by composeGroupClaudeMd on every spawn (do NOT symlink — the composer overwrites it); AGENTS.md flat-include is derived from it for Codex.
+- **CLAUDE.local.md** — symlinked to the source's CLAUDE.local.md when present, so both siblings share per-group memory (consulting context, project notes, etc.).
 - **Repos** — symlinked top-level dirs that contain `.git/`.
 - **sources/** — mnemon inbox; both agents feed the same memory.
 - **conversations/** — transcript archive; both agents see each other's archived turns.
@@ -84,7 +85,15 @@ SIBLING_ID=${SIBLING_FOLDER}                # use folder name as ag-id, matching
 
 mkdir -p groups/${SIBLING_FOLDER}
 cd groups/${SIBLING_FOLDER}
-ln -sfn ../${SOURCE_FOLDER}/CLAUDE.md CLAUDE.md
+
+# Per-group memory: share the source's CLAUDE.local.md so both siblings
+# remember the same project context. Conditional — if the source has no
+# CLAUDE.local.md, leave it absent and let composeGroupClaudeMd create an
+# empty one at first spawn. Do NOT symlink CLAUDE.md here: the composer
+# overwrites it with a fresh `@-imports`-only entry every spawn, so a
+# symlink would be wiped on first wake.
+[ -f ../${SOURCE_FOLDER}/CLAUDE.local.md ] && ln -sfn ../${SOURCE_FOLDER}/CLAUDE.local.md CLAUDE.local.md
+
 [ -d ../${SOURCE_FOLDER}/sources ] && ln -sfn ../${SOURCE_FOLDER}/sources sources
 [ -d ../${SOURCE_FOLDER}/conversations ] && ln -sfn ../${SOURCE_FOLDER}/conversations conversations
 
