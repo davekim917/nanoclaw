@@ -193,8 +193,36 @@ export function createMessagingGroupAgent(mga: MessagingGroupAgent): void {
 }
 
 export function getMessagingGroupAgents(messagingGroupId: string): MessagingGroupAgent[] {
+  // COALESCE-hydrate nullable columns to OPERATIONAL defaults (not the schema
+  // CREATE TABLE defaults) so manually-inserted rows match how the router
+  // actually wires new MGs. The schema defaults (`drop`, `shared`) are stale
+  // relative to runtime behavior:
+  //
+  //   - ignored_message_policy='accumulate' — matches router.ts:370 (auto-create
+  //     uses 'accumulate'). Drop = silently discard non-engaging messages,
+  //     which loses thread context the agent needs when it later engages.
+  //   - session_mode='per-thread' — matches every channel's operational config
+  //     (NANOCLAW_DEFAULT_SESSION_MODE_SLACK_<workspace>=per-thread). Shared
+  //     would collapse every thread into one session, mixing context across
+  //     unrelated conversations.
+  //
+  // Schema CREATE TABLE defaults need a separate migration to match.
   return getDb()
-    .prepare('SELECT * FROM messaging_group_agents WHERE messaging_group_id = ? ORDER BY priority DESC')
+    .prepare(
+      `SELECT
+         id, messaging_group_id, agent_group_id,
+         COALESCE(engage_mode, 'mention') AS engage_mode,
+         engage_pattern,
+         COALESCE(sender_scope, 'all') AS sender_scope,
+         COALESCE(ignored_message_policy, 'accumulate') AS ignored_message_policy,
+         COALESCE(session_mode, 'per-thread') AS session_mode,
+         COALESCE(priority, 0) AS priority,
+         default_model, default_effort, default_tone,
+         created_at
+       FROM messaging_group_agents
+       WHERE messaging_group_id = ?
+       ORDER BY priority DESC`,
+    )
     .all(messagingGroupId) as MessagingGroupAgent[];
 }
 

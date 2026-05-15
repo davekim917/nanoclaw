@@ -151,6 +151,20 @@ for (const ws of workspaces) {
         botToken: ws.botToken,
         signingSecret: ws.signingSecret,
       });
+      // Multi-workspace dedup isolation. The @chat library's message dedup
+      // key is `dedupe:${adapter.name}:${message.id}`. SlackAdapter defaults
+      // `name = "slack"` for all instances; combined with a shared SqliteState
+      // adapter (state-sqlite.ts uses getDb()), two slack adapters processing
+      // the same Slack event (same `ts`) collide on the dedup key and the
+      // second one silently drops the message. This bites the two-bots-in-
+      // same-workspace case (e.g. illie + illie-codex both seeing user
+      // messages in #agents-xzo). Across-workspace it doesn't bite because
+      // each Slack workspace's `ts` values are disjoint.
+      //
+      // Override the adapter name to the channelType so each workspace has
+      // its own dedup keyspace. The name also keys `chat.webhooks[...]` so
+      // the webhook-server lookup matches.
+      (slackAdapter as unknown as { name: string }).name = ws.channelType;
       const client = new WebClient(ws.botToken);
       const bridge = createChatSdkBridge({
         adapter: slackAdapter,
