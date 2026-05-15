@@ -10,7 +10,9 @@
  *   - `~/.claude/CLAUDE.md`                        — top-level behavioral rules
  *   - `~/.claude/` glob `*.md`                     — any `@`-included file (RTK.md today,
  *                                                    anything else Dave adds tomorrow)
+ *   - `~/.claude/agents/*.md`                      — Claude personal-scope subagents
  *   - `~/plugins/` recursive `SKILL.md` files      — every plugin-bundled skill
+ *   - `~/plugins/**` recursive `agents/*.md`       — plugin-shipped subagents
  *   - `~/plugins/<plugin>` add/remove              — marketplace install/uninstall
  *
  * What it does on change:
@@ -34,7 +36,7 @@ import path from 'path';
 
 import chokidar from 'chokidar';
 
-import { syncCodexAgentsMd, syncCodexPluginSkills } from './codex-sync.js';
+import { syncCodexAgentsMd, syncCodexPluginSkills, syncCodexSubagents } from './codex-sync.js';
 
 const HOME = os.homedir();
 const CODEX_DIR = path.join(HOME, '.codex');
@@ -58,8 +60,23 @@ function isRelevantPath(eventPath: string): boolean {
   if (path.dirname(eventPath) === CLAUDE_DIR && eventPath.endsWith('.md')) {
     return true;
   }
+  // ~/.claude/agents/<name>.md — personal-scope subagents (currently empty
+  // for Dave but supported for completeness so future overrides trigger sync).
+  if (path.dirname(eventPath) === path.join(CLAUDE_DIR, 'agents') && eventPath.endsWith('.md')) {
+    return true;
+  }
   // ~/plugins/<plugin>/.../SKILL.md — any SKILL.md anywhere under a plugin.
   if (eventPath.startsWith(PLUGINS_DIR + path.sep) && path.basename(eventPath) === 'SKILL.md') {
+    return true;
+  }
+  // ~/plugins/<plugin>/<...>/agents/<name>.md — plugin-shipped subagents.
+  // The immediate parent dir must be named exactly `agents` (catches both
+  // top-level and nested-sub-plugin layouts) and the file must be `.md`.
+  if (
+    eventPath.startsWith(PLUGINS_DIR + path.sep) &&
+    eventPath.endsWith('.md') &&
+    path.basename(path.dirname(eventPath)) === 'agents'
+  ) {
     return true;
   }
   return false;
@@ -213,6 +230,13 @@ async function runSync(trigger: string): Promise<void> {
       `plugin-skills: ${skillsResult.target} — discovered=${skillsResult.discovered} ` +
         `created=${skillsResult.created.length} removed=${skillsResult.removed.length} ` +
         `unchanged=${skillsResult.unchanged.length} skipped=${skillsResult.skipped.length}`,
+    );
+    const subagentsResult = syncCodexSubagents();
+    log(
+      `subagents: ${subagentsResult.targets.length} target(s) — discovered=${subagentsResult.discovered} ` +
+        `writes=${subagentsResult.writes} unchangedFiles=${subagentsResult.unchangedFiles} ` +
+        `removedFiles=${subagentsResult.removedFiles} skipped=${subagentsResult.skipped.length} ` +
+        `targets=${subagentsResult.targets.join(',')}`,
     );
     fs.writeFileSync(HEARTBEAT_FILE, `${new Date().toISOString()} ${trigger}\n`);
     success = true;

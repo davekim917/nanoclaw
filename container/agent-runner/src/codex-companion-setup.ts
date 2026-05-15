@@ -343,6 +343,24 @@ export function setupCodexRuntime(mcpServers: Record<string, McpServerConfig>): 
     }
   }
 
+  // agents/: symlink the host's subagent TOML dir so codex-as-peer sees
+  // the same subagent definitions Codex primary sees. The host watcher
+  // (src/codex-sync-watcher.ts) populates ~/.codex/agents/ (and per-group
+  // ~/.codex-<folder>/agents/) with Claude `.md` → TOML conversions of
+  // every plugin-shipped subagent. Without this symlink, codex-as-peer
+  // sessions would have CODEX_HOME pointed at .codex-runtime/ with no
+  // agents/ subdir, so /agent + spawnAgent would find nothing.
+  const hostAgentsDir = path.join(HOST_CODEX_DIR, 'agents');
+  const runtimeAgentsDir = path.join(RUNTIME_CODEX_DIR, 'agents');
+  if (fs.existsSync(hostAgentsDir)) {
+    try {
+      try { fs.unlinkSync(runtimeAgentsDir); } catch { /* fresh */ }
+      fs.symlinkSync(hostAgentsDir, runtimeAgentsDir);
+    } catch (err) {
+      log(`Failed to symlink agents/: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   // Read host config (tolerate missing — we'll generate a minimal one).
   const hostConfigPath = path.join(HOST_CODEX_DIR, 'config.toml');
   let hostConfig = '';
