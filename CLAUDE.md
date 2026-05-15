@@ -86,17 +86,21 @@ Today: only `install_packages` / `add_mcp_server` (per-agent-group container con
 
 ## Secrets / Credentials / OneCLI
 
-Secrets live in the OneCLI gateway, injected into per-agent containers at request time — never passed via env vars or chat. Host-side wiring: `src/onecli-approvals.ts`, `ensureAgent()` in `container-runner.ts`. Container-side: `container/skills/onecli-gateway/SKILL.md`. Use `onecli --help` for commands.
+Secrets live in the OneCLI gateway, injected into per-agent containers at request time — never passed via env vars or chat. Host-side wiring: `src/modules/approvals/onecli-approvals.ts`, `ensureAgent()` + `applyOnecliSecrets()` in `container-runner.ts` (~line 1787). Container-side: `container/skills/onecli-gateway/SKILL.md`. Use `onecli --help` for commands.
 
-### Gotcha: auto-created agents start in `selective` secret mode
+### Per-group secret scoping (declarative)
 
-`container-runner.ts:385` calls `onecli.ensureAgent({...})` and the OneCLI `POST /api/agents` endpoint defaults to **`selective`** mode → no secrets assigned even when matching ones exist in the vault. Symptom: proxy + CA wired correctly, but agent gets `401` from APIs whose credentials *are* in the vault.
+Each group's `container.json` may carry `onecliSecrets: ["Datafold-MadisonReed", "Anthropic", ...]` (NAMES or UUIDs). On every spawn, `applyOnecliSecrets()` resolves names → UUIDs, forces the agent's secret mode to `selective`, and assigns exactly the declared set. Fail-closed: unresolvable names throw, spawn aborts, sweep retries. No declaration = no-op (preserves operator-set assignments). See `src/onecli-secrets.ts`.
 
-The SDK doesn't expose `setSecretMode`. Fix via CLI (`onecli agents set-secret-mode --mode all` for matching-pattern injection, or `onecli agents set-secrets --secret-ids <ids>` to stay selective) or the web UI at `http://127.0.0.1:10254`. After enabling `mode all`, no container restart needed — the gateway looks up secrets per request.
+### Gotcha: auto-created agents start in `selective` secret mode (mitigated)
+
+`container-runner.ts:1787` calls `onecli.ensureAgent({...})` and the OneCLI `POST /api/agents` endpoint defaults to **`selective`** mode → no secrets assigned even when matching ones exist in the vault. Symptom: proxy + CA wired correctly, but agent gets `401` from APIs whose credentials *are* in the vault.
+
+Right fix: declare `onecliSecrets` in `container.json` (see above). Escape hatches: `onecli agents set-secrets --id <agent-uuid> --secret-ids <ids>` for explicit assignment or `onecli agents set-secret-mode --mode all` for matching-pattern injection (looser — cross-tenant risk if vault patterns overlap groups). UI at `http://127.0.0.1:10254` accepts either. Verified against `onecli@1.4.1`.
 
 ### Requiring approval for credential use
 
-Two-sided flow: **server-side** (OneCLI gateway emits pending approvals — currently UI-only configuration at `http://127.0.0.1:10254`; `onecli rules create --action` accepts only `block`/`rate_limit` as of `onecli@1.3.0`) + **host-side** (`src/modules/approvals/onecli-approvals.ts` long-polls `GET /api/approvals/pending` and DMs an approver from `user_roles` — scoped admins → global admins → owners). If server-side configured but host callback dies, every credentialed call hangs to gateway timeout. If gateway has no rule, host callback never fires.
+Two-sided flow: **server-side** (OneCLI gateway emits pending approvals — currently UI-only configuration at `http://127.0.0.1:10254`; `onecli rules create --action` accepts only `block`/`rate_limit` as of `onecli@1.4.1`) + **host-side** (`src/modules/approvals/onecli-approvals.ts` long-polls `GET /api/approvals/pending` and DMs an approver from `user_roles` — scoped admins → global admins → owners). If server-side configured but host callback dies, every credentialed call hangs to gateway timeout. If gateway has no rule, host callback never fires.
 
 ## Skills
 

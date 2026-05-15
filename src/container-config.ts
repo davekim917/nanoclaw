@@ -93,6 +93,24 @@ export interface ContainerConfig {
   maxMessagesPerPrompt?: number;
 
   /**
+   * Per-group OneCLI secret declaration. Each entry is either a secret
+   * NAME (e.g. "Datafold-MadisonReed") or a UUID. Names resolve via
+   * `onecli secrets list` at apply time. When non-empty, the host
+   * forces the agent's secret mode to `selective` and assigns exactly
+   * these secrets (declarative — replaces any prior assignment).
+   *
+   * Missing/empty/absent = no-op: agent keeps whatever assignment and
+   * mode the operator set via the UI or CLI. Use this when you want a
+   * group to have access to only a specific subset of vault secrets
+   * (e.g. `madison-reed` should not see `Illysium-*` keys).
+   *
+   * Hard-fails the container spawn if any declared name doesn't resolve
+   * to a vault secret — matches the codebase's fail-closed posture so
+   * misconfigurations are loud rather than silently broken.
+   */
+  onecliSecrets?: string[];
+
+  /**
    * Name of the env var on the host that holds this group's GitHub token.
    * If unset, container-runner derives a name from the folder
    * (`GITHUB_TOKEN_<FOLDER_UPPER>` with dashes as underscores) and falls
@@ -302,6 +320,7 @@ export function readContainerConfig(folder: string): ContainerConfig {
       providerConfig: raw.providerConfig,
       memory: (raw as Record<string, unknown>).memory as MemoryConfig | undefined,
       dailySummary: raw.dailySummary,
+      onecliSecrets: raw.onecliSecrets,
     };
   } catch (err) {
     console.error(`[container-config] failed to parse ${p}: ${String(err)}`);

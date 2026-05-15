@@ -1,11 +1,6 @@
 import { describe, expect, test } from 'vitest';
 
-import {
-  MANAGED_MARKER,
-  formatCodexAgentToml,
-  isManagedToml,
-  parseClaudeAgentMd,
-} from './claude-agent-md.js';
+import { MANAGED_MARKER, formatCodexAgentToml, isManagedToml, parseClaudeAgentMd } from './claude-agent-md.js';
 
 describe('parseClaudeAgentMd', () => {
   test('parses plain frontmatter', () => {

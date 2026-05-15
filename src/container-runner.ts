@@ -37,6 +37,7 @@ import { buildArchiveProjection, buildCentralProjection } from './db/per-agent-p
 import { initGroupFilesystem } from './group-init.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
+import { applyOnecliSecrets } from './onecli-secrets.js';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
 import YAML from 'yaml';
 
@@ -1782,9 +1783,26 @@ async function buildContainerArgs(
   // with no credentials would only mask the misconfiguration.
   if (process.env.ANTHROPIC_BASE_URL) {
     log.info('Skipping OneCLI gateway — ANTHROPIC_BASE_URL set, using direct proxy', { containerName });
+    if (containerConfig.onecliSecrets && containerConfig.onecliSecrets.length > 0) {
+      // `onecliSecrets` is a declarative scope intended for the OneCLI
+      // gateway path. In the ANTHROPIC_BASE_URL bypass path the gateway
+      // is OFF, so the declaration has no effect. Fail-closed: refuse
+      // to spawn so the operator catches the misconfiguration rather
+      // than running with phantom scoping.
+      throw new Error(
+        `container.json declares onecliSecrets but ANTHROPIC_BASE_URL is set — ` +
+          `OneCLI gateway is bypassed in this path, so per-group secret scoping cannot apply. ` +
+          `Pick one: drop ANTHROPIC_BASE_URL (run through OneCLI) or remove onecliSecrets from container.json.`,
+      );
+    }
   } else {
     if (agentIdentifier) {
       await onecli.ensureAgent({ name: agentGroup.name, identifier: agentIdentifier });
+      // Per-group secret scoping — declarative model, fail-closed.
+      // No-op when `onecliSecrets` is undefined/empty (preserves whatever
+      // assignment the operator set via UI/CLI for that agent — e.g. the
+      // 3 mode-all agents that were left untouched by design).
+      applyOnecliSecrets(agentIdentifier, containerConfig.onecliSecrets);
     }
     const onecliApplied = await onecli.applyContainerConfig(args, { addHostMapping: false, agent: agentIdentifier });
     if (!onecliApplied) {
