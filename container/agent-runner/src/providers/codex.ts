@@ -374,6 +374,12 @@ async function* runOneTurn(
     // long tool executions keep the loop awake.
     buffer.push({ type: 'activity' });
 
+    // TEMP DEBUG: log every method to diagnose missing reasoning events.
+    if (method.includes('reasoning') || method.startsWith('item/') || method === 'turn/started' || method === 'turn/completed') {
+      // eslint-disable-next-line no-console
+      console.error(`[codex-debug] method=${method}`);
+    }
+
     switch (method) {
       case 'thread/started': {
         const thread = params.thread as { id?: string } | undefined;
