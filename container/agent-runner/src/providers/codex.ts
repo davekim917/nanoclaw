@@ -457,6 +457,15 @@ async function* runOneTurn(
         // others emit a structured object (e.g. { state: 'thinking',
         // detail: '...' }). Extract the most useful human-readable label;
         // never let template coercion produce "[object Object]".
+        //
+        // Drop the trivial "active" / "idle" labels — they fire on every
+        // turn-state flip, so the chat-side status message (which the host
+        // delivers as edit-in-place) ends up overwriting the 💭 thinking
+        // labels emitted from item/reasoning/* with "status: active". The
+        // Claude provider hit the analogous problem with tool_use labels
+        // overwriting thinking and resolved it the same way (claude.ts:54).
+        // Anything more semantic that codex might emit (compacting,
+        // loading skills, etc.) still gets forwarded.
         const raw = params.status;
         let label: string | null = null;
         if (typeof raw === 'string') {
@@ -467,7 +476,9 @@ async function* runOneTurn(
             obj.label ?? obj.state ?? obj.status ?? obj.kind ?? obj.type ?? obj.message ?? obj.text;
           label = typeof candidate === 'string' ? candidate : JSON.stringify(raw);
         }
-        if (label) buffer.push({ type: 'progress', message: `status: ${label}` });
+        if (label && label !== 'active' && label !== 'idle') {
+          buffer.push({ type: 'progress', message: `status: ${label}` });
+        }
         break;
       }
       default:
