@@ -147,9 +147,7 @@ describe('applyOnecliSecrets — happy path', () => {
     );
     const argv = setSecretsCall![1] as string[];
     const idsArg = argv[argv.length - 1];
-    expect(idsArg).toBe(
-      'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa,cccccccc-cccc-cccc-cccc-cccccccccccc',
-    );
+    expect(idsArg).toBe('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa,cccccccc-cccc-cccc-cccc-cccccccccccc');
   });
 
   test('always forces mode to selective regardless of current mode', () => {
@@ -160,16 +158,14 @@ describe('applyOnecliSecrets — happy path', () => {
     // when onecliSecrets is set — that's the declarative posture.
     applyOnecliSecrets('illysium-codex', ['Hex']);
 
-    const modeCall = mockedExec.mock.calls.find(
-      (c) => (c[1] as string[])[1] === 'set-secret-mode',
-    );
+    const modeCall = mockedExec.mock.calls.find((c) => (c[1] as string[])[1] === 'set-secret-mode');
     expect(modeCall).toBeDefined();
     expect((modeCall![1] as string[]).at(-1)).toBe('selective');
   });
 });
 
 describe('applyOnecliSecrets — fail-closed paths', () => {
-  test('throws when agent identifier doesn\'t exist in vault', () => {
+  test("throws when agent identifier doesn't exist in vault", () => {
     setupCliResponses();
 
     expect(() => applyOnecliSecrets('does-not-exist', ['Anthropic'])).toThrow(
@@ -182,12 +178,12 @@ describe('applyOnecliSecrets — fail-closed paths', () => {
     expect(setSecretsCall).toBeUndefined();
   });
 
-  test('throws when a declared secret NAME doesn\'t resolve', () => {
+  test("throws when a declared secret NAME doesn't resolve", () => {
     setupCliResponses();
 
-    expect(() =>
-      applyOnecliSecrets('madison-reed', ['Datafold-MadisonReed', 'Mistyped-Name']),
-    ).toThrow(/secret\(s\) not found in vault: Mistyped-Name/);
+    expect(() => applyOnecliSecrets('madison-reed', ['Datafold-MadisonReed', 'Mistyped-Name'])).toThrow(
+      /secret\(s\) not found in vault: Mistyped-Name/,
+    );
     // No set-secrets should have been issued — fail-closed before apply
     const setSecretsCall = mockedExec.mock.calls.find(
       (c) => (c[1] as string[])[0] === 'agents' && (c[1] as string[])[1] === 'set-secrets',
@@ -195,7 +191,7 @@ describe('applyOnecliSecrets — fail-closed paths', () => {
     expect(setSecretsCall).toBeUndefined();
   });
 
-  test('throws when a declared UUID doesn\'t exist in vault', () => {
+  test("throws when a declared UUID doesn't exist in vault", () => {
     setupCliResponses();
     const phantomUuid = '99999999-9999-9999-9999-999999999999';
 
@@ -207,9 +203,7 @@ describe('applyOnecliSecrets — fail-closed paths', () => {
   test('reports ALL unresolvable names in one error', () => {
     setupCliResponses();
 
-    expect(() =>
-      applyOnecliSecrets('madison-reed', ['Bad-One', 'Anthropic', 'Bad-Two']),
-    ).toThrow(/Bad-One, Bad-Two/);
+    expect(() => applyOnecliSecrets('madison-reed', ['Bad-One', 'Anthropic', 'Bad-Two'])).toThrow(/Bad-One, Bad-Two/);
   });
 });
 
