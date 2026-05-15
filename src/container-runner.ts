@@ -1955,6 +1955,21 @@ async function buildContainerArgs(
       url: 'https://mcp.linear.app/mcp',
     };
   }
+  if (canInject('datafold') && isToolEnabled(containerConfig.tools, 'datafold')) {
+    // Official Datafold HTTP MCP. Expose it through a stdio bridge so both
+    // Claude and Codex agents get the same `mcp__datafold__*` namespace.
+    // Datafold requires `Authorization: Key <api-key>`; OneCLI overwrites
+    // the placeholder header at the proxy boundary for app.datafold.com.
+    mcpServers.datafold = {
+      type: 'stdio',
+      command: 'bun',
+      args: ['/app/src/remote-mcp-bridge.ts', 'https://app.datafold.com/mcp/'],
+      env: {
+        REMOTE_MCP_NAME: 'datafold',
+        REMOTE_MCP_AUTHORIZATION: 'Key onecli-managed',
+      },
+    };
+  }
   if (canInject('atlassian') && isToolEnabled(containerConfig.tools, 'atlassian')) {
     // sooperset/mcp-atlassian — stdio Python MCP server (72 tools across
     // Jira + Confluence). Installed via /opt/atlassian-venv in the

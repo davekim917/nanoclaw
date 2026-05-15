@@ -193,7 +193,7 @@ export interface ContainerConfig {
    * Omit to grant every credential surface; include to filter per-tool
    * before mount. Supported tool names: gmail, gmail-readonly, calendar,
    * google-workspace, snowflake, aws, gcloud, dbt, github, render,
-   * browser-auth.
+   * browser-auth, datafold.
    */
   tools?: string[];
 
