@@ -374,10 +374,17 @@ async function* runOneTurn(
     // long tool executions keep the loop awake.
     buffer.push({ type: 'activity' });
 
-    // TEMP DEBUG: log every method to diagnose missing reasoning events.
+    // TEMP DEBUG: log every method + relevant payload to diagnose missing
+    // reasoning events.
     if (method.includes('reasoning') || method.startsWith('item/') || method === 'turn/started' || method === 'turn/completed') {
+      let extra = '';
+      if (method === 'item/started' || method === 'item/completed') {
+        const item = (params as { item?: { type?: string; text?: string } }).item;
+        const txtPreview = typeof item?.text === 'string' ? item.text.slice(0, 80) : undefined;
+        extra = ` item.type=${item?.type ?? '?'}` + (txtPreview ? ` text="${txtPreview}"` : '');
+      }
       // eslint-disable-next-line no-console
-      console.error(`[codex-debug] method=${method}`);
+      console.error(`[codex-debug] method=${method}${extra}`);
     }
 
     switch (method) {
