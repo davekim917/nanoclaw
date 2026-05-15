@@ -55,15 +55,15 @@ Set the Request URL to the same `https://<your-domain>/webhook/slack` as the exi
 
 After installing the new app to the workspace, capture the **bot token** (`xoxb-...`) and **signing secret** from the Slack app settings.
 
-> **Note on naming**: the Slack-side bot display name can have dashes (e.g. `illie-codex`). The env-var suffix below must be alphanumeric only — `SLACK_BOT_TOKEN_ILLIECODEX` (no dash/underscore) — because the slack adapter's regex is `^SLACK_(BOT_TOKEN|SIGNING_SECRET)(?:_([A-Za-z0-9]+))?$`. The two names are independent.
+> **Note on naming**: the Slack-side bot display name (`illie-codex`), the env-var suffix (`ILLYSIUM_CODEX`), and the resulting channelType (`slack-illysium-codex`) are independent but conventionally aligned. The adapter accepts uppercase + underscores in the suffix and maps `_` → `-` when deriving the channelType, so `SLACK_BOT_TOKEN_ILLYSIUM_CODEX` becomes `slack-illysium-codex` — symmetric with the existing `SLACK_BOT_TOKEN_ILLYSIUM` → `slack-illysium`.
 
 ### 3. Add the sibling's env vars
 
-Pick a uppercase-alphanumeric `ENV_SUFFIX` (e.g. `ILLIECODEX`). The host's slack adapter discovers it on next restart and creates a new `channelType` value `slack-<env_suffix-lowercased>` (e.g. `slack-illiecodex`).
+Pick an `ENV_SUFFIX` that mirrors the source's suffix with `_CODEX` appended (e.g. existing `ILLYSIUM` → new `ILLYSIUM_CODEX`). Uppercase alphanumeric + underscores. The host's slack adapter discovers it on next restart and creates a new `channelType` value `slack-<env_suffix-lowercased-with-dashes>`.
 
 ```bash
-ENV_SUFFIX=ILLIECODEX                     # uppercase alphanumeric, no dash/underscore
-CHANNEL_TYPE=slack-$(echo "${ENV_SUFFIX}" | tr '[:upper:]' '[:lower:]')
+ENV_SUFFIX=ILLYSIUM_CODEX                 # uppercase, underscores OK
+CHANNEL_TYPE=slack-$(echo "${ENV_SUFFIX}" | tr '[:upper:]_' '[:lower:]-')
 
 # Sibling Slack app credentials (paste your actual values).
 cat >> .env <<EOF
@@ -73,6 +73,7 @@ EOF
 
 # Verify.
 grep "_${ENV_SUFFIX}=" .env
+echo "Webhook URL for Slack app config: https://<your-domain>/webhook/${CHANNEL_TYPE}"
 ```
 
 ### 4. Create the sibling group directory + symlinks
@@ -191,7 +192,7 @@ sudo systemctl stop nanoclaw-v2
 
 # Drop wiring + agent_groups row.
 pnpm exec tsx scripts/q.ts data/v2.db "delete from messaging_group_agents where agent_group_id='${SIBLING_ID}'"
-pnpm exec tsx scripts/q.ts data/v2.db "delete from messaging_groups where channel_type='slack-$(echo "${ENV_SUFFIX}" | tr '[:upper:]' '[:lower:]')'"
+pnpm exec tsx scripts/q.ts data/v2.db "delete from messaging_groups where channel_type='slack-$(echo "${ENV_SUFFIX}" | tr '[:upper:]_' '[:lower:]-')'"
 pnpm exec tsx scripts/q.ts data/v2.db "delete from agent_groups where id='${SIBLING_ID}'"
 
 # Drop the symlink tree.
@@ -199,7 +200,10 @@ rm -rf groups/${SIBLING_FOLDER}
 
 # Drop env entries.
 ENV_KEY=MNEMON_STORE_$(echo "${SIBLING_FOLDER}" | tr '-' '_')
-sed -i.bak -e "/^${ENV_KEY}=/d" -e "/^SLACK_BOT_TOKEN_${ENV_SUFFIX}=/d" -e "/^SLACK_SIGNING_SECRET_${ENV_SUFFIX}=/d" .env
+sed -i.bak \
+  -e "/^${ENV_KEY}=/d" \
+  -e "/^SLACK_BOT_TOKEN_${ENV_SUFFIX}=/d" \
+  -e "/^SLACK_SIGNING_SECRET_${ENV_SUFFIX}=/d" .env
 
 sudo systemctl start nanoclaw-v2
 ```

@@ -13,8 +13,10 @@
  *   SLACK_SIGNING_SECRET_<SUFFIX>=…
  *
  * Each workspace is a separate Slack app (created per-workspace at
- * api.slack.com/apps, "Not distributed"). Suffix is any [A-Za-z0-9]+ and
- * is lowercased for the channelType.
+ * api.slack.com/apps, "Not distributed"). Suffix is any [A-Za-z0-9_]+
+ * (alphanumerics + underscore — matches the convention used by other
+ * scoped env vars in this fork like GITHUB_TOKEN_MADISON_REED) and is
+ * lowercased for the channelType.
  *
  * This file is re-applied on top of the upstream /add-slack output so
  * `/add-slack` remains an idempotent install that preserves the
@@ -41,15 +43,22 @@ export interface SlackWorkspace {
 /**
  * Pure helper — parse workspace configs from an env key/value map.
  * Exported for testing.
+ *
+ * Suffix-to-channelType derivation: lowercase, then map `_` → `-`. This
+ * keeps env-var names readable when an underscore appears (e.g.
+ * SLACK_BOT_TOKEN_ILLYSIUM_CODEX) while producing a channelType that
+ * matches the existing dash-separated convention (slack-illysium-codex).
+ * The reverse direction at channel-auto-wire/index.ts:67 already maps
+ * `-` → `_` when building env-var lookups, so the round-trip is stable.
  */
 export function parseSlackWorkspaces(env: Record<string, string>): SlackWorkspace[] {
   const bySuffix = new Map<string, { botToken?: string; signingSecret?: string }>();
 
   for (const [key, value] of Object.entries(env)) {
-    const m = key.match(/^SLACK_(BOT_TOKEN|SIGNING_SECRET)(?:_([A-Za-z0-9]+))?$/);
+    const m = key.match(/^SLACK_(BOT_TOKEN|SIGNING_SECRET)(?:_([A-Za-z0-9_]+))?$/);
     if (!m) continue;
     const [, kind, rawSuffix] = m;
-    const suffix = rawSuffix ? rawSuffix.toLowerCase() : '';
+    const suffix = rawSuffix ? rawSuffix.toLowerCase().replace(/_/g, '-') : '';
     const entry = bySuffix.get(suffix) ?? {};
     if (kind === 'BOT_TOKEN') entry.botToken = value;
     else entry.signingSecret = value;

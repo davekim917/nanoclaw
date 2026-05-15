@@ -703,7 +703,6 @@ async function deliverMessage(
     } catch {
       // best-effort
     }
-
   }
 
   clearOutbox(session.agent_group_id, session.id, msg.id);
