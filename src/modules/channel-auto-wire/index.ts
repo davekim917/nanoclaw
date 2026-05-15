@@ -23,6 +23,8 @@
  *   NANOCLAW_DEFAULT_SENDER_POLICY_<CHANNEL_TYPE>   strict | request_approval |
  *                                                   public (default: strict — the
  *                                                   safe v2 upstream default)
+ *   NANOCLAW_DEFAULT_IGNORED_POLICY_<CHANNEL_TYPE>  accumulate | drop
+ *                                                   (default: accumulate)
  *
  * Why sender policy is part of auto-wire. Router creates new messaging
  * groups with `unknown_sender_policy='strict'`, which is the right safe
@@ -37,6 +39,13 @@
  *   NANOCLAW_DEFAULT_AGENT_GROUP_SLACK_ILLYSIUM=illysium-v2
  *   NANOCLAW_DEFAULT_SESSION_MODE_SLACK_ILLYSIUM=per-thread
  *   NANOCLAW_DEFAULT_SENDER_POLICY_SLACK_ILLYSIUM=public
+ *   NANOCLAW_DEFAULT_IGNORED_POLICY_SLACK_ILLYSIUM=accumulate
+ *
+ * Architectural default policy. getMessagingGroupAgents() COALESCEs NULL
+ * ignored_message_policy values to 'accumulate' for legacy/manual rows, but
+ * auto-wire still writes the resolved value explicitly. That keeps DB
+ * inspection, exports, audit queries, and future raw-column filters honest
+ * while the COALESCE remains belt-and-suspenders for rows not created here.
  *
  * When a Slack message arrives from a channel in the Illysium workspace
  * that's not yet wired, this module creates a `messaging_group_agents`
@@ -62,6 +71,9 @@ type SessionMode = 'shared' | 'per-thread' | 'agent-shared';
 
 const VALID_SENDER_POLICIES = new Set(['strict', 'request_approval', 'public'] as const);
 type SenderPolicy = MessagingGroup['unknown_sender_policy'];
+
+const VALID_IGNORED_POLICIES = new Set(['drop', 'accumulate'] as const);
+type IgnoredMessagePolicy = MessagingGroupAgent['ignored_message_policy'];
 
 function envKey(prefix: string, channelType: string): string {
   return `${prefix}_${channelType.toUpperCase().replace(/-/g, '_')}`;
@@ -99,6 +111,21 @@ function resolveDefaultSenderPolicy(channelType: string): SenderPolicy | null {
     value: trimmed,
   });
   return null;
+}
+
+function resolveDefaultIgnoredPolicy(channelType: string): IgnoredMessagePolicy {
+  const raw = process.env[envKey('NANOCLAW_DEFAULT_IGNORED_POLICY', channelType)];
+  const trimmed = raw?.trim();
+  if (trimmed && VALID_IGNORED_POLICIES.has(trimmed as IgnoredMessagePolicy)) {
+    return trimmed as IgnoredMessagePolicy;
+  }
+  if (trimmed) {
+    log.warn('channel-auto-wire: invalid ignored_message_policy in env, falling back to accumulate', {
+      channelType,
+      value: trimmed,
+    });
+  }
+  return 'accumulate';
 }
 
 function newId(): string {
@@ -152,7 +179,7 @@ export const resolver: UnwiredChannelResolverFn = (event, mg) => {
     engage_mode: engageMode,
     engage_pattern: engagePattern,
     sender_scope: 'all',
-    ignored_message_policy: 'drop',
+    ignored_message_policy: resolveDefaultIgnoredPolicy(event.channelType),
     session_mode: sessionMode,
     priority: 0,
     default_model: null,

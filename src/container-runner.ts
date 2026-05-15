@@ -2028,8 +2028,7 @@ async function buildContainerArgs(
         DBT_MCP_ENABLE_DBT_CLI: 'false',
         DBT_MCP_ENABLE_LSP: 'false',
         DISABLE_TOOLS:
-          resolveScopedEnv('DBT_MCP_DISABLE_TOOLS', credentialFolder) ??
-          'trigger_job_run,cancel_job_run,retry_job_run',
+          resolveScopedEnv('DBT_MCP_DISABLE_TOOLS', credentialFolder) ?? 'trigger_job_run,cancel_job_run,retry_job_run',
       };
       const devEnvId = resolveScopedEnv('DBT_DEV_ENV_ID', credentialFolder);
       if (devEnvId) env.DBT_DEV_ENV_ID = devEnvId;
