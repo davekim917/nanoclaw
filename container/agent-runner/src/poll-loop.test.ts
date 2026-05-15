@@ -1,10 +1,19 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 
 import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from './db/connection.js';
 import { getPendingMessages, markCompleted } from './db/messages-in.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { formatMessages, extractRouting } from './formatter.js';
-import { dispatchResultText, isAdmissibleTrigger, isAupRefusal, selectInTurnFollowUps } from './poll-loop.js';
+import {
+  dispatchFileAttachment,
+  dispatchResultText,
+  isAdmissibleTrigger,
+  isAupRefusal,
+  selectInTurnFollowUps,
+} from './poll-loop.js';
 import { MockProvider } from './providers/mock.js';
 
 beforeEach(() => {
@@ -731,6 +740,55 @@ describe('dispatchResultText — unwrapped output fallback', () => {
       routing('slack', 'C-MAIN'),
     );
 
+    expect(getUndeliveredMessages()).toHaveLength(0);
+  });
+
+  it('stages provider-generated files into outbox and routes them to the origin destination', () => {
+    seedDestination('slack-main', 'slack', 'C-MAIN');
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, kind, timestamp, status, trigger, platform_id, channel_type, thread_id, content)
+         VALUES ('in-1', 'chat', datetime('now'), 'completed', 1, 'C-MAIN', 'slack', 'thread-1', '{}')`,
+      )
+      .run();
+
+    const sourceDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-image-'));
+    const outboxRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-outbox-'));
+    const sourcePath = path.join(sourceDir, 'cafe.png');
+    fs.writeFileSync(sourcePath, Buffer.from('png-bytes'));
+
+    const delivered = dispatchFileAttachment(
+      { path: sourcePath, text: 'Preview', filename: '../cafe.png' },
+      routing('slack', 'C-MAIN'),
+      outboxRoot,
+    );
+
+    expect(delivered).toBe(true);
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(out[0].channel_type).toBe('slack');
+    expect(out[0].platform_id).toBe('C-MAIN');
+    expect(out[0].thread_id).toBe('thread-1');
+    expect(out[0].in_reply_to).toBe('in-1');
+    const content = JSON.parse(out[0].content);
+    expect(content).toEqual({ text: 'Preview', files: ['cafe.png'] });
+    expect(fs.readFileSync(path.join(outboxRoot, out[0].id, 'cafe.png'), 'utf-8')).toBe('png-bytes');
+  });
+
+  it('does not broadcast provider-generated files when the origin cannot be resolved', () => {
+    seedDestination('slack-main', 'slack', 'C-MAIN');
+    seedDestination('discord-side', 'discord', 'chan-9');
+    const sourceDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-image-'));
+    const sourcePath = path.join(sourceDir, 'cafe.png');
+    fs.writeFileSync(sourcePath, Buffer.from('png-bytes'));
+
+    const delivered = dispatchFileAttachment(
+      { path: sourcePath },
+      routing('slack', 'C-UNKNOWN'),
+      fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-outbox-')),
+    );
+
+    expect(delivered).toBe(false);
     expect(getUndeliveredMessages()).toHaveLength(0);
   });
 });

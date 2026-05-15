@@ -154,6 +154,12 @@ export type ProviderEvent =
   | { type: 'error'; message: string; retryable: boolean; classification?: string }
   | { type: 'progress'; message: string }
   /**
+   * Provider-produced file artifact that should be delivered to the
+   * originating channel as an attachment. The poll-loop owns routing and
+   * outbox staging; providers only report the local path.
+   */
+  | { type: 'file'; path: string; filename?: string; text?: string }
+  /**
    * Liveness signal. Providers MUST yield this on every underlying SDK
    * event (tool call, thinking, partial message, anything) so the
    * poll-loop's idle timer stays honest during long tool runs.

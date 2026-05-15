@@ -1,6 +1,10 @@
 import { describe, expect, it } from 'vitest';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 
 import { dockerResourceLimitArgs, resolveAnthropicAuth, resolveProviderName } from './container-runner.js';
+import { getProviderContainerConfig } from './providers/provider-container-registry.js';
 
 describe('resolveProviderName', () => {
   it('prefers session over group and container.json', () => {
@@ -209,5 +213,64 @@ describe('resolveAnthropicAuth', () => {
     };
     const auth = resolveAnthropicAuth('any', env);
     expect(auth.oauthFallbacks.map((f) => f.index)).toEqual([2, 5, 10]);
+  });
+});
+
+describe('codex provider host auth', () => {
+  function makeHome(): string {
+    return fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-codex-home-'));
+  }
+
+  function makeSessionDir(): string {
+    return fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-codex-session-'));
+  }
+
+  function writeAuth(dir: string, value: string): void {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'auth.json'), JSON.stringify({ account: value }));
+  }
+
+  function copiedAuth(sessionDir: string): unknown {
+    return JSON.parse(fs.readFileSync(path.join(sessionDir, 'codex', 'auth.json'), 'utf-8'));
+  }
+
+  it('copies scoped Codex auth for the agent group folder without DB lookup', () => {
+    const home = makeHome();
+    const sessionDir = makeSessionDir();
+    writeAuth(path.join(home, '.codex'), 'global');
+    writeAuth(path.join(home, '.codex-madison-reed-codex'), 'madison-reed');
+
+    const fn = getProviderContainerConfig('codex');
+    expect(fn).toBeDefined();
+    const contribution = fn!({
+      sessionDir,
+      agentGroupId: 'ag-does-not-match-folder',
+      agentGroupFolder: 'madison-reed-codex',
+      hostEnv: { HOME: home } as NodeJS.ProcessEnv,
+    });
+
+    expect(copiedAuth(sessionDir)).toEqual({ account: 'madison-reed' });
+    expect(contribution.mounts?.[0]).toMatchObject({
+      hostPath: path.join(sessionDir, 'codex'),
+      containerPath: '/home/node/.codex',
+      readonly: false,
+    });
+  });
+
+  it('falls back to global Codex auth when no scoped auth exists', () => {
+    const home = makeHome();
+    const sessionDir = makeSessionDir();
+    writeAuth(path.join(home, '.codex'), 'global');
+
+    const fn = getProviderContainerConfig('codex');
+    expect(fn).toBeDefined();
+    fn!({
+      sessionDir,
+      agentGroupId: 'madison-reed-codex',
+      agentGroupFolder: 'madison-reed-codex',
+      hostEnv: { HOME: home } as NodeJS.ProcessEnv,
+    });
+
+    expect(copiedAuth(sessionDir)).toEqual({ account: 'global' });
   });
 });

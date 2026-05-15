@@ -5,7 +5,7 @@ import path from 'path';
 import { describe, it, expect } from 'bun:test';
 
 import { createProvider } from './factory.js';
-import { CodexProvider, resolveClaudeImports } from './codex.js';
+import { CodexProvider, extractImageGenerationPath, materializeRawImageGeneration, resolveClaudeImports } from './codex.js';
 
 describe('createProvider (codex)', () => {
   it('returns CodexProvider for codex', () => {
@@ -29,6 +29,30 @@ describe('createProvider (codex)', () => {
   it('declares no native slash command support', () => {
     const p = new CodexProvider();
     expect(p.supportsNativeSlashCommands).toBe(false);
+  });
+
+  it('bridges HTTP MCP servers and filters SSE servers', () => {
+    const p = new CodexProvider({
+      mcpServers: {
+        exa: { type: 'http', url: 'https://mcp.exa.ai/mcp' },
+        custom: {
+          type: 'http',
+          url: 'https://example.test/mcp',
+          headers: { Authorization: 'Bearer placeholder' },
+        },
+        legacy: { type: 'sse', url: 'https://example.test/sse' },
+      },
+    }) as unknown as {
+      mcpServers: Record<string, { command: string; args?: string[]; env?: Record<string, string> }>;
+    };
+
+    expect(p.mcpServers.exa).toEqual({
+      command: 'bun',
+      args: ['/app/src/remote-mcp-bridge.ts', 'https://mcp.exa.ai/mcp'],
+      env: { REMOTE_MCP_NAME: 'exa' },
+    });
+    expect(p.mcpServers.custom.env?.REMOTE_MCP_AUTHORIZATION).toBe('Bearer placeholder');
+    expect(p.mcpServers.legacy).toBeUndefined();
   });
 });
 
@@ -76,5 +100,82 @@ describe('resolveClaudeImports', () => {
     const dir = scratchDir();
     const resolved = resolveClaudeImports('email @someone for details', dir);
     expect(resolved).toBe('email @someone for details');
+  });
+});
+
+describe('extractImageGenerationPath', () => {
+  it('accepts completed imageGeneration items with savedPath', () => {
+    expect(
+      extractImageGenerationPath({
+        type: 'imageGeneration',
+        status: 'completed',
+        savedPath: '/home/node/.codex/generated_images/session/image.png',
+      }),
+    ).toBe('/home/node/.codex/generated_images/session/image.png');
+  });
+
+  it('accepts snake_case saved_path from raw app-server payloads', () => {
+    expect(
+      extractImageGenerationPath({
+        type: 'imageGeneration',
+        status: 'succeeded',
+        saved_path: '/home/node/.codex/generated_images/session/image.png',
+      }),
+    ).toBe('/home/node/.codex/generated_images/session/image.png');
+  });
+
+  it('accepts a saved path even when Codex reports a nonterminal status label', () => {
+    expect(
+      extractImageGenerationPath({
+        type: 'imageGeneration',
+        status: 'generating',
+        savedPath: '/home/node/.codex/generated_images/session/image.png',
+      }),
+    ).toBe('/home/node/.codex/generated_images/session/image.png');
+  });
+
+  it('ignores failed and non-image items', () => {
+    expect(
+      extractImageGenerationPath({
+        type: 'imageGeneration',
+        status: 'failed',
+        savedPath: '/home/node/.codex/generated_images/session/image.png',
+      }),
+    ).toBeNull();
+    expect(extractImageGenerationPath({ type: 'agentMessage', savedPath: '/tmp/nope.png' })).toBeNull();
+  });
+});
+
+describe('materializeRawImageGeneration', () => {
+  it('writes raw image_generation_call bytes to a generated image file', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-raw-image-'));
+    const out = materializeRawImageGeneration(
+      {
+        type: 'image_generation_call',
+        id: 'ig/test:path',
+        status: 'generating',
+        result: Buffer.from('png-bytes').toString('base64'),
+      },
+      root,
+    );
+
+    expect(out).toBe(path.join(root, 'ig_test_path.png'));
+    expect(fs.readFileSync(out!, 'utf-8')).toBe('png-bytes');
+  });
+
+  it('ignores failed raw image_generation_call items', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-raw-image-'));
+    const out = materializeRawImageGeneration(
+      {
+        type: 'image_generation_call',
+        id: 'ig_failed',
+        status: 'failed',
+        result: Buffer.from('png-bytes').toString('base64'),
+      },
+      root,
+    );
+
+    expect(out).toBeNull();
+    expect(fs.readdirSync(root)).toHaveLength(0);
   });
 });

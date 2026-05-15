@@ -1,3 +1,6 @@
+import fs from 'fs';
+import path from 'path';
+
 import { findByName, findByRouting, getAllDestinations, type DestinationEntry } from './destinations.js';
 import { getPendingMessages, markProcessing, markCompleted, type MessageInRow } from './db/messages-in.js';
 import { writeMessageOut } from './db/messages-out.js';
@@ -37,6 +40,31 @@ function log(msg: string): void {
 
 function generateId(): string {
   return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+const FILE_EVENT_MAX_BYTES = 50 * 1024 * 1024;
+const FILE_EVENT_ALLOWED_PREFIXES = [
+  '/home/node/.codex/generated_images',
+  '/workspace/agent',
+  '/workspace/worktrees',
+  '/workspace/extra',
+  '/tmp/',
+];
+
+function isAllowedFileEventPath(p: string): boolean {
+  return FILE_EVENT_ALLOWED_PREFIXES.some((prefix) => {
+    const boundary = prefix.endsWith(path.sep) ? prefix : `${prefix}${path.sep}`;
+    return p === prefix || p.startsWith(boundary);
+  });
+}
+
+function sanitizeOutboundFilename(filename: string): string {
+  const base = path.basename(filename)
+    .replace(/[^\w .@()+,=[\]-]/g, '_')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 180);
+  return base && base !== '.' && base !== '..' ? base : `attachment-${Date.now()}`;
 }
 
 /**
@@ -713,6 +741,8 @@ async function processQuery(
               `Use <message to="name"> blocks to address them. Bare text goes to the scratchpad fallback only.`,
           );
         }
+      } else if (event.type === 'file') {
+        dispatchFileAttachment(event, routing);
       }
     }
   } finally {
@@ -759,10 +789,72 @@ function handleEvent(event: ProviderEvent, routing: RoutingContext): void {
         content: JSON.stringify({ text: event.message }),
       });
       break;
+    case 'file':
+      log(`File: ${event.path}`);
+      break;
     case 'compacted':
       log(`Compacted: ${event.text}`);
       break;
   }
+}
+
+export function dispatchFileAttachment(
+  file: { path: string; filename?: string; text?: string },
+  routing: RoutingContext,
+  outboxRoot = '/workspace/outbox',
+): boolean {
+  let realPath: string;
+  try {
+    realPath = fs.realpathSync(file.path);
+  } catch {
+    log(`Generated file not found: ${file.path}`);
+    return false;
+  }
+
+  if (!isAllowedFileEventPath(realPath)) {
+    log(`Generated file outside allowed attachment paths: ${realPath}`);
+    return false;
+  }
+
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(realPath);
+  } catch {
+    log(`Generated file stat failed: ${realPath}`);
+    return false;
+  }
+  if (!stat.isFile() || stat.size === 0 || stat.size > FILE_EVENT_MAX_BYTES) {
+    log(`Generated file rejected: ${realPath} (${stat.size} bytes)`);
+    return false;
+  }
+
+  const origin = findByRouting(routing.channelType, routing.platformId);
+  const all = getAllDestinations();
+  const dest = origin ?? (all.length === 1 ? all[0] : null);
+  if (!dest) {
+    log(`Generated file has no safe destination: ${realPath}`);
+    return false;
+  }
+
+  const platformId = dest.type === 'channel' ? dest.platformId! : dest.agentGroupId!;
+  const channelType = dest.type === 'channel' ? dest.channelType! : 'agent';
+  const destRouting = resolveDestinationThread(channelType, platformId);
+  const id = generateId();
+  const filename = sanitizeOutboundFilename(file.filename ?? path.basename(realPath));
+  const outboxDir = path.join(outboxRoot, id);
+  fs.mkdirSync(outboxDir, { recursive: true });
+  fs.copyFileSync(realPath, path.join(outboxDir, filename));
+
+  writeMessageOut({
+    id,
+    in_reply_to: destRouting?.inReplyTo ?? routing.inReplyTo,
+    kind: 'chat',
+    platform_id: platformId,
+    channel_type: channelType,
+    thread_id: destRouting?.threadId ?? routing.threadId,
+    content: JSON.stringify({ text: file.text ?? '', files: [filename] }),
+  });
+  return true;
 }
 
 /**

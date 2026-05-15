@@ -397,12 +397,33 @@ export interface CodexMcpServer {
   env?: Record<string, string>;
 }
 
+function stripExistingMcpServers(toml: string): string {
+  const out: string[] = [];
+  let inMcpBlock = false;
+  for (const line of toml.split('\n')) {
+    const header = line.match(/^\s*\[([^\]]+)\]\s*$/);
+    if (header) {
+      inMcpBlock = header[1].trim().startsWith('mcp_servers.');
+      if (inMcpBlock) continue;
+    }
+    if (!inMcpBlock) out.push(line);
+  }
+  return out.join('\n').trimEnd();
+}
+
 export function writeCodexMcpConfigToml(servers: Record<string, CodexMcpServer>): void {
   const codexConfigDir = path.join(process.env.HOME || '/home/node', '.codex');
   fs.mkdirSync(codexConfigDir, { recursive: true });
   const configTomlPath = path.join(codexConfigDir, 'config.toml');
 
-  const lines: string[] = [];
+  let base = '';
+  try {
+    base = stripExistingMcpServers(fs.readFileSync(configTomlPath, 'utf-8'));
+  } catch {
+    base = '';
+  }
+
+  const lines: string[] = base ? [base, '', '# --- nanoclaw runtime MCP servers ---', ''] : [];
   for (const [name, config] of Object.entries(servers)) {
     lines.push(`[mcp_servers.${name}]`);
     lines.push('type = "stdio"');

@@ -14,6 +14,7 @@
  * turns, so no message is dropped).
  */
 import fs from 'fs';
+import crypto from 'crypto';
 import path from 'path';
 
 import { z } from 'zod';
@@ -89,6 +90,21 @@ type ReasoningThreadItem = {
   content?: unknown;
 };
 
+type ImageGenerationThreadItem = {
+  id?: unknown;
+  type?: string;
+  status?: string;
+  savedPath?: unknown;
+  saved_path?: unknown;
+};
+
+type RawImageGenerationResponseItem = {
+  id?: unknown;
+  type?: string;
+  status?: string;
+  result?: unknown;
+};
+
 function joinStringArray(value: unknown): string {
   if (!Array.isArray(value)) return '';
   return value.filter((part): part is string => typeof part === 'string' && part.trim().length > 0).join('\n\n');
@@ -103,6 +119,47 @@ function extractReasoningItemText(item: ReasoningThreadItem | undefined): string
   if (summary) return summary;
   const content = joinStringArray(item.content);
   return content || null;
+}
+
+export function extractImageGenerationPath(item: ImageGenerationThreadItem | undefined): string | null {
+  if (item?.type !== 'imageGeneration') return null;
+  const status = typeof item.status === 'string' ? item.status.toLowerCase() : '';
+  if (['failed', 'error', 'cancelled', 'canceled'].includes(status)) return null;
+  const savedPath = item.savedPath ?? item.saved_path;
+  return typeof savedPath === 'string' && savedPath.trim() ? savedPath : null;
+}
+
+function imageGenerationKey(item: { id?: unknown } | undefined, fallback: string): string {
+  return typeof item?.id === 'string' && item.id.trim() ? `image:${item.id.trim()}` : fallback;
+}
+
+export function materializeRawImageGeneration(
+  item: RawImageGenerationResponseItem | undefined,
+  rootDir = '/home/node/.codex/generated_images/nanoclaw-raw',
+): string | null {
+  if (item?.type !== 'image_generation_call') return null;
+  const status = typeof item.status === 'string' ? item.status.toLowerCase() : '';
+  if (['failed', 'error', 'cancelled', 'canceled'].includes(status)) return null;
+  if (typeof item.result !== 'string' || !item.result.trim()) return null;
+
+  const id =
+    typeof item.id === 'string' && item.id.trim()
+      ? item.id.trim()
+      : crypto.createHash('sha256').update(item.result).digest('hex').slice(0, 32);
+  const filename = `${id.replace(/[^\w.-]/g, '_')}.png`;
+  const outPath = path.join(rootDir, filename);
+  const image = Buffer.from(item.result, 'base64');
+  if (image.length === 0) return null;
+
+  try {
+    fs.mkdirSync(rootDir, { recursive: true });
+    if (!fs.existsSync(outPath)) {
+      fs.writeFileSync(outPath, image);
+    }
+  } catch {
+    return null;
+  }
+  return outPath;
 }
 
 // ── Provider config schema ──────────────────────────────────────────────────
@@ -197,11 +254,22 @@ export class CodexProvider implements AgentProvider {
   private readonly stickyConfig: z.infer<typeof codexConfigSchema>;
 
   constructor(options: ProviderOptions = {}) {
-    // Codex only supports stdio MCP servers. Filter out any http/sse entries.
+    // Codex only supports stdio MCP servers. Native stdio entries pass through;
+    // hosted HTTP MCPs are exposed through the local stdio bridge. SSE entries
+    // stay filtered because remote-mcp-bridge speaks Streamable HTTP, not SSE.
     const stdioOnly: Record<string, CodexMcpServer> = {};
     for (const [name, cfg] of Object.entries(options.mcpServers ?? {})) {
       if (cfg && (cfg.type === undefined || cfg.type === 'stdio') && 'command' in cfg) {
         stdioOnly[name] = { command: cfg.command, args: cfg.args, env: cfg.env };
+      } else if (cfg?.type === 'http') {
+        const env: Record<string, string> = { REMOTE_MCP_NAME: name };
+        const authorization = cfg.headers?.Authorization ?? cfg.headers?.authorization;
+        if (authorization) env.REMOTE_MCP_AUTHORIZATION = authorization;
+        stdioOnly[name] = {
+          command: 'bun',
+          args: ['/app/src/remote-mcp-bridge.ts', cfg.url],
+          env,
+        };
       }
     }
     this.mcpServers = stdioOnly;
@@ -371,6 +439,7 @@ async function* runOneTurn(
   let reasoningBuffer = '';
   const reasoningItemsWithDeltas = new Set<string>();
   const emittedReasoningItemIds = new Set<string>();
+  const emittedImageKeys = new Set<string>();
 
   // Buffered event queue so we can `yield` across the async notification
   // callback. Each notification pushes zero or more ProviderEvents; the
@@ -400,6 +469,12 @@ async function* runOneTurn(
 
     buffer.push({ type: 'progress', message: formatBlockquoteLabel('💭', truncate(text)) });
     if (itemId) emittedReasoningItemIds.add(itemId);
+  };
+
+  const emitGeneratedFile = (filePath: string, key: string): void => {
+    if (emittedImageKeys.has(key)) return;
+    emittedImageKeys.add(key);
+    buffer.push({ type: 'file', path: filePath });
   };
 
   const handler = (n: JsonRpcNotification): void => {
@@ -456,9 +531,21 @@ async function* runOneTurn(
         break;
       }
       case 'item/completed': {
-        const item = params.item as ({ type?: string; text?: string } & ReasoningThreadItem) | undefined;
+        const item = params.item as ({ type?: string; text?: string } & ReasoningThreadItem & ImageGenerationThreadItem) | undefined;
         if (item?.type === 'agentMessage' && item.text) resultText = item.text;
         if (item?.type === 'reasoning') emitCompletedReasoningItem(item);
+        const generatedImagePath = extractImageGenerationPath(item);
+        if (generatedImagePath) {
+          emitGeneratedFile(generatedImagePath, imageGenerationKey(item, `path:${generatedImagePath}`));
+        }
+        break;
+      }
+      case 'rawResponseItem/completed': {
+        const item = params.item as RawImageGenerationResponseItem | undefined;
+        const generatedImagePath = materializeRawImageGeneration(item);
+        if (generatedImagePath) {
+          emitGeneratedFile(generatedImagePath, imageGenerationKey(item, `path:${generatedImagePath}`));
+        }
         break;
       }
       case 'item/reasoning/summaryTextDelta':
