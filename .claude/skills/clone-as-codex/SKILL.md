@@ -164,11 +164,57 @@ Wait ~5 seconds. On restart, the slack adapter sees `SLACK_BOT_TOKEN_${ENV_SUFFI
 
 ### 9. Wire the sibling to the desired Slack channels
 
-The sibling needs to be added to the relevant Slack channels FROM SLACK first — invite the new bot user (e.g. `@illie-codex`) to `#agents-xzo` and any other channels you want it to operate in. Slack delivers the first message it receives in each channel to the host's webhook; the host auto-creates a `messaging_groups` row for the channel under the new `channelType`. After that auto-wire happens, the sibling's `messaging_group_agents` row gets created automatically with `engage_mode='mention'` (the platform-default — fires on real `@`-mention of its bot user).
+The sibling needs to be added to the relevant Slack channels FROM SLACK first — invite the new bot user (e.g. `@illie-codex`) to `#agents-xzo` and any other channels you want it to operate in.
 
 The source bot keeps its own `messaging_group_agents` row in the existing `slack-<source>` channelType — untouched by this skill. Both bots share the channel physically; their NanoClaw routing is separate.
 
-> If you'd rather not rely on auto-wire, you can pre-insert the row manually after step 8 — see `.claude/skills/manage-channels/SKILL.md`.
+Wire each desired physical Slack channel through the host `register` step, not by raw-inserting `messaging_group_agents`. The register path calls `createMessagingGroupAgent()`, which also creates the companion `agent_destinations` row the container needs for `<message to="...">` routing and origin-fallback.
+
+```bash
+SLACK_CHANNEL_ID=C0AJA89MN2E                  # Slack channel id for #agents-xzo
+SLACK_CHANNEL_NAME=agents-xzo
+
+pnpm exec tsx setup/index.ts --step register -- \
+  --platform-id "slack:${SLACK_CHANNEL_ID}" \
+  --name "#${SLACK_CHANNEL_NAME}" \
+  --folder "${SIBLING_FOLDER}" \
+  --channel "${CHANNEL_TYPE}" \
+  --session-mode "per-thread" \
+  --assistant-name "${DISPLAY_NAME}"
+```
+
+If a `messaging_group_agents` row was already hand-inserted and the sibling fires but cannot send, repair the missing destination row explicitly. Use this only as a repair; new wiring should go through `register`.
+
+```bash
+DESTINATION_NAME=${SLACK_CHANNEL_NAME}
+NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+pnpm exec tsx scripts/q.ts data/v2.db "
+insert into agent_destinations (agent_group_id, local_name, target_type, target_id, created_at)
+select '${SIBLING_ID}', '${DESTINATION_NAME}', 'channel', mg.id, coalesce(mga.created_at, '${NOW}')
+from messaging_groups mg
+join messaging_group_agents mga
+  on mga.messaging_group_id = mg.id
+ and mga.agent_group_id = '${SIBLING_ID}'
+where mg.channel_type = '${CHANNEL_TYPE}'
+  and mg.platform_id = 'slack:${SLACK_CHANNEL_ID}'
+  and not exists (
+    select 1
+    from agent_destinations ad
+    where ad.agent_group_id = '${SIBLING_ID}'
+      and ad.target_type = 'channel'
+      and ad.target_id = mg.id
+  )
+  and not exists (
+    select 1
+    from agent_destinations ad
+    where ad.agent_group_id = '${SIBLING_ID}'
+      and ad.local_name = '${DESTINATION_NAME}'
+  )
+"
+```
+
+After repairing an already-active session, send a new mention or restart the host/container so `writeDestinations()` refreshes the session-local `destinations` projection. The central `agent_destinations` table is the source of truth, but running containers read the projection in their `inbound.db`.
 
 ### 10. Verify
 
@@ -191,6 +237,7 @@ Assumes you still have `SOURCE_FOLDER`, `SOURCE_ID`, `SIBLING_FOLDER`, `SIBLING_
 sudo systemctl stop nanoclaw-v2
 
 # Drop wiring + agent_groups row.
+pnpm exec tsx scripts/q.ts data/v2.db "delete from agent_destinations where agent_group_id='${SIBLING_ID}' or (target_type='channel' and target_id in (select id from messaging_groups where channel_type='slack-$(echo "${ENV_SUFFIX}" | tr '[:upper:]_' '[:lower:]-')'))"
 pnpm exec tsx scripts/q.ts data/v2.db "delete from messaging_group_agents where agent_group_id='${SIBLING_ID}'"
 pnpm exec tsx scripts/q.ts data/v2.db "delete from messaging_groups where channel_type='slack-$(echo "${ENV_SUFFIX}" | tr '[:upper:]_' '[:lower:]-')'"
 pnpm exec tsx scripts/q.ts data/v2.db "delete from agent_groups where id='${SIBLING_ID}'"
