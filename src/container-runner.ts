@@ -602,6 +602,14 @@ const SCOPED_CREDENTIAL_VARS = [
   'DBT_DEV_ENV_ID',
   'DBT_USER_ID',
   'DBT_MCP_DISABLE_TOOLS',
+  // Looker API3 credentials — agent shell needs these to do the /login
+  // dance (POST /api/4.0/login → access_token) for direct REST calls.
+  // Previously only flowed to the looker MCP subprocess; this exposes
+  // them to the container's main env in parallel so curl/scripts can
+  // authenticate without going through the MCP tool surface.
+  'LOOKER_BASE_URL',
+  'LOOKER_CLIENT_ID',
+  'LOOKER_CLIENT_SECRET',
   'OPENAI_API_KEY',
   'BRAINTRUST_API_KEY',
   'EXA_API_KEY',
