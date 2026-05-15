@@ -414,6 +414,30 @@ export function resolveAnthropicAuth(folder: string, env: NodeJS.ProcessEnv = pr
 }
 
 /**
+ * Resolve the host-side `.codex/` directory to mount for a given agent
+ * group's container. Mirrors the per-group OAuth pattern from
+ * `resolveAnthropicAuth` but for Codex, which stores credentials as an
+ * `auth.json` file rather than env-var tokens.
+ *
+ * Convention: a per-group dir at `~/.codex-<folder>/` (with a real
+ * `auth.json`) wins over the global `~/.codex/`. Operators create it by
+ * running `CODEX_HOME=~/.codex-<folder> codex login` once, which logs the
+ * user into a SEPARATE ChatGPT/OpenAI account and writes that account's
+ * tokens to the scoped dir.
+ *
+ * Falls back to the global `~/.codex/` when no per-group dir exists, so
+ * existing single-account installs keep working unchanged.
+ *
+ * Exported for unit testing — keeps the resolver pure (no side effects)
+ * and lets test fixtures stand in for a real homedir.
+ */
+export function resolveCodexAuthDir(folder: string, homedir: string = os.homedir()): string {
+  const scoped = path.join(homedir, `.codex-${folder}`);
+  if (fs.existsSync(path.join(scoped, 'auth.json'))) return scoped;
+  return path.join(homedir, '.codex');
+}
+
+/**
  * Sentinel value injected by `onecli run --` as the host service's
  * CLAUDE_CODE_OAUTH_TOKEN. The wrapper's own proxy substitutes it for a
  * real vault token at request time — but the literal string is never a
@@ -939,7 +963,10 @@ function buildMounts(
     if (containerConfig.codexHostAuth === true && !excluded.has('codex') && entries.includes('codex')) {
       const providerHasCodexMount = providerContribution.mounts?.some((m) => m.containerPath === '/home/node/.codex');
       if (!providerHasCodexMount) {
-        const hostCodex = path.join(os.homedir(), '.codex');
+        // Per-group resolution: ~/.codex-<folder>/ wins if it has an
+        // auth.json, otherwise fall back to the global ~/.codex/. See
+        // resolveCodexAuthDir for the rationale.
+        const hostCodex = resolveCodexAuthDir(agentGroup.folder);
         if (fs.existsSync(hostCodex)) {
           mounts.push({ hostPath: hostCodex, containerPath: '/home/node/.codex', readonly: false });
         }

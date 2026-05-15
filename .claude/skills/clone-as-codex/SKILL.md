@@ -134,6 +134,21 @@ EOF
 # — the operator decides which tools are appropriate for the codex sibling.
 ```
 
+### 6a. Per-group Codex account (optional — skip for shared account)
+
+By default, every codex-provider container mounts the host's primary `~/.codex/` (single OpenAI/ChatGPT account shared across groups). To run this sibling on a **different OpenAI account** — e.g., a client's MR-codex account distinct from your personal one — create a scoped `~/.codex-<sibling-folder>/` dir on the host:
+
+```bash
+# Logs into a SEPARATE OpenAI/ChatGPT account and writes auth.json
+# to the scoped dir. Requires browser auth — run from a host terminal,
+# not from inside a container or Claude Code subshell.
+CODEX_HOME=~/.codex-${SIBLING_FOLDER} codex login
+```
+
+`container-runner.ts:resolveCodexAuthDir` resolves `~/.codex-${SIBLING_FOLDER}/auth.json` first; falls back to the global `~/.codex/` when the scoped dir is absent. No env var to set, no container.json field to flip — just create the dir.
+
+Mirrors the per-group OAuth pattern Claude already uses via scoped `CLAUDE_CODE_OAUTH_TOKEN_<FOLDER>` env vars (see `resolveAnthropicAuth`).
+
 ### 6. Scoped MNEMON_STORE override
 
 Routes the sibling's memory writes to the source group's existing store. The override value is the source's **ag-id** (not folder), because `container-runner.ts` defaults `MNEMON_STORE` to `agentGroup.id`.
