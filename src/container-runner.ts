@@ -750,6 +750,32 @@ function buildMounts(
   // Agent group folder at /workspace/agent (RW for working files + CLAUDE.local.md)
   mounts.push({ hostPath: groupDir, containerPath: '/workspace/agent', readonly: false });
 
+  // Sibling-group symlink overlay. clone-as-codex creates relative symlinks
+  // (e.g. groups/illie-codex/XZO -> ../illie/XZO) so two siblings share the
+  // same source repos / sources / conversations on the host. Inside the
+  // container, those symlinks would dereference to /workspace/illie/XZO,
+  // which isn't mounted — so create_worktree, conversations reads, mnemon
+  // source-ingest all fail with ENOENT. Overlay each host-resolvable
+  // symlink with a bind mount at the same container path so the entry
+  // appears as a real directory inside the container, transparently
+  // pointing at the source group's files.
+  //
+  // Absolute symlinks whose targets only exist inside the container (e.g.
+  // .claude-shared.md -> /app/CLAUDE.md) are skipped: realpathSync fails
+  // on the host because /app doesn't exist there, and the existing /app
+  // mount makes the symlink work inside the container anyway.
+  for (const entry of fs.readdirSync(groupDir, { withFileTypes: true })) {
+    if (!entry.isSymbolicLink()) continue;
+    const linkPath = path.join(groupDir, entry.name);
+    let realTarget: string;
+    try {
+      realTarget = fs.realpathSync(linkPath);
+    } catch {
+      continue;
+    }
+    mounts.push({ hostPath: realTarget, containerPath: `/workspace/agent/${entry.name}`, readonly: false });
+  }
+
   // container.json — nested RO mount on top of RW group dir so the agent
   // can read its config but cannot modify it.
   const containerJsonPath = path.join(groupDir, 'container.json');

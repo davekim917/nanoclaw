@@ -60,6 +60,28 @@ const COLLAB_TOOL_VERB: Record<string, string> = {
   closeAgent: 'closed',
 };
 
+// Thinking-label helpers — mirror the Claude provider's truncate /
+// formatBlockquoteLabel / NANOCLAW_HIDE_THINKING semantics so Codex
+// reasoning surfaces with the same 💭 blockquote affordance.
+const LABEL_MAX = 2000;
+
+function truncate(s: string): string {
+  const trimmed = s.trim();
+  if (trimmed.length <= LABEL_MAX) return trimmed;
+  return trimmed.slice(0, LABEL_MAX - 1).replace(/\s+\S*$/, '') + '…';
+}
+
+function formatBlockquoteLabel(emoji: string, prose: string): string {
+  const lines = prose.split('\n');
+  lines[0] = `${emoji} ${lines[0]}`;
+  return lines.map((line) => `> ${line}`).join('\n');
+}
+
+function thinkingForwardingEnabled(): boolean {
+  const v = process.env.NANOCLAW_HIDE_THINKING;
+  return !v || v === '0' || v.toLowerCase() === 'false';
+}
+
 // ── Provider config schema ──────────────────────────────────────────────────
 // Mirrors the `claudeConfigSchema` pattern but with Codex-native vocabulary:
 // `reasoning_effort` instead of Claude's `effort`. Enum mirrors the
@@ -319,6 +341,10 @@ async function* runOneTurn(
   const turnState: { error: Error | null } = { error: null };
   let resultText = '';
   let turnDone = false;
+  // Accumulates reasoning text deltas (raw or summary) between section
+  // breaks; flushed as a 💭 progress label on summaryPartAdded or
+  // turn/completed. See the case handlers below for details.
+  let reasoningBuffer = '';
 
   // Buffered event queue so we can `yield` across the async notification
   // callback. Each notification pushes zero or more ProviderEvents; the
@@ -328,6 +354,15 @@ async function* runOneTurn(
   const kick = (): void => {
     waker?.();
     waker = null;
+  };
+
+  const flushReasoning = (): void => {
+    if (!reasoningBuffer.trim()) {
+      reasoningBuffer = '';
+      return;
+    }
+    buffer.push({ type: 'progress', message: formatBlockquoteLabel('💭', truncate(reasoningBuffer)) });
+    reasoningBuffer = '';
   };
 
   const handler = (n: JsonRpcNotification): void => {
@@ -388,7 +423,24 @@ async function* runOneTurn(
         if (item?.type === 'agentMessage' && item.text) resultText = item.text;
         break;
       }
+      case 'item/reasoning/summaryTextDelta':
+      case 'item/reasoning/textDelta': {
+        // Codex emits one of these (per `show_raw_agent_reasoning` config —
+        // default false → summary deltas). Accumulate until a section
+        // break or turn end flushes as a 💭 thinking label, mirroring
+        // Claude's thinking-block UX. Suppressed when NANOCLAW_HIDE_THINKING=1.
+        const delta = params.delta as string;
+        if (delta && thinkingForwardingEnabled()) reasoningBuffer += delta;
+        break;
+      }
+      case 'item/reasoning/summaryPartAdded':
+        // Codex finalized a reasoning summary section. Emit whatever we
+        // accumulated so the user sees thinking updates as they happen,
+        // not just one giant label at turn end.
+        flushReasoning();
+        break;
       case 'turn/completed':
+        flushReasoning();
         if (turnTracker) turnTracker.currentTurnId = null;
         turnDone = true;
         break;
