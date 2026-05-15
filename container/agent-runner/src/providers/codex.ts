@@ -82,6 +82,29 @@ function thinkingForwardingEnabled(): boolean {
   return !v || v === '0' || v.toLowerCase() === 'false';
 }
 
+type ReasoningThreadItem = {
+  id?: string;
+  type?: string;
+  summary?: unknown;
+  content?: unknown;
+};
+
+function joinStringArray(value: unknown): string {
+  if (!Array.isArray(value)) return '';
+  return value.filter((part): part is string => typeof part === 'string' && part.trim().length > 0).join('\n\n');
+}
+
+function extractReasoningItemText(item: ReasoningThreadItem | undefined): string | null {
+  if (item?.type !== 'reasoning') return null;
+  // ThreadItem reasoning payloads carry summary/content as string arrays.
+  // Prefer summaries because those are the user-facing reasoning surface;
+  // content is only a fallback for app-server builds that finalize raw text.
+  const summary = joinStringArray(item.summary);
+  if (summary) return summary;
+  const content = joinStringArray(item.content);
+  return content || null;
+}
+
 // ── Provider config schema ──────────────────────────────────────────────────
 // Mirrors the `claudeConfigSchema` pattern but with Codex-native vocabulary:
 // `reasoning_effort` instead of Claude's `effort`. Enum mirrors the
@@ -341,10 +364,13 @@ async function* runOneTurn(
   const turnState: { error: Error | null } = { error: null };
   let resultText = '';
   let turnDone = false;
-  // Accumulates reasoning text deltas (raw or summary) between section
-  // breaks; flushed as a 💭 progress label on summaryPartAdded or
-  // turn/completed. See the case handlers below for details.
+  // Codex can deliver reasoning two ways: streaming item/reasoning/* deltas
+  // when enabled by the app-server, or finalized reasoning ThreadItems via
+  // item/completed. Streamed item IDs are tracked so lifecycle fallback
+  // payloads do not duplicate already-forwarded summaries.
   let reasoningBuffer = '';
+  const reasoningItemsWithDeltas = new Set<string>();
+  const emittedReasoningItemIds = new Set<string>();
 
   // Buffered event queue so we can `yield` across the async notification
   // callback. Each notification pushes zero or more ProviderEvents; the
@@ -365,6 +391,17 @@ async function* runOneTurn(
     reasoningBuffer = '';
   };
 
+  const emitCompletedReasoningItem = (item: ReasoningThreadItem | undefined): void => {
+    const text = extractReasoningItemText(item);
+    if (!text || !thinkingForwardingEnabled()) return;
+
+    const itemId = typeof item?.id === 'string' ? item.id : undefined;
+    if (itemId && (reasoningItemsWithDeltas.has(itemId) || emittedReasoningItemIds.has(itemId))) return;
+
+    buffer.push({ type: 'progress', message: formatBlockquoteLabel('💭', truncate(text)) });
+    if (itemId) emittedReasoningItemIds.add(itemId);
+  };
+
   const handler = (n: JsonRpcNotification): void => {
     const method = n.method;
     const params = n.params;
@@ -373,19 +410,6 @@ async function* runOneTurn(
     // idle timer — yield before any event-specific translation so even
     // long tool executions keep the loop awake.
     buffer.push({ type: 'activity' });
-
-    // TEMP DEBUG: log every method + relevant payload to diagnose missing
-    // reasoning events.
-    if (method.includes('reasoning') || method.startsWith('item/') || method === 'turn/started' || method === 'turn/completed') {
-      let extra = '';
-      if (method === 'item/started' || method === 'item/completed') {
-        const item = (params as { item?: { type?: string; text?: string } }).item;
-        const txtPreview = typeof item?.text === 'string' ? item.text.slice(0, 80) : undefined;
-        extra = ` item.type=${item?.type ?? '?'}` + (txtPreview ? ` text="${txtPreview}"` : '');
-      }
-      // eslint-disable-next-line no-console
-      console.error(`[codex-debug] method=${method}${extra}`);
-    }
 
     switch (method) {
       case 'thread/started': {
@@ -432,8 +456,9 @@ async function* runOneTurn(
         break;
       }
       case 'item/completed': {
-        const item = params.item as { type?: string; text?: string } | undefined;
+        const item = params.item as ({ type?: string; text?: string } & ReasoningThreadItem) | undefined;
         if (item?.type === 'agentMessage' && item.text) resultText = item.text;
+        if (item?.type === 'reasoning') emitCompletedReasoningItem(item);
         break;
       }
       case 'item/reasoning/summaryTextDelta':
@@ -442,16 +467,24 @@ async function* runOneTurn(
         // default false → summary deltas). Accumulate until a section
         // break or turn end flushes as a 💭 thinking label, mirroring
         // Claude's thinking-block UX. Suppressed when NANOCLAW_HIDE_THINKING=1.
+        const itemId = (params as { itemId?: unknown }).itemId;
+        if (typeof itemId === 'string') {
+          reasoningItemsWithDeltas.add(itemId);
+          if (emittedReasoningItemIds.has(itemId)) break;
+        }
         const delta = params.delta as string;
         if (delta && thinkingForwardingEnabled()) reasoningBuffer += delta;
         break;
       }
-      case 'item/reasoning/summaryPartAdded':
+      case 'item/reasoning/summaryPartAdded': {
+        const itemId = (params as { itemId?: unknown }).itemId;
+        if (typeof itemId === 'string') reasoningItemsWithDeltas.add(itemId);
         // Codex finalized a reasoning summary section. Emit whatever we
         // accumulated so the user sees thinking updates as they happen,
         // not just one giant label at turn end.
         flushReasoning();
         break;
+      }
       case 'turn/completed':
         flushReasoning();
         if (turnTracker) turnTracker.currentTurnId = null;

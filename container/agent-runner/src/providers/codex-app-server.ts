@@ -21,6 +21,14 @@ function log(msg: string): void {
 
 const INIT_TIMEOUT_MS = 30_000;
 
+const CODEX_INITIALIZE_CAPABILITIES = {
+  experimentalApi: false,
+  // `optOutNotificationMethods` is a suppression list, not an allow-list.
+  // Keep it empty so high-volume streams such as item/agentMessage/delta and
+  // item/reasoning/* remain eligible for delivery on this connection.
+  optOutNotificationMethods: [],
+};
+
 /**
  * Errors from `thread/resume` that indicate the thread ID is unusable —
  * typically because the app-server has no memory of it (thread transcript
@@ -273,7 +281,7 @@ export async function initializeCodexAppServer(server: AppServer): Promise<void>
     'initialize',
     {
       clientInfo: { name: 'nanoclaw', version: '1.0.0' },
-      capabilities: { experimentalApi: false },
+      capabilities: CODEX_INITIALIZE_CAPABILITIES,
     },
     INIT_TIMEOUT_MS,
   );
