@@ -70,9 +70,7 @@ describe('parseSlackWorkspaces', () => {
       SLACK_BOT_TOKEN_ILLYSIUM_CODEX: 'xoxb-codex',
       SLACK_SIGNING_SECRET_ILLYSIUM_CODEX: 'sig-codex',
     });
-    expect(ws).toEqual([
-      { channelType: 'slack-illysium-codex', botToken: 'xoxb-codex', signingSecret: 'sig-codex' },
-    ]);
+    expect(ws).toEqual([{ channelType: 'slack-illysium-codex', botToken: 'xoxb-codex', signingSecret: 'sig-codex' }]);
   });
 });
 

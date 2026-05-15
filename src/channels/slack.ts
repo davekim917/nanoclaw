@@ -138,7 +138,11 @@ export async function slackCreateThread(
   return { threadId: parentMessageId, messageId: reply.ts as string };
 }
 
-const workspaces = parseSlackWorkspaces(readEnvFileMatching(/^SLACK_(BOT_TOKEN|SIGNING_SECRET)(_[A-Za-z0-9]+)?$/));
+// Keep the pre-filter regex in sync with the suffix regex inside
+// parseSlackWorkspaces — both must allow `_` in the suffix, otherwise
+// env vars like SLACK_BOT_TOKEN_ILLYSIUM_CODEX get dropped here before
+// they ever reach the parser.
+const workspaces = parseSlackWorkspaces(readEnvFileMatching(/^SLACK_(BOT_TOKEN|SIGNING_SECRET)(_[A-Za-z0-9_]+)?$/));
 
 for (const ws of workspaces) {
   registerChannelAdapter(ws.channelType, {
