@@ -33,7 +33,7 @@ import './providers/index.js';
 import { createProvider, type ProviderName } from './providers/factory.js';
 import type { McpServerConfig } from './providers/types.js';
 import { runPollLoop } from './poll-loop.js';
-import { setupCodexRuntime } from './codex-companion-setup.js';
+import { setupCodexRuntime, syncCodexSkillsMirror } from './codex-companion-setup.js';
 
 function log(msg: string): void {
   console.error(`[agent-runner] ${msg}`);
@@ -138,11 +138,21 @@ async function main(): Promise<void> {
     }
   }
 
-  // Container-local CODEX_HOME so Codex-as-peer (invoked by Claude via the
-  // codex-companion script) sees the same MCP servers Claude does — most
-  // importantly the in-container `nanoclaw` server. No-op when Codex auth
-  // isn't mounted or when Codex is the primary provider (its own writer
-  // handles ~/.codex/config.toml directly).
+  // Skills parity: populate `/home/node/.agents/skills/` unconditionally so
+  // BOTH codex-primary (illie-codex) AND codex-as-peer (illie running the
+  // codex companion) see the same plugin skills (humanizer, gitnexus-*,
+  // impeccable, etc.). Before splitting this out, the mirror only ran in
+  // the `providerName !== 'codex'` branch, so codex-primary sessions saw
+  // only Codex's built-in system skills — humanizer + every other plugin
+  // skill was invisible.
+  syncCodexSkillsMirror();
+
+  // Container-local CODEX_HOME for codex-as-peer mode (invoked by Claude
+  // via the codex-companion script). Builds ~/.codex-runtime/ with auth.json
+  // symlink + merged config.toml so the peer sees the same MCP servers
+  // Claude does — most importantly the in-container `nanoclaw` server.
+  // No-op when codex is the primary provider — its own writer handles
+  // ~/.codex/config.toml at thread/start time.
   if (providerName !== 'codex') {
     const codexHome = setupCodexRuntime(mcpServers);
     if (codexHome) {
