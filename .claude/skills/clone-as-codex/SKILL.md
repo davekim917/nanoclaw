@@ -123,6 +123,7 @@ cat > groups/${SIBLING_FOLDER}/container.json <<EOF
   "groupName": "${SIBLING_FOLDER}",
   "assistantName": "${SIBLING_FOLDER}",
   "agentGroupId": "${SIBLING_ID}",
+  "credentialFolder": "${SOURCE_FOLDER}",
   "gitnexusInjectAgentsMd": true,
   "tools": [],
   "memory": { "enabled": true },
@@ -130,9 +131,22 @@ cat > groups/${SIBLING_FOLDER}/container.json <<EOF
 }
 EOF
 
-# Manually copy the "tools" array from groups/${SOURCE_FOLDER}/container.json
-# — the operator decides which tools are appropriate for the codex sibling.
+# Manually copy the "tools" array (and any "additionalMounts") from
+# groups/${SOURCE_FOLDER}/container.json — the operator decides which tools
+# are appropriate for the codex sibling.
 ```
+
+**Why `credentialFolder`**: container-runner's per-group credential lookups
+(LOOKER_*, DBT_*, GITHUB_TOKEN_*, RENDER_PG_*, GIT_AUTHOR_*, Claude OAuth,
+Snowflake, etc.) key on `<BASE>_<FOLDER_UPPER>`. Without this field a
+sibling folder like `madison-reed-codex` would look for
+`LOOKER_BASE_URL_MADISON_REED_CODEX`, which doesn't exist — leaving the
+codex sibling stripped of every per-group credential. `credentialFolder`
+redirects ONLY the credential lookups to the source folder; identity-bound
+paths (container name, group dir mount, MNEMON_STORE override) stay on
+the sibling's own folder. The Codex auth dir lookup (~/.codex-<folder>/)
+also stays on the sibling's folder so per-sibling Codex accounts work
+correctly.
 
 ### 6a. Per-group Codex account (optional — skip for shared account)
 

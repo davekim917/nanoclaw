@@ -964,8 +964,14 @@ function buildMounts(
       const providerHasCodexMount = providerContribution.mounts?.some((m) => m.containerPath === '/home/node/.codex');
       if (!providerHasCodexMount) {
         // Per-group resolution: ~/.codex-<folder>/ wins if it has an
-        // auth.json, otherwise fall back to the global ~/.codex/. See
-        // resolveCodexAuthDir for the rationale.
+        // auth.json, otherwise fall back to the global ~/.codex/.
+        //
+        // NB: Keyed on `agentGroup.folder`, NOT `containerConfig.credentialFolder`.
+        // A codex sibling typically WANTS its own Codex account (different
+        // OpenAI/ChatGPT identity than the Claude source); credentialFolder
+        // is for env-var creds (LOOKER, DBT, GitHub tokens) which the sibling
+        // should inherit. Conflating the two would silently override the
+        // sibling's purpose-built ~/.codex-<sibling>/ dir with the source's.
         const hostCodex = resolveCodexAuthDir(agentGroup.folder);
         if (fs.existsSync(hostCodex)) {
           mounts.push({ hostPath: hostCodex, containerPath: '/home/node/.codex', readonly: false });
@@ -1602,13 +1608,25 @@ async function buildContainerArgs(
   args.push('-e', 'CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1');
   args.push('-e', 'ENABLE_TOOL_SEARCH=true');
 
+  // Credential-lookup folder. Defaults to `agent_groups.folder`; sibling
+  // groups (codex clones, etc.) can override via container.json's
+  // `credentialFolder` field to inherit the source group's scoped env vars
+  // (LOOKER_*, DBT_*, GITHUB_TOKEN_*, RENDER_PG_*, GIT_AUTHOR_*, Claude
+  // OAuth, Codex auth dir, etc.) without duplicating every var with a
+  // sibling-specific suffix.
+  //
+  // Identity-bound concerns (containerName, group dir mount, MNEMON_STORE
+  // override env-key, log fields) stay on `agentGroup.folder` so siblings
+  // remain individually addressable.
+  const credentialFolder = containerConfig.credentialFolder ?? agentGroup.folder;
+
   // Per-group Anthropic credentials. Default behaviour reads the global
   // `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` (and `_N` rotation
   // siblings); the per-group form `<BASE>_<FOLDER_UPPER>` overrides the
   // global and pins the *entire* rotation set to the workplace/account
   // tokens for this group only — preventing fallback onto a different
   // account on retryable errors.
-  const auth = resolveAnthropicAuth(agentGroup.folder);
+  const auth = resolveAnthropicAuth(credentialFolder);
 
   // Optional non-Anthropic routing: when ANTHROPIC_BASE_URL is set on the
   // host, forward it + ANTHROPIC_API_KEY + any ANTHROPIC_API_KEY_N
@@ -1651,7 +1669,7 @@ async function buildContainerArgs(
   // from container.json `githubTokenEnv`, then from
   // `GITHUB_TOKEN_<FOLDER_UPPER>`, then falls back to `GITHUB_TOKEN`.
   // OneCLI's proxy model doesn't fit git auth — we pass the real token.
-  const ghToken = resolveGitHubToken(agentGroup.folder, containerConfig);
+  const ghToken = resolveGitHubToken(credentialFolder, containerConfig);
   if (ghToken) {
     args.push('-e', `GH_TOKEN=${ghToken}`);
     args.push('-e', `GITHUB_TOKEN=${ghToken}`);
@@ -1661,7 +1679,7 @@ async function buildContainerArgs(
     // so gh's own auth store can't bypass the URL scope. Without this,
     // a container with a broad GitHub token can clone/push to any org
     // the token grants. Per-agent-group via GITHUB_ALLOWED_ORGS_<FOLDER>.
-    const ghOrgs = resolveScopedEnv('GITHUB_ALLOWED_ORGS', agentGroup.folder);
+    const ghOrgs = resolveScopedEnv('GITHUB_ALLOWED_ORGS', credentialFolder);
     if (ghOrgs) args.push('-e', `GITHUB_ALLOWED_ORGS=${ghOrgs}`);
   } else {
     log.warn('No GitHub token resolved for agent group — git push/PR will fail', {
@@ -1676,7 +1694,7 @@ async function buildContainerArgs(
   // Scoped credential env vars: each base resolves via
   // `<BASE>_<FOLDER_UPPER>` → `<BASE>` and is injected if found.
   for (const base of SCOPED_CREDENTIAL_VARS) {
-    const v = resolveScopedEnv(base, agentGroup.folder);
+    const v = resolveScopedEnv(base, credentialFolder);
     if (v) args.push('-e', `${base}=${v}`);
   }
 
@@ -1692,7 +1710,7 @@ async function buildContainerArgs(
   // (substring overlap with axie-dev). The strict prefix-anchored match
   // here, combined with the folder-name collision check at create_agent
   // time, eliminates the ambiguity.
-  const folderTok = agentGroup.folder.toUpperCase().replace(/-/g, '_');
+  const folderTok = credentialFolder.toUpperCase().replace(/-/g, '_');
   const verbatimPrefixes = ['RENDER_PG_', 'RENDER_REDIS_URL_'];
   for (const [k, v] of Object.entries(process.env)) {
     if (!v) continue;
@@ -1969,9 +1987,9 @@ async function buildContainerArgs(
     // in the env block here because the MCP SDK's stdio transport only
     // inherits HOME/LOGNAME/PATH/SHELL/TERM/USER by default — container env
     // vars don't reach the child process unless explicitly passed.
-    const baseUrl = resolveScopedEnv('LOOKER_BASE_URL', agentGroup.folder);
-    const clientId = resolveScopedEnv('LOOKER_CLIENT_ID', agentGroup.folder);
-    const clientSecret = resolveScopedEnv('LOOKER_CLIENT_SECRET', agentGroup.folder);
+    const baseUrl = resolveScopedEnv('LOOKER_BASE_URL', credentialFolder);
+    const clientId = resolveScopedEnv('LOOKER_CLIENT_ID', credentialFolder);
+    const clientSecret = resolveScopedEnv('LOOKER_CLIENT_SECRET', credentialFolder);
     if (baseUrl && clientId && clientSecret) {
       mcpServers.looker = {
         type: 'stdio',
@@ -1981,7 +1999,7 @@ async function buildContainerArgs(
           LOOKER_BASE_URL: baseUrl,
           LOOKER_CLIENT_ID: clientId,
           LOOKER_CLIENT_SECRET: clientSecret,
-          LOOKER_VERIFY_SSL: resolveScopedEnv('LOOKER_VERIFY_SSL', agentGroup.folder) ?? 'true',
+          LOOKER_VERIFY_SSL: resolveScopedEnv('LOOKER_VERIFY_SSL', credentialFolder) ?? 'true',
         },
       };
     } else {
@@ -1999,9 +2017,9 @@ async function buildContainerArgs(
     // DBT_CLOUD_API_TOKEN_<FOLDER> as DBT_TOKEN. Read-only by default: CLI
     // and LSP toolsets disabled (no local dbt project mounted), and the three
     // mutating Admin tools disabled. Override via DBT_MCP_DISABLE_TOOLS_<FOLDER>.
-    const host = resolveScopedEnv('DBT_HOST', agentGroup.folder);
-    const token = resolveScopedEnv('DBT_CLOUD_API_TOKEN', agentGroup.folder);
-    const prodEnvId = resolveScopedEnv('DBT_PROD_ENV_ID', agentGroup.folder);
+    const host = resolveScopedEnv('DBT_HOST', credentialFolder);
+    const token = resolveScopedEnv('DBT_CLOUD_API_TOKEN', credentialFolder);
+    const prodEnvId = resolveScopedEnv('DBT_PROD_ENV_ID', credentialFolder);
     if (host && token && prodEnvId) {
       const env: Record<string, string> = {
         DBT_HOST: host,
@@ -2010,14 +2028,14 @@ async function buildContainerArgs(
         DBT_MCP_ENABLE_DBT_CLI: 'false',
         DBT_MCP_ENABLE_LSP: 'false',
         DISABLE_TOOLS:
-          resolveScopedEnv('DBT_MCP_DISABLE_TOOLS', agentGroup.folder) ??
+          resolveScopedEnv('DBT_MCP_DISABLE_TOOLS', credentialFolder) ??
           'trigger_job_run,cancel_job_run,retry_job_run',
       };
-      const devEnvId = resolveScopedEnv('DBT_DEV_ENV_ID', agentGroup.folder);
+      const devEnvId = resolveScopedEnv('DBT_DEV_ENV_ID', credentialFolder);
       if (devEnvId) env.DBT_DEV_ENV_ID = devEnvId;
-      const userId = resolveScopedEnv('DBT_USER_ID', agentGroup.folder);
+      const userId = resolveScopedEnv('DBT_USER_ID', credentialFolder);
       if (userId) env.DBT_USER_ID = userId;
-      const multicell = resolveScopedEnv('DBT_MULTICELL_ACCOUNT_PREFIX', agentGroup.folder);
+      const multicell = resolveScopedEnv('DBT_MULTICELL_ACCOUNT_PREFIX', credentialFolder);
       if (multicell) env.MULTICELL_ACCOUNT_PREFIX = multicell;
       mcpServers['dbt-mcp'] = {
         type: 'stdio',
