@@ -1,6 +1,6 @@
 ---
 name: clone-as-codex
-description: Create a Codex-backed sibling agent for an existing Claude group. The sibling shares the source group's CLAUDE.md, repos, sources, conversations, and mnemon store via symlinks + scoped-env. Cross-agent walkie-talkie collaboration works natively via Slack mentions — requires installing a second Slack app for the sibling so each agent has its own real bot user.
+description: Create a Codex-backed sibling agent for an existing Claude group. The sibling shares the source group's CLAUDE.md, repos, sources, conversations, and mnemon store via symlinks + scoped-env. Cross-agent collaboration happens via standard Slack `@`-mentions — requires installing a second Slack app for the sibling so each agent has its own real bot user.
 ---
 
 # Clone Group As Codex Sibling

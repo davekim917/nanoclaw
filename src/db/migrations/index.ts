@@ -33,6 +33,7 @@ import { migration030 } from './030-tasks-archived-at.js';
 import { migration031 } from './031-inbox-board-foundations.js';
 import { migration032 } from './032-sessions-last-outbound.js';
 import { migration033 } from './033-steer-idempotency-drop-task-id.js';
+import { migration035 } from './035-drop-thread-walkie-state.js';
 
 export interface Migration {
   version: number;
@@ -68,6 +69,7 @@ const migrations: Migration[] = [
   migration031,
   migration032,
   migration033,
+  migration035,
 ];
 
 export function runMigrations(db: Database.Database): void {
