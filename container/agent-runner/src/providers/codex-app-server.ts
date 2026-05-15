@@ -21,6 +21,14 @@ function log(msg: string): void {
 
 const INIT_TIMEOUT_MS = 30_000;
 
+const CODEX_INITIALIZE_CAPABILITIES = {
+  experimentalApi: false,
+  // `optOutNotificationMethods` is a suppression list, not an allow-list.
+  // Keep it empty so high-volume streams such as item/agentMessage/delta and
+  // item/reasoning/* remain eligible for delivery on this connection.
+  optOutNotificationMethods: [],
+};
+
 /**
  * Errors from `thread/resume` that indicate the thread ID is unusable —
  * typically because the app-server has no memory of it (thread transcript
@@ -273,7 +281,7 @@ export async function initializeCodexAppServer(server: AppServer): Promise<void>
     'initialize',
     {
       clientInfo: { name: 'nanoclaw', version: '1.0.0' },
-      capabilities: { experimentalApi: false },
+      capabilities: CODEX_INITIALIZE_CAPABILITIES,
     },
     INIT_TIMEOUT_MS,
   );
@@ -350,6 +358,34 @@ export async function startCodexTurn(server: AppServer, params: TurnParams): Pro
   if (resp.error) throw new Error(`turn/start failed: ${resp.error.message}`);
 }
 
+/**
+ * Append text input to a turn that is currently in flight. Codex's app-server
+ * routes the new input to the running turn (rather than queuing it for the
+ * next turn), so the agent's response can reference late-arriving content
+ * without ending the turn first.
+ *
+ * `expectedTurnId` is a precondition the server checks — if it doesn't match
+ * the active turn, the request fails. The caller has to pass the turnId
+ * observed from a prior `turn/started` notification.
+ *
+ * Throws on RPC error so the caller can fall back to queuing the message
+ * for the next turn (e.g. if the active turn has just ended).
+ */
+export async function steerCodexTurn(
+  server: AppServer,
+  params: { threadId: string; expectedTurnId: string; inputText: string },
+): Promise<{ turnId: string }> {
+  const resp = await sendCodexRequest(server, 'turn/steer', {
+    threadId: params.threadId,
+    expectedTurnId: params.expectedTurnId,
+    input: [{ type: 'text', text: params.inputText }],
+  });
+  if (resp.error) throw new Error(`turn/steer failed: ${resp.error.message}`);
+  const turnId = (resp.result as { turnId?: string } | undefined)?.turnId;
+  if (!turnId) throw new Error('turn/steer returned no turnId');
+  return { turnId };
+}
+
 // ── MCP config.toml ─────────────────────────────────────────────────────────
 // Codex discovers MCP servers by reading ~/.codex/config.toml at startup.
 // We rewrite it on every spawn from whatever mcpServers the agent-runner
@@ -388,6 +424,70 @@ export function writeCodexMcpConfigToml(servers: Record<string, CodexMcpServer>)
   log(`Wrote MCP config.toml (${Object.keys(servers).length} server(s))`);
 }
 
+// ── hooks.json (NanoClaw guardrails + memory-capture) ───────────────────────
+// Codex app-server reads ~/.codex/hooks.json at session start and fires
+// shell-command hooks on PreToolUse / PostToolUse / etc. We point each
+// event at `bun /app/src/codex-hooks/cli.ts <event>` which dispatches to
+// the same hook decisions the Claude provider uses as SDK callbacks
+// (see ../codex-hooks/runner.ts).
+
+/**
+ * Build the hooks.json content (in-memory). Split out from the filesystem
+ * write so tests can assert on the structure without depending on `fs`
+ * mocks set by sibling test files.
+ */
+export function buildCodexHooksJson(opts?: { emailGateTimeoutSec?: number }): {
+  hooks: {
+    PreToolUse: { hooks: { type: 'command'; command: string; timeout: number }[] }[];
+    PostToolUse: { hooks: { type: 'command'; command: string; timeout: number }[] }[];
+  };
+} {
+  const cliPath = '/app/src/codex-hooks/cli.ts';
+  const preTimeoutSec = opts?.emailGateTimeoutSec ?? 3600;
+  return {
+    hooks: {
+      PreToolUse: [
+        {
+          hooks: [
+            {
+              type: 'command' as const,
+              command: `bun ${cliPath} PreToolUse`,
+              timeout: preTimeoutSec,
+            },
+          ],
+        },
+      ],
+      PostToolUse: [
+        {
+          hooks: [
+            {
+              type: 'command' as const,
+              command: `bun ${cliPath} PostToolUse`,
+              timeout: 30,
+            },
+          ],
+        },
+      ],
+    },
+  };
+}
+
+/**
+ * Generate `~/.codex/hooks.json` for the current container. Mirrors the
+ * Claude SDK hooks block in `claude.ts` for PreToolUse / PostToolUse
+ * coverage. Email-gate is on the PreToolUse chain — its 60-minute admin
+ * approval wait requires a long timeout (`emailGateTimeoutSec`), so this
+ * event gets the longest timeout in the file.
+ */
+export function writeCodexHooksJson(opts?: { emailGateTimeoutSec?: number }): void {
+  const codexConfigDir = path.join(process.env.HOME || '/home/node', '.codex');
+  fs.mkdirSync(codexConfigDir, { recursive: true });
+  const hooksJsonPath = path.join(codexConfigDir, 'hooks.json');
+  const hooks = buildCodexHooksJson(opts);
+  fs.writeFileSync(hooksJsonPath, JSON.stringify(hooks, null, 2));
+  log(`Wrote hooks.json (PreToolUse timeout=${hooks.hooks.PreToolUse[0].hooks[0].timeout}s)`);
+}
+
 /**
  * Build the `-c key=value` overrides passed to `codex app-server`. The
  * `stickyConfig` argument is the validated per-agent provider config slice
@@ -399,11 +499,18 @@ export function writeCodexMcpConfigToml(servers: Record<string, CodexMcpServer>)
  * shadow but not improve precedence.
  */
 export function createCodexConfigOverrides(stickyConfig?: {
-  reasoning_effort?: 'low' | 'medium' | 'high';
+  reasoning_effort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
 }): string[] {
   const overrides = ['features.use_linux_sandbox_bwrap=false'];
   if (stickyConfig?.reasoning_effort) {
     overrides.push(`model_reasoning_effort="${stickyConfig.reasoning_effort}"`);
   }
+  // Force reasoning-summary notifications on. Without this, gpt-5.x runs in
+  // xhigh effort still produce zero `item/reasoning/summaryTextDelta` events
+  // — verified empirically via per-method debug logging. "detailed" gives
+  // the richest stream; "auto" was insufficient even with high effort.
+  // Container chat-UX surfaces these as 💭 thinking labels (see codex.ts
+  // runOneTurn's item/reasoning/* cases).
+  overrides.push('model_reasoning_summary="detailed"');
   return overrides;
 }

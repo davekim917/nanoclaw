@@ -361,8 +361,26 @@ export function setupCodexRuntime(mcpServers: Record<string, McpServerConfig>): 
     return null;
   }
 
-  // Skills parity: write into /home/node/.agents/skills/ — the runtime-
-  // agnostic location Codex auto-scans (verified). Two sources contribute:
+  syncCodexSkillsMirror();
+
+  log(`CODEX_HOME runtime ready at ${RUNTIME_CODEX_DIR} (${Object.keys(mcpServers).length} MCP servers merged)`);
+  return RUNTIME_CODEX_DIR;
+}
+
+/**
+ * Populate `/home/node/.agents/skills/` with symlinks to every discoverable
+ * skill — container-bundled NanoClaw skills + host plugin tree. Codex
+ * auto-scans this dir (verified via `codex debug prompt-input`; appears as
+ * discovery root `r1`), so this is what makes plugin skills like
+ * `humanizer`, `gitnexus-*`, `impeccable`, etc. visible to Codex sessions.
+ *
+ * Called unconditionally from agent-runner startup — needed for BOTH
+ * codex-primary (illie-codex) and codex-as-peer (illie running the codex
+ * companion script). Idempotent: `syncDiscoveredSkillSymlinks` reconciles
+ * existing entries (creates/removes/leaves as appropriate).
+ */
+export function syncCodexSkillsMirror(): void {
+  // Two sources contribute:
   //   1. Container-bundled NanoClaw skills at /home/node/.claude/skills/
   //      (agent-browser, vercel-cli, slack-formatting, etc.)
   //   2. Host plugin tree mounted RO at /workspace/plugins/, discovered via
@@ -401,8 +419,5 @@ export function setupCodexRuntime(mcpServers: Record<string, McpServerConfig>): 
       `created=${result.created.length} unchanged=${result.unchanged.length} ` +
       `removed=${result.removed.length} skipped=${result.skipped.length}`,
   );
-
-  log(`CODEX_HOME runtime ready at ${RUNTIME_CODEX_DIR} (${Object.keys(mcpServers).length} MCP servers merged)`);
-  return RUNTIME_CODEX_DIR;
 }
 

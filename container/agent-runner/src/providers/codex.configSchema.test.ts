@@ -16,6 +16,7 @@ describe('codexConfigSchema', () => {
   });
 
   it('test_codexConfigSchema_rejects_max_effort', () => {
+    // 'max' is a Claude-only tier — Codex's ReasoningEffort enum doesn't include it.
     const result = codexConfigSchema.safeParse({ reasoning_effort: 'max' });
     expect(result.success).toBe(false);
     if (!result.success) {
@@ -24,10 +25,20 @@ describe('codexConfigSchema', () => {
     }
   });
 
-  it('test_codexConfigSchema_rejects_xhigh_effort', () => {
-    const result = codexConfigSchema.safeParse({ reasoning_effort: 'xhigh' });
-    expect(result.success).toBe(false);
+  it('test_codexConfigSchema_accepts_xhigh_effort', () => {
+    // xhigh is in Codex's ReasoningEffort enum (verified via app-server
+    // generate-json-schema) and is supported by gpt-5.2-codex and gpt-5.5.
+    const parsed = codexConfigSchema.parse({ reasoning_effort: 'xhigh' });
+    expect(parsed.reasoning_effort).toBe('xhigh');
   });
+
+  it.each(['none', 'minimal', 'low', 'medium', 'high', 'xhigh'])(
+    'test_codexConfigSchema_accepts_%s_effort',
+    (effort) => {
+      const parsed = codexConfigSchema.parse({ reasoning_effort: effort });
+      expect(parsed.reasoning_effort).toBe(effort);
+    },
+  );
 
   it('test_codexConfigSchema_rejects_claude_key', () => {
     const result = codexConfigSchema.safeParse({ effort: 'high' });
@@ -43,9 +54,12 @@ describe('codexConfigSchema', () => {
     expect(result.success).toBe(false);
   });
 
-  it('test_codexConfigSchema_empty_object_defaults_to_high', () => {
+  it('test_codexConfigSchema_empty_object_defaults_to_xhigh', () => {
+    // gpt-5.5 (our default model) supports xhigh — default to the deepest
+    // tier that doesn't require an extra opt-in. Operators dial down via
+    // container.json when cost/latency matter more than reasoning depth.
     const parsed = codexConfigSchema.parse({});
-    expect(parsed).toEqual({ reasoning_effort: 'high' });
+    expect(parsed).toEqual({ reasoning_effort: 'xhigh' });
   });
 
   it('test_codexConfigSchema_explicit_low_overrides_default', () => {
@@ -81,17 +95,18 @@ describe('CodexProvider sticky config + override propagation', () => {
     expect(overrides.find((o) => o.startsWith('model_reasoning_effort'))).toBeUndefined();
   });
 
-  it('test_stickyConfig_default_high_emits_override', () => {
+  it('test_stickyConfig_default_xhigh_emits_override', () => {
     // CodexProvider's constructor parses providerConfig through the schema,
-    // which defaults reasoning_effort to 'high'. This covers the production
-    // path: every codex agent gets high effort unless explicitly overridden.
+    // which defaults reasoning_effort to 'xhigh' for gpt-5.5 (the default
+    // model). This covers the production path: every codex agent gets xhigh
+    // effort unless explicitly overridden in container.json.
     const p = new CodexProvider();
     const sticky = (p as unknown as {
-      stickyConfig: { reasoning_effort?: 'low' | 'medium' | 'high' };
+      stickyConfig: { reasoning_effort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' };
     }).stickyConfig;
-    expect(sticky.reasoning_effort).toBe('high');
+    expect(sticky.reasoning_effort).toBe('xhigh');
     const overrides = createCodexConfigOverrides(sticky);
-    expect(overrides).toContain('model_reasoning_effort="high"');
+    expect(overrides).toContain('model_reasoning_effort="xhigh"');
   });
 
   it('test_stickyConfig_model_overrides_default_and_env', () => {

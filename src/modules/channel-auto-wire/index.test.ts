@@ -51,6 +51,7 @@ function makeAgentGroup(id: string, folder: string, name: string): AgentGroup {
 const ENV_FOLDER_KEY = 'NANOCLAW_DEFAULT_AGENT_GROUP_SLACK_ILLYSIUM';
 const ENV_MODE_KEY = 'NANOCLAW_DEFAULT_SESSION_MODE_SLACK_ILLYSIUM';
 const ENV_POLICY_KEY = 'NANOCLAW_DEFAULT_SENDER_POLICY_SLACK_ILLYSIUM';
+const ENV_IGNORED_KEY = 'NANOCLAW_DEFAULT_IGNORED_POLICY_SLACK_ILLYSIUM';
 const ENV_DISCORD_KEY = 'NANOCLAW_DEFAULT_AGENT_GROUP_DISCORD';
 
 let saved: Record<string, string | undefined> = {};
@@ -62,11 +63,13 @@ beforeEach(() => {
     [ENV_FOLDER_KEY]: process.env[ENV_FOLDER_KEY],
     [ENV_MODE_KEY]: process.env[ENV_MODE_KEY],
     [ENV_POLICY_KEY]: process.env[ENV_POLICY_KEY],
+    [ENV_IGNORED_KEY]: process.env[ENV_IGNORED_KEY],
     [ENV_DISCORD_KEY]: process.env[ENV_DISCORD_KEY],
   };
   delete process.env[ENV_FOLDER_KEY];
   delete process.env[ENV_MODE_KEY];
   delete process.env[ENV_POLICY_KEY];
+  delete process.env[ENV_IGNORED_KEY];
   delete process.env[ENV_DISCORD_KEY];
 });
 
@@ -127,6 +130,35 @@ describe('channel-auto-wire resolver', () => {
     const result = resolver(makeEvent('slack-illysium', 'slack:C4'), mg);
 
     expect(result[0].session_mode).toBe('shared');
+  });
+
+  it('defaults ignored_message_policy to accumulate when not configured', () => {
+    const ag = makeAgentGroup('ag-auto', 'illysium-v2', 'illie');
+    createAgentGroup(ag);
+    process.env[ENV_FOLDER_KEY] = 'illysium-v2';
+
+    const mg = makeMg('mg-ignored-1', 'slack-illysium', 'slack:CI1');
+    createMessagingGroup(mg);
+    const result = resolver(makeEvent('slack-illysium', 'slack:CI1'), mg);
+
+    expect(result[0].ignored_message_policy).toBe('accumulate');
+    const persisted = getMessagingGroupAgents('mg-ignored-1');
+    expect(persisted[0].ignored_message_policy).toBe('accumulate');
+  });
+
+  it('honors an explicit ignored_message_policy override', () => {
+    const ag = makeAgentGroup('ag-auto', 'illysium-v2', 'illie');
+    createAgentGroup(ag);
+    process.env[ENV_FOLDER_KEY] = 'illysium-v2';
+    process.env[ENV_IGNORED_KEY] = 'drop';
+
+    const mg = makeMg('mg-ignored-2', 'slack-illysium', 'slack:CI2');
+    createMessagingGroup(mg);
+    const result = resolver(makeEvent('slack-illysium', 'slack:CI2'), mg);
+
+    expect(result[0].ignored_message_policy).toBe('drop');
+    const persisted = getMessagingGroupAgents('mg-ignored-2');
+    expect(persisted[0].ignored_message_policy).toBe('drop');
   });
 
   it('falls back to per-thread when session_mode is invalid', () => {

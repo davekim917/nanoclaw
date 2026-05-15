@@ -32,23 +32,96 @@ import {
   spawnCodexAppServer,
   startCodexTurn,
   startOrResumeCodexThread,
+  steerCodexTurn,
+  writeCodexHooksJson,
   writeCodexMcpConfigToml,
 } from './codex-app-server.js';
 
 /** Hard ceiling for a single turn. Guards against app-server wedging. */
 const TURN_TIMEOUT_MS = 5 * 60 * 1000;
 
+/**
+ * Lookup tables for translating Codex's `collabAgentToolCall` tool names
+ * into human-readable progress labels. See the schema
+ * `definitions/CollabAgentTool` in `codex_app_server_protocol.schemas.json`.
+ */
+const COLLAB_TOOL_EMOJI: Record<string, string> = {
+  spawnAgent: '🌱',
+  sendInput: '📨',
+  resumeAgent: '▶️',
+  wait: '⏳',
+  closeAgent: '🛑',
+};
+const COLLAB_TOOL_VERB: Record<string, string> = {
+  spawnAgent: 'spawned',
+  sendInput: 'sent input to',
+  resumeAgent: 'resumed',
+  wait: 'waiting on',
+  closeAgent: 'closed',
+};
+
+// Thinking-label helpers — mirror the Claude provider's truncate /
+// formatBlockquoteLabel / NANOCLAW_HIDE_THINKING semantics so Codex
+// reasoning surfaces with the same 💭 blockquote affordance.
+const LABEL_MAX = 2000;
+
+function truncate(s: string): string {
+  const trimmed = s.trim();
+  if (trimmed.length <= LABEL_MAX) return trimmed;
+  return trimmed.slice(0, LABEL_MAX - 1).replace(/\s+\S*$/, '') + '…';
+}
+
+function formatBlockquoteLabel(emoji: string, prose: string): string {
+  const lines = prose.split('\n');
+  lines[0] = `${emoji} ${lines[0]}`;
+  return lines.map((line) => `> ${line}`).join('\n');
+}
+
+function thinkingForwardingEnabled(): boolean {
+  const v = process.env.NANOCLAW_HIDE_THINKING;
+  return !v || v === '0' || v.toLowerCase() === 'false';
+}
+
+type ReasoningThreadItem = {
+  id?: string;
+  type?: string;
+  summary?: unknown;
+  content?: unknown;
+};
+
+function joinStringArray(value: unknown): string {
+  if (!Array.isArray(value)) return '';
+  return value.filter((part): part is string => typeof part === 'string' && part.trim().length > 0).join('\n\n');
+}
+
+function extractReasoningItemText(item: ReasoningThreadItem | undefined): string | null {
+  if (item?.type !== 'reasoning') return null;
+  // ThreadItem reasoning payloads carry summary/content as string arrays.
+  // Prefer summaries because those are the user-facing reasoning surface;
+  // content is only a fallback for app-server builds that finalize raw text.
+  const summary = joinStringArray(item.summary);
+  if (summary) return summary;
+  const content = joinStringArray(item.content);
+  return content || null;
+}
+
 // ── Provider config schema ──────────────────────────────────────────────────
 // Mirrors the `claudeConfigSchema` pattern but with Codex-native vocabulary:
-// `reasoning_effort` instead of Claude's `effort`, and a 3-value enum
-// (low | medium | high) — Codex has no `'xhigh'` or `'max'` tier.
+// `reasoning_effort` instead of Claude's `effort`. Enum mirrors the
+// `ReasoningEffort` definition exposed by `codex app-server generate-json-schema`
+// (none | minimal | low | medium | high | xhigh) — gpt-5.2-codex and gpt-5.5
+// both support xhigh per OpenAI's model docs.
+//
+// Default is `xhigh` for the production model (gpt-5.5); operators can dial
+// down per-agent via container.json when cost/latency matters more than
+// reasoning depth.
 //
 // Sticky-only: `model` and `reasoning_effort` are applied at thread-start /
 // codex-spawn time and persist for the session. Per-turn overrides for these
 // fields are not currently exposed by Codex's `thread/start` shape.
 export const codexConfigSchema = z.strictObject({
   model: z.string().min(1).optional(),
-  reasoning_effort: z.enum(['low', 'medium', 'high']).optional().default('high'),
+  reasoning_effort: z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh']).optional().default('xhigh'),
 });
 
 registerProviderConfigSchema('codex', codexConfigSchema);
@@ -159,6 +232,15 @@ export class CodexProvider implements AgentProvider {
       waiting?.();
     };
 
+    // Mid-turn input plumbing: when the agent is mid-turn we steer the
+    // active turn instead of queueing the message. `runOneTurn` updates
+    // `currentTurnId` on turn/started + clears it on turn/completed.
+    const turnTracker: { server: AppServer | null; threadId: string | null; currentTurnId: string | null } = {
+      server: null,
+      threadId: null,
+      currentTurnId: null,
+    };
+
     pending.push(input.prompt);
 
     const self = this;
@@ -168,7 +250,9 @@ export class CodexProvider implements AgentProvider {
       // query active per batch of pending messages and ends it on idle, so
       // spawn-per-query matches that cadence naturally.
       writeCodexMcpConfigToml(self.mcpServers);
+      writeCodexHooksJson();
       const server = spawnCodexAppServer(createCodexConfigOverrides(self.stickyConfig));
+      turnTracker.server = server;
       attachCodexAutoApproval(server);
 
       let threadId: string | undefined = input.continuation;
@@ -187,6 +271,7 @@ export class CodexProvider implements AgentProvider {
         };
 
         threadId = await startOrResumeCodexThread(server, threadId, threadParams);
+        turnTracker.threadId = threadId ?? null;
 
         while (!aborted) {
           while (pending.length === 0 && !ended && !aborted) {
@@ -214,15 +299,35 @@ export class CodexProvider implements AgentProvider {
             () => {
               initYielded = true;
             },
+            turnTracker,
           );
         }
       } finally {
+        turnTracker.server = null;
+        turnTracker.threadId = null;
+        turnTracker.currentTurnId = null;
         killCodexAppServer(server);
       }
     }
 
     return {
       push: (message: string) => {
+        // If a turn is in flight, steer it instead of queueing — the agent's
+        // response can then reference the late-arriving content. Falls back
+        // to queueing on RPC error (e.g. the turn just ended between our
+        // check and the call) and on missing handles.
+        if (turnTracker.server && turnTracker.threadId && turnTracker.currentTurnId) {
+          const expectedTurnId = turnTracker.currentTurnId;
+          void steerCodexTurn(turnTracker.server, {
+            threadId: turnTracker.threadId,
+            expectedTurnId,
+            inputText: message,
+          }).catch(() => {
+            pending.push(message);
+            kick();
+          });
+          return;
+        }
         pending.push(message);
         kick();
       },
@@ -252,12 +357,20 @@ async function* runOneTurn(
   cwd: string,
   hasInit: () => boolean,
   markInit: () => void,
+  turnTracker?: { currentTurnId: string | null },
 ): AsyncGenerator<ProviderEvent> {
   // Mutable refs via object properties — TS can't track closure assignments
   // for narrowing, but property access keeps the declared type visible.
   const turnState: { error: Error | null } = { error: null };
   let resultText = '';
   let turnDone = false;
+  // Codex can deliver reasoning two ways: streaming item/reasoning/* deltas
+  // when enabled by the app-server, or finalized reasoning ThreadItems via
+  // item/completed. Streamed item IDs are tracked so lifecycle fallback
+  // payloads do not duplicate already-forwarded summaries.
+  let reasoningBuffer = '';
+  const reasoningItemsWithDeltas = new Set<string>();
+  const emittedReasoningItemIds = new Set<string>();
 
   // Buffered event queue so we can `yield` across the async notification
   // callback. Each notification pushes zero or more ProviderEvents; the
@@ -267,6 +380,26 @@ async function* runOneTurn(
   const kick = (): void => {
     waker?.();
     waker = null;
+  };
+
+  const flushReasoning = (): void => {
+    if (!reasoningBuffer.trim()) {
+      reasoningBuffer = '';
+      return;
+    }
+    buffer.push({ type: 'progress', message: formatBlockquoteLabel('💭', truncate(reasoningBuffer)) });
+    reasoningBuffer = '';
+  };
+
+  const emitCompletedReasoningItem = (item: ReasoningThreadItem | undefined): void => {
+    const text = extractReasoningItemText(item);
+    if (!text || !thinkingForwardingEnabled()) return;
+
+    const itemId = typeof item?.id === 'string' ? item.id : undefined;
+    if (itemId && (reasoningItemsWithDeltas.has(itemId) || emittedReasoningItemIds.has(itemId))) return;
+
+    buffer.push({ type: 'progress', message: formatBlockquoteLabel('💭', truncate(text)) });
+    if (itemId) emittedReasoningItemIds.add(itemId);
   };
 
   const handler = (n: JsonRpcNotification): void => {
@@ -287,22 +420,80 @@ async function* runOneTurn(
         }
         break;
       }
+      case 'turn/started': {
+        const tid = (params as { turnId?: string }).turnId
+          ?? ((params as { turn?: { id?: string } }).turn?.id);
+        if (turnTracker && typeof tid === 'string') turnTracker.currentTurnId = tid;
+        break;
+      }
       case 'item/agentMessage/delta': {
         const delta = params.delta as string;
         if (delta) resultText += delta;
         break;
       }
+      case 'item/started': {
+        // Surface subagent activity (spawn/wait/close) as progress events
+        // so the dashboard + Slack status messages show the same kind of
+        // signal Claude sessions emit via parent_tool_use_id rendering.
+        // Codex shape (per codex_app_server_protocol schema):
+        //   { type: 'collabAgentToolCall', tool: <spawnAgent|sendInput|
+        //     resumeAgent|wait|closeAgent>, senderThreadId, receiverThreadIds }
+        const item = params.item as
+          | {
+              type?: string;
+              tool?: 'spawnAgent' | 'sendInput' | 'resumeAgent' | 'wait' | 'closeAgent';
+              receiverThreadIds?: string[];
+            }
+          | undefined;
+        if (item?.type === 'collabAgentToolCall' && item.tool) {
+          const emoji = COLLAB_TOOL_EMOJI[item.tool] ?? '🔧';
+          const verb = COLLAB_TOOL_VERB[item.tool] ?? item.tool;
+          const recv = item.receiverThreadIds?.length
+            ? ` (${item.receiverThreadIds.length} agent${item.receiverThreadIds.length === 1 ? '' : 's'})`
+            : '';
+          buffer.push({ type: 'progress', message: `${emoji} subagent: ${verb}${recv}` });
+        }
+        break;
+      }
       case 'item/completed': {
-        const item = params.item as { type?: string; text?: string } | undefined;
+        const item = params.item as ({ type?: string; text?: string } & ReasoningThreadItem) | undefined;
         if (item?.type === 'agentMessage' && item.text) resultText = item.text;
+        if (item?.type === 'reasoning') emitCompletedReasoningItem(item);
+        break;
+      }
+      case 'item/reasoning/summaryTextDelta':
+      case 'item/reasoning/textDelta': {
+        // Codex emits one of these (per `show_raw_agent_reasoning` config —
+        // default false → summary deltas). Accumulate until a section
+        // break or turn end flushes as a 💭 thinking label, mirroring
+        // Claude's thinking-block UX. Suppressed when NANOCLAW_HIDE_THINKING=1.
+        const itemId = (params as { itemId?: unknown }).itemId;
+        if (typeof itemId === 'string') {
+          reasoningItemsWithDeltas.add(itemId);
+          if (emittedReasoningItemIds.has(itemId)) break;
+        }
+        const delta = params.delta as string;
+        if (delta && thinkingForwardingEnabled()) reasoningBuffer += delta;
+        break;
+      }
+      case 'item/reasoning/summaryPartAdded': {
+        const itemId = (params as { itemId?: unknown }).itemId;
+        if (typeof itemId === 'string') reasoningItemsWithDeltas.add(itemId);
+        // Codex finalized a reasoning summary section. Emit whatever we
+        // accumulated so the user sees thinking updates as they happen,
+        // not just one giant label at turn end.
+        flushReasoning();
         break;
       }
       case 'turn/completed':
+        flushReasoning();
+        if (turnTracker) turnTracker.currentTurnId = null;
         turnDone = true;
         break;
       case 'turn/failed': {
         const e = params.error as { message?: string } | undefined;
         turnState.error = new Error(e?.message || 'Turn failed');
+        if (turnTracker) turnTracker.currentTurnId = null;
         turnDone = true;
         break;
       }
@@ -312,6 +503,15 @@ async function* runOneTurn(
         // others emit a structured object (e.g. { state: 'thinking',
         // detail: '...' }). Extract the most useful human-readable label;
         // never let template coercion produce "[object Object]".
+        //
+        // Drop the trivial "active" / "idle" labels — they fire on every
+        // turn-state flip, so the chat-side status message (which the host
+        // delivers as edit-in-place) ends up overwriting the 💭 thinking
+        // labels emitted from item/reasoning/* with "status: active". The
+        // Claude provider hit the analogous problem with tool_use labels
+        // overwriting thinking and resolved it the same way (claude.ts:54).
+        // Anything more semantic that codex might emit (compacting,
+        // loading skills, etc.) still gets forwarded.
         const raw = params.status;
         let label: string | null = null;
         if (typeof raw === 'string') {
@@ -322,7 +522,9 @@ async function* runOneTurn(
             obj.label ?? obj.state ?? obj.status ?? obj.kind ?? obj.type ?? obj.message ?? obj.text;
           label = typeof candidate === 'string' ? candidate : JSON.stringify(raw);
         }
-        if (label) buffer.push({ type: 'progress', message: `status: ${label}` });
+        if (label && label !== 'active' && label !== 'idle') {
+          buffer.push({ type: 'progress', message: `status: ${label}` });
+        }
         break;
       }
       default:

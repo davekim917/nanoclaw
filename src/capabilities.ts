@@ -493,6 +493,23 @@ function buildSessionServicesSnapshot(agentGroupId: string): SessionServicesSnap
     });
   }
 
+  // Datafold — gated by tool entry. Container-runner injects the official
+  // Datafold HTTP MCP through a stdio bridge when 'datafold' is in
+  // container.json.tools. OneCLI gateway overwrites the placeholder
+  // `Authorization: Key ...` header at request time; the raw Datafold API key
+  // is never placed in container.json or process env.
+  if (declared(['datafold'])) {
+    services.push({
+      name: 'Datafold',
+      mcpNamespace: 'mcp__datafold__*',
+      declaredTools: declaredMatchingTools(['datafold']),
+      scopes: [],
+      credentialPaths: [],
+      useFor:
+        'Official Datafold MCP at https://app.datafold.com/mcp/ via local stdio bridge. Auth pre-injected as `Authorization: Key ...`. Use for listing Datafold data sources, running queries against configured data sources, and managing Data Diff workflows. Tools appear under `mcp__datafold__*` after a fresh container wake.',
+    });
+  }
+
   // Atlassian via sooperset/mcp-atlassian (stdio Python MCP, ~72 tools).
   // Gated by tool entry. Hits the direct Atlassian REST API at
   // <site>.atlassian.net — NOT Rovo MCP, which requires an org admin to

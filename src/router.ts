@@ -273,6 +273,43 @@ function safeParseContent(raw: string): { text?: string; sender?: string; sender
   }
 }
 
+function isSlackChannelType(channelType: string): boolean {
+  return channelType === 'slack' || channelType.startsWith('slack-');
+}
+
+/**
+ * Slack DM thread-on-first-reply.
+ *
+ * @chat-adapter/slack represents a root DM with no thread_ts as
+ * `slack:<D-channel>:`. The chat-sdk bridge has a Slack-only normalizer for
+ * bare `adapter.name === 'slack'`, but this fork intentionally renames
+ * multi-workspace Slack adapters to `slack-<workspace>` so dedupe keys don't
+ * collide. There is no slack.ts config knob for "use event.ts as thread_ts".
+ *
+ * Do the minimum router-level synthesis for per-thread Slack DMs: convert a
+ * root DM address into Slack's encoded thread id `slack:<D-channel>:<event.ts>`.
+ * That gives each top-level DM message its own session and makes outbound
+ * replies post under the user's message. The scope is deliberately Slack-only;
+ * other threaded adapters keep their adapter-provided thread id unchanged.
+ */
+function effectiveThreadIdForAgent(
+  event: InboundEvent,
+  adapterSupportsThreads: boolean,
+  sessionMode: MessagingGroupAgent['session_mode'],
+): string | null {
+  if (!adapterSupportsThreads || sessionMode !== 'per-thread' || event.isDM !== true) {
+    return event.threadId;
+  }
+  if (!isSlackChannelType(event.channelType) || !event.platformId.startsWith('slack:')) {
+    return event.threadId;
+  }
+  if (!event.message.id) return event.threadId;
+
+  const rootDmThreadIds = new Set<string | null>([null, '', event.platformId, `${event.platformId}:`]);
+  if (!rootDmThreadIds.has(event.threadId)) return event.threadId;
+  return `${event.platformId}:${event.message.id}`;
+}
+
 /**
  * Route an inbound message from a channel adapter to the correct session.
  * Creates messaging group + session if they don't exist yet.
@@ -648,6 +685,23 @@ function evaluateEngage(
     }
     case 'mention':
       return isMention;
+    case 'mention-pattern': {
+      // Hybrid: requires both a platform @-mention AND a text-pattern match.
+      // Use when two sibling agents share one bot user (e.g. illie + illie-codex
+      // on the same Slack app) and a keyword in the message text decides
+      // which sibling fires. Without isMention, random chatter mentioning
+      // the keyword would wake the bot; without the pattern, both siblings
+      // would fire on every @-mention.
+      if (!isMention) return false;
+      const pat = agent.engage_pattern ?? '.';
+      if (pat === '.') return true;
+      try {
+        return new RegExp(pat).test(text);
+      } catch {
+        // Bad regex: fail open so admin sees the agent responding + can fix.
+        return true;
+      }
+    }
     case 'mention-sticky': {
       if (isMention) return true;
       if (mg.is_group === 0) return false; // DMs never use mention-sticky sensibly
@@ -678,14 +732,17 @@ async function deliverToAgent(
 ): Promise<void> {
   // Apply the adapter thread policy: threaded adapter in a group chat →
   // per-thread session regardless of wiring. agent-shared preserved (it's
-  // a cross-channel directive the adapter doesn't know about). DMs collapse
-  // sub-threads to one session (is_group=0 short-circuit).
+  // a cross-channel directive the adapter doesn't know about). DMs preserve
+  // the wiring's session mode; root Slack DMs may synthesize a thread id
+  // below when the wiring is per-thread.
   let effectiveSessionMode = agent.session_mode;
   if (adapterSupportsThreads && effectiveSessionMode !== 'agent-shared' && mg.is_group !== 0) {
     effectiveSessionMode = 'per-thread';
   }
 
-  const { session, created } = resolveSession(agent.agent_group_id, mg.id, event.threadId, effectiveSessionMode);
+  const effectiveThreadId = effectiveThreadIdForAgent(event, adapterSupportsThreads, effectiveSessionMode);
+
+  const { session, created } = resolveSession(agent.agent_group_id, mg.id, effectiveThreadId, effectiveSessionMode);
 
   // v1 behavior: a follow-up message to a session with a pending
   // bash/destructive gate implicitly rejects the gate so the agent's
@@ -703,7 +760,7 @@ async function deliverToAgent(
   // the why and the platform-gating (Discord only).
   if (created) {
     const firstText = parsedContent.text ?? '';
-    if (firstText) maybeRenameNewThread(event.channelType, event.threadId, firstText);
+    if (firstText) maybeRenameNewThread(event.channelType, effectiveThreadId, firstText);
   }
 
   // Persist any base64-encoded attachments from chat-sdk-bridge onto the
@@ -723,7 +780,7 @@ async function deliverToAgent(
   const deliveryAddr = event.replyTo ?? {
     channelType: event.channelType,
     platformId: event.platformId,
-    threadId: event.threadId,
+    threadId: effectiveThreadId,
   };
 
   // Command gate: classify slash commands before they reach the container.
@@ -791,12 +848,12 @@ async function deliverToAgent(
   if (
     wake &&
     adapterSupportsThreads &&
-    event.threadId !== null &&
+    effectiveThreadId !== null &&
     adapter?.fetchThreadHistory &&
     (event.message.kind === 'chat' || event.message.kind === 'chat-sdk')
   ) {
     try {
-      const history = await adapter.fetchThreadHistory(event.threadId, {
+      const history = await adapter.fetchThreadHistory(effectiveThreadId, {
         limit: 50,
         excludeMessageId: event.message.id,
       });
@@ -831,7 +888,7 @@ async function deliverToAgent(
   // Start typing indicator before writeSessionMessage so recall injection
   // latency doesn't delay visible feedback on chat/chat-sdk paths.
   if (wake && (event.message.kind === 'chat' || event.message.kind === 'chat-sdk')) {
-    startTypingRefresh(session.id, session.agent_group_id, event.channelType, event.platformId, event.threadId);
+    startTypingRefresh(session.id, session.agent_group_id, event.channelType, event.platformId, effectiveThreadId);
   }
 
   await writeSessionMessage(session.agent_group_id, session.id, {
@@ -857,7 +914,7 @@ async function deliverToAgent(
         channelType: event.channelType,
         channelName: mg.name ?? null,
         platformId: event.platformId,
-        threadId: event.threadId,
+        threadId: effectiveThreadId,
         role: 'user',
         senderId: userId,
         senderName: parsedContent.sender ?? null,
@@ -886,7 +943,7 @@ async function deliverToAgent(
   if (wake) {
     // For non-chat kinds, typing indicator fires here (after write) as before.
     if (event.message.kind !== 'chat' && event.message.kind !== 'chat-sdk') {
-      startTypingRefresh(session.id, session.agent_group_id, event.channelType, event.platformId, event.threadId);
+      startTypingRefresh(session.id, session.agent_group_id, event.channelType, event.platformId, effectiveThreadId);
     }
     const freshSession = getSession(session.id);
     if (freshSession) {

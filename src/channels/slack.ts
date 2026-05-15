@@ -13,8 +13,10 @@
  *   SLACK_SIGNING_SECRET_<SUFFIX>=…
  *
  * Each workspace is a separate Slack app (created per-workspace at
- * api.slack.com/apps, "Not distributed"). Suffix is any [A-Za-z0-9]+ and
- * is lowercased for the channelType.
+ * api.slack.com/apps, "Not distributed"). Suffix is any [A-Za-z0-9_]+
+ * (alphanumerics + underscore — matches the convention used by other
+ * scoped env vars in this fork like GITHUB_TOKEN_MADISON_REED) and is
+ * lowercased for the channelType.
  *
  * This file is re-applied on top of the upstream /add-slack output so
  * `/add-slack` remains an idempotent install that preserves the
@@ -41,15 +43,22 @@ export interface SlackWorkspace {
 /**
  * Pure helper — parse workspace configs from an env key/value map.
  * Exported for testing.
+ *
+ * Suffix-to-channelType derivation: lowercase, then map `_` → `-`. This
+ * keeps env-var names readable when an underscore appears (e.g.
+ * SLACK_BOT_TOKEN_ILLYSIUM_CODEX) while producing a channelType that
+ * matches the existing dash-separated convention (slack-illysium-codex).
+ * The reverse direction at channel-auto-wire/index.ts:67 already maps
+ * `-` → `_` when building env-var lookups, so the round-trip is stable.
  */
 export function parseSlackWorkspaces(env: Record<string, string>): SlackWorkspace[] {
   const bySuffix = new Map<string, { botToken?: string; signingSecret?: string }>();
 
   for (const [key, value] of Object.entries(env)) {
-    const m = key.match(/^SLACK_(BOT_TOKEN|SIGNING_SECRET)(?:_([A-Za-z0-9]+))?$/);
+    const m = key.match(/^SLACK_(BOT_TOKEN|SIGNING_SECRET)(?:_([A-Za-z0-9_]+))?$/);
     if (!m) continue;
     const [, kind, rawSuffix] = m;
-    const suffix = rawSuffix ? rawSuffix.toLowerCase() : '';
+    const suffix = rawSuffix ? rawSuffix.toLowerCase().replace(/_/g, '-') : '';
     const entry = bySuffix.get(suffix) ?? {};
     if (kind === 'BOT_TOKEN') entry.botToken = value;
     else entry.signingSecret = value;
@@ -129,7 +138,11 @@ export async function slackCreateThread(
   return { threadId: parentMessageId, messageId: reply.ts as string };
 }
 
-const workspaces = parseSlackWorkspaces(readEnvFileMatching(/^SLACK_(BOT_TOKEN|SIGNING_SECRET)(_[A-Za-z0-9]+)?$/));
+// Keep the pre-filter regex in sync with the suffix regex inside
+// parseSlackWorkspaces — both must allow `_` in the suffix, otherwise
+// env vars like SLACK_BOT_TOKEN_ILLYSIUM_CODEX get dropped here before
+// they ever reach the parser.
+const workspaces = parseSlackWorkspaces(readEnvFileMatching(/^SLACK_(BOT_TOKEN|SIGNING_SECRET)(_[A-Za-z0-9_]+)?$/));
 
 for (const ws of workspaces) {
   registerChannelAdapter(ws.channelType, {
@@ -138,6 +151,20 @@ for (const ws of workspaces) {
         botToken: ws.botToken,
         signingSecret: ws.signingSecret,
       });
+      // Multi-workspace dedup isolation. The @chat library's message dedup
+      // key is `dedupe:${adapter.name}:${message.id}`. SlackAdapter defaults
+      // `name = "slack"` for all instances; combined with a shared SqliteState
+      // adapter (state-sqlite.ts uses getDb()), two slack adapters processing
+      // the same Slack event (same `ts`) collide on the dedup key and the
+      // second one silently drops the message. This bites the two-bots-in-
+      // same-workspace case (e.g. illie + illie-codex both seeing user
+      // messages in #agents-xzo). Across-workspace it doesn't bite because
+      // each Slack workspace's `ts` values are disjoint.
+      //
+      // Override the adapter name to the channelType so each workspace has
+      // its own dedup keyspace. The name also keys `chat.webhooks[...]` so
+      // the webhook-server lookup matches.
+      (slackAdapter as unknown as { name: string }).name = ws.channelType;
       const client = new WebClient(ws.botToken);
       const bridge = createChatSdkBridge({
         adapter: slackAdapter,

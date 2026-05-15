@@ -31,6 +31,7 @@ import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContaine
 import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
+import { getMessagingGroup } from './db/messaging-groups.js';
 import { findSessionByAgentGroupAndMessagingGroup } from './db/sessions.js';
 import { buildArchiveProjection, buildCentralProjection } from './db/per-agent-projections.js';
 import { initGroupFilesystem } from './group-init.js';
@@ -54,6 +55,7 @@ import {
   markContainerRunning,
   markContainerStopped,
   sessionDir,
+  threadWorktreeDir,
   writeSessionRouting,
 } from './session-manager.js';
 import type { AgentGroup, Session } from './types.js';
@@ -412,6 +414,30 @@ export function resolveAnthropicAuth(folder: string, env: NodeJS.ProcessEnv = pr
 }
 
 /**
+ * Resolve the host-side `.codex/` directory to mount for a given agent
+ * group's container. Mirrors the per-group OAuth pattern from
+ * `resolveAnthropicAuth` but for Codex, which stores credentials as an
+ * `auth.json` file rather than env-var tokens.
+ *
+ * Convention: a per-group dir at `~/.codex-<folder>/` (with a real
+ * `auth.json`) wins over the global `~/.codex/`. Operators create it by
+ * running `CODEX_HOME=~/.codex-<folder> codex login` once, which logs the
+ * user into a SEPARATE ChatGPT/OpenAI account and writes that account's
+ * tokens to the scoped dir.
+ *
+ * Falls back to the global `~/.codex/` when no per-group dir exists, so
+ * existing single-account installs keep working unchanged.
+ *
+ * Exported for unit testing — keeps the resolver pure (no side effects)
+ * and lets test fixtures stand in for a real homedir.
+ */
+export function resolveCodexAuthDir(folder: string, homedir: string = os.homedir()): string {
+  const scoped = path.join(homedir, `.codex-${folder}`);
+  if (fs.existsSync(path.join(scoped, 'auth.json'))) return scoped;
+  return path.join(homedir, '.codex');
+}
+
+/**
  * Sentinel value injected by `onecli run --` as the host service's
  * CLAUDE_CODE_OAUTH_TOKEN. The wrapper's own proxy substitutes it for a
  * real vault token at request time — but the literal string is never a
@@ -576,6 +602,14 @@ const SCOPED_CREDENTIAL_VARS = [
   'DBT_DEV_ENV_ID',
   'DBT_USER_ID',
   'DBT_MCP_DISABLE_TOOLS',
+  // Looker API3 credentials — agent shell needs these to do the /login
+  // dance (POST /api/4.0/login → access_token) for direct REST calls.
+  // Previously only flowed to the looker MCP subprocess; this exposes
+  // them to the container's main env in parallel so curl/scripts can
+  // authenticate without going through the MCP tool surface.
+  'LOOKER_BASE_URL',
+  'LOOKER_CLIENT_ID',
+  'LOOKER_CLIENT_SECRET',
   'OPENAI_API_KEY',
   'BRAINTRUST_API_KEY',
   'EXA_API_KEY',
@@ -691,6 +725,36 @@ function buildMounts(
     mounts.push({ hostPath: inboundDbFile, containerPath: '/workspace/inbound.db', readonly: true });
   }
 
+  // Thread-scoped worktrees: shared bind-mount across all sibling agents
+  // (Claude + Codex) in the same thread, so collaborative code edits land
+  // in one repo checkout regardless of which agent ran them. The session
+  // dir mount above provides `/workspace/worktrees` by default; this layered
+  // mount overrides it with the thread-keyed path. Docker applies mounts
+  // in declaration order — inner overrides outer for the subpath.
+  //
+  // The thread key collapses to `<mg>:msg-<first-msg-id>` when threadId is
+  // null (DM channels) so every conversation still gets a deterministic
+  // worktree identity rather than sharing one global `<mg>:none` dir.
+  //
+  // Gated on NANOCLAW_THREAD_WORKTREES=1 for backward-compat: existing
+  // single-agent deployments keep their session-scoped worktrees and don't
+  // lose access on container restart after this deploy. Set the env var to
+  // opt in (required for sibling-agent collaboration to share code state).
+  if (session.messaging_group_id && process.env.NANOCLAW_THREAD_WORKTREES === '1') {
+    // Two-bot sibling design: illie (slack-illysium) and illie-codex
+    // (slack-illiecodex) each have their own MG row in this channel,
+    // but they share the same platform_id (the Slack channel id) and the
+    // same thread_id from chat-sdk-bridge. Keying threadWorktreeDir on
+    // platform_id + thread_id resolves both bots to the same worktree dir,
+    // so collaborative code edits in a thread are visible across siblings.
+    const mg = getMessagingGroup(session.messaging_group_id);
+    if (mg) {
+      const tDir = threadWorktreeDir(mg.platform_id, session.thread_id);
+      fs.mkdirSync(tDir, { recursive: true });
+      mounts.push({ hostPath: tDir, containerPath: '/workspace/worktrees', readonly: false });
+    }
+  }
+
   // Channel-root inbound.db at /workspace/channel-inbound.db (read-only).
   // Scheduled tasks live in the channel-root session for this (agent, MG)
   // pair, not in the calling thread's session. The container's `list_tasks`
@@ -717,6 +781,32 @@ function buildMounts(
 
   // Agent group folder at /workspace/agent (RW for working files + CLAUDE.local.md)
   mounts.push({ hostPath: groupDir, containerPath: '/workspace/agent', readonly: false });
+
+  // Sibling-group symlink overlay. clone-as-codex creates relative symlinks
+  // (e.g. groups/illie-codex/XZO -> ../illie/XZO) so two siblings share the
+  // same source repos / sources / conversations on the host. Inside the
+  // container, those symlinks would dereference to /workspace/illie/XZO,
+  // which isn't mounted — so create_worktree, conversations reads, mnemon
+  // source-ingest all fail with ENOENT. Overlay each host-resolvable
+  // symlink with a bind mount at the same container path so the entry
+  // appears as a real directory inside the container, transparently
+  // pointing at the source group's files.
+  //
+  // Absolute symlinks whose targets only exist inside the container (e.g.
+  // .claude-shared.md -> /app/CLAUDE.md) are skipped: realpathSync fails
+  // on the host because /app doesn't exist there, and the existing /app
+  // mount makes the symlink work inside the container anyway.
+  for (const entry of fs.readdirSync(groupDir, { withFileTypes: true })) {
+    if (!entry.isSymbolicLink()) continue;
+    const linkPath = path.join(groupDir, entry.name);
+    let realTarget: string;
+    try {
+      realTarget = fs.realpathSync(linkPath);
+    } catch {
+      continue;
+    }
+    mounts.push({ hostPath: realTarget, containerPath: `/workspace/agent/${entry.name}`, readonly: false });
+  }
 
   // container.json — nested RO mount on top of RW group dir so the agent
   // can read its config but cannot modify it.
@@ -881,7 +971,16 @@ function buildMounts(
     if (containerConfig.codexHostAuth === true && !excluded.has('codex') && entries.includes('codex')) {
       const providerHasCodexMount = providerContribution.mounts?.some((m) => m.containerPath === '/home/node/.codex');
       if (!providerHasCodexMount) {
-        const hostCodex = path.join(os.homedir(), '.codex');
+        // Per-group resolution: ~/.codex-<folder>/ wins if it has an
+        // auth.json, otherwise fall back to the global ~/.codex/.
+        //
+        // NB: Keyed on `agentGroup.folder`, NOT `containerConfig.credentialFolder`.
+        // A codex sibling typically WANTS its own Codex account (different
+        // OpenAI/ChatGPT identity than the Claude source); credentialFolder
+        // is for env-var creds (LOOKER, DBT, GitHub tokens) which the sibling
+        // should inherit. Conflating the two would silently override the
+        // sibling's purpose-built ~/.codex-<sibling>/ dir with the source's.
+        const hostCodex = resolveCodexAuthDir(agentGroup.folder);
         if (fs.existsSync(hostCodex)) {
           mounts.push({ hostPath: hostCodex, containerPath: '/home/node/.codex', readonly: false });
         }
@@ -1517,13 +1616,25 @@ async function buildContainerArgs(
   args.push('-e', 'CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1');
   args.push('-e', 'ENABLE_TOOL_SEARCH=true');
 
+  // Credential-lookup folder. Defaults to `agent_groups.folder`; sibling
+  // groups (codex clones, etc.) can override via container.json's
+  // `credentialFolder` field to inherit the source group's scoped env vars
+  // (LOOKER_*, DBT_*, GITHUB_TOKEN_*, RENDER_PG_*, GIT_AUTHOR_*, Claude
+  // OAuth, Codex auth dir, etc.) without duplicating every var with a
+  // sibling-specific suffix.
+  //
+  // Identity-bound concerns (containerName, group dir mount, MNEMON_STORE
+  // override env-key, log fields) stay on `agentGroup.folder` so siblings
+  // remain individually addressable.
+  const credentialFolder = containerConfig.credentialFolder ?? agentGroup.folder;
+
   // Per-group Anthropic credentials. Default behaviour reads the global
   // `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` (and `_N` rotation
   // siblings); the per-group form `<BASE>_<FOLDER_UPPER>` overrides the
   // global and pins the *entire* rotation set to the workplace/account
   // tokens for this group only — preventing fallback onto a different
   // account on retryable errors.
-  const auth = resolveAnthropicAuth(agentGroup.folder);
+  const auth = resolveAnthropicAuth(credentialFolder);
 
   // Optional non-Anthropic routing: when ANTHROPIC_BASE_URL is set on the
   // host, forward it + ANTHROPIC_API_KEY + any ANTHROPIC_API_KEY_N
@@ -1566,7 +1677,7 @@ async function buildContainerArgs(
   // from container.json `githubTokenEnv`, then from
   // `GITHUB_TOKEN_<FOLDER_UPPER>`, then falls back to `GITHUB_TOKEN`.
   // OneCLI's proxy model doesn't fit git auth — we pass the real token.
-  const ghToken = resolveGitHubToken(agentGroup.folder, containerConfig);
+  const ghToken = resolveGitHubToken(credentialFolder, containerConfig);
   if (ghToken) {
     args.push('-e', `GH_TOKEN=${ghToken}`);
     args.push('-e', `GITHUB_TOKEN=${ghToken}`);
@@ -1576,7 +1687,7 @@ async function buildContainerArgs(
     // so gh's own auth store can't bypass the URL scope. Without this,
     // a container with a broad GitHub token can clone/push to any org
     // the token grants. Per-agent-group via GITHUB_ALLOWED_ORGS_<FOLDER>.
-    const ghOrgs = resolveScopedEnv('GITHUB_ALLOWED_ORGS', agentGroup.folder);
+    const ghOrgs = resolveScopedEnv('GITHUB_ALLOWED_ORGS', credentialFolder);
     if (ghOrgs) args.push('-e', `GITHUB_ALLOWED_ORGS=${ghOrgs}`);
   } else {
     log.warn('No GitHub token resolved for agent group — git push/PR will fail', {
@@ -1591,7 +1702,7 @@ async function buildContainerArgs(
   // Scoped credential env vars: each base resolves via
   // `<BASE>_<FOLDER_UPPER>` → `<BASE>` and is injected if found.
   for (const base of SCOPED_CREDENTIAL_VARS) {
-    const v = resolveScopedEnv(base, agentGroup.folder);
+    const v = resolveScopedEnv(base, credentialFolder);
     if (v) args.push('-e', `${base}=${v}`);
   }
 
@@ -1607,7 +1718,7 @@ async function buildContainerArgs(
   // (substring overlap with axie-dev). The strict prefix-anchored match
   // here, combined with the folder-name collision check at create_agent
   // time, eliminates the ambiguity.
-  const folderTok = agentGroup.folder.toUpperCase().replace(/-/g, '_');
+  const folderTok = credentialFolder.toUpperCase().replace(/-/g, '_');
   const verbatimPrefixes = ['RENDER_PG_', 'RENDER_REDIS_URL_'];
   for (const [k, v] of Object.entries(process.env)) {
     if (!v) continue;
@@ -1627,8 +1738,19 @@ async function buildContainerArgs(
   }
 
   // Memory env vars: injected only when memory is enabled for this group.
+  //
+  // MNEMON_STORE default = the agent_group id, so each group is isolated.
+  // Sibling agents that should SHARE a memory store (e.g. illie + illie-codex
+  // pointing at the same Illysium memory) override via the scoped-env
+  // convention used elsewhere for per-group settings (GIT_AUTHOR_NAME_<group>):
+  //
+  //   MNEMON_STORE_illie_codex=illie
+  //
+  // Folder name → env key: replace '-' with '_' (so illie-codex → illie_codex).
   if (containerConfig.memory?.enabled === true) {
-    args.push('-e', `MNEMON_STORE=${agentGroup.id}`);
+    const scopedKey = `MNEMON_STORE_${agentGroup.folder.replace(/-/g, '_')}`;
+    const mnemonStore = process.env[scopedKey] ?? agentGroup.id;
+    args.push('-e', `MNEMON_STORE=${mnemonStore}`);
     args.push('-e', 'MNEMON_READ_ONLY=1');
     args.push('-e', 'MNEMON_EMBED_ENDPOINT=http://host.docker.internal:11434');
     args.push('-e', 'MNEMON_EMBED_MODEL=nomic-embed-text');
@@ -1833,6 +1955,21 @@ async function buildContainerArgs(
       url: 'https://mcp.linear.app/mcp',
     };
   }
+  if (canInject('datafold') && isToolEnabled(containerConfig.tools, 'datafold')) {
+    // Official Datafold HTTP MCP. Expose it through a stdio bridge so both
+    // Claude and Codex agents get the same `mcp__datafold__*` namespace.
+    // Datafold requires `Authorization: Key <api-key>`; OneCLI overwrites
+    // the placeholder header at the proxy boundary for app.datafold.com.
+    mcpServers.datafold = {
+      type: 'stdio',
+      command: 'bun',
+      args: ['/app/src/remote-mcp-bridge.ts', 'https://app.datafold.com/mcp/'],
+      env: {
+        REMOTE_MCP_NAME: 'datafold',
+        REMOTE_MCP_AUTHORIZATION: 'Key onecli-managed',
+      },
+    };
+  }
   if (canInject('atlassian') && isToolEnabled(containerConfig.tools, 'atlassian')) {
     // sooperset/mcp-atlassian — stdio Python MCP server (72 tools across
     // Jira + Confluence). Installed via /opt/atlassian-venv in the
@@ -1873,9 +2010,9 @@ async function buildContainerArgs(
     // in the env block here because the MCP SDK's stdio transport only
     // inherits HOME/LOGNAME/PATH/SHELL/TERM/USER by default — container env
     // vars don't reach the child process unless explicitly passed.
-    const baseUrl = resolveScopedEnv('LOOKER_BASE_URL', agentGroup.folder);
-    const clientId = resolveScopedEnv('LOOKER_CLIENT_ID', agentGroup.folder);
-    const clientSecret = resolveScopedEnv('LOOKER_CLIENT_SECRET', agentGroup.folder);
+    const baseUrl = resolveScopedEnv('LOOKER_BASE_URL', credentialFolder);
+    const clientId = resolveScopedEnv('LOOKER_CLIENT_ID', credentialFolder);
+    const clientSecret = resolveScopedEnv('LOOKER_CLIENT_SECRET', credentialFolder);
     if (baseUrl && clientId && clientSecret) {
       mcpServers.looker = {
         type: 'stdio',
@@ -1885,7 +2022,7 @@ async function buildContainerArgs(
           LOOKER_BASE_URL: baseUrl,
           LOOKER_CLIENT_ID: clientId,
           LOOKER_CLIENT_SECRET: clientSecret,
-          LOOKER_VERIFY_SSL: resolveScopedEnv('LOOKER_VERIFY_SSL', agentGroup.folder) ?? 'true',
+          LOOKER_VERIFY_SSL: resolveScopedEnv('LOOKER_VERIFY_SSL', credentialFolder) ?? 'true',
         },
       };
     } else {
@@ -1903,9 +2040,9 @@ async function buildContainerArgs(
     // DBT_CLOUD_API_TOKEN_<FOLDER> as DBT_TOKEN. Read-only by default: CLI
     // and LSP toolsets disabled (no local dbt project mounted), and the three
     // mutating Admin tools disabled. Override via DBT_MCP_DISABLE_TOOLS_<FOLDER>.
-    const host = resolveScopedEnv('DBT_HOST', agentGroup.folder);
-    const token = resolveScopedEnv('DBT_CLOUD_API_TOKEN', agentGroup.folder);
-    const prodEnvId = resolveScopedEnv('DBT_PROD_ENV_ID', agentGroup.folder);
+    const host = resolveScopedEnv('DBT_HOST', credentialFolder);
+    const token = resolveScopedEnv('DBT_CLOUD_API_TOKEN', credentialFolder);
+    const prodEnvId = resolveScopedEnv('DBT_PROD_ENV_ID', credentialFolder);
     if (host && token && prodEnvId) {
       const env: Record<string, string> = {
         DBT_HOST: host,
@@ -1914,14 +2051,13 @@ async function buildContainerArgs(
         DBT_MCP_ENABLE_DBT_CLI: 'false',
         DBT_MCP_ENABLE_LSP: 'false',
         DISABLE_TOOLS:
-          resolveScopedEnv('DBT_MCP_DISABLE_TOOLS', agentGroup.folder) ??
-          'trigger_job_run,cancel_job_run,retry_job_run',
+          resolveScopedEnv('DBT_MCP_DISABLE_TOOLS', credentialFolder) ?? 'trigger_job_run,cancel_job_run,retry_job_run',
       };
-      const devEnvId = resolveScopedEnv('DBT_DEV_ENV_ID', agentGroup.folder);
+      const devEnvId = resolveScopedEnv('DBT_DEV_ENV_ID', credentialFolder);
       if (devEnvId) env.DBT_DEV_ENV_ID = devEnvId;
-      const userId = resolveScopedEnv('DBT_USER_ID', agentGroup.folder);
+      const userId = resolveScopedEnv('DBT_USER_ID', credentialFolder);
       if (userId) env.DBT_USER_ID = userId;
-      const multicell = resolveScopedEnv('DBT_MULTICELL_ACCOUNT_PREFIX', agentGroup.folder);
+      const multicell = resolveScopedEnv('DBT_MULTICELL_ACCOUNT_PREFIX', credentialFolder);
       if (multicell) env.MULTICELL_ACCOUNT_PREFIX = multicell;
       mcpServers['dbt-mcp'] = {
         type: 'stdio',

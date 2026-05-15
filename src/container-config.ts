@@ -129,6 +129,28 @@ export interface ContainerConfig {
   codexHostAuth?: boolean;
 
   /**
+   * Optional override for the folder used as the lookup key when resolving
+   * per-group credentials (LOOKER_*, DBT_*, GITHUB_TOKEN, RENDER_PG_*,
+   * GIT_AUTHOR_*, Claude OAuth, Codex auth dir, etc.) via the
+   * `<BASE>_<FOLDER_UPPER>` scoped-env convention.
+   *
+   * Default (when undefined): `agent_groups.folder` is the lookup key, so
+   * each group needs its own scoped env vars.
+   *
+   * Set when a sibling agent group should inherit another group's credentials
+   * — most commonly a Codex sibling cloned from a Claude source. Example:
+   * `groups/madison-reed-codex/container.json` sets
+   * `"credentialFolder": "madison-reed"` so bo-codex picks up
+   * `LOOKER_BASE_URL_MADISON_REED` instead of looking for the non-existent
+   * `LOOKER_BASE_URL_MADISON_REED_CODEX`.
+   *
+   * Does NOT affect identity-bound paths: container name, group dir mount,
+   * MNEMON_STORE override env-key, log fields — those stay on
+   * `agent_groups.folder`.
+   */
+  credentialFolder?: string;
+
+  /**
    * When true, sets `GITNEXUS_INJECT_AGENTS_MD=true` in the container so
    * GitNexus auto-injects AGENTS.md into repos the agent works on.
    */
@@ -171,7 +193,7 @@ export interface ContainerConfig {
    * Omit to grant every credential surface; include to filter per-tool
    * before mount. Supported tool names: gmail, gmail-readonly, calendar,
    * google-workspace, snowflake, aws, gcloud, dbt, github, render,
-   * browser-auth.
+   * browser-auth, datafold.
    */
   tools?: string[];
 
@@ -269,6 +291,7 @@ export function readContainerConfig(folder: string): ContainerConfig {
       githubTokenEnv: raw.githubTokenEnv,
       excludePlugins: raw.excludePlugins,
       codexHostAuth: raw.codexHostAuth,
+      credentialFolder: raw.credentialFolder,
       excludeMcpServers: raw.excludeMcpServers,
       gitnexusInjectAgentsMd: raw.gitnexusInjectAgentsMd,
       ollamaAdminTools: raw.ollamaAdminTools,

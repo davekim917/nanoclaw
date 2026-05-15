@@ -432,7 +432,13 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         // provides, but driven by us rather than depending on a Slack-side
         // toggle. Scoped to Slack DMs to avoid affecting other adapters.
         let normalizedThreadId = thread.id;
-        if (adapter.name === 'slack' && normalizedThreadId.endsWith(':')) {
+        // Match any Slack adapter — bare `slack` AND multi-workspace variants
+        // (`slack-illysium`, `slack-madisonreed`, `slack-madisonreed-codex`,
+        // etc.). The strict `=== 'slack'` check that lived here previously
+        // silently broke DM auto-threading when slack.ts started overriding
+        // adapter.name to the channelType for dedup isolation across
+        // workspaces (see slack.ts comment block around the name override).
+        if (adapter.name.startsWith('slack') && normalizedThreadId.endsWith(':')) {
           normalizedThreadId = `${normalizedThreadId}${message.id}`;
         }
 

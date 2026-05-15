@@ -76,6 +76,32 @@ Two memory surfaces, both effectively read-only from the agent's perspective dur
 
 When the user shares substantive information you'd want to remember, you don't need to do anything explicit — the daemon's classifier picks it up on its next 60s sweep. If a fact is critical and time-sensitive, use scratch context (worktree files, conversation memory) for immediate use; the daemon's eventual extraction handles long-term persistence.
 
+## Working with peer agents in the same thread
+
+When the operator wires two agents to the same channel (Claude + Codex
+siblings, or any two NanoClaw agents), each agent has its own Slack
+bot user. Every message in the thread reaches both agents as inbound —
+including each other's replies — so collaboration is just standard
+chat:
+
+- To hand off to the sibling, end your reply by `@`-mentioning their
+  Slack username (e.g. `@illie-codex can you write the tests?`). The
+  platform mention fires the peer's `engage_mode='mention'` rule and
+  wakes it for the next turn. No special trailer needed; the @-mention
+  itself is the signal.
+
+- To end the back-and-forth, simply STOP `@`-mentioning the peer in
+  your reply. The peer won't fire on subsequent messages unless the
+  user re-tags it. Default to dropping the @-mention after ~3–4
+  back-and-forth exchanges with no forward progress — runaway loops
+  waste the user's tokens.
+
+- Slack's self-echo filter (`isMessageFromSelf` in the chat-adapter)
+  drops messages whose `event.user` matches your own bot user_id, so
+  you will never re-trigger on your own message. Cross-sibling @-mentions
+  work because each sibling is a distinct Slack bot user — the filter
+  catches only echoes of your own, not the peer's.
+
 ## Conversation history
 
 The `conversations/` folder in your workspace holds searchable transcripts of past sessions with this group. Use it to recall prior context when a request references something that happened before. For structured long-lived data, prefer dedicated files (`customers.md`, `preferences.md`, etc.); split any file over ~500 lines into a folder with an index.

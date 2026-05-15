@@ -56,6 +56,22 @@ describe('parseSlackWorkspaces', () => {
     });
     expect(ws).toEqual([]);
   });
+
+  it('accepts underscores in the suffix and maps them to dashes in channelType', () => {
+    // Convention match in two directions:
+    //   - Env-var name: `SLACK_BOT_TOKEN_ILLYSIUM_CODEX` mirrors how other
+    //     fork-scoped env vars look (GITHUB_TOKEN_MADISON_REED).
+    //   - channelType: `slack-illysium-codex` mirrors the dash-separated
+    //     existing channelType convention (`slack-illysium`,
+    //     `slack-madisonreed`).
+    // channel-auto-wire/index.ts:67 inverse-maps `-` → `_` when building
+    // env-var lookups, so the round-trip is symmetric.
+    const ws = parseSlackWorkspaces({
+      SLACK_BOT_TOKEN_ILLYSIUM_CODEX: 'xoxb-codex',
+      SLACK_SIGNING_SECRET_ILLYSIUM_CODEX: 'sig-codex',
+    });
+    expect(ws).toEqual([{ channelType: 'slack-illysium-codex', botToken: 'xoxb-codex', signingSecret: 'sig-codex' }]);
+  });
 });
 
 describe('extractSlackChannelId', () => {

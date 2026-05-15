@@ -56,6 +56,49 @@ export function sessionDir(agentGroupId: string, sessionId: string): string {
   return path.join(sessionsBaseDir(), agentGroupId, sessionId);
 }
 
+/** Root directory for all thread-scoped worktrees. */
+export function threadsBaseDir(): string {
+  return path.join(DATA_DIR, 'v2-threads');
+}
+
+/**
+ * Sanitize a thread-id (or messaging-group-id) into a filesystem-safe slug.
+ * Slack uses `1234567890.123456` (period), Discord uses `123456789012345678`
+ * (digits), and platform-internal ids may have other separators. Keep it
+ * minimal — replace anything not [A-Za-z0-9._-] with `_`.
+ */
+function fsSlug(s: string): string {
+  return s.replace(/[^A-Za-z0-9._-]/g, '_');
+}
+
+/**
+ * Thread-scoped worktree directory. All sibling agents in the same thread
+ * (e.g. illie + illie-codex) bind-mount this same host path at
+ * `/workspace/worktrees` inside their containers so they collaborate on
+ * the same checkout.
+ *
+ * Key derivation: `<thread-id>` (preferred) or `dm-<platform-id>` fallback.
+ * Slack thread ids encode `slack:<channel>:<ts>` and Discord encodes
+ * `discord:<guild>:<channel>:<thread>` — both globally unique, including
+ * the platform prefix. So just using the thread_id alone is enough.
+ *
+ * For DM / non-threaded channels (thread_id=null), `dm-<platform_id>` keeps
+ * the dir stable per conversation. Critically, when TWO sibling agents are
+ * wired to the same channel via TWO Slack apps (`slack-illysium` +
+ * `slack-illiecodex` both seeing `slack:C0AJA89MN2E`), they share the same
+ * platform_id and therefore the same worktree path — that's what makes
+ * cross-bot collaboration work.
+ *
+ * Nested dirs (not a flat `<mg>:<thread>` key) because Docker's `-v` flag
+ * uses `:` as the field separator between source:target:options. A colon in
+ * the host path turns `-v src:dst` into a three-part `src:dst:opts` which
+ * Docker rejects with exit 125. fsSlug strips any embedded colons too.
+ */
+export function threadWorktreeDir(platformId: string, threadId: string | null): string {
+  const tid = threadId ?? `dm-${platformId}`;
+  return path.join(threadsBaseDir(), fsSlug(tid), 'worktrees');
+}
+
 /** Path to the host-owned inbound DB (messages_in + delivered). */
 export function inboundDbPath(agentGroupId: string, sessionId: string): string {
   return path.join(sessionDir(agentGroupId, sessionId), 'inbound.db');
