@@ -139,9 +139,12 @@ EOF
 By default, every codex-provider container mounts the host's primary `~/.codex/` (single OpenAI/ChatGPT account shared across groups). To run this sibling on a **different OpenAI account** — e.g., a client's MR-codex account distinct from your personal one — create a scoped `~/.codex-<sibling-folder>/` dir on the host:
 
 ```bash
-# Logs into a SEPARATE OpenAI/ChatGPT account and writes auth.json
-# to the scoped dir. Requires browser auth — run from a host terminal,
-# not from inside a container or Claude Code subshell.
+# Codex refuses to start if CODEX_HOME doesn't already exist, so create
+# the dir first. Then login launches a browser, you authenticate against
+# a SEPARATE OpenAI/ChatGPT account, and auth.json lands in the scoped
+# dir. Requires browser auth — run from a host terminal, not from inside
+# a container or Claude Code subshell.
+mkdir -p ~/.codex-${SIBLING_FOLDER}
 CODEX_HOME=~/.codex-${SIBLING_FOLDER} codex login
 ```
 
