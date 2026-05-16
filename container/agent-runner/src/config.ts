@@ -7,7 +7,7 @@
  */
 import fs from 'fs';
 
-const CONFIG_PATH = '/workspace/agent/container.json';
+const DEFAULT_CONFIG_PATH = '/workspace/agent/container.json';
 
 export interface RunnerConfig {
   provider: string;
@@ -26,20 +26,11 @@ const DEFAULT_MAX_MESSAGES = 10;
 let _config: RunnerConfig | null = null;
 
 /**
- * Load config from container.json. Called once at startup.
- * Falls back to sensible defaults for any missing field.
+ * Pure parse — exported so unit tests can verify schema mapping without
+ * touching the filesystem.
  */
-export function loadConfig(): RunnerConfig {
-  if (_config) return _config;
-
-  let raw: Record<string, unknown> = {};
-  try {
-    raw = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
-  } catch {
-    console.error(`[config] Failed to read ${CONFIG_PATH}, using defaults`);
-  }
-
-  _config = {
+export function parseRawConfig(raw: Record<string, unknown>): RunnerConfig {
+  return {
     provider: (raw.provider as string) || 'claude',
     assistantName: (raw.assistantName as string) || '',
     groupName: (raw.groupName as string) || '',
@@ -48,7 +39,23 @@ export function loadConfig(): RunnerConfig {
     mcpServers: (raw.mcpServers as RunnerConfig['mcpServers']) || {},
     providerConfig: (raw.providerConfig as Record<string, unknown>) ?? {},
   };
+}
 
+/**
+ * Load config from container.json. Called once at startup.
+ * Falls back to sensible defaults for any missing field.
+ */
+export function loadConfig(): RunnerConfig {
+  if (_config) return _config;
+
+  let raw: Record<string, unknown> = {};
+  try {
+    raw = JSON.parse(fs.readFileSync(DEFAULT_CONFIG_PATH, 'utf8'));
+  } catch {
+    console.error(`[config] Failed to read ${DEFAULT_CONFIG_PATH}, using defaults`);
+  }
+
+  _config = parseRawConfig(raw);
   return _config;
 }
 

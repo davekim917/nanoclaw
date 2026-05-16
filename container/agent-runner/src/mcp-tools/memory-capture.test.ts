@@ -1,6 +1,14 @@
-import { describe, it, expect, mock, beforeEach } from 'bun:test';
+import { describe, it, expect, mock, beforeEach, afterAll } from 'bun:test';
+import * as realFs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
+
+// Snapshot real fs BEFORE the mock.module replaces it, so afterAll can put
+// it back. Without this, the mocked writeFileSync (no-op) and existsSync
+// (always false) leak globally and clobber every later test file in the
+// `bun test` run — verified to break codex.factory.test.ts's
+// resolveClaudeImports tests.
+const realFsSnapshot = { ...realFs };
 
 // We mock 'fs' before importing the module under test. atomicWrite uses
 // writeFileSync (with flag: 'wx') + linkSync to publish + unlinkSync to clean
@@ -28,6 +36,10 @@ mock.module('fs', () => ({
   linkSync: mockLinkSync,
   unlinkSync: mockUnlinkSync,
 }));
+
+afterAll(() => {
+  mock.module('fs', () => ({ default: realFsSnapshot, ...realFsSnapshot }));
+});
 
 import {
   createMemoryCaptureMcpHook,
