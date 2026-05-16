@@ -41,7 +41,7 @@ describe('syncCodexLocalMarketplacePluginCache', () => {
     const pluginRoot = path.join(marketplaceRoot, 'plugins', 'workflow-codex');
     writeCodexPlugin(pluginRoot, '0.1.0', 'first body');
     writeJson(path.join(marketplaceRoot, '.agents', 'plugins', 'marketplace.json'), {
-      name: 'davekim917-bootstrap-codex',
+      name: 'davekim917-bootstrap',
       plugins: [
         {
           name: 'bootstrap-workflow-codex',
@@ -53,10 +53,10 @@ describe('syncCodexLocalMarketplacePluginCache', () => {
     fs.writeFileSync(
       path.join(tmpDir, '.codex', 'config.toml'),
       [
-        '[plugins."bootstrap-workflow-codex@davekim917-bootstrap-codex"]',
+        '[plugins."bootstrap-workflow-codex@davekim917-bootstrap"]',
         'enabled = true',
         '',
-        '[marketplaces.davekim917-bootstrap-codex]',
+        '[marketplaces.davekim917-bootstrap]',
         'source_type = "local"',
         `source = "${marketplaceRoot}"`,
         '',
@@ -66,13 +66,13 @@ describe('syncCodexLocalMarketplacePluginCache', () => {
     const result = syncCodexLocalMarketplacePluginCache();
 
     expect(result.errors).toEqual([]);
-    expect(result.installed).toEqual(['bootstrap-workflow-codex@davekim917-bootstrap-codex']);
+    expect(result.installed).toEqual(['bootstrap-workflow-codex@davekim917-bootstrap']);
     const cachedSkill = path.join(
       tmpDir,
       '.codex',
       'plugins',
       'cache',
-      'davekim917-bootstrap-codex',
+      'davekim917-bootstrap',
       'bootstrap-workflow-codex',
       'local',
       'skills',
@@ -83,7 +83,7 @@ describe('syncCodexLocalMarketplacePluginCache', () => {
 
     writeCodexPlugin(pluginRoot, '0.1.1', 'second body');
     const update = syncCodexLocalMarketplacePluginCache();
-    expect(update.updated).toEqual(['bootstrap-workflow-codex@davekim917-bootstrap-codex']);
+    expect(update.updated).toEqual(['bootstrap-workflow-codex@davekim917-bootstrap']);
     expect(fs.readFileSync(cachedSkill, 'utf-8')).toContain('second body');
   });
 
@@ -92,7 +92,7 @@ describe('syncCodexLocalMarketplacePluginCache', () => {
     const pluginRoot = path.join(marketplaceRoot, 'plugins', 'workflow-codex');
     writeCodexPlugin(pluginRoot, '0.1.0', 'body');
     writeJson(path.join(marketplaceRoot, '.agents', 'plugins', 'marketplace.json'), {
-      name: 'davekim917-bootstrap-codex',
+      name: 'davekim917-bootstrap',
       plugins: [
         {
           name: 'bootstrap-workflow-codex',
@@ -104,10 +104,10 @@ describe('syncCodexLocalMarketplacePluginCache', () => {
     fs.writeFileSync(
       path.join(tmpDir, '.codex', 'config.toml'),
       [
-        '[plugins."bootstrap-workflow-codex@davekim917-bootstrap-codex"]',
+        '[plugins."bootstrap-workflow-codex@davekim917-bootstrap"]',
         'enabled = false',
         '',
-        '[marketplaces.davekim917-bootstrap-codex]',
+        '[marketplaces.davekim917-bootstrap]',
         'source_type = "local"',
         `source = "${marketplaceRoot}"`,
         '',
@@ -117,18 +117,10 @@ describe('syncCodexLocalMarketplacePluginCache', () => {
     const result = syncCodexLocalMarketplacePluginCache();
 
     expect(result.installed).toEqual([]);
-    expect(result.skipped).toContain('bootstrap-workflow-codex@davekim917-bootstrap-codex:disabled');
+    expect(result.skipped).toContain('bootstrap-workflow-codex@davekim917-bootstrap:disabled');
     expect(
       fs.existsSync(
-        path.join(
-          tmpDir,
-          '.codex',
-          'plugins',
-          'cache',
-          'davekim917-bootstrap-codex',
-          'bootstrap-workflow-codex',
-          'local',
-        ),
+        path.join(tmpDir, '.codex', 'plugins', 'cache', 'davekim917-bootstrap', 'bootstrap-workflow-codex', 'local'),
       ),
     ).toBe(false);
   });
