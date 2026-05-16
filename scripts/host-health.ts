@@ -56,89 +56,105 @@ function dbRunningCount(): { count: number; oldest?: { id: string; lastActive: s
 }
 
 /**
- * The "Host sweep started" marker line appears in nanoclaw.log every time
- * `startHostSweep()` runs (i.e., on every host start). Find its timestamp
- * once, then reuse it as the cutoff for any log file. Returns null if the
- * info log is missing or has no marker (e.g., older host that didn't emit
- * this line).
- *
- * Format: `[HH:MM:SS.mmm] ...` — host log timestamps are in local TZ,
- * lexicographic compare is reliable within a single calendar day.
+ * Boot wallclock from systemd. Returns epoch-ms of the current
+ * nanoclaw-v2 service start, or null if unavailable. Used as the
+ * "since restart" cutoff for log filtering — robust to log files that
+ * span multiple days where lexical compare on `[HH:MM:SS.mmm]` prefixes
+ * would conflate yesterday's 23:58 with today's 23:58.
  */
-function findLastRestartTimestamp(): string | null {
-  if (!existsSync(LOG_INFO)) return null;
-  const lines = readFileSync(LOG_INFO, 'utf-8').split('\n');
-  for (let i = lines.length - 1; i >= 0; i--) {
-    if (!lines[i].includes('Host sweep started')) continue;
-    const m = lines[i].match(/^\[(\d{2}:\d{2}:\d{2}\.\d+)\]/);
-    if (m) return m[1];
+function hostBootEpochMs(): number | null {
+  try {
+    const out = execSync('systemctl show -p ActiveEnterTimestamp --value nanoclaw-v2', { encoding: 'utf-8' });
+    const started = Date.parse(out.trim());
+    return Number.isNaN(started) ? null : started;
+  } catch {
+    return null;
   }
-  return null;
+}
+
+function hostUptimeSec(bootMs: number | null): number | null {
+  return bootMs === null ? null : Math.floor((Date.now() - bootMs) / 1000);
 }
 
 /**
- * Count lines in `logPath` matching `pattern` whose `[HH:MM:SS.mmm]`
- * prefix is >= `cutoffTs`. Returns -1 if the file is missing.
+ * Iterate matching lines in `logPath` BACKWARDS until we cross the
+ * `cutoffMs` boundary. Each visited line is mapped to a wallclock by
+ * combining its `[HH:MM:SS.mmm]` prefix with a date tracker that
+ * increments whenever the time-of-day jumps UP between adjacent lines
+ * (going backward, that signals a midnight crossing into an earlier
+ * day). Callback returns false to stop early.
  *
- * Lines without a timestamp prefix (stack-trace continuations) are
- * counted only if the most recent timestamped line is past the cutoff —
- * tracks the same source event.
+ * Robust to log files that span many days. Assumes the log is the
+ * server-local TZ — both this script and the host log writer pull
+ * time-of-day from the same Node process TZ.
  */
-function countSinceRestart(logPath: string, pattern: RegExp, cutoffTs: string): number {
-  if (!existsSync(logPath)) return -1;
+function walkLinesBackToCutoff(logPath: string, cutoffMs: number, onLine: (line: string, ts: number) => void): void {
+  if (!existsSync(logPath)) return;
   const lines = readFileSync(logPath, 'utf-8').split('\n');
-  let inWindow = false;
-  let n = 0;
-  for (const line of lines) {
-    const m = line.match(/^\[(\d{2}:\d{2}:\d{2}\.\d+)\]/);
-    if (m) inWindow = m[1] >= cutoffTs;
-    if (inWindow && pattern.test(line)) n++;
+  const tsRe = /^\[(\d{2}):(\d{2}):(\d{2})\.(\d+)\]/;
+  const now = new Date();
+  let prevHms = -1; // seconds since midnight of the previously-walked line
+  let dateAnchor = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    const m = line.match(tsRe);
+    if (!m) {
+      // continuation line — attribute to most-recently-seen timestamp
+      // (intentionally not counted toward cutoff stop)
+      continue;
+    }
+    const hms = Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]);
+    if (prevHms !== -1 && hms > prevHms) {
+      // walking backward and time-of-day jumped UP → crossed midnight
+      // into an earlier day
+      dateAnchor = new Date(dateAnchor.getTime() - 24 * 3600 * 1000);
+    }
+    prevHms = hms;
+    const lineMs =
+      dateAnchor.getTime() +
+      Number(m[1]) * 3600_000 +
+      Number(m[2]) * 60_000 +
+      Number(m[3]) * 1000 +
+      Number(m[4].padEnd(3, '0').slice(0, 3));
+    if (lineMs < cutoffMs) return;
+    onLine(line, lineMs);
   }
+}
+
+function countSinceBoot(logPath: string, pattern: RegExp, bootMs: number | null): number {
+  if (bootMs === null) return -1;
+  if (!existsSync(logPath)) return -1;
+  let n = 0;
+  walkLinesBackToCutoff(logPath, bootMs, (line) => {
+    if (pattern.test(line)) n++;
+  });
   return n;
 }
 
 /**
  * Identify message_ids in `Killing container — message claimed then silent`
- * warnings that appear more than `repeatThreshold` times since the cutoff.
+ * warnings that appear more than `repeatThreshold` times since boot.
  * Repeated kills against the same id indicate a stuck claim that never
  * clears (the old task-plugin-updater pattern).
  */
 function stuckClaimHotspots(
   repeatThreshold: number,
-  cutoffTs: string | null,
+  bootMs: number | null,
 ): Array<{ messageId: string; count: number }> {
-  if (!existsSync(LOG_ERROR)) return [];
-  const lines = readFileSync(LOG_ERROR, 'utf-8').split('\n');
+  if (bootMs === null) return [];
   const counts = new Map<string, number>();
-  const re = /messageId[^=]*="([^"]+)"/g;
-  let inWindow = cutoffTs === null;
-  for (const line of lines) {
-    if (cutoffTs !== null) {
-      const m = line.match(/^\[(\d{2}:\d{2}:\d{2}\.\d+)\]/);
-      if (m) inWindow = m[1] >= cutoffTs;
-    }
-    if (!inWindow) continue;
-    if (!line.includes('claimed then silent')) continue;
+  const idRe = /messageId[^=]*="([^"]+)"/g;
+  walkLinesBackToCutoff(LOG_ERROR, bootMs, (line) => {
+    if (!line.includes('claimed then silent')) return;
     let m: RegExpExecArray | null;
-    while ((m = re.exec(line)) !== null) {
+    while ((m = idRe.exec(line)) !== null) {
       counts.set(m[1], (counts.get(m[1]) ?? 0) + 1);
     }
-  }
+  });
   return [...counts.entries()]
     .filter(([, n]) => n >= repeatThreshold)
     .map(([messageId, count]) => ({ messageId, count }))
     .sort((a, b) => b.count - a.count);
-}
-
-function hostUptimeSec(): number | null {
-  try {
-    const out = execSync('systemctl show -p ActiveEnterTimestamp --value nanoclaw-v2', { encoding: 'utf-8' });
-    const started = Date.parse(out.trim());
-    if (Number.isNaN(started)) return null;
-    return Math.floor((Date.now() - started) / 1000);
-  } catch {
-    return null;
-  }
 }
 
 function fmtCount(n: number): string {
@@ -155,12 +171,12 @@ function fmtDuration(sec: number | null): string {
 
 const dockerCount = dockerSessionCount();
 const { count: dbCount, oldest } = dbRunningCount();
-const restartTs = findLastRestartTimestamp();
-const waitDeferred = restartTs ? countSinceRestart(LOG_ERROR, /wake deferred/, restartTs) : -1;
-const ceilingKills = restartTs ? countSinceRestart(LOG_ERROR, /past absolute ceiling/, restartTs) : -1;
-const expiredEvents = restartTs ? countSinceRestart(LOG_INFO, /Expired stale pending/, restartTs) : -1;
-const stuck = stuckClaimHotspots(3, restartTs);
-const uptime = hostUptimeSec();
+const bootMs = hostBootEpochMs();
+const waitDeferred = countSinceBoot(LOG_ERROR, /wake deferred/, bootMs);
+const ceilingKills = countSinceBoot(LOG_ERROR, /past absolute ceiling/, bootMs);
+const expiredEvents = countSinceBoot(LOG_INFO, /Expired stale pending/, bootMs);
+const stuck = stuckClaimHotspots(3, bootMs);
+const uptime = hostUptimeSec(bootMs);
 
 const drift = dockerCount >= 0 && dbCount >= 0 ? dockerCount - dbCount : null;
 
