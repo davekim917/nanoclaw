@@ -190,6 +190,29 @@ export function countDueMessages(db: Database.Database): number {
   ).count;
 }
 
+/**
+ * Mark long-pending rows as 'expired' so sweep stops re-waking sessions on
+ * messages that have been sitting unprocessed for a day or more. Recurring
+ * tasks whose next fire is in the future are protected by the
+ * `process_after >= now` check.
+ *
+ * Returns the number of rows expired this call.
+ */
+export function expireStalePending(db: Database.Database, maxAgeMs: number): number {
+  const cutoffIso = new Date(Date.now() - maxAgeMs).toISOString();
+  const nowIso = new Date().toISOString();
+  const result = db
+    .prepare(
+      `UPDATE messages_in
+       SET status = 'expired'
+       WHERE status = 'pending'
+         AND timestamp < ?
+         AND (process_after IS NULL OR process_after < ?)`,
+    )
+    .run(cutoffIso, nowIso);
+  return result.changes;
+}
+
 export function markMessageFailed(db: Database.Database, messageId: string): void {
   db.prepare("UPDATE messages_in SET status = 'failed' WHERE id = ?").run(messageId);
 }

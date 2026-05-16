@@ -1,8 +1,9 @@
-import { describe, it, expect, mock, beforeEach, afterEach } from 'bun:test';
+import { describe, it, expect } from 'bun:test';
 
 import { createProvider, type ProviderName } from './factory.js';
 import { ClaudeProvider } from './claude.js';
 import { MockProvider } from './mock.js';
+import { parseRawConfig } from '../config.js';
 
 describe('createProvider', () => {
   it('returns ClaudeProvider for claude', () => {
@@ -21,49 +22,21 @@ describe('createProvider', () => {
 // ── A4 tests: loadConfig providerConfig plumbing ──
 
 describe('loadConfig providerConfig', () => {
-  // We test config.ts by mocking fs and resetting the singleton between tests.
-  // Import config module functions directly (not mocked).
+  // Tests exercise parseRawConfig directly so the filesystem and module
+  // singleton stay out of it. The previous mock.module('fs', ...) approach
+  // leaked process-globally and clobbered codex-app-server.test.ts's
+  // fs.readFileSync — bun's mock.restore() does not undo module mocks.
 
-  it('test_loadConfig_missing_providerConfig_defaults_empty', async () => {
-    // Mock fs for this test
-    mock.module('fs', () => ({
-      default: {
-        readFileSync: (_path: string) => JSON.stringify({ provider: 'claude' }),
-        existsSync: () => false,
-        readdirSync: () => [],
-        statSync: () => ({ isDirectory: () => false }),
-        mkdirSync: () => {},
-        writeFileSync: () => {},
-      },
-      readFileSync: (_path: string) => JSON.stringify({ provider: 'claude' }),
-      existsSync: () => false,
-    }));
-
-    const { loadConfig, _resetConfig } = await import('../config.js');
-    _resetConfig();
-    const result = loadConfig();
+  it('test_loadConfig_missing_providerConfig_defaults_empty', () => {
+    const result = parseRawConfig({ provider: 'claude' });
     expect(result.providerConfig).toEqual({});
   });
 
-  it('test_loadConfig_populated_providerConfig_passthrough', async () => {
-    mock.module('fs', () => ({
-      default: {
-        readFileSync: (_path: string) =>
-          JSON.stringify({ provider: 'claude', providerConfig: { model: 'claude-opus-4-7', effort: 'high' } }),
-        existsSync: () => false,
-        readdirSync: () => [],
-        statSync: () => ({ isDirectory: () => false }),
-        mkdirSync: () => {},
-        writeFileSync: () => {},
-      },
-      readFileSync: (_path: string) =>
-        JSON.stringify({ provider: 'claude', providerConfig: { model: 'claude-opus-4-7', effort: 'high' } }),
-      existsSync: () => false,
-    }));
-
-    const { loadConfig, _resetConfig } = await import('../config.js');
-    _resetConfig();
-    const result = loadConfig();
+  it('test_loadConfig_populated_providerConfig_passthrough', () => {
+    const result = parseRawConfig({
+      provider: 'claude',
+      providerConfig: { model: 'claude-opus-4-7', effort: 'high' },
+    });
     expect(result.providerConfig).toEqual({ model: 'claude-opus-4-7', effort: 'high' });
   });
 

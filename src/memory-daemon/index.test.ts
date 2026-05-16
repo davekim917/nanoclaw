@@ -482,6 +482,13 @@ describe('runSweep C5 wiring', () => {
   });
 
   it('test_nightly_task_runs_after_4am', async () => {
+    // Mock current time to 5am UTC (hour >= 4) — set FIRST so oldDate below
+    // is computed against the mocked clock; otherwise the test's day math
+    // depends on wall-clock proximity to mockDate and drifts as the calendar
+    // advances.
+    const mockDate = new Date('2026-05-07T05:00:00Z');
+    vi.setSystemTime(mockDate);
+
     const db = makeTestIngestDb();
 
     // Set lastNightlyAt to yesterday
@@ -490,7 +497,7 @@ describe('runSweep C5 wiring', () => {
       yesterday,
     );
 
-    // Insert a recall_outcome older than 90 days
+    // Insert a recall_outcome older than 90 days (relative to mocked now)
     const oldDate = new Date(Date.now() - 91 * 24 * 3_600_000).toISOString();
     db.prepare(
       `INSERT INTO recall_outcomes (recall_event_id, fact_id, judge_prompt_version, agent_group_id, query_strategy, trigger_sent_at, created_at, judge_method)
@@ -499,10 +506,6 @@ describe('runSweep C5 wiring', () => {
 
     const countBefore = (db.prepare('SELECT COUNT(*) AS n FROM recall_outcomes').get() as { n: number }).n;
     expect(countBefore).toBe(1);
-
-    // Mock current time to 5am UTC (hour >= 4)
-    const mockDate = new Date('2026-05-07T05:00:00Z');
-    vi.setSystemTime(mockDate);
 
     const hr = new HealthRecorder();
     hr.setIngestDbForTest(db);
