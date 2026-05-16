@@ -6,7 +6,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { execFileSync } from 'child_process';
-import * as fs from 'fs';
+import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
