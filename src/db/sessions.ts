@@ -127,6 +127,25 @@ export function deleteSession(id: string): void {
 }
 
 /**
+ * Mark every session whose central-DB container_status is 'running' or 'idle'
+ * as 'stopped'. Called at host startup because session containers all use
+ * `--rm` and don't survive the host process restart — leaving these rows
+ * inconsistent makes the sweep waste cycles enforcing SLA against
+ * phantom containers (e.g., the kill-ceiling and kill-claim warnings
+ * observed against sessions whose docker container had been gone for
+ * days). The in-memory activeContainers map starts empty after restart;
+ * this brings central DB in line so a freshly-arrived inbound for an
+ * orphaned session takes the cold-spawn path immediately rather than the
+ * "thinks it's alive, try to kill, no-op" path. Returns the row count.
+ */
+export function resetPhantomContainerStatus(): number {
+  const result = getDb()
+    .prepare("UPDATE sessions SET container_status = 'stopped' WHERE container_status IN ('running', 'idle')")
+    .run();
+  return result.changes;
+}
+
+/**
  * Soft-dismiss a session from the inbox's default view. Returns true when
  * the row flipped from visible→archived (mirrors `archiveTaskById`'s
  * change-only contract so callers can gate SSE emits without doing a

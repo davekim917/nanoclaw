@@ -20,6 +20,7 @@ import {
   updateMessagingGroup,
 } from './db/messaging-groups.js';
 import { ensureContainerRuntimeRunning, cleanupOrphans } from './container-runtime.js';
+import { resetPhantomContainerStatus } from './db/sessions.js';
 import { stopAllContainers } from './container-runner.js';
 import {
   getDeliveryAdapter,
@@ -159,6 +160,16 @@ async function main(): Promise<void> {
   // 2. Container runtime
   ensureContainerRuntimeRunning();
   cleanupOrphans();
+
+  // 2a. Reset phantom container_status='running' rows in central DB. Session
+  // containers use --rm and don't survive the host restart, so any 'running'
+  // row in sessions is stale by definition at this point. Without this, the
+  // sweep wastes ticks enforcing SLA against containers that no longer exist
+  // (see kill-ceiling / kill-claim warnings against 3-week-old sessions).
+  const resetCount = resetPhantomContainerStatus();
+  if (resetCount > 0) {
+    log.info('Reset phantom container_status rows on startup', { count: resetCount });
+  }
 
   // 3. Channel adapters
   await initChannelAdapters((adapter: ChannelAdapter): ChannelSetup => {

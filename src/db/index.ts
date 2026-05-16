@@ -33,6 +33,7 @@ export {
   getRunningSessions,
   updateSession,
   deleteSession,
+  resetPhantomContainerStatus,
   createPendingQuestion,
   getPendingQuestion,
   deletePendingQuestion,
