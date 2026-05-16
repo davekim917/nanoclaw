@@ -9,6 +9,12 @@
  * DISCORD_SLASH_CHANNEL_IDS (comma-separated channel ids) so accidental
  * invocations in random channels don't run deploy commands.
  *
+ * Multi-bot note: slash commands are bound to the PRIMARY DISCORD_BOT_TOKEN
+ * only — these are operator/admin commands and shouldn't be duplicated
+ * across secondary bots (e.g. an "axie-codex" bot). Secondary bots
+ * registered via DISCORD_BOT_TOKEN_<SUFFIX> still receive @mentions through
+ * the chat adapter but don't expose /deploy etc.
+ *
  * /update-container injects a synthetic chat message into the router
  * (routeInbound) carrying an audit prompt. The agent (running in a
  * container for the receiving messaging group) runs the audit, presents

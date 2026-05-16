@@ -1,11 +1,28 @@
 /**
  * Discord channel adapter (v2) — uses Chat SDK bridge.
  * Self-registers on import.
+ *
+ * Multi-bot env-var convention (mirrors slack.ts):
+ *   DISCORD_BOT_TOKEN=…                   → channelType "discord"
+ *   DISCORD_PUBLIC_KEY=…                  (optional — slash-cmd interactions)
+ *   DISCORD_APPLICATION_ID=…              (optional — same)
+ *   DISCORD_BOT_TOKEN_<SUFFIX>=…          → channelType "discord-<suffix>"
+ *   DISCORD_PUBLIC_KEY_<SUFFIX>=…
+ *   DISCORD_APPLICATION_ID_<SUFFIX>=…
+ *
+ * Each suffix is a separate Discord application (created per-bot at
+ * discord.com/developers). Suffix is any [A-Za-z0-9_]+, lowercased and
+ * `_` → `-` for the channelType — same round-trip as slack.ts so the
+ * channel-auto-wire resolver's `-` → `_` reverse mapping works.
+ *
+ * Slash commands (discord-slash-commands.ts) stay bound to the primary
+ * DISCORD_BOT_TOKEN — secondary bots receive @mentions but don't expose
+ * /deploy etc.
  */
 import { createDiscordAdapter } from '@chat-adapter/discord';
 import { Constants, MessageType, REST, Routes } from 'discord.js';
 
-import { readEnvFile } from '../env.js';
+import { readEnvFileMatching } from '../env.js';
 import { log } from '../log.js';
 import { transformOutsideProtectedRegions } from '../text-styles.js';
 import { createChatSdkBridge, type ReplyContext } from './chat-sdk-bridge.js';
@@ -239,33 +256,104 @@ export async function discordCreateThread(
   return { threadId: thread.id, messageId: firstMsg.id };
 }
 
-registerChannelAdapter('discord', {
-  factory: () => {
-    const env = readEnvFile(['DISCORD_BOT_TOKEN', 'DISCORD_PUBLIC_KEY', 'DISCORD_APPLICATION_ID']);
-    if (!env.DISCORD_BOT_TOKEN) return null;
-    const discordAdapter = createDiscordAdapter({
-      botToken: env.DISCORD_BOT_TOKEN,
-      publicKey: env.DISCORD_PUBLIC_KEY,
-      applicationId: env.DISCORD_APPLICATION_ID,
+export interface DiscordWorkspace {
+  channelType: string;
+  botToken: string;
+  publicKey?: string;
+  applicationId?: string;
+}
+
+/**
+ * Pure helper — parse Discord workspace configs from an env key/value map.
+ * Exported for testing. Mirrors parseSlackWorkspaces in `slack.ts`.
+ *
+ * Only DISCORD_BOT_TOKEN is required to register a workspace. publicKey
+ * and applicationId are optional (only consumed when slash-command
+ * interactions are configured for that app), so a token-only entry still
+ * yields a working chat adapter.
+ */
+export function parseDiscordWorkspaces(env: Record<string, string>): DiscordWorkspace[] {
+  const bySuffix = new Map<string, { botToken?: string; publicKey?: string; applicationId?: string }>();
+
+  for (const [key, value] of Object.entries(env)) {
+    const m = key.match(/^DISCORD_(BOT_TOKEN|PUBLIC_KEY|APPLICATION_ID)(?:_([A-Za-z0-9_]+))?$/);
+    if (!m) continue;
+    const [, kind, rawSuffix] = m;
+    const suffix = rawSuffix ? rawSuffix.toLowerCase().replace(/_/g, '-') : '';
+    const entry = bySuffix.get(suffix) ?? {};
+    if (kind === 'BOT_TOKEN') entry.botToken = value;
+    else if (kind === 'PUBLIC_KEY') entry.publicKey = value;
+    else entry.applicationId = value;
+    bySuffix.set(suffix, entry);
+  }
+
+  const workspaces: DiscordWorkspace[] = [];
+  for (const [suffix, parts] of bySuffix) {
+    if (!parts.botToken) continue;
+    workspaces.push({
+      channelType: suffix ? `discord-${suffix}` : 'discord',
+      botToken: parts.botToken,
+      publicKey: parts.publicKey,
+      applicationId: parts.applicationId,
     });
-    const rest = new REST({ version: '10' }).setToken(env.DISCORD_BOT_TOKEN);
-    const bridge = createChatSdkBridge({
-      adapter: discordAdapter,
-      concurrency: 'concurrent',
-      botToken: env.DISCORD_BOT_TOKEN,
-      extractReplyContext,
-      supportsThreads: true,
-      maxTextLength: 1900,
-      // Markdown delivery (not raw) keeps the chat-adapter's tableToAscii
-      // conversion in play; without it, Markdown tables would render as raw
-      // `|`-pipe text in Discord (no native table block).
-      transformOutboundMarkdown: rewriteDiscordLinks,
-      inboundFilter: isUserMessage,
-      fetchThreadAnchor: makeFetchThreadAnchor(env.DISCORD_BOT_TOKEN),
-    });
-    bridge.postParent = (platformId, text) => discordPostParent(rest, platformId, text);
-    bridge.createThread = (platformId, parentMessageId, title, firstMessage) =>
-      discordCreateThread(rest, platformId, parentMessageId, title, firstMessage);
-    return bridge;
-  },
-});
+  }
+  return workspaces;
+}
+
+// Pre-filter regex must allow `_` in the suffix so env vars like
+// DISCORD_BOT_TOKEN_AXIE_CODEX reach the parser intact.
+const workspaces = parseDiscordWorkspaces(
+  readEnvFileMatching(/^DISCORD_(BOT_TOKEN|PUBLIC_KEY|APPLICATION_ID)(_[A-Za-z0-9_]+)?$/),
+);
+
+for (const ws of workspaces) {
+  registerChannelAdapter(ws.channelType, {
+    factory: () => {
+      const discordAdapter = createDiscordAdapter({
+        botToken: ws.botToken,
+        publicKey: ws.publicKey,
+        applicationId: ws.applicationId,
+      });
+      // Multi-bot dedup isolation. The chat-adapter's message-dedup key is
+      // `dedupe:${adapter.name}:${message.id}`. createDiscordAdapter defaults
+      // `name = "discord"` for every instance (verified at
+      // @chat-adapter/discord dist:364); combined with a shared SqliteState
+      // adapter, two Discord adapters processing the same Discord message
+      // (same id) would collide on the dedup key and the second silently
+      // drops the message. This bites the two-bots-in-same-guild case (e.g.
+      // axie + axie-codex both observing user messages in #chat).
+      //
+      // Override adapter.name to the channelType so each workspace has its
+      // own dedup keyspace. The name also keys `chat.webhooks[...]` — but
+      // Discord is a gateway adapter (not webhook), so that path doesn't
+      // fire here. Mirrors the equivalent override in slack.ts.
+      (discordAdapter as unknown as { name: string }).name = ws.channelType;
+      const rest = new REST({ version: '10' }).setToken(ws.botToken);
+      const bridge = createChatSdkBridge({
+        adapter: discordAdapter,
+        concurrency: 'concurrent',
+        botToken: ws.botToken,
+        extractReplyContext,
+        supportsThreads: true,
+        maxTextLength: 1900,
+        channelType: ws.channelType,
+        // Markdown delivery (not raw) keeps the chat-adapter's tableToAscii
+        // conversion in play; without it, Markdown tables would render as raw
+        // `|`-pipe text in Discord (no native table block).
+        transformOutboundMarkdown: rewriteDiscordLinks,
+        inboundFilter: isUserMessage,
+        fetchThreadAnchor: makeFetchThreadAnchor(ws.botToken),
+      });
+      bridge.postParent = (platformId, text) => discordPostParent(rest, platformId, text);
+      bridge.createThread = (platformId, parentMessageId, title, firstMessage) =>
+        discordCreateThread(rest, platformId, parentMessageId, title, firstMessage);
+      return bridge;
+    },
+  });
+}
+
+if (workspaces.length > 1) {
+  log.info('Multiple Discord bots registered', {
+    channelTypes: workspaces.map((w) => w.channelType),
+  });
+}

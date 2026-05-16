@@ -615,10 +615,7 @@ function dirSizeBytes(root: string): number {
  * cache directory names. Sessions stay alive (host-side), they just shed
  * their pnpm install footprint until next use.
  */
-export function pruneIdleSessionArtifacts(
-  now: number = Date.now(),
-  root: string = sessionsBaseDir(),
-): void {
+export function pruneIdleSessionArtifacts(now: number = Date.now(), root: string = sessionsBaseDir()): void {
   let groupDirs: fs.Dirent[];
   try {
     groupDirs = fs.readdirSync(root, { withFileTypes: true });

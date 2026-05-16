@@ -2,12 +2,113 @@ import { describe, expect, it, vi } from 'vitest';
 
 import {
   isUserMessage,
+  parseDiscordWorkspaces,
   rewriteDiscordLinks,
   discordPostParent,
   discordCreateThread,
   extractDiscordChannelId,
   type DiscordRestClient,
 } from './discord.js';
+
+describe('parseDiscordWorkspaces', () => {
+  it('returns an empty list when no credentials present', () => {
+    expect(parseDiscordWorkspaces({})).toEqual([]);
+  });
+
+  it('registers the primary workspace as channelType "discord"', () => {
+    const ws = parseDiscordWorkspaces({
+      DISCORD_BOT_TOKEN: 'tok-primary',
+      DISCORD_PUBLIC_KEY: 'pk-primary',
+      DISCORD_APPLICATION_ID: 'app-primary',
+    });
+    expect(ws).toEqual([
+      {
+        channelType: 'discord',
+        botToken: 'tok-primary',
+        publicKey: 'pk-primary',
+        applicationId: 'app-primary',
+      },
+    ]);
+  });
+
+  it('accepts token-only entries (public key and app id are optional)', () => {
+    // Slash-command interactions need public key + application id, but the
+    // chat adapter itself works with just the bot token. Token-only entries
+    // must still register so a chat-only secondary bot is usable.
+    const ws = parseDiscordWorkspaces({ DISCORD_BOT_TOKEN: 'tok-only' });
+    expect(ws).toEqual([
+      { channelType: 'discord', botToken: 'tok-only', publicKey: undefined, applicationId: undefined },
+    ]);
+  });
+
+  it('registers suffixed workspaces as channelType "discord-<suffix>" (lowercased)', () => {
+    const ws = parseDiscordWorkspaces({
+      DISCORD_BOT_TOKEN_AXIE: 'tok-axie',
+      DISCORD_BOT_TOKEN_CODEX: 'tok-codex',
+    });
+    expect(ws.map((w) => w.channelType).sort()).toEqual(['discord-axie', 'discord-codex']);
+  });
+
+  it('registers primary and suffixed workspaces together', () => {
+    const ws = parseDiscordWorkspaces({
+      DISCORD_BOT_TOKEN: 'tok-p',
+      DISCORD_BOT_TOKEN_SECOND: 'tok-s',
+    });
+    expect(ws.map((w) => w.channelType).sort()).toEqual(['discord', 'discord-second']);
+  });
+
+  it('skips workspaces missing a bot token', () => {
+    // An orphan public-key / application-id without a bot token can't be
+    // used — drop it rather than registering a broken adapter.
+    const ws = parseDiscordWorkspaces({
+      DISCORD_BOT_TOKEN: 'tok-p',
+      DISCORD_PUBLIC_KEY_ORPHAN: 'pk-orphan',
+      DISCORD_APPLICATION_ID_ORPHAN: 'app-orphan',
+    });
+    expect(ws.map((w) => w.channelType)).toEqual(['discord']);
+  });
+
+  it('accepts underscores in the suffix and maps them to dashes in channelType', () => {
+    // Same convention as slack.ts: env var keeps `_` for readability, but
+    // channelType uses `-` to match the existing dash-separated convention.
+    // channel-auto-wire's `-` → `_` reverse mapping makes this round-trip safe.
+    const ws = parseDiscordWorkspaces({
+      DISCORD_BOT_TOKEN_AXIE_CODEX: 'tok-codex',
+      DISCORD_PUBLIC_KEY_AXIE_CODEX: 'pk-codex',
+      DISCORD_APPLICATION_ID_AXIE_CODEX: 'app-codex',
+    });
+    expect(ws).toEqual([
+      {
+        channelType: 'discord-axie-codex',
+        botToken: 'tok-codex',
+        publicKey: 'pk-codex',
+        applicationId: 'app-codex',
+      },
+    ]);
+  });
+
+  it('groups bot token + public key + application id by suffix', () => {
+    const ws = parseDiscordWorkspaces({
+      DISCORD_BOT_TOKEN_A: 'tok-a',
+      DISCORD_PUBLIC_KEY_A: 'pk-a',
+      DISCORD_APPLICATION_ID_A: 'app-a',
+      DISCORD_BOT_TOKEN_B: 'tok-b',
+    });
+    const byType = new Map(ws.map((w) => [w.channelType, w]));
+    expect(byType.get('discord-a')).toEqual({
+      channelType: 'discord-a',
+      botToken: 'tok-a',
+      publicKey: 'pk-a',
+      applicationId: 'app-a',
+    });
+    expect(byType.get('discord-b')).toEqual({
+      channelType: 'discord-b',
+      botToken: 'tok-b',
+      publicKey: undefined,
+      applicationId: undefined,
+    });
+  });
+});
 
 describe('rewriteDiscordLinks', () => {
   it('rewrites bare Google document and slide URLs to safe labeled links', () => {
