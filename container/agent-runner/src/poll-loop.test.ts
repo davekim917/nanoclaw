@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
-import fs from 'fs';
+import * as fs from 'fs';
 import os from 'os';
 import path from 'path';
 
