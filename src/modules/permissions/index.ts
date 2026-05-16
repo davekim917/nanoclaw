@@ -19,6 +19,7 @@ import { recordDroppedMessage } from '../../db/dropped-messages.js';
 import { getAgentGroup, getAllAgentGroups } from '../../db/agent-groups.js';
 import { createMessagingGroupAgent, setMessagingGroupDeniedAt } from '../../db/messaging-groups.js';
 import {
+  isDiscordChannelType,
   routeInbound,
   setAccessGate,
   setChannelRequestGate,
@@ -459,7 +460,7 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
   // mention so each invocation is intentional. DMs always use pattern='.'.
   const engageMode: MessagingGroupAgent['engage_mode'] = !isGroup
     ? 'pattern'
-    : event.channelType === 'discord'
+    : isDiscordChannelType(event.channelType)
       ? 'mention-sticky'
       : 'mention';
   const engagePattern = isGroup ? null : '.';
@@ -568,7 +569,7 @@ setMessageInterceptor(async (event: InboundEvent): Promise<boolean> => {
   // to plain mention. DMs always use pattern='.'.
   const engageMode: MessagingGroupAgent['engage_mode'] = !isGroup
     ? 'pattern'
-    : originalEvent.channelType === 'discord'
+    : isDiscordChannelType(originalEvent.channelType)
       ? 'mention-sticky'
       : 'mention';
   const engagePattern = isGroup ? null : '.';

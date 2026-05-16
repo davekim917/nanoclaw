@@ -66,7 +66,9 @@ import type { InboundEvent } from './channels/adapter.js';
  */
 function adapterHasWorkspaceIdentity(channelType: string): boolean {
   // Discord: handled separately (guild id parsed from platform_id).
-  if (channelType === 'discord') return true;
+  // Includes multi-bot variants (`discord-<suffix>`) for forks running
+  // multiple Discord apps in one process.
+  if (isDiscordChannelType(channelType)) return true;
   // Slack channel types are stamped with the workspace suffix
   // ("slack-<workspace>"); bare "slack" without suffix is ambiguous.
   if (channelType.startsWith('slack-')) return true;
@@ -81,21 +83,25 @@ function inheritedAgentGroupFor(mg: MessagingGroup): { id: string; sourceMessagi
   const db = getDb();
   let rows: Array<{ agent_group_id: string; messaging_group_id: string; cnt: number }>;
 
-  if (mg.channel_type === 'discord' && mg.platform_id.startsWith('discord:')) {
+  if (isDiscordChannelType(mg.channel_type) && mg.platform_id.startsWith('discord:')) {
     const guildId = mg.platform_id.split(':')[1];
     if (!guildId) return null;
+    // Scope the lookup to the same channel_type (same bot identity). With
+    // multi-bot forks, axie + axie-codex can both have wirings in the same
+    // guild — they're separate bots, so a fresh channel under one bot should
+    // inherit only that bot's wirings, not the other's.
     rows = db
       .prepare(
         `SELECT mga.agent_group_id, MIN(mga.messaging_group_id) AS messaging_group_id, COUNT(*) AS cnt
          FROM messaging_group_agents mga
          JOIN messaging_groups m ON m.id = mga.messaging_group_id
-         WHERE m.channel_type = 'discord'
+         WHERE m.channel_type = ?
            AND m.platform_id LIKE ?
            AND m.id != ?
          GROUP BY mga.agent_group_id
          ORDER BY COUNT(*) DESC, MIN(m.created_at) ASC`,
       )
-      .all(`discord:${guildId}:%`, mg.id) as typeof rows;
+      .all(mg.channel_type, `discord:${guildId}:%`, mg.id) as typeof rows;
   } else if (adapterHasWorkspaceIdentity(mg.channel_type)) {
     rows = db
       .prepare(
@@ -278,6 +284,20 @@ function isSlackChannelType(channelType: string): boolean {
 }
 
 /**
+ * Discord channel-type predicate that tolerates multi-bot variants.
+ *
+ * Forks running multiple Discord apps in one process tag the secondary
+ * adapter with a suffix (`discord-<suffix>`) so dedupe keyspaces don't
+ * collide. Every Discord-flavored gate in this file must accept both
+ * bare `discord` and `discord-*`, otherwise the secondary bot would
+ * silently lose Discord-specific behavior (guild-id auto-wire,
+ * mention-sticky engage default, etc.).
+ */
+export function isDiscordChannelType(channelType: string): boolean {
+  return channelType === 'discord' || channelType.startsWith('discord-');
+}
+
+/**
  * Slack DM thread-on-first-reply.
  *
  * @chat-adapter/slack represents a root DM with no thread_ts as
@@ -398,8 +418,9 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
           agent_group_id: inheritedAgent.id,
           // Discord defaults to mention-sticky (in-thread auto-reply matches
           // Discord conversational norms); every other platform defaults to
-          // plain mention so each invocation is intentional.
-          engage_mode: event.channelType === 'discord' ? 'mention-sticky' : 'mention',
+          // plain mention so each invocation is intentional. Includes multi-
+          // bot variants so a secondary Discord bot keeps the same default.
+          engage_mode: isDiscordChannelType(event.channelType) ? 'mention-sticky' : 'mention',
           engage_pattern: null,
           session_mode: 'per-thread',
           priority: 0,
