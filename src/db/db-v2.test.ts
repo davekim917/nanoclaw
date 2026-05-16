@@ -28,6 +28,7 @@ import {
   getRunningSessions,
   updateSession,
   deleteSession,
+  resetPhantomContainerStatus,
   createPendingQuestion,
   getPendingQuestion,
   deletePendingQuestion,
@@ -355,6 +356,24 @@ describe('sessions', () => {
     createSession({ ...sess(), id: 'sess-idle', container_status: 'idle', thread_id: 'thread-1' });
     createSession({ ...sess(), id: 'sess-stopped', container_status: 'stopped', thread_id: 'thread-2' });
     expect(getRunningSessions()).toHaveLength(2);
+  });
+
+  it('resetPhantomContainerStatus: flips running+idle to stopped, leaves stopped alone', () => {
+    createSession({ ...sess(), id: 'a', container_status: 'running' });
+    createSession({ ...sess(), id: 'b', container_status: 'idle', thread_id: 't1' });
+    createSession({ ...sess(), id: 'c', container_status: 'stopped', thread_id: 't2' });
+
+    expect(resetPhantomContainerStatus()).toBe(2);
+    expect(getRunningSessions()).toHaveLength(0);
+    expect(getSession('a')!.container_status).toBe('stopped');
+    expect(getSession('b')!.container_status).toBe('stopped');
+    expect(getSession('c')!.container_status).toBe('stopped');
+  });
+
+  it('resetPhantomContainerStatus: idempotent — second call expires zero', () => {
+    createSession({ ...sess(), container_status: 'running' });
+    expect(resetPhantomContainerStatus()).toBe(1);
+    expect(resetPhantomContainerStatus()).toBe(0);
   });
 
   it('should update', () => {
