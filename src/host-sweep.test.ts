@@ -5,6 +5,10 @@
  *
  * Also contains C3 watchdog integration tests.
  */
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+
 import Database from 'better-sqlite3';
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 
@@ -13,12 +17,14 @@ import { closeDb, initTestDb, runMigrations } from './db/index.js';
 import {
   ABSOLUTE_CEILING_MS,
   CLAIM_STUCK_MS,
+  SESSION_ARTIFACT_IDLE_MS,
   SPAWN_GRACE_MS,
   _resetStuckProcessingRowsForTesting,
   _sweepTaskWatchdogForTesting,
   autoArchiveOldCompleted,
   decideStuckAction,
   parseSqliteUtc,
+  pruneIdleSessionArtifacts,
   pruneSteerIdempotency,
 } from './host-sweep.js';
 import { getDb } from './db/connection.js';
@@ -999,5 +1005,136 @@ describe('autoArchiveOldCompleted', () => {
       archived_at: string | null;
     };
     expect(row.archived_at).toBeNull();
+  });
+});
+
+describe('pruneIdleSessionArtifacts', () => {
+  let tmpRoot: string;
+  const HOUR = 60 * 60 * 1000;
+
+  beforeEach(() => {
+    mockIsContainerRunning.mockReset();
+    mockIsContainerRunning.mockReturnValue(false);
+    tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'host-sweep-prune-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  function makeSession(opts: {
+    group: string;
+    sess: string;
+    dbAgeMs: number;
+    withNodeModules?: boolean;
+    withPnpmStore?: boolean;
+    nodeModulesInWorktree?: boolean;
+  }): string {
+    const dir = path.join(tmpRoot, opts.group, opts.sess);
+    fs.mkdirSync(dir, { recursive: true });
+    const dbPath = path.join(dir, 'inbound.db');
+    fs.writeFileSync(dbPath, 'fake');
+    const mtime = (Date.now() - opts.dbAgeMs) / 1000;
+    fs.utimesSync(dbPath, mtime, mtime);
+    if (opts.withNodeModules) {
+      const nm = path.join(dir, 'node_modules');
+      fs.mkdirSync(nm);
+      fs.writeFileSync(path.join(nm, 'pkg.json'), '{}');
+    }
+    if (opts.withPnpmStore) {
+      const ps = path.join(dir, '.pnpm-store');
+      fs.mkdirSync(ps);
+      fs.writeFileSync(path.join(ps, 'index.db'), 'x');
+    }
+    if (opts.nodeModulesInWorktree) {
+      const nested = path.join(dir, 'worktrees', 'repo', 'node_modules');
+      fs.mkdirSync(nested, { recursive: true });
+      fs.writeFileSync(path.join(nested, 'pkg.json'), '{}');
+    }
+    return dir;
+  }
+
+  it('removes node_modules and .pnpm-store from idle sessions', () => {
+    const dir = makeSession({
+      group: 'ag-1',
+      sess: 'sess-old',
+      dbAgeMs: SESSION_ARTIFACT_IDLE_MS + HOUR,
+      withNodeModules: true,
+      withPnpmStore: true,
+      nodeModulesInWorktree: true,
+    });
+
+    pruneIdleSessionArtifacts(Date.now(), tmpRoot);
+
+    expect(fs.existsSync(path.join(dir, 'node_modules'))).toBe(false);
+    expect(fs.existsSync(path.join(dir, '.pnpm-store'))).toBe(false);
+    expect(fs.existsSync(path.join(dir, 'worktrees', 'repo', 'node_modules'))).toBe(false);
+    // Session dir and DB file untouched
+    expect(fs.existsSync(path.join(dir, 'inbound.db'))).toBe(true);
+    expect(fs.existsSync(path.join(dir, 'worktrees', 'repo'))).toBe(true);
+  });
+
+  it('leaves recently-active sessions alone', () => {
+    const dir = makeSession({
+      group: 'ag-1',
+      sess: 'sess-fresh',
+      dbAgeMs: HOUR, // 1 hour < 24 hour default
+      withNodeModules: true,
+    });
+
+    pruneIdleSessionArtifacts(Date.now(), tmpRoot);
+
+    expect(fs.existsSync(path.join(dir, 'node_modules'))).toBe(true);
+  });
+
+  it('skips sessions whose container is currently running', () => {
+    const dir = makeSession({
+      group: 'ag-1',
+      sess: 'sess-running',
+      dbAgeMs: SESSION_ARTIFACT_IDLE_MS + HOUR,
+      withNodeModules: true,
+    });
+    mockIsContainerRunning.mockImplementation((sid: string) => sid === 'sess-running');
+
+    pruneIdleSessionArtifacts(Date.now(), tmpRoot);
+
+    expect(fs.existsSync(path.join(dir, 'node_modules'))).toBe(true);
+  });
+
+  it('ignores non-sess dirs (e.g. .claude-shared, .claude-memory)', () => {
+    const sharedDir = path.join(tmpRoot, 'ag-1', '.claude-shared');
+    fs.mkdirSync(sharedDir, { recursive: true });
+    const nmInShared = path.join(sharedDir, 'node_modules');
+    fs.mkdirSync(nmInShared);
+    fs.writeFileSync(path.join(nmInShared, 'pkg.json'), '{}');
+
+    pruneIdleSessionArtifacts(Date.now(), tmpRoot);
+
+    expect(fs.existsSync(nmInShared)).toBe(true);
+  });
+
+  it('does not follow symlinks out of the session subtree', () => {
+    const dir = makeSession({
+      group: 'ag-1',
+      sess: 'sess-symlink',
+      dbAgeMs: SESSION_ARTIFACT_IDLE_MS + HOUR,
+    });
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'outside-store-'));
+    const outsideNm = path.join(outside, 'node_modules');
+    fs.mkdirSync(outsideNm);
+    fs.writeFileSync(path.join(outsideNm, 'pkg.json'), '{}');
+    try {
+      fs.symlinkSync(outside, path.join(dir, 'shared-link'));
+
+      pruneIdleSessionArtifacts(Date.now(), tmpRoot);
+
+      expect(fs.existsSync(outsideNm)).toBe(true);
+    } finally {
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it('no-ops on a non-existent sessions root', () => {
+    expect(() => pruneIdleSessionArtifacts(Date.now(), path.join(tmpRoot, 'does-not-exist'))).not.toThrow();
   });
 });
