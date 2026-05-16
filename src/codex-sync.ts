@@ -274,7 +274,7 @@ export function syncCodexLocalMarketplacePluginCache(): CodexLocalMarketplacePlu
         sourceRoot,
         pluginRoot,
         cacheRoot,
-        cachePath: path.join(cacheRoot, sourceType === 'local' ? 'local' : marketplaceInstallId(block)),
+        cachePath: path.join(cacheRoot, sourceType === 'local' ? 'local' : marketplaceInstallId(block, pluginRoot)),
         enabled: enabledPlugins.has(`${pluginName}@${block.name}`),
       });
     }
@@ -586,10 +586,22 @@ function resolveMarketplaceSourceRoot(
   return sourceRoot;
 }
 
-function marketplaceInstallId(block: ParsedTomlBlock): string {
+function marketplaceInstallId(block: ParsedTomlBlock, pluginRoot: string): string {
+  const version = codexPluginVersion(pluginRoot);
+  if (version && /^[A-Za-z0-9._-]+$/.test(version)) return version;
   const revision = tomlString(block.values.get('last_revision'));
   if (revision) return revision.slice(0, 8);
   return 'git';
+}
+
+function codexPluginVersion(pluginRoot: string): string | null {
+  const manifestPath = path.join(pluginRoot, '.codex-plugin', 'plugin.json');
+  try {
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf-8')) as { version?: unknown };
+    return typeof manifest.version === 'string' && manifest.version.trim() ? manifest.version.trim() : null;
+  } catch {
+    return null;
+  }
 }
 
 function isInsidePath(parent: string, child: string): boolean {

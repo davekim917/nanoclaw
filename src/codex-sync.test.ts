@@ -125,7 +125,7 @@ describe('syncCodexLocalMarketplacePluginCache', () => {
     ).toBe(false);
   });
 
-  it('copies enabled Git marketplace plugins from Codex marketplace checkouts using the latest revision', () => {
+  it('copies enabled Git marketplace plugins from Codex marketplace checkouts using the plugin version', () => {
     const marketplaceRoot = path.join(tmpDir, '.codex', '.tmp', 'marketplaces', 'davekim917-bootstrap');
     const pluginRoot = path.join(marketplaceRoot, 'plugins', 'workflow-codex');
     writeCodexPlugin(pluginRoot, '0.1.0', 'git body');
@@ -165,7 +165,7 @@ describe('syncCodexLocalMarketplacePluginCache', () => {
       'cache',
       'davekim917-bootstrap',
       'bootstrap-workflow-codex',
-      '3eb8fabb',
+      '0.1.0',
       'skills',
       'team-build',
       'SKILL.md',
