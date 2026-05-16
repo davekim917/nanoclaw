@@ -11,6 +11,7 @@ import path from 'path';
 import { describe, it, expect, afterEach } from 'vitest';
 
 import {
+  expireStalePending,
   getInboundSourceSessionId,
   migrateMessagesInTable,
   sessionInboundHasMessage,
@@ -311,5 +312,136 @@ describe('sessionInboundHasMessage', () => {
 
   it('test_sessionInboundHasMessage_no_db', () => {
     expect(sessionInboundHasMessage(TEST_GROUP, 'nonexistent-session', 'msg-1')).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// expireStalePending
+// ---------------------------------------------------------------------------
+
+describe('expireStalePending', () => {
+  function makeInboundDb(): Database.Database {
+    const db = new Database(':memory:');
+    db.pragma('journal_mode = DELETE');
+    db.exec(INBOUND_SCHEMA);
+    return db;
+  }
+
+  function insertRow(
+    db: Database.Database,
+    args: {
+      id: string;
+      timestamp: string;
+      status?: string;
+      processAfter?: string | null;
+      kind?: string;
+    },
+  ): void {
+    const seq = (db.prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM messages_in').get() as { m: number }).m + 2;
+    db.prepare(
+      `INSERT INTO messages_in (id, seq, kind, timestamp, status, content, process_after, series_id, trigger)
+       VALUES (@id, @seq, @kind, @timestamp, @status, '{}', @processAfter, @id, 1)`,
+    ).run({
+      id: args.id,
+      seq,
+      kind: args.kind ?? 'chat',
+      timestamp: args.timestamp,
+      status: args.status ?? 'pending',
+      processAfter: args.processAfter ?? null,
+    });
+  }
+
+  it('expires pending rows older than the cutoff', () => {
+    const db = makeInboundDb();
+    try {
+      const oldTs = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+      const recentTs = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+      insertRow(db, { id: 'old-1', timestamp: oldTs });
+      insertRow(db, { id: 'recent-1', timestamp: recentTs });
+
+      const changed = expireStalePending(db, 24 * 60 * 60 * 1000);
+
+      expect(changed).toBe(1);
+      const rows = db.prepare('SELECT id, status FROM messages_in ORDER BY id').all() as Array<{
+        id: string;
+        status: string;
+      }>;
+      expect(rows.find((r) => r.id === 'old-1')?.status).toBe('expired');
+      expect(rows.find((r) => r.id === 'recent-1')?.status).toBe('pending');
+    } finally {
+      db.close();
+    }
+  });
+
+  it('protects future-scheduled recurring tasks (process_after >= now)', () => {
+    const db = makeInboundDb();
+    try {
+      const oldTs = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+      const futureFire = new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString();
+      insertRow(db, { id: 'cron-1', timestamp: oldTs, processAfter: futureFire, kind: 'task' });
+
+      const changed = expireStalePending(db, 24 * 60 * 60 * 1000);
+
+      expect(changed).toBe(0);
+      const row = db.prepare("SELECT status FROM messages_in WHERE id = 'cron-1'").get() as {
+        status: string;
+      };
+      expect(row.status).toBe('pending');
+    } finally {
+      db.close();
+    }
+  });
+
+  it('expires rows whose process_after is also in the past', () => {
+    const db = makeInboundDb();
+    try {
+      const oldTs = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+      const stalePastFire = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+      insertRow(db, {
+        id: 'cron-overdue',
+        timestamp: oldTs,
+        processAfter: stalePastFire,
+        kind: 'task',
+      });
+
+      const changed = expireStalePending(db, 24 * 60 * 60 * 1000);
+
+      expect(changed).toBe(1);
+      const row = db.prepare("SELECT status FROM messages_in WHERE id = 'cron-overdue'").get() as {
+        status: string;
+      };
+      expect(row.status).toBe('expired');
+    } finally {
+      db.close();
+    }
+  });
+
+  it('leaves non-pending rows untouched', () => {
+    const db = makeInboundDb();
+    try {
+      const oldTs = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+      insertRow(db, { id: 'p1', timestamp: oldTs, status: 'processing' });
+      insertRow(db, { id: 'c1', timestamp: oldTs, status: 'completed' });
+      insertRow(db, { id: 'f1', timestamp: oldTs, status: 'failed' });
+
+      const changed = expireStalePending(db, 24 * 60 * 60 * 1000);
+
+      expect(changed).toBe(0);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('is idempotent — second call expires nothing', () => {
+    const db = makeInboundDb();
+    try {
+      const oldTs = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+      insertRow(db, { id: 'old-1', timestamp: oldTs });
+
+      expect(expireStalePending(db, 24 * 60 * 60 * 1000)).toBe(1);
+      expect(expireStalePending(db, 24 * 60 * 60 * 1000)).toBe(0);
+    } finally {
+      db.close();
+    }
   });
 });

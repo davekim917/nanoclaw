@@ -36,6 +36,7 @@ import { getAgentGroup } from './db/agent-groups.js';
 import {
   countDueMessages,
   deleteOrphanProcessingClaims,
+  expireStalePending,
   getContainerState,
   getMessageForRetry,
   getProcessingClaims,
@@ -98,6 +99,18 @@ export const CLAIM_STUCK_MS = 60 * 1000;
 // container is killed within ms of spawn for a 4-day-old claim it hadn't
 // had a chance to clear.
 export const SPAWN_GRACE_MS = 60 * 1000;
+// Pending inbound rows older than this get marked 'expired' by the sweep so
+// they stop waking sessions forever. Reason: containers that crashed mid-spawn
+// or hit a contract bug leave un-acked rows that the sweep treats as "due"
+// every tick, which fills the concurrency cap with squatters. Recurring tasks
+// whose next fire is in the future are protected via process_after.
+// Tunable via PENDING_MESSAGE_MAX_AGE_HOURS (default 24).
+const parsedMaxAgeHours = Number(process.env.PENDING_MESSAGE_MAX_AGE_HOURS);
+export const PENDING_MESSAGE_MAX_AGE_MS =
+  (Number.isFinite(parsedMaxAgeHours) && parsedMaxAgeHours > 0 ? parsedMaxAgeHours : 24) *
+  60 *
+  60 *
+  1000;
 const MAX_TRIES = 5;
 const BACKOFF_BASE_MS = 5000;
 
@@ -249,6 +262,17 @@ async function sweepSession(session: Session): Promise<void> {
     // 1. Sync processing_ack → messages_in status
     if (outDb) {
       syncProcessingAcks(inDb, outDb);
+    }
+
+    // 1a. Expire long-pending rows so sweep stops re-waking sessions on
+    // messages that have been sitting unprocessed past the age cutoff.
+    const expired = expireStalePending(inDb, PENDING_MESSAGE_MAX_AGE_MS);
+    if (expired > 0) {
+      log.info('Expired stale pending messages', {
+        sessionId: session.id,
+        count: expired,
+        maxAgeMs: PENDING_MESSAGE_MAX_AGE_MS,
+      });
     }
 
     // 2. Wake a container if work is due and nothing is running. Ordered

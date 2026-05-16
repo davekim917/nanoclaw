@@ -102,6 +102,30 @@ chat:
   work because each sibling is a distinct Slack bot user — the filter
   catches only echoes of your own, not the peer's.
 
+### When the user @-mentions BOTH you and your sibling in one message
+
+You will both receive the same message body and wake independently — there
+is no router-side disambiguation. **Before doing anything, parse out which
+work is for YOU specifically** and ack only your slice. Common framings:
+
+- `@you can you have @peer do X while we run Y?` → YOU run Y, **peer**
+  runs X. Don't take X. Acknowledge briefly, do Y. The peer will see the
+  same message and pick up X on its own.
+- `@you and @peer, please collaborate on Z` → coordinate. Pick a sub-task
+  consistent with your strengths, ack which slice you're taking, and let
+  the peer take the rest.
+- `@you @peer status?` → each replies for itself. Don't speak for the peer.
+
+Heuristic: if the message uses words like *have*, *while*, *kick off*, *in
+parallel*, or addresses you both with split tasks, **assume the framing is
+delegational** unless the text explicitly asks you both to do the same
+thing. When in doubt, ack briefly with your understanding ("On it — I'll
+take Y, leaving X to @peer") rather than silently grabbing all the work.
+
+Re-delegating to yourself is a failure mode. If you see yourself in the
+peer slot of your own outbound, you've mis-parsed — stop and reread the
+original message.
+
 ## Conversation history
 
 The `conversations/` folder in your workspace holds searchable transcripts of past sessions with this group. Use it to recall prior context when a request references something that happened before. For structured long-lived data, prefer dedicated files (`customers.md`, `preferences.md`, etc.); split any file over ~500 lines into a folder with an index.
