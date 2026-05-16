@@ -171,7 +171,7 @@ interface ParsedTomlBlock {
   values: Map<string, string>;
 }
 
-interface LocalMarketplacePlugin {
+interface MarketplacePlugin {
   marketplace: string;
   plugin: string;
   sourceRoot: string;
@@ -192,15 +192,15 @@ export interface CodexLocalMarketplacePluginCacheSyncResult {
 }
 
 /**
- * Materialize enabled local Codex marketplace plugins into Codex's installed
+ * Materialize enabled Codex marketplace plugins into Codex's installed
  * plugin cache.
  *
- * `codex plugin marketplace add ~/plugins/bootstrap` records the marketplace
- * source, but active prompt assembly reads enabled plugin skills from
- * `~/.codex/plugins/cache/<marketplace>/<plugin>/<install-id>/`. The TUI
- * installs remote plugins into that cache; for local host-managed plugin repos
- * we need the same cache shape so version bumps and skill edits pulled by the
- * host updater are visible to Codex and to mounted container runtimes.
+ * `codex plugin marketplace add ...` records the marketplace source, but active
+ * prompt assembly reads enabled plugin skills from
+ * `~/.codex/plugins/cache/<marketplace>/<plugin>/<install-id>/`. The TUI can
+ * install plugins into that cache; host-managed automation needs the same
+ * cache shape so version bumps and skill edits are visible to Codex and to
+ * mounted container runtimes.
  */
 export function syncCodexLocalMarketplacePluginCache(): CodexLocalMarketplacePluginCacheSyncResult {
   const home = os.homedir();
@@ -230,16 +230,17 @@ export function syncCodexLocalMarketplacePluginCache(): CodexLocalMarketplacePlu
     blocks.filter((b) => b.table === 'plugins' && tomlBool(b.values.get('enabled')) === true).map((b) => b.name),
   );
 
-  const localPlugins: LocalMarketplacePlugin[] = [];
+  const marketplacePlugins: MarketplacePlugin[] = [];
   for (const block of blocks) {
     if (block.table !== 'marketplaces') continue;
-    if (tomlString(block.values.get('source_type')) !== 'local') continue;
-    const source = tomlString(block.values.get('source'));
-    if (!source) {
-      result.skipped.push(`${block.name}:missing-source`);
+    const sourceType = tomlString(block.values.get('source_type'));
+    if (sourceType !== 'local' && sourceType !== 'git') continue;
+
+    const sourceRoot = resolveMarketplaceSourceRoot(block, sourceType, codexDir, home, result);
+    if (!sourceRoot) {
       continue;
     }
-    const sourceRoot = path.resolve(expandHome(source, home));
+
     const marketplacePath = path.join(sourceRoot, '.agents', 'plugins', 'marketplace.json');
     let marketplace: MarketplaceJson;
     try {
@@ -267,19 +268,19 @@ export function syncCodexLocalMarketplacePluginCache(): CodexLocalMarketplacePlu
         continue;
       }
       const cacheRoot = path.join(target, block.name, pluginName);
-      localPlugins.push({
+      marketplacePlugins.push({
         marketplace: block.name,
         plugin: pluginName,
         sourceRoot,
         pluginRoot,
         cacheRoot,
-        cachePath: path.join(cacheRoot, 'local'),
+        cachePath: path.join(cacheRoot, sourceType === 'local' ? 'local' : marketplaceInstallId(block)),
         enabled: enabledPlugins.has(`${pluginName}@${block.name}`),
       });
     }
   }
 
-  for (const plugin of localPlugins) {
+  for (const plugin of marketplacePlugins) {
     if (!plugin.enabled) {
       result.skipped.push(`${plugin.plugin}@${plugin.marketplace}:disabled`);
       continue;
@@ -295,8 +296,8 @@ export function syncCodexLocalMarketplacePluginCache(): CodexLocalMarketplacePlu
     }
   }
 
-  const desiredCachePaths = new Set(localPlugins.filter((p) => p.enabled).map((p) => path.resolve(p.cachePath)));
-  for (const plugin of localPlugins) {
+  const desiredCachePaths = new Set(marketplacePlugins.filter((p) => p.enabled).map((p) => path.resolve(p.cachePath)));
+  for (const plugin of marketplacePlugins) {
     const cacheRoot = path.resolve(plugin.cacheRoot);
     if (!isInsidePath(target, cacheRoot) || !fs.existsSync(cacheRoot)) continue;
     let entries: fs.Dirent[];
@@ -559,6 +560,36 @@ function expandHome(p: string, home: string): string {
   if (p === '~') return home;
   if (p.startsWith(`~${path.sep}`)) return path.join(home, p.slice(2));
   return p;
+}
+
+function resolveMarketplaceSourceRoot(
+  block: ParsedTomlBlock,
+  sourceType: string,
+  codexDir: string,
+  home: string,
+  result: CodexLocalMarketplacePluginCacheSyncResult,
+): string | null {
+  if (sourceType === 'local') {
+    const source = tomlString(block.values.get('source'));
+    if (!source) {
+      result.skipped.push(`${block.name}:missing-source`);
+      return null;
+    }
+    return path.resolve(expandHome(source, home));
+  }
+
+  const sourceRoot = path.join(codexDir, '.tmp', 'marketplaces', block.name);
+  if (!fs.existsSync(sourceRoot)) {
+    result.skipped.push(`${block.name}:missing-git-marketplace-cache`);
+    return null;
+  }
+  return sourceRoot;
+}
+
+function marketplaceInstallId(block: ParsedTomlBlock): string {
+  const revision = tomlString(block.values.get('last_revision'));
+  if (revision) return revision.slice(0, 8);
+  return 'git';
 }
 
 function isInsidePath(parent: string, child: string): boolean {

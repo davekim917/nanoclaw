@@ -124,4 +124,52 @@ describe('syncCodexLocalMarketplacePluginCache', () => {
       ),
     ).toBe(false);
   });
+
+  it('copies enabled Git marketplace plugins from Codex marketplace checkouts using the latest revision', () => {
+    const marketplaceRoot = path.join(tmpDir, '.codex', '.tmp', 'marketplaces', 'davekim917-bootstrap');
+    const pluginRoot = path.join(marketplaceRoot, 'plugins', 'workflow-codex');
+    writeCodexPlugin(pluginRoot, '0.1.0', 'git body');
+    writeJson(path.join(marketplaceRoot, '.agents', 'plugins', 'marketplace.json'), {
+      name: 'davekim917-bootstrap',
+      plugins: [
+        {
+          name: 'bootstrap-workflow-codex',
+          source: { source: 'local', path: './plugins/workflow-codex' },
+        },
+      ],
+    });
+    fs.mkdirSync(path.join(tmpDir, '.codex'), { recursive: true });
+    fs.writeFileSync(
+      path.join(tmpDir, '.codex', 'config.toml'),
+      [
+        '[plugins."bootstrap-workflow-codex@davekim917-bootstrap"]',
+        'enabled = true',
+        '',
+        '[marketplaces.davekim917-bootstrap]',
+        'source_type = "git"',
+        'source = "https://github.com/davekim917/bootstrap.git"',
+        'ref = "main"',
+        'last_revision = "3eb8fabbac0f019a8b65e061db96673d3b43ef1a"',
+        '',
+      ].join('\n'),
+    );
+
+    const result = syncCodexLocalMarketplacePluginCache();
+
+    expect(result.errors).toEqual([]);
+    expect(result.installed).toEqual(['bootstrap-workflow-codex@davekim917-bootstrap']);
+    const cachedSkill = path.join(
+      tmpDir,
+      '.codex',
+      'plugins',
+      'cache',
+      'davekim917-bootstrap',
+      'bootstrap-workflow-codex',
+      '3eb8fabb',
+      'skills',
+      'team-build',
+      'SKILL.md',
+    );
+    expect(fs.readFileSync(cachedSkill, 'utf-8')).toContain('git body');
+  });
 });

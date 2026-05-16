@@ -52,12 +52,12 @@ export interface UpdateResult {
 export interface CodexSurfaceRefreshResult {
   skills?: ReturnType<typeof syncCodexPluginSkills>;
   subagents?: ReturnType<typeof syncCodexSubagents>;
-  localPluginCache?: ReturnType<typeof syncCodexLocalMarketplacePluginCache>;
   marketplaceUpgrade?: {
     changed: boolean;
     output?: string;
     error?: string;
   };
+  localPluginCache?: ReturnType<typeof syncCodexLocalMarketplacePluginCache>;
 }
 
 async function updatePlugin(pluginPath: string, name: string): Promise<UpdateResult> {
@@ -121,12 +121,11 @@ export async function runPluginUpdates(): Promise<UpdateResult[]> {
 /**
  * Refresh every Codex surface derived from plugin repos.
  *
- * Local Codex marketplaces (for example `~/plugins/bootstrap`) are copied into
- * Codex's installed plugin cache after `git pull`. Git-backed Codex
- * marketplaces use Codex's own cache, so run `codex plugin marketplace
- * upgrade` as well. The legacy `.agents/skills` and `.codex/agents` mirrors
- * remain for non-native plugin surfaces, but plugin-native workflow skills are
- * excluded by `plugin-skill-discovery`.
+ * Codex marketplaces are copied into Codex's installed plugin cache after local
+ * `git pull` and after Codex's own Git marketplace checkout is upgraded. The
+ * legacy `.agents/skills` and `.codex/agents` mirrors remain for non-native
+ * plugin surfaces, but plugin-native workflow skills are excluded by
+ * `plugin-skill-discovery`.
  */
 export async function refreshCodexPluginSurfaces(): Promise<CodexSurfaceRefreshResult> {
   const result: CodexSurfaceRefreshResult = {};
@@ -159,8 +158,26 @@ export async function refreshCodexPluginSurfaces(): Promise<CodexSurfaceRefreshR
   }
 
   try {
+    const { stdout, stderr } = await execFileAsync('codex', ['plugin', 'marketplace', 'upgrade'], {
+      timeout: CODEX_MARKETPLACE_UPGRADE_TIMEOUT_MS,
+      encoding: 'utf-8',
+    });
+    const output = [stdout.trim(), stderr.trim()].filter(Boolean).join('\n');
+    const changed =
+      !/(No configured Git marketplaces to upgrade\.|All configured Git marketplaces are already up to date\.)/.test(
+        output,
+      );
+    result.marketplaceUpgrade = { changed, output };
+    log.info('Codex marketplace upgrade completed', { changed, output });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    result.marketplaceUpgrade = { changed: false, error: msg };
+    log.warn('Codex marketplace upgrade failed', { err: msg });
+  }
+
+  try {
     result.localPluginCache = syncCodexLocalMarketplacePluginCache();
-    log.info('Codex local marketplace plugin cache refreshed', {
+    log.info('Codex marketplace plugin cache refreshed', {
       target: result.localPluginCache.target,
       marketplaces: result.localPluginCache.marketplaces,
       installed: result.localPluginCache.installed.length,
@@ -170,22 +187,7 @@ export async function refreshCodexPluginSurfaces(): Promise<CodexSurfaceRefreshR
       errors: result.localPluginCache.errors.length,
     });
   } catch (err) {
-    log.warn('Codex local marketplace plugin cache refresh failed', { err });
-  }
-
-  try {
-    const { stdout, stderr } = await execFileAsync('codex', ['plugin', 'marketplace', 'upgrade'], {
-      timeout: CODEX_MARKETPLACE_UPGRADE_TIMEOUT_MS,
-      encoding: 'utf-8',
-    });
-    const output = [stdout.trim(), stderr.trim()].filter(Boolean).join('\n');
-    const changed = !/No configured Git marketplaces to upgrade\./.test(output);
-    result.marketplaceUpgrade = { changed, output };
-    log.info('Codex marketplace upgrade completed', { changed, output });
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    result.marketplaceUpgrade = { changed: false, error: msg };
-    log.warn('Codex marketplace upgrade failed', { err: msg });
+    log.warn('Codex marketplace plugin cache refresh failed', { err });
   }
 
   return result;
