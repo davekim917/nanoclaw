@@ -278,6 +278,52 @@ describe('decideStuckAction', () => {
     });
     expect(res.action).toBe('kill-claim');
   });
+
+  it('does not kill-ceiling when stale heartbeat predates spawn and we are in grace', () => {
+    // Heartbeat on disk is from a long-dead prior container instance; the
+    // fresh container has only been alive for 10s and hasn't touched the
+    // heartbeat file yet. Without this protection, a host restart would
+    // SIGKILL every freshly-spawned container whose previous heartbeat was
+    // already past the ceiling — the exact respawn loop seen in the
+    // 2026-05-15 incident.
+    const res = decideStuckAction({
+      now: BASE,
+      heartbeatMtimeMs: BASE - 2 * ABSOLUTE_CEILING_MS, // 1h stale
+      containerState: null,
+      claims: [],
+      spawnedAtMs: BASE - 10_000, // 10s ago
+    });
+    expect(res.action).toBe('ok');
+  });
+
+  it('does kill-ceiling once spawn-grace has elapsed without a fresh heartbeat', () => {
+    // Container has been alive long enough that the agent-runner should
+    // have written its first heartbeat. Still seeing prior-container's
+    // stale mtime → kill is the right call (the new container is wedged).
+    const res = decideStuckAction({
+      now: BASE,
+      heartbeatMtimeMs: BASE - 2 * ABSOLUTE_CEILING_MS,
+      containerState: null,
+      claims: [],
+      spawnedAtMs: BASE - SPAWN_GRACE_MS - 5_000, // past grace
+    });
+    expect(res.action).toBe('kill-ceiling');
+  });
+
+  it('does kill-ceiling when heartbeat predates spawn but ages past ceiling AFTER spawn', () => {
+    // Pathological: heartbeat is newer than spawn (so it's the current
+    // container's own write), but it's still > 30 min old. That means the
+    // current container has gone genuinely silent for the full ceiling
+    // window — kill is correct.
+    const res = decideStuckAction({
+      now: BASE,
+      heartbeatMtimeMs: BASE - 35 * 60 * 1000, // 35 min ago
+      containerState: null,
+      claims: [],
+      spawnedAtMs: BASE - 40 * 60 * 1000, // spawned before the heartbeat
+    });
+    expect(res.action).toBe('kill-ceiling');
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -107,10 +107,7 @@ export const SPAWN_GRACE_MS = 60 * 1000;
 // Tunable via PENDING_MESSAGE_MAX_AGE_HOURS (default 24).
 const parsedMaxAgeHours = Number(process.env.PENDING_MESSAGE_MAX_AGE_HOURS);
 export const PENDING_MESSAGE_MAX_AGE_MS =
-  (Number.isFinite(parsedMaxAgeHours) && parsedMaxAgeHours > 0 ? parsedMaxAgeHours : 24) *
-  60 *
-  60 *
-  1000;
+  (Number.isFinite(parsedMaxAgeHours) && parsedMaxAgeHours > 0 ? parsedMaxAgeHours : 24) * 60 * 60 * 1000;
 const MAX_TRIES = 5;
 const BACKOFF_BASE_MS = 5000;
 
@@ -151,7 +148,21 @@ export function decideStuckAction(args: {
     const heartbeatAge = now - heartbeatMtimeMs;
     const ceiling = Math.max(ABSOLUTE_CEILING_MS, declaredBashMs ?? 0);
     if (heartbeatAge > ceiling) {
-      return { action: 'kill-ceiling', heartbeatAgeMs: heartbeatAge, ceilingMs: ceiling };
+      // Skip kill when the stale heartbeat is from a PRIOR container
+      // instance AND we're still inside the spawn-grace window. The
+      // heartbeat file persists across container restarts at a host-side
+      // path mounted into /workspace/.heartbeat — the new container
+      // inherits the previous instance's stale mtime until its first
+      // poll-loop iteration touches it. Without this, a host restart
+      // (or any post-crash respawn for a session whose previous heartbeat
+      // had already aged past the ceiling) SIGKILLs the fresh container
+      // before the agent-runner can mark itself alive, creating an
+      // infinite spawn → kill → respawn loop.
+      const inSpawnGrace = spawnedAtMs > 0 && now - spawnedAtMs < SPAWN_GRACE_MS;
+      const heartbeatFromPriorContainer = spawnedAtMs > 0 && heartbeatMtimeMs < spawnedAtMs;
+      if (!(inSpawnGrace && heartbeatFromPriorContainer)) {
+        return { action: 'kill-ceiling', heartbeatAgeMs: heartbeatAge, ceilingMs: ceiling };
+      }
     }
   }
 
