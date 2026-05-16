@@ -602,6 +602,13 @@ export async function runChatStreamSweep(
   store: MemoryStore,
   health: HealthRecorder,
 ): Promise<SweepResult> {
+  // Nothing to do if no groups are memory-enabled. Skipping early avoids
+  // opening archive.db unnecessarily, which lets the unit tests run on a
+  // tmpfs where DATA_DIR/archive.db has never been created.
+  if (groups.length === 0) {
+    return { groupsProcessed: 0, pairsClassified: 0, factsWritten: 0, failures: 0, poisoned: 0 };
+  }
+
   const ownArchiveDb = !_archiveDb;
   const archiveDb = _archiveDb ?? new Database(path.join(DATA_DIR, 'archive.db'), { readonly: true });
   const ingestDb = getIngestDb();
