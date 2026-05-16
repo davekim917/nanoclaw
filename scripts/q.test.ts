@@ -36,7 +36,7 @@ describe('scripts/q.ts', () => {
   });
 
   function run(sql: string): { stdout: string; stderr: string; status: number } {
-    const r = spawnSync('pnpm', ['exec', 'tsx', Q, dbPath, sql], {
+    const r = spawnSync(process.execPath, ['--import', 'tsx', Q, dbPath, sql], {
       encoding: 'utf-8',
       cwd: path.resolve(__dirname, '..'),
     });
@@ -77,15 +77,15 @@ describe('scripts/q.ts', () => {
     expect(r.status).toBe(0);
 
     const db = new Database(dbPath, { readonly: true });
-    const ids = (db.prepare('SELECT id FROM t ORDER BY id').all() as { id: number }[]).map(
-      (r) => r.id,
-    );
+    const ids = (db.prepare('SELECT id FROM t ORDER BY id').all() as { id: number }[]).map((r) => r.id);
     db.close();
     expect(ids).toEqual([2, 9]);
   });
 
   it('WITH...DELETE is treated as a mutation, not a query', () => {
-    const r = run("WITH stale AS (SELECT id FROM t WHERE name = 'alice') DELETE FROM t WHERE id IN (SELECT id FROM stale)");
+    const r = run(
+      "WITH stale AS (SELECT id FROM t WHERE name = 'alice') DELETE FROM t WHERE id IN (SELECT id FROM stale)",
+    );
     expect(r.status).toBe(0);
     expect(r.stdout).toBe('');
 
@@ -96,7 +96,7 @@ describe('scripts/q.ts', () => {
   });
 
   it('exits 2 with usage when args are missing', () => {
-    const r = spawnSync('pnpm', ['exec', 'tsx', Q], {
+    const r = spawnSync(process.execPath, ['--import', 'tsx', Q], {
       encoding: 'utf-8',
       cwd: path.resolve(__dirname, '..'),
     });

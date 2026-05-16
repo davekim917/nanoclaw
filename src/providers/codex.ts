@@ -10,6 +10,9 @@
  * - The in-container provider can rewrite config.toml freely on every
  *   wake with container-appropriate MCP server paths, without racing
  *   other sessions or leaking per-session paths back to the host.
+ * - Host-installed Codex plugins remain resolvable in the container: config
+ *   preserves `[plugins.*]` tables, and the plugin cache is mounted read-only
+ *   at the matching `~/.codex/plugins` path.
  *
  * Env passthrough covers the two knobs that are read at runtime:
  *   OPENAI_API_KEY  — fallback auth when auth.json isn't a subscription token
@@ -43,9 +46,56 @@ function stripMcpServerBlocks(toml: string): string {
   return out.join('\n').trimEnd() + '\n';
 }
 
+function unescapeTomlBasicString(value: string): string {
+  return value.replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+}
+
+function tomlBasicString(value: string): string {
+  return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+}
+
+function rewriteLocalMarketplaceSourcesForContainer(toml: string, hostHome: string): string {
+  const hostPluginsRoot = path.join(hostHome, 'plugins');
+  const lines = toml.split('\n');
+  return (
+    lines
+      .map((line) => {
+        const match = line.match(/^(\s*source\s*=\s*)"((?:\\.|[^"\\])*)"\s*$/);
+        if (!match) return line;
+        const source = unescapeTomlBasicString(match[2]);
+        const relative = path.relative(hostPluginsRoot, source);
+        if (relative.startsWith('..') || path.isAbsolute(relative) || relative === '') return line;
+        return `${match[1]}${tomlBasicString(path.posix.join('/workspace/plugins', relative.split(path.sep).join('/')))}`;
+      })
+      .join('\n')
+      .trimEnd() + '\n'
+  );
+}
+
+function resolveCodexPluginsDir(sourceDir: string, hostHome: string): string | null {
+  const candidates = [
+    // Per-group Codex homes may eventually carry their own plugin cache.
+    path.join(sourceDir, 'plugins'),
+    // Today plugin installs are normally global even when auth is scoped.
+    path.join(hostHome, '.codex', 'plugins'),
+  ];
+  const seen = new Set<string>();
+  for (const candidate of candidates) {
+    if (seen.has(candidate)) continue;
+    seen.add(candidate);
+    try {
+      if (fs.statSync(candidate).isDirectory()) return candidate;
+    } catch {
+      continue;
+    }
+  }
+  return null;
+}
+
 registerProviderContainerConfig('codex', (ctx) => {
   const codexDir = path.join(ctx.sessionDir, 'codex');
   fs.mkdirSync(codexDir, { recursive: true });
+  const mounts = [{ hostPath: codexDir, containerPath: '/home/node/.codex', readonly: false }];
 
   // Copy auth.json from the per-group Codex home when present
   // (`~/.codex-<folder>/auth.json`), otherwise fall back to global ~/.codex.
@@ -59,9 +109,17 @@ registerProviderContainerConfig('codex', (ctx) => {
       fs.copyFileSync(hostAuth, path.join(codexDir, 'auth.json'));
     }
     const hostConfig = path.join(sourceDir, 'config.toml');
-    if (fs.existsSync(hostConfig)) {
-      const stripped = stripMcpServerBlocks(fs.readFileSync(hostConfig, 'utf-8'));
-      fs.writeFileSync(path.join(codexDir, 'config.toml'), stripped);
+    const globalConfig = path.join(hostHome, '.codex', 'config.toml');
+    const configSource = fs.existsSync(hostConfig) ? hostConfig : globalConfig;
+    if (fs.existsSync(configSource)) {
+      const stripped = stripMcpServerBlocks(fs.readFileSync(configSource, 'utf-8'));
+      const rewritten = rewriteLocalMarketplaceSourcesForContainer(stripped, hostHome);
+      fs.writeFileSync(path.join(codexDir, 'config.toml'), rewritten);
+    }
+    const pluginsDir = resolveCodexPluginsDir(sourceDir, hostHome);
+    if (pluginsDir) {
+      fs.mkdirSync(path.join(codexDir, 'plugins'), { recursive: true });
+      mounts.push({ hostPath: pluginsDir, containerPath: '/home/node/.codex/plugins', readonly: true });
     }
   }
 
@@ -72,7 +130,7 @@ registerProviderContainerConfig('codex', (ctx) => {
   }
 
   return {
-    mounts: [{ hostPath: codexDir, containerPath: '/home/node/.codex', readonly: false }],
+    mounts,
     env,
   };
 });

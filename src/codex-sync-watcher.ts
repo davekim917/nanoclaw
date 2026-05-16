@@ -11,14 +11,17 @@
  *   - `~/.claude/` glob `*.md`                     — any `@`-included file (RTK.md today,
  *                                                    anything else Dave adds tomorrow)
  *   - `~/.claude/agents/*.md`                      — Claude personal-scope subagents
+ *   - `~/.codex/config.toml`                       — local marketplace installs/enabled state
  *   - `~/plugins/` recursive `SKILL.md` files      — every plugin-bundled skill
+ *   - `~/plugins/` recursive `.codex-plugin` trees — Codex-native plugin installs
  *   - `~/plugins/**` recursive `agents/*.md`       — plugin-shipped subagents
  *   - `~/plugins/<plugin>` add/remove              — marketplace install/uninstall
  *
  * What it does on change:
  *   - debounce 5s (collapse rapid edits into one run)
  *   - acquire file lock at `~/.codex/.sync.lock` (concurrent fires no-op)
- *   - run both sync scripts via `pnpm exec tsx scripts/sync-codex-{agents-md,plugin-skills}.ts`
+ *   - refresh Codex AGENTS.md, mirrored portable skills, subagents, and local
+ *     marketplace plugin cache in-process
  *   - touch `~/.codex/.sync-heartbeat` on success for future healthcheck timer
  *
  * On startup:
@@ -36,10 +39,16 @@ import path from 'path';
 
 import chokidar from 'chokidar';
 
-import { syncCodexAgentsMd, syncCodexPluginSkills, syncCodexSubagents } from './codex-sync.js';
+import {
+  syncCodexAgentsMd,
+  syncCodexLocalMarketplacePluginCache,
+  syncCodexPluginSkills,
+  syncCodexSubagents,
+} from './codex-sync.js';
 
 const HOME = os.homedir();
 const CODEX_DIR = path.join(HOME, '.codex');
+const CODEX_CONFIG = path.join(CODEX_DIR, 'config.toml');
 const LOCK_FILE = path.join(CODEX_DIR, '.sync.lock');
 const HEARTBEAT_FILE = path.join(CODEX_DIR, '.sync-heartbeat');
 
@@ -50,10 +59,13 @@ const DEBOUNCE_MS = 5_000;
 const CLAUDE_DIR = path.join(HOME, '.claude');
 const PLUGINS_DIR = path.join(HOME, 'plugins');
 
-const WATCH_PATHS = [CLAUDE_DIR, PLUGINS_DIR];
+const WATCH_PATHS = [CLAUDE_DIR, PLUGINS_DIR, CODEX_CONFIG];
 
 /** Returns true if `eventPath` is a change we care about. */
 function isRelevantPath(eventPath: string): boolean {
+  if (eventPath === CODEX_CONFIG) {
+    return true;
+  }
   // ~/.claude — only top-level *.md files (behavioral rules + @-includes).
   // Ignore everything else under .claude/ (projects, sessions, plugins cache,
   // hooks, statusline, etc.). path.dirname() catches the "direct child" case.
@@ -69,6 +81,12 @@ function isRelevantPath(eventPath: string): boolean {
   if (eventPath.startsWith(PLUGINS_DIR + path.sep) && path.basename(eventPath) === 'SKILL.md') {
     return true;
   }
+  // ~/plugins/<plugin>/.../.codex-plugin/plugin.json or any file under a
+  // Codex-native plugin root. These are installed through Codex marketplace
+  // metadata and mirrored into ~/.codex/plugins/cache for active sessions.
+  if (eventPath.startsWith(PLUGINS_DIR + path.sep) && isUnderCodexPluginRoot(eventPath)) {
+    return true;
+  }
   // ~/plugins/<plugin>/<...>/agents/<name>.md — plugin-shipped subagents.
   // The immediate parent dir must be named exactly `agents` (catches both
   // top-level and nested-sub-plugin layouts) and the file must be `.md`.
@@ -78,6 +96,18 @@ function isRelevantPath(eventPath: string): boolean {
     path.basename(path.dirname(eventPath)) === 'agents'
   ) {
     return true;
+  }
+  return false;
+}
+
+function isUnderCodexPluginRoot(eventPath: string): boolean {
+  let current = path.dirname(eventPath);
+  while (current.startsWith(PLUGINS_DIR + path.sep)) {
+    if (fs.existsSync(path.join(current, '.codex-plugin', 'plugin.json'))) {
+      return true;
+    }
+    if (path.dirname(current) === current) break;
+    current = path.dirname(current);
   }
   return false;
 }
@@ -237,6 +267,13 @@ async function runSync(trigger: string): Promise<void> {
         `writes=${subagentsResult.writes} unchangedFiles=${subagentsResult.unchangedFiles} ` +
         `removedFiles=${subagentsResult.removedFiles} skipped=${subagentsResult.skipped.length} ` +
         `targets=${subagentsResult.targets.join(',')}`,
+    );
+    const localPluginCacheResult = syncCodexLocalMarketplacePluginCache();
+    log(
+      `local-plugin-cache: ${localPluginCacheResult.target} — marketplaces=${localPluginCacheResult.marketplaces} ` +
+        `installed=${localPluginCacheResult.installed.length} updated=${localPluginCacheResult.updated.length} ` +
+        `removed=${localPluginCacheResult.removed.length} skipped=${localPluginCacheResult.skipped.length} ` +
+        `errors=${localPluginCacheResult.errors.length}`,
     );
     fs.writeFileSync(HEARTBEAT_FILE, `${new Date().toISOString()} ${trigger}\n`);
     success = true;

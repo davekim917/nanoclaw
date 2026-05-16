@@ -12,6 +12,8 @@
  * `/home/node/.codex-runtime/`, populated with:
  *   - a symlink to the mounted host `auth.json` (so OAuth refresh still
  *     persists back to the host)
+ *   - a symlink to the mounted host `plugins/` cache, so `[plugins.*]`
+ *     config blocks resolve the same installed Codex plugins in peer mode
  *   - a config.toml that wraps the host's config with the additional MCP
  *     servers the agent-runner has wired (including `nanoclaw`).
  *
@@ -29,10 +31,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { tomlBasicString } from './providers/codex-app-server.js';
-import {
-  discoverPortableSkills,
-  syncSkillSymlinks as syncDiscoveredSkillSymlinks,
-} from './plugin-skill-discovery.js';
+import { discoverPortableSkills, syncSkillSymlinks as syncDiscoveredSkillSymlinks } from './plugin-skill-discovery.js';
 import type { McpServerConfig } from './providers/types.js';
 
 const HOST_CODEX_DIR = '/home/node/.codex';
@@ -61,10 +60,7 @@ export function parseHostMcpServersForTest(toml: string): Record<string, McpServ
   return parseHostMcpServers(toml);
 }
 
-export function buildMergedConfigForTest(
-  hostConfig: string,
-  mcpServers: Record<string, McpServerConfig>,
-): string {
+export function buildMergedConfigForTest(hostConfig: string, mcpServers: Record<string, McpServerConfig>): string {
   return buildMergedConfig(hostConfig, mcpServers);
 }
 
@@ -156,8 +152,7 @@ function parseHostMcpServers(toml: string): Record<string, McpServerConfig> {
     const explicitType = partial.type as string | undefined;
     const url = partial.url as string | undefined;
     const command = partial.command as string | undefined;
-    const inferredType =
-      explicitType ?? (url ? 'http' : command ? 'stdio' : undefined);
+    const inferredType = explicitType ?? (url ? 'http' : command ? 'stdio' : undefined);
     if (inferredType === 'http' || inferredType === 'sse') {
       if (url) result[currentName] = { type: inferredType, url };
     } else if (inferredType === 'stdio') {
@@ -280,7 +275,7 @@ function splitTomlArray(inside: string): string[] {
  */
 function buildMergedConfig(hostConfig: string, mcpServers: Record<string, McpServerConfig>): string {
   const { stripped } = stripExistingMcpServers(hostConfig);
-  const base = stripped.trimEnd();
+  const base = rewriteLocalMarketplaceSourcesForContainer(stripped).trimEnd();
   const hostMcps = parseHostMcpServers(hostConfig);
 
   // Runtime wins on name collision — that's why `mcpServers` is spread second.
@@ -292,6 +287,29 @@ function buildMergedConfig(hostConfig: string, mcpServers: Record<string, McpSer
     mcpLines.push('');
   }
   return [base, '', '# --- nanoclaw merged MCP servers (host ∪ container) ---', '', ...mcpLines].join('\n');
+}
+
+function rewriteLocalMarketplaceSourcesForContainer(toml: string): string {
+  return (
+    toml
+      .split('\n')
+      .map((line) => {
+        const match = line.match(/^(\s*source\s*=\s*)"((?:\\.|[^"\\])*)"\s*$/);
+        if (!match) return line;
+        const source = match[2].replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+        const marker = '/plugins/';
+        const markerAt = source.indexOf(marker);
+        if (markerAt < 0) return line;
+        const relative = source.slice(markerAt + marker.length);
+        const pluginName = relative.split('/')[0];
+        if (!pluginName) return line;
+        const containerSource = `/workspace/plugins/${relative}`;
+        if (!fs.existsSync(`/workspace/plugins/${pluginName}`)) return line;
+        return `${match[1]}${tomlBasicString(containerSource)}`;
+      })
+      .join('\n')
+      .trimEnd() + '\n'
+  );
 }
 
 /**
@@ -336,7 +354,11 @@ export function setupCodexRuntime(mcpServers: Record<string, McpServerConfig>): 
   const runtimeAgents = path.join(RUNTIME_CODEX_DIR, 'AGENTS.md');
   if (fs.existsSync(hostAgents)) {
     try {
-      try { fs.unlinkSync(runtimeAgents); } catch { /* fresh */ }
+      try {
+        fs.unlinkSync(runtimeAgents);
+      } catch {
+        /* fresh */
+      }
       fs.symlinkSync(hostAgents, runtimeAgents);
     } catch (err) {
       log(`Failed to symlink AGENTS.md: ${err instanceof Error ? err.message : String(err)}`);
@@ -354,10 +376,29 @@ export function setupCodexRuntime(mcpServers: Record<string, McpServerConfig>): 
   const runtimeAgentsDir = path.join(RUNTIME_CODEX_DIR, 'agents');
   if (fs.existsSync(hostAgentsDir)) {
     try {
-      try { fs.unlinkSync(runtimeAgentsDir); } catch { /* fresh */ }
+      try {
+        fs.unlinkSync(runtimeAgentsDir);
+      } catch {
+        /* fresh */
+      }
       fs.symlinkSync(hostAgentsDir, runtimeAgentsDir);
     } catch (err) {
       log(`Failed to symlink agents/: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  // plugins/: preserve native Codex plugin installs for codex-as-peer mode.
+  // The merged config below keeps non-MCP blocks, including `[plugins.*]`;
+  // without this symlink those blocks can point at a cache tree that is absent
+  // from CODEX_HOME and Codex falls back to whatever legacy skill mirrors exist.
+  const hostPluginsDir = path.join(HOST_CODEX_DIR, 'plugins');
+  const runtimePluginsDir = path.join(RUNTIME_CODEX_DIR, 'plugins');
+  if (fs.existsSync(hostPluginsDir)) {
+    try {
+      fs.rmSync(runtimePluginsDir, { recursive: true, force: true });
+      fs.symlinkSync(hostPluginsDir, runtimePluginsDir);
+    } catch (err) {
+      log(`Failed to symlink plugins/: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -438,4 +479,3 @@ export function syncCodexSkillsMirror(): void {
       `removed=${result.removed.length} skipped=${result.skipped.length}`,
   );
 }
-

@@ -985,6 +985,27 @@ function buildMounts(
         const hostCodex = resolveCodexAuthDir(agentGroup.folder);
         if (fs.existsSync(hostCodex)) {
           mounts.push({ hostPath: hostCodex, containerPath: '/home/node/.codex', readonly: false });
+          const globalCodex = path.join(os.homedir(), '.codex');
+          if (hostCodex !== globalCodex) {
+            const scopedConfig = path.join(hostCodex, 'config.toml');
+            const globalConfig = path.join(globalCodex, 'config.toml');
+            if (!fs.existsSync(scopedConfig) && fs.existsSync(globalConfig)) {
+              mounts.push({
+                hostPath: globalConfig,
+                containerPath: '/home/node/.codex/config.toml',
+                readonly: true,
+              });
+            }
+            const scopedPlugins = path.join(hostCodex, 'plugins');
+            const globalPlugins = path.join(globalCodex, 'plugins');
+            if (!fs.existsSync(scopedPlugins) && fs.existsSync(globalPlugins)) {
+              mounts.push({
+                hostPath: globalPlugins,
+                containerPath: '/home/node/.codex/plugins',
+                readonly: true,
+              });
+            }
+          }
         }
       }
     }

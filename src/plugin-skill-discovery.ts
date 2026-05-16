@@ -27,6 +27,9 @@
  *   - Deprecated dirs under `<plugin>/deprecated/`
  *   - Plugins under `<plugin>/plugins/<sub>/skills/` when `<sub>` matches a
  *     plugin-specific denylist (e.g. bootstrap-workflow within davekim917/bootstrap)
+ *   - Codex-native plugin skill roots that are loaded through Codex plugin
+ *     metadata. Mirroring those into `~/.agents/skills` would create a second
+ *     same-named install path and make source precedence ambiguous.
  */
 import fs from 'fs';
 import path from 'path';
@@ -61,7 +64,14 @@ const DEFAULT_DENY_PLUGINS = new Set<string>([
  *
  * Format: `<plugin>/<sub-plugin-skills-segment>`
  */
-const DENY_SUB_PLUGIN_SKILL_DIRS = new Set<string>(['bootstrap/plugins/workflow/skills']);
+const DENY_SUB_PLUGIN_SKILL_DIRS = new Set<string>([
+  // Claude workflow: not portable to Codex directly.
+  'bootstrap/plugins/workflow/skills',
+  // Codex workflow: installed through `.codex-plugin/plugin.json`, not the
+  // legacy skills mirror. The skill names intentionally match the Claude
+  // workflow, so mirroring would make plugin install precedence ambiguous.
+  'bootstrap/plugins/workflow-codex/skills',
+]);
 
 /**
  * Path segments that mean "runtime-specific copy of a skill" — we prefer the

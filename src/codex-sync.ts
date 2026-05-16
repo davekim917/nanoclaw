@@ -165,6 +165,159 @@ export function syncCodexSubagents(): SubagentsSyncResult {
   };
 }
 
+interface ParsedTomlBlock {
+  table: string;
+  name: string;
+  values: Map<string, string>;
+}
+
+interface LocalMarketplacePlugin {
+  marketplace: string;
+  plugin: string;
+  sourceRoot: string;
+  pluginRoot: string;
+  cacheRoot: string;
+  cachePath: string;
+  enabled: boolean;
+}
+
+export interface CodexLocalMarketplacePluginCacheSyncResult {
+  target: string;
+  marketplaces: number;
+  installed: string[];
+  updated: string[];
+  removed: string[];
+  skipped: string[];
+  errors: string[];
+}
+
+/**
+ * Materialize enabled local Codex marketplace plugins into Codex's installed
+ * plugin cache.
+ *
+ * `codex plugin marketplace add ~/plugins/bootstrap` records the marketplace
+ * source, but active prompt assembly reads enabled plugin skills from
+ * `~/.codex/plugins/cache/<marketplace>/<plugin>/<install-id>/`. The TUI
+ * installs remote plugins into that cache; for local host-managed plugin repos
+ * we need the same cache shape so version bumps and skill edits pulled by the
+ * host updater are visible to Codex and to mounted container runtimes.
+ */
+export function syncCodexLocalMarketplacePluginCache(): CodexLocalMarketplacePluginCacheSyncResult {
+  const home = os.homedir();
+  const codexDir = path.join(home, '.codex');
+  const target = path.join(codexDir, 'plugins', 'cache');
+  const configPath = path.join(codexDir, 'config.toml');
+  const result: CodexLocalMarketplacePluginCacheSyncResult = {
+    target,
+    marketplaces: 0,
+    installed: [],
+    updated: [],
+    removed: [],
+    skipped: [],
+    errors: [],
+  };
+
+  let config: string;
+  try {
+    config = fs.readFileSync(configPath, 'utf-8');
+  } catch {
+    result.skipped.push(`${configPath}:missing`);
+    return result;
+  }
+
+  const blocks = parseTomlBlocks(config);
+  const enabledPlugins = new Set(
+    blocks.filter((b) => b.table === 'plugins' && tomlBool(b.values.get('enabled')) === true).map((b) => b.name),
+  );
+
+  const localPlugins: LocalMarketplacePlugin[] = [];
+  for (const block of blocks) {
+    if (block.table !== 'marketplaces') continue;
+    if (tomlString(block.values.get('source_type')) !== 'local') continue;
+    const source = tomlString(block.values.get('source'));
+    if (!source) {
+      result.skipped.push(`${block.name}:missing-source`);
+      continue;
+    }
+    const sourceRoot = path.resolve(expandHome(source, home));
+    const marketplacePath = path.join(sourceRoot, '.agents', 'plugins', 'marketplace.json');
+    let marketplace: MarketplaceJson;
+    try {
+      marketplace = JSON.parse(fs.readFileSync(marketplacePath, 'utf-8')) as MarketplaceJson;
+    } catch (err) {
+      result.errors.push(`${block.name}:read-marketplace:${err instanceof Error ? err.message : String(err)}`);
+      continue;
+    }
+    result.marketplaces += 1;
+
+    for (const entry of marketplace.plugins ?? []) {
+      const pluginName = entry?.name;
+      const entrySource = entry?.source;
+      if (!pluginName || entrySource?.source !== 'local' || !entrySource.path) {
+        result.skipped.push(`${block.name}:unsupported-entry`);
+        continue;
+      }
+      const pluginRoot = path.resolve(sourceRoot, entrySource.path);
+      if (!isInsidePath(sourceRoot, pluginRoot)) {
+        result.skipped.push(`${block.name}/${pluginName}:outside-marketplace-root`);
+        continue;
+      }
+      if (!fs.existsSync(path.join(pluginRoot, '.codex-plugin', 'plugin.json'))) {
+        result.skipped.push(`${block.name}/${pluginName}:missing-plugin-json`);
+        continue;
+      }
+      const cacheRoot = path.join(target, block.name, pluginName);
+      localPlugins.push({
+        marketplace: block.name,
+        plugin: pluginName,
+        sourceRoot,
+        pluginRoot,
+        cacheRoot,
+        cachePath: path.join(cacheRoot, 'local'),
+        enabled: enabledPlugins.has(`${pluginName}@${block.name}`),
+      });
+    }
+  }
+
+  for (const plugin of localPlugins) {
+    if (!plugin.enabled) {
+      result.skipped.push(`${plugin.plugin}@${plugin.marketplace}:disabled`);
+      continue;
+    }
+    try {
+      const existed = fs.existsSync(plugin.cachePath);
+      replaceDirectory(plugin.pluginRoot, plugin.cachePath);
+      (existed ? result.updated : result.installed).push(`${plugin.plugin}@${plugin.marketplace}`);
+    } catch (err) {
+      result.errors.push(
+        `${plugin.plugin}@${plugin.marketplace}:copy:${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  const desiredCachePaths = new Set(localPlugins.filter((p) => p.enabled).map((p) => path.resolve(p.cachePath)));
+  for (const plugin of localPlugins) {
+    const cacheRoot = path.resolve(plugin.cacheRoot);
+    if (!isInsidePath(target, cacheRoot) || !fs.existsSync(cacheRoot)) continue;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(cacheRoot, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const entryPath = path.resolve(cacheRoot, entry.name);
+      if (desiredCachePaths.has(entryPath)) continue;
+      if (!isInsidePath(target, entryPath)) continue;
+      fs.rmSync(entryPath, { recursive: true, force: true });
+      result.removed.push(`${plugin.plugin}@${plugin.marketplace}/${entry.name}`);
+    }
+  }
+
+  return result;
+}
+
 interface OneDirResult {
   created: string[];
   unchanged: string[];
@@ -337,4 +490,90 @@ function walkPluginAgents(dir: string, seen: Map<string, DiscoveredSubagent>, de
     }
     walkPluginAgents(childPath, seen, depth + 1);
   }
+}
+
+interface MarketplaceJson {
+  plugins?: MarketplaceEntry[];
+}
+
+interface MarketplaceEntry {
+  name?: string;
+  source?: {
+    source?: string;
+    path?: string;
+  };
+}
+
+function parseTomlBlocks(content: string): ParsedTomlBlock[] {
+  const blocks: ParsedTomlBlock[] = [];
+  let current: ParsedTomlBlock | null = null;
+
+  for (const line of content.split(/\r?\n/)) {
+    const header = line.match(/^\s*\[([^\]]+)]\s*$/);
+    if (header) {
+      const parsed = parseTableHeader(header[1]);
+      current = parsed;
+      if (current) blocks.push(current);
+      continue;
+    }
+    if (!current) continue;
+    const kv = line.match(/^\s*([A-Za-z0-9_-]+)\s*=\s*(.*?)\s*$/);
+    if (!kv) continue;
+    current.values.set(kv[1], kv[2].replace(/\s+#.*$/, ''));
+  }
+
+  return blocks;
+}
+
+function parseTableHeader(raw: string): ParsedTomlBlock | null {
+  const dot = raw.indexOf('.');
+  if (dot < 0) return null;
+  const table = raw.slice(0, dot);
+  if (table !== 'marketplaces' && table !== 'plugins') return null;
+  const name = tomlString(raw.slice(dot + 1)) ?? raw.slice(dot + 1);
+  return { table, name, values: new Map() };
+}
+
+function tomlString(value: string | undefined): string | null {
+  if (!value) return null;
+  const trimmed = value.trim();
+  if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    try {
+      return JSON.parse(trimmed) as string;
+    } catch {
+      return trimmed.slice(1, -1);
+    }
+  }
+  return trimmed;
+}
+
+function tomlBool(value: string | undefined): boolean | null {
+  if (!value) return null;
+  const trimmed = value.trim();
+  if (trimmed === 'true') return true;
+  if (trimmed === 'false') return false;
+  return null;
+}
+
+function expandHome(p: string, home: string): string {
+  if (p === '~') return home;
+  if (p.startsWith(`~${path.sep}`)) return path.join(home, p.slice(2));
+  return p;
+}
+
+function isInsidePath(parent: string, child: string): boolean {
+  const rel = path.relative(path.resolve(parent), path.resolve(child));
+  return rel === '' || (!!rel && !rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
+function replaceDirectory(source: string, target: string): void {
+  const resolvedTarget = path.resolve(target);
+  fs.mkdirSync(path.dirname(resolvedTarget), { recursive: true });
+  fs.rmSync(resolvedTarget, { recursive: true, force: true });
+  fs.cpSync(source, resolvedTarget, {
+    recursive: true,
+    dereference: false,
+    verbatimSymlinks: true,
+    filter: (src) => !src.split(path.sep).includes('.git'),
+  });
 }
