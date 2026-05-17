@@ -125,8 +125,16 @@ function flattenInner(filePath: string, visited: Set<string>, depth: number, opt
     // Don't intercept email-like patterns or things inside code fences;
     // a conservative heuristic: the `@` must be followed by a path
     // (containing / or .md) — not a bare identifier like `@param`.
+    //
+    // Whitespace in the ref means it's prose, not a path. Real paths
+    // never contain spaces (and quoted paths aren't supported in this
+    // syntax), so the presence of any whitespace is a strong "this is
+    // a sentence" signal. Without this, prose like "the @-mention itself
+    // is the signal." gets parsed as `@-mention itself is the signal.`
+    // → ENOENT on a nonexistent file, with the failure marker spliced
+    // mid-sentence into the composed AGENTS.md.
     const ref = match[2];
-    if (!/[\/\.]/.test(ref) || /@\w+\s/.test(line)) {
+    if (/\s/.test(ref) || !/[\/\.]/.test(ref) || /@\w+\s/.test(line)) {
       out.push(line);
       continue;
     }

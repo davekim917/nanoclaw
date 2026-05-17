@@ -85,6 +85,20 @@ describe('flattenClaudeMd', () => {
     expect(out).toContain('@param foo');
   });
 
+  it('does not treat prose lines starting with `@-word ...` as an include', () => {
+    // Field-observed: the line "  @-mention itself is the signal." in
+    // container/CLAUDE.md got parsed as `@-mention itself is the signal.`
+    // because the ref contains a `.` (matches the path heuristic) and the
+    // hyphen after `@` skipped the `@\w+` bare-identifier guard. The
+    // compositor tried to read the file and spliced an ENOENT marker
+    // mid-sentence into the AGENTS.md that codex agents read. The
+    // whitespace-in-ref guard catches all prose-shaped lines.
+    const file = write('CLAUDE.md', '  @-mention itself is the signal.\nNormal line.\n');
+    const out = flattenClaudeMd(file);
+    expect(out).toContain('@-mention itself is the signal.');
+    expect(out).not.toContain('agents-md-flatten: failed');
+  });
+
   it('translates container paths via the prefix map', () => {
     fs.mkdirSync(path.join(tmpDir, 'container'));
     fs.writeFileSync(path.join(tmpDir, 'container', 'global.md'), 'CONTAINER_GLOBAL\n');
