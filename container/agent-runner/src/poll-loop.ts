@@ -59,7 +59,8 @@ function isAllowedFileEventPath(p: string): boolean {
 }
 
 function sanitizeOutboundFilename(filename: string): string {
-  const base = path.basename(filename)
+  const base = path
+    .basename(filename)
     .replace(/[^\w .@()+,=[\]-]/g, '_')
     .replace(/\s+/g, ' ')
     .trim()
@@ -224,7 +225,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // claim them — leaving rows pending is the correct signal that they
     // weren't consumed. (Mirrors selectInTurnFollowUps' deferral logic.)
     if (!keep.some(isAdmissibleTrigger)) {
-      log(`All ${normalMessages.length} non-command message(s) gated by script or no admissible trigger, skipping query`);
+      log(
+        `All ${normalMessages.length} non-command message(s) gated by script or no admissible trigger, skipping query`,
+      );
       continue;
     }
 
@@ -280,9 +283,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // fallbacks OR once they're exhausted, fall through to the error
       // write. Ordered before isContextTooLong because prompt-too-long can
       // LOOK retryable in some error shapes, and the rotation cost is low.
-      const rotation = config.provider.isRetryable?.(err)
-        ? config.provider.rotateApiKey?.()
-        : undefined;
+      const rotation = config.provider.isRetryable?.(err) ? config.provider.rotateApiKey?.() : undefined;
       if (rotation?.rotated) {
         // Continuation is preserved across rotations: the SDK's `resume:`
         // reads a local .jsonl, and the Anthropic API has no account-bound
@@ -614,7 +615,9 @@ async function processQuery(
         if (!keep.some(isAdmissibleTrigger)) {
           if (skipped.length > 0) {
             markCompleted(skipped);
-            log(`Pre-task script skipped ${skipped.length} follow-up task(s); no admissible trigger remained, deferring context rows`);
+            log(
+              `Pre-task script skipped ${skipped.length} follow-up task(s); no admissible trigger remained, deferring context rows`,
+            );
           }
           return;
         }
@@ -885,23 +888,63 @@ export function dispatchFileAttachment(
  *
  * The agent must always wrap output in <message to="name">...</message>
  * blocks, even with a single destination. Bare text is scratchpad only.
+ *
+ * Tolerant of unclosed openers: when the agent emits a `<message to=…>`
+ * without a matching `</message>` (a common degradation mode after long
+ * turns, auto-compaction, or extended thinking), the body extends to
+ * either the next opener or end-of-text. Without this tolerance, the old
+ * regex required a closing tag — a missing close produced zero matches,
+ * the entire text fell through to the unwrapped-output fallback, and the
+ * literal `<message to=…>` markup leaked to Slack/Discord verbatim.
+ *
+ * Tag-stripping safety net: if the scratchpad ends up carrying any
+ * residual `<message…>` opener/closer text (e.g. the agent emitted
+ * `<message to="">` with an empty name that doesn't capture, or other
+ * malformed XML), we strip those tokens before posting to the fallback
+ * destination so users never see raw wrapper markup.
  */
-export function dispatchResultText(text: string, routing: RoutingContext): void {
-  const MESSAGE_RE = /<message\s+to="([^"]+)"\s*>([\s\S]*?)<\/message>/g;
+const MESSAGE_OPENER_RE = /<message\s+to="([^"]*)"\s*>/g;
+const MESSAGE_CLOSER = '</message>';
+// Tokens we strip from scratchpad / fallback text so the user never sees
+// raw wrapper markup even if the parser couldn't pair an opener with a
+// closer (e.g. opener with empty `to=""` that we ignored). Anything that
+// pairs cleanly is already consumed before this strip runs.
+const STRAY_WRAPPER_RE = /<\/?message(?:\s+to="[^"]*")?\s*>/g;
 
-  let match: RegExpExecArray | null;
+export function dispatchResultText(text: string, routing: RoutingContext): void {
+  type Opener = { index: number; endIndex: number; toName: string };
+  const openers: Opener[] = [];
+  MESSAGE_OPENER_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = MESSAGE_OPENER_RE.exec(text)) !== null) {
+    openers.push({ index: m.index, endIndex: MESSAGE_OPENER_RE.lastIndex, toName: m[1] });
+  }
+
   let sent = 0;
-  let lastIndex = 0;
+  let cursor = 0;
   const scratchpadParts: string[] = [];
 
-  while ((match = MESSAGE_RE.exec(text)) !== null) {
-    if (match.index > lastIndex) {
-      scratchpadParts.push(text.slice(lastIndex, match.index));
+  for (let i = 0; i < openers.length; i++) {
+    const opener = openers[i];
+    if (opener.index > cursor) {
+      scratchpadParts.push(text.slice(cursor, opener.index));
     }
-    const toName = match[1];
-    const body = match[2].trim();
-    lastIndex = MESSAGE_RE.lastIndex;
+    // Body endpoint precedence: explicit </message> before the next
+    // opener wins; otherwise the next opener; otherwise end-of-text.
+    const nextOpenerIdx = i + 1 < openers.length ? openers[i + 1].index : text.length;
+    const explicitClose = text.indexOf(MESSAGE_CLOSER, opener.endIndex);
+    const closeBeforeNext = explicitClose !== -1 && explicitClose <= nextOpenerIdx;
+    const bodyEnd = closeBeforeNext ? explicitClose : nextOpenerIdx;
+    const body = text.slice(opener.endIndex, bodyEnd).trim();
+    cursor = closeBeforeNext ? explicitClose + MESSAGE_CLOSER.length : nextOpenerIdx;
 
+    const toName = opener.toName;
+    if (!toName) {
+      // Opener with empty to="" — treat as malformed; body becomes scratchpad.
+      log(`Empty destination in <message to="">, dropping block`);
+      if (body) scratchpadParts.push(body);
+      continue;
+    }
     const dest = findByName(toName);
     if (!dest) {
       log(`Unknown destination in <message to="${toName}">, dropping block`);
@@ -911,11 +954,14 @@ export function dispatchResultText(text: string, routing: RoutingContext): void 
     sendToDestination(dest, body, routing);
     sent++;
   }
-  if (lastIndex < text.length) {
-    scratchpadParts.push(text.slice(lastIndex));
+  if (cursor < text.length) {
+    scratchpadParts.push(text.slice(cursor));
   }
 
-  const scratchpad = stripInternalTags(scratchpadParts.join(''));
+  // Strip any stray opener/closer tokens that escaped the structured
+  // pairing above — these would otherwise reach Slack/Discord verbatim
+  // via the unwrapped-output fallback below.
+  const scratchpad = stripInternalTags(scratchpadParts.join('').replace(STRAY_WRAPPER_RE, '')).trim();
 
   // Unwrapped-output fallback: if the agent forgot to wrap (a common
   // failure mode after long turns, auto-compaction, or extended thinking),
@@ -1024,10 +1070,7 @@ interface FlagIntent {
 }
 
 // Precedence: turn override → sticky → host-injected default (NANOCLAW_DEFAULT_EFFORT).
-function applyFlagBatch(
-  messages: MessageInRow[],
-  _routing: RoutingContext,
-): { model?: string; effort?: string } {
+function applyFlagBatch(messages: MessageInRow[], _routing: RoutingContext): { model?: string; effort?: string } {
   let intent: FlagIntent | undefined;
   for (const m of messages) {
     // Tasks carry flagIntent the same way chat messages do — used by scheduled
