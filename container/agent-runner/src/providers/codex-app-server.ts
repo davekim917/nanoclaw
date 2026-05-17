@@ -522,7 +522,14 @@ export function writeCodexHooksJson(opts?: { emailGateTimeoutSec?: number }): vo
 export function createCodexConfigOverrides(stickyConfig?: {
   reasoning_effort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
 }): string[] {
-  const overrides = ['features.use_linux_sandbox_bwrap=false'];
+  // `features.goals=true` enables Codex's goals feature for every container
+  // agent — same always-on pattern as `features.use_linux_sandbox_bwrap`.
+  // Using the `-c` CLI override (rather than persisting in config.toml)
+  // because writeCodexMcpConfigToml regenerates the config file per-spawn
+  // and CLI overrides take precedence either way; keeping the toggle here
+  // means it survives a config.toml rewrite and doesn't need a [features]
+  // block injected into the writer.
+  const overrides = ['features.use_linux_sandbox_bwrap=false', 'features.goals=true'];
   if (stickyConfig?.reasoning_effort) {
     overrides.push(`model_reasoning_effort="${stickyConfig.reasoning_effort}"`);
   }
