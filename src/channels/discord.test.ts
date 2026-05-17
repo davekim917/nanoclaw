@@ -4,6 +4,7 @@ import {
   isUserMessage,
   parseDiscordWorkspaces,
   resolveDiscordMentions,
+  resolveIncomingDiscordMentions,
   rewriteDiscordLinks,
   discordPostParent,
   discordCreateThread,
@@ -97,6 +98,77 @@ describe('resolveDiscordMentions', () => {
     const bots2 = new Map<string, DiscordBotIdentity>([['discord', { userId: '9', username: 'domain.com' }]]);
     expect(resolveDiscordMentions('contact user@domain.com today', bots2)).toBe('contact user@domain.com today');
     expect(resolveDiscordMentions('@domain.com hi', bots2)).toBe('<@9> hi');
+  });
+});
+
+describe('resolveIncomingDiscordMentions', () => {
+  const bots = new Map<string, DiscordBotIdentity>([
+    ['discord', { userId: '1478986205319135302', username: 'Axie' }],
+    ['discord-axie-codex', { userId: '1505246118940770375', username: 'Axie-Codex' }],
+  ]);
+
+  it('returns text unchanged when no bots are registered', () => {
+    // Without a bot registry the resolver has nothing to look up. Don't
+    // mangle the message — the agent will see raw IDs which is no worse
+    // than today.
+    expect(resolveIncomingDiscordMentions('<@1478986205319135302> hi', new Map())).toBe(
+      '<@1478986205319135302> hi',
+    );
+  });
+
+  it('rewrites a known bot snowflake to `@username`', () => {
+    expect(resolveIncomingDiscordMentions('<@1478986205319135302> take this', bots)).toBe(
+      '@Axie take this',
+    );
+  });
+
+  it('rewrites the nickname-mention form `<@!id>`', () => {
+    // Some Discord clients still emit the legacy nickname-mention form when
+    // the mentioned user has a server-specific nickname. Same target user,
+    // same resolution.
+    expect(resolveIncomingDiscordMentions('<@!1478986205319135302> take this', bots)).toBe(
+      '@Axie take this',
+    );
+  });
+
+  it('rewrites multiple bot mentions in one message', () => {
+    // The exact wire form from the field bug: Dave wrote
+    // `@Axie-Codex @Axie take turns roasting me. @Axie go first`
+    // which Discord delivered as raw snowflakes. Without this resolver
+    // Axie had no way to know its peer was called "Axie-Codex" and
+    // resorted to `<@sibling>`.
+    const raw =
+      '<@1505246118940770375> <@1478986205319135302> take turns roasting me. <@1478986205319135302> go first';
+    expect(resolveIncomingDiscordMentions(raw, bots)).toBe(
+      '@Axie-Codex @Axie take turns roasting me. @Axie go first',
+    );
+  });
+
+  it('leaves unknown snowflakes unchanged', () => {
+    // Human users and out-of-process bots aren't in the registry. Fail
+    // soft — the agent reads sender info from author metadata, not from
+    // inline mentions of humans.
+    expect(resolveIncomingDiscordMentions('<@608746260706361344> hello bots', bots)).toBe(
+      '<@608746260706361344> hello bots',
+    );
+  });
+
+  it('does not touch role mentions `<@&id>`', () => {
+    // The regex demands `\d+` so the `&` prefix can't match and roles
+    // pass through unchanged. Same for channel mentions.
+    expect(resolveIncomingDiscordMentions('<@&999999999> hi', bots)).toBe('<@&999999999> hi');
+    expect(resolveIncomingDiscordMentions('<#123456789> see here', bots)).toBe('<#123456789> see here');
+  });
+
+  it('round-trips with the outbound rewriter', () => {
+    // The whole point: inbound `<@id>` → `@username`, agent writes
+    // `@username`, outbound `@username` → `<@id>`. End-to-end the wire
+    // form is preserved while the agent only ever handles names.
+    const inboundRaw = '<@1505246118940770375> please review';
+    const agentSees = resolveIncomingDiscordMentions(inboundRaw, bots);
+    expect(agentSees).toBe('@Axie-Codex please review');
+    const agentReplies = `Sure, ${agentSees.split(' ').slice(0, 1)[0]} — on it`;
+    expect(resolveDiscordMentions(agentReplies, bots)).toBe('Sure, <@1505246118940770375> — on it');
   });
 });
 

@@ -80,6 +80,16 @@ export interface ChatSdkBridgeConfig {
    */
   transformOutboundMarkdown?: (markdown: string) => string;
   /**
+   * Optional transform applied to the inbound message's `text` field before
+   * it lands in `messages_in`. Used by channels whose raw wire format leaks
+   * non-human-readable user references (Discord's `<@123456789>` snowflake
+   * mentions are the canonical case): the agent reads `content.text` and
+   * has no way to tell which snowflake is "@Axie-Codex" vs a stranger.
+   * Resolving here keeps the round-trip symmetric — the outbound rewriter
+   * already turns `@Axie-Codex` back into `<@id>` on the way out.
+   */
+  transformInboundText?: (text: string) => string;
+  /**
    * Optional filter applied to inbound Chat SDK messages before they reach
    * the host router. Return false to drop. Used by channels that need to
    * suppress platform-emitted system messages the SDK doesn't filter (e.g.
@@ -301,6 +311,14 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       serialized.senderId = author.userId;
       serialized.sender = name;
       serialized.senderName = name;
+    }
+
+    // Resolve raw platform mention syntax (Discord's `<@snowflake>`) into
+    // names the agent can actually use. Slack already resolves usernames in
+    // its inbound text; without this hook Discord agents see only opaque
+    // numeric IDs and resort to placeholder names like `<@sibling>`.
+    if (config.transformInboundText && typeof serialized.text === 'string') {
+      serialized.text = config.transformInboundText(serialized.text);
     }
 
     // Preserve isMention as an explicit flat field the router can read
