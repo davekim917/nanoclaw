@@ -713,13 +713,17 @@ function enforceRunningContainerSla(
       heartbeatAgeMs: decision.heartbeatAgeMs,
       ceilingMs: decision.ceilingMs,
     });
+    // Snapshot claims BEFORE kill so the notify helper has the pre-kill
+    // state — resetStuckProcessingRows clears the claims, so a read
+    // afterward would always be empty.
+    const pendingClaims = getProcessingClaims(outDb).length;
     killContainer(session.id, 'absolute-ceiling');
-    // Tell the user we just reaped their container. Posted AFTER kill so
-    // we honor the outbound.db single-writer invariant
-    // (session-db.ts:openOutboundDbWritable) — host writes only after the
-    // container is gone, never alongside a live one. Same ordering as
-    // resetStuckProcessingRows below. Best-effort: failures log and move on.
-    notifyKillCeiling(inDb, outDb, session, decision.heartbeatAgeMs);
+    // Posted AFTER kill to honor the outbound.db single-writer invariant
+    // (session-db.ts:openOutboundDbWritable). The helper itself gates on
+    // `pendingClaims === 0` (no user was waiting) to avoid spamming
+    // restart notices on quiet sessions that just naturally reached the
+    // 30-min idle ceiling.
+    notifyKillCeiling(inDb, outDb, session, decision.heartbeatAgeMs, pendingClaims);
     resetStuckProcessingRows(inDb, outDb, session, 'absolute-ceiling');
     return;
   }
@@ -746,16 +750,17 @@ export function _resetStuckProcessingRowsForTesting(
 export { sweepTaskWatchdog as _sweepTaskWatchdogForTesting };
 
 /**
- * Tell the user we're about to reap their container for inactivity. The
+ * Tell the user we just reaped their container for inactivity. The
  * outbound.db write lands on the normal delivery path — no container
- * involvement needed (it's about to die anyway). Best-effort: a missing
- * routing row (fresh session) or a write failure just logs and moves on.
+ * involvement needed (it's already dead).
  *
- * Mirrors the spawn-task-watchdog notify shape at sweepTaskWatchdog: the
- * difference is `kind='chat'` writing to **outbound** (host → channel
- * delivery), not inbound (host → child container as a new turn input).
- * The container is gone after killContainer; an inbound write would just
- * sit until the next inbound from the user.
+ * Three gates, all skip with a debug log:
+ *   1. No session_routing yet (fresh session that never woke).
+ *   2. `pendingClaims === 0` — no inbound was in-flight when we killed,
+ *      meaning no user was actually waiting. The ceiling fires on every
+ *      idle 30-min container; without this gate the chat spams every
+ *      operator across every quiet session every half hour.
+ *   3. Duplicate notice in the last 60s (racing sweep tick).
  *
  * The optional `writableOutDb` parameter mirrors `resetStuckProcessingRows`:
  * tests pass an in-memory writable handle; production omits it and the
@@ -766,9 +771,16 @@ export function notifyKillCeiling(
   outDb: Database.Database,
   session: Session,
   heartbeatAgeMs: number,
+  pendingClaims: number,
   writableOutDb?: Database.Database,
 ): void {
   try {
+    if (pendingClaims === 0) {
+      log.debug('kill-ceiling notify skipped — no pending claims, user was not waiting', {
+        sessionId: session.id,
+      });
+      return;
+    }
     const routing = readSessionRouting(inDb);
     if (!routing) {
       log.debug('kill-ceiling notify skipped — no session_routing', {
@@ -835,8 +847,9 @@ export function _notifyKillCeilingForTesting(
   outDb: Database.Database,
   session: Session,
   heartbeatAgeMs: number,
+  pendingClaims: number,
 ): void {
-  notifyKillCeiling(inDb, outDb, session, heartbeatAgeMs, outDb);
+  notifyKillCeiling(inDb, outDb, session, heartbeatAgeMs, pendingClaims, outDb);
 }
 
 function resetStuckProcessingRows(

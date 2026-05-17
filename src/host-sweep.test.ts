@@ -1216,11 +1216,15 @@ function makeNotifyTestDbs(opts?: { withRouting?: boolean; recentNotice?: boolea
 }
 
 describe('notifyKillCeiling (Layer-3 fix)', () => {
+  // `pendingClaims=1` means the container had an in-flight inbound when we
+  // killed it — i.e. a user was actually waiting. That's the only case
+  // where the notify should fire (see the spam-gate test below for the
+  // claims=0 case).
   it('writes a visible chat outbound with the session route before killContainer', () => {
     const { inDb, outDb } = makeNotifyTestDbs();
     const heartbeatAgeMs = 32 * 60_000;
 
-    _notifyKillCeilingForTesting(inDb, outDb, fakeSession(), heartbeatAgeMs);
+    _notifyKillCeilingForTesting(inDb, outDb, fakeSession(), heartbeatAgeMs, 1);
 
     const rows = outDb
       .prepare('SELECT kind, platform_id, channel_type, thread_id, content FROM messages_out')
@@ -1243,15 +1247,28 @@ describe('notifyKillCeiling (Layer-3 fix)', () => {
     expect(body._system?.kind).toBe('agent_restart_inactivity');
   });
 
+  it('skips when no inbound was claimed at kill time (idle session, no user waiting)', () => {
+    // The kill-ceiling sweep fires on every container that hits the 30-min
+    // idle ceiling, not just ones with users waiting on a reply. Without
+    // this gate, every quiet operator gets a restart notice every half
+    // hour across every wired session. Routing is present (session DID
+    // wake before) — the only thing that distinguishes "user waiting" from
+    // "idle" is whether any inbound was claimed (processing_ack) when we
+    // killed.
+    const { inDb, outDb } = makeNotifyTestDbs();
+    _notifyKillCeilingForTesting(inDb, outDb, fakeSession(), 32 * 60_000, 0);
+    expect(outDb.prepare('SELECT COUNT(*) AS c FROM messages_out').get()).toEqual({ c: 0 });
+  });
+
   it('skips when the session has never been routed (fresh session_routing row missing)', () => {
     const { inDb, outDb } = makeNotifyTestDbs({ withRouting: false });
-    _notifyKillCeilingForTesting(inDb, outDb, fakeSession(), 32 * 60_000);
+    _notifyKillCeilingForTesting(inDb, outDb, fakeSession(), 32 * 60_000, 1);
     expect(outDb.prepare('SELECT COUNT(*) AS c FROM messages_out').get()).toEqual({ c: 0 });
   });
 
   it('is idempotent within 60s — a re-firing sweep tick does not duplicate the notice', () => {
     const { inDb, outDb } = makeNotifyTestDbs({ recentNotice: true });
-    _notifyKillCeilingForTesting(inDb, outDb, fakeSession(), 32 * 60_000);
+    _notifyKillCeilingForTesting(inDb, outDb, fakeSession(), 32 * 60_000, 1);
     // Only the seed row should be present; the second call recognized the
     // marker and skipped.
     const rows = outDb.prepare('SELECT id FROM messages_out').all() as Array<{ id: string }>;
