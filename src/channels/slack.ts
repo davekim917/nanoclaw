@@ -33,6 +33,7 @@ import { log } from '../log.js';
 import { markdownHeadingsToBold } from '../text-styles.js';
 import { createChatSdkBridge } from './chat-sdk-bridge.js';
 import { registerChannelAdapter } from './channel-registry.js';
+import { fetchSlackBotIdentity, registerSlackBot, resolveSlackMentions } from './slack-mentions.js';
 
 export interface SlackWorkspace {
   channelType: string;
@@ -146,7 +147,7 @@ const workspaces = parseSlackWorkspaces(readEnvFileMatching(/^SLACK_(BOT_TOKEN|S
 
 for (const ws of workspaces) {
   registerChannelAdapter(ws.channelType, {
-    factory: () => {
+    factory: async () => {
       const slackAdapter = createSlackAdapter({
         botToken: ws.botToken,
         signingSecret: ws.signingSecret,
@@ -166,6 +167,20 @@ for (const ws of workspaces) {
       // the webhook-server lookup matches.
       (slackAdapter as unknown as { name: string }).name = ws.channelType;
       const client = new WebClient(ws.botToken);
+
+      // Discover this bot's user_id + username + team_id so sibling bots in
+      // the same Slack workspace can resolve `@username` → `<@USER_ID>` on
+      // outbound. One auth.test call at adapter init; cached for the
+      // lifetime of the process. Mirrors discord.ts's fetchDiscordBotIdentity.
+      const identity = await fetchSlackBotIdentity(client);
+      if (identity) {
+        registerSlackBot(ws.channelType, identity);
+      } else {
+        log.warn('Slack bot identity unavailable — outbound @-mentions for this bot will not resolve', {
+          channelType: ws.channelType,
+        });
+      }
+
       const bridge = createChatSdkBridge({
         adapter: slackAdapter,
         concurrency: 'concurrent',
@@ -174,7 +189,14 @@ for (const ws of workspaces) {
         // ATX headings → bold so Block Kit table delivery stays on the
         // `markdown` path (table-block conversion only fires for markdown/ast
         // input). The adapter handles bold/italic/links/lists/tables natively.
-        transformOutboundMarkdown: markdownHeadingsToBold,
+        //
+        // resolveSlackMentions runs first so `@bot-username` becomes
+        // `<@USER_ID>` (Slack's required mention syntax) BEFORE Markdown
+        // heading conversion — the rewriter only touches `@…` tokens, and
+        // markdownHeadingsToBold only touches line-anchored `#` prefixes,
+        // so order is independent for correctness but consistent for
+        // intent.
+        transformOutboundMarkdown: (text) => markdownHeadingsToBold(resolveSlackMentions(text, ws.channelType)),
       });
       bridge.postParent = (platformId, text) => slackPostParent(client, platformId, text);
       bridge.createThread = (platformId, parentMessageId, title, firstMessage) =>

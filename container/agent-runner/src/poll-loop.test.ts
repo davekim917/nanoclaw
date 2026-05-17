@@ -237,16 +237,26 @@ describe('accumulate gate (trigger column)', () => {
     // Pair admission must be checked against the post-filter trigger set,
     // not the raw snapshot. /clear's id should NOT satisfy a recall pair.
     insertMessage('clear-id', 'chat', { sender: 'B', text: '/clear' }, { trigger: 1 });
-    insertMessage('recall-clear-id', 'system', { subtype: 'recall_context', text: 'facts' }, {
-      trigger: 0,
-    });
+    insertMessage(
+      'recall-clear-id',
+      'system',
+      { subtype: 'recall_context', text: 'facts' },
+      {
+        trigger: 0,
+      },
+    );
     expect(selectInTurnFollowUps(getPendingMessages())).toEqual([]);
 
     // But a recall paired with a real trigger does ride along.
     insertMessage('real-mention', 'chat', { sender: 'B', text: 'hey @bot' }, { trigger: 1 });
-    insertMessage('recall-real-mention', 'system', { subtype: 'recall_context', text: 'facts' }, {
-      trigger: 0,
-    });
+    insertMessage(
+      'recall-real-mention',
+      'system',
+      { subtype: 'recall_context', text: 'facts' },
+      {
+        trigger: 0,
+      },
+    );
     const ids = selectInTurnFollowUps(getPendingMessages())
       .map((m) => m.id)
       .sort();
@@ -478,7 +488,13 @@ describe('origin metadata (from= attribute)', () => {
       .run(name, name, channelType, platformId);
   }
 
-  function insertWithRouting(id: string, kind: string, content: object, channelType: string | null, platformId: string | null): void {
+  function insertWithRouting(
+    id: string,
+    kind: string,
+    content: object,
+    channelType: string | null,
+    platformId: string | null,
+  ): void {
     getInboundDb()
       .prepare(
         `INSERT INTO messages_in (id, kind, timestamp, status, platform_id, channel_type, content)
@@ -656,10 +672,7 @@ describe('dispatchResultText — unwrapped output fallback', () => {
     seedDestination('slack-main', 'slack', 'C-MAIN');
     seedDestination('discord-side', 'discord', 'chan-9');
 
-    dispatchResultText(
-      '<message to="discord-side">explicit reply</message>',
-      routing('slack', 'C-MAIN'),
-    );
+    dispatchResultText('<message to="discord-side">explicit reply</message>', routing('slack', 'C-MAIN'));
 
     const out = getUndeliveredMessages();
     expect(out).toHaveLength(1);
@@ -675,10 +688,7 @@ describe('dispatchResultText — unwrapped output fallback', () => {
     seedDestination('slack-main', 'slack', 'C-MAIN');
     seedDestination('discord-side', 'discord', 'chan-9');
 
-    dispatchResultText(
-      'Sorry, I dropped the wrapping. Here is my actual answer.',
-      routing('slack', 'C-MAIN'),
-    );
+    dispatchResultText('Sorry, I dropped the wrapping. Here is my actual answer.', routing('slack', 'C-MAIN'));
 
     const out = getUndeliveredMessages();
     expect(out).toHaveLength(1);
@@ -693,10 +703,7 @@ describe('dispatchResultText — unwrapped output fallback', () => {
     seedDestination('slack-main', 'slack', 'C-MAIN');
     seedDestination('discord-side', 'discord', 'chan-9');
 
-    dispatchResultText(
-      'unwrapped reply with no resolvable origin',
-      routing('telegram', 'unknown-chat'),
-    );
+    dispatchResultText('unwrapped reply with no resolvable origin', routing('telegram', 'unknown-chat'));
 
     expect(getUndeliveredMessages()).toHaveLength(0);
   });
@@ -706,10 +713,7 @@ describe('dispatchResultText — unwrapped output fallback', () => {
     // a single-destination group still get rescued.
     seedDestination('slack-only', 'slack', 'C-ONLY');
 
-    dispatchResultText(
-      'bare text from a null-routed source',
-      routing(null, null),
-    );
+    dispatchResultText('bare text from a null-routed source', routing(null, null));
 
     const out = getUndeliveredMessages();
     expect(out).toHaveLength(1);
@@ -736,10 +740,7 @@ describe('dispatchResultText — unwrapped output fallback', () => {
   it('only <internal> tags → empty scratchpad → no delivery', () => {
     seedDestination('slack-main', 'slack', 'C-MAIN');
 
-    dispatchResultText(
-      '<internal>just thinking</internal>',
-      routing('slack', 'C-MAIN'),
-    );
+    dispatchResultText('<internal>just thinking</internal>', routing('slack', 'C-MAIN'));
 
     expect(getUndeliveredMessages()).toHaveLength(0);
   });
@@ -791,6 +792,106 @@ describe('dispatchResultText — unwrapped output fallback', () => {
 
     expect(delivered).toBe(false);
     expect(getUndeliveredMessages()).toHaveLength(0);
+  });
+});
+
+describe('dispatchResultText — unclosed-wrapper tolerance', () => {
+  // Production repro (illie-codex, 2026-05-17 Slack thread C0AJA89MN2E):
+  // the agent emitted two `<message to="slack_illysium_agents_xzo">`
+  // openers in one final response with NO closing `</message>` tag for
+  // either. The old regex required a close → zero matches → the entire
+  // text fell through to the unwrapped-fallback path and Slack saw the
+  // raw `<message to="…">` XML in chat. The tolerant parser slices each
+  // body to "next opener / explicit close / EOT" and routes each block,
+  // so a single forgotten close no longer leaks markup.
+  function seedDestination(name: string, channelType: string, platformId: string): void {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES (?, ?, 'channel', ?, ?, NULL)`,
+      )
+      .run(name, name, channelType, platformId);
+  }
+  function routing(channelType: string | null, platformId: string | null) {
+    return { channelType, platformId, threadId: null, inReplyTo: null, quietStatus: false };
+  }
+
+  it('single unclosed opener at end-of-text → body extends to EOT and routes normally', () => {
+    seedDestination('slack-main', 'slack', 'C-MAIN');
+    dispatchResultText('<message to="slack-main">no closing tag, please ship this', routing('slack', 'C-MAIN'));
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(out[0].channel_type).toBe('slack');
+    expect(JSON.parse(out[0].content).text).toBe('no closing tag, please ship this');
+  });
+
+  it('two consecutive unclosed openers (same dest) → two sends, no markup leak', () => {
+    // Mirrors the illie-codex production repro: two `<message to="…">`
+    // openers, no closes. Each becomes its own outbound row.
+    seedDestination('slack-main', 'slack', 'C-MAIN');
+    dispatchResultText(
+      '<message to="slack-main">first body\nspans multiple lines\n' + '<message to="slack-main">second body acked',
+      routing('slack', 'C-MAIN'),
+    );
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(2);
+    const texts = out.map((r) => JSON.parse(r.content).text);
+    expect(texts).toEqual(['first body\nspans multiple lines', 'second body acked']);
+    // No <message…> markup should reach the wire.
+    for (const t of texts) {
+      expect(t).not.toContain('<message');
+      expect(t).not.toContain('</message>');
+    }
+  });
+
+  it('explicit close before next opener wins as the body endpoint', () => {
+    seedDestination('slack-main', 'slack', 'C-MAIN');
+    dispatchResultText(
+      '<message to="slack-main">first done</message>\nbetween\n' + '<message to="slack-main">second still open',
+      routing('slack', 'C-MAIN'),
+    );
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(2);
+    expect(JSON.parse(out[0].content).text).toBe('first done');
+    expect(JSON.parse(out[1].content).text).toBe('second still open');
+    // The "between" text is scratchpad — never delivered (a partial wrap
+    // counts as wrapped output, so the fallback doesn't fire).
+  });
+
+  it('opener with empty to="" → block dropped, no markup leaks via fallback', () => {
+    // Malformed opener — drop the block and ensure any residual `<message…>`
+    // text in the fallback path gets stripped before reaching the user.
+    seedDestination('slack-main', 'slack', 'C-MAIN');
+    dispatchResultText('<message to="">malformed body</message>\nrest of reply', routing('slack', 'C-MAIN'));
+    const out = getUndeliveredMessages();
+    // Since the malformed opener's body becomes scratchpad and there are
+    // no successful sends, the fallback fires on the combined scratchpad.
+    expect(out).toHaveLength(1);
+    const text = JSON.parse(out[0].content).text;
+    expect(text).toContain('malformed body');
+    expect(text).toContain('rest of reply');
+    expect(text).not.toContain('<message');
+    expect(text).not.toContain('</message>');
+  });
+
+  it('stray `<message…>` markup in scratchpad-only text gets stripped from fallback', () => {
+    // Defensive: an agent that emits orphan opener tokens with no
+    // matching close but ALSO no valid destination resolution should
+    // never expose raw markup to the user. The opener regex requires
+    // a `to="…"` attribute, so a bare `<message>` literal (no `to`)
+    // doesn't even match — but if one slips in via a different path
+    // (e.g. an unknown destination plus a stripped wrapper), the strip
+    // catches it.
+    seedDestination('slack-main', 'slack', 'C-MAIN');
+    dispatchResultText(
+      'pre-text\n<message to="unknown-destination">body</message>\npost-text',
+      routing('slack', 'C-MAIN'),
+    );
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    const text = JSON.parse(out[0].content).text;
+    expect(text).not.toContain('<message');
+    expect(text).not.toContain('</message>');
   });
 });
 
@@ -872,10 +973,7 @@ describe('handleEvent — terminal-error visibility (Layer-1 fix)', () => {
   }
 
   it('retryable=false writes a visible chat outbound on the session route', () => {
-    handleEvent(
-      { type: 'error', message: 'Turn timed out after 300000ms', retryable: false },
-      routingFixture(),
-    );
+    handleEvent({ type: 'error', message: 'Turn timed out after 300000ms', retryable: false }, routingFixture());
     const out = getUndeliveredMessages();
     expect(out).toHaveLength(1);
     expect(out[0].kind).toBe('chat');
@@ -884,22 +982,16 @@ describe('handleEvent — terminal-error visibility (Layer-1 fix)', () => {
     expect(out[0].thread_id).toBe('T-TEST');
     const body = JSON.parse(out[0].content) as { text: string };
     expect(body.text).toContain('Turn timed out after 300000ms');
-    expect(body.text).toContain("pick up from your next message");
+    expect(body.text).toContain('pick up from your next message');
   });
 
   it('retryable=true is silent — runner is still working on a fix internally', () => {
-    handleEvent(
-      { type: 'error', message: 'API retry', retryable: true },
-      routingFixture(),
-    );
+    handleEvent({ type: 'error', message: 'API retry', retryable: true }, routingFixture());
     expect(getUndeliveredMessages()).toHaveLength(0);
   });
 
   it('classification is included in the chat surface for terminal errors', () => {
-    handleEvent(
-      { type: 'error', message: 'Rate limit', retryable: false, classification: 'quota' },
-      routingFixture(),
-    );
+    handleEvent({ type: 'error', message: 'Rate limit', retryable: false, classification: 'quota' }, routingFixture());
     const out = getUndeliveredMessages();
     expect(out).toHaveLength(1);
     const body = JSON.parse(out[0].content) as { text: string };
