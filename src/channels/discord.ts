@@ -198,6 +198,90 @@ export function rewriteDiscordLinks(text: string): string {
   });
 }
 
+// ── Sibling-bot mention registry ─────────────────────────────────────────
+//
+// Discord requires real `<@USER_SNOWFLAKE>` syntax for an @-mention to fire
+// the receiving bot's `engage_mode='mention'` wiring. Plain text like
+// `@Axie-codex` ships as literal characters — no Discord mention event
+// fires, no peer wake. Slack's chat-adapter rewrites bare `@username` to
+// `<@U…>` server-side via a cached lookup; the Discord adapter doesn't.
+//
+// We close the gap by maintaining a process-wide registry of every Discord
+// bot this host has loaded — keyed by channelType, populated by a one-shot
+// `GET /users/@me` call when each adapter factory runs. The outbound text
+// transform then rewrites `@bot-username` to `<@id>` so sibling handoffs
+// actually wake the peer.
+//
+// Limited to bots running in this process: a third-party bot in the same
+// guild whose token we don't carry will not be in the registry, and its
+// `@name` references will be left as plain text. That's the correct
+// fail-soft — we never invent a snowflake we can't verify.
+
+export interface DiscordBotIdentity {
+  userId: string;
+  username: string;
+}
+
+const knownDiscordBots = new Map<string, DiscordBotIdentity>();
+
+/**
+ * Look up a bot's identity from Discord via REST. Single round-trip on
+ * adapter init; the result is cached in `knownDiscordBots` for the lifetime
+ * of the process. Returns null on any failure — outbound mention rewriting
+ * gracefully no-ops if the registry is empty or the username can't be
+ * resolved.
+ */
+async function fetchDiscordBotIdentity(botToken: string): Promise<DiscordBotIdentity | null> {
+  try {
+    const res = await fetch('https://discord.com/api/v10/users/@me', {
+      headers: { Authorization: `Bot ${botToken}` },
+    });
+    if (!res.ok) {
+      log.warn('Discord bot identity fetch non-OK', { status: res.status });
+      return null;
+    }
+    const user = (await res.json()) as { id?: string; username?: string };
+    if (!user.id || !user.username) return null;
+    return { userId: user.id, username: user.username };
+  } catch (err) {
+    log.warn('Discord bot identity fetch network error', {
+      err: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
+}
+
+/**
+ * Rewrite `@bot-username` (plain text) to a real Discord mention
+ * `<@USER_ID>` for every bot in `bots`. Case-insensitive on the username.
+ * Code regions are passed through unchanged.
+ *
+ * Exported with the registry as an injectable parameter so tests can supply
+ * a synthetic bot set without touching the module-level Map.
+ */
+export function resolveDiscordMentions(text: string, bots: Map<string, DiscordBotIdentity> = knownDiscordBots): string {
+  if (bots.size === 0) return text;
+
+  // Username → id, lowercased for case-insensitive matching.
+  const byName = new Map<string, string>();
+  for (const { userId, username } of bots.values()) {
+    byName.set(username.toLowerCase(), userId);
+  }
+
+  // Discord usernames allow `[a-z0-9_.]` post-2023; we additionally accept
+  // `-` so legacy usernames like "Axie-Codex" still resolve.
+  const MENTION_RE = /@([\w.-]+)/g;
+
+  return transformOutsideProtectedRegions(text, (segment) =>
+    segment.replace(MENTION_RE, (match, name: string, offset: number) => {
+      // Skip if already inside a `<@…>` mention or `<@&…>` role mention.
+      if (offset > 0 && segment[offset - 1] === '<') return match;
+      const id = byName.get(name.toLowerCase());
+      return id ? `<@${id}>` : match;
+    }),
+  );
+}
+
 /** Minimal REST interface for Discord operations — narrow surface for testing. */
 export interface DiscordRestClient {
   post(route: `/${string}`, options?: { body?: unknown }): Promise<unknown>;
@@ -308,7 +392,19 @@ const workspaces = parseDiscordWorkspaces(
 
 for (const ws of workspaces) {
   registerChannelAdapter(ws.channelType, {
-    factory: () => {
+    factory: async () => {
+      // Discover this bot's user id + username so sibling bots in the same
+      // process can resolve `@username` → `<@id>` on outbound. One REST call
+      // at adapter init; cached for the lifetime of the process.
+      const identity = await fetchDiscordBotIdentity(ws.botToken);
+      if (identity) {
+        knownDiscordBots.set(ws.channelType, identity);
+      } else {
+        log.warn('Discord bot identity unavailable — outbound @-mentions for this bot will not resolve', {
+          channelType: ws.channelType,
+        });
+      }
+
       const discordAdapter = createDiscordAdapter({
         botToken: ws.botToken,
         publicKey: ws.publicKey,
@@ -340,7 +436,12 @@ for (const ws of workspaces) {
         // Markdown delivery (not raw) keeps the chat-adapter's tableToAscii
         // conversion in play; without it, Markdown tables would render as raw
         // `|`-pipe text in Discord (no native table block).
-        transformOutboundMarkdown: rewriteDiscordLinks,
+        //
+        // resolveDiscordMentions runs first so any `@bot-username` it rewrites
+        // to `<@id>` is then passed through rewriteDiscordLinks unchanged
+        // (the link rewriter only touches markdown links and bare URLs, never
+        // mention syntax).
+        transformOutboundMarkdown: (text) => rewriteDiscordLinks(resolveDiscordMentions(text)),
         inboundFilter: isUserMessage,
         fetchThreadAnchor: makeFetchThreadAnchor(ws.botToken),
       });
