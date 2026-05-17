@@ -80,13 +80,19 @@ export interface ChatSdkBridgeConfig {
    */
   transformOutboundMarkdown?: (markdown: string) => string;
   /**
-   * Optional transform applied to the inbound message's `text` field before
-   * it lands in `messages_in`. Used by channels whose raw wire format leaks
-   * non-human-readable user references (Discord's `<@123456789>` snowflake
-   * mentions are the canonical case): the agent reads `content.text` and
-   * has no way to tell which snowflake is "@Axie-Codex" vs a stranger.
-   * Resolving here keeps the round-trip symmetric — the outbound rewriter
-   * already turns `@Axie-Codex` back into `<@id>` on the way out.
+   * Optional transform applied to the inbound message's user-facing text
+   * fields before it lands in `messages_in`. Used by channels whose raw
+   * wire format leaks non-human-readable user references (Discord's
+   * `<@123456789>` snowflake mentions are the canonical case): the agent
+   * reads `content.text` and has no way to tell which snowflake is
+   * "@Axie-Codex" vs a stranger. Resolving here keeps the round-trip
+   * symmetric — the outbound rewriter already turns `@Axie-Codex` back
+   * into `<@id>` on the way out.
+   *
+   * Applied to both `serialized.text` (the message body) and
+   * `serialized.replyTo.text` (the quoted-message context the formatter
+   * surfaces to the agent). Anywhere else the raw wire form leaks would
+   * need its own pass.
    */
   transformInboundText?: (text: string) => string;
   /**
@@ -317,8 +323,19 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
     // names the agent can actually use. Slack already resolves usernames in
     // its inbound text; without this hook Discord agents see only opaque
     // numeric IDs and resort to placeholder names like `<@sibling>`.
-    if (config.transformInboundText && typeof serialized.text === 'string') {
-      serialized.text = config.transformInboundText(serialized.text);
+    //
+    // Also rewrites the quoted reply context — `replyTo.text` comes from
+    // `raw.referenced_message.content` (raw Discord wire format) and the
+    // agent's formatter surfaces it verbatim in <quoted_message> tags, so
+    // snowflakes there bleed through into the agent's view without this.
+    if (config.transformInboundText) {
+      if (typeof serialized.text === 'string') {
+        serialized.text = config.transformInboundText(serialized.text);
+      }
+      const replyTo = serialized.replyTo as { text?: unknown } | undefined;
+      if (replyTo && typeof replyTo.text === 'string') {
+        replyTo.text = config.transformInboundText(replyTo.text);
+      }
     }
 
     // Preserve isMention as an explicit flat field the router can read
