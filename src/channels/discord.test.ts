@@ -64,6 +64,17 @@ describe('resolveDiscordMentions', () => {
   it('handles `@username` at end-of-string with no trailing whitespace', () => {
     expect(resolveDiscordMentions('over to @Axie-Codex', bots)).toBe('over to <@2222222222>');
   });
+
+  it('does not match `@` preceded by a word character (email-like text)', () => {
+    // Codex review finding B: `user@domain.com` previously matched as
+    // `@domain.com`. Fail-soft today (no bot named "domain.com"), but the
+    // word-boundary guard makes intent explicit. Confirms the lookbehind
+    // anchors the `@` so the right-hand side of an email or path is never
+    // treated as a mention target.
+    const bots2 = new Map<string, DiscordBotIdentity>([['discord', { userId: '9', username: 'domain.com' }]]);
+    expect(resolveDiscordMentions('contact user@domain.com today', bots2)).toBe('contact user@domain.com today');
+    expect(resolveDiscordMentions('@domain.com hi', bots2)).toBe('<@9> hi');
+  });
 });
 
 describe('parseDiscordWorkspaces', () => {

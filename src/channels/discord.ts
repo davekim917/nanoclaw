@@ -224,17 +224,45 @@ export interface DiscordBotIdentity {
 
 const knownDiscordBots = new Map<string, DiscordBotIdentity>();
 
+// Cross-package channel for the patched chat-adapter. The patched
+// MessageCreate / reaction handlers in @chat-adapter/discord need to know
+// which bot ids belong to sibling NanoClaw bots in this process so they
+// can let those messages through while still dropping unrelated third-
+// party bots (webhooks, music bots, MEE6, etc.). The patch reads this Set
+// off globalThis at message-arrival time so adapter init order doesn't
+// matter. Keep the property name in sync with the patch.
+const NANOCLAW_DISCORD_SIBLINGS = '__nanoclawDiscordSiblings';
+
+interface GlobalWithSiblings {
+  [NANOCLAW_DISCORD_SIBLINGS]?: Set<string>;
+}
+
+function publishSiblingId(userId: string): void {
+  const g = globalThis as unknown as GlobalWithSiblings;
+  if (!g[NANOCLAW_DISCORD_SIBLINGS]) g[NANOCLAW_DISCORD_SIBLINGS] = new Set();
+  g[NANOCLAW_DISCORD_SIBLINGS].add(userId);
+}
+
 /**
  * Look up a bot's identity from Discord via REST. Single round-trip on
  * adapter init; the result is cached in `knownDiscordBots` for the lifetime
  * of the process. Returns null on any failure — outbound mention rewriting
  * gracefully no-ops if the registry is empty or the username can't be
  * resolved.
+ *
+ * Hard timeout: channel-registry awaits factories serially, so a stalled
+ * Discord CDN connection at host boot would block every adapter that
+ * registers after Discord. 5s is well above Discord's typical p99 for this
+ * endpoint and short enough that a hung connection doesn't visibly delay
+ * startup.
  */
+const DISCORD_REST_TIMEOUT_MS = 5000;
+
 async function fetchDiscordBotIdentity(botToken: string): Promise<DiscordBotIdentity | null> {
   try {
     const res = await fetch('https://discord.com/api/v10/users/@me', {
       headers: { Authorization: `Bot ${botToken}` },
+      signal: AbortSignal.timeout(DISCORD_REST_TIMEOUT_MS),
     });
     if (!res.ok) {
       log.warn('Discord bot identity fetch non-OK', { status: res.status });
@@ -244,7 +272,7 @@ async function fetchDiscordBotIdentity(botToken: string): Promise<DiscordBotIden
     if (!user.id || !user.username) return null;
     return { userId: user.id, username: user.username };
   } catch (err) {
-    log.warn('Discord bot identity fetch network error', {
+    log.warn('Discord bot identity fetch failed', {
       err: err instanceof Error ? err.message : String(err),
     });
     return null;
@@ -270,7 +298,13 @@ export function resolveDiscordMentions(text: string, bots: Map<string, DiscordBo
 
   // Discord usernames allow `[a-z0-9_.]` post-2023; we additionally accept
   // `-` so legacy usernames like "Axie-Codex" still resolve.
-  const MENTION_RE = /@([\w.-]+)/g;
+  //
+  // The `(?<!\w)` lookbehind anchors the `@` to a word boundary — without
+  // it, `user@domain.com` would parse as `@domain.com` and look up a bot
+  // named "domain.com". In practice that fail-softs (no match), but the
+  // boundary check makes intent explicit and avoids surprise if a bot's
+  // username ever collides with the right-hand side of an email or path.
+  const MENTION_RE = /(?<!\w)@([\w.-]+)/g;
 
   return transformOutsideProtectedRegions(text, (segment) =>
     segment.replace(MENTION_RE, (match, name: string, offset: number) => {
@@ -399,6 +433,7 @@ for (const ws of workspaces) {
       const identity = await fetchDiscordBotIdentity(ws.botToken);
       if (identity) {
         knownDiscordBots.set(ws.channelType, identity);
+        publishSiblingId(identity.userId);
       } else {
         log.warn('Discord bot identity unavailable — outbound @-mentions for this bot will not resolve', {
           channelType: ws.channelType,

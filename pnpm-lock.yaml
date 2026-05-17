@@ -6,7 +6,7 @@ settings:
 
 patchedDependencies:
   '@chat-adapter/discord@4.26.0':
-    hash: 9aee8af804e6a9bae9ebb5f343c58b495e40f22f9890da642e7f045ddeeab64c
+    hash: 21c5ed99cd28c6a943afed77bba7a16b4930ceb0e0a8d1727361684016376921
     path: patches/@chat-adapter__discord@4.26.0.patch
 
 importers:
@@ -15,7 +15,7 @@ importers:
     dependencies:
       '@chat-adapter/discord':
         specifier: 4.26.0
-        version: 4.26.0(patch_hash=9aee8af804e6a9bae9ebb5f343c58b495e40f22f9890da642e7f045ddeeab64c)
+        version: 4.26.0(patch_hash=21c5ed99cd28c6a943afed77bba7a16b4930ceb0e0a8d1727361684016376921)
       '@chat-adapter/slack':
         specifier: 4.26.0
         version: 4.26.0
@@ -1966,7 +1966,7 @@ snapshots:
       css-tree: 3.2.1
     optional: true
 
-  '@chat-adapter/discord@4.26.0(patch_hash=9aee8af804e6a9bae9ebb5f343c58b495e40f22f9890da642e7f045ddeeab64c)':
+  '@chat-adapter/discord@4.26.0(patch_hash=21c5ed99cd28c6a943afed77bba7a16b4930ceb0e0a8d1727361684016376921)':
     dependencies:
       '@chat-adapter/shared': 4.26.0
       chat: 4.26.0
