@@ -304,16 +304,35 @@ export function resolveDiscordMentions(text: string, bots: Map<string, DiscordBo
   // named "domain.com". In practice that fail-softs (no match), but the
   // boundary check makes intent explicit and avoids surprise if a bot's
   // username ever collides with the right-hand side of an email or path.
-  const MENTION_RE = /(?<!\w)@([\w.-]+)/g;
+  //
+  // Two passes by design, agent-mistake-tolerant:
+  //   1. `<@Name>` — the bracketed form agents sometimes emit when they
+  //      remember the Slack `<@U123>` template but substitute the username
+  //      instead of the snowflake. Discord would render this as literal
+  //      text. We catch it here and rewrite to `<@id>`.
+  //   2. `@Name` — the canonical bare form per container/CLAUDE.md
+  //      guidance.
+  // Real `<@SNOWFLAKE>` mentions and `<@&ROLE>` role mentions are
+  // unaffected: byName keys are usernames, so digits-only or `&`-prefixed
+  // captures don't match the lookup. The bare-form pass skips text
+  // preceded by `<` so it never re-touches what pass 1 just emitted.
+  const BRACKETED_MENTION_RE = /(?<!\w)<@([\w.-]+)>/g;
+  const BARE_MENTION_RE = /(?<!\w)@([\w.-]+)/g;
 
-  return transformOutsideProtectedRegions(text, (segment) =>
-    segment.replace(MENTION_RE, (match, name: string, offset: number) => {
-      // Skip if already inside a `<@…>` mention or `<@&…>` role mention.
-      if (offset > 0 && segment[offset - 1] === '<') return match;
+  return transformOutsideProtectedRegions(text, (segment) => {
+    const rewriteByName = (match: string, name: string): string => {
       const id = byName.get(name.toLowerCase());
       return id ? `<@${id}>` : match;
-    }),
-  );
+    };
+
+    const afterBracketed = segment.replace(BRACKETED_MENTION_RE, rewriteByName);
+    return afterBracketed.replace(BARE_MENTION_RE, (match, name: string, offset: number) => {
+      // Skip if `@` is preceded by `<` — pass 1 already handled bracketed
+      // forms, and `<@SNOWFLAKE>` / `<@&ROLE>` syntax stays untouched.
+      if (offset > 0 && afterBracketed[offset - 1] === '<') return match;
+      return rewriteByName(match, name);
+    });
+  });
 }
 
 /** Minimal REST interface for Discord operations — narrow surface for testing. */
