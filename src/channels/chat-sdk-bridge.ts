@@ -80,6 +80,22 @@ export interface ChatSdkBridgeConfig {
    */
   transformOutboundMarkdown?: (markdown: string) => string;
   /**
+   * Optional transform applied to the inbound message's user-facing text
+   * fields before it lands in `messages_in`. Used by channels whose raw
+   * wire format leaks non-human-readable user references (Discord's
+   * `<@123456789>` snowflake mentions are the canonical case): the agent
+   * reads `content.text` and has no way to tell which snowflake is
+   * "@Axie-Codex" vs a stranger. Resolving here keeps the round-trip
+   * symmetric — the outbound rewriter already turns `@Axie-Codex` back
+   * into `<@id>` on the way out.
+   *
+   * Applied to both `serialized.text` (the message body) and
+   * `serialized.replyTo.text` (the quoted-message context the formatter
+   * surfaces to the agent). Anywhere else the raw wire form leaks would
+   * need its own pass.
+   */
+  transformInboundText?: (text: string) => string;
+  /**
    * Optional filter applied to inbound Chat SDK messages before they reach
    * the host router. Return false to drop. Used by channels that need to
    * suppress platform-emitted system messages the SDK doesn't filter (e.g.
@@ -301,6 +317,25 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       serialized.senderId = author.userId;
       serialized.sender = name;
       serialized.senderName = name;
+    }
+
+    // Resolve raw platform mention syntax (Discord's `<@snowflake>`) into
+    // names the agent can actually use. Slack already resolves usernames in
+    // its inbound text; without this hook Discord agents see only opaque
+    // numeric IDs and resort to placeholder names like `<@sibling>`.
+    //
+    // Also rewrites the quoted reply context — `replyTo.text` comes from
+    // `raw.referenced_message.content` (raw Discord wire format) and the
+    // agent's formatter surfaces it verbatim in <quoted_message> tags, so
+    // snowflakes there bleed through into the agent's view without this.
+    if (config.transformInboundText) {
+      if (typeof serialized.text === 'string') {
+        serialized.text = config.transformInboundText(serialized.text);
+      }
+      const replyTo = serialized.replyTo as { text?: unknown } | undefined;
+      if (replyTo && typeof replyTo.text === 'string') {
+        replyTo.text = config.transformInboundText(replyTo.text);
+      }
     }
 
     // Preserve isMention as an explicit flat field the router can read
@@ -831,6 +866,12 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
     ): Promise<Array<{ sender: string; text: string; timestamp: string; isAnchor?: boolean }>> {
       const limit = opts?.limit ?? 50;
       const inThread: Array<{ sender: string; text: string; timestamp: string; isAnchor?: boolean }> = [];
+      // Apply the same inbound text transform that messageToInbound uses, so
+      // resumed-thread context the router prepends as [Thread context] doesn't
+      // leak the raw wire form (Discord snowflakes) the live path normalizes
+      // away. Fail-soft: with no transform configured this is identity.
+      const applyInboundTransform = (t: string): string =>
+        config.transformInboundText ? config.transformInboundText(t) : t;
       try {
         const result = await adapter.fetchMessages(threadId, { limit });
         const msgs = (result?.messages ?? []) as Array<{
@@ -844,7 +885,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           if (!m.text || m.text.length === 0) continue;
           inThread.push({
             sender: m.author.isMe ? 'assistant' : m.author.fullName || m.author.userName || 'unknown',
-            text: m.text,
+            text: applyInboundTransform(m.text),
             timestamp: m.metadata.dateSent.toISOString(),
           });
         }
@@ -866,7 +907,10 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // De-dupe on (sender, text) against the in-thread set — for forum
       // threads the anchor is already the first in-thread message, and
       // timestamps from the message-by-id endpoint and the channel-messages
-      // endpoint don't always round-trip to the same ISO string.
+      // endpoint don't always round-trip to the same ISO string. De-dupe
+      // happens AFTER the transform on both sides so the comparison is on
+      // normalized text — otherwise a normalized in-thread copy and a raw
+      // anchor copy of the same message would both survive.
       if (config.fetchThreadAnchor) {
         try {
           const anchors = await config.fetchThreadAnchor(threadId, { excludeMessageId: opts?.excludeMessageId });
@@ -875,8 +919,9 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
             for (let i = anchors.length - 1; i >= 0; i--) {
               const a = anchors[i];
               if (!a.text || a.text.length === 0) continue;
-              const alreadyPresent = inThread.some((m) => m.sender === a.sender && m.text === a.text);
-              if (!alreadyPresent) inThread.unshift(a);
+              const normalized = { ...a, text: applyInboundTransform(a.text) };
+              const alreadyPresent = inThread.some((m) => m.sender === normalized.sender && m.text === normalized.text);
+              if (!alreadyPresent) inThread.unshift(normalized);
             }
           }
         } catch (err) {

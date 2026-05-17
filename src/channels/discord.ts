@@ -335,6 +335,49 @@ export function resolveDiscordMentions(text: string, bots: Map<string, DiscordBo
   });
 }
 
+/**
+ * Inbound counterpart to `resolveDiscordMentions`. Rewrites Discord's raw
+ * `<@SNOWFLAKE>` / `<@!SNOWFLAKE>` user-mention syntax to `@bot_username`
+ * for any registered NanoClaw bot. Unknown snowflakes (human users, bots
+ * outside this process) pass through unchanged so the host can still log
+ * the raw form for debugging.
+ *
+ * Why bots only: this exists to fix sibling handoff. The agent needs to
+ * know its peer is called `Axie-Codex` (not just snowflake 1505...). It
+ * doesn't need human display names — the chat-sdk Message envelope
+ * already carries `author.fullName` for the sender, and humans aren't
+ * routing targets.
+ *
+ * Role mentions (`<@&ROLE>`) and channel mentions (`<#CHAN>`) are not
+ * touched — the regex demands a digit-only capture so `&` and `#`
+ * prefixes fall through.
+ *
+ * Code regions are skipped via `transformOutsideProtectedRegions`,
+ * mirroring the outbound rewriter. A pasted log line like
+ * `` `payload: <@123>` `` stays verbatim — the user put it in code on
+ * purpose, and the agent reading the inbound is better served by the
+ * exact text the user typed than by a "helpful" name substitution
+ * inside what is meant to be raw content.
+ */
+export function resolveIncomingDiscordMentions(
+  text: string,
+  bots: Map<string, DiscordBotIdentity> = knownDiscordBots,
+): string {
+  if (bots.size === 0) return text;
+  const byId = new Map<string, string>();
+  for (const { userId, username } of bots.values()) {
+    byId.set(userId, username);
+  }
+  // `<@123>` is a normal mention; `<@!123>` is the legacy "nickname mention"
+  // form some older Discord clients still emit. Both resolve to the same user.
+  return transformOutsideProtectedRegions(text, (segment) =>
+    segment.replace(/<@!?(\d+)>/g, (match, id: string) => {
+      const username = byId.get(id);
+      return username ? `@${username}` : match;
+    }),
+  );
+}
+
 /** Minimal REST interface for Discord operations — narrow surface for testing. */
 export interface DiscordRestClient {
   post(route: `/${string}`, options?: { body?: unknown }): Promise<unknown>;
@@ -496,6 +539,10 @@ for (const ws of workspaces) {
         // (the link rewriter only touches markdown links and bare URLs, never
         // mention syntax).
         transformOutboundMarkdown: (text) => rewriteDiscordLinks(resolveDiscordMentions(text)),
+        // Inbound counterpart: turn the raw `<@snowflake>` form Discord
+        // delivers into `@bot_username` for any sibling bot, so the agent
+        // can address its peer by name instead of guessing.
+        transformInboundText: (text) => resolveIncomingDiscordMentions(text),
         inboundFilter: isUserMessage,
         fetchThreadAnchor: makeFetchThreadAnchor(ws.botToken),
       });
