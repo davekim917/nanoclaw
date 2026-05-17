@@ -87,6 +87,19 @@ describe('CodexProvider sticky config + override propagation', () => {
     expect(overrides).toContain('model_reasoning_effort="high"');
   });
 
+  it('test_features_goals_always_enabled_for_all_codex_agents', () => {
+    // `features.goals=true` is always-on for every Codex container agent,
+    // same shape as `features.use_linux_sandbox_bwrap=false`. Both must be
+    // present regardless of sticky config (or its absence).
+    const withSticky = createCodexConfigOverrides({ reasoning_effort: 'xhigh' });
+    expect(withSticky).toContain('features.goals=true');
+    expect(withSticky).toContain('features.use_linux_sandbox_bwrap=false');
+
+    const withoutSticky = createCodexConfigOverrides();
+    expect(withoutSticky).toContain('features.goals=true');
+    expect(withoutSticky).toContain('features.use_linux_sandbox_bwrap=false');
+  });
+
   it('test_stickyConfig_explicit_undefined_no_override', () => {
     // Constructing CodexProvider with an empty providerConfig schema-defaults
     // to 'high', so this case is hit only when stickyConfig is genuinely
