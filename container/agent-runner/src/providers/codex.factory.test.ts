@@ -179,3 +179,71 @@ describe('materializeRawImageGeneration', () => {
     expect(fs.readdirSync(root)).toHaveLength(0);
   });
 });
+
+describe('codex gen() self-heals on hard turn errors (Layer-2 fix)', () => {
+  // Background: when a codex turn hits TURN_TIMEOUT_MS, the provider yields
+  // `{type:'error', retryable:false}` and runOneTurn returns — but the
+  // outer `while (!aborted)` used to continue with `yield* runOneTurn(...)`,
+  // and the codex app-server's internal turn state stayed wedged. There's
+  // no `turn/cancel` RPC in the protocol (only `turn/start`/`turn/steer`),
+  // so subsequent startCodexTurn calls re-timed-out the same way every
+  // 5 min. Without the early return, the only recovery was host-sweep at
+  // ABSOLUTE_CEILING_MS (30 min). The fix: re-yield events explicitly and
+  // return from gen() on a `retryable:false` so the outer finally runs
+  // killCodexAppServer; the next poll-loop iteration spawns a fresh
+  // app-server within seconds.
+  //
+  // Source-anchored guard (matches the F4 done-flag regression-guard
+  // pattern in poll-loop.test.ts). A behavior-level test would need a
+  // live app-server fake at the JSON-RPC boundary — out of scope for the
+  // factory test bundle; the F4 anchor pattern is the established way to
+  // freeze this invariant in this tree.
+  it('gen() returns on `retryable:false` so the app-server gets killed', () => {
+    const src = fs.readFileSync(new URL('./codex.ts', import.meta.url), 'utf8');
+    const lines = src.split('\n');
+
+    // The runOneTurn call is the anchor. Confirm we iterate-and-re-yield
+    // rather than blind `yield*` — blind delegation can't inspect events
+    // and so can't trigger the early return on a hard error.
+    const runOneTurnIdx = lines.findIndex((l) => /^\s+for await \(const ev of runOneTurn\(/.test(l));
+    expect(runOneTurnIdx).toBeGreaterThan(-1);
+
+    // The lines after the runOneTurn anchor are the inner consumption
+    // loop (the runOneTurn signature itself spans ~11 args, then the body
+    // is 4-5 more lines). Widen the window to comfortably include the
+    // `return` statement and its enclosing `if`.
+    const window = lines.slice(runOneTurnIdx, runOneTurnIdx + 20).join('\n');
+    // Strip line comments before pattern matching so explanatory prose
+    // can mention "retryable===false" without satisfying the check.
+    const codeOnly = window
+      .split('\n')
+      .map((l) => {
+        const i = l.indexOf('//');
+        return i >= 0 ? l.slice(0, i) : l;
+      })
+      .join('\n');
+
+    expect(codeOnly).toContain('yield ev');
+    expect(codeOnly).toMatch(/retryable\s*===\s*false/);
+    expect(codeOnly).toContain('return');
+
+    // And the file's finally block still kills the app-server — that's
+    // what makes the return actually recover.
+    expect(src).toMatch(/finally\s*\{[\s\S]*killCodexAppServer\(server\)/);
+  });
+
+  it('gen() does NOT use bare `yield*` for runOneTurn — that path is silent on hard error', () => {
+    const src = fs.readFileSync(new URL('./codex.ts', import.meta.url), 'utf8');
+    // Strip line and block comments so a comment explaining the prohibited
+    // pattern doesn't trip the assertion.
+    const codeOnly = src
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .split('\n')
+      .map((l) => {
+        const i = l.indexOf('//');
+        return i >= 0 ? l.slice(0, i) : l;
+      })
+      .join('\n');
+    expect(codeOnly).not.toMatch(/yield\*\s+runOneTurn\(/);
+  });
+});

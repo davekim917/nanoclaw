@@ -357,7 +357,17 @@ export class CodexProvider implements AgentProvider {
           // from the app-server yields an `activity` first (so the
           // poll-loop's idle timer stays honest) and then, where relevant,
           // an init / result / progress event.
-          yield* runOneTurn(
+          //
+          // We inspect each event while re-yielding it: on a `retryable:false`
+          // error (e.g. TURN_TIMEOUT_MS) the codex app-server is wedged
+          // server-side — there's no turn-cancel RPC, only turn/start and
+          // turn/steer, so the next startCodexTurn would either block or
+          // immediately re-time-out. Return from gen() so the outer finally
+          // (line ~373) calls killCodexAppServer and the next poll-loop
+          // iteration spawns a fresh app-server within seconds. Without
+          // this, every subsequent turn dies the same way until host-sweep
+          // reaps the whole container at its 30-min ABSOLUTE_CEILING_MS.
+          for await (const ev of runOneTurn(
             server,
             threadId!,
             text,
@@ -368,7 +378,12 @@ export class CodexProvider implements AgentProvider {
               initYielded = true;
             },
             turnTracker,
-          );
+          )) {
+            yield ev;
+            if (ev.type === 'error' && ev.retryable === false) {
+              return;
+            }
+          }
         }
       } finally {
         turnTracker.server = null;

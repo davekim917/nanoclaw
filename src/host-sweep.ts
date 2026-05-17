@@ -42,6 +42,7 @@ import {
   getMessageForRetry,
   getProcessingClaims,
   markMessageFailed,
+  readSessionRouting,
   retryWithBackoff,
   syncProcessingAcks,
   type ContainerState,
@@ -54,6 +55,7 @@ import {
   inboundDbPath,
   heartbeatPath,
   sessionsBaseDir,
+  writeOutboundDirect,
   writeSessionMessage,
 } from './session-manager.js';
 import {
@@ -712,6 +714,12 @@ function enforceRunningContainerSla(
       ceilingMs: decision.ceilingMs,
     });
     killContainer(session.id, 'absolute-ceiling');
+    // Tell the user we just reaped their container. Posted AFTER kill so
+    // we honor the outbound.db single-writer invariant
+    // (session-db.ts:openOutboundDbWritable) — host writes only after the
+    // container is gone, never alongside a live one. Same ordering as
+    // resetStuckProcessingRows below. Best-effort: failures log and move on.
+    notifyKillCeiling(inDb, outDb, session, decision.heartbeatAgeMs);
     resetStuckProcessingRows(inDb, outDb, session, 'absolute-ceiling');
     return;
   }
@@ -736,6 +744,100 @@ export function _resetStuckProcessingRowsForTesting(
 }
 
 export { sweepTaskWatchdog as _sweepTaskWatchdogForTesting };
+
+/**
+ * Tell the user we're about to reap their container for inactivity. The
+ * outbound.db write lands on the normal delivery path — no container
+ * involvement needed (it's about to die anyway). Best-effort: a missing
+ * routing row (fresh session) or a write failure just logs and moves on.
+ *
+ * Mirrors the spawn-task-watchdog notify shape at sweepTaskWatchdog: the
+ * difference is `kind='chat'` writing to **outbound** (host → channel
+ * delivery), not inbound (host → child container as a new turn input).
+ * The container is gone after killContainer; an inbound write would just
+ * sit until the next inbound from the user.
+ *
+ * The optional `writableOutDb` parameter mirrors `resetStuckProcessingRows`:
+ * tests pass an in-memory writable handle; production omits it and the
+ * function opens a fresh writable handle by path via writeOutboundDirect.
+ */
+export function notifyKillCeiling(
+  inDb: Database.Database,
+  outDb: Database.Database,
+  session: Session,
+  heartbeatAgeMs: number,
+  writableOutDb?: Database.Database,
+): void {
+  try {
+    const routing = readSessionRouting(inDb);
+    if (!routing) {
+      log.debug('kill-ceiling notify skipped — no session_routing', {
+        sessionId: session.id,
+      });
+      return;
+    }
+    // Idempotency: if a kill-ceiling notice was already written within the
+    // last 60s (e.g. a sweep raced and re-fired), skip the duplicate. The
+    // check is by content marker rather than a dedicated column to avoid
+    // a schema migration. Cheap query against an already-open handle.
+    const recent = outDb
+      .prepare(
+        "SELECT 1 FROM messages_out WHERE timestamp > datetime('now', '-60 seconds') AND content LIKE '%agent_restart_inactivity%' LIMIT 1",
+      )
+      .get();
+    if (recent) {
+      log.debug('kill-ceiling notify skipped — duplicate within 60s', {
+        sessionId: session.id,
+      });
+      return;
+    }
+    const minutes = Math.round(heartbeatAgeMs / 60_000);
+    const id = `sys-kill-ceiling-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    // Don't ask the user to resend: the kill-ceiling branch runs
+    // resetStuckProcessingRows immediately after, which calls
+    // retryWithBackoff on every claimed pending message. Unclaimed pending
+    // rows just sit until the next wake. Either way the system recovers
+    // the user's existing input — a resend would just create duplicates.
+    const content = JSON.stringify({
+      text:
+        `⚠️ I went silent for ${minutes} minutes and the host is restarting me. ` +
+        `Your last messages will be picked up automatically on the next wake — ` +
+        `no need to resend.`,
+      // Machine-readable marker so the idempotency check above (and any
+      // future consumer that wants to react) doesn't need to grep prose.
+      _system: { kind: 'agent_restart_inactivity', heartbeat_age_ms: heartbeatAgeMs },
+    });
+    if (writableOutDb) {
+      writableOutDb
+        .prepare(
+          `INSERT OR IGNORE INTO messages_out (id, seq, timestamp, kind, platform_id, channel_type, thread_id, content)
+           VALUES (?, (SELECT COALESCE(MAX(seq), 0) + 2 FROM messages_out), datetime('now'), ?, ?, ?, ?, ?)`,
+        )
+        .run(id, 'chat', routing.platform_id, routing.channel_type, routing.thread_id, content);
+    } else {
+      writeOutboundDirect(session.agent_group_id, session.id, {
+        id,
+        kind: 'chat',
+        platformId: routing.platform_id,
+        channelType: routing.channel_type,
+        threadId: routing.thread_id,
+        content,
+      });
+    }
+  } catch (err) {
+    log.warn('kill-ceiling notify failed', { sessionId: session.id, err });
+  }
+}
+
+/** Test-only re-export with an injected writable outbound DB handle. */
+export function _notifyKillCeilingForTesting(
+  inDb: Database.Database,
+  outDb: Database.Database,
+  session: Session,
+  heartbeatAgeMs: number,
+): void {
+  notifyKillCeiling(inDb, outDb, session, heartbeatAgeMs, outDb);
+}
 
 function resetStuckProcessingRows(
   inDb: Database.Database,
