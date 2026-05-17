@@ -312,4 +312,48 @@ describe('codex turn timer is idle-based, not wall-clock', () => {
     // Cleanup: finally clears the idle timer.
     expect(src).toMatch(/finally\s*\{[\s\S]*clearTimeout\(idleTimer\)/);
   });
+
+  // Codex review feedback (P1): long-running tool calls (Bash test runs,
+  // `hex project run --timeout 30m`, etc.) emit one `item/started`,
+  // execute silently for minutes, then `item/completed`. A naïve 120s
+  // idle watchdog would kill the turn mid-tool. The fix tracks an
+  // inFlightItems counter from start/completed events; the watchdog
+  // stays suppressed while the counter is > 0.
+  it('inFlightItems counter rises on item/started and falls on item/completed', () => {
+    const src = fs.readFileSync(new URL('./codex.ts', import.meta.url), 'utf8');
+    // Strip comments so explanatory prose mentioning the prior pattern
+    // can't satisfy the assertions.
+    const codeOnly = src
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .split('\n')
+      .map((l) => {
+        const i = l.indexOf('//');
+        return i >= 0 ? l.slice(0, i) : l;
+      })
+      .join('\n');
+
+    // Counter must be declared and adjusted by start/completed events.
+    expect(codeOnly).toMatch(/let\s+inFlightItems\s*=\s*0/);
+    expect(codeOnly).toMatch(/method\s*===\s*['"]item\/started['"][\s\S]{0,200}inFlightItems\+\+/);
+    expect(codeOnly).toMatch(/method\s*===\s*['"]item\/completed['"][\s\S]{0,200}inFlightItems\s*=\s*Math\.max\(0,\s*inFlightItems\s*-\s*1\)/);
+    // turn/completed and turn/failed must clear the counter — covers the
+    // rare orphan-start case (item starts but never completes).
+    expect(codeOnly).toMatch(/turn\/completed[\s\S]{0,200}inFlightItems\s*=\s*0|turn\/failed[\s\S]{0,200}inFlightItems\s*=\s*0/);
+  });
+
+  it('resetIdleTimer suppresses re-arm when a tool item is in flight', () => {
+    const src = fs.readFileSync(new URL('./codex.ts', import.meta.url), 'utf8');
+    // The reset function must consult inFlightItems and skip the
+    // re-arm when > 0. Anchor on the function name; check the body.
+    const fnStart = src.indexOf('const resetIdleTimer');
+    expect(fnStart).toBeGreaterThan(-1);
+    // Take a generous window — the body is small but spans comments.
+    const fnBody = src.slice(fnStart, fnStart + 600);
+    // The body must check inFlightItems and short-circuit (return)
+    // before calling setTimeout, otherwise the watchdog re-arms during
+    // a tool call.
+    expect(fnBody).toMatch(/inFlightItems\s*>\s*0[\s\S]{0,200}return/);
+    // And it must still arm setTimeout in the no-tool case.
+    expect(fnBody).toContain('setTimeout');
+  });
 });
