@@ -86,9 +86,7 @@ describe('resolveDiscordMentions', () => {
   it('still resolves dotted usernames (Discord post-2023 `user.name` form)', () => {
     // The new regex permits `.suffix` segments so `@user.name` still resolves.
     // Verifies the trailing-punctuation fix didn't regress legal dot-in-username.
-    const dotBots = new Map<string, DiscordBotIdentity>([
-      ['discord', { userId: '3333333333', username: 'axie.bot' }],
-    ]);
+    const dotBots = new Map<string, DiscordBotIdentity>([['discord', { userId: '3333333333', username: 'axie.bot' }]]);
     expect(resolveDiscordMentions('@axie.bot hi', dotBots)).toBe('<@3333333333> hi');
     expect(resolveDiscordMentions('@axie.bot.', dotBots)).toBe('<@3333333333>.');
     expect(resolveDiscordMentions('hi @axie.bot, ready?', dotBots)).toBe('hi <@3333333333>, ready?');
@@ -186,9 +184,7 @@ describe('end-to-end: resolveDiscordMentions → installed chat-sdk adapter rend
   });
 
   it('passes through messages with no mention untouched', () => {
-    expect(deliver('Just a regular message, no mentions here.')).toBe(
-      'Just a regular message, no mentions here.',
-    );
+    expect(deliver('Just a regular message, no mentions here.')).toBe('Just a regular message, no mentions here.');
   });
 
   it('handles multiple mentions in one message with mixed punctuation', () => {
