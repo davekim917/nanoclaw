@@ -38,8 +38,32 @@ import {
   writeCodexMcpConfigToml,
 } from './codex-app-server.js';
 
-/** Hard ceiling for a single turn. Guards against app-server wedging. */
-const TURN_TIMEOUT_MS = 5 * 60 * 1000;
+/**
+ * Idle watchdog for a single turn. Guards against codex-app-server wedging.
+ *
+ * Previously this was a wall-clock timer from turn start (`TURN_TIMEOUT_MS
+ * = 300_000`). That cut off every legitimate long turn — `xhigh` reasoning
+ * with multi-step tool work routinely runs past 5 min while emitting
+ * reasoning deltas every 1–10s. Wall-clock can't tell "thinking hard" from
+ * "wedged"; idle-from-last-notification can.
+ *
+ * The handler at runOneTurn resets the timer on every JSON-RPC
+ * notification (including `thread/status/changed` and `item/reasoning/*`
+ * deltas, which fire continuously during real work). 120s of total silence
+ * with no events arriving = the app-server is wedged at the JSON-RPC
+ * layer. Caught faster than the old 5-min wall-clock for real wedges; the
+ * old false-positives on long reasoning chains go away.
+ *
+ * Long-tool suppression: long-running tool calls (e.g. multi-minute Bash
+ * tests, `hex project run --timeout 30m`) emit one `item/started` then
+ * run silently until `item/completed`. The handler tracks an
+ * `inFlightItems` counter from those events and suppresses the watchdog
+ * while > 0 — long silence during a known-active tool is not a wedge.
+ * Backstop for a tool that truly hangs forever: host-sweep's 30-min
+ * ABSOLUTE_CEILING_MS (host-sweep.ts:163, same place that extends its
+ * own ceiling for declared Bash timeouts).
+ */
+const TURN_IDLE_TIMEOUT_MS = 120 * 1000;
 
 /**
  * Lookup tables for translating Codex's `collabAgentToolCall` tool names
@@ -492,9 +516,57 @@ async function* runOneTurn(
     buffer.push({ type: 'file', path: filePath });
   };
 
+  // Idle watchdog: armed below, reset on every notification when no
+  // tool item is in flight. See TURN_IDLE_TIMEOUT_MS comment block for
+  // design notes.
+  //
+  // Tool-aware suppression: codex emits item/started for every tool /
+  // reasoning / agent-message item and pairs it with item/completed. A
+  // long-running Bash call (think `go test ./...` or `hex project run
+  // --timeout 30m`) emits start, then runs silently for minutes, then
+  // emits complete. While the inflight count is > 0, long notification
+  // silence is expected — suppress the watchdog. Mirrors host-sweep's
+  // declared-Bash extension at host-sweep.ts:163. If a tool call truly
+  // hangs forever, host-sweep's 30-min ABSOLUTE_CEILING_MS is the
+  // backstop.
+  let idleTimer: ReturnType<typeof setTimeout> | null = null;
+  let inFlightItems = 0;
+
+  const resetIdleTimer = (): void => {
+    if (idleTimer !== null) {
+      clearTimeout(idleTimer);
+      idleTimer = null;
+    }
+    if (inFlightItems > 0) return;
+    idleTimer = setTimeout(() => {
+      turnState.error = new Error(`Codex turn idle for ${TURN_IDLE_TIMEOUT_MS}ms (no notifications)`);
+      turnDone = true;
+      kick();
+    }, TURN_IDLE_TIMEOUT_MS);
+  };
+
   const handler = (n: JsonRpcNotification): void => {
     const method = n.method;
     const params = n.params;
+
+    // Adjust the tool-in-flight count BEFORE resetting the idle timer,
+    // so the reset logic sees the new count and skips re-arming while a
+    // tool is running. Codex pairs item/started ↔ item/completed for
+    // every item type (tool calls, reasoning, agentMessage). On
+    // turn/completed and turn/failed we also clear the count — covers
+    // the rare case of an orphan start with no matching completion.
+    if (method === 'item/started') {
+      inFlightItems++;
+    } else if (method === 'item/completed') {
+      inFlightItems = Math.max(0, inFlightItems - 1);
+    } else if (method === 'turn/completed' || method === 'turn/failed') {
+      inFlightItems = 0;
+    }
+
+    // Reset the idle watchdog on every notification — even ones we don't
+    // translate to a ProviderEvent. The app-server emitting ANYTHING
+    // means it's alive; only total silence is a wedge signal.
+    resetIdleTimer();
 
     // Every inbound notification counts as activity for the poll-loop's
     // idle timer — yield before any event-specific translation so even
@@ -640,11 +712,11 @@ async function* runOneTurn(
 
   server.notificationHandlers.push(handler);
 
-  const timer = setTimeout(() => {
-    turnState.error = new Error(`Turn timed out after ${TURN_TIMEOUT_MS}ms`);
-    turnDone = true;
-    kick();
-  }, TURN_TIMEOUT_MS);
+  // Arm the idle watchdog before turn/start dispatches — there's a small
+  // window where startCodexTurn could hang at the JSON-RPC layer with no
+  // notifications ever arriving. The timer will be reset by the first
+  // real notification (typically thread/started or turn/started).
+  resetIdleTimer();
 
   try {
     // If we yield init before turn/start, the poll-loop stores
@@ -677,7 +749,7 @@ async function* runOneTurn(
 
     yield { type: 'result', text: resultText || null };
   } finally {
-    clearTimeout(timer);
+    if (idleTimer !== null) clearTimeout(idleTimer);
     const idx = server.notificationHandlers.indexOf(handler);
     if (idx >= 0) server.notificationHandlers.splice(idx, 1);
   }

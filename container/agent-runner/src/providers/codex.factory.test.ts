@@ -247,3 +247,113 @@ describe('codex gen() self-heals on hard turn errors (Layer-2 fix)', () => {
     expect(codeOnly).not.toMatch(/yield\*\s+runOneTurn\(/);
   });
 });
+
+describe('codex turn timer is idle-based, not wall-clock', () => {
+  // Background: the old TURN_TIMEOUT_MS was a wall-clock setTimeout from
+  // turn start. xhigh-reasoning turns that legitimately ran 5+ min while
+  // emitting reasoning deltas every 1–10s got killed at the wall-clock
+  // boundary — same exit point as a real wedge, with the same Slack
+  // "Turn ended with an error" surface. The fix replaces the wall-clock
+  // with an idle watchdog reset on every notification: real wedges (zero
+  // events) are caught in ~120s; legitimate long reasoning chains are not
+  // cut off so long as the app-server keeps emitting notifications.
+  //
+  // Source-anchored guards, matching the F4 + Layer-2 patterns.
+
+  it('declares an idle threshold, not a wall-clock total-turn threshold', () => {
+    const src = fs.readFileSync(new URL('./codex.ts', import.meta.url), 'utf8');
+    // Strip block + line comments so explanatory prose about the prior
+    // pattern can mention `TURN_TIMEOUT_MS` without satisfying the check.
+    const codeOnly = src
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .split('\n')
+      .map((l) => {
+        const i = l.indexOf('//');
+        return i >= 0 ? l.slice(0, i) : l;
+      })
+      .join('\n');
+    // Old constant must be gone from non-comment source.
+    expect(codeOnly).not.toMatch(/\bTURN_TIMEOUT_MS\b/);
+    // New idle constant must be present.
+    expect(codeOnly).toMatch(/\bTURN_IDLE_TIMEOUT_MS\b/);
+    // The constant is a millisecond value within a reasonable range
+    // (60-300s). Too short trips false-positives on slow reasoning;
+    // too long delays wedge detection.
+    const decl = codeOnly.match(/const\s+TURN_IDLE_TIMEOUT_MS\s*=\s*([\d_*\s]+);/);
+    expect(decl).not.toBeNull();
+    const ms = Function(`'use strict'; return (${decl![1]});`)() as number;
+    expect(ms).toBeGreaterThanOrEqual(60_000);
+    expect(ms).toBeLessThanOrEqual(300_000);
+  });
+
+  it('handler resets the idle timer on every notification', () => {
+    const src = fs.readFileSync(new URL('./codex.ts', import.meta.url), 'utf8');
+    // The handler body (in runOneTurn) must call resetIdleTimer near the
+    // top — before the per-method switch — so EVERY notification refreshes
+    // the watchdog, including ones we don't translate to a ProviderEvent.
+    const handlerStart = src.indexOf('const handler = (n: JsonRpcNotification)');
+    expect(handlerStart).toBeGreaterThan(-1);
+    const switchStart = src.indexOf('switch (method)', handlerStart);
+    expect(switchStart).toBeGreaterThan(-1);
+    const handlerPreamble = src.slice(handlerStart, switchStart);
+    expect(handlerPreamble).toContain('resetIdleTimer()');
+  });
+
+  it('idle timer is armed before the first turn dispatch and cleared in finally', () => {
+    const src = fs.readFileSync(new URL('./codex.ts', import.meta.url), 'utf8');
+    // Initial arm is needed because startCodexTurn could hang at the
+    // JSON-RPC layer before any notification arrives. Without an initial
+    // arm, the timer would only start after the first notification — and
+    // a wedged turn/start would never trigger a wedge-error event.
+    const startCodexTurnIdx = src.indexOf('await startCodexTurn(server,');
+    expect(startCodexTurnIdx).toBeGreaterThan(-1);
+    const preStart = src.slice(0, startCodexTurnIdx);
+    expect(preStart).toMatch(/resetIdleTimer\(\);\s*$|resetIdleTimer\(\);\s*\n[^\n]*try/m);
+    // Cleanup: finally clears the idle timer.
+    expect(src).toMatch(/finally\s*\{[\s\S]*clearTimeout\(idleTimer\)/);
+  });
+
+  // Codex review feedback (P1): long-running tool calls (Bash test runs,
+  // `hex project run --timeout 30m`, etc.) emit one `item/started`,
+  // execute silently for minutes, then `item/completed`. A naïve 120s
+  // idle watchdog would kill the turn mid-tool. The fix tracks an
+  // inFlightItems counter from start/completed events; the watchdog
+  // stays suppressed while the counter is > 0.
+  it('inFlightItems counter rises on item/started and falls on item/completed', () => {
+    const src = fs.readFileSync(new URL('./codex.ts', import.meta.url), 'utf8');
+    // Strip comments so explanatory prose mentioning the prior pattern
+    // can't satisfy the assertions.
+    const codeOnly = src
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .split('\n')
+      .map((l) => {
+        const i = l.indexOf('//');
+        return i >= 0 ? l.slice(0, i) : l;
+      })
+      .join('\n');
+
+    // Counter must be declared and adjusted by start/completed events.
+    expect(codeOnly).toMatch(/let\s+inFlightItems\s*=\s*0/);
+    expect(codeOnly).toMatch(/method\s*===\s*['"]item\/started['"][\s\S]{0,200}inFlightItems\+\+/);
+    expect(codeOnly).toMatch(/method\s*===\s*['"]item\/completed['"][\s\S]{0,200}inFlightItems\s*=\s*Math\.max\(0,\s*inFlightItems\s*-\s*1\)/);
+    // turn/completed and turn/failed must clear the counter — covers the
+    // rare orphan-start case (item starts but never completes).
+    expect(codeOnly).toMatch(/turn\/completed[\s\S]{0,200}inFlightItems\s*=\s*0|turn\/failed[\s\S]{0,200}inFlightItems\s*=\s*0/);
+  });
+
+  it('resetIdleTimer suppresses re-arm when a tool item is in flight', () => {
+    const src = fs.readFileSync(new URL('./codex.ts', import.meta.url), 'utf8');
+    // The reset function must consult inFlightItems and skip the
+    // re-arm when > 0. Anchor on the function name; check the body.
+    const fnStart = src.indexOf('const resetIdleTimer');
+    expect(fnStart).toBeGreaterThan(-1);
+    // Take a generous window — the body is small but spans comments.
+    const fnBody = src.slice(fnStart, fnStart + 600);
+    // The body must check inFlightItems and short-circuit (return)
+    // before calling setTimeout, otherwise the watchdog re-arms during
+    // a tool call.
+    expect(fnBody).toMatch(/inFlightItems\s*>\s*0[\s\S]{0,200}return/);
+    // And it must still arm setTimeout in the no-tool case.
+    expect(fnBody).toContain('setTimeout');
+  });
+});
