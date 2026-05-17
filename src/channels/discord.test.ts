@@ -161,6 +161,30 @@ describe('resolveIncomingDiscordMentions', () => {
     const agentReplies = `Sure, ${agentSees.split(' ').slice(0, 1)[0]} — on it`;
     expect(resolveDiscordMentions(agentReplies, bots)).toBe('Sure, <@1505246118940770375> — on it');
   });
+
+  it('preserves code regions verbatim (mirrors outbound)', () => {
+    // Codex review #97: when a user pastes a raw log line into a code
+    // fence or inline code, the resolver must not "helpfully" rewrite
+    // the snowflake — the user put it in code on purpose. The exact
+    // string they typed is what the agent should see.
+    expect(resolveIncomingDiscordMentions('Inline: `payload: <@1478986205319135302>`', bots)).toBe(
+      'Inline: `payload: <@1478986205319135302>`',
+    );
+    expect(
+      resolveIncomingDiscordMentions('```\nlog: <@1478986205319135302> arrived\n```', bots),
+    ).toBe('```\nlog: <@1478986205319135302> arrived\n```');
+  });
+
+  it('rewrites prose mentions but leaves code-region copies alone in the same message', () => {
+    // Mixed prose + code: prose mention should still resolve, code mention
+    // should not. Confirms code-region protection is scoped to the protected
+    // regions and not a blanket pass-through.
+    const input =
+      'Hey <@1505246118940770375>, here is the raw event:\n```\nevent: { user: "<@1478986205319135302>" }\n```';
+    expect(resolveIncomingDiscordMentions(input, bots)).toBe(
+      'Hey @Axie-Codex, here is the raw event:\n```\nevent: { user: "<@1478986205319135302>" }\n```',
+    );
+  });
 });
 
 describe('parseDiscordWorkspaces', () => {

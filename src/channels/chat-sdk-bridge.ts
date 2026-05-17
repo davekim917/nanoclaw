@@ -866,6 +866,12 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
     ): Promise<Array<{ sender: string; text: string; timestamp: string; isAnchor?: boolean }>> {
       const limit = opts?.limit ?? 50;
       const inThread: Array<{ sender: string; text: string; timestamp: string; isAnchor?: boolean }> = [];
+      // Apply the same inbound text transform that messageToInbound uses, so
+      // resumed-thread context the router prepends as [Thread context] doesn't
+      // leak the raw wire form (Discord snowflakes) the live path normalizes
+      // away. Fail-soft: with no transform configured this is identity.
+      const applyInboundTransform = (t: string): string =>
+        config.transformInboundText ? config.transformInboundText(t) : t;
       try {
         const result = await adapter.fetchMessages(threadId, { limit });
         const msgs = (result?.messages ?? []) as Array<{
@@ -879,7 +885,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           if (!m.text || m.text.length === 0) continue;
           inThread.push({
             sender: m.author.isMe ? 'assistant' : m.author.fullName || m.author.userName || 'unknown',
-            text: m.text,
+            text: applyInboundTransform(m.text),
             timestamp: m.metadata.dateSent.toISOString(),
           });
         }
@@ -901,7 +907,10 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // De-dupe on (sender, text) against the in-thread set — for forum
       // threads the anchor is already the first in-thread message, and
       // timestamps from the message-by-id endpoint and the channel-messages
-      // endpoint don't always round-trip to the same ISO string.
+      // endpoint don't always round-trip to the same ISO string. De-dupe
+      // happens AFTER the transform on both sides so the comparison is on
+      // normalized text — otherwise a normalized in-thread copy and a raw
+      // anchor copy of the same message would both survive.
       if (config.fetchThreadAnchor) {
         try {
           const anchors = await config.fetchThreadAnchor(threadId, { excludeMessageId: opts?.excludeMessageId });
@@ -910,8 +919,11 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
             for (let i = anchors.length - 1; i >= 0; i--) {
               const a = anchors[i];
               if (!a.text || a.text.length === 0) continue;
-              const alreadyPresent = inThread.some((m) => m.sender === a.sender && m.text === a.text);
-              if (!alreadyPresent) inThread.unshift(a);
+              const normalized = { ...a, text: applyInboundTransform(a.text) };
+              const alreadyPresent = inThread.some(
+                (m) => m.sender === normalized.sender && m.text === normalized.text,
+              );
+              if (!alreadyPresent) inThread.unshift(normalized);
             }
           }
         } catch (err) {

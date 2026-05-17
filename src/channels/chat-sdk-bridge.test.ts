@@ -228,6 +228,69 @@ describe('createChatSdkBridge — fetchThreadHistory anchor', () => {
     await bridge.fetchThreadHistory!('discord:g:c:t', { limit: 50, excludeMessageId: 'mention-msg-id' });
     expect(receivedExclude).toBe('mention-msg-id');
   });
+
+  it('applies transformInboundText to in-thread message text', async () => {
+    // Codex review #97: live messages go through messageToInbound which
+    // applies transformInboundText. The thread-history path was bypassing
+    // it, so a resumed thread saw raw snowflakes in [Thread context] even
+    // after live messages stopped leaking them.
+    const bridge = createChatSdkBridge({
+      adapter: adapterWithFetchMessages([
+        { id: 'in-1', text: 'hey <@123> can you check', sender: 'Dave', iso: '2026-05-03T12:00:00Z' },
+        { id: 'in-2', text: 'sure thing', sender: 'Axie', iso: '2026-05-03T12:01:00Z' },
+      ]),
+      supportsThreads: true,
+      transformInboundText: (t) => t.replace(/<@123>/g, '@Axie-Codex'),
+    });
+    const history = await bridge.fetchThreadHistory!('discord:g:c:t', { limit: 50 });
+    expect(history.map((m) => m.text)).toEqual(['hey @Axie-Codex can you check', 'sure thing']);
+  });
+
+  it('applies transformInboundText to anchor messages too', async () => {
+    // The mention-trigger anchor on Discord auto-threads sits outside
+    // fetchMessages but is prepended into history. Without applying the
+    // transform there, the very first wake on a thread can still surface
+    // raw `<@id>` to the agent.
+    const bridge = createChatSdkBridge({
+      adapter: adapterWithFetchMessages([
+        { id: 'in-1', text: 'on it', sender: 'Axie', iso: '2026-05-03T13:00:00Z' },
+      ]),
+      supportsThreads: true,
+      fetchThreadAnchor: async () => [
+        {
+          sender: 'Dave',
+          text: 'hey <@123> have <@456> handle this',
+          timestamp: '2026-05-03T10:00:00Z',
+          isAnchor: true,
+        },
+      ],
+      transformInboundText: (t) => t.replace(/<@123>/g, '@Axie').replace(/<@456>/g, '@Axie-Codex'),
+    });
+    const history = await bridge.fetchThreadHistory!('discord:g:c:t', { limit: 50 });
+    expect(history[0].text).toBe('hey @Axie have @Axie-Codex handle this');
+    expect(history[0].isAnchor).toBe(true);
+  });
+
+  it('de-dupes anchors against in-thread results on transformed text, not raw', async () => {
+    // For forum threads the anchor IS the first in-thread message; if we
+    // de-duped on raw text against transformed text the same starter post
+    // would survive twice. Comparison must be on normalized text on both
+    // sides.
+    const rawText = 'starter <@123> hi';
+    const transformedText = 'starter @Axie hi';
+    const bridge = createChatSdkBridge({
+      adapter: adapterWithFetchMessages([
+        { id: 'starter', text: rawText, sender: 'Axie', iso: '2026-05-03T10:00:00Z' },
+      ]),
+      supportsThreads: true,
+      fetchThreadAnchor: async () => [
+        { sender: 'Axie', text: rawText, timestamp: '2026-05-03T10:00:00Z', isAnchor: true },
+      ],
+      transformInboundText: (t) => t.replace(/<@123>/g, '@Axie'),
+    });
+    const history = await bridge.fetchThreadHistory!('discord:g:c:t', { limit: 50 });
+    expect(history.filter((m) => m.text === transformedText)).toHaveLength(1);
+  });
 });
 
 describe('createChatSdkBridge — outbound transform path', () => {

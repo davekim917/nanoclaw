@@ -351,6 +351,13 @@ export function resolveDiscordMentions(text: string, bots: Map<string, DiscordBo
  * Role mentions (`<@&ROLE>`) and channel mentions (`<#CHAN>`) are not
  * touched — the regex demands a digit-only capture so `&` and `#`
  * prefixes fall through.
+ *
+ * Code regions are skipped via `transformOutsideProtectedRegions`,
+ * mirroring the outbound rewriter. A pasted log line like
+ * `` `payload: <@123>` `` stays verbatim — the user put it in code on
+ * purpose, and the agent reading the inbound is better served by the
+ * exact text the user typed than by a "helpful" name substitution
+ * inside what is meant to be raw content.
  */
 export function resolveIncomingDiscordMentions(
   text: string,
@@ -363,10 +370,12 @@ export function resolveIncomingDiscordMentions(
   }
   // `<@123>` is a normal mention; `<@!123>` is the legacy "nickname mention"
   // form some older Discord clients still emit. Both resolve to the same user.
-  return text.replace(/<@!?(\d+)>/g, (match, id: string) => {
-    const username = byId.get(id);
-    return username ? `@${username}` : match;
-  });
+  return transformOutsideProtectedRegions(text, (segment) =>
+    segment.replace(/<@!?(\d+)>/g, (match, id: string) => {
+      const username = byId.get(id);
+      return username ? `@${username}` : match;
+    }),
+  );
 }
 
 /** Minimal REST interface for Discord operations — narrow surface for testing. */
