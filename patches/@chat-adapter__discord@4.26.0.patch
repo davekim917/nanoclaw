@@ -1,0 +1,78 @@
+diff --git a/dist/index.js b/dist/index.js
+index 8b490cf67e4d4dcec82404a27ef364f440c617b6..9e00c9370c1946d3e0081764851a5a6077281eba 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -1658,14 +1658,23 @@ var DiscordAdapter = class _DiscordAdapter {
+         this.logger.debug("Ignoring message - Gateway is shutting down");
+         return;
+       }
+-      if (message.author.bot) {
+-        this.logger.debug("Ignoring message from bot", {
++      if (message.author.id === client.user?.id) {
++        this.logger.debug("Ignoring self-echo", {
+           authorId: message.author.id,
+-          authorName: message.author.username,
+-          isMe: message.author.id === client.user?.id
++          authorName: message.author.username
+         });
+         return;
+       }
++      if (message.author.bot) {
++        const siblings = globalThis.__nanoclawDiscordSiblings;
++        if (!(siblings && siblings.has(message.author.id))) {
++          this.logger.debug("Ignoring non-sibling bot message", {
++            authorId: message.author.id,
++            authorName: message.author.username
++          });
++          return;
++        }
++      }
+       const isUserMentioned = message.mentions.has(client.user?.id ?? "");
+       const isRoleMentioned = this.mentionRoleIds.length > 0 && message.mentions.roles.some(
+         (role) => this.mentionRoleIds.includes(role.id)
+@@ -1687,13 +1696,17 @@ var DiscordAdapter = class _DiscordAdapter {
+         this.logger.debug("Ignoring reaction - Gateway is shutting down");
+         return;
+       }
+-      if (user.bot) {
+-        this.logger.debug("Ignoring reaction from bot", {
+-          userId: user.id,
+-          isMe: user.id === client.user?.id
+-        });
++      if (user.id === client.user?.id) {
++        this.logger.debug("Ignoring self-reaction", { userId: user.id });
+         return;
+       }
++      if (user.bot) {
++        const siblings = globalThis.__nanoclawDiscordSiblings;
++        if (!(siblings && siblings.has(user.id))) {
++          this.logger.debug("Ignoring non-sibling bot reaction", { userId: user.id });
++          return;
++        }
++      }
+       this.logger.info("Discord Gateway reaction added", {
+         emoji: reaction.emoji.name,
+         messageId: reaction.message.id,
+@@ -1715,13 +1728,17 @@ var DiscordAdapter = class _DiscordAdapter {
+         );
+         return;
+       }
+-      if (user.bot) {
+-        this.logger.debug("Ignoring reaction removal from bot", {
+-          userId: user.id,
+-          isMe: user.id === client.user?.id
+-        });
++      if (user.id === client.user?.id) {
++        this.logger.debug("Ignoring self-reaction removal", { userId: user.id });
+         return;
+       }
++      if (user.bot) {
++        const siblings = globalThis.__nanoclawDiscordSiblings;
++        if (!(siblings && siblings.has(user.id))) {
++          this.logger.debug("Ignoring non-sibling bot reaction removal", { userId: user.id });
++          return;
++        }
++      }
+       this.logger.info("Discord Gateway reaction removed", {
+         emoji: reaction.emoji.name,
+         messageId: reaction.message.id,

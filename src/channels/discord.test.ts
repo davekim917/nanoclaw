@@ -3,12 +3,79 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   isUserMessage,
   parseDiscordWorkspaces,
+  resolveDiscordMentions,
   rewriteDiscordLinks,
   discordPostParent,
   discordCreateThread,
   extractDiscordChannelId,
+  type DiscordBotIdentity,
   type DiscordRestClient,
 } from './discord.js';
+
+describe('resolveDiscordMentions', () => {
+  const bots = new Map<string, DiscordBotIdentity>([
+    ['discord', { userId: '1111111111', username: 'Axie' }],
+    ['discord-axie-codex', { userId: '2222222222', username: 'Axie-Codex' }],
+  ]);
+
+  it('returns text unchanged when no bots are registered', () => {
+    expect(resolveDiscordMentions('@Axie hello', new Map())).toBe('@Axie hello');
+  });
+
+  it('rewrites a known username to a real mention', () => {
+    expect(resolveDiscordMentions('@Axie hello', bots)).toBe('<@1111111111> hello');
+  });
+
+  it('rewrites case-insensitively', () => {
+    expect(resolveDiscordMentions('@AXIE hello', bots)).toBe('<@1111111111> hello');
+    expect(resolveDiscordMentions('@axie hello', bots)).toBe('<@1111111111> hello');
+  });
+
+  it('handles usernames with dashes', () => {
+    // The bug we are fixing — Axie-Codex would not resolve in the screenshot.
+    expect(resolveDiscordMentions('@Axie-Codex take the next verse', bots)).toBe('<@2222222222> take the next verse');
+  });
+
+  it('leaves unknown usernames as plain text', () => {
+    // Fail-soft: never invent a snowflake for a name we cannot verify.
+    expect(resolveDiscordMentions('@RandomUser hello', bots)).toBe('@RandomUser hello');
+  });
+
+  it('does not double-wrap an existing `<@id>` mention', () => {
+    expect(resolveDiscordMentions('<@1111111111> hi', bots)).toBe('<@1111111111> hi');
+  });
+
+  it('does not touch role mentions `<@&…>`', () => {
+    expect(resolveDiscordMentions('<@&999999999> hi', bots)).toBe('<@&999999999> hi');
+  });
+
+  it('preserves code regions verbatim', () => {
+    // Mentions inside fenced or inline code must not be rewritten — a
+    // documentation example like "use `@Axie hello`" would otherwise rewrite
+    // mid-code.
+    expect(resolveDiscordMentions('Inline: `@Axie hello`', bots)).toBe('Inline: `@Axie hello`');
+    expect(resolveDiscordMentions('```\n@Axie hello\n```', bots)).toBe('```\n@Axie hello\n```');
+  });
+
+  it('rewrites multiple distinct mentions in one message', () => {
+    expect(resolveDiscordMentions('@Axie and @Axie-Codex collab', bots)).toBe('<@1111111111> and <@2222222222> collab');
+  });
+
+  it('handles `@username` at end-of-string with no trailing whitespace', () => {
+    expect(resolveDiscordMentions('over to @Axie-Codex', bots)).toBe('over to <@2222222222>');
+  });
+
+  it('does not match `@` preceded by a word character (email-like text)', () => {
+    // Codex review finding B: `user@domain.com` previously matched as
+    // `@domain.com`. Fail-soft today (no bot named "domain.com"), but the
+    // word-boundary guard makes intent explicit. Confirms the lookbehind
+    // anchors the `@` so the right-hand side of an email or path is never
+    // treated as a mention target.
+    const bots2 = new Map<string, DiscordBotIdentity>([['discord', { userId: '9', username: 'domain.com' }]]);
+    expect(resolveDiscordMentions('contact user@domain.com today', bots2)).toBe('contact user@domain.com today');
+    expect(resolveDiscordMentions('@domain.com hi', bots2)).toBe('<@9> hi');
+  });
+});
 
 describe('parseDiscordWorkspaces', () => {
   it('returns an empty list when no credentials present', () => {
