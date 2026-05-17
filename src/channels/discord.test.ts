@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
+import { DiscordFormatConverter } from '@chat-adapter/discord';
+
 import {
   isUserMessage,
   parseDiscordWorkspaces,
@@ -66,6 +68,32 @@ describe('resolveDiscordMentions', () => {
     expect(resolveDiscordMentions('over to @Axie-Codex', bots)).toBe('over to <@2222222222>');
   });
 
+  it('handles trailing sentence punctuation without gobbling it into the capture', () => {
+    // This was the bug from the 5/17 roasting thread: the original `[\w.-]+`
+    // greedily included the trailing period, so `@Axie-Codex.` looked up
+    // `axie-codex.` and missed. The downstream chat-sdk adapter then split
+    // on the dash via its `/@(\w+)/g` pass and rendered `<@Axie>-Codex.`.
+    // The new `[\w-]+(?:\.[\w-]+)*` pattern stops at sentence punctuation.
+    expect(resolveDiscordMentions('Your turn, @Axie-Codex.', bots)).toBe('Your turn, <@2222222222>.');
+    expect(resolveDiscordMentions('hey @Axie-Codex, ready?', bots)).toBe('hey <@2222222222>, ready?');
+    expect(resolveDiscordMentions('@Axie-Codex!', bots)).toBe('<@2222222222>!');
+    expect(resolveDiscordMentions('@Axie-Codex?', bots)).toBe('<@2222222222>?');
+    expect(resolveDiscordMentions('(over to @Axie-Codex)', bots)).toBe('(over to <@2222222222>)');
+    expect(resolveDiscordMentions('@Axie-Codex: take it', bots)).toBe('<@2222222222>: take it');
+    expect(resolveDiscordMentions('@Axie-Codex; next', bots)).toBe('<@2222222222>; next');
+  });
+
+  it('still resolves dotted usernames (Discord post-2023 `user.name` form)', () => {
+    // The new regex permits `.suffix` segments so `@user.name` still resolves.
+    // Verifies the trailing-punctuation fix didn't regress legal dot-in-username.
+    const dotBots = new Map<string, DiscordBotIdentity>([
+      ['discord', { userId: '3333333333', username: 'axie.bot' }],
+    ]);
+    expect(resolveDiscordMentions('@axie.bot hi', dotBots)).toBe('<@3333333333> hi');
+    expect(resolveDiscordMentions('@axie.bot.', dotBots)).toBe('<@3333333333>.');
+    expect(resolveDiscordMentions('hi @axie.bot, ready?', dotBots)).toBe('hi <@3333333333>, ready?');
+  });
+
   it('rewrites the bracketed-by-name form `<@Name>` agents sometimes emit', () => {
     // Field-observed bug: agents wrote `<@Axie-Codex>` literally (they
     // generalize the Slack `<@U123>` template but substitute the username
@@ -98,6 +126,75 @@ describe('resolveDiscordMentions', () => {
     const bots2 = new Map<string, DiscordBotIdentity>([['discord', { userId: '9', username: 'domain.com' }]]);
     expect(resolveDiscordMentions('contact user@domain.com today', bots2)).toBe('contact user@domain.com today');
     expect(resolveDiscordMentions('@domain.com hi', bots2)).toBe('<@9> hi');
+  });
+});
+
+describe('end-to-end: resolveDiscordMentions → installed chat-sdk adapter render', () => {
+  // This is the test that should have existed all along. It exercises the
+  // ACTUAL pipeline that runs on the wire to Discord — our outbound rewriter
+  // followed by the installed `@chat-adapter/discord`'s `renderPostable` —
+  // and asserts on the exact bytes Discord receives.
+  //
+  // Without this test, five PRs shipped while the rendered chip in
+  // screenshots was actually `<` literal + chip + `>` literal (a side-effect
+  // of the adapter double-wrapping our resolved `<@SNOWFLAKE>` mentions). The
+  // chip looked correct but the wire was `<<@SNOWFLAKE>>`, breaking the
+  // wire-level mention contract (no entry in `message.mentions[]`, no
+  // notification, no peer-bot wake on the platform side — only the chat-sdk
+  // dispatch wakes the sibling, which still worked, so the bug was hard to
+  // spot from logs alone).
+  //
+  // Both halves of the fix are exercised:
+  //   (a) the new `[\w-]+(?:\.[\w-]+)*` regex stops at trailing punctuation,
+  //       so `@Axie-Codex.` is resolved instead of slipping through.
+  //   (b) the patched `convertMentionsToDiscord` / `nodeToDiscordMarkdown`
+  //       use `(?<!<)@(\w+)` so the already-resolved `<@SNOWFLAKE>` is not
+  //       double-wrapped.
+  const bots = new Map<string, DiscordBotIdentity>([
+    ['discord', { userId: '1478986205319135302', username: 'Axie' }],
+    ['discord-axie-codex', { userId: '1505246118940770375', username: 'Axie-Codex' }],
+  ]);
+
+  function deliver(agentRawText: string): string {
+    const afterMyRewriter = resolveDiscordMentions(agentRawText, bots);
+    const converter = new DiscordFormatConverter();
+    return converter.renderPostable({ markdown: afterMyRewriter });
+  }
+
+  it('produces a clean `<@SNOWFLAKE>` on the wire for `@bot-name.` (sentence-ending)', () => {
+    // The exact text from the failed 5/17 thread.
+    expect(deliver('Your turn, @Axie-Codex. Try to keep up.')).toBe(
+      'Your turn, <@1505246118940770375>. Try to keep up.',
+    );
+  });
+
+  it('produces a clean `<@SNOWFLAKE>` for `@bot-name` followed by space', () => {
+    expect(deliver('I’ll hold my fire. @Axie has first swing.')).toBe(
+      'I’ll hold my fire. <@1478986205319135302> has first swing.',
+    );
+  });
+
+  it('handles the bracketed-by-name form agents sometimes emit (`<@Name>`)', () => {
+    expect(deliver('<@Axie-Codex> your turn.')).toBe('<@1505246118940770375> your turn.');
+  });
+
+  it('does NOT double-wrap a pre-resolved `<@SNOWFLAKE>` (the bug the patch fixes)', () => {
+    // Sanity: even if our rewriter produces `<@id>` on its first pass, the
+    // installed adapter must not re-wrap to `<<@id>>` on its way to Discord.
+    // Without the lookbehind patch, this assertion fails.
+    expect(deliver('hey <@1478986205319135302>')).toBe('hey <@1478986205319135302>');
+  });
+
+  it('passes through messages with no mention untouched', () => {
+    expect(deliver('Just a regular message, no mentions here.')).toBe(
+      'Just a regular message, no mentions here.',
+    );
+  });
+
+  it('handles multiple mentions in one message with mixed punctuation', () => {
+    expect(deliver('OK @Axie, you go first; @Axie-Codex, you follow.')).toBe(
+      'OK <@1478986205319135302>, you go first; <@1505246118940770375>, you follow.',
+    );
   });
 });
 
