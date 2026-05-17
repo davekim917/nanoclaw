@@ -65,6 +65,29 @@ describe('resolveDiscordMentions', () => {
     expect(resolveDiscordMentions('over to @Axie-Codex', bots)).toBe('over to <@2222222222>');
   });
 
+  it('rewrites the bracketed-by-name form `<@Name>` agents sometimes emit', () => {
+    // Field-observed bug: agents wrote `<@Axie-Codex>` literally (they
+    // generalize the Slack `<@U123>` template but substitute the username
+    // instead of the snowflake). Discord renders this as text since the
+    // body isn't a valid id. The rewriter has to be tolerant of this form
+    // or sibling handoffs silently break in chat even with the bot filter
+    // and outbound rewriter both shipping.
+    expect(resolveDiscordMentions('<@Axie-Codex> your turn.', bots)).toBe('<@2222222222> your turn.');
+    expect(resolveDiscordMentions('Your turn, <@Axie-Codex> — take it.', bots)).toBe(
+      'Your turn, <@2222222222> — take it.',
+    );
+  });
+
+  it('does not touch a real `<@SNOWFLAKE>` mention even with the bracketed-form pass', () => {
+    // The bracketed-form rewriter matches `<@([\w.-]+)>`, which would also
+    // catch numeric snowflakes. The byName lookup keys on usernames only,
+    // so a digits-only capture has no match and falls through unchanged.
+    expect(resolveDiscordMentions('<@1111111111> hi', bots)).toBe('<@1111111111> hi');
+    expect(resolveDiscordMentions('<@9999999999999999999> from another bot', bots)).toBe(
+      '<@9999999999999999999> from another bot',
+    );
+  });
+
   it('does not match `@` preceded by a word character (email-like text)', () => {
     // Codex review finding B: `user@domain.com` previously matched as
     // `@domain.com`. Fail-soft today (no bot named "domain.com"), but the
