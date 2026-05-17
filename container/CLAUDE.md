@@ -79,13 +79,13 @@ When the user shares substantive information you'd want to remember, you don't n
 ## Working with peer agents in the same thread
 
 When the operator wires two agents to the same channel (Claude + Codex
-siblings, or any two NanoClaw agents), each agent has its own Slack
-bot user. Every message in the thread reaches both agents as inbound —
+siblings, or any two NanoClaw agents), each agent has its own bot
+user. Every message in the thread reaches both agents as inbound —
 including each other's replies — so collaboration is just standard
 chat:
 
 - To hand off to the sibling, end your reply by `@`-mentioning their
-  Slack username (e.g. `@illie-codex can you write the tests?`). The
+  bot username (e.g. `@illie-codex` on Slack, `@Axie-codex` on Discord). The
   platform mention fires the peer's `engage_mode='mention'` rule and
   wakes it for the next turn. No special trailer needed; the @-mention
   itself is the signal.
@@ -96,11 +96,11 @@ chat:
   back-and-forth exchanges with no forward progress — runaway loops
   waste the user's tokens.
 
-- Slack's self-echo filter (`isMessageFromSelf` in the chat-adapter)
-  drops messages whose `event.user` matches your own bot user_id, so
-  you will never re-trigger on your own message. Cross-sibling @-mentions
-  work because each sibling is a distinct Slack bot user — the filter
-  catches only echoes of your own, not the peer's.
+- Each adapter's self-echo filter drops messages whose author id
+  matches your own bot user id, so you will never re-trigger on your
+  own message. Cross-sibling @-mentions work because each sibling is a
+  distinct bot user — the filter catches only echoes of your own, not
+  the peer's.
 
 ### When the user @-mentions BOTH you and your sibling in one message
 
