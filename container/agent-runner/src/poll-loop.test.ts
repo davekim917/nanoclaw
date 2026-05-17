@@ -10,6 +10,7 @@ import { formatMessages, extractRouting } from './formatter.js';
 import {
   dispatchFileAttachment,
   dispatchResultText,
+  handleEvent,
   isAdmissibleTrigger,
   isAupRefusal,
   selectInTurnFollowUps,
@@ -849,5 +850,59 @@ describe('isAupRefusal', () => {
     expect(isAupRefusal('')).toBe(false);
     expect(isAupRefusal('Done.')).toBe(false);
     expect(isAupRefusal('API Error: rate limit exceeded.')).toBe(false);
+  });
+});
+
+describe('handleEvent — terminal-error visibility (Layer-1 fix)', () => {
+  // Background: when a provider yields `{type:'error', retryable:false}`
+  // (e.g. codex hard turn-timeout, claude quota exhaustion), the user
+  // used to see nothing — the for-await would exit, the next turn would
+  // also time out the same way, and 30 min later host-sweep silently
+  // reaped the container. The fix surfaces the error on the user's
+  // delivery channel as a normal chat outbound. Retryable errors stay
+  // quiet (the runner retries upstream); only the terminal branch posts.
+  function routingFixture() {
+    return {
+      channelType: 'slack',
+      platformId: 'C-TEST',
+      threadId: 'T-TEST',
+      inReplyTo: null,
+      quietStatus: false,
+    };
+  }
+
+  it('retryable=false writes a visible chat outbound on the session route', () => {
+    handleEvent(
+      { type: 'error', message: 'Turn timed out after 300000ms', retryable: false },
+      routingFixture(),
+    );
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(out[0].kind).toBe('chat');
+    expect(out[0].channel_type).toBe('slack');
+    expect(out[0].platform_id).toBe('C-TEST');
+    expect(out[0].thread_id).toBe('T-TEST');
+    const body = JSON.parse(out[0].content) as { text: string };
+    expect(body.text).toContain('Turn timed out after 300000ms');
+    expect(body.text).toContain("pick up from your next message");
+  });
+
+  it('retryable=true is silent — runner is still working on a fix internally', () => {
+    handleEvent(
+      { type: 'error', message: 'API retry', retryable: true },
+      routingFixture(),
+    );
+    expect(getUndeliveredMessages()).toHaveLength(0);
+  });
+
+  it('classification is included in the chat surface for terminal errors', () => {
+    handleEvent(
+      { type: 'error', message: 'Rate limit', retryable: false, classification: 'quota' },
+      routingFixture(),
+    );
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    const body = JSON.parse(out[0].content) as { text: string };
+    expect(body.text).toContain('Rate limit');
   });
 });

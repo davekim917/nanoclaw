@@ -753,7 +753,7 @@ async function processQuery(
   return { continuation: queryContinuation };
 }
 
-function handleEvent(event: ProviderEvent, routing: RoutingContext): void {
+export function handleEvent(event: ProviderEvent, routing: RoutingContext): void {
   switch (event.type) {
     case 'init':
       log(`Session: ${event.continuation}`);
@@ -765,6 +765,27 @@ function handleEvent(event: ProviderEvent, routing: RoutingContext): void {
       log(
         `Error: ${event.message} (retryable: ${event.retryable}${event.classification ? `, ${event.classification}` : ''})`,
       );
+      // Surface terminal errors to the user. Retryable errors (transient
+      // upstream blips, mid-stream retries) stay quiet — only the final
+      // failure mode is worth a Slack/Discord post. Without this write the
+      // provider yields its error event, the for-await exits, the outer
+      // poll-loop iterates into the next turn, and the user sees nothing
+      // for up to the host-sweep ABSOLUTE_CEILING_MS (30 min). The thrown-
+      // error branch in runPollLoop has its own chat write (search for
+      // `Error: ${errMsg}` in this file) — this case is its yielded-event
+      // sibling.
+      if (event.retryable === false) {
+        writeMessageOut({
+          id: generateId(),
+          kind: 'chat',
+          platform_id: routing.platformId,
+          channel_type: routing.channelType,
+          thread_id: routing.threadId,
+          content: JSON.stringify({
+            text: `⚠️ Turn ended with an error: ${event.message}. I'll pick up from your next message.`,
+          }),
+        });
+      }
       break;
     case 'progress':
       log(`Progress: ${event.message}`);

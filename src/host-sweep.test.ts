@@ -19,6 +19,7 @@ import {
   CLAIM_STUCK_MS,
   SESSION_ARTIFACT_IDLE_MS,
   SPAWN_GRACE_MS,
+  _notifyKillCeilingForTesting,
   _resetStuckProcessingRowsForTesting,
   _sweepTaskWatchdogForTesting,
   autoArchiveOldCompleted,
@@ -1136,5 +1137,124 @@ describe('pruneIdleSessionArtifacts', () => {
 
   it('no-ops on a non-existent sessions root', () => {
     expect(() => pruneIdleSessionArtifacts(Date.now(), path.join(tmpRoot, 'does-not-exist'))).not.toThrow();
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// kill-ceiling notify (Layer-3 fix)
+//
+// Background: host-sweep used to silently reap a stale-heartbeat container
+// after ABSOLUTE_CEILING_MS (30 min). Users waiting on a wedged agent saw
+// nothing for the entire window, then the container came back as if
+// nothing happened. `notifyKillCeiling` writes a chat outbound on the
+// session's primary route before kill, so the user gets a "resend please"
+// signal within a sweep tick of the heartbeat going stale.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function makeNotifyTestDbs(opts?: {
+  withRouting?: boolean;
+  recentNotice?: boolean;
+}): { inDb: Database.Database; outDb: Database.Database } {
+  const inDb = new Database(':memory:');
+  inDb.exec(`
+    CREATE TABLE session_routing (
+      id            INTEGER PRIMARY KEY CHECK (id = 1),
+      channel_type  TEXT,
+      platform_id   TEXT,
+      thread_id     TEXT,
+      spawn_task_id TEXT,
+      session_id    TEXT
+    );
+    CREATE TABLE messages_in (
+      id            TEXT PRIMARY KEY,
+      seq           INTEGER UNIQUE,
+      kind          TEXT NOT NULL,
+      timestamp     TEXT NOT NULL,
+      status        TEXT DEFAULT 'pending',
+      process_after TEXT,
+      recurrence    TEXT,
+      series_id     TEXT,
+      tries         INTEGER DEFAULT 0,
+      trigger       INTEGER NOT NULL DEFAULT 1,
+      platform_id   TEXT,
+      channel_type  TEXT,
+      thread_id     TEXT,
+      content       TEXT NOT NULL
+    );
+  `);
+  if (opts?.withRouting !== false) {
+    inDb
+      .prepare(
+        `INSERT INTO session_routing (id, channel_type, platform_id, thread_id)
+         VALUES (1, 'slack', 'C-TEST', 'T-TEST')`,
+      )
+      .run();
+  }
+  const outDb = new Database(':memory:');
+  outDb.exec(`
+    CREATE TABLE messages_out (
+      id           TEXT PRIMARY KEY,
+      seq          INTEGER UNIQUE,
+      in_reply_to  TEXT,
+      timestamp    TEXT NOT NULL,
+      kind         TEXT NOT NULL,
+      platform_id  TEXT,
+      channel_type TEXT,
+      thread_id    TEXT,
+      content      TEXT NOT NULL
+    );
+  `);
+  if (opts?.recentNotice) {
+    outDb
+      .prepare(
+        `INSERT INTO messages_out (id, seq, timestamp, kind, content)
+         VALUES ('prior', 1, datetime('now'), 'chat', '{"_system":{"kind":"agent_restart_inactivity"}}')`,
+      )
+      .run();
+  }
+  return { inDb, outDb };
+}
+
+describe('notifyKillCeiling (Layer-3 fix)', () => {
+  it('writes a visible chat outbound with the session route before killContainer', () => {
+    const { inDb, outDb } = makeNotifyTestDbs();
+    const heartbeatAgeMs = 32 * 60_000;
+
+    _notifyKillCeilingForTesting(inDb, outDb, fakeSession(), heartbeatAgeMs);
+
+    const rows = outDb
+      .prepare('SELECT kind, platform_id, channel_type, thread_id, content FROM messages_out')
+      .all() as Array<{
+      kind: string;
+      platform_id: string | null;
+      channel_type: string | null;
+      thread_id: string | null;
+      content: string;
+    }>;
+    expect(rows).toHaveLength(1);
+    expect(rows[0].kind).toBe('chat');
+    expect(rows[0].channel_type).toBe('slack');
+    expect(rows[0].platform_id).toBe('C-TEST');
+    expect(rows[0].thread_id).toBe('T-TEST');
+    const body = JSON.parse(rows[0].content) as { text: string; _system?: { kind: string } };
+    expect(body.text).toContain('32 minutes');
+    expect(body.text).toContain('resend');
+    expect(body._system?.kind).toBe('agent_restart_inactivity');
+  });
+
+  it('skips when the session has never been routed (fresh session_routing row missing)', () => {
+    const { inDb, outDb } = makeNotifyTestDbs({ withRouting: false });
+    _notifyKillCeilingForTesting(inDb, outDb, fakeSession(), 32 * 60_000);
+    expect(outDb.prepare('SELECT COUNT(*) AS c FROM messages_out').get()).toEqual({ c: 0 });
+  });
+
+  it('is idempotent within 60s — a re-firing sweep tick does not duplicate the notice', () => {
+    const { inDb, outDb } = makeNotifyTestDbs({ recentNotice: true });
+    _notifyKillCeilingForTesting(inDb, outDb, fakeSession(), 32 * 60_000);
+    // Only the seed row should be present; the second call recognized the
+    // marker and skipped.
+    const rows = outDb.prepare('SELECT id FROM messages_out').all() as Array<{ id: string }>;
+    expect(rows).toHaveLength(1);
+    expect(rows[0].id).toBe('prior');
   });
 });

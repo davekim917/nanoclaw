@@ -217,6 +217,28 @@ export function markMessageFailed(db: Database.Database, messageId: string): voi
   db.prepare("UPDATE messages_in SET status = 'failed' WHERE id = ?").run(messageId);
 }
 
+export interface SessionRouting {
+  channel_type: string | null;
+  platform_id: string | null;
+  thread_id: string | null;
+}
+
+/**
+ * Read the session's default reply routing. Used by host-side code that
+ * needs to surface a message to the user without going through the agent —
+ * e.g. host-sweep's kill-ceiling notice when a container is reaped for
+ * inactivity. Returns null on fresh sessions that haven't had a wake yet
+ * (no row in session_routing).
+ */
+export function readSessionRouting(db: Database.Database): SessionRouting | null {
+  const row = db
+    .prepare('SELECT channel_type, platform_id, thread_id FROM session_routing WHERE id = 1')
+    .get() as SessionRouting | undefined;
+  if (!row) return null;
+  if (!row.channel_type || !row.platform_id) return null;
+  return row;
+}
+
 export function retryWithBackoff(db: Database.Database, messageId: string, backoffSec: number): void {
   db.prepare(
     `UPDATE messages_in SET tries = tries + 1, process_after = datetime('now', '+${backoffSec} seconds') WHERE id = ?`,
