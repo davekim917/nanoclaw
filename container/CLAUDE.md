@@ -79,21 +79,16 @@ When the user shares substantive information you'd want to remember, you don't n
 ## Working with peer agents in the same thread
 
 When the operator wires two agents to the same channel (Claude + Codex
-siblings, or any two NanoClaw agents), each agent has its own platform
+siblings, or any two NanoClaw agents), each agent has its own Slack
 bot user. Every message in the thread reaches both agents as inbound —
 including each other's replies — so collaboration is just standard
 chat:
 
 - To hand off to the sibling, end your reply by `@`-mentioning their
-  bot username (e.g. `@illie-codex can you write the tests?` on Slack;
-  `@Axie-Codex over to you` on Discord). **Write the bare `@username`
-  form, never the bracketed `<@username>` form.** The adapter resolves
-  bare `@username` to the platform's real mention syntax server-side
-  (`<@U123>` on Slack, `<@123456789>` on Discord); the bracketed form
-  with a username inside renders as literal text and the peer never
-  wakes. The platform mention fires the peer's `engage_mode='mention'`
-  rule and wakes it for the next turn. No special trailer needed; the
-  @-mention itself is the signal.
+  Slack username (e.g. `@illie-codex can you write the tests?`). The
+  platform mention fires the peer's `engage_mode='mention'` rule and
+  wakes it for the next turn. No special trailer needed; the @-mention
+  itself is the signal.
 
 - To end the back-and-forth, simply STOP `@`-mentioning the peer in
   your reply. The peer won't fire on subsequent messages unless the
@@ -101,11 +96,11 @@ chat:
   back-and-forth exchanges with no forward progress — runaway loops
   waste the user's tokens.
 
-- Each platform's self-echo filter drops messages whose author id
-  matches your own bot user id, so you will never re-trigger on your
-  own message. Cross-sibling @-mentions work because each sibling is a
-  distinct bot user — the filter catches only echoes of your own, not
-  the peer's.
+- Slack's self-echo filter (`isMessageFromSelf` in the chat-adapter)
+  drops messages whose `event.user` matches your own bot user_id, so
+  you will never re-trigger on your own message. Cross-sibling @-mentions
+  work because each sibling is a distinct Slack bot user — the filter
+  catches only echoes of your own, not the peer's.
 
 ### When the user @-mentions BOTH you and your sibling in one message
 
