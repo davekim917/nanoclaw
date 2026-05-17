@@ -247,3 +247,69 @@ describe('codex gen() self-heals on hard turn errors (Layer-2 fix)', () => {
     expect(codeOnly).not.toMatch(/yield\*\s+runOneTurn\(/);
   });
 });
+
+describe('codex turn timer is idle-based, not wall-clock', () => {
+  // Background: the old TURN_TIMEOUT_MS was a wall-clock setTimeout from
+  // turn start. xhigh-reasoning turns that legitimately ran 5+ min while
+  // emitting reasoning deltas every 1–10s got killed at the wall-clock
+  // boundary — same exit point as a real wedge, with the same Slack
+  // "Turn ended with an error" surface. The fix replaces the wall-clock
+  // with an idle watchdog reset on every notification: real wedges (zero
+  // events) are caught in ~120s; legitimate long reasoning chains are not
+  // cut off so long as the app-server keeps emitting notifications.
+  //
+  // Source-anchored guards, matching the F4 + Layer-2 patterns.
+
+  it('declares an idle threshold, not a wall-clock total-turn threshold', () => {
+    const src = fs.readFileSync(new URL('./codex.ts', import.meta.url), 'utf8');
+    // Strip block + line comments so explanatory prose about the prior
+    // pattern can mention `TURN_TIMEOUT_MS` without satisfying the check.
+    const codeOnly = src
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .split('\n')
+      .map((l) => {
+        const i = l.indexOf('//');
+        return i >= 0 ? l.slice(0, i) : l;
+      })
+      .join('\n');
+    // Old constant must be gone from non-comment source.
+    expect(codeOnly).not.toMatch(/\bTURN_TIMEOUT_MS\b/);
+    // New idle constant must be present.
+    expect(codeOnly).toMatch(/\bTURN_IDLE_TIMEOUT_MS\b/);
+    // The constant is a millisecond value within a reasonable range
+    // (60-300s). Too short trips false-positives on slow reasoning;
+    // too long delays wedge detection.
+    const decl = codeOnly.match(/const\s+TURN_IDLE_TIMEOUT_MS\s*=\s*([\d_*\s]+);/);
+    expect(decl).not.toBeNull();
+    const ms = Function(`'use strict'; return (${decl![1]});`)() as number;
+    expect(ms).toBeGreaterThanOrEqual(60_000);
+    expect(ms).toBeLessThanOrEqual(300_000);
+  });
+
+  it('handler resets the idle timer on every notification', () => {
+    const src = fs.readFileSync(new URL('./codex.ts', import.meta.url), 'utf8');
+    // The handler body (in runOneTurn) must call resetIdleTimer near the
+    // top — before the per-method switch — so EVERY notification refreshes
+    // the watchdog, including ones we don't translate to a ProviderEvent.
+    const handlerStart = src.indexOf('const handler = (n: JsonRpcNotification)');
+    expect(handlerStart).toBeGreaterThan(-1);
+    const switchStart = src.indexOf('switch (method)', handlerStart);
+    expect(switchStart).toBeGreaterThan(-1);
+    const handlerPreamble = src.slice(handlerStart, switchStart);
+    expect(handlerPreamble).toContain('resetIdleTimer()');
+  });
+
+  it('idle timer is armed before the first turn dispatch and cleared in finally', () => {
+    const src = fs.readFileSync(new URL('./codex.ts', import.meta.url), 'utf8');
+    // Initial arm is needed because startCodexTurn could hang at the
+    // JSON-RPC layer before any notification arrives. Without an initial
+    // arm, the timer would only start after the first notification — and
+    // a wedged turn/start would never trigger a wedge-error event.
+    const startCodexTurnIdx = src.indexOf('await startCodexTurn(server,');
+    expect(startCodexTurnIdx).toBeGreaterThan(-1);
+    const preStart = src.slice(0, startCodexTurnIdx);
+    expect(preStart).toMatch(/resetIdleTimer\(\);\s*$|resetIdleTimer\(\);\s*\n[^\n]*try/m);
+    // Cleanup: finally clears the idle timer.
+    expect(src).toMatch(/finally\s*\{[\s\S]*clearTimeout\(idleTimer\)/);
+  });
+});

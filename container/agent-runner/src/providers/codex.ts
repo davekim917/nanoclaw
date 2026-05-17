@@ -38,8 +38,31 @@ import {
   writeCodexMcpConfigToml,
 } from './codex-app-server.js';
 
-/** Hard ceiling for a single turn. Guards against app-server wedging. */
-const TURN_TIMEOUT_MS = 5 * 60 * 1000;
+/**
+ * Idle watchdog for a single turn. Guards against codex-app-server wedging.
+ *
+ * Previously this was a wall-clock timer from turn start (`TURN_TIMEOUT_MS
+ * = 300_000`). That cut off every legitimate long turn — `xhigh` reasoning
+ * with multi-step tool work routinely runs past 5 min while emitting
+ * reasoning deltas every 1–10s. Wall-clock can't tell "thinking hard" from
+ * "wedged"; idle-from-last-notification can.
+ *
+ * The handler at runOneTurn resets the timer on every JSON-RPC
+ * notification (including `thread/status/changed` and `item/reasoning/*`
+ * deltas, which fire continuously during real work). 120s of total silence
+ * with no events arriving = the app-server is wedged at the JSON-RPC
+ * layer. Caught faster than the old 5-min wall-clock for real wedges; the
+ * old false-positives on long reasoning chains go away.
+ *
+ * Long-tool caveat: a Bash call that takes >120s with no codex
+ * notifications during execution can trip the watchdog. The host-side
+ * sweep already extends its ceiling for declared Bash timeouts
+ * (host-sweep.ts:163); the codex layer doesn't have that telemetry yet,
+ * so a long Bash will surface as a turn-idle error and the user gets the
+ * visible L1 chat. Acceptable for now — most Bash calls are well under
+ * 120s, and the failure mode is recoverable (fresh app-server, retry).
+ */
+const TURN_IDLE_TIMEOUT_MS = 120 * 1000;
 
 /**
  * Lookup tables for translating Codex's `collabAgentToolCall` tool names
@@ -492,9 +515,26 @@ async function* runOneTurn(
     buffer.push({ type: 'file', path: filePath });
   };
 
+  // Idle watchdog: armed below, reset on every notification. See
+  // TURN_IDLE_TIMEOUT_MS comment block for design notes.
+  let idleTimer: ReturnType<typeof setTimeout> | null = null;
+  const resetIdleTimer = (): void => {
+    if (idleTimer !== null) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      turnState.error = new Error(`Codex turn idle for ${TURN_IDLE_TIMEOUT_MS}ms (no notifications)`);
+      turnDone = true;
+      kick();
+    }, TURN_IDLE_TIMEOUT_MS);
+  };
+
   const handler = (n: JsonRpcNotification): void => {
     const method = n.method;
     const params = n.params;
+
+    // Reset the idle watchdog on every notification — even ones we don't
+    // translate to a ProviderEvent. The app-server emitting ANYTHING
+    // means it's alive; only total silence is a wedge signal.
+    resetIdleTimer();
 
     // Every inbound notification counts as activity for the poll-loop's
     // idle timer — yield before any event-specific translation so even
@@ -640,11 +680,11 @@ async function* runOneTurn(
 
   server.notificationHandlers.push(handler);
 
-  const timer = setTimeout(() => {
-    turnState.error = new Error(`Turn timed out after ${TURN_TIMEOUT_MS}ms`);
-    turnDone = true;
-    kick();
-  }, TURN_TIMEOUT_MS);
+  // Arm the idle watchdog before turn/start dispatches — there's a small
+  // window where startCodexTurn could hang at the JSON-RPC layer with no
+  // notifications ever arriving. The timer will be reset by the first
+  // real notification (typically thread/started or turn/started).
+  resetIdleTimer();
 
   try {
     // If we yield init before turn/start, the poll-loop stores
@@ -677,7 +717,7 @@ async function* runOneTurn(
 
     yield { type: 'result', text: resultText || null };
   } finally {
-    clearTimeout(timer);
+    if (idleTimer !== null) clearTimeout(idleTimer);
     const idx = server.notificationHandlers.indexOf(handler);
     if (idx >= 0) server.notificationHandlers.splice(idx, 1);
   }
