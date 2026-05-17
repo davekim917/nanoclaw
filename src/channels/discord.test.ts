@@ -111,24 +111,18 @@ describe('resolveIncomingDiscordMentions', () => {
     // Without a bot registry the resolver has nothing to look up. Don't
     // mangle the message — the agent will see raw IDs which is no worse
     // than today.
-    expect(resolveIncomingDiscordMentions('<@1478986205319135302> hi', new Map())).toBe(
-      '<@1478986205319135302> hi',
-    );
+    expect(resolveIncomingDiscordMentions('<@1478986205319135302> hi', new Map())).toBe('<@1478986205319135302> hi');
   });
 
   it('rewrites a known bot snowflake to `@username`', () => {
-    expect(resolveIncomingDiscordMentions('<@1478986205319135302> take this', bots)).toBe(
-      '@Axie take this',
-    );
+    expect(resolveIncomingDiscordMentions('<@1478986205319135302> take this', bots)).toBe('@Axie take this');
   });
 
   it('rewrites the nickname-mention form `<@!id>`', () => {
     // Some Discord clients still emit the legacy nickname-mention form when
     // the mentioned user has a server-specific nickname. Same target user,
     // same resolution.
-    expect(resolveIncomingDiscordMentions('<@!1478986205319135302> take this', bots)).toBe(
-      '@Axie take this',
-    );
+    expect(resolveIncomingDiscordMentions('<@!1478986205319135302> take this', bots)).toBe('@Axie take this');
   });
 
   it('rewrites multiple bot mentions in one message', () => {
@@ -137,11 +131,8 @@ describe('resolveIncomingDiscordMentions', () => {
     // which Discord delivered as raw snowflakes. Without this resolver
     // Axie had no way to know its peer was called "Axie-Codex" and
     // resorted to `<@sibling>`.
-    const raw =
-      '<@1505246118940770375> <@1478986205319135302> take turns roasting me. <@1478986205319135302> go first';
-    expect(resolveIncomingDiscordMentions(raw, bots)).toBe(
-      '@Axie-Codex @Axie take turns roasting me. @Axie go first',
-    );
+    const raw = '<@1505246118940770375> <@1478986205319135302> take turns roasting me. <@1478986205319135302> go first';
+    expect(resolveIncomingDiscordMentions(raw, bots)).toBe('@Axie-Codex @Axie take turns roasting me. @Axie go first');
   });
 
   it('leaves unknown snowflakes unchanged', () => {
