@@ -252,9 +252,7 @@ describe('createChatSdkBridge — fetchThreadHistory anchor', () => {
     // transform there, the very first wake on a thread can still surface
     // raw `<@id>` to the agent.
     const bridge = createChatSdkBridge({
-      adapter: adapterWithFetchMessages([
-        { id: 'in-1', text: 'on it', sender: 'Axie', iso: '2026-05-03T13:00:00Z' },
-      ]),
+      adapter: adapterWithFetchMessages([{ id: 'in-1', text: 'on it', sender: 'Axie', iso: '2026-05-03T13:00:00Z' }]),
       supportsThreads: true,
       fetchThreadAnchor: async () => [
         {

@@ -920,9 +920,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
               const a = anchors[i];
               if (!a.text || a.text.length === 0) continue;
               const normalized = { ...a, text: applyInboundTransform(a.text) };
-              const alreadyPresent = inThread.some(
-                (m) => m.sender === normalized.sender && m.text === normalized.text,
-              );
+              const alreadyPresent = inThread.some((m) => m.sender === normalized.sender && m.text === normalized.text);
               if (!alreadyPresent) inThread.unshift(normalized);
             }
           }

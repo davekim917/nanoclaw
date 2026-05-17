@@ -170,9 +170,9 @@ describe('resolveIncomingDiscordMentions', () => {
     expect(resolveIncomingDiscordMentions('Inline: `payload: <@1478986205319135302>`', bots)).toBe(
       'Inline: `payload: <@1478986205319135302>`',
     );
-    expect(
-      resolveIncomingDiscordMentions('```\nlog: <@1478986205319135302> arrived\n```', bots),
-    ).toBe('```\nlog: <@1478986205319135302> arrived\n```');
+    expect(resolveIncomingDiscordMentions('```\nlog: <@1478986205319135302> arrived\n```', bots)).toBe(
+      '```\nlog: <@1478986205319135302> arrived\n```',
+    );
   });
 
   it('rewrites prose mentions but leaves code-region copies alone in the same message', () => {
