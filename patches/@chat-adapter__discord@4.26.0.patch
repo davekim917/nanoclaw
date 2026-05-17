@@ -1,8 +1,35 @@
 diff --git a/dist/index.js b/dist/index.js
-index 8b490cf67e4d4dcec82404a27ef364f440c617b6..9e00c9370c1946d3e0081764851a5a6077281eba 100644
+index 8b490cf67e4d4dcec82404a27ef364f440c617b6..1a8e6e5aed119601f4a48a1523b6e502452a0cf7 100644
 --- a/dist/index.js
 +++ b/dist/index.js
-@@ -1658,14 +1658,23 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -247,7 +247,13 @@ var DiscordFormatConverter = class extends BaseFormatConverter {
+    * @name → <@name>
+    */
+   convertMentionsToDiscord(text) {
+-    return text.replace(/@(\w+)/g, "<@$1>");
++    // Negative lookbehind for `<` so already-resolved `<@SNOWFLAKE>` mentions
++    // — which NanoClaw's outbound `resolveDiscordMentions` produces — do not
++    // get double-wrapped to `<<@SNOWFLAKE>>`. Without this, Discord renders
++    // the inner as a chip surrounded by literal `<` `>` characters, which
++    // looks visually like a mention but breaks the wire-level mention
++    // contract (no entry in `message.mentions[]`, no notification fired).
++    return text.replace(/(?<!<)@(\w+)/g, "<@$1>");
+   }
+   /**
+    * Override renderPostable to convert @mentions in plain strings.
+@@ -293,7 +299,10 @@ var DiscordFormatConverter = class extends BaseFormatConverter {
+       return getNodeChildren(node).map((child) => this.nodeToDiscordMarkdown(child)).join("");
+     }
+     if (isTextNode(node)) {
+-      return node.value.replace(/@(\w+)/g, "<@$1>");
++      // See convertMentionsToDiscord: same `<` lookbehind to avoid double-wrap
++      // when the inbound markdown already contains `<@SNOWFLAKE>` mentions
++      // produced by NanoClaw's outbound resolveDiscordMentions.
++      return node.value.replace(/(?<!<)@(\w+)/g, "<@$1>");
+     }
+     if (isStrongNode(node)) {
+       const content = getNodeChildren(node).map((child) => this.nodeToDiscordMarkdown(child)).join("");
+@@ -1658,14 +1667,23 @@ var DiscordAdapter = class _DiscordAdapter {
          this.logger.debug("Ignoring message - Gateway is shutting down");
          return;
        }
@@ -30,7 +57,7 @@ index 8b490cf67e4d4dcec82404a27ef364f440c617b6..9e00c9370c1946d3e0081764851a5a60
        const isUserMentioned = message.mentions.has(client.user?.id ?? "");
        const isRoleMentioned = this.mentionRoleIds.length > 0 && message.mentions.roles.some(
          (role) => this.mentionRoleIds.includes(role.id)
-@@ -1687,13 +1696,17 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -1687,13 +1705,17 @@ var DiscordAdapter = class _DiscordAdapter {
          this.logger.debug("Ignoring reaction - Gateway is shutting down");
          return;
        }
@@ -53,7 +80,7 @@ index 8b490cf67e4d4dcec82404a27ef364f440c617b6..9e00c9370c1946d3e0081764851a5a60
        this.logger.info("Discord Gateway reaction added", {
          emoji: reaction.emoji.name,
          messageId: reaction.message.id,
-@@ -1715,13 +1728,17 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -1715,13 +1737,17 @@ var DiscordAdapter = class _DiscordAdapter {
          );
          return;
        }

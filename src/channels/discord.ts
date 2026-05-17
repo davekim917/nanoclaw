@@ -305,6 +305,15 @@ export function resolveDiscordMentions(text: string, bots: Map<string, DiscordBo
   // boundary check makes intent explicit and avoids surprise if a bot's
   // username ever collides with the right-hand side of an email or path.
   //
+  // Username body: word chars and dashes, with OPTIONAL `.suffix` segments
+  // so `user.name` still resolves but a trailing sentence-ending period
+  // ("Your turn, @Axie-Codex.") doesn't gobble into the capture and miss
+  // the lookup. A naïve `[\w.-]+` swallows the trailing period, which then
+  // misses `byName.get("axie-codex.")` and falls through to the
+  // chat-sdk-adapter's own `/@(\w+)/g` pass — which captures only `@Axie`
+  // (no dash support) and brackets it to `<@Axie>`, leaving `-Codex.` as
+  // dangling text. That double-failure was the live Discord bug.
+  //
   // Two passes by design, agent-mistake-tolerant:
   //   1. `<@Name>` — the bracketed form agents sometimes emit when they
   //      remember the Slack `<@U123>` template but substitute the username
@@ -316,8 +325,9 @@ export function resolveDiscordMentions(text: string, bots: Map<string, DiscordBo
   // unaffected: byName keys are usernames, so digits-only or `&`-prefixed
   // captures don't match the lookup. The bare-form pass skips text
   // preceded by `<` so it never re-touches what pass 1 just emitted.
-  const BRACKETED_MENTION_RE = /(?<!\w)<@([\w.-]+)>/g;
-  const BARE_MENTION_RE = /(?<!\w)@([\w.-]+)/g;
+  const USERNAME = String.raw`[\w-]+(?:\.[\w-]+)*`;
+  const BRACKETED_MENTION_RE = new RegExp(String.raw`(?<!\w)<@(${USERNAME})>`, 'g');
+  const BARE_MENTION_RE = new RegExp(String.raw`(?<!\w)@(${USERNAME})`, 'g');
 
   return transformOutsideProtectedRegions(text, (segment) => {
     const rewriteByName = (match: string, name: string): string => {
