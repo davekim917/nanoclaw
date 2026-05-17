@@ -1151,10 +1151,10 @@ describe('pruneIdleSessionArtifacts', () => {
 // signal within a sweep tick of the heartbeat going stale.
 // ─────────────────────────────────────────────────────────────────────────────
 
-function makeNotifyTestDbs(opts?: {
-  withRouting?: boolean;
-  recentNotice?: boolean;
-}): { inDb: Database.Database; outDb: Database.Database } {
+function makeNotifyTestDbs(opts?: { withRouting?: boolean; recentNotice?: boolean }): {
+  inDb: Database.Database;
+  outDb: Database.Database;
+} {
   const inDb = new Database(':memory:');
   inDb.exec(`
     CREATE TABLE session_routing (
@@ -1238,7 +1238,8 @@ describe('notifyKillCeiling (Layer-3 fix)', () => {
     expect(rows[0].thread_id).toBe('T-TEST');
     const body = JSON.parse(rows[0].content) as { text: string; _system?: { kind: string } };
     expect(body.text).toContain('32 minutes');
-    expect(body.text).toContain('resend');
+    expect(body.text).toContain('picked up automatically');
+    expect(body.text).toContain('no need to resend');
     expect(body._system?.kind).toBe('agent_restart_inactivity');
   });
 

@@ -231,9 +231,9 @@ export interface SessionRouting {
  * (no row in session_routing).
  */
 export function readSessionRouting(db: Database.Database): SessionRouting | null {
-  const row = db
-    .prepare('SELECT channel_type, platform_id, thread_id FROM session_routing WHERE id = 1')
-    .get() as SessionRouting | undefined;
+  const row = db.prepare('SELECT channel_type, platform_id, thread_id FROM session_routing WHERE id = 1').get() as
+    | SessionRouting
+    | undefined;
   if (!row) return null;
   if (!row.channel_type || !row.platform_id) return null;
   return row;

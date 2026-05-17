@@ -713,14 +713,13 @@ function enforceRunningContainerSla(
       heartbeatAgeMs: decision.heartbeatAgeMs,
       ceilingMs: decision.ceilingMs,
     });
-    // Tell the user before we silently reap the container. Without this,
-    // a user waiting on a stuck agent sees zero signal for up to 30 min
-    // and the container then comes back as if nothing happened. Write to
-    // outbound.db directly so it goes through the normal delivery path
-    // without needing the (about-to-be-killed) container to do anything.
-    // Best-effort: failures are logged but don't block the kill.
-    notifyKillCeiling(inDb, outDb, session, decision.heartbeatAgeMs);
     killContainer(session.id, 'absolute-ceiling');
+    // Tell the user we just reaped their container. Posted AFTER kill so
+    // we honor the outbound.db single-writer invariant
+    // (session-db.ts:openOutboundDbWritable) — host writes only after the
+    // container is gone, never alongside a live one. Same ordering as
+    // resetStuckProcessingRows below. Best-effort: failures log and move on.
+    notifyKillCeiling(inDb, outDb, session, decision.heartbeatAgeMs);
     resetStuckProcessingRows(inDb, outDb, session, 'absolute-ceiling');
     return;
   }
@@ -794,11 +793,16 @@ export function notifyKillCeiling(
     }
     const minutes = Math.round(heartbeatAgeMs / 60_000);
     const id = `sys-kill-ceiling-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    // Don't ask the user to resend: the kill-ceiling branch runs
+    // resetStuckProcessingRows immediately after, which calls
+    // retryWithBackoff on every claimed pending message. Unclaimed pending
+    // rows just sit until the next wake. Either way the system recovers
+    // the user's existing input — a resend would just create duplicates.
     const content = JSON.stringify({
       text:
         `⚠️ I went silent for ${minutes} minutes and the host is restarting me. ` +
-        `If you were waiting on a response, please resend your last message — ` +
-        `I'll pick up from there.`,
+        `Your last messages will be picked up automatically on the next wake — ` +
+        `no need to resend.`,
       // Machine-readable marker so the idempotency check above (and any
       // future consumer that wants to react) doesn't need to grep prose.
       _system: { kind: 'agent_restart_inactivity', heartbeat_age_ms: heartbeatAgeMs },
