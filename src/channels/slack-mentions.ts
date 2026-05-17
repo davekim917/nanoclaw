@@ -83,11 +83,17 @@ export function resolveSlackMentions(
   // Composed as a base + optional `.SUFFIX` segments so a trailing
   // sentence-ending period ("Your turn, @illie-codex.") doesn't get
   // gobbled into the capture — matches Discord's pattern in discord.ts:328.
-  // The `(?<!\w)` lookbehind keeps `user@domain.com` from parsing as
-  // `@domain.com`.
+  //
+  // Boundary: `(?<![\w/:])` keeps `user@domain.com` from parsing as
+  // `@domain.com` AND skips `@`-after-URL-path/scheme cases like
+  // `https://example.com/@illie-codex` or `path/@illie-codex/sub`. Without
+  // the `/` and `:` in the exclude class, the bare-mention pass corrupts
+  // URLs (path char `/` is not `\w`, so `(?<!\w)` alone would let it
+  // through). `transformOutsideProtectedRegions` only shields code spans,
+  // not URL regions — so URL safety has to live in the lookbehind itself.
   const USERNAME = String.raw`[\w-]+(?:\.[\w-]+)*`;
-  const BRACKETED_RE = new RegExp(String.raw`(?<!\w)<@(${USERNAME})>`, 'g');
-  const BARE_RE = new RegExp(String.raw`(?<!\w)@(${USERNAME})`, 'g');
+  const BRACKETED_RE = new RegExp(String.raw`(?<![\w/:])<@(${USERNAME})>`, 'g');
+  const BARE_RE = new RegExp(String.raw`(?<![\w/:])@(${USERNAME})`, 'g');
 
   return transformOutsideProtectedRegions(text, (segment) => {
     const rewriteByName = (match: string, name: string): string => {

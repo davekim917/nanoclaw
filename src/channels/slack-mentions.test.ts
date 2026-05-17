@@ -90,6 +90,36 @@ describe('resolveSlackMentions', () => {
   it('leaves unknown @-names alone (fail-soft)', () => {
     expect(resolveSlackMentions('@randomuser hi', 'slack-illysium', makeBots())).toBe('@randomuser hi');
   });
+
+  // URL safety — `transformOutsideProtectedRegions` only shields code
+  // spans, so URL guards live in the lookbehind itself. Without `/` and
+  // `:` in the exclude class, an `@-after-path-slash` would get rewritten
+  // and corrupt the URL.
+  describe('URL safety', () => {
+    it('does not rewrite inside a https URL path', () => {
+      expect(
+        resolveSlackMentions('Check https://example.com/@illie-codex for the diff', 'slack-illysium', makeBots()),
+      ).toBe('Check https://example.com/@illie-codex for the diff');
+    });
+
+    it('does not rewrite inside a generic path (slash before @)', () => {
+      expect(resolveSlackMentions('see notes/users/@illie-codex.md', 'slack-illysium', makeBots())).toBe(
+        'see notes/users/@illie-codex.md',
+      );
+    });
+
+    it('does not rewrite after `:` (user:pass@host URL form)', () => {
+      expect(resolveSlackMentions('jdbc:postgres://user:@illie-codex.example.com', 'slack-illysium', makeBots())).toBe(
+        'jdbc:postgres://user:@illie-codex.example.com',
+      );
+    });
+
+    it('still rewrites a real mention right after a URL on the same line', () => {
+      expect(resolveSlackMentions('https://example.com — over to @illie-codex', 'slack-illysium', makeBots())).toBe(
+        'https://example.com — over to <@U-CODEX>',
+      );
+    });
+  });
 });
 
 describe('fetchSlackBotIdentity', () => {

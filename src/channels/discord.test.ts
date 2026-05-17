@@ -125,6 +125,22 @@ describe('resolveDiscordMentions', () => {
     expect(resolveDiscordMentions('contact user@domain.com today', bots2)).toBe('contact user@domain.com today');
     expect(resolveDiscordMentions('@domain.com hi', bots2)).toBe('<@9> hi');
   });
+
+  it('does not corrupt URLs containing a sibling bot name in the path', () => {
+    // Lookbehind tightening: `(?<![\w/:])`. The bare-mention pass used to
+    // see `@Axie-Codex` after a path `/` and rewrite the URL into
+    // `https://example.com/<@SNOWFLAKE>`, breaking link rendering. The
+    // tightened lookbehind keeps URL paths intact.
+    const bots = new Map<string, DiscordBotIdentity>([['discord', { userId: '2222222222', username: 'Axie-Codex' }]]);
+    expect(resolveDiscordMentions('https://example.com/@Axie-Codex/diff', bots)).toBe(
+      'https://example.com/@Axie-Codex/diff',
+    );
+    expect(resolveDiscordMentions('see notes/users/@Axie-Codex.md', bots)).toBe('see notes/users/@Axie-Codex.md');
+    // Real mention right after a URL still works.
+    expect(resolveDiscordMentions('https://example.com — over to @Axie-Codex', bots)).toBe(
+      'https://example.com — over to <@2222222222>',
+    );
+  });
 });
 
 describe('end-to-end: resolveDiscordMentions → installed chat-sdk adapter render', () => {

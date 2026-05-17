@@ -325,9 +325,13 @@ export function resolveDiscordMentions(text: string, bots: Map<string, DiscordBo
   // unaffected: byName keys are usernames, so digits-only or `&`-prefixed
   // captures don't match the lookup. The bare-form pass skips text
   // preceded by `<` so it never re-touches what pass 1 just emitted.
+  // Boundary: `(?<![\w/:])` — the `/` and `:` exclusions keep
+  // `https://example.com/@user` from getting its path corrupted into
+  // `https://example.com/<@SNOWFLAKE>`. transformOutsideProtectedRegions
+  // only shields code spans, not URL regions. Mirrors slack-mentions.ts.
   const USERNAME = String.raw`[\w-]+(?:\.[\w-]+)*`;
-  const BRACKETED_MENTION_RE = new RegExp(String.raw`(?<!\w)<@(${USERNAME})>`, 'g');
-  const BARE_MENTION_RE = new RegExp(String.raw`(?<!\w)@(${USERNAME})`, 'g');
+  const BRACKETED_MENTION_RE = new RegExp(String.raw`(?<![\w/:])<@(${USERNAME})>`, 'g');
+  const BARE_MENTION_RE = new RegExp(String.raw`(?<![\w/:])@(${USERNAME})`, 'g');
 
   return transformOutsideProtectedRegions(text, (segment) => {
     const rewriteByName = (match: string, name: string): string => {
