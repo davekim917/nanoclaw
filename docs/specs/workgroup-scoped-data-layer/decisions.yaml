@@ -1,0 +1,130 @@
+feature: workgroup-scoped-data-layer
+created_by: /team-brief
+last_updated_by: /team-brief
+
+constraints:
+  - id: C1
+    type: HARD
+    text: "Projection-time enforcement — container's /workspace/archive.db must NOT contain rows outside the spawning agent's workgroup. Raw SQLite access is advisory-only; projection filter is the real boundary (src/container-runner.ts:855-863)."
+    source: brief
+    verified: false
+
+  - id: C2
+    type: HARD
+    text: "Sibling agent_groups remain separate rows in agent_groups. Each retains its own platform bot user, CLAUDE.md, routing identity, and mention-engage rules. Workgroup is the layer above, not a collapse."
+    source: brief
+    verified: false
+
+  - id: C3
+    type: HARD
+    text: "No data loss for existing mnemon stores, archive content, or OneCLI secret assignments during migration."
+    source: brief
+    verified: false
+
+  - id: C4
+    type: HARD
+    text: "Existing recall_scope modes ('self', 'all-groups', folder list) continue working unchanged — 'workgroup' is an additive 4th mode."
+    source: brief
+    verified: false
+
+  - id: C5
+    type: HARD
+    text: "Migration is idempotent — re-running on an already-migrated install is a no-op."
+    source: brief
+    verified: false
+
+  - id: C6
+    type: HARD
+    text: "PR #105 compatibility — the case-insensitive MNEMON_STORE_<folder> env override must keep functioning during the transition; this work does not delete it."
+    source: brief
+    verified: false
+
+  - id: C7
+    type: SOFT
+    text: "Backfill heuristic should auto-pair <x> + <x>-codex from naming convention; explicit declaration available as override."
+    source: brief
+    verified: false
+
+  - id: C8
+    type: SOFT
+    text: "Existing duplicate onecliSecrets declarations across sibling container.json files should be possible to consolidate to workgroup level — mechanism is design's call, not required by this brief."
+    source: brief
+    verified: false
+
+decisions:
+  - id: D1
+    stage: brief
+    description: "Workgroup is the unit of isolation for shared data layer, sitting above agent_groups"
+    chosen: "Add workgroup_id as an attribute that groups multiple agent_groups together; workgroup pools chat archive, mnemon, and OneCLI secret declarations"
+    rejected:
+      - option: "Collapse sibling agent_groups into a single row with multi-provider config"
+        reason: "Breaks per-agent bot identity required for native @-mention plumbing on Slack/Discord; documented in clone-as-codex skill rationale"
+      - option: "Owner-gated cross-group access (any group an owner controls can see any other group's data)"
+        reason: "Gives Axie access to MR data because Dave owns both — exact opposite of the tenant boundary Dave wants"
+      - option: "Spawn-task primitive (ask the sibling to read its own data and return)"
+        reason: "Already works as a fallback but is slow (cold-spawn latency), depends on sibling availability, and degrades summary quality. Not the durable answer."
+    constraint_refs: [C1, C2]
+
+  - id: D2
+    stage: brief
+    description: "Membership grows beyond parent+codex twin"
+    chosen: "Workgroup is the tenant unit — future agents like <x>-research, <x>-data-analyst join the same workgroup automatically when declared"
+    rejected:
+      - option: "Hard-code workgroup to exactly two members (parent + codex twin)"
+        reason: "Dave explicitly confirmed wanting to grow membership over time; locking to two would force re-architecture later"
+    constraint_refs: []
+
+  - id: D3
+    stage: brief
+    description: "OneCLI secret inheritance is in scope"
+    chosen: "Workgroup-level onecliSecrets declarations are inherited by all member agent_groups at container spawn"
+    rejected:
+      - option: "Keep secrets strictly per-group, defer workgroup inheritance to a follow-on"
+        reason: "Dave explicitly approved workgroup-level inheritance in this brief; deferring would force a near-term schema re-cut"
+    constraint_refs: []
+
+  - id: D4
+    stage: brief
+    description: "Slack user-token via OneCLI (Q1) is a separate follow-on"
+    chosen: "Q1 ships AFTER workgroup so it can declare its Slack secret at workgroup level, avoiding per-group duplication"
+    rejected:
+      - option: "Bundle Q1 and Q2 into one feature"
+        reason: "Q1 is additive (new credential surface) and Q2 is architectural (boundary change); coupling delays both"
+    constraint_refs: []
+
+assumptions:
+  - id: A1
+    stage: brief
+    text: "Workgroup-scoped is the default for new agent_groups (rather than opt-in via explicit declaration)"
+    validation: "Confirm at brief approval; if false, flip default to opt-in and require explicit recall_scope='workgroup' per group"
+    validated: false
+
+  - id: A2
+    stage: brief
+    text: "Auto-pair codex twins via naming convention (<x>-codex strip → <x>) plus parent-row existence check"
+    validation: "Design phase enumerates all 10 current pairs; if any fail to auto-pair, fall back to explicit container.json declaration"
+    validated: false
+
+  - id: A3
+    stage: brief
+    text: "OneCLI secret merge semantics: workgroup baseline + per-group additive (can add, cannot subtract)"
+    validation: "Design phase confirms with security review — additive-only prevents per-group from accidentally weakening workgroup baseline"
+    validated: false
+
+  - id: A4
+    stage: brief
+    text: "A dedicated workgroups table is needed (carries onecli_secrets, display_name)"
+    validation: "Design phase weighs table vs lookup against folder-config; deciding factor is whether workgroup needs its own metadata beyond membership"
+    validated: false
+
+  - id: A5
+    stage: brief
+    text: "Migration runs once via the existing migration chain (src/db/migrations/) and produces zero diffs on a re-run"
+    validation: "Implementation verifies idempotency in tests; QA verifies on live install"
+    validated: false
+
+review_cycles: []
+
+auto_qa_cycles: []
+
+auto_judgments: []
