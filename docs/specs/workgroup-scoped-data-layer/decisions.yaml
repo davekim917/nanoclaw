@@ -1,6 +1,6 @@
 feature: workgroup-scoped-data-layer
 created_by: /team-brief
-last_updated_by: /team-brief
+last_updated_by: /team-design
 
 constraints:
   - id: C1
@@ -123,7 +123,100 @@ assumptions:
     validation: "Implementation verifies idempotency in tests; QA verifies on live install"
     validated: false
 
-review_cycles: []
+  - id: A6
+    stage: design
+    text: "Suffix-strip + parent-existence pairs all 10 of Dave's current sibling folders without operator action"
+    validation: "Pre-migration enumeration of folder LIKE '%-codex' rows verifies each has matching non-codex folder; backfill reports mismatches"
+    validated: false
+
+  - id: A7
+    stage: design
+    text: "Workgroup-of-1 mnemon recall is functionally equivalent to today's 'self' for standalone groups"
+    validation: "Test: 'workgroup' scope on standalone group returns same single-id set as 'self' mode"
+    validated: false
+
+  - id: A8
+    stage: design
+    text: "applyOnecliSecrets handles a unioned declarations list without requiring host-side dedup"
+    validation: "Test with duplicate names in declarations; verify resolved UUIDs are deduplicated downstream — add Set wrapper at call site if not"
+    validated: false
+
+  - id: A9
+    stage: design
+    text: "Dropping in-container 'agent_group_id = ?' filter from thread tools doesn't break other tool paths"
+    validation: "grep -rn 'agent_group_id' container/agent-runner/src/mcp-tools/ for full enumeration; container tests pass against modified projection"
+    validated: false
+
+  - id: A10
+    stage: design
+    text: "Flipping getRecallScope default to 'workgroup' is safe — standalone groups behave identically; sibling pools intended"
+    validation: "QA verifies first recall post-migration on a known sibling thread returns pooled context; explicit recall_scope: 'self' restores prior behavior"
+    validated: false
+
+  - id: A11
+    stage: design
+    text: "Migration 036 idempotency holds across partial failure (schema applied, backfill crashed)"
+    validation: "Simulate mid-backfill kill, re-run, verify schema_version gate prevents double-apply and final state is consistent"
+    validated: false
+
+  - id: A12
+    stage: design
+    text: "agent_groups.folder column matches groups/ filesystem listing on Dave's install at migration time"
+    validation: "SELECT folder FROM agent_groups vs ls groups/ comparison before migration runs"
+    validated: false
+
+decisions_design:
+  - id: D5
+    stage: design
+    description: "Workgroup schema model — workgroups table + workgroup_id column on agent_groups"
+    chosen: "Option A: ADD workgroup_id TEXT column to agent_groups + CREATE TABLE workgroups (id, display_name, onecli_secrets JSON, created_at, updated_at). container.json.workgroup_id is operator-facing SoT; DB column is derived/cached for hot-path queries."
+    rejected:
+      - option: "Option B: tag-only workgroup (no workgroups table) — workgroup-level secrets duplicated across every member's container.json"
+        reason: "Re-creates the exact drift-trap class of bug PR #105 just fixed for MNEMON_STORE_<folder>. No canonical workgroup row; future workgroup-level fields compound the duplication tax."
+      - option: "Option C: filesystem-driven workgroup.json — new groups/<workgroup>/ topology"
+        reason: "Adds a new filesystem layer not present elsewhere; doesn't compose with channel/provider skill installer pattern; slower at spawn time than a DB JOIN."
+    constraint_refs: [C1, C2, C3]
+
+  - id: D6
+    stage: design
+    description: "Backfill heuristic for auto-pairing existing sibling pairs"
+    chosen: "Suffix-strip <x>-codex + bidirectional parent-existence check against agent_groups.folder. Standalone (no match) → workgroup_id = own folder."
+    rejected:
+      - option: "Prefix-match (find shared folder-name prefix between rows)"
+        reason: "Ambiguous on names like '<x>-bot-codex' — would falsely pair with '<x>' instead of '<x>-bot'."
+      - option: "Explicit-only (require operator to declare workgroup_id in every container.json before migration)"
+        reason: "Violates R6 ('auto-pair without operator action'). Future siblings can still use explicit declaration — this heuristic is a migration-time convenience."
+    constraint_refs: [C7]
+
+  - id: D7
+    stage: design
+    description: "Mnemon recall default scope changes from 'self' to 'workgroup'"
+    chosen: "Flip default at getRecallScope (container-config.ts:74) to 'workgroup'. Safe because workgroup-of-1 (standalone groups) yields the same row set as 'self'; sibling pairs get pooled recall automatically."
+    rejected:
+      - option: "Keep 'self' default; require explicit recall_scope: 'workgroup' per group"
+        reason: "More conservative but defeats R6's auto-pairing benefit on Dave's install (10+ container.json edits required), and a fresh sibling pair created later would still be 'self' by default. Default-on is the right product call given the workgroup formalization."
+    constraint_refs: [C4]
+
+  - id: D8
+    stage: design
+    description: "OneCLI secret merge semantics"
+    chosen: "Workgroup baseline ∪ per-group additive (UNION, additive-only). Computed at spawn-time in container-runner before applyOnecliSecrets."
+    rejected:
+      - option: "Per-group replaces workgroup"
+        reason: "A sibling could silently weaken the shared baseline by re-declaring a narrower list."
+      - option: "Strict workgroup-only (per-group declarations ignored)"
+        reason: "Defeats legitimate per-group tool-specific secrets (e.g., a single sibling needs Datafold while others don't)."
+    constraint_refs: []
+
+  - id: D9
+    stage: design
+    description: "Drop in-container WHERE agent_group_id = ? from thread tools"
+    chosen: "Remove filter from resolve_thread_link, search_threads, read_thread family in thread-search.ts. Projection enforces the workgroup boundary; the in-tool filter would narrow back to self-only and defeat pooling."
+    rejected:
+      - option: "Keep filter but add workgroup-aware variant"
+        reason: "Defeats pooling intent — projection already bounds visibility, in-tool filter only narrows. Two filter mechanisms for the same boundary is needless complexity."
+    constraint_refs: [C1]
+
 
 auto_qa_cycles: []
 
