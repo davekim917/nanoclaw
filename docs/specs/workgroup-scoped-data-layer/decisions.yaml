@@ -1,6 +1,6 @@
 feature: workgroup-scoped-data-layer
 created_by: /team-brief
-last_updated_by: /team-review
+last_updated_by: /team-review (cycle 2)
 
 constraints:
   - id: C1
@@ -224,6 +224,11 @@ review_cycles:
     should_fix_count: 10
     wont_fix_count: 2
     completed_at: 2026-05-18T13:30:00Z
+  - iteration: 2
+    must_fix_count: 7
+    should_fix_count: 9
+    wont_fix_count: 1
+    completed_at: 2026-05-18T14:00:00Z
 
 auto_qa_cycles: []
 
