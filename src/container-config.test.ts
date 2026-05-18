@@ -5,10 +5,12 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import {
   readContainerConfig,
+  writeContainerConfig,
   isFeedbackEnabled,
   getQueryStrategy,
   getRecallScope,
   type MemoryConfig,
+  type RecallScope,
 } from './container-config.js';
 
 let tmpDir: string;
@@ -96,6 +98,45 @@ describe('MemoryConfig resolvers', () => {
   it('test_getRecallScope_array', () => {
     const cfg: MemoryConfig = { enabled: true, recall_scope: ['axie-dev', 'madison-reed'] };
     expect(getRecallScope(cfg)).toEqual(['axie-dev', 'madison-reed']);
+  });
+});
+
+describe('RecallScope type + getRecallScope (B1)', () => {
+  it('test_recall_scope_default_unchanged', () => {
+    // Critical: default MUST stay 'self'
+    expect(getRecallScope(undefined)).toBe('self');
+    const cfg: MemoryConfig = { enabled: true };
+    expect(getRecallScope(cfg)).toBe('self');
+  });
+
+  it('test_recall_scope_accepts_workgroup', () => {
+    // 'workgroup' is now a valid RecallScope value (type narrowing should pass)
+    const scope: RecallScope = 'workgroup';
+    const cfg: MemoryConfig = { enabled: true, recall_scope: scope };
+    expect(getRecallScope(cfg)).toBe('workgroup');
+  });
+
+  it('test_recall_scope_accepts_string_array', () => {
+    const scope: RecallScope = ['axie-dev', 'madison-reed'];
+    const cfg: MemoryConfig = { enabled: true, recall_scope: scope };
+    expect(getRecallScope(cfg)).toEqual(['axie-dev', 'madison-reed']);
+  });
+
+  it('test_workgroup_id_round_trip', () => {
+    // writeContainerConfig + readContainerConfig must preserve workgroup_id
+    const folder = 'test-wg-roundtrip';
+    const dir = path.join(GROUPS_DIR, folder);
+    fs.mkdirSync(dir, { recursive: true });
+    const config = {
+      mcpServers: {},
+      packages: { apt: [], npm: [] },
+      additionalMounts: [],
+      skills: 'all' as const,
+      workgroup_id: 'my-workgroup-123',
+    };
+    writeContainerConfig(folder, config);
+    const result = readContainerConfig(folder);
+    expect(result.workgroup_id).toBe('my-workgroup-123');
   });
 });
 

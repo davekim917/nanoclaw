@@ -6,7 +6,7 @@ import type Database from 'better-sqlite3';
 import type { FactInput, MemoryStore, RecallResult, RecalledFact, RememberResult } from './store.js';
 import { redactSecrets } from './secret-redactor.js';
 import { openMnemonIngestDb, runMnemonIngestMigrations } from '../../db/migrations/019-mnemon-ingest-db.js';
-import type { MemoryConfig } from '../../container-config.js';
+import type { MemoryConfig, RecallScope } from '../../container-config.js';
 import { getRecallScope } from '../../container-config.js';
 import { resolveRecallScope } from './scope-resolver.js';
 import { mergeAndRerank } from './rrf.js';
@@ -211,7 +211,7 @@ export class MnemonStore implements MemoryStore {
       limit?: number;
       timeoutMs?: number;
       signal?: AbortSignal;
-      recallScope?: 'self' | 'all-groups' | string[];
+      recallScope?: RecallScope;
     } = {},
   ): Promise<RecallResult> {
     const start = Date.now();

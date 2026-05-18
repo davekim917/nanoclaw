@@ -1,7 +1,9 @@
 import fs from 'fs';
 import path from 'path';
+import type Database from 'better-sqlite3';
 
 import { GROUPS_DIR } from '../../config.js';
+import type { RecallScope } from '../../container-config.js';
 
 interface CacheEntry {
   groupIds: string[];
@@ -19,11 +21,21 @@ export function clearScopeCacheForTest(): void {
   scopeCache.clear();
 }
 
+/**
+ * Test injection point for the central DB. When set, scope-resolver uses
+ * this instead of opening the on-disk v2.db. Must be closed by the caller
+ * after the test.
+ */
+let _centralDbOverride: Database.Database | null = null;
+export function setCentralDbForTest(db: Database.Database | null): void {
+  _centralDbOverride = db;
+}
+
 function getGroupsDir(): string {
   return _groupsDirOverride ?? GROUPS_DIR;
 }
 
-function cacheKey(callingGroupId: string, scope: 'self' | 'all-groups' | string[]): string {
+function cacheKey(callingGroupId: string, scope: RecallScope): string {
   return `${callingGroupId}::${Array.isArray(scope) ? scope.join(',') : scope}`;
 }
 
@@ -65,9 +77,108 @@ function getFolderGroupId(folder: string): string | null {
   return cfg.agentGroupId;
 }
 
-export function resolveRecallScope(callingGroupId: string, scope: 'self' | 'all-groups' | string[]): string[] {
+/**
+ * Open (or reuse) the central DB connection. Returns the test override if
+ * one is set; otherwise opens the on-disk v2.db from DATA_DIR. The returned
+ * DB must NOT be closed by the caller when using the test override — the test
+ * manages its lifecycle. For the on-disk path we open fresh per-call (the
+ * central DB singleton lives in connection.ts and requires initDb() — we
+ * can't rely on it being initialized inside unit tests, so open directly).
+ */
+function openCentralDb(): { db: Database.Database; owned: boolean } {
+  if (_centralDbOverride) {
+    return { db: _centralDbOverride, owned: false };
+  }
+
+  // Lazy import to avoid circular dependency at module load time.
+  // DATA_DIR is not available at import time during tests unless initDb is called.
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { DATA_DIR } = require('../../config.js') as { DATA_DIR: string };
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const BetterSqlite3 = require('better-sqlite3') as typeof import('better-sqlite3');
+  const dbPath = path.join(DATA_DIR, 'v2.db');
+  const db = new BetterSqlite3(dbPath, { readonly: true });
+  return { db, owned: true };
+}
+
+/**
+ * Resolve the shared mnemon_store_id for callingGroupId's workgroup.
+ * Returns the storeId (a single agent_groups.id) that is the canonical
+ * mnemon store for the workgroup. Used by 'workgroup' scope mode.
+ */
+export function resolveWorkgroupStoreId(callingGroupId: string): string {
+  const { db, owned } = openCentralDb();
+  try {
+    const agRow = db
+      .prepare(`SELECT workgroup_id FROM agent_groups WHERE id = ? LIMIT 1`)
+      .get(callingGroupId) as { workgroup_id: string | null } | undefined;
+
+    if (!agRow || agRow.workgroup_id == null) {
+      throw new Error(
+        `[scope-resolver] workgroup mode: agent_group ${callingGroupId} has no workgroup_id in central DB`,
+      );
+    }
+
+    const wgRow = db
+      .prepare(`SELECT mnemon_store_id FROM workgroups WHERE id = ? LIMIT 1`)
+      .get(agRow.workgroup_id) as { mnemon_store_id: string | null } | undefined;
+
+    if (!wgRow || wgRow.mnemon_store_id == null) {
+      throw new Error(
+        `[scope-resolver] workgroup mode: workgroup ${agRow.workgroup_id} has no mnemon_store_id`,
+      );
+    }
+
+    return wgRow.mnemon_store_id;
+  } finally {
+    if (owned) db.close();
+  }
+}
+
+/**
+ * Returns all agent_group IDs that belong to the same workgroup as
+ * callingGroupId, with callingGroupId first (guaranteed by spec).
+ */
+export function resolveWorkgroupMembers(callingGroupId: string): string[] {
+  const { db, owned } = openCentralDb();
+  try {
+    const agRow = db
+      .prepare(`SELECT workgroup_id FROM agent_groups WHERE id = ? LIMIT 1`)
+      .get(callingGroupId) as { workgroup_id: string | null } | undefined;
+
+    if (!agRow || agRow.workgroup_id == null) {
+      // Standalone / unmatched: treat as single-member group
+      return [callingGroupId];
+    }
+
+    const members = db
+      .prepare(`SELECT id FROM agent_groups WHERE workgroup_id = ?`)
+      .all(agRow.workgroup_id) as Array<{ id: string }>;
+
+    const memberIds = members.map((r) => r.id);
+    // calling group first, then others
+    const set = new Set([callingGroupId, ...memberIds]);
+    return Array.from(set);
+  } finally {
+    if (owned) db.close();
+  }
+}
+
+/** Exhaustiveness check — TypeScript asserts this is unreachable at compile time. */
+function assertNever(x: never): never {
+  throw new Error(`[scope-resolver] Unhandled RecallScope value: ${JSON.stringify(x)}`);
+}
+
+export function resolveRecallScope(callingGroupId: string, scope: RecallScope): string[] {
   if (scope === 'self') {
     return [callingGroupId];
+  }
+
+  if (scope === 'workgroup') {
+    // Return a single-element array containing the shared mnemon store id.
+    // This engages the fast path in mnemon-impl (groupIds.length <= 1).
+    const storeId = resolveWorkgroupStoreId(callingGroupId);
+    return [storeId];
   }
 
   const key = cacheKey(callingGroupId, scope);
@@ -83,7 +194,7 @@ export function resolveRecallScope(callingGroupId: string, scope: 'self' | 'all-
     // Deduplicate and ensure callingGroupId is first
     const set = new Set([callingGroupId, ...all]);
     groupIds = Array.from(set);
-  } else {
+  } else if (Array.isArray(scope)) {
     // string[] — folder names to resolve
     const resolved: string[] = [];
     for (const folder of scope) {
@@ -93,6 +204,11 @@ export function resolveRecallScope(callingGroupId: string, scope: 'self' | 'all-
     // Deduplicate and ensure callingGroupId is first
     const set = new Set([callingGroupId, ...resolved]);
     groupIds = Array.from(set);
+  } else {
+    // This branch is unreachable if RecallScope is exhaustive. assertNever
+    // causes a compile-time error if a new variant is added without updating
+    // this switch chain, and a runtime error if someone casts to any.
+    assertNever(scope);
   }
 
   scopeCache.set(key, { groupIds, expiresAt: Date.now() + CACHE_TTL_MS });

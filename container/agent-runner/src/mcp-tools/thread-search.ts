@@ -7,7 +7,6 @@
  */
 import { Database } from 'bun:sqlite';
 
-import { getConfig } from '../config.js';
 import { findByName } from '../destinations.js';
 import { getSessionRouting } from '../db/session-routing.js';
 import { registerTools } from './server.js';
@@ -37,10 +36,6 @@ function getDb(): Database | null {
     log(`Archive not available at ${ARCHIVE_PATH}: ${e instanceof Error ? e.message : String(e)}`);
     return null;
   }
-}
-
-function currentAgentGroupId(): string | undefined {
-  return getConfig().agentGroupId || undefined;
 }
 
 /**
@@ -178,9 +173,6 @@ export const searchThreadsTool: McpToolDefinition = {
     const db = getDb();
     if (!db) return err('archive database not mounted — host may be too old for thread search');
 
-    const ag = currentAgentGroupId();
-    if (!ag) return err('agent group id unavailable — NANOCLAW_AGENT_GROUP_ID not set');
-
     const sanitized = sanitizeFtsQuery(query);
     if (!sanitized) return ok('No searchable tokens in query.');
 
@@ -222,12 +214,11 @@ export const searchThreadsTool: McpToolDefinition = {
               LIMIT 1) AS first_snippet
            FROM messages_archive a
            JOIN matches m ON m.rowid = a.rowid
-           WHERE a.agent_group_id = $ag
            GROUP BY a.thread_id, a.channel_type, a.platform_id
            ORDER BY best_score ASC
            LIMIT $limit`,
         )
-        .all({ $ag: ag, $q: sanitized, $limit: ftsLimit }) as SearchHitRow[];
+        .all({ $q: sanitized, $limit: ftsLimit }) as SearchHitRow[];
     } catch (e) {
       return err(`FTS search failed: ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -320,9 +311,6 @@ export const resolveThreadLinkTool: McpToolDefinition = {
     const db = getDb();
     if (!db) return err('archive database not mounted');
 
-    const ag = currentAgentGroupId();
-    if (!ag) return err('agent group id unavailable');
-
     // Figure out channel_type + platform_id + thread_id we should load.
     let channelType: string | null = null;
     let platformId: string | null = null;
@@ -356,14 +344,13 @@ export const resolveThreadLinkTool: McpToolDefinition = {
         .prepare(
           `SELECT role, sender_name, text, sent_at, channel_name
            FROM messages_archive
-           WHERE agent_group_id = ?
-             AND channel_type LIKE ?
+           WHERE channel_type LIKE ?
              AND platform_id = ?
              AND thread_id = ?
            ORDER BY sent_at ASC
            LIMIT ?`,
         )
-        .all(ag, channelType, platformId, threadId, limit) as TranscriptRow[];
+        .all(channelType, platformId, threadId, limit) as TranscriptRow[];
     } catch (e) {
       return err(`lookup failed: ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -490,8 +477,6 @@ export const readThreadTool: McpToolDefinition = {
 
     const db = getDb();
     if (!db) return err('archive database not mounted');
-    const ag = currentAgentGroupId();
-    if (!ag) return err('agent group id unavailable');
 
     // Apollo/xzo guard: refuse the current channel's "most recent thread"
     // fallback. The bug it prevents is silently picking a sibling thread
@@ -512,10 +497,10 @@ export const readThreadTool: McpToolDefinition = {
         const latest = db
           .prepare(
             `SELECT thread_id FROM messages_archive
-             WHERE agent_group_id = ? AND channel_type = ? AND platform_id = ?
+             WHERE channel_type = ? AND platform_id = ?
              ORDER BY sent_at DESC LIMIT 1`,
           )
-          .get(ag, routing.channelType, routing.platformId) as { thread_id: string | null } | undefined;
+          .get(routing.channelType, routing.platformId) as { thread_id: string | null } | undefined;
         resolvedThreadId = latest?.thread_id ?? null;
       } catch (e) {
         return err(`thread lookup failed: ${e instanceof Error ? e.message : String(e)}`);
@@ -528,14 +513,13 @@ export const readThreadTool: McpToolDefinition = {
         .prepare(
           `SELECT role, sender_name, text, sent_at, channel_name
            FROM messages_archive
-           WHERE agent_group_id = ?
-             AND channel_type = ?
+           WHERE channel_type = ?
              AND platform_id = ?
              AND (thread_id = ? OR (thread_id IS NULL AND ? IS NULL))
            ORDER BY sent_at ASC
            LIMIT ?`,
         )
-        .all(ag, routing.channelType, routing.platformId, resolvedThreadId, resolvedThreadId, limit) as TranscriptRow[];
+        .all(routing.channelType, routing.platformId, resolvedThreadId, resolvedThreadId, limit) as TranscriptRow[];
     } catch (e) {
       return err(`lookup failed: ${e instanceof Error ? e.message : String(e)}`);
     }
