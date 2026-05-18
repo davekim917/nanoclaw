@@ -1,6 +1,6 @@
 feature: workgroup-scoped-data-layer
 created_by: /team-brief
-last_updated_by: /team-review (cycle 2)
+last_updated_by: /team-review (cycle 3)
 
 constraints:
   - id: C1
@@ -190,11 +190,13 @@ decisions_design:
 
   - id: D7
     stage: design
-    description: "Mnemon recall default scope changes from 'self' to 'workgroup'"
-    chosen: "Flip default at getRecallScope (container-config.ts:74) to 'workgroup'. Safe because workgroup-of-1 (standalone groups) yields the same row set as 'self'; sibling pairs get pooled recall automatically."
+    description: "Mnemon recall default scope (SUPERSEDED by cycle-1 auto_judgment — see auto_judgments[2])"
+    chosen: "REVISED: keep getRecallScope default at 'self'; migration writes explicit recall_scope: 'workgroup' to container.json for auto-paired groups only. No surprise behavior change for implicit-self consumers."
     rejected:
-      - option: "Keep 'self' default; require explicit recall_scope: 'workgroup' per group"
-        reason: "More conservative but defeats R6's auto-pairing benefit on Dave's install (10+ container.json edits required), and a fresh sibling pair created later would still be 'self' by default. Default-on is the right product call given the workgroup formalization."
+      - option: "Flip default at container-config.ts:74 to 'workgroup' (original D7 choice)"
+        reason: "Cycle-1 review surfaced behavior-change risk for implicit-self consumers. Replaced by migration-time explicit declaration (matches PlanetScale expand-and-contract guidance)."
+      - option: "Keep 'self' default; require explicit recall_scope: 'workgroup' per group with no migration assist"
+        reason: "Defeats R6 auto-pairing benefit on Dave's install. Migration writes deliver the auto-pairing without changing the default."
     constraint_refs: [C4]
 
   - id: D8
@@ -229,6 +231,11 @@ review_cycles:
     should_fix_count: 9
     wont_fix_count: 1
     completed_at: 2026-05-18T14:00:00Z
+  - iteration: 3
+    must_fix_count: 4
+    should_fix_count: 3
+    wont_fix_count: 2
+    completed_at: 2026-05-18T14:30:00Z
 
 auto_qa_cycles: []
 
@@ -331,3 +338,56 @@ auto_judgments:
       changes_hard_constraint: false
       weakens_safety_invariant: false
     recorded_at: 2026-05-18T13:30:00Z
+
+  - stage: Review
+    iteration: 3
+    decision: "Drop schema-level NOT NULL for workgroup_id; rely on app-layer W1 + runtime W3"
+    alternatives_considered:
+      - "Keep cycle-2 table-rebuild approach with PRAGMA foreign_keys=OFF (must be set OUTSIDE outer transaction — incompatible with migration barrel; requires special-casing the migration runner)"
+      - "Keep cycle-2 table-rebuild approach with PRAGMA defer_foreign_keys=ON (works inside transaction but still introduces schema-preservation risk per Reviewer C #3 — need full sqlite_master/table_info introspection to enumerate columns added across migrations 002-035)"
+      - "Drop table-rebuild; use ALTER TABLE ADD COLUMN ... REFERENCES (nullable); enforce W1 via migration validation + W3 fail-closed projection (recommended)"
+    grounding:
+      - "Reviewer A cycle-3 finding #1: SQLite ALTER TABLE limitations + foreign_keys PRAGMA-no-op-inside-transaction"
+      - "Reviewer B PRIMARY DRIFT: sqlite.org/draft/lang_altertable.html (T1) — table rebuild requires foreign_keys OFF before transaction"
+      - "Rails GitHub issue #55866 (Oct 2025) — production data-loss incident from this exact pattern"
+      - "Cycle-2 W3 invariant already enforces fail-closed at projection — schema NOT NULL is belt-and-suspenders, not load-bearing"
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false   # W1 stays HARD; enforcement mechanism shifts from schema to app+runtime
+      weakens_safety_invariant: false  # W3 is the practical enforcement point; W1 still validated at migration tail
+    recorded_at: 2026-05-18T14:30:00Z
+
+  - stage: Review
+    iteration: 3
+    decision: "Move container.json + log FS writes out of migration into a separate startup phase reconcileWorkgroupFsState()"
+    alternatives_considered:
+      - "Keep FS writes inside migration 036 up() (cycle-2 design — unreachable recovery path because barrel transaction wraps everything)"
+      - "Move FS writes to a separate function called from src/index.ts after runMigrations completes (recommended)"
+    grounding:
+      - "Reviewer A cycle-3 finding #2: src/db/migrations/index.ts:97-103 wraps every m.up(db) in outer transaction"
+      - "Reviewer C cycle-3 finding #4: DB migration commit + FS writes flow violates idempotency claim"
+      - "Pattern alignment: idempotent post-migration reconciler matches Kubernetes controller pattern cited in cycle-1 Reviewer B"
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-05-18T14:30:00Z
+
+  - stage: Review
+    iteration: 3
+    decision: "Reconciler queries parent agent_groups row by folder before locking mnemon_store_id"
+    alternatives_considered:
+      - "Reconciler uses agentGroup.id directly (cycle-2 design — spawn-order race)"
+      - "Reconciler queries parent by folder slug, falls back to agentGroup.id only if no parent exists (recommended)"
+    grounding:
+      - "Reviewer A cycle-3 finding #3: empirical verification of mnemon store paths"
+      - "Reviewer C cycle-3 finding #2: spawn-order determines wrong canonical store"
+      - "Migration's mnemon_store_id backfill already uses this rule — reconciler should match"
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-05-18T14:30:00Z
