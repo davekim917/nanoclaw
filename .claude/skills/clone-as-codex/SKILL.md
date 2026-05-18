@@ -237,14 +237,23 @@ grep "^${ENV_KEY}=" .env
 
 `agent_groups.created_at` is `NOT NULL` with no default.
 
+`agent_groups.name` should match `id` and `folder` — the workspace
+convention (`<source>-codex`), NOT the Slack/Discord bot display name.
+The bot display name is platform-side (configured at api.slack.com/apps
+or the Discord dev portal) and is purely how chat users see the avatar;
+mixing the two leaves the dashboard with inconsistent groupings (e.g.
+`illie-codex` next to `axie-dev-codex` instead of `illysium-codex`). The
+host-side container-config sync at `container-runner.ts:1519-1525` reads
+`agent_groups.name` into `containerConfig.assistantName`, so this is also
+the string the agent sees as its own self-reference in the system prompt.
+
 ```bash
 NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-DISPLAY_NAME=<display_name>                 # what users see in the dashboard, e.g. "illie-codex"
 
 EXISTING=$(pnpm exec tsx scripts/q.ts data/v2.db "select id from agent_groups where folder='${SIBLING_FOLDER}'" 2>/dev/null | tr -d '\n')
 if [ -z "${EXISTING}" ]; then
   pnpm exec tsx scripts/q.ts data/v2.db \
-    "insert into agent_groups (id, folder, name, agent_provider, created_at) values ('${SIBLING_ID}', '${SIBLING_FOLDER}', '${DISPLAY_NAME}', 'codex', '${NOW}')"
+    "insert into agent_groups (id, folder, name, agent_provider, created_at) values ('${SIBLING_ID}', '${SIBLING_FOLDER}', '${SIBLING_ID}', 'codex', '${NOW}')"
 fi
 ```
 
@@ -280,7 +289,7 @@ pnpm exec tsx setup/index.ts --step register -- \
   --folder "${SIBLING_FOLDER}" \
   --channel "${CHANNEL_TYPE}" \
   --session-mode "per-thread" \
-  --assistant-name "${DISPLAY_NAME}"
+  --assistant-name "${SIBLING_ID}"
 ```
 
 If a `messaging_group_agents` row was already hand-inserted and the sibling fires but cannot send, repair the missing destination row explicitly. Use this only as a repair; new wiring should go through `register`.
@@ -333,7 +342,7 @@ pnpm exec tsx setup/index.ts --step register -- \
   --folder "${SIBLING_FOLDER}" \
   --channel "${CHANNEL_TYPE}" \
   --session-mode "per-thread" \
-  --assistant-name "${DISPLAY_NAME}"
+  --assistant-name "${SIBLING_ID}"
 ```
 
 The `register` step defaults `engage_mode='mention'` for group channels — sibling-safe (only fires on explicit `@`-mention, no sticky lurking). This is what you want for siblings; sticky combined with two bots in the same thread risks runaway loops where each bot wakes on the other's reply via session existence.
