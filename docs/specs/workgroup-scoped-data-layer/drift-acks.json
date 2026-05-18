@@ -1,0 +1,24 @@
+{
+  "acknowledgments": [
+    {
+      "id": "B1",
+      "reason": "SOT internal contradiction: design.md § 'Decision Record Updates' D7 has stale text from cycle-1 that says 'default flips to workgroup'. The cycle-3 revision's § 'Default scope, revised (M8)' section supersedes D7 — explicit text: 'getRecallScope default ... stays self — no default flip.' decisions.yaml auto_judgments[2] (Review iteration 1) makes this explicit. Plan correctly implements M8 (no flip; migration writes explicit recall_scope to paired groups). Design will be updated post-build to clean up D7 residual text."
+    },
+    {
+      "id": "B2",
+      "reason": "SOT internal contradiction: design.md § Research Summary stale text from cycle-0 says 'both projections widen with workgroup_id IN (...)'. Cycle-1 review surfaced per-table semantic differences; § 'Per-table pooling strategy (M5)' explicitly says only messages_archive widens; backlog_items/ship_log/tasks/agent_group_capabilities stay agent-scoped (orchestrator role must remain per-agent). decisions.yaml auto_judgments[3] confirms M5 authoritative. Plan correctly follows M5."
+    },
+    {
+      "id": "B3",
+      "reason": "SOT internal contradiction: design.md § Research Summary stale text says workgroup mode uses 'existing container.json walker pattern' (filesystem). Cycle-1 M1 supersedes — workgroup mode reads from central DB to avoid filesystem-vs-DB drift (the exact failure class Option B was rejected for). decisions.yaml auto_judgments[4] makes this explicit. Plan correctly reads from DB."
+    },
+    {
+      "id": "B4",
+      "reason": "Plan uses string[] (e.g., ['Anthropic','Exa']) instead of design's [{name, uuid}] for workgroups.onecli_secrets. Functional parity: applyOnecliSecrets accepts names OR UUIDs at src/onecli-secrets.ts:181 and the identifierToUuid cache at :54 already amortizes resolution cost across spawns. The simpler string[] form avoids the schema complexity of nested objects in JSON, makes set-workgroup-secrets.ts CLI simpler, and is one less migration step if the format changes later. Design will be updated post-build to reflect actual shape (or kept as documented future optimization)."
+    },
+    {
+      "id": "B5",
+      "reason": "Surface-level divergence with functional CONFIRMED. Design text 'every auto-paired group's container.json' is informal. The operational condition `workgroup_id !== folder` correctly captures only the codex twin (the case where 'self' would resolve incorrectly). The parent's agent_groups.id IS the workgroups.mnemon_store_id (backfilled to match), so parent's 'self' mode already resolves to the workgroup canonical store. Writing recall_scope: 'workgroup' to the parent is a no-op (same store id resolves either way). Plan correctly omits the redundant write."
+    }
+  ]
+}
