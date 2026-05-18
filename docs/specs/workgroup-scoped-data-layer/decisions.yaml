@@ -1,6 +1,6 @@
 feature: workgroup-scoped-data-layer
 created_by: /team-brief
-last_updated_by: /team-design
+last_updated_by: /team-review
 
 constraints:
   - id: C1
@@ -218,6 +218,111 @@ decisions_design:
     constraint_refs: [C1]
 
 
+review_cycles:
+  - iteration: 1
+    must_fix_count: 9
+    should_fix_count: 10
+    wont_fix_count: 2
+    completed_at: 2026-05-18T13:30:00Z
+
 auto_qa_cycles: []
 
-auto_judgments: []
+auto_judgments:
+  - stage: Review
+    iteration: 1
+    decision: "Workgroup-of-1 identifier = folder slug (agent_groups.folder), not agent_groups.id"
+    alternatives_considered:
+      - "agent_groups.id (ag-<ts>-<rand>) — opaque, machine-readable, FK-safe but display-meaningless"
+      - "agent_groups.folder (human slug) — operator-facing, UNIQUE-constrained, matches container.json declaration pattern"
+    grounding:
+      - "src/db/migrations/001-initial.ts:13 — folder TEXT NOT NULL UNIQUE"
+      - "container.json declares folder-keyed identity throughout: groups/<folder>/container.json carries agentGroupId, folder name = directory"
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-05-18T13:30:00Z
+
+  - stage: Review
+    iteration: 1
+    decision: "Mnemon store routing = single store per workgroup; workgroups.id IS the store name; scope-resolver returns single id for workgroup mode"
+    alternatives_considered:
+      - "Per-agent stores with fan-out (existing pattern, but creates redundancy with MNEMON_STORE_<folder> env override)"
+      - "Single store per workgroup (subsumes env override eventually; one fewer moving part)"
+    grounding:
+      - "src/modules/memory/mnemon-impl.ts:225-279 — fan-out path; collapsing to single store is the simpler model"
+      - "Verified earlier this session: 4 codex-twin mnemon stores are empty (oplog <= 71, no facts) — no migration cost"
+      - "src/container-runner.ts:1773-1779 — MNEMON_STORE_<folder> env override stays in place per C6 (HARD); workgroup mode is authoritative"
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-05-18T13:30:00Z
+
+  - stage: Review
+    iteration: 1
+    decision: "Default flip approach: keep getRecallScope default at 'self'; migration writes recall_scope: 'workgroup' to container.json for auto-paired members only"
+    alternatives_considered:
+      - "Original design: change default at container-config.ts:74 to 'workgroup' (behavior change for implicit-self consumers)"
+      - "Migration-time explicit declaration (no default change; standalone groups untouched)"
+    grounding:
+      - "Reviewer B citation: PlanetScale 'Backward compatible database changes' — default-value flip is application-visible semantic shift, not a backward-compat schema change"
+      - "Reviewer C #4: widening recall is the risky direction for prompt contamination"
+      - "Brief R6 requires auto-pairing for Dave's 10 existing pairs — achieved by writing explicit recall_scope to those pairs' container.json during migration; standalone groups stay on 'self' default"
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-05-18T13:30:00Z
+
+  - stage: Review
+    iteration: 1
+    decision: "Per-table pooling: only messages_archive widens to workgroup; backlog_items / ship_log / tasks / agent_group_capabilities stay agent-scoped"
+    alternatives_considered:
+      - "Pool all central-DB tables across workgroup — would silently widen orchestrator capability (server.ts:45) across siblings"
+      - "Pool only messages_archive — each table evaluated on semantic merit"
+    grounding:
+      - "container/agent-runner/src/mcp-tools/server.ts:45 — orchestrator check is per-agent; pooling would conflate sibling roles"
+      - "container/agent-runner/src/mcp-tools/backlog.ts:273-342 — backlog operations narrate per-agent activity; pooling would create cross-sibling todo confusion"
+      - "Brief R2 explicitly scopes pooling to chat archive ('siblings can read each other's chat archive') — not to backlog or roles"
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-05-18T13:30:00Z
+
+  - stage: Review
+    iteration: 1
+    decision: "Membership SoT: agent_groups.workgroup_id (DB) is canonical for runtime queries; container.json declares operator intent and host reconciles to DB on spawn"
+    alternatives_considered:
+      - "Container.json is runtime SoT (scope-resolver walks filesystem) — re-creates the drift class of bug PR #105 fixed"
+      - "DB is canonical for runtime; container.json declares intent; reconciliation on spawn"
+    grounding:
+      - "Design Option B rejection cited this exact drift concern; chosen Option A inherits the same concern unless DB is canonical at runtime"
+      - "src/modules/memory/scope-resolver.ts:30-66 — existing filesystem reader pattern; workgroup mode reads from DB instead (host has DB access at the same call site that builds the projection)"
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-05-18T13:30:00Z
+
+  - stage: Review
+    iteration: 1
+    decision: "Pooled messages_archive dedup: projection-only change, GROUP BY canonical key, keep row with lowest agent_group_id"
+    alternatives_considered:
+      - "Insert-time dedup in router.ts:793,916,932 — touches archive write path, larger blast radius"
+      - "Projection-only dedup — buildArchiveProjection GROUP BY (messaging_group_id, thread_id, sent_at, role, text); deterministic with MIN(agent_group_id)"
+    grounding:
+      - "src/router.ts:793, 916, 932 — confirmed each agent writes its own archive row via messageIdForAgent"
+      - "src/db/per-agent-projections.ts:89-121 — single chokepoint for projection logic; dedup added here keeps the change contained"
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-05-18T13:30:00Z
