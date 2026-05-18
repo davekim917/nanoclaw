@@ -1770,9 +1770,13 @@ async function buildContainerArgs(
   //   MNEMON_STORE_illie_codex=illie
   //
   // Folder name → env key: replace '-' with '_' (so illie-codex → illie_codex).
+  // Falls back to the uppercase variant so hand-edited .env files that
+  // SCREAMING_CASE the suffix still resolve. Without the fallback, a casing
+  // mismatch silently routes the sibling to its own isolated store.
   if (containerConfig.memory?.enabled === true) {
     const scopedKey = `MNEMON_STORE_${agentGroup.folder.replace(/-/g, '_')}`;
-    const mnemonStore = process.env[scopedKey] ?? agentGroup.id;
+    const mnemonStore =
+      process.env[scopedKey] ?? process.env[scopedKey.toUpperCase()] ?? agentGroup.id;
     args.push('-e', `MNEMON_STORE=${mnemonStore}`);
     args.push('-e', 'MNEMON_READ_ONLY=1');
     args.push('-e', 'MNEMON_EMBED_ENDPOINT=http://host.docker.internal:11434');
