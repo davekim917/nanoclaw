@@ -289,7 +289,7 @@ pnpm exec tsx setup/index.ts --step register -- \
   --folder "${SIBLING_FOLDER}" \
   --channel "${CHANNEL_TYPE}" \
   --session-mode "per-thread" \
-  --assistant-name "${DISPLAY_NAME}"
+  --assistant-name "${SIBLING_ID}"
 ```
 
 If a `messaging_group_agents` row was already hand-inserted and the sibling fires but cannot send, repair the missing destination row explicitly. Use this only as a repair; new wiring should go through `register`.
@@ -342,7 +342,7 @@ pnpm exec tsx setup/index.ts --step register -- \
   --folder "${SIBLING_FOLDER}" \
   --channel "${CHANNEL_TYPE}" \
   --session-mode "per-thread" \
-  --assistant-name "${DISPLAY_NAME}"
+  --assistant-name "${SIBLING_ID}"
 ```
 
 The `register` step defaults `engage_mode='mention'` for group channels — sibling-safe (only fires on explicit `@`-mention, no sticky lurking). This is what you want for siblings; sticky combined with two bots in the same thread risks runaway loops where each bot wakes on the other's reply via session existence.
