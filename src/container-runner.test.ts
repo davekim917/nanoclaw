@@ -534,6 +534,71 @@ describe('resolveMnemonStore — C2', () => {
   });
 });
 
+// ── reconcileWorkgroupAtSpawn — preserve migration 036 pairings ──────────────
+// Codex P1 catch on PR #107 commit f166ae1: when container.json omits
+// workgroup_id, the prior code defaulted to agentGroup.folder and overwrote
+// the migration's pairing on first spawn. New behavior: preserve existing DB
+// value when config is silent.
+
+describe('reconcileWorkgroupAtSpawn — workgroup_id preservation', () => {
+  let db: Database.Database;
+
+  beforeEach(() => {
+    db = makeWorkgroupDb();
+  });
+
+  it('test_preserves_migrated_workgroup_id_when_container_config_silent', () => {
+    // Simulate post-migration-036 state for illie + illie-codex pair:
+    // both agent_groups rows have workgroup_id='illysium' set by migration,
+    // but illie-codex's container.json does not declare workgroup_id (FS
+    // reconciler only wrote recall_scope).
+    insertGroup(db, 'ag-illie', 'illysium', 'illysium');
+    insertGroup(db, 'ag-illie-codex', 'illysium-codex', 'illysium');
+    insertWorkgroup(db, 'illysium', 'ag-illie');
+
+    // Spawn illie-codex with no workgroup_id in containerConfig — must preserve
+    // the migrated pairing rather than overwriting to 'illysium-codex'.
+    reconcileWorkgroupAtSpawn(db, { id: 'ag-illie-codex', folder: 'illysium-codex' }, {});
+
+    const after = db.prepare('SELECT workgroup_id FROM agent_groups WHERE id = ?').get('ag-illie-codex') as {
+      workgroup_id: string;
+    };
+    expect(after.workgroup_id).toBe('illysium'); // preserved, NOT overwritten to 'illysium-codex'
+
+    // workgroups row for 'illysium' must still point at the seed sibling.
+    const wg = db.prepare('SELECT mnemon_store_id FROM workgroups WHERE id = ?').get('illysium') as {
+      mnemon_store_id: string;
+    };
+    expect(wg.mnemon_store_id).toBe('ag-illie');
+  });
+
+  it('test_explicit_config_workgroup_id_overrides_db_value', () => {
+    // If container.json explicitly sets workgroup_id, operator intent wins
+    // (e.g., operator moves a sibling to a different workgroup).
+    insertGroup(db, 'ag-foo', 'foo', 'old-workgroup');
+
+    reconcileWorkgroupAtSpawn(db, { id: 'ag-foo', folder: 'foo' }, { workgroup_id: 'new-workgroup' });
+
+    const after = db.prepare('SELECT workgroup_id FROM agent_groups WHERE id = ?').get('ag-foo') as {
+      workgroup_id: string;
+    };
+    expect(after.workgroup_id).toBe('new-workgroup'); // operator intent honored
+  });
+
+  it('test_defaults_to_own_folder_when_db_value_null', () => {
+    // Fresh install: no migration ran, agent_groups.workgroup_id is NULL,
+    // container.json silent → default to workgroup-of-1 (own folder).
+    insertGroup(db, 'ag-fresh', 'fresh'); // no workgroup_id set
+
+    reconcileWorkgroupAtSpawn(db, { id: 'ag-fresh', folder: 'fresh' }, {});
+
+    const after = db.prepare('SELECT workgroup_id FROM agent_groups WHERE id = ?').get('ag-fresh') as {
+      workgroup_id: string;
+    };
+    expect(after.workgroup_id).toBe('fresh'); // workgroup-of-1
+  });
+});
+
 // ── Spawn merged-secrets tests (C3) ──────────────────────────────────────────
 // These tests verify the merge logic by exercising mergeWorkgroupAndGroupSecrets
 // (from onecli-secrets.ts) as it would be called from the spawn path.

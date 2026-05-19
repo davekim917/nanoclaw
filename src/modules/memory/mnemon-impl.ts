@@ -1,4 +1,5 @@
 import { spawn } from 'child_process';
+import fs from 'fs';
 import { homedir } from 'os';
 import path from 'path';
 
@@ -6,10 +7,50 @@ import type Database from 'better-sqlite3';
 import type { FactInput, MemoryStore, RecallResult, RecalledFact, RememberResult } from './store.js';
 import { redactSecrets } from './secret-redactor.js';
 import { openMnemonIngestDb, runMnemonIngestMigrations } from '../../db/migrations/019-mnemon-ingest-db.js';
+import { GROUPS_DIR } from '../../config.js';
 import type { MemoryConfig, RecallScope } from '../../container-config.js';
 import { getRecallScope } from '../../container-config.js';
 import { resolveRecallScope, resolveWorkgroupStoreId } from './scope-resolver.js';
 import { mergeAndRerank } from './rrf.js';
+
+/**
+ * Read recall_scope from the agent's container.json on disk. Used by remember()
+ * to route writes — a group with `recall_scope: 'self'` must write to its own
+ * store (preserving the isolation contract), not to the workgroup canonical.
+ *
+ * Returns 'workgroup' (the default) when:
+ *   - GROUPS_DIR is unreadable
+ *   - No container.json matches this agentGroupId
+ *   - The matching container.json has no `memory.recall_scope` field
+ *
+ * Synchronous filesystem walk (~10 ms for ~30 groups). Daemon writes happen
+ * once per fact ingest (~60s sweep), so the per-call cost is negligible.
+ * (Codex P2 catch on PR #107.)
+ */
+function readGroupRecallScope(agentGroupId: string): RecallScope {
+  try {
+    const entries = fs.readdirSync(GROUPS_DIR, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const cfgPath = path.join(GROUPS_DIR, entry.name, 'container.json');
+      if (!fs.existsSync(cfgPath)) continue;
+      try {
+        const raw = JSON.parse(fs.readFileSync(cfgPath, 'utf8')) as {
+          agentGroupId?: string;
+          memory?: MemoryConfig;
+        };
+        if (raw.agentGroupId === agentGroupId) {
+          return getRecallScope(raw.memory);
+        }
+      } catch {
+        continue;
+      }
+    }
+  } catch {
+    // GROUPS_DIR unreadable — fall through to default below.
+  }
+  return 'workgroup';
+}
 
 interface RedactionRecorder {
   recordRedaction(agentGroupId: string, reason: string): void;
@@ -339,16 +380,27 @@ export class MnemonStore implements MemoryStore {
       return { action: 'skipped', factId: '' };
     }
 
-    // CD-2: Resolve workgroup canonical store id so daemon writes land in the same
-    // store the container reads from. Falls back to agentGroupId if no workgroup row
-    // (pre-migration installs, test contexts without workgroups schema, or standalone
-    // agents not yet wired into a workgroup).
+    // Resolve the write target based on the agent's recall_scope:
+    // - 'self'      → write to agentGroupId (preserves isolation contract;
+    //                 self-scoped agents must not leak facts into shared store)
+    // - 'workgroup' → write to workgroup canonical (so daemon writes land in
+    //                 the same store paired siblings read from). DEFAULT.
+    // - 'all-groups' or string[] → write to agentGroupId; fan-out modes have
+    //                              no single canonical store to redirect to.
+    //
+    // Falls back to agentGroupId if no workgroup row (pre-migration installs,
+    // test contexts without workgroups schema, or standalone agents).
+    // (Codex P2 catch on PR #107 — read/write asymmetry under 'self' opt-out.)
     let storeId = agentGroupId;
-    try {
-      storeId = resolveWorkgroupStoreId(agentGroupId) ?? agentGroupId;
-    } catch {
-      // Central DB unavailable — use agent's own id as legacy fallback
+    const scope = readGroupRecallScope(agentGroupId);
+    if (scope === 'workgroup') {
+      try {
+        storeId = resolveWorkgroupStoreId(agentGroupId) ?? agentGroupId;
+      } catch {
+        // Central DB unavailable — use agent's own id as legacy fallback
+      }
     }
+    // 'self', 'all-groups', and string[] modes all keep storeId = agentGroupId.
 
     const args = ['remember', '--store', storeId, '--cat', fact.category, '--imp', String(fact.importance)];
 

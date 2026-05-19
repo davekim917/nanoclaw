@@ -139,28 +139,47 @@ export function isContainerRunning(sessionId: string): boolean {
 
 /**
  * Reconcile workgroup membership at spawn time. Run on every container wake
- * so that workgroup_id in the DB always reflects the operator's declared
- * intent from container.json.
+ * so that workgroup_id in the DB reflects the operator's declared intent
+ * from container.json — when that intent is present.
  *
- * Source of truth: container.json.workgroup_id is operator intent. When
- * absent it defaults to a workgroup-of-1 (own folder). The DB column is the
- * runtime canonical form — this function keeps them in sync.
+ * Precedence:
+ *   1. container.json.workgroup_id (operator intent — overrides everything)
+ *   2. Existing DB value on agent_groups.workgroup_id (preserves migration 036
+ *      pairings and prior spawn state)
+ *   3. agentGroup.folder (default to workgroup-of-1 when nothing else is set)
  *
- * Race / spawn-order safety: we look up the parent row by FOLDER (not by the
- * sibling's id), so spawning illie-codex before illie still resolves to
- * illie's id once illie's agent_groups row exists. If the parent row doesn't
- * exist yet, we fall back to the calling group's own id (workgroup-of-1) so
- * the container can still spawn; the next spawn of this group will converge.
+ * Critical: when container.json is silent (`workgroup_id` undefined), do NOT
+ * overwrite the DB value with `agentGroup.folder`. Migration 036 pairs
+ * existing `*-codex` siblings into their seed sibling's workgroup but the FS
+ * reconciler does not back-fill `workgroup_id` into existing container.json
+ * files. Treating "config silent" as "operator declared workgroup-of-1" would
+ * sever every migrated pairing on first spawn after deploy. Operator silence
+ * means "preserve whatever's there" — not "force own-folder."
+ *
+ * Race / spawn-order safety: parent lookup is by FOLDER (not by sibling id),
+ * so spawning illie-codex before illie still resolves to illie's id once
+ * illie's agent_groups row exists. If the parent row doesn't exist yet, we
+ * fall back to the calling group's own id (workgroup-of-1) so the container
+ * can still spawn; this is the CD-4 spawn-order race documented in
+ * docs/workgroups.md § Staleness window. (Codex P1 catch on PR #107.)
  */
 export function reconcileWorkgroupAtSpawn(
   db: Database.Database,
   agentGroup: Pick<AgentGroup, 'id' | 'folder'>,
   containerConfig: Pick<ContainerConfig, 'workgroup_id'>,
 ): void {
-  // declared = the folder name identifying the workgroup, defaults to own folder
-  const declared = containerConfig.workgroup_id ?? agentGroup.folder;
+  // Determine declared workgroup_id with the precedence above.
+  let declared: string;
+  if (containerConfig.workgroup_id !== undefined) {
+    declared = containerConfig.workgroup_id;
+  } else {
+    const existing = db.prepare('SELECT workgroup_id FROM agent_groups WHERE id = ? LIMIT 1').get(agentGroup.id) as
+      | { workgroup_id: string | null }
+      | undefined;
+    declared = existing?.workgroup_id ?? agentGroup.folder;
+  }
 
-  // Look up the parent agent_groups row for the declared workgroup id (folder).
+  // Look up the seed agent_groups row for the declared workgroup id (folder).
   const parentRow = db.prepare('SELECT id FROM agent_groups WHERE folder = ? LIMIT 1').get(declared) as
     | { id: string }
     | undefined;
