@@ -147,7 +147,7 @@ export class MnemonStore implements MemoryStore {
   }
 
   private async recallSingleStore(
-    agentGroupId: string,
+    storeId: string,
     query: string,
     opts: { limit?: number; timeoutMs?: number; signal?: AbortSignal },
   ): Promise<RecallResult> {
@@ -166,7 +166,7 @@ export class MnemonStore implements MemoryStore {
     });
 
     try {
-      const args = ['recall', query, '--store', agentGroupId, '--limit', String(limit)];
+      const args = ['recall', query, '--store', storeId, '--limit', String(limit)];
       const { stdout, code } = await spawnMnemon(args, signal);
       clearTimeout(timeout);
 
@@ -224,9 +224,16 @@ export class MnemonStore implements MemoryStore {
     const scope = opts.recallScope ?? getRecallScope(this.memoryConfig);
     const groupIds = resolveRecallScope(agentGroupId, scope);
 
-    // Single-store fast path: scope='self' or resolved to just the calling group.
+    // Single-store fast path: pass the RESOLVED store id (groupIds[0]), not the
+    // raw agentGroupId. For scope='self' these are identical; for scope='workgroup'
+    // the resolver returns the canonical workgroup store id, which differs from
+    // the calling group's id for non-seed siblings (e.g., a codex twin reading
+    // its Claude twin's store). Passing agentGroupId here would silently route
+    // recall to the calling group's own (empty) store while env/mounts point at
+    // the shared store. (Codex review on PR #107 caught this.)
     if (groupIds.length <= 1) {
-      return this.recallSingleStore(agentGroupId, query, opts);
+      const storeId = groupIds[0] ?? agentGroupId;
+      return this.recallSingleStore(storeId, query, opts);
     }
 
     // Multi-store fan-out path.

@@ -15,7 +15,7 @@ vi.mock('child_process', () => ({
 import { spawn } from 'child_process';
 import { MnemonStore, setMnemonStoreIngestDb } from './mnemon-impl.js';
 import { runMnemonIngestMigrations } from '../../db/migrations/019-mnemon-ingest-db.js';
-import { clearScopeCacheForTest, setGroupsDirForTest } from './scope-resolver.js';
+import { clearScopeCacheForTest, setCentralDbForTest, setGroupsDirForTest } from './scope-resolver.js';
 
 const mockSpawn = vi.mocked(spawn);
 
@@ -302,7 +302,7 @@ describe('MnemonStore fan-out (D3)', () => {
   });
 
   it('test_self_scope_single_store_path', async () => {
-    // scope='self' (default) → single-store path, pMap NOT invoked.
+    // scope='self' → single-store path, pMap NOT invoked.
     const store = new MnemonStore({ enabled: true, recall_scope: 'self' });
     const child = makeChildMock({ stdout: makeRecallResult([{ id: 'f1', content: 'c1' }]) });
     mockSpawn.mockReturnValue(child as unknown as ReturnType<typeof spawn>);
@@ -313,6 +313,100 @@ describe('MnemonStore fan-out (D3)', () => {
     expect(result.facts[0].id).toBe('f1');
     // Only one spawn call (single-store path)
     expect(mockSpawn).toHaveBeenCalledTimes(1);
+  });
+
+  it('test_workgroup_fast_path_uses_resolved_store_not_calling_group', async () => {
+    // Codex P1 catch on PR #107: with the new default recall_scope='workgroup',
+    // resolveRecallScope returns a single-element array containing the workgroup
+    // canonical store id (the seed sibling's id, often DIFFERENT from the calling
+    // group). The single-store fast path MUST use that resolved id, not the
+    // raw agentGroupId — otherwise codex twins recall from their own empty store
+    // while env/mounts correctly point at the shared store.
+    const wgDb = new Database(':memory:');
+    wgDb.exec(`
+      CREATE TABLE workgroups (
+        id              TEXT PRIMARY KEY,
+        display_name    TEXT,
+        onecli_secrets  TEXT NOT NULL DEFAULT '[]',
+        mnemon_store_id TEXT,
+        created_at      TEXT NOT NULL,
+        updated_at      TEXT
+      );
+      CREATE TABLE agent_groups (
+        id           TEXT PRIMARY KEY,
+        name         TEXT NOT NULL,
+        folder       TEXT NOT NULL UNIQUE,
+        workgroup_id TEXT REFERENCES workgroups(id),
+        created_at   TEXT NOT NULL
+      );
+      INSERT INTO workgroups (id, mnemon_store_id, created_at) VALUES ('illie', 'ag-illie', '2026-01-01');
+      INSERT INTO agent_groups (id, name, folder, workgroup_id, created_at)
+        VALUES ('ag-illie', 'illie', 'illie', 'illie', '2026-01-01'),
+               ('ag-illie-codex', 'illie-codex', 'illie-codex', 'illie', '2026-01-01');
+    `);
+    setCentralDbForTest(wgDb);
+
+    try {
+      const store = new MnemonStore({ enabled: true, recall_scope: 'workgroup' });
+      const child = makeChildMock({ stdout: makeRecallResult([{ id: 'f1', content: 'c1' }]) });
+      mockSpawn.mockReturnValue(child as unknown as ReturnType<typeof spawn>);
+
+      // Codex twin recalls — should hit the SEED sibling's store, not its own
+      await store.recall('ag-illie-codex', 'test query');
+
+      expect(mockSpawn).toHaveBeenCalledTimes(1);
+      const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
+      // mnemon CLI args: ['recall', query, '--store', <storeId>, '--limit', N]
+      const storeFlagIdx = spawnArgs.indexOf('--store');
+      expect(storeFlagIdx).toBeGreaterThanOrEqual(0);
+      expect(spawnArgs[storeFlagIdx + 1]).toBe('ag-illie'); // resolved seed sibling
+      expect(spawnArgs[storeFlagIdx + 1]).not.toBe('ag-illie-codex'); // NOT calling group
+    } finally {
+      setCentralDbForTest(null);
+      wgDb.close();
+    }
+  });
+
+  it('test_workgroup_fast_path_falls_back_to_self_for_standalone_agent', async () => {
+    // Standalone agent (no workgroup_id) under the new default — must still
+    // recall from its own store (soft fallback in resolveRecallScope).
+    const wgDb = new Database(':memory:');
+    wgDb.exec(`
+      CREATE TABLE workgroups (
+        id              TEXT PRIMARY KEY,
+        display_name    TEXT,
+        onecli_secrets  TEXT NOT NULL DEFAULT '[]',
+        mnemon_store_id TEXT,
+        created_at      TEXT NOT NULL,
+        updated_at      TEXT
+      );
+      CREATE TABLE agent_groups (
+        id           TEXT PRIMARY KEY,
+        name         TEXT NOT NULL,
+        folder       TEXT NOT NULL UNIQUE,
+        workgroup_id TEXT REFERENCES workgroups(id),
+        created_at   TEXT NOT NULL
+      );
+      INSERT INTO agent_groups (id, name, folder, workgroup_id, created_at)
+        VALUES ('ag-standalone', 'standalone', 'standalone', NULL, '2026-01-01');
+    `);
+    setCentralDbForTest(wgDb);
+
+    try {
+      const store = new MnemonStore({ enabled: true, recall_scope: 'workgroup' });
+      const child = makeChildMock({ stdout: makeRecallResult([{ id: 'f1', content: 'c1' }]) });
+      mockSpawn.mockReturnValue(child as unknown as ReturnType<typeof spawn>);
+
+      await store.recall('ag-standalone', 'test query');
+
+      expect(mockSpawn).toHaveBeenCalledTimes(1);
+      const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
+      const storeFlagIdx = spawnArgs.indexOf('--store');
+      expect(spawnArgs[storeFlagIdx + 1]).toBe('ag-standalone');
+    } finally {
+      setCentralDbForTest(null);
+      wgDb.close();
+    }
   });
 
   it('test_all_groups_fans_out_with_concurrency_4', async () => {
