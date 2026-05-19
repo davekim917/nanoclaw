@@ -334,12 +334,13 @@ export class MnemonStore implements MemoryStore {
 
     // CD-2: Resolve workgroup canonical store id so daemon writes land in the same
     // store the container reads from. Falls back to agentGroupId if no workgroup row
-    // (pre-migration installs, test contexts without workgroups schema).
+    // (pre-migration installs, test contexts without workgroups schema, or standalone
+    // agents not yet wired into a workgroup).
     let storeId = agentGroupId;
     try {
-      storeId = resolveWorkgroupStoreId(agentGroupId);
+      storeId = resolveWorkgroupStoreId(agentGroupId) ?? agentGroupId;
     } catch {
-      // No workgroup row or central DB unavailable — use agent's own id as legacy fallback
+      // Central DB unavailable — use agent's own id as legacy fallback
     }
 
     const args = ['remember', '--store', storeId, '--cat', fact.category, '--imp', String(fact.importance)];

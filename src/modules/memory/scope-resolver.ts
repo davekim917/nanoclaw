@@ -98,19 +98,30 @@ function openCentralDb(): { db: Database.Database; owned: boolean } {
 /**
  * Resolve the shared mnemon_store_id for callingGroupId's workgroup.
  * Returns the storeId (a single agent_groups.id) that is the canonical
- * mnemon store for the workgroup. Used by 'workgroup' scope mode.
+ * mnemon store for the workgroup.
+ *
+ * Returns null for standalone agents (no workgroup_id) — callers must
+ * decide how to handle that case. 'workgroup' recall mode falls back
+ * to 'self'; mnemon write redirection falls back to writing to the
+ * agent's own store.
  */
-export function resolveWorkgroupStoreId(callingGroupId: string): string {
-  const { db, owned } = openCentralDb();
+export function resolveWorkgroupStoreId(callingGroupId: string): string | null {
+  let opened: { db: Database.Database; owned: boolean };
+  try {
+    opened = openCentralDb();
+  } catch {
+    // Central DB unavailable (fresh install, test scaffold without override,
+    // permission error). Treat as "no workgroup info" — callers will fall back.
+    return null;
+  }
+  const { db, owned } = opened;
   try {
     const agRow = db
       .prepare(`SELECT workgroup_id FROM agent_groups WHERE id = ? LIMIT 1`)
       .get(callingGroupId) as { workgroup_id: string | null } | undefined;
 
     if (!agRow || agRow.workgroup_id == null) {
-      throw new Error(
-        `[scope-resolver] workgroup mode: agent_group ${callingGroupId} has no workgroup_id in central DB`,
-      );
+      return null;
     }
 
     const wgRow = db
@@ -118,12 +129,14 @@ export function resolveWorkgroupStoreId(callingGroupId: string): string {
       .get(agRow.workgroup_id) as { mnemon_store_id: string | null } | undefined;
 
     if (!wgRow || wgRow.mnemon_store_id == null) {
-      throw new Error(
-        `[scope-resolver] workgroup mode: workgroup ${agRow.workgroup_id} has no mnemon_store_id`,
-      );
+      return null;
     }
 
     return wgRow.mnemon_store_id;
+  } catch {
+    // Schema mismatch or query error (e.g., workgroups table absent on a
+    // pre-migration DB). Fall back to "no workgroup info".
+    return null;
   } finally {
     if (owned) db.close();
   }
@@ -134,7 +147,13 @@ export function resolveWorkgroupStoreId(callingGroupId: string): string {
  * callingGroupId, with callingGroupId first (guaranteed by spec).
  */
 export function resolveWorkgroupMembers(callingGroupId: string): string[] {
-  const { db, owned } = openCentralDb();
+  let opened: { db: Database.Database; owned: boolean };
+  try {
+    opened = openCentralDb();
+  } catch {
+    return [callingGroupId];
+  }
+  const { db, owned } = opened;
   try {
     const agRow = db
       .prepare(`SELECT workgroup_id FROM agent_groups WHERE id = ? LIMIT 1`)
@@ -153,6 +172,8 @@ export function resolveWorkgroupMembers(callingGroupId: string): string[] {
     // calling group first, then others
     const set = new Set([callingGroupId, ...memberIds]);
     return Array.from(set);
+  } catch {
+    return [callingGroupId];
   } finally {
     if (owned) db.close();
   }
@@ -171,8 +192,11 @@ export function resolveRecallScope(callingGroupId: string, scope: RecallScope): 
   if (scope === 'workgroup') {
     // Return a single-element array containing the shared mnemon store id.
     // This engages the fast path in mnemon-impl (groupIds.length <= 1).
+    // Standalone agents (no workgroup_id) silently fall back to 'self' —
+    // workgroup is the default scope, so this branch handles every group
+    // that hasn't been wired into a workgroup yet.
     const storeId = resolveWorkgroupStoreId(callingGroupId);
-    return [storeId];
+    return [storeId ?? callingGroupId];
   }
 
   const key = cacheKey(callingGroupId, scope);

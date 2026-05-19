@@ -256,6 +256,38 @@ describe('resolveRecallScope', () => {
     expect(storeId).toBe('ag-parent');
   });
 
+  it('test_resolveWorkgroupStoreId_returns_null_for_standalone_agent', () => {
+    // Agent exists but has no workgroup_id — represents a standalone agent
+    // not yet wired into a workgroup. Must NOT throw; callers handle null.
+    centralDb = makeWorkgroupDb([]);
+    centralDb
+      .prepare(`INSERT INTO agent_groups (id, name, folder, workgroup_id, created_at) VALUES (?, ?, ?, NULL, '2026-01-01')`)
+      .run('ag-standalone', 'standalone', 'standalone');
+    setCentralDbForTest(centralDb);
+
+    expect(resolveWorkgroupStoreId('ag-standalone')).toBeNull();
+  });
+
+  it('test_resolveWorkgroupStoreId_returns_null_for_unknown_agent', () => {
+    centralDb = makeWorkgroupDb([]);
+    setCentralDbForTest(centralDb);
+
+    expect(resolveWorkgroupStoreId('ag-does-not-exist')).toBeNull();
+  });
+
+  it('test_workgroup_scope_falls_back_to_self_for_standalone_agent', () => {
+    // 'workgroup' is the default scope — standalone agents (no workgroup_id)
+    // must silently fall back to their own store rather than throw.
+    centralDb = makeWorkgroupDb([]);
+    centralDb
+      .prepare(`INSERT INTO agent_groups (id, name, folder, workgroup_id, created_at) VALUES (?, ?, ?, NULL, '2026-01-01')`)
+      .run('ag-standalone', 'standalone', 'standalone');
+    setCentralDbForTest(centralDb);
+
+    const result = resolveRecallScope('ag-standalone', 'workgroup');
+    expect(result).toEqual(['ag-standalone']);
+  });
+
   it('test_assertNever_catches_future_scope', () => {
     // Casting an invalid scope value to 'any' and passing it should throw
     // (assertNever at end of switch triggers)

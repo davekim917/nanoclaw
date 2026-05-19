@@ -83,11 +83,11 @@ describe('MemoryConfig resolvers', () => {
 
   it('test_getRecallScope_default', () => {
     const cfg: MemoryConfig = { enabled: true };
-    expect(getRecallScope(cfg)).toBe('self');
+    expect(getRecallScope(cfg)).toBe('workgroup');
   });
 
   it('test_getRecallScope_undefined', () => {
-    expect(getRecallScope(undefined)).toBe('self');
+    expect(getRecallScope(undefined)).toBe('workgroup');
   });
 
   it('test_getRecallScope_all_groups', () => {
@@ -102,11 +102,13 @@ describe('MemoryConfig resolvers', () => {
 });
 
 describe('RecallScope type + getRecallScope (B1)', () => {
-  it('test_recall_scope_default_unchanged', () => {
-    // Critical: default MUST stay 'self'
-    expect(getRecallScope(undefined)).toBe('self');
+  it('test_recall_scope_default_is_workgroup', () => {
+    // Default flipped 2026-05-19 — workgroups feature exists to widen recall,
+    // so the default IS the wider behavior. Standalone agents (no workgroup_id)
+    // fall back to 'self' in resolveRecallScope (see scope-resolver tests).
+    expect(getRecallScope(undefined)).toBe('workgroup');
     const cfg: MemoryConfig = { enabled: true };
-    expect(getRecallScope(cfg)).toBe('self');
+    expect(getRecallScope(cfg)).toBe('workgroup');
   });
 
   it('test_recall_scope_accepts_workgroup', () => {
