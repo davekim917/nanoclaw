@@ -1034,14 +1034,26 @@ function buildMounts(
     mounts.push(...validated);
   }
 
-  // Memory store: per-group RW mount so sqlite can create journal/lock files.
-  // Scoped to agentGroupId (C20 cross-tenant narrowing — never mount whole ~/.mnemon/).
+  // Memory store: RW mount so sqlite can create journal/lock files.
+  //
+  // CRITICAL: the mount path must match the resolved MNEMON_STORE env value, NOT
+  // just agentGroup.id. With PR #105's env override + PR #106's workgroups.mnemon_store_id
+  // resolution, the codex twin's MNEMON_STORE points at the parent's store id —
+  // mounting only ~/.mnemon/data/<agentGroup.id> would leave the parent's store
+  // directory absent from the container, so recall would see an empty store.
+  // (Codex review on PR #105 caught this — the original cross-tenant narrowing
+  // comment was correct, but the implementation tied the mount to the wrong id.)
+  //
+  // Cross-tenant narrowing still holds: resolveMnemonStore is bounded to the
+  // spawning agent's workgroup (via workgroups.mnemon_store_id JOIN on agent_groups)
+  // or to an explicit env override. Never mounts ~/.mnemon/ at large.
   if (containerConfig.memory?.enabled === true) {
-    const mnemonDataDir = path.join(os.homedir(), '.mnemon', 'data', agentGroup.id);
+    const resolvedStore = resolveMnemonStore(getDb(), agentGroup);
+    const mnemonDataDir = path.join(os.homedir(), '.mnemon', 'data', resolvedStore);
     fs.mkdirSync(mnemonDataDir, { recursive: true });
     mounts.push({
       hostPath: mnemonDataDir,
-      containerPath: `/home/node/.mnemon/data/${agentGroup.id}`,
+      containerPath: `/home/node/.mnemon/data/${resolvedStore}`,
       readonly: false,
     });
   }
