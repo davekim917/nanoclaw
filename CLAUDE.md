@@ -31,12 +31,16 @@ user_roles (user_id, role, agent_group_id)       — owner | admin (global or sc
 agent_group_members (user_id, agent_group_id)    — unprivileged access gate
 user_dms (user_id, channel_type, messaging_group_id) — cold-DM cache
 
-agent_groups (workspace, memory, CLAUDE.md, personality, container config)
+workgroups (id slug, display_name, onecli_secrets JSON, mnemon_store_id)
+    ↑ 1:many
+agent_groups (... workgroup_id REFERENCES workgroups.id, plus workspace, memory, CLAUDE.md, personality, container config)
     ↕ many-to-many via messaging_group_agents (session_mode, trigger_rules, priority)
 messaging_groups (one chat/channel on one platform; unknown_sender_policy)
 
 sessions (agent_group_id + messaging_group_id + thread_id → per-session container)
 ```
+
+Sibling agent_groups (parent + codex twin and future siblings like `<x>-research`) share a workgroup; the workgroup is the data-pool boundary for chat archive, mnemon recall, and OneCLI secret declarations. Each agent_group keeps its own platform bot user, CLAUDE.md, routing identity, and mention-engage rules — the workgroup is the layer above, not a collapse. See [docs/workgroups.md](docs/workgroups.md) for the full model.
 
 Privilege is user-level (owner/admin), not agent-group-level. See [docs/isolation-model.md](docs/isolation-model.md) for the three isolation levels (`agent-shared`, `shared`, separate agents).
 
@@ -91,6 +95,10 @@ Secrets live in the OneCLI gateway, injected into per-agent containers at reques
 ### Per-group secret scoping (declarative)
 
 Each group's `container.json` may carry `onecliSecrets: ["Datafold-MadisonReed", "Anthropic", ...]` (NAMES or UUIDs). On every spawn, `applyOnecliSecrets()` resolves names → UUIDs, forces the agent's secret mode to `selective`, and assigns exactly the declared set. Fail-closed: unresolvable names throw, spawn aborts, sweep retries. No declaration = no-op (preserves operator-set assignments). See `src/onecli-secrets.ts`.
+
+### Workgroup-level secret inheritance
+
+Workgroup-level `onecli_secrets` (JSON on the `workgroups` row) are inherited by every member at spawn time. The host merges as a union (workgroup baseline ∪ per-group additive — per-group can extend, cannot subtract) before calling `applyOnecliSecrets`. Populate workgroup-level secrets via `scripts/set-workgroup-secrets.ts`. Names are validated against the OneCLI vault BEFORE write, so a bad name can't blast-radius every member's spawn. See [docs/workgroups.md](docs/workgroups.md).
 
 ### Gotcha: auto-created agents start in `selective` secret mode (mitigated)
 

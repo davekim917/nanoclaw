@@ -37,7 +37,8 @@ import { buildArchiveProjection, buildCentralProjection } from './db/per-agent-p
 import { initGroupFilesystem } from './group-init.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
-import { applyOnecliSecrets } from './onecli-secrets.js';
+import { applyOnecliSecrets, mergeWorkgroupAndGroupSecrets } from './onecli-secrets.js';
+import type Database from 'better-sqlite3';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
 import YAML from 'yaml';
 
@@ -132,6 +133,86 @@ export function isContainerRunning(sessionId: string): boolean {
   return activeContainers.has(sessionId);
 }
 
+// ── Workgroup reconciler ────────────────────────────────────────────────────
+//
+// Exported for unit testing. Production callers go through spawnContainer.
+
+/**
+ * Reconcile workgroup membership at spawn time. Run on every container wake
+ * so that workgroup_id in the DB always reflects the operator's declared
+ * intent from container.json.
+ *
+ * Source of truth: container.json.workgroup_id is operator intent. When
+ * absent it defaults to a workgroup-of-1 (own folder). The DB column is the
+ * runtime canonical form — this function keeps them in sync.
+ *
+ * Race / spawn-order safety: we look up the parent row by FOLDER (not by the
+ * sibling's id), so spawning illie-codex before illie still resolves to
+ * illie's id once illie's agent_groups row exists. If the parent row doesn't
+ * exist yet, we fall back to the calling group's own id (workgroup-of-1) so
+ * the container can still spawn; the next spawn of this group will converge.
+ */
+export function reconcileWorkgroupAtSpawn(
+  db: Database.Database,
+  agentGroup: Pick<AgentGroup, 'id' | 'folder'>,
+  containerConfig: Pick<ContainerConfig, 'workgroup_id'>,
+): void {
+  // declared = the folder name identifying the workgroup, defaults to own folder
+  const declared = containerConfig.workgroup_id ?? agentGroup.folder;
+
+  // Look up the parent agent_groups row for the declared workgroup id (folder).
+  const parentRow = db
+    .prepare('SELECT id FROM agent_groups WHERE folder = ? LIMIT 1')
+    .get(declared) as { id: string } | undefined;
+  const mnemonStoreId = parentRow?.id ?? agentGroup.id;
+
+  db.transaction(() => {
+    // Insert workgroup row idempotently. ON CONFLICT DO NOTHING preserves any
+    // mnemon_store_id already set by a prior spawn or migration 036.
+    db.prepare(`
+      INSERT INTO workgroups (id, display_name, onecli_secrets, mnemon_store_id, created_at)
+      VALUES (?, ?, '[]', ?, datetime('now'))
+      ON CONFLICT(id) DO NOTHING
+    `).run(declared, declared, mnemonStoreId);
+
+    // Atomic conditional update: only update if the column is NULL or stale.
+    db.prepare(`
+      UPDATE agent_groups SET workgroup_id = ?
+      WHERE id = ? AND (workgroup_id IS NULL OR workgroup_id != ?)
+    `).run(declared, agentGroup.id, declared);
+  })();
+}
+
+/**
+ * Resolve the MNEMON_STORE value for a container spawn.
+ *
+ * Precedence (most specific wins):
+ *   1. MNEMON_STORE_<folder> env override (case-insensitive fallback per PR #105)
+ *   2. workgroups.mnemon_store_id for this agent's workgroup
+ *   3. agentGroup.id (graceful fallback when no workgroup row exists)
+ */
+export function resolveMnemonStore(
+  db: Database.Database,
+  agentGroup: Pick<AgentGroup, 'id' | 'folder'>,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const scopedKey = `MNEMON_STORE_${agentGroup.folder.replace(/-/g, '_')}`;
+  const envOverride = env[scopedKey] ?? env[scopedKey.toUpperCase()];
+  if (envOverride) {
+    return envOverride;
+  }
+
+  const wgRow = db
+    .prepare(
+      `SELECT w.mnemon_store_id FROM workgroups w
+       JOIN agent_groups a ON a.workgroup_id = w.id
+       WHERE a.id = ?`,
+    )
+    .get(agentGroup.id) as { mnemon_store_id: string | null } | undefined;
+
+  return wgRow?.mnemon_store_id ?? agentGroup.id;
+}
+
 /**
  * Wake up a container for a session. If already running or mid-spawn, no-op
  * (the in-flight wake promise is reused).
@@ -206,6 +287,14 @@ async function spawnContainer(session: Session): Promise<void> {
   // Ensure container.json has the agent group identity fields the runner needs.
   // Written at spawn time so the runner can read them from the RO mount.
   ensureRuntimeFields(containerConfig, agentGroup);
+
+  // Workgroup reconciliation — runs at every spawn.
+  // Keeps agent_groups.workgroup_id and workgroups rows in sync with the
+  // operator's container.json.workgroup_id declaration. Idempotent and fast
+  // (two indexed DB ops inside a transaction). Fail-closed: if the central DB
+  // is unavailable the exception propagates up through spawnContainer and the
+  // caller retries on the next sweep tick.
+  reconcileWorkgroupAtSpawn(getDb(), agentGroup, containerConfig);
 
   // Resolve the effective provider + any host-side contribution it declares
   // (extra mounts, env passthrough). Computed once and threaded through both
@@ -1762,17 +1851,13 @@ async function buildContainerArgs(
 
   // Memory env vars: injected only when memory is enabled for this group.
   //
-  // MNEMON_STORE default = the agent_group id, so each group is isolated.
-  // Sibling agents that should SHARE a memory store (e.g. illie + illie-codex
-  // pointing at the same Illysium memory) override via the scoped-env
-  // convention used elsewhere for per-group settings (GIT_AUTHOR_NAME_<group>):
-  //
-  //   MNEMON_STORE_illie_codex=illie
-  //
-  // Folder name → env key: replace '-' with '_' (so illie-codex → illie_codex).
+  // MNEMON_STORE resolution precedence (most specific wins):
+  //   1. MNEMON_STORE_<folder> env override (case-insensitive fallback, PR #105)
+  //   2. workgroups.mnemon_store_id for this agent's workgroup (set by the
+  //      reconciler at spawn time — ensures illie-codex shares illie's store)
+  //   3. agentGroup.id (graceful fallback when workgroups row is absent)
   if (containerConfig.memory?.enabled === true) {
-    const scopedKey = `MNEMON_STORE_${agentGroup.folder.replace(/-/g, '_')}`;
-    const mnemonStore = process.env[scopedKey] ?? agentGroup.id;
+    const mnemonStore = resolveMnemonStore(getDb(), agentGroup);
     args.push('-e', `MNEMON_STORE=${mnemonStore}`);
     args.push('-e', 'MNEMON_READ_ONLY=1');
     args.push('-e', 'MNEMON_EMBED_ENDPOINT=http://host.docker.internal:11434');
@@ -1819,11 +1904,21 @@ async function buildContainerArgs(
   } else {
     if (agentIdentifier) {
       await onecli.ensureAgent({ name: agentGroup.name, identifier: agentIdentifier });
-      // Per-group secret scoping — declarative model, fail-closed.
-      // No-op when `onecliSecrets` is undefined/empty (preserves whatever
-      // assignment the operator set via UI/CLI for that agent — e.g. the
-      // 3 mode-all agents that were left untouched by design).
-      applyOnecliSecrets(agentIdentifier, containerConfig.onecliSecrets);
+      // Per-group + workgroup secret scoping — declarative model, fail-closed.
+      // Workgroup-level secrets are the baseline; per-group onecliSecrets extend
+      // (additive) — neither list can subtract from the other. No-op when the
+      // merged list is empty (preserves whatever assignment the operator set via
+      // UI/CLI — e.g. the 3 mode-all agents intentionally left untouched).
+      const wgSecretsRow = getDb()
+        .prepare(
+          `SELECT w.onecli_secrets FROM workgroups w
+           JOIN agent_groups a ON a.workgroup_id = w.id
+           WHERE a.id = ?`,
+        )
+        .get(agentGroup.id) as { onecli_secrets: string } | undefined;
+      const workgroupSecrets: string[] = wgSecretsRow ? (JSON.parse(wgSecretsRow.onecli_secrets) as string[]) : [];
+      const mergedSecrets = mergeWorkgroupAndGroupSecrets(workgroupSecrets, containerConfig.onecliSecrets);
+      applyOnecliSecrets(agentIdentifier, mergedSecrets);
     }
     const onecliApplied = await onecli.applyContainerConfig(args, { addHostMapping: false, agent: agentIdentifier });
     if (!onecliApplied) {
