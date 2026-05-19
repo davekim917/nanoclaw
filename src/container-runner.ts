@@ -184,12 +184,43 @@ export function reconcileWorkgroupAtSpawn(
 }
 
 /**
+ * Pattern for a valid mnemon store identifier. Matches the shape of
+ * agent_groups.id (`ag-<ts>-<rand>`), workgroup slugs (`a-z0-9` + hyphen),
+ * and any sensible operator-chosen value. Crucially REJECTS:
+ *   - `..` (path traversal)
+ *   - `/` or `\` (path separators)
+ *   - empty / whitespace-only strings
+ *   - shell metacharacters that could break --store arg parsing
+ *
+ * Defense-in-depth: even though .env write is already privileged, an
+ * unvalidated env override would let a `.env` line like
+ * `MNEMON_STORE_illie_codex=../../.ssh` escape ~/.mnemon/data and bind-mount
+ * an arbitrary host path RW into the container. Validate at the resolution
+ * point so every caller (env mount, container env, write redirection) is
+ * uniformly protected. (Codex P2 catch on PR #107.)
+ */
+const STORE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
+
+export function isValidStoreId(value: string): boolean {
+  if (!STORE_ID_PATTERN.test(value)) return false;
+  // STORE_ID_PATTERN allows '.' for ids like `ag-1.5.0` but explicitly reject
+  // a `..` substring anywhere — pattern char-class alone doesn't catch
+  // sequences. Same for explicit literal '..' segments.
+  if (value === '.' || value === '..' || value.includes('..')) return false;
+  return true;
+}
+
+/**
  * Resolve the MNEMON_STORE value for a container spawn.
  *
  * Precedence (most specific wins):
  *   1. MNEMON_STORE_<folder> env override (case-insensitive fallback per PR #105)
  *   2. workgroups.mnemon_store_id for this agent's workgroup
  *   3. agentGroup.id (graceful fallback when no workgroup row exists)
+ *
+ * Throws if any source produces a value that fails {@link isValidStoreId} —
+ * fail-closed posture prevents an .env mistake or attacker-controlled path
+ * traversal from escaping `~/.mnemon/data` via the mount or container env.
  */
 export function resolveMnemonStore(
   db: Database.Database,
@@ -199,6 +230,12 @@ export function resolveMnemonStore(
   const scopedKey = `MNEMON_STORE_${agentGroup.folder.replace(/-/g, '_')}`;
   const envOverride = env[scopedKey] ?? env[scopedKey.toUpperCase()];
   if (envOverride) {
+    if (!isValidStoreId(envOverride)) {
+      throw new Error(
+        `resolveMnemonStore: ${scopedKey} value is not a valid store id (got ${JSON.stringify(envOverride)}). ` +
+          `Must match /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/ with no '..' sequences.`,
+      );
+    }
     return envOverride;
   }
 
@@ -210,7 +247,14 @@ export function resolveMnemonStore(
     )
     .get(agentGroup.id) as { mnemon_store_id: string | null } | undefined;
 
-  return wgRow?.mnemon_store_id ?? agentGroup.id;
+  const resolved = wgRow?.mnemon_store_id ?? agentGroup.id;
+  if (!isValidStoreId(resolved)) {
+    throw new Error(
+      `resolveMnemonStore: resolved store id is invalid (got ${JSON.stringify(resolved)} for agent_group ${agentGroup.id}). ` +
+        `Workgroup row or agent_groups.id has an unexpected shape.`,
+    );
+  }
+  return resolved;
 }
 
 /**

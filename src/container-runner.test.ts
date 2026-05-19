@@ -474,6 +474,62 @@ describe('resolveMnemonStore — C2', () => {
     const result = resolveMnemonStore(db, { id: 'ag-orphan', folder: 'orphan' }, {});
     expect(result).toBe('ag-orphan');
   });
+
+  // ── Codex P2: path-traversal validation ────────────────────────────────────
+
+  it('test_rejects_env_override_with_path_traversal', () => {
+    insertGroup(db, 'ag-illie-codex', 'illysium-codex', 'illysium');
+    insertWorkgroup(db, 'illysium', 'ag-illie');
+
+    // An operator typo (or attacker who controls .env) sets a traversal value.
+    // Must throw rather than silently mount ~/.ssh or similar.
+    const env = { MNEMON_STORE_illysium_codex: '../../.ssh' };
+    expect(() =>
+      resolveMnemonStore(db, { id: 'ag-illie-codex', folder: 'illysium-codex' }, env),
+    ).toThrow(/not a valid store id/);
+  });
+
+  it('test_rejects_env_override_with_slash', () => {
+    insertGroup(db, 'ag-illie-codex', 'illysium-codex', 'illysium');
+    insertWorkgroup(db, 'illysium', 'ag-illie');
+
+    const env = { MNEMON_STORE_illysium_codex: 'subdir/store' };
+    expect(() =>
+      resolveMnemonStore(db, { id: 'ag-illie-codex', folder: 'illysium-codex' }, env),
+    ).toThrow(/not a valid store id/);
+  });
+
+  it('test_rejects_env_override_with_double_dot_substring', () => {
+    insertGroup(db, 'ag-illie-codex', 'illysium-codex', 'illysium');
+    insertWorkgroup(db, 'illysium', 'ag-illie');
+
+    // Even without a leading slash, a `..` substring is rejected (defense
+    // against `prefix..suffix` style attempts).
+    const env = { MNEMON_STORE_illysium_codex: 'a..b' };
+    expect(() =>
+      resolveMnemonStore(db, { id: 'ag-illie-codex', folder: 'illysium-codex' }, env),
+    ).toThrow(/not a valid store id/);
+  });
+
+  it('test_rejects_empty_env_override_falls_through_to_workgroup', () => {
+    // Empty string is falsy → falls through to workgroup lookup (not validated
+    // because we never reach the validation path).
+    insertGroup(db, 'ag-illie-codex', 'illysium-codex', 'illysium');
+    insertWorkgroup(db, 'illysium', 'ag-illie');
+
+    const env = { MNEMON_STORE_illysium_codex: '' };
+    const result = resolveMnemonStore(db, { id: 'ag-illie-codex', folder: 'illysium-codex' }, env);
+    expect(result).toBe('ag-illie'); // workgroups.mnemon_store_id wins
+  });
+
+  it('test_accepts_normal_store_ids', () => {
+    // Sanity: don't break legitimate ids.
+    insertGroup(db, 'ag-1776377699463-2axxhg', 'illysium');
+    insertWorkgroup(db, 'illysium', 'ag-1776377699463-2axxhg');
+
+    const result = resolveMnemonStore(db, { id: 'ag-1776377699463-2axxhg', folder: 'illysium' }, {});
+    expect(result).toBe('ag-1776377699463-2axxhg');
+  });
 });
 
 // ── Spawn merged-secrets tests (C3) ──────────────────────────────────────────
