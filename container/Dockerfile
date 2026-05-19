@@ -54,6 +54,7 @@ ARG MMDC_VERSION=11.14.0
 ARG GWS_VERSION=0.22.5
 ARG CODEX_VERSION=0.130.0
 ARG DBT_MCP_VERSION=1.18.0
+ARG SLACK_MCP_VERSION=1.3.0
 
 # ---- System dependencies -----------------------------------------------------
 # tini: correct PID 1 / signal forwarding so outbound.db writes finalize on
@@ -127,6 +128,22 @@ RUN python3 -m venv /opt/atlassian-venv \
     && /opt/atlassian-venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel \
     && /opt/atlassian-venv/bin/pip install --no-cache-dir "mcp-atlassian==${MCP_ATLASSIAN_VERSION}" \
     && ln -sf /opt/atlassian-venv/bin/mcp-atlassian /usr/local/bin/mcp-atlassian
+
+# korotovsky/slack-mcp-server — stdio MCP server for Slack user-token (xoxp-)
+# auth. Single Go-built binary (~16MB), published to GitHub Releases. Used by
+# agents whose container.json sets slack_user_token.enabled. Token injection
+# is at spawn time (SLACK_MCP_XOXP_TOKEN env via OneCLI vault), permission
+# gating is per-session in container-runner.ts.
+RUN ARCH=$(uname -m) \
+    && case "$ARCH" in \
+         x86_64)  SLACK_ARCH=amd64 ;; \
+         aarch64) SLACK_ARCH=arm64 ;; \
+         *)       echo "unsupported arch for slack-mcp-server: $ARCH" >&2; exit 1 ;; \
+       esac \
+    && curl -fsSL "https://github.com/korotovsky/slack-mcp-server/releases/download/v${SLACK_MCP_VERSION}/slack-mcp-server-linux-${SLACK_ARCH}" \
+       -o /usr/local/bin/slack-mcp-server \
+    && chmod +x /usr/local/bin/slack-mcp-server \
+    && /usr/local/bin/slack-mcp-server --version 2>&1 || true
 
 # dbt-labs/dbt-mcp — stdio MCP server for dbt Cloud (Discovery + Semantic Layer
 # + Admin API + dbt CLI/LSP). Requires Python >=3.12; node:22-slim (bookworm)

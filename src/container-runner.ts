@@ -430,6 +430,7 @@ async function spawnContainer(session: Session): Promise<void> {
       channelDefaultEffort,
       channelDefaultTone,
     },
+    session.messaging_group_id ?? null,
   );
 
   log.info('Spawning container', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
@@ -1803,6 +1804,7 @@ async function buildContainerArgs(
     channelDefaultEffort: string | null;
     channelDefaultTone: string | null;
   },
+  sessionMessagingGroupId?: string | null,
 ): Promise<string[]> {
   const args: string[] = ['run', '--rm', '--name', containerName, '--label', CONTAINER_INSTALL_LABEL];
   args.push(...dockerResourceLimitArgs());
@@ -2364,6 +2366,48 @@ async function buildContainerArgs(
       });
     }
   }
+  // Slack user-token (xoxp-) MCP — korotovsky/slack-mcp-server, baked into the
+  // image. Gated per-spawn: only registers if the session is the owner's 1:1
+  // DM with this agent (default) OR the session's messaging_group_id is in
+  // container.json's slack_user_token.also_allowed_in override list. Fail-
+  // closed by default so adding the agent to a team channel doesn't leak the
+  // owner's DMs through it.
+  //
+  // The token is xoxp- placeholder here; OneCLI gateway substitutes the real
+  // Bearer header for outbound slack.com calls based on the workgroup's
+  // assigned `Slack-User-Token-<Workspace>` vault secret. Gateway rules for
+  // slack.com hosts must be configured at the OneCLI side (see
+  // docs/slack-user-token.md).
+  if (containerConfig.slack_user_token?.enabled) {
+    const { canUseSlackUserToken } = await import('./modules/permissions/slack-user-token-gate.js');
+    const allowed = canUseSlackUserToken(getDb(), sessionMessagingGroupId ?? null, containerConfig.slack_user_token);
+    if (allowed) {
+      mcpServers['slack-user-token'] = {
+        type: 'stdio',
+        command: 'slack-mcp-server',
+        args: [],
+        env: {
+          SLACK_MCP_XOXP_TOKEN: 'xoxp-onecli-managed-placeholder',
+          // No caches by default — keeps startup simple. A future revision
+          // could mount a writable cache path for faster repeat lookups.
+          SLACK_MCP_USERS_CACHE: '',
+          SLACK_MCP_CHANNELS_CACHE_V2: '',
+          // Honor the container's HTTPS_PROXY so outbound slack.com calls
+          // route through OneCLI's gateway for credential substitution.
+          // Go's net/http honors HTTPS_PROXY by default, but korotovsky also
+          // accepts its own SLACK_MCP_PROXY var — set both for safety.
+          SLACK_MCP_PROXY: process.env.HTTPS_PROXY ?? '',
+        },
+      };
+    } else {
+      log.info('slack-user-token MCP gated off for this session', {
+        sessionMessagingGroupId: sessionMessagingGroupId ?? null,
+        folder: agentGroup.folder,
+        reason: sessionMessagingGroupId == null ? 'no_messaging_group' : 'not_owner_dm_and_not_in_allowlist',
+      });
+    }
+  }
+
   if (Object.keys(mcpServers).length > 0) {
     args.push('-e', `NANOCLAW_MCP_SERVERS=${JSON.stringify(mcpServers)}`);
   }

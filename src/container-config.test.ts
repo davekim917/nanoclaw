@@ -140,6 +140,42 @@ describe('RecallScope type + getRecallScope (B1)', () => {
     const result = readContainerConfig(folder);
     expect(result.workgroup_id).toBe('my-workgroup-123');
   });
+
+  it('test_slack_user_token_round_trip', () => {
+    // writeContainerConfig + readContainerConfig must preserve slack_user_token
+    // (enabled flag + override allow-list)
+    const folder = 'test-slack-user-token-roundtrip';
+    const dir = path.join(GROUPS_DIR, folder);
+    fs.mkdirSync(dir, { recursive: true });
+    const config = {
+      mcpServers: {},
+      packages: { apt: [], npm: [] },
+      additionalMounts: [],
+      skills: 'all' as const,
+      slack_user_token: {
+        enabled: true,
+        also_allowed_in: ['mg-channel-eng-leads-private'],
+      },
+    };
+    writeContainerConfig(folder, config);
+    const result = readContainerConfig(folder);
+    expect(result.slack_user_token?.enabled).toBe(true);
+    expect(result.slack_user_token?.also_allowed_in).toEqual(['mg-channel-eng-leads-private']);
+  });
+
+  it('test_slack_user_token_undefined_when_absent', () => {
+    const folder = 'test-slack-user-token-absent';
+    const dir = path.join(GROUPS_DIR, folder);
+    fs.mkdirSync(dir, { recursive: true });
+    writeContainerConfig(folder, {
+      mcpServers: {},
+      packages: { apt: [], npm: [] },
+      additionalMounts: [],
+      skills: 'all' as const,
+    });
+    const result = readContainerConfig(folder);
+    expect(result.slack_user_token).toBeUndefined();
+  });
 });
 
 describe('readContainerConfig — memory block', () => {
