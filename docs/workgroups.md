@@ -6,7 +6,7 @@ A **workgroup** is a tenant-level grouping that contains one or more `agent_grou
 - **Mnemon recall** — workgroup members read/write a single canonical mnemon store.
 - **OneCLI secret declarations** — workgroup-level secrets are inherited by all member agent_groups at container spawn time.
 
-Sibling `agent_groups` (parent + codex twin, plus future siblings like `<x>-research` or `<x>-data-analyst`) remain separate rows in the database — each has its own platform bot user, CLAUDE.md, container, and routing identity. The workgroup is the layer **above** them, not a collapse.
+Sibling `agent_groups` (e.g., a Claude twin + a Codex twin, plus future siblings like `<x>-research` or `<x>-data-analyst`) are peers — each remains a separate row in the database with its own platform bot user, CLAUDE.md, container, and routing identity. No sibling is a parent of another; the workgroup is the layer **above** them, not a collapse and not a hierarchy.
 
 ---
 
@@ -27,7 +27,7 @@ Workgroups are identified by a **folder slug** (lowercase letters, digits, hyphe
 - `workgroups.id` IS the slug.
 - `agent_groups.workgroup_id` references it.
 
-For an agent group whose own folder is `<x>` (e.g., `illysium`), the workgroup id is `<x>`. For a codex twin whose folder is `<x>-codex` (e.g., `illysium-codex`), the workgroup id is the parent's `<x>` (`illysium`).
+For an agent group whose own folder is `<x>` (e.g., `illysium`), the workgroup id is `<x>`. For a codex twin whose folder is `<x>-codex` (e.g., `illysium-codex`), the workgroup id is the base slug `<x>` (`illysium`) — the same workgroup the Claude twin belongs to. They are siblings sharing one workgroup, not parent/child.
 
 A `CHECK` constraint on `workgroups.id` rejects values matching the opaque `agent_groups.id` shape (`ag-<ts>-<rand>`) — this prevents future code from accidentally conflating the two ID namespaces.
 
@@ -45,8 +45,8 @@ When `container.json.workgroup_id` is omitted, the workgroup defaults to the age
 
 The migration backfills `workgroup_id` for existing agent_groups via a suffix-strip heuristic:
 
-- For each row whose `folder` ends with `-codex`: strip the `-codex` suffix; if a row exists with that base folder, set both rows' `workgroup_id` to the base folder (paired).
-- Orphan codex twins (no matching parent) get `workgroup_id = own folder` and are flagged in the backfill report under `suffix_strip_unmatched`.
+- For each row whose `folder` ends with `-codex`: strip the `-codex` suffix; if a sibling row exists with that base folder, set both rows' `workgroup_id` to the base folder (paired).
+- Orphan codex twins (no matching base-slug sibling) get `workgroup_id = own folder` and are flagged in the backfill report under `suffix_strip_unmatched`.
 - All other rows get `workgroup_id = own folder` (standalone).
 
 The backfill report is written to `logs/migration-036.log` for operator inspection.
@@ -64,7 +64,7 @@ The per-agent projection (built by the host at every container spawn) widens **o
 | `messages_archive` | **Yes** — workgroup-wide projection | Siblings share chat history (Requirement R2) |
 | `backlog_items` | No (agent-scoped) | Each agent has its own todo list |
 | `ship_log` | No (agent-scoped) | Each agent's commits are its own activity |
-| `tasks` | No (filtered by `parent_agent_group_id`) | Dispatch ownership is per-agent |
+| `tasks` | No (filtered by `parent_agent_group_id` — schema column name; refers to the orchestrating agent) | Dispatch ownership is per-agent |
 | `agent_group_capabilities` | No (agent-scoped) | Orchestrator role is per-agent — pooling would silently widen capability |
 
 The structural test at `tests/structural/projection-chokepoint.test.ts` enforces this invariant: any future MCP tool query against `messages_archive` must go through the projection's chokepoint, and the agent-scoped tables retain their in-container `WHERE agent_group_id = ?` filters.
@@ -86,7 +86,9 @@ When sibling agents are wired to the same chat channel, each agent's adapter wri
 
 Every workgroup has exactly one canonical mnemon store, identified by `workgroups.mnemon_store_id`.
 
-For Dave's install (and any other install with pre-existing mnemon stores), migration 036 backfills `mnemon_store_id` to the **parent agent_group's existing `agent_groups.id`** — e.g., the `illysium` workgroup's `mnemon_store_id` is set to `ag-1776377699463-2axxhg` (illie's existing store path). This preserves 43MB+ of accumulated recall history without a separate filesystem migration.
+For Dave's install (and any other install with pre-existing mnemon stores), migration 036 backfills `mnemon_store_id` to the **seed sibling's existing `agent_groups.id`** — the sibling whose folder matches the workgroup id, since that's where the populated mnemon store lives on disk. E.g., the `illysium` workgroup's `mnemon_store_id` is set to `ag-1776377699463-2axxhg` (illie's existing store path). This preserves 43MB+ of accumulated recall history without a separate filesystem migration.
+
+The "seed sibling" is a path-selection convention, not a hierarchy. If the seed sibling is deleted later, the store keeps living at the same path on disk and the remaining siblings keep using it via `workgroups.mnemon_store_id`. Workgroup members are peers; no sibling is a parent of another.
 
 At container spawn, the host sets `MNEMON_STORE=<workgroups.mnemon_store_id>` on the agent. Precedence (highest first):
 

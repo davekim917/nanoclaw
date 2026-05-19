@@ -37,11 +37,7 @@ function seedBaseSchema(db: Database.Database) {
 }
 
 /** Minimal agent_groups row — only required fields. */
-function insertGroup(
-  db: Database.Database,
-  id: string,
-  folder: string,
-) {
+function insertGroup(db: Database.Database, id: string, folder: string) {
   db.prepare(
     `INSERT INTO agent_groups (id, name, folder, created_at)
      VALUES (?, ?, ?, ?)`,
@@ -50,16 +46,16 @@ function insertGroup(
 
 /** The 10 known sibling pairs from Dave's install. */
 const KNOWN_PAIRS: Array<{ folder: string; id: string; codexId: string }> = [
-  { folder: 'axie-dev',      id: 'ag-1776735605480-ymhokes', codexId: 'axie-dev-codex'      },
-  { folder: 'axis-labs',     id: 'ag-1776735605480-gg0aix7', codexId: 'axis-labs-codex'     },
-  { folder: 'dirt-market',   id: 'ag-1776735605480-6q2c9zu', codexId: 'dirt-market-codex'   },
-  { folder: 'illysium',      id: 'ag-1776377699463-2axxhg',  codexId: 'illysium-codex'      },
-  { folder: 'madison-reed',  id: 'ag-1776735605480-vosgej2', codexId: 'madison-reed-codex'  },
-  { folder: 'main',          id: 'ag-1776402507183-cf39lq',  codexId: 'main-codex'          },
+  { folder: 'axie-dev', id: 'ag-1776735605480-ymhokes', codexId: 'axie-dev-codex' },
+  { folder: 'axis-labs', id: 'ag-1776735605480-gg0aix7', codexId: 'axis-labs-codex' },
+  { folder: 'dirt-market', id: 'ag-1776735605480-6q2c9zu', codexId: 'dirt-market-codex' },
+  { folder: 'illysium', id: 'ag-1776377699463-2axxhg', codexId: 'illysium-codex' },
+  { folder: 'madison-reed', id: 'ag-1776735605480-vosgej2', codexId: 'madison-reed-codex' },
+  { folder: 'main', id: 'ag-1776402507183-cf39lq', codexId: 'main-codex' },
   { folder: 'number-drinks', id: 'ag-1776735605479-6p0461m', codexId: 'number-drinks-codex' },
-  { folder: 'sunday',        id: 'ag-1776735605480-sunday',  codexId: 'sunday-codex'        },
-  { folder: 'video-agent',   id: 'ag-1776735605480-5htprgz', codexId: 'video-agent-codex'   },
-  { folder: 'xerus',         id: 'ag-1776735605480-y23k2jv', codexId: 'xerus-codex'         },
+  { folder: 'sunday', id: 'ag-1776735605480-sunday', codexId: 'sunday-codex' },
+  { folder: 'video-agent', id: 'ag-1776735605480-5htprgz', codexId: 'video-agent-codex' },
+  { folder: 'xerus', id: 'ag-1776735605480-y23k2jv', codexId: 'xerus-codex' },
 ];
 
 // ── tests ────────────────────────────────────────────────────────────────────
@@ -78,9 +74,11 @@ describe('migration036 — workgroup-id', () => {
     migration036.up(db);
 
     // Table exists
-    const tableInfo = db
-      .prepare(`PRAGMA table_info(workgroups)`)
-      .all() as Array<{ name: string; notnull: number; dflt_value: string | null }>;
+    const tableInfo = db.prepare(`PRAGMA table_info(workgroups)`).all() as Array<{
+      name: string;
+      notnull: number;
+      dflt_value: string | null;
+    }>;
     const colNames = tableInfo.map((c) => c.name);
     expect(colNames).toContain('id');
     expect(colNames).toContain('display_name');
@@ -95,15 +93,11 @@ describe('migration036 — workgroup-id', () => {
     expect(secretsCol.dflt_value).toBe("'[]'");
 
     // agent_groups has workgroup_id column
-    const agColInfo = db
-      .prepare(`PRAGMA table_info(agent_groups)`)
-      .all() as Array<{ name: string }>;
+    const agColInfo = db.prepare(`PRAGMA table_info(agent_groups)`).all() as Array<{ name: string }>;
     expect(agColInfo.map((c) => c.name)).toContain('workgroup_id');
 
     // Index exists
-    const indices = db
-      .prepare(`PRAGMA index_list(agent_groups)`)
-      .all() as Array<{ name: string }>;
+    const indices = db.prepare(`PRAGMA index_list(agent_groups)`).all() as Array<{ name: string }>;
     expect(indices.map((i) => i.name)).toContain('idx_agent_groups_workgroup_id');
   });
 
@@ -125,42 +119,38 @@ describe('migration036 — workgroup-id', () => {
 
     // All 10 parent folders are workgroups
     for (const p of KNOWN_PAIRS) {
-      const wg = db
-        .prepare(`SELECT id FROM workgroups WHERE id = ?`)
-        .get(p.folder) as { id: string } | undefined;
+      const wg = db.prepare(`SELECT id FROM workgroups WHERE id = ?`).get(p.folder) as { id: string } | undefined;
       expect(wg, `workgroup for ${p.folder} should exist`).toBeDefined();
     }
 
     // Each codex twin maps to parent's workgroup
     for (const p of KNOWN_PAIRS) {
-      const ag = db
-        .prepare(`SELECT workgroup_id FROM agent_groups WHERE id = ?`)
-        .get(p.codexId) as { workgroup_id: string } | undefined;
+      const ag = db.prepare(`SELECT workgroup_id FROM agent_groups WHERE id = ?`).get(p.codexId) as
+        | { workgroup_id: string }
+        | undefined;
       expect(ag?.workgroup_id, `${p.codexId} workgroup_id should equal parent folder`).toBe(p.folder);
     }
 
     // illysium workgroup mnemon_store_id = parent agent_groups.id
-    const illysiumWg = db
-      .prepare(`SELECT mnemon_store_id FROM workgroups WHERE id = 'illysium'`)
-      .get() as { mnemon_store_id: string } | undefined;
+    const illysiumWg = db.prepare(`SELECT mnemon_store_id FROM workgroups WHERE id = 'illysium'`).get() as
+      | { mnemon_store_id: string }
+      | undefined;
     expect(illysiumWg?.mnemon_store_id).toBe('ag-1776377699463-2axxhg');
 
     // Standalones are their own workgroup
-    const saA = db
-      .prepare(`SELECT workgroup_id FROM agent_groups WHERE folder = 'standalone-a'`)
-      .get() as { workgroup_id: string } | undefined;
+    const saA = db.prepare(`SELECT workgroup_id FROM agent_groups WHERE folder = 'standalone-a'`).get() as
+      | { workgroup_id: string }
+      | undefined;
     expect(saA?.workgroup_id).toBe('standalone-a');
 
     // orphan-codex is its own workgroup (suffix_strip_unmatched)
-    const orphan = db
-      .prepare(`SELECT workgroup_id FROM agent_groups WHERE folder = 'orphan-codex'`)
-      .get() as { workgroup_id: string } | undefined;
+    const orphan = db.prepare(`SELECT workgroup_id FROM agent_groups WHERE folder = 'orphan-codex'`).get() as
+      | { workgroup_id: string }
+      | undefined;
     expect(orphan?.workgroup_id).toBe('orphan-codex');
 
     // Verify report table exists and has pairings
-    const reportRow = db
-      .prepare(`SELECT report FROM _migration036_report`)
-      .get() as { report: string } | undefined;
+    const reportRow = db.prepare(`SELECT report FROM _migration036_report`).get() as { report: string } | undefined;
     expect(reportRow).toBeDefined();
     const report = JSON.parse(reportRow!.report) as {
       pairings: Array<{ child: string; parent: string }>;
@@ -186,9 +176,7 @@ describe('migration036 — workgroup-id', () => {
 
     migration036.up(db);
 
-    const reportRow = db
-      .prepare(`SELECT report FROM _migration036_report`)
-      .get() as { report: string } | undefined;
+    const reportRow = db.prepare(`SELECT report FROM _migration036_report`).get() as { report: string } | undefined;
     const report = JSON.parse(reportRow!.report) as {
       standalone: string[];
       suffix_strip_unmatched: string[];
@@ -200,9 +188,9 @@ describe('migration036 — workgroup-id', () => {
     expect(report.standalone).not.toContain('lone-codex');
 
     // workgroup_id should be 'lone-codex' (own folder, since it's orphan)
-    const ag = db
-      .prepare(`SELECT workgroup_id FROM agent_groups WHERE id = 'lone-codex-id'`)
-      .get() as { workgroup_id: string } | undefined;
+    const ag = db.prepare(`SELECT workgroup_id FROM agent_groups WHERE id = 'lone-codex-id'`).get() as
+      | { workgroup_id: string }
+      | undefined;
     expect(ag?.workgroup_id).toBe('lone-codex');
   });
 
@@ -285,7 +273,9 @@ describe('migration036 — workgroup-id', () => {
     // workgroup_id is null (column added but not updated)
 
     const nullRows = db4
-      .prepare(`SELECT id FROM agent_groups WHERE workgroup_id IS NULL OR workgroup_id NOT IN (SELECT id FROM workgroups)`)
+      .prepare(
+        `SELECT id FROM agent_groups WHERE workgroup_id IS NULL OR workgroup_id NOT IN (SELECT id FROM workgroups)`,
+      )
       .all();
     expect(nullRows.length).toBeGreaterThan(0); // validation query would catch this
 
@@ -296,9 +286,7 @@ describe('migration036 — workgroup-id', () => {
     insertGroup(db5, 'ag-valid', 'valid-group');
     expect(() => migration036.up(db5)).not.toThrow();
 
-    const result = db5
-      .prepare(`SELECT id FROM agent_groups WHERE workgroup_id IS NULL`)
-      .all();
+    const result = db5.prepare(`SELECT id FROM agent_groups WHERE workgroup_id IS NULL`).all();
     expect(result).toHaveLength(0); // no nulls after successful migration
   });
 

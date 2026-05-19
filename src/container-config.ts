@@ -58,9 +58,10 @@ export interface AdditionalMountConfig {
  * Recall scope for agent memory. Controls which mnemon stores are queried
  * during recall injection.
  *
- * - 'self'      — only the calling agent's own store (default)
+ * - 'self'       — only the calling agent's own store
  * - 'all-groups' — all memory-enabled groups in GROUPS_DIR
- * - 'workgroup'  — the shared store for this agent's workgroup
+ * - 'workgroup'  — the shared store for this agent's workgroup (default)
+ *                  Standalone agents (no workgroup_id) fall back to 'self'.
  * - string[]    — explicit list of group folder names to include
  */
 export type RecallScope = 'self' | 'all-groups' | 'workgroup' | string[];
@@ -82,7 +83,7 @@ export function getQueryStrategy(cfg: MemoryConfig | undefined): 'raw' | 'heuris
 }
 
 export function getRecallScope(cfg: MemoryConfig | undefined): RecallScope {
-  return cfg?.recall_scope ?? 'self';
+  return cfg?.recall_scope ?? 'workgroup';
 }
 
 export interface ContainerConfig {

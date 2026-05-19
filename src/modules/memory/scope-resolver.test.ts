@@ -70,9 +70,10 @@ function makeWorkgroupDb(
   }
 
   for (const [wgId, storeId] of wgMap) {
-    db.prepare(
-      `INSERT INTO workgroups (id, mnemon_store_id, created_at) VALUES (?, ?, '2026-01-01')`,
-    ).run(wgId, storeId);
+    db.prepare(`INSERT INTO workgroups (id, mnemon_store_id, created_at) VALUES (?, ?, '2026-01-01')`).run(
+      wgId,
+      storeId,
+    );
   }
 
   for (const f of fixtures) {
@@ -185,8 +186,12 @@ describe('resolveRecallScope', () => {
 
   // ── B2: workgroup mode + new exports ───────────────────────────────────────
 
-  it('test_workgroup_mode_returns_single_store_id', () => {
-    // illie + illie-codex share workgroup "illie", mnemon_store_id = ag-illie-parent
+  it('test_workgroup_mode_returns_caller_and_canonical_stores', () => {
+    // illie + illie-codex share workgroup "illie", mnemon_store_id = ag-illie-parent.
+    // Codex P2 catch on PR #107: include caller's own store so historical facts
+    // (written before the default flip, when env override was broken pre-#105) remain
+    // reachable. Recall fans out across both; self-heals as new writes accumulate
+    // in the canonical store.
     centralDb = makeWorkgroupDb([
       { agId: 'ag-illie-parent', folder: 'illie', workgroupId: 'illie', mnemonStoreId: 'ag-illie-parent' },
       { agId: 'ag-illie-codex', folder: 'illie-codex', workgroupId: 'illie', mnemonStoreId: 'ag-illie-parent' },
@@ -195,13 +200,63 @@ describe('resolveRecallScope', () => {
 
     const result = resolveRecallScope('ag-illie-codex', 'workgroup');
 
-    // Should return a single-element array containing the shared store id
+    // Caller first, then canonical
+    expect(result).toEqual(['ag-illie-codex', 'ag-illie-parent']);
+  });
+
+  it('test_string_array_canonicalizes_workgroup_targets', () => {
+    // Codex P2 catch on PR #107: when a folder target is part of a workgroup,
+    // string[] mode must resolve through the workgroup canonical store_id —
+    // writes have been redirected there, so targeted reads must follow.
+    centralDb = makeWorkgroupDb([
+      { agId: 'ag-illie-parent', folder: 'illie', workgroupId: 'illie', mnemonStoreId: 'ag-illie-parent' },
+      { agId: 'ag-illie-codex', folder: 'illie-codex', workgroupId: 'illie', mnemonStoreId: 'ag-illie-parent' },
+    ]);
+    setCentralDbForTest(centralDb);
+
+    // Set up the FS-side resolution for folder name → agent_group_id
+    tmpDir = makeTempGroupsDir([{ folder: 'illie-codex', agentGroupId: 'ag-illie-codex', memoryEnabled: true }]);
+    setGroupsDirForTest(tmpDir);
+
+    // A different calling group targets illie-codex by folder
+    const result = resolveRecallScope('ag-caller', ['illie-codex']);
+
+    // illie-codex's writes are redirected to canonical (ag-illie-parent), so
+    // a folder target of 'illie-codex' must canonicalize to ag-illie-parent,
+    // not the sibling's own (now-stale) store id.
+    expect(result).toContain('ag-illie-parent');
+    expect(result).not.toContain('ag-illie-codex');
+  });
+
+  it('test_string_array_unchanged_for_non_workgroup_folder', () => {
+    // Folders outside any workgroup resolve to their own agent_group_id as before.
+    centralDb = makeWorkgroupDb([]);
+    setCentralDbForTest(centralDb);
+
+    tmpDir = makeTempGroupsDir([{ folder: 'standalone', agentGroupId: 'ag-standalone', memoryEnabled: true }]);
+    setGroupsDirForTest(tmpDir);
+
+    const result = resolveRecallScope('ag-caller', ['standalone']);
+    expect(result).toContain('ag-standalone'); // own id preserved
+  });
+
+  it('test_workgroup_mode_seed_sibling_returns_single_store', () => {
+    // Calling group IS the seed sibling → canonical == caller, so dedup to single store.
+    centralDb = makeWorkgroupDb([
+      { agId: 'ag-illie-parent', folder: 'illie', workgroupId: 'illie', mnemonStoreId: 'ag-illie-parent' },
+      { agId: 'ag-illie-codex', folder: 'illie-codex', workgroupId: 'illie', mnemonStoreId: 'ag-illie-parent' },
+    ]);
+    setCentralDbForTest(centralDb);
+
+    const result = resolveRecallScope('ag-illie-parent', 'workgroup');
     expect(result).toEqual(['ag-illie-parent']);
   });
 
   it('test_workgroup_of_1_equivalent_to_self', () => {
     // Standalone agent — workgroup has only 1 member; should return [ownId]
-    centralDb = makeWorkgroupDb([{ agId: 'ag-standalone', folder: 'standalone', workgroupId: 'standalone', mnemonStoreId: 'ag-standalone' }]);
+    centralDb = makeWorkgroupDb([
+      { agId: 'ag-standalone', folder: 'standalone', workgroupId: 'standalone', mnemonStoreId: 'ag-standalone' },
+    ]);
     setCentralDbForTest(centralDb);
 
     const result = resolveRecallScope('ag-standalone', 'workgroup');
@@ -254,6 +309,42 @@ describe('resolveRecallScope', () => {
 
     const storeId = resolveWorkgroupStoreId('ag-codex');
     expect(storeId).toBe('ag-parent');
+  });
+
+  it('test_resolveWorkgroupStoreId_returns_null_for_standalone_agent', () => {
+    // Agent exists but has no workgroup_id — represents a standalone agent
+    // not yet wired into a workgroup. Must NOT throw; callers handle null.
+    centralDb = makeWorkgroupDb([]);
+    centralDb
+      .prepare(
+        `INSERT INTO agent_groups (id, name, folder, workgroup_id, created_at) VALUES (?, ?, ?, NULL, '2026-01-01')`,
+      )
+      .run('ag-standalone', 'standalone', 'standalone');
+    setCentralDbForTest(centralDb);
+
+    expect(resolveWorkgroupStoreId('ag-standalone')).toBeNull();
+  });
+
+  it('test_resolveWorkgroupStoreId_returns_null_for_unknown_agent', () => {
+    centralDb = makeWorkgroupDb([]);
+    setCentralDbForTest(centralDb);
+
+    expect(resolveWorkgroupStoreId('ag-does-not-exist')).toBeNull();
+  });
+
+  it('test_workgroup_scope_falls_back_to_self_for_standalone_agent', () => {
+    // 'workgroup' is the default scope — standalone agents (no workgroup_id)
+    // must silently fall back to their own store rather than throw.
+    centralDb = makeWorkgroupDb([]);
+    centralDb
+      .prepare(
+        `INSERT INTO agent_groups (id, name, folder, workgroup_id, created_at) VALUES (?, ?, ?, NULL, '2026-01-01')`,
+      )
+      .run('ag-standalone', 'standalone', 'standalone');
+    setCentralDbForTest(centralDb);
+
+    const result = resolveRecallScope('ag-standalone', 'workgroup');
+    expect(result).toEqual(['ag-standalone']);
   });
 
   it('test_assertNever_catches_future_scope', () => {

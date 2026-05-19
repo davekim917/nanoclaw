@@ -98,32 +98,45 @@ function openCentralDb(): { db: Database.Database; owned: boolean } {
 /**
  * Resolve the shared mnemon_store_id for callingGroupId's workgroup.
  * Returns the storeId (a single agent_groups.id) that is the canonical
- * mnemon store for the workgroup. Used by 'workgroup' scope mode.
+ * mnemon store for the workgroup.
+ *
+ * Returns null for standalone agents (no workgroup_id) — callers must
+ * decide how to handle that case. 'workgroup' recall mode falls back
+ * to 'self'; mnemon write redirection falls back to writing to the
+ * agent's own store.
  */
-export function resolveWorkgroupStoreId(callingGroupId: string): string {
-  const { db, owned } = openCentralDb();
+export function resolveWorkgroupStoreId(callingGroupId: string): string | null {
+  let opened: { db: Database.Database; owned: boolean };
   try {
-    const agRow = db
-      .prepare(`SELECT workgroup_id FROM agent_groups WHERE id = ? LIMIT 1`)
-      .get(callingGroupId) as { workgroup_id: string | null } | undefined;
+    opened = openCentralDb();
+  } catch {
+    // Central DB unavailable (fresh install, test scaffold without override,
+    // permission error). Treat as "no workgroup info" — callers will fall back.
+    return null;
+  }
+  const { db, owned } = opened;
+  try {
+    const agRow = db.prepare(`SELECT workgroup_id FROM agent_groups WHERE id = ? LIMIT 1`).get(callingGroupId) as
+      | { workgroup_id: string | null }
+      | undefined;
 
     if (!agRow || agRow.workgroup_id == null) {
-      throw new Error(
-        `[scope-resolver] workgroup mode: agent_group ${callingGroupId} has no workgroup_id in central DB`,
-      );
+      return null;
     }
 
-    const wgRow = db
-      .prepare(`SELECT mnemon_store_id FROM workgroups WHERE id = ? LIMIT 1`)
-      .get(agRow.workgroup_id) as { mnemon_store_id: string | null } | undefined;
+    const wgRow = db.prepare(`SELECT mnemon_store_id FROM workgroups WHERE id = ? LIMIT 1`).get(agRow.workgroup_id) as
+      | { mnemon_store_id: string | null }
+      | undefined;
 
     if (!wgRow || wgRow.mnemon_store_id == null) {
-      throw new Error(
-        `[scope-resolver] workgroup mode: workgroup ${agRow.workgroup_id} has no mnemon_store_id`,
-      );
+      return null;
     }
 
     return wgRow.mnemon_store_id;
+  } catch {
+    // Schema mismatch or query error (e.g., workgroups table absent on a
+    // pre-migration DB). Fall back to "no workgroup info".
+    return null;
   } finally {
     if (owned) db.close();
   }
@@ -134,25 +147,33 @@ export function resolveWorkgroupStoreId(callingGroupId: string): string {
  * callingGroupId, with callingGroupId first (guaranteed by spec).
  */
 export function resolveWorkgroupMembers(callingGroupId: string): string[] {
-  const { db, owned } = openCentralDb();
+  let opened: { db: Database.Database; owned: boolean };
   try {
-    const agRow = db
-      .prepare(`SELECT workgroup_id FROM agent_groups WHERE id = ? LIMIT 1`)
-      .get(callingGroupId) as { workgroup_id: string | null } | undefined;
+    opened = openCentralDb();
+  } catch {
+    return [callingGroupId];
+  }
+  const { db, owned } = opened;
+  try {
+    const agRow = db.prepare(`SELECT workgroup_id FROM agent_groups WHERE id = ? LIMIT 1`).get(callingGroupId) as
+      | { workgroup_id: string | null }
+      | undefined;
 
     if (!agRow || agRow.workgroup_id == null) {
       // Standalone / unmatched: treat as single-member group
       return [callingGroupId];
     }
 
-    const members = db
-      .prepare(`SELECT id FROM agent_groups WHERE workgroup_id = ?`)
-      .all(agRow.workgroup_id) as Array<{ id: string }>;
+    const members = db.prepare(`SELECT id FROM agent_groups WHERE workgroup_id = ?`).all(agRow.workgroup_id) as Array<{
+      id: string;
+    }>;
 
     const memberIds = members.map((r) => r.id);
     // calling group first, then others
     const set = new Set([callingGroupId, ...memberIds]);
     return Array.from(set);
+  } catch {
+    return [callingGroupId];
   } finally {
     if (owned) db.close();
   }
@@ -169,10 +190,22 @@ export function resolveRecallScope(callingGroupId: string, scope: RecallScope): 
   }
 
   if (scope === 'workgroup') {
-    // Return a single-element array containing the shared mnemon store id.
-    // This engages the fast path in mnemon-impl (groupIds.length <= 1).
+    // Return [callingGroupId, canonicalStoreId] deduped — workgroup-canonical
+    // FIRST when calling group is NOT the seed, calling group only when it is.
+    //
+    // Including the caller's own store preserves historical facts written
+    // before the workgroup default applied (e.g., non-seed siblings whose
+    // env override was silently broken pre-PR#105 wrote to their own per-agent
+    // store). Without this, the new default would orphan those facts on first
+    // spawn after deploy. Self-heals over time as new writes accumulate in
+    // the canonical store. (Codex P2 catch on PR #107.)
+    //
+    // Standalone agents (no workgroup_id) silently fall back to caller-only.
     const storeId = resolveWorkgroupStoreId(callingGroupId);
-    return [storeId];
+    if (storeId == null || storeId === callingGroupId) {
+      return [callingGroupId];
+    }
+    return [callingGroupId, storeId];
   }
 
   const key = cacheKey(callingGroupId, scope);
@@ -189,11 +222,20 @@ export function resolveRecallScope(callingGroupId: string, scope: RecallScope): 
     const set = new Set([callingGroupId, ...all]);
     groupIds = Array.from(set);
   } else if (Array.isArray(scope)) {
-    // string[] — folder names to resolve
+    // string[] — folder names to resolve.
+    //
+    // Targets that belong to a workgroup are CANONICALIZED through their
+    // workgroup's mnemon_store_id. Writes from any sibling in that workgroup
+    // are redirected to the canonical store, so a folder-targeted read must
+    // follow the same mapping or it would see stale per-sibling history and
+    // miss the new redirected facts. Folders outside any workgroup resolve
+    // to their own agent_group_id as before. (Codex P2 catch on PR #107.)
     const resolved: string[] = [];
     for (const folder of scope) {
       const id = getFolderGroupId(folder);
-      if (id) resolved.push(id);
+      if (!id) continue;
+      const canonical = resolveWorkgroupStoreId(id);
+      resolved.push(canonical ?? id);
     }
     // Deduplicate and ensure callingGroupId is first
     const set = new Set([callingGroupId, ...resolved]);
