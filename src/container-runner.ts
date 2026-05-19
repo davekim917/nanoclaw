@@ -2058,6 +2058,21 @@ async function buildContainerArgs(
           `Pick one: drop ANTHROPIC_BASE_URL (run through OneCLI) or remove onecliSecrets from container.json.`,
       );
     }
+    if (containerConfig.slack_user_token?.enabled) {
+      // Same class of misconfiguration: Slack user-token MCP relies on the
+      // OneCLI gateway substituting the placeholder Bearer header for
+      // outbound slack.com calls. In the ANTHROPIC_BASE_URL bypass path
+      // the gateway is OFF, so the placeholder xoxp- value reaches Slack
+      // unchanged and every API call 401s. Fail-closed at spawn rather
+      // than ship a session whose Slack tools all silently fail.
+      // (Codex P2 catch on PR #108.)
+      throw new Error(
+        `container.json declares slack_user_token.enabled but ANTHROPIC_BASE_URL is set — ` +
+          `OneCLI gateway is bypassed in this path, so the Slack MCP's Bearer-header substitution ` +
+          `cannot fire and outbound slack.com calls would 401. ` +
+          `Pick one: drop ANTHROPIC_BASE_URL (run through OneCLI) or remove slack_user_token from container.json.`,
+      );
+    }
   } else {
     if (agentIdentifier) {
       await onecli.ensureAgent({ name: agentGroup.name, identifier: agentIdentifier });
@@ -2408,6 +2423,13 @@ async function buildContainerArgs(
         },
       };
     } else {
+      // Codex P2 catch on PR #108: a static `slack-user-token` entry already
+      // present in container.json.mcpServers seeds the map BEFORE this gate
+      // runs. Logging alone would leave that pre-declared entry intact and
+      // the agent would still receive the Slack MCP in a denied session.
+      // Explicit delete = the gate is authoritative regardless of how the
+      // entry got there.
+      delete mcpServers['slack-user-token'];
       log.info('slack-user-token MCP gated off for this session', {
         sessionMessagingGroupId: sessionMessagingGroupId ?? null,
         folder: agentGroup.folder,

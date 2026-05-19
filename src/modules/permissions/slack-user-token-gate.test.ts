@@ -168,4 +168,28 @@ describe('canUseSlackUserToken — permission gate', () => {
     `);
     expect(canUseSlackUserToken(db, 'mg-scoped-dm', { enabled: true })).toBe(false);
   });
+
+  it('test_override_works_when_user_dms_cache_cold', () => {
+    // Codex P2 catch on PR #108: user_dms is populated lazily and a first-
+    // time DM may not yet have a row. The default gate denies in that
+    // case (correct fail-closed), but the explicit also_allowed_in
+    // override MUST still work — it doesn't depend on user_dms at all.
+    //
+    // Note: the prewarm fix lives in router.ts (it now populates user_dms
+    // on inbound DMs from a known user). This test pins the gate's
+    // contract: an override allow-list entry succeeds regardless of cache
+    // state, so even if the prewarm regresses or the operator is testing
+    // before any inbound has flowed, the override is dependable.
+    const freshDb = makeDb();
+    freshDb.exec(`
+      INSERT INTO messaging_groups (id, channel_type, platform_id, name, is_group, created_at)
+        VALUES ('mg-cold-channel', 'slack', 'C-COLD', '#cold-channel', 1, '2026-01-01');
+    `);
+    expect(
+      canUseSlackUserToken(freshDb, 'mg-cold-channel', {
+        enabled: true,
+        also_allowed_in: ['mg-cold-channel'],
+      }),
+    ).toBe(true);
+  });
 });

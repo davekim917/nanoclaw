@@ -501,6 +501,30 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
   //    Without the module, userId is null — downstream tolerates it.
   const userId: string | null = senderResolver ? senderResolver(event) : null;
 
+  // 2a. Eagerly populate the user_dms cache for inbound 1:1 DMs. The cache
+  //     was historically only written lazily by ensureUserDm() on the
+  //     outbound-DM path (approvals, DMs we initiate), which meant
+  //     features depending on "is this messaging_group the user's DM?"
+  //     (Slack user-token gate, future per-user DM features) would
+  //     incorrectly deny on a first-time inbound DM until something else
+  //     prewarmed the cache. Writing here makes the cache reliable.
+  //     (Codex P2 catch on PR #108.)
+  if (userId !== null && mg.is_group === 0) {
+    try {
+      const { upsertUserDm } = await import('./modules/permissions/db/user-dms.js');
+      upsertUserDm({
+        user_id: userId,
+        channel_type: mg.channel_type,
+        messaging_group_id: mg.id,
+        resolved_at: new Date().toISOString(),
+      });
+    } catch (err) {
+      // Permissions module not installed — downstream features that depend
+      // on this cache will just see no row. Non-fatal.
+      log.debug('router: skipped user_dms upsert (permissions module unavailable)', { err: String(err) });
+    }
+  }
+
   // 2b. Pre-fan-out intercept gate: runs ONCE per inbound, before agents
   //     are resolved. Handles /dashboard-token and other INTERCEPT_COMMANDS.
   //     FILTERED commands are dropped. Unknown/ADMIN commands fall through.
