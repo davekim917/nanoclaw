@@ -315,13 +315,12 @@ describe('MnemonStore fan-out (D3)', () => {
     expect(mockSpawn).toHaveBeenCalledTimes(1);
   });
 
-  it('test_workgroup_fast_path_uses_resolved_store_not_calling_group', async () => {
-    // Codex P1 catch on PR #107: with the new default recall_scope='workgroup',
-    // resolveRecallScope returns a single-element array containing the workgroup
-    // canonical store id (the seed sibling's id, often DIFFERENT from the calling
-    // group). The single-store fast path MUST use that resolved id, not the
-    // raw agentGroupId — otherwise codex twins recall from their own empty store
-    // while env/mounts correctly point at the shared store.
+  it('test_workgroup_mode_fans_out_across_caller_and_canonical', async () => {
+    // Codex P2 catch on PR #107 (follow-up to original P1): non-seed siblings
+    // recall from BOTH their own store (preserves historical facts) AND the
+    // workgroup canonical (new redirected writes). Two spawn calls, one per
+    // store, RRF-merged. The earlier "fast path uses resolved store" assertion
+    // is preserved by the dedup branch when caller IS the seed.
     const wgDb = new Database(':memory:');
     wgDb.exec(`
       CREATE TABLE workgroups (
@@ -348,19 +347,68 @@ describe('MnemonStore fan-out (D3)', () => {
 
     try {
       const store = new MnemonStore({ enabled: true, recall_scope: 'workgroup' });
+      // Two children for the two stores; both return non-empty results.
+      mockSpawn.mockImplementation(
+        () =>
+          makeChildMock({ stdout: makeRecallResult([{ id: 'f1', content: 'c1' }]) }) as unknown as ReturnType<
+            typeof spawn
+          >,
+      );
+
+      // Codex twin recalls — should hit BOTH its own store (historical) AND seed (canonical)
+      await store.recall('ag-illie-codex', 'test query');
+
+      expect(mockSpawn).toHaveBeenCalledTimes(2);
+      // Collect --store arg from each spawn call
+      const storeIds = mockSpawn.mock.calls.map((call) => {
+        const args = call[1] as string[];
+        const idx = args.indexOf('--store');
+        return idx >= 0 ? args[idx + 1] : null;
+      });
+      expect(storeIds.sort()).toEqual(['ag-illie', 'ag-illie-codex'].sort());
+    } finally {
+      setCentralDbForTest(null);
+      wgDb.close();
+    }
+  });
+
+  it('test_workgroup_mode_seed_sibling_uses_single_store_fast_path', async () => {
+    // When the caller IS the seed sibling, canonical == caller → dedup to one
+    // store → fast path (single spawn).
+    const wgDb = new Database(':memory:');
+    wgDb.exec(`
+      CREATE TABLE workgroups (
+        id              TEXT PRIMARY KEY,
+        display_name    TEXT,
+        onecli_secrets  TEXT NOT NULL DEFAULT '[]',
+        mnemon_store_id TEXT,
+        created_at      TEXT NOT NULL,
+        updated_at      TEXT
+      );
+      CREATE TABLE agent_groups (
+        id           TEXT PRIMARY KEY,
+        name         TEXT NOT NULL,
+        folder       TEXT NOT NULL UNIQUE,
+        workgroup_id TEXT REFERENCES workgroups(id),
+        created_at   TEXT NOT NULL
+      );
+      INSERT INTO workgroups (id, mnemon_store_id, created_at) VALUES ('illie', 'ag-illie', '2026-01-01');
+      INSERT INTO agent_groups (id, name, folder, workgroup_id, created_at)
+        VALUES ('ag-illie', 'illie', 'illie', 'illie', '2026-01-01');
+    `);
+    setCentralDbForTest(wgDb);
+
+    try {
+      const store = new MnemonStore({ enabled: true, recall_scope: 'workgroup' });
       const child = makeChildMock({ stdout: makeRecallResult([{ id: 'f1', content: 'c1' }]) });
       mockSpawn.mockReturnValue(child as unknown as ReturnType<typeof spawn>);
 
-      // Codex twin recalls — should hit the SEED sibling's store, not its own
-      await store.recall('ag-illie-codex', 'test query');
+      await store.recall('ag-illie', 'test query');
 
       expect(mockSpawn).toHaveBeenCalledTimes(1);
       const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
-      // mnemon CLI args: ['recall', query, '--store', <storeId>, '--limit', N]
       const storeFlagIdx = spawnArgs.indexOf('--store');
-      expect(storeFlagIdx).toBeGreaterThanOrEqual(0);
-      expect(spawnArgs[storeFlagIdx + 1]).toBe('ag-illie'); // resolved seed sibling
-      expect(spawnArgs[storeFlagIdx + 1]).not.toBe('ag-illie-codex'); // NOT calling group
+      expect(spawnArgs[storeFlagIdx + 1]).toBe('ag-illie');
     } finally {
       setCentralDbForTest(null);
       wgDb.close();

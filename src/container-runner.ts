@@ -26,7 +26,13 @@ import {
   ONECLI_URL,
   TIMEZONE,
 } from './config.js';
-import { readContainerConfig, writeContainerConfig, type ContainerConfig } from './container-config.js';
+import {
+  getRecallScope,
+  readContainerConfig,
+  writeContainerConfig,
+  type ContainerConfig,
+  type RecallScope,
+} from './container-config.js';
 import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainer } from './container-runtime.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
@@ -240,8 +246,17 @@ export function isValidStoreId(value: string): boolean {
  *
  * Precedence (most specific wins):
  *   1. MNEMON_STORE_<folder> env override (case-insensitive fallback per PR #105)
- *   2. workgroups.mnemon_store_id for this agent's workgroup
- *   3. agentGroup.id (graceful fallback when no workgroup row exists)
+ *   2. If recallScope === 'self': agentGroup.id (honors explicit isolation opt-out)
+ *   3. workgroups.mnemon_store_id for this agent's workgroup
+ *   4. agentGroup.id (graceful fallback when no workgroup row exists)
+ *
+ * The `recallScope` parameter controls behavior at step 2: when a group has
+ * declared `memory.recall_scope: 'self'` for isolation, both the mount and the
+ * in-container `MNEMON_STORE` env must point at the group's own store, not the
+ * workgroup canonical — otherwise in-container `mnemon recall` reads the
+ * shared store, bypassing the documented self-only contract. The host-side
+ * recall-injection path already honors recall_scope; this keeps the
+ * container-side symmetric. (Codex P2 catch on PR #107.)
  *
  * Throws if any source produces a value that fails {@link isValidStoreId} —
  * fail-closed posture prevents an .env mistake or attacker-controlled path
@@ -251,6 +266,7 @@ export function resolveMnemonStore(
   db: Database.Database,
   agentGroup: Pick<AgentGroup, 'id' | 'folder'>,
   env: NodeJS.ProcessEnv = process.env,
+  recallScope?: RecallScope,
 ): string {
   const scopedKey = `MNEMON_STORE_${agentGroup.folder.replace(/-/g, '_')}`;
   const envOverride = env[scopedKey] ?? env[scopedKey.toUpperCase()];
@@ -262,6 +278,15 @@ export function resolveMnemonStore(
       );
     }
     return envOverride;
+  }
+
+  if (recallScope === 'self') {
+    if (!isValidStoreId(agentGroup.id)) {
+      throw new Error(
+        `resolveMnemonStore: agent_group.id is not a valid store id (got ${JSON.stringify(agentGroup.id)}).`,
+      );
+    }
+    return agentGroup.id;
   }
 
   const wgRow = db
@@ -1115,7 +1140,12 @@ function buildMounts(
   // spawning agent's workgroup (via workgroups.mnemon_store_id JOIN on agent_groups)
   // or to an explicit env override. Never mounts ~/.mnemon/ at large.
   if (containerConfig.memory?.enabled === true) {
-    const resolvedStore = resolveMnemonStore(getDb(), agentGroup);
+    // Pass recall_scope so 'self' opt-outs mount their own store, not the
+    // workgroup canonical (Codex P2 catch on PR #107 — host-side
+    // recall-injection honors recall_scope; this keeps the container-side
+    // symmetric so in-container `mnemon recall` reads from the same store).
+    const recallScope = getRecallScope(containerConfig.memory);
+    const resolvedStore = resolveMnemonStore(getDb(), agentGroup, process.env, recallScope);
     const mnemonDataDir = path.join(os.homedir(), '.mnemon', 'data', resolvedStore);
     fs.mkdirSync(mnemonDataDir, { recursive: true });
     mounts.push({
@@ -1973,11 +2003,16 @@ async function buildContainerArgs(
   //
   // MNEMON_STORE resolution precedence (most specific wins):
   //   1. MNEMON_STORE_<folder> env override (case-insensitive fallback, PR #105)
-  //   2. workgroups.mnemon_store_id for this agent's workgroup (set by the
+  //   2. recall_scope === 'self' → agentGroup.id (honors isolation opt-out)
+  //   3. workgroups.mnemon_store_id for this agent's workgroup (set by the
   //      reconciler at spawn time — ensures illie-codex shares illie's store)
-  //   3. agentGroup.id (graceful fallback when workgroups row is absent)
+  //   4. agentGroup.id (graceful fallback when workgroups row is absent)
+  //
+  // Must agree with the mount path resolved in buildMounts — both call
+  // resolveMnemonStore with the same recallScope argument.
   if (containerConfig.memory?.enabled === true) {
-    const mnemonStore = resolveMnemonStore(getDb(), agentGroup);
+    const recallScope = getRecallScope(containerConfig.memory);
+    const mnemonStore = resolveMnemonStore(getDb(), agentGroup, process.env, recallScope);
     args.push('-e', `MNEMON_STORE=${mnemonStore}`);
     args.push('-e', 'MNEMON_READ_ONLY=1');
     args.push('-e', 'MNEMON_EMBED_ENDPOINT=http://host.docker.internal:11434');

@@ -532,6 +532,41 @@ describe('resolveMnemonStore — C2', () => {
     const result = resolveMnemonStore(db, { id: 'ag-1776377699463-2axxhg', folder: 'illysium' }, {});
     expect(result).toBe('ag-1776377699463-2axxhg');
   });
+
+  // ── Codex P2 #3 (PR #107): honor recall_scope='self' at the mount path ─────
+
+  it('test_self_scope_returns_agent_id_not_workgroup_canonical', () => {
+    // A workgroup member explicitly opting out of shared recall via
+    // recall_scope: 'self' must mount its OWN store, not the workgroup canonical
+    // — otherwise the in-container `mnemon recall` reads the shared store and
+    // bypasses the isolation contract.
+    insertGroup(db, 'ag-illie-codex', 'illysium-codex', 'illysium');
+    insertWorkgroup(db, 'illysium', 'ag-illie'); // canonical points at seed
+
+    const result = resolveMnemonStore(db, { id: 'ag-illie-codex', folder: 'illysium-codex' }, {}, 'self');
+    expect(result).toBe('ag-illie-codex'); // own id, NOT 'ag-illie'
+  });
+
+  it('test_workgroup_scope_falls_through_to_canonical', () => {
+    // Default behavior preserved when scope is 'workgroup' (the new default).
+    insertGroup(db, 'ag-illie-codex', 'illysium-codex', 'illysium');
+    insertWorkgroup(db, 'illysium', 'ag-illie');
+
+    const result = resolveMnemonStore(db, { id: 'ag-illie-codex', folder: 'illysium-codex' }, {}, 'workgroup');
+    expect(result).toBe('ag-illie');
+  });
+
+  it('test_env_override_still_wins_over_self_scope', () => {
+    // Operator-set env override is the most specific source and beats every
+    // other selector, including a recall_scope='self' opt-out (otherwise an
+    // operator could not redirect a self-scoped agent to a custom store).
+    insertGroup(db, 'ag-foo', 'foo', 'foo');
+    insertWorkgroup(db, 'foo', 'ag-foo');
+
+    const env = { MNEMON_STORE_foo: 'custom-store' };
+    const result = resolveMnemonStore(db, { id: 'ag-foo', folder: 'foo' }, env, 'self');
+    expect(result).toBe('custom-store');
+  });
 });
 
 // ── reconcileWorkgroupAtSpawn — preserve migration 036 pairings ──────────────

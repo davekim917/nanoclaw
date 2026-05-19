@@ -190,13 +190,22 @@ export function resolveRecallScope(callingGroupId: string, scope: RecallScope): 
   }
 
   if (scope === 'workgroup') {
-    // Return a single-element array containing the shared mnemon store id.
-    // This engages the fast path in mnemon-impl (groupIds.length <= 1).
-    // Standalone agents (no workgroup_id) silently fall back to 'self' —
-    // workgroup is the default scope, so this branch handles every group
-    // that hasn't been wired into a workgroup yet.
+    // Return [callingGroupId, canonicalStoreId] deduped — workgroup-canonical
+    // FIRST when calling group is NOT the seed, calling group only when it is.
+    //
+    // Including the caller's own store preserves historical facts written
+    // before the workgroup default applied (e.g., non-seed siblings whose
+    // env override was silently broken pre-PR#105 wrote to their own per-agent
+    // store). Without this, the new default would orphan those facts on first
+    // spawn after deploy. Self-heals over time as new writes accumulate in
+    // the canonical store. (Codex P2 catch on PR #107.)
+    //
+    // Standalone agents (no workgroup_id) silently fall back to caller-only.
     const storeId = resolveWorkgroupStoreId(callingGroupId);
-    return [storeId ?? callingGroupId];
+    if (storeId == null || storeId === callingGroupId) {
+      return [callingGroupId];
+    }
+    return [callingGroupId, storeId];
   }
 
   const key = cacheKey(callingGroupId, scope);
@@ -213,11 +222,20 @@ export function resolveRecallScope(callingGroupId: string, scope: RecallScope): 
     const set = new Set([callingGroupId, ...all]);
     groupIds = Array.from(set);
   } else if (Array.isArray(scope)) {
-    // string[] — folder names to resolve
+    // string[] — folder names to resolve.
+    //
+    // Targets that belong to a workgroup are CANONICALIZED through their
+    // workgroup's mnemon_store_id. Writes from any sibling in that workgroup
+    // are redirected to the canonical store, so a folder-targeted read must
+    // follow the same mapping or it would see stale per-sibling history and
+    // miss the new redirected facts. Folders outside any workgroup resolve
+    // to their own agent_group_id as before. (Codex P2 catch on PR #107.)
     const resolved: string[] = [];
     for (const folder of scope) {
       const id = getFolderGroupId(folder);
-      if (id) resolved.push(id);
+      if (!id) continue;
+      const canonical = resolveWorkgroupStoreId(id);
+      resolved.push(canonical ?? id);
     }
     // Deduplicate and ensure callingGroupId is first
     const set = new Set([callingGroupId, ...resolved]);
