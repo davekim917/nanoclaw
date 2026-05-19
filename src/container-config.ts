@@ -274,6 +274,49 @@ export interface ContainerConfig {
    * recall_scope = 'workgroup'.
    */
   workgroup_id?: string;
+
+  /**
+   * Slack user-token (xoxp-) MCP capability. When enabled, the agent gets
+   * the korotovsky/slack-mcp-server MCP — letting it search/read DMs,
+   * channels, threads, and files from the OWNER'S Slack lens.
+   *
+   * Fail-closed defaults: the capability is auto-scoped to the owner's
+   * 1:1 DM with this agent at runtime. Adding the agent to a shared
+   * channel does NOT grant teammates the ability to query through it
+   * unless the operator explicitly extends `also_allowed_in` with the
+   * channel's messaging_group_id.
+   *
+   * The OneCLI vault must have a token entry for the agent's workspace
+   * (e.g., `Slack-User-Token-Illysium`) assigned via the workgroup's
+   * `onecli_secrets`. Without the token, the MCP refuses to register
+   * even when `enabled: true` and the gate would allow.
+   */
+  slack_user_token?: SlackUserTokenConfig;
+}
+
+/**
+ * Per-agent Slack user-token MCP capability. Wired into containers via the
+ * korotovsky/slack-mcp-server binary. The actual token lives in OneCLI vault
+ * and is injected at request time — never appears in this config.
+ */
+export interface SlackUserTokenConfig {
+  /**
+   * Whether this agent has the Slack user-token MCP at all. When false or
+   * unset, the MCP is never registered for this agent. Default false.
+   */
+  enabled: boolean;
+
+  /**
+   * Override allow-list. By default the MCP is only registered when the
+   * spawning session is the owner's 1:1 DM with this agent. Add specific
+   * `messaging_group_id` values here to allow the capability in additional
+   * contexts (e.g., a private channel that's just the owner + trusted
+   * collaborators where it's OK to query the owner's lens).
+   *
+   * Format: messaging_groups.id strings. Use `pnpm exec tsx scripts/q.ts
+   * data/v2.db "SELECT id, name FROM messaging_groups"` to find ids.
+   */
+  also_allowed_in?: string[];
 }
 
 function emptyConfig(): ContainerConfig {
@@ -345,6 +388,7 @@ export function readContainerConfig(folder: string): ContainerConfig {
       dailySummary: raw.dailySummary,
       onecliSecrets: raw.onecliSecrets,
       workgroup_id: raw.workgroup_id,
+      slack_user_token: raw.slack_user_token,
     };
   } catch (err) {
     console.error(`[container-config] failed to parse ${p}: ${String(err)}`);
