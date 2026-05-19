@@ -10,7 +10,7 @@ import { MnemonStore } from './mnemon-impl.js';
 import { computeQueryFactCosines } from './cheap-signal.js';
 import { insertPendingOutcomes } from './recall-outcomes.js';
 import { extractFocusedQuery } from './query-extractor.js';
-import { isFeedbackEnabled, getQueryStrategy, getRecallScope, type MemoryConfig } from '../../container-config.js';
+import { isFeedbackEnabled, getQueryStrategy, getRecallScope, type MemoryConfig, type RecallScope } from '../../container-config.js';
 
 let store: MnemonStore = new MnemonStore();
 export function setStoreForTest(s: MnemonStore): void {
@@ -544,7 +544,7 @@ export async function maybeInjectRecall(params: {
     // Resolve MemoryConfig fields (cached at 60s TTL per §1.7 design).
     let queryStrategy: 'raw' | 'heuristic' | 'llm';
     let feedbackEnabled: boolean;
-    let recallScope: 'self' | 'all-groups' | string[];
+    let recallScope: RecallScope;
     if (memoryConfigOverride !== undefined) {
       queryStrategy = getQueryStrategy(memoryConfigOverride);
       feedbackEnabled = isFeedbackEnabled(memoryConfigOverride);

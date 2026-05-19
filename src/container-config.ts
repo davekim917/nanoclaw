@@ -54,11 +54,22 @@ export interface AdditionalMountConfig {
   readonly?: boolean;
 }
 
+/**
+ * Recall scope for agent memory. Controls which mnemon stores are queried
+ * during recall injection.
+ *
+ * - 'self'      — only the calling agent's own store (default)
+ * - 'all-groups' — all memory-enabled groups in GROUPS_DIR
+ * - 'workgroup'  — the shared store for this agent's workgroup
+ * - string[]    — explicit list of group folder names to include
+ */
+export type RecallScope = 'self' | 'all-groups' | 'workgroup' | string[];
+
 export interface MemoryConfig {
   enabled: boolean;
   feedback_enabled?: boolean;
   query_strategy?: 'raw' | 'heuristic' | 'llm';
-  recall_scope?: 'self' | 'all-groups' | string[];
+  recall_scope?: RecallScope;
 }
 
 export function isFeedbackEnabled(cfg: MemoryConfig | undefined): boolean {
@@ -70,7 +81,7 @@ export function getQueryStrategy(cfg: MemoryConfig | undefined): 'raw' | 'heuris
   return cfg?.query_strategy ?? 'raw';
 }
 
-export function getRecallScope(cfg: MemoryConfig | undefined): 'self' | 'all-groups' | string[] {
+export function getRecallScope(cfg: MemoryConfig | undefined): RecallScope {
   return cfg?.recall_scope ?? 'self';
 }
 
@@ -251,6 +262,17 @@ export interface ContainerConfig {
   dailySummary?: {
     messagingGroupId?: string;
   };
+
+  /**
+   * The workgroup this agent belongs to. Set by migration 036 and written
+   * into container.json so the projection layer can perform workgroup-scoped
+   * recall without hitting the central DB at runtime.
+   *
+   * Value matches workgroups.id (e.g. "madison-reed" for both madison-reed
+   * and madison-reed-codex agents). Read by scope-resolver.ts when
+   * recall_scope = 'workgroup'.
+   */
+  workgroup_id?: string;
 }
 
 function emptyConfig(): ContainerConfig {
@@ -321,6 +343,7 @@ export function readContainerConfig(folder: string): ContainerConfig {
       memory: (raw as Record<string, unknown>).memory as MemoryConfig | undefined,
       dailySummary: raw.dailySummary,
       onecliSecrets: raw.onecliSecrets,
+      workgroup_id: raw.workgroup_id,
     };
   } catch (err) {
     console.error(`[container-config] failed to parse ${p}: ${String(err)}`);

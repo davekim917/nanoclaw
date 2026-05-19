@@ -1,0 +1,393 @@
+feature: workgroup-scoped-data-layer
+created_by: /team-brief
+last_updated_by: /team-review (cycle 3)
+
+constraints:
+  - id: C1
+    type: HARD
+    text: "Projection-time enforcement — container's /workspace/archive.db must NOT contain rows outside the spawning agent's workgroup. Raw SQLite access is advisory-only; projection filter is the real boundary (src/container-runner.ts:855-863)."
+    source: brief
+    verified: false
+
+  - id: C2
+    type: HARD
+    text: "Sibling agent_groups remain separate rows in agent_groups. Each retains its own platform bot user, CLAUDE.md, routing identity, and mention-engage rules. Workgroup is the layer above, not a collapse."
+    source: brief
+    verified: false
+
+  - id: C3
+    type: HARD
+    text: "No data loss for existing mnemon stores, archive content, or OneCLI secret assignments during migration."
+    source: brief
+    verified: false
+
+  - id: C4
+    type: HARD
+    text: "Existing recall_scope modes ('self', 'all-groups', folder list) continue working unchanged — 'workgroup' is an additive 4th mode."
+    source: brief
+    verified: false
+
+  - id: C5
+    type: HARD
+    text: "Migration is idempotent — re-running on an already-migrated install is a no-op."
+    source: brief
+    verified: false
+
+  - id: C6
+    type: HARD
+    text: "PR #105 compatibility — the case-insensitive MNEMON_STORE_<folder> env override must keep functioning during the transition; this work does not delete it."
+    source: brief
+    verified: false
+
+  - id: C7
+    type: SOFT
+    text: "Backfill heuristic should auto-pair <x> + <x>-codex from naming convention; explicit declaration available as override."
+    source: brief
+    verified: false
+
+  - id: C8
+    type: SOFT
+    text: "Existing duplicate onecliSecrets declarations across sibling container.json files should be possible to consolidate to workgroup level — mechanism is design's call, not required by this brief."
+    source: brief
+    verified: false
+
+decisions:
+  - id: D1
+    stage: brief
+    description: "Workgroup is the unit of isolation for shared data layer, sitting above agent_groups"
+    chosen: "Add workgroup_id as an attribute that groups multiple agent_groups together; workgroup pools chat archive, mnemon, and OneCLI secret declarations"
+    rejected:
+      - option: "Collapse sibling agent_groups into a single row with multi-provider config"
+        reason: "Breaks per-agent bot identity required for native @-mention plumbing on Slack/Discord; documented in clone-as-codex skill rationale"
+      - option: "Owner-gated cross-group access (any group an owner controls can see any other group's data)"
+        reason: "Gives Axie access to MR data because Dave owns both — exact opposite of the tenant boundary Dave wants"
+      - option: "Spawn-task primitive (ask the sibling to read its own data and return)"
+        reason: "Already works as a fallback but is slow (cold-spawn latency), depends on sibling availability, and degrades summary quality. Not the durable answer."
+    constraint_refs: [C1, C2]
+
+  - id: D2
+    stage: brief
+    description: "Membership grows beyond parent+codex twin"
+    chosen: "Workgroup is the tenant unit — future agents like <x>-research, <x>-data-analyst join the same workgroup automatically when declared"
+    rejected:
+      - option: "Hard-code workgroup to exactly two members (parent + codex twin)"
+        reason: "Dave explicitly confirmed wanting to grow membership over time; locking to two would force re-architecture later"
+    constraint_refs: []
+
+  - id: D3
+    stage: brief
+    description: "OneCLI secret inheritance is in scope"
+    chosen: "Workgroup-level onecliSecrets declarations are inherited by all member agent_groups at container spawn"
+    rejected:
+      - option: "Keep secrets strictly per-group, defer workgroup inheritance to a follow-on"
+        reason: "Dave explicitly approved workgroup-level inheritance in this brief; deferring would force a near-term schema re-cut"
+    constraint_refs: []
+
+  - id: D4
+    stage: brief
+    description: "Slack user-token via OneCLI (Q1) is a separate follow-on"
+    chosen: "Q1 ships AFTER workgroup so it can declare its Slack secret at workgroup level, avoiding per-group duplication"
+    rejected:
+      - option: "Bundle Q1 and Q2 into one feature"
+        reason: "Q1 is additive (new credential surface) and Q2 is architectural (boundary change); coupling delays both"
+    constraint_refs: []
+
+assumptions:
+  - id: A1
+    stage: brief
+    text: "Workgroup-scoped is the default for new agent_groups (rather than opt-in via explicit declaration)"
+    validation: "Confirm at brief approval; if false, flip default to opt-in and require explicit recall_scope='workgroup' per group"
+    validated: false
+
+  - id: A2
+    stage: brief
+    text: "Auto-pair codex twins via naming convention (<x>-codex strip → <x>) plus parent-row existence check"
+    validation: "Design phase enumerates all 10 current pairs; if any fail to auto-pair, fall back to explicit container.json declaration"
+    validated: false
+
+  - id: A3
+    stage: brief
+    text: "OneCLI secret merge semantics: workgroup baseline + per-group additive (can add, cannot subtract)"
+    validation: "Design phase confirms with security review — additive-only prevents per-group from accidentally weakening workgroup baseline"
+    validated: false
+
+  - id: A4
+    stage: brief
+    text: "A dedicated workgroups table is needed (carries onecli_secrets, display_name)"
+    validation: "Design phase weighs table vs lookup against folder-config; deciding factor is whether workgroup needs its own metadata beyond membership"
+    validated: false
+
+  - id: A5
+    stage: brief
+    text: "Migration runs once via the existing migration chain (src/db/migrations/) and produces zero diffs on a re-run"
+    validation: "Implementation verifies idempotency in tests; QA verifies on live install"
+    validated: false
+
+  - id: A6
+    stage: design
+    text: "Suffix-strip + parent-existence pairs all 10 of Dave's current sibling folders without operator action"
+    validation: "Pre-migration enumeration of folder LIKE '%-codex' rows verifies each has matching non-codex folder; backfill reports mismatches"
+    validated: false
+
+  - id: A7
+    stage: design
+    text: "Workgroup-of-1 mnemon recall is functionally equivalent to today's 'self' for standalone groups"
+    validation: "Test: 'workgroup' scope on standalone group returns same single-id set as 'self' mode"
+    validated: false
+
+  - id: A8
+    stage: design
+    text: "applyOnecliSecrets handles a unioned declarations list without requiring host-side dedup"
+    validation: "Test with duplicate names in declarations; verify resolved UUIDs are deduplicated downstream — add Set wrapper at call site if not"
+    validated: false
+
+  - id: A9
+    stage: design
+    text: "Dropping in-container 'agent_group_id = ?' filter from thread tools doesn't break other tool paths"
+    validation: "grep -rn 'agent_group_id' container/agent-runner/src/mcp-tools/ for full enumeration; container tests pass against modified projection"
+    validated: false
+
+  - id: A10
+    stage: design
+    text: "Flipping getRecallScope default to 'workgroup' is safe — standalone groups behave identically; sibling pools intended"
+    validation: "QA verifies first recall post-migration on a known sibling thread returns pooled context; explicit recall_scope: 'self' restores prior behavior"
+    validated: false
+
+  - id: A11
+    stage: design
+    text: "Migration 036 idempotency holds across partial failure (schema applied, backfill crashed)"
+    validation: "Simulate mid-backfill kill, re-run, verify schema_version gate prevents double-apply and final state is consistent"
+    validated: false
+
+  - id: A12
+    stage: design
+    text: "agent_groups.folder column matches groups/ filesystem listing on Dave's install at migration time"
+    validation: "SELECT folder FROM agent_groups vs ls groups/ comparison before migration runs"
+    validated: false
+
+decisions_design:
+  - id: D5
+    stage: design
+    description: "Workgroup schema model — workgroups table + workgroup_id column on agent_groups"
+    chosen: "Option A: ADD workgroup_id TEXT column to agent_groups + CREATE TABLE workgroups (id, display_name, onecli_secrets JSON, created_at, updated_at). container.json.workgroup_id is operator-facing SoT; DB column is derived/cached for hot-path queries."
+    rejected:
+      - option: "Option B: tag-only workgroup (no workgroups table) — workgroup-level secrets duplicated across every member's container.json"
+        reason: "Re-creates the exact drift-trap class of bug PR #105 just fixed for MNEMON_STORE_<folder>. No canonical workgroup row; future workgroup-level fields compound the duplication tax."
+      - option: "Option C: filesystem-driven workgroup.json — new groups/<workgroup>/ topology"
+        reason: "Adds a new filesystem layer not present elsewhere; doesn't compose with channel/provider skill installer pattern; slower at spawn time than a DB JOIN."
+    constraint_refs: [C1, C2, C3]
+
+  - id: D6
+    stage: design
+    description: "Backfill heuristic for auto-pairing existing sibling pairs"
+    chosen: "Suffix-strip <x>-codex + bidirectional parent-existence check against agent_groups.folder. Standalone (no match) → workgroup_id = own folder."
+    rejected:
+      - option: "Prefix-match (find shared folder-name prefix between rows)"
+        reason: "Ambiguous on names like '<x>-bot-codex' — would falsely pair with '<x>' instead of '<x>-bot'."
+      - option: "Explicit-only (require operator to declare workgroup_id in every container.json before migration)"
+        reason: "Violates R6 ('auto-pair without operator action'). Future siblings can still use explicit declaration — this heuristic is a migration-time convenience."
+    constraint_refs: [C7]
+
+  - id: D7
+    stage: design
+    description: "Mnemon recall default scope (SUPERSEDED by cycle-1 auto_judgment — see auto_judgments[2])"
+    chosen: "REVISED: keep getRecallScope default at 'self'; migration writes explicit recall_scope: 'workgroup' to container.json for auto-paired groups only. No surprise behavior change for implicit-self consumers."
+    rejected:
+      - option: "Flip default at container-config.ts:74 to 'workgroup' (original D7 choice)"
+        reason: "Cycle-1 review surfaced behavior-change risk for implicit-self consumers. Replaced by migration-time explicit declaration (matches PlanetScale expand-and-contract guidance)."
+      - option: "Keep 'self' default; require explicit recall_scope: 'workgroup' per group with no migration assist"
+        reason: "Defeats R6 auto-pairing benefit on Dave's install. Migration writes deliver the auto-pairing without changing the default."
+    constraint_refs: [C4]
+
+  - id: D8
+    stage: design
+    description: "OneCLI secret merge semantics"
+    chosen: "Workgroup baseline ∪ per-group additive (UNION, additive-only). Computed at spawn-time in container-runner before applyOnecliSecrets."
+    rejected:
+      - option: "Per-group replaces workgroup"
+        reason: "A sibling could silently weaken the shared baseline by re-declaring a narrower list."
+      - option: "Strict workgroup-only (per-group declarations ignored)"
+        reason: "Defeats legitimate per-group tool-specific secrets (e.g., a single sibling needs Datafold while others don't)."
+    constraint_refs: []
+
+  - id: D9
+    stage: design
+    description: "Drop in-container WHERE agent_group_id = ? from thread tools"
+    chosen: "Remove filter from resolve_thread_link, search_threads, read_thread family in thread-search.ts. Projection enforces the workgroup boundary; the in-tool filter would narrow back to self-only and defeat pooling."
+    rejected:
+      - option: "Keep filter but add workgroup-aware variant"
+        reason: "Defeats pooling intent — projection already bounds visibility, in-tool filter only narrows. Two filter mechanisms for the same boundary is needless complexity."
+    constraint_refs: [C1]
+
+
+review_cycles:
+  - iteration: 1
+    must_fix_count: 9
+    should_fix_count: 10
+    wont_fix_count: 2
+    completed_at: 2026-05-18T13:30:00Z
+  - iteration: 2
+    must_fix_count: 7
+    should_fix_count: 9
+    wont_fix_count: 1
+    completed_at: 2026-05-18T14:00:00Z
+  - iteration: 3
+    must_fix_count: 4
+    should_fix_count: 3
+    wont_fix_count: 2
+    completed_at: 2026-05-18T14:30:00Z
+
+auto_qa_cycles: []
+
+auto_judgments:
+  - stage: Review
+    iteration: 1
+    decision: "Workgroup-of-1 identifier = folder slug (agent_groups.folder), not agent_groups.id"
+    alternatives_considered:
+      - "agent_groups.id (ag-<ts>-<rand>) — opaque, machine-readable, FK-safe but display-meaningless"
+      - "agent_groups.folder (human slug) — operator-facing, UNIQUE-constrained, matches container.json declaration pattern"
+    grounding:
+      - "src/db/migrations/001-initial.ts:13 — folder TEXT NOT NULL UNIQUE"
+      - "container.json declares folder-keyed identity throughout: groups/<folder>/container.json carries agentGroupId, folder name = directory"
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-05-18T13:30:00Z
+
+  - stage: Review
+    iteration: 1
+    decision: "Mnemon store routing = single store per workgroup; workgroups.id IS the store name; scope-resolver returns single id for workgroup mode"
+    alternatives_considered:
+      - "Per-agent stores with fan-out (existing pattern, but creates redundancy with MNEMON_STORE_<folder> env override)"
+      - "Single store per workgroup (subsumes env override eventually; one fewer moving part)"
+    grounding:
+      - "src/modules/memory/mnemon-impl.ts:225-279 — fan-out path; collapsing to single store is the simpler model"
+      - "Verified earlier this session: 4 codex-twin mnemon stores are empty (oplog <= 71, no facts) — no migration cost"
+      - "src/container-runner.ts:1773-1779 — MNEMON_STORE_<folder> env override stays in place per C6 (HARD); workgroup mode is authoritative"
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-05-18T13:30:00Z
+
+  - stage: Review
+    iteration: 1
+    decision: "Default flip approach: keep getRecallScope default at 'self'; migration writes recall_scope: 'workgroup' to container.json for auto-paired members only"
+    alternatives_considered:
+      - "Original design: change default at container-config.ts:74 to 'workgroup' (behavior change for implicit-self consumers)"
+      - "Migration-time explicit declaration (no default change; standalone groups untouched)"
+    grounding:
+      - "Reviewer B citation: PlanetScale 'Backward compatible database changes' — default-value flip is application-visible semantic shift, not a backward-compat schema change"
+      - "Reviewer C #4: widening recall is the risky direction for prompt contamination"
+      - "Brief R6 requires auto-pairing for Dave's 10 existing pairs — achieved by writing explicit recall_scope to those pairs' container.json during migration; standalone groups stay on 'self' default"
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-05-18T13:30:00Z
+
+  - stage: Review
+    iteration: 1
+    decision: "Per-table pooling: only messages_archive widens to workgroup; backlog_items / ship_log / tasks / agent_group_capabilities stay agent-scoped"
+    alternatives_considered:
+      - "Pool all central-DB tables across workgroup — would silently widen orchestrator capability (server.ts:45) across siblings"
+      - "Pool only messages_archive — each table evaluated on semantic merit"
+    grounding:
+      - "container/agent-runner/src/mcp-tools/server.ts:45 — orchestrator check is per-agent; pooling would conflate sibling roles"
+      - "container/agent-runner/src/mcp-tools/backlog.ts:273-342 — backlog operations narrate per-agent activity; pooling would create cross-sibling todo confusion"
+      - "Brief R2 explicitly scopes pooling to chat archive ('siblings can read each other's chat archive') — not to backlog or roles"
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-05-18T13:30:00Z
+
+  - stage: Review
+    iteration: 1
+    decision: "Membership SoT: agent_groups.workgroup_id (DB) is canonical for runtime queries; container.json declares operator intent and host reconciles to DB on spawn"
+    alternatives_considered:
+      - "Container.json is runtime SoT (scope-resolver walks filesystem) — re-creates the drift class of bug PR #105 fixed"
+      - "DB is canonical for runtime; container.json declares intent; reconciliation on spawn"
+    grounding:
+      - "Design Option B rejection cited this exact drift concern; chosen Option A inherits the same concern unless DB is canonical at runtime"
+      - "src/modules/memory/scope-resolver.ts:30-66 — existing filesystem reader pattern; workgroup mode reads from DB instead (host has DB access at the same call site that builds the projection)"
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-05-18T13:30:00Z
+
+  - stage: Review
+    iteration: 1
+    decision: "Pooled messages_archive dedup: projection-only change, GROUP BY canonical key, keep row with lowest agent_group_id"
+    alternatives_considered:
+      - "Insert-time dedup in router.ts:793,916,932 — touches archive write path, larger blast radius"
+      - "Projection-only dedup — buildArchiveProjection GROUP BY (messaging_group_id, thread_id, sent_at, role, text); deterministic with MIN(agent_group_id)"
+    grounding:
+      - "src/router.ts:793, 916, 932 — confirmed each agent writes its own archive row via messageIdForAgent"
+      - "src/db/per-agent-projections.ts:89-121 — single chokepoint for projection logic; dedup added here keeps the change contained"
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-05-18T13:30:00Z
+
+  - stage: Review
+    iteration: 3
+    decision: "Drop schema-level NOT NULL for workgroup_id; rely on app-layer W1 + runtime W3"
+    alternatives_considered:
+      - "Keep cycle-2 table-rebuild approach with PRAGMA foreign_keys=OFF (must be set OUTSIDE outer transaction — incompatible with migration barrel; requires special-casing the migration runner)"
+      - "Keep cycle-2 table-rebuild approach with PRAGMA defer_foreign_keys=ON (works inside transaction but still introduces schema-preservation risk per Reviewer C #3 — need full sqlite_master/table_info introspection to enumerate columns added across migrations 002-035)"
+      - "Drop table-rebuild; use ALTER TABLE ADD COLUMN ... REFERENCES (nullable); enforce W1 via migration validation + W3 fail-closed projection (recommended)"
+    grounding:
+      - "Reviewer A cycle-3 finding #1: SQLite ALTER TABLE limitations + foreign_keys PRAGMA-no-op-inside-transaction"
+      - "Reviewer B PRIMARY DRIFT: sqlite.org/draft/lang_altertable.html (T1) — table rebuild requires foreign_keys OFF before transaction"
+      - "Rails GitHub issue #55866 (Oct 2025) — production data-loss incident from this exact pattern"
+      - "Cycle-2 W3 invariant already enforces fail-closed at projection — schema NOT NULL is belt-and-suspenders, not load-bearing"
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false   # W1 stays HARD; enforcement mechanism shifts from schema to app+runtime
+      weakens_safety_invariant: false  # W3 is the practical enforcement point; W1 still validated at migration tail
+    recorded_at: 2026-05-18T14:30:00Z
+
+  - stage: Review
+    iteration: 3
+    decision: "Move container.json + log FS writes out of migration into a separate startup phase reconcileWorkgroupFsState()"
+    alternatives_considered:
+      - "Keep FS writes inside migration 036 up() (cycle-2 design — unreachable recovery path because barrel transaction wraps everything)"
+      - "Move FS writes to a separate function called from src/index.ts after runMigrations completes (recommended)"
+    grounding:
+      - "Reviewer A cycle-3 finding #2: src/db/migrations/index.ts:97-103 wraps every m.up(db) in outer transaction"
+      - "Reviewer C cycle-3 finding #4: DB migration commit + FS writes flow violates idempotency claim"
+      - "Pattern alignment: idempotent post-migration reconciler matches Kubernetes controller pattern cited in cycle-1 Reviewer B"
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-05-18T14:30:00Z
+
+  - stage: Review
+    iteration: 3
+    decision: "Reconciler queries parent agent_groups row by folder before locking mnemon_store_id"
+    alternatives_considered:
+      - "Reconciler uses agentGroup.id directly (cycle-2 design — spawn-order race)"
+      - "Reconciler queries parent by folder slug, falls back to agentGroup.id only if no parent exists (recommended)"
+    grounding:
+      - "Reviewer A cycle-3 finding #3: empirical verification of mnemon store paths"
+      - "Reviewer C cycle-3 finding #2: spawn-order determines wrong canonical store"
+      - "Migration's mnemon_store_id backfill already uses this rule — reconciler should match"
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-05-18T14:30:00Z

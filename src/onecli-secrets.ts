@@ -126,7 +126,7 @@ function resolveAgentUuid(identifier: string): string {
  * leave the agent in an under-credentialed state without a clear
  * error signal.
  */
-function resolveSecretUuids(declarations: string[]): string[] {
+export function resolveSecretUuids(declarations: string[]): string[] {
   if (declarations.length === 0) return [];
 
   const secrets = listSecrets();
@@ -200,6 +200,38 @@ export function applyOnecliSecrets(agentIdentifier: string, declarations: string
   });
 }
 
+/**
+ * Merge workgroup-level and per-group OneCLI secret declarations into a
+ * single ordered, deduplicated list. Workgroup secrets come first (baseline);
+ * per-group secrets are appended additively. Neither list can subtract from
+ * the other — the merge is union-only.
+ *
+ * This implements the workgroup-baseline-∪-group-additive model from the
+ * workgroup-scoped-data-layer design: workgroups.onecli_secrets provides a
+ * shared floor that every member inherits, and container.json.onecliSecrets
+ * can extend but not restrict.
+ */
+export function mergeWorkgroupAndGroupSecrets(
+  workgroupSecrets: string[] | undefined,
+  groupSecrets: string[] | undefined,
+): string[] {
+  const set = new Set<string>();
+  const ordered: string[] = [];
+  for (const s of workgroupSecrets ?? []) {
+    if (!set.has(s)) {
+      set.add(s);
+      ordered.push(s);
+    }
+  }
+  for (const s of groupSecrets ?? []) {
+    if (!set.has(s)) {
+      set.add(s);
+      ordered.push(s);
+    }
+  }
+  return ordered;
+}
+
 /** Test hook — clears the in-memory caches so each test starts clean. */
 export function __resetCachesForTest(): void {
   identifierToUuid.clear();
@@ -207,6 +239,9 @@ export function __resetCachesForTest(): void {
 
 /**
  * Internal helpers exported solely for unit tests. Production callers
- * use `applyOnecliSecrets`.
+ * use `applyOnecliSecrets`. Note: `resolveSecretUuids` is ALSO exported at
+ * top-level (above) for use by `scripts/set-workgroup-secrets.ts` — the
+ * `__test` reference here is for legacy tests that already imported via
+ * this namespace and is kept for compatibility.
  */
-export const __test = { isUuid, resolveSecretUuids, resolveAgentUuid };
+export const __test = { isUuid, resolveAgentUuid };

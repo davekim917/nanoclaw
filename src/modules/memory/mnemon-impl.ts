@@ -6,9 +6,9 @@ import type Database from 'better-sqlite3';
 import type { FactInput, MemoryStore, RecallResult, RecalledFact, RememberResult } from './store.js';
 import { redactSecrets } from './secret-redactor.js';
 import { openMnemonIngestDb, runMnemonIngestMigrations } from '../../db/migrations/019-mnemon-ingest-db.js';
-import type { MemoryConfig } from '../../container-config.js';
+import type { MemoryConfig, RecallScope } from '../../container-config.js';
 import { getRecallScope } from '../../container-config.js';
-import { resolveRecallScope } from './scope-resolver.js';
+import { resolveRecallScope, resolveWorkgroupStoreId } from './scope-resolver.js';
 import { mergeAndRerank } from './rrf.js';
 
 interface RedactionRecorder {
@@ -211,7 +211,7 @@ export class MnemonStore implements MemoryStore {
       limit?: number;
       timeoutMs?: number;
       signal?: AbortSignal;
-      recallScope?: 'self' | 'all-groups' | string[];
+      recallScope?: RecallScope;
     } = {},
   ): Promise<RecallResult> {
     const start = Date.now();
@@ -332,7 +332,17 @@ export class MnemonStore implements MemoryStore {
       return { action: 'skipped', factId: '' };
     }
 
-    const args = ['remember', '--store', agentGroupId, '--cat', fact.category, '--imp', String(fact.importance)];
+    // CD-2: Resolve workgroup canonical store id so daemon writes land in the same
+    // store the container reads from. Falls back to agentGroupId if no workgroup row
+    // (pre-migration installs, test contexts without workgroups schema).
+    let storeId = agentGroupId;
+    try {
+      storeId = resolveWorkgroupStoreId(agentGroupId);
+    } catch {
+      // No workgroup row or central DB unavailable — use agent's own id as legacy fallback
+    }
+
+    const args = ['remember', '--store', storeId, '--cat', fact.category, '--imp', String(fact.importance)];
 
     if (fact.entities && fact.entities.length > 0) {
       args.push('--entities', fact.entities.join(','));

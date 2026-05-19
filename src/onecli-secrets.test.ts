@@ -1,6 +1,6 @@
 import { describe, expect, test, vi, beforeEach, afterEach } from 'vitest';
 
-import { applyOnecliSecrets, __resetCachesForTest, __test } from './onecli-secrets.js';
+import { applyOnecliSecrets, mergeWorkgroupAndGroupSecrets, __resetCachesForTest, __test } from './onecli-secrets.js';
 
 // Mock child_process.execFileSync so we don't actually shell out to `onecli`
 // during tests. Hoisted via vi.mock so it applies before the module imports.
@@ -257,5 +257,52 @@ describe('applyOnecliSecrets — caching', () => {
 
     applyOnecliSecrets('newly-created-identifier', ['Anthropic']);
     expect(callsToAgentsList).toBe(2);
+  });
+});
+
+describe('mergeWorkgroupAndGroupSecrets — C3', () => {
+  test('test_merge_workgroup_baseline_plus_group_additive', () => {
+    const result = mergeWorkgroupAndGroupSecrets(['Anthropic', 'Exa'], ['Datafold-Illysium']);
+    expect(result).toEqual(['Anthropic', 'Exa', 'Datafold-Illysium']);
+  });
+
+  test('test_merge_dedup_when_group_repeats_workgroup_secret', () => {
+    const result = mergeWorkgroupAndGroupSecrets(['Anthropic', 'Exa'], ['Anthropic', 'Datafold-Illysium']);
+    // Anthropic appears in both — only one copy in output, workgroup order preserved
+    expect(result).toEqual(['Anthropic', 'Exa', 'Datafold-Illysium']);
+  });
+
+  test('test_merge_empty_workgroup_passes_through', () => {
+    const result = mergeWorkgroupAndGroupSecrets([], ['Datafold-Illysium']);
+    expect(result).toEqual(['Datafold-Illysium']);
+  });
+
+  test('test_merge_empty_group_passes_through', () => {
+    const result = mergeWorkgroupAndGroupSecrets(['Anthropic', 'Exa'], []);
+    expect(result).toEqual(['Anthropic', 'Exa']);
+  });
+
+  test('test_merge_per_group_cannot_subtract', () => {
+    // Per-group list is additive only — cannot remove workgroup secrets
+    const result = mergeWorkgroupAndGroupSecrets(['Anthropic', 'Exa'], ['Datafold-Illysium']);
+    // Anthropic + Exa from workgroup MUST be present
+    expect(result).toContain('Anthropic');
+    expect(result).toContain('Exa');
+    expect(result).toContain('Datafold-Illysium');
+  });
+
+  test('handles undefined workgroup secrets', () => {
+    const result = mergeWorkgroupAndGroupSecrets(undefined, ['Datafold-Illysium']);
+    expect(result).toEqual(['Datafold-Illysium']);
+  });
+
+  test('handles undefined group secrets', () => {
+    const result = mergeWorkgroupAndGroupSecrets(['Anthropic'], undefined);
+    expect(result).toEqual(['Anthropic']);
+  });
+
+  test('handles both undefined', () => {
+    const result = mergeWorkgroupAndGroupSecrets(undefined, undefined);
+    expect(result).toEqual([]);
   });
 });

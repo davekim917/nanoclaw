@@ -24,13 +24,23 @@ import Database from 'better-sqlite3';
 import { log } from '../log.js';
 
 /**
- * Build a per-agent projection of `archive.db` containing only rows where
- * `agent_group_id = ?`. The schema is declared fresh (matching the host
- * `archive.ts` schema) — copying via sqlite_master would also pull FTS5
- * shadow tables (`*_fts_data`, `*_fts_idx`, `*_fts_docsize`, `*_fts_config`)
- * which conflict with the auto-creation that happens when we declare the
- * virtual table. INSERTing into messages_archive triggers FTS population
- * via the AFTER INSERT trigger declared below.
+ * Build a per-agent projection of `archive.db` containing all rows for
+ * agents that share the same workgroup_id. Rows are deduplicated across
+ * siblings by grouping on (messaging_group_id, thread_id, role, sender_id,
+ * sent_at, text) — identical user messages written to multiple siblings
+ * collapse to a single row (MIN id for determinism). Assistant rows from
+ * different agents survive because their sender_id differs.
+ *
+ * Fail-closed (W3): if the calling agent has NULL workgroup_id in
+ * agent_groups, the function throws — this prevents silent scope collapse
+ * from producing an empty or wrong projection.
+ *
+ * The schema is declared fresh (matching the host `archive.ts` schema) —
+ * copying via sqlite_master would also pull FTS5 shadow tables
+ * (`*_fts_data`, `*_fts_idx`, `*_fts_docsize`, `*_fts_config`) which
+ * conflict with the auto-creation that happens when we declare the virtual
+ * table. INSERTing into messages_archive triggers FTS population via the
+ * AFTER INSERT trigger declared below.
  */
 const ARCHIVE_SCHEMA_SQL = `
   CREATE TABLE messages_archive (
@@ -86,7 +96,27 @@ const ARCHIVE_COLS = [
   'channel_name',
 ];
 
-export function buildArchiveProjection(srcPath: string, dstPath: string, agentGroupId: string): void {
+/**
+ * Build a per-agent projection of `archive.db` containing rows for the spawning agent's
+ * workgroup (or just the agent itself if `workgroupMemberIds` is omitted — legacy mode).
+ *
+ * The caller (container-runner spawn path) is responsible for resolving the workgroup
+ * member set from the central DB and passing it as `workgroupMemberIds`. The archive.db
+ * source doesn't carry the agent_groups/workgroups schema; cross-DB joins would require
+ * ATTACH and add complexity. Passing the set as a parameter keeps `archive.db` write-side
+ * simple and the projection's hot path index-friendly.
+ *
+ * Empty array → projection contains zero rows (W3 fail-closed: caller checks workgroup_id
+ * BEFORE calling and passes empty if invalid, or throws upstream).
+ * Undefined → legacy single-agent filter (`WHERE agent_group_id = ?`). Used by tests and
+ * any future caller that doesn't have central-DB access at the projection time.
+ */
+export function buildArchiveProjection(
+  srcPath: string,
+  dstPath: string,
+  agentGroupId: string,
+  workgroupMemberIds?: string[],
+): void {
   if (fs.existsSync(dstPath)) fs.unlinkSync(dstPath);
   const dst = new Database(dstPath);
   try {
@@ -98,11 +128,43 @@ export function buildArchiveProjection(srcPath: string, dstPath: string, agentGr
     }
     const src = new Database(srcPath, { readonly: true });
     try {
+      let rows: Array<Record<string, unknown>>;
+      if (workgroupMemberIds && workgroupMemberIds.length > 0) {
+        // ── Workgroup-widened SELECT with dedup ─────────────────────────
+        // GROUP BY the content columns; identical user messages from sibling
+        // agents collapse to 1 row (MIN id). Assistant rows differ by
+        // sender_id so they get their own bucket → survive dedup.
+        const placeholders = workgroupMemberIds.map(() => '?').join(', ');
+        rows = src
+          .prepare(
+            `SELECT
+               MIN(id)               AS id,
+               MIN(agent_group_id)   AS agent_group_id,
+               messaging_group_id,
+               MAX(channel_type)     AS channel_type,
+               MAX(channel_name)     AS channel_name,
+               MAX(platform_id)      AS platform_id,
+               thread_id,
+               role,
+               sender_id,
+               MAX(sender_name)      AS sender_name,
+               text,
+               sent_at,
+               MIN(created_at)       AS created_at
+             FROM messages_archive
+             WHERE agent_group_id IN (${placeholders})
+             GROUP BY messaging_group_id, thread_id, role, sender_id, sent_at, text`,
+          )
+          .all(...workgroupMemberIds) as Array<Record<string, unknown>>;
+      } else {
+        // ── Legacy single-agent filter (test fixtures, fresh installs pre-migration) ─
+        rows = src
+          .prepare(`SELECT ${ARCHIVE_COLS.join(', ')} FROM messages_archive WHERE agent_group_id = ?`)
+          .all(agentGroupId) as Array<Record<string, unknown>>;
+      }
+
       const colList = ARCHIVE_COLS.join(', ');
       const placeholders = ARCHIVE_COLS.map(() => '?').join(', ');
-      const rows = src
-        .prepare(`SELECT ${colList} FROM messages_archive WHERE agent_group_id = ?`)
-        .all(agentGroupId) as Array<Record<string, unknown>>;
       const insertStmt = dst.prepare(`INSERT INTO messages_archive (${colList}) VALUES (${placeholders})`);
       const insertMany = dst.transaction((batch: Array<Record<string, unknown>>) => {
         for (const row of batch) {
@@ -115,6 +177,10 @@ export function buildArchiveProjection(srcPath: string, dstPath: string, agentGr
     }
   } catch (err) {
     log.error('buildArchiveProjection failed', { err, agentGroupId, dstPath });
+    // CD-3: re-throw fail-closed. The caller (container-runner spawn) sees the failure
+    // and aborts the spawn rather than silently mounting an empty projection that
+    // looks-valid but yields zero rows on every read.
+    throw err;
   } finally {
     dst.close();
   }
@@ -122,9 +188,18 @@ export function buildArchiveProjection(srcPath: string, dstPath: string, agentGr
 
 /**
  * Build a per-agent projection of `central.db` containing ONLY the tables
- * the container reads (backlog_items, ship_log) filtered to this agent's
- * rows. Other central tables (pending_approvals, user_roles, sessions, etc.)
- * are deliberately omitted — the container has no need to see them.
+ * the container reads (backlog_items, ship_log, tasks, agent_group_capabilities)
+ * filtered to this agent's rows. Other central tables (pending_approvals,
+ * user_roles, sessions, etc.) are deliberately omitted — the container has
+ * no need to see them.
+ *
+ * Per-table pooling strategy (workgroup-scoped data layer, cycle-3 design):
+ * - messages_archive: WORKGROUP-widened (via buildArchiveProjection, separate function)
+ * - backlog_items: AGENT-scoped (each agent has own todo list)
+ * - ship_log: AGENT-scoped (each agent's commits are own activity)
+ * - tasks: AGENT-scoped via parent_agent_group_id (dispatch ownership)
+ * - agent_group_capabilities: AGENT-scoped (orchestrator role per-agent)
+ * See docs/specs/workgroup-scoped-data-layer/design.md § "Per-table pooling strategy (M5)"
  */
 export function buildCentralProjection(srcPath: string, dstPath: string, agentGroupId: string): void {
   if (!fs.existsSync(srcPath)) {

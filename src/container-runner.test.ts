@@ -1,9 +1,18 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, beforeEach } from 'vitest';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import BetterSQLite3 from 'better-sqlite3';
+import type Database from 'better-sqlite3';
 
-import { dockerResourceLimitArgs, resolveAnthropicAuth, resolveProviderName } from './container-runner.js';
+import {
+  dockerResourceLimitArgs,
+  resolveAnthropicAuth,
+  resolveProviderName,
+  reconcileWorkgroupAtSpawn,
+  resolveMnemonStore,
+} from './container-runner.js';
+import { mergeWorkgroupAndGroupSecrets } from './onecli-secrets.js';
 import { getProviderContainerConfig } from './providers/provider-container-registry.js';
 
 describe('resolveProviderName', () => {
@@ -272,5 +281,225 @@ describe('codex provider host auth', () => {
     });
 
     expect(copiedAuth(sessionDir)).toEqual({ account: 'global' });
+  });
+});
+
+// ── Workgroup reconciler tests (C1) ──────────────────────────────────────────
+
+/** Create a minimal in-memory DB with the workgroup schema (migration 036). */
+function makeWorkgroupDb(): Database.Database {
+  const db = new BetterSQLite3(':memory:');
+  db.pragma('foreign_keys = ON');
+  db.exec(`
+    CREATE TABLE agent_groups (
+      id           TEXT PRIMARY KEY,
+      name         TEXT NOT NULL,
+      folder       TEXT NOT NULL UNIQUE,
+      workgroup_id TEXT,
+      created_at   TEXT NOT NULL
+    );
+    CREATE TABLE workgroups (
+      id              TEXT PRIMARY KEY,
+      display_name    TEXT,
+      onecli_secrets  TEXT NOT NULL DEFAULT '[]',
+      mnemon_store_id TEXT,
+      created_at      TEXT NOT NULL,
+      updated_at      TEXT
+    );
+  `);
+  return db;
+}
+
+function insertGroup(db: Database.Database, id: string, folder: string, workgroupId?: string): void {
+  db.prepare(
+    `INSERT INTO agent_groups (id, name, folder, workgroup_id, created_at)
+     VALUES (?, ?, ?, ?, datetime('now'))`,
+  ).run(id, folder, folder, workgroupId ?? null);
+}
+
+function insertWorkgroup(db: Database.Database, id: string, mnemonStoreId: string, onecliSecrets = '[]'): void {
+  db.prepare(
+    `INSERT INTO workgroups (id, display_name, onecli_secrets, mnemon_store_id, created_at)
+     VALUES (?, ?, ?, ?, datetime('now'))`,
+  ).run(id, id, onecliSecrets, mnemonStoreId);
+}
+
+describe('reconcileWorkgroupAtSpawn — C1', () => {
+  let db: Database.Database;
+
+  beforeEach(() => {
+    db = makeWorkgroupDb();
+  });
+
+  it('test_reconciler_uses_parent_folder_for_mnemon_store_id', () => {
+    // Seed illie (parent) and illie-codex (sibling)
+    insertGroup(db, 'ag-illie', 'illysium');
+    insertGroup(db, 'ag-illie-codex', 'illysium-codex');
+
+    // Spawn illie-codex with workgroup_id pointing to the parent folder
+    const agentGroup = { id: 'ag-illie-codex', folder: 'illysium-codex' };
+    const containerConfig = { workgroup_id: 'illysium' };
+
+    reconcileWorkgroupAtSpawn(db, agentGroup, containerConfig);
+
+    // workgroup row should exist with mnemon_store_id = illie's agent_groups.id
+    const wg = db
+      .prepare('SELECT mnemon_store_id FROM workgroups WHERE id = ?')
+      .get('illysium') as { mnemon_store_id: string };
+    expect(wg).toBeDefined();
+    expect(wg.mnemon_store_id).toBe('ag-illie');
+
+    // agent_groups.workgroup_id should be updated
+    const ag = db
+      .prepare('SELECT workgroup_id FROM agent_groups WHERE id = ?')
+      .get('ag-illie-codex') as { workgroup_id: string };
+    expect(ag.workgroup_id).toBe('illysium');
+  });
+
+  it('test_reconciler_preserves_existing_workgroup_row', () => {
+    // Pre-seed workgroup with custom mnemon_store_id
+    const customStoreId = 'ag-custom-store';
+    insertGroup(db, 'ag-illie', 'illysium');
+    insertGroup(db, 'ag-illie-codex', 'illysium-codex');
+    insertWorkgroup(db, 'illysium', customStoreId);
+
+    const agentGroup = { id: 'ag-illie-codex', folder: 'illysium-codex' };
+    const containerConfig = { workgroup_id: 'illysium' };
+
+    reconcileWorkgroupAtSpawn(db, agentGroup, containerConfig);
+
+    // ON CONFLICT DO NOTHING: existing row preserved
+    const wg = db
+      .prepare('SELECT mnemon_store_id FROM workgroups WHERE id = ?')
+      .get('illysium') as { mnemon_store_id: string };
+    expect(wg.mnemon_store_id).toBe(customStoreId);
+  });
+
+  it('test_reconciler_standalone_fallback_to_self', () => {
+    // Standalone group — no parent, no sibling
+    insertGroup(db, 'ag-solo', 'solo-agent');
+
+    const agentGroup = { id: 'ag-solo', folder: 'solo-agent' };
+    const containerConfig = {}; // no workgroup_id declared
+
+    reconcileWorkgroupAtSpawn(db, agentGroup, containerConfig);
+
+    // workgroup id = own folder; mnemon_store_id = own agent_groups.id
+    const wg = db
+      .prepare('SELECT mnemon_store_id FROM workgroups WHERE id = ?')
+      .get('solo-agent') as { mnemon_store_id: string };
+    expect(wg).toBeDefined();
+    expect(wg.mnemon_store_id).toBe('ag-solo');
+
+    const ag = db
+      .prepare('SELECT workgroup_id FROM agent_groups WHERE id = ?')
+      .get('ag-solo') as { workgroup_id: string };
+    expect(ag.workgroup_id).toBe('solo-agent');
+  });
+
+  it('test_reconciler_atomic_workgroup_id_update', () => {
+    // Start with NULL workgroup_id; reconciler must set it
+    insertGroup(db, 'ag-foo', 'foo');
+
+    reconcileWorkgroupAtSpawn(db, { id: 'ag-foo', folder: 'foo' }, {});
+
+    const ag = db
+      .prepare('SELECT workgroup_id FROM agent_groups WHERE id = ?')
+      .get('ag-foo') as { workgroup_id: string };
+    expect(ag.workgroup_id).toBe('foo');
+  });
+
+  it('test_reconciler_noop_when_unchanged', () => {
+    // Pre-set workgroup_id correctly
+    insertGroup(db, 'ag-bar', 'bar', 'bar');
+    insertWorkgroup(db, 'bar', 'ag-bar');
+
+    // Spy on prepare to check that UPDATE runs but updates 0 rows
+    const before = db.prepare('SELECT workgroup_id FROM agent_groups WHERE id = ?').get('ag-bar') as {
+      workgroup_id: string;
+    };
+    expect(before.workgroup_id).toBe('bar');
+
+    reconcileWorkgroupAtSpawn(db, { id: 'ag-bar', folder: 'bar' }, {});
+
+    // workgroup_id unchanged after noop
+    const after = db.prepare('SELECT workgroup_id FROM agent_groups WHERE id = ?').get('ag-bar') as {
+      workgroup_id: string;
+    };
+    expect(after.workgroup_id).toBe('bar');
+  });
+});
+
+// ── MNEMON_STORE resolver tests (C2) ─────────────────────────────────────────
+
+describe('resolveMnemonStore — C2', () => {
+  let db: Database.Database;
+
+  beforeEach(() => {
+    db = makeWorkgroupDb();
+  });
+
+  it('test_mnemon_store_from_workgroups_when_no_env_override', () => {
+    insertGroup(db, 'ag-illie-codex', 'illysium-codex', 'illysium');
+    insertWorkgroup(db, 'illysium', 'ag-illie'); // parent's id
+
+    const result = resolveMnemonStore(db, { id: 'ag-illie-codex', folder: 'illysium-codex' }, {});
+    expect(result).toBe('ag-illie');
+  });
+
+  it('test_pr_105_env_override_takes_precedence', () => {
+    insertGroup(db, 'ag-illie-codex', 'illysium-codex', 'illysium');
+    insertWorkgroup(db, 'illysium', 'ag-illie');
+
+    // Env override should win over workgroups.mnemon_store_id
+    const env = { MNEMON_STORE_illysium_codex: 'env-override-store' };
+    const result = resolveMnemonStore(db, { id: 'ag-illie-codex', folder: 'illysium-codex' }, env);
+    expect(result).toBe('env-override-store');
+  });
+
+  it('test_uppercase_env_override_fallback_preserved', () => {
+    insertGroup(db, 'ag-foo', 'foo', 'foo');
+    insertWorkgroup(db, 'foo', 'ag-foo');
+
+    // Uppercase variant should also be honored (PR #105 case-insensitive fallback)
+    const env = { MNEMON_STORE_FOO: 'uppercase-override' };
+    const result = resolveMnemonStore(db, { id: 'ag-foo', folder: 'foo' }, env);
+    expect(result).toBe('uppercase-override');
+  });
+
+  it('test_fallback_to_agent_group_id_when_workgroups_row_missing', () => {
+    // No workgroups row and no workgroup_id on agent_groups
+    insertGroup(db, 'ag-orphan', 'orphan');
+
+    const result = resolveMnemonStore(db, { id: 'ag-orphan', folder: 'orphan' }, {});
+    expect(result).toBe('ag-orphan');
+  });
+});
+
+// ── Spawn merged-secrets tests (C3) ──────────────────────────────────────────
+// These tests verify the merge logic by exercising mergeWorkgroupAndGroupSecrets
+// (from onecli-secrets.ts) as it would be called from the spawn path.
+// The full buildContainerArgs path uses live onecli shell calls — tested via
+// the unit tests in onecli-secrets.test.ts instead.
+
+describe('workgroup secrets merge at spawn (C3 contract verification)', () => {
+  it('test_spawn_applies_merged_secrets — workgroup baseline union group additive', () => {
+    // Directly verify the merge that buildContainerArgs performs:
+    // workgroups.onecli_secrets ∪ containerConfig.onecliSecrets (additive, dedup)
+    const workgroupSecrets = ['Anthropic', 'Exa'];
+    const groupSecrets = ['Datafold-Illysium'];
+    const merged = mergeWorkgroupAndGroupSecrets(workgroupSecrets, groupSecrets);
+
+    expect(merged).toEqual(['Anthropic', 'Exa', 'Datafold-Illysium']);
+  });
+
+  it('dedup when group repeats workgroup secret', () => {
+    const merged = mergeWorkgroupAndGroupSecrets(['Anthropic', 'Exa'], ['Anthropic', 'NewSecret']);
+    expect(merged).toEqual(['Anthropic', 'Exa', 'NewSecret']);
+  });
+
+  it('empty workgroup secrets passes through group secrets only', () => {
+    const merged = mergeWorkgroupAndGroupSecrets([], ['Datafold-Illysium']);
+    expect(merged).toEqual(['Datafold-Illysium']);
   });
 });

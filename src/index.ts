@@ -112,6 +112,10 @@ import './modules/index.js';
 // since the reconciler queries the central DB.
 import { runReconcilerOnStartup as runDispatchReconcilerOnStartup } from './modules/orchestrator-dispatch/index.js';
 
+// Workgroup FS reconciler — drains the _migration036_report temp table and
+// writes recall_scope to paired groups' container.json. Runs after migrations.
+import { reconcileWorkgroupFsState } from './modules/workgroup/fs-reconcile.js';
+
 import type { ChannelAdapter, ChannelSetup } from './channels/adapter.js';
 import { initChannelAdapters, teardownChannelAdapters, getChannelAdapter } from './channels/channel-registry.js';
 
@@ -143,6 +147,18 @@ async function main(): Promise<void> {
   const dbPath = path.join(DATA_DIR, 'v2.db');
   const db = initDb(dbPath);
   runMigrations(db);
+
+  // Workgroup FS reconciliation — runs after migrations to drain the
+  // _migration036_report temp table and write recall_scope to paired
+  // groups' container.json. On FS failure, exit; restart is the recovery
+  // (reconciler is idempotent).
+  try {
+    reconcileWorkgroupFsState(db);
+  } catch (fsErr) {
+    log.error('Workgroup FS reconciliation failed at startup', { err: fsErr });
+    process.exit(1);
+  }
+
   log.info('Central DB ready', { path: dbPath });
 
   // 1a. Start dashboard — after migrations (028 must exist) and before
