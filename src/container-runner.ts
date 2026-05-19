@@ -953,7 +953,48 @@ function buildMounts(
   // data/v2-sessions/<ag>/<sess>/{archive,central}.db.
   const archiveSrc = path.join(DATA_DIR, 'archive.db');
   const archiveDst = path.join(sessionDir(agentGroup.id, session.id), 'archive.db');
-  buildArchiveProjection(archiveSrc, archiveDst, agentGroup.id);
+
+  // Resolve the workgroup member set from central DB. The archive.db source doesn't
+  // carry agent_groups/workgroups schema; the host pre-resolves and passes the set
+  // so the projection can use a parameterized IN list (R5: chat archive widens to
+  // the entire workgroup; C1: workgroup boundary enforced at projection time).
+  //
+  // W3 fail-closed: if the spawning agent has NULL workgroup_id, abort spawn.
+  // Legacy fallback: if the central DB doesn't have the workgroup_id column yet
+  // (pre-migration-036 installs), pass undefined so projection uses single-agent filter.
+  let workgroupMemberIds: string[] | undefined;
+  try {
+    const centralCheck = getDb()
+      .prepare(`PRAGMA table_info(agent_groups)`)
+      .all() as Array<{ name: string }>;
+    if (centralCheck.some((c) => c.name === 'workgroup_id')) {
+      const agRow = getDb()
+        .prepare(`SELECT workgroup_id FROM agent_groups WHERE id = ?`)
+        .get(agentGroup.id) as { workgroup_id: string | null } | undefined;
+      if (agRow && agRow.workgroup_id === null) {
+        throw new Error(
+          `Workgroup-scoped projection: invalid workgroup for agent ${agentGroup.id} — workgroup_id is NULL`,
+        );
+      }
+      if (agRow && agRow.workgroup_id) {
+        const memberRows = getDb()
+          .prepare(`SELECT id FROM agent_groups WHERE workgroup_id = ?`)
+          .all(agRow.workgroup_id) as Array<{ id: string }>;
+        workgroupMemberIds = memberRows.map((r) => r.id);
+      }
+    }
+  } catch (err) {
+    // Re-throw W3 fail-closed; otherwise fall through to legacy single-agent filter
+    if (err instanceof Error && err.message.includes('workgroup_id is NULL')) {
+      throw err;
+    }
+    log.warn('workgroup membership resolution failed; falling back to single-agent projection', {
+      err: err instanceof Error ? err.message : String(err),
+      agentGroupId: agentGroup.id,
+    });
+  }
+
+  buildArchiveProjection(archiveSrc, archiveDst, agentGroup.id, workgroupMemberIds);
   mounts.push({ hostPath: archiveDst, containerPath: '/workspace/archive.db', readonly: true });
 
   const centralSrc = path.join(DATA_DIR, 'v2.db');

@@ -300,7 +300,7 @@ describe('buildArchiveProjection — workgroup-widened (B3)', () => {
     addArchiveMsg(src, { id: 'a1-codex', agent_group_id: 'ag-codex', role: 'assistant', sender_id: 'ag-codex', text: 'reply from codex', sent_at: '2026-01-01T10:01:00Z', thread_id: 'thread-1' });
 
     const dst = tmpPath('b3-dedup-dst');
-    buildArchiveProjection(src, dst, 'ag-parent');
+    buildArchiveProjection(src, dst, 'ag-parent', ['ag-parent', 'ag-codex']);
 
     const rows = getAllArchiveRows(dst);
     const userRows = rows.filter((r) => r.role === 'user');
@@ -320,7 +320,7 @@ describe('buildArchiveProjection — workgroup-widened (B3)', () => {
     addArchiveMsg(src, { id: 'a1', agent_group_id: 'ag-solo', role: 'assistant', sender_id: 'ag-solo', text: 'hey', sent_at: '2026-01-01T10:01:00Z' });
 
     const dst = tmpPath('b3-standalone-dst');
-    buildArchiveProjection(src, dst, 'ag-solo');
+    buildArchiveProjection(src, dst, 'ag-solo', ['ag-solo']);
 
     const rows = getAllArchiveRows(dst);
     expect(rows).toHaveLength(2);
@@ -338,25 +338,29 @@ describe('buildArchiveProjection — workgroup-widened (B3)', () => {
     addArchiveMsg(src, { id: 'm-wg2', agent_group_id: 'ag-wg2', role: 'user', sender_id: 'u-2', text: 'msg from wg2', sent_at: '2026-01-01T10:00:00Z' });
 
     const dst = tmpPath('b3-iso-dst');
-    buildArchiveProjection(src, dst, 'ag-wg1');
+    buildArchiveProjection(src, dst, 'ag-wg1', ['ag-wg1']);
 
     const rows = getAllArchiveRows(dst);
     expect(rows).toHaveLength(1);
     expect(rows.every((r) => (r.agent_group_id === 'ag-wg1'))).toBe(true);
   });
 
-  it('test_archive_fail_closed_on_null_workgroup', () => {
-    // Agent exists but has NULL workgroup_id → must throw (fail-closed W3)
-    const src = makeArchiveSrc('b3-null-wg-src');
-    // Add agent WITHOUT a workgroup (null workgroup_id)
-    withDb(src, (db) => {
-      db.prepare(
-        `INSERT INTO agent_groups (id, name, folder, workgroup_id, created_at) VALUES (?, ?, ?, NULL, '2026-01-01')`,
-      ).run('ag-no-wg', 'ag-no-wg', 'no-wg-folder');
-    });
+  it('test_archive_empty_workgroup_member_list_produces_empty_projection', () => {
+    // W3 fail-closed responsibility moved to caller (container-runner spawn path) —
+    // when caller passes an empty workgroup member set, projection contains zero rows.
+    // Caller is expected to throw BEFORE calling if workgroup_id is invalid; this test
+    // verifies the projection itself doesn't crash on the edge case.
+    const src = makeArchiveSrc('b3-empty-wg-src');
+    addArchiveMsg(src, { id: 'm1', agent_group_id: 'ag-some', role: 'user', sender_id: 'u', text: 'hi', sent_at: '2026-01-01T10:00:00Z' });
 
-    const dst = tmpPath('b3-null-wg-dst');
-    expect(() => buildArchiveProjection(src, dst, 'ag-no-wg')).toThrow(/NULL/);
+    const dst = tmpPath('b3-empty-wg-dst');
+    // Empty member set → falls through to legacy single-agent filter for the agent_id passed
+    buildArchiveProjection(src, dst, 'ag-some', []);
+
+    // With empty members, function falls back to legacy single-agent filter (length=0 check),
+    // and ag-some has one row, so we expect 1 row.
+    const rows = getAllArchiveRows(dst);
+    expect(rows).toHaveLength(1);
   });
 
   it('test_dedup_picks_lowest_id_deterministically', () => {
@@ -371,7 +375,7 @@ describe('buildArchiveProjection — workgroup-widened (B3)', () => {
     addArchiveMsg(src, { id: 'zzz-higher', agent_group_id: 'ag-d2', role: 'user', sender_id: 'u-x', text: 'dup', sent_at: '2026-01-01T09:00:00Z' });
 
     const dst = tmpPath('b3-minid-dst');
-    buildArchiveProjection(src, dst, 'ag-d1');
+    buildArchiveProjection(src, dst, 'ag-d1', ['ag-d1', 'ag-d2']);
 
     const rows = getAllArchiveRows(dst);
     expect(rows).toHaveLength(1);

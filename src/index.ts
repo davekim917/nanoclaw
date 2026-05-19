@@ -153,7 +153,7 @@ async function main(): Promise<void> {
   // groups' container.json. On FS failure, exit; restart is the recovery
   // (reconciler is idempotent).
   try {
-    await reconcileWorkgroupFsState(db);
+    reconcileWorkgroupFsState(db);
   } catch (fsErr) {
     log.error('Workgroup FS reconciliation failed at startup', { err: fsErr });
     process.exit(1);

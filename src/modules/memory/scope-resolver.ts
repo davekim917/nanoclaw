@@ -1,8 +1,9 @@
 import fs from 'fs';
 import path from 'path';
+import BetterSqlite3 from 'better-sqlite3';
 import type Database from 'better-sqlite3';
 
-import { GROUPS_DIR } from '../../config.js';
+import { DATA_DIR, GROUPS_DIR } from '../../config.js';
 import type { RecallScope } from '../../container-config.js';
 
 interface CacheEntry {
@@ -89,13 +90,6 @@ function openCentralDb(): { db: Database.Database; owned: boolean } {
   if (_centralDbOverride) {
     return { db: _centralDbOverride, owned: false };
   }
-
-  // Lazy import to avoid circular dependency at module load time.
-  // DATA_DIR is not available at import time during tests unless initDb is called.
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const { DATA_DIR } = require('../../config.js') as { DATA_DIR: string };
-  // eslint-disable-next-line @typescript-eslint/no-require-imports
-  const BetterSqlite3 = require('better-sqlite3') as typeof import('better-sqlite3');
   const dbPath = path.join(DATA_DIR, 'v2.db');
   const db = new BetterSqlite3(dbPath, { readonly: true });
   return { db, owned: true };

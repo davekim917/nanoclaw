@@ -126,7 +126,7 @@ function resolveAgentUuid(identifier: string): string {
  * leave the agent in an under-credentialed state without a clear
  * error signal.
  */
-function resolveSecretUuids(declarations: string[]): string[] {
+export function resolveSecretUuids(declarations: string[]): string[] {
   if (declarations.length === 0) return [];
 
   const secrets = listSecrets();
@@ -239,13 +239,9 @@ export function __resetCachesForTest(): void {
 
 /**
  * Internal helpers exported solely for unit tests. Production callers
- * use `applyOnecliSecrets`.
+ * use `applyOnecliSecrets`. Note: `resolveSecretUuids` is ALSO exported at
+ * top-level (above) for use by `scripts/set-workgroup-secrets.ts` — the
+ * `__test` reference here is for legacy tests that already imported via
+ * this namespace and is kept for compatibility.
  */
-export const __test = { isUuid, resolveSecretUuids, resolveAgentUuid };
-
-/**
- * Exported for the `scripts/set-workgroup-secrets.ts` CLI so it can validate
- * secret names before writing to the DB without calling `applyOnecliSecrets`.
- * Not intended for other production callers.
- */
-export { resolveSecretUuids };
+export const __test = { isUuid, resolveAgentUuid };

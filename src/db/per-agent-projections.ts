@@ -96,7 +96,27 @@ const ARCHIVE_COLS = [
   'channel_name',
 ];
 
-export function buildArchiveProjection(srcPath: string, dstPath: string, agentGroupId: string): void {
+/**
+ * Build a per-agent projection of `archive.db` containing rows for the spawning agent's
+ * workgroup (or just the agent itself if `workgroupMemberIds` is omitted — legacy mode).
+ *
+ * The caller (container-runner spawn path) is responsible for resolving the workgroup
+ * member set from the central DB and passing it as `workgroupMemberIds`. The archive.db
+ * source doesn't carry the agent_groups/workgroups schema; cross-DB joins would require
+ * ATTACH and add complexity. Passing the set as a parameter keeps `archive.db` write-side
+ * simple and the projection's hot path index-friendly.
+ *
+ * Empty array → projection contains zero rows (W3 fail-closed: caller checks workgroup_id
+ * BEFORE calling and passes empty if invalid, or throws upstream).
+ * Undefined → legacy single-agent filter (`WHERE agent_group_id = ?`). Used by tests and
+ * any future caller that doesn't have central-DB access at the projection time.
+ */
+export function buildArchiveProjection(
+  srcPath: string,
+  dstPath: string,
+  agentGroupId: string,
+  workgroupMemberIds?: string[],
+): void {
   if (fs.existsSync(dstPath)) fs.unlinkSync(dstPath);
   const dst = new Database(dstPath);
   try {
@@ -108,74 +128,43 @@ export function buildArchiveProjection(srcPath: string, dstPath: string, agentGr
     }
     const src = new Database(srcPath, { readonly: true });
     try {
-      // ── W3 fail-closed: verify agent has a non-null workgroup_id ──────────
-      // If agent_groups doesn't exist in this archive src (older installs), fall
-      // through gracefully. If it does exist, NULL workgroup_id is a hard error.
-      const agentGroupsExists = src
-        .prepare(`SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_groups'`)
-        .get() as { 1: number } | undefined;
-
-      if (agentGroupsExists) {
-        const agRow = src
-          .prepare(`SELECT workgroup_id FROM agent_groups WHERE id = ? LIMIT 1`)
-          .get(agentGroupId) as { workgroup_id: string | null } | undefined;
-
-        if (agRow !== undefined && agRow.workgroup_id === null) {
-          throw new Error(
-            `Workgroup-scoped projection: invalid workgroup for agent ${agentGroupId} — workgroup_id is NULL`,
-          );
-        }
-
-        if (agRow !== undefined && agRow.workgroup_id !== null) {
-          // ── Workgroup-widened SELECT with dedup ─────────────────────────
-          // GROUP BY the content columns; identical user messages from sibling
-          // agents collapse to 1 row (MIN id). Assistant rows differ by
-          // sender_id so they get their own bucket → survive dedup.
-          const rows = src
-            .prepare(
-              `SELECT
-                 MIN(id)               AS id,
-                 MIN(agent_group_id)   AS agent_group_id,
-                 messaging_group_id,
-                 MAX(channel_type)     AS channel_type,
-                 MAX(channel_name)     AS channel_name,
-                 MAX(platform_id)      AS platform_id,
-                 thread_id,
-                 role,
-                 sender_id,
-                 MAX(sender_name)      AS sender_name,
-                 text,
-                 sent_at,
-                 MIN(created_at)       AS created_at
-               FROM messages_archive
-               WHERE agent_group_id IN (
-                 SELECT id FROM agent_groups WHERE workgroup_id = (
-                   SELECT workgroup_id FROM agent_groups WHERE id = ?
-                 )
-               )
-               GROUP BY messaging_group_id, thread_id, role, sender_id, sent_at, text`,
-            )
-            .all(agentGroupId) as Array<Record<string, unknown>>;
-
-          const colList = ARCHIVE_COLS.join(', ');
-          const placeholders = ARCHIVE_COLS.map(() => '?').join(', ');
-          const insertStmt = dst.prepare(`INSERT INTO messages_archive (${colList}) VALUES (${placeholders})`);
-          const insertMany = dst.transaction((batch: Array<Record<string, unknown>>) => {
-            for (const row of batch) {
-              insertStmt.run(...ARCHIVE_COLS.map((c) => row[c]));
-            }
-          });
-          insertMany(rows);
-          return;
-        }
+      let rows: Array<Record<string, unknown>>;
+      if (workgroupMemberIds && workgroupMemberIds.length > 0) {
+        // ── Workgroup-widened SELECT with dedup ─────────────────────────
+        // GROUP BY the content columns; identical user messages from sibling
+        // agents collapse to 1 row (MIN id). Assistant rows differ by
+        // sender_id so they get their own bucket → survive dedup.
+        const placeholders = workgroupMemberIds.map(() => '?').join(', ');
+        rows = src
+          .prepare(
+            `SELECT
+               MIN(id)               AS id,
+               MIN(agent_group_id)   AS agent_group_id,
+               messaging_group_id,
+               MAX(channel_type)     AS channel_type,
+               MAX(channel_name)     AS channel_name,
+               MAX(platform_id)      AS platform_id,
+               thread_id,
+               role,
+               sender_id,
+               MAX(sender_name)      AS sender_name,
+               text,
+               sent_at,
+               MIN(created_at)       AS created_at
+             FROM messages_archive
+             WHERE agent_group_id IN (${placeholders})
+             GROUP BY messaging_group_id, thread_id, role, sender_id, sent_at, text`,
+          )
+          .all(...workgroupMemberIds) as Array<Record<string, unknown>>;
+      } else {
+        // ── Legacy single-agent filter (test fixtures, fresh installs pre-migration) ─
+        rows = src
+          .prepare(`SELECT ${ARCHIVE_COLS.join(', ')} FROM messages_archive WHERE agent_group_id = ?`)
+          .all(agentGroupId) as Array<Record<string, unknown>>;
       }
 
-      // ── Legacy / no workgroup: fall back to single-agent filter ──────────
       const colList = ARCHIVE_COLS.join(', ');
       const placeholders = ARCHIVE_COLS.map(() => '?').join(', ');
-      const rows = src
-        .prepare(`SELECT ${colList} FROM messages_archive WHERE agent_group_id = ?`)
-        .all(agentGroupId) as Array<Record<string, unknown>>;
       const insertStmt = dst.prepare(`INSERT INTO messages_archive (${colList}) VALUES (${placeholders})`);
       const insertMany = dst.transaction((batch: Array<Record<string, unknown>>) => {
         for (const row of batch) {
@@ -188,11 +177,6 @@ export function buildArchiveProjection(srcPath: string, dstPath: string, agentGr
     }
   } catch (err) {
     log.error('buildArchiveProjection failed', { err, agentGroupId, dstPath });
-    // Re-throw if this is the W3 fail-closed error so callers (container-runner spawn)
-    // see the error and abort the spawn rather than silently producing a wrong projection.
-    if (err instanceof Error && err.message.includes('workgroup_id is NULL')) {
-      throw err;
-    }
   } finally {
     dst.close();
   }

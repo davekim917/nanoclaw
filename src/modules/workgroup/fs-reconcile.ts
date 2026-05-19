@@ -21,7 +21,7 @@ import type Database from 'better-sqlite3';
 import { log } from '../../log.js';
 import { readContainerConfig, writeContainerConfig } from '../../container-config.js';
 
-export async function reconcileWorkgroupFsState(db: Database.Database): Promise<void> {
+export function reconcileWorkgroupFsState(db: Database.Database): void {
   // ── 1. Drain migration-036 report if present ──────────────────────────
   const reportTableExists = db
     .prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='_migration036_report'`)

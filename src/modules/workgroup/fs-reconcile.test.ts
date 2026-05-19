@@ -232,7 +232,7 @@ describe('reconcileWorkgroupFsState', () => {
   });
 
   // ── T4: throws on FS failure ─────────────────────────────────────────
-  it('test_throws_on_fs_failure', async () => {
+  it('test_throws_on_fs_failure', () => {
     const db = makeDb();
     const report = { pairings: [], standalone: ['foo'], suffix_strip_unmatched: [] };
     seedMigrationReport(db, report);
@@ -243,7 +243,7 @@ describe('reconcileWorkgroupFsState', () => {
     });
 
     try {
-      await expect(reconcileWorkgroupFsState(db)).rejects.toThrow('DISK FULL');
+      expect(() => reconcileWorkgroupFsState(db)).toThrow('DISK FULL');
 
       // DB state: _migration036_report must still exist (reconciler threw before DROP)
       const tableRow = db
