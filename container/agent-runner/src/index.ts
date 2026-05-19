@@ -116,8 +116,22 @@ async function main(): Promise<void> {
     },
   };
 
+  // MCP names that are HOST-ONLY: container.json's mcpServers cannot wire
+  // them, because the host runs a per-session permission gate that the
+  // static config would bypass. Anything in this list MUST be injected via
+  // NANOCLAW_MCP_SERVERS env (host-controlled) to take effect.
+  // (Codex P2 catch on PR #108 — closes the static-declaration bypass.)
+  const HOST_ONLY_MCP_NAMES = new Set(['slack-user-token']);
+
   // Static per-group config from container.json.
   for (const [name, serverConfig] of Object.entries(config.mcpServers)) {
+    if (HOST_ONLY_MCP_NAMES.has(name)) {
+      log(
+        `Ignored container.json mcpServers[${name}] — host-only MCP; ` +
+          `wire via host config (gated per-session) instead`,
+      );
+      continue;
+    }
     mcpServers[name] = serverConfig;
     log(`Additional MCP server: ${name} (${serverConfig.command})`);
   }

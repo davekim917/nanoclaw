@@ -508,8 +508,15 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
   //     (Slack user-token gate, future per-user DM features) would
   //     incorrectly deny on a first-time inbound DM until something else
   //     prewarmed the cache. Writing here makes the cache reliable.
-  //     (Codex P2 catch on PR #108.)
-  if (userId !== null && mg.is_group === 0) {
+  //
+  //     Guard: require event.isDM === true explicitly (not just
+  //     mg.is_group === 0). The messaging-group creation path defaults
+  //     is_group to 0 when the adapter doesn't pass isDM (line above
+  //     this branch — `event.isDM === false ? 1 : 0`), so is_group=0
+  //     can mean "uncertain adapter" rather than "confirmed DM." Caching
+  //     a shared channel as a user's DM would poison subsequent DM
+  //     resolution. (Codex P2 catch on PR #108 follow-up.)
+  if (userId !== null && event.isDM === true) {
     try {
       const { upsertUserDm } = await import('./modules/permissions/db/user-dms.js');
       upsertUserDm({

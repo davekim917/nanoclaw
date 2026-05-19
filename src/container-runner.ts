@@ -2058,19 +2058,18 @@ async function buildContainerArgs(
           `Pick one: drop ANTHROPIC_BASE_URL (run through OneCLI) or remove onecliSecrets from container.json.`,
       );
     }
+    // Slack MCP is incompatible with the OneCLI bypass path (no gateway to
+    // substitute the placeholder Bearer → 401 on every call). But we should
+    // NOT throw — that would block every spawn of the agent, including
+    // sessions in shared channels where the gate would deny Slack anyway.
+    // Log + flag: the Slack MCP registration block below will skip
+    // registration when this flag is set, leaving the rest of the spawn
+    // intact. (Codex P2 catch on PR #108 follow-up.)
     if (containerConfig.slack_user_token?.enabled) {
-      // Same class of misconfiguration: Slack user-token MCP relies on the
-      // OneCLI gateway substituting the placeholder Bearer header for
-      // outbound slack.com calls. In the ANTHROPIC_BASE_URL bypass path
-      // the gateway is OFF, so the placeholder xoxp- value reaches Slack
-      // unchanged and every API call 401s. Fail-closed at spawn rather
-      // than ship a session whose Slack tools all silently fail.
-      // (Codex P2 catch on PR #108.)
-      throw new Error(
-        `container.json declares slack_user_token.enabled but ANTHROPIC_BASE_URL is set — ` +
-          `OneCLI gateway is bypassed in this path, so the Slack MCP's Bearer-header substitution ` +
-          `cannot fire and outbound slack.com calls would 401. ` +
-          `Pick one: drop ANTHROPIC_BASE_URL (run through OneCLI) or remove slack_user_token from container.json.`,
+      log.warn(
+        'slack_user_token.enabled but ANTHROPIC_BASE_URL is set — OneCLI gateway is bypassed, ' +
+          'Slack MCP will not be registered for any session of this agent until BASE_URL is dropped',
+        { folder: agentGroup.folder },
       );
     }
   } else {
@@ -2400,36 +2399,47 @@ async function buildContainerArgs(
   // process). The slack-mcp-wrapper.sh baked into the image copies the
   // container's HTTPS_PROXY into SLACK_MCP_PROXY at startup — see
   // container/slack-mcp-wrapper.sh.
-  if (containerConfig.slack_user_token?.enabled) {
+  // Resolve allowed-or-not BEFORE branching so the deny path runs even when
+  // the operator left slack_user_token unset/disabled. A static
+  // `slack-user-token` entry in container.json.mcpServers would otherwise
+  // sneak past — `delete` runs unconditionally on deny.
+  // (Codex P2 catch on PR #108 follow-up.)
+  let slackUserTokenAllowed = false;
+  if (containerConfig.slack_user_token?.enabled && !process.env.ANTHROPIC_BASE_URL) {
     const { canUseSlackUserToken } = await import('./modules/permissions/slack-user-token-gate.js');
-    const allowed = canUseSlackUserToken(getDb(), sessionMessagingGroupId ?? null, containerConfig.slack_user_token);
-    if (allowed) {
-      mcpServers['slack-user-token'] = {
-        type: 'stdio',
-        command: 'slack-mcp-server',
-        // `--transport stdio` is REQUIRED by v1.3.0 — omitting it means the
-        // server starts without a transport and MCP init handshake fails.
-        args: ['--transport', 'stdio'],
-        env: {
-          SLACK_MCP_XOXP_TOKEN: 'xoxp-onecli-managed-placeholder',
-          // Caches default to `.users_cache.json` + `.channels_cache_v2.json`
-          // in the working directory. With --rm containers the cache vanishes
-          // per spawn, so the first call after spawn pays a one-time
-          // listing cost — acceptable for low-spawn frequency. If perf
-          // becomes a concern, mount a writable cache path and set
-          // SLACK_MCP_USERS_CACHE / SLACK_MCP_CHANNELS_CACHE to absolute
-          // paths there. Empty values fall through to the default — we do
-          // NOT set them.
-        },
-      };
-    } else {
-      // Codex P2 catch on PR #108: a static `slack-user-token` entry already
-      // present in container.json.mcpServers seeds the map BEFORE this gate
-      // runs. Logging alone would leave that pre-declared entry intact and
-      // the agent would still receive the Slack MCP in a denied session.
-      // Explicit delete = the gate is authoritative regardless of how the
-      // entry got there.
-      delete mcpServers['slack-user-token'];
+    slackUserTokenAllowed = canUseSlackUserToken(
+      getDb(),
+      sessionMessagingGroupId ?? null,
+      containerConfig.slack_user_token,
+    );
+  }
+  if (slackUserTokenAllowed) {
+    mcpServers['slack-user-token'] = {
+      type: 'stdio',
+      command: 'slack-mcp-server',
+      // `--transport stdio` is REQUIRED by v1.3.0 — omitting it means the
+      // server starts without a transport and MCP init handshake fails.
+      args: ['--transport', 'stdio'],
+      env: {
+        SLACK_MCP_XOXP_TOKEN: 'xoxp-onecli-managed-placeholder',
+        // Caches default to `.users_cache.json` + `.channels_cache_v2.json`
+        // in the working directory. With --rm containers the cache vanishes
+        // per spawn, so the first call after spawn pays a one-time
+        // listing cost — acceptable for low-spawn frequency. If perf
+        // becomes a concern, mount a writable cache path and set
+        // SLACK_MCP_USERS_CACHE / SLACK_MCP_CHANNELS_CACHE to absolute
+        // paths there. Empty values fall through to the default — we do
+        // NOT set them.
+      },
+    };
+  } else {
+    // Strip any pre-declared `slack-user-token` entry that came from
+    // container.json.mcpServers (operator mistake, stale config, or copy-
+    // paste). The host-side env-var copy is the only one we control here;
+    // container-side enforcement is at container/agent-runner/src/index.ts
+    // via the SLACK_USER_TOKEN_RESERVED list. (Codex P2 catch on PR #108.)
+    delete mcpServers['slack-user-token'];
+    if (containerConfig.slack_user_token?.enabled) {
       log.info('slack-user-token MCP gated off for this session', {
         sessionMessagingGroupId: sessionMessagingGroupId ?? null,
         folder: agentGroup.folder,
