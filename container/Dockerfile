@@ -136,11 +136,17 @@ RUN python3 -m venv /opt/atlassian-venv \
 # gating is per-session in container-runner.ts.
 #
 # Installs to /usr/local/bin/slack-mcp-server.real; the on-disk
-# /usr/local/bin/slack-mcp-server is a thin wrapper (container/slack-mcp-wrapper.sh)
-# that copies HTTPS_PROXY → SLACK_MCP_PROXY at startup so korotovsky's HTTP
-# client (which honors only SLACK_MCP_PROXY, not HTTPS_PROXY) routes outbound
-# slack.com calls through the OneCLI gateway for credential substitution.
-COPY container/slack-mcp-wrapper.sh /usr/local/bin/slack-mcp-server
+# /usr/local/bin/slack-mcp-server is a thin wrapper (slack-mcp-wrapper.sh in
+# this directory) that copies HTTPS_PROXY → SLACK_MCP_PROXY at startup so
+# korotovsky's HTTP client (which honors only SLACK_MCP_PROXY, not
+# HTTPS_PROXY) routes outbound slack.com calls through the OneCLI gateway
+# for credential substitution.
+#
+# Path is relative to the Docker build context, which is `container/` (per
+# container/build.sh:55 — `docker build … .` after `cd "$SCRIPT_DIR"`). The
+# prior `container/slack-mcp-wrapper.sh` form double-nested and broke the
+# build because Docker resolves COPY paths relative to the context root.
+COPY slack-mcp-wrapper.sh /usr/local/bin/slack-mcp-server
 RUN ARCH=$(uname -m) \
     && case "$ARCH" in \
          x86_64)  SLACK_ARCH=amd64 ;; \
