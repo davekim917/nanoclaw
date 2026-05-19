@@ -2378,6 +2378,13 @@ async function buildContainerArgs(
   // assigned `Slack-User-Token-<Workspace>` vault secret. Gateway rules for
   // slack.com hosts must be configured at the OneCLI side (see
   // docs/slack-user-token.md).
+  //
+  // Proxy: korotovsky's HTTP client honors only SLACK_MCP_PROXY, not the
+  // standard HTTPS_PROXY. We can't compute the gateway URL here (it's
+  // injected by applyContainerConfig into the container's env, not the host
+  // process). The slack-mcp-wrapper.sh baked into the image copies the
+  // container's HTTPS_PROXY into SLACK_MCP_PROXY at startup — see
+  // container/slack-mcp-wrapper.sh.
   if (containerConfig.slack_user_token?.enabled) {
     const { canUseSlackUserToken } = await import('./modules/permissions/slack-user-token-gate.js');
     const allowed = canUseSlackUserToken(getDb(), sessionMessagingGroupId ?? null, containerConfig.slack_user_token);
@@ -2385,18 +2392,19 @@ async function buildContainerArgs(
       mcpServers['slack-user-token'] = {
         type: 'stdio',
         command: 'slack-mcp-server',
-        args: [],
+        // `--transport stdio` is REQUIRED by v1.3.0 — omitting it means the
+        // server starts without a transport and MCP init handshake fails.
+        args: ['--transport', 'stdio'],
         env: {
           SLACK_MCP_XOXP_TOKEN: 'xoxp-onecli-managed-placeholder',
-          // No caches by default — keeps startup simple. A future revision
-          // could mount a writable cache path for faster repeat lookups.
-          SLACK_MCP_USERS_CACHE: '',
-          SLACK_MCP_CHANNELS_CACHE_V2: '',
-          // Honor the container's HTTPS_PROXY so outbound slack.com calls
-          // route through OneCLI's gateway for credential substitution.
-          // Go's net/http honors HTTPS_PROXY by default, but korotovsky also
-          // accepts its own SLACK_MCP_PROXY var — set both for safety.
-          SLACK_MCP_PROXY: process.env.HTTPS_PROXY ?? '',
+          // Caches default to `.users_cache.json` + `.channels_cache_v2.json`
+          // in the working directory. With --rm containers the cache vanishes
+          // per spawn, so the first call after spawn pays a one-time
+          // listing cost — acceptable for low-spawn frequency. If perf
+          // becomes a concern, mount a writable cache path and set
+          // SLACK_MCP_USERS_CACHE / SLACK_MCP_CHANNELS_CACHE to absolute
+          // paths there. Empty values fall through to the default — we do
+          // NOT set them.
         },
       };
     } else {
