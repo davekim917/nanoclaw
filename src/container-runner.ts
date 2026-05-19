@@ -161,53 +161,59 @@ export function reconcileWorkgroupAtSpawn(
   const declared = containerConfig.workgroup_id ?? agentGroup.folder;
 
   // Look up the parent agent_groups row for the declared workgroup id (folder).
-  const parentRow = db
-    .prepare('SELECT id FROM agent_groups WHERE folder = ? LIMIT 1')
-    .get(declared) as { id: string } | undefined;
+  const parentRow = db.prepare('SELECT id FROM agent_groups WHERE folder = ? LIMIT 1').get(declared) as
+    | { id: string }
+    | undefined;
   const mnemonStoreId = parentRow?.id ?? agentGroup.id;
 
   db.transaction(() => {
     // Insert workgroup row idempotently. ON CONFLICT DO NOTHING preserves any
     // mnemon_store_id already set by a prior spawn or migration 036.
-    db.prepare(`
+    db.prepare(
+      `
       INSERT INTO workgroups (id, display_name, onecli_secrets, mnemon_store_id, created_at)
       VALUES (?, ?, '[]', ?, datetime('now'))
       ON CONFLICT(id) DO NOTHING
-    `).run(declared, declared, mnemonStoreId);
+    `,
+    ).run(declared, declared, mnemonStoreId);
 
     // Atomic conditional update: only update if the column is NULL or stale.
-    db.prepare(`
+    db.prepare(
+      `
       UPDATE agent_groups SET workgroup_id = ?
       WHERE id = ? AND (workgroup_id IS NULL OR workgroup_id != ?)
-    `).run(declared, agentGroup.id, declared);
+    `,
+    ).run(declared, agentGroup.id, declared);
   })();
 }
 
 /**
- * Pattern for a valid mnemon store identifier. Matches the shape of
- * agent_groups.id (`ag-<ts>-<rand>`), workgroup slugs (`a-z0-9` + hyphen),
- * and any sensible operator-chosen value. Crucially REJECTS:
- *   - `..` (path traversal)
+ * Pattern for a valid mnemon store identifier. Must align with the in-container
+ * mnemon-wrapper regex (`container/mnemon-wrapper.sh:12`: `^[a-zA-Z0-9_-]+$`),
+ * with an added 128-char length cap as defense-in-depth. Crucially REJECTS:
+ *   - `..` (path traversal — the `.` class char is not allowed at all)
  *   - `/` or `\` (path separators)
  *   - empty / whitespace-only strings
  *   - shell metacharacters that could break --store arg parsing
  *
- * Defense-in-depth: even though .env write is already privileged, an
+ * Why host-side validation: even though .env write is already privileged, an
  * unvalidated env override would let a `.env` line like
  * `MNEMON_STORE_illie_codex=../../.ssh` escape ~/.mnemon/data and bind-mount
- * an arbitrary host path RW into the container. Validate at the resolution
- * point so every caller (env mount, container env, write redirection) is
- * uniformly protected. (Codex P2 catch on PR #107.)
+ * an arbitrary host path RW into the container before the container wrapper
+ * could reject it. Validate at the host resolution point so every caller
+ * (env mount, container env, write redirection) is protected before any
+ * filesystem operation runs.
+ *
+ * Why align with the container wrapper (not stricter or looser): a value
+ * accepted by the host but rejected by the wrapper produces a silent recall
+ * outage — mount succeeds, env is set, then every `mnemon recall` invocation
+ * inside the container exits with code 2 and returns empty. The two patterns
+ * must agree. (Codex P2 catches on PR #107.)
  */
-const STORE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
+const STORE_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 
 export function isValidStoreId(value: string): boolean {
-  if (!STORE_ID_PATTERN.test(value)) return false;
-  // STORE_ID_PATTERN allows '.' for ids like `ag-1.5.0` but explicitly reject
-  // a `..` substring anywhere — pattern char-class alone doesn't catch
-  // sequences. Same for explicit literal '..' segments.
-  if (value === '.' || value === '..' || value.includes('..')) return false;
-  return true;
+  return STORE_ID_PATTERN.test(value);
 }
 
 /**
@@ -1008,13 +1014,11 @@ function buildMounts(
   // (pre-migration-036 installs), pass undefined so projection uses single-agent filter.
   let workgroupMemberIds: string[] | undefined;
   try {
-    const centralCheck = getDb()
-      .prepare(`PRAGMA table_info(agent_groups)`)
-      .all() as Array<{ name: string }>;
+    const centralCheck = getDb().prepare(`PRAGMA table_info(agent_groups)`).all() as Array<{ name: string }>;
     if (centralCheck.some((c) => c.name === 'workgroup_id')) {
-      const agRow = getDb()
-        .prepare(`SELECT workgroup_id FROM agent_groups WHERE id = ?`)
-        .get(agentGroup.id) as { workgroup_id: string | null } | undefined;
+      const agRow = getDb().prepare(`SELECT workgroup_id FROM agent_groups WHERE id = ?`).get(agentGroup.id) as
+        | { workgroup_id: string | null }
+        | undefined;
       if (agRow && agRow.workgroup_id === null) {
         throw new Error(
           `Workgroup-scoped projection: invalid workgroup for agent ${agentGroup.id} — workgroup_id is NULL`,

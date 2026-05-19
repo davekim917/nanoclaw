@@ -141,7 +141,11 @@ describe('reconcileWorkgroupFsState', () => {
   // ── T1: drain migration report ──────────────────────────────────────
   it('test_writes_logs_when_migration_report_present', async () => {
     const db = makeDb();
-    const report = { pairings: [{ child: 'foo-codex', parent: 'foo' }], standalone: ['bar'], suffix_strip_unmatched: [] };
+    const report = {
+      pairings: [{ child: 'foo-codex', parent: 'foo' }],
+      standalone: ['bar'],
+      suffix_strip_unmatched: [],
+    };
     seedMigrationReport(db, report);
 
     // No agent_groups rows — avoids needing readContainerConfig mocked
@@ -175,13 +179,34 @@ describe('reconcileWorkgroupFsState', () => {
     // illie (standalone parent) — has memory.enabled but NOT recall_scope
     vi.mocked(readContainerConfig).mockImplementation((folder: string) => {
       if (folder === 'illysium') {
-        return { mcpServers: {}, packages: { apt: [], npm: [] }, additionalMounts: [], skills: 'all', tools: [], memory: { enabled: true } };
+        return {
+          mcpServers: {},
+          packages: { apt: [], npm: [] },
+          additionalMounts: [],
+          skills: 'all',
+          tools: [],
+          memory: { enabled: true },
+        };
       }
       if (folder === 'illysium-codex') {
-        return { mcpServers: {}, packages: { apt: [], npm: [] }, additionalMounts: [], skills: 'all', tools: [], memory: { enabled: true } };
+        return {
+          mcpServers: {},
+          packages: { apt: [], npm: [] },
+          additionalMounts: [],
+          skills: 'all',
+          tools: [],
+          memory: { enabled: true },
+        };
       }
       if (folder === 'standalone-x') {
-        return { mcpServers: {}, packages: { apt: [], npm: [] }, additionalMounts: [], skills: 'all', tools: [], memory: { enabled: true } };
+        return {
+          mcpServers: {},
+          packages: { apt: [], npm: [] },
+          additionalMounts: [],
+          skills: 'all',
+          tools: [],
+          memory: { enabled: true },
+        };
       }
       throw new Error(`Unexpected folder: ${folder}`);
     });
@@ -190,7 +215,10 @@ describe('reconcileWorkgroupFsState', () => {
 
     // writeContainerConfig called exactly once — for illie-codex (the paired sibling)
     expect(vi.mocked(writeContainerConfig)).toHaveBeenCalledTimes(1);
-    const [calledFolder, calledCfg] = vi.mocked(writeContainerConfig).mock.calls[0] as [string, { memory?: { recall_scope?: string } }];
+    const [calledFolder, calledCfg] = vi.mocked(writeContainerConfig).mock.calls[0] as [
+      string,
+      { memory?: { recall_scope?: string } },
+    ];
     expect(calledFolder).toBe('illysium-codex');
     expect(calledCfg.memory?.recall_scope).toBe('workgroup');
 
@@ -208,9 +236,23 @@ describe('reconcileWorkgroupFsState', () => {
     // First call — illie-codex not yet set
     vi.mocked(readContainerConfig).mockImplementation((folder: string) => {
       if (folder === 'illysium-codex') {
-        return { mcpServers: {}, packages: { apt: [], npm: [] }, additionalMounts: [], skills: 'all', tools: [], memory: { enabled: true } };
+        return {
+          mcpServers: {},
+          packages: { apt: [], npm: [] },
+          additionalMounts: [],
+          skills: 'all',
+          tools: [],
+          memory: { enabled: true },
+        };
       }
-      return { mcpServers: {}, packages: { apt: [], npm: [] }, additionalMounts: [], skills: 'all', tools: [], memory: { enabled: true } };
+      return {
+        mcpServers: {},
+        packages: { apt: [], npm: [] },
+        additionalMounts: [],
+        skills: 'all',
+        tools: [],
+        memory: { enabled: true },
+      };
     });
 
     await reconcileWorkgroupFsState(db);
@@ -220,9 +262,23 @@ describe('reconcileWorkgroupFsState', () => {
     // Second call — illie-codex already has recall_scope: 'workgroup'
     vi.mocked(readContainerConfig).mockImplementation((folder: string) => {
       if (folder === 'illysium-codex') {
-        return { mcpServers: {}, packages: { apt: [], npm: [] }, additionalMounts: [], skills: 'all', tools: [], memory: { enabled: true, recall_scope: 'workgroup' } };
+        return {
+          mcpServers: {},
+          packages: { apt: [], npm: [] },
+          additionalMounts: [],
+          skills: 'all',
+          tools: [],
+          memory: { enabled: true, recall_scope: 'workgroup' },
+        };
       }
-      return { mcpServers: {}, packages: { apt: [], npm: [] }, additionalMounts: [], skills: 'all', tools: [], memory: { enabled: true } };
+      return {
+        mcpServers: {},
+        packages: { apt: [], npm: [] },
+        additionalMounts: [],
+        skills: 'all',
+        tools: [],
+        memory: { enabled: true },
+      };
     });
 
     await reconcileWorkgroupFsState(db);

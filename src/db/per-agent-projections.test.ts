@@ -182,9 +182,10 @@ function makeArchiveSrc(label: string): string {
 
 function addWorkgroup(p: string, wgId: string, storeId: string): void {
   withDb(p, (db) => {
-    db.prepare(
-      `INSERT INTO workgroups (id, mnemon_store_id, created_at) VALUES (?, ?, '2026-01-01')`,
-    ).run(wgId, storeId);
+    db.prepare(`INSERT INTO workgroups (id, mnemon_store_id, created_at) VALUES (?, ?, '2026-01-01')`).run(
+      wgId,
+      storeId,
+    );
   });
 }
 
@@ -211,12 +212,14 @@ interface ArchiveRow {
 
 function addArchiveMsg(p: string, row: ArchiveRow): void {
   withDb(p, (db) => {
-    db.prepare(`
+    db.prepare(
+      `
       INSERT INTO messages_archive
         (id, agent_group_id, messaging_group_id, channel_type, thread_id, role,
          sender_id, sender_name, text, sent_at, created_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '2026-01-01T00:00:00Z')
-    `).run(
+    `,
+    ).run(
       row.id,
       row.agent_group_id,
       row.messaging_group_id ?? 'mg-1',
@@ -274,9 +277,7 @@ function addAgentToSrc(p: string, agId: string, wgId?: string): void {
 
 function addWorkgroupToSrc(p: string, wgId: string): void {
   withDb(p, (db) => {
-    db.prepare(
-      `INSERT OR IGNORE INTO workgroups (id, created_at) VALUES (?, '2026-01-01T00:00:00Z')`,
-    ).run(wgId);
+    db.prepare(`INSERT OR IGNORE INTO workgroups (id, created_at) VALUES (?, '2026-01-01T00:00:00Z')`).run(wgId);
   });
 }
 
@@ -292,12 +293,44 @@ describe('buildArchiveProjection — workgroup-widened (B3)', () => {
     addAgentWithWorkgroup(src, 'ag-codex', 'my-group-codex', 'my-wg');
 
     // Same user message duplicated across both sibling agents
-    addArchiveMsg(src, { id: 'm1-parent', agent_group_id: 'ag-parent', role: 'user', sender_id: 'u-123', text: 'hello', sent_at: '2026-01-01T10:00:00Z', thread_id: 'thread-1' });
-    addArchiveMsg(src, { id: 'm1-codex', agent_group_id: 'ag-codex', role: 'user', sender_id: 'u-123', text: 'hello', sent_at: '2026-01-01T10:00:00Z', thread_id: 'thread-1' });
+    addArchiveMsg(src, {
+      id: 'm1-parent',
+      agent_group_id: 'ag-parent',
+      role: 'user',
+      sender_id: 'u-123',
+      text: 'hello',
+      sent_at: '2026-01-01T10:00:00Z',
+      thread_id: 'thread-1',
+    });
+    addArchiveMsg(src, {
+      id: 'm1-codex',
+      agent_group_id: 'ag-codex',
+      role: 'user',
+      sender_id: 'u-123',
+      text: 'hello',
+      sent_at: '2026-01-01T10:00:00Z',
+      thread_id: 'thread-1',
+    });
 
     // Two distinct assistant replies (different sender_id → different GROUP BY bucket → 2 rows)
-    addArchiveMsg(src, { id: 'a1-parent', agent_group_id: 'ag-parent', role: 'assistant', sender_id: 'ag-parent', text: 'reply from parent', sent_at: '2026-01-01T10:01:00Z', thread_id: 'thread-1' });
-    addArchiveMsg(src, { id: 'a1-codex', agent_group_id: 'ag-codex', role: 'assistant', sender_id: 'ag-codex', text: 'reply from codex', sent_at: '2026-01-01T10:01:00Z', thread_id: 'thread-1' });
+    addArchiveMsg(src, {
+      id: 'a1-parent',
+      agent_group_id: 'ag-parent',
+      role: 'assistant',
+      sender_id: 'ag-parent',
+      text: 'reply from parent',
+      sent_at: '2026-01-01T10:01:00Z',
+      thread_id: 'thread-1',
+    });
+    addArchiveMsg(src, {
+      id: 'a1-codex',
+      agent_group_id: 'ag-codex',
+      role: 'assistant',
+      sender_id: 'ag-codex',
+      text: 'reply from codex',
+      sent_at: '2026-01-01T10:01:00Z',
+      thread_id: 'thread-1',
+    });
 
     const dst = tmpPath('b3-dedup-dst');
     buildArchiveProjection(src, dst, 'ag-parent', ['ag-parent', 'ag-codex']);
@@ -316,8 +349,22 @@ describe('buildArchiveProjection — workgroup-widened (B3)', () => {
     addWorkgroup(src, 'solo-wg', 'ag-solo');
     addAgentWithWorkgroup(src, 'ag-solo', 'solo', 'solo-wg');
 
-    addArchiveMsg(src, { id: 'm1', agent_group_id: 'ag-solo', role: 'user', sender_id: 'u-1', text: 'hi', sent_at: '2026-01-01T10:00:00Z' });
-    addArchiveMsg(src, { id: 'a1', agent_group_id: 'ag-solo', role: 'assistant', sender_id: 'ag-solo', text: 'hey', sent_at: '2026-01-01T10:01:00Z' });
+    addArchiveMsg(src, {
+      id: 'm1',
+      agent_group_id: 'ag-solo',
+      role: 'user',
+      sender_id: 'u-1',
+      text: 'hi',
+      sent_at: '2026-01-01T10:00:00Z',
+    });
+    addArchiveMsg(src, {
+      id: 'a1',
+      agent_group_id: 'ag-solo',
+      role: 'assistant',
+      sender_id: 'ag-solo',
+      text: 'hey',
+      sent_at: '2026-01-01T10:01:00Z',
+    });
 
     const dst = tmpPath('b3-standalone-dst');
     buildArchiveProjection(src, dst, 'ag-solo', ['ag-solo']);
@@ -334,15 +381,29 @@ describe('buildArchiveProjection — workgroup-widened (B3)', () => {
     addAgentWithWorkgroup(src, 'ag-wg1', 'group1', 'wg1');
     addAgentWithWorkgroup(src, 'ag-wg2', 'group2', 'wg2');
 
-    addArchiveMsg(src, { id: 'm-wg1', agent_group_id: 'ag-wg1', role: 'user', sender_id: 'u-1', text: 'msg from wg1', sent_at: '2026-01-01T10:00:00Z' });
-    addArchiveMsg(src, { id: 'm-wg2', agent_group_id: 'ag-wg2', role: 'user', sender_id: 'u-2', text: 'msg from wg2', sent_at: '2026-01-01T10:00:00Z' });
+    addArchiveMsg(src, {
+      id: 'm-wg1',
+      agent_group_id: 'ag-wg1',
+      role: 'user',
+      sender_id: 'u-1',
+      text: 'msg from wg1',
+      sent_at: '2026-01-01T10:00:00Z',
+    });
+    addArchiveMsg(src, {
+      id: 'm-wg2',
+      agent_group_id: 'ag-wg2',
+      role: 'user',
+      sender_id: 'u-2',
+      text: 'msg from wg2',
+      sent_at: '2026-01-01T10:00:00Z',
+    });
 
     const dst = tmpPath('b3-iso-dst');
     buildArchiveProjection(src, dst, 'ag-wg1', ['ag-wg1']);
 
     const rows = getAllArchiveRows(dst);
     expect(rows).toHaveLength(1);
-    expect(rows.every((r) => (r.agent_group_id === 'ag-wg1'))).toBe(true);
+    expect(rows.every((r) => r.agent_group_id === 'ag-wg1')).toBe(true);
   });
 
   it('test_archive_empty_workgroup_member_list_produces_empty_projection', () => {
@@ -351,7 +412,14 @@ describe('buildArchiveProjection — workgroup-widened (B3)', () => {
     // Caller is expected to throw BEFORE calling if workgroup_id is invalid; this test
     // verifies the projection itself doesn't crash on the edge case.
     const src = makeArchiveSrc('b3-empty-wg-src');
-    addArchiveMsg(src, { id: 'm1', agent_group_id: 'ag-some', role: 'user', sender_id: 'u', text: 'hi', sent_at: '2026-01-01T10:00:00Z' });
+    addArchiveMsg(src, {
+      id: 'm1',
+      agent_group_id: 'ag-some',
+      role: 'user',
+      sender_id: 'u',
+      text: 'hi',
+      sent_at: '2026-01-01T10:00:00Z',
+    });
 
     const dst = tmpPath('b3-empty-wg-dst');
     // Empty member set → falls through to legacy single-agent filter for the agent_id passed
@@ -371,8 +439,22 @@ describe('buildArchiveProjection — workgroup-widened (B3)', () => {
     addAgentWithWorkgroup(src, 'ag-d2', 'group-d2', 'wg-d');
 
     // Both get the "same" user message — id 'aaa-...' < 'zzz-...'
-    addArchiveMsg(src, { id: 'aaa-lower', agent_group_id: 'ag-d1', role: 'user', sender_id: 'u-x', text: 'dup', sent_at: '2026-01-01T09:00:00Z' });
-    addArchiveMsg(src, { id: 'zzz-higher', agent_group_id: 'ag-d2', role: 'user', sender_id: 'u-x', text: 'dup', sent_at: '2026-01-01T09:00:00Z' });
+    addArchiveMsg(src, {
+      id: 'aaa-lower',
+      agent_group_id: 'ag-d1',
+      role: 'user',
+      sender_id: 'u-x',
+      text: 'dup',
+      sent_at: '2026-01-01T09:00:00Z',
+    });
+    addArchiveMsg(src, {
+      id: 'zzz-higher',
+      agent_group_id: 'ag-d2',
+      role: 'user',
+      sender_id: 'u-x',
+      text: 'dup',
+      sent_at: '2026-01-01T09:00:00Z',
+    });
 
     const dst = tmpPath('b3-minid-dst');
     buildArchiveProjection(src, dst, 'ag-d1', ['ag-d1', 'ag-d2']);
@@ -422,12 +504,16 @@ describe('buildCentralProjection — per-table isolation (B4)', () => {
     addAgentToSrc(src, 'ag-ship-b', 'wg-b4s');
 
     withDb(src, (db) => {
-      db.prepare(
-        `INSERT INTO ship_log (id, agent_group_id, title, shipped_at) VALUES (?, ?, ?, '2026-01-01')`,
-      ).run('sl-a', 'ag-ship-a', 'Ship A');
-      db.prepare(
-        `INSERT INTO ship_log (id, agent_group_id, title, shipped_at) VALUES (?, ?, ?, '2026-01-01')`,
-      ).run('sl-b', 'ag-ship-b', 'Ship B');
+      db.prepare(`INSERT INTO ship_log (id, agent_group_id, title, shipped_at) VALUES (?, ?, ?, '2026-01-01')`).run(
+        'sl-a',
+        'ag-ship-a',
+        'Ship A',
+      );
+      db.prepare(`INSERT INTO ship_log (id, agent_group_id, title, shipped_at) VALUES (?, ?, ?, '2026-01-01')`).run(
+        'sl-b',
+        'ag-ship-b',
+        'Ship B',
+      );
     });
 
     const dst = tmpPath('b4-ship-dst');

@@ -116,17 +116,17 @@ export function resolveWorkgroupStoreId(callingGroupId: string): string | null {
   }
   const { db, owned } = opened;
   try {
-    const agRow = db
-      .prepare(`SELECT workgroup_id FROM agent_groups WHERE id = ? LIMIT 1`)
-      .get(callingGroupId) as { workgroup_id: string | null } | undefined;
+    const agRow = db.prepare(`SELECT workgroup_id FROM agent_groups WHERE id = ? LIMIT 1`).get(callingGroupId) as
+      | { workgroup_id: string | null }
+      | undefined;
 
     if (!agRow || agRow.workgroup_id == null) {
       return null;
     }
 
-    const wgRow = db
-      .prepare(`SELECT mnemon_store_id FROM workgroups WHERE id = ? LIMIT 1`)
-      .get(agRow.workgroup_id) as { mnemon_store_id: string | null } | undefined;
+    const wgRow = db.prepare(`SELECT mnemon_store_id FROM workgroups WHERE id = ? LIMIT 1`).get(agRow.workgroup_id) as
+      | { mnemon_store_id: string | null }
+      | undefined;
 
     if (!wgRow || wgRow.mnemon_store_id == null) {
       return null;
@@ -155,18 +155,18 @@ export function resolveWorkgroupMembers(callingGroupId: string): string[] {
   }
   const { db, owned } = opened;
   try {
-    const agRow = db
-      .prepare(`SELECT workgroup_id FROM agent_groups WHERE id = ? LIMIT 1`)
-      .get(callingGroupId) as { workgroup_id: string | null } | undefined;
+    const agRow = db.prepare(`SELECT workgroup_id FROM agent_groups WHERE id = ? LIMIT 1`).get(callingGroupId) as
+      | { workgroup_id: string | null }
+      | undefined;
 
     if (!agRow || agRow.workgroup_id == null) {
       // Standalone / unmatched: treat as single-member group
       return [callingGroupId];
     }
 
-    const members = db
-      .prepare(`SELECT id FROM agent_groups WHERE workgroup_id = ?`)
-      .all(agRow.workgroup_id) as Array<{ id: string }>;
+    const members = db.prepare(`SELECT id FROM agent_groups WHERE workgroup_id = ?`).all(agRow.workgroup_id) as Array<{
+      id: string;
+    }>;
 
     const memberIds = members.map((r) => r.id);
     // calling group first, then others

@@ -343,16 +343,16 @@ describe('reconcileWorkgroupAtSpawn — C1', () => {
     reconcileWorkgroupAtSpawn(db, agentGroup, containerConfig);
 
     // workgroup row should exist with mnemon_store_id = illie's agent_groups.id
-    const wg = db
-      .prepare('SELECT mnemon_store_id FROM workgroups WHERE id = ?')
-      .get('illysium') as { mnemon_store_id: string };
+    const wg = db.prepare('SELECT mnemon_store_id FROM workgroups WHERE id = ?').get('illysium') as {
+      mnemon_store_id: string;
+    };
     expect(wg).toBeDefined();
     expect(wg.mnemon_store_id).toBe('ag-illie');
 
     // agent_groups.workgroup_id should be updated
-    const ag = db
-      .prepare('SELECT workgroup_id FROM agent_groups WHERE id = ?')
-      .get('ag-illie-codex') as { workgroup_id: string };
+    const ag = db.prepare('SELECT workgroup_id FROM agent_groups WHERE id = ?').get('ag-illie-codex') as {
+      workgroup_id: string;
+    };
     expect(ag.workgroup_id).toBe('illysium');
   });
 
@@ -369,9 +369,9 @@ describe('reconcileWorkgroupAtSpawn — C1', () => {
     reconcileWorkgroupAtSpawn(db, agentGroup, containerConfig);
 
     // ON CONFLICT DO NOTHING: existing row preserved
-    const wg = db
-      .prepare('SELECT mnemon_store_id FROM workgroups WHERE id = ?')
-      .get('illysium') as { mnemon_store_id: string };
+    const wg = db.prepare('SELECT mnemon_store_id FROM workgroups WHERE id = ?').get('illysium') as {
+      mnemon_store_id: string;
+    };
     expect(wg.mnemon_store_id).toBe(customStoreId);
   });
 
@@ -385,15 +385,15 @@ describe('reconcileWorkgroupAtSpawn — C1', () => {
     reconcileWorkgroupAtSpawn(db, agentGroup, containerConfig);
 
     // workgroup id = own folder; mnemon_store_id = own agent_groups.id
-    const wg = db
-      .prepare('SELECT mnemon_store_id FROM workgroups WHERE id = ?')
-      .get('solo-agent') as { mnemon_store_id: string };
+    const wg = db.prepare('SELECT mnemon_store_id FROM workgroups WHERE id = ?').get('solo-agent') as {
+      mnemon_store_id: string;
+    };
     expect(wg).toBeDefined();
     expect(wg.mnemon_store_id).toBe('ag-solo');
 
-    const ag = db
-      .prepare('SELECT workgroup_id FROM agent_groups WHERE id = ?')
-      .get('ag-solo') as { workgroup_id: string };
+    const ag = db.prepare('SELECT workgroup_id FROM agent_groups WHERE id = ?').get('ag-solo') as {
+      workgroup_id: string;
+    };
     expect(ag.workgroup_id).toBe('solo-agent');
   });
 
@@ -403,9 +403,9 @@ describe('reconcileWorkgroupAtSpawn — C1', () => {
 
     reconcileWorkgroupAtSpawn(db, { id: 'ag-foo', folder: 'foo' }, {});
 
-    const ag = db
-      .prepare('SELECT workgroup_id FROM agent_groups WHERE id = ?')
-      .get('ag-foo') as { workgroup_id: string };
+    const ag = db.prepare('SELECT workgroup_id FROM agent_groups WHERE id = ?').get('ag-foo') as {
+      workgroup_id: string;
+    };
     expect(ag.workgroup_id).toBe('foo');
   });
 
@@ -484,9 +484,9 @@ describe('resolveMnemonStore — C2', () => {
     // An operator typo (or attacker who controls .env) sets a traversal value.
     // Must throw rather than silently mount ~/.ssh or similar.
     const env = { MNEMON_STORE_illysium_codex: '../../.ssh' };
-    expect(() =>
-      resolveMnemonStore(db, { id: 'ag-illie-codex', folder: 'illysium-codex' }, env),
-    ).toThrow(/not a valid store id/);
+    expect(() => resolveMnemonStore(db, { id: 'ag-illie-codex', folder: 'illysium-codex' }, env)).toThrow(
+      /not a valid store id/,
+    );
   });
 
   it('test_rejects_env_override_with_slash', () => {
@@ -494,21 +494,23 @@ describe('resolveMnemonStore — C2', () => {
     insertWorkgroup(db, 'illysium', 'ag-illie');
 
     const env = { MNEMON_STORE_illysium_codex: 'subdir/store' };
-    expect(() =>
-      resolveMnemonStore(db, { id: 'ag-illie-codex', folder: 'illysium-codex' }, env),
-    ).toThrow(/not a valid store id/);
+    expect(() => resolveMnemonStore(db, { id: 'ag-illie-codex', folder: 'illysium-codex' }, env)).toThrow(
+      /not a valid store id/,
+    );
   });
 
-  it('test_rejects_env_override_with_double_dot_substring', () => {
+  it('test_rejects_env_override_with_dot_character', () => {
     insertGroup(db, 'ag-illie-codex', 'illysium-codex', 'illysium');
     insertWorkgroup(db, 'illysium', 'ag-illie');
 
-    // Even without a leading slash, a `..` substring is rejected (defense
-    // against `prefix..suffix` style attempts).
-    const env = { MNEMON_STORE_illysium_codex: 'a..b' };
-    expect(() =>
-      resolveMnemonStore(db, { id: 'ag-illie-codex', folder: 'illysium-codex' }, env),
-    ).toThrow(/not a valid store id/);
+    // The host-side pattern aligns with the container wrapper's
+    // `^[a-zA-Z0-9_-]+$` regex (`container/mnemon-wrapper.sh:12`), which
+    // disallows `.` entirely. A value the container would later reject
+    // must also fail at the host so we don't mount-then-fail silently.
+    const env = { MNEMON_STORE_illysium_codex: 'foo.bar' };
+    expect(() => resolveMnemonStore(db, { id: 'ag-illie-codex', folder: 'illysium-codex' }, env)).toThrow(
+      /not a valid store id/,
+    );
   });
 
   it('test_rejects_empty_env_override_falls_through_to_workgroup', () => {

@@ -70,9 +70,10 @@ function makeWorkgroupDb(
   }
 
   for (const [wgId, storeId] of wgMap) {
-    db.prepare(
-      `INSERT INTO workgroups (id, mnemon_store_id, created_at) VALUES (?, ?, '2026-01-01')`,
-    ).run(wgId, storeId);
+    db.prepare(`INSERT INTO workgroups (id, mnemon_store_id, created_at) VALUES (?, ?, '2026-01-01')`).run(
+      wgId,
+      storeId,
+    );
   }
 
   for (const f of fixtures) {
@@ -201,7 +202,9 @@ describe('resolveRecallScope', () => {
 
   it('test_workgroup_of_1_equivalent_to_self', () => {
     // Standalone agent — workgroup has only 1 member; should return [ownId]
-    centralDb = makeWorkgroupDb([{ agId: 'ag-standalone', folder: 'standalone', workgroupId: 'standalone', mnemonStoreId: 'ag-standalone' }]);
+    centralDb = makeWorkgroupDb([
+      { agId: 'ag-standalone', folder: 'standalone', workgroupId: 'standalone', mnemonStoreId: 'ag-standalone' },
+    ]);
     setCentralDbForTest(centralDb);
 
     const result = resolveRecallScope('ag-standalone', 'workgroup');
@@ -261,7 +264,9 @@ describe('resolveRecallScope', () => {
     // not yet wired into a workgroup. Must NOT throw; callers handle null.
     centralDb = makeWorkgroupDb([]);
     centralDb
-      .prepare(`INSERT INTO agent_groups (id, name, folder, workgroup_id, created_at) VALUES (?, ?, ?, NULL, '2026-01-01')`)
+      .prepare(
+        `INSERT INTO agent_groups (id, name, folder, workgroup_id, created_at) VALUES (?, ?, ?, NULL, '2026-01-01')`,
+      )
       .run('ag-standalone', 'standalone', 'standalone');
     setCentralDbForTest(centralDb);
 
@@ -280,7 +285,9 @@ describe('resolveRecallScope', () => {
     // must silently fall back to their own store rather than throw.
     centralDb = makeWorkgroupDb([]);
     centralDb
-      .prepare(`INSERT INTO agent_groups (id, name, folder, workgroup_id, created_at) VALUES (?, ?, ?, NULL, '2026-01-01')`)
+      .prepare(
+        `INSERT INTO agent_groups (id, name, folder, workgroup_id, created_at) VALUES (?, ?, ?, NULL, '2026-01-01')`,
+      )
       .run('ag-standalone', 'standalone', 'standalone');
     setCentralDbForTest(centralDb);
 

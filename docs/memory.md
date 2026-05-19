@@ -488,31 +488,52 @@ The fallback chain guarantees recall never breaks: `llm (800ms timeout) → heur
 
 ## Cross-Group Recall Scope
 
-By default each agent group recalls only from its own mnemon store (`recall_scope: 'self'`). This preserves per-group isolation.
+`recall_scope` controls which mnemon stores feed recall. Four modes:
+
+| Mode | What it does | When to use |
+|---|---|---|
+| `'workgroup'` (**default**) | Recall reads from the workgroup-canonical store shared across all sibling agent_groups in this workgroup (set by `workgroups.mnemon_store_id`). Standalone agents (no workgroup) fall back to their own store, so the default works for every group. | Default. The workgroup feature exists to widen recall across siblings; this is the intended posture. |
+| `'self'` | Recall reads only from the calling agent_group's own store. | Opt-out for groups that must NOT see workgroup-mates' facts (e.g., a sandboxed eval group). |
+| `'all-groups'` | Fans out across every memory-enabled group on the install with 4-way concurrency, 1500ms per-store timeout, RRF-merged results. | Multi-project setups where one group needs cross-project recall. Manual operator decision. |
+| `string[]` | Fans out across an explicit list of folder names. | Targeted sharing — e.g. recall from `['axie-dev', 'madison-reed']` only. |
+
+### Default (workgroup)
+
+```jsonc
+// groups/<group-folder>/container.json
+"memory": { "enabled": true }   // recall_scope defaults to 'workgroup'
+```
+
+A codex sibling under this default reads from the Claude sibling's populated store via `workgroups.mnemon_store_id`. See [`docs/workgroups.md`](workgroups.md) for the workgroup model.
+
+### Opting out to self
+
+If a group must NOT share recall with workgroup siblings:
+
+```jsonc
+"memory": { "enabled": true, "recall_scope": "self" }
+```
+
+This is rare — workgroup is the right default for paired siblings. Use `'self'` only when there's a deliberate isolation requirement.
 
 ### Flipping to all-groups
 
-The `all-groups` scope is designed for multi-project use cases (e.g. axis-labs, where agents across projects share common institutional facts). **This is a manual operator decision** — there is no automatic revert.
-
-```bash
-# Edit groups/<group-folder>/container.json:
-# "memory": { "enabled": true, "recall_scope": "all-groups" }
+```jsonc
+"memory": { "enabled": true, "recall_scope": "all-groups" }
 ```
 
 After flipping, the next recall will fan out to all memory-enabled groups with 4-way concurrency and 1500ms per-store timeout, then RRF-merge the results. Cross-store failures are tolerated — a store that times out returns empty facts without breaking the recall.
 
 To target specific groups instead of all:
 
-```bash
-# "recall_scope": ["axie-dev", "madison-reed"]
-# (folder names, not agent group IDs)
+```jsonc
+"recall_scope": ["axie-dev", "madison-reed"]
+// folder names, not agent group IDs
 ```
 
-### Reverting
+### Reverting from all-groups or string[]
 
-```bash
-# Set recall_scope back to "self" in container.json (or remove the field)
-```
+Remove the field (or set it back to `"workgroup"`) to return to workgroup-default behavior. Setting it to `"self"` instead is a deliberate narrowing — it stops sharing with workgroup siblings too.
 
 ### RRF recency boost
 

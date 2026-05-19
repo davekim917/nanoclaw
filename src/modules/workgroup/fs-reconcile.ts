@@ -28,9 +28,9 @@ export function reconcileWorkgroupFsState(db: Database.Database): void {
     .get() as { name: string } | undefined;
 
   if (reportTableExists) {
-    const reportRow = db
-      .prepare(`SELECT report FROM _migration036_report LIMIT 1`)
-      .get() as { report: string } | undefined;
+    const reportRow = db.prepare(`SELECT report FROM _migration036_report LIMIT 1`).get() as
+      | { report: string }
+      | undefined;
 
     if (reportRow) {
       // mkdirSync before writeFileSync — let FS errors propagate to the caller
@@ -40,10 +40,7 @@ export function reconcileWorkgroupFsState(db: Database.Database): void {
 
       // Compute per-workgroup intersection of member onecliSecrets (S10)
       const secretsReport = computeDuplicateSecretsReport(db);
-      fs.writeFileSync(
-        path.join('logs', 'migration-036-secrets.log'),
-        JSON.stringify(secretsReport, null, 2) + '\n',
-      );
+      fs.writeFileSync(path.join('logs', 'migration-036-secrets.log'), JSON.stringify(secretsReport, null, 2) + '\n');
     }
 
     // DROP only after both writes succeed (so a partial failure leaves the table intact)
@@ -52,9 +49,11 @@ export function reconcileWorkgroupFsState(db: Database.Database): void {
   }
 
   // ── 2. Write recall_scope: 'workgroup' to paired groups' container.json ──
-  const rows = db
-    .prepare(`SELECT id, folder, workgroup_id FROM agent_groups`)
-    .all() as Array<{ id: string; folder: string; workgroup_id: string | null }>;
+  const rows = db.prepare(`SELECT id, folder, workgroup_id FROM agent_groups`).all() as Array<{
+    id: string;
+    folder: string;
+    workgroup_id: string | null;
+  }>;
 
   for (const ag of rows) {
     // Skip standalone groups (workgroup_id === folder) and null workgroup_id rows
@@ -85,16 +84,14 @@ export function reconcileWorkgroupFsState(db: Database.Database): void {
  * already has declared, which may indicate they should be promoted to
  * workgroup-level secret config instead.
  */
-function computeDuplicateSecretsReport(
-  db: Database.Database,
-): Array<{ workgroup: string; intersection: string[] }> {
+function computeDuplicateSecretsReport(db: Database.Database): Array<{ workgroup: string; intersection: string[] }> {
   const workgroups = db.prepare(`SELECT id FROM workgroups`).all() as Array<{ id: string }>;
   const report: Array<{ workgroup: string; intersection: string[] }> = [];
 
   for (const wg of workgroups) {
-    const members = db
-      .prepare(`SELECT folder FROM agent_groups WHERE workgroup_id = ?`)
-      .all(wg.id) as Array<{ folder: string }>;
+    const members = db.prepare(`SELECT folder FROM agent_groups WHERE workgroup_id = ?`).all(wg.id) as Array<{
+      folder: string;
+    }>;
 
     if (members.length <= 1) continue;
 

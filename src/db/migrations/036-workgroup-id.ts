@@ -37,9 +37,7 @@ export const migration036: Migration = {
 
     // ALTER TABLE is not idempotent in SQLite.  Guard with a column-existence
     // check so a re-run after a partial failure doesn't error on "duplicate column".
-    const agCols = (db.prepare(`PRAGMA table_info(agent_groups)`).all() as Array<{ name: string }>).map(
-      (c) => c.name,
-    );
+    const agCols = (db.prepare(`PRAGMA table_info(agent_groups)`).all() as Array<{ name: string }>).map((c) => c.name);
     if (!agCols.includes('workgroup_id')) {
       db.exec(`ALTER TABLE agent_groups ADD COLUMN workgroup_id TEXT REFERENCES workgroups(id);`);
     }
@@ -142,9 +140,7 @@ export const migration036: Migration = {
     // FK check
     const fkViolations = db.prepare(`PRAGMA foreign_key_check(agent_groups)`).all();
     if (fkViolations.length > 0) {
-      throw new Error(
-        `Migration 036: PRAGMA foreign_key_check found violations: ${JSON.stringify(fkViolations)}`,
-      );
+      throw new Error(`Migration 036: PRAGMA foreign_key_check found violations: ${JSON.stringify(fkViolations)}`);
     }
 
     // ── 4. Temp report table for FS reconciler ─────────────────────────────
