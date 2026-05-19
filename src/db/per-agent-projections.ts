@@ -177,6 +177,10 @@ export function buildArchiveProjection(
     }
   } catch (err) {
     log.error('buildArchiveProjection failed', { err, agentGroupId, dstPath });
+    // CD-3: re-throw fail-closed. The caller (container-runner spawn) sees the failure
+    // and aborts the spawn rather than silently mounting an empty projection that
+    // looks-valid but yields zero rows on every read.
+    throw err;
   } finally {
     dst.close();
   }
