@@ -281,3 +281,101 @@ describe('C2: pre-fanout intercept dispatch', () => {
     expect(writeSessionMessage).not.toHaveBeenCalled();
   });
 });
+
+// Issue 1 from the @Bo -e max thread: Bo-codex's accumulate-mode wiring on
+// the shared MR channel ran the flag dispatcher even though @Bo was the
+// addressed agent. Two side effects to prevent:
+//   (a) Bo-codex's bot user emits a duplicate "effort → X" notice — visible
+//       channel noise from an agent the operator wasn't talking to.
+//   (b) Bo-codex's session_state gets `max` stored as effort even though
+//       Codex's reasoning_effort schema doesn't accept it; the value is
+//       silently invalid and the next spawn either throws or falls back.
+// Fix: deliverToAgent now gates the flag dispatcher on `wake === true`.
+describe('flag dispatcher wake gate', () => {
+  it('skips parseMessageFlags when wake=false (accumulate path)', async () => {
+    const { parseMessageFlags } = await import('./flag-parser.js');
+    const { getAgentGroup } = await import('./db/agent-groups.js');
+    const mg = makeMg({ id: 'mg-shared', is_group: 1 });
+    const accumulateAgent = makeAgent({
+      id: 'mga-bocodex',
+      agent_group_id: 'ag-bocodex',
+      // Mention-mode but accumulate policy: NOT addressed by this message
+      // (isMention=true is for the OTHER agent in the channel), still
+      // gets the message delivered as silent context.
+      engage_mode: 'mention',
+      ignored_message_policy: 'accumulate',
+    });
+    vi.mocked(getMessagingGroupWithAgentCount).mockReturnValue({ mg, agentCount: 1 });
+    vi.mocked(getMessagingGroupAgents).mockReturnValue([accumulateAgent]);
+    vi.mocked(getAgentGroup).mockReturnValue({
+      id: 'ag-bocodex',
+      name: 'Bo-codex',
+      folder: 'madison-reed-codex',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+    vi.mocked(resolveSession).mockReturnValue({
+      session: {
+        id: 's-bocodex',
+        agent_group_id: 'ag-bocodex',
+        messaging_group_id: 'mg-shared',
+        thread_id: null,
+        agent_provider: null,
+        status: 'active',
+        container_status: 'idle',
+        last_active: null,
+        created_at: new Date().toISOString(),
+      },
+      created: true,
+    });
+
+    // The message is NOT a mention for this agent (engages=false) but the
+    // accumulate policy still delivers it. The text carries a `-e` flag
+    // meant for the OTHER bot.
+    const event = makeChatEvent('@Bo -e max', {
+      message: { ...makeChatEvent('@Bo -e max').message, isMention: false },
+    });
+    await routeInbound(event);
+
+    // The dispatcher must NOT run on the accumulate-path delivery.
+    expect(parseMessageFlags).not.toHaveBeenCalled();
+    // The host must NOT post a sibling "effort → max" notice.
+    expect(writeOutboundDirect).not.toHaveBeenCalled();
+  });
+
+  it('still runs parseMessageFlags when wake=true (the addressed agent)', async () => {
+    const { parseMessageFlags } = await import('./flag-parser.js');
+    const { getAgentGroup } = await import('./db/agent-groups.js');
+    const mg = makeMg();
+    const agent = makeAgent();
+    vi.mocked(getMessagingGroupWithAgentCount).mockReturnValue({ mg, agentCount: 1 });
+    vi.mocked(getMessagingGroupAgents).mockReturnValue([agent]);
+    vi.mocked(getAgentGroup).mockReturnValue({
+      id: 'ag-1',
+      name: 'Bo',
+      folder: 'madison-reed',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+    vi.mocked(resolveSession).mockReturnValue({
+      session: {
+        id: 's-1',
+        agent_group_id: 'ag-1',
+        messaging_group_id: 'mg-1',
+        thread_id: null,
+        agent_provider: null,
+        status: 'active',
+        container_status: 'idle',
+        last_active: null,
+        created_at: new Date().toISOString(),
+      },
+      created: true,
+    });
+
+    // Real mention → engages=true → wake=true → dispatcher runs.
+    const event = makeChatEvent('-e high');
+    await routeInbound(event);
+
+    expect(parseMessageFlags).toHaveBeenCalled();
+  });
+});

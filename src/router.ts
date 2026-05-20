@@ -861,9 +861,20 @@ async function deliverToAgent(
   // Host emits the flag confirmation directly to outbound so it lands
   // without waiting for the agent turn. Structured intent is attached to
   // messages_in.content so the container never re-parses text.
+  //
+  // Wake gate: skip the flag dispatcher entirely when `wake=false`. The
+  // accumulate path delivers the message as silent context (the agent
+  // isn't being addressed), so applying `-e`/`-m` flags from a message
+  // that was for a sibling would (a) post a duplicate "effort → X" reply
+  // from this agent's bot user — visible noise in the channel — and (b)
+  // store the flag in this session's sticky config when the operator
+  // never intended it. Observed: `@Bo -e max` triggered Bo-codex's
+  // accumulate path on the shared MR channel; Bo-codex emitted its own
+  // "effort → max" message and stored "max" in its session_state even
+  // though "max" isn't a valid Codex reasoning_effort value.
   let flagIntent: FlagIntent | undefined;
   let flagCleanedText: string | null = null;
-  if (event.message.kind === 'chat' || event.message.kind === 'chat-sdk') {
+  if (wake && (event.message.kind === 'chat' || event.message.kind === 'chat-sdk')) {
     const rawText = parsedContent.text ?? '';
     const parsed = parseMessageFlags(rawText);
     if (parsed.intent || parsed.errors.length > 0 || parsed.warnings.length > 0) {
