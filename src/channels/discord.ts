@@ -290,10 +290,26 @@ async function fetchDiscordBotIdentity(botToken: string): Promise<DiscordBotIden
 export function resolveDiscordMentions(text: string, bots: Map<string, DiscordBotIdentity> = knownDiscordBots): string {
   if (bots.size === 0) return text;
 
-  // Username → id, lowercased for case-insensitive matching.
+  // Username → id, lowercased for case-insensitive matching. Each bot also
+  // contributes a separator-stripped alias (`axie-codex` ↔ `axiecodex`) so
+  // operator-typed Discord handles that diverge from the agent's logical
+  // name still resolve. Literal-first conflict resolution: an exact literal
+  // owns its slot in byName; normalized aliases fill only unowned slots.
+  // Mirrors slack-mentions.ts's normalized-fallback fix (PR-fix-slack-...).
   const byName = new Map<string, string>();
+  const literalKeys = new Set<string>();
   for (const { userId, username } of bots.values()) {
-    byName.set(username.toLowerCase(), userId);
+    const literal = username.toLowerCase();
+    byName.set(literal, userId);
+    literalKeys.add(literal);
+  }
+  for (const { userId, username } of bots.values()) {
+    const literal = username.toLowerCase();
+    const normalized = normalizeHandle(literal);
+    if (normalized === literal) continue;
+    if (literalKeys.has(normalized)) continue;
+    if (byName.has(normalized)) continue;
+    byName.set(normalized, userId);
   }
 
   // Discord usernames allow `[a-z0-9_.]` post-2023; we additionally accept
@@ -335,7 +351,8 @@ export function resolveDiscordMentions(text: string, bots: Map<string, DiscordBo
 
   return transformOutsideProtectedRegions(text, (segment) => {
     const rewriteByName = (match: string, name: string): string => {
-      const id = byName.get(name.toLowerCase());
+      const literal = name.toLowerCase();
+      const id = byName.get(literal) ?? byName.get(normalizeHandle(literal));
       return id ? `<@${id}>` : match;
     };
 
@@ -347,6 +364,16 @@ export function resolveDiscordMentions(text: string, bots: Map<string, DiscordBo
       return rewriteByName(match, name);
     });
   });
+}
+
+/**
+ * Strip Discord-handle separators (`-`, `_`, `.`) so `axie-codex` ≡
+ * `axiecodex` ≡ `axie_codex` for fuzzy matching. Used only as a fallback
+ * after literal lookup misses — never replaces literal equality. Mirrors
+ * the same helper in `slack-mentions.ts`.
+ */
+function normalizeHandle(handle: string): string {
+  return handle.replace(/[-_.]/g, '');
 }
 
 /**

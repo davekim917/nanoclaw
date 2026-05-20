@@ -72,10 +72,42 @@ export function resolveSlackMentions(
   // self-mentions are filtered by Slack's own UI ("you can't @-mention
   // yourself") and re-trigger by the adapter's echo filter on the inbound
   // side.
+  //
+  // Each bot contributes TWO keys: its literal lowercase username AND a
+  // separator-stripped form (`bo-codex` ↔ `bocodex`). Slack usernames are
+  // operator-typed when the app is created, so they often diverge from the
+  // logical name the agent emits — e.g. agent_group `madison-reed-codex`
+  // ends up as Slack username `bocodex` (no hyphen) because the operator
+  // typed it that way. The agent (per CLAUDE.md "Working with peer agents")
+  // emits `@Bo-codex`, the rewriter looked up literal `bo-codex` only, missed,
+  // and the @-mention shipped as plain text → no Slack mention event → peer
+  // didn't wake. Separator-normalized fallback closes that gap without
+  // requiring the operator to rename either side.
+  //
+  // Conflict resolution: literal keys win. If bot A's literal happens to
+  // equal bot B's normalized form, bot A is reachable via literal lookup
+  // and bot B is reachable via its own literal (just not via the colliding
+  // normalized form). Both bots remain mentionable; the only loss is
+  // "fuzzy" reachability for the second bot. That's the right priority —
+  // literal matches the operator's chosen Slack handle exactly, and Slack's
+  // own UI never produces ambiguous separator variants.
   const byName = new Map<string, string>();
+  const literalKeys = new Set<string>();
   for (const ident of bots.values()) {
     if (ident.teamId !== currentBot.teamId) continue;
-    byName.set(ident.username.toLowerCase(), ident.userId);
+    const literal = ident.username.toLowerCase();
+    byName.set(literal, ident.userId);
+    literalKeys.add(literal);
+  }
+  // Second pass for normalized aliases, only filling slots no literal owns.
+  for (const ident of bots.values()) {
+    if (ident.teamId !== currentBot.teamId) continue;
+    const literal = ident.username.toLowerCase();
+    const normalized = normalizeHandle(literal);
+    if (normalized === literal) continue;
+    if (literalKeys.has(normalized)) continue;
+    if (byName.has(normalized)) continue;
+    byName.set(normalized, ident.userId);
   }
   if (byName.size === 0) return text;
 
@@ -101,7 +133,10 @@ export function resolveSlackMentions(
       // uppercase alphanumerics) — those are already canonical and shouldn't
       // be looked up as usernames.
       if (/^U[A-Z0-9]{7,}$/.test(name)) return match;
-      const id = byName.get(name.toLowerCase());
+      const literal = name.toLowerCase();
+      // Literal first so an exact operator-chosen Slack handle always wins
+      // over a fuzzy collision; fall back to separator-normalized lookup.
+      const id = byName.get(literal) ?? byName.get(normalizeHandle(literal));
       return id ? `<@${id}>` : match;
     };
 
@@ -113,6 +148,15 @@ export function resolveSlackMentions(
       return rewriteByName(match, name);
     });
   });
+}
+
+/**
+ * Strip Slack-handle separators (`-`, `_`, `.`) so `bo-codex` ≡ `bocodex` ≡
+ * `bo_codex` for fuzzy matching. Used only as a fallback after literal
+ * lookup misses — never replaces literal equality.
+ */
+function normalizeHandle(handle: string): string {
+  return handle.replace(/[-_.]/g, '');
 }
 
 /**

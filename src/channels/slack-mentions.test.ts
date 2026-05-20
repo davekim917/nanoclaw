@@ -91,6 +91,67 @@ describe('resolveSlackMentions', () => {
     expect(resolveSlackMentions('@randomuser hi', 'slack-illysium', makeBots())).toBe('@randomuser hi');
   });
 
+  // Operator-typed Slack handles often drop hyphens/underscores even though
+  // the agent's logical name keeps them. Production case: agent_group
+  // `madison-reed-codex` registered as Slack username `bocodex`. The agent
+  // (per CLAUDE.md "Working with peer agents") writes `@Bo-codex`; without
+  // separator-normalized fallback the lookup misses and the @-mention ships
+  // as plain text — Slack fires no mention event, the peer never wakes.
+  describe('separator-normalized fallback (operator-handle mismatch)', () => {
+    function makeBotsWithMismatch(): Map<string, SlackBotIdentity> {
+      const bots = new Map<string, SlackBotIdentity>();
+      bots.set('slack-madisonreed', { userId: 'U-BO', username: 'beau', teamId: MR_TEAM });
+      bots.set('slack-madisonreed-codex', { userId: 'U-BO-CODEX', username: 'bocodex', teamId: MR_TEAM });
+      return bots;
+    }
+
+    it('rewrites `@bo-codex` when Slack handle is `bocodex` (separators stripped)', () => {
+      expect(resolveSlackMentions('@bo-codex pick this up', 'slack-madisonreed', makeBotsWithMismatch())).toBe(
+        '<@U-BO-CODEX> pick this up',
+      );
+    });
+
+    it('rewrites `@Bo-Codex` case-insensitively against `bocodex`', () => {
+      expect(resolveSlackMentions('@Bo-Codex pick this up', 'slack-madisonreed', makeBotsWithMismatch())).toBe(
+        '<@U-BO-CODEX> pick this up',
+      );
+    });
+
+    it('rewrites `@bo_codex` (underscore variant) against `bocodex`', () => {
+      expect(resolveSlackMentions('@bo_codex pick this up', 'slack-madisonreed', makeBotsWithMismatch())).toBe(
+        '<@U-BO-CODEX> pick this up',
+      );
+    });
+
+    it('still rewrites the literal `@bocodex` form', () => {
+      expect(resolveSlackMentions('@bocodex pick this up', 'slack-madisonreed', makeBotsWithMismatch())).toBe(
+        '<@U-BO-CODEX> pick this up',
+      );
+    });
+
+    it('preserves literal-first priority — `bo-codex` literal beats `bocodex`-normalized collision', () => {
+      // Both bots registered: one literal `bo-codex`, one literal `bocodex`.
+      // The normalized form of both is `bocodex`. The literal `bocodex`
+      // owns the `bocodex` slot in byName (literal-first). `@bo-codex`
+      // hits its own literal; `@bocodex` hits the other literal — both
+      // bots remain individually mentionable.
+      const bots = new Map<string, SlackBotIdentity>();
+      bots.set('slack-mr', { userId: 'U-A', username: 'bo-codex', teamId: MR_TEAM });
+      bots.set('slack-mr-codex', { userId: 'U-B', username: 'bocodex', teamId: MR_TEAM });
+      bots.set('slack-mr-self', { userId: 'U-SELF', username: 'beau', teamId: MR_TEAM });
+      expect(resolveSlackMentions('@bo-codex hi', 'slack-mr-self', bots)).toBe('<@U-A> hi');
+      expect(resolveSlackMentions('@bocodex hi', 'slack-mr-self', bots)).toBe('<@U-B> hi');
+    });
+
+    it('does not cross workspaces via normalized form either', () => {
+      // illie-codex is in Illysium; an MR agent writing `@illiecodex` (a
+      // separator-collapsed normalized form) must NOT resolve to the
+      // Illysium bot because they're in different teamIds.
+      const bots = makeBots(); // illie-codex is ILLY_TEAM, bo is MR_TEAM
+      expect(resolveSlackMentions('@illiecodex hi', 'slack-madisonreed', bots)).toBe('@illiecodex hi');
+    });
+  });
+
   // URL safety — `transformOutsideProtectedRegions` only shields code
   // spans, so URL guards live in the lookbehind itself. Without `/` and
   // `:` in the exclude class, an `@-after-path-slash` would get rewritten
