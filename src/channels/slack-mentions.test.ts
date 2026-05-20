@@ -288,6 +288,52 @@ describe('resolveSlackMentions', () => {
   });
 });
 
+describe('getSlackBotDisplayName', () => {
+  // Host-side accessor used by container-runner's `resolveAssistantName` to
+  // compute per-spawn NANOCLAW_ASSISTANT_NAME. Precedence mirrors what
+  // Slack's UI autocomplete itself uses for @-mention resolution.
+  function withRegistered(channelType: string, identity: SlackBotIdentity, fn: () => void): void {
+    registerSlackBot(channelType, identity);
+    try {
+      fn();
+    } finally {
+      // Channel-types are unique per test; "clear" by overwriting with a
+      // disjoint teamId so cross-test bleed is impossible.
+      registerSlackBot(channelType, { ...identity, teamId: '__cleared__' });
+    }
+  }
+
+  it('returns null when the channel_type has no registered bot', async () => {
+    const { getSlackBotDisplayName } = await import('./slack-mentions.js');
+    expect(getSlackBotDisplayName('slack-unregistered')).toBeNull();
+  });
+
+  it('prefers profile.display_name over realName and username', async () => {
+    const { getSlackBotDisplayName } = await import('./slack-mentions.js');
+    withRegistered(
+      'slack-disp',
+      { userId: 'U-1', username: 'legacy', displayName: 'Friendly', realName: 'Real', teamId: MR_TEAM },
+      () => {
+        expect(getSlackBotDisplayName('slack-disp')).toBe('Friendly');
+      },
+    );
+  });
+
+  it('falls back to profile.real_name when display_name is empty', async () => {
+    const { getSlackBotDisplayName } = await import('./slack-mentions.js');
+    withRegistered('slack-real', { userId: 'U-2', username: 'beau', realName: 'Bo', teamId: MR_TEAM }, () => {
+      expect(getSlackBotDisplayName('slack-real')).toBe('Bo');
+    });
+  });
+
+  it('falls back to legacy auth.test.user when neither profile field is set', async () => {
+    const { getSlackBotDisplayName } = await import('./slack-mentions.js');
+    withRegistered('slack-user', { userId: 'U-3', username: 'beau', teamId: MR_TEAM }, () => {
+      expect(getSlackBotDisplayName('slack-user')).toBe('beau');
+    });
+  });
+});
+
 describe('fetchSlackBotIdentity', () => {
   // fetchSlackBotIdentity is intentionally fast/non-blocking — it only does
   // auth.test, never users.info. Profile enrichment runs separately via

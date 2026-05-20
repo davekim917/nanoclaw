@@ -1764,10 +1764,14 @@ function ensureRuntimeFields(
     containerConfig.groupName = agentGroup.name;
     dirty = true;
   }
-  if (containerConfig.assistantName !== agentGroup.name) {
-    containerConfig.assistantName = agentGroup.name;
-    dirty = true;
-  }
+  // NOTE: `assistantName` is NOT force-synced here. The agent's user-facing
+  // name varies per channel — the same agent_group can show as "Bo" in
+  // Slack, "Axie" in Discord, etc. The per-session resolver lives in
+  // `resolveAssistantName` below; container-runner passes the result as
+  // the NANOCLAW_ASSISTANT_NAME env var on every spawn so the in-container
+  // runner can prefer it over container.json's static value. Keeping the
+  // file untouched preserves whatever the operator (or
+  // `container_configs.assistant_name`) wrote without per-channel churn.
   if (dirty) {
     // Race-safe write: re-read container.json immediately before persisting
     // and merge our identity fields onto the freshest disk state. Without
@@ -1784,7 +1788,6 @@ function ensureRuntimeFields(
     const fresh = readContainerConfig(agentGroup.folder);
     fresh.agentGroupId = agentGroup.id;
     fresh.groupName = agentGroup.name;
-    fresh.assistantName = agentGroup.name;
     writeContainerConfig(agentGroup.folder, fresh);
     // Sync the in-memory copy with anything the concurrent writer may have
     // added between our read and write — downstream spawn code reads other
@@ -1793,6 +1796,50 @@ function ensureRuntimeFields(
     if (fresh.tools !== undefined) containerConfig.tools = fresh.tools;
     if (fresh.mcpServers !== undefined) containerConfig.mcpServers = fresh.mcpServers;
   }
+}
+
+/**
+ * Per-session resolution of the agent's user-facing name. Used to populate
+ * `NANOCLAW_ASSISTANT_NAME` for every spawn.
+ *
+ * Precedence:
+ *   1. `container_configs.assistant_name` (operator-set per-agent override —
+ *      already merged into `containerConfig.assistantName` by readContainerConfig)
+ *      WHEN it differs from `agent_group.name` (i.e., operator-intentional).
+ *   2. Platform bot display from the session's channel — what users actually
+ *      see in chat. Slack first (most installs), then Discord.
+ *   3. `agent_group.name` (structural fallback — admin/cli sessions, freshly-
+ *      booted adapters before identity fetch completes).
+ *
+ * Same agent_group routed to different channels gets different names; on the
+ * Slack MR channel "Bo", on Discord "Axie", on admin sessions "madison-reed".
+ */
+async function resolveAssistantName(
+  agentGroup: AgentGroup,
+  containerConfig: import('./container-config.js').ContainerConfig,
+  sessionMessagingGroupId: string | null,
+): Promise<string> {
+  // Operator-set explicit override (CLI: `ncl groups config update <id> --assistant-name=…`).
+  // `readContainerConfig` collapses `row.assistant_name ?? group.name` so we
+  // can only tell it's operator-set when it diverges from `group.name`.
+  if (containerConfig.assistantName && containerConfig.assistantName !== agentGroup.name) {
+    return containerConfig.assistantName;
+  }
+
+  if (sessionMessagingGroupId) {
+    const { getMessagingGroup } = await import('./db/messaging-groups.js');
+    const mg = getMessagingGroup(sessionMessagingGroupId);
+    if (mg) {
+      const { getSlackBotDisplayName } = await import('./channels/slack-mentions.js');
+      const slack = getSlackBotDisplayName(mg.channel_type);
+      if (slack) return slack;
+      const { getDiscordBotDisplayName } = await import('./channels/discord.js');
+      const discord = getDiscordBotDisplayName(mg.channel_type);
+      if (discord) return discord;
+    }
+  }
+
+  return agentGroup.name;
 }
 
 async function buildContainerArgs(
@@ -1877,6 +1924,36 @@ async function buildContainerArgs(
   if (defaultTone) {
     args.push('-e', `NANOCLAW_DEFAULT_TONE=${defaultTone}`);
   }
+
+  // Per-session assistant name. Resolved channel-aware so the same
+  // agent_group can say "I am Bo" on Slack MR, "I am Axie" on Discord, etc.
+  // The in-container runner prefers NANOCLAW_ASSISTANT_NAME over
+  // container.json's static value (see container/agent-runner/src/config.ts).
+  // Falls back to agent_group.name when no channel bot is registered
+  // (admin/cli sessions, freshly-booted adapters).
+  const resolvedAssistantName = await resolveAssistantName(
+    agentGroup,
+    containerConfig,
+    sessionMessagingGroupId ?? null,
+  );
+  args.push('-e', `NANOCLAW_ASSISTANT_NAME=${resolvedAssistantName}`);
+
+  // Workgroup awareness — the agent learns which workgroup (multi-agent
+  // tenant boundary) it belongs to, so prompts grounded in "my workgroup is
+  // X" reach the right scope. Omitted when the agent has no workgroup row
+  // (pre-migration-036 installs / fresh standalone agents).
+  //
+  // Read directly from the DB rather than from `agentGroup` because the
+  // typed `AgentGroup` interface doesn't surface workgroup_id (column was
+  // added in migration 036; the row carries it but the type predates it).
+  // Mirrors the existing W3 fail-closed lookup at container-runner.ts:1068.
+  const agRow = getDb().prepare(`SELECT workgroup_id FROM agent_groups WHERE id = ?`).get(agentGroup.id) as
+    | { workgroup_id: string | null }
+    | undefined;
+  if (agRow?.workgroup_id) {
+    args.push('-e', `NANOCLAW_WORKGROUP_ID=${agRow.workgroup_id}`);
+  }
+
   // v1 settings.json env block (src/container-runner.ts:1703-1709): SDK
   // capabilities that need explicit opt-in. Porting as plain env since
   // v2's container reads env, not a settings.json mount point.

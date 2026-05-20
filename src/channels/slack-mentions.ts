@@ -58,6 +58,25 @@ export function getKnownSlackBots(): ReadonlyMap<string, SlackBotIdentity> {
 }
 
 /**
+ * Resolve the bot's user-facing display name for a Slack channel_type.
+ * Precedence matches what Slack's UI itself uses for @-mention autocomplete:
+ *   1. `profile.display_name` (per-workspace customizable; preferred)
+ *   2. `profile.real_name` (autocomplete fallback when display_name is empty)
+ *   3. `auth.test.user` (legacy install-time username, last resort)
+ *
+ * Returns null when the bot isn't registered (yet) — e.g. a spawn that
+ * races adapter init before auth.test completes, or an admin/cli session
+ * with no Slack adapter. The caller (`resolveAssistantName` in
+ * container-runner) treats null as "fall through to the next platform
+ * resolver or the agent_group.name floor".
+ */
+export function getSlackBotDisplayName(channelType: string): string | null {
+  const bot = knownSlackBots.get(channelType);
+  if (!bot) return null;
+  return bot.displayName || bot.realName || bot.username || null;
+}
+
+/**
  * Rewrite `@bot-username` and `<@bot-username>` to Slack's canonical
  * `<@USER_ID>` mention syntax for every sibling bot that lives in the
  * same Slack workspace as `currentChannelType`.

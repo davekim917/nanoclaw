@@ -32,9 +32,16 @@ let _config: RunnerConfig | null = null;
  * touching the filesystem.
  */
 export function parseRawConfig(raw: Record<string, unknown>): RunnerConfig {
+  // NANOCLAW_ASSISTANT_NAME is per-spawn, set by the host (container-runner)
+  // after resolving the agent's user-facing name for THIS session's channel
+  // (Slack display, Discord username, or agent_group.name fallback). When
+  // present it wins over container.json's static value — the JSON is
+  // operator-static while the env is channel-aware. See
+  // src/container-runner.ts `resolveAssistantName`.
+  const envAssistantName = typeof process !== 'undefined' ? process.env?.NANOCLAW_ASSISTANT_NAME : undefined;
   return {
     provider: (raw.provider as string) || 'claude',
-    assistantName: (raw.assistantName as string) || '',
+    assistantName: envAssistantName || (raw.assistantName as string) || '',
     groupName: (raw.groupName as string) || '',
     agentGroupId: (raw.agentGroupId as string) || '',
     maxMessagesPerPrompt: (raw.maxMessagesPerPrompt as number) || DEFAULT_MAX_MESSAGES,

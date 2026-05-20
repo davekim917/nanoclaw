@@ -101,7 +101,22 @@ export function buildSystemPromptAddendum(assistantName?: string): string {
   const sections: string[] = [];
 
   if (assistantName) {
-    sections.push(['# You are ' + assistantName, '', `Your name is **${assistantName}**. Use it when the channel asks who you are, when introducing yourself, and when signing any message that explicitly calls for a signature.`].join('\n'));
+    // Workgroup awareness — set by the host (container-runner) via
+    // NANOCLAW_WORKGROUP_ID when the agent_group has one. The workgroup is
+    // the multi-agent tenant boundary (chat archive, mnemon recall, OneCLI
+    // secret pool). The agent knows which scope it operates under so prompts
+    // grounded in "my workgroup is X" reach the right peers and data pool.
+    const workgroupId =
+      typeof process !== 'undefined' ? process.env?.NANOCLAW_WORKGROUP_ID : undefined;
+    const headerLines = [
+      '# You are ' + assistantName,
+      '',
+      `Your name is **${assistantName}**. Use it when the channel asks who you are, when introducing yourself, and when signing any message that explicitly calls for a signature.`,
+    ];
+    if (workgroupId) {
+      headerLines.push('', `Your workgroup is **${workgroupId}** — this is the multi-agent tenant boundary you operate under. Peers in the same workgroup share your chat archive and memory; agents in other workgroups do not.`);
+    }
+    sections.push(headerLines.join('\n'));
   }
 
   // Communication invariants the NanoClaw harness relies on across every

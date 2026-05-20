@@ -241,6 +241,22 @@ describe('end-to-end: resolveDiscordMentions → installed chat-sdk adapter rend
   });
 });
 
+describe('getDiscordBotDisplayName', () => {
+  // Host-side accessor used by container-runner's `resolveAssistantName` to
+  // compute per-spawn NANOCLAW_ASSISTANT_NAME for Discord-rooted sessions.
+  // Discord post-2023 uses a single `username` field — no display_name /
+  // discriminator split to navigate.
+  //
+  // The Discord registry isn't exposed for test seeding (would require an
+  // intrusive export), so we cover only the null fall-through here. The
+  // happy path is covered via the integration of `resolveAssistantName`
+  // when the host wires both Slack + Discord adapters.
+  it('returns null for an unregistered channel_type — caller falls through to next resolver', async () => {
+    const { getDiscordBotDisplayName } = await import('./discord.js');
+    expect(getDiscordBotDisplayName('discord-not-here')).toBeNull();
+  });
+});
+
 describe('resolveIncomingDiscordMentions', () => {
   const bots = new Map<string, DiscordBotIdentity>([
     ['discord', { userId: '1478986205319135302', username: 'Axie' }],
