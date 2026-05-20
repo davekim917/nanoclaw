@@ -192,4 +192,91 @@ describe('canUseSlackUserToken — permission gate', () => {
       }),
     ).toBe(true);
   });
+
+  // ── Sibling-aware owner matching (codex-twin DMs) ─────────────────────────
+  // Production bug discovered on Dave's install: bo (Claude) and bo-codex
+  // have separate Slack bots → separate channel adapters → separate user
+  // namespaces. The same human is `slack-madisonreed:U0…` from bo's lens
+  // and `slack-madisonreed-codex:U0…` from bo-codex's lens. The old
+  // exact-match user_id JOIN only matched the bot the operator originally
+  // had owner role on, so the codex twin's DM was incorrectly gated off.
+  // The fix matches by HANDLE within the same channel FAMILY (slack-* family).
+
+  it('test_codex_twin_dm_recognized_via_handle_match', () => {
+    // Operator (owner) is recorded on bo's adapter only:
+    //   user_id = slack-madisonreed:U0ARRQSMUAD
+    // The DM in question is on bo-codex's adapter:
+    //   user_id = slack-madisonreed-codex:U0ARRQSMUAD
+    // Both share the same Slack handle (U0ARRQSMUAD) and same family (slack).
+    const wgDb = makeDb();
+    wgDb.exec(`
+      INSERT INTO users (id, kind, display_name, created_at)
+        VALUES
+          ('slack-madisonreed:U0ARRQSMUAD', 'human', 'Dave', '2026-01-01'),
+          ('slack-madisonreed-codex:U0ARRQSMUAD', 'human', 'Dave', '2026-01-01');
+      INSERT INTO user_roles (user_id, role, agent_group_id, granted_at)
+        VALUES ('slack-madisonreed:U0ARRQSMUAD', 'owner', NULL, '2026-01-01');
+      INSERT INTO messaging_groups (id, channel_type, platform_id, is_group, created_at)
+        VALUES ('mg-bo-codex-dm', 'slack-madisonreed-codex', 'slack:D0B3N6Q41D5', 0, '2026-01-01');
+      INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at)
+        VALUES ('slack-madisonreed-codex:U0ARRQSMUAD', 'slack-madisonreed-codex', 'mg-bo-codex-dm', '2026-01-01');
+    `);
+    expect(canUseSlackUserToken(wgDb, 'mg-bo-codex-dm', { enabled: true })).toBe(true);
+  });
+
+  it('test_handle_match_rejects_cross_family_collision', () => {
+    // Defense: a Slack user_id handle string that happens to equal a
+    // Discord snowflake handle must NOT cross the family boundary.
+    // Owner on Discord; DM on Slack; same numeric handle (contrived). Deny.
+    const wgDb = makeDb();
+    wgDb.exec(`
+      INSERT INTO users (id, kind, created_at)
+        VALUES
+          ('discord-axie-codex:608746260706361344', 'human', '2026-01-01'),
+          ('slack-madisonreed:608746260706361344', 'human', '2026-01-01');
+      INSERT INTO user_roles (user_id, role, agent_group_id, granted_at)
+        VALUES ('discord-axie-codex:608746260706361344', 'owner', NULL, '2026-01-01');
+      INSERT INTO messaging_groups (id, channel_type, platform_id, is_group, created_at)
+        VALUES ('mg-slack-dm-collision', 'slack-madisonreed', 'slack:DCOLLIDE', 0, '2026-01-01');
+      INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at)
+        VALUES ('slack-madisonreed:608746260706361344', 'slack-madisonreed', 'mg-slack-dm-collision', '2026-01-01');
+    `);
+    expect(canUseSlackUserToken(wgDb, 'mg-slack-dm-collision', { enabled: true })).toBe(false);
+  });
+
+  it('test_handle_mismatch_within_family_denies', () => {
+    // Same Slack family but different handle (e.g., a teammate's DM on a
+    // codex twin's adapter). Must deny — handles are how we identify the
+    // human, family alone isn't enough.
+    const wgDb = makeDb();
+    wgDb.exec(`
+      INSERT INTO users (id, kind, created_at)
+        VALUES
+          ('slack-madisonreed:U0ARRQSMUAD', 'human', '2026-01-01'),
+          ('slack-madisonreed-codex:UTEAMMATE', 'human', '2026-01-01');
+      INSERT INTO user_roles (user_id, role, agent_group_id, granted_at)
+        VALUES ('slack-madisonreed:U0ARRQSMUAD', 'owner', NULL, '2026-01-01');
+      INSERT INTO messaging_groups (id, channel_type, platform_id, is_group, created_at)
+        VALUES ('mg-teammate-dm', 'slack-madisonreed-codex', 'slack:DTEAMMATE', 0, '2026-01-01');
+      INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at)
+        VALUES ('slack-madisonreed-codex:UTEAMMATE', 'slack-madisonreed-codex', 'mg-teammate-dm', '2026-01-01');
+    `);
+    expect(canUseSlackUserToken(wgDb, 'mg-teammate-dm', { enabled: true })).toBe(false);
+  });
+
+  it('test_bare_channel_type_no_dash_resolves_family_to_self', () => {
+    // For channel_types without a hyphen (e.g., plain 'discord', 'telegram'),
+    // the family IS the channel_type itself. Exact-match still works.
+    const wgDb = makeDb();
+    wgDb.exec(`
+      INSERT INTO users (id, kind, created_at) VALUES ('telegram:6037840640', 'human', '2026-01-01');
+      INSERT INTO user_roles (user_id, role, agent_group_id, granted_at)
+        VALUES ('telegram:6037840640', 'owner', NULL, '2026-01-01');
+      INSERT INTO messaging_groups (id, channel_type, platform_id, is_group, created_at)
+        VALUES ('mg-tg-dm', 'telegram', 'tg:6037840640', 0, '2026-01-01');
+      INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at)
+        VALUES ('telegram:6037840640', 'telegram', 'mg-tg-dm', '2026-01-01');
+    `);
+    expect(canUseSlackUserToken(wgDb, 'mg-tg-dm', { enabled: true })).toBe(true);
+  });
 });
