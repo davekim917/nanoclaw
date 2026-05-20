@@ -123,9 +123,74 @@ export function buildSystemPromptAddendum(assistantName?: string): string {
     ].join('\n'),
   );
 
+  const peerSection = buildPeersSection(assistantName);
+  if (peerSection) sections.push(peerSection);
+
   sections.push(buildDestinationsSection());
 
   return sections.join('\n\n');
+}
+
+/**
+ * In-channel peers — other agent_groups wired to the session's
+ * messaging_group. Container-runner enumerates them at spawn time and
+ * passes the list via NANOCLAW_PEERS as a JSON array of `{ name }`. We
+ * surface the names here so the agent has an explicit signal "your sibling
+ * is X" instead of inferring from chat history.
+ *
+ * Production failure mode this fixes: Bo (display "Bo") referring to its
+ * sibling as just "Bo" in prose ("Bo and I will share a worktree") because
+ * the agent couldn't disambiguate from chat history — both bots showed up
+ * as "Bo" prefixed display names in Slack, and the model collapsed the
+ * shared prefix into self-reference. Explicit peer roster gives the model
+ * a non-ambiguous handle.
+ *
+ * Returns empty when env is absent (single-agent channel, admin shell,
+ * no session messaging_group) or unparseable — fail-soft, never breaks
+ * boot.
+ */
+function buildPeersSection(assistantName?: string): string | null {
+  const raw = process.env.NANOCLAW_PEERS;
+  if (!raw) return null;
+  let peers: Array<{ name?: string }>;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return null;
+    peers = parsed as Array<{ name?: string }>;
+  } catch {
+    return null;
+  }
+  const names = peers
+    .map((p) => (typeof p?.name === 'string' ? sanitizeDisplayName(p.name) : ''))
+    .filter((n): n is string => n.length > 0);
+  if (names.length === 0) return null;
+
+  const lines = ['## Peer agents in this channel', ''];
+  if (names.length === 1) {
+    const peer = names[0];
+    lines.push(`You are sharing this channel with **${peer}**.`);
+    lines.push('');
+    lines.push(
+      `When you refer to ${peer} in prose, use the full name "${peer}" — not "${assistantName ?? 'Bo'}" or a shortened form. Display names in Slack/Discord often share a prefix between siblings (e.g. "Bo" and "Bo-codex"), so collapsing to the shared prefix means you are talking about YOURSELF, not your peer.`,
+    );
+    lines.push('');
+    lines.push(
+      `To hand off active work or coordinate next steps, end your reply by \`@\`-mentioning the peer (e.g. \`@${peer}\`). The outbound rewriter resolves the @-mention to the peer's real platform user id; without the @-mention, the peer's session does not fire and the conversation stalls. Stop @-mentioning only when the work is verifiably DONE — proposing next steps, asking the peer a question, or describing collaboration in progress are all signals to keep the @-mention on.`,
+    );
+  } else {
+    lines.push('You are sharing this channel with these peers:');
+    lines.push('');
+    for (const peer of names) lines.push(`- **${peer}**`);
+    lines.push('');
+    lines.push(
+      `When referring to peers in prose, use their full names (the bolded values above) — not "${assistantName ?? 'Bo'}" or shortened forms. Display names often share a prefix between siblings, so collapsing to the shared prefix would mean you are talking about YOURSELF, not your peer.`,
+    );
+    lines.push('');
+    lines.push(
+      'To hand off active work or coordinate next steps, end your reply by `@`-mentioning the peer (e.g. `@<name>`). The outbound rewriter resolves the @-mention to the peer\'s real platform user id; without the @-mention, the peer\'s session does not fire and the conversation stalls. Stop @-mentioning only when the work is verifiably DONE.',
+    );
+  }
+  return lines.join('\n');
 }
 
 function buildDestinationsSection(): string {

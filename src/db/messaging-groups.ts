@@ -235,6 +235,38 @@ export function getMessagingGroupAgentByPair(
     .get(messagingGroupId, agentGroupId) as MessagingGroupAgent | undefined;
 }
 
+/**
+ * Peer agent_groups wired to the same messaging_group as `agentGroupId` —
+ * excluding the agent itself. Used by container-runner at spawn time to
+ * inject the in-channel peer roster into the runtime system prompt, so an
+ * agent like Bo can be told explicitly "your sibling here is Bo-codex"
+ * rather than inferring it from chat history (where it sometimes confuses
+ * the sibling's name with its own).
+ *
+ * Returns minimal identity fields: id + name. The container's
+ * buildSystemPromptAddendum surfaces `name`, and the slack/discord
+ * outbound rewriter resolves `@<name>` to the real platform user_id at
+ * send time (PR #111 makes that resolution robust to separator and
+ * display_name variance).
+ */
+export interface ChannelPeer {
+  agent_group_id: string;
+  name: string;
+}
+
+export function getChannelPeers(messagingGroupId: string, agentGroupId: string): ChannelPeer[] {
+  return getDb()
+    .prepare(
+      `SELECT ag.id AS agent_group_id, ag.name AS name
+       FROM messaging_group_agents mga
+       JOIN agent_groups ag ON ag.id = mga.agent_group_id
+       WHERE mga.messaging_group_id = ?
+         AND mga.agent_group_id != ?
+       ORDER BY ag.name`,
+    )
+    .all(messagingGroupId, agentGroupId) as ChannelPeer[];
+}
+
 export function getMessagingGroupAgent(id: string): MessagingGroupAgent | undefined {
   return getDb().prepare('SELECT * FROM messaging_group_agents WHERE id = ?').get(id) as
     | MessagingGroupAgent

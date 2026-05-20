@@ -277,6 +277,66 @@ describe('messaging group agents', () => {
       .sort();
     expect(dests).toEqual(['gen', 'gen-2']);
   });
+
+  describe('getChannelPeers', () => {
+    it('returns peer agent_groups wired to the same messaging_group, excluding self', async () => {
+      const { getChannelPeers } = await import('./messaging-groups.js');
+      // ag-1 wired to mg-1 (seeded by parent beforeEach).
+      createMessagingGroupAgent(mga());
+      // Add a sibling agent_group also wired to mg-1.
+      createAgentGroup({ id: 'ag-2', name: 'Bo-codex', folder: 'bo-codex', agent_provider: null, created_at: now() });
+      createMessagingGroupAgent({ ...mga(), id: 'mga-2', agent_group_id: 'ag-2', priority: 5 });
+
+      const peersOfAg1 = getChannelPeers('mg-1', 'ag-1');
+      expect(peersOfAg1).toEqual([{ agent_group_id: 'ag-2', name: 'Bo-codex' }]);
+
+      const peersOfAg2 = getChannelPeers('mg-1', 'ag-2');
+      expect(peersOfAg2).toEqual([{ agent_group_id: 'ag-1', name: 'Agent' }]);
+    });
+
+    it('returns empty when no other agents are wired to the messaging_group', async () => {
+      // mg-1 has only one agent (none yet) — empty peer list.
+      const { getChannelPeers } = await import('./messaging-groups.js');
+      const peers = getChannelPeers('mg-1', 'ag-1');
+      expect(peers).toEqual([]);
+    });
+
+    it('does not return peers wired to OTHER messaging_groups', async () => {
+      const { getChannelPeers } = await import('./messaging-groups.js');
+      createMessagingGroupAgent(mga());
+      // Sibling wired to a DIFFERENT messaging_group — must NOT appear.
+      createAgentGroup({ id: 'ag-other', name: 'Other', folder: 'other', agent_provider: null, created_at: now() });
+      createMessagingGroup({
+        id: 'mg-other',
+        channel_type: 'discord',
+        platform_id: 'chan-other',
+        name: 'Other',
+        is_group: 1,
+        unknown_sender_policy: 'strict',
+        created_at: now(),
+      });
+      createMessagingGroupAgent({
+        ...mga(),
+        id: 'mga-other',
+        agent_group_id: 'ag-other',
+        messaging_group_id: 'mg-other',
+      });
+
+      expect(getChannelPeers('mg-1', 'ag-1')).toEqual([]);
+    });
+
+    it('orders peers by name', async () => {
+      const { getChannelPeers } = await import('./messaging-groups.js');
+      createMessagingGroupAgent(mga());
+      createAgentGroup({ id: 'ag-z', name: 'Zebra', folder: 'zebra', agent_provider: null, created_at: now() });
+      createAgentGroup({ id: 'ag-a', name: 'Aardvark', folder: 'aardvark', agent_provider: null, created_at: now() });
+      createMessagingGroupAgent({ ...mga(), id: 'mga-z', agent_group_id: 'ag-z' });
+      createMessagingGroupAgent({ ...mga(), id: 'mga-a', agent_group_id: 'ag-a' });
+
+      const peers = getChannelPeers('mg-1', 'ag-1');
+      expect(peers.map((p) => p.name)).toEqual(['Aardvark', 'Zebra']);
+    });
+  });
 });
 
 // ── Sessions ──

@@ -1873,6 +1873,28 @@ async function buildContainerArgs(
   if (defaultTone) {
     args.push('-e', `NANOCLAW_DEFAULT_TONE=${defaultTone}`);
   }
+
+  // In-channel peers — other agent_groups wired to the session's
+  // messaging_group. Surfaced in the runtime system prompt so the agent
+  // can disambiguate its own name from its sibling's without inferring it
+  // from chat history. Production failure mode this fixes: Bo (display
+  // "Bo") writing "Bo and I will share a worktree" when referring to its
+  // sibling Bo-codex — the LLM had no explicit signal that the OTHER bot's
+  // name was "Bo-codex" not "Bo", and the shared display-name prefix
+  // collapsed into self-reference.
+  //
+  // Empty when no session messaging_group (e.g. admin shell) or when the
+  // wiring is single-agent. The container's destinations.ts treats absence
+  // as "no peers" and omits the section entirely — same fail-soft pattern
+  // as destinations / tone.
+  if (sessionMessagingGroupId) {
+    const { getChannelPeers } = await import('./db/messaging-groups.js');
+    const peers = getChannelPeers(sessionMessagingGroupId, agentGroup.id);
+    if (peers.length > 0) {
+      args.push('-e', `NANOCLAW_PEERS=${JSON.stringify(peers.map((p) => ({ name: p.name })))}`);
+    }
+  }
+
   // v1 settings.json env block (src/container-runner.ts:1703-1709): SDK
   // capabilities that need explicit opt-in. Porting as plain env since
   // v2's container reads env, not a settings.json mount point.

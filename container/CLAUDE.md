@@ -84,17 +84,37 @@ user. Every message in the thread reaches both agents as inbound —
 including each other's replies — so collaboration is just standard
 chat:
 
-- To hand off to the sibling, end your reply by `@`-mentioning their
-  bot username (e.g. `@illie-codex` on Slack, `@Axie-codex` on Discord). The
-  platform mention fires the peer's `engage_mode='mention'` rule and
-  wakes it for the next turn. No special trailer needed; the @-mention
-  itself is the signal.
+- **Your peers are listed in the runtime system prompt under "Peer
+  agents in this channel"** — read that section to learn their exact
+  names. Refer to them in prose by the FULL name from that list, not
+  by a shared display-name prefix. Sibling agents typically share a
+  prefix (e.g. "Bo" and "Bo-codex" in Slack); collapsing to the prefix
+  means you are referring to YOURSELF, not the peer. This is a
+  high-recurrence failure mode — get the name right.
 
-- To end the back-and-forth, simply STOP `@`-mentioning the peer in
-  your reply. The peer won't fire on subsequent messages unless the
-  user re-tags it. Default to dropping the @-mention after ~3–4
-  back-and-forth exchanges with no forward progress — runaway loops
-  waste the user's tokens.
+- To hand off to the peer, end your reply by `@`-mentioning their
+  full name (e.g. `@Bo-codex` on Slack, `@Axie-codex` on Discord). The
+  outbound rewriter resolves the `@<name>` to the peer's real platform
+  user id — separator variance and `display_name`/`real_name` mismatch
+  are handled — so any spelling that matches the peer's display name
+  works. The platform mention then fires the peer's
+  `engage_mode='mention'` rule and wakes their session.
+
+- **Keep `@`-mentioning the peer for as long as the work is in
+  progress** — proposing a next step, asking them a question, agreeing
+  on a plan, or describing in-flight collaboration all require the
+  peer's session to fire next. Stop @-mentioning only when the work is
+  verifiably DONE (artifact merged, request closed, the user
+  explicitly says "thanks, all good"). Dropping the @-mention while
+  there's still coordination ahead stalls the back-and-forth and the
+  user has to re-tag the peer manually — a small UX failure that
+  compounds across long threads.
+
+- The back-and-forth-cap heuristic ("drop after ~3–4 turns with no
+  forward progress") applies only when the two agents are looping
+  WITHOUT advancing — repeating the same point, restating agreement,
+  etc. Forward progress (new artifacts, new findings, next-phase
+  scoping) is NOT a stop signal; keep the peer engaged.
 
 - Each adapter's self-echo filter drops messages whose author id
   matches your own bot user id, so you will never re-trigger on your
