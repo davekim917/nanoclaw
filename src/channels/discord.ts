@@ -224,6 +224,21 @@ export interface DiscordBotIdentity {
 
 const knownDiscordBots = new Map<string, DiscordBotIdentity>();
 
+/**
+ * Resolve the bot's user-facing display name for a Discord channel_type.
+ * Returns null when the bot isn't registered — e.g. a spawn that races
+ * adapter init or a non-Discord session. The caller (`resolveAssistantName`
+ * in container-runner) treats null as "try the next resolver or fall back
+ * to agent_group.name".
+ *
+ * Discord stores a single `username` post-2023 (the legacy discriminator
+ * system is gone); we surface that directly. No `display_name` distinction
+ * to navigate like Slack's profile fields.
+ */
+export function getDiscordBotDisplayName(channelType: string): string | null {
+  return knownDiscordBots.get(channelType)?.username ?? null;
+}
+
 // Cross-package channel for the patched chat-adapter. The patched
 // MessageCreate / reaction handlers in @chat-adapter/discord need to know
 // which bot ids belong to sibling NanoClaw bots in this process so they

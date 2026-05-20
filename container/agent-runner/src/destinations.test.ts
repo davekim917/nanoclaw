@@ -61,3 +61,39 @@ describe('buildSystemPromptAddendum — multi-destination routing guidance', () 
     expect(prompt).toContain('`casa`');
   });
 });
+
+describe('buildSystemPromptAddendum — workgroup awareness (NANOCLAW_WORKGROUP_ID)', () => {
+  function withWorkgroup<T>(value: string | undefined, fn: () => T): T {
+    const snapshot = process.env.NANOCLAW_WORKGROUP_ID;
+    try {
+      if (value === undefined) delete process.env.NANOCLAW_WORKGROUP_ID;
+      else process.env.NANOCLAW_WORKGROUP_ID = value;
+      return fn();
+    } finally {
+      if (snapshot === undefined) delete process.env.NANOCLAW_WORKGROUP_ID;
+      else process.env.NANOCLAW_WORKGROUP_ID = snapshot;
+    }
+  }
+
+  it('includes "Your workgroup is X" line when env is set', () => {
+    withWorkgroup('madison-reed', () => {
+      const prompt = buildSystemPromptAddendum('Bo');
+      expect(prompt).toContain('Your workgroup is **madison-reed**');
+      expect(prompt).toContain('multi-agent tenant boundary');
+    });
+  });
+
+  it('omits the workgroup line when env is unset (pre-migration / standalone agents)', () => {
+    withWorkgroup(undefined, () => {
+      const prompt = buildSystemPromptAddendum('Bo');
+      expect(prompt).not.toContain('Your workgroup is');
+    });
+  });
+
+  it('omits the workgroup line when assistantName is missing (no header section to attach to)', () => {
+    withWorkgroup('madison-reed', () => {
+      const prompt = buildSystemPromptAddendum(undefined);
+      expect(prompt).not.toContain('Your workgroup is');
+    });
+  });
+});
