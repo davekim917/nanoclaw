@@ -1947,11 +1947,24 @@ async function buildContainerArgs(
   // typed `AgentGroup` interface doesn't surface workgroup_id (column was
   // added in migration 036; the row carries it but the type predates it).
   // Mirrors the existing W3 fail-closed lookup at container-runner.ts:1068.
-  const agRow = getDb().prepare(`SELECT workgroup_id FROM agent_groups WHERE id = ?`).get(agentGroup.id) as
-    | { workgroup_id: string | null }
-    | undefined;
-  if (agRow?.workgroup_id) {
-    args.push('-e', `NANOCLAW_WORKGROUP_ID=${agRow.workgroup_id}`);
+  //
+  // Try/catch fail-soft: pre-migration-036 installs don't have the
+  // workgroup_id column at all. `SELECT workgroup_id FROM ...` throws
+  // `no such column` on those schemas. Codex P1 on PR #113 caught this
+  // turning a best-effort prompt addendum into a hard spawn failure.
+  // The W3 path at line 1066 uses PRAGMA table_info to guard the same
+  // case; here we use try/catch because the workgroup line is purely
+  // additive — silent fall-through is the right semantic.
+  try {
+    const agRow = getDb().prepare(`SELECT workgroup_id FROM agent_groups WHERE id = ?`).get(agentGroup.id) as
+      | { workgroup_id: string | null }
+      | undefined;
+    if (agRow?.workgroup_id) {
+      args.push('-e', `NANOCLAW_WORKGROUP_ID=${agRow.workgroup_id}`);
+    }
+  } catch {
+    // Pre-migration-036 schema. Omit the env var; the container's
+    // buildSystemPromptAddendum already treats absence as "no workgroup".
   }
 
   // v1 settings.json env block (src/container-runner.ts:1703-1709): SDK
