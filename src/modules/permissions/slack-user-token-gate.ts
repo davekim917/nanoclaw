@@ -28,12 +28,18 @@ import type { SlackUserTokenConfig } from '../../container-config.js';
  * `slack-madisonreed-codex:U0…` for the bo-codex DM. A naive exact-match
  * JOIN between `user_roles.user_id` and `user_dms.user_id` would only see
  * the owner of the bot they originally talked to. Instead, the gate matches
- * by HANDLE (the segment after the first colon) within the same channel
- * FAMILY (the segment before the first hyphen in `channel_type`). For Slack
- * that means `slack-madisonreed:U0…` and `slack-madisonreed-codex:U0…` both
- * count as the same owner from the gate's perspective. The channel-family
- * check prevents accidental cross-platform handle collisions (a Discord
- * snowflake that happens to equal a Slack user-id string).
+ * by HANDLE (the segment after the first colon) within the same Slack
+ * WORKSPACE (the channel_type with known sibling suffixes stripped). For
+ * Slack that means `slack-madisonreed:U0…` and `slack-madisonreed-codex:U0…`
+ * both count as the same owner from the gate's perspective.
+ *
+ * Cross-tenant defense: workspace matching is keyed on the FULL channel_type
+ * (sibling suffix stripped) — `slack-madisonreed` vs `slack-illysium` stay
+ * distinct, so a hypothetical user_id collision in a different Slack
+ * workspace cannot satisfy the gate. The MCP is Slack-only by name and the
+ * gate enforces it by requiring both sides to be `slack-*` channel_types —
+ * a Discord DM session can never satisfy the Slack MCP gate even if its
+ * handle happens to equal an owner's.
  *
  * The check is run at spawn time, not per-tool-call: if the gate denies, the
  * MCP server is never spawned for this session, so the in-container agent
@@ -65,22 +71,39 @@ export function canUseSlackUserToken(
   if (!dm) return false;
 
   const dmHandle = handleOf(dm.user_id);
-  const dmFamily = familyOf(dm.channel_type);
-  if (!dmHandle || !dmFamily) return false;
+  const dmWorkspace = slackWorkspaceOf(dm.channel_type);
+  // Slack MCP only applies in Slack DMs. Non-Slack channel_types short-
+  // circuit here regardless of handle, preventing a Discord/Telegram DM
+  // session with a colliding handle from satisfying the gate.
+  if (!dmHandle || !dmWorkspace) return false;
 
   // Match any global owner whose handle equals the DM user's handle AND
-  // whose channel-type family matches (Slack-to-Slack, Discord-to-Discord).
+  // whose channel_type resolves to the SAME Slack workspace after stripping
+  // sibling suffixes. `slack-madisonreed:U0…` ≡ `slack-madisonreed-codex:U0…`
+  // (same workspace, sibling bots). `slack-madisonreed:U0…` ≢
+  // `slack-illysium:U0…` (different workspaces — colliding handles do NOT
+  // cross-tenant escalate). Caught by Codex review on PR #110.
   const owners = db
     .prepare(`SELECT user_id FROM user_roles WHERE role = 'owner' AND agent_group_id IS NULL`)
     .all() as Array<{ user_id: string }>;
 
   for (const o of owners) {
     if (handleOf(o.user_id) !== dmHandle) continue;
-    if (familyOfUserId(o.user_id) !== dmFamily) continue;
+    const ownerChannelType = channelTypeOf(o.user_id);
+    if (!ownerChannelType) continue;
+    if (slackWorkspaceOf(ownerChannelType) !== dmWorkspace) continue;
     return true;
   }
   return false;
 }
+
+/**
+ * Known sibling-bot channel-type suffixes. The clone-as-codex skill provisions
+ * codex twins under a `-codex`-suffixed Slack app; future sibling kinds (e.g.,
+ * `-research`, `-data-analyst`) would follow the same convention. Add to this
+ * list when a new sibling kind ships — the test suite covers each pattern.
+ */
+const SIBLING_CHANNEL_SUFFIXES = ['-codex'] as const;
 
 /**
  * Extract the handle from a NanoClaw user_id (`<channel_type>:<handle>`).
@@ -92,24 +115,32 @@ function handleOf(userId: string): string | null {
   return userId.slice(idx + 1) || null;
 }
 
-/**
- * Extract the channel-type family from a NanoClaw user_id. The family is
- * the segment before the first hyphen in the channel_type prefix. Examples:
- *   slack-madisonreed:U0…       → "slack"
- *   slack-madisonreed-codex:U0… → "slack"
- *   discord-axie-codex:6087…    → "discord"
- *   discord:6087…               → "discord"
- *   telegram:6037840640         → "telegram"
- */
-function familyOfUserId(userId: string): string | null {
+/** Extract the channel_type prefix from a NanoClaw user_id. */
+function channelTypeOf(userId: string): string | null {
   const idx = userId.indexOf(':');
-  if (idx < 0) return null;
-  return familyOf(userId.slice(0, idx));
+  if (idx <= 0) return null;
+  return userId.slice(0, idx);
 }
 
-/** Same as familyOfUserId but takes a raw channel_type string. */
-function familyOf(channelType: string): string | null {
-  if (!channelType) return null;
-  const dash = channelType.indexOf('-');
-  return dash < 0 ? channelType : channelType.slice(0, dash);
+/**
+ * Resolve the Slack WORKSPACE for a channel_type. Returns null for non-Slack
+ * channel_types (Discord/Telegram/etc.) — the Slack MCP gate must refuse to
+ * cross platforms even if a handle happens to collide.
+ *
+ *   slack-madisonreed       → "slack-madisonreed"
+ *   slack-madisonreed-codex → "slack-madisonreed"   (sibling suffix stripped)
+ *   slack-illysium          → "slack-illysium"      (different workspace, no match with above)
+ *   slack-illysium-codex    → "slack-illysium"
+ *   discord                 → null                   (not Slack — gate denies)
+ *   discord-axie-codex      → null
+ *   telegram                → null
+ */
+function slackWorkspaceOf(channelType: string): string | null {
+  if (channelType !== 'slack' && !channelType.startsWith('slack-')) return null;
+  for (const suffix of SIBLING_CHANNEL_SUFFIXES) {
+    if (channelType.endsWith(suffix)) {
+      return channelType.slice(0, -suffix.length);
+    }
+  }
+  return channelType;
 }

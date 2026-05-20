@@ -224,10 +224,10 @@ describe('canUseSlackUserToken — permission gate', () => {
     expect(canUseSlackUserToken(wgDb, 'mg-bo-codex-dm', { enabled: true })).toBe(true);
   });
 
-  it('test_handle_match_rejects_cross_family_collision', () => {
-    // Defense: a Slack user_id handle string that happens to equal a
-    // Discord snowflake handle must NOT cross the family boundary.
-    // Owner on Discord; DM on Slack; same numeric handle (contrived). Deny.
+  it('test_handle_match_rejects_cross_platform_collision', () => {
+    // Cross-platform defense: an owner on Discord whose handle string happens
+    // to collide with a Slack user_id must NOT satisfy the Slack MCP gate.
+    // The gate explicitly refuses non-Slack channel_types regardless of handle.
     const wgDb = makeDb();
     wgDb.exec(`
       INSERT INTO users (id, kind, created_at)
@@ -242,6 +242,52 @@ describe('canUseSlackUserToken — permission gate', () => {
         VALUES ('slack-madisonreed:608746260706361344', 'slack-madisonreed', 'mg-slack-dm-collision', '2026-01-01');
     `);
     expect(canUseSlackUserToken(wgDb, 'mg-slack-dm-collision', { enabled: true })).toBe(false);
+  });
+
+  it('test_handle_match_rejects_cross_workspace_collision', () => {
+    // CRITICAL: Codex P1 catch on PR #110. The first version of the
+    // sibling-aware fix collapsed all `slack-*` channel_types to `slack`,
+    // which would let a hypothetical user in workspace B whose handle
+    // collides with an owner in workspace A satisfy the gate and read
+    // workspace A's user-token MCP. Real cross-tenant bypass.
+    //
+    // The fix: workspace matching uses the FULL channel_type with sibling
+    // suffixes stripped — `slack-madisonreed` and `slack-illysium` stay
+    // distinct. A handle collision across workspaces no longer satisfies
+    // the gate.
+    const wgDb = makeDb();
+    wgDb.exec(`
+      INSERT INTO users (id, kind, created_at)
+        VALUES
+          ('slack-madisonreed:UCOLLIDE', 'human', '2026-01-01'),
+          ('slack-illysium:UCOLLIDE', 'human', '2026-01-01');
+      INSERT INTO user_roles (user_id, role, agent_group_id, granted_at)
+        VALUES ('slack-madisonreed:UCOLLIDE', 'owner', NULL, '2026-01-01');
+      INSERT INTO messaging_groups (id, channel_type, platform_id, is_group, created_at)
+        VALUES ('mg-illy-dm-collision', 'slack-illysium', 'slack:DCOLLIDE', 0, '2026-01-01');
+      INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at)
+        VALUES ('slack-illysium:UCOLLIDE', 'slack-illysium', 'mg-illy-dm-collision', '2026-01-01');
+    `);
+    expect(canUseSlackUserToken(wgDb, 'mg-illy-dm-collision', { enabled: true })).toBe(false);
+  });
+
+  it('test_handle_match_rejects_cross_workspace_with_codex_sibling', () => {
+    // Variant of the above: the DM is on the codex twin of a DIFFERENT
+    // workspace. After stripping `-codex`, the workspaces still differ.
+    const wgDb = makeDb();
+    wgDb.exec(`
+      INSERT INTO users (id, kind, created_at)
+        VALUES
+          ('slack-madisonreed:UCOLLIDE', 'human', '2026-01-01'),
+          ('slack-illysium-codex:UCOLLIDE', 'human', '2026-01-01');
+      INSERT INTO user_roles (user_id, role, agent_group_id, granted_at)
+        VALUES ('slack-madisonreed:UCOLLIDE', 'owner', NULL, '2026-01-01');
+      INSERT INTO messaging_groups (id, channel_type, platform_id, is_group, created_at)
+        VALUES ('mg-illy-codex-dm-collision', 'slack-illysium-codex', 'slack:DCOLLIDE', 0, '2026-01-01');
+      INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at)
+        VALUES ('slack-illysium-codex:UCOLLIDE', 'slack-illysium-codex', 'mg-illy-codex-dm-collision', '2026-01-01');
+    `);
+    expect(canUseSlackUserToken(wgDb, 'mg-illy-codex-dm-collision', { enabled: true })).toBe(false);
   });
 
   it('test_handle_mismatch_within_family_denies', () => {
@@ -264,9 +310,12 @@ describe('canUseSlackUserToken — permission gate', () => {
     expect(canUseSlackUserToken(wgDb, 'mg-teammate-dm', { enabled: true })).toBe(false);
   });
 
-  it('test_bare_channel_type_no_dash_resolves_family_to_self', () => {
-    // For channel_types without a hyphen (e.g., plain 'discord', 'telegram'),
-    // the family IS the channel_type itself. Exact-match still works.
+  it('test_non_slack_dm_always_denied', () => {
+    // The Slack user-token MCP only applies in Slack DMs. A Telegram or
+    // Discord DM, even with a matching owner role, must not register the
+    // Slack MCP — the credentials wouldn't be valid there and the gate
+    // is the only thing standing between an LLM hallucination and a
+    // cross-platform credential leak.
     const wgDb = makeDb();
     wgDb.exec(`
       INSERT INTO users (id, kind, created_at) VALUES ('telegram:6037840640', 'human', '2026-01-01');
@@ -277,6 +326,6 @@ describe('canUseSlackUserToken — permission gate', () => {
       INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at)
         VALUES ('telegram:6037840640', 'telegram', 'mg-tg-dm', '2026-01-01');
     `);
-    expect(canUseSlackUserToken(wgDb, 'mg-tg-dm', { enabled: true })).toBe(true);
+    expect(canUseSlackUserToken(wgDb, 'mg-tg-dm', { enabled: true })).toBe(false);
   });
 });
