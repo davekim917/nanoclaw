@@ -33,6 +33,8 @@ import {
   type ContainerConfig,
   type RecallScope,
 } from './container-config.js';
+import { getContainerConfig } from './db/container-configs.js';
+import { updateContainerConfigScalars, updateContainerConfigJson } from './db/container-configs.js';
 import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainer } from './container-runtime.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
@@ -478,9 +480,13 @@ async function spawnContainer(session: Session): Promise<void> {
 }
 
 /** Kill a container for a session. */
-export function killContainer(sessionId: string, reason: string): void {
+export function killContainer(sessionId: string, reason: string, onExit?: () => void): void {
   const entry = activeContainers.get(sessionId);
   if (!entry) return;
+
+  if (onExit) {
+    entry.process.once('close', onExit);
+  }
 
   log.info('Killing container', { sessionId, reason, containerName: entry.containerName });
   try {
@@ -831,18 +837,16 @@ const SCOPED_CREDENTIAL_VARS = [
  * the provider-install skills:
  *
  *   sessions.agent_provider
- *     → agent_groups.agent_provider
- *     → container.json `provider`
+ *     → container_configs.provider
  *     → 'claude'
  *
  * Pure so the precedence can be unit-tested without a DB or filesystem.
  */
 export function resolveProviderName(
   sessionProvider: string | null | undefined,
-  agentGroupProvider: string | null | undefined,
   containerConfigProvider: string | null | undefined,
 ): string {
-  return (sessionProvider || agentGroupProvider || containerConfigProvider || 'claude').toLowerCase();
+  return (sessionProvider || containerConfigProvider || 'claude').toLowerCase();
 }
 
 function resolveProviderContribution(
@@ -850,7 +854,7 @@ function resolveProviderContribution(
   agentGroup: AgentGroup,
   containerConfig: import('./container-config.js').ContainerConfig,
 ): { provider: string; contribution: ProviderContainerContribution } {
-  const provider = resolveProviderName(session.agent_provider, agentGroup.agent_provider, containerConfig.provider);
+  const provider = resolveProviderName(session.agent_provider, containerConfig.provider);
   const fn = getProviderContainerConfig(provider);
   const contribution = fn
     ? fn({
@@ -2489,10 +2493,10 @@ export async function buildAgentGroupImage(agentGroupId: string): Promise<void> 
   const agentGroup = getAgentGroup(agentGroupId);
   if (!agentGroup) throw new Error('Agent group not found');
 
-  const containerConfig = readContainerConfig(agentGroup.folder);
-  const aptPackages = containerConfig.packages.apt;
-  const npmPackages = containerConfig.packages.npm;
-
+  const configRow = getContainerConfig(agentGroup.id);
+  if (!configRow) throw new Error('Container config not found');
+  const aptPackages = JSON.parse(configRow.packages_apt) as string[];
+  const npmPackages = JSON.parse(configRow.packages_npm) as string[];
   if (aptPackages.length === 0 && npmPackages.length === 0) {
     throw new Error('No packages to install. Use install_packages first.');
   }
@@ -2522,15 +2526,14 @@ export async function buildAgentGroupImage(agentGroupId: string): Promise<void> 
     execSync(`${CONTAINER_RUNTIME_BIN} build -t ${imageTag} -f ${tmpDockerfile} .`, {
       cwd: DATA_DIR,
       stdio: 'pipe',
-      timeout: 300_000,
+      timeout: 900_000,
     });
   } finally {
     fs.unlinkSync(tmpDockerfile);
   }
 
-  // Store the image tag in groups/<folder>/container.json
-  containerConfig.imageTag = imageTag;
-  writeContainerConfig(agentGroup.folder, containerConfig);
+  // Store the image tag in the DB
+  updateContainerConfigScalars(agentGroup.id, { image_tag: imageTag });
 
   log.info('Per-agent-group image built', { agentGroupId, imageTag });
 }

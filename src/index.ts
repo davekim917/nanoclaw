@@ -7,6 +7,7 @@
 import fs from 'fs';
 import path from 'path';
 
+import { backfillContainerConfigs } from './backfill-container-configs.js';
 import { DATA_DIR } from './config.js';
 import { enforceStartupBackoff, resetCircuitBreaker } from './circuit-breaker.js';
 import { migrateGroupsToClaudeLocal } from './claude-md-compose.js';
@@ -115,6 +116,11 @@ import { runReconcilerOnStartup as runDispatchReconcilerOnStartup } from './modu
 // Workgroup FS reconciler — drains the _migration036_report temp table and
 // writes recall_scope to paired groups' container.json. Runs after migrations.
 import { reconcileWorkgroupFsState } from './modules/workgroup/fs-reconcile.js';
+// CLI command barrel — populates the `ncl` registry before the CLI server
+// accepts connections.
+import './cli/commands/index.js';
+import './cli/delivery-action.js';
+import { startCliServer, stopCliServer } from './cli/socket-server.js';
 
 import type { ChannelAdapter, ChannelSetup } from './channels/adapter.js';
 import { initChannelAdapters, teardownChannelAdapters, getChannelAdapter } from './channels/channel-registry.js';
@@ -165,10 +171,14 @@ async function main(): Promise<void> {
   //     channel adapters so the HTTP server is up regardless of channel config.
   startDashboard();
 
-  // 1c. Orchestrator-dispatch reconciler startup scan — must run after migrations
+  // 1b. Orchestrator-dispatch reconciler startup scan — must run after migrations
   // so the tasks table exists. Recovers any tasks left in 'pending' with
   // admitted_at set but no child_session_id (host crashed mid-completion).
   runDispatchReconcilerOnStartup();
+
+  // 1c. Backfill container_configs from legacy container.json files.
+  // Idempotent — skips groups that already have a config row.
+  backfillContainerConfigs();
 
   // 1d. One-time filesystem cutover — idempotent, no-op after first run.
   migrateGroupsToClaudeLocal();
@@ -354,11 +364,14 @@ async function main(): Promise<void> {
   // 11. Restore any Remote Control session that was running before restart
   restoreRemoteControl();
 
-  // 10. Start Discord slash-command client (gated on
+  // 12. Start Discord slash-command client (gated on
   //     ENABLE_DISCORD_SLASH_COMMANDS=1).
   startDiscordSlashCommands().catch((err) => {
     log.error('Discord slash commands failed to start', { err });
   });
+
+  // 13. Start the `ncl` CLI socket server (data/ncl.sock).
+  await startCliServer();
 
   log.info('NanoClaw running');
 }
@@ -380,6 +393,7 @@ async function shutdown(signal: string): Promise<void> {
   stopCommitScan();
   stopDailySummary();
   await stopDiscordSlashCommands();
+  await stopCliServer();
   try {
     await teardownChannelAdapters();
     // Synchronously stop agent containers before exit. Without this, child

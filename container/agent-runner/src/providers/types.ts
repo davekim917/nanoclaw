@@ -69,6 +69,16 @@ export interface ProviderOptions {
    * only its own slice in its constructor or query() method.
    */
   providerConfig?: Record<string, unknown>;
+  /**
+   * Model alias (`sonnet`, `opus`, `haiku`) or full model ID. Passed through
+   * to the underlying SDK. If omitted, the SDK default is used.
+   */
+  model?: string;
+  /**
+   * Reasoning effort (`'low' | 'medium' | 'high' | 'xhigh' | 'max'`). Passed
+   * through to the underlying SDK. If omitted, the SDK default is used.
+   */
+  effort?: string;
 }
 
 export interface QueryInput {
@@ -164,12 +174,4 @@ export type ProviderEvent =
    * event (tool call, thinking, partial message, anything) so the
    * poll-loop's idle timer stays honest during long tool runs.
    */
-  | { type: 'activity' }
-  /**
-   * The provider's underlying SDK auto-compacted the conversation context.
-   * The poll-loop reacts by injecting a destination reminder back into
-   * the live query so the agent doesn't drop `<message to="…">` wrapping
-   * after compaction. Distinct from `result` so it doesn't mark the turn
-   * completed or get dispatched as a chat message. See qwibitai/nanoclaw#2325.
-   */
-  | { type: 'compacted'; text: string };
+  | { type: 'activity' };

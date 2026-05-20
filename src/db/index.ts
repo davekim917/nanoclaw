@@ -61,3 +61,12 @@ export {
   type BacklogItem,
   type CommitDigestState,
 } from './backlog.js';
+export {
+  getContainerConfig,
+  getAllContainerConfigs,
+  createContainerConfig,
+  ensureContainerConfig,
+  updateContainerConfigScalars,
+  updateContainerConfigJson,
+  deleteContainerConfig,
+} from './container-configs.js';

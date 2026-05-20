@@ -827,6 +827,8 @@ export class ClaudeProvider implements AgentProvider {
    */
   private fallbackOauth: Array<{ name: string; value: string }>;
   private nextOauthFallback = 0;
+  private model?: string;
+  private effort?: string;
 
   constructor(options: ProviderOptions = {}) {
     this.assistantName = options.assistantName;
@@ -856,6 +858,8 @@ export class ClaudeProvider implements AgentProvider {
     if (this.fallbackOauth.length > 0) {
       log(`Loaded ${this.fallbackOauth.length} CLAUDE_CODE_OAUTH_TOKEN fallback(s): ${this.fallbackOauth.map((k) => k.name).join(', ')}`);
     }
+    this.model = options.model;
+    this.effort = options.effort;
   }
 
   isSessionInvalid(err: unknown): boolean {
@@ -1061,7 +1065,7 @@ export class ClaudeProvider implements AgentProvider {
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'compact_boundary') {
           const meta = (message as { compact_metadata?: { pre_tokens?: number } }).compact_metadata;
           const detail = meta?.pre_tokens ? ` (${meta.pre_tokens.toLocaleString()} tokens compacted)` : '';
-          yield { type: 'compacted', text: `Context compacted${detail}.` };
+          yield { type: 'result', text: `Context compacted${detail}.` };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
           const tn = message as { summary?: string; status?: string };
           const summary = tn.summary || 'Task notification';

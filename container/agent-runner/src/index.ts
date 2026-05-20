@@ -180,6 +180,8 @@ async function main(): Promise<void> {
     env: { ...process.env },
     additionalDirectories: additionalDirectories.length > 0 ? additionalDirectories : undefined,
     providerConfig: config.providerConfig,
+    model: config.model,
+    effort: config.effort,
   });
 
   await runPollLoop({

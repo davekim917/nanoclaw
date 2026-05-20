@@ -122,10 +122,12 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   clearStaleProcessingAcks();
 
   let pollCount = 0;
+  let isFirstPoll = true;
   while (true) {
     // Skip system messages — they're responses for MCP tools (e.g., ask_user_question).
     // Exception: recall_context system messages must reach the prompt path so the agent sees recalled facts.
-    const messages = getPendingMessages().filter((m) => {
+    // isFirstPoll → getPendingMessages so on_wake rows only fire on the fresh container's first poll.
+    const messages = getPendingMessages(isFirstPoll).filter((m) => {
       if (m.kind !== 'system') return true;
       try {
         const parsed = JSON.parse(m.content) as { subtype?: string };
@@ -134,6 +136,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         return false;
       }
     });
+    isFirstPoll = false;
     pollCount++;
 
     // Periodic heartbeat so we know the loop is alive
@@ -544,6 +547,7 @@ async function processQuery(
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
   let done = false;
+  let unwrappedNudged = false;
 
   // Concurrent polling: push follow-ups into the active query as they arrive.
   // We do NOT force-end the stream on silence — keeping the query open avoids
@@ -644,6 +648,7 @@ async function processQuery(
         const followUpRouting = extractRouting(keep);
         setCurrentInReplyTo(followUpRouting.inReplyTo);
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
+        unwrappedNudged = false;
         query.push(prompt);
         markCompleted(keptIds);
       } catch (err) {
@@ -725,7 +730,18 @@ async function processQuery(
               });
             }
           }
-          dispatchResultText(event.text, routing);
+          const { hasUnwrapped } = dispatchResultText(event.text, routing);
+          if (hasUnwrapped && !unwrappedNudged) {
+            unwrappedNudged = true;
+            const destinations = getAllDestinations();
+            const names = destinations.map((d) => d.name).join(', ');
+            query.push(
+              `<system>Your response was not delivered — it was not wrapped in <message to="name">...</message> blocks. ` +
+                `All output must be wrapped: use <message to="name"> for content to send, or <internal> for scratchpad. ` +
+                `Your destinations: ${names}. ` +
+                `Please re-send your response with the correct wrapping.</system>`,
+            );
+          }
         }
       } else if (event.type === 'compacted') {
         // The SDK auto-compacted the conversation. After compaction the
@@ -815,9 +831,6 @@ export function handleEvent(event: ProviderEvent, routing: RoutingContext): void
       break;
     case 'file':
       log(`File: ${event.path}`);
-      break;
-    case 'compacted':
-      log(`Compacted: ${event.text}`);
       break;
   }
 }
@@ -911,7 +924,7 @@ const MESSAGE_CLOSER = '</message>';
 // pairs cleanly is already consumed before this strip runs.
 const STRAY_WRAPPER_RE = /<\/?message(?:\s+to="[^"]*")?\s*>/g;
 
-export function dispatchResultText(text: string, routing: RoutingContext): void {
+export function dispatchResultText(text: string, routing: RoutingContext): { sent: number; hasUnwrapped: boolean } {
   type Opener = { index: number; endIndex: number; toName: string };
   const openers: Opener[] = [];
   MESSAGE_OPENER_RE.lastIndex = 0;
@@ -992,13 +1005,13 @@ export function dispatchResultText(text: string, routing: RoutingContext): void 
     if (origin) {
       sendToDestination(origin, scratchpad, routing);
       log(`Origin-fallback: unwrapped text routed to "${origin.name}" (${scratchpad.length} chars)`);
-      return;
+      return { sent: 1, hasUnwrapped: false };
     }
     const all = getAllDestinations();
     if (all.length === 1) {
       sendToDestination(all[0], scratchpad, routing);
       log(`Single-destination fallback: bare text routed to "${all[0].name}" (${scratchpad.length} chars)`);
-      return;
+      return { sent: 1, hasUnwrapped: false };
     }
   }
 
@@ -1006,9 +1019,11 @@ export function dispatchResultText(text: string, routing: RoutingContext): void 
     log(`[scratchpad] ${scratchpad.slice(0, 500)}${scratchpad.length > 500 ? '…' : ''}`);
   }
 
-  if (sent === 0 && text.trim()) {
+  const hasUnwrapped = sent === 0 && !!scratchpad;
+  if (hasUnwrapped) {
     log(`WARNING: agent output had no <message to="..."> blocks — nothing was sent`);
   }
+  return { sent, hasUnwrapped };
 }
 
 function sendToDestination(dest: DestinationEntry, body: string, routing: RoutingContext): void {

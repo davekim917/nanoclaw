@@ -19,6 +19,8 @@ export interface RunnerConfig {
 
   // ADDED: per-provider sticky config from container.json.providerConfig
   providerConfig: Record<string, unknown>;
+  model?: string;
+  effort?: string;
 }
 
 const DEFAULT_MAX_MESSAGES = 10;
@@ -38,6 +40,8 @@ export function parseRawConfig(raw: Record<string, unknown>): RunnerConfig {
     maxMessagesPerPrompt: (raw.maxMessagesPerPrompt as number) || DEFAULT_MAX_MESSAGES,
     mcpServers: (raw.mcpServers as RunnerConfig['mcpServers']) || {},
     providerConfig: (raw.providerConfig as Record<string, unknown>) ?? {},
+    model: (raw.model as string) || undefined,
+    effort: (raw.effort as string) || undefined,
   };
 }
 
@@ -56,6 +60,7 @@ export function loadConfig(): RunnerConfig {
   }
 
   _config = parseRawConfig(raw);
+
   return _config;
 }
 

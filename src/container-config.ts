@@ -1,18 +1,25 @@
 /**
- * Per-group container config, stored as a plain JSON file at
- * `groups/<folder>/container.json`. Mounted read-only inside the container
- * at `/workspace/agent/container.json` — the runner reads it at startup but
- * cannot modify it. Config changes go through the self-mod approval flow.
+ * Container config types and access layer.
  *
- * All fields are optional — a missing file or a partial file both resolve
- * to sensible defaults. Writes are atomic-enough (write-then-rename is not
- * worth the ceremony here since there's only one writer in practice: the
- * host, from the delivery thread that processes approved system actions).
+ * Two sources of truth coexist during the transition to DB-backed config:
+ *   - File-based: `groups/<folder>/container.json` (current default; read by
+ *     `readContainerConfig`, written by `writeContainerConfig`).
+ *   - DB-backed: `container_configs` table (populated by migration 014 +
+ *     `backfillContainerConfigs`; read via `configFromDb`, materialized to
+ *     disk via `materializeContainerJson`).
+ *
+ * This module exports both APIs. Local code paths (spawn flow, host modules)
+ * still read/write the file; the DB row tracks operationally-mutated fields
+ * (image_tag, packages_apt, packages_npm, mcp_servers) so they survive
+ * regenerations.
  */
 import fs from 'fs';
 import path from 'path';
 
 import { GROUPS_DIR } from './config.js';
+import { getContainerConfig } from './db/container-configs.js';
+import { getAgentGroup } from './db/agent-groups.js';
+import type { AgentGroup, ContainerConfigRow } from './types.js';
 
 /**
  * Per-MCP-server config. Stdio (default) runs a subprocess inside the
@@ -26,9 +33,6 @@ export interface StdioMcpServerConfig {
   command: string;
   args?: string[];
   env?: Record<string, string>;
-  // Optional always-in-context guidance. When set, the host writes the
-  // content to `.claude-fragments/mcp-<name>.md` at spawn and imports it
-  // into the composed CLAUDE.md.
   instructions?: string;
 }
 
@@ -86,23 +90,27 @@ export function getRecallScope(cfg: MemoryConfig | undefined): RecallScope {
   return cfg?.recall_scope ?? 'workgroup';
 }
 
+/** Shape of the materialized `container.json` file read by the container runner. */
 export interface ContainerConfig {
   mcpServers: Record<string, McpServerConfig>;
   packages: { apt: string[]; npm: string[] };
   imageTag?: string;
   additionalMounts: AdditionalMountConfig[];
-  /** Which skills to enable — array of skill names or "all" (default). */
   skills: string[] | 'all';
-  /** Agent provider name (e.g. "claude", "opencode"). Default: "claude". */
   provider?: string;
-  /** Agent group display name (used in transcript archiving). */
   groupName?: string;
-  /** Assistant display name (used in system prompt / responses). */
   assistantName?: string;
-  /** Agent group ID — set by the host, read by the runner. */
   agentGroupId?: string;
-  /** Max messages per prompt. Falls back to code default if unset. */
   maxMessagesPerPrompt?: number;
+
+  /**
+   * Provider-level model / reasoning effort tracked in the container_configs
+   * DB row (upstream's 014 schema). Distinct from the per-group default*
+   * fields below — those are intent ("opus" alias resolution); these are
+   * what the DB row materializes for ops tooling that scopes via `ncl`.
+   */
+  model?: string;
+  effort?: string;
 
   /**
    * Per-group OneCLI secret declaration. Each entry is either a secret
@@ -347,6 +355,27 @@ function configPath(folder: string): string {
   return path.join(GROUPS_DIR, folder, 'container.json');
 }
 
+/** Build a `ContainerConfig` from a DB row + agent group identity. */
+export function configFromDb(row: ContainerConfigRow, group: AgentGroup): ContainerConfig {
+  return {
+    mcpServers: JSON.parse(row.mcp_servers) as Record<string, McpServerConfig>,
+    packages: {
+      apt: JSON.parse(row.packages_apt) as string[],
+      npm: JSON.parse(row.packages_npm) as string[],
+    },
+    imageTag: row.image_tag ?? undefined,
+    additionalMounts: JSON.parse(row.additional_mounts) as AdditionalMountConfig[],
+    skills: JSON.parse(row.skills) as string[] | 'all',
+    provider: row.provider ?? undefined,
+    groupName: group.name,
+    assistantName: row.assistant_name ?? group.name,
+    agentGroupId: group.id,
+    maxMessagesPerPrompt: row.max_messages_per_prompt ?? undefined,
+    model: row.model ?? undefined,
+    effort: row.effort ?? undefined,
+  };
+}
+
 /**
  * Read the container config for a group, returning sensible defaults for
  * any missing fields (or an entirely empty config if the file is absent).
@@ -372,6 +401,8 @@ export function readContainerConfig(folder: string): ContainerConfig {
       assistantName: raw.assistantName,
       agentGroupId: raw.agentGroupId,
       maxMessagesPerPrompt: raw.maxMessagesPerPrompt,
+      model: raw.model,
+      effort: raw.effort,
       githubTokenEnv: raw.githubTokenEnv,
       excludePlugins: raw.excludePlugins,
       codexHostAuth: raw.codexHostAuth,
@@ -429,4 +460,26 @@ export function initContainerConfig(folder: string): boolean {
   if (fs.existsSync(p)) return false;
   writeContainerConfig(folder, emptyConfig());
   return true;
+}
+
+/**
+ * Materialize `container.json` from the DB. Called at spawn time so the
+ * container always sees fresh config. Returns the `ContainerConfig` for
+ * use by the caller (buildMounts, buildContainerArgs, etc.).
+ */
+export function materializeContainerJson(agentGroupId: string): ContainerConfig {
+  const group = getAgentGroup(agentGroupId);
+  if (!group) throw new Error(`Agent group not found: ${agentGroupId}`);
+
+  const row = getContainerConfig(agentGroupId);
+  if (!row) throw new Error(`Container config not found for agent group: ${agentGroupId}`);
+
+  const config = configFromDb(row, group);
+
+  const p = path.join(GROUPS_DIR, group.folder, 'container.json');
+  const dir = path.dirname(p);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(p, JSON.stringify(config, null, 2) + '\n');
+
+  return config;
 }
