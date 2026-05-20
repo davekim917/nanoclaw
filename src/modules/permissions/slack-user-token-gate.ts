@@ -75,6 +75,7 @@ import type { SlackUserTokenConfig } from '../../container-config.js';
  */
 export function canUseSlackUserToken(
   db: Database.Database,
+  agentGroupId: string,
   sessionMessagingGroupId: string | null,
   config: SlackUserTokenConfig | undefined,
 ): boolean {
@@ -84,45 +85,108 @@ export function canUseSlackUserToken(
   if (config.also_allowed_in?.includes(sessionMessagingGroupId)) return true;
 
   // The default safe path. Requires ALL of:
-  //   1. session's messaging_group is a 1:1 DM (is_group = 0)
-  //   2. session's messaging_group is wired to an agent with a non-null
-  //      workgroup_id (post-migration-036; standalone agents are workgroup-
-  //      of-1, which is also fine since the workgroup_id then equals the
-  //      agent's own folder slug)
-  //   3. the user on the OTHER end of the session's DM (per user_dms) has
-  //      the same HANDLE as a global owner (role='owner', agent_group_id
-  //      IS NULL)
-  //   4. that owner has a user_dms entry wired to an agent in the SAME
-  //      workgroup as the session's agent
+  //   1. session's messaging_group is a 1:1 DM (is_group = 0) and is wired
+  //      to THIS spawning agent (mga_session.agent_group_id = agentGroupId);
+  //      filtering by the active agent prevents a multi-wired DM from
+  //      authorizing via a different agent's workgroup. Codex P2 #3 on
+  //      PR #110.
+  //   2. the spawning agent has a non-null workgroup_id (post-migration-036;
+  //      standalone agents are workgroup-of-1)
+  //   3. some global owner (role='owner', agent_group_id IS NULL) has a
+  //      user_dms entry that is wired to a 1:1 DM with an agent in the
+  //      SAME workgroup as the spawning agent
+  //   4. THAT owner's user_id and the session DM's user_id share BOTH the
+  //      same HANDLE (segment after first ':') AND the same PLATFORM PREFIX
+  //      (channel_type segment before first '-' — `slack`, `discord`,
+  //      `telegram`, etc.). Platform-prefix equality on top of handle
+  //      equality prevents cross-platform handle collision from authorizing
+  //      (Codex P1 on PR #110: `telegram:123` owner ≠ `slack-mr:123` session
+  //      user even if handles collide). Workgroup equality on top of
+  //      handle equality prevents cross-workspace collision (different
+  //      Slack workspaces have different workgroups). All three must hold.
   //
-  // (3) identifies the same human across sibling adapters. (4) constrains
-  // it to the trust boundary — different Slack workspaces have different
-  // workgroups by construction, so a collision in (3) alone can't
-  // authorize. Both must hold.
-  //
-  // Handle = `substr(user_id, instr(user_id, ':') + 1)`. user_ids follow
-  // the format `<channel_type>:<handle>` per schema contract.
-  const row = db
+  // The query fetches owner-candidates that pass the workgroup + is_group
+  // constraints; the platform-prefix and handle filter is applied in JS
+  // because SQLite doesn't have a native registered helper for the
+  // channel_type-before-first-dash extraction and inlining nested
+  // substr/instr in SQL is unreadable.
+
+  type SessionRow = { user_id: string };
+  const sessionRow = db
     .prepare(
-      `SELECT 1
+      `SELECT ud_session.user_id AS user_id
        FROM messaging_group_agents mga_session
-       JOIN agent_groups            a_session  ON a_session.id  = mga_session.agent_group_id
-       JOIN messaging_groups        mg_session ON mg_session.id = mga_session.messaging_group_id
-       JOIN user_dms                ud_session ON ud_session.messaging_group_id = mga_session.messaging_group_id
-       JOIN user_roles              ur         ON ur.role = 'owner'
-                                                  AND ur.agent_group_id IS NULL
-                                                  AND substr(ur.user_id, instr(ur.user_id, ':') + 1)
-                                                      = substr(ud_session.user_id, instr(ud_session.user_id, ':') + 1)
-       JOIN user_dms                ud_owner   ON ud_owner.user_id = ur.user_id
-       JOIN messaging_group_agents  mga_owner  ON mga_owner.messaging_group_id = ud_owner.messaging_group_id
-       JOIN agent_groups            a_owner    ON a_owner.id = mga_owner.agent_group_id
+       JOIN agent_groups     a_session  ON a_session.id  = mga_session.agent_group_id
+       JOIN messaging_groups mg_session ON mg_session.id = mga_session.messaging_group_id
+       JOIN user_dms         ud_session ON ud_session.messaging_group_id = mga_session.messaging_group_id
        WHERE mga_session.messaging_group_id = ?
-         AND mg_session.is_group = 0
+         AND mga_session.agent_group_id     = ?
+         AND mg_session.is_group            = 0
          AND a_session.workgroup_id IS NOT NULL
-         AND a_owner.workgroup_id  = a_session.workgroup_id
        LIMIT 1`,
     )
-    .get(sessionMessagingGroupId);
+    .get(sessionMessagingGroupId, agentGroupId) as SessionRow | undefined;
 
-  return row !== undefined;
+  if (!sessionRow) return false;
+
+  const sessionHandle = handleOf(sessionRow.user_id);
+  const sessionPrefix = platformPrefixOf(sessionRow.user_id);
+  if (!sessionHandle || !sessionPrefix) return false;
+
+  type OwnerRow = { user_id: string };
+  const owners = db
+    .prepare(
+      `SELECT ur.user_id AS user_id
+       FROM user_roles ur
+       JOIN user_dms             ud_owner  ON ud_owner.user_id           = ur.user_id
+       JOIN messaging_group_agents mga_owner ON mga_owner.messaging_group_id = ud_owner.messaging_group_id
+       JOIN agent_groups         a_owner   ON a_owner.id                 = mga_owner.agent_group_id
+       JOIN messaging_groups     mg_owner  ON mg_owner.id                = mga_owner.messaging_group_id
+       JOIN messaging_group_agents mga_session ON mga_session.messaging_group_id = ?
+       JOIN agent_groups         a_session ON a_session.id               = mga_session.agent_group_id
+       WHERE ur.role = 'owner'
+         AND ur.agent_group_id IS NULL
+         AND mga_session.agent_group_id = ?
+         AND mg_owner.is_group  = 0
+         AND a_owner.workgroup_id = a_session.workgroup_id`,
+    )
+    .all(sessionMessagingGroupId, agentGroupId) as OwnerRow[];
+
+  for (const owner of owners) {
+    if (handleOf(owner.user_id) !== sessionHandle) continue;
+    if (platformPrefixOf(owner.user_id) !== sessionPrefix) continue;
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Extract the handle from a user_id (`<channel_type>:<handle>`). Returns
+ * null when there is no `:` separator or the handle is empty.
+ */
+function handleOf(userId: string): string | null {
+  const idx = userId.indexOf(':');
+  if (idx < 0) return null;
+  const handle = userId.slice(idx + 1);
+  return handle || null;
+}
+
+/**
+ * Extract the platform prefix from a user_id. The platform is the channel_type
+ * segment before the first `-`, or the whole channel_type if there is no `-`.
+ *   slack-mr:UDAVE       → "slack"
+ *   slack-mr-codex:UDAVE → "slack"
+ *   discord:608…         → "discord"
+ *   discord-axie-codex:6 → "discord"
+ *   telegram:6037840640  → "telegram"
+ *
+ * Same human across SIBLING adapters of the same platform satisfies — but
+ * cross-platform user_ids never satisfy even if handles collide.
+ */
+function platformPrefixOf(userId: string): string | null {
+  const colon = userId.indexOf(':');
+  if (colon <= 0) return null;
+  const channelType = userId.slice(0, colon);
+  const dash = channelType.indexOf('-');
+  return dash < 0 ? channelType : channelType.slice(0, dash);
 }

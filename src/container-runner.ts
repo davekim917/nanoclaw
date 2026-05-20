@@ -2409,6 +2409,7 @@ async function buildContainerArgs(
     const { canUseSlackUserToken } = await import('./modules/permissions/slack-user-token-gate.js');
     slackUserTokenAllowed = canUseSlackUserToken(
       getDb(),
+      agentGroup.id,
       sessionMessagingGroupId ?? null,
       containerConfig.slack_user_token,
     );
