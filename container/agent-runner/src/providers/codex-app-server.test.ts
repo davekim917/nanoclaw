@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { buildCodexHooksJson, writeCodexMcpConfigToml } from './codex-app-server.js';
+import { buildCodexHooksJson, createCodexConfigOverrides, writeCodexMcpConfigToml } from './codex-app-server.js';
 
 describe('buildCodexHooksJson', () => {
   it('emits a PreToolUse and PostToolUse entry with command type', () => {
@@ -33,6 +33,50 @@ describe('buildCodexHooksJson', () => {
   it('PostToolUse uses a short 30s timeout', () => {
     const data = buildCodexHooksJson();
     expect(data.hooks.PostToolUse[0].hooks[0].timeout).toBe(30);
+  });
+});
+
+describe('createCodexConfigOverrides', () => {
+  it('always sets features.steer=true so turn/steer RPC injects mid-turn input', () => {
+    // Issue 2 from the Bo / Bo-codex parity report: Dave's mid-turn
+    // @-mentions weren't steering Bo-codex's reasoning, only landing as
+    // the next turn's input. Root cause: Codex's CLI defaults
+    // `features.steer = false`, in which state the app-server rejects
+    // turn/steer RPCs and our provider's catch path re-queues the
+    // message. Forcing `features.steer=true` at every spawn matches
+    // Dave's local Codex CLI setting.
+    const overrides = createCodexConfigOverrides();
+    expect(overrides).toContain('features.steer=true');
+  });
+
+  it('always sets features.goals=true and disables linux sandbox bwrap', () => {
+    const overrides = createCodexConfigOverrides();
+    expect(overrides).toContain('features.goals=true');
+    expect(overrides).toContain('features.use_linux_sandbox_bwrap=false');
+  });
+
+  it('always enables Codex memories — both read and write', () => {
+    // Codex's [memories] block opts the session into its own
+    // turn-summary store (distinct from NanoClaw mnemon). Both halves
+    // must be on: generate_memories writes; use_memories surfaces them
+    // in subsequent prompts. Operator parity with Dave's local Codex CLI.
+    const overrides = createCodexConfigOverrides();
+    expect(overrides).toContain('memories.generate_memories=true');
+    expect(overrides).toContain('memories.use_memories=true');
+  });
+
+  it('forces detailed reasoning summary regardless of stickyConfig', () => {
+    expect(createCodexConfigOverrides()).toContain('model_reasoning_summary="detailed"');
+    expect(createCodexConfigOverrides({ reasoning_effort: 'low' })).toContain('model_reasoning_summary="detailed"');
+  });
+
+  it('emits model_reasoning_effort when stickyConfig sets it, omits otherwise', () => {
+    expect(createCodexConfigOverrides()).not.toEqual(
+      expect.arrayContaining([expect.stringMatching(/^model_reasoning_effort=/)]),
+    );
+    expect(createCodexConfigOverrides({ reasoning_effort: 'xhigh' })).toContain(
+      'model_reasoning_effort="xhigh"',
+    );
   });
 });
 

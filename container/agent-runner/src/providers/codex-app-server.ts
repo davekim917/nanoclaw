@@ -524,12 +524,35 @@ export function createCodexConfigOverrides(stickyConfig?: {
 }): string[] {
   // `features.goals=true` enables Codex's goals feature for every container
   // agent — same always-on pattern as `features.use_linux_sandbox_bwrap`.
+  //
+  // `features.steer=true` enables the `turn/steer` RPC path so mid-stream
+  // follow-up messages inject into the active turn instead of being queued
+  // for the next one. Without it, our codex provider's `push()` calls
+  // `steerCodexTurn` (an RPC the app-server then rejects), the catch path
+  // re-queues the message via `pending.push`, and the operator's
+  // mid-stream "steer left" effectively waits for the current turn to
+  // finish — observed during Bo-codex's 5.5-min response to a mid-turn
+  // @-mention from Dave (session sess-1779235256589, May 2026). The Codex
+  // CLI defaults this off; Dave's local Codex CLI sets it in
+  // `[features] steer = true`. Containerized installs need the same toggle.
+  //
   // Using the `-c` CLI override (rather than persisting in config.toml)
   // because writeCodexMcpConfigToml regenerates the config file per-spawn
   // and CLI overrides take precedence either way; keeping the toggle here
   // means it survives a config.toml rewrite and doesn't need a [features]
   // block injected into the writer.
-  const overrides = ['features.use_linux_sandbox_bwrap=false', 'features.goals=true'];
+  const overrides = [
+    'features.use_linux_sandbox_bwrap=false',
+    'features.goals=true',
+    'features.steer=true',
+    // Memories: writing AND reading. `[memories]` is Codex CLI's own
+    // session-summary store (separate from NanoClaw's mnemon graph, which is
+    // host-side). `generate_memories=true` writes summaries on turn boundaries;
+    // `use_memories=true` makes the next-turn prompt include them. Operator
+    // parity with Dave's local Codex CLI config — both default false upstream.
+    'memories.generate_memories=true',
+    'memories.use_memories=true',
+  ];
   if (stickyConfig?.reasoning_effort) {
     overrides.push(`model_reasoning_effort="${stickyConfig.reasoning_effort}"`);
   }

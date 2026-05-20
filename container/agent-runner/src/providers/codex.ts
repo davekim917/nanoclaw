@@ -270,6 +270,59 @@ function composeBaseInstructions(promptAddendum: string | undefined): string | u
 
 // ── Provider ────────────────────────────────────────────────────────────────
 
+/**
+ * Container env vars that need to reach every MCP subprocess for outbound
+ * HTTPS to work through OneCLI's substitution proxy + CA. Order matters
+ * only in that comments and key membership do; if the host has the var
+ * set in process.env, it gets forwarded; if not, the slot is omitted.
+ *
+ * Categories:
+ *   - HTTPS_PROXY / HTTP_PROXY / NO_PROXY (and lowercase): routes
+ *     outbound HTTP through the OneCLI gateway. Without these, remote
+ *     MCP calls bypass OneCLI and outbound auth substitution fails.
+ *   - NODE_USE_ENV_PROXY: makes Node 22+ fetch honor HTTPS_PROXY without
+ *     explicit ProxyAgent setup. Required because remote-mcp-bridge uses
+ *     undici's fetch which only honors env-proxy when this flag is set.
+ *   - NODE_EXTRA_CA_CERTS + the CA-bundle siblings: lets the MCP
+ *     subprocess trust OneCLI's mitm CA. Without these, outbound TLS to
+ *     the gateway fails with CERT_HAS_EXPIRED / SELF_SIGNED_CERT.
+ */
+const MCP_PROXY_ENV_KEYS = [
+  'HTTPS_PROXY',
+  'HTTP_PROXY',
+  'NO_PROXY',
+  'https_proxy',
+  'http_proxy',
+  'no_proxy',
+  'NODE_USE_ENV_PROXY',
+  'NODE_EXTRA_CA_CERTS',
+  'SSL_CERT_FILE',
+  'CURL_CA_BUNDLE',
+  'REQUESTS_CA_BUNDLE',
+  'PIP_CERT',
+  'AWS_CA_BUNDLE',
+  'DENO_CERT',
+  'GIT_SSL_CAINFO',
+] as const;
+
+/**
+ * Copy the proxy + CA env vars from `process.env` into `baseEnv` if they're
+ * not already set. Existing keys in `baseEnv` (e.g. an MCP that intentionally
+ * overrides a proxy setting) win. Returns a new object — never mutates the
+ * input.
+ */
+export function augmentWithProxyEnv(baseEnv: Record<string, string>): Record<string, string> {
+  const out: Record<string, string> = { ...baseEnv };
+  for (const key of MCP_PROXY_ENV_KEYS) {
+    if (out[key] !== undefined) continue;
+    const value = process.env[key];
+    if (typeof value === 'string' && value.length > 0) {
+      out[key] = value;
+    }
+  }
+  return out;
+}
+
 export class CodexProvider implements AgentProvider {
   readonly supportsNativeSlashCommands = false;
 
@@ -281,18 +334,36 @@ export class CodexProvider implements AgentProvider {
     // Codex only supports stdio MCP servers. Native stdio entries pass through;
     // hosted HTTP MCPs are exposed through the local stdio bridge. SSE entries
     // stay filtered because remote-mcp-bridge speaks Streamable HTTP, not SSE.
+    //
+    // Every MCP env block is augmented with the container's outbound-HTTP
+    // env: HTTPS_PROXY / HTTP_PROXY / NO_PROXY (and lowercase variants),
+    // NODE_USE_ENV_PROXY, NODE_EXTRA_CA_CERTS, and the various CA-bundle
+    // pointers (SSL_CERT_FILE, CURL_CA_BUNDLE, REQUESTS_CA_BUNDLE, etc.).
+    // These come from container-runner's docker run args and are present
+    // in `process.env` here. Codex's MCP launcher writes each entry's env
+    // block to `~/.codex/config.toml` under `[mcp_servers.X.env]` and
+    // passes ONLY that block to the spawned subprocess — host env doesn't
+    // propagate to MCP subprocesses through the app-server boundary the
+    // way it does for stdio MCPs Claude's SDK spawns directly. Without
+    // this propagation, the bridge logs `HTTPS_PROXY not set — remote MCP
+    // calls may go out unauthenticated` (remote-mcp-bridge.ts:123) and
+    // OneCLI's credential-substitution proxy never sees the call.
     const stdioOnly: Record<string, CodexMcpServer> = {};
     for (const [name, cfg] of Object.entries(options.mcpServers ?? {})) {
       if (cfg && (cfg.type === undefined || cfg.type === 'stdio') && 'command' in cfg) {
-        stdioOnly[name] = { command: cfg.command, args: cfg.args, env: cfg.env };
+        stdioOnly[name] = {
+          command: cfg.command,
+          args: cfg.args,
+          env: augmentWithProxyEnv(cfg.env ?? {}),
+        };
       } else if (cfg?.type === 'http') {
-        const env: Record<string, string> = { REMOTE_MCP_NAME: name };
+        const baseEnv: Record<string, string> = { REMOTE_MCP_NAME: name };
         const authorization = cfg.headers?.Authorization ?? cfg.headers?.authorization;
-        if (authorization) env.REMOTE_MCP_AUTHORIZATION = authorization;
+        if (authorization) baseEnv.REMOTE_MCP_AUTHORIZATION = authorization;
         stdioOnly[name] = {
           command: 'bun',
           args: ['/app/src/remote-mcp-bridge.ts', cfg.url],
-          env,
+          env: augmentWithProxyEnv(baseEnv),
         };
       }
     }

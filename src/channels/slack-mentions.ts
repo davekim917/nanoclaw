@@ -22,8 +22,27 @@ import { transformOutsideProtectedRegions } from '../text-styles.js';
 export interface SlackBotIdentity {
   /** Slack user_id, e.g. "U0AKALV5HRP" — the value to substitute into `<@…>`. */
   userId: string;
-  /** Slack username (display handle), e.g. "illie-codex" — case-insensitive lookup. */
+  /**
+   * Slack `user.name` field as returned by `auth.test` — the legacy username
+   * fixed at app install time. Slack's UI autocomplete does NOT prefer this
+   * field when `displayName` or `realName` are present, so it's necessary
+   * but not sufficient for the rewriter on its own (e.g. Bo has `name=beau`
+   * but operators @-mention it as `@bo`).
+   */
   username: string;
+  /**
+   * Profile `display_name` (per-workspace customizable, often empty). When
+   * present, Slack's UI autocomplete prefers this over `username` and
+   * `realName`. Registered as a rewriter alias.
+   */
+  displayName?: string;
+  /**
+   * Profile `real_name`, e.g. "Bo" or "Bo-codex". Slack falls back to this
+   * for autocomplete when `display_name` is empty. The user-facing handle
+   * Dave actually types in Slack typically matches this lowercased.
+   * Registered as a rewriter alias.
+   */
+  realName?: string;
   /** Slack workspace identifier (team_id). Used to scope cross-bot resolution to siblings in the same workspace. */
   teamId: string;
 }
@@ -67,15 +86,66 @@ export function resolveSlackMentions(
   const currentBot = bots.get(currentChannelType);
   if (!currentBot) return text;
 
-  // Build username → userId map scoped to the current Slack workspace
-  // (matches by teamId). Includes the current bot itself — harmless because
+  // Build name → userId map scoped to the current Slack workspace (matches
+  // by teamId). Includes the current bot itself — harmless because
   // self-mentions are filtered by Slack's own UI ("you can't @-mention
   // yourself") and re-trigger by the adapter's echo filter on the inbound
   // side.
+  //
+  // Three Slack identity fields all need to resolve to the same user_id:
+  //
+  //   1. `username` (`user.name` from auth.test) — legacy install-time
+  //      handle. Stays even if the operator renames the App's Default Name
+  //      in the App config. e.g. Bo's `name` is `beau` because that was the
+  //      original install name; renaming the App to "Bo" doesn't propagate
+  //      to existing bot user records.
+  //   2. `displayName` — per-workspace customizable. When set, Slack's UI
+  //      autocomplete prefers this over `name` and `realName`.
+  //   3. `realName` — Slack's autocomplete fallback when `displayName` is
+  //      empty. The user-facing handle Dave actually sees in Slack
+  //      typically matches this (lowercased). e.g. Bo's `real_name` is "Bo"
+  //      and that's what `@bo` autocompletes against in MR Slack.
+  //
+  // Plus separator-normalized aliases of each (`bo-codex` ↔ `bocodex` ↔
+  // `bo_codex`) for operator-typed handles that drop hyphens/underscores.
+  //
+  // Conflict resolution: literal `username` keys win (they match the
+  // canonical Slack handle exactly). `displayName`/`realName` literals
+  // fill empty slots. Normalized variants fill remaining empty slots only.
+  // Both bots in any A/B collision remain individually mentionable via
+  // their own literals; only the "fuzzy" path may be claimed by one side.
   const byName = new Map<string, string>();
+  const literalKeys = new Set<string>();
   for (const ident of bots.values()) {
     if (ident.teamId !== currentBot.teamId) continue;
-    byName.set(ident.username.toLowerCase(), ident.userId);
+    const username = ident.username.toLowerCase();
+    byName.set(username, ident.userId);
+    literalKeys.add(username);
+  }
+  const tryAddAlias = (alias: string | undefined, userId: string): void => {
+    if (!alias) return;
+    const lower = alias.toLowerCase();
+    if (!lower) return;
+    if (literalKeys.has(lower)) return;
+    if (byName.has(lower)) return;
+    byName.set(lower, userId);
+  };
+  // Second pass: displayName + realName literals.
+  for (const ident of bots.values()) {
+    if (ident.teamId !== currentBot.teamId) continue;
+    tryAddAlias(ident.displayName, ident.userId);
+    tryAddAlias(ident.realName, ident.userId);
+  }
+  // Third pass: separator-normalized aliases of every populated field.
+  for (const ident of bots.values()) {
+    if (ident.teamId !== currentBot.teamId) continue;
+    for (const candidate of [ident.username, ident.displayName, ident.realName]) {
+      if (!candidate) continue;
+      const literal = candidate.toLowerCase();
+      const normalized = normalizeHandle(literal);
+      if (normalized === literal) continue;
+      tryAddAlias(normalized, ident.userId);
+    }
   }
   if (byName.size === 0) return text;
 
@@ -101,7 +171,10 @@ export function resolveSlackMentions(
       // uppercase alphanumerics) — those are already canonical and shouldn't
       // be looked up as usernames.
       if (/^U[A-Z0-9]{7,}$/.test(name)) return match;
-      const id = byName.get(name.toLowerCase());
+      const literal = name.toLowerCase();
+      // Literal first so an exact operator-chosen Slack handle always wins
+      // over a fuzzy collision; fall back to separator-normalized lookup.
+      const id = byName.get(literal) ?? byName.get(normalizeHandle(literal));
       return id ? `<@${id}>` : match;
     };
 
@@ -113,6 +186,15 @@ export function resolveSlackMentions(
       return rewriteByName(match, name);
     });
   });
+}
+
+/**
+ * Strip Slack-handle separators (`-`, `_`, `.`) so `bo-codex` ≡ `bocodex` ≡
+ * `bo_codex` for fuzzy matching. Used only as a fallback after literal
+ * lookup misses — never replaces literal equality.
+ */
+function normalizeHandle(handle: string): string {
+  return handle.replace(/[-_.]/g, '');
 }
 
 /**
@@ -137,17 +219,29 @@ interface SlackAuthTestClient {
       team_id?: string;
     }>;
   };
+  users?: {
+    info(args: { user: string }): Promise<{
+      ok?: boolean;
+      user?: {
+        name?: string;
+        profile?: {
+          display_name?: string;
+          real_name?: string;
+        };
+      };
+    }>;
+  };
 }
 
 export async function fetchSlackBotIdentity(client: SlackAuthTestClient): Promise<SlackBotIdentity | null> {
   try {
-    const racer = new Promise<never>((_, reject) =>
+    const authRacer = new Promise<never>((_, reject) =>
       setTimeout(
         () => reject(new Error(`Slack auth.test timed out after ${SLACK_AUTH_TIMEOUT_MS}ms`)),
         SLACK_AUTH_TIMEOUT_MS,
       ),
     );
-    const res = await Promise.race([client.auth.test(), racer]);
+    const res = await Promise.race([client.auth.test(), authRacer]);
     if (!res.ok || !res.user_id || !res.user || !res.team_id) {
       log.warn('Slack auth.test returned incomplete identity — outbound @-mentions for this bot will not resolve', {
         ok: res.ok,
@@ -163,5 +257,59 @@ export async function fetchSlackBotIdentity(client: SlackAuthTestClient): Promis
       err: err instanceof Error ? err.message : String(err),
     });
     return null;
+  }
+}
+
+/**
+ * Best-effort upgrade for an already-registered bot identity: fetch
+ * `profile.display_name` + `profile.real_name` via `users.info` and rewrite
+ * the existing registry entry to include them.
+ *
+ * Fire-and-forget — call from the adapter factory with `void`. Channel
+ * adapters init serially during host boot, so awaiting this would extend
+ * boot latency by up to 5s per Slack workspace when Slack's profile API is
+ * slow (codex P2 review on PR #111). Running it after `registerSlackBot` lets
+ * the rewriter already resolve outbound mentions on the `username` key
+ * while the profile call fans out in the background; once the profile
+ * arrives, the registry entry gains `displayName` + `realName` aliases.
+ *
+ * Why the profile fields matter: Slack's UI autocomplete resolves
+ * @-mentions against `profile.display_name` (preferred when set) or
+ * `profile.real_name` (fallback), NOT `auth.test.user`. Bo's
+ * `auth.test.user` is the legacy `beau` but operators type `@bo` in Slack
+ * because `profile.real_name` is "Bo". Without the alias, an outbound
+ * `@bo` ships as plain text.
+ */
+export async function upgradeSlackBotProfile(
+  client: Pick<SlackAuthTestClient, 'users'>,
+  channelType: string,
+): Promise<void> {
+  const identity = knownSlackBots.get(channelType);
+  if (!identity) return;
+  if (!client.users?.info) return;
+  try {
+    const profileRacer = new Promise<never>((_, reject) =>
+      setTimeout(
+        () => reject(new Error(`Slack users.info timed out after ${SLACK_AUTH_TIMEOUT_MS}ms`)),
+        SLACK_AUTH_TIMEOUT_MS,
+      ),
+    );
+    const profileRes = await Promise.race([client.users.info({ user: identity.userId }), profileRacer]);
+    if (!profileRes.ok || !profileRes.user) return;
+    const profile = profileRes.user.profile;
+    const displayName = profile?.display_name || undefined;
+    const realName = profile?.real_name || undefined;
+    if (!displayName && !realName) return;
+    // Re-register with augmented identity. Re-read first in case another
+    // call to registerSlackBot happened in the meantime (unlikely — adapter
+    // factories only register once — but defensive against future callers).
+    const current = knownSlackBots.get(channelType);
+    if (!current) return;
+    registerSlackBot(channelType, { ...current, displayName, realName });
+  } catch (err) {
+    log.warn('Slack users.info fetch failed — outbound @-mentions limited to username only', {
+      channelType,
+      err: err instanceof Error ? err.message : String(err),
+    });
   }
 }

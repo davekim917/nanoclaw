@@ -44,6 +44,37 @@ describe('resolveDiscordMentions', () => {
     expect(resolveDiscordMentions('@RandomUser hello', bots)).toBe('@RandomUser hello');
   });
 
+  // Operator-typed Discord handles often drop hyphens/underscores even
+  // though the agent's logical name keeps them. Mirrors slack-mentions.ts's
+  // normalized-fallback behavior so cross-platform users get consistent
+  // peer-handoff behavior.
+  describe('separator-normalized fallback', () => {
+    const mismatchBots = new Map<string, DiscordBotIdentity>([
+      ['discord', { userId: '1111', username: 'axie' }],
+      ['discord-axie-codex', { userId: '2222', username: 'axiecodex' }],
+    ]);
+
+    it('rewrites `@Axie-Codex` when Discord handle is `axiecodex` (separators stripped)', () => {
+      expect(resolveDiscordMentions('@Axie-Codex hello', mismatchBots)).toBe('<@2222> hello');
+    });
+
+    it('rewrites `@axie_codex` (underscore variant) against `axiecodex`', () => {
+      expect(resolveDiscordMentions('@axie_codex hello', mismatchBots)).toBe('<@2222> hello');
+    });
+
+    it('preserves literal-first priority on normalized collision', () => {
+      // `axie-codex` and `axiecodex` both registered — literal owns its
+      // own slot; the normalized form of `axie-codex` (= `axiecodex`)
+      // does NOT clobber `axiecodex`'s literal entry.
+      const collisionBots = new Map<string, DiscordBotIdentity>([
+        ['discord-a', { userId: '1', username: 'axie-codex' }],
+        ['discord-b', { userId: '2', username: 'axiecodex' }],
+      ]);
+      expect(resolveDiscordMentions('@axie-codex hi', collisionBots)).toBe('<@1> hi');
+      expect(resolveDiscordMentions('@axiecodex hi', collisionBots)).toBe('<@2> hi');
+    });
+  });
+
   it('does not double-wrap an existing `<@id>` mention', () => {
     expect(resolveDiscordMentions('<@1111111111> hi', bots)).toBe('<@1111111111> hi');
   });
