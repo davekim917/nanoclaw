@@ -2,7 +2,6 @@ import fs from 'fs';
 import path from 'path';
 
 import { DATA_DIR, GROUPS_DIR } from './config.js';
-import { ensureContainerConfig } from './db/container-configs.js';
 import { log } from './log.js';
 import type { AgentGroup } from './types.js';
 
@@ -222,10 +221,13 @@ export function initGroupFilesystem(group: AgentGroup, opts?: { instructions?: s
     initialized.push('CLAUDE.local.md');
   }
 
-  // Ensure container_configs row exists in the DB. Idempotent — no-op if
-  // the row already exists (e.g. created by backfill or group creation).
-  ensureContainerConfig(group.id);
-  initialized.push('container_configs');
+  // Note: the container_configs DB row is NOT created here. Local's
+  // applyCreateAgent ordering puts initGroupFilesystem BEFORE the
+  // agent_groups insert (so a DB failure can roll back the FS via
+  // safeRemoveFolder). Calling ensureContainerConfig at this point would
+  // fail the FK constraint on agent_group_id. The row is created later
+  // by backfillContainerConfigs at host startup or via explicit
+  // createContainerConfig in upstream's create-agent flow.
 
   // 2. data/v2-sessions/<id>/.claude-shared/ — Claude state + per-group skills
   const claudeDir = path.join(DATA_DIR, 'v2-sessions', group.id, '.claude-shared');
