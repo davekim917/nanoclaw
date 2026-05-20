@@ -251,47 +251,65 @@ export async function fetchSlackBotIdentity(client: SlackAuthTestClient): Promis
       });
       return null;
     }
-
-    // Fetch the bot user's profile too. `auth.test.user` returns the legacy
-    // install-time name field, but Slack's UI autocomplete resolves
-    // @-mentions against `profile.display_name` (preferred when set) or
-    // `profile.real_name` (fallback). Concrete case: Bo's `auth.test.user`
-    // is `beau` (legacy) but operators type `@bo` in Slack because
-    // `real_name` is "Bo". Without the profile fields here, the rewriter
-    // only ever recognizes `@beau` — `@bo` ships as plain text.
-    //
-    // Best-effort: failures to fetch profile (missing scope, transient
-    // error, no `users.info` on the client) degrade to username-only
-    // resolution, identical to the pre-fix behavior. Don't block adapter
-    // startup on profile fetch.
-    let displayName: string | undefined;
-    let realName: string | undefined;
-    if (client.users?.info) {
-      try {
-        const profileRacer = new Promise<never>((_, reject) =>
-          setTimeout(
-            () => reject(new Error(`Slack users.info timed out after ${SLACK_AUTH_TIMEOUT_MS}ms`)),
-            SLACK_AUTH_TIMEOUT_MS,
-          ),
-        );
-        const profileRes = await Promise.race([client.users.info({ user: res.user_id }), profileRacer]);
-        if (profileRes.ok && profileRes.user) {
-          const profile = profileRes.user.profile;
-          if (profile?.display_name) displayName = profile.display_name;
-          if (profile?.real_name) realName = profile.real_name;
-        }
-      } catch (err) {
-        log.warn('Slack users.info fetch failed — outbound @-mentions limited to username only', {
-          err: err instanceof Error ? err.message : String(err),
-        });
-      }
-    }
-
-    return { userId: res.user_id, username: res.user, displayName, realName, teamId: res.team_id };
+    return { userId: res.user_id, username: res.user, teamId: res.team_id };
   } catch (err) {
     log.warn('Slack bot identity fetch failed', {
       err: err instanceof Error ? err.message : String(err),
     });
     return null;
+  }
+}
+
+/**
+ * Best-effort upgrade for an already-registered bot identity: fetch
+ * `profile.display_name` + `profile.real_name` via `users.info` and rewrite
+ * the existing registry entry to include them.
+ *
+ * Fire-and-forget — call from the adapter factory with `void`. Channel
+ * adapters init serially during host boot, so awaiting this would extend
+ * boot latency by up to 5s per Slack workspace when Slack's profile API is
+ * slow (codex P2 review on PR #111). Running it after `registerSlackBot` lets
+ * the rewriter already resolve outbound mentions on the `username` key
+ * while the profile call fans out in the background; once the profile
+ * arrives, the registry entry gains `displayName` + `realName` aliases.
+ *
+ * Why the profile fields matter: Slack's UI autocomplete resolves
+ * @-mentions against `profile.display_name` (preferred when set) or
+ * `profile.real_name` (fallback), NOT `auth.test.user`. Bo's
+ * `auth.test.user` is the legacy `beau` but operators type `@bo` in Slack
+ * because `profile.real_name` is "Bo". Without the alias, an outbound
+ * `@bo` ships as plain text.
+ */
+export async function upgradeSlackBotProfile(
+  client: Pick<SlackAuthTestClient, 'users'>,
+  channelType: string,
+): Promise<void> {
+  const identity = knownSlackBots.get(channelType);
+  if (!identity) return;
+  if (!client.users?.info) return;
+  try {
+    const profileRacer = new Promise<never>((_, reject) =>
+      setTimeout(
+        () => reject(new Error(`Slack users.info timed out after ${SLACK_AUTH_TIMEOUT_MS}ms`)),
+        SLACK_AUTH_TIMEOUT_MS,
+      ),
+    );
+    const profileRes = await Promise.race([client.users.info({ user: identity.userId }), profileRacer]);
+    if (!profileRes.ok || !profileRes.user) return;
+    const profile = profileRes.user.profile;
+    const displayName = profile?.display_name || undefined;
+    const realName = profile?.real_name || undefined;
+    if (!displayName && !realName) return;
+    // Re-register with augmented identity. Re-read first in case another
+    // call to registerSlackBot happened in the meantime (unlikely — adapter
+    // factories only register once — but defensive against future callers).
+    const current = knownSlackBots.get(channelType);
+    if (!current) return;
+    registerSlackBot(channelType, { ...current, displayName, realName });
+  } catch (err) {
+    log.warn('Slack users.info fetch failed — outbound @-mentions limited to username only', {
+      channelType,
+      err: err instanceof Error ? err.message : String(err),
+    });
   }
 }

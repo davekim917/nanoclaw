@@ -33,7 +33,12 @@ import { log } from '../log.js';
 import { markdownHeadingsToBold } from '../text-styles.js';
 import { createChatSdkBridge } from './chat-sdk-bridge.js';
 import { registerChannelAdapter } from './channel-registry.js';
-import { fetchSlackBotIdentity, registerSlackBot, resolveSlackMentions } from './slack-mentions.js';
+import {
+  fetchSlackBotIdentity,
+  registerSlackBot,
+  resolveSlackMentions,
+  upgradeSlackBotProfile,
+} from './slack-mentions.js';
 
 export interface SlackWorkspace {
   channelType: string;
@@ -172,9 +177,16 @@ for (const ws of workspaces) {
       // the same Slack workspace can resolve `@username` → `<@USER_ID>` on
       // outbound. One auth.test call at adapter init; cached for the
       // lifetime of the process. Mirrors discord.ts's fetchDiscordBotIdentity.
+      //
+      // Profile alias enrichment (displayName/realName from users.info)
+      // runs as fire-and-forget AFTER registration so it doesn't extend
+      // serial channel-factory startup. The registry has username
+      // resolution working immediately; the additional aliases appear
+      // once the (typically sub-second) users.info call completes.
       const identity = await fetchSlackBotIdentity(client);
       if (identity) {
         registerSlackBot(ws.channelType, identity);
+        void upgradeSlackBotProfile(client, ws.channelType);
       } else {
         log.warn('Slack bot identity unavailable — outbound @-mentions for this bot will not resolve', {
           channelType: ws.channelType,

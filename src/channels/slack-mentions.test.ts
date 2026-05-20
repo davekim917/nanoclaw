@@ -1,6 +1,12 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { fetchSlackBotIdentity, resolveSlackMentions, type SlackBotIdentity } from './slack-mentions.js';
+import {
+  fetchSlackBotIdentity,
+  registerSlackBot,
+  resolveSlackMentions,
+  upgradeSlackBotProfile,
+  type SlackBotIdentity,
+} from './slack-mentions.js';
 
 const ILLY_TEAM = 'T-ILLYSIUM';
 const MR_TEAM = 'T-MADISONREED';
@@ -283,10 +289,13 @@ describe('resolveSlackMentions', () => {
 });
 
 describe('fetchSlackBotIdentity', () => {
-  it('returns identity with profile fields when auth.test + users.info succeed', async () => {
-    // Production case: Bo's auth.test.user is the legacy `beau` but
-    // profile.real_name is `Bo`. Both must surface so the rewriter can
-    // resolve `@bo` AND `@beau` to the same user_id.
+  // fetchSlackBotIdentity is intentionally fast/non-blocking — it only does
+  // auth.test, never users.info. Profile enrichment runs separately via
+  // upgradeSlackBotProfile so adapter factory init stays under the auth.test
+  // ceiling (5s) even when Slack's profile API is slow. See Codex P2 review
+  // on PR #111.
+  it('returns identity without profile fields — adapter init never awaits users.info', async () => {
+    const usersInfo = vi.fn(); // present but should not be called by fetch
     const client = {
       auth: {
         test: vi.fn().mockResolvedValue({
@@ -296,69 +305,11 @@ describe('fetchSlackBotIdentity', () => {
           team_id: MR_TEAM,
         }),
       },
-      users: {
-        info: vi.fn().mockResolvedValue({
-          ok: true,
-          user: { profile: { display_name: '', real_name: 'Bo' } },
-        }),
-      },
+      users: { info: usersInfo },
     };
     const id = await fetchSlackBotIdentity(client);
-    expect(id).toEqual({
-      userId: 'U-BO',
-      username: 'beau',
-      realName: 'Bo',
-      displayName: undefined,
-      teamId: MR_TEAM,
-    });
-  });
-
-  it('falls back to username-only when users.info is unavailable', async () => {
-    // Best-effort: a token without users:read scope or a client without
-    // users.info bound (test fixtures, older WebClient mock) still yields
-    // a working identity — identical to pre-fix behavior.
-    const client = {
-      auth: {
-        test: vi.fn().mockResolvedValue({
-          ok: true,
-          user_id: 'U-ILLIE',
-          user: 'illie',
-          team_id: ILLY_TEAM,
-        }),
-      },
-    };
-    const id = await fetchSlackBotIdentity(client);
-    expect(id).toEqual({
-      userId: 'U-ILLIE',
-      username: 'illie',
-      realName: undefined,
-      displayName: undefined,
-      teamId: ILLY_TEAM,
-    });
-  });
-
-  it('continues with username-only when users.info throws', async () => {
-    const client = {
-      auth: {
-        test: vi.fn().mockResolvedValue({
-          ok: true,
-          user_id: 'U-BO',
-          user: 'beau',
-          team_id: MR_TEAM,
-        }),
-      },
-      users: {
-        info: vi.fn().mockRejectedValue(new Error('missing_scope')),
-      },
-    };
-    const id = await fetchSlackBotIdentity(client);
-    expect(id).toEqual({
-      userId: 'U-BO',
-      username: 'beau',
-      realName: undefined,
-      displayName: undefined,
-      teamId: MR_TEAM,
-    });
+    expect(id).toEqual({ userId: 'U-BO', username: 'beau', teamId: MR_TEAM });
+    expect(usersInfo).not.toHaveBeenCalled();
   });
 
   it('returns null on incomplete response', async () => {
@@ -373,5 +324,81 @@ describe('fetchSlackBotIdentity', () => {
       auth: { test: vi.fn().mockRejectedValue(new Error('not_authed')) },
     };
     expect(await fetchSlackBotIdentity(client)).toBeNull();
+  });
+});
+
+describe('upgradeSlackBotProfile (fire-and-forget profile enrichment)', () => {
+  // Tests mutate the module-scoped knownSlackBots map. Each test seeds
+  // exactly the channelType it asserts against and clears it after, so
+  // tests don't leak state.
+  function withRegistered(channelType: string, identity: SlackBotIdentity, fn: () => Promise<void>): Promise<void> {
+    registerSlackBot(channelType, identity);
+    return fn().finally(() => {
+      // The module exports no unregister; overwrite with a defunct entry to
+      // avoid cross-test bleed. Other tests use disjoint channelType names.
+      registerSlackBot(channelType, { ...identity, teamId: '__cleared__' });
+    });
+  }
+
+  it('upgrades the registry entry with displayName + realName when users.info succeeds', async () => {
+    const client = {
+      users: {
+        info: vi.fn().mockResolvedValue({
+          ok: true,
+          user: { profile: { display_name: '', real_name: 'Bo' } },
+        }),
+      },
+    };
+    await withRegistered('slack-test-mr', { userId: 'U-BO', username: 'beau', teamId: MR_TEAM }, async () => {
+      await upgradeSlackBotProfile(client, 'slack-test-mr');
+      const bots = new Map<string, SlackBotIdentity>();
+      bots.set('slack-test-self', { userId: 'U-SELF', username: 'self', teamId: MR_TEAM });
+      // Pull the upgraded entry from the live registry into a snapshot
+      // map and verify @bo now resolves through it.
+      const { getKnownSlackBots } = await import('./slack-mentions.js');
+      for (const [ch, ident] of getKnownSlackBots()) bots.set(ch, ident);
+      expect(resolveSlackMentions('@bo over to you', 'slack-test-self', bots)).toBe('<@U-BO> over to you');
+      expect(resolveSlackMentions('@beau over to you', 'slack-test-self', bots)).toBe('<@U-BO> over to you');
+    });
+  });
+
+  it('is a no-op when the channelType is not registered (defensive)', async () => {
+    const usersInfo = vi.fn();
+    const client = { users: { info: usersInfo } };
+    await upgradeSlackBotProfile(client, 'slack-unregistered');
+    expect(usersInfo).not.toHaveBeenCalled();
+  });
+
+  it('is a no-op when the client has no users.info (e.g. older mock)', async () => {
+    await withRegistered('slack-test-noinfo', { userId: 'U-X', username: 'x', teamId: 'T-X' }, async () => {
+      // Should resolve cleanly without throwing.
+      await upgradeSlackBotProfile({}, 'slack-test-noinfo');
+    });
+  });
+
+  it('swallows errors when users.info rejects — registry stays at username-only', async () => {
+    const client = { users: { info: vi.fn().mockRejectedValue(new Error('missing_scope')) } };
+    await withRegistered('slack-test-err', { userId: 'U-ERR', username: 'err', teamId: 'T-ERR' }, async () => {
+      await expect(upgradeSlackBotProfile(client, 'slack-test-err')).resolves.toBeUndefined();
+    });
+  });
+
+  it('skips the registry update when neither display_name nor real_name is set', async () => {
+    const client = {
+      users: {
+        info: vi.fn().mockResolvedValue({
+          ok: true,
+          user: { profile: { display_name: '', real_name: '' } },
+        }),
+      },
+    };
+    await withRegistered('slack-test-empty', { userId: 'U-EMPTY', username: 'empty', teamId: 'T-EMPTY' }, async () => {
+      await upgradeSlackBotProfile(client, 'slack-test-empty');
+      const { getKnownSlackBots } = await import('./slack-mentions.js');
+      const got = getKnownSlackBots().get('slack-test-empty');
+      // Registry entry retains the username-only shape.
+      expect(got?.realName).toBeUndefined();
+      expect(got?.displayName).toBeUndefined();
+    });
   });
 });
