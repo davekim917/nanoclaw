@@ -152,6 +152,105 @@ describe('resolveSlackMentions', () => {
     });
   });
 
+  // Slack's `auth.test.user` returns the legacy install-time name. For bots
+  // that have been renamed via the App config (or whose `real_name` diverges
+  // from `name`), operators @-mention them by the display name shown in
+  // Slack's UI, which comes from `profile.real_name` (or `display_name` when
+  // set). Concrete production case: Bo's `auth.test.user = "beau"` but
+  // `profile.real_name = "Bo"` — operators write `@bo`.
+  describe('displayName/realName aliases (auth.test name diverges from UI name)', () => {
+    function makeMrBots(): Map<string, SlackBotIdentity> {
+      const bots = new Map<string, SlackBotIdentity>();
+      bots.set('slack-madisonreed', {
+        userId: 'U-BO',
+        username: 'beau',
+        realName: 'Bo',
+        teamId: MR_TEAM,
+      });
+      bots.set('slack-madisonreed-codex', {
+        userId: 'U-BO-CODEX',
+        username: 'bocodex',
+        realName: 'Bo-codex',
+        teamId: MR_TEAM,
+      });
+      return bots;
+    }
+
+    it('rewrites `@bo` against realName when username is legacy `beau`', () => {
+      expect(resolveSlackMentions('@bo over to you', 'slack-madisonreed-codex', makeMrBots())).toBe(
+        '<@U-BO> over to you',
+      );
+    });
+
+    it('rewrites `@beau` against legacy username — both names work', () => {
+      expect(resolveSlackMentions('@beau over to you', 'slack-madisonreed-codex', makeMrBots())).toBe(
+        '<@U-BO> over to you',
+      );
+    });
+
+    it('rewrites `@Bo-codex` against realName when username is `bocodex`', () => {
+      expect(resolveSlackMentions('@Bo-codex pick this up', 'slack-madisonreed', makeMrBots())).toBe(
+        '<@U-BO-CODEX> pick this up',
+      );
+    });
+
+    it('rewrites `@bocodex` against literal username — still works', () => {
+      expect(resolveSlackMentions('@bocodex pick this up', 'slack-madisonreed', makeMrBots())).toBe(
+        '<@U-BO-CODEX> pick this up',
+      );
+    });
+
+    it('prefers displayName over realName when both are set', () => {
+      const bots = new Map<string, SlackBotIdentity>();
+      bots.set('slack-mr', {
+        userId: 'U-SELF',
+        username: 'self',
+        teamId: MR_TEAM,
+      });
+      bots.set('slack-mr-bot', {
+        userId: 'U-BOT',
+        username: 'legacy',
+        displayName: 'Friendly',
+        realName: 'Real',
+        teamId: MR_TEAM,
+      });
+      // Both display ("friendly") and real ("real") map to the same user.
+      expect(resolveSlackMentions('@friendly hi', 'slack-mr', bots)).toBe('<@U-BOT> hi');
+      expect(resolveSlackMentions('@real hi', 'slack-mr', bots)).toBe('<@U-BOT> hi');
+      expect(resolveSlackMentions('@legacy hi', 'slack-mr', bots)).toBe('<@U-BOT> hi');
+    });
+
+    it('literal username still wins on collision with another bot realName', () => {
+      // Bot A's username is `bo`. Bot B's realName lowercased is also `bo`.
+      // The literal username owns the slot — bot B's realName collision
+      // does not overwrite it.
+      const bots = new Map<string, SlackBotIdentity>();
+      bots.set('slack-mr-self', { userId: 'U-SELF', username: 'self', teamId: MR_TEAM });
+      bots.set('slack-mr-a', { userId: 'U-A', username: 'bo', teamId: MR_TEAM });
+      bots.set('slack-mr-b', { userId: 'U-B', username: 'other', realName: 'Bo', teamId: MR_TEAM });
+      expect(resolveSlackMentions('@bo hi', 'slack-mr-self', bots)).toBe('<@U-A> hi');
+      expect(resolveSlackMentions('@other hi', 'slack-mr-self', bots)).toBe('<@U-B> hi');
+    });
+
+    it('does not cross workspaces via realName alias', () => {
+      // An Illysium bot's realName lowercased could collide with an MR
+      // session's expected handle, but teamId scoping must block it.
+      const bots = new Map<string, SlackBotIdentity>();
+      bots.set('slack-madisonreed', { userId: 'U-BO', username: 'beau', realName: 'Bo', teamId: MR_TEAM });
+      bots.set('slack-illysium-impostor', {
+        userId: 'U-IMPOSTOR',
+        username: 'impostor',
+        realName: 'Bo', // collides on realName with MR's bot
+        teamId: ILLY_TEAM,
+      });
+      // From MR session, @bo resolves to MR's bot, not Illysium's.
+      expect(resolveSlackMentions('@bo hi', 'slack-madisonreed', bots)).toBe('<@U-BO> hi');
+      // From Illysium session, @bo resolves to Illysium's bot only — MR's
+      // is filtered out by teamId.
+      expect(resolveSlackMentions('@bo hi', 'slack-illysium-impostor', bots)).toBe('<@U-IMPOSTOR> hi');
+    });
+  });
+
   // URL safety — `transformOutsideProtectedRegions` only shields code
   // spans, so URL guards live in the lookbehind itself. Without `/` and
   // `:` in the exclude class, an `@-after-path-slash` would get rewritten
@@ -184,7 +283,40 @@ describe('resolveSlackMentions', () => {
 });
 
 describe('fetchSlackBotIdentity', () => {
-  it('returns identity when auth.test succeeds', async () => {
+  it('returns identity with profile fields when auth.test + users.info succeed', async () => {
+    // Production case: Bo's auth.test.user is the legacy `beau` but
+    // profile.real_name is `Bo`. Both must surface so the rewriter can
+    // resolve `@bo` AND `@beau` to the same user_id.
+    const client = {
+      auth: {
+        test: vi.fn().mockResolvedValue({
+          ok: true,
+          user_id: 'U-BO',
+          user: 'beau',
+          team_id: MR_TEAM,
+        }),
+      },
+      users: {
+        info: vi.fn().mockResolvedValue({
+          ok: true,
+          user: { profile: { display_name: '', real_name: 'Bo' } },
+        }),
+      },
+    };
+    const id = await fetchSlackBotIdentity(client);
+    expect(id).toEqual({
+      userId: 'U-BO',
+      username: 'beau',
+      realName: 'Bo',
+      displayName: undefined,
+      teamId: MR_TEAM,
+    });
+  });
+
+  it('falls back to username-only when users.info is unavailable', async () => {
+    // Best-effort: a token without users:read scope or a client without
+    // users.info bound (test fixtures, older WebClient mock) still yields
+    // a working identity — identical to pre-fix behavior.
     const client = {
       auth: {
         test: vi.fn().mockResolvedValue({
@@ -196,7 +328,37 @@ describe('fetchSlackBotIdentity', () => {
       },
     };
     const id = await fetchSlackBotIdentity(client);
-    expect(id).toEqual({ userId: 'U-ILLIE', username: 'illie', teamId: ILLY_TEAM });
+    expect(id).toEqual({
+      userId: 'U-ILLIE',
+      username: 'illie',
+      realName: undefined,
+      displayName: undefined,
+      teamId: ILLY_TEAM,
+    });
+  });
+
+  it('continues with username-only when users.info throws', async () => {
+    const client = {
+      auth: {
+        test: vi.fn().mockResolvedValue({
+          ok: true,
+          user_id: 'U-BO',
+          user: 'beau',
+          team_id: MR_TEAM,
+        }),
+      },
+      users: {
+        info: vi.fn().mockRejectedValue(new Error('missing_scope')),
+      },
+    };
+    const id = await fetchSlackBotIdentity(client);
+    expect(id).toEqual({
+      userId: 'U-BO',
+      username: 'beau',
+      realName: undefined,
+      displayName: undefined,
+      teamId: MR_TEAM,
+    });
   });
 
   it('returns null on incomplete response', async () => {
