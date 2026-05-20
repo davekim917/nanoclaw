@@ -5,7 +5,13 @@ import path from 'path';
 import { describe, it, expect } from 'bun:test';
 
 import { createProvider } from './factory.js';
-import { CodexProvider, extractImageGenerationPath, materializeRawImageGeneration, resolveClaudeImports } from './codex.js';
+import {
+  CodexProvider,
+  augmentWithProxyEnv,
+  extractImageGenerationPath,
+  materializeRawImageGeneration,
+  resolveClaudeImports,
+} from './codex.js';
 
 describe('createProvider (codex)', () => {
   it('returns CodexProvider for codex', () => {
@@ -46,13 +52,152 @@ describe('createProvider (codex)', () => {
       mcpServers: Record<string, { command: string; args?: string[]; env?: Record<string, string> }>;
     };
 
-    expect(p.mcpServers.exa).toEqual({
-      command: 'bun',
-      args: ['/app/src/remote-mcp-bridge.ts', 'https://mcp.exa.ai/mcp'],
-      env: { REMOTE_MCP_NAME: 'exa' },
-    });
+    expect(p.mcpServers.exa.command).toBe('bun');
+    expect(p.mcpServers.exa.args).toEqual(['/app/src/remote-mcp-bridge.ts', 'https://mcp.exa.ai/mcp']);
+    // env block carries the required bridge identity plus any proxy/CA env
+    // augmentation from process.env (see augmentWithProxyEnv tests below).
+    expect(p.mcpServers.exa.env?.REMOTE_MCP_NAME).toBe('exa');
     expect(p.mcpServers.custom.env?.REMOTE_MCP_AUTHORIZATION).toBe('Bearer placeholder');
     expect(p.mcpServers.legacy).toBeUndefined();
+  });
+
+  // Issue 3 from the Bo / Bo-codex parity report: Bo-codex's thinking
+  // suggested HTTPS_PROXY was missing in MCP subprocesses. Codex's app-server
+  // writes each MCP's env block to ~/.codex/config.toml and passes ONLY
+  // that block to spawned subprocesses; host env doesn't propagate the way
+  // it does for Claude's SDK-spawned stdio MCPs. Without explicit
+  // forwarding, the remote-mcp-bridge can't route outbound HTTPS through
+  // OneCLI's substitution proxy. Provider constructor now augments every
+  // MCP env block via `augmentWithProxyEnv`.
+  describe('MCP proxy env propagation', () => {
+    // Tests touch process.env — snapshot + restore so neighbours stay clean.
+    function withEnv<T>(overrides: Record<string, string | undefined>, fn: () => T): T {
+      const snapshot: Record<string, string | undefined> = {};
+      for (const key of Object.keys(overrides)) snapshot[key] = process.env[key];
+      try {
+        for (const [k, v] of Object.entries(overrides)) {
+          if (v === undefined) delete process.env[k];
+          else process.env[k] = v;
+        }
+        return fn();
+      } finally {
+        for (const [k, v] of Object.entries(snapshot)) {
+          if (v === undefined) delete process.env[k];
+          else process.env[k] = v;
+        }
+      }
+    }
+
+    it('augments HTTP MCP env block with HTTPS_PROXY + NODE_EXTRA_CA_CERTS from container env', () => {
+      withEnv(
+        {
+          HTTPS_PROXY: 'http://x:secret@host.docker.internal:10255',
+          NODE_EXTRA_CA_CERTS: '/tmp/onecli-gateway-ca.pem',
+        },
+        () => {
+          const p = new CodexProvider({
+            mcpServers: { exa: { type: 'http', url: 'https://mcp.exa.ai/mcp' } },
+          }) as unknown as {
+            mcpServers: Record<string, { env?: Record<string, string> }>;
+          };
+          expect(p.mcpServers.exa.env?.HTTPS_PROXY).toBe('http://x:secret@host.docker.internal:10255');
+          expect(p.mcpServers.exa.env?.NODE_EXTRA_CA_CERTS).toBe('/tmp/onecli-gateway-ca.pem');
+          expect(p.mcpServers.exa.env?.REMOTE_MCP_NAME).toBe('exa');
+        },
+      );
+    });
+
+    it('augments stdio MCP env block too — not just HTTP-bridged ones', () => {
+      withEnv({ HTTPS_PROXY: 'http://proxy:10255', SSL_CERT_FILE: '/tmp/ca.pem' }, () => {
+        const p = new CodexProvider({
+          mcpServers: {
+            local: { type: 'stdio', command: 'bun', args: ['/app/src/local-mcp.ts'], env: { LOCAL_FLAG: 'on' } },
+          },
+        }) as unknown as { mcpServers: Record<string, { env?: Record<string, string> }> };
+        expect(p.mcpServers.local.env?.LOCAL_FLAG).toBe('on');
+        expect(p.mcpServers.local.env?.HTTPS_PROXY).toBe('http://proxy:10255');
+        expect(p.mcpServers.local.env?.SSL_CERT_FILE).toBe('/tmp/ca.pem');
+      });
+    });
+
+    it('does not overwrite an env block that already sets a proxy var', () => {
+      withEnv({ HTTPS_PROXY: 'http://host-default:10255' }, () => {
+        const p = new CodexProvider({
+          mcpServers: {
+            custom: {
+              type: 'http',
+              url: 'https://example.test/mcp',
+              headers: { Authorization: 'Bearer placeholder' },
+            },
+          },
+        }) as unknown as { mcpServers: Record<string, { env?: Record<string, string> }> };
+        // Env starts with REMOTE_MCP_NAME + REMOTE_MCP_AUTHORIZATION (set by
+        // the provider, not by augment). Host HTTPS_PROXY then fills in.
+        expect(p.mcpServers.custom.env?.HTTPS_PROXY).toBe('http://host-default:10255');
+      });
+    });
+
+    it('omits proxy keys that are not set in process.env', () => {
+      withEnv(
+        {
+          HTTPS_PROXY: 'http://proxy:10255',
+          HTTP_PROXY: undefined,
+          NO_PROXY: undefined,
+          NODE_EXTRA_CA_CERTS: undefined,
+        },
+        () => {
+          const p = new CodexProvider({
+            mcpServers: { exa: { type: 'http', url: 'https://mcp.exa.ai/mcp' } },
+          }) as unknown as { mcpServers: Record<string, { env?: Record<string, string> }> };
+          expect(p.mcpServers.exa.env?.HTTPS_PROXY).toBe('http://proxy:10255');
+          expect(p.mcpServers.exa.env?.HTTP_PROXY).toBeUndefined();
+          expect(p.mcpServers.exa.env?.NO_PROXY).toBeUndefined();
+          expect(p.mcpServers.exa.env?.NODE_EXTRA_CA_CERTS).toBeUndefined();
+        },
+      );
+    });
+  });
+
+  describe('augmentWithProxyEnv (unit)', () => {
+    it('returns a copy — does not mutate input', () => {
+      const orig: Record<string, string> = { LOCAL: 'x' };
+      const snapshot = process.env.HTTPS_PROXY;
+      try {
+        process.env.HTTPS_PROXY = 'http://proxy:10255';
+        const out = augmentWithProxyEnv(orig);
+        expect(out).not.toBe(orig);
+        expect(orig.HTTPS_PROXY).toBeUndefined();
+        expect(out.HTTPS_PROXY).toBe('http://proxy:10255');
+        expect(out.LOCAL).toBe('x');
+      } finally {
+        if (snapshot === undefined) delete process.env.HTTPS_PROXY;
+        else process.env.HTTPS_PROXY = snapshot;
+      }
+    });
+
+    it('respects existing keys in baseEnv — host env does not clobber explicit MCP env', () => {
+      const snapshot = process.env.HTTPS_PROXY;
+      try {
+        process.env.HTTPS_PROXY = 'http://host:10255';
+        const out = augmentWithProxyEnv({ HTTPS_PROXY: 'http://mcp-explicit:9999' });
+        expect(out.HTTPS_PROXY).toBe('http://mcp-explicit:9999');
+      } finally {
+        if (snapshot === undefined) delete process.env.HTTPS_PROXY;
+        else process.env.HTTPS_PROXY = snapshot;
+      }
+    });
+
+    it('skips empty-string proxy values (treats as unset)', () => {
+      const snapshot = process.env.HTTPS_PROXY;
+      try {
+        process.env.HTTPS_PROXY = '';
+        const out = augmentWithProxyEnv({});
+        expect(out.HTTPS_PROXY).toBeUndefined();
+      } finally {
+        if (snapshot === undefined) delete process.env.HTTPS_PROXY;
+        else process.env.HTTPS_PROXY = snapshot;
+      }
+    });
   });
 });
 
