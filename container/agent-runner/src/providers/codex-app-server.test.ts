@@ -55,6 +55,16 @@ describe('createCodexConfigOverrides', () => {
     expect(overrides).toContain('features.use_linux_sandbox_bwrap=false');
   });
 
+  it('always enables Codex memories — both read and write', () => {
+    // Codex's [memories] block opts the session into its own
+    // turn-summary store (distinct from NanoClaw mnemon). Both halves
+    // must be on: generate_memories writes; use_memories surfaces them
+    // in subsequent prompts. Operator parity with Dave's local Codex CLI.
+    const overrides = createCodexConfigOverrides();
+    expect(overrides).toContain('memories.generate_memories=true');
+    expect(overrides).toContain('memories.use_memories=true');
+  });
+
   it('forces detailed reasoning summary regardless of stickyConfig', () => {
     expect(createCodexConfigOverrides()).toContain('model_reasoning_summary="detailed"');
     expect(createCodexConfigOverrides({ reasoning_effort: 'low' })).toContain('model_reasoning_summary="detailed"');

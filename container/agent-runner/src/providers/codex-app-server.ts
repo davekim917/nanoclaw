@@ -545,6 +545,13 @@ export function createCodexConfigOverrides(stickyConfig?: {
     'features.use_linux_sandbox_bwrap=false',
     'features.goals=true',
     'features.steer=true',
+    // Memories: writing AND reading. `[memories]` is Codex CLI's own
+    // session-summary store (separate from NanoClaw's mnemon graph, which is
+    // host-side). `generate_memories=true` writes summaries on turn boundaries;
+    // `use_memories=true` makes the next-turn prompt include them. Operator
+    // parity with Dave's local Codex CLI config — both default false upstream.
+    'memories.generate_memories=true',
+    'memories.use_memories=true',
   ];
   if (stickyConfig?.reasoning_effort) {
     overrides.push(`model_reasoning_effort="${stickyConfig.reasoning_effort}"`);
