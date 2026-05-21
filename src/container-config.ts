@@ -167,6 +167,26 @@ export interface ContainerConfig {
   codexHostAuth?: boolean;
 
   /**
+   * Ordered list of additional host `~/.codex*` directories to mount as
+   * fallback OAuth identities. Each entry is a host path (e.g.
+   * `~/.codex`, `~/.codex-other`). At spawn, container-runner resolves
+   * `~`, drops entries that lack an `auth.json`, mounts each survivor RW
+   * at `/home/node/.codex-fallback-N/`, and forwards
+   * `CODEX_FALLBACK_HOMES=/home/node/.codex-fallback-1:/home/node/.codex-fallback-2`.
+   *
+   * The container's codex provider rotates through these on
+   * UsageLimitExceeded / ServerOverloaded / coarse-systemError by
+   * copying the active thread's rollout `.jsonl` into the next CODEX_HOME's
+   * sessions tree, killing the codex app-server, and respawning under the
+   * new CODEX_HOME. Conversation history is preserved (the rollout file
+   * is self-contained — codex reconstructs history inline).
+   *
+   * Inherits the existing `codexHostAuth: true` gate; entries are ignored
+   * when host-auth mounting is opt-out.
+   */
+  codexAuthFallbacks?: string[];
+
+  /**
    * Optional override for the folder used as the lookup key when resolving
    * per-group credentials (LOOKER_*, DBT_*, GITHUB_TOKEN, RENDER_PG_*,
    * GIT_AUTHOR_*, Claude OAuth, Codex auth dir, etc.) via the
@@ -406,6 +426,7 @@ export function readContainerConfig(folder: string): ContainerConfig {
       githubTokenEnv: raw.githubTokenEnv,
       excludePlugins: raw.excludePlugins,
       codexHostAuth: raw.codexHostAuth,
+      codexAuthFallbacks: raw.codexAuthFallbacks,
       credentialFolder: raw.credentialFolder,
       excludeMcpServers: raw.excludeMcpServers,
       gitnexusInjectAgentsMd: raw.gitnexusInjectAgentsMd,

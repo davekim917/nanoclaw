@@ -8,7 +8,9 @@ import { createProvider } from './factory.js';
 import {
   CodexProvider,
   augmentWithProxyEnv,
+  copyRolloutToFallback,
   extractImageGenerationPath,
+  findRolloutFile,
   materializeRawImageGeneration,
   resolveClaudeImports,
 } from './codex.js';
@@ -345,22 +347,20 @@ describe('codex gen() self-heals on hard turn errors (Layer-2 fix)', () => {
   // freeze this invariant in this tree.
   it('gen() returns on `retryable:false` so the app-server gets killed', () => {
     const src = fs.readFileSync(new URL('./codex.ts', import.meta.url), 'utf8');
-    const lines = src.split('\n');
 
-    // The runOneTurn call is the anchor. Confirm we iterate-and-re-yield
-    // rather than blind `yield*` — blind delegation can't inspect events
-    // and so can't trigger the early return on a hard error.
-    const runOneTurnIdx = lines.findIndex((l) => /^\s+for await \(const ev of runOneTurn\(/.test(l));
+    // The runOneTurn for-await is the anchor. Slice from there to the
+    // matching outer finally (where killCodexAppServer fires) so the
+    // assertion covers the whole inner-loop body regardless of how much
+    // rotation logic lives between the iterator and the terminal return.
+    const runOneTurnIdx = src.search(/^\s+for await \(const ev of runOneTurn\(/m);
     expect(runOneTurnIdx).toBeGreaterThan(-1);
-
-    // The lines after the runOneTurn anchor are the inner consumption
-    // loop (the runOneTurn signature itself spans ~11 args, then the body
-    // is 4-5 more lines). Widen the window to comfortably include the
-    // `return` statement and its enclosing `if`.
-    const window = lines.slice(runOneTurnIdx, runOneTurnIdx + 20).join('\n');
-    // Strip line comments before pattern matching so explanatory prose
-    // can mention "retryable===false" without satisfying the check.
+    const finallyIdx = src.indexOf('} finally {', runOneTurnIdx);
+    expect(finallyIdx).toBeGreaterThan(runOneTurnIdx);
+    const window = src.slice(runOneTurnIdx, finallyIdx);
+    // Strip line comments + block comments so explanatory prose can mention
+    // "retryable===false" without satisfying the check.
     const codeOnly = window
+      .replace(/\/\*[\s\S]*?\*\//g, '')
       .split('\n')
       .map((l) => {
         const i = l.indexOf('//');
@@ -368,6 +368,10 @@ describe('codex gen() self-heals on hard turn errors (Layer-2 fix)', () => {
       })
       .join('\n');
 
+    // We must inspect-and-re-yield (not bare `yield*`), branch on
+    // retryable===false, and have a terminal return for non-rotatable
+    // errors. The rotation path also re-yields progress events but the
+    // structural invariants below must still hold.
     expect(codeOnly).toContain('yield ev');
     expect(codeOnly).toMatch(/retryable\s*===\s*false/);
     expect(codeOnly).toContain('return');
@@ -500,5 +504,274 @@ describe('codex turn timer is idle-based, not wall-clock', () => {
     expect(fnBody).toMatch(/inFlightItems\s*>\s*0[\s\S]{0,200}return/);
     // And it must still arm setTimeout in the no-tool case.
     expect(fnBody).toContain('setTimeout');
+  });
+});
+
+describe('codex turn-failure classification (systemError + turn/completed:failed)', () => {
+  // Background (2026-05-21): a Madison Reed codex session hit its ChatGPT
+  // weekly usage cap mid-turn. The codex app-server emitted a
+  // `thread/status/changed` with status `systemError`, then no follow-up
+  // `turn/completed` arrived (codex-cli 0.130.0). The container sat for
+  // 30 min until host-sweep's ABSOLUTE_CEILING_MS killed it.
+  //
+  // Root causes:
+  //   1. systemError was treated as a generic progress label, not a turn
+  //      end — runOneTurn kept waiting.
+  //   2. turn/completed had no branch for status='failed' or an `error`
+  //      payload — every turn/completed was treated as success.
+  //
+  // Both are source-anchored so the invariants stay frozen even if the
+  // surrounding handler grows new cases.
+
+  it('thread/status/changed: systemError ends the turn (not just a progress label)', () => {
+    const src = fs.readFileSync(new URL('./codex.ts', import.meta.url), 'utf8');
+    const codeOnly = src
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .split('\n')
+      .map((l) => {
+        const i = l.indexOf('//');
+        return i >= 0 ? l.slice(0, i) : l;
+      })
+      .join('\n');
+
+    // The handler must detect `label === 'systemError'` and set turnDone.
+    // We anchor on the literal so an unrelated `systemError` mention in
+    // comments doesn't satisfy the assertion (comments are stripped).
+    const m = codeOnly.match(/label\s*===\s*['"]systemError['"][\s\S]{0,500}/);
+    expect(m).not.toBeNull();
+    const window = m![0];
+    // Within the systemError branch, both turnState.error and turnDone
+    // must be set. Ordering doesn't matter; presence does.
+    expect(window).toMatch(/turnState\.error\s*=\s*new\s+Error/);
+    expect(window).toMatch(/turnDone\s*=\s*true/);
+  });
+
+  it('turn/completed branch handles status=failed + carries codexErrorInfo.type into turnState.errorKind', () => {
+    const src = fs.readFileSync(new URL('./codex.ts', import.meta.url), 'utf8');
+    const codeOnly = src
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .split('\n')
+      .map((l) => {
+        const i = l.indexOf('//');
+        return i >= 0 ? l.slice(0, i) : l;
+      })
+      .join('\n');
+
+    // Anchor on `case 'turn/completed'`. The next ~500 chars must contain
+    // the failed-status branch and the kind capture.
+    const caseIdx = codeOnly.indexOf("case 'turn/completed'");
+    expect(caseIdx).toBeGreaterThan(-1);
+    const window = codeOnly.slice(caseIdx, caseIdx + 800);
+
+    // status==='failed' OR error-presence path
+    expect(window).toMatch(/p\.status\s*===\s*['"]failed['"]|status\s*===\s*['"]failed['"]/);
+    // structured error type captured into turnState.errorKind
+    expect(window).toMatch(/codexErrorInfo[\s\S]{0,200}type/);
+    expect(window).toMatch(/turnState\.errorKind\s*=/);
+  });
+
+  it('turnState carries an errorKind field for structured Codex error classification', () => {
+    const src = fs.readFileSync(new URL('./codex.ts', import.meta.url), 'utf8');
+    // Declaration must include errorKind alongside error.
+    expect(src).toMatch(/const\s+turnState\s*:\s*\{[^}]*errorKind[^}]*\}/);
+  });
+
+  it('turn/failed branch also captures errorKind (parity with turn/completed:failed)', () => {
+    const src = fs.readFileSync(new URL('./codex.ts', import.meta.url), 'utf8');
+    const codeOnly = src
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .split('\n')
+      .map((l) => {
+        const i = l.indexOf('//');
+        return i >= 0 ? l.slice(0, i) : l;
+      })
+      .join('\n');
+    const caseIdx = codeOnly.indexOf("case 'turn/failed'");
+    expect(caseIdx).toBeGreaterThan(-1);
+    const window = codeOnly.slice(caseIdx, caseIdx + 500);
+    expect(window).toMatch(/codexErrorInfo[\s\S]{0,200}type/);
+    expect(window).toMatch(/turnState\.errorKind\s*=/);
+  });
+});
+
+describe('codex OAuth fallback — rotation primitives', () => {
+  // Helpers for building a fake CODEX_HOME layout. Codex writes rollouts
+  // to `${CODEX_HOME}/sessions/YYYY/MM/DD/rollout-<ISO>-<threadId>.jsonl`.
+
+  function makeHome(): string {
+    return fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-codex-rotation-'));
+  }
+
+  function writeRollout(home: string, dateSubpath: string, threadId: string, content = 'meta\nturn1\n'): string {
+    const dir = path.join(home, 'sessions', dateSubpath);
+    fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `rollout-2026-05-21T03-15-00-${threadId}.jsonl`);
+    fs.writeFileSync(file, content);
+    return file;
+  }
+
+  describe('findRolloutFile', () => {
+    it('returns null when sessions dir does not exist', () => {
+      const home = makeHome();
+      expect(findRolloutFile('019dd6dc-ad2c-7071-a95f-08d8dcd11dc8', home)).toBeNull();
+    });
+
+    it('finds the rollout matching the threadId suffix', () => {
+      const home = makeHome();
+      const tid = '019dd6dc-ad2c-7071-a95f-08d8dcd11dc8';
+      const written = writeRollout(home, '2026/05/21', tid);
+      const found = findRolloutFile(tid, home);
+      expect(found).toBe(written);
+    });
+
+    it('returns null when threadId is not present in any filename', () => {
+      const home = makeHome();
+      writeRollout(home, '2026/05/21', 'aaaaaaaa-aaaa-7071-a95f-aaaaaaaaaaaa');
+      expect(findRolloutFile('bbbbbbbb-bbbb-7071-a95f-bbbbbbbbbbbb', home)).toBeNull();
+    });
+
+    it('matches case-insensitively', () => {
+      const home = makeHome();
+      const written = writeRollout(home, '2026/05/21', 'ABCDEF12-ABCD-7071-A95F-ABCDEF123456');
+      const found = findRolloutFile('abcdef12-abcd-7071-a95f-abcdef123456', home);
+      expect(found).toBe(written);
+    });
+
+    it('walks the year/month/day tree to depth 3', () => {
+      const home = makeHome();
+      const tid = '019dd6dc-deep-7071-a95f-08d8dcd11dc8';
+      const written = writeRollout(home, '2026/05/21', tid);
+      expect(findRolloutFile(tid, home)).toBe(written);
+    });
+  });
+
+  describe('copyRolloutToFallback', () => {
+    it('copies the rollout to the matching path under the fallback home', () => {
+      const src = makeHome();
+      const dst = makeHome();
+      const tid = '019dd6dc-ad2c-7071-a95f-08d8dcd11dc8';
+      const srcFile = writeRollout(src, '2026/05/21', tid, 'src-content\n');
+
+      const result = copyRolloutToFallback(srcFile, src, dst);
+      expect(result).not.toBeNull();
+      expect(result!).toBe(path.join(dst, 'sessions', '2026/05/21', path.basename(srcFile)));
+      expect(fs.readFileSync(result!, 'utf-8')).toBe('src-content\n');
+    });
+
+    it('creates the destination date subdirectory if missing', () => {
+      const src = makeHome();
+      const dst = makeHome();
+      const tid = '019dd6dc-ad2c-7071-a95f-08d8dcd11dc8';
+      const srcFile = writeRollout(src, '2026/05/21', tid);
+      // dst's sessions/2026/05/21/ doesn't exist yet
+      expect(fs.existsSync(path.join(dst, 'sessions', '2026/05/21'))).toBe(false);
+      copyRolloutToFallback(srcFile, src, dst);
+      expect(fs.existsSync(path.join(dst, 'sessions', '2026/05/21'))).toBe(true);
+    });
+
+    it('returns null when the source is outside the sessions root', () => {
+      const src = makeHome();
+      const dst = makeHome();
+      // File OUTSIDE sessions/ — must be rejected, not silently copied
+      // somewhere weird.
+      const bogus = path.join(src, 'rollout-not-in-sessions.jsonl');
+      fs.writeFileSync(bogus, 'x');
+      expect(copyRolloutToFallback(bogus, src, dst)).toBeNull();
+    });
+
+    it('overwrites an existing destination (idempotent)', () => {
+      const src = makeHome();
+      const dst = makeHome();
+      const tid = '019dd6dc-ad2c-7071-a95f-08d8dcd11dc8';
+      const srcFile = writeRollout(src, '2026/05/21', tid, 'new-content\n');
+      // Pre-existing destination with stale content
+      const stalePath = path.join(dst, 'sessions', '2026/05/21', path.basename(srcFile));
+      fs.mkdirSync(path.dirname(stalePath), { recursive: true });
+      fs.writeFileSync(stalePath, 'stale-content\n');
+
+      copyRolloutToFallback(srcFile, src, dst);
+      expect(fs.readFileSync(stalePath, 'utf-8')).toBe('new-content\n');
+    });
+  });
+
+  describe('CodexProvider fallback cursor', () => {
+    function withEnv<T>(env: Record<string, string | undefined>, fn: () => T): T {
+      const prev: Record<string, string | undefined> = {};
+      for (const k of Object.keys(env)) {
+        prev[k] = process.env[k];
+        if (env[k] === undefined) delete process.env[k];
+        else process.env[k] = env[k];
+      }
+      try {
+        return fn();
+      } finally {
+        for (const k of Object.keys(prev)) {
+          if (prev[k] === undefined) delete process.env[k];
+          else process.env[k] = prev[k];
+        }
+      }
+    }
+
+    it('parses CODEX_FALLBACK_HOMES into an ordered list', () => {
+      withEnv(
+        { CODEX_FALLBACK_HOMES: '/home/node/.codex-fallback-1:/home/node/.codex-fallback-2' },
+        () => {
+          const p = new CodexProvider();
+          expect(p.fallbackHomes).toEqual([
+            '/home/node/.codex-fallback-1',
+            '/home/node/.codex-fallback-2',
+          ]);
+        },
+      );
+    });
+
+    it('returns empty fallbackHomes when CODEX_FALLBACK_HOMES is unset or blank', () => {
+      withEnv({ CODEX_FALLBACK_HOMES: undefined }, () => {
+        expect(new CodexProvider().fallbackHomes).toEqual([]);
+      });
+      withEnv({ CODEX_FALLBACK_HOMES: '' }, () => {
+        expect(new CodexProvider().fallbackHomes).toEqual([]);
+      });
+      withEnv({ CODEX_FALLBACK_HOMES: '  ' }, () => {
+        expect(new CodexProvider().fallbackHomes).toEqual([]);
+      });
+    });
+
+    it('rotateCodexHome walks through fallbacks and returns null when exhausted', () => {
+      withEnv({ CODEX_FALLBACK_HOMES: '/a:/b:/c' }, () => {
+        const p = new CodexProvider();
+        expect(p.rotateCodexHome()).toBe('/a');
+        expect(p.rotateCodexHome()).toBe('/b');
+        expect(p.rotateCodexHome()).toBe('/c');
+        expect(p.rotateCodexHome()).toBeNull();
+        // Position sticks once exhausted — does not loop.
+        expect(p.rotateCodexHome()).toBeNull();
+      });
+    });
+
+    it('rotateCodexHome returns null immediately when no fallbacks configured', () => {
+      withEnv({ CODEX_FALLBACK_HOMES: undefined }, () => {
+        expect(new CodexProvider().rotateCodexHome()).toBeNull();
+      });
+    });
+  });
+
+  describe('runOneTurn error → ProviderEvent classification mapping', () => {
+    // The mapping table lives in runOneTurn's terminal error emit (single
+    // location, very small). Source-anchored to keep the wire format frozen.
+    it('UsageLimitExceeded → classification "quota"', () => {
+      const src = fs.readFileSync(new URL('./codex.ts', import.meta.url), 'utf8');
+      expect(src).toMatch(/UsageLimitExceeded[\s\S]{0,80}classification\s*=\s*['"]quota['"]/);
+    });
+
+    it('ServerOverloaded → classification "overloaded"', () => {
+      const src = fs.readFileSync(new URL('./codex.ts', import.meta.url), 'utf8');
+      expect(src).toMatch(/ServerOverloaded[\s\S]{0,80}classification\s*=\s*['"]overloaded['"]/);
+    });
+
+    it('codex_system_error → classification "system_error"', () => {
+      const src = fs.readFileSync(new URL('./codex.ts', import.meta.url), 'utf8');
+      expect(src).toMatch(/codex_system_error[\s\S]{0,150}classification\s*=\s*['"]system_error['"]/);
+    });
   });
 });

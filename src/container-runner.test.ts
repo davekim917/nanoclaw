@@ -8,6 +8,7 @@ import type Database from 'better-sqlite3';
 import {
   dockerResourceLimitArgs,
   resolveAnthropicAuth,
+  resolveCodexAuthFallbacks,
   resolveProviderName,
   reconcileWorkgroupAtSpawn,
   resolveMnemonStore,
@@ -276,6 +277,100 @@ describe('codex provider host auth', () => {
     });
 
     expect(copiedAuth(sessionDir)).toEqual({ account: 'global' });
+  });
+});
+
+describe('resolveCodexAuthFallbacks', () => {
+  function makeHome(): string {
+    return fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-codex-fb-'));
+  }
+
+  function writeAuth(dir: string): void {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'auth.json'), '{}');
+  }
+
+  it('returns [] when declarations is undefined or empty', () => {
+    const home = makeHome();
+    expect(resolveCodexAuthFallbacks(undefined, path.join(home, '.codex'), home)).toEqual([]);
+    expect(resolveCodexAuthFallbacks([], path.join(home, '.codex'), home)).toEqual([]);
+  });
+
+  it('expands ~/ relative to provided homedir', () => {
+    const home = makeHome();
+    writeAuth(path.join(home, '.codex'));
+    // Primary is some scoped dir; fallback is the global ~/.codex
+    const out = resolveCodexAuthFallbacks(['~/.codex'], path.join(home, '.codex-mr'), home);
+    expect(out).toEqual([
+      { hostPath: path.join(home, '.codex'), containerPath: '/home/node/.codex-fallback-1' },
+    ]);
+  });
+
+  it('skips entries without an auth.json (no false-positive mounts)', () => {
+    const home = makeHome();
+    writeAuth(path.join(home, '.codex'));
+    // ~/.codex-missing has no auth.json — must be silently dropped
+    const out = resolveCodexAuthFallbacks(
+      ['~/.codex-missing', '~/.codex'],
+      path.join(home, '.codex-mr'),
+      home,
+    );
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({
+      hostPath: path.join(home, '.codex'),
+      containerPath: '/home/node/.codex-fallback-1',
+    });
+  });
+
+  it('dedupes against the primary host path', () => {
+    const home = makeHome();
+    writeAuth(path.join(home, '.codex'));
+    // Primary IS ~/.codex, so the same path in fallbacks must be dropped
+    const out = resolveCodexAuthFallbacks(['~/.codex'], path.join(home, '.codex'), home);
+    expect(out).toEqual([]);
+  });
+
+  it('dedupes within the declaration list (same path declared twice)', () => {
+    const home = makeHome();
+    writeAuth(path.join(home, '.codex'));
+    const out = resolveCodexAuthFallbacks(
+      ['~/.codex', '~/.codex'],
+      path.join(home, '.codex-mr'),
+      home,
+    );
+    expect(out).toHaveLength(1);
+    expect(out[0].containerPath).toBe('/home/node/.codex-fallback-1');
+  });
+
+  it('preserves declared order and numbers container paths starting at 1', () => {
+    const home = makeHome();
+    writeAuth(path.join(home, '.codex-a'));
+    writeAuth(path.join(home, '.codex-b'));
+    writeAuth(path.join(home, '.codex-c'));
+    const out = resolveCodexAuthFallbacks(
+      ['~/.codex-b', '~/.codex-a', '~/.codex-c'],
+      path.join(home, '.codex-mr'),
+      home,
+    );
+    expect(out.map((e) => e.hostPath)).toEqual([
+      path.join(home, '.codex-b'),
+      path.join(home, '.codex-a'),
+      path.join(home, '.codex-c'),
+    ]);
+    expect(out.map((e) => e.containerPath)).toEqual([
+      '/home/node/.codex-fallback-1',
+      '/home/node/.codex-fallback-2',
+      '/home/node/.codex-fallback-3',
+    ]);
+  });
+
+  it('ignores non-string and blank entries', () => {
+    const home = makeHome();
+    writeAuth(path.join(home, '.codex'));
+    const messy = [null, '', '   ', '~/.codex'] as unknown as string[];
+    const out = resolveCodexAuthFallbacks(messy, path.join(home, '.codex-mr'), home);
+    expect(out).toHaveLength(1);
+    expect(out[0].hostPath).toBe(path.join(home, '.codex'));
   });
 });
 

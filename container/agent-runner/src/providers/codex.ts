@@ -323,12 +323,123 @@ export function augmentWithProxyEnv(baseEnv: Record<string, string>): Record<str
   return out;
 }
 
+// ── Codex OAuth fallback (rollout-copy rotation) ───────────────────────────
+// Codex stores per-thread state in `${CODEX_HOME}/sessions/YYYY/MM/DD/
+// rollout-<ISO>-<threadId>.jsonl`. The file is self-contained: the codex
+// app-server reconstructs full history from it and sends the inline message
+// list to the responses API on resume — no `previous_response_id`, no
+// account-binding (verified via openai/codex docs + empirical inspection of
+// a real rollout's payload). So OAuth fallback can preserve conversation
+// context by copying the rollout into the new CODEX_HOME's sessions tree
+// before respawning the app-server.
+
+/**
+ * `codexErrorInfo.type` values that should trigger OAuth fallback rotation.
+ * Both are quota-flavored — distinct from `Unauthorized` / `BadRequest` /
+ * `ContextWindowExceeded` etc., which are terminal regardless of which
+ * identity is used. Source: openai/codex `CodexErrorInfo` enum + the TUI's
+ * `app_server_rate_limit_error_kind` rate-limit classifier.
+ */
+const ROTATABLE_CODEX_ERROR_KINDS: ReadonlySet<string> = new Set([
+  'UsageLimitExceeded',
+  'ServerOverloaded',
+]);
+
+/**
+ * Walk `${codexHome}/sessions/` for the rollout `.jsonl` whose filename
+ * embeds the given thread UUID. Codex's path layout is
+ * `sessions/YYYY/MM/DD/rollout-<ISO>-<threadId>.jsonl`. Returns absolute
+ * path or null if nothing matches.
+ *
+ * Tolerates UUIDs in any case and missing date subdirs. Walks at most 3
+ * levels deep (year/month/day) so a corrupted sessions tree can't lock the
+ * search; returns the first match (multiple rollouts per thread aren't
+ * expected in this codex version).
+ */
+export function findRolloutFile(threadId: string, codexHome: string): string | null {
+  const sessionsRoot = path.join(codexHome, 'sessions');
+  if (!fs.existsSync(sessionsRoot)) return null;
+  const needle = threadId.toLowerCase();
+  const stack: Array<{ dir: string; depth: number }> = [{ dir: sessionsRoot, depth: 0 }];
+  while (stack.length > 0) {
+    const { dir, depth } = stack.pop()!;
+    let entries: string[];
+    try {
+      entries = fs.readdirSync(dir);
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const full = path.join(dir, entry);
+      let stat: fs.Stats;
+      try {
+        stat = fs.statSync(full);
+      } catch {
+        continue;
+      }
+      if (stat.isDirectory()) {
+        if (depth < 3) stack.push({ dir: full, depth: depth + 1 });
+        continue;
+      }
+      if (!entry.endsWith('.jsonl')) continue;
+      if (entry.toLowerCase().includes(needle)) return full;
+    }
+  }
+  return null;
+}
+
+/**
+ * Copy a rollout `.jsonl` from one CODEX_HOME's sessions tree to another,
+ * preserving the date subdirectory layout. The destination path mirrors the
+ * source's path relative to its sessions/ root (so `sessions/2026/05/21/...`
+ * lands at the same subpath under the fallback home).
+ *
+ * Idempotent: overwrites the destination if it exists. Creates parent dirs.
+ * Returns the destination path on success, null on failure.
+ *
+ * Important: copying mid-turn is safe because Codex's writer appends
+ * line-by-line and fsyncs per record. The destination won't capture any
+ * records written after the copy starts, but those records belong to the
+ * failed turn anyway (the rotation routine will replay the user input
+ * against the new app-server, generating a fresh assistant response).
+ */
+export function copyRolloutToFallback(
+  srcRollout: string,
+  srcCodexHome: string,
+  dstCodexHome: string,
+): string | null {
+  const srcSessionsRoot = path.join(srcCodexHome, 'sessions');
+  const rel = path.relative(srcSessionsRoot, srcRollout);
+  if (rel.startsWith('..') || path.isAbsolute(rel)) return null;
+  const dstPath = path.join(dstCodexHome, 'sessions', rel);
+  try {
+    fs.mkdirSync(path.dirname(dstPath), { recursive: true });
+    fs.copyFileSync(srcRollout, dstPath);
+    return dstPath;
+  } catch {
+    return null;
+  }
+}
+
 export class CodexProvider implements AgentProvider {
   readonly supportsNativeSlashCommands = false;
 
   private readonly mcpServers: Record<string, CodexMcpServer>;
   private readonly model: string;
   private readonly stickyConfig: z.infer<typeof codexConfigSchema>;
+
+  /**
+   * Ordered fallback CODEX_HOME paths from the `CODEX_FALLBACK_HOMES` env
+   * (colon-joined). Host's container-runner mounts each fallback `~/.codex*`
+   * dir at `/home/node/.codex-fallback-N/` and forwards the env var. Used
+   * by the rotation routine in `gen()` to walk through alternate OAuth
+   * identities on `UsageLimitExceeded` / `ServerOverloaded` / coarse
+   * `systemError`. Cursor persists for the provider instance lifetime —
+   * once we've rotated to slot N, slot N+1 is the next target even across
+   * `query()` calls.
+   */
+  readonly fallbackHomes: readonly string[];
+  private nextFallback = 0;
 
   constructor(options: ProviderOptions = {}) {
     // Codex only supports stdio MCP servers. Native stdio entries pass through;
@@ -379,6 +490,36 @@ export class CodexProvider implements AgentProvider {
       this.stickyConfig.model ??
       (options.env?.CODEX_MODEL as string | undefined) ??
       'gpt-5.5';
+
+    // Fallback OAuth identities. Empty when CODEX_FALLBACK_HOMES is unset
+    // (the host didn't mount any fallbacks). Read from process.env rather
+    // than options.env because options.env is filtered for SDK consumption
+    // — the host-side container-runner passes the var via `-e`, and Codex
+    // doesn't have an env-allowlist filter for the app-server side.
+    const fallbackEnv = process.env.CODEX_FALLBACK_HOMES ?? '';
+    this.fallbackHomes = Object.freeze(
+      fallbackEnv
+        .split(':')
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0),
+    );
+    if (this.fallbackHomes.length > 0) {
+      console.error(
+        `[codex-provider] Loaded ${this.fallbackHomes.length} Codex OAuth fallback(s): ${this.fallbackHomes.join(', ')}`,
+      );
+    }
+  }
+
+  /**
+   * Advance the rotation cursor and return the next fallback CODEX_HOME, or
+   * null when slots are exhausted. Position persists for the provider's
+   * lifetime (matches the Claude provider's `rotateApiKey` contract).
+   *
+   * Exported as a method so the gen() body and unit tests can both drive it.
+   */
+  rotateCodexHome(): string | null {
+    if (this.nextFallback >= this.fallbackHomes.length) return null;
+    return this.fallbackHomes[this.nextFallback++];
   }
 
   isSessionInvalid(err: unknown): boolean {
@@ -414,12 +555,18 @@ export class CodexProvider implements AgentProvider {
       // spawn-per-query matches that cadence naturally.
       writeCodexMcpConfigToml(self.mcpServers);
       writeCodexHooksJson();
-      const server = spawnCodexAppServer(createCodexConfigOverrides(self.stickyConfig));
+      let server = spawnCodexAppServer(createCodexConfigOverrides(self.stickyConfig));
       turnTracker.server = server;
       attachCodexAutoApproval(server);
 
       let threadId: string | undefined = input.continuation;
       let initYielded = false;
+
+      // Current CODEX_HOME. Tracked locally so the rotation routine can
+      // pass it into findRolloutFile (the rollout to copy lives in the home
+      // we're rotating AWAY from). Falls back to the conventional path when
+      // process.env.CODEX_HOME is unset — the codex CLI uses the same default.
+      let currentCodexHome = process.env.CODEX_HOME ?? '/home/node/.codex';
 
       try {
         await initializeCodexAppServer(server);
@@ -448,35 +595,131 @@ export class CodexProvider implements AgentProvider {
 
           const text = pending.shift()!;
 
-          // One turn = one channel of streaming events. Each notification
-          // from the app-server yields an `activity` first (so the
-          // poll-loop's idle timer stays honest) and then, where relevant,
-          // an init / result / progress event.
-          //
-          // We inspect each event while re-yielding it: on a `retryable:false`
-          // error (e.g. TURN_TIMEOUT_MS) the codex app-server is wedged
-          // server-side — there's no turn-cancel RPC, only turn/start and
-          // turn/steer, so the next startCodexTurn would either block or
-          // immediately re-time-out. Return from gen() so the outer finally
-          // (line ~373) calls killCodexAppServer and the next poll-loop
-          // iteration spawns a fresh app-server within seconds. Without
-          // this, every subsequent turn dies the same way until host-sweep
-          // reaps the whole container at its 30-min ABSOLUTE_CEILING_MS.
-          for await (const ev of runOneTurn(
-            server,
-            threadId!,
-            text,
-            self.model,
-            input.cwd,
-            () => initYielded,
-            () => {
-              initYielded = true;
-            },
-            turnTracker,
-          )) {
-            yield ev;
-            if (ev.type === 'error' && ev.retryable === false) {
-              return;
+          // Rotation loop. Each iteration runs the same `text` against the
+          // current app-server; on a rotation-eligible error with fallback
+          // slots remaining, we copy the rollout, kill the server, switch
+          // CODEX_HOME, spawn a fresh server, re-resume the thread, and
+          // re-run the same input. Up to (1 + fallbackHomes.length)
+          // attempts so an exhausted rotation falls through to surface the
+          // error instead of looping.
+          let attemptsRemaining = self.fallbackHomes.length + 1;
+          let rotateAndRetry = true;
+          while (rotateAndRetry && attemptsRemaining-- > 0) {
+            rotateAndRetry = false;
+
+            // One turn = one channel of streaming events. Each notification
+            // from the app-server yields an `activity` first (so the
+            // poll-loop's idle timer stays honest) and then, where relevant,
+            // an init / result / progress event.
+            //
+            // We inspect each event while re-yielding it: on a
+            // `retryable:false` error (e.g. TURN_IDLE_TIMEOUT_MS) the codex
+            // app-server is wedged server-side — there's no turn-cancel RPC,
+            // only turn/start and turn/steer, so the next startCodexTurn
+            // would either block or immediately re-time-out. Return from
+            // gen() so the outer finally calls killCodexAppServer and the
+            // next poll-loop iteration spawns a fresh app-server within
+            // seconds. Without this, every subsequent turn dies the same
+            // way until host-sweep reaps the whole container at its 30-min
+            // ABSOLUTE_CEILING_MS.
+            //
+            // EXCEPTION: when the error's classification matches a
+            // rotation-eligible kind AND we have a fallback CODEX_HOME
+            // available, transparently swap identity and retry instead of
+            // surfacing the error.
+            for await (const ev of runOneTurn(
+              server,
+              threadId!,
+              text,
+              self.model,
+              input.cwd,
+              () => initYielded,
+              () => {
+                initYielded = true;
+              },
+              turnTracker,
+            )) {
+              if (ev.type === 'error' && ev.retryable === false) {
+                const eligible =
+                  ev.classification === 'quota' ||
+                  ev.classification === 'overloaded' ||
+                  ev.classification === 'system_error';
+                if (eligible && self.nextFallback < self.fallbackHomes.length) {
+                  const nextHome = self.rotateCodexHome();
+                  if (nextHome) {
+                    // Best-effort: copy the active rollout into the new
+                    // CODEX_HOME's sessions tree so thread/resume reconstructs
+                    // history inline. If the rollout doesn't exist yet (first
+                    // turn) or the copy fails, the new app-server falls back
+                    // to a fresh thread via STALE_THREAD_RE in
+                    // startOrResumeCodexThread — conversation context is lost
+                    // but the turn still completes.
+                    let rolloutCopied = false;
+                    if (threadId) {
+                      const src = findRolloutFile(threadId, currentCodexHome);
+                      if (src) {
+                        const dst = copyRolloutToFallback(src, currentCodexHome, nextHome);
+                        rolloutCopied = dst !== null;
+                      }
+                    }
+
+                    // Visible status — better than swallowing the rotation
+                    // silently. Uses progress so it flows through the same
+                    // edit-in-place surface as the thinking labels.
+                    yield {
+                      type: 'progress',
+                      message: formatBlockquoteLabel(
+                        '↻',
+                        `Codex OAuth rotating (${ev.classification}) → fallback ${self.nextFallback}/${self.fallbackHomes.length}` +
+                          (rolloutCopied ? ' (history preserved)' : ' (history reset)'),
+                      ),
+                    };
+
+                    // Tear down the wedged app-server, switch identity,
+                    // spawn fresh. CODEX_HOME on process.env is what the
+                    // app-server reads at spawn.
+                    turnTracker.server = null;
+                    turnTracker.threadId = null;
+                    turnTracker.currentTurnId = null;
+                    killCodexAppServer(server);
+                    process.env.CODEX_HOME = nextHome;
+                    currentCodexHome = nextHome;
+
+                    // config.toml / hooks.json live under CODEX_HOME, so
+                    // regenerate them in the new dir. The MCP config is the
+                    // same content (host wiring hasn't changed); writing it
+                    // again is cheap and keeps the new home consistent.
+                    writeCodexMcpConfigToml(self.mcpServers);
+                    writeCodexHooksJson();
+
+                    server = spawnCodexAppServer(createCodexConfigOverrides(self.stickyConfig));
+                    turnTracker.server = server;
+                    attachCodexAutoApproval(server);
+                    await initializeCodexAppServer(server);
+
+                    // Re-resume the thread on the new identity. If the
+                    // rollout copy succeeded, threadId stays the same and
+                    // history continues. If it didn't, startOrResume falls
+                    // back to a fresh thread via STALE_THREAD_RE and
+                    // returns a new id — re-emit init so the poll loop
+                    // updates its continuation.
+                    const previousThreadId: string | undefined = threadId;
+                    threadId = await startOrResumeCodexThread(server, threadId, threadParams);
+                    turnTracker.threadId = threadId ?? null;
+                    if (threadId !== previousThreadId) {
+                      initYielded = false;
+                    }
+
+                    rotateAndRetry = true;
+                    break; // exit for-await; the outer rotation while re-runs
+                  }
+                }
+                // Not eligible OR no fallback slots — original behavior:
+                // surface the error and end the query.
+                yield ev;
+                return;
+              }
+              yield ev;
             }
           }
         }
@@ -539,7 +782,13 @@ async function* runOneTurn(
 ): AsyncGenerator<ProviderEvent> {
   // Mutable refs via object properties — TS can't track closure assignments
   // for narrowing, but property access keeps the declared type visible.
-  const turnState: { error: Error | null } = { error: null };
+  //
+  // `errorKind` carries Codex's structured `codexErrorInfo.type` enum
+  // (e.g. `UsageLimitExceeded`, `ServerOverloaded`, `Unauthorized`,
+  // `ContextWindowExceeded`) when present on a `turn/completed: failed`
+  // payload. Used by callers to decide whether an error is rotation-eligible
+  // (quota-flavored) vs terminal (auth/context).
+  const turnState: { error: Error | null; errorKind: string | null } = { error: null, errorKind: null };
   let resultText = '';
   let turnDone = false;
   // Codex can deliver reasoning two ways: streaming item/reasoning/* deltas
@@ -730,14 +979,34 @@ async function* runOneTurn(
         flushReasoning();
         break;
       }
-      case 'turn/completed':
+      case 'turn/completed': {
+        // Codex's `turn/completed` is overloaded: it fires for both successful
+        // and failed turns. A failed turn carries `status: 'failed'` and an
+        // `error` object with `message`, `codexErrorInfo` (structured enum:
+        // UsageLimitExceeded | ServerOverloaded | ContextWindowExceeded |
+        // Unauthorized | BadRequest | ...), and optional `additionalDetails`.
+        // Treating every `turn/completed` as success made rate-limit hangs
+        // invisible — the agent yielded an empty result and the poll loop
+        // looped back into the same systemError.
+        const p = params as {
+          status?: string;
+          error?: { message?: string; codexErrorInfo?: { type?: string } };
+        };
+        if (p.status === 'failed' || p.error) {
+          const kind = p.error?.codexErrorInfo?.type;
+          turnState.error = new Error(p.error?.message || 'Turn failed');
+          if (typeof kind === 'string') turnState.errorKind = kind;
+        }
         flushReasoning();
         if (turnTracker) turnTracker.currentTurnId = null;
         turnDone = true;
         break;
+      }
       case 'turn/failed': {
-        const e = params.error as { message?: string } | undefined;
+        const e = params.error as { message?: string; codexErrorInfo?: { type?: string } } | undefined;
         turnState.error = new Error(e?.message || 'Turn failed');
+        const kind = e?.codexErrorInfo?.type;
+        if (typeof kind === 'string') turnState.errorKind = kind;
         if (turnTracker) turnTracker.currentTurnId = null;
         turnDone = true;
         break;
@@ -746,8 +1015,9 @@ async function* runOneTurn(
         // Codex's thread/status/changed payload shape varies by app-server
         // version. Some versions emit params.status as a plain string;
         // others emit a structured object (e.g. { state: 'thinking',
-        // detail: '...' }). Extract the most useful human-readable label;
-        // never let template coercion produce "[object Object]".
+        // detail: '...' }, or { type: 'systemError' }). Extract the most
+        // useful human-readable label; never let template coercion produce
+        // "[object Object]".
         //
         // Drop the trivial "active" / "idle" labels — they fire on every
         // turn-state flip, so the chat-side status message (which the host
@@ -766,6 +1036,20 @@ async function* runOneTurn(
           const candidate =
             obj.label ?? obj.state ?? obj.status ?? obj.kind ?? obj.type ?? obj.message ?? obj.text;
           label = typeof candidate === 'string' ? candidate : JSON.stringify(raw);
+        }
+        // `systemError` is a thread-fatal state — Codex stops processing the
+        // turn but the follow-up `turn/completed: failed` is unreliable
+        // across app-server versions (observed wedge in 0.130.0: 30-min idle
+        // until host-sweep ceiling killed the container). End the turn here
+        // so the caller can react instead of waiting for a notification that
+        // may never come. errorKind stays null because thread/status/changed
+        // carries no structured detail — rotation logic should treat that as
+        // "unknown, conservative-rotate" rather than "definitely auth/context".
+        if (label === 'systemError') {
+          turnState.error = new Error('codex_system_error: thread entered systemError state');
+          if (turnTracker) turnTracker.currentTurnId = null;
+          turnDone = true;
+          break;
         }
         if (label && label !== 'active' && label !== 'idle') {
           buffer.push({ type: 'progress', message: `status: ${label}` });
@@ -814,7 +1098,25 @@ async function* runOneTurn(
     while (buffer.length > 0) yield buffer.shift()!;
 
     if (turnState.error) {
-      yield { type: 'error', message: turnState.error.message, retryable: false };
+      // Map the structured CodexErrorInfo type to a ProviderEvent
+      // `classification` so callers (CodexProvider.gen rotation) can decide
+      // whether to rotate OAuth identities. Unknown → omit classification.
+      // The `system_error` value below covers the coarse-systemError path
+      // where thread/status/changed fired but no follow-up turn/completed
+      // carried structured detail (observed wedge in codex-cli 0.130.0).
+      let classification: string | undefined;
+      if (turnState.errorKind && ROTATABLE_CODEX_ERROR_KINDS.has(turnState.errorKind)) {
+        if (turnState.errorKind === 'UsageLimitExceeded') classification = 'quota';
+        else if (turnState.errorKind === 'ServerOverloaded') classification = 'overloaded';
+      } else if (turnState.error.message.startsWith('codex_system_error')) {
+        classification = 'system_error';
+      }
+      yield {
+        type: 'error',
+        message: turnState.error.message,
+        retryable: false,
+        ...(classification ? { classification } : {}),
+      };
       return;
     }
 

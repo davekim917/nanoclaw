@@ -629,6 +629,50 @@ export function resolveCodexAuthDir(folder: string, homedir: string = os.homedir
 }
 
 /**
+ * Resolved fallback OAuth dir for a codex container: host path → container
+ * mount path. Returned in declared order; index 0 maps to `.codex-fallback-1`,
+ * index 1 to `.codex-fallback-2`, etc.
+ */
+export interface CodexAuthFallback {
+  hostPath: string;
+  containerPath: string;
+}
+
+/**
+ * Filter a `codexAuthFallbacks` declaration into a deduped, validated list
+ * of fallback mounts. Entries are silently skipped when:
+ *   - the declared host path doesn't have an `auth.json`
+ *   - the path resolves to the same dir as the primary mount
+ *   - the entry has already been seen earlier in the list
+ *
+ * `~/` is expanded relative to `homedir`. Both the mount block and the
+ * env-forward block call this so they stay in sync without sharing state.
+ *
+ * Exported for unit testing.
+ */
+export function resolveCodexAuthFallbacks(
+  declarations: string[] | undefined,
+  primaryHostPath: string,
+  homedir: string = os.homedir(),
+): CodexAuthFallback[] {
+  if (!Array.isArray(declarations) || declarations.length === 0) return [];
+  const out: CodexAuthFallback[] = [];
+  const seen = new Set<string>([primaryHostPath]);
+  for (const decl of declarations) {
+    if (typeof decl !== 'string' || !decl.trim()) continue;
+    const expanded = decl.startsWith('~/') ? path.join(homedir, decl.slice(2)) : decl;
+    if (seen.has(expanded)) continue;
+    if (!fs.existsSync(path.join(expanded, 'auth.json'))) {
+      log.warn('codexAuthFallbacks: entry skipped (no auth.json)', { hostPath: expanded });
+      continue;
+    }
+    seen.add(expanded);
+    out.push({ hostPath: expanded, containerPath: `/home/node/.codex-fallback-${out.length + 1}` });
+  }
+  return out;
+}
+
+/**
  * Sentinel value injected by `onecli run --` as the host service's
  * CLAUDE_CODE_OAUTH_TOKEN. The wrapper's own proxy substitutes it for a
  * real vault token at request time — but the literal string is never a
@@ -1250,6 +1294,23 @@ function buildMounts(
               });
             }
           }
+
+          // codexAuthFallbacks: ordered list of additional ~/.codex* dirs to
+          // mount as fallback OAuth identities. Resolution + filtering lives
+          // in `resolveCodexAuthFallbacks` so the env-forward block (in the
+          // spawn-args builder) can compute the same list without duplicating
+          // logic. Each survivor mounts at /home/node/.codex-fallback-N/ in
+          // declared order; the container provider reads CODEX_FALLBACK_HOMES
+          // and rotates on UsageLimitExceeded / ServerOverloaded / coarse-
+          // systemError. RW for parity with the primary mount (codex
+          // refresh-rotates tokens in-place).
+          const resolved = resolveCodexAuthFallbacks(
+            containerConfig.codexAuthFallbacks,
+            hostCodex,
+          );
+          resolved.forEach((entry) => {
+            mounts.push({ hostPath: entry.hostPath, containerPath: entry.containerPath, readonly: false });
+          });
         }
       }
     }
@@ -2028,6 +2089,19 @@ async function buildContainerArgs(
   args.push('-e', 'CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1');
   args.push('-e', 'CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1');
   args.push('-e', 'ENABLE_TOOL_SEARCH=true');
+
+  // Forward CODEX_FALLBACK_HOMES when fallback codex auth dirs were mounted.
+  // Source of truth is the mounts array — buildMounts decided which entries
+  // survived (auth.json exists, not deduped against primary). Reconstructing
+  // from mounts keeps the env var aligned with what's actually accessible.
+  // Format: colon-joined container paths in mount order, which is the same
+  // as declaration order in codexAuthFallbacks (see resolveCodexAuthFallbacks).
+  const codexFallbackPaths = mounts
+    .filter((m) => m.containerPath.startsWith('/home/node/.codex-fallback-'))
+    .map((m) => m.containerPath);
+  if (codexFallbackPaths.length > 0) {
+    args.push('-e', `CODEX_FALLBACK_HOMES=${codexFallbackPaths.join(':')}`);
+  }
 
   // Credential-lookup folder. Defaults to `agent_groups.folder`; sibling
   // groups (codex clones, etc.) can override via container.json's
