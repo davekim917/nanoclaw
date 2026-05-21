@@ -279,6 +279,109 @@ describe('messaging group agents', () => {
   });
 });
 
+describe('getChannelPeers — sibling-adapter awareness', () => {
+  beforeEach(() => {
+    // Two siblings (Bo / Bo-codex) on the SAME Slack channel are modeled as
+    // two messaging_groups sharing platform_id but with channel_type that
+    // differs per bot adapter. A third unrelated agent is wired to a totally
+    // separate channel to confirm cross-channel isolation.
+    createAgentGroup({ id: 'bo', name: 'Bo', folder: 'bo', agent_provider: null, created_at: now() });
+    createAgentGroup({
+      id: 'bo-codex',
+      name: 'Bo-codex',
+      folder: 'bo-codex',
+      agent_provider: null,
+      created_at: now(),
+    });
+    createAgentGroup({
+      id: 'unrelated',
+      name: 'Unrelated',
+      folder: 'unrelated',
+      agent_provider: null,
+      created_at: now(),
+    });
+    createMessagingGroup({
+      id: 'mg-bo',
+      channel_type: 'slack-mr',
+      platform_id: 'C123CHANNEL',
+      name: 'general',
+      is_group: 1,
+      unknown_sender_policy: 'strict',
+      created_at: now(),
+    });
+    createMessagingGroup({
+      id: 'mg-bo-codex',
+      channel_type: 'slack-mr-codex',
+      platform_id: 'C123CHANNEL',
+      name: 'general',
+      is_group: 1,
+      unknown_sender_policy: 'strict',
+      created_at: now(),
+    });
+    createMessagingGroup({
+      id: 'mg-other',
+      channel_type: 'slack-mr',
+      platform_id: 'C999OTHER',
+      name: 'other-channel',
+      is_group: 1,
+      unknown_sender_policy: 'strict',
+      created_at: now(),
+    });
+    const base = {
+      engage_mode: 'mention' as const,
+      engage_pattern: null,
+      sender_scope: 'all' as const,
+      ignored_message_policy: 'accumulate' as const,
+      session_mode: 'per-thread' as const,
+      priority: 0,
+      default_model: null,
+      default_effort: null,
+      default_tone: null,
+      created_at: now(),
+    };
+    createMessagingGroupAgent({ ...base, id: 'mga-bo', messaging_group_id: 'mg-bo', agent_group_id: 'bo' });
+    createMessagingGroupAgent({
+      ...base,
+      id: 'mga-bo-codex',
+      messaging_group_id: 'mg-bo-codex',
+      agent_group_id: 'bo-codex',
+    });
+    createMessagingGroupAgent({
+      ...base,
+      id: 'mga-unrelated',
+      messaging_group_id: 'mg-other',
+      agent_group_id: 'unrelated',
+    });
+  });
+
+  it('returns sibling on same platform_id but different channel_type adapter', async () => {
+    const { getChannelPeers } = await import('./messaging-groups.js');
+    const peers = getChannelPeers('mg-bo', 'bo');
+    expect(peers).toHaveLength(1);
+    expect(peers[0].agent_group_id).toBe('bo-codex');
+    expect(peers[0].name).toBe('Bo-codex');
+    expect(peers[0].channel_type).toBe('slack-mr-codex');
+  });
+
+  it('excludes self from peer list', async () => {
+    const { getChannelPeers } = await import('./messaging-groups.js');
+    const peers = getChannelPeers('mg-bo', 'bo');
+    expect(peers.map((p) => p.agent_group_id)).not.toContain('bo');
+  });
+
+  it('excludes unrelated agents on different platform_id', async () => {
+    const { getChannelPeers } = await import('./messaging-groups.js');
+    const peers = getChannelPeers('mg-bo', 'bo');
+    expect(peers.map((p) => p.agent_group_id)).not.toContain('unrelated');
+  });
+
+  it('returns empty when the agent has no siblings on the channel', async () => {
+    const { getChannelPeers } = await import('./messaging-groups.js');
+    const peers = getChannelPeers('mg-other', 'unrelated');
+    expect(peers).toHaveLength(0);
+  });
+});
+
 // ── Sessions ──
 
 describe('sessions', () => {

@@ -143,6 +143,36 @@ describe('XML escaping', () => {
   });
 });
 
+describe('sender_id attribute (canonical @-mention target)', () => {
+  it('emits sender_id from top-level senderId field', () => {
+    insertMessage('m1', 'chat', { sender: 'Dave', senderId: 'U0B4AQ2UHPS', text: 'hi' });
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('sender_id="U0B4AQ2UHPS"');
+  });
+
+  it('falls back to author.userId when senderId is absent', () => {
+    insertMessage('m1', 'chat', {
+      sender: 'Dave',
+      author: { userId: 'U0B4AQ2UHPS', fullName: 'Dave Kim' },
+      text: 'hi',
+    });
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('sender_id="U0B4AQ2UHPS"');
+  });
+
+  it('omits sender_id when neither field is present', () => {
+    insertMessage('m1', 'chat', { sender: 'CLI', text: 'system msg' });
+    const result = formatMessages(getPendingMessages());
+    expect(result).not.toContain('sender_id=');
+  });
+
+  it('XML-escapes sender_id (defense-in-depth, even though platform ids are alphanumeric)', () => {
+    insertMessage('m1', 'chat', { sender: 'X', senderId: 'a&b"c', text: 'hi' });
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain('sender_id="a&amp;b&quot;c"');
+  });
+});
+
 describe('trigger-flag split', () => {
   it('all-trigger-1 batch renders as the legacy single <message> (one row)', () => {
     insertMessage('m1', 'chat', { sender: 'Alice', text: 'hi' }, { trigger: 1 });

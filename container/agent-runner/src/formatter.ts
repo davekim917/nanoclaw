@@ -310,8 +310,19 @@ function formatSingleChat(msg: MessageInRow): string {
   const attachmentsSuffix = formatAttachments(content.attachments);
 
   const fromAttr = originAttr(msg);
+  // Surface the platform-side sender user_id so the agent can build
+  // canonical `<@USER_ID>` mentions when replying to the sender (humans
+  // OR bots). Slack `auth.test` returns the user_id without the channel-
+  // type prefix; Discord uses bare snowflakes. This sidesteps the
+  // "@Dave" vs "@Dave.kim" prose-name ambiguity by giving the model the
+  // authoritative id to wrap. Omitted when the inbound envelope has no
+  // senderId (e.g. system/CLI messages).
+  const senderId = content.senderId || content.author?.userId;
+  const senderIdAttr = typeof senderId === 'string' && senderId.length > 0
+    ? ` sender_id="${escapeXml(senderId)}"`
+    : '';
 
-  return `<message${idAttr}${fromAttr} sender="${escapeXml(sender)}" time="${escapeXml(time)}"${replyAttr}>${replyPrefix}${escapeXml(text)}${attachmentsSuffix}</message>`;
+  return `<message${idAttr}${fromAttr} sender="${escapeXml(sender)}"${senderIdAttr} time="${escapeXml(time)}"${replyAttr}>${replyPrefix}${escapeXml(text)}${attachmentsSuffix}</message>`;
 }
 
 /**
