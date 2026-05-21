@@ -1260,6 +1260,13 @@ function buildMounts(
     // now operators must explicitly grant Codex host auth per group.
     if (containerConfig.codexHostAuth === true && !excluded.has('codex') && entries.includes('codex')) {
       const providerHasCodexMount = providerContribution.mounts?.some((m) => m.containerPath === '/home/node/.codex');
+
+      // Primary host-codex mount fires only when the provider didn't
+      // already contribute one. provider=codex paths bring their own
+      // session-local copy of auth.json at /home/node/.codex (see
+      // src/providers/codex.ts's container-config registry contribution);
+      // codex-as-peer setups (provider=claude with the codex plugin) rely
+      // on this block to surface the host's ~/.codex directly.
       if (!providerHasCodexMount) {
         // Per-group resolution: ~/.codex-<folder>/ wins if it has an
         // auth.json, otherwise fall back to the global ~/.codex/.
@@ -1294,22 +1301,37 @@ function buildMounts(
               });
             }
           }
-
-          // codexAuthFallbacks: ordered list of additional ~/.codex* dirs to
-          // mount as fallback OAuth identities. Resolution + filtering lives
-          // in `resolveCodexAuthFallbacks` so the env-forward block (in the
-          // spawn-args builder) can compute the same list without duplicating
-          // logic. Each survivor mounts at /home/node/.codex-fallback-N/ in
-          // declared order; the container provider reads CODEX_FALLBACK_HOMES
-          // and rotates on UsageLimitExceeded / ServerOverloaded / coarse-
-          // systemError. RW for parity with the primary mount (codex
-          // refresh-rotates tokens in-place).
-          const resolved = resolveCodexAuthFallbacks(containerConfig.codexAuthFallbacks, hostCodex);
-          resolved.forEach((entry) => {
-            mounts.push({ hostPath: entry.hostPath, containerPath: entry.containerPath, readonly: false });
-          });
         }
       }
+
+      // codexAuthFallbacks: ordered list of additional ~/.codex* dirs to
+      // mount as fallback OAuth identities. INDEPENDENT of the primary
+      // mount source — fallbacks target /home/node/.codex-fallback-N/
+      // which never conflicts with /home/node/.codex. So they fire
+      // regardless of whether the primary came from the provider's
+      // per-session copy (provider=codex, the original MR-codex case) or
+      // from the direct host mount above (codex-as-peer). Without this
+      // independence the fallback was effectively dead code for the very
+      // configuration we built it for.
+      //
+      // Resolution + filtering lives in `resolveCodexAuthFallbacks`; each
+      // survivor mounts at /home/node/.codex-fallback-N/ in declared order.
+      // The container provider reads CODEX_FALLBACK_HOMES and rotates on
+      // UsageLimitExceeded / ServerOverloaded / coarse-systemError. RW
+      // because codex refresh-rotates tokens in-place.
+      //
+      // primaryHostPath for dedup uses resolveCodexAuthDir — the host path
+      // the primary auth came from, regardless of whether the actual
+      // /home/node/.codex mount source is that path or a session-local
+      // copy. Lets a fallback declaration matching the primary be skipped.
+      const primaryHostPath = resolveCodexAuthDir(agentGroup.folder);
+      const resolvedFallbacks = resolveCodexAuthFallbacks(
+        containerConfig.codexAuthFallbacks,
+        primaryHostPath,
+      );
+      resolvedFallbacks.forEach((entry) => {
+        mounts.push({ hostPath: entry.hostPath, containerPath: entry.containerPath, readonly: false });
+      });
     }
   }
 
