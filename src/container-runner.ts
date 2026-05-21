@@ -1986,35 +1986,36 @@ async function buildContainerArgs(
   // shell) or no other agent is wired to the platform channel. The
   // container treats absence as "no peers" and omits the section.
   if (sessionMessagingGroupId) {
-    const { getChannelPeers } = await import('./db/messaging-groups.js');
+    const { getChannelPeers, getMessagingGroup } = await import('./db/messaging-groups.js');
     const { getSlackBotDisplayName, getKnownSlackBots } = await import('./channels/slack-mentions.js');
-    const { getDiscordBotDisplayName } = await import('./channels/discord.js');
+    const { getDiscordBotDisplayName, getKnownDiscordBots } = await import('./channels/discord.js');
     const peers = getChannelPeers(sessionMessagingGroupId, agentGroup.id);
     const slackBots = getKnownSlackBots();
+    const discordBots = getKnownDiscordBots();
     const peerEntries = peers.map((p) => {
-      // Prefer the user_id from the channel-scoped bot registry. Slack and
-      // Discord both populate by channel_type during adapter init.
+      // Look up user_id in EITHER registry — channel_type is the disjoint
+      // key (Slack channel_types start with `slack-`, Discord with
+      // `discord-`). Slack registry wins when both happen to be populated
+      // for a given channel_type (shouldn't occur in practice).
       const slackBot = slackBots.get(p.channel_type);
+      const discordBot = discordBots.get(p.channel_type);
       let userId: string | undefined;
-      let name: string;
+      let name: string = p.name;
       if (slackBot) {
         userId = slackBot.userId;
         name = getSlackBotDisplayName(p.channel_type) ?? p.name;
-      } else {
-        // Discord registry doesn't expose its identity map — we surface the
-        // username only when present; user_id is omitted (rewriter on the
-        // outbound side still resolves `@Name` → `<@id>` for Discord).
-        const discordName = getDiscordBotDisplayName(p.channel_type);
-        name = discordName ?? p.name;
+      } else if (discordBot) {
+        userId = discordBot.userId;
+        name = getDiscordBotDisplayName(p.channel_type) ?? p.name;
       }
       return { name, userId };
     });
-    // Self user_id — same registry, indexed by THIS session's channel_type.
-    const selfMg = (await import('./db/messaging-groups.js')).getMessagingGroup(sessionMessagingGroupId);
+    // Self user_id — same dual-registry lookup. Discord-only sessions
+    // also get the self-mention guard text in the runtime prompt.
+    const selfMg = getMessagingGroup(sessionMessagingGroupId);
     let selfUserId: string | undefined;
     if (selfMg) {
-      const selfBot = slackBots.get(selfMg.channel_type);
-      if (selfBot) selfUserId = selfBot.userId;
+      selfUserId = slackBots.get(selfMg.channel_type)?.userId ?? discordBots.get(selfMg.channel_type)?.userId;
     }
     if (peerEntries.length > 0 || selfUserId) {
       args.push('-e', `NANOCLAW_PEERS=${JSON.stringify({ self: { userId: selfUserId }, peers: peerEntries })}`);

@@ -239,6 +239,16 @@ export function getDiscordBotDisplayName(channelType: string): string | null {
   return knownDiscordBots.get(channelType)?.username ?? null;
 }
 
+/**
+ * Read-only view of the Discord bot registry. Mirrors `getKnownSlackBots`
+ * so callers needing the bot's canonical `userId` (for self-mention guard
+ * text or peer @-mention resolution) can index by channel_type without
+ * routing through the Slack registry.
+ */
+export function getKnownDiscordBots(): ReadonlyMap<string, DiscordBotIdentity> {
+  return knownDiscordBots;
+}
+
 // Cross-package channel for the patched chat-adapter. The patched
 // MessageCreate / reaction handlers in @chat-adapter/discord need to know
 // which bot ids belong to sibling NanoClaw bots in this process so they

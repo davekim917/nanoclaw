@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 
+import { getDb } from './connection.js';
 import {
   initTestDb,
   closeDb,
@@ -284,7 +285,11 @@ describe('getChannelPeers — sibling-adapter awareness', () => {
     // Two siblings (Bo / Bo-codex) on the SAME Slack channel are modeled as
     // two messaging_groups sharing platform_id but with channel_type that
     // differs per bot adapter. A third unrelated agent is wired to a totally
-    // separate channel to confirm cross-channel isolation.
+    // separate channel to confirm cross-channel isolation. All three share
+    // workgroup_id so the workgroup-scoping filter doesn't drop them. The
+    // cross-workgroup collision case is exercised in a separate describe
+    // block below.
+    getDb().prepare(`INSERT INTO workgroups (id, display_name, created_at) VALUES ('wg-mr', 'MR', ?)`).run(now());
     createAgentGroup({ id: 'bo', name: 'Bo', folder: 'bo', agent_provider: null, created_at: now() });
     createAgentGroup({
       id: 'bo-codex',
@@ -300,6 +305,7 @@ describe('getChannelPeers — sibling-adapter awareness', () => {
       agent_provider: null,
       created_at: now(),
     });
+    getDb().prepare(`UPDATE agent_groups SET workgroup_id = 'wg-mr' WHERE id IN ('bo','bo-codex','unrelated')`).run();
     createMessagingGroup({
       id: 'mg-bo',
       channel_type: 'slack-mr',
@@ -379,6 +385,113 @@ describe('getChannelPeers — sibling-adapter awareness', () => {
     const { getChannelPeers } = await import('./messaging-groups.js');
     const peers = getChannelPeers('mg-other', 'unrelated');
     expect(peers).toHaveLength(0);
+  });
+});
+
+describe('getChannelPeers — workgroup tenant boundary', () => {
+  beforeEach(() => {
+    // Two workgroups exist on the host. By engineered coincidence two
+    // independent Slack workspaces wire a channel that ends up storing the
+    // SAME platform_id `slack:C123COLLIDE`. Without workgroup scoping the
+    // peer query would cross-pollinate (return the wrong-workgroup agent
+    // as a "peer"). With workgroup scoping it must not.
+    getDb().prepare(`INSERT INTO workgroups (id, display_name, created_at) VALUES ('mr', 'MR', ?)`).run(now());
+    getDb()
+      .prepare(`INSERT INTO workgroups (id, display_name, created_at) VALUES ('illysium', 'Illysium', ?)`)
+      .run(now());
+    createAgentGroup({ id: 'bo', name: 'Bo', folder: 'bo', agent_provider: null, created_at: now() });
+    createAgentGroup({ id: 'illie', name: 'Illie', folder: 'illie', agent_provider: null, created_at: now() });
+    getDb().prepare(`UPDATE agent_groups SET workgroup_id = 'mr' WHERE id = 'bo'`).run();
+    getDb().prepare(`UPDATE agent_groups SET workgroup_id = 'illysium' WHERE id = 'illie'`).run();
+    createMessagingGroup({
+      id: 'mg-bo-collide',
+      channel_type: 'slack-mr',
+      platform_id: 'slack:C123COLLIDE',
+      name: 'general',
+      is_group: 1,
+      unknown_sender_policy: 'strict',
+      created_at: now(),
+    });
+    createMessagingGroup({
+      id: 'mg-illie-collide',
+      channel_type: 'slack-illysium',
+      platform_id: 'slack:C123COLLIDE',
+      name: 'general',
+      is_group: 1,
+      unknown_sender_policy: 'strict',
+      created_at: now(),
+    });
+    const base = {
+      engage_mode: 'mention' as const,
+      engage_pattern: null,
+      sender_scope: 'all' as const,
+      ignored_message_policy: 'accumulate' as const,
+      session_mode: 'per-thread' as const,
+      priority: 0,
+      default_model: null,
+      default_effort: null,
+      default_tone: null,
+      created_at: now(),
+    };
+    createMessagingGroupAgent({
+      ...base,
+      id: 'mga-bo-collide',
+      messaging_group_id: 'mg-bo-collide',
+      agent_group_id: 'bo',
+    });
+    createMessagingGroupAgent({
+      ...base,
+      id: 'mga-illie-collide',
+      messaging_group_id: 'mg-illie-collide',
+      agent_group_id: 'illie',
+    });
+  });
+
+  it('does not surface cross-workgroup agents even on identical platform_id (Slack workspace-id collision guard)', async () => {
+    const { getChannelPeers } = await import('./messaging-groups.js');
+    const peers = getChannelPeers('mg-bo-collide', 'bo');
+    expect(peers.map((p) => p.agent_group_id)).not.toContain('illie');
+    expect(peers).toHaveLength(0);
+  });
+
+  it('excludes agents with NULL workgroup_id when caller has a workgroup', async () => {
+    // Migrate an agent into the same platform_id but leave it with no
+    // workgroup. Should be excluded (NULL workgroup is never "same as" a
+    // real workgroup id).
+    createAgentGroup({
+      id: 'orphan',
+      name: 'Orphan',
+      folder: 'orphan',
+      agent_provider: null,
+      created_at: now(),
+    });
+    createMessagingGroup({
+      id: 'mg-orphan',
+      channel_type: 'slack-mr-codex',
+      platform_id: 'slack:C123COLLIDE',
+      name: 'general',
+      is_group: 1,
+      unknown_sender_policy: 'strict',
+      created_at: now(),
+    });
+    createMessagingGroupAgent({
+      id: 'mga-orphan',
+      messaging_group_id: 'mg-orphan',
+      agent_group_id: 'orphan',
+      engage_mode: 'mention',
+      engage_pattern: null,
+      sender_scope: 'all',
+      ignored_message_policy: 'accumulate',
+      session_mode: 'per-thread',
+      priority: 0,
+      default_model: null,
+      default_effort: null,
+      default_tone: null,
+      created_at: now(),
+    });
+    const { getChannelPeers } = await import('./messaging-groups.js');
+    const peers = getChannelPeers('mg-bo-collide', 'bo');
+    expect(peers.map((p) => p.agent_group_id)).not.toContain('orphan');
   });
 });
 
