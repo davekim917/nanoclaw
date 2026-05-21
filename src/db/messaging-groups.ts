@@ -235,6 +235,90 @@ export function getMessagingGroupAgentByPair(
     .get(messagingGroupId, agentGroupId) as MessagingGroupAgent | undefined;
 }
 
+/**
+ * Peer agent_groups operating on the same platform-side channel as
+ * `agentGroupId` — excluding the agent itself. Used by container-runner at
+ * spawn time to inject the in-channel peer roster into the runtime system
+ * prompt.
+ *
+ * Sibling adapter awareness: Bo and Bo-codex on the SAME Slack channel
+ * have SEPARATE NanoClaw messaging_groups (one per bot adapter:
+ * `slack-madisonreed` for Bo, `slack-madisonreed-codex` for Bo-codex)
+ * even though Slack-side they're in the same channel. The shared identity
+ * is `messaging_groups.platform_id` (the Slack channel id / Discord
+ * snowflake). Matching on platform_id rather than messaging_group_id
+ * surfaces siblings across adapters; matching on messaging_group_id alone
+ * would miss Bo-codex when querying from Bo's session.
+ *
+ * Tenant scoping: peers are additionally constrained to share `workgroup_id`
+ * with self. Slack channel IDs are workspace-scoped (only unique per
+ * workspace, not globally), so a `slack:C123` in workspace A could in
+ * principle collide with `slack:C123` in workspace B if both were ever
+ * wired into the same NanoClaw install. Workgroup is the authoritative
+ * multi-tenant boundary (docs/workgroups.md) so requiring a workgroup match
+ * makes the lookup correct by construction rather than by luck. Pre-
+ * migration-036 schemas don't have the column — fall back to platform-only
+ * matching (the prior behavior) when the column is absent.
+ *
+ * The peer's bot user_id (for canonical `<@U…>` mentions) is resolved by
+ * the caller from `knownSlackBots`/`knownDiscordBots` keyed by the peer's
+ * `channel_type` (which IS distinct per adapter and tells us which
+ * registry entry to look up).
+ */
+export interface ChannelPeer {
+  agent_group_id: string;
+  name: string;
+  /** channel_type of THIS peer's wiring on the platform channel — used to
+   *  index `knownSlackBots`/`knownDiscordBots` for the peer's bot user_id. */
+  channel_type: string;
+}
+
+export function getChannelPeers(messagingGroupId: string, agentGroupId: string): ChannelPeer[] {
+  const db = getDb();
+  const cols = db.prepare(`PRAGMA table_info(agent_groups)`).all() as Array<{ name: string }>;
+  const hasWorkgroupId = cols.some((c) => c.name === 'workgroup_id');
+  // Workgroup-scoped query (post-migration-036). The self-side workgroup is
+  // resolved by joining agent_groups twice: once for the peer (ag), once for
+  // self (ag_self via mga_self.agent_group_id from THIS session's mg + caller).
+  // Same-workgroup filter sits next to the platform_id filter so siblings in
+  // OTHER workgroups are correctly excluded even if a Slack channel-id
+  // collision were to occur.
+  if (hasWorkgroupId) {
+    return db
+      .prepare(
+        `SELECT ag.id   AS agent_group_id,
+                ag.name AS name,
+                mg.channel_type AS channel_type
+         FROM   messaging_group_agents mga
+         JOIN   agent_groups     ag      ON ag.id = mga.agent_group_id
+         JOIN   messaging_groups mg      ON mg.id = mga.messaging_group_id
+         JOIN   messaging_groups mg_self ON mg_self.id = ?
+         JOIN   agent_groups     ag_self ON ag_self.id = ?
+         WHERE  mg.platform_id    = mg_self.platform_id
+           AND  mga.agent_group_id != ?
+           AND  ag.workgroup_id IS NOT NULL
+           AND  ag.workgroup_id = ag_self.workgroup_id
+         ORDER BY ag.name`,
+      )
+      .all(messagingGroupId, agentGroupId, agentGroupId) as ChannelPeer[];
+  }
+  // Pre-036 fallback: platform_id only (no workgroup column to filter on).
+  return db
+    .prepare(
+      `SELECT ag.id   AS agent_group_id,
+              ag.name AS name,
+              mg.channel_type AS channel_type
+       FROM   messaging_group_agents mga
+       JOIN   agent_groups     ag      ON ag.id = mga.agent_group_id
+       JOIN   messaging_groups mg      ON mg.id = mga.messaging_group_id
+       JOIN   messaging_groups mg_self ON mg_self.id = ?
+       WHERE  mg.platform_id    = mg_self.platform_id
+         AND  mga.agent_group_id != ?
+       ORDER BY ag.name`,
+    )
+    .all(messagingGroupId, agentGroupId) as ChannelPeer[];
+}
+
 export function getMessagingGroupAgent(id: string): MessagingGroupAgent | undefined {
   return getDb().prepare('SELECT * FROM messaging_group_agents WHERE id = ?').get(id) as
     | MessagingGroupAgent

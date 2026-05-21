@@ -1967,6 +1967,61 @@ async function buildContainerArgs(
     // buildSystemPromptAddendum already treats absence as "no workgroup".
   }
 
+  // Peer identity injection — every agent_group operating on the same
+  // platform-side channel as THIS session, with its bot user_id resolved
+  // for canonical `<@U…>` mentions. The container's
+  // buildSystemPromptAddendum reads NANOCLAW_PEERS and renders an
+  // identity block: "You are X (<@uid>). Peers: ...". This gives the
+  // model an explicit name→user_id mapping per turn so prose handoff
+  // ("@Bo-codex" → `<@U0B3X1QUAKV>`) doesn't depend on chat-history
+  // inference. Self user_id is included separately so the agent
+  // recognizes inbound @-mentions to itself.
+  //
+  // Sibling-adapter awareness: Bo and Bo-codex on the same Slack channel
+  // have separate messaging_groups (one per bot adapter). getChannelPeers
+  // matches on messaging_groups.platform_id, surfacing peers across
+  // sibling adapters. See src/db/messaging-groups.ts for the rationale.
+  //
+  // Empty when the agent has no session-side messaging_group (admin/cli
+  // shell) or no other agent is wired to the platform channel. The
+  // container treats absence as "no peers" and omits the section.
+  if (sessionMessagingGroupId) {
+    const { getChannelPeers, getMessagingGroup } = await import('./db/messaging-groups.js');
+    const { getSlackBotDisplayName, getKnownSlackBots } = await import('./channels/slack-mentions.js');
+    const { getDiscordBotDisplayName, getKnownDiscordBots } = await import('./channels/discord.js');
+    const peers = getChannelPeers(sessionMessagingGroupId, agentGroup.id);
+    const slackBots = getKnownSlackBots();
+    const discordBots = getKnownDiscordBots();
+    const peerEntries = peers.map((p) => {
+      // Look up user_id in EITHER registry — channel_type is the disjoint
+      // key (Slack channel_types start with `slack-`, Discord with
+      // `discord-`). Slack registry wins when both happen to be populated
+      // for a given channel_type (shouldn't occur in practice).
+      const slackBot = slackBots.get(p.channel_type);
+      const discordBot = discordBots.get(p.channel_type);
+      let userId: string | undefined;
+      let name: string = p.name;
+      if (slackBot) {
+        userId = slackBot.userId;
+        name = getSlackBotDisplayName(p.channel_type) ?? p.name;
+      } else if (discordBot) {
+        userId = discordBot.userId;
+        name = getDiscordBotDisplayName(p.channel_type) ?? p.name;
+      }
+      return { name, userId };
+    });
+    // Self user_id — same dual-registry lookup. Discord-only sessions
+    // also get the self-mention guard text in the runtime prompt.
+    const selfMg = getMessagingGroup(sessionMessagingGroupId);
+    let selfUserId: string | undefined;
+    if (selfMg) {
+      selfUserId = slackBots.get(selfMg.channel_type)?.userId ?? discordBots.get(selfMg.channel_type)?.userId;
+    }
+    if (peerEntries.length > 0 || selfUserId) {
+      args.push('-e', `NANOCLAW_PEERS=${JSON.stringify({ self: { userId: selfUserId }, peers: peerEntries })}`);
+    }
+  }
+
   // v1 settings.json env block (src/container-runner.ts:1703-1709): SDK
   // capabilities that need explicit opt-in. Porting as plain env since
   // v2's container reads env, not a settings.json mount point.

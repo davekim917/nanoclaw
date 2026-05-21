@@ -108,15 +108,28 @@ export function buildSystemPromptAddendum(assistantName?: string): string {
     // grounded in "my workgroup is X" reach the right peers and data pool.
     const workgroupId =
       typeof process !== 'undefined' ? process.env?.NANOCLAW_WORKGROUP_ID : undefined;
+    // Peer identity injection — NANOCLAW_PEERS is set by container-runner
+    // per spawn with the in-channel peer agents (auto-derived from
+    // messaging_group platform_id). Surfacing explicit name → user_id
+    // mapping in the runtime prompt prevents the prose-handoff failure
+    // mode where Bo wrote "@Bo" instead of "@Bo-codex" because the model
+    // collapsed the shared display-name prefix to self-reference.
+    const peerSpec = readPeersFromEnv();
+    const selfUserId = peerSpec?.self?.userId;
     const headerLines = [
       '# You are ' + assistantName,
       '',
-      `Your name is **${assistantName}**. Use it when the channel asks who you are, when introducing yourself, and when signing any message that explicitly calls for a signature.`,
+      selfUserId
+        ? `Your name is **${assistantName}** (canonical user_id \`<@${selfUserId}>\`). Use the name when the channel asks who you are, when introducing yourself, and when signing any message that explicitly calls for a signature. If you see \`<@${selfUserId}>\` in an inbound message, someone is talking to YOU — never @-mention yourself in outbound.`
+        : `Your name is **${assistantName}**. Use it when the channel asks who you are, when introducing yourself, and when signing any message that explicitly calls for a signature.`,
     ];
     if (workgroupId) {
       headerLines.push('', `Your workgroup is **${workgroupId}** — this is the multi-agent tenant boundary you operate under. Peers in the same workgroup share your chat archive and memory; agents in other workgroups do not.`);
     }
     sections.push(headerLines.join('\n'));
+
+    const peerSection = buildPeersSection(peerSpec?.peers ?? []);
+    if (peerSection) sections.push(peerSection);
   }
 
   // Communication invariants the NanoClaw harness relies on across every
@@ -141,6 +154,73 @@ export function buildSystemPromptAddendum(assistantName?: string): string {
   sections.push(buildDestinationsSection());
 
   return sections.join('\n\n');
+}
+
+/**
+ * Per-peer entry the host writes into NANOCLAW_PEERS.
+ */
+interface PeerEntry {
+  name: string;
+  userId?: string;
+}
+
+interface PeerSpec {
+  self?: { userId?: string };
+  peers: PeerEntry[];
+}
+
+/**
+ * Parse NANOCLAW_PEERS env. Fails soft — returns undefined on any error or
+ * if the env is unset. Host sets it as JSON `{ self: { userId }, peers: [
+ * { name, userId? }, ... ] }`. Container-runner's resolver computes the
+ * payload per spawn via `getChannelPeers` + bot registry lookup.
+ */
+function readPeersFromEnv(): PeerSpec | undefined {
+  const raw = typeof process !== 'undefined' ? process.env?.NANOCLAW_PEERS : undefined;
+  if (!raw) return undefined;
+  try {
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object' && Array.isArray(parsed.peers)) {
+      return parsed as PeerSpec;
+    }
+  } catch {
+    // ignore — fall through to undefined
+  }
+  return undefined;
+}
+
+/**
+ * Render the "## Peer agents in this channel" block. Each peer is listed
+ * with name + (when available) canonical user_id so the agent has an
+ * unambiguous @-mention target.
+ */
+function buildPeersSection(peers: PeerEntry[]): string | null {
+  const cleaned = peers
+    .map((p) => ({
+      name: typeof p?.name === 'string' ? sanitizeDisplayName(p.name) : '',
+      userId: typeof p?.userId === 'string' && /^[\w]+$/.test(p.userId) ? p.userId : undefined,
+    }))
+    .filter((p) => p.name.length > 0);
+  if (cleaned.length === 0) return null;
+
+  const lines = ['## Peer agents in this channel', ''];
+  if (cleaned.length === 1) {
+    const p = cleaned[0];
+    const idSuffix = p.userId ? ` (canonical user_id \`<@${p.userId}>\`)` : '';
+    lines.push(`You are sharing this channel with **${p.name}**${idSuffix}.`);
+  } else {
+    lines.push('You are sharing this channel with these peers:');
+    lines.push('');
+    for (const p of cleaned) {
+      const idSuffix = p.userId ? ` (\`<@${p.userId}>\`)` : '';
+      lines.push(`- **${p.name}**${idSuffix}`);
+    }
+  }
+  lines.push('');
+  lines.push(
+    'When referring to a peer in prose, use their full name from the list above — never a shared display-name prefix or shortened form. To hand off active work or coordinate next steps, end your reply by `@`-mentioning the peer (e.g. `@<Name>`); the outbound rewriter resolves it to the peer\'s canonical user_id syntax. Stop @-mentioning only when the work is verifiably DONE.',
+  );
+  return lines.join('\n');
 }
 
 function buildDestinationsSection(): string {
