@@ -10,6 +10,7 @@ import {
   augmentWithProxyEnv,
   copyRolloutToFallback,
   extractImageGenerationPath,
+  findNewestRolloutAcrossHomes,
   findRolloutFile,
   materializeRawImageGeneration,
   resolveClaudeImports,
@@ -772,6 +773,134 @@ describe('codex OAuth fallback — rotation primitives', () => {
     it('codex_system_error → classification "system_error"', () => {
       const src = fs.readFileSync(new URL('./codex.ts', import.meta.url), 'utf8');
       expect(src).toMatch(/codex_system_error[\s\S]{0,150}classification\s*=\s*['"]system_error['"]/);
+    });
+  });
+
+  describe('findNewestRolloutAcrossHomes', () => {
+    // Cross-container repair selector: scan multiple CODEX_HOMEs for a
+    // rollout matching the threadId, pick the freshest by (mtime DESC,
+    // size DESC). Size is the tiebreaker because mtimes can be near-equal
+    // after the in-session rotation's copyFileSync — codex rollouts are
+    // append-only so the larger file has more turns.
+
+    function makeHome(): string {
+      return fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-codex-newest-'));
+    }
+
+    function writeRollout(home: string, dateSubpath: string, threadId: string, content: string, mtimeMs?: number): string {
+      const dir = path.join(home, 'sessions', dateSubpath);
+      fs.mkdirSync(dir, { recursive: true });
+      const file = path.join(dir, `rollout-2026-05-21T03-15-00-${threadId}.jsonl`);
+      fs.writeFileSync(file, content);
+      if (mtimeMs !== undefined) {
+        const t = mtimeMs / 1000;
+        fs.utimesSync(file, t, t);
+      }
+      return file;
+    }
+
+    it('returns null when threadId is not present in any home', () => {
+      const h1 = makeHome();
+      const h2 = makeHome();
+      expect(findNewestRolloutAcrossHomes('019dd6dc-aaaa-bbbb-cccc-deadbeef0001', [h1, h2])).toBeNull();
+    });
+
+    it('returns null gracefully when sessions dirs are missing entirely', () => {
+      // Brand-new CODEX_HOMEs with no sessions/ subtree yet — common for
+      // fallback dirs that haven't been written to.
+      const h1 = makeHome();
+      // do NOT create sessions/ — verify we don't throw
+      expect(findNewestRolloutAcrossHomes('019dd6dc-ad2c-7071-a95f-08d8dcd11dc8', [h1])).toBeNull();
+    });
+
+    it('handles empty homes array', () => {
+      expect(findNewestRolloutAcrossHomes('019dd6dc-ad2c-7071-a95f-08d8dcd11dc8', [])).toBeNull();
+    });
+
+    it('returns the only home that has the rollout when others lack it', () => {
+      const primary = makeHome();
+      const fallback = makeHome();
+      const tid = '019dd6dc-ad2c-7071-a95f-08d8dcd11dc8';
+      const file = writeRollout(primary, '2026/05/21', tid, 'meta\nturn1\n');
+      const result = findNewestRolloutAcrossHomes(tid, [primary, fallback]);
+      expect(result).not.toBeNull();
+      expect(result!.home).toBe(primary);
+      expect(result!.path).toBe(file);
+    });
+
+    it('picks fallback when its mtime is newer than primary', () => {
+      const primary = makeHome();
+      const fallback = makeHome();
+      const tid = '019dd6dc-ad2c-7071-a95f-08d8dcd11dc8';
+      writeRollout(primary, '2026/05/21', tid, 'pre-rotation\n', 1_000_000);
+      writeRollout(fallback, '2026/05/21', tid, 'post-rotation\nturn2\n', 2_000_000);
+      const result = findNewestRolloutAcrossHomes(tid, [primary, fallback]);
+      expect(result!.home).toBe(fallback);
+    });
+
+    it('tiebreaker: when mtimes are equal, larger size wins', () => {
+      const primary = makeHome();
+      const fallback = makeHome();
+      const tid = '019dd6dc-ad2c-7071-a95f-08d8dcd11dc8';
+      writeRollout(primary, '2026/05/21', tid, 'short\n', 1_500_000);
+      writeRollout(fallback, '2026/05/21', tid, 'meta\nturn1\nturn2\nturn3\nturn4\n', 1_500_000);
+      const result = findNewestRolloutAcrossHomes(tid, [primary, fallback]);
+      // Same mtime, fallback has more bytes (more appended turns) → fallback wins
+      expect(result!.home).toBe(fallback);
+      expect(result!.size).toBeGreaterThan(result!.mtimeMs > 0 ? 6 : 0);
+    });
+
+    it('matches threadId case-insensitively', () => {
+      const home = makeHome();
+      const written = writeRollout(home, '2026/05/21', 'ABCDEF12-ABCD-7071-A95F-ABCDEF123456', 'x\n');
+      const result = findNewestRolloutAcrossHomes('abcdef12-abcd-7071-a95f-abcdef123456', [home]);
+      expect(result!.path).toBe(written);
+    });
+
+    it('walks the year/month/day tree across multiple subdirs', () => {
+      const home = makeHome();
+      const tid = '019dd6dc-deep-7071-a95f-08d8dcd11dc8';
+      const written = writeRollout(home, '2026/05/18', tid, 'multi-day-session\n');
+      // even though we look at "today" 2026/05/21, the rollout lives at its
+      // creation-date subdir 2026/05/18 — must still find it
+      expect(findNewestRolloutAcrossHomes(tid, [home])!.path).toBe(written);
+    });
+  });
+
+  describe('gen() cross-container rollout repair (source-anchored)', () => {
+    // Source-anchored to keep the resume-time repair pass invariant. The
+    // call must:
+    //   1. Live in gen() before startOrResumeCodexThread, so the resumed
+    //      thread sees the freshest history.
+    //   2. Be gated on self.fallbackHomes.length > 0 — zero-cost fast path
+    //      for installs without OAuth fallback.
+    //   3. Be gated on threadId being defined — fresh threads have nothing
+    //      to repair.
+    //   4. Copy via copyRolloutToFallback when the winner is in a non-
+    //      active home.
+    it('repair pass exists at gen() resume time with the required gates', () => {
+      const src = fs.readFileSync(new URL('./codex.ts', import.meta.url), 'utf8');
+      const codeOnly = src
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .split('\n')
+        .map((l) => {
+          const i = l.indexOf('//');
+          return i >= 0 ? l.slice(0, i) : l;
+        })
+        .join('\n');
+
+      // findNewestRolloutAcrossHomes is invoked from gen()
+      expect(codeOnly).toContain('findNewestRolloutAcrossHomes(');
+      // Gated on threadId + fallbacks (zero-cost fast path)
+      expect(codeOnly).toMatch(/threadId\s*&&\s*self\.fallbackHomes\.length\s*>\s*0/);
+      // The repair copy uses copyRolloutToFallback (reuses the rotation primitive)
+      expect(codeOnly).toMatch(/copyRolloutToFallback\([^)]*candidate\.path[^)]*candidate\.home[^)]*currentCodexHome/);
+      // The repair happens BEFORE startOrResumeCodexThread, not after
+      const repairIdx = codeOnly.indexOf('findNewestRolloutAcrossHomes(');
+      const resumeIdx = codeOnly.indexOf('await startOrResumeCodexThread(server, threadId, threadParams)');
+      expect(repairIdx).toBeGreaterThan(-1);
+      expect(resumeIdx).toBeGreaterThan(-1);
+      expect(repairIdx).toBeLessThan(resumeIdx);
     });
   });
 });

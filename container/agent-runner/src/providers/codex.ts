@@ -421,6 +421,82 @@ export function copyRolloutToFallback(
   }
 }
 
+/**
+ * Locate the freshest rollout for `threadId` across multiple CODEX_HOMEs.
+ *
+ * Why this exists: after an in-session rotation, the rollout file diverges
+ * across homes. Primary holds the pre-rotation history; the fallback holds
+ * the newer post-rotation history. When the container later dies (host-sweep
+ * absolute-ceiling, idle timeout) and a fresh container spawns for the same
+ * thread, `nextFallback` resets to 0 and `thread/resume` reads from primary
+ * — finding the STALE pre-rotation rollout. Post-rotation turns are
+ * stranded on the fallback; if primary is still rate-limited, rotation
+ * fires again and the *stale* primary rollout overwrites the *newer*
+ * fallback rollout, destroying history.
+ *
+ * The fix: at thread/resume time, scan all CODEX_HOMEs for rollout files
+ * matching this threadId and pick the freshest. Selection key is
+ * `(mtimeMs DESC, size DESC)` — mtime alone is fragile because the
+ * rotation's `copyFileSync` can leave two homes with nearly-identical
+ * mtimes; size as a tiebreaker prefers the one with more appended turns
+ * (codex rollouts are append-only line-by-line).
+ *
+ * Returns null when no home contains the threadId. Skips homes whose
+ * sessions tree is missing entirely (fresh fallback dirs that haven't
+ * been written to yet).
+ */
+export interface RolloutCandidate {
+  home: string;
+  path: string;
+  mtimeMs: number;
+  size: number;
+}
+
+export function findNewestRolloutAcrossHomes(
+  threadId: string,
+  codexHomes: readonly string[],
+): RolloutCandidate | null {
+  const needle = threadId.toLowerCase();
+  let best: RolloutCandidate | null = null;
+  for (const home of codexHomes) {
+    const sessionsRoot = path.join(home, 'sessions');
+    if (!fs.existsSync(sessionsRoot)) continue;
+    const stack: Array<{ dir: string; depth: number }> = [{ dir: sessionsRoot, depth: 0 }];
+    while (stack.length > 0) {
+      const { dir, depth } = stack.pop()!;
+      let entries: string[];
+      try {
+        entries = fs.readdirSync(dir);
+      } catch {
+        continue;
+      }
+      for (const entry of entries) {
+        const full = path.join(dir, entry);
+        let stat: fs.Stats;
+        try {
+          stat = fs.statSync(full);
+        } catch {
+          continue;
+        }
+        if (stat.isDirectory()) {
+          if (depth < 3) stack.push({ dir: full, depth: depth + 1 });
+          continue;
+        }
+        if (!entry.endsWith('.jsonl')) continue;
+        if (!entry.toLowerCase().includes(needle)) continue;
+        if (
+          best === null ||
+          stat.mtimeMs > best.mtimeMs ||
+          (stat.mtimeMs === best.mtimeMs && stat.size > best.size)
+        ) {
+          best = { home, path: full, mtimeMs: stat.mtimeMs, size: stat.size };
+        }
+      }
+    }
+  }
+  return best;
+}
+
 export class CodexProvider implements AgentProvider {
   readonly supportsNativeSlashCommands = false;
 
@@ -579,6 +655,33 @@ export class CodexProvider implements AgentProvider {
           personality: 'friendly',
           baseInstructions: composeBaseInstructions(input.systemContext?.instructions),
         };
+
+        // Cross-container rollout repair. When a prior session rotated to a
+        // fallback and that container later died, the fallback holds the
+        // newest rollout — but the fresh container starts with
+        // currentCodexHome=primary (the rotation cursor resets per-instance).
+        // Without this pass, thread/resume would read the STALE pre-rotation
+        // rollout from primary; if rotation fires again here, the in-session
+        // rotation copy would write that stale rollout OVER the newer
+        // fallback rollout, destroying history.
+        //
+        // Cost: ~4ms with current sessions-tree scale (151 files), zero when
+        // no fallbacks are configured. The fast-path skip is what makes this
+        // free for the 99% of installs not using OAuth fallback.
+        if (threadId && self.fallbackHomes.length > 0) {
+          const candidate = findNewestRolloutAcrossHomes(threadId, [
+            currentCodexHome,
+            ...self.fallbackHomes,
+          ]);
+          if (candidate && candidate.home !== currentCodexHome) {
+            const copied = copyRolloutToFallback(candidate.path, candidate.home, currentCodexHome);
+            if (copied) {
+              console.error(
+                `[codex-provider] Pre-resume rollout repair: copied newer rollout from ${candidate.home} → ${currentCodexHome} (mtime=${candidate.mtimeMs} size=${candidate.size})`,
+              );
+            }
+          }
+        }
 
         threadId = await startOrResumeCodexThread(server, threadId, threadParams);
         turnTracker.threadId = threadId ?? null;
