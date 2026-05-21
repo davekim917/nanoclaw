@@ -1325,10 +1325,7 @@ function buildMounts(
       // /home/node/.codex mount source is that path or a session-local
       // copy. Lets a fallback declaration matching the primary be skipped.
       const primaryHostPath = resolveCodexAuthDir(agentGroup.folder);
-      const resolvedFallbacks = resolveCodexAuthFallbacks(
-        containerConfig.codexAuthFallbacks,
-        primaryHostPath,
-      );
+      const resolvedFallbacks = resolveCodexAuthFallbacks(containerConfig.codexAuthFallbacks, primaryHostPath);
       resolvedFallbacks.forEach((entry) => {
         mounts.push({ hostPath: entry.hostPath, containerPath: entry.containerPath, readonly: false });
       });
