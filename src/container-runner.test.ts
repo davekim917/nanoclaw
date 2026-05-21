@@ -301,20 +301,14 @@ describe('resolveCodexAuthFallbacks', () => {
     writeAuth(path.join(home, '.codex'));
     // Primary is some scoped dir; fallback is the global ~/.codex
     const out = resolveCodexAuthFallbacks(['~/.codex'], path.join(home, '.codex-mr'), home);
-    expect(out).toEqual([
-      { hostPath: path.join(home, '.codex'), containerPath: '/home/node/.codex-fallback-1' },
-    ]);
+    expect(out).toEqual([{ hostPath: path.join(home, '.codex'), containerPath: '/home/node/.codex-fallback-1' }]);
   });
 
   it('skips entries without an auth.json (no false-positive mounts)', () => {
     const home = makeHome();
     writeAuth(path.join(home, '.codex'));
     // ~/.codex-missing has no auth.json — must be silently dropped
-    const out = resolveCodexAuthFallbacks(
-      ['~/.codex-missing', '~/.codex'],
-      path.join(home, '.codex-mr'),
-      home,
-    );
+    const out = resolveCodexAuthFallbacks(['~/.codex-missing', '~/.codex'], path.join(home, '.codex-mr'), home);
     expect(out).toHaveLength(1);
     expect(out[0]).toMatchObject({
       hostPath: path.join(home, '.codex'),
@@ -333,11 +327,7 @@ describe('resolveCodexAuthFallbacks', () => {
   it('dedupes within the declaration list (same path declared twice)', () => {
     const home = makeHome();
     writeAuth(path.join(home, '.codex'));
-    const out = resolveCodexAuthFallbacks(
-      ['~/.codex', '~/.codex'],
-      path.join(home, '.codex-mr'),
-      home,
-    );
+    const out = resolveCodexAuthFallbacks(['~/.codex', '~/.codex'], path.join(home, '.codex-mr'), home);
     expect(out).toHaveLength(1);
     expect(out[0].containerPath).toBe('/home/node/.codex-fallback-1');
   });

@@ -1304,10 +1304,7 @@ function buildMounts(
           // and rotates on UsageLimitExceeded / ServerOverloaded / coarse-
           // systemError. RW for parity with the primary mount (codex
           // refresh-rotates tokens in-place).
-          const resolved = resolveCodexAuthFallbacks(
-            containerConfig.codexAuthFallbacks,
-            hostCodex,
-          );
+          const resolved = resolveCodexAuthFallbacks(containerConfig.codexAuthFallbacks, hostCodex);
           resolved.forEach((entry) => {
             mounts.push({ hostPath: entry.hostPath, containerPath: entry.containerPath, readonly: false });
           });
