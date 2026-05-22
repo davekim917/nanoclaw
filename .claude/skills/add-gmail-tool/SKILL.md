@@ -143,7 +143,7 @@ Must complete cleanly. The new `pnpm install -g` layer is ~60s first time (cache
 
 ## Phase 3: Wire Per-Agent-Group
 
-For each agent group that should have Gmail (ask the user — typically their personal DM and CLI agents, sometimes shared household agents), persist two changes to the **central DB** (`data/v2.db`): the `mcpServers.gmail` entry and an `additionalMounts` entry for `.gmail-mcp`. Both flow through `materializeContainerJson` on every spawn, so editing `groups/<folder>/container.json` by hand does **not** stick — that file is regenerated from the DB.
+For each agent group that should have Gmail (ask the user — typically their personal DM and CLI agents, sometimes shared household agents), edit `groups/<folder>/container.json` directly: add a `mcpServers.gmail` entry and an `additionalMounts` entry for `.gmail-mcp`. The file is the canonical source the spawn path reads (via `readContainerConfig`); the `container_configs` DB row is a read-side projection backfilled from the file at host startup, not a sync target.
 
 ### List groups, pick which ones get Gmail
 
@@ -151,42 +151,59 @@ For each agent group that should have Gmail (ask the user — typically their pe
 ncl groups list
 ```
 
-### Register the MCP server
+### Register the MCP server + mount
 
-For each chosen `<group-id>`:
+For each chosen group folder, edit `groups/<folder>/container.json` to merge in:
 
-```bash
-ncl groups config add-mcp-server \
-  --id <group-id> \
-  --name gmail \
-  --command gmail-mcp \
-  --args '[]' \
-  --env '{"GMAIL_OAUTH_PATH":"/workspace/extra/.gmail-mcp/gcp-oauth.keys.json","GMAIL_CREDENTIALS_PATH":"/workspace/extra/.gmail-mcp/credentials.json"}'
+```json
+{
+  "mcpServers": {
+    "gmail": {
+      "type": "stdio",
+      "command": "gmail-mcp",
+      "args": [],
+      "env": {
+        "GMAIL_OAUTH_PATH": "/workspace/extra/.gmail-mcp/gcp-oauth.keys.json",
+        "GMAIL_CREDENTIALS_PATH": "/workspace/extra/.gmail-mcp/credentials.json"
+      }
+    }
+  },
+  "additionalMounts": [
+    {
+      "hostPath": "/home/<user>/.gmail-mcp",
+      "containerPath": ".gmail-mcp",
+      "readonly": false
+    }
+  ]
+}
 ```
 
-Approval behaviour depends on where you run it: from inside an agent's container `ncl` write verbs are approval-gated (admin approves before it lands); from a host operator shell with full scope, it executes immediately. Either way, the response tells you which path it took.
-
-### Add the `.gmail-mcp` mount
-
-There is no `ncl groups config add-mount` verb yet (tracked in [#2395](https://github.com/nanocoai/nanoclaw/issues/2395)). Until that ships, edit the DB directly via the in-tree wrapper (`scripts/q.ts` — `setup/verify.ts:5` codifies that NanoClaw avoids depending on the `sqlite3` CLI binary, so don't shell out to it):
+Or scripted with `jq`:
 
 ```bash
-GROUP_ID='<group-id>'
+FOLDER=<group-folder>
 HOST_PATH="$HOME/.gmail-mcp"
-MOUNT=$(jq -cn --arg h "$HOST_PATH" '{hostPath:$h, containerPath:".gmail-mcp", readonly:false}')
-pnpm exec tsx scripts/q.ts data/v2.db "UPDATE container_configs \
-  SET additional_mounts = json_insert(additional_mounts, '\$[#]', json('$MOUNT')), \
-      updated_at = datetime('now') \
-  WHERE agent_group_id = '$GROUP_ID';"
+jq --arg h "$HOST_PATH" '
+  .mcpServers["gmail"] = {
+    "type": "stdio",
+    "command": "gmail-mcp",
+    "args": [],
+    "env": {
+      "GMAIL_OAUTH_PATH": "/workspace/extra/.gmail-mcp/gcp-oauth.keys.json",
+      "GMAIL_CREDENTIALS_PATH": "/workspace/extra/.gmail-mcp/credentials.json"
+    }
+  } |
+  .additionalMounts += [{
+    "hostPath": $h,
+    "containerPath": ".gmail-mcp",
+    "readonly": false
+  }]
+' groups/$FOLDER/container.json > /tmp/cj.json && mv /tmp/cj.json groups/$FOLDER/container.json
 ```
 
-Run from your NanoClaw project root (where `data/v2.db` lives). The `$[#]` placeholder is SQLite JSON1's append-to-end notation; it's `\$`-escaped so bash doesn't arithmetic-expand it before sqlite sees it. `updated_at` is ISO-string everywhere else in the schema, so use `datetime('now')` — not `strftime('%s','now')`, which would silently mix epoch ints into a column of YYYY-MM-DD HH:MM:SS strings.
+`containerPath` is relative — `mount-security` rejects absolute paths. Additional mounts land at `/workspace/extra/<relative>`, so `containerPath: ".gmail-mcp"` resolves to `/workspace/extra/.gmail-mcp` inside the container. The MCP server's `GMAIL_OAUTH_PATH` / `GMAIL_CREDENTIALS_PATH` env vars point at that absolute location.
 
-**Switch to `ncl groups config add-mount` once #2395 lands.** Update this skill at that time.
-
-**Why the container path is relative:** `mount-security` rejects absolute `containerPath` values. Additional mounts are prefixed with `/workspace/extra/`, so `containerPath: ".gmail-mcp"` lands at `/workspace/extra/.gmail-mcp`. The MCP server's `GMAIL_OAUTH_PATH` / `GMAIL_CREDENTIALS_PATH` env vars point at that absolute location inside the container.
-
-**Why this can't be `groups/<folder>/container.json`:** post-migration `014-container-configs`, `materializeContainerJson` in `src/container-config.ts` rewrites that file from the DB on every spawn. Anything hand-edited there is silently overwritten on next restart.
+> **Note — `ncl groups config add-mcp-server` is currently DB-only:** the verb writes to `container_configs.mcp_servers` (DB) but the spawn path reads from `groups/<folder>/container.json` (file). DB-only writes get overwritten by `backfill-container-configs` on the next host startup. Prefer direct file edits until that gap closes; if you do use the verb, mirror the change to the file too.
 
 ## Phase 4: Build and Restart
 

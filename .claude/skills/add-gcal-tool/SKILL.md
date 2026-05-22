@@ -130,46 +130,61 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
 
 ## Phase 3: Wire Per-Agent-Group
 
-For each agent group, persist two changes to the **central DB** (`data/v2.db`): the `mcpServers.calendar` entry and an `additionalMounts` entry for `.calendar-mcp`. Both flow through `materializeContainerJson` on every spawn, so editing `groups/<folder>/container.json` by hand does **not** stick — that file is regenerated from the DB.
+For each agent group, edit `groups/<folder>/container.json` directly: add a `mcpServers.calendar` entry and an `additionalMounts` entry for `.calendar-mcp`. The file is the canonical source the spawn path reads (via `readContainerConfig`); the `container_configs` DB row is a read-side projection backfilled from the file at host startup, not a sync target.
 
-### Register the MCP server
+### Register the MCP server + mount
 
-For each chosen `<group-id>` (use `ncl groups list` to enumerate):
+For each chosen group folder (use `ncl groups list` for the mapping), edit `groups/<folder>/container.json` to merge in:
 
-```bash
-ncl groups config add-mcp-server \
-  --id <group-id> \
-  --name calendar \
-  --command google-calendar-mcp \
-  --args '[]' \
-  --env '{"GOOGLE_OAUTH_CREDENTIALS":"/workspace/extra/.calendar-mcp/gcp-oauth.keys.json","GOOGLE_CALENDAR_MCP_TOKEN_PATH":"/workspace/extra/.calendar-mcp/credentials.json"}'
+```json
+{
+  "mcpServers": {
+    "calendar": {
+      "type": "stdio",
+      "command": "google-calendar-mcp",
+      "args": [],
+      "env": {
+        "GOOGLE_OAUTH_CREDENTIALS": "/workspace/extra/.calendar-mcp/gcp-oauth.keys.json",
+        "GOOGLE_CALENDAR_MCP_TOKEN_PATH": "/workspace/extra/.calendar-mcp/credentials.json"
+      }
+    }
+  },
+  "additionalMounts": [
+    {
+      "hostPath": "/home/<user>/.calendar-mcp",
+      "containerPath": ".calendar-mcp",
+      "readonly": false
+    }
+  ]
+}
 ```
 
-Approval behaviour depends on where you run it: from inside an agent's container `ncl` write verbs are approval-gated (admin approves before it lands); from a host operator shell with full scope, it executes immediately. Either way, the response tells you which path it took.
-
-### Add the `.calendar-mcp` mount
-
-There is no `ncl groups config add-mount` verb yet (tracked in [#2395](https://github.com/nanocoai/nanoclaw/issues/2395)). Until that ships, edit the DB directly via the in-tree wrapper (`scripts/q.ts` — `setup/verify.ts:5` codifies that NanoClaw avoids depending on the `sqlite3` CLI binary, so don't shell out to it):
+Or scripted with `jq`:
 
 ```bash
-GROUP_ID='<group-id>'
+FOLDER=<group-folder>
 HOST_PATH="$HOME/.calendar-mcp"
-MOUNT=$(jq -cn --arg h "$HOST_PATH" '{hostPath:$h, containerPath:".calendar-mcp", readonly:false}')
-pnpm exec tsx scripts/q.ts data/v2.db "UPDATE container_configs \
-  SET additional_mounts = json_insert(additional_mounts, '\$[#]', json('$MOUNT')), \
-      updated_at = datetime('now') \
-  WHERE agent_group_id = '$GROUP_ID';"
+jq --arg h "$HOST_PATH" '
+  .mcpServers["calendar"] = {
+    "type": "stdio",
+    "command": "google-calendar-mcp",
+    "args": [],
+    "env": {
+      "GOOGLE_OAUTH_CREDENTIALS": "/workspace/extra/.calendar-mcp/gcp-oauth.keys.json",
+      "GOOGLE_CALENDAR_MCP_TOKEN_PATH": "/workspace/extra/.calendar-mcp/credentials.json"
+    }
+  } |
+  .additionalMounts += [{
+    "hostPath": $h,
+    "containerPath": ".calendar-mcp",
+    "readonly": false
+  }]
+' groups/$FOLDER/container.json > /tmp/cj.json && mv /tmp/cj.json groups/$FOLDER/container.json
 ```
 
-Run from your NanoClaw project root (where `data/v2.db` lives). The `$[#]` placeholder is SQLite JSON1's append-to-end notation; it's `\$`-escaped so bash doesn't arithmetic-expand it before sqlite sees it. `updated_at` is ISO-string everywhere else in the schema, so use `datetime('now')` — not `strftime('%s','now')`, which would silently mix epoch ints into a column of YYYY-MM-DD HH:MM:SS strings.
+`containerPath` is relative — mount-security rejects absolute paths, and additional mounts land at `/workspace/extra/<relative>`.
 
-**Switch to `ncl groups config add-mount` once #2395 lands.** Update this skill at that time.
-
-`containerPath` is relative (mount-security rejects absolute paths — additional mounts land at `/workspace/extra/<relative>`).
-
-**Why this can't be `groups/<folder>/container.json`:** post-migration `014-container-configs`, `materializeContainerJson` in `src/container-config.ts` rewrites that file from the DB on every spawn. Anything hand-edited there is silently overwritten on next restart.
-
-**Same-group-as-gmail tip:** if this group already has the gmail MCP + `.gmail-mcp` mount, both coexist — `ncl groups config add-mcp-server` only updates the named entry, and `json_insert` appends to `additional_mounts` without disturbing existing entries.
+> **Note — `ncl groups config add-mcp-server` is currently DB-only:** the verb at `src/cli/resources/groups.ts` writes to `container_configs.mcp_servers` (the DB) but the spawn path reads from `groups/<folder>/container.json` (the file). DB-only writes get overwritten by `backfill-container-configs` on the next host startup. Prefer direct file edits until that gap closes; if you do use the verb, mirror the change to the file too.
 
 ## Phase 4: Build and Restart
 

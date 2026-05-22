@@ -33,7 +33,7 @@ import './providers/index.js';
 import { createProvider, type ProviderName } from './providers/factory.js';
 import type { McpServerConfig } from './providers/types.js';
 import { runPollLoop } from './poll-loop.js';
-import { setupCodexRuntime, syncCodexSkillsMirror } from './codex-companion-setup.js';
+import { setupCodexRuntime, syncAgentSkillsMirror } from './codex-companion-setup.js';
 
 function log(msg: string): void {
   console.error(`[agent-runner] ${msg}`);
@@ -155,11 +155,15 @@ async function main(): Promise<void> {
   // Skills parity: populate `/home/node/.agents/skills/` unconditionally so
   // BOTH codex-primary (illie-codex) AND codex-as-peer (illie running the
   // codex companion) see the same plugin skills (humanizer, gitnexus-*,
-  // impeccable, etc.). Before splitting this out, the mirror only ran in
-  // the `providerName !== 'codex'` branch, so codex-primary sessions saw
-  // only Codex's built-in system skills — humanizer + every other plugin
-  // skill was invisible.
-  syncCodexSkillsMirror();
+  // impeccable, etc.). Pass runtime so runtime-specific denylists apply
+  // correctly — e.g., opencode runtime surfaces workflow-codex skills as
+  // text (since there's no codex-plugin loader on opencode), while codex
+  // runtime continues to deny them (loaded via .codex-plugin/ instead).
+  const skillRuntime: 'codex' | 'opencode' | 'claude' =
+    providerName === 'codex' ? 'codex' :
+    providerName === 'opencode' ? 'opencode' :
+    'claude';
+  syncAgentSkillsMirror(skillRuntime);
 
   // Container-local CODEX_HOME for codex-as-peer mode (invoked by Claude
   // via the codex-companion script). Builds ~/.codex-runtime/ with auth.json

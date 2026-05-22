@@ -60,33 +60,50 @@ import './opencode.js';
 
 ### 4. Add the agent-runner dependency
 
-Pinned. Bump deliberately, not with `bun update`. Use `1.4.17` — must match the `opencode-ai` CLI version pinned in step 5. The 1.14.x SDK has a completely different API and is **incompatible** with the current provider code.
+Pinned. Bump deliberately, not with `bun update`. Use `1.15.7` — must match the `opencode-ai` CLI version pinned in step 5. The SDK type surface is OpenAPI-generated and has been API-stable from 1.4.x through 1.15.x; older add-opencode skill copies warned that 1.14.x was incompatible, but a byte-level diff of `sdk.gen.d.ts` shows zero breaking changes.
 
 ```bash
-cd container/agent-runner && bun add @opencode-ai/sdk@1.4.17 && cd -
+cd container/agent-runner && bun add @opencode-ai/sdk@1.15.7 && cd -
 ```
 
 ### 5. Add `opencode-ai` to the container Dockerfile
 
 Two edits to `container/Dockerfile`, both idempotent (skip if already present):
 
-**(a)** In the "Pin CLI versions" ARG block (around line 18), add after `ARG VERCEL_VERSION=latest`:
+**(a)** In the "Pin CLI versions" ARG block (around line 45–57), add after `ARG CODEX_VERSION=...`:
 
 ```dockerfile
-ARG OPENCODE_VERSION=1.4.17
+ARG OPENCODE_VERSION=1.15.7
 ```
 
-> **Do not use `latest`** — the CLI and SDK must be the same version. `latest` silently upgrades the CLI to 1.14.x which has a breaking session API change (UUID session IDs → `ses_` prefix) incompatible with SDK 1.4.x.
+> **Pin to an exact version** — keep host CLI, container CLI, and SDK locked to the same release. `latest` works but caves to upstream cadence; bump deliberately when there's a reason.
 
-**(b)** In the `pnpm install -g` block (around line 80), append `"opencode-ai@${OPENCODE_VERSION}"` to the list:
+**(b)** In the "Illysium additions" `pnpm install -g` block (around line 339–344, the one that already lists `gitnexus`, `mermaid-cli`, `@googleworkspace/cli`, and `@openai/codex`), append `"opencode-ai@${OPENCODE_VERSION}"`:
 
 ```dockerfile
+RUN --mount=type=cache,target=/root/.cache/pnpm \
     pnpm install -g \
-        "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
-        "agent-browser@${AGENT_BROWSER_VERSION}" \
-        "vercel@${VERCEL_VERSION}" \
+        "gitnexus@${GITNEXUS_VERSION}" \
+        "@mermaid-js/mermaid-cli@${MMDC_VERSION}" \
+        "@googleworkspace/cli@${GWS_VERSION}" \
+        "@openai/codex@${CODEX_VERSION}" \
         "opencode-ai@${OPENCODE_VERSION}"
 ```
+
+> If your Dockerfile still has a single combined `pnpm install -g` block for claude-code + agent-browser + vercel (older upstream layout), append `opencode-ai` there instead. Look for the existing layer that installs `@openai/codex` and add OpenCode next to it.
+
+**(c)** Add `opencode-ai` to the `only-built-dependencies` allowlist in `/root/.npmrc`. The container's pnpm is configured to skip postinstall scripts by default; opencode-ai's postinstall downloads its native binary and the CLI errors out at runtime without it ("opencode-ai's postinstall script was not run"). The allowlist is configured in the same `RUN` block that installs vercel (around line 323–328):
+
+```dockerfile
+RUN --mount=type=cache,target=/root/.cache/pnpm \
+    echo "only-built-dependencies[]=agent-browser" > /root/.npmrc && \
+    echo "only-built-dependencies[]=@anthropic-ai/claude-code" >> /root/.npmrc && \
+    echo "only-built-dependencies[]=@googleworkspace/cli" >> /root/.npmrc && \
+    echo "only-built-dependencies[]=opencode-ai" >> /root/.npmrc && \
+    pnpm install -g "vercel@${VERCEL_VERSION}"
+```
+
+> The container `.npmrc` allowlist is **separate** from the host's `pnpm-workspace.yaml` `onlyBuiltDependencies`. The host allowlist is human-gated per CLAUDE.md; this container-side allowlist follows the same posture (only add packages the operator explicitly wants — opencode-ai's postinstall pattern matches the existing entries).
 
 ### 6. Build
 
@@ -218,7 +235,7 @@ Extra MCP servers still come from **`NANOCLAW_MCP_SERVERS`** / `container_config
 ## Operational notes
 
 - OpenCode keeps a local **`opencode serve`** process and SSE subscription; the provider tears down with **`stream.return`** and **SIGKILL** on the server process on **`abort()`** / shared runtime reset to avoid MCP/zombie hangs.
-- Session continuation uses UUID format (SDK 1.4.x / CLI 1.4.x). Stale sessions are cleared by `isSessionInvalid` on OpenCode-specific error patterns. If you see UUID-related errors after an accidental CLI upgrade, clear `session_state` in `outbound.db` and wipe the `opencode-xdg` directory under the session folder.
+- Session continuation passes through whatever opaque id OpenCode hands back; stale sessions are cleared by `isSessionInvalid` on OpenCode-specific error patterns. If you see session-not-found errors after an accidental CLI version mismatch, clear `session_state` in `outbound.db` and wipe the `opencode-xdg` directory under the session folder.
 - **`NO_PROXY`** for localhost matters when the OpenCode client talks to `127.0.0.1` inside the container while HTTP(S)_PROXY is set (e.g. OneCLI).
 
 ## Verify

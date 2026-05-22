@@ -183,6 +183,9 @@ export async function run(args: string[]): Promise<void> {
       ignored_message_policy: 'drop',
       session_mode: parsed.sessionMode as 'shared' | 'per-thread' | 'agent-shared',
       priority: 0,
+      default_model: null,
+      default_effort: null,
+      default_tone: null,
       created_at: new Date().toISOString(),
     });
     log.info('Wired agent to messaging group', {

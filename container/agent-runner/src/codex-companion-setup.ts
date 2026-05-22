@@ -31,7 +31,11 @@ import fs from 'fs';
 import path from 'path';
 
 import { tomlBasicString } from './providers/codex-app-server.js';
-import { discoverPortableSkills, syncSkillSymlinks as syncDiscoveredSkillSymlinks } from './plugin-skill-discovery.js';
+import {
+  type AgentRuntime,
+  discoverPortableSkills,
+  syncSkillSymlinks as syncDiscoveredSkillSymlinks,
+} from './plugin-skill-discovery.js';
 import type { McpServerConfig } from './providers/types.js';
 
 const HOST_CODEX_DIR = '/home/node/.codex';
@@ -420,7 +424,11 @@ export function setupCodexRuntime(mcpServers: Record<string, McpServerConfig>): 
     return null;
   }
 
-  syncCodexSkillsMirror();
+  // Skills mirror is already populated by index.ts at startup with the correct
+  // runtime; calling it again here without a runtime arg would default to
+  // 'codex' and strip workflow-codex skills for opencode containers that have
+  // codex auth mounted (codex-as-peer mode). Idempotency of syncSkillSymlinks
+  // makes the call cheap, but the wrong denylist makes it incorrect.
 
   log(`CODEX_HOME runtime ready at ${RUNTIME_CODEX_DIR} (${Object.keys(mcpServers).length} MCP servers merged)`);
   return RUNTIME_CODEX_DIR;
@@ -438,7 +446,7 @@ export function setupCodexRuntime(mcpServers: Record<string, McpServerConfig>): 
  * companion script). Idempotent: `syncDiscoveredSkillSymlinks` reconciles
  * existing entries (creates/removes/leaves as appropriate).
  */
-export function syncCodexSkillsMirror(): void {
+export function syncAgentSkillsMirror(runtime?: AgentRuntime): void {
   // Two sources contribute:
   //   1. Container-bundled NanoClaw skills at /home/node/.claude/skills/
   //      (agent-browser, vercel-cli, slack-formatting, etc.)
@@ -463,7 +471,7 @@ export function syncCodexSkillsMirror(): void {
     /* container skills dir missing */
   }
 
-  const pluginSkills = discoverPortableSkills(CONTAINER_PLUGINS_DIR);
+  const pluginSkills = discoverPortableSkills(CONTAINER_PLUGINS_DIR, { runtime });
 
   // Plugin skills first (preferred source), then container-bundled —
   // first occurrence wins by name.

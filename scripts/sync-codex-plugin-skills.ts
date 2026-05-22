@@ -19,7 +19,8 @@ function main(): void {
   const dryRun = process.argv.includes('--dry-run');
   const pluginsRoot = path.join(os.homedir(), 'plugins');
 
-  const discovered = discoverPortableSkills(pluginsRoot);
+  // 'codex' runtime denies both Claude and codex-loaded-elsewhere workflows.
+  const discovered = discoverPortableSkills(pluginsRoot, { runtime: 'codex' });
   console.log(`Discovered ${discovered.length} portable skill(s) under ${pluginsRoot}:`);
   for (const s of discovered) {
     console.log(`  ${s.name.padEnd(34)} ← ${s.plugin}/${path.relative(path.join(pluginsRoot, s.plugin), s.skillDir)}`);

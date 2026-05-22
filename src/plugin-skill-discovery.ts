@@ -57,21 +57,55 @@ const DEFAULT_DENY_PLUGINS = new Set<string>([
 
 /**
  * Within a multi-plugin repo (like davekim917/bootstrap, which contains
- * workflow/domain/tools sub-plugins), this set marks the *sub-plugin* skill
- * roots to ignore. Bootstrap-workflow's `/team-*` skills require Claude's
- * Skill/Agent tool to function. Bootstrap-tools/cortex-code is pure prose
- * but currently invokes `cortex` CLI through Bash — portable.
+ * workflow/domain/tools sub-plugins), these maps mark the *sub-plugin* skill
+ * roots to ignore — runtime-conditional. Different agent runtimes have
+ * different native plugin loaders, so a skill that's "denied" for one runtime
+ * (because the runtime loads it via a native path) may need to be surfaced
+ * for another runtime that lacks that loader.
  *
  * Format: `<plugin>/<sub-plugin-skills-segment>`
+ *
+ * Sibling-parity invariant: when adding a new runtime, the denylist for that
+ * runtime should ONLY exclude skill roots that this runtime loads through
+ * another path. Skills that can't be invoked but CAN be read as instruction
+ * text should still be surfaced.
  */
-const DENY_SUB_PLUGIN_SKILL_DIRS = new Set<string>([
-  // Claude workflow: not portable to Codex directly.
-  'bootstrap/plugins/workflow/skills',
-  // Codex workflow: installed through `.codex-plugin/plugin.json`, not the
-  // legacy skills mirror. The skill names intentionally match the Claude
-  // workflow, so mirroring would make plugin install precedence ambiguous.
-  'bootstrap/plugins/workflow-codex/skills',
-]);
+const DENY_SUB_PLUGIN_SKILL_DIRS_BY_RUNTIME: Record<AgentRuntime, Set<string>> = {
+  claude: new Set<string>([
+    // workflow-codex: same skill names as the Claude workflow; the Claude
+    // runtime already loads its own `bootstrap/plugins/workflow/skills` via
+    // the Claude plugin marketplace, so mirroring the codex variant would be
+    // a name-collision duplicate.
+    'bootstrap/plugins/workflow-codex/skills',
+  ]),
+  codex: new Set<string>([
+    // Claude workflow: requires Claude's Skill/Agent tool.
+    'bootstrap/plugins/workflow/skills',
+    // Codex workflow: installed through `.codex-plugin/plugin.json`, not the
+    // legacy skills mirror. Same-name collision would make precedence ambiguous.
+    'bootstrap/plugins/workflow-codex/skills',
+  ]),
+  opencode: new Set<string>([
+    // Claude workflow: requires Claude's Skill/Agent tool.
+    'bootstrap/plugins/workflow/skills',
+    // workflow-codex is NOT denied for opencode — there's no native codex-plugin
+    // loader on opencode, and surfacing the skill TEXT gives the agent
+    // awareness of /team-* patterns even without the spawn_task harness
+    // (which is a separate runtime gap).
+  ]),
+};
+
+export type AgentRuntime = 'claude' | 'codex' | 'opencode';
+
+/**
+ * Default runtime when none is specified. 'claude' is intentionally chosen as
+ * the most-conservative fallback: every runtime is allowed to see Claude's
+ * `bootstrap/plugins/workflow/skills` (since the workflow-claude denylist
+ * targets the codex-loaded path, not the Claude-loaded one). Callers should
+ * still pass `runtime` explicitly; the default exists only for back-compat
+ * with pre-runtime-split callers that haven't been updated.
+ */
+const DEFAULT_RUNTIME: AgentRuntime = 'claude';
 
 /**
  * Path segments that mean "runtime-specific copy of a skill" — we prefer the
@@ -141,7 +175,11 @@ function readPluginName(skillDir: string): string | null {
  * preference order. Returns each skill exactly once (by name) — later
  * matches with the same name are dropped.
  */
-function discoverInPlugin(pluginDir: string, pluginName: string): DiscoveredSkill[] {
+function discoverInPlugin(
+  pluginDir: string,
+  pluginName: string,
+  denySubPluginSkillDirs: Set<string>,
+): DiscoveredSkill[] {
   const skills = new Map<string, DiscoveredSkill>();
 
   const recordCandidate = (skillDir: string) => {
@@ -197,12 +235,12 @@ function discoverInPlugin(pluginDir: string, pluginName: string): DiscoveredSkil
   }
 
   // 7. multi-plugin repos: <plugin>/plugins/<sub>/skills/<name>/
-  //    Common in davekim917/bootstrap. Respect DENY_SUB_PLUGIN_SKILL_DIRS.
+  //    Common in davekim917/bootstrap. Respect runtime-specific denylist.
   const multiPluginDir = path.join(pluginDir, 'plugins');
   if (isDirectory(multiPluginDir)) {
     for (const sub of fs.readdirSync(multiPluginDir)) {
       const subKey = `${pluginName}/plugins/${sub}/skills`;
-      if (DENY_SUB_PLUGIN_SKILL_DIRS.has(subKey)) continue;
+      if (denySubPluginSkillDirs.has(subKey)) continue;
       const subSkillsDir = path.join(multiPluginDir, sub, 'skills');
       if (!isDirectory(subSkillsDir)) continue;
       for (const skillName of fs.readdirSync(subSkillsDir)) {
@@ -221,18 +259,28 @@ export interface DiscoverOptions {
   denySkills?: Set<string>;
   /** Paths or path components that should never be traversed (runtime-specific dirs) */
   denyDirSegments?: Set<string>;
+  /**
+   * Target agent runtime. Selects the appropriate sub-plugin denylist
+   * (different runtimes have different native plugin loaders, so a sub-plugin
+   * may be denied for one runtime and surfaced for another).
+   * Defaults to 'codex' for back-compat with the original Codex-parity caller.
+   */
+  runtime?: AgentRuntime;
 }
 
 /**
- * Walk a plugins root and return every portable skill we'd want Codex to see.
- * Pure function — no filesystem writes. Caller decides what to do with the
- * results (typically: symlink each `skillDir` into `<CODEX_HOME>/skills/<name>/`).
+ * Walk a plugins root and return every portable skill we'd want to expose to
+ * the target runtime. Pure function — no filesystem writes. Caller decides
+ * what to do with the results (typically: symlink each `skillDir` into
+ * `<runtime-home>/skills/<name>/` or `~/.agents/skills/<name>/`).
  */
 export function discoverPortableSkills(pluginsRoot: string, options: DiscoverOptions = {}): DiscoveredSkill[] {
   if (!isDirectory(pluginsRoot)) return [];
 
   const denyPlugins = options.denyPlugins ?? DEFAULT_DENY_PLUGINS;
   const denySkills = options.denySkills ?? new Set<string>();
+  const runtime = options.runtime ?? DEFAULT_RUNTIME;
+  const denySubPluginSkillDirs = DENY_SUB_PLUGIN_SKILL_DIRS_BY_RUNTIME[runtime];
 
   const allSkills = new Map<string, DiscoveredSkill>();
   for (const pluginName of fs.readdirSync(pluginsRoot)) {
@@ -242,7 +290,7 @@ export function discoverPortableSkills(pluginsRoot: string, options: DiscoverOpt
     if (!isDirectory(pluginDir)) continue;
     // Skip deprecated subtree contents — they live at <plugin>/deprecated/ and
     // shouldn't appear as portable skills.
-    for (const skill of discoverInPlugin(pluginDir, pluginName)) {
+    for (const skill of discoverInPlugin(pluginDir, pluginName, denySubPluginSkillDirs)) {
       if (denySkills.has(skill.name)) continue;
       if (skill.skillDir.includes('/deprecated/')) continue;
       // First-plugin-wins by name (alphabetical iteration); a later plugin

@@ -23,10 +23,13 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
+import { assertValidGroupFolder } from '../group-folder.js';
 import { registerProviderContainerConfig } from './provider-container-registry.js';
 
 function resolveCodexSourceDir(agentGroupFolder: string | undefined, agentGroupId: string, hostHome: string): string {
   const scopedFolder = agentGroupFolder || agentGroupId;
+  // Defense-in-depth — same rationale as resolveOpenCodeSourceDir in opencode.ts.
+  assertValidGroupFolder(scopedFolder);
   const scoped = path.join(hostHome, `.codex-${scopedFolder}`);
   if (fs.existsSync(path.join(scoped, 'auth.json'))) return scoped;
   return path.join(hostHome, '.codex');

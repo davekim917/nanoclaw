@@ -53,6 +53,7 @@ ARG BUN_VERSION=1.3.13
 ARG MMDC_VERSION=11.14.0
 ARG GWS_VERSION=0.22.5
 ARG CODEX_VERSION=0.130.0
+ARG OPENCODE_VERSION=1.15.7
 ARG DBT_MCP_VERSION=1.18.0
 ARG SLACK_MCP_VERSION=1.3.0
 
@@ -324,6 +325,7 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
     echo "only-built-dependencies[]=agent-browser" > /root/.npmrc && \
     echo "only-built-dependencies[]=@anthropic-ai/claude-code" >> /root/.npmrc && \
     echo "only-built-dependencies[]=@googleworkspace/cli" >> /root/.npmrc && \
+    echo "only-built-dependencies[]=opencode-ai" >> /root/.npmrc && \
     pnpm install -g "vercel@${VERCEL_VERSION}"
 
 RUN --mount=type=cache,target=/root/.cache/pnpm \
@@ -341,7 +343,8 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
         "gitnexus@${GITNEXUS_VERSION}" \
         "@mermaid-js/mermaid-cli@${MMDC_VERSION}" \
         "@googleworkspace/cli@${GWS_VERSION}" \
-        "@openai/codex@${CODEX_VERSION}"
+        "@openai/codex@${CODEX_VERSION}" \
+        "opencode-ai@${OPENCODE_VERSION}"
 
 # Puppeteer config used by mmdc — points at the system Chromium and passes
 # --no-sandbox, without which mmdc launches and silently exits 0 producing no

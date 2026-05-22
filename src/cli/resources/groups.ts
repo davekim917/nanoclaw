@@ -1,6 +1,11 @@
+import fs from 'fs';
+import path from 'path';
+
+import { GROUPS_DIR } from '../../config.js';
 import type { McpServerConfig } from '../../container-config.js';
 import { buildAgentGroupImage, killContainer, wakeContainer } from '../../container-runner.js';
 import { restartAgentGroupContainers } from '../../container-restart.js';
+import { getAgentGroupByFolder } from '../../db/agent-groups.js';
 import { getSession } from '../../db/sessions.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import {
@@ -8,6 +13,8 @@ import {
   updateContainerConfigScalars,
   updateContainerConfigJson,
 } from '../../db/container-configs.js';
+import { assertValidGroupFolder } from '../../group-folder.js';
+import { SIBLING_BOUND_FIELDS } from '../../sibling-parity.js';
 import type { ContainerConfigRow } from '../../types.js';
 import { registerResource } from '../crud.js';
 
@@ -276,6 +283,68 @@ registerResource({
         return {
           removed: { apt: apt || null, npm: npm || null },
           note: 'Image rebuild required for package changes to take effect.',
+        };
+      },
+    },
+    'parity-check': {
+      access: 'approval',
+      description:
+        'Diff a sibling group against its source group on the parity invariant (model + provider are the only fields allowed to differ). ' +
+        'Use --source <source-folder> --sibling <sibling-folder>. Reads container.json from disk for non-DB fields (onecliSecrets, tools, etc.) ' +
+        'plus the DB for wiring + container config scalars. Reports drift, does NOT auto-fix.',
+      handler: async (args, ctx) => {
+        const sourceFolder = (args.source ?? args['source-folder']) as string | undefined;
+        const siblingFolder = (args.sibling ?? args['sibling-folder']) as string | undefined;
+        if (!sourceFolder || !siblingFolder) {
+          throw new Error('Both --source <folder> and --sibling <folder> are required');
+        }
+        // Reject path-traversal + reserved names before forming any filesystem
+        // path. assertValidGroupFolder enforces `[A-Za-z0-9][A-Za-z0-9_-]{0,63}`.
+        assertValidGroupFolder(sourceFolder);
+        assertValidGroupFolder(siblingFolder);
+        // cli_scope='group' isolation: agent callers may only diff folders that
+        // belong to their own agent_group (matches the post-handler scope filter
+        // applied to generic ops). Both folders must resolve to the caller's
+        // agent_group_id; otherwise we'd leak another group's container.json.
+        if (ctx.caller === 'agent') {
+          const srcGroup = getAgentGroupByFolder(sourceFolder);
+          const sibGroup = getAgentGroupByFolder(siblingFolder);
+          const callerId = ctx.agentGroupId;
+          if (!srcGroup || srcGroup.id !== callerId || !sibGroup || sibGroup.id !== callerId) {
+            throw new Error(
+              `parity-check from cli_scope='group' is restricted to the caller's own agent_group (${callerId}); ` +
+                `requested source=${sourceFolder} sibling=${siblingFolder} resolved to different groups`,
+            );
+          }
+        }
+        const readJson = (folder: string): Record<string, unknown> => {
+          const p = path.join(GROUPS_DIR, folder, 'container.json');
+          if (!fs.existsSync(p)) throw new Error(`container.json missing for ${folder}`);
+          return JSON.parse(fs.readFileSync(p, 'utf-8')) as Record<string, unknown>;
+        };
+        const src = readJson(sourceFolder);
+        const sib = readJson(siblingFolder);
+
+        // The set of allowed-to-differ fields lives in src/sibling-parity.ts
+        // so the /clone-as-* skills and this verb agree mechanically.
+
+        const allKeys = new Set([...Object.keys(src), ...Object.keys(sib)]);
+        const drifts: Array<{ field: string; source: unknown; sibling: unknown }> = [];
+        for (const k of allKeys) {
+          if (SIBLING_BOUND_FIELDS.has(k)) continue;
+          const a = JSON.stringify(src[k] ?? null);
+          const b = JSON.stringify(sib[k] ?? null);
+          if (a !== b) drifts.push({ field: k, source: src[k], sibling: sib[k] });
+        }
+
+        return {
+          source: sourceFolder,
+          sibling: siblingFolder,
+          status: drifts.length === 0 ? 'parity' : 'drift',
+          drifts,
+          note:
+            'Only model + provider + identity-bound fields are allowed to differ. Runtime parity (OneCLI secret ' +
+            'assignment, MCP server availability) requires a warm-up spawn + post-spawn verification.',
         };
       },
     },

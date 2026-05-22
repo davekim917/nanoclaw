@@ -1,24 +1,25 @@
 /**
  * Container config types and access layer.
  *
- * Two sources of truth coexist during the transition to DB-backed config:
- *   - File-based: `groups/<folder>/container.json` (current default; read by
- *     `readContainerConfig`, written by `writeContainerConfig`).
- *   - DB-backed: `container_configs` table (populated by migration 014 +
- *     `backfillContainerConfigs`; read via `configFromDb`, materialized to
- *     disk via `materializeContainerJson`).
+ * `groups/<folder>/container.json` is the canonical source of truth for every
+ * non-DB field (onecliSecrets, tools, credentialFolder, codexHostAuth, memory,
+ * dailySummary, etc.) — read by `readContainerConfig`, written by
+ * `writeContainerConfig`, modified directly on disk by skills and operators.
  *
- * This module exports both APIs. Local code paths (spawn flow, host modules)
- * still read/write the file; the DB row tracks operationally-mutated fields
- * (image_tag, packages_apt, packages_npm, mcp_servers) so they survive
- * regenerations.
+ * The `container_configs` table mirrors a subset of operationally-mutated
+ * scalars (provider, model, effort, image_tag, assistant_name, skills,
+ * mcp_servers, packages_apt, packages_npm, additional_mounts, cli_scope) so
+ * those fields are addressable via `ncl groups config get/update` and survive
+ * across container respawns. `configFromDb` reconstructs ONLY those scalars;
+ * it does NOT carry the file-only fields. Any code path that writes the file
+ * from DB state alone would silently drop those fields — which is why no such
+ * path exists. The DB row is a read-side projection, not an authoritative
+ * source for the full config.
  */
 import fs from 'fs';
 import path from 'path';
 
 import { GROUPS_DIR } from './config.js';
-import { getContainerConfig } from './db/container-configs.js';
-import { getAgentGroup } from './db/agent-groups.js';
 import type { AgentGroup, ContainerConfigRow } from './types.js';
 
 /**
@@ -483,24 +484,3 @@ export function initContainerConfig(folder: string): boolean {
   return true;
 }
 
-/**
- * Materialize `container.json` from the DB. Called at spawn time so the
- * container always sees fresh config. Returns the `ContainerConfig` for
- * use by the caller (buildMounts, buildContainerArgs, etc.).
- */
-export function materializeContainerJson(agentGroupId: string): ContainerConfig {
-  const group = getAgentGroup(agentGroupId);
-  if (!group) throw new Error(`Agent group not found: ${agentGroupId}`);
-
-  const row = getContainerConfig(agentGroupId);
-  if (!row) throw new Error(`Container config not found for agent group: ${agentGroupId}`);
-
-  const config = configFromDb(row, group);
-
-  const p = path.join(GROUPS_DIR, group.folder, 'container.json');
-  const dir = path.dirname(p);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(p, JSON.stringify(config, null, 2) + '\n');
-
-  return config;
-}

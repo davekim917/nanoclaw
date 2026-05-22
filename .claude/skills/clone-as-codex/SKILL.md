@@ -162,10 +162,10 @@ cd -
 
 ### 5. Write container.json
 
-Copy the source's tool list (so the sibling inherits the same MCP servers + integrations), set `provider: "codex"`, and drop `dailySummary` (no duplicate roll-ups).
+Start with the sibling-specific scaffold, then auto-inherit `onecliSecrets`, `tools`, `mcpServers`, and `additionalMounts` from the source group via `jq` (parity invariant — the only differences should be provider, model, and codex-specific fields).
 
 ```bash
-# Edit values to match your source group; "tools" should mirror the source.
+# 1. Write sibling-only fields.
 cat > groups/${SIBLING_FOLDER}/container.json <<EOF
 {
   "provider": "codex",
@@ -180,13 +180,25 @@ cat > groups/${SIBLING_FOLDER}/container.json <<EOF
   "gitnexusInjectAgentsMd": true,
   "tools": [],
   "memory": { "enabled": true },
+  "onecliSecrets": [],
   "codexHostAuth": true
 }
 EOF
 
-# Manually copy the "tools" array (and any "additionalMounts") from
-# groups/${SOURCE_FOLDER}/container.json — the operator decides which tools
-# are appropriate for the codex sibling.
+# 2. Inherit operator-managed fields from the source. Excludes one-writer-per-
+# workgroup fields (dailySummary).
+jq --slurpfile src groups/${SOURCE_FOLDER}/container.json '
+  .onecliSecrets = ($src[0].onecliSecrets // []) |
+  .tools = ($src[0].tools // []) |
+  .mcpServers = ($src[0].mcpServers // {}) |
+  .additionalMounts = ($src[0].additionalMounts // []) |
+  .packages = ($src[0].packages // {"apt":[],"npm":[]})
+' groups/${SIBLING_FOLDER}/container.json > /tmp/cj-sibling.json && \
+  mv /tmp/cj-sibling.json groups/${SIBLING_FOLDER}/container.json
+
+# 3. Verify parity (the only diff should be sibling-bound fields).
+diff <(jq -S 'del(.groupName,.assistantName,.agentGroupId,.credentialFolder,.provider,.memory,.codexHostAuth,.dailySummary)' groups/${SOURCE_FOLDER}/container.json) \
+     <(jq -S 'del(.groupName,.assistantName,.agentGroupId,.credentialFolder,.provider,.memory,.codexHostAuth)' groups/${SIBLING_FOLDER}/container.json) || true
 ```
 
 **Why `credentialFolder`**: container-runner's per-group credential lookups
@@ -406,6 +418,46 @@ If the sibling responds but the back-and-forth handoff doesn't continue, check:
 - `groups/${SIBLING_FOLDER}/AGENTS.md` was composed cleanly (no `agents-md-flatten: failed` markers). If it was, the sibling-handoff guidance may be truncated; redeploy and respawn the container.
 
 > **Mention syntax**: agents write bare `@<bot-username>` in their reply. The Discord adapter's outbound rewriter (`resolveDiscordMentions` in `src/channels/discord.ts`) converts that to a real `<@SNOWFLAKE_ID>` mention before posting. Agents do not need to know the snowflake. The rewriter also tolerates the bracketed-by-name form `<@<bot-username>>` as a safety net, so both `@Axie-codex` and `<@Axie-codex>` resolve correctly.
+
+### 11. Parity audit
+
+The sibling-parity invariant says only model + provider may differ between source and sibling. This step diffs the two and prints any unexpected drift before you ship.
+
+```bash
+SIBLING_FOLDER=${SIBLING_FOLDER}
+SOURCE_FOLDER=${SOURCE_FOLDER}
+
+bash <(cat <<'AUDIT'
+SF="$1"; SR="$2"
+echo "=== container.json structural diff (only identity-bound fields should differ) ==="
+diff <(jq -S 'del(.groupName,.assistantName,.agentGroupId,.credentialFolder,.provider,.memory,.codexHostAuth,.dailySummary)' groups/${SF}/container.json) \
+     <(jq -S 'del(.groupName,.assistantName,.agentGroupId,.credentialFolder,.provider,.memory,.codexHostAuth)' groups/${SR}/container.json) \
+  && echo "  ✅ structural parity"
+echo
+echo "=== OneCLI secret name list parity ==="
+diff <(jq -S '.onecliSecrets // [] | sort' groups/${SF}/container.json) \
+     <(jq -S '.onecliSecrets // [] | sort' groups/${SR}/container.json) \
+  && echo "  ✅ onecliSecrets identical"
+echo
+echo "=== tools list parity ==="
+diff <(jq -S '.tools // [] | sort' groups/${SF}/container.json) \
+     <(jq -S '.tools // [] | sort' groups/${SR}/container.json) \
+  && echo "  ✅ tools identical"
+echo
+echo "=== messaging-group wiring (channels) ==="
+pnpm exec tsx scripts/q.ts data/v2.db "
+SELECT mg.channel_type, mg.platform_id, mg.name, mga.engage_mode, mga.session_mode
+FROM messaging_groups mg
+JOIN messaging_group_agents mga ON mga.messaging_group_id=mg.id
+WHERE mga.agent_group_id='${SR}'
+"
+echo
+echo "Note: runtime parity (actual OneCLI secret assignment) requires a warm-up spawn — send any message to the sibling, then verify with: docker exec <container> env | grep -E 'ANTHROPIC_API_KEY|GITHUB_TOKEN'"
+AUDIT
+) "$SOURCE_FOLDER" "$SIBLING_FOLDER"
+```
+
+A clean audit shows ✅ on the three diff checks. Any drift means the inheritance step didn't run or was hand-edited — fix and re-run.
 
 ## Reverting
 
