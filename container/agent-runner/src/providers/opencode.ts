@@ -437,7 +437,17 @@ export class OpenCodeProvider implements AgentProvider {
               throw new Error('OpenCode SSE stream ended unexpectedly');
             }
 
-            if (!ev?.type || ev.type === 'server.connected' || ev.type === 'server.heartbeat') continue;
+            // Heartbeats prove the SSE connection is alive but carry no content.
+            // Reset the idle timer so a long-thinking subagent (verified
+            // empirically: Kimi K2.6 can think silently for 5-7min mid-turn
+            // while dispatching parallel subagents) doesn't trip the 90s
+            // false-positive timeout. Skip the `activity` yield to avoid
+            // flooding the consumer with no-op events.
+            if (!ev?.type || ev.type === 'server.connected') continue;
+            if (ev.type === 'server.heartbeat') {
+              lastEventAt = Date.now();
+              continue;
+            }
 
             lastEventAt = Date.now();
             yield { type: 'activity' };
