@@ -185,6 +185,7 @@ function createAdapter(): ChannelAdapter {
       reply_to?: unknown;
       sender?: unknown;
       senderId?: unknown;
+      isMention?: unknown;
     };
     try {
       payload = JSON.parse(line);
@@ -201,6 +202,12 @@ function createAdapter(): ChannelAdapter {
       // Routed message — admin transport. Build a full InboundEvent targeting
       // `to`'s channel/platform, and let `reply_to` (if any) redirect replies.
       // Does NOT claim the chat slot, so an active terminal chat isn't evicted.
+      //
+      // Caller may set `isMention: true` to indicate this is a platform-style
+      // mention of the bot. Without this hint the router falls back to its
+      // adapter-native mention check, which CLI doesn't have (isMention
+      // stays undefined → engage_mode='mention' agents won't wake). Admin
+      // transports use this to simulate an explicit @-mention.
       const event: InboundEvent = {
         channelType: to.channelType,
         platformId: to.platformId,
@@ -209,6 +216,7 @@ function createAdapter(): ChannelAdapter {
           id: `cli-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
           kind: 'chat',
           timestamp: new Date().toISOString(),
+          isMention: payload.isMention === true ? true : undefined,
           content: JSON.stringify({
             text: payload.text,
             sender: typeof payload.sender === 'string' ? payload.sender : 'cli',
