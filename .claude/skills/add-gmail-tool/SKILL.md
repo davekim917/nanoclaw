@@ -232,13 +232,9 @@ Common signals:
    ```bash
    ncl groups config remove-mcp-server --id <group-id> --name gmail
    ```
-2. Remove the `.gmail-mcp` mount from the DB (no `remove-mount` verb yet — same #2395 dependency):
+2. Remove the `.gmail-mcp` mount:
    ```bash
-   pnpm exec tsx scripts/q.ts data/v2.db "UPDATE container_configs \
-     SET additional_mounts = (SELECT json_group_array(value) FROM json_each(additional_mounts) \
-                              WHERE json_extract(value, '\$.containerPath') != '.gmail-mcp'), \
-         updated_at = datetime('now') \
-     WHERE agent_group_id = '<group-id>';"
+   ncl groups config remove-mount --id <group-id> --container-path .gmail-mcp
    ```
 3. Remove the `GMAIL_MCP_VERSION` ARG and the `pnpm install -g @gongrzhe/server-gmail-autoauth-mcp` block from `container/Dockerfile`.
 4. `pnpm run build && ./container/build.sh && systemctl --user restart "$(. setup/lib/install-slug.sh && systemd_unit)"`.

@@ -217,13 +217,9 @@ Common signals:
    ```bash
    ncl groups config remove-mcp-server --id <group-id> --name calendar
    ```
-2. Remove the `.calendar-mcp` mount from the DB (no `remove-mount` verb yet — same #2395 dependency):
+2. Remove the `.calendar-mcp` mount:
    ```bash
-   pnpm exec tsx scripts/q.ts data/v2.db "UPDATE container_configs \
-     SET additional_mounts = (SELECT json_group_array(value) FROM json_each(additional_mounts) \
-                              WHERE json_extract(value, '\$.containerPath') != '.calendar-mcp'), \
-         updated_at = datetime('now') \
-     WHERE agent_group_id = '<group-id>';"
+   ncl groups config remove-mount --id <group-id> --container-path .calendar-mcp
    ```
 3. Remove `CALENDAR_MCP_VERSION` ARG and the calendar package from the Dockerfile install block.
 4. `pnpm run build && ./container/build.sh && systemctl --user restart "$(. setup/lib/install-slug.sh && systemd_unit)"`.

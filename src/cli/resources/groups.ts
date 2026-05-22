@@ -1,4 +1,6 @@
-import type { McpServerConfig } from '../../container-config.js';
+import type { McpServerConfig, AdditionalMountConfig } from '../../container-config.js';
+import { updateContainerConfig } from '../../container-config.js';
+import { getAgentGroup } from '../../db/agent-groups.js';
 import { buildAgentGroupImage, killContainer, wakeContainer } from '../../container-runner.js';
 import { restartAgentGroupContainers } from '../../container-restart.js';
 import { getSession } from '../../db/sessions.js';
@@ -277,6 +279,84 @@ registerResource({
           removed: { apt: apt || null, npm: npm || null },
           note: 'Image rebuild required for package changes to take effect.',
         };
+      },
+    },
+    'config add-mount': {
+      access: 'approval',
+      description:
+        'Add an additional mount to a group. Requires `ncl groups restart` to take effect. ' +
+        'Use --id <group-id> --host-path <path> --container-path <relative-path> [--readonly].',
+      handler: async (args) => {
+        const id = args.id as string;
+        if (!id) throw new Error('--id is required');
+        const hostPath = args.host_path as string;
+        if (!hostPath) throw new Error('--host-path is required');
+        const containerPath = args.container_path as string;
+        if (!containerPath) throw new Error('--container-path is required');
+
+        const group = getAgentGroup(id);
+        if (!group) throw new Error(`No agent group: ${id}`);
+        const row = getContainerConfig(id);
+        if (!row) throw new Error(`No container config for group: ${id}`);
+
+        if (containerPath.startsWith('/')) {
+          throw new Error(
+            `Invalid container path: "${containerPath}" — must be relative (cannot start with '/')`,
+          );
+        }
+        if (containerPath.includes('..') || containerPath.includes(':')) {
+          throw new Error(
+            `Invalid container path: "${containerPath}" — must not contain ".." or ":"`,
+          );
+        }
+
+        const newEntry: AdditionalMountConfig = {
+          hostPath,
+          containerPath,
+          readonly: args.readonly === true,
+        };
+
+        const fileConfig = updateContainerConfig(group.folder, (cfg) => {
+          if (!cfg.additionalMounts) cfg.additionalMounts = [];
+          const idx = cfg.additionalMounts.findIndex((m) => m.containerPath === containerPath);
+          if (idx >= 0) {
+            cfg.additionalMounts[idx] = newEntry;
+          } else {
+            cfg.additionalMounts.push(newEntry);
+          }
+        });
+        updateContainerConfigJson(id, 'additional_mounts', fileConfig.additionalMounts ?? []);
+
+        return { added: newEntry, mounts: fileConfig.additionalMounts ?? [] };
+      },
+    },
+    'config remove-mount': {
+      access: 'approval',
+      description:
+        'Remove an additional mount from a group. Requires `ncl groups restart` to take effect. ' +
+        'Use --id <group-id> --container-path <relative-path>.',
+      handler: async (args) => {
+        const id = args.id as string;
+        if (!id) throw new Error('--id is required');
+        const containerPath = args.container_path as string;
+        if (!containerPath) throw new Error('--container-path is required');
+
+        const group = getAgentGroup(id);
+        if (!group) throw new Error(`No agent group: ${id}`);
+        const row = getContainerConfig(id);
+        if (!row) throw new Error(`No container config for group: ${id}`);
+
+        const fileConfig = updateContainerConfig(group.folder, (cfg) => {
+          if (!cfg.additionalMounts) cfg.additionalMounts = [];
+          const idx = cfg.additionalMounts.findIndex((m) => m.containerPath === containerPath);
+          if (idx === -1) {
+            throw new Error(`Mount with container path "${containerPath}" not found`);
+          }
+          cfg.additionalMounts.splice(idx, 1);
+        });
+        updateContainerConfigJson(id, 'additional_mounts', fileConfig.additionalMounts ?? []);
+
+        return { removed: containerPath, mounts: fileConfig.additionalMounts ?? [] };
       },
     },
   },
