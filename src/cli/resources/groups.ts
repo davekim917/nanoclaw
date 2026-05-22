@@ -2,10 +2,10 @@ import fs from 'fs';
 import path from 'path';
 
 import { GROUPS_DIR } from '../../config.js';
-import type { McpServerConfig } from '../../container-config.js';
+import { type McpServerConfig, updateContainerConfig } from '../../container-config.js';
 import { buildAgentGroupImage, killContainer, wakeContainer } from '../../container-runner.js';
 import { restartAgentGroupContainers } from '../../container-restart.js';
-import { getAgentGroupByFolder } from '../../db/agent-groups.js';
+import { getAgentGroup, getAgentGroupByFolder } from '../../db/agent-groups.js';
 import { getSession } from '../../db/sessions.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import {
@@ -183,18 +183,30 @@ registerResource({
         const command = args.command as string;
         if (!command) throw new Error('--command is required');
 
+        const group = getAgentGroup(id);
+        if (!group) throw new Error(`No agent group: ${id}`);
         const row = getContainerConfig(id);
         if (!row) throw new Error(`No container config for group: ${id}`);
 
-        const servers = JSON.parse(row.mcp_servers) as Record<string, McpServerConfig>;
-        servers[name] = {
+        const newEntry: McpServerConfig = {
           command,
           args: args.args ? (JSON.parse(args.args as string) as string[]) : [],
           env: args.env ? (JSON.parse(args.env as string) as Record<string, string>) : {},
         };
-        updateContainerConfigJson(id, 'mcp_servers', servers);
 
-        return { added: name, servers };
+        // Dual-write: container.json (canonical — what the spawn reads via
+        // readContainerConfig) + container_configs.mcp_servers (cache — what
+        // `ncl groups config get` reads). DB-only writes were silently dead
+        // for mcp_servers/additional_mounts since the spawn path never reads
+        // those fields from the DB; the backfill-container-configs sync is
+        // file→DB one-way, so DB drift gets overwritten on next host start.
+        const fileConfig = updateContainerConfig(group.folder, (cfg) => {
+          if (!cfg.mcpServers) cfg.mcpServers = {};
+          cfg.mcpServers[name] = newEntry;
+        });
+        updateContainerConfigJson(id, 'mcp_servers', fileConfig.mcpServers ?? {});
+
+        return { added: name, servers: fileConfig.mcpServers ?? {} };
       },
     },
     'config remove-mcp-server': {
@@ -207,13 +219,20 @@ registerResource({
         const name = args.name as string;
         if (!name) throw new Error('--name is required');
 
+        const group = getAgentGroup(id);
+        if (!group) throw new Error(`No agent group: ${id}`);
         const row = getContainerConfig(id);
         if (!row) throw new Error(`No container config for group: ${id}`);
 
-        const servers = JSON.parse(row.mcp_servers) as Record<string, McpServerConfig>;
-        if (!servers[name]) throw new Error(`MCP server "${name}" not found`);
-        delete servers[name];
-        updateContainerConfigJson(id, 'mcp_servers', servers);
+        // Validate against the canonical file (DB cache may be stale post-
+        // operator-edit; file is the source of truth).
+        const fileConfig = updateContainerConfig(group.folder, (cfg) => {
+          if (!cfg.mcpServers || !cfg.mcpServers[name]) {
+            throw new Error(`MCP server "${name}" not found`);
+          }
+          delete cfg.mcpServers[name];
+        });
+        updateContainerConfigJson(id, 'mcp_servers', fileConfig.mcpServers ?? {});
 
         return { removed: name };
       },
@@ -226,6 +245,8 @@ registerResource({
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
 
+        const group = getAgentGroup(id);
+        if (!group) throw new Error(`No agent group: ${id}`);
         const row = getContainerConfig(id);
         if (!row) throw new Error(`No container config for group: ${id}`);
 
@@ -233,20 +254,18 @@ registerResource({
         const npm = args.npm as string | undefined;
         if (!apt && !npm) throw new Error('Provide --apt <pkg> or --npm <pkg>');
 
-        if (apt) {
-          const existing = JSON.parse(row.packages_apt) as string[];
-          if (!existing.includes(apt)) {
-            existing.push(apt);
-            updateContainerConfigJson(id, 'packages_apt', existing);
-          }
-        }
-        if (npm) {
-          const existing = JSON.parse(row.packages_npm) as string[];
-          if (!existing.includes(npm)) {
-            existing.push(npm);
-            updateContainerConfigJson(id, 'packages_npm', existing);
-          }
-        }
+        // Dual-write packages: file (canonical, survives backfill at host
+        // restart) + DB (cache, read by buildAgentGroupImage at rebuild time).
+        // Build path happens to read from DB too, so package-add WAS working
+        // pre-fix — but file would have drifted, leaving operators with stale
+        // container.json and a DB that gets clobbered by next backfill.
+        const fileConfig = updateContainerConfig(group.folder, (cfg) => {
+          if (!cfg.packages) cfg.packages = { apt: [], npm: [] };
+          if (apt && !cfg.packages.apt.includes(apt)) cfg.packages.apt.push(apt);
+          if (npm && !cfg.packages.npm.includes(npm)) cfg.packages.npm.push(npm);
+        });
+        if (apt) updateContainerConfigJson(id, 'packages_apt', fileConfig.packages.apt);
+        if (npm) updateContainerConfigJson(id, 'packages_npm', fileConfig.packages.npm);
 
         return {
           added: { apt: apt || null, npm: npm || null },
@@ -262,6 +281,8 @@ registerResource({
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
 
+        const group = getAgentGroup(id);
+        if (!group) throw new Error(`No agent group: ${id}`);
         const row = getContainerConfig(id);
         if (!row) throw new Error(`No container config for group: ${id}`);
 
@@ -269,16 +290,13 @@ registerResource({
         const npm = args.npm as string | undefined;
         if (!apt && !npm) throw new Error('Provide --apt <pkg> or --npm <pkg>');
 
-        if (apt) {
-          const existing = JSON.parse(row.packages_apt) as string[];
-          const filtered = existing.filter((p) => p !== apt);
-          updateContainerConfigJson(id, 'packages_apt', filtered);
-        }
-        if (npm) {
-          const existing = JSON.parse(row.packages_npm) as string[];
-          const filtered = existing.filter((p) => p !== npm);
-          updateContainerConfigJson(id, 'packages_npm', filtered);
-        }
+        const fileConfig = updateContainerConfig(group.folder, (cfg) => {
+          if (!cfg.packages) cfg.packages = { apt: [], npm: [] };
+          if (apt) cfg.packages.apt = cfg.packages.apt.filter((p) => p !== apt);
+          if (npm) cfg.packages.npm = cfg.packages.npm.filter((p) => p !== npm);
+        });
+        if (apt) updateContainerConfigJson(id, 'packages_apt', fileConfig.packages.apt);
+        if (npm) updateContainerConfigJson(id, 'packages_npm', fileConfig.packages.npm);
 
         return {
           removed: { apt: apt || null, npm: npm || null },

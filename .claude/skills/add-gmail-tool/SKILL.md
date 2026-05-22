@@ -203,7 +203,7 @@ jq --arg h "$HOST_PATH" '
 
 `containerPath` is relative — `mount-security` rejects absolute paths. Additional mounts land at `/workspace/extra/<relative>`, so `containerPath: ".gmail-mcp"` resolves to `/workspace/extra/.gmail-mcp` inside the container. The MCP server's `GMAIL_OAUTH_PATH` / `GMAIL_CREDENTIALS_PATH` env vars point at that absolute location.
 
-> **Note — `ncl groups config add-mcp-server` is currently DB-only:** the verb writes to `container_configs.mcp_servers` (DB) but the spawn path reads from `groups/<folder>/container.json` (file). DB-only writes get overwritten by `backfill-container-configs` on the next host startup. Prefer direct file edits until that gap closes; if you do use the verb, mirror the change to the file too.
+> **Alternative — `ncl groups config add-mcp-server`** dual-writes (file + DB) and is approval-gated for in-container callers. The direct-file edit above is more explicit; both work. There's no `ncl groups config add-mount` verb yet, so the mount step is still file-direct either way.
 
 ## Phase 4: Build and Restart
 

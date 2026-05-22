@@ -483,4 +483,3 @@ export function initContainerConfig(folder: string): boolean {
   writeContainerConfig(folder, emptyConfig());
   return true;
 }
-

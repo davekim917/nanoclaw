@@ -184,7 +184,7 @@ jq --arg h "$HOST_PATH" '
 
 `containerPath` is relative — mount-security rejects absolute paths, and additional mounts land at `/workspace/extra/<relative>`.
 
-> **Note — `ncl groups config add-mcp-server` is currently DB-only:** the verb at `src/cli/resources/groups.ts` writes to `container_configs.mcp_servers` (the DB) but the spawn path reads from `groups/<folder>/container.json` (the file). DB-only writes get overwritten by `backfill-container-configs` on the next host startup. Prefer direct file edits until that gap closes; if you do use the verb, mirror the change to the file too.
+> **Alternative — `ncl groups config add-mcp-server`** dual-writes (file + DB) and is approval-gated for in-container callers. The direct-file edit above is more explicit; both work. There's no `ncl groups config add-mount` verb yet, so the mount step is still file-direct either way.
 
 ## Phase 4: Build and Restart
 
