@@ -424,7 +424,6 @@ function discoverCodexAgentTargets(): string[] {
   return targets;
 }
 
-
 interface MarketplaceJson {
   plugins?: MarketplaceEntry[];
 }

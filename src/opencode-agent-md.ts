@@ -36,7 +36,13 @@ const MANAGED_MARKER = '# managed by nanoclaw opencode-sync';
  * output (and leave manually-authored .md files alone).
  */
 export function formatOpenCodeAgentMd(agent: ClaudeAgent): string {
-  const lines: string[] = ['---', MANAGED_MARKER, `description: ${yamlScalar(agent.description)}`, 'mode: subagent', '---'];
+  const lines: string[] = [
+    '---',
+    MANAGED_MARKER,
+    `description: ${yamlScalar(agent.description)}`,
+    'mode: subagent',
+    '---',
+  ];
   // Body ends without trailing newline from the parser; add one so the file
   // ends with `\n` like every other text file.
   return `${lines.join('\n')}\n${agent.body.trimEnd()}\n`;
