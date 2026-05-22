@@ -45,6 +45,7 @@ import {
   syncCodexPluginSkills,
   syncCodexSubagents,
 } from './codex-sync.js';
+import { syncOpenCodePluginSkills, syncOpenCodeSubagents } from './opencode-sync.js';
 
 const HOME = os.homedir();
 const CODEX_DIR = path.join(HOME, '.codex');
@@ -267,6 +268,19 @@ async function runSync(trigger: string): Promise<void> {
         `writes=${subagentsResult.writes} unchangedFiles=${subagentsResult.unchangedFiles} ` +
         `removedFiles=${subagentsResult.removedFiles} skipped=${subagentsResult.skipped.length} ` +
         `targets=${subagentsResult.targets.join(',')}`,
+    );
+    const ocSubagentsResult = syncOpenCodeSubagents();
+    log(
+      `opencode-subagents: ${ocSubagentsResult.targets.length} target(s) — discovered=${ocSubagentsResult.discovered} ` +
+        `writes=${ocSubagentsResult.writes} unchangedFiles=${ocSubagentsResult.unchangedFiles} ` +
+        `removedFiles=${ocSubagentsResult.removedFiles} skipped=${ocSubagentsResult.skipped.length} ` +
+        `targets=${ocSubagentsResult.targets.join(',')}`,
+    );
+    const ocSkillsResult = syncOpenCodePluginSkills();
+    log(
+      `opencode-skills: ${ocSkillsResult.targets.length} target(s) — discovered=${ocSkillsResult.discovered} ` +
+        `created=${ocSkillsResult.created} unchanged=${ocSkillsResult.unchanged} ` +
+        `removed=${ocSkillsResult.removed} skipped=${ocSkillsResult.skipped.length}`,
     );
     const localPluginCacheResult = syncCodexLocalMarketplacePluginCache();
     log(

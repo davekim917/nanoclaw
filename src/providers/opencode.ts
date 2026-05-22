@@ -80,6 +80,38 @@ registerProviderContainerConfig('opencode', (ctx) => {
       fs.copyFileSync(hostAuth, path.join(opencodeSubdir, 'auth.json'));
       authCopied = true;
     }
+    // Subagents (managed by scripts/sync-opencode-subagents.ts): copy every
+    // `.md` from the per-sibling host agent/ dir into the session XDG. OpenCode
+    // reads agents from `$XDG_CONFIG_HOME/opencode/agent/`; we point both
+    // XDG_DATA_HOME and XDG_CONFIG_HOME at the same path below, so the agents
+    // surface alongside auth.json + opencode.db. Per-session copy (not a host
+    // bind mount) so sibling state stays read-only from the container's view
+    // — agents on disk are owned by the host sync, not the running session.
+    const hostAgentsDir = path.join(sourceDir, 'agent');
+    if (fs.existsSync(hostAgentsDir)) {
+      const targetAgentsDir = path.join(opencodeSubdir, 'agent');
+      fs.mkdirSync(targetAgentsDir, { recursive: true });
+      for (const entry of fs.readdirSync(hostAgentsDir)) {
+        if (!entry.endsWith('.md')) continue;
+        fs.copyFileSync(path.join(hostAgentsDir, entry), path.join(targetAgentsDir, entry));
+      }
+    }
+    // Skills (managed by syncOpenCodePluginSkills in opencode-sync.ts): copy
+    // the per-sibling skill/ tree into the session XDG with dereference:true.
+    // OpenCode's skill sync writes managed mirror dirs whose children are
+    // symlinks back to plugin source paths; dereference rewrites those to
+    // real files so the container (which doesn't mount ~/plugins/) sees
+    // every SKILL.md as a real file. Each SKILL.md becomes a slash command
+    // automatically per packages/opencode/src/command/index.ts.
+    const hostSkillsDir = path.join(sourceDir, 'skill');
+    if (fs.existsSync(hostSkillsDir)) {
+      const targetSkillsDir = path.join(opencodeSubdir, 'skill');
+      fs.cpSync(hostSkillsDir, targetSkillsDir, {
+        recursive: true,
+        dereference: true,
+        force: true,
+      });
+    }
   }
 
   // When the sibling has its own auth.json (OAuth-login flow), the container's
@@ -92,6 +124,12 @@ registerProviderContainerConfig('opencode', (ctx) => {
   const noProxyAdditions = authCopied ? '127.0.0.1,localhost,opencode.ai' : '127.0.0.1,localhost';
   const env: Record<string, string> = {
     XDG_DATA_HOME: '/opencode-xdg',
+    // OpenCode reads agents from `$XDG_CONFIG_HOME/opencode/agent/` (verified
+    // empirically against opencode-ai@1.15.7). Pointing XDG_CONFIG_HOME at the
+    // same mount as XDG_DATA_HOME means opencode.jsonc / agent/ / auth.json /
+    // opencode.db all live in one /opencode-xdg/opencode/ tree — no second
+    // mount needed. Provider copies the per-sibling agent/*.md above.
+    XDG_CONFIG_HOME: '/opencode-xdg',
     NO_PROXY: mergeNoProxy(ctx.hostEnv.NO_PROXY, noProxyAdditions),
     no_proxy: mergeNoProxy(ctx.hostEnv.no_proxy, noProxyAdditions),
   };

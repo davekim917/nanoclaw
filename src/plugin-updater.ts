@@ -25,6 +25,7 @@ import { promisify } from 'util';
 
 import { syncCodexLocalMarketplacePluginCache, syncCodexPluginSkills, syncCodexSubagents } from './codex-sync.js';
 import { log } from './log.js';
+import { syncOpenCodePluginSkills, syncOpenCodeSubagents } from './opencode-sync.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -52,6 +53,8 @@ export interface UpdateResult {
 export interface CodexSurfaceRefreshResult {
   skills?: ReturnType<typeof syncCodexPluginSkills>;
   subagents?: ReturnType<typeof syncCodexSubagents>;
+  opencodeSubagents?: ReturnType<typeof syncOpenCodeSubagents>;
+  opencodeSkills?: ReturnType<typeof syncOpenCodePluginSkills>;
   marketplaceUpgrade?: {
     changed: boolean;
     output?: string;
@@ -155,6 +158,33 @@ export async function refreshCodexPluginSurfaces(): Promise<CodexSurfaceRefreshR
     });
   } catch (err) {
     log.warn('Codex subagent mirror refresh failed', { err });
+  }
+
+  try {
+    result.opencodeSubagents = syncOpenCodeSubagents();
+    log.info('OpenCode subagent mirror refreshed', {
+      targets: result.opencodeSubagents.targets.length,
+      discovered: result.opencodeSubagents.discovered,
+      writes: result.opencodeSubagents.writes,
+      removed: result.opencodeSubagents.removedFiles,
+      skipped: result.opencodeSubagents.skipped.length,
+    });
+  } catch (err) {
+    log.warn('OpenCode subagent mirror refresh failed', { err });
+  }
+
+  try {
+    result.opencodeSkills = syncOpenCodePluginSkills();
+    log.info('OpenCode plugin skill mirror refreshed', {
+      targets: result.opencodeSkills.targets.length,
+      discovered: result.opencodeSkills.discovered,
+      created: result.opencodeSkills.created,
+      unchanged: result.opencodeSkills.unchanged,
+      removed: result.opencodeSkills.removed,
+      skipped: result.opencodeSkills.skipped.length,
+    });
+  } catch (err) {
+    log.warn('OpenCode plugin skill mirror refresh failed', { err });
   }
 
   try {
