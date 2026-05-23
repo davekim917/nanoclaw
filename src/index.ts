@@ -187,6 +187,25 @@ async function main(): Promise<void> {
   ensureContainerRuntimeRunning();
   cleanupOrphans();
 
+  // 2a. Surface agent-runner deps drift at boot, not when an agent silently
+  // stops responding. Non-fatal — the hard gate lives in spawnContainer, this
+  // is just an early operator signal.
+  void (async () => {
+    try {
+      const { checkAgentRunnerDepsDrift } = await import('./agent-runner-image-check.js');
+      const r = await checkAgentRunnerDepsDrift();
+      if (!r.ok) {
+        log.warn('agent-runner image deps drift detected at boot — spawns will be refused until rebuild', {
+          expected: r.expected,
+          actual: r.actual,
+          message: r.message,
+        });
+      }
+    } catch (err) {
+      log.warn('agent-runner deps drift check failed at boot', { err });
+    }
+  })();
+
   // 2a. Reset phantom container_status='running' rows in central DB. Session
   // containers use --rm and don't survive the host restart, so any 'running'
   // row in sessions is stale by definition at this point. Without this, the

@@ -389,3 +389,13 @@ ENTRYPOINT ["/usr/bin/tini", "--", "/app/entrypoint.sh"]
 # referenced earlier), so the rebuild is near-instant.
 ARG NANOCLAW_COMMIT=unknown
 LABEL nanoclaw.commit=$NANOCLAW_COMMIT
+
+# Agent-runner deps hash — sha256(sha256(package.json) || sha256(bun.lock))
+# sliced to 16 hex chars. Computed by container/build.sh and compared at host
+# spawn time by src/agent-runner-image-check.ts. Catches the "added a dep,
+# forgot to rebuild" footgun: agent-runner src is bind-mounted live but
+# node_modules is baked here, so a missing dep crash-loops every spawn with
+# no surfaced error. Same ARG+LABEL pattern as nanoclaw.commit above —
+# `docker build --label` is silently dropped on fully-cached rebuilds.
+ARG AGENT_RUNNER_DEPS_HASH=unknown
+LABEL nanoclaw.agentRunnerDepsHash=$AGENT_RUNNER_DEPS_HASH

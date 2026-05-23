@@ -49,8 +49,23 @@ fi
 NANOCLAW_COMMIT="$(cd "$PROJECT_ROOT" && git rev-parse HEAD 2>/dev/null || echo unknown)"
 BUILD_ARGS+=(--build-arg "NANOCLAW_COMMIT=${NANOCLAW_COMMIT}")
 
+# Hash of agent-runner deps (package.json + bun.lock). Stamped into the image
+# via ARG+LABEL so src/agent-runner-image-check.ts can detect drift between
+# the host's on-disk deps and what's baked in. MUST stay byte-identical to
+# computeAgentRunnerDepsHash() in src/agent-runner-image-check.ts.
+PKG_FILE="$PROJECT_ROOT/container/agent-runner/package.json"
+LOCK_FILE="$PROJECT_ROOT/container/agent-runner/bun.lock"
+if [ -r "$PKG_FILE" ] && [ -r "$LOCK_FILE" ]; then
+    PKG_SHA="$(sha256sum "$PKG_FILE" | awk '{print $1}')"
+    LOCK_SHA="$(sha256sum "$LOCK_FILE" | awk '{print $1}')"
+    AGENT_RUNNER_DEPS_HASH="$(printf '%s%s' "$PKG_SHA" "$LOCK_SHA" | sha256sum | cut -c1-16)"
+else
+    AGENT_RUNNER_DEPS_HASH="unknown"
+fi
+BUILD_ARGS+=(--build-arg "AGENT_RUNNER_DEPS_HASH=${AGENT_RUNNER_DEPS_HASH}")
+
 echo "Building NanoClaw agent container image..."
-echo "Image: ${IMAGE_REF} (commit ${NANOCLAW_COMMIT})"
+echo "Image: ${IMAGE_REF} (commit ${NANOCLAW_COMMIT}, agent-runner-deps ${AGENT_RUNNER_DEPS_HASH})"
 
 ${CONTAINER_RUNTIME} build "${BUILD_ARGS[@]}" -t "${IMAGE_REF}" .
 

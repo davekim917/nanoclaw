@@ -36,6 +36,7 @@ import {
 import { getContainerConfig } from './db/container-configs.js';
 import { updateContainerConfigScalars, updateContainerConfigJson } from './db/container-configs.js';
 import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainer } from './container-runtime.js';
+import { checkAgentRunnerDepsDrift } from './agent-runner-image-check.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
@@ -360,6 +361,23 @@ async function spawnContainer(session: Session): Promise<void> {
   if (!agentGroup) {
     log.error('Agent group not found', { agentGroupId: session.agent_group_id });
     return;
+  }
+
+  // Refuse spawn if the on-disk agent-runner deps (package.json + bun.lock)
+  // don't match what's baked into the image. The runner's src is bind-mounted
+  // live but node_modules is image-baked — adding a dep + import without
+  // ./container/build.sh crash-loops every spawn with no surfaced error.
+  // See src/agent-runner-image-check.ts.
+  const depsCheck = await checkAgentRunnerDepsDrift();
+  if (!depsCheck.ok) {
+    log.warn('Refusing spawn — agent-runner deps drift', {
+      sessionId: session.id,
+      agentGroup: agentGroup.name,
+      expected: depsCheck.expected,
+      actual: depsCheck.actual,
+      message: depsCheck.message,
+    });
+    throw new Error(depsCheck.message);
   }
 
   // Refresh the destination map and default reply routing so any admin
