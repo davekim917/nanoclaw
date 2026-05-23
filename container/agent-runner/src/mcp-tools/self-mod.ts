@@ -12,7 +12,9 @@
  * Package names are sanitized here at the tool boundary AND re-validated on
  * the host side (defense in depth).
  */
+import { getCentralDb } from '../db/connection.js';
 import { writeMessageOut } from '../db/messages-out.js';
+import { getConfig } from '../config.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
@@ -117,4 +119,106 @@ export const addMcpServer: McpToolDefinition = {
   },
 };
 
-registerTools([installPackages, addMcpServer]);
+export const listModels: McpToolDefinition = {
+  tool: {
+    name: 'list_models',
+    description:
+      'List the model slugs an operator has whitelisted for YOUR current provider. Returns [{slug, display_name, notes, default_effort, supports_effort, is_default}]. Use this before change_model to show valid options to the user, and to validate a slug they propose. Read-only, no approval needed.',
+    inputSchema: { type: 'object' as const, properties: {} },
+  },
+  async handler() {
+    const central = getCentralDb();
+    if (!central) return err('Central DB not mounted — cannot list models.');
+
+    const agentGroupId = getConfig().agentGroupId;
+    if (!agentGroupId) return err('No agent group ID — container not properly initialized.');
+
+    // Look up our own provider, then enumerate that provider's allowlist.
+    const config = central
+      .prepare('SELECT provider, model, effort FROM container_configs WHERE agent_group_id = ?')
+      .get(agentGroupId) as { provider: string | null; model: string | null; effort: string | null } | undefined;
+    if (!config?.provider) return err('No provider configured for this agent group.');
+
+    const rows = central
+      .prepare(
+        `SELECT slug, display_name, notes, default_effort, supports_effort, is_default
+         FROM provider_models WHERE provider = ?
+         ORDER BY is_default DESC, slug ASC`,
+      )
+      .all(config.provider) as Array<{
+      slug: string;
+      display_name: string | null;
+      notes: string | null;
+      default_effort: string | null;
+      supports_effort: number;
+      is_default: number;
+    }>;
+
+    if (rows.length === 0) {
+      return ok(
+        `No models whitelisted for provider "${config.provider}" yet. An operator must seed via "ncl provider-models add" first.`,
+      );
+    }
+
+    const payload = {
+      provider: config.provider,
+      current: { model: config.model, effort: config.effort },
+      models: rows.map((r) => ({
+        slug: r.slug,
+        display_name: r.display_name,
+        notes: r.notes,
+        default_effort: r.default_effort,
+        supports_effort: r.supports_effort === 1,
+        is_default: r.is_default === 1,
+      })),
+    };
+    return ok(JSON.stringify(payload, null, 2));
+  },
+};
+
+export const changeModel: McpToolDefinition = {
+  tool: {
+    name: 'change_model',
+    description:
+      "Request a model change for YOUR own container. Requires admin approval; fire-and-forget. On approval, the container's model (and optionally effort) is updated and the container is restarted. Use list_models first to discover valid slugs for your provider — passing a slug NOT in that allowlist is rejected at request time.",
+    inputSchema: {
+      type: 'object' as const,
+      properties: {
+        slug: {
+          type: 'string',
+          description:
+            'The model identifier to switch to (must be in the allowlist returned by list_models, e.g. "opencode/kimi-k2.6-thinking").',
+        },
+        effort: {
+          type: 'string',
+          enum: ['low', 'medium', 'high'],
+          description: 'Optional effort level. Omit to keep current.',
+        },
+        reason: { type: 'string', description: 'Why this change is needed — shown to the admin for context.' },
+      },
+      required: ['slug'],
+    },
+  },
+  async handler(args) {
+    const slug = args.slug as string;
+    const effort = args.effort as string | undefined;
+    const reason = (args.reason as string) || '';
+    if (!slug) return err('slug is required');
+    if (effort && !['low', 'medium', 'high'].includes(effort)) {
+      return err('effort must be one of: low, medium, high');
+    }
+
+    const requestId = generateId();
+    writeMessageOut({
+      id: requestId,
+      kind: 'system',
+      content: JSON.stringify({ action: 'change_model', slug, effort: effort ?? null, reason }),
+    });
+    log(`change_model: ${requestId} → ${slug}${effort ? ` (effort=${effort})` : ''}`);
+    return ok(
+      `Model change request submitted (${slug}). You will be notified when admin approves or rejects. Continue your current work; if the change is approved, the container will restart and you'll get a follow-up message.`,
+    );
+  },
+};
+
+registerTools([installPackages, addMcpServer, listModels, changeModel]);

@@ -70,3 +70,12 @@ export {
   updateContainerConfigJson,
   deleteContainerConfig,
 } from './container-configs.js';
+export {
+  listProviderModels,
+  getProviderModel,
+  isAllowedModel,
+  addProviderModel,
+  removeProviderModel,
+  type ProviderModel,
+  type ProviderModelInput,
+} from './provider-models.js';

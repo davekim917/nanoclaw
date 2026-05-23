@@ -89,3 +89,70 @@ export async function handleAddMcpServer(content: Record<string, unknown>, sessi
     question: `Agent "${agentGroup.name}" is attempting to add a new MCP server:\n${serverName} (${command})`,
   });
 }
+
+export async function handleChangeModel(content: Record<string, unknown>, session: Session): Promise<void> {
+  const agentGroup = getAgentGroup(session.agent_group_id);
+  if (!agentGroup) {
+    notifyAgent(session, 'change_model failed: agent group not found.');
+    return;
+  }
+  const { getContainerConfig } = await import('../../db/container-configs.js');
+  const config = getContainerConfig(agentGroup.id);
+  if (!config) {
+    notifyAgent(session, 'change_model failed: container config not found.');
+    return;
+  }
+  if (!config.provider) {
+    notifyAgent(session, 'change_model failed: group has no provider set; cannot validate model.');
+    return;
+  }
+
+  const slug = content.slug as string;
+  const effort = content.effort as string | undefined;
+  if (!slug) {
+    notifyAgent(session, 'change_model failed: --slug (the model identifier) is required.');
+    return;
+  }
+  if (effort && !['low', 'medium', 'high'].includes(effort)) {
+    notifyAgent(session, 'change_model failed: --effort must be one of: low, medium, high.');
+    return;
+  }
+
+  const { listProviderModels } = await import('../../db/provider-models.js');
+  const allowed = listProviderModels(config.provider);
+  if (allowed.length === 0) {
+    notifyAgent(
+      session,
+      `change_model failed: no allowlist seeded for provider "${config.provider}". An operator must run "ncl provider-models add" before models can be changed.`,
+    );
+    return;
+  }
+  const match = allowed.find((m) => m.slug === slug);
+  if (!match) {
+    const list = allowed.map((m) => `  - ${m.slug}${m.display_name ? ` (${m.display_name})` : ''}`).join('\n');
+    notifyAgent(
+      session,
+      `change_model failed: "${slug}" is not in the ${config.provider} allowlist. Valid options:\n${list}`,
+    );
+    return;
+  }
+
+  const reason = (content.reason as string) || '';
+  const question =
+    `Agent "${agentGroup.name}" requests model change to:\n` +
+    `${slug}${match.display_name ? ` (${match.display_name})` : ''}` +
+    (effort ? `\nEffort: ${effort}` : '') +
+    `\nProvider: ${config.provider}` +
+    `\nCurrent: ${config.model || '(none)'}${config.effort ? ` / ${config.effort}` : ''}` +
+    (reason ? `\nReason: ${reason}` : '') +
+    `\n\nThis will restart the container.`;
+
+  await requestApproval({
+    session,
+    agentName: agentGroup.name,
+    action: 'change_model',
+    payload: { slug, effort: effort ?? null, reason },
+    title: 'Change Model Request',
+    question,
+  });
+}

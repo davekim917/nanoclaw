@@ -12,7 +12,12 @@
  */
 import { buildAgentGroupImage, killContainer, wakeContainer } from '../../container-runner.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
-import { getContainerConfig, updateContainerConfigJson } from '../../db/container-configs.js';
+import {
+  getContainerConfig,
+  updateContainerConfigJson,
+  updateContainerConfigScalars,
+} from '../../db/container-configs.js';
+import { listProviderModels } from '../../db/provider-models.js';
 import { getSession } from '../../db/sessions.js';
 import type { McpServerConfig } from '../../container-config.js';
 import { log } from '../../log.js';
@@ -123,4 +128,70 @@ export const applyAddMcpServer: ApprovalHandler = async ({ session, payload, use
     if (s) wakeContainer(s);
   });
   log.info('MCP server add approved', { agentGroupId: session.agent_group_id, userId });
+};
+
+export const applyChangeModel: ApprovalHandler = async ({ session, payload, userId, notify }) => {
+  const agentGroup = getAgentGroup(session.agent_group_id);
+  if (!agentGroup) {
+    await notify('change_model approved but agent group missing.');
+    return;
+  }
+  const config = getContainerConfig(agentGroup.id);
+  if (!config) {
+    await notify('change_model approved but container config missing.');
+    return;
+  }
+  if (!config.provider) {
+    await notify('change_model approved but group has no provider — cannot revalidate model.');
+    return;
+  }
+
+  const slug = payload.slug as string;
+  const effort = payload.effort as string | null;
+
+  // Defense-in-depth: re-validate against the allowlist at apply time, in
+  // case the allowlist changed between request and approval.
+  const allowed = listProviderModels(config.provider);
+  if (!allowed.some((m) => m.slug === slug)) {
+    await notify(
+      `change_model approved but "${slug}" is no longer in the ${config.provider} allowlist. Aborted — re-request if still desired.`,
+    );
+    return;
+  }
+
+  // Update both model and (optionally) effort scalars in container_configs.
+  // Effort is applied alongside so the agent gets a coherent next-spawn state.
+  const updates: Parameters<typeof updateContainerConfigScalars>[1] = { model: slug };
+  if (effort) updates.effort = effort;
+  updateContainerConfigScalars(agentGroup.id, updates);
+
+  log.info('Model change approved', {
+    agentGroupId: session.agent_group_id,
+    userId,
+    previousModel: config.model,
+    newModel: slug,
+    effort,
+  });
+
+  writeSessionMessage(session.agent_group_id, session.id, {
+    id: `appr-note-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    kind: 'chat',
+    timestamp: new Date().toISOString(),
+    platformId: session.agent_group_id,
+    channelType: 'agent',
+    threadId: null,
+    content: JSON.stringify({
+      text:
+        `Model changed to "${slug}"${effort ? ` (effort: ${effort})` : ''}. Container has restarted on the new model. ` +
+        `Briefly confirm what model you're now running, then continue the work.`,
+      sender: 'system',
+      senderId: 'system',
+    }),
+    onWake: 1,
+  });
+
+  killContainer(session.id, 'model changed', () => {
+    const s = getSession(session.id);
+    if (s) wakeContainer(s);
+  });
 };

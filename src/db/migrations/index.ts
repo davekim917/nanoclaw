@@ -35,6 +35,7 @@ import { migration032 } from './032-sessions-last-outbound.js';
 import { migration033 } from './033-steer-idempotency-drop-task-id.js';
 import { migration035 } from './035-drop-thread-walkie-state.js';
 import { migration036 } from './036-workgroup-id.js';
+import { migration037 } from './037-provider-models.js';
 // Upstream's 014/015 — file numbers clash with local but uniqueness is by `name`.
 // Aliased to avoid JS identifier collisions with the local 014/015 above.
 import { migration014 as containerConfigs } from './014-container-configs.js';
@@ -76,6 +77,7 @@ const migrations: Migration[] = [
   migration033,
   migration035,
   migration036,
+  migration037,
   containerConfigs,
   cliScope,
 ];
