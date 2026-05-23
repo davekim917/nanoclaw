@@ -35,10 +35,13 @@ const LABEL_KEY = 'nanoclaw.agentRunnerDepsHash';
 const PKG_PATH = path.join(REPO_ROOT, 'container/agent-runner/package.json');
 const LOCK_PATH = path.join(REPO_ROOT, 'container/agent-runner/bun.lock');
 
-let cachedOk = false;
+// Cache positive results per image ref. Drift results are NOT cached so the
+// next spawn after a rebuild picks up the new label without a host restart.
+const okImageRefs = new Set<string>();
 
 export interface DepsDriftCheck {
   ok: boolean;
+  imageRef: string;
   expected: string | null;
   actual: string | null;
   message: string;
@@ -55,14 +58,17 @@ async function fileSha256Hex(p: string): Promise<string> {
  */
 export async function computeAgentRunnerDepsHash(): Promise<string> {
   const [pkgHash, lockHash] = await Promise.all([fileSha256Hex(PKG_PATH), fileSha256Hex(LOCK_PATH)]);
-  return createHash('sha256').update(pkgHash + lockHash).digest('hex').slice(0, 16);
+  return createHash('sha256')
+    .update(pkgHash + lockHash)
+    .digest('hex')
+    .slice(0, 16);
 }
 
-async function imageLabel(): Promise<string | null> {
+async function imageLabel(imageRef: string): Promise<string | null> {
   try {
     const { stdout } = await execFileAsync(
       CONTAINER_RUNTIME_BIN,
-      ['inspect', '--format', `{{index .Config.Labels "${LABEL_KEY}"}}`, CONTAINER_IMAGE],
+      ['inspect', '--format', `{{index .Config.Labels "${LABEL_KEY}"}}`, imageRef],
       { timeout: 10_000 },
     );
     const v = stdout.trim();
@@ -72,32 +78,41 @@ async function imageLabel(): Promise<string | null> {
   }
 }
 
-export async function checkAgentRunnerDepsDrift(): Promise<DepsDriftCheck> {
-  if (cachedOk) {
-    return { ok: true, expected: null, actual: null, message: 'cached OK' };
+/**
+ * Check the given image (defaults to CONTAINER_IMAGE — the shared base).
+ * Per-agent images built via install_packages override the spawn image, so
+ * spawnContainer passes the resolved containerConfig.imageTag to catch
+ * derived-image drift too. Docker label inheritance means per-agent images
+ * derived FROM a freshly-rebuilt base get the new label automatically.
+ */
+export async function checkAgentRunnerDepsDrift(imageRef: string = CONTAINER_IMAGE): Promise<DepsDriftCheck> {
+  if (okImageRefs.has(imageRef)) {
+    return { ok: true, imageRef, expected: null, actual: null, message: 'cached OK' };
   }
-  const [expected, actual] = await Promise.all([computeAgentRunnerDepsHash(), imageLabel()]);
+  const [expected, actual] = await Promise.all([computeAgentRunnerDepsHash(), imageLabel(imageRef)]);
   const rebuildHint = 'cd container/agent-runner && bun install && cd ../.. && ./container/build.sh';
   if (actual === null) {
     return {
       ok: false,
+      imageRef,
       expected,
       actual: null,
-      message: `agent-runner image ${CONTAINER_IMAGE} missing ${LABEL_KEY} label — rebuild needed: ${rebuildHint}`,
+      message: `agent-runner image ${imageRef} missing ${LABEL_KEY} label — rebuild needed: ${rebuildHint}`,
     };
   }
   if (actual !== expected) {
     return {
       ok: false,
+      imageRef,
       expected,
       actual,
-      message: `agent-runner deps drift: image baked from ${actual}, current files hash to ${expected}. Run: ${rebuildHint}`,
+      message: `agent-runner deps drift on ${imageRef}: image baked from ${actual}, current files hash to ${expected}. Run: ${rebuildHint}`,
     };
   }
-  cachedOk = true;
-  return { ok: true, expected, actual, message: 'agent-runner deps in sync' };
+  okImageRefs.add(imageRef);
+  return { ok: true, imageRef, expected, actual, message: 'agent-runner deps in sync' };
 }
 
 export function _resetCacheForTests(): void {
-  cachedOk = false;
+  okImageRefs.clear();
 }

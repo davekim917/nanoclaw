@@ -12,7 +12,10 @@ describe('computeAgentRunnerDepsHash', () => {
     const lock = await readFile(path.join(REPO_ROOT, 'container/agent-runner/bun.lock'));
     const pkgHash = createHash('sha256').update(pkg).digest('hex');
     const lockHash = createHash('sha256').update(lock).digest('hex');
-    const expected = createHash('sha256').update(pkgHash + lockHash).digest('hex').slice(0, 16);
+    const expected = createHash('sha256')
+      .update(pkgHash + lockHash)
+      .digest('hex')
+      .slice(0, 16);
     const actual = await computeAgentRunnerDepsHash();
     expect(actual).toBe(expected);
     expect(actual).toMatch(/^[0-9a-f]{16}$/);
