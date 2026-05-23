@@ -53,12 +53,27 @@ BUILD_ARGS+=(--build-arg "NANOCLAW_COMMIT=${NANOCLAW_COMMIT}")
 # via ARG+LABEL so src/agent-runner-image-check.ts can detect drift between
 # the host's on-disk deps and what's baked in. MUST stay byte-identical to
 # computeAgentRunnerDepsHash() in src/agent-runner-image-check.ts.
+#
+# Linux ships `sha256sum`; macOS ships `shasum`. Either prints "<hex>  <path>"
+# so the `awk '{print $1}'` extraction is identical. Apple Container users
+# build this image on macOS hosts — without the fallback `set -e` aborts here
+# and the spawn gate then refuses every container until tooling is installed.
+if command -v sha256sum >/dev/null 2>&1; then
+    sha256_file() { sha256sum "$1" | awk '{print $1}'; }
+    sha256_stdin() { sha256sum | awk '{print $1}'; }
+elif command -v shasum >/dev/null 2>&1; then
+    sha256_file() { shasum -a 256 "$1" | awk '{print $1}'; }
+    sha256_stdin() { shasum -a 256 | awk '{print $1}'; }
+else
+    echo "neither sha256sum nor shasum found on PATH — cannot stamp agent-runner deps hash" >&2
+    exit 1
+fi
 PKG_FILE="$PROJECT_ROOT/container/agent-runner/package.json"
 LOCK_FILE="$PROJECT_ROOT/container/agent-runner/bun.lock"
 if [ -r "$PKG_FILE" ] && [ -r "$LOCK_FILE" ]; then
-    PKG_SHA="$(sha256sum "$PKG_FILE" | awk '{print $1}')"
-    LOCK_SHA="$(sha256sum "$LOCK_FILE" | awk '{print $1}')"
-    AGENT_RUNNER_DEPS_HASH="$(printf '%s%s' "$PKG_SHA" "$LOCK_SHA" | sha256sum | cut -c1-16)"
+    PKG_SHA="$(sha256_file "$PKG_FILE")"
+    LOCK_SHA="$(sha256_file "$LOCK_FILE")"
+    AGENT_RUNNER_DEPS_HASH="$(printf '%s%s' "$PKG_SHA" "$LOCK_SHA" | sha256_stdin | cut -c1-16)"
 else
     AGENT_RUNNER_DEPS_HASH="unknown"
 fi

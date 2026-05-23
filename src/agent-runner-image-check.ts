@@ -13,12 +13,13 @@
  *
  * Defense: container/build.sh hashes package.json + bun.lock, bakes the hash
  * into the image as a LABEL (nanoclaw.agentRunnerDepsHash). On every spawn we
- * compare the on-disk hash against the image label. Mismatch → refuse to
- * spawn with an actionable message naming the rebuild command.
+ * recompute the on-disk hash and compare against the image label. Mismatch →
+ * refuse to spawn with an actionable message naming the rebuild command.
  *
- * Caches the OK result for the process lifetime so repeated spawns skip the
- * docker inspect. Drift results are NOT cached — the next spawn after
- * `./container/build.sh` picks up the new label without a host restart.
+ * Intentionally uncached: the failure mode is exactly "operator edits
+ * package.json without rebuilding", so a cache keyed on imageRef alone would
+ * mask the very edits we're guarding against. ~50ms per spawn (two file reads
+ * + one docker inspect) is negligible against multi-second spawn cost.
  */
 import { createHash } from 'crypto';
 import { readFile } from 'fs/promises';
@@ -35,15 +36,18 @@ const LABEL_KEY = 'nanoclaw.agentRunnerDepsHash';
 const PKG_PATH = path.join(REPO_ROOT, 'container/agent-runner/package.json');
 const LOCK_PATH = path.join(REPO_ROOT, 'container/agent-runner/bun.lock');
 
-// Cache positive results per image ref. Drift results are NOT cached so the
-// next spawn after a rebuild picks up the new label without a host restart.
-const okImageRefs = new Set<string>();
+export type LabelLookup =
+  | { kind: 'found'; value: string }
+  | { kind: 'missing' } // image exists but has no label (built by an old build.sh)
+  | { kind: 'no-image' } // docker doesn't know this image ref
+  | { kind: 'inspect-error'; reason: string }; // daemon down, timeout, permissions, etc.
 
 export interface DepsDriftCheck {
   ok: boolean;
   imageRef: string;
   expected: string | null;
   actual: string | null;
+  lookup: LabelLookup;
   message: string;
 }
 
@@ -64,7 +68,12 @@ export async function computeAgentRunnerDepsHash(): Promise<string> {
     .slice(0, 16);
 }
 
-async function imageLabel(imageRef: string): Promise<string | null> {
+/**
+ * Inspect the image's deps-hash label, distinguishing operational failures
+ * (daemon down, timeout) from "image exists but unlabeled" and "image not
+ * found." Conflating these would send operators to the wrong remediation.
+ */
+async function lookupImageLabel(imageRef: string): Promise<LabelLookup> {
   try {
     const { stdout } = await execFileAsync(
       CONTAINER_RUNTIME_BIN,
@@ -72,10 +81,31 @@ async function imageLabel(imageRef: string): Promise<string | null> {
       { timeout: 10_000 },
     );
     const v = stdout.trim();
-    return v && v !== '<no value>' ? v : null;
-  } catch {
-    return null;
+    if (v && v !== '<no value>') return { kind: 'found', value: v };
+    return { kind: 'missing' };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    // `docker inspect` writes "Error: No such object: <ref>" / "No such image"
+    // to stderr and exits 1. node's execFile surfaces it in the thrown error.
+    if (/No such (object|image|container)/i.test(msg)) {
+      return { kind: 'no-image' };
+    }
+    return { kind: 'inspect-error', reason: msg };
   }
+}
+
+function rebuildHint(imageRef: string): string {
+  if (imageRef === CONTAINER_IMAGE) {
+    return 'cd container/agent-runner && bun install && cd ../.. && ./container/build.sh';
+  }
+  // Per-agent override (buildAgentGroupImage / install_packages). Rebuilding
+  // just the base does NOT update the derived image — operator must re-run
+  // install_packages so the derived image inherits the freshly-stamped label.
+  return (
+    'this is a per-agent override image (built via install_packages). ' +
+    'Rebuild the base first: cd container/agent-runner && bun install && cd ../.. && ./container/build.sh — ' +
+    'then re-run the install_packages self-mod (or equivalent) so the derived image inherits the new label.'
+  );
 }
 
 /**
@@ -86,33 +116,49 @@ async function imageLabel(imageRef: string): Promise<string | null> {
  * derived FROM a freshly-rebuilt base get the new label automatically.
  */
 export async function checkAgentRunnerDepsDrift(imageRef: string = CONTAINER_IMAGE): Promise<DepsDriftCheck> {
-  if (okImageRefs.has(imageRef)) {
-    return { ok: true, imageRef, expected: null, actual: null, message: 'cached OK' };
-  }
-  const [expected, actual] = await Promise.all([computeAgentRunnerDepsHash(), imageLabel(imageRef)]);
-  const rebuildHint = 'cd container/agent-runner && bun install && cd ../.. && ./container/build.sh';
-  if (actual === null) {
-    return {
-      ok: false,
-      imageRef,
-      expected,
-      actual: null,
-      message: `agent-runner image ${imageRef} missing ${LABEL_KEY} label — rebuild needed: ${rebuildHint}`,
-    };
-  }
-  if (actual !== expected) {
-    return {
-      ok: false,
-      imageRef,
-      expected,
-      actual,
-      message: `agent-runner deps drift on ${imageRef}: image baked from ${actual}, current files hash to ${expected}. Run: ${rebuildHint}`,
-    };
-  }
-  okImageRefs.add(imageRef);
-  return { ok: true, imageRef, expected, actual, message: 'agent-runner deps in sync' };
-}
+  const [expected, lookup] = await Promise.all([computeAgentRunnerDepsHash(), lookupImageLabel(imageRef)]);
 
-export function _resetCacheForTests(): void {
-  okImageRefs.clear();
+  switch (lookup.kind) {
+    case 'inspect-error':
+      return {
+        ok: false,
+        imageRef,
+        expected,
+        actual: null,
+        lookup,
+        message: `agent-runner deps check: docker inspect ${imageRef} failed (${lookup.reason}). Not necessarily a drift — verify the container runtime is reachable.`,
+      };
+    case 'no-image':
+      return {
+        ok: false,
+        imageRef,
+        expected,
+        actual: null,
+        lookup,
+        message: `agent-runner image ${imageRef} not found — build it: ${rebuildHint(imageRef)}`,
+      };
+    case 'missing':
+      return {
+        ok: false,
+        imageRef,
+        expected,
+        actual: null,
+        lookup,
+        message: `agent-runner image ${imageRef} has no ${LABEL_KEY} label (built by an older build.sh) — rebuild: ${rebuildHint(imageRef)}`,
+      };
+    case 'found': {
+      const actual = lookup.value;
+      if (actual !== expected) {
+        return {
+          ok: false,
+          imageRef,
+          expected,
+          actual,
+          lookup,
+          message: `agent-runner deps drift on ${imageRef}: image baked from ${actual}, current files hash to ${expected}. Run: ${rebuildHint(imageRef)}`,
+        };
+      }
+      return { ok: true, imageRef, expected, actual, lookup, message: 'agent-runner deps in sync' };
+    }
+  }
 }
