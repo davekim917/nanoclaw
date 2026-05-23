@@ -149,9 +149,6 @@ function buildOpenCodeConfig(options: ProviderOptions): Record<string, unknown> 
   const provider = process.env.OPENCODE_PROVIDER || 'anthropic';
   const model = process.env.OPENCODE_MODEL;
   const smallModel = process.env.OPENCODE_SMALL_MODEL;
-  // Prefer OPENCODE_BASE_URL; fall back to ANTHROPIC_BASE_URL for back-compat
-  // with older add-opencode skill examples that overloaded the Anthropic env.
-  const proxyUrl = process.env.OPENCODE_BASE_URL ?? process.env.ANTHROPIC_BASE_URL;
 
   const providerModelId = model ? model.replace(new RegExp(`^${provider}/`), '') : undefined;
   const providerSmallModelId = smallModel ? smallModel.replace(new RegExp(`^${provider}/`), '') : undefined;
@@ -213,13 +210,14 @@ function buildOpenCodeConfig(options: ProviderOptions): Record<string, unknown> 
   //   - apiKey: only injected for the OneCLI-proxy path (non-OAuth providers).
   //     When auth.json is mounted, the SDK reads it natively and we MUST NOT
   //     override or it'd send 'placeholder' as the Bearer token.
-  //   - baseURL: always honored when env says so. For the `opencode` provider
-  //     this is how callers select Go (https://opencode.ai/zen/go/v1) vs Zen
-  //     (https://opencode.ai/zen/v1) — both billing endpoints accept the same
-  //     auth.json but route to different model catalogs + credit pools.
+  //   - baseURL: NOT set. OpenCode's provider registry routes based on the
+  //     cred-key in auth.json (`opencode-go` → /zen/go/v1, `opencode` →
+  //     /zen/v1, `nvidia` → NVIDIA's endpoint, etc.) — no manual override
+  //     needed. Earlier code took an OPENCODE_BASE_URL env var as a hack
+  //     to force Go billing; that's now unnecessary and was removed
+  //     2026-05-23 alongside the host-side passthrough.
   const sdkOptions: Record<string, unknown> = {};
   if (!opencodeAuthAvailable) sdkOptions.apiKey = 'placeholder';
-  if (proxyUrl) sdkOptions.baseURL = proxyUrl;
 
   const providerOptions: Record<string, unknown> =
     provider === 'anthropic'

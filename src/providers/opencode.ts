@@ -155,14 +155,11 @@ registerProviderContainerConfig('opencode', (ctx) => {
   // mirror the pattern above.
   const smallModel = resolveScopedEnv('OPENCODE_SMALL_MODEL', ctx.agentGroupFolder, ctx.hostEnv);
   if (smallModel) env.OPENCODE_SMALL_MODEL = smallModel;
-  // OPENCODE_BASE_URL — opencode provider's baseURL override (Go vs Zen endpoint
-  // selection). Falls back to ANTHROPIC_BASE_URL for back-compat with older
-  // skill examples that overloaded the Anthropic env var. The container code
-  // also accepts either, but new wiring should prefer OPENCODE_BASE_URL.
-  const baseUrl =
-    resolveScopedEnv('OPENCODE_BASE_URL', ctx.agentGroupFolder, ctx.hostEnv) ??
-    resolveScopedEnv('ANTHROPIC_BASE_URL', ctx.agentGroupFolder, ctx.hostEnv);
-  if (baseUrl) env.OPENCODE_BASE_URL = baseUrl;
+  // Endpoint routing is determined by the cred-key in auth.json + the model
+  // slug prefix (opencode-go/* → /zen/go/v1, opencode/* → /zen/v1, nvidia/*
+  // → NVIDIA, etc.). We do NOT pass OPENCODE_BASE_URL — OpenCode's provider
+  // registry handles the URL automatically. (Removed 2026-05-23 after the
+  // earlier "force Go billing via base URL" hack proved unnecessary.)
 
   return {
     mounts: [{ hostPath: opencodeDir, containerPath: '/opencode-xdg', readonly: false }],
