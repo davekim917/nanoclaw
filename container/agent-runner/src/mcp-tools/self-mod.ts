@@ -158,17 +158,28 @@ export const listModels: McpToolDefinition = {
     const agentGroupId = getConfig().agentGroupId;
     if (!agentGroupId) return err('No agent group ID — container not properly initialized.');
 
+    // Both tables come from the per-session central-db projection
+    // (src/db/per-agent-projections.ts). Missing tables on an older session
+    // shouldn't kill the tool — we still want the model list to surface.
     let config: { provider: string | null; model: string | null; effort: string | null } | undefined;
     let deniedSet = new Set<string>();
     if (central) {
-      config = central
-        .prepare('SELECT provider, model, effort FROM container_configs WHERE agent_group_id = ?')
-        .get(agentGroupId) as typeof config;
+      try {
+        config = central
+          .prepare('SELECT provider, model, effort FROM container_configs WHERE agent_group_id = ?')
+          .get(agentGroupId) as typeof config;
+      } catch (e) {
+        log(`list_models: container_configs unavailable (${e instanceof Error ? e.message : String(e)})`);
+      }
       if (config?.provider) {
-        const deniedRows = central
-          .prepare('SELECT slug FROM denied_models WHERE provider = ?')
-          .all(config.provider) as Array<{ slug: string }>;
-        deniedSet = new Set(deniedRows.map((r) => r.slug));
+        try {
+          const deniedRows = central
+            .prepare('SELECT slug FROM denied_models WHERE provider = ?')
+            .all(config.provider) as Array<{ slug: string }>;
+          deniedSet = new Set(deniedRows.map((r) => r.slug));
+        } catch (e) {
+          log(`list_models: denied_models unavailable (${e instanceof Error ? e.message : String(e)})`);
+        }
       }
     }
 

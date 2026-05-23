@@ -215,13 +215,29 @@ export function buildCentralProjection(srcPath: string, dstPath: string, agentGr
     const src = new Database(srcPath, { readonly: true });
     try {
       // Copy ONLY the schemas the container actually reads.
-      const allowed = new Set(['backlog_items', 'ship_log', 'tasks', 'agent_group_capabilities']);
+      const allowed = new Set([
+        'backlog_items',
+        'ship_log',
+        'tasks',
+        'agent_group_capabilities',
+        // container_configs: per-agent row carrying provider/model/effort/etc.
+        // Container's list_models MCP tool reads it to annotate "current model"
+        // in the response. Filtered to the agent's own row only.
+        'container_configs',
+        // denied_models: operator-curated blocklist of (provider, slug) pairs.
+        // Container's list_models filters its `opencode models` output through
+        // this. Operator policy, not tenant data — projected wholesale.
+        'denied_models',
+      ]);
       // Tables that don't use agent_group_id as their filter column.
+      // '*' means "no filter, copy all rows" (used for global operator policy).
       const filterColumnByTable: Record<string, string> = {
         backlog_items: 'agent_group_id',
         ship_log: 'agent_group_id',
         agent_group_capabilities: 'agent_group_id',
         tasks: 'parent_agent_group_id',
+        container_configs: 'agent_group_id',
+        denied_models: '*',
       };
       const schemaRows = src
         .prepare(
@@ -248,9 +264,13 @@ export function buildCentralProjection(srcPath: string, dstPath: string, agentGr
           if (cols.length === 0) continue; // table doesn't exist in src
           const colList = cols.map((c) => c.name).join(', ');
           const placeholders = cols.map(() => '?').join(', ');
-          const rows = src.prepare(`SELECT ${colList} FROM ${table} WHERE ${filterCol} = ?`).all(agentGroupId) as Array<
-            Record<string, unknown>
-          >;
+          // '*' = global table, copy all rows (e.g. operator-policy tables like denied_models).
+          // Anything else = per-agent filter on that column.
+          const rows = (
+            filterCol === '*'
+              ? src.prepare(`SELECT ${colList} FROM ${table}`).all()
+              : src.prepare(`SELECT ${colList} FROM ${table} WHERE ${filterCol} = ?`).all(agentGroupId)
+          ) as Array<Record<string, unknown>>;
           const insertStmt = dst.prepare(`INSERT INTO ${table} (${colList}) VALUES (${placeholders})`);
           for (const row of rows) {
             insertStmt.run(...cols.map((c) => row[c.name]));

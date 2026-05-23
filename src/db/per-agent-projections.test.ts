@@ -6,7 +6,6 @@ import path from 'path';
 import { buildCentralProjection, buildArchiveProjection } from './per-agent-projections.js';
 import { migration025 } from './migrations/025-agent-group-capabilities.js';
 import { migration026 } from './migrations/026-tasks-and-dispatch-routing.js';
-import { migration036 } from './migrations/036-workgroup-id.js';
 
 const tmpFiles: string[] = [];
 
@@ -640,6 +639,84 @@ describe('buildCentralProjection', () => {
     expect(tableExists(dst, 'ship_log')).toBe(true);
     expect(countRows(dst, 'tasks')).toBe(0);
     expect(countRows(dst, 'agent_group_capabilities')).toBe(0);
+  });
+
+  it('test_container_configs_filtered_to_self_only', () => {
+    // container_configs is per-agent; the projection must only carry this
+    // agent's own row, never any other group's config.
+    const src = makeSrcFile('p-cc-src');
+    addAgent(src, 'ag-self');
+    addAgent(src, 'ag-other');
+    withDb(src, (db) => {
+      db.exec(`
+        CREATE TABLE container_configs (
+          agent_group_id TEXT PRIMARY KEY,
+          provider       TEXT,
+          model          TEXT,
+          effort         TEXT,
+          config_json    TEXT,
+          updated_at     TEXT NOT NULL
+        );
+      `);
+      db.prepare(
+        `INSERT INTO container_configs (agent_group_id, provider, model, effort, config_json, updated_at)
+         VALUES (?, ?, ?, ?, '{}', '2026-01-01')`,
+      ).run('ag-self', 'opencode', 'opencode/kimi-k2.6', 'medium');
+      db.prepare(
+        `INSERT INTO container_configs (agent_group_id, provider, model, effort, config_json, updated_at)
+         VALUES (?, ?, ?, ?, '{}', '2026-01-01')`,
+      ).run('ag-other', 'codex', 'gpt-5.5', 'high');
+    });
+
+    const dst = tmpPath('p-cc-dst');
+    buildCentralProjection(src, dst, 'ag-self');
+
+    expect(countRows(dst, 'container_configs')).toBe(1);
+    const db = new Database(dst, { readonly: true });
+    try {
+      const row = db.prepare(`SELECT agent_group_id, model FROM container_configs`).get() as {
+        agent_group_id: string;
+        model: string;
+      };
+      expect(row.agent_group_id).toBe('ag-self');
+      expect(row.model).toBe('opencode/kimi-k2.6');
+    } finally {
+      db.close();
+    }
+  });
+
+  it('test_denied_models_projected_wholesale_across_providers', () => {
+    // denied_models is operator policy (not tenant-scoped) — every row is
+    // projected so the agent can filter its `opencode models` output against
+    // the full set without needing to know its own provider first.
+    const src = makeSrcFile('p-dm-src');
+    addAgent(src, 'ag-self');
+    withDb(src, (db) => {
+      db.exec(`
+        CREATE TABLE denied_models (
+          provider   TEXT NOT NULL,
+          slug       TEXT NOT NULL,
+          reason     TEXT,
+          created_at TEXT NOT NULL,
+          PRIMARY KEY (provider, slug)
+        );
+      `);
+      db.prepare(`INSERT INTO denied_models (provider, slug, reason, created_at) VALUES (?, ?, ?, '2026-01-01')`).run(
+        'opencode',
+        'anthropic/claude-opus-4-7',
+        'wrong billing tier',
+      );
+      db.prepare(`INSERT INTO denied_models (provider, slug, reason, created_at) VALUES (?, ?, ?, '2026-01-01')`).run(
+        'codex',
+        'gpt-5.5-mini',
+        'placeholder reason',
+      );
+    });
+
+    const dst = tmpPath('p-dm-dst');
+    buildCentralProjection(src, dst, 'ag-self');
+
+    expect(countRows(dst, 'denied_models')).toBe(2);
   });
 
   it('test_existing_backlog_and_shiplog_still_copied', () => {
