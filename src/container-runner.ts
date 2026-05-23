@@ -36,6 +36,7 @@ import {
 import { getContainerConfig } from './db/container-configs.js';
 import { updateContainerConfigScalars, updateContainerConfigJson } from './db/container-configs.js';
 import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainer } from './container-runtime.js';
+import { checkAgentRunnerDepsDrift } from './agent-runner-image-check.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
@@ -379,6 +380,27 @@ async function spawnContainer(session: Session): Promise<void> {
   // Read container config once — threaded through provider resolution,
   // buildMounts, and buildContainerArgs so we don't re-read the file.
   const containerConfig = readContainerConfig(agentGroup.folder);
+
+  // Refuse spawn if the agent-runner deps (package.json + bun.lock) on disk
+  // don't match what's baked into the image we'd spawn from. Source is
+  // bind-mounted live but node_modules is image-baked — adding a dep +
+  // import without ./container/build.sh crash-loops every spawn with no
+  // surfaced error. Passes the resolved imageTag (per-agent override or the
+  // shared base) so derived images built via install_packages are checked
+  // against their own label, not the base's. See src/agent-runner-image-check.ts.
+  const spawnImageRef = containerConfig.imageTag || CONTAINER_IMAGE;
+  const depsCheck = await checkAgentRunnerDepsDrift(spawnImageRef);
+  if (!depsCheck.ok) {
+    log.warn('Refusing spawn — agent-runner deps drift', {
+      sessionId: session.id,
+      agentGroup: agentGroup.name,
+      imageRef: depsCheck.imageRef,
+      expected: depsCheck.expected,
+      actual: depsCheck.actual,
+      message: depsCheck.message,
+    });
+    throw new Error(depsCheck.message);
+  }
 
   // Ensure container.json has the agent group identity fields the runner needs.
   // Written at spawn time so the runner can read them from the RO mount.
