@@ -25,9 +25,7 @@ export function listDeniedModels(provider?: string): DeniedModel[] {
       .prepare('SELECT * FROM denied_models WHERE provider = ? ORDER BY slug ASC')
       .all(provider) as DeniedModel[];
   }
-  return getDb()
-    .prepare('SELECT * FROM denied_models ORDER BY provider ASC, slug ASC')
-    .all() as DeniedModel[];
+  return getDb().prepare('SELECT * FROM denied_models ORDER BY provider ASC, slug ASC').all() as DeniedModel[];
 }
 
 export function getDeniedModel(provider: string, slug: string): DeniedModel | undefined {

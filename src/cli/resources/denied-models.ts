@@ -1,9 +1,4 @@
-import {
-  addDeniedModel,
-  getDeniedModel,
-  listDeniedModels,
-  removeDeniedModel,
-} from '../../db/denied-models.js';
+import { addDeniedModel, getDeniedModel, listDeniedModels, removeDeniedModel } from '../../db/denied-models.js';
 import { registerResource } from '../crud.js';
 
 /**
