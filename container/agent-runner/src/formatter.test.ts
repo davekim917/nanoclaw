@@ -13,7 +13,8 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
 import { initTestSessionDb, closeSessionDb, getInboundDb } from './db/connection.js';
 import { getPendingMessages } from './db/messages-in.js';
-import { formatMessages, stripInternalTags } from './formatter.js';
+import { formatMessages, stripInternalTags, categorizeMessage, isClearCommand } from './formatter.js';
+import type { MessageInRow } from './db/messages-in.js';
 import { TIMEZONE } from './timezone.js';
 
 // seq is NULL-allowed in the schema; assign monotonically per test so
@@ -358,6 +359,115 @@ describe('spawn cancel envelope (_spawn_cancel)', () => {
     const result = formatMessages(getPendingMessages());
     // Should be a plain readable system note, not raw JSON
     expect(result).not.toContain('"task_id"');
+  });
+});
+
+describe('categorizeMessage — thread-context + leading mentions', () => {
+  function chatRow(text: string): MessageInRow {
+    return {
+      id: 'm1',
+      kind: 'chat-sdk',
+      timestamp: new Date().toISOString(),
+      status: 'pending',
+      process_after: null,
+      recurrence: null,
+      tries: 0,
+      trigger: 1,
+      seq: 1,
+      platform_id: null,
+      channel_type: 'slack',
+      thread_id: null,
+      content: JSON.stringify({ text }),
+    };
+  }
+
+  it('classifies /compact wrapped with [Thread context]/[Latest message] as admin', () => {
+    const wrapped = '[Thread context]\nalice: hi\nbot: how can I help?\n[Latest message]\n/compact';
+    const info = categorizeMessage(chatRow(wrapped));
+    expect(info.category).toBe('admin');
+    expect(info.command).toBe('/compact');
+    expect(info.text).toBe('/compact');
+  });
+
+  it('classifies /compact wrapped with [New in thread since last response] as admin', () => {
+    const wrapped = '[New in thread since last response]\nalice: ping\n[Latest message]\n/compact';
+    const info = categorizeMessage(chatRow(wrapped));
+    expect(info.category).toBe('admin');
+    expect(info.text).toBe('/compact');
+  });
+
+  it('strips leading Discord/Slack <@id> mention before classifying', () => {
+    const info = categorizeMessage(chatRow('<@U0AKALV5HRP> /compact'));
+    expect(info.category).toBe('admin');
+    expect(info.text).toBe('/compact');
+  });
+
+  it('strips a bare @name mention before classifying', () => {
+    const info = categorizeMessage(chatRow('@axie /compact'));
+    expect(info.category).toBe('admin');
+    expect(info.text).toBe('/compact');
+  });
+
+  it('handles thread-context wrapping AND a leading mention together', () => {
+    const wrapped = '[Thread context]\nalice: hi\n[Latest message]\n<@U0AKALV5HRP> /compact';
+    const info = categorizeMessage(chatRow(wrapped));
+    expect(info.category).toBe('admin');
+    expect(info.text).toBe('/compact');
+  });
+
+  it('returns category=none for plain prose containing the marker as quoted text', () => {
+    const info = categorizeMessage(chatRow('I typed [Latest message]\nplease compact this'));
+    expect(info.category).toBe('none');
+  });
+
+  it('does not false-positive when [Latest message] appears inside a quoted body', () => {
+    const info = categorizeMessage(chatRow('just chatting'));
+    expect(info.category).toBe('none');
+  });
+
+  it('still classifies a plain (unwrapped) /compact as admin', () => {
+    const info = categorizeMessage(chatRow('/compact'));
+    expect(info.category).toBe('admin');
+    expect(info.text).toBe('/compact');
+  });
+});
+
+describe('isClearCommand — thread-context + leading mentions', () => {
+  function chatRow(text: string): MessageInRow {
+    return {
+      id: 'm1',
+      kind: 'chat-sdk',
+      timestamp: new Date().toISOString(),
+      status: 'pending',
+      process_after: null,
+      recurrence: null,
+      tries: 0,
+      trigger: 1,
+      seq: 1,
+      platform_id: null,
+      channel_type: 'slack',
+      thread_id: null,
+      content: JSON.stringify({ text }),
+    };
+  }
+
+  it('recognizes /clear wrapped with [Latest message]', () => {
+    expect(
+      isClearCommand(chatRow('[Thread context]\nalice: hi\n[Latest message]\n/clear')),
+    ).toBe(true);
+  });
+
+  it('recognizes /clear with a leading <@id> mention', () => {
+    expect(isClearCommand(chatRow('<@U0AKALV5HRP> /clear'))).toBe(true);
+  });
+
+  it('still recognizes plain /clear', () => {
+    expect(isClearCommand(chatRow('/clear'))).toBe(true);
+  });
+
+  it('returns false for non-clear text', () => {
+    expect(isClearCommand(chatRow('hello'))).toBe(false);
+    expect(isClearCommand(chatRow('[Thread context]\na: b\n[Latest message]\nhello'))).toBe(false);
   });
 });
 

@@ -23,6 +23,43 @@ export interface CommandInfo {
 }
 
 /**
+ * For threaded chat-sdk inbounds, router.ts prepends
+ *   `[Thread context]\n<transcript>\n[Latest message]\n<user text>`
+ * (or `[New in thread since last response]\n...` on later wakes) to
+ * `content.text`. Slash-command classification must run against the
+ * USER's text, not the wrapped form, so peel everything before the
+ * final `[Latest message]\n` marker. Plain inbounds pass through.
+ *
+ * Mirrors `extractUserMessage` in src/command-gate.ts. Kept duplicated
+ * because the host and container tree don't share modules — only the
+ * session DB.
+ */
+function extractUserText(text: string): string {
+  const marker = '[Latest message]\n';
+  const idx = text.lastIndexOf(marker);
+  if (idx === -1) return text;
+  return text.substring(idx + marker.length).trim();
+}
+
+/**
+ * Discord/Slack deliver `<@U123> /compact` (or `@bot /compact`) when the
+ * bot is mentioned — the slash command is the second token. Without
+ * stripping, `startsWith('/')` mis-classifies these as plain prose and
+ * the SDK never dispatches `/compact`. Mirrors `stripLeadingMentions`
+ * in src/command-gate.ts.
+ */
+function stripLeadingMentions(text: string): string {
+  let prev: string;
+  let cur = text;
+  do {
+    prev = cur;
+    cur = cur.replace(/^\s*<@[!&]?[\w-]+(\|[^>]*)?>\s*/, '');
+    cur = cur.replace(/^\s*@[\w-]+\s+/, '');
+  } while (prev !== cur);
+  return cur;
+}
+
+/**
  * Categorize a message as a command or not.
  * Only applies to chat/chat-sdk messages.
  *
@@ -32,10 +69,17 @@ export interface CommandInfo {
  * platform id with no prefix, so we prefix it here. If the id already
  * contains a `:` we assume it's pre-namespaced (non-chat-sdk adapters
  * that populate `senderId` directly) and leave it alone.
+ *
+ * `text` is unwrapped and mention-stripped so callers that pass it raw
+ * to the SDK (formatMessagesWithCommands) send `/compact` rather than
+ * `[Thread context]\n...\n[Latest message]\n/compact` — the latter
+ * arrives as plain user text and the SDK never dispatches it as a
+ * slash command.
  */
 export function categorizeMessage(msg: MessageInRow): CommandInfo {
   const content = parseContent(msg.content);
-  const text = (content.text || '').trim();
+  const rawText = (content.text || '').trim();
+  const text = stripLeadingMentions(extractUserText(rawText));
   const senderId = extractSenderId(msg, content);
 
   if (!text.startsWith('/')) {
@@ -59,11 +103,13 @@ export function categorizeMessage(msg: MessageInRow): CommandInfo {
 /**
  * Narrow check for /clear — the only command the runner handles directly.
  * All other command gating (filtered, admin) is done by the host router
- * before messages reach the container.
+ * before messages reach the container. Must unwrap thread-context and
+ * strip leading mentions for the same reason as `categorizeMessage`.
  */
 export function isClearCommand(msg: MessageInRow): boolean {
   const content = parseContent(msg.content);
-  const text = (content.text || '').trim();
+  const rawText = (content.text || '').trim();
+  const text = stripLeadingMentions(extractUserText(rawText));
   return text.toLowerCase().startsWith('/clear');
 }
 
