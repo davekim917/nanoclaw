@@ -19,6 +19,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
+import { getContainerConfig } from '../db/container-configs.js';
 import { assertValidGroupFolder } from '../group-folder.js';
 import { registerProviderContainerConfig } from './provider-container-registry.js';
 
@@ -133,10 +134,27 @@ registerProviderContainerConfig('opencode', (ctx) => {
     NO_PROXY: mergeNoProxy(ctx.hostEnv.NO_PROXY, noProxyAdditions),
     no_proxy: mergeNoProxy(ctx.hostEnv.no_proxy, noProxyAdditions),
   };
-  for (const key of ['OPENCODE_PROVIDER', 'OPENCODE_MODEL', 'OPENCODE_SMALL_MODEL', 'OPENCODE_EFFORT'] as const) {
-    const value = resolveScopedEnv(key, ctx.agentGroupFolder, ctx.hostEnv);
-    if (value) env[key] = value;
-  }
+  // Model + effort: prefer the DB value (container_configs.model / .effort)
+  // over the .env scoped value. The DB is what `change_model` (self-mod) +
+  // `ncl groups config update --model X` mutate, so it must win — otherwise
+  // those changes never take effect (the container reads OPENCODE_MODEL at
+  // startup, and an unread DB value silently no-ops). .env stays as the
+  // initial-bootstrap source for groups that haven't been touched via DB yet.
+  const dbConfig = getContainerConfig(ctx.agentGroupId);
+  const dbProvider = dbConfig?.provider ?? null;
+  const dbModel = dbConfig?.model ?? null;
+  const dbEffort = dbConfig?.effort ?? null;
+
+  const provider = dbProvider ?? resolveScopedEnv('OPENCODE_PROVIDER', ctx.agentGroupFolder, ctx.hostEnv);
+  if (provider) env.OPENCODE_PROVIDER = provider;
+  const model = dbModel ?? resolveScopedEnv('OPENCODE_MODEL', ctx.agentGroupFolder, ctx.hostEnv);
+  if (model) env.OPENCODE_MODEL = model;
+  const effort = dbEffort ?? resolveScopedEnv('OPENCODE_EFFORT', ctx.agentGroupFolder, ctx.hostEnv);
+  if (effort) env.OPENCODE_EFFORT = effort;
+  // SMALL_MODEL — kept env-only for now; no DB field. If it ever moves to DB,
+  // mirror the pattern above.
+  const smallModel = resolveScopedEnv('OPENCODE_SMALL_MODEL', ctx.agentGroupFolder, ctx.hostEnv);
+  if (smallModel) env.OPENCODE_SMALL_MODEL = smallModel;
   // OPENCODE_BASE_URL — opencode provider's baseURL override (Go vs Zen endpoint
   // selection). Falls back to ANTHROPIC_BASE_URL for back-compat with older
   // skill examples that overloaded the Anthropic env var. The container code
