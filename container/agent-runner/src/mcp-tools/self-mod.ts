@@ -123,7 +123,7 @@ export const listModels: McpToolDefinition = {
   tool: {
     name: 'list_models',
     description:
-      'List the model slugs an operator has whitelisted for YOUR current provider. Returns [{slug, display_name, notes, default_effort, supports_effort, is_default}]. Use this before change_model to show valid options to the user, and to validate a slug they propose. Read-only, no approval needed.',
+      "REQUIRED whenever the user asks anything about available models, model options, what you can switch to, what models are available, what your provider supports, or similar — you MUST call this tool first and report its result, NOT speculate from training data. Returns the operator-curated allowlist filtered to YOUR current provider, with shape { provider, current: { model, effort }, models: [{ slug, display_name, notes, default_effort, supports_effort, is_default }] }. Training-data lists of models are not authoritative; this tool is. Also call this before invoking change_model to validate any slug the user proposes. Read-only, no approval needed.",
     inputSchema: { type: 'object' as const, properties: {} },
   },
   async handler() {
