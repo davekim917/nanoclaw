@@ -77,7 +77,10 @@ async function lookupImageLabel(imageRef: string): Promise<LabelLookup> {
   try {
     const { stdout } = await execFileAsync(
       CONTAINER_RUNTIME_BIN,
-      ['inspect', '--format', `{{index .Config.Labels "${LABEL_KEY}"}}`, imageRef],
+      // --type=image: `docker inspect <name>` is ambiguous across object types
+      // (image / container / volume / network). Without --type a name collision
+      // could surface container metadata and falsely report a missing label.
+      ['inspect', '--type=image', '--format', `{{index .Config.Labels "${LABEL_KEY}"}}`, imageRef],
       { timeout: 10_000 },
     );
     const v = stdout.trim();
@@ -137,7 +140,24 @@ export async function checkAgentRunnerDepsDrift(imageRef: string = CONTAINER_IMA
         lookup,
         message: `agent-runner image ${imageRef} not found — build it: ${rebuildHint(imageRef)}`,
       };
-    case 'missing':
+    case 'missing': {
+      // Image exists but lacks our label. Two interpretations:
+      //  - For the shared base image, this means an older build.sh was used →
+      //    require a rebuild (fail closed).
+      //  - For an admin-set image_tag override, this can legitimately be a
+      //    custom prebuilt image that never went through container/build.sh.
+      //    Permanently blocking those would lock admins out of their override.
+      //    Fail open with a warning — operator opted into the override.
+      if (imageRef !== CONTAINER_IMAGE) {
+        return {
+          ok: true,
+          imageRef,
+          expected,
+          actual: null,
+          lookup,
+          message: `agent-runner image ${imageRef} has no ${LABEL_KEY} label — treating admin-set image_tag override as opt-out from drift check. If this is a derived image from ${CONTAINER_IMAGE}, rebuild base then re-run install_packages.`,
+        };
+      }
       return {
         ok: false,
         imageRef,
@@ -146,6 +166,7 @@ export async function checkAgentRunnerDepsDrift(imageRef: string = CONTAINER_IMA
         lookup,
         message: `agent-runner image ${imageRef} has no ${LABEL_KEY} label (built by an older build.sh) — rebuild: ${rebuildHint(imageRef)}`,
       };
+    }
     case 'found': {
       const actual = lookup.value;
       if (actual !== expected) {
