@@ -13,4 +13,4 @@ import './user-dms.js';
 import './dropped-messages.js';
 import './approvals.js';
 import './sessions.js';
-import './provider-models.js';
+import './denied-models.js';

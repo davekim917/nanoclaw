@@ -17,7 +17,7 @@ import {
   updateContainerConfigJson,
   updateContainerConfigScalars,
 } from '../../db/container-configs.js';
-import { listProviderModels } from '../../db/provider-models.js';
+import { getDeniedModel } from '../../db/denied-models.js';
 import { getSession } from '../../db/sessions.js';
 import type { McpServerConfig } from '../../container-config.js';
 import { log } from '../../log.js';
@@ -149,12 +149,16 @@ export const applyChangeModel: ApprovalHandler = async ({ session, payload, user
   const slug = payload.slug as string;
   const effort = payload.effort as string | null;
 
-  // Defense-in-depth: re-validate against the allowlist at apply time, in
-  // case the allowlist changed between request and approval.
-  const allowed = listProviderModels(config.provider);
-  if (!allowed.some((m) => m.slug === slug)) {
+  // Defense-in-depth: re-check the deny list at apply time, in case the
+  // operator added a denial between request and approval. The container's
+  // own check (against `opencode models` for reachability) happens at next
+  // spawn; we just enforce the operator hard-no here.
+  const denied = getDeniedModel(config.provider, slug);
+  if (denied) {
     await notify(
-      `change_model approved but "${slug}" is no longer in the ${config.provider} allowlist. Aborted — re-request if still desired.`,
+      `change_model approved but "${slug}" was just added to the deny list${
+        denied.reason ? ` (${denied.reason})` : ''
+      }. Aborted.`,
     );
     return;
   }

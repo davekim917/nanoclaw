@@ -118,21 +118,17 @@ export async function handleChangeModel(content: Record<string, unknown>, sessio
     return;
   }
 
-  const { listProviderModels } = await import('../../db/provider-models.js');
-  const allowed = listProviderModels(config.provider);
-  if (allowed.length === 0) {
+  // Host-side check is only the deny list. The container's list_models tool
+  // is the source of truth for "is this slug reachable" — but that runs in
+  // the container, not here. We just enforce the operator hard-no.
+  const { getDeniedModel } = await import('../../db/denied-models.js');
+  const denied = getDeniedModel(config.provider, slug);
+  if (denied) {
     notifyAgent(
       session,
-      `change_model failed: no allowlist seeded for provider "${config.provider}". An operator must run "ncl provider-models add" before models can be changed.`,
-    );
-    return;
-  }
-  const match = allowed.find((m) => m.slug === slug);
-  if (!match) {
-    const list = allowed.map((m) => `  - ${m.slug}${m.display_name ? ` (${m.display_name})` : ''}`).join('\n');
-    notifyAgent(
-      session,
-      `change_model failed: "${slug}" is not in the ${config.provider} allowlist. Valid options:\n${list}`,
+      `change_model failed: "${slug}" is in the ${config.provider} deny list${
+        denied.reason ? ` (${denied.reason})` : ''
+      }.`,
     );
     return;
   }
@@ -140,7 +136,7 @@ export async function handleChangeModel(content: Record<string, unknown>, sessio
   const reason = (content.reason as string) || '';
   const question =
     `Agent "${agentGroup.name}" requests model change to:\n` +
-    `${slug}${match.display_name ? ` (${match.display_name})` : ''}` +
+    `${slug}` +
     (effort ? `\nEffort: ${effort}` : '') +
     `\nProvider: ${config.provider}` +
     `\nCurrent: ${config.model || '(none)'}${config.effort ? ` / ${config.effort}` : ''}` +

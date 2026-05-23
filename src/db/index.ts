@@ -71,11 +71,10 @@ export {
   deleteContainerConfig,
 } from './container-configs.js';
 export {
-  listProviderModels,
-  getProviderModel,
-  isAllowedModel,
-  addProviderModel,
-  removeProviderModel,
-  type ProviderModel,
-  type ProviderModelInput,
-} from './provider-models.js';
+  listDeniedModels,
+  getDeniedModel,
+  isDeniedModel,
+  addDeniedModel,
+  removeDeniedModel,
+  type DeniedModel,
+} from './denied-models.js';

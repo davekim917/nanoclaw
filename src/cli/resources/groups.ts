@@ -13,7 +13,7 @@ import {
   updateContainerConfigScalars,
   updateContainerConfigJson,
 } from '../../db/container-configs.js';
-import { listProviderModels } from '../../db/provider-models.js';
+import { getDeniedModel } from '../../db/denied-models.js';
 import { assertValidGroupFolder } from '../../group-folder.js';
 import { SIBLING_BOUND_FIELDS } from '../../sibling-parity.js';
 import type { ContainerConfigRow } from '../../types.js';
@@ -165,23 +165,22 @@ registerResource({
           );
         }
 
-        // Model allowlist enforcement: when --model is set (with or without
-        // --provider), validate against provider_models. Use the new provider
-        // if it's being changed in the same call; otherwise the current one.
-        // Skip enforcement when the allowlist is empty for that provider —
-        // treat it as "operator hasn't curated this provider yet" rather than
-        // a hard rejection. (Operators seed via `ncl provider-models add`.)
-        if (updates.model !== undefined) {
+        // Model deny enforcement: when --model is set, reject if the (provider,
+        // slug) pair is in denied_models. Host can't tell whether a model is
+        // ACTUALLY reachable (that depends on container-side opencode CLI +
+        // auth.json), but it CAN enforce the operator's hard-no list. Use the
+        // new provider if it's being changed in the same call; otherwise current.
+        if (updates.model !== undefined && updates.model !== null) {
           const effectiveProvider = updates.provider ?? row.provider;
           if (!effectiveProvider) {
             throw new Error('Cannot validate --model without a provider set on the group');
           }
-          const allowed = listProviderModels(effectiveProvider);
-          if (allowed.length > 0 && !allowed.some((m) => m.slug === updates.model)) {
-            const list = allowed.map((m) => `  - ${m.slug}${m.display_name ? ` (${m.display_name})` : ''}`).join('\n');
+          const denied = getDeniedModel(effectiveProvider, updates.model);
+          if (denied) {
             throw new Error(
-              `Model "${updates.model}" is not in the ${effectiveProvider} allowlist. Valid options:\n${list}\n\n` +
-                `Operator can extend via: ncl provider-models add --provider ${effectiveProvider} --slug ${updates.model} ...`,
+              `Model "${updates.model}" is denied for provider "${effectiveProvider}".` +
+                (denied.reason ? ` Reason: ${denied.reason}` : '') +
+                `\n\nOperator can remove via: ncl denied-models remove --provider ${effectiveProvider} --slug ${updates.model}`,
             );
           }
         }

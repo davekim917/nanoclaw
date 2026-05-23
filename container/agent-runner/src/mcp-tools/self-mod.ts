@@ -123,54 +123,74 @@ export const listModels: McpToolDefinition = {
   tool: {
     name: 'list_models',
     description:
-      "REQUIRED whenever the user asks anything about available models, model options, what you can switch to, what models are available, what your provider supports, or similar — you MUST call this tool first and report its result, NOT speculate from training data. Returns the operator-curated allowlist filtered to YOUR current provider, with shape { provider, current: { model, effort }, models: [{ slug, display_name, notes, default_effort, supports_effort, is_default }] }. Training-data lists of models are not authoritative; this tool is. Also call this before invoking change_model to validate any slug the user proposes. Read-only, no approval needed.",
+      "REQUIRED whenever the user asks anything about available models, model options, what you can switch to, what models are available, what your provider supports, or similar — you MUST call this tool first and report its result, NOT speculate from training data. Returns every model reachable from this container's auth.json + env (asking OpenCode itself), grouped by upstream provider prefix (opencode-go/*, opencode/*, nvidia/*, etc.), minus any slugs the operator has put on the deny list. Training-data lists of models are not authoritative; this tool is. Also call this before invoking change_model to validate any slug the user proposes. Read-only, no approval needed.",
     inputSchema: { type: 'object' as const, properties: {} },
   },
   async handler() {
-    const central = getCentralDb();
-    if (!central) return err('Central DB not mounted — cannot list models.');
+    // Live source of truth: `opencode models` enumerates every reachable
+    // model given the container's auth.json + env. We then subtract the
+    // operator-curated deny list (central.db: denied_models).
+    let opencodeOut: string;
+    try {
+      const proc = Bun.spawn(['opencode', 'models'], {
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+      opencodeOut = await new Response(proc.stdout).text();
+      const exitCode = await proc.exited;
+      if (exitCode !== 0) {
+        const stderr = await new Response(proc.stderr).text();
+        return err(`opencode models exited ${exitCode}: ${stderr.trim() || 'no stderr'}`);
+      }
+    } catch (e) {
+      return err(`Failed to run opencode models: ${e instanceof Error ? e.message : String(e)}`);
+    }
 
+    // Each non-blank line is a slug like "opencode-go/kimi-k2.6" or
+    // "nvidia/deepseek-ai/deepseek-v4-pro". Group by the FIRST path segment.
+    const slugs = opencodeOut
+      .split('\n')
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0 && !l.startsWith('#'));
+
+    // Pull the deny list for this provider from central.db so we can filter.
+    const central = getCentralDb();
     const agentGroupId = getConfig().agentGroupId;
     if (!agentGroupId) return err('No agent group ID — container not properly initialized.');
 
-    // Look up our own provider, then enumerate that provider's allowlist.
-    const config = central
-      .prepare('SELECT provider, model, effort FROM container_configs WHERE agent_group_id = ?')
-      .get(agentGroupId) as { provider: string | null; model: string | null; effort: string | null } | undefined;
-    if (!config?.provider) return err('No provider configured for this agent group.');
+    let config: { provider: string | null; model: string | null; effort: string | null } | undefined;
+    let deniedSet = new Set<string>();
+    if (central) {
+      config = central
+        .prepare('SELECT provider, model, effort FROM container_configs WHERE agent_group_id = ?')
+        .get(agentGroupId) as typeof config;
+      if (config?.provider) {
+        const deniedRows = central
+          .prepare('SELECT slug FROM denied_models WHERE provider = ?')
+          .all(config.provider) as Array<{ slug: string }>;
+        deniedSet = new Set(deniedRows.map((r) => r.slug));
+      }
+    }
 
-    const rows = central
-      .prepare(
-        `SELECT slug, display_name, notes, default_effort, supports_effort, is_default
-         FROM provider_models WHERE provider = ?
-         ORDER BY is_default DESC, slug ASC`,
-      )
-      .all(config.provider) as Array<{
-      slug: string;
-      display_name: string | null;
-      notes: string | null;
-      default_effort: string | null;
-      supports_effort: number;
-      is_default: number;
-    }>;
-
-    if (rows.length === 0) {
-      return ok(
-        `No models whitelisted for provider "${config.provider}" yet. An operator must seed via "ncl provider-models add" first.`,
-      );
+    const grouped: Record<string, string[]> = {};
+    let denied = 0;
+    for (const slug of slugs) {
+      if (deniedSet.has(slug)) {
+        denied++;
+        continue;
+      }
+      const sep = slug.indexOf('/');
+      const prefix = sep > 0 ? slug.slice(0, sep) : '(unknown)';
+      if (!grouped[prefix]) grouped[prefix] = [];
+      grouped[prefix].push(slug);
     }
 
     const payload = {
-      provider: config.provider,
-      current: { model: config.model, effort: config.effort },
-      models: rows.map((r) => ({
-        slug: r.slug,
-        display_name: r.display_name,
-        notes: r.notes,
-        default_effort: r.default_effort,
-        supports_effort: r.supports_effort === 1,
-        is_default: r.is_default === 1,
-      })),
+      provider: config?.provider ?? null,
+      current: { model: config?.model ?? null, effort: config?.effort ?? null },
+      total: slugs.length - denied,
+      denied,
+      grouped,
     };
     return ok(JSON.stringify(payload, null, 2));
   },
