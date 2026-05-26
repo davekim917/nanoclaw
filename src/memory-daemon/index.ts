@@ -7,7 +7,7 @@ import { setDeadLettersDb, getDueRetries, deleteAfterSuccess } from './dead-lett
 import { runChatStreamSweep, setIngestDb } from './classifier.js';
 import { SourceIngester, setIngestDb as setSourceIngestDb, isNonSymlinkChain } from './source-ingest.js';
 import { readContainerConfig, isFeedbackEnabled } from '../container-config.js';
-import { GROUPS_DIR, CC_PROJECTS_DIR, CC_MEMORY_MARKER } from '../config.js';
+import { GROUPS_DIR, DATA_DIR, CC_PROJECTS_DIR, CC_MEMORY_MARKER, WORKGROUP_SHARED_FS } from '../config.js';
 import type { MemoryStore } from '../modules/memory/store.js';
 import { processPendingJudgments } from './recall-judge/judge.js';
 
@@ -23,6 +23,96 @@ export interface DiscoveredGroup {
   sourcesBasePath: string;
   enabled: boolean;
   feedbackEnabled: boolean;
+}
+
+/**
+ * Workgroup shared-filesystem discovery root (Phase 2 of the shared-FS
+ * feature — see docs/specs/workgroup-shared-fs.md).
+ *
+ * When a workgroup is migrated, `reconcileWorkgroupSharedDirs` MOVES the seed
+ * sibling's `sources/` out of `groups/<wgId>/` into `data/workgroups/<wgId>/`
+ * and leaves a CONTAINER-ABSOLUTE compat symlink at `groups/<wgId>/sources`
+ * that DANGLES on the host. The GROUPS_DIR walk above therefore SKIPS the seed
+ * (its `isNonSymlinkChain(<seed>, 'sources', 'inbox')` check fails-closed on
+ * the symlinked `sources`) — without this root, the seed's inbox would no
+ * longer be watched and fact ingestion would silently die for the workgroup.
+ *
+ * For each migrated workgroup we emit ONE DiscoveredGroup whose:
+ *   - sourcesBasePath = `data/workgroups/<wgId>/` (the new home of `sources/`)
+ *   - agentGroupId    = the SEED's agentGroupId (from `groups/<wgId>/container.json`,
+ *     still present post-migration — only `sources`/`conversations`/repos move).
+ *
+ * Store attribution is preserved EXACTLY because attribution is driven by
+ * `agentGroupId`, not by the inbox path: `processInboxFile` → `store.remember`
+ * → `readGroupRecallScope(agentGroupId)` → `resolveWorkgroupStoreId(agentGroupId)`
+ * → `workgroups.mnemon_store_id`. Pre-migration the GROUPS_DIR walk emitted the
+ * seed with this same agentGroupId; emitting the same id here funnels every
+ * sibling's capture into the identical workgroup store. (Even if container.json
+ * were absent, `remember`'s fallback is `agentGroupId`, which equals the seed's
+ * mnemon_store_id for every workgroup.)
+ *
+ * Gate mirrors container-runner's mount gate exactly: discover when the
+ * `.migrated` marker exists OR the flag is on. Gating on the marker (not just
+ * the flag) means a flag-off-after-enable install keeps the inbox watched —
+ * the symlinks still dangle, so the seed is still skipped above.
+ */
+function discoverMigratedWorkgroups(): DiscoveredGroup[] {
+  const out: DiscoveredGroup[] = [];
+  const workgroupsRoot = path.join(DATA_DIR, 'workgroups');
+
+  let entries: fs.Dirent[];
+  try {
+    entries = fs.readdirSync(workgroupsRoot, { withFileTypes: true });
+  } catch {
+    // data/workgroups/ doesn't exist (no migration has ever run) — normal.
+    return out;
+  }
+
+  for (const dirent of entries) {
+    // Reject symlinked workgroup roots up front (cross-tenant defense, parity
+    // with the CC root): a symlink here could point its `sources/inbox` at
+    // another workgroup's, cross-ingesting into the wrong store.
+    if (dirent.isSymbolicLink()) continue;
+    if (!dirent.isDirectory()) continue;
+
+    const wgId = dirent.name;
+    const wgDir = path.join(workgroupsRoot, wgId);
+
+    // Migration gate — mirror container-runner.buildMounts: a workgroup is
+    // "migrated" iff `data/workgroups/<wgId>/.migrated` exists. Honor the flag
+    // too, but the marker is the authoritative per-workgroup signal so the
+    // daemon keeps watching even if the flag is later turned off.
+    const migratedMarker = path.join(wgDir, '.migrated');
+    if (!WORKGROUP_SHARED_FS && !fs.existsSync(migratedMarker)) continue;
+
+    // Resolve the SEED's agentGroupId so attribution is byte-identical to the
+    // pre-migration GROUPS_DIR walk (seed folder == workgroup_id by construction
+    // — reconcileWorkgroupSharedDirs resolves the seed the same way).
+    // readContainerConfig is fully defensive (existsSync guard + try/catch →
+    // emptyConfig), so it never throws; a missing/corrupt seed config yields no
+    // agentGroupId and we skip — same as the GROUPS_DIR walk above. No health
+    // recording here: it would introduce a `wg-` key space the GROUPS_DIR-keyed
+    // pruneMemoryEnabledCheckFailures call doesn't know about.
+    const config = readContainerConfig(wgId);
+    const agentGroupId = config.agentGroupId;
+    if (!agentGroupId) continue;
+
+    // Same symlink-chain guard as every other root: reject if `sources` or
+    // `sources/inbox` under the workgroup dir is a symlink/non-dir. The shared
+    // tree was moved here as real dirs, so this passes for a clean migration
+    // and fails-closed on tampering.
+    if (!isNonSymlinkChain(wgDir, 'sources', 'inbox')) continue;
+
+    out.push({
+      agentGroupId,
+      folder: wgId,
+      sourcesBasePath: wgDir,
+      enabled: config.memory?.enabled === true,
+      feedbackEnabled: isFeedbackEnabled(config.memory),
+    });
+  }
+
+  return out;
 }
 
 // Exported for unit tests. Production code calls it from runSweep below.
@@ -89,6 +179,12 @@ export function discoverMemoryGroups(health?: HealthRecorder): DiscoveredGroup[]
   // Drop stale entries for groups that no longer exist on disk. The per-loop
   // clear above doesn't fire for deleted entries (the loop never visits them).
   health?.pruneMemoryEnabledCheckFailures(new Set(entries));
+
+  // Workgroup shared-FS discovery root — emit the migrated workgroups' inboxes
+  // at their new `data/workgroups/<wgId>/sources/inbox` home. MUST run before
+  // the CC-side block below, whose early `return groups` paths (missing/unreadable
+  // CC_PROJECTS_DIR) would otherwise skip it. See discoverMigratedWorkgroups.
+  groups.push(...discoverMigratedWorkgroups());
 
   // CC-side discovery: walk ~/.claude/projects/<slug>/ for `.memory-enabled`
   // markers. Each marked project becomes a discovered group with agentGroupId

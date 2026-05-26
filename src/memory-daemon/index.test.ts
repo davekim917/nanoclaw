@@ -2,7 +2,7 @@ import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import fs from 'fs';
 import path from 'path';
 import Database from 'better-sqlite3';
-import { CC_PROJECTS_DIR, GROUPS_DIR } from '../config.js';
+import { CC_PROJECTS_DIR, DATA_DIR, GROUPS_DIR } from '../config.js';
 import { discoverMemoryGroups, runSweep } from './index.js';
 import * as containerConfig from '../container-config.js';
 import * as judgeModule from './recall-judge/judge.js';
@@ -403,6 +403,277 @@ describe('discoverMemoryGroups', () => {
   });
 });
 
+// ---- Phase 2: workgroup shared-FS discovery root ===========================
+//
+// After reconcileWorkgroupSharedDirs (flag-gated migration) moves a workgroup's
+// `sources/` out of `groups/<wgId>/` into `data/workgroups/<wgId>/`, the seed's
+// GROUPS_DIR `sources` becomes a host-dangling container-absolute symlink. The
+// GROUPS_DIR walk must SKIP that dangling seed (its chain check fails-closed),
+// and the new `data/workgroups/*` root must pick the inbox back up with the
+// SAME agentGroupId so fact ingestion keeps landing in the identical mnemon
+// store. See docs/specs/workgroup-shared-fs.md.
+
+const WORKGROUPS_ROOT = path.join(DATA_DIR, 'workgroups');
+
+interface WgEntry {
+  /** Workgroup id == seed folder name. */
+  wgId: string;
+  /** Defaults to false — entry under data/workgroups is a regular dir. */
+  symlink?: boolean;
+  /** Defaults to true. */
+  directory?: boolean;
+  /** Whether `data/workgroups/<wgId>/.migrated` exists. Default true. */
+  migrated?: boolean;
+  /** lstat type for `data/workgroups/<wgId>/sources`. Default 'dir'. */
+  sources?: 'dir' | 'symlink' | 'file' | 'missing';
+  /** lstat type for `data/workgroups/<wgId>/sources/inbox`. Default 'dir'. */
+  inbox?: 'dir' | 'symlink' | 'file' | 'missing';
+}
+
+interface SeedSpec {
+  /** agentGroupId returned by readContainerConfig(seedFolder). */
+  agentGroupId?: string;
+  /** memory.enabled in the seed config. Default true. */
+  memoryEnabled?: boolean;
+  /**
+   * GROUPS_DIR-walk view of the seed folder's `sources`:
+   *  - 'symlink' (default): the post-migration dangling compat symlink (skipped)
+   *  - 'dir': an unmigrated seed (still watched the old way)
+   *  - 'missing': seed folder present but no sources yet
+   */
+  groupsSources?: 'dir' | 'symlink' | 'missing';
+}
+
+/**
+ * Mock fs + readContainerConfig for the workgroup discovery root. Models three
+ * roots: GROUPS_DIR (seed folders), DATA_DIR/workgroups (the migrated home),
+ * and CC_PROJECTS_DIR (absent here). `seeds` is keyed by folder name == wgId.
+ */
+function mockWorkgroupFs(opts: { wgEntries?: WgEntry[]; seeds?: Record<string, SeedSpec> }): void {
+  const wgEntries = opts.wgEntries ?? [];
+  const seeds = opts.seeds ?? {};
+  const seedFolders = Object.keys(seeds);
+
+  vi.spyOn(fs, 'readdirSync').mockImplementation(((p: fs.PathLike, options?: { withFileTypes?: boolean }) => {
+    const s = String(p);
+    if (s === GROUPS_DIR) return seedFolders as unknown as fs.Dirent[];
+    if (s === WORKGROUPS_ROOT) {
+      if (!options?.withFileTypes) return wgEntries.map((e) => e.wgId) as unknown as fs.Dirent[];
+      return wgEntries.map(
+        (e) =>
+          ({
+            name: e.wgId,
+            isDirectory: () => e.directory ?? true,
+            isSymbolicLink: () => Boolean(e.symlink),
+          }) as unknown as fs.Dirent,
+      ) as unknown as fs.Dirent[];
+    }
+    // CC_PROJECTS_DIR (and anything else) — absent.
+    const err = new Error('ENOENT') as NodeJS.ErrnoException;
+    err.code = 'ENOENT';
+    throw err;
+  }) as unknown as typeof fs.readdirSync);
+
+  // existsSync only used by the workgroup root for the `.migrated` marker.
+  vi.spyOn(fs, 'existsSync').mockImplementation(((p: fs.PathLike) => {
+    const s = String(p);
+    const m = wgEntries.find((e) => s === path.join(WORKGROUPS_ROOT, e.wgId, '.migrated'));
+    if (m) return m.migrated ?? true;
+    return false;
+  }) as unknown as typeof fs.existsSync);
+
+  // GROUPS_DIR walk uses statSync to confirm a seed folder isDirectory.
+  vi.spyOn(fs, 'statSync').mockImplementation(((p: fs.PathLike) => {
+    const s = String(p);
+    if (seedFolders.some((f) => s === path.join(GROUPS_DIR, f))) {
+      return { isDirectory: () => true } as fs.Stats;
+    }
+    const err = new Error('ENOENT') as NodeJS.ErrnoException;
+    err.code = 'ENOENT';
+    throw err;
+  }) as unknown as typeof fs.statSync);
+
+  vi.spyOn(fs, 'realpathSync').mockImplementation(((p: fs.PathLike) => String(p)) as unknown as typeof fs.realpathSync);
+
+  vi.spyOn(fs, 'lstatSync').mockImplementation(((p: fs.PathLike) => {
+    const s = String(p);
+
+    const mkStat = (t: 'dir' | 'symlink' | 'file'): fs.Stats =>
+      ({
+        isFile: () => t === 'file',
+        isSymbolicLink: () => t === 'symlink',
+        isDirectory: () => t === 'dir',
+      }) as fs.Stats;
+    const enoent = (): never => {
+      const err = new Error('ENOENT') as NodeJS.ErrnoException;
+      err.code = 'ENOENT';
+      throw err;
+    };
+
+    // --- data/workgroups/<wgId> chain (isNonSymlinkChain parent + sources + inbox)
+    for (const e of wgEntries) {
+      const wgDir = path.join(WORKGROUPS_ROOT, e.wgId);
+      if (s === wgDir) return mkStat(e.symlink ? 'symlink' : (e.directory ?? true) ? 'dir' : 'file');
+      if (s === path.join(wgDir, 'sources')) {
+        const t = e.sources ?? 'dir';
+        return t === 'missing' ? enoent() : mkStat(t);
+      }
+      if (s === path.join(wgDir, 'sources', 'inbox')) {
+        const t = e.inbox ?? 'dir';
+        return t === 'missing' ? enoent() : mkStat(t);
+      }
+    }
+
+    // --- GROUPS_DIR/<seed> chain (parent + sources + inbox)
+    for (const f of seedFolders) {
+      const seedDir = path.join(GROUPS_DIR, f);
+      if (s === seedDir) return mkStat('dir');
+      if (s === path.join(seedDir, 'sources')) {
+        const view = seeds[f].groupsSources ?? 'symlink'; // default: post-migration dangling link
+        return view === 'missing' ? enoent() : mkStat(view);
+      }
+      if (s === path.join(seedDir, 'sources', 'inbox')) {
+        // Only reached when sources is a real dir (unmigrated seed). Default
+        // 'missing' so the chain check passes (daemon would mkdir).
+        return enoent();
+      }
+    }
+
+    return enoent();
+  }) as unknown as typeof fs.lstatSync);
+
+  vi.spyOn(containerConfig, 'readContainerConfig').mockImplementation(((folder: string) => {
+    const seed = seeds[folder];
+    return {
+      agentGroupId: seed?.agentGroupId,
+      memory: { enabled: seed?.memoryEnabled ?? true },
+      mcpServers: {},
+      packages: { apt: [], npm: [] },
+      additionalMounts: [],
+      skills: [],
+    } as unknown as containerConfig.ContainerConfig;
+  }) as unknown as typeof containerConfig.readContainerConfig);
+}
+
+describe('discoverMemoryGroups — workgroup shared-FS root', () => {
+  it('discovers a migrated workgroup at data/workgroups/<wgId>/sources/inbox', () => {
+    mockWorkgroupFs({
+      wgEntries: [{ wgId: 'madison-reed', migrated: true }],
+      seeds: { 'madison-reed': { agentGroupId: 'ag-mr-seed', groupsSources: 'symlink' } },
+    });
+
+    const groups = discoverMemoryGroups();
+
+    // Exactly one group: the dangling seed in GROUPS_DIR is skipped, the new
+    // data/workgroups root supplies the inbox.
+    expect(groups).toHaveLength(1);
+    expect(groups[0]).toEqual({
+      agentGroupId: 'ag-mr-seed',
+      folder: 'madison-reed',
+      sourcesBasePath: path.join(WORKGROUPS_ROOT, 'madison-reed'),
+      enabled: true,
+      feedbackEnabled: true,
+    });
+  });
+
+  it('preserves store attribution: emitted agentGroupId == seed agentGroupId (same store)', () => {
+    // The GROUPS_DIR walk pre-migration emitted the seed with this exact id;
+    // emitting the SAME id from the data/workgroups root means store.remember
+    // → resolveWorkgroupStoreId resolves the identical workgroup store. The
+    // sourcesBasePath changed, but attribution is path-independent.
+    mockWorkgroupFs({
+      wgEntries: [{ wgId: 'madison-reed', migrated: true }],
+      seeds: { 'madison-reed': { agentGroupId: 'ag-1776735605480-vosgej2', groupsSources: 'symlink' } },
+    });
+
+    const [group] = discoverMemoryGroups();
+
+    // Identical to what readContainerConfig('madison-reed') yields — i.e. the
+    // pre-migration GROUPS_DIR-walk agentGroupId. Same id in → same store out.
+    expect(group.agentGroupId).toBe('ag-1776735605480-vosgej2');
+    expect(group.sourcesBasePath).toBe(path.join(WORKGROUPS_ROOT, 'madison-reed'));
+  });
+
+  it('skips the dangling seed symlink in GROUPS_DIR without throwing or emitting a duplicate', () => {
+    mockWorkgroupFs({
+      wgEntries: [{ wgId: 'madison-reed', migrated: true }],
+      seeds: { 'madison-reed': { agentGroupId: 'ag-mr-seed', groupsSources: 'symlink' } },
+    });
+
+    // No throw, and the seed's GROUPS_DIR path is NOT emitted (only the
+    // data/workgroups path is) — i.e. no double-watch.
+    const groups = discoverMemoryGroups();
+    const seedGroupsPath = path.join(GROUPS_DIR, 'madison-reed');
+    expect(groups.some((g) => g.sourcesBasePath === seedGroupsPath)).toBe(false);
+    expect(groups).toHaveLength(1);
+    expect(groups[0].sourcesBasePath).toBe(path.join(WORKGROUPS_ROOT, 'madison-reed'));
+  });
+
+  it('unmigrated workgroup (no .migrated marker) is still discovered the OLD way via GROUPS_DIR', () => {
+    mockWorkgroupFs({
+      // data/workgroups dir present but NOT migrated (no marker) and flag off.
+      wgEntries: [{ wgId: 'madison-reed', migrated: false }],
+      // Seed's GROUPS_DIR sources is a real dir (never migrated) → watched old-way.
+      seeds: { 'madison-reed': { agentGroupId: 'ag-mr-seed', groupsSources: 'dir' } },
+    });
+
+    const groups = discoverMemoryGroups();
+
+    expect(groups).toHaveLength(1);
+    expect(groups[0]).toEqual({
+      agentGroupId: 'ag-mr-seed',
+      folder: 'madison-reed',
+      sourcesBasePath: path.join(GROUPS_DIR, 'madison-reed'), // OLD path
+      enabled: true,
+      feedbackEnabled: true,
+    });
+  });
+
+  it('does not emit a data/workgroups dir lacking a .migrated marker (flag off)', () => {
+    // No GROUPS_DIR seed at all → if the workgroup root emitted unmigrated dirs,
+    // we'd see a phantom group. It must stay empty.
+    mockWorkgroupFs({
+      wgEntries: [{ wgId: 'orphan-wg', migrated: false }],
+      seeds: {},
+    });
+
+    expect(discoverMemoryGroups()).toEqual([]);
+  });
+
+  it('rejects a symlinked data/workgroups/<wgId> root (cross-tenant defense)', () => {
+    // No GROUPS_DIR seed — isolate the data/workgroups root. The symlinked
+    // entry is rejected at the dirent.isSymbolicLink() check, before any
+    // container-config read.
+    mockWorkgroupFs({
+      wgEntries: [{ wgId: 'sneaky', migrated: true, symlink: true }],
+      seeds: {},
+    });
+
+    expect(discoverMemoryGroups()).toEqual([]);
+  });
+
+  it('rejects a migrated workgroup whose data/workgroups sources/inbox is a symlink', () => {
+    // Seed's GROUPS_DIR sources is the post-migration dangling symlink (skipped
+    // by the GROUPS_DIR walk), and the data/workgroups inbox is a symlink too
+    // (rejected by the chain check) → nothing emitted.
+    mockWorkgroupFs({
+      wgEntries: [{ wgId: 'tampered', migrated: true, sources: 'dir', inbox: 'symlink' }],
+      seeds: { tampered: { agentGroupId: 'ag-tampered', groupsSources: 'symlink' } },
+    });
+
+    expect(discoverMemoryGroups()).toEqual([]);
+  });
+
+  it('skips a migrated workgroup whose seed container.json has no agentGroupId', () => {
+    mockWorkgroupFs({
+      wgEntries: [{ wgId: 'no-id', migrated: true }],
+      seeds: { 'no-id': { agentGroupId: undefined, groupsSources: 'symlink' } },
+    });
+
+    expect(discoverMemoryGroups()).toEqual([]);
+  });
+});
+
 // ---- C5: runSweep wiring tests ----
 
 function makeTestIngestDb(): Database.Database {
@@ -454,8 +725,6 @@ describe('runSweep C5 wiring', () => {
     const db = makeTestIngestDb();
     const hr = new HealthRecorder();
     hr.setIngestDbForTest(db);
-    const store = makeNullStore();
-    const ingester = makeNullIngester();
 
     // Patch discoverMemoryGroups to return a stub group
     const { discoverMemoryGroups: orig } = await import('./index.js');
