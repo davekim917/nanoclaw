@@ -19,7 +19,6 @@ import { recordDroppedMessage } from '../../db/dropped-messages.js';
 import { getAgentGroup, getAllAgentGroups } from '../../db/agent-groups.js';
 import { createMessagingGroupAgent, setMessagingGroupDeniedAt } from '../../db/messaging-groups.js';
 import {
-  isDiscordChannelType,
   routeInbound,
   setAccessGate,
   setChannelRequestGate,
@@ -462,14 +461,11 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
   }
 
   const isGroup = event.threadId !== null;
-  // Discord defaults to mention-sticky (in-thread auto-reply matches Discord
-  // conversational norms); every other group platform defaults to plain
-  // mention so each invocation is intentional. DMs always use pattern='.'.
-  const engageMode: MessagingGroupAgent['engage_mode'] = !isGroup
-    ? 'pattern'
-    : isDiscordChannelType(event.channelType)
-      ? 'mention-sticky'
-      : 'mention';
+  // Group platforms default to plain mention so each invocation is intentional
+  // (Discord previously defaulted to mention-sticky, but with sibling agents
+  // co-resident in every channel that let one agent auto-dominate threads —
+  // owner directive 2026-05-26). DMs always use pattern='.'.
+  const engageMode: MessagingGroupAgent['engage_mode'] = !isGroup ? 'pattern' : 'mention';
   const engagePattern = isGroup ? null : '.';
 
   const mgaId = `mga-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -572,13 +568,10 @@ setMessageInterceptor(async (event: InboundEvent): Promise<boolean> => {
   }
 
   const isGroup = originalEvent.threadId !== null;
-  // Discord defaults to mention-sticky; every other group platform defaults
-  // to plain mention. DMs always use pattern='.'.
-  const engageMode: MessagingGroupAgent['engage_mode'] = !isGroup
-    ? 'pattern'
-    : isDiscordChannelType(originalEvent.channelType)
-      ? 'mention-sticky'
-      : 'mention';
+  // Group platforms default to plain mention (Discord no longer defaults to
+  // mention-sticky — owner directive 2026-05-26, since siblings co-reside in
+  // every channel now). DMs always use pattern='.'.
+  const engageMode: MessagingGroupAgent['engage_mode'] = !isGroup ? 'pattern' : 'mention';
   const engagePattern = isGroup ? null : '.';
 
   const mgaId = `mga-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;

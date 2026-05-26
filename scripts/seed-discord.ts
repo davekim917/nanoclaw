@@ -58,12 +58,13 @@ try {
     id: 'mga-discord',
     messaging_group_id: MESSAGING_GROUP_ID,
     agent_group_id: AGENT_GROUP_ID,
-    // Discord group channel → mention-sticky default. Mention once, stay
-    // subscribed to the thread. Admins can tune via /manage-channels.
-    engage_mode: 'mention-sticky',
+    // Discord group channel → mention + accumulate (uniform default; siblings
+    // co-reside in channels, so no agent is sticky). Admins can tune via
+    // /manage-channels.
+    engage_mode: 'mention',
     engage_pattern: null,
     sender_scope: 'all',
-    ignored_message_policy: 'drop',
+    ignored_message_policy: 'accumulate',
     session_mode: 'shared',
     priority: 0,
     default_model: null,
