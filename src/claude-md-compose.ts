@@ -20,6 +20,7 @@ import path from 'path';
 import { GROUPS_DIR } from './config.js';
 import type { McpServerConfig } from './container-config.js';
 import { getContainerConfig } from './db/container-configs.js';
+import { buildSessionServicesSnapshot, renderSessionCapabilities } from './capabilities.js';
 import { flattenClaudeMd } from './agents-md-flatten.js';
 import { log } from './log.js';
 import type { AgentGroup } from './types.js';
@@ -105,6 +106,21 @@ export function composeGroupClaudeMd(group: AgentGroup): void {
         content: mcp.instructions,
       });
     }
+  }
+
+  // Session capabilities fragment — the services actually wired into this
+  // container (Looker, Google Workspace, Snowflake, …) with their activation
+  // steps, so the agent reads them every turn instead of (wrongly) concluding
+  // it lacks access and rediscovering each session. Push, not pull: the same
+  // snapshot the `get_capabilities` MCP tool returns, baked into the prompt.
+  // Best-effort — a failure here must never block CLAUDE.md regeneration.
+  try {
+    const capsFragment = renderSessionCapabilities(buildSessionServicesSnapshot(group.id));
+    if (capsFragment) {
+      desired.set('session-capabilities.md', { type: 'inline', content: capsFragment });
+    }
+  } catch (err) {
+    log.warn('Session capabilities fragment skipped', { group: group.id, err: String(err) });
   }
 
   // Reconcile: drop stale, write desired.

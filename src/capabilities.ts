@@ -125,6 +125,33 @@ function hostDirExists(...parts: string[]): boolean {
   return fs.existsSync(path.join(os.homedir(), ...parts));
 }
 
+/**
+ * Render the per-session services snapshot as a CLAUDE.md fragment. Pushed
+ * into the composed prompt (see claude-md-compose) so the agent reads its
+ * ACTUALLY-WIRED services — Looker, Google Workspace, Snowflake, … — with
+ * their activation steps on every turn, instead of guessing it lacks access
+ * and rediscovering each session. Returns '' when nothing is wired so the
+ * fragment is omitted entirely.
+ */
+export function renderSessionCapabilities(snapshot: SessionServicesSnapshot): string {
+  if (snapshot.services.length === 0) return '';
+  const lines: string[] = [
+    '# Your wired capabilities (this session)',
+    '',
+    'The services below are wired into THIS container right now. Do NOT tell the user you lack access to them, and do NOT ask for their credentials — auth is already injected at spawn. Use them directly. For full host-wide detail you can also call `mcp__nanoclaw__get_capabilities`.',
+    '',
+  ];
+  for (const s of snapshot.services) {
+    const handle = s.cli ? `CLI \`${s.cli}\`` : s.mcpNamespace ? `MCP \`${s.mcpNamespace}\`` : '';
+    const scope = s.scopes.length > 0 ? ` — scopes: ${s.scopes.join(', ')}` : '';
+    lines.push(`- **${s.name}**${handle ? ` — ${handle}` : ''}${scope}`);
+    const detail = s.activation ?? s.useFor;
+    if (detail) lines.push(`  - ${detail}`);
+  }
+  lines.push('');
+  return lines.join('\n');
+}
+
 /** Env names we scope per-agent-group (must stay in sync with SCOPED_CREDENTIAL_VARS in container-runner). */
 const SCOPED_ENV_NAMES = [
   'GITHUB_TOKEN',
@@ -218,10 +245,18 @@ function yamlTopLevelKeys(absPath: string): string[] {
   }
 }
 
-function buildSessionServicesSnapshot(agentGroupId: string): SessionServicesSnapshot {
+export function buildSessionServicesSnapshot(agentGroupId: string): SessionServicesSnapshot {
   const ag = getAgentGroup(agentGroupId);
-  const folder = ag?.folder ?? '';
   const cfg = ag ? readContainerConfig(ag.folder) : undefined;
+  // Env-scoped services (Looker, dbt-mcp, dbt Cloud, GitHub, Render) resolve
+  // their host creds by FOLDER via resolveScopedEnvVar. Sibling groups (e.g.
+  // madison-reed-codex) set `credentialFolder` to the seed folder so they
+  // share the seed's scoped creds, and the real MCP wiring keys on
+  // credentialFolder too (container-runner resolveScopedEnv). The snapshot
+  // MUST use the same folder, or it looks for LOOKER_*_MADISON_REED_CODEX
+  // (which never exists), falls through to unscoped, and falsely reports
+  // "credentials missing — Ask Dave" for every sibling.
+  const folder = cfg?.credentialFolder ?? ag?.folder ?? '';
   const tools = cfg?.tools;
 
   const listAccounts = (absDir: string): string[] => {
