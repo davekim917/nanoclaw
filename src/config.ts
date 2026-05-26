@@ -6,7 +6,14 @@ import { getContainerImageBase, getDefaultContainerImage, getInstallSlug } from 
 import { isValidTimezone } from './timezone.js';
 
 // Read config values from .env (falls back to process.env).
-const envConfig = readEnvFile(['ASSISTANT_NAME', 'ASSISTANT_HAS_OWN_NUMBER', 'ONECLI_URL', 'ONECLI_API_KEY', 'TZ']);
+const envConfig = readEnvFile([
+  'ASSISTANT_NAME',
+  'ASSISTANT_HAS_OWN_NUMBER',
+  'ONECLI_URL',
+  'ONECLI_API_KEY',
+  'TZ',
+  'NANOCLAW_WORKGROUP_SHARED_FS',
+]);
 
 export const ASSISTANT_NAME = process.env.ASSISTANT_NAME || envConfig.ASSISTANT_NAME || 'Andy';
 export const ASSISTANT_HAS_OWN_NUMBER =
@@ -30,7 +37,12 @@ export const REPO_ROOT = PROJECT_ROOT;
 // sibling's shared dirs there. Default OFF — the live-data migration only
 // runs, and the container mount only changes, when explicitly enabled.
 // See docs/specs/workgroup-shared-fs.md.
-export const WORKGROUP_SHARED_FS = process.env.NANOCLAW_WORKGROUP_SHARED_FS === '1';
+// Honor the real environment (takes precedence) AND .env. These config consts
+// are captured at import time — BEFORE index.ts's loadEnvIntoProcess() runs — so
+// a value present only in .env must come through envConfig (readEnvFile), not
+// process.env, or the flag silently reads false. See docs/specs/workgroup-shared-fs.md.
+export const WORKGROUP_SHARED_FS =
+  (process.env.NANOCLAW_WORKGROUP_SHARED_FS ?? envConfig.NANOCLAW_WORKGROUP_SHARED_FS) === '1';
 // Per-CC-project mnemon discovery root. The memory daemon walks this in
 // addition to GROUPS_DIR; any subdir containing a `.memory-enabled` marker
 // becomes a discovered group with agentGroupId = `cc-<slug>` and a
