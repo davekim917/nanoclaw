@@ -17,6 +17,14 @@ import { execFileSync } from 'child_process';
 // Type-safe handle to the mocked function.
 const mockedExec = vi.mocked(execFileSync);
 
+// LIST ops now go through the gateway API via curl (the CLI caps at 20 rows), so
+// a list call looks like execFileSync('curl', [..., '<base>/api/<resource>...']).
+// Set ops still shell out to `onecli`. These match a mock.calls entry [bin, args].
+const isAgentsListCall = (c: unknown[]): boolean =>
+  c[0] === 'curl' && (c[1] as string[]).some((a) => String(a).includes('/api/agents'));
+const isSecretsListCall = (c: unknown[]): boolean =>
+  c[0] === 'curl' && (c[1] as string[]).some((a) => String(a).includes('/api/secrets'));
+
 beforeEach(() => {
   __resetCachesForTest();
   mockedExec.mockReset();
@@ -53,11 +61,16 @@ const SECRET_FIXTURE = {
 };
 
 function setupCliResponses(): void {
-  mockedExec.mockImplementation((_bin: unknown, rawArgs: unknown) => {
+  mockedExec.mockImplementation((bin: unknown, rawArgs: unknown) => {
     const argv = (rawArgs ?? []) as string[];
-    if (argv[0] === 'agents' && argv[1] === 'list') return JSON.stringify(AGENT_FIXTURE);
-    if (argv[0] === 'secrets' && argv[1] === 'list') return JSON.stringify(SECRET_FIXTURE);
-    return ''; // set-secrets / set-secret-mode return empty success
+    // LIST ops go through the gateway API via curl; route by the URL in argv.
+    if (bin === 'curl') {
+      const url = argv.join(' ');
+      if (url.includes('/api/agents')) return JSON.stringify(AGENT_FIXTURE);
+      if (url.includes('/api/secrets')) return JSON.stringify(SECRET_FIXTURE);
+      return '';
+    }
+    return ''; // onecli set-secrets / set-secret-mode return empty success
   });
 }
 
@@ -100,13 +113,19 @@ describe('applyOnecliSecrets — happy path', () => {
 
     applyOnecliSecrets('madison-reed', ['Datafold-MadisonReed', 'Hex', 'Anthropic']);
 
-    const calls = mockedExec.mock.calls.map((c) => c[1] as string[]);
+    const rawCalls = mockedExec.mock.calls;
 
-    // Order: agents list (UUID resolution), secrets list (name resolution),
-    // set-secret-mode (defensive lock), set-secrets (declarative apply)
-    expect(calls[0]).toEqual(['agents', 'list']);
-    expect(calls[1]).toEqual(['secrets', 'list']);
-    expect(calls[2]).toEqual([
+    // Order: agents list (UUID resolution) → secrets list (name resolution) via
+    // the gateway API (curl), then set-secret-mode (defensive lock) + set-secrets
+    // (declarative apply) via the onecli CLI.
+    const agentsListIdx = rawCalls.findIndex(isAgentsListCall);
+    const secretsListIdx = rawCalls.findIndex(isSecretsListCall);
+    expect(agentsListIdx).toBeGreaterThanOrEqual(0);
+    expect(secretsListIdx).toBeGreaterThan(agentsListIdx);
+
+    const modeCall = rawCalls.find((c) => (c[1] as string[])[1] === 'set-secret-mode');
+    const setCall = rawCalls.find((c) => (c[1] as string[])[1] === 'set-secrets');
+    expect(modeCall?.[1] as string[]).toEqual([
       'agents',
       'set-secret-mode',
       '--id',
@@ -114,7 +133,7 @@ describe('applyOnecliSecrets — happy path', () => {
       '--mode',
       'selective',
     ]);
-    expect(calls[3]).toEqual([
+    expect(setCall?.[1] as string[]).toEqual([
       'agents',
       'set-secrets',
       '--id',
@@ -212,14 +231,10 @@ describe('applyOnecliSecrets — caching', () => {
     setupCliResponses();
 
     applyOnecliSecrets('madison-reed', ['Anthropic']);
-    const firstCallCount = mockedExec.mock.calls.filter(
-      (c) => (c[1] as string[])[0] === 'agents' && (c[1] as string[])[1] === 'list',
-    ).length;
+    const firstCallCount = mockedExec.mock.calls.filter(isAgentsListCall).length;
 
     applyOnecliSecrets('madison-reed', ['Hex']);
-    const secondCallCount = mockedExec.mock.calls.filter(
-      (c) => (c[1] as string[])[0] === 'agents' && (c[1] as string[])[1] === 'list',
-    ).length;
+    const secondCallCount = mockedExec.mock.calls.filter(isAgentsListCall).length;
 
     // First call populated the cache; second call should NOT re-list agents.
     expect(secondCallCount).toBe(firstCallCount);
@@ -230,25 +245,29 @@ describe('applyOnecliSecrets — caching', () => {
     // that contains an identifier we'll ask for — the cache miss should
     // re-issue `agents list` and discover it.
     let callsToAgentsList = 0;
-    mockedExec.mockImplementation((_bin: unknown, rawArgs: unknown) => {
+    mockedExec.mockImplementation((bin: unknown, rawArgs: unknown) => {
       const argv = (rawArgs ?? []) as string[];
-      if (argv[0] === 'agents' && argv[1] === 'list') {
-        callsToAgentsList++;
-        if (callsToAgentsList === 1) return JSON.stringify(AGENT_FIXTURE);
-        // Second call: include a new agent
-        return JSON.stringify({
-          data: [
-            ...AGENT_FIXTURE.data,
-            {
-              id: '33333333-3333-3333-3333-333333333333',
-              name: 'newly-created',
-              identifier: 'newly-created-identifier',
-              secretMode: 'selective',
-            },
-          ],
-        });
+      if (bin === 'curl') {
+        const url = argv.join(' ');
+        if (url.includes('/api/agents')) {
+          callsToAgentsList++;
+          if (callsToAgentsList === 1) return JSON.stringify(AGENT_FIXTURE);
+          // Second call: include a new agent
+          return JSON.stringify({
+            data: [
+              ...AGENT_FIXTURE.data,
+              {
+                id: '33333333-3333-3333-3333-333333333333',
+                name: 'newly-created',
+                identifier: 'newly-created-identifier',
+                secretMode: 'selective',
+              },
+            ],
+          });
+        }
+        if (url.includes('/api/secrets')) return JSON.stringify(SECRET_FIXTURE);
+        return '';
       }
-      if (argv[0] === 'secrets' && argv[1] === 'list') return JSON.stringify(SECRET_FIXTURE);
       return '';
     });
 

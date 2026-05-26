@@ -24,12 +24,13 @@
  * SDK-bypass rationale: the `@onecli-sh/sdk@0.5.0` only exposes
  * `getGatewaySkill`, `getContainerConfig`, `applyContainerConfig`,
  * `createAgent`, `ensureAgent`, `provisionUser`, and
- * `configureManualApproval`. List/set operations on agents and secrets
- * are CLI-only, so this module follows the shell-out pattern from
- * `setup/auth.ts:80-113`.
+ * `configureManualApproval`. Set operations are CLI-only (shell-out, per
+ * `setup/auth.ts:80-113`); LIST operations go straight to the gateway API
+ * (`listViaApi`) because the CLI's list caps at 20 rows with no pagination.
  */
 import { execFileSync } from 'child_process';
 
+import { ONECLI_URL, ONECLI_API_KEY } from './config.js';
 import { log } from './log.js';
 
 interface OnecliAgent {
@@ -75,16 +76,39 @@ function runOnecli(args: string[]): string {
   });
 }
 
+/**
+ * Fetch a FULL list (agents or secrets) from the OneCLI gateway API.
+ *
+ * Why not `onecli <resource> list`: the CLI hard-caps its output at 20 rows
+ * with no pagination flag (verified against the gateway: `--limit` is ignored).
+ * Once the vault holds >20 agents/secrets it silently drops the rest, which
+ * fail-closes the lookups below for anything past the first page — the bug that
+ * took primaries offline after the opencode rollout pushed the agent count to
+ * 28. The SDK exposes no list op, so we hit the gateway API directly with a
+ * high limit. Localhost gateway (ONECLI_URL), auth'd with the same key the SDK
+ * uses; the API returns the full set (a bare array, or `{data:[...]}`).
+ *
+ * Kept synchronous (curl via execFileSync) so the resolve/apply call chain
+ * stays sync — set operations still go through `runOnecli` (they target one
+ * agent + explicit ids, so they have no pagination concern).
+ */
+function listViaApi(resource: 'agents' | 'secrets'): unknown[] {
+  const base = (ONECLI_URL || 'http://127.0.0.1:10254').replace(/\/$/, '');
+  const args = ['-fsS', `${base}/api/${resource}?limit=10000`];
+  if (ONECLI_API_KEY) args.unshift('-H', `Authorization: Bearer ${ONECLI_API_KEY}`);
+  const out = execFileSync('curl', args, { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'pipe'] });
+  const parsed = JSON.parse(out) as unknown;
+  if (Array.isArray(parsed)) return parsed;
+  const data = (parsed as { data?: unknown }).data;
+  return Array.isArray(data) ? data : [];
+}
+
 function listAgents(): OnecliAgent[] {
-  const out = runOnecli(['agents', 'list']);
-  const parsed = JSON.parse(out) as { data?: unknown };
-  return Array.isArray(parsed.data) ? (parsed.data as OnecliAgent[]) : [];
+  return listViaApi('agents') as OnecliAgent[];
 }
 
 function listSecrets(): OnecliSecret[] {
-  const out = runOnecli(['secrets', 'list']);
-  const parsed = JSON.parse(out) as { data?: unknown };
-  return Array.isArray(parsed.data) ? (parsed.data as OnecliSecret[]) : [];
+  return listViaApi('secrets') as OnecliSecret[];
 }
 
 /**
