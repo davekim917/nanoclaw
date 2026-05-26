@@ -65,7 +65,7 @@ pnpm run build
 6. Under **Privileged Gateway Intents**, enable **Message Content Intent**
 7. Go to **OAuth2** > **URL Generator**:
    - Scopes: select `bot`
-   - Bot Permissions: select `Send Messages`, `Read Message History`, `Add Reactions`, `Attach Files`, `Use Slash Commands`
+   - Bot Permissions: NanoClaw's setup flow generates the invite URL with `permissions=3378792827444288` automatically (see `INVITE_PERMISSIONS` in `setup/channels/discord.ts` for the authoritative value + full breakdown). For a manual invite, the notable boxes are `View Channel`, `Send Messages`, `Send Messages in Threads`, `Create Public Threads`, `Create Private Threads`, `Manage Threads`, `Embed Links`, `Attach Files`, `Read Message History`, `Add Reactions`, `Use Slash Commands`, plus `Mention Everyone` — but NOT `Manage Channels`, `Manage Messages`, or `Manage Webhooks`.
 8. Copy the generated URL and open it in your browser to invite the bot to your server
 
 ### Configure environment

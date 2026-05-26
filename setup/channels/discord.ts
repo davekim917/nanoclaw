@@ -38,10 +38,15 @@ import { accentGreen, brandBody, fmtDuration, note } from '../lib/theme.js';
 const DEFAULT_AGENT_NAME = 'Nano';
 const DISCORD_API = 'https://discord.com/api/v10';
 
-// Send Messages (0x800) + Add Reactions (0x40) + Attach Files (0x8000)
-//   + Read Message History (0x10000) = 100416.
-// Matches the permissions set documented in .claude/skills/add-discord/SKILL.md.
-const INVITE_PERMISSIONS = '100416';
+// Discord bot invite permission bitfield (Discord OAuth2 URL Generator value).
+// 3378792827444288 = the agent feature set: View Channel, Send Messages,
+// Embed Links, Attach Files, Read Message History, Add Reactions, all thread
+// perms (create public/private + send-in + Manage Threads), Use Slash Commands,
+// external emoji/stickers, voice (connect/speak/VAD), Manage Events, embedded
+// activities — PLUS Mention Everyone. NOT granted: Administrator / Kick / Ban /
+// Manage Guild / Manage Roles / Manage Channels / Manage Messages / Manage
+// Webhooks. Keep in sync with .claude/skills/add-discord/SKILL.md.
+const INVITE_PERMISSIONS = '3378792827444288';
 
 interface AppInfo {
   applicationId: string;
