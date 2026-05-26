@@ -37,8 +37,14 @@ const SECRET_FIXTURE = {
 };
 
 function setupOnecliMock(): void {
-  mockedExec.mockImplementation((_bin: unknown, rawArgs: unknown) => {
+  mockedExec.mockImplementation((bin: unknown, rawArgs: unknown) => {
     const argv = (rawArgs ?? []) as string[];
+    // onecli-secrets now lists secrets via the gateway API (listViaApi: a curl
+    // to /api/secrets) to dodge the CLI's 20-row cap (919d3bce). Match that.
+    if (bin === 'curl' && argv.some((a) => String(a).includes('/api/secrets'))) {
+      return JSON.stringify(SECRET_FIXTURE);
+    }
+    // Back-compat with the old `onecli secrets list` call shape.
     if (argv[0] === 'secrets' && argv[1] === 'list') return JSON.stringify(SECRET_FIXTURE);
     return '';
   });
