@@ -121,7 +121,7 @@ describe('reconcileWorkgroupSharedDirs', () => {
     // Contents copied, source removed, no leftover staging dir.
     expect(fs.existsSync(path.join(wgDir, 'sources', 'inbox', 'f.json'))).toBe(true);
     expect(fs.existsSync(path.join(wgDir, 'dbt', '.git'))).toBe(true);
-    expect(fs.existsSync(path.join(wgDir, 'sources.partial'))).toBe(false);
+    expect(fs.existsSync(path.join(wgDir, '.sources.partial'))).toBe(false);
     expect(fs.lstatSync(path.join(groupsDir, 'wgx', 'sources')).isSymbolicLink()).toBe(true);
   });
 
@@ -141,5 +141,27 @@ describe('reconcileWorkgroupSharedDirs', () => {
     expect(fs.lstatSync(seedSources).isSymbolicLink()).toBe(true);
     expect(fs.readlinkSync(seedSources)).toBe('/workspace/workgroup/sources');
     expect(fs.existsSync(path.join(wgDir, 'sources', 'inbox', 'f.json'))).toBe(true);
+  });
+
+  it('recovers a moved dir whose name ends in .partial (no staging-namespace collision)', () => {
+    const wgDir = path.join(dataDir, 'workgroups', 'wgx');
+    // A legitimately shared git repo whose real name ends in `.partial`.
+    fs.mkdirSync(path.join(groupsDir, 'wgx', 'repo.partial', '.git'), { recursive: true });
+    // Simulate a crash AFTER the move (dst complete, src already removed) but
+    // BEFORE the compat symlink — the exact window the wgDir re-scan recovers.
+    // The old `.endsWith('.partial')` skip would orphan this dir.
+    fs.mkdirSync(path.join(wgDir, 'repo.partial', '.git'), { recursive: true });
+    fs.rmSync(path.join(groupsDir, 'wgx', 'repo.partial'), { recursive: true, force: true });
+
+    reconcileWorkgroupSharedDirs(db, { groupsDir, dataDir });
+
+    // Recovery re-added it: seed path is the compat symlink, data intact.
+    const seedRepo = path.join(groupsDir, 'wgx', 'repo.partial');
+    expect(fs.lstatSync(seedRepo).isSymbolicLink()).toBe(true);
+    expect(fs.readlinkSync(seedRepo)).toBe('/workspace/workgroup/repo.partial');
+    expect(fs.existsSync(path.join(wgDir, 'repo.partial', '.git'))).toBe(true);
+    // And it's recorded as moved (recovery completed the cutover).
+    const marker = JSON.parse(fs.readFileSync(path.join(wgDir, '.migrated'), 'utf-8'));
+    expect(marker.moved).toContain('repo.partial');
   });
 });

@@ -107,6 +107,7 @@ function migrateWorkgroup(db: Database.Database, workgroupId: string, groupsDir:
     }
     for (const e of entries) {
       if (!e.isSymbolicLink()) continue;
+      if (e.name.startsWith('.') || e.name === 'node_modules') continue; // match the seed scan: never share dot/build dirs
       const seedEntry = path.join(seedDir, e.name);
       if (isRealDir(seedEntry)) {
         shared.add(e.name);
@@ -118,15 +119,17 @@ function migrateWorkgroup(db: Database.Database, workgroupId: string, groupsDir:
 
   // Crash recovery: any real dir already in wgDir was moved by a prior
   // interrupted run (we only reach here when `.migrated` is absent — a
-  // completed run returned early above). A crash AFTER renameSync(src,dst) but
-  // BEFORE the compat symlink/sibling-repoint would otherwise drop that name
-  // from the seed-derived set above (its source is already gone), orphaning the
+  // completed run returned early above). A crash AFTER the move but BEFORE the
+  // compat symlink/sibling-repoint would otherwise drop that name from the
+  // seed-derived set above (its source is already gone), orphaning the
   // `/workspace/agent/<name>` path. Re-include it so the move loop finishes the
-  // cutover. Skip `.partial` staging dirs (incomplete copies — reprocessed via
-  // the still-real seed source instead).
+  // cutover. Staging dirs are hidden (`.<name>.partial`) and shared dirs are
+  // never dot-named (both the seed scan and the sibling union exclude dot dirs),
+  // so the single dotfile skip cleanly excludes incomplete copies WITHOUT
+  // excluding a real shared dir whose name happens to end in `.partial`.
   try {
     for (const e of fs.readdirSync(wgDir, { withFileTypes: true })) {
-      if (e.isDirectory() && !e.name.startsWith('.') && !e.name.endsWith('.partial')) {
+      if (e.isDirectory() && !e.name.startsWith('.')) {
         shared.add(e.name);
       }
     }
@@ -168,7 +171,10 @@ function migrateWorkgroup(db: Database.Database, workgroupId: string, groupsDir:
       if (strategy === 'rename') {
         fs.renameSync(src, dst); // atomic within the filesystem
       } else {
-        const staging = `${dst}.partial`;
+        // Hidden staging name so the crash-recovery wgDir scan (which skips
+        // dotfiles) never mistakes an incomplete copy for a moved dir — and so
+        // it never collides with a real shared dir whose name ends in `.partial`.
+        const staging = path.join(wgDir, `.${name}.partial`);
         fs.rmSync(staging, { recursive: true, force: true }); // clear any stale partial
         fs.cpSync(src, staging, { recursive: true, verbatimSymlinks: true });
         fs.renameSync(staging, dst); // atomic into place — dst is now complete-or-absent
