@@ -23,6 +23,14 @@ export const STORE_DIR = path.resolve(PROJECT_ROOT, 'store');
 export const GROUPS_DIR = path.resolve(PROJECT_ROOT, 'groups');
 export const DATA_DIR = path.resolve(PROJECT_ROOT, 'data');
 export const REPO_ROOT = PROJECT_ROOT;
+
+// Feature flag: when '1', workgroup members share a dedicated
+// `data/workgroups/<workgroup_id>/` directory bind-mounted at
+// `/workspace/workgroup`, and a startup migration consolidates the seed
+// sibling's shared dirs there. Default OFF — the live-data migration only
+// runs, and the container mount only changes, when explicitly enabled.
+// See docs/specs/workgroup-shared-fs.md.
+export const WORKGROUP_SHARED_FS = process.env.NANOCLAW_WORKGROUP_SHARED_FS === '1';
 // Per-CC-project mnemon discovery root. The memory daemon walks this in
 // addition to GROUPS_DIR; any subdir containing a `.memory-enabled` marker
 // becomes a discovered group with agentGroupId = `cc-<slug>` and a

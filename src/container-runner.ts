@@ -25,6 +25,7 @@ import {
   ONECLI_API_KEY,
   ONECLI_URL,
   TIMEZONE,
+  WORKGROUP_SHARED_FS,
 } from './config.js';
 import {
   getRecallScope,
@@ -47,6 +48,7 @@ import { initGroupFilesystem } from './group-init.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { applyOnecliSecrets, mergeWorkgroupAndGroupSecrets } from './onecli-secrets.js';
+import { workgroupSharedDir, WORKGROUP_CONTAINER_PATH } from './modules/workgroup/shared-dirs.js';
 import type Database from 'better-sqlite3';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
 import YAML from 'yaml';
@@ -1067,6 +1069,21 @@ function buildMounts(
       continue;
     }
     mounts.push({ hostPath: realTarget, containerPath: `/workspace/agent/${entry.name}`, readonly: false });
+  }
+
+  // Workgroup shared filesystem — flag-gated. Bind-mount data/workgroups/<id>/
+  // at /workspace/workgroup so every sibling in the workgroup shares one tree
+  // (the "house"); /workspace/agent stays private (the "bedroom"). The seed's
+  // shared dirs are compat-symlinked to this path by reconcileWorkgroupSharedDirs
+  // (container-absolute targets, skipped by the overlay loop above), so existing
+  // /workspace/agent/<name> reader paths resolve through it with no repoint.
+  // Also mounts when a prior migration left a .migrated marker, so flipping the
+  // flag off after enabling doesn't dangle the compat symlinks.
+  const wgId = agentGroup.workgroup_id || agentGroup.folder;
+  const wgShared = workgroupSharedDir(wgId);
+  if (WORKGROUP_SHARED_FS || fs.existsSync(path.join(wgShared, '.migrated'))) {
+    fs.mkdirSync(wgShared, { recursive: true });
+    mounts.push({ hostPath: wgShared, containerPath: WORKGROUP_CONTAINER_PATH, readonly: false });
   }
 
   // container.json — nested RO mount on top of RW group dir so the agent

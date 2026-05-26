@@ -7,6 +7,10 @@ export interface AgentGroup {
   /** @deprecated Use container_configs.provider instead. */
   agent_provider: string | null;
   created_at: string;
+  /** Workgroup this group belongs to (migration 036). Standalone groups have
+   *  workgroup_id === folder. Selected via `SELECT *`; may be absent on rows
+   *  written before the migration. */
+  workgroup_id?: string | null;
 }
 
 /** Per-agent-group container runtime config. Source of truth in the DB;

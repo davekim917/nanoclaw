@@ -116,6 +116,8 @@ import { runReconcilerOnStartup as runDispatchReconcilerOnStartup } from './modu
 // Workgroup FS reconciler — drains the _migration036_report temp table and
 // writes recall_scope to paired groups' container.json. Runs after migrations.
 import { reconcileWorkgroupFsState } from './modules/workgroup/fs-reconcile.js';
+import { reconcileWorkgroupSharedDirs } from './modules/workgroup/shared-dirs.js';
+import { WORKGROUP_SHARED_FS } from './config.js';
 // CLI command barrel — populates the `ncl` registry before the CLI server
 // accepts connections.
 import './cli/commands/index.js';
@@ -163,6 +165,19 @@ async function main(): Promise<void> {
   } catch (fsErr) {
     log.error('Workgroup FS reconciliation failed at startup', { err: fsErr });
     process.exit(1);
+  }
+
+  // Workgroup shared-FS consolidation — flag-gated (NANOCLAW_WORKGROUP_SHARED_FS,
+  // default off). Moves each workgroup's shared dirs into data/workgroups/<id>/
+  // (bind-mounted at /workspace/workgroup). Idempotent + fail-closed; runs
+  // before any container spawn so the filesystem is quiesced during the move.
+  if (WORKGROUP_SHARED_FS) {
+    try {
+      reconcileWorkgroupSharedDirs(db);
+    } catch (sharedErr) {
+      log.error('Workgroup shared-FS consolidation failed at startup', { err: sharedErr });
+      process.exit(1);
+    }
   }
 
   log.info('Central DB ready', { path: dbPath });
