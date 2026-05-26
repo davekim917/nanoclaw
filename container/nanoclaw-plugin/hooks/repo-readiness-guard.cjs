@@ -33,20 +33,57 @@ function findGitRoot(startDir) {
 }
 
 /**
- * Returns 'missing' | 'stale' | 'current'
+ * Locate the .gitnexus index dir for a repo. The index lives at the repo root
+ * on a normal checkout, but for a LINKED worktree (container agents commit in
+ * /workspace/worktrees/<repo>) it sits beside the BASE clone
+ * (/workspace/agent/<repo>/.gitnexus) — a sibling that --show-toplevel never
+ * points at. Resolve the base clone via git's COMMON dir and check there too.
+ * Returns the .gitnexus dir path, or null when no index exists anywhere.
  */
-function checkGitNexusIndex(repoPath) {
-  const metaPath = path.join(repoPath, '.gitnexus', 'meta.json');
-  if (!fs.existsSync(metaPath)) return 'missing';
-
+function findGitNexusDir(repoPath) {
+  const direct = path.join(repoPath, '.gitnexus');
+  if (fs.existsSync(path.join(direct, 'meta.json'))) return direct;
   try {
-    const meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
-    const lastCommit = meta.lastCommit || '';
-
-    const head = spawnSync('git', ['rev-parse', 'HEAD'], {
+    const common = spawnSync('git', ['rev-parse', '--git-common-dir'], {
       encoding: 'utf-8',
       timeout: 3000,
       cwd: repoPath,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    if (common.status === 0) {
+      const gitDir = (common.stdout || '').trim();
+      if (gitDir) {
+        const baseRoot = path.dirname(path.resolve(repoPath, gitDir));
+        const candidate = path.join(baseRoot, '.gitnexus');
+        if (fs.existsSync(path.join(candidate, 'meta.json'))) return candidate;
+      }
+    }
+  } catch {
+    /* ignore — fall through to null */
+  }
+  return null;
+}
+
+/**
+ * Returns 'missing' | 'stale' | 'current'
+ */
+function checkGitNexusIndex(repoPath) {
+  const gnDir = findGitNexusDir(repoPath);
+  if (!gnDir) return 'missing';
+
+  try {
+    const meta = JSON.parse(fs.readFileSync(path.join(gnDir, 'meta.json'), 'utf-8'));
+    const lastCommit = meta.lastCommit || '';
+
+    // Compare against the HEAD of the repo the index DESCRIBES (the dir that
+    // contains .gitnexus — the base clone for a worktree), not the worktree's
+    // thread-branch tip. The thread branch always diverges from the indexed
+    // base, which would otherwise read as perpetually 'stale'.
+    const indexRepo = path.dirname(gnDir);
+    const head = spawnSync('git', ['rev-parse', 'HEAD'], {
+      encoding: 'utf-8',
+      timeout: 3000,
+      cwd: indexRepo,
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     const currentHead = (head.stdout || '').trim();
