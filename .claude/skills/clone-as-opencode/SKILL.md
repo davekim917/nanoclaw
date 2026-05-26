@@ -49,8 +49,15 @@ Capture the `id` value — it's an `ag-...` string (or the folder name itself fo
 SOURCE_FOLDER=<source-folder>             # e.g. illysium
 SOURCE_ID=$(pnpm exec tsx scripts/q.ts data/v2.db "select id from agent_groups where folder='${SOURCE_FOLDER}'" | tr -d '\n')
 test -n "${SOURCE_ID}" || { echo "ERROR: source group '${SOURCE_FOLDER}' not found"; exit 1; }
-echo "Source folder: ${SOURCE_FOLDER}"
-echo "Source ag-id:  ${SOURCE_ID}"
+# Workgroup the sibling must JOIN — the SOURCE's workgroup, not the sibling's
+# own folder. This is what grants shared chat-archive, mnemon store, and
+# workgroup-level OneCLI secrets. For a primary source it equals the folder;
+# clone from a codex sibling and it still resolves to the shared workgroup.
+SOURCE_WORKGROUP=$(pnpm exec tsx scripts/q.ts data/v2.db "select coalesce(workgroup_id, folder) from agent_groups where folder='${SOURCE_FOLDER}'" | tr -d '\n')
+test -n "${SOURCE_WORKGROUP}" || { echo "ERROR: could not resolve workgroup for '${SOURCE_FOLDER}'"; exit 1; }
+echo "Source folder:    ${SOURCE_FOLDER}"
+echo "Source ag-id:     ${SOURCE_ID}"
+echo "Source workgroup: ${SOURCE_WORKGROUP}"
 ```
 
 ### 2. Install the sibling's bot app
@@ -152,44 +159,28 @@ cd -
 
 ### 5. Write container.json
 
-Copy the source's tool list (so the sibling inherits the same MCP servers + integrations) and set `provider: "opencode"`. Drop `dailySummary` (no duplicate roll-ups).
-
-Start with the sibling-specific scaffold, then inherit `onecliSecrets`, `tools`, `mcpServers`, and `additionalMounts` from the source group via `jq` (parity invariant — the only differences should be provider, model, and codex-specific fields).
+Construct the sibling's container.json as **the source's, minus every sibling-bound field, plus this sibling's own identity + provider + memory**. Inheriting "everything except sibling-bound" (rather than a hand-picked subset like `onecliSecrets`/`tools`/`mcpServers`) is what guarantees a clean `ncl groups parity-check` *by construction* and carries over operator fields a fixed list would silently drop (e.g. `slack_user_token`). The sibling-bound set is the source of truth in `src/sibling-parity.ts` (`SIBLING_BOUND_FIELDS`) — keep this `del(...)` list in sync with it.
 
 ```bash
-# 1. Write sibling-only fields.
-cat > groups/${SIBLING_FOLDER}/container.json <<EOF
-{
-  "provider": "opencode",
-  "mcpServers": {},
-  "packages": { "apt": [], "npm": [] },
-  "additionalMounts": [],
-  "skills": "all",
-  "groupName": "${SIBLING_FOLDER}",
-  "assistantName": "${SIBLING_FOLDER}",
-  "agentGroupId": "${SIBLING_ID}",
-  "credentialFolder": "${SOURCE_FOLDER}",
-  "gitnexusInjectAgentsMd": true,
-  "tools": [],
-  "memory": { "enabled": true },
-  "onecliSecrets": []
-}
-EOF
-
-# 2. Inherit operator-managed fields from the source. Excludes codex-specific
-# fields (codexHostAuth) and one-writer-per-workgroup fields (dailySummary).
-jq --slurpfile src groups/${SOURCE_FOLDER}/container.json '
-  .onecliSecrets = ($src[0].onecliSecrets // []) |
-  .tools = ($src[0].tools // []) |
-  .mcpServers = ($src[0].mcpServers // {}) |
-  .additionalMounts = ($src[0].additionalMounts // []) |
-  .packages = ($src[0].packages // {"apt":[],"npm":[]})
-' groups/${SIBLING_FOLDER}/container.json > /tmp/cj-sibling.json && \
+# Source MINUS every sibling-bound field, PLUS this sibling's identity/provider/memory.
+jq --arg folder "${SIBLING_FOLDER}" --arg src "${SOURCE_FOLDER}" '
+  del(.groupName, .assistantName, .agentGroupId, .credentialFolder, .provider,
+      .codexHostAuth, .model, .effort, .imageTag, .defaultModel, .defaultEffort,
+      .maxMessagesPerPrompt, .memory, .dailySummary, .gitnexusInjectAgentsMd)
+  | { provider: "opencode" } + .
+  | .groupName = $folder
+  | .assistantName = $folder
+  | .agentGroupId = $folder
+  | .credentialFolder = $src
+  | .gitnexusInjectAgentsMd = true
+  | .memory = { "enabled": true }
+' groups/${SOURCE_FOLDER}/container.json > /tmp/cj-sibling.json && \
   mv /tmp/cj-sibling.json groups/${SIBLING_FOLDER}/container.json
 
-# 3. Verify parity (the only diff should be sibling-bound + codex-specific fields).
-diff <(jq -S 'del(.groupName,.assistantName,.agentGroupId,.credentialFolder,.provider,.memory,.codexHostAuth,.dailySummary)' groups/${SOURCE_FOLDER}/container.json) \
-     <(jq -S 'del(.groupName,.assistantName,.agentGroupId,.credentialFolder,.provider,.memory)' groups/${SIBLING_FOLDER}/container.json) || true
+# Verify parity — only sibling-bound fields may differ (clean by construction).
+DEL='del(.groupName,.assistantName,.agentGroupId,.credentialFolder,.provider,.codexHostAuth,.model,.effort,.imageTag,.defaultModel,.defaultEffort,.maxMessagesPerPrompt,.memory,.dailySummary,.gitnexusInjectAgentsMd,.workgroup_id)'
+diff <(jq -S "$DEL" groups/${SOURCE_FOLDER}/container.json) \
+     <(jq -S "$DEL" groups/${SIBLING_FOLDER}/container.json) && echo "  ✅ parity clean" || true
 ```
 
 **Why `credentialFolder`**: container-runner's per-group credential lookups (LOOKER_*, DBT_*, GITHUB_TOKEN_*, RENDER_PG_*, GIT_AUTHOR_*, Snowflake, etc.) key on `<BASE>_<FOLDER_UPPER>`. Without this field a sibling folder like `madison-reed-opencode` would look for `LOOKER_BASE_URL_MADISON_REED_OPENCODE`, which doesn't exist. `credentialFolder` redirects credential lookups to the source folder; identity-bound paths (container name, group dir mount, MNEMON_STORE override, OpenCode auth dir) stay on the sibling's own folder.
@@ -222,18 +213,16 @@ ls -la ~/.local/share/opencode-${SIBLING_FOLDER}/auth.json
 
 To share one OpenCode account across all opencode siblings instead, skip this step entirely — the host falls back to the global `~/.local/share/opencode/auth.json`.
 
-### 6b. Scoped MNEMON_STORE override
+### 6b. Scoped MNEMON_STORE override — OPTIONAL (legacy escape-hatch)
 
-Routes the sibling's memory writes to the source group's existing store. The override value is the source's **ag-id** (not folder).
+**Skip this for normal siblings.** `workgroup_id` on the `agent_groups` row (step 7) already routes both mnemon recall and writes to the workgroup's shared store — `resolveMnemonStore`'s DB path (`container-runner.ts:295`) joins through `workgroups.mnemon_store_id`, and `recall_scope` defaults to `'workgroup'`. The env override wins over that DB resolution (`container-runner.ts:276`), so a stale one creates **split-brain memory** if `workgroups.mnemon_store_id` ever changes without also editing `.env`. Live codex and opencode siblings run with NO override.
+
+Set this **only** to force a store *different* from the workgroup's canonical one (rare):
 
 ```bash
+# Optional — usually unnecessary; workgroup_id (step 7) handles routing.
 ENV_KEY=MNEMON_STORE_$(echo "${SIBLING_FOLDER}" | tr 'a-z-' 'A-Z_')
-if grep -q "^${ENV_KEY}=" .env; then
-  sed -i.bak "s|^${ENV_KEY}=.*|${ENV_KEY}=${SOURCE_ID}|" .env
-else
-  echo "${ENV_KEY}=${SOURCE_ID}" >> .env
-fi
-grep "^${ENV_KEY}=" .env
+echo "${ENV_KEY}=${SOURCE_ID}" >> .env   # only to override the workgroup's shared store
 ```
 
 ### 6c. Scoped OpenCode model selection
@@ -298,6 +287,8 @@ Run `opencode models` (from the host, after `providers login`) to see what's act
 
 `agent_groups.created_at` is `NOT NULL` with no default.
 
+**`workgroup_id` is the load-bearing field.** It places the sibling in the SAME workgroup as its source + codex sibling, which is what grants shared chat-archive visibility, mnemon recall fan-out, and workgroup-level OneCLI-secret inheritance. It lives on the `agent_groups` row, NOT in `container.json` (matching how migration 036 set up the codex siblings — `reconcileWorkgroupAtSpawn` reads the DB value, and `recall_scope` defaults to `'workgroup'` whenever it is set; putting it in container.json instead would trip the parity-check since `workgroup_id` is not a sibling-bound field). Omitting it here is the bug that isolated the first opencode sibling (`illysium-opencode`) into its own workgroup-of-one: migration 036 only auto-pairs the `-codex` suffix, never `-opencode`.
+
 `agent_groups.name` should match `id` and `folder` — the workspace convention (`<source>-opencode`), NOT the Slack/Discord bot display name. The bot display name is platform-side (configured at api.slack.com/apps or the Discord dev portal) and is purely how chat users see the avatar; mixing the two leaves the dashboard with inconsistent groupings.
 
 ```bash
@@ -306,7 +297,7 @@ NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 EXISTING=$(pnpm exec tsx scripts/q.ts data/v2.db "select id from agent_groups where folder='${SIBLING_FOLDER}'" 2>/dev/null | tr -d '\n')
 if [ -z "${EXISTING}" ]; then
   pnpm exec tsx scripts/q.ts data/v2.db \
-    "insert into agent_groups (id, folder, name, agent_provider, created_at) values ('${SIBLING_ID}', '${SIBLING_FOLDER}', '${SIBLING_ID}', 'opencode', '${NOW}')"
+    "insert into agent_groups (id, folder, name, agent_provider, workgroup_id, created_at) values ('${SIBLING_ID}', '${SIBLING_FOLDER}', '${SIBLING_ID}', 'opencode', '${SOURCE_WORKGROUP}', '${NOW}')"
 fi
 ```
 
@@ -418,6 +409,63 @@ WHERE ur.role = 'owner' AND ur.agent_group_id IS NULL
 Slack siblings don't need this mirror — Slack's channelType is already workspace-scoped, so the per-workspace user_roles rows inherit naturally under `slack-<workspace>-opencode`.
 
 ### 10. Verify
+
+> **Functional checks first — the parity audit (step 11) is structural and will
+> NOT catch the two runtime failures that have bitten opencode siblings:**
+> 1. **Wrong provider/model vs auth.json** → the agent replies `Model not found`
+>    / `Invalid API key`. The bug lives in the agent-runner's config generation,
+>    so `opencode models` / `opencode run` alone do **not** reproduce it — only a
+>    real agent turn does. Root cause is always: `OPENCODE_MODEL`'s provider
+>    prefix is not a key in the `auth.json` this sibling uses (e.g. `opencode/*`
+>    when only `opencode-go` is authed, or vice-versa).
+> 2. **Double-prefixed `platform_id`** → delivery fails with `Invalid
+>    Discord/Slack thread ID`. The register step prepends the channel_type even
+>    when the adapter already base-prefixed the id.
+
+**Check A — `platform_id` is not double-prefixed (deterministic, no spawn):**
+
+```bash
+pnpm exec tsx scripts/q.ts data/v2.db "
+SELECT CASE WHEN mg.platform_id LIKE mg.channel_type || ':%'
+            THEN '❌ DOUBLE-PREFIXED: ' || mg.platform_id || '  → strip the channel_type prefix (UPDATE messaging_groups SET platform_id=...)'
+            ELSE '✅ platform_id ok: ' || mg.platform_id END
+FROM messaging_groups mg
+JOIN messaging_group_agents mga ON mga.messaging_group_id=mg.id
+WHERE mga.agent_group_id='${SIBLING_FOLDER}'"
+```
+
+**Check B — pre-flight: `OPENCODE_MODEL`'s provider is authed (deterministic, no spawn):**
+
+```bash
+PROV="${OPENCODE_PROVIDER}"   # e.g. opencode-go (global auth) or opencode (scoped Zen)
+# Resolve the auth.json this sibling actually uses: scoped dir if present, else global.
+AUTH="$HOME/.local/share/opencode-${SIBLING_FOLDER}/opencode/auth.json"
+[ -f "$AUTH" ] || AUTH="$HOME/.local/share/opencode/auth.json"
+node -e "const a=require('$AUTH'); process.exit(('$PROV' in a)?0:1)" \
+  && echo "✅ provider '$PROV' is present in $(basename $(dirname $(dirname "$AUTH")))" \
+  || echo "❌ provider '$PROV' is NOT in $AUTH — OPENCODE_MODEL will fail at runtime. Fix OPENCODE_PROVIDER/MODEL or 'opencode providers login' under the right XDG dir."
+```
+
+**Check C — live round-trip (the only check that exercises model + auth + delivery):**
+
+Send a test @-mention in the sibling's channel: `@<sibling-bot-name> reply with the single word OK`. Then assert the response was not an error:
+
+```bash
+SDIR=$(ls -dt data/v2-sessions/${SIBLING_FOLDER}/sess-* 2>/dev/null | head -1)
+pnpm exec tsx scripts/q.ts "$SDIR/outbound.db" "SELECT content FROM messages_out ORDER BY rowid DESC LIMIT 1" \
+  | grep -qiE "Model not found|Invalid API key|Error:" \
+  && echo "❌ sibling returned an error — see Check B; fix .env then 'ncl groups restart --id ${SIBLING_ID}'" \
+  || echo "✅ sibling produced a clean response — round-trip verified"
+```
+
+Checks A and B are deterministic and should both be ✅ before you announce the sibling. Check C is the end-to-end seal.
+
+> **Note on rebuilds:** an agent-runner *source* change (e.g. fixing the provider
+> config) does **not** need `./container/build.sh` — `container/agent-runner/src`
+> is bind-mounted read-only into the container, so a respawn (`ncl groups restart`
+> or host restart) reloads it. Only dep / Dockerfile changes need an image rebuild.
+
+#### Interaction checks
 
 #### Slack path
 

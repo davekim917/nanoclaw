@@ -50,8 +50,15 @@ Capture the `id` value — it's an `ag-...` string. Every later SQL statement th
 SOURCE_FOLDER=<source-folder>             # e.g. illysium
 SOURCE_ID=$(pnpm exec tsx scripts/q.ts data/v2.db "select id from agent_groups where folder='${SOURCE_FOLDER}'" | tr -d '\n')
 test -n "${SOURCE_ID}" || { echo "ERROR: source group '${SOURCE_FOLDER}' not found"; exit 1; }
-echo "Source folder: ${SOURCE_FOLDER}"
-echo "Source ag-id:  ${SOURCE_ID}"
+# Workgroup the sibling must JOIN — the SOURCE's workgroup, not the sibling's
+# own folder. This is what grants shared chat-archive, mnemon store, and
+# workgroup-level OneCLI secrets. For a primary source it equals the folder;
+# clone from another sibling and it still resolves to the shared workgroup.
+SOURCE_WORKGROUP=$(pnpm exec tsx scripts/q.ts data/v2.db "select coalesce(workgroup_id, folder) from agent_groups where folder='${SOURCE_FOLDER}'" | tr -d '\n')
+test -n "${SOURCE_WORKGROUP}" || { echo "ERROR: could not resolve workgroup for '${SOURCE_FOLDER}'"; exit 1; }
+echo "Source folder:    ${SOURCE_FOLDER}"
+echo "Source ag-id:     ${SOURCE_ID}"
+echo "Source workgroup: ${SOURCE_WORKGROUP}"
 ```
 
 ### 2. Install the sibling's bot app
@@ -162,43 +169,29 @@ cd -
 
 ### 5. Write container.json
 
-Start with the sibling-specific scaffold, then auto-inherit `onecliSecrets`, `tools`, `mcpServers`, and `additionalMounts` from the source group via `jq` (parity invariant — the only differences should be provider, model, and codex-specific fields).
+Construct the sibling's container.json as **the source's, minus every sibling-bound field, plus this sibling's own identity + provider + memory + `codexHostAuth`**. Inheriting "everything except sibling-bound" (rather than a hand-picked subset like `onecliSecrets`/`tools`/`mcpServers`) is what guarantees a clean `ncl groups parity-check` *by construction* and carries over operator fields a fixed list would silently drop (e.g. `slack_user_token`). The sibling-bound set is the source of truth in `src/sibling-parity.ts` (`SIBLING_BOUND_FIELDS`) — keep this `del(...)` list in sync with it.
 
 ```bash
-# 1. Write sibling-only fields.
-cat > groups/${SIBLING_FOLDER}/container.json <<EOF
-{
-  "provider": "codex",
-  "mcpServers": {},
-  "packages": { "apt": [], "npm": [] },
-  "additionalMounts": [],
-  "skills": "all",
-  "groupName": "${SIBLING_FOLDER}",
-  "assistantName": "${SIBLING_FOLDER}",
-  "agentGroupId": "${SIBLING_ID}",
-  "credentialFolder": "${SOURCE_FOLDER}",
-  "gitnexusInjectAgentsMd": true,
-  "tools": [],
-  "memory": { "enabled": true },
-  "onecliSecrets": [],
-  "codexHostAuth": true
-}
-EOF
-
-# 2. Inherit operator-managed fields from the source. Excludes one-writer-per-
-# workgroup fields (dailySummary).
-jq --slurpfile src groups/${SOURCE_FOLDER}/container.json '
-  .onecliSecrets = ($src[0].onecliSecrets // []) |
-  .tools = ($src[0].tools // []) |
-  .mcpServers = ($src[0].mcpServers // {}) |
-  .additionalMounts = ($src[0].additionalMounts // []) |
-  .packages = ($src[0].packages // {"apt":[],"npm":[]})
-' groups/${SIBLING_FOLDER}/container.json > /tmp/cj-sibling.json && \
+# Source MINUS every sibling-bound field, PLUS this sibling's identity/provider/memory.
+jq --arg folder "${SIBLING_FOLDER}" --arg src "${SOURCE_FOLDER}" '
+  del(.groupName, .assistantName, .agentGroupId, .credentialFolder, .provider,
+      .codexHostAuth, .model, .effort, .imageTag, .defaultModel, .defaultEffort,
+      .maxMessagesPerPrompt, .memory, .dailySummary, .gitnexusInjectAgentsMd)
+  | { provider: "codex" } + .
+  | .groupName = $folder
+  | .assistantName = $folder
+  | .agentGroupId = $folder
+  | .credentialFolder = $src
+  | .gitnexusInjectAgentsMd = true
+  | .memory = { "enabled": true }
+  | .codexHostAuth = true
+' groups/${SOURCE_FOLDER}/container.json > /tmp/cj-sibling.json && \
   mv /tmp/cj-sibling.json groups/${SIBLING_FOLDER}/container.json
 
-# 3. Verify parity (the only diff should be sibling-bound fields).
-diff <(jq -S 'del(.groupName,.assistantName,.agentGroupId,.credentialFolder,.provider,.memory,.codexHostAuth,.dailySummary)' groups/${SOURCE_FOLDER}/container.json) \
-     <(jq -S 'del(.groupName,.assistantName,.agentGroupId,.credentialFolder,.provider,.memory,.codexHostAuth)' groups/${SIBLING_FOLDER}/container.json) || true
+# Verify parity — only sibling-bound fields may differ (clean by construction).
+DEL='del(.groupName,.assistantName,.agentGroupId,.credentialFolder,.provider,.codexHostAuth,.model,.effort,.imageTag,.defaultModel,.defaultEffort,.maxMessagesPerPrompt,.memory,.dailySummary,.gitnexusInjectAgentsMd,.workgroup_id)'
+diff <(jq -S "$DEL" groups/${SOURCE_FOLDER}/container.json) \
+     <(jq -S "$DEL" groups/${SIBLING_FOLDER}/container.json) && echo "  ✅ parity clean" || true
 ```
 
 **Why `credentialFolder`**: container-runner's per-group credential lookups
@@ -231,23 +224,23 @@ CODEX_HOME=~/.codex-${SIBLING_FOLDER} codex login
 
 Mirrors the per-group OAuth pattern Claude already uses via scoped `CLAUDE_CODE_OAUTH_TOKEN_<FOLDER>` env vars (see `resolveAnthropicAuth`).
 
-### 6. Scoped MNEMON_STORE override
+### 6. Scoped MNEMON_STORE override — OPTIONAL (legacy escape-hatch)
 
-Routes the sibling's memory writes to the source group's existing store. The override value is the source's **ag-id** (not folder), because `container-runner.ts` defaults `MNEMON_STORE` to `agentGroup.id`.
+**Skip this for normal siblings.** `workgroup_id` on the `agent_groups` row (step 7) already routes both mnemon recall and writes to the workgroup's shared store — `resolveMnemonStore`'s DB path (`container-runner.ts:295`) joins through `workgroups.mnemon_store_id`, and `recall_scope` defaults to `'workgroup'`. The env override wins over that DB resolution (`container-runner.ts:276`), so a stale one creates **split-brain memory** if `workgroups.mnemon_store_id` ever changes without also editing `.env`. Live codex and opencode siblings run with NO override.
+
+Set this **only** to force a store *different* from the workgroup's canonical one (rare):
 
 ```bash
+# Optional — usually unnecessary; workgroup_id (step 7) handles routing.
 ENV_KEY=MNEMON_STORE_$(echo "${SIBLING_FOLDER}" | tr 'a-z-' 'A-Z_')
-if grep -q "^${ENV_KEY}=" .env; then
-  sed -i.bak "s|^${ENV_KEY}=.*|${ENV_KEY}=${SOURCE_ID}|" .env
-else
-  echo "${ENV_KEY}=${SOURCE_ID}" >> .env
-fi
-grep "^${ENV_KEY}=" .env
+echo "${ENV_KEY}=${SOURCE_ID}" >> .env   # only to override the workgroup's shared store
 ```
 
 ### 7. Insert the agent_groups row
 
 `agent_groups.created_at` is `NOT NULL` with no default.
+
+**`workgroup_id` is the load-bearing field.** It places the sibling in the SAME workgroup as its source, granting shared chat-archive visibility, mnemon recall fan-out, and workgroup-level OneCLI-secret inheritance. It lives on the `agent_groups` row, NOT in `container.json` (`reconcileWorkgroupAtSpawn` reads the DB value, and `recall_scope` defaults to `'workgroup'` whenever it is set; putting it in container.json would trip the parity-check since `workgroup_id` is not a sibling-bound field). Migration 036 auto-paired the codex siblings that pre-dated it — but it has already run and won't re-run, so a codex sibling created TODAY without this column is isolated in its own workgroup-of-one.
 
 `agent_groups.name` should match `id` and `folder` — the workspace
 convention (`<source>-codex`), NOT the Slack/Discord bot display name.
@@ -265,7 +258,7 @@ NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 EXISTING=$(pnpm exec tsx scripts/q.ts data/v2.db "select id from agent_groups where folder='${SIBLING_FOLDER}'" 2>/dev/null | tr -d '\n')
 if [ -z "${EXISTING}" ]; then
   pnpm exec tsx scripts/q.ts data/v2.db \
-    "insert into agent_groups (id, folder, name, agent_provider, created_at) values ('${SIBLING_ID}', '${SIBLING_FOLDER}', '${SIBLING_ID}', 'codex', '${NOW}')"
+    "insert into agent_groups (id, folder, name, agent_provider, workgroup_id, created_at) values ('${SIBLING_ID}', '${SIBLING_FOLDER}', '${SIBLING_ID}', 'codex', '${SOURCE_WORKGROUP}', '${NOW}')"
 fi
 ```
 
@@ -390,6 +383,48 @@ WHERE ur.role = 'owner' AND ur.agent_group_id IS NULL
 This is unique to Discord because Discord's primary channelType is bare `discord` — so adding a Discord sibling introduces a new namespace (`discord-<suffix>`) that existing owner roles don't cover. Slack's primary channelType is already workspace-scoped (`slack-<workspace>`), so adding a Slack sibling under `slack-<workspace>-codex` inherits owner roles correctly through the existing per-workspace user_roles rows; no mirror needed.
 
 ### 10. Verify
+
+> **Functional checks first — the parity audit (step 11) is structural and will
+> NOT catch the two runtime failures siblings can hit:**
+> 1. **Double-prefixed `platform_id`** → delivery fails with `Invalid
+>    Discord/Slack thread ID`. The register step prepends the channel_type even
+>    when the adapter already base-prefixed the id. (Direct-inserting the
+>    messaging group avoids it; the `setup register` path does not.)
+> 2. **Auth not wired** → the agent replies with an auth/`Error:` message instead
+>    of content. Only a real agent turn reproduces it.
+
+**Check A — `platform_id` is not double-prefixed (deterministic, no spawn):**
+
+```bash
+pnpm exec tsx scripts/q.ts data/v2.db "
+SELECT CASE WHEN mg.platform_id LIKE mg.channel_type || ':%'
+            THEN '❌ DOUBLE-PREFIXED: ' || mg.platform_id || '  → strip the channel_type prefix (UPDATE messaging_groups SET platform_id=...)'
+            ELSE '✅ platform_id ok: ' || mg.platform_id END
+FROM messaging_groups mg
+JOIN messaging_group_agents mga ON mga.messaging_group_id=mg.id
+WHERE mga.agent_group_id='${SIBLING_FOLDER}'"
+```
+
+**Check B — live round-trip (the only check that exercises model + auth + delivery):**
+
+Send a test @-mention in the sibling's channel: `@<sibling-bot-name> reply with the single word OK`. Then assert the response was not an error:
+
+```bash
+SDIR=$(ls -dt data/v2-sessions/${SIBLING_FOLDER}/sess-* 2>/dev/null | head -1)
+pnpm exec tsx scripts/q.ts "$SDIR/outbound.db" "SELECT content FROM messages_out ORDER BY rowid DESC LIMIT 1" \
+  | grep -qiE "not authenticated|Invalid API key|401|Error:" \
+  && echo "❌ sibling returned an error — check codex auth (codexHostAuth) then 'ncl groups restart --id ${SIBLING_ID}'" \
+  || echo "✅ sibling produced a clean response — round-trip verified"
+```
+
+Check A is deterministic and should be ✅ before you announce the sibling. Check B is the end-to-end seal.
+
+> **Note on rebuilds:** an agent-runner *source* change does **not** need
+> `./container/build.sh` — `container/agent-runner/src` is bind-mounted read-only
+> into the container, so a respawn (`ncl groups restart` or host restart) reloads
+> it. Only dep / Dockerfile changes need an image rebuild.
+
+#### Interaction checks
 
 #### Slack path
 
