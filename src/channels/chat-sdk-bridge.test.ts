@@ -2,7 +2,8 @@ import { describe, expect, it } from 'vitest';
 
 import type { Adapter, AdapterPostableMessage, RawMessage } from 'chat';
 
-import { createChatSdkBridge, parseRetryAfterMs, splitForLimit } from './chat-sdk-bridge.js';
+import { createChatSdkBridge, parseRetryAfterMs, resolveQuotedReply, splitForLimit } from './chat-sdk-bridge.js';
+import type { Message as ChatMessage } from 'chat';
 
 function stubAdapter(partial: Partial<Adapter>): Adapter {
   return { name: 'stub', ...partial } as unknown as Adapter;
@@ -722,5 +723,49 @@ describe('createChatSdkBridge.deliver — post path 429 retry', () => {
     // Chunk 1 ok (1 call) + chunk 2 first attempt (1) + 3 retries = 5 total.
     expect(calls.length).toBe(1 + 1 + 3);
     expect(id).toBe('id-1');
+  });
+});
+
+describe('resolveQuotedReply', () => {
+  const msg = (links: unknown): ChatMessage => ({ links }) as unknown as ChatMessage;
+
+  it('resolves the first link exposing a fetchMessage into reply context', async () => {
+    const m = msg([
+      { url: 'https://x' }, // no fetchMessage — skipped
+      { fetchMessage: async () => ({ id: 'm1', text: 'the quoted text', author: { fullName: 'Dave' } }) },
+    ]);
+    expect(await resolveQuotedReply(m)).toEqual({ id: 'm1', sender: 'Dave', text: 'the quoted text' });
+  });
+
+  it('falls back to userName when fullName is absent', async () => {
+    const m = msg([{ fetchMessage: async () => ({ text: 'hi', author: { userName: 'donthe' } }) }]);
+    expect(await resolveQuotedReply(m)).toMatchObject({ sender: 'donthe', text: 'hi' });
+  });
+
+  it('returns null when there are no resolvable links', async () => {
+    expect(await resolveQuotedReply(msg(undefined))).toBeNull();
+    expect(await resolveQuotedReply(msg([]))).toBeNull();
+    expect(await resolveQuotedReply(msg([{ url: 'https://x' }]))).toBeNull();
+  });
+
+  it('returns null (never throws) when fetchMessage rejects', async () => {
+    const m = msg([
+      {
+        fetchMessage: async () => {
+          throw new Error('slack 403');
+        },
+      },
+    ]);
+    expect(await resolveQuotedReply(m)).toBeNull();
+  });
+
+  it('returns null when the resolved message has no usable text', async () => {
+    const m = msg([{ fetchMessage: async () => ({ text: '   ', author: { fullName: 'Dave' } }) }]);
+    expect(await resolveQuotedReply(m)).toBeNull();
+  });
+
+  it('returns null on timeout — never stalls the inbound path', async () => {
+    const m = msg([{ fetchMessage: () => new Promise((res) => setTimeout(() => res({ text: 'late' }), 100)) }]);
+    expect(await resolveQuotedReply(m, 10)).toBeNull();
   });
 });

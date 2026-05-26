@@ -45,6 +45,53 @@ export interface ReplyContext {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export type ReplyContextExtractor = (raw: Record<string, any>) => ReplyContext | null;
 
+/** Race a promise against a timeout; rejects if the timeout wins. */
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return Promise.race([
+    p,
+    new Promise<T>((_, reject) => {
+      const timer = setTimeout(() => reject(new Error('timeout')), ms);
+      timer.unref();
+    }),
+  ]);
+}
+
+/**
+ * Resolve a quoted/shared MESSAGE link into reply context.
+ *
+ * Slack delivers a shared message — or a pasted message permalink — as a
+ * `message.links[]` LinkPreview carrying a `fetchMessage()` resolver. But
+ * `Message.toJSON()` strips that callback, and Slack (unlike Discord) wires no
+ * `extractReplyContext` hook, so the quoted text would otherwise never reach
+ * the agent (the gap behind "quoted messages don't come through to me as
+ * content"). Resolve the first link exposing a `fetchMessage`, time-bounded
+ * and fully defensive: any error/timeout returns null (the agent can still
+ * pull the thread on demand via `resolve_thread_link`). Multiple quoted links
+ * collapse to the first — the formatter renders a single <quoted_message>.
+ */
+export async function resolveQuotedReply(
+  message: ChatMessage,
+  timeoutMs = 8000,
+): Promise<(ReplyContext & { id?: string }) | null> {
+  try {
+    const links = (message as unknown as { links?: Array<{ fetchMessage?: () => Promise<unknown> }> }).links;
+    const resolver = links?.find((l) => typeof l?.fetchMessage === 'function')?.fetchMessage;
+    if (!resolver) return null;
+    const resolved = (await withTimeout(resolver(), timeoutMs)) as {
+      id?: string;
+      text?: string;
+      author?: { fullName?: string; userName?: string };
+    } | null;
+    const text = resolved?.text;
+    if (!resolved || typeof text !== 'string' || !text.trim()) return null;
+    const sender = resolved.author?.fullName ?? resolved.author?.userName ?? 'unknown';
+    return { id: resolved.id, sender, text };
+  } catch (err) {
+    log.warn('Failed to resolve quoted message link', { err: String(err) });
+    return null;
+  }
+}
+
 export interface ChatSdkBridgeConfig {
   adapter: Adapter;
   concurrency?: ConcurrencyStrategy;
@@ -306,6 +353,16 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const replyTo = config.extractReplyContext(message.raw as Record<string, any>);
       if (replyTo) serialized.replyTo = replyTo;
+    }
+
+    // Slack (and any adapter without an extractReplyContext hook): resolve a
+    // quoted/shared message link into reply context so the quoted text reaches
+    // the agent instead of being dropped. Time-bounded + defensive — see
+    // resolveQuotedReply. Runs only when no reply context was set above and the
+    // message actually carries a resolvable message link.
+    if (!serialized.replyTo) {
+      const quoted = await resolveQuotedReply(message);
+      if (quoted) serialized.replyTo = quoted;
     }
 
     // Project chat-sdk's nested author into the flat sender fields the router
