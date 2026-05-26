@@ -11,6 +11,34 @@ function log(msg: string): void {
   console.error(`[opencode-provider] ${msg}`);
 }
 
+/**
+ * True when the mounted OAuth auth.json carries a credential for `provider`.
+ * In that case the SDK resolves the token natively (XDG_DATA_HOME) and we must
+ * NOT inject the `apiKey: 'placeholder'` override — that would clobber the real
+ * OAuth token and break auth.
+ *
+ * Covers BOTH opencode OAuth keys that live in the same auth.json — `opencode`
+ * (Zen, /zen/v1) and `opencode-go` (Go subscription, /zen/go/v1) — plus any
+ * other provider whose cred is present (e.g. `nvidia`). Static OneCLI-proxied
+ * API-key providers (deepseek/openrouter/zen-via-paste-key) are absent from
+ * auth.json, so they correctly fall through to the placeholder path.
+ *
+ * The previous check hardcoded `provider === 'opencode'`, so `opencode-go`
+ * (whose cred IS in the mounted auth.json) wrongly got the placeholder and
+ * every Go-subscription sibling failed with "Invalid API key" / "Model not
+ * found".
+ */
+function opencodeAuthHasCredential(provider: string): boolean {
+  try {
+    const raw = fs.readFileSync('/opencode-xdg/opencode/auth.json', 'utf-8');
+    const auth = JSON.parse(raw) as Record<string, unknown>;
+    return !!auth && typeof auth === 'object' && provider in auth;
+  } catch {
+    // Missing file or unparseable → no native cred; fall back to placeholder.
+    return false;
+  }
+}
+
 const SESSION_STATUS_RETRY_ERROR_AFTER = 3;
 
 /** Stale / dead OpenCode session heuristics (complement Claude-centric host patterns). */
@@ -156,14 +184,13 @@ function buildOpenCodeConfig(options: ProviderOptions): Record<string, unknown> 
     .filter(Boolean)
     .filter((mid, i, a) => a.indexOf(mid as string) === i);
 
-  // For the `opencode` provider specifically, prefer the SDK's native
-  // auth.json resolution (XDG_DATA_HOME) when an auth.json exists. The
-  // `apiKey: 'placeholder'` override below is for the OneCLI-proxy path used
-  // by static API-key providers (deepseek/openrouter/zen-via-paste-key). When
-  // OAuth-issued auth.json is mounted, that override would replace the real
-  // token with the placeholder and break auth.
-  const opencodeAuthAvailable =
-    provider === 'opencode' && fs.existsSync('/opencode-xdg/opencode/auth.json');
+  // Prefer the SDK's native auth.json resolution (XDG_DATA_HOME) for any
+  // provider whose credential is present in the mounted auth.json (see
+  // opencodeAuthHasCredential). The `apiKey: 'placeholder'` override below is
+  // only for the OneCLI-proxy path used by static API-key providers
+  // (deepseek/openrouter/zen-via-paste-key) that are NOT in auth.json — for an
+  // OAuth-issued cred the placeholder would replace the real token and break auth.
+  const opencodeAuthAvailable = opencodeAuthHasCredential(provider);
 
   // OPENCODE_EFFORT controls upstream reasoning effort. Sent as
   // `reasoning_effort` only — the `thinking.budgetTokens` field is
@@ -231,6 +258,21 @@ function buildOpenCodeConfig(options: ProviderOptions): Record<string, unknown> 
 
   const mcp = mcpServersToOpenCodeConfig(options.mcpServers);
 
+  // NanoClaw guard plugin: the destructive-action gate (+ best-effort GitNexus
+  // post-commit reindex), at parity with the Claude Code `block-destructive`
+  // hook via a shared decision core. opencode auto-approves every tool call
+  // (`permission: 'allow'` + permission auto-reply), so this plugin's
+  // `tool.execute.before` throw is the ONLY guardrail standing between the agent
+  // and a destructive command. The plugin is mounted read-only from the
+  // bootstrap plugin at /workspace/plugins/bootstrap. If it's absent (e.g. a
+  // group excludes the bootstrap plugin), we log loudly rather than silently
+  // running an unguarded prod agent.
+  const GUARD_PLUGIN = '/workspace/plugins/bootstrap/plugins/workflow/hooks/guards/opencode-guard.ts';
+  const guardAvailable = fs.existsSync(GUARD_PLUGIN);
+  if (!guardAvailable) {
+    log(`WARNING: destructive-action guard plugin not found at ${GUARD_PLUGIN} — opencode is running WITHOUT the gate`);
+  }
+
   return {
     ...(model ? { model } : {}),
     ...(smallModel ? { small_model: smallModel } : {}),
@@ -240,6 +282,7 @@ function buildOpenCodeConfig(options: ProviderOptions): Record<string, unknown> 
     snapshot: false,
     provider: providerOptions,
     mcp,
+    ...(guardAvailable ? { plugin: [GUARD_PLUGIN] } : {}),
   };
 }
 

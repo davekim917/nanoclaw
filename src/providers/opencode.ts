@@ -145,10 +145,28 @@ registerProviderContainerConfig('opencode', (ctx) => {
   const dbModel = dbConfig?.model ?? null;
   const dbEffort = dbConfig?.effort ?? null;
 
-  const provider = dbProvider ?? resolveScopedEnv('OPENCODE_PROVIDER', ctx.agentGroupFolder, ctx.hostEnv);
-  if (provider) env.OPENCODE_PROVIDER = provider;
+  // The model is the freely-changeable knob: DB value (set by self-mod
+  // change_model / `ncl groups config update --model`) wins over the .env
+  // scoped default, so those changes take effect on the next spawn.
   const model = dbModel ?? resolveScopedEnv('OPENCODE_MODEL', ctx.agentGroupFolder, ctx.hostEnv);
   if (model) env.OPENCODE_MODEL = model;
+
+  // OPENCODE_PROVIDER is the opencode-INTERNAL billing/routing provider
+  // (opencode=Zen /zen/v1 | opencode-go=Go /zen/go/v1 | nvidia | ...). It MUST
+  // equal the model slug's provider prefix: opencode resolves `model:"<p>/<id>"`
+  // against `enabled_providers:["<p>"]`, so any drift yields "Model not found".
+  // DERIVE it from the resolved model so the two can never disagree — including
+  // after a change_model to a different provider's model. This is NOT
+  // dbConfig.provider: that is the agent-RUNTIME selector (always "opencode" for
+  // an opencode sibling — it picks the provider CLASS), and conflating the two
+  // forced OPENCODE_PROVIDER="opencode" for every sibling, mismatching every
+  // "opencode-go/*" model. Scoped env / runtime selector are fallbacks only when
+  // no model (hence no prefix) is configured.
+  const provider =
+    (model && model.includes('/') ? model.slice(0, model.indexOf('/')) : null) ??
+    resolveScopedEnv('OPENCODE_PROVIDER', ctx.agentGroupFolder, ctx.hostEnv) ??
+    dbProvider;
+  if (provider) env.OPENCODE_PROVIDER = provider;
   const effort = dbEffort ?? resolveScopedEnv('OPENCODE_EFFORT', ctx.agentGroupFolder, ctx.hostEnv);
   if (effort) env.OPENCODE_EFFORT = effort;
   // SMALL_MODEL — kept env-only for now; no DB field. If it ever moves to DB,
