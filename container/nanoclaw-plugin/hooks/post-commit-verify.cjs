@@ -26,13 +26,42 @@ function readInput() {
 }
 
 function findGitNexusDir(startDir) {
-  let dir = startDir || process.cwd();
+  const start = startDir || process.cwd();
+  let dir = start;
   for (let i = 0; i < 5; i++) {
     const candidate = path.join(dir, '.gitnexus');
     if (fs.existsSync(candidate)) return candidate;
     const parent = path.dirname(dir);
     if (parent === dir) break;
     dir = parent;
+  }
+
+  // Worktree fallback. Container agents commit inside a LINKED worktree
+  // (/workspace/worktrees/<repo>) whose index lives next to the BASE clone
+  // (/workspace/agent/<repo>/.gitnexus) — a sibling that walking up the cwd
+  // never reaches. Resolve the base clone via git's COMMON dir (the worktree's
+  // .git file points at <base>/.git/worktrees/<name>, and --git-common-dir
+  // returns <base>/.git) and look for .gitnexus beside it. No-op on the host's
+  // main checkout (the walk-up above already found it) and fail-safe: any git
+  // error falls through to null, matching the pre-existing "no index" path.
+  try {
+    const common = spawnSync('git', ['rev-parse', '--git-common-dir'], {
+      encoding: 'utf-8',
+      timeout: 3000,
+      cwd: start,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    if (common.status === 0) {
+      const gitDir = (common.stdout || '').trim();
+      if (gitDir) {
+        // --git-common-dir may be relative to cwd; resolve before taking parent.
+        const baseRoot = path.dirname(path.resolve(start, gitDir));
+        const candidate = path.join(baseRoot, '.gitnexus');
+        if (fs.existsSync(candidate)) return candidate;
+      }
+    }
+  } catch {
+    /* fall through to null — same as the no-index case */
   }
   return null;
 }
