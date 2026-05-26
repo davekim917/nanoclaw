@@ -645,14 +645,18 @@ export function buildSessionServicesSnapshot(agentGroupId: string): SessionServi
   // it wrongly told the owner it couldn't read DMs or resolve a link, both
   // false in an owner DM. `resolve_thread_link` works regardless of token.
   if (cfg?.slack_user_token?.enabled) {
+    // No top-level mcpNamespace: this snapshot is group-level (no session
+    // context), and the user-token MCP is registered ONLY in the owner's 1:1
+    // DM (canUseSlackUserToken). Emitting it as a "wired now" namespace would
+    // overclaim in group-channel/non-owner sessions where the host strips it.
+    // The useFor states the session-dependence explicitly instead.
     services.push({
-      name: 'Slack (read)',
-      mcpNamespace: 'mcp__slack-user-token__*',
+      name: 'Slack (read — owner DM only)',
       declaredTools: [],
       scopes: [],
       credentialPaths: [],
       useFor:
-        "Reading Slack from the owner's lens. In the owner's 1:1 DM with you the Slack user-token MCP is active (`mcp__slack-user-token__*` — e.g. `conversations_history`, `conversations_replies`, `conversations_search_messages`): read the owner's DMs, group DMs, channels they're in, threads, and search. It is NOT registered in group channels (owner-DM-only, by design). To resolve a pasted Slack OR Discord permalink, use `resolve_thread_link` — it loads the linked thread from the workgroup chat archive at `/workspace/archive.db` and works regardless of token scope. Caveat: the BOT token can post and read channels the bot is a member of, but cannot read arbitrary DMs — use the user-token MCP or `resolve_thread_link` for those. Do NOT claim you can't read a DM/thread/quoted message without first trying these tools.",
+        "Reading Slack from the owner's lens — AVAILABILITY IS SESSION-DEPENDENT, check your actual tool list. ONLY in the owner's 1:1 DM with you is the Slack user-token MCP loaded (`mcp__slack-user-token__*` — `conversations_history`, `conversations_replies`, `conversations_search_messages`): read the owner's DMs, group DMs, channels they're in, threads, search. In group channels it is NOT loaded (owner-DM-only, by design) — do not assume those tools exist there. ALWAYS available regardless of session: `resolve_thread_link` resolves a pasted Slack OR Discord permalink from the workgroup chat archive (`/workspace/archive.db`). The BOT token can post + read channels the bot is in but cannot read arbitrary DMs. Bottom line: before telling the user you can't read a DM/thread/quoted message, check your tools and try `resolve_thread_link`.",
     });
   }
 

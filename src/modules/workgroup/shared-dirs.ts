@@ -116,6 +116,24 @@ function migrateWorkgroup(db: Database.Database, workgroupId: string, groupsDir:
     }
   }
 
+  // Crash recovery: any real dir already in wgDir was moved by a prior
+  // interrupted run (we only reach here when `.migrated` is absent — a
+  // completed run returned early above). A crash AFTER renameSync(src,dst) but
+  // BEFORE the compat symlink/sibling-repoint would otherwise drop that name
+  // from the seed-derived set above (its source is already gone), orphaning the
+  // `/workspace/agent/<name>` path. Re-include it so the move loop finishes the
+  // cutover. Skip `.partial` staging dirs (incomplete copies — reprocessed via
+  // the still-real seed source instead).
+  try {
+    for (const e of fs.readdirSync(wgDir, { withFileTypes: true })) {
+      if (e.isDirectory() && !e.name.startsWith('.') && !e.name.endsWith('.partial')) {
+        shared.add(e.name);
+      }
+    }
+  } catch {
+    /* wgDir doesn't exist yet (first run) — nothing to recover */
+  }
+
   if (shared.size === 0) {
     log.info('reconcileWorkgroupSharedDirs: nothing to consolidate', { workgroupId });
     return;
@@ -123,7 +141,7 @@ function migrateWorkgroup(db: Database.Database, workgroupId: string, groupsDir:
 
   // ── Choose move strategy (rename within a filesystem, else copy) ──────────
   fs.mkdirSync(wgDir, { recursive: true });
-  const strategy: 'rename' | 'copy' = sameFilesystem(GROUPS_DIR, DATA_DIR) ? 'rename' : 'copy';
+  const strategy: 'rename' | 'copy' = sameFilesystem(groupsDir, dataDir) ? 'rename' : 'copy';
 
   log.info('reconcileWorkgroupSharedDirs: plan', {
     workgroupId,
@@ -140,20 +158,27 @@ function migrateWorkgroup(db: Database.Database, workgroupId: string, groupsDir:
   for (const name of [...shared].sort()) {
     const src = path.join(seedDir, name);
     const dst = path.join(wgDir, name);
-    if (fs.existsSync(dst)) {
-      // Already in the shared dir (partial prior run) — just ensure the seed
-      // compat symlink exists, then continue.
-      ensureCompatSymlink(seedDir, name);
-      moved.push(name);
-      continue;
-    }
-    if (!isRealDir(src)) continue; // moved already / not a real dir — skip defensively
 
-    if (strategy === 'rename') {
-      fs.renameSync(src, dst);
-    } else {
-      fs.cpSync(src, dst, { recursive: true, verbatimSymlinks: true });
-      if (!fs.existsSync(dst)) throw new Error(`copy verify failed for ${src} -> ${dst}`);
+    if (!fs.existsSync(dst)) {
+      // Not yet in the shared dir — move src in. Both strategies make dst
+      // appear ATOMICALLY (rename; or copy-to-staging then rename), so a crash
+      // mid-move can never leave a partial tree at dst that the idempotency
+      // check would later mistake for a completed move.
+      if (!isRealDir(src)) continue; // nothing real to move (already a symlink / gone)
+      if (strategy === 'rename') {
+        fs.renameSync(src, dst); // atomic within the filesystem
+      } else {
+        const staging = `${dst}.partial`;
+        fs.rmSync(staging, { recursive: true, force: true }); // clear any stale partial
+        fs.cpSync(src, staging, { recursive: true, verbatimSymlinks: true });
+        fs.renameSync(staging, dst); // atomic into place — dst is now complete-or-absent
+        fs.rmSync(src, { recursive: true, force: true });
+      }
+    } else if (isRealDir(src)) {
+      // dst already exists AND src is still a real dir → a crash landed between
+      // the atomic move and the source cleanup. dst is complete (both paths
+      // create it atomically), so finish the cleanup. Safe: the migration runs
+      // before any container spawn, so src cannot have been modified since.
       fs.rmSync(src, { recursive: true, force: true });
     }
     ensureCompatSymlink(seedDir, name);

@@ -7,7 +7,7 @@ import { setDeadLettersDb, getDueRetries, deleteAfterSuccess } from './dead-lett
 import { runChatStreamSweep, setIngestDb } from './classifier.js';
 import { SourceIngester, setIngestDb as setSourceIngestDb, isNonSymlinkChain } from './source-ingest.js';
 import { readContainerConfig, isFeedbackEnabled } from '../container-config.js';
-import { GROUPS_DIR, DATA_DIR, CC_PROJECTS_DIR, CC_MEMORY_MARKER, WORKGROUP_SHARED_FS } from '../config.js';
+import { GROUPS_DIR, DATA_DIR, CC_PROJECTS_DIR, CC_MEMORY_MARKER } from '../config.js';
 import type { MemoryStore } from '../modules/memory/store.js';
 import { processPendingJudgments } from './recall-judge/judge.js';
 
@@ -78,12 +78,19 @@ function discoverMigratedWorkgroups(): DiscoveredGroup[] {
     const wgId = dirent.name;
     const wgDir = path.join(workgroupsRoot, wgId);
 
-    // Migration gate — mirror container-runner.buildMounts: a workgroup is
-    // "migrated" iff `data/workgroups/<wgId>/.migrated` exists. Honor the flag
-    // too, but the marker is the authoritative per-workgroup signal so the
-    // daemon keeps watching even if the flag is later turned off.
+    // Migration gate — discover a workgroup's shared root ONLY after its
+    // migration COMPLETED. reconcileWorkgroupSharedDirs writes `.migrated`
+    // AFTER it moves sources/ into data/workgroups/<wgId>/. We deliberately do
+    // NOT honor the flag alone: the daemon is a SEPARATE process that can sweep
+    // before/during the host migration, and because isNonSymlinkChain returns
+    // true for a missing component and the watcher mkdir's the inbox at need, a
+    // flag-on pre-migration sweep would pre-create an empty
+    // data/workgroups/<wgId>/sources/inbox for an UNMIGRATED workgroup — which
+    // the migration then mistakes for an already-moved destination and rm's the
+    // real seed source (data loss). The marker implies sources/ is already
+    // here, so gating on it alone closes that race.
     const migratedMarker = path.join(wgDir, '.migrated');
-    if (!WORKGROUP_SHARED_FS && !fs.existsSync(migratedMarker)) continue;
+    if (!fs.existsSync(migratedMarker)) continue;
 
     // Resolve the SEED's agentGroupId so attribution is byte-identical to the
     // pre-migration GROUPS_DIR walk (seed folder == workgroup_id by construction

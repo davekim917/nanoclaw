@@ -3,7 +3,7 @@ import os from 'os';
 import path from 'path';
 
 import Database from 'better-sqlite3';
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
 import { reconcileWorkgroupSharedDirs } from './shared-dirs.js';
 
@@ -102,5 +102,44 @@ describe('reconcileWorkgroupSharedDirs', () => {
     const sibDbt = path.join(groupsDir, 'wgx-codex', 'dbt');
     expect(fs.lstatSync(sibDbt).isSymbolicLink()).toBe(false); // still a real dir
     expect(fs.readFileSync(path.join(sibDbt, 'own.txt'), 'utf-8')).toBe('mine'); // untouched
+  });
+
+  it('cross-filesystem move uses copy+staging and leaves no partial dir', () => {
+    // Force sameFilesystem(groupsDir, dataDir) -> false so the copy path runs.
+    // sameFilesystem is the only fs.statSync(JS) caller in the migration; cpSync/
+    // rename/rm/existsSync/lstatSync are native and unaffected by this spy.
+    vi.spyOn(fs, 'statSync').mockImplementation(
+      ((p: fs.PathLike) => (p === dataDir ? { dev: 2 } : { dev: 1 }) as fs.Stats) as typeof fs.statSync,
+    );
+    try {
+      reconcileWorkgroupSharedDirs(db, { groupsDir, dataDir });
+    } finally {
+      vi.restoreAllMocks();
+    }
+    const wgDir = path.join(dataDir, 'workgroups', 'wgx');
+    expect(JSON.parse(fs.readFileSync(path.join(wgDir, '.migrated'), 'utf-8')).strategy).toBe('copy');
+    // Contents copied, source removed, no leftover staging dir.
+    expect(fs.existsSync(path.join(wgDir, 'sources', 'inbox', 'f.json'))).toBe(true);
+    expect(fs.existsSync(path.join(wgDir, 'dbt', '.git'))).toBe(true);
+    expect(fs.existsSync(path.join(wgDir, 'sources.partial'))).toBe(false);
+    expect(fs.lstatSync(path.join(groupsDir, 'wgx', 'sources')).isSymbolicLink()).toBe(true);
+  });
+
+  it('finishes cleanup when a crash left dst complete but the source not yet removed', () => {
+    const wgDir = path.join(dataDir, 'workgroups', 'wgx');
+    // Simulate a crash after the atomic move created a complete dst but before
+    // the source was removed: dst exists complete, seed src is still a real dir.
+    fs.mkdirSync(path.join(wgDir, 'sources', 'inbox'), { recursive: true });
+    fs.writeFileSync(path.join(wgDir, 'sources', 'inbox', 'f.json'), '{}');
+    expect(fs.lstatSync(path.join(groupsDir, 'wgx', 'sources')).isDirectory()).toBe(true);
+
+    reconcileWorkgroupSharedDirs(db, { groupsDir, dataDir });
+
+    // The leftover real source is removed and replaced with the compat symlink;
+    // dst is preserved (not clobbered or re-copied).
+    const seedSources = path.join(groupsDir, 'wgx', 'sources');
+    expect(fs.lstatSync(seedSources).isSymbolicLink()).toBe(true);
+    expect(fs.readlinkSync(seedSources)).toBe('/workspace/workgroup/sources');
+    expect(fs.existsSync(path.join(wgDir, 'sources', 'inbox', 'f.json'))).toBe(true);
   });
 });
