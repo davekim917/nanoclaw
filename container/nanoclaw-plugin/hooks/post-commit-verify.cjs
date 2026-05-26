@@ -15,7 +15,10 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 
 const MAX_SYMBOLS = 15;
-const TIMEOUT_BUDGET_MS = 25000; // leave 5s headroom from the 30s hook timeout
+// Default leaves 5s headroom from the 30s Claude-hook timeout. Callers that run
+// this synchronously in a latency-sensitive path (e.g. the git_commit MCP tool)
+// pass a tighter budget via GITNEXUS_ADVISORY_BUDGET_MS so commits stay snappy.
+const TIMEOUT_BUDGET_MS = Number(process.env.GITNEXUS_ADVISORY_BUDGET_MS) || 25000;
 
 function readInput() {
   try {
