@@ -159,7 +159,9 @@ function wireIfMissing(mg: MessagingGroup, ag: AgentGroup, now: string, label: s
     engage_mode: mg.is_group === 0 ? 'pattern' : 'mention',
     engage_pattern: mg.is_group === 0 ? '.' : null,
     sender_scope: 'all',
-    ignored_message_policy: 'drop',
+    // accumulate (not drop) so any non-triggering context is retained for the
+    // agent. Owner directive: accumulate is the default for all agents.
+    ignored_message_policy: 'accumulate',
     session_mode: 'shared',
     priority: 0,
     default_model: null,

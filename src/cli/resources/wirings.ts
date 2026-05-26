@@ -52,7 +52,9 @@ registerResource({
       description:
         'What happens to messages that don\'t trigger engagement. "drop" — agent never sees them. "accumulate" — stored as background context (trigger=0) so the agent has prior context when eventually triggered.',
       enum: ['drop', 'accumulate'],
-      default: 'drop',
+      // accumulate by default: group/sibling members need prior context when
+      // triggered (dropping it left the opencode siblings context-blind).
+      default: 'accumulate',
       updatable: true,
     },
     {

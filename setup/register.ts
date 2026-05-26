@@ -180,7 +180,11 @@ export async function run(args: string[]): Promise<void> {
       engage_mode: engageMode,
       engage_pattern: engagePattern,
       sender_scope: 'all',
-      ignored_message_policy: 'drop',
+      // accumulate (not drop): group/sibling members need prior thread context
+      // when eventually triggered, or they start fresh — the bug that left the
+      // opencode siblings context-blind. Owner directive: accumulate is the
+      // default for all agents.
+      ignored_message_policy: 'accumulate',
       session_mode: parsed.sessionMode as 'shared' | 'per-thread' | 'agent-shared',
       priority: 0,
       default_model: null,

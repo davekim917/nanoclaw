@@ -71,7 +71,12 @@ import {
 } from './session-manager.js';
 import type { AgentGroup, Session } from './types.js';
 
-const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
+// timeout 30s (SDK default is 5s): createAgent/applyContainerConfig run at
+// spawn, and the gateway can be briefly slow when the host is reaping many
+// stale containers against it at once. A 5s abort there fails the spawn and
+// forces a ~60s sweep-retry (observed delaying the opencode-sibling spawns).
+// 30s rides out the transient blip without hanging spawns indefinitely.
+const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY, timeout: 30_000 });
 
 // Default model + effort. SINGLE source of truth for what containers
 // resolve `opus` / `sonnet` / `haiku` aliases to and what reasoning
