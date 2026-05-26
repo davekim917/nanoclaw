@@ -65,7 +65,7 @@ try {
     engage_pattern: null,
     sender_scope: 'all',
     ignored_message_policy: 'accumulate',
-    session_mode: 'shared',
+    session_mode: 'per-thread',
     priority: 0,
     default_model: null,
     default_effort: null,

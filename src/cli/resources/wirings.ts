@@ -63,7 +63,9 @@ registerResource({
       description:
         '"shared" — one session per (agent, messaging group). "per-thread" — separate session per thread/topic. "agent-shared" — one session across all messaging groups wired to this agent. Note: threaded adapters in group chats force per-thread regardless of this setting.',
       enum: ['shared', 'per-thread', 'agent-shared'],
-      default: 'shared',
+      // per-thread by default: matches the router/permissions auto-wire and
+      // every other origin; threaded adapters force per-thread anyway.
+      default: 'per-thread',
       updatable: true,
     },
     { name: 'created_at', type: 'string', description: 'Auto-set.', generated: true },

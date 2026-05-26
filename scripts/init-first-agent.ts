@@ -162,7 +162,7 @@ function wireIfMissing(mg: MessagingGroup, ag: AgentGroup, now: string, label: s
     // accumulate (not drop) so any non-triggering context is retained for the
     // agent. Owner directive: accumulate is the default for all agents.
     ignored_message_policy: 'accumulate',
-    session_mode: 'shared',
+    session_mode: 'per-thread',
     priority: 0,
     default_model: null,
     default_effort: null,

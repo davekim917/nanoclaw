@@ -52,7 +52,7 @@ function parseArgs(args: string[]): RegisterArgs {
     channel: 'discord',
     requiresTrigger: false,
     assistantName: 'Andy',
-    sessionMode: 'shared',
+    sessionMode: 'per-thread',
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -79,7 +79,7 @@ function parseArgs(args: string[]): RegisterArgs {
         result.assistantName = args[++i] || 'Andy';
         break;
       case '--session-mode':
-        result.sessionMode = args[++i] || 'shared';
+        result.sessionMode = args[++i] || 'per-thread';
         break;
     }
   }
