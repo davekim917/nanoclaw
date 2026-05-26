@@ -1,6 +1,10 @@
 # Workgroup Shared Filesystem — "Same House, Own Bedrooms"
 
-**Status:** in progress (started 2026-05-26). Built behind a default-off flag `NANOCLAW_WORKGROUP_SHARED_FS`; the live-data migration does not fire until the flag is set and the owner enables it after a controlled test.
+**Status (2026-05-26):** Phase 1 (mount + migration + tests, `b4b3ce38`) ✅, Phase 2 (mnemon daemon discovery, `7ccc2ce4`) ✅, Phase 3 agent-facing note in `container/CLAUDE.md` ✅. Built behind a default-off flag `NANOCLAW_WORKGROUP_SHARED_FS`; the live-data migration does not fire until the flag is set and the owner enables it after a controlled test.
+
+**Remaining follow-on (does NOT block enabling for the existing 10 workgroups):** update `/clone-as-codex` + `/clone-as-opencode` step 4 to stop creating per-dir relative symlinks and rely on the `/workspace/workgroup` mount. Relevant only for NEW siblings created *after* the flag is enabled (the existing workgroups are handled by the startup migration). The relative symlinks a clone currently creates would, post-migration, resolve to the seed's container-absolute compat symlink — messy but mount-saved; best fixed when the flag is actually enabled, with flag-aware symlink logic. Tracked here.
+
+**Enable sequence (owner-gated):** (1) `sudo systemctl stop nanoclaw-v2`; confirm no `nanoclaw-v2-*` containers running. (2) set `NANOCLAW_WORKGROUP_SHARED_FS=1` in `.env`. (3) `sudo systemctl start nanoclaw-v2` (migration runs against the quiesced FS) **and** `sudo systemctl restart nanoclaw-memory-daemon` (daemon picks up the data/workgroups discovery root). (4) smoke-test per the Verification plan below from a respawned `madison-reed-codex` session.
 
 ## Goal (owner's words)
 "Everything within a workgroup should be able to be ACCESSED across agents… They all live in the same house but have their own bedrooms for their specific needs." Every member of a workgroup can access everything shared in that workgroup; each keeps a private space.
