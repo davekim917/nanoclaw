@@ -18,6 +18,15 @@
  */
 export function namespacedPlatformId(channel: string, raw: string): string {
   if (raw.startsWith(`${channel}:`)) return raw;
+  // Suffixed multi-bot channel types ("discord-codex", "discord-opencode",
+  // "slack-<x>", ...) reuse the SAME Chat SDK adapter as their base platform,
+  // which emits the base-prefixed id ("discord:guild:chan") for every bot.
+  // Without this, seeding a messaging group for a suffixed channel type
+  // double-prefixes ("discord-opencode:discord:guild:chan") — the adapter then
+  // rejects it as an invalid thread id at delivery time. Only fires when raw is
+  // already base-namespaced; native id formats (handled below) are untouched.
+  const dash = channel.indexOf('-');
+  if (dash > 0 && raw.startsWith(`${channel.slice(0, dash)}:`)) return raw;
   if (raw.includes('@')) return raw;
   if (raw.startsWith('+') || raw.startsWith('group:')) return raw;
   if (channel === 'deltachat') return raw;
