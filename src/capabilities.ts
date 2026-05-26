@@ -637,6 +637,25 @@ export function buildSessionServicesSnapshot(agentGroupId: string): SessionServi
     });
   }
 
+  // Slack read access — gated by container.json `slack_user_token.enabled`
+  // (the capability grant). The user-token MCP (korotovsky/slack-mcp-server)
+  // is registered per-spawn ONLY in the owner's 1:1 DM (canUseSlackUserToken),
+  // so the entry describes it conditionally. Added because Slack was absent
+  // from this snapshot, which left the agent GUESSING its Slack abilities —
+  // it wrongly told the owner it couldn't read DMs or resolve a link, both
+  // false in an owner DM. `resolve_thread_link` works regardless of token.
+  if (cfg?.slack_user_token?.enabled) {
+    services.push({
+      name: 'Slack (read)',
+      mcpNamespace: 'mcp__slack-user-token__*',
+      declaredTools: [],
+      scopes: [],
+      credentialPaths: [],
+      useFor:
+        "Reading Slack from the owner's lens. In the owner's 1:1 DM with you the Slack user-token MCP is active (`mcp__slack-user-token__*` — e.g. `conversations_history`, `conversations_replies`, `conversations_search_messages`): read the owner's DMs, group DMs, channels they're in, threads, and search. It is NOT registered in group channels (owner-DM-only, by design). To resolve a pasted Slack OR Discord permalink, use `resolve_thread_link` — it loads the linked thread from the workgroup chat archive at `/workspace/archive.db` and works regardless of token scope. Caveat: the BOT token can post and read channels the bot is a member of, but cannot read arbitrary DMs — use the user-token MCP or `resolve_thread_link` for those. Do NOT claim you can't read a DM/thread/quoted message without first trying these tools.",
+    });
+  }
+
   return { agentGroupId, services };
 }
 
