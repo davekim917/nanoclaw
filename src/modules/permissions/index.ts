@@ -32,7 +32,7 @@ import { registerResponseHandler, type ResponsePayload } from '../../response-re
 import { getDeliveryAdapter } from '../../delivery.js';
 import { log } from '../../log.js';
 import type { MessagingGroup, MessagingGroupAgent } from '../../types.js';
-import { canAccessAgentGroup } from './access.js';
+import { canAccessAgentGroup, isSiblingBotSender } from './access.js';
 import {
   buildAgentSelectionOptions,
   CHOOSE_EXISTING_VALUE,
@@ -171,6 +171,19 @@ function handleUnknownSender(
 
 setSenderResolver(extractAndUpsertUser);
 
+// ── Sibling-bot allow-list ──
+// Provider injected by the host once channel adapters are up (see
+// `setSiblingBotIdsProvider` wiring in src/index.ts). Returns the set of
+// platform user-ids belonging to NanoClaw's OWN bots in this process. The
+// access gate consults it so sibling agents can engage each other even under a
+// `strict` messaging group. Defaults to empty (fail-closed) until wired, and
+// is read live at message time so it reflects the current adapter registries.
+const EMPTY_BOT_IDS: ReadonlySet<string> = new Set();
+let getSiblingBotIds: () => ReadonlySet<string> = () => EMPTY_BOT_IDS;
+export function setSiblingBotIdsProvider(provider: () => ReadonlySet<string>): void {
+  getSiblingBotIds = provider;
+}
+
 setAccessGate((event, userId, mg, agentGroupId): AccessGateResult => {
   // Public channels skip the access check entirely.
   if (mg.unknown_sender_policy === 'public') {
@@ -184,6 +197,21 @@ setAccessGate((event, userId, mg, agentGroupId): AccessGateResult => {
 
   const decision = canAccessAgentGroup(userId, agentGroupId);
   if (decision.allowed) {
+    return { allowed: true };
+  }
+
+  // Sibling agent bots are trusted peers, not strangers. A message authored by
+  // one of our own bots is allowed past the strict / request_approval gate so
+  // siblings can hand off to each other (the whole point of clone-as-codex /
+  // -opencode). Unknown humans and third-party bots still fall through to the
+  // drop / approval path below.
+  if (isSiblingBotSender(userId, getSiblingBotIds())) {
+    log.debug('ACCESS — sibling agent bot allowed past gate', {
+      messagingGroupId: mg.id,
+      agentGroupId,
+      userId,
+      policy: mg.unknown_sender_policy,
+    });
     return { allowed: true };
   }
 

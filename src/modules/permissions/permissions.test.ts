@@ -12,7 +12,7 @@ import {
   teardownChannelAdapters,
 } from '../../channels/channel-registry.js';
 import { closeDb, createAgentGroup, createMessagingGroup, initTestDb, runMigrations } from '../../db/index.js';
-import { canAccessAgentGroup } from './access.js';
+import { canAccessAgentGroup, isSiblingBotSender } from './access.js';
 import { addMember, isMember } from './db/agent-group-members.js';
 import { createUser } from './db/users.js';
 import { grantRole, hasAnyOwner, isOwner } from './db/user-roles.js';
@@ -138,6 +138,41 @@ describe('canAccessAgentGroup', () => {
     const d = canAccessAgentGroup('u-known', 'ag-1');
     expect(d.allowed).toBe(false);
     expect(d.allowed === false && d.reason).toBe('not_member');
+  });
+});
+
+describe('isSiblingBotSender', () => {
+  // Our own bots, keyed by their bare platform user-id (what the adapter
+  // known-bot registries expose). The sender id is namespaced by channelType.
+  const ourBots = new Set(['1478986205319135302', '1505246118940770375', '1508565750875426996']);
+
+  it('matches a sibling bot regardless of the channelType prefix', () => {
+    // Axie (1478…302) seen by the opencode adapter is still our bot.
+    expect(isSiblingBotSender('discord-opencode:1478986205319135302', ourBots)).toBe(true);
+    expect(isSiblingBotSender('discord:1478986205319135302', ourBots)).toBe(true);
+    expect(isSiblingBotSender('discord-codex:1505246118940770375', ourBots)).toBe(true);
+  });
+
+  it('matches a slack-style namespaced sender', () => {
+    expect(isSiblingBotSender('slack:U123BOT', new Set(['U123BOT']))).toBe(true);
+  });
+
+  it('rejects a third-party / unknown bot id', () => {
+    expect(isSiblingBotSender('discord:999999999999999999', ourBots)).toBe(false);
+  });
+
+  it('fails closed on an empty registry (before the host wires the provider)', () => {
+    expect(isSiblingBotSender('discord:1478986205319135302', new Set())).toBe(false);
+  });
+
+  it('rejects malformed sender ids (no separator / empty platform id)', () => {
+    expect(isSiblingBotSender('1478986205319135302', ourBots)).toBe(false);
+    expect(isSiblingBotSender('discord:', ourBots)).toBe(false);
+  });
+
+  it('matches only the full platform id, not a prefix of it', () => {
+    // Guard against substring/loose matching: a partial id must not pass.
+    expect(isSiblingBotSender('discord:147898620531913530', ourBots)).toBe(false);
   });
 });
 

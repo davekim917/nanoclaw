@@ -297,6 +297,39 @@ async function main(): Promise<void> {
     };
   });
 
+  // Wire the access gate's sibling-bot allow-list now that channel adapters are
+  // up and their known-bot registries are populated. A message authored by one
+  // of our own bots (Axie, Axie-Codex, Axie-OpenCode, …) is then allowed to
+  // engage siblings even under a `strict` messaging group — without this, a
+  // strict mg drops sibling @-mentions as `not_member` and cross-agent handoff
+  // silently fails (only owner/admins/members get through). Dynamic imports so
+  // a build without a given channel adapter still links; the provider reads the
+  // registries live, so it reflects later identity fetches too.
+  {
+    const { setSiblingBotIdsProvider } = await import('./modules/permissions/index.js');
+    const botRegistries: Array<() => ReadonlyMap<string, { userId: string }>> = [];
+    try {
+      const m = await import('./channels/discord.js');
+      if (typeof m.getKnownDiscordBots === 'function') botRegistries.push(m.getKnownDiscordBots);
+    } catch {
+      /* discord adapter not installed */
+    }
+    try {
+      const m = await import('./channels/slack-mentions.js');
+      if (typeof m.getKnownSlackBots === 'function') botRegistries.push(m.getKnownSlackBots);
+    } catch {
+      /* slack adapter not installed */
+    }
+    setSiblingBotIdsProvider(() => {
+      const ids = new Set<string>();
+      for (const getBots of botRegistries) {
+        for (const { userId } of getBots().values()) ids.add(userId);
+      }
+      return ids;
+    });
+    log.info('Sibling-bot allow-list wired for access gate', { registries: botRegistries.length });
+  }
+
   // 4. Delivery adapter bridge — dispatches to channel adapters
   const deliveryAdapter = {
     async deliver(
