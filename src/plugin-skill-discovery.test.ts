@@ -136,8 +136,12 @@ describe('discoverPortableSkills', () => {
     // must be provisioned for it or the visible skills that reference them break. Claude/Codex
     // load those via their plugin loaders, so their mirrors omit them (stay lean).
     writeSkill(path.join(tmpDir, 'plug', 'skills', 'visible'), { name: 'visible' });
-    writeSkill(path.join(tmpDir, 'plug', 'skills', 'hidden-helper'), { name: 'hidden-helper', 'user-invocable': 'false' });
-    const names = (rt: 'claude' | 'codex' | 'opencode') => discoverPortableSkills(tmpDir, { runtime: rt }).map((s) => s.name);
+    writeSkill(path.join(tmpDir, 'plug', 'skills', 'hidden-helper'), {
+      name: 'hidden-helper',
+      'user-invocable': 'false',
+    });
+    const names = (rt: 'claude' | 'codex' | 'opencode') =>
+      discoverPortableSkills(tmpDir, { runtime: rt }).map((s) => s.name);
     expect(names('opencode')).toEqual(expect.arrayContaining(['visible', 'hidden-helper']));
     for (const rt of ['claude', 'codex'] as const) {
       expect(names(rt)).toContain('visible');
