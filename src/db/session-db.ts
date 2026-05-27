@@ -197,10 +197,19 @@ export function countDueMessages(db: Database.Database): number {
 }
 
 /**
- * Mark long-pending rows as 'expired' so sweep stops re-waking sessions on
- * messages that have been sitting unprocessed for a day or more. Recurring
- * tasks whose next fire is in the future are protected by the
- * `process_after >= now` check.
+ * Mark long-pending NON-RECURRING rows as 'expired' so sweep stops re-waking
+ * sessions on one-shot messages that have sat unprocessed for a day or more.
+ *
+ * Recurring tasks (recurrence IS NOT NULL) are NEVER expired here. A recurring
+ * row is inserted ~24h before its next daily fire, so it crosses the staleness
+ * cutoff the moment it comes due — reaping it would silently lose that fire and
+ * (since handleRecurrence only resumes completed/failed/expired rows) used to
+ * strand the whole series. They instead stay 'pending' and are re-fired by the
+ * sweep (caught up if a fire was missed), then advanced to their next slot by
+ * handleRecurrence on completion. A missed recurring fire must resume the
+ * schedule, never get reaped. (The earlier `process_after >= now` framing only
+ * protected FUTURE-dated rows and let due recurring rows be reaped — that
+ * stranded wiki-synth across all memory-enabled agents on 2026-05-10.)
  *
  * Returns the number of rows expired this call.
  */
@@ -212,6 +221,7 @@ export function expireStalePending(db: Database.Database, maxAgeMs: number): num
       `UPDATE messages_in
        SET status = 'expired'
        WHERE status = 'pending'
+         AND recurrence IS NULL
          AND timestamp < ?
          AND (process_after IS NULL OR process_after < ?)`,
     )

@@ -119,12 +119,19 @@ export interface RecurringMessage {
   series_id: string;
 }
 
-// Includes 'failed' so a single bad fire doesn't strand the cron series.
-// The failed historical row stays in place for audit; the next slot is
-// inserted as a fresh pending row by handleRecurrence.
+// Includes 'failed' AND 'expired' so a single bad OR missed fire doesn't strand
+// the cron series. 'failed' = the fire ran and errored; 'expired' = the fire was
+// never claimed (host down / sweep delayed) and expireStalePending reaped the
+// overdue pending row. Without 'expired' here, any recurring task that missed
+// one fire died permanently — this stranded the daily wiki-synth across all
+// memory-enabled agents on 2026-05-10. The historical row stays for audit;
+// handleRecurrence inserts the next slot as a fresh pending row (nextRun = next
+// cron occurrence after now, so a backlog of missed slots is skipped, not
+// replayed). expireStalePending no longer expires recurring rows, so going
+// forward 'expired' here mainly heals legacy strandings.
 export function getCompletedRecurring(db: Database.Database): RecurringMessage[] {
   return db
-    .prepare("SELECT * FROM messages_in WHERE status IN ('completed', 'failed') AND recurrence IS NOT NULL")
+    .prepare("SELECT * FROM messages_in WHERE status IN ('completed', 'failed', 'expired') AND recurrence IS NOT NULL")
     .all() as RecurringMessage[];
 }
 

@@ -392,6 +392,38 @@ describe('expireStalePending', () => {
     }
   });
 
+  it('never expires a DUE recurring task (recurring rows are protected regardless of process_after)', () => {
+    // Regression: a daily recurring row is inserted ~24h before its next fire,
+    // so it crosses the staleness cutoff the instant it comes due. Reaping it
+    // lost the fire AND stranded the series (wiki-synth across all memory-enabled
+    // agents, 2026-05-10). Recurring rows must never be expired here.
+    const db = makeInboundDb();
+    try {
+      const oldTs = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString(); // >24h old
+      const overdue = new Date(Date.now() - 60 * 1000).toISOString(); // already due (in the past)
+      const seq = (db.prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM messages_in').get() as { m: number }).m + 2;
+      db.prepare(
+        `INSERT INTO messages_in (id, seq, kind, timestamp, status, content, process_after, recurrence, series_id, trigger)
+         VALUES ('cron-due', @seq, 'task', @ts, 'pending', '{}', @pa, '0 9 * * *', 'cron-due', 1)`,
+      ).run({ seq, ts: oldTs, pa: overdue });
+      // A non-recurring row in the SAME overdue+stale state, to confirm the
+      // protection is scoped to recurring rows (the one-shot still expires).
+      db.prepare(
+        `INSERT INTO messages_in (id, seq, kind, timestamp, status, content, process_after, series_id, trigger)
+         VALUES ('oneshot-due', @seq, 'task', @ts, 'pending', '{}', @pa, 'oneshot-due', 1)`,
+      ).run({ seq: seq + 2, ts: oldTs, pa: overdue });
+
+      const changed = expireStalePending(db, 24 * 60 * 60 * 1000);
+
+      expect(changed).toBe(1); // only the one-shot
+      const rows = db.prepare('SELECT id, status FROM messages_in').all() as Array<{ id: string; status: string }>;
+      expect(rows.find((r) => r.id === 'cron-due')?.status).toBe('pending'); // recurring survives
+      expect(rows.find((r) => r.id === 'oneshot-due')?.status).toBe('expired'); // one-shot reaped
+    } finally {
+      db.close();
+    }
+  });
+
   it('expires rows whose process_after is also in the past', () => {
     const db = makeInboundDb();
     try {

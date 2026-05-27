@@ -120,6 +120,21 @@ describe('cancelTask / pauseTask / resumeTask series matching', () => {
     db.close();
   });
 
+  it('expired recurring task is picked up so a missed fire resumes the series', () => {
+    // Regression: a recurring fire that was never claimed (host down / sweep
+    // delayed) is reaped to 'expired' by expireStalePending. Without 'expired'
+    // in this set the row was orphaned and the series died permanently —
+    // stranded the daily wiki-synth across all memory-enabled agents 2026-05-10.
+    const db = freshDb();
+    insertBasicTask(db, 'task-exp', '0 9 * * *');
+    db.prepare("UPDATE messages_in SET status = 'expired' WHERE id = 'task-exp'").run();
+
+    const recurring = getCompletedRecurring(db);
+    expect(recurring).toHaveLength(1);
+    expect(recurring[0].id).toBe('task-exp');
+    db.close();
+  });
+
   it('pause by original id pauses the live follow-up', () => {
     const db = freshDb();
     seedRecurringChain(db);
