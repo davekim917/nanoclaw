@@ -6,10 +6,16 @@
 set -euo pipefail
 
 GROUPS_DIR="/home/ubuntu/nanoclaw-v2/groups"
+# Workgroup shared-FS (NANOCLAW_WORKGROUP_SHARED_FS): a migrated workgroup's wiki
+# repo lives at data/workgroups/<wg>/wiki, and groups/<wg>/wiki is a container-
+# absolute symlink that DANGLES on the host. Iterate both roots so the shared
+# wikis AND any non-workgroup group wikis are pushed; dangling seed symlinks are
+# skipped by the `-d "$wiki_dir/.git"` test below (resolves false off-host).
+WORKGROUPS_DIR="/home/ubuntu/nanoclaw-v2/data/workgroups"
 TS=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 shopt -s nullglob
-for wiki_dir in "$GROUPS_DIR"/*/wiki; do
+for wiki_dir in "$GROUPS_DIR"/*/wiki "$WORKGROUPS_DIR"/*/wiki; do
   [[ -d "$wiki_dir/.git" ]] || continue
   group_name=$(basename "$(dirname "$wiki_dir")")
 
