@@ -130,6 +130,21 @@ describe('discoverPortableSkills', () => {
     expect(names).not.toContain('team-qa');
   });
 
+  it('opencode provisions user-invocable:false helpers (no plugin loader); claude/codex exclude them', () => {
+    // opencode has no native plugin loader — the discovery mirror is its ONLY skill delivery,
+    // so referenceable helpers (user-invocable:false, e.g. team-verification-before-completion)
+    // must be provisioned for it or the visible skills that reference them break. Claude/Codex
+    // load those via their plugin loaders, so their mirrors omit them (stay lean).
+    writeSkill(path.join(tmpDir, 'plug', 'skills', 'visible'), { name: 'visible' });
+    writeSkill(path.join(tmpDir, 'plug', 'skills', 'hidden-helper'), { name: 'hidden-helper', 'user-invocable': 'false' });
+    const names = (rt: 'claude' | 'codex' | 'opencode') => discoverPortableSkills(tmpDir, { runtime: rt }).map((s) => s.name);
+    expect(names('opencode')).toEqual(expect.arrayContaining(['visible', 'hidden-helper']));
+    for (const rt of ['claude', 'codex'] as const) {
+      expect(names(rt)).toContain('visible');
+      expect(names(rt)).not.toContain('hidden-helper');
+    }
+  });
+
   it('cross-plugin name collision: first plugin alphabetically wins', () => {
     writeSkill(path.join(tmpDir, 'aaa', 'skills', 'dup'), { name: 'dup', body: 'FROM-AAA' });
     writeSkill(path.join(tmpDir, 'bbb', 'skills', 'dup'), { name: 'dup', body: 'FROM-BBB' });

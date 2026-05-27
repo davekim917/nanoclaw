@@ -165,12 +165,20 @@ function discoverInPlugin(
   pluginDir: string,
   pluginName: string,
   denySubPluginSkillDirs: Set<string>,
+  allowNonInvocable: boolean,
 ): DiscoveredSkill[] {
   const skills = new Map<string, DiscoveredSkill>();
 
   const recordCandidate = (skillDir: string) => {
     if (!hasSkillMd(skillDir)) return;
-    if (!isUserInvocable(skillDir)) return;
+    // `user-invocable: false` skills are referenceable helpers (e.g.
+    // team-verification-before-completion), not user-facing commands. Claude & Codex load
+    // them via native plugin loaders — available to reference, hidden from the command list.
+    // OpenCode has NO plugin loader; this discovery mirror is its ONLY skill delivery, so
+    // filtering these out makes them UNavailable and breaks the visible skills that reference
+    // them. For opencode we therefore provision them too (they also surface as commands —
+    // opencode can't load-without-surfacing — an accepted cosmetic cost for availability parity).
+    if (!isUserInvocable(skillDir) && !allowNonInvocable) return;
     const fmName = readPluginName(skillDir);
     const name = fmName ?? path.basename(skillDir);
     if (skills.has(name)) return; // first match wins (preference order)
@@ -263,6 +271,10 @@ export function discoverPortableSkills(pluginsRoot: string, options: DiscoverOpt
   const denySkills = options.denySkills ?? new Set<string>();
   const runtime = options.runtime ?? DEFAULT_RUNTIME;
   const denySubPluginSkillDirs = DENY_SUB_PLUGIN_SKILL_DIRS_BY_RUNTIME[runtime];
+  // OpenCode has no native plugin loader (the discovery mirror is its sole skill delivery),
+  // so it must also receive `user-invocable:false` helper skills that the visible skills
+  // reference. Claude/Codex load those via their plugin loaders, so their mirrors stay lean.
+  const allowNonInvocable = runtime === 'opencode';
 
   const allSkills = new Map<string, DiscoveredSkill>();
   for (const pluginName of fs.readdirSync(pluginsRoot)) {
@@ -272,7 +284,7 @@ export function discoverPortableSkills(pluginsRoot: string, options: DiscoverOpt
     if (!isDirectory(pluginDir)) continue;
     // Skip deprecated subtree contents — they live at <plugin>/deprecated/ and
     // shouldn't appear as portable skills.
-    for (const skill of discoverInPlugin(pluginDir, pluginName, denySubPluginSkillDirs)) {
+    for (const skill of discoverInPlugin(pluginDir, pluginName, denySubPluginSkillDirs, allowNonInvocable)) {
       if (denySkills.has(skill.name)) continue;
       if (skill.skillDir.includes('/deprecated/')) continue;
       // First-plugin-wins by name (alphabetical iteration); a later plugin
