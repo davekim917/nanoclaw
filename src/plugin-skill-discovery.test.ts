@@ -105,7 +105,12 @@ describe('discoverPortableSkills', () => {
     expect(out.map((s) => s.name)).toEqual(['y']);
   });
 
-  it('bootstrap multi-plugin: workflow skills denied, domain skills included', () => {
+  it('bootstrap multi-plugin (codex runtime): native workflow ports denied, domain/tools included', () => {
+    // Codex loads BOTH the Claude workflow/ (unusable — needs Claude's Skill/Agent tool) and the
+    // workflow-agents port (via .codex-plugin) through native paths, so neither belongs in the
+    // portable mirror; domain/tools have no native loader and must be surfaced. (The claude default
+    // runtime, by contrast, surfaces its own workflow/ — see DEFAULT_RUNTIME — so this asserts the
+    // codex scenario explicitly, which is the "workflow denied" intent.)
     writeSkill(path.join(tmpDir, 'bootstrap', 'plugins', 'workflow', 'skills', 'team-build'), { name: 'team-build' });
     writeSkill(path.join(tmpDir, 'bootstrap', 'plugins', 'workflow-agents', 'skills', 'team-build'), {
       name: 'team-build',
@@ -117,7 +122,7 @@ describe('discoverPortableSkills', () => {
       name: 'software-engineering',
     });
     writeSkill(path.join(tmpDir, 'bootstrap', 'plugins', 'tools', 'skills', 'cortex-code'), { name: 'cortex-code' });
-    const out = discoverPortableSkills(tmpDir);
+    const out = discoverPortableSkills(tmpDir, { runtime: 'codex' });
     const names = out.map((s) => s.name);
     expect(names).toContain('software-engineering');
     expect(names).toContain('cortex-code');
