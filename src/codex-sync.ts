@@ -96,7 +96,7 @@ export function syncCodexPluginSkills(): PluginSkillsSyncResult {
   const agentsSkills = path.join(os.homedir(), '.agents', 'skills');
 
   // 'codex' runtime denies both bootstrap/plugins/workflow/skills (Claude-only)
-  // and bootstrap/plugins/workflow-codex/skills (loaded via .codex-plugin/).
+  // and bootstrap/plugins/workflow-agents/skills (loaded via .codex-plugin/).
   // Default would now be 'claude', which would surface the Claude workflow set
   // into ~/.agents/skills and reintroduce Claude-only skills into Codex.
   const discovered = discoverPortableSkills(pluginsRoot, { runtime: 'codex' });

@@ -426,7 +426,7 @@ export function setupCodexRuntime(mcpServers: Record<string, McpServerConfig>): 
 
   // Skills mirror is already populated by index.ts at startup with the correct
   // runtime; calling it again here without a runtime arg would default to
-  // 'codex' and strip workflow-codex skills for opencode containers that have
+  // 'codex' and strip workflow-agents skills for opencode containers that have
   // codex auth mounted (codex-as-peer mode). Idempotency of syncSkillSymlinks
   // makes the call cheap, but the wrong denylist makes it incorrect.
 

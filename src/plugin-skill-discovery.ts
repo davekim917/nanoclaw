@@ -72,23 +72,23 @@ const DEFAULT_DENY_PLUGINS = new Set<string>([
  */
 const DENY_SUB_PLUGIN_SKILL_DIRS_BY_RUNTIME: Record<AgentRuntime, Set<string>> = {
   claude: new Set<string>([
-    // workflow-codex: same skill names as the Claude workflow; the Claude
+    // workflow-agents: same skill names as the Claude workflow; the Claude
     // runtime already loads its own `bootstrap/plugins/workflow/skills` via
     // the Claude plugin marketplace, so mirroring the codex variant would be
     // a name-collision duplicate.
-    'bootstrap/plugins/workflow-codex/skills',
+    'bootstrap/plugins/workflow-agents/skills',
   ]),
   codex: new Set<string>([
     // Claude workflow: requires Claude's Skill/Agent tool.
     'bootstrap/plugins/workflow/skills',
     // Codex workflow: installed through `.codex-plugin/plugin.json`, not the
     // legacy skills mirror. Same-name collision would make precedence ambiguous.
-    'bootstrap/plugins/workflow-codex/skills',
+    'bootstrap/plugins/workflow-agents/skills',
   ]),
   opencode: new Set<string>([
     // Claude workflow: requires Claude's Skill/Agent tool.
     'bootstrap/plugins/workflow/skills',
-    // workflow-codex is NOT denied for opencode — there's no native codex-plugin
+    // workflow-agents is NOT denied for opencode — there's no native codex-plugin
     // loader on opencode, and surfacing the skill TEXT gives the agent
     // awareness of /team-* patterns even without the spawn_task harness
     // (which is a separate runtime gap).

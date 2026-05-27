@@ -107,10 +107,10 @@ describe('discoverPortableSkills', () => {
 
   it('bootstrap multi-plugin: workflow skills denied, domain skills included', () => {
     writeSkill(path.join(tmpDir, 'bootstrap', 'plugins', 'workflow', 'skills', 'team-build'), { name: 'team-build' });
-    writeSkill(path.join(tmpDir, 'bootstrap', 'plugins', 'workflow-codex', 'skills', 'team-build'), {
+    writeSkill(path.join(tmpDir, 'bootstrap', 'plugins', 'workflow-agents', 'skills', 'team-build'), {
       name: 'team-build',
     });
-    writeSkill(path.join(tmpDir, 'bootstrap', 'plugins', 'workflow-codex', 'skills', 'team-qa'), {
+    writeSkill(path.join(tmpDir, 'bootstrap', 'plugins', 'workflow-agents', 'skills', 'team-qa'), {
       name: 'team-qa',
     });
     writeSkill(path.join(tmpDir, 'bootstrap', 'plugins', 'domain', 'skills', 'software-engineering'), {

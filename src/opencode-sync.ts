@@ -218,7 +218,7 @@ export interface OpenCodeSkillSyncResult {
  * Mirror portable plugin skills into OpenCode's skill discovery path.
  *
  * Why a separate sync from `syncCodexPluginSkills`:
- *   - Codex sync uses `runtime: 'codex'` which denies workflow-codex/skills
+ *   - Codex sync uses `runtime: 'codex'` which denies workflow-agents/skills
  *     (codex loads those via `.codex-plugin/plugin.json` instead). The shared
  *     `~/.agents/skills/` mirror reflects the codex-filtered set, so OpenCode
  *     reading from `~/.agents/skills/` misses /team-* today.
@@ -230,7 +230,7 @@ export interface OpenCodeSkillSyncResult {
  *     `~/.local/share/opencode-<folder>/skill/` for the per-sibling sets.
  *
  * Discovery uses `runtime: 'opencode'` — its denylist excludes the Claude
- * workflow (which expects Claude's Agent tool) but allows workflow-codex
+ * workflow (which expects Claude's Agent tool) but allows workflow-agents
  * skills (runtime-agnostic prose; OpenCode dispatches via its `task` tool +
  * the subagents synced by syncOpenCodeSubagents).
  *
@@ -244,7 +244,7 @@ export function syncOpenCodePluginSkills(): OpenCodeSkillSyncResult {
   const targets = discoverOpenCodeXdgTargets('skill');
 
   // Collect sibling support dirs (non-SKILL-md children of skills/ roots, e.g.
-  // workflow-codex/skills/shared/codex-workflow-primitives.md) — referenced by
+  // workflow-agents/skills/shared/codex-workflow-primitives.md) — referenced by
   // peer SKILL.md files via `../<sibling>/...` relative paths. Without this,
   // team-auto/SKILL.md's `../shared/codex-workflow-primitives.md` lookup
   // resolves to a missing file in the mirror.
@@ -283,7 +283,7 @@ export function syncOpenCodePluginSkills(): OpenCodeSkillSyncResult {
 
 /**
  * Walk every plugin skills/ root represented in `discovered` and return the
- * non-SKILL-md child dirs that need mirroring as siblings (e.g. workflow-codex/
+ * non-SKILL-md child dirs that need mirroring as siblings (e.g. workflow-agents/
  * skills/shared/). Keyed by dir name; first-wins if multiple plugins share a
  * name (alphabetical by source plugin).
  */

@@ -156,7 +156,7 @@ async function main(): Promise<void> {
   // BOTH codex-primary (illie-codex) AND codex-as-peer (illie running the
   // codex companion) see the same plugin skills (humanizer, gitnexus-*,
   // impeccable, etc.). Pass runtime so runtime-specific denylists apply
-  // correctly — e.g., opencode runtime surfaces workflow-codex skills as
+  // correctly — e.g., opencode runtime surfaces workflow-agents skills as
   // text (since there's no codex-plugin loader on opencode), while codex
   // runtime continues to deny them (loaded via .codex-plugin/ instead).
   const skillRuntime: 'codex' | 'opencode' | 'claude' =
