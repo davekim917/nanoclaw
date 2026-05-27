@@ -15,6 +15,8 @@ Create `groups/<source>-codex/` from `groups/<source>/`. The codex sibling share
 - **mnemon store** — scoped-env override (`MNEMON_STORE_<sibling>=<source-ag-id>`) routes both writers to the same store.
 - **Thread worktree** — when `NANOCLAW_THREAD_WORKTREES=1`, both siblings in the same platform thread mount the same `data/v2-threads/<thread-id>/worktrees/<repo>/` host path. Uncommitted edits flow across.
 
+> Under workgroup shared-FS (`data/workgroups/<wg>/.migrated` present), the **Repos / sources / conversations** links point at the container-absolute `/workspace/workgroup/<name>` mount instead of `../<source>/` — Step 4 detects the mode and reproduces exactly what `reconcileWorkgroupSharedDirs` already did for the existing siblings. **CLAUDE.local.md** stays a relative link in both modes (it's a loose file, never migrated).
+
 `container.json` for the new sibling gets `provider: "codex"` and `memory.enabled: true`.
 
 **Critical architectural choice — two bot apps, not one shared bot.** Each sibling agent has its own platform bot user, installed as a separate app in the workspace/guild. This lets agents `@`-mention each other (real platform mentions, real autocomplete) and have those mentions fire the peer via standard `engage_mode='mention'`. The single-bot/text-pattern alternative was tried and abandoned — it triggered runaway agent-to-agent loops that bypassed the platform entirely.
@@ -143,27 +145,53 @@ grep "_${ENV_SUFFIX}=" .env
 SIBLING_FOLDER=${SOURCE_FOLDER}-codex
 SIBLING_ID=${SIBLING_FOLDER}                # use folder name as ag-id, matching host-default groups (main, axie-dev)
 
+# Has the source's workgroup been consolidated by the shared-FS migration
+# (reconcileWorkgroupSharedDirs)? The `.migrated` marker is the same signal
+# container-runner keys off to mount data/workgroups/<wg> at /workspace/workgroup,
+# so testing it keeps the sibling consistent with the host even if the
+# WORKGROUP_SHARED_FS flag is later toggled. Resolve to an absolute path now —
+# we cd into the sibling dir below.
+WG_DIR_ABS="$(pwd)/data/workgroups/${SOURCE_WORKGROUP}"
+
 mkdir -p groups/${SIBLING_FOLDER}
 cd groups/${SIBLING_FOLDER}
 
-# Per-group memory: share the source's CLAUDE.local.md so both siblings
-# remember the same project context. Conditional — if the source has no
-# CLAUDE.local.md, leave it absent and let composeGroupClaudeMd create an
-# empty one at first spawn. Do NOT symlink CLAUDE.md here: the composer
-# overwrites it with a fresh `@-imports`-only entry every spawn, so a
-# symlink would be wiped on first wake.
+# Per-group memory: share the source's CLAUDE.local.md so both siblings remember
+# the same project context. It's a loose FILE (the shared-FS migration only moves
+# directories), so a RELATIVE symlink is correct in BOTH modes — container-runner
+# realpath-overlays it into the sibling container. Conditional — if the source has
+# none, leave it absent and let composeGroupClaudeMd create an empty one at first
+# spawn. Do NOT symlink CLAUDE.md: the composer overwrites it every spawn.
 [ -f ../${SOURCE_FOLDER}/CLAUDE.local.md ] && ln -sfn ../${SOURCE_FOLDER}/CLAUDE.local.md CLAUDE.local.md
 
-[ -d ../${SOURCE_FOLDER}/sources ] && ln -sfn ../${SOURCE_FOLDER}/sources sources
-[ -d ../${SOURCE_FOLDER}/conversations ] && ln -sfn ../${SOURCE_FOLDER}/conversations conversations
-
-# Repo symlinks (every dir that contains .git/).
-for repo in ../${SOURCE_FOLDER}/*/; do
-  if [ -d "${repo}.git" ]; then
-    name=$(basename "${repo%/}")
-    ln -sfn "../${SOURCE_FOLDER}/${name}" "${name}"
-  fi
-done
+if [ -f "${WG_DIR_ABS}/.migrated" ]; then
+  # Shared-FS live: the source's repos + sources + conversations have moved to
+  # data/workgroups/<wg>/ and are referenced via the CONTAINER-ABSOLUTE compat
+  # symlink `<name> -> /workspace/workgroup/<name>`. Emit the SAME symlink for
+  # this sibling — a relative `../${SOURCE_FOLDER}/<name>` would dangle in the
+  # sibling's container (the source dir isn't mounted there), and the repo probe
+  # below can't see `.git/` through the source's now-dangling compat symlinks
+  # anyway. These dangle on the host (container-runner's symlink-overlay skips
+  # them) and resolve via the /workspace/workgroup mount in-container — identical
+  # to what reconcileWorkgroupSharedDirs produces for the already-migrated siblings.
+  for entry in "${WG_DIR_ABS}"/*/; do
+    [ -d "${entry}" ] || continue          # dirs only; skips the `.migrated` file + an empty glob
+    name=$(basename "${entry%/}")
+    ln -sfn "/workspace/workgroup/${name}" "${name}"
+  done
+else
+  # Pre-shared-FS: RELATIVE symlinks into the source dir; container-runner
+  # realpath-overlays each one into the sibling container as a bind mount.
+  [ -d ../${SOURCE_FOLDER}/sources ] && ln -sfn ../${SOURCE_FOLDER}/sources sources
+  [ -d ../${SOURCE_FOLDER}/conversations ] && ln -sfn ../${SOURCE_FOLDER}/conversations conversations
+  # Repo symlinks (every dir that contains .git/).
+  for repo in ../${SOURCE_FOLDER}/*/; do
+    if [ -d "${repo}.git" ]; then
+      name=$(basename "${repo%/}")
+      ln -sfn "../${SOURCE_FOLDER}/${name}" "${name}"
+    fi
+  done
+fi
 cd -
 ```
 
