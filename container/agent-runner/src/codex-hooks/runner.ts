@@ -80,6 +80,126 @@ export function normalizeCodexHookInput(input: CodexHookInput): CodexHookInput {
 
 export type HookEvent = 'PreToolUse' | 'PostToolUse' | 'PostToolUseFailure';
 
+// ── Destructive-action guard (shared bootstrap core) ───────────────────────────
+// Codex does NOT fire plugin-provided hooks under app-server (container) or exec
+// (host) — verified empirically. So the destructive-command gate (parity with the
+// Claude block-destructive hook + the OpenCode opencode-guard plugin) is wired
+// into THIS chain, the codex surface that provably fires (same path email-gate
+// rides). It reuses the SAME decision core the other runtimes import — no drift.
+// The equivalent HOST codex adapter is workflow-agents/hooks/codex-guard.ts
+// (wired via ~/.codex/hooks.json, which fires in interactive codex).
+type GuardCore = {
+  evaluateBashCommand: (cmd: string, opts?: { skipGate?: boolean }) => { action: 'allow' | 'block' | 'gate'; reason?: string };
+  consumeGateApproval: (cmd: string) => boolean;
+  runNanoclawGate: (cmd: string, reason: string, onStageError?: (e: unknown) => void) => 'approved' | 'denied' | 'timeout';
+  IS_NANOCLAW: boolean;
+};
+
+/** Default container path to the vendored shared guard core. Overridable via
+ *  NANOCLAW_DESTRUCTIVE_GUARD_CORE (used by tests). */
+const DEFAULT_GUARD_CORE_PATH =
+  '/workspace/plugins/bootstrap/plugins/workflow-agents/hooks/guards/block-destructive-core.ts';
+
+/** Import the shared guard core from the mounted bootstrap plugin (bun caches the
+ *  module, so re-calls are cheap). Fail-open (returns null + warns) if the mount
+ *  is absent — a missing plugin must not wedge the agent. */
+async function loadGuardCore(): Promise<GuardCore | null> {
+  const corePath = process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE || DEFAULT_GUARD_CORE_PATH;
+  try {
+    return (await import(corePath)) as unknown as GuardCore;
+  } catch (err) {
+    console.error(
+      `[codex-hook] destructive-guard core unavailable at ${corePath} — codex running WITHOUT the gate: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    return null;
+  }
+}
+
+function denyDecision(reason: string): {
+  hookSpecificOutput: { hookEventName: 'PreToolUse'; permissionDecision: 'deny'; permissionDecisionReason: string };
+} {
+  const r = reason.startsWith('BLOCKED:') || reason.startsWith('GATED:') ? reason : `BLOCKED: ${reason}`;
+  return {
+    hookSpecificOutput: {
+      hookEventName: 'PreToolUse',
+      permissionDecision: 'deny',
+      permissionDecisionReason: r,
+    },
+  };
+}
+
+/** Evaluate a bash command against the shared core; return a deny decision to
+ *  block, or null to allow. Mirrors the control flow of block-destructive.ts /
+ *  opencode-guard.ts / codex-guard.ts (each a thin adapter over the same core). */
+async function runDestructiveGuard(
+  command: string,
+): Promise<ReturnType<typeof denyDecision> | null> {
+  if (!command) return null;
+  const core = await loadGuardCore();
+  if (!core) return null; // fail-open: core unavailable (e.g. bootstrap not mounted)
+
+  const verdict = core.evaluateBashCommand(command);
+  if (verdict.action === 'allow') return null;
+  if (verdict.action === 'block') return denyDecision(verdict.reason ?? 'destructive command blocked');
+
+  // gate
+  const reason = verdict.reason ?? 'requires approval';
+  if (core.consumeGateApproval(command)) {
+    const post = core.evaluateBashCommand(command, { skipGate: true });
+    return post.action === 'block' ? denyDecision(post.reason ?? reason) : null;
+  }
+  if (core.IS_NANOCLAW) {
+    let staged = true;
+    const decision = core.runNanoclawGate(command, reason, () => {
+      staged = false;
+    });
+    if (!staged) return denyDecision(`${reason} — could not stage approval request (session DBs unavailable).`);
+    if (decision === 'approved') {
+      const post = core.evaluateBashCommand(command, { skipGate: true });
+      return post.action === 'block' ? denyDecision(post.reason ?? reason) : null;
+    }
+    const detail =
+      decision === 'denied'
+        ? 'Cancelled by user. Do not retry or explain why it was blocked — just acknowledge the cancellation briefly.'
+        : 'Timed out waiting for user approval. Do not retry.';
+    return denyDecision(`${reason} — ${detail}`);
+  }
+  // No session-DB surface (non-NanoClaw): fail-closed for gated infra commands.
+  return denyDecision(`${reason} — requires explicit user approval, unavailable in this environment.`);
+}
+
+// ── File-protection (shared bootstrap core, parity with Claude file-protection) ──
+type FileProtectionCore = {
+  EDIT_TOOLS: Set<string>;
+  checkEditProtection: (toolName: string, toolInput: Record<string, unknown>) => string | null;
+};
+
+/** Import file-protection-core.ts from the same dir as the guard core. */
+async function loadFileProtectionCore(): Promise<FileProtectionCore | null> {
+  const guardPath = process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE || DEFAULT_GUARD_CORE_PATH;
+  const fpPath = guardPath.replace(/[^/]+$/, 'file-protection-core.ts');
+  try {
+    return (await import(fpPath)) as unknown as FileProtectionCore;
+  } catch {
+    return null; // fail-open: file-protection unavailable
+  }
+}
+
+/** Block edits (Edit/Write/apply_patch/...) to protected paths. Returns a deny
+ *  decision or null. Bypassable via SKIP_FILE_PROTECTION=1 (parity with Claude). */
+async function runFileProtection(
+  toolName: string,
+  toolInput: Record<string, unknown>,
+): Promise<ReturnType<typeof denyDecision> | null> {
+  if (process.env.SKIP_FILE_PROTECTION === '1') return null;
+  const core = await loadFileProtectionCore();
+  if (!core || !core.EDIT_TOOLS.has(toolName)) return null;
+  const blocked = core.checkEditProtection(toolName, toolInput);
+  return blocked
+    ? denyDecision(`file-protection — '${blocked}' is protected from automated edits. Set SKIP_FILE_PROTECTION=1 to bypass.`)
+    : null;
+}
+
 /**
  * Run the PreToolUse hook chain in sequence. Stops on the first hook
  * that emits a `decision: 'block'` or a `permissionDecision: 'deny'`.
@@ -109,6 +229,13 @@ export async function runPreToolUseChain(input: CodexHookInput): Promise<unknown
   }
 
   if (normalized.tool_name !== 'Bash') {
+    // File-protection applies to edit tools (apply_patch, Edit, Write, ...) —
+    // they don't go through the Bash chain below.
+    const fpDeny = await runFileProtection(
+      normalized.tool_name ?? '',
+      (normalized.tool_input ?? {}) as Record<string, unknown>,
+    );
+    if (fpDeny) return fpDeny;
     return first ?? { continue: true };
   }
 
@@ -154,6 +281,12 @@ export async function runPreToolUseChain(input: CodexHookInput): Promise<unknown
       currentInput = { ...currentInput, tool_input: mergedUpdatedInput };
     }
   }
+
+  // Destructive-action guard — runs on the post-sanitize command, after the
+  // existing chain. Returns a deny decision (blocks) or null (allow/continue).
+  const guardCommand = (currentInput.tool_input as { command?: string } | undefined)?.command ?? '';
+  const guardDeny = await runDestructiveGuard(guardCommand);
+  if (guardDeny) return guardDeny;
 
   if (mergedUpdatedInput) {
     return {

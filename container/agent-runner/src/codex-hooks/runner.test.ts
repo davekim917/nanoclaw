@@ -115,3 +115,71 @@ describe('runPreToolUseChain — guardrails', () => {
     expect(out.continue).toBe(true);
   });
 });
+
+describe('runPreToolUseChain — destructive-action guard wiring', () => {
+  // Point the guard loader at the in-repo stub core (the real core lives in the
+  // bootstrap repo; its verdicts are validated there). This tests that runner.ts
+  // calls the core and maps verdicts → codex deny/continue correctly.
+  const FIXTURE = new URL('./__test-fixtures__/guard-core-stub.ts', import.meta.url).pathname;
+  let saved: string | undefined;
+
+  beforeEach(() => {
+    saved = process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE;
+    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = FIXTURE;
+  });
+  afterEach(() => {
+    if (saved === undefined) delete process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE;
+    else process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = saved;
+  });
+
+  it('denies a hard-blocked command (core → block)', async () => {
+    const out = (await runPreToolUseChain({
+      tool_name: 'exec_command',
+      tool_input: { command: 'echo STUB_BLOCK' },
+    })) as { hookSpecificOutput?: { permissionDecision?: string; permissionDecisionReason?: string } };
+    expect(out.hookSpecificOutput?.permissionDecision).toBe('deny');
+    expect(out.hookSpecificOutput?.permissionDecisionReason).toContain('stub hard-block');
+  });
+
+  it('denies a gated command when no session-DB gate exists (core → gate, IS_NANOCLAW false → fail-closed)', async () => {
+    const out = (await runPreToolUseChain({
+      tool_name: 'exec_command',
+      tool_input: { command: 'echo STUB_GATE' },
+    })) as { hookSpecificOutput?: { permissionDecision?: string } };
+    expect(out.hookSpecificOutput?.permissionDecision).toBe('deny');
+  });
+
+  it('allows a benign command (core → allow)', async () => {
+    const out = (await runPreToolUseChain({
+      tool_name: 'exec_command',
+      tool_input: { command: 'echo benign-ok' },
+    })) as { hookSpecificOutput?: { permissionDecision?: string } };
+    expect(out.hookSpecificOutput?.permissionDecision).toBeUndefined();
+  });
+
+  it('fails open (allows) when the guard core is unavailable', async () => {
+    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = '/nonexistent/guard-core.ts';
+    const out = (await runPreToolUseChain({
+      tool_name: 'exec_command',
+      tool_input: { command: 'echo STUB_BLOCK' },
+    })) as { hookSpecificOutput?: { permissionDecision?: string } };
+    // Missing core must not wedge the agent — guard no-ops, command not denied.
+    expect(out.hookSpecificOutput?.permissionDecision).toBeUndefined();
+  });
+
+  it('denies an edit to a protected path (file-protection core → blocked)', async () => {
+    const out = (await runPreToolUseChain({
+      tool_name: 'Write',
+      tool_input: { file_path: 'app/STUB_PROTECTED.env' },
+    })) as { hookSpecificOutput?: { permissionDecision?: string } };
+    expect(out.hookSpecificOutput?.permissionDecision).toBe('deny');
+  });
+
+  it('allows an edit to a safe path', async () => {
+    const out = (await runPreToolUseChain({
+      tool_name: 'Write',
+      tool_input: { file_path: 'src/index.ts' },
+    })) as { hookSpecificOutput?: { permissionDecision?: string } };
+    expect(out.hookSpecificOutput?.permissionDecision).toBeUndefined();
+  });
+});
