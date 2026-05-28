@@ -88,7 +88,7 @@ const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY, timeout: 30
 // (messaging_group_agents.default_model/effort) and per-group
 // (container.json defaultModel/defaultEffort) layers can still override.
 // Per-session flags (-m / -e) and sticky config override on top of those.
-const DEFAULT_OPUS_MODEL = 'claude-opus-4-7[1m]';
+const DEFAULT_OPUS_MODEL = 'claude-opus-4-8[1m]';
 const DEFAULT_SONNET_MODEL = 'claude-sonnet-4-6';
 const DEFAULT_HAIKU_MODEL = 'claude-haiku-4-5-20251001';
 const DEFAULT_EFFORT = 'high';

@@ -31,6 +31,8 @@ const MODEL_ALIAS_MAP: Record<string, string> = {
   'opus4-6': 'claude-opus-4-6[1m]',
   opus47: 'claude-opus-4-7[1m]',
   'opus4-7': 'claude-opus-4-7[1m]',
+  opus48: 'claude-opus-4-8[1m]',
+  'opus4-8': 'claude-opus-4-8[1m]',
   sonnet46: 'claude-sonnet-4-6',
   'sonnet4-6': 'claude-sonnet-4-6',
   sonnet47: 'claude-sonnet-4-7',
@@ -74,6 +76,10 @@ const MODEL_EFFORT_SUPPORT: Record<string, ReadonlySet<EffortLevel>> = {
   // Opus 4.7: adds xhigh. Same 1M-only policy as 4.6.
   opus: new Set(['low', 'medium', 'high', 'xhigh', 'max']),
   'claude-opus-4-7[1m]': new Set(['low', 'medium', 'high', 'xhigh', 'max']),
+  // Opus 4.8: same effort surface as 4.7 (xhigh from 4.7+, max from 4.6+).
+  // Same 1M-only policy. Bare `opus` resolves here once DEFAULT_OPUS_MODEL
+  // points at 4.8 (container-runner.ts).
+  'claude-opus-4-8[1m]': new Set(['low', 'medium', 'high', 'xhigh', 'max']),
 };
 
 /** Structured representation of a parsed flag set. Empty object = no flags. */

@@ -57,6 +57,22 @@ describe('parseMessageFlags', () => {
       const r = parseMessageFlags('-m opus hi');
       expect(r.intent).toEqual({ stickyModel: 'opus' });
     });
+
+    it('resolves opus48 / opus4-8 aliases to claude-opus-4-8[1m]', () => {
+      expect(parseMessageFlags('-m opus48 hi').intent).toEqual({ stickyModel: 'claude-opus-4-8[1m]' });
+      expect(parseMessageFlags('-m opus4-8 hi').intent).toEqual({ stickyModel: 'claude-opus-4-8[1m]' });
+    });
+
+    it('auto-appends [1m] to bare claude-opus-4-8 id', () => {
+      const r = parseMessageFlags('-m claude-opus-4-8 hi');
+      expect(r.intent).toEqual({ stickyModel: 'claude-opus-4-8[1m]' });
+    });
+
+    it('accepts xhigh effort on opus 4.8 (effort matrix knows the new id)', () => {
+      const r = parseMessageFlags('-m opus48 -e xhigh hi');
+      expect(r.intent).toEqual({ stickyModel: 'claude-opus-4-8[1m]', stickyEffort: 'xhigh' });
+      expect(r.warnings).toEqual([]);
+    });
   });
 
   describe('mention prefix before flags', () => {

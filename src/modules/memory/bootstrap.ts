@@ -223,12 +223,12 @@ export async function bootstrapMemoryForGroup(
         destination,
         // Wiki synthesis is a high-leverage low-frequency reasoning task —
         // read N mnemon facts, dedupe, organize across multiple wiki pages,
-        // update index. Run on Opus with reasoning_effort=high once a day;
+        // update index. Run on Opus with reasoning_effort=medium once a day;
         // chat in the same group keeps the agent's sticky config (typically
         // Sonnet) since these are turn-only overrides.
         flagIntent: {
-          turnModel: 'claude-opus-4-7',
-          turnEffort: 'high',
+          turnModel: 'claude-opus-4-8',
+          turnEffort: 'medium',
         },
       },
       DATA_DIR,
@@ -243,7 +243,7 @@ export async function bootstrapMemoryForGroup(
   // weekly so processAfter must be the NEXT cron fire (not "now") — otherwise
   // a re-bootstrap fires lint immediately, ahead of the user's expected
   // "Sundays at 10am" cadence. Same destination as synth (parent channel,
-  // threadId=null), same Opus+high config, same quietStatus:true.
+  // threadId=null), same Opus+medium config, same quietStatus:true.
   let lintProcessAfter: string;
   try {
     const { CronExpressionParser } = await import('cron-parser');
@@ -269,8 +269,8 @@ export async function bootstrapMemoryForGroup(
         quietStatus: true,
         destination,
         flagIntent: {
-          turnModel: 'claude-opus-4-7',
-          turnEffort: 'high',
+          turnModel: 'claude-opus-4-8',
+          turnEffort: 'medium',
         },
       },
       DATA_DIR,
