@@ -20,7 +20,7 @@
 # publish a linux/arm64 prebuilt at storage.googleapis.com. The alias FROM
 # lets us pull the binary via COPY --from below while keeping the version
 # pinned via build-arg.
-ARG MCP_TOOLBOX_VERSION=1.1.0
+ARG MCP_TOOLBOX_VERSION=1.3.0
 FROM us-central1-docker.pkg.dev/database-toolbox/toolbox/toolbox:${MCP_TOOLBOX_VERSION} AS mcp-toolbox-src
 
 # ---- rtk builder stage -------------------------------------------------------
@@ -31,7 +31,7 @@ FROM us-central1-docker.pkg.dev/database-toolbox/toolbox/toolbox:${MCP_TOOLBOX_V
 # in this builder stage and copy the resulting binary into the final image —
 # Rust toolchain stays in the builder layer, never reaches runtime.
 FROM rust:1-bookworm AS rtk-builder
-ARG RTK_VERSION=0.39.0
+ARG RTK_VERSION=0.42.0
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     cargo install --git https://github.com/rtk-ai/rtk --tag "v${RTK_VERSION}" --locked --root /out rtk
@@ -45,16 +45,16 @@ ARG INSTALL_CJK_FONTS=false
 # Pin CLI versions for reproducibility. Bump deliberately — unpinned installs
 # mean every rebuild silently picks up the latest and can break in lockstep
 # across all users.
-ARG CLAUDE_CODE_VERSION=2.1.154
+ARG CLAUDE_CODE_VERSION=2.1.156
 ARG AGENT_BROWSER_VERSION=0.27.0
 ARG VERCEL_VERSION=52.2.1
-ARG GITNEXUS_VERSION=1.6.4
-ARG BUN_VERSION=1.3.13
-ARG MMDC_VERSION=11.14.0
+ARG GITNEXUS_VERSION=1.6.5
+ARG BUN_VERSION=1.3.14
+ARG MMDC_VERSION=11.15.0
 ARG GWS_VERSION=0.22.5
-ARG CODEX_VERSION=0.130.0
-ARG OPENCODE_VERSION=1.15.7
-ARG DBT_MCP_VERSION=1.18.0
+ARG CODEX_VERSION=0.135.0
+ARG OPENCODE_VERSION=1.15.12
+ARG DBT_MCP_VERSION=1.19.2
 ARG SLACK_MCP_VERSION=1.3.0
 
 # ---- System dependencies -----------------------------------------------------
@@ -114,12 +114,12 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 #   /opt/dbt-venv/bin/dbt → /usr/local/bin/dbt
 RUN python3 -m venv /opt/snow-venv \
     && /opt/snow-venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel \
-    && /opt/snow-venv/bin/pip install --no-cache-dir snowflake-cli==3.17.0 \
+    && /opt/snow-venv/bin/pip install --no-cache-dir snowflake-cli==3.19.0 \
     && ln -sf /opt/snow-venv/bin/snow /usr/local/bin/snow
 
 RUN python3 -m venv /opt/dbt-venv \
     && /opt/dbt-venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel \
-    && /opt/dbt-venv/bin/pip install --no-cache-dir dbt-core==1.11.9 dbt-snowflake==1.11.4 \
+    && /opt/dbt-venv/bin/pip install --no-cache-dir dbt-core==1.11.11 dbt-snowflake==1.11.5 \
     && ln -sf /opt/dbt-venv/bin/dbt /usr/local/bin/dbt
 
 # sooperset/mcp-atlassian — stdio MCP server for Jira + Confluence (72 tools).
@@ -194,9 +194,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends gnupg \
     && rm -rf /var/lib/apt/lists/*
 
 # Render / Railway / Supabase CLIs (released as prebuilt binaries)
-ARG RENDER_VERSION=2.16.0
-ARG RAILWAY_VERSION=4.57.4
-ARG SUPABASE_VERSION=2.98.2
+ARG RENDER_VERSION=2.19.0
+ARG RAILWAY_VERSION=4.65.0
+ARG SUPABASE_VERSION=2.101.0
 RUN DPKG_ARCH=$(dpkg --print-architecture) && UARCH=$(uname -m) \
     && curl -fsSL "https://github.com/render-oss/cli/releases/download/v${RENDER_VERSION}/cli_${RENDER_VERSION}_linux_${DPKG_ARCH}.zip" \
        -o /tmp/render.zip \
@@ -216,10 +216,10 @@ RUN DPKG_ARCH=$(dpkg --print-architecture) && UARCH=$(uname -m) \
 COPY --from=mcp-toolbox-src /toolbox /usr/local/bin/toolbox
 
 # Pinned mnemon binary — auto-tracked by /update-container audit.
-# Per-arch SHA256 from https://github.com/mnemon-dev/mnemon/releases/download/v0.1.2/checksums.txt
-ARG MNEMON_VERSION=0.1.3
-ARG MNEMON_SHA256_arm64=31a1088803a6ea2c0a0b3417828f55dbddd7a773fbfe44e0e79d071e7a0e2700
-ARG MNEMON_SHA256_amd64=dfca47f5834d4afd32c9c76e7e876abc9fbca1fac8e50166f6a9ba3673ce41b0
+# Per-arch SHA256 from https://github.com/mnemon-dev/mnemon/releases/download/v0.1.11/checksums.txt
+ARG MNEMON_VERSION=0.1.11
+ARG MNEMON_SHA256_arm64=566cd5770175a32d4bd8030f5e2628532aecfc683ffec669e00b86c652dcae1a
+ARG MNEMON_SHA256_amd64=34c692079a152fb21f6253dd04de9e4239ed4301086c32af7e4e30dbc2993423
 
 RUN ARCH=$(dpkg --print-architecture) \
     && SHA=$(if [ "$ARCH" = "arm64" ]; then echo "$MNEMON_SHA256_arm64"; else echo "$MNEMON_SHA256_amd64"; fi) \
@@ -245,9 +245,9 @@ RUN chmod +x /usr/local/bin/mnemon-wrapper.sh \
 # stale CDN edge):
 #   curl -sL https://github.com/hex-inc/hex-cli/releases/download/v$V/hex-aarch64-unknown-linux-gnu.tar.xz.sha256
 #   curl -sL https://github.com/hex-inc/hex-cli/releases/download/v$V/hex-x86_64-unknown-linux-gnu.tar.xz.sha256
-ARG HEX_CLI_VERSION=1.3.0
-ARG HEX_CLI_SHA256_arm64=284743e6a58d4a98ec7b457673ddd948c54069fcbd67826cde34b4cd4b48d8ae
-ARG HEX_CLI_SHA256_amd64=375d08789afec2529d71373a6326ba638720031e44a094cb7f10538a60ca31a3
+ARG HEX_CLI_VERSION=1.4.0
+ARG HEX_CLI_SHA256_arm64=b0fa1532dc44af4f8028abf309d985ec073535c939517753fdc3c063b3503a5c
+ARG HEX_CLI_SHA256_amd64=ddbcdd3bfb0973351da08c1d21afcc6b3138b5b7ad4511eca4492279bf42fbe8
 
 RUN ARCH=$(dpkg --print-architecture) \
     && case "$ARCH" in \
