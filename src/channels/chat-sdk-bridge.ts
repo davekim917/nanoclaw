@@ -17,6 +17,9 @@ import {
   type Adapter,
   type ConcurrencyStrategy,
   type Message as ChatMessage,
+  toPlainText,
+  getNodeChildren,
+  isListNode,
 } from 'chat';
 import { log } from '../log.js';
 import { SqliteStateAdapter } from '../state-sqlite.js';
@@ -54,6 +57,86 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
       timer.unref();
     }),
   ]);
+}
+
+/**
+ * Minimal view of the mdast nodes we touch when rebuilding inbound text.
+ * The Chat SDK exposes the parsed message as `message.formatted` (an mdast
+ * `Root`); we only read structural fields, so a loose shape keeps us off the
+ * full `@types/mdast` dependency.
+ */
+interface MdNode {
+  type?: string;
+  ordered?: boolean;
+  start?: number;
+  value?: string;
+  lang?: string;
+  children?: MdNode[];
+}
+
+/** Render a single mdast `list` node, preserving markers, nesting, and newlines. */
+function renderListNode(list: MdNode, depth: number): string {
+  const ordered = list.ordered === true;
+  const start = typeof list.start === 'number' ? list.start : 1;
+  const indent = '  '.repeat(depth);
+  const lines: string[] = [];
+  const items = getNodeChildren(list as never) as MdNode[];
+  items.forEach((item, i) => {
+    const marker = ordered ? `${start + i}.` : '-';
+    let firstContent = true;
+    for (const child of getNodeChildren(item as never) as MdNode[]) {
+      if (isListNode(child as never)) {
+        lines.push(renderListNode(child, depth + 1));
+        continue;
+      }
+      const txt = (toPlainText(child as never) as string).trim();
+      if (!txt) continue;
+      if (firstContent) {
+        lines.push(`${indent}${marker} ${txt}`);
+        firstContent = false;
+      } else {
+        // continuation line within the same item, aligned under the text
+        lines.push(`${indent}  ${txt}`);
+      }
+    }
+    // Preserve an empty item so ordered numbering stays aligned.
+    if (firstContent) lines.push(`${indent}${marker}`);
+  });
+  return lines.join('\n');
+}
+
+/**
+ * Rebuild the inbound message text from the Chat SDK's mdast `formatted` AST,
+ * preserving block structure (paragraph breaks, list markers, code fences).
+ *
+ * Why: the SDK's `message.text` is `mdastToString(formatted)`, which strips ALL
+ * structure — it concatenates every text node with no separators. So
+ * `-e xhigh\n1. Approved\n2. Approved\n3. Catch up …` arrives as
+ * `-e xhighApprovedApprovedCatch up …`, which both breaks `-e`/`-m` flag parsing
+ * (the `\S*` value grabs the run-on) AND hands the agent garbled instructions.
+ * The SDK itself documents `stringifyMarkdown(message.formatted)` as the way to
+ * recover markdown, but that escapes every `_`/`*`/`~` (`SOURCE_DATA` →
+ * `SOURCE\_DATA`) — pervasive corruption of snake_case identifiers. So we render
+ * structure ourselves and use the SDK's (non-escaping) `toPlainText` for inline
+ * content, matching the existing flattening exactly within each block.
+ *
+ * Returns null when there's no usable AST, so callers fall back to `.text`.
+ */
+export function reconstructInboundText(formatted: unknown): string | null {
+  const root = formatted as MdNode | undefined;
+  if (!root || !Array.isArray(root.children) || root.children.length === 0) return null;
+  const blocks: string[] = [];
+  for (const node of root.children) {
+    if (isListNode(node as never)) {
+      blocks.push(renderListNode(node, 0));
+    } else if (node.type === 'code') {
+      blocks.push(`\`\`\`${node.lang ?? ''}\n${node.value ?? ''}\n\`\`\``);
+    } else {
+      blocks.push(toPlainText(node as never) as string);
+    }
+  }
+  const out = blocks.join('\n\n');
+  return out.trim() ? out : null;
 }
 
 /**
@@ -374,6 +457,17 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       serialized.senderId = author.userId;
       serialized.sender = name;
       serialized.senderName = name;
+    }
+
+    // Rebuild the message body from the mdast AST so block structure (newlines,
+    // list markers, code fences) survives. The SDK's `.text` is a structure-less
+    // flatten of `.formatted`, which breaks `-e`/`-m` flag parsing and garbles
+    // multi-line instructions (e.g. a numbered list). Falls back to `.text`.
+    // Runs BEFORE transformInboundText so Discord snowflake resolution still
+    // applies to the rebuilt text.
+    if (serialized.formatted) {
+      const rebuilt = reconstructInboundText(serialized.formatted);
+      if (rebuilt !== null) serialized.text = rebuilt;
     }
 
     // Resolve raw platform mention syntax (Discord's `<@snowflake>`) into

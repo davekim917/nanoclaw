@@ -2,8 +2,17 @@ import { describe, expect, it } from 'vitest';
 
 import type { Adapter, AdapterPostableMessage, RawMessage } from 'chat';
 
-import { createChatSdkBridge, parseRetryAfterMs, resolveQuotedReply, splitForLimit } from './chat-sdk-bridge.js';
+import { parseMarkdown } from 'chat';
+
+import {
+  createChatSdkBridge,
+  parseRetryAfterMs,
+  reconstructInboundText,
+  resolveQuotedReply,
+  splitForLimit,
+} from './chat-sdk-bridge.js';
 import type { Message as ChatMessage } from 'chat';
+import { parseMessageFlags } from '../flag-parser.js';
 
 function stubAdapter(partial: Partial<Adapter>): Adapter {
   return { name: 'stub', ...partial } as unknown as Adapter;
@@ -767,5 +776,68 @@ describe('resolveQuotedReply', () => {
   it('returns null on timeout — never stalls the inbound path', async () => {
     const m = msg([{ fetchMessage: () => new Promise((res) => setTimeout(() => res({ text: 'late' }), 100)) }]);
     expect(await resolveQuotedReply(m, 10)).toBeNull();
+  });
+});
+
+describe('reconstructInboundText', () => {
+  // The AST the Chat SDK attaches as `message.formatted`. We build it with the
+  // SDK's own markdown parser so the test exercises the real node shapes.
+  const ast = (md: string) => parseMarkdown(md);
+
+  it('preserves the newline between a flag line and a numbered list (the prod bug)', () => {
+    const md =
+      '-e xhigh\n1. Approved\n2. Approved\n3. Catch up should be done on the gold layer (SOURCE_DATA), not the raw S3 data';
+    const out = reconstructInboundText(ast(md));
+    expect(out).toBe(
+      '-e xhigh\n\n1. Approved\n2. Approved\n3. Catch up should be done on the gold layer (SOURCE_DATA), not the raw S3 data',
+    );
+  });
+
+  it('does NOT escape snake_case / glob identifiers (unlike stringifyMarkdown)', () => {
+    const out = reconstructInboundText(ast('use table SOURCE_DATA join gold_layer on user_id, run my_func() 3*4'));
+    expect(out).toBe('use table SOURCE_DATA join gold_layer on user_id, run my_func() 3*4');
+  });
+
+  it('keeps unordered list markers and nesting', () => {
+    const out = reconstructInboundText(ast('items:\n- one\n- two\n  - nested'));
+    expect(out).toBe('items:\n\n- one\n- two\n  - nested');
+  });
+
+  it('preserves ordered-list start offset', () => {
+    const out = reconstructInboundText(ast('5. five\n6. six'));
+    expect(out).toBe('5. five\n6. six');
+  });
+
+  it('preserves fenced code blocks', () => {
+    const out = reconstructInboundText(ast('run:\n```sql\nselect a_b from t\n```'));
+    expect(out).toBe('run:\n\n```sql\nselect a_b from t\n```');
+  });
+
+  it('leaves a single-paragraph message identical to the old flatten', () => {
+    expect(reconstructInboundText(ast('-e xhigh do the thing'))).toBe('-e xhigh do the thing');
+  });
+
+  it('returns null for an empty/unusable AST so callers fall back to .text', () => {
+    expect(reconstructInboundText(undefined)).toBeNull();
+    expect(reconstructInboundText({ type: 'root', children: [] })).toBeNull();
+    expect(reconstructInboundText(ast('   '))).toBeNull();
+  });
+
+  it('end-to-end: rebuilt text lets the flag parser extract -e xhigh cleanly', () => {
+    const md = '@illie -e xhigh\n1. Approved\n2. Approved\n3. Catch up on SOURCE_DATA';
+    const rebuilt = reconstructInboundText(ast(md))!;
+    const parsed = parseMessageFlags(rebuilt);
+    expect(parsed.errors).toEqual([]);
+    expect(parsed.intent).toEqual({ stickyEffort: 'xhigh' });
+    expect(parsed.cleanedText).toBe('1. Approved\n2. Approved\n3. Catch up on SOURCE_DATA');
+  });
+
+  it('end-to-end: the OLD flatten is what produced the bogus effort value', () => {
+    // Documents the regression guard: mdastToString-style flattening (what the
+    // SDK's .text does) concatenates list items with no separator, so -e's \S*
+    // swallows the run-on. This is the behavior reconstructInboundText replaces.
+    const flattened = '@illie -e xhighApprovedApprovedCatch up on SOURCE_DATA';
+    const parsed = parseMessageFlags(flattened);
+    expect(parsed.errors[0]).toMatch(/unknown effort level: xhighApprovedApprovedCatch/);
   });
 });
