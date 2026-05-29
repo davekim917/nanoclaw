@@ -14,6 +14,7 @@ import { getOutboundDb } from './connection.js';
 const LEGACY_KEY = 'sdk_session_id';
 const STICKY_MODEL_KEY = 'sticky_model';
 const STICKY_EFFORT_KEY = 'sticky_effort';
+const STICKY_ULTRACODE_KEY = 'sticky_ultracode';
 
 function continuationKey(providerName: string): string {
   return `continuation:${providerName.toLowerCase()}`;
@@ -108,4 +109,23 @@ export function setStickyEffort(effort: string): void {
 
 export function clearStickyEffort(): void {
   deleteValue(STICKY_EFFORT_KEY);
+}
+
+/**
+ * Session-sticky ultracode flag (`-e ultracode`). Stored as '1'/'0' so an
+ * explicit `-e <normal-level>` can persist the off-state. Returns undefined
+ * when never set (caller falls back to no ultracode). Claude-only.
+ */
+export function getStickyUltracode(): boolean | undefined {
+  const v = getValue(STICKY_ULTRACODE_KEY);
+  if (v === undefined) return undefined;
+  return v === '1';
+}
+
+export function setStickyUltracode(on: boolean): void {
+  setValue(STICKY_ULTRACODE_KEY, on ? '1' : '0');
+}
+
+export function clearStickyUltracode(): void {
+  deleteValue(STICKY_ULTRACODE_KEY);
 }

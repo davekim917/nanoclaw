@@ -941,6 +941,10 @@ export class ClaudeProvider implements AgentProvider {
     // Per-turn input takes precedence over sticky config (A3).
     const model = input.model ?? this.stickyConfig.model;
     const effort = input.effort ?? this.stickyConfig.effort;
+    // ultracode is a session flag (xhigh + standing dynamic-workflow
+    // orchestration), NOT an effort value — applied via the SDK control
+    // request below. Effort is already forced to xhigh upstream when set.
+    const ultracode = input.ultracode === true;
 
     // Discover plugins each query so hot-mounted plugin drops are picked up
     // without a container restart. Cheap (just fs.readdir under
@@ -1039,6 +1043,21 @@ export class ClaudeProvider implements AgentProvider {
       // "it's alive and doing something."
       let lastToolProgressAt = 0;
       const TOOL_PROGRESS_MIN_INTERVAL_MS = 1500;
+
+      // Enable ultracode for the session before consuming the stream. It's a
+      // flag SETTING (not an effort value, not read from settings.json), so the
+      // SDK's apply_flag_settings control request is the only programmatic
+      // lever — available because we run in streaming-input mode. Non-fatal:
+      // if the underlying CLI build doesn't honor it, log and continue at the
+      // already-set xhigh effort rather than failing the turn.
+      if (ultracode) {
+        try {
+          await sdkResult.applyFlagSettings({ ultracode: true });
+          log('ultracode enabled for session (xhigh + standing dynamic-workflow orchestration)');
+        } catch (err) {
+          log(`applyFlagSettings(ultracode) failed — continuing without: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
 
       for await (const message of sdkResult) {
         if (aborted) return;

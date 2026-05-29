@@ -101,9 +101,9 @@ describe('parseMessageFlags', () => {
       expect(r.cleanedText).toBe('hi');
     });
 
-    it(`clears sticky effort on -e ""`, () => {
+    it(`clears sticky effort (and ultracode) on -e ""`, () => {
       const r = parseMessageFlags(`-e "" hi`);
-      expect(r.intent).toEqual({ clearStickyEffort: true });
+      expect(r.intent).toEqual({ clearStickyEffort: true, clearStickyUltracode: true });
     });
   });
 
@@ -167,6 +167,36 @@ describe('parseMessageFlags', () => {
       expect(r.errors[0]).toMatch(/unknown effort level: turbo/);
     });
   });
+
+  describe('ultracode', () => {
+    it('maps -e ultracode to xhigh effort + a separate ultracode flag (not the effort enum)', () => {
+      const r = parseMessageFlags('-e ultracode build the thing');
+      expect(r.intent).toEqual({ stickyEffort: 'xhigh', stickyUltracode: true });
+      expect(r.errors).toEqual([]);
+      expect(r.cleanedText).toBe('build the thing');
+    });
+
+    it('is case-insensitive and supports the per-turn -e1 form', () => {
+      expect(parseMessageFlags('-e ULTRACODE x').intent).toEqual({ stickyEffort: 'xhigh', stickyUltracode: true });
+      expect(parseMessageFlags('-e1 ultracode x').intent).toEqual({ turnEffort: 'xhigh', turnUltracode: true });
+    });
+
+    it('a normal -e level emits a clean intent (ultracode-off is inferred container-side)', () => {
+      // No stickyUltracode field — the container clears ultracode whenever
+      // stickyEffort is set without the ultracode flag.
+      expect(parseMessageFlags('-e high x').intent).toEqual({ stickyEffort: 'high' });
+    });
+
+    it(`-e '' clears both effort and ultracode`, () => {
+      expect(parseMessageFlags(`-e '' x`).intent).toEqual({ clearStickyEffort: true, clearStickyUltracode: true });
+    });
+
+    it('drops ultracode and warns when the model is not xhigh-capable', () => {
+      const r = parseMessageFlags('-m sonnet -e ultracode x');
+      expect(r.intent).toEqual({ stickyModel: 'sonnet' });
+      expect(r.warnings.some((w) => /ultracode needs an xhigh-capable model/.test(w))).toBe(true);
+    });
+  });
 });
 
 describe('formatFlagConfirmation', () => {
@@ -193,5 +223,11 @@ describe('formatFlagConfirmation', () => {
 
   it('returns empty string for empty intent with no messages', () => {
     expect(formatFlagConfirmation({}, [], [])).toBe('');
+  });
+
+  it('shows ultracode instead of a redundant effort → xhigh line', () => {
+    const out = formatFlagConfirmation({ stickyEffort: 'xhigh', stickyUltracode: true }, [], []);
+    expect(out).toContain('ultracode ON');
+    expect(out).not.toContain('effort → xhigh');
   });
 });

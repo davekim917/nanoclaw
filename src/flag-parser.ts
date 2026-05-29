@@ -22,6 +22,18 @@ export type EffortLevel = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 const VALID_EFFORT: ReadonlySet<string> = new Set<EffortLevel>(['low', 'medium', 'high', 'xhigh', 'max']);
 
 /**
+ * `ultracode` is NOT an effort level — the SDK's EffortLevel enum has no such
+ * value. It's a separate session-scoped flag setting (`Settings.ultracode`,
+ * enabled via the Agent SDK `applyFlagSettings` control request) that turns on
+ * xhigh effort PLUS standing dynamic-workflow orchestration. We accept it as a
+ * pseudo-value of `-e`/`-e1` for ergonomics (mirrors Claude Code's
+ * `/effort ultracode`), then translate it to `effort=xhigh` + a separate
+ * `ultracode` boolean that rides alongside the effort fields — never into the
+ * effort enum itself. Claude-only; requires an xhigh-capable model.
+ */
+const ULTRACODE = 'ultracode';
+
+/**
  * Model alias → concrete id. Bare aliases (`opus`, `sonnet`, `haiku`) are
  * SDK-native "current default in family"; the pinned aliases (`opus4-7`,
  * etc.) force a specific version regardless of SDK default drift.
@@ -90,6 +102,16 @@ export interface FlagIntent {
   stickyEffort?: string;
   clearStickyEffort?: boolean;
   turnEffort?: string;
+  /**
+   * Ultracode (xhigh + standing dynamic-workflow orchestration), set via
+   * `-e ultracode` / `-e1 ultracode`. Rides alongside effort (which is forced
+   * to xhigh), NOT inside it. `stickyUltracode=false` is emitted by a normal
+   * `-e <level>` to explicitly turn ultracode off; `clearStickyUltracode` by
+   * `-e ''`. Claude-only — other providers ignore it.
+   */
+  stickyUltracode?: boolean;
+  clearStickyUltracode?: boolean;
+  turnUltracode?: boolean;
 }
 
 export interface FlagParseResult {
@@ -154,20 +176,32 @@ export function parseMessageFlags(rawText: string): FlagParseResult {
       case '-e': {
         if (rawValue === '') {
           intent.clearStickyEffort = true;
+          intent.clearStickyUltracode = true;
+        } else if (rawValue.toLowerCase() === ULTRACODE) {
+          // ultracode = xhigh effort + dynamic-workflow orchestration. Force
+          // effort to xhigh and flip the separate ultracode flag on.
+          intent.stickyEffort = 'xhigh';
+          intent.stickyUltracode = true;
         } else if (VALID_EFFORT.has(rawValue)) {
           intent.stickyEffort = rawValue;
+          // No ultracode field emitted here — a plain effort change implicitly
+          // turns ultracode off, inferred container-side from stickyEffort being
+          // set without stickyUltracode. Keeps the intent minimal.
         } else {
-          errors.push(`unknown effort level: ${rawValue} (expected low|medium|high|xhigh|max)`);
+          errors.push(`unknown effort level: ${rawValue} (expected low|medium|high|xhigh|max|ultracode)`);
         }
         break;
       }
       case '-e1': {
         if (rawValue === '') {
           errors.push(`-e1 requires a value (use -e '' to clear sticky)`);
+        } else if (rawValue.toLowerCase() === ULTRACODE) {
+          intent.turnEffort = 'xhigh';
+          intent.turnUltracode = true;
         } else if (VALID_EFFORT.has(rawValue)) {
           intent.turnEffort = rawValue;
         } else {
-          errors.push(`unknown effort level: ${rawValue}`);
+          errors.push(`unknown effort level: ${rawValue} (expected low|medium|high|xhigh|max|ultracode)`);
         }
         break;
       }
@@ -189,6 +223,13 @@ export function parseMessageFlags(rawText: string): FlagParseResult {
       delete intent.stickyEffort;
       delete intent.turnEffort;
       delete intent.clearStickyEffort;
+      // ultracode requires an xhigh-capable model; if the chosen model can't
+      // do the (xhigh) effort, ultracode can't apply either — drop it too.
+      if (intent.stickyUltracode || intent.turnUltracode) {
+        warnings.push(`ultracode needs an xhigh-capable model (e.g. opus) — skipped`);
+        delete intent.stickyUltracode;
+        delete intent.turnUltracode;
+      }
     }
   }
 
@@ -197,8 +238,11 @@ export function parseMessageFlags(rawText: string): FlagParseResult {
     intent.turnModel !== undefined ||
     intent.stickyEffort !== undefined ||
     intent.turnEffort !== undefined ||
+    intent.stickyUltracode !== undefined ||
+    intent.turnUltracode !== undefined ||
     intent.clearStickyModel === true ||
-    intent.clearStickyEffort === true;
+    intent.clearStickyEffort === true ||
+    intent.clearStickyUltracode === true;
 
   return {
     intent: hasIntent ? intent : undefined,
@@ -225,10 +269,15 @@ export function formatFlagConfirmation(intent: FlagIntent, warnings: string[], e
   }
   if (intent.clearStickyEffort) {
     parts.push('sticky effort cleared');
+  } else if (intent.stickyUltracode) {
+    // ultracode subsumes effort (it forces xhigh) — show it instead of "effort → xhigh".
+    parts.push('ultracode ON (xhigh + dynamic workflows)');
   } else if (intent.stickyEffort) {
     parts.push(`effort → ${intent.stickyEffort}`);
   }
-  if (intent.turnEffort) {
+  if (intent.turnUltracode) {
+    parts.push('ultracode this turn (xhigh + dynamic workflows)');
+  } else if (intent.turnEffort) {
     parts.push(`effort (this turn) → ${intent.turnEffort}`);
   }
 

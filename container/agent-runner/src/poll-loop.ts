@@ -16,6 +16,9 @@ import {
   getStickyEffort,
   setStickyEffort,
   clearStickyEffort,
+  getStickyUltracode,
+  setStickyUltracode,
+  clearStickyUltracode,
 } from './db/session-state.js';
 import { clearCurrentInReplyTo, setCurrentInReplyTo } from './current-batch.js';
 import {
@@ -238,7 +241,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     const keptIds = keep.map((m) => m.id);
     markProcessing(keptIds);
 
-    const { model: effectiveModel, effort: effectiveEffort } = applyFlagBatch(keep, routing);
+    const { model: effectiveModel, effort: effectiveEffort, ultracode: effectiveUltracode } = applyFlagBatch(keep, routing);
 
     // Format messages: passthrough commands get raw text (only if the
     // provider natively handles slash commands), others get XML.
@@ -256,6 +259,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       cwd: config.cwd,
       model: effectiveModel,
       effort: effectiveEffort,
+      ultracode: effectiveUltracode,
       systemContext: config.systemContext,
     });
 
@@ -300,6 +304,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             systemContext: config.systemContext,
             model: effectiveModel,
             effort: effectiveEffort,
+            ultracode: effectiveUltracode,
           });
           const retryResult = await processQuery(retryQuery, routing, processingIds, config.providerName);
           if (retryResult.continuation && retryResult.continuation !== continuation) {
@@ -348,6 +353,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             systemContext: config.systemContext,
             model: effectiveModel,
             effort: effectiveEffort,
+            ultracode: effectiveUltracode,
           });
           const retryResult = await processQuery(retryQuery, routing, processingIds, config.providerName);
           if (retryResult.continuation) {
@@ -387,6 +393,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             systemContext: config.systemContext,
             model: effectiveModel,
             effort: effectiveEffort,
+            ultracode: effectiveUltracode,
           });
           const retryResult = await processQuery(retryQuery, routing, processingIds, config.providerName);
           if (retryResult.continuation) {
@@ -1082,10 +1089,18 @@ interface FlagIntent {
   stickyEffort?: string;
   turnEffort?: string;
   clearStickyEffort?: boolean;
+  stickyUltracode?: boolean;
+  turnUltracode?: boolean;
+  clearStickyUltracode?: boolean;
 }
 
 // Precedence: turn override → sticky → host-injected default (NANOCLAW_DEFAULT_EFFORT).
-function applyFlagBatch(messages: MessageInRow[], _routing: RoutingContext): { model?: string; effort?: string } {
+// ultracode follows the same precedence; effort is already forced to xhigh
+// host-side when ultracode is requested, so it rides alongside effort here.
+function applyFlagBatch(
+  messages: MessageInRow[],
+  _routing: RoutingContext,
+): { model?: string; effort?: string; ultracode?: boolean } {
   let intent: FlagIntent | undefined;
   for (const m of messages) {
     // Tasks carry flagIntent the same way chat messages do — used by scheduled
@@ -1114,10 +1129,20 @@ function applyFlagBatch(messages: MessageInRow[], _routing: RoutingContext): { m
     } else if (intent.stickyEffort) {
       setStickyEffort(intent.stickyEffort);
     }
+    if (intent.clearStickyUltracode) {
+      clearStickyUltracode();
+    } else if (intent.stickyUltracode) {
+      setStickyUltracode(true);
+    } else if (intent.stickyEffort !== undefined) {
+      // A plain effort change (stickyEffort set without the ultracode flag)
+      // turns ultracode off — `-e high` after `-e ultracode` means plain high.
+      clearStickyUltracode();
+    }
   }
 
   const model = intent?.turnModel ?? getStickyModel();
   const effort = intent?.turnEffort ?? getStickyEffort() ?? process.env.NANOCLAW_DEFAULT_EFFORT;
+  const ultracode = intent?.turnUltracode ?? getStickyUltracode() ?? false;
 
-  return { model, effort };
+  return { model, effort, ultracode };
 }

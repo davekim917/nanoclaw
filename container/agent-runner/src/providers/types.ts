@@ -112,6 +112,14 @@ export interface QueryInput {
 
   /** Per-turn effort level override (SDK option `effort`, first-class since Opus 4.6). */
   effort?: string;
+
+  /**
+   * Enable ultracode for the session (xhigh effort + standing dynamic-workflow
+   * orchestration). Set via `-e ultracode`. The Claude provider applies it via
+   * the Agent SDK `applyFlagSettings` control request; effort is already forced
+   * to xhigh upstream. Providers that don't support it ignore this field.
+   */
+  ultracode?: boolean;
 }
 
 export type McpServerConfig = StdioMcpServerConfig | HttpMcpServerConfig | SseMcpServerConfig;
