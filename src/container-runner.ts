@@ -2425,7 +2425,8 @@ async function buildContainerArgs(
       }
 
       await onecli.ensureAgent({
-        name: identity === agentIdentifier ? agentGroup.name : `${agentGroup.name} (no Slack — non-owner-safe sessions)`,
+        name:
+          identity === agentIdentifier ? agentGroup.name : `${agentGroup.name} (no Slack — non-owner-safe sessions)`,
         identifier: identity,
       });
       applyOnecliSecrets(identity, effectiveSecrets);
