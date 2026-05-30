@@ -54,19 +54,35 @@ are attributable to them.
 
 - **OneCLI installed and the gateway running.** Check: `onecli version` and
   `curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:10254` → `200`.
-  If not installed, run `/init-onecli` first.
+  **If it's not installed, don't send the user away — install it for them.**
+  OneCLI is the whole credential mechanism; `claude-ws` does nothing without it,
+  so there is no "skip OneCLI" path. Install the gateway + CLI (the local gateway
+  is a daemon on this machine, not a SaaS — but it does require a OneCLI account
+  to authenticate; have the user sign in when prompted):
+  ```bash
+  curl -fsSL onecli.sh/install | sh        # gateway daemon
+  curl -fsSL onecli.sh/cli/install | sh    # onecli CLI
+  ```
+  If `onecli` isn't found afterward it likely landed in `~/.local/bin` — add that
+  to PATH (`echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc`) and
+  re-check `onecli version`. The installer prints a `ONECLI_URL`; the gateway
+  should answer `200` at `http://127.0.0.1:10254`. Then `onecli auth status`
+  should show the user authenticated. (The `/init-onecli` skill is host-specific
+  — it migrates an existing NanoClaw `.env` into the vault and checks Docker — so
+  teammates on a plain laptop use the two installers above, not that skill.)
 - **Claude Code installed** and logged into the user's subscription
   (`claude` → `/login`).
 - **node** on PATH (the launcher reads the map with it).
 
 Confirm all four before continuing:
 ```bash
-command -v onecli >/dev/null && echo "onecli: ok" || echo "onecli: MISSING — run /init-onecli"
+command -v onecli >/dev/null && echo "onecli: ok" || echo "onecli: MISSING — install it (see above)"
 command -v claude >/dev/null && echo "claude: ok"  || echo "claude: MISSING"
 command -v node   >/dev/null && echo "node: ok"    || echo "node: MISSING"
 curl -s -o /dev/null -w 'gateway_http=%{http_code}\n' http://127.0.0.1:10254
 ```
-If the gateway isn't `200`, stop and get OneCLI running (`/init-onecli`).
+If the gateway isn't `200`, install/start OneCLI using the two installers above
+before continuing.
 
 ## Install the launcher files (both paths)
 
@@ -219,7 +235,10 @@ SSH-tunnel to the host gateway. The kit files are `$HOME`-relative and portable.
 
 ## Troubleshooting
 
-- **`onecli not found` / gateway not 200** → install/start OneCLI (`/init-onecli`).
+- **`onecli not found` / gateway not 200** → (re-)run the two `curl onecli.sh`
+  installers in Prerequisites; the gateway is a daemon the installer starts.
+  Confirm with `onecli version`, `onecli auth status`, and a `200` from
+  `http://127.0.0.1:10254`.
 - **401 on a service** → the identity lacks that secret. Operator: assign via the
   UI or `onecli agents set-secrets`. Teammate: connect the app at
   `http://127.0.0.1:10254` under that identity. Gateway matches on **host
