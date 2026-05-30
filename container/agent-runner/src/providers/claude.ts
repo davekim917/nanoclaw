@@ -778,6 +778,21 @@ function discoverPlugins(): SdkPluginConfig[] {
  */
 const CLAUDE_CODE_AUTO_COMPACT_WINDOW = process.env.CLAUDE_CODE_AUTO_COMPACT_WINDOW || '165000';
 
+/**
+ * Opus is only supported in its 1M-context form in this fork. Auto-append
+ * `[1m]` to a bare `claude-opus-X-Y` id before it reaches the SDK as the
+ * mainLoopModel. Load-bearing for the auto-compact window: the CLI grants the
+ * 1M window deterministically only when the model id literally carries `[1m]`
+ * (`PG(model) = /\[1m\]/.test(model)`). A bare opus id falls back to a gate
+ * (`firstParty && ANTHROPIC_BASE_URL===api.anthropic.com`) that is false under
+ * proxy auth, collapsing the window to 200k and force-compacting long sessions.
+ * Mirrors the host-side `ensureOpus1mSuffix` in src/flag-parser.ts. No-op for
+ * aliases (`opus`), non-opus ids, or ids that already carry a `[Nm]` suffix.
+ */
+function ensureOpus1mSuffix(model: string): string {
+  return /^claude-opus-\d+-\d+$/i.test(model) ? `${model}[1m]` : model;
+}
+
 // ── Provider ──
 
 /**
@@ -939,7 +954,10 @@ export class ClaudeProvider implements AgentProvider {
     const instructions = input.systemContext?.instructions;
 
     // Per-turn input takes precedence over sticky config (A3).
-    const model = input.model ?? this.stickyConfig.model;
+    // Normalize bare opus → [1m] so the CLI's auto-compact window stays at 1M
+    // regardless of auth path (see ensureOpus1mSuffix).
+    const rawModel = input.model ?? this.stickyConfig.model;
+    const model = rawModel ? ensureOpus1mSuffix(rawModel) : rawModel;
     const effort = input.effort ?? this.stickyConfig.effort;
     // ultracode is a session flag (xhigh + standing dynamic-workflow
     // orchestration), NOT an effort value — applied via the SDK control

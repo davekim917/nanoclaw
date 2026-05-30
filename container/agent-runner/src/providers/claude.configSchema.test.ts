@@ -79,7 +79,10 @@ describe('ClaudeProvider sticky config', () => {
     provider.query({ prompt: 'hi', cwd: '/tmp', continuation: undefined });
 
     expect(mockSdkQuery).toHaveBeenCalledTimes(1);
-    expect(capturedSdkOptions?.model).toBe('claude-opus-4-7');
+    // A bare claude-opus id is normalized to its [1m] form before reaching the
+    // SDK so the CLI's auto-compact window stays at 1M under proxy auth (a bare
+    // opus id otherwise collapses to a 200k window). See ensureOpus1mSuffix.
+    expect(capturedSdkOptions?.model).toBe('claude-opus-4-7[1m]');
     expect(capturedSdkOptions?.effort).toBe('high');
   });
 

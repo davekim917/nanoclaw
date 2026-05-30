@@ -55,14 +55,27 @@ const MODEL_ALIAS_MAP: Record<string, string> = {
 
 const VALID_MODEL_RE = /^(?:opus|sonnet|haiku|default|claude-(?:opus|sonnet|haiku)-\d+-\d+(?:\[\dm\])?)$/;
 
+/**
+ * Opus is only supported in its 1M-context form in this fork. Auto-append
+ * `[1m]` to a bare `claude-opus-X-Y` id. This is load-bearing for the
+ * compaction window: the Claude Code CLI grants the 1M auto-compact window
+ * deterministically only when the model id literally carries `[1m]`
+ * (`PG(model) = /\[1m\]/.test(model)` in the bundle). The bare-id fallback
+ * routes through a `firstParty && ANTHROPIC_BASE_URL===api.anthropic.com`
+ * gate (`Ee`/`S1`); under proxy auth (OneCLI gateway) that gate is false, so a
+ * bare opus id silently collapses to a 200k window and force-compacts long
+ * sessions (observed: an opus session auto-compacted at 372k instead of ~784k).
+ * Appending `[1m]` makes the 1M window unconditional regardless of auth path.
+ * No-op for aliases (`opus`), non-opus ids, or ids that already carry a
+ * `[Nm]` suffix.
+ */
+export function ensureOpus1mSuffix(model: string): string {
+  return /^claude-opus-\d+-\d+$/i.test(model) ? `${model}[1m]` : model;
+}
+
 function resolveModelAlias(raw: string): string {
   const mapped = MODEL_ALIAS_MAP[raw.toLowerCase()] ?? raw;
-  // Opus is only supported in its 1M-context form in this fork — auto-append
-  // [1m] when a caller passes a bare `claude-opus-*` id without a context
-  // suffix so ANTHROPIC_DEFAULT_OPUS_MODEL math and compaction-window math
-  // line up.
-  if (/^claude-opus-\d+-\d+$/i.test(mapped)) return `${mapped}[1m]`;
-  return mapped;
+  return ensureOpus1mSuffix(mapped);
 }
 
 /**

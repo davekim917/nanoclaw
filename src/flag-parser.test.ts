@@ -1,6 +1,23 @@
 import { describe, it, expect } from 'vitest';
 
-import { parseMessageFlags, formatFlagConfirmation } from './flag-parser.js';
+import { parseMessageFlags, formatFlagConfirmation, ensureOpus1mSuffix } from './flag-parser.js';
+
+describe('ensureOpus1mSuffix', () => {
+  it('appends [1m] to a bare claude-opus id (1M auto-compact window guard)', () => {
+    expect(ensureOpus1mSuffix('claude-opus-4-8')).toBe('claude-opus-4-8[1m]');
+    expect(ensureOpus1mSuffix('claude-opus-4-7')).toBe('claude-opus-4-7[1m]');
+  });
+
+  it('is a no-op when the [1m] suffix is already present', () => {
+    expect(ensureOpus1mSuffix('claude-opus-4-8[1m]')).toBe('claude-opus-4-8[1m]');
+  });
+
+  it('leaves family aliases and non-opus models untouched', () => {
+    expect(ensureOpus1mSuffix('opus')).toBe('opus');
+    expect(ensureOpus1mSuffix('claude-sonnet-4-6')).toBe('claude-sonnet-4-6');
+    expect(ensureOpus1mSuffix('claude-haiku-4-5')).toBe('claude-haiku-4-5');
+  });
+});
 
 describe('parseMessageFlags', () => {
   describe('no flags', () => {
