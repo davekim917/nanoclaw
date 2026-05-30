@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# claude-ws — launch local Claude Code with the same third-party access a
+# NanoClaw container agent has, scoped to a workstream's OneCLI vault identity.
+#
+#   claude-ws <workstream> [claude args...]
+#   claude-ws madison-reed
+#   claude-ws illysium -p "what's in the latest Linear cycle?"
+#   claude-ws --list
+#
+# Credentials (GitHub, Linear, Atlassian, Snowflake, Datafold, Gmail, ...) are
+# injected at the OneCLI gateway boundary — never on disk or in env in usable
+# form. Your Anthropic MODEL traffic stays on your local subscription login (the
+# parity shim bypasses api.anthropic.com). cd into your project first, like normal.
+set -euo pipefail
+
+CFG="${CLAUDE_WS_DIR:-$HOME/.config/claude-ws}"
+MAP="$CFG/workstreams.json"
+SHIM="$CFG/parity-shim.sh"
+
+die() { echo "claude-ws: $*" >&2; exit 1; }
+
+list_ws() {
+  node -e "const m=require(process.argv[1]);for(const k of Object.keys(m))console.error('  '+k+'  ->  '+(typeof m[k]==='string'?m[k]:m[k].agent))" "$MAP" 2>/dev/null \
+    || die "could not read $MAP"
+}
+
+[ -f "$MAP" ]  || die "missing map: $MAP (re-run /setup-local-claude)"
+[ -x "$SHIM" ] || die "shim not executable: $SHIM (chmod +x \"$SHIM\")"
+command -v onecli >/dev/null || die "onecli not found on PATH"
+command -v node   >/dev/null || die "node not found on PATH"
+
+if [ $# -lt 1 ] || [ "$1" = "-h" ] || [ "$1" = "--help" ] || [ "$1" = "--list" ]; then
+  echo "usage: claude-ws <workstream> [claude args...]" >&2
+  echo "workstreams:" >&2; list_ws
+  [ "${1:-}" = "--list" ] && exit 0 || exit 2
+fi
+
+WS="$1"; shift
+AGENT="$(node -e "const m=require(process.argv[1]);const v=m[process.argv[2]];if(!v)process.exit(3);process.stdout.write(typeof v==='string'?v:v.agent)" "$MAP" "$WS" 2>/dev/null || true)"
+if [ -z "$AGENT" ]; then
+  echo "claude-ws: unknown workstream '$WS'" >&2
+  echo "workstreams:" >&2; list_ws
+  exit 2
+fi
+
+# onecli run sets HTTPS_PROXY + CA + AOC_* for this identity, then execs the
+# parity shim, which adds the remaining container-parity env and runs claude.
+exec onecli run --agent "$AGENT" -- "$SHIM" "$@"
