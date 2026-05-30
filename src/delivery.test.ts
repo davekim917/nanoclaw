@@ -450,3 +450,97 @@ describe('assertChannelRoutingConsistency', () => {
     );
   });
 });
+
+describe('per-turn channel-root threading', () => {
+  // Insert a chat row with an explicit in_reply_to + timestamp so ordering is
+  // deterministic across the drain (getDueOutboundMessages sorts by timestamp).
+  function insertChatReply(
+    agentGroupId: string,
+    sessionId: string,
+    msgId: string,
+    inReplyTo: string | null,
+    ts: string,
+  ): void {
+    const db = new Database(outboundDbPath(agentGroupId, sessionId));
+    db.prepare(
+      `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, thread_id, in_reply_to, content)
+       VALUES (?, ?, 'chat', 'telegram:123', 'telegram', NULL, ?, ?)`,
+    ).run(msgId, ts, inReplyTo, JSON.stringify({ text: msgId }));
+    db.close();
+  }
+
+  it('threads a turn’s follow-up messages under the first root post', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    // Two messages, same turn (same in_reply_to), both thread-unbound — the
+    // scheduled-task shape: first posts at root, second replies under it.
+    insertChatReply('ag-1', session.id, 'out-1', 'task-fire-A', '2026-05-30T12:00:00.000Z');
+    insertChatReply('ag-1', session.id, 'out-2', 'task-fire-A', '2026-05-30T12:00:01.000Z');
+
+    const calls: Array<{ id: string; threadId: string | null }> = [];
+    let n = 0;
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, threadId, _kind, content) {
+        const id = (JSON.parse(content) as { text: string }).text;
+        calls.push({ id, threadId });
+        return `plat-${++n}`;
+      },
+    });
+
+    await deliverSessionMessages(session);
+
+    expect(calls).toHaveLength(2);
+    // First posts at root (no thread).
+    expect(calls[0]).toEqual({ id: 'out-1', threadId: null });
+    // Second threads under the first message's returned platform id.
+    expect(calls[1]).toEqual({ id: 'out-2', threadId: 'plat-1' });
+  });
+
+  it('starts a new root thread when the turn (in_reply_to) changes', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertChatReply('ag-1', session.id, 'out-1', 'task-fire-A', '2026-05-30T12:00:00.000Z');
+    insertChatReply('ag-1', session.id, 'out-2', 'task-fire-B', '2026-05-30T12:00:01.000Z');
+
+    const calls: Array<{ id: string; threadId: string | null }> = [];
+    let n = 0;
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, threadId, _kind, content) {
+        const id = (JSON.parse(content) as { text: string }).text;
+        calls.push({ id, threadId });
+        return `plat-${++n}`;
+      },
+    });
+
+    await deliverSessionMessages(session);
+
+    expect(calls).toHaveLength(2);
+    // Different fires (in_reply_to) → each posts at its own root.
+    expect(calls[0]).toEqual({ id: 'out-1', threadId: null });
+    expect(calls[1]).toEqual({ id: 'out-2', threadId: null });
+  });
+
+  it('leaves an agent-targeted thread_id untouched (no anchoring)', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    // thread_id explicitly set — a per-thread reply, not a root post.
+    const db = new Database(outboundDbPath('ag-1', session.id));
+    db.prepare(
+      `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, thread_id, in_reply_to, content)
+       VALUES ('out-1', '2026-05-30T12:00:00.000Z', 'chat', 'telegram:123', 'telegram', 'thr-9', 'task-fire-A', ?)`,
+    ).run(JSON.stringify({ text: 'out-1' }));
+    db.close();
+
+    const calls: Array<{ threadId: string | null }> = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, threadId) {
+        calls.push({ threadId });
+        return 'plat-1';
+      },
+    });
+
+    await deliverSessionMessages(session);
+
+    expect(calls).toEqual([{ threadId: 'thr-9' }]);
+  });
+});

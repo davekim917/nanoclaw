@@ -80,6 +80,35 @@ interface StatusTrack {
 const statusTracking = new Map<string, StatusTrack>();
 
 /**
+ * Per-session anchor for threading a turn's multiple channel-root messages.
+ *
+ * When a session emits several user-facing messages in one turn to a channel
+ * *root* — i.e. the outbound row's `thread_id` is null because the session
+ * isn't bound to a thread — the first message posts fresh and becomes the
+ * thread parent; later messages of the same turn reply under it instead of
+ * each landing as a separate top-level post.
+ *
+ * This is the only correct fix for scheduled-task sessions: a scheduled task
+ * MUST stay thread-unbound (binding it to a thread would tie its lifetime to
+ * a session that dies), so the anchor lives delivery-side, keyed by the
+ * turn's `in_reply_to`. Each fire of a recurring task gets a fresh inbound
+ * id, so a long-lived poller (e.g. the every-15-min inbox poller) starts a
+ * NEW thread every fire rather than chaining days of output under one
+ * ancient root post.
+ *
+ * Sessions already bound to a thread (per-thread channel replies carry a
+ * non-null `thread_id`) are untouched — the anchor only engages when
+ * `thread_id` is null AND `in_reply_to` is set.
+ */
+interface ChatThreadAnchor {
+  inReplyTo: string;
+  channelType: string;
+  platformId: string;
+  messageId: string;
+}
+const chatThreadAnchor = new Map<string, ChatThreadAnchor>();
+
+/**
  * Sessions whose outbound queue is currently being drained.
  *
  * The active poll (1s, running sessions) and the sweep poll (60s, all
@@ -626,14 +655,48 @@ async function deliverMessage(
   // thinking bubble remains a single growing message; only the final
   // answer separates out into its own message at the bottom.
 
+  // Per-turn channel-root threading (see ChatThreadAnchor above). Only
+  // engages when the agent didn't already target a thread (thread_id null)
+  // and the turn has an inbound anchor (in_reply_to set). The first message
+  // of the turn posts at root and is recorded below; later messages of the
+  // same turn reply under it so a scheduled task's follow-ups thread instead
+  // of stacking as separate top-level posts.
+  const baseThreadId = msg.thread_id && msg.thread_id.length > 0 ? msg.thread_id : null;
+  const anchorEligible = baseThreadId === null && msg.in_reply_to != null;
+  let effectiveThreadId = baseThreadId;
+  if (anchorEligible) {
+    const anchor = chatThreadAnchor.get(session.id);
+    if (
+      anchor &&
+      anchor.inReplyTo === msg.in_reply_to &&
+      anchor.channelType === msg.channel_type &&
+      anchor.platformId === msg.platform_id
+    ) {
+      effectiveThreadId = anchor.messageId;
+    }
+  }
+
   const platformMsgId = await deliveryAdapter.deliver(
     msg.channel_type,
     msg.platform_id,
-    msg.thread_id,
+    effectiveThreadId,
     msg.kind,
     scrubbedContent,
     files,
   );
+
+  // Record the turn's first root post as the anchor for its follow-ups. Only
+  // when we actually posted at root (effectiveThreadId still null) — a message
+  // that already threaded under an existing anchor must not overwrite it, or
+  // the third message would chain off the second instead of the first.
+  if (anchorEligible && effectiveThreadId === null && platformMsgId) {
+    chatThreadAnchor.set(session.id, {
+      inReplyTo: msg.in_reply_to as string,
+      channelType: msg.channel_type,
+      platformId: msg.platform_id,
+      messageId: platformMsgId,
+    });
+  }
   log.info('Message delivered', {
     id: msg.id,
     channelType: msg.channel_type,
