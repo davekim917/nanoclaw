@@ -649,7 +649,7 @@ export function buildSessionServicesSnapshot(
   //   - owner-safe session (owner 1:1 DM, or messaging_group in
   //     slack_user_token.also_allowed_in): the Slack OneCLI secret is injected
   //     → the agent has live Slack read access here.
-  //   - shared session (anything else): the host spawns under the `-noslack`
+  //   - non-owner-safe session (anything else): the host spawns under the `-noslack`
   //     OneCLI identity with the Slack secret WITHHELD → no Slack access here,
   //     by design, so teammates can't extract the owner's Slack through the
   //     agent. (See isOwnerSafeSlackSession + the two-tier identity in
@@ -689,7 +689,7 @@ export function buildSessionServicesSnapshot(
       // Shared session: Slack is genuinely withheld here. Be explicit so the
       // agent does NOT try curl/MCP and does NOT promise the owner a read.
       useFor =
-        'WITHHELD IN THIS SESSION (by design): this is a shared (non-owner-safe) session, so the Slack user token is NOT injected into your OneCLI agent. You CANNOT read the owner’s Slack DMs/channels/threads here — `curl https://slack.com/api/*` will fail auth and the user-token MCP is not loaded. This protects the owner’s Slack from being queried by others through you. `resolve_thread_link` still resolves a pasted Slack/Discord permalink from the workgroup archive (`/workspace/archive.db`). If you genuinely need live Slack here, tell the owner to add this messaging group to `slack_user_token.also_allowed_in`.';
+        'WITHHELD IN THIS SESSION (by design): this session is not one of the owner’s private/owner-safe Slack contexts (their 1:1 DM, or a messaging group in `slack_user_token.also_allowed_in`), so the Slack user token is NOT injected into your OneCLI agent. You CANNOT read the owner’s Slack DMs/channels/threads here — `curl https://slack.com/api/*` will fail auth and the user-token MCP is not loaded. This protects the owner’s Slack from being queried by others through you. (Unrelated to `session_mode` — every channel is still per-thread; this is purely about whose Slack credentials are in scope.) `resolve_thread_link` still resolves a pasted Slack/Discord permalink from the workgroup archive (`/workspace/archive.db`). If you genuinely need live Slack here, tell the owner to add this messaging group to `slack_user_token.also_allowed_in`.';
     } else {
       // Owner-safe session, or group-level/no-session snapshot. Describe the
       // layered access: MCP first (when present), proxy floor underneath.
@@ -700,18 +700,18 @@ export function buildSessionServicesSnapshot(
         ? 'Convenience layer (prefer when loaded): the user-token MCP `mcp__slack-user-token__*` (`conversations_history`, `conversations_replies`, `conversations_search_messages`) — structured Slack reads. Registered in owner-safe sessions (owner DM, or an allow-listed context). If it isn’t in your tool list, that does NOT mean you lack Slack — use the proxy floor. '
         : '';
       const availability = !sessionKnown
-        ? 'Availability is session-scoped: present in owner-safe sessions (the owner’s 1:1 DM, or a messaging group in `slack_user_token.also_allowed_in`); withheld in shared sessions. '
+        ? 'Availability is scoped to owner-safe Slack contexts (NOT the same thing as `session_mode` — every channel stays per-thread): present in the owner’s 1:1 DM or a messaging group in `slack_user_token.also_allowed_in`; withheld everywhere else. '
         : '';
       // Bottom line must match what we actually know:
       //   - no Slack secret at all → weak generic nudge.
       //   - session known + owner-safe → assert access in THIS session.
       //   - session unknown (group-level fragment) → state the session-scoped
-      //     rule WITHOUT claiming access here, since shared sessions withhold.
+      //     rule WITHOUT claiming access here, since non-owner-safe sessions withhold.
       const bottomLine = !hasSlackSecret
         ? 'Bottom line: before telling the owner you can’t read a DM/thread/quoted message, check your tools and try `resolve_thread_link`.'
         : sessionKnown
           ? 'Bottom line: you have live Slack read access in THIS session — never tell the owner you can’t read a DM/thread/quoted message without first trying the MCP (if loaded) or `curl https://slack.com/api/auth.test`, plus `resolve_thread_link`.'
-          : 'Bottom line: in owner-safe sessions you have live Slack read access (use the MCP if loaded, else the curl floor); shared sessions withhold it. Confirm for the current session via your tool list or `get_capabilities` before telling the owner you can’t read something.';
+          : 'Bottom line: in owner-safe Slack contexts you have live Slack read access (use the MCP if loaded, else the curl floor); everywhere else it is withheld. Confirm for the current session via your tool list or `get_capabilities` before telling the owner you can’t read something.';
       useFor =
         availability +
         mcp +

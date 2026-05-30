@@ -446,7 +446,7 @@ describe('isOwnerSafeSlackSession — credential-layer predicate', () => {
     expect(isOwnerSafeSlackSession(db, 'ag-bo-codex', 'mg-bo-codex-dm', undefined)).toBe(true);
   });
 
-  it('group channel is NOT owner-safe by default (→ shared → Slack withheld)', () => {
+  it('group channel is NOT owner-safe by default (→ non-owner-safe → Slack withheld)', () => {
     expect(isOwnerSafeSlackSession(db, 'ag-bo', 'mg-team-eng', undefined)).toBe(false);
   });
 

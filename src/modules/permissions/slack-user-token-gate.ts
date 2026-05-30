@@ -113,7 +113,10 @@ export function canUseSlackUserToken(
  *     platform-prefix + workgroup match documented below).
  *
  * Fail-closed: no messaging group (admin shell) → NOT owner-safe → Slack
- * withheld. Anything not provably owner-safe is treated as shared.
+ * withheld. Anything not provably owner-safe is non-owner-safe (Slack
+ * withheld). NOTE: "owner-safe" is a Slack-credential-trust classification
+ * and has nothing to do with `session_mode` (per-thread vs shared) — every
+ * channel can be per-thread and still be non-owner-safe for Slack purposes.
  */
 export function isOwnerSafeSlackSession(
   db: Database.Database,

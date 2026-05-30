@@ -2386,11 +2386,13 @@ async function buildContainerArgs(
       // boundary (the MCP half is canUseSlackUserToken below). The OneCLI
       // agent identity is per-GROUP, so all sessions of this group share one
       // secret set; we cannot strip Slack per-session on a single identity
-      // without racing concurrent sessions. Instead, shared (non-owner-safe)
-      // sessions spawn under a SECOND identity `<group>-noslack` whose secret
-      // set excludes the Slack user token. The proxy then has no Slack token
-      // to inject for that container → both `curl slack.com/api/*` and the MCP
-      // fail closed. Owner-safe sessions (owner DM or also_allowed_in) keep the
+      // without racing concurrent sessions. Instead, non-owner-safe sessions
+      // (a Slack-credential-trust classification — NOTHING to do with
+      // session_mode; every channel stays per-thread) spawn under a SECOND
+      // identity `<group>-noslack` whose secret set excludes the Slack user
+      // token. The proxy then has no Slack token to inject for that container →
+      // both `curl slack.com/api/*` and the MCP fail closed. Owner-safe sessions
+      // (owner DM or also_allowed_in) keep the
       // primary identity + full set. Only ONE extra identity per affected
       // group, so well clear of the gateway's list-pagination ceiling.
       //
@@ -2413,7 +2415,7 @@ async function buildContainerArgs(
         if (!ownerSafe) {
           identity = `${agentIdentifier}-noslack`;
           effectiveSecrets = mergedSecrets.filter((s) => !slackSecrets.includes(s));
-          log.info('Slack user-token secret withheld for shared session', {
+          log.info('Slack user-token secret withheld for non-owner-safe session', {
             folder: agentGroup.folder,
             sessionMessagingGroupId: sessionMessagingGroupId ?? null,
             withheld: slackSecrets,
@@ -2423,7 +2425,7 @@ async function buildContainerArgs(
       }
 
       await onecli.ensureAgent({
-        name: identity === agentIdentifier ? agentGroup.name : `${agentGroup.name} (no Slack — shared sessions)`,
+        name: identity === agentIdentifier ? agentGroup.name : `${agentGroup.name} (no Slack — non-owner-safe sessions)`,
         identifier: identity,
       });
       applyOnecliSecrets(identity, effectiveSecrets);
