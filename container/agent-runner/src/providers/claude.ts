@@ -344,13 +344,26 @@ const OAUTH_FALLBACK_RE = /^CLAUDE_CODE_OAUTH_TOKEN_(\d+)$/;
 const RETRYABLE_ERROR_RE = /429|rate[\s_-]?limit|overloaded|upstream_error|External provider returned|subscription_quota_exhausted/i;
 
 // Claude Max subscription quota exhaustion. The Agent SDK delivers this
-// as a plain result-text string ("You're out of extra usage · resets …")
-// rather than a thrown error or a `rate_limit_event` system message, so
-// neither the catch-block rotation nor the in-stream rate_limit_event
-// path triggers. Detect the text and re-throw to engage rotation.
-// Strict-anchored to avoid false-positives on agent prose that mentions
-// "usage" in passing.
-const QUOTA_RESULT_RE = /^\s*You'?re out of (extra |daily |weekly )?usage\b/i;
+// as a plain result-text string rather than a thrown error or a
+// `rate_limit_event` system message, so neither the catch-block rotation
+// nor the in-stream rate_limit_event path triggers. Detect the text and
+// re-throw to engage rotation.
+//
+// Two distinct surfacings, both handled here:
+//   - weekly/extra cap: "You're out of extra usage · resets …"
+//   - 5-hour session-window cap: "You've hit your session limit · resets …"
+// The session-window wording ("You've hit your … limit") is newer and was
+// NOT matched by the original usage-only regex, so rotation silently failed
+// and the dead-stop quota message was dispatched to the user instead of
+// advancing to the next OAuth fallback.
+//
+// Strict-anchored on the "You're/You've …" sentence opener to avoid
+// false-positives on agent prose that mentions "usage" or "limit" in passing.
+// The apostrophe class tolerates both straight (U+0027, what the SDK emits
+// today) and curly (U+2019) so a typographic change upstream can't silently
+// re-break rotation.
+export const QUOTA_RESULT_RE =
+  /^\s*You['’]?(re|ve) (out of (extra |daily |weekly )?usage|(hit|reached) your (session |usage |weekly )?limit)\b/i;
 
 // Secrets the SDK needs for API auth but that Bash subprocesses must not see.
 // Built lazily inside the hook so late-bound env additions are covered.
