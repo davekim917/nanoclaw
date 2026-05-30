@@ -79,10 +79,51 @@ export function canUseSlackUserToken(
   sessionMessagingGroupId: string | null,
   config: SlackUserTokenConfig | undefined,
 ): boolean {
+  // The MCP-capability grant (`enabled`) AND the owner-safe context check
+  // must both hold. The owner-safe check is the same predicate that now
+  // also governs whether the Slack OneCLI secret is injected at the proxy
+  // layer (see isOwnerSafeSlackSession + container-runner two-tier identity),
+  // so the MCP and the curl floor share ONE boundary instead of the old
+  // split where the MCP was gated but the proxy token leaked everywhere.
   if (!config?.enabled) return false;
+  return isOwnerSafeSlackSession(db, agentGroupId, sessionMessagingGroupId, config.also_allowed_in);
+}
+
+/**
+ * Is this session a context where the OWNER's Slack may be read on the
+ * owner's behalf — i.e., a private space the operator controls, with no
+ * non-owner human able to query through the agent?
+ *
+ * This is the single source of truth for Slack user-token authorization,
+ * consumed by BOTH:
+ *   - `canUseSlackUserToken` (whether the Slack user-token MCP is spawned), and
+ *   - the spawn-time credential gate (whether the Slack OneCLI secret is
+ *     injected into this session's OneCLI agent — the curl/proxy floor).
+ *
+ * Independent of `slack_user_token.enabled`: a group may carry the Slack
+ * OneCLI secret without enabling the MCP, and we still want the curl floor
+ * scoped to owner-safe sessions only.
+ *
+ * Owner-safe iff EITHER:
+ *   - `sessionMessagingGroupId` is in the operator-curated `also_allowed_in`
+ *     allow-list (trusted private contexts — e.g. the owner's personal
+ *     Discord server channel, which is is_group=1 and so can't be derived as
+ *     owner-only without an explicit signal), OR
+ *   - the session is the owner's 1:1 DM with this agent (the handle +
+ *     platform-prefix + workgroup match documented below).
+ *
+ * Fail-closed: no messaging group (admin shell) → NOT owner-safe → Slack
+ * withheld. Anything not provably owner-safe is treated as shared.
+ */
+export function isOwnerSafeSlackSession(
+  db: Database.Database,
+  agentGroupId: string,
+  sessionMessagingGroupId: string | null,
+  alsoAllowedIn: string[] | undefined,
+): boolean {
   if (!sessionMessagingGroupId) return false;
 
-  if (config.also_allowed_in?.includes(sessionMessagingGroupId)) return true;
+  if (alsoAllowedIn?.includes(sessionMessagingGroupId)) return true;
 
   // The default safe path. Requires ALL of:
   //   1. session's messaging_group is a 1:1 DM (is_group = 0) and is wired

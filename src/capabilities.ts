@@ -23,7 +23,10 @@ import path from 'path';
 import { GROUPS_DIR } from './config.js';
 import { getRegisteredChannelNames } from './channels/channel-registry.js';
 import { readContainerConfig } from './container-config.js';
-import { getAllAgentGroups, getAgentGroup } from './db/agent-groups.js';
+import { getDb } from './db/connection.js';
+import { getAllAgentGroups, getAgentGroup, getWorkgroupOnecliSecrets } from './db/agent-groups.js';
+import { mergeWorkgroupAndGroupSecrets, slackUserTokenSecrets } from './onecli-secrets.js';
+import { isOwnerSafeSlackSession } from './modules/permissions/slack-user-token-gate.js';
 import { getAllMessagingGroups } from './db/messaging-groups.js';
 import { extractToolScopes } from './scoped-env.js';
 
@@ -245,7 +248,10 @@ function yamlTopLevelKeys(absPath: string): string[] {
   }
 }
 
-export function buildSessionServicesSnapshot(agentGroupId: string): SessionServicesSnapshot {
+export function buildSessionServicesSnapshot(
+  agentGroupId: string,
+  sessionMessagingGroupId?: string | null,
+): SessionServicesSnapshot {
   const ag = getAgentGroup(agentGroupId);
   const cfg = ag ? readContainerConfig(ag.folder) : undefined;
   // Env-scoped services (Looker, dbt-mcp, dbt Cloud, GitHub, Render) resolve
@@ -637,33 +643,92 @@ export function buildSessionServicesSnapshot(agentGroupId: string): SessionServi
     });
   }
 
-  // Slack read access — gated by container.json `slack_user_token.enabled`
-  // (the capability grant). The user-token MCP (korotovsky/slack-mcp-server)
-  // is registered per-spawn ONLY in the owner's 1:1 DM (canUseSlackUserToken),
-  // so the entry describes it conditionally. Added because Slack was absent
-  // from this snapshot, which left the agent GUESSING its Slack abilities —
-  // it wrongly told the owner it couldn't read DMs or resolve a link, both
-  // false in an owner DM. `resolve_thread_link` works regardless of token.
-  if (cfg?.slack_user_token?.enabled) {
-    // No top-level mcpNamespace: this snapshot is group-level (no session
-    // context), and the user-token MCP is registered ONLY in the owner's 1:1
-    // DM (canUseSlackUserToken). Emitting it as a "wired now" namespace would
-    // overclaim in group-channel/non-owner sessions where the host strips it.
-    // The useFor states the session-dependence explicitly instead.
-    services.push({
-      name: 'Slack (read — owner DM only)',
-      declaredTools: [],
-      scopes: [],
-      credentialPaths: [],
-      useFor:
-        "Reading Slack from the owner's lens — AVAILABILITY IS SESSION-DEPENDENT, check your actual tool list. ONLY in the owner's 1:1 DM with you is the Slack user-token MCP loaded (`mcp__slack-user-token__*` — `conversations_history`, `conversations_replies`, `conversations_search_messages`): read the owner's DMs, group DMs, channels they're in, threads, search. In group channels it is NOT loaded (owner-DM-only, by design) — do not assume those tools exist there. ALWAYS available regardless of session: `resolve_thread_link` resolves a pasted Slack OR Discord permalink from the workgroup chat archive (`/workspace/archive.db`). The BOT token can post + read channels the bot is in but cannot read arbitrary DMs. Bottom line: before telling the user you can't read a DM/thread/quoted message, check your tools and try `resolve_thread_link`.",
-    });
+  // Slack read access — SESSION-AWARE, because the user-token (which reads the
+  // OWNER's Slack lens) is scoped per session by the owner-safe boundary:
+  //
+  //   - owner-safe session (owner 1:1 DM, or messaging_group in
+  //     slack_user_token.also_allowed_in): the Slack OneCLI secret is injected
+  //     → the agent has live Slack read access here.
+  //   - shared session (anything else): the host spawns under the `-noslack`
+  //     OneCLI identity with the Slack secret WITHHELD → no Slack access here,
+  //     by design, so teammates can't extract the owner's Slack through the
+  //     agent. (See isOwnerSafeSlackSession + the two-tier identity in
+  //     container-runner.)
+  //
+  // Layering of the access (when present), correct shape — MCP first, proxy
+  // floor underneath:
+  //   - Convenience layer: the user-token MCP (`mcp__slack-user-token__*`),
+  //     registered per-spawn in owner-safe sessions when slack_user_token is
+  //     enabled. Structured — prefer it when loaded.
+  //   - Floor: direct Slack Web API via the OneCLI proxy (`curl
+  //     https://slack.com/api/*`, no auth header — the proxy injects the
+  //     token). ALWAYS available when the secret is in-session, so the agent
+  //     must never conclude "no Slack access" just because the MCP isn't
+  //     loaded.
+  // `resolve_thread_link` (archive) works in any session regardless.
+  const mergedSecrets = mergeWorkgroupAndGroupSecrets(getWorkgroupOnecliSecrets(agentGroupId), cfg?.onecliSecrets);
+  const hasSlackSecret = slackUserTokenSecrets(mergedSecrets, cfg?.slack_user_token?.onecli_secret_names).length > 0;
+  const slackMcpEnabled = !!cfg?.slack_user_token?.enabled;
+  if (hasSlackSecret || slackMcpEnabled) {
+    // ownerSafe is only knowable with a session context. When the snapshot is
+    // built group-level (no session — e.g. the get_capabilities tool with no
+    // messaging group), describe the capability generically rather than
+    // fail-closed-withholding, which would under-claim.
+    const sessionKnown = sessionMessagingGroupId !== undefined;
+    const ownerSafe =
+      sessionKnown &&
+      isOwnerSafeSlackSession(
+        getDb(),
+        agentGroupId,
+        sessionMessagingGroupId ?? null,
+        cfg?.slack_user_token?.also_allowed_in,
+      );
+
+    let useFor: string;
+    if (hasSlackSecret && sessionKnown && !ownerSafe) {
+      // Shared session: Slack is genuinely withheld here. Be explicit so the
+      // agent does NOT try curl/MCP and does NOT promise the owner a read.
+      useFor =
+        'WITHHELD IN THIS SESSION (by design): this is a shared (non-owner-safe) session, so the Slack user token is NOT injected into your OneCLI agent. You CANNOT read the owner’s Slack DMs/channels/threads here — `curl https://slack.com/api/*` will fail auth and the user-token MCP is not loaded. This protects the owner’s Slack from being queried by others through you. `resolve_thread_link` still resolves a pasted Slack/Discord permalink from the workgroup archive (`/workspace/archive.db`). If you genuinely need live Slack here, tell the owner to add this messaging group to `slack_user_token.also_allowed_in`.';
+    } else {
+      // Owner-safe session, or group-level/no-session snapshot. Describe the
+      // layered access: MCP first (when present), proxy floor underneath.
+      const floor = hasSlackSecret
+        ? 'Floor (always available when you have Slack access — reach for this whenever the MCP isn’t loaded): direct Slack Web API through the OneCLI proxy. `curl https://slack.com/api/<method>` with NO auth header; the proxy injects the user token at the boundary. `auth.test` to confirm identity, then `conversations.history`, `conversations.replies`, `search.messages`, `conversations.list`, `users.info`, etc. Reads everything the owner can see. '
+        : '';
+      const mcp = slackMcpEnabled
+        ? 'Convenience layer (prefer when loaded): the user-token MCP `mcp__slack-user-token__*` (`conversations_history`, `conversations_replies`, `conversations_search_messages`) — structured Slack reads. Registered in owner-safe sessions (owner DM, or an allow-listed context). If it isn’t in your tool list, that does NOT mean you lack Slack — use the proxy floor. '
+        : '';
+      const availability = !sessionKnown
+        ? 'Availability is session-scoped: present in owner-safe sessions (the owner’s 1:1 DM, or a messaging group in `slack_user_token.also_allowed_in`); withheld in shared sessions. '
+        : '';
+      // Bottom line must match what we actually know:
+      //   - no Slack secret at all → weak generic nudge.
+      //   - session known + owner-safe → assert access in THIS session.
+      //   - session unknown (group-level fragment) → state the session-scoped
+      //     rule WITHOUT claiming access here, since shared sessions withhold.
+      const bottomLine = !hasSlackSecret
+        ? 'Bottom line: before telling the owner you can’t read a DM/thread/quoted message, check your tools and try `resolve_thread_link`.'
+        : sessionKnown
+          ? 'Bottom line: you have live Slack read access in THIS session — never tell the owner you can’t read a DM/thread/quoted message without first trying the MCP (if loaded) or `curl https://slack.com/api/auth.test`, plus `resolve_thread_link`.'
+          : 'Bottom line: in owner-safe sessions you have live Slack read access (use the MCP if loaded, else the curl floor); shared sessions withhold it. Confirm for the current session via your tool list or `get_capabilities` before telling the owner you can’t read something.';
+      useFor =
+        availability +
+        mcp +
+        floor +
+        '`resolve_thread_link` resolves a pasted Slack OR Discord permalink from the workgroup chat archive (`/workspace/archive.db`) in any session. The BOT token can post + read channels the bot is in but cannot read arbitrary DMs. ' +
+        bottomLine;
+    }
+    services.push({ name: 'Slack (read)', declaredTools: [], scopes: [], credentialPaths: [], useFor });
   }
 
   return { agentGroupId, services };
 }
 
-export function getHostCapabilities(forAgentGroupId?: string): HostCapabilities {
+export function getHostCapabilities(
+  forAgentGroupId?: string,
+  sessionMessagingGroupId?: string | null,
+): HostCapabilities {
   const registered = getRegisteredChannelNames();
 
   const messagingGroups = getAllMessagingGroups();
@@ -716,6 +781,6 @@ export function getHostCapabilities(forAgentGroupId?: string): HostCapabilities 
     agentGroups,
     messagingGroupsByChannel: byChannel,
     credentialEnvSet,
-    session: forAgentGroupId ? buildSessionServicesSnapshot(forAgentGroupId) : undefined,
+    session: forAgentGroupId ? buildSessionServicesSnapshot(forAgentGroupId, sessionMessagingGroupId) : undefined,
   };
 }

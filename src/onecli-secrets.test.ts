@@ -1,6 +1,12 @@
 import { describe, expect, test, vi, beforeEach, afterEach } from 'vitest';
 
-import { applyOnecliSecrets, mergeWorkgroupAndGroupSecrets, __resetCachesForTest, __test } from './onecli-secrets.js';
+import {
+  applyOnecliSecrets,
+  mergeWorkgroupAndGroupSecrets,
+  slackUserTokenSecrets,
+  __resetCachesForTest,
+  __test,
+} from './onecli-secrets.js';
 
 // Mock child_process.execFileSync so we don't actually shell out to `onecli`
 // during tests. Hoisted via vi.mock so it applies before the module imports.
@@ -323,5 +329,36 @@ describe('mergeWorkgroupAndGroupSecrets — C3', () => {
   test('handles both undefined', () => {
     const result = mergeWorkgroupAndGroupSecrets(undefined, undefined);
     expect(result).toEqual([]);
+  });
+});
+
+describe('slackUserTokenSecrets', () => {
+  const merged = ['Anthropic', 'Slack-User-Token-Madison-Reed', 'Slack-Bot-Token-MR', 'GranolaAPI'];
+
+  test('convention match selects the user-token secret, not the bot token', () => {
+    expect(slackUserTokenSecrets(merged)).toEqual(['Slack-User-Token-Madison-Reed']);
+  });
+
+  test('convention is case-insensitive', () => {
+    expect(slackUserTokenSecrets(['slack-USER-token-x'])).toEqual(['slack-USER-token-x']);
+  });
+
+  test('explicit names take precedence over the convention', () => {
+    // An explicitly-named secret that does NOT match the convention is still
+    // selected; a convention-matching secret NOT in the explicit list is not.
+    expect(slackUserTokenSecrets(['Slack-MR', 'Slack-User-Token-Madison-Reed'], ['Slack-MR'])).toEqual(['Slack-MR']);
+  });
+
+  test('explicit match is case-insensitive and returns names as they appear', () => {
+    expect(slackUserTokenSecrets(['Slack-MR'], ['slack-mr'])).toEqual(['Slack-MR']);
+  });
+
+  test('no match returns empty', () => {
+    expect(slackUserTokenSecrets(['Anthropic', 'GranolaAPI'])).toEqual([]);
+    expect(slackUserTokenSecrets([])).toEqual([]);
+  });
+
+  test('empty explicit list falls back to convention', () => {
+    expect(slackUserTokenSecrets(merged, [])).toEqual(['Slack-User-Token-Madison-Reed']);
   });
 });

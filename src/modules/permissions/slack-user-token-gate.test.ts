@@ -1,7 +1,7 @@
 import Database from 'better-sqlite3';
 import { describe, expect, it, beforeEach } from 'vitest';
 
-import { canUseSlackUserToken } from './slack-user-token-gate.js';
+import { canUseSlackUserToken, isOwnerSafeSlackSession } from './slack-user-token-gate.js';
 
 /**
  * Mini-schema for gate tests. Mirrors the relevant columns from production
@@ -421,5 +421,42 @@ describe('canUseSlackUserToken — permission gate', () => {
         also_allowed_in: ['mg-cold'],
       }),
     ).toBe(true);
+  });
+});
+
+describe('isOwnerSafeSlackSession — credential-layer predicate', () => {
+  let db: Database.Database;
+
+  beforeEach(() => {
+    db = makeDb();
+    seedMrWorkgroup(db);
+  });
+
+  it('is independent of slack_user_token.enabled (no config arg at all)', () => {
+    // The credential layer reuses this WITHOUT the enabled flag — a group can
+    // carry the Slack secret for curl without registering the MCP.
+    expect(isOwnerSafeSlackSession(db, 'ag-bo', 'mg-bo-dm', undefined)).toBe(true);
+  });
+
+  it('owner 1:1 DM is owner-safe', () => {
+    expect(isOwnerSafeSlackSession(db, 'ag-bo', 'mg-bo-dm', undefined)).toBe(true);
+  });
+
+  it('sibling Codex DM is owner-safe via workgroup match', () => {
+    expect(isOwnerSafeSlackSession(db, 'ag-bo-codex', 'mg-bo-codex-dm', undefined)).toBe(true);
+  });
+
+  it('group channel is NOT owner-safe by default (→ shared → Slack withheld)', () => {
+    expect(isOwnerSafeSlackSession(db, 'ag-bo', 'mg-team-eng', undefined)).toBe(false);
+  });
+
+  it('group channel becomes owner-safe when listed in also_allowed_in', () => {
+    // This is exactly how Dave's personal Discord channel (is_group=1) is
+    // marked owner-safe so siblings keep full Slack there.
+    expect(isOwnerSafeSlackSession(db, 'ag-bo', 'mg-team-eng', ['mg-team-eng'])).toBe(true);
+  });
+
+  it('no messaging group (admin shell) is NOT owner-safe — fail-closed', () => {
+    expect(isOwnerSafeSlackSession(db, 'ag-bo', null, ['mg-team-eng'])).toBe(false);
   });
 });

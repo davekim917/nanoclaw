@@ -346,6 +346,23 @@ export interface SlackUserTokenConfig {
    * data/v2.db "SELECT id, name FROM messaging_groups"` to find ids.
    */
   also_allowed_in?: string[];
+
+  /**
+   * Names (or UUIDs) of the OneCLI secrets that back Slack user-token access
+   * for this agent — the credentials that let it read the OWNER's Slack via
+   * the proxy (`curl https://slack.com/api/*`) or the MCP. In SHARED sessions
+   * (not owner-safe per `also_allowed_in` / owner-DM) these secrets are
+   * WITHHELD from the session's OneCLI agent, so neither curl nor the MCP can
+   * reach Slack — the boundary is enforced at the credential layer, not just
+   * the MCP registration.
+   *
+   * When unset, the host falls back to a naming convention: any merged
+   * OneCLI secret whose name contains both "slack" and "user" (case-
+   * insensitive — matches `Slack-User-Token-*`). Set this explicitly when
+   * your secret doesn't follow that convention, so the security control
+   * doesn't rely on a regex guess. See `slackUserTokenSecrets`.
+   */
+  onecli_secret_names?: string[];
 }
 
 function emptyConfig(): ContainerConfig {

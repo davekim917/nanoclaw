@@ -256,6 +256,39 @@ export function mergeWorkgroupAndGroupSecrets(
   return ordered;
 }
 
+/**
+ * Identify which of the given OneCLI secret names back Slack USER-token
+ * access — the credentials that let an agent read the owner's Slack DMs/
+ * threads (via the proxy or the korotovsky MCP). The host withholds exactly
+ * these from a session's OneCLI agent when the session is not owner-safe, so
+ * teammates in a shared channel can't extract the owner's Slack through the
+ * agent. See `isOwnerSafeSlackSession` + the two-tier identity in
+ * container-runner.
+ *
+ * Resolution:
+ *   - If `explicitNames` is provided (from `slack_user_token.onecli_secret_names`),
+ *     it is authoritative: return the intersection of it with `secrets`
+ *     (case-insensitive). No convention guessing.
+ *   - Otherwise fall back to the naming convention: a secret whose name
+ *     contains BOTH "slack" and "user" (case-insensitive) — matches
+ *     `Slack-User-Token-*` while excluding bot-token secrets like
+ *     `Slack-Bot-Token-*` (bot tokens can't read arbitrary DMs, so they
+ *     aren't owner-Slack-sensitive in the same way).
+ *
+ * Returns the matching names AS THEY APPEAR in `secrets` (so callers can
+ * filter the merged list by identity).
+ */
+export function slackUserTokenSecrets(secrets: string[], explicitNames?: string[]): string[] {
+  if (explicitNames && explicitNames.length > 0) {
+    const wanted = new Set(explicitNames.map((n) => n.toLowerCase()));
+    return secrets.filter((s) => wanted.has(s.toLowerCase()));
+  }
+  return secrets.filter((s) => {
+    const lower = s.toLowerCase();
+    return lower.includes('slack') && lower.includes('user');
+  });
+}
+
 /** Test hook — clears the in-memory caches so each test starts clean. */
 export function __resetCachesForTest(): void {
   identifierToUuid.clear();

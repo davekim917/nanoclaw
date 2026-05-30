@@ -39,7 +39,8 @@ import { updateContainerConfigScalars, updateContainerConfigJson } from './db/co
 import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainer } from './container-runtime.js';
 import { checkAgentRunnerDepsDrift } from './agent-runner-image-check.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
-import { getAgentGroup } from './db/agent-groups.js';
+import { ensureOpus1mSuffix } from './flag-parser.js';
+import { getAgentGroup, getWorkgroupOnecliSecrets } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
 import { findSessionByAgentGroupAndMessagingGroup } from './db/sessions.js';
@@ -47,7 +48,7 @@ import { buildArchiveProjection, buildCentralProjection } from './db/per-agent-p
 import { initGroupFilesystem } from './group-init.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
-import { applyOnecliSecrets, mergeWorkgroupAndGroupSecrets } from './onecli-secrets.js';
+import { applyOnecliSecrets, mergeWorkgroupAndGroupSecrets, slackUserTokenSecrets } from './onecli-secrets.js';
 import { workgroupSharedDir, WORKGROUP_CONTAINER_PATH } from './modules/workgroup/shared-dirs.js';
 import type Database from 'better-sqlite3';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
@@ -382,7 +383,7 @@ async function spawnContainer(session: Session): Promise<void> {
   // Snapshot host capabilities into the session dir so the container can
   // read a static JSON (Phase 5.3). Refreshed every spawn so newly-mounted
   // credentials / plugins / channel registrations appear immediately.
-  writeCapabilitiesSnapshot(agentGroup.id, session.id);
+  writeCapabilitiesSnapshot(agentGroup.id, session.id, session.messaging_group_id);
 
   // Read container config once — threaded through provider resolution,
   // buildMounts, and buildContainerArgs so we don't re-read the file.
@@ -817,9 +818,13 @@ function mergeNoProxy(args: string[], host: string): void {
  * every container spawn. Container's get_capabilities MCP tool reads
  * this JSON directly — no round-trip, always fresh per spawn.
  */
-function writeCapabilitiesSnapshot(agentGroupId: string, sessionId: string): void {
+function writeCapabilitiesSnapshot(
+  agentGroupId: string,
+  sessionId: string,
+  sessionMessagingGroupId: string | null,
+): void {
   try {
-    const caps = getHostCapabilities(agentGroupId);
+    const caps = getHostCapabilities(agentGroupId, sessionMessagingGroupId);
     const outPath = path.join(sessionDir(agentGroupId, sessionId), 'capabilities.json');
     fs.writeFileSync(outPath, JSON.stringify(caps, null, 2) + '\n');
   } catch (err) {
@@ -2028,7 +2033,15 @@ async function buildContainerArgs(
   // ANTHROPIC_DEFAULT_<FAMILY>_MODEL is the SDK's alias resolver
   // short-circuit: whatever string is in that env var gets sent to the
   // API verbatim when the agent or a subagent uses the bare alias.
-  const defaultOpusModel = channelDefaults?.channelDefaultModel ?? containerConfig.defaultModel ?? DEFAULT_OPUS_MODEL;
+  // ensureOpus1mSuffix is load-bearing here: a bare `claude-opus-*` reaching
+  // ANTHROPIC_DEFAULT_OPUS_MODEL (e.g. via set_channel_model, which does not
+  // resolve aliases, or a hand-set channel/container default) makes the CLI's
+  // auto-compact window collapse to 200k under proxy auth and force-compact
+  // long sessions. Normalizing at this consumption point guarantees the 1M
+  // window regardless of how a bare value got into the DB.
+  const defaultOpusModel = ensureOpus1mSuffix(
+    channelDefaults?.channelDefaultModel ?? containerConfig.defaultModel ?? DEFAULT_OPUS_MODEL,
+  );
   args.push('-e', `ANTHROPIC_DEFAULT_OPUS_MODEL=${defaultOpusModel}`);
   args.push('-e', `ANTHROPIC_DEFAULT_SONNET_MODEL=${DEFAULT_SONNET_MODEL}`);
   args.push('-e', `ANTHROPIC_DEFAULT_HAIKU_MODEL=${DEFAULT_HAIKU_MODEL}`);
@@ -2356,25 +2369,70 @@ async function buildContainerArgs(
       );
     }
   } else {
+    // The OneCLI identity this container's proxy is wired to. Defaults to the
+    // per-group identity; a non-owner-safe session carrying a Slack user-token
+    // secret is reassigned to `<group>-noslack` below (Slack withheld).
+    let effectiveIdentifier = agentIdentifier;
     if (agentIdentifier) {
-      await onecli.ensureAgent({ name: agentGroup.name, identifier: agentIdentifier });
       // Per-group + workgroup secret scoping — declarative model, fail-closed.
       // Workgroup-level secrets are the baseline; per-group onecliSecrets extend
       // (additive) — neither list can subtract from the other. No-op when the
       // merged list is empty (preserves whatever assignment the operator set via
       // UI/CLI — e.g. the 3 mode-all agents intentionally left untouched).
-      const wgSecretsRow = getDb()
-        .prepare(
-          `SELECT w.onecli_secrets FROM workgroups w
-           JOIN agent_groups a ON a.workgroup_id = w.id
-           WHERE a.id = ?`,
-        )
-        .get(agentGroup.id) as { onecli_secrets: string } | undefined;
-      const workgroupSecrets: string[] = wgSecretsRow ? (JSON.parse(wgSecretsRow.onecli_secrets) as string[]) : [];
+      const workgroupSecrets = getWorkgroupOnecliSecrets(agentGroup.id);
       const mergedSecrets = mergeWorkgroupAndGroupSecrets(workgroupSecrets, containerConfig.onecliSecrets);
-      applyOnecliSecrets(agentIdentifier, mergedSecrets);
+
+      // Slack user-token scoping — the credential-layer half of the Slack
+      // boundary (the MCP half is canUseSlackUserToken below). The OneCLI
+      // agent identity is per-GROUP, so all sessions of this group share one
+      // secret set; we cannot strip Slack per-session on a single identity
+      // without racing concurrent sessions. Instead, shared (non-owner-safe)
+      // sessions spawn under a SECOND identity `<group>-noslack` whose secret
+      // set excludes the Slack user token. The proxy then has no Slack token
+      // to inject for that container → both `curl slack.com/api/*` and the MCP
+      // fail closed. Owner-safe sessions (owner DM or also_allowed_in) keep the
+      // primary identity + full set. Only ONE extra identity per affected
+      // group, so well clear of the gateway's list-pagination ceiling.
+      //
+      // Suffix is `-noslack` (not `::shared`) because OneCLI identifiers are
+      // constrained to lowercase letters, numbers, and hyphens (`onecli agents
+      // create --identifier`). agentGroup.id already satisfies that, so the
+      // suffixed form is valid. Collision would require a real agent_group
+      // literally named `<group>-noslack`, which we never create.
+      const slackSecrets = slackUserTokenSecrets(mergedSecrets, containerConfig.slack_user_token?.onecli_secret_names);
+      let identity = agentIdentifier;
+      let effectiveSecrets = mergedSecrets;
+      if (slackSecrets.length > 0) {
+        const { isOwnerSafeSlackSession } = await import('./modules/permissions/slack-user-token-gate.js');
+        const ownerSafe = isOwnerSafeSlackSession(
+          getDb(),
+          agentGroup.id,
+          sessionMessagingGroupId ?? null,
+          containerConfig.slack_user_token?.also_allowed_in,
+        );
+        if (!ownerSafe) {
+          identity = `${agentIdentifier}-noslack`;
+          effectiveSecrets = mergedSecrets.filter((s) => !slackSecrets.includes(s));
+          log.info('Slack user-token secret withheld for shared session', {
+            folder: agentGroup.folder,
+            sessionMessagingGroupId: sessionMessagingGroupId ?? null,
+            withheld: slackSecrets,
+            identity,
+          });
+        }
+      }
+
+      await onecli.ensureAgent({
+        name: identity === agentIdentifier ? agentGroup.name : `${agentGroup.name} (no Slack — shared sessions)`,
+        identifier: identity,
+      });
+      applyOnecliSecrets(identity, effectiveSecrets);
+      effectiveIdentifier = identity;
     }
-    const onecliApplied = await onecli.applyContainerConfig(args, { addHostMapping: false, agent: agentIdentifier });
+    const onecliApplied = await onecli.applyContainerConfig(args, {
+      addHostMapping: false,
+      agent: effectiveIdentifier,
+    });
     if (!onecliApplied) {
       throw new Error('OneCLI gateway not applied — refusing to spawn container without credentials');
     }

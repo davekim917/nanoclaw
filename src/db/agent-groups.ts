@@ -42,3 +42,27 @@ export function updateAgentGroup(id: string, updates: Partial<Pick<AgentGroup, '
 export function deleteAgentGroup(id: string): void {
   getDb().prepare('DELETE FROM agent_groups WHERE id = ?').run(id);
 }
+
+/**
+ * The OneCLI secret declarations on the workgroup this agent group belongs
+ * to. These are the shared baseline every sibling inherits at spawn — the
+ * host merges them (union) with the per-group `container.json.onecliSecrets`
+ * before calling `applyOnecliSecrets`. Returns [] if the group has no
+ * workgroup or the workgroup declares none. See `mergeWorkgroupAndGroupSecrets`.
+ */
+export function getWorkgroupOnecliSecrets(agentGroupId: string): string[] {
+  const row = getDb()
+    .prepare(
+      `SELECT w.onecli_secrets AS secrets FROM workgroups w
+       JOIN agent_groups a ON a.workgroup_id = w.id
+       WHERE a.id = ?`,
+    )
+    .get(agentGroupId) as { secrets: string } | undefined;
+  if (!row) return [];
+  try {
+    const parsed = JSON.parse(row.secrets) as unknown;
+    return Array.isArray(parsed) ? (parsed as string[]) : [];
+  } catch {
+    return [];
+  }
+}
