@@ -1,6 +1,6 @@
 ---
 name: setup-local-claude
-description: Installs a `claude-ws <workstream>` launcher so local Claude Code (host or laptop) gets the same third-party credential + MCP access a NanoClaw container agent has, scoped per workstream through the OneCLI gateway. Use this skill whenever the user wants to run Claude Code locally with their agents' credentials, mirror or replicate container access on their own machine, move Claude work off the container or Agent SDK onto the local CLI, give the local CLI a group's GitHub/Linear/Atlassian/Snowflake access, or mentions "claude-ws", "local claude access", or "container parity locally". Requires OneCLI.
+description: Installs a `claude-ws <workstream>` launcher so local Claude Code (host or laptop) gets the same third-party credential + MCP access a NanoClaw container agent has, scoped per workstream through the OneCLI gateway. Use this skill whenever the user wants to run Claude Code locally with their agents' credentials, mirror or replicate container access on their own machine, move Claude work off the container or Agent SDK onto the local CLI, give the local CLI a group's GitHub/Linear/Atlassian/Snowflake access, set a teammate up with local Claude access, or mentions "claude-ws", "local claude access", or "container parity locally". Requires OneCLI.
 ---
 
 # setup-local-claude
@@ -16,49 +16,61 @@ claude-ws illysium -p "summarize the current Linear cycle"
 claude-ws --list
 ```
 
+`cd` into your project first, like normal `claude`.
+
+## Two setup paths — pick one before you start
+
+This skill is run interactively. Decide which person you're setting up:
+
+- **Operator** — you run the NanoClaw host; the agent identities already live in
+  your own OneCLI vault. You just need the launcher pointed at them. → **Path A**.
+- **Teammate** — you do NOT run the host. You want local Claude Code with the
+  same *kinds* of access, but under your **own** accounts and your **own** OneCLI
+  vault. The wizard creates your identities and walks you through connecting your
+  own apps. → **Path B**.
+
+If unsure: do you have a `groups/` directory with `container.json` files AND those
+agent identities in `onecli agents list`? Yes → operator. No → teammate.
+
 ## What it replicates (and what it deliberately doesn't)
 
 A container agent's "access" is five separable layers. This skill mirrors the
 two that matter for local work and intentionally leaves the rest:
 
 | Layer | Container agent | claude-ws |
-|---|---|---|
+|-------|-----------------|-----------|
 | **Anthropic model auth** | vault/forwarded token, `api.anthropic.com` bypassed | **Your local subscription login** — the shim unsets the injected token and bypasses `api.anthropic.com`, so Claude uses your `/login` account |
-| **3rd-party creds** (GitHub, Linear, Atlassian, Snowflake, Datafold, Gmail…) | OneCLI gateway injects at the proxy boundary, per identity | **Identical** — `onecli run --agent <id>` points the same proxy + CA at the same gateway, same identity |
+| **3rd-party creds** (GitHub, Linear, Atlassian, Snowflake, Datafold, Gmail…) | OneCLI gateway injects at the proxy boundary, per identity | **Identical mechanism** — `onecli run --agent <id>` points the same proxy + CA at the gateway, scoped to that identity's secrets |
 | **MCP servers** | per-group + universal set | universal set (exa, linear, deepwiki, pocket, context7) via `--mcp-config`; creds injected per identity |
 | Skills / CLAUDE.md / workspace / memory | mounted per group | not replicated — your normal local config + the project repo |
 | Host guardrails (approvals, destructive-guard, mnemon, isolation) | yes | **no, by design** — you're the operator at your own keyboard |
 
-"Exactly the same" applies to **creds + MCP**. Model auth is intentionally
-different and simpler (native subscription login — the path Anthropic's
-SDK-on-subscription deprecation doesn't affect).
+Model auth is intentionally different and simpler (native subscription login —
+the path Anthropic's SDK-on-subscription deprecation doesn't affect). A
+teammate's creds are **their own**, not the operator's — each person's actions
+are attributable to them.
 
-## Prerequisites
+## Prerequisites (both paths)
 
 - **OneCLI installed and the gateway running.** Check: `onecli version` and
   `curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:10254` → `200`.
   If not installed, run `/init-onecli` first.
 - **Claude Code installed** and logged into the user's subscription
   (`claude` → `/login`).
-- **node** on PATH (used by the launcher to read the map).
-- Run this skill from the **NanoClaw repo root** (needs `groups/*/container.json`).
+- **node** on PATH (the launcher reads the map with it).
 
-## Installation
-
-Do these steps. `${CLAUDE_SKILL_DIR}` is this skill's directory.
-
-### 1. Confirm prerequisites
-
+Confirm all four before continuing:
 ```bash
 command -v onecli >/dev/null && echo "onecli: ok" || echo "onecli: MISSING — run /init-onecli"
-command -v claude >/dev/null && echo "claude: ok" || echo "claude: MISSING"
-command -v node   >/dev/null && echo "node: ok"   || echo "node: MISSING"
+command -v claude >/dev/null && echo "claude: ok"  || echo "claude: MISSING"
+command -v node   >/dev/null && echo "node: ok"    || echo "node: MISSING"
 curl -s -o /dev/null -w 'gateway_http=%{http_code}\n' http://127.0.0.1:10254
 ```
 If the gateway isn't `200`, stop and get OneCLI running (`/init-onecli`).
 
-### 2. Create install dirs and copy the kit
+## Install the launcher files (both paths)
 
+`${CLAUDE_SKILL_DIR}` is this skill's directory.
 ```bash
 mkdir -p ~/.config/claude-ws ~/.local/bin
 cp "${CLAUDE_SKILL_DIR}/scripts/parity-shim.sh" ~/.config/claude-ws/parity-shim.sh
@@ -66,33 +78,100 @@ cp "${CLAUDE_SKILL_DIR}/scripts/mcp.json"       ~/.config/claude-ws/mcp.json
 cp "${CLAUDE_SKILL_DIR}/scripts/claude-ws"      ~/.local/bin/claude-ws
 chmod +x ~/.config/claude-ws/parity-shim.sh ~/.local/bin/claude-ws
 ```
+Ensure `~/.local/bin` is on PATH (zsh users: use `~/.zshrc`):
+```bash
+case ":$PATH:" in *":$HOME/.local/bin:"*) echo "on PATH";; *) echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc; echo "added — restart shell";; esac
+```
 
-### 3. Generate the workstream → identity map
+---
 
-Reads every `groups/*/container.json` and maps folder name → `agentGroupId`.
-Excludes `*-codex` / `*-opencode` siblings by default (those are other-provider
-agents; for local *Claude* you want the Claude/parent groups):
+## Path A — Operator (you run the host)
 
+Generate the map from your checkout's `groups/*/container.json` (folder →
+`agentGroupId`, which already exists in your vault). Run from the repo root:
 ```bash
 node "${CLAUDE_SKILL_DIR}/scripts/generate-workstreams.mjs" > ~/.config/claude-ws/workstreams.json
 cat ~/.config/claude-ws/workstreams.json
 ```
+Show the user the map, confirm it's the workstreams they want, and drop any keys
+they don't need (the key is what they'll type after `claude-ws`). Each value must
+be an identifier present in `onecli agents list --max 80`. (`--include-siblings`
+also maps `*-codex`/`*-opencode`; those run in `all` secret mode for some groups.)
 
-Show the user the generated map and confirm it's the set of workstreams they
-want. Edit `~/.config/claude-ws/workstreams.json` to rename keys (the key is what
-they'll type after `claude-ws`) or drop entries. Each value must be the OneCLI
-agent **identifier** that exists in the vault — verify with `onecli agents list
---max 80`. (Pass `--include-siblings` to the generator to also map codex/opencode
-groups, but those identities run in `all` secret mode for some groups.)
+Then jump to **Verify** below.
 
-### 4. Ensure `~/.local/bin` is on PATH
+---
 
+## Path B — Teammate (own accounts, own vault)
+
+The teammate's vault starts empty of these identities. The wizard's job: pick
+workstreams, create each identity in *their* vault, connect *their* apps, write
+their map. Walk through it conversationally — the teammate may not be technical,
+so explain each step plainly and run the commands for them.
+
+### B1. Discover the canonical workstreams + what each needs
+
+Run against any NanoClaw checkout the teammate can read (or one you provide). The
+`--teammate` flag makes the identifier the folder NAME (self-documenting in their
+own vault); `--describe` lists the apps each workstream connects:
 ```bash
-case ":$PATH:" in *":$HOME/.local/bin:"*) echo "on PATH";; *) echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc; echo "added to ~/.bashrc — restart shell or source it";; esac
+node "${CLAUDE_SKILL_DIR}/scripts/generate-workstreams.mjs" --teammate --describe > /tmp/ws-describe.json
+cat /tmp/ws-describe.json
 ```
-On zsh, append to `~/.zshrc` instead.
+Each entry looks like `{ "identifier": "madison-reed", "secrets": [...], "tools": [...] }`.
+The `secrets`/`tools` are the apps that workstream uses (GitHub, Linear,
+Atlassian, Snowflake, Gmail, …) — your checklist for the OAuth walkthrough.
 
-### 5. Verify end-to-end
+### B2. Let the teammate pick their workstreams
+
+Ask which ones they actually work in — don't create identities they won't use.
+Use `AskUserQuestion` with the discovered names. Keep only the chosen subset.
+
+### B3. Create each chosen identity in their vault
+
+For each chosen workstream `<ws>`, create an agent if it doesn't already exist:
+```bash
+onecli agents list --max 80 | grep -q '"identifier": "<ws>"' \
+  || onecli agents create --name "<ws> (local Claude)" --identifier "<ws>"
+```
+Leave secret mode at the default `selective` — they'll connect only what they
+need in the next step.
+
+### B4. Connect each workstream's apps (the actual credential step)
+
+For each chosen workstream, look at its `secrets`/`tools` from B1 and have the
+teammate connect those apps in **their** OneCLI vault. The gateway is per-host,
+so this is their own GitHub/Gmail/etc., not the operator's:
+
+- Open the OneCLI dashboard: `http://127.0.0.1:10254` → Connections.
+- For each app the workstream needs (e.g. GitHub, Gmail, Linear, Atlassian),
+  click connect and complete that provider's OAuth as themselves.
+- For API-key services (Snowflake, Datafold, Exa, …), paste their own key into
+  the matching secret. If they don't have one, that workstream's tools for that
+  service simply won't work until they do — that's expected, not an error.
+
+Don't block on connecting everything — connect what they have, note the rest.
+
+### B5. Write their map
+
+Build `workstreams.json` from the chosen subset (identifier = folder name):
+```bash
+node "${CLAUDE_SKILL_DIR}/scripts/generate-workstreams.mjs" --teammate > /tmp/ws-all.json
+# then keep only the chosen keys — e.g. with node/jq, or hand-write the subset:
+cat > ~/.config/claude-ws/workstreams.json <<'JSON'
+{
+  "madison-reed": "madison-reed",
+  "illysium": "illysium"
+}
+JSON
+cat ~/.config/claude-ws/workstreams.json
+```
+
+Then continue to **Verify**.
+
+---
+
+## Verify (both paths)
 
 Plumbing (launcher → onecli run → shim → claude):
 ```bash
@@ -100,16 +179,14 @@ claude-ws "$(node -e 'console.log(Object.keys(require(process.env.HOME+"/.config
 ```
 
 Credential injection is **scoped per identity** and the gateway matches on
-**host pattern**, so smoke-test against the actual product host a workstream's
-secret targets (NOT a generic api host). Pick a workstream that has a known
-secret (e.g. the group whose `container.json` lists `Atlassian`) and:
+**host pattern**, so smoke-test against the real product host a workstream's
+secret targets (NOT a generic api host). Pick a workstream with a connected app:
 ```bash
-ID=$(node -e 'const m=require(process.env.HOME+"/.config/claude-ws/workstreams.json");process.stdout.write(m["<that-workstream>"])')
-onecli run --agent "$ID" -- curl -sS -o /dev/null -w 'http=%{http_code}\n' https://<product-host>/<auth-checking-path>
+ID=$(node -e 'const m=require(process.env.HOME+"/.config/claude-ws/workstreams.json");process.stdout.write(m["<workstream>"])')
+onecli run --agent "$ID" -- curl -sS -o /dev/null -w 'http=%{http_code}\n' https://<product-host>/<auth-path>
 ```
-`200`/`405` with injection vs `401` without (try the default agent for contrast)
-confirms the credential is being injected. A real model call also proves the
-subscription-login path:
+`200`/`405` with injection vs `401` without confirms it. A real model call proves
+the subscription-login path:
 ```bash
 claude-ws <workstream> -p "Reply with exactly: works"
 ```
@@ -143,13 +220,14 @@ SSH-tunnel to the host gateway. The kit files are `$HOME`-relative and portable.
 ## Troubleshooting
 
 - **`onecli not found` / gateway not 200** → install/start OneCLI (`/init-onecli`).
-- **401 on a service** the workstream should have → the identity needs that secret
-  assigned (`onecli agents list` shows `selective` mode; assign via the UI at
-  http://127.0.0.1:10254 or `onecli agents set-secrets`). Remember the gateway
-  matches on **host pattern** (e.g. `<tenant>.atlassian.net`, not
-  `api.atlassian.com`) — test the right host.
+- **401 on a service** → the identity lacks that secret. Operator: assign via the
+  UI or `onecli agents set-secrets`. Teammate: connect the app at
+  `http://127.0.0.1:10254` under that identity. Gateway matches on **host
+  pattern** (e.g. `<tenant>.atlassian.net`, not `api.atlassian.com`) — test the
+  right host.
 - **Model calls fail / wrong account** → confirm `claude` is logged in (`/login`);
   the shim handles the token-unset + `api.anthropic.com` bypass.
 - **`unknown workstream`** → check `claude-ws --list`; edit `workstreams.json`.
 - Smoke-test injection without launching Claude:
   `onecli run --agent <id> -- curl -sS -o /dev/null -w '%{http_code}\n' <api-url>`
+```
