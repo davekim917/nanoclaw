@@ -291,6 +291,48 @@ the thread.
 
 ---
 
+## 6a. Related (folded in): thread-scoped "loops" vs channel-root scheduled tasks
+
+Surfaced 2026-06-02 from a real incident: Dave told illie (in a Slack thread)
+"run a loop to check the PR for new codex reviews"; the loop's `*/10` iterations
+posted to the parent #agents-xzo channel, not the thread.
+
+**Root cause (verified, not theorized):**
+- Container agents have **no Claude Code `/loop`**. illie's recurrence surface is
+  only `schedule_task` / `list|read|cancel|pause|resume|update_task`
+  (`container/agent-runner/src/mcp-tools/scheduling.ts`). The host-side `/loop`
+  skill (thread-local, "session = thread") exists only in a *host* Claude Code
+  session, not inside the container.
+- So "run a loop" was implemented as a recurring `schedule_task`. The actual row:
+  `task-1780413607328-7wfpjh`, `*/10 * * * *`, `thread_id=null`, in the
+  **channel-root** session `sess-1778203069713-ukvol3` (same session as the email
+  poller). Channel-root + `thread_id=null` is enforced for *every* scheduled task
+  by `src/modules/scheduling/actions.ts:10-29` for lifetime (a task in a thread
+  session dies when the thread is archived) AND security (post-2026-05-02
+  cross-tenant leak: host never trusts agent-supplied routing). Working as
+  designed → it posts at channel root.
+
+**Decision (Dave, 2026-06-02):** do NOT make scheduled tasks report into threads —
+they stay channel-root; follow-ups on a scheduled-task output happen in a fresh
+thread like any other session. The loop/scheduled-task conflation is the bug, not
+the channel-root routing.
+
+**Implication / what would actually close the gap:** a **thread-scoped recurring
+primitive** distinct from `schedule_task` — one that runs *in the per-thread
+session* and reports in-thread. This is a new feature, not a scheduled-task tweak.
+It shares this spec's core infra (a per-thread session that is woken on a
+schedule/event and reports in its own thread). Two lifetime options if/when built:
+1. **Ephemeral, thread-bound** — runs in the thread session; dies if the thread is
+   archived. Acceptable for a short, self-cancelling loop (the PR-watch case).
+2. **Durable + report-target** — runs channel-root for durability but stamps
+   outbound into a host-authoritative `report_thread_id` captured from the
+   *calling session's own* `thread_id` (NOT agent-supplied — sidesteps the
+   security objection). Reuses the `in_reply_to`→outbound plumbing from `2a7e80e9`.
+
+Not building now (per Dave: fold into this scope, decide later). Listed as a
+sibling feature because it wants the same per-thread-session-on-a-schedule
+machinery as §3.
+
 ## 7. Risks / watch-items
 
 - **Idempotency:** the poll can re-see a thread before labeling completes; key
