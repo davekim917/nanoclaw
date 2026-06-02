@@ -318,20 +318,50 @@ thread like any other session. The loop/scheduled-task conflation is the bug, no
 the channel-root routing.
 
 **Implication / what would actually close the gap:** a **thread-scoped recurring
-primitive** distinct from `schedule_task` — one that runs *in the per-thread
-session* and reports in-thread. This is a new feature, not a scheduled-task tweak.
-It shares this spec's core infra (a per-thread session that is woken on a
-schedule/event and reports in its own thread). Two lifetime options if/when built:
-1. **Ephemeral, thread-bound** — runs in the thread session; dies if the thread is
-   archived. Acceptable for a short, self-cancelling loop (the PR-watch case).
-2. **Durable + report-target** — runs channel-root for durability but stamps
-   outbound into a host-authoritative `report_thread_id` captured from the
-   *calling session's own* `thread_id` (NOT agent-supplied — sidesteps the
-   security objection). Reuses the `in_reply_to`→outbound plumbing from `2a7e80e9`.
+primitive** distinct from the durable channel-root `schedule_task` — one that runs
+*in the per-thread session* and reports in-thread.
 
-Not building now (per Dave: fold into this scope, decide later). Listed as a
-sibling feature because it wants the same per-thread-session-on-a-schedule
-machinery as §3.
+**Feasibility (verified 2026-06-02): HIGH, and close.** The firing machinery
+already supports it — `src/host-sweep.ts:220-346` iterates **all** active sessions
+(`getActiveSessions`) and runs the due-message wake + `handleRecurrence(inDb,
+session)` for *each*, per-thread sessions included. A recurring row placed in a
+per-thread session's inbound.db would therefore fire there, and that session's
+outbound already carries `session.thread_id` (per-thread reply routing,
+`mcp-tools/core.ts` resolveRouting), so iterations post in-thread **with no
+delivery changes**. The *only* blocker is the deliberate redirect in
+`scheduling/actions.ts:10-29` that forces every task to the channel-root session
+with `thread_id=null`.
+
+**Cleanest design — opt-in `scope` on `schedule_task`:**
+- `scope: 'channel'` (default, today's behavior) — durable, channel-root,
+  `thread_id=null`. Unchanged. For the email poller and any durable task.
+- `scope: 'thread'` (new) — when the calling session is a per-thread session,
+  `handleScheduleTask` writes the task into **that** session's inbound.db using
+  the calling session's **host-authoritative** `thread_id` (from the sessions
+  table — NOT the agent-supplied `threadId`, so the post-2026-05-02 cross-tenant
+  invariant still holds). Fires in that session; reports in-thread; **dies with
+  the thread session** (correct for an ephemeral, self-cancelling loop).
+
+**Scope of work (moderate, self-contained):**
+1. `scope` param on the `schedule_task` MCP tool + threaded through the system
+   action (`mcp-tools/scheduling.ts`).
+2. Branch in `handleScheduleTask` (`scheduling/actions.ts`): for `scope:'thread'`
+   + a per-thread calling session, target that session's inbound with its real
+   `thread_id`; else current channel-root path.
+3. Task-management tools (`list/read/cancel/pause/resume/update_task`) currently
+   assume the channel-root inbound (`openChannelInboundDb`) — extend to also see
+   thread-scoped tasks in the current thread session.
+4. **Lifecycle guard:** ensure a per-thread session holding a pending recurring
+   row is NOT reaped between fires (the due-wake should keep it warm — verify
+   against the stale-session sweep and the 2026-05-27 recurring-expiry fix).
+5. Tests: thread-scoped loop fires in-thread; survives across fires; self-cancels;
+   channel-scoped path unchanged; cross-tenant routing still rejected.
+
+No new session machinery, no delivery rework — distinct from §3's per-issue
+dispatch but reuses the same "per-thread session woken on a schedule, reports
+in-thread" foundation. Could ship independently and *before* §3 (smaller).
+
+Status: not building yet (per Dave: folded here, decide later).
 
 ## 7. Risks / watch-items
 
