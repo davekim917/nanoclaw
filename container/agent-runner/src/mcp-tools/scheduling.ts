@@ -5,7 +5,9 @@
  * Scheduling operations are sent as system actions via messages_out — the host
  * reads them during delivery and applies the changes to inbound.db.
  */
-import { openChannelInboundDb } from '../db/connection.js';
+import type { Database } from 'bun:sqlite';
+
+import { openChannelInboundDb, openInboundDb } from '../db/connection.js';
 import { writeMessageOut } from '../db/messages-out.js';
 import { getSessionRouting } from '../db/session-routing.js';
 import { TIMEZONE, parseZonedToUtc } from '../timezone.js';
@@ -14,6 +16,50 @@ import type { McpToolDefinition } from './types.js';
 
 function log(msg: string): void {
   console.error(`[mcp-tools] ${msg}`);
+}
+
+interface TaskRow {
+  id: string;
+  status: string;
+  process_after: string | null;
+  recurrence: string | null;
+  thread_id: string | null;
+  content: string;
+}
+
+/**
+ * Scheduled tasks live in one of two inbound.dbs visible to this container:
+ *   - the OWN session inbound (`/workspace/inbound.db`) — holds thread-scoped
+ *     loops bound to this thread;
+ *   - the channel-root mount (`/workspace/channel-inbound.db`) — holds durable
+ *     channel-scoped tasks.
+ * For a channel-root container the two can reference the same rows, so we dedupe
+ * by series id. One row per series — the live (pending/paused) occurrence.
+ */
+function collectLiveTasks(status: string | undefined): TaskRow[] {
+  const seen = new Set<string>();
+  const out: TaskRow[] = [];
+  for (const db of [openInboundDb(), openChannelInboundDb()] as Array<Database | null>) {
+    if (!db) continue;
+    try {
+      const where = status ? 'status = ?' : "status IN ('pending', 'paused')";
+      const sql =
+        `SELECT series_id AS id, status, process_after, recurrence, thread_id, content, MAX(seq) AS _seq
+           FROM messages_in
+          WHERE kind = 'task' AND ${where}
+          GROUP BY series_id`;
+      const rows = (status ? db.prepare(sql).all(status) : db.prepare(sql).all()) as TaskRow[];
+      for (const r of rows) {
+        if (seen.has(r.id)) continue;
+        seen.add(r.id);
+        out.push(r);
+      }
+    } finally {
+      db.close();
+    }
+  }
+  out.sort((a, b) => (a.process_after ?? '').localeCompare(b.process_after ?? ''));
+  return out;
 }
 
 function generateId(): string {
@@ -52,6 +98,12 @@ export const scheduleTask: McpToolDefinition = {
             'Cron expression for recurring tasks (e.g., "0 9 * * 1-5" = weekdays at 9am user-local). Evaluated in the user\'s timezone.',
         },
         script: { type: 'string', description: 'Optional pre-agent script to run before processing' },
+        scope: {
+          type: 'string',
+          enum: ['channel', 'thread'],
+          description:
+            `Where the task lives and reports. 'channel' (default): durable — runs in the channel-root session and posts to the channel root, surviving thread archival. Use for standing tasks like inbox pollers. 'thread': an opt-in recurring "loop" bound to THIS thread — runs in this thread's session and reports IN this thread. It lives and dies with the thread, which is correct for an ephemeral, self-cancelling loop started in a conversation (e.g. "loop until the PR is approved, report here"). Only meaningful when invoked from within a thread; from the channel root it falls back to 'channel'.`,
+        },
       },
       required: ['prompt', 'processAfter'],
     },
@@ -60,6 +112,7 @@ export const scheduleTask: McpToolDefinition = {
     const prompt = args.prompt as string;
     const processAfterIn = args.processAfter as string;
     if (!prompt || !processAfterIn) return err('prompt and processAfter are required');
+    const scope = args.scope === 'thread' ? 'thread' : 'channel';
 
     let processAfter: string;
     try {
@@ -89,14 +142,17 @@ export const scheduleTask: McpToolDefinition = {
         script,
         processAfter,
         recurrence,
+        scope,
         platformId: r.platform_id,
         channelType: r.channel_type,
         threadId: r.thread_id,
       }),
     });
 
-    log(`schedule_task: ${id} at ${processAfter}${recurrence ? ` (recurring: ${recurrence})` : ''}`);
-    return ok(`Task scheduled (id: ${id}, runs at: ${processAfter}${recurrence ? `, recurrence: ${recurrence}` : ''})`);
+    log(`schedule_task: ${id} at ${processAfter}${recurrence ? ` (recurring: ${recurrence})` : ''} scope=${scope}`);
+    return ok(
+      `Task scheduled (id: ${id}, runs at: ${processAfter}${recurrence ? `, recurrence: ${recurrence}` : ''}${scope === 'thread' ? ', scope: thread (reports in this thread)' : ''})`,
+    );
   },
 };
 
@@ -114,56 +170,20 @@ export const listTasks: McpToolDefinition = {
   },
   async handler(args) {
     const status = args.status as string | undefined;
-    // Tasks live in the channel-root session's inbound.db (mounted RO at
-    // /workspace/channel-inbound.db). When the mount is absent — no
-    // channel-root session yet, or session has no messaging_group_id — there
-    // are no tasks for this scope.
-    const db = openChannelInboundDb();
-    if (!db) return ok('No tasks found.');
-    try {
-      // One row per series — the live (pending or paused) occurrence. Recurring
-      // tasks accumulate one completed row per firing plus one live follow-up;
-      // exposing the whole pile to the agent is noisy and confuses task identity
-      // ("which id do I cancel?"). The series_id is the stable handle.
-      //
-      // SQLite quirk: when MAX(seq) appears in the SELECT list of a GROUP BY
-      // query, the bare columns take values from the row that contains that max
-      // — that's how we pick "the latest live row per series" in one pass.
-      let rows;
-      if (status) {
-        rows = db
-          .prepare(
-            `SELECT series_id AS id, status, process_after, recurrence, content, MAX(seq) AS _seq
-               FROM messages_in
-              WHERE kind = 'task' AND status = ?
-              GROUP BY series_id
-              ORDER BY process_after ASC`,
-          )
-          .all(status);
-      } else {
-        rows = db
-          .prepare(
-            `SELECT series_id AS id, status, process_after, recurrence, content, MAX(seq) AS _seq
-               FROM messages_in
-              WHERE kind = 'task' AND status IN ('pending', 'paused')
-              GROUP BY series_id
-              ORDER BY process_after ASC`,
-          )
-          .all();
-      }
+    // Merge thread-scoped loops (own inbound) + durable channel tasks (channel
+    // mount), one row per series. The series_id is the stable handle the
+    // update/cancel/pause/resume tools expect.
+    const rows = collectLiveTasks(status);
+    if (rows.length === 0) return ok('No tasks found.');
 
-      if ((rows as unknown[]).length === 0) return ok('No tasks found.');
+    const lines = rows.map((r) => {
+      const content = JSON.parse(r.content);
+      const prompt = ((content.prompt as string) || '').slice(0, 80);
+      const scope = r.thread_id ? ' [thread]' : '';
+      return `- ${r.id} [${r.status}]${scope} at=${r.process_after || 'now'} ${r.recurrence ? `recur=${r.recurrence} ` : ''}→ ${prompt}`;
+    });
 
-      const lines = (rows as Array<{ id: string; status: string; process_after: string | null; recurrence: string | null; content: string }>).map((r) => {
-        const content = JSON.parse(r.content);
-        const prompt = (content.prompt as string || '').slice(0, 80);
-        return `- ${r.id} [${r.status}] at=${r.process_after || 'now'} ${r.recurrence ? `recur=${r.recurrence} ` : ''}→ ${prompt}`;
-      });
-
-      return ok(lines.join('\n'));
-    } finally {
-      db.close();
-    }
+    return ok(lines.join('\n'));
   },
 };
 
@@ -183,37 +203,24 @@ export const readTask: McpToolDefinition = {
   async handler(args) {
     const taskId = args.taskId as string;
     if (!taskId) return err('taskId is required');
-    const db = openChannelInboundDb();
-    if (!db) return err(`task not found: ${taskId} (no scheduled tasks for this channel yet)`);
-    try {
-      const row = db
-        .prepare(
-          `SELECT id, series_id, status, process_after, recurrence, content, MAX(seq) AS _seq
-             FROM messages_in
-            WHERE kind = 'task' AND series_id = ? AND status IN ('pending', 'paused')
-            GROUP BY series_id`,
-        )
-        .get(taskId) as
-        | { id: string; series_id: string; status: string; process_after: string | null; recurrence: string | null; content: string }
-        | undefined;
-      if (!row) return err(`task not found: ${taskId} (no live row for this series)`);
+    // Look across both inboxes (thread-scoped own inbound + channel mount).
+    const row = collectLiveTasks(undefined).find((r) => r.id === taskId);
+    if (!row) return err(`task not found: ${taskId} (no live row for this series)`);
 
-      const parsed = JSON.parse(row.content) as { prompt?: string; script?: string };
-      const lines = [
-        `id: ${row.series_id}`,
-        `status: ${row.status}`,
-        `process_after: ${row.process_after ?? 'now'}`,
-        `recurrence: ${row.recurrence ?? '(one-shot)'}`,
-        `prompt:`,
-        parsed.prompt ?? '',
-      ];
-      if (parsed.script) {
-        lines.push(`script:`, parsed.script);
-      }
-      return ok(lines.join('\n'));
-    } finally {
-      db.close();
+    const parsed = JSON.parse(row.content) as { prompt?: string; script?: string };
+    const lines = [
+      `id: ${row.id}`,
+      `status: ${row.status}`,
+      `scope: ${row.thread_id ? 'thread (reports in this thread)' : 'channel'}`,
+      `process_after: ${row.process_after ?? 'now'}`,
+      `recurrence: ${row.recurrence ?? '(one-shot)'}`,
+      `prompt:`,
+      parsed.prompt ?? '',
+    ];
+    if (parsed.script) {
+      lines.push(`script:`, parsed.script);
     }
+    return ok(lines.join('\n'));
   },
 };
 

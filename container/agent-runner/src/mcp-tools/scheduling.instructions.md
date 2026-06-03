@@ -2,7 +2,14 @@
 
 For any recurring task, use `schedule_task`. This is the scheduling path — tasks persist across sessions and restarts, and support the pre-task `script` hook described below.
 
-To inspect or change existing tasks, use `list_tasks` (returns one row per series with the stable id) and `update_task` / `cancel_task` / `pause_task` / `resume_task`. Prefer `update_task` over cancel + reschedule.
+To inspect or change existing tasks, use `list_tasks` (returns one row per series with the stable id; thread-scoped loops are marked `[thread]`) and `update_task` / `cancel_task` / `pause_task` / `resume_task`. Prefer `update_task` over cancel + reschedule.
+
+### `scope`: where the task lives and reports
+
+- **`scope: 'channel'` (default)** — durable. Runs in the channel-root session and posts to the channel root, surviving thread archival. Use for standing tasks (inbox pollers, daily briefings, anything that should outlive any one conversation).
+- **`scope: 'thread'`** — an opt-in recurring **loop bound to the current thread**. It runs in this thread's session and reports **in this thread**, and it lives and dies with the thread. Use it when a user, talking to you *in a thread*, asks you to "run a loop" / "keep checking and report here" — e.g. "loop every 10 min until the PR is approved, report in this thread". When the loop's stop-condition is met, `cancel_task` it. From the channel root (not a thread) it falls back to `'channel'`.
+
+When a request to "run a loop" comes from inside a thread and the intent is to watch something and report back **here**, prefer `scope: 'thread'` so iterations thread under the conversation instead of posting to the parent channel.
 
 Frequent recurring scheduled tasks — more than a few times a day — consume API credits and can risk account restrictions. You can add a `script` that runs first, and you will only be called when the check passes.
 

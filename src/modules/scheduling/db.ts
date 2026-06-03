@@ -35,22 +35,33 @@ export function insertTask(
   });
 }
 
-export function cancelTask(db: Database.Database, taskId: string): void {
-  db.prepare(
-    "UPDATE messages_in SET status = 'completed', recurrence = NULL WHERE (id = ? OR series_id = ?) AND kind = 'task' AND status IN ('pending', 'paused')",
-  ).run(taskId, taskId);
+// cancel/pause/resume return the number of rows touched so callers can resolve
+// which inbound.db holds the series (thread-scoped tasks live in the calling
+// per-thread session's inbound; channel-scoped tasks live in the channel-root
+// session's). A caller tries its own session first and falls back to channel
+// root only when 0 rows matched.
+export function cancelTask(db: Database.Database, taskId: string): number {
+  return db
+    .prepare(
+      "UPDATE messages_in SET status = 'completed', recurrence = NULL WHERE (id = ? OR series_id = ?) AND kind = 'task' AND status IN ('pending', 'paused')",
+    )
+    .run(taskId, taskId).changes;
 }
 
-export function pauseTask(db: Database.Database, taskId: string): void {
-  db.prepare(
-    "UPDATE messages_in SET status = 'paused' WHERE (id = ? OR series_id = ?) AND kind = 'task' AND status = 'pending'",
-  ).run(taskId, taskId);
+export function pauseTask(db: Database.Database, taskId: string): number {
+  return db
+    .prepare(
+      "UPDATE messages_in SET status = 'paused' WHERE (id = ? OR series_id = ?) AND kind = 'task' AND status = 'pending'",
+    )
+    .run(taskId, taskId).changes;
 }
 
-export function resumeTask(db: Database.Database, taskId: string): void {
-  db.prepare(
-    "UPDATE messages_in SET status = 'pending' WHERE (id = ? OR series_id = ?) AND kind = 'task' AND status = 'paused'",
-  ).run(taskId, taskId);
+export function resumeTask(db: Database.Database, taskId: string): number {
+  return db
+    .prepare(
+      "UPDATE messages_in SET status = 'pending' WHERE (id = ? OR series_id = ?) AND kind = 'task' AND status = 'paused'",
+    )
+    .run(taskId, taskId).changes;
 }
 
 export interface TaskUpdate {

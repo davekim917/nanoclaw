@@ -54,6 +54,66 @@ describe('insertTask', () => {
     expect(row.series_id).toBe('task-1');
     db.close();
   });
+
+  it('persists thread_id for a thread-scoped task', () => {
+    const db = freshDb();
+    insertTask(db, {
+      id: 'task-thr',
+      processAfter: new Date().toISOString(),
+      recurrence: '*/10 * * * *',
+      platformId: 'C0AJA89MN2E',
+      channelType: 'slack',
+      threadId: 'C0AJA89MN2E:1779996680.937799',
+      content: JSON.stringify({ prompt: 'loop' }),
+    });
+    const row = db.prepare('SELECT thread_id FROM messages_in WHERE id = ?').get('task-thr') as { thread_id: string };
+    expect(row.thread_id).toBe('C0AJA89MN2E:1779996680.937799');
+    db.close();
+  });
+
+  it('carries thread_id forward across a recurrence fire', () => {
+    const db = freshDb();
+    insertTask(db, {
+      id: 'task-thr',
+      processAfter: new Date().toISOString(),
+      recurrence: '*/10 * * * *',
+      platformId: 'C0AJA89MN2E',
+      channelType: 'slack',
+      threadId: 'thr-xyz',
+      content: JSON.stringify({ prompt: 'loop' }),
+    });
+    db.prepare("UPDATE messages_in SET status = 'completed' WHERE id = 'task-thr'").run();
+    const [msg] = getCompletedRecurring(db);
+    insertRecurrence(db, msg, 'task-thr-2', new Date(Date.now() + 600000).toISOString());
+    const next = db.prepare("SELECT thread_id FROM messages_in WHERE id = 'task-thr-2'").get() as {
+      thread_id: string;
+    };
+    expect(next.thread_id).toBe('thr-xyz');
+    db.close();
+  });
+});
+
+describe('cancel/pause/resume return affected-row counts', () => {
+  // The host's management handlers use these counts to resolve which inbound
+  // holds the series — calling-session (thread-scoped) first, then channel root.
+  it('cancelTask returns 1 on match, 0 on miss', () => {
+    const db = freshDb();
+    insertBasicTask(db, 'task-1', null);
+    expect(cancelTask(db, 'task-1')).toBe(1);
+    expect(cancelTask(db, 'task-1')).toBe(0); // already completed
+    expect(cancelTask(db, 'nope')).toBe(0);
+    db.close();
+  });
+
+  it('pauseTask / resumeTask return counts', () => {
+    const db = freshDb();
+    insertBasicTask(db, 'task-1', '0 9 * * *');
+    expect(pauseTask(db, 'task-1')).toBe(1);
+    expect(pauseTask(db, 'task-1')).toBe(0); // already paused
+    expect(resumeTask(db, 'task-1')).toBe(1);
+    expect(resumeTask(db, 'nope')).toBe(0);
+    db.close();
+  });
 });
 
 describe('cancelTask / pauseTask / resumeTask series matching', () => {

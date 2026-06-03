@@ -361,7 +361,27 @@ No new session machinery, no delivery rework — distinct from §3's per-issue
 dispatch but reuses the same "per-thread session woken on a schedule, reports
 in-thread" foundation. Could ship independently and *before* §3 (smaller).
 
-Status: not building yet (per Dave: folded here, decide later).
+**Status: BUILT (2026-06-03), on this branch, pending deploy.** Shipped the
+opt-in `scope` exactly as designed above:
+- `container/agent-runner/src/mcp-tools/scheduling.ts` — `scope` param on
+  `schedule_task`; `list_tasks`/`read_task` now merge own-inbound (thread loops)
+  + channel mount and mark thread-scoped rows `[thread]`.
+- `src/modules/scheduling/actions.ts` — `handleScheduleTask` routes
+  `scope:'thread'` into the calling per-thread session's inbound using the
+  host-authoritative `session.thread_id` (reuses delivery's open handle; falls
+  back to channel-root from a non-thread caller). Management ops resolve the
+  calling thread session first, then channel root.
+- `src/modules/scheduling/db.ts` — cancel/pause/resume return affected-row
+  counts (drive the resolution order).
+- `scheduling.instructions.md` — agent guidance for thread-loops.
+- Tests: `src/modules/scheduling/{db,actions}.test.ts` (+10 cases). Full host
+  suite 1639 pass / 0 fail; container mcp-tools pass in isolation (the 6
+  parallel-race flakies are pre-existing, unrelated). Host + container
+  typechecks clean.
+
+Deploy: host `pnpm run build` + `sudo systemctl restart nanoclaw-v2` (restart
+respawns containers, which pick up the bind-mounted agent-runner source — no
+image rebuild needed).
 
 ## 7. Risks / watch-items
 
