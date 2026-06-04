@@ -48,3 +48,41 @@ describe('send_message MCP tool — in_reply_to plumbing', () => {
     expect(out[0].in_reply_to).toBeNull();
   });
 });
+
+describe('send_message MCP tool — default replies in the current conversation', () => {
+  // Regression for the /team-auto-to-DM bug: omitting `to` must post in the
+  // session's own thread, even when an owner-DM destination exists. Only an
+  // explicit `to` redirects elsewhere.
+  beforeEach(() => {
+    const db = getInboundDb();
+    db.exec(
+      'CREATE TABLE IF NOT EXISTS session_routing (id INTEGER PRIMARY KEY, channel_type TEXT, platform_id TEXT, thread_id TEXT)',
+    );
+    db.prepare(
+      "INSERT INTO session_routing (id, channel_type, platform_id, thread_id) VALUES (1, 'slack', 'slack:C0AJA89MN2E', 'slack:C0AJA89MN2E:1780316121.601669')",
+    ).run();
+    // An owner-DM destination the agent could (wrongly) redirect to.
+    db.prepare(
+      `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+       VALUES ('dave', 'Dave', 'channel', 'slack', 'slack:D0AK1BR5J92', NULL)`,
+    ).run();
+  });
+
+  it('omitting `to` posts in the session thread, not the owner DM', async () => {
+    await sendMessage.handler({ text: 'team-auto: build stage done' });
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(out[0].platform_id).toBe('slack:C0AJA89MN2E');
+    expect(out[0].thread_id).toBe('slack:C0AJA89MN2E:1780316121.601669');
+  });
+
+  it('explicit `to` still redirects to the DM (channel-root, no thread)', async () => {
+    await sendMessage.handler({ to: 'dave', text: 'explicitly DM you' });
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(out[0].platform_id).toBe('slack:D0AK1BR5J92');
+    expect(out[0].thread_id).toBeNull();
+  });
+});

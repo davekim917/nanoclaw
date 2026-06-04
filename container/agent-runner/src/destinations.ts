@@ -256,7 +256,11 @@ function buildDestinationsSection(): string {
   );
   lines.push('');
   lines.push(
-    'The `send_message` MCP tool is the same delivery, available mid-turn — handy for a quick acknowledgment ("on it") before a slow tool call. Each `send_message` call and each final-response `<message>` block lands as its own message in the conversation, so they read as a sequence rather than as one combined reply.',
+    'Keep the WHOLE conversation in the place it started. Progress updates, interim status, and the final result for work you were asked to do all go back to the destination the request came `from` — including across a long, multi-step task (e.g. a `/team-auto` run or a loop). Do NOT redirect status or completion reports to someone\'s DM, even the owner\'s, just because it feels like "telling them" — that splits the conversation across two places. Address a DM or a different channel ONLY when the person explicitly asked you to message there.',
+  );
+  lines.push('');
+  lines.push(
+    'The `send_message` MCP tool is the same delivery, available mid-turn — handy for a quick acknowledgment ("on it") before a slow tool call. Omit its `to` argument to post in the current conversation (this is the default and works no matter how many destinations you have); pass `to` only to reach a destination OTHER than the one you\'re working in. Each `send_message` call and each final-response `<message>` block lands as its own message in the conversation, so they read as a sequence rather than as one combined reply.',
   );
   return lines.join('\n');
 }

@@ -383,6 +383,35 @@ Deploy: host `pnpm run build` + `sudo systemctl restart nanoclaw-v2` (restart
 respawns containers, which pick up the bind-mounted agent-runner source — no
 image rebuild needed).
 
+## 6b. Related (BUILT): proactive output should stay in the originating conversation
+
+Surfaced 2026-06-03: a `/team-auto` run launched in a Slack thread sent all 7 of
+its stage-progress + completion reports to the owner's **DM**, while normal
+working chatter correctly stayed in the thread.
+
+**Root cause (verified against `sess-1780316123279-1cmw43` outbound):** NOT a
+routing bug. The agent's turn-final replies and `send_message` with no `to`
+already default to the session's own conversation (`resolveRouting`,
+`mcp-tools/core.ts:78-88` → `getSessionRouting()` returns the thread). The agent
+**explicitly** addressed the owner-DM destination by name for each progress
+report. The in-prompt guidance (`destinations.ts`) only told it to "address the
+destination it came `from`" *when replying to an incoming message* — it said
+nothing about mid-run proactive output — and the `send_message` description
+("if you have only one destination, you can omit `to`") implied that with
+multiple destinations you must name one, nudging it toward the salient "Dave" DM.
+
+**Fix (BUILT 2026-06-04, this branch) — guidance + tool descriptions, no routing
+logic change:**
+- `destinations.ts` — added an explicit rule: keep the whole conversation
+  (progress, interim status, final result, across long `/team-auto`/loop runs) in
+  the destination it came `from`; never redirect status/completion to a DM unless
+  explicitly asked. Clarified that omitting `send_message`'s `to` posts in the
+  current conversation regardless of destination count.
+- `core.ts` — rewrote `send_message`/`send_file` descriptions to make "omit `to`
+  = reply here" the clear default and warn against redirecting routine output.
+- `core.test.ts` — +2 regression cases: omit-`to` posts in the session thread
+  (not the owner DM); explicit `to` still redirects.
+
 ## 7. Risks / watch-items
 
 - **Idempotency:** the poll can re-see a thread before labeling completes; key

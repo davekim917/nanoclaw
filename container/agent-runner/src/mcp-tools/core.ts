@@ -118,7 +118,8 @@ function resolveRouting(
 export const sendMessage: McpToolDefinition = {
   tool: {
     name: 'send_message',
-    description: 'Send a message to a named destination. If you have only one destination, you can omit `to`.',
+    description:
+      'Send a message. Omit `to` to post in the CURRENT conversation (the thread/channel you are working in) — this is the default and works regardless of how many destinations you have, so it is the right choice for progress updates and results of the work you were asked to do. Pass `to` ONLY to reach a different destination than the current conversation (a sibling agent, another channel, or a DM someone explicitly asked you to use). Do not redirect routine status/completion to a DM.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -157,7 +158,8 @@ export const sendMessage: McpToolDefinition = {
 export const sendFile: McpToolDefinition = {
   tool: {
     name: 'send_file',
-    description: 'Send a file to a named destination. If you have only one destination, you can omit `to`.',
+    description:
+      'Send a file. Omit `to` to post in the current conversation (the thread/channel you are working in) — the default, regardless of destination count. Pass `to` only to reach a different destination than the current conversation.',
     inputSchema: {
       type: 'object' as const,
       properties: {
