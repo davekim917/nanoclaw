@@ -271,6 +271,51 @@ the thread.
 
 ---
 
+## 5a. Decisions locked + v1 BUILT (2026-06-05)
+
+Dave's calls on §5:
+1. **Every real support ticket** gets a channel announcement + working thread
+   (the pre-script already filters noise, so each remaining ticket is genuine).
+2. **illie (same Illysium group)** works each issue as a per-thread session —
+   reuses illie's Linear/gws creds, CLAUDE.md, identity. No new bot/secrets.
+3. **Agent-driven dispatch via a new MCP tool** (`dispatch_support_issue`) with a
+   **thin host handler** — reuses the `postParent→createThread→resolveSession→seed
+   →wake` primitives but NOT the orchestrator-dispatch tasks/watchdog (support
+   threads idle for days; the watchdog would reap them). One idempotent tool
+   handles new tickets AND follow-ups, keyed on Gmail `threadId`.
+4. **Mapping store = central-DB `support_threads` table** (host-readable for
+   follow-up routing).
+5. **Channel surface = per-ticket announcement + thread** (replaces the bundled
+   digest; only failures/`filtered N` lines remain at channel root).
+6. **Outbound email send deferred to v2** — v1 is read → ticket → work-in-Slack;
+   illie may draft in-thread but not send. `last_gmail_message_id` retained for v2.
+7. **Lifecycle:** sessions are normal per-thread sessions woken by engineer
+   replies / follow-up emails; `status='open'`, reopened on any follow-up; a
+   `closeSupportThread` helper exists for when an issue resolves (not yet wired to
+   Linear-resolved — a v1.1 follow-up). Archived sessions auto-reopen on the next
+   follow-up email.
+
+**BUILT this branch (code is LIVE-but-dormant until illie's poller prompt adopts
+the tool — see `poller-prompt-v1.md`):**
+- `src/db/migrations/041-support-threads.ts` + `src/db/support-threads.ts` — table
+  + CRUD (get/insert(OR IGNORE)/touch/close).
+- `src/modules/support-threads/dispatch.ts` + `index.ts` — `dispatch_support_issue`
+  delivery-action handler (idempotent new/follow-up), registered via the modules
+  barrel.
+- `container/agent-runner/src/mcp-tools/support.ts` (+ barrel import) — the tool.
+- Tests: `dispatch.test.ts` (new opens one thread+session+mapping+seed; follow-up
+  routes in, no duplicate), `db`-level via those, `support.test.ts` (tool
+  contract). Full host suite 1641 pass / 0 fail; container support test 2/2; host
+  + container typechecks clean.
+- `poller-prompt-v1.md` — the operational prompt that activates it.
+
+**v2 / follow-ups (not built):** outbound email send (draft-in-Slack → approve →
+`gws gmail send` with In-Reply-To/References from `last_gmail_message_id`);
+close-on-Linear-resolved wiring; optional dashboard surfacing of support threads
+(the board reads channel-root tasks, so per-issue sessions won't show there yet).
+
+---
+
 ## 6. Rough phased plan (post-decisions)
 
 1. **Mapping store** — `support_threads` table (or extended JSON): `gmail_thread_id

@@ -34,3 +34,7 @@ import './backlog/index.js';
 // Channel-config registers delivery actions for set_channel_model /
 // set_channel_effort. Depends on permissions (for isAdminOfAgentGroup).
 import './channel-config/index.js';
+// Support-threads — dispatch_support_issue: route each support email thread to
+// its own Slack thread + per-issue session. Depends on the delivery action
+// registry being up (satisfied by import order).
+import './support-threads/index.js';
