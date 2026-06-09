@@ -2,7 +2,11 @@ export GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=/home/node/.config/gws/accounts/sup
 python3 <<'PY'
 import json, subprocess, sys, os, re
 
-TMAP_PATH = "/workspace/agent/support_ticketed_threads.json"
+# Shared workflow state (NOT a private bedroom): lives in /workspace/workgroup
+# so any sibling assigned to the support workflow reads/writes the same
+# Gmail-thread → Linear-issue map. The host's central support_threads table is
+# the authoritative routing record; this file is the pre-wake dedup cache.
+TMAP_PATH = "/workspace/workgroup/support_ticketed_threads.json"
 
 def gws(*args):
     r = subprocess.run(["gws", *args], capture_output=True, text=True, timeout=60)

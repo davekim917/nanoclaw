@@ -284,7 +284,14 @@ Dave's calls on §5:
    threads idle for days; the watchdog would reap them). One idempotent tool
    handles new tickets AND follow-ups, keyed on Gmail `threadId`.
 4. **Mapping store = central-DB `support_threads` table** (host-readable for
-   follow-up routing).
+   follow-up routing) — host-owned, agent-agnostic. **State must not live in any
+   agent's private bedroom** (Dave's principle, 2026-06-09): the pre-script's
+   pre-wake dedup cache (`support_ticketed_threads.json`) moved from
+   `/workspace/agent/` → `/workspace/workgroup/` (shared across all
+   support-assigned siblings), so the workflow's protocol AND state are both
+   agent-agnostic and any assigned agent keeps continuity. Purest end-state
+   (zero agent-side cache — move Linear new-vs-existing fully host-side off
+   `support_threads`) is a deliberate v1.1 follow-up.
 5. **Channel surface = per-ticket announcement + thread** (replaces the bundled
    digest; only failures/`filtered N` lines remain at channel root).
 6. **Outbound email send deferred to v2** — v1 is read → ticket → work-in-Slack;
