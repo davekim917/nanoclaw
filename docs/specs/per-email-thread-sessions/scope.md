@@ -285,13 +285,22 @@ Dave's calls on §5:
    handles new tickets AND follow-ups, keyed on Gmail `threadId`.
 4. **Mapping store = central-DB `support_threads` table** (host-readable for
    follow-up routing) — host-owned, agent-agnostic. **State must not live in any
-   agent's private bedroom** (Dave's principle, 2026-06-09): the pre-script's
-   pre-wake dedup cache (`support_ticketed_threads.json`) moved from
-   `/workspace/agent/` → `/workspace/workgroup/` (shared across all
-   support-assigned siblings), so the workflow's protocol AND state are both
-   agent-agnostic and any assigned agent keeps continuity. Purest end-state
-   (zero agent-side cache — move Linear new-vs-existing fully host-side off
-   `support_threads`) is a deliberate v1.1 follow-up.
+   agent's private bedroom** (Dave's principle, 2026-06-09).
+
+   **PUREST VERSION BUILT (2026-06-09, same day, per Dave):** zero agent-side
+   state of any kind — no bedroom file, no workgroup file. The poller is a thin
+   triager (noise pre-flight → `dispatch_support_issue` → Gmail label); it does
+   NO Linear work and tracks nothing. The host decides new-vs-existing from
+   `support_threads`; the PER-ISSUE session creates the Linear ticket (or
+   comments on follow-ups, per its seed prompt) and reports it back via the new
+   `update_support_ticket` tool (resolved by calling-session id — no
+   agent-supplied keys), which also auto-edits the channel announcement to show
+   the ticket id (migration 042 added subject/sender columns to recompose it).
+   Also fixed in this pass: the reopen path now UPSERTs (the original
+   INSERT OR IGNORE silently dropped the new session on reopen, stranding all
+   future follow-ups), and legacy ticket-map entries are seeded host-side into
+   `support_threads` so in-flight email threads get comments, not duplicate
+   tickets. Host suite 1645 pass / 0 fail; container support tests 4/4.
 5. **Channel surface = per-ticket announcement + thread** (replaces the bundled
    digest; only failures/`filtered N` lines remain at channel root).
 6. **Outbound email send deferred to v2** — v1 is read → ticket → work-in-Slack;

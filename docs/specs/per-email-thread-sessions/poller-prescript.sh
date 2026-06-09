@@ -1,23 +1,18 @@
 export GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=/home/node/.config/gws/accounts/support-illysium.json
 python3 <<'PY'
-import json, subprocess, sys, os, re
+import json, subprocess, sys, re
 
-# Shared workflow state (NOT a private bedroom): lives in /workspace/workgroup
-# so any sibling assigned to the support workflow reads/writes the same
-# Gmail-thread → Linear-issue map. The host's central support_threads table is
-# the authoritative routing record; this file is the pre-wake dedup cache.
-TMAP_PATH = "/workspace/workgroup/support_ticketed_threads.json"
+# NO local state. New-vs-existing-ticket is decided HOST-side from the central
+# support_threads table when the agent calls dispatch_support_issue — the
+# poller never tracks which threads are ticketed. The Gmail `bot-ticketed`
+# label (applied after dispatch) is the only "already processed" marker, and
+# it lives in Gmail itself.
 
 def gws(*args):
     r = subprocess.run(["gws", *args], capture_output=True, text=True, timeout=60)
     if r.returncode != 0: return None
     try: return json.loads(r.stdout)
     except: return None
-
-tmap = {}
-if os.path.exists(TMAP_PATH):
-    try: tmap = json.load(open(TMAP_PATH))
-    except: tmap = {}
 
 # Gmail query: exclude already-ticketed, promotions/updates/social/forums categories,
 # and obvious automated noreply senders. Real support emails come from people, not
@@ -50,7 +45,7 @@ summaries = []
 for m in msgs[:25]:
     full = gws("gmail","users","messages","get","--params",
                json.dumps({"userId":"me","id":m["id"],"format":"metadata",
-                           "metadataHeaders":["From","Subject","Date","List-Unsubscribe","Precedence","Auto-Submitted"]}))
+                           "metadataHeaders":["From","Subject","Date","Message-ID","List-Unsubscribe","Precedence","Auto-Submitted"]}))
     if not full: continue
     headers = {h["name"]: h["value"] for h in full.get("payload",{}).get("headers",[])}
     sender = headers.get("From","")
@@ -73,8 +68,8 @@ for m in msgs[:25]:
         "from": sender,
         "subject": headers.get("Subject",""),
         "date": headers.get("Date",""),
+        "messageIdHeader": headers.get("Message-ID",""),
         "snippet": (full.get("snippet","") or "")[:400],
-        "existingTicket": tmap.get(m["threadId"]),
     })
 
 if not summaries:

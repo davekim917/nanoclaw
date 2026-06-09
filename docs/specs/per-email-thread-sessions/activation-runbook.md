@@ -4,72 +4,69 @@ Chosen config (2026-06-05): **illie-codex runs the whole support flow** (poller 
 per-issue work) in a **dedicated #support Slack channel**; illie (Claude) stays
 reachable in the thread by @-mention.
 
-The feature code needs **no changes** for this — `dispatch_support_issue` derives
-the channel from the poller's messaging group and the worker from the poller's
-agent group, so running the poller as illie-codex in #support is sufficient.
+Purest-design revision (2026-06-09, Dave's principle): **zero agent-side workflow
+state**. The poller is a thin triager (no Linear, no map file); the host decides
+new-vs-existing from the central `support_threads` table; the per-issue session
+owns all Linear work and reports its ticket via `update_support_ticket`. Protocol
+lives in the repo, state lives host-side — any agent can be assigned without
+migration.
+
+The feature code derives the channel from the poller's messaging group and the
+worker from the poller's agent group, so running the poller as illie-codex in
+#support is sufficient — no per-agent configuration.
 
 ## Prereqs (already satisfied)
 
-- illie-codex `container.json` already declares `linear` + `google-workspace:support-illysium`
-  creds (symmetric with illie) — so its container can run the Gmail pre-script
-  and write Linear tickets. No new credential provisioning.
+- illie-codex `container.json` declares `linear` + `google-workspace:support-illysium`
+  creds (symmetric with illie) — pre-script (gws) and per-issue Linear work both
+  covered. No new credential provisioning.
 - The pre-script runs in the agent-runner before the provider is invoked, so it
   works identically under Codex.
-- Internal MCP tools (incl. `dispatch_support_issue`) are served by the single
-  `nanoclaw` stdio server every provider connects to — available to illie-codex.
+- Internal MCP tools (`dispatch_support_issue`, `update_support_ticket`) are
+  served by the single `nanoclaw` stdio server every provider connects to.
 
-## Steps
+## Steps (host-executable; performed 2026-06-09)
 
-1. **Deploy the feature code** — merge this branch to `main`, `pnpm run build`,
-   `sudo systemctl restart nanoclaw-v2`. Safe: dispatch_support_issue is dormant
-   until a poller calls it.
+1. **Deploy the feature code** — merge to `main`, `pnpm run build`,
+   `sudo systemctl restart nanoclaw-v2` (runs migrations 041/042). Safe:
+   dormant until a poller calls the tool.
 
-2. **Create #support in Slack** and @-mention **both** illie-codex and illie in
-   it once. Workspace-trust auto-wire (router.ts) wires each sibling to the new
-   channel on first mention — no manual `/manage-channels` needed. (illie must be
-   wired too so it receives thread @-mentions.)
+2. **Create #support in Slack** and @-mention **both** illie-codex and illie
+   once — workspace-trust auto-wire wires each sibling. ✅ done by Dave
+   (mg `slack:C0B9JUB95FE` wired for both bot apps).
 
-3. **Schedule the poller as illie-codex, in #support.** In the #support channel
-   (so the task lands in illie-codex's #support channel-root session), have
-   illie-codex create the recurring support poller:
-   - **`script`**: reuse the existing Gmail pre-filter from illie's current
-     support poller verbatim (it emits `newMessages` with `threadId` +
-     `existingTicket`). illie-codex can read it from illie's current scheduled
-     task, or copy it from the shared workgroup.
-   - **`prompt`**: the v1 prompt in `poller-prompt-v1.md` (triage → ticket →
-     `dispatch_support_issue` per email; no bundled digest).
-   - **`recurrence`**: `*/15 * * * *` (or whatever cadence you want).
-   - This is a normal `schedule_task` — it stays a channel-root task in #support
-     (correct: the detector must not be thread-bound). Each new ticket then gets
-     its own thread via `dispatch_support_issue`.
+3. **Seed `support_threads` from the legacy ticket map** (one-time, host-side):
+   illie's old flow kept `gmailThreadId → {team, issue}` in its workspace JSON.
+   Insert one row per entry (`linear_*` set, `session_id`/`slack_*` NULL) so a
+   follow-up email on an in-flight thread opens its working thread with the
+   existing ticket attached (Linear comment, not a duplicate ticket). The legacy
+   JSON is then retired — nothing reads it anymore.
 
-   - **Shared workflow state (no per-agent bedroom):** the pre-script + prompt
-     keep the Gmail-thread → Linear-issue map at
-     `/workspace/workgroup/support_ticketed_threads.json` — SHARED across every
-     support-assigned sibling, so reassigning the workflow keeps continuity and
-     no agent owns the state privately. The host's central `support_threads`
-     table is the authoritative routing record. **One-time migration:** move
-     illie's existing `/workspace/agent/support_ticketed_threads.json` into
-     `/workspace/workgroup/` so in-flight threads are recognized (already-labeled
-     emails are skipped by the Gmail query regardless). After that it's shared
-     and agent-agnostic forever.
+4. **Schedule the poller** (host-side insert into illie-codex's #support
+   channel-root session, or ask illie-codex in #support):
+   - `script` = `poller-prescript.sh` (no map, emits `messageIdHeader`)
+   - `prompt` = the prompt block in `poller-prompt.md`
+   - `recurrence` = `*/15 * * * *`
+   - Channel-root task by design — the detector must not be thread-bound; each
+     issue gets its thread via `dispatch_support_issue`.
 
-4. **Cut over — disable illie's old #agents-xzo poller.** IMPORTANT: the existing
-   support poller on illie (in #agents-xzo) must be **cancelled/paused** when the
-   new one goes live, or BOTH run — double-ticketing races on the Gmail
-   `bot-ticketed` label and two sets of Slack output. Have illie `cancel_task`
-   its current support poller (or `pause_task` it during a soak). Verify only one
-   support poller is active (`list_tasks`).
+5. **Cut over — cancel illie's old #agents-xzo poller** (host-side `cancelTask`
+   on its channel-root inbound, or ask illie). With both running you'd get
+   double-processing races on the Gmail `bot-ticketed` label.
 
-5. **Verify (first real ticket):** a genuine support email should produce (a) a
-   Linear ticket, (b) one announcement in #support, (c) a working thread under it
-   with illie-codex's assessment, (d) a `support_threads` row. A follow-up email
-   on the same Gmail thread should land in the SAME thread, no duplicate. @-mention
-   illie in a thread to confirm the sibling joins.
+6. **Verify (first real ticket):** a genuine support email should produce
+   (a) one announcement in #support (`🎫 Support: subject — sender`),
+   (b) a working thread with the email + illie-codex's assessment,
+   (c) a Linear ticket created BY the per-issue session,
+   (d) the announcement auto-edited to `🎫 TEAM ISSUE: subject — sender`,
+   (e) a fully-populated `support_threads` row.
+   A follow-up email on the same Gmail thread lands in the SAME thread (Linear
+   comment, no duplicate). @-mention illie in a thread to confirm the sibling
+   joins.
 
 ## Rollback
 
-- Feature: restore illie's old #agents-xzo poller prompt (the bundled-digest one)
-  and cancel the illie-codex poller. The code stays deployed but dormant.
-- The `support_threads` rows + opened threads are harmless if left; new tickets
+- Cancel the illie-codex poller task; restore illie's old bundled-digest poller
+  if desired. The code stays deployed but dormant.
+- `support_threads` rows + opened threads are harmless if left; new tickets
   simply stop being dispatched.

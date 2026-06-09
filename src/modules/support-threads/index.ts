@@ -6,6 +6,7 @@
  * See docs/specs/per-email-thread-sessions/scope.md.
  */
 import { registerDeliveryAction } from '../../delivery.js';
-import { handleDispatchSupportIssue } from './dispatch.js';
+import { handleDispatchSupportIssue, handleUpdateSupportTicket } from './dispatch.js';
 
 registerDeliveryAction('dispatch_support_issue', handleDispatchSupportIssue);
+registerDeliveryAction('update_support_ticket', handleUpdateSupportTicket);

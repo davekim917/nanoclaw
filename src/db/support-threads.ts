@@ -19,6 +19,8 @@ export interface SupportThread {
   session_id: string | null;
   status: string;
   last_gmail_message_id: string | null;
+  subject: string | null;
+  sender: string | null;
   created_at: string;
   last_activity_at: string;
 }
@@ -29,7 +31,7 @@ export function getSupportThread(gmailThreadId: string): SupportThread | undefin
     .get(gmailThreadId) as SupportThread | undefined;
 }
 
-export interface InsertSupportThread {
+export interface UpsertSupportThread {
   gmailThreadId: string;
   agentGroupId: string;
   messagingGroupId: string;
@@ -39,27 +41,73 @@ export interface InsertSupportThread {
   slackThreadId: string;
   sessionId: string;
   lastGmailMessageId: string | null;
+  subject: string | null;
+  sender: string | null;
 }
 
 /**
- * Record a freshly-opened support thread. `INSERT OR IGNORE` so a duplicate
- * dispatch for the same Gmail thread (retried fire, racing poll) can't create
- * a second row — the caller checks `getSupportThread` first, this is the
- * belt-and-suspenders guard. Returns true if a row was inserted.
+ * Record a freshly-opened support thread. UPSERT, not INSERT OR IGNORE: a row
+ * may already exist with no live session/thread — either seeded from a legacy
+ * ticket map (linear fields set, session/slack null) or left behind when its
+ * session was archived (reopen). In both cases the new session/thread MUST be
+ * recorded or every later follow-up would open yet another thread. Linear
+ * fields use COALESCE so a dispatch without ticket info never clobbers a
+ * recorded ticket; `created_at` is preserved on conflict.
  */
-export function insertSupportThread(t: InsertSupportThread, now: string): boolean {
-  const res = getDb()
+export function upsertSupportThread(t: UpsertSupportThread, now: string): void {
+  getDb()
     .prepare(
-      `INSERT OR IGNORE INTO support_threads
+      `INSERT INTO support_threads
          (gmail_thread_id, agent_group_id, messaging_group_id, linear_team, linear_issue,
           slack_parent_msg_id, slack_thread_id, session_id, status, last_gmail_message_id,
-          created_at, last_activity_at)
+          subject, sender, created_at, last_activity_at)
        VALUES (@gmailThreadId, @agentGroupId, @messagingGroupId, @linearTeam, @linearIssue,
           @slackParentMsgId, @slackThreadId, @sessionId, 'open', @lastGmailMessageId,
-          @now, @now)`,
+          @subject, @sender, @now, @now)
+       ON CONFLICT(gmail_thread_id) DO UPDATE SET
+         agent_group_id = excluded.agent_group_id,
+         messaging_group_id = excluded.messaging_group_id,
+         linear_team = COALESCE(excluded.linear_team, linear_team),
+         linear_issue = COALESCE(excluded.linear_issue, linear_issue),
+         slack_parent_msg_id = excluded.slack_parent_msg_id,
+         slack_thread_id = excluded.slack_thread_id,
+         session_id = excluded.session_id,
+         status = 'open',
+         last_gmail_message_id = COALESCE(excluded.last_gmail_message_id, last_gmail_message_id),
+         subject = COALESCE(excluded.subject, subject),
+         sender = COALESCE(excluded.sender, sender),
+         last_activity_at = excluded.last_activity_at`,
     )
     .run({ ...t, now });
-  return res.changes > 0;
+}
+
+/**
+ * Resolve the support thread a per-issue session belongs to. Used by the
+ * `update_support_ticket` handler — keying on the CALLING session id means the
+ * agent never supplies a cross-row key (same security posture as scheduling).
+ */
+export function getSupportThreadBySession(sessionId: string): SupportThread | undefined {
+  return getDb()
+    .prepare('SELECT * FROM support_threads WHERE session_id = ?')
+    .get(sessionId) as SupportThread | undefined;
+}
+
+/** Record the Linear ticket a per-issue session created for its thread. */
+export function setSupportThreadTicket(
+  gmailThreadId: string,
+  linearIssue: string,
+  linearTeam: string | null,
+  now: string,
+): void {
+  getDb()
+    .prepare(
+      `UPDATE support_threads
+          SET linear_issue = @linearIssue,
+              linear_team = COALESCE(@linearTeam, linear_team),
+              last_activity_at = @now
+        WHERE gmail_thread_id = @gmailThreadId`,
+    )
+    .run({ gmailThreadId, linearIssue, linearTeam, now });
 }
 
 /**
