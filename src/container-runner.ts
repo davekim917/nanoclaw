@@ -2196,24 +2196,10 @@ async function buildContainerArgs(
   // account on retryable errors.
   const auth = resolveAnthropicAuth(credentialFolder);
 
-  // Optional non-Anthropic routing: when ANTHROPIC_BASE_URL is set on the
-  // host, forward it + ANTHROPIC_API_KEY + any ANTHROPIC_API_KEY_N
-  // fallbacks to the container so the SDK talks to that endpoint instead
-  // of going through the OneCLI proxy. The container's claude provider
-  // rotates through the _N keys on retryable errors (429, rate_limit,
-  // overloaded, upstream_error, External provider returned).
-  //
-  // Gated on ANTHROPIC_BASE_URL: without it, keys aren't forwarded and
-  // OneCLI's HTTPS proxy injects credentials at request time (default path).
-  if (process.env.ANTHROPIC_BASE_URL) {
-    args.push('-e', `ANTHROPIC_BASE_URL=${process.env.ANTHROPIC_BASE_URL}`);
-    if (auth.apiKeyPrimary) {
-      args.push('-e', `ANTHROPIC_API_KEY=${auth.apiKeyPrimary}`);
-    }
-    for (const fb of auth.apiKeyFallbacks) {
-      args.push('-e', `ANTHROPIC_API_KEY_${fb.index}=${fb.value}`);
-    }
-  }
+  // Anthropic custom-upstream auth (ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY)
+  // is forwarded inside the OneCLI gateway block below, after the gateway
+  // applies, so the custom host can be excluded from the proxy via NO_PROXY
+  // and the forwarded key is authoritative. See the bypass block there.
 
   // OAuth path (Claude Max subscription). When CLAUDE_CODE_OAUTH_TOKEN is
   // set on the host we forward it + any CLAUDE_CODE_OAUTH_TOKEN_N fallbacks
@@ -2329,46 +2315,19 @@ async function buildContainerArgs(
   // Must ensureAgent first for non-admin groups, otherwise applyContainerConfig
   // rejects the unknown agent identifier and returns false.
   //
-  // Skipped entirely when the operator is running a non-Anthropic routing
-  // proxy via ANTHROPIC_BASE_URL. The two paths are mutually exclusive:
-  // OneCLI intercepts outbound HTTPS at the TCP layer, which would
-  // interfere with openlimits / custom-proxy auth. In the BASE_URL path,
-  // ANTHROPIC_API_KEY (+ _N fallbacks) forwarded directly by the
-  // env-forwarding block above provide auth without OneCLI.
+  // The gateway runs for EVERY container so all tools (Slack, GitHub,
+  // Snowflake, Exa, …) get vault credential injection. When the operator
+  // routes Anthropic to a custom upstream via ANTHROPIC_BASE_URL, only that
+  // one host is excluded from the proxy (NO_PROXY entry added in the bypass
+  // block below, alongside the OAuth bypass) and authenticates with the
+  // forwarded ANTHROPIC_API_KEY — OneCLI keeps handling every other host.
+  // Same per-host bypass mechanism already used for snowflake/aws/github.
   //
-  // When OneCLI IS the path: gateway failure is treated as transient and
-  // throws — the caller (router/host-sweep) catches, leaves the inbound
-  // message pending, and the next sweep tick retries. Spawning a container
-  // with no credentials would only mask the misconfiguration.
-  if (process.env.ANTHROPIC_BASE_URL) {
-    log.info('Skipping OneCLI gateway — ANTHROPIC_BASE_URL set, using direct proxy', { containerName });
-    if (containerConfig.onecliSecrets && containerConfig.onecliSecrets.length > 0) {
-      // `onecliSecrets` is a declarative scope intended for the OneCLI
-      // gateway path. In the ANTHROPIC_BASE_URL bypass path the gateway
-      // is OFF, so the declaration has no effect. Fail-closed: refuse
-      // to spawn so the operator catches the misconfiguration rather
-      // than running with phantom scoping.
-      throw new Error(
-        `container.json declares onecliSecrets but ANTHROPIC_BASE_URL is set — ` +
-          `OneCLI gateway is bypassed in this path, so per-group secret scoping cannot apply. ` +
-          `Pick one: drop ANTHROPIC_BASE_URL (run through OneCLI) or remove onecliSecrets from container.json.`,
-      );
-    }
-    // Slack MCP is incompatible with the OneCLI bypass path (no gateway to
-    // substitute the placeholder Bearer → 401 on every call). But we should
-    // NOT throw — that would block every spawn of the agent, including
-    // sessions in shared channels where the gate would deny Slack anyway.
-    // Log + flag: the Slack MCP registration block below will skip
-    // registration when this flag is set, leaving the rest of the spawn
-    // intact. (Codex P2 catch on PR #108 follow-up.)
-    if (containerConfig.slack_user_token?.enabled) {
-      log.warn(
-        'slack_user_token.enabled but ANTHROPIC_BASE_URL is set — OneCLI gateway is bypassed, ' +
-          'Slack MCP will not be registered for any session of this agent until BASE_URL is dropped',
-        { folder: agentGroup.folder },
-      );
-    }
-  } else {
+  // Gateway failure is treated as transient and throws — the caller
+  // (router/host-sweep) catches, leaves the inbound message pending, and the
+  // next sweep tick retries. Spawning a container with no credentials would
+  // only mask the misconfiguration.
+  {
     // The OneCLI identity this container's proxy is wired to. Defaults to the
     // per-group identity; a non-owner-safe session carrying a Slack user-token
     // secret is reassigned to `<group>-noslack` below (Slack withheld).
@@ -2517,6 +2476,30 @@ async function buildContainerArgs(
         const key = `CLAUDE_CODE_OAUTH_TOKEN_${fb.index}`;
         stripEnvEntry(args, key);
         args.push('-e', `${key}=${fb.value}`);
+      }
+    }
+
+    // Custom-upstream Anthropic auth: when ANTHROPIC_BASE_URL routes Anthropic
+    // to a custom endpoint (e.g. a key-rotating proxy), exclude that one host
+    // from the OneCLI proxy so its MITM doesn't intercept the request, and
+    // authenticate with the forwarded ANTHROPIC_API_KEY (+ _N rotation). OneCLI
+    // does not manage Anthropic in this mode; it keeps injecting for every
+    // other host. Forwarded here, after the gateway applied, so these are the
+    // authoritative env values.
+    if (process.env.ANTHROPIC_BASE_URL) {
+      args.push('-e', `ANTHROPIC_BASE_URL=${process.env.ANTHROPIC_BASE_URL}`);
+      if (auth.apiKeyPrimary) {
+        args.push('-e', `ANTHROPIC_API_KEY=${auth.apiKeyPrimary}`);
+      }
+      for (const fb of auth.apiKeyFallbacks) {
+        args.push('-e', `ANTHROPIC_API_KEY_${fb.index}=${fb.value}`);
+      }
+      try {
+        mergeNoProxy(args, new URL(process.env.ANTHROPIC_BASE_URL).hostname);
+      } catch {
+        log.warn('ANTHROPIC_BASE_URL is not a valid URL — no NO_PROXY bypass added', {
+          value: process.env.ANTHROPIC_BASE_URL,
+        });
       }
     }
   }
@@ -2749,7 +2732,7 @@ async function buildContainerArgs(
   // sneak past — `delete` runs unconditionally on deny.
   // (Codex P2 catch on PR #108 follow-up.)
   let slackUserTokenAllowed = false;
-  if (containerConfig.slack_user_token?.enabled && !process.env.ANTHROPIC_BASE_URL) {
+  if (containerConfig.slack_user_token?.enabled) {
     const { canUseSlackUserToken } = await import('./modules/permissions/slack-user-token-gate.js');
     slackUserTokenAllowed = canUseSlackUserToken(
       getDb(),
