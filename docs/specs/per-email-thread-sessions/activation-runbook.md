@@ -43,6 +43,16 @@ agent group, so running the poller as illie-codex in #support is sufficient.
      (correct: the detector must not be thread-bound). Each new ticket then gets
      its own thread via `dispatch_support_issue`.
 
+   - **Thread-map migration (one-time):** the pre-script keeps
+     `/workspace/agent/support_ticketed_threads.json` (Gmail thread → Linear
+     issue) to avoid duplicate tickets. That file is in illie's *private*
+     bedroom; illie-codex starts with an empty one. Already-processed emails are
+     excluded by the Gmail query (`-label:bot-ticketed`), so the risk is small,
+     but to recognize in-flight threads, copy illie's map over once: have illie
+     write it to `/workspace/workgroup/support_ticketed_threads.json` (shared),
+     then illie-codex copies it into its own `/workspace/agent/`. Or accept that
+     a handful of in-flight threads may get a fresh ticket during the transition.
+
 4. **Cut over — disable illie's old #agents-xzo poller.** IMPORTANT: the existing
    support poller on illie (in #agents-xzo) must be **cancelled/paused** when the
    new one goes live, or BOTH run — double-ticketing races on the Gmail
