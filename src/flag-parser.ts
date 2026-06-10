@@ -45,6 +45,12 @@ const MODEL_ALIAS_MAP: Record<string, string> = {
   'opus4-7': 'claude-opus-4-7[1m]',
   opus48: 'claude-opus-4-8[1m]',
   'opus4-8': 'claude-opus-4-8[1m]',
+  // Fable 5 (GA 2026-06-09): single-digit version scheme (claude-fable-5,
+  // not -5-0). 1M-context-only in this fork, same policy as opus. NOTE:
+  // $10/$50 per MTok — 2x Opus 4.8; opt-in via flag, never a default.
+  fable: 'claude-fable-5[1m]',
+  fable5: 'claude-fable-5[1m]',
+  'fable-5': 'claude-fable-5[1m]',
   sonnet46: 'claude-sonnet-4-6',
   'sonnet4-6': 'claude-sonnet-4-6',
   sonnet47: 'claude-sonnet-4-7',
@@ -53,7 +59,8 @@ const MODEL_ALIAS_MAP: Record<string, string> = {
   'haiku4-5': 'claude-haiku-4-5',
 };
 
-const VALID_MODEL_RE = /^(?:opus|sonnet|haiku|default|claude-(?:opus|sonnet|haiku)-\d+-\d+(?:\[\dm\])?)$/;
+const VALID_MODEL_RE =
+  /^(?:opus|sonnet|haiku|default|claude-(?:opus|sonnet|haiku)-\d+-\d+(?:\[\dm\])?|claude-fable-\d+(?:\[\dm\])?)$/;
 
 /**
  * Opus is only supported in its 1M-context form in this fork. Auto-append
@@ -70,7 +77,8 @@ const VALID_MODEL_RE = /^(?:opus|sonnet|haiku|default|claude-(?:opus|sonnet|haik
  * `[Nm]` suffix.
  */
 export function ensureOpus1mSuffix(model: string): string {
-  return /^claude-opus-\d+-\d+$/i.test(model) ? `${model}[1m]` : model;
+  // Fable shares the opus 1M-only policy (single-digit version: claude-fable-5).
+  return /^claude-(?:opus-\d+-\d+|fable-\d+)$/i.test(model) ? `${model}[1m]` : model;
 }
 
 function resolveModelAlias(raw: string): string {
@@ -105,6 +113,10 @@ const MODEL_EFFORT_SUPPORT: Record<string, ReadonlySet<EffortLevel>> = {
   // Same 1M-only policy. Bare `opus` resolves here once DEFAULT_OPUS_MODEL
   // points at 4.8 (container-runner.ts).
   'claude-opus-4-8[1m]': new Set(['low', 'medium', 'high', 'xhigh', 'max']),
+  // Fable 5: full effort surface (docs/en/build-with-claude/effort, verified
+  // 2026-06-09). Adaptive thinking is ALWAYS ON for fable — `disabled` is
+  // rejected by the API — so effort is the only depth control.
+  'claude-fable-5[1m]': new Set(['low', 'medium', 'high', 'xhigh', 'max']),
 };
 
 /** Structured representation of a parsed flag set. Empty object = no flags. */

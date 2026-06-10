@@ -365,6 +365,15 @@ const RETRYABLE_ERROR_RE = /429|rate[\s_-]?limit|overloaded|upstream_error|Exter
 export const QUOTA_RESULT_RE =
   /^\s*You['’]?(re|ve) (out of (extra |daily |weekly )?usage|(hit|reached) your (session |usage |weekly )?limit)\b/i;
 
+// Poisoned continuation: the SDK surfaces the thinking-signature 400 as plain
+// result text ("API Error: 400 ... Invalid `signature` in `thinking` block"),
+// not a thrown error — same delivery quirk as QUOTA_RESULT_RE above, so the
+// catch-block isSessionInvalid path never fires on its own. Detect and
+// re-throw; the message keeps the original text so STALE_SESSION_RE matches
+// and poll-loop's stale-session branch clears the continuation and retries
+// with a recap. See STALE_SESSION_RE for how continuations get poisoned.
+export const POISONED_CONTINUATION_RE = /invalid `?signature`? in `?thinking`? block/i;
+
 // Secrets the SDK needs for API auth but that Bash subprocesses must not see.
 // Built lazily inside the hook so late-bound env additions are covered.
 //
@@ -803,7 +812,9 @@ const CLAUDE_CODE_AUTO_COMPACT_WINDOW = process.env.CLAUDE_CODE_AUTO_COMPACT_WIN
  * aliases (`opus`), non-opus ids, or ids that already carry a `[Nm]` suffix.
  */
 function ensureOpus1mSuffix(model: string): string {
-  return /^claude-opus-\d+-\d+$/i.test(model) ? `${model}[1m]` : model;
+  // Fable shares the opus 1M-only policy (single-digit version: claude-fable-5).
+  // Keep in sync with src/flag-parser.ts ensureOpus1mSuffix.
+  return /^claude-(?:opus-\d+-\d+|fable-\d+)$/i.test(model) ? `${model}[1m]` : model;
 }
 
 // ── Provider ──
@@ -813,7 +824,14 @@ function ensureOpus1mSuffix(model: string): string {
  * resumed session can't be found — missing transcript .jsonl, unknown
  * session ID, etc.
  */
-const STALE_SESSION_RE = /no conversation found|ENOENT.*\.jsonl|session.*not found/i;
+// `Invalid signature in thinking block`: the stored continuation replays
+// thinking blocks signed by a different serving upstream (observed in the
+// 2026-06-09 auth-flip drill — turns produced under a custom ANTHROPIC_BASE_URL
+// proxy fail signature validation when replayed to api.anthropic.com, and vice
+// versa is possible). The history is unusable under the current auth path, so
+// treat it like a stale session: reset the continuation and start fresh.
+const STALE_SESSION_RE =
+  /no conversation found|ENOENT.*\.jsonl|session.*not found|invalid `?signature`? in `?thinking`? block/i;
 
 /**
  * Prompt-too-long detection. Matches the text variations Anthropic has
@@ -969,7 +987,15 @@ export class ClaudeProvider implements AgentProvider {
     // Per-turn input takes precedence over sticky config (A3).
     // Normalize bare opus → [1m] so the CLI's auto-compact window stays at 1M
     // regardless of auth path (see ensureOpus1mSuffix).
-    const rawModel = input.model ?? this.stickyConfig.model;
+    //
+    // Final fallback is the `opus` ALIAS, never undefined: with model
+    // undefined the CLI uses its own built-in default — which for a pinned
+    // binary is whatever Opus was current at its release (2.1.156 → opus-4-7,
+    // observed live 2026-06-09), silently ignoring the configured
+    // ANTHROPIC_DEFAULT_OPUS_MODEL chain (channel default → container.json →
+    // DEFAULT_OPUS_MODEL). The bare alias forces resolution through that env
+    // var, making the documented precedence the real behavior.
+    const rawModel = input.model ?? this.stickyConfig.model ?? 'opus';
     const model = rawModel ? ensureOpus1mSuffix(rawModel) : rawModel;
     const effort = input.effort ?? this.stickyConfig.effort;
     // ultracode is a session flag (xhigh + standing dynamic-workflow
@@ -1106,6 +1132,13 @@ export class ClaudeProvider implements AgentProvider {
             // fallback and retry instead of dispatching the quota message
             // to the user.
             throw new Error(`subscription_quota_exhausted: ${text}`);
+          }
+          if (text && POISONED_CONTINUATION_RE.test(text)) {
+            // Throw so poll-loop's isSessionInvalid branch clears the
+            // poisoned continuation and retries with a recap instead of
+            // dispatching the raw 400 to the user (and dead-stopping the
+            // session — the same history would fail every future turn).
+            throw new Error(text);
           }
           yield { type: 'result', text };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'api_retry') {

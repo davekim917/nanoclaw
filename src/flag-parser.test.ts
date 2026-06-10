@@ -90,6 +90,26 @@ describe('parseMessageFlags', () => {
       expect(r.intent).toEqual({ stickyModel: 'claude-opus-4-8[1m]', stickyEffort: 'xhigh' });
       expect(r.warnings).toEqual([]);
     });
+
+    it('resolves fable / fable5 / fable-5 aliases to claude-fable-5[1m]', () => {
+      expect(parseMessageFlags('-m fable hi').intent).toEqual({ stickyModel: 'claude-fable-5[1m]' });
+      expect(parseMessageFlags('-m fable5 hi').intent).toEqual({ stickyModel: 'claude-fable-5[1m]' });
+      expect(parseMessageFlags('-m fable-5 hi').intent).toEqual({ stickyModel: 'claude-fable-5[1m]' });
+    });
+
+    it('auto-appends [1m] to bare claude-fable-5 id (single-digit version scheme)', () => {
+      const r = parseMessageFlags('-m claude-fable-5 hi');
+      expect(r.intent).toEqual({ stickyModel: 'claude-fable-5[1m]' });
+    });
+
+    it('accepts the full effort surface on fable 5 (incl. xhigh and max)', () => {
+      const xhigh = parseMessageFlags('-m fable -e xhigh hi');
+      expect(xhigh.intent).toEqual({ stickyModel: 'claude-fable-5[1m]', stickyEffort: 'xhigh' });
+      expect(xhigh.warnings).toEqual([]);
+      const max = parseMessageFlags('-m fable -e max hi');
+      expect(max.intent).toEqual({ stickyModel: 'claude-fable-5[1m]', stickyEffort: 'max' });
+      expect(max.warnings).toEqual([]);
+    });
   });
 
   describe('mention prefix before flags', () => {

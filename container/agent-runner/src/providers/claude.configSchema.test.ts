@@ -99,4 +99,55 @@ describe('ClaudeProvider sticky config', () => {
     expect(mockSdkQuery).toHaveBeenCalledTimes(1);
     expect(capturedSdkOptions?.model).toBe('claude-sonnet-4-6');
   });
+
+  it('test_claude_flagless_default_is_opus_alias: no input model + no sticky → model is the opus ALIAS, never undefined', () => {
+    // With model undefined the CLI silently uses its pinned built-in default
+    // (2.1.156 → opus-4-7, observed live 2026-06-09) instead of the configured
+    // ANTHROPIC_DEFAULT_OPUS_MODEL chain. The provider must force the alias.
+    capturedSdkOptions = null;
+    mockSdkQuery.mockClear();
+
+    const provider = new ClaudeProvider({});
+
+    provider.query({ prompt: 'hi', cwd: '/tmp', continuation: undefined });
+
+    expect(mockSdkQuery).toHaveBeenCalledTimes(1);
+    expect(capturedSdkOptions?.model).toBe('opus');
+  });
+
+  it('test_claude_fable_1m_suffix: bare claude-fable-5 is normalized to its [1m] form', () => {
+    capturedSdkOptions = null;
+    mockSdkQuery.mockClear();
+
+    const provider = new ClaudeProvider({});
+
+    provider.query({ prompt: 'hi', cwd: '/tmp', model: 'claude-fable-5' });
+
+    expect(mockSdkQuery).toHaveBeenCalledTimes(1);
+    expect(capturedSdkOptions?.model).toBe('claude-fable-5[1m]');
+  });
+});
+
+describe('poisoned continuation detection (cross-auth-path thinking signatures)', async () => {
+  const { POISONED_CONTINUATION_RE } = await import('./claude.js');
+
+  // Verbatim error text observed in the 2026-06-09 auth-flip drill.
+  const DRILL_ERROR = 'API Error: 400 messages.5.content.0: Invalid `signature` in `thinking` block';
+
+  it('test_poisoned_re_matches_drill_text: matches the SDK result text verbatim', () => {
+    expect(POISONED_CONTINUATION_RE.test(DRILL_ERROR)).toBe(true);
+  });
+
+  it('test_poisoned_re_matches_unbacktick_variant: tolerates a wording change that drops backticks', () => {
+    expect(POISONED_CONTINUATION_RE.test('Invalid signature in thinking block')).toBe(true);
+  });
+
+  it('test_poisoned_re_no_false_positive: does not match ordinary signature/thinking prose', () => {
+    expect(POISONED_CONTINUATION_RE.test('the function signature changed while thinking about the block')).toBe(false);
+  });
+
+  it('test_isSessionInvalid_matches_rethrown_error: the re-thrown error engages the stale-session recovery branch', () => {
+    const provider = new ClaudeProvider({});
+    expect(provider.isSessionInvalid(new Error(DRILL_ERROR))).toBe(true);
+  });
 });
