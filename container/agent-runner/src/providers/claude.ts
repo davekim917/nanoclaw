@@ -817,6 +817,30 @@ function ensureOpus1mSuffix(model: string): string {
   return /^claude-(?:opus-\d+-\d+|fable-\d+)$/i.test(model) ? `${model}[1m]` : model;
 }
 
+/**
+ * Per-model-family default effort, applied only when nothing upstream chose
+ * one (-e flag, group provider config, operator NANOCLAW_DEFAULT_EFFORT).
+ *
+ *   opus  → xhigh — the recommended starting point for coding/agentic work
+ *           per the effort docs; deliberate fleet default (operator decision
+ *           2026-06-10).
+ *   fable → high  — fable's docs recommend `high` as the default starting
+ *           point; lower levels "often exceed xhigh performance on prior
+ *           models", and fable bills 2x Opus ($10/$50 per MTok).
+ *   sonnet → high — sonnet 4.6 rejects xhigh (low|medium|high|max only).
+ *   haiku → undefined — no effort control at the API level.
+ *
+ * `-e <level>` (turn or sticky) always wins over all of these.
+ */
+function defaultEffortForModel(model: string | undefined): string | undefined {
+  if (!model) return 'high';
+  const m = model.toLowerCase();
+  if (m === 'opus' || m.startsWith('claude-opus-')) return 'xhigh';
+  if (m.startsWith('claude-fable-')) return 'high';
+  if (m === 'haiku' || m.startsWith('claude-haiku-')) return undefined;
+  return 'high';
+}
+
 // ── Provider ──
 
 /**
@@ -997,7 +1021,11 @@ export class ClaudeProvider implements AgentProvider {
     // var, making the documented precedence the real behavior.
     const rawModel = input.model ?? this.stickyConfig.model ?? 'opus';
     const model = rawModel ? ensureOpus1mSuffix(rawModel) : rawModel;
-    const effort = input.effort ?? this.stickyConfig.effort;
+    // Effort precedence: -e flag (turn/sticky, arrives as input.effort) →
+    // group container.json provider config → operator override env
+    // (NANOCLAW_DEFAULT_EFFORT, injected by the host only when a channel or
+    // group default is explicitly configured) → per-model-family default.
+    const effort = input.effort ?? this.stickyConfig.effort ?? process.env.NANOCLAW_DEFAULT_EFFORT ?? defaultEffortForModel(model);
     // ultracode is a session flag (xhigh + standing dynamic-workflow
     // orchestration), NOT an effort value — applied via the SDK control
     // request below. Effort is already forced to xhigh upstream when set.

@@ -92,7 +92,8 @@ const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY, timeout: 30
 const DEFAULT_OPUS_MODEL = 'claude-opus-4-8[1m]';
 const DEFAULT_SONNET_MODEL = 'claude-sonnet-4-6';
 const DEFAULT_HAIKU_MODEL = 'claude-haiku-4-5-20251001';
-const DEFAULT_EFFORT = 'high';
+// (DEFAULT_EFFORT removed 2026-06-10 — effort defaults are per-model-family
+// in the claude provider; NANOCLAW_DEFAULT_EFFORT is operator-override-only.)
 
 /** Active containers tracked by session ID. */
 const activeContainers = new Map<string, { process: ChildProcess; containerName: string; spawnedAt: number }>();
@@ -2003,16 +2004,14 @@ async function buildContainerArgs(
   // fires at 80% of the model's own context window before this override matters.
   // The CLI itself hints at this value: "override with CLAUDE_CODE_AUTO_COMPACT_WINDOW=1000000".
   args.push('-e', 'CLAUDE_CODE_AUTO_COMPACT_WINDOW=1000000');
-  // Disable adaptive thinking so the CLI uses the older fixed-budget mode that
-  // emits visible `thinking` content blocks (what our deriveProgressLabels
-  // forwards). The CLI's own gate only actually flips modes when the model id
-  // contains "opus-4-6" or "sonnet-4-6"; for 4-7 this is a benign no-op. Keeps
-  // behavior consistent when a session explicitly selects 4-6.
-  args.push('-e', 'CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1');
-  // Fixed thinking budget (pairs with disable-adaptive above). max_output − 1
-  // for Opus 4.7 = 127999. Deprecated in the SDK query option but still
-  // honored as a CLI env knob.
-  args.push('-e', 'MAX_THINKING_TOKENS=127999');
+  // (Removed 2026-06-10: CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING=1 +
+  // MAX_THINKING_TOKENS=127999. They forced the CLI's legacy fixed-budget
+  // thinking mode for explicit 4-6 selections so thinking blocks stayed
+  // visible for progress labels — superseded by the provider passing
+  // `thinking: {type: 'adaptive', display: 'summarized'}` on every query
+  // (claude.ts), which yields visible summarized thinking on every 4.6+
+  // model, and they could conflict with always-adaptive models like
+  // claude-fable-5 that reject non-adaptive thinking.)
 
   // Default `opus` alias resolution and default effort. The constants
   // at the top of this file (DEFAULT_OPUS_MODEL etc.) are the single
@@ -2046,8 +2045,18 @@ async function buildContainerArgs(
   args.push('-e', `ANTHROPIC_DEFAULT_SONNET_MODEL=${DEFAULT_SONNET_MODEL}`);
   args.push('-e', `ANTHROPIC_DEFAULT_HAIKU_MODEL=${DEFAULT_HAIKU_MODEL}`);
 
-  const defaultEffort = channelDefaults?.channelDefaultEffort ?? containerConfig.defaultEffort ?? DEFAULT_EFFORT;
-  args.push('-e', `NANOCLAW_DEFAULT_EFFORT=${defaultEffort}`);
+  // NANOCLAW_DEFAULT_EFFORT is an OPERATOR override (per-channel wiring or
+  // per-group container.json) — injected only when one is actually set.
+  // When absent, the claude provider applies per-model-family defaults
+  // (opus → xhigh, fable/sonnet → high, haiku → none; see
+  // defaultEffortForModel in agent-runner claude.ts). The old unconditional
+  // `?? DEFAULT_EFFORT` fold made every model inherit one blanket value,
+  // which breaks per-family defaults (sonnet rejects xhigh) and masked
+  // whether the operator had chosen anything at all.
+  const defaultEffort = channelDefaults?.channelDefaultEffort ?? containerConfig.defaultEffort;
+  if (defaultEffort) {
+    args.push('-e', `NANOCLAW_DEFAULT_EFFORT=${defaultEffort}`);
+  }
 
   // Per-channel default tone profile — ports v1's "always-on tone" feature.
   // Precedence: per-channel wiring (messaging_group_agents.default_tone) →

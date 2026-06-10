@@ -1094,7 +1094,8 @@ interface FlagIntent {
   clearStickyUltracode?: boolean;
 }
 
-// Precedence: turn override → sticky → host-injected default (NANOCLAW_DEFAULT_EFFORT).
+// Precedence: turn override → sticky. Effort defaults (operator override env +
+// per-model-family) are applied inside the claude provider, not here.
 // ultracode follows the same precedence; effort is already forced to xhigh
 // host-side when ultracode is requested, so it rides alongside effort here.
 function applyFlagBatch(
@@ -1141,7 +1142,13 @@ function applyFlagBatch(
   }
 
   const model = intent?.turnModel ?? getStickyModel();
-  const effort = intent?.turnEffort ?? getStickyEffort() ?? process.env.NANOCLAW_DEFAULT_EFFORT;
+  // Effort here is USER INTENT ONLY (turn flag → sticky flag). Defaults are
+  // provider business: the claude provider resolves the operator override
+  // (NANOCLAW_DEFAULT_EFFORT) and per-model-family defaults itself, because
+  // only it knows the final model (and e.g. sonnet rejects xhigh). Codex and
+  // opencode have their own default surfaces (codex config schema default,
+  // opencode model-native) and never consumed this env fold.
+  const effort = intent?.turnEffort ?? getStickyEffort();
   const ultracode = intent?.turnUltracode ?? getStickyUltracode() ?? false;
 
   return { model, effort, ultracode };

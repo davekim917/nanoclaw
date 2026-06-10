@@ -128,6 +128,60 @@ describe('ClaudeProvider sticky config', () => {
   });
 });
 
+describe('per-model-family effort defaults', () => {
+  const run = (input: Record<string, unknown>, env?: string) => {
+    capturedSdkOptions = null;
+    mockSdkQuery.mockClear();
+    const prev = process.env.NANOCLAW_DEFAULT_EFFORT;
+    if (env === undefined) delete process.env.NANOCLAW_DEFAULT_EFFORT;
+    else process.env.NANOCLAW_DEFAULT_EFFORT = env;
+    try {
+      const provider = new ClaudeProvider({});
+      provider.query({ prompt: 'hi', cwd: '/tmp', ...input });
+      return capturedSdkOptions;
+    } finally {
+      if (prev === undefined) delete process.env.NANOCLAW_DEFAULT_EFFORT;
+      else process.env.NANOCLAW_DEFAULT_EFFORT = prev;
+    }
+  };
+
+  it('test_effort_default_opus_xhigh: flagless turn (opus alias default) gets xhigh', () => {
+    const opts = run({});
+    expect(opts?.model).toBe('opus');
+    expect(opts?.effort).toBe('xhigh');
+  });
+
+  it('test_effort_default_fable_high: -m fable without -e defaults to high (2x-cost model, docs-recommended default)', () => {
+    const opts = run({ model: 'claude-fable-5[1m]' });
+    expect(opts?.effort).toBe('high');
+  });
+
+  it('test_effort_flag_wins_on_fable: -e xhigh on fable overrides the family default', () => {
+    const opts = run({ model: 'claude-fable-5[1m]', effort: 'xhigh' });
+    expect(opts?.effort).toBe('xhigh');
+  });
+
+  it('test_effort_default_haiku_none: haiku gets no effort option (no API-level effort support)', () => {
+    const opts = run({ model: 'claude-haiku-4-5' });
+    expect(opts?.effort).toBeUndefined();
+  });
+
+  it('test_effort_default_sonnet_high: sonnet family defaults to high (rejects xhigh)', () => {
+    const opts = run({ model: 'claude-sonnet-4-6' });
+    expect(opts?.effort).toBe('high');
+  });
+
+  it('test_effort_operator_env_overrides_family_default: NANOCLAW_DEFAULT_EFFORT beats the family default', () => {
+    const opts = run({}, 'medium');
+    expect(opts?.effort).toBe('medium');
+  });
+
+  it('test_effort_flag_beats_operator_env: explicit -e wins over the operator env override', () => {
+    const opts = run({ effort: 'low' }, 'medium');
+    expect(opts?.effort).toBe('low');
+  });
+});
+
 describe('poisoned continuation detection (cross-auth-path thinking signatures)', async () => {
   const { POISONED_CONTINUATION_RE } = await import('./claude.js');
 
