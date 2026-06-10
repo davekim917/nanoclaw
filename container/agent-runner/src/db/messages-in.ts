@@ -40,6 +40,16 @@ export interface MessageInRow {
   content: string;
 }
 
+// Parse the two timestamp shapes that live in the session DBs into epoch ms.
+// SQLite's datetime('now') yields 'YYYY-MM-DD HH:MM:SS' — UTC but with no
+// zone marker, which Date.parse would read as LOCAL time. scheduleTask writes
+// ISO 'YYYY-MM-DDTHH:MM:SS.SSSZ'. Normalize to explicit-UTC before parsing.
+function parseDbUtc(value: string): number {
+  let s = value.includes('T') ? value : value.replace(' ', 'T');
+  if (!/(?:[zZ]|[+-]\d{2}:?\d{2})$/.test(s)) s += 'Z';
+  return Date.parse(s);
+}
+
 // Cap on how many messages reach the agent in one prompt. Read from
 // container.json; falls back to 10.
 function getMaxMessagesPerPrompt(): number {
@@ -97,13 +107,31 @@ export function getPendingMessages(isFirstPoll = false): MessageInRow[] {
     // gets duplicate replies. messages_out.in_reply_to is set to the originating
     // input id for every response the agent writes; presence of that row is the
     // authoritative "this input has been answered" signal.
-    const respondedIds = new Set(
-      (
-        outbound
-          .prepare('SELECT DISTINCT in_reply_to AS id FROM messages_out WHERE in_reply_to IS NOT NULL')
-          .all() as Array<{ id: string }>
-      ).map((r) => r.id),
-    );
+    //
+    // Due-aware refinement (2026-06-10): a reply can never precede its
+    // question. resolveDestinationThread used to stamp destination sends with
+    // in_reply_to = the NEWEST inbound row of the channel, so a task turn's
+    // output could claim to "answer" a sibling task's future, not-yet-due
+    // fire row — permanently suppressing that series (the row stays pending,
+    // recurrence never advances). Only honor a reply as the answer to a row
+    // if it was written at/after the row became due (process_after). Rows
+    // without process_after (chat) keep the original any-reply semantics.
+    const respondedAt = new Map<string, number>();
+    for (const r of outbound
+      .prepare(
+        'SELECT in_reply_to AS id, MAX(timestamp) AS ts FROM messages_out WHERE in_reply_to IS NOT NULL GROUP BY in_reply_to',
+      )
+      .all() as Array<{ id: string; ts: string }>) {
+      respondedAt.set(r.id, parseDbUtc(r.ts));
+    }
+    const pendingById = new Map(pending.map((m) => [m.id, m]));
+    const isResponded = (id: string): boolean => {
+      const ts = respondedAt.get(id);
+      if (ts === undefined) return false;
+      const row = pendingById.get(id);
+      if (!row || row.process_after == null) return true;
+      return ts >= parseDbUtc(row.process_after);
+    };
 
     // Orphan recall_context drain: a `recall-<X>` row is paired to inbound
     // row `<X>` by the host's recall-injection (it strips the prefix to
@@ -119,13 +147,13 @@ export function getPendingMessages(isFirstPoll = false): MessageInRow[] {
     const isOrphanRecall = (m: MessageInRow): boolean => {
       if (!m.id.startsWith('recall-')) return false;
       const pairedId = m.id.slice('recall-'.length);
-      return ackedIds.has(pairedId) || respondedIds.has(pairedId);
+      return ackedIds.has(pairedId) || isResponded(pairedId);
     };
 
     // Reverse: we fetched DESC to take the most recent N, but the agent
     // should see them in chronological order (oldest first).
     return pending
-      .filter((m) => !ackedIds.has(m.id) && !respondedIds.has(m.id) && !isOrphanRecall(m))
+      .filter((m) => !ackedIds.has(m.id) && !isResponded(m.id) && !isOrphanRecall(m))
       .reverse();
   } finally {
     inbound.close();

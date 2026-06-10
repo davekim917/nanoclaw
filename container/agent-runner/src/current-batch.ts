@@ -15,12 +15,47 @@
  */
 let currentInReplyTo: string | null = null;
 
+/**
+ * Per-destination reply anchors for the batch being processed, keyed by
+ * `<channelType>\0<platformId>`. In agent-shared sessions one batch can
+ * carry messages from several channels; a reply sent to channel X must
+ * anchor to X's inbound message, not the batch's first message.
+ *
+ * Derived ONLY from the claimed batch — never resolved from the newest
+ * inbound DB row. Batch rows are already claimed/processing, so stamping
+ * them as replied-to is harmless; a freshly-resolved "latest row" can be a
+ * sibling scheduled task's unfired future fire, and marking THAT as
+ * replied-to suppressed the series forever (the 2026-05-27..31 die-off).
+ */
+const batchAnchors = new Map<string, string>();
+
+function anchorKey(channelType: string, platformId: string): string {
+  return `${channelType}\0${platformId}`;
+}
+
+export function setCurrentBatchAnchors(
+  messages: Array<{ id: string; channel_type: string | null; platform_id: string | null }>,
+): void {
+  batchAnchors.clear();
+  // Later rows win: the most recent message from each channel is the anchor.
+  for (const m of messages) {
+    if (m.channel_type != null && m.platform_id != null) {
+      batchAnchors.set(anchorKey(m.channel_type, m.platform_id), m.id);
+    }
+  }
+}
+
+export function getBatchAnchor(channelType: string, platformId: string): string | null {
+  return batchAnchors.get(anchorKey(channelType, platformId)) ?? null;
+}
+
 export function setCurrentInReplyTo(id: string | null): void {
   currentInReplyTo = id;
 }
 
 export function clearCurrentInReplyTo(): void {
   currentInReplyTo = null;
+  batchAnchors.clear();
 }
 
 export function getCurrentInReplyTo(): string | null {
