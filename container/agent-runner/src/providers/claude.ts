@@ -821,24 +821,54 @@ function ensureOpus1mSuffix(model: string): string {
  * Per-model-family default effort, applied only when nothing upstream chose
  * one (-e flag, group provider config, operator NANOCLAW_DEFAULT_EFFORT).
  *
- *   opus  → xhigh — the recommended starting point for coding/agentic work
- *           per the effort docs; deliberate fleet default (operator decision
- *           2026-06-10).
+ *   opus 4.7+ → xhigh — the recommended starting point for coding/agentic
+ *           work per the effort docs; deliberate fleet default (operator
+ *           decision 2026-06-10). Opus 4.6 caps at high (no xhigh support).
  *   fable → high  — fable's docs recommend `high` as the default starting
  *           point; lower levels "often exceed xhigh performance on prior
  *           models", and fable bills 2x Opus ($10/$50 per MTok).
  *   sonnet → high — sonnet 4.6 rejects xhigh (low|medium|high|max only).
  *   haiku → undefined — no effort control at the API level.
  *
- * `-e <level>` (turn or sticky) always wins over all of these.
+ * `-e <level>` (turn or sticky) always wins over all of these — subject to
+ * clampEffortForModel below.
  */
 function defaultEffortForModel(model: string | undefined): string | undefined {
   if (!model) return 'high';
   const m = model.toLowerCase();
-  if (m === 'opus' || m.startsWith('claude-opus-')) return 'xhigh';
+  if (m === 'opus' || m.startsWith('claude-opus-')) {
+    // 4.6 and earlier have no xhigh (xhigh shipped with 4.7).
+    return /^claude-opus-4-[0-6]\b/.test(m) ? 'high' : 'xhigh';
+  }
   if (m.startsWith('claude-fable-')) return 'high';
   if (m === 'haiku' || m.startsWith('claude-haiku-')) return undefined;
   return 'high';
+}
+
+/**
+ * Effort support per model family — the provider-side safety net. Mismatches
+ * can reach here from layers that never see model and effort together:
+ * an operator NANOCLAW_DEFAULT_EFFORT (single value, model-blind), a sticky
+ * `-e xhigh` followed by `-m1 sonnet` on a later turn (flag-parser only
+ * cross-validates -m/-e when they arrive in the same message), or a group
+ * container.json effort paired with a per-turn model switch. An unsupported
+ * value would 400 at the API, so clamp to the family default instead.
+ * Keep the support sets consistent with MODEL_EFFORT_SUPPORT in
+ * src/flag-parser.ts (host tree — not importable from this Bun package).
+ */
+function clampEffortForModel(model: string | undefined, effort: string | undefined): string | undefined {
+  if (!effort) return effort;
+  const m = (model ?? '').toLowerCase();
+  const supported = (() => {
+    if (m === 'haiku' || m.startsWith('claude-haiku-')) return new Set<string>();
+    if (m.startsWith('claude-sonnet-') || m === 'sonnet') return new Set(['low', 'medium', 'high', 'max']);
+    if (/^claude-opus-4-[0-6]\b/.test(m)) return new Set(['low', 'medium', 'high', 'max']);
+    // opus 4.7+, fable, bare `opus` alias (resolves to the configured 4.7+
+    // default), unknown future models: full surface.
+    return new Set(['low', 'medium', 'high', 'xhigh', 'max']);
+  })();
+  if (supported.has(effort)) return effort;
+  return defaultEffortForModel(model);
 }
 
 // ── Provider ──
@@ -1025,7 +1055,11 @@ export class ClaudeProvider implements AgentProvider {
     // group container.json provider config → operator override env
     // (NANOCLAW_DEFAULT_EFFORT, injected by the host only when a channel or
     // group default is explicitly configured) → per-model-family default.
-    const effort = input.effort ?? this.stickyConfig.effort ?? process.env.NANOCLAW_DEFAULT_EFFORT ?? defaultEffortForModel(model);
+    const requestedEffort =
+      input.effort ?? this.stickyConfig.effort ?? process.env.NANOCLAW_DEFAULT_EFFORT ?? defaultEffortForModel(model);
+    // Safety clamp: drop to the family default when the resolved effort is
+    // unsupported by the resolved model (would 400 at the API otherwise).
+    const effort = clampEffortForModel(model, requestedEffort);
     // ultracode is a session flag (xhigh + standing dynamic-workflow
     // orchestration), NOT an effort value — applied via the SDK control
     // request below. Effort is already forced to xhigh upstream when set.
@@ -1034,7 +1068,11 @@ export class ClaudeProvider implements AgentProvider {
     // the ONLY runtime surface that shows what we asked for — the CLI never
     // logs the request body and OAuth traffic has no proxy dashboard.
     // Verify via `docker logs <container>` while it's alive.
-    log(`query: model=${model ?? '(cli default)'} effort=${effort ?? '(none)'}${ultracode ? ' ultracode' : ''}`);
+    log(
+      `query: model=${model ?? '(cli default)'} effort=${effort ?? '(none)'}` +
+        `${effort !== requestedEffort ? ` (clamped from ${requestedEffort ?? '(none)'})` : ''}` +
+        `${ultracode ? ' ultracode' : ''}`,
+    );
 
     // Discover plugins each query so hot-mounted plugin drops are picked up
     // without a container restart. Cheap (just fs.readdir under

@@ -180,6 +180,33 @@ describe('per-model-family effort defaults', () => {
     const opts = run({ effort: 'low' }, 'medium');
     expect(opts?.effort).toBe('low');
   });
+
+  it('test_effort_clamp_sticky_xhigh_on_sonnet: sticky xhigh + model switch to sonnet clamps to high (sonnet rejects xhigh)', () => {
+    const opts = run({ model: 'claude-sonnet-4-6', effort: 'xhigh' });
+    expect(opts?.effort).toBe('high');
+  });
+
+  it('test_effort_clamp_operator_env_on_sonnet: model-blind operator override xhigh clamps for sonnet turns', () => {
+    const opts = run({ model: 'claude-sonnet-4-6' }, 'xhigh');
+    expect(opts?.effort).toBe('high');
+  });
+
+  it('test_effort_clamp_opus46_no_xhigh: opus 4.6 has no xhigh — flagless default and explicit xhigh both land on high', () => {
+    const flagless = run({ model: 'claude-opus-4-6[1m]' });
+    expect(flagless?.effort).toBe('high');
+    const explicit = run({ model: 'claude-opus-4-6[1m]', effort: 'xhigh' });
+    expect(explicit?.effort).toBe('high');
+  });
+
+  it('test_effort_clamp_haiku_drops_any_effort: haiku drops even an explicit effort (no API support)', () => {
+    const opts = run({ model: 'claude-haiku-4-5', effort: 'high' });
+    expect(opts?.effort).toBeUndefined();
+  });
+
+  it('test_effort_no_clamp_max_on_sonnet: max is valid on sonnet and passes through', () => {
+    const opts = run({ model: 'claude-sonnet-4-6', effort: 'max' });
+    expect(opts?.effort).toBe('max');
+  });
 });
 
 describe('poisoned continuation detection (cross-auth-path thinking signatures)', async () => {
