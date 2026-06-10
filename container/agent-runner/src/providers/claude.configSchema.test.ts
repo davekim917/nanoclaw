@@ -132,16 +132,16 @@ describe('per-model-family effort defaults', () => {
   const run = (input: Record<string, unknown>, env?: string) => {
     capturedSdkOptions = null;
     mockSdkQuery.mockClear();
-    const prev = process.env.NANOCLAW_DEFAULT_EFFORT;
-    if (env === undefined) delete process.env.NANOCLAW_DEFAULT_EFFORT;
-    else process.env.NANOCLAW_DEFAULT_EFFORT = env;
+    const prev = process.env.NANOCLAW_EFFORT_OVERRIDE;
+    if (env === undefined) delete process.env.NANOCLAW_EFFORT_OVERRIDE;
+    else process.env.NANOCLAW_EFFORT_OVERRIDE = env;
     try {
       const provider = new ClaudeProvider({});
       provider.query({ prompt: 'hi', cwd: '/tmp', ...input });
       return capturedSdkOptions;
     } finally {
-      if (prev === undefined) delete process.env.NANOCLAW_DEFAULT_EFFORT;
-      else process.env.NANOCLAW_DEFAULT_EFFORT = prev;
+      if (prev === undefined) delete process.env.NANOCLAW_EFFORT_OVERRIDE;
+      else process.env.NANOCLAW_EFFORT_OVERRIDE = prev;
     }
   };
 
@@ -171,7 +171,7 @@ describe('per-model-family effort defaults', () => {
     expect(opts?.effort).toBe('high');
   });
 
-  it('test_effort_operator_env_overrides_family_default: NANOCLAW_DEFAULT_EFFORT beats the family default', () => {
+  it('test_effort_operator_env_overrides_family_default: NANOCLAW_EFFORT_OVERRIDE beats the family default', () => {
     const opts = run({}, 'medium');
     expect(opts?.effort).toBe('medium');
   });

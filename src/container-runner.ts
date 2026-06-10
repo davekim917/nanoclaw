@@ -93,7 +93,7 @@ const DEFAULT_OPUS_MODEL = 'claude-opus-4-8[1m]';
 const DEFAULT_SONNET_MODEL = 'claude-sonnet-4-6';
 const DEFAULT_HAIKU_MODEL = 'claude-haiku-4-5-20251001';
 // (DEFAULT_EFFORT removed 2026-06-10 — effort defaults are per-model-family
-// in the claude provider; NANOCLAW_DEFAULT_EFFORT is operator-override-only.)
+// in the claude provider; NANOCLAW_EFFORT_OVERRIDE is operator-override-only.)
 
 /** Active containers tracked by session ID. */
 const activeContainers = new Map<string, { process: ChildProcess; containerName: string; spawnedAt: number }>();
@@ -2045,7 +2045,7 @@ async function buildContainerArgs(
   args.push('-e', `ANTHROPIC_DEFAULT_SONNET_MODEL=${DEFAULT_SONNET_MODEL}`);
   args.push('-e', `ANTHROPIC_DEFAULT_HAIKU_MODEL=${DEFAULT_HAIKU_MODEL}`);
 
-  // NANOCLAW_DEFAULT_EFFORT is an OPERATOR override (per-channel wiring or
+  // NANOCLAW_EFFORT_OVERRIDE is an OPERATOR override (per-channel wiring or
   // per-group container.json) — injected only when one is actually set.
   // When absent, the claude provider applies per-model-family defaults
   // (opus → xhigh, fable/sonnet → high, haiku → none; see
@@ -2055,7 +2055,7 @@ async function buildContainerArgs(
   // whether the operator had chosen anything at all.
   const defaultEffort = channelDefaults?.channelDefaultEffort ?? containerConfig.defaultEffort;
   if (defaultEffort) {
-    args.push('-e', `NANOCLAW_DEFAULT_EFFORT=${defaultEffort}`);
+    args.push('-e', `NANOCLAW_EFFORT_OVERRIDE=${defaultEffort}`);
   }
 
   // Per-channel default tone profile — ports v1's "always-on tone" feature.

@@ -819,7 +819,7 @@ function ensureOpus1mSuffix(model: string): string {
 
 /**
  * Per-model-family default effort, applied only when nothing upstream chose
- * one (-e flag, group provider config, operator NANOCLAW_DEFAULT_EFFORT).
+ * one (-e flag, group provider config, operator NANOCLAW_EFFORT_OVERRIDE).
  *
  *   opus 4.7+ → xhigh — the recommended starting point for coding/agentic
  *           work per the effort docs; deliberate fleet default (operator
@@ -848,7 +848,7 @@ function defaultEffortForModel(model: string | undefined): string | undefined {
 /**
  * Effort support per model family — the provider-side safety net. Mismatches
  * can reach here from layers that never see model and effort together:
- * an operator NANOCLAW_DEFAULT_EFFORT (single value, model-blind), a sticky
+ * an operator NANOCLAW_EFFORT_OVERRIDE (single value, model-blind), a sticky
  * `-e xhigh` followed by `-m1 sonnet` on a later turn (flag-parser only
  * cross-validates -m/-e when they arrive in the same message), or a group
  * container.json effort paired with a per-turn model switch. An unsupported
@@ -1053,10 +1053,10 @@ export class ClaudeProvider implements AgentProvider {
     const model = rawModel ? ensureOpus1mSuffix(rawModel) : rawModel;
     // Effort precedence: -e flag (turn/sticky, arrives as input.effort) →
     // group container.json provider config → operator override env
-    // (NANOCLAW_DEFAULT_EFFORT, injected by the host only when a channel or
+    // (NANOCLAW_EFFORT_OVERRIDE, injected by the host only when a channel or
     // group default is explicitly configured) → per-model-family default.
     const requestedEffort =
-      input.effort ?? this.stickyConfig.effort ?? process.env.NANOCLAW_DEFAULT_EFFORT ?? defaultEffortForModel(model);
+      input.effort ?? this.stickyConfig.effort ?? process.env.NANOCLAW_EFFORT_OVERRIDE ?? defaultEffortForModel(model);
     // Safety clamp: drop to the family default when the resolved effort is
     // unsupported by the resolved model (would 400 at the API otherwise).
     const effort = clampEffortForModel(model, requestedEffort);

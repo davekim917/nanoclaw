@@ -1144,7 +1144,7 @@ function applyFlagBatch(
   const model = intent?.turnModel ?? getStickyModel();
   // Effort here is USER INTENT ONLY (turn flag → sticky flag). Defaults are
   // provider business: the claude provider resolves the operator override
-  // (NANOCLAW_DEFAULT_EFFORT) and per-model-family defaults itself, because
+  // (NANOCLAW_EFFORT_OVERRIDE) and per-model-family defaults itself, because
   // only it knows the final model (and e.g. sonnet rejects xhigh). Codex and
   // opencode have their own default surfaces (codex config schema default,
   // opencode model-native) and never consumed this env fold.

@@ -57,7 +57,13 @@ const DEPRECATED_ENV: readonly string[] = [
   'ANTHROPIC_DEFAULT_OPUS_MODEL',
   'ANTHROPIC_DEFAULT_SONNET_MODEL',
   'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+  // Renamed to NANOCLAW_EFFORT_OVERRIDE 2026-06-10 (it's an operator
+  // override, not a default — defaults are per-model-family in the claude
+  // provider). The old name stays here so legacy settings.json values
+  // keep getting scrubbed; the new name is spawn-env-only and must never
+  // be pinned in settings.json either.
   'NANOCLAW_DEFAULT_EFFORT',
+  'NANOCLAW_EFFORT_OVERRIDE',
 ];
 
 // Nanoclaw-managed top-level settings. Same reconciliation semantics as
