@@ -1030,6 +1030,11 @@ export class ClaudeProvider implements AgentProvider {
     // orchestration), NOT an effort value — applied via the SDK control
     // request below. Effort is already forced to xhigh upstream when set.
     const ultracode = input.ultracode === true;
+    // Boundary instrumentation: the resolved model+effort per turn. This is
+    // the ONLY runtime surface that shows what we asked for — the CLI never
+    // logs the request body and OAuth traffic has no proxy dashboard.
+    // Verify via `docker logs <container>` while it's alive.
+    log(`query: model=${model ?? '(cli default)'} effort=${effort ?? '(none)'}${ultracode ? ' ultracode' : ''}`);
 
     // Discover plugins each query so hot-mounted plugin drops are picked up
     // without a container restart. Cheap (just fs.readdir under
