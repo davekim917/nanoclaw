@@ -125,6 +125,28 @@ export function isRunnerCommand(msg: MessageInRow): boolean {
   return cat === 'admin' || cat === 'passthrough';
 }
 
+/**
+ * True when the message carries a host-parsed flagIntent (-m/-e/-m1/-e1).
+ * Model and effort are query-creation options — they cannot be applied to an
+ * already-running SDK query, and applyFlagBatch only runs when a new query
+ * starts. A flag message pushed into an active stream would be silently
+ * dropped while the host's ⚙️ ack had already told the user it applied
+ * (observed live 2026-06-10: `-m fable` mid-turn left no sticky row and the
+ * turn kept running opus). Used by the follow-up poller to end the stream —
+ * same treatment as isRunnerCommand — so the outer loop re-batches and the
+ * fresh query honors the flags. Kinds mirror applyFlagBatch (chat,
+ * chat-sdk, task).
+ */
+export function hasFlagIntent(msg: MessageInRow): boolean {
+  if (msg.kind !== 'chat' && msg.kind !== 'chat-sdk' && msg.kind !== 'task') return false;
+  try {
+    const parsed = JSON.parse(msg.content) as { flagIntent?: unknown };
+    return parsed.flagIntent != null && typeof parsed.flagIntent === 'object';
+  } catch {
+    return false;
+  }
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function extractSenderId(msg: MessageInRow, content: any): string | null {
   const raw: string | null = content?.senderId || content?.author?.userId || null;

@@ -13,7 +13,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
 import { initTestSessionDb, closeSessionDb, getInboundDb } from './db/connection.js';
 import { getPendingMessages } from './db/messages-in.js';
-import { formatMessages, stripInternalTags, categorizeMessage, isClearCommand } from './formatter.js';
+import { formatMessages, stripInternalTags, categorizeMessage, hasFlagIntent, isClearCommand } from './formatter.js';
 import type { MessageInRow } from './db/messages-in.js';
 import { TIMEZONE } from './timezone.js';
 
@@ -498,5 +498,39 @@ describe('stripInternalTags', () => {
     expect(stripInternalTags('<internal>thinking</internal>The answer is 42')).toBe(
       'The answer is 42',
     );
+  });
+});
+
+describe('hasFlagIntent', () => {
+  it('detects flagIntent on chat messages (-m fable mid-turn must end the stream)', () => {
+    insertMessage('f1', 'chat', {
+      sender: 'Dave',
+      text: 'What model are you now?',
+      flagIntent: { stickyModel: 'claude-fable-5[1m]' },
+    });
+    const [msg] = getPendingMessages();
+    expect(hasFlagIntent(msg)).toBe(true);
+  });
+
+  it('detects flagIntent on task messages (scheduled wakes pin model/effort)', () => {
+    insertMessage('f2', 'task', {
+      prompt: 'wiki synth',
+      flagIntent: { turnModel: 'claude-opus-4-8[1m]', turnEffort: 'high' },
+    });
+    const [msg] = getPendingMessages();
+    expect(hasFlagIntent(msg)).toBe(true);
+  });
+
+  it('false for plain chat without flags', () => {
+    insertMessage('f3', 'chat', { sender: 'Dave', text: 'hello there' });
+    const [msg] = getPendingMessages();
+    expect(hasFlagIntent(msg)).toBe(false);
+  });
+
+  it('false for non-flag kinds and malformed content', () => {
+    insertMessage('f4', 'system', { flagIntent: { stickyModel: 'x' } });
+    const [sys] = getPendingMessages();
+    expect(hasFlagIntent(sys)).toBe(false);
+    expect(hasFlagIntent({ ...sys, kind: 'chat', content: 'not-json{' } as never)).toBe(false);
   });
 });

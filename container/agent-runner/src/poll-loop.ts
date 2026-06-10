@@ -25,6 +25,7 @@ import {
   formatMessages,
   extractRouting,
   categorizeMessage,
+  hasFlagIntent,
   isClearCommand,
   isRunnerCommand,
   stripInternalTags,
@@ -586,6 +587,20 @@ async function processQuery(
         // handles them via the canonical command path + formatMessagesWithCommands.
         if (allPending.some((m) => isRunnerCommand(m))) {
           log('Pending slash command — ending stream so outer loop can process');
+          endedForCommand = true;
+          query.end();
+          return;
+        }
+
+        // Flag-bearing messages (-m/-e) need a fresh query for the same
+        // reason: model and effort are fixed at sdkQuery() time, and
+        // applyFlagBatch only runs when the outer loop starts a new query.
+        // Pushed mid-stream they'd be silently dropped after the host
+        // already acked them (observed live 2026-06-10). End the stream and
+        // leave the rows pending; the outer loop re-batches with the flags
+        // applied.
+        if (allPending.some((m) => hasFlagIntent(m))) {
+          log('Pending flag intent (-m/-e) — ending stream so the next query honors it');
           endedForCommand = true;
           query.end();
           return;
