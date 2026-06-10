@@ -592,19 +592,12 @@ async function processQuery(
           return;
         }
 
-        // Flag-bearing messages (-m/-e) need a fresh query for the same
-        // reason: model and effort are fixed at sdkQuery() time, and
-        // applyFlagBatch only runs when the outer loop starts a new query.
-        // Pushed mid-stream they'd be silently dropped after the host
-        // already acked them (observed live 2026-06-10). End the stream and
-        // leave the rows pending; the outer loop re-batches with the flags
-        // applied.
-        if (allPending.some((m) => hasFlagIntent(m))) {
-          log('Pending flag intent (-m/-e) — ending stream so the next query honors it');
-          endedForCommand = true;
-          query.end();
-          return;
-        }
+        // Flag-bearing messages (-m/-e) are handled after admission, below:
+        // stickies are persisted and the changes applied to the LIVE query
+        // via provider control requests (query.applySettings) — same
+        // conversation, same stream. Ending the stream is only the fallback
+        // when the provider has no live controls or the combination can't
+        // be expressed (e.g. effort 'max').
 
         // Filtering on thread_id here caused deadlocks when the initial batch
         // and follow-ups had mismatched thread_ids (e.g. a host-generated welcome
@@ -653,6 +646,38 @@ async function processQuery(
         if (done) {
           if (skipped.length > 0) markCompleted(skipped);
           return;
+        }
+
+        // -m/-e flags in this batch: persist stickies NOW (applyFlagBatch —
+        // previously this never ran on the follow-up path, so flags were
+        // acked by the host then silently dropped; observed live
+        // 2026-06-10), then apply to the live query via provider control
+        // requests. Runs BEFORE the rows are claimed so the fallback can
+        // walk away and leave them pending: the outer loop reopens the
+        // query and applyFlagBatch re-runs there (idempotent — it re-reads
+        // flagIntent from the same rows).
+        if (keep.some((m) => hasFlagIntent(m))) {
+          const fb = applyFlagBatch(keep, extractRouting(keep));
+          if (!query.applySettings) {
+            log('Flag intent (-m/-e) but provider has no live controls — ending stream; next query honors it');
+            endedForCommand = true;
+            query.end();
+            return;
+          }
+          try {
+            await query.applySettings({ model: fb.model, effort: fb.effort, ultracode: fb.ultracode });
+          } catch (err) {
+            log(
+              `Live applySettings failed (${err instanceof Error ? err.message : String(err)}) — ` +
+                'ending stream; outer loop reopens with flags applied',
+            );
+            endedForCommand = true;
+            query.end();
+            return;
+          }
+          // The await above widens the done-race window — re-check before
+          // claiming so rows aren't marked processing against a dead stream.
+          if (done) return;
         }
 
         const keptIds = keep.map((m) => m.id);

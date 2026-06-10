@@ -3,11 +3,26 @@ import { describe, it, expect, mock, beforeAll } from 'bun:test';
 // Mock the SDK before importing claude.ts, so sdkQuery is interceptable.
 // We capture the options passed to sdkQuery to verify sticky config behavior.
 let capturedSdkOptions: Record<string, unknown> | null = null;
+let capturedSetModel: Array<string | undefined> = [];
+let capturedFlagSettings: Array<Record<string, unknown>> = [];
 const mockSdkQuery = mock((_args: unknown) => {
   const args = _args as { options?: Record<string, unknown> };
   capturedSdkOptions = args.options ?? null;
-  // Return an async iterable that immediately ends
-  return (async function* () {})();
+  // Async iterable that immediately ends, plus the live-control surface
+  // (setModel / applyFlagSettings) that applySettings exercises.
+  const gen = (async function* () {})() as AsyncGenerator & {
+    setModel: (m?: string) => Promise<void>;
+    applyFlagSettings: (s: Record<string, unknown>) => Promise<void>;
+  };
+  gen.setModel = (m?: string) => {
+    capturedSetModel.push(m);
+    return Promise.resolve();
+  };
+  gen.applyFlagSettings = (s: Record<string, unknown>) => {
+    capturedFlagSettings.push(s);
+    return Promise.resolve();
+  };
+  return gen;
 });
 
 // Mock dependent modules to avoid side effects in test environment
@@ -230,5 +245,48 @@ describe('poisoned continuation detection (cross-auth-path thinking signatures)'
   it('test_isSessionInvalid_matches_rethrown_error: the re-thrown error engages the stale-session recovery branch', () => {
     const provider = new ClaudeProvider({});
     expect(provider.isSessionInvalid(new Error(DRILL_ERROR))).toBe(true);
+  });
+});
+
+describe('live applySettings (-m/-e on an active query — same conversation, no teardown)', () => {
+  const start = (input: Record<string, unknown> = {}) => {
+    capturedSetModel = [];
+    capturedFlagSettings = [];
+    mockSdkQuery.mockClear();
+    const provider = new ClaudeProvider({});
+    return provider.query({ prompt: 'hi', cwd: '/tmp', ...input });
+  };
+
+  it('test_applySettings_model_switch: -m fable mid-turn → setModel + family-default effort', async () => {
+    const q = start(); // opus @ xhigh
+    await q.applySettings!({ model: 'claude-fable-5[1m]' });
+    expect(capturedSetModel).toEqual(['claude-fable-5[1m]']);
+    expect(capturedFlagSettings).toEqual([{ effortLevel: 'high' }]);
+  });
+
+  it('test_applySettings_effort_only: -e medium mid-turn → no setModel, effortLevel applied', async () => {
+    const q = start();
+    await q.applySettings!({ effort: 'medium' });
+    expect(capturedSetModel).toEqual([]);
+    expect(capturedFlagSettings).toEqual([{ effortLevel: 'medium' }]);
+  });
+
+  it('test_applySettings_clamps_for_model: sonnet + xhigh clamps to high live', async () => {
+    const q = start();
+    await q.applySettings!({ model: 'claude-sonnet-4-6', effort: 'xhigh' });
+    expect(capturedSetModel).toEqual(['claude-sonnet-4-6']);
+    expect(capturedFlagSettings).toEqual([{ effortLevel: 'high' }]);
+  });
+
+  it('test_applySettings_max_throws: effortLevel control cannot express max → caller falls back to reopen', async () => {
+    const q = start();
+    await expect(q.applySettings!({ effort: 'max' })).rejects.toThrow(/max/);
+    expect(capturedFlagSettings).toEqual([]);
+  });
+
+  it('test_applySettings_bare_fable_gets_1m: bare id normalized before setModel', async () => {
+    const q = start();
+    await q.applySettings!({ model: 'claude-fable-5' });
+    expect(capturedSetModel).toEqual(['claude-fable-5[1m]']);
   });
 });

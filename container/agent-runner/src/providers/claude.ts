@@ -1249,6 +1249,11 @@ export class ClaudeProvider implements AgentProvider {
       log(`Query completed after ${messageCount} SDK messages`);
     }
 
+    // Tracks the model the live query is currently on — updated by
+    // applySettings so a later effort-only change clamps against the
+    // model actually in effect, not the one the query started with.
+    let activeModel = model;
+
     return {
       push: (msg) => stream.push(msg),
       end: () => stream.end(),
@@ -1256,6 +1261,36 @@ export class ClaudeProvider implements AgentProvider {
       abort: () => {
         aborted = true;
         stream.end();
+      },
+      // In-flight -m/-e: same conversation, same stream — the SDK control
+      // requests mirror interactive Claude Code's /model. Re-runs the same
+      // effort resolution chain as query() so a model switch without an
+      // explicit -e lands on the new model's family default (e.g. -m fable
+      // mid-turn → fable@high, not fable@inherited-xhigh).
+      applySettings: async (s) => {
+        const newModel = s.model ? ensureOpus1mSuffix(s.model) : undefined;
+        if (newModel && newModel !== activeModel) {
+          await sdkResult.setModel(newModel);
+          activeModel = newModel;
+        }
+        const requested =
+          s.effort ?? this.stickyConfig.effort ?? process.env.NANOCLAW_EFFORT_OVERRIDE ?? defaultEffortForModel(activeModel);
+        const clamped = clampEffortForModel(activeModel, requested);
+        if (clamped === 'max') {
+          // Settings.effortLevel has no 'max' — signal the poll-loop to
+          // fall back to reopening the query (where effort is a creation
+          // option that does accept max).
+          throw new Error("effortLevel control cannot express 'max'");
+        }
+        const settings: { effortLevel: 'low' | 'medium' | 'high' | 'xhigh' | null; ultracode?: boolean } = {
+          effortLevel: (clamped as 'low' | 'medium' | 'high' | 'xhigh' | undefined) ?? null,
+        };
+        if (s.ultracode !== undefined) settings.ultracode = s.ultracode;
+        await sdkResult.applyFlagSettings(settings);
+        log(
+          `applySettings (live): model=${activeModel ?? '(unchanged)'} effort=${clamped ?? '(none)'}` +
+            `${s.ultracode !== undefined ? ` ultracode=${s.ultracode}` : ''}`,
+        );
       },
     };
   }

@@ -161,6 +161,18 @@ export interface AgentQuery {
 
   /** Force-stop the query. */
   abort(): void;
+
+  /**
+   * Apply -m/-e flag changes to the LIVE query — same conversation, same
+   * stream, no teardown (claude: SDK setModel + applyFlagSettings control
+   * requests, mirroring interactive Claude Code's /model). Optional:
+   * providers without in-flight controls (codex/opencode are sticky-only)
+   * omit it and the poll-loop falls back to ending the stream so the next
+   * query picks the flags up. MUST throw when the requested combination
+   * can't be expressed live (e.g. the effortLevel control has no 'max') so
+   * the caller can use the same fallback.
+   */
+  applySettings?(settings: { model?: string; effort?: string; ultracode?: boolean }): Promise<void>;
 }
 
 export type ProviderEvent =
