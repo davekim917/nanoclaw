@@ -75,7 +75,11 @@ function inboundOf(sessionId: string): Array<{ thread_id: string | null; content
   }
 }
 
-function dispatchContent(gmailThreadId: string, body: string, ticket?: { issue: string; team: string }): Record<string, unknown> {
+function dispatchContent(
+  gmailThreadId: string,
+  body: string,
+  ticket?: { issue: string; team: string },
+): Record<string, unknown> {
   return {
     action: 'dispatch_support_issue',
     gmailThreadId,
@@ -234,11 +238,7 @@ describe('handleUpdateSupportTicket', () => {
     seed();
     const { session: poller } = resolveSession('ag-1', 'mg-1', null, 'shared');
 
-    await handleUpdateSupportTicket(
-      { action: 'update_support_ticket', linearIssue: 'XZO-999' },
-      poller,
-      {} as never,
-    );
+    await handleUpdateSupportTicket({ action: 'update_support_ticket', linearIssue: 'XZO-999' }, poller, {} as never);
 
     expect(adapterDeliver).not.toHaveBeenCalled();
   });

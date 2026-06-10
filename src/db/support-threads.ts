@@ -26,9 +26,9 @@ export interface SupportThread {
 }
 
 export function getSupportThread(gmailThreadId: string): SupportThread | undefined {
-  return getDb()
-    .prepare('SELECT * FROM support_threads WHERE gmail_thread_id = ?')
-    .get(gmailThreadId) as SupportThread | undefined;
+  return getDb().prepare('SELECT * FROM support_threads WHERE gmail_thread_id = ?').get(gmailThreadId) as
+    | SupportThread
+    | undefined;
 }
 
 export interface UpsertSupportThread {
@@ -87,9 +87,9 @@ export function upsertSupportThread(t: UpsertSupportThread, now: string): void {
  * agent never supplies a cross-row key (same security posture as scheduling).
  */
 export function getSupportThreadBySession(sessionId: string): SupportThread | undefined {
-  return getDb()
-    .prepare('SELECT * FROM support_threads WHERE session_id = ?')
-    .get(sessionId) as SupportThread | undefined;
+  return getDb().prepare('SELECT * FROM support_threads WHERE session_id = ?').get(sessionId) as
+    | SupportThread
+    | undefined;
 }
 
 /** Record the Linear ticket a per-issue session created for its thread. */

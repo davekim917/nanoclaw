@@ -16,9 +16,7 @@ export const migration042: Migration = {
   version: 42,
   name: 'support-threads-subject-sender',
   up(db: Database.Database) {
-    const cols = (db.prepare(`PRAGMA table_info(support_threads)`).all() as Array<{ name: string }>).map(
-      (c) => c.name,
-    );
+    const cols = (db.prepare(`PRAGMA table_info(support_threads)`).all() as Array<{ name: string }>).map((c) => c.name);
     if (!cols.includes('subject')) {
       db.exec(`ALTER TABLE support_threads ADD COLUMN subject TEXT;`);
     }

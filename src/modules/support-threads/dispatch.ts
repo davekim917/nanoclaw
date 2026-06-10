@@ -66,7 +66,12 @@ function str(v: unknown): string | null {
 }
 
 /** The channel-level announcement (the working thread's parent message). */
-function announcementText(subject: string, sender: string, linearIssue: string | null, linearTeam: string | null): string {
+function announcementText(
+  subject: string,
+  sender: string,
+  linearIssue: string | null,
+  linearTeam: string | null,
+): string {
   const tag = [linearTeam, linearIssue].filter(Boolean).join(' ') || 'Support';
   return `🎫 ${tag}: ${subject} — ${sender}`;
 }
