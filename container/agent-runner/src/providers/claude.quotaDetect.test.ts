@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'bun:test';
 
-import { QUOTA_RESULT_RE } from './claude.js';
+import { QUOTA_RESULT_RE, SUBSCRIPTION_BLOCKED_RE } from './claude.js';
 
 // QUOTA_RESULT_RE gates OAuth-fallback rotation: when a top-level `result`
 // text matches, the provider throws `subscription_quota_exhausted` so the
@@ -44,5 +44,41 @@ describe('QUOTA_RESULT_RE', () => {
     expect(QUOTA_RESULT_RE.test("You've hit a snag with the retry limit downstream.")).toBe(false);
     expect(QUOTA_RESULT_RE.test('The rate limit on the endpoint is 100 req/min.')).toBe(false);
     expect(QUOTA_RESULT_RE.test('Here is a summary of your token usage limit settings.')).toBe(false);
+  });
+});
+
+// SUBSCRIPTION_BLOCKED_RE gates the same rotation path for accounts whose
+// org has disabled Claude Code subscription access entirely (as opposed to
+// quota exhaustion). Surfaced 2026-06-11 on a fallback token mid-rotation.
+describe('SUBSCRIPTION_BLOCKED_RE', () => {
+  it('matches the org access-disabled wording (2026-06-11 incident)', () => {
+    // Exact text captured from the illysium outbound DB, 2026-06-11 22:22 UTC.
+    expect(
+      SUBSCRIPTION_BLOCKED_RE.test(
+        'Your organization has disabled Claude subscription access for Claude Code · Use an Anthropic API key instead, or ask your admin to enable access',
+      ),
+    ).toBe(true);
+    // Plausible near-future variants.
+    expect(SUBSCRIPTION_BLOCKED_RE.test('Your organization has disabled Claude Code access')).toBe(
+      true,
+    );
+    expect(SUBSCRIPTION_BLOCKED_RE.test('Your admin has disabled Claude access for your team')).toBe(
+      true,
+    );
+    expect(SUBSCRIPTION_BLOCKED_RE.test('Your team has disabled Claude subscription access')).toBe(
+      true,
+    );
+  });
+
+  it('does not match agent prose about other disabled things', () => {
+    expect(SUBSCRIPTION_BLOCKED_RE.test('Your organization has disabled SSO for this app.')).toBe(
+      false,
+    );
+    expect(
+      SUBSCRIPTION_BLOCKED_RE.test('Your organization has disabled access to the staging cluster.'),
+    ).toBe(false);
+    expect(
+      SUBSCRIPTION_BLOCKED_RE.test('I checked: your organization has Claude access enabled.'),
+    ).toBe(false);
   });
 });

@@ -341,7 +341,7 @@ const OAUTH_FALLBACK_RE = /^CLAUDE_CODE_OAUTH_TOKEN_(\d+)$/;
 // below) — when the SDK returns the Claude Max quota message as a
 // normal result text instead of throwing, we re-throw with this prefix
 // so the existing rotation+retry path picks it up.
-const RETRYABLE_ERROR_RE = /429|rate[\s_-]?limit|overloaded|upstream_error|External provider returned|subscription_quota_exhausted/i;
+const RETRYABLE_ERROR_RE = /429|rate[\s_-]?limit|overloaded|upstream_error|External provider returned|subscription_quota_exhausted|subscription_access_disabled/i;
 
 // Claude Max subscription quota exhaustion. The Agent SDK delivers this
 // as a plain result-text string rather than a thrown error or a
@@ -374,6 +374,20 @@ const RETRYABLE_ERROR_RE = /429|rate[\s_-]?limit|overloaded|upstream_error|Exter
 // re-break rotation.
 export const QUOTA_RESULT_RE =
   /^\s*You['’]?(re|ve) (out of (extra |daily |weekly )?usage|(hit|reached) your ((org['’]?s |team['’]?s |account['’]?s |session |usage |weekly |daily |monthly |annual |spend(ing)? |token |credit )*)limit)\b/i;
+
+// Org-level Claude Code access block, e.g. "Your organization has disabled
+// Claude subscription access for Claude Code · Use an Anthropic API key
+// instead, or ask your admin to enable access" (first seen 2026-06-11 on a
+// fallback account, surfaced mid-rotation after the primary's spend-limit
+// exhaustion). Same delivery quirk as QUOTA_RESULT_RE — plain result text,
+// not a thrown error — and the same remediation: the credential is unusable,
+// so throw to advance rotation to the next OAuth fallback. Distinct marker
+// (`subscription_access_disabled`) so logs distinguish a blocked account
+// from an exhausted one. Anchored on the "Your <org-word> has disabled
+// Claude … access" sentence opener; requires "Claude" + "access" so agent
+// prose about other things an org disabled can't match.
+export const SUBSCRIPTION_BLOCKED_RE =
+  /^\s*Your (organization|org|team|admin|account) has disabled Claude( Code)?( subscription)? access\b/i;
 
 // Poisoned continuation: the SDK surfaces the thinking-signature 400 as plain
 // result text ("API Error: 400 ... Invalid `signature` in `thinking` block"),
@@ -1213,6 +1227,11 @@ export class ClaudeProvider implements AgentProvider {
             // fallback and retry instead of dispatching the quota message
             // to the user.
             throw new Error(`subscription_quota_exhausted: ${text}`);
+          }
+          if (text && SUBSCRIPTION_BLOCKED_RE.test(text)) {
+            // Org-disabled account: same rotation path as quota exhaustion,
+            // distinct marker for diagnosability.
+            throw new Error(`subscription_access_disabled: ${text}`);
           }
           if (text && POISONED_CONTINUATION_RE.test(text)) {
             // Throw so poll-loop's isSessionInvalid branch clears the
