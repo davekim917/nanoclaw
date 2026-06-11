@@ -22,6 +22,23 @@ describe('QUOTA_RESULT_RE', () => {
     expect(QUOTA_RESULT_RE.test("You've reached your session limit")).toBe(true);
   });
 
+  it('matches the org/credit monthly-spend cap wording (2026-06-11 incident)', () => {
+    // Exact text captured from illysium + dirt-market outbound DBs,
+    // 2026-06-11 ~21:49–22:01 UTC.
+    expect(
+      QUOTA_RESULT_RE.test(
+        "You've hit your org's monthly spend limit · ask your admin to raise it at claude.ai/settings/usage",
+      ),
+    ).toBe(true);
+    // Plausible near-future variants the repeated-qualifier class must absorb.
+    expect(QUOTA_RESULT_RE.test("You've hit your monthly spend limit")).toBe(true);
+    expect(QUOTA_RESULT_RE.test('You’ve hit your org’s monthly spend limit · resets July 1')).toBe(
+      true,
+    );
+    expect(QUOTA_RESULT_RE.test("You've reached your account's monthly credit limit")).toBe(true);
+    expect(QUOTA_RESULT_RE.test("You've hit your team's daily token limit")).toBe(true);
+  });
+
   it('does not match benign agent prose mentioning usage/limit in passing', () => {
     expect(QUOTA_RESULT_RE.test('Your usage of the API looks healthy.')).toBe(false);
     expect(QUOTA_RESULT_RE.test("You've hit a snag with the retry limit downstream.")).toBe(false);

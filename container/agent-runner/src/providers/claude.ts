@@ -349,21 +349,31 @@ const RETRYABLE_ERROR_RE = /429|rate[\s_-]?limit|overloaded|upstream_error|Exter
 // nor the in-stream rate_limit_event path triggers. Detect the text and
 // re-throw to engage rotation.
 //
-// Two distinct surfacings, both handled here:
+// Three distinct surfacings, all handled here:
 //   - weekly/extra cap: "You're out of extra usage · resets …"
 //   - 5-hour session-window cap: "You've hit your session limit · resets …"
-// The session-window wording ("You've hit your … limit") is newer and was
-// NOT matched by the original usage-only regex, so rotation silently failed
-// and the dead-stop quota message was dispatched to the user instead of
-// advancing to the next OAuth fallback.
+//   - org/credit spend cap: "You've hit your org's monthly spend limit ·
+//     ask your admin to raise it at claude.ai/settings/usage" (first seen
+//     2026-06-11, ahead of the June-15 Agent SDK credit change; surfaces
+//     with "org" wording even on individual subscription accounts)
+// Each new wording has broken rotation once before being added: the
+// session-window form wasn't matched by the original usage-only regex, and
+// the org-spend form wasn't matched by the enumerated-qualifier form — in
+// both cases rotation silently failed and the dead-stop quota message was
+// dispatched to the user instead of advancing to the next OAuth fallback.
 //
 // Strict-anchored on the "You're/You've …" sentence opener to avoid
 // false-positives on agent prose that mentions "usage" or "limit" in passing.
+// The qualifier between "your" and "limit" is a repeated word-class rather
+// than an enumerated list so the next wording variant ("daily token limit",
+// "org's annual spend limit", …) can't silently re-break rotation; it is
+// deliberately scoped to quota-ish words so "you've hit your retry limit"
+// style prose still doesn't match.
 // The apostrophe class tolerates both straight (U+0027, what the SDK emits
 // today) and curly (U+2019) so a typographic change upstream can't silently
 // re-break rotation.
 export const QUOTA_RESULT_RE =
-  /^\s*You['’]?(re|ve) (out of (extra |daily |weekly )?usage|(hit|reached) your (session |usage |weekly )?limit)\b/i;
+  /^\s*You['’]?(re|ve) (out of (extra |daily |weekly )?usage|(hit|reached) your ((org['’]?s |team['’]?s |account['’]?s |session |usage |weekly |daily |monthly |annual |spend(ing)? |token |credit )*)limit)\b/i;
 
 // Poisoned continuation: the SDK surfaces the thinking-signature 400 as plain
 // result text ("API Error: 400 ... Invalid `signature` in `thinking` block"),
