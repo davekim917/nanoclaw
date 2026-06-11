@@ -880,9 +880,18 @@ async function deliverToAgent(
   if (wake && (event.message.kind === 'chat' || event.message.kind === 'chat-sdk')) {
     const rawText = parsedContent.text ?? '';
     // Flag vocabulary is provider-specific (codex accepts gpt-5.5, rejects
-    // claude ids; claude the reverse). Same precedence as container spawn:
-    // sessions.agent_provider → container_configs.provider → 'claude'.
-    const provider = resolveProviderName(session.agent_provider, getContainerConfig(session.agent_group_id)?.provider);
+    // claude ids; claude the reverse). Precedence mirrors container spawn
+    // (sessions.agent_provider → container config → 'claude'), with
+    // agent_groups.agent_provider as the gap-filler: groups created mid-run
+    // have no container_configs row until backfillContainerConfigs runs at
+    // the next host restart (see group-init.ts — the FK ordering note), but
+    // the create flows do stamp the group row. Without this rung a fresh
+    // codex sibling would parse flags with the claude vocabulary until the
+    // next restart (codex-review finding on PR #124).
+    const provider = resolveProviderName(
+      session.agent_provider,
+      getContainerConfig(session.agent_group_id)?.provider ?? agentGroup.agent_provider,
+    );
     const parsed = parseMessageFlags(rawText, provider);
     if (parsed.intent || parsed.errors.length > 0 || parsed.warnings.length > 0) {
       flagIntent = parsed.intent;

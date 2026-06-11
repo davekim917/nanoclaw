@@ -385,4 +385,45 @@ describe('flag dispatcher wake gate', () => {
 
     expect(parseMessageFlags).toHaveBeenCalled();
   });
+
+  it('falls back to agent_groups.agent_provider when the container_configs row is missing (mid-run-created group)', async () => {
+    // Groups created mid-run have no container_configs row until
+    // backfillContainerConfigs at the next host restart (group-init.ts FK
+    // ordering note), but create flows stamp agent_groups.agent_provider.
+    // Without this rung a fresh codex sibling parses flags with the claude
+    // vocabulary until restart (codex-review finding on PR #124). The
+    // suite-level getContainerConfig mock already returns undefined.
+    const { parseMessageFlags } = await import('./flag-parser.js');
+    const { getAgentGroup } = await import('./db/agent-groups.js');
+    const mg = makeMg();
+    const agent = makeAgent({ id: 'mga-newcodex', agent_group_id: 'ag-newcodex' });
+    vi.mocked(getMessagingGroupWithAgentCount).mockReturnValue({ mg, agentCount: 1 });
+    vi.mocked(getMessagingGroupAgents).mockReturnValue([agent]);
+    vi.mocked(getAgentGroup).mockReturnValue({
+      id: 'ag-newcodex',
+      name: 'fresh-codex-sibling',
+      folder: 'fresh-codex-sibling',
+      agent_provider: 'codex',
+      created_at: new Date().toISOString(),
+    });
+    vi.mocked(resolveSession).mockReturnValue({
+      session: {
+        id: 's-newcodex',
+        agent_group_id: 'ag-newcodex',
+        messaging_group_id: 'mg-1',
+        thread_id: null,
+        agent_provider: null,
+        status: 'active',
+        container_status: 'idle',
+        last_active: null,
+        created_at: new Date().toISOString(),
+      },
+      created: true,
+    });
+
+    const event = makeChatEvent('-m gpt-5.5 hello');
+    await routeInbound(event);
+
+    expect(parseMessageFlags).toHaveBeenCalledWith(expect.any(String), 'codex');
+  });
 });
