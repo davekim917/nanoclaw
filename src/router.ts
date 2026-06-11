@@ -39,6 +39,7 @@ import { upsertArchiveMessage } from './message-archive.js';
 import { parseMessageFlags, formatFlagConfirmation, type FlagIntent } from './flag-parser.js';
 import { maybeRenameNewThread } from './topic-title.js';
 import { wakeContainer } from './container-runner.js';
+import { getContainerConfig, resolveProviderName } from './db/container-configs.js';
 import { getSession } from './db/sessions.js';
 import type { AgentGroup, MessagingGroup, MessagingGroupAgent } from './types.js';
 import type { InboundEvent } from './channels/adapter.js';
@@ -878,7 +879,20 @@ async function deliverToAgent(
   let flagCleanedText: string | null = null;
   if (wake && (event.message.kind === 'chat' || event.message.kind === 'chat-sdk')) {
     const rawText = parsedContent.text ?? '';
-    const parsed = parseMessageFlags(rawText);
+    // Flag vocabulary is provider-specific (codex accepts gpt-5.5, rejects
+    // claude ids; claude the reverse). Precedence mirrors container spawn
+    // (sessions.agent_provider → container config → 'claude'), with
+    // agent_groups.agent_provider as the gap-filler: groups created mid-run
+    // have no container_configs row until backfillContainerConfigs runs at
+    // the next host restart (see group-init.ts — the FK ordering note), but
+    // the create flows do stamp the group row. Without this rung a fresh
+    // codex sibling would parse flags with the claude vocabulary until the
+    // next restart (codex-review finding on PR #124).
+    const provider = resolveProviderName(
+      session.agent_provider,
+      getContainerConfig(session.agent_group_id)?.provider ?? agentGroup.agent_provider,
+    );
+    const parsed = parseMessageFlags(rawText, provider);
     if (parsed.intent || parsed.errors.length > 0 || parsed.warnings.length > 0) {
       flagIntent = parsed.intent;
       flagCleanedText = parsed.cleanedText;

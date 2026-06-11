@@ -312,6 +312,52 @@ describe('accumulate gate (trigger column)', () => {
     expect(ids).toEqual(['Y']);
   });
 
+  it('getPendingMessages: due task row survives a phantom reply written BEFORE it was due (poison guard)', () => {
+    // Regression for the 2026-05-27..31 scheduled-task die-off: a sibling
+    // task's output was stamped in_reply_to = this row's id hours before
+    // this row's process_after. A reply can't precede its question — the
+    // row must still fire.
+    const dueAt = new Date(Date.now() - 60 * 60 * 1000).toISOString(); // due 1h ago
+    insertMessage('t-next', 'task', { prompt: 'daily briefing' }, { processAfter: dueAt });
+    getOutboundDb()
+      .prepare(
+        `INSERT INTO messages_out (id, kind, timestamp, in_reply_to, content)
+         VALUES ('phantom', 'chat', datetime('now', '-3 hours'), 't-next', '{"text":"sibling task output"}')`,
+      )
+      .run();
+    const ids = getPendingMessages().map((m) => m.id);
+    expect(ids).toEqual(['t-next']);
+  });
+
+  it('getPendingMessages: task row IS filtered when the reply came after it was due (crash-dup protection)', () => {
+    // The original guard's purpose: container died between writing the
+    // reply and markCompleted. Reply timestamp >= process_after means the
+    // row genuinely ran — don't re-process it.
+    const dueAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(); // due 2h ago
+    insertMessage('t-ran', 'task', { prompt: 'daily briefing' }, { processAfter: dueAt });
+    getOutboundDb()
+      .prepare(
+        `INSERT INTO messages_out (id, kind, timestamp, in_reply_to, content)
+         VALUES ('real-reply', 'chat', datetime('now', '-1 hour'), 't-ran', '{"text":"briefing output"}')`,
+      )
+      .run();
+    expect(getPendingMessages().map((m) => m.id)).toEqual([]);
+  });
+
+  it('getPendingMessages: due-aware guard handles SQLite-format process_after (retryWithBackoff shape)', () => {
+    // process_after can be ISO (scheduleTask) or 'YYYY-MM-DD HH:MM:SS'
+    // (datetime-based backoff). Both must compare correctly as UTC.
+    insertMessage('t-backoff', 'task', { prompt: 'retry me' }, { processAfter: '2026-01-01 00:00:00' });
+    getOutboundDb()
+      .prepare(
+        `INSERT INTO messages_out (id, kind, timestamp, in_reply_to, content)
+         VALUES ('late-reply', 'chat', datetime('now'), 't-backoff', '{"text":"done"}')`,
+      )
+      .run();
+    // Reply (now) is after due (2026-01-01) → genuinely handled → filtered.
+    expect(getPendingMessages().map((m) => m.id)).toEqual([]);
+  });
+
   it('getPendingMessages: legitimate paired recall-X + X both still returned (no false positive drain)', () => {
     // The drain only fires when X is acked or replied-to. A normal pair
     // with both rows still pending must come through untouched.
@@ -818,7 +864,7 @@ describe('dispatchResultText — unwrapped output fallback', () => {
 
     const delivered = dispatchFileAttachment(
       { path: sourcePath, text: 'Preview', filename: '../cafe.png' },
-      routing('slack', 'C-MAIN'),
+      { ...routing('slack', 'C-MAIN'), inReplyTo: 'trigger-1' },
       outboxRoot,
     );
 
@@ -827,8 +873,12 @@ describe('dispatchResultText — unwrapped output fallback', () => {
     expect(out).toHaveLength(1);
     expect(out[0].channel_type).toBe('slack');
     expect(out[0].platform_id).toBe('C-MAIN');
+    // thread_id resolves from the destination's latest inbound row, but
+    // in_reply_to must be the TURN's triggering message — never the latest
+    // inbound row, which can be a sibling task's unfired future row (the
+    // 2026-05 scheduled-task poison).
     expect(out[0].thread_id).toBe('thread-1');
-    expect(out[0].in_reply_to).toBe('in-1');
+    expect(out[0].in_reply_to).toBe('trigger-1');
     const content = JSON.parse(out[0].content);
     expect(content).toEqual({ text: 'Preview', files: ['cafe.png'] });
     expect(fs.readFileSync(path.join(outboxRoot, out[0].id, 'cafe.png'), 'utf-8')).toBe('png-bytes');

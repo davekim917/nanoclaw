@@ -20,7 +20,7 @@ import {
   setStickyUltracode,
   clearStickyUltracode,
 } from './db/session-state.js';
-import { clearCurrentInReplyTo, setCurrentInReplyTo } from './current-batch.js';
+import { clearCurrentInReplyTo, getBatchAnchor, setCurrentBatchAnchors, setCurrentInReplyTo } from './current-batch.js';
 import {
   formatMessages,
   extractRouting,
@@ -272,6 +272,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // Publish the batch's in_reply_to so MCP tools (send_message, send_file)
     // can stamp it on outbound rows — needed for a2a return-path routing.
     setCurrentInReplyTo(routing.inReplyTo);
+    setCurrentBatchAnchors(keep);
     try {
       const result = await processQuery(query, routing, processingIds, config.providerName);
       if (result.continuation && result.continuation !== continuation) {
@@ -694,6 +695,7 @@ async function processQuery(
         // be a different session in a different mg.
         const followUpRouting = extractRouting(keep);
         setCurrentInReplyTo(followUpRouting.inReplyTo);
+        setCurrentBatchAnchors(keep);
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
         unwrappedNudged = false;
         query.push(prompt);
@@ -931,7 +933,12 @@ export function dispatchFileAttachment(
 
   writeMessageOut({
     id,
-    in_reply_to: destRouting?.inReplyTo ?? routing.inReplyTo,
+    // in_reply_to anchors to the CLAIMED BATCH: this destination's message
+    // from the batch if present, else the batch's triggering message. Never
+    // a freshly-resolved "latest inbound row" — that row can be a sibling
+    // scheduled task's future fire, and stamping it as replied-to permanently
+    // suppresses that series (see getPendingMessages' due-aware guard).
+    in_reply_to: getBatchAnchor(channelType, platformId) ?? routing.inReplyTo,
     kind: 'chat',
     platform_id: platformId,
     channel_type: channelType,
@@ -1083,7 +1090,9 @@ function sendToDestination(dest: DestinationEntry, body: string, routing: Routin
   const destRouting = resolveDestinationThread(channelType, platformId);
   writeMessageOut({
     id: generateId(),
-    in_reply_to: destRouting?.inReplyTo ?? routing.inReplyTo,
+    // Batch anchor, not the channel's latest inbound row — see the poison
+    // note in dispatchFileAttachment / getPendingMessages.
+    in_reply_to: getBatchAnchor(channelType, platformId) ?? routing.inReplyTo,
     kind: 'chat',
     platform_id: platformId,
     channel_type: channelType,
@@ -1093,23 +1102,28 @@ function sendToDestination(dest: DestinationEntry, body: string, routing: Routin
 }
 
 /**
- * Find the thread_id and message id from the most recent inbound message
- * matching the given channel+platform. Returns null if no match found.
+ * Find the thread_id from the most recent inbound message matching the given
+ * channel+platform. Returns null if no match found.
+ *
+ * Thread context ONLY. This used to also return the row's id for use as
+ * in_reply_to, which poisoned scheduled-task series: right after a task
+ * fires, the newest inbound row for a quiet channel is often a sibling
+ * task's freshly-inserted future fire row, and stamping it as "replied to"
+ * made getPendingMessages' idempotency guard suppress that fire forever
+ * (killed every interleaved daily task between 2026-05-27 and 05-31).
+ * in_reply_to must always come from the turn's triggering batch.
  */
-function resolveDestinationThread(
-  channelType: string,
-  platformId: string,
-): { threadId: string | null; inReplyTo: string | null } | null {
+function resolveDestinationThread(channelType: string, platformId: string): { threadId: string | null } | null {
   try {
     const db = getInboundDb();
     const row = db
       .prepare(
-        `SELECT thread_id, id FROM messages_in
+        `SELECT thread_id FROM messages_in
          WHERE channel_type = ? AND platform_id = ?
          ORDER BY seq DESC LIMIT 1`,
       )
-      .get(channelType, platformId) as { thread_id: string | null; id: string } | undefined;
-    if (row) return { threadId: row.thread_id, inReplyTo: row.id };
+      .get(channelType, platformId) as { thread_id: string | null } | undefined;
+    if (row) return { threadId: row.thread_id };
   } catch (err) {
     log(`resolveDestinationThread error: ${err instanceof Error ? err.message : String(err)}`);
   }

@@ -268,3 +268,78 @@ describe('formatFlagConfirmation', () => {
     expect(out).not.toContain('effort → xhigh');
   });
 });
+
+describe('provider-aware vocabulary (codex)', () => {
+  // Observed live 2026-06-10 on dirt-market-codex: `-m fable` was acked and
+  // stored on a codex session (then silently ignored by the provider), while
+  // `-m gpt-5.5` — the model actually running — was rejected as unknown.
+  // The parser now selects vocabulary by the target group's provider.
+
+  it('accepts codex model ids that the claude vocab rejects', () => {
+    const r = parseMessageFlags('-m gpt-5.5 hi', 'codex');
+    expect(r.intent).toEqual({ stickyModel: 'gpt-5.5' });
+    expect(r.errors).toEqual([]);
+  });
+
+  it('accepts dotted/dashed codex ids and turn overrides', () => {
+    const r = parseMessageFlags('-m1 gpt-5.2-codex hi', 'codex');
+    expect(r.intent).toEqual({ turnModel: 'gpt-5.2-codex' });
+  });
+
+  it('resolves codex convenience aliases', () => {
+    const r = parseMessageFlags('-m gpt5.5 hi', 'codex');
+    expect(r.intent).toEqual({ stickyModel: 'gpt-5.5' });
+  });
+
+  it('rejects claude ids on a codex group with a shape hint', () => {
+    const r = parseMessageFlags('-m fable hi', 'codex');
+    expect(r.intent).toBeUndefined();
+    expect(r.errors[0]).toMatch(/unknown model: fable/);
+    expect(r.errors[0]).toMatch(/gpt-5\.5/);
+  });
+
+  it('accepts the codex effort enum including none/minimal', () => {
+    expect(parseMessageFlags('-e minimal hi', 'codex').intent).toEqual({ stickyEffort: 'minimal' });
+    expect(parseMessageFlags('-e xhigh hi', 'codex').intent).toEqual({ stickyEffort: 'xhigh' });
+  });
+
+  it("rejects claude-only 'max' effort on codex, listing the codex enum", () => {
+    const r = parseMessageFlags('-e max hi', 'codex');
+    expect(r.intent).toBeUndefined();
+    expect(r.errors[0]).toMatch(/unknown effort level: max/);
+    expect(r.errors[0]).toMatch(/none\|minimal\|low\|medium\|high\|xhigh/);
+  });
+
+  it('rejects ultracode on codex with an honest provider message', () => {
+    const r = parseMessageFlags('-e ultracode hi', 'codex');
+    expect(r.intent).toBeUndefined();
+    expect(r.errors[0]).toMatch(/ultracode is Claude-only/);
+    const r1 = parseMessageFlags('-e1 ultracode hi', 'codex');
+    expect(r1.errors[0]).toMatch(/ultracode is Claude-only/);
+  });
+
+  it('clears sticky model/effort identically across providers', () => {
+    expect(parseMessageFlags("-m '' hi", 'codex').intent).toEqual({ clearStickyModel: true });
+    expect(parseMessageFlags("-e '' hi", 'codex').intent).toEqual({
+      clearStickyEffort: true,
+      clearStickyUltracode: true,
+    });
+  });
+
+  it('codex model+effort pairs skip the claude effort matrix', () => {
+    const r = parseMessageFlags('-m gpt-5.5 -e xhigh hi', 'codex');
+    expect(r.intent).toEqual({ stickyModel: 'gpt-5.5', stickyEffort: 'xhigh' });
+    expect(r.warnings).toEqual([]);
+  });
+
+  it('defaults to the claude vocabulary when no provider is passed (back-compat)', () => {
+    const r = parseMessageFlags('-m fable hi');
+    expect(r.intent).toEqual({ stickyModel: 'claude-fable-5[1m]' });
+    expect(parseMessageFlags('-m gpt-5.5 hi').errors[0]).toMatch(/unknown model/);
+  });
+
+  it('opencode falls back to claude vocabulary for now (deliberate, see vocabFor)', () => {
+    const r = parseMessageFlags('-m fable hi', 'opencode');
+    expect(r.intent).toEqual({ stickyModel: 'claude-fable-5[1m]' });
+  });
+});

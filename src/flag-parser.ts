@@ -119,6 +119,77 @@ const MODEL_EFFORT_SUPPORT: Record<string, ReadonlySet<EffortLevel>> = {
   'claude-fable-5[1m]': new Set(['low', 'medium', 'high', 'xhigh', 'max']),
 };
 
+// ── Per-provider flag vocabulary ────────────────────────────────────────────
+// `-m`/`-e` values are provider-specific: a codex group must accept gpt-5.5
+// and reject claude-fable-5, and vice versa. Before this table existed the
+// parser was Claude-only, which produced two bugs on codex groups (observed
+// live 2026-06-10, dirt-market-codex): `-m fable` was acked and stored as
+// sticky_model — then silently ignored by the codex provider — while
+// `-m gpt-5.5` (the model actually running) was rejected as unknown.
+
+/** Codex reasoning_effort enum — mirrors `codexConfigSchema` in the agent-runner. */
+const CODEX_VALID_EFFORT: ReadonlySet<string> = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh']);
+
+/** Convenience aliases for codex model ids (typo-tolerant dot forms). */
+const CODEX_MODEL_ALIAS_MAP: Record<string, string> = {
+  'gpt5.5': 'gpt-5.5',
+  'gpt5.2-codex': 'gpt-5.2-codex',
+};
+
+/**
+ * Codex model ids are pattern-validated (`gpt-*`), not allowlisted: OpenAI
+ * ships new ids frequently and the codex app-server is the real authority —
+ * a well-formed-but-nonexistent id fails loudly at turn/start. The pattern
+ * exists to catch cross-provider mistakes (claude ids on a codex group),
+ * not to track OpenAI's catalog.
+ */
+const CODEX_VALID_MODEL_RE = /^gpt-[a-z0-9][a-z0-9.-]*$/;
+
+interface ProviderFlagVocab {
+  resolveModel(raw: string): string;
+  isValidModel(resolved: string): boolean;
+  /** Appended to the unknown-model error so the user learns the right shape. */
+  modelHint: string;
+  validEfforts: ReadonlySet<string>;
+  /** The `(expected …)` list in the unknown-effort error. */
+  effortHint: string;
+  /** ultracode is a Claude Agent SDK feature; other providers reject it. */
+  allowsUltracode: boolean;
+  /** Per-model effort matrix, or undefined when the provider has none. */
+  effortSupportFor(model: string): ReadonlySet<EffortLevel> | undefined;
+}
+
+const CLAUDE_VOCAB: ProviderFlagVocab = {
+  resolveModel: (raw) => resolveModelAlias(raw),
+  isValidModel: (resolved) => VALID_MODEL_RE.test(resolved),
+  modelHint: '',
+  validEfforts: VALID_EFFORT,
+  effortHint: 'low|medium|high|xhigh|max|ultracode',
+  allowsUltracode: true,
+  effortSupportFor: (model) => MODEL_EFFORT_SUPPORT[model],
+};
+
+const CODEX_VOCAB: ProviderFlagVocab = {
+  resolveModel: (raw) => CODEX_MODEL_ALIAS_MAP[raw.toLowerCase()] ?? raw.toLowerCase(),
+  isValidModel: (resolved) => CODEX_VALID_MODEL_RE.test(resolved),
+  modelHint: ' (codex models look like gpt-5.5, gpt-5.2-codex)',
+  validEfforts: CODEX_VALID_EFFORT,
+  effortHint: 'none|minimal|low|medium|high|xhigh',
+  allowsUltracode: false,
+  effortSupportFor: () => undefined,
+};
+
+/**
+ * Vocabulary lookup. Unknown providers (including opencode, for now) fall
+ * back to the Claude vocabulary — that preserves pre-provider-aware behavior
+ * exactly. Opencode model validation needs the live `opencode models` list
+ * (only available in-container; see list_models MCP) so its vocabulary is a
+ * deliberate follow-up, not an accidental omission.
+ */
+function vocabFor(provider: string): ProviderFlagVocab {
+  return provider === 'codex' ? CODEX_VOCAB : CLAUDE_VOCAB;
+}
+
 /** Structured representation of a parsed flag set. Empty object = no flags. */
 export interface FlagIntent {
   stickyModel?: string;
@@ -161,8 +232,13 @@ const FLAG_TOKEN_RE = /^\s*(-[me]1?)\s+("([^"]*)"|'([^']*)'|(\S*))\s*/;
 /**
  * Parse mention + flags from the front of the message text. Always returns a
  * result — callers inspect `intent`, `warnings`, `errors` to decide behavior.
+ *
+ * `provider` selects the flag vocabulary (model ids, effort enum, ultracode
+ * availability) for the agent group the message targets. Defaults to claude
+ * — the safe choice for every pre-existing call site.
  */
-export function parseMessageFlags(rawText: string): FlagParseResult {
+export function parseMessageFlags(rawText: string, provider: string = 'claude'): FlagParseResult {
+  const vocab = vocabFor(provider);
   let cursor = rawText.replace(MENTION_PREFIX_RE, '').replace(SWITCH_COMMAND_RE, '');
 
   const intent: FlagIntent = {};
@@ -182,9 +258,9 @@ export function parseMessageFlags(rawText: string): FlagParseResult {
         if (rawValue === '') {
           intent.clearStickyModel = true;
         } else {
-          const resolved = resolveModelAlias(rawValue);
-          if (VALID_MODEL_RE.test(resolved)) intent.stickyModel = resolved;
-          else errors.push(`unknown model: ${rawValue}`);
+          const resolved = vocab.resolveModel(rawValue);
+          if (vocab.isValidModel(resolved)) intent.stickyModel = resolved;
+          else errors.push(`unknown model: ${rawValue}${vocab.modelHint}`);
         }
         break;
       }
@@ -192,9 +268,9 @@ export function parseMessageFlags(rawText: string): FlagParseResult {
         if (rawValue === '') {
           errors.push(`-m1 requires a value (use -m '' to clear sticky)`);
         } else {
-          const resolved = resolveModelAlias(rawValue);
-          if (VALID_MODEL_RE.test(resolved)) intent.turnModel = resolved;
-          else errors.push(`unknown model: ${rawValue}`);
+          const resolved = vocab.resolveModel(rawValue);
+          if (vocab.isValidModel(resolved)) intent.turnModel = resolved;
+          else errors.push(`unknown model: ${rawValue}${vocab.modelHint}`);
         }
         break;
       }
@@ -203,17 +279,21 @@ export function parseMessageFlags(rawText: string): FlagParseResult {
           intent.clearStickyEffort = true;
           intent.clearStickyUltracode = true;
         } else if (rawValue.toLowerCase() === ULTRACODE) {
-          // ultracode = xhigh effort + dynamic-workflow orchestration. Force
-          // effort to xhigh and flip the separate ultracode flag on.
-          intent.stickyEffort = 'xhigh';
-          intent.stickyUltracode = true;
-        } else if (VALID_EFFORT.has(rawValue)) {
+          if (vocab.allowsUltracode) {
+            // ultracode = xhigh effort + dynamic-workflow orchestration. Force
+            // effort to xhigh and flip the separate ultracode flag on.
+            intent.stickyEffort = 'xhigh';
+            intent.stickyUltracode = true;
+          } else {
+            errors.push(`ultracode is Claude-only — this is a ${provider} agent (expected ${vocab.effortHint})`);
+          }
+        } else if (vocab.validEfforts.has(rawValue)) {
           intent.stickyEffort = rawValue;
           // No ultracode field emitted here — a plain effort change implicitly
           // turns ultracode off, inferred container-side from stickyEffort being
           // set without stickyUltracode. Keeps the intent minimal.
         } else {
-          errors.push(`unknown effort level: ${rawValue} (expected low|medium|high|xhigh|max|ultracode)`);
+          errors.push(`unknown effort level: ${rawValue} (expected ${vocab.effortHint})`);
         }
         break;
       }
@@ -221,12 +301,16 @@ export function parseMessageFlags(rawText: string): FlagParseResult {
         if (rawValue === '') {
           errors.push(`-e1 requires a value (use -e '' to clear sticky)`);
         } else if (rawValue.toLowerCase() === ULTRACODE) {
-          intent.turnEffort = 'xhigh';
-          intent.turnUltracode = true;
-        } else if (VALID_EFFORT.has(rawValue)) {
+          if (vocab.allowsUltracode) {
+            intent.turnEffort = 'xhigh';
+            intent.turnUltracode = true;
+          } else {
+            errors.push(`ultracode is Claude-only — this is a ${provider} agent (expected ${vocab.effortHint})`);
+          }
+        } else if (vocab.validEfforts.has(rawValue)) {
           intent.turnEffort = rawValue;
         } else {
-          errors.push(`unknown effort level: ${rawValue} (expected low|medium|high|xhigh|max|ultracode)`);
+          errors.push(`unknown effort level: ${rawValue} (expected ${vocab.effortHint})`);
         }
         break;
       }
@@ -236,7 +320,7 @@ export function parseMessageFlags(rawText: string): FlagParseResult {
   const modelForValidation = intent.turnModel ?? intent.stickyModel;
   const effortForValidation = intent.turnEffort ?? intent.stickyEffort;
   if (modelForValidation && effortForValidation) {
-    const supported = MODEL_EFFORT_SUPPORT[modelForValidation];
+    const supported = vocab.effortSupportFor(modelForValidation);
     if (supported && !supported.has(effortForValidation as EffortLevel)) {
       if (supported.size === 0) {
         warnings.push(`${modelForValidation} doesn't support effort — applied model, skipped effort`);

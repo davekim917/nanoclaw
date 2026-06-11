@@ -34,7 +34,7 @@ import {
   type ContainerConfig,
   type RecallScope,
 } from './container-config.js';
-import { getContainerConfig } from './db/container-configs.js';
+import { getContainerConfig, resolveProviderName } from './db/container-configs.js';
 import { updateContainerConfigScalars, updateContainerConfigJson } from './db/container-configs.js';
 import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainer } from './container-runtime.js';
 import { checkAgentRunnerDepsDrift } from './agent-runner-image-check.js';
@@ -911,22 +911,10 @@ const SCOPED_CREDENTIAL_VARS = [
   'GIT_COMMITTER_EMAIL',
 ];
 
-/**
- * Resolve the provider name for a session using the precedence documented in
- * the provider-install skills:
- *
- *   sessions.agent_provider
- *     → container_configs.provider
- *     → 'claude'
- *
- * Pure so the precedence can be unit-tested without a DB or filesystem.
- */
-export function resolveProviderName(
-  sessionProvider: string | null | undefined,
-  containerConfigProvider: string | null | undefined,
-): string {
-  return (sessionProvider || containerConfigProvider || 'claude').toLowerCase();
-}
+// Canonical definition moved to db/container-configs.ts so light consumers
+// (router flag parsing) don't import this module, which most of the test
+// suite factory-mocks. Re-exported here for existing import sites.
+export { resolveProviderName } from './db/container-configs.js';
 
 function resolveProviderContribution(
   session: Session,
