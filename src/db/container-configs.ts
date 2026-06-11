@@ -12,6 +12,26 @@ const SCALAR_COLUMNS = new Set([
 ]);
 const JSON_COLUMNS = new Set(['skills', 'mcp_servers', 'packages_apt', 'packages_npm', 'additional_mounts']);
 
+/**
+ * Resolve the provider name for a session using the precedence documented in
+ * the provider-install skills:
+ *
+ *   sessions.agent_provider
+ *     → container_configs.provider
+ *     → 'claude'
+ *
+ * Pure so the precedence can be unit-tested without a DB or filesystem.
+ * Lives here (not container-runner.ts, which re-exports it) so light
+ * consumers — e.g. the router's provider-aware flag parsing — don't have to
+ * import the container runner, which half the test suite factory-mocks.
+ */
+export function resolveProviderName(
+  sessionProvider: string | null | undefined,
+  containerConfigProvider: string | null | undefined,
+): string {
+  return (sessionProvider || containerConfigProvider || 'claude').toLowerCase();
+}
+
 export function getContainerConfig(agentGroupId: string): ContainerConfigRow | undefined {
   return getDb().prepare('SELECT * FROM container_configs WHERE agent_group_id = ?').get(agentGroupId) as
     | ContainerConfigRow

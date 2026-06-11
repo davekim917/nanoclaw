@@ -39,6 +39,7 @@ import { upsertArchiveMessage } from './message-archive.js';
 import { parseMessageFlags, formatFlagConfirmation, type FlagIntent } from './flag-parser.js';
 import { maybeRenameNewThread } from './topic-title.js';
 import { wakeContainer } from './container-runner.js';
+import { getContainerConfig, resolveProviderName } from './db/container-configs.js';
 import { getSession } from './db/sessions.js';
 import type { AgentGroup, MessagingGroup, MessagingGroupAgent } from './types.js';
 import type { InboundEvent } from './channels/adapter.js';
@@ -878,7 +879,11 @@ async function deliverToAgent(
   let flagCleanedText: string | null = null;
   if (wake && (event.message.kind === 'chat' || event.message.kind === 'chat-sdk')) {
     const rawText = parsedContent.text ?? '';
-    const parsed = parseMessageFlags(rawText);
+    // Flag vocabulary is provider-specific (codex accepts gpt-5.5, rejects
+    // claude ids; claude the reverse). Same precedence as container spawn:
+    // sessions.agent_provider → container_configs.provider → 'claude'.
+    const provider = resolveProviderName(session.agent_provider, getContainerConfig(session.agent_group_id)?.provider);
+    const parsed = parseMessageFlags(rawText, provider);
     if (parsed.intent || parsed.errors.length > 0 || parsed.warnings.length > 0) {
       flagIntent = parsed.intent;
       flagCleanedText = parsed.cleanedText;

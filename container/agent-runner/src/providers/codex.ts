@@ -207,6 +207,46 @@ export const codexConfigSchema = z.strictObject({
 
 registerProviderConfigSchema('codex', codexConfigSchema);
 
+// ── Per-query model/effort overrides (-m/-e flags) ──────────────────────────
+// The poll-loop delivers host-parsed flag values via QueryInput.model/.effort
+// (turn override → sticky, resolved in applyFlagBatch). Both are validated
+// here before they reach the app-server: session_state can carry values from
+// before the host's flag vocabulary became provider-aware (observed live
+// 2026-06-10: sticky_model=claude-fable-5[1m] on a codex session), and a
+// claude id at thread/start would fail every turn of the session.
+
+/** Mirrors CODEX_VALID_MODEL_RE in the host's flag-parser (separate package trees). */
+export const CODEX_MODEL_RE = /^gpt-[a-z0-9][a-z0-9.-]*$/;
+
+const CODEX_EFFORT_VALUES: ReadonlySet<string> = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh']);
+
+type CodexStickyConfig = z.infer<typeof codexConfigSchema>;
+
+/** Flag-requested model if it's codex-shaped, else the configured fallback. */
+export function resolveQueryModel(requested: string | undefined, fallback: string): string {
+  if (!requested) return fallback;
+  if (CODEX_MODEL_RE.test(requested)) return requested;
+  console.error(`[codex-provider] Ignoring non-codex model override "${requested}" — staying on ${fallback}`);
+  return fallback;
+}
+
+/**
+ * Sticky config with the flag-requested effort folded in (when valid for
+ * codex's reasoning_effort enum). Returned object feeds
+ * createCodexConfigOverrides at app-server spawn — one server per query, so
+ * a per-query effort lands as `-c model_reasoning_effort` naturally.
+ */
+export function resolveQueryEffort(requested: string | undefined, sticky: CodexStickyConfig): CodexStickyConfig {
+  if (!requested) return sticky;
+  if (CODEX_EFFORT_VALUES.has(requested)) {
+    return { ...sticky, reasoning_effort: requested as CodexStickyConfig['reasoning_effort'] };
+  }
+  console.error(
+    `[codex-provider] Ignoring non-codex effort override "${requested}" — staying on ${sticky.reasoning_effort}`,
+  );
+  return sticky;
+}
+
 // ── System-prompt assembly ──────────────────────────────────────────────────
 // Codex's app-server doesn't expand Claude Code's `@-import` syntax in
 // CLAUDE.md, and doesn't auto-load CLAUDE.local.md from the working dir the
@@ -625,13 +665,18 @@ export class CodexProvider implements AgentProvider {
 
     const self = this;
 
+    // -m/-e flag overrides for this query (validated; invalid values fall
+    // back to configured defaults — see resolveQueryModel/resolveQueryEffort).
+    const effectiveModel = resolveQueryModel(input.model, this.model);
+    const effectiveConfig = resolveQueryEffort(input.effort, this.stickyConfig);
+
     async function* gen(): AsyncGenerator<ProviderEvent> {
       // One app-server per query invocation. The poll-loop keeps a single
       // query active per batch of pending messages and ends it on idle, so
       // spawn-per-query matches that cadence naturally.
       writeCodexMcpConfigToml(self.mcpServers);
       writeCodexHooksJson();
-      let server = spawnCodexAppServer(createCodexConfigOverrides(self.stickyConfig));
+      let server = spawnCodexAppServer(createCodexConfigOverrides(effectiveConfig));
       turnTracker.server = server;
       attachCodexAutoApproval(server);
 
@@ -648,7 +693,7 @@ export class CodexProvider implements AgentProvider {
         await initializeCodexAppServer(server);
 
         const threadParams = {
-          model: self.model,
+          model: effectiveModel,
           cwd: input.cwd,
           sandbox: 'danger-full-access',
           approvalPolicy: 'never',
@@ -734,7 +779,7 @@ export class CodexProvider implements AgentProvider {
               server,
               threadId!,
               text,
-              self.model,
+              effectiveModel,
               input.cwd,
               () => initYielded,
               () => {
@@ -795,7 +840,7 @@ export class CodexProvider implements AgentProvider {
                     writeCodexMcpConfigToml(self.mcpServers);
                     writeCodexHooksJson();
 
-                    server = spawnCodexAppServer(createCodexConfigOverrides(self.stickyConfig));
+                    server = spawnCodexAppServer(createCodexConfigOverrides(effectiveConfig));
                     turnTracker.server = server;
                     attachCodexAutoApproval(server);
                     await initializeCodexAppServer(server);

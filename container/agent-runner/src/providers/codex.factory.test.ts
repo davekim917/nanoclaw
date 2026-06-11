@@ -14,6 +14,8 @@ import {
   findRolloutFile,
   materializeRawImageGeneration,
   resolveClaudeImports,
+  resolveQueryModel,
+  resolveQueryEffort,
 } from './codex.js';
 
 describe('createProvider (codex)', () => {
@@ -901,6 +903,91 @@ describe('codex OAuth fallback — rotation primitives', () => {
       expect(repairIdx).toBeGreaterThan(-1);
       expect(resumeIdx).toBeGreaterThan(-1);
       expect(repairIdx).toBeLessThan(resumeIdx);
+    });
+  });
+});
+
+describe('per-query model/effort overrides (-m/-e flags)', () => {
+  // The poll-loop delivers host-parsed flag values via QueryInput.model and
+  // QueryInput.effort. Before 2026-06, the codex provider ignored both —
+  // observed live (dirt-market-codex): `-m fable` was acked by the host and
+  // stored as sticky_model=claude-fable-5[1m], while the session silently
+  // kept running gpt-5.5. These resolvers are the validation boundary.
+
+  describe('resolveQueryModel', () => {
+    it('passes through a codex-shaped model override', () => {
+      expect(resolveQueryModel('gpt-5.2-codex', 'gpt-5.5')).toBe('gpt-5.2-codex');
+    });
+
+    it('falls back to the configured model when no override is requested', () => {
+      expect(resolveQueryModel(undefined, 'gpt-5.5')).toBe('gpt-5.5');
+      expect(resolveQueryModel('', 'gpt-5.5')).toBe('gpt-5.5');
+    });
+
+    it('ignores a claude id (poisoned pre-provider-aware sticky_model)', () => {
+      expect(resolveQueryModel('claude-fable-5[1m]', 'gpt-5.5')).toBe('gpt-5.5');
+      expect(resolveQueryModel('opus', 'gpt-5.5')).toBe('gpt-5.5');
+    });
+
+    it('ignores malformed gpt-ish values', () => {
+      expect(resolveQueryModel('gpt-', 'gpt-5.5')).toBe('gpt-5.5');
+      expect(resolveQueryModel('GPT-5.5', 'gpt-5.5')).toBe('gpt-5.5');
+    });
+  });
+
+  describe('resolveQueryEffort', () => {
+    const sticky = { reasoning_effort: 'xhigh' as const };
+
+    it('folds a valid codex effort into the sticky config', () => {
+      expect(resolveQueryEffort('medium', sticky).reasoning_effort).toBe('medium');
+      expect(resolveQueryEffort('none', sticky).reasoning_effort).toBe('none');
+    });
+
+    it('does not mutate the original sticky config', () => {
+      resolveQueryEffort('low', sticky);
+      expect(sticky.reasoning_effort).toBe('xhigh');
+    });
+
+    it('keeps the sticky effort when no override is requested', () => {
+      expect(resolveQueryEffort(undefined, sticky).reasoning_effort).toBe('xhigh');
+      expect(resolveQueryEffort('', sticky).reasoning_effort).toBe('xhigh');
+    });
+
+    it("ignores claude-only values ('max', poisoned pre-provider-aware stickies)", () => {
+      expect(resolveQueryEffort('max', sticky).reasoning_effort).toBe('xhigh');
+      expect(resolveQueryEffort('ultracode', sticky).reasoning_effort).toBe('xhigh');
+    });
+  });
+
+  // Source-anchored wiring guards (same pattern as the Layer-2 self-heal
+  // tests above): gen() must consume the resolved values, not self.model /
+  // self.stickyConfig, or flags regress to acked-but-ignored.
+  describe('gen() wiring', () => {
+    const src = fs.readFileSync(new URL('./codex.ts', import.meta.url), 'utf8');
+    const codeOnly = src
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .split('\n')
+      .map((l) => {
+        const i = l.indexOf('//');
+        return i >= 0 ? l.slice(0, i) : l;
+      })
+      .join('\n');
+
+    it('resolves overrides from QueryInput before gen()', () => {
+      expect(codeOnly).toMatch(/resolveQueryModel\(input\.model,\s*this\.model\)/);
+      expect(codeOnly).toMatch(/resolveQueryEffort\(input\.effort,\s*this\.stickyConfig\)/);
+    });
+
+    it('thread params and per-turn model use the resolved model', () => {
+      expect(codeOnly).toMatch(/model:\s*effectiveModel/);
+      expect(codeOnly).not.toMatch(/model:\s*self\.model/);
+      expect(codeOnly).not.toMatch(/runOneTurn\(\s*server,\s*threadId!,\s*text,\s*self\.model/);
+    });
+
+    it('every app-server spawn uses the effort-folded config', () => {
+      const spawns = codeOnly.match(/spawnCodexAppServer\(createCodexConfigOverrides\(([^)]*)\)\)/g) ?? [];
+      expect(spawns.length).toBeGreaterThanOrEqual(2);
+      for (const s of spawns) expect(s).toContain('effectiveConfig');
     });
   });
 });

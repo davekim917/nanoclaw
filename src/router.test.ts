@@ -11,6 +11,13 @@ vi.mock('./db/connection.js', () => ({
   getDb: vi.fn(),
   hasTable: vi.fn(() => true),
 }));
+vi.mock('./db/container-configs.js', async (importOriginal) => ({
+  // resolveProviderName is pure — keep it real so flag parsing sees the
+  // genuine provider cascade. getContainerConfig hits the central DB; stub
+  // it to "no config row" (provider falls back to 'claude').
+  ...(await importOriginal<typeof import('./db/container-configs.js')>()),
+  getContainerConfig: vi.fn(() => undefined),
+}));
 
 vi.mock('./db/messaging-groups.js', () => ({
   getMessagingGroupWithAgentCount: vi.fn(),
