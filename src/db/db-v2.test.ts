@@ -33,6 +33,8 @@ import {
   createPendingQuestion,
   getPendingQuestion,
   deletePendingQuestion,
+  ensureContainerConfig,
+  getContainerConfig,
 } from './index.js';
 
 function now() {
@@ -819,5 +821,17 @@ describe('assertSameWorkgroupWiring (via createMessagingGroupAgent)', () => {
     // shared-dir resolution. Different folders → different data pools → reject.
     createMessagingGroupAgent(mgaRow('mga-a', 'ag-a'));
     expect(() => createMessagingGroupAgent(mgaRow('mga-b', 'ag-b'))).toThrow(/same workgroup/);
+  });
+});
+
+// ── Container Configs ──
+
+describe('container configs', () => {
+  it('container_configs has nullable security_json column defaulting to null', () => {
+    createAgentGroup({ id: 'ag-sec', name: 'Sec', folder: 'sec', agent_provider: null, created_at: now() });
+    ensureContainerConfig('ag-sec');
+    const row = getContainerConfig('ag-sec');
+    expect(row).toBeDefined();
+    expect(row!.security_json).toBeNull();
   });
 });

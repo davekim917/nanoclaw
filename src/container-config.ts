@@ -72,6 +72,26 @@ export interface AdditionalMountConfig {
   readonly?: boolean;
 }
 
+/**
+ * Per-group container PRIVILEGE hardening. Absent fields fall back to the
+ * hardcoded safe defaults in `securityArgs` (cap-drop ALL, no-new-privileges).
+ *
+ * Deliberately narrower than upstream's shape: resource ceilings (memory,
+ * pids-limit, cpu) are NOT here. This install already owns those in
+ * `resources` / `ContainerResources`, resolved by `resolveContainerResources`
+ * and emitted by `dockerResourceLimitArgs`. Two places to set one Docker flag
+ * is how a spawn ends up with contradictory `--memory` args, so privilege
+ * flags live here and resource ceilings live there — one mechanism each.
+ */
+export interface SecurityConfig {
+  /** Linux capabilities to drop. Default `['ALL']`. */
+  capDrop?: string[];
+  /** Capabilities to add back after the drop. Default none. */
+  capAdd?: string[];
+  /** Emit `--security-opt no-new-privileges:true`. Default true. */
+  noNewPrivileges?: boolean;
+}
+
 /** Shape of the materialized `container.json` file read by the container runner. */
 export interface ContainerConfig {
   mcpServers: Record<string, McpServerConfig>;
@@ -86,6 +106,9 @@ export interface ContainerConfig {
   maxMessagesPerPrompt?: number;
   /** Per-session container resource request and hard ceilings. */
   resources?: ContainerResources;
+
+  /** Per-session container privilege hardening (capabilities, no-new-privileges). */
+  security?: SecurityConfig;
 
   /**
    * Provider-level model / reasoning effort tracked in the container_configs
@@ -469,6 +492,7 @@ export function configFromDb(row: ContainerConfigRow, group: AgentGroup): Contai
     maxMessagesPerPrompt: row.max_messages_per_prompt ?? undefined,
     model: row.model ?? undefined,
     effort: row.effort ?? undefined,
+    security: row.security_json ? (JSON.parse(row.security_json) as SecurityConfig) : undefined,
   };
 }
 
@@ -530,6 +554,7 @@ function materializeContainerConfig(raw: Partial<ContainerConfig>): ContainerCon
     agentGroupId: raw.agentGroupId,
     maxMessagesPerPrompt: raw.maxMessagesPerPrompt,
     resources: raw.resources,
+    security: raw.security,
     model: raw.model,
     effort: raw.effort,
     providerFallback: raw.providerFallback,
