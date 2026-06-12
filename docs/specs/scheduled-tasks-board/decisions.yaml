@@ -253,7 +253,11 @@ assumptions_design:
     validated: false
     invalidated_at: null
 
-review_cycles:
+# Informal pre-approval design iterations (ad-hoc reviewer swarms commissioned by the
+# operator BEFORE /team-review existed for this feature). NOT /team-review invocations —
+# the schema defines review_cycles as one entry per /team-review invocation, so these
+# live under their own key. Full finding history: decisions D6-D18 + design rev notes.
+design_iteration_cycles:
   - iteration: 1
     must_fix_count: 9
     should_fix_count: 8
@@ -264,3 +268,28 @@ review_cycles:
     should_fix_count: 8
     wont_fix_count: 0
     completed_at: 2026-06-12T00:30:00Z
+
+review_cycles:
+  - iteration: 1
+    must_fix_count: 6
+    should_fix_count: 10
+    wont_fix_count: 1
+    completed_at: 2026-06-12T18:20:00Z
+
+auto_judgments:
+  - stage: Review
+    iteration: 1
+    decision: "Relabel the two informal pre-approval reviewer passes from review_cycles to design_iteration_cycles; formal /team-review counting starts at this invocation (1/3)."
+    alternatives_considered:
+      - "Keep informal passes in review_cycles (this run = cycle 3/3, cap-reached escalation on any MUST-FIX)"
+      - "Drop the informal history entirely"
+    grounding:
+      - "skills/shared/decision-record-schema.md — review_cycles: '/team-review | Append: review_cycles (one entry per invocation)'"
+      - "team-review SKILL.md Step 5 — 'Append a new review_cycles entry with iteration = N+1' tied to running the three reviewers"
+      - "Informal passes were ad-hoc Agent swarms commissioned directly by the operator before /team-auto was invoked; their findings are preserved in D6-D18"
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-06-12T18:20:00Z
