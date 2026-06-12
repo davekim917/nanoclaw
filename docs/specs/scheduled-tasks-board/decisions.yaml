@@ -275,6 +275,11 @@ review_cycles:
     should_fix_count: 10
     wont_fix_count: 1
     completed_at: 2026-06-12T18:20:00Z
+  - iteration: 2
+    must_fix_count: 4
+    should_fix_count: 5
+    wont_fix_count: 1
+    completed_at: 2026-06-12T19:40:00Z
 
 auto_judgments:
   - stage: Review
@@ -293,3 +298,33 @@ auto_judgments:
       changes_hard_constraint: false
       weakens_safety_invariant: false
     recorded_at: 2026-06-12T18:20:00Z
+  - stage: Review
+    iteration: 2
+    decision: "Consolidate all verb guards into a single authoritative §4.0 verb×state matrix instead of patching the six guard contradictions individually."
+    alternatives_considered:
+      - "Patch each contradiction in place across §4.2/§4.6/§3b prose"
+      - "Drop the unknown/late substates to reduce the state space"
+    grounding:
+      - "review.md cycle-2: A2#1/A2#2/A2#3 + C2#3/C2#6/C2#7 all root in guard logic scattered across sections (six findings, one generator)"
+      - "design.md §4.6 vs §4.1 contradiction surfaced by /team-review reviewer A (stalled ⇒ process_after ≤ now ⇒ unconditional 409)"
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-06-12T19:40:00Z
+  - stage: Review
+    iteration: 2
+    decision: "Move guard tightened to 'paused OR process_after > now + grace' — removes the documented TOCTOU window entirely rather than accepting it."
+    alternatives_considered:
+      - "Keep the rev-3 due-now check with documented residual ms-window"
+      - "Semantic lock (persisted in-progress marker on the source row)"
+    grounding:
+      - "C2#7 (residual window is the double-fire class the design protects against) + A2#2 (paused rows are safe to move regardless of slot)"
+      - "best-practice-check cycle 2: lock-vs-check noted as accepted deviation; future-dated requirement achieves lock-equivalent safety without new state"
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-06-12T19:40:00Z

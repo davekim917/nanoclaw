@@ -58,6 +58,45 @@ Also applied: A#13 (index added to baseline INBOUND_SCHEMA + migrate fn; board r
 - `[RENDER-CHECK NEEDED]` (design §3c): health-pill palette contrast — map to a build task acceptance criterion.
 - Assumption A2 (module-owned series registry covers all 22) and A3 (warm assembly < 1s) — validate during build.
 
-## Gate
+## Gate (cycle 1)
 
-MUST-FIX outstanding after rev 3: **0** (all six resolved in-document; resolutions verified against the cited primitives). Rev 3 goes back through `/team-review` as formal cycle 2 for confirmation per the rollback rule ("a changed design requires fresh assessment").
+MUST-FIX outstanding after rev 3: 0 in-document. Rev 3 re-reviewed as formal cycle 2 per the rollback rule.
+
+---
+
+# Cycle 2 — design rev 3 → rev 4 (2026-06-12)
+
+Reviewers: A (architecture — verified ALL 16 cycle-1 resolutions hold against source, then found 6 new internal inconsistencies introduced by rev 3's additions) · B (best-practice — move flow now CONFORMS to saga/compensating-transaction pattern, T1-sourced; cycle-1 drift resolved; 3 LOW notes) · C (Codex adversarial, direct foreground run — 7 findings).
+
+**Root cause of the cycle-2 MUST-FIX cluster:** verb guard logic was scattered across §4.2/§4.6/§3b prose; each rev-3 addition created a contradiction with another section. Rev 4 fixes the generator, not just the instances: new **§4.0 verb × state availability matrix** is the single authoritative guard spec.
+
+## MUST-FIX (4) — resolved in rev 4
+
+| # | Finding | Raised by | Resolution (rev 4) |
+|---|---------|-----------|--------------------|
+| M7 | Verb availability contradictions: strand-cancel unreachable under `touched==0 → 409` (the §4.3 guard's own target case); run-now/move verb-dead on exactly the stalled/unknown rows the board exists to remediate; edit unguarded on claimed rows | A2#1 + A2#2 + C2#3 (conv.) | §4.0 matrix: cancel touched-count includes terminal-recurrence clears (cancel IS the strand remedy); run-now 409s only on positive claim (unclaimed overdue = its primary use case); edit gets the source_busy guard; every guard derives from three named primitives |
+| M8 | Move silently un-pauses paused series — `scheduleTask` and `insertRecurrence` both hardcode `'pending'` (`scheduled-tasks.ts:211`, `db.ts:157`); snapshot omits status | A2#3 | §4.2 step 4a: snapshot status; `pauseTask(target)` post-insert (safe — matrix admits only paused/future-dated rows); `restoreTaskRow` restores snapshot status |
+| M9 | Intent-row lifecycle gaps: stale action enum, unspecified `resolved_at` writer, prunable correlation id, review.md S1 "zero new schema" contradicted by `resolved_at` | A2#4 | §4.4: action enum extended (`move_intent`/`move_restore_failed`); `resolved_at` stamped by execute-handler-on-success or sweep recovery; `correlation_id` promoted to real prune-exempt column; S1's "zero new schema" claim corrected — S1 auto-resolve is computed, but the intent mechanism does add two columns (recorded) |
+| M10 | No autonomous recovery from unresolved move_intent — "surfaces as stalled" is observability, not recovery; a crash post-cancel leaves the series dead until a human looks | C2#2 + B2-drift-1 (conv.) | §4.2 step 2b: host-sweep module hook (additive, handleRecurrence pattern) consumes unresolved intents older than one sweep — completes the target insert or restores the source from the intent's snapshot, stamping `resolved_at` |
+
+## SHOULD-FIX (5) — applied in rev 4
+
+| # | Finding | Raised by | Resolution |
+|---|---------|-----------|------------|
+| S11 | Grace formula hides days of lateness on long-cadence series (weekly ≈ 3.5d grace) | C2#1 | `late` state visible immediately on any overdue; stall grace capped at absolute 24h; per-series overrides v2 |
+| S12 | Per-session inbound.db read failure semantics undefined (one bad file: fail fleet or silently omit?) | C2#4 | Partial snapshot; `unreadable` grey entries + strip count; mutations on affected keys fail closed 503 |
+| S13 | Run-now near-slot double fire kept as warn-only | C2#6 | 409 by default within grace of next slot; `force=true` fires AND advances `process_after` past the slot (run-now-skip-next — single-execution even when forced) |
+| S14 | Health strip omits `unknown` count — S9's substate invisible at summary layer | A2#5 + B2-drift-3 | Strip gains `unknown`/`unreadable` grey counts |
+| S15 | C1 ledger incomplete; §3b detail line missing audit-tail tier qualifier | A2#6 | C1 status cell now lists all three deliberate adjacent acts; §3b qualified |
+
+## WON'T-FIX (1)
+
+| # | Finding | Raised by | Reason |
+|---|---------|-----------|--------|
+| W2 | Move preview should diff the full execution environment (packages, MCP, mounts, provider) and block on losses | C2#5 | Explicitly decided v1 scope (rev 3 S7): static caveat + `environmentDeltaChecked: false` + v2 OUT item. Single-operator, owner-tier-gated, and the failure mode (script breaks in target) is visible on the board as failed/no-output fires. Logged for v2. |
+
+B2's remaining LOW notes: lock-vs-check isolation (documented accepted deviation — single-writer host narrows exposure; matrix's future-dated rule now removes the residual window entirely); recovery runbook (resolved by M10's sweep recovery); unknown-strip (resolved by S14).
+
+## Gate (cycle 2)
+
+MUST-FIX outstanding after rev 4: **0**. Rev 4 proceeds to formal cycle 3 (FINAL — cap) for confirmation.
