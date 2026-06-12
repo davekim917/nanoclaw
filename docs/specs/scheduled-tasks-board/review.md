@@ -100,3 +100,36 @@ B2's remaining LOW notes: lock-vs-check isolation (documented accepted deviation
 ## Gate (cycle 2)
 
 MUST-FIX outstanding after rev 4: **0**. Rev 4 proceeds to formal cycle 3 (FINAL — cap) for confirmation.
+
+---
+
+# Cycle 3 — design rev 4 (FINAL cycle, 2026-06-12)
+
+Reviewers: A (architecture — exhaustive: verified every matrix cell, all cycle-2 resolutions, and all line citations against source; 4 findings) · B (best-practice — both rev-4 mechanisms CONFORM: matrix = textbook transition-table consolidation, sweep hook completes saga conformance incl. correct pivot semantics; 1 MEDIUM + 1 LOW drift) · C (Codex adversarial — 4 findings).
+
+**Verified clean:** §4.0 matrix coherent for pending-branch moves, all strand/processing/stale-key cells, M9/M10/S11-S15 resolutions, the full constraint table, and every file:line citation. The remaining findings are concentrated in three rev-4 mechanisms.
+
+## Findings (MUST-FIX class, merged; each carries a reviewer-specified resolution)
+
+| # | Finding | Raised by | Reviewer-specified fix |
+|---|---------|-----------|------------------------|
+| F1 | **Paused-overdue move still fires**: matrix admits paused rows with no `process_after` condition; insert-then-pause leaves a pending+due target claimable in the window — and if claimed, ack-sync overwrites the late pause and recurrence mints a *pending* successor: the un-pause bug resurfaces through the race the fix claimed closed. §4.2's leftover "imminent-fire edge" sentence contradicts 4a. | A3#1 ≡ C3#1 (conv.) | Staged insert for paused snapshots: insert future-dated (`now + guard_grace`) → `pauseTask(target)` → `updateTask(target, {processAfter: snapshot})` (matches paused rows, db.ts:81) — never simultaneously pending and due. Delete the stale sentence. (C3's alternative — status-bearing insert helper — equivalent; staged variant avoids touching scheduleTask's signature again.) |
+| F2 | **Recovery predicate permits double-restore / double-fire**: crash between intent-write and cancel leaves source live; a target-existence-only check restores blindly → two live rows. Separately, restore→stamp spans two DB files (not atomic) — crash between them re-restores on the next sweep. | A3#2 + B3-MEDIUM (conv.) | Predicate = fleet-wide zero-live-rows for series_id (the step-6 invariant primitive); `restoreTaskRow` re-checks the precondition immediately before insert (idempotent compensation per T1 guidance); stamp after. |
+| F3 | **`force=skip-next` unimplementable as written**: the successor row does not exist at force time — `handleRecurrence` computes next-after-*completion*, which IS the imminent slot. The promised single-execution semantics have no mechanism. | A3#3 ≡ C3#2 (conv.) | Either a `skip_next` intent consumed by the §4.2-2b sweep hook (4th C1-ledger act), or drop `force` to "fires; imminent slot may still fire — documented residual" keeping the 409 default as the real protection. **Recommend the latter for v1** (simpler; the 409 default already prevents accidental duplicates; force becomes a deliberate operator override with a named residual). |
+| F4 | **`grace` undefined in guard contexts**: §4.0/§4.2/§4.6 reuse the term; the only defined formula (§4.1 stall) yields 12h for a daily series — move would be `source_busy` for half of every cycle. | A3#4 | Define `guard_grace = max(2 × SWEEP_INTERVAL, 2min)` as a distinct §4.0 constant; §4.1's formula is stall-detection only. |
+| F5 | **Intent snapshot contradicts the audit-privacy guarantee**: `move_intent.detail_json` carries the full prompt+script while §4.4 promises "verbatim bodies are never persisted." | C3#3 | Purge-on-resolution: stamping `resolved_at` also clears the intent row's `detail_json` body (handler and sweep both do it) — the plaintext copy exists only while a move is unresolved (seconds, or one sweep interval after a crash). §4.4 wording amended to "never persisted *beyond an unresolved move intent's lifetime*." |
+| F6 | **Run-now on `unknown` is unsafe**: claim state is unknowable by definition; confirm-and-fire can duplicate an already-claimed run. | C3#4 | Matrix cell flips to fail-closed `503 claim_state_unreadable` for run-now (and move already 409s); non-execution verbs (edit/pause/cancel) remain available on `unknown`. |
+
+LOW (carry-forward, not blocking): matrix axes precedence sentence (kind columns are masks AND'd with state guards) — A3-minor; matrix enforced as ONE table-driven code path that also drives drawer button enable/disable — B3-LOW.
+
+## Carry-forward to /team-plan
+
+- [NEEDS SPEC: §4.0 matrix implemented as a single table-driven structure consumed by both API handlers and the drawer's verb buttons — B3-LOW, prevents re-scattering]
+- [NEEDS SPEC: matrix kind-columns precedence sentence — A3-minor]
+- [NEEDS SPEC: per-series stall-grace overrides — v2, from cycle 1]
+- `[RENDER-CHECK NEEDED]` (§3c): health-pill palette contrast → build-task acceptance criterion.
+- Assumptions A2 (module-series registry) and A3 (warm assembly <1s) → validate during build.
+
+## Gate (cycle 3 — CAP REACHED)
+
+Review cycle cap reached (3/3) with 6 merged MUST-FIX findings outstanding, each carrying a converged reviewer-specified resolution. Escalated to the operator per `/team-auto` protocol — see `auto-pause.md`.
