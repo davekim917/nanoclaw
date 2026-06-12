@@ -34,6 +34,11 @@ const STARTUP_DELAY_MS = 5 * 60 * 1000; // wait 5min after startup so host is qu
 const GIT_PULL_TIMEOUT_MS = 30_000;
 const CODEX_MARKETPLACE_UPGRADE_TIMEOUT_MS = 60_000;
 
+// Once-per-process latch for the missing-codex-binary info line — the
+// refresh runs hourly and the binary won't appear without operator action,
+// so repeating it every cycle is pure log noise (223 warns before this latch).
+let codexBinaryMissingLogged = false;
+
 export interface PluginUpdaterDeps {
   /**
    * Optional: send a notification when plugins updated. First arg is
@@ -202,7 +207,22 @@ export async function refreshCodexPluginSurfaces(): Promise<CodexSurfaceRefreshR
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     result.marketplaceUpgrade = { changed: false, error: msg };
-    log.warn('Codex marketplace upgrade failed', { err: msg });
+    // ENOENT = no `codex` binary on the host PATH. This step only upgrades
+    // Git-sourced codex marketplaces; the local bootstrap marketplace is
+    // synced by syncCodexLocalMarketplacePluginCache below with pure file
+    // ops, so a missing host binary loses nothing. Hosts that never
+    // installed the codex CLI (containers carry their own) would otherwise
+    // log a spurious warn every hourly cycle.
+    if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') {
+      if (!codexBinaryMissingLogged) {
+        codexBinaryMissingLogged = true;
+        log.info(
+          'Codex CLI not installed on host — skipping Git-marketplace upgrade (local marketplaces sync via file ops)',
+        );
+      }
+    } else {
+      log.warn('Codex marketplace upgrade failed', { err: msg });
+    }
   }
 
   try {
