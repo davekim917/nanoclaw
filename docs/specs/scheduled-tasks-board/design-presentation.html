@@ -1,0 +1,493 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Scheduled Tasks Board — NanoClaw Design</title>
+<link rel="preconnect" href="https://api.fontshare.com" />
+<link href="https://api.fontshare.com/v2/css?f[]=clash-display@500,600,700&f[]=plus-jakarta-sans@400,500,600,700&display=swap" rel="stylesheet" />
+<style>
+  :root{
+    --bg:#050505; --panel:#0b0b0e; --core:#101014;
+    --hair:rgba(255,255,255,.08); --hair2:rgba(255,255,255,.14);
+    --txt:#f4f4f6; --mut:#9b9ba6; --dim:#5e5e6a;
+    --emerald:#34d399; --amber:#fbbf24; --rose:#fb7185; --violet:#a78bfa; --sky:#7dd3fc;
+    --ease:cubic-bezier(.32,.72,0,1);
+    --disp:'Clash Display',ui-sans-serif,system-ui,sans-serif;
+    --body:'Plus Jakarta Sans',ui-sans-serif,system-ui,sans-serif;
+    --mono:ui-monospace,'SF Mono','JetBrains Mono',Menlo,monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{background:var(--bg);color:var(--txt);font-family:var(--body);line-height:1.6;-webkit-font-smoothing:antialiased;overflow-x:hidden}
+  /* mesh orbs */
+  .orbs{position:fixed;inset:0;z-index:0;pointer-events:none;overflow:hidden}
+  .orb{position:absolute;border-radius:50%;filter:blur(140px);opacity:.16}
+  .orb.a{width:640px;height:640px;background:#34d399;top:-220px;left:-160px}
+  .orb.b{width:560px;height:560px;background:#7c3aed;top:30%;right:-220px;opacity:.13}
+  .orb.c{width:520px;height:520px;background:#0ea5e9;bottom:-200px;left:28%;opacity:.10}
+  /* grain */
+  .grain{position:fixed;inset:0;z-index:40;pointer-events:none;opacity:.035;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/%3E%3C/filter%3E%3Crect width='160' height='160' filter='url(%23n)' opacity='0.6'/%3E%3C/svg%3E")}
+  main{position:relative;z-index:1;max-width:1200px;margin:0 auto;padding:0 32px}
+  /* nav pill */
+  nav{position:fixed;top:24px;left:50%;transform:translateX(-50%);z-index:60;display:flex;gap:4px;align-items:center;
+    padding:8px 10px;border-radius:999px;background:rgba(10,10,12,.6);backdrop-filter:blur(24px);
+    border:1px solid var(--hair);box-shadow:inset 0 1px 1px rgba(255,255,255,.06),0 24px 60px rgba(0,0,0,.5)}
+  nav .mark{width:26px;height:26px;border-radius:999px;background:linear-gradient(135deg,#34d399,#0ea5e9);margin-right:6px;
+    box-shadow:0 0 18px rgba(52,211,153,.4)}
+  nav a{color:var(--mut);text-decoration:none;font-size:12.5px;font-weight:600;padding:7px 14px;border-radius:999px;
+    white-space:nowrap;transition:all .5s var(--ease)}
+  nav a:hover{color:var(--txt);background:rgba(255,255,255,.07)}
+  @media(max-width:768px){nav a:not(.keep){display:none}}
+  /* type */
+  .eyebrow{display:inline-flex;align-items:center;gap:8px;border-radius:999px;padding:5px 14px;font-size:10px;
+    letter-spacing:.22em;text-transform:uppercase;font-weight:600;color:var(--mut);
+    border:1px solid var(--hair2);background:rgba(255,255,255,.03)}
+  .eyebrow i{width:6px;height:6px;border-radius:50%;background:var(--emerald);box-shadow:0 0 10px var(--emerald)}
+  h1,h2,h3{font-family:var(--disp);font-weight:600;letter-spacing:-.02em;line-height:1.04}
+  h1{font-size:clamp(52px,8vw,104px)}
+  h2{font-size:clamp(34px,4.6vw,54px);letter-spacing:-.018em}
+  h3{font-size:19px;font-weight:600;letter-spacing:-.01em}
+  .lede{color:var(--mut);font-size:clamp(16px,1.6vw,19px);max-width:640px}
+  section{padding:120px 0}
+  @media(max-width:768px){section{padding:72px 0}main{padding:0 18px}}
+  /* double bezel */
+  .shell{background:rgba(255,255,255,.035);border:1px solid var(--hair);border-radius:2rem;padding:8px;
+    transition:transform .7s var(--ease),border-color .7s var(--ease)}
+  .shell:hover{transform:translateY(-3px);border-color:var(--hair2)}
+  .core{background:var(--core);border-radius:calc(2rem - 8px);padding:30px;height:100%;
+    box-shadow:inset 0 1px 1px rgba(255,255,255,.07)}
+  /* bento */
+  .bento{display:grid;grid-template-columns:repeat(12,1fr);gap:18px}
+  .c12{grid-column:span 12}.c8{grid-column:span 8}.c7{grid-column:span 7}.c6{grid-column:span 6}.c5{grid-column:span 5}.c4{grid-column:span 4}
+  @media(max-width:768px){.bento>*{grid-column:span 12!important}}
+  /* chips + stats */
+  .chips{display:flex;gap:10px;flex-wrap:wrap}
+  .chip{border-radius:999px;padding:7px 16px;font-size:12px;font-weight:600;border:1px solid var(--hair2);color:var(--mut);
+    background:rgba(255,255,255,.04)}
+  .chip b{color:var(--txt);font-weight:700}
+  .statgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:18px}
+  @media(max-width:768px){.statgrid{grid-template-columns:repeat(2,1fr)}}
+  .stat .n{font-family:var(--disp);font-size:46px;font-weight:600;letter-spacing:-.02em;
+    background:linear-gradient(180deg,#fff,#9b9ba6);-webkit-background-clip:text;background-clip:text;color:transparent}
+  .stat .l{color:var(--dim);font-size:12px;letter-spacing:.14em;text-transform:uppercase;font-weight:600;margin-top:4px}
+  /* pills */
+  .pill{display:inline-flex;align-items:center;gap:6px;border-radius:999px;padding:3px 11px;font-size:11px;font-weight:700}
+  .pill i{width:6px;height:6px;border-radius:50%}
+  .p-ok{background:rgba(52,211,153,.12);color:var(--emerald)}.p-ok i{background:var(--emerald)}
+  .p-bad{background:rgba(251,113,133,.13);color:var(--rose)}.p-bad i{background:var(--rose);box-shadow:0 0 8px var(--rose)}
+  .p-warn{background:rgba(251,191,36,.12);color:var(--amber)}.p-warn i{background:var(--amber)}
+  .p-info{background:rgba(125,211,252,.12);color:var(--sky)}.p-info i{background:var(--sky)}
+  .p-mod{background:rgba(167,139,250,.13);color:var(--violet)}.p-mod i{background:var(--violet)}
+  /* board mock */
+  .mock{font-size:12.5px}
+  .mock .strip{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px}
+  .mock .stripcard{flex:1;min-width:120px;border:1px solid var(--hair);border-radius:14px;padding:12px 16px;background:rgba(255,255,255,.025)}
+  .mock .stripcard .v{font-family:var(--disp);font-size:26px;font-weight:600}
+  .mock .stripcard .k{color:var(--dim);font-size:10px;letter-spacing:.16em;text-transform:uppercase;font-weight:700;margin-top:2px}
+  .mock .alert{border:1px solid rgba(251,113,133,.35);background:rgba(251,113,133,.07);border-radius:14px;padding:11px 16px;
+    display:flex;align-items:center;gap:10px;margin-bottom:16px;color:#fda4af;font-weight:600}
+  .mock .ghead{display:flex;align-items:center;gap:10px;color:var(--mut);font-weight:700;font-size:11.5px;
+    letter-spacing:.1em;text-transform:uppercase;margin:18px 0 8px}
+  .mock .ghead .prov{font-weight:600;letter-spacing:0;text-transform:none;color:var(--dim);font-size:11px}
+  .mock .row{display:grid;grid-template-columns:1.5fr 1fr 1.1fr .9fr auto;gap:12px;align-items:center;
+    border:1px solid var(--hair);border-radius:14px;padding:12px 16px;margin-bottom:8px;background:rgba(255,255,255,.02);
+    transition:all .5s var(--ease);cursor:default}
+  .mock .row:hover{background:rgba(255,255,255,.05);transform:translateX(3px)}
+  .mock .row.sel{border-color:rgba(52,211,153,.4);background:rgba(52,211,153,.05)}
+  .mock .row .nm{font-weight:700}
+  .mock .row .meta{color:var(--dim);font-size:11px}
+  .mock .row .cron{font-family:var(--mono);color:var(--mut);font-size:11px}
+  @media(max-width:768px){.mock .row{grid-template-columns:1fr auto}.mock .row .meta,.mock .row .cron{display:none}}
+  /* drawer */
+  .drawer{border:1px solid var(--hair2);border-radius:18px;background:rgba(16,16,20,.92);padding:22px;height:100%}
+  .drawer .dh{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px}
+  .drawer .field{margin-bottom:13px}
+  .drawer .field .k{color:var(--dim);font-size:10px;letter-spacing:.16em;text-transform:uppercase;font-weight:700;margin-bottom:4px}
+  .drawer .field .v{font-family:var(--mono);font-size:11.5px;color:var(--mut);background:rgba(0,0,0,.4);
+    border:1px solid var(--hair);border-radius:10px;padding:9px 12px;line-height:1.55}
+  .verbs{display:flex;gap:8px;flex-wrap:wrap;margin-top:16px}
+  .verb{border-radius:999px;padding:8px 16px;font-size:11.5px;font-weight:700;border:1px solid var(--hair2);
+    color:var(--txt);background:rgba(255,255,255,.05);display:inline-flex;align-items:center;gap:8px;
+    transition:all .5s var(--ease);cursor:default}
+  .verb:hover{background:rgba(255,255,255,.1);transform:translateY(-1px)}
+  .verb.primary{background:linear-gradient(135deg,rgba(52,211,153,.18),rgba(14,165,233,.18));border-color:rgba(52,211,153,.4)}
+  .verb .ic{width:20px;height:20px;border-radius:999px;background:rgba(255,255,255,.1);display:inline-flex;
+    align-items:center;justify-content:center;font-size:10px;transition:transform .5s var(--ease)}
+  .verb:hover .ic{transform:translate(1px,-1px) scale(1.08)}
+  .hist{display:flex;gap:6px;margin-top:4px}
+  .hist .dot{width:22px;height:22px;border-radius:7px;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:800}
+  .h-ok{background:rgba(52,211,153,.15);color:var(--emerald)}
+  .h-bad{background:rgba(251,113,133,.16);color:var(--rose)}
+  .h-dim{background:rgba(255,255,255,.06);color:var(--dim)}
+  /* flow */
+  .flow{display:flex;flex-direction:column;gap:0}
+  .step{display:grid;grid-template-columns:52px 1fr;gap:18px;position:relative;padding-bottom:26px}
+  .step:last-child{padding-bottom:0}
+  .step .nub{width:34px;height:34px;border-radius:12px;background:rgba(255,255,255,.05);border:1px solid var(--hair2);
+    display:flex;align-items:center;justify-content:center;font-family:var(--disp);font-weight:600;font-size:14px;z-index:1}
+  .step:not(:last-child):before{content:"";position:absolute;left:17px;top:36px;bottom:0;width:1px;
+    background:linear-gradient(180deg,var(--hair2),transparent)}
+  .step .t{font-weight:700;font-size:14.5px}
+  .step .d{color:var(--mut);font-size:13px;margin-top:2px}
+  .step .d code{font-family:var(--mono);font-size:11.5px;color:var(--sky);background:rgba(125,211,252,.08);
+    border-radius:6px;padding:1px 6px}
+  .step.danger .nub{background:rgba(251,113,133,.12);border-color:rgba(251,113,133,.35);color:var(--rose)}
+  /* delta mock */
+  .delta{border:1px solid rgba(251,191,36,.3);background:rgba(251,191,36,.05);border-radius:16px;padding:18px;margin-top:18px}
+  .delta .dt{font-weight:800;color:var(--amber);font-size:12px;letter-spacing:.12em;text-transform:uppercase;margin-bottom:10px}
+  .delta .li{display:flex;gap:9px;align-items:center;font-family:var(--mono);font-size:12px;color:var(--mut);padding:3px 0}
+  .delta .gain{color:var(--emerald)}.delta .loss{color:var(--rose)}
+  /* api */
+  .api{font-family:var(--mono);font-size:12.5px}
+  .api .r{display:grid;grid-template-columns:64px 1fr auto;gap:14px;padding:10px 14px;border-bottom:1px solid var(--hair);align-items:center}
+  .api .r:last-child{border:none}
+  .api .m{font-weight:700}.api .m.g{color:var(--emerald)}.api .m.p{color:var(--sky)}.api .m.u{color:var(--amber)}
+  .api .path{color:var(--mut)}.api .note{color:var(--dim);font-size:11px;font-family:var(--body)}
+  @media(max-width:768px){.api .note{display:none}}
+  /* arch svg */
+  .arch svg{width:100%;height:auto}
+  /* scope */
+  .scope li{list-style:none;display:flex;gap:10px;padding:7px 0;color:var(--mut);font-size:14px;border-bottom:1px dashed var(--hair)}
+  .scope li:last-child{border:none}
+  .scope li:before{content:"";width:7px;height:7px;border-radius:999px;margin-top:7px;flex-shrink:0}
+  .scope.in li:before{background:var(--emerald)}
+  .scope.out li:before{background:var(--dim)}
+  /* amendments */
+  .amend{border:1px solid rgba(251,191,36,.3);background:rgba(251,191,36,.05);border-radius:18px;padding:22px}
+  .amend .tag{color:var(--amber);font-weight:800;font-size:11px;letter-spacing:.16em;text-transform:uppercase}
+  /* reveal */
+  .rv{opacity:0;transform:translateY(48px);filter:blur(10px);transition:opacity .9s var(--ease),transform .9s var(--ease),filter .9s var(--ease)}
+  .rv.on{opacity:1;transform:none;filter:none}
+  footer{padding:80px 0 60px;color:var(--dim);font-size:12.5px;border-top:1px solid var(--hair);margin-top:40px}
+  .kbd{font-family:var(--mono);font-size:11px;border:1px solid var(--hair2);border-radius:6px;padding:1px 7px;color:var(--mut)}
+</style>
+</head>
+<body>
+<div class="orbs"><div class="orb a"></div><div class="orb b"></div><div class="orb c"></div></div>
+<div class="grain"></div>
+
+<nav>
+  <span class="mark"></span>
+  <a href="#why" class="keep">Why</a><a href="#board">The Board</a><a href="#arch">Architecture</a>
+  <a href="#health">Health</a><a href="#move">Move</a><a href="#security">Security</a><a href="#scope" class="keep">Scope</a>
+</nav>
+
+<main>
+  <!-- HERO -->
+  <section style="padding-top:180px;min-height:100dvh;display:flex;flex-direction:column;justify-content:center">
+    <div class="rv"><span class="eyebrow"><i></i>NanoClaw · Design Document · rev 2 · 2026-06-12</span></div>
+    <h1 class="rv" style="margin:28px 0 8px">Scheduled Tasks<br/><span style="background:linear-gradient(90deg,#34d399,#7dd3fc 55%,#a78bfa);-webkit-background-clip:text;background-clip:text;color:transparent">Board.</span></h1>
+    <p class="lede rv" style="margin-top:18px">Every recurring task your agent fleet runs — visible, healthy, and movable. One view across every agent group, with the silent-death failure mode designed out.</p>
+    <div class="chips rv" style="margin-top:34px">
+      <span class="chip">Brief <b>approved</b></span>
+      <span class="chip">Design <b>rev 2</b></span>
+      <span class="chip"><b>4</b> independent reviewers + Codex</span>
+      <span class="chip"><b>27</b> findings resolved</span>
+    </div>
+    <div class="statgrid rv" style="margin-top:72px">
+      <div class="stat"><div class="n">32</div><div class="l">Active series today</div></div>
+      <div class="stat"><div class="n">9</div><div class="l">API routes</div></div>
+      <div class="stat"><div class="n">6</div><div class="l">Management verbs</div></div>
+      <div class="stat"><div class="n">0</div><div class="l">Firing-path changes</div></div>
+    </div>
+  </section>
+
+  <!-- WHY -->
+  <section id="why">
+    <div class="rv"><span class="eyebrow"><i style="background:var(--rose);box-shadow:0 0 10px var(--rose)"></i>The incident that demanded this</span></div>
+    <h2 class="rv" style="margin:22px 0 16px;max-width:760px">Seventeen schedules died in silence. Nothing noticed for two weeks.</h2>
+    <div class="bento" style="margin-top:48px">
+      <div class="shell c7 rv"><div class="core">
+        <h3 style="color:var(--rose)">May 27 – 31, 2026</h3>
+        <p style="color:var(--mut);margin-top:10px;font-size:14.5px">A reply-routing bug stamped task output onto sibling tasks' <em>future</em> fire rows. The idempotency guard read those phantom replies as "already answered" and suppressed every interleaved daily series — briefings, email recaps, parental monitoring, wiki maintenance. <b style="color:var(--txt)">No <code class="kbd">failed</code> status was ever written.</b> The rows sat <code class="kbd">pending</code>, looking perfectly normal to anything that reads status.</p>
+        <p style="color:var(--mut);margin-top:12px;font-size:14.5px">The fix shipped June 10. The lesson shipped here: <b style="color:var(--txt)">a dead schedule must be impossible to miss, and death must be detected by arithmetic, never by status.</b></p>
+      </div></div>
+      <div class="shell c5 rv"><div class="core">
+        <h3>Design principles it forced</h3>
+        <div style="margin-top:16px;display:flex;flex-direction:column;gap:14px;font-size:14px;color:var(--mut)">
+          <div><b style="color:var(--emerald)">Truth on read.</b> No materialized copies of scheduling state — every prior incident was derived-state drift.</div>
+          <div><b style="color:var(--emerald)">Derived health.</b> Stalled = <span class="kbd">now − next_fire</span> beyond grace. Status is never the signal.</div>
+          <div><b style="color:var(--emerald)">Unhealthy first.</b> A die-off is the first thing on screen, never row 28.</div>
+          <div><b style="color:var(--emerald)">Fail closed, fail loud.</b> Every mutation path's worst case is visible, never silent.</div>
+        </div>
+      </div></div>
+    </div>
+  </section>
+
+  <!-- BOARD MOCK -->
+  <section id="board">
+    <div class="rv"><span class="eyebrow"><i></i>The board · third dashboard view</span></div>
+    <h2 class="rv" style="margin:22px 0 12px">Health strip. Grouped list. Detail drawer.</h2>
+    <p class="lede rv">Joins the spawn Kanban and Inbox under the same BoardShell chrome. Grouped by agent group — the axis you actually scan by.</p>
+    <div class="shell rv" style="margin-top:44px"><div class="core mock">
+      <div class="strip">
+        <div class="stripcard"><div class="v" style="color:var(--rose)">1</div><div class="k">Stalled</div></div>
+        <div class="stripcard"><div class="v" style="color:var(--amber)">2</div><div class="k">Paused</div></div>
+        <div class="stripcard"><div class="v" style="color:var(--emerald)">28</div><div class="k">Healthy</div></div>
+        <div class="stripcard"><div class="v" style="color:var(--sky)">3</div><div class="k">One-offs</div></div>
+      </div>
+      <div class="alert">⚠ <span><b>memory-synth · xerus</b> — stalled · overdue 2 fires · stuck pending since Jun 10 07:13Z</span></div>
+      <div class="bento">
+        <div class="c7">
+          <div class="ghead">main · Discord #general <span class="prov">claude</span></div>
+          <div class="row sel">
+            <span class="nm">morning-briefing</span><span class="cron">0 12 * * *</span>
+            <span class="meta">next 16:00Z · 12:00 ET</span><span class="meta">fired 18h ago</span>
+            <span class="pill p-ok"><i></i>healthy</span>
+          </div>
+          <div class="row">
+            <span class="nm">parental-monitoring</span><span class="cron">0 14 * * *</span>
+            <span class="meta">next 18:00Z · 14:00 ET</span><span class="meta">fired 16h ago</span>
+            <span class="pill p-ok"><i></i>healthy</span>
+          </div>
+          <div class="row">
+            <span class="nm">meeting-digest</span><span class="cron">0 22 * * *</span>
+            <span class="meta">next 02:00Z · 22:00 ET</span><span class="meta">fired 8h ago</span>
+            <span class="pill p-ok"><i></i>healthy</span>
+          </div>
+          <div class="row">
+            <span class="nm">memory-synth <span class="pill p-mod" style="margin-left:6px"><i></i>module</span></span>
+            <span class="cron">28 3 * * *</span><span class="meta">next 07:28Z</span><span class="meta">fired 21h ago</span>
+            <span class="pill p-ok"><i></i>healthy</span>
+          </div>
+          <div class="ghead">xerus · Discord #xerus <span class="prov">opencode</span></div>
+          <div class="row" style="border-color:rgba(251,113,133,.4)">
+            <span class="nm">memory-synth <span class="pill p-mod" style="margin-left:6px"><i></i>module</span></span>
+            <span class="cron">13 3 * * *</span><span class="meta" style="color:var(--rose)">overdue 2 fires</span><span class="meta">Jun 10 07:13Z</span>
+            <span class="pill p-bad"><i></i>stalled</span>
+          </div>
+          <div class="ghead">illysium · Slack #agents <span class="prov">codex sibling</span></div>
+          <div class="row">
+            <span class="nm">support-inbox-poll <span class="pill p-info" style="margin-left:6px"><i></i>thread</span></span>
+            <span class="cron">*/15 * * * *</span><span class="meta">next in 4m</span><span class="meta">fired 11m ago</span>
+            <span class="pill p-ok"><i></i>healthy</span>
+          </div>
+        </div>
+        <div class="c5"><div class="drawer">
+          <div class="dh">
+            <div><h3>morning-briefing</h3><div style="color:var(--dim);font-size:11px;margin-top:2px">main · #general · channel root · operator-owned</div></div>
+            <span class="pill p-ok"><i></i>healthy</span>
+          </div>
+          <div class="field"><div class="k">Schedule</div><div class="v">0 12 * * *&nbsp;&nbsp;→ next 2026-06-12 16:00Z · 12:00 America/New_York</div></div>
+          <div class="field"><div class="k">Prompt</div><div class="v">You are running a daily morning briefing. 1. <b>Calendar</b> — today's meetings via gws CLI… 2. <b>Follow-ups</b> — open items…</div></div>
+          <div class="field"><div class="k">Overrides</div><div class="v">quietStatus: false · flagIntent: —</div></div>
+          <div class="field"><div class="k">Last 5 fires</div>
+            <div class="hist"><span class="dot h-ok">✓</span><span class="dot h-ok">✓</span><span class="dot h-ok">✓</span><span class="dot h-bad">✕</span><span class="dot h-ok">✓</span></div>
+          </div>
+          <div class="verbs">
+            <span class="verb primary">Edit<span class="ic">✎</span></span>
+            <span class="verb">Move<span class="ic">⇄</span></span>
+            <span class="verb">Run now<span class="ic">▸</span></span>
+            <span class="verb">Pause<span class="ic">‖</span></span>
+            <span class="verb" style="color:var(--rose)">Cancel<span class="ic">✕</span></span>
+          </div>
+        </div></div>
+      </div>
+    </div></div>
+  </section>
+
+  <!-- ARCHITECTURE -->
+  <section id="arch">
+    <div class="rv"><span class="eyebrow"><i></i>Architecture · zero new state</span></div>
+    <h2 class="rv" style="margin:22px 0 12px">Reads sweep the truth.<br/>Writes go through one door.</h2>
+    <div class="bento" style="margin-top:48px">
+      <div class="shell c12 rv"><div class="core arch">
+        <svg viewBox="0 0 1100 320" fill="none" font-family="Plus Jakarta Sans,sans-serif">
+          <defs>
+            <linearGradient id="g1" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#34d399" stop-opacity=".25"/><stop offset="1" stop-color="#0ea5e9" stop-opacity=".12"/></linearGradient>
+            <marker id="arr" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L8 4 L0 8 z" fill="#5e5e6a"/></marker>
+          </defs>
+          <!-- browser -->
+          <rect x="20" y="110" width="180" height="100" rx="18" fill="rgba(255,255,255,.04)" stroke="rgba(255,255,255,.14)"/>
+          <text x="110" y="152" fill="#f4f4f6" font-size="15" font-weight="700" text-anchor="middle">Dashboard SPA</text>
+          <text x="110" y="174" fill="#9b9ba6" font-size="11" text-anchor="middle">React · SWR · SSE</text>
+          <!-- host -->
+          <rect x="300" y="40" width="420" height="240" rx="22" fill="url(#g1)" stroke="rgba(52,211,153,.35)"/>
+          <text x="510" y="70" fill="#34d399" font-size="11" font-weight="700" letter-spacing="2" text-anchor="middle">HOST PROCESS · SOLE WRITER</text>
+          <rect x="325" y="90" width="170" height="74" rx="14" fill="rgba(0,0,0,.45)" stroke="rgba(255,255,255,.12)"/>
+          <text x="410" y="121" fill="#f4f4f6" font-size="13" font-weight="700" text-anchor="middle">/api/scheduled</text>
+          <text x="410" y="140" fill="#9b9ba6" font-size="10.5" text-anchor="middle">9 routes · per-verb gates</text>
+          <rect x="325" y="182" width="170" height="74" rx="14" fill="rgba(0,0,0,.45)" stroke="rgba(255,255,255,.12)"/>
+          <text x="410" y="213" fill="#f4f4f6" font-size="13" font-weight="700" text-anchor="middle">Chunked sweep</text>
+          <text x="410" y="232" fill="#9b9ba6" font-size="10.5" text-anchor="middle">setImmediate · 5s TTL · single-flight</text>
+          <rect x="525" y="90" width="170" height="74" rx="14" fill="rgba(0,0,0,.45)" stroke="rgba(255,255,255,.12)"/>
+          <text x="610" y="121" fill="#f4f4f6" font-size="13" font-weight="700" text-anchor="middle">Scheduling primitives</text>
+          <text x="610" y="140" fill="#9b9ba6" font-size="10.5" text-anchor="middle">update · pause · cancel · scheduleTask</text>
+          <rect x="525" y="182" width="170" height="74" rx="14" fill="rgba(0,0,0,.45)" stroke="rgba(255,255,255,.12)"/>
+          <text x="610" y="213" fill="#f4f4f6" font-size="13" font-weight="700" text-anchor="middle">Health derivation</text>
+          <text x="610" y="232" fill="#9b9ba6" font-size="10.5" text-anchor="middle">overdue math · dup detector · strand scan</text>
+          <!-- DBs -->
+          <rect x="810" y="40" width="270" height="106" rx="18" fill="rgba(255,255,255,.04)" stroke="rgba(255,255,255,.14)"/>
+          <text x="945" y="72" fill="#f4f4f6" font-size="14" font-weight="700" text-anchor="middle">Session DBs ×36</text>
+          <text x="945" y="93" fill="#9b9ba6" font-size="11" text-anchor="middle">inbound.db — task rows (truth)</text>
+          <text x="945" y="111" fill="#9b9ba6" font-size="11" text-anchor="middle">outbound.db — acks (read-only)</text>
+          <text x="945" y="131" fill="#5e5e6a" font-size="10" text-anchor="middle">busy_timeout 1000 · + (series_id, seq) index</text>
+          <rect x="810" y="176" width="270" height="104" rx="18" fill="rgba(255,255,255,.04)" stroke="rgba(255,255,255,.14)"/>
+          <text x="945" y="208" fill="#f4f4f6" font-size="14" font-weight="700" text-anchor="middle">Central v2.db</text>
+          <text x="945" y="229" fill="#9b9ba6" font-size="11" text-anchor="middle">groups · channels · secrets scope</text>
+          <text x="945" y="248" fill="#9b9ba6" font-size="11" text-anchor="middle">+ scheduled_audit (hashed, 90d prune)</text>
+          <!-- arrows -->
+          <path d="M200 145 H296" stroke="#5e5e6a" stroke-width="1.5" marker-end="url(#arr)"/>
+          <text x="248" y="135" fill="#5e5e6a" font-size="10" text-anchor="middle">HTTPS + SSE</text>
+          <path d="M722 110 H806" stroke="#5e5e6a" stroke-width="1.5" marker-end="url(#arr)"/>
+          <path d="M722 226 H806" stroke="#5e5e6a" stroke-width="1.5" marker-end="url(#arr)"/>
+        </svg>
+      </div></div>
+      <div class="shell c4 rv"><div class="core">
+        <h3>Read path</h3>
+        <p style="color:var(--mut);font-size:13.5px;margin-top:10px">One session per event-loop tick — the host's delivery polls and SSE never stall. Warm cache serves in microseconds; a board mutation invalidates it synchronously so you always read your own write.</p>
+      </div></div>
+      <div class="shell c4 rv"><div class="core">
+        <h3>Why no index table</h3>
+        <p style="color:var(--mut);font-size:13.5px;margin-top:10px">Both prior incidents were derived state diverging from truth. A materialized copy of schedules is the same trap with a nicer name. The board reads the rows that actually fire.</p>
+      </div></div>
+      <div class="shell c4 rv"><div class="core">
+        <h3>Proven primitives</h3>
+        <p style="color:var(--mut);font-size:13.5px;margin-top:10px">Every verb maps to a primitive already in production — <span class="kbd">updateTask</span>, <span class="kbd">pauseTask</span>, <span class="kbd">cancelTask</span>, <span class="kbd">scheduleTask</span>. One additive change: moves carry pre-task scripts.</p>
+      </div></div>
+    </div>
+  </section>
+
+  <!-- HEALTH -->
+  <section id="health">
+    <div class="rv"><span class="eyebrow"><i></i>Health model · arithmetic, not status</span></div>
+    <h2 class="rv" style="margin:22px 0 12px">A dead series cannot hide.</h2>
+    <p class="lede rv">The May die-off left zero <span class="kbd">failed</span> rows — every victim looked "pending". So health is computed, and the three ways a series can die silently each have a dedicated detector.</p>
+    <div class="bento" style="margin-top:44px">
+      <div class="shell c6 rv"><div class="core">
+        <h3 style="color:var(--rose)">Detector 1 — Overdue arithmetic</h3>
+        <div class="field" style="margin-top:12px"><div class="v" style="font-family:var(--mono);font-size:12px;color:var(--mut);background:rgba(0,0,0,.4);border:1px solid var(--hair);border-radius:10px;padding:12px 14px">stalled ⇐ now − process_after ><br/>&nbsp;&nbsp;max(cron_interval × 0.5, 2 × sweep)</div></div>
+        <p style="color:var(--mut);font-size:13.5px;margin-top:10px">Catches the poison-class death: a live row past its slot with no terminal status. Exactly the June signature — verified against the real incident data as the acceptance test.</p>
+      </div></div>
+      <div class="shell c6 rv"><div class="core">
+        <h3 style="color:var(--rose)">Detector 2 — Residual strand</h3>
+        <p style="color:var(--mut);font-size:13.5px;margin-top:12px">A terminal row still carrying its cron, persisting across sweeps, means the scheduler is failing to mint the successor — the swallowed cron-parse-error path found during review. Flagged stalled.</p>
+        <h3 style="color:var(--rose);margin-top:18px">Detector 3 — Duplicate successor</h3>
+        <p style="color:var(--mut);font-size:13.5px;margin-top:8px">Two live rows in one series can double-fire while one hides behind the latest-row read shape. A GROUP BY counter surfaces both rows, flagged unhealthy.</p>
+      </div></div>
+      <div class="shell c12 rv"><div class="core" style="display:flex;gap:12px;flex-wrap:wrap;align-items:center">
+        <span style="color:var(--dim);font-size:11px;letter-spacing:.16em;text-transform:uppercase;font-weight:700;margin-right:6px">States</span>
+        <span class="pill p-ok"><i></i>healthy</span><span class="pill p-bad"><i></i>stalled</span>
+        <span class="pill p-warn"><i></i>paused</span><span class="pill p-info"><i></i>processing</span>
+        <span class="pill p-mod"><i></i>module-owned</span><span class="pill p-info"><i></i>thread-bound</span>
+        <span style="color:var(--dim);font-size:12.5px;margin-left:auto">Fire history: ran · completed (no output) · failed · missed · cancelled</span>
+      </div></div>
+    </div>
+  </section>
+
+  <!-- MOVE -->
+  <section id="move">
+    <div class="rv"><span class="eyebrow"><i></i>The marquee verb · cross-agent moves</span></div>
+    <h2 class="rv" style="margin:22px 0 12px">Hand a schedule to your Codex sibling.<br/>With the credential delta on the table.</h2>
+    <div class="bento" style="margin-top:44px">
+      <div class="shell c7 rv"><div class="core">
+        <div class="flow">
+          <div class="step"><div class="nub">1</div><div><div class="t">Preview — gated at mutation tier</div><div class="d">Wiring validated dry-run; destination <code>channel_type</code> translated to the sibling's variant (same channel, its own bot).</div></div></div>
+          <div class="step"><div class="nub">2</div><div><div class="t">Credential delta confirm</div><div class="d">OneCLI secret <em>names</em> the task gains and loses — values never leave the gateway. Cross-workgroup moves name the boundary crossing.</div></div></div>
+          <div class="step"><div class="nub">3</div><div><div class="t">Execute re-validates everything</div><div class="d">Authz, scope, wiring, and delta re-checked server-side; a changed delta returns <code>409 delta_changed</code> and forces re-confirm.</div></div></div>
+          <div class="step"><div class="nub">4</div><div><div class="t">Cancel source, insert target</div><div class="d">Cancel-first: the bad day is a brief gap, never a double-fire. Prompt, <b>pre-task script</b>, cron, and overrides travel atomically.</div></div></div>
+          <div class="step danger"><div class="nub">!</div><div><div class="t">Compensation that cannot vanish a series</div><div class="d">Insert fails → source restored from snapshot. Both fail → durable repair record, surfaced as <b>stalled</b> on the strip. A successfully-placed target is never deleted.</div></div></div>
+          <div class="step"><div class="nub">5</div><div><div class="t">Invariant check + audit</div><div class="d">Exactly one live row fleet-wide per series — verified after every move, alert on violation.</div></div></div>
+        </div>
+      </div></div>
+      <div class="shell c5 rv"><div class="core">
+        <h3>Move confirm</h3>
+        <div style="color:var(--dim);font-size:11px;margin-top:2px">morning-briefing · main → discord-codex</div>
+        <div class="delta">
+          <div class="dt">⚠ Credential scope changes</div>
+          <div class="li gain">+ OpenAI <span style="color:var(--dim)">(gains)</span></div>
+          <div class="li loss">− GranolaAPI <span style="color:var(--dim)">(loses)</span></div>
+          <div class="li" style="color:var(--dim)">workgroup boundary: same (main)</div>
+          <div class="li" style="color:var(--amber)">▲ carries a pre-task bash script — runs unattended in the target container</div>
+        </div>
+        <div class="verbs" style="margin-top:18px">
+          <span class="verb primary">Confirm move<span class="ic">→</span></span>
+          <span class="verb">Back<span class="ic">←</span></span>
+        </div>
+        <p style="color:var(--dim);font-size:12px;margin-top:16px">Same fail-closed wiring contract as the chat scheduler — an unwired target is refused with the reason, never guessed around.</p>
+      </div></div>
+    </div>
+  </section>
+
+  <!-- SECURITY -->
+  <section id="security">
+    <div class="rv"><span class="eyebrow"><i></i>Security · this is remote control of unattended execution</span></div>
+    <h2 class="rv" style="margin:22px 0 12px">Strictest tier by default.</h2>
+    <div class="bento" style="margin-top:44px">
+      <div class="shell c4 rv"><div class="core">
+        <h3>Per-verb gates</h3>
+        <p style="color:var(--mut);font-size:13.5px;margin-top:10px">Every mutation — <em>and</em> move-preview, which reads vault secret names — requires <b style="color:var(--txt)">owner or global-admin</b>. Scoped admins are read-only within their groups. The auth cookie alone never authorizes a write.</p>
+      </div></div>
+      <div class="shell c4 rv"><div class="core">
+        <h3>Scope-filtered reads</h3>
+        <p style="color:var(--mut);font-size:13.5px;margin-top:10px">"Fleet-wide" means the groups you're authorized for — disclose-as-not-found, same contract as every existing dashboard API. SSE frames carry the owning group and filter per connection.</p>
+      </div></div>
+      <div class="shell c4 rv"><div class="core">
+        <h3>Audit without leakage</h3>
+        <p style="color:var(--mut);font-size:13.5px;margin-top:10px">Every change recorded: who, when, what. Bodies stored as <b style="color:var(--txt)">sha-256 + 512-char preview</b> — scripts hash-only, never verbatim. 90-day prune. No second plaintext copy of unattended code.</p>
+      </div></div>
+      <div class="shell c12 rv"><div class="core api">
+        <div class="r"><span class="m g">GET</span><span class="path">/dashboard/api/scheduled</span><span class="note">list · health-derived · scope-filtered</span></div>
+        <div class="r"><span class="m g">GET</span><span class="path">/dashboard/api/scheduled/:key</span><span class="note">detail · history · audit tail</span></div>
+        <div class="r"><span class="m u">PUT</span><span class="path">/dashboard/api/scheduled/:key</span><span class="note">edit prompt / script / cron — validated, bounded</span></div>
+        <div class="r"><span class="m p">POST</span><span class="path">/dashboard/api/scheduled/:key/pause</span><span class="note">existing paused-status primitive</span></div>
+        <div class="r"><span class="m p">POST</span><span class="path">/dashboard/api/scheduled/:key/resume</span><span class="note">recomputes next slot — skip, never replay</span></div>
+        <div class="r"><span class="m p">POST</span><span class="path">/dashboard/api/scheduled/:key/run-now</span><span class="note">fires in seconds · 409 if already due/processing</span></div>
+        <div class="r"><span class="m p">POST</span><span class="path">/dashboard/api/scheduled/:key/cancel</span><span class="note">audit-labeled, distinguishable from natural end</span></div>
+        <div class="r"><span class="m p">POST</span><span class="path">/dashboard/api/scheduled/:key/move/preview</span><span class="note">dry-run + secret delta · mutation-tier gate</span></div>
+        <div class="r"><span class="m p">POST</span><span class="path">/dashboard/api/scheduled/:key/move</span><span class="note">re-validates all · compensated · invariant-checked</span></div>
+      </div></div>
+    </div>
+  </section>
+
+  <!-- SCOPE -->
+  <section id="scope">
+    <div class="rv"><span class="eyebrow"><i></i>Scope · v1 ships the pain-killer</span></div>
+    <h2 class="rv" style="margin:22px 0 12px">In, out, and two honest amendments.</h2>
+    <div class="bento" style="margin-top:44px">
+      <div class="shell c6 rv"><div class="core">
+        <h3 style="color:var(--emerald)">In — v1</h3>
+        <ul class="scope in" style="margin-top:14px">
+          <li>Fleet-wide visibility: groups, channels, cron, next fire (UTC + local), prompts, scripts, overrides</li>
+          <li>Derived health + the three silent-death detectors, unhealthy-first</li>
+          <li>Edit · pause/resume · run-now · cancel · move with credential-delta confirm</li>
+          <li>Module-owned badges with accurate reseed warnings; thread-loop badges</li>
+          <li>Hashed audit trail · owner/global-admin gates · one new session-DB index</li>
+        </ul>
+      </div></div>
+      <div class="shell c6 rv"><div class="core">
+        <h3 style="color:var(--dim)">Out — deliberately</h3>
+        <ul class="scope out" style="margin-top:14px">
+          <li>Create-from-board — creation stays in chat where it works today</li>
+          <li>Proactive alerting — visibility first; tripwires exist separately</li>
+          <li>Central-table storage migration — recorded wart, separate decision</li>
+          <li>Moving thread-bound loops — their lifecycle is the thread, by design</li>
+          <li>Mobile drawer editing — read-only on small screens, v1</li>
+        </ul>
+      </div></div>
+      <div class="c12 rv"><div class="amend">
+        <span class="tag">⚠ Two brief amendments need your sign-off</span>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:22px;margin-top:14px">
+          <div style="font-size:13.5px;color:var(--mut)"><b style="color:var(--txt)">1 · Provenance table.</b> The brief assumed stamping audit data into row content — review proved no primitive can write it. The minimal viable alternative is one hashed-body table with a 90-day prune. Same intent, honest mechanism.</div>
+          <div style="font-size:13.5px;color:var(--mut)"><b style="color:var(--txt)">2 · Skipped-vs-quiet fires.</b> Distinguishing script-gated skips from quiet runs needs a fire-outcome record the firing path doesn't write — touching it violates the no-firing-changes constraint. v1 merges them under "completed (no chat output)"; v2 owns the real record.</div>
+        </div>
+      </div></div>
+    </div>
+  </section>
+
+  <footer>
+    <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:14px">
+      <div>NanoClaw · Scheduled Tasks Board · design rev 2 · <span class="kbd">docs/specs/scheduled-tasks-board/</span></div>
+      <div>Reviewed by architecture · security · performance · CPO · Codex (cross-model) — 27 findings verified &amp; resolved</div>
+    </div>
+  </footer>
+</main>
+
+<script>
+  const io=new IntersectionObserver(es=>{es.forEach(e=>{if(e.isIntersecting){e.target.classList.add('on');io.unobserve(e.target)}})},{threshold:.12});
+  document.querySelectorAll('.rv').forEach((el,i)=>{el.style.transitionDelay=(i%4)*70+'ms';io.observe(el)});
+</script>
+</body>
+</html>
