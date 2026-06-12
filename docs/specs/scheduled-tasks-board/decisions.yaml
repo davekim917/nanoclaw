@@ -202,7 +202,7 @@ assumptions:
     affects_groups: []
   - id: D15
     stage: design
-    description: "Provenance mechanism — brief amendment #1 (PENDING OPERATOR APPROVAL)"
+    description: "Provenance mechanism — brief amendment #1 (operator APPROVED 2026-06-12 with design rev 2)"
     chosen: "Minimal scheduled_audit table in central DB: hashed bodies (sha256), 512-char prompt previews, scripts hash-only, 90d sweep prune. Adopted because the brief's assumed content-stamp is mechanically impossible (updateTask whitelists prompt/script only, db.ts:96-98)."
     rejected:
       - option: "Content-stamp _cancelled/_audit into row content (brief's assumption)"
@@ -213,7 +213,7 @@ assumptions:
     affects_groups: []
   - id: D16
     stage: design
-    description: "Skipped-vs-quiet fire history — brief amendment #2 (PENDING OPERATOR APPROVAL)"
+    description: "Skipped-vs-quiet fire history — brief amendment #2 (operator APPROVED 2026-06-12 with design rev 2)"
     chosen: "v1 merges script-gated and quiet runs under 'completed (no chat output)'; persisted fire-outcome record deferred to v2."
     rejected:
       - option: "Persist a script-gate outcome marker from the container"

@@ -16,7 +16,7 @@
 ### Health (the reason this feature exists)
 
 - The board computes a **derived health signal** per series. CRITICAL: the May/June 2026 die-offs left NO `failed` row — the death signature is a row stuck `pending` with `process_after` materially in the past. Health must therefore be **derived** (e.g. "overdue when `process_after` is past by more than one cron interval or N sweep cycles"), never read from row status alone. A series that has silently stopped firing must be visually unmissable.
-- Fire-history states the board distinguishes (from available data, including derived checks): succeeded, failed, skipped/gated by pre-task script, overdue/stalled, paused, processing, terminal (ended). "Last fired at" and recent-fire outcomes are shown per series (bounded, e.g. last 5 fires — this requires a deliberate widening of the latest-row-per-series read shape, accepted and capped).
+- Fire-history states the board distinguishes (from available data, including derived checks): succeeded, failed, overdue/stalled, paused, processing, terminal (ended). **[AMENDED, operator-approved 2026-06-12]:** script-gated skips and quiet runs are merged under "completed (no chat output)" in v1 — distinguishing them needs a fire-outcome record the firing path doesn't write (C1); v2 owns that record. "Last fired at" and recent-fire outcomes are shown per series (bounded, e.g. last 5 fires — this requires a deliberate widening of the latest-row-per-series read shape, accepted and capped).
 - For an unhealthy series, the board surfaces a best-effort coarse reason where cheaply available (paused, tries/backoff, stuck-pending-since-X); deep diagnosis links out to the existing session detail view.
 
 ### Management
@@ -33,7 +33,7 @@
 ### Mutation safety
 
 - All board mutations pass an **explicit per-handler authorization gate** (the `canSteer` precedent — `requireAuth`'s read-scope filter alone does NOT authorize mutation). v1 contract: **all Scheduled-board mutations require owner or global-admin**; scoped admins get read-only within their groups. (Editing prompts/scripts is remote control of unattended agent execution — strictest tier until a need to loosen appears.)
-- Board mutations record minimal provenance — `{action, actor, timestamp, before/after}` for prompt/script/cron/group/channel changes — following the `_via: 'dashboard'` stamping precedent, so a misbehaving series is traceable to its last edit. A full audit table is out of scope.
+- Board mutations record minimal provenance — `{action, actor, timestamp, before/after}` for prompt/script/cron/group/channel changes — so a misbehaving series is traceable to its last edit. **[AMENDED, operator-approved 2026-06-12]:** provenance is a single minimal `scheduled_audit` table (hashed bodies, 512-char previews, 90d prune) — the originally-assumed content-stamp is mechanically impossible (`updateTask` whitelists prompt/script only). "Full audit system" (UI, retention machinery, compliance) remains out of scope.
 - All mutations go through host-side APIs (the host is the sole writer of session inbound DBs); the board never opens session DBs from the browser.
 
 ## Constraints
