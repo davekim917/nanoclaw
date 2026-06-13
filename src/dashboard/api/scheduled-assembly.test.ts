@@ -15,7 +15,13 @@ import Database from 'better-sqlite3';
 import { initTestDb, closeDb, getDb } from '../../db/connection.js';
 import { ensureSchema, openInboundDb } from '../../db/session-db.js';
 import { invalidateScheduledCache, getScheduledCache, SWEEP_INTERVAL_MS } from './scheduled-shared.js';
-import { assembleSnapshot, deriveHealth, type HealthCtx, type ScheduledAssemblyOptions } from './scheduled-assembly.js';
+import {
+  assembleSnapshot,
+  deriveHealth,
+  _resetAssemblyInFlightForTesting,
+  type HealthCtx,
+  type ScheduledAssemblyOptions,
+} from './scheduled-assembly.js';
 
 const TEST_DIR = '/tmp/nanoclaw-scheduled-assembly-test';
 const NOW = Date.parse('2026-06-13T12:00:00Z');
@@ -137,6 +143,10 @@ beforeEach(() => {
   fs.mkdirSync(TEST_DIR, { recursive: true });
   setupCentralDb();
   invalidateScheduledCache();
+  // Drop any single-flight promise a sibling test file left behind — vitest can
+  // schedule files into the same worker, and a leaked in-flight assembly would
+  // make assembleSnapshot return another file's snapshot (cross-file flake).
+  _resetAssemblyInFlightForTesting();
 });
 
 afterEach(() => {

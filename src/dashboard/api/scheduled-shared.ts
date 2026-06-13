@@ -13,12 +13,15 @@ import type Database from 'better-sqlite3';
 import { isOwner, isGlobalAdmin } from '../../modules/permissions/db/user-roles.js';
 
 /**
- * Host sweep cadence (matches the un-exported `SWEEP_INTERVAL_MS` in
- * src/host-sweep.ts). Defined here as the board feature's single exported home
- * for the constant so the verb×state matrix's `guard_grace` derivation
- * (scheduled-board-matrix.ts) can import it without reaching across group
- * ownership into host-sweep.ts. Value MUST stay in lockstep with
- * host-sweep.ts:90.
+ * Host sweep cadence. MIRRORS the private `SWEEP_INTERVAL_MS = 60_000` at
+ * src/host-sweep.ts:90 — defined here as the board feature's single host-side
+ * home for the constant so the verb×state matrix's `guard_grace` derivation
+ * (scheduled-board-matrix.ts) and the health-grace math (scheduled-assembly.ts)
+ * can import it without reaching across group ownership into host-sweep.ts.
+ *
+ * The board's health-grace and guard-grace math MUST use the same interval the
+ * sweep actually runs at, so the two values are coupled: if anyone ever changes
+ * the sweep cadence, BOTH src/host-sweep.ts:90 and this const must move together.
  */
 export const SWEEP_INTERVAL_MS = 60_000;
 
