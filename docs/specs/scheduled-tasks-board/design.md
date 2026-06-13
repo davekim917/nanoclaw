@@ -285,5 +285,5 @@ Composite: **3a-A (chunked) + 3b-A + 3c-Layout-2**, mechanisms §4. Confidence: 
 
 ---
 
-**Status:** rev 2 — awaiting Codex cross-model pass, then operator approval gate (note the §4.4 brief-amendment flag).
-**Next step:** Codex review → final design → HTML visualization → `/team-review` or `/team-auto` per operator choice.
+**Status:** rev 5 — APPROVED design (operator approval 2026-06-12 incl. both §4.4/§4.1 brief amendments); 3 formal `/team-review` cycles complete (cap), 6 cap-cycle MUST-FIX applied as F1–F6, verified by `/team-drift` (all resolution claims CONFIRMED). MUST-FIX outstanding: 0.
+**Next step:** `/team-plan` (Stage B of `/team-auto`).
