@@ -7,6 +7,7 @@
  * DB, and drives assembleSnapshot / deriveHealth directly.
  */
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
@@ -23,7 +24,9 @@ import {
   type ScheduledAssemblyOptions,
 } from './scheduled-assembly.js';
 
-const TEST_DIR = '/tmp/nanoclaw-scheduled-assembly-test';
+// Unique per-file temp dir (mkdtemp) — never a fixed /tmp path a sibling file or
+// a parallel agent process could rm out from under these fixtures mid-test.
+const TEST_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-sched-assembly-'));
 const NOW = Date.parse('2026-06-13T12:00:00Z');
 
 function isoIn(ms: number): string {
@@ -150,6 +153,10 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  // Reset shared singletons on the way out too — leave nothing for the next
+  // file to inherit (hermetic regardless of order).
+  invalidateScheduledCache();
+  _resetAssemblyInFlightForTesting();
   closeDb();
   vi.restoreAllMocks();
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });

@@ -1,0 +1,461 @@
+/**
+ * Tests for the Scheduled Tasks Board simple mutations (Tasks C1-C5):
+ *   PUT  /scheduled/:key            edit (prompt/script/cron)
+ *   POST /scheduled/:key/pause      pause
+ *   POST /scheduled/:key/resume     resume (slot recompute)
+ *   POST /scheduled/:key/run-now    early fire
+ *   POST /scheduled/:key/cancel     end series
+ *   moduleOwner(seriesId)           module-owned registry
+ *
+ * TDD: written before the implementation. On-disk session fixtures + in-memory
+ * central DB, driving the AuthHandlers directly.
+ */
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+
+import Database from 'better-sqlite3';
+
+import { initTestDb, closeDb, getDb } from '../../db/connection.js';
+import { ensureSchema, openInboundDb } from '../../db/session-db.js';
+import { migration043 } from '../../db/migrations/043-scheduled-audit.js';
+import {
+  encodeKey,
+  invalidateScheduledCache,
+  moduleOwner,
+  _resetScheduledRateLimitForTesting,
+} from './scheduled-shared.js';
+import type { AuthedRequestContext } from '../router.js';
+
+// wakeContainer is mocked so run-now doesn't try to spawn a real container.
+const mockWakeContainer = vi.fn().mockResolvedValue(true);
+vi.mock('../../container-runner.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../../container-runner.js')>();
+  return { ...real, wakeContainer: (...args: unknown[]) => mockWakeContainer(...args) };
+});
+
+import {
+  editHandler,
+  pauseHandler,
+  resumeHandler,
+  runNowHandler,
+  cancelHandler,
+  _setMutationsTestOptions,
+} from './scheduled-mutations.js';
+
+// Unique per-file temp dir (mkdtemp) — no fixed /tmp path a sibling file or a
+// parallel agent process could collide on (hermeticity, matches the read/
+// assembly test fix).
+const TEST_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-sched-mut-'));
+const NOW = Date.parse('2026-06-13T12:00:00Z');
+const AG = 'ag-1';
+const SESS = 'sess-1';
+const MG = 'mg-1';
+
+function isoIn(ms: number): string {
+  return new Date(NOW + ms).toISOString();
+}
+
+function setupCentralDb(): void {
+  const db = initTestDb();
+  db.exec(`
+    CREATE TABLE agent_groups (id TEXT PRIMARY KEY, name TEXT NOT NULL, folder TEXT NOT NULL UNIQUE, agent_provider TEXT, created_at TEXT NOT NULL);
+    CREATE TABLE messaging_groups (id TEXT PRIMARY KEY, channel_type TEXT NOT NULL, platform_id TEXT NOT NULL, name TEXT, created_at TEXT NOT NULL, UNIQUE(channel_type, platform_id));
+    CREATE TABLE sessions (id TEXT PRIMARY KEY, agent_group_id TEXT NOT NULL, messaging_group_id TEXT, thread_id TEXT, agent_provider TEXT, status TEXT DEFAULT 'active', container_status TEXT DEFAULT 'stopped', last_active TEXT, created_at TEXT NOT NULL);
+    CREATE TABLE users (id TEXT PRIMARY KEY, kind TEXT NOT NULL, display_name TEXT, created_at TEXT NOT NULL);
+    CREATE TABLE user_roles (user_id TEXT NOT NULL, role TEXT NOT NULL, agent_group_id TEXT, granted_by TEXT, granted_at TEXT NOT NULL, PRIMARY KEY (user_id, role, agent_group_id));
+  `);
+  migration043.up(db);
+  db.prepare("INSERT INTO agent_groups (id, name, folder, created_at) VALUES (?, ?, ?, datetime('now'))").run(
+    AG,
+    'G1',
+    AG,
+  );
+  db.prepare(
+    "INSERT INTO messaging_groups (id, channel_type, platform_id, name, created_at) VALUES (?, 'discord', 'd:1', 'chan', datetime('now'))",
+  ).run(MG);
+  db.prepare(
+    "INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, status, container_status, created_at) VALUES (?, ?, ?, NULL, 'active', 'stopped', datetime('now'))",
+  ).run(SESS, AG, MG);
+}
+
+function addUser(id: string): void {
+  getDb().prepare("INSERT INTO users (id, kind, created_at) VALUES (?, 'phone', datetime('now'))").run(id);
+}
+function grant(uid: string, role: string, ag: string | null): void {
+  getDb()
+    .prepare("INSERT INTO user_roles (user_id, role, agent_group_id, granted_at) VALUES (?, ?, ?, datetime('now'))")
+    .run(uid, role, ag);
+}
+
+function seedSession(): { inbound: string; outbound: string } {
+  const dir = path.join(TEST_DIR, 'v2-sessions', AG, SESS);
+  fs.mkdirSync(dir, { recursive: true });
+  const inbound = path.join(dir, 'inbound.db');
+  const outbound = path.join(dir, 'outbound.db');
+  ensureSchema(inbound, 'inbound');
+  ensureSchema(outbound, 'outbound');
+  return { inbound, outbound };
+}
+
+function insertRow(
+  inboundPath: string,
+  row: {
+    id: string;
+    series_id?: string;
+    status?: string;
+    recurrence?: string | null;
+    process_after?: string | null;
+    content?: string;
+  },
+): void {
+  const db = openInboundDb(inboundPath);
+  const seq = (db.prepare('SELECT COALESCE(MAX(seq),0) AS m FROM messages_in').get() as { m: number }).m + 2;
+  db.prepare(
+    `INSERT INTO messages_in (id, seq, kind, timestamp, status, process_after, recurrence, series_id, content, platform_id, channel_type)
+     VALUES (@id, @seq, 'task', @ts, @status, @processAfter, @recurrence, @seriesId, @content, 'd:1', 'discord')`,
+  ).run({
+    id: row.id,
+    seq,
+    ts: isoIn(-3600_000),
+    status: row.status ?? 'pending',
+    processAfter: row.process_after === undefined ? isoIn(3600_000) : row.process_after,
+    recurrence: row.recurrence === undefined ? '0 9 * * *' : row.recurrence,
+    seriesId: row.series_id ?? row.id,
+    content: row.content ?? JSON.stringify({ prompt: 'old prompt', script: 'echo old' }),
+  });
+  db.close();
+}
+
+function setClaim(outboundPath: string, messageId: string): void {
+  const db = new Database(outboundPath);
+  db.pragma('journal_mode = DELETE');
+  db.prepare(
+    "INSERT OR REPLACE INTO processing_ack (message_id, status, status_changed) VALUES (?, 'processing', datetime('now'))",
+  ).run(messageId);
+  db.close();
+}
+
+function liveRow(
+  seriesId: string,
+): { status: string; process_after: string | null; recurrence: string | null; content: string } | undefined {
+  const db = openInboundDb(path.join(TEST_DIR, 'v2-sessions', AG, SESS, 'inbound.db'));
+  const row = db
+    .prepare(
+      'SELECT status, process_after, recurrence, content FROM messages_in WHERE series_id = ? ORDER BY seq DESC LIMIT 1',
+    )
+    .get(seriesId) as
+    | { status: string; process_after: string | null; recurrence: string | null; content: string }
+    | undefined;
+  db.close();
+  return row;
+}
+
+function ctxFor(userId: string, scopes: AuthedRequestContext['scopes']): AuthedRequestContext {
+  return {
+    rawNodeReq: {} as never,
+    user: { id: userId, kind: 'phone', display_name: null, created_at: '' } as never,
+    scopes,
+  };
+}
+const OWNER_SCOPES = { role: 'owner' as const, allowed_group_ids: [], no_filter: true };
+
+function putReq(body: unknown): Request {
+  return new Request('http://x/m', {
+    method: 'PUT',
+    body: JSON.stringify(body),
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
+function postReq(body?: unknown): Request {
+  return new Request('http://x/m', {
+    method: 'POST',
+    body: body ? JSON.stringify(body) : undefined,
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
+async function readJson(res: Response): Promise<Record<string, unknown>> {
+  return (await res.json()) as Record<string, unknown>;
+}
+
+function keyFor(seriesId: string): string {
+  return encodeKey(AG, SESS, seriesId);
+}
+
+beforeEach(() => {
+  if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+  fs.mkdirSync(TEST_DIR, { recursive: true });
+  setupCentralDb();
+  invalidateScheduledCache();
+  _resetScheduledRateLimitForTesting();
+  mockWakeContainer.mockClear();
+  _setMutationsTestOptions({ dataDir: TEST_DIR, nowMs: NOW });
+  addUser('owner');
+  grant('owner', 'owner', null);
+});
+
+afterEach(() => {
+  _setMutationsTestOptions(null);
+  closeDb();
+  vi.restoreAllMocks();
+  if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+});
+
+// ── C1: edit ────────────────────────────────────────────────────────────────
+describe('editHandler', () => {
+  it('test_edit_cron_recomputes_process_after', async () => {
+    insertRow(seedSession().inbound, {
+      id: 'r1',
+      series_id: 'ser-1',
+      recurrence: '0 9 * * *',
+      process_after: isoIn(3600_000),
+    });
+    const res = (await editHandler(
+      putReq({ cron: '0 6 * * *' }),
+      { key: keyFor('ser-1') },
+      ctxFor('owner', OWNER_SCOPES),
+    ))!;
+    expect(res.status).toBe(200);
+    const row = liveRow('ser-1')!;
+    expect(row.recurrence).toBe('0 6 * * *');
+    // process_after recomputed to the next 06:00 occurrence — strictly future, not the old 09:00 slot.
+    expect(Date.parse(row.process_after!)).toBeGreaterThan(NOW);
+    expect(row.process_after).not.toBe(isoIn(3600_000));
+  });
+
+  it('test_edit_invalid_cron_400', async () => {
+    insertRow(seedSession().inbound, { id: 'r1', series_id: 'ser-1' });
+    const res = (await editHandler(
+      putReq({ cron: 'not a cron' }),
+      { key: keyFor('ser-1') },
+      ctxFor('owner', OWNER_SCOPES),
+    ))!;
+    expect(res.status).toBe(400);
+    expect((await readJson(res)).error).toBe('bad_cron');
+  });
+
+  it('test_edit_script_too_long_400', async () => {
+    insertRow(seedSession().inbound, { id: 'r1', series_id: 'ser-1' });
+    const res = (await editHandler(
+      putReq({ script: 'x'.repeat(4001) }),
+      { key: keyFor('ser-1') },
+      ctxFor('owner', OWNER_SCOPES),
+    ))!;
+    expect(res.status).toBe(400);
+    expect((await readJson(res)).error).toBe('too_long');
+  });
+
+  it('prompt too long → 400', async () => {
+    insertRow(seedSession().inbound, { id: 'r1', series_id: 'ser-1' });
+    const res = (await editHandler(
+      putReq({ prompt: 'x'.repeat(8001) }),
+      { key: keyFor('ser-1') },
+      ctxFor('owner', OWNER_SCOPES),
+    ))!;
+    expect(res.status).toBe(400);
+  });
+
+  it('test_edit_claimed_409', async () => {
+    const { inbound, outbound } = seedSession();
+    insertRow(inbound, { id: 'r1', series_id: 'ser-1', process_after: isoIn(-1000) });
+    setClaim(outbound, 'r1'); // processing claim → processing health
+    const res = (await editHandler(
+      putReq({ prompt: 'new' }),
+      { key: keyFor('ser-1') },
+      ctxFor('owner', OWNER_SCOPES),
+    ))!;
+    expect(res.status).toBe(409);
+    expect((await readJson(res)).reason).toBe('source_busy');
+  });
+
+  it('edits prompt + script into content (updateTask merge)', async () => {
+    insertRow(seedSession().inbound, {
+      id: 'r1',
+      series_id: 'ser-1',
+      content: JSON.stringify({ prompt: 'old', script: 'echo old', extra: 'keep' }),
+    });
+    await editHandler(putReq({ prompt: 'new prompt' }), { key: keyFor('ser-1') }, ctxFor('owner', OWNER_SCOPES));
+    const parsed = JSON.parse(liveRow('ser-1')!.content) as Record<string, unknown>;
+    expect(parsed.prompt).toBe('new prompt');
+    expect(parsed.script).toBe('echo old');
+    expect(parsed.extra).toBe('keep');
+  });
+
+  it('gate: non-manage caller → 404; malformed key → 400', async () => {
+    insertRow(seedSession().inbound, { id: 'r1', series_id: 'ser-1' });
+    addUser('member');
+    grant('member', 'member', AG);
+    const memberScopes = { role: 'member' as const, allowed_group_ids: [AG], no_filter: false };
+    expect(
+      (await editHandler(putReq({ prompt: 'x' }), { key: keyFor('ser-1') }, ctxFor('member', memberScopes)))!.status,
+    ).toBe(404);
+    expect(
+      (await editHandler(putReq({ prompt: 'x' }), { key: '@@bad@@' }, ctxFor('owner', OWNER_SCOPES)))!.status,
+    ).toBe(400);
+  });
+});
+
+// ── C2: pause / resume ────────────────────────────────────────────────────────
+describe('pause / resume', () => {
+  it('test_pause_then_resume_roundtrip', async () => {
+    insertRow(seedSession().inbound, { id: 'r1', series_id: 'ser-1', process_after: isoIn(3600_000) });
+    expect((await pauseHandler(postReq(), { key: keyFor('ser-1') }, ctxFor('owner', OWNER_SCOPES)))!.status).toBe(200);
+    expect(liveRow('ser-1')!.status).toBe('paused');
+    expect((await resumeHandler(postReq(), { key: keyFor('ser-1') }, ctxFor('owner', OWNER_SCOPES)))!.status).toBe(200);
+    const row = liveRow('ser-1')!;
+    expect(row.status).toBe('pending');
+    expect(Date.parse(row.process_after!)).toBeGreaterThan(NOW);
+  });
+
+  it('test_resume_recomputes_slot_no_immediate_fire', async () => {
+    // Paused, process_after 2 slots in the past.
+    insertRow(seedSession().inbound, {
+      id: 'r1',
+      series_id: 'ser-1',
+      status: 'paused',
+      recurrence: '0 9 * * *',
+      process_after: isoIn(-48 * 3600_000),
+    });
+    await resumeHandler(postReq(), { key: keyFor('ser-1') }, ctxFor('owner', OWNER_SCOPES));
+    const row = liveRow('ser-1')!;
+    expect(row.status).toBe('pending');
+    // Recomputed to a FUTURE slot — does NOT fire immediately.
+    expect(Date.parse(row.process_after!)).toBeGreaterThan(NOW);
+  });
+
+  it('test_pause_claimed_409', async () => {
+    const { inbound, outbound } = seedSession();
+    insertRow(inbound, { id: 'r1', series_id: 'ser-1', process_after: isoIn(-1000) });
+    setClaim(outbound, 'r1');
+    const res = (await pauseHandler(postReq(), { key: keyFor('ser-1') }, ctxFor('owner', OWNER_SCOPES)))!;
+    expect(res.status).toBe(409);
+    expect((await readJson(res)).reason).toBe('source_busy');
+  });
+});
+
+// ── C3: run-now ────────────────────────────────────────────────────────────────
+describe('runNowHandler', () => {
+  it('test_runnow_stalled_unclaimed_fires', async () => {
+    // Overdue + unclaimed (no outbound claim) → fires.
+    insertRow(seedSession().inbound, { id: 'r1', series_id: 'ser-1', process_after: isoIn(-60_000) });
+    const res = (await runNowHandler(postReq(), { key: keyFor('ser-1') }, ctxFor('owner', OWNER_SCOPES)))!;
+    expect(res.status).toBe(200);
+    expect((await readJson(res)).fired).toBe(true);
+    // process_after set to ~now; wakeContainer called.
+    expect(mockWakeContainer).toHaveBeenCalledTimes(1);
+    expect(Date.parse(liveRow('ser-1')!.process_after!)).toBeLessThanOrEqual(NOW + 1000);
+  });
+
+  it('test_runnow_unknown_503', async () => {
+    // Overdue but outbound.db absent → unknown → 503 fail-closed, no wake.
+    const dir = path.join(TEST_DIR, 'v2-sessions', AG, SESS);
+    fs.mkdirSync(dir, { recursive: true });
+    ensureSchema(path.join(dir, 'inbound.db'), 'inbound');
+    // NO outbound.db created → unknown.
+    insertRow(path.join(dir, 'inbound.db'), { id: 'r1', series_id: 'ser-1', process_after: isoIn(-60_000) });
+    const res = (await runNowHandler(postReq(), { key: keyFor('ser-1') }, ctxFor('owner', OWNER_SCOPES)))!;
+    expect(res.status).toBe(503);
+    expect((await readJson(res)).reason).toBe('claim_state_unreadable');
+    expect(mockWakeContainer).not.toHaveBeenCalled();
+  });
+
+  it('test_runnow_near_slot_needs_force', async () => {
+    // process_after within GUARD_GRACE of now (healthy, near slot), not forced.
+    insertRow(seedSession().inbound, { id: 'r1', series_id: 'ser-1', process_after: isoIn(30_000) });
+    const res = (await runNowHandler(postReq(), { key: keyFor('ser-1') }, ctxFor('owner', OWNER_SCOPES)))!;
+    expect(res.status).toBe(409);
+    expect((await readJson(res)).reason).toBe('near_slot');
+    expect(mockWakeContainer).not.toHaveBeenCalled();
+  });
+
+  it('test_runnow_force_fires', async () => {
+    insertRow(seedSession().inbound, { id: 'r1', series_id: 'ser-1', process_after: isoIn(30_000) });
+    const res = (await runNowHandler(
+      postReq({ force: true }),
+      { key: keyFor('ser-1') },
+      ctxFor('owner', OWNER_SCOPES),
+    ))!;
+    expect(res.status).toBe(200);
+    expect(mockWakeContainer).toHaveBeenCalledTimes(1);
+  });
+
+  it('test_runnow_rate_limited', async () => {
+    insertRow(seedSession().inbound, { id: 'r1', series_id: 'ser-1', process_after: isoIn(-60_000) });
+    let got429 = false;
+    for (let i = 0; i < 200; i++) {
+      const res = (await runNowHandler(postReq(), { key: keyFor('ser-1') }, ctxFor('owner', OWNER_SCOPES)))!;
+      if (res.status === 429) {
+        got429 = true;
+        break;
+      }
+    }
+    expect(got429).toBe(true);
+  });
+});
+
+// ── C4: cancel ──────────────────────────────────────────────────────────────
+describe('cancelHandler', () => {
+  it('test_cancel_writes_audit', async () => {
+    insertRow(seedSession().inbound, { id: 'r1', series_id: 'ser-1' });
+    const res = (await cancelHandler(postReq(), { key: keyFor('ser-1') }, ctxFor('owner', OWNER_SCOPES)))!;
+    expect(res.status).toBe(200);
+    expect((await readJson(res)).cancelled).toBe(true);
+    const audit = getDb()
+      .prepare("SELECT 1 AS ok FROM scheduled_audit WHERE series_id = 'ser-1' AND action = 'cancel'")
+      .get() as { ok: number } | undefined;
+    expect(audit).toBeDefined();
+    expect(liveRow('ser-1')!.status).toBe('completed');
+  });
+
+  it('test_cancel_strand_succeeds', async () => {
+    // Pure strand: one terminal (completed) row, recurrence still set, no live row.
+    const { inbound } = seedSession();
+    insertRow(inbound, { id: 'r1', series_id: 'ser-1' });
+    {
+      const db = openInboundDb(inbound);
+      db.prepare("UPDATE messages_in SET status='completed' WHERE series_id='ser-1'").run(); // recurrence stays set
+      db.close();
+    }
+    const res = (await cancelHandler(postReq(), { key: keyFor('ser-1') }, ctxFor('owner', OWNER_SCOPES)))!;
+    expect(res.status).toBe(200); // NOT 409 — the strand clear counts as touched
+  });
+
+  it('test_cancel_no_resurrection', async () => {
+    const { inbound } = seedSession();
+    insertRow(inbound, { id: 'r1', series_id: 'ser-1' });
+    {
+      const db = openInboundDb(inbound);
+      db.prepare("UPDATE messages_in SET status='completed' WHERE series_id='ser-1'").run();
+      db.close();
+    }
+    await cancelHandler(postReq(), { key: keyFor('ser-1') }, ctxFor('owner', OWNER_SCOPES));
+    // getCompletedRecurring would mint a successor if recurrence were still set.
+    const { getCompletedRecurring } = await import('../../modules/scheduling/db.js');
+    const db = openInboundDb(inbound);
+    const recurring = getCompletedRecurring(db).filter((r) => r.series_id === 'ser-1');
+    db.close();
+    expect(recurring).toHaveLength(0);
+  });
+
+  it('stale key (no rows) → 409 stale_key', async () => {
+    seedSession(); // empty inbound
+    const res = (await cancelHandler(postReq(), { key: keyFor('nonexistent') }, ctxFor('owner', OWNER_SCOPES)))!;
+    expect(res.status).toBe(409);
+    expect((await readJson(res)).reason).toBe('stale_key');
+  });
+});
+
+// ── C5: moduleOwner ─────────────────────────────────────────────────────────
+describe('moduleOwner', () => {
+  it('test_module_synth_detected', () => {
+    expect(moduleOwner('memory-synth-ag-xyz')).toEqual({ moduleOwned: true, owner: 'memory' });
+  });
+  it('test_operator_task_not_module', () => {
+    expect(moduleOwner('task-morning-briefing')).toEqual({ moduleOwned: false });
+  });
+  it('test_mnemon_static_map', () => {
+    // memory-lint-* is the other prefixed module series.
+    expect(moduleOwner('memory-lint-ag-xyz')).toEqual({ moduleOwned: true, owner: 'memory' });
+  });
+});

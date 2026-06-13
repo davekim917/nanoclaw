@@ -1276,3 +1276,209 @@ describe('notifyKillCeiling (Layer-3 fix)', () => {
     expect(rows[0].id).toBe('prior');
   });
 });
+
+// ─── D3: move-intent recovery + D4: audit body prune ──────────────────────────
+// Self-contained: these helpers take an explicit central-DB handle + options,
+// so they don't rely on the file-level getDb/session-manager mocks above.
+describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
+  // Lazy import inside the describe so the helpers resolve against the real
+  // host-sweep module (already imported at top).
+  let recoverMoveIntents: typeof import('./host-sweep.js').recoverMoveIntents;
+  let pruneAuditBodies: typeof import('./host-sweep.js').pruneAuditBodies;
+  let migration043: typeof import('./db/migrations/043-scheduled-audit.js').migration043;
+  let ensureSchema: typeof import('./db/session-db.js').ensureSchema;
+  let openInboundDb: typeof import('./db/session-db.js').openInboundDb;
+
+  const DIR = path.join(os.tmpdir(), 'nanoclaw-d3d4-test');
+  const NOW = Date.parse('2026-06-13T12:00:00Z');
+  const SWEEP_MS = 60_000;
+
+  beforeEach(async () => {
+    ({ recoverMoveIntents, pruneAuditBodies } = await import('./host-sweep.js'));
+    ({ migration043 } = await import('./db/migrations/043-scheduled-audit.js'));
+    ({ ensureSchema, openInboundDb } = await import('./db/session-db.js'));
+    if (fs.existsSync(DIR)) fs.rmSync(DIR, { recursive: true });
+    fs.mkdirSync(DIR, { recursive: true });
+  });
+  afterEach(() => {
+    if (fs.existsSync(DIR)) fs.rmSync(DIR, { recursive: true });
+  });
+
+  function centralDb(): Database.Database {
+    const db = new Database(':memory:');
+    migration043.up(db);
+    return db;
+  }
+
+  function seedInbound(agentGroupId: string, sessionId: string): string {
+    const dir = path.join(DIR, 'v2-sessions', agentGroupId, sessionId);
+    fs.mkdirSync(dir, { recursive: true });
+    const p = path.join(dir, 'inbound.db');
+    ensureSchema(p, 'inbound');
+    return p;
+  }
+
+  function insertLive(inboundPath: string, seriesId: string): void {
+    const db = openInboundDb(inboundPath);
+    const seq = (db.prepare('SELECT COALESCE(MAX(seq),0) AS m FROM messages_in').get() as { m: number }).m + 2;
+    db.prepare(
+      `INSERT INTO messages_in (id, seq, kind, timestamp, status, process_after, recurrence, series_id, content)
+       VALUES (?, ?, 'task', datetime('now'), 'pending', ?, '0 9 * * *', ?, '{}')`,
+    ).run(`live-${seriesId}`, seq, new Date(NOW + 3600_000).toISOString(), seriesId);
+    db.close();
+  }
+
+  function writeIntent(
+    db: Database.Database,
+    opts: { seriesId: string; ag: string; sess: string; tsMs: number; snapshot?: object },
+  ): void {
+    const snapshot = opts.snapshot ?? {
+      id: `orig-${opts.seriesId}`,
+      series_id: opts.seriesId,
+      status: 'pending',
+      process_after: new Date(NOW + 3600_000).toISOString(),
+      recurrence: '0 9 * * *',
+      content: JSON.stringify({ prompt: 'p' }),
+      platform_id: 'p:1',
+      channel_type: 'discord',
+      thread_id: null,
+      kind: 'task',
+    };
+    db.prepare(
+      `INSERT INTO scheduled_audit (ts, actor, action, agent_group_id, session_id, series_id, detail_json, correlation_id)
+       VALUES (?, 'owner', 'move_intent', ?, ?, ?, ?, ?)`,
+    ).run(
+      new Date(opts.tsMs).toISOString(),
+      opts.ag,
+      opts.sess,
+      opts.seriesId,
+      JSON.stringify({ snapshot }),
+      `corr-${opts.seriesId}`,
+    );
+  }
+
+  it('test_recover_stamps_when_live_row_exists', () => {
+    const db = centralDb();
+    const inbound = seedInbound('src-ag', 'src-sess');
+    insertLive(inbound, 'ser-1'); // a live row exists for the series
+    writeIntent(db, { seriesId: 'ser-1', ag: 'src-ag', sess: 'src-sess', tsMs: NOW - 2 * SWEEP_MS });
+
+    recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW });
+
+    const row = db
+      .prepare("SELECT detail_json, resolved_at FROM scheduled_audit WHERE correlation_id = 'corr-ser-1'")
+      .get() as { detail_json: string | null; resolved_at: string | null };
+    expect(row.resolved_at).toBeTruthy(); // stamped
+    expect(row.detail_json).toBeNull(); // body purged
+    // No restore performed — the existing live row is the only one.
+    const live = openInboundDb(inbound)
+      .prepare("SELECT COUNT(*) AS c FROM messages_in WHERE series_id='ser-1' AND status='pending'")
+      .get() as { c: number };
+    expect(live.c).toBe(1);
+    db.close();
+  });
+
+  it('test_recover_restores_when_zero_live_rows', () => {
+    const db = centralDb();
+    const inbound = seedInbound('src-ag', 'src-sess'); // empty — simulates crash post-cancel
+    writeIntent(db, { seriesId: 'ser-2', ag: 'src-ag', sess: 'src-sess', tsMs: NOW - 2 * SWEEP_MS });
+
+    recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW });
+
+    // restoreTaskRow inserted a live row from the snapshot.
+    const live = openInboundDb(inbound)
+      .prepare(
+        "SELECT series_id, status, recurrence FROM messages_in WHERE series_id='ser-2' AND status IN ('pending','paused')",
+      )
+      .all() as Array<{ series_id: string; status: string; recurrence: string | null }>;
+    expect(live).toHaveLength(1);
+    expect(live[0].recurrence).toBe('0 9 * * *');
+    const row = db
+      .prepare("SELECT detail_json, resolved_at FROM scheduled_audit WHERE correlation_id = 'corr-ser-2'")
+      .get() as { detail_json: string | null; resolved_at: string | null };
+    expect(row.resolved_at).toBeTruthy();
+    expect(row.detail_json).toBeNull(); // body purged
+    db.close();
+  });
+
+  it('test_recover_idempotent_no_double_restore', () => {
+    const db = centralDb();
+    const inbound = seedInbound('src-ag', 'src-sess');
+    writeIntent(db, { seriesId: 'ser-3', ag: 'src-ag', sess: 'src-sess', tsMs: NOW - 2 * SWEEP_MS });
+
+    recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW }); // first pass restores
+    recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW }); // second pass must be a no-op
+
+    const live = openInboundDb(inbound)
+      .prepare("SELECT COUNT(*) AS c FROM messages_in WHERE series_id='ser-3' AND status IN ('pending','paused')")
+      .get() as { c: number };
+    expect(live.c).toBe(1); // exactly one — no double restore
+    db.close();
+  });
+
+  it('does not recover an intent younger than one sweep interval', () => {
+    const db = centralDb();
+    seedInbound('src-ag', 'src-sess');
+    writeIntent(db, { seriesId: 'ser-4', ag: 'src-ag', sess: 'src-sess', tsMs: NOW - 5_000 }); // 5s old
+
+    recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW });
+
+    const row = db.prepare("SELECT resolved_at FROM scheduled_audit WHERE correlation_id = 'corr-ser-4'").get() as {
+      resolved_at: string | null;
+    };
+    expect(row.resolved_at).toBeNull(); // too young — left alone
+    db.close();
+  });
+
+  // ── D4 ──
+  function insertAudit(db: Database.Database, opts: { action: string; tsMs: number; bodies?: boolean }): number {
+    const r = db
+      .prepare(
+        `INSERT INTO scheduled_audit (ts, actor, action, agent_group_id, session_id, series_id, before_preview, after_preview, detail_json)
+       VALUES (?, 'owner', ?, 'ag', 'sess', 'ser', ?, ?, ?)`,
+      )
+      .run(
+        new Date(opts.tsMs).toISOString(),
+        opts.action,
+        opts.bodies === false ? null : 'before body',
+        opts.bodies === false ? null : 'after body',
+        opts.bodies === false ? null : '{"x":1}',
+      );
+    return Number(r.lastInsertRowid);
+  }
+
+  it('test_prune_nulls_bodies_after_90d', () => {
+    const db = centralDb();
+    const id = insertAudit(db, { action: 'edit', tsMs: NOW - 91 * 24 * 3600_000 });
+    pruneAuditBodies(db, { nowMs: NOW });
+    const row = db
+      .prepare('SELECT actor, action, before_preview, after_preview, detail_json FROM scheduled_audit WHERE id = ?')
+      .get(id) as Record<string, unknown>;
+    expect(row.before_preview).toBeNull();
+    expect(row.after_preview).toBeNull();
+    expect(row.detail_json).toBeNull();
+    expect(row.actor).toBe('owner'); // metadata intact
+    expect(row.action).toBe('edit');
+    db.close();
+  });
+
+  it('test_prune_keeps_recent_bodies', () => {
+    const db = centralDb();
+    const id = insertAudit(db, { action: 'edit', tsMs: NOW - 10 * 24 * 3600_000 });
+    pruneAuditBodies(db, { nowMs: NOW });
+    const row = db.prepare('SELECT before_preview FROM scheduled_audit WHERE id = ?').get(id) as {
+      before_preview: string | null;
+    };
+    expect(row.before_preview).toBe('before body'); // unchanged
+    db.close();
+  });
+
+  it('test_prune_preserves_cancel_metadata', () => {
+    const db = centralDb();
+    const id = insertAudit(db, { action: 'cancel', tsMs: NOW - 100 * 24 * 3600_000 });
+    pruneAuditBodies(db, { nowMs: NOW });
+    const row = db.prepare('SELECT action FROM scheduled_audit WHERE id = ?').get(id) as { action: string };
+    expect(row.action).toBe('cancel'); // row survives so history can still label the cancellation
+    db.close();
+  });
+});

@@ -7,6 +7,7 @@
  * central DB, driving the AuthHandlers directly with a synthetic ctx.
  */
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
@@ -20,7 +21,11 @@ import { _resetAssemblyInFlightForTesting } from './scheduled-assembly.js';
 import { scheduledListHandler, scheduledDetailHandler } from './scheduled-read.js';
 import type { AuthedRequestContext } from '../router.js';
 
-const TEST_DIR = '/tmp/nanoclaw-scheduled-read-test';
+// Unique per-file temp dir (mkdtemp) so a sibling test file OR a parallel agent
+// process can never collide on a fixed /tmp path and wipe these fixtures
+// mid-test — the cross-file/cross-process pollution that made the detail join
+// read the wrong (or a half-deleted) session DB and return a null channel_name.
+const TEST_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-sched-read-'));
 const NOW = Date.parse('2026-06-13T12:00:00Z');
 
 // The read handlers default to DATA_DIR; point that at our fixture dir for the
@@ -161,7 +166,13 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  // Reset EVERY shared singleton this file's handlers touch on the way OUT too,
+  // so a sibling file never inherits a populated cache / in-flight assembly /
+  // stale read-options pointing at this file's (now-deleted) dataDir. Hermetic
+  // regardless of file order.
   readMod._setReadTestOptions(null);
+  invalidateScheduledCache();
+  _resetAssemblyInFlightForTesting();
   closeDb();
   vi.restoreAllMocks();
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });

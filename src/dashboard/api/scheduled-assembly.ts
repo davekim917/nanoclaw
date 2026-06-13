@@ -30,6 +30,7 @@ import {
   SWEEP_INTERVAL_MS,
   encodeKey,
   getScheduledCache,
+  moduleOwner,
   type ScheduledSnapshot as CacheSnapshot,
 } from './scheduled-shared.js';
 
@@ -85,24 +86,8 @@ export interface ScheduledAssemblyOptions {
   nowMs?: number;
 }
 
-// ── Module-owned series detection ──────────────────────────────────────────────
-// Series-prefix registry + static map (§4.5). Kept local so the read layer
-// doesn't couple to the memory/support modules. Cross-checked against the live
-// fleet at build time (C5 — see commit message).
-
-const MODULE_OWNED_PREFIXES: Array<{ prefix: string; owner: string }> = [
-  { prefix: 'memory-synth-', owner: 'mnemon' },
-  { prefix: 'memory-lint-', owner: 'mnemon' },
-  { prefix: 'mnemon-', owner: 'mnemon' },
-  { prefix: 'support-', owner: 'support' },
-];
-
-function moduleOwnerOf(seriesId: string): string | null {
-  for (const { prefix, owner } of MODULE_OWNED_PREFIXES) {
-    if (seriesId.startsWith(prefix)) return owner;
-  }
-  return null;
-}
+// Module-owned series detection now lives in scheduled-shared.ts (the single
+// registry shared with the mutation handlers) — imported as `moduleOwner`.
 
 // ── Time helpers ────────────────────────────────────────────────────────────────
 
@@ -284,7 +269,7 @@ function channelNameOf(
   platformId: string | null,
 ): string | null {
   if (!channelType || !platformId) return null;
-  return mgByDest.get(`${channelType} ${platformId}`) ?? null;
+  return mgByDest.get(`${channelType} ${platformId}`) ?? null;
 }
 
 interface OutboundView {
@@ -400,7 +385,7 @@ function rawToRow(
     next_fire_utc: processAfterMs !== null ? new Date(processAfterMs).toISOString() : null,
     next_fire_local: localString(processAfterMs),
     health,
-    module_owner: moduleOwnerOf(seriesId),
+    module_owner: moduleOwner(seriesId).owner ?? null,
     quiet_status: parsed.quietStatus,
     flag_intent: parsed.flagIntent,
     last_fires: [],
@@ -534,7 +519,7 @@ export function buildDetailRow(
     platform_id: string;
     name: string | null;
   }>) {
-    if (m.name) mgByDest.set(`${m.channel_type}\0${m.platform_id}`, m.name);
+    if (m.name) mgByDest.set(`${m.channel_type} ${m.platform_id}`, m.name);
   }
 
   const desc: SessionDescriptor = {
@@ -650,7 +635,7 @@ async function doAssemble(scopes: AuthScopes, options: ScheduledAssemblyOptions)
         platform_id: string;
         name: string | null;
       }>
-    ).map((m) => [`${m.channel_type} ${m.platform_id}`, m.name ?? '']),
+    ).map((m) => [`${m.channel_type} ${m.platform_id}`, m.name ?? '']),
   );
 
   // Enumerate authorized sessions (scope filter — C7).

@@ -60,5 +60,20 @@ builder-A auto-claimed Group B after finishing A; stood down. builder-B is sole 
 ## Frozen contract (B must match E's client types)
 list `{rows, counts, degraded, assembled_at}`; ScheduledRow fields: key, series_id, agent_group_id, agent_group_name, provider, channel_name, channel_type, thread_id, kind, cron, next_fire_utc, next_fire_local, health, module_owner, quiet_status, flag_intent, last_fires[].outcome, available_verbs. Detail adds prompt, script, history, audit_tail?.
 
+## VALIDATED complete (Group D)
+- **Group D** (builder-A): VALIDATED. 16/16 named tests present (4 preview, 6 move, 3 recover, 3 prune); 75/75 pass in `scheduled-move.test.ts` + `host-sweep.test.ts`. Compiles clean (0 tsc errors in move/sweep). The lone WARN in the run is the expected `test_move_compensation_restores_source` scenario (target insert fails → `restoreTaskRow` source). Files: `scheduled-move.ts` (movePreviewHandler + moveExecuteHandler), `src/host-sweep.ts` (recoverMoveIntents D3 + pruneAuditBodies D4 in one additive MODULE-HOOK), + tests. NOT yet committed (held with Group C).
+
+## Group C status (C1–C5 validated; C6 + integration fixes in flight)
+- **C1–C5** (builder-A): VALIDATED. 18/18 named tests present (4 edit, 3 pause/resume, 5 run-now, 3 cancel, 3 module-owner); 22/22 `scheduled-mutations.test.ts` pass.
+- **C6** (route registration) in_progress.
+- **C5 live-fleet cross-check (DONE by lead):** 33 active series — 10 `memory-synth-*`, 10 `memory-lint-*` (both module-owned, owner='memory'), 12 `task-*` operator, 1 `task-…-support-poller` (operator-owned, NOT module-owned — confirmed no auto-reseed via `per-email-thread-sessions/activation-runbook.md:45`), ZERO `mnemon-*`/`support-*` series. So C5's registry (memory-synth-/memory-lint- → 'memory', empty static map) is CORRECT against ground truth.
+
+## Pending integration fixes (directive sent to builder-A — do AFTER C6, before Group C complete)
+1. **MUST (spec violation):** unify the module-owner registry. assembly.ts:93-97 ships a DIVERGENT local copy (owner='mnemon' + dead mnemon-/support- prefixes) that violates plan C5 ASSERT (owner must be 'memory') and populates the user-visible badge wrong. Fix: single `moduleOwner` in scheduled-shared.ts, imported by BOTH assembly + mutations; assembly:403 → `moduleOwner(seriesId).owner ?? null`; delete assembly's local `moduleOwnerOf`/`MODULE_OWNED_PREFIXES`. (No import cycle — verified.)
+2. **SHOULD (hygiene):** scheduled-assembly.ts has 2 raw 0x00 NUL bytes (lines 287 lookup + 653 build) as the channel-name map separator — consistent so functionally green, but reads as binary to tooling. Replace with ` ` escapes.
+
 ## Not yet done
-D, C builders await B. Render-check (E1) deferred to post-build. Post-build drift pending. QA (Stage D) pending.
+- builder-A: finish C6 + the 2 integration fixes, re-run `npx vitest run src/dashboard/api/ src/host-sweep.test.ts` green.
+- Lead: validate C6 (9 routes registered, requireAuth-wrapped, splat last) + the integration fixes; then FULL host `pnpm run build` (tsc — now unblocked) + FULL `pnpm test` + dashboard build; commit Groups D+C.
+- ~~Render-check (§3c health-pill palette)~~ **DONE — PASS (lead, computed WCAG):** the flagged "stalled-red on dark card" combo clears AA — stalled count `--st-failed` on `--st-failed-bg`(red@0.14)/panel = **4.82:1** (≥4.5 normal text); stalled border on panel = **5.74:1** (≥3 UI); degraded badge / inline-stalled header = 4.82:1; stalled-link text 15:1. Computed from the actual oklch tokens (rigorous > screenshot). Lone sub-threshold: the 10px uppercase micro-label (`--fg-3`) at 3.55:1 — pre-existing app-wide label token, NOT the flagged red concern, and the count it labels passes; non-blocking a11y nit. **Residual:** styles.css:1296-1297 still carries the stale `[RENDER-CHECK] pending` comment — flip to "verified PASS" (trivial doc edit; fold into builder-A cleanup or post-build).
+- Post-build drift (plan vs implementation). Then team-auto Stage D (QA). STOP at ship gate.

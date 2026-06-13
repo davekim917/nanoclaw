@@ -266,3 +266,33 @@ export function invalidateScheduledCache(): void {
   scheduledCache.data = null;
   scheduledCache.expiresMs = 0;
 }
+
+// ── Module-owned series registry (the SINGLE source of truth) ────────────────────
+// One definition consumed by BOTH the read assembly (the user-visible badge,
+// scheduled-assembly.ts) and the mutation handlers (the reseed-warning confirm,
+// scheduled-mutations.ts). Lives here in the shared module so neither layer
+// imports the other. Series-id prefix matching + a static map for any
+// non-prefixed module series. Owner is 'memory' — the module lives at
+// src/modules/memory/ (plan C5 ASSERT). Cross-checked against the live fleet
+// (33 series: 10 memory-synth-*, 10 memory-lint-*, 12 task-* operator, 1
+// operator-owned task-…-support-poller; ZERO mnemon-*/support- series — those
+// prefixes are dead and intentionally absent here).
+
+const MODULE_PREFIXES: Array<{ prefix: string; owner: string }> = [
+  { prefix: 'memory-synth-', owner: 'memory' },
+  { prefix: 'memory-lint-', owner: 'memory' },
+];
+
+const MODULE_STATIC: Record<string, string> = {
+  // Static map for any non-prefixed module series. Empty against the current
+  // fleet; extend here if a future module series doesn't carry a known prefix.
+};
+
+export function moduleOwner(seriesId: string): { moduleOwned: boolean; owner?: string } {
+  for (const { prefix, owner } of MODULE_PREFIXES) {
+    if (seriesId.startsWith(prefix)) return { moduleOwned: true, owner };
+  }
+  const staticOwner = MODULE_STATIC[seriesId];
+  if (staticOwner) return { moduleOwned: true, owner: staticOwner };
+  return { moduleOwned: false };
+}

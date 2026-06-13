@@ -42,11 +42,14 @@ import {
   getMessageForRetry,
   getProcessingClaims,
   markMessageFailed,
+  openInboundDb as openInboundDbByPath,
   readSessionRouting,
   retryWithBackoff,
   syncProcessingAcks,
   type ContainerState,
 } from './db/session-db.js';
+import { restoreTaskRow, type TaskRowSnapshot } from './modules/scheduling/db.js';
+import { purgeIntentBody } from './dashboard/api/scheduled-shared.js';
 import { log } from './log.js';
 import {
   openInboundDb,
@@ -239,6 +242,17 @@ async function sweep(): Promise<void> {
   // Prune steer_idempotency rows: applied rows older than 60s, pending rows older than 5min.
   pruneSteerIdempotency();
 
+  // MODULE-HOOK:scheduled-move-recovery — autonomous recovery of unresolved
+  // move intents + 90d audit-body prune. Additive (same pattern as the
+  // recurrence hook); touches only scheduled_audit (central) + the move's own
+  // session inbound rows — no firing-path change (C1).
+  try {
+    recoverMoveIntents(getDb(), {});
+    pruneAuditBodies(getDb(), {});
+  } catch (err) {
+    log.warn('scheduled-move-recovery: sweep hook failed', { err });
+  }
+
   // Reclaim disk from idle session worktrees — only `node_modules` and
   // `.pnpm-store` get removed, and only when no container is bound to the
   // session and its DB files are older than SESSION_ARTIFACT_IDLE_MS.
@@ -271,6 +285,198 @@ async function sweep(): Promise<void> {
   await sweepTaskWatchdog();
 
   setTimeout(sweep, SWEEP_INTERVAL_MS);
+}
+
+// ─── Scheduled-move recovery + audit-body prune (D3 / D4) ─────────────────────
+
+interface MoveRecoveryOptions {
+  /** Sessions root parent; defaults to the real DATA_DIR's parent of v2-sessions. */
+  dataDir?: string;
+  nowMs?: number;
+}
+
+interface MoveIntentSnapshot extends TaskRowSnapshot {
+  // TaskRowSnapshot fields, parsed from the intent's detail_json.
+}
+
+/**
+ * Count live (pending|paused) rows for a series across EVERY session on disk —
+ * a true fleet-wide predicate (F2). A crash BEFORE the move's cancel leaves the
+ * SOURCE live; a crash after a successful target insert leaves the TARGET live.
+ * Either way, if any live row exists the intent is already effectively
+ * resolved and must NOT be restored (a target-only or source-only check would
+ * double-restore). Scans the v2-sessions tree; unreadable DBs count as 0.
+ */
+function countLiveRowsForSeriesFleetWide(sessionsRoot: string, seriesId: string): number {
+  if (!fs.existsSync(sessionsRoot)) return 0;
+  let count = 0;
+  for (const groupDir of fs.readdirSync(sessionsRoot)) {
+    const groupPath = path.join(sessionsRoot, groupDir);
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(groupPath);
+    } catch {
+      continue;
+    }
+    if (!stat.isDirectory()) continue;
+    for (const sessDir of fs.readdirSync(groupPath)) {
+      const inboundPath = path.join(groupPath, sessDir, 'inbound.db');
+      if (!fs.existsSync(inboundPath)) continue;
+      let db: Database.Database | null = null;
+      try {
+        db = openInboundDbByPath(inboundPath);
+        count += (
+          db
+            .prepare(
+              "SELECT COUNT(*) AS c FROM messages_in WHERE series_id = ? AND kind = 'task' AND status IN ('pending','paused')",
+            )
+            .get(seriesId) as { c: number }
+        ).c;
+      } catch {
+        /* unreadable — contributes 0 */
+      } finally {
+        db?.close();
+      }
+    }
+  }
+  return count;
+}
+
+/**
+ * Consume unresolved `move_intent` rows older than one sweep interval (D3).
+ * FLEET-WIDE predicate: if ANY live row exists for the series → stamp
+ * resolved_at + purge the body (the move resolved itself). Otherwise restore
+ * the source row from the intent snapshot — re-checking zero-live-rows
+ * immediately before the insert so a crash between restore and stamp makes the
+ * next pass a no-op (idempotent compensation, M10). Autonomous, not just
+ * observable. Additive — no firing-path change (C1).
+ */
+export function recoverMoveIntents(centralDb: Database.Database, options: MoveRecoveryOptions): void {
+  const nowMs = options.nowMs ?? Date.now();
+  const sessionsRoot = options.dataDir ? path.join(options.dataDir, 'v2-sessions') : sessionsBaseDir();
+
+  let intents: Array<{
+    session_id: string;
+    agent_group_id: string;
+    series_id: string;
+    detail_json: string | null;
+    correlation_id: string | null;
+    ts: string;
+  }>;
+  try {
+    intents = centralDb
+      .prepare(
+        `SELECT session_id, agent_group_id, series_id, detail_json, correlation_id, ts
+           FROM scheduled_audit
+          WHERE action = 'move_intent' AND resolved_at IS NULL`,
+      )
+      .all() as typeof intents;
+  } catch {
+    // Table absent (feature not installed) — nothing to recover.
+    return;
+  }
+
+  for (const intent of intents) {
+    const tsMs = parseSqliteUtc(intent.ts);
+    // Only act on intents older than one sweep interval — the normal in-flight
+    // window is seconds; younger ones are likely still executing.
+    if (Number.isNaN(tsMs) || nowMs - tsMs <= SWEEP_INTERVAL_MS) continue;
+    if (!intent.correlation_id) continue;
+
+    const liveCount = countLiveRowsForSeriesFleetWide(sessionsRoot, intent.series_id);
+    if (liveCount > 0) {
+      // A live row exists somewhere → the move is effectively resolved. Stamp +
+      // purge; never restore (would double the live rows).
+      purgeIntentBody(centralDb, intent.correlation_id);
+      continue;
+    }
+
+    // Zero live rows fleet-wide → restore the source from the snapshot.
+    let snapshot: MoveIntentSnapshot | null = null;
+    try {
+      const detail = intent.detail_json ? (JSON.parse(intent.detail_json) as { snapshot?: MoveIntentSnapshot }) : null;
+      snapshot = detail?.snapshot ?? null;
+    } catch {
+      snapshot = null;
+    }
+    if (!snapshot) {
+      // Body lost (purged but somehow still unresolved) — cannot restore.
+      // Leave it unresolved so the board surfaces it as a repair row.
+      log.warn('scheduled-move-recovery: unresolved intent with no snapshot — manual repair', {
+        seriesId: intent.series_id,
+        correlationId: intent.correlation_id,
+      });
+      continue;
+    }
+
+    const inboundPath = path.join(sessionsRoot, intent.agent_group_id, intent.session_id, 'inbound.db');
+    if (!fs.existsSync(inboundPath)) {
+      log.warn('scheduled-move-recovery: source inbound.db missing — cannot restore', {
+        seriesId: intent.series_id,
+      });
+      continue;
+    }
+    let db: Database.Database | null = null;
+    try {
+      db = openInboundDbByPath(inboundPath);
+      // Idempotency re-check: the restore + the resolved_at stamp span two DB
+      // files (not atomic), so re-confirm zero-live IMMEDIATELY before insert.
+      const stillZero = countLiveRowsForSeriesFleetWide(sessionsRoot, intent.series_id) === 0;
+      if (stillZero) {
+        restoreTaskRow(db, {
+          // Fresh id — the cancelled source row may still hold the snapshot id.
+          id: `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          series_id: snapshot.series_id,
+          status: snapshot.status,
+          process_after: snapshot.process_after,
+          recurrence: snapshot.recurrence,
+          content: snapshot.content,
+          platform_id: snapshot.platform_id,
+          channel_type: snapshot.channel_type,
+          thread_id: snapshot.thread_id,
+          kind: snapshot.kind,
+        });
+      }
+    } catch (err) {
+      log.error('scheduled-move-recovery: restore failed', {
+        seriesId: intent.series_id,
+        err: err instanceof Error ? err.message : String(err),
+      });
+      continue;
+    } finally {
+      db?.close();
+    }
+    // Stamp + purge AFTER the restore (so a crash before this makes the next
+    // pass re-evaluate; now a live row exists → it stamps without re-restoring).
+    purgeIntentBody(centralDb, intent.correlation_id);
+  }
+}
+
+const AUDIT_BODY_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
+
+/**
+ * Prune `scheduled_audit` bodies older than 90 days (D4): NULL the
+ * `before_preview`/`after_preview`/`detail_json` columns ONLY, keeping the
+ * action-metadata row (actor/action/ts/hashes/correlation_id/resolved_at) for
+ * the series' lifetime. This bounds the plaintext footprint while preserving
+ * cancel-vs-completed distinguishability (the `action='cancel'` join, §4.3)
+ * indefinitely. Design §4.4 retention.
+ */
+export function pruneAuditBodies(centralDb: Database.Database, options: { nowMs?: number }): void {
+  const nowMs = options.nowMs ?? Date.now();
+  const cutoff = new Date(nowMs - AUDIT_BODY_RETENTION_MS).toISOString();
+  try {
+    centralDb
+      .prepare(
+        `UPDATE scheduled_audit
+            SET before_preview = NULL, after_preview = NULL, detail_json = NULL
+          WHERE ts < ?
+            AND (before_preview IS NOT NULL OR after_preview IS NOT NULL OR detail_json IS NOT NULL)`,
+      )
+      .run(cutoff);
+  } catch {
+    // Table absent — nothing to prune.
+  }
 }
 
 async function sweepSession(session: Session): Promise<void> {
