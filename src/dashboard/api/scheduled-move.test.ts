@@ -467,4 +467,28 @@ describe('moveExecuteHandler', () => {
     const res = (await moveExecuteHandler(req(moveBody()), { key }, ctxFor('sadmin', scopes)))!;
     expect(res.status).toBe(404);
   });
+
+  it('test_move_unreadable_source_503', async () => {
+    // An in-scope, authorized move whose decoded source :key points at a session
+    // whose inbound.db is unreadable → 503 session_unreadable, fail-closed
+    // BEFORE any cancel/scheduleTask (the guard is pre-cancel, §3a).
+    const { key } = seedMoveFixture({ sourceProcessAfter: isoIn(10 * 3600_000) });
+    // Make the source session's inbound.db unopenable by removing it (the
+    // handler guards on fs.existsSync(sourceInbound)). Everything else — central
+    // DB rows, target MG, wiring — stays valid so we hit the source-unreadable
+    // branch specifically, not an earlier gate.
+    fs.rmSync(path.join(TEST_DIR, 'v2-sessions', 'src-ag', 'src-sess', 'inbound.db'));
+
+    const res = (await moveExecuteHandler(req(moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
+    expect(res.status).toBe(503);
+    expect((await readJson(res)).error).toBe('session_unreadable');
+
+    // Pre-cancel guard: NO side effect occurred — no move_intent audit row was
+    // written, and no target session/row was created.
+    const auditRows = getDb().prepare("SELECT COUNT(*) AS c FROM scheduled_audit WHERE series_id = 'ser-1'").get() as {
+      c: number;
+    };
+    expect(auditRows.c).toBe(0);
+    expect(targetSessionId()).toBeNull();
+  });
 });
