@@ -212,7 +212,14 @@ function nextSlot(cron: string, afterMs: number): string {
 }
 
 /** Validate a cron via the firing-path parser + confirm a finite interval (§4.5). */
-function cronIsValid(cron: string): boolean {
+function cronIsValid(cron: unknown): boolean {
+  // cron-parser ACCEPTS null/undefined/'' (and treats them as "* * * * *" — a
+  // per-minute fire). A falsy cron reaching the firing path turns a series into
+  // a runaway minute loop, so reject non-strings AND empty/whitespace-only here
+  // (the M3 corruption class, extended to the third editable field). The typeof
+  // guard in editHandler already 400s a non-string before this, but keeping the
+  // check here makes the helper safe for any future caller.
+  if (typeof cron !== 'string' || cron.trim() === '') return false;
   try {
     const it = CronExpressionParser.parse(cron, { tz: TIMEZONE });
     it.next();
@@ -233,10 +240,11 @@ const SCRIPT_MAX = 4000;
 
 export const editHandler: AuthHandler = async (req, params, ctx) => {
   const { dataDir, nowMs } = mutationOpts();
-  // prompt/script are `unknown` at the boundary so the M3 type guards below are
-  // meaningful (a non-string from a malformed client body must be rejected, not
-  // narrowed away by the type system and then merged into live content).
-  let body: { prompt?: unknown; script?: unknown; cron?: string };
+  // prompt/script/cron are `unknown` at the boundary so the M3 type guards below
+  // are meaningful (a non-string from a malformed client body must be rejected,
+  // not narrowed away by the type system and then merged into live content or
+  // the recurrence column).
+  let body: { prompt?: unknown; script?: unknown; cron?: unknown };
   try {
     body = (await req.json()) as typeof body;
   } catch {
@@ -250,8 +258,13 @@ export const editHandler: AuthHandler = async (req, params, ctx) => {
   // M3: reject non-string prompt/script BEFORE any length check or write — a
   // non-string would be merged verbatim into the live row's JSON content and
   // corrupt it (the firing path expects content.prompt/script to be strings).
+  // The same class applies to `cron` (the third editable field): a non-string
+  // cron (null/number/object) slips past cronIsValid because cron-parser accepts
+  // null/'' as "* * * * *" → a runaway per-minute fire loop. Reject it here with
+  // the same 400 before any write; cronIsValid below rejects an empty string.
   if (body.prompt !== undefined && typeof body.prompt !== 'string') return json({ error: 'invalid_request' }, 400);
   if (body.script !== undefined && typeof body.script !== 'string') return json({ error: 'invalid_request' }, 400);
+  if (body.cron !== undefined && typeof body.cron !== 'string') return json({ error: 'invalid_request' }, 400);
 
   // Bounds (C8).
   if (body.prompt !== undefined && body.prompt.length > PROMPT_MAX) return json({ error: 'too_long' }, 400);

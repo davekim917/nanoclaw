@@ -426,8 +426,21 @@ export function recoverMoveIntents(centralDb: Database.Database, options: MoveRe
       continue;
     }
     if (live.count > 0) {
-      // A live row exists at source or target → the move is effectively
-      // resolved. Stamp + purge; never restore (would double the live rows).
+      // A live row exists at source or target → the move's row landed; the intent
+      // breadcrumb has done its job. Stamp + purge; never restore (would double the
+      // live rows).
+      if (live.count > 1) {
+        // >1 = a PRE-EXISTING duplicate the move inherited (it didn't create it — the
+        // move's E-2 invariant already returned 500 and refused to claim success).
+        // We resolve the intent WITHOUT auto-deduping: deleting a row the move didn't
+        // own is its own data-loss risk, and leaving it unresolved would reintroduce
+        // the ADV-S2 zombie repair row. The board's duplicate-successor health detector
+        // surfaces the duplicate independently. Log it so it isn't silently swallowed.
+        log.warn(
+          'scheduled-move-recovery: >1 live row for series — pre-existing duplicate, resolving intent without dedup (surfaced via duplicate-successor health)',
+          { seriesId: intent.series_id, correlationId: intent.correlation_id, liveCount: live.count },
+        );
+      }
       purgeIntentBody(centralDb, intent.correlation_id);
       continue;
     }

@@ -235,6 +235,27 @@ describe('editHandler', () => {
     expect((await readJson(res)).error).toBe('bad_cron');
   });
 
+  it('test_edit_cron_empty_or_null_rejected_no_runaway', async () => {
+    // cron-parser 5.5.0 ACCEPTS '' / null / undefined as the wildcard "* * * * *"
+    // (parse does not throw), so a non-string/empty cron would slip past cronIsValid
+    // and write recurrence='' / null verbatim → a runaway per-minute fire loop (the
+    // recurring-task-runaway class). Each of these must be 400 with the live row's
+    // recurrence UNCHANGED. (Empty string → 400 bad_cron via cronIsValid; null/number
+    // → 400 invalid_request via the typeof guard.)
+    insertRow(seedSession().inbound, {
+      id: 'r1',
+      series_id: 'ser-1',
+      recurrence: '0 9 * * *',
+      process_after: isoIn(3600_000),
+    });
+    for (const bad of ['', null, 99, {}, []] as unknown[]) {
+      const res = (await editHandler(putReq({ cron: bad }), { key: keyFor('ser-1') }, ctxFor('owner', OWNER_SCOPES)))!;
+      expect(res.status).toBe(400);
+      // The live recurring row is untouched — no recurrence='' / null written.
+      expect(liveRow('ser-1')!.recurrence).toBe('0 9 * * *');
+    }
+  });
+
   it('test_edit_script_too_long_400', async () => {
     insertRow(seedSession().inbound, { id: 'r1', series_id: 'ser-1' });
     const res = (await editHandler(
@@ -343,6 +364,50 @@ describe('editHandler', () => {
     const traversalKey = Buffer.from('..\\x/sess/series', 'utf8').toString('base64url');
     const res = (await cancelHandler(postReq(), { key: traversalKey }, ctxFor('owner', OWNER_SCOPES)))!;
     expect([400, 404]).toContain(res.status);
+  });
+
+  // ── cron corruption (M3 sibling): a falsy/non-string cron must never reach the
+  // recurrence column. cron-parser accepts null/undefined/'' as "* * * * *" (a
+  // per-minute fire), so an unguarded `{cron:""}` or `{cron:null}` turns a live
+  // series into a runaway minute loop. Each of these MUST 400 with NO mutation.
+  it('test_edit_empty_string_cron_400_no_mutation', async () => {
+    const original = '0 9 * * *';
+    insertRow(seedSession().inbound, { id: 'r1', series_id: 'ser-1', recurrence: original });
+    const res = (await editHandler(putReq({ cron: '' }), { key: keyFor('ser-1') }, ctxFor('owner', OWNER_SCOPES)))!;
+    expect(res.status).toBe(400);
+    // recurrence is UNCHANGED (never '' — '' is IS NOT NULL → firing-path runaway).
+    expect(liveRow('ser-1')!.recurrence).toBe(original);
+    const audit = getDb().prepare("SELECT COUNT(*) AS c FROM scheduled_audit WHERE series_id = 'ser-1'").get() as {
+      c: number;
+    };
+    expect(audit.c).toBe(0);
+  });
+
+  it('test_edit_whitespace_cron_400', async () => {
+    insertRow(seedSession().inbound, { id: 'r1', series_id: 'ser-1', recurrence: '0 9 * * *' });
+    const res = (await editHandler(putReq({ cron: '   ' }), { key: keyFor('ser-1') }, ctxFor('owner', OWNER_SCOPES)))!;
+    expect(res.status).toBe(400);
+    expect(liveRow('ser-1')!.recurrence).toBe('0 9 * * *');
+  });
+
+  it('test_edit_null_cron_400_no_recurrence_clear', async () => {
+    insertRow(seedSession().inbound, { id: 'r1', series_id: 'ser-1', recurrence: '0 9 * * *' });
+    // JSON `{"cron":null}` — must NOT silently clear recurrence (recurring→one-off)
+    // or reschedule. typeof guard → 400 invalid_request, row untouched.
+    const res = (await editHandler(putReq({ cron: null }), { key: keyFor('ser-1') }, ctxFor('owner', OWNER_SCOPES)))!;
+    expect(res.status).toBe(400);
+    expect((await readJson(res)).error).toBe('invalid_request');
+    expect(liveRow('ser-1')!.recurrence).toBe('0 9 * * *');
+  });
+
+  it('test_edit_non_string_cron_400', async () => {
+    insertRow(seedSession().inbound, { id: 'r1', series_id: 'ser-1', recurrence: '0 9 * * *' });
+    for (const bad of [12345, { x: 1 }, ['0 9 * * *']]) {
+      const res = (await editHandler(putReq({ cron: bad }), { key: keyFor('ser-1') }, ctxFor('owner', OWNER_SCOPES)))!;
+      expect(res.status).toBe(400);
+      expect((await readJson(res)).error).toBe('invalid_request');
+      expect(liveRow('ser-1')!.recurrence).toBe('0 9 * * *');
+    }
   });
 });
 

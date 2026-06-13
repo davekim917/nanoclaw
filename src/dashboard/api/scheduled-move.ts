@@ -203,8 +203,11 @@ function readSourceLiveRow(
   sessionId: string,
   seriesId: string,
 ): SourceLiveReadResult {
-  const inboundPath = path.join(dataDir, 'v2-sessions', agentGroupId, sessionId, 'inbound.db');
-  if (!fs.existsSync(inboundPath)) return { unreadable: false, row: null };
+  // Route through the containment-checked chokepoint (security re-QA SUGGESTION) so
+  // the preview READ path has the same traversal backstop as the execute path — a
+  // null (containment failure) is treated as "no live row" (→ no script in preview).
+  const inboundPath = sessionInboundPathFor(dataDir, agentGroupId, sessionId);
+  if (!inboundPath || !fs.existsSync(inboundPath)) return { unreadable: false, row: null };
   let db: Database.Database | null = null;
   try {
     db = new Database(inboundPath, { readonly: true });
