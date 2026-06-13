@@ -8,49 +8,49 @@ constraints:
     text: "Scheduled work remains in per-session inbound.db messages_in rows (recurring = recurrence set; one-offs = future process_after, recurrence NULL); board manages in place via host APIs. No changes to the firing mechanism or the status values it reads."
     source: brief
     verified: true
-    affects_groups: []
+    affects_groups: [A, B, D]
   - id: C2
     type: HARD
     text: "Move = cancel-in-source + scheduleTask()-into-target, two host ops sequenced by the board API. scheduleTask provides fail-closed wiring validation on the insert only; series identity across a move is nominal (shared series_id string, two DBs); pre-move history stays in the source session; post-move invariant: exactly one live row fleet-wide per series."
     source: brief
     verified: true
-    affects_groups: []
+    affects_groups: [D]
   - id: C3
     type: HARD
     text: "Host process is the only writer of session inbound DBs — all board mutations execute in the host process (dashboard API routes)."
     source: CLAUDE.md
     verified: true
-    affects_groups: []
+    affects_groups: [A, B, C, D]
   - id: C4
     type: HARD
     text: "Reuse the existing BoardShell dashboard frame, auth, and API router — Scheduled is a third view. Every mutation handler adds its own per-handler authorization gate (canSteer precedent); requireAuth's read filter alone does not authorize mutation."
     source: brief
     verified: true
-    affects_groups: []
+    affects_groups: [A, B, C, D, E]
   - id: C7
     type: HARD
     text: "Scheduled read API applies the existing per-group dashboard scope filter (disclose-as-not-found). Fleet-wide = all groups the caller is authorized for, not a scope bypass."
     source: brief
     verified: true
-    affects_groups: []
+    affects_groups: [B]
   - id: C5
     type: SOFT
     text: "Current-state read follows scripts/list-scheduled-tasks.ts shape (latest-row-per-series + central join), extended to one-offs; fire history is an additional deliberately-widened capped query (e.g. last 5 fires)."
     source: brief
     verified: true
-    affects_groups: []
+    affects_groups: [B]
   - id: C6
     type: SOFT
     text: "Display both UTC and service-local (systemd unit TZ) next-fire times."
     source: brief
     verified: true
-    affects_groups: []
+    affects_groups: [E]
   - id: C8
     type: SOFT
     text: "Cron edits validate via the firing path's parser and fail closed; prompt/script edits enforce a length bound (steer's 4000-char precedent as reference)."
     source: brief
     verified: false
-    affects_groups: []
+    affects_groups: [C]
 
 decisions:
   - id: D1
@@ -121,7 +121,7 @@ decisions:
       - option: "scoped-admin may mutate within own groups (steer parity)"
         reason: "Steer sends a message; this surface edits prompts and bash scripts that run unattended with scoped credentials. Defer loosening until needed."
     constraint_refs: [C4]
-    affects_groups: []
+    affects_groups: [A, C, D]
   - id: D8
     stage: brief
     description: "Cross-credential-boundary moves (security review MUST-FIX)"
@@ -130,7 +130,7 @@ decisions:
       - option: "Rely on scheduleTask wiring validation alone"
         reason: "Wiring check (scheduled-tasks.ts:155-163) validates output routing only; it is blind to credential scope."
     constraint_refs: [C2]
-    affects_groups: []
+    affects_groups: [D, E]
   - id: D9
     stage: brief
     description: "Thread-scoped loops on the board (Codex review MUST-FIX)"
@@ -161,7 +161,7 @@ assumptions:
       - option: "Synchronous in-handler assembly (rev 1)"
         reason: "better-sqlite3 blocks the shared host event loop — would stall delivery polls and SSE during assembly (perf review MUST-FIX)."
     constraint_refs: [C1, C5]
-    affects_groups: []
+    affects_groups: [B]
   - id: D11
     stage: design
     description: "Mutation API shape"
@@ -199,7 +199,7 @@ assumptions:
       - option: "Delete target on any compensation"
         reason: "Double-failure would leave zero live rows with recurrence cleared everywhere — invisible to every read shape and to getCompletedRecurring."
     constraint_refs: [C2]
-    affects_groups: []
+    affects_groups: [D]
   - id: D15
     stage: design
     description: "Provenance mechanism — brief amendment #1 (operator APPROVED 2026-06-12 with design rev 2)"
@@ -219,7 +219,7 @@ assumptions:
       - option: "Persist a script-gate outcome marker from the container"
         reason: "Touches firing-path write semantics (C1); processing_ack status values are read by host sync."
     constraint_refs: [C1]
-    affects_groups: []
+    affects_groups: [B]
   - id: D17
     stage: design
     description: "Authorization tier for move/preview (security MUST-FIX)"
