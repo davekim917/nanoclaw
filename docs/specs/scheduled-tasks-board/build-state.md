@@ -86,4 +86,11 @@ list `{rows, counts, degraded, assembled_at}`; ScheduledRow fields: key, series_
 - **Render-check §3c** PASS (computed WCAG; styles.css comment flipped to verified). builder-A also fixed a real D2 restoreTaskRow PK-collision bug.
 - **Post-build drift: PASS** (`post-build-drift.md`) — Claude+Codex independent, **122 CONFIRMED / 3 PARTIAL / 0 DIVERGED / 0 MISSING**; both models converged on the same 3 PARTIALs (none blocking). Every load-bearing ASSERT traced to enforcing code; rejected options (D10 materialized table, D14 insert-first) confirmed absent.
   - P1 (move 503-on-unreadable: code correct, no dedicated test) → directed builder-A to add `test_move_unreadable_source_503` (only actionable item). P2 (mnemon-static-map test) ACCEPT correct-as-built. P3 (E3 search list-fields-not-prompt) ACCEPT — plan-vs-design tension, impl follows design; flag to Dave at ship gate.
-- **NOW:** awaiting P1 test → validate+commit → Stage D QA (`/team-qa`) → STOP at ship gate (no merge/push/deploy without Dave).
+- P1 test added + committed (`bcbbe408`).
+
+## ⚠️ Stage D QA — COMPLETE, found 6 MUST-FIX → fix pass IN PROGRESS (operator approved "go")
+- **QA report:** `qa-report.md`. Denoise CLEAN; Style 1 SHOULD+2 ADV; Doc 1 SHOULD (fixed B-1); review-swarm (4 reviewers: adversarial/domain/security/concurrency) 4 BUG+17 SUGG; Codex 4 (2 after reconciliation). All reviewers reconciled, zero cross-lane contradictions.
+- **6 MUST-FIX:** M1 recovery bare-series_id over-count→cross-group loss; M2 fleet-count swallow-read→undercount→double-row; M3 editHandler non-string→live-content corruption; M4 decodeKey path-traversal; M5/M6 group-filter server-side no-op + test.
+- **Reconciliation wins:** Codex E-2 (cancel-race) REFUTED by tracing the synchronous read→cancel span (downgraded to SHOULD-FIX defensive); CONC-BUG (swallow→double-row) UPGRADED to MUST-FIX. S7 = lead's own NUL→space directive regression.
+- **Fix pass:** spec at `qa-fixes.md`; single builder `fixer` (agentId ab06f310...) doing 6 MUST-FIX + 6 high-value SHOULD-FIX (E-2/E-3/E-4/S7/ADV-S1/ADV-S2) + A-1, TDD. Deferred: cosmetic ADVISORY (A-2/A-3/B-2/S1-S6/CONC-S1/S3/S4/ADV-S4).
+- **NEXT:** lead validates fixer's output (re-read delicate move/recovery code + run gates) → commit → re-run `/team-qa --only swarm,codex` on the move/recovery diff → **ship gate** (no merge/push/deploy without Dave).

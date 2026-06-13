@@ -29,7 +29,14 @@ import { log } from '../../log.js';
 import { emitDashboardEvent } from './events.js';
 import { verbVerdict, type HealthState, type SeriesKind } from './scheduled-board-matrix.js';
 import type { AuthHandler, AuthedRequestContext } from '../router.js';
-import { canManageScheduled, decodeKey, invalidateScheduledCache, rateLimit, writeAudit } from './scheduled-shared.js';
+import {
+  canManageScheduled,
+  decodeKey,
+  invalidateScheduledCache,
+  rateLimit,
+  sessionInboundPathFor,
+  writeAudit,
+} from './scheduled-shared.js';
 
 // `moduleOwner` (the single canonical module-owned registry) lives in
 // scheduled-shared.ts; the read assembly + tests import it directly from there.
@@ -104,8 +111,13 @@ function resolveTarget(
     return { error: json({ error: 'not_found' }, 404) };
   }
 
-  const inboundPath = path.join(dataDir, 'v2-sessions', decoded.agentGroupId, decoded.sessionId, 'inbound.db');
-  const outboundPath = path.join(dataDir, 'v2-sessions', decoded.agentGroupId, decoded.sessionId, 'outbound.db');
+  // M4: build the inbound path through the containment-checked helper. A null
+  // (containment violation — decodeKey already rejects traversal, this is
+  // defense in depth) collapses to 404 disclose-as-not-found, never an open
+  // outside data/v2-sessions.
+  const inboundPath = sessionInboundPathFor(dataDir, decoded.agentGroupId, decoded.sessionId);
+  if (!inboundPath) return { error: json({ error: 'not_found' }, 404) };
+  const outboundPath = path.join(path.dirname(inboundPath), 'outbound.db');
   // Unreadable / missing session inbound → 503 fail-closed (§3a).
   if (!fs.existsSync(inboundPath))
     return { error: json({ error: 'session_unreadable', reason: 'session_unreadable' }, 503) };
@@ -221,7 +233,10 @@ const SCRIPT_MAX = 4000;
 
 export const editHandler: AuthHandler = async (req, params, ctx) => {
   const { dataDir, nowMs } = mutationOpts();
-  let body: { prompt?: string; script?: string; cron?: string };
+  // prompt/script are `unknown` at the boundary so the M3 type guards below are
+  // meaningful (a non-string from a malformed client body must be rejected, not
+  // narrowed away by the type system and then merged into live content).
+  let body: { prompt?: unknown; script?: unknown; cron?: string };
   try {
     body = (await req.json()) as typeof body;
   } catch {
@@ -231,6 +246,12 @@ export const editHandler: AuthHandler = async (req, params, ctx) => {
   const r = resolveTarget(params['key'] ?? '', ctx, nowMs, dataDir);
   if ('error' in r) return r.error;
   const t = r.ok;
+
+  // M3: reject non-string prompt/script BEFORE any length check or write — a
+  // non-string would be merged verbatim into the live row's JSON content and
+  // corrupt it (the firing path expects content.prompt/script to be strings).
+  if (body.prompt !== undefined && typeof body.prompt !== 'string') return json({ error: 'invalid_request' }, 400);
+  if (body.script !== undefined && typeof body.script !== 'string') return json({ error: 'invalid_request' }, 400);
 
   // Bounds (C8).
   if (body.prompt !== undefined && body.prompt.length > PROMPT_MAX) return json({ error: 'too_long' }, 400);
@@ -439,7 +460,9 @@ export const cancelHandler: AuthHandler = async (_req, params, ctx) => {
     return json({ error: 'not_found' }, 404);
   }
 
-  const inboundPath = path.join(dataDir, 'v2-sessions', decoded.agentGroupId, decoded.sessionId, 'inbound.db');
+  // M4: containment-checked open (null → 404 disclose-as-not-found).
+  const inboundPath = sessionInboundPathFor(dataDir, decoded.agentGroupId, decoded.sessionId);
+  if (!inboundPath) return json({ error: 'not_found' }, 404);
   if (!fs.existsSync(inboundPath)) return json({ error: 'session_unreadable', reason: 'session_unreadable' }, 503);
 
   let touched = 0;

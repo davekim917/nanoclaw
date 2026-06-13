@@ -1307,7 +1307,22 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
   function centralDb(): Database.Database {
     const db = new Database(':memory:');
     migration043.up(db);
+    // Recovery resolves the target channel-root session id from `sessions`
+    // (M1 scoped count); provide the table so the lookup is exercised, not a
+    // missing-table fallback.
+    db.exec(`
+      CREATE TABLE sessions (
+        id TEXT PRIMARY KEY, agent_group_id TEXT NOT NULL, messaging_group_id TEXT,
+        thread_id TEXT, status TEXT DEFAULT 'active', created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+    `);
     return db;
+  }
+
+  function addTargetSession(db: Database.Database, id: string, ag: string, mg: string): void {
+    db.prepare(
+      "INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, status) VALUES (?, ?, ?, NULL, 'active')",
+    ).run(id, ag, mg);
   }
 
   function seedInbound(agentGroupId: string, sessionId: string): string {
@@ -1330,7 +1345,16 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
 
   function writeIntent(
     db: Database.Database,
-    opts: { seriesId: string; ag: string; sess: string; tsMs: number; snapshot?: object },
+    opts: {
+      seriesId: string;
+      ag: string;
+      sess: string;
+      tsMs: number;
+      snapshot?: object | null;
+      noSnapshot?: boolean;
+      targetAgentGroupId?: string;
+      targetMessagingGroupId?: string;
+    },
   ): void {
     const snapshot = opts.snapshot ?? {
       id: `orig-${opts.seriesId}`,
@@ -1344,6 +1368,9 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
       thread_id: null,
       kind: 'task',
     };
+    const detail: Record<string, unknown> = opts.noSnapshot ? {} : { snapshot };
+    if (opts.targetAgentGroupId) detail.targetAgentGroupId = opts.targetAgentGroupId;
+    if (opts.targetMessagingGroupId) detail.targetMessagingGroupId = opts.targetMessagingGroupId;
     db.prepare(
       `INSERT INTO scheduled_audit (ts, actor, action, agent_group_id, session_id, series_id, detail_json, correlation_id)
        VALUES (?, 'owner', 'move_intent', ?, ?, ?, ?, ?)`,
@@ -1352,7 +1379,7 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
       opts.ag,
       opts.sess,
       opts.seriesId,
-      JSON.stringify({ snapshot }),
+      opts.noSnapshot ? null : JSON.stringify(detail),
       `corr-${opts.seriesId}`,
     );
   }
@@ -1427,6 +1454,120 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
       resolved_at: string | null;
     };
     expect(row.resolved_at).toBeNull(); // too young — left alone
+    db.close();
+  });
+
+  // ── M1: scoped {source,target} count — an UNRELATED group's same series_id ─────
+  // must NOT cause a false resolve. The crashed source still gets restored.
+  it('test_recover_scoped_count_ignores_unrelated_group', () => {
+    const db = centralDb();
+    // Source session is EMPTY (crashed post-cancel, before the target insert).
+    const srcInbound = seedInbound('src-ag', 'src-sess');
+    // Target session exists but has NO live row (insert never landed).
+    seedInbound('tgt-ag', 'tgt-sess');
+    addTargetSession(db, 'tgt-sess', 'tgt-ag', 'tgt-mg');
+    // An UNRELATED group has a live row reusing the SAME series_id — the exact
+    // condition the bare-series_id fleet scan over-counted (M1 false-resolve).
+    const unrelated = seedInbound('other-ag', 'other-sess');
+    insertLive(unrelated, 'ser-scoped');
+
+    writeIntent(db, {
+      seriesId: 'ser-scoped',
+      ag: 'src-ag',
+      sess: 'src-sess',
+      tsMs: NOW - 2 * SWEEP_MS,
+      targetAgentGroupId: 'tgt-ag',
+      targetMessagingGroupId: 'tgt-mg',
+    });
+
+    recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW });
+
+    // The scoped {source,target} count is 0 → the crashed source IS restored,
+    // the unrelated group's row is ignored.
+    const restored = openInboundDb(srcInbound)
+      .prepare("SELECT COUNT(*) AS c FROM messages_in WHERE series_id='ser-scoped' AND status IN ('pending','paused')")
+      .get() as { c: number };
+    expect(restored.c).toBe(1);
+    const row = db
+      .prepare("SELECT resolved_at FROM scheduled_audit WHERE correlation_id = 'corr-ser-scoped'")
+      .get() as { resolved_at: string | null };
+    expect(row.resolved_at).toBeTruthy(); // resolved after restore
+    db.close();
+  });
+
+  it('test_recover_scoped_count_stamps_when_target_has_live_row', () => {
+    // The move SUCCEEDED (target has the live row) but the intent was never
+    // stamped (crash after insert). Scoped count sees the target row → stamp, do
+    // NOT restore the source (would double the live rows).
+    const db = centralDb();
+    const srcInbound = seedInbound('src-ag', 'src-sess'); // empty source
+    const tgtInbound = seedInbound('tgt-ag', 'tgt-sess');
+    addTargetSession(db, 'tgt-sess', 'tgt-ag', 'tgt-mg');
+    insertLive(tgtInbound, 'ser-tgt'); // target carries the live row
+
+    writeIntent(db, {
+      seriesId: 'ser-tgt',
+      ag: 'src-ag',
+      sess: 'src-sess',
+      tsMs: NOW - 2 * SWEEP_MS,
+      targetAgentGroupId: 'tgt-ag',
+      targetMessagingGroupId: 'tgt-mg',
+    });
+
+    recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW });
+
+    // Source NOT restored (the target's live row is the one live row).
+    const srcCount = openInboundDb(srcInbound)
+      .prepare("SELECT COUNT(*) AS c FROM messages_in WHERE series_id='ser-tgt' AND status IN ('pending','paused')")
+      .get() as { c: number };
+    expect(srcCount.c).toBe(0);
+    const row = db.prepare("SELECT resolved_at FROM scheduled_audit WHERE correlation_id = 'corr-ser-tgt'").get() as {
+      resolved_at: string | null;
+    };
+    expect(row.resolved_at).toBeTruthy();
+    db.close();
+  });
+
+  // ── ADV-S2: a dangling unrecoverable intent must resolve (no permanent zombie) ─
+  it('test_recover_no_snapshot_resolves_intent', () => {
+    const db = centralDb();
+    seedInbound('src-ag', 'src-sess');
+    // Intent with NO snapshot body (purged-but-still-unresolved) → unrecoverable,
+    // but it must NOT surface forever as a repair row: stamp resolved_at.
+    writeIntent(db, {
+      seriesId: 'ser-nosnap',
+      ag: 'src-ag',
+      sess: 'src-sess',
+      tsMs: NOW - 2 * SWEEP_MS,
+      noSnapshot: true,
+    });
+
+    recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW });
+
+    const row = db
+      .prepare("SELECT resolved_at FROM scheduled_audit WHERE correlation_id = 'corr-ser-nosnap'")
+      .get() as { resolved_at: string | null };
+    expect(row.resolved_at).toBeTruthy(); // resolved — no permanent zombie
+    db.close();
+  });
+
+  it('test_recover_source_dir_missing_resolves_intent', () => {
+    const db = centralDb();
+    // No source inbound.db on disk at all → cannot restore, but must resolve so
+    // it does not surface as an unclearable stalled repair row forever.
+    writeIntent(db, {
+      seriesId: 'ser-nodir',
+      ag: 'gone-ag',
+      sess: 'gone-sess',
+      tsMs: NOW - 2 * SWEEP_MS,
+    });
+
+    recoverMoveIntents(db, { dataDir: DIR, nowMs: NOW });
+
+    const row = db.prepare("SELECT resolved_at FROM scheduled_audit WHERE correlation_id = 'corr-ser-nodir'").get() as {
+      resolved_at: string | null;
+    };
+    expect(row.resolved_at).toBeTruthy(); // resolved — no permanent zombie
     db.close();
   });
 

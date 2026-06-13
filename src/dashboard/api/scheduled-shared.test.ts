@@ -9,6 +9,8 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 
 import { initTestDb, closeDb, getDb } from '../../db/connection.js';
 import { migration043 } from '../../db/migrations/043-scheduled-audit.js';
+import path from 'path';
+
 import {
   canManageScheduled,
   writeAudit,
@@ -16,6 +18,7 @@ import {
   rateLimit,
   encodeKey,
   decodeKey,
+  sessionInboundPathFor,
   getScheduledCache,
   invalidateScheduledCache,
   _resetScheduledRateLimitForTesting,
@@ -290,6 +293,46 @@ describe('encodeKey / decodeKey', () => {
     // base64url of "only-one-segment" with no separators.
     const bad = Buffer.from('only-one-segment').toString('base64url');
     expect(decodeKey(bad)).toBeNull();
+  });
+
+  // ── M4: path-traversal segment rejection ─────────────────────────────────────
+  it('test_decodekey_rejects_dotdot_traversal', () => {
+    // base64url of "../../x/series" → a traversal-laden agentGroupId/sessionId.
+    const key = Buffer.from('../../x/series', 'utf8').toString('base64url');
+    expect(decodeKey(key)).toBeNull();
+  });
+
+  it('rejects a "." or ".." segment in any position', () => {
+    expect(decodeKey(Buffer.from('./sess/series', 'utf8').toString('base64url'))).toBeNull();
+    expect(decodeKey(Buffer.from('ag/../series', 'utf8').toString('base64url'))).toBeNull();
+    expect(decodeKey(Buffer.from('ag/sess/..', 'utf8').toString('base64url'))).toBeNull();
+  });
+
+  it('rejects a backslash or NUL char in a segment', () => {
+    expect(decodeKey(Buffer.from('ag\\x/sess/series', 'utf8').toString('base64url'))).toBeNull();
+    expect(decodeKey(Buffer.from('ag/se\x00ss/series', 'utf8').toString('base64url'))).toBeNull();
+  });
+
+  it('still accepts a clean three-segment key (no traversal)', () => {
+    const decoded = decodeKey(encodeKey('ag-1', 'sess-2', 'series-3'));
+    expect(decoded).toEqual({ agentGroupId: 'ag-1', sessionId: 'sess-2', seriesId: 'series-3' });
+  });
+});
+
+// ── M4: containment-checked open helper ─────────────────────────────────────────
+describe('sessionInboundPathFor', () => {
+  const BASE = '/tmp/nc-base-dir';
+
+  it('builds the canonical inbound.db path for a clean locator', () => {
+    const p = sessionInboundPathFor(BASE, 'ag-1', 'sess-1');
+    expect(p).toBe(path.join(BASE, 'v2-sessions', 'ag-1', 'sess-1', 'inbound.db'));
+  });
+
+  it('test_session_path_rejects_traversal_escape', () => {
+    // A segment that would escape the v2-sessions base → null (containment).
+    expect(sessionInboundPathFor(BASE, '..', 'sess-1')).toBeNull();
+    expect(sessionInboundPathFor(BASE, 'ag-1', '../../etc')).toBeNull();
+    expect(sessionInboundPathFor(BASE, '../../../etc', 'passwd')).toBeNull();
   });
 });
 

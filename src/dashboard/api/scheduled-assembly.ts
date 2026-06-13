@@ -74,6 +74,13 @@ export interface ScheduledSnapshot {
   rows: ScheduledRow[];
   degraded: boolean;
   counts: Record<string, number>;
+  /**
+   * Per-agent_group unreadable session count (E-3). The fleet-wide
+   * `counts.unreadable` is a fleet assembly-health signal; a SCOPED caller must
+   * see only its own groups' unreadable count, so the read handler sums this map
+   * over the caller's in-scope groups rather than reusing the fleet total.
+   */
+  unreadable_by_group: Record<string, number>;
   assembled_at: string;
 }
 
@@ -269,7 +276,11 @@ function channelNameOf(
   platformId: string | null,
 ): string | null {
   if (!channelType || !platformId) return null;
-  return mgByDest.get(`${channelType} ${platformId}`) ?? null;
+  // S7: NUL (\0) separator — channel_type + platform_id are operator-controlled
+  // and could collide under a printable separator ("a"+"b c" vs "a b"+"c"), but
+  // \0 can appear in neither. The build sites (doAssemble + buildDetailRow) must
+  // use the byte-identical key or the join silently returns null.
+  return mgByDest.get(`${channelType}\0${platformId}`) ?? null;
 }
 
 interface OutboundView {
@@ -507,11 +518,11 @@ export function buildDetailRow(
   const ag = central.prepare('SELECT name, agent_provider FROM agent_groups WHERE id = ?').get(agentGroupId) as
     | { name: string; agent_provider: string | null }
     | undefined;
-  // Key MUST match channelNameOf's lookup format. channelNameOf is the shared
-  // getter for BOTH the list and detail paths, and it (plus doAssemble's
-  // list-path map) keys on a NUL separator — channel_type and platform_id are
-  // operator-controlled and could collide under a printable separator, but \0
-  // cannot appear in either. All three sites must agree or the join silently
+  // Key MUST match channelNameOf's lookup format (S7). channelNameOf is the
+  // shared getter for BOTH the list and detail paths, and it (plus doAssemble's
+  // list-path map) keys on a NUL (\0) separator — channel_type and platform_id
+  // are operator-controlled and could collide under a printable separator, but
+  // \0 cannot appear in either. All three sites must agree or the join silently
   // returns null.
   const mgByDest = new Map<string, string>();
   for (const m of central.prepare('SELECT channel_type, platform_id, name FROM messaging_groups').all() as Array<{
@@ -519,7 +530,7 @@ export function buildDetailRow(
     platform_id: string;
     name: string | null;
   }>) {
-    if (m.name) mgByDest.set(`${m.channel_type} ${m.platform_id}`, m.name);
+    if (m.name) mgByDest.set(`${m.channel_type}\0${m.platform_id}`, m.name);
   }
 
   const desc: SessionDescriptor = {
@@ -635,7 +646,10 @@ async function doAssemble(scopes: AuthScopes, options: ScheduledAssemblyOptions)
         platform_id: string;
         name: string | null;
       }>
-    ).map((m) => [`${m.channel_type} ${m.platform_id}`, m.name ?? '']),
+    )
+      // S7: NUL (\0) key — byte-identical to channelNameOf's lookup + buildDetailRow's
+      // build map (collision-safe; channel_type/platform_id can't contain \0).
+      .map((m) => [`${m.channel_type}\0${m.platform_id}`, m.name ?? '']),
   );
 
   // Enumerate authorized sessions (scope filter — C7).
@@ -643,7 +657,13 @@ async function doAssemble(scopes: AuthScopes, options: ScheduledAssemblyOptions)
   const sessionParams: unknown[] = [];
   if (!scopes.no_filter) {
     if (scopes.allowed_group_ids.length === 0) {
-      return { rows: [], degraded: false, counts: { ...EMPTY_COUNTS }, assembled_at: new Date(nowMs).toISOString() };
+      return {
+        rows: [],
+        degraded: false,
+        counts: { ...EMPTY_COUNTS },
+        unreadable_by_group: {},
+        assembled_at: new Date(nowMs).toISOString(),
+      };
     }
     sessionSql += ` AND agent_group_id IN (${scopes.allowed_group_ids.map(() => '?').join(', ')})`;
     sessionParams.push(...scopes.allowed_group_ids);
@@ -655,6 +675,8 @@ async function doAssemble(scopes: AuthScopes, options: ScheduledAssemblyOptions)
 
   const rows: ScheduledRow[] = [];
   const counts: Record<string, number> = { ...EMPTY_COUNTS };
+  // E-3: per-group unreadable buckets so a scoped caller can sum only its own.
+  const unreadableByGroup: Record<string, number> = {};
 
   for (const s of sessionRows) {
     await yieldTick(); // one session per event-loop tick — never one block (§4.9)
@@ -671,6 +693,9 @@ async function doAssemble(scopes: AuthScopes, options: ScheduledAssemblyOptions)
       countRow(counts, r);
     }
     counts.unreadable += res.unreadable;
+    if (res.unreadable > 0) {
+      unreadableByGroup[s.agent_group_id] = (unreadableByGroup[s.agent_group_id] ?? 0) + res.unreadable;
+    }
   }
 
   const elapsed = Date.now() - startedAt;
@@ -692,6 +717,7 @@ async function doAssemble(scopes: AuthScopes, options: ScheduledAssemblyOptions)
     rows,
     degraded,
     counts,
+    unreadable_by_group: unreadableByGroup,
     assembled_at: new Date(nowMs).toISOString(),
   };
 

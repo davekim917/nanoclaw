@@ -294,6 +294,56 @@ describe('editHandler', () => {
       (await editHandler(putReq({ prompt: 'x' }), { key: '@@bad@@' }, ctxFor('owner', OWNER_SCOPES)))!.status,
     ).toBe(400);
   });
+
+  // ── M3: reject non-string prompt/script (live-content corruption) ─────────────
+  it('test_edit_non_string_prompt_400_no_mutation', async () => {
+    const original = JSON.stringify({ prompt: 'old prompt', script: 'echo old' });
+    insertRow(seedSession().inbound, { id: 'r1', series_id: 'ser-1', content: original });
+    const res = (await editHandler(
+      putReq({ prompt: 99999 }),
+      { key: keyFor('ser-1') },
+      ctxFor('owner', OWNER_SCOPES),
+    ))!;
+    expect(res.status).toBe(400);
+    expect((await readJson(res)).error).toBe('invalid_request');
+    // The live row's content is UNCHANGED.
+    expect(liveRow('ser-1')!.content).toBe(original);
+    // No audit row was written.
+    const audit = getDb().prepare("SELECT COUNT(*) AS c FROM scheduled_audit WHERE series_id = 'ser-1'").get() as {
+      c: number;
+    };
+    expect(audit.c).toBe(0);
+  });
+
+  it('test_edit_non_string_script_400', async () => {
+    const original = JSON.stringify({ prompt: 'old', script: 'echo old' });
+    insertRow(seedSession().inbound, { id: 'r1', series_id: 'ser-1', content: original });
+    const res = (await editHandler(
+      putReq({ script: { x: 1 } }),
+      { key: keyFor('ser-1') },
+      ctxFor('owner', OWNER_SCOPES),
+    ))!;
+    expect(res.status).toBe(400);
+    expect((await readJson(res)).error).toBe('invalid_request');
+    expect(liveRow('ser-1')!.content).toBe(original);
+  });
+
+  // ── M4: a traversal :key never opens a file outside data/v2-sessions ──────────
+  it('test_edit_traversal_key_rejected', async () => {
+    insertRow(seedSession().inbound, { id: 'r1', series_id: 'ser-1' });
+    // A base64url key whose decoded agentGroupId is '..' → decodeKey rejects it
+    // (M4) → 400 bad_key, never an open outside the session tree.
+    const traversalKey = Buffer.from('../../etc/passwd', 'utf8').toString('base64url');
+    const res = (await editHandler(putReq({ prompt: 'x' }), { key: traversalKey }, ctxFor('owner', OWNER_SCOPES)))!;
+    expect([400, 404]).toContain(res.status);
+  });
+
+  it('test_cancel_traversal_key_rejected', async () => {
+    seedSession();
+    const traversalKey = Buffer.from('..\\x/sess/series', 'utf8').toString('base64url');
+    const res = (await cancelHandler(postReq(), { key: traversalKey }, ctxFor('owner', OWNER_SCOPES)))!;
+    expect([400, 404]).toContain(res.status);
+  });
 });
 
 // ── C2: pause / resume ────────────────────────────────────────────────────────

@@ -7,6 +7,7 @@
  * See docs/specs/scheduled-tasks-board/design.md §3a, §4.4, §4.5.
  */
 import { createHash } from 'crypto';
+import path from 'path';
 
 import type Database from 'better-sqlite3';
 
@@ -232,7 +233,38 @@ export function decodeKey(key: string): { agentGroupId: string; sessionId: strin
   const sessionId = decoded.slice(first + 1, second);
   const seriesId = decoded.slice(second + 1);
   if (!agentGroupId || !sessionId || !seriesId) return null;
+  // M4: reject path-traversal segments. agentGroupId and sessionId are the two
+  // segments used to BUILD a filesystem path (v2-sessions/<ag>/<sess>/inbound.db);
+  // a '.', '..', separator, or NUL char in either would let a crafted :key
+  // escape the session tree. They can never contain a raw '/' (the codec split
+  // on '/'), but a '\' or NUL still must be rejected.
+  for (const seg of [agentGroupId, sessionId]) {
+    if (seg === '.' || seg === '..') return null;
+    if (seg.includes('\\') || seg.includes('\0')) return null;
+  }
+  // seriesId is ALWAYS used as a bound SQL parameter (series_id = ?), never as a
+  // path component, so an internal '/' is a supported, harmless case (the codec
+  // round-trips it). Still reject the structurally-invalid '.'/'..' whole-segment
+  // and a NUL char.
+  if (seriesId === '.' || seriesId === '..' || seriesId.includes('\0')) return null;
   return { agentGroupId, sessionId, seriesId };
+}
+
+/**
+ * Build the canonical inbound.db path for a session locator, with a
+ * canonicalize + containment check (M4). Returns the absolute path ONLY if it
+ * resolves to exactly `<dataDir>/v2-sessions/<agentGroupId>/<sessionId>/inbound.db`
+ * AND stays strictly inside the v2-sessions base — otherwise null. This is the
+ * single hardened open-site for every scheduled-board handler that opens a
+ * session inbound.db from a decoded :key (defense in depth: decodeKey already
+ * rejects traversal segments, but routing every open through here means a future
+ * caller that forgets the codec guard still cannot escape the base).
+ */
+export function sessionInboundPathFor(dataDir: string, agentGroupId: string, sessionId: string): string | null {
+  const base = path.resolve(dataDir, 'v2-sessions');
+  const p = path.resolve(base, agentGroupId, sessionId, 'inbound.db');
+  const expected = path.join(base, agentGroupId, sessionId, 'inbound.db');
+  return p === expected && p.startsWith(base + path.sep) ? p : null;
 }
 
 // ── Read-cache singleton ──────────────────────────────────────────────────────

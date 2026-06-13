@@ -148,8 +148,8 @@ function ctxFor(userId: string, scopes: AuthedRequestContext['scopes']): AuthedR
 
 const OWNER_SCOPES = { role: 'owner' as const, allowed_group_ids: [], no_filter: true };
 
-function listReq(): Request {
-  return new Request('http://x/dashboard/api/scheduled');
+function listReq(query?: string): Request {
+  return new Request(`http://x/dashboard/api/scheduled${query ? `?${query}` : ''}`);
 }
 async function readJson(res: Response): Promise<Record<string, unknown>> {
   return (await res.json()) as Record<string, unknown>;
@@ -234,6 +234,64 @@ describe('scheduledListHandler', () => {
     expect(body.counts).toBeDefined();
     expect(body.degraded).toBe(false);
     expect(body.assembled_at).toBeTruthy();
+  });
+
+  // ── M5/M6: server-side group filter ────────────────────────────────────────
+  it('test_list_group_filter_owner_scopes_to_group', async () => {
+    addGroup('ag-1', 'G1');
+    addGroup('ag-2', 'G2');
+    addMg('mg-1', 'discord', 'd:1', 'chan-1');
+    addSession('s1', 'ag-1', 'mg-1');
+    addSession('s2', 'ag-2', 'mg-1');
+    insertRow(seedSession('ag-1', 's1').inbound, { id: 'r1' });
+    insertRow(seedSession('ag-2', 's2').inbound, { id: 'r2' });
+    addUser('owner');
+    grant('owner', 'owner', null);
+
+    // A no_filter owner with ?group_id=ag-1 → only ag-1 rows (not the whole fleet).
+    const res = (await scheduledListHandler(listReq('group_id=ag-1'), {}, ctxFor('owner', OWNER_SCOPES)))!;
+    const body = await readJson(res);
+    const rows = body.rows as Array<{ agent_group_id: string }>;
+    expect(rows.length).toBeGreaterThan(0);
+    expect(rows.every((r) => r.agent_group_id === 'ag-1')).toBe(true);
+  });
+
+  it('test_list_group_filter_nonexistent_empty', async () => {
+    addGroup('ag-1', 'G1');
+    addMg('mg-1', 'discord', 'd:1', 'chan-1');
+    addSession('s1', 'ag-1', 'mg-1');
+    insertRow(seedSession('ag-1', 's1').inbound, { id: 'r1' });
+    addUser('owner');
+    grant('owner', 'owner', null);
+
+    // An out-of-scope / nonexistent group_id yields an empty list (NOT an error).
+    const res = (await scheduledListHandler(listReq('group_id=does-not-exist'), {}, ctxFor('owner', OWNER_SCOPES)))!;
+    expect(res.status).toBe(200);
+    const body = await readJson(res);
+    expect((body.rows as unknown[]).length).toBe(0);
+  });
+
+  // ── E-3: scoped caller's unreadable count is in-scope-only (not fleet-wide) ────
+  it('test_list_unreadable_count_scoped', async () => {
+    addGroup('ag-1', 'G1');
+    addGroup('ag-2', 'G2');
+    addMg('mg-1', 'discord', 'd:1', 'chan-1');
+    addSession('s1', 'ag-1', 'mg-1');
+    addSession('s2', 'ag-2', 'mg-1');
+    // BOTH sessions have a corrupt inbound.db → each contributes 1 unreadable.
+    fs.mkdirSync(path.join(TEST_DIR, 'v2-sessions', 'ag-1', 's1'), { recursive: true });
+    fs.writeFileSync(path.join(TEST_DIR, 'v2-sessions', 'ag-1', 's1', 'inbound.db'), 'not sqlite');
+    fs.mkdirSync(path.join(TEST_DIR, 'v2-sessions', 'ag-2', 's2'), { recursive: true });
+    fs.writeFileSync(path.join(TEST_DIR, 'v2-sessions', 'ag-2', 's2', 'inbound.db'), 'not sqlite');
+    addUser('sadmin');
+    grant('sadmin', 'admin', 'ag-1');
+
+    const scopes = { role: 'admin_of_group' as const, allowed_group_ids: ['ag-1'], no_filter: false };
+    const res = (await scheduledListHandler(listReq(), {}, ctxFor('sadmin', scopes)))!;
+    const body = await readJson(res);
+    const counts = body.counts as Record<string, number>;
+    // Only ag-1's unreadable session counts for this caller — NOT the fleet's 2.
+    expect(counts.unreadable).toBe(1);
   });
 
   it('test_list_surfaces_unresolved_repair_row', async () => {
@@ -379,6 +437,17 @@ describe('scheduledDetailHandler', () => {
     grant('owner', 'owner', null);
     const res = (await scheduledDetailHandler(detailReq(), { key: '@@bad@@' }, ctxFor('owner', OWNER_SCOPES)))!;
     expect(res.status).toBe(400);
+  });
+
+  // ── M4: a traversal :key never opens a file outside data/v2-sessions ──────────
+  it('test_detail_traversal_key_404', async () => {
+    addUser('owner');
+    grant('owner', 'owner', null);
+    // decodeKey rejects the '..' agentGroupId segment → 400 bad_key; either way,
+    // never an open outside the session tree.
+    const traversalKey = Buffer.from('../../etc/passwd', 'utf8').toString('base64url');
+    const res = (await scheduledDetailHandler(detailReq(), { key: traversalKey }, ctxFor('owner', OWNER_SCOPES)))!;
+    expect([400, 404]).toContain(res.status);
   });
 
   it('returns a COMPLETE ScheduledRow the drawer can consume (available_verbs/health/joins)', async () => {

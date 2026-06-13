@@ -49,6 +49,7 @@ import {
   type ContainerState,
 } from './db/session-db.js';
 import { restoreTaskRow, type TaskRowSnapshot } from './modules/scheduling/db.js';
+import { countLiveRowsInSessions } from './modules/scheduling/live-count.js';
 import { purgeIntentBody } from './dashboard/api/scheduled-shared.js';
 import { log } from './log.js';
 import {
@@ -295,64 +296,83 @@ interface MoveRecoveryOptions {
   nowMs?: number;
 }
 
-interface MoveIntentSnapshot extends TaskRowSnapshot {
-  // TaskRowSnapshot fields, parsed from the intent's detail_json.
-}
+// TaskRowSnapshot fields, parsed from the intent's detail_json (A-1: a type
+// alias, not an empty-extends interface — clears the lone no-empty-interface lint).
+type MoveIntentSnapshot = TaskRowSnapshot;
 
 /**
- * Count live (pending|paused) rows for a series across EVERY session on disk —
- * a true fleet-wide predicate (F2). A crash BEFORE the move's cancel leaves the
- * SOURCE live; a crash after a successful target insert leaves the TARGET live.
- * Either way, if any live row exists the intent is already effectively
- * resolved and must NOT be restored (a target-only or source-only check would
- * double-restore). Scans the v2-sessions tree; unreadable DBs count as 0.
+ * Resolve the target channel-root session id (thread_id IS NULL, active) for a
+ * (targetAgentGroupId, targetMessagingGroupId) pair from the central DB.
+ * Defensive: returns null on any error (e.g. the `sessions` table is absent in a
+ * minimal test DB, or no session exists yet because the move crashed before the
+ * target insert). A null target session contributes 0 to the scoped count.
  */
-function countLiveRowsForSeriesFleetWide(sessionsRoot: string, seriesId: string): number {
-  if (!fs.existsSync(sessionsRoot)) return 0;
-  let count = 0;
-  for (const groupDir of fs.readdirSync(sessionsRoot)) {
-    const groupPath = path.join(sessionsRoot, groupDir);
-    let stat: fs.Stats;
-    try {
-      stat = fs.statSync(groupPath);
-    } catch {
-      continue;
-    }
-    if (!stat.isDirectory()) continue;
-    for (const sessDir of fs.readdirSync(groupPath)) {
-      const inboundPath = path.join(groupPath, sessDir, 'inbound.db');
-      if (!fs.existsSync(inboundPath)) continue;
-      let db: Database.Database | null = null;
-      try {
-        db = openInboundDbByPath(inboundPath);
-        count += (
-          db
-            .prepare(
-              "SELECT COUNT(*) AS c FROM messages_in WHERE series_id = ? AND kind = 'task' AND status IN ('pending','paused')",
-            )
-            .get(seriesId) as { c: number }
-        ).c;
-      } catch {
-        /* unreadable — contributes 0 */
-      } finally {
-        db?.close();
-      }
-    }
+function resolveTargetSessionId(
+  centralDb: Database.Database,
+  targetAgentGroupId: string,
+  targetMessagingGroupId: string,
+): string | null {
+  try {
+    const row = centralDb
+      .prepare(
+        "SELECT id FROM sessions WHERE agent_group_id = ? AND messaging_group_id = ? AND thread_id IS NULL AND status = 'active' LIMIT 1",
+      )
+      .get(targetAgentGroupId, targetMessagingGroupId) as { id: string } | undefined;
+    return row?.id ?? null;
+  } catch {
+    return null;
   }
-  return count;
+}
+
+interface ParsedIntentDetail {
+  snapshot: MoveIntentSnapshot | null;
+  targetAgentGroupId: string | null;
+  targetMessagingGroupId: string | null;
+}
+
+function parseIntentDetail(detailJson: string | null): ParsedIntentDetail {
+  if (!detailJson) return { snapshot: null, targetAgentGroupId: null, targetMessagingGroupId: null };
+  try {
+    const d = JSON.parse(detailJson) as {
+      snapshot?: MoveIntentSnapshot;
+      targetAgentGroupId?: string;
+      targetMessagingGroupId?: string;
+    };
+    return {
+      snapshot: d.snapshot ?? null,
+      targetAgentGroupId: typeof d.targetAgentGroupId === 'string' ? d.targetAgentGroupId : null,
+      targetMessagingGroupId: typeof d.targetMessagingGroupId === 'string' ? d.targetMessagingGroupId : null,
+    };
+  } catch {
+    return { snapshot: null, targetAgentGroupId: null, targetMessagingGroupId: null };
+  }
 }
 
 /**
  * Consume unresolved `move_intent` rows older than one sweep interval (D3).
- * FLEET-WIDE predicate: if ANY live row exists for the series → stamp
- * resolved_at + purge the body (the move resolved itself). Otherwise restore
- * the source row from the intent snapshot — re-checking zero-live-rows
- * immediately before the insert so a crash between restore and stamp makes the
- * next pass a no-op (idempotent compensation, M10). Autonomous, not just
- * observable. Additive — no firing-path change (C1).
+ *
+ * SCOPED predicate (M1): the live-row count is taken over EXACTLY {source
+ * session, target session} — never a bare-series_id fleet scan that an unrelated
+ * group reusing the same series_id could falsely satisfy. A crash BEFORE the
+ * move's cancel leaves the SOURCE live; a crash after a successful target insert
+ * leaves the TARGET live. If either holds a live row → stamp + purge (the move
+ * resolved itself), never restore (would double the live rows). If the scoped
+ * count is a readable ZERO → restore the source from the snapshot, re-checking
+ * zero-live immediately before the insert (idempotent compensation, M10).
+ *
+ * FAIL-SAFE (F6 / M2): if the scoped count is UNREADABLE, the live state is
+ * UNKNOWN — skip this intent this pass (leave it unresolved for a clean later
+ * pass), NEVER restore on unknown.
+ *
+ * ADV-S2: an intent that can NEVER be restored (no snapshot body, or the source
+ * inbound.db is gone) is RESOLVED (resolved_at stamped) rather than surfacing
+ * forever as an unclearable 'stalled' repair row.
+ *
+ * Autonomous, not just observable. Additive — no firing-path change (C1).
  */
 export function recoverMoveIntents(centralDb: Database.Database, options: MoveRecoveryOptions): void {
   const nowMs = options.nowMs ?? Date.now();
+  const dataDir = options.dataDir ?? path.dirname(sessionsBaseDir());
   const sessionsRoot = options.dataDir ? path.join(options.dataDir, 'v2-sessions') : sessionsBaseDir();
 
   let intents: Array<{
@@ -383,46 +403,73 @@ export function recoverMoveIntents(centralDb: Database.Database, options: MoveRe
     if (Number.isNaN(tsMs) || nowMs - tsMs <= SWEEP_INTERVAL_MS) continue;
     if (!intent.correlation_id) continue;
 
-    const liveCount = countLiveRowsForSeriesFleetWide(sessionsRoot, intent.series_id);
-    if (liveCount > 0) {
-      // A live row exists somewhere → the move is effectively resolved. Stamp +
-      // purge; never restore (would double the live rows).
-      purgeIntentBody(centralDb, intent.correlation_id);
-      continue;
-    }
+    const detail = parseIntentDetail(intent.detail_json);
+    const source = { agentGroupId: intent.agent_group_id, sessionId: intent.session_id };
+    const targetSessionId =
+      detail.targetAgentGroupId && detail.targetMessagingGroupId
+        ? resolveTargetSessionId(centralDb, detail.targetAgentGroupId, detail.targetMessagingGroupId)
+        : null;
+    const target =
+      detail.targetAgentGroupId && targetSessionId
+        ? { agentGroupId: detail.targetAgentGroupId, sessionId: targetSessionId }
+        : null;
 
-    // Zero live rows fleet-wide → restore the source from the snapshot.
-    let snapshot: MoveIntentSnapshot | null = null;
-    try {
-      const detail = intent.detail_json ? (JSON.parse(intent.detail_json) as { snapshot?: MoveIntentSnapshot }) : null;
-      snapshot = detail?.snapshot ?? null;
-    } catch {
-      snapshot = null;
-    }
-    if (!snapshot) {
-      // Body lost (purged but somehow still unresolved) — cannot restore.
-      // Leave it unresolved so the board surfaces it as a repair row.
-      log.warn('scheduled-move-recovery: unresolved intent with no snapshot — manual repair', {
+    // Scoped {source, target} live count — M1 (never a fleet-wide series scan).
+    const live = countLiveRowsInSessions(dataDir, [source, target], intent.series_id);
+    if (live.unreadable) {
+      // Live state UNKNOWN → skip this pass (leave unresolved). Never restore on
+      // unknown (F6 / M2).
+      log.warn('scheduled-move-recovery: scoped live count unreadable — deferring', {
         seriesId: intent.series_id,
         correlationId: intent.correlation_id,
       });
       continue;
     }
+    if (live.count > 0) {
+      // A live row exists at source or target → the move is effectively
+      // resolved. Stamp + purge; never restore (would double the live rows).
+      purgeIntentBody(centralDb, intent.correlation_id);
+      continue;
+    }
+
+    // Zero live rows in scope → restore the source from the snapshot.
+    if (!detail.snapshot) {
+      // ADV-S2: body lost (purged but still unresolved) — unrecoverable. RESOLVE
+      // it (stamp) so it does not surface forever as an unclearable repair row.
+      log.warn('scheduled-move-recovery: unresolved intent with no snapshot — resolving (unrecoverable)', {
+        seriesId: intent.series_id,
+        correlationId: intent.correlation_id,
+      });
+      purgeIntentBody(centralDb, intent.correlation_id);
+      continue;
+    }
 
     const inboundPath = path.join(sessionsRoot, intent.agent_group_id, intent.session_id, 'inbound.db');
     if (!fs.existsSync(inboundPath)) {
-      log.warn('scheduled-move-recovery: source inbound.db missing — cannot restore', {
+      // ADV-S2: the source session is gone — cannot restore. RESOLVE so it does
+      // not zombie as a permanent stalled repair row.
+      log.warn('scheduled-move-recovery: source inbound.db missing — resolving (unrecoverable)', {
         seriesId: intent.series_id,
+        correlationId: intent.correlation_id,
       });
+      purgeIntentBody(centralDb, intent.correlation_id);
       continue;
     }
+    const snapshot = detail.snapshot;
     let db: Database.Database | null = null;
     try {
       db = openInboundDbByPath(inboundPath);
       // Idempotency re-check: the restore + the resolved_at stamp span two DB
-      // files (not atomic), so re-confirm zero-live IMMEDIATELY before insert.
-      const stillZero = countLiveRowsForSeriesFleetWide(sessionsRoot, intent.series_id) === 0;
-      if (stillZero) {
+      // files (not atomic), so re-confirm a readable zero-live IMMEDIATELY before
+      // insert. An unreadable re-check defers (never restore on unknown).
+      const recheck = countLiveRowsInSessions(dataDir, [source, target], intent.series_id);
+      if (recheck.unreadable) {
+        log.warn('scheduled-move-recovery: re-check unreadable — deferring restore', {
+          seriesId: intent.series_id,
+        });
+        continue;
+      }
+      if (recheck.count === 0) {
         restoreTaskRow(db, {
           // Fresh id — the cancelled source row may still hold the snapshot id.
           id: `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,

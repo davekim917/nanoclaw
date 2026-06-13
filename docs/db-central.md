@@ -320,6 +320,38 @@ CREATE TABLE container_configs (
 - **Readers:** `src/container-config.ts`, `src/container-runner.ts`, `src/cli/dispatch.ts` (scope enforcement), `src/claude-md-compose.ts`
 - **Writers:** `src/db/container-configs.ts`, `src/modules/self-mod/apply.ts`, `src/backfill-container-configs.ts`
 
+### 1.16 `scheduled_audit`
+
+Audit trail for operator actions on the Scheduled Tasks Board (edit / pause / resume / run-now / cancel / move). One row per action; `action` is an open enum (`edit|pause|resume|run_now|cancel|move|move_intent|move_restore_failed`, no CHECK constraint). Bodies are stored hash-first: `before_hash`/`after_hash` always; `before_preview`/`after_preview` truncated previews; scripts are NEVER stored verbatim (hash-only). `detail_json` holds structured deltas — for moves, secret *counts*+hashes only (never names/values); the one exception is a `move_intent` row, which persists the full task snapshot verbatim until the move resolves, then `purgeIntentBody` NULLs it and stamps `resolved_at`. A 90-day sweep (`pruneAuditBodies`) NULLs the body columns while keeping the action-metadata row for the series lifetime (so `action='cancel'` stays distinguishable from natural completion indefinitely). `correlation_id` ties the two-sided rows of a move (one per group). Added by migration 043.
+
+```sql
+CREATE TABLE scheduled_audit (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts              TEXT NOT NULL DEFAULT (datetime('now')),
+  actor           TEXT NOT NULL,
+  action          TEXT NOT NULL,    -- edit|pause|resume|run_now|cancel|move|move_intent|move_restore_failed
+  agent_group_id  TEXT NOT NULL,
+  session_id      TEXT NOT NULL,
+  series_id       TEXT NOT NULL,
+  before_hash     TEXT,
+  after_hash      TEXT,
+  before_preview  TEXT,
+  after_preview   TEXT,
+  before_len      INTEGER,
+  after_len       INTEGER,
+  detail_json     TEXT,             -- structured delta; move secret COUNTS+hashes only; move_intent snapshot purged on resolve
+  correlation_id  TEXT,             -- ties the two-sided audit rows of a move
+  resolved_at     TEXT              -- stamped when a move_intent resolves (then detail_json is NULLed)
+);
+
+CREATE INDEX idx_scheduled_audit_series ON scheduled_audit(series_id);
+CREATE INDEX idx_scheduled_audit_correlation ON scheduled_audit(correlation_id);
+CREATE INDEX idx_scheduled_audit_unresolved ON scheduled_audit(action, resolved_at);  -- sweep recovery scan
+```
+
+- **Readers:** `src/dashboard/api/scheduled-read.ts` (drawer `audit_tail`, mutation-tier only), `src/host-sweep.ts` (`recoverMoveIntents`, `pruneAuditBodies`)
+- **Writers:** `src/dashboard/api/scheduled-shared.ts` (`writeAudit`, `purgeIntentBody`), `src/dashboard/api/scheduled-mutations.ts`, `src/dashboard/api/scheduled-move.ts`, `src/host-sweep.ts`
+
 ---
 
 ## 2. Migration system

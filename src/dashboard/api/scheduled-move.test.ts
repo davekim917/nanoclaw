@@ -303,9 +303,17 @@ describe('movePreviewHandler', () => {
 });
 
 // ── D2: execute ────────────────────────────────────────────────────────────────
-function deltaHashFor(): string {
+function deltaHashFor(targetMessagingGroupId = 'tgt-mg'): string {
   // effective(src) = {Anthropic, Linear}; effective(tgt) = {Anthropic, Linear, Datafold-Prod}.
-  return computeSecretDelta('src-ag', 'src-folder', 'tgt-ag', 'tgt-folder', path.join(TEST_DIR, 'groups')).deltaHash;
+  // The hash now binds the move target identity (E-4) — pass the MG id used at execute.
+  return computeSecretDelta(
+    'src-ag',
+    'src-folder',
+    'tgt-ag',
+    'tgt-folder',
+    targetMessagingGroupId,
+    path.join(TEST_DIR, 'groups'),
+  ).deltaHash;
 }
 
 function liveRowsForSeries(
@@ -490,5 +498,116 @@ describe('moveExecuteHandler', () => {
     };
     expect(auditRows.c).toBe(0);
     expect(targetSessionId()).toBeNull();
+  });
+
+  // ── M1: move_intent persists the full target locator ──────────────────────────
+  it('test_move_intent_stores_target_locator', async () => {
+    // Force a path where the intent is written then left unresolved so its body
+    // survives: a post-move invariant violation (E-2) leaves the intent. We get
+    // there by pre-seeding TWO live ser-1 rows in the target channel-root session
+    // — scheduleTask's idempotent UPDATE only touches one, so both stay live and
+    // the post-move {source,target} count becomes 2 (invariant violated).
+    const { key } = seedMoveFixture({ sourceProcessAfter: isoIn(10 * 3600_000) });
+    addSession('tgt-sess', 'tgt-ag', 'tgt-mg');
+    const tgtInbound = seedSession('tgt-ag', 'tgt-sess').inbound;
+    insertRow(tgtInbound, { id: 'stray-a', series_id: 'ser-1', status: 'pending' });
+    insertRow(tgtInbound, { id: 'stray-b', series_id: 'ser-1', status: 'pending' });
+
+    const res = (await moveExecuteHandler(req(moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
+    // Invariant violated (2 live rows post-move) → 500, intent left unresolved.
+    expect(res.status).toBe(500);
+    const intent = getDb()
+      .prepare("SELECT detail_json, resolved_at FROM scheduled_audit WHERE action = 'move_intent'")
+      .get() as { detail_json: string | null; resolved_at: string | null };
+    expect(intent.resolved_at).toBeNull(); // E-2: NOT purged → recoverable
+    const detail = JSON.parse(intent.detail_json!) as Record<string, unknown>;
+    expect(detail.targetAgentGroupId).toBe('tgt-ag');
+    expect(detail.targetMessagingGroupId).toBe('tgt-mg');
+  });
+
+  // ── E-2: post-move invariant violation → 500 + intent unresolved ───────────────
+  it('test_move_invariant_violation_leaves_intent_unresolved', async () => {
+    const { key } = seedMoveFixture({ sourceProcessAfter: isoIn(10 * 3600_000) });
+    // Two pre-existing live ser-1 rows in the target session → after the move's
+    // idempotent UPDATE, both remain → post-move count == 2.
+    addSession('tgt-sess', 'tgt-ag', 'tgt-mg');
+    const tgtInbound = seedSession('tgt-ag', 'tgt-sess').inbound;
+    insertRow(tgtInbound, { id: 'stray-a', series_id: 'ser-1', status: 'pending' });
+    insertRow(tgtInbound, { id: 'stray-b', series_id: 'ser-1', status: 'pending' });
+
+    const res = (await moveExecuteHandler(req(moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
+    expect(res.status).toBe(500);
+    expect((await readJson(res)).error).toBe('move_failed');
+    // Intent left unresolved so the recovery sweep can repair it.
+    const intent = getDb().prepare("SELECT resolved_at FROM scheduled_audit WHERE action = 'move_intent'").get() as {
+      resolved_at: string | null;
+    };
+    expect(intent.resolved_at).toBeNull();
+    // No two-sided 'move' success audit was written.
+    const moveRows = getDb().prepare("SELECT COUNT(*) AS c FROM scheduled_audit WHERE action = 'move'").get() as {
+      c: number;
+    };
+    expect(moveRows.c).toBe(0);
+  });
+
+  // ── M2: compensation must NOT restore when the count is UNREADABLE ─────────────
+  it('test_move_compensation_unreadable_no_spurious_restore', async () => {
+    const { key } = seedMoveFixture({ sourceProcessAfter: isoIn(10 * 3600_000) });
+    // Unwire the target so scheduleTask throws AFTER cancel (the compensation
+    // path). The target session never gets created — but corrupt the SOURCE
+    // inbound.db AFTER the cancel so the live-count read throws → unreadable →
+    // the handler must NOT restore (fail-safe). We can't time the corruption
+    // mid-handler, so instead: pre-seed a corrupt SECOND target session row that
+    // the {source,target} count would read. Simpler + deterministic: unwire +
+    // corrupt the target's would-be session dir so the count read throws.
+    getDb().prepare("DELETE FROM messaging_group_agents WHERE agent_group_id = 'tgt-ag'").run();
+    // Pre-create the target channel-root session pointer + a CORRUPT inbound.db so
+    // the post-cancel compensation count read throws → unreadable.
+    addSession('tgt-sess', 'tgt-ag', 'tgt-mg');
+    const tgtDir = path.join(TEST_DIR, 'v2-sessions', 'tgt-ag', 'tgt-sess');
+    fs.mkdirSync(tgtDir, { recursive: true });
+    fs.writeFileSync(path.join(tgtDir, 'inbound.db'), 'this is not sqlite');
+
+    const res = (await moveExecuteHandler(req(moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
+    expect(res.status).toBe(500);
+    // Unreadable count → NO restore → source stays terminal (cancelled), and the
+    // move_restore_failed audit is written (recoverable, not silently healed).
+    expect(liveRowsForSeries('src-ag', 'src-sess', 'ser-1')).toHaveLength(0);
+    const failRow = getDb()
+      .prepare("SELECT COUNT(*) AS c FROM scheduled_audit WHERE action = 'move_restore_failed'")
+      .get() as { c: number };
+    expect(failRow.c).toBe(1);
+  });
+
+  // ── E-4: delta hash binds the move target ──────────────────────────────────────
+  it('test_delta_hash_binds_target', async () => {
+    const { key } = seedMoveFixture({ sourceProcessAfter: isoIn(10 * 3600_000) });
+    // A second target MG wired to the SAME target group → identical secret
+    // gains/losses, but a different target identity.
+    addMg('tgt-mg2', 'discord', 'tgt:2', 'tgt-chan-2');
+    wire('tgt-mg2', 'tgt-ag');
+    // Hash computed for tgt-mg, replayed on an execute targeting tgt-mg2.
+    const hashForMg1 = deltaHashFor('tgt-mg');
+    const res = (await moveExecuteHandler(
+      req({ targetAgentGroupId: 'tgt-ag', targetMessagingGroupId: 'tgt-mg2', confirmedDeltaHash: hashForMg1 }),
+      { key },
+      ctxFor('owner', OWNER_SCOPES),
+    ))!;
+    expect(res.status).toBe(409);
+    expect((await readJson(res)).reason).toBe('delta_changed');
+    // No cancel performed.
+    expect(liveRowsForSeries('src-ag', 'src-sess', 'ser-1')).toHaveLength(1);
+  });
+
+  // ── ADV-S1: corrupt source distinguishes 503 (read-throw) from 409 (empty) ─────
+  it('test_move_corrupt_source_503_not_409', async () => {
+    const { key } = seedMoveFixture({ sourceProcessAfter: isoIn(10 * 3600_000) });
+    // Corrupt the source inbound.db so readSourceLiveRow THROWS (file exists but
+    // isn't valid sqlite). Distinguished from an empty result (→ 409 stale_key).
+    const srcPath = path.join(TEST_DIR, 'v2-sessions', 'src-ag', 'src-sess', 'inbound.db');
+    fs.writeFileSync(srcPath, 'this is not sqlite');
+    const res = (await moveExecuteHandler(req(moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
+    expect(res.status).toBe(503);
+    expect((await readJson(res)).reason).toBe('session_unreadable');
   });
 });

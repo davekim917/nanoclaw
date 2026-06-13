@@ -392,6 +392,39 @@ describe('residual-strand + duplicate detection', () => {
     expect(rows.every((r) => r.health === 'stalled')).toBe(true);
   });
 
+  // ── S7: channel-name map keys on NUL, not space (collision-safe) ──────────────
+  it('test_channel_name_nul_key_no_collision', async () => {
+    addGroup('ag-1', 'G1', 'g1');
+    // Two messaging groups whose `channel_type + ' ' + platform_id` would COLLIDE
+    // under a literal space ("a b c"), but are DISTINCT under a NUL separator.
+    addMg('mg-1', 'a', 'b c', 'chan-ONE'); // space key: "a b c"
+    addMg('mg-2', 'a b', 'c', 'chan-TWO'); // space key: "a b c"  ← same!
+    addSession('s1', 'ag-1', 'mg-1');
+    addSession('s2', 'ag-1', 'mg-2');
+    // Task rows whose destination (channel_type, platform_id) matches each MG.
+    insertInboundRow(seedSessionDbs('ag-1', 's1').inbound, {
+      id: 'r1',
+      series_id: 'ser-1',
+      process_after: isoIn(3600_000),
+      channel_type: 'a',
+      platform_id: 'b c',
+    });
+    insertInboundRow(seedSessionDbs('ag-1', 's2').inbound, {
+      id: 'r2',
+      series_id: 'ser-2',
+      process_after: isoIn(3600_000),
+      channel_type: 'a b',
+      platform_id: 'c',
+    });
+
+    const snap = await assembleSnapshot(ALL_SCOPES, opts());
+    const row1 = snap.rows.find((r) => r.series_id === 'ser-1')!;
+    const row2 = snap.rows.find((r) => r.series_id === 'ser-2')!;
+    // Under a NUL key the two destinations resolve to DISTINCT channel names.
+    expect(row1.channel_name).toBe('chan-ONE');
+    expect(row2.channel_name).toBe('chan-TWO');
+  });
+
   it('processing health reflects a real processing_ack in outbound.db', async () => {
     addGroup('ag-1', 'G1', 'g1');
     addMg('mg-1', 'discord', 'd:1', 'chan-1');

@@ -29,7 +29,14 @@ import {
   type ScheduledRow,
   type ScheduledSnapshot,
 } from './scheduled-assembly.js';
-import { SWEEP_INTERVAL_MS, canManageScheduled, decodeKey, encodeKey, getScheduledCache } from './scheduled-shared.js';
+import {
+  SWEEP_INTERVAL_MS,
+  canManageScheduled,
+  decodeKey,
+  encodeKey,
+  getScheduledCache,
+  sessionInboundPathFor,
+} from './scheduled-shared.js';
 
 // ── Test seam ─────────────────────────────────────────────────────────────────
 // Production reads from DATA_DIR with a live clock. Tests inject a fixture dir +
@@ -148,8 +155,14 @@ function repairRows(nowMs: number, liveSeriesIds: Set<string>): ScheduledRow[] {
  * full-fleet snapshot (assembled under no_filter) so a scoped read never
  * poisons an owner's view; the per-caller scope filter happens here.
  */
-export const scheduledListHandler: AuthHandler = async (_req, _params, ctx) => {
+export const scheduledListHandler: AuthHandler = async (req, _params, ctx) => {
   const { dataDir, nowMs } = readOpts();
+
+  // M5/M6: optional `?group_id=` server-side filter (mirrors sessions.ts). An
+  // out-of-scope/nonexistent group_id yields an empty list, NOT an error
+  // (out-of-scope-as-nonexistent) — the scope filter below already restricts the
+  // row set, and ANDing the group_id naturally yields zero rows.
+  const groupIdFilter = new URL(req.url).searchParams.get('group_id');
 
   // Serve a warm cache (full-fleet); else assemble it.
   const cache = getScheduledCache();
@@ -165,12 +178,25 @@ export const scheduledListHandler: AuthHandler = async (_req, _params, ctx) => {
   const allRows = [...snapshot.rows, ...repair];
 
   // Per-caller scope filter (C7 — disclose-as-not-found: out-of-scope rows are
-  // simply absent, never a 403).
-  const visible = allRows.filter((r) => rowInScope(ctx.scopes, r.agent_group_id));
+  // simply absent, never a 403), ANDed with the optional group_id filter.
+  const inScopeAndGroup = (agentGroupId: string): boolean =>
+    rowInScope(ctx.scopes, agentGroupId) && (!groupIdFilter || agentGroupId === groupIdFilter);
+  const visible = allRows.filter((r) => inScopeAndGroup(r.agent_group_id));
+
+  // E-3: the unreadable count must reflect ONLY the caller's in-scope (and
+  // group-filtered) groups — never the fleet-wide total. Sum the per-group
+  // unreadable buckets over the groups this caller can actually see.
+  const unreadableByGroup = (snapshot.unreadable_by_group ?? {}) as Record<string, number>;
+  let scopedUnreadable = 0;
+  for (const [agId, n] of Object.entries(unreadableByGroup)) {
+    if (inScopeAndGroup(agId)) scopedUnreadable += n;
+  }
 
   return json({
     rows: visible,
-    counts: countRows(visible, snapshot.counts.unreadable ?? 0),
+    counts: countRows(visible, scopedUnreadable),
+    // `degraded` is a fleet assembly-health signal (the assembly either finished
+    // in budget or it didn't); the per-caller UNREADABLE count above is scoped.
     degraded: snapshot.degraded,
     assembled_at: snapshot.assembled_at,
   });
@@ -369,8 +395,12 @@ export const scheduledDetailHandler: AuthHandler = async (_req, params, ctx) => 
     return json({ error: 'not_found' }, 404);
   }
 
-  const inboundPath = path.join(dataDir, 'v2-sessions', decoded.agentGroupId, decoded.sessionId, 'inbound.db');
-  const outboundPath = path.join(dataDir, 'v2-sessions', decoded.agentGroupId, decoded.sessionId, 'outbound.db');
+  // M4: containment-checked open. A null path (containment violation — decodeKey
+  // already rejects traversal segments, this is defense in depth) → 404
+  // disclose-as-not-found, never an open outside data/v2-sessions.
+  const inboundPath = sessionInboundPathFor(dataDir, decoded.agentGroupId, decoded.sessionId);
+  if (!inboundPath) return json({ error: 'not_found' }, 404);
+  const outboundPath = path.join(path.dirname(inboundPath), 'outbound.db');
 
   // Read the series' live/latest row for the full prompt + script bodies (the
   // snapshot carries neither). null → the series ended/moved since the list →
