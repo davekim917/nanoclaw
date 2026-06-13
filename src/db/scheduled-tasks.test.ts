@@ -155,6 +155,69 @@ describe('test_scheduleTask_rejects_unwired_destination', () => {
   });
 });
 
+// ── test_scheduletask_omits_script_when_absent ─────────────────────────────
+describe('test_scheduletask_omits_script_when_absent', () => {
+  it('content JSON has no "script" key when TaskDef.script is undefined', async () => {
+    seedActiveSession();
+    seedInboundDb();
+
+    await scheduleTask(
+      {
+        id: 't-no-script',
+        agentGroupId: AGENT_GROUP_ID,
+        cron: '0 3 * * *',
+        processAfter: new Date(Date.now() + 86400000).toISOString(),
+        seriesId: 's-no-script',
+        prompt: 'do thing',
+        destination: TEST_DESTINATION,
+      },
+      TEST_DIR,
+    );
+
+    const db = openInboundDb(inboundPath());
+    const row = db.prepare("SELECT content FROM messages_in WHERE series_id = 's-no-script'").get() as {
+      content: string;
+    };
+    db.close();
+
+    const parsed = JSON.parse(row.content) as Record<string, unknown>;
+    expect('script' in parsed).toBe(false);
+    expect(parsed.prompt).toBe('do thing');
+  });
+});
+
+// ── test_scheduletask_includes_script_when_present ─────────────────────────
+describe('test_scheduletask_includes_script_when_present', () => {
+  it('content JSON carries script === the provided value', async () => {
+    seedActiveSession();
+    seedInboundDb();
+
+    await scheduleTask(
+      {
+        id: 't-with-script',
+        agentGroupId: AGENT_GROUP_ID,
+        cron: '0 3 * * *',
+        processAfter: new Date(Date.now() + 86400000).toISOString(),
+        seriesId: 's-with-script',
+        prompt: 'do thing',
+        script: 'echo hi',
+        destination: TEST_DESTINATION,
+      },
+      TEST_DIR,
+    );
+
+    const db = openInboundDb(inboundPath());
+    const row = db.prepare("SELECT content FROM messages_in WHERE series_id = 's-with-script'").get() as {
+      content: string;
+    };
+    db.close();
+
+    const parsed = JSON.parse(row.content) as Record<string, unknown>;
+    expect(parsed.script).toBe('echo hi');
+    expect(parsed.prompt).toBe('do thing');
+  });
+});
+
 // ── test_scheduleTask_inserts_new ──────────────────────────────────────────
 describe('test_scheduleTask_inserts_new', () => {
   it('inserts a new task row with correct fields', async () => {

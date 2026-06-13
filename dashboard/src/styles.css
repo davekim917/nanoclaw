@@ -1286,3 +1286,265 @@ button.nc-pulse-cell.active .lbl { color: var(--fg); }
   padding: 0; margin: -1px;
   overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0;
 }
+
+/* ─────────────────────────────────────────────────────────────────────────
+   Scheduled-tasks board (Group E). Reuses the status-token palette defined in
+   :root — stalled/strand map to --st-failed (attention-red), late to
+   --st-needs (orange), paused to --st-pending (amber), processing to
+   --st-running (cyan), healthy to --st-done (green), unknown/unreadable to
+   --st-cancel (grey) so an observability failure reads visibly different from
+   a known-bad state. [RENDER-CHECK] the stalled-red-on-dark-card contrast is
+   pending lead visual verification (design §3c).
+   ───────────────────────────────────────────────────────────────────────── */
+
+.nc-sched-top {
+  padding: 18px 22px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-panel);
+}
+.nc-sched-headerrow {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 14px;
+}
+
+/* Health summary strip */
+.nc-sched-strip {
+  display: flex; flex-wrap: wrap; gap: 8px; align-items: stretch;
+}
+.nc-sched-pill {
+  display: flex; flex-direction: column; gap: 2px;
+  min-width: 64px; padding: 7px 11px;
+  border-radius: 5px;
+  border: 1px solid var(--line);
+  background: var(--bg-card);
+}
+.nc-sched-pill .n {
+  font-family: var(--font-mono); font-size: 18px; font-weight: 600; line-height: 1;
+  color: var(--fg);
+}
+.nc-sched-pill .lbl {
+  font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--fg-3);
+}
+/* tone accents — left border + count colour */
+.nc-sched-pill.stalled    { border-color: var(--st-failed);  background: var(--st-failed-bg); }
+.nc-sched-pill.stalled .n { color: var(--st-failed); }
+.nc-sched-pill.late       { border-color: var(--st-needs);   background: var(--st-needs-bg); }
+.nc-sched-pill.late .n    { color: var(--st-needs); }
+.nc-sched-pill.paused     { border-color: var(--st-pending); background: var(--st-pending-bg); }
+.nc-sched-pill.paused .n  { color: var(--st-pending); }
+.nc-sched-pill.healthy    { border-color: var(--st-done);    background: var(--st-done-bg); }
+.nc-sched-pill.healthy .n { color: var(--st-done); }
+.nc-sched-pill.unknown,
+.nc-sched-pill.unreadable    { border-color: var(--st-cancel); background: var(--st-cancel-bg); }
+.nc-sched-pill.unknown .n,
+.nc-sched-pill.unreadable .n { color: var(--fg-2); }
+.nc-sched-pill.oneoff     { border-color: var(--line-2); }
+
+.nc-sched-degraded {
+  display: inline-flex; align-items: center; gap: 6px; align-self: center;
+  margin-left: auto;
+  padding: 5px 10px; border-radius: 5px;
+  background: var(--st-failed-bg); color: var(--st-failed);
+  font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase;
+}
+.nc-sched-degraded .dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--st-failed); box-shadow: 0 0 6px var(--st-failed);
+}
+
+/* Stalled inline list — always first, enumerated (§3c) */
+.nc-sched-stalled-inline {
+  margin-top: 12px; padding: 10px 12px;
+  border: 1px solid var(--st-failed);
+  background: var(--st-failed-bg);
+  border-radius: 6px;
+}
+.nc-sched-stalled-inline .hdr {
+  font-family: var(--font-mono); font-size: 12px; font-weight: 600; color: var(--st-failed);
+  letter-spacing: 0.04em;
+}
+.nc-sched-stalled-inline ul { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-wrap: wrap; gap: 6px; }
+.nc-sched-stalled-link {
+  display: inline-flex; gap: 6px; align-items: baseline;
+  background: var(--bg-card); border: 1px solid var(--line-2); border-radius: 4px;
+  padding: 4px 8px; cursor: pointer; color: var(--fg);
+}
+.nc-sched-stalled-link:hover { border-color: var(--st-failed); }
+.nc-sched-stalled-link .nm  { font-family: var(--font-mono); font-size: 12px; }
+.nc-sched-stalled-link .grp { font-size: 11px; color: var(--fg-3); }
+
+/* Toolbar */
+.nc-sched-toolbar { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.nc-sched-toolbar select,
+.nc-sched-toolbar input {
+  background: var(--bg-inset); color: var(--fg);
+  border: 1px solid var(--line); border-radius: 5px;
+  padding: 6px 9px; font-size: 13px; font-family: var(--font-sans);
+}
+.nc-sched-toolbar input.nc-sched-search { flex: 1; min-width: 180px; }
+.nc-sched-toolbar select:focus,
+.nc-sched-toolbar input:focus { outline: none; border-color: var(--brand); }
+
+/* Body — grouped sections */
+.nc-sched-body { padding: 14px 22px 40px; }
+.nc-sched-section { margin-bottom: 14px; }
+.nc-sched-section-head {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  background: none; border: none; cursor: pointer; padding: 6px 0;
+  color: var(--fg); text-align: left;
+}
+.nc-sched-section-head .chev { color: var(--fg-3); width: 12px; }
+.nc-sched-section-head .nm { font-weight: 600; font-size: 14px; }
+.nc-sched-section-head .cnt {
+  font-family: var(--font-mono); font-size: 11px; color: var(--fg-3);
+  background: var(--bg-card); border-radius: 10px; padding: 1px 8px;
+}
+.nc-sched-section-body { display: flex; flex-direction: column; gap: 6px; padding-top: 4px; }
+
+/* Row */
+.nc-sched-row {
+  border: 1px solid var(--line); border-left-width: 3px; border-radius: 6px;
+  background: var(--bg-card); padding: 9px 12px; cursor: pointer;
+}
+.nc-sched-row:hover { border-color: var(--line-2); }
+.nc-sched-row:focus-visible { outline: 2px solid var(--brand); outline-offset: 1px; }
+.nc-sched-row.health-stalled,
+.nc-sched-row.health-strand  { border-left-color: var(--st-failed); }
+.nc-sched-row.health-late    { border-left-color: var(--st-needs); }
+.nc-sched-row.health-paused  { border-left-color: var(--st-pending); }
+.nc-sched-row.health-processing { border-left-color: var(--st-running); }
+.nc-sched-row.health-healthy { border-left-color: var(--st-done); }
+.nc-sched-row.health-unknown { border-left-color: var(--st-cancel); }
+
+.nc-sched-row-main { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.nc-sched-name { font-family: var(--font-mono); font-size: 13px; color: var(--fg); }
+.nc-sched-row-meta {
+  display: flex; flex-wrap: wrap; gap: 12px; margin-top: 5px;
+  font-size: 11px; color: var(--fg-3);
+}
+.nc-sched-row-meta .utc { color: var(--fg-2); font-family: var(--font-mono); }
+.nc-sched-row-meta .local { color: var(--fg-3); }
+.nc-sched-row-meta .cron { font-family: var(--font-mono); }
+
+/* Health pill on the row */
+.nc-sched-healthpill {
+  font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase;
+  padding: 2px 7px; border-radius: 3px; font-weight: 600;
+}
+.nc-sched-healthpill.stalled,
+.nc-sched-healthpill.strand  { background: var(--st-failed-bg);  color: var(--st-failed); }
+.nc-sched-healthpill.late    { background: var(--st-needs-bg);   color: var(--st-needs); }
+.nc-sched-healthpill.paused  { background: var(--st-pending-bg); color: var(--st-pending); }
+.nc-sched-healthpill.processing { background: var(--st-running-bg); color: var(--st-running); }
+.nc-sched-healthpill.healthy { background: var(--st-done-bg);    color: var(--st-done); }
+.nc-sched-healthpill.unknown { background: var(--st-cancel-bg);  color: var(--fg-2); }
+
+/* Badges */
+.nc-sched-badge {
+  font-size: 10px; letter-spacing: 0.04em; text-transform: uppercase;
+  padding: 2px 6px; border-radius: 3px; background: oklch(0.30 0.008 60); color: var(--fg-2);
+}
+.nc-sched-badge.module { background: oklch(0.30 0.02 280); color: oklch(0.85 0.08 280); }
+.nc-sched-badge.thread { background: oklch(0.30 0.02 200); color: oklch(0.85 0.08 200); }
+.nc-sched-badge.quiet  { background: var(--bg-card-2); color: var(--fg-3); }
+
+/* ─── Drawer ─── */
+.nc-sched-drawer {
+  position: fixed; top: 0; right: 0; bottom: 0; width: min(440px, 92vw);
+  background: var(--bg-panel); border-left: 1px solid var(--line-2);
+  box-shadow: -8px 0 28px oklch(0 0 0 / 0.4);
+  display: flex; flex-direction: column; z-index: 40;
+  overflow: hidden;
+}
+.nc-sched-drawer-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 16px 18px; border-bottom: 1px solid var(--line);
+}
+.nc-sched-drawer-head h3 { margin: 0; font-size: 15px; font-family: var(--font-mono); }
+.nc-sched-drawer-close {
+  background: none; border: none; color: var(--fg-3); font-size: 22px; cursor: pointer; line-height: 1;
+}
+.nc-sched-drawer-close:hover { color: var(--fg); }
+.nc-sched-drawer-body { overflow-y: auto; padding: 16px 18px; }
+
+.nc-sched-drawer-meta { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 14px; margin-bottom: 16px; }
+.nc-sched-field { display: flex; flex-direction: column; gap: 2px; }
+.nc-sched-field .k { font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--fg-4); }
+.nc-sched-field .v { font-size: 12px; color: var(--fg); font-family: var(--font-mono); word-break: break-word; }
+
+.nc-sched-overrides, .nc-sched-prompt, .nc-sched-history, .nc-sched-audit { margin-bottom: 16px; }
+.nc-sched-drawer-body h4 {
+  margin: 0 0 6px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--fg-3);
+}
+.nc-sched-prompt pre {
+  background: var(--bg-inset); border: 1px solid var(--line); border-radius: 5px;
+  padding: 9px 11px; font-family: var(--font-mono); font-size: 12px; color: var(--fg-2);
+  white-space: pre-wrap; word-break: break-word; margin: 0 0 10px;
+}
+.nc-sched-history ul, .nc-sched-audit ul { list-style: none; margin: 0; padding: 0; }
+.nc-sched-history li, .nc-sched-audit li {
+  display: flex; gap: 10px; align-items: baseline; padding: 4px 0;
+  border-bottom: 1px solid var(--line); font-size: 12px;
+}
+.nc-sched-history .ts, .nc-sched-audit .ts { font-family: var(--font-mono); color: var(--fg-3); font-size: 11px; }
+.nc-sched-history .outcome.ok    { color: var(--st-done); }
+.nc-sched-history .outcome.bad   { color: var(--st-failed); }
+.nc-sched-history .outcome.muted { color: var(--fg-3); }
+
+/* Verb buttons */
+.nc-sched-verbs { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0; }
+.nc-sched-verb {
+  padding: 7px 13px; border-radius: 5px; cursor: pointer;
+  border: 1px solid var(--line-2); background: var(--bg-card); color: var(--fg);
+  font-size: 13px;
+}
+.nc-sched-verb:hover:not(:disabled) { border-color: var(--brand); }
+.nc-sched-verb.cancel:not(:disabled) { border-color: var(--st-failed); color: var(--st-failed); }
+.nc-sched-verb:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* Confirm / form panes */
+.nc-sched-confirm, .nc-sched-move-confirm, .nc-sched-edit-form, .nc-sched-move-form {
+  border: 1px solid var(--line-2); border-radius: 6px; background: var(--bg-inset);
+  padding: 14px; margin-top: 8px;
+}
+.nc-sched-confirm h4, .nc-sched-move-confirm h4 { color: var(--fg); font-size: 13px; text-transform: none; }
+.nc-sched-confirm p { font-size: 13px; color: var(--fg-2); margin: 6px 0 12px; }
+.nc-sched-edit-form label, .nc-sched-move-form label {
+  display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px;
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--fg-3);
+}
+.nc-sched-edit-form textarea, .nc-sched-edit-form input,
+.nc-sched-move-form input {
+  background: var(--bg-card); border: 1px solid var(--line); border-radius: 5px;
+  padding: 7px 9px; color: var(--fg); font-family: var(--font-mono); font-size: 12px;
+}
+.nc-sched-form-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 10px; }
+.nc-sched-form-actions button {
+  padding: 6px 14px; border-radius: 5px; cursor: pointer;
+  border: 1px solid var(--line-2); background: var(--bg-card); color: var(--fg); font-size: 13px;
+}
+.nc-sched-form-actions button.danger { border-color: var(--st-failed); color: var(--st-failed); }
+.nc-sched-form-actions button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.nc-sched-reseed-warning {
+  border: 1px solid var(--st-pending); background: var(--st-pending-bg);
+  color: var(--st-pending); border-radius: 5px; padding: 9px 11px; font-size: 12px; margin-bottom: 10px;
+}
+.nc-sched-delta { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 10px 0; }
+.nc-sched-delta .lbl { font-size: 10px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--fg-4); display: block; }
+.nc-sched-delta ul { list-style: none; margin: 4px 0 0; padding: 0; }
+.nc-sched-delta li { font-family: var(--font-mono); font-size: 12px; padding: 2px 0; }
+.nc-sched-delta .gains li  { color: var(--st-done); }
+.nc-sched-delta .losses li { color: var(--st-failed); }
+.nc-sched-delta .none { font-size: 12px; color: var(--fg-3); }
+.nc-sched-caveat { font-size: 12px; color: var(--fg-2); margin: 8px 0; line-height: 1.45; }
+.nc-sched-drawer-error {
+  border: 1px solid var(--st-failed); background: var(--st-failed-bg); color: var(--st-failed);
+  border-radius: 5px; padding: 8px 10px; font-size: 12px; margin: 8px 0;
+}
+
+@media (max-width: 899px) {
+  .nc-sched-drawer { width: 100vw; }
+  .nc-sched-drawer-meta { grid-template-columns: 1fr; }
+  .nc-sched-delta { grid-template-columns: 1fr; }
+}

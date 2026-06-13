@@ -17,7 +17,10 @@ import {
   resumeTask,
   updateTask,
   getCompletedRecurring,
+  restoreTaskRow,
+  cancelSeriesWithStrandClear,
   type RecurringMessage,
+  type TaskRowSnapshot,
 } from './db.js';
 
 const TEST_DIR = '/tmp/nanoclaw-scheduling-db-test';
@@ -337,6 +340,144 @@ describe('updateTask', () => {
 
     const touched = updateTask(db, 'task-1', { prompt: 'new' });
     expect(touched).toBe(0);
+  });
+});
+
+describe('restoreTaskRow', () => {
+  // Move compensation (§4.2 step 5) and paused-snapshot staged restore (§4.2 4a)
+  // re-insert a snapshot of the source row. Unlike insertTask (which sets
+  // series_id = new id, severing identity) restoreTaskRow preserves the
+  // snapshot's series_id AND status — a paused row must come back paused.
+  it('test_restore_preserves_series_id_and_status', () => {
+    const db = freshDb();
+    const snapshot: TaskRowSnapshot = {
+      id: 'restored-1',
+      series_id: 'S',
+      status: 'paused',
+      process_after: '2026-01-01T00:00:00Z',
+      recurrence: '0 9 * * *',
+      content: JSON.stringify({ prompt: 'restore me', script: 'echo hi' }),
+      platform_id: 'C1',
+      channel_type: 'slack',
+      thread_id: null,
+      kind: 'task',
+    };
+
+    restoreTaskRow(db, snapshot);
+
+    const row = db
+      .prepare(
+        'SELECT series_id, status, recurrence, process_after, content, platform_id, channel_type, kind FROM messages_in WHERE id = ?',
+      )
+      .get('restored-1') as {
+      series_id: string;
+      status: string;
+      recurrence: string | null;
+      process_after: string | null;
+      content: string;
+      platform_id: string | null;
+      channel_type: string | null;
+      kind: string;
+    };
+    expect(row.series_id).toBe('S');
+    expect(row.status).toBe('paused');
+    expect(row.recurrence).toBe('0 9 * * *');
+    expect(row.process_after).toBe('2026-01-01T00:00:00Z');
+    expect(JSON.parse(row.content).script).toBe('echo hi');
+    expect(row.platform_id).toBe('C1');
+    expect(row.channel_type).toBe('slack');
+    expect(row.kind).toBe('task');
+    db.close();
+  });
+
+  it('restores a pending snapshot as pending', () => {
+    const db = freshDb();
+    const snapshot: TaskRowSnapshot = {
+      id: 'restored-2',
+      series_id: 'S2',
+      status: 'pending',
+      process_after: '2026-02-01T00:00:00Z',
+      recurrence: '0 9 * * *',
+      content: '{}',
+      platform_id: null,
+      channel_type: null,
+      thread_id: null,
+      kind: 'task',
+    };
+    restoreTaskRow(db, snapshot);
+    const row = db.prepare('SELECT status FROM messages_in WHERE id = ?').get('restored-2') as { status: string };
+    expect(row.status).toBe('pending');
+    db.close();
+  });
+});
+
+describe('cancelSeriesWithStrandClear', () => {
+  it('test_cancel_strand_clear_clears_terminal_recurrence', () => {
+    // A pure strand: one terminal (completed) row still carrying recurrence,
+    // no live row. getCompletedRecurring would mint a successor, silently
+    // undoing the operator's cancel. cancelSeriesWithStrandClear clears it.
+    const db = freshDb();
+    insertBasicTask(db, 'task-strand', '0 9 * * *');
+    db.prepare("UPDATE messages_in SET status = 'completed' WHERE id = 'task-strand'").run();
+    // Precondition: the strand is resurrectable.
+    expect(getCompletedRecurring(db).some((r) => r.series_id === 'task-strand')).toBe(true);
+
+    const count = cancelSeriesWithStrandClear(db, 'task-strand');
+
+    const row = db.prepare("SELECT recurrence FROM messages_in WHERE id = 'task-strand'").get() as {
+      recurrence: string | null;
+    };
+    expect(row.recurrence).toBeNull();
+    expect(count).toBeGreaterThanOrEqual(1);
+    // No longer resurrectable.
+    expect(getCompletedRecurring(db).some((r) => r.series_id === 'task-strand')).toBe(false);
+    db.close();
+  });
+
+  it('test_cancel_strand_clear_live_and_terminal', () => {
+    // One live pending row + one terminal recurrence-set row in the same
+    // series. The live row → completed + recurrence NULL (cancelTask); the
+    // terminal row → recurrence NULL (strand clear). Count === 2.
+    const db = freshDb();
+    // Terminal recurrence-set row (crash residue / swallowed-parse strand).
+    insertBasicTask(db, 'series-term', '0 9 * * *');
+    db.prepare("UPDATE messages_in SET status = 'completed' WHERE id = 'series-term'").run();
+    // Live pending follow-up sharing the same series_id.
+    const msg: RecurringMessage = {
+      id: 'series-term',
+      kind: 'task',
+      content: JSON.stringify({ prompt: 'noop' }),
+      recurrence: '0 9 * * *',
+      process_after: null,
+      platform_id: null,
+      channel_type: null,
+      thread_id: null,
+      series_id: 'series-term',
+    };
+    insertRecurrence(db, msg, 'series-live', new Date(Date.now() + 86400000).toISOString());
+
+    const count = cancelSeriesWithStrandClear(db, 'series-term');
+
+    const live = db.prepare("SELECT status, recurrence FROM messages_in WHERE id = 'series-live'").get() as {
+      status: string;
+      recurrence: string | null;
+    };
+    const term = db.prepare("SELECT recurrence FROM messages_in WHERE id = 'series-term'").get() as {
+      recurrence: string | null;
+    };
+    expect(live.status).toBe('completed');
+    expect(live.recurrence).toBeNull();
+    expect(term.recurrence).toBeNull();
+    expect(count).toBe(2);
+    // Series is no longer resurrectable.
+    expect(getCompletedRecurring(db).some((r) => r.series_id === 'series-term')).toBe(false);
+    db.close();
+  });
+
+  it('returns 0 on a fully-absent series (no live rows, no terminal recurrence)', () => {
+    const db = freshDb();
+    expect(cancelSeriesWithStrandClear(db, 'nonexistent')).toBe(0);
+    db.close();
   });
 });
 

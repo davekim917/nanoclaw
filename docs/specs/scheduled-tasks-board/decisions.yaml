@@ -305,6 +305,21 @@ review_cycles:
 auto_judgments:
   - stage: Build
     iteration: 1
+    decision: "Board's SWEEP_INTERVAL_MS constant home = exported in scheduled-shared.ts (Group A's file), mirroring private host-sweep.ts:90; Group D imports it. Avoids builder-A editing Group D's exclusive file."
+    alternatives_considered:
+      - "Add export to host-sweep.ts (cross-group write into Group D's file — merge-conflict risk)"
+      - "Hardcode 120000 in A5 (loses the GUARD_GRACE derivation the ASSERT checks)"
+    grounding:
+      - "plan.md File Ownership Map: host-sweep.ts is Group D exclusive (D3/D4); scheduled-shared.ts is Group A (A6)"
+      - "design.md §4.0: guard_grace = max(2*SWEEP_INTERVAL, 2min) is a board concept; value 60_000 verified at host-sweep.ts:90 by builder-A"
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-06-13T03:55:00Z
+  - stage: Build
+    iteration: 1
     decision: "Pre-build drift found the plan under-encoded 2 MISSING + 1 DIVERGED + 6 PARTIAL mechanisms vs design rev 5; reconciled the plan to the design (added Task D4 audit-prune, B3/E1 repair-row surfacing, preview 404, +6 ASSERTs) rather than escalating drift-gate."
     alternatives_considered:
       - "Escalate drift-gate to the operator"

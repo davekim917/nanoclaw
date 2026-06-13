@@ -3,6 +3,7 @@ import { createRoot } from 'react-dom/client';
 import { AuthGate } from './auth/AuthGate.js';
 import { KanbanBoard } from './views/KanbanBoard.js';
 import { InboxBoard } from './views/InboxBoard.js';
+import { ScheduledBoard } from './views/ScheduledBoard.js';
 import { TaskDetail } from './views/TaskDetail.js';
 import { SessionDetail } from './views/SessionDetail.js';
 import { authMe as fetchAuthMe } from './lib/api.js';
@@ -19,6 +20,7 @@ function parseHash(): { route: BoardRoute | 'task' | 'session'; taskId?: string;
   if (hash.startsWith('/task/')) return { route: 'task', taskId: hash.slice(6) };
   if (hash.startsWith('/session/')) return { route: 'session', sessionId: hash.slice(9) };
   if (hash === '/inbox') return { route: 'inbox' };
+  if (hash === '/scheduled') return { route: 'scheduled' };
   return { route: 'board' };
 }
 
@@ -55,7 +57,7 @@ function App() {
   }, []);
 
   const navigate = useCallback((r: BoardRoute) => {
-    location.hash = r === 'inbox' ? '#/inbox' : '#/board';
+    location.hash = r === 'inbox' ? '#/inbox' : r === 'scheduled' ? '#/scheduled' : '#/board';
   }, []);
 
   if (authState === 'loading') {
@@ -89,6 +91,9 @@ function App() {
     <div className={TWEAK_CLASS} style={{ minHeight: '100vh' }}>
       {hashState.route === 'board' && me && <KanbanBoard authMe={me} route="board" onRouteChange={navigate} />}
       {hashState.route === 'inbox' && me && <InboxBoard authMe={me} route="inbox" onRouteChange={navigate} />}
+      {hashState.route === 'scheduled' && me && (
+        <ScheduledBoard authMe={me} route="scheduled" onRouteChange={navigate} />
+      )}
       {hashState.route === 'task' && hashState.taskId && me && <TaskDetail authMe={me} taskId={hashState.taskId} />}
       {hashState.route === 'session' && hashState.sessionId && me && (
         <SessionDetail authMe={me} sessionId={hashState.sessionId} />

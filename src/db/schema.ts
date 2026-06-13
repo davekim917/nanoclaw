@@ -190,6 +190,12 @@ CREATE TABLE IF NOT EXISTS messages_in (
                -- Dying containers (past first poll) skip these rows.
 );
 CREATE INDEX IF NOT EXISTS idx_messages_in_series ON messages_in(series_id);
+-- Read-path enabler for the Scheduled Tasks Board: latest-row-per-series
+-- (MAX(seq)) and the drawer's ORDER BY seq DESC LIMIT 5 both materialize +
+-- sort all series rows under the plain (series_id) index. The compound index
+-- serves both. Read-path only; firing semantics untouched (C1). See
+-- docs/specs/scheduled-tasks-board/design.md §4.8.
+CREATE INDEX IF NOT EXISTS idx_messages_in_series_seq ON messages_in(series_id, seq DESC);
 
 -- Host tracks delivery outcomes for messages_out IDs.
 -- Avoids writing to outbound.db (container-owned).

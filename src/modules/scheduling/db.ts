@@ -172,3 +172,109 @@ export function insertRecurrence(
 export function clearRecurrence(db: Database.Database, messageId: string): void {
   db.prepare('UPDATE messages_in SET recurrence = NULL WHERE id = ?').run(messageId);
 }
+
+/**
+ * Snapshot of a single live task row, captured before a board move so the
+ * source can be re-inserted faithfully on the compensation path. Mirrors the
+ * `messages_in` columns the firing path reads (status is `pending` or `paused`
+ * — terminal rows are never snapshotted).
+ */
+export interface TaskRowSnapshot {
+  id: string;
+  series_id: string;
+  status: 'pending' | 'paused';
+  process_after: string | null;
+  recurrence: string | null;
+  content: string;
+  platform_id: string | null;
+  channel_type: string | null;
+  thread_id: string | null;
+  kind: string;
+}
+
+/**
+ * Re-insert a task row from a snapshot, preserving its identity (`series_id`)
+ * AND its `status`. Used by the board move flow: compensation (§4.2 step 5,
+ * restore source after a failed target insert) and the paused-snapshot staged
+ * restore (§4.2 4a).
+ *
+ * This is `insertRecurrence`'s raw-insert shape (db.ts:149-170) with two
+ * deliberate differences:
+ *   - `series_id` comes from the snapshot, NOT a fresh id. `insertTask` sets
+ *     series_id = id, which would sever the series identity — exactly what a
+ *     restore must not do.
+ *   - `status` comes from the snapshot, overriding insertRecurrence's
+ *     hardcoded `'pending'`. A paused source row must come back paused, or the
+ *     restore would silently un-pause it.
+ *
+ * C1: writes no status value the firing path doesn't already read
+ * (`pending`/`paused` are both existing live states).
+ */
+export function restoreTaskRow(db: Database.Database, snapshot: TaskRowSnapshot): void {
+  db.prepare(
+    `INSERT INTO messages_in (id, seq, kind, timestamp, status, tries, process_after, recurrence, platform_id, channel_type, thread_id, content, series_id)
+     VALUES (@id, @seq, @kind, datetime('now'), @status, 0, @processAfter, @recurrence, @platformId, @channelType, @threadId, @content, @seriesId)`,
+  ).run({
+    id: snapshot.id,
+    seq: nextEvenSeq(db),
+    kind: snapshot.kind,
+    status: snapshot.status,
+    processAfter: snapshot.process_after,
+    recurrence: snapshot.recurrence,
+    platformId: snapshot.platform_id,
+    channelType: snapshot.channel_type,
+    threadId: snapshot.thread_id,
+    content: snapshot.content,
+    seriesId: snapshot.series_id,
+  });
+}
+
+/**
+ * Board-cancel a series AND make it non-resurrectable. `cancelTask` cancels
+ * the live row(s) and clears their recurrence, but crash residue
+ * (`recurrence.ts:36-37` insert-then-clear) or a swallowed-parse strand can
+ * leave a TERMINAL row (`completed`/`failed`/`expired`) still carrying
+ * recurrence — which `getCompletedRecurring` (db.ts:143-146) would heal into a
+ * fresh successor, silently undoing the cancel. This clears recurrence on
+ * those terminal rows of the same series too (§4.3 resurrection guard).
+ *
+ * Returns touched-count = live rows cancelled + terminal recurrence-clears, so
+ * the cancel verb is reachable on a PURE strand (no live row, just a terminal
+ * recurrence-set row — §4.0 footnote: cancel's touched-count includes terminal
+ * clears so strand cleanup never reports a misleading 0).
+ *
+ * C1: only sets recurrence=NULL on terminal rows — an existing data operation
+ * (clearRecurrence), removing rows from the sweep's input without changing any
+ * firing-path code or minting a new status value.
+ */
+export function cancelSeriesWithStrandClear(db: Database.Database, taskId: string): number {
+  return db.transaction(() => {
+    // 1. Cancel live rows (and clear their recurrence) via existing semantics.
+    const liveCancelled = cancelTask(db, taskId);
+
+    // 2. Resolve the affected series so terminal-row cleanup is scoped to them.
+    //    taskId may be a row id or a series_id; match the same way cancelTask
+    //    does, then collect distinct series_ids.
+    const seriesRows = db
+      .prepare("SELECT DISTINCT series_id FROM messages_in WHERE (id = ? OR series_id = ?) AND kind = 'task'")
+      .all(taskId, taskId) as Array<{ series_id: string | null }>;
+    const seriesIds = seriesRows.map((r) => r.series_id).filter((s): s is string => s !== null);
+
+    // 3. Clear recurrence on terminal rows of those series. The just-cancelled
+    //    rows already have recurrence NULL (step 1), so `recurrence IS NOT NULL`
+    //    naturally excludes them — no double-count.
+    let terminalCleared = 0;
+    for (const seriesId of seriesIds) {
+      terminalCleared += db
+        .prepare(
+          `UPDATE messages_in SET recurrence = NULL
+             WHERE series_id = ? AND kind = 'task'
+               AND status IN ('completed', 'failed', 'expired')
+               AND recurrence IS NOT NULL`,
+        )
+        .run(seriesId).changes;
+    }
+
+    return liveCancelled + terminalCleared;
+  })();
+}
