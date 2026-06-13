@@ -130,6 +130,17 @@ LOW (carry-forward, not blocking): matrix axes precedence sentence (kind columns
 - `[RENDER-CHECK NEEDED]` (§3c): health-pill palette contrast → build-task acceptance criterion.
 - Assumptions A2 (module-series registry) and A3 (warm assembly <1s) → validate during build.
 
-## Gate (cycle 3 — CAP REACHED)
+## Gate (cycle 3 — CAP REACHED → operator chose apply-and-drift-check)
 
-Review cycle cap reached (3/3) with 6 merged MUST-FIX findings outstanding, each carrying a converged reviewer-specified resolution. Escalated to the operator per `/team-auto` protocol — see `auto-pause.md`.
+Review cycle cap reached (3/3) with 6 merged MUST-FIX findings, each carrying a converged reviewer-specified resolution. Escalated per `/team-auto`; operator chose **Option 1: apply F1–F6 as specified, verify via `/team-drift` instead of a 4th review cycle**.
+
+**Resolution (design rev 5, 2026-06-13):**
+- **F1** (paused-overdue move fires): §4.2 step 4a now STAGES the paused-snapshot insert — `scheduleTask(processAfter = now + guard_grace)` → `pauseTask(target)` → `updateTask(processAfter = snapshot)`; the target is never simultaneously pending and due. Stale "imminent-fire edge" sentence deleted.
+- **F2** (recovery double-restore): §4.2 step 2b predicate is now FLEET-WIDE zero-live-rows (the step-6 invariant), and `restoreTaskRow` re-checks the precondition immediately before insert (idempotent compensation).
+- **F3** (`force=skip-next` unimplementable): dropped to honest documented-residual — `force` fires with a confirm stating the next occurrence may still fire; 409-default is the real protection; true skip-next deferred to v2 (§5 OUT).
+- **F4** (`grace` undefined): `guard_grace = max(2 × SWEEP_INTERVAL, 2min)` defined as a distinct §4.0 constant, separate from §4.1's stall formula.
+- **F5** (snapshot vs privacy guarantee): §4.4 reconciled — `move_intent.detail_json` is the one time-bounded exception; purged on `resolved_at` stamp; standing guarantee reworded precisely.
+- **F6** (run-now on `unknown` unsafe): matrix cell flipped to fail-closed `503 claim_state_unreadable`.
+- LOW carry-forwards applied inline: matrix axes-precedence sentence, matrix-as-one-table-driven-structure enforcement note.
+
+Verified by `/team-drift` (rev 5 design vs the F1–F6 resolution claims) rather than a 4th review cycle — see drift report. **MUST-FIX outstanding: 0.**

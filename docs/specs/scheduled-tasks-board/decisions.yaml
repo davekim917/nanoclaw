@@ -239,6 +239,20 @@ assumptions:
     constraint_refs: [C1, C5]
     affects_groups: []
 
+  - id: D19
+    stage: design
+    description: "Cap-reached cycle-3 MUST-FIX resolution path (operator-chosen)"
+    chosen: "Apply all 6 converged reviewer-specified fixes (F1-F6) as design rev 5, verify via /team-drift instead of a 4th review cycle (cap forbids cycle 4)."
+    rejected:
+      - option: "Waive remaining MUST-FIX"
+        reason: "They are correctness findings (paused-move double-fire, unimplementable force semantics, audit-privacy self-contradiction), not style — not waivable without changing observable behavior."
+      - option: "Rework via /team-design re-entry"
+        reason: "Every finding carried a converged, cited fix needing no new design exploration — re-entry is heavier than the findings warrant."
+      - option: "Simplify-to-MVP: cut move from v1"
+        reason: "Operator chose to keep move; the staged-insert + fleet-wide-recovery fixes make it sound."
+    constraint_refs: [C1, C2]
+    affects_groups: []
+
 assumptions_design:
   - id: A2
     stage: design
@@ -286,6 +300,7 @@ review_cycles:
     should_fix_count: 0
     wont_fix_count: 0
     completed_at: 2026-06-12T21:05:00Z
+    resolution: "cap-reached; operator chose apply-and-drift-check (D19). 6 MUST-FIX → design rev 5; verified via /team-drift, not a 4th cycle."
 
 auto_judgments:
   - stage: Review
