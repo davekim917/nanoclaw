@@ -52,8 +52,8 @@ Sequencing: **A → B → D → C**; **E parallel** with the host chain after pl
 | `src/dashboard/api/scheduled-read.test.ts` | B | B3,B4 | CREATE |
 | `src/dashboard/api/scheduled-move.ts` | D | D1,D2 | CREATE |
 | `src/dashboard/api/scheduled-move.test.ts` | D | D1,D2 | CREATE |
-| `src/host-sweep.ts` | D | D3 | MODIFY |
-| `src/host-sweep.test.ts` | D | D3 | MODIFY |
+| `src/host-sweep.ts` | D | D3,D4 | MODIFY |
+| `src/host-sweep.test.ts` | D | D3,D4 | MODIFY |
 | `src/dashboard/api/scheduled-mutations.ts` | C | C1-C5 | CREATE |
 | `src/dashboard/api/scheduled-mutations.test.ts` | C | C1-C5 | CREATE |
 | `src/dashboard/index.ts` | C | C6 | MODIFY |
@@ -253,6 +253,7 @@ Owns the schema changes and the shared host modules every other host group impor
   function invalidateScheduledCache(): void   // bumps gen, clears data
   ```
   - ASSERT: `writeAudit` NEVER stores a verbatim script — scripts are hash-only EXCEPT the `move_intent` detail_json snapshot (the one F5 exception).
+  - ASSERT: for a non-`move_intent` move audit row, `detail_json` stores secret-delta COUNTS + hashes ONLY — secret NAMES are never persisted (names live only in the live preview response; persisting them would re-open the enumeration hole §4.5 closes; design §4.4).
   - ASSERT: `purgeIntentBody` nulls detail_json AND stamps resolved_at in one statement (F5 — body lives only until resolve).
   - ASSERT: `decodeKey` of a malformed/non-base64url string returns null (no throw — handler maps to 400).
   - ASSERT: `canManageScheduled` returns false for member/scoped-admin/unknown; true only for owner|global-admin (D7).
@@ -325,7 +326,8 @@ Owns the snapshot assembly + health derivation + the two GET endpoints. Pre-cond
   - ASSERT: a row overdue with outbound.db unreadable → `unknown` (NOT stalled, NOT healthy) — claim-state honesty (F6/S9).
   - ASSERT: stall grace is capped at 24h absolute — a weekly series late by 2 days is `stalled`, not `healthy` (S11).
   - ASSERT: a terminal-with-recurrence row, no live successor, aged > 2×SWEEP_INTERVAL → `strand` (the swallowed-parse-error signature, §4.1).
-  - ASSERT: two live rows for one series → both flagged (duplicate-successor; the latest-row read shape alone would hide one).
+  - ASSERT: two live rows for one series → both flagged (duplicate-successor detector: `... WHERE status IN ('pending','paused') AND kind='task' GROUP BY series_id HAVING COUNT(*)>1`, design §4.1); the list/detail endpoints return ALL live rows for a duplicate series (not just the MAX(seq) row — else one fireable duplicate stays hidden).
+  - ASSERT: one-off rows use overdue interval = 2 × SWEEP_INTERVAL (design §4.1 "one-offs: same overdue check with interval = 2 sweeps").
   - ASSERT: health is DERIVED, never read from `status` alone (D6 — the May/June die-off left no failed row).
 - **Named test cases:**
   ```
@@ -344,20 +346,23 @@ Owns the snapshot assembly + health derivation + the two GET endpoints. Pre-cond
 ### Task B3 — `GET /dashboard/api/scheduled` (list)
 - **File:** `src/dashboard/api/scheduled-read.ts` (CREATE — exports `scheduledListHandler`)
 - **Test file:** `src/dashboard/api/scheduled-read.test.ts`
-- **Operation:** CREATE. AuthHandler that returns the cached snapshot (or triggers single-flight assembly), filtered by the caller's scope (sessions.ts:207-224 pattern, disclose-as-not-found — C7). Serves cache when warm (<5s); cold → awaits assembly.
+- **Operation:** CREATE. AuthHandler that returns the cached snapshot (or triggers single-flight assembly), filtered by the caller's scope (sessions.ts:207-224 pattern, disclose-as-not-found — C7). Serves cache when warm (<5s); cold → awaits assembly. The snapshot ALSO folds in **audit-only repair rows** (design §4.2 step 5 / §4.4): unresolved `move_restore_failed` rows AND `move_intent` rows older than one sweep with no live row fleet-wide (read from central `scheduled_audit` via `idx_scheduled_audit_unresolved`) surface as synthetic `strand`/stalled entries — else a double-failure move is durably recorded yet invisible (the failure mode the board exists to prevent).
 - **Interface:** `GET /dashboard/api/scheduled → 200 { rows: ScheduledRow[], counts, degraded, assembled_at }` (rows scope-filtered).
   - ASSERT: a scoped admin sees only rows for their `allowed_group_ids`; owner/no_filter sees all (C7 — fleet-wide = authorized groups, not bypass).
   - ASSERT: `available_verbs` present on every row (frontend renders buttons from this — the single-source matrix output).
   - ASSERT: response includes `degraded` flag when assembly exceeded the budget (S8).
+  - ASSERT: unresolved `move_restore_failed` / stale-unresolved `move_intent` audit rows (no live row fleet-wide) appear as synthetic stalled/strand rows in the snapshot — audit-only repair rows are visible on the board (design §4.2 step 5).
 - **Named test cases:**
   ```
   test_list_scope_filters_rows: scoped-admin of group X → rows all have agent_group_id in allowed set
   test_list_owner_sees_all: owner (no_filter) → rows span multiple groups
   test_list_includes_available_verbs: each row has a non-undefined available_verbs array
+  test_list_surfaces_unresolved_repair_row: an unresolved move_restore_failed audit row with no live row → a synthetic stalled row appears in the list
   ```
 - **Acceptance criteria:**
   - [ ] Scope-filtered list; `available_verbs` + `counts` + `degraded` present
   - [ ] Warm cache served without re-assembly within TTL
+  - [ ] Audit-only repair rows (move_restore_failed / stale move_intent) surface as stalled (design §4.2 step 5)
 - **Pre-conditions:** B1, B2 complete.
 
 ### Task B4 — `GET /dashboard/api/scheduled/:key` (detail)
@@ -386,14 +391,14 @@ Owns the move preview/execute endpoints and the sweep recovery hook — the F1-F
 - **File:** `src/dashboard/api/scheduled-move.ts` (CREATE — exports `movePreviewHandler`)
 - **Test file:** `src/dashboard/api/scheduled-move.test.ts`
 - **Operation:** CREATE. Gated at MUTATION tier (`canManageScheduled` — it reads vault secret names; M5/SEC-1). Resolve target MG (translate `channel_type` to the target group's sibling variant — same platform_id; design §2 A1). Run scheduleTask's wiring validation WITHOUT writing. Compute the secret-scope delta as NAMES (per-group onecliSecrets ∪ workgroup baseline) — names only, never values, enumeration bounded to source∪target (D8). Return `deltaHash` for the execute TOCTOU re-check.
-- **Interface:** `POST /scheduled/:key/move/preview {targetAgentGroupId, targetMessagingGroupId} → 200 { wiringOk, gains:string[], losses:string[], crossWorkgroup:boolean, scriptPresent:boolean, environmentDeltaChecked:false, deltaHash } | 403 | 409`
-  - ASSERT: preview requires `canManageScheduled` (owner/global-admin) — a scoped admin CANNOT enumerate a target's secret names (M5/SEC-1).
+- **Interface:** `POST /scheduled/:key/move/preview {targetAgentGroupId, targetMessagingGroupId} → 200 { wiringOk, gains:string[], losses:string[], crossWorkgroup:boolean, scriptPresent:boolean, environmentDeltaChecked:false, deltaHash } | 404 | 409`
+  - ASSERT: preview requires `canManageScheduled` (owner/global-admin) — a scoped admin CANNOT enumerate a target's secret names (M5/SEC-1). A non-manage caller (incl. scoped-admin) and an out-of-scope `:key`/target both get **404 disclose-as-not-found** (design §4.2 "404 otherwise" + C7 — never 403, which would reveal the resource/target exists).
   - ASSERT: gains/losses are secret NAMES/UUIDs only; no secret VALUES appear in the response (D8).
   - ASSERT: `environmentDeltaChecked:false` is returned (v1 checks secrets only; W2 — config delta is v2).
   - ASSERT: unwired (target group, target channel) pair → preview reports `wiringOk:false` (fail-closed, C2).
 - **Named test cases:**
   ```
-  test_preview_requires_mutation_tier: scoped-admin caller → 403 (cannot enumerate target secret names)
+  test_preview_requires_mutation_tier: scoped-admin caller → 404 disclose-as-not-found (cannot enumerate target secret names; existence not revealed)
   test_preview_returns_names_not_values: gains/losses contain secret identifiers; no value-shaped strings
   test_preview_unwired_target: target group not wired to target channel → wiringOk:false
   test_preview_emits_delta_hash: response has a stable deltaHash for the same inputs
@@ -413,6 +418,8 @@ Owns the move preview/execute endpoints and the sweep recovery hook — the F1-F
   - ASSERT: post-move invariant — exactly ONE live (pending/paused, recurrence-set) row fleet-wide for the series (C2).
   - ASSERT: a stale `:key` (touched 0 rows) → 409 stale_key, never a silent no-op (§3b).
   - ASSERT: changed delta between preview and execute → 409 delta_changed (TOCTOU, SEC-2).
+  - ASSERT: the audit write is TWO rows — one keyed to the source group, one to the target group — sharing a `correlation_id` (design §4.4 "move rows keyed to BOTH groups, one row per side"), so each side's audit tail is complete without a cross-scope read.
+  - ASSERT: a `:key` whose session inbound.db is unreadable → 503 `session_unreadable` (fail-closed, design §3a — mutations against unreadable-session keys do not proceed).
 - **Named test cases:**
   ```
   test_move_paused_stages_insert_never_due_pending:
@@ -470,9 +477,36 @@ Owns the move preview/execute endpoints and the sweep recovery hook — the F1-F
   - [ ] Fleet-wide predicate; idempotent restore; additive hook (firing path untouched); body purged on resolve
 - **Pre-conditions:** A4, A6, D2 complete (shares the move-intent contract).
 
+### Task D4 — 90-day audit-body retention prune (sweep)
+- **File:** `src/host-sweep.ts` (same MODULE-HOOK block added in D3; one additional pruning statement)
+- **Test file:** `src/host-sweep.test.ts` (add cases)
+- **Operation:** MODIFY. In the same sweep hook, prune `scheduled_audit` rows older than 90 days by NULLing the body columns ONLY — `before_preview`, `after_preview`, `detail_json` — while KEEPING the action-metadata row (id, ts, actor, action, agent_group_id, session_id, series_id, hashes, correlation_id, resolved_at) for the series' lifetime (design §4.4 retention). This preserves cancel-vs-completed distinguishability (the `action='cancel'` join, §4.3) indefinitely while bounding the plaintext footprint.
+- **Interface:** internal `pruneAuditBodies(centralDb): void` invoked once per sweep tick.
+  - ASSERT: at >90 days, body columns (before_preview/after_preview/detail_json) are NULLed; the row itself is NOT deleted (action metadata survives for series lifetime — design §4.4).
+  - ASSERT: an `action='cancel'` row older than 90 days still exists (with NULLed bodies) so history can still label a board-cancellation (§4.3).
+  - ASSERT: rows younger than 90 days are untouched.
+- **Named test cases:**
+  ```
+  test_prune_nulls_bodies_after_90d:
+    Setup: scheduled_audit row ts = 91 days ago with before_preview/detail_json set
+    Action: pruneAuditBodies(db)
+    Assert: that row still exists; before_preview/after_preview/detail_json are NULL; actor/action/hashes intact
+  test_prune_keeps_recent_bodies:
+    Setup: row ts = 10 days ago with bodies set
+    Action: pruneAuditBodies(db)
+    Assert: bodies unchanged
+  test_prune_preserves_cancel_metadata:
+    Setup: action='cancel' row 100 days old
+    Action: pruneAuditBodies(db)
+    Assert: row present, action='cancel' intact (history can still label the cancellation)
+  ```
+- **Acceptance criteria:**
+  - [ ] 90d prune NULLs bodies only; action metadata kept for series lifetime; cancel-distinguishability survives
+- **Pre-conditions:** A1 (table), D3 (the sweep hook block this extends).
+
 ## Group C: Simple Mutations & Route Registration
 
-Owns the five non-move mutation handlers and the single route-registration edit. Pre-condition: A + B + D complete (registration imports B's GET handlers and D's move handlers). All handlers: `canManageScheduled` gate, decode `:key`, apply `verbVerdict`, `writeAudit`, `invalidateScheduledCache` after write.
+Owns the five non-move mutation handlers and the single route-registration edit. Pre-condition: A + B + D complete (registration imports B's GET handlers and D's move handlers). **Every mutation handler (C1-C4) shares this contract:** `canManageScheduled` gate (404 disclose-as-not-found for non-manage/out-of-scope — never 403); decode `:key` (malformed → 400); if the `:key`'s session inbound.db is unreadable → **503 `session_unreadable`** (fail-closed, design §3a); apply `verbVerdict`; `writeAudit`; **emit a `session_event` SSE frame with the row's owning `agent_group_id` (NEVER null — null bypasses `_scopeAllows` per-frame filtering, §4.5)**; `invalidateScheduledCache()` after write.
 
 ### Task C1 — `PUT /dashboard/api/scheduled/:key` (edit prompt/script/cron)
 - **File:** `src/dashboard/api/scheduled-mutations.ts` (CREATE — exports `editHandler`)
@@ -480,7 +514,7 @@ Owns the five non-move mutation handlers and the single route-registration edit.
 - **Operation:** CREATE. Edit via `updateTask` (db.ts:78 — merges prompt/script into content, sets recurrence/process_after columns). `verbVerdict('edit')` → 409 source_busy if claimed. Cron edits recompute `process_after` via `CronExpressionParser.parse(cron,{tz:TIMEZONE})` (M6 — else the board shows new cron while old slot fires). Validate cron with the firing-path parser; reject invalid with 400. Bounds: prompt ≤ 8000, script ≤ 4000 (C8). Audit before/after (hashed).
 - **Interface:** `PUT /scheduled/:key {prompt?, script?, cron?} → 200 {updated:true} | 400 (bad_cron|too_long) | 403 | 409 (source_busy|stale_key)`
   - ASSERT: a cron edit recomputes `process_after` to the next occurrence (M6) — not left at the old slot.
-  - ASSERT: invalid cron string → 400 bad_cron (parser-validated, identical call to recurrence.ts:31); never silently accepted (would create a strand).
+  - ASSERT: invalid cron string → 400 bad_cron (parser-validated via `CronExpressionParser.parse(cron,{tz:TIMEZONE})` identical to recurrence.ts:31, PLUS `.next()` called twice to confirm a finite interval; design §4.5); never silently accepted (would create a strand).
   - ASSERT: prompt >8000 or script >4000 → 400 too_long (C8).
   - ASSERT: edit on a claimed row → 409 source_busy (matrix).
 - **Named test cases:**
@@ -604,6 +638,7 @@ Owns the Scheduled view — separate build tree (Vite/React/vitest-jsdom), zero 
   - ASSERT: default sort surfaces unhealthy (stalled/late/unknown) rows first — a die-off is the first thing visible, never row 28 (design §3c, the feature's reason for being).
   - ASSERT: strip shows distinct `unknown` and `unreadable` (grey) counts — observability failures are visible at the summary layer (S14).
   - ASSERT: `degraded:true` from the API renders a visible degraded indicator on the strip (S8).
+  - ASSERT: synthetic repair rows (move_restore_failed / stale move_intent, from B3's snapshot) render in the stalled section so a double-failure move is visible (design §4.2 step 5).
   - **[RENDER-CHECK NEEDED]** health-pill palette (stalled = attention-red on dark card bg) — design §3c flag.
 - **Named test cases:**
   ```
@@ -622,7 +657,7 @@ Owns the Scheduled view — separate build tree (Vite/React/vitest-jsdom), zero 
 - **Operation:** MODIFY (same file). Body: collapsible sections grouped by agent group; each row shows name, channel + thread/root, cron + next fire (UTC + service-local — both, C6), ownership badge (module-owned → badge with owner), health pill, last-fired. Row click → opens the drawer (E4).
 - **Interface:** internal `<GroupSection>` / `<ScheduledRow>` components.
   - ASSERT: each row shows BOTH UTC and service-local next-fire (C6).
-  - ASSERT: module-owned rows render the owner badge (D2).
+  - ASSERT: module-owned rows render the owner badge; thread-loop rows render a thread-bound badge (§5 IN — move disabled for them, shown via `available_verbs`).
   - ASSERT: next-fire/health/cron come from the API row (no client-side health re-derivation — single source).
 - **Named test cases:**
   ```

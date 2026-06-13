@@ -303,6 +303,22 @@ review_cycles:
     resolution: "cap-reached; operator chose apply-and-drift-check (D19). 6 MUST-FIX → design rev 5; verified via /team-drift, not a 4th cycle."
 
 auto_judgments:
+  - stage: Build
+    iteration: 1
+    decision: "Pre-build drift found the plan under-encoded 2 MISSING + 1 DIVERGED + 6 PARTIAL mechanisms vs design rev 5; reconciled the plan to the design (added Task D4 audit-prune, B3/E1 repair-row surfacing, preview 404, +6 ASSERTs) rather than escalating drift-gate."
+    alternatives_considered:
+      - "Escalate drift-gate to the operator"
+      - "Proceed to build with the gaps (would produce code missing the 90d prune + invisible double-failure moves)"
+    grounding:
+      - "design.md §4.4 (90d body prune + both-group audit keying), §4.2 step 5 (move_restore_failed surfaced as stalled), §3a (503 session_unreadable), §4.1 (dup kind='task', one-off 2-sweep interval), §4.5 (.next() twice, SSE non-null group) — all already in the SOT; the plan merely omitted them"
+      - "pre-build-drift.md: both extractors (Claude + Codex) independently flagged MISSING-1 (90d prune) and converged on MISSING-2"
+      - "team-build pre-build gate: 'Fix the plan to match the design (the plan was wrong)' is the prescribed action for plan-under-encodes-design"
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-06-13T03:30:00Z
   - stage: Review
     iteration: 1
     decision: "Relabel the two informal pre-approval reviewer passes from review_cycles to design_iteration_cycles; formal /team-review counting starts at this invocation (1/3)."
