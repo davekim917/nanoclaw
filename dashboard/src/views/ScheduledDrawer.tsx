@@ -356,7 +356,12 @@ function EditForm({
       data-testid="sched-edit-form"
       onSubmit={(e) => {
         e.preventDefault();
-        onSubmit({ prompt: p, script: s, cron: c });
+        // Only submit `cron` when the user actually has one. A one-off row has
+        // row.cron === null → c === '' → submitting cron:'' would 400 (bad_cron)
+        // and block prompt/script edits. Omitting it leaves the schedule unchanged.
+        const body: { prompt?: string; script?: string; cron?: string } = { prompt: p, script: s };
+        if (c.trim() !== '') body.cron = c.trim();
+        onSubmit(body);
       }}
     >
       {isModule && (

@@ -236,8 +236,16 @@ function parseUtcMs(s: string | null): number | null {
  *   completed + no reply → completed (no chat output)   (the D16 merge)
  *   failed → failed · expired → missed · board-cancelled (audit) → cancelled
  */
-function outcomeFor(row: HistoryRow, replyTs: string | undefined, cancelledSeries: boolean): FireOutcomeLabel {
-  if (cancelledSeries && row.status === 'completed') return 'cancelled';
+function outcomeFor(row: HistoryRow, replyTs: string | undefined, cancelTsMs: number | null): FireOutcomeLabel {
+  // Label 'cancelled' ONLY for the occurrence the board-cancel actually ended — a
+  // completed row whose scheduled due (process_after) is at/after the cancel audit
+  // ts. Prior completed fires (due < cancelTs) genuinely RAN and keep their ran /
+  // no-output label. (Was a series-level boolean that relabeled every prior run as
+  // cancelled the moment the series had any cancel audit.)
+  if (cancelTsMs !== null && row.status === 'completed') {
+    const dueMs = parseUtcMs(row.process_after);
+    if (dueMs !== null && dueMs >= cancelTsMs) return 'cancelled';
+  }
   if (row.status === 'failed') return 'failed';
   if (row.status === 'expired') return 'missed';
   if (row.status === 'completed') {
@@ -255,7 +263,7 @@ function readHistory(
   inboundPath: string,
   outboundPath: string,
   seriesId: string,
-  cancelledSeries: boolean,
+  cancelTsMs: number | null,
 ): FireOutcome[] {
   let inDb: Database.Database | null = null;
   let outDb: Database.Database | null = null;
@@ -292,7 +300,7 @@ function readHistory(
     return rows.map((r) => ({
       id: r.id,
       ts: r.process_after,
-      outcome: outcomeFor(r, replies.get(r.id), cancelledSeries),
+      outcome: outcomeFor(r, replies.get(r.id), cancelTsMs),
     }));
   } catch (err) {
     log.warn('scheduled-detail: history read failed', {
@@ -328,14 +336,14 @@ function readAuditTail(seriesId: string): AuditTailRow[] {
   }
 }
 
-function cancelledByBoard(seriesId: string): boolean {
+function cancelAuditTsMs(seriesId: string): number | null {
   try {
     const row = getDb()
-      .prepare("SELECT 1 AS ok FROM scheduled_audit WHERE series_id = ? AND action = 'cancel' LIMIT 1")
-      .get(seriesId) as { ok: number } | undefined;
-    return !!row;
+      .prepare("SELECT ts FROM scheduled_audit WHERE series_id = ? AND action = 'cancel' ORDER BY id ASC LIMIT 1")
+      .get(seriesId) as { ts: string } | undefined;
+    return row ? parseUtcMs(row.ts) : null;
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -426,8 +434,8 @@ export const scheduledDetailHandler: AuthHandler = async (_req, params, ctx) => 
   const prompt = typeof parsed.prompt === 'string' ? parsed.prompt : live.content;
   const script = typeof parsed.script === 'string' ? (parsed.script as string) : null;
 
-  const cancelledSeries = cancelledByBoard(decoded.seriesId);
-  const history = readHistory(inboundPath, outboundPath, decoded.seriesId, cancelledSeries);
+  const cancelTsMs = cancelAuditTsMs(decoded.seriesId);
+  const history = readHistory(inboundPath, outboundPath, decoded.seriesId, cancelTsMs);
 
   const body: Record<string, unknown> = { row, prompt, script, history };
 

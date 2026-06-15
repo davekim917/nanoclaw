@@ -432,6 +432,49 @@ describe('scheduledDetailHandler', () => {
     expect(history.find((h) => h.outcome === 'completed (no chat output)')).toBeDefined();
   });
 
+  it('test_detail_cancel_labels_only_post_cancel_fire', async () => {
+    // A board-cancel must NOT relabel PRIOR successful runs as 'cancelled' — only
+    // the occurrence the cancel actually ended (due at/after the cancel audit ts).
+    addGroup('ag-1', 'G1');
+    addMg('mg-1', 'discord', 'd:1', 'chan-1');
+    addSession('s1', 'ag-1', 'mg-1');
+    const { inbound } = seedSession('ag-1', 's1');
+    insertRow(inbound, { id: 'live', series_id: 'ser-1' });
+    // A prior successful run — due 2h BEFORE the cancel. Must keep a non-cancelled label.
+    insertRow(inbound, {
+      id: 'prior-run',
+      series_id: 'ser-1',
+      status: 'completed',
+      recurrence: null,
+      process_after: isoIn(-7200_000),
+      timestamp: isoIn(-7200_000),
+    });
+    // The cancelled occurrence — the future slot cancelTask terminalized (due AFTER the cancel).
+    insertRow(inbound, {
+      id: 'cancelled-occ',
+      series_id: 'ser-1',
+      status: 'completed',
+      recurrence: null,
+      process_after: isoIn(3600_000),
+      timestamp: isoIn(-1800_000),
+    });
+    // Board cancel audit stamped at NOW (the cancel ts) — controlled, not datetime('now').
+    getDb()
+      .prepare(
+        "INSERT INTO scheduled_audit (ts, actor, action, agent_group_id, session_id, series_id) VALUES (?, 'owner', 'cancel', 'ag-1', 's1', 'ser-1')",
+      )
+      .run(isoIn(0));
+    addUser('owner');
+    grant('owner', 'owner', null);
+
+    const key = encodeKey('ag-1', 's1', 'ser-1');
+    const res = (await scheduledDetailHandler(detailReq(), { key }, ctxFor('owner', OWNER_SCOPES)))!;
+    const history = (await readJson(res)).history as Array<{ id: string; outcome: string }>;
+    // Prior run keeps its real outcome; only the post-cancel occurrence is 'cancelled'.
+    expect(history.find((h) => h.id === 'prior-run')?.outcome).not.toBe('cancelled');
+    expect(history.find((h) => h.id === 'cancelled-occ')?.outcome).toBe('cancelled');
+  });
+
   it('rejects a malformed key with 400 (codec contract — bad request, not hidden resource)', async () => {
     addUser('owner');
     grant('owner', 'owner', null);

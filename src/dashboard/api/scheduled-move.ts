@@ -21,7 +21,7 @@ import Database from 'better-sqlite3';
 
 import { randomUUID } from 'crypto';
 
-import { GROUPS_DIR } from '../../config.js';
+import { DATA_DIR, GROUPS_DIR } from '../../config.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import { getWorkgroupOnecliSecrets } from '../../db/agent-groups.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
@@ -70,7 +70,11 @@ function moveOpts(): MoveOptions {
       nowMs: testOptions.nowMs,
     };
   }
-  return { dataDir: '', groupsDir: GROUPS_DIR, nowMs: Date.now() };
+  // Production default MUST be DATA_DIR (matches readOpts in scheduled-read.ts).
+  // A '' default resolved session DBs under <cwd>/v2-sessions instead of
+  // <cwd>/data/v2-sessions → every real move hit the missing-source guard and
+  // returned session_unreadable (move broken outside tests, which inject a dir).
+  return { dataDir: DATA_DIR, groupsDir: GROUPS_DIR, nowMs: Date.now() };
 }
 
 function json(body: unknown, status = 200): Response {

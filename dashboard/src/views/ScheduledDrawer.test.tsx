@@ -242,4 +242,33 @@ describe('ScheduledDrawer', () => {
     );
     expect(screen.getByTestId('sched-audit-tail')).toBeTruthy();
   });
+
+  // ─── edit form: cron is omitted for a one-off (row.cron === null) ───
+  // A one-off row has no cron → the cron field is empty → submitting cron:'' would
+  // hit the backend's empty-cron guard (400 bad_cron) and block the prompt/script
+  // edit. The form must OMIT cron when empty so the edit succeeds.
+
+  it('test_edit_one_off_omits_cron: a one-off edit submits no cron field', async () => {
+    await renderDrawer(
+      detail({ script: 'echo x' }, { kind: 'one_off', cron: null, available_verbs: ['edit', 'cancel'] }),
+    );
+    await userEvent.click(verbButton('edit'));
+    const form = await screen.findByTestId('sched-edit-form');
+    await userEvent.click(within(form).getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(api.editScheduled).toHaveBeenCalledTimes(1));
+    const body = vi.mocked(api.editScheduled).mock.calls[0][1];
+    expect(body).not.toHaveProperty('cron');
+    expect(body).toMatchObject({ prompt: 'Send the morning briefing.', script: 'echo x' });
+  });
+
+  it('test_edit_recurring_includes_cron: a recurring edit still submits its cron', async () => {
+    // default row is recurring with cron '0 9 * * *' — the omit-when-empty logic
+    // must NOT drop a real cron.
+    await renderDrawer(detail({}, { available_verbs: ['edit', 'pause', 'cancel'] }));
+    await userEvent.click(verbButton('edit'));
+    const form = await screen.findByTestId('sched-edit-form');
+    await userEvent.click(within(form).getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(api.editScheduled).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(api.editScheduled).mock.calls[0][1]).toMatchObject({ cron: '0 9 * * *' });
+  });
 });
