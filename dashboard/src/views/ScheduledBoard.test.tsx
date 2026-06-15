@@ -38,7 +38,7 @@ vi.mock('./ScheduledDrawer.js', () => ({
   ),
 }));
 
-import { ScheduledBoard } from './ScheduledBoard.js';
+import { ScheduledBoard, filterRows } from './ScheduledBoard.js';
 import useSWR from 'swr';
 import type { ScheduledRow, ScheduledSnapshot } from '../lib/api.js';
 
@@ -262,9 +262,11 @@ describe('ScheduledBoard', () => {
     expect(container.querySelector('.nc-sched-row[data-series-id="h"]')).toBeNull();
   });
 
-  it('test_search_matches_prompt: search filters rows whose prompt contains the term', async () => {
-    // prompt is not on the row; the board searches name + series_id + channel.
-    // Use series_id as the searchable text surrogate exercised by the board.
+  it('test_search_matches_on_row_fields_instantly: name/series_id filter with zero latency', async () => {
+    // The INSTANT client haystack path (name/group/channel/cron). Prompt/script
+    // search is server-side (covered by filterRows unit tests + the search
+    // endpoint tests) and unions in via promptMatchKeys; this asserts the
+    // zero-latency on-row match that needs no round-trip.
     mockData(
       snapshot([
         row({ series_id: 'morning-briefing', agent_group_name: 'Axie' }),
@@ -292,5 +294,46 @@ describe('ScheduledBoard', () => {
     emitEvent('session_event', { kind: 'container_state' });
     await waitFor(() => expect(mutate).toHaveBeenCalled(), { timeout: 1000 });
     expect(mutate.mock.calls.length).toBe(1);
+  });
+});
+
+// ── filterRows — prompt/title search union (pure unit) ───────────────────────
+describe('filterRows — prompt/title search', () => {
+  it('test_filterrows_includes_prompt_match_key_when_on_row_haystack_misses', () => {
+    const rows = [
+      row({ series_id: 'morning-brief', key: 'K1', agent_group_name: 'Axie', channel_name: '#ops', cron: '0 9 * * *' }),
+      row({ series_id: 'nightly-synth', key: 'K2', agent_group_name: 'Axie', channel_name: '#ops', cron: '0 22 * * *' }),
+    ];
+    // 'zebra' matches NEITHER row's on-row fields; the server reports K1 matches
+    // (its prompt body contains zebra). K1 is included via promptMatchKeys; K2 not.
+    const out = filterRows(rows, { ownership: 'all', health: 'all', search: 'zebra', promptMatchKeys: new Set(['K1']) });
+    expect(out.map((r) => r.key)).toEqual(['K1']);
+  });
+
+  it('test_filterrows_on_row_match_works_without_server_keys', () => {
+    const rows = [row({ series_id: 'morning-brief', key: 'K1' }), row({ series_id: 'nightly', key: 'K2' })];
+    // No promptMatchKeys (search endpoint hasn't resolved) — the on-row haystack
+    // still matches 'morning' instantly. Graceful degradation, not a hard dep.
+    const out = filterRows(rows, { ownership: 'all', health: 'all', search: 'morning' });
+    expect(out.map((r) => r.key)).toEqual(['K1']);
+  });
+
+  it('test_filterrows_excludes_rows_matching_neither_haystack_nor_keys', () => {
+    const rows = [row({ series_id: 'alpha', key: 'K1' }), row({ series_id: 'beta', key: 'K2' })];
+    const out = filterRows(rows, { ownership: 'all', health: 'all', search: 'zzz', promptMatchKeys: new Set(['K9']) });
+    expect(out).toEqual([]);
+  });
+
+  it('test_filterrows_prompt_match_still_respects_ownership_and_health_facets', () => {
+    // A prompt match must NOT resurrect a row excluded by a facet — the facet
+    // checks run before the search clause, so the union can't bypass them.
+    const rows = [row({ series_id: 'x', key: 'K1', module_owner: 'memory', health: 'healthy' })];
+    const out = filterRows(rows, {
+      ownership: 'operator', // K1 is module-owned → excluded by the ownership facet
+      health: 'all',
+      search: 'zebra',
+      promptMatchKeys: new Set(['K1']),
+    });
+    expect(out).toEqual([]);
   });
 });

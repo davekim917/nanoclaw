@@ -403,6 +403,19 @@ export async function listScheduled(params?: { group_id?: string }): Promise<Sch
   return apiFetch<ScheduledSnapshot>(`/dashboard/api/scheduled${query ? `?${query}` : ''}`);
 }
 
+/**
+ * Prompt/title search: returns the scope-filtered row keys whose name/group/
+ * channel/cron OR prompt/script match `q`. Server-side because prompt/script are
+ * deliberately absent from the lean list snapshot. Returns only KEYS (no prompt
+ * text on the wire); the board unions these with its instant on-row haystack.
+ */
+export async function searchScheduled(q: string, params?: { group_id?: string }): Promise<{ keys: string[] }> {
+  const qs = new URLSearchParams();
+  qs.set('q', q);
+  if (params?.group_id) qs.set('group_id', params.group_id);
+  return apiFetch<{ keys: string[] }>(`/dashboard/api/scheduled/search?${qs.toString()}`);
+}
+
 export async function getScheduledDetail(key: string): Promise<ScheduledDetail> {
   return apiFetch<ScheduledDetail>(`/dashboard/api/scheduled/${encodeURIComponent(key)}`);
 }

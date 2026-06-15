@@ -81,6 +81,13 @@ export interface ScheduledSnapshot {
    * over the caller's in-scope groups rather than reusing the fleet total.
    */
   unreadable_by_group: Record<string, number>;
+  /**
+   * Server-side ONLY search blob per row key (lowercased name/group/channel/cron
+   * PLUS parsed prompt + script). Powers the `?q=` search endpoint's prompt/script
+   * matching. NEVER serialized to the wire — the list/search handlers pick fields
+   * explicitly and never emit this map, so prompt/script stay detail-tier.
+   */
+  search_index: Record<string, string>;
   assembled_at: string;
 }
 
@@ -259,6 +266,8 @@ interface SessionDescriptor {
 
 interface SessionReadResult {
   rows: ScheduledRow[];
+  /** Per-row-key server-side search blob (incl. prompt/script). Wire-excluded. */
+  searchByKey: Record<string, string>;
   unreadable: number;
 }
 
@@ -344,6 +353,21 @@ function parseContent(content: string): {
   };
 }
 
+/**
+ * Server-side search blob for a row: lowercased name/group/channel/cron PLUS the
+ * parsed prompt + script. Used only by the `?q=` search endpoint — NEVER
+ * serialized to the wire (prompt/script stay detail-tier). Re-parses content
+ * (cheap: one JSON.parse/row) to keep rawToRow's return type unchanged; the
+ * malformed-JSON fallback in parseContent means the raw content is still
+ * searchable even when it isn't valid prompt/script JSON.
+ */
+function searchTextFor(raw: RawRow, row: ScheduledRow): string {
+  const { prompt, script } = parseContent(raw.content);
+  return [row.series_id, row.agent_group_name, row.channel_name ?? '', row.cron ?? '', prompt, script ?? '']
+    .join(' ')
+    .toLowerCase();
+}
+
 function kindOf(raw: RawRow): SeriesKind {
   if (raw.recurrence === null) return 'one_off';
   if (raw.thread_id) return 'thread_loop';
@@ -417,7 +441,7 @@ function readSession(
   nowMs: number,
 ): SessionReadResult {
   const inboundPath = inboundPathOf(dataDir, desc.agentGroupId, desc.sessionId);
-  if (!fs.existsSync(inboundPath)) return { rows: [], unreadable: 0 };
+  if (!fs.existsSync(inboundPath)) return { rows: [], searchByKey: {}, unreadable: 0 };
 
   let inDb: Database.Database | null = null;
   try {
@@ -443,32 +467,38 @@ function readSession(
     const outbound = readOutbound(outboundPathOf(dataDir, desc.agentGroupId, desc.sessionId));
 
     const rows: ScheduledRow[] = [];
+    const searchByKey: Record<string, string> = {};
+    const emit = (raw: RawRow, forceUnhealthy: boolean): void => {
+      const row = rawToRow(raw, desc, mgByDest, outbound, nowMs, forceUnhealthy);
+      rows.push(row);
+      searchByKey[row.key] = searchTextFor(raw, row);
+    };
 
     // Duplicate series: every live row, all flagged.
     for (const raw of dupRows) {
-      rows.push(rawToRow(raw, desc, mgByDest, outbound, nowMs, true));
+      emit(raw, true);
     }
     // Latest-per-series recurring rows, skipping any series already emitted as
     // duplicates (the MAX(seq) row of a dup series is one of the dupRows).
     for (const raw of latest) {
       const seriesId = raw.series_id ?? raw.id;
       if (dupSeries.has(seriesId)) continue;
-      rows.push(rawToRow(raw, desc, mgByDest, outbound, nowMs, false));
+      emit(raw, false);
     }
     // One-off live rows (recurrence NULL), skipping dup series.
     for (const raw of oneOffs) {
       const seriesId = raw.series_id ?? raw.id;
       if (dupSeries.has(seriesId)) continue;
-      rows.push(rawToRow(raw, desc, mgByDest, outbound, nowMs, false));
+      emit(raw, false);
     }
 
-    return { rows, unreadable: 0 };
+    return { rows, searchByKey, unreadable: 0 };
   } catch (err) {
     log.warn('scheduled-assembly: session read failed — partial snapshot', {
       sessionId: desc.sessionId,
       err: err instanceof Error ? err.message : String(err),
     });
-    return { rows: [], unreadable: 1 };
+    return { rows: [], searchByKey: {}, unreadable: 1 };
   } finally {
     inDb?.close();
   }
@@ -662,6 +692,7 @@ async function doAssemble(scopes: AuthScopes, options: ScheduledAssemblyOptions)
         degraded: false,
         counts: { ...EMPTY_COUNTS },
         unreadable_by_group: {},
+        search_index: {},
         assembled_at: new Date(nowMs).toISOString(),
       };
     }
@@ -677,6 +708,9 @@ async function doAssemble(scopes: AuthScopes, options: ScheduledAssemblyOptions)
   const counts: Record<string, number> = { ...EMPTY_COUNTS };
   // E-3: per-group unreadable buckets so a scoped caller can sum only its own.
   const unreadableByGroup: Record<string, number> = {};
+  // Server-side search blobs (incl. prompt/script) keyed by row key. Cached on
+  // the snapshot, never serialized to the wire (see ScheduledSnapshot.search_index).
+  const searchIndex: Record<string, string> = {};
 
   for (const s of sessionRows) {
     await yieldTick(); // one session per event-loop tick — never one block (§4.9)
@@ -692,6 +726,7 @@ async function doAssemble(scopes: AuthScopes, options: ScheduledAssemblyOptions)
       rows.push(r);
       countRow(counts, r);
     }
+    Object.assign(searchIndex, res.searchByKey);
     counts.unreadable += res.unreadable;
     if (res.unreadable > 0) {
       unreadableByGroup[s.agent_group_id] = (unreadableByGroup[s.agent_group_id] ?? 0) + res.unreadable;
@@ -718,6 +753,7 @@ async function doAssemble(scopes: AuthScopes, options: ScheduledAssemblyOptions)
     degraded,
     counts,
     unreadable_by_group: unreadableByGroup,
+    search_index: searchIndex,
     assembled_at: new Date(nowMs).toISOString(),
   };
 

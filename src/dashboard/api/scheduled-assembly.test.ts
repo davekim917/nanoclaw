@@ -437,3 +437,52 @@ describe('residual-strand + duplicate detection', () => {
     expect(snap.rows.find((r) => r.series_id === 'claimed')!.health).toBe('processing');
   });
 });
+
+// ── search_index (prompt/title search fast-follow) ───────────────────────────
+describe('assembleSnapshot — search_index', () => {
+  it('test_search_index_includes_prompt_and_script_not_on_wire_row', async () => {
+    addGroup('ag-1', 'G1', 'g1');
+    addMg('mg-1', 'discord', 'd:1', 'chan-1');
+    addSession('sess-1', 'ag-1', 'mg-1');
+    const { inbound } = seedSessionDbs('ag-1', 'sess-1');
+    insertInboundRow(inbound, {
+      id: 'r1',
+      series_id: 'morning-brief',
+      process_after: isoIn(3600_000),
+      content: JSON.stringify({ prompt: 'Compile the QUARTERLY Zebra report', script: 'echo PLATYPUS' }),
+    });
+
+    const snap = await assembleSnapshot(ALL_SCOPES, opts());
+    const row = snap.rows.find((r) => r.series_id === 'morning-brief')!;
+    expect(row).toBeTruthy();
+
+    // The index carries the lowercased prompt + script (+ name) for this key...
+    const blob = snap.search_index[row.key];
+    expect(blob).toContain('zebra'); // prompt body
+    expect(blob).toContain('platypus'); // script body
+    expect(blob).toContain('morning-brief'); // series_id still searchable
+
+    // ...but the WIRE row must NOT carry prompt/script (lean-list invariant).
+    expect('prompt' in row).toBe(false);
+    expect('script' in row).toBe(false);
+  });
+
+  it('test_search_index_falls_back_to_raw_content_when_not_json', async () => {
+    addGroup('ag-1', 'G1', 'g1');
+    addMg('mg-1', 'discord', 'd:1', 'chan-1');
+    addSession('sess-1', 'ag-1', 'mg-1');
+    const { inbound } = seedSessionDbs('ag-1', 'sess-1');
+    // Non-JSON content → parseContent falls back to raw content as the prompt,
+    // so even a legacy/malformed row stays searchable.
+    insertInboundRow(inbound, {
+      id: 'r1',
+      series_id: 'legacy-task',
+      process_after: isoIn(3600_000),
+      content: 'plain text WALRUS reminder',
+    });
+
+    const snap = await assembleSnapshot(ALL_SCOPES, opts());
+    const row = snap.rows.find((r) => r.series_id === 'legacy-task')!;
+    expect(snap.search_index[row.key]).toContain('walrus');
+  });
+});

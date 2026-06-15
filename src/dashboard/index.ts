@@ -21,7 +21,7 @@ import {
   sessionArchiveHandler,
   sessionUnarchiveHandler,
 } from './archive.js';
-import { scheduledListHandler, scheduledDetailHandler } from './api/scheduled-read.js';
+import { scheduledListHandler, scheduledDetailHandler, scheduledSearchHandler } from './api/scheduled-read.js';
 import { editHandler, pauseHandler, resumeHandler, runNowHandler, cancelHandler } from './api/scheduled-mutations.js';
 import { movePreviewHandler, moveExecuteHandler } from './api/scheduled-move.js';
 
@@ -65,12 +65,16 @@ export function startDashboard(): void {
   register('POST', '/dashboard/api/sessions/:id/archive', requireAuth(sessionArchiveHandler));
   register('POST', '/dashboard/api/sessions/:id/unarchive', requireAuth(sessionUnarchiveHandler));
 
-  // Scheduled Tasks Board — 9 routes (design §3b). The `scheduled` namespace is
-  // distinct from `tasks` (the spawn board owns that). All auth-gated. Route
-  // matching is by exact segment count (router.ts:104), so `/move` (4 segs) and
-  // `/move/preview` (5 segs) are unambiguous regardless of order — only the
-  // static `*tail` splat below must stay LAST.
+  // Scheduled Tasks Board — 10 routes (design §3b + prompt/title search). The
+  // `scheduled` namespace is distinct from `tasks` (the spawn board owns that).
+  // All auth-gated. Route matching is by exact segment count (router.ts:104), so
+  // `/move` (4 segs) and `/move/preview` (5 segs) are unambiguous regardless of
+  // order. BUT `/search` and `/:key` share a segment count, and `:key` captures
+  // any segment — dispatch is first-match (router.ts:205), so `/search` MUST be
+  // registered before `/:key` or it'd be swallowed as a key. Static `*tail` splat
+  // stays LAST.
   register('GET', '/dashboard/api/scheduled', requireAuth(scheduledListHandler));
+  register('GET', '/dashboard/api/scheduled/search', requireAuth(scheduledSearchHandler));
   register('GET', '/dashboard/api/scheduled/:key', requireAuth(scheduledDetailHandler));
   register('PUT', '/dashboard/api/scheduled/:key', requireAuth(editHandler));
   register('POST', '/dashboard/api/scheduled/:key/pause', requireAuth(pauseHandler));

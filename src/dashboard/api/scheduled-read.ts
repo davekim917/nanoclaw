@@ -202,6 +202,52 @@ export const scheduledListHandler: AuthHandler = async (req, _params, ctx) => {
   });
 };
 
+// ── Prompt/title search (fast-follow) ───────────────────────────────────────────
+
+/**
+ * `GET /dashboard/api/scheduled/search?q=&group_id=` → `{ keys: string[] }`.
+ *
+ * Returns the scope-filtered row keys whose server-side search blob matches `q`.
+ * The blob (assembled in scheduled-assembly) covers name/group/channel/cron PLUS
+ * the task prompt + script — so this is the prompt/title search the lean list
+ * snapshot can't do client-side. Only KEYS are returned: prompt/script text is
+ * NEVER serialized (it stays detail-tier; the audit layer hashes it). The client
+ * unions these keys with its instant on-row haystack, so list rows/counts/
+ * stalled-inline are untouched — this endpoint only narrows the displayed set.
+ *
+ * Reuses the warm 5s snapshot cache (no extra DB reads on a cache hit). Empty `q`
+ * short-circuits to no matches.
+ */
+export const scheduledSearchHandler: AuthHandler = async (req, _params, ctx) => {
+  const { dataDir, nowMs } = readOpts();
+  const url = new URL(req.url);
+  const q = (url.searchParams.get('q') ?? '').trim().toLowerCase();
+  const groupIdFilter = url.searchParams.get('group_id');
+  if (q === '') return json({ keys: [] });
+
+  // Serve the warm full-fleet cache; else assemble it (same source as the list).
+  const cache = getScheduledCache();
+  let snapshot: ScheduledSnapshot;
+  if (cache.data && cache.expiresMs > nowMs) {
+    snapshot = cache.data as unknown as ScheduledSnapshot;
+  } else {
+    snapshot = await assembleSnapshot({ role: 'owner', allowed_group_ids: [], no_filter: true }, { dataDir, nowMs });
+  }
+
+  const index = (snapshot.search_index ?? {}) as Record<string, string>;
+  // Same scope+group predicate as the list handler (disclose-as-not-found): a
+  // caller only ever sees keys for groups it's authorized for, group-filtered.
+  const inScopeAndGroup = (agentGroupId: string): boolean =>
+    rowInScope(ctx.scopes, agentGroupId) && (!groupIdFilter || agentGroupId === groupIdFilter);
+
+  const keys = snapshot.rows
+    .filter((r) => inScopeAndGroup(r.agent_group_id))
+    .filter((r) => (index[r.key] ?? '').includes(q))
+    .map((r) => r.key);
+
+  return json({ keys });
+};
+
 // ── B4: detail handler ───────────────────────────────────────────────────────────
 
 interface DetailLiveRow {
