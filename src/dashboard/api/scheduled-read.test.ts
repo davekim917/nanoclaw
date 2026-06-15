@@ -356,6 +356,28 @@ describe('scheduledDetailHandler', () => {
     expect(history.find((h) => h.outcome === 'ran')).toBeDefined();
   });
 
+  it('test_detail_cancelled_series_404', async () => {
+    addGroup('ag-1', 'G1');
+    addMg('mg-1', 'discord', 'd:1', 'chan-1');
+    addSession('s1', 'ag-1', 'mg-1');
+    const { inbound } = seedSession('ag-1', 's1');
+    // Cancelled recurring series (cron still set) — excluded from the board list;
+    // the detail tier 404s to match, never resolving a phantom strand/stalled row.
+    insertRow(inbound, {
+      id: 'r1',
+      series_id: 'ser-cancelled',
+      status: 'cancelled',
+      recurrence: '0 9 * * *',
+      process_after: isoIn(-30 * 86400_000),
+    });
+    addUser('owner');
+    grant('owner', 'owner', null);
+
+    const key = encodeKey('ag-1', 's1', 'ser-cancelled');
+    const res = (await scheduledDetailHandler(detailReq(), { key }, ctxFor('owner', OWNER_SCOPES)))!;
+    expect(res.status).toBe(404);
+  });
+
   it('test_detail_out_of_scope_404', async () => {
     addGroup('ag-1', 'G1');
     addGroup('ag-2', 'G2');
