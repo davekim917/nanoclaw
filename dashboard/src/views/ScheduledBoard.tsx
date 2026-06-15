@@ -3,6 +3,7 @@ import useSWR from 'swr';
 import {
   listGroups,
   listScheduled,
+  searchScheduled,
   type AuthMe,
   type GroupSummary,
   type HealthState,
@@ -120,6 +121,27 @@ export const ScheduledBoard: React.FC<ScheduledBoardProps> = ({ authMe, route, o
   const { data: groupsData } = useSWR('/dashboard/api/groups', () => listGroups(), { refreshInterval: 0 });
   const groups: GroupSummary[] = groupsData?.groups ?? [];
 
+  // Prompt/title search is SERVER-side: prompt/script aren't on the lean list
+  // row, so the client can't substring-match them. Debounce the query feeding
+  // the fetch (no request per keystroke); the instant on-row haystack in
+  // filterRows still covers name/group/channel/cron with zero latency while
+  // prompt/script matches stream in here as a set of keys (prompt text itself
+  // never reaches the SPA). null key (empty query) means no request at all.
+  const [searchDebounced, setSearchDebounced] = useState('');
+  useEffect(() => {
+    const id = window.setTimeout(() => setSearchDebounced(search.trim()), 250);
+    return () => window.clearTimeout(id);
+  }, [search]);
+  const searchSwrKey = searchDebounced
+    ? (['/dashboard/api/scheduled/search', searchDebounced, groupFilter] as const)
+    : null;
+  const { data: searchData } = useSWR(
+    searchSwrKey,
+    () => searchScheduled(searchDebounced, groupFilter === 'all' ? {} : { group_id: groupFilter }),
+    { dedupingInterval: 250, keepPreviousData: true },
+  );
+  const promptMatchKeys = useMemo(() => new Set(searchData?.keys ?? []), [searchData]);
+
   // Trailing-edge debounce, identical rationale to InboxBoard: a status burst
   // emits many session_event frames; one refetch at 300ms is enough.
   const debounceRef = useRef<number | null>(null);
@@ -148,12 +170,10 @@ export const ScheduledBoard: React.FC<ScheduledBoardProps> = ({ authMe, route, o
 
   // Client-side filtering of the already-fetched snapshot (E3). Pure — never
   // re-derives health; only reads the server-computed `health`/`module_owner`.
-  const filtered = useMemo(() => filterRows(rows, { ownership, health: healthFilter, search }), [
-    rows,
-    ownership,
-    healthFilter,
-    search,
-  ]);
+  const filtered = useMemo(
+    () => filterRows(rows, { ownership, health: healthFilter, search, promptMatchKeys }),
+    [rows, ownership, healthFilter, search, promptMatchKeys],
+  );
 
   // Unhealthy-first ordering (E1 ASSERT): sort by health rank, then group, then
   // next fire so a die-off leads the list regardless of insertion order.
@@ -219,7 +239,24 @@ export const ScheduledBoard: React.FC<ScheduledBoardProps> = ({ authMe, route, o
  */
 export function filterRows(
   rows: ScheduledRow[],
-  filters: { ownership: OwnershipFilter; health: HealthFilter; search: string },
+  filters: {
+    ownership: OwnershipFilter;
+    health: HealthFilter;
+    search: string;
+    /**
+     * Keys the server matched on prompt/script (and metadata) for the current
+     * query. A row passes search if it matches the INSTANT on-row haystack OR is
+     * in this set — so name/group/channel/cron filter with zero latency while
+     * prompt/script matches (which the lean row can't carry) union in from the
+     * server. Undefined/empty before the debounced search resolves → graceful
+     * degradation to on-row matching only. During typing this set may briefly
+     * reflect the PREVIOUS query (250ms debounce + keepPreviousData), so a
+     * prompt-only match for the prior query can show for ~one round-trip until
+     * the current query resolves — bounded over-inclusion, never a leak (keys
+     * only, never prompt text).
+     */
+    promptMatchKeys?: Set<string>;
+  },
 ): ScheduledRow[] {
   const q = filters.search.trim().toLowerCase();
   return rows.filter((r) => {
@@ -230,7 +267,7 @@ export function filterRows(
       const hay = [r.series_id, r.agent_group_name, r.channel_name ?? '', r.cron ?? '']
         .join(' ')
         .toLowerCase();
-      if (!hay.includes(q)) return false;
+      if (!hay.includes(q) && !filters.promptMatchKeys?.has(r.key)) return false;
     }
     return true;
   });
@@ -361,7 +398,7 @@ function ScheduledHeader({
         <input
           className="nc-sched-search"
           type="search"
-          placeholder="Search series, group, channel, cron…"
+          placeholder="Search name, group, channel, cron, prompt…"
           value={search}
           onChange={(e) => onSearch(e.target.value)}
           aria-label="Search scheduled series"

@@ -3,6 +3,7 @@ import {
   authMe,
   postSteer,
   listScheduled,
+  searchScheduled,
   getScheduledDetail,
   editScheduled,
   pauseScheduled,
@@ -118,6 +119,31 @@ describe('api', () => {
 
       const [url] = mockFetch.mock.calls[0] as [string, RequestInit];
       expect(url).toBe('/dashboard/api/scheduled?group_id=ag-7');
+    });
+  });
+
+  describe('test_search_scheduled_calls_endpoint', () => {
+    it('searchScheduled(q) GETs the search endpoint with the encoded query', async () => {
+      const mockFetch = vi.fn().mockResolvedValue(okJson({ keys: [] }));
+      vi.stubGlobal('fetch', mockFetch);
+
+      await searchScheduled('zebra report');
+
+      const [url, init] = mockFetch.mock.calls[0] as [string, RequestInit];
+      expect(url).toBe('/dashboard/api/scheduled/search?q=zebra+report');
+      // never the /tasks namespace; never the :key detail path
+      expect(url).not.toMatch(/\/tasks/);
+      expect(init.credentials).toBe('include');
+    });
+
+    it('searchScheduled(q, {group_id}) appends the group filter', async () => {
+      const mockFetch = vi.fn().mockResolvedValue(okJson({ keys: [] }));
+      vi.stubGlobal('fetch', mockFetch);
+
+      await searchScheduled('narwhal', { group_id: 'ag-2' });
+
+      const [url] = mockFetch.mock.calls[0] as [string, RequestInit];
+      expect(url).toBe('/dashboard/api/scheduled/search?q=narwhal&group_id=ag-2');
     });
   });
 

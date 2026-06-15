@@ -18,7 +18,7 @@ import { ensureSchema, openInboundDb } from '../../db/session-db.js';
 import { migration043 } from '../../db/migrations/043-scheduled-audit.js';
 import { invalidateScheduledCache, encodeKey, writeAudit } from './scheduled-shared.js';
 import { _resetAssemblyInFlightForTesting } from './scheduled-assembly.js';
-import { scheduledListHandler, scheduledDetailHandler } from './scheduled-read.js';
+import { scheduledListHandler, scheduledDetailHandler, scheduledSearchHandler } from './scheduled-read.js';
 import type { AuthedRequestContext } from '../router.js';
 
 // Unique per-file temp dir (mkdtemp) so a sibling test file OR a parallel agent
@@ -520,5 +520,146 @@ describe('scheduledDetailHandler', () => {
     expect('next_fire_local' in row).toBe(true);
     expect('quiet_status' in row).toBe(true);
     expect('flag_intent' in row).toBe(true);
+  });
+});
+
+// ── Prompt/title search (fast-follow) ────────────────────────────────────────
+describe('scheduledSearchHandler', () => {
+  function searchReq(query: string): Request {
+    return new Request(`http://x/dashboard/api/scheduled/search?${query}`);
+  }
+
+  it('test_search_matches_prompt_body', async () => {
+    addGroup('ag-1', 'G1');
+    addMg('mg-1', 'discord', 'd:1', 'chan-1');
+    addSession('s1', 'ag-1', 'mg-1');
+    const { inbound } = seedSession('ag-1', 's1');
+    // series_id deliberately has NO 'zebra' — only the PROMPT body does, proving
+    // this is a prompt match the lean-row client haystack could never make.
+    insertRow(inbound, {
+      id: 'r1',
+      series_id: 'morning-brief',
+      content: JSON.stringify({ prompt: 'compile the quarterly zebra report', script: 'echo hi' }),
+    });
+    insertRow(inbound, {
+      id: 'r2',
+      series_id: 'evening-digest',
+      content: JSON.stringify({ prompt: 'unrelated nightly task', script: null }),
+    });
+    addUser('owner');
+    grant('owner', 'owner', null);
+
+    const res = (await scheduledSearchHandler(searchReq('q=zebra'), {}, ctxFor('owner', OWNER_SCOPES)))!;
+    const body = await readJson(res);
+    const keys = body.keys as string[];
+    expect(keys).toContain(encodeKey('ag-1', 's1', 'morning-brief'));
+    expect(keys).not.toContain(encodeKey('ag-1', 's1', 'evening-digest'));
+  });
+
+  it('test_search_matches_script_body', async () => {
+    addGroup('ag-1', 'G1');
+    addMg('mg-1', 'discord', 'd:1', 'chan-1');
+    addSession('s1', 'ag-1', 'mg-1');
+    insertRow(seedSession('ag-1', 's1').inbound, {
+      id: 'r1',
+      series_id: 'deploy-job',
+      content: JSON.stringify({ prompt: 'plain prompt', script: 'curl https://platypus.example/hook' }),
+    });
+    addUser('owner');
+    grant('owner', 'owner', null);
+
+    const res = (await scheduledSearchHandler(searchReq('q=platypus'), {}, ctxFor('owner', OWNER_SCOPES)))!;
+    const keys = (await readJson(res)).keys as string[];
+    expect(keys).toContain(encodeKey('ag-1', 's1', 'deploy-job'));
+  });
+
+  it('test_search_empty_query_returns_no_keys', async () => {
+    addGroup('ag-1', 'G1');
+    addMg('mg-1', 'discord', 'd:1', 'chan-1');
+    addSession('s1', 'ag-1', 'mg-1');
+    insertRow(seedSession('ag-1', 's1').inbound, { id: 'r1' });
+    addUser('owner');
+    grant('owner', 'owner', null);
+
+    // Empty + whitespace-only both short-circuit to [] (no fleet scan, no match-all).
+    for (const q of ['q=', 'q=%20%20']) {
+      const res = (await scheduledSearchHandler(searchReq(q), {}, ctxFor('owner', OWNER_SCOPES)))!;
+      expect((await readJson(res)).keys).toEqual([]);
+    }
+  });
+
+  it('test_search_scope_filters_keys', async () => {
+    addGroup('ag-1', 'G1');
+    addGroup('ag-2', 'G2');
+    addMg('mg-1', 'discord', 'd:1', 'chan-1');
+    addSession('s1', 'ag-1', 'mg-1');
+    addSession('s2', 'ag-2', 'mg-1');
+    // SAME matching token in BOTH groups; a scoped caller must see only its own.
+    insertRow(seedSession('ag-1', 's1').inbound, {
+      id: 'r1',
+      series_id: 'ser-1',
+      content: JSON.stringify({ prompt: 'find the narwhal', script: null }),
+    });
+    insertRow(seedSession('ag-2', 's2').inbound, {
+      id: 'r2',
+      series_id: 'ser-2',
+      content: JSON.stringify({ prompt: 'find the narwhal', script: null }),
+    });
+    addUser('sadmin');
+    grant('sadmin', 'admin', 'ag-1');
+
+    const scopes = { role: 'admin_of_group' as const, allowed_group_ids: ['ag-1'], no_filter: false };
+    const res = (await scheduledSearchHandler(searchReq('q=narwhal'), {}, ctxFor('sadmin', scopes)))!;
+    const keys = (await readJson(res)).keys as string[];
+    expect(keys).toContain(encodeKey('ag-1', 's1', 'ser-1'));
+    expect(keys).not.toContain(encodeKey('ag-2', 's2', 'ser-2'));
+  });
+
+  it('test_search_group_filter_narrows_to_group', async () => {
+    addGroup('ag-1', 'G1');
+    addGroup('ag-2', 'G2');
+    addMg('mg-1', 'discord', 'd:1', 'chan-1');
+    addSession('s1', 'ag-1', 'mg-1');
+    addSession('s2', 'ag-2', 'mg-1');
+    insertRow(seedSession('ag-1', 's1').inbound, {
+      id: 'r1',
+      series_id: 'ser-1',
+      content: JSON.stringify({ prompt: 'find the narwhal', script: null }),
+    });
+    insertRow(seedSession('ag-2', 's2').inbound, {
+      id: 'r2',
+      series_id: 'ser-2',
+      content: JSON.stringify({ prompt: 'find the narwhal', script: null }),
+    });
+    addUser('owner');
+    grant('owner', 'owner', null);
+
+    const res = (await scheduledSearchHandler(
+      searchReq('q=narwhal&group_id=ag-2'),
+      {},
+      ctxFor('owner', OWNER_SCOPES),
+    ))!;
+    const keys = (await readJson(res)).keys as string[];
+    expect(keys).toEqual([encodeKey('ag-2', 's2', 'ser-2')]);
+  });
+
+  it('test_search_response_carries_only_keys_no_prompt_text', async () => {
+    addGroup('ag-1', 'G1');
+    addMg('mg-1', 'discord', 'd:1', 'chan-1');
+    addSession('s1', 'ag-1', 'mg-1');
+    insertRow(seedSession('ag-1', 's1').inbound, {
+      id: 'r1',
+      series_id: 'ser-1',
+      content: JSON.stringify({ prompt: 'secret aardvark plan', script: 'rm -rf /tmp/x' }),
+    });
+    addUser('owner');
+    grant('owner', 'owner', null);
+
+    const res = (await scheduledSearchHandler(searchReq('q=aardvark'), {}, ctxFor('owner', OWNER_SCOPES)))!;
+    const raw = await res.text();
+    // The wire body is ONLY { keys }: prompt/script text must never be serialized.
+    expect(Object.keys(JSON.parse(raw))).toEqual(['keys']);
+    expect(raw).not.toContain('aardvark');
+    expect(raw).not.toContain('rm -rf');
   });
 });
