@@ -16,7 +16,7 @@ import type { GroupFilter } from '../lib/use-group-filter.js';
  * reordered children. C8 reuses the same primitives without forking them.
  */
 
-export type BoardRoute = 'board' | 'inbox';
+export type BoardRoute = 'board' | 'inbox' | 'scheduled';
 
 const MOBILE_QUERY = '(max-width: 899px)';
 
@@ -88,6 +88,12 @@ export function RouteNav({
       </button>
       <button className={`nav-link ${route === 'inbox' ? 'active' : ''}`} onClick={() => onRouteChange('inbox')}>
         Inbox
+      </button>
+      <button
+        className={`nav-link ${route === 'scheduled' ? 'active' : ''}`}
+        onClick={() => onRouteChange('scheduled')}
+      >
+        Scheduled
       </button>
     </nav>
   );

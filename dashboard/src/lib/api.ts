@@ -285,3 +285,190 @@ export async function bulkArchive(
     body: JSON.stringify({ status, group_id }),
   });
 }
+
+// ─── Scheduled-tasks board (Group E) ────────────────────────────────────────
+//
+// Types mirror the host-side frozen contract: the verb×state matrix
+// (src/dashboard/api/scheduled-board-matrix.ts), the assembly ScheduledRow /
+// ScheduledSnapshot shapes (src/dashboard/api/scheduled-assembly.ts), and the
+// 9 routes under /dashboard/api/scheduled (design §3b). The SPA never
+// re-derives health or verb availability — `health` and `available_verbs`
+// arrive computed from the API and are the single source of truth.
+
+/** Health states — derived server-side per design §4.1; never read from `status`. */
+export type HealthState =
+  | 'healthy'
+  | 'late'
+  | 'stalled'
+  | 'paused'
+  | 'processing'
+  | 'unknown'
+  | 'strand';
+
+/** Series kind — a column-mask AND'd with the health-state cell (matrix §4.0). */
+export type SeriesKind = 'recurring' | 'one_off' | 'thread_loop';
+
+/** Operator verbs — the matrix output. Buttons are enabled iff the verb is in `available_verbs`. */
+export type ScheduledVerb = 'edit' | 'pause' | 'resume' | 'run_now' | 'cancel' | 'move';
+
+/** Per-fire history outcome labels (design §4.1; the D16 F-amendment merge). */
+export type FireOutcomeLabel =
+  | 'ran'
+  | 'completed (no chat output)'
+  | 'failed'
+  | 'missed'
+  | 'cancelled';
+
+export interface FireOutcome {
+  /** Live row id / fire id for this entry. */
+  id?: string;
+  /** ISO timestamp of the fire (due/process_after for the entry). */
+  ts?: string | null;
+  outcome: FireOutcomeLabel;
+}
+
+export interface ScheduledRow {
+  /** base64url(agentGroupId/sessionId/seriesId) — a LOCATOR, never an authz input (§4.5). */
+  key: string;
+  series_id: string;
+  agent_group_id: string;
+  agent_group_name: string;
+  provider: string | null;
+  channel_name: string | null;
+  channel_type: string | null;
+  thread_id: string | null;
+  kind: SeriesKind;
+  cron: string | null;
+  /** Next fire rendered in UTC and in service-local time — both shown (C6). */
+  next_fire_utc: string | null;
+  next_fire_local: string | null;
+  /** Server-derived health — the load-bearing field. Never recompute client-side. */
+  health: HealthState;
+  /** Non-null on module-owned series (memory/mnemon/support, C5) → owner badge + reseed warning. */
+  module_owner: string | null;
+  quiet_status: boolean;
+  /** Per-fire flagIntent override (model/effort) — brief-required metadata; opaque to the SPA. */
+  flag_intent: Record<string, unknown> | null;
+  last_fires: FireOutcome[];
+  /** The matrix output. Verb buttons render solely from this (single source of truth, E4). */
+  available_verbs: ScheduledVerb[];
+}
+
+/** counts keyed by health state plus the two observability/kind extras. */
+export type ScheduledCounts = Partial<Record<HealthState | 'unreadable' | 'one_off', number>>;
+
+export interface ScheduledSnapshot {
+  rows: ScheduledRow[];
+  degraded: boolean;
+  counts: ScheduledCounts;
+  assembled_at: string;
+}
+
+export interface ScheduledAuditRow {
+  id: number;
+  ts: string;
+  actor: string;
+  action: string;
+  correlation_id?: string | null;
+  [extra: string]: unknown;
+}
+
+export interface ScheduledDetail {
+  row: ScheduledRow;
+  prompt: string;
+  script: string | null;
+  history: FireOutcome[];
+  /** Present ONLY for mutation-tier callers (owner/global-admin); absent for read-only (M5). */
+  audit_tail?: ScheduledAuditRow[];
+}
+
+export interface MovePreviewResult {
+  wiringOk: boolean;
+  /** Secret NAMES the series gains at the target — never values (D8). */
+  gains: string[];
+  /** Secret NAMES the series loses at the target — never values (D8). */
+  losses: string[];
+  crossWorkgroup: boolean;
+  scriptPresent: boolean;
+  /** Always false in v1 — only the secret delta is checked; wider env is not (W2). */
+  environmentDeltaChecked: false;
+  /** Echoed back to /move as confirmedDeltaHash to close the preview→execute TOCTOU (SEC-2). */
+  deltaHash: string;
+}
+
+export async function listScheduled(params?: { group_id?: string }): Promise<ScheduledSnapshot> {
+  const qs = new URLSearchParams();
+  if (params?.group_id) qs.set('group_id', params.group_id);
+  const query = qs.toString();
+  return apiFetch<ScheduledSnapshot>(`/dashboard/api/scheduled${query ? `?${query}` : ''}`);
+}
+
+export async function getScheduledDetail(key: string): Promise<ScheduledDetail> {
+  return apiFetch<ScheduledDetail>(`/dashboard/api/scheduled/${encodeURIComponent(key)}`);
+}
+
+export async function editScheduled(
+  key: string,
+  body: { prompt?: string; script?: string; cron?: string },
+): Promise<{ updated: true }> {
+  return apiFetch<{ updated: true }>(`/dashboard/api/scheduled/${encodeURIComponent(key)}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+export async function pauseScheduled(key: string): Promise<{ paused?: true }> {
+  return apiFetch<{ paused?: true }>(`/dashboard/api/scheduled/${encodeURIComponent(key)}/pause`, {
+    method: 'POST',
+  });
+}
+
+export async function resumeScheduled(key: string): Promise<{ resumed?: true }> {
+  return apiFetch<{ resumed?: true }>(`/dashboard/api/scheduled/${encodeURIComponent(key)}/resume`, {
+    method: 'POST',
+  });
+}
+
+export async function runNowScheduled(
+  key: string,
+  opts?: { force?: boolean },
+): Promise<{ fired: true }> {
+  return apiFetch<{ fired: true }>(`/dashboard/api/scheduled/${encodeURIComponent(key)}/run-now`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    // Only send a body when forcing; an absent body keeps force=false at the host.
+    ...(opts?.force ? { body: JSON.stringify({ force: true }) } : {}),
+  });
+}
+
+export async function cancelScheduled(key: string): Promise<{ cancelled: true }> {
+  return apiFetch<{ cancelled: true }>(`/dashboard/api/scheduled/${encodeURIComponent(key)}/cancel`, {
+    method: 'POST',
+  });
+}
+
+export async function moveScheduledPreview(
+  key: string,
+  body: { targetAgentGroupId: string; targetMessagingGroupId: string },
+): Promise<MovePreviewResult> {
+  return apiFetch<MovePreviewResult>(
+    `/dashboard/api/scheduled/${encodeURIComponent(key)}/move/preview`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    },
+  );
+}
+
+export async function moveScheduled(
+  key: string,
+  body: { targetAgentGroupId: string; targetMessagingGroupId: string; confirmedDeltaHash: string },
+): Promise<{ moved: true }> {
+  return apiFetch<{ moved: true }>(`/dashboard/api/scheduled/${encodeURIComponent(key)}/move`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}

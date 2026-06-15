@@ -21,6 +21,9 @@ import {
   sessionArchiveHandler,
   sessionUnarchiveHandler,
 } from './archive.js';
+import { scheduledListHandler, scheduledDetailHandler } from './api/scheduled-read.js';
+import { editHandler, pauseHandler, resumeHandler, runNowHandler, cancelHandler } from './api/scheduled-mutations.js';
+import { movePreviewHandler, moveExecuteHandler } from './api/scheduled-move.js';
 
 // Side-effect imports — these files register their routes/handlers at module load
 import './auth/exchange.js'; // POST /dashboard/api/auth/exchange
@@ -61,6 +64,21 @@ export function startDashboard(): void {
   register('POST', '/dashboard/api/tasks/:id/unarchive', requireAuth(unarchiveHandler));
   register('POST', '/dashboard/api/sessions/:id/archive', requireAuth(sessionArchiveHandler));
   register('POST', '/dashboard/api/sessions/:id/unarchive', requireAuth(sessionUnarchiveHandler));
+
+  // Scheduled Tasks Board — 9 routes (design §3b). The `scheduled` namespace is
+  // distinct from `tasks` (the spawn board owns that). All auth-gated. Route
+  // matching is by exact segment count (router.ts:104), so `/move` (4 segs) and
+  // `/move/preview` (5 segs) are unambiguous regardless of order — only the
+  // static `*tail` splat below must stay LAST.
+  register('GET', '/dashboard/api/scheduled', requireAuth(scheduledListHandler));
+  register('GET', '/dashboard/api/scheduled/:key', requireAuth(scheduledDetailHandler));
+  register('PUT', '/dashboard/api/scheduled/:key', requireAuth(editHandler));
+  register('POST', '/dashboard/api/scheduled/:key/pause', requireAuth(pauseHandler));
+  register('POST', '/dashboard/api/scheduled/:key/resume', requireAuth(resumeHandler));
+  register('POST', '/dashboard/api/scheduled/:key/run-now', requireAuth(runNowHandler));
+  register('POST', '/dashboard/api/scheduled/:key/cancel', requireAuth(cancelHandler));
+  register('POST', '/dashboard/api/scheduled/:key/move/preview', requireAuth(movePreviewHandler));
+  register('POST', '/dashboard/api/scheduled/:key/move', requireAuth(moveExecuteHandler));
 
   // Static assets — public, no auth (design §6). Splat must be LAST.
   register('GET', '/dashboard/', indexHtmlHandler);

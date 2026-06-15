@@ -36,6 +36,16 @@ export interface TaskDef {
   processAfter: string;
   seriesId: string;
   prompt: string;
+  /**
+   * Optional pre-task shell script, mirrored into the content payload exactly
+   * as the firing path reads it. Added for the Scheduled Tasks Board's move
+   * flow: a move snapshots the source row's content (including its script) and
+   * re-schedules it into the target session — without this field on the shared
+   * primitive, scheduleTask would silently drop the pre-task script. Existing
+   * callers omit it (the key is absent from content when undefined), so they
+   * are byte-unaffected. See docs/specs/scheduled-tasks-board/design.md §4.2.
+   */
+  script?: string;
   tz?: string;
   /**
    * REQUIRED. Where the task's chat output lands AND the messaging group
@@ -178,6 +188,7 @@ export async function scheduleTask(def: TaskDef, _dataDir?: string): Promise<voi
   try {
     const content = JSON.stringify({
       prompt: def.prompt,
+      ...(def.script !== undefined ? { script: def.script } : {}),
       ...(def.quietStatus ? { quietStatus: true } : {}),
       ...(def.flagIntent ? { flagIntent: def.flagIntent } : {}),
     });

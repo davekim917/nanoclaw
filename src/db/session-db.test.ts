@@ -99,6 +99,65 @@ describe('migrateMessagesInTable', () => {
     expect(getInboundSourceSessionId(db, 'does-not-exist')).toBeNull();
     db.close();
   });
+
+  // ── A2: (series_id, seq DESC) read-path index (design §4.8) ───────────────
+  function indexNames(db: Database.Database, table: string): Set<string> {
+    // PRAGMA does not accept bound parameters; `table` is a test-literal.
+    return new Set((db.prepare(`PRAGMA index_list(${table})`).all() as Array<{ name: string }>).map((r) => r.name));
+  }
+
+  it('test_migrate_adds_series_seq_index', () => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+
+    // Build a DB with the OLD index (idx_messages_in_series) but NOT the new
+    // compound one — i.e. series_id already exists, so the migrate function's
+    // series_id branch is skipped. The compound index must still be added.
+    const db = new Database(DB_PATH);
+    db.exec(`
+      CREATE TABLE messages_in (
+        id             TEXT PRIMARY KEY,
+        seq            INTEGER UNIQUE,
+        kind           TEXT NOT NULL,
+        timestamp      TEXT NOT NULL,
+        status         TEXT DEFAULT 'pending',
+        process_after  TEXT,
+        recurrence     TEXT,
+        series_id      TEXT,
+        tries          INTEGER DEFAULT 0,
+        platform_id    TEXT,
+        channel_type   TEXT,
+        thread_id      TEXT,
+        content        TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_messages_in_series ON messages_in(series_id);
+    `);
+
+    // Precondition: old index present, new index absent.
+    const before = indexNames(db, 'messages_in');
+    expect(before.has('idx_messages_in_series')).toBe(true);
+    expect(before.has('idx_messages_in_series_seq')).toBe(false);
+
+    migrateMessagesInTable(db);
+    migrateMessagesInTable(db); // idempotent
+
+    const after = indexNames(db, 'messages_in');
+    expect(after.has('idx_messages_in_series_seq')).toBe(true);
+    // Existing index is left intact.
+    expect(after.has('idx_messages_in_series')).toBe(true);
+    db.close();
+  });
+
+  it('test_fresh_schema_has_series_seq_index', () => {
+    const db = new Database(':memory:');
+    db.pragma('journal_mode = DELETE');
+    db.exec(INBOUND_SCHEMA);
+
+    const idx = indexNames(db, 'messages_in');
+    expect(idx.has('idx_messages_in_series_seq')).toBe(true);
+    expect(idx.has('idx_messages_in_series')).toBe(true);
+    db.close();
+  });
 });
 
 describe('upsertSessionRouting — spawn_task_id + session_id columns', () => {

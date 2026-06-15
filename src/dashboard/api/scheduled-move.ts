@@ -1,0 +1,709 @@
+/**
+ * Scheduled Tasks Board move flow (Tasks D1 + D2):
+ *   POST /dashboard/api/scheduled/:key/move/preview  — dry-run wiring + secret delta
+ *   POST /dashboard/api/scheduled/:key/move           — cancel-first execute
+ *
+ * Move = cancel-in-source + scheduleTask-into-target, sequenced here (C2). All
+ * the F1–F6 hardening lives in moveExecuteHandler: staged paused insert (F1),
+ * durable move_intent before cancel + purge on resolve (F2/F5), preview→execute
+ * delta TOCTOU re-check, fail-closed compensation, and the exactly-one-live-row
+ * invariant. Both preview and execute are gated at the MUTATION tier
+ * (canManageScheduled) — preview reads vault secret NAMES, so a scoped admin
+ * must not be able to enumerate them (M5/SEC-1).
+ *
+ * See docs/specs/scheduled-tasks-board/design.md §4.0, §4.2, §4.4, §4.5.
+ */
+import { createHash } from 'crypto';
+import fs from 'fs';
+import path from 'path';
+
+import Database from 'better-sqlite3';
+
+import { randomUUID } from 'crypto';
+
+import { DATA_DIR, GROUPS_DIR } from '../../config.js';
+import { getAgentGroup } from '../../db/agent-groups.js';
+import { getWorkgroupOnecliSecrets } from '../../db/agent-groups.js';
+import { getMessagingGroup } from '../../db/messaging-groups.js';
+import { getDb } from '../../db/connection.js';
+import { openInboundDb } from '../../db/session-db.js';
+import * as scheduledTasks from '../../db/scheduled-tasks.js';
+import { type TaskDef } from '../../db/scheduled-tasks.js';
+import {
+  cancelTask,
+  pauseTask,
+  restoreTaskRow,
+  updateTask,
+  type TaskRowSnapshot,
+} from '../../modules/scheduling/db.js';
+import { countLiveRowsInSessions } from '../../modules/scheduling/live-count.js';
+import { log } from '../../log.js';
+import { mergeWorkgroupAndGroupSecrets } from '../../onecli-secrets.js';
+import { GUARD_GRACE_MS, verbVerdict, type HealthState } from './scheduled-board-matrix.js';
+import type { AuthHandler, AuthedRequestContext } from '../router.js';
+import {
+  canManageScheduled,
+  decodeKey,
+  invalidateScheduledCache,
+  purgeIntentBody,
+  rateLimit,
+  sessionInboundPathFor,
+  writeAudit,
+} from './scheduled-shared.js';
+
+// ── Test seam ─────────────────────────────────────────────────────────────────
+
+interface MoveOptions {
+  dataDir: string;
+  groupsDir: string;
+  nowMs: number;
+}
+let testOptions: { dataDir: string; nowMs: number } | null = null;
+export function _setMoveTestOptions(opts: { dataDir: string; nowMs: number } | null): void {
+  testOptions = opts;
+}
+function moveOpts(): MoveOptions {
+  if (testOptions) {
+    return {
+      dataDir: testOptions.dataDir,
+      groupsDir: path.join(testOptions.dataDir, 'groups'),
+      nowMs: testOptions.nowMs,
+    };
+  }
+  // Production default MUST be DATA_DIR (matches readOpts in scheduled-read.ts).
+  // A '' default resolved session DBs under <cwd>/v2-sessions instead of
+  // <cwd>/data/v2-sessions → every real move hit the missing-source guard and
+  // returned session_unreadable (move broken outside tests, which inject a dir).
+  return { dataDir: DATA_DIR, groupsDir: GROUPS_DIR, nowMs: Date.now() };
+}
+
+function json(body: unknown, status = 200): Response {
+  return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
+}
+
+// ── Secret-scope resolution (names only — values never leave the gateway) ───────
+
+/**
+ * Read a group's per-group onecliSecrets from its container.json. Returns [] if
+ * the file is absent/unparseable. Folder-based so it's testable against an
+ * injected groupsDir (mirrors readContainerConfig's configPath, but with an
+ * overridable root for the move test seam).
+ */
+function groupSecretsFromFolder(folder: string, groupsDir: string): string[] {
+  const p = path.join(groupsDir, folder, 'container.json');
+  if (!fs.existsSync(p)) return [];
+  try {
+    const raw = JSON.parse(fs.readFileSync(p, 'utf8')) as { onecliSecrets?: unknown };
+    return Array.isArray(raw.onecliSecrets) ? (raw.onecliSecrets as string[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Effective secret scope for a group = workgroup baseline ∪ per-group
+ * onecliSecrets (the same union the host applies at spawn —
+ * mergeWorkgroupAndGroupSecrets). NAMES/UUIDs only; values are never resolved
+ * host-side (§4.2 step 3 — enumeration bounded to source∪target effective sets,
+ * never a vault listing).
+ */
+function effectiveSecrets(agentGroupId: string, folder: string, groupsDir: string): string[] {
+  const workgroup = getWorkgroupOnecliSecrets(agentGroupId);
+  const group = groupSecretsFromFolder(folder, groupsDir);
+  return mergeWorkgroupAndGroupSecrets(workgroup, group);
+}
+
+export interface SecretDelta {
+  gains: string[];
+  losses: string[];
+  deltaHash: string;
+}
+
+/**
+ * Compute the move secret delta: gains = effective(target) − effective(source),
+ * losses = effective(source) − effective(target). The deltaHash is a stable
+ * sha256 that BINDS the move target identity (E-4) in addition to the sorted
+ * gains+losses, so a preview confirmed for targetA can never be replayed on an
+ * execute targeting a different targetB that happens to produce identical
+ * gains/losses — execute recomputes from the BODY's target and 409s on mismatch
+ * (TOCTOU, SEC-2 + target-rebind, E-4).
+ */
+function computeSecretDelta(
+  sourceAg: string,
+  sourceFolder: string,
+  targetAg: string,
+  targetFolder: string,
+  targetMessagingGroupId: string,
+  groupsDir: string,
+): SecretDelta {
+  const src = new Set(effectiveSecrets(sourceAg, sourceFolder, groupsDir));
+  const tgt = new Set(effectiveSecrets(targetAg, targetFolder, groupsDir));
+  const gains = [...tgt].filter((s) => !src.has(s)).sort();
+  const losses = [...src].filter((s) => !tgt.has(s)).sort();
+  // Canonical, key-ordered payload — the target identity is part of the hashed
+  // surface so the confirmed hash is tied to the exact (targetAg, targetMg) pair.
+  const deltaHash = createHash('sha256')
+    .update(
+      JSON.stringify({
+        targetAgentGroupId: targetAg,
+        targetMessagingGroupId,
+        gains,
+        losses,
+      }),
+    )
+    .digest('hex');
+  return { gains, losses, deltaHash };
+}
+
+export { computeSecretDelta };
+
+// ── Wiring validation (no write) ────────────────────────────────────────────────
+
+/**
+ * Is `targetAgentGroupId` wired to `targetMessagingGroupId` via
+ * messaging_group_agents? This is scheduleTask's destination-validation
+ * predicate (scheduled-tasks.ts:158-165) run WITHOUT writing — fail-closed (C2):
+ * an unwired pair means the move would route output to a chat the target agent
+ * isn't authorized for.
+ */
+function isWired(agentGroupId: string, messagingGroupId: string): boolean {
+  const row = getDb()
+    .prepare('SELECT 1 AS ok FROM messaging_group_agents WHERE agent_group_id = ? AND messaging_group_id = ?')
+    .get(agentGroupId, messagingGroupId) as { ok: number } | undefined;
+  return !!row;
+}
+
+// ── Source live row (for scriptPresent + the execute snapshot) ──────────────────
+
+interface SourceLiveRow {
+  id: string;
+  status: string;
+  process_after: string | null;
+  recurrence: string | null;
+  content: string;
+  platform_id: string | null;
+  channel_type: string | null;
+  thread_id: string | null;
+  kind: string;
+}
+
+/**
+ * Read the source series' live row. The result DISTINGUISHES three cases (ADV-S1,
+ * mirroring resolveTarget in scheduled-mutations.ts):
+ *   - { unreadable: true }       → the file exists but the read threw → 503
+ *   - { unreadable: false, row } → a live row (or null when the series ended) →
+ *                                  null maps to 409 stale_key, never a false 503.
+ * A missing inbound.db is `row: null` (the caller's pre-cancel existsSync guard
+ * already mapped that to 503 in execute; preview treats it as "no script").
+ */
+interface SourceLiveReadResult {
+  unreadable: boolean;
+  row: SourceLiveRow | null;
+}
+
+function readSourceLiveRow(
+  dataDir: string,
+  agentGroupId: string,
+  sessionId: string,
+  seriesId: string,
+): SourceLiveReadResult {
+  // Route through the containment-checked chokepoint (security re-QA SUGGESTION) so
+  // the preview READ path has the same traversal backstop as the execute path — a
+  // null (containment failure) is treated as "no live row" (→ no script in preview).
+  const inboundPath = sessionInboundPathFor(dataDir, agentGroupId, sessionId);
+  if (!inboundPath || !fs.existsSync(inboundPath)) return { unreadable: false, row: null };
+  let db: Database.Database | null = null;
+  try {
+    db = new Database(inboundPath, { readonly: true });
+    db.pragma('busy_timeout = 1000');
+    const row =
+      (db
+        .prepare(
+          `SELECT id, status, process_after, recurrence, content, platform_id, channel_type, thread_id, kind
+             FROM messages_in
+            WHERE series_id = ? AND kind = 'task' AND status IN ('pending', 'paused')
+            ORDER BY seq DESC LIMIT 1`,
+        )
+        .get(seriesId) as SourceLiveRow | undefined) ?? null;
+    return { unreadable: false, row };
+  } catch (err) {
+    log.warn('scheduled-move: source live row read failed', {
+      seriesId,
+      err: err instanceof Error ? err.message : String(err),
+    });
+    return { unreadable: true, row: null };
+  } finally {
+    db?.close();
+  }
+}
+
+// ── Shared resolve + gate for both preview and execute ──────────────────────────
+
+interface MoveBody {
+  targetAgentGroupId?: string;
+  targetMessagingGroupId?: string;
+  confirmedDeltaHash?: string;
+}
+
+interface ResolvedMove {
+  source: { agentGroupId: string; sessionId: string; seriesId: string; folder: string };
+  target: { agentGroupId: string; messagingGroupId: string; folder: string };
+}
+
+/**
+ * Decode + gate + resolve both ends. Every failure that could reveal the
+ * existence of a resource/target to an unauthorized caller returns 404
+ * disclose-as-not-found (never 403) — the mutation gate, the source-scope
+ * check, and a missing source/target group all collapse to 404 (§4.2 "404
+ * otherwise" + C7). Returns a Response on any reject, or the resolved ends.
+ */
+function resolveAndGate(
+  key: string,
+  body: MoveBody,
+  ctx: AuthedRequestContext,
+): { error: Response } | { ok: ResolvedMove } {
+  const decoded = decodeKey(key);
+  if (!decoded) return { error: json({ error: 'not_found' }, 404) };
+
+  // Mutation-tier gate (preview reads secret names — M5/SEC-1). Non-manage →
+  // 404, never 403 (don't reveal the resource exists).
+  if (!canManageScheduled(ctx.user.id)) return { error: json({ error: 'not_found' }, 404) };
+
+  // Scope re-check from the decoded key (never trust the key as authz, §4.5).
+  if (!ctx.scopes.no_filter && !ctx.scopes.allowed_group_ids.includes(decoded.agentGroupId)) {
+    return { error: json({ error: 'not_found' }, 404) };
+  }
+
+  const sourceAg = getAgentGroup(decoded.agentGroupId);
+  if (!sourceAg) return { error: json({ error: 'not_found' }, 404) };
+
+  const targetAgId = body.targetAgentGroupId;
+  const targetMgId = body.targetMessagingGroupId;
+  if (!targetAgId || !targetMgId) return { error: json({ error: 'invalid_request' }, 400) };
+
+  const targetAg = getAgentGroup(targetAgId);
+  if (!targetAg) return { error: json({ error: 'not_found' }, 404) };
+  const targetMg = getMessagingGroup(targetMgId);
+  if (!targetMg) return { error: json({ error: 'not_found' }, 404) };
+
+  return {
+    ok: {
+      source: {
+        agentGroupId: decoded.agentGroupId,
+        sessionId: decoded.sessionId,
+        seriesId: decoded.seriesId,
+        folder: sourceAg.folder,
+      },
+      target: { agentGroupId: targetAgId, messagingGroupId: targetMgId, folder: targetAg.folder },
+    },
+  };
+}
+
+function isCrossWorkgroup(sourceAgId: string, targetAgId: string): boolean {
+  const s = getAgentGroup(sourceAgId);
+  const t = getAgentGroup(targetAgId);
+  const sw = s?.workgroup_id ?? s?.folder;
+  const tw = t?.workgroup_id ?? t?.folder;
+  return sw !== tw;
+}
+
+// ── D1: preview handler ─────────────────────────────────────────────────────────
+
+export const movePreviewHandler: AuthHandler = async (req, params, ctx) => {
+  const { groupsDir, dataDir } = moveOpts();
+  let body: MoveBody;
+  try {
+    body = (await req.json()) as MoveBody;
+  } catch {
+    return json({ error: 'invalid_request' }, 400);
+  }
+
+  const resolved = resolveAndGate(params['key'] ?? '', body, ctx);
+  if ('error' in resolved) return resolved.error;
+  const { source, target } = resolved.ok;
+
+  const wiringOk = isWired(target.agentGroupId, target.messagingGroupId);
+  const delta = computeSecretDelta(
+    source.agentGroupId,
+    source.folder,
+    target.agentGroupId,
+    target.folder,
+    target.messagingGroupId,
+    groupsDir,
+  );
+
+  const live = readSourceLiveRow(dataDir, source.agentGroupId, source.sessionId, source.seriesId).row;
+  let scriptPresent = false;
+  if (live) {
+    try {
+      scriptPresent = typeof (JSON.parse(live.content) as { script?: unknown }).script === 'string';
+    } catch {
+      /* malformed content — scriptPresent stays false */
+    }
+  }
+
+  return json({
+    wiringOk,
+    gains: delta.gains,
+    losses: delta.losses,
+    crossWorkgroup: isCrossWorkgroup(source.agentGroupId, target.agentGroupId),
+    scriptPresent,
+    environmentDeltaChecked: false,
+    deltaHash: delta.deltaHash,
+  });
+};
+
+// ── D2: execute handler ─────────────────────────────────────────────────────────
+
+function inboundPathOf(dataDir: string, agentGroupId: string, sessionId: string): string {
+  return path.join(dataDir, 'v2-sessions', agentGroupId, sessionId, 'inbound.db');
+}
+
+/** Map the source live-row status to the §4.0 health state the move guard needs. */
+function moveGuardState(status: string, processAfterMs: number | null, nowMs: number): HealthState {
+  if (status === 'paused') return 'paused';
+  // A pending row maps to healthy/late by overdue-ness; verbVerdict's move cell
+  // keys on processAfterMs + claimed, so 'healthy' vs 'late' both route to the
+  // same future-dated admission test. Use 'late' when overdue so the guard's
+  // isDue/isNearDue checks reflect reality.
+  return processAfterMs !== null && processAfterMs <= nowMs ? 'late' : 'healthy';
+}
+
+function parseUtcMs(s: string | null): number | null {
+  if (!s) return null;
+  const normalized = /[zZ]|[+-]\d{2}:?\d{2}$/.test(s) ? s : (s.includes('T') ? s : s.replace(' ', 'T')) + 'Z';
+  const ms = Date.parse(normalized);
+  return Number.isNaN(ms) ? null : ms;
+}
+
+/** Build the TaskDef that re-schedules the snapshot into the target session. */
+function taskDefFromSnapshot(
+  snapshot: SourceLiveRow,
+  seriesId: string,
+  targetAgentGroupId: string,
+  targetMg: { platform_id: string; channel_type: string },
+  processAfterOverride?: string,
+): TaskDef {
+  let content: { prompt?: string; script?: string; quietStatus?: boolean; flagIntent?: TaskDef['flagIntent'] } = {};
+  try {
+    content = JSON.parse(snapshot.content) as typeof content;
+  } catch {
+    /* malformed — fall through with empty content; prompt falls back below */
+  }
+  return {
+    id: `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    agentGroupId: targetAgentGroupId,
+    cron: snapshot.recurrence ?? '',
+    processAfter: processAfterOverride ?? snapshot.process_after ?? new Date().toISOString(),
+    seriesId,
+    prompt: typeof content.prompt === 'string' ? content.prompt : snapshot.content,
+    ...(typeof content.script === 'string' ? { script: content.script } : {}),
+    ...(content.quietStatus ? { quietStatus: true } : {}),
+    ...(content.flagIntent ? { flagIntent: content.flagIntent } : {}),
+    destination: {
+      platformId: targetMg.platform_id,
+      channelType: targetMg.channel_type,
+      threadId: snapshot.thread_id,
+    },
+  };
+}
+
+/**
+ * Count live rows for the series across exactly {source session, target session}
+ * (H1 helper). `unreadable` callers MUST honor: never restore / never claim
+ * success on an unknown post-state. Replaces the old bare-series_id fleet scan
+ * (M1: an unrelated group reusing the series_id no longer causes a false count).
+ */
+function scopedLiveCount(
+  dataDir: string,
+  source: { agentGroupId: string; sessionId: string },
+  target: { agentGroupId: string; sessionId: string | null },
+  seriesId: string,
+): { count: number; unreadable: boolean } {
+  return countLiveRowsInSessions(
+    dataDir,
+    [source, target.sessionId ? { agentGroupId: target.agentGroupId, sessionId: target.sessionId } : null],
+    seriesId,
+  );
+}
+
+/** Resolve the target channel-root session id (after scheduleTask created it). */
+function targetSessionIdFor(targetAgentGroupId: string, targetMessagingGroupId: string): string | null {
+  const row = getDb()
+    .prepare(
+      "SELECT id FROM sessions WHERE agent_group_id = ? AND messaging_group_id = ? AND thread_id IS NULL AND status = 'active' LIMIT 1",
+    )
+    .get(targetAgentGroupId, targetMessagingGroupId) as { id: string } | undefined;
+  return row?.id ?? null;
+}
+
+export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
+  const { dataDir, groupsDir, nowMs } = moveOpts();
+  let body: MoveBody;
+  try {
+    body = (await req.json()) as MoveBody;
+  } catch {
+    return json({ error: 'invalid_request' }, 400);
+  }
+
+  const resolved = resolveAndGate(params['key'] ?? '', body, ctx);
+  if ('error' in resolved) return resolved.error;
+  const { source, target } = resolved.ok;
+
+  // Rate limit (move converts a keypress into container compute — §4.5/A14/S10).
+  const rl = rateLimit(ctx.user.id, 'move');
+  if (!rl.ok) return json({ error: 'rate_limited', retry_after: rl.retryAfter }, 429);
+
+  const targetMg = getMessagingGroup(target.messagingGroupId);
+  if (!targetMg) return json({ error: 'not_found' }, 404);
+
+  // Step 0a: M4 — containment-checked source open (null → 404; decodeKey already
+  // rejects traversal, this is defense in depth — never an open outside the tree).
+  const sourceInbound = sessionInboundPathFor(dataDir, source.agentGroupId, source.sessionId);
+  if (!sourceInbound) return json({ error: 'not_found' }, 404);
+  // Step 0b: source session unreadable → fail closed (§3a).
+  if (!fs.existsSync(sourceInbound)) return json({ error: 'session_unreadable', reason: 'session_unreadable' }, 503);
+
+  // Step 1: delta TOCTOU re-check (SEC-2 + target-rebind E-4). The hash binds the
+  // target identity, so a hash confirmed for a different target won't match.
+  const delta = computeSecretDelta(
+    source.agentGroupId,
+    source.folder,
+    target.agentGroupId,
+    target.folder,
+    target.messagingGroupId,
+    groupsDir,
+  );
+  if (body.confirmedDeltaHash !== delta.deltaHash) {
+    return json({ error: 'delta_changed', reason: 'delta_changed' }, 409);
+  }
+
+  // Step 2: snapshot the source live row. ADV-S1: a read THROW (corrupt-but-
+  // existent inbound.db) is 503 session_unreadable — distinguished from an empty
+  // result (the series ended/moved → 409 stale_key), never collapsed into 409.
+  const sourceRead = readSourceLiveRow(dataDir, source.agentGroupId, source.sessionId, source.seriesId);
+  if (sourceRead.unreadable) return json({ error: 'session_unreadable', reason: 'session_unreadable' }, 503);
+  const snapshot = sourceRead.row;
+  // Stale key — no live source row to move (§3b: touched 0 → 409 stale_key).
+  if (!snapshot) return json({ error: 'stale_key', reason: 'stale_key' }, 409);
+
+  // Step 2a: §4.0 in-flight admission guard (verbVerdict is the ONLY guard source).
+  const processAfterMs = parseUtcMs(snapshot.process_after);
+  const guardState = moveGuardState(snapshot.status, processAfterMs, nowMs);
+  const verdict = verbVerdict('move', {
+    state: guardState,
+    kind: snapshot.recurrence ? (snapshot.thread_id ? 'thread_loop' : 'recurring') : 'one_off',
+    claimed: false,
+    processAfterMs,
+    nowMs,
+  });
+  if (!verdict.allowed) {
+    return json(
+      { error: verdict.reason ?? 'source_busy', reason: verdict.reason ?? 'source_busy' },
+      verdict.status ?? 409,
+    );
+  }
+
+  const wasPaused = snapshot.status === 'paused';
+  const correlationId = randomUUID();
+  const central = getDb();
+
+  // Step 2b: durable move_intent BEFORE cancel (F2). Full snapshot in
+  // detail_json; correlation_id links the recovery.
+  writeAudit(central, {
+    actor: ctx.user.id,
+    action: 'move_intent',
+    agentGroupId: source.agentGroupId,
+    sessionId: source.sessionId,
+    seriesId: source.seriesId,
+    correlationId,
+    detail: {
+      snapshot: {
+        id: snapshot.id,
+        series_id: source.seriesId,
+        status: snapshot.status,
+        process_after: snapshot.process_after,
+        recurrence: snapshot.recurrence,
+        content: snapshot.content,
+        platform_id: snapshot.platform_id,
+        channel_type: snapshot.channel_type,
+        thread_id: snapshot.thread_id,
+        kind: snapshot.kind,
+      },
+      // M1: the FULL target locator so recovery can scope its live-count to
+      // exactly {source session, target session} — not a bare series_id fleet
+      // scan that an unrelated group's same-series_id row could falsely satisfy.
+      target: target.agentGroupId,
+      targetAgentGroupId: target.agentGroupId,
+      targetMessagingGroupId: target.messagingGroupId,
+    },
+  });
+
+  const restoreSnapshot: TaskRowSnapshot = {
+    // FRESH id — the cancelled source row still holds snapshot.id (cancel sets
+    // status=completed, never deletes), so re-using it would PK-collide. Series
+    // identity is carried by series_id, not the row id (restoreTaskRow preserves
+    // series_id, A4).
+    id: `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    series_id: source.seriesId,
+    status: wasPaused ? 'paused' : 'pending',
+    process_after: snapshot.process_after,
+    recurrence: snapshot.recurrence,
+    content: snapshot.content,
+    platform_id: snapshot.platform_id,
+    channel_type: snapshot.channel_type,
+    thread_id: snapshot.thread_id,
+    kind: snapshot.kind,
+  };
+
+  // Step 3: cancel the source live row (→ completed, recurrence cleared).
+  // Capture the touched count (E-2): the §2a guard already proved the source is
+  // live, so a 0-touch cancel is unexpected — but if it happens, abort BEFORE
+  // inserting the target so a no-op cancel can never leave a target-only series.
+  let cancelTouched = 0;
+  {
+    const srcDb = openInboundDb(sourceInbound);
+    try {
+      cancelTouched = cancelTask(srcDb, source.seriesId);
+    } finally {
+      srcDb.close();
+    }
+  }
+  if (cancelTouched === 0) {
+    // Nothing was cancelled (raced terminal/move between the guard and here) —
+    // leave the intent unresolved for the recovery sweep and do NOT insert.
+    log.warn('scheduled-move: cancel touched 0 rows — aborting before target insert', {
+      seriesId: source.seriesId,
+    });
+    return json({ error: 'stale_key', reason: 'stale_key' }, 409);
+  }
+
+  // Step 4: re-schedule into the target. Paused snapshots take the staged path
+  // (4a) so the row is never simultaneously pending + due (F1).
+  try {
+    if (wasPaused) {
+      const stagedProcessAfter = new Date(nowMs + GUARD_GRACE_MS).toISOString();
+      await scheduledTasks.scheduleTask(
+        taskDefFromSnapshot(snapshot, source.seriesId, target.agentGroupId, targetMg, stagedProcessAfter),
+        dataDir,
+      );
+      const tgtSessId = targetSessionIdFor(target.agentGroupId, target.messagingGroupId);
+      if (tgtSessId) {
+        const tgtDb = openInboundDb(inboundPathOf(dataDir, target.agentGroupId, tgtSessId));
+        try {
+          pauseTask(tgtDb, source.seriesId);
+          if (snapshot.process_after) updateTask(tgtDb, source.seriesId, { processAfter: snapshot.process_after });
+        } finally {
+          tgtDb.close();
+        }
+      }
+    } else {
+      await scheduledTasks.scheduleTask(
+        taskDefFromSnapshot(snapshot, source.seriesId, target.agentGroupId, targetMg),
+        dataDir,
+      );
+    }
+  } catch (err) {
+    // Step 5: target insert failed → restore the source — but ONLY when the
+    // scoped {source,target} live count is a readable ZERO. M2/F6: if the count
+    // is UNREADABLE, the post-state is UNKNOWN, so we must NOT restore (a blind
+    // restore on top of a live row we couldn't see would double it). Never
+    // delete a succeeded target.
+    log.warn('scheduled-move: target insert failed — restoring source', {
+      seriesId: source.seriesId,
+      err: err instanceof Error ? err.message : String(err),
+    });
+    let restored = false;
+    try {
+      const tgtSessId = targetSessionIdFor(target.agentGroupId, target.messagingGroupId);
+      const live = scopedLiveCount(
+        dataDir,
+        { agentGroupId: source.agentGroupId, sessionId: source.sessionId },
+        { agentGroupId: target.agentGroupId, sessionId: tgtSessId },
+        source.seriesId,
+      );
+      if (!live.unreadable && live.count === 0) {
+        const srcDb = openInboundDb(sourceInbound);
+        try {
+          restoreTaskRow(srcDb, restoreSnapshot);
+          restored = true;
+        } finally {
+          srcDb.close();
+        }
+      }
+    } catch (restoreErr) {
+      log.error('scheduled-move: source restore ALSO failed', {
+        seriesId: source.seriesId,
+        err: restoreErr instanceof Error ? restoreErr.message : String(restoreErr),
+      });
+    }
+    if (!restored) {
+      writeAudit(central, {
+        actor: ctx.user.id,
+        action: 'move_restore_failed',
+        agentGroupId: source.agentGroupId,
+        sessionId: source.sessionId,
+        seriesId: source.seriesId,
+        correlationId,
+      });
+    } else {
+      purgeIntentBody(central, correlationId);
+    }
+    invalidateScheduledCache();
+    return json({ error: 'move_failed', reason: 'move_failed' }, 500);
+  }
+
+  // Step 6: invariant — exactly one live row across {source, target} for the
+  // series. E-2: a violation is NOT logged-and-200'd — we return an error and
+  // LEAVE the move_intent unresolved so the recovery sweep repairs it. An
+  // UNREADABLE post-state is equally not-success (never claim a move succeeded
+  // on a state we couldn't observe).
+  const tgtSessId = targetSessionIdFor(target.agentGroupId, target.messagingGroupId);
+  const post = scopedLiveCount(
+    dataDir,
+    { agentGroupId: source.agentGroupId, sessionId: source.sessionId },
+    { agentGroupId: target.agentGroupId, sessionId: tgtSessId },
+    source.seriesId,
+  );
+  if (post.unreadable) {
+    log.error('scheduled-move: post-move live count UNREADABLE — leaving intent for recovery', {
+      seriesId: source.seriesId,
+    });
+    invalidateScheduledCache();
+    return json({ error: 'move_failed', reason: 'post_state_unreadable' }, 503);
+  }
+  if (post.count !== 1) {
+    log.error('scheduled-move: post-move invariant violated — leaving intent for recovery', {
+      seriesId: source.seriesId,
+      liveCount: post.count,
+    });
+    invalidateScheduledCache();
+    return json({ error: 'move_failed', reason: 'invariant_violated' }, 500);
+  }
+
+  // Step 7: resolve the intent (stamp + purge body, F5) + two-sided move audit
+  // (one row per group, shared correlation_id) + invalidate cache.
+  purgeIntentBody(central, correlationId);
+  const secretDetail = { secretGainsCount: delta.gains.length, secretLossesCount: delta.losses.length };
+  writeAudit(central, {
+    actor: ctx.user.id,
+    action: 'move',
+    agentGroupId: source.agentGroupId,
+    sessionId: source.sessionId,
+    seriesId: source.seriesId,
+    correlationId,
+    detail: { direction: 'source', target: target.agentGroupId, ...secretDetail },
+  });
+  writeAudit(central, {
+    actor: ctx.user.id,
+    action: 'move',
+    agentGroupId: target.agentGroupId,
+    sessionId: tgtSessId ?? '',
+    seriesId: source.seriesId,
+    correlationId,
+    detail: { direction: 'target', source: source.agentGroupId, ...secretDetail },
+  });
+  invalidateScheduledCache();
+
+  return json({ moved: true });
+};

@@ -465,6 +465,12 @@ export function migrateMessagesInTable(db: Database.Database): void {
     // All existing rows are normal messages, so default 0.
     db.prepare('ALTER TABLE messages_in ADD COLUMN on_wake INTEGER NOT NULL DEFAULT 0').run();
   }
+  // Read-path enabler for the Scheduled Tasks Board (design §4.8). Added
+  // unconditionally — existing DBs already carry `series_id` (so the branch
+  // above is skipped) yet still need this compound index. Created on the next
+  // write-path open; board read-only opens tolerate its absence and fall back
+  // to the scan. Idempotent via IF NOT EXISTS. Read-path only; C1 untouched.
+  db.prepare('CREATE INDEX IF NOT EXISTS idx_messages_in_series_seq ON messages_in(series_id, seq DESC)').run();
 }
 
 /**
