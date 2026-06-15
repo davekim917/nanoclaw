@@ -7,6 +7,7 @@
  * central DB, driving the AuthHandlers directly with a synthetic ctx.
  */
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
@@ -18,7 +19,10 @@ import { movePreviewHandler, moveExecuteHandler, _setMoveTestOptions } from './s
 import { computeSecretDelta } from './scheduled-move.js';
 import type { AuthedRequestContext } from '../router.js';
 
-const TEST_DIR = '/tmp/nanoclaw-scheduled-move-test';
+// Unique per-file temp root (mkdtempSync) so parallel vitest workers never
+// share a fixed path and clobber each other's rmSync. beforeEach still
+// wipes/recreates this dir for per-test isolation.
+const TEST_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-scheduled-move-test-'));
 const NOW = Date.parse('2026-06-13T12:00:00Z');
 
 function isoIn(ms: number): string {

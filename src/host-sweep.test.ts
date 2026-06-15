@@ -1289,7 +1289,9 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
   let ensureSchema: typeof import('./db/session-db.js').ensureSchema;
   let openInboundDb: typeof import('./db/session-db.js').openInboundDb;
 
-  const DIR = path.join(os.tmpdir(), 'nanoclaw-d3d4-test');
+  // Unique per-file temp root (mkdtempSync) so parallel vitest workers never
+  // share a fixed path and clobber each other's rmSync.
+  const DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-d3d4-test-'));
   const NOW = Date.parse('2026-06-13T12:00:00Z');
   const SWEEP_MS = 60_000;
 
