@@ -226,11 +226,20 @@ interface RawRow {
   content: string;
 }
 
+// A `cancelled` row is an INTENTIONALLY-terminated task, not a scheduled one —
+// it must drop off the board entirely (not surface as "stalled"). The board's
+// own cancel nulls the recurrence (so board-cancelled tasks fall out via the
+// `recurrence IS NOT NULL` filter), but legacy/agent-side cancels leave the cron
+// set, so we must also exclude `status = 'cancelled'` explicitly. We intentionally
+// do NOT exclude completed/failed/expired here: deriveHealth's strand detector
+// relies on seeing a terminal-but-still-recurring latest row to catch a genuine
+// silent death (the fired-but-no-successor signature §4.1).
 const LATEST_PER_SERIES_SQL = `
   SELECT id, series_id, recurrence, process_after, status, kind, timestamp,
          platform_id, channel_type, thread_id, content
     FROM messages_in
    WHERE recurrence IS NOT NULL
+     AND status != 'cancelled'
      AND seq = (SELECT MAX(m2.seq) FROM messages_in m2 WHERE m2.series_id = messages_in.series_id)
 `;
 
@@ -578,6 +587,10 @@ export function buildDetailRow(
       (inDb.prepare(ONE_SERIES_LIVE_SQL).get(seriesId) as RawRow | undefined) ??
       (inDb.prepare(ONE_SERIES_LATEST_SQL).get(seriesId) as RawRow | undefined);
     if (!raw) return null;
+    // A cancelled series is intentionally ended and is excluded from the board
+    // list (LATEST_PER_SERIES_SQL). The detail tier 404s to match — never
+    // resolves a phantom 'strand'/'stalled' row for a task that's off the board.
+    if (raw.status === 'cancelled') return null;
 
     const isLive = raw.status === 'pending' || raw.status === 'paused';
     const isStrand = !isLive && raw.recurrence !== null;

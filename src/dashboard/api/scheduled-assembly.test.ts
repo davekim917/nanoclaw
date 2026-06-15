@@ -486,3 +486,87 @@ describe('assembleSnapshot — search_index', () => {
     expect(snap.search_index[row.key]).toContain('walrus');
   });
 });
+
+// ── cancelled rows drop off the board (not "stalled") ────────────────────────
+describe('assembleSnapshot — cancelled exclusion', () => {
+  it('test_cancelled_recurring_latest_row_excluded', async () => {
+    addGroup('ag-1', 'G1', 'g1');
+    addMg('mg-1', 'discord', 'd:1', 'chan-1');
+    addSession('sess-1', 'ag-1', 'mg-1');
+    const { inbound } = seedSessionDbs('ag-1', 'sess-1');
+    // Recurring series whose LATEST row is cancelled (cron still set) — an
+    // intentionally-terminated task. Must NOT appear on the board at all (it was
+    // mislabeled 'stalled' before this fix).
+    insertInboundRow(inbound, {
+      id: 'r1',
+      series_id: 'old-cancelled',
+      status: 'cancelled',
+      recurrence: '0 9 * * *',
+      process_after: isoIn(-30 * 86400_000),
+    });
+    const snap = await assembleSnapshot(ALL_SCOPES, opts());
+    expect(snap.rows.find((r) => r.series_id === 'old-cancelled')).toBeUndefined();
+  });
+
+  it('test_cancelled_exclusion_leaves_live_pending_recurring_healthy', async () => {
+    addGroup('ag-1', 'G1', 'g1');
+    addMg('mg-1', 'discord', 'd:1', 'chan-1');
+    addSession('sess-1', 'ag-1', 'mg-1');
+    const { inbound } = seedSessionDbs('ag-1', 'sess-1');
+    insertInboundRow(inbound, {
+      id: 'r1',
+      series_id: 'live-daily',
+      status: 'pending',
+      recurrence: '0 9 * * *',
+      process_after: isoIn(3600_000),
+    });
+    const snap = await assembleSnapshot(ALL_SCOPES, opts());
+    const row = snap.rows.find((r) => r.series_id === 'live-daily');
+    expect(row?.health).toBe('healthy');
+  });
+
+  it('test_strand_detection_preserved_after_cancelled_exclusion', async () => {
+    // REGRESSION GUARD: a completed-but-still-recurring latest row (the genuine
+    // fired-but-no-successor silent death) MUST still surface as 'strand'. We
+    // excluded only 'cancelled', not the terminal statuses strand relies on.
+    addGroup('ag-1', 'G1', 'g1');
+    addMg('mg-1', 'discord', 'd:1', 'chan-1');
+    addSession('sess-1', 'ag-1', 'mg-1');
+    const { inbound } = seedSessionDbs('ag-1', 'sess-1');
+    insertInboundRow(inbound, {
+      id: 'r1',
+      series_id: 'dead-synth',
+      status: 'completed',
+      recurrence: '0 9 * * *',
+      process_after: isoIn(-30 * 86400_000), // aged far past 2×SWEEP
+      timestamp: '2026-05-14 09:00:00',
+    });
+    const snap = await assembleSnapshot(ALL_SCOPES, opts());
+    expect(snap.rows.find((r) => r.series_id === 'dead-synth')?.health).toBe('strand');
+  });
+
+  it('test_cancelled_latest_hides_series_even_with_earlier_pending', async () => {
+    // The cancel is the latest event (highest seq) → series terminated; an
+    // earlier pending row of the same series must not resurrect it on the board.
+    addGroup('ag-1', 'G1', 'g1');
+    addMg('mg-1', 'discord', 'd:1', 'chan-1');
+    addSession('sess-1', 'ag-1', 'mg-1');
+    const { inbound } = seedSessionDbs('ag-1', 'sess-1');
+    insertInboundRow(inbound, {
+      id: 'r-old',
+      series_id: 'superseded',
+      status: 'pending',
+      recurrence: '0 9 * * *',
+      process_after: isoIn(-2 * 86400_000),
+    });
+    insertInboundRow(inbound, {
+      id: 'r-cancel',
+      series_id: 'superseded',
+      status: 'cancelled',
+      recurrence: '0 9 * * *',
+      process_after: isoIn(-1 * 86400_000),
+    });
+    const snap = await assembleSnapshot(ALL_SCOPES, opts());
+    expect(snap.rows.find((r) => r.series_id === 'superseded')).toBeUndefined();
+  });
+});
