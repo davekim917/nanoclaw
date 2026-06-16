@@ -218,13 +218,23 @@ function pickCandidates(cap: number): CandidateRow[] {
   // (see `stampFailureBackoff`) shouldn't slip back into the candidate
   // set just because its `title` column is still NULL. The refresh case
   // (title present + new messages) is gated in JS by `shouldGenerate`.
+  //
+  // ORDER: untitled sessions first (`title IS NOT NULL` sorts 0 before 1), then
+  // most-recently-active first. This is load-bearing: the old "oldest
+  // title_generated_at ASC" surfaced the oldest-CREATED sessions, which on a
+  // long-lived install are overwhelmingly empty/churned shells with no content
+  // to summarize. The sweep would pick LIMIT empties, skip them all (0
+  // generated), and — because an empty session was never stamped — get the SAME
+  // empties next tick, starving every real session forever. Prioritizing
+  // recently-active untitled sessions titles the visible inbox cards first; the
+  // empty-skip stamp in the loop below drains the rest of the shells.
   const rows = getDb()
     .prepare(
       `SELECT id, agent_group_id, title, title_generated_at, title_basis_seq
          FROM sessions
         WHERE status = 'active'
           AND (title_generated_at IS NULL OR title_generated_at < ?)
-        ORDER BY COALESCE(title_generated_at, '0000') ASC
+        ORDER BY (title IS NOT NULL), COALESCE(last_active, created_at) DESC
         LIMIT ?`,
     )
     .all(cooldownIso, cap * 4) as CandidateRow[];
@@ -415,11 +425,25 @@ async function _runSessionTitleSweepLocked(): Promise<{ generated: number; skipp
   for (const row of candidates) {
     if (tasks.length >= CONCURRENCY_CAP) break;
     const slice = readSessionSlice(row.agent_group_id, row.id);
-    if (!shouldGenerate(row, slice.maxSeq)) {
+    // Empty / no-usable-content session: nothing to summarize. STAMP a backoff
+    // so it exits the candidate pool rather than re-entering every tick. Without
+    // this, a backlog of empty NULL-title shells permanently occupies the LIMIT
+    // and starves real sessions (the sweep skips all N and generates 0 forever
+    // — the clog this fix targets). A stamped shell that later gains content
+    // re-enters after the cooldown ages out and gets titled then.
+    if (slice.maxSeq < 0 || !slice.text) {
+      try {
+        stampFailureBackoff(row.id);
+      } catch {
+        /* stamp failure is non-fatal — next tick will retry */
+      }
       skipped++;
       continue;
     }
-    if (!slice.text) {
+    // Has content but not enough NEW messages to justify a refresh — leave it on
+    // its natural cooldown (it already has a title + title_generated_at); do NOT
+    // re-stamp, which would churn its refresh clock.
+    if (!shouldGenerate(row, slice.maxSeq)) {
       skipped++;
       continue;
     }

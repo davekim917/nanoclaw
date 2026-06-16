@@ -343,4 +343,51 @@ describe('runSessionTitleSweep', () => {
     expect(second.generated).toBe(0);
     expect(backendSecond).not.toHaveBeenCalled();
   });
+
+  it('stamps an empty/contentless session so it exits the candidate pool (clog fix)', async () => {
+    // An active NULL-title session with an inbound.db that has NO messages.
+    // Pre-fix this was skipped WITHOUT stamping, so it re-entered the candidate
+    // set forever and (in bulk) starved real sessions. It must now be stamped.
+    seedSession('sess-empty', 'ag-1');
+    writeInboundMessages('ag-1', 'sess-empty', []); // empty db, slice.maxSeq < 0
+    const backend = vi.fn(async () => 'unused');
+    setTitleBackendForTest(backend);
+
+    const result = await runSessionTitleSweep();
+    expect(result.generated).toBe(0);
+    expect(backend).not.toHaveBeenCalled();
+    const row = getDb().prepare('SELECT title, title_generated_at FROM sessions WHERE id = ?').get('sess-empty') as {
+      title: string | null;
+      title_generated_at: string | null;
+    };
+    expect(row.title).toBeNull();
+    expect(row.title_generated_at).toBeTruthy(); // stamped → won't clog next tick
+  });
+
+  it('a backlog of empty shells does NOT starve a real recently-active session (clog fix)', async () => {
+    // 15 empty shells, seeded FIRST (lowest rowids) and marked long-inactive.
+    // Pre-fix the candidate query (oldest-rowid-first, LIMIT cap*4=12) returned
+    // only these 12 empties → 0 generated, and the real session below — seeded
+    // last, highest rowid — was never reached. The new ordering (untitled +
+    // most-recently-active first) surfaces the real session instead.
+    for (let i = 1; i <= 15; i++) {
+      seedSession(`sess-empty-${i}`, 'ag-1');
+      writeInboundMessages('ag-1', `sess-empty-${i}`, []);
+      getDb().prepare("UPDATE sessions SET last_active = '2026-01-01T00:00:00Z' WHERE id = ?").run(`sess-empty-${i}`);
+    }
+    seedSession('sess-real', 'ag-1');
+    writeInboundMessages('ag-1', 'sess-real', [
+      { kind: 'chat', content: JSON.stringify({ text: 'deploy the XZO-99 hotfix' }) },
+    ]);
+    getDb().prepare('UPDATE sessions SET last_active = ? WHERE id = ?').run(now(), 'sess-real');
+
+    setTitleBackendForTest(async () => 'XZO-99 hotfix deploy');
+    const result = await runSessionTitleSweep();
+
+    const real = getDb().prepare('SELECT title FROM sessions WHERE id = ?').get('sess-real') as {
+      title: string | null;
+    };
+    expect(real.title).toBe('XZO-99 hotfix deploy'); // not starved
+    expect(result.generated).toBeGreaterThanOrEqual(1);
+  });
 });
