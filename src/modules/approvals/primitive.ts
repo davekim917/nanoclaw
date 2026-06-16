@@ -67,6 +67,50 @@ export function getApprovalHandler(action: string): ApprovalHandler | undefined 
   return approvalHandlers.get(action);
 }
 
+// ── Approval-resolved callbacks ──
+// Modules that want to observe approval resolution (any action, approve or
+// reject) register here at import time. The response handler fires every
+// registered callback after the admin's decision is applied — e.g. a module
+// clearing an "awaiting approval" status indicator it set when the card went
+// out. Callback errors are logged and isolated; they never block resolution.
+//
+// Only authorized clicks resolve an approval (the response handler's
+// isAuthorizedApprovalClick gate runs first), so callbacks never fire for
+// unauthorized responses.
+
+export interface ApprovalResolvedEvent {
+  approval: PendingApproval;
+  session: Session;
+  outcome: 'approve' | 'reject';
+  /** Namespaced user ID (`<channel>:<handle>`) of the resolving admin. Empty string if unknown. */
+  userId: string;
+}
+
+export type ApprovalResolvedHandler = (event: ApprovalResolvedEvent) => Promise<void> | void;
+
+const approvalResolvedHandlers: ApprovalResolvedHandler[] = [];
+
+export function registerApprovalResolvedHandler(handler: ApprovalResolvedHandler): void {
+  approvalResolvedHandlers.push(handler);
+}
+
+/** Fire every registered approval-resolved callback. Called by the response handler. */
+export async function notifyApprovalResolved(event: ApprovalResolvedEvent): Promise<void> {
+  for (const handler of approvalResolvedHandlers) {
+    try {
+      await handler(event);
+      // eslint-disable-next-line no-catch-all/no-catch-all -- isolation is the contract: one bad callback must not block resolution or other callbacks
+    } catch (err) {
+      log.error('Approval-resolved handler threw', {
+        approvalId: event.approval.approval_id,
+        action: event.approval.action,
+        outcome: event.outcome,
+        err,
+      });
+    }
+  }
+}
+
 // ── Approver picking ──
 
 /**

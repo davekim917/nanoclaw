@@ -41,6 +41,7 @@ import { routeInbound } from './router.js';
 import { log } from './log.js';
 import { runStartupOllamaCheck } from './host-ollama-status.js';
 import { startDashboard } from './dashboard/index.js';
+import { enforceUpgradeTripwire } from './upgrade-state.js';
 
 // Response + shutdown registries live in response-registry.ts to break the
 // circular import cycle: src/index.ts imports src/modules/index.js for side
@@ -125,7 +126,11 @@ import './cli/delivery-action.js';
 import { startCliServer, stopCliServer } from './cli/socket-server.js';
 
 import type { ChannelAdapter, ChannelSetup } from './channels/adapter.js';
-import { initChannelAdapters, teardownChannelAdapters, getChannelAdapter } from './channels/channel-registry.js';
+import {
+  initChannelAdapters,
+  teardownChannelAdapters,
+  createChannelDeliveryAdapter,
+} from './channels/channel-registry.js';
 
 async function main(): Promise<void> {
   log.info('NanoClaw starting');
@@ -150,6 +155,10 @@ async function main(): Promise<void> {
     .catch(() => {
       /* never throws */
     });
+
+  // 0.5 Upgrade tripwire — refuse to start if this install was updated
+  // outside the sanctioned path (raw `git pull` instead of /update-nanoclaw).
+  enforceUpgradeTripwire();
 
   // 1. Init central DB
   const dbPath = path.join(DATA_DIR, 'v2.db');
@@ -237,6 +246,9 @@ async function main(): Promise<void> {
       onInbound(platformId, threadId, message) {
         routeInbound({
           channelType: adapter.channelType,
+          // The one host-side stamping seam: adapters stay instance-blind,
+          // the host stamps the receiving instance on every inbound event.
+          instance: adapter.instance ?? adapter.channelType,
           platformId,
           threadId,
           isDM: message.isDM,
@@ -330,54 +342,12 @@ async function main(): Promise<void> {
     log.info('Sibling-bot allow-list wired for access gate', { registries: botRegistries.length });
   }
 
-  // 4. Delivery adapter bridge — dispatches to channel adapters
-  const deliveryAdapter = {
-    async deliver(
-      channelType: string,
-      platformId: string,
-      threadId: string | null,
-      kind: string,
-      content: string,
-      files?: import('./channels/adapter.js').OutboundFile[],
-    ): Promise<string | undefined> {
-      const adapter = getChannelAdapter(channelType);
-      if (!adapter) {
-        log.warn('No adapter for channel type', { channelType });
-        return;
-      }
-      return adapter.deliver(platformId, threadId, { kind, content: JSON.parse(content), files });
-    },
-    async setTyping(channelType: string, platformId: string, threadId: string | null): Promise<void> {
-      const adapter = getChannelAdapter(channelType);
-      await adapter?.setTyping?.(platformId, threadId);
-    },
-    async deleteMessage(
-      channelType: string,
-      platformId: string,
-      threadId: string | null,
-      messageId: string,
-    ): Promise<void> {
-      const adapter = getChannelAdapter(channelType);
-      await adapter?.deleteMessage?.(platformId, threadId, messageId);
-    },
-    async postParent(channelType: string, platformId: string, text: string): Promise<{ messageId: string }> {
-      const adapter = getChannelAdapter(channelType);
-      if (!adapter?.postParent) throw new Error(`adapter ${channelType} doesn't support postParent`);
-      return adapter.postParent(platformId, text);
-    },
-    async createThread(
-      channelType: string,
-      platformId: string,
-      parentMessageId: string,
-      title: string,
-      firstMessage: string,
-    ): Promise<{ threadId: string; messageId: string }> {
-      const adapter = getChannelAdapter(channelType);
-      if (!adapter?.createThread) throw new Error(`adapter ${channelType} doesn't support createThread`);
-      return adapter.createThread(platformId, parentMessageId, title, firstMessage);
-    },
-  };
-  setDeliveryAdapter(deliveryAdapter);
+  // 4. Delivery adapter bridge — dispatches to channel adapters by EXACT
+  // registry key (instance ?? channelType): a named instance with an
+  // offline adapter is never rerouted through a sibling bot. The factory now
+  // also carries our support-thread surfaces (deleteMessage/postParent/
+  // createThread). See createChannelDeliveryAdapter in channel-registry.ts.
+  setDeliveryAdapter(createChannelDeliveryAdapter());
 
   // 5. Start delivery polls
   startActiveDeliveryPoll();

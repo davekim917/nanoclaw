@@ -13,6 +13,7 @@ import {
   handleEvent,
   isAdmissibleTrigger,
   isAupRefusal,
+  isCorruptionError,
   selectInTurnFollowUps,
 } from './poll-loop.js';
 import { MockProvider } from './providers/mock.js';
@@ -48,13 +49,15 @@ describe('formatter', () => {
     expect(prompt).toContain('Hello world');
   });
 
-  it('should format multiple chat messages as XML block', () => {
+  it('should format multiple chat messages as distinct <message> blocks', () => {
     insertMessage('m1', 'chat', { sender: 'John', text: 'Hello' });
     insertMessage('m2', 'chat', { sender: 'Jane', text: 'Hi there' });
     const messages = getPendingMessages();
     const prompt = formatMessages(messages);
-    expect(prompt).toContain('<messages>');
-    expect(prompt).toContain('</messages>');
+    // The <messages> envelope was dropped in fe2e881b (#2556) so the SDK calls
+    // the API; each message is now its own self-contained <message> block.
+    expect(prompt).not.toContain('<messages>');
+    expect(prompt.match(/<message /g) ?? []).toHaveLength(2);
     expect(prompt).toContain('sender="John"');
     expect(prompt).toContain('sender="Jane"');
   });
@@ -1103,5 +1106,22 @@ describe('handleEvent — terminal-error visibility (Layer-1 fix)', () => {
     expect(out).toHaveLength(1);
     const body = JSON.parse(out[0].content) as { text: string };
     expect(body.text).toContain('Rate limit');
+  });
+});
+
+describe('isCorruptionError', () => {
+  it('matches the Docker Desktop macOS torn-read symptom', () => {
+    expect(isCorruptionError('database disk image is malformed')).toBe(true);
+  });
+
+  it('matches wrapped SQLite corruption codes', () => {
+    expect(isCorruptionError('SqliteError: SQLITE_CORRUPT_VTAB: ...')).toBe(true);
+    expect(isCorruptionError('file is not a database')).toBe(true);
+  });
+
+  it('returns false for unrelated errors', () => {
+    expect(isCorruptionError('database is locked')).toBe(false);
+    expect(isCorruptionError('no such table: messages_in')).toBe(false);
+    expect(isCorruptionError('')).toBe(false);
   });
 });

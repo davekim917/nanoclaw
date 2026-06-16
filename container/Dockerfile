@@ -321,6 +321,11 @@ ENV PATH="$PNPM_HOME:$PATH"
 ARG PNPM_VERSION=10.33.4
 RUN corepack enable && corepack prepare pnpm@${PNPM_VERSION} --activate
 
+# Global Node CLIs the agent invokes at runtime are installed explicitly below,
+# each pinned via an ARG (see the version block above). This fork keeps the
+# Dockerfile-ARG pin convention rather than upstream's cli-tools.json manifest,
+# so a caret bump upstream surfaces as a merge conflict instead of a silent
+# re-resolution.
 RUN --mount=type=cache,target=/root/.cache/pnpm \
     echo "only-built-dependencies[]=agent-browser" > /root/.npmrc && \
     echo "only-built-dependencies[]=@anthropic-ai/claude-code" >> /root/.npmrc && \

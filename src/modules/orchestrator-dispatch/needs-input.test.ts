@@ -42,8 +42,8 @@ function seedGroups(): void {
   createAgentGroup({ id: 'ag-child', name: 'ag-child', folder: 'ag-child', agent_provider: null, created_at: now() });
   getDb()
     .prepare(
-      `INSERT INTO messaging_groups (id, channel_type, platform_id, name, is_group, unknown_sender_policy, created_at)
-       VALUES ('mg-child', 'slack', 'W-illysium', 'illysium-channel', 1, 'strict', ?)`,
+      `INSERT INTO messaging_groups (id, channel_type, platform_id, instance, name, is_group, unknown_sender_policy, created_at)
+       VALUES ('mg-child', 'slack', 'W-illysium', 'slack', 'illysium-channel', 1, 'strict', ?)`,
     )
     .run(now());
   getDb()

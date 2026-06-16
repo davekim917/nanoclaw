@@ -215,12 +215,12 @@ describe('applySteer — D5', () => {
     const dbForMg = getDb();
     dbForMg
       .prepare(
-        `INSERT OR IGNORE INTO messaging_groups (id, channel_type, platform_id, name, is_group, unknown_sender_policy, created_at) VALUES ('mg-1','slack','C-1','test-ch',1,'public',datetime('now'))`,
+        `INSERT OR IGNORE INTO messaging_groups (id, channel_type, platform_id, instance, name, is_group, unknown_sender_policy, created_at) VALUES ('mg-1','slack','C-1','slack','test-ch',1,'public',datetime('now'))`,
       )
       .run();
     dbForMg
       .prepare(
-        `INSERT OR IGNORE INTO messaging_groups (id, channel_type, platform_id, name, is_group, unknown_sender_policy, created_at) VALUES ('mg-slack','slack','C-slack','slack-ch',1,'public',datetime('now'))`,
+        `INSERT OR IGNORE INTO messaging_groups (id, channel_type, platform_id, instance, name, is_group, unknown_sender_policy, created_at) VALUES ('mg-slack','slack','C-slack','slack','slack-ch',1,'public',datetime('now'))`,
       )
       .run();
     // Verify mg-1 was actually inserted (debug)
@@ -605,8 +605,8 @@ describe('applySessionSteer — C5', () => {
     getDb()
       .prepare(
         `INSERT OR IGNORE INTO messaging_groups
-           (id, channel_type, platform_id, name, is_group, unknown_sender_policy, created_at)
-         VALUES ('mg-s', 'slack', 'C-s', 'echo-ch', 1, 'public', datetime('now'))`,
+           (id, channel_type, platform_id, instance, name, is_group, unknown_sender_policy, created_at)
+         VALUES ('mg-s', 'slack', 'C-s', 'slack', 'echo-ch', 1, 'public', datetime('now'))`,
       )
       .run();
     getDb()

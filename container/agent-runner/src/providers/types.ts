@@ -6,6 +6,25 @@ export interface AgentProvider {
    */
   readonly supportsNativeSlashCommands: boolean;
 
+  /**
+   * Optional. When true, the runner scaffolds a persistent `memory/` tree in the
+   * agent's workspace at boot. Providers with their own native memory (e.g.
+   * Claude's `CLAUDE.local.md`) omit this and get nothing — memory is opt-in per
+   * provider, never gated on a provider name.
+   */
+  readonly usesMemoryScaffold?: boolean;
+
+  /**
+   * Optional. Called by the poll-loop after each completed exchange (a
+   * result, a wrapping retry, or an error). Providers whose harness keeps no
+   * on-disk transcript implement this to persist exchanges themselves (e.g.
+   * markdown into the agent's `conversations/` dir); providers that persist
+   * and archive their own transcript (e.g. the Claude Agent SDK's `.jsonl`)
+   * omit it. Best-effort: the loop catches and logs anything it throws. The
+   * implementation lives with the provider, never in the runner.
+   */
+  onExchangeComplete?(exchange: ProviderExchange): void;
+
   /** Start a new query. Returns a handle for streaming input and output. */
   query(input: QueryInput): AgentQuery;
 
@@ -49,6 +68,31 @@ export interface AgentProvider {
    * flakiness without dead-turning the user.
    */
   rotateApiKey?(): { rotated: boolean };
+
+  /**
+   * Optional pre-resume maintenance. Given the stored continuation token,
+   * decide whether its backing transcript has grown too large or too old to
+   * resume cheaply. Return a non-null reason string to tell the caller to drop
+   * the continuation and start a fresh session (the provider archives any
+   * recoverable summary first); return null to keep resuming.
+   *
+   * Guards the cold-resume failure mode: a long-lived hub session accumulates
+   * days of history — including base64 image blocks the agent Read — and the
+   * SDK reloads the whole .jsonl on every resume. Past a threshold the first
+   * turn alone can exceed the host's idle ceiling, so the container is killed
+   * before it ever replies. Providers without an on-disk transcript omit this.
+   */
+  maybeRotateContinuation?(continuation: string, cwd: string): string | null;
+}
+
+/** One prompt/result round-trip, as reported to `onExchangeComplete`. */
+export interface ProviderExchange {
+  /** The user prompt this exchange answers (never an internal retry nudge). */
+  prompt: string;
+  result: string | null;
+  /** Continuation/thread id in effect for the exchange, if any. */
+  continuation?: string;
+  status: 'completed' | 'undelivered' | 'error';
 }
 
 /**

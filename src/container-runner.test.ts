@@ -251,6 +251,8 @@ describe('codex provider host auth', () => {
       sessionDir,
       agentGroupId: 'ag-does-not-match-folder',
       agentGroupFolder: 'madison-reed-codex',
+      groupDir: sessionDir,
+      selectedSkills: [],
       hostEnv: { HOME: home } as NodeJS.ProcessEnv,
     });
 
@@ -273,6 +275,8 @@ describe('codex provider host auth', () => {
       sessionDir,
       agentGroupId: 'madison-reed-codex',
       agentGroupFolder: 'madison-reed-codex',
+      groupDir: sessionDir,
+      selectedSkills: [],
       hostEnv: { HOME: home } as NodeJS.ProcessEnv,
     });
 

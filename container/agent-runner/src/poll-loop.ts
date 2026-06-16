@@ -31,12 +31,37 @@ import {
   stripInternalTags,
   type RoutingContext,
 } from './formatter.js';
-import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
+import { isUploadTraceCommand, uploadTrace } from './upload-trace.js';
+import type { AgentProvider, AgentQuery, ProviderEvent, ProviderExchange } from './providers/types.js';
 import { autoCommitDirtyWorktrees } from './worktree-autosave.js';
 import { buildSessionRecap, wrapRecap } from './session-recap.js';
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
+
+/**
+ * Number of consecutive `database disk image is malformed` errors after which
+ * the follow-up poll gives up and exits the process. At ACTIVE_POLL_INTERVAL_MS
+ * = 500ms this is roughly 5 seconds — long enough to dodge a transient torn
+ * read during a host write, short enough to recover quickly from a poisoned
+ * page cache (host-sweep then respawns with a fresh mount).
+ */
+const CORRUPTION_STREAK_EXIT = 10;
+
+/**
+ * True for SQLite errors that indicate a corrupt READ view — almost always a
+ * cross-mount page-cache coherency issue on Docker Desktop macOS rather than
+ * actual file damage (host-side integrity_check passes). Reopening the DB
+ * handle inside this process does NOT recover; only a fresh container mount
+ * does. Caller's job is to exit so host-sweep respawns the container.
+ */
+export function isCorruptionError(msg: string): boolean {
+  return (
+    msg.includes('database disk image is malformed') ||
+    msg.includes('SQLITE_CORRUPT') ||
+    msg.includes('file is not a database')
+  );
+}
 
 function log(msg: string): void {
   console.error(`[poll-loop] ${msg}`);
@@ -97,6 +122,12 @@ export interface PollLoopConfig {
   systemContext?: {
     instructions?: string;
   };
+  /**
+   * Optional stop signal. In production the loop runs until the container
+   * dies; tests pass a signal so an abandoned loop actually exits instead of
+   * polling forever and stealing messages from the next test's DB.
+   */
+  signal?: AbortSignal;
 }
 
 /**
@@ -117,6 +148,19 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   // a Codex thread id never gets handed to Claude or vice versa.
   let continuation: string | undefined = migrateLegacyContinuation(config.providerName);
 
+  // Before resuming, drop a session whose on-disk transcript has grown too
+  // large/old to cold-resume within the host's idle ceiling. Without this a
+  // long-lived hub keeps trying to reload an ever-growing .jsonl, hangs the
+  // first turn, and gets killed before it can reply (then repeats forever).
+  if (continuation) {
+    const rotateReason = config.provider.maybeRotateContinuation?.(continuation, config.cwd);
+    if (rotateReason) {
+      log(`Rotating session — ${rotateReason}; starting fresh`);
+      clearContinuation(config.providerName);
+      continuation = undefined;
+    }
+  }
+
   if (continuation) {
     log(`Resuming agent session ${continuation}`);
   }
@@ -128,6 +172,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   let pollCount = 0;
   let isFirstPoll = true;
   while (true) {
+    if (config.signal?.aborted) return;
     // Skip system messages — they're responses for MCP tools (e.g., ask_user_question).
     // Exception: recall_context system messages must reach the prompt path so the agent sees recalled facts.
     // isFirstPoll → getPendingMessages so on_wake rows only fire on the fresh container's first poll.
@@ -193,6 +238,19 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
           channel_type: routing.channelType,
           thread_id: routing.threadId,
           content: JSON.stringify({ text: 'Session cleared.' }),
+        });
+        commandIds.push(msg.id);
+        continue;
+      }
+      if ((msg.kind === 'chat' || msg.kind === 'chat-sdk') && isUploadTraceCommand(msg)) {
+        log('Uploading session trace to Hugging Face');
+        writeMessageOut({
+          id: generateId(),
+          kind: 'chat',
+          platform_id: routing.platformId,
+          channel_type: routing.channelType,
+          thread_id: routing.threadId,
+          content: JSON.stringify({ text: uploadTrace() }),
         });
         commandIds.push(msg.id);
         continue;
@@ -274,7 +332,15 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     setCurrentInReplyTo(routing.inReplyTo);
     setCurrentBatchAnchors(keep);
     try {
-      const result = await processQuery(query, routing, processingIds, config.providerName);
+      const result = await processQuery(
+        query,
+        routing,
+        processingIds,
+        config.providerName,
+        config.provider.onExchangeComplete?.bind(config.provider),
+        prompt,
+        continuation,
+      );
       if (result.continuation && result.continuation !== continuation) {
         continuation = result.continuation;
         setContinuation(config.providerName, continuation);
@@ -308,7 +374,15 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             effort: effectiveEffort,
             ultracode: effectiveUltracode,
           });
-          const retryResult = await processQuery(retryQuery, routing, processingIds, config.providerName);
+          const retryResult = await processQuery(
+            retryQuery,
+            routing,
+            processingIds,
+            config.providerName,
+            config.provider.onExchangeComplete?.bind(config.provider),
+            prompt,
+            continuation,
+          );
           if (retryResult.continuation && retryResult.continuation !== continuation) {
             continuation = retryResult.continuation;
             setContinuation(config.providerName, continuation);
@@ -357,7 +431,15 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             effort: effectiveEffort,
             ultracode: effectiveUltracode,
           });
-          const retryResult = await processQuery(retryQuery, routing, processingIds, config.providerName);
+          const retryResult = await processQuery(
+            retryQuery,
+            routing,
+            processingIds,
+            config.providerName,
+            config.provider.onExchangeComplete?.bind(config.provider),
+            prompt,
+            undefined,
+          );
           if (retryResult.continuation) {
             continuation = retryResult.continuation;
             setContinuation(config.providerName, continuation);
@@ -397,7 +479,15 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             effort: effectiveEffort,
             ultracode: effectiveUltracode,
           });
-          const retryResult = await processQuery(retryQuery, routing, processingIds, config.providerName);
+          const retryResult = await processQuery(
+            retryQuery,
+            routing,
+            processingIds,
+            config.providerName,
+            config.provider.onExchangeComplete?.bind(config.provider),
+            prompt,
+            undefined,
+          );
           if (retryResult.continuation) {
             continuation = retryResult.continuation;
             setContinuation(config.providerName, continuation);
@@ -553,10 +643,18 @@ async function processQuery(
   routing: RoutingContext,
   initialBatchIds: string[],
   providerName: string,
+  onExchangeComplete: ((exchange: ProviderExchange) => void) | undefined,
+  initialPrompt: string,
+  initialContinuation: string | undefined,
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
   let done = false;
   let unwrappedNudged = false;
+  // Prompt queue for the exchange hook — each result event consumes the
+  // oldest unanswered prompt, except a wrapping-retry result, which answers
+  // the same prompt again. Unused (and unmaintained) when the provider
+  // doesn't implement `onExchangeComplete`.
+  const archivePrompts: string[] = [initialPrompt];
 
   // Concurrent polling: push follow-ups into the active query as they arrive.
   // We do NOT force-end the stream on silence — keeping the query open avoids
@@ -572,6 +670,7 @@ async function processQuery(
   // can dispatch them through the canonical command path. Once we've decided to
   // end, gate further polling so we don't reclaim the rows mid-teardown.
   let endedForCommand = false;
+  let corruptionStreak = 0;
   const pollHandle = setInterval(() => {
     if (done || pollInFlight || endedForCommand) return;
     pollInFlight = true;
@@ -580,16 +679,20 @@ async function processQuery(
       try {
         const allPending = getPendingMessages();
 
-        // Slash commands need a fresh query: /clear resets the SDK's resume
-        // id (fixed at sdkQuery() time); admin/passthrough commands (/compact,
-        // /cost, …) only dispatch when they're the first input of a query —
-        // pushed mid-stream they arrive as plain text and the SDK never runs
-        // them. End the stream and leave the rows pending; the outer loop
-        // handles them via the canonical command path + formatMessagesWithCommands.
+        // Slash commands need a fresh query: /clear resets the SDK's
+        // resume id (fixed at sdkQuery() time); admin/passthrough commands
+        // (/compact, /cost, …) only dispatch when they're the first input
+        // of a query — pushed mid-stream they arrive as plain text and
+        // the SDK never runs them. Abort the active stream and leave the
+        // rows pending; the outer loop handles them on next iteration via
+        // the canonical command path + formatMessagesWithCommands. Abort,
+        // not end: end() lets an in-flight turn run to completion, which
+        // can block the command (e.g. /clear during a long task) for as
+        // long as the turn takes.
         if (allPending.some((m) => isRunnerCommand(m))) {
-          log('Pending slash command — ending stream so outer loop can process');
+          log('Pending slash command — aborting active stream so outer loop can process');
           endedForCommand = true;
-          query.end();
+          query.abort();
           return;
         }
 
@@ -699,6 +802,7 @@ async function processQuery(
         log(`Pushing ${keep.length} follow-up message(s) into active query`);
         unwrappedNudged = false;
         query.push(prompt);
+        archivePrompts.push(prompt);
         markCompleted(keptIds);
       } catch (err) {
         // Without this catch the rejection escapes the void IIFE and Node
@@ -707,6 +811,31 @@ async function processQuery(
         // path is not, so it needs its own.
         const errMsg = err instanceof Error ? err.message : String(err);
         log(`Follow-up poll error: ${errMsg}`);
+
+        // Detect SQLite cross-mount corruption (Docker Desktop macOS virtiofs /
+        // gRPC-FUSE coherency bug — the kernel page cache for the inbound.db
+        // bind mount can latch a torn snapshot mid-host-write, after which
+        // every fresh openInboundDb() in this process sees the same broken
+        // view. Reopening inside the container does NOT recover; only a fresh
+        // container mount does. Exit so the host sweep respawns us.
+        if (isCorruptionError(errMsg)) {
+          corruptionStreak += 1;
+          if (corruptionStreak >= CORRUPTION_STREAK_EXIT) {
+            log(
+              `Follow-up poll: ${corruptionStreak} consecutive '${errMsg}' errors — ` +
+                `inbound.db page cache is poisoned. Exiting so host respawns with a fresh mount.`,
+            );
+            // Stop touching the heartbeat so host-sweep stale detection fires
+            // promptly even if exit() races with in-flight async work.
+            done = true;
+            clearInterval(pollHandle);
+            // Defer exit one tick so this log line flushes through Docker's
+            // log driver before the process dies.
+            setTimeout(() => process.exit(75), 100);
+          }
+        } else {
+          corruptionStreak = 0;
+        }
       } finally {
         pollInFlight = false;
       }
@@ -780,7 +909,14 @@ async function processQuery(
             }
           }
           const { hasUnwrapped } = dispatchResultText(event.text, routing);
-          if (hasUnwrapped && !unwrappedNudged) {
+          const willRetryWrapping = hasUnwrapped && !unwrappedNudged;
+          notifyExchangeComplete(onExchangeComplete, {
+            prompt: archivePrompts[0] ?? initialPrompt,
+            result: event.text,
+            continuation: queryContinuation ?? initialContinuation,
+            status: hasUnwrapped ? 'undelivered' : 'completed',
+          });
+          if (willRetryWrapping) {
             unwrappedNudged = true;
             const destinations = getAllDestinations();
             const names = destinations.map((d) => d.name).join(', ');
@@ -791,6 +927,11 @@ async function processQuery(
                 `Please re-send your response with the correct wrapping.</system>`,
             );
           }
+          // The wrapping-retry result answers the SAME user prompt — keep it
+          // queued so the retry archives against it, not the nudge text.
+          if (!willRetryWrapping) archivePrompts.shift();
+        } else {
+          archivePrompts.shift();
         }
       } else if (event.type === 'compacted') {
         // The SDK auto-compacted the conversation. After compaction the
@@ -813,12 +954,33 @@ async function processQuery(
         dispatchFileAttachment(event, routing);
       }
     }
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err);
+    notifyExchangeComplete(onExchangeComplete, {
+      prompt: archivePrompts[0] ?? initialPrompt,
+      result: `Error: ${errMsg}`,
+      continuation: queryContinuation ?? initialContinuation,
+      status: 'error',
+    });
+    throw err;
   } finally {
     done = true;
     clearInterval(pollHandle);
   }
 
   return { continuation: queryContinuation };
+}
+
+function notifyExchangeComplete(
+  hook: ((exchange: ProviderExchange) => void) | undefined,
+  exchange: ProviderExchange,
+): void {
+  if (!hook) return;
+  try {
+    hook(exchange);
+  } catch (err) {
+    log(`onExchangeComplete failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 export function handleEvent(event: ProviderEvent, routing: RoutingContext): void {

@@ -59,14 +59,43 @@ describe('context timezone header', () => {
     expect(result).toContain(`<context timezone="${TIMEZONE}"`);
   });
 
-  it('header comes before the <messages> block', () => {
+  it('header comes before the first <message> block when multiple are present', () => {
     insertMessage('m1', 'chat', { sender: 'Alice', text: 'one' });
     insertMessage('m2', 'chat', { sender: 'Bob', text: 'two' });
     const result = formatMessages(getPendingMessages());
     const ctxIdx = result.indexOf('<context');
-    const msgsIdx = result.indexOf('<messages>');
+    const firstMsgIdx = result.indexOf('<message ');
     expect(ctxIdx).toBeGreaterThanOrEqual(0);
-    expect(msgsIdx).toBeGreaterThan(ctxIdx);
+    expect(firstMsgIdx).toBeGreaterThan(ctxIdx);
+  });
+});
+
+describe('multi-message chat batches', () => {
+  // Regression guard for #2555: an outer `<messages>` envelope around
+  // multiple chat messages caused the Claude Agent SDK to emit a synthetic
+  // `No response requested.` stub instead of calling the API. Each
+  // `<message>` block is self-contained; concatenating them is enough.
+  it('does NOT wrap multiple chat messages in an outer <messages> envelope', () => {
+    insertMessage('m1', 'chat', { sender: 'Alice', text: 'one' });
+    insertMessage('m2', 'chat', { sender: 'Bob', text: 'two' });
+    const result = formatMessages(getPendingMessages());
+    expect(result).not.toContain('<messages>');
+    expect(result).not.toContain('</messages>');
+  });
+
+  it('emits one <message> block per inbound row, in order', () => {
+    insertMessage('m1', 'chat', { sender: 'Alice', text: 'first' });
+    insertMessage('m2', 'chat', { sender: 'Bob', text: 'second' });
+    insertMessage('m3', 'chat', { sender: 'Carol', text: 'third' });
+    const result = formatMessages(getPendingMessages());
+    const matches = result.match(/<message [^>]*>/g) ?? [];
+    expect(matches.length).toBe(3);
+    const firstIdx = result.indexOf('first');
+    const secondIdx = result.indexOf('second');
+    const thirdIdx = result.indexOf('third');
+    expect(firstIdx).toBeGreaterThan(0);
+    expect(secondIdx).toBeGreaterThan(firstIdx);
+    expect(thirdIdx).toBeGreaterThan(secondIdx);
   });
 });
 
@@ -184,12 +213,16 @@ describe('trigger-flag split', () => {
     expect(result).not.toContain('<messages>');
   });
 
-  it('all-trigger-1 batch renders as the legacy <messages> group (multiple rows)', () => {
+  it('all-trigger-1 batch renders as concatenated <message> blocks (no <messages> envelope)', () => {
     insertMessage('m1', 'chat', { sender: 'Alice', text: 'one' }, { trigger: 1 });
     insertMessage('m2', 'chat', { sender: 'Bob', text: 'two' }, { trigger: 1 });
     const result = formatMessages(getPendingMessages());
-    expect(result).toContain('<messages>');
-    expect(result).toContain('</messages>');
+    expect(result).toContain('<message');
+    // #2555: no outer <messages> envelope — the Claude Agent SDK responds to
+    // that wrapper with a synthetic "No response requested." stub instead of
+    // calling the API. Self-contained <message> blocks are concatenated.
+    expect(result).not.toContain('<messages>');
+    expect(result).not.toContain('</messages>');
     expect(result).not.toContain('<thread_context');
     expect(result).not.toContain('<addressed_to_you');
   });

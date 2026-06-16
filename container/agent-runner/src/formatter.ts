@@ -12,7 +12,16 @@ import { TIMEZONE, formatLocalTime } from './timezone.js';
  */
 export type CommandCategory = 'admin' | 'filtered' | 'passthrough' | 'none';
 
-const ADMIN_COMMANDS = new Set(['/remote-control', '/clear', '/compact', '/context', '/cost', '/files', '/kill']);
+const ADMIN_COMMANDS = new Set([
+  '/remote-control',
+  '/clear',
+  '/compact',
+  '/context',
+  '/cost',
+  '/files',
+  '/kill',
+  '/upload-trace',
+]);
 const FILTERED_COMMANDS = new Set(['/help', '/login', '/logout', '/doctor', '/config', '/start']);
 
 export interface CommandInfo {
@@ -333,11 +342,12 @@ function formatChatMessages(messages: MessageInRow[]): string {
   const context = messages.filter((m) => m.trigger !== 1);
 
   if (context.length === 0) {
-    if (messages.length === 1) return formatSingleChat(messages[0]);
-    const lines = ['<messages>'];
-    for (const msg of messages) lines.push(formatSingleChat(msg));
-    lines.push('</messages>');
-    return lines.join('\n');
+    // No thread context — just the addressed message(s). Concatenate the
+    // self-contained <message> blocks; do NOT wrap them in an outer
+    // <messages> envelope: the Claude Agent SDK responds to that shape with a
+    // synthetic "No response requested." stub instead of calling the API
+    // (#2555). The single-message path is just the N=1 case of this.
+    return messages.map(formatSingleChat).join('\n');
   }
 
   const parts: string[] = [];

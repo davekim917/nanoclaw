@@ -45,7 +45,7 @@ export function clearInterceptHandlers(): void {
 }
 
 const FILTERED_COMMANDS = new Set(['/help', '/login', '/logout', '/doctor', '/config', '/remote-control']);
-const ADMIN_COMMANDS = new Set(['/clear', '/compact', '/context', '/cost', '/files']);
+const ADMIN_COMMANDS = new Set(['/clear', '/compact', '/context', '/cost', '/files', '/upload-trace']);
 
 /**
  * For threaded chat-sdk inbounds, the message text the agent sees is wrapped

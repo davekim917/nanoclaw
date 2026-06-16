@@ -341,8 +341,10 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
   if (messageInterceptor && (await messageInterceptor(event))) return;
 
   // 0. Apply the adapter's thread policy. Non-threaded adapters (Telegram,
-  //    WhatsApp, iMessage, email) collapse threads to the channel.
-  const adapter = getChannelAdapter(event.channelType);
+  //    WhatsApp, iMessage, email) collapse threads to the channel. Resolved
+  //    by the RECEIVING instance — sibling instances of one platform can
+  //    differ in thread support.
+  const adapter = getChannelAdapter(event.instance ?? event.channelType);
   if (adapter && !adapter.supportsThreads) {
     event = { ...event, threadId: null };
   }
@@ -352,8 +354,14 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
   // 1. Combined lookup: messaging_group row + count of wired agents in a
   //    single query. Cheap short-circuit for the common "unwired channel"
   //    case — one DB read and we're out, no auto-create, no sender
-  //    resolution, no log spam.
-  const found = getMessagingGroupWithAgentCount(event.channelType, event.platformId);
+  //    resolution, no log spam. Exact-on-instance: an unknown named
+  //    instance falls through to auto-create rather than hijacking a
+  //    sibling instance's row.
+  const found = getMessagingGroupWithAgentCount(
+    event.channelType,
+    event.platformId,
+    event.instance ?? event.channelType,
+  );
 
   let mg: MessagingGroup;
   let agentCount: number;
@@ -367,6 +375,9 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
       id: mgId,
       channel_type: event.channelType,
       platform_id: event.platformId,
+      // Persist the receiving instance — without this, the first bot's row
+      // would absorb every sibling instance's traffic.
+      instance: event.instance ?? event.channelType,
       name: null,
       // Adapter tells us whether this is a DM (isDM=true) or a group chat
       // (isDM=false). When unknown, default to 0 (DM-style) to preserve
@@ -967,7 +978,14 @@ async function deliverToAgent(
   // Start typing indicator before writeSessionMessage so recall injection
   // latency doesn't delay visible feedback on chat/chat-sdk paths.
   if (wake && (event.message.kind === 'chat' || event.message.kind === 'chat-sdk')) {
-    startTypingRefresh(session.id, session.agent_group_id, event.channelType, event.platformId, effectiveThreadId);
+    startTypingRefresh(
+      session.id,
+      session.agent_group_id,
+      event.channelType,
+      event.platformId,
+      effectiveThreadId,
+      mg.instance,
+    );
   }
 
   await writeSessionMessage(session.agent_group_id, session.id, {
@@ -1021,8 +1039,16 @@ async function deliverToAgent(
 
   if (wake) {
     // For non-chat kinds, typing indicator fires here (after write) as before.
+    // Typing fires via the adapter instance that owns this chat's row.
     if (event.message.kind !== 'chat' && event.message.kind !== 'chat-sdk') {
-      startTypingRefresh(session.id, session.agent_group_id, event.channelType, event.platformId, effectiveThreadId);
+      startTypingRefresh(
+        session.id,
+        session.agent_group_id,
+        event.channelType,
+        event.platformId,
+        effectiveThreadId,
+        mg.instance,
+      );
     }
     const freshSession = getSession(session.id);
     if (freshSession) {
