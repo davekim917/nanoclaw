@@ -722,6 +722,34 @@ export function buildSessionServicesSnapshot(
     services.push({ name: 'Slack (read)', declaredTools: [], scopes: [], credentialPaths: [], useFor });
   }
 
+  // Wix — gated on a Wix OneCLI secret (REST) and/or a mounted ~/.wix (CLI).
+  // REST: the gateway injects the API key on www.wixapis.com. CLI: OAuth via the
+  // mounted ~/.wix (operator ran `wix login` on the host). The site/account IDs
+  // are NOT secret and differ per site, so they're supplied per task, never baked in.
+  const hasWixSecret = mergedSecrets.some((s) => /wix/i.test(s));
+  const hasWixCli = cfg?.wixHostAuth === true;
+  if (hasWixSecret || hasWixCli) {
+    const parts: string[] = [];
+    if (hasWixSecret) {
+      parts.push(
+        'REST API at https://www.wixapis.com — auth pre-injected (do NOT set an Authorization header yourself). You MUST add exactly one target header: `wix-site-id: <SITE_ID>` for site-level APIs (Stores, Bookings, CMS/`wix-data`, Contacts) or `wix-account-id: <ACCOUNT_ID>` for account-level. These IDs are NOT secret and differ per site — the user gives you the one for the site you are working on; never hardcode or guess them. A 400 "missing site/account context" means the header is missing (or you sent both).',
+      );
+    }
+    if (hasWixCli) {
+      parts.push(
+        '`wix` CLI for Velo local-dev + publish on git-integrated Wix sites — pre-authenticated via the mounted ~/.wix (run `wix whoami` to confirm; DO NOT run `wix login`). Use it to edit Velo page code and `wix publish`. It CANNOT create pages or place/position elements — that is a Wix-editor (human) action; once a page and its named elements exist, you wire them in code.',
+      );
+    }
+    services.push({
+      name: 'Wix',
+      cli: hasWixCli ? 'wix' : undefined,
+      declaredTools: [],
+      scopes: [],
+      credentialPaths: hasWixCli ? ['/home/node/.wix/auth/account.json'] : [],
+      useFor: parts.join(' '),
+    });
+  }
+
   return { agentGroupId, services };
 }
 

@@ -168,6 +168,17 @@ export interface ContainerConfig {
   codexHostAuth?: boolean;
 
   /**
+   * When true, mount the host `~/.wix` directory into the container RW so the
+   * Wix CLI uses the host's OAuth session (operator ran `wix login` once on the
+   * host). RW because the CLI rewrites `~/.wix/auth/account.json` on token
+   * refresh. Mounted straight to `/home/node/.wix` via a dedicated path in
+   * container-runner — NOT `additionalMounts`, which `validateAdditionalMounts`
+   * sandboxes under `/workspace/extra` (where the CLI's `os.homedir()`-based
+   * `~/.wix` lookup would never find it). Mirrors `codexHostAuth`. Default OFF.
+   */
+  wixHostAuth?: boolean;
+
+  /**
    * Ordered list of additional host `~/.codex*` directories to mount as
    * fallback OAuth identities. Each entry is a host path (e.g.
    * `~/.codex`, `~/.codex-other`). At spawn, container-runner resolves
@@ -444,6 +455,7 @@ export function readContainerConfig(folder: string): ContainerConfig {
       githubTokenEnv: raw.githubTokenEnv,
       excludePlugins: raw.excludePlugins,
       codexHostAuth: raw.codexHostAuth,
+      wixHostAuth: raw.wixHostAuth,
       codexAuthFallbacks: raw.codexAuthFallbacks,
       credentialFolder: raw.credentialFolder,
       excludeMcpServers: raw.excludeMcpServers,

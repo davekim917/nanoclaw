@@ -54,6 +54,7 @@ ARG MMDC_VERSION=11.15.0
 ARG GWS_VERSION=0.22.5
 ARG CODEX_VERSION=0.139.0
 ARG OPENCODE_VERSION=1.17.0
+ARG WIX_CLI_VERSION=1.1.217
 ARG DBT_MCP_VERSION=1.20.2
 ARG SLACK_MCP_VERSION=1.3.0
 
@@ -338,6 +339,13 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
 
 RUN --mount=type=cache,target=/root/.cache/pnpm \
     pnpm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}"
+
+# Wix CLI — Velo local-dev + publish for Wix-hosted sites (e.g. SipTrue).
+# Auth is OAuth via a per-group mounted ~/.wix dir (operator runs `wix login`
+# on the host once), NOT the OneCLI REST key. The CLI binary is fleet-wide;
+# only groups with the ~/.wix mount + a Wix secret can actually use it.
+RUN --mount=type=cache,target=/root/.cache/pnpm \
+    pnpm install -g "@wix/cli@${WIX_CLI_VERSION}"
 
 # Illysium additions: code-intelligence + diagram + Google Workspace CLIs.
 # Codex CLI (@openai/codex) is invoked by /team-qa Validator E for

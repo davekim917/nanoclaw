@@ -1323,6 +1323,19 @@ export function buildMounts(
       });
     }
 
+    // Host ~/.wix mount: opt-in via container.json `wixHostAuth: true`. RW
+    // because the Wix CLI rewrites ~/.wix/auth/account.json on OAuth token
+    // refresh. Mounted straight to /home/node/.wix — NOT via additionalMounts,
+    // which validateAdditionalMounts sandboxes under /workspace/extra (where
+    // the CLI's os.homedir()-based ~/.wix lookup would never find it). The
+    // CLI's *.wix.com traffic is NO_PROXY-bypassed in the gateway block below.
+    if (containerConfig.wixHostAuth === true) {
+      const hostWix = path.join(os.homedir(), '.wix');
+      if (fs.existsSync(hostWix)) {
+        mounts.push({ hostPath: hostWix, containerPath: '/home/node/.wix', readonly: false });
+      }
+    }
+
     // Host ~/.codex mount: opt-in via container.json `codexHostAuth: true`.
     // RW because the Codex CLI rewrites auth.json on token refresh — RO
     // breaks long-running sessions when access tokens expire. Token-theft
@@ -2482,6 +2495,18 @@ async function buildContainerArgs(
     // ad-hoc packages). Wheels live on files.pythonhosted.org.
     mergeNoProxy(args, 'pypi.org');
     mergeNoProxy(args, 'pythonhosted.org');
+
+    // Wix CLI OAuth bypass — `wix login`/`whoami`/dev/publish talk to *.wix.com
+    // (manage/editor/users.wix.com) with the CLI's own OAuth token from the
+    // mounted ~/.wix. OneCLI's MITM on those hosts breaks the CLI ("not
+    // authenticated"), same class as the chatgpt.com case above. Bypass only
+    // `wix.com` (matches *.wix.com) — the Wix REST API on `www.wixapis.com` is
+    // a DIFFERENT domain, so it stays on the gateway and keeps getting the
+    // injected API key. Gated on the ~/.wix auth mount so only Wix-enabled
+    // groups bypass.
+    if (containerConfig.wixHostAuth === true) {
+      mergeNoProxy(args, 'wix.com');
+    }
 
     // OAuth bypass: when a host OAuth token is forwarded, tell the
     // in-container HTTPS_PROXY (just configured by OneCLI) to skip
