@@ -12,6 +12,7 @@ import os from 'os';
 import path from 'path';
 
 import { flattenClaudeMd } from './agents-md-flatten.js';
+import { capCodexProjectDoc } from './codex-project-doc-cap.js';
 import { formatCodexAgentToml, isManagedToml, parseClaudeAgentMd } from './claude-agent-md.js';
 import { discoverClaudeSubagents, type DiscoveredSubagent } from './claude-subagent-discovery.js';
 import { discoverPortableSkills, syncSkillSymlinks } from './plugin-skill-discovery.js';
@@ -53,7 +54,7 @@ export function syncCodexAgentsMd(): AgentsMdSyncResult {
   }
 
   const flattened = flattenClaudeMd(claudeMd);
-  const output = CODEX_PEER_HEADER + flattened;
+  const output = capCodexProjectDoc(CODEX_PEER_HEADER + flattened, '~/.codex/AGENTS.md');
 
   const target = path.join(os.homedir(), '.codex', 'AGENTS.md');
   fs.mkdirSync(path.dirname(target), { recursive: true });
