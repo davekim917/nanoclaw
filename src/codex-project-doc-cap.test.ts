@@ -28,10 +28,10 @@ describe('capCodexProjectDoc', () => {
     expect(capCodexProjectDoc(doc)).toBe(doc);
   });
 
-  it('degrades by dropping the largest sections until it fits, never throwing', () => {
+  it('degrades by dropping the section(s) needed to fit, keeping the head and the rest, never throwing', () => {
     const head = '# Title\n\nhighest-priority rules\n';
     const small1 = `## Keep Me One\n\n${filler(2000)}`;
-    const huge = `## Drop Me\n\n${filler(40 * 1024)}`; // alone exceeds the cap
+    const huge = `## Drop Me\n\n${filler(40 * 1024)}`; // only its removal fits
     const small2 = `## Keep Me Two\n\n${filler(2000)}`;
     const doc = [head, small1, huge, small2].join('\n');
     expect(bytes(doc)).toBeGreaterThan(CODEX_PROJECT_DOC_MAX_BYTES);
@@ -45,6 +45,26 @@ describe('capCodexProjectDoc', () => {
     expect(out).toContain('highest-priority rules'); // head preserved
     expect(out).toContain('Keep Me One'); // smaller sections preserved
     expect(out).toContain('Keep Me Two');
+  });
+
+  it('drops the smallest section that makes it fit, not the largest', () => {
+    // Both sections individually fit when removed, but the guard must prefer
+    // the SMALLEST sufficient drop — losing the least content. Regression for
+    // the real-world case: main-codex needed to shed ~240 bytes, and the old
+    // "drop largest" evicted the 4.7KB self-mod section instead of a small one.
+    const head = '# Title\n\nrules\n';
+    const big = `## Keep Big\n\n${'x'.repeat(24 * 1024)}`;
+    const small = `## Drop Small\n\n${'y'.repeat(9 * 1024)}`;
+    const doc = [head, big, small].join('\n'); // ~33KB, over the cap
+    expect(bytes(doc)).toBeGreaterThan(CODEX_PROJECT_DOC_MAX_BYTES);
+
+    const out = capCodexProjectDoc(doc);
+
+    expect(bytes(out)).toBeLessThanOrEqual(CODEX_PROJECT_DOC_MAX_BYTES);
+    expect(out).toContain('## Keep Big'); // larger section preserved...
+    expect(out).toContain('x'.repeat(24 * 1024)); // ...with its body intact
+    expect(out).not.toContain('y'.repeat(9 * 1024)); // smaller section dropped
+    expect(out).toContain('Drop Small'); // named in the omission note
   });
 
   it('does not throw when the head alone exceeds the cap (writes oversized)', () => {
