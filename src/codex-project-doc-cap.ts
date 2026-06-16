@@ -71,51 +71,48 @@ export function capCodexProjectDoc(content: string, label = 'AGENTS.md'): string
   }
 
   const { head, sections } = splitTopLevelSections(content);
-  // Index sections so we can drop by original position while ranking by size.
-  const indexed = sections.map((content, idx) => ({ content, idx }));
-  const dropped: number[] = [];
+  // Surviving sections in original order (splice preserves it). Byte size is
+  // measured once here rather than re-encoded on every drop.
+  const kept = sections.map((text) => ({ text, bytes: bytesOf(text) }));
+  const droppedTitles: string[] = [];
 
-  const render = (): string => {
-    const kept = indexed.filter((s) => !dropped.includes(s.idx)).map((s) => s.content);
-    const parts = [head, ...kept];
-    if (dropped.length > 0) {
-      const titles = dropped
-        .map((i) =>
-          sections[i]
-            .split('\n', 1)[0]
-            .replace(/^##\s+/, '')
-            .trim(),
-        )
-        .filter(Boolean);
+  // head + surviving sections, plus an omission note once anything is dropped.
+  const assemble = (): string => {
+    const parts = [head, ...kept.map((s) => s.text)];
+    if (droppedTitles.length > 0) {
       parts.push(
         `## Omitted for size\n\nThese sections were omitted to fit Codex's ${Math.round(
           CODEX_PROJECT_DOC_MAX_BYTES / 1024,
-        )}KB project-doc cap: ${titles.join(', ')}. Their behavior still applies where the underlying tools/rules are active; trim CLAUDE.md to restore them.`,
+        )}KB project-doc cap: ${droppedTitles.join(', ')}. Their behavior still applies where the underlying tools/rules are active; trim CLAUDE.md to restore them.`,
       );
     }
     return parts.join('\n');
   };
 
-  let out = render();
-  while (bytesOf(out) > CODEX_PROJECT_DOC_MAX_BYTES) {
-    const remaining = indexed.filter((s) => !dropped.includes(s.idx));
-    if (remaining.length === 0) {
-      // Only the head is left and it's still oversized — write it rather than
-      // brick the group; Codex will truncate, but we've logged the cause.
-      break;
+  // Drop the largest surviving section until it fits. When only the head is
+  // left and it's still oversized, stop and write it rather than brick the
+  // group — Codex truncates, but the cause is logged below.
+  while (kept.length > 0 && bytesOf(assemble()) > CODEX_PROJECT_DOC_MAX_BYTES) {
+    let largest = 0;
+    for (let i = 1; i < kept.length; i++) {
+      if (kept[i].bytes >= kept[largest].bytes) largest = i;
     }
-    const largest = remaining.reduce((a, b) => (bytesOf(b.content) >= bytesOf(a.content) ? b : a));
-    dropped.push(largest.idx);
-    out = render();
+    const [removed] = kept.splice(largest, 1);
+    const title = removed.text
+      .split('\n', 1)[0]
+      .replace(/^##\s+/, '')
+      .trim();
+    if (title) droppedTitles.push(title);
   }
 
+  const out = assemble();
   log.error('Codex project doc exceeded size cap — dropped largest sections', {
     label,
     originalBytes: bytes,
     finalBytes: bytesOf(out),
     maxBytes: CODEX_PROJECT_DOC_MAX_BYTES,
-    droppedCount: dropped.length,
-    headOversized: dropped.length === 0,
+    droppedCount: droppedTitles.length,
+    headOversized: droppedTitles.length === 0,
   });
   return out;
 }
