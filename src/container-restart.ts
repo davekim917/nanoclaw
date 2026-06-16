@@ -45,7 +45,15 @@ export function restartAgentGroupContainers(agentGroupId: string, reason: string
     // explicit wake message, or in-flight messages the dying container had
     // claimed. Without this, a provider switch mid-conversation leaves the
     // claimed messages dark until the next inbound or a slow sweep backoff.
-    const hasPending = countDueMessages(openInboundDb(session.agent_group_id, session.id)) > 0;
+    const inDb = openInboundDb(session.agent_group_id, session.id);
+    let hasPending = false;
+    try {
+      hasPending = countDueMessages(inDb) > 0;
+    } finally {
+      // Callers own the connection lifecycle (session-db.ts) — close per op or
+      // each restart leaks one better-sqlite3 FD + mmap segment per session.
+      inDb.close();
+    }
     killContainer(
       session.id,
       reason,

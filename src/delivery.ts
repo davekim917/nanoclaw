@@ -76,6 +76,9 @@ interface StatusTrack {
   platformId: string;
   threadId: string | null;
   messageId: string;
+  /** Instance the status was posted through — the orphan delete must reuse it
+   *  or it routes through the default-instance adapter (a sibling bot). */
+  instance?: string;
 }
 const statusTracking = new Map<string, StatusTrack>();
 
@@ -133,7 +136,13 @@ export interface ChannelDeliveryAdapter {
     instance?: string,
   ): Promise<string | undefined>;
   setTyping?(channelType: string, platformId: string, threadId: string | null, instance?: string): Promise<void>;
-  deleteMessage?(channelType: string, platformId: string, threadId: string | null, messageId: string): Promise<void>;
+  deleteMessage?(
+    channelType: string,
+    platformId: string,
+    threadId: string | null,
+    messageId: string,
+    instance?: string,
+  ): Promise<void>;
   postParent?(channelType: string, platformId: string, text: string): Promise<{ messageId: string }>;
   createThread?(
     channelType: string,
@@ -589,6 +598,8 @@ async function deliverMessage(
       msg.thread_id,
       msg.kind,
       outbound,
+      undefined,
+      deliverInstance,
     );
     if (platformMsgId && !existing) {
       // Pin the route at post-time. The cleanup branch on chat delivery uses
@@ -601,6 +612,7 @@ async function deliverMessage(
         platformId: msg.platform_id,
         threadId: msg.thread_id,
         messageId: platformMsgId,
+        instance: deliverInstance,
       });
     }
     log.info('Status delivered', {
@@ -742,7 +754,13 @@ async function deliverMessage(
     const orphan = isSpawnChild ? undefined : statusTracking.get(session.id);
     if (orphan && deliveryAdapter.deleteMessage) {
       try {
-        await deliveryAdapter.deleteMessage(orphan.channelType, orphan.platformId, orphan.threadId, orphan.messageId);
+        await deliveryAdapter.deleteMessage(
+          orphan.channelType,
+          orphan.platformId,
+          orphan.threadId,
+          orphan.messageId,
+          orphan.instance,
+        );
       } catch (err) {
         log.warn('Failed to delete orphan thinking-block status — leaving as-is', {
           sessionId: session.id,

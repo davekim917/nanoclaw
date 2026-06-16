@@ -26,14 +26,7 @@ vi.mock('./config.js', async () => {
 
 const TEST_DIR = '/tmp/nanoclaw-test-delivery';
 
-import {
-  initTestDb,
-  closeDb,
-  runMigrations,
-  createAgentGroup,
-  createMessagingGroup,
-  createMessagingGroupAgent,
-} from './db/index.js';
+import { initTestDb, closeDb, runMigrations, createAgentGroup, createMessagingGroup } from './db/index.js';
 import { getDeliveredIds } from './db/session-db.js';
 import { resolveSession, outboundDbPath, openInboundDb } from './session-manager.js';
 import { deliverSessionMessages, setDeliveryAdapter, assertChannelRoutingConsistency } from './delivery.js';
@@ -193,6 +186,63 @@ describe('deliverSessionMessages — concurrent invocations', () => {
       threadId: null,
       messageId: 'plat-status-id',
     });
+  });
+
+  it('threads the messaging-group instance through status delivery and the orphan delete', async () => {
+    // Multi-instance install: a messaging_groups row whose `instance` differs
+    // from its `channel_type` (two bots of the same platform). The status post
+    // and the chat reply must both go through the SAME named instance, and the
+    // orphan-delete must reuse it — otherwise the two halves of one turn post
+    // from different bot identities and the delete misroutes to the default
+    // adapter. Regression for the merged channel-instance dimension (the status
+    // branch previously dropped the instance arg).
+    createAgentGroup({
+      id: 'ag-1',
+      name: 'Test Agent',
+      folder: 'test-agent',
+      agent_provider: null,
+      created_at: now(),
+    });
+    createMessagingGroup({
+      id: 'mg-1',
+      channel_type: 'telegram',
+      platform_id: 'telegram:123',
+      instance: 'telegram-bot-A',
+      name: 'Test Chat',
+      is_group: 0,
+      unknown_sender_policy: 'public',
+      created_at: now(),
+    });
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+
+    insertOutboundKind('ag-1', session.id, 'status-1', 'status', 'telegram', 'telegram:123', {
+      text: '> 💭 thinking...',
+    });
+
+    const deliverInstances: Array<string | undefined> = [];
+    const deleteInstances: Array<string | undefined> = [];
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, _content, _files, instance) {
+        deliverInstances.push(instance);
+        return 'plat-status-id';
+      },
+      async deleteMessage(_channelType, _platformId, _threadId, _messageId, instance) {
+        deleteInstances.push(instance);
+      },
+    });
+
+    await deliverSessionMessages(session);
+    // Status posted through the named instance — previously dropped → default.
+    expect(deliverInstances).toEqual(['telegram-bot-A']);
+
+    insertOutboundKind('ag-1', session.id, 'chat-1', 'chat', 'telegram', 'telegram:123', {
+      text: 'final answer',
+    });
+    await deliverSessionMessages(session);
+
+    // Chat reply through the same instance, and the orphan delete reuses it.
+    expect(deliverInstances).toEqual(['telegram-bot-A', 'telegram-bot-A']);
+    expect(deleteInstances).toEqual(['telegram-bot-A']);
   });
 
   it('suppresses status messages in chat for spawn-child sessions', async () => {

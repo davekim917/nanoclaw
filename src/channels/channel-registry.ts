@@ -107,8 +107,9 @@ export function createChannelDeliveryAdapter(): ChannelDeliveryAdapter {
       platformId: string,
       threadId: string | null,
       messageId: string,
+      instance?: string,
     ): Promise<void> {
-      const adapter = getChannelAdapterExact(channelType);
+      const adapter = getChannelAdapterExact(instance ?? channelType);
       await adapter?.deleteMessage?.(platformId, threadId, messageId);
     },
     async postParent(channelType: string, platformId: string, text: string): Promise<{ messageId: string }> {
