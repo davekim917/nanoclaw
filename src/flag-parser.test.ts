@@ -337,7 +337,6 @@ describe('provider-aware vocabulary (codex)', () => {
     expect(r.intent).toEqual({ stickyModel: 'claude-fable-5[1m]' });
     expect(parseMessageFlags('-m gpt-5.5 hi').errors[0]).toMatch(/unknown model/);
   });
-
 });
 
 describe('provider-aware vocabulary (opencode)', () => {
