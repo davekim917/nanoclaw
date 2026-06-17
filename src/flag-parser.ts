@@ -180,14 +180,16 @@ const CODEX_VOCAB: ProviderFlagVocab = {
 };
 
 /**
- * OpenCode effort enum. The container provider maps `reasoning_effort` to the
- * portable intersection accepted by every Zen/Go/nvidia upstream (Kimi, GLM,
- * DeepSeek, Qwen, …): `low | medium | high`. The OpenAI/DeepSeek extensions
- * (`xhigh`/`max`) and `none`/`minimal` are NOT portable, so we reject them
- * here rather than silently clamping (which would mislead the user into
- * thinking they got xhigh). This is the documented per-harness variation.
+ * OpenCode effort enum: `low | medium | high | max`. These are the reasoning
+ * variants OpenCode itself exposes (its model-variant picker offers exactly
+ * Default/low/medium/high/max). `max` is real and supported by some models
+ * (e.g. DeepSeek V4 Pro/Flash); it is NOT universally supported (Kimi/GLM and
+ * others 400 on it), but — like model slugs — we accept the shape and let the
+ * upstream fail loudly on a model that doesn't support it, rather than silently
+ * downgrading and making `max` unreachable on the models that DO support it.
+ * `xhigh`/`none`/`minimal` are NOT OpenCode levels and are rejected.
  */
-const OPENCODE_VALID_EFFORT: ReadonlySet<string> = new Set(['low', 'medium', 'high']);
+const OPENCODE_VALID_EFFORT: ReadonlySet<string> = new Set(['low', 'medium', 'high', 'max']);
 
 /**
  * OpenCode model slugs are `<provider>/<id…>` (e.g. `opencode-go/kimi-k2.7-code`,
@@ -222,7 +224,7 @@ const OPENCODE_VOCAB: ProviderFlagVocab = {
   modelHint:
     ' (opencode slugs are provider-prefixed, e.g. opencode-go/kimi-k2.7-code or nvidia/meta/llama-3.3-70b-instruct — ask the agent to run list_models for exact ids)',
   validEfforts: OPENCODE_VALID_EFFORT,
-  effortHint: 'low|medium|high',
+  effortHint: 'low|medium|high|max',
   allowsUltracode: false,
   effortSupportFor: () => undefined,
 };

@@ -100,8 +100,8 @@ export async function handleChangeModel(content: Record<string, unknown>, sessio
     notifyAgent(session, 'change_model failed: --slug (the model identifier) is required.');
     return;
   }
-  if (effort && !['low', 'medium', 'high'].includes(effort)) {
-    notifyAgent(session, 'change_model failed: --effort must be one of: low, medium, high.');
+  if (effort && !['low', 'medium', 'high', 'max'].includes(effort)) {
+    notifyAgent(session, 'change_model failed: --effort must be one of: low, medium, high, max.');
     return;
   }
 

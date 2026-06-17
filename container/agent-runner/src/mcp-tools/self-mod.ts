@@ -14,6 +14,7 @@
  */
 import { getCentralDb } from '../db/connection.js';
 import { writeMessageOut } from '../db/messages-out.js';
+import { setStickyModel, setStickyEffort } from '../db/session-state.js';
 import { getConfig } from '../config.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
@@ -21,6 +22,11 @@ import type { McpToolDefinition } from './types.js';
 function log(msg: string): void {
   console.error(`[mcp-tools] ${msg}`);
 }
+
+// Mirror of the host flag-parser's OPENCODE_VALID_MODEL_RE (src/flag-parser.ts):
+// a well-formed provider-prefixed opencode slug `<provider>/<id…>`. Kept in sync
+// by hand — the container can't import the host module (separate tree).
+const OPENCODE_MODEL_SLUG_RE = /^[a-z0-9][a-z0-9._-]*\/[a-z0-9][a-z0-9._/-]*$/i;
 
 function generateId(): string {
   return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -211,43 +217,72 @@ export const changeModel: McpToolDefinition = {
   tool: {
     name: 'change_model',
     description:
-      "Change the model for YOUR own container — applied immediately, NO admin approval needed (the operator deny list is the only block). The container's model (and optionally effort) is updated and the container restarts on the new model. Use list_models first to discover valid slugs for your provider. Note: users can also switch your model per-message with the `-m <slug>` flag (and `-e low|medium|high` for opencode effort) without restarting — change_model is the persistent group-level equivalent.",
+      "Switch the model for YOUR session — exactly like the user's `-m <slug>` flag. Takes effect on your NEXT turn with NO container restart; this turn finishes on the current model. Session-scoped (does NOT change the group default — that's `ncl groups config update`). Use list_models first for valid slugs. Optional effort: low|medium|high|max (max only on models that support it, e.g. DeepSeek V4). The operator deny list is the only hard block.",
     inputSchema: {
       type: 'object' as const,
       properties: {
         slug: {
           type: 'string',
           description:
-            'The model identifier to switch to (must be in the allowlist returned by list_models, e.g. "opencode/kimi-k2.6-thinking").',
+            'The model slug to switch to, e.g. "opencode-go/kimi-k2.7-code" (provider-prefixed for opencode). Run list_models for valid ids.',
         },
         effort: {
           type: 'string',
-          enum: ['low', 'medium', 'high'],
-          description: 'Optional effort level. Omit to keep current.',
+          enum: ['low', 'medium', 'high', 'max'],
+          description: 'Optional effort level (max is supported by some models, e.g. DeepSeek V4). Omit to keep current.',
         },
-        reason: { type: 'string', description: 'Why this change is needed — shown to the admin for context.' },
       },
       required: ['slug'],
     },
   },
   async handler(args) {
-    const slug = args.slug as string;
+    const slug = (args.slug as string)?.trim();
     const effort = args.effort as string | undefined;
-    const reason = (args.reason as string) || '';
     if (!slug) return err('slug is required');
-    if (effort && !['low', 'medium', 'high'].includes(effort)) {
-      return err('effort must be one of: low, medium, high');
+    if (effort && !['low', 'medium', 'high', 'max'].includes(effort)) {
+      return err('effort must be one of: low, medium, high, max');
     }
 
-    const requestId = generateId();
-    writeMessageOut({
-      id: requestId,
-      kind: 'system',
-      content: JSON.stringify({ action: 'change_model', slug, effort: effort ?? null, reason }),
-    });
-    log(`change_model: ${requestId} → ${slug}${effort ? ` (effort=${effort})` : ''}`);
+    const provider = getConfig().provider;
+    // OpenCode slugs MUST be a well-formed provider-prefixed `<provider>/<id>`
+    // (the routing provider is derived from the prefix). Mirrors the host
+    // flag-parser's OPENCODE_VALID_MODEL_RE / isOpenCodeModelSlug exactly —
+    // replicated here because the container can't import the host module. A
+    // looser "contains a slash" check would let `opencode-go/`, `/kimi`, or
+    // garbage chars persist into session_state, after which splitModelSlug
+    // silently drops body.model while the prompt claims a switch.
+    if (provider === 'opencode' && !OPENCODE_MODEL_SLUG_RE.test(slug)) {
+      return err(
+        `"${slug}" is not a valid opencode model slug — use the provider-prefixed form ` +
+          `(e.g. opencode-go/kimi-k2.7-code, nvidia/moonshotai/kimi-k2.6). Run list_models for exact ids.`,
+      );
+    }
+
+    // Operator deny list (central.db projection) — block wrong-subscription models.
+    const central = getCentralDb();
+    if (central) {
+      try {
+        const denied = central
+          .prepare('SELECT reason FROM denied_models WHERE provider = ? AND slug = ?')
+          .get(provider, slug) as { reason?: string } | undefined;
+        if (denied) {
+          return err(`"${slug}" is on the operator deny list${denied.reason ? ` (${denied.reason})` : ''} — cannot switch to it.`);
+        }
+      } catch {
+        // denied_models absent on an older session projection — skip the check.
+      }
+    }
+
+    // Behave EXACTLY like the user's `-m`/`-e` flags: set the SESSION-sticky model
+    // (+ effort) in session_state. The provider applies it per-turn on the NEXT
+    // turn (this turn finishes on the prior model). No container restart, no
+    // group-DB change — seamless and session-scoped, identical to `-m`.
+    setStickyModel(slug);
+    if (effort) setStickyEffort(effort);
+    log(`change_model: session sticky → ${slug}${effort ? ` (effort=${effort})` : ''}`);
     return ok(
-      `Model change to "${slug}"${effort ? ` (effort=${effort})` : ''} submitted — applied immediately, no approval needed. The container will restart on the new model and you'll get a follow-up message confirming it. Wrap up your current turn.`,
+      `Switched to \`${slug}\`${effort ? ` (effort \`${effort}\`)` : ''} for this session — takes effect on your next turn ` +
+        `(no restart; same as the \`-m\` flag). This turn finishes on the previous model.`,
     );
   },
 };

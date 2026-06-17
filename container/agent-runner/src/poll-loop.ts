@@ -25,7 +25,6 @@ import {
   formatMessages,
   extractRouting,
   categorizeMessage,
-  hasFlagIntent,
   isClearCommand,
   isRunnerCommand,
   stripInternalTags,
@@ -340,6 +339,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         config.provider.onExchangeComplete?.bind(config.provider),
         prompt,
         continuation,
+        { model: effectiveModel, effort: effectiveEffort, ultracode: effectiveUltracode },
       );
       if (result.continuation && result.continuation !== continuation) {
         continuation = result.continuation;
@@ -382,6 +382,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             config.provider.onExchangeComplete?.bind(config.provider),
             prompt,
             continuation,
+            { model: effectiveModel, effort: effectiveEffort, ultracode: effectiveUltracode },
           );
           if (retryResult.continuation && retryResult.continuation !== continuation) {
             continuation = retryResult.continuation;
@@ -439,6 +440,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             config.provider.onExchangeComplete?.bind(config.provider),
             prompt,
             undefined,
+            { model: effectiveModel, effort: effectiveEffort, ultracode: effectiveUltracode },
           );
           if (retryResult.continuation) {
             continuation = retryResult.continuation;
@@ -487,6 +489,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             config.provider.onExchangeComplete?.bind(config.provider),
             prompt,
             undefined,
+            { model: effectiveModel, effort: effectiveEffort, ultracode: effectiveUltracode },
           );
           if (retryResult.continuation) {
             continuation = retryResult.continuation;
@@ -646,6 +649,10 @@ async function processQuery(
   onExchangeComplete: ((exchange: ProviderExchange) => void) | undefined,
   initialPrompt: string,
   initialContinuation: string | undefined,
+  // The model/effort/ultracode this query was created with. The follow-up
+  // handler compares the current effective values against these to detect a
+  // mid-turn change (flag OR change_model) and end-and-reopen on the new model.
+  querySettings: { model?: string; effort?: string; ultracode?: boolean },
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
   let done = false;
@@ -752,18 +759,29 @@ async function processQuery(
           return;
         }
 
-        // -m/-e flags in this batch: persist stickies NOW (applyFlagBatch —
-        // previously this never ran on the follow-up path, so flags were
-        // acked by the host then silently dropped; observed live
-        // 2026-06-10), then apply to the live query via provider control
-        // requests. Runs BEFORE the rows are claimed so the fallback can
-        // walk away and leave them pending: the outer loop reopens the
-        // query and applyFlagBatch re-runs there (idempotent — it re-reads
-        // flagIntent from the same rows).
-        if (keep.some((m) => hasFlagIntent(m))) {
-          const fb = applyFlagBatch(keep, extractRouting(keep));
+        // Model/effort change since this query was created — from a -m/-e flag
+        // row OR a mid-turn change_model tool call (which writes sticky_model
+        // directly, with NO flag row). applyFlagBatch persists any flag stickies
+        // (previously this never ran on the follow-up path, so flags were acked
+        // by the host then silently dropped; observed live 2026-06-10) AND
+        // re-reads the current effective model/effort — idempotent on a no-flag
+        // batch — so comparing it to the query's creation values catches BOTH
+        // paths. (Previously gated on hasFlagIntent, so a change_model sticky
+        // write was silently pushed into the old-model stream — Codex P1.) A
+        // provider without live controls (opencode/codex) ends the stream so the
+        // outer loop reopens on the new model, leaving these rows pending; one
+        // with live controls (claude) applies it in place, same stream.
+        const fb = applyFlagBatch(keep, extractRouting(keep));
+        const modelOrEffortChanged =
+          fb.model !== querySettings.model ||
+          fb.effort !== querySettings.effort ||
+          fb.ultracode !== querySettings.ultracode;
+        if (modelOrEffortChanged) {
           if (!query.applySettings) {
-            log('Flag intent (-m/-e) but provider has no live controls — ending stream; next query honors it');
+            log(
+              `Model/effort change (${querySettings.model ?? 'default'} → ${fb.model ?? 'default'}) — ` +
+                'ending stream; next query honors it',
+            );
             endedForCommand = true;
             query.end();
             return;
@@ -773,7 +791,7 @@ async function processQuery(
           } catch (err) {
             log(
               `Live applySettings failed (${err instanceof Error ? err.message : String(err)}) — ` +
-                'ending stream; outer loop reopens with flags applied',
+                'ending stream; outer loop reopens with the new model',
             );
             endedForCommand = true;
             query.end();

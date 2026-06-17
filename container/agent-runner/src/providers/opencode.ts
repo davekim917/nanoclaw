@@ -194,7 +194,7 @@ function readAgentInstructionsForPrompt(): string | undefined {
   return cachedAgentInstructions;
 }
 
-function wrapPromptWithContext(text: string, systemInstructions?: string): string {
+function wrapPromptWithContext(text: string, systemInstructions?: string, currentModel?: string): string {
   let out = text;
   if (systemInstructions) {
     out = `<system>\n${systemInstructions}\n</system>\n\n${out}`;
@@ -203,19 +203,31 @@ function wrapPromptWithContext(text: string, systemInstructions?: string): strin
   if (agentMd) {
     out = `<system>\n${agentMd}\n</system>\n\n${out}`;
   }
+  // Tell the agent which model it is ACTUALLY running on this turn. OpenCode
+  // doesn't surface this to the model, so without it the agent guesses its own
+  // identity and gets it wrong after a `-m`/change_model switch (reporting the
+  // old model and making the switch look like it failed). Outermost block so
+  // it's prominent. `currentModel` is the effective per-turn slug.
+  if (currentModel) {
+    out =
+      `<system>\nYou are currently running on model \`${currentModel}\`. ` +
+      `If asked which model or provider you are, answer with exactly this — do not guess from earlier context.\n</system>\n\n${out}`;
+  }
   return out;
 }
 
 /**
- * Clamp a raw effort string to opencode's portable reasoning_effort set.
+ * Normalize a raw effort string to an opencode reasoning_effort level.
  * `reasoning_effort` is sent alone — the `thinking.budgetTokens` field is
- * Anthropic-specific and 400s on most non-Anthropic upstreams (Kimi, GLM,
- * DeepSeek). Values are clamped to the portable intersection accepted by all
- * common upstreams: `low | medium | high`. `xhigh`/`max` (OpenAI/DeepSeek
- * extensions) map to `high`. Unset / 'default' → null (inject nothing; most
- * thinking-capable Go-catalog models already do their highest reasoning by
- * default). The host flag-parser (OPENCODE_VOCAB) already restricts `-e` to
- * low|medium|high, so this clamp is the second line of defense for the env path.
+ * Anthropic-specific and 400s on non-Anthropic upstreams. OpenCode's own
+ * levels are `low | medium | high | max`; `max` is passed through (it's a real
+ * variant some models support, e.g. DeepSeek V4 — a model that doesn't support
+ * it will 400 loudly rather than us silently downgrading and making `max`
+ * unreachable). `xhigh` (an OpenAI/codex term, not an opencode level) and
+ * `minimal` map to the nearest opencode level. Unset / 'default' → null (inject
+ * nothing; most thinking-capable models already run their highest by default).
+ * The host flag-parser (OPENCODE_VOCAB) restricts `-e` to low|medium|high|max;
+ * this is the second line of defense for the env/DB path.
  */
 function clampOpenCodeEffort(raw: string | undefined): string | null {
   const effortClampMap: Record<string, string> = {
@@ -224,7 +236,7 @@ function clampOpenCodeEffort(raw: string | undefined): string | null {
     medium: 'medium',
     high: 'high',
     xhigh: 'high',
-    max: 'high',
+    max: 'max',
   };
   return effortClampMap[(raw || '').trim().toLowerCase()] || null;
 }
@@ -459,8 +471,19 @@ export class OpenCodeProvider implements AgentProvider {
     let ended = false;
     let aborted = false;
 
+    // Per-turn `-m`/`-e` (resolved by the poll-loop from sticky + turn flags).
+    // `effort` rebuilds the runtime config (it lives server-side); `model` is
+    // applied per-prompt via body.model below so a switch needs no respawn and
+    // keeps session continuity. The effective model = turn override → env
+    // default (host sets OPENCODE_MODEL from the DB default). effectiveModel is
+    // also injected into the prompt (wrapPromptWithContext) so the agent knows
+    // which model it's actually on.
+    const turn: OpenCodeTurnOverrides = { model: input.model, effort: input.effort };
+    const effectiveModel = input.model ?? process.env.OPENCODE_MODEL;
+    const promptModel = effectiveModel ? splitModelSlug(effectiveModel) : null;
+
     const systemInstructions = input.systemContext?.instructions;
-    pending.push(wrapPromptWithContext(input.prompt, systemInstructions));
+    pending.push(wrapPromptWithContext(input.prompt, systemInstructions, effectiveModel));
 
     const kick = (): void => {
       waiting?.();
@@ -469,15 +492,6 @@ export class OpenCodeProvider implements AgentProvider {
     const self = this;
     const queryCwd = input.cwd;
     const IDLE_TIMEOUT_MS = 90_000;
-
-    // Per-turn `-m`/`-e` (resolved by the poll-loop from sticky + turn flags).
-    // `effort` rebuilds the runtime config (it lives server-side); `model` is
-    // applied per-prompt via body.model below so a switch needs no respawn and
-    // keeps session continuity. The effective model = turn override → env
-    // default (host sets OPENCODE_MODEL from the DB default).
-    const turn: OpenCodeTurnOverrides = { model: input.model, effort: input.effort };
-    const effectiveModel = input.model ?? process.env.OPENCODE_MODEL;
-    const promptModel = effectiveModel ? splitModelSlug(effectiveModel) : null;
 
     async function* gen(): AsyncGenerator<ProviderEvent> {
       let initYielded = false;
@@ -661,13 +675,25 @@ export class OpenCodeProvider implements AgentProvider {
           }
           resultText = texts.join('');
         }
-        yield { type: 'result', text: resultText || null };
+        // Empty-turn fallback: the turn completed (session.idle, no error) but
+        // produced no text — the model emitted only reasoning/whitespace. Without
+        // this the poll-loop delivers nothing and the user sees silence (observed
+        // with free-tier nvidia models degenerating). Surface a visible, actionable
+        // message instead of dead air.
+        if (!resultText.trim()) {
+          const m = effectiveModel ?? 'the current model';
+          log(`Empty assistant response (model=${m}) — surfacing fallback instead of silent no-reply`);
+          resultText =
+            `⚠️ \`${m}\` returned an empty response this turn (no text generated). ` +
+            `Some models/providers do this under load — try again, or switch with \`-m <provider/model>\`.`;
+        }
+        yield { type: 'result', text: resultText };
       }
     }
 
     return {
       push: (message: string) => {
-        pending.push(wrapPromptWithContext(message, systemInstructions));
+        pending.push(wrapPromptWithContext(message, systemInstructions, effectiveModel));
         kick();
       },
       end: () => {

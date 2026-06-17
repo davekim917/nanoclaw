@@ -373,12 +373,20 @@ describe('provider-aware vocabulary (opencode)', () => {
     expect(parseMessageFlags('-e high hi', 'opencode').intent).toEqual({ stickyEffort: 'high' });
   });
 
-  it('rejects non-portable efforts (xhigh/max/none/minimal) with the opencode enum', () => {
-    for (const bad of ['xhigh', 'max', 'none', 'minimal']) {
+  it('accepts max (a real opencode variant, e.g. DeepSeek V4)', () => {
+    expect(parseMessageFlags('-e max hi', 'opencode').intent).toEqual({ stickyEffort: 'max' });
+    expect(parseMessageFlags('-m opencode-go/deepseek-v4-pro -e max hi', 'opencode').intent).toEqual({
+      stickyModel: 'opencode-go/deepseek-v4-pro',
+      stickyEffort: 'max',
+    });
+  });
+
+  it('rejects non-opencode effort levels (xhigh/none/minimal) with the opencode enum', () => {
+    for (const bad of ['xhigh', 'none', 'minimal']) {
       const r = parseMessageFlags(`-e ${bad} hi`, 'opencode');
       expect(r.intent).toBeUndefined();
       expect(r.errors[0]).toMatch(new RegExp(`unknown effort level: ${bad}`));
-      expect(r.errors[0]).toMatch(/low\|medium\|high/);
+      expect(r.errors[0]).toMatch(/low\|medium\|high\|max/);
     }
   });
 
