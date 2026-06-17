@@ -180,14 +180,63 @@ const CODEX_VOCAB: ProviderFlagVocab = {
 };
 
 /**
- * Vocabulary lookup. Unknown providers (including opencode, for now) fall
- * back to the Claude vocabulary — that preserves pre-provider-aware behavior
- * exactly. Opencode model validation needs the live `opencode models` list
- * (only available in-container; see list_models MCP) so its vocabulary is a
- * deliberate follow-up, not an accidental omission.
+ * OpenCode effort enum. The container provider maps `reasoning_effort` to the
+ * portable intersection accepted by every Zen/Go/nvidia upstream (Kimi, GLM,
+ * DeepSeek, Qwen, …): `low | medium | high`. The OpenAI/DeepSeek extensions
+ * (`xhigh`/`max`) and `none`/`minimal` are NOT portable, so we reject them
+ * here rather than silently clamping (which would mislead the user into
+ * thinking they got xhigh). This is the documented per-harness variation.
+ */
+const OPENCODE_VALID_EFFORT: ReadonlySet<string> = new Set(['low', 'medium', 'high']);
+
+/**
+ * OpenCode model slugs are `<provider>/<id…>` (e.g. `opencode-go/kimi-k2.7-code`,
+ * `opencode/gpt-5.5`, `nvidia/meta/llama-3.3-70b-instruct`). The provider
+ * prefix is REQUIRED — the container derives the routing provider from it, and
+ * the `/` cleanly rejects claude aliases (`opus`) and codex ids (`gpt-5.5`)
+ * mistakenly aimed at an opencode group. The live catalog is huge and only
+ * enumerable in-container (`opencode models` / the `list_models` MCP tool), so
+ * — exactly like codex — we shape-validate here and let the opencode server
+ * fail loudly on a well-formed-but-nonexistent slug. The pattern catches
+ * cross-provider mistakes, it does not track the catalog.
+ */
+const OPENCODE_VALID_MODEL_RE = /^[a-z0-9][a-z0-9._-]*\/[a-z0-9][a-z0-9._/-]*$/i;
+
+/**
+ * Shape check for an opencode model slug (provider-prefixed `<provider>/<id…>`).
+ * Exported so the `change_model` self-mod path can reject a bare/malformed slug
+ * (e.g. `kimi-k2.7-code`) before persisting it — the host would otherwise derive
+ * `provider='opencode-go'` for an unprefixed id and the restarted container
+ * couldn't resolve the model. Same regex the `-m` flag path validates against,
+ * keeping one source of truth.
+ */
+export function isOpenCodeModelSlug(slug: string): boolean {
+  return OPENCODE_VALID_MODEL_RE.test(slug.trim());
+}
+
+const OPENCODE_VOCAB: ProviderFlagVocab = {
+  resolveModel: (raw) => raw.trim(),
+  // Delegate to isOpenCodeModelSlug so the `-m` flag path and the change_model
+  // self-mod path share ONE shape predicate (not just the bare regex constant).
+  isValidModel: (resolved) => isOpenCodeModelSlug(resolved),
+  modelHint:
+    ' (opencode slugs are provider-prefixed, e.g. opencode-go/kimi-k2.7-code or nvidia/meta/llama-3.3-70b-instruct — ask the agent to run list_models for exact ids)',
+  validEfforts: OPENCODE_VALID_EFFORT,
+  effortHint: 'low|medium|high',
+  allowsUltracode: false,
+  effortSupportFor: () => undefined,
+};
+
+/**
+ * Vocabulary lookup. Each agent harness validates `-m`/`-e` against its own
+ * model ids and effort enum; unknown providers fall back to the Claude
+ * vocabulary (the safe pre-provider-aware default). OpenCode validates slug
+ * SHAPE only (the live model list lives in-container; see list_models MCP).
  */
 function vocabFor(provider: string): ProviderFlagVocab {
-  return provider === 'codex' ? CODEX_VOCAB : CLAUDE_VOCAB;
+  if (provider === 'codex') return CODEX_VOCAB;
+  if (provider === 'opencode') return OPENCODE_VOCAB;
+  return CLAUDE_VOCAB;
 }
 
 /** Structured representation of a parsed flag set. Empty object = no flags. */

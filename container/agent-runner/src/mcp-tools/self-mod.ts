@@ -211,7 +211,7 @@ export const changeModel: McpToolDefinition = {
   tool: {
     name: 'change_model',
     description:
-      "Request a model change for YOUR own container. Requires admin approval; fire-and-forget. On approval, the container's model (and optionally effort) is updated and the container is restarted. Use list_models first to discover valid slugs for your provider — passing a slug NOT in that allowlist is rejected at request time.",
+      "Change the model for YOUR own container — applied immediately, NO admin approval needed (the operator deny list is the only block). The container's model (and optionally effort) is updated and the container restarts on the new model. Use list_models first to discover valid slugs for your provider. Note: users can also switch your model per-message with the `-m <slug>` flag (and `-e low|medium|high` for opencode effort) without restarting — change_model is the persistent group-level equivalent.",
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -247,7 +247,7 @@ export const changeModel: McpToolDefinition = {
     });
     log(`change_model: ${requestId} → ${slug}${effort ? ` (effort=${effort})` : ''}`);
     return ok(
-      `Model change request submitted (${slug}). You will be notified when admin approves or rejects. Continue your current work; if the change is approved, the container will restart and you'll get a follow-up message.`,
+      `Model change to "${slug}"${effort ? ` (effort=${effort})` : ''} submitted — applied immediately, no approval needed. The container will restart on the new model and you'll get a follow-up message confirming it. Wrap up your current turn.`,
     );
   },
 };

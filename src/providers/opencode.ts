@@ -23,6 +23,16 @@ import { getContainerConfig } from '../db/container-configs.js';
 import { assertValidGroupFolder } from '../group-folder.js';
 import { registerProviderContainerConfig } from './provider-container-registry.js';
 
+// Code-level opencode defaults — the floor under the per-group DB value
+// (container_configs), mirroring DEFAULT_OPUS_MODEL etc. for claude in
+// container-runner.ts. Default to the Go subscription (cheapest tier); Zen is
+// opt-in via an explicit `opencode/*` model. Bump these when the fleet default
+// moves (e.g. a new Kimi). The provider is derived from the model prefix at
+// runtime; the constant only guards a malformed override.
+const DEFAULT_OPENCODE_MODEL = 'opencode-go/kimi-k2.7-code';
+const DEFAULT_OPENCODE_PROVIDER = 'opencode-go';
+const DEFAULT_OPENCODE_EFFORT = 'high';
+
 function mergeNoProxy(current: string | undefined, additions: string): string {
   if (!current?.trim()) return additions;
   const parts = new Set(
@@ -52,19 +62,6 @@ function resolveOpenCodeSourceDir(
   const scoped = path.join(hostHome, '.local', 'share', `opencode-${scopedFolder}`);
   if (fs.existsSync(path.join(scoped, 'auth.json'))) return scoped;
   return path.join(hostHome, '.local', 'share', 'opencode');
-}
-
-function resolveScopedEnv(
-  base: string,
-  agentGroupFolder: string | undefined,
-  hostEnv: NodeJS.ProcessEnv,
-): string | undefined {
-  if (agentGroupFolder) {
-    const suffix = agentGroupFolder.toUpperCase().replace(/-/g, '_');
-    const scopedValue = hostEnv[`${base}_${suffix}`];
-    if (scopedValue) return scopedValue;
-  }
-  return hostEnv[base];
 }
 
 registerProviderContainerConfig('opencode', (ctx) => {
@@ -134,45 +131,29 @@ registerProviderContainerConfig('opencode', (ctx) => {
     NO_PROXY: mergeNoProxy(ctx.hostEnv.NO_PROXY, noProxyAdditions),
     no_proxy: mergeNoProxy(ctx.hostEnv.no_proxy, noProxyAdditions),
   };
-  // Model + effort: prefer the DB value (container_configs.model / .effort)
-  // over the .env scoped value. The DB is what `change_model` (self-mod) +
-  // `ncl groups config update --model X` mutate, so it must win — otherwise
-  // those changes never take effect (the container reads OPENCODE_MODEL at
-  // startup, and an unread DB value silently no-ops). .env stays as the
-  // initial-bootstrap source for groups that haven't been touched via DB yet.
+  // Model + effort resolution mirrors the claude/codex template: a code-level
+  // default (DEFAULT_OPENCODE_*) is the floor, the per-group DB value
+  // (container_configs.model / .effort, set by `ncl groups config update` or
+  // self-mod) overrides it. NO `.env` scoped vars — those were an opencode-only
+  // anomaly (claude uses DEFAULT_OPUS_MODEL etc., never `.env`). Removing them
+  // keeps one config pattern across all harnesses. The DB is authoritative; the
+  // container reads OPENCODE_MODEL at startup, so an unread value would no-op.
   const dbConfig = getContainerConfig(ctx.agentGroupId);
-  const dbProvider = dbConfig?.provider ?? null;
-  const dbModel = dbConfig?.model ?? null;
-  const dbEffort = dbConfig?.effort ?? null;
-
-  // The model is the freely-changeable knob: DB value (set by self-mod
-  // change_model / `ncl groups config update --model`) wins over the .env
-  // scoped default, so those changes take effect on the next spawn.
-  const model = dbModel ?? resolveScopedEnv('OPENCODE_MODEL', ctx.agentGroupFolder, ctx.hostEnv);
-  if (model) env.OPENCODE_MODEL = model;
+  const model = dbConfig?.model ?? DEFAULT_OPENCODE_MODEL;
+  env.OPENCODE_MODEL = model;
 
   // OPENCODE_PROVIDER is the opencode-INTERNAL billing/routing provider
-  // (opencode=Zen /zen/v1 | opencode-go=Go /zen/go/v1 | nvidia | ...). It MUST
-  // equal the model slug's provider prefix: opencode resolves `model:"<p>/<id>"`
-  // against `enabled_providers:["<p>"]`, so any drift yields "Model not found".
-  // DERIVE it from the resolved model so the two can never disagree — including
-  // after a change_model to a different provider's model. This is NOT
-  // dbConfig.provider: that is the agent-RUNTIME selector (always "opencode" for
-  // an opencode sibling — it picks the provider CLASS), and conflating the two
-  // forced OPENCODE_PROVIDER="opencode" for every sibling, mismatching every
-  // "opencode-go/*" model. Scoped env / runtime selector are fallbacks only when
-  // no model (hence no prefix) is configured.
-  const provider =
-    (model && model.includes('/') ? model.slice(0, model.indexOf('/')) : null) ??
-    resolveScopedEnv('OPENCODE_PROVIDER', ctx.agentGroupFolder, ctx.hostEnv) ??
-    dbProvider;
-  if (provider) env.OPENCODE_PROVIDER = provider;
-  const effort = dbEffort ?? resolveScopedEnv('OPENCODE_EFFORT', ctx.agentGroupFolder, ctx.hostEnv);
-  if (effort) env.OPENCODE_EFFORT = effort;
-  // SMALL_MODEL — kept env-only for now; no DB field. If it ever moves to DB,
-  // mirror the pattern above.
-  const smallModel = resolveScopedEnv('OPENCODE_SMALL_MODEL', ctx.agentGroupFolder, ctx.hostEnv);
-  if (smallModel) env.OPENCODE_SMALL_MODEL = smallModel;
+  // (opencode=Zen /zen/v1 | opencode-go=Go /zen/go/v1 | nvidia | ...). DERIVE it
+  // from the model slug's prefix so the two can never disagree (opencode
+  // resolves `model:"<p>/<id>"` against the enabled providers). This is NOT
+  // dbConfig.provider — that is the agent-RUNTIME selector (always "opencode"
+  // for an opencode sibling; it picks the provider CLASS). Since `model` always
+  // carries a prefix (DB value or DEFAULT_OPENCODE_MODEL), the fallback only
+  // guards a malformed override.
+  const slash = model.indexOf('/');
+  env.OPENCODE_PROVIDER = slash > 0 ? model.slice(0, slash) : DEFAULT_OPENCODE_PROVIDER;
+
+  env.OPENCODE_EFFORT = dbConfig?.effort ?? DEFAULT_OPENCODE_EFFORT;
   // Endpoint routing is determined by the cred-key in auth.json + the model
   // slug prefix (opencode-go/* → /zen/go/v1, opencode/* → /zen/v1, nvidia/*
   // → NVIDIA, etc.). We do NOT pass OPENCODE_BASE_URL — OpenCode's provider

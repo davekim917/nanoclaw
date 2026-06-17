@@ -29,14 +29,47 @@ function log(msg: string): void {
  * found".
  */
 function opencodeAuthHasCredential(provider: string): boolean {
+  return opencodeAuthProviders().includes(provider);
+}
+
+/**
+ * Every provider with a credential in the mounted auth.json (e.g.
+ * `opencode-go`, `opencode` (Zen), `nvidia`). We enable ALL of them in the
+ * session config so the agent can switch to any go/zen/nvidia model per-prompt
+ * within one session (see buildOpenCodeConfig) — not just the one provider its
+ * default model belongs to. Static for the container lifetime (auth.json is
+ * copied once at spawn), so it doesn't churn the shared-runtime config key.
+ */
+// Memoized at module scope: auth.json is copied once at spawn and never written
+// from inside the container, so the provider set is fixed for the container
+// lifetime (same rationale as cachedAgentInstructions below). Without this the
+// file was read + JSON-parsed 1-3× per turn on the hot path (runtimeConfigKey,
+// buildOpenCodeConfig, and opencodeAuthHasCredential all call this).
+let cachedAuthProviders: string[] | null = null;
+function opencodeAuthProviders(): string[] {
+  if (cachedAuthProviders !== null) return cachedAuthProviders;
   try {
     const raw = fs.readFileSync('/opencode-xdg/opencode/auth.json', 'utf-8');
     const auth = JSON.parse(raw) as Record<string, unknown>;
-    return !!auth && typeof auth === 'object' && provider in auth;
+    cachedAuthProviders = auth && typeof auth === 'object' ? Object.keys(auth) : [];
   } catch {
-    // Missing file or unparseable → no native cred; fall back to placeholder.
-    return false;
+    // Missing file or unparseable → no native creds.
+    cachedAuthProviders = [];
   }
+  return cachedAuthProviders;
+}
+
+/** Split a `<provider>/<id…>` slug into the SDK's per-prompt model shape. */
+function splitModelSlug(slug: string): { providerID: string; modelID: string } | null {
+  const i = slug.indexOf('/');
+  if (i <= 0 || i >= slug.length - 1) return null;
+  return { providerID: slug.slice(0, i), modelID: slug.slice(i + 1) };
+}
+
+/** Per-turn model/effort overrides flowing in from QueryInput (the `-m`/`-e` flags). */
+interface OpenCodeTurnOverrides {
+  model?: string;
+  effort?: string;
 }
 
 const SESSION_STATUS_RETRY_ERROR_AFTER = 3;
@@ -173,38 +206,18 @@ function wrapPromptWithContext(text: string, systemInstructions?: string): strin
   return out;
 }
 
-function buildOpenCodeConfig(options: ProviderOptions): Record<string, unknown> {
-  const provider = process.env.OPENCODE_PROVIDER || 'anthropic';
-  const model = process.env.OPENCODE_MODEL;
-  const smallModel = process.env.OPENCODE_SMALL_MODEL;
-
-  const providerModelId = model ? model.replace(new RegExp(`^${provider}/`), '') : undefined;
-  const providerSmallModelId = smallModel ? smallModel.replace(new RegExp(`^${provider}/`), '') : undefined;
-  const modelsToRegister = [providerModelId, providerSmallModelId]
-    .filter(Boolean)
-    .filter((mid, i, a) => a.indexOf(mid as string) === i);
-
-  // Prefer the SDK's native auth.json resolution (XDG_DATA_HOME) for any
-  // provider whose credential is present in the mounted auth.json (see
-  // opencodeAuthHasCredential). The `apiKey: 'placeholder'` override below is
-  // only for the OneCLI-proxy path used by static API-key providers
-  // (deepseek/openrouter/zen-via-paste-key) that are NOT in auth.json — for an
-  // OAuth-issued cred the placeholder would replace the real token and break auth.
-  const opencodeAuthAvailable = opencodeAuthHasCredential(provider);
-
-  // OPENCODE_EFFORT controls upstream reasoning effort. Sent as
-  // `reasoning_effort` only — the `thinking.budgetTokens` field is
-  // Anthropic-specific and 400s on most non-Anthropic upstreams (Kimi, GLM,
-  // DeepSeek). User-supplied values are clamped to the portable intersection
-  // accepted by all common upstreams: `low | medium | high`. Out-of-range
-  // values like `xhigh` (OpenAI extension) or `max` (DeepSeek extension) are
-  // mapped to `high` for portability; native xhigh/max requires per-model
-  // overrides that aren't wired here yet.
-  //
-  // Unset / 'default' = inject nothing. Most thinking-capable models in the
-  // OpenCode Go catalog (Kimi, GLM, DeepSeek auto-max, Qwen, MiniMax, MiMo)
-  // already do their highest reasoning by default in agent contexts.
-  const rawEffort = (process.env.OPENCODE_EFFORT || '').trim().toLowerCase();
+/**
+ * Clamp a raw effort string to opencode's portable reasoning_effort set.
+ * `reasoning_effort` is sent alone — the `thinking.budgetTokens` field is
+ * Anthropic-specific and 400s on most non-Anthropic upstreams (Kimi, GLM,
+ * DeepSeek). Values are clamped to the portable intersection accepted by all
+ * common upstreams: `low | medium | high`. `xhigh`/`max` (OpenAI/DeepSeek
+ * extensions) map to `high`. Unset / 'default' → null (inject nothing; most
+ * thinking-capable Go-catalog models already do their highest reasoning by
+ * default). The host flag-parser (OPENCODE_VOCAB) already restricts `-e` to
+ * low|medium|high, so this clamp is the second line of defense for the env path.
+ */
+function clampOpenCodeEffort(raw: string | undefined): string | null {
   const effortClampMap: Record<string, string> = {
     minimal: 'low',
     low: 'low',
@@ -213,9 +226,50 @@ function buildOpenCodeConfig(options: ProviderOptions): Record<string, unknown> 
     xhigh: 'high',
     max: 'high',
   };
-  const effortValue = effortClampMap[rawEffort] || null;
+  return effortClampMap[(raw || '').trim().toLowerCase()] || null;
+}
+
+function buildOpenCodeConfig(options: ProviderOptions, turn: OpenCodeTurnOverrides = {}): Record<string, unknown> {
+  // EFFECTIVE model = per-turn `-m` override → env default (host sets
+  // OPENCODE_MODEL from the DB default; see src/providers/opencode.ts). It is
+  // also passed PER-PROMPT via body.model in query(), so a model switch with NO
+  // effort active needs no respawn (runtimeConfigKey omits the model then).
+  // Effort is per-model `options` in the opencode config (no per-prompt effort
+  // field exists), so it is registered HERE against the effective model — and
+  // runtimeConfigKey includes the effective model whenever effort is active, so
+  // a `-m`+`-e` switch rebuilds the runtime and the effort follows the chosen
+  // model (otherwise the override model would run at its native effort while the
+  // router had already acknowledged the requested effort).
+  const model = turn.model ?? process.env.OPENCODE_MODEL;
+  const smallModel = process.env.OPENCODE_SMALL_MODEL;
+  const defaultSplit = model ? splitModelSlug(model) : null;
+  const provider = defaultSplit?.providerID ?? process.env.OPENCODE_PROVIDER ?? 'anthropic';
+
+  // Enable EVERY credentialed provider so the agent can `-m`-switch to any
+  // go/zen/nvidia model within one session (per-prompt body.model resolves
+  // against enabled_providers). Falls back to the single default provider when
+  // auth.json is absent (e.g. OneCLI-proxy static-key groups).
+  const authProviders = opencodeAuthProviders();
+  const enabledProviders =
+    authProviders.length > 0
+      ? Array.from(new Set([...authProviders, ...(provider !== 'anthropic' ? [provider] : [])]))
+      : [provider];
+
+  const effortValue = clampOpenCodeEffort(turn.effort ?? process.env.OPENCODE_EFFORT);
   const modelOptions = effortValue ? { reasoningEffort: effortValue } : null;
 
+  // Register the EFFECTIVE model (default or `-m` override) under its provider
+  // with tool_call forced on + the resolved effort, so effort follows the model
+  // actually in use. body.model (query()) sends this same model per-prompt, so
+  // the registered options apply to it. A model switch while effort is active
+  // rebuilds the runtime (runtimeConfigKey), re-registering effort on the new
+  // model; with no effort active nothing is registered and the switch is
+  // respawn-free.
+  const defaultModelId = defaultSplit?.modelID;
+  const smallModelId = smallModel ? (splitModelSlug(smallModel)?.modelID ?? smallModel) : undefined;
+  const modelsToRegister = [defaultModelId, smallModelId]
+    .filter((mid): mid is string => Boolean(mid))
+    .filter((mid, i, a) => a.indexOf(mid) === i);
   const modelsBlock =
     modelsToRegister.length > 0
       ? {
@@ -226,25 +280,21 @@ function buildOpenCodeConfig(options: ProviderOptions): Record<string, unknown> 
                 id: mid,
                 name: mid,
                 tool_call: true,
-                ...(modelOptions ? { options: modelOptions } : {}),
+                ...(mid === defaultModelId && modelOptions ? { options: modelOptions } : {}),
               },
             ]),
           ),
         }
       : {};
 
-  // SDK options block:
-  //   - apiKey: only injected for the OneCLI-proxy path (non-OAuth providers).
-  //     When auth.json is mounted, the SDK reads it natively and we MUST NOT
-  //     override or it'd send 'placeholder' as the Bearer token.
-  //   - baseURL: NOT set. OpenCode's provider registry routes based on the
-  //     cred-key in auth.json (`opencode-go` → /zen/go/v1, `opencode` →
-  //     /zen/v1, `nvidia` → NVIDIA's endpoint, etc.) — no manual override
-  //     needed. Earlier code took an OPENCODE_BASE_URL env var as a hack
-  //     to force Go billing; that's now unnecessary and was removed
-  //     2026-05-23 alongside the host-side passthrough.
+  // apiKey placeholder is only for the OneCLI-proxy path (default provider NOT
+  // in auth.json — deepseek/openrouter/zen-via-paste-key). When the cred is in
+  // auth.json the SDK reads it natively and the placeholder would clobber the
+  // real Bearer token. baseURL is NOT set: opencode's provider registry routes
+  // by the auth.json cred-key + model prefix (opencode-go → /zen/go/v1,
+  // opencode → /zen/v1, nvidia → NVIDIA), so no manual override is needed.
   const sdkOptions: Record<string, unknown> = {};
-  if (!opencodeAuthAvailable) sdkOptions.apiKey = 'placeholder';
+  if (!opencodeAuthHasCredential(provider)) sdkOptions.apiKey = 'placeholder';
 
   const providerOptions: Record<string, unknown> =
     provider === 'anthropic'
@@ -276,7 +326,7 @@ function buildOpenCodeConfig(options: ProviderOptions): Record<string, unknown> 
   return {
     ...(model ? { model } : {}),
     ...(smallModel ? { small_model: smallModel } : {}),
-    enabled_providers: [provider],
+    enabled_providers: enabledProviders,
     permission: 'allow',
     autoupdate: false,
     snapshot: false,
@@ -297,19 +347,34 @@ let sharedRuntime: SharedRuntime | null = null;
 let sharedConfigKey: string | null = null;
 let sharedInit: Promise<SharedRuntime> | null = null;
 
-function runtimeConfigKey(options: ProviderOptions, cwd: string | undefined): string {
+function runtimeConfigKey(options: ProviderOptions, cwd: string | undefined, turn: OpenCodeTurnOverrides): string {
+  const effort = turn.effort ?? process.env.OPENCODE_EFFORT;
+  const effectiveModel = turn.model ?? process.env.OPENCODE_MODEL;
   return JSON.stringify({
     mcp: mcpServersToOpenCodeConfig(options.mcpServers),
     model: process.env.OPENCODE_MODEL,
     small: process.env.OPENCODE_SMALL_MODEL,
-    op: process.env.OPENCODE_PROVIDER,
-    effort: process.env.OPENCODE_EFFORT,
+    providers: opencodeAuthProviders(),
+    // Per-turn `-e` IS in the key: effort lives in the server config, so
+    // changing it rebuilds the runtime. A respawn that can't resume the prior
+    // session self-heals via the poll-loop's stale-session recap path.
+    effort,
+    // The `-m` model is normally applied per-prompt (body.model) with NO respawn
+    // (continuity preserved). The ONE exception: when effort is active it is
+    // registered ON the effective model (buildOpenCodeConfig), so a model switch
+    // must rebuild to move the effort onto the new model. Include the model in
+    // the key only then — otherwise effort-less switches stay respawn-free.
+    effortModel: clampOpenCodeEffort(effort) ? effectiveModel : null,
     cwd: cwd ?? null,
   });
 }
 
-async function ensureSharedRuntime(options: ProviderOptions, cwd: string | undefined): Promise<SharedRuntime> {
-  const key = runtimeConfigKey(options, cwd);
+async function ensureSharedRuntime(
+  options: ProviderOptions,
+  cwd: string | undefined,
+  turn: OpenCodeTurnOverrides,
+): Promise<SharedRuntime> {
+  const key = runtimeConfigKey(options, cwd, turn);
   if (sharedRuntime && sharedConfigKey === key) return sharedRuntime;
 
   if (sharedInit) return sharedInit;
@@ -318,7 +383,7 @@ async function ensureSharedRuntime(options: ProviderOptions, cwd: string | undef
     if (sharedRuntime) {
       destroySharedRuntime();
     }
-    const config = buildOpenCodeConfig(options);
+    const config = buildOpenCodeConfig(options, turn);
     const { url, proc } = await spawnOpencodeServer(config, cwd);
     // Also pass `directory` to the SDK client — opencode uses it as a hint
     // for project-context features (project root, file paths in completions).
@@ -405,9 +470,18 @@ export class OpenCodeProvider implements AgentProvider {
     const queryCwd = input.cwd;
     const IDLE_TIMEOUT_MS = 90_000;
 
+    // Per-turn `-m`/`-e` (resolved by the poll-loop from sticky + turn flags).
+    // `effort` rebuilds the runtime config (it lives server-side); `model` is
+    // applied per-prompt via body.model below so a switch needs no respawn and
+    // keeps session continuity. The effective model = turn override → env
+    // default (host sets OPENCODE_MODEL from the DB default).
+    const turn: OpenCodeTurnOverrides = { model: input.model, effort: input.effort };
+    const effectiveModel = input.model ?? process.env.OPENCODE_MODEL;
+    const promptModel = effectiveModel ? splitModelSlug(effectiveModel) : null;
+
     async function* gen(): AsyncGenerator<ProviderEvent> {
       let initYielded = false;
-      const rt = await ensureSharedRuntime(self.options, queryCwd);
+      const rt = await ensureSharedRuntime(self.options, queryCwd, turn);
       const { client, stream } = rt;
 
       while (!aborted) {
@@ -441,7 +515,11 @@ export class OpenCodeProvider implements AgentProvider {
 
         const promptRes = await client.session.promptAsync({
           path: { id: sessionId },
-          body: { parts: [{ type: 'text', text }] },
+          // body.model carries the per-turn `-m` model (provider/id split). When
+          // unset (no override + no env default) opencode uses the session/server
+          // default. Switching models mid-session is just a different body.model
+          // on the next prompt — no server respawn.
+          body: { parts: [{ type: 'text', text }], ...(promptModel ? { model: promptModel } : {}) },
         });
         if (promptRes.error) {
           self.activeSessionId = undefined;

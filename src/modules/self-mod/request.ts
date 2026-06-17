@@ -91,22 +91,9 @@ export async function handleAddMcpServer(content: Record<string, unknown>, sessi
 }
 
 export async function handleChangeModel(content: Record<string, unknown>, session: Session): Promise<void> {
-  const agentGroup = getAgentGroup(session.agent_group_id);
-  if (!agentGroup) {
-    notifyAgent(session, 'change_model failed: agent group not found.');
-    return;
-  }
-  const { getContainerConfig } = await import('../../db/container-configs.js');
-  const config = getContainerConfig(agentGroup.id);
-  if (!config) {
-    notifyAgent(session, 'change_model failed: container config not found.');
-    return;
-  }
-  if (!config.provider) {
-    notifyAgent(session, 'change_model failed: group has no provider set; cannot validate model.');
-    return;
-  }
-
+  // Model changes do NOT require admin approval — same as a user's no-approval
+  // `-m` flag. We validate shape here, then apply directly via performModelChange
+  // (which re-checks the group/provider/deny-list and restarts the container).
   const slug = content.slug as string;
   const effort = content.effort as string | undefined;
   if (!slug) {
@@ -118,37 +105,6 @@ export async function handleChangeModel(content: Record<string, unknown>, sessio
     return;
   }
 
-  // Host-side check is only the deny list. The container's list_models tool
-  // is the source of truth for "is this slug reachable" — but that runs in
-  // the container, not here. We just enforce the operator hard-no.
-  const { getDeniedModel } = await import('../../db/denied-models.js');
-  const denied = getDeniedModel(config.provider, slug);
-  if (denied) {
-    notifyAgent(
-      session,
-      `change_model failed: "${slug}" is in the ${config.provider} deny list${
-        denied.reason ? ` (${denied.reason})` : ''
-      }.`,
-    );
-    return;
-  }
-
-  const reason = (content.reason as string) || '';
-  const question =
-    `Agent "${agentGroup.name}" requests model change to:\n` +
-    `${slug}` +
-    (effort ? `\nEffort: ${effort}` : '') +
-    `\nProvider: ${config.provider}` +
-    `\nCurrent: ${config.model || '(none)'}${config.effort ? ` / ${config.effort}` : ''}` +
-    (reason ? `\nReason: ${reason}` : '') +
-    `\n\nThis will restart the container.`;
-
-  await requestApproval({
-    session,
-    agentName: agentGroup.name,
-    action: 'change_model',
-    payload: { slug, effort: effort ?? null, reason },
-    title: 'Change Model Request',
-    question,
-  });
+  const { performModelChange } = await import('./apply.js');
+  await performModelChange(session, slug, effort ?? null, (message) => notifyAgent(session, message));
 }

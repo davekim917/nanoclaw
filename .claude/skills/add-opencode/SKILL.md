@@ -134,16 +134,17 @@ done
 
 ## Configuration
 
-### Host `.env` (typical)
+### Model / provider config (DB, not `.env`)
 
-Set model/provider strings in the form OpenCode expects (often `provider/model-id`). **Put comments on their own lines** — a `#` inside a value is kept verbatim and breaks model IDs.
+Model, provider, and effort live in the **`container_configs`** DB row, set via `ncl` — the same one-pattern template claude and codex use (a code-level default, overridden per-group in the DB). The host **no longer reads** `OPENCODE_PROVIDER` / `OPENCODE_MODEL` / `OPENCODE_SMALL_MODEL` / `OPENCODE_EFFORT` from `.env` for model selection (those scoped vars are dead — see `src/providers/opencode.ts`). The provider is **derived from the model slug's prefix** (`deepseek/…` → deepseek, `opencode-go/…` → Go, `opencode/…` → Zen, `nvidia/…` → NVIDIA); there is no base-URL var to set — opencode's provider registry routes by prefix + the auth.json/OneCLI cred.
 
-These variables are read **on the host** and passed into the container only when the effective provider is `opencode`. They do not switch the provider by themselves; the DB still needs `agent_provider` set (below).
+Set the model on the group (after `agent_provider=opencode` is set, below — the group row must exist):
 
-- `OPENCODE_PROVIDER` — OpenCode provider id, e.g. `openrouter`, `anthropic`, `deepseek`.
-- `OPENCODE_MODEL` — full model id in `provider/model` form, e.g. `deepseek/deepseek-chat`.
-- `OPENCODE_SMALL_MODEL` — optional second model for lighter tasks; defaults to `OPENCODE_MODEL` if unset.
-- `ANTHROPIC_BASE_URL` — **required for non-`anthropic` providers.** The opencode container provider passes this as the `baseURL` for the upstream provider config so requests route through OneCLI's credential proxy or directly to the provider's API. Set it to the provider's API base URL (e.g. `https://api.deepseek.com/v1`, `https://openrouter.ai/api/v1`).
+```bash
+ncl groups config update --id <agentGroupFolder> --model deepseek/deepseek-chat --effort high
+```
+
+If you set nothing, the group inherits the code default `opencode-go/kimi-k2.7-code` (effort `high`) — correct for an OpenCode Go group, wrong for any other provider, so a non-Go group **must** set `--model` explicitly. Effort accepts `low|medium|high` (opencode's portable set). The `provider/model-id` shapes in the examples below are still the right FORMAT for `--model` — just pass them to `ncl`, not `.env`.
 
 Credentials: register provider API keys in OneCLI with the matching `--host-pattern` (e.g. `api.deepseek.com`, `openrouter.ai`). OneCLI injects them via `HTTPS_PROXY` in the container — the key never lives in `.env` or the container environment.
 
@@ -159,16 +160,13 @@ onecli agents set-secrets --id "$AGENT_ID" --secret-ids "$MERGED"
 onecli agents secrets --id "$AGENT_ID"
 ```
 
+Each example below gives the `provider/model-id` to pass to `ncl … --model` plus
+its OneCLI credential registration. **Nothing about the model goes in `.env`.**
+
 #### Example: DeepSeek
 
-```env
-OPENCODE_PROVIDER=deepseek
-OPENCODE_MODEL=deepseek/deepseek-chat
-OPENCODE_SMALL_MODEL=deepseek/deepseek-chat
-ANTHROPIC_BASE_URL=https://api.deepseek.com/v1
-```
+Model id for `--model`: `deepseek/deepseek-chat`. Register the key:
 
-Register the key:
 ```bash
 onecli secrets create --name "DeepSeek" --type generic \
   --value YOUR_KEY --host-pattern "api.deepseek.com" \
@@ -177,46 +175,24 @@ onecli secrets create --name "DeepSeek" --type generic \
 
 #### Example: OpenRouter
 
-```env
-OPENCODE_PROVIDER=openrouter
-OPENCODE_MODEL=openrouter/anthropic/claude-sonnet-4
-OPENCODE_SMALL_MODEL=openrouter/anthropic/claude-haiku-4.5
-ANTHROPIC_BASE_URL=https://openrouter.ai/api/v1
-```
-
-Register the key:
+Model id for `--model`: `openrouter/anthropic/claude-sonnet-4`. Register the key:
 ```bash
 onecli secrets create --name "OpenRouter" --type generic \
   --value YOUR_KEY --host-pattern "openrouter.ai" \
   --header-name "Authorization" --value-format "Bearer {value}"
 ```
 
-#### Example: Anthropic (no ANTHROPIC_BASE_URL needed)
+#### Example: Anthropic
 
-When `OPENCODE_PROVIDER` is `anthropic`, OpenCode uses normal Anthropic env inside the container — the proxy + placeholder key pattern is unchanged and `ANTHROPIC_BASE_URL` is not required.
-
-```env
-OPENCODE_PROVIDER=anthropic
-OPENCODE_MODEL=anthropic/claude-sonnet-4-20250514
-OPENCODE_SMALL_MODEL=anthropic/claude-haiku-4-5-20251001
-```
+Model id for `--model`: `anthropic/claude-sonnet-4-20250514`. When the model is an `anthropic/*` slug, OpenCode uses the normal Anthropic env inside the container — the proxy + placeholder-key pattern is unchanged.
 
 #### OpenCode Zen (`x-api-key`, not Bearer)
 
 Zen's HTTP API (e.g. `POST …/zen/v1/messages`) expects the key in the **`x-api-key`** header. If OneCLI injects **`Authorization: Bearer …`** only, Zen often returns **401 / "Missing API key"** even though the gateway is working.
 
-**Naming:** NanoClaw **`AGENT_PROVIDER=opencode`** (DB `agent_provider`) means "run the **OpenCode agent provider**." Separately, **`OPENCODE_PROVIDER=opencode`** in `.env` is OpenCode's **Zen provider id** inside the OpenCode config (see [Zen docs](https://opencode.ai/docs/zen/)).
+**Naming:** NanoClaw **`AGENT_PROVIDER=opencode`** (DB `agent_provider`) means "run the **OpenCode agent provider**." Separately, the **`opencode`** prefix in a model slug is OpenCode's **Zen provider id** — the host derives the routing provider from the slug prefix (see [Zen docs](https://opencode.ai/docs/zen/)).
 
-**Host `.env` (typical Zen shape):**
-
-```env
-OPENCODE_PROVIDER=opencode
-OPENCODE_MODEL=opencode/big-pickle
-OPENCODE_SMALL_MODEL=opencode/big-pickle
-ANTHROPIC_BASE_URL=https://opencode.ai/zen/v1
-```
-
-Use a real Zen model id from the docs; `big-pickle` is one example.
+Model id for `--model`: an `opencode/<id>` slug, e.g. `opencode/big-pickle` (use a real Zen model id from the docs).
 
 **OneCLI:** register the Zen key with **`x-api-key`**, not Bearer:
 

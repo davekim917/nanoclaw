@@ -253,56 +253,50 @@ ENV_KEY=MNEMON_STORE_$(echo "${SIBLING_FOLDER}" | tr 'a-z-' 'A-Z_')
 echo "${ENV_KEY}=${SOURCE_ID}" >> .env   # only to override the workgroup's shared store
 ```
 
-### 6c. Scoped OpenCode model selection
+### 6c. OpenCode model selection
 
-The host-side opencode provider supports scoped env vars `OPENCODE_PROVIDER_<FOLDER>`, `OPENCODE_MODEL_<FOLDER>`, `OPENCODE_SMALL_MODEL_<FOLDER>`, `OPENCODE_EFFORT_<FOLDER>`, and `OPENCODE_BASE_URL_<FOLDER>` (falls back to bare versions if scoped isn't set; `ANTHROPIC_BASE_URL_<FOLDER>` is also accepted as a back-compat fallback for the base URL). For multiple opencode siblings on different backends, set the scoped versions per-sibling.
+Model/effort config follows the same template as claude/codex: a **code-level
+default** is the floor, the **per-group DB value** (`container_configs`, set via
+`ncl`) overrides it. There are **no `.env` model vars** — the old
+`OPENCODE_MODEL_<FOLDER>` / `OPENCODE_PROVIDER_<FOLDER>` / `OPENCODE_BASE_URL_<FOLDER>`
+scoped vars were removed (one config pattern across all harnesses).
 
-For an OpenCode Go-billing sibling defaulting to Kimi K2.6 with high reasoning:
+A new Go-billing sibling needs **no model config at all** — it inherits
+`DEFAULT_OPENCODE_MODEL` (`opencode-go/kimi-k2.7-code`, effort `high`) from
+`src/providers/opencode.ts`. To run a different model, set it on the DB row
+**after** the `agent_groups` row exists (step 7):
 
 ```bash
-FOLDER_UPPER=$(echo "${SIBLING_FOLDER}" | tr 'a-z-' 'A-Z_')
-
-cat >> .env <<EOF
-OPENCODE_PROVIDER_${FOLDER_UPPER}=opencode
-OPENCODE_MODEL_${FOLDER_UPPER}=opencode/kimi-k2.6
-OPENCODE_EFFORT_${FOLDER_UPPER}=high
-OPENCODE_BASE_URL_${FOLDER_UPPER}=https://opencode.ai/zen/go/v1
-EOF
+ncl groups config update --id "${SIBLING_FOLDER}" --model opencode-go/glm-5.1 --effort high
 ```
 
-**Critical: Go vs Zen billing routing.** OpenCode Go and Zen share the SAME `opencode/*` model ids and the same auth.json, but they're billed via **different API endpoints**:
+**Go vs Zen billing routing — by the model-slug PREFIX, not a base URL.** Both
+share the same `auth.json`, but the provider prefix selects the billing
+endpoint, and the host derives `OPENCODE_PROVIDER` from it automatically:
 
-| URL path | Catalog (per OpenCode console source) | Billing |
+| Model slug prefix | Endpoint | Billing |
 |---|---|---|
-| `https://opencode.ai/zen/v1` (SDK default) | `ZenData.list("full")` — full catalog (Claude/GPT/Gemini + Asian models) | **Zen credit** |
-| `https://opencode.ai/zen/go/v1` | `ZenData.list("lite")` — Go-tier only (Kimi/GLM/DeepSeek/Qwen/MiniMax/MiMo) | **Go subscription** |
+| `opencode-go/*` (e.g. `opencode-go/kimi-k2.7-code`) | `/zen/go/v1` | **Go subscription** (default — cheapest) |
+| `opencode/*` (e.g. `opencode/gpt-5.5`) | `/zen/v1` | **Zen credit** (opt-in; use only for a Zen-only model) |
+| `nvidia/*` | NVIDIA | per NVIDIA cred |
 
-Without setting `OPENCODE_BASE_URL_<FOLDER>`, the SDK defaults to `/zen/v1` and drains your Zen credit balance — even for Go-only models. Always set the Go endpoint explicitly for Go-billed siblings.
+The container enables EVERY credentialed provider in-session, so the agent can
+switch to any go/zen/nvidia model mid-thread with the `-m <slug>` flag (no
+restart) — `ncl groups config update --model` / `change_model` is the
+persistent group-level equivalent. Default to `opencode-go/*`; reach for
+`opencode/*` only when you deliberately want a Zen-only model.
 
-**Reasoning effort** — `OPENCODE_EFFORT` accepts user-friendly values but is **clamped to the portable intersection** `low | medium | high` before reaching upstream. Out-of-range values are mapped: `minimal → low`, `xhigh → high`, `max → high`. The container provider sends only `reasoning_effort` (not `thinking.budgetTokens`), because the latter is Anthropic-specific and 400s on most non-Anthropic upstreams (Kimi, GLM, DeepSeek). Leave unset to skip the field entirely and let each model use its upstream default.
+**Reasoning effort** — `-e` / the `--effort` DB field accept `low | medium | high`
+(the portable intersection). `xhigh`/`max`/`minimal` are NOT accepted for
+opencode (they 400 on most Go/Zen upstreams); the container sends only
+`reasoning_effort`, never the Anthropic-specific `thinking.budgetTokens`. Leave
+unset to let each model use its upstream default (most Go thinking models —
+Kimi/GLM/DeepSeek/Qwen — already run high by default).
 
-Why the clamp: each upstream provider's API has a different validation schema:
-
-| Model family | Upstream `reasoning_effort` schema | Default behavior |
-|---|---|---|
-| **OpenAI / GPT-5** (Zen) | `minimal\|low\|medium\|high` — `xhigh` is an OpenCode extension that some upstreams reject | Set `OPENCODE_EFFORT=high` for portability. `xhigh` requires OpenAI-pinned siblings. |
-| **Anthropic / Claude** (Zen) | Uses `thinking.budgetTokens` (different schema entirely) | Not controlled by `OPENCODE_EFFORT` today. Future work: detect provider and switch field. |
-| **DeepSeek V4 Pro/Flash** (Go) | `high\|max` | OpenCode auto-sets `max` for agent contexts when no explicit value sent. `OPENCODE_EFFORT=high` overrides to lower tier; unset = auto-max. |
-| **Kimi K2.6** (Go) | `low\|medium\|high\|none` — strict literal | `OPENCODE_EFFORT=high` works. Thinking is on by default; `OPENCODE_EFFORT` only changes effort tier. |
-| **GLM-5 / GLM-5.1** (Go) | `thinking: enabled\|disabled` (no granular effort) | `OPENCODE_EFFORT` is a no-op; thinking is compulsory when enabled. |
-| **Qwen3.x Plus / MiniMax / MiMo** (Go) | Mostly binary on/off | Verify per-model in upstream docs before setting. |
-
-**Practical rule**: for OpenCode Go siblings, set `OPENCODE_EFFORT=high` (or unset). For OpenAI-Zen-pinned siblings wanting native xhigh, that requires per-sibling code paths not wired today — file an issue when you need it.
-
-**Picking `OPENCODE_MODEL`:**
-
-| Plan | Example model ids (subject to OpenCode's catalog) |
-|------|-----|
-| OpenCode Go | `opencode/kimi-k2.6`, `opencode/qwen-3.6-plus`, `opencode/deepseek-v4-pro`, `opencode/glm-5.1`, `opencode/mimo-v2.5-pro` |
-| OpenCode Zen | `opencode/big-pickle`, `opencode/gpt-5-nano` |
-| Free | `opencode/minimax-m2.5-free`, `opencode/nemotron-3-super-free`, `opencode/deepseek-v4-flash-free` |
-
-Run `opencode models` (from the host, after `providers login`) to see what's actually available under your plan — the catalog updates dynamically.
+**Picking a model** — run `opencode models` (from the host after `providers login`,
+or ask the running agent to call its `list_models` tool) for the live catalog;
+it updates dynamically. Examples: `opencode-go/kimi-k2.7-code`,
+`opencode-go/glm-5.1`, `opencode-go/deepseek-v4-pro`, `opencode-go/qwen3.7-plus`.
 
 **OpenCode Go credit overflow:** Go subscriptions drain from Zen credit balance when Go limits are hit, so a single login with both plans active gives you a smooth fallback.
 
@@ -462,16 +456,22 @@ JOIN messaging_group_agents mga ON mga.messaging_group_id=mg.id
 WHERE mga.agent_group_id='${SIBLING_FOLDER}'"
 ```
 
-**Check B — pre-flight: `OPENCODE_MODEL`'s provider is authed (deterministic, no spawn):**
+**Check B — pre-flight: the model's provider is authed (deterministic, no spawn):**
 
 ```bash
-PROV="${OPENCODE_PROVIDER}"   # e.g. opencode-go (global auth) or opencode (scoped Zen)
-# Resolve the auth.json this sibling actually uses: scoped dir if present, else global.
-AUTH="$HOME/.local/share/opencode-${SIBLING_FOLDER}/opencode/auth.json"
+# Effective model = DB value (container_configs) or the code default; provider =
+# its slug prefix (the host derives OPENCODE_PROVIDER from this — there is no
+# .env var to read anymore).
+MODEL=$(pnpm exec tsx scripts/q.ts data/v2.db \
+  "SELECT model FROM container_configs WHERE agent_group_id='${SIBLING_FOLDER}'" 2>/dev/null | tr -d '\n')
+[ -n "$MODEL" ] || MODEL="opencode-go/kimi-k2.7-code"   # DEFAULT_OPENCODE_MODEL
+PROV="${MODEL%%/*}"   # e.g. opencode-go (Go), opencode (Zen), nvidia
+# Resolve the auth.json this sibling uses: scoped dir if present, else global.
+AUTH="$HOME/.local/share/opencode-${SIBLING_FOLDER}/auth.json"
 [ -f "$AUTH" ] || AUTH="$HOME/.local/share/opencode/auth.json"
 node -e "const a=require('$AUTH'); process.exit(('$PROV' in a)?0:1)" \
-  && echo "✅ provider '$PROV' is present in $(basename $(dirname $(dirname "$AUTH")))" \
-  || echo "❌ provider '$PROV' is NOT in $AUTH — OPENCODE_MODEL will fail at runtime. Fix OPENCODE_PROVIDER/MODEL or 'opencode providers login' under the right XDG dir."
+  && echo "✅ provider '$PROV' (from model '$MODEL') is present in $AUTH" \
+  || echo "❌ provider '$PROV' is NOT in $AUTH — '$MODEL' will fail at runtime. Pick a model whose provider is authed, or 'opencode providers login' for it."
 ```
 
 **Check C — live round-trip (the only check that exercises model + auth + delivery):**

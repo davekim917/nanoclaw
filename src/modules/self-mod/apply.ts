@@ -19,9 +19,11 @@ import {
 } from '../../db/container-configs.js';
 import { getDeniedModel } from '../../db/denied-models.js';
 import { getSession } from '../../db/sessions.js';
+import { isOpenCodeModelSlug } from '../../flag-parser.js';
 import type { McpServerConfig } from '../../container-config.js';
 import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
+import type { Session } from '../../types.js';
 import type { ApprovalHandler } from '../approvals/index.js';
 
 export const applyInstallPackages: ApprovalHandler = async ({ session, payload, userId, notify }) => {
@@ -130,33 +132,54 @@ export const applyAddMcpServer: ApprovalHandler = async ({ session, payload, use
   log.info('MCP server add approved', { agentGroupId: session.agent_group_id, userId });
 };
 
-export const applyChangeModel: ApprovalHandler = async ({ session, payload, userId, notify }) => {
+/**
+ * Apply a model (+ optional effort) change to an agent group's container config
+ * and restart the container. Model changes do NOT require admin approval — the
+ * agent's `change_model` tool calls this DIRECTLY (see request.ts); the
+ * operator deny list is the only guardrail (re-checked here as defense-in-depth,
+ * since a denial may land between an in-flight request and apply). Mirrors how
+ * a user changes models with the no-approval `-m` flag. `notify` surfaces
+ * failures to the caller's audience (the agent for the direct path).
+ */
+export async function performModelChange(
+  session: Session,
+  slug: string,
+  effort: string | null,
+  notify: (message: string) => void | Promise<void>,
+  logContext: Record<string, unknown> = {},
+): Promise<void> {
   const agentGroup = getAgentGroup(session.agent_group_id);
   if (!agentGroup) {
-    await notify('change_model approved but agent group missing.');
+    await notify('change_model failed: agent group missing.');
     return;
   }
   const config = getContainerConfig(agentGroup.id);
   if (!config) {
-    await notify('change_model approved but container config missing.');
+    await notify('change_model failed: container config missing.');
     return;
   }
   if (!config.provider) {
-    await notify('change_model approved but group has no provider — cannot revalidate model.');
+    await notify('change_model failed: group has no provider — cannot revalidate model.');
     return;
   }
 
-  const slug = payload.slug as string;
-  const effort = payload.effort as string | null;
+  // Opencode slugs MUST be provider-prefixed (`<provider>/<id>`) — the host
+  // derives the routing provider from the prefix. A bare slug (e.g.
+  // `kimi-k2.7-code`) would persist and restart into a container that can't
+  // resolve the model. The `-m` flag path validates this; mirror it here since
+  // change_model now applies with no approval checkpoint. Same check, one source.
+  if (config.provider === 'opencode' && !isOpenCodeModelSlug(slug)) {
+    await notify(
+      `change_model failed: "${slug}" is not a valid opencode slug — it must be provider-prefixed ` +
+        `(e.g. opencode-go/kimi-k2.7-code, nvidia/meta/llama-3.3-70b-instruct). Run list_models for exact ids.`,
+    );
+    return;
+  }
 
-  // Defense-in-depth: re-check the deny list at apply time, in case the
-  // operator added a denial between request and approval. The container's
-  // own check (against `opencode models` for reachability) happens at next
-  // spawn; we just enforce the operator hard-no here.
   const denied = getDeniedModel(config.provider, slug);
   if (denied) {
     await notify(
-      `change_model approved but "${slug}" was just added to the deny list${
+      `change_model failed: "${slug}" is in the ${config.provider} deny list${
         denied.reason ? ` (${denied.reason})` : ''
       }. Aborted.`,
     );
@@ -169,9 +192,9 @@ export const applyChangeModel: ApprovalHandler = async ({ session, payload, user
   if (effort) updates.effort = effort;
   updateContainerConfigScalars(agentGroup.id, updates);
 
-  log.info('Model change approved', {
+  log.info('Model change applied', {
     agentGroupId: session.agent_group_id,
-    userId,
+    ...logContext,
     previousModel: config.model,
     newModel: slug,
     effort,
@@ -198,4 +221,13 @@ export const applyChangeModel: ApprovalHandler = async ({ session, payload, user
     const s = getSession(session.id);
     if (s) wakeContainer(s);
   });
+}
+
+/**
+ * Legacy approval-path wrapper, retained so any change_model approval record
+ * still in flight at deploy time applies cleanly. New requests no longer create
+ * approvals (request.ts calls performModelChange directly).
+ */
+export const applyChangeModel: ApprovalHandler = async ({ session, payload, userId, notify }) => {
+  await performModelChange(session, payload.slug as string, payload.effort as string | null, notify, { userId });
 };

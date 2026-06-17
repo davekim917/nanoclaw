@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 
-import { parseMessageFlags, formatFlagConfirmation, ensureOpus1mSuffix } from './flag-parser.js';
+import { parseMessageFlags, formatFlagConfirmation, ensureOpus1mSuffix, isOpenCodeModelSlug } from './flag-parser.js';
 
 describe('ensureOpus1mSuffix', () => {
   it('appends [1m] to a bare claude-opus id (1M auto-compact window guard)', () => {
@@ -338,8 +338,76 @@ describe('provider-aware vocabulary (codex)', () => {
     expect(parseMessageFlags('-m gpt-5.5 hi').errors[0]).toMatch(/unknown model/);
   });
 
-  it('opencode falls back to claude vocabulary for now (deliberate, see vocabFor)', () => {
-    const r = parseMessageFlags('-m fable hi', 'opencode');
-    expect(r.intent).toEqual({ stickyModel: 'claude-fable-5[1m]' });
+});
+
+describe('provider-aware vocabulary (opencode)', () => {
+  // OpenCode validates slug SHAPE (`<provider>/<id…>`), not an allowlist — the
+  // live catalog is huge and only enumerable in-container (list_models MCP).
+
+  it('accepts a provider-prefixed Go slug', () => {
+    const r = parseMessageFlags('-m opencode-go/kimi-k2.7-code hi', 'opencode');
+    expect(r.intent).toEqual({ stickyModel: 'opencode-go/kimi-k2.7-code' });
+    expect(r.errors).toEqual([]);
+  });
+
+  it('accepts a Zen slug and a multi-segment nvidia slug', () => {
+    expect(parseMessageFlags('-m opencode/gpt-5.5 hi', 'opencode').intent).toEqual({
+      stickyModel: 'opencode/gpt-5.5',
+    });
+    expect(parseMessageFlags('-m1 nvidia/meta/llama-3.3-70b-instruct hi', 'opencode').intent).toEqual({
+      turnModel: 'nvidia/meta/llama-3.3-70b-instruct',
+    });
+  });
+
+  it('rejects unprefixed ids (claude aliases, bare codex ids) with a shape hint', () => {
+    const claude = parseMessageFlags('-m fable hi', 'opencode');
+    expect(claude.intent).toBeUndefined();
+    expect(claude.errors[0]).toMatch(/unknown model: fable/);
+    expect(claude.errors[0]).toMatch(/provider-prefixed/);
+    const codex = parseMessageFlags('-m gpt-5.5 hi', 'opencode');
+    expect(codex.intent).toBeUndefined();
+    expect(codex.errors[0]).toMatch(/unknown model: gpt-5\.5/);
+  });
+
+  it('accepts the portable effort enum (low|medium|high)', () => {
+    expect(parseMessageFlags('-e low hi', 'opencode').intent).toEqual({ stickyEffort: 'low' });
+    expect(parseMessageFlags('-e high hi', 'opencode').intent).toEqual({ stickyEffort: 'high' });
+  });
+
+  it('rejects non-portable efforts (xhigh/max/none/minimal) with the opencode enum', () => {
+    for (const bad of ['xhigh', 'max', 'none', 'minimal']) {
+      const r = parseMessageFlags(`-e ${bad} hi`, 'opencode');
+      expect(r.intent).toBeUndefined();
+      expect(r.errors[0]).toMatch(new RegExp(`unknown effort level: ${bad}`));
+      expect(r.errors[0]).toMatch(/low\|medium\|high/);
+    }
+  });
+
+  it('rejects ultracode on opencode (Claude-only)', () => {
+    const r = parseMessageFlags('-e ultracode hi', 'opencode');
+    expect(r.intent).toBeUndefined();
+    expect(r.errors[0]).toMatch(/ultracode is Claude-only/);
+  });
+
+  it('accepts a model+effort pair with no claude effort-matrix warnings', () => {
+    const r = parseMessageFlags('-m opencode-go/glm-5.1 -e medium hi', 'opencode');
+    expect(r.intent).toEqual({ stickyModel: 'opencode-go/glm-5.1', stickyEffort: 'medium' });
+    expect(r.warnings).toEqual([]);
+  });
+});
+
+describe('isOpenCodeModelSlug (shared with change_model validation)', () => {
+  it('accepts provider-prefixed slugs', () => {
+    expect(isOpenCodeModelSlug('opencode-go/kimi-k2.7-code')).toBe(true);
+    expect(isOpenCodeModelSlug('opencode/gpt-5.5')).toBe(true);
+    expect(isOpenCodeModelSlug('nvidia/meta/llama-3.3-70b-instruct')).toBe(true);
+    expect(isOpenCodeModelSlug('  opencode-go/glm-5.1  ')).toBe(true); // trims
+  });
+
+  it('rejects bare/malformed slugs (the change_model failure mode)', () => {
+    expect(isOpenCodeModelSlug('kimi-k2.7-code')).toBe(false); // no provider prefix
+    expect(isOpenCodeModelSlug('opencode-go/')).toBe(false); // empty id
+    expect(isOpenCodeModelSlug('/kimi')).toBe(false); // empty provider
+    expect(isOpenCodeModelSlug('')).toBe(false);
   });
 });
