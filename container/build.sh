@@ -12,6 +12,30 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$SCRIPT_DIR"
 
+# Serialize concurrent builds. A manual /deploy (scripts/deploy.sh) and the
+# rebuild watcher (src/container-rebuild-watcher.ts) can both invoke build.sh
+# at once — e.g. merging a container/-touching PR and running /deploy. Two
+# full image builds racing doubles build time, spikes host load (starving the
+# OneCLI gateway → container spawn timeouts), and risks deploy's
+# `systemctl restart` SIGKILLing an in-flight build mid-export, which would
+# leave the spawn image tagged from a stale layer set. flock makes the second
+# caller wait for the first, then rebuild from cache in seconds. Best-effort:
+# flock ships with util-linux (Linux); macOS/Apple-Container hosts lack it and
+# proceed unserialized, as before. Lock lives in logs/ (gitignored, and a
+# sibling of the docker build context so it never enters the image).
+if command -v flock >/dev/null 2>&1; then
+    mkdir -p "$PROJECT_ROOT/logs" 2>/dev/null || true
+    BUILD_LOCK="$PROJECT_ROOT/logs/container-build.lock"
+    # Open fd 9 on the lock; tolerate open failure (degrade to unserialized).
+    if { exec 9>"$BUILD_LOCK"; } 2>/dev/null; then
+        if ! flock -n 9; then
+            echo "Another container build is in progress — waiting for it to finish..."
+            flock 9
+            echo "Build lock acquired; continuing (prior build's layers will be cache hits)."
+        fi
+    fi
+fi
+
 # Derive the image name from the project root so two NanoClaw installs on the
 # same host don't overwrite each other's `nanoclaw-agent:latest` tag. Matches
 # setup/lib/install-slug.sh + src/install-slug.ts.

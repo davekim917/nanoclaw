@@ -50,18 +50,37 @@ if ! pnpm run build:dashboard >> "$LOG" 2>&1; then
   exit 1
 fi
 
-# Rebuild container image if any container/ files changed since the image
-# was last built. Compare image creation time to git history for container/.
-IMAGE_CREATED=$(docker inspect nanoclaw-agent:v2 --format '{{.Created}}' 2>/dev/null | cut -d. -f1 | tr 'T' ' ')
-if [ -n "$IMAGE_CREATED" ]; then
-  CONTAINER_CHANGES=$(git diff --name-only "$(git log -1 --before="$IMAGE_CREATED" --format=%H)" HEAD -- container/ 2>/dev/null)
+# Rebuild the container image the host spawns from if any container/ files
+# changed since it was built. The host spawns from CONTAINER_IMAGE
+# (src/config.ts -> getDefaultContainerImage = <install-slug-base>:latest), so
+# we must inspect and rebuild *that exact tag*. The legacy `nanoclaw-agent:v2`
+# name used here was wrong on both base (unslugged) and tag (`v2` vs `latest`):
+# the inspect always missed -> CONTAINER_CHANGES="no-image" -> a full rebuild
+# every deploy, and `build.sh v2` produced a tag nothing ever spawns from, so
+# the container rebuild only ever took effect because the rebuild watcher
+# (which builds the correct tag) happened to run too. Mirrors the fix already
+# in src/container-rebuild-watcher.ts.
+PROJECT_ROOT="$(pwd)"
+# shellcheck source=setup/lib/install-slug.sh
+source "setup/lib/install-slug.sh"
+SPAWN_TAG="latest"
+SPAWN_IMAGE="$(container_image_base):${SPAWN_TAG}"
+
+# Compare the commit baked into the image (nanoclaw.commit LABEL, stamped by
+# container/build.sh) against HEAD. Created-timestamp + `git log --before`
+# heuristics are unreliable — Docker reuses an existing image's Created time on
+# a full cache hit. Fall back to rebuild whenever the label is missing or its
+# commit isn't in local history; never skip the rebuild on uncertainty.
+IMAGE_COMMIT=$(docker inspect "$SPAWN_IMAGE" --format '{{index .Config.Labels "nanoclaw.commit"}}' 2>/dev/null)
+if [ -n "$IMAGE_COMMIT" ] && git cat-file -e "${IMAGE_COMMIT}^{commit}" 2>/dev/null; then
+  CONTAINER_CHANGES=$(git diff --name-only "$IMAGE_COMMIT" HEAD -- container/ 2>/dev/null)
 else
-  CONTAINER_CHANGES="no-image"
+  CONTAINER_CHANGES="no-image-or-unlabeled"
 fi
 if [ -n "$CONTAINER_CHANGES" ]; then
-  echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Container files changed, rebuilding image..." >> "$LOG"
+  echo "$(date -u '+%Y-%m-%dT%H:%M:%SZ') Container changed (or image unlabeled), rebuilding ${SPAWN_IMAGE}..." >> "$LOG"
   write_status "running" "container build" ""
-  if ! ./container/build.sh v2 >> "$LOG" 2>&1; then
+  if ! CONTAINER_IMAGE_REF="$SPAWN_IMAGE" ./container/build.sh "$SPAWN_TAG" >> "$LOG" 2>&1; then
     write_status "failed" "container build" "Container image build failed"
     exit 1
   fi
