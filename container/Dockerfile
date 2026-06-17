@@ -31,7 +31,7 @@ FROM us-central1-docker.pkg.dev/database-toolbox/toolbox/toolbox:${MCP_TOOLBOX_V
 # in this builder stage and copy the resulting binary into the final image —
 # Rust toolchain stays in the builder layer, never reaches runtime.
 FROM rust:1-bookworm AS rtk-builder
-ARG RTK_VERSION=0.42.3
+ARG RTK_VERSION=0.42.4
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     cargo install --git https://github.com/rtk-ai/rtk --tag "v${RTK_VERSION}" --locked --root /out rtk
@@ -45,17 +45,17 @@ ARG INSTALL_CJK_FONTS=false
 # Pin CLI versions for reproducibility. Bump deliberately — unpinned installs
 # mean every rebuild silently picks up the latest and can break in lockstep
 # across all users.
-ARG CLAUDE_CODE_VERSION=2.1.170
-ARG AGENT_BROWSER_VERSION=0.27.1
+ARG CLAUDE_CODE_VERSION=2.1.179
+ARG AGENT_BROWSER_VERSION=0.28.0
 ARG VERCEL_VERSION=52.2.1
 ARG GITNEXUS_VERSION=1.6.7
 ARG BUN_VERSION=1.3.14
 ARG MMDC_VERSION=11.15.0
 ARG GWS_VERSION=0.22.5
-ARG CODEX_VERSION=0.139.0
-ARG OPENCODE_VERSION=1.17.0
+ARG CODEX_VERSION=0.140.0
+ARG OPENCODE_VERSION=1.17.7
 ARG WIX_CLI_VERSION=1.1.217
-ARG DBT_MCP_VERSION=1.20.2
+ARG DBT_MCP_VERSION=1.20.4
 ARG SLACK_MCP_VERSION=1.3.0
 
 # ---- System dependencies -----------------------------------------------------
@@ -196,8 +196,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends gnupg \
 
 # Render / Railway / Supabase CLIs (released as prebuilt binaries)
 ARG RENDER_VERSION=2.20.0
-ARG RAILWAY_VERSION=5.8.0
-ARG SUPABASE_VERSION=2.105.0
+ARG RAILWAY_VERSION=5.15.0
+ARG SUPABASE_VERSION=2.106.0
 RUN DPKG_ARCH=$(dpkg --print-architecture) && UARCH=$(uname -m) \
     && curl -fsSL "https://github.com/render-oss/cli/releases/download/v${RENDER_VERSION}/cli_${RENDER_VERSION}_linux_${DPKG_ARCH}.zip" \
        -o /tmp/render.zip \
