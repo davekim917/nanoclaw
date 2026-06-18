@@ -160,6 +160,40 @@ describe('poll loop integration', () => {
     await loopPromise.catch(() => {});
   });
 
+  it('peer addressed as a destination is recovered to the origin channel with an @mention', async () => {
+    const prevPeers = process.env.NANOCLAW_PEERS;
+    process.env.NANOCLAW_PEERS = JSON.stringify({
+      self: { userId: 'SELF' },
+      peers: [{ name: 'Axie-Codex', userId: 'PEER1' }],
+    });
+    try {
+      insertMessage('m1', { sender: 'Alice', text: 'hi' }, { platformId: 'chan-1', channelType: 'discord' });
+
+      // The opencode failure mode: addresses the sibling as a destination.
+      const provider = new MockProvider({}, () => '<message to="Axie-Codex">Good catch — fixing the query.</message>');
+      const controller = new AbortController();
+      const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
+
+      await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+      controller.abort();
+
+      const out = getUndeliveredMessages();
+      // Recovered, not dropped: routed to the origin channel (chan-1) with the mention.
+      expect(out).toHaveLength(1);
+      expect(out[0].platform_id).toBe('chan-1');
+      expect(out[0].channel_type).toBe('discord');
+      const text = JSON.parse(out[0].content).text as string;
+      expect(text).toContain('@Axie-Codex');
+      expect(text).toContain('Good catch');
+      expect(text).not.toContain('dropped');
+
+      await loopPromise.catch(() => {});
+    } finally {
+      if (prevPeers === undefined) delete process.env.NANOCLAW_PEERS;
+      else process.env.NANOCLAW_PEERS = prevPeers;
+    }
+  });
+
   it('multiple <message> blocks each produce an outbound message', async () => {
     getInboundDb()
       .prepare(
@@ -365,7 +399,20 @@ describe('poll loop — exchange hook (onExchangeComplete)', () => {
   });
 
   it('does not report the internal wrapping-retry nudge as a user prompt', async () => {
-    insertMessage('m1', { sender: 'Alice', text: 'wrap this later' }, { platformId: 'chan-1', channelType: 'discord' });
+    // The wrapping-retry nudge only fires when unwrapped output can't be
+    // auto-recovered by the origin/single-destination fallback (poll-loop.ts
+    // dispatchResultText): i.e. the inbound has no resolvable origin AND the
+    // group has >1 destination. Set up exactly that — a null-routed inbound
+    // (like a cron task) plus a second destination — so the retry path is
+    // actually exercised. (The happy-path origin-fallback is covered by
+    // "bare text falls back to the origin destination".)
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES ('slack-test', 'Slack Test', 'channel', 'slack', 'chan-2', NULL)`,
+      )
+      .run();
+    insertMessage('m1', { sender: 'Alice', text: 'wrap this later' });
 
     let calls = 0;
     const provider = new HookedMockProvider({}, () => {

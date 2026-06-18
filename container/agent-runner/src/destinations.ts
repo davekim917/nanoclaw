@@ -190,6 +190,21 @@ function readPeersFromEnv(): PeerSpec | undefined {
 }
 
 /**
+ * Resolve an agent-supplied name (e.g. from `<message to="X">`) to a known
+ * peer's canonical name, case-insensitively. Returns undefined when X is not a
+ * peer. Used by the dispatcher to RECOVER the common mistake of addressing a
+ * sibling as a destination (peers aren't destinations — you reach them by
+ * @-mentioning in the body of a channel message), instead of silently dropping.
+ */
+export function findPeerName(name: string): string | undefined {
+  const spec = readPeersFromEnv();
+  if (!spec) return undefined;
+  const target = name.trim().toLowerCase();
+  const match = spec.peers.find((p) => typeof p?.name === 'string' && p.name.trim().toLowerCase() === target);
+  return match?.name;
+}
+
+/**
  * Render the "## Peer agents in this channel" block. Each peer is listed
  * with name + (when available) canonical user_id so the agent has an
  * unambiguous @-mention target.
@@ -218,7 +233,7 @@ function buildPeersSection(peers: PeerEntry[]): string | null {
   }
   lines.push('');
   lines.push(
-    'When referring to a peer in prose, use their full name from the list above — never a shared display-name prefix or shortened form. To hand off active work or coordinate next steps, end your reply by `@`-mentioning the peer (e.g. `@<Name>`); the outbound rewriter resolves it to the peer\'s canonical user_id syntax. Stop @-mentioning only when the work is verifiably DONE.',
+    'Peers are NOT destinations. Do NOT address a peer with `<message to="<peer>">` or `send_message(to: "<peer>")` — there is no destination by that name and the message is dropped. To reach a peer, send to your normal channel destination (the one the request came `from`) and put `@<Peer>` in the message BODY. When referring to a peer in prose, use their full name from the list above — never a shared display-name prefix or shortened form. To hand off active work or coordinate next steps, `@`-mention the peer (e.g. `@<Name>`) in the body of that reply; the outbound rewriter resolves it to the peer\'s canonical user_id and wakes them. Stop @-mentioning only when the work is verifiably DONE.',
   );
   return lines.join('\n');
 }

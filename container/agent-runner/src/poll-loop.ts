@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 
-import { findByName, findByRouting, getAllDestinations, type DestinationEntry } from './destinations.js';
+import { findByName, findByRouting, findPeerName, getAllDestinations, type DestinationEntry } from './destinations.js';
 import { getPendingMessages, markProcessing, markCompleted, type MessageInRow } from './db/messages-in.js';
 import { writeMessageOut } from './db/messages-out.js';
 import { getSessionSpawnTaskId } from './db/session-routing.js';
@@ -1194,6 +1194,22 @@ export function dispatchResultText(text: string, routing: RoutingContext): { sen
     }
     const dest = findByName(toName);
     if (!dest) {
+      // Recovery: the agent addressed a PEER (sibling) as a destination — a
+      // common mistake, esp. opencode (observed: `<message to="Axie-Codex">`
+      // dropped). Peers aren't destinations; you reach them by @-mentioning in
+      // the body of a channel message. Convert it: route the body to the
+      // conversation's ORIGIN channel with `@<peer>` ensured in the body, so the
+      // handoff actually posts AND wakes the peer instead of vanishing.
+      const peerName = findPeerName(toName);
+      const originDest = peerName ? findByRouting(routing.channelType, routing.platformId) : undefined;
+      if (peerName && originDest) {
+        const mention = `@${peerName}`;
+        const recoveredBody = body.toLowerCase().includes(mention.toLowerCase()) ? body : `${mention} ${body}`.trim();
+        log(`Recovered peer-as-destination <message to="${toName}"> → channel "${originDest.name}" with ${mention}`);
+        sendToDestination(originDest, recoveredBody, routing);
+        sent++;
+        continue;
+      }
       log(`Unknown destination in <message to="${toName}">, dropping block`);
       scratchpadParts.push(`[dropped: unknown destination "${toName}"] ${body}`);
       continue;
