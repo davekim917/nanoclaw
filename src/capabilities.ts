@@ -750,6 +750,42 @@ export function buildSessionServicesSnapshot(
     });
   }
 
+  // SELECT (select.dev) — REST-only via the OneCLI gateway, gated on a
+  // `Select-*` OneCLI secret. No MCP/CLI surface: the agent `curl`s the host
+  // directly and the gateway injects `Authorization: Bearer <key>` at the
+  // boundary (e.g. vault entry "Select-MadisonReed" → api.select.dev). The
+  // organization_id rides in the URL path and is NOT a secret; it's embedded
+  // only for the MadisonReed tenant (the install's only SELECT org), mirroring
+  // how the Atlassian entry above embeds the madison-reed site.
+  if (mergedSecrets.some((s) => /^select(-|$)/i.test(s))) {
+    const selectOrg = mergedSecrets.some((s) => /madison.?reed/i.test(s))
+      ? 'org_DceCh2f5ybKfzIlh'
+      : '<organization_id — ask the owner>';
+    services.push({
+      name: 'SELECT (select.dev)',
+      cli: 'curl',
+      declaredTools: [],
+      scopes: [],
+      credentialPaths: [],
+      useFor: `Snowflake cost & usage analytics REST API at https://api.select.dev — auth pre-injected as \`Authorization: Bearer\` (send NO auth header; the OneCLI gateway adds it at the boundary). Routes are ORG-SCOPED: \`GET /api/${selectOrg}/...\` (e.g. \`/users\`, \`/usage-group-sets\`); the org id goes in the path and is not secret. GOTCHA: SELECT validates the key against the org in the path, so a wrong or missing org returns \`401 {"detail":"Invalid API key"}\` even when the key is valid — do NOT read that as a bad key. Docs: https://api-docs.select.dev/ (route index at /llms.txt).`,
+    });
+  }
+
+  // Fivetran — REST-only via the OneCLI gateway, gated on a `Fivetran-*` OneCLI
+  // secret. The gateway injects `Authorization: Basic <base64(apiKey:apiSecret)>`
+  // at the boundary (e.g. vault entry "Fivetran-MadisonReed" → api.fivetran.com).
+  if (mergedSecrets.some((s) => /^fivetran(-|$)/i.test(s))) {
+    services.push({
+      name: 'Fivetran',
+      cli: 'curl',
+      declaredTools: [],
+      scopes: [],
+      credentialPaths: [],
+      useFor:
+        'Data-ingestion / connector management REST API at https://api.fivetran.com (e.g. `GET /v1/groups`, `/v1/connectors`, `/v1/users`). Auth pre-injected as `Authorization: Basic` (send NO auth header; the OneCLI gateway adds it at the boundary). Docs: https://fivetran.com/docs/rest-api.',
+    });
+  }
+
   return { agentGroupId, services };
 }
 
