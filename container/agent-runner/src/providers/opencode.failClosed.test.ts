@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test';
 import * as fs from 'fs';
 
 import { buildOpenCodeConfig, buildOpencodeServerEnv } from './opencode.js';
-import { buildSecretEnvVarList } from './secret-env.js';
+import { buildSecretEnvVarList, MCP_HEADER_ONLY_SECRET_VARS } from './secret-env.js';
 
 // The guard plugin path buildOpenCodeConfig probes via fs.existsSync. We never
 // touch the real filesystem here — every test stubs fs.existsSync so "present"
@@ -139,6 +139,41 @@ describe('buildOpencodeServerEnv — secret strip (F2)', () => {
     // ...but ANTHROPIC_API_KEY (matched by buildSecretEnvVarList against
     // process.env) is still stripped even though it was on `base`.
     expect(childEnv.ANTHROPIC_API_KEY).toBeUndefined();
+  });
+
+  it('test_oc_child_env_strips_mcp_header_secrets (codex #126): EXA/BRAINTRUST/GRANOLA stripped; data-tool secrets + proxy/CA/XDG kept', () => {
+    const base: NodeJS.ProcessEnv = {
+      PATH: '/usr/bin',
+      HOME: '/home/agent',
+      // MCP / header-only secrets — must be stripped (parity with Claude filterSdkEnv).
+      EXA_API_KEY: 'exa-secret',
+      BRAINTRUST_API_KEY: 'bt-secret',
+      GRANOLA_ACCESS_TOKEN: 'granola-secret',
+      // Data-tool secrets bash legitimately consumes — must be KEPT (matches Claude).
+      SNOWFLAKE_PASSWORD: 'snow-pw',
+      OPENAI_API_KEY: 'oai-key',
+      // Proxy / CA / XDG that `opencode serve` + its children need — must be KEPT.
+      HTTPS_PROXY: 'http://127.0.0.1:10254',
+      NO_PROXY: 'wix.com',
+      NODE_EXTRA_CA_CERTS: '/etc/ca.pem',
+      XDG_DATA_HOME: '/opencode-xdg',
+    };
+    // Premise guard: the names we're asserting are actually in the shared list.
+    expect(MCP_HEADER_ONLY_SECRET_VARS).toContain('EXA_API_KEY');
+    expect(MCP_HEADER_ONLY_SECRET_VARS).toContain('BRAINTRUST_API_KEY');
+    expect(MCP_HEADER_ONLY_SECRET_VARS).toContain('GRANOLA_ACCESS_TOKEN');
+
+    const childEnv = buildOpencodeServerEnv(base, { permission: 'allow' });
+    for (const v of MCP_HEADER_ONLY_SECRET_VARS) {
+      expect(childEnv[v]).toBeUndefined();
+    }
+    // No over-strip: data-tool secrets + infra vars survive.
+    expect(childEnv.SNOWFLAKE_PASSWORD).toBe('snow-pw');
+    expect(childEnv.OPENAI_API_KEY).toBe('oai-key');
+    expect(childEnv.HTTPS_PROXY).toBe('http://127.0.0.1:10254');
+    expect(childEnv.NO_PROXY).toBe('wix.com');
+    expect(childEnv.NODE_EXTRA_CA_CERTS).toBe('/etc/ca.pem');
+    expect(childEnv.XDG_DATA_HOME).toBe('/opencode-xdg');
   });
 
   it('imports the shared buildSecretEnvVarList (no duplication of the list)', () => {

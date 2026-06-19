@@ -14,7 +14,7 @@ import {
 
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/connection.js';
 import { registerProvider, registerProviderConfigSchema } from './provider-registry.js';
-import { buildSecretEnvVarList } from './secret-env.js';
+import { buildSecretEnvVarList, MCP_HEADER_ONLY_SECRET_VARS } from './secret-env.js';
 import type { AgentProvider, AgentQuery, McpServerConfig, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
 import { autoCommitDirtyWorktrees } from '../worktree-autosave.js';
 import { createBlockMnemonRealHook } from '../modules/memory/block-mnemon-real-hook.js';
@@ -633,10 +633,23 @@ const EMAIL_LEADING_ASSIGNMENT_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
  *  codex #8) and honor a bypass flag only in OPTION position (not as a prior bare
  *  option's value). Fail-closed: every step only makes bypass LESS likely. */
 function emailBypassIsRealArgvToken(gwsSegment: string): boolean {
-  const unquoted = gwsSegment
+  // Strip NON-expanding quotes first (single + ANSI-C $'…' — no expansion), then
+  // fail closed on a `$(`/backtick inside an EXPANDING span ("…" / locale $"…"):
+  // bash still runs COMMAND SUBSTITUTION there, so `--dry-run --body "$(gws …
+  // +send --to victim)"` would shell out a REAL send before the no-op flag — the
+  // NUL-strip would otherwise hide it from the metachar check. Inspect the span
+  // CONTENT (capture group) so the locale `$` prefix isn't counted. Only command
+  // substitution executes — bare `$VAR`/`$5` is parameter expansion, so a legit
+  // `--body "cost is $5"` must still bypass. Mirrors SoT. (codex #126 P1)
+  const safeStripped = gwsSegment
     .replace(/\$'(?:[^'\\]|\\.)*'/g, EMAIL_QUOTED_SPAN_SENTINEL)
+    .replace(/'[^']*'/g, EMAIL_QUOTED_SPAN_SENTINEL);
+  const expandingQuoteRe = /\$?"((?:[^"\\]|\\.)*)"/g;
+  for (let m = expandingQuoteRe.exec(safeStripped); m !== null; m = expandingQuoteRe.exec(safeStripped)) {
+    if (m[1].includes('$(') || m[1].includes('`')) return false; // command substitution in expanding quotes → don't bypass
+  }
+  const unquoted = safeStripped
     .replace(/\$"(?:[^"\\]|\\.)*"/g, EMAIL_QUOTED_SPAN_SENTINEL)
-    .replace(/'[^']*'/g, EMAIL_QUOTED_SPAN_SENTINEL)
     .replace(/"(?:[^"\\]|\\.)*"/g, EMAIL_QUOTED_SPAN_SENTINEL);
   if (unquoted.includes("'") || unquoted.includes('"')) return false;
   if (unquoted.includes('\\')) return false; // unquoted backslash escape → don't bypass (codex #6)
@@ -977,11 +990,9 @@ export function createBlockGitCloneHook(): HookCallback {
 // HTTP-header-only auth values (Exa, Braintrust MCP). They are intentionally
 // passed as MCP server headers at registration time, not as Bash-visible env.
 // Forwarding them into the SDK's child-process env defeats that isolation.
-const SDK_ENV_DENYLIST: ReadonlySet<string> = new Set([
-  'GRANOLA_ACCESS_TOKEN',
-  'EXA_API_KEY',
-  'BRAINTRUST_API_KEY',
-]);
+// Single source shared with the OpenCode provider (secret-env.ts) so the two
+// providers' env-hygiene can't drift apart. (codex #126)
+const SDK_ENV_DENYLIST: ReadonlySet<string> = new Set(MCP_HEADER_ONLY_SECRET_VARS);
 
 function filterSdkEnv(env: Record<string, string | undefined>): Record<string, string | undefined> {
   const out: Record<string, string | undefined> = {};

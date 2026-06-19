@@ -412,7 +412,10 @@ function stripExistingMcpServers(toml: string): string {
 }
 
 export function writeCodexMcpConfigToml(servers: Record<string, CodexMcpServer>): void {
-  const codexConfigDir = path.join(process.env.HOME || '/home/node', '.codex');
+  // Honor CODEX_HOME so a rotated home (OAuth fallback) gets its own regenerated
+  // config — otherwise the rotated app-server reads stale config from the wrong
+  // dir. CODEX_HOME == $HOME/.codex on initial spawn, so this is a no-op there. (codex #126)
+  const codexConfigDir = process.env.CODEX_HOME || path.join(process.env.HOME || '/home/node', '.codex');
   fs.mkdirSync(codexConfigDir, { recursive: true });
   const configTomlPath = path.join(codexConfigDir, 'config.toml');
 
@@ -501,7 +504,10 @@ export function buildCodexHooksJson(opts?: { emailGateTimeoutSec?: number }): {
  * event gets the longest timeout in the file.
  */
 export function writeCodexHooksJson(opts?: { emailGateTimeoutSec?: number }): void {
-  const codexConfigDir = path.join(process.env.HOME || '/home/node', '.codex');
+  // Honor CODEX_HOME (see writeCodexMcpConfigToml): hooks.json is the destructive-
+  // guard wiring, so a rotated fallback home MUST get the regenerated hooks or the
+  // guard silently stops firing after an OAuth rotation. (codex #126)
+  const codexConfigDir = process.env.CODEX_HOME || path.join(process.env.HOME || '/home/node', '.codex');
   fs.mkdirSync(codexConfigDir, { recursive: true });
   const hooksJsonPath = path.join(codexConfigDir, 'hooks.json');
   const hooks = buildCodexHooksJson(opts);

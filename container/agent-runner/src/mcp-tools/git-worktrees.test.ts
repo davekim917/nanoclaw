@@ -403,6 +403,23 @@ describe('getReposDir / resolveRepoDir / clone_repo', () => {
     expect(text).toContain(join(workgroupDir, 'repos', name)); // the relocation hint
   });
 
+  test('test_clone_symlinked_shared_repo_not_refused (codex #126): compat symlink whose realpath is in the shared tree is reused, not flagged private', async () => {
+    const name = 'svc';
+    const url = 'https://github.com/acme/svc';
+    // Shared tree mounted; the real clone lives in the workgroup tree, exposed to
+    // the agent only through the migration compat symlink /agent/<name> -> /workgroup/<name>.
+    mkdirSync(workgroupDir, { recursive: true });
+    const realInShared = join(workgroupDir, name); // realpath under the shared tree
+    initRepoWithOrigin(realInShared, url);
+    symlinkSync(realInShared, join(agentDir, name));
+    expect(resolveRepoDir(name)).toBe(join(agentDir, name)); // premise: resolves to the symlink alias
+
+    const res = await cloneRepoTool.handler({ url, name });
+    // Its realpath is inside the workgroup tree → siblings CAN see it → reuse, not refuse.
+    expect(res.isError).toBeFalsy();
+    expect(res.content[0].text).not.toContain('PRIVATE');
+  });
+
   test('test_clone_private_reuse_ok_when_no_shared_tree (codex #126): degraded mode still reuses the bedroom clone', async () => {
     const name = 'svc';
     const url = 'https://github.com/acme/svc';

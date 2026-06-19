@@ -6,7 +6,7 @@ import { createOpencodeClient, type OpencodeClient } from '@opencode-ai/sdk';
 import { registerProvider } from './provider-registry.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
 import { mcpServersToOpenCodeConfig } from './mcp-to-opencode.js';
-import { buildSecretEnvVarList } from './secret-env.js';
+import { buildSecretEnvVarList, MCP_HEADER_ONLY_SECRET_VARS } from './secret-env.js';
 
 function log(msg: string): void {
   console.error(`[opencode-provider] ${msg}`);
@@ -106,7 +106,11 @@ export function buildOpencodeServerEnv(
   baseEnv: NodeJS.ProcessEnv,
   config: Record<string, unknown>,
 ): NodeJS.ProcessEnv {
-  const secretVars = new Set(buildSecretEnvVarList());
+  // Strip the env-derived auth list PLUS the MCP/header-only secrets Claude also
+  // strips (filterSdkEnv) — env-hygiene parity so opencode's bash/MCP children
+  // can't printenv Exa/Braintrust/Granola. Data-tool secrets (SNOWFLAKE_PASSWORD,
+  // DBT_*, OPENAI_API_KEY, …) are deliberately KEPT, matching Claude. (codex #126)
+  const secretVars = new Set([...buildSecretEnvVarList(), ...MCP_HEADER_ONLY_SECRET_VARS]);
   const env: NodeJS.ProcessEnv = {};
   for (const [k, v] of Object.entries(baseEnv)) {
     if (secretVars.has(k)) continue;

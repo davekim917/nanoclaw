@@ -346,23 +346,32 @@ export const cloneRepoTool: McpToolDefinition = {
     // wrong code, so error out and let the operator resolve the collision.
     const existing = resolveRepoDir(repoName);
     if (existing) {
-      // When the shared workgroup tree is mounted, repos belong in
-      // /workspace/workgroup/repos so every sibling sees them (see getReposDir).
-      // resolveRepoDir also matches PRIVATE bedroom clones
-      // (/workspace/agent/repos/<name> or the legacy /workspace/agent/<name>) at
-      // lower precedence — handing one of those back reports success while siblings
-      // can't see the checkout. Refuse loudly so the operator relocates it into the
-      // shared tree (or removes it to re-clone there). Degraded mode — workgroup
-      // expected but not mounted — leaves workgroupDir() absent, so this gate stays
-      // off and the private clone remains reusable. (codex #126)
-      const sharedClonePath = path.join(workgroupDir(), 'repos', repoName);
-      if (fs.existsSync(workgroupDir()) && existing !== sharedClonePath) {
-        return err(
-          `Repo '${repoName}' is already cloned at ${existing}, a PRIVATE (bedroom) location, but ` +
-            `the shared workgroup tree (${workgroupDir()}) is mounted — a private clone is NOT ` +
-            `visible to sibling agents. Refusing to silently reuse it. Move it into the shared tree ` +
-            `(\`mv ${existing} ${sharedClonePath}\`) or remove it and re-run clone_repo to clone there.`,
-        );
+      // When the shared workgroup tree is mounted, repos belong under it so every
+      // sibling sees them (see getReposDir). resolveRepoDir also matches PRIVATE
+      // bedroom clones (/workspace/agent/repos/<name> or the legacy
+      // /workspace/agent/<name>) at lower precedence — handing one of those back
+      // reports success while siblings can't see the checkout. Refuse loudly so the
+      // operator relocates it. Compare by CANONICAL path: a migrated repo can be
+      // exposed via a compat symlink (/workspace/agent/<name> ->
+      // /workspace/workgroup/<name>) whose realpath IS inside the shared tree, so a
+      // raw string compare would wrongly reject it. Only refuse when the realpath
+      // is genuinely OUTSIDE the workgroup tree. Degraded mode — workgroup expected
+      // but not mounted — leaves workgroupDir() absent → gate off → private reuse
+      // still works. (codex #126)
+      const wg = workgroupDir();
+      if (fs.existsSync(wg)) {
+        const wgReal = canonPath(wg);
+        const existingReal = canonPath(existing);
+        const underShared = existingReal === wgReal || existingReal.startsWith(wgReal + path.sep);
+        if (!underShared) {
+          const sharedClonePath = path.join(wg, 'repos', repoName);
+          return err(
+            `Repo '${repoName}' is already cloned at ${existing}, a PRIVATE (bedroom) location, but ` +
+              `the shared workgroup tree (${wg}) is mounted — a private clone is NOT visible to ` +
+              `sibling agents. Refusing to silently reuse it. Move it into the shared tree ` +
+              `(\`mv ${existing} ${sharedClonePath}\`) or remove it and re-run clone_repo to clone there.`,
+          );
+        }
       }
       const origin = tryGit(existing, ['config', '--get', 'remote.origin.url']);
       if (origin !== null && !originsMatch(origin, url)) {

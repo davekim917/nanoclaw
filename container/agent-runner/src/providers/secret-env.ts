@@ -40,3 +40,23 @@ export function buildSecretEnvVarList(): string[] {
     'GMAIL_CREDENTIALS_PATH',
   ];
 }
+
+/**
+ * MCP / header-only secrets: passed to MCP servers as registration-time HTTP
+ * headers (Exa, Braintrust) or short-lived rotating tokens (Granola), and never
+ * needed by a Bash/tool subprocess. BOTH providers must strip these from any
+ * child env they spawn so an unguarded `bash`/`printenv` can't read them — this
+ * is the cross-provider env-hygiene parity bar (Claude via filterSdkEnv, OpenCode
+ * via buildOpencodeServerEnv). Distinct from buildSecretEnvVarList() (the
+ * always-unset auth list, env-derived): this is a fixed, deliberately-curated set.
+ *
+ * Deliberately NOT here: data-tool secrets that bash tools legitimately consume
+ * from env (SNOWFLAKE_PASSWORD, DBT_* tokens, OPENAI_API_KEY, …) — stripping
+ * those would break `snow`/`dbt`/etc. on BOTH providers. Single source of truth;
+ * do not fork this list into an adapter. (codex #126)
+ */
+export const MCP_HEADER_ONLY_SECRET_VARS: readonly string[] = [
+  'GRANOLA_ACCESS_TOKEN',
+  'EXA_API_KEY',
+  'BRAINTRUST_API_KEY',
+];
