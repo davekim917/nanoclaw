@@ -10,6 +10,9 @@ import {
   resolveRepoDir,
   cloneRepoTool,
   createWorktreeTool,
+  gitCommitTool,
+  gitPushTool,
+  openPrTool,
 } from './git-worktrees';
 
 // The advisory shells out to `node <post-commit-verify.cjs>`. Where node is
@@ -287,6 +290,30 @@ describe('getReposDir / resolveRepoDir / clone_repo', () => {
     const res = await createWorktreeTool.handler({ repo: name });
     expect(res.isError).toBe(true);
     expect(res.content[0].text).toContain('different clone');
+  });
+
+  test('test_commit_push_pr_reject_stale_worktree_attachment (codex #126 N5)', async () => {
+    const name = 'svc';
+    const url = 'https://github.com/acme/svc';
+    // Worktree attached to the agent clone...
+    const agentClone = join(agentDir, 'repos', name);
+    initRepoWithOrigin(agentClone, url);
+    execFileSync(
+      'git',
+      ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '--allow-empty', '-m', 'init'],
+      { cwd: agentClone, stdio: 'pipe' },
+    );
+    const worktreeDir = join(root, 'worktrees', name);
+    execFileSync('git', ['worktree', 'add', '-b', 'thread-old', worktreeDir], { cwd: agentClone, stdio: 'pipe' });
+    // ...then a workgroup clone shadows it.
+    initRepoWithOrigin(join(workgroupDir, 'repos', name), url);
+
+    // commit / push / open_pr must all refuse before doing any git/gh work.
+    for (const tool of [gitCommitTool, gitPushTool, openPrTool]) {
+      const res = await tool.handler({ repo: name, message: 'm', title: 't' });
+      expect(res.isError).toBe(true);
+      expect(res.content[0].text).toContain('different clone');
+    }
   });
 
   test('test_clone_nonempty_no_git_dir_errors: non-empty no-.git destination is NOT destroyed', async () => {

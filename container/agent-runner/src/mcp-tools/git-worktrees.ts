@@ -108,6 +108,31 @@ export function resolveRepoDir(name: string): string | null {
   return chosen;
 }
 
+/**
+ * Returns an error message if the worktree at <worktreeDir> is attached to a
+ * DIFFERENT clone than the currently-resolved repo for <repo>, else null. This
+ * catches the shadow case: a worktree created against /workspace/agent/repos/<repo>
+ * once a /workspace/workgroup/repos/<repo> clone appears and resolveRepoDir starts
+ * preferring it — every worktree-operating tool (create_worktree reuse, commit,
+ * push, open_pr) must refuse rather than silently land work in the shadowed clone.
+ * Returns null when there's no resolvable clone or git can't report the common
+ * dir (the caller's own existence checks handle those). (codex #126 N4 + N5)
+ */
+function staleWorktreeAttachmentError(worktreeDir: string, repo: string): string | null {
+  const repoDir = resolveRepoDir(repo);
+  if (!repoDir) return null;
+  const commonDir = tryGit(worktreeDir, ['rev-parse', '--path-format=absolute', '--git-common-dir']);
+  if (commonDir && path.resolve(commonDir) !== path.resolve(repoDir, '.git')) {
+    return (
+      `Worktree at ${worktreeDir} is attached to a different clone (${commonDir}) than the ` +
+      `currently-resolved repo (${path.resolve(repoDir, '.git')}) — a workgroup clone likely now ` +
+      `shadows an older agent clone. Push any wanted work from the old clone, then remove the stale ` +
+      `worktree (\`rm -rf ${worktreeDir}\`) and re-run create_worktree to re-attach it to the current clone.`
+    );
+  }
+  return null;
+}
+
 function log(msg: string): void {
   console.error(`[git-worktrees] ${msg}`);
 }
@@ -439,23 +464,11 @@ export const createWorktreeTool: McpToolDefinition = {
         log(`create_worktree: corrupt worktree at ${worktreeDir}, removing`);
         try { fs.rmSync(worktreeDir, { recursive: true, force: true }); } catch { /* ignore */ }
       } else {
-        // Stale-attachment guard (codex #126 N4): the worktree may be bound to a
-        // DIFFERENT clone than the currently-resolved repoDir — e.g. it was created
-        // against /workspace/agent/repos/<repo> and a workgroup clone at
-        // /workspace/workgroup/repos/<repo> now shadows it (resolveRepoDir prefers
-        // the workgroup copy). Rebasing/operating via repoDir would mix two object
-        // stores. Compare the worktree's git-common-dir to repoDir/.git; on
-        // mismatch refuse with guidance rather than silently acting on the wrong
-        // clone. (No auto-remove — the work lives in the OTHER clone's object store.)
-        const commonDir = tryGit(worktreeDir, ['rev-parse', '--path-format=absolute', '--git-common-dir']);
-        if (commonDir && path.resolve(commonDir) !== path.resolve(repoDir, '.git')) {
-          return err(
-            `Worktree at ${worktreeDir} is attached to a different clone (${commonDir}) than the ` +
-              `currently-resolved repo (${path.resolve(repoDir, '.git')}) — a workgroup clone likely now ` +
-              `shadows an older agent clone. Push any wanted work, then remove the stale worktree ` +
-              `(\`rm -rf ${worktreeDir}\`) and retry create_worktree to re-attach it to the current clone.`,
-          );
-        }
+        // Stale-attachment guard (codex #126 N4): refuse to reuse a worktree bound
+        // to a clone other than the currently-resolved one (workgroup now shadows
+        // the agent clone it was created against) rather than mixing object stores.
+        const staleErr = staleWorktreeAttachmentError(worktreeDir, repo);
+        if (staleErr) return err(staleErr);
         const current = tryGit(worktreeDir, ['rev-parse', '--abbrev-ref', 'HEAD']);
         if (current && current !== branchName) {
           return err(
@@ -605,6 +618,9 @@ export const gitCommitTool: McpToolDefinition = {
     if (!fs.existsSync(path.join(worktreeDir, '.git'))) {
       return err(`Worktree not found: ${repo}. Run create_worktree first.`);
     }
+    // Refuse to commit into a worktree bound to a shadowed clone (codex #126 N5).
+    const staleErr = staleWorktreeAttachmentError(worktreeDir, repo);
+    if (staleErr) return err(staleErr);
 
     // Defensive: clear stale index.lock
     try { fs.unlinkSync(path.join(worktreeDir, '.git', 'index.lock')); } catch { /* ignore */ }
@@ -657,6 +673,10 @@ export const gitPushTool: McpToolDefinition = {
     if (!fs.existsSync(path.join(worktreeDir, '.git'))) {
       return err(`Worktree not found: ${repo}.`);
     }
+    // Refuse to push from a worktree bound to a shadowed clone (codex #126 N5):
+    // pushing would publish the OLD clone's branch, not the resolved clone's.
+    const staleErr = staleWorktreeAttachmentError(worktreeDir, repo);
+    if (staleErr) return err(staleErr);
 
     try {
       const branch = runGit(worktreeDir, ['rev-parse', '--abbrev-ref', 'HEAD']);
@@ -703,6 +723,9 @@ export const openPrTool: McpToolDefinition = {
     if (!fs.existsSync(path.join(worktreeDir, '.git'))) {
       return err(`Worktree not found: ${repo}.`);
     }
+    // Refuse to open a PR from a worktree bound to a shadowed clone (codex #126 N5).
+    const staleErr = staleWorktreeAttachmentError(worktreeDir, repo);
+    if (staleErr) return err(staleErr);
 
     try {
       const url = execFileSync('gh', ['pr', 'create', '--title', title, '--body', body], {
