@@ -86,6 +86,13 @@ const STALE_SESSION_RE =
  * (opencodeAuthProviders reads /opencode-xdg/opencode/auth.json), NOT
  * process.env, so removing these is safe and never breaks model auth.
  *
+ * This INTENTIONALLY includes ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN
+ * (codex #126 F3). An `anthropic/*` OpenCode model must authenticate via
+ * auth.json like every other provider — NOT via the host's Anthropic creds
+ * leaking through process.env. Forwarding the host's Claude-subscription OAuth
+ * token to OpenCode's model traffic is exactly the leak this strip prevents
+ * (and OpenCode 1.3+ can't use that subscription token anyway).
+ *
  * The Claude provider unsets the same vars per-Bash-command (createSanitizeBashHook).
  * OpenCode has no equivalent per-tool hook on its bash path, so we strip once at
  * the server level — broader than Claude's per-command unset, but the outcome is
@@ -452,27 +459,37 @@ async function ensureSharedRuntime(
   if (sharedInit) return sharedInit;
 
   sharedInit = (async () => {
-    if (sharedRuntime) {
-      destroySharedRuntime();
+    try {
+      if (sharedRuntime) {
+        destroySharedRuntime();
+      }
+      const config = buildOpenCodeConfig(options, turn);
+      const { url, proc } = await spawnOpencodeServer(config, cwd);
+      // Also pass `directory` to the SDK client — opencode uses it as a hint
+      // for project-context features (project root, file paths in completions).
+      const client = createOpencodeClient({ baseUrl: url, ...(cwd ? { directory: cwd } : {}) });
+      const sub = await client.event.subscribe();
+      const stream = sub.stream as AsyncGenerator<{ type: string; properties: Record<string, unknown> }, void, void>;
+      sharedRuntime = {
+        proc,
+        client,
+        stream,
+        streamRelease: () => {
+          void stream.return?.(undefined);
+        },
+      };
+      sharedConfigKey = key;
+      return sharedRuntime;
+    } finally {
+      // Clear the in-flight promise on BOTH success and failure. On success the
+      // result is cached in sharedRuntime (line 450 short-circuits next time); on
+      // failure (e.g. buildOpenCodeConfig throws because the guard plugin isn't
+      // mounted yet, or before OPENCODE_ALLOW_UNGUARDED is set) clearing lets a
+      // later turn RE-RUN init instead of replaying the cached rejection forever.
+      // The poll loop survives per-turn errors, so without this the container is
+      // stuck unguarded-broken for its whole life. (codex #126 F5)
+      sharedInit = null;
     }
-    const config = buildOpenCodeConfig(options, turn);
-    const { url, proc } = await spawnOpencodeServer(config, cwd);
-    // Also pass `directory` to the SDK client — opencode uses it as a hint
-    // for project-context features (project root, file paths in completions).
-    const client = createOpencodeClient({ baseUrl: url, ...(cwd ? { directory: cwd } : {}) });
-    const sub = await client.event.subscribe();
-    const stream = sub.stream as AsyncGenerator<{ type: string; properties: Record<string, unknown> }, void, void>;
-    sharedRuntime = {
-      proc,
-      client,
-      stream,
-      streamRelease: () => {
-        void stream.return?.(undefined);
-      },
-    };
-    sharedConfigKey = key;
-    sharedInit = null;
-    return sharedRuntime;
   })();
 
   return sharedInit;

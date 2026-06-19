@@ -818,11 +818,32 @@ function emailActionVerb(command: string): string {
   return gwsSegment.match(/\+(send|reply|reply-all|forward)\b/)?.[1] ?? 'send';
 }
 
+/** A dynamically-imported core verdict is trusted only when its action is a
+ *  known value. Mirrors the codex-runner wellFormedVerdict guard so a malformed
+ *  email-core return can't fall through to allow. */
+function isWellFormedEmailVerdict(v: unknown): v is EmailGateVerdict {
+  const a = (v as { action?: unknown } | null | undefined)?.action;
+  return a === 'allow' || a === 'gate';
+}
+
 export function createEmailGateHook(): HookCallback {
   return async (input) => {
     const pre = input as PreToolUseHookInput;
     const command = (pre.tool_input as { command?: string })?.command;
     if (!command) return {};
+
+    // createSanitizeBashHook runs EARLIER in this chain and rewrites the command
+    // to `unset <secret-vars> 2>/dev/null; <original>` (updatedInput). Strip that
+    // EXACT, reconstructed prefix before evaluating, so a legit `--dry-run`/`--help`
+    // probe isn't gated by the injected `unset …;` — the whole-command bypass would
+    // otherwise read `unset` as the first word + a `;` metachar and refuse the
+    // bypass. Only the precise sanitizer prefix is stripped (reconstructed from the
+    // same buildSecretEnvVarList), never an arbitrary `unset` (which could hide a
+    // `$( … )` send), so it can't smuggle a real send past the gate. (codex #126 F1)
+    const sanitizeVars = buildSecretEnvVarList();
+    const sanitizePrefix = sanitizeVars.length ? `unset ${sanitizeVars.join(' ')} 2>/dev/null; ` : '';
+    const evalCommand =
+      sanitizePrefix && command.startsWith(sanitizePrefix) ? command.slice(sanitizePrefix.length) : command;
 
     // Verdict (allow vs gate + pre-built card) comes from the shared core's
     // evaluateEmailSend; the inline evaluator is the fail-CLOSED fallback when
@@ -833,17 +854,24 @@ export function createEmailGateHook(): HookCallback {
     let verdict: EmailGateVerdict;
     if (coreEvaluator) {
       try {
-        verdict = coreEvaluator(command, { isScheduledTask });
+        const v = coreEvaluator(evalCommand, { isScheduledTask });
+        // A dynamically-imported core can return a malformed verdict (bad shape /
+        // unknown action). Anything that isn't a well-formed allow|gate is
+        // untrusted → fall back to the inline fail-CLOSED evaluator. Without this,
+        // `{action:'bogus'}` / `{}` would hit the non-'gate' branch below and ALLOW
+        // a real send unapproved. (codex #126 F2 — mirrors the codex-runner
+        // verdict-shape guard.)
+        verdict = isWellFormedEmailVerdict(v) ? v : evaluateEmailSendInline(evalCommand, { isScheduledTask });
       } catch {
-        verdict = evaluateEmailSendInline(command, { isScheduledTask });
+        verdict = evaluateEmailSendInline(evalCommand, { isScheduledTask });
       }
     } else {
-      verdict = evaluateEmailSendInline(command, { isScheduledTask });
+      verdict = evaluateEmailSendInline(evalCommand, { isScheduledTask });
     }
 
     if (verdict.action !== 'gate') return {};
 
-    const action = emailActionVerb(command);
+    const action = emailActionVerb(evalCommand);
     const label = verdict.label ?? `Email ${action}`;
     const summary = verdict.summary ?? '';
 

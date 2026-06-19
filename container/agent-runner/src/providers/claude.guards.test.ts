@@ -7,6 +7,7 @@ import {
   createBlockGitCloneHook,
   createEmailGateHook,
 } from './claude.js';
+import { buildSecretEnvVarList } from './secret-env.js';
 import * as messagesOut from '../db/messages-out.js';
 import * as sessionRouting from '../db/session-routing.js';
 import * as deliveryAcks from '../db/delivery-acks.js';
@@ -17,6 +18,7 @@ const STUB_CORE = new URL('./__test-fixtures__/guard-core-stub.ts', import.meta.
 const BROKEN_CORE = new URL('./__test-fixtures__/guard-core-broken.ts', import.meta.url).pathname;
 const THROWING_CORE = new URL('./__test-fixtures__/guard-core-throwing.ts', import.meta.url).pathname;
 const EMAIL_STUB_CORE = new URL('./__test-fixtures__/email-gate-core-stub.ts', import.meta.url).pathname;
+const EMAIL_MALFORMED_CORE = new URL('./__test-fixtures__/email-gate-core-malformed.ts', import.meta.url).pathname;
 
 const EMPTY_CTX = {} as Parameters<HookCallback>[1];
 const EMPTY_OPTS = {} as Parameters<HookCallback>[2];
@@ -484,6 +486,61 @@ describe('E3 createEmailGateHook', () => {
     expect(card!.summary as string).toContain('victim@evil.com');
     expect(ackedRequestId).not.toBeNull();
     expect(r.permissionDecision).toBeUndefined();
+  });
+
+  it('malformed core verdict falls back to inline fail-closed (gates, not allow) — codex #126 F2', async () => {
+    process.env.NANOCLAW_EMAIL_GATE_CORE = EMAIL_MALFORMED_CORE;
+    delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
+    ackToReturn = { status: 'delivered' };
+    // The core returns {action:'bogus'} — untrusted. The hook must NOT treat the
+    // non-'gate' action as allow; it falls back to the inline evaluator, which
+    // gates an interactive real send (card carries the real recipient).
+    const r = await runBashHook(
+      createEmailGateHook(),
+      'gws gmail +send --to victim@evil.com --subject hi --body x',
+    );
+    const card = gateCard();
+    expect(card).toBeDefined(); // gated via inline fallback, NOT allowed
+    expect(card!.summary as string).toContain('victim@evil.com');
+    expect(ackedRequestId).not.toBeNull();
+    expect(r.permissionDecision).toBeUndefined(); // delivered ack → allow after gate
+  });
+
+  it('sanitizer unset-prefix does NOT over-block a real --dry-run (strips exact prefix) — codex #126 F1', async () => {
+    // Reproduce the prod chain: createSanitizeBashHook prepends `unset <vars>
+    // 2>/dev/null; ` before the email gate sees the command. A legit dry-run must
+    // still bypass — the gate strips the exact reconstructed prefix first.
+    const saved = process.env.ANTHROPIC_API_KEY;
+    process.env.ANTHROPIC_API_KEY = 'sk-test'; // ensure buildSecretEnvVarList is non-empty
+    try {
+      process.env.NANOCLAW_EMAIL_GATE_CORE = '/nonexistent/email-gate-core.ts'; // inline path
+      delete process.env.NANOCLAW_IS_SCHEDULED_TASK;
+      const prefix = `unset ${buildSecretEnvVarList().join(' ')} 2>/dev/null; `;
+      // dry-run → bypass (allow, no staging) despite the sanitizer prefix
+      const dry = await runBashHook(
+        createEmailGateHook(),
+        `${prefix}gws gmail +send --to a@b.com --subject hi --body x --dry-run`,
+      );
+      expect(dry.permissionDecision).toBeUndefined();
+      expect(gateCard()).toBeUndefined();
+      expect(ackedRequestId).toBeNull();
+
+      // …but a real (non-dry-run) send behind the same prefix STILL gates: the
+      // strip only removes the known prefix, leaving the real send fully checked.
+      staged.length = 0;
+      ackToReturn = { status: 'delivered' };
+      const real = await runBashHook(
+        createEmailGateHook(),
+        `${prefix}gws gmail +send --to victim@evil.com --subject hi --body x`,
+      );
+      const card = gateCard();
+      expect(card).toBeDefined();
+      expect(card!.summary as string).toContain('victim@evil.com');
+      expect(real.permissionDecision).toBeUndefined();
+    } finally {
+      if (saved === undefined) delete process.env.ANTHROPIC_API_KEY;
+      else process.env.ANTHROPIC_API_KEY = saved;
+    }
   });
 
   it('non-email commands are a no-op (allow, no staging)', async () => {

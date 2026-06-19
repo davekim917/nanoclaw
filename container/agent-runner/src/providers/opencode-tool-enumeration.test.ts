@@ -21,10 +21,16 @@ import type { McpServerConfig } from './types.js';
  *
  * Re-derive with: `opencode serve` + `curl $URL/experimental/tool/ids`.
  *
- * If OpenCode adds a built-in tool, the live list will gain a name this map
- * lacks, and `test_oc_every_tool_classified` FAILS — forcing a human to
- * classify the new capability rather than silently exposing it. That is the
- * point: the inventory cannot rot silently.
+ * LIMITATION — this is a STATIC snapshot, not a live query (codex #126 F4).
+ * Spawning a real `opencode` server in CI to enumerate tools at test time was
+ * deliberately rejected as too heavy (design D13/C7). So this list does NOT
+ * auto-detect a new built-in on an opencode UPGRADE: until someone re-captures
+ * it, `test_oc_every_tool_classified` keeps checking the OLD names and a newly
+ * exposed capability would go unclassified. The mitigation is procedural — this
+ * snapshot is pinned to opencode@1.15.7 and MUST be re-derived (command above)
+ * whenever the opencode version is bumped (the Dockerfile pin is the trigger).
+ * The test catches a stale classification map within a fixed version, not a
+ * version drift; treat the re-capture as part of the opencode upgrade checklist.
  */
 const OPENCODE_BUILTIN_TOOLS = [
   'invalid',
