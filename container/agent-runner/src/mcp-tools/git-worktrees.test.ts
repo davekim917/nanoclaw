@@ -1,6 +1,6 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { execFileSync } from 'child_process';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
@@ -347,5 +347,74 @@ describe('getReposDir / resolveRepoDir / clone_repo', () => {
     const text = res.content[0].text;
     expect(text).not.toContain('Refusing to destroy');
     expect(text).toContain('git clone failed');
+  });
+
+  // --- codex #126 round-5 fixes ------------------------------------------
+
+  test('test_stale_check_symlink_alias_not_false_rejected (codex #126): a worktree on a symlinked repo alias is NOT flagged stale', async () => {
+    // Migration compat symlink: resolveRepoDir returns the symlink alias
+    // (/workspace/agent/<name> -> real clone), but git --git-common-dir reports
+    // the real target. A path.resolve()-only compare would call this "a different
+    // clone" and false-reject every worktree op. canonPath() (realpath) must
+    // reconcile them.
+    const name = 'svc';
+    const url = 'https://github.com/acme/svc';
+    // Real clone living OUTSIDE the agent dir, with a commit + an attached worktree.
+    const realClone = join(root, 'realhome', name);
+    initRepoWithOrigin(realClone, url);
+    execFileSync(
+      'git',
+      ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '--allow-empty', '-m', 'init'],
+      { cwd: realClone, stdio: 'pipe' },
+    );
+    const branch = 'thread-session-svc'; // = defaultBranchName('svc') with no NANOCLAW_SESSION_ID
+    const worktreeDir = join(root, 'worktrees', name);
+    execFileSync('git', ['worktree', 'add', '-b', branch, worktreeDir], { cwd: realClone, stdio: 'pipe' });
+
+    // Legacy candidate-3 path is a SYMLINK to the real clone; no workgroup/private
+    // copies exist, so resolveRepoDir must return the symlink alias itself.
+    symlinkSync(realClone, join(agentDir, name));
+    expect(resolveRepoDir(name)).toBe(join(agentDir, name));
+    // Sanity: the alias really does resolve to the real clone.
+    expect(realpathSync(join(agentDir, name))).toBe(realpathSync(realClone));
+
+    const res = await createWorktreeTool.handler({ repo: name });
+    // The op may no-op/succeed (fetch is offline), but it must NOT mis-fire the
+    // stale-attachment guard. Before the canonPath fix this returned "different clone".
+    expect(res.content[0].text).not.toContain('different clone');
+    expect(res.isError).toBeFalsy();
+  });
+
+  test('test_clone_refuses_private_reuse_when_shared_mounted (codex #126): silent bedroom reuse is rejected', async () => {
+    const name = 'svc';
+    const url = 'https://github.com/acme/svc';
+    // Shared tree IS mounted, but the only existing clone is PRIVATE (bedroom).
+    mkdirSync(workgroupDir, { recursive: true });
+    const privateClone = join(agentDir, 'repos', name);
+    initRepoWithOrigin(privateClone, url);
+    expect(resolveRepoDir(name)).toBe(privateClone); // premise: private resolves
+
+    const res = await cloneRepoTool.handler({ url, name });
+    // Refuse loudly — a private clone is invisible to siblings under shared-FS.
+    expect(res.isError).toBe(true);
+    const text = res.content[0].text;
+    expect(text).toContain('PRIVATE');
+    expect(text).toContain(privateClone);
+    expect(text).toContain(join(workgroupDir, 'repos', name)); // the relocation hint
+  });
+
+  test('test_clone_private_reuse_ok_when_no_shared_tree (codex #126): degraded mode still reuses the bedroom clone', async () => {
+    const name = 'svc';
+    const url = 'https://github.com/acme/svc';
+    // No workgroup mounted (default) — private reuse must still work, gate stays off.
+    expect(existsSync(workgroupDir)).toBe(false);
+    const privateClone = join(agentDir, 'repos', name);
+    initRepoWithOrigin(privateClone, url);
+
+    const res = await cloneRepoTool.handler({ url, name });
+    expect(res.isError).toBeFalsy();
+    const text = res.content[0].text;
+    expect(text).toContain(privateClone);
+    expect(text).not.toContain('PRIVATE'); // the new gate did NOT fire
   });
 });

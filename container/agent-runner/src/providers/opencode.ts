@@ -459,12 +459,20 @@ async function ensureSharedRuntime(
   if (sharedInit) return sharedInit;
 
   sharedInit = (async () => {
+    // Tracks the spawned `opencode serve` child until sharedRuntime takes
+    // ownership. If init throws AFTER spawnOpencodeServer returns a LIVE proc but
+    // BEFORE the sharedRuntime assignment (e.g. client.event.subscribe() rejects),
+    // destroySharedRuntime() can't see this proc — so the finally kills it here.
+    // Without this, every retry leaks another orphaned server process. (codex #126
+    // F5 follow-up)
+    let orphanProc: ChildProcess | undefined;
     try {
       if (sharedRuntime) {
         destroySharedRuntime();
       }
       const config = buildOpenCodeConfig(options, turn);
       const { url, proc } = await spawnOpencodeServer(config, cwd);
+      orphanProc = proc;
       // Also pass `directory` to the SDK client — opencode uses it as a hint
       // for project-context features (project root, file paths in completions).
       const client = createOpencodeClient({ baseUrl: url, ...(cwd ? { directory: cwd } : {}) });
@@ -479,8 +487,15 @@ async function ensureSharedRuntime(
         },
       };
       sharedConfigKey = key;
+      orphanProc = undefined; // ownership transferred to sharedRuntime
       return sharedRuntime;
     } finally {
+      // Kill a spawned-but-unowned server before clearing the in-flight promise.
+      // On the success path orphanProc was reset to undefined above; it is set
+      // here only if init threw between spawn and the sharedRuntime assignment.
+      if (orphanProc) {
+        try { orphanProc.kill('SIGKILL'); } catch { /* ignore */ }
+      }
       // Clear the in-flight promise on BOTH success and failure. On success the
       // result is cached in sharedRuntime (line 450 short-circuits next time); on
       // failure (e.g. buildOpenCodeConfig throws because the guard plugin isn't
