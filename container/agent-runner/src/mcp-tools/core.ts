@@ -23,6 +23,7 @@ const SEND_FILE_MAX_BYTES = 50 * 1024 * 1024; // Slack's own cap is 1GB but most
 const SEND_FILE_ALLOWED_PREFIXES = [
   '/workspace/agent',
   '/workspace/worktrees',
+  '/workspace/workgroup',
   '/workspace/extra',
   '/tmp/',
 ];
@@ -35,8 +36,20 @@ const SEND_FILE_ACK_TIMEOUT_MS = 30_000;
 // lifespan of a turn-chain on the same topic.
 const sentFileHashes = new Map<string, string>();
 
-function isAllowedFilePath(p: string): boolean {
-  return SEND_FILE_ALLOWED_PREFIXES.some((prefix) => p === prefix || p.startsWith(prefix));
+// Exported for unit testing — the prefix set is the security boundary for
+// send_file, so it is asserted directly rather than only through the full
+// send_file path (which short-circuits on a non-existent file before the
+// allowlist check is reached).
+//
+// Match on a path-separator boundary, not bare startsWith, so a prefix-lookalike
+// (e.g. /workspace/workgroup-evil) cannot satisfy /workspace/workgroup. Mirrors
+// poll-loop.ts's isAllowedFileEventPath. `p === prefix` still allows the exact
+// dir itself.
+export function isAllowedFilePath(p: string): boolean {
+  return SEND_FILE_ALLOWED_PREFIXES.some((prefix) => {
+    const boundary = prefix.endsWith(path.sep) ? prefix : `${prefix}${path.sep}`;
+    return p === prefix || p.startsWith(boundary);
+  });
 }
 
 function log(msg: string): void {

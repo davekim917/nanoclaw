@@ -5,12 +5,12 @@
  * send_file) must pick it up so a2a return-path routing on the host can
  * correlate replies back to the originating session.
  */
-import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import { describe, it, test, expect, beforeEach, afterEach } from 'bun:test';
 
 import { initTestSessionDb, closeSessionDb, getInboundDb } from '../db/connection.js';
 import { getUndeliveredMessages } from '../db/messages-out.js';
 import { setCurrentInReplyTo, clearCurrentInReplyTo } from '../current-batch.js';
-import { sendMessage } from './core.js';
+import { sendMessage, isAllowedFilePath } from './core.js';
 
 beforeEach(() => {
   initTestSessionDb();
@@ -84,5 +84,30 @@ describe('send_message MCP tool — default replies in the current conversation'
     expect(out).toHaveLength(1);
     expect(out[0].platform_id).toBe('slack:D0AK1BR5J92');
     expect(out[0].thread_id).toBeNull();
+  });
+});
+
+describe('send_file allowlist (Group G — workgroup shared tree)', () => {
+  test('test_send_file_allows_workgroup: a /workspace/workgroup path is allowed', () => {
+    expect(isAllowedFilePath('/workspace/workgroup/repos/svc/report.png')).toBe(true);
+    expect(isAllowedFilePath('/workspace/workgroup')).toBe(true);
+    // Existing prefixes remain allowed (no regression).
+    expect(isAllowedFilePath('/workspace/agent/x.txt')).toBe(true);
+    expect(isAllowedFilePath('/workspace/worktrees/svc/y.txt')).toBe(true);
+  });
+
+  test('test_send_file_rejects_outside: a path outside all prefixes is rejected', () => {
+    expect(isAllowedFilePath('/etc/passwd')).toBe(false);
+    expect(isAllowedFilePath('/home/node/.codex/auth.json')).toBe(false);
+    expect(isAllowedFilePath('/workspace/secrets')).toBe(false);
+  });
+
+  test('test_send_file_rejects_prefix_lookalike: boundary holds — lookalike rejected, real path allowed', () => {
+    // The matcher uses a path-separator boundary, so a sibling dir that merely
+    // shares the prefix STRING does not satisfy the allowlist.
+    expect(isAllowedFilePath('/workspace/workgroup-evil/x')).toBe(false);
+    expect(isAllowedFilePath('/workspace/agentXYZ/secret')).toBe(false);
+    // ...while the genuine prefixed path still passes.
+    expect(isAllowedFilePath('/workspace/workgroup/x')).toBe(true);
   });
 });

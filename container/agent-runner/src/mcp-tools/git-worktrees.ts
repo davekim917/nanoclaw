@@ -21,23 +21,93 @@ import path from 'path';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
-const AGENT_DIR = '/workspace/agent';
-const WORKTREES_DIR = '/workspace/worktrees';
-// Cloned repos live under /workspace/agent/repos/<name> so they stay namespaced
-// away from the agent's bedroom files, and a single `repos/` rule can gitignore
-// them in the groups repo. Legacy clones at /workspace/agent/<name> are still
-// resolved for backward-compat until migrated.
-const REPOS_DIR = `${AGENT_DIR}/repos`;
+// Base dirs are resolved through these helpers (not module consts) so a single
+// override surface — the NANOCLAW_*_DIR_OVERRIDE env vars — can repoint them for
+// tests without touching `/workspace`. Production never sets the overrides, so
+// the canonical container paths apply unchanged.
+function agentDir(): string {
+  return process.env.NANOCLAW_AGENT_DIR_OVERRIDE || '/workspace/agent';
+}
+function worktreesDir(): string {
+  return process.env.NANOCLAW_WORKTREES_DIR_OVERRIDE || '/workspace/worktrees';
+}
+function workgroupDir(): string {
+  return process.env.NANOCLAW_WORKGROUP_DIR_OVERRIDE || '/workspace/workgroup';
+}
 
-/** Resolve an existing cloned-repo dir for <name>: prefer the namespaced
- *  /workspace/agent/repos/<name>, fall back to the legacy /workspace/agent/<name>.
- *  Returns null if neither is a real git clone. */
-function resolveRepoDir(name: string): string | null {
-  const namespaced = path.join(REPOS_DIR, name);
-  if (fs.existsSync(path.join(namespaced, '.git'))) return namespaced;
-  const legacy = path.join(AGENT_DIR, name);
-  if (fs.existsSync(path.join(legacy, '.git'))) return legacy;
-  return null;
+const WORKTREES_DIR = worktreesDir();
+
+/**
+ * Resolve where new clones land. Cloned repos live under `<base>/repos/<name>`
+ * so they stay namespaced away from the agent's bedroom files and a single
+ * `repos/` rule can gitignore them.
+ *
+ * Destination preference:
+ * - If the shared workgroup tree is mounted (`/workspace/workgroup` exists),
+ *   clone into `/workspace/workgroup/repos` so every sibling in the workgroup
+ *   shares one checkout (the "house"). This is the default when shared-FS is on.
+ * - Otherwise clone into the private `/workspace/agent/repos` (the "bedroom").
+ *
+ * Fail-loud on expected-but-missing: if `NANOCLAW_WORKGROUP_ID` is set (the
+ * agent_group HAS a workgroup) but `/workspace/workgroup` is absent, the mount
+ * failed. We must NOT silently fall back to a private clone — that would split
+ * the workgroup's shared tree and hide a real misconfiguration. Log loudly and
+ * still return the private dir so the operation can proceed degraded, but the
+ * warning is the signal the operator must act on.
+ */
+export function getReposDir(): string {
+  const wg = workgroupDir();
+  if (fs.existsSync(wg)) return path.join(wg, 'repos');
+
+  if (process.env.NANOCLAW_WORKGROUP_ID) {
+    log(
+      `WARNING: NANOCLAW_WORKGROUP_ID is set (${process.env.NANOCLAW_WORKGROUP_ID}) but ${wg} ` +
+        `is not mounted — the workgroup shared tree is missing. NOT cloning into the shared ` +
+        `tree; falling back to the private ${agentDir()}/repos. This is a mount failure: clones ` +
+        `will NOT be visible to sibling agents. Check the workgroup-shared-FS mount on the host.`,
+    );
+  }
+  return path.join(agentDir(), 'repos');
+}
+
+/**
+ * Resolve an existing cloned-repo dir for <name>, highest precedence first:
+ *   1. workgroup shared repos: `/workspace/workgroup/repos/<name>`
+ *   2. namespaced private repos: `/workspace/agent/repos/<name>`
+ *   3. legacy private root:      `/workspace/agent/<name>`
+ * Returns null if none is a real git clone.
+ *
+ * Same-name shadow guard: if a real clone of <name> exists in more than one of
+ * these locations, the higher-precedence one wins, but we log a warning (no
+ * silent shadow) — and, when both clones expose an `origin` URL, note whether
+ * they disagree so an operator can spot a divergent shared/private checkout.
+ */
+export function resolveRepoDir(name: string): string | null {
+  const candidates = [
+    path.join(workgroupDir(), 'repos', name),
+    path.join(agentDir(), 'repos', name),
+    path.join(agentDir(), name),
+  ];
+  const matches = candidates.filter((dir) => fs.existsSync(path.join(dir, '.git')));
+  if (matches.length === 0) return null;
+
+  const chosen = matches[0];
+  if (matches.length > 1) {
+    const shadowed = matches.slice(1);
+    const chosenOrigin = tryGit(chosen, ['config', '--get', 'remote.origin.url']);
+    const originNote = shadowed
+      .map((dir) => {
+        const o = tryGit(dir, ['config', '--get', 'remote.origin.url']);
+        const mismatch = chosenOrigin && o && o !== chosenOrigin ? ' [ORIGIN MISMATCH]' : '';
+        return `${dir}${mismatch}`;
+      })
+      .join(', ');
+    log(
+      `WARNING: repo '${name}' exists in multiple locations — using higher-precedence ` +
+        `${chosen}, shadowing: ${originNote}. Remove the stale copy to avoid confusion.`,
+    );
+  }
+  return chosen;
 }
 
 function log(msg: string): void {
@@ -67,6 +137,22 @@ function tryGit(cwd: string, args: string[], timeoutMs = 30_000): string | null 
   } catch {
     return null;
   }
+}
+
+/**
+ * Compare two git remote URLs for "same repo" up to trivial differences a real
+ * clone introduces: a trailing `.git`, a trailing slash, and case in the host.
+ * Intentionally conservative — it only normalizes cosmetic suffixes, so a
+ * genuinely different owner/repo still reads as a mismatch.
+ */
+function normalizeOrigin(u: string): string {
+  return u
+    .trim()
+    .replace(/\.git$/i, '')
+    .replace(/\/+$/, '');
+}
+function originsMatch(a: string, b: string): boolean {
+  return normalizeOrigin(a) === normalizeOrigin(b);
 }
 
 function validateRepoName(repo: string): string | null {
@@ -178,7 +264,7 @@ export const cloneRepoTool: McpToolDefinition = {
   tool: {
     name: 'clone_repo',
     description:
-      'Clone a GitHub repo into this agent group at /workspace/agent/repos/<name>. Idempotent: returns the existing path if the repo is already cloned. Use this INSTEAD of `git clone` — direct git clone is not set up with credentials.',
+      'Clone a GitHub repo into this agent group. Lands in the shared workgroup tree (/workspace/workgroup/repos/<name>) when it is mounted, otherwise the private /workspace/agent/repos/<name>. Idempotent: returns the existing path if the repo is already cloned (origin must match). Use this INSTEAD of `git clone` — direct git clone is not set up with credentials.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -208,21 +294,69 @@ export const cloneRepoTool: McpToolDefinition = {
     const nameErr = validateRepoName(repoName);
     if (nameErr) return err(nameErr);
 
-    // Idempotent: reuse an existing real clone (namespaced repos/ or legacy root).
+    // Idempotent: reuse an existing real clone (workgroup/repos, namespaced
+    // private repos/, or legacy root) — but only when its origin matches the
+    // requested URL. A same-name dir pointing at a DIFFERENT origin is not the
+    // repo the caller asked for; silently returning it would hand back the
+    // wrong code, so error out and let the operator resolve the collision.
     const existing = resolveRepoDir(repoName);
     if (existing) {
+      const origin = tryGit(existing, ['config', '--get', 'remote.origin.url']);
+      if (origin !== null && !originsMatch(origin, url)) {
+        return err(
+          `Repo '${repoName}' already exists at ${existing} but its origin (${origin}) does not ` +
+            `match the requested URL (${url}). Refusing to reuse a mismatched clone. Use a ` +
+            `different name, or remove the existing clone first.`,
+        );
+      }
+      if (origin === null) {
+        // The existing clone has NO origin remote, so it cannot be verified
+        // against — or fetch/push to — the requested URL. It may be a partial
+        // clone or an operator-placed local-only repo, not the repo the caller
+        // asked for. Don't silently pass it off as a match: reuse it
+        // (non-destructive — a conservative error would break legit local-only
+        // repos) but surface the mismatch LOUDLY so it's resolvable (S-QA1).
+        log(
+          `clone_repo: WARNING — ${repoName} at ${existing} has NO origin remote; ` +
+            `reusing as-is, but it may not match ${url}`,
+        );
+        return ok(
+          `Repo already present at ${existing}, but it has NO 'origin' remote — it cannot be ` +
+            `verified against or fetch/push to the requested URL (${url}). Reusing it as-is. ` +
+            `If this is the wrong repo, remove ${existing} or clone under a different name.`,
+        );
+      }
       log(`clone_repo: ${repoName} already exists at ${existing} (idempotent)`);
       return ok(`Repo already present at ${existing}`);
     }
 
-    const destDir = path.join(REPOS_DIR, repoName);
-    // A prior failed clone can leave an empty dir behind (no .git), which would
-    // break create_worktree downstream — clear it before re-cloning.
+    const reposDir = getReposDir();
+    const destDir = path.join(reposDir, repoName);
+    // A prior failed clone can leave a dir behind with no .git, which would
+    // break create_worktree downstream. Only auto-clear it if it is EMPTY — a
+    // non-empty no-.git dir may hold real files (a partial clone, or something
+    // an operator placed there) and we must never blindly destroy it. Surface
+    // an error instead so the caller decides.
     if (fs.existsSync(destDir)) {
-      log(`clone_repo: ${destDir} exists but has no .git — removing and re-cloning`);
-      try { fs.rmSync(destDir, { recursive: true, force: true }); } catch { /* ignore */ }
+      let entries: string[];
+      try {
+        entries = fs.readdirSync(destDir);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return err(`Cannot inspect existing path ${destDir}: ${msg}`);
+      }
+      if (entries.length === 0) {
+        log(`clone_repo: ${destDir} is an empty no-.git dir — clearing before clone`);
+        try { fs.rmSync(destDir, { recursive: true, force: true }); } catch { /* ignore */ }
+      } else {
+        return err(
+          `Destination ${destDir} already exists, is not a git clone, and is not empty ` +
+            `(${entries.length} entr${entries.length === 1 ? 'y' : 'ies'}). Refusing to destroy it. ` +
+            `Remove it manually or choose a different name, then retry.`,
+        );
+      }
     }
-    try { fs.mkdirSync(REPOS_DIR, { recursive: true }); } catch { /* ignore */ }
+    try { fs.mkdirSync(reposDir, { recursive: true }); } catch { /* ignore */ }
 
     try {
       execFileSync('git', ['clone', url, destDir], { stdio: 'pipe', timeout: 120_000 });

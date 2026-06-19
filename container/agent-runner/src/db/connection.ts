@@ -229,6 +229,7 @@ export function initTestSessionDb(): { inbound: Database; outbound: Database } {
       message_out_id      TEXT PRIMARY KEY,
       platform_message_id TEXT,
       status              TEXT NOT NULL DEFAULT 'delivered',
+      error               TEXT,
       delivered_at        TEXT NOT NULL
     );
     CREATE TABLE destinations (

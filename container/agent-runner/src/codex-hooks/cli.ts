@@ -8,8 +8,10 @@
  * Reads JSON from stdin, dispatches to the appropriate hook chain in
  * `./runner.ts`, writes the decision JSON to stdout, exits 0.
  *
- * On parse / runtime error, writes a diagnostic to stderr and exits
- * non-zero — Codex treats hook failure as soft (does not block the tool).
+ * Error policy: a malformed-stdin / unknown-event error exits 2 (Codex treats
+ * exit 2 as a block). A runtime error from the hook chain FAILS CLOSED for
+ * PreToolUse (emits a deny decision) and soft-continues for PostToolUse — see
+ * the catch in main().
  */
 import { runHookForCodex, type HookEvent, type CodexHookInput } from './runner.js';
 
@@ -40,7 +42,27 @@ async function main(): Promise<void> {
     process.stdout.write(JSON.stringify(result));
   } catch (err) {
     process.stderr.write(`[codex-hook] runtime error in ${eventArg}: ${err instanceof Error ? err.message : String(err)}\n`);
-    // Soft fail: don't block the tool call on hook error.
+    // Fail CLOSED for PreToolUse (C4): a guard chain that throws must DENY the
+    // tool, never silently allow it. A bare `{continue:true}` here is fail-OPEN
+    // — Codex treats continue:true + exit 0 as "run the tool", so a thrown guard
+    // exception (a malformed core verdict, or an approval-DB failure in the email
+    // gate) would let a gated destructive/email action proceed unguarded.
+    // PostToolUse is advisory (the tool already ran) → keep it soft so a
+    // post-hook error doesn't wedge the session.
+    if (eventArg === 'PreToolUse') {
+      process.stdout.write(
+        JSON.stringify({
+          hookSpecificOutput: {
+            hookEventName: 'PreToolUse',
+            permissionDecision: 'deny',
+            permissionDecisionReason:
+              'BLOCKED: guard hook errored — denying for safety. Report this rather than retrying.',
+          },
+        }),
+      );
+      process.exit(0);
+    }
+    // Soft fail for PostToolUse only.
     process.stdout.write(JSON.stringify({ continue: true }));
     process.exit(0);
   }

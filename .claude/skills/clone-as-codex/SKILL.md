@@ -588,6 +588,26 @@ Trunk ships a `pnpm patch` on `@chat-adapter/discord` (`patches/@chat-adapter__d
 
 For sibling collab to work in Discord, both bots must be loaded in the same host process (which is the default — both `DISCORD_BOT_TOKEN` and `DISCORD_BOT_TOKEN_<SUFFIX>` are read at startup). A third-party Discord bot in the same guild (e.g. MEE6, a webhook bot) is NOT in the allowlist, so its messages do not wake any NanoClaw agent. Operators with chatty third-party bots may want a custom allowlist; today the boundary is "bots my host loaded = trusted."
 
+## Guard parity contract
+
+The three providers (Claude, Codex, OpenCode) are **one team that must be at command-guard parity by construction** — same guards, same fail-closed behavior, enforced by a shared guard core plus a machine-checked conformance/dispatch test suite. Cloning a group as Codex is not "done" when the bot replies; it's done when the Codex sibling's guard wiring satisfies the contract below. This generalizes — see `.claude/skills/clone-as-provider-template/SKILL.md` for the provider-agnostic form.
+
+### The contract — what "done" means for a Codex sibling
+
+1. **Every command guard routes through the shared core — no inline policy copies.** The guard set is: **self-approval**, **snowflake-connector**, **email-gate**, **git-clone destination**, **destructive bash/SQL**, and **file-protection** (edits to `.env` / lockfiles / `.git` / terraform). The decision logic lives in the shared cores, one place per concern: `block-destructive-core.ts` (`evaluateBashCommand`, `evaluateGitCloneDestination`, `evaluateSelfApproval`, `evaluateSnowflakeConnector`, `consumeGateApproval`, `runNanoclawGate`, `IS_NANOCLAW`) owns destructive / git-clone / self-approval / snowflake; `email-gate-core.ts` owns the email-gate verdict; `file-protection-core.ts` (`EDIT_TOOLS`, `checkEditProtection`) owns file-protection. An adapter owns only its own I/O surface (how it reads the tool call, how it emits a deny); it must never re-implement a verdict. The Codex sibling has **two** adapter surfaces, both of which route to the same cores:
+   - **Host / interactive `codex`** — `workflow-agents/hooks/codex-guard.ts`, wired via `~/.codex/hooks.json`, emits a stdout-JSON `permissionDecision: 'deny'`.
+   - **Container / `codex app-server`** — the agent-runner's `container/agent-runner/src/codex-hooks/runner.ts` (`runPreToolUseChain`), which imports the vendored cores via `loadGuardCore` + `loadFileProtectionCore`. This is wired into the codex hook surface that **provably fires** in-container — the same path the email-gate, self-approval, snowflake, git-clone, and sanitize hooks ride.
+
+2. **Fail closed when the guard core is absent or malformed.** A sibling is only at parity when, for **both** container-side loaders (`loadGuardCore` and `loadFileProtectionCore`), an absent or malformed core denies rather than silently allows: validate that the imported module actually exposes the expected exports (don't bare-cast the dynamic `import()` to the core type), and wrap each evaluator call so an exception maps to **deny**, not a thrown-through crash that the outer try/catch turns into an allow. The gate path already fails closed when there is no session-DB approval surface (`IS_NANOCLAW === false` → deny); the absent/malformed-core case must follow the same posture.
+
+3. **Pass the machine-checked suite — that gate IS the definition of done.** Two layers:
+   - **Cross-surface conformance** — `conformance.test.ts` is the single readable manifest of expected verdicts for the canonical destructive / git-clone / file-protection set. If it holds, every surface that imports the same cores agrees by construction.
+   - **Per-adapter dispatch coverage** — each adapter has a co-located test that confirms it maps the core verdict faithfully to its own I/O. For the Codex container adapter that is `runner.test.ts` (`runPreToolUseChain` blocks/denies the canonical set, fails closed on the no-session gate path, passes non-Bash tools through). A Codex sibling is shipped only when conformance **and** the Codex dispatch-coverage test are green.
+
+### C6 caveat — `codex exec` sub-delegation fires no hooks
+
+`codex exec` sub-delegations run with **no** PreToolUse hooks at all — neither the plugin hook system nor `~/.codex/hooks.json` fire on that path (verified empirically: a plugin-declared PreToolUse never ran; `eval` executed unblocked; zero hook artifacts across container sessions). So on the `codex exec` path the guard set is **instruction-only** (the rule is stated in `container/CLAUDE.md` and followed by convention), and there is **no hook-parity claim** to make there. This is a property of Codex's runtime, not a wiring bug — do not file it as drift. Hook-enforced parity covers interactive `codex` (host) and `codex app-server` (container); the `exec` sub-agent path is convention-enforced only.
+
 ## Future work — captured for later, not in scope today
 
 ### 1. Flip primary provider (Claude-nerf resilience)
