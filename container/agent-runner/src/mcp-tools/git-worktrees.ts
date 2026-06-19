@@ -23,6 +23,22 @@ import type { McpToolDefinition } from './types.js';
 
 const AGENT_DIR = '/workspace/agent';
 const WORKTREES_DIR = '/workspace/worktrees';
+// Cloned repos live under /workspace/agent/repos/<name> so they stay namespaced
+// away from the agent's bedroom files, and a single `repos/` rule can gitignore
+// them in the groups repo. Legacy clones at /workspace/agent/<name> are still
+// resolved for backward-compat until migrated.
+const REPOS_DIR = `${AGENT_DIR}/repos`;
+
+/** Resolve an existing cloned-repo dir for <name>: prefer the namespaced
+ *  /workspace/agent/repos/<name>, fall back to the legacy /workspace/agent/<name>.
+ *  Returns null if neither is a real git clone. */
+function resolveRepoDir(name: string): string | null {
+  const namespaced = path.join(REPOS_DIR, name);
+  if (fs.existsSync(path.join(namespaced, '.git'))) return namespaced;
+  const legacy = path.join(AGENT_DIR, name);
+  if (fs.existsSync(path.join(legacy, '.git'))) return legacy;
+  return null;
+}
 
 function log(msg: string): void {
   console.error(`[git-worktrees] ${msg}`);
@@ -162,7 +178,7 @@ export const cloneRepoTool: McpToolDefinition = {
   tool: {
     name: 'clone_repo',
     description:
-      'Clone a GitHub repo into this agent group at /workspace/agent/<name>. Idempotent: returns the existing path if the repo is already cloned. Use this INSTEAD of `git clone` — direct git clone is not set up with credentials.',
+      'Clone a GitHub repo into this agent group at /workspace/agent/repos/<name>. Idempotent: returns the existing path if the repo is already cloned. Use this INSTEAD of `git clone` — direct git clone is not set up with credentials.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -192,19 +208,21 @@ export const cloneRepoTool: McpToolDefinition = {
     const nameErr = validateRepoName(repoName);
     if (nameErr) return err(nameErr);
 
-    const destDir = path.join(AGENT_DIR, repoName);
+    // Idempotent: reuse an existing real clone (namespaced repos/ or legacy root).
+    const existing = resolveRepoDir(repoName);
+    if (existing) {
+      log(`clone_repo: ${repoName} already exists at ${existing} (idempotent)`);
+      return ok(`Repo already present at ${existing}`);
+    }
 
-    // Idempotent only if it's a *real* clone — a prior failed clone can leave
-    // an empty dir behind, which would silently falsely return success here
-    // and then break create_worktree downstream.
+    const destDir = path.join(REPOS_DIR, repoName);
+    // A prior failed clone can leave an empty dir behind (no .git), which would
+    // break create_worktree downstream — clear it before re-cloning.
     if (fs.existsSync(destDir)) {
-      if (fs.existsSync(path.join(destDir, '.git'))) {
-        log(`clone_repo: ${repoName} already exists at ${destDir} (idempotent)`);
-        return ok(`Repo already present at ${destDir}`);
-      }
       log(`clone_repo: ${destDir} exists but has no .git — removing and re-cloning`);
       try { fs.rmSync(destDir, { recursive: true, force: true }); } catch { /* ignore */ }
     }
+    try { fs.mkdirSync(REPOS_DIR, { recursive: true }); } catch { /* ignore */ }
 
     try {
       execFileSync('git', ['clone', url, destDir], { stdio: 'pipe', timeout: 120_000 });
@@ -241,8 +259,8 @@ export const createWorktreeTool: McpToolDefinition = {
     const nameErr = validateRepoName(repo);
     if (nameErr) return err(nameErr);
 
-    const repoDir = path.join(AGENT_DIR, repo);
-    if (!fs.existsSync(repoDir) || !fs.existsSync(path.join(repoDir, '.git'))) {
+    const repoDir = resolveRepoDir(repo);
+    if (!repoDir) {
       return err(`Repo not found in agent group: ${repo}. Run clone_repo first.`);
     }
 

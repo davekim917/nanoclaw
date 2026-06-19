@@ -716,20 +716,50 @@ export function createEmailGateHook(): HookCallback {
 // ANYWHERE alongside `git clone`, regardless of segment order. False
 // positives (e.g. `git clone /tmp/x && echo /workspace/agent exists`)
 // are acceptable — the agent can rephrase.
+// Inline policy is a fail-CLOSED FALLBACK only. The single source of truth is
+// the shared guard core (block-destructive-core.ts) — the same module the
+// OpenCode plugin and the Codex runner consume — so all three providers enforce
+// one policy with no drift. We dynamic-import it from the mounted bootstrap
+// plugin (bun caches the module). If the mount is absent (e.g. unit tests), we
+// fall back to these inline regexes so Claude never silently fails open.
 const GIT_CLONE_RE = /\bgit\s+clone\b/;
 const MANAGED_DIR_RE = /\/workspace\/(?:agent|worktrees|global|extra|thread|plugins)\b/;
+const GIT_CLONE_BLOCK_MSG =
+  '`git clone` with any reference to /workspace/{agent,worktrees,...} is blocked. Use the `create_worktree` MCP tool for a managed worktree under /workspace/worktrees/<repo>, or `clone_repo` to add a repo to the agent group (it lands under /workspace/agent/repos/<name>). If the clone is ephemeral, keep the entire command within /tmp.';
+
+const GIT_CLONE_CORE_PATH =
+  '/workspace/plugins/bootstrap/plugins/workflow-agents/hooks/guards/block-destructive-core.ts';
+type GitCloneEvaluator = (command: string) => { action: 'allow' | 'block' | 'gate'; reason?: string };
+let _gitCloneEvaluator: GitCloneEvaluator | null | undefined;
+
+async function loadGitCloneEvaluator(): Promise<GitCloneEvaluator | null> {
+  if (_gitCloneEvaluator !== undefined) return _gitCloneEvaluator;
+  try {
+    const core = (await import(GIT_CLONE_CORE_PATH)) as { evaluateGitCloneDestination?: GitCloneEvaluator };
+    _gitCloneEvaluator =
+      typeof core.evaluateGitCloneDestination === 'function' ? core.evaluateGitCloneDestination : null;
+  } catch {
+    _gitCloneEvaluator = null;
+  }
+  return _gitCloneEvaluator;
+}
 
 export function createBlockGitCloneHook(): HookCallback {
   return async (input) => {
     const pre = input as PreToolUseHookInput;
     const command = (pre.tool_input as { command?: string })?.command;
     if (!command) return {};
-    if (!GIT_CLONE_RE.test(command)) return {};
-    if (MANAGED_DIR_RE.test(command)) {
-      return denyBash(
-        '`git clone` with any reference to /workspace/{agent,worktrees,...} is blocked. Use the `create_worktree` MCP tool for a managed worktree under /workspace/worktrees/<repo>, or `clone_repo` to add a repo to the agent group. If the clone is ephemeral, keep the entire command within /tmp.',
-      );
+
+    const evaluator = await loadGitCloneEvaluator();
+    if (evaluator) {
+      const verdict = evaluator(command);
+      if (verdict.action === 'block') return denyBash(verdict.reason ?? GIT_CLONE_BLOCK_MSG);
+      return {};
     }
+
+    // Fallback: shared core unavailable — apply the inline policy, fail-closed.
+    if (!GIT_CLONE_RE.test(command)) return {};
+    if (MANAGED_DIR_RE.test(command)) return denyBash(GIT_CLONE_BLOCK_MSG);
     // Allow pure /tmp-only clones (tool installs, scratch builds).
     return {};
   };

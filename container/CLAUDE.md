@@ -151,7 +151,7 @@ The `conversations/` folder in your workspace holds searchable transcripts of pa
 3. `git_commit({ repo: "REPO-NAME", message: "feat: description" })` — stage + commit
 4. `git_push({ repo: "REPO-NAME" })` — push branch to origin. Pass `force: true` only when `create_worktree` warned about a rewrite.
 5. `open_pr({ repo: "REPO-NAME", title: "...", body: "..." })` — create a GitHub PR
-6. NEVER run `git clone` — it is blocked. Use `create_worktree` for existing repos or `clone_repo` for new ones.
+6. NEVER run `git clone` into the workspace — it is blocked (hook-enforced for all providers). Use `create_worktree` for existing repos or `clone_repo` for new ones. `clone_repo` lands the repo under `/workspace/agent/repos/<name>` (a dedicated, gitignored namespace — keep clones there, not at the agent-dir root). This rule holds even when running under `codex exec`, which fires no hooks: do not `git clone` into `/workspace/{agent,worktrees,...}` there either; use the MCP tools.
 7. On thread resume, check `/workspace/worktrees/` for prior work from this session.
 8. If you do not commit explicitly, the host auto-commits all dirty worktrees on session exit.
 
