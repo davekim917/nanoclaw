@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'bun:test';
 
+import * as fs from 'fs';
 import { mcpServersToOpenCodeConfig } from './mcp-to-opencode.js';
 // SINGLE SOURCE: the Claude SDK-disallowed tool names are imported from the
 // Claude provider, never copied here (D15). If that list grows, this test must
@@ -8,30 +9,37 @@ import { SDK_DISALLOWED_TOOLS } from './claude.js';
 import type { McpServerConfig } from './types.js';
 
 /**
- * OpenCode's built-in tool inventory, captured from the LIVE installed binary
- * (opencode@1.15.7) — NOT from memory or the SDK types (which model the tool set
- * as a dynamic `[key: string]: boolean` map, so they don't enumerate names).
+ * OpenCode's built-in tool inventory, captured from the LIVE binary at the
+ * version the container actually pins — **opencode@1.17.7** (container/Dockerfile
+ * `ARG OPENCODE_VERSION`) — NOT from memory or the SDK types (which model the
+ * tool set as a dynamic `[key: string]: boolean` map, so they don't enumerate
+ * names). Keep OPENCODE_CAPTURED_VERSION below in lock-step with that ARG.
  *
- * Source of truth, reproducible:
- *   1. `opencode debug agent build|general|plan` → the `tools` object keys
- *      (per-agent enable/disable, but the NAMES are the built-in registry).
+ * Source of truth, reproducible (run against the PINNED version):
+ *   1. `npx opencode-ai@<pinned> debug agent build|general|plan` → the `tools`
+ *      object keys (per-agent enable/disable, but the NAMES are the registry).
  *   2. The running server's `GET /experimental/tool/ids` endpoint, which
  *      returns the canonical built-in tool-id array — the superset used here
  *      (it adds `websearch` + `apply_patch` over the per-agent `tools` dict).
  *
- * Re-derive with: `opencode serve` + `curl $URL/experimental/tool/ids`.
+ * Re-derive with: `npx opencode-ai@<pinned> serve --port 0` + `curl $URL/experimental/tool/ids`.
+ * (Verified 2026-06-19: the 1.17.7 list is identical to the prior 1.15.7 capture
+ * — no built-in was added or renamed across that bump.)
  *
  * LIMITATION — this is a STATIC snapshot, not a live query (codex #126 F4).
  * Spawning a real `opencode` server in CI to enumerate tools at test time was
- * deliberately rejected as too heavy (design D13/C7). So this list does NOT
- * auto-detect a new built-in on an opencode UPGRADE: until someone re-captures
- * it, `test_oc_every_tool_classified` keeps checking the OLD names and a newly
- * exposed capability would go unclassified. The mitigation is procedural — this
- * snapshot is pinned to opencode@1.15.7 and MUST be re-derived (command above)
- * whenever the opencode version is bumped (the Dockerfile pin is the trigger).
- * The test catches a stale classification map within a fixed version, not a
- * version drift; treat the re-capture as part of the opencode upgrade checklist.
+ * deliberately rejected as too heavy (design D13/C7), and opencode isn't an
+ * agent-runner npm dep so it isn't even present in the `bun test` CI env. So
+ * this list does NOT auto-detect a new built-in on an opencode UPGRADE: until
+ * someone re-captures it, `test_oc_every_tool_classified` keeps checking the OLD
+ * names. The mitigation is procedural and now self-checking: OPENCODE_CAPTURED_VERSION
+ * is asserted against the Dockerfile `OPENCODE_VERSION` ARG below, so a version
+ * bump that forgets to re-capture FAILS this test (turning a silent drift into a
+ * loud one). Re-deriving the list is part of the opencode upgrade checklist.
  */
+// Lock-step with container/Dockerfile `ARG OPENCODE_VERSION`. Bump BOTH together
+// and re-derive OPENCODE_BUILTIN_TOOLS from the new binary (see above).
+const OPENCODE_CAPTURED_VERSION = '1.17.7';
 const OPENCODE_BUILTIN_TOOLS = [
   'invalid',
   'question',
@@ -150,6 +158,20 @@ describe('OpenCode tool enumeration — classify-or-fail (F4)', () => {
     nanoclaw: { type: 'stdio', command: 'node', args: ['nanoclaw-mcp.js'] },
     granola: { type: 'http', url: 'https://granola.example/mcp' },
   };
+
+  it('test_oc_snapshot_matches_pinned_dockerfile_version: the captured version tracks OPENCODE_VERSION (codex #126 F4)', () => {
+    // Turn the silent drift Codex flagged into a LOUD failure: if the Dockerfile
+    // bumps OPENCODE_VERSION without re-deriving OPENCODE_BUILTIN_TOOLS (and
+    // bumping OPENCODE_CAPTURED_VERSION to match), this test fails — forcing the
+    // re-capture rather than letting the snapshot silently lag the real binary.
+    const dockerfile = fs.readFileSync(
+      new URL('../../../Dockerfile', import.meta.url).pathname,
+      'utf-8',
+    );
+    const m = dockerfile.match(/ARG\s+OPENCODE_VERSION=([\w.-]+)/);
+    expect(m, 'Dockerfile must declare ARG OPENCODE_VERSION').not.toBeNull();
+    expect(m![1]).toBe(OPENCODE_CAPTURED_VERSION);
+  });
 
   it('test_oc_exposes_no_denied_builtin: none of the 9 SDK_DISALLOWED_TOOLS names appear in OpenCode built-ins', () => {
     // Absence = parity with the Claude block surface (D-D / M3). OpenCode's
