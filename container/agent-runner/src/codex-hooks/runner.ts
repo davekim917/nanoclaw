@@ -208,10 +208,15 @@ async function runDestructiveGuard(
   // gate
   const reason = verdict.reason ?? 'requires approval';
   try {
-    if (core.consumeGateApproval(command)) {
+    // STRICT boolean: a malformed core could return a truthy non-boolean ({}, a
+    // non-empty string) — only an exact `true` counts as "already approved".
+    // Anything else falls through to real gate staging (fail-closed). (codex #126 N1)
+    if (core.consumeGateApproval(command) === true) {
       const post = core.evaluateBashCommand(command, { skipGate: true });
       if (!wellFormedVerdict(post)) return denyDecision(`${reason} — malformed post-approval verdict, denying for safety.`);
-      return post.action === 'block' ? denyDecision(post.reason ?? reason) : null;
+      // Only an explicit `allow` passes. A repeated `gate` (a stale/malformed core
+      // that ignored skipGate) must NOT become an allow — deny it. (codex #126 N2)
+      return post.action === 'allow' ? null : denyDecision(post.reason ?? reason);
     }
     if (core.IS_NANOCLAW) {
       let staged = true;
@@ -222,7 +227,9 @@ async function runDestructiveGuard(
       if (decision === 'approved') {
         const post = core.evaluateBashCommand(command, { skipGate: true });
         if (!wellFormedVerdict(post)) return denyDecision(`${reason} — malformed post-approval verdict, denying for safety.`);
-        return post.action === 'block' ? denyDecision(post.reason ?? reason) : null;
+        // Only an explicit `allow` passes — a repeated `gate` after approval (stale
+        // core ignoring skipGate) must deny, not fall through to allow. (codex #126 N2)
+        return post.action === 'allow' ? null : denyDecision(post.reason ?? reason);
       }
       const detail =
         decision === 'denied'
@@ -318,7 +325,9 @@ async function runFileProtection(
 
   const core = loaded.core;
   if (!core.EDIT_TOOLS.has(toolName)) return null;
-  let blocked: string | null;
+  // Typed `unknown`: checkEditProtection comes from a dynamically-imported core,
+  // so its runtime return can't be trusted to match the `string | null` type.
+  let blocked: unknown;
   try {
     blocked = core.checkEditProtection(toolName, toolInput);
   } catch (err) {
@@ -327,9 +336,19 @@ async function runFileProtection(
       `file-protection check errored (${err instanceof Error ? err.message : String(err)}) — denying edit for safety. Set SKIP_FILE_PROTECTION=1 to bypass.`,
     );
   }
-  return blocked
-    ? denyDecision(`file-protection — '${blocked}' is protected from automated edits. Set SKIP_FILE_PROTECTION=1 to bypass.`)
-    : null;
+  // Contract: a non-empty string = protected (block); null = allowed. Anything
+  // else (undefined/false/''/0/a non-string) is a malformed core result — for an
+  // EDIT tool (we passed EDIT_TOOLS.has above) that means deny, never fall through
+  // to allow on a falsy-non-null. (codex #126 N3)
+  if (blocked === null) return null;
+  if (typeof blocked === 'string' && blocked.length > 0) {
+    return denyDecision(
+      `file-protection — '${blocked}' is protected from automated edits. Set SKIP_FILE_PROTECTION=1 to bypass.`,
+    );
+  }
+  return denyDecision(
+    `file-protection returned a malformed result (expected a protected-path string or null) — denying edit for safety. Set SKIP_FILE_PROTECTION=1 to bypass.`,
+  );
 }
 
 /**

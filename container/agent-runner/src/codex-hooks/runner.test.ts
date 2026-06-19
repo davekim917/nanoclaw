@@ -226,6 +226,51 @@ describe('runPreToolUseChain — destructive-action guard wiring', () => {
     expect(out.hookSpecificOutput?.permissionDecisionReason).toContain('malformed post-approval verdict');
   });
 
+  // codex #126 N1: consumeGateApproval returning a TRUTHY NON-BOOLEAN ({}) must
+  // not count as "already approved" — the strict `=== true` check falls through
+  // to real gate staging, which here can't stage → deny (NOT a skip-gate allow).
+  it('test_codex_gate_nonboolean_approval_fails_closed: truthy-non-boolean consumeGateApproval denies', async () => {
+    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = new URL(
+      './__test-fixtures__/gate-postcheck/block-destructive-core.ts',
+      import.meta.url,
+    ).pathname;
+    const out = (await runPreToolUseChain({
+      tool_name: 'exec_command',
+      tool_input: { command: 'echo NONBOOL_APPROVAL' },
+    })) as { hookSpecificOutput?: { permissionDecision?: string; permissionDecisionReason?: string } };
+    expect(out.hookSpecificOutput?.permissionDecision).toBe('deny');
+    expect(out.hookSpecificOutput?.permissionDecisionReason).toContain('stage');
+  });
+
+  // codex #126 N2: a repeated `gate` after an approval is consumed (a stale core
+  // ignoring skipGate) must DENY — only an explicit `allow` post-verdict passes.
+  it('test_codex_gate_repeated_after_approval_fails_closed: post-approval gate denies', async () => {
+    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = new URL(
+      './__test-fixtures__/gate-postcheck/block-destructive-core.ts',
+      import.meta.url,
+    ).pathname;
+    const out = (await runPreToolUseChain({
+      tool_name: 'exec_command',
+      tool_input: { command: 'echo GATE_AFTER_APPROVAL' },
+    })) as { hookSpecificOutput?: { permissionDecision?: string } };
+    expect(out.hookSpecificOutput?.permissionDecision).toBe('deny');
+  });
+
+  // codex #126 N3: a file-protection core returning a falsy NON-null ({undefined})
+  // for an edit must DENY (fail-closed), not fall through to allow.
+  it('test_codex_file_protection_malformed_result_fails_closed: falsy-non-null denies the edit', async () => {
+    process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = new URL(
+      './__test-fixtures__/fp-malformed-result/block-destructive-core.ts',
+      import.meta.url,
+    ).pathname;
+    const out = (await runPreToolUseChain({
+      tool_name: 'Write',
+      tool_input: { file_path: 'src/index.ts' },
+    })) as { hookSpecificOutput?: { permissionDecision?: string; permissionDecisionReason?: string } };
+    expect(out.hookSpecificOutput?.permissionDecision).toBe('deny');
+    expect(out.hookSpecificOutput?.permissionDecisionReason).toContain('malformed');
+  });
+
   it('denies an edit to a protected path (file-protection core → blocked)', async () => {
     const out = (await runPreToolUseChain({
       tool_name: 'Write',

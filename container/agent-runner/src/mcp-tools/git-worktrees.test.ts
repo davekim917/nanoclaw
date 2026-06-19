@@ -9,6 +9,7 @@ import {
   getReposDir,
   resolveRepoDir,
   cloneRepoTool,
+  createWorktreeTool,
 } from './git-worktrees';
 
 // The advisory shells out to `node <post-commit-verify.cjs>`. Where node is
@@ -261,6 +262,31 @@ describe('getReposDir / resolveRepoDir / clone_repo', () => {
     expect(text).toContain(noOrigin);
     expect(text).toContain("NO 'origin' remote");
     expect(text).toContain(url);
+  });
+
+  test('test_worktree_stale_attachment_rejected (codex #126 N4): worktree bound to a shadowed clone errors', async () => {
+    const name = 'svc';
+    const url = 'https://github.com/acme/svc';
+    // Agent clone with a commit + a worktree ATTACHED to it.
+    const agentClone = join(agentDir, 'repos', name);
+    initRepoWithOrigin(agentClone, url);
+    execFileSync(
+      'git',
+      ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '--allow-empty', '-m', 'init'],
+      { cwd: agentClone, stdio: 'pipe' },
+    );
+    const worktreeDir = join(root, 'worktrees', name);
+    execFileSync('git', ['worktree', 'add', '-b', 'thread-old', worktreeDir], { cwd: agentClone, stdio: 'pipe' });
+
+    // A workgroup clone of the same name now SHADOWS the agent clone, so
+    // resolveRepoDir returns it — but the worktree is still bound to the agent clone.
+    const wgClone = join(workgroupDir, 'repos', name);
+    initRepoWithOrigin(wgClone, url);
+    expect(resolveRepoDir(name)).toBe(wgClone); // premise: workgroup now wins
+
+    const res = await createWorktreeTool.handler({ repo: name });
+    expect(res.isError).toBe(true);
+    expect(res.content[0].text).toContain('different clone');
   });
 
   test('test_clone_nonempty_no_git_dir_errors: non-empty no-.git destination is NOT destroyed', async () => {

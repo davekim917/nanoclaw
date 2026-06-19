@@ -35,8 +35,6 @@ function workgroupDir(): string {
   return process.env.NANOCLAW_WORKGROUP_DIR_OVERRIDE || '/workspace/workgroup';
 }
 
-const WORKTREES_DIR = worktreesDir();
-
 /**
  * Resolve where new clones land. Cloned repos live under `<base>/repos/<name>`
  * so they stay namespaced away from the agent's bedroom files and a single
@@ -398,7 +396,7 @@ export const createWorktreeTool: McpToolDefinition = {
       return err(`Repo not found in agent group: ${repo}. Run clone_repo first.`);
     }
 
-    const worktreeDir = path.join(WORKTREES_DIR, repo);
+    const worktreeDir = path.join(worktreesDir(), repo);
 
     // Validate branch name shape early — same value is needed by both paths
     // below, and we don't want to discover an invalid name only after fetch +
@@ -441,6 +439,23 @@ export const createWorktreeTool: McpToolDefinition = {
         log(`create_worktree: corrupt worktree at ${worktreeDir}, removing`);
         try { fs.rmSync(worktreeDir, { recursive: true, force: true }); } catch { /* ignore */ }
       } else {
+        // Stale-attachment guard (codex #126 N4): the worktree may be bound to a
+        // DIFFERENT clone than the currently-resolved repoDir — e.g. it was created
+        // against /workspace/agent/repos/<repo> and a workgroup clone at
+        // /workspace/workgroup/repos/<repo> now shadows it (resolveRepoDir prefers
+        // the workgroup copy). Rebasing/operating via repoDir would mix two object
+        // stores. Compare the worktree's git-common-dir to repoDir/.git; on
+        // mismatch refuse with guidance rather than silently acting on the wrong
+        // clone. (No auto-remove — the work lives in the OTHER clone's object store.)
+        const commonDir = tryGit(worktreeDir, ['rev-parse', '--path-format=absolute', '--git-common-dir']);
+        if (commonDir && path.resolve(commonDir) !== path.resolve(repoDir, '.git')) {
+          return err(
+            `Worktree at ${worktreeDir} is attached to a different clone (${commonDir}) than the ` +
+              `currently-resolved repo (${path.resolve(repoDir, '.git')}) — a workgroup clone likely now ` +
+              `shadows an older agent clone. Push any wanted work, then remove the stale worktree ` +
+              `(\`rm -rf ${worktreeDir}\`) and retry create_worktree to re-attach it to the current clone.`,
+          );
+        }
         const current = tryGit(worktreeDir, ['rev-parse', '--abbrev-ref', 'HEAD']);
         if (current && current !== branchName) {
           return err(
@@ -464,7 +479,7 @@ export const createWorktreeTool: McpToolDefinition = {
       tryGit(repoDir, ['rev-parse', '--verify', `refs/heads/${branchName}`]) !== null ||
       tryGit(repoDir, ['rev-parse', '--verify', `refs/remotes/origin/${branchName}`]) !== null;
 
-    fs.mkdirSync(WORKTREES_DIR, { recursive: true });
+    fs.mkdirSync(worktreesDir(), { recursive: true });
 
     // Clean up dangling .git/worktrees/ entries from prior crashes.
     tryGit(repoDir, ['worktree', 'prune'], 30_000);
@@ -586,7 +601,7 @@ export const gitCommitTool: McpToolDefinition = {
     if (nameErr) return err(nameErr);
     if (!message.trim()) return err('message is required');
 
-    const worktreeDir = path.join(WORKTREES_DIR, repo);
+    const worktreeDir = path.join(worktreesDir(), repo);
     if (!fs.existsSync(path.join(worktreeDir, '.git'))) {
       return err(`Worktree not found: ${repo}. Run create_worktree first.`);
     }
@@ -638,7 +653,7 @@ export const gitPushTool: McpToolDefinition = {
     const nameErr = validateRepoName(repo);
     if (nameErr) return err(nameErr);
 
-    const worktreeDir = path.join(WORKTREES_DIR, repo);
+    const worktreeDir = path.join(worktreesDir(), repo);
     if (!fs.existsSync(path.join(worktreeDir, '.git'))) {
       return err(`Worktree not found: ${repo}.`);
     }
@@ -684,7 +699,7 @@ export const openPrTool: McpToolDefinition = {
     if (nameErr) return err(nameErr);
     if (!title.trim()) return err('title is required');
 
-    const worktreeDir = path.join(WORKTREES_DIR, repo);
+    const worktreeDir = path.join(worktreesDir(), repo);
     if (!fs.existsSync(path.join(worktreeDir, '.git'))) {
       return err(`Worktree not found: ${repo}.`);
     }
