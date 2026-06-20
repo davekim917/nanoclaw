@@ -75,11 +75,14 @@ const FILE_EVENT_ALLOWED_PREFIXES = [
   '/home/node/.codex/generated_images',
   '/workspace/agent',
   '/workspace/worktrees',
+  '/workspace/workgroup',
   '/workspace/extra',
   '/tmp/',
 ];
 
-function isAllowedFileEventPath(p: string): boolean {
+// Exported for unit testing — the prefix set is the boundary for which
+// agent-produced files get forwarded, so it is asserted directly.
+export function isAllowedFileEventPath(p: string): boolean {
   return FILE_EVENT_ALLOWED_PREFIXES.some((prefix) => {
     const boundary = prefix.endsWith(path.sep) ? prefix : `${prefix}${path.sep}`;
     return p === prefix || p.startsWith(boundary);

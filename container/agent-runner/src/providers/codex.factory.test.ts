@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { describe, it, expect } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
 import { createProvider } from './factory.js';
 import {
@@ -13,6 +13,7 @@ import {
   findNewestRolloutAcrossHomes,
   findRolloutFile,
   materializeRawImageGeneration,
+  mirrorCodexAgentsToHome,
   resolveClaudeImports,
   resolveQueryModel,
   resolveQueryEffort,
@@ -989,5 +990,39 @@ describe('per-query model/effort overrides (-m/-e flags)', () => {
       expect(spawns.length).toBeGreaterThanOrEqual(2);
       for (const s of spawns) expect(s).toContain('effectiveConfig');
     });
+  });
+});
+
+describe('mirrorCodexAgentsToHome (codex #126)', () => {
+  let primary: string;
+  let fallback: string;
+  beforeEach(() => {
+    primary = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-primary-'));
+    fallback = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-fallback-'));
+  });
+  afterEach(() => {
+    fs.rmSync(primary, { recursive: true, force: true });
+    fs.rmSync(fallback, { recursive: true, force: true });
+  });
+
+  it('copies the primary agents/ role definitions into the fallback home', () => {
+    // The agents/ tree is bind-mounted only at the primary; a rotated fallback
+    // would otherwise lose every named subagent role.
+    fs.mkdirSync(path.join(primary, 'agents'), { recursive: true });
+    fs.writeFileSync(path.join(primary, 'agents', 'architecture-advisor.toml'), 'name = "arch"\n');
+    fs.writeFileSync(path.join(primary, 'agents', 'security-reviewer.toml'), 'name = "sec"\n');
+
+    expect(mirrorCodexAgentsToHome(primary, fallback)).toBe(true);
+    expect(fs.existsSync(path.join(fallback, 'agents', 'architecture-advisor.toml'))).toBe(true);
+    expect(fs.readFileSync(path.join(fallback, 'agents', 'security-reviewer.toml'), 'utf-8')).toContain('sec');
+  });
+
+  it('is a no-op when src==dst or the primary has no agents/ tree', () => {
+    // No agents/ at primary → nothing to mirror, returns false (not an error).
+    expect(mirrorCodexAgentsToHome(primary, fallback)).toBe(false);
+    expect(fs.existsSync(path.join(fallback, 'agents'))).toBe(false);
+    // src == dst → no self-copy.
+    fs.mkdirSync(path.join(primary, 'agents'), { recursive: true });
+    expect(mirrorCodexAgentsToHome(primary, primary)).toBe(false);
   });
 });

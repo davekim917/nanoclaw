@@ -462,6 +462,31 @@ export function copyRolloutToFallback(
 }
 
 /**
+ * Mirror the named-subagent role definitions (`<primary>/agents`) into a rotated
+ * CODEX_HOME. The agents/ tree is bind-mounted ONLY at the primary home, so a
+ * fallback home reached on OAuth rotation has no role TOMLs and would silently
+ * lose every named subagent role (architecture-advisor, code-review-specialist,
+ * …) — the exact layer the agents/ mount surfaces. Copy (not symlink): the
+ * fallback home is RW and Codex reads roles from `$CODEX_HOME/agents/`. No-op
+ * when src==dst or the primary has no agents/ tree. (codex #126)
+ */
+export function mirrorCodexAgentsToHome(primaryCodexHome: string, targetCodexHome: string): boolean {
+  if (primaryCodexHome === targetCodexHome) return false;
+  const src = path.join(primaryCodexHome, 'agents');
+  if (!fs.existsSync(src)) return false;
+  const dst = path.join(targetCodexHome, 'agents');
+  try {
+    fs.cpSync(src, dst, { recursive: true });
+    return true;
+  } catch (e) {
+    console.error(
+      `[codex-provider] failed to mirror agents/ ${src} → ${dst}: ${e instanceof Error ? e.message : String(e)}`,
+    );
+    return false;
+  }
+}
+
+/**
  * Locate the freshest rollout for `threadId` across multiple CODEX_HOMEs.
  *
  * Why this exists: after an in-session rotation, the rollout file diverges
@@ -688,6 +713,10 @@ export class CodexProvider implements AgentProvider {
       // we're rotating AWAY from). Falls back to the conventional path when
       // process.env.CODEX_HOME is unset — the codex CLI uses the same default.
       let currentCodexHome = process.env.CODEX_HOME ?? '/home/node/.codex';
+      // Stable reference to the PRIMARY home — the only one with the bind-mounted
+      // agents/ tree. Captured before any rotation reassigns currentCodexHome, so
+      // the rotation routine can mirror the role definitions into a fallback. (codex #126)
+      const primaryCodexHome = currentCodexHome;
 
       try {
         await initializeCodexAppServer(server);
@@ -833,12 +862,15 @@ export class CodexProvider implements AgentProvider {
                     process.env.CODEX_HOME = nextHome;
                     currentCodexHome = nextHome;
 
-                    // config.toml / hooks.json live under CODEX_HOME, so
-                    // regenerate them in the new dir. The MCP config is the
-                    // same content (host wiring hasn't changed); writing it
-                    // again is cheap and keeps the new home consistent.
+                    // config.toml / hooks.json / agents/ all live under CODEX_HOME,
+                    // so the new dir needs all three. The writers honor CODEX_HOME
+                    // (just switched above), so regenerating config + the guard hooks
+                    // lands them in the fallback home — without this the rotated
+                    // app-server runs UNGUARDED. agents/ is bind-mounted only at the
+                    // primary, so mirror the role definitions across explicitly. (codex #126)
                     writeCodexMcpConfigToml(self.mcpServers);
                     writeCodexHooksJson();
+                    mirrorCodexAgentsToHome(primaryCodexHome, nextHome);
 
                     server = spawnCodexAppServer(createCodexConfigOverrides(effectiveConfig));
                     turnTracker.server = server;

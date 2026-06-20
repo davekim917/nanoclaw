@@ -6,6 +6,7 @@ import { createOpencodeClient, type OpencodeClient } from '@opencode-ai/sdk';
 import { registerProvider } from './provider-registry.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
 import { mcpServersToOpenCodeConfig } from './mcp-to-opencode.js';
+import { buildSecretEnvVarList, MCP_HEADER_ONLY_SECRET_VARS } from './secret-env.js';
 
 function log(msg: string): void {
   console.error(`[opencode-provider] ${msg}`);
@@ -78,6 +79,47 @@ const SESSION_STATUS_RETRY_ERROR_AFTER = 3;
 const STALE_SESSION_RE =
   /no conversation found|ENOENT.*\.jsonl|session.*not found|NotFoundError|connection reset|ECONNRESET|404|event timeout/i;
 
+/**
+ * Build the env handed to the `opencode serve` child, stripping the auth secrets
+ * named by buildSecretEnvVarList() (the SINGLE SOURCE shared with the Claude
+ * provider — see secret-env.ts). OpenCode authenticates via auth.json / XDG
+ * (opencodeAuthProviders reads /opencode-xdg/opencode/auth.json), NOT
+ * process.env, so removing these is safe and never breaks model auth.
+ *
+ * This INTENTIONALLY includes ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN
+ * (codex #126 F3). An `anthropic/*` OpenCode model must authenticate via
+ * auth.json like every other provider — NOT via the host's Anthropic creds
+ * leaking through process.env. Forwarding the host's Claude-subscription OAuth
+ * token to OpenCode's model traffic is exactly the leak this strip prevents
+ * (and OpenCode 1.3+ can't use that subscription token anyway).
+ *
+ * The Claude provider unsets the same vars per-Bash-command (createSanitizeBashHook).
+ * OpenCode has no equivalent per-tool hook on its bash path, so we strip once at
+ * the server level — broader than Claude's per-command unset, but the outcome is
+ * identical: every shell subprocess opencode spawns (bash tool, MCP stdio
+ * children) inherits a secret-free env. We keep OPENCODE_CONFIG_CONTENT and all
+ * non-secret vars (PATH, HOME, NANOCLAW_*, OPENCODE_*) intact.
+ *
+ * Pure + exported so it can be unit-tested without actually spawning a process.
+ */
+export function buildOpencodeServerEnv(
+  baseEnv: NodeJS.ProcessEnv,
+  config: Record<string, unknown>,
+): NodeJS.ProcessEnv {
+  // Strip the env-derived auth list PLUS the MCP/header-only secrets Claude also
+  // strips (filterSdkEnv) — env-hygiene parity so opencode's bash/MCP children
+  // can't printenv Exa/Braintrust/Granola. Data-tool secrets (SNOWFLAKE_PASSWORD,
+  // DBT_*, OPENAI_API_KEY, …) are deliberately KEPT, matching Claude. (codex #126)
+  const secretVars = new Set([...buildSecretEnvVarList(), ...MCP_HEADER_ONLY_SECRET_VARS]);
+  const env: NodeJS.ProcessEnv = {};
+  for (const [k, v] of Object.entries(baseEnv)) {
+    if (secretVars.has(k)) continue;
+    env[k] = v;
+  }
+  env.OPENCODE_CONFIG_CONTENT = JSON.stringify(config);
+  return env;
+}
+
 function spawnOpencodeServer(
   config: Record<string, unknown>,
   cwd: string | undefined,
@@ -99,10 +141,11 @@ function spawnOpencodeServer(
     // passes input.cwd; this brings OpenCode to parity. Caller falls back to
     // process.cwd() if input.cwd was undefined.
     const proc = spawn('opencode', ['serve', `--hostname=${hostname}`, `--port=${port}`], {
-      env: {
-        ...process.env,
-        OPENCODE_CONFIG_CONTENT: JSON.stringify(config),
-      },
+      // Auth secrets (ANTHROPIC_API_KEY*, CLAUDE_CODE_OAUTH_TOKEN*, GMAIL_*) are
+      // stripped from the child env here — OpenCode auths via auth.json/XDG, not
+      // process.env, so they're never needed and an unguarded `bash` tool would
+      // otherwise be able to printenv them. See buildOpencodeServerEnv.
+      env: buildOpencodeServerEnv(process.env, config),
       cwd: cwd ?? process.cwd(),
     });
 
@@ -241,7 +284,10 @@ function clampOpenCodeEffort(raw: string | undefined): string | null {
   return effortClampMap[(raw || '').trim().toLowerCase()] || null;
 }
 
-function buildOpenCodeConfig(options: ProviderOptions, turn: OpenCodeTurnOverrides = {}): Record<string, unknown> {
+export function buildOpenCodeConfig(
+  options: ProviderOptions,
+  turn: OpenCodeTurnOverrides = {},
+): Record<string, unknown> {
   // EFFECTIVE model = per-turn `-m` override → env default (host sets
   // OPENCODE_MODEL from the DB default; see src/providers/opencode.ts). It is
   // also passed PER-PROMPT via body.model in query(), so a model switch with NO
@@ -326,13 +372,31 @@ function buildOpenCodeConfig(options: ProviderOptions, turn: OpenCodeTurnOverrid
   // (`permission: 'allow'` + permission auto-reply), so this plugin's
   // `tool.execute.before` throw is the ONLY guardrail standing between the agent
   // and a destructive command. The plugin is mounted read-only from the
-  // bootstrap plugin at /workspace/plugins/bootstrap. If it's absent (e.g. a
-  // group excludes the bootstrap plugin), we log loudly rather than silently
-  // running an unguarded prod agent.
+  // bootstrap plugin at /workspace/plugins/bootstrap.
+  //
+  // FAIL-CLOSED: if the plugin is absent (e.g. a group excludes the bootstrap
+  // plugin), we REFUSE to build a config — returning one with `permission:
+  // 'allow'` but no guard would run an unguarded prod agent with auto-approve on
+  // every tool call. Throwing aborts the spawn; the sweep retries, and the
+  // operator sees the failure rather than a silently-unguarded agent. The old
+  // behavior here was warn-and-continue, which is exactly the silent gap this
+  // closes. Set OPENCODE_ALLOW_UNGUARDED=1 to opt out (dev-only escape hatch,
+  // default-closed) — e.g. local experimentation without the bootstrap mount.
   const GUARD_PLUGIN = '/workspace/plugins/bootstrap/plugins/workflow/hooks/guards/opencode-guard.ts';
   const guardAvailable = fs.existsSync(GUARD_PLUGIN);
-  if (!guardAvailable) {
-    log(`WARNING: destructive-action guard plugin not found at ${GUARD_PLUGIN} — opencode is running WITHOUT the gate`);
+  const allowUnguarded = process.env.OPENCODE_ALLOW_UNGUARDED === '1';
+  if (!guardAvailable && !allowUnguarded) {
+    throw new Error(
+      `OpenCode destructive-action guard plugin not found at ${GUARD_PLUGIN} — refusing to spawn an unguarded agent ` +
+        `(permission:'allow' auto-approves every tool call). Mount the bootstrap plugin, or set ` +
+        `OPENCODE_ALLOW_UNGUARDED=1 to override (dev-only).`,
+    );
+  }
+  if (!guardAvailable && allowUnguarded) {
+    log(
+      `WARNING: guard plugin absent at ${GUARD_PLUGIN} but OPENCODE_ALLOW_UNGUARDED=1 — ` +
+        `running opencode WITHOUT the destructive-action gate (explicit opt-out)`,
+    );
   }
 
   return {
@@ -344,7 +408,14 @@ function buildOpenCodeConfig(options: ProviderOptions, turn: OpenCodeTurnOverrid
     snapshot: false,
     provider: providerOptions,
     mcp,
-    ...(guardAvailable ? { plugin: [GUARD_PLUGIN] } : {}),
+    // Unconditional. The fail-closed throw above guarantees we only reach here
+    // when either the plugin exists OR the explicit OPENCODE_ALLOW_UNGUARDED
+    // opt-out is set. In the opt-out + absent case opencode harmlessly ignores
+    // a non-existent plugin path (verified empirically on opencode@1.15.7: the
+    // server starts and skips the missing plugin), so an unconditional mount is
+    // safe and keeps the guard mounted on every guarded spawn — no config path
+    // can return permission:'allow' without it.
+    plugin: [GUARD_PLUGIN],
   };
 }
 
@@ -392,27 +463,52 @@ async function ensureSharedRuntime(
   if (sharedInit) return sharedInit;
 
   sharedInit = (async () => {
-    if (sharedRuntime) {
-      destroySharedRuntime();
+    // Tracks the spawned `opencode serve` child until sharedRuntime takes
+    // ownership. If init throws AFTER spawnOpencodeServer returns a LIVE proc but
+    // BEFORE the sharedRuntime assignment (e.g. client.event.subscribe() rejects),
+    // destroySharedRuntime() can't see this proc — so the finally kills it here.
+    // Without this, every retry leaks another orphaned server process. (codex #126
+    // F5 follow-up)
+    let orphanProc: ChildProcess | undefined;
+    try {
+      if (sharedRuntime) {
+        destroySharedRuntime();
+      }
+      const config = buildOpenCodeConfig(options, turn);
+      const { url, proc } = await spawnOpencodeServer(config, cwd);
+      orphanProc = proc;
+      // Also pass `directory` to the SDK client — opencode uses it as a hint
+      // for project-context features (project root, file paths in completions).
+      const client = createOpencodeClient({ baseUrl: url, ...(cwd ? { directory: cwd } : {}) });
+      const sub = await client.event.subscribe();
+      const stream = sub.stream as AsyncGenerator<{ type: string; properties: Record<string, unknown> }, void, void>;
+      sharedRuntime = {
+        proc,
+        client,
+        stream,
+        streamRelease: () => {
+          void stream.return?.(undefined);
+        },
+      };
+      sharedConfigKey = key;
+      orphanProc = undefined; // ownership transferred to sharedRuntime
+      return sharedRuntime;
+    } finally {
+      // Kill a spawned-but-unowned server before clearing the in-flight promise.
+      // On the success path orphanProc was reset to undefined above; it is set
+      // here only if init threw between spawn and the sharedRuntime assignment.
+      if (orphanProc) {
+        try { orphanProc.kill('SIGKILL'); } catch { /* ignore */ }
+      }
+      // Clear the in-flight promise on BOTH success and failure. On success the
+      // result is cached in sharedRuntime (line 450 short-circuits next time); on
+      // failure (e.g. buildOpenCodeConfig throws because the guard plugin isn't
+      // mounted yet, or before OPENCODE_ALLOW_UNGUARDED is set) clearing lets a
+      // later turn RE-RUN init instead of replaying the cached rejection forever.
+      // The poll loop survives per-turn errors, so without this the container is
+      // stuck unguarded-broken for its whole life. (codex #126 F5)
+      sharedInit = null;
     }
-    const config = buildOpenCodeConfig(options, turn);
-    const { url, proc } = await spawnOpencodeServer(config, cwd);
-    // Also pass `directory` to the SDK client — opencode uses it as a hint
-    // for project-context features (project root, file paths in completions).
-    const client = createOpencodeClient({ baseUrl: url, ...(cwd ? { directory: cwd } : {}) });
-    const sub = await client.event.subscribe();
-    const stream = sub.stream as AsyncGenerator<{ type: string; properties: Record<string, unknown> }, void, void>;
-    sharedRuntime = {
-      proc,
-      client,
-      stream,
-      streamRelease: () => {
-        void stream.return?.(undefined);
-      },
-    };
-    sharedConfigKey = key;
-    sharedInit = null;
-    return sharedRuntime;
   })();
 
   return sharedInit;

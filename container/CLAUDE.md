@@ -151,7 +151,7 @@ The `conversations/` folder in your workspace holds searchable transcripts of pa
 3. `git_commit({ repo: "REPO-NAME", message: "feat: description" })` — stage + commit
 4. `git_push({ repo: "REPO-NAME" })` — push branch to origin. Pass `force: true` only when `create_worktree` warned about a rewrite.
 5. `open_pr({ repo: "REPO-NAME", title: "...", body: "..." })` — create a GitHub PR
-6. NEVER run `git clone` — it is blocked. Use `create_worktree` for existing repos or `clone_repo` for new ones.
+6. Use `create_worktree` for existing repos or `clone_repo` for new ones — don't `git clone` into the workspace ad-hoc. `clone_repo` lands the repo in a managed, gitignored repos namespace. On a normal Claude / Codex / OpenCode turn an **advisory** guard blocks `git clone` into `/workspace/{agent,worktrees,workgroup,...}` and steers you to the MCP tools (it's a nudge, not a hard boundary — you already have write access there). Heads-up: `codex exec` sub-delegations fire **no** hooks, so the guard cannot enforce on that path — the rule still applies; follow it by convention.
 7. On thread resume, check `/workspace/worktrees/` for prior work from this session.
 8. If you do not commit explicitly, the host auto-commits all dirty worktrees on session exit.
 

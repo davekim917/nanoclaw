@@ -124,6 +124,29 @@ registerProviderContainerConfig('codex', (ctx) => {
       fs.mkdirSync(path.join(codexDir, 'plugins'), { recursive: true });
       mounts.push({ hostPath: pluginsDir, containerPath: '/home/node/.codex/plugins', readonly: true });
     }
+
+    // agents/: surface the synced named subagent role definitions so a
+    // codex-primary session can spawn the same custom roles the host has
+    // (architecture-advisor, code-review-specialist, security-reviewer, ...).
+    //
+    // The `multi_agent` feature is stable + default-on in Codex 0.140, so the
+    // spawn_agent/wait_agent/close_agent tools — and thus GENERIC subagents —
+    // already work in the container without this. What was missing is the
+    // NAMED role layer: Codex reads `[agents.*]` roles from
+    // $CODEX_HOME/agents/*.toml, which `src/codex-sync.ts` writes to the
+    // per-group (`~/.codex-<folder>/agents/`) and global (`~/.codex/agents/`)
+    // homes. Our fresh session-local /home/node/.codex copied auth/config/
+    // plugins but not agents/, so those roles never reached codex-primary
+    // groups. Mount RO (definitions are read-only to Codex; keeps host
+    // re-syncs live and prevents the container from mutating host defs).
+    // Mirrors codex-companion-setup.ts's agents/ symlink for the peer path.
+    const sourceAgents = path.join(sourceDir, 'agents');
+    const globalAgents = path.join(hostHome, '.codex', 'agents');
+    const agentsDir = fs.existsSync(sourceAgents) ? sourceAgents : fs.existsSync(globalAgents) ? globalAgents : null;
+    if (agentsDir) {
+      fs.mkdirSync(path.join(codexDir, 'agents'), { recursive: true });
+      mounts.push({ hostPath: agentsDir, containerPath: '/home/node/.codex/agents', readonly: true });
+    }
   }
 
   const env: Record<string, string> = {};

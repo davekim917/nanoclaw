@@ -1,0 +1,526 @@
+feature: cross-provider-guard-parity
+created_by: /team-brief
+last_updated_by: /team-design
+
+constraints:
+  - id: C1
+    type: HARD
+    text: "Single-source policy: no adapter carries its own copy of a migrated guard's policy, except explicitly-marked fail-closed fallbacks used only when the core can't load."
+    source: brief
+    verified: false
+    affects_groups: [A, B, E]
+  - id: C2
+    type: HARD
+    text: "block-destructive-core.ts (workflow/) is source of truth; workflow-agents/ is vendored via scripts/vendor-guards.mjs (--check gate)."
+    source: brief
+    verified: false
+    affects_groups: [D]
+  - id: C3
+    type: HARD
+    text: "email-gate's existing human-approval flow for Claude/Codex is preserved exactly (no regression); the core stays I/O-free (env injected, gate primitive supplied by the adapter)."
+    source: brief
+    verified: false
+    affects_groups: [A, E]
+  - id: C4
+    type: HARD
+    text: "Fail-closed on security guards everywhere, INCLUDING when the guard plugin/core is absent."
+    source: brief
+    verified: false
+    affects_groups: [B, E]
+  - id: C5
+    type: HARD
+    text: "Spans nanoclaw-v2/container/agent-runner + davekim917/bootstrap. Bump bootstrap workflow plugin.json + marketplace.json and workflow-agents .codex-plugin/plugin.json per convention."
+    source: brief
+    verified: false
+    affects_groups: [D]
+  - id: C6
+    type: HARD
+    text: "codex exec sub-delegation fires no hooks — instruction-only on that path; no hook-parity claim."
+    source: brief
+    verified: false
+    affects_groups: [H]
+  - id: C7
+    type: SOFT
+    text: "Use core-conformance + per-adapter wiring/dispatch tests, not a cross-repo real-invocation harness."
+    source: brief
+    verified: false
+    affects_groups: [C]
+  - id: C8
+    type: SOFT
+    text: "Keep claude.ts edits minimal-risk (hot path); migrate guards incrementally with tests green at each step."
+    source: brief
+    verified: false
+    affects_groups: []
+  - id: C9
+    type: HARD
+    text: "The git-clone guard is ADVISORY (the agent already has RW to managed dirs). Airtight closure of bare-clone/git -C/renamed-binary/symlink bypasses is OUT OF SCOPE; comments/docs must say so."
+    source: review (security + codex)
+    verified: true
+    affects_groups: [H]
+  - id: C10
+    type: HARD
+    text: "OpenCode must fail CLOSED when the guard plugin is absent (today it keeps permission:'allow' + omits the plugin → unguarded). The brief's earlier 'fail-closed fallbacks' claim was wrong for OpenCode and is corrected."
+    source: review (codex #3)
+    verified: true
+    affects_groups: []
+  - id: C11
+    type: HARD
+    text: "New core FILES are not vendored unless added to VENDORED_FILES (vendor-guards.mjs:33). Either extend block-destructive-core.ts or add new files to that list + the --check."
+    source: review (architecture S3)
+    verified: true
+    affects_groups: [D]
+  - id: C12
+    type: HARD
+    text: "Env/secret parity: OpenCode shell tools must not see the auth env vars Claude/Codex strip via sanitize-bash (effect required; mechanism is design's choice)."
+    source: review (codex #6)
+    verified: true
+    affects_groups: [F]
+
+decisions:
+  - id: D1
+    stage: brief
+    description: "Which claude.ts-inline guards migrate into the shared core."
+    chosen: "All portable guards: self-approval, snowflake-connector, email-gate migrate to the core. sanitize-bash is a transform (out of verdict conformance, but its secret-stripping effect is required — see C12); mnemon-real migrates if cheap."
+    rejected:
+      - option: "Strict: migrate EVERY inline guard incl. sanitize-bash as a verdict."
+        reason: "sanitize-bash mutates the command (transform), not a verdict — wrong shape for verdict conformance."
+      - option: "Minimal: only the 3 gap guards, no disposition for sanitize/mnemon."
+        reason: "Leaves claude.ts partly fat and masks the env/secret parity gap."
+    constraint_refs: [C1, C8, C12]
+    affects_groups: []
+  - id: D2
+    stage: brief
+    description: "Strength of the conformance seam."
+    chosen: "Core-conformance + per-adapter wiring tests + per-adapter DISPATCH-COVERAGE tests + a guard-absence-fails-closed assertion."
+    rejected:
+      - option: "Real per-adapter invocation harness (cross-repo)."
+        reason: "Higher wiring cost; user chose the existing pattern. Dispatch-coverage closes the 'reached' gap without a cross-repo harness."
+      - option: "Core-conformance + wiring tests only (original brief)."
+        reason: "Reviews showed wiring tests prove 'correct' not 'reached' — the exact drift that caused OpenCode's blindness. Dispatch-coverage added."
+    constraint_refs: [C7]
+    affects_groups: []
+  - id: D3
+    stage: brief
+    description: "Where clone_repo lands repos."
+    chosen: "/workspace/workgroup/repos/<name> (shared, per workgroup-shared-fs spec), fallback to /workspace/agent/repos/<name> when no workgroup mounted; keep resolving legacy /workspace/agent/<name>. Includes path-allowlist repoints."
+    rejected:
+      - option: "Keep /workspace/agent/repos (private)."
+        reason: "Contradicts the spec's shared-repo intent + the 'one team' model; siblings would re-clone separately."
+    constraint_refs: []
+    affects_groups: []
+  - id: D4
+    stage: brief
+    description: "Handling the shipped steps 1-3 given the reviews."
+    chosen: "Apply the safe correctness fixes immediately (gate-type narrow, +workgroup, fail-closed, honest comments, CLAUDE.md wording — shipped in bootstrap d23df80 + nanoclaw f7fa1740) and fold the deeper redesign (clone destination, OpenCode fail-open, email-gate, tool-denylist, env/secret, dispatch tests) into this feature."
+    rejected:
+      - option: "Leave steps 1-3 untouched; fold everything into the feature."
+        reason: "The safe fixes are unambiguous improvements with no design dependency — no reason to defer."
+    constraint_refs: [C9, C10]
+    affects_groups: []
+  - id: D5
+    stage: brief
+    description: "email-gate cross-adapter boundary."
+    chosen: "Pure evaluateEmailSend(command, env-snapshot) + each adapter reuses the gate primitive it already owns (Claude/Codex async awaitDeliveryAck — untouched; OpenCode sync runNanoclawGate/writeGateRequest+pollDeliveredTable). NOT a bespoke injected-callback port."
+    rejected:
+      - option: "Injected I/O callback interface (original brief A1)."
+        reason: "OpenCode's adapter is a sync throw; it can't await. The destructive gate already solved this with the sync primitive — reuse it. Strictly less new surface."
+    constraint_refs: [C3]
+    affects_groups: []
+  - id: D6
+    stage: brief
+    description: "tool-denylist parity placement."
+    chosen: "Treat as its own design item (a flat string list, not a verdict — no core/conformance home). Must map Claude-SDK tool names to OpenCode names and run around OpenCode's permission auto-reply 'always' path, not only tool.execute.before."
+    rejected:
+      - option: "Fold into the conformance contract (original brief)."
+        reason: "Structurally can't — it's not a verdict evaluator."
+    constraint_refs: [C4]
+    affects_groups: []
+  - id: D7
+    stage: design
+    description: "email-gate cross-provider shape (D-A)."
+    chosen: "Pure evaluateEmailSend(command, envSnapshot)->{action:'allow'|'gate', label?, summary?} in a NEW vendored email-gate-core.ts; verdict is shared/conformance-pinned, approval round-trip stays per-adapter (Claude/Codex async awaitDeliveryAck untouched; OpenCode sync writeGateRequest+pollDeliveredTable)."
+    rejected:
+      - { option: "Inline-only in nanoclaw", reason: "OpenCode can't reach it." }
+      - { option: "Extract envelope parsing only", reason: "doesn't solve parity." }
+    constraint_refs: [C1, C3]
+    affects_groups: []
+  - id: D8
+    stage: design
+    description: "Approval gate primitive (D-B)."
+    chosen: "Dual path is load-bearing: OpenCode sync runNanoclawGate; Claude/Codex async awaitDeliveryAck. OpenCode tool.execute.before is a sync throw + OC 1.15.7 has no async hooks."
+    rejected:
+      - { option: "Unified async + OpenCode sync-wrapper", reason: "couples to Bun Atomics, no win." }
+      - { option: "Async everywhere", reason: "OpenCode contract can't support it today." }
+    constraint_refs: [C3]
+    affects_groups: []
+  - id: D9
+    stage: design
+    description: "self-approval + snowflake migration + sanitize-bash disposition (D-C)."
+    chosen: "Extract evaluateSelfApproval + evaluateSnowflakeConnector into block-destructive-core.ts (extend, no VENDORED_FILES change); claude.ts thin verdict->denyBash + fallback; codex inherits; opencode-guard calls them. sanitize-bash stays a TRANSFORM (provider-specific); its secret-stripping effect reaches OpenCode via D-E env-scrub."
+    rejected:
+      - { option: "Migrate sanitize-bash as a verdict", reason: "it mutates the command (updatedInput), not a verdict." }
+    constraint_refs: [C1, C12]
+    affects_groups: []
+  - id: D10
+    stage: design
+    description: "OpenCode tool-denylist enforcement (D-D)."
+    superseded_by: D15
+    chosen: "[SUPERSEDED cycle-3 by D15] tool-name check in opencode-guard tool.execute.before before file-protection; canonical DISALLOWED_TOOLS as a vendored constant in block-destructive-core.ts, shared by opencode/codex + Claude's SDK arg/hook."
+    rejected:
+      - { option: "Permission-event check before the 'always' auto-reply", reason: "depends on the OC SDK exposing tool_name (unverified in 1.15.7)." }
+      - { option: "MCP config-time filtering", reason: "misses built-in tools." }
+    constraint_refs: [C4]
+    affects_groups: []
+  - id: D11
+    stage: design
+    description: "OpenCode fail-closed + env parity (D-E)."
+    chosen: "Refuse spawn (throw in buildOpenCodeConfig) if guard plugin absent; strip auth env vars from the OpenCode child env before spawn (safe — OC auths via auth.json/XDG). Optional additive OPENCODE_ALLOW_UNGUARDED=1 dev opt-out, default-closed."
+    rejected:
+      - { option: "Deny-by-default permission", reason: "useless session + needs SDK support." }
+    constraint_refs: [C4, C12]
+    affects_groups: []
+  - id: D12
+    stage: design
+    description: "Clone destination move (D-F)."
+    chosen: "Runtime getReposDir() via NANOCLAW_WORKGROUP_ID + fs.existsSync('/workspace/workgroup') -> workgroup/repos else agent/repos; resolveRepoDir precedence workgroup/repos->agent/repos->legacy; clone_repo verifies origin==URL + only rmSync a no-.git empty dir; add /workspace/workgroup to core.ts + poll-loop allowlists; WORKTREES_DIR unchanged."
+    rejected:
+      - { option: "clone-to-agent + resolveRepoDir-reads-workgroup", reason: "doesn't actually share on clone (violates spec intent)." }
+    constraint_refs: []
+    affects_groups: []
+  - id: D13
+    stage: design
+    description: "Conformance seam (D-G)."
+    chosen: "conformance.test.ts (verdicts) + per-adapter dispatch-coverage tests co-located with each adapter (drive the REAL entrypoint: OpenCode NanoclawGuard tool.execute.before, Codex runHookForCodex, Claude PreToolUse chain) + guard-absence-fails-closed assertions."
+    rejected:
+      - { option: "New vendored block-destructive-dispatch.ts wrapper + vendored .test.ts (grounding Approach B)", reason: "over-engineered; vendoring test files non-standard; cross-adapter test can't import 3 adapters across repo boundaries in isolated caches." }
+    constraint_refs: [C7]
+    affects_groups: []
+  - id: D14
+    stage: design
+    description: "Shared-core layout + vendor (D-H, resolves C11)."
+    chosen: "Extend block-destructive-core.ts for the two small additions (self-approval, snowflake) — no VENDORED_FILES change; add ONE new email-gate-core.ts -> add to VENDORED_FILES + --check. Re-vendor + bump plugin versions. [REVISED cycle-3: DISALLOWED_TOOLS is NOT added to the core — per D15 it stays single-source in nanoclaw claude.ts, never vendored.]"
+    rejected:
+      - { option: "All-new-files for every guard", reason: "needless file + vendor churn for tiny regex guards." }
+    constraint_refs: [C2, C11]
+    affects_groups: []
+
+  - id: D15
+    stage: review
+    description: "Denylist single-source placement (cycle-3, supersedes D10 + D14's DISALLOWED_TOOLS clause + A6)."
+    chosen: "SDK_DISALLOWED_TOOLS stays SINGLE-SOURCE in nanoclaw claude.ts:114-124 (a static constant). Claude consumes it via the sync disallowedTools SDK arg (claude.ts:1290) + preToolUseHook; Codex via the same-repo re-export (runner.ts:358). It is NOT added to block-destructive-core.ts and NOT vendored. OpenCode adds NO runtime denylist check (the 9 CamelCase Claude-builtin names cannot occur on OpenCode's lowercase tool surface — verified no-op). OpenCode parity is a RECURRING build-time enumeration test that classifies every exposed tool (built-ins + mcp__) against a minimal capability map and FAILS on any denied-capability match OR unrecognized tool."
+    rejected:
+      - { option: "cross-repo copy of the denylist + byte-equal parity test (cycle-2 M2)", reason: "unimplementable AND unnecessary — the two repos are isolated Bun trees, vendor-guards reaches one way only, and the symbol need not exist in bootstrap (A-Finding-1)." }
+      - { option: "vendor DISALLOWED_TOOLS into block-destructive-core.ts (D10/D14)", reason: "needless vendor surface for a constant only Claude/Codex (same repo) consume; OpenCode consumes no denylist." }
+      - { option: "runtime denylist name-check in opencode-guard.ts as defense-in-depth", reason: "pure no-op for the current OpenCode tool surface; add an explicit block only if a future enumeration finds a real OpenCode equivalent (codex C3-2 — no production OpenCode denylist to dispatch-test)." }
+    constraint_refs: [C1, C4, C7]
+    affects_groups: [F, C]
+  - id: D16
+    stage: review
+    description: "writeGateRequest action parameterization (cycle-3, refines D7/D-A)."
+    chosen: "[REVISED cycle-5 by D18 for signature-safety] Add an `action` param to the INTERNAL writeGateRequest (called only by gate wrappers) + a new action-aware lower-level runGateRequest(command, reason, {action, onStageError}). Keep the existing runNanoclawGate(command, reason, onStageError?) signature UNCHANGED as the destructive wrapper (request_destructive_gate); runEmailGate(command, reason, onStageError?) is the bash-gate wrapper (request_bash_gate). OpenCode's email gate calls runEmailGate (emits request_bash_gate, matching Claude/Codex's card type), NOT the destructive writer which hardcodes request_destructive_gate (block-destructive-core.ts:963 SoT). Claude/Codex async awaitDeliveryAck path untouched. A dispatch test asserts email->request_bash_gate, destructive->request_destructive_gate per adapter; a regression test asserts the legacy 3-arg runNanoclawGate(cmd,reason,cb) still emits request_destructive_gate."
+    rejected:
+      - { option: "OpenCode email reuses writeGateRequest as-is", reason: "it hardcodes action:'request_destructive_gate' -> host renders the wrong card ('🛑 Destructive command' vs '⚠️ Bash command', src/modules/bash-gate/index.ts:293-310), silently degrading OpenCode's email approval vs Claude's (C3-1 / A-Finding-2, verified core.ts:963)." }
+    constraint_refs: [C1, C3]
+    affects_groups: []
+
+  - id: D17
+    stage: review
+    description: "Codex fail-closed completeness (cycle-4 M1, extends D-E/D11)."
+    chosen: "D-E's Codex fail-closed flip covers BOTH dynamically-loaded container-side cores: loadGuardCore/runDestructiveGuard (runner.ts:106-116/138-139) AND loadFileProtectionCore/runFileProtection (runner.ts:178-186/195-196) — both fail OPEN today. Flip both to deny-on-absent. Also handle 'invalid' (not just 'missing'): each loader validates required-export types (typed-failure -> deny) and runDestructiveGuard/runFileProtection map any evaluator exception to a deny decision. The fail-closed export-validation (both adapters) covers the gate primitives (writeGateRequest action union, runEmailGate, runNanoclawGate, pollDeliveredTable), not just verdict evaluators. Tests: missing / malformed / throwing per core. Does NOT touch the four claude.ts hook factories the codex chain imports (runner.ts:244-250) — same-repo, cannot be absent."
+    rejected:
+      - { option: "flip only loadGuardCore (D-E as-written through cycle 3)", reason: "leaves loadFileProtectionCore fail-open -> residual HARD C4 violation: a missing Codex mount would silently allow .env/lockfile/.git edits; contradicts the design's own 'uniform fail-closed' (D-G) claim (A-Finding-1 cycle-4)." }
+      - { option: "treat import-success as trusted (handle 'missing' only)", reason: "a malformed-but-importable core passes await import() then throws at call time outside a deny path -> 'invalid core' is not actually fail-closed (codex-C3)." }
+    constraint_refs: [C4]
+    affects_groups: [E]
+
+  - id: D18
+    stage: review
+    description: "Signature-safe gate-wrapper refactor (cycle-5 codex-C5-1, supersedes D16's positional-action approach)."
+    chosen: "Preserve the existing runNanoclawGate(command, reason, onStageError?) signature. Add `action` to the internal writeGateRequest (only the wrappers call it). Add a lower-level runGateRequest(command, reason, {action, onStageError}); runNanoclawGate is the destructive wrapper (request_destructive_gate, signature unchanged), runEmailGate is the bash-gate wrapper (request_bash_gate). Regression test: legacy 3-arg runNanoclawGate(cmd, reason, cb) still emits request_destructive_gate (zero caller churn)."
+    rejected:
+      - { option: "runNanoclawGate(command, reason, action='request_destructive_gate', onStageError?) (D16/cycle-4 as-written)", reason: "inserts `action` at positional arg 3 where existing callers pass the onStageError CALLBACK (runner.ts:153 `runNanoclawGate(command, reason, () => {...})`, opencode-guard.ts:78, Claude block-destructive) -> shifts the callback, regresses the destructive gate. The 'back-compat' claim was false (codex-C5-1, verified runner.ts:153). TS would flag it at every call site, but the design must not ship a misleading signature." }
+    constraint_refs: [C1, C3]
+    affects_groups: [A, E]
+
+auto_qa_cycles:
+  - iteration: 1
+    must_fix_count: 1
+    should_fix_count: 2
+    completed_at: 2026-06-19
+    note: "Validators: denoise (clean), swarm (adversarial/security/domain on nanoclaw), codex E cross-model (both repos). 1 MUST-FIX (M-QA1 Codex guard fail-open) FIXED + regression-tested; 1 HIGH pre-existing escalated (codex #2 email --dry-run-in-content bypass, faithfully ported per C3); 2 SHOULD-FIX listed for ship. MUST-FIX==0 after fix -> Stage E."
+  - iteration: "2-9 (email-bypass re-pass)"
+    must_fix_count: 0
+    should_fix_count: 2
+    completed_at: 2026-06-19
+    note: >
+      QA RE-PASS triggered by explicit user instruction ("do a qa repass and fix the email bypass").
+      This SUPERSEDES C3 (preserve email-gate flow EXACTLY) for the bypass-detection path: the user
+      directed the fix, so codex #2 moves from ESCALATED to FIXED. Iterative cross-model loop
+      (codex exec -s read-only): cycles 4-8 each surfaced a real, source-verified bypass of a DETECTED
+      send and were fixed fail-closed in SoT (email-gate-core.ts) + mirrored in the inline fallback
+      (claude.ts), re-vendored (byte-equal), regression-tested both repos; cycle 9 = APPROVE (only a
+      LOW absolute-path over-block, documented intentional). Arc: (4) real-argv-token + per-segment;
+      (5) whole-command + obfuscated-verb decoy + quoted-sep over-block; (6) reject unquoted backslash
+      + IFS-split + newline metachar; (7) NUL-sentinel quote replacement (bash word-concatenation,
+      fail-closed-monotone); (8) bind to direct gws invocation + option-position (closes exec/env
+      wrappers + value-of-option). DETECTION-evasion of a deliberately-obfuscated verb remains the
+      documented egress-proxy boundary (out of scope, unchanged). Accepted fail-closed over-blocks
+      locked as tests. Final: bootstrap guards 393/0, nanoclaw guard surface 77/0, both tsc clean,
+      vendor --check + parity-lint green; 10 full-suite fails are the documented DB-race flakes.
+
+waivers: []
+
+assumptions:
+  - id: A1
+    stage: brief
+    text: "email-gate boundary is the per-adapter gate primitive (D5), not an injected callback."
+    validation: "Design confirms; build verifies Claude/Codex approval-card flow byte-for-byte preserved and OpenCode gets the same flow via its sync primitive."
+    validated: false
+    invalidated_at: null
+  - id: A2
+    stage: brief
+    text: "sanitize-bash = command transform (provider-specific, out of verdict conformance) but its secret-stripping effect is a required parity outcome (C12). mnemon-real = portable verdict, migrate if cheap."
+    validation: "Design records mechanism for the OpenCode env/secret outcome; mnemon-real migrated or explicitly deferred."
+    validated: false
+    invalidated_at: null
+  - id: A3
+    stage: brief
+    text: "Claude-SDK disallowed-tool names map to real OpenCode tool names; the denylist is effective only for names that exist in OpenCode. MCP-prefixed (mcp__server__tool) variants are NOT covered by built-in names."
+    validation: "Build enumerates OpenCode's actual tool names + audits MCP exposure."
+    validated: false
+    invalidated_at: null
+  - id: A4
+    stage: design
+    text: "NANOCLAW_WORKGROUP_ID is readable in-container at agent-runner startup (set container-runner.ts:2136-2146; || null fallback for pre-036 schemas)."
+    validation: "Grounded; build reads process.env.NANOCLAW_WORKGROUP_ID in git-worktrees.ts."
+    validated: true
+    invalidated_at: null
+  - id: A5
+    stage: design
+    text: "Stripping auth env vars from the OpenCode child does not break OpenCode auth (it reads auth.json/XDG, not process.env — opencode.ts:52)."
+    validation: "Grounded; build smoke-tests OpenCode auth after env-strip."
+    validated: true
+    invalidated_at: null
+  - id: A6
+    stage: design
+    text: "[RESOLVED cycle-3 by D15] The denylist is NOT in the core. SDK_DISALLOWED_TOOLS is a static constant single-source in nanoclaw claude.ts:114-124, consumed sync by Claude's disallowedTools arg (claude.ts:1290) and re-exported same-repo by the codex runner (runner.ts:358). No dynamic load, no cross-repo copy — so the original 'feed the SDK arg from the async-loaded core' problem does not exist."
+    validation: "Resolved at design (cycle 3). Build asserts: Claude passes SDK_DISALLOWED_TOOLS, Codex re-exports the same symbol, OpenCode consumes no denylist."
+    validated: true
+    invalidated_at: null
+
+review_cycles:
+  - iteration: 1
+    note: "Pre-design independent review (architecture-advisor, security-reviewer, codex cross-model) of the brief + shipped steps 1-3."
+    blocking_found: 3
+    should_fix_found: 7
+    nice_to_have_found: 3
+    outcome: "All traced to source + accepted. Safe shipped fixes landed (d23df80, f7fa1740); design-level findings folded into this revised brief."
+  - iteration: 2
+    note: "/team-review of design.md (A architecture-advisor, B best-practice-check CONFORMING, C codex adversarial read-only). All MUST-FIX claims fact-checked against source by the lead."
+    must_fix_found: 4
+    should_fix_found: 8
+    wont_fix_found: 3
+    must_fix: ["M1 wrong poll-loop allowlist citation (74-78)", "M2 denylist single-source infeasible via dynamic load (query() sync) -> static + parity test", "M3 tool-denylist no-op on OpenCode (Claude-builtin names absent) -> enumerate + reframe", "M4 Codex runner fails OPEN -> violates HARD C4 -> make fail-closed"]
+    outcome: "Design revised to address all 4 MUST-FIX + 8 SHOULD-FIX (see auto_judgments); re-review = cycle 3."
+    completed_at: 2026-06-19
+  - iteration: 3
+    note: "/team-review of cycle-2-revised design.md (A architecture-advisor, B best-practice-check, C codex adversarial read-only). Architecture confirmed CONFORMING a 3rd time; remaining findings were doc-precision, not structural."
+    must_fix_found: 2
+    should_fix_found: 5
+    wont_fix_found: 1
+    must_fix: ["A-Finding-1 cycle-2 M2 denylist 'cross-repo copy + byte-equal test' is unimplementable (symbol lives only in nanoclaw) -> simplify to single-source nanoclaw + OpenCode enumeration (D15)", "C3-1/A-Finding-2 OpenCode email gate would reuse writeGateRequest which hardcodes request_destructive_gate -> wrong card; parameterize (D16)"]
+    should_fix: ["A-Finding-3 git-clone fail-closed citation -> claude.ts:760-761/768-773", "A-Finding-4 Codex loadGuardCore flip scope = destructive-gate path only, not the 4 imported guards", "C3-3 minimal capability map so 'denied capability' is concrete", "B-LOW1 differential-cores verdict assertion (SoT vs vendored)", "B-LOW2 make OpenCode enumeration a RECURRING gate not a one-time snapshot"]
+    wont_fix: ["A-Finding-5 NIT rename DISALLOWED_TOOLS -> SDK_DISALLOWED_TOOLS in design prose (applied anyway during cleanup)"]
+    outcome: "Design revised (cycle-3): D15 denylist single-source simplification + D16 writeGateRequest parameterization + all SHOULD/NIT folded in. re-review = cycle 4."
+    completed_at: 2026-06-19
+  - iteration: 4
+    note: "/team-review of cycle-3-revised design.md (A architecture-advisor, B best-practice-check CONFORMING 4th time, C codex adversarial read-only). All findings fact-checked against source by the lead (runner.ts + block-destructive-core.ts read end-to-end)."
+    must_fix_found: 1
+    should_fix_found: 5
+    wont_fix_found: 3
+    must_fix: ["M1 [A-Finding-1 + codex-C3] Codex file-protection core (loadFileProtectionCore runner.ts:178-186/195-196) ALSO fails open — same C4 condition D-E only fixed for loadGuardCore; plus 'invalid core' (malformed-but-importable) unhandled -> residual HARD C4 violation (D17)"]
+    should_fix: ["A-Finding-2/codex-C2 D16 gate-primitive refactor mis-described (writeGateRequest positional, called by runNanoclawGate:1063) + export-assertion must cover wrappers", "codex-C4/B-MED make vendor-guards --check a required CI gate", "B-MED vendoring tradeoff stated + packaging-revisit trigger", "A-Finding-5 D-G denylist 'not chain-dispatched' imprecise for Codex (preToolUseHook runner.ts:222)", "codex-C1 doc-clarification: name-exact Claude-builtins => no current parity gap"]
+    wont_fix: ["codex-C1 runtime tool-capability gate = deferred N3 (MVP-OUT)", "A-Finding-3 NIT two-module email path", "A-Finding-4 NIT line ranges (applied)"]
+    outcome: "Design revised (cycle-4): D17 Codex fail-closed completeness (both cores + malformed/throwing -> deny) + 5 SHOULD-FIX folded in. re-review = cycle 5 (FINAL allowed cycle, cap=5)."
+    completed_at: 2026-06-19
+  - iteration: 5
+    note: "/team-review of cycle-4-revised design.md (A architecture-advisor, B best-practice-check, C codex adversarial read-only). FINAL allowed cycle (cap=5). A: CONFORMING 5th time, NO BLOCKERS, M1 genuinely resolved (verified loadFileProtectionCore fail-open + the D17 fix has a same-repo reference impl at claude.ts:738-748). B: design now FULLY CONFORMS, vendoring drift downgraded MEDIUM->LOW (CI-gated, escalation path). C: one finding (D18, applied)."
+    must_fix_found: 0
+    should_fix_found: 1
+    wont_fix_found: 2
+    should_fix: ["codex-C5-1 [APPLIED -> D18] D-A proposed runNanoclawGate with `action` inserted at positional arg 3, breaking existing callback callers (runner.ts:153); fixed with signature-safe wrapper pattern (runGateRequest lower-level + runNanoclawGate signature preserved). Compiler-gated failure mode; A+B found no blockers."]
+    wont_fix: ["A-Finding NIT-1 'stale line numbers' — design cites the SoT (workflow/) :963/:1063 which IS correct; reviewer read the vendored copy (workflow-agents/, +4 banner offset). No change.", "A-Finding NIT-2 carry-forward: when OpenCode warn->throw lands, collapse the dead `...(guardAvailable ? {plugin:[GUARD_PLUGIN]} : {})` ternary at opencode.ts:347 to unconditional. -> /team-plan"]
+    outcome: "MUST-FIX == 0. Design clears review (5/5). codex-C5-1 applied inline (D18). Carry-forward NIT-2 + the 'validate in build' items (required-CI-gate status, mount invariant) go to /team-plan. Stage A clears -> Stage B."
+    completed_at: 2026-06-19
+
+auto_judgments:
+  - stage: Review
+    iteration: 2
+    decision: "M4 — flip Codex container runner loadGuardCore from fail-OPEN to fail-CLOSED on missing/invalid core, to honor HARD constraint C4 and match OpenCode/Claude."
+    alternatives_considered: ["keep Codex fail-open + carve a documented C4 exception (mount-always-present)", "make Codex fail-closed (chosen)"]
+    grounding:
+      - "container/agent-runner/src/codex-hooks/runner.ts:106-116 — loadGuardCore returns null + 'codex running WITHOUT the gate' (fail-open), verified by lead"
+      - "brief C4 (HARD): fail-closed everywhere incl. guard-absent — decisions.yaml"
+      - "review finding A10 (architecture-advisor) + codex C4/C6"
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false   # Codex refusing on a missing mount is operational, not product-user-facing; mount is an always-present invariant on this fleet
+      changes_hard_constraint: false      # honors existing HARD C4
+      weakens_safety_invariant: false     # strengthens the guard (deny on absent); the prior fail-open was an availability choice, not a safety invariant
+    recorded_at: 2026-06-19
+  - stage: Review
+    iteration: 2
+    decision: "M2 — make the canonical DISALLOWED_TOOLS a STATIC constant pinned by a parity test, not a dynamically-loaded single source, because Claude's query() is sync and cannot await-load the vendored core for the SDK disallowedTools arg."
+    alternatives_considered: ["dynamic await-import for the SDK arg (infeasible — query() is sync)", "make query() async (caller churn)", "static constant + cross-copy parity test (chosen)"]
+    grounding:
+      - "container/agent-runner/src/providers/claude.ts:1211 — query(input): AgentQuery is sync; :1290 passes disallowedTools synchronously (verified)"
+      - "review finding A2 + codex C3"
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-06-19
+  - stage: Review
+    iteration: 2
+    decision: "M3 — reframe D-D tool-denylist: the 9 Claude-builtin names don't exist in OpenCode (no-op), so parity for them is satisfied by absence; substantive parity = design-time enumeration of OpenCode's real tool set + build audit that no exposed capability is one Claude/Codex deny. Keep the name-check as defense-in-depth; don't write dispatch tests against impossible tools."
+    alternatives_considered: ["literal 9-name check as the parity mechanism (no-op false confidence)", "absence + enumeration/audit + defense-in-depth (chosen)", "full capability-normalization layer (deferred — N3)"]
+    grounding:
+      - "claude.ts:114-124 — SDK_DISALLOWED_TOOLS are CamelCase Claude-Code builtins; opencode tools are lowercase domain tools (opencode-guard.ts:114, file-protection-core.ts:46-47) — verified"
+      - "review finding A3 + codex C2"
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false   # clarifies how the existing 'OpenCode denylist parity' requirement is met; doesn't remove it
+      weakens_safety_invariant: false
+    recorded_at: 2026-06-19
+  - stage: Review
+    iteration: 3
+    decision: "A-Finding-1 — simplify the denylist to single-source in nanoclaw (D15): drop the cycle-2 cross-repo copy + byte-equal parity test; SDK_DISALLOWED_TOOLS stays in claude.ts (consumed sync by Claude + same-repo re-export by Codex), OpenCode adds no runtime denylist, parity is a recurring OpenCode tool-enumeration test."
+    alternatives_considered: ["cross-repo copy + byte-equal test (cycle-2 M2 — unimplementable: symbol lives only in nanoclaw, vendor-guards is one-way)", "vendor the constant into the core (needless surface; only same-repo consumers)", "single-source nanoclaw + OpenCode enumeration (chosen)"]
+    grounding:
+      - "claude.ts:114-124 SDK_DISALLOWED_TOOLS + :1290 sync disallowedTools arg; runner.ts:358 same-repo re-export — verified by lead"
+      - "cycle-3 review finding A-Finding-1 (architecture-advisor) + codex C3-2 (no production OpenCode denylist to dispatch-test)"
+      - "scripts/vendor-guards.mjs — vendor reaches workflow->workflow-agents one way only; bootstrap has no nanoclaw symbol"
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false   # still meets the 'denylist parity' requirement, by a feasible mechanism
+      weakens_safety_invariant: false  # OpenCode denylist check was a verified no-op; enumeration test is stronger drift protection
+    recorded_at: 2026-06-19
+  - stage: Review
+    iteration: 3
+    decision: "C3-1/A-Finding-2 — parameterize writeGateRequest into runDestructiveGate/runEmailGate (D16) so OpenCode's email gate emits request_bash_gate (correct card) instead of the hardcoded request_destructive_gate."
+    alternatives_considered: ["OpenCode email reuses writeGateRequest as-is (emits wrong card type — silent degradation)", "parameterize action + thin wrappers (chosen)"]
+    grounding:
+      - "block-destructive-core.ts:963 — writeGateRequest hardcodes action:'request_destructive_gate' (verified)"
+      - "src/modules/bash-gate/index.ts:293-310 — host routes request_destructive_gate vs request_bash_gate to different cards"
+      - "claude.ts:668-702 — Claude/Codex email path already uses request_bash_gate via awaitDeliveryAck"
+      - "cycle-3 review finding C3-1 (codex) + A-Finding-2 (architecture-advisor)"
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false   # makes OpenCode's email card MATCH Claude/Codex; corrects a divergence, doesn't introduce one
+      changes_hard_constraint: false      # honors C3 (preserve the approval flow) + C1 (single-source)
+      weakens_safety_invariant: false
+    recorded_at: 2026-06-19
+  - stage: Review
+    iteration: 4
+    decision: "M1 — extend D-E's Codex fail-closed flip to BOTH dynamically-loaded cores (loadGuardCore AND loadFileProtectionCore) + handle 'invalid' core (validate export types, map evaluator exceptions to deny), not just 'missing'; export-validation covers gate primitives too (D17). Closes a residual HARD C4 violation the cycle-3 design left open."
+    alternatives_considered: ["flip only loadGuardCore (leaves file-protection fail-open -> C4 violation)", "handle 'missing' only (malformed-importable core throws outside deny path)", "flip both cores + validate exports + exceptions->deny (chosen)"]
+    grounding:
+      - "container/agent-runner/src/codex-hooks/runner.ts:178-186 loadFileProtectionCore `catch { return null // fail-open }` + :195-196 runFileProtection `if (!core) return null` — read end-to-end by lead (fail-open CONFIRMED)"
+      - "runner.ts:106-116/138-139 loadGuardCore/runDestructiveGuard fail-open (the path D-E already flips) — same condition"
+      - "runner.ts:141 core.evaluateBashCommand + :197 core.checkEditProtection called with no export-type validation -> malformed core throws (codex-C3)"
+      - "decisions.yaml C4 (HARD): fail-closed everywhere incl. guard-absent; design D-G claims 'uniform fail-closed'"
+      - "cycle-4 review finding A-Finding-1 (architecture-advisor) + codex-C3"
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false   # only changes behavior when a mounted core is absent/malformed — an always-present fleet invariant; same shape as the loadGuardCore flip already in D-E
+      changes_hard_constraint: false      # COMPLETES the existing HARD C4 ('fix BOTH adapters'); does not change C4
+      weakens_safety_invariant: false     # strengthens (deny on absent/malformed/throwing); prior fail-open was an availability choice, not a safety invariant
+    recorded_at: 2026-06-19
+  - stage: Review
+    iteration: 5
+    decision: "codex-C5-1 — replace D-A's positional `action` insertion with a signature-safe wrapper pattern (D18): keep runNanoclawGate(command,reason,onStageError?) unchanged; add internal `action` to writeGateRequest + a lower-level runGateRequest; runEmailGate/runNanoclawGate are the two wrappers. Applied inline (SHOULD-FIX, compiler-gated) rather than escalated, per Principle 3 (in-scope, citable grounding)."
+    alternatives_considered: ["positional action arg 3 (breaks existing callback callers — runner.ts:153)", "signature-safe wrapper pattern (chosen)"]
+    grounding:
+      - "container/agent-runner/src/codex-hooks/runner.ts:153 — runNanoclawGate(command, reason, () => { staged = false; }) passes onStageError as arg 3 (verified by lead)"
+      - "block-destructive-core.ts:1056-1063 SoT — runNanoclawGate(command, reason, onStageError?) signature + writeGateRequest(reason, reason, command) sole call (verified)"
+      - "cycle-5 review finding codex-C5-1 (adversarial); A + B returned no blockers"
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false   # preserves the existing destructive-gate behavior + card; corrects a would-be regression, introduces none
+      changes_hard_constraint: false      # honors C1 (single-source) + C3 (preserve approval flow)
+      weakens_safety_invariant: false
+    recorded_at: 2026-06-19
+  - stage: Build
+    iteration: 1
+    decision: "A3 email-gate scheduled-task polarity — corrected the plan's inverted ASSERT to match verbatim source: scheduled tasks BYPASS (allow), interactive sessions GATE. builder-A flagged the spec-vs-source contradiction; ruled faithful-to-source."
+    alternatives_considered: ["spec as written (isScheduledTask=true -> gate) — INVERTS source, rejected", "faithful-to-source (scheduled bypass, interactive gate) — chosen"]
+    grounding:
+      - "claude.ts:617-619 — `if (NANOCLAW_IS_SCHEDULED_TASK === '1') return {}` (bypass=allow), read end-to-end by lead"
+      - "claude.ts:613-615 — EMAIL_BYPASS_RE --dry-run/--draft also bypasses (preserved)"
+      - "C3 (HARD): preserve the existing email-gate human-approval flow EXACTLY — faithful-to-source is the contract, not a discretionary choice"
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false   # corrects the port to MATCH existing prod behavior; a wrong port would have changed it
+      changes_hard_constraint: false      # enforces C3
+      weakens_safety_invariant: false     # gating MORE (interactive) and bypassing automated is the existing, intended posture
+    recorded_at: 2026-06-19
+  - stage: Build
+    iteration: 1
+    decision: "G4 owner-mode hardening — fixed core.ts isAllowedFilePath bare-startsWith to a path.sep boundary (matching poll-loop.ts:87-88) so the send_file allowlist rejects prefix-lookalikes (e.g. /workspace/workgroup-evil). Beyond G4's literal 'add the prefix' scope but on the same allowlist G modified."
+    alternatives_considered: ["leave bare-startsWith (G's out-of-scope default — leaves a lookalike hole for ALL prefixes)", "harden to path.sep boundary matching poll-loop (chosen)"]
+    grounding:
+      - "container/agent-runner/src/mcp-tools/core.ts:44 bare `p.startsWith(prefix)` — verified by lead"
+      - "container/agent-runner/src/poll-loop.ts:87-88 — the correct boundary pattern already in-repo (reference)"
+      - "docs/project-scope.md security_surface: 'agent-issued filesystem actions must respect mount allowlist'"
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false   # only rejects prefix-lookalike paths no legitimate path uses; tightening
+      changes_hard_constraint: false
+      weakens_safety_invariant: false     # strengthens the send_file allowlist integrity
+    recorded_at: 2026-06-19
+  - stage: QA
+    iteration: 1
+    decision: "M-QA1 — closed a Codex guard fail-OPEN found by cross-model QA (codex E #1+#3 + swarm rev-adversarial). cli.ts now denies on PreToolUse runtime error (was {continue:true}=run); runDestructiveGuard validates verdict SHAPE (deny on null/undefined/unknown-action); chain loop wraps await hook() in try/catch->deny. Closes the throw/malformed-verdict fail-open that defeated the feature's fail-closed claim."
+    alternatives_considered: ["leave fail-open (pre-existing cli.ts) — rejected, defeats C4 + the feature's core claim", "fix only runner.ts per-path — rejected, cli.ts is the comprehensive backstop", "defense-in-depth cli.ts + runner.ts verdict-shape + chain try/catch (chosen)"]
+    grounding:
+      - "container/agent-runner/src/codex-hooks/cli.ts:41-45 — caught error -> {continue:true}+exit0 (fail-open), verified by lead"
+      - "runner.ts runDestructiveGuard — verdict.action access was OUTSIDE the try/catch; validateGuardCore only checks export is a function not the return shape (codex #1)"
+      - "rev-adversarial verified vs codex-rs hooks/src/engine/output_parser.rs: continue:true+exit0 = tool RUNS; only permissionDecision:deny or exit 2 blocks"
+      - "C4 (HARD): fail-closed everywhere incl. guard errors"
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false   # only changes the ERROR path (malformed/throwing guard) from allow->deny; a security tightening, the feature's own intent
+      changes_hard_constraint: false      # ENFORCES C4
+      weakens_safety_invariant: false     # strengthens (closes a fail-open)
+    recorded_at: 2026-06-19
+  - stage: QA
+    iteration: 1
+    decision: "codex #2 (email --dry-run/-h-in-content bypass) NOT auto-fixed — escalated to ship gate. It's a verbatim port of the existing prod source (pre-existing, not introduced), C3 mandates preserving the email flow exactly, fixing it changes observable email-gate behavior, and it doesn't block parity (all 3 adapters identical). Per /team-auto, a HARD-constraint/behavior change is escalated to the user, not autonomously applied."
+    alternatives_considered: ["auto-fix the bypass — rejected (violates C3, changes behavior, pre-existing/out-of-scope)", "flag prominently for the ship decision (chosen)"]
+    grounding:
+      - "rev-domain: evaluateEmailSendInline is a line-for-line verbatim port of workflow/email-gate-core.ts:129-190 (pre-existing)"
+      - "C3 (HARD): preserve the email-gate flow EXACTLY"
+      - "codex E #2 HIGH 0.95 — real bypass, but identical across all 3 adapters (parity holds)"
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false   # by NOT changing it (the escalation); fixing WOULD change behavior, hence escalated
+      changes_hard_constraint: false
+      weakens_safety_invariant: false     # pre-existing posture, faithfully preserved; flagged for the owner to decide
+    recorded_at: 2026-06-19
+  - stage: Build
+    iteration: 1
+    decision: "Accepted builder-E's +1-line edit to db/connection.ts (OUTSIDE E's owned files) — added `error TEXT` to initTestSessionDb's `delivered` test-fixture table. E flagged it (did not silently expand). Verified it's a test-fixture/production parity fix, not a behavior change."
+    alternatives_considered: ["reject the out-of-scope edit + have E find another way", "accept the verified fixture-parity fix (chosen)"]
+    grounding:
+      - "src/db/schema.ts:215 — the REAL `delivered` table HAS `error TEXT` (verified by lead); the test fixture was missing it, so awaitDeliveryAck's `SELECT ...,error...` threw against the fixture"
+      - "git diff: connection.ts change is exactly +1 line (the fixture column); no production code path touched"
+      - "no team group owns db/connection.ts — no cross-group write conflict"
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false   # test-only fixture; brings the fixture into parity with the real schema
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-06-19

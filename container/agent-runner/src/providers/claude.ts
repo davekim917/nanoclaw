@@ -14,6 +14,7 @@ import {
 
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/connection.js';
 import { registerProvider, registerProviderConfigSchema } from './provider-registry.js';
+import { buildSecretEnvVarList, MCP_HEADER_ONLY_SECRET_VARS } from './secret-env.js';
 import type { AgentProvider, AgentQuery, McpServerConfig, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
 import { autoCommitDirtyWorktrees } from '../worktree-autosave.js';
 import { createBlockMnemonRealHook } from '../modules/memory/block-mnemon-real-hook.js';
@@ -335,14 +336,13 @@ export function createPreCompactHook(assistantName?: string): HookCallback {
 
 // ── Bash secret sanitization hook ──
 
-// ANTHROPIC_API_KEY and its _N fallback variants (_2, _5, ...).
-const ANTHROPIC_KEY_RE = /^ANTHROPIC_API_KEY(_\d+)?$/;
+// ANTHROPIC_API_KEY _N fallback variants (_2, _5, ...). The base-name match
+// (ANTHROPIC_KEY_RE) lives in secret-env.ts with the Bash-sanitize list.
 const ANTHROPIC_FALLBACK_RE = /^ANTHROPIC_API_KEY_(\d+)$/;
 
-// CLAUDE_CODE_OAUTH_TOKEN (Claude Max subscription) + _N fallback variants.
+// CLAUDE_CODE_OAUTH_TOKEN (Claude Max subscription) _N fallback variants.
 // Parallel rotation list to API-key fallbacks — when the host operates on
 // OAuth (no ANTHROPIC_API_KEY), retryable errors advance through these.
-const OAUTH_KEY_RE = /^CLAUDE_CODE_OAUTH_TOKEN(_\d+)?$/;
 const OAUTH_FALLBACK_RE = /^CLAUDE_CODE_OAUTH_TOKEN_(\d+)$/;
 
 // Retryable upstream errors. v1's list — see
@@ -408,25 +408,8 @@ export const SUBSCRIPTION_BLOCKED_RE =
 // with a recap. See STALE_SESSION_RE for how continuations get poisoned.
 export const POISONED_CONTINUATION_RE = /invalid `?signature`? in `?thinking`? block/i;
 
-// Secrets the SDK needs for API auth but that Bash subprocesses must not see.
-// Built lazily inside the hook so late-bound env additions are covered.
-//
-// NANOCLAW_GH_TOKEN / GH_TOKEN / GITHUB_TOKEN are deliberately NOT in this
-// list. Stripping them would break the very thing the URL-scoped credential
-// helper is trying to enable: git invokes its helper via a subprocess that
-// inherits the Bash env, and the helper reads NANOCLAW_GH_TOKEN from there
-// to hand back to git. An agent that wants to exfiltrate the token can
-// `printenv` it — the mitigation is at the URL-scoped helper (token is
-// useless outside the allowlisted orgs) and at auth-level controls on
-// GitHub's side, not at the bash-env boundary.
-function buildSecretEnvVarList(): string[] {
-  return [
-    ...Object.keys(process.env).filter((k) => ANTHROPIC_KEY_RE.test(k)),
-    ...Object.keys(process.env).filter((k) => OAUTH_KEY_RE.test(k)),
-    'GMAIL_OAUTH_PATH',
-    'GMAIL_CREDENTIALS_PATH',
-  ];
-}
+// buildSecretEnvVarList (the Bash-sanitize unset list) lives in secret-env.ts —
+// an SDK-free module so sibling adapters can import the same single-source list.
 
 export function createSanitizeBashHook(): HookCallback {
   return async (input) => {
@@ -459,6 +442,51 @@ function denyBash(reason: string) {
   };
 }
 
+// ── Shared block-destructive-core evaluator loader ──
+// The advisory bash guards (self-approval, snowflake-connector, git-clone) all
+// delegate to PURE evaluators in the shared guard core (block-destructive-core.ts),
+// the same module the OpenCode plugin and the Codex runner consume. Each adapter
+// dynamic-imports it from the mounted bootstrap plugin (bun caches the module).
+// The inline regexes below are a fail-CLOSED FALLBACK only, used when the mount
+// is absent (e.g. unit tests, a plugin-less install). Single source of truth =
+// the core; the fallbacks reproduce its verdict and must stay in sync.
+type CommandEvaluator = (command: string) => { action: 'allow' | 'block'; reason?: string };
+
+// Default container path to the mounted bootstrap guard core. Overridable via
+// NANOCLAW_DESTRUCTIVE_GUARD_CORE (same env var the Codex runner uses) so unit
+// tests can point at a fixture core. Resolved fresh per call so a test that sets
+// the override sees it even after an earlier default-path attempt cached a miss.
+const DEFAULT_GUARD_CORE_PATH =
+  '/workspace/plugins/bootstrap/plugins/workflow-agents/hooks/guards/block-destructive-core.ts';
+function guardCorePath(): string {
+  return process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE || DEFAULT_GUARD_CORE_PATH;
+}
+
+// Memo keyed by `<resolvedPath>::<exportName>`: undefined = not yet attempted,
+// null = unavailable/mistyped. Keying on the path means an override swap (tests)
+// re-imports instead of returning a stale verdict for a different core.
+const _coreEvaluators: Record<string, CommandEvaluator | null | undefined> = {};
+
+/**
+ * Dynamic-import a named pure evaluator from the shared guard core and validate
+ * it is a function. Returns null (memoized) when the core can't be imported or
+ * the export is missing / not a function — callers MUST then fall back to their
+ * inline fail-closed policy.
+ */
+async function loadCoreEvaluator(exportName: string): Promise<CommandEvaluator | null> {
+  const corePath = guardCorePath();
+  const key = `${corePath}::${exportName}`;
+  if (_coreEvaluators[key] !== undefined) return _coreEvaluators[key]!;
+  try {
+    const core = (await import(corePath)) as Record<string, unknown>;
+    const fn = core[exportName];
+    _coreEvaluators[key] = typeof fn === 'function' ? (fn as CommandEvaluator) : null;
+  } catch {
+    _coreEvaluators[key] = null;
+  }
+  return _coreEvaluators[key]!;
+}
+
 // ── Self-approval block ──
 // The bootstrap/plugins/workflow plugin's block-destructive hook gates
 // destructive filesystem ops behind a file-based approval at
@@ -467,18 +495,32 @@ function denyBash(reason: string) {
 // .claude-destructive-gate`, `echo … > .claude-destructive-gate`, etc.).
 // Admin approval must come through the chat channel, not the agent's own
 // filesystem writes. v1 `createSelfApprovalBlockHook` equivalent.
+// Delegates to the shared core's evaluateSelfApproval; the inline regex is the
+// fail-closed fallback when the core is unavailable.
 const SELF_APPROVAL_RE = /\.claude-destructive-gate/;
+const SELF_APPROVAL_BLOCK_MSG =
+  'Self-approval of destructive operation gates is not allowed. Approval must come from the user via the chat channel, not by writing .claude-destructive-gate yourself.';
 
 export function createSelfApprovalBlockHook(): HookCallback {
   return async (input) => {
     const pre = input as PreToolUseHookInput;
     const command = (pre.tool_input as { command?: string })?.command;
     if (!command) return {};
-    if (SELF_APPROVAL_RE.test(command)) {
-      return denyBash(
-        'Self-approval of destructive operation gates is not allowed. Approval must come from the user via the chat channel, not by writing .claude-destructive-gate yourself.',
-      );
+
+    const evaluator = await loadCoreEvaluator('evaluateSelfApproval');
+    if (evaluator) {
+      try {
+        const verdict = evaluator(command);
+        // Fail-closed: anything that isn't an explicit `allow` is a block.
+        if (verdict?.action !== 'allow') return denyBash(verdict?.reason ?? SELF_APPROVAL_BLOCK_MSG);
+        return {};
+      } catch {
+        // evaluator threw — fall through to the inline fallback.
+      }
     }
+
+    // Fallback: shared core unavailable/threw — apply the inline policy, fail-closed.
+    if (SELF_APPROVAL_RE.test(command)) return denyBash(SELF_APPROVAL_BLOCK_MSG);
     return {};
   };
 }
@@ -495,18 +537,32 @@ export function createSelfApprovalBlockHook(): HookCallback {
 // credentials when the snow CLI is actually invoked — a larger arch
 // change. In the current model the hook nudges the agent toward `snow
 // sql` for normal cases and raises the friction for unintended paths.
+// Delegates to the shared core's evaluateSnowflakeConnector; the inline regex
+// is the fail-closed fallback when the core is unavailable.
 const SNOWFLAKE_CONNECTOR_EXEC_RE = /\bpython[23]?\b.*\bsnowflake[._]connector\b/i;
+const SNOWFLAKE_CONNECTOR_BLOCK_MSG =
+  'Direct use of Python snowflake.connector is blocked. Use `snow sql` for ad-hoc queries. If `snow` isn\'t working, report the error rather than falling back to the Python connector.';
 
 export function createBlockSnowflakeConnectorHook(): HookCallback {
   return async (input) => {
     const pre = input as PreToolUseHookInput;
     const command = (pre.tool_input as { command?: string })?.command;
     if (!command) return {};
-    if (SNOWFLAKE_CONNECTOR_EXEC_RE.test(command)) {
-      return denyBash(
-        'Direct use of Python snowflake.connector is blocked. Use `snow sql` for ad-hoc queries. If `snow` isn\'t working, report the error rather than falling back to the Python connector.',
-      );
+
+    const evaluator = await loadCoreEvaluator('evaluateSnowflakeConnector');
+    if (evaluator) {
+      try {
+        const verdict = evaluator(command);
+        // Fail-closed: anything that isn't an explicit `allow` is a block.
+        if (verdict?.action !== 'allow') return denyBash(verdict?.reason ?? SNOWFLAKE_CONNECTOR_BLOCK_MSG);
+        return {};
+      } catch {
+        // evaluator threw — fall through to the inline fallback.
+      }
     }
+
+    // Fallback: shared core unavailable/threw — apply the inline policy, fail-closed.
+    if (SNOWFLAKE_CONNECTOR_EXEC_RE.test(command)) return denyBash(SNOWFLAKE_CONNECTOR_BLOCK_MSG);
     return {};
   };
 }
@@ -542,15 +598,74 @@ export function createBlockSnowflakeConnectorHook(): HookCallback {
 // awaitDeliveryAck. Up to 60 minutes (must match host-side BASH_GATE_TIMEOUT_MS).
 export const GWS_EMAIL_SEND_RE =
   /\bgws\s+gmail\s+(?:\+(?:send|reply|reply-all|forward)|users\s+(?:messages|drafts)\s+send)\b/;
-// `(?:\s|$)` anchor prevents `--dry-run=false` from matching. The prior
-// `\b` alone was satisfied by `=`, which turned the guard into a trivial
-// bypass: `gws gmail +send --dry-run=false --to attacker@…` skipped the
-// approval while still sending.
-//
-// `--help` / `-h` are also exempt — they never send, they just print the
-// CLI manpage. Without this bypass every agent exploration of the gws
-// gmail surface ("gws gmail +send --help") lights up an approval card.
-const EMAIL_BYPASS_RE = /\s(?:--(?:dry-run|draft|help)|-h)(?:\s|$)/;
+/** Inline mirror of email-gate-core.ts (this is the fail-closed FALLBACK, so it
+ *  can't import the core). Keep in sync with the SoT. QA codex-#2/#3/#4. */
+const EMAIL_BYPASS_FLAGS = new Set(['--dry-run', '--draft', '--help', '-h']);
+// Includes `#` (comment: `… --body x # --dry-run` drops the flag at runtime) and
+// the NEWLINE separator `\n\r` — the bypass check runs on the WHOLE command, so a
+// `--dry-run\n<real send>` decoy must fail closed here (else `\s+` token-splitting
+// treats the newline as whitespace and the decoy's --dry-run reads as real argv
+// while bash runs the second line). Mirrors the SoT SHELL_METACHAR_RE.
+// QA codex re-pass #4 (comment) + #5 (newline decoy).
+const EMAIL_SHELL_METACHAR_RE = /[<>|;&$`(){}#\n\r]/;
+
+/** A bypass flag (--dry-run/--draft/--help/-h) is honored only as a real argv
+ *  token in a SIMPLE gws command: strip quoted content in all four bash quote
+ *  forms (ANSI-C `$'…'` and locale `$"…"` first, then plain `'…'`/`"…"`,
+ *  escape-aware), fail closed on unbalanced quotes, on any unquoted BACKSLASH
+ *  (a shell escape — `--body \ --dry-run` joins `\ ` into the body so gws gets no
+ *  real flag), OR any unquoted shell metacharacter (redirects / pipes /
+ *  expansions / grouping / comments / newlines can divert the token from gws's
+ *  argv while the mail still sends), then split on bash IFS (space/tab/newline,
+ *  not JS \s) and match a whole flag token. After these rejections the tokens
+ *  EXACTLY equal bash's argv words. Mirrors the SoT bypassFlagIsRealArgvToken.
+ *  QA codex re-pass #1 (subshell) + #3 (redirection) + #4 (comment, ANSI-C)
+ *  + #5 (newline) + #6 (backslash / non-IFS whitespace). */
+// Non-IFS, non-flag, non-metachar placeholder for a stripped quoted span. Using
+// a sentinel (not a space) keeps bash word-concatenation: `--body 'x'--dry-run`
+// joins to one word `x--dry-run` (no real flag), so the replacement must keep it
+// one token — a space would manufacture a bogus --dry-run (codex #7). Mirrors SoT.
+const EMAIL_QUOTED_SPAN_SENTINEL = '\x00';
+const EMAIL_LEADING_ASSIGNMENT_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
+/** Mirrors SoT bypassFlagIsRealArgvToken: quote→sentinel, reject quote/backslash/
+ *  metachar, then bind to a DIRECT gws invocation (skip VAR=value, require first
+ *  word `gws` so a wrapper like `exec -a --dry-run gws …` can't swallow the flag —
+ *  codex #8) and honor a bypass flag only in OPTION position (not as a prior bare
+ *  option's value). Fail-closed: every step only makes bypass LESS likely. */
+function emailBypassIsRealArgvToken(gwsSegment: string): boolean {
+  // Strip NON-expanding quotes first (single + ANSI-C $'…' — no expansion), then
+  // fail closed on a `$(`/backtick inside an EXPANDING span ("…" / locale $"…"):
+  // bash still runs COMMAND SUBSTITUTION there, so `--dry-run --body "$(gws …
+  // +send --to victim)"` would shell out a REAL send before the no-op flag — the
+  // NUL-strip would otherwise hide it from the metachar check. Inspect the span
+  // CONTENT (capture group) so the locale `$` prefix isn't counted. Only command
+  // substitution executes — bare `$VAR`/`$5` is parameter expansion, so a legit
+  // `--body "cost is $5"` must still bypass. Mirrors SoT. (codex #126 P1)
+  const safeStripped = gwsSegment
+    .replace(/\$'(?:[^'\\]|\\.)*'/g, EMAIL_QUOTED_SPAN_SENTINEL)
+    .replace(/'[^']*'/g, EMAIL_QUOTED_SPAN_SENTINEL);
+  const expandingQuoteRe = /\$?"((?:[^"\\]|\\.)*)"/g;
+  for (let m = expandingQuoteRe.exec(safeStripped); m !== null; m = expandingQuoteRe.exec(safeStripped)) {
+    if (m[1].includes('$(') || m[1].includes('`')) return false; // command substitution in expanding quotes → don't bypass
+  }
+  const unquoted = safeStripped
+    .replace(/\$"(?:[^"\\]|\\.)*"/g, EMAIL_QUOTED_SPAN_SENTINEL)
+    .replace(/"(?:[^"\\]|\\.)*"/g, EMAIL_QUOTED_SPAN_SENTINEL);
+  if (unquoted.includes("'") || unquoted.includes('"')) return false;
+  if (unquoted.includes('\\')) return false; // unquoted backslash escape → don't bypass (codex #6)
+  if (EMAIL_SHELL_METACHAR_RE.test(unquoted)) return false;
+  const tokens = unquoted.split(/[ \t\n]+/).filter((t) => t.length > 0); // bash IFS, not JS \s
+  let i = 0;
+  while (i < tokens.length && EMAIL_LEADING_ASSIGNMENT_RE.test(tokens[i])) i++; // skip VAR=value
+  if (tokens[i] !== 'gws') return false; // direct gws invocation only, no wrapper (codex #8)
+  for (let j = i + 1; j < tokens.length; j++) {
+    if (!EMAIL_BYPASS_FLAGS.has(tokens[j])) continue;
+    const prev = tokens[j - 1];
+    const prevConsumesValue = prev.startsWith('-') && !prev.includes('='); // bare -x/--opt eats next word
+    if (!prevConsumesValue) return true;
+  }
+  return false;
+}
 
 /**
  * Decode the RFC 822 envelope from `--json '{"raw":"<base64url>"}'` so the
@@ -601,70 +716,183 @@ export function envelopeFromJsonRaw(segment: string): {
   return out;
 }
 
+// Email-gate verdict shape (mirrors email-gate-core.ts EmailGateVerdict). PURE.
+type EmailGateVerdict = { action: 'allow' | 'gate'; label?: string; summary?: string; reason?: string };
+type EmailGateEvaluator = (command: string, env: { isScheduledTask: boolean }) => EmailGateVerdict;
+
+// Default container path to the vendored email-gate core. Overridable via
+// NANOCLAW_EMAIL_GATE_CORE for unit tests (mirrors the guard-core override).
+const DEFAULT_EMAIL_GATE_CORE_PATH =
+  '/workspace/plugins/bootstrap/plugins/workflow-agents/hooks/guards/email-gate-core.ts';
+function emailGateCorePath(): string {
+  return process.env.NANOCLAW_EMAIL_GATE_CORE || DEFAULT_EMAIL_GATE_CORE_PATH;
+}
+// Memo keyed by resolved path so an override swap re-imports.
+const _emailGateEvaluators: Record<string, EmailGateEvaluator | null | undefined> = {};
+
+async function loadEmailGateEvaluator(): Promise<EmailGateEvaluator | null> {
+  const corePath = emailGateCorePath();
+  if (_emailGateEvaluators[corePath] !== undefined) return _emailGateEvaluators[corePath]!;
+  try {
+    const core = (await import(corePath)) as { evaluateEmailSend?: EmailGateEvaluator };
+    _emailGateEvaluators[corePath] =
+      typeof core.evaluateEmailSend === 'function' ? core.evaluateEmailSend : null;
+  } catch {
+    _emailGateEvaluators[corePath] = null;
+  }
+  return _emailGateEvaluators[corePath]!;
+}
+
+/**
+ * Inline fail-CLOSED fallback that reproduces evaluateEmailSend's decision +
+ * card-build when the shared core can't be imported (unit tests, plugin-less
+ * install). Verbatim port of the policy in email-gate-core.ts so the fallback
+ * can never drift OPEN relative to the core. Keep in sync with the core.
+ */
+function evaluateEmailSendInline(command: string, env: { isScheduledTask: boolean }): EmailGateVerdict {
+  if (!command || !GWS_EMAIL_SEND_RE.test(command)) return { action: 'allow' };
+
+  // Bypass ONLY when the WHOLE command is a single, simple send carrying a real
+  // bypass flag — no shell separators, no metacharacters, no second command.
+  // Checking the whole command (not a per-segment slice) collapses the decoy
+  // class: `: gws gmail +send --dry-run; <real send>` contains a `;`, so the
+  // metacharacter check refuses the bypass and the gate fires — whether the real
+  // send is regex-visible OR obfuscated (`+se''nd`). A determined adversary can
+  // still evade DETECTION at the shell layer (egress proxy is the sound boundary
+  // — see email-gate-core.ts header), but no bypass-flag decoy rides past the
+  // gate. Keep in sync with email-gate-core.ts evaluateEmailSend (QA codex #4/#5).
+  if (emailBypassIsRealArgvToken(command)) return { action: 'allow' };
+
+  // Scheduled tasks intentionally bypass — v1 also did this so
+  // automated email reports aren't prompted every run.
+  if (env.isScheduledTask) return { action: 'allow' };
+
+  // Card fields are extracted from the WHOLE command: in a decoy chain the real
+  // send (and its recipient) may live in a segment that doesn't cleanly match
+  // GWS_EMAIL_SEND_RE (obfuscated verb), so a per-segment pick can miss it. The
+  // gate has already fired; the card is best-effort (raw command is in the
+  // tool-call log). Mirrors email-gate-core.ts.
+  const gwsSegment = command;
+
+  // Parse the email envelope so the card shows structured fields
+  // instead of raw shell. Each matcher handles both --flag 'quoted'
+  // and --flag unquoted. Helper-verb sends carry envelope as flags;
+  // raw-API sends carry it as base64url RFC 822 inside `--json '{"raw":…}'`.
+  const matchFlag = (flag: string): string | undefined => {
+    const quoted = gwsSegment.match(new RegExp(`${flag}\\s+['"]([^'"]+)['"]`));
+    if (quoted) return quoted[1];
+    const bare = gwsSegment.match(new RegExp(`${flag}\\s+(\\S+)`));
+    return bare?.[1];
+  };
+  const flagTo = matchFlag('--to');
+  const envelope = !flagTo ? envelopeFromJsonRaw(gwsSegment) : {};
+  const to = flagTo ?? envelope.to ?? 'unknown recipient';
+  const subject = matchFlag('--subject') ?? envelope.subject ?? '';
+  const body = matchFlag('--body') ?? '';
+  const cc = matchFlag('--cc') ?? envelope.cc;
+  const bcc = matchFlag('--bcc') ?? envelope.bcc;
+  const isHtml = /\s--html(?:\s|$)/.test(gwsSegment);
+  // Parse the sending identity from GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE.
+  // Path convention: /home/node/.config/gws/accounts/<slug>.json.
+  // The slug is the human-facing account name the user configured.
+  const credsMatch = command.match(
+    /GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=\S*?\/accounts\/([\w.-]+)\.json/,
+  );
+  const fromAccount = credsMatch?.[1] ?? 'default';
+  // Anchor to the four allowed helper verbs only — the prior `\+(\w[\w-]*)`
+  // could capture spurious `+ABC` substrings from a base64 payload in the
+  // raw-API form. Falls back to "send" for the raw form (which has no +verb).
+  const action = gwsSegment.match(/\+(send|reply|reply-all|forward)\b/)?.[1] ?? 'send';
+  const label = subject ? `Email ${action} to ${to}: "${subject}"` : `Email ${action} to ${to}`;
+
+  // No `command` field on the payload → host's buildCardBody skips
+  // its code-block branch entirely. Full raw command is still in the
+  // SDK tool-call log for audit; we just don't surface shell noise
+  // to the approver.
+  const lines: string[] = [`*From:* ${fromAccount}`, `*To:* ${to}`];
+  if (cc) lines.push(`*Cc:* ${cc}`);
+  if (bcc) lines.push(`*Bcc:* ${bcc}`);
+  if (subject) lines.push(`*Subject:* ${subject}`);
+  if (body) {
+    const bodyPreview = body.length > 400 ? body.slice(0, 400) + '…' : body;
+    lines.push('', isHtml ? '*Body* (HTML):' : '*Body:*', `> ${bodyPreview.replace(/\n/g, '\n> ')}`);
+  }
+  const summary = lines.join('\n');
+
+  return { action: 'gate', label, summary };
+}
+
+/** Derive the email verb for user-facing deny wording ("Email reply blocked: …").
+ *  The core verdict carries only label/summary, not the bare verb, so re-derive
+ *  it here the same way the core does. */
+function emailActionVerb(command: string): string {
+  const segments = command.split(/[;&|]\s*|\s*&&\s*|\s*\|\|\s*|\n/);
+  const gwsSegment = segments.find((s) => GWS_EMAIL_SEND_RE.test(s)) ?? command;
+  return gwsSegment.match(/\+(send|reply|reply-all|forward)\b/)?.[1] ?? 'send';
+}
+
+/** A dynamically-imported core verdict is trusted only when its action is a
+ *  known value. Mirrors the codex-runner wellFormedVerdict guard so a malformed
+ *  email-core return can't fall through to allow. */
+function isWellFormedEmailVerdict(v: unknown): v is EmailGateVerdict {
+  const a = (v as { action?: unknown } | null | undefined)?.action;
+  return a === 'allow' || a === 'gate';
+}
+
 export function createEmailGateHook(): HookCallback {
   return async (input) => {
     const pre = input as PreToolUseHookInput;
     const command = (pre.tool_input as { command?: string })?.command;
-    if (!command || !GWS_EMAIL_SEND_RE.test(command)) return {};
+    if (!command) return {};
 
-    // Bypass on --dry-run / --draft, but only in the segment containing
-    // the gws command — a later bypass flag in a piped cleanup step must
-    // not silently suppress the gate for the sending command.
-    const segments = command.split(/[;&|]\s*|\s*&&\s*|\s*\|\|\s*|\n/);
-    const gwsSegment = segments.find((s) => GWS_EMAIL_SEND_RE.test(s)) ?? command;
-    if (EMAIL_BYPASS_RE.test(gwsSegment)) return {};
+    // createSanitizeBashHook runs EARLIER in this chain and rewrites the command
+    // to `unset <secret-vars> 2>/dev/null; <original>` (updatedInput). Strip that
+    // EXACT, reconstructed prefix before evaluating, so a legit `--dry-run`/`--help`
+    // probe isn't gated by the injected `unset …;` — the whole-command bypass would
+    // otherwise read `unset` as the first word + a `;` metachar and refuse the
+    // bypass. Only the precise sanitizer prefix is stripped (reconstructed from the
+    // same buildSecretEnvVarList), never an arbitrary `unset` (which could hide a
+    // `$( … )` send), so it can't smuggle a real send past the gate. (codex #126 F1)
+    const sanitizeVars = buildSecretEnvVarList();
+    const sanitizePrefix = sanitizeVars.length ? `unset ${sanitizeVars.join(' ')} 2>/dev/null; ` : '';
+    const evalCommand =
+      sanitizePrefix && command.startsWith(sanitizePrefix) ? command.slice(sanitizePrefix.length) : command;
 
-    // Scheduled tasks intentionally bypass — v1 also did this so
-    // automated email reports aren't prompted every run.
-    if (process.env.NANOCLAW_IS_SCHEDULED_TASK === '1') return {};
-
-    // Parse the email envelope so the card shows structured fields
-    // instead of raw shell. Each matcher handles both --flag 'quoted'
-    // and --flag unquoted. Helper-verb sends carry envelope as flags;
-    // raw-API sends carry it as base64url RFC 822 inside `--json '{"raw":…}'`.
-    const matchFlag = (flag: string): string | undefined => {
-      const quoted = gwsSegment.match(new RegExp(`${flag}\\s+['"]([^'"]+)['"]`));
-      if (quoted) return quoted[1];
-      const bare = gwsSegment.match(new RegExp(`${flag}\\s+(\\S+)`));
-      return bare?.[1];
-    };
-    const flagTo = matchFlag('--to');
-    const env = !flagTo ? envelopeFromJsonRaw(gwsSegment) : {};
-    const to = flagTo ?? env.to ?? 'unknown recipient';
-    const subject = matchFlag('--subject') ?? env.subject ?? '';
-    const body = matchFlag('--body') ?? '';
-    const cc = matchFlag('--cc') ?? env.cc;
-    const bcc = matchFlag('--bcc') ?? env.bcc;
-    const isHtml = /\s--html(?:\s|$)/.test(gwsSegment);
-    // Parse the sending identity from GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE.
-    // Path convention: /home/node/.config/gws/accounts/<slug>.json.
-    // The slug is the human-facing account name the user configured.
-    const credsMatch = command.match(
-      /GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=\S*?\/accounts\/([\w.-]+)\.json/,
-    );
-    const fromAccount = credsMatch?.[1] ?? 'default';
-    // Anchor to the four allowed helper verbs only — the prior `\+(\w[\w-]*)`
-    // could capture spurious `+ABC` substrings from a base64 payload in the
-    // raw-API form. Falls back to "send" for the raw form (which has no +verb).
-    const action = gwsSegment.match(/\+(send|reply|reply-all|forward)\b/)?.[1] ?? 'send';
-    const label = subject ? `Email ${action} to ${to}: "${subject}"` : `Email ${action} to ${to}`;
-
-    // No `command` field on the payload → host's buildCardBody skips
-    // its code-block branch entirely. Full raw command is still in the
-    // SDK tool-call log for audit; we just don't surface shell noise
-    // to the approver.
-    const lines: string[] = [`*From:* ${fromAccount}`, `*To:* ${to}`];
-    if (cc) lines.push(`*Cc:* ${cc}`);
-    if (bcc) lines.push(`*Bcc:* ${bcc}`);
-    if (subject) lines.push(`*Subject:* ${subject}`);
-    if (body) {
-      const bodyPreview = body.length > 400 ? body.slice(0, 400) + '…' : body;
-      lines.push('', isHtml ? '*Body* (HTML):' : '*Body:*', `> ${bodyPreview.replace(/\n/g, '\n> ')}`);
+    // Verdict (allow vs gate + pre-built card) comes from the shared core's
+    // evaluateEmailSend; the inline evaluator is the fail-CLOSED fallback when
+    // the core can't be imported. The faithful policy (scheduled bypasses,
+    // interactive gates, --dry-run/--draft bypass) lives in the core.
+    const isScheduledTask = process.env.NANOCLAW_IS_SCHEDULED_TASK === '1';
+    const coreEvaluator = await loadEmailGateEvaluator();
+    let verdict: EmailGateVerdict;
+    if (coreEvaluator) {
+      try {
+        const v = coreEvaluator(evalCommand, { isScheduledTask });
+        // A dynamically-imported core can return a malformed verdict (bad shape /
+        // unknown action). Anything that isn't a well-formed allow|gate is
+        // untrusted → fall back to the inline fail-CLOSED evaluator. Without this,
+        // `{action:'bogus'}` / `{}` would hit the non-'gate' branch below and ALLOW
+        // a real send unapproved. (codex #126 F2 — mirrors the codex-runner
+        // verdict-shape guard.)
+        verdict = isWellFormedEmailVerdict(v) ? v : evaluateEmailSendInline(evalCommand, { isScheduledTask });
+      } catch {
+        verdict = evaluateEmailSendInline(evalCommand, { isScheduledTask });
+      }
+    } else {
+      verdict = evaluateEmailSendInline(evalCommand, { isScheduledTask });
     }
-    const summary = lines.join('\n');
 
-    // Dynamic imports to avoid any risk of circular-import with the DB
-    // module graph during provider init.
+    if (verdict.action !== 'gate') return {};
+
+    const action = emailActionVerb(evalCommand);
+    const label = verdict.label ?? `Email ${action}`;
+    const summary = verdict.summary ?? '';
+
+    // Approval round-trip — UNCHANGED from the pre-core implementation: write a
+    // request_bash_gate system action to outbound.db and block on the host's
+    // decision via awaitDeliveryAck (60 min, matches host BASH_GATE_TIMEOUT_MS).
+    // Dynamic imports avoid any risk of circular-import with the DB module graph
+    // during provider init.
     const { writeMessageOut } = await import('../db/messages-out.js');
     const { getSessionRouting } = await import('../db/session-routing.js');
     const { awaitDeliveryAck } = await import('../db/delivery-acks.js');
@@ -716,20 +944,41 @@ export function createEmailGateHook(): HookCallback {
 // ANYWHERE alongside `git clone`, regardless of segment order. False
 // positives (e.g. `git clone /tmp/x && echo /workspace/agent exists`)
 // are acceptable — the agent can rephrase.
+// ADVISORY git-clone nudge (not a security boundary — the agent already has RW
+// to managed dirs). Single source of truth is the shared guard core
+// (block-destructive-core.ts), the same module the OpenCode plugin and the Codex
+// runner consume. We dynamic-import it from the mounted bootstrap plugin (bun
+// caches the module). The inline regexes are a fail-CLOSED FALLBACK only, used
+// when the mount is absent (e.g. unit tests). KNOWN residual bypasses (bare
+// `git clone <url>` into cwd=/workspace/agent, `git -C`, renamed binary,
+// symlink) are documented in the core; this guard catches literal-managed-path
+// forms and steers agents to clone_repo/create_worktree.
 const GIT_CLONE_RE = /\bgit\s+clone\b/;
-const MANAGED_DIR_RE = /\/workspace\/(?:agent|worktrees|global|extra|thread|plugins)\b/;
+const MANAGED_DIR_RE = /\/workspace\/(?:agent|worktrees|workgroup|global|extra|thread|plugins)\b/;
+const GIT_CLONE_BLOCK_MSG =
+  'Ad-hoc `git clone` into a managed dir (/workspace/{agent,worktrees,workgroup,...}) is blocked. Use the `create_worktree` MCP tool for an existing repo, or `clone_repo` to add a new one. If the clone is ephemeral, keep the entire command within /tmp.';
 
 export function createBlockGitCloneHook(): HookCallback {
   return async (input) => {
     const pre = input as PreToolUseHookInput;
     const command = (pre.tool_input as { command?: string })?.command;
     if (!command) return {};
-    if (!GIT_CLONE_RE.test(command)) return {};
-    if (MANAGED_DIR_RE.test(command)) {
-      return denyBash(
-        '`git clone` with any reference to /workspace/{agent,worktrees,...} is blocked. Use the `create_worktree` MCP tool for a managed worktree under /workspace/worktrees/<repo>, or `clone_repo` to add a repo to the agent group. If the clone is ephemeral, keep the entire command within /tmp.',
-      );
+
+    const evaluator = await loadCoreEvaluator('evaluateGitCloneDestination');
+    if (evaluator) {
+      try {
+        const verdict = evaluator(command);
+        // Fail-closed: anything that isn't an explicit `allow` is a block.
+        if (verdict?.action !== 'allow') return denyBash(verdict?.reason ?? GIT_CLONE_BLOCK_MSG);
+        return {};
+      } catch {
+        // evaluator threw — fall through to the inline fallback.
+      }
     }
+
+    // Fallback: shared core unavailable/threw — apply the inline policy, fail-closed.
+    if (!GIT_CLONE_RE.test(command)) return {};
+    if (MANAGED_DIR_RE.test(command)) return denyBash(GIT_CLONE_BLOCK_MSG);
     // Allow pure /tmp-only clones (tool installs, scratch builds).
     return {};
   };
@@ -741,11 +990,9 @@ export function createBlockGitCloneHook(): HookCallback {
 // HTTP-header-only auth values (Exa, Braintrust MCP). They are intentionally
 // passed as MCP server headers at registration time, not as Bash-visible env.
 // Forwarding them into the SDK's child-process env defeats that isolation.
-const SDK_ENV_DENYLIST: ReadonlySet<string> = new Set([
-  'GRANOLA_ACCESS_TOKEN',
-  'EXA_API_KEY',
-  'BRAINTRUST_API_KEY',
-]);
+// Single source shared with the OpenCode provider (secret-env.ts) so the two
+// providers' env-hygiene can't drift apart. (codex #126)
+const SDK_ENV_DENYLIST: ReadonlySet<string> = new Set(MCP_HEADER_ONLY_SECRET_VARS);
 
 function filterSdkEnv(env: Record<string, string | undefined>): Record<string, string | undefined> {
   const out: Record<string, string | undefined> = {};

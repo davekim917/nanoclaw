@@ -3,7 +3,12 @@ import * as fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { buildCodexHooksJson, createCodexConfigOverrides, writeCodexMcpConfigToml } from './codex-app-server.js';
+import {
+  buildCodexHooksJson,
+  createCodexConfigOverrides,
+  writeCodexHooksJson,
+  writeCodexMcpConfigToml,
+} from './codex-app-server.js';
 
 describe('buildCodexHooksJson', () => {
   it('emits a PreToolUse and PostToolUse entry with command type', () => {
@@ -83,9 +88,11 @@ describe('createCodexConfigOverrides', () => {
 describe('writeCodexMcpConfigToml', () => {
   it('preserves non-MCP config blocks while replacing MCP blocks', () => {
     const prevHome = process.env.HOME;
+    const prevCodexHome = process.env.CODEX_HOME;
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-home-'));
     try {
       process.env.HOME = home;
+      delete process.env.CODEX_HOME; // exercise the $HOME/.codex default path deterministically
       const codexDir = path.join(home, '.codex');
       fs.mkdirSync(codexDir, { recursive: true });
       fs.writeFileSync(
@@ -120,7 +127,48 @@ describe('writeCodexMcpConfigToml', () => {
       } else {
         process.env.HOME = prevHome;
       }
+      if (prevCodexHome === undefined) {
+        delete process.env.CODEX_HOME;
+      } else {
+        process.env.CODEX_HOME = prevCodexHome;
+      }
       fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('writes config.toml + hooks.json to CODEX_HOME, not $HOME/.codex (codex #126 rotation)', () => {
+    // On OAuth rotation the provider sets CODEX_HOME to a fallback dir; the writers
+    // must target it (else the rotated app-server runs with stale config and — for
+    // hooks.json — NO destructive guard).
+    const prevHome = process.env.HOME;
+    const prevCodexHome = process.env.CODEX_HOME;
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-home-'));
+    const fallback = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-fallback-'));
+    try {
+      process.env.HOME = home;
+      process.env.CODEX_HOME = fallback; // simulate post-rotation
+
+      writeCodexMcpConfigToml({ nanoclaw: { command: 'bun', args: ['x'] } });
+      writeCodexHooksJson();
+
+      // Both land in the fallback (CODEX_HOME), NOT $HOME/.codex.
+      expect(fs.existsSync(path.join(fallback, 'config.toml'))).toBe(true);
+      expect(fs.existsSync(path.join(fallback, 'hooks.json'))).toBe(true);
+      expect(fs.existsSync(path.join(home, '.codex', 'config.toml'))).toBe(false);
+      expect(fs.existsSync(path.join(home, '.codex', 'hooks.json'))).toBe(false);
+    } finally {
+      if (prevHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = prevHome;
+      }
+      if (prevCodexHome === undefined) {
+        delete process.env.CODEX_HOME;
+      } else {
+        process.env.CODEX_HOME = prevCodexHome;
+      }
+      fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(fallback, { recursive: true, force: true });
     }
   });
 });

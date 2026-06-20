@@ -100,19 +100,53 @@ type GuardCore = {
 const DEFAULT_GUARD_CORE_PATH =
   '/workspace/plugins/bootstrap/plugins/workflow-agents/hooks/guards/block-destructive-core.ts';
 
+/** Typed load result — never a bare null. A failure carries a reason so the
+ *  caller can deny with a diagnostic instead of silently allowing (D17/C4:
+ *  the destructive guard is fail-CLOSED). */
+type GuardCoreLoad = { ok: true; core: GuardCore } | { ok: false; reason: string };
+
+/** Required exports + their expected types. A core missing/mis-typing any of
+ *  these is malformed and must be rejected (fail-closed), not used partially. */
+function validateGuardCore(mod: Record<string, unknown>): string | null {
+  const missing: string[] = [];
+  if (typeof mod.evaluateBashCommand !== 'function') missing.push('evaluateBashCommand');
+  if (typeof mod.consumeGateApproval !== 'function') missing.push('consumeGateApproval');
+  if (typeof mod.runNanoclawGate !== 'function') missing.push('runNanoclawGate');
+  if (typeof mod.IS_NANOCLAW !== 'boolean') missing.push('IS_NANOCLAW');
+  return missing.length > 0 ? `missing/mis-typed export(s): ${missing.join(', ')}` : null;
+}
+
 /** Import the shared guard core from the mounted bootstrap plugin (bun caches the
- *  module, so re-calls are cheap). Fail-open (returns null + warns) if the mount
- *  is absent — a missing plugin must not wedge the agent. */
-async function loadGuardCore(): Promise<GuardCore | null> {
+ *  module, so re-calls are cheap), then validate its export shape. Returns a
+ *  TYPED failure (never a bare null) if the import fails or the exports are
+ *  malformed — the caller denies. Fail-CLOSED: a missing/broken core must not
+ *  let destructive commands through unguarded. */
+async function loadGuardCore(): Promise<GuardCoreLoad> {
   const corePath = process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE || DEFAULT_GUARD_CORE_PATH;
+  let mod: Record<string, unknown>;
   try {
-    return (await import(corePath)) as unknown as GuardCore;
+    mod = (await import(corePath)) as Record<string, unknown>;
   } catch (err) {
-    console.error(
-      `[codex-hook] destructive-guard core unavailable at ${corePath} — codex running WITHOUT the gate: ${err instanceof Error ? err.message : String(err)}`,
-    );
-    return null;
+    const reason = `destructive-guard core unavailable at ${corePath}: ${err instanceof Error ? err.message : String(err)}`;
+    console.error(`[codex-hook] ${reason} — denying (fail-closed)`);
+    return { ok: false, reason };
   }
+  const invalid = validateGuardCore(mod);
+  if (invalid) {
+    const reason = `destructive-guard core malformed at ${corePath}: ${invalid}`;
+    console.error(`[codex-hook] ${reason} — denying (fail-closed)`);
+    return { ok: false, reason };
+  }
+  return { ok: true, core: mod as unknown as GuardCore };
+}
+
+/** A guard core's evaluateBashCommand may return garbage even when it passes
+ *  the load-time export-type check. Every verdict — initial AND the post-approval
+ *  skipGate re-checks — must be shape-validated; an unknown/missing action denies
+ *  (fail-closed), never falls through to allow. QA codex re-pass #2. */
+function wellFormedVerdict(v: unknown): v is { action: 'allow' | 'block' | 'gate'; reason?: string } {
+  const action = (v as { action?: unknown } | null | undefined)?.action;
+  return action === 'allow' || action === 'block' || action === 'gate';
 }
 
 function denyDecision(reason: string): {
@@ -135,34 +169,79 @@ async function runDestructiveGuard(
   command: string,
 ): Promise<ReturnType<typeof denyDecision> | null> {
   if (!command) return null;
-  const core = await loadGuardCore();
-  if (!core) return null; // fail-open: core unavailable (e.g. bootstrap not mounted)
+  const loaded = await loadGuardCore();
+  // Fail-CLOSED (D17/C4): a missing or malformed core denies, it does NOT allow.
+  if (!loaded.ok) {
+    return denyDecision(
+      `Destructive-command guard unavailable (${loaded.reason}). Denying for safety — report this rather than retrying.`,
+    );
+  }
+  const core = loaded.core;
 
-  const verdict = core.evaluateBashCommand(command);
+  // Wrap the core evaluator: any exception → deny (a throwing guard must never
+  // fall through to allow). consumeGateApproval / runNanoclawGate exceptions are
+  // likewise treated as a denied gate below.
+  let verdict: ReturnType<GuardCore['evaluateBashCommand']>;
+  try {
+    verdict = core.evaluateBashCommand(command);
+  } catch (err) {
+    return denyDecision(
+      `Destructive-command guard errored (${err instanceof Error ? err.message : String(err)}). Denying for safety.`,
+    );
+  }
+  // Validate the verdict SHAPE (C4 fail-closed): validateGuardCore only proves
+  // evaluateBashCommand is a function — not that it RETURNS a real verdict. A
+  // malformed-but-importable core returning undefined/null/{}/an unknown action
+  // would otherwise fall through `verdict.action` access (the prior `.action`
+  // read sat outside the try/catch and would throw, escaping to the CLI's
+  // fail-open path). The SAME check is applied to the post-approval skipGate
+  // re-checks below (QA codex re-pass #2) — every evaluateBashCommand result is
+  // shape-validated, never just the first.
+  if (!wellFormedVerdict(verdict)) {
+    return denyDecision(
+      'Destructive-command guard returned a malformed verdict — denying for safety. Report this rather than retrying.',
+    );
+  }
   if (verdict.action === 'allow') return null;
   if (verdict.action === 'block') return denyDecision(verdict.reason ?? 'destructive command blocked');
 
   // gate
   const reason = verdict.reason ?? 'requires approval';
-  if (core.consumeGateApproval(command)) {
-    const post = core.evaluateBashCommand(command, { skipGate: true });
-    return post.action === 'block' ? denyDecision(post.reason ?? reason) : null;
-  }
-  if (core.IS_NANOCLAW) {
-    let staged = true;
-    const decision = core.runNanoclawGate(command, reason, () => {
-      staged = false;
-    });
-    if (!staged) return denyDecision(`${reason} — could not stage approval request (session DBs unavailable).`);
-    if (decision === 'approved') {
+  try {
+    // STRICT boolean: a malformed core could return a truthy non-boolean ({}, a
+    // non-empty string) — only an exact `true` counts as "already approved".
+    // Anything else falls through to real gate staging (fail-closed). (codex #126 N1)
+    if (core.consumeGateApproval(command) === true) {
       const post = core.evaluateBashCommand(command, { skipGate: true });
-      return post.action === 'block' ? denyDecision(post.reason ?? reason) : null;
+      if (!wellFormedVerdict(post)) return denyDecision(`${reason} — malformed post-approval verdict, denying for safety.`);
+      // Only an explicit `allow` passes. A repeated `gate` (a stale/malformed core
+      // that ignored skipGate) must NOT become an allow — deny it. (codex #126 N2)
+      return post.action === 'allow' ? null : denyDecision(post.reason ?? reason);
     }
-    const detail =
-      decision === 'denied'
-        ? 'Cancelled by user. Do not retry or explain why it was blocked — just acknowledge the cancellation briefly.'
-        : 'Timed out waiting for user approval. Do not retry.';
-    return denyDecision(`${reason} — ${detail}`);
+    if (core.IS_NANOCLAW) {
+      let staged = true;
+      const decision = core.runNanoclawGate(command, reason, () => {
+        staged = false;
+      });
+      if (!staged) return denyDecision(`${reason} — could not stage approval request (session DBs unavailable).`);
+      if (decision === 'approved') {
+        const post = core.evaluateBashCommand(command, { skipGate: true });
+        if (!wellFormedVerdict(post)) return denyDecision(`${reason} — malformed post-approval verdict, denying for safety.`);
+        // Only an explicit `allow` passes — a repeated `gate` after approval (stale
+        // core ignoring skipGate) must deny, not fall through to allow. (codex #126 N2)
+        return post.action === 'allow' ? null : denyDecision(post.reason ?? reason);
+      }
+      const detail =
+        decision === 'denied'
+          ? 'Cancelled by user. Do not retry or explain why it was blocked — just acknowledge the cancellation briefly.'
+          : 'Timed out waiting for user approval. Do not retry.';
+      return denyDecision(`${reason} — ${detail}`);
+    }
+  } catch (err) {
+    // A throw anywhere in the gate path is treated as a denied gate, never allow.
+    return denyDecision(
+      `${reason} — approval gate errored (${err instanceof Error ? err.message : String(err)}). Denying for safety.`,
+    );
   }
   // No session-DB surface (non-NanoClaw): fail-closed for gated infra commands.
   return denyDecision(`${reason} — requires explicit user approval, unavailable in this environment.`);
@@ -174,30 +253,102 @@ type FileProtectionCore = {
   checkEditProtection: (toolName: string, toolInput: Record<string, unknown>) => string | null;
 };
 
-/** Import file-protection-core.ts from the same dir as the guard core. */
-async function loadFileProtectionCore(): Promise<FileProtectionCore | null> {
+/** Inline fallback set of edit-tool names — used ONLY to decide fail-closed deny
+ *  when the file-protection core is unavailable/malformed (so we still know a
+ *  call is an edit that should be blocked without a working EDIT_TOOLS export).
+ *  Keep in sync with file-protection-core.ts EDIT_TOOLS. */
+const FALLBACK_EDIT_TOOLS = new Set([
+  'Edit',
+  'MultiEdit',
+  'Write',
+  'edit',
+  'write',
+  'write_file',
+  'create_file',
+  'apply_patch',
+]);
+
+/** Typed load result for the file-protection core — never a bare null. */
+type FileProtectionLoad = { ok: true; core: FileProtectionCore } | { ok: false; reason: string };
+
+/** Validate the file-protection core's export shape. */
+function validateFileProtectionCore(mod: Record<string, unknown>): string | null {
+  const missing: string[] = [];
+  if (!(mod.EDIT_TOOLS instanceof Set)) missing.push('EDIT_TOOLS');
+  if (typeof mod.checkEditProtection !== 'function') missing.push('checkEditProtection');
+  return missing.length > 0 ? `missing/mis-typed export(s): ${missing.join(', ')}` : null;
+}
+
+/** Import file-protection-core.ts from the same dir as the guard core, then
+ *  validate its export shape. Returns a TYPED failure (never a bare null) when
+ *  the import fails or the exports are malformed. Fail-CLOSED: the caller denies
+ *  protected edits when the core can't be loaded. */
+async function loadFileProtectionCore(): Promise<FileProtectionLoad> {
   const guardPath = process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE || DEFAULT_GUARD_CORE_PATH;
   const fpPath = guardPath.replace(/[^/]+$/, 'file-protection-core.ts');
+  let mod: Record<string, unknown>;
   try {
-    return (await import(fpPath)) as unknown as FileProtectionCore;
-  } catch {
-    return null; // fail-open: file-protection unavailable
+    mod = (await import(fpPath)) as Record<string, unknown>;
+  } catch (err) {
+    const reason = `file-protection core unavailable at ${fpPath}: ${err instanceof Error ? err.message : String(err)}`;
+    console.error(`[codex-hook] ${reason} — denying protected edits (fail-closed)`);
+    return { ok: false, reason };
   }
+  const invalid = validateFileProtectionCore(mod);
+  if (invalid) {
+    const reason = `file-protection core malformed at ${fpPath}: ${invalid}`;
+    console.error(`[codex-hook] ${reason} — denying protected edits (fail-closed)`);
+    return { ok: false, reason };
+  }
+  return { ok: true, core: mod as unknown as FileProtectionCore };
 }
 
 /** Block edits (Edit/Write/apply_patch/...) to protected paths. Returns a deny
- *  decision or null. Bypassable via SKIP_FILE_PROTECTION=1 (parity with Claude). */
+ *  decision or null. Bypassable via SKIP_FILE_PROTECTION=1 (parity with Claude).
+ *  Fail-CLOSED: a missing/malformed/throwing core denies any EDIT tool call
+ *  (identified via FALLBACK_EDIT_TOOLS) rather than letting the edit through. */
 async function runFileProtection(
   toolName: string,
   toolInput: Record<string, unknown>,
 ): Promise<ReturnType<typeof denyDecision> | null> {
   if (process.env.SKIP_FILE_PROTECTION === '1') return null;
-  const core = await loadFileProtectionCore();
-  if (!core || !core.EDIT_TOOLS.has(toolName)) return null;
-  const blocked = core.checkEditProtection(toolName, toolInput);
-  return blocked
-    ? denyDecision(`file-protection — '${blocked}' is protected from automated edits. Set SKIP_FILE_PROTECTION=1 to bypass.`)
-    : null;
+
+  const loaded = await loadFileProtectionCore();
+  if (!loaded.ok) {
+    // Core gone/broken — deny edit-tool calls (using the inline edit-tool set),
+    // pass non-edit tools through (file-protection only governs edits).
+    if (!FALLBACK_EDIT_TOOLS.has(toolName)) return null;
+    return denyDecision(
+      `file-protection unavailable (${loaded.reason}) — denying edit to '${(toolInput.file_path ?? toolInput.path ?? toolName) as string}' for safety. Set SKIP_FILE_PROTECTION=1 to bypass.`,
+    );
+  }
+
+  const core = loaded.core;
+  if (!core.EDIT_TOOLS.has(toolName)) return null;
+  // Typed `unknown`: checkEditProtection comes from a dynamically-imported core,
+  // so its runtime return can't be trusted to match the `string | null` type.
+  let blocked: unknown;
+  try {
+    blocked = core.checkEditProtection(toolName, toolInput);
+  } catch (err) {
+    // A throwing protection check must not fall through to allow.
+    return denyDecision(
+      `file-protection check errored (${err instanceof Error ? err.message : String(err)}) — denying edit for safety. Set SKIP_FILE_PROTECTION=1 to bypass.`,
+    );
+  }
+  // Contract: a non-empty string = protected (block); null = allowed. Anything
+  // else (undefined/false/''/0/a non-string) is a malformed core result — for an
+  // EDIT tool (we passed EDIT_TOOLS.has above) that means deny, never fall through
+  // to allow on a falsy-non-null. (codex #126 N3)
+  if (blocked === null) return null;
+  if (typeof blocked === 'string' && blocked.length > 0) {
+    return denyDecision(
+      `file-protection — '${blocked}' is protected from automated edits. Set SKIP_FILE_PROTECTION=1 to bypass.`,
+    );
+  }
+  return denyDecision(
+    `file-protection returned a malformed result (expected a protected-path string or null) — denying edit for safety. Set SKIP_FILE_PROTECTION=1 to bypass.`,
+  );
 }
 
 /**
@@ -256,11 +407,23 @@ export async function runPreToolUseChain(input: CodexHookInput): Promise<unknown
   let mergedUpdatedInput: Record<string, unknown> | undefined;
 
   for (const hook of chain) {
-    const out = await hook(
-      currentInput as Parameters<HookCallback>[0],
-      {} as Parameters<HookCallback>[1],
-      {} as Parameters<HookCallback>[2],
-    );
+    let out: Awaited<ReturnType<HookCallback>>;
+    try {
+      out = await hook(
+        currentInput as Parameters<HookCallback>[0],
+        {} as Parameters<HookCallback>[1],
+        {} as Parameters<HookCallback>[2],
+      );
+    } catch (err) {
+      // Fail CLOSED (C4): a guard hook that throws — e.g. the email gate's
+      // session-DB round-trip (writeMessageOut/awaitDeliveryAck) failing — must
+      // DENY, not let the exception escape to the CLI's PreToolUse handler.
+      // (cli.ts now also denies on escape; this denies at the source with a
+      // clearer reason and keeps the guarantee local to the chain.)
+      return denyDecision(
+        `Guard hook errored (${err instanceof Error ? err.message : String(err)}) — denying for safety. Report this rather than retrying.`,
+      );
+    }
     if (!out) continue;
     const ret = out as {
       decision?: string;
