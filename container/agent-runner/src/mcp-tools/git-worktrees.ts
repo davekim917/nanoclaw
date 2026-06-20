@@ -70,19 +70,30 @@ export function getReposDir(): string {
 
 /**
  * Resolve an existing cloned-repo dir for <name>, highest precedence first:
- *   1. workgroup shared repos: `/workspace/workgroup/repos/<name>`
- *   2. namespaced private repos: `/workspace/agent/repos/<name>`
- *   3. legacy private root:      `/workspace/agent/<name>`
+ *   1. workgroup shared, namespaced: `/workspace/workgroup/repos/<name>`
+ *   2. workgroup shared, legacy root: `/workspace/workgroup/<name>`
+ *   3. namespaced private:           `/workspace/agent/repos/<name>`
+ *   4. legacy private root:          `/workspace/agent/<name>`
  * Returns null if none is a real git clone.
  *
- * Same-name shadow guard: if a real clone of <name> exists in more than one of
- * these locations, the higher-precedence one wins, but we log a warning (no
- * silent shadow) — and, when both clones expose an `origin` URL, note whether
- * they disagree so an operator can spot a divergent shared/private checkout.
+ * Why the workgroup ROOT (2) is a candidate: clones predating the `repos/`
+ * namespacing live at the workgroup root (`/workspace/workgroup/<name>`), where
+ * every sibling can see them via the shared mount. Without this candidate a
+ * sibling that lacks a bedroom symlink to that clone resolves to null and
+ * `clone_repo` re-clones a DUPLICATE into `repos/` — fragmenting what should be
+ * one shared checkout. SHARED (1,2) always outranks PRIVATE (3,4) so siblings
+ * converge on the shared clone rather than a bedroom copy.
+ *
+ * Same-name shadow guard: if a real clone of <name> exists in more than one
+ * location, the higher-precedence one wins and we warn (no silent shadow). The
+ * comparison is by realpath: a bedroom symlink (agent/<name> -> workgroup/<name>)
+ * and the workgroup path resolve to the SAME clone reached two ways — that is NOT
+ * a shadow, so it must not warn. Only a genuinely different real clone does.
  */
 export function resolveRepoDir(name: string): string | null {
   const candidates = [
     path.join(workgroupDir(), 'repos', name),
+    path.join(workgroupDir(), name),
     path.join(agentDir(), 'repos', name),
     path.join(agentDir(), name),
   ];
@@ -90,8 +101,11 @@ export function resolveRepoDir(name: string): string | null {
   if (matches.length === 0) return null;
 
   const chosen = matches[0];
-  if (matches.length > 1) {
-    const shadowed = matches.slice(1);
+  const chosenReal = canonPath(chosen);
+  // Only lower-precedence matches whose REAL path differs from the chosen one are
+  // genuine shadows; symlink aliases to the same clone are deduped out.
+  const shadowed = matches.slice(1).filter((dir) => canonPath(dir) !== chosenReal);
+  if (shadowed.length > 0) {
     const chosenOrigin = tryGit(chosen, ['config', '--get', 'remote.origin.url']);
     const originNote = shadowed
       .map((dir) => {

@@ -219,6 +219,48 @@ describe('getReposDir / resolveRepoDir / clone_repo', () => {
     expect(joined).toContain('ORIGIN MISMATCH');
   });
 
+  test('test_resolve_workgroup_root_legacy: a clone at the workgroup ROOT (pre-repos/) is resolved', () => {
+    // Shared clones predating the repos/ namespacing live at /workspace/workgroup/<name>.
+    // Without a candidate for the root, a sibling resolves null and clone_repo
+    // re-clones a duplicate into repos/ — this is the fix that prevents that.
+    const name = 'svc';
+    const root = join(workgroupDir, name);
+    initRepoWithOrigin(root, 'https://github.com/acme/svc.git');
+    expect(resolveRepoDir(name)).toBe(root);
+  });
+
+  test('test_resolve_shared_root_beats_private: workgroup ROOT outranks a private bedroom clone', () => {
+    // SHARED always wins over PRIVATE so siblings converge on the shared clone.
+    const name = 'svc';
+    const sharedRoot = join(workgroupDir, name);
+    const privateNs = join(agentDir, 'repos', name);
+    initRepoWithOrigin(privateNs, 'https://github.com/acme/svc.git');
+    expect(resolveRepoDir(name)).toBe(privateNs); // only private exists → private
+    initRepoWithOrigin(sharedRoot, 'https://github.com/acme/svc.git');
+    expect(resolveRepoDir(name)).toBe(sharedRoot); // shared root now outranks private
+  });
+
+  test('test_resolve_symlink_alias_not_shadow: a bedroom symlink to the workgroup clone is NOT a shadow', () => {
+    // agent/<name> -> workgroup/<name> is one shared clone reached two ways. The
+    // realpath dedup must (a) return the workgroup path and (b) emit NO warning.
+    const name = 'svc';
+    const root = join(workgroupDir, name);
+    initRepoWithOrigin(root, 'https://github.com/acme/svc.git');
+    symlinkSync(root, join(agentDir, name)); // bedroom compat symlink
+
+    const warnings: string[] = [];
+    const origErr = console.error;
+    console.error = (...a: unknown[]) => { warnings.push(a.map(String).join(' ')); };
+    let resolved: string | null;
+    try {
+      resolved = resolveRepoDir(name);
+    } finally {
+      console.error = origErr;
+    }
+    expect(resolved).toBe(root); // canonical shared path, not the symlink
+    expect(warnings.join('\n')).not.toContain('WARNING'); // symlink alias ≠ shadow
+  });
+
   // --- G3: clone_repo ----------------------------------------------------
 
   test('test_clone_lands_in_workgroup: idempotent reuse resolves to workgroup/repos when mounted', async () => {
@@ -412,7 +454,9 @@ describe('getReposDir / resolveRepoDir / clone_repo', () => {
     const realInShared = join(workgroupDir, name); // realpath under the shared tree
     initRepoWithOrigin(realInShared, url);
     symlinkSync(realInShared, join(agentDir, name));
-    expect(resolveRepoDir(name)).toBe(join(agentDir, name)); // premise: resolves to the symlink alias
+    // resolveRepoDir prefers the canonical workgroup ROOT clone (candidate 2) over
+    // the bedroom symlink (candidate 4) — same real clone, canonical path returned.
+    expect(resolveRepoDir(name)).toBe(realInShared);
 
     const res = await cloneRepoTool.handler({ url, name });
     // Its realpath is inside the workgroup tree → siblings CAN see it → reuse, not refuse.
