@@ -20,7 +20,7 @@
 # publish a linux/arm64 prebuilt at storage.googleapis.com. The alias FROM
 # lets us pull the binary via COPY --from below while keeping the version
 # pinned via build-arg.
-ARG MCP_TOOLBOX_VERSION=1.4.0
+ARG MCP_TOOLBOX_VERSION=1.5.0
 FROM us-central1-docker.pkg.dev/database-toolbox/toolbox/toolbox:${MCP_TOOLBOX_VERSION} AS mcp-toolbox-src
 
 # ---- rtk builder stage -------------------------------------------------------
@@ -45,16 +45,16 @@ ARG INSTALL_CJK_FONTS=false
 # Pin CLI versions for reproducibility. Bump deliberately — unpinned installs
 # mean every rebuild silently picks up the latest and can break in lockstep
 # across all users.
-ARG CLAUDE_CODE_VERSION=2.1.179
+ARG CLAUDE_CODE_VERSION=2.1.183
 ARG AGENT_BROWSER_VERSION=0.28.0
 ARG VERCEL_VERSION=52.2.1
 ARG GITNEXUS_VERSION=1.6.7
 ARG BUN_VERSION=1.3.14
 ARG MMDC_VERSION=11.15.0
 ARG GWS_VERSION=0.22.5
-ARG CODEX_VERSION=0.140.0
-ARG OPENCODE_VERSION=1.17.7
-ARG WIX_CLI_VERSION=1.1.217
+ARG CODEX_VERSION=0.141.0
+ARG OPENCODE_VERSION=1.17.8
+ARG WIX_CLI_VERSION=1.1.218
 ARG DBT_MCP_VERSION=1.20.4
 ARG SLACK_MCP_VERSION=1.3.0
 
@@ -196,8 +196,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends gnupg \
 
 # Render / Railway / Supabase CLIs (released as prebuilt binaries)
 ARG RENDER_VERSION=2.20.0
-ARG RAILWAY_VERSION=5.15.0
-ARG SUPABASE_VERSION=2.106.0
+ARG RAILWAY_VERSION=5.20.0
+ARG SUPABASE_VERSION=2.107.0
 RUN DPKG_ARCH=$(dpkg --print-architecture) && UARCH=$(uname -m) \
     && curl -fsSL "https://github.com/render-oss/cli/releases/download/v${RENDER_VERSION}/cli_${RENDER_VERSION}_linux_${DPKG_ARCH}.zip" \
        -o /tmp/render.zip \
@@ -217,10 +217,10 @@ RUN DPKG_ARCH=$(dpkg --print-architecture) && UARCH=$(uname -m) \
 COPY --from=mcp-toolbox-src /toolbox /usr/local/bin/toolbox
 
 # Pinned mnemon binary — auto-tracked by /update-container audit.
-# Per-arch SHA256 from https://github.com/mnemon-dev/mnemon/releases/download/v0.1.11/checksums.txt
-ARG MNEMON_VERSION=0.1.14
-ARG MNEMON_SHA256_arm64=0ce22ae86cfd4d018cc79c30ffeb620e79f3a630e31d9c4ac4a399cd3806bb33
-ARG MNEMON_SHA256_amd64=8b0bc856c8c1078de85d55d9f1e5f8d180082fb85f7cae82f65ee638a8293810
+# Per-arch SHA256 from https://github.com/mnemon-dev/mnemon/releases/download/v0.1.16/checksums.txt
+ARG MNEMON_VERSION=0.1.16
+ARG MNEMON_SHA256_arm64=7f5d955ce96200e90a40bb5cf9ef64fc5eb6f16c81da1d27cecafa4020a1d495
+ARG MNEMON_SHA256_amd64=41e4b85e45d83466582ad44a9df9ed2b0722f5c12b9991353390da26e14f0f51
 
 RUN ARCH=$(dpkg --print-architecture) \
     && SHA=$(if [ "$ARCH" = "arm64" ]; then echo "$MNEMON_SHA256_arm64"; else echo "$MNEMON_SHA256_amd64"; fi) \
