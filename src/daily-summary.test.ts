@@ -1,8 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
-import { extractRepo, formatDigest } from './daily-summary.js';
+import { extractRepo, formatDigest, isCommitScanEntry } from './daily-summary.js';
 import type { ShipLogEntry, BacklogItem } from './db/backlog.js';
-import type { AgentGroup } from './types.js';
 
 function shipEntry(over: Partial<ShipLogEntry> = {}): ShipLogEntry {
   return {
@@ -35,13 +34,9 @@ function backlogItem(over: Partial<BacklogItem> = {}): BacklogItem {
   };
 }
 
-const fakeGroup: AgentGroup = {
-  id: 'ag-x',
-  name: 'illysium',
-  folder: 'illysium',
-  agent_provider: 'claude',
-  created_at: '2026-04-01T00:00:00.000Z',
-};
+function emptySummary() {
+  return { agentShipped: [], otherCommits: [], resolved: [], openBacklog: [] };
+}
 
 describe('extractRepo', () => {
   it('parses owner/repo from a github PR url', () => {
@@ -90,21 +85,45 @@ describe('extractRepo', () => {
   });
 });
 
+describe('isCommitScanEntry', () => {
+  it('is false when no tags', () => {
+    expect(isCommitScanEntry(shipEntry({ tags: null }))).toBe(false);
+  });
+
+  it('detects the comma-separated commit-scan tag', () => {
+    expect(isCommitScanEntry(shipEntry({ tags: 'commit-digest,nanoclaw-v2' }))).toBe(true);
+  });
+
+  it('detects the legacy JSON-array commit-digest tag', () => {
+    expect(isCommitScanEntry(shipEntry({ tags: '["commit-digest","ILLYSE"]' }))).toBe(true);
+  });
+
+  it('is false for agent-recorded entries (non commit-digest tags)', () => {
+    expect(isCommitScanEntry(shipEntry({ tags: 'feature,backend' }))).toBe(false);
+    expect(isCommitScanEntry(shipEntry({ tags: '["feature"]' }))).toBe(false);
+  });
+});
+
 describe('formatDigest', () => {
+  const WG = 'madison-reed';
+
   it('emits only the header when all sources are empty', () => {
-    const out = formatDigest(fakeGroup, { shipped: [], resolved: [], openBacklog: [] });
+    const out = formatDigest(WG, emptySummary());
     // Header line only — caller is expected to skip-empty before formatting.
-    expect(out).toBe('📋 **Daily Summary** — illysium');
+    expect(out).toBe('📋 **Daily Summary** — madison-reed');
+  });
+
+  it('uses the provided workgroup label in the header', () => {
+    expect(formatDigest('illysium', emptySummary())).toContain('— illysium');
   });
 
   it('renders Agent Shipped without per-repo header when only one repo', () => {
-    const out = formatDigest(fakeGroup, {
-      shipped: [
+    const out = formatDigest(WG, {
+      ...emptySummary(),
+      agentShipped: [
         shipEntry({ title: 'fix: x', pr_url: 'https://github.com/o/r/pull/1' }),
         shipEntry({ id: 'ship-2', title: 'feat: y', pr_url: 'https://github.com/o/r/pull/2' }),
       ],
-      resolved: [],
-      openBacklog: [],
     });
     expect(out).toContain('🤖 **Agent Shipped** (2):');
     expect(out).not.toContain('**o/r**');
@@ -112,37 +131,46 @@ describe('formatDigest', () => {
     expect(out).toContain('• feat: y — https://github.com/o/r/pull/2');
   });
 
+  it('renders a separate Other commits section for commit-scan work', () => {
+    const out = formatDigest(WG, {
+      ...emptySummary(),
+      agentShipped: [shipEntry({ title: 'agent: did a thing', pr_url: 'https://github.com/o/r/pull/9' })],
+      otherCommits: [shipEntry({ id: 'c1', title: 'human fix', tags: 'commit-digest,nanoclaw-v2' })],
+    });
+    expect(out).toContain('🤖 **Agent Shipped** (1):');
+    expect(out).toContain('• agent: did a thing — https://github.com/o/r/pull/9');
+    expect(out).toContain('🛠 **Other commits** (1):');
+    expect(out).toContain('• human fix');
+  });
+
   it('emits per-repo header when multiple repos', () => {
-    const out = formatDigest(fakeGroup, {
-      shipped: [
+    const out = formatDigest(WG, {
+      ...emptySummary(),
+      agentShipped: [
         shipEntry({ title: 'a', pr_url: 'https://github.com/o/r1/pull/1' }),
         shipEntry({ id: 'ship-2', title: 'b', pr_url: 'https://github.com/o/r2/pull/2' }),
       ],
-      resolved: [],
-      openBacklog: [],
     });
     expect(out).toContain('**o/r1**');
     expect(out).toContain('**o/r2**');
   });
 
   it('omits PR-url suffix when entry has no pr_url', () => {
-    const out = formatDigest(fakeGroup, {
-      shipped: [shipEntry({ title: 'plain-shipped', pr_url: null })],
-      resolved: [],
-      openBacklog: [],
+    const out = formatDigest(WG, {
+      ...emptySummary(),
+      agentShipped: [shipEntry({ title: 'plain-shipped', pr_url: null })],
     });
     expect(out).toContain('• plain-shipped');
     expect(out).not.toContain('• plain-shipped —');
   });
 
   it('renders Resolved with the right emoji per status', () => {
-    const out = formatDigest(fakeGroup, {
-      shipped: [],
+    const out = formatDigest(WG, {
+      ...emptySummary(),
       resolved: [
         backlogItem({ id: 'b1', title: 'fixed-issue', status: 'resolved' }),
         backlogItem({ id: 'b2', title: 'wont-do', status: 'wont_fix' }),
       ],
-      openBacklog: [],
     });
     expect(out).toContain('✅ **Resolved** (2):');
     expect(out).toContain('✅ fixed-issue');
@@ -150,9 +178,8 @@ describe('formatDigest', () => {
   });
 
   it('renders Open Backlog with priority emoji + in-progress suffix', () => {
-    const out = formatDigest(fakeGroup, {
-      shipped: [],
-      resolved: [],
+    const out = formatDigest(WG, {
+      ...emptySummary(),
       openBacklog: [
         backlogItem({ id: 'b1', title: 'high-thing', priority: 'high', status: 'open' }),
         backlogItem({ id: 'b2', title: 'mid-thing', priority: 'medium', status: 'in_progress' }),
@@ -167,22 +194,13 @@ describe('formatDigest', () => {
   });
 
   it('omits sections that have no entries', () => {
-    const out = formatDigest(fakeGroup, {
-      shipped: [shipEntry({ title: 'only-ship' })],
-      resolved: [],
-      openBacklog: [],
+    const out = formatDigest(WG, {
+      ...emptySummary(),
+      agentShipped: [shipEntry({ title: 'only-ship' })],
     });
     expect(out).toContain('🤖 **Agent Shipped**');
+    expect(out).not.toContain('🛠 **Other commits**');
     expect(out).not.toContain('✅ **Resolved**');
     expect(out).not.toContain('📌 **Open Backlog**');
-  });
-
-  it('uses group.name as the header label, falling back to folder then id', () => {
-    expect(formatDigest({ ...fakeGroup, name: '' }, { shipped: [], resolved: [], openBacklog: [] })).toContain(
-      '— illysium',
-    );
-    expect(
-      formatDigest({ ...fakeGroup, name: '', folder: '' }, { shipped: [], resolved: [], openBacklog: [] }),
-    ).toContain('— ag-x');
   });
 });
