@@ -347,9 +347,21 @@ export function parseRetryAfterMs(err: unknown): number | null {
 
 const MAX_RATE_LIMIT_RETRIES = 3;
 const RATE_LIMIT_BUFFER_MS = 100;
+const CARD_TITLE_MAX_CODE_POINTS = 150;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function fitCardTitle(title: string): string {
+  const codePoints = Array.from(title);
+  if (codePoints.length <= CARD_TITLE_MAX_CODE_POINTS) return title;
+  return (
+    codePoints
+      .slice(0, CARD_TITLE_MAX_CODE_POINTS - 1)
+      .join('')
+      .trimEnd() + '…'
+  );
 }
 
 export function splitForLimit(text: string, limit: number): string[] {
@@ -829,15 +841,16 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // Ask question card — render as Card with buttons
       if (content.type === 'ask_question' && content.questionId && content.options) {
         const questionId = content.questionId as string;
-        const title = content.title as string;
-        const question = content.question as string;
+        const title = typeof content.title === 'string' ? content.title : '';
+        const displayTitle = fitCardTitle(title);
+        const question = typeof content.question === 'string' ? content.question : '';
         if (!title) {
           log.error('ask_question missing required title — skipping delivery', { questionId });
           return;
         }
         const options: NormalizedOption[] = normalizeOptions(content.options as never);
         const card = Card({
-          title,
+          title: displayTitle,
           children: [
             CardText(question),
             Actions(
@@ -863,7 +876,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         });
         const result = await adapter.postMessage(tid, {
           card,
-          fallbackText: `${title}\n\n${question}\nOptions: ${options.map((o) => o.label).join(', ')}`,
+          fallbackText: `${displayTitle}\n\n${question}\nOptions: ${options.map((o) => o.label).join(', ')}`,
         });
         return result?.id;
       }
@@ -873,8 +886,10 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // callback button would have nowhere to land. URL actions render as link buttons.
       if (content.type === 'card' && content.card && typeof content.card === 'object') {
         const cardSpec = content.card as Record<string, unknown>;
-        const title = (cardSpec.title as string) || '';
-        const fallbackText = (content.fallbackText as string) || (cardSpec.description as string) || title || '';
+        const rawTitle = typeof cardSpec.title === 'string' ? cardSpec.title : '';
+        const title = fitCardTitle(rawTitle);
+        const fallbackText =
+          (content.fallbackText as string) || (cardSpec.description as string) || title || rawTitle || '';
 
         const cardChildren: CardChild[] = [];
         if (typeof cardSpec.description === 'string' && cardSpec.description) {

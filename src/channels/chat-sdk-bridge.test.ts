@@ -62,6 +62,20 @@ function makePostCapture() {
   return { calls, postMessage };
 }
 
+function hasLoneSurrogate(value: string): boolean {
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(i + 1);
+      if (next < 0xdc00 || next > 0xdfff) return true;
+      i++;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return true;
+    }
+  }
+  return false;
+}
+
 describe('splitForLimit', () => {
   it('returns a single chunk when text fits', () => {
     expect(splitForLimit('short text', 100)).toEqual(['short text']);
@@ -358,6 +372,35 @@ describe('createChatSdkBridge — outbound transform path', () => {
   });
 });
 
+describe('createChatSdkBridge.deliver — ask_question cards', () => {
+  it('caps rendered ask_question titles before creating the Card header', async () => {
+    const { calls, postMessage } = makePostCapture();
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({ postMessage }),
+      supportsThreads: false,
+    });
+
+    await bridge.deliver('slack:C123', 'slack:C123:1781317853.356239', {
+      kind: 'chat-sdk',
+      content: {
+        type: 'ask_question',
+        questionId: 'q-long-title',
+        title: 'Question '.repeat(30),
+        question: 'Pick one',
+        options: ['Approve', 'Reject'],
+      },
+    });
+
+    expect(calls).toHaveLength(1);
+    const msg = calls[0].message as { card?: { title?: string }; fallbackText?: string };
+    const renderedTitle = msg.card?.title ?? '';
+    expect(Array.from(renderedTitle)).toHaveLength(150);
+    expect(renderedTitle).toMatch(/…$/);
+    expect(hasLoneSurrogate(renderedTitle)).toBe(false);
+    expect(msg.fallbackText?.startsWith(renderedTitle)).toBe(true);
+  });
+});
+
 describe('createChatSdkBridge.deliver — display cards (send_card)', () => {
   // The send_card MCP tool writes outbound rows with `{ type: 'card', card, fallbackText }`.
   // Before this branch existed the bridge silently dropped them: cards have no
@@ -388,6 +431,32 @@ describe('createChatSdkBridge.deliver — display cards (send_card)', () => {
     const msg = calls[0].message as { card?: unknown; fallbackText?: string };
     expect(msg.fallbackText).toBe('Daily: your plate');
     expect(msg.card).toBeDefined();
+  });
+
+  it('caps rendered send_card titles without splitting emoji code points', async () => {
+    const { calls, postMessage } = makePostCapture();
+    const bridge = createChatSdkBridge({
+      adapter: stubAdapter({ postMessage }),
+      supportsThreads: false,
+    });
+    await bridge.deliver('slack:C123', null, {
+      kind: 'chat-sdk',
+      content: {
+        type: 'card',
+        card: {
+          title: `${'A'.repeat(148)}🚨 tail`,
+          description: 'body',
+        },
+      },
+    });
+
+    const msg = calls[0].message as { card?: { title?: string } };
+    const renderedTitle = msg.card?.title ?? '';
+    const renderedCodePoints = Array.from(renderedTitle);
+    expect(renderedCodePoints).toHaveLength(150);
+    expect(renderedCodePoints.at(-2)).toBe('🚨');
+    expect(renderedCodePoints.at(-1)).toBe('…');
+    expect(hasLoneSurrogate(renderedTitle)).toBe(false);
   });
 
   it('drops actions without url (send_card is fire-and-forget; non-URL buttons would have nowhere to land)', async () => {

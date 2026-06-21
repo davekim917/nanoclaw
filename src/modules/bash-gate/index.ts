@@ -72,6 +72,7 @@ import {
 // prior 30-min window matched v1's IDLE_TIMEOUT but routinely timed out
 // on approvers who were in a call when the card landed.
 const BASH_GATE_TIMEOUT_MS = 60 * 60 * 1000;
+const GATE_CARD_TITLE_MAX_CHARS = 140;
 
 const pendingTimeouts = new Map<string, NodeJS.Timeout>();
 
@@ -176,6 +177,18 @@ function buildCardBody(category: GateCategory, summary: string, command: string)
   return parts.join('\n\n');
 }
 
+function buildCardTitle(category: GateCategory, label: string): string {
+  const title = `${category.titleEmoji} ${label}`;
+  const codePoints = Array.from(title);
+  if (codePoints.length <= GATE_CARD_TITLE_MAX_CHARS) return title;
+  return (
+    codePoints
+      .slice(0, GATE_CARD_TITLE_MAX_CHARS - 1)
+      .join('')
+      .trimEnd() + '…'
+  );
+}
+
 function createGateHandler(category: GateCategory) {
   return async function handleGateRequest(
     content: Record<string, unknown>,
@@ -228,13 +241,13 @@ function createGateHandler(category: GateCategory) {
       sessionId: session.id,
     };
 
-    await requestApproval({
+    const approvalDelivered = await requestApproval({
       session,
       agentName: session.agent_group_id,
       action: category.approvalAction,
       requestId,
       payload: payload as unknown as Record<string, unknown>,
-      title: `${category.titleEmoji} ${label}`,
+      title: buildCardTitle(category, label),
       question: buildCardBody(category, summary, command),
       // Gates deliver in-thread so teammates using the agent can approve
       // their own work-level requests without waiting on the bot owner.
@@ -243,6 +256,17 @@ function createGateHandler(category: GateCategory) {
       // approvals stay admin-DM (their defaults).
       deliveryTarget: 'thread',
     });
+    if (!approvalDelivered) {
+      clearPending(requestId);
+      sessionsWithActiveGates.delete(session.id);
+      writeGateAck(
+        session,
+        requestId,
+        'rejected',
+        `${category.approvalAction} delivery failed: approval request could not be posted.`,
+      );
+      return { deferAck: true };
+    }
 
     // Write a 'pending' row to `delivered` so the delivery loop's
     // getDeliveredIds dedup filter skips this message on the next poll

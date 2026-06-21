@@ -23,7 +23,12 @@
  */
 import { normalizeOptions, type RawOption } from '../../channels/ask-question.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
-import { createPendingApproval, getSession, updatePendingApprovalMessageId } from '../../db/sessions.js';
+import {
+  createPendingApproval,
+  deletePendingApproval,
+  getSession,
+  updatePendingApprovalMessageId,
+} from '../../db/sessions.js';
 import { getDeliveryAdapter } from '../../delivery.js';
 import { wakeContainer } from '../../container-runner.js';
 import { log } from '../../log.js';
@@ -242,7 +247,7 @@ export interface RequestApprovalOptions {
  * caller's perspective — the admin's response kicks off the registered
  * approval handler for this action via the response dispatcher.
  */
-export async function requestApproval(opts: RequestApprovalOptions): Promise<void> {
+export async function requestApproval(opts: RequestApprovalOptions): Promise<boolean> {
   const { session, action, payload, title, question, agentName, deliveryTarget = 'admin' } = opts;
 
   // Resolve delivery destination based on target policy.
@@ -251,13 +256,13 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<voi
   let destination: { channelType: string; platformId: string; threadId: string | null; label: string };
   if (deliveryTarget === 'thread') {
     if (!session.messaging_group_id) {
-      notifyAgent(session, `${action} failed: session has no originating channel to post approval in.`);
-      return;
+      await notifyAgent(session, `${action} failed: session has no originating channel to post approval in.`);
+      return false;
     }
     const mg = getMessagingGroup(session.messaging_group_id);
     if (!mg) {
-      notifyAgent(session, `${action} failed: originating channel not found.`);
-      return;
+      await notifyAgent(session, `${action} failed: originating channel not found.`);
+      return false;
     }
     destination = {
       channelType: mg.channel_type,
@@ -268,16 +273,16 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<voi
   } else {
     const approvers = pickApprover(session.agent_group_id);
     if (approvers.length === 0) {
-      notifyAgent(session, `${action} failed: no owner or admin configured to approve.`);
-      return;
+      await notifyAgent(session, `${action} failed: no owner or admin configured to approve.`);
+      return false;
     }
     const originChannelType = session.messaging_group_id
       ? (getMessagingGroup(session.messaging_group_id)?.channel_type ?? '')
       : '';
     const target = await pickApprovalDelivery(approvers, originChannelType);
     if (!target) {
-      notifyAgent(session, `${action} failed: no DM channel found for any eligible approver.`);
-      return;
+      await notifyAgent(session, `${action} failed: no DM channel found for any eligible approver.`);
+      return false;
     }
     destination = {
       channelType: target.messagingGroup.channel_type,
@@ -309,32 +314,44 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<voi
   });
 
   const adapter = getDeliveryAdapter();
-  if (adapter) {
-    try {
-      const platformMsgId = await adapter.deliver(
-        destination.channelType,
-        destination.platformId,
-        destination.threadId,
-        'chat-sdk',
-        JSON.stringify({
-          type: 'ask_question',
-          questionId: approvalId,
-          title,
-          question,
-          options: APPROVAL_OPTIONS,
-        }),
-      );
-      if (platformMsgId) {
-        updatePendingApprovalMessageId(approvalId, platformMsgId);
-      }
-    } catch (err) {
-      log.error('Failed to deliver approval card', { action, approvalId, target: destination.label, err });
-      notifyAgent(session, `${action} failed: could not deliver approval request to ${destination.label}.`);
-      return;
+  if (!adapter) {
+    deletePendingApproval(approvalId);
+    log.error('Failed to deliver approval card', {
+      action,
+      approvalId,
+      target: destination.label,
+      err: 'delivery adapter unavailable',
+    });
+    await notifyAgent(session, `${action} failed: delivery adapter unavailable for ${destination.label}.`);
+    return false;
+  }
+
+  try {
+    const platformMsgId = await adapter.deliver(
+      destination.channelType,
+      destination.platformId,
+      destination.threadId,
+      'chat-sdk',
+      JSON.stringify({
+        type: 'ask_question',
+        questionId: approvalId,
+        title,
+        question,
+        options: APPROVAL_OPTIONS,
+      }),
+    );
+    if (platformMsgId) {
+      updatePendingApprovalMessageId(approvalId, platformMsgId);
     }
+  } catch (err) {
+    deletePendingApproval(approvalId);
+    log.error('Failed to deliver approval card', { action, approvalId, target: destination.label, err });
+    await notifyAgent(session, `${action} failed: could not deliver approval request to ${destination.label}.`);
+    return false;
   }
 
   log.info('Approval requested', { action, approvalId, agentName, target: destination.label, deliveryTarget });
+  return true;
 }
 
 /**
