@@ -40,6 +40,36 @@ describe('loadConfig providerConfig', () => {
     expect(result.providerConfig).toEqual({ model: 'claude-opus-4-7', effort: 'high' });
   });
 
+  it('test_loadConfig_preserves_stdio_and_http_mcp_transports', () => {
+    const result = parseRawConfig({
+      provider: 'codex',
+      mcpServers: {
+        local: { command: 'bun', args: ['run', '/app/mcp.ts'], env: { FOO: 'bar' } },
+        exa: {
+          type: 'http',
+          url: 'https://mcp.exa.ai/mcp',
+          headers: { Authorization: 'Bearer placeholder' },
+        },
+      },
+    });
+
+    expect(result.mcpServers.local).toEqual({ command: 'bun', args: ['run', '/app/mcp.ts'], env: { FOO: 'bar' } });
+    expect(result.mcpServers.exa).toEqual({
+      type: 'http',
+      url: 'https://mcp.exa.ai/mcp',
+      headers: { Authorization: 'Bearer placeholder' },
+    });
+  });
+
+  it('test_loadConfig_rejects_deprecated_sse_mcp_servers', () => {
+    expect(() =>
+      parseRawConfig({
+        provider: 'codex',
+        mcpServers: { legacy: { type: 'sse', url: 'https://example.test/sse' } },
+      }),
+    ).toThrow(/deprecated SSE transport/);
+  });
+
   it('test_factory_propagates_providerConfig_to_claude', () => {
     // createProvider('claude', { providerConfig: { model: 'claude-opus-4-7' } })
     // should return a ClaudeProvider with stickyConfig.model set.

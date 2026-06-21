@@ -46,13 +46,23 @@ describe('renderMcpServer', () => {
     expect(lines).toEqual(['[mcp_servers.m]', 'type = "stdio"', 'command = "x"']);
   });
 
-  it('emits http servers with url, no command/args', () => {
-    const lines = renderMcpServerForTest('deepwiki', { type: 'http', url: 'https://example.com/mcp' });
+  it('emits native Codex HTTP servers with url + http_headers, no command/args', () => {
+    const lines = renderMcpServerForTest('deepwiki', {
+      type: 'http',
+      url: 'https://example.com/mcp',
+      headers: { Authorization: 'Bearer placeholder', 'X-Tenant': 'demo' },
+    });
     expect(lines).toEqual([
       '[mcp_servers.deepwiki]',
-      'type = "http"',
       'url = "https://example.com/mcp"',
+      'http_headers = { "Authorization" = "Bearer placeholder", "X-Tenant" = "demo" }',
     ]);
+  });
+
+  it('rejects deprecated SSE servers', () => {
+    expect(() => renderMcpServerForTest('legacy', { type: 'sse', url: 'https://example.com/sse' })).toThrow(
+      /deprecated SSE transport/,
+    );
   });
 
   it('escapes quotes and backslashes in strings', () => {
@@ -75,6 +85,7 @@ describe('stripExistingMcpServers', () => {
       '[mcp_servers.exa]',
       'type = "http"',
       'url = "https://exa.example.com"',
+      'http_headers = { "Authorization" = "Bearer placeholder" }',
       '',
       '[mcp_servers.gitnexus]',
       'type = "stdio"',
@@ -199,6 +210,7 @@ describe('parseHostMcpServers', () => {
       '[mcp_servers.exa]',
       'type = "http"',
       'url = "https://exa.example.com"',
+      'http_headers = { "Authorization" = "Bearer placeholder" }',
       '',
       '[mcp_servers.with_env]',
       'type = "stdio"',
@@ -217,7 +229,11 @@ describe('parseHostMcpServers', () => {
       args: ['-y', 'gitnexus', 'mcp'],
       env: {},
     });
-    expect(parsed.exa).toEqual({ type: 'http', url: 'https://exa.example.com' });
+    expect(parsed.exa).toEqual({
+      type: 'http',
+      url: 'https://exa.example.com',
+      headers: { Authorization: 'Bearer placeholder' },
+    });
     expect(parsed.with_env).toEqual({
       type: 'stdio',
       command: 'bun',
@@ -228,6 +244,11 @@ describe('parseHostMcpServers', () => {
 
   it('returns empty for TOML with no mcp_servers tables', () => {
     expect(parseHostMcpServersForTest('model = "x"\n[features]\nfoo = true\n')).toEqual({});
+  });
+
+  it('rejects deprecated SSE host MCP entries', () => {
+    const toml = ['[mcp_servers.legacy]', 'type = "sse"', 'url = "https://example.com/sse"'].join('\n');
+    expect(() => parseHostMcpServersForTest(toml)).toThrow(/deprecated SSE transport/);
   });
 });
 

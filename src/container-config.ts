@@ -24,8 +24,9 @@ import type { AgentGroup, ContainerConfigRow } from './types.js';
 
 /**
  * Per-MCP-server config. Stdio (default) runs a subprocess inside the
- * container; http/sse hit a remote URL with credentials injected at the
- * HTTPS_PROXY layer by OneCLI — the container never sees the token.
+ * container; http hits a remote Streamable HTTP URL with credentials injected
+ * at the HTTPS_PROXY layer by OneCLI — the container never sees the token.
+ * SSE is deprecated and rejected by config validation.
  */
 export type McpServerConfig = StdioMcpServerConfig | HttpMcpServerConfig | SseMcpServerConfig;
 
@@ -51,6 +52,17 @@ export interface SseMcpServerConfig {
   headers?: Record<string, string>;
   // Optional always-in-context guidance; host imports into composed CLAUDE.md.
   instructions?: string;
+}
+
+export function validateMcpServers(servers: Record<string, McpServerConfig>): Record<string, McpServerConfig> {
+  for (const [name, server] of Object.entries(servers)) {
+    if (server?.type === 'sse') {
+      throw new Error(
+        `MCP server "${name}" uses deprecated SSE transport. Use Streamable HTTP (type: "http") instead.`,
+      );
+    }
+  }
+  return servers;
 }
 
 export interface AdditionalMountConfig {
@@ -407,7 +419,7 @@ function configPath(folder: string): string {
 /** Build a `ContainerConfig` from a DB row + agent group identity. */
 export function configFromDb(row: ContainerConfigRow, group: AgentGroup): ContainerConfig {
   return {
-    mcpServers: JSON.parse(row.mcp_servers) as Record<string, McpServerConfig>,
+    mcpServers: validateMcpServers(JSON.parse(row.mcp_servers) as Record<string, McpServerConfig>),
     packages: {
       apt: JSON.parse(row.packages_apt) as string[],
       npm: JSON.parse(row.packages_npm) as string[],
@@ -428,54 +440,58 @@ export function configFromDb(row: ContainerConfigRow, group: AgentGroup): Contai
 /**
  * Read the container config for a group, returning sensible defaults for
  * any missing fields (or an entirely empty config if the file is absent).
- * Never throws for missing / malformed files — corruption logs a warning
- * via console.error and falls back to empty.
+ * Never throws for missing / malformed JSON — corruption logs a warning
+ * via console.error and falls back to empty. Unsupported MCP transports fail
+ * closed after the file is parsed.
  */
 export function readContainerConfig(folder: string): ContainerConfig {
   const p = configPath(folder);
   if (!fs.existsSync(p)) return emptyConfig();
+
+  let raw: Partial<ContainerConfig>;
   try {
-    const raw = JSON.parse(fs.readFileSync(p, 'utf8')) as Partial<ContainerConfig>;
-    return {
-      mcpServers: raw.mcpServers ?? {},
-      packages: {
-        apt: raw.packages?.apt ?? [],
-        npm: raw.packages?.npm ?? [],
-      },
-      imageTag: raw.imageTag,
-      additionalMounts: raw.additionalMounts ?? [],
-      skills: raw.skills ?? 'all',
-      provider: raw.provider,
-      groupName: raw.groupName,
-      assistantName: raw.assistantName,
-      agentGroupId: raw.agentGroupId,
-      maxMessagesPerPrompt: raw.maxMessagesPerPrompt,
-      model: raw.model,
-      effort: raw.effort,
-      githubTokenEnv: raw.githubTokenEnv,
-      excludePlugins: raw.excludePlugins,
-      codexHostAuth: raw.codexHostAuth,
-      wixHostAuth: raw.wixHostAuth,
-      codexAuthFallbacks: raw.codexAuthFallbacks,
-      credentialFolder: raw.credentialFolder,
-      excludeMcpServers: raw.excludeMcpServers,
-      gitnexusInjectAgentsMd: raw.gitnexusInjectAgentsMd,
-      ollamaAdminTools: raw.ollamaAdminTools,
-      defaultModel: raw.defaultModel,
-      defaultEffort: raw.defaultEffort,
-      tone: raw.tone,
-      tools: raw.tools,
-      providerConfig: raw.providerConfig,
-      memory: (raw as Record<string, unknown>).memory as MemoryConfig | undefined,
-      dailySummary: raw.dailySummary,
-      onecliSecrets: raw.onecliSecrets,
-      workgroup_id: raw.workgroup_id,
-      slack_user_token: raw.slack_user_token,
-    };
+    raw = JSON.parse(fs.readFileSync(p, 'utf8')) as Partial<ContainerConfig>;
   } catch (err) {
     console.error(`[container-config] failed to parse ${p}: ${String(err)}`);
     return emptyConfig();
   }
+
+  return {
+    mcpServers: validateMcpServers(raw.mcpServers ?? {}),
+    packages: {
+      apt: raw.packages?.apt ?? [],
+      npm: raw.packages?.npm ?? [],
+    },
+    imageTag: raw.imageTag,
+    additionalMounts: raw.additionalMounts ?? [],
+    skills: raw.skills ?? 'all',
+    provider: raw.provider,
+    groupName: raw.groupName,
+    assistantName: raw.assistantName,
+    agentGroupId: raw.agentGroupId,
+    maxMessagesPerPrompt: raw.maxMessagesPerPrompt,
+    model: raw.model,
+    effort: raw.effort,
+    githubTokenEnv: raw.githubTokenEnv,
+    excludePlugins: raw.excludePlugins,
+    codexHostAuth: raw.codexHostAuth,
+    wixHostAuth: raw.wixHostAuth,
+    codexAuthFallbacks: raw.codexAuthFallbacks,
+    credentialFolder: raw.credentialFolder,
+    excludeMcpServers: raw.excludeMcpServers,
+    gitnexusInjectAgentsMd: raw.gitnexusInjectAgentsMd,
+    ollamaAdminTools: raw.ollamaAdminTools,
+    defaultModel: raw.defaultModel,
+    defaultEffort: raw.defaultEffort,
+    tone: raw.tone,
+    tools: raw.tools,
+    providerConfig: raw.providerConfig,
+    memory: (raw as Record<string, unknown>).memory as MemoryConfig | undefined,
+    dailySummary: raw.dailySummary,
+    onecliSecrets: raw.onecliSecrets,
+    workgroup_id: raw.workgroup_id,
+    slack_user_token: raw.slack_user_token,
+  };
 }
 
 /**
@@ -484,6 +500,7 @@ export function readContainerConfig(folder: string): ContainerConfig {
  * flow are reviewable.
  */
 export function writeContainerConfig(folder: string, config: ContainerConfig): void {
+  validateMcpServers(config.mcpServers ?? {});
   const p = configPath(folder);
   const dir = path.dirname(p);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });

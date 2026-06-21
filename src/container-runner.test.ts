@@ -6,7 +6,9 @@ import BetterSQLite3 from 'better-sqlite3';
 import type Database from 'better-sqlite3';
 
 import {
+  DATAFOLD_MCP_SERVER,
   dockerResourceLimitArgs,
+  serializeMcpServersEnv,
   resolveAnthropicAuth,
   resolveCodexAuthFallbacks,
   resolveProviderName,
@@ -52,6 +54,28 @@ describe('dockerResourceLimitArgs', () => {
       '--pids-limit',
       '512',
     ]);
+  });
+});
+
+describe('serializeMcpServersEnv', () => {
+  it('serializes Datafold as native Streamable HTTP without the bridge', () => {
+    const env = serializeMcpServersEnv({ datafold: DATAFOLD_MCP_SERVER });
+    expect(env).not.toBeNull();
+    expect(env).not.toContain('remote-mcp-bridge');
+
+    const payload = env!.replace(/^NANOCLAW_MCP_SERVERS=/, '');
+    const servers = JSON.parse(payload);
+    expect(servers.datafold).toEqual({
+      type: 'http',
+      url: 'https://app.datafold.com/mcp/',
+      headers: { Authorization: 'Key onecli-managed' },
+    });
+  });
+
+  it('rejects deprecated SSE before serializing the container env var', () => {
+    expect(() => serializeMcpServersEnv({ legacy: { type: 'sse', url: 'https://example.test/sse' } })).toThrow(
+      /deprecated SSE transport/,
+    );
   });
 });
 

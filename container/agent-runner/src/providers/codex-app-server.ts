@@ -57,6 +57,12 @@ export function tomlBasicString(value: string): string {
   return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 }
 
+function tomlInlineStringMap(map: Record<string, string>): string {
+  return `{ ${Object.entries(map)
+    .map(([key, value]) => `${tomlBasicString(key)} = ${tomlBasicString(value)}`)
+    .join(', ')} }`;
+}
+
 // ── JSON-RPC types ──────────────────────────────────────────────────────────
 
 let nextRequestId = 1;
@@ -391,10 +397,19 @@ export async function steerCodexTurn(
 // We rewrite it on every spawn from whatever mcpServers the agent-runner
 // passes in, so the container's config reflects the current host wiring.
 
-export interface CodexMcpServer {
+export type CodexMcpServer = CodexStdioMcpServer | CodexHttpMcpServer;
+
+export interface CodexStdioMcpServer {
+  type?: 'stdio';
   command: string;
   args?: string[];
   env?: Record<string, string>;
+}
+
+export interface CodexHttpMcpServer {
+  type: 'http';
+  url: string;
+  headers?: Record<string, string>;
 }
 
 function stripExistingMcpServers(toml: string): string {
@@ -429,16 +444,23 @@ export function writeCodexMcpConfigToml(servers: Record<string, CodexMcpServer>)
   const lines: string[] = base ? [base, '', '# --- nanoclaw runtime MCP servers ---', ''] : [];
   for (const [name, config] of Object.entries(servers)) {
     lines.push(`[mcp_servers.${name}]`);
-    lines.push('type = "stdio"');
-    lines.push(`command = ${tomlBasicString(config.command)}`);
-    if (config.args && config.args.length > 0) {
-      const argsStr = config.args.map(tomlBasicString).join(', ');
-      lines.push(`args = [${argsStr}]`);
-    }
-    if (config.env && Object.keys(config.env).length > 0) {
-      lines.push(`[mcp_servers.${name}.env]`);
-      for (const [key, value] of Object.entries(config.env)) {
-        lines.push(`${key} = ${tomlBasicString(value)}`);
+    if (config.type === 'http') {
+      lines.push(`url = ${tomlBasicString(config.url)}`);
+      if (config.headers && Object.keys(config.headers).length > 0) {
+        lines.push(`http_headers = ${tomlInlineStringMap(config.headers)}`);
+      }
+    } else {
+      lines.push('type = "stdio"');
+      lines.push(`command = ${tomlBasicString(config.command)}`);
+      if (config.args && config.args.length > 0) {
+        const argsStr = config.args.map(tomlBasicString).join(', ');
+        lines.push(`args = [${argsStr}]`);
+      }
+      if (config.env && Object.keys(config.env).length > 0) {
+        lines.push(`[mcp_servers.${name}.env]`);
+        for (const [key, value] of Object.entries(config.env)) {
+          lines.push(`${key} = ${tomlBasicString(value)}`);
+        }
       }
     }
     lines.push('');

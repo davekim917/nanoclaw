@@ -52,6 +52,12 @@ function log(msg: string): void {
   console.error(`[codex-companion-setup] ${msg}`);
 }
 
+function tomlInlineStringMap(map: Record<string, string>): string {
+  return `{ ${Object.entries(map)
+    .map(([key, value]) => `${tomlBasicString(key)} = ${tomlBasicString(value)}`)
+    .join(', ')} }`;
+}
+
 export function renderMcpServerForTest(name: string, config: McpServerConfig): string[] {
   return renderMcpServer(name, config);
 }
@@ -72,9 +78,15 @@ function renderMcpServer(name: string, config: McpServerConfig): string[] {
   const lines: string[] = [];
   lines.push(`[mcp_servers.${name}]`);
 
-  if (config.type === 'http' || config.type === 'sse') {
-    lines.push(`type = ${tomlBasicString(config.type)}`);
+  if (config.type === 'sse') {
+    throw new Error(`MCP server "${name}" uses deprecated SSE transport. Use type: "http" instead.`);
+  }
+
+  if (config.type === 'http') {
     lines.push(`url = ${tomlBasicString(config.url)}`);
+    if (config.headers && Object.keys(config.headers).length > 0) {
+      lines.push(`http_headers = ${tomlInlineStringMap(config.headers)}`);
+    }
     return lines;
   }
 
@@ -157,8 +169,17 @@ function parseHostMcpServers(toml: string): Record<string, McpServerConfig> {
     const url = partial.url as string | undefined;
     const command = partial.command as string | undefined;
     const inferredType = explicitType ?? (url ? 'http' : command ? 'stdio' : undefined);
-    if (inferredType === 'http' || inferredType === 'sse') {
-      if (url) result[currentName] = { type: inferredType, url };
+    if (inferredType === 'sse') {
+      throw new Error(`MCP server "${currentName}" uses deprecated SSE transport. Use type: "http" instead.`);
+    }
+    if (inferredType === 'http') {
+      if (url) {
+        result[currentName] = {
+          type: 'http',
+          url,
+          ...(partial.headers ? { headers: partial.headers as Record<string, string> } : {}),
+        };
+      }
     } else if (inferredType === 'stdio') {
       if (command) {
         result[currentName] = {
@@ -213,6 +234,8 @@ function parseHostMcpServers(toml: string): Record<string, McpServerConfig> {
 
     if (key === 'type' || key === 'command' || key === 'url') {
       partial[key] = parseTomlString(valueRaw);
+    } else if (key === 'http_headers' && valueRaw.startsWith('{')) {
+      partial.headers = parseTomlInlineStringMap(valueRaw);
     } else if (key === 'args' && valueRaw.startsWith('[')) {
       const arrayMatch = valueRaw.match(/^\[(.*)\]$/);
       if (arrayMatch) {
@@ -229,6 +252,18 @@ function parseTomlString(raw: string): string {
   const m = raw.match(/^"((?:[^"\\]|\\.)*)"/);
   if (!m) return raw;
   return m[1].replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+}
+
+function parseTomlInlineStringMap(raw: string): Record<string, string> {
+  const map: Record<string, string> = {};
+  const body = raw.trim().replace(/^\{\s*/, '').replace(/\s*\}$/, '');
+  for (const part of splitTomlArray(body)) {
+    const m = part.match(/^("((?:[^"\\]|\\.)*)"|[A-Za-z_][A-Za-z0-9_-]*)\s*=\s*(.+)$/);
+    if (!m) continue;
+    const key = m[2] !== undefined ? parseTomlString(m[1]) : m[1];
+    map[key] = parseTomlString(m[3].trim());
+  }
+  return map;
 }
 
 function splitTomlArray(inside: string): string[] {

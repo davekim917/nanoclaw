@@ -9,7 +9,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { GROUPS_DIR } from './config.js';
-import type { McpServerConfig, AdditionalMountConfig } from './container-config.js';
+import { validateMcpServers, type McpServerConfig, type AdditionalMountConfig } from './container-config.js';
 import { getAllAgentGroups } from './db/agent-groups.js';
 import { getContainerConfig, createContainerConfig } from './db/container-configs.js';
 import { log } from './log.js';
@@ -60,7 +60,7 @@ export function backfillContainerConfigs(): void {
       assistant_name: legacy.assistantName ?? null,
       max_messages_per_prompt: legacy.maxMessagesPerPrompt ?? null,
       skills: JSON.stringify(legacy.skills ?? 'all'),
-      mcp_servers: JSON.stringify(legacy.mcpServers ?? {}),
+      mcp_servers: JSON.stringify(validateMcpServers(legacy.mcpServers ?? {})),
       packages_apt: JSON.stringify(legacy.packages?.apt ?? []),
       packages_npm: JSON.stringify(legacy.packages?.npm ?? []),
       additional_mounts: JSON.stringify(legacy.additionalMounts ?? []),

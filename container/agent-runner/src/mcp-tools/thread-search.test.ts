@@ -43,27 +43,15 @@ mock.module('bun:sqlite', () => ({
   },
 }));
 
-// ---- Mock config to supply agentGroupId ----
-let _currentAgentGroupId = 'ag-self';
-mock.module('../config.js', () => ({
-  getConfig: () => ({ agentGroupId: _currentAgentGroupId }),
-}));
+const { initTestSessionDb, closeSessionDb, getInboundDb } = await import("../db/connection.js");
 
-// ---- Mock session-routing (not used in the SQL tests, but imported) ----
-mock.module('../db/session-routing.js', () => ({
-  getSessionRouting: () => ({
-    channel_type: 'slack',
-    platform_id: 'slack:C001',
-    thread_id: null,
-  }),
-  getSessionSpawnTaskId: () => null,
-  getSessionId: () => 'sess-test',
-}));
-
-// ---- Mock destinations (resolveRouting fallback) ----
-mock.module('../destinations.js', () => ({
-  findByName: (_name: string) => null,
-}));
+function seedSessionRouting(): void {
+  const db = getInboundDb();
+  db.exec("CREATE TABLE IF NOT EXISTS session_routing (id INTEGER PRIMARY KEY CHECK (id = 1), channel_type TEXT, platform_id TEXT, thread_id TEXT, spawn_task_id TEXT, session_id TEXT)");
+  db.prepare(
+    "INSERT INTO session_routing (id, channel_type, platform_id, thread_id, spawn_task_id, session_id) VALUES (1, ?, ?, NULL, NULL, ?)",
+  ).run("slack", "slack:C001", "sess-test");
+}
 
 // ---- Mock server.js registerTools (side-effect on import) ----
 mock.module('./server.js', () => ({
@@ -195,12 +183,13 @@ function getText(result: { content: Array<{ type: string; text: string }> }): st
 
 describe('thread-search workgroup-pooled tests', () => {
   beforeEach(() => {
+    initTestSessionDb();
+    seedSessionRouting();
     clearDb(sharedDb);
-    _currentAgentGroupId = 'ag-self';
   });
 
   afterEach(() => {
-    // nothing extra needed
+    closeSessionDb();
   });
 
   // -----------------------------------------------------------------------

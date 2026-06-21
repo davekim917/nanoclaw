@@ -20,7 +20,7 @@ import {
 import { getDeniedModel } from '../../db/denied-models.js';
 import { getSession } from '../../db/sessions.js';
 import { isOpenCodeModelSlug } from '../../flag-parser.js';
-import type { McpServerConfig } from '../../container-config.js';
+import { validateMcpServers, type McpServerConfig } from '../../container-config.js';
 import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import type { Session } from '../../types.js';
@@ -109,7 +109,7 @@ export const applyAddMcpServer: ApprovalHandler = async ({ session, payload, use
     args: (payload.args as string[]) || [],
     env: (payload.env as Record<string, string>) || {},
   };
-  updateContainerConfigJson(agentGroup.id, 'mcp_servers', servers);
+  updateContainerConfigJson(agentGroup.id, 'mcp_servers', validateMcpServers(servers));
 
   writeSessionMessage(session.agent_group_id, session.id, {
     id: `appr-note-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,

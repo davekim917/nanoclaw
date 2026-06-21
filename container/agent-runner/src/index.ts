@@ -40,6 +40,14 @@ function log(msg: string): void {
   console.error(`[agent-runner] ${msg}`);
 }
 
+function mcpServerSummary(name: string, server: McpServerConfig): string {
+  if (server.type === 'sse') {
+    throw new Error(`MCP server "${name}" uses deprecated SSE transport. Use type: "http" instead.`);
+  }
+  if (server.type === 'http') return `http: ${server.url}`;
+  return `${server.type ?? 'stdio'}: ${server.command}`;
+}
+
 const CWD = '/workspace/agent';
 
 async function main(): Promise<void> {
@@ -134,7 +142,7 @@ async function main(): Promise<void> {
       continue;
     }
     mcpServers[name] = serverConfig;
-    log(`Additional MCP server: ${name} (${serverConfig.command})`);
+    log(`Additional MCP server: ${name} (${mcpServerSummary(name, serverConfig)})`);
   }
 
   // Dynamic host-injected servers via env — lets the host wire universal
@@ -144,9 +152,7 @@ async function main(): Promise<void> {
       const additional = JSON.parse(process.env.NANOCLAW_MCP_SERVERS) as Record<string, McpServerConfig>;
       for (const [name, serverConfig] of Object.entries(additional)) {
         mcpServers[name] = serverConfig;
-        const summary =
-          serverConfig.type === 'http' || serverConfig.type === 'sse' ? serverConfig.url : serverConfig.command;
-        log(`Additional MCP server: ${name} (${serverConfig.type ?? 'stdio'}: ${summary})`);
+        log(`Additional MCP server: ${name} (${mcpServerSummary(name, serverConfig)})`);
       }
     } catch (e) {
       log(`Failed to parse NANOCLAW_MCP_SERVERS: ${e}`);

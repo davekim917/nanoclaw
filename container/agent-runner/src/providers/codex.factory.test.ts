@@ -43,7 +43,7 @@ describe('createProvider (codex)', () => {
     expect(p.supportsNativeSlashCommands).toBe(false);
   });
 
-  it('bridges HTTP MCP servers and filters SSE servers', () => {
+  it('keeps HTTP MCP servers native by default', () => {
     const p = new CodexProvider({
       mcpServers: {
         exa: { type: 'http', url: 'https://mcp.exa.ai/mcp' },
@@ -52,29 +52,63 @@ describe('createProvider (codex)', () => {
           url: 'https://example.test/mcp',
           headers: { Authorization: 'Bearer placeholder' },
         },
-        legacy: { type: 'sse', url: 'https://example.test/sse' },
       },
     }) as unknown as {
-      mcpServers: Record<string, { command: string; args?: string[]; env?: Record<string, string> }>;
+      mcpServers: Record<
+        string,
+        { type?: string; url?: string; headers?: Record<string, string>; command?: string; args?: string[] }
+      >;
     };
 
-    expect(p.mcpServers.exa.command).toBe('bun');
-    expect(p.mcpServers.exa.args).toEqual(['/app/src/remote-mcp-bridge.ts', 'https://mcp.exa.ai/mcp']);
-    // env block carries the required bridge identity plus any proxy/CA env
-    // augmentation from process.env (see augmentWithProxyEnv tests below).
-    expect(p.mcpServers.exa.env?.REMOTE_MCP_NAME).toBe('exa');
-    expect(p.mcpServers.custom.env?.REMOTE_MCP_AUTHORIZATION).toBe('Bearer placeholder');
-    expect(p.mcpServers.legacy).toBeUndefined();
+    expect(p.mcpServers.exa).toEqual({ type: 'http', url: 'https://mcp.exa.ai/mcp' });
+    expect(p.mcpServers.custom).toEqual({
+      type: 'http',
+      url: 'https://example.test/mcp',
+      headers: { Authorization: 'Bearer placeholder' },
+    });
+    expect(p.mcpServers.exa.command).toBeUndefined();
+    expect(p.mcpServers.exa.args).toBeUndefined();
   });
 
-  // Issue 3 from the Bo / Bo-codex parity report: Bo-codex's thinking
-  // suggested HTTPS_PROXY was missing in MCP subprocesses. Codex's app-server
-  // writes each MCP's env block to ~/.codex/config.toml and passes ONLY
-  // that block to spawned subprocesses; host env doesn't propagate the way
-  // it does for Claude's SDK-spawned stdio MCPs. Without explicit
-  // forwarding, the remote-mcp-bridge can't route outbound HTTPS through
-  // OneCLI's substitution proxy. Provider constructor now augments every
-  // MCP env block via `augmentWithProxyEnv`.
+  it('rejects deprecated SSE MCP servers', () => {
+    expect(
+      () => new CodexProvider({ mcpServers: { legacy: { type: 'sse', url: 'https://example.test/sse' } } }),
+    ).toThrow(/deprecated SSE transport/);
+  });
+
+  it('uses the HTTP bridge only when the explicit fallback flag is enabled', () => {
+    const previous = process.env.NANOCLAW_CODEX_MCP_HTTP_BRIDGE_FALLBACK;
+    try {
+      process.env.NANOCLAW_CODEX_MCP_HTTP_BRIDGE_FALLBACK = '1';
+      const p = new CodexProvider({
+        mcpServers: {
+          exa: { type: 'http', url: 'https://mcp.exa.ai/mcp' },
+          custom: {
+            type: 'http',
+            url: 'https://example.test/mcp',
+            headers: { Authorization: 'Bearer placeholder' },
+          },
+        },
+      }) as unknown as {
+        mcpServers: Record<string, { command: string; args?: string[]; env?: Record<string, string> }>;
+      };
+
+      expect(p.mcpServers.exa.command).toBe('bun');
+      expect(p.mcpServers.exa.args).toEqual(['/app/src/remote-mcp-bridge.ts', 'https://mcp.exa.ai/mcp']);
+      expect(p.mcpServers.exa.env?.REMOTE_MCP_NAME).toBe('exa');
+      expect(p.mcpServers.custom.env?.REMOTE_MCP_AUTHORIZATION).toBe('Bearer placeholder');
+    } finally {
+      if (previous === undefined) delete process.env.NANOCLAW_CODEX_MCP_HTTP_BRIDGE_FALLBACK;
+      else process.env.NANOCLAW_CODEX_MCP_HTTP_BRIDGE_FALLBACK = previous;
+    }
+  });
+
+  // Issue 3 from the Bo / Bo-codex parity report: Codex's app-server writes
+  // stdio MCP env blocks to ~/.codex/config.toml and passes ONLY that block to
+  // spawned subprocesses; host env doesn't propagate the way it does for
+  // Claude's SDK-spawned stdio MCPs. Stdio MCPs and the explicit HTTP bridge
+  // fallback both need proxy/CA env propagation. Native HTTP MCP servers do not
+  // spawn a child process, so they do not carry an env block.
   describe('MCP proxy env propagation', () => {
     // Tests touch process.env — snapshot + restore so neighbours stay clean.
     function withEnv<T>(overrides: Record<string, string | undefined>, fn: () => T): T {
@@ -94,9 +128,10 @@ describe('createProvider (codex)', () => {
       }
     }
 
-    it('augments HTTP MCP env block with HTTPS_PROXY + NODE_EXTRA_CA_CERTS from container env', () => {
+    it('augments HTTP bridge fallback env block with HTTPS_PROXY + NODE_EXTRA_CA_CERTS from container env', () => {
       withEnv(
         {
+          NANOCLAW_CODEX_MCP_HTTP_BRIDGE_FALLBACK: '1',
           HTTPS_PROXY: 'http://x:secret@host.docker.internal:10255',
           NODE_EXTRA_CA_CERTS: '/tmp/onecli-gateway-ca.pem',
         },
@@ -126,8 +161,8 @@ describe('createProvider (codex)', () => {
       });
     });
 
-    it('does not overwrite an env block that already sets a proxy var', () => {
-      withEnv({ HTTPS_PROXY: 'http://host-default:10255' }, () => {
+    it('does not overwrite an HTTP bridge fallback env block that already sets a proxy var', () => {
+      withEnv({ NANOCLAW_CODEX_MCP_HTTP_BRIDGE_FALLBACK: '1', HTTPS_PROXY: 'http://host-default:10255' }, () => {
         const p = new CodexProvider({
           mcpServers: {
             custom: {
@@ -146,6 +181,7 @@ describe('createProvider (codex)', () => {
     it('omits proxy keys that are not set in process.env', () => {
       withEnv(
         {
+          NANOCLAW_CODEX_MCP_HTTP_BRIDGE_FALLBACK: '1',
           HTTPS_PROXY: 'http://proxy:10255',
           HTTP_PROXY: undefined,
           NO_PROXY: undefined,

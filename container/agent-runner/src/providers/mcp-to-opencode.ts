@@ -8,7 +8,7 @@ export type OpenCodeMcpLocal = {
   enabled: true;
 };
 
-/** OpenCode `mcp` entry shape (remote HTTP server). */
+/** OpenCode `mcp` entry shape (remote Streamable HTTP server). */
 export type OpenCodeMcpRemote = {
   type: 'remote';
   url: string;
@@ -19,9 +19,10 @@ export type OpenCodeMcpRemote = {
 export type OpenCodeMcpEntry = OpenCodeMcpLocal | OpenCodeMcpRemote;
 
 /**
- * Map NanoClaw v2 MCP definitions (same shape as Claude Agent SDK) into
- * OpenCode config `mcp` field. Handles all three McpServerConfig variants:
- * stdio (explicit or implicit) → local, http/sse → remote.
+ * Map NanoClaw v2 MCP definitions into OpenCode config `mcp` field.
+ * stdio (explicit or implicit) → local, Streamable HTTP → remote.
+ * Legacy SSE is intentionally rejected instead of silently preserving a
+ * transport that is not part of the cross-harness native baseline.
  */
 export function mcpServersToOpenCodeConfig(
   servers: Record<string, McpServerConfig> | undefined,
@@ -29,7 +30,10 @@ export function mcpServersToOpenCodeConfig(
   const out: Record<string, OpenCodeMcpEntry> = {};
   if (!servers) return out;
   for (const [name, cfg] of Object.entries(servers)) {
-    if (cfg.type === 'http' || cfg.type === 'sse') {
+    if (cfg.type === 'sse') {
+      throw new Error(`MCP server "${name}" uses deprecated SSE transport. Use type: "http" instead.`);
+    }
+    if (cfg.type === 'http') {
       out[name] = {
         type: 'remote',
         url: cfg.url,

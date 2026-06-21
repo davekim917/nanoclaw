@@ -30,8 +30,10 @@ import {
 import {
   getRecallScope,
   readContainerConfig,
+  validateMcpServers,
   writeContainerConfig,
   type ContainerConfig,
+  type McpServerConfig,
   type RecallScope,
 } from './container-config.js';
 import { getContainerConfig, resolveProviderName } from './db/container-configs.js';
@@ -75,6 +77,18 @@ import {
   writeSessionRouting,
 } from './session-manager.js';
 import type { AgentGroup, Session } from './types.js';
+
+export const DATAFOLD_MCP_SERVER = {
+  type: 'http',
+  url: 'https://app.datafold.com/mcp/',
+  headers: { Authorization: 'Key onecli-managed' },
+} as const satisfies McpServerConfig;
+
+export function serializeMcpServersEnv(servers: Record<string, unknown>): string | null {
+  const validated = validateMcpServers(servers as Record<string, McpServerConfig>);
+  if (Object.keys(validated).length === 0) return null;
+  return `NANOCLAW_MCP_SERVERS=${JSON.stringify(validated)}`;
+}
 
 // timeout 30s (SDK default is 5s): createAgent/applyContainerConfig run at
 // spawn, and the gateway can be briefly slow when the host is reaping many
@@ -2651,19 +2665,10 @@ async function buildContainerArgs(
     };
   }
   if (canInject('datafold') && isToolEnabled(containerConfig.tools, 'datafold')) {
-    // Official Datafold HTTP MCP. Expose it through a stdio bridge so both
-    // Claude and Codex agents get the same `mcp__datafold__*` namespace.
-    // Datafold requires `Authorization: Key <api-key>`; OneCLI overwrites
-    // the placeholder header at the proxy boundary for app.datafold.com.
-    mcpServers.datafold = {
-      type: 'stdio',
-      command: 'bun',
-      args: ['/app/src/remote-mcp-bridge.ts', 'https://app.datafold.com/mcp/'],
-      env: {
-        REMOTE_MCP_NAME: 'datafold',
-        REMOTE_MCP_AUTHORIZATION: 'Key onecli-managed',
-      },
-    };
+    // Official Datafold Streamable HTTP MCP. Datafold requires
+    // `Authorization: Key <api-key>`; OneCLI overwrites the placeholder
+    // header at the proxy boundary for app.datafold.com.
+    mcpServers.datafold = DATAFOLD_MCP_SERVER;
   }
   if (canInject('atlassian') && isToolEnabled(containerConfig.tools, 'atlassian')) {
     // sooperset/mcp-atlassian — stdio Python MCP server (72 tools across
@@ -2838,8 +2843,9 @@ async function buildContainerArgs(
     }
   }
 
-  if (Object.keys(mcpServers).length > 0) {
-    args.push('-e', `NANOCLAW_MCP_SERVERS=${JSON.stringify(mcpServers)}`);
+  const mcpServersEnv = serializeMcpServersEnv(mcpServers);
+  if (mcpServersEnv) {
+    args.push('-e', mcpServersEnv);
   }
 
   // Override entrypoint so we skip tini's stdin-read wait (host-spawned

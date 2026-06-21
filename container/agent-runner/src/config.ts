@@ -7,6 +7,8 @@
  */
 import fs from 'fs';
 
+import type { McpServerConfig } from './providers/types.js';
+
 const DEFAULT_CONFIG_PATH = '/workspace/agent/container.json';
 
 export interface RunnerConfig {
@@ -15,7 +17,7 @@ export interface RunnerConfig {
   groupName: string;
   agentGroupId: string;
   maxMessagesPerPrompt: number;
-  mcpServers: Record<string, { command: string; args: string[]; env: Record<string, string> }>;
+  mcpServers: Record<string, McpServerConfig>;
 
   // ADDED: per-provider sticky config from container.json.providerConfig
   providerConfig: Record<string, unknown>;
@@ -26,6 +28,17 @@ export interface RunnerConfig {
 const DEFAULT_MAX_MESSAGES = 10;
 
 let _config: RunnerConfig | null = null;
+
+function validateMcpServers(servers: Record<string, McpServerConfig>): Record<string, McpServerConfig> {
+  for (const [name, server] of Object.entries(servers)) {
+    if (server?.type === 'sse') {
+      throw new Error(
+        `MCP server "${name}" uses deprecated SSE transport. Use Streamable HTTP (type: "http") instead.`,
+      );
+    }
+  }
+  return servers;
+}
 
 /**
  * Pure parse — exported so unit tests can verify schema mapping without
@@ -45,7 +58,7 @@ export function parseRawConfig(raw: Record<string, unknown>): RunnerConfig {
     groupName: (raw.groupName as string) || '',
     agentGroupId: (raw.agentGroupId as string) || '',
     maxMessagesPerPrompt: (raw.maxMessagesPerPrompt as number) || DEFAULT_MAX_MESSAGES,
-    mcpServers: (raw.mcpServers as RunnerConfig['mcpServers']) || {},
+    mcpServers: validateMcpServers((raw.mcpServers as RunnerConfig['mcpServers']) || {}),
     providerConfig: (raw.providerConfig as Record<string, unknown>) ?? {},
     model: (raw.model as string) || undefined,
     effort: (raw.effort as string) || undefined,

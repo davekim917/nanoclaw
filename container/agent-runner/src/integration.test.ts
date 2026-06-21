@@ -340,6 +340,9 @@ describe('poll loop integration', () => {
 
 // Helper: run poll loop until aborted or timeout
 async function runPollLoopWithTimeout(provider: MockProvider, signal: AbortSignal, timeoutMs: number): Promise<void> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  let abortListener: (() => void) | undefined;
+
   return Promise.race([
     runPollLoop({
       provider,
@@ -347,11 +350,21 @@ async function runPollLoopWithTimeout(provider: MockProvider, signal: AbortSigna
       cwd: '/tmp',
       signal,
     }),
-    new Promise<void>((_, reject) => {
-      signal.addEventListener('abort', () => reject(new Error('aborted')));
+    new Promise<void>((resolve) => {
+      if (signal.aborted) {
+        resolve();
+        return;
+      }
+      abortListener = () => resolve();
+      signal.addEventListener('abort', abortListener, { once: true });
     }),
-    new Promise<void>((_, reject) => setTimeout(() => reject(new Error('timeout')), timeoutMs)),
-  ]);
+    new Promise<void>((_, reject) => {
+      timeout = setTimeout(() => reject(new Error('timeout')), timeoutMs);
+    }),
+  ]).finally(() => {
+    if (timeout !== undefined) clearTimeout(timeout);
+    if (abortListener) signal.removeEventListener('abort', abortListener);
+  });
 }
 
 async function waitFor(condition: () => boolean, timeoutMs: number): Promise<void> {

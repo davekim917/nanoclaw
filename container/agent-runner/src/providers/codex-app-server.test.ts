@@ -136,6 +136,45 @@ describe('writeCodexMcpConfigToml', () => {
     }
   });
 
+  it('writes native HTTP MCP entries with url and http_headers', () => {
+    const prevHome = process.env.HOME;
+    const prevCodexHome = process.env.CODEX_HOME;
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-home-'));
+    try {
+      process.env.HOME = home;
+      delete process.env.CODEX_HOME;
+
+      writeCodexMcpConfigToml({
+        exa: {
+          type: 'http',
+          url: 'https://mcp.exa.ai/mcp',
+          headers: { Authorization: 'Bearer placeholder' },
+        },
+      });
+
+      const config = fs.readFileSync(path.join(home, '.codex', 'config.toml'), 'utf-8');
+      expect(config).toContain('[mcp_servers.exa]');
+      expect(config).toContain('url = "https://mcp.exa.ai/mcp"');
+      expect(config).toContain('http_headers = { "Authorization" = "Bearer placeholder" }');
+      expect(config).not.toContain('type = "http"');
+      expect(config).not.toContain('type = "stdio"');
+      expect(config).not.toContain('remote-mcp-bridge');
+      expect(config).not.toContain('command = "bun"');
+    } finally {
+      if (prevHome === undefined) {
+        delete process.env.HOME;
+      } else {
+        process.env.HOME = prevHome;
+      }
+      if (prevCodexHome === undefined) {
+        delete process.env.CODEX_HOME;
+      } else {
+        process.env.CODEX_HOME = prevCodexHome;
+      }
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it('writes config.toml + hooks.json to CODEX_HOME, not $HOME/.codex (codex #126 rotation)', () => {
     // On OAuth rotation the provider sets CODEX_HOME to a fallback dir; the writers
     // must target it (else the rotated app-server runs with stale config and — for

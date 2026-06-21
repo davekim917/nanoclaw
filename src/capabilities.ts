@@ -535,10 +535,10 @@ export function buildSessionServicesSnapshot(
   }
 
   // Datafold — gated by tool entry. Container-runner injects the official
-  // Datafold HTTP MCP through a stdio bridge when 'datafold' is in
-  // container.json.tools. OneCLI gateway overwrites the placeholder
-  // `Authorization: Key ...` header at request time; the raw Datafold API key
-  // is never placed in container.json or process env.
+  // Datafold Streamable HTTP MCP when 'datafold' is in container.json.tools.
+  // OneCLI gateway overwrites the placeholder `Authorization: Key ...` header
+  // at request time; the raw Datafold API key is never placed in container.json
+  // or process env.
   if (declared(['datafold'])) {
     services.push({
       name: 'Datafold',
@@ -547,7 +547,7 @@ export function buildSessionServicesSnapshot(
       scopes: [],
       credentialPaths: [],
       useFor:
-        'Official Datafold MCP at https://app.datafold.com/mcp/ via local stdio bridge. Auth pre-injected as `Authorization: Key ...`. Use for listing Datafold data sources, running queries against configured data sources, and managing Data Diff workflows. Tools appear under `mcp__datafold__*` after a fresh container wake.',
+        'Official Datafold Streamable HTTP MCP at https://app.datafold.com/mcp/. Auth pre-injected as `Authorization: Key ...`. Use for listing Datafold data sources, running queries against configured data sources, and managing Data Diff workflows. Tools appear under `mcp__datafold__*` after a fresh container wake.',
     });
   }
 

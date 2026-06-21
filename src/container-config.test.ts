@@ -222,3 +222,52 @@ describe('readContainerConfig — memory block', () => {
     expect((result as unknown as Record<string, unknown>).mnemon).toBeUndefined();
   });
 });
+
+describe('MCP server transport validation', () => {
+  it('preserves stdio and Streamable HTTP MCP server configs', () => {
+    writeGroupConfig('test-mcp-transports', {
+      mcpServers: {
+        local: { command: 'bun', args: ['run', '/app/mcp.ts'], env: { FOO: 'bar' } },
+        exa: {
+          type: 'http',
+          url: 'https://mcp.exa.ai/mcp',
+          headers: { Authorization: 'Bearer placeholder' },
+        },
+      },
+      packages: { apt: [], npm: [] },
+      additionalMounts: [],
+      skills: 'all',
+    });
+
+    const result = readContainerConfig('test-mcp-transports');
+
+    expect(result.mcpServers.local).toEqual({ command: 'bun', args: ['run', '/app/mcp.ts'], env: { FOO: 'bar' } });
+    expect(result.mcpServers.exa).toEqual({
+      type: 'http',
+      url: 'https://mcp.exa.ai/mcp',
+      headers: { Authorization: 'Bearer placeholder' },
+    });
+  });
+
+  it('readContainerConfig rejects deprecated SSE MCP servers', () => {
+    writeGroupConfig('test-mcp-sse-read', {
+      mcpServers: { legacy: { type: 'sse', url: 'https://example.test/sse' } },
+      packages: { apt: [], npm: [] },
+      additionalMounts: [],
+      skills: 'all',
+    });
+
+    expect(() => readContainerConfig('test-mcp-sse-read')).toThrow(/deprecated SSE transport/);
+  });
+
+  it('writeContainerConfig rejects deprecated SSE MCP servers', () => {
+    expect(() =>
+      writeContainerConfig('test-mcp-sse-write', {
+        mcpServers: { legacy: { type: 'sse', url: 'https://example.test/sse' } },
+        packages: { apt: [], npm: [] },
+        additionalMounts: [],
+        skills: 'all',
+      }),
+    ).toThrow(/deprecated SSE transport/);
+  });
+});

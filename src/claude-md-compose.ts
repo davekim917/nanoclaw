@@ -18,7 +18,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { GROUPS_DIR } from './config.js';
-import type { McpServerConfig } from './container-config.js';
+import { validateMcpServers, type McpServerConfig } from './container-config.js';
 import { getContainerConfig } from './db/container-configs.js';
 import { buildSessionServicesSnapshot, renderSessionCapabilities } from './capabilities.js';
 import { flattenClaudeMd } from './agents-md-flatten.js';
@@ -60,7 +60,7 @@ export function composeGroupClaudeMd(group: AgentGroup): void {
   // Desired fragment set.
   const configRow = getContainerConfig(group.id);
   const mcpServers: Record<string, McpServerConfig> = configRow
-    ? (JSON.parse(configRow.mcp_servers) as Record<string, McpServerConfig>)
+    ? validateMcpServers(JSON.parse(configRow.mcp_servers) as Record<string, McpServerConfig>)
     : {};
   const desired = new Map<string, { type: 'symlink' | 'inline'; content: string }>();
 

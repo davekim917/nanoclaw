@@ -196,7 +196,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     }
 
     if (messages.length === 0) {
-      await sleep(POLL_INTERVAL_MS);
+      await sleep(POLL_INTERVAL_MS, config.signal);
       continue;
     }
 
@@ -209,7 +209,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // the "store as context, don't engage" contract. Host-side countDueMessages
     // gates the same way for wake-from-cold (see src/db/session-db.ts).
     if (!messages.some((m) => m.trigger === 1)) {
-      await sleep(POLL_INTERVAL_MS);
+      await sleep(POLL_INTERVAL_MS, config.signal);
       continue;
     }
 
@@ -333,6 +333,17 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // can stamp it on outbound rows — needed for a2a return-path routing.
     setCurrentInReplyTo(routing.inReplyTo);
     setCurrentBatchAnchors(keep);
+    let abortActiveQuery: (() => void) | undefined;
+    if (config.signal) {
+      abortActiveQuery = () => {
+        query.abort();
+      };
+      if (config.signal.aborted) {
+        query.abort();
+      } else {
+        config.signal.addEventListener('abort', abortActiveQuery, { once: true });
+      }
+    }
     try {
       const result = await processQuery(
         query,
@@ -521,6 +532,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         });
       }
     } finally {
+      if (abortActiveQuery) config.signal?.removeEventListener('abort', abortActiveQuery);
       // Always clear the per-batch in_reply_to so MCP tools don't stamp
       // stale routing on the next turn (a2a return-path safety).
       clearCurrentInReplyTo();
@@ -1329,8 +1341,18 @@ function resolveDestinationThread(channelType: string, platformId: string): { th
   return null;
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const finish = () => {
+      if (timeout !== undefined) clearTimeout(timeout);
+      signal?.removeEventListener("abort", finish);
+      resolve();
+    };
+    timeout = setTimeout(finish, ms);
+    signal?.addEventListener("abort", finish, { once: true });
+  });
 }
 
 // Mirror of FlagIntent in src/flag-parser.ts. Can't share a module across

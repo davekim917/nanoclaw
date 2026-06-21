@@ -73,14 +73,11 @@ describe('mcpServersToOpenCodeConfig', () => {
     });
   });
 
-  it('maps sse MCP entries to remote', () => {
-    const mcp = mcpServersToOpenCodeConfig({
-      stream: { type: 'sse', url: 'https://example.com/sse' },
-    });
-    expect(mcp.stream).toEqual({
-      type: 'remote',
-      url: 'https://example.com/sse',
-      enabled: true,
-    });
+  it('rejects deprecated SSE MCP entries', () => {
+    expect(() =>
+      mcpServersToOpenCodeConfig({
+        stream: { type: 'sse', url: 'https://example.com/sse' },
+      }),
+    ).toThrow(/deprecated SSE transport/);
   });
 });

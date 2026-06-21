@@ -583,43 +583,44 @@ export class CodexProvider implements AgentProvider {
   private nextFallback = 0;
 
   constructor(options: ProviderOptions = {}) {
-    // Codex only supports stdio MCP servers. Native stdio entries pass through;
-    // hosted HTTP MCPs are exposed through the local stdio bridge. SSE entries
-    // stay filtered because remote-mcp-bridge speaks Streamable HTTP, not SSE.
-    //
-    // Every MCP env block is augmented with the container's outbound-HTTP
-    // env: HTTPS_PROXY / HTTP_PROXY / NO_PROXY (and lowercase variants),
-    // NODE_USE_ENV_PROXY, NODE_EXTRA_CA_CERTS, and the various CA-bundle
-    // pointers (SSL_CERT_FILE, CURL_CA_BUNDLE, REQUESTS_CA_BUNDLE, etc.).
-    // These come from container-runner's docker run args and are present
-    // in `process.env` here. Codex's MCP launcher writes each entry's env
-    // block to `~/.codex/config.toml` under `[mcp_servers.X.env]` and
-    // passes ONLY that block to the spawned subprocess — host env doesn't
-    // propagate to MCP subprocesses through the app-server boundary the
-    // way it does for stdio MCPs Claude's SDK spawns directly. Without
-    // this propagation, the bridge logs `HTTPS_PROXY not set — remote MCP
-    // calls may go out unauthenticated` (remote-mcp-bridge.ts:123) and
-    // OneCLI's credential-substitution proxy never sees the call.
-    const stdioOnly: Record<string, CodexMcpServer> = {};
+    // Native-first MCP wiring:
+    // - stdio stays stdio, with proxy/CA env injected for child MCP processes.
+    // - Streamable HTTP stays native Codex HTTP (url in config.toml).
+    // - the old stdio bridge is only an explicit compatibility fallback.
+    // - legacy SSE is rejected at config parse time and defensively here.
+    const mcpServers: Record<string, CodexMcpServer> = {};
+    const useHttpBridgeFallback = process.env.NANOCLAW_CODEX_MCP_HTTP_BRIDGE_FALLBACK === '1';
     for (const [name, cfg] of Object.entries(options.mcpServers ?? {})) {
       if (cfg && (cfg.type === undefined || cfg.type === 'stdio') && 'command' in cfg) {
-        stdioOnly[name] = {
+        mcpServers[name] = {
+          type: 'stdio',
           command: cfg.command,
           args: cfg.args,
           env: augmentWithProxyEnv(cfg.env ?? {}),
         };
       } else if (cfg?.type === 'http') {
-        const baseEnv: Record<string, string> = { REMOTE_MCP_NAME: name };
-        const authorization = cfg.headers?.Authorization ?? cfg.headers?.authorization;
-        if (authorization) baseEnv.REMOTE_MCP_AUTHORIZATION = authorization;
-        stdioOnly[name] = {
-          command: 'bun',
-          args: ['/app/src/remote-mcp-bridge.ts', cfg.url],
-          env: augmentWithProxyEnv(baseEnv),
-        };
+        if (useHttpBridgeFallback) {
+          const baseEnv: Record<string, string> = { REMOTE_MCP_NAME: name };
+          const authorization = cfg.headers?.Authorization ?? cfg.headers?.authorization;
+          if (authorization) baseEnv.REMOTE_MCP_AUTHORIZATION = authorization;
+          mcpServers[name] = {
+            type: 'stdio',
+            command: 'bun',
+            args: ['/app/src/remote-mcp-bridge.ts', cfg.url],
+            env: augmentWithProxyEnv(baseEnv),
+          };
+        } else {
+          mcpServers[name] = {
+            type: 'http',
+            url: cfg.url,
+            ...(cfg.headers ? { headers: cfg.headers } : {}),
+          };
+        }
+      } else if (cfg?.type === 'sse') {
+        throw new Error(`MCP server "${name}" uses deprecated SSE transport. Use type: "http" instead.`);
       }
     }
-    this.mcpServers = stdioOnly;
+    this.mcpServers = mcpServers;
 
     // Defensive re-parse (R8): catches hand-edited container.json or self-mod
     // mutations on startup before they reach codex.
