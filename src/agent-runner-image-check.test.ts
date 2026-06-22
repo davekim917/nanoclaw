@@ -63,3 +63,22 @@ describe('checkAgentRunnerDepsDrift', () => {
     }
   });
 });
+
+describe('agent runner image global CLI PATH', () => {
+  it('keeps pnpm-installed CLIs visible to login shells and non-pnpm PATHs', async () => {
+    const dockerfile = await readFile(path.join(REPO_ROOT, 'container/Dockerfile'), 'utf-8');
+    const shimBlockIndex = dockerfile.indexOf('/etc/profile.d/nanoclaw-pnpm.sh');
+    expect(shimBlockIndex).toBeGreaterThan(0);
+
+    const globalInstallIndexes = [...dockerfile.matchAll(/pnpm install -g/g)].map((m) => m.index ?? -1);
+    expect(globalInstallIndexes.length).toBeGreaterThan(0);
+    expect(globalInstallIndexes.every((i) => i > 0 && i < shimBlockIndex)).toBe(true);
+
+    expect(dockerfile).toContain('ENV PNPM_HOME="/pnpm"');
+    expect(dockerfile).toContain('ENV PATH="$PNPM_HOME:$PATH"');
+    expect(dockerfile).toContain('"export PNPM_HOME=/pnpm"');
+    expect(dockerfile).toContain('export PATH=\\"/pnpm:\\$PATH\\"');
+    expect(dockerfile).toContain('find /pnpm -maxdepth 1 -type f -perm /111');
+    expect(dockerfile).toContain('/usr/local/bin/\\$(basename \\"\\$1\\")');
+  });
+});

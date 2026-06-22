@@ -359,6 +359,16 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
         "@openai/codex@${CODEX_VERSION}" \
         "opencode-ai@${OPENCODE_VERSION}"
 
+# Login shells reset PATH on Debian and can drop Docker ENV-provided /pnpm,
+# which makes globally installed CLIs invisible to Codex/OpenCode shell tools.
+# Expose pnpm shims through /usr/local/bin as a belt-and-suspenders fallback.
+RUN printf "%s\n" \
+        "export PNPM_HOME=/pnpm" \
+        "case \":\$PATH:\" in *\":/pnpm:\"*) ;; *) export PATH=\"/pnpm:\$PATH\" ;; esac" \
+        > /etc/profile.d/nanoclaw-pnpm.sh && \
+    chmod 0644 /etc/profile.d/nanoclaw-pnpm.sh && \
+    find /pnpm -maxdepth 1 -type f -perm /111 -exec sh -c "ln -sf \"\$1\" \"/usr/local/bin/\$(basename \"\$1\")\"" _ {} \;
+
 # Puppeteer config used by mmdc — points at the system Chromium and passes
 # --no-sandbox, without which mmdc launches and silently exits 0 producing no
 # output on Debian containers that lack unprivileged user namespaces.
