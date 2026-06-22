@@ -13,6 +13,7 @@ import path from 'path';
 
 import { flattenClaudeMd } from './agents-md-flatten.js';
 import { capCodexProjectDoc } from './codex-project-doc-cap.js';
+import { rewriteCodexRtkGuidance } from './codex-rtk-guidance.js';
 import { formatCodexAgentToml, isManagedToml, parseClaudeAgentMd } from './claude-agent-md.js';
 import { discoverClaudeSubagents, type DiscoveredSubagent } from './claude-subagent-discovery.js';
 import { discoverPortableSkills, syncSkillSymlinks } from './plugin-skill-discovery.js';
@@ -53,7 +54,7 @@ export function syncCodexAgentsMd(): AgentsMdSyncResult {
     throw new Error(`Source not found: ${claudeMd}`);
   }
 
-  const flattened = flattenClaudeMd(claudeMd);
+  const flattened = rewriteCodexRtkGuidance(flattenClaudeMd(claudeMd));
   const output = capCodexProjectDoc(CODEX_PEER_HEADER + flattened, '~/.codex/AGENTS.md');
 
   const target = path.join(os.homedir(), '.codex', 'AGENTS.md');

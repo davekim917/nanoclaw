@@ -3,7 +3,8 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { syncCodexLocalMarketplacePluginCache } from './codex-sync.js';
+import { rewriteCodexRtkGuidance } from './codex-rtk-guidance.js';
+import { syncCodexAgentsMd, syncCodexLocalMarketplacePluginCache } from './codex-sync.js';
 
 let tmpDir: string;
 
@@ -171,5 +172,61 @@ describe('syncCodexLocalMarketplacePluginCache', () => {
       'SKILL.md',
     );
     expect(fs.readFileSync(cachedSkill, 'utf-8')).toContain('git body');
+  });
+});
+
+describe('Codex RTK guidance', () => {
+  it('rewrites Claude-only RTK hook guidance for Codex', () => {
+    const input = [
+      '# RTK - Rust Token Killer',
+      '',
+      '## Meta Commands (always use rtk directly)',
+      '',
+      '```bash',
+      'rtk gain',
+      '```',
+      '',
+      '## Hook-Based Usage',
+      '',
+      'All other commands are automatically rewritten by the Claude Code hook.',
+      'Example: `git status` → `rtk git status` (transparent, 0 tokens overhead)',
+      '',
+      'Refer to CLAUDE.md for full command reference.',
+      '',
+      '## Next Section',
+    ].join('\n');
+
+    const output = rewriteCodexRtkGuidance(input);
+
+    expect(output).toContain('## Codex Usage');
+    expect(output).toContain('Use `rtk` explicitly');
+    expect(output).toContain('rtk git status');
+    expect(output).not.toContain('automatically rewritten by the Claude Code hook');
+  });
+
+  it('applies Codex RTK guidance during AGENTS.md sync', () => {
+    const claudeDir = path.join(tmpDir, '.claude');
+    fs.mkdirSync(claudeDir, { recursive: true });
+    fs.writeFileSync(path.join(claudeDir, 'CLAUDE.md'), '@RTK.md\n');
+    fs.writeFileSync(
+      path.join(claudeDir, 'RTK.md'),
+      [
+        '# RTK - Rust Token Killer',
+        '',
+        '## Hook-Based Usage',
+        '',
+        'All other commands are automatically rewritten by the Claude Code hook.',
+        'Example: `git status` → `rtk git status` (transparent, 0 tokens overhead)',
+        '',
+        'Refer to CLAUDE.md for full command reference.',
+      ].join('\n'),
+    );
+
+    syncCodexAgentsMd();
+
+    const agents = fs.readFileSync(path.join(tmpDir, '.codex', 'AGENTS.md'), 'utf-8');
+    expect(agents).toContain('## Codex Usage');
+    expect(agents).toContain('Use `rtk` explicitly');
+    expect(agents).not.toContain('automatically rewritten by the Claude Code hook');
   });
 });
