@@ -1488,9 +1488,11 @@ export function buildMounts(
   //   tools = [...]      → filter + stage per-tool. E.g. `snowflake:sunday`
   //                        stages only the [connections.sunday] section of
   //                        connections.toml and its referenced private
-  //                        keys; `aws:work` stages [default] + [work] from
-  //                        ~/.aws/credentials; `dbt:snowflake-db` stages a
-  //                        profiles.yml containing only that profile.
+  //                        keys; `aws:work` stages only [work] from
+  //                        ~/.aws/credentials (scoped = exactly the named
+  //                        profiles, no implicit [default]); bare unscoped
+  //                        `aws` stages all profiles; `dbt:snowflake-db`
+  //                        stages a profiles.yml containing only that profile.
   //
   // Rationale for the gate (see docs/V2_BACKLOG.md → scoped credentials):
   //   OneCLI's proxy covers API-level secrets (keys flowing through
@@ -1748,17 +1750,27 @@ export function buildMounts(
   }
 
   // ---- AWS (~/.aws/{credentials,config}) ----------------------------------
+  // Scoped `aws:<profile>` stages EXACTLY the named profiles — no implicit
+  // `default`. A scoped group must not inherit whatever account `default`
+  // points at: that is a cross-tenant leak (e.g. an `aws:ihm-mr` Madison Reed
+  // group silently picking up a personal/Illysium `default`). A group that
+  // genuinely needs the default profile requests it explicitly via
+  // `aws:default[:<other>]`.
+  //
+  // Unscoped bare `aws` still stages every profile — intentional broad access
+  // (e.g. a personal cross-domain agent). Consequence: adding a new profile to
+  // the host `~/.aws` only fans out to groups that opted into unscoped `aws`,
+  // never to scoped groups.
   if (isToolEnabled(tools, 'aws')) {
     const awsDir = path.join(home, '.aws');
     if (fs.existsSync(awsDir)) {
       const { scopes: allowedProfiles, isScoped: filterProfiles } = extractToolScopes(tools, 'aws');
       const dest = stageDir('aws');
-      const alwaysInclude = new Set(['default']);
 
       const origCreds = path.join(awsDir, 'credentials');
       if (fs.existsSync(origCreds)) {
         let content = fs.readFileSync(origCreds, 'utf-8');
-        if (filterProfiles) content = filterConfigSections(content, allowedProfiles, { alwaysInclude });
+        if (filterProfiles) content = filterConfigSections(content, allowedProfiles);
         fs.writeFileSync(path.join(dest, 'credentials'), content, { mode: 0o600 });
       }
       const origConfig = path.join(awsDir, 'config');
@@ -1769,7 +1781,6 @@ export function buildMounts(
           // to compare raw name against the allowlist.
           content = filterConfigSections(content, allowedProfiles, {
             headerTransform: (h) => h.replace(/^profile\s+/, ''),
-            alwaysInclude,
           });
         }
         fs.writeFileSync(path.join(dest, 'config'), content, { mode: 0o600 });
