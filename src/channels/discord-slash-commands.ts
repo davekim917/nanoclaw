@@ -259,7 +259,7 @@ const UPDATE_CONTAINER_PROMPT = [
   'For each PINNED package, check the latest available version:',
   '- npm: `npm view <pkg> version`',
   '- pip: `curl -s https://pypi.org/pypi/<pkg>/json | jq -r .info.version`',
-  '- GitHub release ARGs: `gh release view --repo <owner>/<repo> --json tagName -q .tagName` for RENDER_VERSION → render-oss/cli, RAILWAY_VERSION → railwayapp/cli, SUPABASE_VERSION → supabase/cli, MNEMON_VERSION → mnemon-dev/mnemon.',
+  '- GitHub release ARGs: `gh release view --repo <owner>/<repo> --json tagName -q .tagName` for RENDER_VERSION → render-oss/cli, RAILWAY_VERSION → railwayapp/cli, SUPABASE_VERSION → supabase/cli, MNEMON_VERSION → mnemon-dev/mnemon, RTK_VERSION → rtk-ai/rtk (built from source in the rtk-builder Dockerfile stage; `gh release view` returns the latest stable and skips the dev-*-rc pre-releases).',
   '',
   'For each UNPINNED package, also check the latest version and report with status ❓ unpinned. These drift on every rebuild without attention.',
   '',
