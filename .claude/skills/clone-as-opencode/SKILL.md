@@ -19,6 +19,18 @@ Create `groups/<source>-opencode/` from `groups/<source>/`. The opencode sibling
 
 `container.json` for the new sibling gets `provider: "opencode"` and `memory.enabled: true`.
 
+**Capability parity invariant for new siblings.** An OpenCode sibling must
+inherit the source group's NanoClaw capability surface unless a provider/runtime
+architecture block is named explicitly. Step 5 preserves `mcpServers`, `tools`,
+`onecliSecrets`, mounts, skills, and other non-sibling-bound fields by
+construction. OpenCode should not get a special MCP downgrade: stdio MCPs map to
+native local MCP entries, Streamable HTTP MCPs map to native remote MCP entries,
+deprecated SSE is invalid, and `remote-mcp-bridge` is only an explicitly
+documented compatibility exception. Browser automation is part of the baseline:
+the shared agent image exposes `agent-browser` to login shells, so a newly
+spawned OpenCode sibling should have the same `agent-browser open/snapshot/click`
+workflow as Claude and Codex.
+
 **Critical architectural choice — two bot apps, not one shared bot.** Each sibling agent has its own platform bot user, installed as a separate app in the workspace/guild. This lets agents `@`-mention each other (real platform mentions, real autocomplete) and have those mentions fire the peer via standard `engage_mode='mention'`.
 
 ## Prerequisites
@@ -188,6 +200,14 @@ cd -
 ### 5. Write container.json
 
 Construct the sibling's container.json as **the source's, minus every sibling-bound field, plus this sibling's own identity + provider + memory**. Inheriting "everything except sibling-bound" (rather than a hand-picked subset like `onecliSecrets`/`tools`/`mcpServers`) is what guarantees a clean `ncl groups parity-check` *by construction* and carries over operator fields a fixed list would silently drop (e.g. `slack_user_token`). The sibling-bound set is the source of truth in `src/sibling-parity.ts` (`SIBLING_BOUND_FIELDS`) — keep this `del(...)` list in sync with it.
+
+This is also the MCP parity step. Do not rewrite `mcpServers` while cloning:
+the runtime now supports the native matrix across all three providers
+(stdio -> stdio/local, `type: "http"` -> native Streamable HTTP/remote,
+`type: "sse"` -> hard reject). If the source still contains an old
+`remote-mcp-bridge` entry, carry it only as a named architecture-block exception
+and prefer converting the source to `type: "http"` before cloning when the
+server supports Streamable HTTP.
 
 ```bash
 # Source MINUS every sibling-bound field, PLUS this sibling's identity/provider/memory.
@@ -488,6 +508,21 @@ pnpm exec tsx scripts/q.ts "$SDIR/outbound.db" "SELECT content FROM messages_out
 
 Checks A and B are deterministic and should both be ✅ before you announce the sibling. Check C is the end-to-end seal.
 
+**Check D - running sibling has the shared global CLI surface:**
+
+This catches custom `imageTag` drift and the historical `agent-browser` PATH
+miss. Run it after Check C has caused a sibling container to spawn.
+
+```bash
+CNAME=$(docker ps --filter "name=nanoclaw-v2-${SIBLING_FOLDER}-" --format '{{.Names}}' | head -1)
+test -n "$CNAME" || { echo "ERROR: no running sibling container - send the live round-trip first"; exit 1; }
+docker exec "$CNAME" bash -lc 'command -v agent-browser && agent-browser --version'
+```
+
+Expected: a path under `/pnpm` or `/usr/local/bin`, followed by an
+`agent-browser` version. Failure means the sibling is not at capability parity;
+rebuild/fix the image or remove the custom `imageTag` before shipping.
+
 > **Note on rebuilds:** an agent-runner *source* change (e.g. fixing the provider
 > config) does **not** need `./container/build.sh` — `container/agent-runner/src`
 > is bind-mounted read-only into the container, so a respawn (`ncl groups restart`
@@ -542,6 +577,21 @@ echo "=== tools list parity ==="
 diff <(jq -S '.tools // [] | sort' groups/${SF}/container.json) \
      <(jq -S '.tools // [] | sort' groups/${SR}/container.json) \
   && echo "  ✅ tools identical"
+echo
+echo "=== MCP native transport parity ==="
+SSE=$(jq -r '(.mcpServers // {}) | to_entries[] | select(.value.type == "sse") | .key' groups/${SR}/container.json)
+if [ -n "$SSE" ]; then
+  echo "  ERROR: deprecated SSE MCP(s):"
+  echo "$SSE"
+  exit 1
+fi
+BRIDGED=$(jq -r '(.mcpServers // {}) | to_entries[] | select((.value.command? == "bun") and (((.value.args // []) | index("/app/src/remote-mcp-bridge.ts")) != null)) | .key' groups/${SR}/container.json)
+if [ -n "$BRIDGED" ]; then
+  echo "  WARNING: compatibility bridge MCP(s) require an explicit architecture-block note:"
+  echo "$BRIDGED"
+else
+  echo "  ✅ no deprecated SSE or compatibility bridge MCPs"
+fi
 echo
 echo "=== messaging-group wiring (channels) ==="
 pnpm exec tsx scripts/q.ts data/v2.db "

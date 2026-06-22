@@ -7,11 +7,25 @@ description: Reference template for adding a `/clone-as-<newprovider>` sibling s
 
 > **This is a template / reference, not an installer.** Do not run the steps here against a live install — there are none. When a new agent provider lands (a fourth runtime alongside Claude / Codex / OpenCode), copy the structure of `.claude/skills/clone-as-codex/SKILL.md` or `.claude/skills/clone-as-opencode/SKILL.md` — whichever is the closer fit — and adapt it. Those two are the concrete, runnable instances of this template; this file captures only the parts that MUST generalize: the **guard-parity contract** and the **machine-checked gate** that together define when a new provider's sibling is "done."
 
-The mechanical scaffold (resolve source group → install a second bot app → add scoped env vars → create the symlink/shared-FS group dir → write `container.json` minus sibling-bound fields → insert the `agent_groups` row with `workgroup_id` → restart → wire channels → verify) is **identical** across providers and is fully documented in the two existing skills. Generalizing the scaffold itself (`/clone-agent-as-provider <source> <provider>`) is captured as future work in `clone-as-codex`; do not duplicate it here. What does NOT come for free — and what this template exists to pin down — is the guard wiring.
+The mechanical scaffold (resolve source group → install a second bot app → add scoped env vars → create the symlink/shared-FS group dir → write `container.json` minus sibling-bound fields → insert the `agent_groups` row with `workgroup_id` → restart → wire channels → verify) is **identical** across providers and is fully documented in the two existing skills. Generalizing the scaffold itself (`/clone-agent-as-provider <source> <provider>`) is captured as future work in `clone-as-codex`; do not duplicate it here. What does NOT come for free — and what this template exists to pin down — is the provider-specific parity wiring.
 
 ## The parity mandate
 
 The agent providers are **one team that must be at command-guard parity by construction** — same guards, same fail-closed behavior, enforced by a **shared guard core** plus a **machine-checked conformance/dispatch test suite**. A provider's runtime differs (how it fires hooks, how it represents a tool call, how it aborts one); its *policy* must not. The shared cores own the policy; each provider ships only a thin adapter over them.
+
+Command guards are only one part of the parity mandate. A new provider sibling
+must also preserve NanoClaw capability parity unless there is a named
+architecture block:
+
+- `container.json` inheritance preserves `mcpServers`, `tools`,
+  `onecliSecrets`, mounts, skills, and other non-sibling-bound fields.
+- MCP transport mapping is native-first: stdio remains local/stdio, Streamable
+  HTTP remains native remote/http, and deprecated SSE is rejected instead of
+  silently bridged. A `remote-mcp-bridge` entry is an exception that needs an
+  explicit architecture-block note.
+- The shared agent image's global CLI surface is part of the provider baseline.
+  New providers should expose tools such as `agent-browser` from login shells or
+  document why the runtime cannot use them without a heavy workaround.
 
 The shared cores today (the source of truth every adapter imports):
 
@@ -37,6 +51,19 @@ A new provider's sibling is **not** shipped when the bot replies. It is shipped 
 
 5. **Add the new adapter's dispatch-coverage test, co-located with the adapter.** Mirror the existing instances: `opencode-guard.test.ts` next to `opencode-guard.ts`; `runner.test.ts` next to the codex container `runner.ts`; `block-destructive.test.ts` for the Claude adapter. The new provider's test asserts the adapter blocks/denies the canonical block + gate set, allows the safe set, fails closed where the contract requires it (absent/malformed core, no-approval-surface), and passes non-gated tools through. Without this co-located test there is no dispatch-coverage gate, so by item 4 the sibling is not done.
 
+6. **Preserve native MCP transport parity.** The provider adapter must accept the
+   same NanoClaw MCP server definitions as the other providers: stdio/local,
+   native Streamable HTTP/remote, and no SSE. If the provider lacks a native
+   Streamable HTTP surface, decide explicitly whether that is an architecture
+   block or whether the provider is not ready. Do not hide the gap behind an
+   undocumented bridge.
+
+7. **Expose the shared global CLI surface or document the runtime block.** A
+   cloned sibling is not at capability parity if its shell cannot resolve
+   baseline image CLIs such as `agent-browser`. The provider-specific skill must
+   include a spawned-container smoke check for the CLI surface, especially when
+   custom images are allowed.
+
 ## Runtime caveats are documented, not waved away
 
 Some runtimes have hook surfaces that provably do not fire — e.g. Codex's `codex exec` sub-delegation fires no PreToolUse hooks at all, so the guard set is instruction-only on that path (no hook-parity claim is made there; the rule is stated in `container/CLAUDE.md` and followed by convention). When a new provider has an un-hookable path, **document it explicitly** in that provider's skill as a named caveat — what is hook-enforced, what is convention-only, and why it's a property of the runtime rather than a wiring bug. A documented, understood gap is acceptable; a silent one is not. Do not file a runtime's un-hookable path as "drift."
@@ -50,5 +77,7 @@ Some runtimes have hook surfaces that provably do not fire — e.g. Codex's `cod
 - [ ] `conformance.test.ts` green.
 - [ ] New per-adapter dispatch-coverage test added, co-located, green.
 - [ ] Any un-hookable runtime path documented as a named caveat in the provider's skill.
+- [ ] Native MCP matrix documented and tested: stdio/local, Streamable HTTP/remote, no SSE.
+- [ ] Spawned sibling container smoke-checks the shared global CLI surface (`agent-browser` at minimum).
 
 Only when every box is checked is the new provider's sibling "done."
