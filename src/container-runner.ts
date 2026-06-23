@@ -849,6 +849,48 @@ function mergeNoProxy(args: string[], host: string): void {
 }
 
 /**
+ * Host dir holding per-group GCP service-account key files. Drop a key at
+ * `~/.config/nanoclaw-gcp/<credentialFolder>.json` (0600) to grant a group
+ * BigQuery / gcloud / gsutil access. Mirrors the gws accounts-dir convention.
+ */
+const GCP_SA_KEYS_DIR = path.join(os.homedir(), '.config', 'nanoclaw-gcp');
+/**
+ * Container path for the mounted key — a DEDICATED dir, deliberately NOT inside
+ * `~/.config/gcloud`. Bind-mounting a file under the gcloud config dir makes
+ * Docker create that dir root-owned, so gcloud/bq can no longer write their own
+ * state ("Could not setup log file"). `bq`/`gcloud` CLIs authenticate via the
+ * agent-runner's `gcloud auth activate-service-account` at startup; client libs
+ * + `gcloud auth application-default` read it through GOOGLE_APPLICATION_CREDENTIALS.
+ */
+const GCP_KEY_CONTAINER_PATH = '/home/node/.gcp/service-account.json';
+
+/**
+ * Resolve a per-group GCP service-account key file on the host.
+ *
+ * Why a file mount and not the OneCLI vault: vault secrets are HTTP-header
+ * injection on a host pattern (`onecli@1.4.x` types: anthropic | generic). A
+ * service-account key is a private key that gcloud uses to MINT short-lived
+ * tokens locally — there is no static header to inject and the vault can't
+ * materialize it as a file. This follows the gws/wix code-mount pattern,
+ * which deliberately bypasses the agent-facing `additionalMounts` path (that
+ * blocks credential-shaped paths and sandboxes targets away from `~/.config`).
+ *
+ * Keyed on `credentialFolder` so sibling groups that inherit a parent's creds
+ * via `credentialFolder` share the one key (e.g. madison-reed-codex/-opencode
+ * resolve to madison-reed's key). Returns the absolute host path, or null when
+ * no key is configured — the common case, leaving such groups untouched.
+ */
+function resolveGcpServiceAccountKey(credentialFolder: string): string | null {
+  const keyPath = path.join(GCP_SA_KEYS_DIR, `${credentialFolder}.json`);
+  try {
+    // statSync follows symlinks, so a sibling symlink → real key resolves true.
+    return fs.existsSync(keyPath) && fs.statSync(keyPath).isFile() ? keyPath : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Phase 5.3: write a capabilities snapshot into the session dir at
  * every container spawn. Container's get_capabilities MCP tool reads
  * this JSON directly — no round-trip, always fresh per spawn.
@@ -1691,6 +1733,19 @@ export function buildMounts(
     }
   }
 
+  // ---- GCP service-account key (BigQuery / gcloud / gsutil) ---------------
+  // Mount a per-group SA key into a dedicated container path. The agent-runner
+  // activates it for the `gcloud`/`bq` CLIs at startup; client libs read it via
+  // GOOGLE_APPLICATION_CREDENTIALS (wired in buildContainerArgs, along with the
+  // googleapis.com proxy bypass). Gated on the key file existing (see
+  // resolveGcpServiceAccountKey) — groups without one are untouched.
+  {
+    const gcpKey = resolveGcpServiceAccountKey(containerConfig.credentialFolder ?? agentGroup.folder);
+    if (gcpKey) {
+      mounts.push({ hostPath: gcpKey, containerPath: GCP_KEY_CONTAINER_PATH, readonly: true });
+    }
+  }
+
   // ---- Snowflake (connections.toml + keys) --------------------------------
   if (isToolEnabled(tools, 'snowflake')) {
     const snowflakeDir = path.join(home, '.snowflake');
@@ -2257,6 +2312,11 @@ async function buildContainerArgs(
   // remain individually addressable.
   const credentialFolder = containerConfig.credentialFolder ?? agentGroup.folder;
 
+  // GCP service-account key (BigQuery / gcloud / gsutil). Resolved once here;
+  // drives the ADC env vars below and the googleapis.com proxy bypass further
+  // down. null (no key file) for every group that hasn't opted in.
+  const gcpKey = resolveGcpServiceAccountKey(credentialFolder);
+
   // Per-group Anthropic credentials. Default behaviour reads the global
   // `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_API_KEY` (and `_N` rotation
   // siblings); the per-group form `<BASE>_<FOLDER_UPPER>` overrides the
@@ -2342,6 +2402,29 @@ async function buildContainerArgs(
     const tail = k.slice(matchedPrefix.length);
     if (tail !== folderTok && !tail.startsWith(`${folderTok}_`)) continue;
     args.push('-e', `${k}=${v}`);
+  }
+
+  // GCP credentials: point ADC / client libs at the mounted key and default the
+  // project from the key's own `project_id`, so client libs and `bq`/`gcloud`
+  // (once the agent-runner activates the service account at startup) need no
+  // flags. Set regardless of gateway state since ADC works without the proxy;
+  // the googleapis.com bypass is added later in the gateway block. Lockstep
+  // with the mount via `gcpKey`.
+  if (gcpKey) {
+    args.push('-e', `GOOGLE_APPLICATION_CREDENTIALS=${GCP_KEY_CONTAINER_PATH}`);
+    try {
+      const projectId = (JSON.parse(fs.readFileSync(gcpKey, 'utf-8')) as { project_id?: string })
+        .project_id;
+      if (projectId) {
+        args.push('-e', `CLOUDSDK_CORE_PROJECT=${projectId}`);
+        args.push('-e', `GOOGLE_CLOUD_PROJECT=${projectId}`);
+      }
+    } catch (err) {
+      log.warn('GCP service-account key unreadable for project default — agent must pass --project', {
+        folder: credentialFolder,
+        err: err instanceof Error ? err.message : String(err),
+      });
+    }
   }
 
   // Per-group opt-in flags from container.json.
@@ -2505,6 +2588,16 @@ async function buildContainerArgs(
     if (ghToken) {
       mergeNoProxy(args, 'github.com');
     }
+    // GCP bypass — the SA key mints tokens at oauth2.googleapis.com and calls
+    // *.googleapis.com (BigQuery, Storage, …) directly. The key is self-
+    // authenticating, so OneCLI injection adds nothing and its MITM CA breaks
+    // gcloud/google-auth (they trust their own bundled roots, not the system
+    // store where OneCLI's CA lives). Suffix match: a bare `googleapis.com`
+    // entry covers oauth2/sts/bigquery/storage/cloudresourcemanager. Gated on
+    // the mounted key so only GCP-enabled groups bypass.
+    if (gcpKey) {
+      mergeNoProxy(args, 'googleapis.com');
+    }
     // Codex / ChatGPT bypass — codex streams via WebSocket to
     // wss://chatgpt.com/backend-api/codex/responses. OneCLI's MITM doesn't
     // speak WS Upgrade and returns 405 Method Not Allowed, so codex retries
@@ -2521,16 +2614,42 @@ async function buildContainerArgs(
     mergeNoProxy(args, 'pypi.org');
     mergeNoProxy(args, 'pythonhosted.org');
 
-    // Wix CLI OAuth bypass — `wix login`/`whoami`/dev/publish talk to *.wix.com
-    // (manage/editor/users.wix.com) with the CLI's own OAuth token from the
-    // mounted ~/.wix. OneCLI's MITM on those hosts breaks the CLI ("not
-    // authenticated"), same class as the chatgpt.com case above. Bypass only
-    // `wix.com` (matches *.wix.com) — the Wix REST API on `www.wixapis.com` is
-    // a DIFFERENT domain, so it stays on the gateway and keeps getting the
-    // injected API key. Gated on the ~/.wix auth mount so only Wix-enabled
+    // Wix CLI OAuth bypass — `wix login`/`whoami`/dev/publish talk to several
+    // *.wix.com subdomains with the CLI's own OAuth token from the mounted
+    // ~/.wix. OneCLI's TLS MITM on those hosts breaks the CLI (Node CLIs trust
+    // their bundled CA list, not the system store where OneCLI's CA lives), so
+    // they must skip the proxy.
+    //
+    // We bypass each CLI subdomain INDIVIDUALLY rather than the blanket
+    // `wix.com`. NO_PROXY is a suffix match, so a bare `wix.com` entry would
+    // also bypass `mcp.wix.com` — but we deliberately keep mcp.wix.com ON the
+    // gateway so OneCLI injects the Wix API key (`Authorization` header, vault
+    // secret bound to mcp.wix.com) for the hosted Wix MCP's headless API-key
+    // auth. The Wix REST API on `www.wixapis.com` is a different domain and also
+    // stays on the gateway. Gated on the ~/.wix auth mount so only Wix-enabled
     // groups bypass.
+    //
+    // Host list sourced from @wix/cli's own URL constants. Bare `wix.com` is
+    // intentionally omitted — it appears only as browser-facing editor /
+    // app-market URLs, not CLI HTTP-API calls, and including it would
+    // re-capture mcp.wix.com. If a future CLI op breaks on an unlisted host,
+    // add the specific subdomain here (never re-add bare `wix.com`).
     if (containerConfig.wixHostAuth === true) {
-      mergeNoProxy(args, 'wix.com');
+      const WIX_CLI_HOSTS = [
+        'manage.wix.com',
+        'users.wix.com',
+        'editor.wix.com',
+        'dev.wix.com',
+        'bo.wix.com',
+        'code.wix.com',
+        'frog.wix.com',
+        'learn-code.wix.com',
+        'publicmedia.wix.com',
+        'support.wix.com',
+        'vibe.wix.com',
+        'www.wix.com',
+      ];
+      for (const host of WIX_CLI_HOSTS) mergeNoProxy(args, host);
     }
 
     // OAuth bypass: when a host OAuth token is forwarded, tell the
