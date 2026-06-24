@@ -14,6 +14,7 @@ import {
   findRolloutFile,
   materializeRawImageGeneration,
   mirrorCodexAgentsToHome,
+  refreshCodexAuthFromHost,
   resolveClaudeImports,
   resolveQueryModel,
   resolveQueryEffort,
@@ -734,6 +735,29 @@ describe('codex OAuth fallback — rotation primitives', () => {
     });
   });
 
+  describe('refreshCodexAuthFromHost', () => {
+    it('copies changed host auth into the active CODEX_HOME', () => {
+      const active = makeHome();
+      const host = makeHome();
+      fs.writeFileSync(path.join(active, 'auth.json'), '{"token":"old"}');
+      fs.writeFileSync(path.join(host, 'auth.json'), '{"token":"new"}');
+
+      expect(refreshCodexAuthFromHost(active, host)).toBe(true);
+      expect(fs.readFileSync(path.join(active, 'auth.json'), 'utf-8')).toBe('{"token":"new"}');
+    });
+
+    it('returns false when host auth is identical or absent', () => {
+      const active = makeHome();
+      const host = makeHome();
+      fs.writeFileSync(path.join(active, 'auth.json'), '{"token":"same"}');
+      fs.writeFileSync(path.join(host, 'auth.json'), '{"token":"same"}');
+
+      expect(refreshCodexAuthFromHost(active, host)).toBe(false);
+      expect(refreshCodexAuthFromHost(active, undefined)).toBe(false);
+      expect(refreshCodexAuthFromHost(active, makeHome())).toBe(false);
+    });
+  });
+
   describe('CodexProvider fallback cursor', () => {
     function withEnv<T>(env: Record<string, string | undefined>, fn: () => T): T {
       const prev: Record<string, string | undefined> = {};
@@ -940,6 +964,29 @@ describe('codex OAuth fallback — rotation primitives', () => {
       expect(repairIdx).toBeGreaterThan(-1);
       expect(resumeIdx).toBeGreaterThan(-1);
       expect(repairIdx).toBeLessThan(resumeIdx);
+    });
+  });
+
+  describe('gen() primary auth refresh (source-anchored)', () => {
+    it('refreshes copied primary auth before fallback rotation or surfacing a system_error', () => {
+      const src = fs.readFileSync(new URL('./codex.ts', import.meta.url), 'utf8');
+      const codeOnly = src
+        .replace(/\/\*[\s\S]*?\*\//g, '')
+        .split('\n')
+        .map((l) => {
+          const i = l.indexOf('//');
+          return i >= 0 ? l.slice(0, i) : l;
+        })
+        .join('\n');
+
+      const refreshIdx = codeOnly.indexOf('refreshCodexAuthFromHost(currentCodexHome, primaryHostCodexHome)');
+      const fallbackIdx = codeOnly.indexOf('if (eligible && self.nextFallback < self.fallbackHomes.length)');
+      const surfaceIdx = codeOnly.indexOf('yield ev;');
+      expect(refreshIdx).toBeGreaterThan(-1);
+      expect(fallbackIdx).toBeGreaterThan(refreshIdx);
+      expect(surfaceIdx).toBeGreaterThan(fallbackIdx);
+      expect(codeOnly).toContain('process.env.CODEX_PRIMARY_HOST_HOME');
+      expect(codeOnly).toContain('primaryAuthRefreshAttempted = true');
     });
   });
 });

@@ -392,6 +392,26 @@ describe('resolveCodexAuthFallbacks', () => {
   });
 });
 
+describe('codex provider primary auth refresh mount', () => {
+  it('mounts the selected host Codex home separately when provider=codex owns /home/node/.codex', () => {
+    const src = fs.readFileSync(new URL('./container-runner.ts', import.meta.url), 'utf8');
+
+    const hostPrimaryConstantIdx = src.indexOf("'/home/node/.codex-host-primary'");
+    const providerMountIdx = src.indexOf('if (providerHasCodexMount');
+    const authJsonIdx = src.indexOf("'auth.json'", providerMountIdx);
+    const mountTargetIdx = src.indexOf('containerPath: CODEX_PRIMARY_HOST_HOME_CONTAINER_PATH', authJsonIdx);
+    const readOnlyIdx = src.indexOf('readonly: true', mountTargetIdx);
+    const envIdx = src.indexOf('CODEX_PRIMARY_HOST_HOME=${CODEX_PRIMARY_HOST_HOME_CONTAINER_PATH}');
+
+    expect(hostPrimaryConstantIdx).toBeGreaterThan(-1);
+    expect(providerMountIdx).toBeGreaterThan(-1);
+    expect(authJsonIdx).toBeGreaterThan(providerMountIdx);
+    expect(mountTargetIdx).toBeGreaterThan(authJsonIdx);
+    expect(readOnlyIdx).toBeGreaterThan(mountTargetIdx);
+    expect(envIdx).toBeGreaterThan(readOnlyIdx);
+  });
+});
+
 // ── Workgroup reconciler tests (C1) ──────────────────────────────────────────
 
 /** Create a minimal in-memory DB with the workgroup schema (migration 036). */

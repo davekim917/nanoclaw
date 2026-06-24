@@ -548,6 +548,28 @@ describe('poll loop — stale session recovery', () => {
 
     await loopPromise.catch(() => {});
   });
+
+  it('clears and retries a provider-yielded system_error continuation before surfacing chat error', async () => {
+    setContinuation('mock', 'poisoned-codex-thread');
+    insertMessage('m1', { sender: 'Alice', text: 'run support poller' }, { platformId: 'chan-1', channelType: 'discord' });
+
+    const provider = new YieldingSystemErrorThenSuccessProvider();
+    const controller = new AbortController();
+    const loopPromise = runPollLoopWithTimeout(provider as unknown as MockProvider, controller.signal, 2000);
+
+    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    controller.abort();
+
+    expect(provider.continuations).toEqual(['poisoned-codex-thread', undefined]);
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(JSON.parse(out[0].content).text).toBe('recovered');
+    expect(getContinuation('mock')).toBe('fresh-codex-thread');
+    expect(getPendingMessages()).toHaveLength(0);
+
+    await loopPromise.catch(() => {});
+  });
 });
 
 describe('poll loop — /clear command', () => {
@@ -633,6 +655,39 @@ class InvalidSessionProvider {
       events: (async function* () {
         yield { type: 'init' as const, continuation: 'doomed-session' };
         throw new Error('session not found');
+      })(),
+    };
+  }
+}
+
+class YieldingSystemErrorThenSuccessProvider {
+  readonly supportsNativeSlashCommands = false;
+  continuations: Array<string | undefined> = [];
+
+  isSessionInvalid(): boolean {
+    return false;
+  }
+
+  query(input: { prompt: string; cwd: string; continuation?: string }) {
+    this.continuations.push(input.continuation);
+    const attempt = this.continuations.length;
+    return {
+      push() {},
+      end() {},
+      abort() {},
+      events: (async function* () {
+        if (attempt === 1) {
+          yield { type: 'init' as const, continuation: 'doomed-codex-thread' };
+          yield {
+            type: 'error' as const,
+            message: 'codex_system_error: thread entered systemError state',
+            retryable: false,
+            classification: 'system_error',
+          };
+          return;
+        }
+        yield { type: 'init' as const, continuation: 'fresh-codex-thread' };
+        yield { type: 'result' as const, text: '<message to="discord-test">recovered</message>' };
       })(),
     };
   }

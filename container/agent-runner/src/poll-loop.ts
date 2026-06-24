@@ -70,6 +70,24 @@ function generateId(): string {
   return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+type ProviderErrorEvent = Extract<ProviderEvent, { type: 'error' }>;
+
+class ProviderEventError extends Error {
+  readonly retryable: boolean;
+  readonly classification: string | undefined;
+
+  constructor(readonly event: ProviderErrorEvent) {
+    super(event.message);
+    this.name = 'ProviderEventError';
+    this.retryable = event.retryable;
+    this.classification = event.classification;
+  }
+}
+
+function isProviderSystemError(err: unknown): boolean {
+  return err instanceof ProviderEventError && err.classification === 'system_error';
+}
+
 const FILE_EVENT_MAX_BYTES = 50 * 1024 * 1024;
 const FILE_EVENT_ALLOWED_PREFIXES = [
   '/home/node/.codex/generated_images',
@@ -520,15 +538,69 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         }
       }
 
+      // Codex can yield a terminal thread/status systemError as a ProviderEvent
+      // instead of throwing. That means it bypasses the stale-session catch path
+      // above unless we handle it here. With a stored continuation, a Codex
+      // thread in systemError is poison: the next support-poller recurrence
+      // resumes the same dead thread and posts the same warning every 15 min.
+      // Clear once and retry fresh with a recap, mirroring stale-session
+      // recovery. If the fresh thread also fails, surface that final error.
+      if (!recovered && continuation && isProviderSystemError(err)) {
+        log(`Provider system_error (${continuation}) - clearing session and retrying with recap`);
+        continuation = undefined;
+        clearContinuation(config.providerName);
+        try {
+          const recap = buildSessionRecap();
+          const retryPrompt =
+            (recap
+              ? wrapRecap(recap, 'provider-system-error-recovered')
+              : '[The prior provider thread entered a terminal system error and was reset. Starting a fresh session.]\n\n') +
+            prompt;
+          const retryQuery = config.provider.query({
+            prompt: retryPrompt,
+            continuation: undefined,
+            cwd: config.cwd,
+            systemContext: config.systemContext,
+            model: effectiveModel,
+            effort: effectiveEffort,
+            ultracode: effectiveUltracode,
+          });
+          const retryResult = await processQuery(
+            retryQuery,
+            routing,
+            processingIds,
+            config.providerName,
+            config.provider.onExchangeComplete?.bind(config.provider),
+            prompt,
+            undefined,
+            { model: effectiveModel, effort: effectiveEffort, ultracode: effectiveUltracode },
+          );
+          if (retryResult.continuation) {
+            continuation = retryResult.continuation;
+            setContinuation(config.providerName, continuation);
+          }
+          recovered = true;
+        } catch (retryErr) {
+          const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
+          log(`Retry after provider system_error also failed: ${retryMsg}`);
+          continuation = undefined;
+          clearContinuation(config.providerName);
+        }
+      }
+
       // Only surface the error to the user if we couldn't recover inline.
       if (!recovered) {
+        const chatText =
+          err instanceof ProviderEventError && err.retryable === false
+            ? `⚠️ Turn ended with an error: ${err.message}. I'll pick up from your next message.`
+            : `Error: ${errMsg}`;
         writeMessageOut({
           id: generateId(),
           kind: 'chat',
           platform_id: routing.platformId,
           channel_type: routing.channelType,
           thread_id: routing.threadId,
-          content: JSON.stringify({ text: `Error: ${errMsg}` }),
+          content: JSON.stringify({ text: chatText }),
         });
       }
     } finally {
@@ -877,6 +949,17 @@ async function processQuery(
 
   try {
     for await (const event of query.events) {
+      if (event.type === 'error') {
+        const err = new ProviderEventError(event);
+        notifyExchangeComplete(onExchangeComplete, {
+          prompt: archivePrompts[0] ?? initialPrompt,
+          result: `Error: ${event.message}`,
+          continuation: queryContinuation ?? initialContinuation,
+          status: 'error',
+        });
+        throw err;
+      }
+
       handleEvent(event, routing);
       touchHeartbeat();
 

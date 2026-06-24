@@ -169,13 +169,15 @@ export interface ContainerConfig {
   excludeMcpServers?: string[];
 
   /**
-   * When true, mount the host `~/.codex` directory into the container as
-   * read-only so the Codex CLI can use the host's OAuth session. SECURITY:
-   * any in-container code with shell access can read the OAuth token; a
-   * compromised agent could exfiltrate it. Default OFF — opt in only for
-   * groups that specifically need Codex host auth (e.g., the Codex agent
-   * provider, /codex:rescue use cases). Pre-2026-05-03 the mount was
-   * unconditional and RW; the cross-tenant audit forced it opt-in + RO.
+   * When true, expose host Codex auth to the container. For provider=codex,
+   * the active `~/.codex` remains a session-local private copy, and the host
+   * Codex home is mounted separately as a read-only refresh source so long
+   * running containers can heal a stale copied auth.json. For codex-as-peer
+   * groups, the host Codex home is mounted directly. SECURITY: read access
+   * to auth.json is enough to exfiltrate the OAuth token. Default OFF — opt
+   * in only for groups that specifically need Codex host auth (e.g., the Codex
+   * agent provider, /codex:rescue use cases). Pre-2026-05-03 the mount was
+   * unconditional and RW; the cross-tenant audit forced it opt-in.
    */
   codexHostAuth?: boolean;
 

@@ -486,6 +486,37 @@ export function mirrorCodexAgentsToHome(primaryCodexHome: string, targetCodexHom
   }
 }
 
+export function refreshCodexAuthFromHost(activeCodexHome: string, hostCodexHome: string | undefined): boolean {
+  if (!hostCodexHome) return false;
+
+  const src = path.join(hostCodexHome, 'auth.json');
+  const dst = path.join(activeCodexHome, 'auth.json');
+  if (path.resolve(src) === path.resolve(dst)) return false;
+
+  try {
+    if (!fs.existsSync(src)) return false;
+    const srcAuth = fs.readFileSync(src);
+    let dstAuth: Buffer | null = null;
+    try {
+      dstAuth = fs.readFileSync(dst);
+    } catch {
+      dstAuth = null;
+    }
+    if (dstAuth && Buffer.compare(srcAuth, dstAuth) === 0) return false;
+
+    fs.mkdirSync(activeCodexHome, { recursive: true });
+    const tmp = path.join(activeCodexHome, `.auth.json.refresh-${process.pid}-${Date.now()}`);
+    fs.writeFileSync(tmp, srcAuth, { mode: 0o600 });
+    fs.renameSync(tmp, dst);
+    return true;
+  } catch (e) {
+    console.error(
+      `[codex-provider] failed to refresh auth.json from host: ${e instanceof Error ? e.message : String(e)}`,
+    );
+    return false;
+  }
+}
+
 /**
  * Locate the freshest rollout for `threadId` across multiple CODEX_HOMEs.
  *
@@ -718,6 +749,8 @@ export class CodexProvider implements AgentProvider {
       // agents/ tree. Captured before any rotation reassigns currentCodexHome, so
       // the rotation routine can mirror the role definitions into a fallback. (codex #126)
       const primaryCodexHome = currentCodexHome;
+      const primaryHostCodexHome = process.env.CODEX_PRIMARY_HOST_HOME;
+      let primaryAuthRefreshAttempted = false;
 
       try {
         await initializeCodexAppServer(server);
@@ -822,6 +855,44 @@ export class CodexProvider implements AgentProvider {
                   ev.classification === 'quota' ||
                   ev.classification === 'overloaded' ||
                   ev.classification === 'system_error';
+                const canRefreshPrimaryAuth =
+                  ev.classification === 'system_error' &&
+                  !primaryAuthRefreshAttempted &&
+                  currentCodexHome === primaryCodexHome &&
+                  refreshCodexAuthFromHost(currentCodexHome, primaryHostCodexHome);
+                if (canRefreshPrimaryAuth) {
+                  primaryAuthRefreshAttempted = true;
+                  yield {
+                    type: 'progress',
+                    message: formatBlockquoteLabel(
+                      '↻',
+                      'Codex auth refreshed from host copy after system error; restarting app-server and retrying turn',
+                    ),
+                  };
+
+                  turnTracker.server = null;
+                  turnTracker.threadId = null;
+                  turnTracker.currentTurnId = null;
+                  killCodexAppServer(server);
+
+                  writeCodexMcpConfigToml(self.mcpServers);
+                  writeCodexHooksJson();
+
+                  server = spawnCodexAppServer(createCodexConfigOverrides(effectiveConfig));
+                  turnTracker.server = server;
+                  attachCodexAutoApproval(server);
+                  await initializeCodexAppServer(server);
+
+                  const previousThreadId: string | undefined = threadId;
+                  threadId = await startOrResumeCodexThread(server, threadId, threadParams);
+                  turnTracker.threadId = threadId ?? null;
+                  if (threadId !== previousThreadId) {
+                    initYielded = false;
+                  }
+
+                  rotateAndRetry = true;
+                  break;
+                }
                 if (eligible && self.nextFallback < self.fallbackHomes.length) {
                   const nextHome = self.rotateCodexHome();
                   if (nextHome) {

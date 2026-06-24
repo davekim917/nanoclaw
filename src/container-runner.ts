@@ -703,6 +703,8 @@ export interface CodexAuthFallback {
   containerPath: string;
 }
 
+const CODEX_PRIMARY_HOST_HOME_CONTAINER_PATH = '/home/node/.codex-host-primary';
+
 /**
  * Filter a `codexAuthFallbacks` declaration into a deduped, validated list
  * of fallback mounts. Entries are silently skipped when:
@@ -1408,6 +1410,15 @@ export function buildMounts(
       // src/providers/codex.ts's container-config registry contribution);
       // codex-as-peer setups (provider=claude with the codex plugin) rely
       // on this block to surface the host's ~/.codex directly.
+      const primaryHostPath = resolveCodexAuthDir(agentGroup.folder);
+      if (providerHasCodexMount && fs.existsSync(path.join(primaryHostPath, 'auth.json'))) {
+        mounts.push({
+          hostPath: primaryHostPath,
+          containerPath: CODEX_PRIMARY_HOST_HOME_CONTAINER_PATH,
+          readonly: true,
+        });
+      }
+
       if (!providerHasCodexMount) {
         // Per-group resolution: ~/.codex-<folder>/ wins if it has an
         // auth.json, otherwise fall back to the global ~/.codex/.
@@ -1418,7 +1429,7 @@ export function buildMounts(
         // is for env-var creds (LOOKER, DBT, GitHub tokens) which the sibling
         // should inherit. Conflating the two would silently override the
         // sibling's purpose-built ~/.codex-<sibling>/ dir with the source's.
-        const hostCodex = resolveCodexAuthDir(agentGroup.folder);
+        const hostCodex = primaryHostPath;
         if (fs.existsSync(hostCodex)) {
           mounts.push({ hostPath: hostCodex, containerPath: '/home/node/.codex', readonly: false });
           const globalCodex = path.join(os.homedir(), '.codex');
@@ -1465,7 +1476,6 @@ export function buildMounts(
       // the primary auth came from, regardless of whether the actual
       // /home/node/.codex mount source is that path or a session-local
       // copy. Lets a fallback declaration matching the primary be skipped.
-      const primaryHostPath = resolveCodexAuthDir(agentGroup.folder);
       const resolvedFallbacks = resolveCodexAuthFallbacks(containerConfig.codexAuthFallbacks, primaryHostPath);
       resolvedFallbacks.forEach((entry) => {
         mounts.push({ hostPath: entry.hostPath, containerPath: entry.containerPath, readonly: false });
@@ -2298,6 +2308,10 @@ async function buildContainerArgs(
     .map((m) => m.containerPath);
   if (codexFallbackPaths.length > 0) {
     args.push('-e', `CODEX_FALLBACK_HOMES=${codexFallbackPaths.join(':')}`);
+  }
+
+  if (mounts.some((m) => m.containerPath === CODEX_PRIMARY_HOST_HOME_CONTAINER_PATH)) {
+    args.push('-e', `CODEX_PRIMARY_HOST_HOME=${CODEX_PRIMARY_HOST_HOME_CONTAINER_PATH}`);
   }
 
   // Credential-lookup folder. Defaults to `agent_groups.folder`; sibling
