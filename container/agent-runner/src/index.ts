@@ -35,6 +35,7 @@ import { createProvider, type ProviderName } from './providers/factory.js';
 import type { McpServerConfig } from './providers/types.js';
 import { runPollLoop } from './poll-loop.js';
 import { setupCodexRuntime, syncAgentSkillsMirror } from './codex-companion-setup.js';
+import { activateGcpServiceAccount } from './gcp-auth-setup.js';
 
 function log(msg: string): void {
   console.error(`[agent-runner] ${msg}`);
@@ -55,6 +56,10 @@ async function main(): Promise<void> {
   const providerName = config.provider.toLowerCase() as ProviderName;
 
   log(`Starting v2 agent-runner (provider: ${providerName})`);
+
+  // GCP service-account: when the host mounted a key (GOOGLE_APPLICATION_CREDENTIALS),
+  // activate it so the `gcloud`/`bq` CLIs authenticate. No-op otherwise. All providers.
+  activateGcpServiceAccount(log);
 
   // Runtime-generated system-prompt addendum: agent identity + communication
   // invariants + live destinations map. Rest of the system prompt (per-module

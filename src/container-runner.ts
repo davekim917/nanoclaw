@@ -867,6 +867,18 @@ const GCP_SA_KEYS_DIR = path.join(os.homedir(), '.config', 'nanoclaw-gcp');
 const GCP_KEY_CONTAINER_PATH = '/home/node/.gcp/service-account.json';
 
 /**
+ * gcloud's config dir for these containers. The default `~/.config/gcloud` is
+ * unusable here: the gws accounts mount (`/home/node/.config/gws/accounts`)
+ * makes Docker create `/home/node/.config` ROOT-owned, but the container runs
+ * as `node` (uid 1001) — so gcloud/bq can't create their config dir and
+ * activation fails with "Could not create directory [/home/node/.config/gcloud]".
+ * Point CLOUDSDK_CONFIG at a node-writable home dir instead. As a container env
+ * var it's also inherited by `docker exec`, so manual gcloud/bq invocations see
+ * the activated account too.
+ */
+const GCP_CLOUDSDK_CONFIG_CONTAINER_PATH = '/home/node/.gcloud-config';
+
+/**
  * Resolve a per-group GCP service-account key file on the host.
  *
  * Why a file mount and not the OneCLI vault: vault secrets are HTTP-header
@@ -2426,9 +2438,10 @@ async function buildContainerArgs(
   // with the mount via `gcpKey`.
   if (gcpKey) {
     args.push('-e', `GOOGLE_APPLICATION_CREDENTIALS=${GCP_KEY_CONTAINER_PATH}`);
+    // Redirect gcloud's config dir to a node-writable path (see const comment).
+    args.push('-e', `CLOUDSDK_CONFIG=${GCP_CLOUDSDK_CONFIG_CONTAINER_PATH}`);
     try {
-      const projectId = (JSON.parse(fs.readFileSync(gcpKey, 'utf-8')) as { project_id?: string })
-        .project_id;
+      const projectId = (JSON.parse(fs.readFileSync(gcpKey, 'utf-8')) as { project_id?: string }).project_id;
       if (projectId) {
         args.push('-e', `CLOUDSDK_CORE_PROJECT=${projectId}`);
         args.push('-e', `GOOGLE_CLOUD_PROJECT=${projectId}`);
