@@ -728,10 +728,7 @@ export function buildSessionServicesSnapshot(
   // are NOT secret and differ per site, so they're supplied per task, never baked in.
   const hasWixSecret = mergedSecrets.some((s) => /wix/i.test(s));
   const hasWixCli = cfg?.wixHostAuth === true;
-  const hasWixMcp = Object.values(cfg?.mcpServers ?? {}).some(
-    (m) => typeof (m as { url?: string })?.url === 'string' && /mcp\.wix\.com/i.test((m as { url: string }).url),
-  );
-  if (hasWixSecret || hasWixCli || hasWixMcp) {
+  if (hasWixSecret || hasWixCli) {
     const parts: string[] = [];
     if (hasWixSecret) {
       parts.push(
@@ -743,15 +740,9 @@ export function buildSessionServicesSnapshot(
         '`wix` CLI for Velo local-dev + publish on git-integrated Wix sites — pre-authenticated via the mounted ~/.wix (run `wix whoami` to confirm; DO NOT run `wix login`). Use it to edit Velo page code and `wix publish`. It CANNOT create pages or place/position elements — that is a Wix-editor (human) action; once a page and its named elements exist, you wire them in code.',
       );
     }
-    if (hasWixMcp) {
-      parts.push(
-        'Wix MCP tools (`mcp__wix-mcp__*`) on https://mcp.wix.com/mcp — auth pre-injected (the API key rides the gateway; the account context is pre-set in the server config). Prefer these for live Wix docs: `SearchWixRESTDocumentation` / `SearchWixSDKDocumentation` / `SearchWixWDSDocumentation` / `SearchWixHeadlessDocumentation`, `ReadFullDocsArticle`, `ReadFullDocsMethodSchema` — use them to look up exact API shapes instead of guessing. Also exposes `ListWixSites` / `CallWixSiteAPI` (these overlap with the REST surface above).',
-      );
-    }
     services.push({
       name: 'Wix',
       cli: hasWixCli ? 'wix' : undefined,
-      mcpNamespace: hasWixMcp ? 'mcp__wix-mcp__*' : undefined,
       declaredTools: [],
       scopes: [],
       credentialPaths: hasWixCli ? ['/home/node/.wix/auth/account.json'] : [],

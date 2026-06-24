@@ -2641,42 +2641,16 @@ async function buildContainerArgs(
     mergeNoProxy(args, 'pypi.org');
     mergeNoProxy(args, 'pythonhosted.org');
 
-    // Wix CLI OAuth bypass — `wix login`/`whoami`/dev/publish talk to several
-    // *.wix.com subdomains with the CLI's own OAuth token from the mounted
-    // ~/.wix. OneCLI's TLS MITM on those hosts breaks the CLI (Node CLIs trust
-    // their bundled CA list, not the system store where OneCLI's CA lives), so
-    // they must skip the proxy.
-    //
-    // We bypass each CLI subdomain INDIVIDUALLY rather than the blanket
-    // `wix.com`. NO_PROXY is a suffix match, so a bare `wix.com` entry would
-    // also bypass `mcp.wix.com` — but we deliberately keep mcp.wix.com ON the
-    // gateway so OneCLI injects the Wix API key (`Authorization` header, vault
-    // secret bound to mcp.wix.com) for the hosted Wix MCP's headless API-key
-    // auth. The Wix REST API on `www.wixapis.com` is a different domain and also
-    // stays on the gateway. Gated on the ~/.wix auth mount so only Wix-enabled
+    // Wix CLI OAuth bypass — `wix login`/`whoami`/dev/publish talk to *.wix.com
+    // (manage/editor/users.wix.com) with the CLI's own OAuth token from the
+    // mounted ~/.wix. OneCLI's MITM on those hosts breaks the CLI ("not
+    // authenticated"), same class as the chatgpt.com case above. Bypass only
+    // `wix.com` (matches *.wix.com) — the Wix REST API on `www.wixapis.com` is
+    // a DIFFERENT domain, so it stays on the gateway and keeps getting the
+    // injected API key. Gated on the ~/.wix auth mount so only Wix-enabled
     // groups bypass.
-    //
-    // Host list sourced from @wix/cli's own URL constants. Bare `wix.com` is
-    // intentionally omitted — it appears only as browser-facing editor /
-    // app-market URLs, not CLI HTTP-API calls, and including it would
-    // re-capture mcp.wix.com. If a future CLI op breaks on an unlisted host,
-    // add the specific subdomain here (never re-add bare `wix.com`).
     if (containerConfig.wixHostAuth === true) {
-      const WIX_CLI_HOSTS = [
-        'manage.wix.com',
-        'users.wix.com',
-        'editor.wix.com',
-        'dev.wix.com',
-        'bo.wix.com',
-        'code.wix.com',
-        'frog.wix.com',
-        'learn-code.wix.com',
-        'publicmedia.wix.com',
-        'support.wix.com',
-        'vibe.wix.com',
-        'www.wix.com',
-      ];
-      for (const host of WIX_CLI_HOSTS) mergeNoProxy(args, host);
+      mergeNoProxy(args, 'wix.com');
     }
 
     // OAuth bypass: when a host OAuth token is forwarded, tell the
