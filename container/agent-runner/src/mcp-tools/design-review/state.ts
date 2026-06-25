@@ -30,6 +30,8 @@ export interface TrackedFinding extends Finding {
 export interface Round {
   round: number;
   findings: TrackedFinding[];
+  /** True iff a non-stale L1 critic pass for THIS artifact version was folded into this round. */
+  criticReviewed?: boolean;
 }
 export interface TraceState {
   id: string;
@@ -92,6 +94,7 @@ export function recordRound(
   id: string,
   roundFindings: Finding[],
   baseDir = DEFAULT_BASE_DIR,
+  criticReviewed = false,
 ): { state: TraceState; status: RunStatus; mustFixOpen: TrackedFinding[] } {
   const dir = traceDir(id, baseDir);
   fs.mkdirSync(dir, { recursive: true });
@@ -100,7 +103,7 @@ export function recordRound(
   acquireLock(lock, owner);
   try {
     const prior = readState(id, baseDir);
-    const next = mergeRound(prior, roundFindings);
+    const next = mergeRound(prior, roundFindings, criticReviewed);
     const status = decideStatus(next);
     next.finalStatus = status === 'continue' ? null : status;
     if (next.finalStatus) next.selectedCandidate = next.rounds.length;
@@ -163,7 +166,7 @@ function spin(ms: number): void {
  * stable id. Present-before-and-now = unresolved; present-before-not-now = resolved;
  * new id = new. (R9 carry-forward — Reviewer findings must not be silently dropped.)
  */
-export function mergeRound(state: TraceState, roundFindings: Finding[]): TraceState {
+export function mergeRound(state: TraceState, roundFindings: Finding[], criticReviewed = false): TraceState {
   const prev = state.rounds[state.rounds.length - 1];
   const prevIds = new Set((prev?.findings ?? []).map((f) => f.id));
   const nowIds = new Set(roundFindings.map((f) => f.id));
@@ -178,7 +181,7 @@ export function mergeRound(state: TraceState, roundFindings: Finding[]): TraceSt
   }
 
   const round = (prev?.round ?? 0) + 1;
-  return { ...state, rounds: [...state.rounds, { round, findings: tracked }] };
+  return { ...state, rounds: [...state.rounds, { round, findings: tracked, criticReviewed }] };
 }
 
 /** Open (unresolved/new, non-resolved) findings in the latest round. */
@@ -187,13 +190,24 @@ export function openFindings(state: TraceState): TrackedFinding[] {
   return (last?.findings ?? []).filter((f) => f.state !== 'resolved');
 }
 
-/** R9 gate. Below cap with open findings → continue. At cap → block on open high, else disclose. */
+/**
+ * R9 gate. Below cap with open findings → continue. At cap → block on open high, else disclose.
+ *
+ * A clean round does NOT auto-ship: the independent L1 vision critic is mandatory and must
+ * have reviewed THIS artifact version (Codex P1 — a clean deterministic lint says nothing
+ * about branded-generic / visual-only slop, which only the critic catches). So a clean
+ * round with no recorded critic pass returns `continue` to force one — except at the cap,
+ * where the loop must terminate.
+ */
 export function decideStatus(state: TraceState): RunStatus {
   const last = state.rounds[state.rounds.length - 1];
   const round = last?.round ?? 0;
   const open = openFindings(state);
   const hasHigh = open.some((f) => f.severity === 'high');
-  if (open.length === 0) return 'shipped-with-disclosures'; // clean → ship (no disclosures)
+  if (open.length === 0) {
+    // clean → ship only once the critic has reviewed this version (or the cap forces it)
+    return last?.criticReviewed || round >= CAP ? 'shipped-with-disclosures' : 'continue';
+  }
   if (round < CAP) return 'continue';
   return hasHigh ? 'blocked' : 'shipped-with-disclosures';
 }

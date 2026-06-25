@@ -80,29 +80,36 @@ export function lintArtifact(html: string, opts: LintOpts = {}): Finding[] {
     findings.push({ id: 'network:xhr', severity: 'high', locus: 'XMLHttpRequest', message: 'XMLHttpRequest is a network call — artifacts must be self-contained.' });
   }
   // Capture external resource URLs from src=, <link href>, css url(), @import, srcset.
-  // Group 1 = scheme ("https://"|"http://"|"//"), group 2 = host. NOT <a href> (navigation, allowed).
-  // quote-optional throughout (Codex E#4 cycle-2: <img src=https://evil/x> must be caught);
-  // host group stops at / whitespace " ' > ) , so unquoted attrs terminate correctly.
-  const urlRes: RegExp[] = [
-    /\bsrc\s*=\s*["']?(https?:\/\/|\/\/)([^"'/\s>]+)/gi,
-    /\bsrcset\s*=\s*["']?[^"'>]*?(https?:\/\/|\/\/)([^"'/\s>,]+)/gi,
-    /<link\b[^>]*\bhref\s*=\s*["']?(https?:\/\/|\/\/)([^"'/\s>]+)/gi,
-    /url\(\s*["']?(https?:\/\/|\/\/)([^"')\s/]+)/gi,
-    /@import\s+(?:url\()?\s*["']?(https?:\/\/|\/\/)([^"'/\s)]+)/gi,
-  ];
+  // quote-optional throughout (Codex E#4 cycle-2: <img src=https://evil/x> must be caught).
+  // addHost takes the post-scheme remainder (host[/path][?query]) and keys by HOST only;
+  // NOT <a href> (navigation, allowed). The documented font CDN is allowlisted.
   const seenHosts = new Set<string>();
-  for (const re of urlRes) {
-    for (const m of html.matchAll(re)) {
-      const host = m[2].toLowerCase();
-      if (FONT_CDN_HOSTS.has(host) || seenHosts.has(host)) continue;
-      seenHosts.add(host);
-      findings.push({
-        id: `network:${host}`,
-        severity: 'high',
-        locus: host,
-        message: `External resource fetch to ${host} — artifacts must be self-contained (only the declared font CDN is allowed).`,
-      });
-    }
+  const addHost = (rest: string) => {
+    const host = rest.toLowerCase().split(/[/?#\s]/)[0];
+    if (!host || FONT_CDN_HOSTS.has(host) || seenHosts.has(host)) return;
+    seenHosts.add(host);
+    findings.push({
+      id: `network:${host}`,
+      severity: 'high',
+      locus: host,
+      message: `External resource fetch to ${host} — artifacts must be self-contained (only the declared font CDN is allowed).`,
+    });
+  };
+  // Single-URL constructs: group 2 = host[+path], stops at quote/space/> (so unquoted attrs terminate).
+  const urlRes: RegExp[] = [
+    /\bsrc\s*=\s*["']?(https?:\/\/|\/\/)([^"'\s>]+)/gi,
+    /<link\b[^>]*\bhref\s*=\s*["']?(https?:\/\/|\/\/)([^"'\s>]+)/gi,
+    /url\(\s*["']?(https?:\/\/|\/\/)([^"')\s]+)/gi,
+    /@import\s+(?:url\()?\s*["']?(https?:\/\/|\/\/)([^"'\s)]+)/gi,
+  ];
+  for (const re of urlRes) for (const m of html.matchAll(re)) addHost(m[2]);
+  // srcset is a COMMA-separated candidate list — a browser may pick ANY candidate by
+  // DPR/width, so scan EVERY URL in the attribute, not just the first (Codex P2). Grab the
+  // whole attribute value (quoted or bare), then pull each absolute/protocol-relative URL.
+  const SRCSET_ATTR = /\bsrcset\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi;
+  for (const m of html.matchAll(SRCSET_ATTR)) {
+    const val = m[1] ?? m[2] ?? m[3] ?? '';
+    for (const um of val.matchAll(/(?:https?:\/\/|\/\/)([^\s,]+)/gi)) addHost(um[1]);
   }
 
   // ── 3. :root token-trace (A8): EVERY colour literal outside :root must come from a

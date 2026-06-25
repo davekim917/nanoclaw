@@ -36,6 +36,19 @@ function isSeverity(v: unknown): v is Severity {
   return v === 'high' || v === 'medium' || v === 'low';
 }
 
+/**
+ * Normalize a critic-supplied severity case-insensitively (Codex P2: "High"/"HIGH" must
+ * not be silently demoted to medium). Unknown-but-stronger words map UP, never down — a
+ * "critical"/"blocker" finding becomes high, so an unresolved visual must-fix can't ship
+ * as a mere disclosure.
+ */
+export function normalizeSeverity(v: unknown): Severity {
+  const s = typeof v === 'string' ? v.trim().toLowerCase() : '';
+  if (isSeverity(s)) return s;
+  if (s === 'critical' || s === 'blocker' || s === 'crit' || s === 'p0' || s === 'p1') return 'high';
+  return 'medium';
+}
+
 /** Validate + normalize the agent-supplied L1 critic findings. */
 function normalizeCritic(input: unknown): Finding[] {
   if (!Array.isArray(input)) return [];
@@ -43,7 +56,7 @@ function normalizeCritic(input: unknown): Finding[] {
   for (const f of input) {
     if (f && typeof f === 'object') {
       const o = f as Record<string, unknown>;
-      const sev = isSeverity(o.severity) ? o.severity : 'medium';
+      const sev = normalizeSeverity(o.severity);
       const locus = typeof o.locus === 'string' ? o.locus : 'taste';
       const id = typeof o.id === 'string' && o.id.includes(':') ? o.id : `taste-${sev}:${locus}`;
       out.push({
@@ -114,6 +127,15 @@ const designReviewTool: McpToolDefinition = {
     if (realArtifact !== realRun && !realArtifact.startsWith(realRun + path.sep)) {
       return err('artifactPath resolves (via symlink) outside its run dir — rejected.');
     }
+    // E (cycle-3, Codex P2): the loop ROOT itself must not be a symlink. If
+    // /workspace/agent/design-artifact-loop were symlinked (e.g. -> /tmp/out) before the
+    // first call, realpath would relocate the whole tree there and an artifact "under
+    // realRoot" would still pass — defeating containment to the persistent design dir.
+    try {
+      if (fs.lstatSync(ALLOWED_ROOT).isSymbolicLink()) {
+        return err('design-artifact-loop root is a symlink — rejected.');
+      }
+    } catch { /* root not yet created — fine; state.ts will mkdir it as a real dir */ }
     // E#2 (cycle-2): the run dir ITSELF must resolve under the allowed root — else a
     // symlinked <id>/ (good -> /tmp/out) would let an artifact "inside realRun" escape.
     let realRoot: string;
@@ -140,22 +162,37 @@ const designReviewTool: McpToolDefinition = {
     // are STALE (the agent revised after the critic looked) and are dropped, not merged.
     const reviewToken = crypto.createHash('sha1').update(html).digest('hex').slice(0, 12);
 
-    // canonical render at the pinned viewports → screenshots + render findings
-    const renders = renderViewports(realArtifact, path.join(runDir, 'shots'));
-    const renderFindings = renders.flatMap((r) => r.findings);
-    const screenshotPaths = renders.map((r) => r.pngPath);
-
+    // Codex P1: lint BEFORE rendering. If the artifact carries executable JS or an external
+    // network construct, do NOT feed it to chromium — rendering it would execute the script
+    // / issue the fetch (violating the no-JS/no-egress guarantee) precisely for the artifacts
+    // the lockdown exists to catch. Render only once the artifact is script/egress-clean.
     const lintFindings = lintArtifact(html);
+    const renderUnsafe = lintFindings.some(
+      (f) => f.severity === 'high' && (f.id.startsWith('no-js:') || f.id.startsWith('network:')),
+    );
+
+    let renderFindings: Finding[] = [];
+    let screenshotPaths: string[] = [];
+    if (!renderUnsafe) {
+      const renders = renderViewports(realArtifact, path.join(runDir, 'shots'));
+      renderFindings = renders.flatMap((r) => r.findings);
+      screenshotPaths = renders.map((r) => r.pngPath);
+    }
 
     const criticToken = typeof args.criticReviewToken === 'string' ? args.criticReviewToken : '';
     const criticRaw = normalizeCritic(args.criticFindings);
     const criticStale = criticRaw.length > 0 && criticToken !== reviewToken;
     const critic = criticStale ? [] : criticRaw;
+    // Codex P1: a critic pass counts only when it reviewed THIS artifact version (token
+    // matches), regardless of how many findings it returned — an empty-but-matching pass
+    // means "critic looked, found nothing". This is the gate that blocks shipping a clean
+    // artifact the visual critic never reviewed.
+    const criticReviewed = criticToken !== '' && criticToken === reviewToken;
 
     const roundFindings: Finding[] = [...renderFindings, ...lintFindings, ...critic];
 
     // E#7: the whole read → merge → decide → write is one locked transaction.
-    const { state, status, mustFixOpen } = recordRound(id, roundFindings);
+    const { state, status, mustFixOpen } = recordRound(id, roundFindings, DEFAULT_BASE_DIR, criticReviewed);
     const round = state.rounds[state.rounds.length - 1].round;
 
     const result = {
@@ -167,15 +204,20 @@ const designReviewTool: McpToolDefinition = {
       mustFixOpen,
       screenshotPaths,
       tracePath: path.join(runDir, 'trace.json'),
+      ...(renderUnsafe ? { renderSkipped: 'artifact has high no-JS/network findings — not rendered until script/egress is removed' } : {}),
       ...(criticStale ? { staleCriticFindingsDropped: criticRaw.length } : {}),
       next:
-        criticStale
-          ? 'Your criticFindings were for an older artifact version and were DROPPED. Run the L1 critic on THIS call\'s screenshotPaths (it must READ a PNG for vision), then call again with criticFindings + criticReviewToken set to the reviewToken above.'
-          : status === 'continue'
-            ? 'Run the L1 critic on screenshotPaths (it must READ a PNG for vision), revise against mustFixOpen, then call design_review again with criticFindings + criticReviewToken=reviewToken.'
-            : status === 'blocked'
-              ? 'At cap with unresolved HIGH findings — fix them and surface remaining ones to the user; do not ship silently.'
-              : 'Shippable. send_file the HTML + a preview PNG + trace.json.',
+        renderUnsafe
+          ? 'Render was SKIPPED — the artifact contains executable JS or an external network construct (see mustFixOpen). Remove every no-js:/network: finding (static HTML/CSS only, self-contained), then call design_review again; screenshots are produced once it is clean.'
+          : criticStale
+            ? 'Your criticFindings were for an older artifact version and were DROPPED. Run the L1 critic on THIS call\'s screenshotPaths (it must READ a PNG for vision), then call again with criticFindings + criticReviewToken set to the reviewToken above.'
+            : status === 'continue'
+              ? (criticReviewed
+                  ? 'Revise against mustFixOpen, re-run the L1 critic on the new screenshotPaths, then call design_review again with criticFindings + criticReviewToken=reviewToken.'
+                  : 'No deterministic findings, but the independent L1 critic has not reviewed this version yet. Run it on screenshotPaths (it must READ a PNG for vision), then call design_review again with criticFindings + criticReviewToken=reviewToken (an empty criticFindings with a matching token is fine if it finds nothing).')
+              : status === 'blocked'
+                ? 'At cap with unresolved HIGH findings — fix them and surface remaining ones to the user; do not ship silently.'
+                : 'Shippable. send_file the HTML + a preview PNG + trace.json.',
     };
     return ok(JSON.stringify(result, null, 2));
   },

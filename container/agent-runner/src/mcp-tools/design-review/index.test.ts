@@ -3,7 +3,7 @@ import { describe, it, expect, mock } from 'bun:test';
 // design_review/index.ts calls registerTools at module scope — no-op it for the test.
 mock.module('../server.js', () => ({ registerTools: () => {} }));
 
-const { designReviewTools } = await import('./index.js');
+const { designReviewTools, normalizeSeverity } = await import('./index.js');
 const tool = designReviewTools[0];
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const call = (args: Record<string, unknown>): Promise<any> => tool.handler(args) as Promise<any>;
@@ -37,5 +37,26 @@ describe('design_review — input validation (Codex E#1/E#2 security guards)', (
     const r = await call({ id: 'okrun', artifactPath: '/workspace/agent/design-artifact-loop/okrun/nope.html' });
     expect(r.isError).toBe(true);
     expect(textOf(r)).toContain('not found');
+  });
+});
+
+describe('normalizeSeverity — case-insensitive, never demotes (Codex P2)', () => {
+  it('test_uppercase_high_preserved', () => {
+    expect(normalizeSeverity('High')).toBe('high');
+    expect(normalizeSeverity('HIGH')).toBe('high');
+    expect(normalizeSeverity(' high ')).toBe('high');
+  });
+  it('test_critical_maps_up_to_high', () => {
+    // a "critical"/"blocker" finding must NOT be silently demoted to medium
+    expect(normalizeSeverity('critical')).toBe('high');
+    expect(normalizeSeverity('Blocker')).toBe('high');
+    expect(normalizeSeverity('P1')).toBe('high');
+  });
+  it('test_unknown_defaults_medium', () => {
+    expect(normalizeSeverity('nitpick')).toBe('medium');
+    expect(normalizeSeverity(undefined)).toBe('medium');
+  });
+  it('test_low_preserved', () => {
+    expect(normalizeSeverity('LOW')).toBe('low');
   });
 });

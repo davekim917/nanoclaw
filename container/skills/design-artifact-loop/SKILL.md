@@ -49,7 +49,14 @@ design_review({ id: "<id>", artifactPath: "/workspace/agent/design-artifact-loop
 ```
 It re-renders the artifact (1440×900 + 390×844), runs the deterministic linter
 (token-trace, no-JS, network, font-denylist), records the round with carry-forward, and
-returns `{ round, status, findings, mustFixOpen, screenshotPaths, tracePath }`.
+returns `{ round, status, findings, mustFixOpen, screenshotPaths, tracePath, reviewToken }`.
+The **`reviewToken`** identifies this exact artifact version — you pass it back with your
+critic findings in step 5 so they aren't mistaken for a stale review.
+
+> If the artifact has `no-js:`/`network:` findings, **render is SKIPPED** (the tool will
+> not run a script-bearing or egress artifact through the browser) and `screenshotPaths`
+> is empty. Remove every `no-js:`/`network:` finding first; screenshots appear once it is
+> static and self-contained.
 
 ### 4. Run the INDEPENDENT visual critic on the render
 - Spawn a **separate** critic pass (NOT your own self-review) and have it **`Read` one
@@ -66,14 +73,24 @@ returns `{ round, status, findings, mustFixOpen, screenshotPaths, tracePath }`.
   `[{severity:'high'|'medium'|'low', locus, message}]`.
 
 ### 5. Feed the critic findings back and revise
-- Call `design_review` again with `criticFindings: [...]`. Revise the artifact against
-  `mustFixOpen` (carried forward across rounds by stable id).
+- Call `design_review` again with **both** `criticFindings: [...]` **and**
+  `criticReviewToken: "<the reviewToken from the call whose screenshots the critic read>"`.
+  If you omit `criticReviewToken` (or it doesn't match the current artifact), the findings
+  are dropped as stale and the round is wasted.
+- If the critic found **nothing**, still pass an empty `criticFindings: []` with the
+  matching `criticReviewToken` — that records "the critic reviewed this version and it's
+  clean", which is required before a clean artifact can ship (see step 6).
+- Revise the artifact against `mustFixOpen` (carried forward across rounds by stable id).
+  Every revision changes the `reviewToken`, so re-run the critic on the **new** screenshots.
 
 ### 6. Ship gate (bounded — max 3 rounds)
 - `status: "shipped-with-disclosures"` → ship; note any unresolved medium/low findings.
 - `status: "blocked"` (cap reached with unresolved HIGH) → fix the highs if you can in
   one more pass, else **surface the unresolved highs to the user** — do not ship silently.
-- `status: "continue"` → loop back to step 4.
+- `status: "continue"` → loop back to step 4. **A clean lint does not ship on its own** —
+  if there are no findings but the critic hasn't reviewed the current version yet, status
+  stays `continue` until you run the critic (step 4) and pass its result with the matching
+  `criticReviewToken`. The independent visual critic is mandatory, not optional.
 
 ### 7. Deliver
 - `send_file` the HTML artifact + a preview PNG (a `screenshotPath`) + the

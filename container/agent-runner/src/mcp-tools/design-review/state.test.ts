@@ -82,11 +82,24 @@ describe('state machine — disk-atomic + carry-forward + R9', () => {
     expect(decideStatus(s)).toBe('shipped-with-disclosures');
   });
 
-  it('test_clean_round_ships', () => {
+  it('test_clean_round_requires_critic_before_ship', () => {
+    // Codex P1: a clean deterministic lint must NOT auto-ship — the independent visual
+    // critic is mandatory and must have reviewed this version first.
     let s = readState('clean', base);
-    s = mergeRound(s, []); // nothing flagged
+    s = mergeRound(s, []);                       // clean lint/render, critic not yet run
+    expect(decideStatus(s)).toBe('continue');    // forced to run the critic
+    s = mergeRound(s, [], true);                 // critic reviewed this version, found nothing
     expect(decideStatus(s)).toBe('shipped-with-disclosures');
     expect(openFindings(s)).toHaveLength(0);
+  });
+
+  it('test_clean_but_uncritiqued_ships_at_cap', () => {
+    // degenerate terminal case: agent ignored the critic directive for all rounds —
+    // the loop must still terminate at the cap rather than spin forever.
+    let s = readState('clean-cap', base);
+    for (let i = 0; i < CAP; i++) s = mergeRound(s, []); // clean every round, never critiqued
+    expect(s.rounds[s.rounds.length - 1].round).toBe(CAP);
+    expect(decideStatus(s)).toBe('shipped-with-disclosures');
   });
 
   it('test_recordRound_transactional_carry_forward', () => {

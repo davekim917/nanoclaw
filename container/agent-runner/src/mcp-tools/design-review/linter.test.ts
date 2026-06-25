@@ -96,6 +96,14 @@ describe('lintArtifact — supplement checks', () => {
   it('test_srcset_flagged', () => {
     expect(lintArtifact(`<img srcset="https://evil.example/x.png 2x">`).some((f) => f.id === 'network:evil.example')).toBe(true);
   });
+  it('test_srcset_scans_every_candidate', () => {
+    // Codex P2: the browser may pick ANY candidate by DPR/width — an allowlisted first
+    // host must not mask a non-allowlisted later one.
+    const f = lintArtifact(`<img srcset="https://fonts.gstatic.com/a 1x, https://evil.example/b 2x, //also.evil/c 3x">`);
+    expect(f.some((x) => x.id === 'network:evil.example')).toBe(true);
+    expect(f.some((x) => x.id === 'network:also.evil')).toBe(true);
+    expect(f.some((x) => x.id === 'network:fonts.gstatic.com')).toBe(false); // allowlisted
+  });
   it('test_font_cdn_is_allowlisted', () => {
     const f = lintArtifact(`<link rel="preconnect" href="https://fonts.gstatic.com"><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=X">`);
     expect(f.some((x) => x.id.startsWith('network:'))).toBe(false); // declared font CDN permitted
