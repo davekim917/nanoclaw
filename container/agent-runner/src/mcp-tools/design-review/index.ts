@@ -265,7 +265,16 @@ const designReviewTool: McpToolDefinition = {
     let renderFindings: Finding[] = [];
     let screenshotPaths: string[] = [];
     if (!renderUnsafe) {
-      const renders = renderViewports(realArtifact, path.join(runDir, 'shots'), reviewToken);
+      // The shots dir must be a REAL directory, not a symlink (Codex P2): mkdirSync(recursive)
+      // would happily follow a pre-existing `shots` symlink and write PNGs/temp files outside
+      // the run dir while still returning in-tree-looking paths.
+      const shotsDir = path.join(runDir, 'shots');
+      try {
+        if (fs.lstatSync(shotsDir).isSymbolicLink()) {
+          return err('shots dir is a symlink — rejected (screenshots must stay inside the run dir).');
+        }
+      } catch { /* not created yet — renderViewports will mkdir it as a real dir */ }
+      const renders = renderViewports(realArtifact, shotsDir, reviewToken);
       renderFindings = renders.flatMap((r) => r.findings);
       // Only expose screenshots that actually exist — a failed/timed-out viewport leaves
       // no PNG (it was unlinked pre-render), so it must not appear as a dangling path the

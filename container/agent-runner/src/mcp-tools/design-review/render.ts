@@ -106,6 +106,11 @@ const CHROMIUM_BASE_ARGS = [
 
 const MEASURE_SENTINEL = '__NC_DR__';
 
+// Monotonic suffix so each render call's throwaway measure file is unique even for
+// overlapping calls on the same id/token/viewport (Codex P2): otherwise one call's
+// `finally` unlink could delete a file another call is mid-`--dump-dom` on.
+let measureSeq = 0;
+
 /**
  * Measure layout metrics at `width` by rendering a COPY of the artifact with a tiny
  * measurement script injected (mirrors render-diagram.ts's __NC_DIAG_H__ pattern). The
@@ -132,7 +137,7 @@ function measureDom(html: string, outDir: string, vpName: string, width: number,
   const measured = stripped.includes('</body>')
     ? stripped.replace('</body>', `${inject}</body>`)
     : stripped + inject;
-  const tmp = path.join(outDir, `.measure-${vpName}.html`);
+  const tmp = path.join(outDir, `.measure-${vpName}-${process.pid}-${++measureSeq}.html`);
   try {
     fs.writeFileSync(tmp, measured);
     const dom = execFileSync(

@@ -200,6 +200,30 @@ describe('lintArtifact — supplement checks', () => {
     expect(f.some((x) => x.id.startsWith('token-trace:'))).toBe(false);
   });
 
+  // ── QA cycle-7 (Codex re-review) ──
+  it('test_commented_root_does_not_satisfy_token_block', () => {
+    // Codex P2: a commented-out :root must not be mistaken for a real declaration
+    const f = lintArtifact(`<style>/* :root{--fg:#000} */ body{color:var(--fg)}</style>`);
+    expect(f.some((x) => x.id === 'token-trace:no-root')).toBe(true);
+  });
+  it('test_relative_src_flagged_not_self_contained', () => {
+    expect(lintArtifact(`<img src="./hero.png">`).some((x) => x.id === 'self-contained:./hero.png')).toBe(true);
+    expect(lintArtifact(`<img src="hero.png">`).some((x) => x.id === 'self-contained:hero.png')).toBe(true);
+  });
+  it('test_relative_stylesheet_link_flagged', () => {
+    expect(lintArtifact(`<link rel="stylesheet" href="./style.css">`).some((x) => x.id === 'self-contained:./style.css')).toBe(true);
+  });
+  it('test_absolute_and_inline_src_not_self_contained_flagged', () => {
+    // absolute (already a network finding), data: URI, and protocol-relative are not "relative subresource"
+    expect(lintArtifact(`<img src="https://cdn.example/x.png">`).some((x) => x.id.startsWith('self-contained:'))).toBe(false);
+    expect(lintArtifact(`<img src="data:image/png;base64,iVBOR">`).some((x) => x.id.startsWith('self-contained:'))).toBe(false);
+    expect(lintArtifact(`<use href="#icon"/>`).some((x) => x.id.startsWith('self-contained:'))).toBe(false);
+  });
+  it('test_canonical_link_and_anchor_not_flagged', () => {
+    // non-fetch-bearing <link rel=canonical> and navigational <a> are not subresources
+    expect(lintArtifact(`<link rel="canonical" href="./page"><a href="./other">x</a>`).some((x) => x.id.startsWith('self-contained:'))).toBe(false);
+  });
+
   // ── QA cycle-3 (Codex re-review): token-trace scans CSS contexts only ──
   it('test_visible_text_hex_not_flagged', () => {
     // a hex shown as page content (colour-picker value, ticket id) is NOT CSS — no finding

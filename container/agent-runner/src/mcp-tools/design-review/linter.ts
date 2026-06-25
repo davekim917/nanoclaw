@@ -153,6 +153,35 @@ export function lintArtifact(html: string, opts: LintOpts = {}): Finding[] {
     const val = m[1] ?? m[2] ?? m[3] ?? '';
     for (const um of val.matchAll(/(?:https?:\/\/|\/\/)([^\s,]+)/gi)) addHost(um[1]);
   }
+  // Relative fetch-bearing subresources break self-containment (Codex P2): delivery sends only
+  // the HTML, so `<img src="./hero.png">` / `<link rel=stylesheet href="x.css">` arrive broken.
+  // Flag relative (non-scheme, non-data/blob, non-#fragment) src= and fetch-bearing <link href>.
+  // Medium — doesn't block render (the asset may resolve locally), but must be inlined before ship.
+  const seenRel = new Set<string>();
+  const flagRelative = (val: string) => {
+    const v = val.trim();
+    if (!v || /^(?:[a-z]+:|\/\/|#)/i.test(v) || seenRel.has(v)) return; // absolute scheme / protocol-relative / inline-data / fragment
+    seenRel.add(v);
+    findings.push({
+      id: `self-contained:${v}`,
+      severity: 'medium',
+      locus: v,
+      message: `Relative subresource "${v}" — the artifact must be a SINGLE self-contained file (inline the asset as a data: URI or inline SVG/CSS); a relative path ships broken.`,
+    });
+  };
+  for (const m of html.matchAll(/(?<![-\w])src\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi)) {
+    flagRelative(m[1] ?? m[2] ?? m[3] ?? '');
+  }
+  for (const m of html.matchAll(/<link\b[^>]*>/gi)) {
+    if (!/\brel\s*=\s*["']?(?:stylesheet|preload|icon|apple-touch-icon)/i.test(m[0])) continue; // only fetch-bearing rels
+    const hm = m[0].match(/\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i);
+    if (hm) flagRelative(hm[1] ?? hm[2] ?? hm[3] ?? '');
+  }
+  // DECLINED (advisory long-tail, documented): entity-encoded URLs/schemes (`java&#x73;cript:`,
+  // `https:&#x2f;&#x2f;`), `imagesrcset`, and `<meta http-equiv=refresh>` are NOT chased here.
+  // The render's --host-resolver-rules allowlist blocks the actual egress regardless of construct
+  // (render.ts), and the container sandbox bounds an adversarial agent — so these checks would be
+  // advisory-only, and decoding entities document-wide reintroduces displayed-code false-positives.
 
   // ── 3. :root token-trace (A8): EVERY colour literal outside :root must come from a
   // token via var(--…). Scan only CSS CONTEXTS — `<style>` block bodies + `style="…"`
@@ -208,7 +237,9 @@ export function lintArtifact(html: string, opts: LintOpts = {}): Finding[] {
   // comments so a commented-out declaration/reference doesn't count.
   const cssText = [...styleBlocks, ...styleAttrs].join('\n').replace(/\/\*[\s\S]*?\*\//g, '');
   const usesTokens = /var\(\s*--/.test(cssText);
-  const declaresInRoot = /:root\b[^{]*\{[^}]*--[\w-]+\s*:/.test(html);
+  // Detect :root from the COMMENT-STRIPPED css, not raw HTML (Codex P2): a commented-out or
+  // displayed `/* :root{--fg:#000} */` must not be mistaken for a real token declaration.
+  const declaresInRoot = /:root\b[^{]*\{[^}]*--[\w-]+\s*:/.test(cssText);
   // every declared custom property, in ANY rule (tokens may be theme-scoped, not only :root)
   const declared = new Set(Array.from(cssText.matchAll(/(--[\w-]+)\s*:/g), (m) => m[1].toLowerCase()));
   if (usesTokens && !declaresInRoot) {
