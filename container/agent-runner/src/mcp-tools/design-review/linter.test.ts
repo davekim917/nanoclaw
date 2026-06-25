@@ -141,6 +141,29 @@ describe('lintArtifact — supplement checks', () => {
     expect(lintArtifact(`<iframe src="data:text/html;base64,PHNjcmlwdD4="></iframe>`).some((x) => x.id === 'no-js:data-html')).toBe(true);
   });
 
+  // ── QA cycle-4 (Codex re-review) ──
+  it('test_svg_image_href_flagged', () => {
+    expect(lintArtifact(`<svg><image href="https://evil.example/p.png"/></svg>`).some((x) => x.id === 'network:evil.example')).toBe(true);
+  });
+  it('test_svg_use_xlink_href_flagged', () => {
+    expect(lintArtifact(`<svg><use xlink:href="https://evil.example/s.svg#i"/></svg>`).some((x) => x.id === 'network:evil.example')).toBe(true);
+  });
+  it('test_anchor_href_still_not_flagged', () => {
+    // the SVG href patterns are tag-scoped — a navigational <a href> must stay allowed
+    expect(lintArtifact(`<a href="https://example.com/page">go</a>`).some((x) => x.id.startsWith('network:'))).toBe(false);
+  });
+  it('test_decimal_entity_srcdoc_script_flagged', () => {
+    expect(lintArtifact(`<iframe srcdoc="&#60;script&#62;alert(1)&#60;/script&#62;"></iframe>`).some((x) => x.id === 'no-js:srcdoc-script')).toBe(true);
+  });
+  it('test_unquoted_inline_style_color_flagged', () => {
+    expect(lintArtifact(`<div style=color:red>x</div>`).some((x) => x.id === 'token-trace:red')).toBe(true);
+  });
+  it('test_visible_code_sample_not_a_network_call', () => {
+    // Codex P2: an API code sample shown as page content must NOT trip a network finding
+    const f = lintArtifact(`<style>:root{--c:#000}body{color:var(--c)}</style><pre><code>fetch('/v1/items')</code></pre>`);
+    expect(f.some((x) => x.id.startsWith('network:'))).toBe(false);
+  });
+
   // ── QA cycle-3 (Codex re-review): token-trace scans CSS contexts only ──
   it('test_visible_text_hex_not_flagged', () => {
     // a hex shown as page content (colour-picker value, ticket id) is NOT CSS — no finding

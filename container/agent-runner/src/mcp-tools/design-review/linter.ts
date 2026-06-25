@@ -80,7 +80,8 @@ export function lintArtifact(html: string, opts: LintOpts = {}): Finding[] {
   // ENTITY-encoded script inside srcdoc (`srcdoc="&lt;script&gt;…"`), or a data:text/html
   // payload. (A *literal* <script> inside srcdoc is already caught above.) Render egress is
   // blocked at the chromium layer, so this is a delivery-cleanliness check, not the boundary.
-  if (/\bsrcdoc\s*=\s*["'][^"']*(?:&lt;\s*script\b|&#x3c;\s*script\b)/i.test(html)) {
+  // Entity forms the browser decodes to `<script>`: &lt; , hex &#x3c; , decimal &#60; (Codex P2).
+  if (/\bsrcdoc\s*=\s*["'][^"']*(?:&lt;|&#x0*3c;|&#0*60;)\s*script\b/i.test(html)) {
     findings.push({ id: 'no-js:srcdoc-script', severity: 'high', locus: 'srcdoc', message: 'Encoded <script> inside an iframe srcdoc is executable JS — not allowed.' });
   }
   if (/\bdata:text\/html/i.test(html)) {
@@ -89,13 +90,11 @@ export function lintArtifact(html: string, opts: LintOpts = {}): Finding[] {
 
   // ── 2. Network-construct lockdown (C8/C3): no egress beyond the declared font CDN. ──
   // External resources are keyed by HOST (stable); the documented font CDN is allowlisted.
+  // NOTE: fetch()/XMLHttpRequest text-scans were REMOVED (Codex P2) — they only execute
+  // inside JS, which is already a `no-js:script` finding, so scanning raw document text just
+  // produced false positives on artifacts that *display* an API code sample
+  // (`<code>fetch('/v1')</code>`), wrongly setting renderUnsafe and blocking visual review.
   const FONT_CDN_HOSTS = new Set(['fonts.googleapis.com', 'fonts.gstatic.com']);
-  if (/\bfetch\s*\(/.test(html)) {
-    findings.push({ id: 'network:fetch', severity: 'high', locus: 'fetch()', message: 'fetch() is a network call — artifacts must be self-contained.' });
-  }
-  if (/\bXMLHttpRequest\b/.test(html)) {
-    findings.push({ id: 'network:xhr', severity: 'high', locus: 'XMLHttpRequest', message: 'XMLHttpRequest is a network call — artifacts must be self-contained.' });
-  }
   // Capture external resource URLs from src=, <link href>, css url(), @import, srcset.
   // quote-optional throughout (Codex E#4 cycle-2: <img src=https://evil/x> must be caught).
   // addHost takes the post-scheme remainder (host[/path][?query]) and keys by HOST only;
@@ -120,11 +119,14 @@ export function lintArtifact(html: string, opts: LintOpts = {}): Finding[] {
   // - <object data> + poster (video/audio): fetchable resources. This list is NOT exhaustive
   //   by design — the render's --host-resolver-rules allowlist is the actual egress boundary,
   //   so these patterns are fast advisory feedback, not a security guarantee.
+  // SVG <image>/<use> href (incl. xlink:href) is scoped to those tags so a navigational
+  // <a href> is NOT mis-flagged (Codex P2).
   const urlRes: RegExp[] = [
     /(?<![-\w])src\s*=\s*["']?(https?:\/\/|\/\/)([^"'\s>]+)/gi,
     /<link\b[^>]*\bhref\s*=\s*["']?(https?:\/\/|\/\/)([^"'\s>]+)/gi,
     /<base\b[^>]*\bhref\s*=\s*["']?(https?:\/\/|\/\/)([^"'\s>]+)/gi,
     /<object\b[^>]*\bdata\s*=\s*["']?(https?:\/\/|\/\/)([^"'\s>]+)/gi,
+    /<(?:image|use)\b[^>]*\b(?:xlink:href|href)\s*=\s*["']?(https?:\/\/|\/\/)([^"'\s>]+)/gi,
     /\bposter\s*=\s*["']?(https?:\/\/|\/\/)([^"'\s>]+)/gi,
     /url\(\s*["']?(https?:\/\/|\/\/)([^"')\s]+)/gi,
     /@import\s+(?:url\()?\s*["']?(https?:\/\/|\/\/)([^"'\s)]+)/gi,
@@ -155,7 +157,11 @@ export function lintArtifact(html: string, opts: LintOpts = {}): Finding[] {
   // WCAG contrast are intentionally the CRITIC's job (it sees the render + DESIGN.md), not
   // this deterministic linter's — adding half-built versions here would be false confidence.
   const styleBlocks = Array.from(html.matchAll(/<style\b[^>]*>([\s\S]*?)<\/style>/gi), (m) => m[1]);
-  const styleAttrs = Array.from(html.matchAll(/\bstyle\s*=\s*(?:"([^"]*)"|'([^']*)')/gi), (m) => m[1] ?? m[2] ?? '');
+  // quoted OR unquoted style="" (Codex P2: `<div style=color:red>` must be traced too).
+  const styleAttrs = Array.from(
+    html.matchAll(/\bstyle\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi),
+    (m) => m[1] ?? m[2] ?? m[3] ?? '',
+  );
   const usage = [...styleBlocks, ...styleAttrs]
     .map((c) => `;${c};`)
     .join('\n')

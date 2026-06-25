@@ -69,14 +69,29 @@ describe('state machine — disk-atomic + carry-forward + R9', () => {
     expect(decideStatus(s)).toBe('continue');
   });
 
-  it('test_cap3_blocks_on_open_high', () => {
+  it('test_critic_found_issue_can_revise_reverify_and_ship', () => {
+    // Codex P1 (round 4): the critic round-trip must fit inside the loop — a critic-found HIGH
+    // must be fixable and clearable, not deadlock-block at the cap.
+    const criticHigh: Finding = { id: 'taste-high:hero', severity: 'high', locus: 'hero', message: 'generic', source: 'critic' };
+    const r1 = recordRound('loop', [], base, false);            // render v1, await critic
+    expect(r1.status).toBe('continue');
+    const r2 = recordRound('loop', [criticHigh], base, true);   // critic reports a HIGH on v1
+    expect(r2.status).toBe('continue');
+    const r3 = recordRound('loop', [], base, false);            // agent revised v2; critic not re-run yet
+    expect(r3.status).toBe('continue');                          // must NOT block — the high is carried, awaiting re-review
+    expect(r3.mustFixOpen.map((f) => f.id)).toContain('taste-high:hero');
+    const r4 = recordRound('loop', [], base, true);             // fresh critic pass on v2 finds nothing
+    expect(r4.status).toBe('shipped-with-disclosures');         // cleared + critic-reviewed → ships
+  });
+
+  it('test_cap_blocks_on_open_high', () => {
     let s = readState('cap', base);
     for (let i = 0; i < CAP; i++) s = mergeRound(s, [F('no-js:0')]); // 3 rounds, still open high
     expect(s.rounds[s.rounds.length - 1].round).toBe(CAP);
     expect(decideStatus(s)).toBe('blocked');
   });
 
-  it('test_cap3_discloses_when_only_medium', () => {
+  it('test_cap_discloses_when_only_medium', () => {
     let s = readState('cap2', base);
     for (let i = 0; i < CAP; i++) s = mergeRound(s, [F('font-denylist:Inter', 'medium')]);
     expect(decideStatus(s)).toBe('shipped-with-disclosures');
@@ -124,7 +139,7 @@ describe('state machine — disk-atomic + carry-forward + R9', () => {
     expect(openFindings(s)).toHaveLength(0);
   });
 
-  it('test_terminal_cap_no_round_four', () => {
+  it('test_terminal_cap_no_round_past_cap', () => {
     // Codex P2: once a terminal status is recorded, recordRound must not append round 4+.
     for (let i = 0; i < CAP; i++) recordRound('term', [F('no-js:script')], base); // 3 rounds → blocked
     const afterCap = readState('term', base);

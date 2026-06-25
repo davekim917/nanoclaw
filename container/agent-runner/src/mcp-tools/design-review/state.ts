@@ -19,7 +19,15 @@ import path from 'path';
 import type { Finding, Severity } from './linter.js';
 
 export const DEFAULT_BASE_DIR = '/workspace/agent/design-artifact-loop';
-export const CAP = 3;
+/**
+ * Max design_review rounds before the loop is forced terminal. Sized for the L1 critic's
+ * inherent one-round-trip latency (Codex P1): a critic finding is always reported one round
+ * after the screenshots it reviewed, and clearing it needs revise → re-render → re-critic.
+ * So a single critic-found issue costs ~4 rounds end-to-end; 6 leaves room for ~2 critic
+ * iterations before blocking, while still bounding the loop. (Was 3 — too tight to ever
+ * clear a critic finding within the loop.)
+ */
+export const CAP = 6;
 
 export type FindingState = 'new' | 'unresolved' | 'resolved';
 export type RunStatus = 'continue' | 'blocked' | 'shipped-with-disclosures';

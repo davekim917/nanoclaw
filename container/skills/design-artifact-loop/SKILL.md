@@ -83,7 +83,7 @@ critic findings in step 5 so they aren't mistaken for a stale review.
 - Revise the artifact against `mustFixOpen` (carried forward across rounds by stable id).
   Every revision changes the `reviewToken`, so re-run the critic on the **new** screenshots.
 
-### 6. Ship gate (bounded — max 3 rounds)
+### 6. Ship gate (bounded — up to 6 rounds)
 - `status: "shipped-with-disclosures"` → ship; note any unresolved medium/low findings.
 - `status: "blocked"` (cap reached with unresolved HIGH) → fix the highs if you can in
   one more pass, else **surface the unresolved highs to the user** — do not ship silently.
