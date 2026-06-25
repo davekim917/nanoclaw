@@ -161,12 +161,16 @@ function measureDom(html: string, outDir: string, vpName: string, width: number,
  * measured via an injected-script + --dump-dom pass so the overflow/empty-DOM checks
  * actually fire in production; when the measure pass fails those checks are skipped.
  */
-export function renderViewports(htmlPath: string, outDir: string): ViewportRender[] {
+export function renderViewports(htmlPath: string, outDir: string, token = ''): ViewportRender[] {
   fs.mkdirSync(outDir, { recursive: true });
   const html = fs.readFileSync(htmlPath, 'utf-8');
   const results: ViewportRender[] = [];
+  // Filenames are keyed by the artifact's reviewToken (Codex P2) so two overlapping
+  // design_review calls for the same id write DISTINCT PNGs — an earlier response's
+  // screenshotPaths can never point at a later artifact's pixels.
+  const prefix = token ? `${token}-` : '';
   for (const vp of VIEWPORTS) {
-    const pngPath = path.join(outDir, `${vp.name}.png`);
+    const pngPath = path.join(outDir, `${prefix}${vp.name}.png`);
     // Unlink any PNG from a PRIOR round first (Codex P2): if this chromium run times out
     // or crashes before writing, the existence check below must not pick up a stale
     // screenshot from an earlier artifact version (which the critic would then review as if

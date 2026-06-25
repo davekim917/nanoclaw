@@ -68,6 +68,7 @@ export interface DirectiveInput {
   status: RunStatus;
   criticReviewed: boolean;
   openCount: number;
+  hasHigh: boolean;
 }
 
 /**
@@ -88,7 +89,16 @@ export function nextDirective(d: DirectiveInput): string {
       + 'criticFindings + criticReviewToken set to the reviewToken above.';
   }
   if (d.status === 'blocked') {
-    return 'At cap with unresolved HIGH findings — fix them and surface remaining ones to the user; do not ship silently.';
+    // The loop is terminal — state the REAL reason (Codex P2). mustFixOpen can be empty when
+    // the block is "the mandatory critic never reviewed this version", not "unresolved HIGHs".
+    if (d.hasHigh) {
+      return 'At cap with unresolved HIGH findings (see mustFixOpen) — surface them to the user; do not ship silently.';
+    }
+    if (!d.criticReviewed) {
+      return 'At cap, but the mandatory independent L1 critic never reviewed this version. The loop has ended — '
+        + 'surface to the user that the design could not be critic-verified within the round budget; do not ship un-reviewed.';
+    }
+    return 'At cap with unresolved findings — surface them to the user; do not ship silently.';
   }
   if (d.status !== 'continue') {
     return 'Shippable. send_file the HTML + a preview PNG + trace.json.';
@@ -192,6 +202,12 @@ const designReviewTool: McpToolDefinition = {
         return err('design-artifact-loop root is a symlink — rejected.');
       }
     } catch { /* root not yet created — fine; state.ts will mkdir it as a real dir */ }
+    // The run dir <id> must be a REAL directory, not a symlink — even one pointing to
+    // another dir UNDER the root (Codex P2): otherwise two distinct ids could share and
+    // clobber the same trace.json / shots/ via the symlink.
+    if (fs.lstatSync(runDir).isSymbolicLink()) {
+      return err('run dir <id> is a symlink — use a real directory (distinct ids must not alias).');
+    }
     // E#2 (cycle-2): the run dir ITSELF must resolve under the allowed root — else a
     // symlinked <id>/ (good -> /tmp/out) would let an artifact "inside realRun" escape.
     let realRoot: string;
@@ -249,7 +265,7 @@ const designReviewTool: McpToolDefinition = {
     let renderFindings: Finding[] = [];
     let screenshotPaths: string[] = [];
     if (!renderUnsafe) {
-      const renders = renderViewports(realArtifact, path.join(runDir, 'shots'));
+      const renders = renderViewports(realArtifact, path.join(runDir, 'shots'), reviewToken);
       renderFindings = renders.flatMap((r) => r.findings);
       // Only expose screenshots that actually exist — a failed/timed-out viewport leaves
       // no PNG (it was unlinked pre-render), so it must not appear as a dangling path the
@@ -285,7 +301,7 @@ const designReviewTool: McpToolDefinition = {
       tracePath: path.join(runDir, 'trace.json'),
       ...(renderUnsafe ? { renderSkipped: 'artifact has high no-JS/network findings — not rendered until script/egress is removed' } : {}),
       ...(criticStale ? { staleCriticFindingsDropped: criticRaw.length } : {}),
-      next: nextDirective({ renderUnsafe, criticStale, status, criticReviewed, openCount: open.length }),
+      next: nextDirective({ renderUnsafe, criticStale, status, criticReviewed, openCount: open.length, hasHigh: open.some((f) => f.severity === 'high') }),
     };
     return ok(JSON.stringify(result, null, 2));
   },

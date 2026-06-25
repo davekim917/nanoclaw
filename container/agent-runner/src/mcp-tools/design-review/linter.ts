@@ -178,6 +178,7 @@ export function lintArtifact(html: string, opts: LintOpts = {}): Finding[] {
   const usage = [...styleBlocks, ...styleAttrs]
     .map((c) => `;${c};`)
     .join('\n')
+    .replace(/\/\*[\s\S]*?\*\//g, '') // strip CSS comments (Codex P3: a colour in a comment does not render)
     .replace(/:root\s*\{[^}]*\}/g, '')
     .replace(/var\([^)]*\)/g, 'var()');
   const seenOutsideRoot = new Set<string>();
@@ -203,19 +204,37 @@ export function lintArtifact(html: string, opts: LintOpts = {}): Finding[] {
     const name = m[1].toLowerCase();
     if (!COLOR_KEYWORDS.has(name)) flagLiteral(name);
   }
-  // (c) a committed design system means a real :root token block (Codex P2). If the CSS
-  // references var(--…) tokens but no :root{ --token: value } declares them, there is no
-  // machine-checkable token trace — fallbacks/undefined vars are not a committed system.
-  const cssText = [...styleBlocks, ...styleAttrs].join('\n');
+  // (c) a committed design system means real, declared tokens (Codex P2). cssText excludes
+  // comments so a commented-out declaration/reference doesn't count.
+  const cssText = [...styleBlocks, ...styleAttrs].join('\n').replace(/\/\*[\s\S]*?\*\//g, '');
   const usesTokens = /var\(\s*--/.test(cssText);
-  const declaresTokens = /:root\b[^{]*\{[^}]*--[\w-]+\s*:/.test(html);
-  if (usesTokens && !declaresTokens) {
+  const declaresInRoot = /:root\b[^{]*\{[^}]*--[\w-]+\s*:/.test(html);
+  // every declared custom property, in ANY rule (tokens may be theme-scoped, not only :root)
+  const declared = new Set(Array.from(cssText.matchAll(/(--[\w-]+)\s*:/g), (m) => m[1].toLowerCase()));
+  if (usesTokens && !declaresInRoot) {
     findings.push({
       id: 'token-trace:no-root',
       severity: 'high',
       locus: ':root',
       message: 'CSS references var(--…) tokens but declares no :root{ --token: value } block — commit a concrete design system (lift the :root block from the chosen tokens.css) before styling.',
     });
+  }
+  // Every referenced token must be DECLARED somewhere — a typo'd/undeclared var() silently
+  // falls back (or drops), so a non-conforming artifact would otherwise pass (Codex P2). Only
+  // when ≥1 token is declared; otherwise the no-root finding already covers "no system at all".
+  if (declared.size > 0) {
+    const seenRef = new Set<string>();
+    for (const m of cssText.matchAll(/var\(\s*(--[\w-]+)/g)) {
+      const ref = m[1].toLowerCase();
+      if (declared.has(ref) || seenRef.has(ref)) continue;
+      seenRef.add(ref);
+      findings.push({
+        id: `token-trace:undeclared:${ref}`,
+        severity: 'high',
+        locus: ref,
+        message: `var(${ref}) references a token that is never declared (no \`${ref}: …\` in any rule) — declare it in :root or fix the typo.`,
+      });
+    }
   }
 
   // ── 4. Font denylist (medium) — impeccable also covers this; kept as a structured finding. ──

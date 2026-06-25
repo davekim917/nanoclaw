@@ -182,6 +182,24 @@ describe('lintArtifact — supplement checks', () => {
     expect(lintArtifact(`<main><h1>Hi</h1></main>`).some((x) => x.id === 'token-trace:no-root')).toBe(false);
   });
 
+  // ── QA cycle-6 (Codex re-review) ──
+  it('test_undeclared_token_reference_flagged', () => {
+    // Codex P2: :root declares --bg but body references an undeclared --fg
+    const f = lintArtifact(`<style>:root{--bg:#fff}body{color:var(--fg);background:var(--bg)}</style>`);
+    expect(f.some((x) => x.id === 'token-trace:undeclared:--fg')).toBe(true);
+    expect(f.some((x) => x.id === 'token-trace:undeclared:--bg')).toBe(false); // declared
+  });
+  it('test_theme_scoped_token_not_flagged_undeclared', () => {
+    // a token declared on a non-:root selector still counts as declared
+    const f = lintArtifact(`<style>:root{--bg:#fff}.dark{--accent:#f00}.btn{color:var(--accent)}body{background:var(--bg)}</style>`);
+    expect(f.some((x) => x.id.startsWith('token-trace:undeclared'))).toBe(false);
+  });
+  it('test_color_literal_in_css_comment_not_flagged', () => {
+    // Codex P3: a colour literal living only in a CSS comment does not render
+    const f = lintArtifact(`<style>:root{--c:#000}body{color:var(--c)}/* legacy brand #ff0000 was here */</style>`);
+    expect(f.some((x) => x.id.startsWith('token-trace:'))).toBe(false);
+  });
+
   // ── QA cycle-3 (Codex re-review): token-trace scans CSS contexts only ──
   it('test_visible_text_hex_not_flagged', () => {
     // a hex shown as page content (colour-picker value, ticket id) is NOT CSS — no finding

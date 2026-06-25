@@ -80,20 +80,31 @@ describe('criticReviewedFor — token + explicit array required (Codex P1)', () 
 
 describe('nextDirective — open findings take priority over the critic prompt (Codex P2)', () => {
   it('test_continue_with_open_findings_says_fix_not_critic', () => {
-    const msg = nextDirective({ renderUnsafe: false, criticStale: false, status: 'continue', criticReviewed: false, openCount: 3 });
+    const msg = nextDirective({ renderUnsafe: false, criticStale: false, status: 'continue', criticReviewed: false, openCount: 3, hasHigh: true });
     expect(msg).toContain('Fix the open findings');
     expect(msg).not.toContain('No deterministic findings');
   });
   it('test_continue_clean_but_uncritiqued_prompts_critic', () => {
-    const msg = nextDirective({ renderUnsafe: false, criticStale: false, status: 'continue', criticReviewed: false, openCount: 0 });
+    const msg = nextDirective({ renderUnsafe: false, criticStale: false, status: 'continue', criticReviewed: false, openCount: 0, hasHigh: false });
     expect(msg).toContain('not reviewed this version yet');
   });
   it('test_render_unsafe_directive', () => {
-    const msg = nextDirective({ renderUnsafe: true, criticStale: false, status: 'continue', criticReviewed: false, openCount: 2 });
+    const msg = nextDirective({ renderUnsafe: true, criticStale: false, status: 'continue', criticReviewed: false, openCount: 2, hasHigh: true });
     expect(msg).toContain('Render was SKIPPED');
   });
-  it('test_blocked_and_ship_directives', () => {
-    expect(nextDirective({ renderUnsafe: false, criticStale: false, status: 'blocked', criticReviewed: true, openCount: 1 })).toContain('At cap');
-    expect(nextDirective({ renderUnsafe: false, criticStale: false, status: 'shipped-with-disclosures', criticReviewed: true, openCount: 0 })).toContain('Shippable');
+  it('test_ship_directive', () => {
+    expect(nextDirective({ renderUnsafe: false, criticStale: false, status: 'shipped-with-disclosures', criticReviewed: true, openCount: 0, hasHigh: false })).toContain('Shippable');
+  });
+
+  // Codex P2 (round 6): blocked directive states the REAL reason, not always "HIGH findings"
+  it('test_blocked_high_directive_mentions_high', () => {
+    const msg = nextDirective({ renderUnsafe: false, criticStale: false, status: 'blocked', criticReviewed: true, openCount: 1, hasHigh: true });
+    expect(msg).toContain('HIGH');
+  });
+  it('test_blocked_no_critic_directive_explains_critic', () => {
+    // clean/medium-only at cap, never critic-reviewed → explain the critic, not phantom HIGHs
+    const msg = nextDirective({ renderUnsafe: false, criticStale: false, status: 'blocked', criticReviewed: false, openCount: 0, hasHigh: false });
+    expect(msg).toContain('critic never reviewed');
+    expect(msg).not.toContain('HIGH findings');
   });
 });
