@@ -91,10 +91,18 @@ describe('state machine — disk-atomic + carry-forward + R9', () => {
     expect(decideStatus(s)).toBe('blocked');
   });
 
-  it('test_cap_discloses_when_only_medium', () => {
+  it('test_cap_discloses_medium_only_when_critic_reviewed', () => {
     let s = readState('cap2', base);
-    for (let i = 0; i < CAP; i++) s = mergeRound(s, [F('font-denylist:Inter', 'medium')]);
-    expect(decideStatus(s)).toBe('shipped-with-disclosures');
+    for (let i = 0; i < CAP; i++) s = mergeRound(s, [F('font-denylist:Inter', 'medium')], true);
+    expect(decideStatus(s)).toBe('shipped-with-disclosures'); // critic reviewed → disclose
+  });
+
+  it('test_cap_blocks_medium_only_without_critic', () => {
+    // Codex P2: a medium/low-only run at the cap that the critic never reviewed must NOT
+    // ship as a disclosure — the visual critic is the only slop check.
+    let s = readState('cap3', base);
+    for (let i = 0; i < CAP; i++) s = mergeRound(s, [F('font-denylist:Inter', 'medium')]); // never critiqued
+    expect(decideStatus(s)).toBe('blocked');
   });
 
   it('test_clean_round_requires_critic_before_ship', () => {

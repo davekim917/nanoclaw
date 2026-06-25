@@ -21,7 +21,7 @@ import { registerTools } from '../server.js';
 import type { McpToolDefinition } from '../types.js';
 import { lintArtifact, type Finding, type Severity } from './linter.js';
 import { renderViewports } from './render.js';
-import { recordRound, openFindings, DEFAULT_BASE_DIR, type RunStatus } from './state.js';
+import { recordRound, openFindings, readState, DEFAULT_BASE_DIR, type RunStatus } from './state.js';
 
 function ok(text: string) {
   return { content: [{ type: 'text' as const, text }] };
@@ -218,6 +218,25 @@ const designReviewTool: McpToolDefinition = {
     // are STALE (the agent revised after the critic looked) and are dropped, not merged.
     const reviewToken = crypto.createHash('sha1').update(html).digest('hex').slice(0, 12);
 
+    // Terminal short-circuit BEFORE rendering (Codex P2): if this id already reached a
+    // terminal finalStatus, the bounded loop is over. Do NOT render — that would burn a
+    // chromium pass and hand back fresh screenshots/reviewToken for an artifact that was
+    // never recorded or critic-reviewed (a stale agent reusing a shipped/blocked id with
+    // changed HTML). Return the recorded terminal state and tell the agent to use a new id.
+    const prior = readState(id);
+    if (prior.finalStatus) {
+      return ok(JSON.stringify({
+        round: prior.rounds.length,
+        status: prior.finalStatus,
+        terminal: true,
+        findings: openFindings(prior),
+        tracePath: path.join(runDir, 'trace.json'),
+        next: `This design loop (id="${id}") already terminated with status "${prior.finalStatus}". `
+          + 'It will not accept further rounds — start a NEW id for a new design. No screenshots were '
+          + 'produced for this call.',
+      }, null, 2));
+    }
+
     // Codex P1: lint BEFORE rendering. If the artifact carries executable JS or an external
     // network construct, do NOT feed it to chromium — rendering it would execute the script
     // / issue the fetch (violating the no-JS/no-egress guarantee) precisely for the artifacts
@@ -232,7 +251,10 @@ const designReviewTool: McpToolDefinition = {
     if (!renderUnsafe) {
       const renders = renderViewports(realArtifact, path.join(runDir, 'shots'));
       renderFindings = renders.flatMap((r) => r.findings);
-      screenshotPaths = renders.map((r) => r.pngPath);
+      // Only expose screenshots that actually exist — a failed/timed-out viewport leaves
+      // no PNG (it was unlinked pre-render), so it must not appear as a dangling path the
+      // critic would try to Read (Codex P2).
+      screenshotPaths = renders.map((r) => r.pngPath).filter((p) => fs.existsSync(p));
     }
 
     const criticToken = typeof args.criticReviewToken === 'string' ? args.criticReviewToken : '';

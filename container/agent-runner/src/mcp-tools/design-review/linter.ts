@@ -80,9 +80,17 @@ export function lintArtifact(html: string, opts: LintOpts = {}): Finding[] {
   // ENTITY-encoded script inside srcdoc (`srcdoc="&lt;script&gt;…"`), or a data:text/html
   // payload. (A *literal* <script> inside srcdoc is already caught above.) Render egress is
   // blocked at the chromium layer, so this is a delivery-cleanliness check, not the boundary.
-  // Entity forms the browser decodes to `<script>`: &lt; , hex &#x3c; , decimal &#60; (Codex P2).
-  if (/\bsrcdoc\s*=\s*["'][^"']*(?:&lt;|&#x0*3c;|&#0*60;)\s*script\b/i.test(html)) {
-    findings.push({ id: 'no-js:srcdoc-script', severity: 'high', locus: 'srcdoc', message: 'Encoded <script> inside an iframe srcdoc is executable JS — not allowed.' });
+  // iframe srcdoc can smuggle JS the literal <script> scan misses. Extract the srcdoc value
+  // (quoted OR unquoted — Codex P2), decode the entity forms a browser resolves to `<`
+  // (&lt; / hex &#x3c; / decimal &#60;), then look for a script/javascript: inside THAT value
+  // only — scoping to the attribute avoids false-positives on displayed code samples.
+  const SRCDOC = /\bsrcdoc\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi;
+  for (const m of html.matchAll(SRCDOC)) {
+    const decoded = (m[1] ?? m[2] ?? m[3] ?? '').replace(/&lt;|&#x0*3c;|&#0*60;/gi, '<');
+    if (/<\s*script\b/i.test(decoded) || /\bjavascript:/i.test(decoded)) {
+      findings.push({ id: 'no-js:srcdoc-script', severity: 'high', locus: 'srcdoc', message: 'Embedded/encoded <script> or javascript: inside an iframe srcdoc is executable JS — not allowed.' });
+      break;
+    }
   }
   if (/\bdata:text\/html/i.test(html)) {
     findings.push({ id: 'no-js:data-html', severity: 'high', locus: 'data:text/html', message: 'data:text/html embeds a separate document (may carry JS) — artifacts must be a single static HTML/CSS file.' });
@@ -94,6 +102,11 @@ export function lintArtifact(html: string, opts: LintOpts = {}): Finding[] {
   // inside JS, which is already a `no-js:script` finding, so scanning raw document text just
   // produced false positives on artifacts that *display* an API code sample
   // (`<code>fetch('/v1')</code>`), wrongly setting renderUnsafe and blocking visual review.
+  // Entity-encoded URLs (e.g. `src='https:&#x2f;&#x2f;evil/x'`) are deliberately NOT decoded
+  // here: decoding entities document-wide would re-introduce false-positives on displayed
+  // code/text, and the actual egress is already prevented at the render layer by chromium's
+  // --host-resolver-rules allowlist (see render.ts) — so an entity-evaded URL cannot fetch
+  // regardless of this scan. This check stays a fast advisory pass over plain URL forms.
   const FONT_CDN_HOSTS = new Set(['fonts.googleapis.com', 'fonts.gstatic.com']);
   // Capture external resource URLs from src=, <link href>, css url(), @import, srcset.
   // quote-optional throughout (Codex E#4 cycle-2: <img src=https://evil/x> must be caught).
@@ -189,6 +202,20 @@ export function lintArtifact(html: string, opts: LintOpts = {}): Finding[] {
   for (const m of usage.matchAll(COLOR_PROP)) {
     const name = m[1].toLowerCase();
     if (!COLOR_KEYWORDS.has(name)) flagLiteral(name);
+  }
+  // (c) a committed design system means a real :root token block (Codex P2). If the CSS
+  // references var(--…) tokens but no :root{ --token: value } declares them, there is no
+  // machine-checkable token trace — fallbacks/undefined vars are not a committed system.
+  const cssText = [...styleBlocks, ...styleAttrs].join('\n');
+  const usesTokens = /var\(\s*--/.test(cssText);
+  const declaresTokens = /:root\b[^{]*\{[^}]*--[\w-]+\s*:/.test(html);
+  if (usesTokens && !declaresTokens) {
+    findings.push({
+      id: 'token-trace:no-root',
+      severity: 'high',
+      locus: ':root',
+      message: 'CSS references var(--…) tokens but declares no :root{ --token: value } block — commit a concrete design system (lift the :root block from the chosen tokens.css) before styling.',
+    });
   }
 
   // ── 4. Font denylist (medium) — impeccable also covers this; kept as a structured finding. ──

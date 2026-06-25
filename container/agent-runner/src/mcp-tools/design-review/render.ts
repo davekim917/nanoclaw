@@ -167,6 +167,11 @@ export function renderViewports(htmlPath: string, outDir: string): ViewportRende
   const results: ViewportRender[] = [];
   for (const vp of VIEWPORTS) {
     const pngPath = path.join(outDir, `${vp.name}.png`);
+    // Unlink any PNG from a PRIOR round first (Codex P2): if this chromium run times out
+    // or crashes before writing, the existence check below must not pick up a stale
+    // screenshot from an earlier artifact version (which the critic would then review as if
+    // it were the current pixels).
+    fs.rmSync(pngPath, { force: true });
     let exitOk = true;
     try {
       execFileSync(

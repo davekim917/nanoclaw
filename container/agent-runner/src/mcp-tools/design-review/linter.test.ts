@@ -164,6 +164,24 @@ describe('lintArtifact — supplement checks', () => {
     expect(f.some((x) => x.id.startsWith('network:'))).toBe(false);
   });
 
+  // ── QA cycle-5 (Codex re-review) ──
+  it('test_unquoted_srcdoc_script_flagged', () => {
+    expect(lintArtifact(`<iframe srcdoc=&lt;script&gt;alert(1)&lt;/script&gt;></iframe>`).some((x) => x.id === 'no-js:srcdoc-script')).toBe(true);
+  });
+  it('test_no_root_token_block_flagged', () => {
+    // Codex P2: var(--…) with no :root token block = no committed design system
+    const f = lintArtifact(`<style>body{color:var(--fg,#000);background:var(--bg)}</style>`);
+    expect(f.some((x) => x.id === 'token-trace:no-root')).toBe(true);
+  });
+  it('test_declared_root_with_tokens_not_no_root_flagged', () => {
+    const f = lintArtifact(`<style>:root{--fg:#141413;--bg:#faf9f5}body{color:var(--fg);background:var(--bg)}</style>`);
+    expect(f.some((x) => x.id === 'token-trace:no-root')).toBe(false);
+  });
+  it('test_no_styling_no_root_finding', () => {
+    // an artifact with no var() usage is not required to declare :root
+    expect(lintArtifact(`<main><h1>Hi</h1></main>`).some((x) => x.id === 'token-trace:no-root')).toBe(false);
+  });
+
   // ── QA cycle-3 (Codex re-review): token-trace scans CSS contexts only ──
   it('test_visible_text_hex_not_flagged', () => {
     // a hex shown as page content (colour-picker value, ticket id) is NOT CSS — no finding
@@ -211,11 +229,11 @@ describe('lintArtifact — supplement checks', () => {
     expect(lintArtifact(`<style>.x{color:rebeccapurple}</style>`).some((x) => x.id === 'token-trace:rebeccapurple')).toBe(true);
   });
   it('test_color_keyword_not_flagged', () => {
-    const f = lintArtifact(`<style>.a{color:transparent}.b{background:inherit}.c{color:var(--fg)}</style>`);
+    const f = lintArtifact(`<style>:root{--fg:#000}.a{color:transparent}.b{background:inherit}.c{color:var(--fg)}</style>`);
     expect(f.some((x) => x.id.startsWith('token-trace:'))).toBe(false);
   });
   it('test_gradient_keyword_not_false_positive', () => {
     // the gradient function name must not be mistaken for a named colour
-    expect(lintArtifact(`<style>.x{background:linear-gradient(90deg,var(--a),var(--b))}</style>`).some((x) => x.id.startsWith('token-trace:'))).toBe(false);
+    expect(lintArtifact(`<style>:root{--a:#111;--b:#222}.x{background:linear-gradient(90deg,var(--a),var(--b))}</style>`).some((x) => x.id.startsWith('token-trace:'))).toBe(false);
   });
 });

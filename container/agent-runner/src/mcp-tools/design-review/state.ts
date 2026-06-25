@@ -240,7 +240,10 @@ export function decideStatus(state: TraceState): RunStatus {
     return round >= CAP ? 'blocked' : 'continue';
   }
   if (round < CAP) return 'continue';
-  return hasHigh ? 'blocked' : 'shipped-with-disclosures';
+  // At the cap with open findings: block on any open HIGH, AND block a medium/low-only run
+  // that the mandatory critic never reviewed (Codex P2) — disclosure still requires a critic
+  // pass, since the critic is the only check for branded-generic visual slop.
+  return hasHigh || !last?.criticReviewed ? 'blocked' : 'shipped-with-disclosures';
 }
 
 export type { Severity };
