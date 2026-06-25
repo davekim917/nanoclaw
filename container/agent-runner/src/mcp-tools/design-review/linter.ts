@@ -1,0 +1,167 @@
+/**
+ * design-artifact-loop — deterministic supplement linter.
+ *
+ * impeccable (mounted in-container from ~/plugins) owns the taste-tell checks
+ * (overused fonts, AI editorial markers, em-dash overuse, etc.). This module
+ * supplements it with the artifact-specific structural/security checks impeccable
+ * does NOT cover: :root token-trace, no-JS policy, network-construct lockdown.
+ *
+ * Pure function — no DOM dependency (Bun-native regex), so no new package
+ * (supply-chain C6). Render-level checks (blank/overflow) live in render.ts and
+ * are merged by the design_review tool; this module is HTML-static only.
+ *
+ * Finding identity is `<check-key>:<locus>` so the design_review state machine
+ * can carry findings forward across rounds (R9).
+ */
+
+export type Severity = 'high' | 'medium' | 'low';
+
+export interface Finding {
+  /** Stable identity `<check-key>:<locus>` — same id across rounds = same finding. */
+  id: string;
+  severity: Severity;
+  locus: string;
+  message: string;
+}
+
+export interface LintOpts {
+  /**
+   * Marker substring an artifact may place in a CSS comment next to a
+   * deliberately-chosen denylist font to justify it (e.g. the DESIGN.md picked it).
+   * Defaults to `font-justified`.
+   */
+  fontJustificationMarker?: string;
+}
+
+/** Convergent AI-tell typefaces (mirrors impeccable's overused-font set). */
+const FONT_DENYLIST = ['Inter', 'Roboto', 'Space Grotesk', 'Geist', 'Plus Jakarta Sans', 'Fraunces'];
+
+export function lintArtifact(html: string, opts: LintOpts = {}): Finding[] {
+  const findings: Finding[] = [];
+  const marker = opts.fontJustificationMarker ?? 'font-justified';
+
+  // ── 1. No-JS policy (C8): no <script> AND no inline event handlers (also JS). ──
+  // IDs are CONTENT-keyed (the construct kind), not positional, so they stay stable
+  // across rounds for carry-forward: a finding persists while ANY instance remains.
+  if (/<script\b/i.test(html)) {
+    findings.push({
+      id: 'no-js:script',
+      severity: 'high',
+      locus: '<script>',
+      message: 'v0 artifacts are static HTML/CSS only — no <script> (inline or external) permitted.',
+    });
+  }
+  // quote-optional: catches unquoted handlers like <body onload=alert(1)> (Codex E#3 cycle-2)
+  const handlers = [...new Set(Array.from(html.matchAll(/\son([a-z]+)\s*=/gi), (m) => m[1].toLowerCase()))];
+  if (handlers.length) {
+    findings.push({
+      id: 'no-js:inline-handler',
+      severity: 'high',
+      locus: handlers.map((h) => `on${h}`).join(', '),
+      message: `Inline event handler(s) (${handlers.map((h) => `on${h}`).join(', ')}) are executable JS — not allowed.`,
+    });
+  }
+  if (/\bjavascript:/i.test(html)) {
+    findings.push({
+      id: 'no-js:javascript-url',
+      severity: 'high',
+      locus: 'javascript:',
+      message: 'javascript: URL is executable JS — not allowed in a static artifact.',
+    });
+  }
+
+  // ── 2. Network-construct lockdown (C8/C3): no egress beyond the declared font CDN. ──
+  // External resources are keyed by HOST (stable); the documented font CDN is allowlisted.
+  const FONT_CDN_HOSTS = new Set(['fonts.googleapis.com', 'fonts.gstatic.com']);
+  if (/\bfetch\s*\(/.test(html)) {
+    findings.push({ id: 'network:fetch', severity: 'high', locus: 'fetch()', message: 'fetch() is a network call — artifacts must be self-contained.' });
+  }
+  if (/\bXMLHttpRequest\b/.test(html)) {
+    findings.push({ id: 'network:xhr', severity: 'high', locus: 'XMLHttpRequest', message: 'XMLHttpRequest is a network call — artifacts must be self-contained.' });
+  }
+  // Capture external resource URLs from src=, <link href>, css url(), @import, srcset.
+  // Group 1 = scheme ("https://"|"http://"|"//"), group 2 = host. NOT <a href> (navigation, allowed).
+  // quote-optional throughout (Codex E#4 cycle-2: <img src=https://evil/x> must be caught);
+  // host group stops at / whitespace " ' > ) , so unquoted attrs terminate correctly.
+  const urlRes: RegExp[] = [
+    /\bsrc\s*=\s*["']?(https?:\/\/|\/\/)([^"'/\s>]+)/gi,
+    /\bsrcset\s*=\s*["']?[^"'>]*?(https?:\/\/|\/\/)([^"'/\s>,]+)/gi,
+    /<link\b[^>]*\bhref\s*=\s*["']?(https?:\/\/|\/\/)([^"'/\s>]+)/gi,
+    /url\(\s*["']?(https?:\/\/|\/\/)([^"')\s/]+)/gi,
+    /@import\s+(?:url\()?\s*["']?(https?:\/\/|\/\/)([^"'/\s)]+)/gi,
+  ];
+  const seenHosts = new Set<string>();
+  for (const re of urlRes) {
+    for (const m of html.matchAll(re)) {
+      const host = m[2].toLowerCase();
+      if (FONT_CDN_HOSTS.has(host) || seenHosts.has(host)) continue;
+      seenHosts.add(host);
+      findings.push({
+        id: `network:${host}`,
+        severity: 'high',
+        locus: host,
+        message: `External resource fetch to ${host} — artifacts must be self-contained (only the declared font CDN is allowed).`,
+      });
+    }
+  }
+
+  // ── 3. :root token-trace (A8): EVERY colour literal outside :root must come from a
+  // token via var(--…). Strip (a) :root blocks (token definitions live there) and
+  // (b) var(...) refs (incl. hex fallbacks), then flag remaining literals. Hardcoding is
+  // flagged even if the value is also a token (Codex E#5: reuse must not pass).
+  // NOTE: this is BEST-EFFORT regex detection — hex, the colour functions below, and bare
+  // named colours in direct colour properties. Exotic CSS (named colours inside shorthands,
+  // every CSS named colour) may slip; the L1 vision critic + sandboxed render are the
+  // backstop, and a real CSS parser (postcss) is the documented future hardening (needs a
+  // supply-chain-approved dep, deliberately deferred).
+  const usage = html
+    .replace(/:root\s*\{[^}]*\}/g, '')
+    .replace(/var\([^)]*\)/g, 'var()');
+  const seenOutsideRoot = new Set<string>();
+  const flagLiteral = (raw: string) => {
+    const lit = raw.toLowerCase().replace(/\s+/g, '');
+    if (seenOutsideRoot.has(lit)) return;
+    seenOutsideRoot.add(lit);
+    findings.push({
+      id: `token-trace:${lit}`,
+      severity: 'high',
+      locus: lit,
+      message: `Hardcoded colour ${raw} used outside :root — every colour must reference a design-system token via var(--…).`,
+    });
+  };
+  // (a) hex + colour functions (rgb/rgba/hsl/hsla/hwb/lab/lch/oklab/oklch/color())
+  const COLOR_LITERAL = /#[0-9a-fA-F]{3,8}(?![0-9a-fA-F])|\b(?:rgba?|hsla?|hwb|lab|lch|oklab|oklch|color)\([^)]*\)/gi;
+  for (const m of usage.matchAll(COLOR_LITERAL)) flagLiteral(m[0]);
+  // (b) bare named colours as a colour-property value (e.g. `color:rebeccapurple`).
+  // Excludes CSS-wide keywords and function/var values (token-trace already covers var()).
+  const COLOR_KEYWORDS = new Set(['transparent', 'currentcolor', 'inherit', 'initial', 'unset', 'revert', 'none', 'auto', 'var']);
+  const COLOR_PROP = /(?:^|[;{]\s*)(?:color|background|background-color|border-color|outline-color|fill|stroke|caret-color|text-decoration-color|column-rule-color|accent-color)\s*:\s*([a-z]+)\b(?![-(\w])/gi;
+  for (const m of usage.matchAll(COLOR_PROP)) {
+    const name = m[1].toLowerCase();
+    if (!COLOR_KEYWORDS.has(name)) flagLiteral(name);
+  }
+
+  // ── 4. Font denylist (medium) — impeccable also covers this; kept as a structured finding. ──
+  for (const font of FONT_DENYLIST) {
+    const re = new RegExp(`font-family\\s*:[^;}]*${font.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}`, 'i');
+    const m = re.exec(html);
+    if (m && !html.slice(Math.max(0, m.index - 80), m.index + 80).includes(marker)) {
+      findings.push({
+        id: `font-denylist:${font}`,
+        severity: 'medium',
+        locus: `${font} @${m.index}`,
+        message: `"${font}" is a convergent AI-tell typeface — choose a distinctive face or justify it with a /* ${marker} */ marker.`,
+      });
+    }
+  }
+
+  return findings;
+}
+
+/** Convenience: highest severity present, or null when clean. */
+export function maxSeverity(findings: Finding[]): Severity | null {
+  if (findings.some((f) => f.severity === 'high')) return 'high';
+  if (findings.some((f) => f.severity === 'medium')) return 'medium';
+  if (findings.some((f) => f.severity === 'low')) return 'low';
+  return null;
+}

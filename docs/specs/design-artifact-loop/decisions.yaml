@@ -1,0 +1,256 @@
+feature: design-artifact-loop
+created_by: /team-brief
+last_updated_by: /team-design (Codex design-review incorporated)
+
+constraints:
+  - id: C1
+    type: HARD
+    text: "Cross-provider parity: capability available and equivalent across claude/codex/opencode; provider-agnostic implementation (mounted files + instruction pattern), no provider-specific generation code."
+    source: CLAUDE.md
+    verified: false
+    affects_groups: []
+  - id: C2
+    type: HARD
+    text: "Render step must be at parity. Codex containers may carry the agent-browser skill file but not the agent-browser command. Design must verify the live image and guarantee a render command across all provider containers or define a parity-clean fallback."
+    source: brief
+    verified: true
+    affects_groups: []
+    note: "VERIFIED (F7 fix): agent-browser@0.28.0 + system chromium in the single shared image, all providers (Dockerfile:49,338,278-285; container-runner.ts:416); login-shell PATH bug fixed; render-diagram MCP tool is the fallback."
+  - id: C3
+    type: HARD
+    text: "Credential model: no raw API keys in containers; external calls via OneCLI gateway; no new secret surface."
+    source: CLAUDE.md
+    verified: false
+    affects_groups: []
+  - id: C4
+    type: HARD
+    text: "Context budget: design-system reference material must not be eager-loaded into every session; read on demand."
+    source: brief
+    verified: false
+    affects_groups: []
+  - id: C5
+    type: HARD
+    text: "License: Open Design assets are Apache-2.0; vendored assets must carry attribution and upstream license."
+    source: brief
+    verified: false
+    affects_groups: []
+  - id: C6
+    type: SOFT
+    text: "Prefer reusing existing container capabilities (skill mount, existing render tool, impeccable) over new services or large packages."
+    source: brief
+    verified: false
+    affects_groups: []
+  - id: C7
+    type: HARD
+    text: "Bounded loop: the revise loop MUST be bounded (unbounded = cost/reliability failure). Exact cap is a default (<=3, see OQ5); boundedness is non-negotiable. At cap, R9 semantics apply."
+    source: brief
+    verified: false
+    affects_groups: []
+  - id: C8
+    type: HARD
+    text: "Artifact safety/packaging: chat-delivered HTML must be self-contained or explicitly package its assets, must not leak credentials/session/internal data, and must not include unsafe external scripts/network calls unless deliberately allowed and disclosed."
+    source: brief
+    verified: false
+    affects_groups: []
+
+decisions:
+  - id: D1
+    stage: brief
+    description: "How to deliver Claude-Design-grade UI generation in nanoclaw agents."
+    chosen: "Option B — port the mechanism (author-then-conform + render-grounded iteration + separate critic + must-fix carry-forward + artifact contract) into the agent flow as a parity-clean container skill."
+    rejected:
+      - option: "Option A — integrate Open Design's daemon/MCP as core infrastructure."
+        reason: "Daemon has no model of its own; it spawns the host agent CLI -> orchestrator-inside-orchestrator (double spawn, double tokens, 5-30min latency). Breaks parity via 'provider laundering' (a codex session would get a claude-generated artifact). BYOK-vs-OneCLI auth mismatch; persistent daemon vs ephemeral containers; 8-week-old 426-issue dep as load-bearing. Validated by two independent Codex passes."
+      - option: "Rely on existing critic skills (impeccable/taste-skill) alone."
+        reason: "Critics flag tells after the fact; they do not make the agent commit a coherent system up front. Operator tried them and output still looked AI."
+    constraint_refs: [C1, C3]
+    affects_groups: []
+  - id: D2
+    stage: brief
+    description: "Exports (PPTX/MP4/PDF) and daemon integration scope for v0."
+    chosen: "Out of scope for v0; exports reserved as a demand-gated escape hatch for a later phase."
+    rejected:
+      - option: "Include exports in v0 (would pull in the daemon or heavy libs)."
+        reason: "Chat-delivered HTML + preview image is the ~95% case; exports are demand-gated and would force daemon/lib integration prematurely (Codex Q3)."
+    constraint_refs: [C6]
+    affects_groups: []
+  - id: D3
+    stage: design
+    description: "How to orchestrate the render-grounded loop parity-clean in-container."
+    chosen: "Option B — mounted skill (SKILL.md + vendored design-systems + index) + a new provider-agnostic MCP tool `design_review` (render + deterministic linter + structured findings + must-fix carry-forward + cap/R9 gate) + a fresh-context taste critic."
+    rejected:
+      - option: "Option A — pure instruction-only skill (SKILL.md + bundled scripts, no runner code)."
+        reason: "Loop enforcement would be prompt-only; the deterministic gate and must-fix carry-forward become 'please run the script', which is exactly Codex's ritual-theater failure mode."
+      - option: "Option C — full in-runner convergence controller."
+        reason: "Architectural inversion — an MCP tool calling back into the agent for generation inverts nanoclaw's 'agent is the planner' model (not merely over-engineered). Re-creates the daemon-in-orchestrator pattern we explicitly rejected (NG1 spirit) one level down. (Codex design-review Q1.)"
+    constraint_refs: [C1, C2, C6, C7]
+    affects_groups: []
+  - id: D5
+    stage: review
+    description: "How design-artifact-loop relates to the existing overlapping render-verify skill (Reviewer A F5)."
+    chosen: "Build standalone; REMOVE the overlapping upstream skill container/skills/frontend-engineer (gavrielc Apr-2026 boilerplate, a Vercel build/deploy skill, not operator-authored, explicitly unwanted). No reconciliation needed once removed."
+    rejected:
+      - option: "Compose with / reuse frontend-engineer's render-verify primitive."
+        reason: "Operator will never use frontend-engineer; depending on unwanted upstream boilerplate is worse than removing it."
+      - option: "Ignore frontend-engineer, leave it mounted."
+        reason: "Still eats container context every session and can fire on 'design a UI' intent — removal is the root fix."
+    constraint_refs: [C1]
+    affects_groups: []
+  - id: D4
+    stage: design
+    description: "In-container independent critic composition (R5). CORRECTED 2026-06-25: impeccable is NOT host-only — it is mounted into every container from ~/plugins (container-runner.ts:1363-1391, /workspace/plugins/impeccable, CLAUDE_PLUGINS_ROOT auto-discovery). Earlier 'host-only' claim was wrong (checked Dockerfile image, missed the ~/plugins mount)."
+    chosen: "Deterministic layer = REUSE impeccable's design hook/skill (already in-container) rather than a from-scratch bundled linter — only add the few checks impeccable lacks (e.g. :root token-trace, no-JS). PLUS an L1 taste critic (separate process, same provider) that READS the screenshot PNG from the shared workspace (Read yields a vision block — types.ts:79-83 'base64 image blocks the agent Read' — NOT a message attachment, which the inbound formatter would degrade to a text ref per formatter.ts:480-493). Independence levels unchanged: L0 self-review NOT allowed; L1 = v0 bar; L2 cross-model deferred."
+    rejected:
+      - option: "Build a from-scratch bundled deterministic linter because impeccable is host-only."
+        reason: "FALSE PREMISE — impeccable IS in-container via the ~/plugins mount (operator-confirmed 2026-06-25). Reinventing it duplicates a maintained plugin."
+      - option: "Pass the screenshot to the critic as a chat-message attachment."
+        reason: "The inbound formatter (formatter.ts:480-493) degrades attached images to TEXT references — no vision. The critic must READ the file from disk to get a vision block."
+    rejected:
+      - option: "Use impeccable as the in-container critic."
+        reason: "Verified host-only — not installed in the container image (Dockerfile has no install line)."
+      - option: "Agent self-reviews its own output as the critic."
+        reason: "Not independent of generation; violates R5; risks ritual-theater logs over real differentiation."
+    constraint_refs: [C1, C6]
+    affects_groups: []
+
+waivers: []
+
+assumptions:
+  - id: A1
+    stage: brief
+    text: "A parity-clean instruction pattern (mounted skill) can reproduce the materially-important part of Open Design's loop — render-grounded iteration + separate critic + must-fix carry-forward — without the daemon's deterministic marker-parse gate."
+    validation: "Design + build produce equivalent non-slop output across all three providers on a held-out task (SC1/SC3)."
+    validated: false
+    invalidated_at: null
+  - id: A2
+    stage: brief
+    text: "An agent-browser-equivalent render+screenshot capability can be made available across claude/codex/opencode containers (or a parity-clean fallback exists)."
+    validation: "Verify against the live container image during /team-design (C2)."
+    validated: true
+    invalidated_at: null
+    note: "VALIDATED in /team-design: agent-browser@0.28.0 + system chromium in the single shared image (Dockerfile:49,338,278-285); all providers spawn same image (container-runner.ts:416); login-shell PATH bug fixed (Dockerfile:362-370). render-diagram MCP tool is a fallback."
+  - id: A3
+    stage: design
+    text: "A new container/skills/<name> dir surfaces to Codex AND OpenCode (not just Claude) via existing per-provider skill sync."
+    validation: "Parity smoke test in /team-build: spawn the skill in claude, codex, opencode sessions; confirm discover+invoke. If not auto, wire into codex-companion-setup + opencode skill sync."
+    validated: false
+    invalidated_at: null
+  - id: A4
+    stage: design
+    text: "A fresh-context L1 critic can READ the screenshot PNG from disk and get a VISION block. PARTIALLY VALIDATED 2026-06-25 (operator challenge): confirmed for Claude — types.ts:79-83 documents 'base64 image blocks the agent Read' (the agent's Read tool yields vision). The F4 text-ref concern was the inbound CHAT-message formatter (formatter.ts:480-493) — a DIFFERENT path the critic avoids by READING the file, not receiving an attachment. Residual: confirm Codex/OpenCode Read-equivalent yields vision in-container."
+    validation: "Bounded spike: in a codex and an opencode container, have a critic Read a sentinel PNG and confirm it reports a render-only detail (Claude path already evidenced). Critic must READ the file, not receive it as an attachment."
+    validated: partial
+    invalidated_at: null
+  - id: A5
+    stage: design
+    text: "The deterministic linter's mechanical checks are meaningful signal, not noise."
+    validation: "Validate findings against the 3-fixture set: slop baseline should fail; this session's two good renders should pass."
+    validated: false
+    invalidated_at: null
+  - id: A6
+    stage: design
+    text: "~15-20 curated systems + on-demand read stays within the C4 context budget."
+    validation: "Measure skill-mount + index token cost at spawn; confirm DESIGN.md read only when selected."
+    validated: false
+    invalidated_at: null
+  - id: A7
+    stage: design
+    text: "design_review MCP tool is INVOCABLE (not just present) on all three providers, parity-tested independently of skill discovery ('MCP tools are shared' is necessary not sufficient)."
+    validation: "Parity spike step 1: call design_review directly in claude/codex/opencode sessions."
+    validated: false
+    invalidated_at: null
+  - id: A8
+    stage: design
+    text: "Token-trace is enforceable from generated HTML via the required :root token block (raw non-token color/type/space values outside the allowlist are detectable by the linter)."
+    validation: "Linter unit test: an artifact with hardcoded hex outside :root must be flagged."
+    validated: false
+    invalidated_at: null
+
+forced_defaults:
+  - id: OQ1
+    text: "Vendor a curated ~15-20 design systems + index (not all 151)."
+    alternative: "Vendor all 151 systems."
+    rationale: "C4 context budget; remainder are on-demand reference data."
+  - id: OQ2
+    text: "v0 independent critic = a deterministic in-container linter (replaces host-only impeccable, which is NOT in containers per D4) + an L1 fresh critic pass (separate process, did not author the design, judges only {screenshot PNG, DESIGN.md, rubric}, must prove vision ingestion). The generator's own self-review (L0) does NOT count (would violate R5). Superseded by D4 — kept in sync (Codex cycle-4 must-fix #2: removed stale 'impeccable')."
+    alternative: "Cross-model critic (different provider judging) in v0 = L2."
+    rationale: "Keeps R5 independence honest and v0-feasible; impeccable is host-only so the linter is the deterministic layer; cross-model (L2) is a later enhancement."
+  - id: OQ3
+    text: "Activation = explicit invocation + design-intent detection."
+    alternative: "Always-on for any output."
+    rationale: "Scope the loop to UI design tasks; avoid overhead on non-design turns."
+  - id: OQ4
+    text: "Lives as a container skill mounted into every agent session; design MUST verify actual provider consumption (Codex $skill / OpenCode surfacing), not assume it."
+    alternative: "Per-group opt-in install."
+    rationale: "Parity-clean; all three providers consume mounted skills identically."
+  - id: OQ5
+    text: "Loop cap default = <=3 revision rounds (boundedness itself is HARD, C7)."
+    alternative: "A different fixed cap."
+    rationale: "Bound cost/latency; tunable later."
+
+review_cycles:
+  - stage: brief
+    reviewer: codex
+    iteration: 1
+    verdict: APPROVE-WITH-CHANGES
+    must_fix_count: 3
+    should_fix_count: 3
+    nice_to_have_count: 1
+    resolution: "All 7 accepted and applied. must-fix: split R2 (->R2 simplified), strengthen C2 render-parity definition, add R9 cap semantics. should-fix: C7->HARD bounded loop (+OQ5 cap default), tighten OQ2 to genuinely-independent fresh critic, SC3 measurable rubric/fixture. nice-to-have: added C8 artifact safety/packaging."
+    completed_at: 2026-06-24
+  - stage: design
+    reviewer: codex
+    iteration: 1
+    verdict: APPROVE-WITH-CHANGES
+    must_fix_count: 3
+    should_fix_count: 2
+    nice_to_have_count: 1
+    resolution: "All 6 accepted and applied. must-fix: added explicit severity taxonomy + finding-identity + status state machine (R9 trace schema); defined critic independence levels L0/L1/L2 (L0 self-review disqualified, v0 bar=L1 separate-process screenshot-ingesting, L2 cross-model deferred) and stopped calling v0 critic 'genuinely independent'; expanded parity spike to INVOKE design_review + prove screenshot ingestion (added mandatory pre-implementation parity spike gate, assumptions A7/A4-revised). should-fix: exact render commands + blank(<2KB / >98% one-color)/overflow(scrollWidth>vw+2px)/CDN-failure thresholds; token-trace via required :root block instead of heuristics (A8). nice-to-have: normalized assumption numbering between design.md and decisions.yaml. Also: Option C reason -> 'architectural inversion'."
+    completed_at: 2026-06-24
+
+  - stage: review
+    reviewer: architecture-advisor (Reviewer A, codebase-grounded)
+    iteration: 3
+    verdict: MUST-FIX-PRESENT-NOW-RESOLVED
+    must_fix_count: 3
+    should_fix_count: 4
+    escalated_count: 1
+    note: "Reviewer A (codebase-grounded). F5 (frontend-engineer overlap) ESCALATED to user -> RESOLVED: user confirmed never uses it; skill REMOVED (D5), build standalone. F1 (disk-backed state, not MCP module memory torn down per-query on Codex) + F2 (/workspace/agent not /workspace/outbox) APPLIED to design. F4 (vision ingestion unproven - images arrive as text refs; OpenCode no same-provider subagent -> codex exec L2) APPLIED: spike must PROVE vision per provider. F3 (OpenCode skill=text-injection not loader) + F6 (egress-lockdown font CDN moot) + F7 (C2 verified flag reconciled) + F8 (linter flags all network constructs) APPLIED. Reviewers B/C to run on the revised design (cycle 4)."
+    completed_at: 2026-06-24
+
+  - stage: review
+    reviewer: codex (Reviewer C, adversarial, on revised design)
+    iteration: 4
+    verdict: APPROVE-WITH-CHANGES-NOW-RESOLVED
+    must_fix_count: 2
+    should_fix_count: 2
+    note: "Confirmed F1/F2/F4 fixes hold + removal clean. Applied all 4: (must-fix) atomic write-temp-rename + advisory lock + crash-recovery on trace.json; fixed stale OQ2 (removed impeccable, match D4). (should-fix) no-JS v0 policy (any <script> = high severity); explicit pixel-only vision sentinel fixture in the spike. Reviewer B (best-practice) skipped — near-zero external-pattern signal for internal multi-provider agent tooling; substituted by 2x Codex + architecture-advisor passes. Stage A CLEAR: MUST-FIX=0."
+    completed_at: 2026-06-24
+
+auto_qa_cycles:
+  - iteration: 1
+    validators: [denoise, style, docs, code-review-CD, codex-E]
+    must_fix_count: 8
+    should_fix_count: 4
+    resolution: "CD found 2 BUG (positional IDs; egress false-negatives); Codex E found ~6 MUST-FIX (path traversal id:'..'; symlink escape; token-trace reuse+non-hex; read-merge-write race; stale-critic-findings versioning; +egress/JS overlap). ALL fixed with regression tests. Deferred SHOULD-FIX: font shorthand, busy-wait, render-diagram flags, exotic-CSS color best-effort."
+    completed_at: 2026-06-25
+  - iteration: 2
+    validators: [codex-E-reverify]
+    must_fix_count: 4
+    should_fix_count: 0
+    resolution: "Codex re-review found 4 second-order evasions: run-dir symlink escape (#2), unquoted inline handler (#3), unquoted external src (#4), named/oklch colors (#5). ALL fixed + verified (tests encode the exact evasions; symlink probe confirms #2). Residual exotic-CSS color coverage classified as documented best-effort (vision critic + sandbox backstop; postcss parser = deferred dep-gated hardening) — NOT a blocker. design-review 63 tests pass; full suite 659 pass; typecheck clean."
+    completed_at: 2026-06-25
+
+auto_judgments:
+  - stage: QA
+    iteration: 2
+    decision: "Stop the regex-linter evasion arms-race after cycle-2; classify exotic-CSS colour coverage as documented best-effort rather than chase every CSS syntax."
+    grounding:
+      - "container/agent-runner/src/mcp-tools/design-review/linter.ts — best-effort note + the L1 vision critic / sandboxed render / impeccable backstop (design D4)"
+      - "team-qa anti-pattern: a finding-class reappearing across loops is a design issue (regex vs full parser) — real fix is postcss, which is dep-gated/deferred"
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-06-25

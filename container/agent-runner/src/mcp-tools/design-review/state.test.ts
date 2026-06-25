@@ -1,0 +1,116 @@
+import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import {
+  readState, writeState, mergeRound, openFindings, decideStatus, recordRound, CAP,
+  type TraceState,
+} from './state.js';
+import type { Finding } from './linter.js';
+
+let base: string;
+beforeEach(() => { base = fs.mkdtempSync(path.join(os.tmpdir(), 'dal-state-')); });
+afterEach(() => { fs.rmSync(base, { recursive: true, force: true }); });
+
+const F = (id: string, severity: Finding['severity'] = 'high'): Finding => ({
+  id, severity, locus: id, message: id,
+});
+
+describe('state machine — disk-atomic + carry-forward + R9', () => {
+  it('test_fresh_id_starts_empty', () => {
+    const s = readState('abc', base);
+    expect(s.rounds).toHaveLength(0);
+    expect(s.finalStatus).toBeNull();
+  });
+
+  it('test_atomic_write_no_partial', () => {
+    let s = readState('x', base);
+    s = mergeRound(s, [F('no-js:0')]);
+    writeState(s, base);
+    const dir = path.join(base, 'x');
+    // no leftover temp/lock, and trace.json is valid JSON
+    const leftovers = fs.readdirSync(dir).filter((f) => f.includes('.tmp.') || f.endsWith('.lock'));
+    expect(leftovers).toHaveLength(0);
+    expect(() => JSON.parse(fs.readFileSync(path.join(dir, 'trace.json'), 'utf-8'))).not.toThrow();
+  });
+
+  it('test_roundtrip_persists', () => {
+    let s = readState('rt', base);
+    s = mergeRound(s, [F('token-trace:#fff')]);
+    writeState(s, base);
+    const reloaded = readState('rt', base);
+    expect(reloaded.rounds).toHaveLength(1);
+    expect(reloaded.rounds[0].findings[0].id).toBe('token-trace:#fff');
+  });
+
+  it('test_carry_forward_marks_unresolved', () => {
+    let s: TraceState = readState('cf', base);
+    s = mergeRound(s, [F('font-denylist:Inter', 'medium')]);          // round 1
+    s = mergeRound(s, [F('font-denylist:Inter', 'medium')]);          // round 2, still present
+    const last = s.rounds[s.rounds.length - 1];
+    const inter = last.findings.find((f) => f.id === 'font-denylist:Inter');
+    expect(inter!.state).toBe('unresolved');
+    // not duplicated within the round
+    expect(last.findings.filter((f) => f.id === 'font-denylist:Inter')).toHaveLength(1);
+  });
+
+  it('test_resolved_when_absent_next_round', () => {
+    let s = readState('rs', base);
+    s = mergeRound(s, [F('no-js:0')]);   // round 1
+    s = mergeRound(s, []);               // round 2 — fixed
+    const last = s.rounds[s.rounds.length - 1];
+    expect(last.findings.find((f) => f.id === 'no-js:0')!.state).toBe('resolved');
+    expect(openFindings(s)).toHaveLength(0);
+  });
+
+  it('test_continue_below_cap_with_open', () => {
+    let s = readState('c1', base);
+    s = mergeRound(s, [F('no-js:0')]); // round 1, open high
+    expect(decideStatus(s)).toBe('continue');
+  });
+
+  it('test_cap3_blocks_on_open_high', () => {
+    let s = readState('cap', base);
+    for (let i = 0; i < CAP; i++) s = mergeRound(s, [F('no-js:0')]); // 3 rounds, still open high
+    expect(s.rounds[s.rounds.length - 1].round).toBe(CAP);
+    expect(decideStatus(s)).toBe('blocked');
+  });
+
+  it('test_cap3_discloses_when_only_medium', () => {
+    let s = readState('cap2', base);
+    for (let i = 0; i < CAP; i++) s = mergeRound(s, [F('font-denylist:Inter', 'medium')]);
+    expect(decideStatus(s)).toBe('shipped-with-disclosures');
+  });
+
+  it('test_clean_round_ships', () => {
+    let s = readState('clean', base);
+    s = mergeRound(s, []); // nothing flagged
+    expect(decideStatus(s)).toBe('shipped-with-disclosures');
+    expect(openFindings(s)).toHaveLength(0);
+  });
+
+  it('test_recordRound_transactional_carry_forward', () => {
+    const r1 = recordRound('rr', [F('no-js:script'), F('font-denylist:Inter', 'medium')], base);
+    expect(r1.status).toBe('continue');
+    expect(r1.mustFixOpen.map((f) => f.id)).toContain('no-js:script'); // only HIGH in mustFixOpen
+    expect(r1.mustFixOpen.map((f) => f.id)).not.toContain('font-denylist:Inter');
+    const r2 = recordRound('rr', [F('font-denylist:Inter', 'medium')], base); // script fixed
+    expect(r2.mustFixOpen).toHaveLength(0);
+    // round 2 persisted on disk via the transactional write
+    expect(readState('rr', base).rounds).toHaveLength(2);
+    expect(r2.state.rounds[1].findings.find((f) => f.id === 'no-js:script')!.state).toBe('resolved');
+  });
+
+  it('test_concurrent_writes_do_not_corrupt', async () => {
+    // fire several writes at the same id concurrently; final trace.json must be valid
+    const writes = Array.from({ length: 8 }, (_, i) => {
+      let s = readState('race', base);
+      s = mergeRound(s, [F(`no-js:${i}`)]);
+      return Promise.resolve().then(() => writeState(s, base));
+    });
+    await Promise.all(writes);
+    const dir = path.join(base, 'race');
+    expect(fs.readdirSync(dir).filter((f) => f.includes('.tmp.'))).toHaveLength(0);
+    expect(() => JSON.parse(fs.readFileSync(path.join(dir, 'trace.json'), 'utf-8'))).not.toThrow();
+  });
+});

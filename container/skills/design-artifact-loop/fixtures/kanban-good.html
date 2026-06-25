@@ -1,0 +1,11 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Board</title><style>
+:root{--bg:#f5f4ed;--surface:#faf9f5;--fg:#141413;--muted:#5e5d59;--accent:#c96442;--border:#f0eee6}
+*{box-sizing:border-box;margin:0}body{background:var(--bg);color:var(--fg);font-family:"Newsreader",Georgia,serif}
+.board{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;padding:24px}
+.col{border-left:1px solid var(--border);padding:0 12px}.card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px;margin:10px 0}
+.cta{background:var(--accent);color:var(--surface);border:none;border-radius:8px;padding:8px 14px}
+</style></head><body><main class="board">
+<section class="col"><h2>Backlog</h2><article class="card">Audit onboarding</article><button class="cta">New</button></section>
+<section class="col"><h2>In progress</h2><article class="card">SSE retry</article></section>
+<section class="col"><h2>Done</h2><article class="card">Secret scoping</article></section>
+</main></body></html>
