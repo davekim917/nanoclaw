@@ -119,6 +119,7 @@ function normalizeCritic(input: unknown): Finding[] {
         severity: sev,
         locus,
         message: typeof o.message === 'string' ? o.message : 'critic finding',
+        source: 'critic',
       });
     }
   }

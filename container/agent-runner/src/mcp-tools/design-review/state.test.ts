@@ -93,13 +93,46 @@ describe('state machine — disk-atomic + carry-forward + R9', () => {
     expect(openFindings(s)).toHaveLength(0);
   });
 
-  it('test_clean_but_uncritiqued_ships_at_cap', () => {
-    // degenerate terminal case: agent ignored the critic directive for all rounds —
-    // the loop must still terminate at the cap rather than spin forever.
+  it('test_clean_but_uncritiqued_blocks_at_cap', () => {
+    // Codex P1: agent ignored the critic directive for all rounds — at the cap the loop must
+    // terminate, but it must NOT ship an artifact the mandatory visual critic never reviewed.
     let s = readState('clean-cap', base);
     for (let i = 0; i < CAP; i++) s = mergeRound(s, []); // clean every round, never critiqued
     expect(s.rounds[s.rounds.length - 1].round).toBe(CAP);
-    expect(decideStatus(s)).toBe('shipped-with-disclosures');
+    expect(decideStatus(s)).toBe('blocked');
+  });
+
+  it('test_critic_high_stays_open_across_uncritiqued_revision', () => {
+    // Codex P1: a critic-sourced HIGH must not silently resolve when the agent revises
+    // without re-running the critic.
+    const critic: Finding = { id: 'taste-high:hero', severity: 'high', locus: 'hero', message: 'generic', source: 'critic' };
+    let s = readState('cc', base);
+    s = mergeRound(s, [critic], true);   // round 1: critic reviewed, flagged a high
+    s = mergeRound(s, [], false);        // round 2: agent revised, did NOT re-run critic
+    const open = openFindings(s);
+    expect(open.some((f) => f.id === 'taste-high:hero')).toBe(true); // still open, not dropped
+    // round 3: a fresh critic pass omits it ⇒ now it clears
+    s = mergeRound(s, [], true);
+    expect(openFindings(s).some((f) => f.id === 'taste-high:hero')).toBe(false);
+  });
+
+  it('test_deterministic_finding_resolves_normally', () => {
+    // a lint/render finding (no source) still resolves by absence — only critic findings are sticky
+    let s = readState('det', base);
+    s = mergeRound(s, [F('no-js:script')]);
+    s = mergeRound(s, []); // fixed
+    expect(openFindings(s)).toHaveLength(0);
+  });
+
+  it('test_terminal_cap_no_round_four', () => {
+    // Codex P2: once a terminal status is recorded, recordRound must not append round 4+.
+    for (let i = 0; i < CAP; i++) recordRound('term', [F('no-js:script')], base); // 3 rounds → blocked
+    const afterCap = readState('term', base);
+    expect(afterCap.finalStatus).toBe('blocked');
+    expect(afterCap.rounds).toHaveLength(CAP);
+    const r4 = recordRound('term', [F('no-js:script')], base); // further call
+    expect(r4.status).toBe('blocked');
+    expect(readState('term', base).rounds).toHaveLength(CAP); // still 3 — no round 4 appended
   });
 
   it('test_recordRound_transactional_carry_forward', () => {

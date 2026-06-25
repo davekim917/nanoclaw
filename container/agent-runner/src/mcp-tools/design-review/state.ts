@@ -103,6 +103,16 @@ export function recordRound(
   acquireLock(lock, owner);
   try {
     const prior = readState(id, baseDir);
+    // Terminal-cap enforcement (Codex P2): once a run has recorded a terminal status
+    // (blocked / shipped-with-disclosures), the bounded loop is OVER — do not append round
+    // 4+. Return the existing terminal state so a stale agent can't keep revising past the cap.
+    if (prior.finalStatus) {
+      return {
+        state: prior,
+        status: prior.finalStatus,
+        mustFixOpen: openFindings(prior).filter((f) => f.severity === 'high'),
+      };
+    }
     const next = mergeRound(prior, roundFindings, criticReviewed);
     const status = decideStatus(next);
     next.finalStatus = status === 'continue' ? null : status;
@@ -165,6 +175,13 @@ function spin(ms: number): void {
  * Carry-forward merge: diff this round's findings against the previous round by
  * stable id. Present-before-and-now = unresolved; present-before-not-now = resolved;
  * new id = new. (R9 carry-forward — Reviewer findings must not be silently dropped.)
+ *
+ * Critic-sourced findings (source==='critic') are special (Codex P1): they are only
+ * present when the agent re-supplies them, so their ABSENCE does not mean "fixed" unless a
+ * fresh critic pass actually reviewed the current artifact (criticReviewed). Otherwise a
+ * visual HIGH would silently flip to `resolved` the moment the agent revised the HTML
+ * without re-running the critic — and could ship. So an absent critic finding is kept
+ * `unresolved` until a real critic pass for the new version clears it.
  */
 export function mergeRound(state: TraceState, roundFindings: Finding[], criticReviewed = false): TraceState {
   const prev = state.rounds[state.rounds.length - 1];
@@ -175,9 +192,13 @@ export function mergeRound(state: TraceState, roundFindings: Finding[], criticRe
     ...f,
     state: prevIds.has(f.id) ? 'unresolved' : 'new',
   }));
-  // Carry forward previously-seen findings that are now gone, marked resolved.
+  // Carry forward previously-seen findings that are now gone.
   for (const pf of prev?.findings ?? []) {
-    if (!nowIds.has(pf.id)) tracked.push({ ...pf, state: 'resolved' });
+    if (nowIds.has(pf.id)) continue;
+    // A critic finding only clears when a fresh critic pass (this round) re-reviewed and
+    // omitted it; without that, keep it open so an uncritiqued revision can't drop it.
+    const clears = pf.source !== 'critic' || criticReviewed;
+    tracked.push({ ...pf, state: clears ? 'resolved' : 'unresolved' });
   }
 
   const round = (prev?.round ?? 0) + 1;
@@ -205,8 +226,10 @@ export function decideStatus(state: TraceState): RunStatus {
   const open = openFindings(state);
   const hasHigh = open.some((f) => f.severity === 'high');
   if (open.length === 0) {
-    // clean → ship only once the critic has reviewed this version (or the cap forces it)
-    return last?.criticReviewed || round >= CAP ? 'shipped-with-disclosures' : 'continue';
+    if (last?.criticReviewed) return 'shipped-with-disclosures'; // clean AND critic-reviewed → ship
+    // clean but the mandatory critic never reviewed this version: keep looping while rounds
+    // remain; at the cap, do NOT ship un-reviewed (Codex P1) — block so it surfaces to the user.
+    return round >= CAP ? 'blocked' : 'continue';
   }
   if (round < CAP) return 'continue';
   return hasHigh ? 'blocked' : 'shipped-with-disclosures';

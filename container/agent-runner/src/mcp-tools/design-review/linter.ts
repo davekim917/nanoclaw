@@ -22,6 +22,13 @@ export interface Finding {
   severity: Severity;
   locus: string;
   message: string;
+  /**
+   * Provenance. Deterministic findings (lint/render) are re-derived every round, so their
+   * absence means "fixed". A `critic` finding is only present when the agent supplies it, so
+   * its absence does NOT mean fixed unless a fresh critic pass reviewed the current version —
+   * the state machine keeps it open until then (see mergeRound). Omitted ⇒ deterministic.
+   */
+  source?: 'lint' | 'render' | 'critic';
 }
 
 export interface LintOpts {
@@ -69,6 +76,16 @@ export function lintArtifact(html: string, opts: LintOpts = {}): Finding[] {
       message: 'javascript: URL is executable JS — not allowed in a static artifact.',
     });
   }
+  // Embedded documents can smuggle JS past the literal <script> scan (Codex P1): an
+  // ENTITY-encoded script inside srcdoc (`srcdoc="&lt;script&gt;…"`), or a data:text/html
+  // payload. (A *literal* <script> inside srcdoc is already caught above.) Render egress is
+  // blocked at the chromium layer, so this is a delivery-cleanliness check, not the boundary.
+  if (/\bsrcdoc\s*=\s*["'][^"']*(?:&lt;\s*script\b|&#x3c;\s*script\b)/i.test(html)) {
+    findings.push({ id: 'no-js:srcdoc-script', severity: 'high', locus: 'srcdoc', message: 'Encoded <script> inside an iframe srcdoc is executable JS — not allowed.' });
+  }
+  if (/\bdata:text\/html/i.test(html)) {
+    findings.push({ id: 'no-js:data-html', severity: 'high', locus: 'data:text/html', message: 'data:text/html embeds a separate document (may carry JS) — artifacts must be a single static HTML/CSS file.' });
+  }
 
   // ── 2. Network-construct lockdown (C8/C3): no egress beyond the declared font CDN. ──
   // External resources are keyed by HOST (stable); the documented font CDN is allowlisted.
@@ -96,13 +113,19 @@ export function lintArtifact(html: string, opts: LintOpts = {}): Finding[] {
     });
   };
   // Single-URL constructs: group 2 = host[+path], stops at quote/space/> (so unquoted attrs terminate).
-  // <base href> is included (Codex P1): an external base silently rewrites EVERY relative
-  // resource URL to that origin (`<base href="https://evil/"><img src="/p.png">` → egress),
-  // so an external base must trip the lockdown and skip render just like a direct external src.
+  // - `(?<![-\w])src` requires a real attribute boundary so `data-src` (lazy-load METADATA the
+  //   browser does NOT fetch without JS) is not a false `network:` finding (Codex P2).
+  // - <base href> (Codex P1): an external base silently rewrites EVERY relative resource URL
+  //   to that origin, so it must trip the lockdown like a direct external src.
+  // - <object data> + poster (video/audio): fetchable resources. This list is NOT exhaustive
+  //   by design — the render's --host-resolver-rules allowlist is the actual egress boundary,
+  //   so these patterns are fast advisory feedback, not a security guarantee.
   const urlRes: RegExp[] = [
-    /\bsrc\s*=\s*["']?(https?:\/\/|\/\/)([^"'\s>]+)/gi,
+    /(?<![-\w])src\s*=\s*["']?(https?:\/\/|\/\/)([^"'\s>]+)/gi,
     /<link\b[^>]*\bhref\s*=\s*["']?(https?:\/\/|\/\/)([^"'\s>]+)/gi,
     /<base\b[^>]*\bhref\s*=\s*["']?(https?:\/\/|\/\/)([^"'\s>]+)/gi,
+    /<object\b[^>]*\bdata\s*=\s*["']?(https?:\/\/|\/\/)([^"'\s>]+)/gi,
+    /\bposter\s*=\s*["']?(https?:\/\/|\/\/)([^"'\s>]+)/gi,
     /url\(\s*["']?(https?:\/\/|\/\/)([^"')\s]+)/gi,
     /@import\s+(?:url\()?\s*["']?(https?:\/\/|\/\/)([^"'\s)]+)/gi,
   ];
@@ -117,15 +140,25 @@ export function lintArtifact(html: string, opts: LintOpts = {}): Finding[] {
   }
 
   // ── 3. :root token-trace (A8): EVERY colour literal outside :root must come from a
-  // token via var(--…). Strip (a) :root blocks (token definitions live there) and
-  // (b) var(...) refs (incl. hex fallbacks), then flag remaining literals. Hardcoding is
-  // flagged even if the value is also a token (Codex E#5: reuse must not pass).
-  // NOTE: this is BEST-EFFORT regex detection — hex, the colour functions below, and bare
-  // named colours in direct colour properties. Exotic CSS (named colours inside shorthands,
-  // every CSS named colour) may slip; the L1 vision critic + sandboxed render are the
-  // backstop, and a real CSS parser (postcss) is the documented future hardening (needs a
-  // supply-chain-approved dep, deliberately deferred).
-  const usage = html
+  // token via var(--…). Scan only CSS CONTEXTS — `<style>` block bodies + `style="…"`
+  // attribute values — NOT the whole document, so visible page text like a colour-picker
+  // label `#ff0000` or a ticket id `#123456` is not mistaken for a hardcoded colour (Codex
+  // P2). Each fragment is `;`-wrapped so a colour at the START of an inline style
+  // (`style="color:red"`) still sits behind a `[;{]` boundary for the named-colour scan.
+  // Then strip (a) :root blocks (token definitions) and (b) var(...) refs (incl. hex
+  // fallbacks) and flag remaining literals — hardcoding is flagged even if the value is also
+  // a token (Codex E#5).
+  // NOTE: BEST-EFFORT regex detection (hex, the colour functions below, bare named colours
+  // in colour properties). Exotic CSS may slip; the L1 vision critic + sandboxed render are
+  // the backstop, and a real CSS parser is the documented future hardening (supply-chain-
+  // approved dep, deliberately deferred). Non-colour token conformance (spacing/radii) and
+  // WCAG contrast are intentionally the CRITIC's job (it sees the render + DESIGN.md), not
+  // this deterministic linter's — adding half-built versions here would be false confidence.
+  const styleBlocks = Array.from(html.matchAll(/<style\b[^>]*>([\s\S]*?)<\/style>/gi), (m) => m[1]);
+  const styleAttrs = Array.from(html.matchAll(/\bstyle\s*=\s*(?:"([^"]*)"|'([^']*)')/gi), (m) => m[1] ?? m[2] ?? '');
+  const usage = [...styleBlocks, ...styleAttrs]
+    .map((c) => `;${c};`)
+    .join('\n')
     .replace(/:root\s*\{[^}]*\}/g, '')
     .replace(/var\([^)]*\)/g, 'var()');
   const seenOutsideRoot = new Set<string>();

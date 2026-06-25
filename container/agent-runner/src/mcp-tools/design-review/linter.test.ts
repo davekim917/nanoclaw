@@ -121,6 +121,38 @@ describe('lintArtifact — supplement checks', () => {
     // a same-document relative base does not egress
     expect(lintArtifact(`<base href="/assets/">`).some((x) => x.id.startsWith('network:'))).toBe(false);
   });
+  it('test_object_data_flagged', () => {
+    expect(lintArtifact(`<object data="https://evil.example/p.svg"></object>`).some((x) => x.id === 'network:evil.example')).toBe(true);
+  });
+  it('test_poster_flagged', () => {
+    expect(lintArtifact(`<video poster="https://evil.example/p.png"></video>`).some((x) => x.id === 'network:evil.example')).toBe(true);
+  });
+  it('test_data_src_not_a_fetch', () => {
+    // Codex P2: data-src is lazy-load metadata, not a browser fetch — must NOT be flagged
+    expect(lintArtifact(`<div data-src="https://example.com/mock.png">x</div>`).some((x) => x.id.startsWith('network:'))).toBe(false);
+  });
+  it('test_real_src_still_flagged_after_boundary_fix', () => {
+    expect(lintArtifact(`<img src="https://evil.example/a.png">`).some((x) => x.id === 'network:evil.example')).toBe(true);
+  });
+  it('test_encoded_srcdoc_script_flagged', () => {
+    expect(lintArtifact(`<iframe srcdoc="&lt;script&gt;alert(1)&lt;/script&gt;"></iframe>`).some((x) => x.id === 'no-js:srcdoc-script')).toBe(true);
+  });
+  it('test_data_text_html_flagged', () => {
+    expect(lintArtifact(`<iframe src="data:text/html;base64,PHNjcmlwdD4="></iframe>`).some((x) => x.id === 'no-js:data-html')).toBe(true);
+  });
+
+  // ── QA cycle-3 (Codex re-review): token-trace scans CSS contexts only ──
+  it('test_visible_text_hex_not_flagged', () => {
+    // a hex shown as page content (colour-picker value, ticket id) is NOT CSS — no finding
+    const f = lintArtifact(`<style>:root{--c:#000}body{color:var(--c)}</style><span>#ff0000</span><p>ticket #123456</p>`);
+    expect(f.some((x) => x.id.startsWith('token-trace:'))).toBe(false);
+  });
+  it('test_named_color_at_start_of_inline_style_flagged', () => {
+    expect(lintArtifact(`<div style="color:red">x</div>`).some((x) => x.id === 'token-trace:red')).toBe(true);
+  });
+  it('test_hex_in_inline_style_flagged', () => {
+    expect(lintArtifact(`<div style="background:#abc123">x</div>`).some((x) => x.id === 'token-trace:#abc123')).toBe(true);
+  });
 
   // ── QA cycle-1 (Codex E): token-trace reuse + non-hex colours + javascript: ──
   it('test_token_hex_reuse_outside_root_flagged', () => {

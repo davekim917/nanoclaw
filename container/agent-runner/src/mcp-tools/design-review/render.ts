@@ -80,6 +80,19 @@ export interface ViewportRender { viewport: string; pngPath: string; findings: F
 
 // Mirror render-diagram.ts's proven hardened flags: no sandbox escape, no /dev/shm
 // exhaustion, no local file:// cross-origin reads.
+//
+// EGRESS ISOLATION (the robust no-egress boundary — verified against the container's
+// chromium 149): --host-resolver-rules fails DNS for every host EXCEPT the declared font
+// CDN, so the render cannot fetch ANY external resource regardless of how the artifact
+// tries (src/<base>/object/iframe/url()/srcdoc/…). This makes the deterministic linter's
+// network checks advisory (fast feedback + keeping the DELIVERED artifact clean) rather
+// than the security boundary — so we don't chase every fetch-bearing HTML construct in
+// regex. The font CDN allowlist mirrors linter.ts's FONT_CDN_HOSTS. JS may still execute
+// during a render, but with the network blocked and the render thrown away it cannot
+// egress or persist (and --blink-settings=scriptEnabled=false breaks --screenshot on
+// chromium 149, so it is deliberately not used).
+const FONT_CDN_RESOLVER_RULE =
+  'MAP * ~NOTFOUND , EXCLUDE fonts.googleapis.com , EXCLUDE fonts.gstatic.com';
 const CHROMIUM_BASE_ARGS = [
   '--headless',
   '--no-sandbox',
@@ -88,6 +101,7 @@ const CHROMIUM_BASE_ARGS = [
   '--disable-dev-shm-usage',
   '--disable-file-access-from-files',
   '--hide-scrollbars',
+  `--host-resolver-rules=${FONT_CDN_RESOLVER_RULE}`,
 ];
 
 const MEASURE_SENTINEL = '__NC_DR__';
@@ -110,9 +124,10 @@ function measureDom(html: string, outDir: string, vpName: string, width: number,
   // a `script-src 'none'` CSP would block the sentinel script, making measureDom return
   // null and silently skip the overflow/blank checks. The artifact itself (screenshot +
   // lint) is untouched; CSP in a static artifact is harmless and only blinds our probe.
-  const stripped = html.replace(
-    /<meta\b[^>]*http-equiv\s*=\s*["']?content-security-policy["']?[^>]*>/gi,
-    '',
+  // Match is attribute-ORDER-independent: a <meta> is dropped if it carries BOTH an
+  // http-equiv=content-security-policy and any content= (the content may precede http-equiv).
+  const stripped = html.replace(/<meta\b[^>]*>/gi, (tag) =>
+    /http-equiv\s*=\s*["']?content-security-policy\b/i.test(tag) ? '' : tag,
   );
   const measured = stripped.includes('</body>')
     ? stripped.replace('</body>', `${inject}</body>`)
