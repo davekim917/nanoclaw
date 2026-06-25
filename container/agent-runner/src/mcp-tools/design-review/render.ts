@@ -100,21 +100,31 @@ const MEASURE_SENTINEL = '__NC_DR__';
  * copy in the sandbox — the artifact under test stays no-JS. Returns null if anything
  * fails (⇒ overflow/empty-DOM checks are conservatively skipped, no false high).
  */
-function measureDom(html: string, outDir: string, vpName: string, width: number): DomMetrics | null {
+function measureDom(html: string, outDir: string, vpName: string, width: number, height: number): DomMetrics | null {
   const inject =
     `<script>window.addEventListener('load',function(){`
     + `var d=document.documentElement,b=document.body;`
     + `document.title='${MEASURE_SENTINEL}:'+d.scrollWidth+','+d.scrollHeight+','+`
     + `((b&&b.innerText||'').trim().length);});</script>`;
-  const measured = html.includes('</body>')
-    ? html.replace('</body>', `${inject}</body>`)
-    : html + inject;
+  // Strip any Content-Security-Policy <meta> from the THROWAWAY measure copy (Codex P2):
+  // a `script-src 'none'` CSP would block the sentinel script, making measureDom return
+  // null and silently skip the overflow/blank checks. The artifact itself (screenshot +
+  // lint) is untouched; CSP in a static artifact is harmless and only blinds our probe.
+  const stripped = html.replace(
+    /<meta\b[^>]*http-equiv\s*=\s*["']?content-security-policy["']?[^>]*>/gi,
+    '',
+  );
+  const measured = stripped.includes('</body>')
+    ? stripped.replace('</body>', `${inject}</body>`)
+    : stripped + inject;
   const tmp = path.join(outDir, `.measure-${vpName}.html`);
   try {
     fs.writeFileSync(tmp, measured);
     const dom = execFileSync(
       'chromium',
-      [...CHROMIUM_BASE_ARGS, `--window-size=${width},900`, '--dump-dom', `file://${tmp}`],
+      // probe at the SAME height as the screenshot viewport so scrollHeight is comparable
+      // to viewportHeight (Codex P2: 900 ≠ the 844 mobile height ⇒ missed render-blank:mobile)
+      [...CHROMIUM_BASE_ARGS, `--window-size=${width},${height}`, '--dump-dom', `file://${tmp}`],
       { timeout: 15_000, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] },
     );
     const m = dom.match(new RegExp(`${MEASURE_SENTINEL}:(\\d+),(\\d+),(\\d+)`));
@@ -158,7 +168,7 @@ export function renderViewports(htmlPath: string, outDir: string): ViewportRende
       exitOk = false;
     }
     const pngBytes = fs.existsSync(pngPath) ? fs.statSync(pngPath).size : 0;
-    const dom = measureDom(html, outDir, vp.name, vp.width) ?? undefined;
+    const dom = measureDom(html, outDir, vp.name, vp.width, vp.height) ?? undefined;
     const findings = classifyRender({
       viewport: vp.name, viewportWidth: vp.width, viewportHeight: vp.height, exitOk, pngBytes, dom,
     });

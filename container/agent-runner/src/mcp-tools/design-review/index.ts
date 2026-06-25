@@ -21,7 +21,7 @@ import { registerTools } from '../server.js';
 import type { McpToolDefinition } from '../types.js';
 import { lintArtifact, type Finding, type Severity } from './linter.js';
 import { renderViewports } from './render.js';
-import { recordRound, openFindings, DEFAULT_BASE_DIR } from './state.js';
+import { recordRound, openFindings, DEFAULT_BASE_DIR, type RunStatus } from './state.js';
 
 function ok(text: string) {
   return { content: [{ type: 'text' as const, text }] };
@@ -47,6 +47,61 @@ export function normalizeSeverity(v: unknown): Severity {
   if (isSeverity(s)) return s;
   if (s === 'critical' || s === 'blocker' || s === 'crit' || s === 'p0' || s === 'p1') return 'high';
   return 'medium';
+}
+
+/**
+ * A critic pass counts as a review of the CURRENT artifact only when (a) the agent passed a
+ * criticReviewToken matching this version's reviewToken AND (b) it passed an actual
+ * criticFindings ARRAY (empty allowed = "critic looked, found nothing"). Requiring the array
+ * (Codex P1) closes the trivial bypass of echoing back just the token from a prior `continue`
+ * response to flip criticReviewed=true without running the critic. The deeper trust boundary
+ * remains — the tool cannot itself run the vision critic, so a fully fabricated
+ * {criticFindings:[], criticReviewToken} can't be detected — but the explicit array is the floor.
+ */
+export function criticReviewedFor(criticToken: string, reviewToken: string, criticFindingsInput: unknown): boolean {
+  return criticToken !== '' && criticToken === reviewToken && Array.isArray(criticFindingsInput);
+}
+
+export interface DirectiveInput {
+  renderUnsafe: boolean;
+  criticStale: boolean;
+  status: RunStatus;
+  criticReviewed: boolean;
+  openCount: number;
+}
+
+/**
+ * The `next` directive the tool returns. Pure so it is unit-testable. Key correctness point
+ * (Codex P2): on `continue` with open deterministic findings, point the agent at FIXING them —
+ * do NOT claim "no deterministic findings" and send it to the critic (which wastes rounds and
+ * can burn the cap without addressing the real blocker).
+ */
+export function nextDirective(d: DirectiveInput): string {
+  if (d.renderUnsafe) {
+    return 'Render was SKIPPED — the artifact contains executable JS or an external network '
+      + 'construct (see mustFixOpen). Remove every no-js:/network: finding (static HTML/CSS only, '
+      + 'self-contained), then call design_review again; screenshots are produced once it is clean.';
+  }
+  if (d.criticStale) {
+    return 'Your criticFindings were for an older artifact version and were DROPPED. Run the L1 '
+      + 'critic on THIS call\'s screenshotPaths (it must READ a PNG for vision), then call again with '
+      + 'criticFindings + criticReviewToken set to the reviewToken above.';
+  }
+  if (d.status === 'blocked') {
+    return 'At cap with unresolved HIGH findings — fix them and surface remaining ones to the user; do not ship silently.';
+  }
+  if (d.status !== 'continue') {
+    return 'Shippable. send_file the HTML + a preview PNG + trace.json.';
+  }
+  // continue: open findings take priority over the critic prompt.
+  if (d.openCount > 0) {
+    return 'Fix the open findings (mustFixOpen lists the HIGH ones)'
+      + (d.criticReviewed ? '' : ', and run the independent L1 critic on screenshotPaths (it must READ a PNG for vision)')
+      + ', then call design_review again with criticFindings + criticReviewToken=reviewToken.';
+  }
+  return 'No deterministic findings, but the independent L1 critic has not reviewed this version yet. '
+    + 'Run it on screenshotPaths (it must READ a PNG for vision), then call design_review again with '
+    + 'criticFindings + criticReviewToken=reviewToken (an empty criticFindings array with a matching token is fine if it found nothing).';
 }
 
 /** Validate + normalize the agent-supplied L1 critic findings. */
@@ -183,41 +238,31 @@ const designReviewTool: McpToolDefinition = {
     const criticRaw = normalizeCritic(args.criticFindings);
     const criticStale = criticRaw.length > 0 && criticToken !== reviewToken;
     const critic = criticStale ? [] : criticRaw;
-    // Codex P1: a critic pass counts only when it reviewed THIS artifact version (token
-    // matches), regardless of how many findings it returned — an empty-but-matching pass
-    // means "critic looked, found nothing". This is the gate that blocks shipping a clean
-    // artifact the visual critic never reviewed.
-    const criticReviewed = criticToken !== '' && criticToken === reviewToken;
+    // A critic pass counts only when it reviewed THIS artifact version AND an explicit
+    // criticFindings array was supplied (empty allowed = "looked, found nothing"). See
+    // criticReviewedFor — this is the gate that blocks shipping a clean artifact the visual
+    // critic never reviewed, and resists the echo-the-token bypass (Codex P1).
+    const criticReviewed = criticReviewedFor(criticToken, reviewToken, args.criticFindings);
 
     const roundFindings: Finding[] = [...renderFindings, ...lintFindings, ...critic];
 
     // E#7: the whole read → merge → decide → write is one locked transaction.
     const { state, status, mustFixOpen } = recordRound(id, roundFindings, DEFAULT_BASE_DIR, criticReviewed);
     const round = state.rounds[state.rounds.length - 1].round;
+    const open = openFindings(state);
 
     const result = {
       round,
       status,
       designSystem,
       reviewToken,
-      findings: openFindings(state),
+      findings: open,
       mustFixOpen,
       screenshotPaths,
       tracePath: path.join(runDir, 'trace.json'),
       ...(renderUnsafe ? { renderSkipped: 'artifact has high no-JS/network findings — not rendered until script/egress is removed' } : {}),
       ...(criticStale ? { staleCriticFindingsDropped: criticRaw.length } : {}),
-      next:
-        renderUnsafe
-          ? 'Render was SKIPPED — the artifact contains executable JS or an external network construct (see mustFixOpen). Remove every no-js:/network: finding (static HTML/CSS only, self-contained), then call design_review again; screenshots are produced once it is clean.'
-          : criticStale
-            ? 'Your criticFindings were for an older artifact version and were DROPPED. Run the L1 critic on THIS call\'s screenshotPaths (it must READ a PNG for vision), then call again with criticFindings + criticReviewToken set to the reviewToken above.'
-            : status === 'continue'
-              ? (criticReviewed
-                  ? 'Revise against mustFixOpen, re-run the L1 critic on the new screenshotPaths, then call design_review again with criticFindings + criticReviewToken=reviewToken.'
-                  : 'No deterministic findings, but the independent L1 critic has not reviewed this version yet. Run it on screenshotPaths (it must READ a PNG for vision), then call design_review again with criticFindings + criticReviewToken=reviewToken (an empty criticFindings with a matching token is fine if it finds nothing).')
-              : status === 'blocked'
-                ? 'At cap with unresolved HIGH findings — fix them and surface remaining ones to the user; do not ship silently.'
-                : 'Shippable. send_file the HTML + a preview PNG + trace.json.',
+      next: nextDirective({ renderUnsafe, criticStale, status, criticReviewed, openCount: open.length }),
     };
     return ok(JSON.stringify(result, null, 2));
   },

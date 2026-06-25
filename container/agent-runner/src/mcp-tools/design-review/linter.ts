@@ -96,9 +96,13 @@ export function lintArtifact(html: string, opts: LintOpts = {}): Finding[] {
     });
   };
   // Single-URL constructs: group 2 = host[+path], stops at quote/space/> (so unquoted attrs terminate).
+  // <base href> is included (Codex P1): an external base silently rewrites EVERY relative
+  // resource URL to that origin (`<base href="https://evil/"><img src="/p.png">` → egress),
+  // so an external base must trip the lockdown and skip render just like a direct external src.
   const urlRes: RegExp[] = [
     /\bsrc\s*=\s*["']?(https?:\/\/|\/\/)([^"'\s>]+)/gi,
     /<link\b[^>]*\bhref\s*=\s*["']?(https?:\/\/|\/\/)([^"'\s>]+)/gi,
+    /<base\b[^>]*\bhref\s*=\s*["']?(https?:\/\/|\/\/)([^"'\s>]+)/gi,
     /url\(\s*["']?(https?:\/\/|\/\/)([^"')\s]+)/gi,
     /@import\s+(?:url\()?\s*["']?(https?:\/\/|\/\/)([^"'\s)]+)/gi,
   ];

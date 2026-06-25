@@ -3,7 +3,7 @@ import { describe, it, expect, mock } from 'bun:test';
 // design_review/index.ts calls registerTools at module scope — no-op it for the test.
 mock.module('../server.js', () => ({ registerTools: () => {} }));
 
-const { designReviewTools, normalizeSeverity } = await import('./index.js');
+const { designReviewTools, normalizeSeverity, criticReviewedFor, nextDirective } = await import('./index.js');
 const tool = designReviewTools[0];
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const call = (args: Record<string, unknown>): Promise<any> => tool.handler(args) as Promise<any>;
@@ -58,5 +58,42 @@ describe('normalizeSeverity — case-insensitive, never demotes (Codex P2)', () 
   });
   it('test_low_preserved', () => {
     expect(normalizeSeverity('LOW')).toBe('low');
+  });
+});
+
+describe('criticReviewedFor — token + explicit array required (Codex P1)', () => {
+  it('test_matching_token_with_empty_array_counts', () => {
+    // "critic ran, found nothing" — an explicit empty array with a matching token is a valid pass
+    expect(criticReviewedFor('abc', 'abc', [])).toBe(true);
+    expect(criticReviewedFor('abc', 'abc', [{ severity: 'low', locus: 'x', message: 'y' }])).toBe(true);
+  });
+  it('test_token_only_without_array_does_not_count', () => {
+    // echoing back just the token (no findings array) must NOT flip criticReviewed — the bypass
+    expect(criticReviewedFor('abc', 'abc', undefined)).toBe(false);
+    expect(criticReviewedFor('abc', 'abc', 'not-an-array')).toBe(false);
+  });
+  it('test_mismatched_or_empty_token_does_not_count', () => {
+    expect(criticReviewedFor('stale', 'abc', [])).toBe(false);
+    expect(criticReviewedFor('', 'abc', [])).toBe(false);
+  });
+});
+
+describe('nextDirective — open findings take priority over the critic prompt (Codex P2)', () => {
+  it('test_continue_with_open_findings_says_fix_not_critic', () => {
+    const msg = nextDirective({ renderUnsafe: false, criticStale: false, status: 'continue', criticReviewed: false, openCount: 3 });
+    expect(msg).toContain('Fix the open findings');
+    expect(msg).not.toContain('No deterministic findings');
+  });
+  it('test_continue_clean_but_uncritiqued_prompts_critic', () => {
+    const msg = nextDirective({ renderUnsafe: false, criticStale: false, status: 'continue', criticReviewed: false, openCount: 0 });
+    expect(msg).toContain('not reviewed this version yet');
+  });
+  it('test_render_unsafe_directive', () => {
+    const msg = nextDirective({ renderUnsafe: true, criticStale: false, status: 'continue', criticReviewed: false, openCount: 2 });
+    expect(msg).toContain('Render was SKIPPED');
+  });
+  it('test_blocked_and_ship_directives', () => {
+    expect(nextDirective({ renderUnsafe: false, criticStale: false, status: 'blocked', criticReviewed: true, openCount: 1 })).toContain('At cap');
+    expect(nextDirective({ renderUnsafe: false, criticStale: false, status: 'shipped-with-disclosures', criticReviewed: true, openCount: 0 })).toContain('Shippable');
   });
 });

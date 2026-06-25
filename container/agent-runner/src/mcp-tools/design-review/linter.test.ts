@@ -112,6 +112,15 @@ describe('lintArtifact — supplement checks', () => {
     // a navigational link is NOT an egress fetch
     expect(lintArtifact(`<a href="https://example.com/page">link</a>`).some((x) => x.id.startsWith('network:'))).toBe(false);
   });
+  it('test_external_base_href_flagged', () => {
+    // Codex P1: an external <base href> silently rewrites every relative URL to that origin
+    const f = lintArtifact(`<head><base href="https://evil.example/"></head><body><img src="/pixel.png"></body>`);
+    expect(f.some((x) => x.id === 'network:evil.example')).toBe(true);
+  });
+  it('test_relative_base_href_not_flagged', () => {
+    // a same-document relative base does not egress
+    expect(lintArtifact(`<base href="/assets/">`).some((x) => x.id.startsWith('network:'))).toBe(false);
+  });
 
   // ── QA cycle-1 (Codex E): token-trace reuse + non-hex colours + javascript: ──
   it('test_token_hex_reuse_outside_root_flagged', () => {
