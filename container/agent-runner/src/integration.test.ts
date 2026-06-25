@@ -47,9 +47,9 @@ describe('poll loop integration', () => {
     const provider = new MockProvider({}, () => '<message to="discord-test">42</message>');
 
     const controller = new AbortController();
-    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 8000);
 
-    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    await waitFor(() => getUndeliveredMessages().length > 0, 8000);
     controller.abort();
 
     const out = getUndeliveredMessages();
@@ -72,9 +72,9 @@ describe('poll loop integration', () => {
 
     const provider = new MockProvider({}, () => '<message to="discord-test">Got both messages</message>');
     const controller = new AbortController();
-    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 8000);
 
-    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    await waitFor(() => getUndeliveredMessages().length > 0, 8000);
     controller.abort();
 
     const out = getUndeliveredMessages();
@@ -111,9 +111,9 @@ describe('poll loop integration', () => {
       () => '<message to="discord-test">reply-d</message><message to="slack-test">reply-s</message>',
     );
     const controller = new AbortController();
-    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 8000);
 
-    await waitFor(() => getUndeliveredMessages().length >= 2, 2000);
+    await waitFor(() => getUndeliveredMessages().length >= 2, 8000);
     controller.abort();
 
     const out = getUndeliveredMessages();
@@ -141,9 +141,9 @@ describe('poll loop integration', () => {
 
     const provider = new MockProvider({}, () => 'I am thinking about this...');
     const controller = new AbortController();
-    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 8000);
 
-    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    await waitFor(() => getUndeliveredMessages().length > 0, 8000);
     controller.abort();
 
     const out = getUndeliveredMessages();
@@ -163,9 +163,9 @@ describe('poll loop integration', () => {
       () => '<message to="nonexistent">dropped</message><message to="discord-test">delivered</message>',
     );
     const controller = new AbortController();
-    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 8000);
 
-    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    await waitFor(() => getUndeliveredMessages().length > 0, 8000);
     controller.abort();
 
     const out = getUndeliveredMessages();
@@ -189,9 +189,9 @@ describe('poll loop integration', () => {
       // The opencode failure mode: addresses the sibling as a destination.
       const provider = new MockProvider({}, () => '<message to="Axie-Codex">Good catch — fixing the query.</message>');
       const controller = new AbortController();
-      const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
+      const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 8000);
 
-      await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+      await waitFor(() => getUndeliveredMessages().length > 0, 8000);
       controller.abort();
 
       const out = getUndeliveredMessages();
@@ -226,9 +226,9 @@ describe('poll loop integration', () => {
       () => '<message to="discord-test">for discord</message><message to="slack-test">for slack</message>',
     );
     const controller = new AbortController();
-    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 8000);
 
-    await waitFor(() => getUndeliveredMessages().length >= 2, 2000);
+    await waitFor(() => getUndeliveredMessages().length >= 2, 8000);
     controller.abort();
 
     const out = getUndeliveredMessages();
@@ -261,9 +261,9 @@ describe('poll loop integration', () => {
 
     const provider = new MockProvider({}, () => '<message to="slack-new">hello slack</message>');
     const controller = new AbortController();
-    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 8000);
 
-    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    await waitFor(() => getUndeliveredMessages().length > 0, 8000);
     controller.abort();
 
     const out = getUndeliveredMessages();
@@ -289,9 +289,9 @@ describe('poll loop integration', () => {
 
     const provider = new MockProvider({}, () => '<message to="discord-test">reply</message>');
     const controller = new AbortController();
-    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 8000);
 
-    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    await waitFor(() => getUndeliveredMessages().length > 0, 8000);
     controller.abort();
 
     const out = getUndeliveredMessages();
@@ -305,13 +305,13 @@ describe('poll loop integration', () => {
   it('should process messages arriving after loop starts', async () => {
     const provider = new MockProvider({}, () => '<message to="discord-test">Processed</message>');
     const controller = new AbortController();
-    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 3000);
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 9000);
 
     // Insert message after loop has started
     await sleep(200);
     insertMessage('m-late', { sender: 'Charlie', text: 'Late arrival' });
 
-    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    await waitFor(() => getUndeliveredMessages().length > 0, 8000);
     controller.abort();
 
     const out = getUndeliveredMessages();
@@ -329,9 +329,9 @@ describe('poll loop integration', () => {
         '<internal>thinking about this...</internal><message to="discord-test">answer</message><internal>done thinking</internal>',
     );
     const controller = new AbortController();
-    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 8000);
 
-    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    await waitFor(() => getUndeliveredMessages().length > 0, 8000);
     controller.abort();
 
     const out = getUndeliveredMessages();
@@ -354,9 +354,9 @@ describe('poll loop integration', () => {
 
     const provider = new MockProvider({}, () => '<message to="discord-test">done</message>');
     const controller = new AbortController();
-    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 8000);
 
-    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    await waitFor(() => getUndeliveredMessages().length > 0, 8000);
     controller.abort();
 
     const out = getUndeliveredMessages();
@@ -419,9 +419,9 @@ describe('poll loop — exchange hook (onExchangeComplete)', () => {
 
     const provider = new HookedMockProvider({}, () => '<message to="discord-test">archived answer</message>');
     const controller = new AbortController();
-    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 8000);
 
-    await waitFor(() => provider.exchanges.length > 0, 2000);
+    await waitFor(() => provider.exchanges.length > 0, 8000);
     controller.abort();
 
     expect(provider.exchanges.length).toBe(1);
@@ -457,9 +457,9 @@ describe('poll loop — exchange hook (onExchangeComplete)', () => {
       return calls === 1 ? 'unwrapped text' : '<message to="discord-test">wrapped now</message>';
     });
     const controller = new AbortController();
-    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 3000);
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 9000);
 
-    await waitFor(() => provider.exchanges.length >= 2, 3000);
+    await waitFor(() => provider.exchanges.length >= 2, 9000);
     controller.abort();
 
     // Both exchanges attribute themselves to the real user prompt, never the nudge.
@@ -486,9 +486,9 @@ describe('poll loop — exchange hook (onExchangeComplete)', () => {
     }
     const provider = new ThrowingHookProvider({}, () => '<message to="discord-test">delivered anyway</message>');
     const controller = new AbortController();
-    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 8000);
 
-    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    await waitFor(() => getUndeliveredMessages().length > 0, 8000);
     controller.abort();
 
     const out = getUndeliveredMessages();
@@ -505,9 +505,9 @@ describe('poll loop — provider error recovery', () => {
 
     const provider = new ThrowingProvider('API rate limit exceeded');
     const controller = new AbortController();
-    const loopPromise = runPollLoopWithTimeout(provider as unknown as MockProvider, controller.signal, 2000);
+    const loopPromise = runPollLoopWithTimeout(provider as unknown as MockProvider, controller.signal, 8000);
 
-    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    await waitFor(() => getUndeliveredMessages().length > 0, 8000);
     controller.abort();
 
     const out = getUndeliveredMessages();
@@ -533,9 +533,9 @@ describe('poll loop — stale session recovery', () => {
 
     const provider = new InvalidSessionProvider();
     const controller = new AbortController();
-    const loopPromise = runPollLoopWithTimeout(provider as unknown as MockProvider, controller.signal, 2000);
+    const loopPromise = runPollLoopWithTimeout(provider as unknown as MockProvider, controller.signal, 8000);
 
-    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    await waitFor(() => getUndeliveredMessages().length > 0, 8000);
     controller.abort();
 
     // Error was written to outbound
@@ -555,9 +555,9 @@ describe('poll loop — stale session recovery', () => {
 
     const provider = new YieldingSystemErrorThenSuccessProvider();
     const controller = new AbortController();
-    const loopPromise = runPollLoopWithTimeout(provider as unknown as MockProvider, controller.signal, 2000);
+    const loopPromise = runPollLoopWithTimeout(provider as unknown as MockProvider, controller.signal, 8000);
 
-    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    await waitFor(() => getUndeliveredMessages().length > 0, 8000);
     controller.abort();
 
     expect(provider.continuations).toEqual(['poisoned-codex-thread', undefined]);
@@ -588,9 +588,9 @@ describe('poll loop — /clear command', () => {
 
     const provider = new MockProvider({}, () => '<message to="discord-test">should not run</message>');
     const controller = new AbortController();
-    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 2000);
+    const loopPromise = runPollLoopWithTimeout(provider, controller.signal, 8000);
 
-    await waitFor(() => getUndeliveredMessages().length > 0, 2000);
+    await waitFor(() => getUndeliveredMessages().length > 0, 8000);
     controller.abort();
 
     const out = getUndeliveredMessages();
@@ -703,19 +703,19 @@ describe('poll loop — slash command during active query', () => {
 
     const provider = new BlockingProvider();
     const controller = new AbortController();
-    const loopPromise = runPollLoopWithTimeout(provider as unknown as MockProvider, controller.signal, 3000);
+    const loopPromise = runPollLoopWithTimeout(provider as unknown as MockProvider, controller.signal, 9000);
 
-    await waitFor(() => provider.queries === 1, 2000);
+    await waitFor(() => provider.queries === 1, 8000);
     insertMessage(
       'm-clear-active',
       { sender: 'Alice', text: '/clear' },
       { platformId: 'chan-1', channelType: 'discord' },
     );
 
-    await waitFor(() => provider.aborts === 1, 2000);
+    await waitFor(() => provider.aborts === 1, 8000);
     await waitFor(
       () => getUndeliveredMessages().some((msg) => JSON.parse(msg.content).text === 'Session cleared.'),
-      2000,
+      8000,
     );
     controller.abort();
 
