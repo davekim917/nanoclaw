@@ -15,10 +15,11 @@
  * See `docs/claude-md-composition.md` for the full design.
  */
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import { GROUPS_DIR } from './config.js';
-import { validateMcpServers, type McpServerConfig } from './container-config.js';
+import { readContainerConfig, validateMcpServers, type McpServerConfig } from './container-config.js';
 import { getContainerConfig } from './db/container-configs.js';
 import { buildSessionServicesSnapshot, renderSessionCapabilities } from './capabilities.js';
 import { flattenClaudeMd } from './agents-md-flatten.js';
@@ -123,6 +124,38 @@ export function composeGroupClaudeMd(group: AgentGroup): void {
     }
   } catch (err) {
     log.warn('Session capabilities fragment skipped', { group: group.id, err: String(err) });
+  }
+
+  // Always-on agent-plugin rulesets — NON-Claude groups only. A Claude group
+  // gets a plugin's always-on behavior from its mounted SessionStart hook
+  // (CLAUDE_PLUGINS_ROOT auto-loads it); Codex/OpenCode containers fire NO
+  // plugin hooks, so we inject the plugin's captured ruleset here instead. A
+  // plugin opts in by writing its ruleset to `~/plugins/<name>/.nanoclaw-always-on.md`
+  // (the /enable-agent-plugins skill authors this). Per-group opt-out reuses
+  // `excludePlugins` — the same field that drops the Claude mount — so excluding
+  // a plugin from a group removes it on every provider. See docs/skills-model.md.
+  const provider = (configRow?.provider ?? 'claude').toLowerCase();
+  if (provider !== 'claude') {
+    const excluded = new Set(readContainerConfig(group.folder).excludePlugins ?? []);
+    const pluginsRoot = path.join(os.homedir(), 'plugins');
+    let pluginDirs: string[] = [];
+    try {
+      pluginDirs = fs.readdirSync(pluginsRoot).sort();
+    } catch {
+      /* no ~/plugins — nothing to inject */
+    }
+    for (const name of pluginDirs) {
+      if (excluded.has(name)) continue;
+      const rulesetFile = path.join(pluginsRoot, name, '.nanoclaw-always-on.md');
+      let content = '';
+      try {
+        if (!fs.statSync(rulesetFile).isFile()) continue;
+        content = fs.readFileSync(rulesetFile, 'utf-8').trim();
+      } catch {
+        continue;
+      }
+      if (content) desired.set(`plugin-${name}.md`, { type: 'inline', content });
+    }
   }
 
   // Reconcile: drop stale, write desired.
