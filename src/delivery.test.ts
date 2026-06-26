@@ -72,12 +72,13 @@ function insertOutboundKind(
   platformId: string,
   content: object,
   threadId: string | null = null,
+  inReplyTo: string | null = null,
 ): void {
   const db = new Database(outboundDbPath(agentGroupId, sessionId));
   db.prepare(
-    `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, thread_id, content)
-     VALUES (?, datetime('now'), ?, ?, ?, ?, ?)`,
-  ).run(msgId, kind, platformId, channelType, threadId, JSON.stringify(content));
+    `INSERT INTO messages_out (id, timestamp, kind, platform_id, channel_type, thread_id, content, in_reply_to)
+     VALUES (?, datetime('now'), ?, ?, ?, ?, ?, ?)`,
+  ).run(msgId, kind, platformId, channelType, threadId, JSON.stringify(content), inReplyTo);
   db.close();
 }
 
@@ -186,6 +187,88 @@ describe('deliverSessionMessages — concurrent invocations', () => {
       threadId: null,
       messageId: 'plat-status-id',
     });
+  });
+
+  it('resets the status line on a new turn when the prior turn posted no chat-final', async () => {
+    // Bug: a turn that ends WITHOUT a user-facing <message> block (agent
+    // thought/used tools but chose not to reply) never writes a kind='chat'
+    // row, so the chat-final orphan cleanup never runs. The 💭 status from
+    // that turn lingers, and the next turn's status — found in statusTracking
+    // — gets EDITED in place, landing above the user's newer message. Status
+    // rows now carry their turn's batch anchor in in_reply_to; a status with a
+    // different anchor than the tracked one must delete the stale orphan and
+    // post fresh instead of editing.
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+
+    type DeliverCall = { kind: string; content: string };
+    const delivers: DeliverCall[] = [];
+    const deletes: string[] = [];
+    let postCount = 0;
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, kind, content) {
+        delivers.push({ kind, content });
+        return `plat-status-${++postCount}`;
+      },
+      async deleteMessage(_channelType, _platformId, _threadId, messageId) {
+        deletes.push(messageId);
+      },
+    });
+
+    // Turn 1: a status posts fresh and is tracked. No chat-final follows.
+    insertOutboundKind(
+      'ag-1',
+      session.id,
+      'status-1',
+      'status',
+      'telegram',
+      'telegram:123',
+      { text: 'turn-1' },
+      null,
+      'in-1',
+    );
+    await deliverSessionMessages(session);
+    expect(delivers).toHaveLength(1);
+    expect(deletes).toHaveLength(0); // No chat-final ran, orphan still tracked.
+
+    // Turn 2 (user followed up → new batch anchor). The stale turn-1 status
+    // must be deleted and turn-2's status posted FRESH, not edited.
+    insertOutboundKind(
+      'ag-1',
+      session.id,
+      'status-2',
+      'status',
+      'telegram',
+      'telegram:123',
+      { text: 'turn-2' },
+      null,
+      'in-2',
+    );
+    await deliverSessionMessages(session);
+    expect(deletes).toEqual(['plat-status-1']); // Stale orphan removed.
+    expect(delivers).toHaveLength(2);
+    // Fresh post, not an edit of the prior turn's message.
+    expect(JSON.parse(delivers[1].content)).not.toHaveProperty('operation');
+
+    // A second status in the SAME turn (same anchor) still edits in place —
+    // the reset must not fire mid-turn.
+    insertOutboundKind(
+      'ag-1',
+      session.id,
+      'status-2b',
+      'status',
+      'telegram',
+      'telegram:123',
+      { text: 'turn-2 more' },
+      null,
+      'in-2',
+    );
+    await deliverSessionMessages(session);
+    expect(deletes).toEqual(['plat-status-1']); // No additional delete.
+    expect(delivers).toHaveLength(3);
+    const edit = JSON.parse(delivers[2].content);
+    expect(edit.operation).toBe('edit');
+    expect(edit.messageId).toBe('plat-status-2'); // Edits turn-2's message.
   });
 
   it('threads the messaging-group instance through status delivery and the orphan delete', async () => {

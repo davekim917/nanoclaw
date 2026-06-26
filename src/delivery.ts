@@ -79,6 +79,13 @@ interface StatusTrack {
   /** Instance the status was posted through — the orphan delete must reuse it
    *  or it routes through the default-instance adapter (a sibling bot). */
   instance?: string;
+  /** Batch anchor (turn id) the tracked status belongs to. The container
+   *  stamps it on every status row's `in_reply_to`. A status whose anchor
+   *  differs from the tracked one belongs to a NEW turn — used to detect the
+   *  prior turn ending without a chat-final (which would otherwise leave the
+   *  💭 orphan undeleted and the next turn editing it in place above the
+   *  user's newer message). Null only when the turn had no inbound anchor. */
+  inReplyTo: string | null;
 }
 const statusTracking = new Map<string, StatusTrack>();
 
@@ -582,6 +589,37 @@ async function deliverMessage(
       });
       return {};
     }
+    // Turn-boundary reset. A status row carries its turn's batch anchor in
+    // `in_reply_to`. If a tracked status belongs to a DIFFERENT turn than the
+    // one now arriving, the prior turn ended without a chat-final to run the
+    // orphan cleanup (the agent thought/used tools but emitted no user-facing
+    // <message> block — common in multi-bot threads or pure-tool turns). That
+    // orphan still sits in the thread, now ABOVE the user's newer message.
+    // Without this reset the next turn's status would edit that stale message
+    // in place. Delete it via the *stored* route and drop tracking so the new
+    // turn posts a fresh status line below the user's message instead.
+    const stale = statusTracking.get(session.id);
+    if (stale && stale.inReplyTo !== msg.in_reply_to) {
+      if (deliveryAdapter.deleteMessage) {
+        try {
+          await deliveryAdapter.deleteMessage(
+            stale.channelType,
+            stale.platformId,
+            stale.threadId,
+            stale.messageId,
+            stale.instance,
+          );
+        } catch (err) {
+          log.warn('Failed to delete stale prior-turn status — leaving as-is', {
+            sessionId: session.id,
+            messageId: stale.messageId,
+            err: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+      statusTracking.delete(session.id);
+    }
+
     const existing = statusTracking.get(session.id);
     let outbound = scrubSecrets(msg.content);
     if (existing) {
@@ -613,6 +651,7 @@ async function deliverMessage(
         threadId: msg.thread_id,
         messageId: platformMsgId,
         instance: deliverInstance,
+        inReplyTo: msg.in_reply_to,
       });
     }
     log.info('Status delivered', {
