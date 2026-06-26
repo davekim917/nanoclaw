@@ -759,6 +759,13 @@ async function processQuery(
   let queryContinuation: string | undefined;
   let done = false;
   let unwrappedNudged = false;
+  // Retryable (e.g. SDK `api_retry`) events are the SDK's own mid-stream retry
+  // signal, NOT a turn-ending error. Record the last one but keep consuming so
+  // the SDK's internal retry can still produce a result; only surface it if the
+  // stream ends without ever yielding one. (2026-06-26: throwing on the first
+  // api_retry dead-turned long ultracode turns with a bogus "Error: API retry".)
+  let sawResult = false;
+  let lastRetryableErr: ProviderEventError | undefined;
   // Prompt queue for the exchange hook — each result event consumes the
   // oldest unanswered prompt, except a wrapping-retry result, which answers
   // the same prompt again. Unused (and unmaintained) when the provider
@@ -966,6 +973,14 @@ async function processQuery(
     for await (const event of query.events) {
       if (event.type === 'error') {
         const err = new ProviderEventError(event);
+        if (event.retryable) {
+          // SDK's own mid-stream retry signal (api_retry). Don't abort — the
+          // SDK retries internally and a result usually follows. Surfaced
+          // after the loop only if no result ever arrives.
+          log(`Retryable upstream event (${event.message}) — continuing; SDK is retrying`);
+          lastRetryableErr = err;
+          continue;
+        }
         notifyExchangeComplete(onExchangeComplete, {
           prompt: archivePrompts[0] ?? initialPrompt,
           result: `Error: ${event.message}`,
@@ -988,6 +1003,7 @@ async function processQuery(
         // Claude session with no prior context.
         setContinuation(providerName, event.continuation);
       } else if (event.type === 'result') {
+        sawResult = true; // the SDK produced output → any prior api_retry recovered
         // A `result` event signals the assistant's turn is complete, but the
         // provider's events generator stays open for follow-up `push()` calls
         // (see container/agent-runner/src/providers/claude.ts:1080 — the
@@ -1085,6 +1101,10 @@ async function processQuery(
         dispatchFileAttachment(event, routing);
       }
     }
+    // Stream ended with only retryable (api_retry) events and no result → the
+    // SDK's internal retries were exhausted. Surface it via the catch below so
+    // the user sees a real failure instead of silence. Any result clears this.
+    if (!sawResult && lastRetryableErr) throw lastRetryableErr;
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err);
     notifyExchangeComplete(onExchangeComplete, {

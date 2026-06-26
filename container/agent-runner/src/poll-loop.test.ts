@@ -1039,6 +1039,27 @@ describe('processQuery done-flag invariant (codex F4 regression guard)', () => {
       .join('\n');
     expect(codeOnly).not.toContain('done = true');
   });
+
+  it('does NOT throw on a retryable (api_retry) event; surfaces only if no result arrives', async () => {
+    // 2026-06-26: processQuery threw on EVERY error event, including the SDK's
+    // own `api_retry` retry signal (retryable:true). That dead-turned long
+    // ultracode turns with a bogus "Error: API retry" the SDK would have
+    // recovered from. The handler must `continue` on a retryable event (let the
+    // SDK's internal retry finish) and only surface it post-loop when the stream
+    // ended without a result. Source-anchored like the F4 guard above — driving
+    // processQuery needs full stream+session-DB fixtures this file avoids.
+    const fs = await import('fs');
+    const src = fs.readFileSync(new URL('./poll-loop.ts', import.meta.url), 'utf8');
+    const errIdx = src.indexOf("if (event.type === 'error') {");
+    expect(errIdx).toBeGreaterThan(-1);
+    const handler = src.slice(errIdx, errIdx + 700);
+    // retryable branch continues instead of throwing
+    expect(handler).toContain('if (event.retryable)');
+    expect(handler).toContain('lastRetryableErr = err;');
+    expect(handler).toContain('continue;');
+    // and the post-loop surface exists so a never-recovering stream isn't silent
+    expect(src).toContain('if (!sawResult && lastRetryableErr) throw lastRetryableErr;');
+  });
 });
 
 describe('isAupRefusal', () => {
