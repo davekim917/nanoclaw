@@ -54,6 +54,27 @@ describe('classifyRender — blank/overflow thresholds', () => {
     expect(f.some((x) => x.id.startsWith('overflow:'))).toBe(false);
   });
 
+  it('test_floored_viewport_no_false_overflow', () => {
+    // Regression: headless chromium floored the 390 request to a wider layout (or used the
+    // ~980 no-viewport-meta fallback). scrollWidth equals the ACTUAL layout width (clientWidth)
+    // ⇒ NOT overflow, even though scrollWidth > the requested viewportWidth. Previously this
+    // false-high'd on every page (a blank page tripped overflow:mobile too).
+    const f = classifyRender({
+      viewport: 'mobile', viewportWidth: 390, viewportHeight: 844, exitOk: true, pngBytes: 40_000,
+      dom: { scrollWidth: 500, scrollHeight: 1200, textLen: 300, clientWidth: 500 },
+    });
+    expect(f.some((x) => x.id.startsWith('overflow:'))).toBe(false);
+  });
+
+  it('test_real_overflow_against_clientWidth', () => {
+    // Content genuinely wider than the actual layout viewport ⇒ still flagged high.
+    const f = classifyRender({
+      viewport: 'mobile', viewportWidth: 390, viewportHeight: 844, exitOk: true, pngBytes: 40_000,
+      dom: { scrollWidth: 700, scrollHeight: 1200, textLen: 300, clientWidth: 500 },
+    });
+    expect(f.find((x) => x.id === 'overflow:mobile')?.severity).toBe('high');
+  });
+
   it('test_unmeasured_dom_skips_overflow_and_dom_blank', () => {
     // measure pass failed (dom undefined) ⇒ overflow + empty-DOM checks skipped (no false high)
     const f = classifyRender({ viewport: 'desktop', viewportWidth: 1440, viewportHeight: 900, exitOk: true, pngBytes: 40_000 });

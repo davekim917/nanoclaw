@@ -27,6 +27,13 @@ export interface DomMetrics {
   scrollWidth: number;   // document.documentElement.scrollWidth at this viewport
   scrollHeight: number;  // document.documentElement.scrollHeight at this viewport
   textLen: number;       // body.innerText length (trimmed)
+  // documentElement.clientWidth = the ACTUAL layout-viewport width chromium used. Overflow is
+  // judged against this, not the requested vp.width: headless chromium can floor a small
+  // --window-size (e.g. 390) to a wider layout — or fall back to the ~980 default when the
+  // artifact has no viewport meta — which made content that actually fits false-positive
+  // against the requested width (every page, even blank, tripped overflow:mobile). Optional
+  // with a viewportWidth fallback so older callers/tests are byte-unaffected. See classifyRender.
+  clientWidth?: number;
 }
 
 export interface RenderSignals {
@@ -65,12 +72,18 @@ export function classifyRender(s: RenderSignals): Finding[] {
         + (domBlank ? ', empty DOM' : '') + ').',
     });
   }
-  if (s.dom !== undefined && s.dom.scrollWidth > s.viewportWidth + OVERFLOW_SLACK_PX) {
+  // Judge overflow against the ACTUAL layout width chromium used (clientWidth), not the
+  // requested vp.width — the canonical `scrollWidth > clientWidth` idiom. This is immune to
+  // headless chromium flooring a small --window-size (or the no-viewport-meta ~980 fallback),
+  // which otherwise false-positived every page against the requested width. Falls back to
+  // viewportWidth when clientWidth is absent (older callers/tests). See DomMetrics.clientWidth.
+  const layoutWidth = s.dom?.clientWidth ?? s.viewportWidth;
+  if (s.dom !== undefined && s.dom.scrollWidth > layoutWidth + OVERFLOW_SLACK_PX) {
     out.push({
       id: `overflow:${s.viewport}`,
       severity: 'high',
       locus: s.viewport,
-      message: `Horizontal overflow at ${s.viewport}: scrollWidth ${s.dom.scrollWidth} > viewport ${s.viewportWidth}.`,
+      message: `Horizontal overflow at ${s.viewport}: scrollWidth ${s.dom.scrollWidth} > layout width ${layoutWidth}.`,
     });
   }
   return out;
@@ -124,7 +137,7 @@ function measureDom(html: string, outDir: string, vpName: string, width: number,
     `<script>window.addEventListener('load',function(){`
     + `var d=document.documentElement,b=document.body;`
     + `document.title='${MEASURE_SENTINEL}:'+d.scrollWidth+','+d.scrollHeight+','+`
-    + `((b&&b.innerText||'').trim().length);});</script>`;
+    + `((b&&b.innerText||'').trim().length)+','+d.clientWidth;});</script>`;
   // Strip any Content-Security-Policy <meta> from the THROWAWAY measure copy (Codex P2):
   // a `script-src 'none'` CSP would block the sentinel script, making measureDom return
   // null and silently skip the overflow/blank checks. The artifact itself (screenshot +
@@ -147,11 +160,13 @@ function measureDom(html: string, outDir: string, vpName: string, width: number,
       [...CHROMIUM_BASE_ARGS, `--window-size=${width},${height}`, '--dump-dom', `file://${tmp}`],
       { timeout: 15_000, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] },
     );
-    const m = dom.match(new RegExp(`${MEASURE_SENTINEL}:(\\d+),(\\d+),(\\d+)`));
+    const m = dom.match(new RegExp(`${MEASURE_SENTINEL}:(\\d+),(\\d+),(\\d+),(\\d+)`));
     if (!m) return null;
-    const [scrollWidth, scrollHeight, textLen] = [m[1], m[2], m[3]].map((n) => parseInt(n, 10));
-    if (![scrollWidth, scrollHeight, textLen].every(Number.isFinite)) return null;
-    return { scrollWidth, scrollHeight, textLen };
+    const [scrollWidth, scrollHeight, textLen, clientWidth] = [m[1], m[2], m[3], m[4]].map((n) =>
+      parseInt(n, 10),
+    );
+    if (![scrollWidth, scrollHeight, textLen, clientWidth].every(Number.isFinite)) return null;
+    return { scrollWidth, scrollHeight, textLen, clientWidth };
   } catch {
     return null;
   } finally {
