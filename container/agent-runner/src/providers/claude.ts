@@ -1276,7 +1276,16 @@ export class ClaudeProvider implements AgentProvider {
    * (it's the only thing the SDK actually uses in that case).
    */
   private fallbackOauth: Array<{ name: string; value: string }>;
-  private nextOauthFallback = 0;
+  // Circular OAuth rotation ring: [primary, ...numbered fallbacks], deduped by
+  // value. rotateApiKey advances around it and wraps back to the primary, so a
+  // transient blip on one credential can't strand the container on a worse one
+  // for its whole life. Position is sticky across turns; the per-turn cycle
+  // budget (oauthRotationsThisCycle) is reset by resetRotationCycle each turn.
+  // (Incident 2026-06-25: a non-scoped group's single promoted fallback was a
+  // spend-capped account, and forward-only rotation could never escape it.)
+  private oauthRing: Array<{ name: string; value: string }> = [];
+  private oauthRingPos = 0;
+  private oauthRotationsThisCycle = 0;
   private model?: string;
   private effort?: string;
 
@@ -1307,6 +1316,22 @@ export class ClaudeProvider implements AgentProvider {
       .map(([k, v]) => ({ name: k, value: v as string }));
     if (this.fallbackOauth.length > 0) {
       log(`Loaded ${this.fallbackOauth.length} CLAUDE_CODE_OAUTH_TOKEN fallback(s): ${this.fallbackOauth.map((k) => k.name).join(', ')}`);
+    }
+    // Build the circular OAuth rotation ring: primary + numbered fallbacks,
+    // deduped by value so a token that appears in two slots isn't visited
+    // twice. The primary occupies position 0; rotateApiKey wraps past the last
+    // fallback back to it.
+    // Host-side container-runner already strips OneCLI's "placeholder"
+    // sentinel before forwarding; guard defensively anyway so a stray
+    // placeholder never enters the ring as a usable credential.
+    const ringPrimary = this.env.CLAUDE_CODE_OAUTH_TOKEN;
+    if (ringPrimary && ringPrimary !== 'placeholder') {
+      const seenRing = new Set<string>();
+      for (const entry of [{ name: 'CLAUDE_CODE_OAUTH_TOKEN', value: ringPrimary }, ...this.fallbackOauth]) {
+        if (seenRing.has(entry.value)) continue;
+        seenRing.add(entry.value);
+        this.oauthRing.push(entry);
+      }
     }
     this.model = options.model;
     this.effort = options.effort;
@@ -1359,14 +1384,23 @@ export class ClaudeProvider implements AgentProvider {
   rotateApiKey(): { rotated: boolean } {
     const usingOauth = !this.env.ANTHROPIC_API_KEY && Boolean(this.env.CLAUDE_CODE_OAUTH_TOKEN);
     if (usingOauth) {
-      if (this.nextOauthFallback >= this.fallbackOauth.length) return { rotated: false };
-      const next = this.fallbackOauth[this.nextOauthFallback++];
-      if (this.env.CLAUDE_CODE_OAUTH_TOKEN === next.value) {
-        return this.rotateApiKey();
-      }
+      // Circular: advance around the ring (wrapping past the last fallback
+      // back to the primary). Give up only once we've visited every OTHER
+      // credential this cycle — so a transient failure on the current token
+      // can recover via any healthy peer, and a since-healed primary is
+      // reachable again on a later turn. The cycle budget is reset per turn
+      // by resetRotationCycle. (Incident 2026-06-25.)
+      if (this.oauthRing.length <= 1) return { rotated: false };
+      if (this.oauthRotationsThisCycle >= this.oauthRing.length - 1) return { rotated: false };
+      this.oauthRingPos = (this.oauthRingPos + 1) % this.oauthRing.length;
+      this.oauthRotationsThisCycle++;
+      const next = this.oauthRing[this.oauthRingPos];
       this.env.CLAUDE_CODE_OAUTH_TOKEN = next.value;
       process.env.CLAUDE_CODE_OAUTH_TOKEN = next.value;
-      log(`Rotated CLAUDE_CODE_OAUTH_TOKEN → ${next.name} (${this.nextOauthFallback}/${this.fallbackOauth.length})`);
+      log(
+        `Rotated CLAUDE_CODE_OAUTH_TOKEN → ${next.name} ` +
+          `(ring ${this.oauthRingPos + 1}/${this.oauthRing.length}, cycle ${this.oauthRotationsThisCycle}/${this.oauthRing.length - 1})`,
+      );
       return { rotated: true };
     }
     if (this.nextFallback >= this.fallbackKeys.length) return { rotated: false };
@@ -1380,6 +1414,18 @@ export class ClaudeProvider implements AgentProvider {
     process.env.ANTHROPIC_API_KEY = next.value;
     log(`Rotated ANTHROPIC_API_KEY → ${next.name} (${this.nextFallback}/${this.fallbackKeys.length})`);
     return { rotated: true };
+  }
+
+  /**
+   * Reset the per-turn OAuth rotation cycle budget. Called once at the start
+   * of every turn so a fresh full pass around the ring is available — the
+   * active position stays sticky, but a credential that has since healed
+   * (e.g. a 5-hour session cap that reset) becomes reachable again. The
+   * ANTHROPIC_API_KEY fallback path is intentionally untouched: it remains
+   * forward-only / exhaust-once, and is never active alongside OAuth.
+   */
+  resetRotationCycle(): void {
+    this.oauthRotationsThisCycle = 0;
   }
 
   maybeRotateContinuation(continuation: string): string | null {

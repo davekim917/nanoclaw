@@ -159,6 +159,41 @@ describe('resolveAnthropicAuth', () => {
     expect(auth.oauthFallbacks).toEqual([{ index: 3, value: 'real-rotation-3' }]);
   });
 
+  it('recovers the real global primary from .env over promoting a fallback (incident 2026-06-25)', () => {
+    // Production reality: OneCLI sets process.env CLAUDE_CODE_OAUTH_TOKEN=
+    // placeholder, which dotenv-style loading does NOT override — so the real
+    // primary in `.env` is shadowed and invisible in `env`. Passing the .env
+    // file values lets us recover it as primary INSTEAD of promoting `_2`
+    // (which had hit a monthly spend cap and broke the whole global pool).
+    const env = {
+      CLAUDE_CODE_OAUTH_TOKEN: 'placeholder',
+      CLAUDE_CODE_OAUTH_TOKEN_2: 'capped-fallback-2',
+      CLAUDE_CODE_OAUTH_TOKEN_3: 'fallback-3',
+    };
+    const envFile = { CLAUDE_CODE_OAUTH_TOKEN: 'real-working-primary' };
+    const auth = resolveAnthropicAuth('illysium', env, envFile);
+    expect(auth.oauthPrimary).toBe('real-working-primary');
+    // Numbered fallbacks stay as fallbacks — NOT promoted.
+    expect(auth.oauthFallbacks).toEqual([
+      { index: 2, value: 'capped-fallback-2' },
+      { index: 3, value: 'fallback-3' },
+    ]);
+  });
+
+  it('still promotes a fallback when .env has no real global primary either', () => {
+    // Last-resort path preserved: if even the .env file lacks a real global
+    // (only numbered siblings exist), promote the first so non-scoped groups
+    // keep a rotation pool rather than collapsing to zero.
+    const env = {
+      CLAUDE_CODE_OAUTH_TOKEN: 'placeholder',
+      CLAUDE_CODE_OAUTH_TOKEN_2: 'real-rotation-2',
+      CLAUDE_CODE_OAUTH_TOKEN_3: 'real-rotation-3',
+    };
+    const auth = resolveAnthropicAuth('illysium', env, { CLAUDE_CODE_OAUTH_TOKEN: 'placeholder' });
+    expect(auth.oauthPrimary).toBe('real-rotation-2');
+    expect(auth.oauthFallbacks).toEqual([{ index: 3, value: 'real-rotation-3' }]);
+  });
+
   it('placeholder in a scoped slot is also filtered', () => {
     const env = {
       CLAUDE_CODE_OAUTH_TOKEN: 'global-oauth',

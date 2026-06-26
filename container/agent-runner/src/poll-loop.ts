@@ -332,6 +332,12 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         (effectiveEffort ? ` effort=${effectiveEffort}` : ''),
     );
 
+    // Fresh credential-rotation cycle for this turn: the active token stays
+    // sticky, but a since-healed credential (e.g. a reset session cap) is
+    // reachable again. Without this, a turn that exhausted the ring could
+    // never rotate again. (Incident 2026-06-25.)
+    config.provider.resetRotationCycle?.();
+
     const query = config.provider.query({
       prompt,
       continuation,
@@ -390,11 +396,16 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // fallbacks OR once they're exhausted, fall through to the error
       // write. Ordered before isContextTooLong because prompt-too-long can
       // LOOK retryable in some error shapes, and the rotation cost is low.
-      const rotation = config.provider.isRetryable?.(err) ? config.provider.rotateApiKey?.() : undefined;
-      if (rotation?.rotated) {
-        // Continuation is preserved across rotations: the SDK's `resume:`
-        // reads a local .jsonl, and the Anthropic API has no account-bound
-        // session object — the new credential just signs the next request.
+      // Keep cycling the credential pool until one succeeds or the ring is
+      // exhausted this turn. rotateApiKey is circular (wraps back to the
+      // primary); it returns rotated:false once every other credential has
+      // been tried this cycle, so the loop always terminates. Continuation is
+      // preserved across rotations: the SDK's `resume:` reads a local .jsonl,
+      // and the Anthropic API has no account-bound session object — the new
+      // credential just signs the next request. (Incident 2026-06-25: a
+      // single rotation could land on a spend-capped fallback and dead-end.)
+      let rotation = config.provider.isRetryable?.(err) ? config.provider.rotateApiKey?.() : undefined;
+      while (rotation?.rotated && !recovered) {
         log(`Upstream transient error — rotated credential, retrying same prompt in-turn`);
         try {
           const retryQuery = config.provider.query({
@@ -424,6 +435,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         } catch (retryErr) {
           const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
           log(`Retry after credential rotation also failed: ${retryMsg}`);
+          // Still retryable? Advance to the next credential in the ring and
+          // retry again; rotateApiKey returns rotated:false when the cycle is
+          // spent, ending the loop.
+          rotation = config.provider.isRetryable?.(retryErr) ? config.provider.rotateApiKey?.() : undefined;
         }
       }
 
@@ -1147,8 +1162,20 @@ export function handleEvent(event: ProviderEvent, routing: RoutingContext): void
       // post-then-edit progress line. Host tracks the platform_message_id
       // per session so subsequent progress events edit in place, and the
       // tracking clears when a real chat message lands.
+      // Stamp the turn's batch anchor so the host can tell this status apart
+      // from a prior turn's. When a turn ends without a chat-final (no
+      // <message> block emitted), the host's chat-final orphan cleanup never
+      // runs; the next turn's status carries a different anchor, which the
+      // host uses to delete the stale 💭 and post fresh rather than editing
+      // the prior turn's message in place. Mirrors the anchor stamped on chat
+      // rows (dispatchResultText / dispatchFileAttachment).
+      const statusAnchor =
+        routing.channelType && routing.platformId
+          ? (getBatchAnchor(routing.channelType, routing.platformId) ?? routing.inReplyTo)
+          : routing.inReplyTo;
       writeMessageOut({
         id: generateId(),
+        in_reply_to: statusAnchor,
         kind: 'status',
         platform_id: routing.platformId,
         channel_type: routing.channelType,

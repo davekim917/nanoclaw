@@ -70,6 +70,17 @@ export interface AgentProvider {
   rotateApiKey?(): { rotated: boolean };
 
   /**
+   * Reset the per-turn rotation cycle budget. Rotation is circular — on a
+   * retryable error the poll-loop keeps calling `rotateApiKey` to cycle
+   * through the whole credential pool (wrapping back to the primary) until
+   * one succeeds or the pool is exhausted *this turn*. The active position is
+   * sticky across turns (a recovered credential keeps serving), but each new
+   * turn gets a fresh full-cycle budget so a credential that's since healed
+   * can be retried. Poll-loop calls this once at the start of every turn.
+   */
+  resetRotationCycle?(): void;
+
+  /**
    * Optional pre-resume maintenance. Given the stored continuation token,
    * decide whether its backing transcript has grown too large or too old to
    * resume cheaply. Return a non-null reason string to tell the caller to drop

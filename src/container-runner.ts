@@ -43,6 +43,7 @@ import { checkAgentRunnerDepsDrift } from './agent-runner-image-check.js';
 import { EGRESS_NETWORK, egressNetworkArgs, ensureEgressNetwork } from './egress-lockdown.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { ensureOpus1mSuffix } from './flag-parser.js';
+import { readEnvFile } from './env.js';
 import { getAgentGroup, getWorkgroupOnecliSecrets } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
@@ -658,9 +659,13 @@ export interface ResolvedAnthropicAuth {
  * matching `resolveScopedEnv`. Folder names that match `^\d+$` collide
  * with the rotation suffix and per-group resolution is skipped for them.
  */
-export function resolveAnthropicAuth(folder: string, env: NodeJS.ProcessEnv = process.env): ResolvedAnthropicAuth {
-  const oauth = resolveScopedRotationSet('CLAUDE_CODE_OAUTH_TOKEN', folder, env);
-  const apiKey = resolveScopedRotationSet('ANTHROPIC_API_KEY', folder, env);
+export function resolveAnthropicAuth(
+  folder: string,
+  env: NodeJS.ProcessEnv = process.env,
+  envFile: Record<string, string> = {},
+): ResolvedAnthropicAuth {
+  const oauth = resolveScopedRotationSet('CLAUDE_CODE_OAUTH_TOKEN', folder, env, envFile);
+  const apiKey = resolveScopedRotationSet('ANTHROPIC_API_KEY', folder, env, envFile);
   return {
     oauthPrimary: oauth.primary,
     oauthFallbacks: oauth.fallbacks,
@@ -759,6 +764,7 @@ function resolveScopedRotationSet(
   base: string,
   folder: string,
   env: NodeJS.ProcessEnv,
+  envFile: Record<string, string> = {},
 ): { primary?: string; fallbacks: { index: number; value: string }[] } {
   const folderTok = folder.toUpperCase().replace(/-/g, '_');
   const isPureDigits = /^\d+$/.test(folderTok);
@@ -779,7 +785,16 @@ function resolveScopedRotationSet(
     return { primary: scopedPrimary, fallbacks };
   }
 
-  const primary = _filterPlaceholder(env[base]);
+  // `onecli run --` wraps the host service and injects `<base>=placeholder`
+  // into the process environment. dotenv-style loading does NOT override an
+  // already-present process.env key, so the operator's REAL global token in
+  // `.env` is never loaded into process.env and is invisible in `env` here.
+  // Recover it from the `.env` file directly so the intended primary is used
+  // rather than silently promoting a numbered fallback to primary (which may
+  // be a different — possibly spend-capped — account). Incident 2026-06-25:
+  // the global OAuth pool ran on the promoted `_2` for weeks while the real
+  // primary sat shadowed; it only surfaced once `_2`'s account hit a cap.
+  const primary = _filterPlaceholder(env[base]) ?? _filterPlaceholder(envFile[base]);
   const fallbacks: { index: number; value: string }[] = [];
   const fallbackRe = new RegExp(`^${base}_(\\d+)$`);
   for (const [k, v] of Object.entries(env)) {
@@ -2349,7 +2364,14 @@ async function buildContainerArgs(
   // global and pins the *entire* rotation set to the workplace/account
   // tokens for this group only — preventing fallback onto a different
   // account on retryable errors.
-  const auth = resolveAnthropicAuth(credentialFolder);
+  // Pass the `.env` file's real global token values so a placeholder-shadowed
+  // global primary (OneCLI wrapper) is recovered rather than promoting a
+  // numbered fallback. See resolveScopedRotationSet. (Incident 2026-06-25.)
+  const auth = resolveAnthropicAuth(
+    credentialFolder,
+    process.env,
+    readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY']),
+  );
 
   // Anthropic custom-upstream auth (ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY)
   // is forwarded inside the OneCLI gateway block below, after the gateway
