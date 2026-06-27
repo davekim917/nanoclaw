@@ -53,17 +53,19 @@ import {
  * (`inFlightItems > 0`, see below), so it measures the gap BETWEEN items —
  * the turn/started → first-item latency and inter-item gaps.
  *
- * 120s, NOT 60s. A 2026-06-27 attempt to tighten this to 60s broke codex
- * wholesale: codex is inherently slow in-container — a TRIVIAL `codex exec
- * "reply OK"` measured ~15s (xhigh reasoning effort + ~12k tokens of
- * skills/hooks/system prompt loaded per invocation), and a real task's
- * first-item / inter-item gap under load routinely exceeds 60s. The
- * between-item gaps are NOT "seconds" for codex at xhigh. With the
- * poll-loop retry on top, a 60s ceiling was actively destructive: a turn
- * that would finish at ~75s got killed at 60s, restarted from scratch,
- * killed again — so it never completed ("codex returns nothing"). 120s is
- * the empirically-safe floor; the retry + instrumentation below only kick
- * in for genuine >120s stalls.
+ * 5 minutes, generously. Codex is inherently slow in-container — a TRIVIAL
+ * `codex exec "reply OK"` measured ~15s (xhigh reasoning effort + ~12k tokens
+ * of skills/hooks/system prompt loaded per invocation), and a real task's
+ * first-item / inter-item gap under load is tens of seconds to minutes. The
+ * between-item gaps are NOT "seconds" for codex at xhigh. A 2026-06-27 attempt
+ * to tighten to 60s broke codex wholesale: with the poll-loop retry on top, a
+ * turn that would finish at ~75s got killed at 60s, restarted, killed again —
+ * never completing ("codex returns nothing"). So we err HARD toward
+ * tolerance: a false-fire on a slow-but-healthy turn is far worse than slow
+ * detection of a rare real wedge (host-sweep's 30-min ABSOLUTE_CEILING is the
+ * ultimate backstop). At a 5-min ceiling a fire almost certainly IS a real
+ * wedge — so poll-loop retries only ONCE (a re-run rarely revives a 5-min
+ * stall). Override via CODEX_TURN_IDLE_TIMEOUT_MS without a recompile.
  *
  * The handler tags a fire as classification 'idle_timeout' so poll-loop
  * retries the turn in-place (search `idle_timeout` in poll-loop.ts), and at
@@ -79,7 +81,7 @@ import {
  * ABSOLUTE_CEILING_MS (host-sweep.ts:163, same place that extends its
  * own ceiling for declared Bash timeouts).
  */
-const TURN_IDLE_TIMEOUT_MS = 120 * 1000;
+const TURN_IDLE_TIMEOUT_MS = Number(process.env.CODEX_TURN_IDLE_TIMEOUT_MS) || 5 * 60 * 1000;
 
 /**
  * Lookup tables for translating Codex's `collabAgentToolCall` tool names

@@ -66,14 +66,13 @@ export function transientOverloadDelayMs(n: number, rand: number = Math.random()
 }
 
 // Codex idle-watchdog recovery (provider yields classification 'idle_timeout'
-// after TURN_IDLE_TIMEOUT_MS — 120s — of app-server silence). With the 120s
-// floor, a fire means a genuine >2min stall, not just codex being slow (see
-// the TURN_IDLE_TIMEOUT_MS note: codex's normal gaps at xhigh effort can reach
-// tens of seconds, which is why 120s is load-bearing). Retry the same prompt
-// in-place; 2 is enough — a transient stall clears by the first retry, and a
-// true wedge won't clear by re-running, so more retries just delay the give-up.
-// Short linear backoff — the watchdog already waited out 2 minutes of silence.
-const CODEX_IDLE_RETRY_MAX = 2;
+// after TURN_IDLE_TIMEOUT_MS — 5 min — of app-server silence). At a 5-min
+// floor a fire almost certainly IS a real wedge (codex's normal slowness lives
+// well under that), so retry only ONCE: a re-run rarely revives a 5-min stall,
+// and each attempt costs another full ceiling, so more retries just make the
+// user wait longer for the give-up. Short backoff — the watchdog already
+// waited out 5 minutes of silence.
+const CODEX_IDLE_RETRY_MAX = 1;
 const CODEX_IDLE_RETRY_BASE_MS = 3000;
 
 /**
