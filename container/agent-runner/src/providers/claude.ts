@@ -587,6 +587,32 @@ export function createBlockSnowflakeConnectorHook(): HookCallback {
   };
 }
 
+// ── Block the codex companion (/codex:* skills) in-container ──
+// `/codex:rescue` and `/codex:review` both run `node …/codex-companion.mjs`,
+// whose runAppServerTurn hardcodes a read-only/workspace-write OS sandbox.
+// That sandbox cannot create its landlock/seccomp namespaces under nested
+// Docker, so codex hangs at sandbox init — observed 2026-06-27: a turn frozen
+// ~14s in with no output for 12+ min, misread as "the codex runtime is
+// wedged" (it isn't — `codex exec --yolo` round-trips in ~13s and generates
+// images fine). The container is already the isolation boundary; the correct
+// in-container path is `codex exec --yolo` (danger-full-access, no inner
+// sandbox). Block the companion with a redirect so the agent fast-fails to the
+// working path instead of hanging. Lives here in NanoClaw (not the codex
+// plugin) so a plugin-repo merge can't clobber it.
+const CODEX_COMPANION_RE = /codex-companion(\.mjs)?\b/;
+const CODEX_COMPANION_BLOCK_MSG =
+  'The /codex:* plugin skills (codex-companion.mjs) hang under nested Docker — their app-server forces an OS sandbox that cannot initialize in-container. Use `codex exec --yolo "<prompt>"` directly instead (no inner sandbox; the container is already the isolation boundary). It supports everything the skills do, including image generation.';
+
+export function createBlockCodexCompanionHook(): HookCallback {
+  return async (input) => {
+    const pre = input as PreToolUseHookInput;
+    const command = (pre.tool_input as { command?: string })?.command;
+    if (!command) return {};
+    if (CODEX_COMPANION_RE.test(command)) return denyBash(CODEX_COMPANION_BLOCK_MSG);
+    return {};
+  };
+}
+
 // ── Email gate ──
 // Intercept agent-initiated outbound Gmail sends and require admin approval
 // before the command runs. Two surfaces matter, both via the gws CLI:
@@ -1586,6 +1612,7 @@ export class ClaudeProvider implements AgentProvider {
                 createSelfApprovalBlockHook(),
                 createBlockSnowflakeConnectorHook(),
                 createBlockGitCloneHook(),
+                createBlockCodexCompanionHook(),
                 createEmailGateHook(),
                 ...(process.env.MNEMON_READ_ONLY === '1' ? [createBlockMnemonRealHook()] : []),
               ],

@@ -446,8 +446,8 @@ describe('codex turn timer is idle-based, not wall-clock', () => {
   // boundary — same exit point as a real wedge, with the same Slack
   // "Turn ended with an error" surface. The fix replaces the wall-clock
   // with an idle watchdog reset on every notification: real wedges (zero
-  // events) are caught in ~120s; legitimate long reasoning chains are not
-  // cut off so long as the app-server keeps emitting notifications.
+  // events) are caught in ~5min (env-overridable); legitimate long reasoning
+  // chains are not cut off so long as the app-server keeps emitting events.
   //
   // Source-anchored guards, matching the F4 + Layer-2 patterns.
 
@@ -467,14 +467,16 @@ describe('codex turn timer is idle-based, not wall-clock', () => {
     expect(codeOnly).not.toMatch(/\bTURN_TIMEOUT_MS\b/);
     // New idle constant must be present.
     expect(codeOnly).toMatch(/\bTURN_IDLE_TIMEOUT_MS\b/);
-    // The constant is a millisecond value within a reasonable range
-    // (60-300s). Too short trips false-positives on slow reasoning;
-    // too long delays wedge detection.
-    const decl = codeOnly.match(/const\s+TURN_IDLE_TIMEOUT_MS\s*=\s*([\d_*\s]+);/);
+    // Env-overridable (CODEX_TURN_IDLE_TIMEOUT_MS) with a hardcoded default.
+    // Capture the full RHS and eval it; with the env var unset (as in test) it
+    // resolves to the default. Default must sit in a sane range (1-10 min):
+    // too short trips false-positives on codex's inherently slow turns (60s
+    // broke codex wholesale, 2026-06-27); too long delays wedge detection.
+    const decl = codeOnly.match(/const\s+TURN_IDLE_TIMEOUT_MS\s*=\s*([^;]+);/);
     expect(decl).not.toBeNull();
     const ms = Function(`'use strict'; return (${decl![1]});`)() as number;
     expect(ms).toBeGreaterThanOrEqual(60_000);
-    expect(ms).toBeLessThanOrEqual(300_000);
+    expect(ms).toBeLessThanOrEqual(600_000);
   });
 
   it('handler resets the idle timer on every notification', () => {

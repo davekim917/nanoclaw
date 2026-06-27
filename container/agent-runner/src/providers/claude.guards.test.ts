@@ -5,6 +5,7 @@ import {
   createSelfApprovalBlockHook,
   createBlockSnowflakeConnectorHook,
   createBlockGitCloneHook,
+  createBlockCodexCompanionHook,
   createEmailGateHook,
 } from './claude.js';
 import { buildSecretEnvVarList } from './secret-env.js';
@@ -613,5 +614,32 @@ describe('E6 claude dispatch — each guard', () => {
       'git clone https://github.com/x/y /workspace/agent/y',
     );
     expect(gitClone.permissionDecision).toBe('deny');
+  });
+});
+
+// ── createBlockCodexCompanionHook: block /codex:* companion in-container ──
+describe('createBlockCodexCompanionHook', () => {
+  it('denies a direct codex-companion.mjs invocation with a redirect to codex exec --yolo', async () => {
+    const r = await runBashHook(
+      createBlockCodexCompanionHook(),
+      'node /workspace/plugins/codex/plugins/codex/scripts/codex-companion.mjs review --cwd /workspace/agent',
+    );
+    expect(r.permissionDecision).toBe('deny');
+    expect(r.permissionDecisionReason).toContain('codex exec --yolo');
+  });
+
+  it('denies the bare companion name too (rescue path)', async () => {
+    const r = await runBashHook(createBlockCodexCompanionHook(), 'node codex-companion review');
+    expect(r.permissionDecision).toBe('deny');
+  });
+
+  it('allows the correct in-container path (codex exec --yolo)', async () => {
+    const r = await runBashHook(createBlockCodexCompanionHook(), 'codex exec --yolo "reply OK"');
+    expect(r.permissionDecision).toBeUndefined();
+  });
+
+  it('does not match unrelated commands that merely mention codex', async () => {
+    const r = await runBashHook(createBlockCodexCompanionHook(), 'echo "running codex review later"');
+    expect(r.permissionDecision).toBeUndefined();
   });
 });
