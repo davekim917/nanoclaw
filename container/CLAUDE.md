@@ -140,6 +140,20 @@ fail with sandbox errors. The container is already the isolation
 boundary; `--yolo` (no inner sandbox) is the correct mode and is exactly
 how the team-qa/team-review codex validators invoke it.
 
+## Generating image FILES (not just inline previews)
+
+To produce an image as a real **file** (to save, read, hand to a sibling, or
+wire into HTML), generate it via the Codex CLI with an explicit save path:
+`codex exec --yolo "Generate <desc> and save it as /workspace/workgroup/<name>.png"`.
+This uses Codex's **built-in** generator (no `OPENAI_API_KEY` needed) and writes a
+real PNG you can then `Read`. Save under `/workspace/workgroup/` so siblings can read it.
+
+Do NOT use the inline chat imagegen tool for file work — it renders a preview but
+gives you no file path. And ignore the bundled imagegen `SKILL.md` claim that file
+output needs the OpenAI API (`OPENAI_API_KEY`) — that fallback is only for transparent
+backgrounds; NanoClaw uses no OpenAI key. Never report "blocked / access_restricted"
+for an ordinary image-file request.
+
 ## Conversation history
 
 The `conversations/` folder in your workspace holds searchable transcripts of past sessions with this group. Use it to recall prior context when a request references something that happened before. For structured long-lived data, prefer dedicated files (`customers.md`, `preferences.md`, etc.); split any file over ~500 lines into a folder with an index.
