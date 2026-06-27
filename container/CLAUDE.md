@@ -142,17 +142,22 @@ how the team-qa/team-review codex validators invoke it.
 
 ## Generating image FILES (not just inline previews)
 
-To produce an image as a real **file** (to save, read, hand to a sibling, or
-wire into HTML), generate it via the Codex CLI with an explicit save path:
-`codex exec --yolo "Generate <desc> and save it as /workspace/workgroup/<name>.png"`.
-This uses Codex's **built-in** generator (no `OPENAI_API_KEY` needed) and writes a
-real PNG you can then `Read`. Save under `/workspace/workgroup/` so siblings can read it.
+Generation takes ~3-4 min PER IMAGE — the #1 cause of "it failed with no file."
 
-Do NOT use the inline chat imagegen tool for file work — it renders a preview but
-gives you no file path. And ignore the bundled imagegen `SKILL.md` claim that file
-output needs the OpenAI API (`OPENAI_API_KEY`) — that fallback is only for transparent
-backgrounds; NanoClaw uses no OpenAI key. Never report "blocked / access_restricted"
-for an ordinary image-file request.
+**Codex agents (have native image generation):** just generate normally. NanoClaw
+saves the result as a real file — delivered as a chat attachment, and written under
+`~/.codex/generated_images/`. To hand it to a sibling, copy the newest file there
+into `/workspace/workgroup/`. Do NOT shell out to `codex exec` — you don't need it.
+
+**Claude / OpenCode agents (no native generation):** either delegate to your Codex
+sibling (@-mention it — it generates natively), or run it yourself via
+`codex exec --yolo "Generate <desc> and save it as /workspace/workgroup/<name>.png"`.
+If you run it yourself you MUST set your Bash tool's `timeout` to `600000` (10 min,
+the max) and do ONE image per call — the default 2-min timeout kills the render
+mid-flight with no file. This uses the built-in generator (no `OPENAI_API_KEY`); the
+bundled imagegen `SKILL.md` claim that file output needs the OpenAI API is wrong —
+that's only for transparent backgrounds, and NanoClaw uses no OpenAI key. Never
+report "blocked / access_restricted" for an ordinary image-file request.
 
 ## Conversation history
 
