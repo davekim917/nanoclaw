@@ -431,20 +431,38 @@ export const TRANSIENT_OVERLOAD_RESULT_RE =
 // buildSecretEnvVarList (the Bash-sanitize unset list) lives in secret-env.ts —
 // an SDK-free module so sibling adapters can import the same single-source list.
 
+// `codex exec` reads stdin IN ADDITION to the prompt arg — codex's own help:
+// "If stdin is piped and a prompt is also provided, stdin is appended as a
+// <stdin> block". The agent's Bash tool leaves stdin open (a pipe with no EOF),
+// so codex blocks forever on that read, gets killed at the turn timeout, and
+// its block-buffered output is lost — surfacing as "codex exec hangs, zero
+// output" (2026-06-27; my own earlier `docker exec` tests EOF'd stdin and
+// masked it). Wrapping the command group's stdin to /dev/null gives codex an
+// immediate EOF so it runs with just the prompt. An explicit `< file` on codex,
+// or a `… | codex` pipe, still wins (inner/pipe redirect binds closer), so
+// deliberate piped input is preserved; only the unused-open-stdin hang changes.
+const CODEX_EXEC_RE = /\bcodex\s+exec\b/;
+const ALREADY_DEVNULL_STDIN_RE = /<\s*\/dev\/null\b/;
+
 export function createSanitizeBashHook(): HookCallback {
   return async (input) => {
     const pre = input as PreToolUseHookInput;
     const command = (pre.tool_input as { command?: string })?.command;
     if (!command) return {};
     const vars = buildSecretEnvVarList();
-    if (vars.length === 0) return {};
-    const unsetPrefix = `unset ${vars.join(' ')} 2>/dev/null; `;
+    const unsetPrefix = vars.length > 0 ? `unset ${vars.join(' ')} 2>/dev/null; ` : '';
+    const wrapCodexStdin = CODEX_EXEC_RE.test(command) && !ALREADY_DEVNULL_STDIN_RE.test(command);
+
+    let rewritten = unsetPrefix + command;
+    if (wrapCodexStdin) rewritten = `{ ${rewritten} ; } </dev/null`;
+    if (rewritten === command) return {};
+
     return {
       hookSpecificOutput: {
         hookEventName: 'PreToolUse',
         updatedInput: {
           ...(pre.tool_input as Record<string, unknown>),
-          command: unsetPrefix + command,
+          command: rewritten,
         },
       },
     };

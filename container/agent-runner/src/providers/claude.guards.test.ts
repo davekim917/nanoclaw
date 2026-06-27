@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, spyOn } from 'bun:test';
 import type { HookCallback, PreToolUseHookInput } from '@anthropic-ai/claude-agent-sdk';
 
 import {
+  createSanitizeBashHook,
   createSelfApprovalBlockHook,
   createBlockSnowflakeConnectorHook,
   createBlockGitCloneHook,
@@ -641,5 +642,43 @@ describe('createBlockCodexCompanionHook', () => {
   it('does not match unrelated commands that merely mention codex', async () => {
     const r = await runBashHook(createBlockCodexCompanionHook(), 'echo "running codex review later"');
     expect(r.permissionDecision).toBeUndefined();
+  });
+});
+
+// ── createSanitizeBashHook: codex exec stdin /dev/null wrap ──
+describe('createSanitizeBashHook codex exec stdin fix', () => {
+  async function sanitize(command: string): Promise<string | undefined> {
+    const input = { tool_name: 'Bash', tool_input: { command } } as unknown as PreToolUseHookInput;
+    const out = await createSanitizeBashHook()(
+      input as Parameters<HookCallback>[0],
+      EMPTY_CTX,
+      EMPTY_OPTS,
+    );
+    const hso = (out as { hookSpecificOutput?: { updatedInput?: { command?: string } } })
+      ?.hookSpecificOutput;
+    return hso?.updatedInput?.command;
+  }
+
+  it('wraps a codex exec command so its stdin is /dev/null', async () => {
+    const out = await sanitize('codex exec --yolo "reply OK"');
+    expect(out).toContain('codex exec --yolo "reply OK"');
+    expect(out).toMatch(/^\{ .* ; \} <\/dev\/null$/);
+  });
+
+  it('wraps even with a cd prefix (last command is codex)', async () => {
+    const out = await sanitize('cd /workspace/agent && codex exec --yolo "x"');
+    expect(out).toMatch(/\} <\/dev\/null$/);
+    expect(out).toContain('cd /workspace/agent && codex exec');
+  });
+
+  it('does not double-redirect when stdin is already /dev/null', async () => {
+    const out = await sanitize('codex exec --yolo "x" </dev/null');
+    // Already has </dev/null → no group wrap added.
+    expect(out).not.toMatch(/\} <\/dev\/null$/);
+  });
+
+  it('does not wrap non-codex commands', async () => {
+    const out = await sanitize('ls -la /workspace');
+    expect(out ?? 'ls -la /workspace').not.toContain('</dev/null');
   });
 });
