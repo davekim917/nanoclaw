@@ -278,6 +278,60 @@ describe('resolveAnthropicAuth', () => {
     const auth = resolveAnthropicAuth('any', env);
     expect(auth.oauthFallbacks.map((f) => f.index)).toEqual([2, 5, 10]);
   });
+
+  // Disk (.env read fresh at spawn) supplements/overrides the host's stale
+  // startup process.env snapshot. The host loads .env once at startup, so a
+  // per-group token ADDED after that is absent from process.env — the
+  // 2026-06-27 incident: madison-reed ran on the global pool for ~15h while
+  // its scoped 3-account set sat in .env, unseen, and rotation had no healthy
+  // fallback to reach.
+  it('resolves a scoped set present only on disk, not yet in process.env (2026-06-27 incident)', () => {
+    // process.env was snapshotted before the scoped tokens were added — only
+    // the global token is present in the live host env.
+    const env = { CLAUDE_CODE_OAUTH_TOKEN: 'global-oauth' };
+    const envFile = {
+      CLAUDE_CODE_OAUTH_TOKEN: 'global-oauth',
+      CLAUDE_CODE_OAUTH_TOKEN_MADISON_REED: 'mr-oauth',
+      CLAUDE_CODE_OAUTH_TOKEN_MADISON_REED_2: 'mr-oauth-2',
+      CLAUDE_CODE_OAUTH_TOKEN_MADISON_REED_3: 'mr-oauth-3',
+    };
+    const auth = resolveAnthropicAuth('madison-reed', env, envFile);
+    expect(auth.oauthPrimary).toBe('mr-oauth');
+    expect(auth.oauthFallbacks).toEqual([
+      { index: 2, value: 'mr-oauth-2' },
+      { index: 3, value: 'mr-oauth-3' },
+    ]);
+  });
+
+  it('includes a scoped numbered sibling that exists only on disk', () => {
+    const env = {
+      CLAUDE_CODE_OAUTH_TOKEN_MADISON_REED: 'mr-oauth',
+      CLAUDE_CODE_OAUTH_TOKEN_MADISON_REED_2: 'mr-oauth-2',
+    };
+    // operator appended _3 to .env but hasn't restarted the host
+    const envFile = { CLAUDE_CODE_OAUTH_TOKEN_MADISON_REED_3: 'mr-oauth-3' };
+    const auth = resolveAnthropicAuth('madison-reed', env, envFile);
+    expect(auth.oauthFallbacks).toEqual([
+      { index: 2, value: 'mr-oauth-2' },
+      { index: 3, value: 'mr-oauth-3' },
+    ]);
+  });
+
+  it('disk value wins over a stale process.env value (token rotated in .env)', () => {
+    // operator replaced a capped token in .env; process.env still holds the old
+    // value from host startup. The container should spawn on the NEW token.
+    const env = { CLAUDE_CODE_OAUTH_TOKEN_MADISON_REED: 'stale-old-token' };
+    const envFile = { CLAUDE_CODE_OAUTH_TOKEN_MADISON_REED: 'fresh-new-token' };
+    expect(resolveAnthropicAuth('madison-reed', env, envFile).oauthPrimary).toBe('fresh-new-token');
+  });
+
+  it('includes a global numbered fallback present only on disk', () => {
+    const env = { CLAUDE_CODE_OAUTH_TOKEN: 'global-oauth' };
+    const envFile = { CLAUDE_CODE_OAUTH_TOKEN_2: 'global-oauth-2' };
+    const auth = resolveAnthropicAuth('any-folder', env, envFile);
+    expect(auth.oauthPrimary).toBe('global-oauth');
+    expect(auth.oauthFallbacks).toEqual([{ index: 2, value: 'global-oauth-2' }]);
+  });
 });
 
 describe('codex provider host auth', () => {

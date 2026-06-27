@@ -43,7 +43,7 @@ import { checkAgentRunnerDepsDrift } from './agent-runner-image-check.js';
 import { EGRESS_NETWORK, egressNetworkArgs, ensureEgressNetwork } from './egress-lockdown.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { ensureOpus1mSuffix } from './flag-parser.js';
-import { readEnvFile } from './env.js';
+import { readEnvFileMatching } from './env.js';
 import { getAgentGroup, getWorkgroupOnecliSecrets } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
@@ -768,14 +768,38 @@ function resolveScopedRotationSet(
 ): { primary?: string; fallbacks: { index: number; value: string }[] } {
   const folderTok = folder.toUpperCase().replace(/-/g, '_');
   const isPureDigits = /^\d+$/.test(folderTok);
+
+  // Effective credential view, placeholder-filtered: process.env first, then
+  // the `.env` file OVERLAID on top (disk wins). The host loads `.env` into
+  // process.env ONCE at startup, so any per-group `<base>_<FOLDER>`, scoped
+  // numbered sibling, or global `<base>_N` that was added OR changed in `.env`
+  // after the host started is invisible in process.env until a full host
+  // restart. We read `.env` fresh at each spawn and let it win, so an operator
+  // editing per-group tokens sees the change on the next container respawn —
+  // no host bounce. Disk-wins also subsumes the placeholder-shadow recovery:
+  // `onecli run --` injects `<base>=placeholder` into process.env, which the
+  // filter strips, and the real value from `.env` shows through. Previously
+  // ONLY the global `<base>` primary was disk-recovered (a single `??`), so
+  // scoped sets and numbered siblings fell through to the global pool until a
+  // restart. (Incidents: 2026-06-25 placeholder shadow, 2026-06-27 a group ran
+  // weeks on the global pool while its scoped 3-account set sat unseen.)
+  const merged: Record<string, string> = {};
+  for (const [k, v] of Object.entries(env)) {
+    const fv = _filterPlaceholder(v);
+    if (fv) merged[k] = fv;
+  }
+  for (const [k, v] of Object.entries(envFile)) {
+    const fv = _filterPlaceholder(v);
+    if (fv) merged[k] = fv;
+  }
+
   const scopedPrimaryKey = `${base}_${folderTok}`;
-  const scopedPrimary = !isPureDigits ? _filterPlaceholder(env[scopedPrimaryKey]) : undefined;
+  const scopedPrimary = !isPureDigits ? merged[scopedPrimaryKey] : undefined;
 
   if (scopedPrimary) {
     const fallbacks: { index: number; value: string }[] = [];
     const fallbackPrefix = `${scopedPrimaryKey}_`;
-    for (const [k, v] of Object.entries(env)) {
-      if (!v) continue;
+    for (const [k, v] of Object.entries(merged)) {
       if (!k.startsWith(fallbackPrefix)) continue;
       const tail = k.slice(fallbackPrefix.length);
       if (!/^\d+$/.test(tail)) continue;
@@ -785,35 +809,22 @@ function resolveScopedRotationSet(
     return { primary: scopedPrimary, fallbacks };
   }
 
-  // `onecli run --` wraps the host service and injects `<base>=placeholder`
-  // into the process environment. dotenv-style loading does NOT override an
-  // already-present process.env key, so the operator's REAL global token in
-  // `.env` is never loaded into process.env and is invisible in `env` here.
-  // Recover it from the `.env` file directly so the intended primary is used
-  // rather than silently promoting a numbered fallback to primary (which may
-  // be a different — possibly spend-capped — account). Incident 2026-06-25:
-  // the global OAuth pool ran on the promoted `_2` for weeks while the real
-  // primary sat shadowed; it only surfaced once `_2`'s account hit a cap.
-  const primary = _filterPlaceholder(env[base]) ?? _filterPlaceholder(envFile[base]);
+  const primary = merged[base];
   const fallbacks: { index: number; value: string }[] = [];
   const fallbackRe = new RegExp(`^${base}_(\\d+)$`);
-  for (const [k, v] of Object.entries(env)) {
-    if (!v) continue;
-    if (v === PLACEHOLDER_SENTINEL) continue;
+  for (const [k, v] of Object.entries(merged)) {
     const m = k.match(fallbackRe);
     if (!m) continue;
     fallbacks.push({ index: Number(m[1]), value: v });
   }
   fallbacks.sort((a, b) => a.index - b.index);
 
-  // When `onecli run --` wraps the host service it injects
-  // CLAUDE_CODE_OAUTH_TOKEN=placeholder into the global slot, which the
-  // filter above strips to undefined. If real rotation siblings exist in
-  // `.env` (e.g., CLAUDE_CODE_OAUTH_TOKEN_2/_3), promote the first one to
-  // primary so the container's in-SDK rotation pool stays the same size.
-  // Without this, container-runner's `if (hostOauth)` gate (line ~1528)
-  // skips forwarding fallbacks entirely → non-scoped groups silently lose
-  // their rotation pool and fall back to OneCLI vault single-token mode.
+  // Last resort: when even the recovered view has no real `<base>` primary
+  // (only numbered siblings exist — e.g. `onecli run --` placeholder + real
+  // `_2`/`_3` in .env), promote the first sibling so the container's rotation
+  // pool stays the same size. Without this, container-runner's `if (hostOauth)`
+  // gate skips forwarding fallbacks entirely and non-scoped groups silently
+  // lose their rotation pool, collapsing to OneCLI vault single-token mode.
   if (!primary && fallbacks.length > 0) {
     const promoted = fallbacks.shift()!;
     return { primary: promoted.value, fallbacks };
@@ -2364,13 +2375,17 @@ async function buildContainerArgs(
   // global and pins the *entire* rotation set to the workplace/account
   // tokens for this group only — preventing fallback onto a different
   // account on retryable errors.
-  // Pass the `.env` file's real global token values so a placeholder-shadowed
-  // global primary (OneCLI wrapper) is recovered rather than promoting a
-  // numbered fallback. See resolveScopedRotationSet. (Incident 2026-06-25.)
+  // Pass ALL Anthropic credential keys from `.env` read fresh at spawn — base,
+  // scoped `_<FOLDER>`, and numbered `_N` (and scoped-numbered) variants — so
+  // resolveScopedRotationSet can let disk win over the host's stale startup
+  // snapshot. This makes per-group token edits take effect on the next
+  // container respawn without a full host restart, and recovers a
+  // placeholder-shadowed global primary. See resolveScopedRotationSet.
+  // (Incidents 2026-06-25, 2026-06-27.)
   const auth = resolveAnthropicAuth(
     credentialFolder,
     process.env,
-    readEnvFile(['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY']),
+    readEnvFileMatching(/^(CLAUDE_CODE_OAUTH_TOKEN|ANTHROPIC_API_KEY)(_|$)/),
   );
 
   // Anthropic custom-upstream auth (ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY)
