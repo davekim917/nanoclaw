@@ -49,20 +49,26 @@ import {
  *
  * The handler at runOneTurn resets the timer on every JSON-RPC
  * notification (including `thread/status/changed` and `item/reasoning/*`
- * deltas). Crucially it ALSO suppresses itself while a tool/reasoning item
- * is in flight (`inFlightItems > 0`, see below), so the only silence it
- * actually measures is the GAP BETWEEN items — overwhelmingly the
- * turn/started → first-item latency, plus the rare inter-item gap. Those
- * gaps are normally seconds; 60s of silence there means the app-server has
- * stalled, not that the model is "thinking hard" (thinking is an item and is
- * suppressed). Dropped from 120s → 60s once it was clear (a) active
- * generation is suppressed, so we're not cutting off long reasoning, and
- * (b) these stalls are transient and recover on the next turn — so poll-loop
- * now RETRIES the turn in-place on an `idle_timeout` classification instead
- * of dead-ending the user (search `idle_timeout` in poll-loop.ts). At fire
- * time we log the last notification method seen, so any false-positive
- * pattern (e.g. a genuinely slow first item under load) is visible and the
- * timeout can be retuned with evidence rather than guessed.
+ * deltas). It suppresses itself while a tool/reasoning item is in flight
+ * (`inFlightItems > 0`, see below), so it measures the gap BETWEEN items —
+ * the turn/started → first-item latency and inter-item gaps.
+ *
+ * 120s, NOT 60s. A 2026-06-27 attempt to tighten this to 60s broke codex
+ * wholesale: codex is inherently slow in-container — a TRIVIAL `codex exec
+ * "reply OK"` measured ~15s (xhigh reasoning effort + ~12k tokens of
+ * skills/hooks/system prompt loaded per invocation), and a real task's
+ * first-item / inter-item gap under load routinely exceeds 60s. The
+ * between-item gaps are NOT "seconds" for codex at xhigh. With the
+ * poll-loop retry on top, a 60s ceiling was actively destructive: a turn
+ * that would finish at ~75s got killed at 60s, restarted from scratch,
+ * killed again — so it never completed ("codex returns nothing"). 120s is
+ * the empirically-safe floor; the retry + instrumentation below only kick
+ * in for genuine >120s stalls.
+ *
+ * The handler tags a fire as classification 'idle_timeout' so poll-loop
+ * retries the turn in-place (search `idle_timeout` in poll-loop.ts), and at
+ * fire time logs the last notification method seen so real wedges stay
+ * diagnosable despite the container's --rm losing the trace.
  *
  * Long-tool suppression: long-running tool calls (e.g. multi-minute Bash
  * tests, `hex project run --timeout 30m`) emit one `item/started` then
@@ -73,7 +79,7 @@ import {
  * ABSOLUTE_CEILING_MS (host-sweep.ts:163, same place that extends its
  * own ceiling for declared Bash timeouts).
  */
-const TURN_IDLE_TIMEOUT_MS = 60 * 1000;
+const TURN_IDLE_TIMEOUT_MS = 120 * 1000;
 
 /**
  * Lookup tables for translating Codex's `collabAgentToolCall` tool names
