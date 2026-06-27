@@ -65,6 +65,15 @@ export function transientOverloadDelayMs(n: number, rand: number = Math.random()
   return Math.floor(ceil / 2 + rand * (ceil / 2));
 }
 
+// Codex idle-watchdog recovery (provider yields classification 'idle_timeout'
+// after TURN_IDLE_TIMEOUT_MS of app-server silence). A transient stall clears
+// by the first retry, so 2 is enough; a DETERMINISTIC hang (same prompt + same
+// app-server re-wedges at the same item — observed 2026-06-27 on an image-gen
+// turn) can't be fixed by re-running, so more retries just delay the give-up.
+// Short linear backoff — the watchdog already waited out the silence.
+const CODEX_IDLE_RETRY_MAX = 2;
+const CODEX_IDLE_RETRY_BASE_MS = 3000;
+
 /**
  * True for SQLite errors that indicate a corrupt READ view — almost always a
  * cross-mount page-cache coherency issue on Docker Desktop macOS rather than
@@ -478,6 +487,70 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         }
       }
 
+      // Codex idle-watchdog recovery: the codex-app-server went silent past
+      // TURN_IDLE_TIMEOUT_MS and the provider classified the error
+      // 'idle_timeout'. These stalls are transient (they recover on the next
+      // user message), so retry the same prompt+continuation in-place instead
+      // of dead-ending the user — the retry is functionally identical to the
+      // "next message" that's already known to work. Bounded with a short
+      // linear backoff; heartbeat touched across the sleep so host-sweep
+      // doesn't reap the container mid-retry.
+      const codexIdle =
+        !recovered && err instanceof ProviderEventError && err.classification === 'idle_timeout';
+      if (codexIdle) {
+        for (let attempt = 0; attempt < CODEX_IDLE_RETRY_MAX && !recovered; attempt++) {
+          const sleepMs = CODEX_IDLE_RETRY_BASE_MS * (attempt + 1);
+          log(`Codex idle-timeout — retry ${attempt + 1}/${CODEX_IDLE_RETRY_MAX} in ${sleepMs}ms`);
+          const beat = setInterval(touchHeartbeat, TRANSIENT_OVERLOAD_HEARTBEAT_MS);
+          try {
+            await new Promise((resolve) => setTimeout(resolve, sleepMs));
+          } finally {
+            clearInterval(beat);
+          }
+          touchHeartbeat();
+          try {
+            const retryQuery = config.provider.query({
+              prompt,
+              continuation,
+              cwd: config.cwd,
+              systemContext: config.systemContext,
+              model: effectiveModel,
+              effort: effectiveEffort,
+              ultracode: effectiveUltracode,
+            });
+            const retryResult = await processQuery(
+              retryQuery,
+              routing,
+              processingIds,
+              config.providerName,
+              config.provider.onExchangeComplete?.bind(config.provider),
+              prompt,
+              continuation,
+              { model: effectiveModel, effort: effectiveEffort, ultracode: effectiveUltracode },
+            );
+            if (retryResult.continuation && retryResult.continuation !== continuation) {
+              continuation = retryResult.continuation;
+              setContinuation(config.providerName, continuation);
+            }
+            recovered = true;
+          } catch (retryErr) {
+            // Still stalled → back off and try again. Any other error → stop
+            // and let the original idle error fall through to the clean message.
+            if (retryErr instanceof ProviderEventError && retryErr.classification === 'idle_timeout') {
+              continue;
+            }
+            log(
+              `Retry after codex idle-timeout hit a different error: ` +
+                `${retryErr instanceof Error ? retryErr.message : String(retryErr)} — surfacing`,
+            );
+            break;
+          }
+        }
+        if (!recovered) {
+          log(`Codex idle-timeout — exhausted ${CODEX_IDLE_RETRY_MAX} retries`);
+        }
+      }
+
       // Retryable-upstream recovery: 429 / rate limit / overloaded /
       // upstream_error / subscription quota exhausted. If the provider has
       // fallback credentials configured (ANTHROPIC_API_KEY_N or
@@ -702,9 +775,11 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       if (!recovered) {
         const chatText = transient
           ? `⚠️ Anthropic's API stayed overloaded across ${TRANSIENT_OVERLOAD_MAX_TRIES} retries — I couldn't finish this turn. I'll pick up from your next message.`
-          : err instanceof ProviderEventError && err.retryable === false
-            ? `⚠️ Turn ended with an error: ${err.message}. I'll pick up from your next message.`
-            : `Error: ${errMsg}`;
+          : codexIdle
+            ? `⚠️ The Codex app-server stalled across ${CODEX_IDLE_RETRY_MAX} retries — I couldn't finish this turn. I'll pick up from your next message.`
+            : err instanceof ProviderEventError && err.retryable === false
+              ? `⚠️ Turn ended with an error: ${err.message}. I'll pick up from your next message.`
+              : `Error: ${errMsg}`;
         writeMessageOut({
           id: generateId(),
           kind: 'chat',

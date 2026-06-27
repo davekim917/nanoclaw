@@ -9,6 +9,7 @@ import {
   CodexProvider,
   augmentWithProxyEnv,
   copyRolloutToFallback,
+  classifyCodexError,
   extractImageGenerationPath,
   findNewestRolloutAcrossHomes,
   findRolloutFile,
@@ -821,21 +822,19 @@ describe('codex OAuth fallback — rotation primitives', () => {
   });
 
   describe('runOneTurn error → ProviderEvent classification mapping', () => {
-    // The mapping table lives in runOneTurn's terminal error emit (single
-    // location, very small). Source-anchored to keep the wire format frozen.
+    // The mapping now lives in the exported `classifyCodexError` helper — test
+    // it behaviorally (stronger than the prior source-anchored grep). Fuller
+    // coverage, incl. the idle_timeout path, is in codex.classify.test.ts.
     it('UsageLimitExceeded → classification "quota"', () => {
-      const src = fs.readFileSync(new URL('./codex.ts', import.meta.url), 'utf8');
-      expect(src).toMatch(/UsageLimitExceeded[\s\S]{0,80}classification\s*=\s*['"]quota['"]/);
+      expect(classifyCodexError('any message', 'UsageLimitExceeded')).toBe('quota');
     });
 
     it('ServerOverloaded → classification "overloaded"', () => {
-      const src = fs.readFileSync(new URL('./codex.ts', import.meta.url), 'utf8');
-      expect(src).toMatch(/ServerOverloaded[\s\S]{0,80}classification\s*=\s*['"]overloaded['"]/);
+      expect(classifyCodexError('any message', 'ServerOverloaded')).toBe('overloaded');
     });
 
     it('codex_system_error → classification "system_error"', () => {
-      const src = fs.readFileSync(new URL('./codex.ts', import.meta.url), 'utf8');
-      expect(src).toMatch(/codex_system_error[\s\S]{0,150}classification\s*=\s*['"]system_error['"]/);
+      expect(classifyCodexError('codex_system_error: detail', null)).toBe('system_error');
     });
   });
 

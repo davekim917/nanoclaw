@@ -49,10 +49,20 @@ import {
  *
  * The handler at runOneTurn resets the timer on every JSON-RPC
  * notification (including `thread/status/changed` and `item/reasoning/*`
- * deltas, which fire continuously during real work). 120s of total silence
- * with no events arriving = the app-server is wedged at the JSON-RPC
- * layer. Caught faster than the old 5-min wall-clock for real wedges; the
- * old false-positives on long reasoning chains go away.
+ * deltas). Crucially it ALSO suppresses itself while a tool/reasoning item
+ * is in flight (`inFlightItems > 0`, see below), so the only silence it
+ * actually measures is the GAP BETWEEN items — overwhelmingly the
+ * turn/started → first-item latency, plus the rare inter-item gap. Those
+ * gaps are normally seconds; 60s of silence there means the app-server has
+ * stalled, not that the model is "thinking hard" (thinking is an item and is
+ * suppressed). Dropped from 120s → 60s once it was clear (a) active
+ * generation is suppressed, so we're not cutting off long reasoning, and
+ * (b) these stalls are transient and recover on the next turn — so poll-loop
+ * now RETRIES the turn in-place on an `idle_timeout` classification instead
+ * of dead-ending the user (search `idle_timeout` in poll-loop.ts). At fire
+ * time we log the last notification method seen, so any false-positive
+ * pattern (e.g. a genuinely slow first item under load) is visible and the
+ * timeout can be retuned with evidence rather than guessed.
  *
  * Long-tool suppression: long-running tool calls (e.g. multi-minute Bash
  * tests, `hex project run --timeout 30m`) emit one `item/started` then
@@ -63,7 +73,7 @@ import {
  * ABSOLUTE_CEILING_MS (host-sweep.ts:163, same place that extends its
  * own ceiling for declared Bash timeouts).
  */
-const TURN_IDLE_TIMEOUT_MS = 120 * 1000;
+const TURN_IDLE_TIMEOUT_MS = 60 * 1000;
 
 /**
  * Lookup tables for translating Codex's `collabAgentToolCall` tool names
@@ -384,6 +394,27 @@ const ROTATABLE_CODEX_ERROR_KINDS: ReadonlySet<string> = new Set([
   'UsageLimitExceeded',
   'ServerOverloaded',
 ]);
+
+/**
+ * Map a terminal turn error to a ProviderEvent `classification` consumed by
+ * the poll-loop catch path:
+ *   - `quota` / `overloaded` → rotation-eligible (structured CodexErrorInfo)
+ *   - `system_error` → coarse thread/status/changed wedge (no structured detail)
+ *   - `idle_timeout` → app-server silence past TURN_IDLE_TIMEOUT_MS; transient,
+ *     poll-loop retries in-place
+ * A rotation-eligible `errorKind` short-circuits the message checks (a
+ * structured quota/overload error is never also a system/idle error).
+ */
+export function classifyCodexError(message: string, errorKind: string | null): string | undefined {
+  if (errorKind && ROTATABLE_CODEX_ERROR_KINDS.has(errorKind)) {
+    if (errorKind === 'UsageLimitExceeded') return 'quota';
+    if (errorKind === 'ServerOverloaded') return 'overloaded';
+    return undefined;
+  }
+  if (message.startsWith('codex_system_error')) return 'system_error';
+  if (message.includes('idle for')) return 'idle_timeout';
+  return undefined;
+}
 
 /**
  * Walk `${codexHome}/sessions/` for the rollout `.jsonl` whose filename
@@ -1103,6 +1134,12 @@ async function* runOneTurn(
   // backstop.
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
   let inFlightItems = 0;
+  // Instrumentation: the last notification method seen before the watchdog
+  // armed. Logged at fire time so we can tell a pre-first-item stall
+  // (last='turn/started') from an inter-item one (last='item/completed') —
+  // the difference between "model never started" and "model paused between
+  // steps" — without the lost-to-`--rm` container trace.
+  let lastMethod = '<turn-start>';
 
   const resetIdleTimer = (): void => {
     if (idleTimer !== null) {
@@ -1111,6 +1148,10 @@ async function* runOneTurn(
     }
     if (inFlightItems > 0) return;
     idleTimer = setTimeout(() => {
+      console.error(
+        `[codex-provider] idle watchdog fired after ${TURN_IDLE_TIMEOUT_MS}ms of silence ` +
+          `(last notification: ${lastMethod}, model: ${model}) — poll-loop will retry`,
+      );
       turnState.error = new Error(`Codex turn idle for ${TURN_IDLE_TIMEOUT_MS}ms (no notifications)`);
       turnDone = true;
       kick();
@@ -1120,6 +1161,7 @@ async function* runOneTurn(
   const handler = (n: JsonRpcNotification): void => {
     const method = n.method;
     const params = n.params;
+    lastMethod = method;
 
     // Adjust the tool-in-flight count BEFORE resetting the idle timer,
     // so the reset logic sees the new count and skips re-arming while a
@@ -1356,13 +1398,12 @@ async function* runOneTurn(
       // The `system_error` value below covers the coarse-systemError path
       // where thread/status/changed fired but no follow-up turn/completed
       // carried structured detail (observed wedge in codex-cli 0.130.0).
-      let classification: string | undefined;
-      if (turnState.errorKind && ROTATABLE_CODEX_ERROR_KINDS.has(turnState.errorKind)) {
-        if (turnState.errorKind === 'UsageLimitExceeded') classification = 'quota';
-        else if (turnState.errorKind === 'ServerOverloaded') classification = 'overloaded';
-      } else if (turnState.error.message.startsWith('codex_system_error')) {
-        classification = 'system_error';
-      }
+      // idle_timeout (TURN_IDLE_TIMEOUT_MS stall) classifies as transient and
+      // is retried in-place by poll-loop instead of dead-ending the user.
+      // retryable stays false: this is NOT the SDK-internal-retry signal (that
+      // path keeps the stream open) — the turn is dead and must be re-run via
+      // the catch path. See classifyCodexError.
+      const classification = classifyCodexError(turnState.error.message, turnState.errorKind);
       yield {
         type: 'error',
         message: turnState.error.message,
