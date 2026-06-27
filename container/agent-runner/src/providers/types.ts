@@ -55,6 +55,20 @@ export interface AgentProvider {
   isRetryable?(err: unknown): boolean;
 
   /**
+   * True if the error is a *transient server-side* rate limit / overload
+   * (HTTP 429/529, "temporarily limiting requests", explicitly "not your
+   * usage limit") — distinct from `isRetryable`, which also covers
+   * credential-quota exhaustion. The server is busy, not the credential, so
+   * rotating keys is useless; the cure is to wait and retry the SAME request.
+   * Poll-loop uses this to back off and retry in-turn (no rotation) instead
+   * of dispatching the provider's error text to the user as the agent's reply.
+   *
+   * Optional: providers whose runtime already retries overloads to exhaustion
+   * and then THROWS (vs. returning the error as result text) can omit this.
+   */
+  isTransientOverload?(err: unknown): boolean;
+
+  /**
    * Advance to the next configured fallback credential (API key or OAuth
    * token). Returns `rotated: true` if a rotation happened, false if no
    * more fallbacks remain. The stored continuation is preserved across

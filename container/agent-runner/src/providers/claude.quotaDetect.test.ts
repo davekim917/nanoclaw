@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'bun:test';
 
-import { QUOTA_RESULT_RE, SUBSCRIPTION_BLOCKED_RE } from './claude.js';
+import { QUOTA_RESULT_RE, SUBSCRIPTION_BLOCKED_RE, TRANSIENT_OVERLOAD_RESULT_RE } from './claude.js';
 
 // QUOTA_RESULT_RE gates OAuth-fallback rotation: when a top-level `result`
 // text matches, the provider throws `subscription_quota_exhausted` so the
@@ -79,6 +79,40 @@ describe('SUBSCRIPTION_BLOCKED_RE', () => {
     ).toBe(false);
     expect(
       SUBSCRIPTION_BLOCKED_RE.test('I checked: your organization has Claude access enabled.'),
+    ).toBe(false);
+  });
+});
+
+// TRANSIENT_OVERLOAD_RESULT_RE gates the backoff-retry path: a top-level
+// `result` text matching it makes the provider throw `transient_overload:` so
+// poll-loop retries the same prompt with backoff instead of posting the
+// rate-limit error to the user's channel as the agent's reply. Wording captured
+// verbatim from logs/nanoclaw.error.log (multiple sessions, 2026-06-20..26).
+describe('TRANSIENT_OVERLOAD_RESULT_RE', () => {
+  it('matches the exact overload + 429 wording rendered by the Claude binary', () => {
+    expect(
+      TRANSIENT_OVERLOAD_RESULT_RE.test(
+        'API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited',
+      ),
+    ).toBe(true);
+    expect(
+      TRANSIENT_OVERLOAD_RESULT_RE.test('API Error: Request rejected (429) · this may be a temporary cap'),
+    ).toBe(true);
+  });
+
+  it('does not match a usage-cap quota message (that path rotates, not retries)', () => {
+    // The quota message is NOT prefixed "API Error:" and names the usage limit.
+    expect(TRANSIENT_OVERLOAD_RESULT_RE.test("You've hit your session limit · resets 10:30pm")).toBe(
+      false,
+    );
+  });
+
+  it('does not match benign agent prose mentioning rate limits in passing', () => {
+    expect(TRANSIENT_OVERLOAD_RESULT_RE.test('The endpoint returned a 429, so I backed off.')).toBe(
+      false,
+    );
+    expect(
+      TRANSIENT_OVERLOAD_RESULT_RE.test('I saw a server temporarily limiting requests earlier.'),
     ).toBe(false);
   });
 });

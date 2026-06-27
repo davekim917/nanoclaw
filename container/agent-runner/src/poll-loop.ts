@@ -47,6 +47,24 @@ const ACTIVE_POLL_INTERVAL_MS = 500;
  */
 const CORRUPTION_STREAK_EXIT = 10;
 
+// Transient server-overload backoff (provider.isTransientOverload — the Claude
+// binary's "Server is temporarily limiting requests (not your usage limit)"
+// after its own internal retries are spent). Retry the same prompt with capped,
+// jittered exponential backoff. 30 tries × 30s cap ≈ 13 min worst case, well
+// under host-sweep's 30-min idle ceiling (heartbeat is touched across each
+// sleep). Full jitter is load-bearing: sibling containers hit the same overload
+// in lockstep, so a fixed schedule would have them all retry on the same beat.
+const TRANSIENT_OVERLOAD_MAX_TRIES = 30;
+const TRANSIENT_OVERLOAD_BASE_MS = 1500;
+const TRANSIENT_OVERLOAD_CAP_MS = 30_000;
+const TRANSIENT_OVERLOAD_HEARTBEAT_MS = 10_000;
+
+/** Capped exponential backoff with full jitter for retry attempt `n` (0-based). */
+export function transientOverloadDelayMs(n: number, rand: number = Math.random()): number {
+  const ceil = Math.min(TRANSIENT_OVERLOAD_CAP_MS, TRANSIENT_OVERLOAD_BASE_MS * 2 ** n);
+  return Math.floor(ceil / 2 + rand * (ceil / 2));
+}
+
 /**
  * True for SQLite errors that indicate a corrupt READ view — almost always a
  * cross-mount page-cache coherency issue on Docker Desktop macOS rather than
@@ -389,6 +407,77 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
       let recovered = false;
 
+      // Transient server-overload recovery: the provider's runtime hit a
+      // 429/529 ("temporarily limiting requests · not your usage limit"),
+      // exhausted its own internal retries, and surfaced the failure as result
+      // text (Claude) — which the provider re-threw with a `transient_overload:`
+      // marker. The credential is fine; the SERVER is busy. Rotating keys is
+      // pointless (every key hits the same overloaded backend), so back off and
+      // retry the SAME prompt+continuation in-turn, up to N times with a
+      // growing jittered sleep. Touch the heartbeat across each sleep so the
+      // host sweep doesn't kill the container as stale while we wait.
+      const transient = config.provider.isTransientOverload?.(err) ?? false;
+      if (transient) {
+        for (let attempt = 0; attempt < TRANSIENT_OVERLOAD_MAX_TRIES && !recovered; attempt++) {
+          const sleepMs = transientOverloadDelayMs(attempt);
+          log(
+            `Transient server overload — retry ${attempt + 1}/${TRANSIENT_OVERLOAD_MAX_TRIES} ` +
+              `in ${sleepMs}ms (same prompt, no rotation)`,
+          );
+          const beat = setInterval(touchHeartbeat, TRANSIENT_OVERLOAD_HEARTBEAT_MS);
+          try {
+            await new Promise((resolve) => setTimeout(resolve, sleepMs));
+          } finally {
+            clearInterval(beat);
+          }
+          touchHeartbeat();
+          try {
+            const retryQuery = config.provider.query({
+              prompt,
+              continuation,
+              cwd: config.cwd,
+              systemContext: config.systemContext,
+              model: effectiveModel,
+              effort: effectiveEffort,
+              ultracode: effectiveUltracode,
+            });
+            const retryResult = await processQuery(
+              retryQuery,
+              routing,
+              processingIds,
+              config.providerName,
+              config.provider.onExchangeComplete?.bind(config.provider),
+              prompt,
+              continuation,
+              { model: effectiveModel, effort: effectiveEffort, ultracode: effectiveUltracode },
+            );
+            if (retryResult.continuation && retryResult.continuation !== continuation) {
+              continuation = retryResult.continuation;
+              setContinuation(config.providerName, continuation);
+            }
+            recovered = true;
+          } catch (retryErr) {
+            // Still overloaded → back off and try again. A *different* error
+            // (the prompt/continuation didn't change, so context-too-long etc.
+            // is essentially impossible mid-retry) → stop and surface the clean
+            // exhausted message. ponytail: a quota-exhaustion appearing here
+            // (overload clears, then the credential's cap is hit) does NOT
+            // rotate this turn — but the next user message starts a fresh turn
+            // that hits the normal rotation path, so it self-heals; not worth
+            // threading retryErr through every downstream recovery branch.
+            if (config.provider.isTransientOverload?.(retryErr)) continue;
+            log(
+              `Retry during transient overload hit a non-transient error: ` +
+                `${retryErr instanceof Error ? retryErr.message : String(retryErr)} — surfacing`,
+            );
+            break;
+          }
+        }
+        if (!recovered) {
+          log(`Transient server overload — exhausted ${TRANSIENT_OVERLOAD_MAX_TRIES} retries`);
+        }
+      }
+
       // Retryable-upstream recovery: 429 / rate limit / overloaded /
       // upstream_error / subscription quota exhausted. If the provider has
       // fallback credentials configured (ANTHROPIC_API_KEY_N or
@@ -404,7 +493,13 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // and the Anthropic API has no account-bound session object — the new
       // credential just signs the next request. (Incident 2026-06-25: a
       // single rotation could land on a spend-capped fallback and dead-end.)
-      let rotation = config.provider.isRetryable?.(err) ? config.provider.rotateApiKey?.() : undefined;
+      // `!transient`: a transient overload also matches isRetryable (its text
+      // contains "Rate limited"), but rotation is the wrong cure — it was
+      // already handled by the backoff loop above. Exclude it here.
+      let rotation =
+        !transient && !recovered && config.provider.isRetryable?.(err)
+          ? config.provider.rotateApiKey?.()
+          : undefined;
       while (rotation?.rotated && !recovered) {
         log(`Upstream transient error — rotated credential, retrying same prompt in-turn`);
         try {
@@ -605,8 +700,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
       // Only surface the error to the user if we couldn't recover inline.
       if (!recovered) {
-        const chatText =
-          err instanceof ProviderEventError && err.retryable === false
+        const chatText = transient
+          ? `⚠️ Anthropic's API stayed overloaded across ${TRANSIENT_OVERLOAD_MAX_TRIES} retries — I couldn't finish this turn. I'll pick up from your next message.`
+          : err instanceof ProviderEventError && err.retryable === false
             ? `⚠️ Turn ended with an error: ${err.message}. I'll pick up from your next message.`
             : `Error: ${errMsg}`;
         writeMessageOut({

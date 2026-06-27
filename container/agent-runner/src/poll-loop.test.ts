@@ -15,6 +15,7 @@ import {
   isAupRefusal,
   isCorruptionError,
   selectInTurnFollowUps,
+  transientOverloadDelayMs,
 } from './poll-loop.js';
 import { MockProvider } from './providers/mock.js';
 
@@ -1144,5 +1145,28 @@ describe('isCorruptionError', () => {
     expect(isCorruptionError('database is locked')).toBe(false);
     expect(isCorruptionError('no such table: messages_in')).toBe(false);
     expect(isCorruptionError('')).toBe(false);
+  });
+});
+
+describe('transientOverloadDelayMs — server-overload backoff schedule', () => {
+  // base 1500ms, cap 30_000ms, full jitter (delay ∈ [ceil/2, ceil]).
+  it('grows exponentially then clamps at the 30s cap', () => {
+    // rand=1 → top of the jitter band = the full ceiling for that attempt.
+    expect(transientOverloadDelayMs(0, 1)).toBe(1500); // 1500 * 2^0
+    expect(transientOverloadDelayMs(1, 1)).toBe(3000); // 1500 * 2^1
+    expect(transientOverloadDelayMs(4, 1)).toBe(24000); // 1500 * 2^4
+    expect(transientOverloadDelayMs(5, 1)).toBe(30000); // 48000 → clamped
+    expect(transientOverloadDelayMs(29, 1)).toBe(30000); // last attempt, still clamped
+  });
+
+  it('applies full jitter — never below half the ceiling, never above it', () => {
+    // rand=0 → bottom of the band = ceil/2.
+    expect(transientOverloadDelayMs(0, 0)).toBe(750);
+    expect(transientOverloadDelayMs(5, 0)).toBe(15000); // clamped ceil 30000 / 2
+    // 30 attempts capped at 30s each ≈ 13 min worst case — under the host
+    // sweep's 30-min idle ceiling (heartbeat is touched across each sleep).
+    let worstCaseMs = 0;
+    for (let n = 0; n < 30; n++) worstCaseMs += transientOverloadDelayMs(n, 1);
+    expect(worstCaseMs).toBeLessThan(30 * 60 * 1000);
   });
 });

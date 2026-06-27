@@ -408,6 +408,26 @@ export const SUBSCRIPTION_BLOCKED_RE =
 // with a recap. See STALE_SESSION_RE for how continuations get poisoned.
 export const POISONED_CONTINUATION_RE = /invalid `?signature`? in `?thinking`? block/i;
 
+// Transient server-side rate limit / overload (HTTP 429/529). After the Claude
+// binary exhausts its OWN internal api_retry attempts, it renders the failure
+// as the turn's RESULT TEXT (not a thrown error, not a rate_limit_event) via
+// `Ml({content, error:"rate_limit"})`:
+//   "API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited"
+//   "API Error: Request rejected (429) · …"
+// Without interception the poll-loop dispatches this 88-char string to the
+// user's channel as the agent's answer and ends the turn silently — the user
+// then has to re-prompt (Dave, 2026-06-26: "extremely disrupting" on long
+// tasks). Throw with a distinct `transient_overload:` marker so poll-loop's
+// catch retries the SAME prompt+continuation with backoff. Rotation is the
+// WRONG cure here — "not your usage limit" means the credential is fine, the
+// server is busy; another key hits the same overloaded server.
+//
+// Anchored on the rendered "API Error:" prefix + the specific server-limit
+// phrase so an agent quoting these words in prose can't trip it (a normal
+// result is the agent's own text, never prefixed "API Error:").
+export const TRANSIENT_OVERLOAD_RESULT_RE =
+  /^API Error:\s*(?:Server is temporarily limiting requests|Request rejected \(429\))/i;
+
 // buildSecretEnvVarList (the Bash-sanitize unset list) lives in secret-env.ts —
 // an SDK-free module so sibling adapters can import the same single-source list.
 
@@ -1352,6 +1372,11 @@ export class ClaudeProvider implements AgentProvider {
     return RETRYABLE_ERROR_RE.test(msg);
   }
 
+  isTransientOverload(err: unknown): boolean {
+    const msg = err instanceof Error ? err.message : String(err);
+    return msg.startsWith('transient_overload:');
+  }
+
   /**
    * Advance the active Anthropic credential to the next fallback. Prefers
    * OAuth rotation (Claude Max) when OAuth is the active auth path — that
@@ -1646,6 +1671,12 @@ export class ClaudeProvider implements AgentProvider {
             // dispatching the raw 400 to the user (and dead-stopping the
             // session — the same history would fail every future turn).
             throw new Error(text);
+          }
+          if (text && TRANSIENT_OVERLOAD_RESULT_RE.test(text)) {
+            // Throw so poll-loop's transient-overload branch backs off and
+            // retries the same prompt instead of posting the rate-limit error
+            // to the user's channel as the agent's reply.
+            throw new Error(`transient_overload: ${text}`);
           }
           yield { type: 'result', text };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'api_retry') {
