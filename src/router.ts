@@ -331,6 +331,14 @@ function effectiveThreadIdForAgent(
   return `${event.platformId}:${event.message.id}`;
 }
 
+function parseUtcTimestampMs(value: string | null | undefined): number | null {
+  if (!value) return null;
+  let normalized = value.includes('T') ? value : value.replace(' ', 'T');
+  if (!/(?:[zZ]|[+-]\d{2}:?\d{2})$/.test(normalized)) normalized += 'Z';
+  const ms = Date.parse(normalized);
+  return Number.isNaN(ms) ? null : ms;
+}
+
 /**
  * Route an inbound message from a channel adapter to the correct session.
  * Creates messaging group + session if they don't exist yet.
@@ -925,7 +933,7 @@ async function deliverToAgent(
   // fetch recent thread history from the platform (covers messages from
   // other bots and plain user messages that never engaged us) and prepend
   // it to the trigger. First wake: include everything (up to 50). Later
-  // wakes: only messages newer than the session's last_active — the agent's
+  // wakes: only messages newer than the last delivered response — the agent's
   // own prior turns are already in the SDK continuation, so re-prepending
   // them would just bloat context.
   let contentForWrite = persistedContent;
@@ -947,14 +955,14 @@ async function deliverToAgent(
         limit: 50,
         excludeMessageId: event.message.id,
       });
-      const sinceIso = created ? null : session.last_active;
-      // Anchor messages (Discord thread parents — what the @mention was
-      // replying to, plus the @mention itself) are load-bearing context
-      // that doesn't decay. The agent's prior turns ARE in the SDK
-      // continuation, but the original ask isn't — it lived outside the
-      // thread. Exempt anchors from the last_active filter so follow-up
-      // wakes still see "what is this thread actually about?"
-      const relevant = sinceIso ? history.filter((m) => m.isAnchor || m.timestamp > sinceIso) : history;
+      const sinceMs = created ? null : parseUtcTimestampMs(session.last_outbound_at ?? session.last_active);
+      const relevant =
+        sinceMs === null
+          ? history
+          : history.filter((m) => {
+              const messageMs = parseUtcTimestampMs(m.timestamp);
+              return messageMs === null || messageMs > sinceMs;
+            });
       if (relevant.length > 0) {
         const header = created ? 'Thread context' : 'New in thread since last response';
         const transcript = relevant.map((m) => `${m.sender}: ${m.text}`).join('\n');

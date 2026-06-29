@@ -161,6 +161,8 @@ export interface Session {
   status: 'active' | 'closed';
   container_status: 'running' | 'idle' | 'stopped';
   last_active: string | null;
+  last_outbound_at?: string | null;
+  last_outbound_kind?: string | null;
   created_at: string;
 }
 

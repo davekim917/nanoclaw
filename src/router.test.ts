@@ -108,7 +108,7 @@ import { writeSessionMessage, writeOutboundDirect, resolveSession } from './sess
 import { wakeContainer } from './container-runner.js';
 import { isAnyAdmin } from './modules/permissions/db/user-roles.js';
 import { registerInterceptHandler, clearInterceptHandlers } from './command-gate.js';
-import type { InboundEvent } from './channels/adapter.js';
+import type { ChannelAdapter, InboundEvent } from './channels/adapter.js';
 import type { MessagingGroup, MessagingGroupAgent } from './types.js';
 
 function makeMg(overrides: Partial<MessagingGroup> = {}): MessagingGroup {
@@ -425,5 +425,110 @@ describe('flag dispatcher wake gate', () => {
     await routeInbound(event);
 
     expect(parseMessageFlags).toHaveBeenCalledWith(expect.any(String), 'codex');
+  });
+});
+
+describe('thread context fetch', () => {
+  it('uses last_outbound_at as the cutoff and does not replay stale anchors', async () => {
+    const { getAgentGroup } = await import('./db/agent-groups.js');
+    const { getChannelAdapter } = await import('./channels/channel-registry.js');
+    const fetchThreadHistory = vi.fn().mockResolvedValue([
+      {
+        sender: 'Dave',
+        text: '@Axie do you have access to my Pocket meetings?',
+        timestamp: '2026-06-28T22:00:00.000Z',
+        isAnchor: true,
+      },
+      {
+        sender: 'assistant',
+        text: 'Pocket yes, fully wired.',
+        timestamp: '2026-06-28T22:39:40.000Z',
+      },
+      {
+        sender: 'Dave',
+        text: 'old user follow-up before the prior response finished',
+        timestamp: '2026-06-28T22:38:00.000Z',
+      },
+      {
+        sender: 'Mike',
+        text: 'fresh context after the prior response',
+        timestamp: '2026-06-28T23:00:00.000Z',
+      },
+    ]);
+
+    const adapter: ChannelAdapter = {
+      name: 'discord',
+      channelType: 'discord',
+      supportsThreads: true,
+      setup: vi.fn(),
+      teardown: vi.fn(),
+      isConnected: vi.fn(() => true),
+      deliver: vi.fn(),
+      fetchThreadHistory,
+    };
+    vi.mocked(getChannelAdapter).mockReturnValue(adapter);
+    vi.mocked(getMessagingGroupWithAgentCount).mockReturnValue({
+      mg: makeMg({
+        id: 'mg-discord-number',
+        channel_type: 'discord',
+        platform_id: 'discord:g:c',
+        is_group: 1,
+      }),
+      agentCount: 1,
+    });
+    vi.mocked(getMessagingGroupAgents).mockReturnValue([makeAgent({ agent_group_id: 'ag-number' })]);
+    vi.mocked(getAgentGroup).mockReturnValue({
+      id: 'ag-number',
+      name: 'number-drinks',
+      folder: 'number-drinks',
+      agent_provider: null,
+      created_at: new Date().toISOString(),
+    });
+    vi.mocked(resolveSession).mockReturnValue({
+      session: {
+        id: 'sess-thread',
+        agent_group_id: 'ag-number',
+        messaging_group_id: 'mg-discord-number',
+        thread_id: 'discord:g:c:t',
+        agent_provider: null,
+        status: 'active',
+        container_status: 'idle',
+        last_active: '2026-06-28T22:36:57.000Z',
+        last_outbound_at: '2026-06-28 22:39:40',
+        created_at: new Date().toISOString(),
+      },
+      created: false,
+    });
+
+    await routeInbound(
+      makeChatEvent('@Axie great, I created staging', {
+        channelType: 'discord',
+        platformId: 'discord:g:c',
+        threadId: 'discord:g:c:t',
+        isDM: false,
+        message: {
+          id: 'latest-msg',
+          kind: 'chat-sdk',
+          content: JSON.stringify({ sender: 'Dave', text: '@Axie great, I created staging' }),
+          timestamp: '2026-06-28T23:32:27.486Z',
+          isMention: true,
+          isGroup: true,
+        },
+      }),
+    );
+
+    expect(fetchThreadHistory).toHaveBeenCalledWith('discord:g:c:t', {
+      limit: 50,
+      excludeMessageId: 'latest-msg',
+    });
+    expect(writeSessionMessage).toHaveBeenCalledOnce();
+    const written = vi.mocked(writeSessionMessage).mock.calls[0]![2];
+    const text = JSON.parse(written.content).text as string;
+    expect(text).toContain('[New in thread since last response]');
+    expect(text).toContain('Mike: fresh context after the prior response');
+    expect(text).toContain('[Latest message]\n@Axie great, I created staging');
+    expect(text).not.toContain('Pocket meetings');
+    expect(text).not.toContain('Pocket yes');
+    expect(text).not.toContain('old user follow-up');
   });
 });
