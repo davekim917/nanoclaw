@@ -1,8 +1,11 @@
 /**
  * Per-thread worktree cleanup cron (Phase 2.11) — host-side GC.
  *
- * Walks data/v2-sessions/<agId>/<sessionId>/worktrees/<repo>/ and
- * removes worktrees whose branch has been merged on GitHub or whose
+ * Walks both worktree layouts:
+ * - data/v2-sessions/<agId>/<sessionId>/worktrees/<repo>/
+ * - data/v2-threads/<threadKey>/worktrees/<repo>/
+ *
+ * Removes worktrees whose branch has been merged on GitHub or whose
  * remote branch has been deleted. Skips dirty, unpushed, and detached
  * HEAD worktrees — those are in-flight agent work.
  *
@@ -27,9 +30,11 @@ import path from 'path';
 
 import { DATA_DIR, GROUPS_DIR } from './config.js';
 import { isContainerRunning } from './container-runner.js';
+import { getDb } from './db/connection.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getSession } from './db/sessions.js';
 import { log } from './log.js';
+import { threadWorktreeDir } from './session-manager.js';
 
 const CLEANUP_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const STARTUP_DELAY_MS = 60_000;
@@ -111,67 +116,141 @@ function safeReaddir(dir: string): string[] {
 }
 
 interface WorktreeTarget {
+  scope: 'session' | 'thread';
   agentGroupId: string;
   sessionId: string;
+  sessionIds: string[];
   repo: string;
   worktreePath: string;
   canonicalRepoPath: string;
 }
 
 function discoverWorktrees(): WorktreeTarget[] {
-  // TODO (Stage 8 follow-up): also walk data/v2-threads/<key>/worktrees/
-  // when NANOCLAW_THREAD_WORKTREES=1. Thread-scoped worktrees are shared
-  // across sibling sessions in a thread; the cleanup gate needs to skip
-  // when ANY active session referencing the thread has a live container,
-  // and the canonical-repo lookup needs to pick one of the participating
-  // agent groups (any works — siblings symlink the same source-group repo).
-  // Until that lands, thread-scoped worktrees are GC'd manually:
-  //   rm -rf data/v2-threads/<key>/worktrees/<repo>
   const sessionsRoot = path.join(DATA_DIR, 'v2-sessions');
-  if (!fs.existsSync(sessionsRoot)) return [];
+  const results: WorktreeTarget[] = [];
+
+  if (fs.existsSync(sessionsRoot)) {
+    for (const agentGroupId of safeReaddir(sessionsRoot)) {
+      const ag = getAgentGroup(agentGroupId);
+      if (!ag) continue;
+      const canonicalBase = path.join(GROUPS_DIR, ag.folder);
+      const agDir = path.join(sessionsRoot, agentGroupId);
+
+      for (const entry of safeReaddir(agDir)) {
+        // Skip overlay dirs that aren't session dirs.
+        if (entry === 'agent-runner-src' || entry === '.claude-shared') continue;
+        const worktreesDir = path.join(agDir, entry, 'worktrees');
+        if (!fs.existsSync(worktreesDir)) continue;
+        for (const repo of safeReaddir(worktreesDir)) {
+          results.push({
+            scope: 'session',
+            agentGroupId,
+            sessionId: entry,
+            sessionIds: [entry],
+            repo,
+            worktreePath: path.join(worktreesDir, repo),
+            canonicalRepoPath: path.join(canonicalBase, repo),
+          });
+        }
+      }
+    }
+  }
+
+  results.push(...discoverThreadWorktrees());
+  return results;
+}
+
+interface ThreadParticipant {
+  sessionId: string;
+  agentGroupId: string;
+  worktreeDir: string;
+}
+
+function discoverThreadWorktrees(): WorktreeTarget[] {
+  let rows: Array<{
+    session_id: string;
+    agent_group_id: string;
+    thread_id: string | null;
+    platform_id: string;
+  }>;
+  try {
+    rows = getDb()
+      .prepare(
+        `SELECT s.id AS session_id, s.agent_group_id, s.thread_id, mg.platform_id
+           FROM sessions s
+           JOIN messaging_groups mg ON mg.id = s.messaging_group_id
+          WHERE s.status = 'active' AND s.messaging_group_id IS NOT NULL`,
+      )
+      .all() as typeof rows;
+  } catch (err) {
+    log.warn('Worktree cleanup: failed to discover thread worktrees', { err });
+    return [];
+  }
+
+  const participantsByDir = new Map<string, ThreadParticipant[]>();
+  for (const row of rows) {
+    const worktreeDir = threadWorktreeDir(row.platform_id, row.thread_id);
+    const participants = participantsByDir.get(worktreeDir) ?? [];
+    participants.push({
+      sessionId: row.session_id,
+      agentGroupId: row.agent_group_id,
+      worktreeDir,
+    });
+    participantsByDir.set(worktreeDir, participants);
+  }
 
   const results: WorktreeTarget[] = [];
-  for (const agentGroupId of safeReaddir(sessionsRoot)) {
-    const ag = getAgentGroup(agentGroupId);
-    if (!ag) continue;
-    const canonicalBase = path.join(GROUPS_DIR, ag.folder);
-    const agDir = path.join(sessionsRoot, agentGroupId);
+  for (const [worktreeDir, participants] of participantsByDir) {
+    if (participants.length === 0 || !fs.existsSync(worktreeDir)) continue;
 
-    for (const entry of safeReaddir(agDir)) {
-      // Skip overlay dirs that aren't session dirs.
-      if (entry === 'agent-runner-src' || entry === '.claude-shared') continue;
-      const worktreesDir = path.join(agDir, entry, 'worktrees');
-      if (!fs.existsSync(worktreesDir)) continue;
-      for (const repo of safeReaddir(worktreesDir)) {
-        results.push({
-          agentGroupId,
-          sessionId: entry,
-          repo,
-          worktreePath: path.join(worktreesDir, repo),
-          canonicalRepoPath: path.join(canonicalBase, repo),
-        });
-      }
+    for (const repo of safeReaddir(worktreeDir)) {
+      const canonicalRepoPath = resolveCanonicalRepoPath(repo, participants);
+      if (!canonicalRepoPath) continue;
+      const primary = participants[0]!;
+      results.push({
+        scope: 'thread',
+        agentGroupId: primary.agentGroupId,
+        sessionId: primary.sessionId,
+        sessionIds: participants.map((p) => p.sessionId),
+        repo,
+        worktreePath: path.join(worktreeDir, repo),
+        canonicalRepoPath,
+      });
     }
   }
   return results;
 }
 
-function cleanupOne(target: WorktreeTarget): void {
-  const { sessionId, worktreePath, canonicalRepoPath, repo, agentGroupId } = target;
-  const ctx = { agentGroupId, sessionId, repo };
+function resolveCanonicalRepoPath(repo: string, participants: ThreadParticipant[]): string | null {
+  let fallback: string | null = null;
+  for (const participant of participants) {
+    const ag = getAgentGroup(participant.agentGroupId);
+    if (!ag) continue;
+    const candidate = path.join(GROUPS_DIR, ag.folder, repo);
+    fallback ??= candidate;
+    if (fs.existsSync(path.join(candidate, '.git'))) {
+      return candidate;
+    }
+  }
+  return fallback;
+}
 
-  // Guard: skip if the session's container is live — it may be mid-git.
-  if (isContainerRunning(sessionId)) {
-    log.debug('Worktree cleanup: skipping session with live container', ctx);
+function cleanupOne(target: WorktreeTarget): void {
+  const { sessionId, sessionIds, worktreePath, canonicalRepoPath, repo, agentGroupId, scope } = target;
+  const ctx = { scope, agentGroupId, sessionId, repo };
+
+  // Guard: skip if any mapped session's container is live — it may be mid-git.
+  if (sessionIds.some((id) => isContainerRunning(id))) {
+    log.debug('Worktree cleanup: skipping target with live container', { ...ctx, sessionIds });
     return;
   }
 
-  // Skip if session is gone from the DB — but keep the worktree for now
-  // in case it was an unexpected DB prune. Deletion-by-DB-absence is not
-  // safe without a separate sweep.
-  const sess = getSession(sessionId);
-  if (!sess) {
-    log.debug('Worktree cleanup: session not in DB, skipping', ctx);
+  // Skip if every mapped session is gone from the DB — but keep the worktree
+  // for now in case it was an unexpected DB prune. Deletion-by-DB-absence is
+  // not safe without a separate sweep.
+  const hasKnownSession = sessionIds.some((id) => Boolean(getSession(id)));
+  if (!hasKnownSession) {
+    log.debug('Worktree cleanup: no mapped session in DB, skipping', { ...ctx, sessionIds });
     return;
   }
 
@@ -255,6 +334,10 @@ function runOnce(): void {
   for (const t of targets) {
     cleanupOne(t);
   }
+}
+
+export function _discoverWorktreesForTesting(): WorktreeTarget[] {
+  return discoverWorktrees();
 }
 
 let intervalHandle: NodeJS.Timeout | null = null;

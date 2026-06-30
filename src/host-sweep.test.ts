@@ -26,6 +26,7 @@ import {
   decideStuckAction,
   parseSqliteUtc,
   pruneIdleSessionArtifacts,
+  pruneIdleThreadArtifacts,
   pruneSteerIdempotency,
 } from './host-sweep.js';
 import { getDb } from './db/connection.js';
@@ -1034,7 +1035,9 @@ describe('pruneIdleSessionArtifacts', () => {
     const dir = path.join(tmpRoot, opts.group, opts.sess);
     fs.mkdirSync(dir, { recursive: true });
     const dbPath = path.join(dir, 'inbound.db');
-    fs.writeFileSync(dbPath, 'fake');
+    const db = new Database(dbPath);
+    db.exec("CREATE TABLE messages_in (status TEXT NOT NULL DEFAULT 'completed')");
+    db.close();
     const mtime = (Date.now() - opts.dbAgeMs) / 1000;
     fs.utimesSync(dbPath, mtime, mtime);
     if (opts.withNodeModules) {
@@ -1137,6 +1140,139 @@ describe('pruneIdleSessionArtifacts', () => {
 
   it('no-ops on a non-existent sessions root', () => {
     expect(() => pruneIdleSessionArtifacts(Date.now(), path.join(tmpRoot, 'does-not-exist'))).not.toThrow();
+  });
+});
+
+describe('pruneIdleThreadArtifacts', () => {
+  let tmpRoot: string;
+  const HOUR = 60 * 60 * 1000;
+
+  beforeEach(() => {
+    tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'host-sweep-thread-prune-'));
+    mockIsContainerRunning.mockReset();
+    mockIsContainerRunning.mockReturnValue(false);
+  });
+
+  afterEach(() => {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  });
+
+  function makeThread(opts: {
+    key: string;
+    activityAgeMs: number;
+    withPnpmStore?: boolean;
+    withNodeModules?: boolean;
+  }): { worktreeDir: string; repoDir: string } {
+    const worktreeDir = path.join(tmpRoot, opts.key, 'worktrees');
+    const repoDir = path.join(worktreeDir, 'repo');
+    fs.mkdirSync(repoDir, { recursive: true });
+    if (opts.withPnpmStore) {
+      const store = path.join(worktreeDir, '.pnpm-store');
+      fs.mkdirSync(store, { recursive: true });
+      fs.writeFileSync(path.join(store, 'index.db'), 'x');
+    }
+    if (opts.withNodeModules) {
+      const nm = path.join(repoDir, 'node_modules');
+      fs.mkdirSync(nm, { recursive: true });
+      fs.writeFileSync(path.join(nm, 'pkg.json'), '{}');
+    }
+    const mtime = (Date.now() - opts.activityAgeMs) / 1000;
+    fs.utimesSync(worktreeDir, mtime, mtime);
+    return { worktreeDir, repoDir };
+  }
+
+  it('removes package caches from idle thread worktrees but preserves repos', () => {
+    const { worktreeDir, repoDir } = makeThread({
+      key: 'thread-old',
+      activityAgeMs: SESSION_ARTIFACT_IDLE_MS + HOUR,
+      withPnpmStore: true,
+      withNodeModules: true,
+    });
+
+    pruneIdleThreadArtifacts(Date.now(), tmpRoot, new Map());
+
+    expect(fs.existsSync(path.join(worktreeDir, '.pnpm-store'))).toBe(false);
+    expect(fs.existsSync(path.join(repoDir, 'node_modules'))).toBe(false);
+    expect(fs.existsSync(repoDir)).toBe(true);
+  });
+
+  it('leaves recently active thread worktrees alone', () => {
+    const { worktreeDir } = makeThread({
+      key: 'thread-fresh',
+      activityAgeMs: HOUR,
+      withPnpmStore: true,
+    });
+
+    pruneIdleThreadArtifacts(Date.now(), tmpRoot, new Map());
+
+    expect(fs.existsSync(path.join(worktreeDir, '.pnpm-store'))).toBe(true);
+  });
+
+  it('uses session activity when supplied instead of stale filesystem mtime', () => {
+    const { worktreeDir } = makeThread({
+      key: 'thread-db-active',
+      activityAgeMs: SESSION_ARTIFACT_IDLE_MS + HOUR,
+      withPnpmStore: true,
+    });
+
+    pruneIdleThreadArtifacts(
+      Date.now(),
+      tmpRoot,
+      new Map([
+        [worktreeDir, { lastActivityMs: Date.now() - HOUR, hasRunningContainer: false, hasBusySession: false }],
+      ]),
+    );
+
+    expect(fs.existsSync(path.join(worktreeDir, '.pnpm-store'))).toBe(true);
+  });
+
+  it('skips thread worktrees with a running container', () => {
+    const { worktreeDir } = makeThread({
+      key: 'thread-running',
+      activityAgeMs: SESSION_ARTIFACT_IDLE_MS + HOUR,
+      withPnpmStore: true,
+    });
+
+    pruneIdleThreadArtifacts(
+      Date.now(),
+      tmpRoot,
+      new Map([
+        [
+          worktreeDir,
+          {
+            lastActivityMs: Date.now() - SESSION_ARTIFACT_IDLE_MS - HOUR,
+            hasRunningContainer: true,
+            hasBusySession: false,
+          },
+        ],
+      ]),
+    );
+
+    expect(fs.existsSync(path.join(worktreeDir, '.pnpm-store'))).toBe(true);
+  });
+
+  it('does not follow symlinks out of the thread worktree subtree', () => {
+    const { repoDir } = makeThread({
+      key: 'thread-symlink',
+      activityAgeMs: SESSION_ARTIFACT_IDLE_MS + HOUR,
+    });
+    const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'outside-thread-store-'));
+    const outsideNm = path.join(outside, 'node_modules');
+    fs.mkdirSync(outsideNm);
+    fs.writeFileSync(path.join(outsideNm, 'pkg.json'), '{}');
+    try {
+      fs.symlinkSync(outside, path.join(repoDir, 'shared-link'));
+
+      pruneIdleThreadArtifacts(Date.now(), tmpRoot, new Map());
+
+      expect(fs.existsSync(outsideNm)).toBe(true);
+    } finally {
+      fs.rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
+  it('no-ops on a non-existent thread root', () => {
+    expect(() => pruneIdleThreadArtifacts(Date.now(), path.join(tmpRoot, 'does-not-exist'), new Map())).not.toThrow();
   });
 });
 

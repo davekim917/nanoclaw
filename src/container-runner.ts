@@ -77,6 +77,7 @@ import {
   threadWorktreeDir,
   writeSessionRouting,
 } from './session-manager.js';
+import { assertStorageAdmission } from './storage-manager.js';
 import type { AgentGroup, Session } from './types.js';
 
 export const DATAFOLD_MCP_SERVER = {
@@ -358,6 +359,23 @@ export function wakeContainer(session: Session): Promise<boolean> {
     log.debug('Container wake already in-flight — joining existing promise', { sessionId: session.id });
     return existing;
   }
+
+  const storageAdmission = assertStorageAdmission({ isContainerRunning });
+  if (!storageAdmission.allowed) {
+    log.warn('Container wake deferred — disk usage remains above storage admission threshold', {
+      sessionId: session.id,
+      reason: storageAdmission.reason,
+      usagePct:
+        storageAdmission.report.filesystem.after?.usagePct ?? storageAdmission.report.filesystem.before?.usagePct,
+      admissionRefusePct: storageAdmission.report.policy.admissionRefusePct,
+      estimatedReclaimableMb: Math.round(storageAdmission.report.estimatedReclaimableBytes / 1024 / 1024),
+      actualReclaimedMb: Math.round(storageAdmission.report.filesystem.actualReclaimedBytes / 1024 / 1024),
+      actions: storageAdmission.report.actions.length,
+      failedActions: storageAdmission.report.actions.filter((a) => a.status === 'failed').length,
+    });
+    return Promise.resolve(false);
+  }
+
   const activeCount = activeContainers.size;
   const inFlightWakes = wakePromises.size;
   if (MAX_CONCURRENT_CONTAINERS > 0 && activeCount + inFlightWakes >= MAX_CONCURRENT_CONTAINERS) {

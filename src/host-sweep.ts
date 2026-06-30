@@ -70,6 +70,14 @@ import {
   killContainer,
   wakeContainer,
 } from './container-runner.js';
+import {
+  SESSION_ARTIFACT_IDLE_MS as STORAGE_SESSION_ARTIFACT_IDLE_MS,
+  collectThreadWorktreeActivity,
+  pruneIdleSessionArtifacts as pruneIdleSessionArtifactsImpl,
+  pruneIdleThreadArtifacts as pruneIdleThreadArtifactsImpl,
+  runStorageMaintenance,
+  type ThreadWorktreeActivity,
+} from './storage-manager.js';
 import type { Session } from './types.js';
 import { getDb } from './db/connection.js';
 import {
@@ -120,17 +128,9 @@ export const PENDING_MESSAGE_MAX_AGE_MS =
 const MAX_TRIES = 5;
 const BACKOFF_BASE_MS = 5000;
 
-// Idle session worktrees accumulate per-session pnpm installs that never get
-// cleaned up. After this many hours of no inbound/outbound DB activity AND
-// no running container, `node_modules` and `.pnpm-store` directories deep
-// under the session tree get removed. The source checkout, git state, and
-// session DBs are untouched — only regenerable cache artifacts go.
-// Tunable via SESSION_ARTIFACT_IDLE_HOURS (default 24).
-const parsedIdleHours = Number(process.env.SESSION_ARTIFACT_IDLE_HOURS);
-export const SESSION_ARTIFACT_IDLE_MS =
-  (Number.isFinite(parsedIdleHours) && parsedIdleHours > 0 ? parsedIdleHours : 24) * 60 * 60 * 1000;
-
-const PRUNABLE_ARTIFACT_DIRS = new Set(['node_modules', '.pnpm-store']);
+// Back-compat export for callers that still reference the old host-sweep
+// cleanup threshold. Storage-manager owns the actual cache cleanup policy.
+export const SESSION_ARTIFACT_IDLE_MS = STORAGE_SESSION_ARTIFACT_IDLE_MS;
 
 export type StuckDecision =
   | { action: 'ok' }
@@ -265,13 +265,12 @@ async function sweep(): Promise<void> {
     log.warn('scheduled-move-recovery: sweep hook failed', { err });
   }
 
-  // Reclaim disk from idle session worktrees — only `node_modules` and
-  // `.pnpm-store` get removed, and only when no container is bound to the
-  // session and its DB files are older than SESSION_ARTIFACT_IDLE_MS.
+  // Reclaim disk from idle caches and Docker artifacts after per-session
+  // sweep work has had a chance to notice and wake due messages.
   try {
-    pruneIdleSessionArtifacts();
+    runStorageMaintenance({ isContainerRunning });
   } catch (err) {
-    log.warn('pruneIdleSessionArtifacts: failed', { err });
+    log.warn('storage-manager: host sweep maintenance failed', { err });
   }
 
   // Auto-archive completed tasks older than 24h so the "Done" lane stays
@@ -817,147 +816,16 @@ export function pruneSteerIdempotency(): void {
   }
 }
 
-/**
- * Newest mtime across the session's known DB files. Acts as a coarse
- * last-activity signal — host writes inbound.db on every routed message and
- * the container writes outbound.db on every reply, so the newer of the two
- * tracks real I/O. Falls back to 0 when the session dir has none of the
- * expected files (caller treats 0 as "skip, can't tell").
- */
-function sessionLastActivityMs(sessPath: string): number {
-  let newest = 0;
-  for (const name of ['inbound.db', 'outbound.db', 'archive.db', 'central.db', '.heartbeat']) {
-    try {
-      const m = fs.statSync(path.join(sessPath, name)).mtimeMs;
-      if (m > newest) newest = m;
-    } catch {
-      // file missing — ignore
-    }
-  }
-  return newest;
-}
-
-function findPrunableArtifactDirs(root: string): string[] {
-  const found: string[] = [];
-  const stack: string[] = [root];
-  while (stack.length > 0) {
-    const dir = stack.pop()!;
-    let entries: fs.Dirent[];
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      continue;
-    }
-    for (const entry of entries) {
-      // lstat semantics — skip symlinks to avoid escaping the session subtree
-      // and accidentally pruning a shared store outside it.
-      if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
-      const full = path.join(dir, entry.name);
-      if (PRUNABLE_ARTIFACT_DIRS.has(entry.name)) {
-        found.push(full);
-        // Don't descend — the whole subtree gets removed by the caller.
-        continue;
-      }
-      stack.push(full);
-    }
-  }
-  return found;
-}
-
-function dirSizeBytes(root: string): number {
-  let total = 0;
-  const stack: string[] = [root];
-  while (stack.length > 0) {
-    const dir = stack.pop()!;
-    let entries: fs.Dirent[];
-    try {
-      entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
-      continue;
-    }
-    for (const entry of entries) {
-      const full = path.join(dir, entry.name);
-      try {
-        const st = fs.lstatSync(full);
-        if (st.isDirectory() && !st.isSymbolicLink()) {
-          stack.push(full);
-        } else if (st.isFile()) {
-          total += st.size;
-        }
-      } catch {
-        // ignore
-      }
-    }
-  }
-  return total;
-}
-
-/**
- * Remove regenerable cache artifacts (`node_modules`, `.pnpm-store`) from
- * session directories whose container isn't running and whose DB files
- * haven't been touched in SESSION_ARTIFACT_IDLE_MS. The session dir, source
- * checkout, git state, and DB files are never touched — only the listed
- * cache directory names. Sessions stay alive (host-side), they just shed
- * their pnpm install footprint until next use.
- */
 export function pruneIdleSessionArtifacts(now: number = Date.now(), root: string = sessionsBaseDir()): void {
-  let groupDirs: fs.Dirent[];
-  try {
-    groupDirs = fs.readdirSync(root, { withFileTypes: true });
-  } catch {
-    return;
-  }
+  pruneIdleSessionArtifactsImpl(now, root, isContainerRunning);
+}
 
-  let dirsRemoved = 0;
-  let bytesFreed = 0;
-
-  for (const groupDirent of groupDirs) {
-    if (!groupDirent.isDirectory() || groupDirent.isSymbolicLink()) continue;
-    const groupPath = path.join(root, groupDirent.name);
-
-    let sessionDirs: fs.Dirent[];
-    try {
-      sessionDirs = fs.readdirSync(groupPath, { withFileTypes: true });
-    } catch {
-      continue;
-    }
-
-    for (const sessDirent of sessionDirs) {
-      if (!sessDirent.isDirectory() || sessDirent.isSymbolicLink()) continue;
-      // Only `sess-*` are real per-conversation sessions. Sibling dirs like
-      // `.claude-memory` and `.claude-shared` live at the group level and
-      // are never cache targets.
-      if (!sessDirent.name.startsWith('sess-')) continue;
-
-      const sessionId = sessDirent.name;
-      if (isContainerRunning(sessionId)) continue;
-
-      const sessPath = path.join(groupPath, sessionId);
-      const lastActivity = sessionLastActivityMs(sessPath);
-      if (lastActivity === 0) continue;
-      if (now - lastActivity < SESSION_ARTIFACT_IDLE_MS) continue;
-
-      for (const target of findPrunableArtifactDirs(sessPath)) {
-        let size = 0;
-        try {
-          size = dirSizeBytes(target);
-          fs.rmSync(target, { recursive: true, force: true });
-          dirsRemoved += 1;
-          bytesFreed += size;
-        } catch (err) {
-          log.warn('pruneIdleSessionArtifacts: rm failed', { path: target, err });
-        }
-      }
-    }
-  }
-
-  if (dirsRemoved > 0) {
-    log.info('Pruned idle session artifacts', {
-      dirsRemoved,
-      mbFreed: Math.round(bytesFreed / 1024 / 1024),
-      idleThresholdHours: Math.round(SESSION_ARTIFACT_IDLE_MS / 3600000),
-    });
-  }
+export function pruneIdleThreadArtifacts(
+  now: number = Date.now(),
+  root: string = path.join(path.dirname(sessionsBaseDir()), 'v2-threads'),
+  activityByWorktreeDir: Map<string, ThreadWorktreeActivity> = collectThreadWorktreeActivity(isContainerRunning),
+): void {
+  pruneIdleThreadArtifactsImpl(now, root, activityByWorktreeDir);
 }
 
 function heartbeatMtimeMs(agentGroupId: string, sessionId: string): number {
