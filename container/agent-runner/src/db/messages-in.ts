@@ -98,15 +98,12 @@ export function getPendingMessages(isFirstPoll = false): MessageInRow[] {
       ),
     );
 
-    // Idempotency guard: a message that already has a response in messages_out
-    // has been handled — even if processing_ack was wiped by clearStaleProcessingAcks
-    // or messages_in.status never got synced to 'completed' because the previous
-    // container died between writing messages_out and calling markCompleted.
-    // Without this, a mid-turn container death after the reply was written but
-    // before mark-completed re-processes the same input on next wake and the user
-    // gets duplicate replies. messages_out.in_reply_to is set to the originating
-    // input id for every response the agent writes; presence of that row is the
-    // authoritative "this input has been answered" signal.
+    // Idempotency guard: a message that already has a real response in
+    // messages_out has been handled — even if processing_ack was wiped by
+    // clearStaleProcessingAcks or messages_in.status never got synced to
+    // 'completed' because the previous container died between writing
+    // messages_out and calling markCompleted. Progress/status rows are not
+    // answers; a restart after a thinking update must still retry the input.
     //
     // Due-aware refinement (2026-06-10): a reply can never precede its
     // question. resolveDestinationThread used to stamp destination sends with
@@ -119,7 +116,11 @@ export function getPendingMessages(isFirstPoll = false): MessageInRow[] {
     const respondedAt = new Map<string, number>();
     for (const r of outbound
       .prepare(
-        'SELECT in_reply_to AS id, MAX(timestamp) AS ts FROM messages_out WHERE in_reply_to IS NOT NULL GROUP BY in_reply_to',
+        `SELECT in_reply_to AS id, MAX(timestamp) AS ts
+         FROM messages_out
+         WHERE in_reply_to IS NOT NULL
+           AND kind != 'status'
+         GROUP BY in_reply_to`,
       )
       .all() as Array<{ id: string; ts: string }>) {
       respondedAt.set(r.id, parseDbUtc(r.ts));
@@ -152,9 +153,7 @@ export function getPendingMessages(isFirstPoll = false): MessageInRow[] {
 
     // Reverse: we fetched DESC to take the most recent N, but the agent
     // should see them in chronological order (oldest first).
-    return pending
-      .filter((m) => !ackedIds.has(m.id) && !isResponded(m.id) && !isOrphanRecall(m))
-      .reverse();
+    return pending.filter((m) => !ackedIds.has(m.id) && !isResponded(m.id) && !isOrphanRecall(m)).reverse();
   } finally {
     inbound.close();
   }
@@ -227,4 +226,3 @@ export function findQuestionResponse(questionId: string): MessageInRow | undefin
     inbound.close();
   }
 }
-

@@ -316,6 +316,25 @@ describe('accumulate gate (trigger column)', () => {
     expect(ids).toEqual(['Y']);
   });
 
+  it('getPendingMessages: status-only output does not hide a pending turn after restart', () => {
+    // A restart between progress delivery and the final answer leaves status
+    // rows in messages_out but the inbound trigger still pending. Those status
+    // rows are not a response; the replacement container must retry X with its
+    // paired recall context instead of polling "0 pending" forever.
+    insertMessage('X', 'chat-sdk', { sender: 'A', text: 'hey @bot' }, { trigger: 1 });
+    insertMessage('recall-X', 'system', { subtype: 'recall_context', text: 'facts' }, { trigger: 0 });
+    getOutboundDb()
+      .prepare(
+        `INSERT INTO messages_out (id, kind, timestamp, in_reply_to, content)
+         VALUES ('status-1', 'status', datetime('now'), 'X', '{"text":"thinking"}')`,
+      )
+      .run();
+    const ids = getPendingMessages()
+      .map((m) => m.id)
+      .sort();
+    expect(ids).toEqual(['X', 'recall-X']);
+  });
+
   it('getPendingMessages: due task row survives a phantom reply written BEFORE it was due (poison guard)', () => {
     // Regression for the 2026-05-27..31 scheduled-task die-off: a sibling
     // task's output was stamped in_reply_to = this row's id hours before
