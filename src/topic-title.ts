@@ -55,12 +55,12 @@ export async function generateTopicTitle(messageText: string): Promise<string | 
  * off the bare thread ID (last segment) since Discord's REST endpoint
  * just wants that.
  */
-async function renameDiscordThread(threadPlatformId: string, newName: string, botToken: string): Promise<void> {
+async function renameDiscordThread(threadPlatformId: string, newName: string, botToken: string): Promise<boolean> {
   const parts = threadPlatformId.split(':');
   const threadId = parts[parts.length - 1];
   if (!threadId || !/^\d+$/.test(threadId)) {
     log.warn('renameDiscordThread: unrecognized thread id format', { threadPlatformId });
-    return;
+    return false;
   }
 
   const res = await fetch(`https://discord.com/api/v10/channels/${threadId}`, {
@@ -76,9 +76,10 @@ async function renameDiscordThread(threadPlatformId: string, newName: string, bo
   if (!res.ok) {
     const body = await res.text().catch(() => '<body unreadable>');
     log.warn('Discord thread rename failed', { threadId, status: res.status, body });
-    return;
+    return false;
   }
   log.info('Discord thread renamed', { threadId, title: newName });
+  return true;
 }
 
 /**
@@ -91,6 +92,18 @@ async function renameDiscordThread(threadPlatformId: string, newName: string, bo
  * Does not await internally — returns an already-scheduled promise so
  * the router can continue without blocking.
  */
+// Threads we've already titled (or are mid-titling), keyed by the bridge-
+// encoded thread id. Defense-in-depth: the router only calls us for the
+// sibling that actually ENGAGED (wake=true), so the common case is one call
+// per thread. But when two siblings genuinely engage on the same opening
+// message (both @-mentioned, or a shared-bot mention-pattern), both would land
+// here and the LAST to finish would clobber the first's title — and double the
+// PATCH volume into Discord's tight rename rate limit. First writer wins.
+// ponytail: unbounded Set, one short string per thread ever titled. At this
+// install's volume (~hundreds) it's negligible; add an LRU cap only if a host
+// ever titles millions of threads without restarting.
+const renamedThreads = new Set<string>();
+
 export function maybeRenameNewThread(
   channelType: string,
   threadPlatformId: string | null,
@@ -108,13 +121,25 @@ export function maybeRenameNewThread(
     return;
   }
 
+  // Claim the thread synchronously BEFORE any await so concurrent siblings
+  // racing through here can't all pass the guard. Released on failure below so
+  // a later message in the thread can retry.
+  if (renamedThreads.has(threadPlatformId)) return;
+  renamedThreads.add(threadPlatformId);
+
   (async () => {
-    const title = await generateTopicTitle(firstMessageText);
-    if (!title) return;
+    let renamed = false;
     try {
-      await renameDiscordThread(threadPlatformId, title, botToken);
+      const title = await generateTopicTitle(firstMessageText);
+      if (!title) return;
+      renamed = await renameDiscordThread(threadPlatformId, title, botToken);
     } catch (err) {
       log.warn('maybeRenameNewThread: rename threw', { err });
+    } finally {
+      // Keep the claim only on a confirmed rename. A failed generation or a
+      // rejected PATCH (e.g. 429) releases it so the next session created in
+      // this thread gets another shot.
+      if (!renamed) renamedThreads.delete(threadPlatformId);
     }
   })();
 }

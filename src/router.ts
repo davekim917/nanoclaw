@@ -832,7 +832,16 @@ async function deliverToAgent(
   // Rename freshly-created Discord threads to a Haiku-derived topic title.
   // Fire-and-forget; failures log and move on. See src/topic-title.ts for
   // the why and the platform-gating (Discord only).
-  if (created) {
+  //
+  // Gate on `wake`, not just `created`: every wired sibling with
+  // ignored_message_policy='accumulate' gets a session created here even when
+  // it DIDN'T engage (wake=false) — it's just stashing the message for later
+  // context. Those non-engaging siblings must not title the thread. Without
+  // this gate, an accumulate sibling whose session is created later in the
+  // turn (fed downstream text — e.g. the engaged sibling's tool output) would
+  // clobber the engaged sibling's correct opening-prompt title. Only the
+  // sibling actually responding to the user names the thread.
+  if (created && wake) {
     const firstText = parsedContent.text ?? '';
     if (firstText) maybeRenameNewThread(event.channelType, effectiveThreadId, firstText);
   }
