@@ -51,16 +51,22 @@ const MODEL_ALIAS_MAP: Record<string, string> = {
   fable: 'claude-fable-5[1m]',
   fable5: 'claude-fable-5[1m]',
   'fable-5': 'claude-fable-5[1m]',
-  sonnet46: 'claude-sonnet-4-6',
-  'sonnet4-6': 'claude-sonnet-4-6',
-  sonnet47: 'claude-sonnet-4-7',
-  'sonnet4-7': 'claude-sonnet-4-7',
+  // Sonnet 5 (GA): single-digit version scheme (claude-sonnet-5, not -5-0),
+  // same as fable. This is what the bare `sonnet` alias resolves to in
+  // containers (DEFAULT_SONNET_MODEL in container-runner.ts). Unlike opus/fable,
+  // Sonnet 5 ALWAYS runs at 1M on the Anthropic API — there's no 200K variant
+  // and no [1m] suffix to select — so the opus-style [1m] window pin doesn't
+  // apply (the global CLAUDE_CODE_AUTO_COMPACT_WINDOW=1000000 handles compaction
+  // sizing). The pre-5 Sonnet 4.x aliases were dropped — this fork only runs
+  // Sonnet 5.
+  sonnet5: 'claude-sonnet-5',
+  'sonnet-5': 'claude-sonnet-5',
   haiku45: 'claude-haiku-4-5',
   'haiku4-5': 'claude-haiku-4-5',
 };
 
 const VALID_MODEL_RE =
-  /^(?:opus|sonnet|haiku|default|claude-(?:opus|sonnet|haiku)-\d+-\d+(?:\[\dm\])?|claude-fable-\d+(?:\[\dm\])?)$/;
+  /^(?:opus|sonnet|haiku|default|claude-(?:opus|haiku)-\d+-\d+(?:\[\dm\])?|claude-sonnet-\d+(?:\[\dm\])?|claude-fable-\d+(?:\[\dm\])?)$/;
 
 /**
  * Opus is only supported in its 1M-context form in this fork. Auto-append
@@ -98,10 +104,10 @@ const MODEL_EFFORT_SUPPORT: Record<string, ReadonlySet<EffortLevel>> = {
   // Haiku: no effort control at the API level (effort is a no-op for this family).
   haiku: new Set(),
   'claude-haiku-4-5': new Set(),
-  // Sonnet 4.6 supports low | medium | high | max (no xhigh).
-  sonnet: new Set(['low', 'medium', 'high', 'max']),
-  'claude-sonnet-4-6': new Set(['low', 'medium', 'high', 'max']),
-  'claude-sonnet-4-7': new Set(['low', 'medium', 'high', 'max']),
+  // Bare `sonnet` resolves to Sonnet 5 (DEFAULT_SONNET_MODEL) — full surface
+  // incl. xhigh. (Sonnet 4.x is not used in this fork.)
+  sonnet: new Set(['low', 'medium', 'high', 'xhigh', 'max']),
+  'claude-sonnet-5': new Set(['low', 'medium', 'high', 'xhigh', 'max']),
   // Opus 4.6: low | medium | high | max. Only the 1M-context variant is
   // supported in this fork — bare `claude-opus-4-6` gets auto-promoted to
   // `[1m]` in resolveModelAlias.

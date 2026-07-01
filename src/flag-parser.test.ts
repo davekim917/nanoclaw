@@ -14,7 +14,7 @@ describe('ensureOpus1mSuffix', () => {
 
   it('leaves family aliases and non-opus models untouched', () => {
     expect(ensureOpus1mSuffix('opus')).toBe('opus');
-    expect(ensureOpus1mSuffix('claude-sonnet-4-6')).toBe('claude-sonnet-4-6');
+    expect(ensureOpus1mSuffix('claude-sonnet-5')).toBe('claude-sonnet-5');
     expect(ensureOpus1mSuffix('claude-haiku-4-5')).toBe('claude-haiku-4-5');
   });
 });
@@ -56,13 +56,13 @@ describe('parseMessageFlags', () => {
     });
 
     it('resolves pinned aliases to concrete ids', () => {
-      const r = parseMessageFlags('-m sonnet4-6 hi');
-      expect(r.intent).toEqual({ stickyModel: 'claude-sonnet-4-6' });
+      const r = parseMessageFlags('-m sonnet5 hi');
+      expect(r.intent).toEqual({ stickyModel: 'claude-sonnet-5' });
     });
 
     it('accepts full concrete model ids', () => {
-      const r = parseMessageFlags('-m claude-sonnet-4-6 hi');
-      expect(r.intent).toEqual({ stickyModel: 'claude-sonnet-4-6' });
+      const r = parseMessageFlags('-m claude-sonnet-5 hi');
+      expect(r.intent).toEqual({ stickyModel: 'claude-sonnet-5' });
     });
 
     it('auto-appends [1m] to bare opus ids (1M-context only in this fork)', () => {
@@ -185,11 +185,16 @@ describe('parseMessageFlags', () => {
       expect(r.warnings[0]).toMatch(/haiku doesn't support effort/);
     });
 
-    it('warns when sonnet gets xhigh (opus-4.7 only)', () => {
+    it('accepts xhigh on bare sonnet (now resolves to Sonnet 5, which has xhigh)', () => {
       const r = parseMessageFlags('-m sonnet -e xhigh explain');
-      expect(r.intent).toEqual({ stickyModel: 'sonnet' });
-      expect(r.warnings).toHaveLength(1);
-      expect(r.warnings[0]).toMatch(/xhigh/);
+      expect(r.intent).toEqual({ stickyModel: 'sonnet', stickyEffort: 'xhigh' });
+      expect(r.warnings).toEqual([]);
+    });
+
+    it('accepts xhigh on an explicit claude-sonnet-5 pin', () => {
+      const r = parseMessageFlags('-m claude-sonnet-5 -e xhigh explain');
+      expect(r.intent).toEqual({ stickyModel: 'claude-sonnet-5', stickyEffort: 'xhigh' });
+      expect(r.warnings).toEqual([]);
     });
 
     it('errors on unknown model', () => {
@@ -229,8 +234,10 @@ describe('parseMessageFlags', () => {
     });
 
     it('drops ultracode and warns when the model is not xhigh-capable', () => {
-      const r = parseMessageFlags('-m sonnet -e ultracode x');
-      expect(r.intent).toEqual({ stickyModel: 'sonnet' });
+      // opus 4.6 has no xhigh; bare `sonnet` now resolves to Sonnet 5 (which
+      // has xhigh), so it would NOT drop ultracode.
+      const r = parseMessageFlags('-m opus46 -e ultracode x');
+      expect(r.intent).toEqual({ stickyModel: 'claude-opus-4-6[1m]' });
       expect(r.warnings.some((w) => /ultracode needs an xhigh-capable model/.test(w))).toBe(true);
     });
   });

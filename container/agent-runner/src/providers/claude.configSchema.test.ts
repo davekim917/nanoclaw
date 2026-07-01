@@ -109,10 +109,10 @@ describe('ClaudeProvider sticky config', () => {
       providerConfig: { model: 'claude-opus-4-7' },
     });
 
-    provider.query({ prompt: 'hi', cwd: '/tmp', model: 'claude-sonnet-4-6' });
+    provider.query({ prompt: 'hi', cwd: '/tmp', model: 'claude-sonnet-5' });
 
     expect(mockSdkQuery).toHaveBeenCalledTimes(1);
-    expect(capturedSdkOptions?.model).toBe('claude-sonnet-4-6');
+    expect(capturedSdkOptions?.model).toBe('claude-sonnet-5');
   });
 
   it('test_claude_flagless_default_is_opus_alias: no input model + no sticky → model is the opus ALIAS, never undefined', () => {
@@ -181,9 +181,9 @@ describe('per-model-family effort defaults', () => {
     expect(opts?.effort).toBeUndefined();
   });
 
-  it('test_effort_default_sonnet_high: sonnet family defaults to high (rejects xhigh)', () => {
-    const opts = run({ model: 'claude-sonnet-4-6' });
-    expect(opts?.effort).toBe('high');
+  it('test_effort_default_sonnet_xhigh: Sonnet 5 defaults to xhigh (fleet default)', () => {
+    const opts = run({ model: 'claude-sonnet-5' });
+    expect(opts?.effort).toBe('xhigh');
   });
 
   it('test_effort_operator_env_overrides_family_default: NANOCLAW_EFFORT_OVERRIDE beats the family default', () => {
@@ -196,14 +196,14 @@ describe('per-model-family effort defaults', () => {
     expect(opts?.effort).toBe('low');
   });
 
-  it('test_effort_clamp_sticky_xhigh_on_sonnet: sticky xhigh + model switch to sonnet clamps to high (sonnet rejects xhigh)', () => {
-    const opts = run({ model: 'claude-sonnet-4-6', effort: 'xhigh' });
-    expect(opts?.effort).toBe('high');
+  it('test_effort_xhigh_on_sonnet5_passes: Sonnet 5 supports xhigh, so an explicit -e xhigh is not clamped', () => {
+    const opts = run({ model: 'claude-sonnet-5', effort: 'xhigh' });
+    expect(opts?.effort).toBe('xhigh');
   });
 
-  it('test_effort_clamp_operator_env_on_sonnet: model-blind operator override xhigh clamps for sonnet turns', () => {
-    const opts = run({ model: 'claude-sonnet-4-6' }, 'xhigh');
-    expect(opts?.effort).toBe('high');
+  it('test_effort_operator_env_xhigh_on_sonnet5: operator override xhigh passes through on Sonnet 5', () => {
+    const opts = run({ model: 'claude-sonnet-5' }, 'xhigh');
+    expect(opts?.effort).toBe('xhigh');
   });
 
   it('test_effort_clamp_opus46_no_xhigh: opus 4.6 has no xhigh — flagless default and explicit xhigh both land on high', () => {
@@ -219,7 +219,7 @@ describe('per-model-family effort defaults', () => {
   });
 
   it('test_effort_no_clamp_max_on_sonnet: max is valid on sonnet and passes through', () => {
-    const opts = run({ model: 'claude-sonnet-4-6', effort: 'max' });
+    const opts = run({ model: 'claude-sonnet-5', effort: 'max' });
     expect(opts?.effort).toBe('max');
   });
 });
@@ -271,11 +271,11 @@ describe('live applySettings (-m/-e on an active query — same conversation, no
     expect(capturedFlagSettings).toEqual([{ effortLevel: 'medium' }]);
   });
 
-  it('test_applySettings_clamps_for_model: sonnet + xhigh clamps to high live', async () => {
+  it('test_applySettings_xhigh_on_sonnet5_live: Sonnet 5 + xhigh passes through live (no clamp)', async () => {
     const q = start();
-    await q.applySettings!({ model: 'claude-sonnet-4-6', effort: 'xhigh' });
-    expect(capturedSetModel).toEqual(['claude-sonnet-4-6']);
-    expect(capturedFlagSettings).toEqual([{ effortLevel: 'high' }]);
+    await q.applySettings!({ model: 'claude-sonnet-5', effort: 'xhigh' });
+    expect(capturedSetModel).toEqual(['claude-sonnet-5']);
+    expect(capturedFlagSettings).toEqual([{ effortLevel: 'xhigh' }]);
   });
 
   it('test_applySettings_max_throws: effortLevel control cannot express max → caller falls back to reopen', async () => {

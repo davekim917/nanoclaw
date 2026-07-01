@@ -108,7 +108,7 @@ const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY, timeout: 30
 // (container.json defaultModel/defaultEffort) layers can still override.
 // Per-session flags (-m / -e) and sticky config override on top of those.
 const DEFAULT_OPUS_MODEL = 'claude-opus-4-8[1m]';
-const DEFAULT_SONNET_MODEL = 'claude-sonnet-4-6';
+const DEFAULT_SONNET_MODEL = 'claude-sonnet-5';
 const DEFAULT_HAIKU_MODEL = 'claude-haiku-4-5-20251001';
 // (DEFAULT_EFFORT removed 2026-06-10 — effort defaults are per-model-family
 // in the claude provider; NANOCLAW_EFFORT_OVERRIDE is operator-override-only.)
@@ -2229,11 +2229,11 @@ async function buildContainerArgs(
   // NANOCLAW_EFFORT_OVERRIDE is an OPERATOR override (per-channel wiring or
   // per-group container.json) — injected only when one is actually set.
   // When absent, the claude provider applies per-model-family defaults
-  // (opus → xhigh, fable/sonnet → high, haiku → none; see
+  // (opus/sonnet → xhigh, fable → high, haiku → none; see
   // defaultEffortForModel in agent-runner claude.ts). The old unconditional
   // `?? DEFAULT_EFFORT` fold made every model inherit one blanket value,
-  // which breaks per-family defaults (sonnet rejects xhigh) and masked
-  // whether the operator had chosen anything at all.
+  // which breaks per-family defaults (e.g. haiku has no effort surface) and
+  // masked whether the operator had chosen anything at all.
   const defaultEffort = channelDefaults?.channelDefaultEffort ?? containerConfig.defaultEffort;
   if (defaultEffort) {
     args.push('-e', `NANOCLAW_EFFORT_OVERRIDE=${defaultEffort}`);

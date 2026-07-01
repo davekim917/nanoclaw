@@ -1241,7 +1241,9 @@ function ensureOpus1mSuffix(model: string): string {
  *   fable → high  — fable's docs recommend `high` as the default starting
  *           point; lower levels "often exceed xhigh performance on prior
  *           models", and fable bills 2x Opus ($10/$50 per MTok).
- *   sonnet → high — sonnet 4.6 rejects xhigh (low|medium|high|max only).
+ *   sonnet → xhigh — Sonnet 5 (the bare `sonnet` alias) defaults to xhigh, the
+ *           recommended setting for coding/agentic work; fleet decision,
+ *           mirrors opus 4.7+. (This fork only runs Sonnet 5.)
  *   haiku → undefined — no effort control at the API level.
  *
  * `-e <level>` (turn or sticky) always wins over all of these — subject to
@@ -1254,6 +1256,8 @@ function defaultEffortForModel(model: string | undefined): string | undefined {
     // 4.6 and earlier have no xhigh (xhigh shipped with 4.7).
     return /^claude-opus-4-[0-6]\b/.test(m) ? 'high' : 'xhigh';
   }
+  // Sonnet 5 (the bare `sonnet` alias resolves to it) defaults to xhigh.
+  if (m === 'sonnet' || m.startsWith('claude-sonnet-')) return 'xhigh';
   if (m.startsWith('claude-fable-')) return 'high';
   if (m === 'haiku' || m.startsWith('claude-haiku-')) return undefined;
   return 'high';
@@ -1275,10 +1279,9 @@ function clampEffortForModel(model: string | undefined, effort: string | undefin
   const m = (model ?? '').toLowerCase();
   const supported = (() => {
     if (m === 'haiku' || m.startsWith('claude-haiku-')) return new Set<string>();
-    if (m.startsWith('claude-sonnet-') || m === 'sonnet') return new Set(['low', 'medium', 'high', 'max']);
     if (/^claude-opus-4-[0-6]\b/.test(m)) return new Set(['low', 'medium', 'high', 'max']);
-    // opus 4.7+, fable, bare `opus` alias (resolves to the configured 4.7+
-    // default), unknown future models: full surface.
+    // opus 4.7+, sonnet 5 + bare `sonnet`/`opus` aliases, fable, unknown future
+    // models: full surface (incl. xhigh).
     return new Set(['low', 'medium', 'high', 'xhigh', 'max']);
   })();
   if (supported.has(effort)) return effort;
