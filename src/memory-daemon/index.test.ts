@@ -3,7 +3,13 @@ import fs from 'fs';
 import path from 'path';
 import Database from 'better-sqlite3';
 import { CC_PROJECTS_DIR, DATA_DIR, GROUPS_DIR } from '../config.js';
-import { discoverMemoryGroups, runSweep } from './index.js';
+import {
+  discoverMemoryGroups,
+  expandChatStreamGroups,
+  runSweep,
+  setCentralDbForTest,
+  type DiscoveredGroup,
+} from './index.js';
 import * as containerConfig from '../container-config.js';
 import * as judgeModule from './recall-judge/judge.js';
 import { HealthRecorder } from './health.js';
@@ -933,5 +939,141 @@ describe('runSweep C5 wiring', () => {
     );
 
     expect(mergeSpy).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ── expandChatStreamGroups — shared-FS sibling expansion for the chat sweep ──
+//
+// Under shared-FS, discovery collapses a workgroup to its seed's agentGroupId.
+// Correct for the (single, shared) source inbox; WRONG for the chat-stream
+// classifier, which reads messages_archive by each sibling's own id — sibling
+// session chat was silently never ingested (2026-07-02). These tests pin the
+// expansion: workgroup-seed groups pull in their memory-enabled siblings from
+// the central DB, fail-closed per sibling, seed-only on any central-DB issue.
+describe('expandChatStreamGroups', () => {
+  const WG_ROOT = path.join(DATA_DIR, 'workgroups');
+
+  function makeCentralDb(rows: Array<{ id: string; folder: string; workgroup_id: string | null }>): Database.Database {
+    const db = new Database(':memory:');
+    db.exec(`CREATE TABLE agent_groups (id TEXT PRIMARY KEY, folder TEXT, workgroup_id TEXT);
+             CREATE TABLE workgroups (id TEXT PRIMARY KEY, mnemon_store_id TEXT);`);
+    const ins = db.prepare('INSERT INTO agent_groups (id, folder, workgroup_id) VALUES (?, ?, ?)');
+    for (const r of rows) ins.run(r.id, r.folder, r.workgroup_id);
+    return db;
+  }
+
+  function seedGroup(over: Partial<DiscoveredGroup> = {}): DiscoveredGroup {
+    return {
+      agentGroupId: 'ag-seed',
+      folder: 'mr',
+      sourcesBasePath: path.join(WG_ROOT, 'mr'),
+      enabled: true,
+      feedbackEnabled: true,
+      ...over,
+    };
+  }
+
+  afterEach(() => {
+    setCentralDbForTest(null);
+  });
+
+  it('adds memory-enabled siblings of a workgroup-seed group', () => {
+    const central = makeCentralDb([
+      { id: 'ag-seed', folder: 'mr', workgroup_id: 'mr' },
+      { id: 'mr-codex', folder: 'mr-codex', workgroup_id: 'mr' },
+      { id: 'mr-opencode', folder: 'mr-opencode', workgroup_id: 'mr' },
+    ]);
+    setCentralDbForTest(central);
+    vi.spyOn(containerConfig, 'readContainerConfig').mockImplementation(
+      (folder: string) =>
+        ({
+          agentGroupId: folder === 'mr-codex' ? 'mr-codex' : 'mr-opencode',
+          memory: { enabled: true, feedback_enabled: folder === 'mr-codex' },
+        }) as ReturnType<typeof containerConfig.readContainerConfig>,
+    );
+
+    const out = expandChatStreamGroups([seedGroup()]);
+
+    expect(out.map((g) => g.agentGroupId)).toEqual(['ag-seed', 'mr-codex', 'mr-opencode']);
+    const codex = out.find((g) => g.agentGroupId === 'mr-codex')!;
+    // Siblings inherit the seed's sourcesBasePath (inert for the chat sweep).
+    expect(codex.sourcesBasePath).toBe(path.join(WG_ROOT, 'mr'));
+    expect(codex.feedbackEnabled).toBe(true);
+    expect(out.find((g) => g.agentGroupId === 'mr-opencode')!.feedbackEnabled).toBe(false);
+    central.close();
+  });
+
+  it('skips siblings with memory disabled or missing', () => {
+    const central = makeCentralDb([
+      { id: 'ag-seed', folder: 'mr', workgroup_id: 'mr' },
+      { id: 'mr-codex', folder: 'mr-codex', workgroup_id: 'mr' },
+    ]);
+    setCentralDbForTest(central);
+    vi.spyOn(containerConfig, 'readContainerConfig').mockReturnValue({
+      agentGroupId: 'mr-codex',
+      memory: { enabled: false },
+    } as ReturnType<typeof containerConfig.readContainerConfig>);
+
+    expect(expandChatStreamGroups([seedGroup()]).map((g) => g.agentGroupId)).toEqual(['ag-seed']);
+    central.close();
+  });
+
+  it('fail-closed: skips a sibling whose config agentGroupId mismatches the central row', () => {
+    const central = makeCentralDb([
+      { id: 'ag-seed', folder: 'mr', workgroup_id: 'mr' },
+      { id: 'mr-codex', folder: 'mr-codex', workgroup_id: 'mr' },
+    ]);
+    setCentralDbForTest(central);
+    // container.json names a DIFFERENT group — attribution would be wrong.
+    vi.spyOn(containerConfig, 'readContainerConfig').mockReturnValue({
+      agentGroupId: 'some-other-group',
+      memory: { enabled: true },
+    } as ReturnType<typeof containerConfig.readContainerConfig>);
+
+    expect(expandChatStreamGroups([seedGroup()]).map((g) => g.agentGroupId)).toEqual(['ag-seed']);
+    central.close();
+  });
+
+  it('does not expand non-workgroup groups (sourcesBasePath outside DATA_DIR/workgroups)', () => {
+    const central = makeCentralDb([
+      { id: 'ag-legacy', folder: 'legacy', workgroup_id: 'mr' },
+      { id: 'mr-codex', folder: 'mr-codex', workgroup_id: 'mr' },
+    ]);
+    setCentralDbForTest(central);
+    const legacy = seedGroup({
+      agentGroupId: 'ag-legacy',
+      folder: 'legacy',
+      sourcesBasePath: path.join(GROUPS_DIR, 'legacy'),
+    });
+
+    expect(expandChatStreamGroups([legacy]).map((g) => g.agentGroupId)).toEqual(['ag-legacy']);
+    central.close();
+  });
+
+  it('does not duplicate a sibling that discovery already found', () => {
+    const central = makeCentralDb([
+      { id: 'ag-seed', folder: 'mr', workgroup_id: 'mr' },
+      { id: 'mr-codex', folder: 'mr-codex', workgroup_id: 'mr' },
+    ]);
+    setCentralDbForTest(central);
+    vi.spyOn(containerConfig, 'readContainerConfig').mockReturnValue({
+      agentGroupId: 'mr-codex',
+      memory: { enabled: true },
+    } as ReturnType<typeof containerConfig.readContainerConfig>);
+    const alreadyDiscovered = seedGroup({
+      agentGroupId: 'mr-codex',
+      folder: 'mr-codex',
+      sourcesBasePath: path.join(GROUPS_DIR, 'mr-codex'),
+    });
+
+    const out = expandChatStreamGroups([seedGroup(), alreadyDiscovered]);
+    expect(out.filter((g) => g.agentGroupId === 'mr-codex')).toHaveLength(1);
+    central.close();
+  });
+
+  it('degrades to seed-only when the central DB is unavailable', () => {
+    // No override and DATA_DIR/v2.db does not exist in the test env → the
+    // readonly open throws → expansion catches and returns the input as-is.
+    expect(expandChatStreamGroups([seedGroup()]).map((g) => g.agentGroupId)).toEqual(['ag-seed']);
   });
 });

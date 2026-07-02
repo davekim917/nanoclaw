@@ -1,6 +1,7 @@
 import { execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+import BetterSqlite3 from 'better-sqlite3';
 import { openMnemonIngestDb, runMnemonIngestMigrations } from '../db/migrations/019-mnemon-ingest-db.js';
 import { HealthRecorder } from './health.js';
 import { setDeadLettersDb, getDueRetries, deleteAfterSuccess } from './dead-letters.js';
@@ -47,9 +48,15 @@ export interface DiscoveredGroup {
  * → `readGroupRecallScope(agentGroupId)` → `resolveWorkgroupStoreId(agentGroupId)`
  * → `workgroups.mnemon_store_id`. Pre-migration the GROUPS_DIR walk emitted the
  * seed with this same agentGroupId; emitting the same id here funnels every
- * sibling's capture into the identical workgroup store. (Even if container.json
- * were absent, `remember`'s fallback is `agentGroupId`, which equals the seed's
- * mnemon_store_id for every workgroup.)
+ * sibling's SOURCE-FILE capture into the identical workgroup store (the inbox
+ * is one shared dir, so one watcher covers all siblings).
+ *
+ * CHAT-STREAM capture is NOT covered by this funnel — it reads the global
+ * `messages_archive` keyed by each sibling's OWN agent_group_id, so collapsing
+ * discovery to the seed silently orphaned codex/opencode session chat from
+ * memory (found 2026-07-02: sibling archive rows present, zero watermarks).
+ * `expandChatStreamGroups` below re-adds the hidden siblings for the chat
+ * sweep (and its retry/judge loops) only.
  *
  * Gate mirrors container-runner's mount gate exactly: discover when the
  * `.migrated` marker exists OR the flag is on. Gating on the marker (not just
@@ -117,6 +124,105 @@ function discoverMigratedWorkgroups(): DiscoveredGroup[] {
       enabled: config.memory?.enabled === true,
       feedbackEnabled: isFeedbackEnabled(config.memory),
     });
+  }
+
+  return out;
+}
+
+/**
+ * Test seam for workgroupMemberRows — unit tests inject an in-memory central
+ * DB (same pattern as scope-resolver's _centralDbOverride). Production leaves
+ * this null and opens DATA_DIR/v2.db read-only per call.
+ */
+let _centralDbOverride: BetterSqlite3.Database | null = null;
+export function setCentralDbForTest(db: BetterSqlite3.Database | null): void {
+  _centralDbOverride = db;
+}
+
+/**
+ * All (id, folder) member rows of the workgroup that `seedAgentGroupId`
+ * belongs to. Read-only central-DB open per call, mirroring
+ * scope-resolver's openCentralDb pattern (the daemon is a separate process;
+ * it never writes v2.db). Throws on missing/unreadable DB — caller catches.
+ */
+function workgroupMemberRows(seedAgentGroupId: string): Array<{ id: string; folder: string }> {
+  const db = _centralDbOverride ?? new BetterSqlite3(path.join(DATA_DIR, 'v2.db'), { readonly: true });
+  try {
+    const agRow = db.prepare(`SELECT workgroup_id FROM agent_groups WHERE id = ? LIMIT 1`).get(seedAgentGroupId) as
+      | { workgroup_id: string | null }
+      | undefined;
+    if (!agRow?.workgroup_id) return [];
+    return db.prepare(`SELECT id, folder FROM agent_groups WHERE workgroup_id = ?`).all(agRow.workgroup_id) as Array<{
+      id: string;
+      folder: string;
+    }>;
+  } finally {
+    if (!_centralDbOverride) db.close();
+  }
+}
+
+/**
+ * Re-add the workgroup siblings that shared-FS discovery hides, for the
+ * CHAT-STREAM sweep only.
+ *
+ * Under shared-FS, discoverMigratedWorkgroups collapses each workgroup to one
+ * DiscoveredGroup carrying the SEED's agentGroupId — correct for source-file
+ * ingestion (one shared inbox), but the chat-stream classifier selects
+ * `messages_archive WHERE agent_group_id = ?`, and codex/opencode siblings
+ * archive under their OWN ids. Result: sibling session chat was never
+ * classified into the shared store (zero watermark rows despite thousands of
+ * archive rows — verified 2026-07-02, all 10 workgroups).
+ *
+ * For each enabled workgroup-seed group (sourcesBasePath under
+ * DATA_DIR/workgroups), enumerate the workgroup's members from the central DB
+ * and add every memory-enabled sibling not already discovered. Fail-closed
+ * per sibling: folder config must exist, carry the MATCHING agentGroupId, and
+ * have memory.enabled=true. Store attribution needs no care here — sibling
+ * writes redirect to the canonical workgroup store via remember() →
+ * resolveWorkgroupStoreId, which is id-driven and already correct.
+ *
+ * Siblings inherit the seed's sourcesBasePath: the chat sweep never reads it,
+ * and the dead-letter retry loop's source-file branch guards with existsSync
+ * on absolute item keys, so the value is inert for expanded entries.
+ *
+ * Central-DB read failure (fresh install, migration window) degrades to
+ * seed-only — the pre-fix behavior — and the next sweep retries.
+ */
+export function expandChatStreamGroups(enabledGroups: DiscoveredGroup[]): DiscoveredGroup[] {
+  const out = [...enabledGroups];
+  const seen = new Set(enabledGroups.map((g) => g.agentGroupId));
+  const wgRoot = path.join(DATA_DIR, 'workgroups');
+
+  for (const g of enabledGroups) {
+    if (path.dirname(g.sourcesBasePath) !== wgRoot) continue;
+    let members: Array<{ id: string; folder: string }>;
+    try {
+      members = workgroupMemberRows(g.agentGroupId);
+    } catch {
+      continue;
+    }
+    for (const m of members) {
+      if (seen.has(m.id)) continue;
+      let cfg;
+      try {
+        cfg = readContainerConfig(m.folder);
+      } catch {
+        continue;
+      }
+      // Config must corroborate the central-DB row — a folder whose
+      // container.json names a different agentGroupId would mis-attribute
+      // every fact it produces. Fail closed.
+      if (cfg.agentGroupId !== m.id) continue;
+      if (cfg.memory?.enabled !== true) continue;
+      seen.add(m.id);
+      out.push({
+        agentGroupId: m.id,
+        folder: m.folder,
+        sourcesBasePath: g.sourcesBasePath,
+        enabled: true,
+        feedbackEnabled: isFeedbackEnabled(cfg.memory),
+      });
+    }
   }
 
   return out;
@@ -277,7 +383,13 @@ export async function runSweep(
 
   ingester.reconcileWatchers(allGroups);
 
-  await runChatStreamSweep(enabledGroups, store, health);
+  // Chat-stream (and its retry/judge loops below) run on the EXPANDED set —
+  // shared-FS-hidden workgroup siblings included. Source-file ingestion stays
+  // on enabledGroups: the siblings share the seed's inbox, and scanning it
+  // once per sibling would ingest every file N times under N group ids.
+  const chatGroups = expandChatStreamGroups(enabledGroups);
+
+  await runChatStreamSweep(chatGroups, store, health);
 
   for (const group of enabledGroups) {
     // Codex F6 round 2: re-validate the chain at use time. Discovery
@@ -320,7 +432,7 @@ export async function runSweep(
     }
   }
 
-  for (const group of enabledGroups) {
+  for (const group of chatGroups) {
     const due = getDueRetries(group.agentGroupId, new Date());
     for (const retry of due) {
       if (retry.itemType === 'turn-pair') {
@@ -340,8 +452,11 @@ export async function runSweep(
     }
   }
 
-  // Judge processor: score pending recall outcomes for feedback-enabled groups
-  for (const group of enabledGroups) {
+  // Judge processor: score pending recall outcomes for feedback-enabled groups.
+  // Runs on chatGroups: recall_outcomes rows are keyed by the CALLING group's
+  // id, so shared-FS-hidden siblings accumulate outcomes that a seed-only loop
+  // would never judge (same orphaning class as the chat sweep).
+  for (const group of chatGroups) {
     if (!group.feedbackEnabled) continue;
     try {
       await processPendingJudgments({ agentGroupId: group.agentGroupId });
