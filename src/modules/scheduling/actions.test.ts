@@ -176,3 +176,72 @@ describe('handleCancelTask scope resolution', () => {
     expect(tasksIn(root.id)[0].status).toBe('completed');
   });
 });
+
+describe('handleScheduleTask model/effort pinning', () => {
+  function contentOf(sessionId: string, taskId: string): Record<string, unknown> {
+    const db = new Database(`${TEST_DIR}/v2-sessions/ag-1/${sessionId}/inbound.db`, { readonly: true });
+    try {
+      const row = db.prepare("SELECT content FROM messages_in WHERE id = ? AND kind = 'task'").get(taskId) as
+        | { content: string }
+        | undefined;
+      return row ? (JSON.parse(row.content) as Record<string, unknown>) : {};
+    } finally {
+      db.close();
+    }
+  }
+
+  it('stores a validated flagIntent from natural-language model + effort', async () => {
+    seed();
+    const { session: root } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    const inDb = openInboundDb('ag-1', root.id);
+    try {
+      await handleScheduleTask(
+        {
+          action: 'schedule_task',
+          taskId: 'task-m',
+          prompt: 'digest',
+          processAfter: now(),
+          model: 'sonnet',
+          effort: 'medium',
+        },
+        root,
+        inDb,
+      );
+    } finally {
+      inDb.close();
+    }
+    expect(contentOf(root.id, 'task-m').flagIntent).toEqual({ turnModel: 'sonnet', turnEffort: 'medium' });
+  });
+
+  it('leaves an unpinned task with no flagIntent (adopts the runtime default)', async () => {
+    seed();
+    const { session: root } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    const inDb = openInboundDb('ag-1', root.id);
+    try {
+      await handleScheduleTask(
+        { action: 'schedule_task', taskId: 'task-u', prompt: 'digest', processAfter: now() },
+        root,
+        inDb,
+      );
+    } finally {
+      inDb.close();
+    }
+    expect(contentOf(root.id, 'task-u').flagIntent).toBeUndefined();
+  });
+
+  it('fail-closed: rejects an invalid model and creates no task', async () => {
+    seed(); // ag-1 has agent_provider=null → resolves to claude vocab
+    const { session: root } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    const inDb = openInboundDb('ag-1', root.id);
+    try {
+      await handleScheduleTask(
+        { action: 'schedule_task', taskId: 'task-x', prompt: 'digest', processAfter: now(), model: 'gpt-5.5' },
+        root,
+        inDb,
+      );
+    } finally {
+      inDb.close();
+    }
+    expect(tasksIn(root.id).find((t) => t.id === 'task-x')).toBeUndefined();
+  });
+});

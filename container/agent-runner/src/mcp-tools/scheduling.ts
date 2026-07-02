@@ -104,6 +104,16 @@ export const scheduleTask: McpToolDefinition = {
           description:
             `Where the task lives and reports. 'channel' (default): durable — runs in the channel-root session and posts to the channel root, surviving thread archival. Use for standing tasks like inbox pollers. 'thread': an opt-in recurring "loop" bound to THIS thread — runs in this thread's session and reports IN this thread. It lives and dies with the thread, which is correct for an ephemeral, self-cancelling loop started in a conversation (e.g. "loop until the PR is approved, report here"). Only meaningful when invoked from within a thread; from the channel root it falls back to 'channel'.`,
         },
+        model: {
+          type: 'string',
+          description:
+            `Optional model to run this task's fires on. Set it when the user names a model (e.g. "use sonnet" → "sonnet", "run it on opus" → "opus"). Accepts family aliases ("sonnet", "opus", "haiku") or exact ids; for codex/opencode agents use that provider's model ids. OMIT to use the scheduled-task default (Claude agents default to Sonnet). Invalid values are rejected host-side, so pass the user's words as-is rather than guessing an id.`,
+        },
+        effort: {
+          type: 'string',
+          description:
+            `Optional reasoning effort for this task's fires: "low" | "medium" | "high" | "xhigh" | "max" (supported levels vary by model/provider). Set it when the user names an effort (e.g. "medium effort" → "medium"). OMIT to use the default (high).`,
+        },
       },
       required: ['prompt', 'processAfter'],
     },
@@ -143,6 +153,11 @@ export const scheduleTask: McpToolDefinition = {
         processAfter,
         recurrence,
         scope,
+        // Model/effort are validated + resolved to a flagIntent host-side
+        // (handleScheduleTask) against this agent's provider vocab. Passed as
+        // the user's raw words; omitted keys leave the task on the default.
+        ...(typeof args.model === 'string' && args.model ? { model: args.model } : {}),
+        ...(typeof args.effort === 'string' && args.effort ? { effort: args.effort } : {}),
         platformId: r.platform_id,
         channelType: r.channel_type,
         threadId: r.thread_id,
@@ -329,6 +344,16 @@ export const updateTask: McpToolDefinition = {
           type: 'string',
           description: 'New pre-agent script (optional). Pass empty string to clear.',
         },
+        model: {
+          type: 'string',
+          description:
+            `New model for this task's fires (optional). Set when the user changes it (e.g. "switch that task to opus"). Family aliases ("sonnet"/"opus"/"haiku") or exact ids; validated host-side. Leaves the current pin unchanged if omitted.`,
+        },
+        effort: {
+          type: 'string',
+          description:
+            `New reasoning effort for this task's fires (optional): "low" | "medium" | "high" | "xhigh" | "max". Leaves the current effort unchanged if omitted.`,
+        },
       },
       required: ['taskId'],
     },
@@ -339,6 +364,8 @@ export const updateTask: McpToolDefinition = {
 
     const update: Record<string, unknown> = { taskId };
     if (typeof args.prompt === 'string') update.prompt = args.prompt;
+    if (typeof args.model === 'string' && args.model) update.model = args.model;
+    if (typeof args.effort === 'string' && args.effort) update.effort = args.effort;
     if (typeof args.processAfter === 'string') {
       try {
         const d = parseZonedToUtc(args.processAfter, TIMEZONE);

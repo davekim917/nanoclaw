@@ -45,13 +45,46 @@
 import type Database from 'better-sqlite3';
 
 import { wakeContainer } from '../../container-runner.js';
+import { getContainerConfig, resolveProviderName } from '../../db/container-configs.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { resolveActiveSession } from '../../db/scheduled-tasks.js';
 import { getSession } from '../../db/sessions.js';
+import { parseMessageFlags, type FlagIntent } from '../../flag-parser.js';
 import { log } from '../../log.js';
 import { openInboundDb, writeSessionMessage } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import { cancelTask, insertTask, pauseTask, resumeTask, updateTask, type TaskUpdate } from './db.js';
+
+/** Per-fire model/effort a scheduled task carries; mirrors the chat FlagIntent. */
+type TaskFlagIntent = Pick<FlagIntent, 'turnModel' | 'turnEffort'>;
+
+/**
+ * Resolve a `{ model?, effort? }` schedule/update payload into a per-fire
+ * flagIntent, validated against the agent group's provider vocabulary. Reuses
+ * the exact chat flag-parser (`-m1`/`-e1` = per-turn) so a task pin is resolved
+ * and rejected identically to an interactive `-m1 sonnet -e1 medium` — no
+ * second, drifting validation path. Returns `{ flagIntent }` on success (empty
+ * object when neither field was given), or `{ error }` with a human-readable
+ * reason the agent sees.
+ */
+function resolveTaskFlagIntent(
+  content: Record<string, unknown>,
+  session: Session,
+): { flagIntent?: TaskFlagIntent; error?: string } {
+  const model = typeof content.model === 'string' ? content.model.trim() : '';
+  const effort = typeof content.effort === 'string' ? content.effort.trim() : '';
+  if (!model && !effort) return {};
+
+  const provider = resolveProviderName(session.agent_provider, getContainerConfig(session.agent_group_id)?.provider);
+  const flagStr = [model ? `-m1 ${model}` : '', effort ? `-e1 ${effort}` : ''].filter(Boolean).join(' ');
+  const parsed = parseMessageFlags(flagStr, provider);
+  if (parsed.errors.length > 0) return { error: parsed.errors.join('; ') };
+
+  const flagIntent: TaskFlagIntent = {};
+  if (parsed.intent?.turnModel) flagIntent.turnModel = parsed.intent.turnModel;
+  if (parsed.intent?.turnEffort) flagIntent.turnEffort = parsed.intent.turnEffort;
+  return { flagIntent };
+}
 
 /**
  * Open the channel-root session's inbound.db for a (agent_group_id,
@@ -131,6 +164,16 @@ export async function handleScheduleTask(
     return;
   }
 
+  // Resolve an optional per-fire model/effort pin. Fail closed: a bad model
+  // (e.g. "sonnet" on a codex agent) rejects the whole schedule so the agent
+  // learns, rather than silently creating a task on the wrong/no model.
+  const { flagIntent, error: flagError } = resolveTaskFlagIntent(content, session);
+  if (flagError) {
+    await notifySchedulingFailure(session, `schedule_task failed: ${flagError}`);
+    return;
+  }
+  const taskContent = JSON.stringify({ prompt, script, ...(flagIntent ? { flagIntent } : {}) });
+
   // Thread-scoped loop: keep the task in the calling per-thread session's
   // inbound (reuse delivery's already-open handle — no second writer to the
   // same file) and stamp the host-authoritative session.thread_id so its fires
@@ -145,7 +188,7 @@ export async function handleScheduleTask(
       platformId: mg.platform_id,
       channelType: mg.channel_type,
       threadId: session.thread_id,
-      content: JSON.stringify({ prompt, script }),
+      content: taskContent,
     });
     log.info('Scheduled task created (thread-scoped)', {
       taskId,
@@ -173,7 +216,7 @@ export async function handleScheduleTask(
       platformId: mg.platform_id,
       channelType: mg.channel_type,
       threadId: null,
-      content: JSON.stringify({ prompt, script }),
+      content: taskContent,
     });
   });
   log.info('Scheduled task created', {
@@ -271,6 +314,12 @@ export async function handleUpdateTask(
   if (content.script === null || typeof content.script === 'string') {
     update.script = content.script as string | null;
   }
+  const { flagIntent, error: flagError } = resolveTaskFlagIntent(content, session);
+  if (flagError) {
+    await notifySchedulingFailure(session, `update_task failed: ${flagError}`);
+    return;
+  }
+  if (flagIntent && (flagIntent.turnModel || flagIntent.turnEffort)) update.flagIntent = flagIntent;
   const touched = await applyTaskOp(session, inDb, session.messaging_group_id, (db) => updateTask(db, taskId, update));
   log.info('Task updated', { taskId, touched, fields: Object.keys(update) });
   if (touched === 0) {

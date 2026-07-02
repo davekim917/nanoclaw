@@ -4,6 +4,18 @@ For any recurring task, use `schedule_task`. This is the scheduling path — tas
 
 To inspect or change existing tasks, use `list_tasks` (returns one row per series with the stable id; thread-scoped loops are marked `[thread]`) and `update_task` / `cancel_task` / `pause_task` / `resume_task`. Prefer `update_task` over cancel + reschedule.
 
+### Model & effort per task
+
+`schedule_task` and `update_task` accept optional `model` and `effort` for the task's fires. **Default: scheduled tasks run on Sonnet at high effort** — good enough for the vast majority of recurring work and far cheaper than Opus. Omit both unless the user asks otherwise.
+
+When the user names a model or effort in natural language, fill these in from their words — don't make them use flags:
+
+- *"schedule a task to do XYZ, use sonnet with medium effort"* → `model: "sonnet", effort: "medium"`
+- *"run the daily digest on opus"* → `model: "opus"` (effort defaults to high)
+- *"switch that task to high effort"* → `update_task({ taskId, effort: "high" })`
+
+Use family aliases (`sonnet`, `opus`, `haiku`) unless the user names an exact id. Values are validated host-side against this agent's provider, so a bad model/effort is rejected with a reason rather than silently applied — pass the user's words as-is instead of guessing.
+
 ### `scope`: where the task lives and reports
 
 - **`scope: 'channel'` (default)** — durable. Runs in the channel-root session and posts to the channel root, surviving thread archival. Use for standing tasks (inbox pollers, daily briefings, anything that should outlive any one conversation).

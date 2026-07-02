@@ -2219,9 +2219,19 @@ async function buildContainerArgs(
   // auto-compact window collapse to 200k under proxy auth and force-compact
   // long sessions. Normalizing at this consumption point guarantees the 1M
   // window regardless of how a bare value got into the DB.
-  const defaultOpusModel = ensureOpus1mSuffix(
-    channelDefaults?.channelDefaultModel ?? containerConfig.defaultModel ?? DEFAULT_OPUS_MODEL,
-  );
+  // Bare FAMILY aliases in a channel/group default (`sonnet`, `opus`,
+  // `haiku`) resolve to the DEFAULT_* constants at this same consumption
+  // point. This lets an operator pin a channel to "current sonnet" instead
+  // of a frozen concrete id — a future family-default bump (e.g. Sonnet 5 →
+  // 5.1) then propagates on respawn with no DB edit. Without this, the bare
+  // alias would reach the API verbatim and 400 (see comment above).
+  const rawDefaultModel = channelDefaults?.channelDefaultModel ?? containerConfig.defaultModel ?? DEFAULT_OPUS_MODEL;
+  const familyDefaults: Record<string, string> = {
+    opus: DEFAULT_OPUS_MODEL,
+    sonnet: DEFAULT_SONNET_MODEL,
+    haiku: DEFAULT_HAIKU_MODEL,
+  };
+  const defaultOpusModel = ensureOpus1mSuffix(familyDefaults[rawDefaultModel.toLowerCase()] ?? rawDefaultModel);
   args.push('-e', `ANTHROPIC_DEFAULT_OPUS_MODEL=${defaultOpusModel}`);
   args.push('-e', `ANTHROPIC_DEFAULT_SONNET_MODEL=${DEFAULT_SONNET_MODEL}`);
   args.push('-e', `ANTHROPIC_DEFAULT_HAIKU_MODEL=${DEFAULT_HAIKU_MODEL}`);
