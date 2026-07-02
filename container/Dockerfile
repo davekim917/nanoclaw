@@ -45,7 +45,7 @@ ARG INSTALL_CJK_FONTS=false
 # Pin CLI versions for reproducibility. Bump deliberately — unpinned installs
 # mean every rebuild silently picks up the latest and can break in lockstep
 # across all users.
-ARG CLAUDE_CODE_VERSION=2.1.191
+ARG CLAUDE_CODE_VERSION=2.1.198
 ARG AGENT_BROWSER_VERSION=0.28.0
 ARG VERCEL_VERSION=52.2.1
 ARG GITNEXUS_VERSION=1.6.7
