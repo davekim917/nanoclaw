@@ -142,6 +142,16 @@ interface MnemonStatusResult {
 }
 
 function spawnMnemon(args: string[], signal?: AbortSignal): Promise<{ stdout: string; code: number }> {
+  // Under vitest, any test that reaches the REAL mnemon binary auto-creates a
+  // store directory per (often generated) group id — 1,635 empty phantom
+  // ag-<ts>-<rand> stores were found under ~/.mnemon/data on 2026-07-04.
+  // Same disease as the ingest-DB guard in 019-mnemon-ingest-db.ts, third
+  // surface. Suites that mock child_process (mnemon-impl.test.ts) set
+  // MNEMON_TEST_ALLOW_SPAWN to reach their mock; everything else fails the
+  // call deterministically without touching disk.
+  if (process.env.VITEST && !process.env.MNEMON_TEST_ALLOW_SPAWN) {
+    return Promise.resolve({ stdout: '', code: 1 });
+  }
   return new Promise((resolve) => {
     let stdout = '';
     let stderr = '';

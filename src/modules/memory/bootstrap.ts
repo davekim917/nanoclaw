@@ -158,10 +158,17 @@ export async function bootstrapMemoryForGroup(
   result.step1_sourcesDirsCreated = true;
 
   // Step 2: mnemon store create (idempotent)
-  const mnemonResult = spawnSync('mnemon', ['store', 'create', agentGroupId], {
-    encoding: 'utf8',
-    env: process.env,
-  });
+  // Under vitest, skip the real binary: create_agent tests generate
+  // ag-<ts>-<rand> group ids and this call materialized a phantom store dir
+  // under ~/.mnemon/data per test run (1,635 found 2026-07-04). Same guard
+  // family as spawnMnemon (mnemon-impl.ts) and openMnemonIngestDb.
+  const mnemonResult =
+    process.env.VITEST && !process.env.MNEMON_TEST_ALLOW_SPAWN
+      ? { error: undefined, status: 0, stderr: '' }
+      : spawnSync('mnemon', ['store', 'create', agentGroupId], {
+          encoding: 'utf8',
+          env: process.env,
+        });
   if (mnemonResult.error) {
     result.step2_mnemonStoreStatus = 'binary-missing';
     result.step2_mnemonStoreError = mnemonResult.error.message;

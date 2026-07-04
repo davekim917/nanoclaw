@@ -12,6 +12,14 @@ vi.mock('child_process', () => ({
   spawn: vi.fn(),
 }));
 
+// This file mocks spawn, so opt past spawnMnemon's VITEST real-binary guard —
+// MODULE scope, not per-describe: every describe here (including fan-out)
+// calls spawnMnemon, and a guard-swallowed spawn leaves a throwError mock
+// child's scheduled 'error' event unlistened → uncaught exception → log.ts
+// process.exit(1) → vitest worker death (the "Worker exited unexpectedly"
+// crash, 2026-07-04).
+process.env.MNEMON_TEST_ALLOW_SPAWN = '1';
+
 import { spawn } from 'child_process';
 import { MnemonStore, setMnemonStoreIngestDb } from './mnemon-impl.js';
 import { runMnemonIngestMigrations } from '../../db/migrations/019-mnemon-ingest-db.js';
