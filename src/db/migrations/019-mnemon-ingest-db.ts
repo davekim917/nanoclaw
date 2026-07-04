@@ -9,6 +9,18 @@ import { runMnemonRecallFactContentMigration } from './023-mnemon-recall-fact-co
 export const MNEMON_INGEST_DB_PATH = path.join(DATA_DIR, 'mnemon-ingest.db');
 
 export function openMnemonIngestDb(dbPath?: string): Database.Database {
+  // Under vitest a no-arg open resolves to the REAL data/mnemon-ingest.db.
+  // A test that triggers a lazy getDb() without injecting its seam
+  // (setDeadLettersDb / setMnemonStoreIngestDb / setIngestDb) then writes
+  // dead_letters and watermarks into PRODUCTION — 1,170 vitest-signature
+  // dead_letter rows (EnvironmentTeardownError) were found on 2026-07-03,
+  // some poisoning real chat pairs out of memory ingestion. Fail loud so the
+  // leaking suite is identified at the call site instead.
+  if (!dbPath && process.env.VITEST) {
+    throw new Error(
+      'openMnemonIngestDb(): refusing to open the production ingest DB under vitest — inject an in-memory DB via the module test seam or pass an explicit temp path',
+    );
+  }
   const resolved = dbPath ?? MNEMON_INGEST_DB_PATH;
   fs.mkdirSync(path.dirname(resolved), { recursive: true });
   const db = new Database(resolved);
