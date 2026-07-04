@@ -12,6 +12,7 @@ import './interactive.js';
 import './agents.js';
 import './self-mod.js';
 import './thread-search.js';
+import './memory-recall.js';
 import './git-worktrees.js';
 import './tone-profiles.js';
 import './remote-control.js';

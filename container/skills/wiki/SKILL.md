@@ -103,7 +103,7 @@ When in doubt: if you'd want it in front of you on every single message, it goes
 
 When this group has the memory layer enabled (i.e. `container.json` has `memory.enabled: true` and the host daemon is active), the wiki's content is produced by the **daily synthesise scheduled task**, not by the agent during chat. The synthesise task reads the mnemon fact graph and compiles wiki pages from it.
 
-**During chat:** you do not read from mnemon directly, and you do not call any mnemon tool. Recalled context from mnemon arrives automatically as `[Recalled context]` system messages before each user turn — that is the only mnemon surface accessible during conversation.
+**During chat:** you do not run the `mnemon` CLI directly. Recalled context from mnemon arrives automatically as `[Recalled context]` system messages before each user turn, and the `recall_memory` MCP tool covers targeted mid-turn queries (see its own instructions) — those are the only mnemon surfaces during conversation. Neither writes; the wiki is still only written by the synthesise task.
 
 **During the daily synthesise task:** the task queries the mnemon graph and writes or updates wiki pages under `wiki/{entities,concepts,timelines}/`, refreshes `wiki/index.md`, and appends to `wiki/log.md`. This is the only time wiki pages are written in a mnemon-enabled group.
 

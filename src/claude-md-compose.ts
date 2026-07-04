@@ -85,7 +85,19 @@ export function composeGroupClaudeMd(group: AgentGroup): void {
   // sibling `<name>.instructions.md`. These describe how the agent should
   // use that module's MCP tools (schedule_task, install_packages, etc.).
   // Skip cli.instructions.md when cli_scope is disabled.
+  // Skip memory-recall.instructions.md when memory is disabled — the
+  // recall_memory tool only registers when MNEMON_STORE is set (memory
+  // enabled), so the fragment would describe a tool the agent doesn't have.
   const cliDisabled = configRow?.cli_scope === 'disabled';
+  let memoryDisabled = true;
+  try {
+    const raw = JSON.parse(fs.readFileSync(path.join(groupDir, 'container.json'), 'utf8')) as {
+      memory?: { enabled?: boolean };
+    };
+    memoryDisabled = raw.memory?.enabled !== true;
+  } catch {
+    // No container.json (or unreadable) — treat as memory-disabled.
+  }
   const mcpToolsHostDir = path.join(process.cwd(), MCP_TOOLS_HOST_SUBPATH);
   if (fs.existsSync(mcpToolsHostDir)) {
     for (const entry of fs.readdirSync(mcpToolsHostDir)) {
@@ -93,6 +105,7 @@ export function composeGroupClaudeMd(group: AgentGroup): void {
       if (!match) continue;
       const moduleName = match[1];
       if (moduleName === 'cli' && cliDisabled) continue;
+      if (moduleName === 'memory-recall' && memoryDisabled) continue;
       desired.set(`module-${moduleName}.md`, {
         type: 'symlink',
         content: `${SHARED_MCP_TOOLS_CONTAINER_BASE}/${entry}`,

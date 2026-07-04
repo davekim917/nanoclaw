@@ -74,7 +74,7 @@ The file `CLAUDE.local.md` in your workspace is your per-group memory. Record th
 Two memory surfaces, both effectively read-only from the agent's perspective during chat:
 
 - **CLAUDE.local.md** (your per-group file) — operator-curated behavioral rules and high-frequency preferences. The operator edits this; you read it on every session start. Do not write to it during chat unless the user explicitly asks you to update it.
-- **mnemon graph** (auto-curated facts) — atomic facts extracted from chat turn-pairs and curated source files (articles, transcripts, attachments) by an async host-side daemon. Recall context arrives as a `[Recalled context]` system message before each user turn. You do not call `mnemon remember` directly — the daemon handles all writes.
+- **mnemon graph** (auto-curated facts) — atomic facts extracted from chat turn-pairs and curated source files (articles, transcripts, attachments) by an async host-side daemon. Recall context arrives as a `[Recalled context]` system message before each user turn, keyed on the user's words. For anything **you** are about to recommend or assert (a vendor, tool, plan, person the group may have already evaluated), query `recall_memory` mid-turn — the automatic injection cannot see your draft. You do not call `mnemon remember` directly — the daemon handles all writes.
 
 When the user shares substantive information you'd want to remember, you don't need to do anything explicit — the daemon's classifier picks it up on its next 60s sweep. If a fact is critical and time-sensitive, use scratch context (worktree files, conversation memory) for immediate use; the daemon's eventual extraction handles long-term persistence.
 
