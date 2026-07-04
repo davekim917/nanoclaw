@@ -606,6 +606,23 @@ export async function maybeInjectRecall(params: {
       factCount: result.facts.length,
       latencyMs: result.latencyMs,
     });
+    if (result.timedOut) {
+      // Timeout is a fail-open, not a legitimate empty result — surface it
+      // loudly and count it, so timeout-empties stop masquerading as
+      // "no matching facts" in the logs and health metrics.
+      log.warn('recall-injection: recall timed out, continuing without context', {
+        agentGroupId,
+        sessionId,
+        latencyMs: result.latencyMs,
+      });
+      try {
+        const recorder = _healthRecorderOverride ?? getHealthRecorder();
+        recorder.recordRecallFailOpen(agentGroupId, 'recall-timeout');
+      } catch {
+        // Health module not available (e.g. in tests without injection).
+      }
+      return;
+    }
     if (!result.facts.length) return;
 
     const recallContent = JSON.stringify({ subtype: 'recall_context', text: formatRecallContext(result.facts) });

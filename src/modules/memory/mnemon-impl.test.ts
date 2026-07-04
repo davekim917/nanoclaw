@@ -98,6 +98,7 @@ describe('MnemonStore', () => {
     expect(result.totalAvailable).toBe(0);
     expect(typeof result.latencyMs).toBe('number');
     expect(result.fromCache).toBe(false);
+    expect(result.timedOut).toBe(true);
     expect(child.kill).toHaveBeenCalledWith('SIGTERM');
     // SIGKILL fires after 500ms grace — give it time
     await new Promise((r) => setTimeout(r, 600));
@@ -115,6 +116,7 @@ describe('MnemonStore', () => {
       totalAvailable: 0,
       latencyMs: expect.any(Number),
       fromCache: false,
+      timedOut: false,
     });
   });
 

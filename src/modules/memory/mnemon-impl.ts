@@ -85,13 +85,17 @@ export function setMnemonStoreIngestDb(db: Database.Database | null): void {
 }
 
 const MNEMON_BIN = path.join(homedir(), '.local', 'bin', 'mnemon');
-// 3000ms reflects measured mnemon CLI runtime: ~1.1s for short queries, ~1.85s
-// for 800-char queries on Ampere ARM. The original spec C5 budget of 1500ms was
-// derived from the embed-only number (60-216ms warm) and didn't account for CLI
-// spawn + DB open + graph traversal. 3000ms gives ~60% headroom over the worst
-// observed case while keeping perceived latency under the typing-indicator
-// reveal window. If mnemon ever moves to a long-lived daemon, this can drop.
-const DEFAULT_TIMEOUT_MS = 3000;
+// 8000ms. Measured mnemon CLI runtime is ~1.1s for short queries, ~1.85s for
+// 800-char queries on Ampere ARM — but the original 3000ms budget timed out
+// 16.3% of all recalls in production (845/5183 in the Jul-2026 host log,
+// p90=3005ms): a message fanning out to sibling agents spawns several
+// concurrent recalls + containers and the CLI stretches well past 3s under
+// that load. 8000ms covers the observed burst case (2 threads × 3 siblings)
+// with headroom; recall runs pre-wake, so worst-case it delays a response by
+// 8s — cheaper than the agent answering with amnesia.
+// ponytail: single fixed budget; add a host-side recall semaphore if 8s
+// timeouts still show up in the recall-timeout fail-open counter.
+const DEFAULT_TIMEOUT_MS = 8000;
 const SIGKILL_GRACE_MS = 500;
 const FAN_OUT_CONCURRENCY = 4;
 const FAN_OUT_STORE_TIMEOUT_MS = 1500;
@@ -195,8 +199,15 @@ export class MnemonStore implements MemoryStore {
     const start = Date.now();
     const { limit = 10, timeoutMs = DEFAULT_TIMEOUT_MS } = opts;
 
+    // Distinguish our own timeout from an external abort or a real CLI
+    // failure — a timed-out recall returns empty facts, and without this flag
+    // the caller can't tell "gave up" from "store has nothing relevant".
+    let timedOut = false;
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs);
     const signal = opts.signal ? anySignal([opts.signal, controller.signal]) : controller.signal;
 
     const empty = (): RecallResult => ({
@@ -204,6 +215,7 @@ export class MnemonStore implements MemoryStore {
       totalAvailable: 0,
       latencyMs: Date.now() - start,
       fromCache: false,
+      timedOut,
     });
 
     try {

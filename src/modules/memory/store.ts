@@ -29,6 +29,10 @@ export interface RecallResult {
   totalAvailable: number;
   latencyMs: number;
   fromCache: boolean;
+  /** True when the recall CLI was killed at the timeout — an empty `facts`
+   *  here means "gave up", NOT "no matching facts". Callers must not treat
+   *  the two the same for health accounting. */
+  timedOut?: boolean;
 }
 
 export interface RememberResult {
