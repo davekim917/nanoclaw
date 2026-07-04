@@ -478,7 +478,14 @@ export class SourceIngester {
 
     let output;
     try {
-      output = await callClassifier(EXTRACTOR_SYSTEM_PROMPT, canonical);
+      // 240s: the codex backend's 30s default killed every real source-file
+      // extraction — measured 51.7s for a 14KB exa file, ~193s worst observed
+      // for image-adjacent codex exec work. Codex traps the timeout SIGTERM,
+      // exits 0 without writing --output-last-message, and the ENOENT read
+      // then dead-letters the file (granola/exa items reached failure_count
+      // 700+ and poisoned). The sweep is async on a 60s loop; a slow
+      // extraction blocks nothing user-facing.
+      output = await callClassifier(EXTRACTOR_SYSTEM_PROMPT, canonical, { timeoutMs: 240_000 });
     } catch (err) {
       if (health) {
         health.recordClassifierFailure(agentGroupId, err instanceof Error ? err : new Error(String(err)));

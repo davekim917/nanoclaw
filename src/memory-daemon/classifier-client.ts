@@ -24,7 +24,12 @@ export const CLASSIFIER_VERSION = 'v1';
 // v2 — added GROUNDING DISCIPLINE section to CLASSIFIER_SYSTEM_PROMPT and
 // EXTRACTOR_SYSTEM_PROMPT to prevent confabulation (acronym expansion,
 // invented aliases, unsourced parentheticals).
-export const PROMPT_VERSION = 'v2';
+// v3 — rejection/reversal rule in CLASSIFIER_SYSTEM_PROMPT: scratching a
+// vendor/option after evaluation is a decision @ importance 4-5, not
+// importance-3 context (which the MIN_FACT_IMPORTANCE=4 gate silently drops
+// — verified with the Jun-23 "Addison Lee scratched" pair, whose rejection
+// was emitted as insight@3 and lost while the positive plan survived at 4).
+export const PROMPT_VERSION = 'v3';
 // v2 — same grounding-discipline addition as PROMPT_VERSION.
 export const EXTRACTOR_VERSION = 'v2';
 

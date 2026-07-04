@@ -47,6 +47,7 @@ Rules:
 - Extract atomic facts — one clear, self-contained statement per fact.
 - Preferred categories: preference, decision, insight, fact, context.
 - Importance: 5 = critical/high-signal, 1 = low-signal background detail.
+- A decision to REJECT, scratch, or rule out a specific option after evaluation (a vendor, service, tool, approach, or plan) is category "decision" with importance 4 or 5 — exactly as durable as the positive choice it complements. The same applies when a prior recommendation is reversed or corrected: the reversal is the durable fact. Do NOT file these as low-importance context or insight; forgetting a rejection causes the rejected option to be re-recommended later.
 - NEVER extract secrets, credentials, API keys, tokens, passwords, or transient state (e.g. error messages with stack traces, temporary values).
 - Return empty facts array for chitchat, greetings, or short filler messages.
 
@@ -237,7 +238,11 @@ async function classifyPair(
 
   let output;
   try {
-    output = await callClassifier(CLASSIFIER_SYSTEM_PROMPT, pairText);
+    // 120s: typical codex pair classify is ~9s, but long assistant runs can
+    // exceed the backend's 30s default (turn-pair dead letters with the
+    // SIGTERM/no-output-file signature exist in production). Same rationale
+    // as source-ingest's 240s — the sweep is async, generous beats poisoned.
+    output = await callClassifier(CLASSIFIER_SYSTEM_PROMPT, pairText, { timeoutMs: 120_000 });
   } catch (err) {
     health.recordClassifierFailure(agentGroupId, err instanceof Error ? err : new Error(String(err)));
     const result = recordOrIncrementFailure({
