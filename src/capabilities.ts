@@ -771,6 +771,21 @@ export function buildSessionServicesSnapshot(
     });
   }
 
+  // Profound — REST/reporting API via OneCLI. Gated on the workgroup OneCLI
+  // secret name "Profound". No MCP/CLI surface is wired: agents call
+  // api.tryprofound.com directly and the gateway injects X-API-Key.
+  if (mergedSecrets.some((s) => /^profound$/i.test(s))) {
+    services.push({
+      name: 'Profound',
+      cli: 'curl',
+      declaredTools: [],
+      scopes: ['madison-reed'],
+      credentialPaths: [],
+      useFor:
+        'Madison Reed Profound REST/reporting API at https://api.tryprofound.com — auth pre-injected as `X-API-Key` (send NO auth header; the OneCLI gateway adds it at the boundary). Use for Profound organization discovery and reports: `GET /v1/org/categories`, `/v1/org/domains`, `/v1/org/models`, `/v1/org/regions`; report pulls such as `POST /v1/reports/visibility`, `/citations`, `/sentiment`, `/query-fanouts`, `/v1/prompts/answers`, `/v2/reports/referrals`, and `/v2/reports/bots`.',
+    });
+  }
+
   // Fivetran — REST-only via the OneCLI gateway, gated on a `Fivetran-*` OneCLI
   // secret. The gateway injects `Authorization: Basic <base64(apiKey:apiSecret)>`
   // at the boundary (e.g. vault entry "Fivetran-MadisonReed" → api.fivetran.com).
