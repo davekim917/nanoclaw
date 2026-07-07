@@ -1368,8 +1368,10 @@ export function buildMounts(
       }
     }
   } catch (err) {
-    // Re-throw W3 fail-closed; otherwise fall through to legacy single-agent filter
-    if (err instanceof Error && err.message.includes('workgroup_id is NULL')) {
+    // Re-throw W3 fail-closed (both the NULL-workgroup error and the
+    // member-check error share the 'Workgroup-scoped projection' prefix);
+    // otherwise fall through to legacy single-agent filter.
+    if (err instanceof Error && err.message.includes('Workgroup-scoped projection')) {
       throw err;
     }
     log.warn('workgroup membership resolution failed; falling back to single-agent projection', {

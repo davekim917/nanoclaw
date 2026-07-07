@@ -281,8 +281,11 @@ function safeParseContent(raw: string): { text?: string; sender?: string; sender
   }
 }
 
-function isSlackChannelType(channelType: string): boolean {
-  return isChannelVariant(channelType, 'slack' satisfies ChannelType);
+export function isSlackChannelType(channelType: string): boolean {
+  // Bare 'slack' AND workspace variants — the default single-workspace Slack
+  // adapter uses bare 'slack', so this predicate must accept both (unlike
+  // adapterHasWorkspaceIdentity, which is deliberately variant-only).
+  return channelType === 'slack' || isChannelVariant(channelType, 'slack' satisfies ChannelType);
 }
 
 /**
@@ -296,7 +299,7 @@ function isSlackChannelType(channelType: string): boolean {
  * mention-sticky engage default, etc.).
  */
 export function isDiscordChannelType(channelType: string): boolean {
-  return isChannelVariant(channelType, 'discord' satisfies ChannelType);
+  return channelType === 'discord' || isChannelVariant(channelType, 'discord' satisfies ChannelType);
 }
 
 /**
