@@ -39,7 +39,7 @@ function setupCentralDb(): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS agent_groups (
       id TEXT PRIMARY KEY, name TEXT NOT NULL, folder TEXT NOT NULL UNIQUE,
-      agent_provider TEXT, created_at TEXT NOT NULL
+      agent_provider TEXT, created_at TEXT NOT NULL, workgroup_id TEXT
     );
     CREATE TABLE IF NOT EXISTS messaging_groups (
       id TEXT PRIMARY KEY, channel_type TEXT NOT NULL, platform_id TEXT NOT NULL,
@@ -152,6 +152,159 @@ describe('test_scheduleTask_rejects_unwired_destination', () => {
         TEST_DIR,
       ),
     ).rejects.toThrow(/no messaging group/);
+  });
+});
+
+// ── test_scheduleTask_rejects_cross_workgroup_peer ──────────────────────────
+describe('test_scheduleTask_rejects_cross_workgroup_peer', () => {
+  it('refuses when a peer agent in a different workgroup is wired to the same messaging group', async () => {
+    seedActiveSession();
+    seedInboundDb();
+
+    const db = getDb();
+    // Seed AGENT_GROUP_ID with workgroup_id='wg-A' so the test exercises the
+    // wg-A-vs-wg-other branch (not the scheduler-null branch).
+    db.prepare(
+      `INSERT INTO agent_groups (id, name, folder, agent_provider, created_at, workgroup_id)
+       VALUES (?, 'primary', ?, NULL, datetime('now'), 'wg-A')
+       ON CONFLICT(id) DO UPDATE SET workgroup_id = excluded.workgroup_id`,
+    ).run(AGENT_GROUP_ID, AGENT_GROUP_ID);
+    // Peer agent in a DIFFERENT workgroup, also wired to the same mg.
+    db.prepare(
+      `INSERT INTO agent_groups (id, name, folder, agent_provider, created_at, workgroup_id)
+       VALUES ('ag-peer-other', 'peer-other', 'peer-other', NULL, datetime('now'), 'wg-other')`,
+    ).run();
+    db.prepare(
+      `INSERT INTO messaging_group_agents (id, messaging_group_id, agent_group_id, created_at)
+       VALUES ('mga-peer-other', ?, 'ag-peer-other', datetime('now'))`,
+    ).run(MESSAGING_GROUP_ID);
+
+    await expect(
+      scheduleTask(
+        {
+          id: 't-xwg',
+          agentGroupId: AGENT_GROUP_ID,
+          cron: '0 3 * * *',
+          processAfter: new Date(Date.now() + 86400000).toISOString(),
+          seriesId: 's-xwg',
+          prompt: 'should not schedule',
+          destination: TEST_DESTINATION,
+        },
+        TEST_DIR,
+      ),
+    ).rejects.toThrow(/cross workgroup boundaries/i);
+  });
+
+  it('refuses when a peer agent has NULL workgroup_id while scheduler has a real one', async () => {
+    seedActiveSession();
+    seedInboundDb();
+
+    const db = getDb();
+    // Scheduler has a real workgroup; peer has NULL → defensive boundary.
+    db.prepare(
+      `INSERT INTO agent_groups (id, name, folder, agent_provider, created_at, workgroup_id)
+       VALUES (?, 'primary', ?, NULL, datetime('now'), 'wg-A')
+       ON CONFLICT(id) DO UPDATE SET workgroup_id = excluded.workgroup_id`,
+    ).run(AGENT_GROUP_ID, AGENT_GROUP_ID);
+    db.prepare(
+      `INSERT INTO agent_groups (id, name, folder, agent_provider, created_at, workgroup_id)
+       VALUES ('ag-peer-null', 'peer-null', 'peer-null', NULL, datetime('now'), NULL)`,
+    ).run();
+    db.prepare(
+      `INSERT INTO messaging_group_agents (id, messaging_group_id, agent_group_id, created_at)
+       VALUES ('mga-peer-null', ?, 'ag-peer-null', datetime('now'))`,
+    ).run(MESSAGING_GROUP_ID);
+
+    await expect(
+      scheduleTask(
+        {
+          id: 't-peer-null',
+          agentGroupId: AGENT_GROUP_ID,
+          cron: '0 3 * * *',
+          processAfter: new Date(Date.now() + 86400000).toISOString(),
+          seriesId: 's-peer-null',
+          prompt: 'should not schedule',
+          destination: TEST_DESTINATION,
+        },
+        TEST_DIR,
+      ),
+    ).rejects.toThrow(/cross workgroup boundaries/i);
+  });
+
+  it('allows scheduling when peer agents are in the same workgroup (sibling fan-out)', async () => {
+    seedActiveSession();
+    seedInboundDb();
+
+    const db = getDb();
+    // Insert AGENT_GROUP_ID + give it a workgroup_id, then add a sibling in the same workgroup.
+    db.prepare(
+      `INSERT INTO agent_groups (id, name, folder, agent_provider, created_at, workgroup_id)
+       VALUES (?, 'primary', ?, NULL, datetime('now'), 'wg-shared')
+       ON CONFLICT(id) DO UPDATE SET workgroup_id = excluded.workgroup_id`,
+    ).run(AGENT_GROUP_ID, AGENT_GROUP_ID);
+    db.prepare(
+      `INSERT INTO agent_groups (id, name, folder, agent_provider, created_at, workgroup_id)
+       VALUES ('ag-sibling', 'sibling', 'sibling', NULL, datetime('now'), 'wg-shared')`,
+    ).run();
+    db.prepare(
+      `INSERT INTO messaging_group_agents (id, messaging_group_id, agent_group_id, created_at)
+       VALUES ('mga-sibling', ?, 'ag-sibling', datetime('now'))`,
+    ).run(MESSAGING_GROUP_ID);
+
+    await expect(
+      scheduleTask(
+        {
+          id: 't-sibling',
+          agentGroupId: AGENT_GROUP_ID,
+          cron: '0 3 * * *',
+          processAfter: new Date(Date.now() + 86400000).toISOString(),
+          seriesId: 's-sibling',
+          prompt: 'should schedule',
+          destination: TEST_DESTINATION,
+        },
+        TEST_DIR,
+      ),
+    ).resolves.toBeUndefined();
+  });
+
+  it('refuses when the scheduling agent has NULL workgroup_id (defensive boundary)', async () => {
+    seedActiveSession();
+    seedInboundDb();
+
+    const db = getDb();
+    // AGENT_GROUP_ID gets an explicit NULL workgroup_id (the test fixture
+    // doesn't insert it into agent_groups, so the row doesn't exist; we
+    // insert with NULL to exercise the boundary).
+    db.prepare(
+      `INSERT INTO agent_groups (id, name, folder, agent_provider, created_at, workgroup_id)
+       VALUES (?, 'primary', ?, NULL, datetime('now'), NULL)
+       ON CONFLICT(id) DO UPDATE SET workgroup_id = NULL`,
+    ).run(AGENT_GROUP_ID, AGENT_GROUP_ID);
+    // Peer agent in a workgroup.
+    db.prepare(
+      `INSERT INTO agent_groups (id, name, folder, agent_provider, created_at, workgroup_id)
+       VALUES ('ag-peer', 'peer', 'peer', NULL, datetime('now'), 'wg-anything')`,
+    ).run();
+    db.prepare(
+      `INSERT INTO messaging_group_agents (id, messaging_group_id, agent_group_id, created_at)
+       VALUES ('mga-peer', ?, 'ag-peer', datetime('now'))`,
+    ).run(MESSAGING_GROUP_ID);
+    // AGENT_GROUP_ID already has workgroup_id NULL (default).
+
+    await expect(
+      scheduleTask(
+        {
+          id: 't-null-wg',
+          agentGroupId: AGENT_GROUP_ID,
+          cron: '0 3 * * *',
+          processAfter: new Date(Date.now() + 86400000).toISOString(),
+          seriesId: 's-null-wg',
+          prompt: 'should not schedule',
+          destination: TEST_DESTINATION,
+        },
+        TEST_DIR,
+      ),
+    ).rejects.toThrow(/cross workgroup boundaries/i);
   });
 });
 

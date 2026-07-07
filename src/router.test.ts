@@ -102,6 +102,8 @@ import {
   setUnwiredChannelResolver,
   setChannelRequestGate,
   setMessageInterceptor,
+  isSlackChannelType,
+  isDiscordChannelType,
 } from './router.js';
 import { getMessagingGroupWithAgentCount, getMessagingGroupAgents } from './db/messaging-groups.js';
 import { writeSessionMessage, writeOutboundDirect, resolveSession } from './session-manager.js';
@@ -530,5 +532,26 @@ describe('thread context fetch', () => {
     expect(text).not.toContain('Pocket meetings');
     expect(text).not.toContain('Pocket yes');
     expect(text).not.toContain('old user follow-up');
+  });
+});
+
+// Regression: PR #133 codex review — the isChannelVariant refactor dropped
+// bare-base matching from these predicates. Bare 'slack'/'discord' are the
+// default single-workspace/first-party adapters and MUST pass; variants
+// (slack-<ws>, discord-<suffix>) must too. whatsapp-cloud-style sibling
+// channels must NOT match a different base.
+describe('channel-type predicates accept bare base and variants', () => {
+  it('isSlackChannelType: bare + variant pass, others fail', () => {
+    expect(isSlackChannelType('slack')).toBe(true);
+    expect(isSlackChannelType('slack-illysium')).toBe(true);
+    expect(isSlackChannelType('discord')).toBe(false);
+    expect(isSlackChannelType('slackish')).toBe(false);
+  });
+
+  it('isDiscordChannelType: bare + variant pass, others fail', () => {
+    expect(isDiscordChannelType('discord')).toBe(true);
+    expect(isDiscordChannelType('discord-second')).toBe(true);
+    expect(isDiscordChannelType('slack')).toBe(false);
+    expect(isDiscordChannelType('discordia')).toBe(false);
   });
 });

@@ -41,7 +41,8 @@ import { maybeRenameNewThread } from './topic-title.js';
 import { wakeContainer } from './container-runner.js';
 import { getContainerConfig, resolveProviderName } from './db/container-configs.js';
 import { getSession } from './db/sessions.js';
-import type { AgentGroup, MessagingGroup, MessagingGroupAgent } from './types.js';
+import type { AgentGroup, ChannelType, MessagingGroup, MessagingGroupAgent } from './types.js';
+import { isChannelVariant } from './types.js';
 import type { InboundEvent } from './channels/adapter.js';
 
 /**
@@ -72,11 +73,11 @@ function adapterHasWorkspaceIdentity(channelType: string): boolean {
   if (isDiscordChannelType(channelType)) return true;
   // Slack channel types are stamped with the workspace suffix
   // ("slack-<workspace>"); bare "slack" without suffix is ambiguous.
-  if (channelType.startsWith('slack-')) return true;
+  if (isChannelVariant(channelType, 'slack' satisfies ChannelType)) return true;
   // GitHub repo and Linear team are workspace-scoped via their adapter's
   // channel_type suffix convention (`github-<owner>-<repo>`, `linear-<team>`).
-  if (channelType.startsWith('github-')) return true;
-  if (channelType.startsWith('linear-')) return true;
+  if (isChannelVariant(channelType, 'github' satisfies ChannelType)) return true;
+  if (isChannelVariant(channelType, 'linear' satisfies ChannelType)) return true;
   return false;
 }
 
@@ -280,8 +281,11 @@ function safeParseContent(raw: string): { text?: string; sender?: string; sender
   }
 }
 
-function isSlackChannelType(channelType: string): boolean {
-  return channelType === 'slack' || channelType.startsWith('slack-');
+export function isSlackChannelType(channelType: string): boolean {
+  // Bare 'slack' AND workspace variants — the default single-workspace Slack
+  // adapter uses bare 'slack', so this predicate must accept both (unlike
+  // adapterHasWorkspaceIdentity, which is deliberately variant-only).
+  return channelType === 'slack' || isChannelVariant(channelType, 'slack' satisfies ChannelType);
 }
 
 /**
@@ -295,7 +299,7 @@ function isSlackChannelType(channelType: string): boolean {
  * mention-sticky engage default, etc.).
  */
 export function isDiscordChannelType(channelType: string): boolean {
-  return channelType === 'discord' || channelType.startsWith('discord-');
+  return channelType === 'discord' || isChannelVariant(channelType, 'discord' satisfies ChannelType);
 }
 
 /**

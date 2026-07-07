@@ -16,7 +16,7 @@ import { ensureSchema, openInboundDb } from '../../db/session-db.js';
 import { migration043 } from '../../db/migrations/043-scheduled-audit.js';
 import { encodeKey, invalidateScheduledCache, _resetScheduledRateLimitForTesting } from './scheduled-shared.js';
 import { movePreviewHandler, moveExecuteHandler, _setMoveTestOptions } from './scheduled-move.js';
-import { computeSecretDelta } from './scheduled-move.js';
+import { computeSecretDelta, isCrossWorkgroup } from './scheduled-move.js';
 import type { AuthedRequestContext } from '../router.js';
 
 // Unique per-file temp root (mkdtempSync) so parallel vitest workers never
@@ -613,5 +613,39 @@ describe('moveExecuteHandler', () => {
     const res = (await moveExecuteHandler(req(moveBody()), { key }, ctxFor('owner', OWNER_SCOPES)))!;
     expect(res.status).toBe(503);
     expect((await readJson(res)).reason).toBe('session_unreadable');
+  });
+});
+
+// ── isCrossWorkgroup unit tests ───────────────────────────────────────────────
+describe('isCrossWorkgroup', () => {
+  beforeEach(() => {
+    setupCentralDb();
+    addWorkgroup('wg-alpha', []);
+    addWorkgroup('wg-beta', []);
+  });
+
+  it('returns false for two agents sharing the same workgroup_id', () => {
+    addGroup('a1', 'folder-a1', 'wg-alpha');
+    addGroup('a2', 'folder-a2', 'wg-alpha');
+    expect(isCrossWorkgroup('a1', 'a2')).toBe(false);
+  });
+
+  it('returns true for two agents in different workgroups', () => {
+    addGroup('a1', 'folder-a1', 'wg-alpha');
+    addGroup('b1', 'folder-b1', 'wg-beta');
+    expect(isCrossWorkgroup('a1', 'b1')).toBe(true);
+  });
+
+  it('returns true when both agents are orphans (workgroup_id === null)', () => {
+    addGroup('orphan-1', 'folder-orphan-1', null);
+    addGroup('orphan-2', 'folder-orphan-2', null);
+    expect(isCrossWorkgroup('orphan-1', 'orphan-2')).toBe(true);
+  });
+
+  it('returns true when only one side is orphaned', () => {
+    addGroup('orphan', 'folder-orphan', null);
+    addGroup('paired', 'folder-paired', 'wg-alpha');
+    expect(isCrossWorkgroup('orphan', 'paired')).toBe(true);
+    expect(isCrossWorkgroup('paired', 'orphan')).toBe(true);
   });
 });

@@ -299,12 +299,11 @@ function resolveAndGate(
   };
 }
 
-function isCrossWorkgroup(sourceAgId: string, targetAgId: string): boolean {
+export function isCrossWorkgroup(sourceAgId: string, targetAgId: string): boolean {
   const s = getAgentGroup(sourceAgId);
   const t = getAgentGroup(targetAgId);
-  const sw = s?.workgroup_id ?? s?.folder;
-  const tw = t?.workgroup_id ?? t?.folder;
-  return sw !== tw;
+  if (s?.workgroup_id == null || t?.workgroup_id == null) return true;
+  return s.workgroup_id !== t.workgroup_id;
 }
 
 // ── D1: preview handler ─────────────────────────────────────────────────────────

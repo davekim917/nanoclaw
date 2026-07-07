@@ -44,7 +44,7 @@ import { EGRESS_NETWORK, egressNetworkArgs, ensureEgressNetwork } from './egress
 import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { ensureOpus1mSuffix } from './flag-parser.js';
 import { readEnvFileMatching } from './env.js';
-import { getAgentGroup, getWorkgroupOnecliSecrets } from './db/agent-groups.js';
+import { getAgentGroup, getWorkgroupOnecliSecrets, getWorkgroupOnecliSecretsById } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
 import { findSessionByAgentGroupAndMessagingGroup } from './db/sessions.js';
@@ -203,7 +203,7 @@ export function reconcileWorkgroupAtSpawn(
   db: Database.Database,
   agentGroup: Pick<AgentGroup, 'id' | 'folder'>,
   containerConfig: Pick<ContainerConfig, 'workgroup_id'>,
-): void {
+): { workgroupId: string } {
   // Determine declared workgroup_id with the precedence above.
   let declared: string;
   if (containerConfig.workgroup_id !== undefined) {
@@ -240,6 +240,14 @@ export function reconcileWorkgroupAtSpawn(
     `,
     ).run(declared, agentGroup.id, declared);
   })();
+
+  // Return the resolved workgroup id so spawnContainer can thread it
+  // through every downstream subsystem (buildMounts /workspace/workgroup
+  // mount, buildArchiveProjection, applyOnecliSecrets, etc.) without each
+  // re-deriving from agentGroups. Eliminates the race where two subsystems
+  // inside the same spawn observe different workgroup ids under a
+  // concurrent reconcile.
+  return { workgroupId: declared };
 }
 
 /**
@@ -297,6 +305,11 @@ export function resolveMnemonStore(
   agentGroup: Pick<AgentGroup, 'id' | 'folder'>,
   env: NodeJS.ProcessEnv = process.env,
   recallScope?: RecallScope,
+  // Resolved workgroup id from spawnContainer. When set, use this directly
+  // instead of re-joining on agent_groups.workgroup_id — eliminates the race
+  // where a concurrent reconcile flips the workgroup between the JOIN read
+  // and the mount/env write.
+  resolvedWgId?: string,
 ): string {
   const scopedKey = `MNEMON_STORE_${agentGroup.folder.replace(/-/g, '_')}`;
   const envOverride = env[scopedKey] ?? env[scopedKey.toUpperCase()];
@@ -319,13 +332,17 @@ export function resolveMnemonStore(
     return agentGroup.id;
   }
 
-  const wgRow = db
-    .prepare(
-      `SELECT w.mnemon_store_id FROM workgroups w
-       JOIN agent_groups a ON a.workgroup_id = w.id
-       WHERE a.id = ?`,
-    )
-    .get(agentGroup.id) as { mnemon_store_id: string | null } | undefined;
+  const wgRow = resolvedWgId
+    ? (db.prepare(`SELECT mnemon_store_id FROM workgroups WHERE id = ?`).get(resolvedWgId) as
+        | { mnemon_store_id: string | null }
+        | undefined)
+    : (db
+        .prepare(
+          `SELECT w.mnemon_store_id FROM workgroups w
+           JOIN agent_groups a ON a.workgroup_id = w.id
+           WHERE a.id = ?`,
+        )
+        .get(agentGroup.id) as { mnemon_store_id: string | null } | undefined);
 
   const resolved = wgRow?.mnemon_store_id ?? agentGroup.id;
   if (!isValidStoreId(resolved)) {
@@ -456,7 +473,11 @@ async function spawnContainer(session: Session): Promise<void> {
   // (two indexed DB ops inside a transaction). Fail-closed: if the central DB
   // is unavailable the exception propagates up through spawnContainer and the
   // caller retries on the next sweep tick.
-  reconcileWorkgroupAtSpawn(getDb(), agentGroup, containerConfig);
+  //
+  // The returned workgroupId is threaded through buildMounts and other
+  // downstream subsystems so they don't each re-derive from agentGroups,
+  // which would race against any concurrent reconcile.
+  const { workgroupId: resolvedWgId } = reconcileWorkgroupAtSpawn(getDb(), agentGroup, containerConfig);
 
   // Per-group filesystem state lives forever after first creation. Init is
   // idempotent: it only writes paths that don't already exist, so this call
@@ -470,7 +491,7 @@ async function spawnContainer(session: Session): Promise<void> {
   // buildMounts and buildContainerArgs so side effects (mkdir, etc.) fire once.
   const { provider, contribution } = resolveProviderContribution(session, agentGroup, containerConfig);
 
-  const mounts = buildMounts(agentGroup, session, containerConfig, provider, contribution);
+  const mounts = buildMounts(agentGroup, session, containerConfig, provider, contribution, resolvedWgId);
   const containerName = `nanoclaw-v2-${agentGroup.folder}-${Date.now()}`;
   // OneCLI agent identifier is always the agent group id — stable across
   // sessions and reversible via getAgentGroup() for approval routing.
@@ -506,6 +527,7 @@ async function spawnContainer(session: Session): Promise<void> {
       channelDefaultTone,
     },
     session.messaging_group_id ?? null,
+    resolvedWgId,
   );
 
   log.info('Spawning container', { sessionId: session.id, agentGroup: agentGroup.name, containerName });
@@ -1076,6 +1098,13 @@ export function buildMounts(
   containerConfig: import('./container-config.js').ContainerConfig,
   provider: string,
   providerContribution: ProviderContainerContribution,
+  // Resolved workgroup id from reconcileWorkgroupAtSpawn. Threaded in by
+  // spawnContainer so every subsystem sees the same value, eliminating the
+  // race where re-deriving inside buildMounts could observe a different
+  // workgroup than reconcile just settled on. Defaults to the agentGroup
+  // field for direct callers (tests, etc.) that don't go through
+  // spawnContainer.
+  resolvedWgId?: string,
 ): VolumeMount[] {
   const projectRoot = process.cwd();
 
@@ -1212,7 +1241,11 @@ export function buildMounts(
   // /workspace/agent/<name> reader paths resolve through it with no repoint.
   // Also mounts when a prior migration left a .migrated marker, so flipping the
   // flag off after enabling doesn't dangle the compat symlinks.
-  const wgId = agentGroup.workgroup_id || agentGroup.folder;
+  // Use the resolved wgId from spawnContainer when available — it's already
+  // been settled by reconcileWorkgroupAtSpawn under the writer lock, so every
+  // subsystem inside this spawn sees the same value. Fall back to the
+  // agentGroup field for direct callers (tests, scripts).
+  const wgId = resolvedWgId ?? agentGroup.workgroup_id ?? agentGroup.folder;
   const wgShared = workgroupSharedDir(wgId);
   if (WORKGROUP_SHARED_FS || fs.existsSync(path.join(wgShared, '.migrated'))) {
     fs.mkdirSync(wgShared, { recursive: true });
@@ -1291,28 +1324,54 @@ export function buildMounts(
   // W3 fail-closed: if the spawning agent has NULL workgroup_id, abort spawn.
   // Legacy fallback: if the central DB doesn't have the workgroup_id column yet
   // (pre-migration-036 installs), pass undefined so projection uses single-agent filter.
+  //
+  // Use the wgId resolved by spawnContainer when available — it's the same
+  // value the /workspace/workgroup mount above saw, eliminating the race
+  // where two subsystems inside the same spawn could observe different
+  // workgroup ids under a concurrent reconcile.
   let workgroupMemberIds: string[] | undefined;
   try {
-    const centralCheck = getDb().prepare(`PRAGMA table_info(agent_groups)`).all() as Array<{ name: string }>;
-    if (centralCheck.some((c) => c.name === 'workgroup_id')) {
-      const agRow = getDb().prepare(`SELECT workgroup_id FROM agent_groups WHERE id = ?`).get(agentGroup.id) as
-        | { workgroup_id: string | null }
-        | undefined;
-      if (agRow && agRow.workgroup_id === null) {
+    if (resolvedWgId) {
+      const memberRows = getDb()
+        .prepare(`SELECT id FROM agent_groups WHERE workgroup_id = ?`)
+        .all(resolvedWgId) as Array<{ id: string }>;
+      // W3 fail-closed: if the spawning agent is no longer a member of the
+      // workgroup reconcile settled on, refuse to build a projection that
+      // would silently drop them. The reconcile just updated
+      // agent_groups.workgroup_id for THIS agent to resolvedWgId; if that
+      // write hasn't yet been observed (or if a second reconcile undid it
+      // mid-spawn), the projection would lie.
+      if (!memberRows.some((r) => r.id === agentGroup.id)) {
         throw new Error(
-          `Workgroup-scoped projection: invalid workgroup for agent ${agentGroup.id} — workgroup_id is NULL`,
+          `Workgroup-scoped projection: agent ${agentGroup.id} is not a member of workgroup ${resolvedWgId} at projection time ` +
+            `(refusing to fall through to legacy single-agent filter; this is the W3 fail-closed path).`,
         );
       }
-      if (agRow && agRow.workgroup_id) {
-        const memberRows = getDb()
-          .prepare(`SELECT id FROM agent_groups WHERE workgroup_id = ?`)
-          .all(agRow.workgroup_id) as Array<{ id: string }>;
-        workgroupMemberIds = memberRows.map((r) => r.id);
+      workgroupMemberIds = memberRows.map((r) => r.id);
+    } else {
+      const centralCheck = getDb().prepare(`PRAGMA table_info(agent_groups)`).all() as Array<{ name: string }>;
+      if (centralCheck.some((c) => c.name === 'workgroup_id')) {
+        const agRow = getDb().prepare(`SELECT workgroup_id FROM agent_groups WHERE id = ?`).get(agentGroup.id) as
+          | { workgroup_id: string | null }
+          | undefined;
+        if (agRow && agRow.workgroup_id === null) {
+          throw new Error(
+            `Workgroup-scoped projection: invalid workgroup for agent ${agentGroup.id} — workgroup_id is NULL`,
+          );
+        }
+        if (agRow && agRow.workgroup_id) {
+          const memberRows = getDb()
+            .prepare(`SELECT id FROM agent_groups WHERE workgroup_id = ?`)
+            .all(agRow.workgroup_id) as Array<{ id: string }>;
+          workgroupMemberIds = memberRows.map((r) => r.id);
+        }
       }
     }
   } catch (err) {
-    // Re-throw W3 fail-closed; otherwise fall through to legacy single-agent filter
-    if (err instanceof Error && err.message.includes('workgroup_id is NULL')) {
+    // Re-throw W3 fail-closed (both the NULL-workgroup error and the
+    // member-check error share the 'Workgroup-scoped projection' prefix);
+    // otherwise fall through to legacy single-agent filter.
+    if (err instanceof Error && err.message.includes('Workgroup-scoped projection')) {
       throw err;
     }
     log.warn('workgroup membership resolution failed; falling back to single-agent projection', {
@@ -1380,7 +1439,7 @@ export function buildMounts(
     // recall-injection honors recall_scope; this keeps the container-side
     // symmetric so in-container `mnemon recall` reads from the same store).
     const recallScope = getRecallScope(containerConfig.memory);
-    const resolvedStore = resolveMnemonStore(getDb(), agentGroup, process.env, recallScope);
+    const resolvedStore = resolveMnemonStore(getDb(), agentGroup, process.env, recallScope, wgId);
     const mnemonDataDir = path.join(os.homedir(), '.mnemon', 'data', resolvedStore);
     fs.mkdirSync(mnemonDataDir, { recursive: true });
     mounts.push({
@@ -2164,6 +2223,11 @@ async function buildContainerArgs(
     channelDefaultTone: string | null;
   },
   sessionMessagingGroupId?: string | null,
+  // Resolved workgroup id from spawnContainer → reconcileWorkgroupAtSpawn.
+  // Threaded in so NANOCLAW_WORKGROUP_ID and the workgroup OneCLI secret
+  // resolution stay aligned with the /workspace/workgroup mount and the
+  // archive projection (race-fix).
+  resolvedWgId?: string,
 ): Promise<string[]> {
   const args: string[] = ['run', '--rm', '--name', containerName, '--label', CONTAINER_INSTALL_LABEL];
   args.push(...dockerResourceLimitArgs());
@@ -2290,11 +2354,17 @@ async function buildContainerArgs(
   // case; here we use try/catch because the workgroup line is purely
   // additive — silent fall-through is the right semantic.
   try {
-    const agRow = getDb().prepare(`SELECT workgroup_id FROM agent_groups WHERE id = ?`).get(agentGroup.id) as
-      | { workgroup_id: string | null }
-      | undefined;
-    if (agRow?.workgroup_id) {
-      args.push('-e', `NANOCLAW_WORKGROUP_ID=${agRow.workgroup_id}`);
+    // Use the resolved wgId from spawnContainer when available — same value
+    // the /workspace/workgroup mount + archive projection already saw.
+    const wgId =
+      resolvedWgId ??
+      (
+        getDb().prepare(`SELECT workgroup_id FROM agent_groups WHERE id = ?`).get(agentGroup.id) as
+          | { workgroup_id: string | null }
+          | undefined
+      )?.workgroup_id;
+    if (wgId) {
+      args.push('-e', `NANOCLAW_WORKGROUP_ID=${wgId}`);
     }
   } catch {
     // Pre-migration-036 schema. Omit the env var; the container's
@@ -2540,7 +2610,11 @@ async function buildContainerArgs(
   // resolveMnemonStore with the same recallScope argument.
   if (containerConfig.memory?.enabled === true) {
     const recallScope = getRecallScope(containerConfig.memory);
-    const mnemonStore = resolveMnemonStore(getDb(), agentGroup, process.env, recallScope);
+    // Pass resolvedWgId so MNEMON_STORE stays aligned with the mount path
+    // computed in buildMounts (which already uses wgId). Without it, a
+    // concurrent reconcile could make the env point at a different workgroup
+    // than the mount — silent recall-divergence. (Codex round-2 catch.)
+    const mnemonStore = resolveMnemonStore(getDb(), agentGroup, process.env, recallScope, resolvedWgId);
     args.push('-e', `MNEMON_STORE=${mnemonStore}`);
     args.push('-e', 'MNEMON_READ_ONLY=1');
     args.push('-e', 'MNEMON_EMBED_ENDPOINT=http://host.docker.internal:11434');
@@ -2582,7 +2656,13 @@ async function buildContainerArgs(
       // (additive) — neither list can subtract from the other. No-op when the
       // merged list is empty (preserves whatever assignment the operator set via
       // UI/CLI — e.g. the 3 mode-all agents intentionally left untouched).
-      const workgroupSecrets = getWorkgroupOnecliSecrets(agentGroup.id);
+      // Use the resolved wgId from spawnContainer when available — the JOIN on
+      // agent_groups.workgroup_id below can return a different workgroup if a
+      // concurrent reconcile flipped it between reconcileWorkgroupAtSpawn
+      // and this lookup (race-fix).
+      const workgroupSecrets = resolvedWgId
+        ? getWorkgroupOnecliSecretsById(resolvedWgId)
+        : getWorkgroupOnecliSecrets(agentGroup.id);
       const mergedSecrets = mergeWorkgroupAndGroupSecrets(workgroupSecrets, containerConfig.onecliSecrets);
 
       // Slack user-token scoping — the credential-layer half of the Slack

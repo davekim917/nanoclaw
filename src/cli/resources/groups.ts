@@ -89,13 +89,46 @@ registerResource({
 
         const hasAgentDestinations = hasTable(db, 'agent_destinations');
         const hasPendingApprovals = hasTable(db, 'pending_approvals');
+        const hasWorkgroups = hasTable(db, 'workgroups');
 
-        // FK-ordered cascade. Single sync transaction — better-sqlite3 rolls
-        // back the whole thing if any statement throws (e.g. an FK constraint
-        // we missed), so the central DB stays consistent. The `removed` counts
-        // are sourced from each DELETE's `changes` so they describe exactly
-        // what the transaction did, not a separate pre-flight snapshot.
+        // FK-ordered cascade. Single sync IMMEDIATE transaction — better-sqlite3
+        // rolls back the whole thing if any statement throws (e.g. an FK
+        // constraint we missed), so the central DB stays consistent. IMMEDIATE
+        // grabs the writer lock up front so a parallel INSERT into
+        // agent_groups between the sibling-refuse check and the dependent
+        // DELETEs can't slip through and surface as a FK error.
+        //
+        // The `removed` counts are sourced from each DELETE's `changes` so
+        // they describe exactly what the transaction did, not a separate
+        // pre-flight snapshot.
         const cascade = db.transaction((groupId: string) => {
+          // Pre-flight: refuse to delete a paired sibling. A workgroup is the
+          // data-pool boundary (CLAUDE.md, docs/workgroups.md) — deleting the
+          // seed leaves the twin with a dangling workgroup_id, which after
+          // any later workgroups-row cleanup silently falls through to
+          // per-agent store = amnesia. Force the operator to unpair (set
+          // sibling workgroup_id = NULL) or migrate the twin before retrying.
+          let workgroupIdToCleanup: string | null = null;
+          if (hasWorkgroups) {
+            const ag = db.prepare('SELECT workgroup_id FROM agent_groups WHERE id = ?').get(groupId) as
+              | { workgroup_id: string | null }
+              | undefined;
+            if (ag?.workgroup_id) {
+              const siblings = db
+                .prepare(`SELECT id, folder FROM agent_groups WHERE workgroup_id = ? AND id != ?`)
+                .all(ag.workgroup_id, groupId) as Array<{ id: string; folder: string }>;
+              if (siblings.length > 0) {
+                throw new Error(
+                  `group ${groupId} is paired in workgroup ${ag.workgroup_id} with ${siblings.length} sibling(s): ` +
+                    siblings.map((s) => `${s.id} (${s.folder})`).join(', ') +
+                    '. Refusing to delete — unpair the siblings first ' +
+                    '(UPDATE agent_groups SET workgroup_id = NULL WHERE id IN (...)) ' +
+                    'or migrate them to a new workgroup, then retry.',
+                );
+              }
+              workgroupIdToCleanup = ag.workgroup_id;
+            }
+          }
           const counts = {
             sessions: 0,
             pending_questions: 0,
@@ -108,6 +141,7 @@ registerResource({
             agent_group_members: 0,
             user_roles: 0,
             container_configs: 0,
+            workgroups: 0,
           };
 
           if (hasAgentDestinations) {
@@ -150,9 +184,16 @@ registerResource({
             .prepare('DELETE FROM container_configs WHERE agent_group_id = ?')
             .run(groupId).changes;
           db.prepare('DELETE FROM agent_groups WHERE id = ?').run(groupId);
+          // Clean up the now-orphan workgroup row (only set when no siblings
+          // existed at pre-flight; the sibling-refuse path above never reaches
+          // this point). Done last so the FK from agent_groups.workgroup_id is
+          // already gone.
+          if (workgroupIdToCleanup) {
+            counts.workgroups = db.prepare('DELETE FROM workgroups WHERE id = ?').run(workgroupIdToCleanup).changes;
+          }
           return counts;
         });
-        const removed = cascade(id);
+        const removed = cascade.immediate(id);
 
         return { deleted: id, removed };
       },

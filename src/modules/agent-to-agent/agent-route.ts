@@ -29,7 +29,7 @@ import { getSession } from '../../db/sessions.js';
 import { wakeContainer } from '../../container-runner.js';
 import { log } from '../../log.js';
 import { openInboundDb, resolveSession, sessionDir, writeSessionMessage } from '../../session-manager.js';
-import type { Session } from '../../types.js';
+import type { Session, SessionMode } from '../../types.js';
 import { hasDestination } from './db/agent-destinations.js';
 
 export { isSafeAttachmentName };
@@ -186,7 +186,7 @@ export interface RoutableAgentMessage {
 interface SessionFallback {
   mgId: string | null;
   threadId: string | null;
-  mode: 'per-thread' | 'agent-shared';
+  mode: Exclude<SessionMode, 'shared'>;
 }
 
 function resolveTargetSession(
@@ -287,7 +287,7 @@ export async function routeAgentMessage(msg: RoutableAgentMessage, session: Sess
   }
   const effectiveMgId = inheritMg ? callerMgId : null;
   const effectiveThreadId = inheritMg ? callerThreadId : null;
-  const targetMode: 'per-thread' | 'agent-shared' = effectiveMgId ? 'per-thread' : 'agent-shared';
+  const targetMode: Exclude<SessionMode, 'shared'> = effectiveMgId ? 'per-thread' : 'agent-shared';
   // Return-path lookup (in_reply_to → source_session_id) takes precedence
   // when the candidate session matches the caller's effective mg context;
   // otherwise we fall through to the threading-aware resolveSession.

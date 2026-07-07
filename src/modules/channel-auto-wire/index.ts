@@ -64,10 +64,10 @@ import { getAgentGroupByFolder } from '../../db/agent-groups.js';
 import { createMessagingGroupAgent, updateMessagingGroup } from '../../db/messaging-groups.js';
 import { log } from '../../log.js';
 import { setUnwiredChannelResolver, type UnwiredChannelResolverFn } from '../../router.js';
-import type { MessagingGroup, MessagingGroupAgent } from '../../types.js';
+import type { MessagingGroup, MessagingGroupAgent, SessionMode } from '../../types.js';
+import { SESSION_MODES } from '../../types.js';
 
-const VALID_SESSION_MODES = new Set(['shared', 'per-thread', 'agent-shared'] as const);
-type SessionMode = 'shared' | 'per-thread' | 'agent-shared';
+const VALID_SESSION_MODES = new Set<string>(SESSION_MODES);
 
 const VALID_SENDER_POLICIES = new Set(['strict', 'request_approval', 'public'] as const);
 type SenderPolicy = MessagingGroup['unknown_sender_policy'];
