@@ -66,3 +66,22 @@ export function getWorkgroupOnecliSecrets(agentGroupId: string): string[] {
     return [];
   }
 }
+
+/**
+ * Workgroup-keyed variant for spawnContainer's hot path. Joins on
+ * `agent_groups.workgroup_id` are racey under concurrent reconcile, so this
+ * variant takes the already-resolved workgroup id and queries the workgroups
+ * row directly. Returns [] if no such workgroup exists.
+ */
+export function getWorkgroupOnecliSecretsById(workgroupId: string): string[] {
+  const row = getDb().prepare(`SELECT onecli_secrets AS secrets FROM workgroups WHERE id = ?`).get(workgroupId) as
+    | { secrets: string }
+    | undefined;
+  if (!row) return [];
+  try {
+    const parsed = JSON.parse(row.secrets) as unknown;
+    return Array.isArray(parsed) ? (parsed as string[]) : [];
+  } catch {
+    return [];
+  }
+}

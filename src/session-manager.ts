@@ -38,7 +38,7 @@ import {
   migrateMessagesInTable,
 } from './db/session-db.js';
 import { log } from './log.js';
-import type { Session } from './types.js';
+import type { Session, SessionMode } from './types.js';
 
 function isPathInside(parent: string, child: string): boolean {
   const relative = path.relative(parent, child);
@@ -281,7 +281,7 @@ export function resolveSession(
   agentGroupId: string,
   messagingGroupId: string | null,
   threadId: string | null,
-  sessionMode: 'shared' | 'per-thread' | 'agent-shared',
+  sessionMode: SessionMode,
 ): { session: Session; created: boolean } {
   // agent-shared: single session per agent group, regardless of messaging group
   if (sessionMode === 'agent-shared') {

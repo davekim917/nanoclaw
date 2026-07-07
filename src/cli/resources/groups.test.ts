@@ -217,4 +217,56 @@ describe('groups CLI delete cascades dependent rows (#2525)', () => {
     expect((resp as { ok: false; error: { code: string; message: string } }).error.code).toBe('handler-error');
     expect((resp as { ok: false; error: { code: string; message: string } }).error.message).toMatch(/not found/i);
   });
+
+  it('refuses to delete a paired sibling — leaves twin intact and surfaces the error', async () => {
+    const SEED = 'ag-seed';
+    const TWIN = 'ag-seed-codex';
+    const WG = 'mr';
+    const db = getDb();
+    createAgentGroup({ id: SEED, name: 'seed', folder: 'seed', agent_provider: null, created_at: now() });
+    createAgentGroup({ id: TWIN, name: 'seed-codex', folder: 'seed-codex', agent_provider: null, created_at: now() });
+    // Workgroups row must exist before workgroup_id FK can be set.
+    db.prepare(`INSERT INTO workgroups (id, onecli_secrets, created_at) VALUES (?, '[]', ?)`).run(WG, now());
+    // Bind both to the same workgroup (the migration-036 invariant)
+    db.prepare('UPDATE agent_groups SET workgroup_id = ? WHERE id IN (?, ?)').run(WG, SEED, TWIN);
+
+    const resp = await dispatch(
+      { id: 'req-del-seed', command: 'groups-delete', args: { id: SEED } },
+      { caller: 'host' },
+    );
+
+    // Pre-flight refused before the transaction ran.
+    expect(resp.ok).toBe(false);
+    expect((resp as { ok: false; error: { code: string; message: string } }).error.code).toBe('handler-error');
+    expect((resp as { ok: false; error: { code: string; message: string } }).error.message).toMatch(
+      /paired in workgroup/,
+    );
+    expect((resp as { ok: false; error: { code: string; message: string } }).error.message).toContain(TWIN);
+
+    // Both agents AND the workgroup row survive.
+    expect(count('SELECT COUNT(*) AS c FROM agent_groups WHERE id = ?', SEED)).toBe(1);
+    expect(count('SELECT COUNT(*) AS c FROM agent_groups WHERE id = ?', TWIN)).toBe(1);
+    expect(count('SELECT COUNT(*) AS c FROM workgroups WHERE id = ?', WG)).toBe(1);
+  });
+
+  it('cleans up the orphan workgroups row when deleting an unpaired agent', async () => {
+    const SOLO = 'ag-solo';
+    const WG = 'solo';
+    const db = getDb();
+    createAgentGroup({ id: SOLO, name: 'solo', folder: 'solo', agent_provider: null, created_at: now() });
+    // Seed the workgroups row as migration-036 would for a solo agent.
+    db.prepare(`INSERT INTO workgroups (id, onecli_secrets, created_at) VALUES (?, '[]', ?)`).run(WG, now());
+    db.prepare('UPDATE agent_groups SET workgroup_id = ? WHERE id = ?').run(WG, SOLO);
+
+    const resp = await dispatch(
+      { id: 'req-del-solo', command: 'groups-delete', args: { id: SOLO } },
+      { caller: 'host' },
+    );
+
+    expect(resp.ok).toBe(true);
+    const data = (resp as { ok: true; data: { removed: Record<string, number> } }).data;
+    expect(data.removed.workgroups).toBe(1);
+    expect(count('SELECT COUNT(*) AS c FROM agent_groups WHERE id = ?', SOLO)).toBe(0);
+    expect(count('SELECT COUNT(*) AS c FROM workgroups WHERE id = ?', WG)).toBe(0);
+  });
 });

@@ -693,9 +693,12 @@ export function buildSessionServicesSnapshot(
     } else {
       // Owner-safe session, or group-level/no-session snapshot. Describe the
       // layered access: MCP first (when present), proxy floor underneath.
-      const floor = hasSlackSecret
-        ? 'Floor (always available when you have Slack access — reach for this whenever the MCP isn’t loaded): direct Slack Web API through the OneCLI proxy. `curl https://slack.com/api/<method>` with NO auth header; the proxy injects the user token at the boundary. `auth.test` to confirm identity, then `conversations.history`, `conversations.replies`, `search.messages`, `conversations.list`, `users.info`, etc. Reads everything the owner can see. '
-        : '';
+      const floor =
+        hasSlackSecret && sessionKnown && ownerSafe
+          ? 'Floor (always available when you have Slack access — reach for this whenever the MCP isn’t loaded): direct Slack Web API through the OneCLI proxy. `curl https://slack.com/api/<method>` with NO auth header; the proxy injects the user token at the boundary. `auth.test` to confirm identity, then `conversations.history`, `conversations.replies`, `search.messages`, `conversations.list`, `users.info`, etc. Reads everything the owner can see. '
+          : hasSlackSecret
+            ? 'Floor (withheld in this snapshot because we don’t yet know whether the session is owner-safe): direct Slack Web API may be available in an owner-safe session — call `get_capabilities` with a session context to confirm. '
+            : '';
       const mcp = slackMcpEnabled
         ? 'Convenience layer (prefer when loaded): the user-token MCP `mcp__slack-user-token__*` (`conversations_history`, `conversations_replies`, `conversations_search_messages`) — structured Slack reads. Registered in owner-safe sessions (owner DM, or an allow-listed context). If it isn’t in your tool list, that does NOT mean you lack Slack — use the proxy floor. '
         : '';

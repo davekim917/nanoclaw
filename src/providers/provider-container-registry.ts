@@ -81,6 +81,10 @@ interface RegistryEntry {
 const registry = new Map<string, RegistryEntry>();
 
 export function registerProviderContainerConfig(
+  // `string` (not `Provider`) so third-party providers installed via skills
+  // can register without extending the shared type. The Provider enum in
+  // types.ts covers the built-ins (claude/codex/opencode); runtime checks
+  // should narrow against PROVIDERS instead of repeating the union.
   name: string,
   fn: ProviderContainerConfigFn,
   capabilities: ProviderHostCapabilities = {},

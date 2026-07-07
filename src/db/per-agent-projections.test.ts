@@ -340,6 +340,14 @@ describe('buildArchiveProjection — workgroup-widened (B3)', () => {
 
     expect(userRows).toHaveLength(1); // deduped
     expect(assistantRows).toHaveLength(2); // distinct sender_id → both survive
+
+    // Attribution: every row in this projection file is served to the
+    // spawning agent's container, so agent_group_id must be the spawning
+    // agent — NOT a sibling picked by MIN(...) from the dedup bucket.
+    // Before this fix the user row carried agent_group_id='ag-codex' (the
+    // alphabetically lower sibling id), giving the projection a sibling's
+    // attribution for content the spawning agent never sent.
+    expect(rows.every((r) => r.agent_group_id === 'ag-parent')).toBe(true);
   });
 
   it('test_archive_standalone_workgroup_no_dedup_needed', () => {

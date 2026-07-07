@@ -131,15 +131,24 @@ export function buildArchiveProjection(
       let rows: Array<Record<string, unknown>>;
       if (workgroupMemberIds && workgroupMemberIds.length > 0) {
         // ── Workgroup-widened SELECT with dedup ─────────────────────────
-        // GROUP BY the content columns; identical user messages from sibling
-        // agents collapse to 1 row (MIN id). Assistant rows differ by
-        // sender_id so they get their own bucket → survive dedup.
+        // Intentional sibling sharing within a workgroup (the workgroup is
+        // the data-pool boundary; the W3 NULL-fail-closed guard in
+        // container-runner.ts enforces the cross-workgroup boundary upstream,
+        // so this widening is safe). GROUP BY the content columns collapses
+        // identical user messages from sibling agents to 1 row (MIN id).
+        // Assistant rows differ by sender_id so they survive dedup.
+        //
+        // agent_group_id is set to the spawning agent (NOT MIN(agent_group_id)
+        // from the dedup bucket): after dedup a row no longer belongs to a
+        // single source agent, so MIN would be arbitrary attribution. The
+        // row belongs to "whoever is querying this projection" — the
+        // spawning agent — which is accurate attribution for the projection's
+        // purpose (the container reads rows scoped to itself).
         const placeholders = workgroupMemberIds.map(() => '?').join(', ');
         rows = src
           .prepare(
             `SELECT
                MIN(id)               AS id,
-               MIN(agent_group_id)   AS agent_group_id,
                messaging_group_id,
                MAX(channel_type)     AS channel_type,
                MAX(channel_name)     AS channel_name,
@@ -168,7 +177,11 @@ export function buildArchiveProjection(
       const insertStmt = dst.prepare(`INSERT INTO messages_archive (${colList}) VALUES (${placeholders})`);
       const insertMany = dst.transaction((batch: Array<Record<string, unknown>>) => {
         for (const row of batch) {
-          insertStmt.run(...ARCHIVE_COLS.map((c) => row[c]));
+          // Stamp the spawning agent's id onto every deduped row (see
+          // workgroup-widened SELECT comment above). Keeps the NOT NULL
+          // schema and gives the projection honest attribution: this file
+          // is served to the spawning agent's container.
+          insertStmt.run(...ARCHIVE_COLS.map((c) => (c === 'agent_group_id' ? agentGroupId : row[c])));
         }
       });
       insertMany(rows);

@@ -150,30 +150,80 @@ export async function resolveActiveSession(
  *   - no messaging group exists with that (platform_id, channel_type)
  *   - the agent group is not wired to that messaging group (catches
  *     misrouted tasks at the credential boundary)
+ *   - any peer agent wired to the same messaging group is in a different
+ *     workgroup (cross-workgroup leak guard, mirrors
+ *     `dashboard/api/scheduled-move.ts#isCrossWorkgroup`)
  *
  * `destination` is required by `TaskDef`'s type — TypeScript prevents
  * callers from omitting it; no runtime guard needed.
  */
 function resolveAndValidateDestination(def: TaskDef): { messagingGroupId: string } {
   const { platformId, channelType } = def.destination;
+  // Wrap validation in an IMMEDIATE transaction on the central DB so a
+  // parallel INSERT into messaging_group_agents can't slip a cross-workgroup
+  // peer in between the wiring check and the peer SELECT. The inbound.db
+  // INSERT happens later against a different DB file, but by then the
+  // central wiring has been serialized under our writer lock.
   const db = getDb();
-  const mg = db
-    .prepare('SELECT id FROM messaging_groups WHERE platform_id = ? AND channel_type = ?')
-    .get(platformId, channelType) as { id: string } | undefined;
-  if (!mg) {
-    throw new Error(
-      `scheduleTask: no messaging group found for ${channelType}:${platformId} (task ${def.id}). The destination must reference an existing messaging group.`,
-    );
-  }
-  const wired = db
-    .prepare('SELECT 1 AS ok FROM messaging_group_agents WHERE agent_group_id = ? AND messaging_group_id = ?')
-    .get(def.agentGroupId, mg.id) as { ok: number } | undefined;
-  if (!wired) {
-    throw new Error(
-      `scheduleTask: agent group ${def.agentGroupId} is not wired to messaging group ${mg.id} (${channelType}:${platformId}). Refusing to schedule task ${def.id} — this would route output to a chat the agent isn't authorized for. Wire the messaging group via messaging_group_agents first, or correct the agentGroupId.`,
-    );
-  }
-  return { messagingGroupId: mg.id };
+  const validate = db.transaction((): { messagingGroupId: string } => {
+    const mg = db
+      .prepare('SELECT id FROM messaging_groups WHERE platform_id = ? AND channel_type = ?')
+      .get(platformId, channelType) as { id: string } | undefined;
+    if (!mg) {
+      throw new Error(
+        `scheduleTask: no messaging group found for ${channelType}:${platformId} (task ${def.id}). The destination must reference an existing messaging group.`,
+      );
+    }
+    const wired = db
+      .prepare('SELECT 1 AS ok FROM messaging_group_agents WHERE agent_group_id = ? AND messaging_group_id = ?')
+      .get(def.agentGroupId, mg.id) as { ok: number } | undefined;
+    if (!wired) {
+      throw new Error(
+        `scheduleTask: agent group ${def.agentGroupId} is not wired to messaging group ${mg.id} (${channelType}:${platformId}). Refusing to schedule task ${def.id} — this would route output to a chat the agent isn't authorized for. Wire the messaging group via messaging_group_agents first, or correct the agentGroupId.`,
+      );
+    }
+
+    // Cross-workgroup guard: every other agent wired to this messaging group
+    // must be in the same workgroup as the scheduling agent. Tasks belong to
+    // a workgroup's data pool; letting a sibling in workgroup-A schedule into
+    // a chat whose canonical owners are in workgroup-B would silently leak
+    // task output across workgroups. The dashboard's move-editor enforces
+    // this; scheduleTask callers (admin scripts, /enable-agent-plugins
+    // installers, the scheduled-tasks-board) must too. NULL workgroup_id on
+    // either side is treated as a boundary violation (defensive: matches
+    // dashboard isCrossWorkgroup's null-handling).
+    const hasWorkgroupsCol = db
+      .prepare(`PRAGMA table_info(agent_groups)`)
+      .all()
+      .some((c) => (c as { name: string }).name === 'workgroup_id');
+    if (hasWorkgroupsCol) {
+      const schedulingAg = db.prepare('SELECT workgroup_id FROM agent_groups WHERE id = ?').get(def.agentGroupId) as
+        | { workgroup_id: string | null }
+        | undefined;
+      const schedulingWg = schedulingAg?.workgroup_id ?? null;
+      const peerWorkgroups = db
+        .prepare(
+          `SELECT ag.id, ag.workgroup_id
+             FROM messaging_group_agents mga
+             JOIN agent_groups ag ON ag.id = mga.agent_group_id
+            WHERE mga.messaging_group_id = ? AND mga.agent_group_id != ?`,
+        )
+        .all(mg.id, def.agentGroupId) as Array<{ id: string; workgroup_id: string | null }>;
+      for (const peer of peerWorkgroups) {
+        if (peer.workgroup_id == null || schedulingWg == null || peer.workgroup_id !== schedulingWg) {
+          throw new Error(
+            `scheduleTask: agent ${def.agentGroupId} (workgroup ${schedulingWg ?? 'null'}) ` +
+              `cannot schedule into messaging group ${mg.id} — peer agent ${peer.id} is in workgroup ${peer.workgroup_id ?? 'null'}. ` +
+              `Refusing to schedule task ${def.id}: tasks belong to a workgroup's data pool and cannot cross workgroup boundaries. ` +
+              `Unwire the peer or migrate it to the same workgroup first.`,
+          );
+        }
+      }
+    }
+
+    return { messagingGroupId: mg.id };
+  });
+  return validate.immediate();
 }
 
 export async function scheduleTask(def: TaskDef, _dataDir?: string): Promise<void> {

@@ -626,6 +626,19 @@ describe('reconcileWorkgroupAtSpawn — C1', () => {
     expect(ag.workgroup_id).toBe('foo');
   });
 
+  it('test_reconciler_returns_resolved_workgroup_id_for_threading', () => {
+    // Contract: spawnContainer threads the resolved wgId from reconcile
+    // through to buildMounts / buildArchiveProjection so they don't re-derive
+    // (race-fix). The reconciler must return what it settled on.
+    insertGroup(db, 'ag-illie-codex', 'illysium-codex');
+    const result = reconcileWorkgroupAtSpawn(
+      db,
+      { id: 'ag-illie-codex', folder: 'illysium-codex' },
+      { workgroup_id: 'illysium' },
+    );
+    expect(result.workgroupId).toBe('illysium');
+  });
+
   it('test_reconciler_noop_when_unchanged', () => {
     // Pre-set workgroup_id correctly
     insertGroup(db, 'ag-bar', 'bar', 'bar');

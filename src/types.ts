@@ -113,6 +113,76 @@ export type EngageMode = 'pattern' | 'mention' | 'mention-pattern' | 'mention-st
 export type SenderScope = 'all' | 'known';
 export type IgnoredMessagePolicy = 'drop' | 'accumulate';
 
+// Session-mode enum shared across router.ts, session-manager.ts, channel-auto-wire,
+// agent-route.ts, and types.ts. The local type that used to live in
+// channel-auto-wire/index.ts is re-exported from here so there's one source of truth.
+export type SessionMode = 'shared' | 'per-thread' | 'agent-shared';
+export const SESSION_MODES: readonly SessionMode[] = ['shared', 'per-thread', 'agent-shared'] as const;
+
+// Provider enum. Values are the agent-runner runtime identifier used by
+// registerProviderContainerConfig and the container_configs.provider column.
+// 'mock' is the in-container test provider (container/agent-runner/src/providers/mock.ts).
+export type Provider = 'claude' | 'codex' | 'opencode' | 'mock';
+export const PROVIDERS: readonly Provider[] = ['claude', 'codex', 'opencode', 'mock'] as const;
+
+// Channel-type enum. Covers external adapters (slack, discord, telegram, ...),
+// hybrid variants (whatsapp-cloud), and the internal synthetic channels
+// ('agent' for agent-to-agent, 'cli' for ncl). Setup migrations may use the
+// older alias 'gchat'; normalize via the channel-registry when reading.
+export type ChannelType =
+  | 'slack'
+  | 'discord'
+  | 'telegram'
+  | 'whatsapp'
+  | 'whatsapp-cloud'
+  | 'teams'
+  | 'linear'
+  | 'github'
+  | 'imessage'
+  | 'webex'
+  | 'matrix'
+  | 'google-chat'
+  | 'resend'
+  | 'signal'
+  | 'agent'
+  | 'cli';
+export const CHANNEL_TYPES: readonly ChannelType[] = [
+  'slack',
+  'discord',
+  'telegram',
+  'whatsapp',
+  'whatsapp-cloud',
+  'teams',
+  'linear',
+  'github',
+  'imessage',
+  'webex',
+  'matrix',
+  'google-chat',
+  'resend',
+  'signal',
+  'agent',
+  'cli',
+] as const;
+
+/**
+ * Match a channel_type against a base adapter name. Channel variants are
+ * encoded as `<base>-<variant>` (e.g. `slack-thread`, `discord-guild`); this
+ * helper returns true for any string that starts with `<base>-`. To check
+ * `channelType === 'slack'` specifically (bare base, no variant), use plain
+ * equality — bare-base matches must stay separate from variant-prefix matches
+ * because some call sites (e.g. router.ts workspace-trust auto-wire) treat
+ * bare base as ambiguous and intentionally exclude it.
+ *
+ * Note: passing `whatsapp` here will also match `whatsapp-cloud`. That's a
+ * false positive for that pair (they're distinct channels, not a base/variant
+ * relationship). Callers should compare against the specific channel name,
+ * not pass 'whatsapp' as a base for that reason.
+ */
+export function isChannelVariant(channelType: string, base: ChannelType): boolean {
+  return channelType.startsWith(`${base}-`);
+}
+
 export interface MessagingGroupAgent {
   id: string;
   messaging_group_id: string;
@@ -126,7 +196,7 @@ export interface MessagingGroupAgent {
   engage_pattern: string | null;
   sender_scope: SenderScope;
   ignored_message_policy: IgnoredMessagePolicy;
-  session_mode: 'shared' | 'per-thread' | 'agent-shared';
+  session_mode: SessionMode;
   priority: number;
   /**
    * Per-channel model override (this channel's conversations with this
