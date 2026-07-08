@@ -1,10 +1,10 @@
 /**
  * design-artifact-loop — deterministic supplement linter.
  *
- * impeccable (mounted in-container from ~/plugins) owns the taste-tell checks
+ * A broader taste linter (e.g. the impeccable plugin) may own taste-tell checks
  * (overused fonts, AI editorial markers, em-dash overuse, etc.). This module
- * supplements it with the artifact-specific structural/security checks impeccable
- * does NOT cover: :root token-trace, no-JS policy, network-construct lockdown.
+ * covers the artifact-specific structural/security checks such a linter does
+ * NOT: :root token-trace, no-JS policy, network-construct lockdown.
  *
  * Pure function — no DOM dependency (Bun-native regex), so no new package
  * (supply-chain C6). Render-level checks (blank/overflow) live in render.ts and

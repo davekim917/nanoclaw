@@ -31,9 +31,10 @@ deploying a real web app, that is a separate workflow.
   committed system.
 
 ### 2. Write a single self-contained HTML artifact
-- Save it under **`/workspace/agent/design-artifact-loop/<id>/artifact.html`** (pick a
-  short stable `<id>`). This dir is persistent and `send_file`-able; do not author under
-  `/workspace/outbox`.
+- Save it under **`<loop-root>/<id>/artifact.html`** (pick a short stable `<id>`).
+  The loop root is `$DESIGN_ARTIFACT_LOOP_ROOT` if set, else `.design-artifact-loop/`
+  in the current working directory — the `design_review` tool's errors echo the exact
+  expected path if you get it wrong.
 - **Conform to the system's tokens:** declare a `:root { --token: value }` block lifted
   from the chosen `tokens.css`, and reference every colour/size via `var(--…)`. No
   hardcoded hex/colour outside `:root`.
@@ -45,7 +46,7 @@ deploying a real web app, that is a separate workflow.
 
 ### 3. Call `design_review`
 ```
-design_review({ id: "<id>", artifactPath: "/workspace/agent/design-artifact-loop/<id>/artifact.html", designSystem: "<name>" })
+design_review({ id: "<id>", artifactPath: "<loop-root>/<id>/artifact.html", designSystem: "<name>" })
 ```
 It re-renders the artifact (1440×900 + 390×844), runs the deterministic linter
 (token-trace, no-JS, network, font-denylist), records the round with carry-forward, and
@@ -63,8 +64,8 @@ critic findings in step 5 so they aren't mistaken for a stale review.
   of the `screenshotPaths` from disk** — reading the PNG yields a vision block so the
   critic actually *sees* the design. **Do not** pass the screenshot as a chat
   attachment (that arrives as a text reference, not vision).
-  - Claude: a `Task` sub-agent. Codex: `codex exec --yolo`. OpenCode: its task/subagent
-    primitive, or `codex exec --yolo` as the cross-process fallback. Give the critic
+  - Claude Code: a `Task` sub-agent. Other harnesses: any independent sub-process
+    with vision that can read the PNG from disk (e.g. `codex exec`). Give the critic
     ONLY the screenshot path + the chosen `DESIGN.md` + this rubric — never your
     generation transcript.
 - **Critic rubric:** is the layout structurally distinct from the slop baseline, or
@@ -93,14 +94,12 @@ critic findings in step 5 so they aren't mistaken for a stale review.
   `criticReviewToken`. The independent visual critic is mandatory, not optional.
 
 ### 7. Deliver
-- `send_file` the HTML artifact + a preview PNG (a `screenshotPath`) + the
-  `trace.json` so the user sees the design, the render, and the review trail.
+- Deliver the HTML artifact + a preview PNG (a `screenshotPath`) + the `trace.json`
+  (attach or share per your environment) so the user sees the design, the render, and
+  the review trail.
 
 ## Hard rules
 - Commit a concrete system FIRST (step 1) — this is the actual slop fix.
 - The critic must be independent and **see the render via `Read`**, not self-review.
 - No JS; everything self-contained; colours via `:root` tokens.
 - The loop is bounded; never silently ship unresolved HIGH findings.
-
-> impeccable (mounted in this container) also flags taste-tells (overused fonts, AI
-> editorial markers) on files you write — treat its findings as part of the critic layer.

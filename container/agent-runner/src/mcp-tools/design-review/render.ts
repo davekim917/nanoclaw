@@ -5,8 +5,8 @@
  * chromium invocation (infra-gated — needs the image's pinned chromium, validated
  * by the live spike, not unit-testable here).
  *
- * Pinned: system chromium (/usr/bin/chromium, image-pinned), viewports 1440x900 +
- * 390x844, PNG output. Mirrors the proven render-diagram.ts chromium invocation.
+ * Chromium binary: $CHROMIUM_BIN if set, else `chromium` on PATH. Viewports
+ * 1440x900 + 390x844, PNG output.
  */
 import { execFileSync } from 'child_process';
 import fs from 'fs';
@@ -117,6 +117,8 @@ const CHROMIUM_BASE_ARGS = [
   `--host-resolver-rules=${FONT_CDN_RESOLVER_RULE}`,
 ];
 
+const CHROMIUM = process.env.CHROMIUM_BIN || 'chromium';
+
 const MEASURE_SENTINEL = '__NC_DR__';
 
 // Monotonic suffix so each render call's throwaway measure file is unique even for
@@ -154,7 +156,7 @@ function measureDom(html: string, outDir: string, vpName: string, width: number,
   try {
     fs.writeFileSync(tmp, measured);
     const dom = execFileSync(
-      'chromium',
+      CHROMIUM,
       // probe at the SAME height as the screenshot viewport so scrollHeight is comparable
       // to viewportHeight (Codex P2: 900 ≠ the 844 mobile height ⇒ missed render-blank:mobile)
       [...CHROMIUM_BASE_ARGS, `--window-size=${width},${height}`, '--dump-dom', `file://${tmp}`],
@@ -199,7 +201,7 @@ export function renderViewports(htmlPath: string, outDir: string, token = ''): V
     let exitOk = true;
     try {
       execFileSync(
-        'chromium',
+        CHROMIUM,
         [
           ...CHROMIUM_BASE_ARGS,
           `--window-size=${vp.width},${vp.height}`,

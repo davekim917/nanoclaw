@@ -5,9 +5,8 @@
  * child nanoclaw MCP process) is spawned/torn down per query, so in-memory state
  * would reset mid-loop. State is rehydrated from disk on every call.
  *
- * Why /workspace/agent (Reviewer A F2): /workspace/outbox is host-owned, deleted
- * after delivery, and not a send_file source. /workspace/agent is persistent and
- * send_file-able.
+ * Base dir: $DESIGN_ARTIFACT_LOOP_ROOT if set, else `.design-artifact-loop/` under
+ * the server's working directory — persistent and user-visible.
  *
  * Why atomic + lock (Codex cycle-4 must-fix): write-temp-then-rename (atomic on the
  * same fs) under an advisory lockfile so overlapping design_review calls on the same
@@ -18,7 +17,9 @@ import fs from 'fs';
 import path from 'path';
 import type { Finding, Severity } from './linter.js';
 
-export const DEFAULT_BASE_DIR = '/workspace/agent/design-artifact-loop';
+export const DEFAULT_BASE_DIR = process.env.DESIGN_ARTIFACT_LOOP_ROOT
+  ? path.resolve(process.env.DESIGN_ARTIFACT_LOOP_ROOT)
+  : path.resolve(process.cwd(), '.design-artifact-loop');
 /**
  * Max design_review rounds before the loop is forced terminal. Sized for the L1 critic's
  * inherent one-round-trip latency (Codex P1): a critic finding is always reported one round
