@@ -53,6 +53,12 @@ const DEFAULT_DENY_PLUGINS = new Set<string>([
   // codex: skills here are Codex-plugin internal, already loaded via the codex
   //        Claude plugin and either non-user-invocable or specific to Claude.
   'codex',
+  // design-artifact-loop: ships in-tree (container/skills skill + the
+  //   agent-runner design_review MCP tool rooted at /workspace/agent). The
+  //   standalone plugin's portable skill uses cwd-based paths the in-container
+  //   tool rejects — mirroring it would duplicate the in-tree skill with
+  //   conflicting instructions. Host codex loads it natively via `codex plugin add`.
+  'design-artifact-loop',
 ]);
 
 /**

@@ -1474,7 +1474,11 @@ export function buildMounts(
   // session and persist refresh tokens.
   const pluginsHostDir = path.join(os.homedir(), 'plugins');
   if (fs.existsSync(pluginsHostDir)) {
-    const excluded = new Set(containerConfig.excludePlugins ?? []);
+    // Plugins whose capability ships in-tree: mounting them would duplicate the
+    // in-tree skill and (via CLAUDE_PLUGINS_ROOT auto-discovery) start a second
+    // MCP server with a different allowed root. Host/OSS-only by design.
+    const IN_TREE_SHADOWED_PLUGINS = ['design-artifact-loop'];
+    const excluded = new Set([...IN_TREE_SHADOWED_PLUGINS, ...(containerConfig.excludePlugins ?? [])]);
     let entries: string[] = [];
     try {
       entries = fs.readdirSync(pluginsHostDir);
