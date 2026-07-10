@@ -136,9 +136,9 @@ describe('CodexProvider sticky config + override propagation', () => {
     expect((p as unknown as { model: string }).model).toBe('gpt-5.4-mini');
   });
 
-  it('test_default_model_is_gpt_5_5_when_no_sticky_or_env', () => {
+  it('test_default_model_is_gpt_5_6_sol_when_no_sticky_or_env', () => {
     const p = new CodexProvider();
-    expect((p as unknown as { model: string }).model).toBe('gpt-5.5');
+    expect((p as unknown as { model: string }).model).toBe('gpt-5.6-sol');
   });
 
   it('test_constructor_rejects_invalid_provider_config', () => {

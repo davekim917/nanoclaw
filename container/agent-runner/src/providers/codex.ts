@@ -211,7 +211,7 @@ export function materializeRawImageGeneration(
 // (none | minimal | low | medium | high | xhigh) — gpt-5.2-codex and gpt-5.5
 // both support xhigh per OpenAI's model docs.
 //
-// Default is `xhigh` for the production model (gpt-5.5); operators can dial
+// Default is `xhigh` for the production model (gpt-5.6-sol); operators can dial
 // down per-agent via container.json when cost/latency matters more than
 // reasoning depth.
 //
@@ -701,7 +701,7 @@ export class CodexProvider implements AgentProvider {
     this.model =
       this.stickyConfig.model ??
       (options.env?.CODEX_MODEL as string | undefined) ??
-      'gpt-5.5';
+      'gpt-5.6-sol';
 
     // Fallback OAuth identities. Empty when CODEX_FALLBACK_HOMES is unset
     // (the host didn't mount any fallbacks). Read from process.env rather

@@ -140,6 +140,9 @@ const CODEX_VALID_EFFORT: ReadonlySet<string> = new Set(['none', 'minimal', 'low
 const CODEX_MODEL_ALIAS_MAP: Record<string, string> = {
   'gpt5.5': 'gpt-5.5',
   'gpt5.2-codex': 'gpt-5.2-codex',
+  'gpt5.6-sol': 'gpt-5.6-sol',
+  'gpt5.6-terra': 'gpt-5.6-terra',
+  'gpt5.6-luna': 'gpt-5.6-luna',
 };
 
 /**
@@ -178,7 +181,7 @@ const CLAUDE_VOCAB: ProviderFlagVocab = {
 const CODEX_VOCAB: ProviderFlagVocab = {
   resolveModel: (raw) => CODEX_MODEL_ALIAS_MAP[raw.toLowerCase()] ?? raw.toLowerCase(),
   isValidModel: (resolved) => CODEX_VALID_MODEL_RE.test(resolved),
-  modelHint: ' (codex models look like gpt-5.5, gpt-5.2-codex)',
+  modelHint: ' (codex models look like gpt-5.6-sol, gpt-5.5)',
   validEfforts: CODEX_VALID_EFFORT,
   effortHint: 'none|minimal|low|medium|high|xhigh',
   allowsUltracode: false,
