@@ -95,11 +95,17 @@ critic findings in step 5 so they aren't mistaken for a stale review.
 
 ### 7. Deliver
 - Deliver the HTML artifact + a preview PNG (a `screenshotPath`) + the `trace.json`
-  (attach or share per your environment) so the user sees the design, the render, and
-  the review trail.
+  as real files — use your environment's file-sending tool (e.g. a `send_file` MCP
+  tool or chat attachment), never bare file paths — so the user sees the design, the
+  render, and the review trail.
 
 ## Hard rules
 - Commit a concrete system FIRST (step 1) — this is the actual slop fix.
 - The critic must be independent and **see the render via `Read`**, not self-review.
 - No JS; everything self-contained; colours via `:root` tokens.
 - The loop is bounded; never silently ship unresolved HIGH findings.
+
+> If a taste linter is available in your environment (e.g. the `impeccable` plugin,
+> which flags overused fonts, AI editorial markers, em-dash overuse), treat its
+> findings on the artifact as part of the critic layer — fold them into
+> `criticFindings` rather than ignoring them.

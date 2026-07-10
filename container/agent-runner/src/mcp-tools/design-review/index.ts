@@ -9,14 +9,18 @@
  * This wrapper is the only tree-specific part: it pins the loop root to the
  * persistent, send_file-able /workspace/agent dir (the vendored engine reads
  * DESIGN_ARTIFACT_LOOP_ROOT at module load, so the env default must be set
- * BEFORE the dynamic import), then registers the tool with the per-session MCP
- * server for all three providers.
+ * BEFORE the dynamic import — src/design-artifact-loop-vendor.test.ts asserts
+ * this ordering), then registers the tool for all three providers.
  */
 import { registerTools } from '../server.js';
 
 process.env.DESIGN_ARTIFACT_LOOP_ROOT ??= '/workspace/agent/design-artifact-loop';
 
-const { designReviewTools } = await import('./design-review.js');
-registerTools(designReviewTools);
-
-export { designReviewTools };
+try {
+  const { designReviewTools } = await import('./design-review.js');
+  registerTools(designReviewTools);
+} catch (err) {
+  // A broken vendored engine (e.g. an unvendored new module) must degrade to
+  // "design_review missing this session", never a dead agent-runner.
+  console.error('[design-review] engine failed to load — design_review unavailable:', err);
+}

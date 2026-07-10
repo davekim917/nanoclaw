@@ -24,27 +24,33 @@ import { fileURLToPath } from 'url';
 export const PLUGIN_ROOT = path.join(os.homedir(), 'plugins', 'design-artifact-loop');
 export const TREE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
-/** Vendored path map: plugin-relative → tree-relative. Dirs sync recursively. */
-export const VENDORED: Array<{ from: string; to: string; dir?: boolean }> = [
-  { from: 'server/design-review.ts', to: 'container/agent-runner/src/mcp-tools/design-review/design-review.ts' },
-  {
-    from: 'server/design-review.test.ts',
-    to: 'container/agent-runner/src/mcp-tools/design-review/design-review.test.ts',
-  },
-  { from: 'server/linter.ts', to: 'container/agent-runner/src/mcp-tools/design-review/linter.ts' },
-  { from: 'server/linter.test.ts', to: 'container/agent-runner/src/mcp-tools/design-review/linter.test.ts' },
-  { from: 'server/render.ts', to: 'container/agent-runner/src/mcp-tools/design-review/render.ts' },
-  { from: 'server/render.test.ts', to: 'container/agent-runner/src/mcp-tools/design-review/render.test.ts' },
-  { from: 'server/state.ts', to: 'container/agent-runner/src/mcp-tools/design-review/state.ts' },
-  { from: 'server/state.test.ts', to: 'container/agent-runner/src/mcp-tools/design-review/state.test.ts' },
-  { from: 'skills/design-artifact-loop/SKILL.md', to: 'container/skills/design-artifact-loop/SKILL.md' },
-  {
-    from: 'skills/design-artifact-loop/design-systems',
-    to: 'container/skills/design-artifact-loop/design-systems',
-    dir: true,
-  },
-  { from: 'skills/design-artifact-loop/fixtures', to: 'container/skills/design-artifact-loop/fixtures', dir: true },
-];
+/**
+ * Vendored path map: plugin-relative → tree-relative. Dirs sync recursively.
+ * The server/ half is DISCOVERED (every .ts except the plugin-only stdio entry)
+ * so a new engine module can never be silently left out of the tree; the vendor
+ * sync also prunes tree files that fall out of the map (see vendorDesignArtifactLoop).
+ */
+const SERVER_ONLY = new Set(['index.ts', 'bundle.test.ts']); // plugin-only: stdio entry (tree has its own wrapper) + dist-bundle freshness test (tree vendors no dist/)
+const TREE_ENGINE_DIR = 'container/agent-runner/src/mcp-tools/design-review';
+
+function buildVendoredMap(): Array<{ from: string; to: string; dir?: boolean }> {
+  const entries: Array<{ from: string; to: string; dir?: boolean }> = [];
+  const serverDir = path.join(PLUGIN_ROOT, 'server');
+  if (fs.existsSync(serverDir)) {
+    for (const f of fs.readdirSync(serverDir).sort()) {
+      if (!f.endsWith('.ts') || SERVER_ONLY.has(f)) continue;
+      entries.push({ from: `server/${f}`, to: `${TREE_ENGINE_DIR}/${f}` });
+    }
+  }
+  entries.push(
+    { from: 'skills/design-artifact-loop/SKILL.md', to: 'container/skills/design-artifact-loop/SKILL.md' },
+    { from: 'skills/design-artifact-loop/design-systems', to: 'container/skills/design-artifact-loop/design-systems', dir: true },
+    { from: 'skills/design-artifact-loop/fixtures', to: 'container/skills/design-artifact-loop/fixtures', dir: true },
+  );
+  return entries;
+}
+
+export const VENDORED = buildVendoredMap();
 
 function listFiles(dir: string): string[] {
   return fs
@@ -87,6 +93,16 @@ export function vendorDesignArtifactLoop(): string[] {
   const changed: string[] = [];
   for (const { from, to, dir } of VENDORED) {
     if (syncOne(from, to, dir ?? false)) changed.push(to);
+  }
+  // Prune tree engine files no longer in the map (a module deleted/renamed in the
+  // plugin must not linger in the tree). index.ts is the tree-only wrapper.
+  const engineDir = path.join(TREE_ROOT, TREE_ENGINE_DIR);
+  const expected = new Set([...VENDORED.map((e) => path.basename(e.to)), 'index.ts']);
+  for (const f of fs.readdirSync(engineDir)) {
+    if (f.endsWith('.ts') && !expected.has(f)) {
+      fs.rmSync(path.join(engineDir, f));
+      changed.push(`${TREE_ENGINE_DIR}/${f} (pruned)`);
+    }
   }
   return changed;
 }

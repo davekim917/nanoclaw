@@ -8,7 +8,10 @@ import fs from 'fs';
 import path from 'path';
 import { lintArtifact, maxSeverity } from './linter.js';
 
-const FIX = path.resolve(import.meta.dir, '../../../../skills/design-artifact-loop/fixtures');
+const FIX = [
+  path.resolve(import.meta.dir, '../skills/design-artifact-loop/fixtures'), // plugin-repo layout
+  path.resolve(import.meta.dir, '../../../../skills/design-artifact-loop/fixtures'), // vendored NanoClaw layout
+].find((p) => fs.existsSync(p))!;
 const read = (f: string) => fs.readFileSync(path.join(FIX, f), 'utf-8');
 
 const SURFACES = ['kanban', 'settings', 'pricing'];

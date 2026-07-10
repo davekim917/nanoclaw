@@ -46,3 +46,24 @@ describe.skipIf(!hasPluginRepo)('design-artifact-loop vendored copies match the 
     });
   }
 });
+
+// Tree-only wrapper contract (runs everywhere — no plugin repo needed): the env pin
+// MUST precede the dynamic engine import (the vendored state.ts resolves the loop
+// root at module load), and the import target must exist. A reorder or a broken
+// re-vendor otherwise ships silently and hard-fails design_review in every container.
+describe('design-review wrapper contract', () => {
+  const wrapperPath = path.join(TREE_ROOT, 'container/agent-runner/src/mcp-tools/design-review/index.ts');
+  const src = fs.readFileSync(wrapperPath, 'utf-8');
+
+  it('pins DESIGN_ARTIFACT_LOOP_ROOT before importing the engine', () => {
+    const pin = src.indexOf("process.env.DESIGN_ARTIFACT_LOOP_ROOT ??=");
+    const imp = src.indexOf("await import('./design-review.js')");
+    expect(pin).toBeGreaterThan(-1);
+    expect(imp).toBeGreaterThan(-1);
+    expect(pin).toBeLessThan(imp);
+  });
+
+  it('imports an engine module that exists', () => {
+    expect(fs.existsSync(path.join(path.dirname(wrapperPath), 'design-review.ts'))).toBe(true);
+  });
+});

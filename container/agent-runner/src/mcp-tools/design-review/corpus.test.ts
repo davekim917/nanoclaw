@@ -3,14 +3,17 @@
  * each system has its DESIGN.md + tokens.css with a :root token block, and the
  * Apache-2.0 LICENSE + attribution are present (C5).
  *
- * Lives in the agent-runner test tree (not the skill dir) so it runs in `bun test`.
+ * Lives in the server test tree (not the skill dir) so it runs in `bun test`.
  */
 import { describe, it, expect } from 'bun:test';
 import fs from 'fs';
 import path from 'path';
 
-// design-review → mcp-tools → src → agent-runner → container → skills/...
-const CORPUS = path.resolve(import.meta.dir, '../../../../skills/design-artifact-loop/design-systems');
+// Resolve the corpus wherever this file lives (plugin repo or vendored tree).
+const CORPUS = [
+  path.resolve(import.meta.dir, '../skills/design-artifact-loop/design-systems'), // plugin-repo layout
+  path.resolve(import.meta.dir, '../../../../skills/design-artifact-loop/design-systems'), // vendored NanoClaw layout
+].find((p) => fs.existsSync(p))!;
 
 function systemDirs(): string[] {
   return fs.readdirSync(CORPUS, { withFileTypes: true })

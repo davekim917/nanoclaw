@@ -4,7 +4,10 @@ import os from 'os';
 import path from 'path';
 
 // The loop root is resolved from the environment at module load — pin it to a temp
-// dir BEFORE importing the module under test.
+// dir BEFORE importing the module under test. CAVEAT: bun test shares one module
+// registry across test files, so this pin only works while no earlier-loading test
+// imports state.ts (directly or via a barrel/wrapper that pins a different root).
+// If such a test is ever added, run it in a subprocess or this file breaks.
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'design-review-test-'));
 process.env.DESIGN_ARTIFACT_LOOP_ROOT = ROOT;
 

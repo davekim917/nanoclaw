@@ -2592,6 +2592,11 @@ async function buildContainerArgs(
   // Claude Code SDK reads this to discover plugins at
   // /workspace/plugins/<name>/ (mounted by buildMounts from ~/plugins/).
   args.push('-e', 'CLAUDE_PLUGINS_ROOT=/workspace/plugins');
+  // Loop root for the design-artifact-loop skill: the vendored SKILL.md tells the
+  // agent "$DESIGN_ARTIFACT_LOOP_ROOT if set" — export it to the agent's shell so
+  // that instruction is TRUE in containers and authoring lands where the vendored
+  // design_review tool (pinned to the same path by its wrapper) will accept it.
+  args.push('-e', 'DESIGN_ARTIFACT_LOOP_ROOT=/workspace/agent/design-artifact-loop');
 
   // Scoped credential env vars: each base resolves via
   // `<BASE>_<FOLDER_UPPER>` → `<BASE>` and is injected if found.
