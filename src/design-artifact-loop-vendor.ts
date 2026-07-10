@@ -27,7 +27,10 @@ export const TREE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url
 /** Vendored path map: plugin-relative → tree-relative. Dirs sync recursively. */
 export const VENDORED: Array<{ from: string; to: string; dir?: boolean }> = [
   { from: 'server/design-review.ts', to: 'container/agent-runner/src/mcp-tools/design-review/design-review.ts' },
-  { from: 'server/design-review.test.ts', to: 'container/agent-runner/src/mcp-tools/design-review/design-review.test.ts' },
+  {
+    from: 'server/design-review.test.ts',
+    to: 'container/agent-runner/src/mcp-tools/design-review/design-review.test.ts',
+  },
   { from: 'server/linter.ts', to: 'container/agent-runner/src/mcp-tools/design-review/linter.ts' },
   { from: 'server/linter.test.ts', to: 'container/agent-runner/src/mcp-tools/design-review/linter.test.ts' },
   { from: 'server/render.ts', to: 'container/agent-runner/src/mcp-tools/design-review/render.ts' },
@@ -35,12 +38,17 @@ export const VENDORED: Array<{ from: string; to: string; dir?: boolean }> = [
   { from: 'server/state.ts', to: 'container/agent-runner/src/mcp-tools/design-review/state.ts' },
   { from: 'server/state.test.ts', to: 'container/agent-runner/src/mcp-tools/design-review/state.test.ts' },
   { from: 'skills/design-artifact-loop/SKILL.md', to: 'container/skills/design-artifact-loop/SKILL.md' },
-  { from: 'skills/design-artifact-loop/design-systems', to: 'container/skills/design-artifact-loop/design-systems', dir: true },
+  {
+    from: 'skills/design-artifact-loop/design-systems',
+    to: 'container/skills/design-artifact-loop/design-systems',
+    dir: true,
+  },
   { from: 'skills/design-artifact-loop/fixtures', to: 'container/skills/design-artifact-loop/fixtures', dir: true },
 ];
 
 function listFiles(dir: string): string[] {
-  return fs.readdirSync(dir, { recursive: true, withFileTypes: true })
+  return fs
+    .readdirSync(dir, { recursive: true, withFileTypes: true })
     .filter((e) => e.isFile())
     .map((e) => path.relative(dir, path.join(e.parentPath, e.name)))
     .sort();
@@ -72,7 +80,9 @@ function syncOne(from: string, to: string, dir: boolean): boolean {
 /** Sync every vendored path; returns the tree-relative paths that changed. */
 export function vendorDesignArtifactLoop(): string[] {
   if (!fs.existsSync(PLUGIN_ROOT)) {
-    throw new Error(`plugin repo not found at ${PLUGIN_ROOT} — clone github.com/davekim917/design-artifact-loop there first`);
+    throw new Error(
+      `plugin repo not found at ${PLUGIN_ROOT} — clone github.com/davekim917/design-artifact-loop there first`,
+    );
   }
   const changed: string[] = [];
   for (const { from, to, dir } of VENDORED) {

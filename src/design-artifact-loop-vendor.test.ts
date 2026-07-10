@@ -16,7 +16,8 @@ import { PLUGIN_ROOT, TREE_ROOT, VENDORED } from './design-artifact-loop-vendor.
 const hasPluginRepo = fs.existsSync(PLUGIN_ROOT);
 
 function listFiles(dir: string): string[] {
-  return fs.readdirSync(dir, { recursive: true, withFileTypes: true })
+  return fs
+    .readdirSync(dir, { recursive: true, withFileTypes: true })
     .filter((e) => e.isFile())
     .map((e) => path.relative(dir, path.join(e.parentPath, e.name)))
     .sort();
@@ -31,10 +32,16 @@ describe.skipIf(!hasPluginRepo)('design-artifact-loop vendored copies match the 
         const srcFiles = listFiles(src);
         expect(listFiles(dst)).toEqual(srcFiles);
         for (const f of srcFiles) {
-          expect(fs.readFileSync(path.join(dst, f)).equals(fs.readFileSync(path.join(src, f))), `${to}/${f} drifted`).toBe(true);
+          expect(
+            fs.readFileSync(path.join(dst, f)).equals(fs.readFileSync(path.join(src, f))),
+            `${to}/${f} drifted`,
+          ).toBe(true);
         }
       } else {
-        expect(fs.readFileSync(dst).equals(fs.readFileSync(src)), `${to} drifted — run scripts/vendor-design-artifact-loop.ts`).toBe(true);
+        expect(
+          fs.readFileSync(dst).equals(fs.readFileSync(src)),
+          `${to} drifted — run scripts/vendor-design-artifact-loop.ts`,
+        ).toBe(true);
       }
     });
   }
