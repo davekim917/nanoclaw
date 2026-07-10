@@ -354,7 +354,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     const effectiveUltracode = flagBatch.ultracode;
 
     // Scheduled-task default (Claude only): an unpinned scheduled-task fire
-    // runs on Sonnet at high effort, independent of any interactive sticky
+    // runs on Sonnet at xhigh effort, independent of any interactive sticky
     // model — the task's OWN -m/-e (its stored flagIntent) is the only thing
     // that overrides it. Interactive chat keeps its Opus default. Codex and
     // opencode manage their own task defaults (gpt-5.6-sol/xhigh, model-native).
@@ -362,7 +362,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       const task = taskWakeIntent(keep);
       if (task.isPureTaskWake) {
         if (!task.turnModel) effectiveModel = 'sonnet';
-        if (!task.turnEffort) effectiveEffort = 'high';
+        if (!task.turnEffort) effectiveEffort = 'xhigh';
       }
     }
 
@@ -1738,7 +1738,7 @@ function applyFlagBatch(
   // Effort here is USER INTENT ONLY (turn flag → sticky flag). Defaults are
   // provider business: the claude provider resolves the operator override
   // (NANOCLAW_EFFORT_OVERRIDE) and per-model-family defaults itself, because
-  // only it knows the final model (and e.g. sonnet rejects xhigh). Codex and
+  // only it knows the final model (and e.g. haiku ignores effort). Codex and
   // opencode have their own default surfaces (codex config schema default,
   // opencode model-native) and never consumed this env fold.
   const effort = intent?.turnEffort ?? getStickyEffort();
