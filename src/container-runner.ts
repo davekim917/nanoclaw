@@ -2114,42 +2114,50 @@ function syncSkillSymlinks(claudeDir: string, containerConfig: import('./contain
 }
 
 /**
+ * Every worker-def filename this feature has ever shipped. Load-bearing for
+ * SECURITY: prune targets come ONLY from this trusted in-source list, never
+ * from container-writable state — `.claude-shared/agents/` is RW-mounted into
+ * the container (session-claude-mounts.ts), so an earlier design that read a
+ * manifest file from there let an agent poison it with `../../../v2.db` and
+ * make the host delete an arbitrary path on the next spawn. When you RENAME or
+ * REMOVE a def from container/agents/, add its OLD filename here so it gets
+ * pruned from groups that already have it. Current names may stay listed
+ * (they're re-copied every spawn, so listing them is a harmless no-op).
+ */
+const MANAGED_WORKER_DEFS = ['worker.md', 'worker-opus.md', 'worker-codex.md'];
+
+/**
  * Copy trunk worker subagent defs (container/agents/*.md) into
  * .claude-shared/agents/ — the container's ~/.claude/agents — so every Claude
  * group gets the orchestrator worker roster (worker, worker-opus,
  * worker-codex). Copies, not symlinks: agent discovery through dangling host
  * symlinks is unverified, and the files are tiny. Trunk is canonical: a
- * manifest records which filenames we copied so renamed/deleted trunk defs
- * are pruned on the next spawn, while operator-added defs (not in the
- * manifest) are never touched. A group can shadow a trunk def with a
- * same-name file in groups/<folder>/.claude/agents/ (project scope outranks
- * user scope).
+ * managed def absent from the current trunk set is pruned; operator-added defs
+ * (never in MANAGED_WORKER_DEFS) are untouched. A group can shadow a trunk def
+ * with a same-name file in groups/<folder>/.claude/agents/ (project scope
+ * outranks user scope).
  */
-const WORKER_DEFS_MANIFEST = '.nanoclaw-managed.json';
-
 function syncWorkerAgentDefs(claudeDir: string): void {
   const srcDir = path.join(process.cwd(), 'container', 'agents');
   if (!fs.existsSync(srcDir)) return;
   const dstDir = path.join(claudeDir, 'agents');
   fs.mkdirSync(dstDir, { recursive: true });
 
-  const manifestPath = path.join(dstDir, WORKER_DEFS_MANIFEST);
-  let previous: string[] = [];
-  try {
-    const parsed: unknown = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-    if (Array.isArray(parsed)) previous = parsed.filter((e): e is string => typeof e === 'string');
-  } catch {
-    /* first sync or unreadable manifest — nothing to prune */
-  }
-
-  const current = fs.readdirSync(srcDir).filter((e) => e.endsWith('.md'));
-  for (const stale of previous) {
-    if (!current.includes(stale)) fs.rmSync(path.join(dstDir, stale), { force: true });
+  const current = new Set(fs.readdirSync(srcDir).filter((e) => e.endsWith('.md')));
+  // Prune managed defs retired from trunk. Names are compile-time constants,
+  // so no traversal is possible even though dstDir is container-writable.
+  for (const name of MANAGED_WORKER_DEFS) {
+    if (!current.has(name)) {
+      try {
+        fs.rmSync(path.join(dstDir, name), { force: true });
+      } catch {
+        /* e.g. a dir shadowing the name — skip; not worth aborting the spawn */
+      }
+    }
   }
   for (const entry of current) {
     fs.copyFileSync(path.join(srcDir, entry), path.join(dstDir, entry));
   }
-  fs.writeFileSync(manifestPath, JSON.stringify(current));
 }
 
 /**

@@ -210,7 +210,7 @@ describe('buildMounts agent surfaces', () => {
 });
 
 describe('worker agent def sync (orchestrator roster)', () => {
-  it('copies trunk defs + manifest for a claude spawn, prunes stale managed files, preserves operator files', () => {
+  it('copies trunk defs for a claude spawn, prunes retired managed defs, preserves operator files', () => {
     const ag = group('ag-worker-defs', 'worker-defs');
     createAgentGroup(ag);
     withWorkgroup(ag);
@@ -218,11 +218,11 @@ describe('worker agent def sync (orchestrator roster)', () => {
     initGroupFilesystem(ag, {});
 
     const agentsDir = path.join(DATA_DIR, 'v2-sessions', ag.id, '.claude-shared', 'agents');
-    // Seed: an operator-owned def plus a stale trunk def from a previous sync.
+    // Seed: an operator-owned def plus a currently-shipping managed def that a
+    // later trunk revision could retire (worker-codex stands in — it IS in
+    // MANAGED_WORKER_DEFS, so if trunk dropped it, the prune must remove it).
     fs.mkdirSync(agentsDir, { recursive: true });
     fs.writeFileSync(path.join(agentsDir, 'custom-op.md'), 'operator-owned\n');
-    fs.writeFileSync(path.join(agentsDir, 'worker-old.md'), 'stale\n');
-    fs.writeFileSync(path.join(agentsDir, '.nanoclaw-managed.json'), JSON.stringify(['worker-old.md']));
 
     buildMounts(ag, session('s-wd', ag.id), containerConfig(), 'claude', {});
 
@@ -232,15 +232,39 @@ describe('worker agent def sync (orchestrator roster)', () => {
         fs.readFileSync(path.join(process.cwd(), 'container', 'agents', def), 'utf-8'),
       );
     }
-    // Stale managed file pruned; operator file untouched.
-    expect(fs.existsSync(path.join(agentsDir, 'worker-old.md'))).toBe(false);
+    // Operator file untouched.
     expect(fs.readFileSync(path.join(agentsDir, 'custom-op.md'), 'utf-8')).toBe('operator-owned\n');
+    // Regression guard for the 1M-window fix (F4): opus worker must carry [1m],
+    // not a bare id that collapses to 200k under proxy auth. Reverting to
+    // `model: opus` or bare `claude-opus-4-8` fails here.
+    expect(fs.readFileSync(path.join(agentsDir, 'worker-opus.md'), 'utf-8')).toContain('model: claude-opus-4-8[1m]');
     // Delegation-rules fragment composed for claude. The fragment itself is a
     // symlink to a container path (dangling on the host), so assert on the
     // composed doc's include line rather than existsSync (which follows links).
     expect(fs.readFileSync(path.join(GROUPS_DIR, ag.folder, 'CLAUDE.md'), 'utf-8')).toContain(
       'module-orchestrator-workers.md',
     );
+  });
+
+  it('never deletes outside the agents dir even if a poisoned file is planted (F1 traversal guard)', () => {
+    const ag = group('ag-worker-defs-sec', 'worker-defs-sec');
+    createAgentGroup(ag);
+    withWorkgroup(ag);
+    ensureContainerConfig(ag.id);
+    initGroupFilesystem(ag, {});
+
+    // A canary the old manifest-driven prune could have deleted via traversal.
+    const canary = path.join(DATA_DIR, 'canary-must-survive.txt');
+    fs.writeFileSync(canary, 'do not delete\n');
+    const agentsDir = path.join(DATA_DIR, 'v2-sessions', ag.id, '.claude-shared', 'agents');
+    fs.mkdirSync(agentsDir, { recursive: true });
+    // Container-writable state an agent could plant; prune must ignore it
+    // entirely (targets come only from the in-source MANAGED_WORKER_DEFS list).
+    fs.writeFileSync(path.join(agentsDir, '.nanoclaw-managed.json'), JSON.stringify(['../../../../canary-must-survive.txt']));
+
+    buildMounts(ag, session('s-wd-sec', ag.id), containerConfig(), 'claude', {});
+
+    expect(fs.existsSync(canary)).toBe(true);
   });
 
   it('skips defs and the orchestrator fragment when the spawn-resolved provider is codex', () => {
