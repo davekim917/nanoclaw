@@ -1120,13 +1120,22 @@ export function buildMounts(
 
     // Worker subagent defs (orchestrator mode) — Claude-only: other providers
     // don't read ~/.claude/agents, and the defs' frontmatter is Claude-format.
+    // Best-effort: the roster is optional, a copy failure must not abort the
+    // spawn (pending messages would retry with no container at all).
     if (provider === 'claude') {
-      syncWorkerAgentDefs(claudeDir);
+      try {
+        syncWorkerAgentDefs(claudeDir);
+      } catch (err) {
+        log.warn('Worker agent def sync failed — spawning without roster', {
+          group: agentGroup.id,
+          err: err instanceof Error ? err.message : String(err),
+        });
+      }
     }
 
     // Compose CLAUDE.md fresh every spawn from the shared base, enabled skill
     // fragments, and MCP server instructions. See `claude-md-compose.ts`.
-    composeGroupClaudeMd(agentGroup);
+    composeGroupClaudeMd(agentGroup, provider);
   }
 
   const mounts: VolumeMount[] = [];
@@ -2109,21 +2118,38 @@ function syncSkillSymlinks(claudeDir: string, containerConfig: import('./contain
  * .claude-shared/agents/ — the container's ~/.claude/agents — so every Claude
  * group gets the orchestrator worker roster (worker, worker-opus,
  * worker-codex). Copies, not symlinks: agent discovery through dangling host
- * symlinks is unverified, and the files are tiny. Overwrites our files on
- * every spawn (trunk is canonical) but never touches other entries, so
- * operators can add per-group defs alongside. A group can shadow a trunk def
- * with a same-name file in groups/<folder>/.claude/agents/ (project scope
- * outranks user scope).
+ * symlinks is unverified, and the files are tiny. Trunk is canonical: a
+ * manifest records which filenames we copied so renamed/deleted trunk defs
+ * are pruned on the next spawn, while operator-added defs (not in the
+ * manifest) are never touched. A group can shadow a trunk def with a
+ * same-name file in groups/<folder>/.claude/agents/ (project scope outranks
+ * user scope).
  */
+const WORKER_DEFS_MANIFEST = '.nanoclaw-managed.json';
+
 function syncWorkerAgentDefs(claudeDir: string): void {
   const srcDir = path.join(process.cwd(), 'container', 'agents');
   if (!fs.existsSync(srcDir)) return;
   const dstDir = path.join(claudeDir, 'agents');
   fs.mkdirSync(dstDir, { recursive: true });
-  for (const entry of fs.readdirSync(srcDir)) {
-    if (!entry.endsWith('.md')) continue;
+
+  const manifestPath = path.join(dstDir, WORKER_DEFS_MANIFEST);
+  let previous: string[] = [];
+  try {
+    const parsed: unknown = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+    if (Array.isArray(parsed)) previous = parsed.filter((e): e is string => typeof e === 'string');
+  } catch {
+    /* first sync or unreadable manifest — nothing to prune */
+  }
+
+  const current = fs.readdirSync(srcDir).filter((e) => e.endsWith('.md'));
+  for (const stale of previous) {
+    if (!current.includes(stale)) fs.rmSync(path.join(dstDir, stale), { force: true });
+  }
+  for (const entry of current) {
     fs.copyFileSync(path.join(srcDir, entry), path.join(dstDir, entry));
   }
+  fs.writeFileSync(manifestPath, JSON.stringify(current));
 }
 
 /**

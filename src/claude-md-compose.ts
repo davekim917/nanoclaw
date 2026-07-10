@@ -44,8 +44,14 @@ const COMPOSED_HEADER = '<!-- Composed at spawn — do not edit. Edit CLAUDE.loc
  * Regenerate `groups/<folder>/CLAUDE.md` from the shared base, enabled skill
  * fragments, and MCP server fragments declared in `container.json`. Creates
  * an empty `CLAUDE.local.md` if missing.
+ *
+ * `provider` is the spawn-resolved effective provider (session override →
+ * container config → 'claude', already lowercased by resolveProviderName).
+ * It must come from the spawn path rather than being re-derived here — a
+ * session-level provider override would otherwise make this gate disagree
+ * with the worker-def sync gate in buildMounts.
  */
-export function composeGroupClaudeMd(group: AgentGroup): void {
+export function composeGroupClaudeMd(group: AgentGroup, provider: string): void {
   const groupDir = path.resolve(GROUPS_DIR, group.folder);
   if (!fs.existsSync(groupDir)) {
     fs.mkdirSync(groupDir, { recursive: true });
@@ -89,9 +95,6 @@ export function composeGroupClaudeMd(group: AgentGroup): void {
   // recall_memory tool only registers when MNEMON_STORE is set (memory
   // enabled), so the fragment would describe a tool the agent doesn't have.
   const cliDisabled = configRow?.cli_scope === 'disabled';
-  // Worker-def orchestration is Claude-only (Task-tool subagents from
-  // ~/.claude/agents); codex/opencode groups must not get these instructions.
-  const providerName = configRow?.provider ?? group.agent_provider ?? 'claude';
   let memoryDisabled = true;
   try {
     const raw = JSON.parse(fs.readFileSync(path.join(groupDir, 'container.json'), 'utf8')) as {
@@ -109,7 +112,9 @@ export function composeGroupClaudeMd(group: AgentGroup): void {
       const moduleName = match[1];
       if (moduleName === 'cli' && cliDisabled) continue;
       if (moduleName === 'memory-recall' && memoryDisabled) continue;
-      if (moduleName === 'orchestrator-workers' && providerName !== 'claude') continue;
+      // Worker-def orchestration is Claude-only (Task-tool subagents from
+      // ~/.claude/agents); codex/opencode groups must not get these instructions.
+      if (moduleName === 'orchestrator-workers' && provider !== 'claude') continue;
       desired.set(`module-${moduleName}.md`, {
         type: 'symlink',
         content: `${SHARED_MCP_TOOLS_CONTAINER_BASE}/${entry}`,
@@ -151,7 +156,6 @@ export function composeGroupClaudeMd(group: AgentGroup): void {
   // (the /enable-agent-plugins skill authors this). Per-group opt-out reuses
   // `excludePlugins` — the same field that drops the Claude mount — so excluding
   // a plugin from a group removes it on every provider. See docs/skills-model.md.
-  const provider = (configRow?.provider ?? 'claude').toLowerCase();
   if (provider !== 'claude') {
     const excluded = new Set(readContainerConfig(group.folder).excludePlugins ?? []);
     const pluginsRoot = path.join(os.homedir(), 'plugins');

@@ -1,7 +1,7 @@
 ---
 name: worker
 description: Default execution worker. Use PROACTIVELY when orchestrating — delegate implementation, research, file edits, test runs, and any token-heavy execution here instead of doing it in the main loop. Runs on Sonnet at xhigh effort.
-model: sonnet
+model: claude-sonnet-5
 effort: xhigh
 ---
 

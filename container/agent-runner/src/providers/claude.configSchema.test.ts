@@ -290,3 +290,22 @@ describe('live applySettings (-m/-e on an active query — same conversation, no
     expect(capturedSetModel).toEqual(['claude-fable-5[1m]']);
   });
 });
+
+describe('subagent model env', () => {
+  it('test_claude_no_subagent_model_pin: perQueryEnv omits CLAUDE_CODE_SUBAGENT_MODEL and pins only the matching family alias', () => {
+    // CLAUDE_CODE_SUBAGENT_MODEL outranks per-invocation and frontmatter model
+    // selection — setting it would pin every subagent to the group model.
+    capturedSdkOptions = null;
+    mockSdkQuery.mockClear();
+
+    const provider = new ClaudeProvider({});
+    provider.query({ prompt: 'hi', cwd: '/tmp', model: 'claude-sonnet-5' });
+
+    expect(mockSdkQuery).toHaveBeenCalledTimes(1);
+    const env = capturedSdkOptions?.env as Record<string, string | undefined>;
+    expect(env.CLAUDE_CODE_SUBAGENT_MODEL).toBeUndefined();
+    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('claude-sonnet-5');
+    // Cross-family aliases stay untouched so explicit frontmatter choices resolve freely.
+    expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBeUndefined();
+  });
+});

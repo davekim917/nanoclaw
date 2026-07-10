@@ -1585,15 +1585,11 @@ export class ClaudeProvider implements AgentProvider {
       log(`Loaded ${plugins.length} plugin(s): ${plugins.map((p) => path.basename(p.path)).join(', ')}`);
     }
 
-    // Subagent model resolution (docs, code.claude.com/docs/en/sub-agents.md):
-    // CLAUDE_CODE_SUBAGENT_MODEL > per-invocation param > frontmatter > main
-    // model. Do NOT set CLAUDE_CODE_SUBAGENT_MODEL here — it outranks explicit
-    // `model:` frontmatter and per-invocation overrides, pinning EVERY subagent
-    // (plugin reviewers, cheap workers) to the group model. Anti-downgrade for
-    // missing/`inherit` frontmatter is already rule 4: those subagents inherit
-    // the main conversation's model. The family env vars below only pin
-    // bare-alias frontmatter (`model: opus` etc.) to the group's exact model id
-    // within the SAME family — cross-family choices stay untouched.
+    // Leave CLAUDE_CODE_SUBAGENT_MODEL unset: a concrete value outranks
+    // per-invocation and frontmatter model selection, pinning every subagent
+    // to the group model; subagents without an explicit model already inherit
+    // the main model. The family env vars below only resolve matching bare
+    // aliases (docs: code.claude.com/docs/en/sub-agents.md).
     const perQueryEnv: Record<string, string | undefined> = { ...this.env };
     if (model) {
       // Guard: a bare alias here would create an alias→alias loop in the SDK.

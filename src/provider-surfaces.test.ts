@@ -208,3 +208,53 @@ describe('buildMounts agent surfaces', () => {
     expect(containerPaths).toContain('/workspace/agent/OWN-DOC.md');
   });
 });
+
+describe('worker agent def sync (orchestrator roster)', () => {
+  it('copies trunk defs + manifest for a claude spawn, prunes stale managed files, preserves operator files', () => {
+    const ag = group('ag-worker-defs', 'worker-defs');
+    createAgentGroup(ag);
+    withWorkgroup(ag);
+    ensureContainerConfig(ag.id);
+    initGroupFilesystem(ag, {});
+
+    const agentsDir = path.join(DATA_DIR, 'v2-sessions', ag.id, '.claude-shared', 'agents');
+    // Seed: an operator-owned def plus a stale trunk def from a previous sync.
+    fs.mkdirSync(agentsDir, { recursive: true });
+    fs.writeFileSync(path.join(agentsDir, 'custom-op.md'), 'operator-owned\n');
+    fs.writeFileSync(path.join(agentsDir, 'worker-old.md'), 'stale\n');
+    fs.writeFileSync(path.join(agentsDir, '.nanoclaw-managed.json'), JSON.stringify(['worker-old.md']));
+
+    buildMounts(ag, session('s-wd', ag.id), containerConfig(), 'claude', {});
+
+    // Trunk roster copied byte-for-byte.
+    for (const def of ['worker.md', 'worker-opus.md', 'worker-codex.md']) {
+      expect(fs.readFileSync(path.join(agentsDir, def), 'utf-8')).toBe(
+        fs.readFileSync(path.join(process.cwd(), 'container', 'agents', def), 'utf-8'),
+      );
+    }
+    // Stale managed file pruned; operator file untouched.
+    expect(fs.existsSync(path.join(agentsDir, 'worker-old.md'))).toBe(false);
+    expect(fs.readFileSync(path.join(agentsDir, 'custom-op.md'), 'utf-8')).toBe('operator-owned\n');
+    // Delegation-rules fragment composed for claude. The fragment itself is a
+    // symlink to a container path (dangling on the host), so assert on the
+    // composed doc's include line rather than existsSync (which follows links).
+    expect(fs.readFileSync(path.join(GROUPS_DIR, ag.folder, 'CLAUDE.md'), 'utf-8')).toContain(
+      'module-orchestrator-workers.md',
+    );
+  });
+
+  it('skips defs and the orchestrator fragment when the spawn-resolved provider is codex', () => {
+    const ag = group('ag-worker-defs-cx', 'worker-defs-cx');
+    createAgentGroup(ag);
+    withWorkgroup(ag);
+    ensureContainerConfig(ag.id);
+    initGroupFilesystem(ag, {});
+
+    buildMounts(ag, session('s-wd-cx', ag.id), containerConfig(), 'codex', {});
+
+    expect(fs.existsSync(path.join(DATA_DIR, 'v2-sessions', ag.id, '.claude-shared', 'agents'))).toBe(false);
+    expect(fs.readFileSync(path.join(GROUPS_DIR, ag.folder, 'CLAUDE.md'), 'utf-8')).not.toContain(
+      'module-orchestrator-workers.md',
+    );
+  });
+});
