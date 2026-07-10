@@ -89,6 +89,9 @@ export function composeGroupClaudeMd(group: AgentGroup): void {
   // recall_memory tool only registers when MNEMON_STORE is set (memory
   // enabled), so the fragment would describe a tool the agent doesn't have.
   const cliDisabled = configRow?.cli_scope === 'disabled';
+  // Worker-def orchestration is Claude-only (Task-tool subagents from
+  // ~/.claude/agents); codex/opencode groups must not get these instructions.
+  const providerName = configRow?.provider ?? group.agent_provider ?? 'claude';
   let memoryDisabled = true;
   try {
     const raw = JSON.parse(fs.readFileSync(path.join(groupDir, 'container.json'), 'utf8')) as {
@@ -106,6 +109,7 @@ export function composeGroupClaudeMd(group: AgentGroup): void {
       const moduleName = match[1];
       if (moduleName === 'cli' && cliDisabled) continue;
       if (moduleName === 'memory-recall' && memoryDisabled) continue;
+      if (moduleName === 'orchestrator-workers' && providerName !== 'claude') continue;
       desired.set(`module-${moduleName}.md`, {
         type: 'symlink',
         content: `${SHARED_MCP_TOOLS_CONTAINER_BASE}/${entry}`,

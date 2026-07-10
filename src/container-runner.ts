@@ -1118,6 +1118,12 @@ export function buildMounts(
     // Sync skill symlinks based on container.json selection before mounting.
     syncSkillSymlinks(claudeDir, containerConfig);
 
+    // Worker subagent defs (orchestrator mode) — Claude-only: other providers
+    // don't read ~/.claude/agents, and the defs' frontmatter is Claude-format.
+    if (provider === 'claude') {
+      syncWorkerAgentDefs(claudeDir);
+    }
+
     // Compose CLAUDE.md fresh every spawn from the shared base, enabled skill
     // fragments, and MCP server instructions. See `claude-md-compose.ts`.
     composeGroupClaudeMd(agentGroup);
@@ -2095,6 +2101,28 @@ function syncSkillSymlinks(claudeDir: string, containerConfig: import('./contain
     if (!exists) {
       fs.symlinkSync(`/app/skills/${skill}`, linkPath);
     }
+  }
+}
+
+/**
+ * Copy trunk worker subagent defs (container/agents/*.md) into
+ * .claude-shared/agents/ — the container's ~/.claude/agents — so every Claude
+ * group gets the orchestrator worker roster (worker, worker-opus,
+ * worker-codex). Copies, not symlinks: agent discovery through dangling host
+ * symlinks is unverified, and the files are tiny. Overwrites our files on
+ * every spawn (trunk is canonical) but never touches other entries, so
+ * operators can add per-group defs alongside. A group can shadow a trunk def
+ * with a same-name file in groups/<folder>/.claude/agents/ (project scope
+ * outranks user scope).
+ */
+function syncWorkerAgentDefs(claudeDir: string): void {
+  const srcDir = path.join(process.cwd(), 'container', 'agents');
+  if (!fs.existsSync(srcDir)) return;
+  const dstDir = path.join(claudeDir, 'agents');
+  fs.mkdirSync(dstDir, { recursive: true });
+  for (const entry of fs.readdirSync(srcDir)) {
+    if (!entry.endsWith('.md')) continue;
+    fs.copyFileSync(path.join(srcDir, entry), path.join(dstDir, entry));
   }
 }
 
