@@ -30,7 +30,7 @@ const script = fs.readFileSync(path.join(repoRoot, 'scripts/design-drift-prechec
 
 const prompt = `You are running the monthly **design-artifact-loop drift check**. A deterministic pre-check already ran; its result is in scriptOutput (the MECHANICAL layer). Do the technique judgment + a concise report — but ONLY post if something is actionable.
 
-scriptOutput compares OUR design-artifact-loop skill against upstream **nexu-io/open-design** (where we ported the "author-then-conform" mechanism from):
+scriptOutput compares OUR design-artifact-loop skill against upstream **nexu-io/open-design** (where the "author-then-conform" mechanism's design-system corpus is vendored from). NOTE: the skill + design_review engine are developed in the standalone plugin repo **github.com/davekim917/design-artifact-loop** (host clone: ~/plugins/design-artifact-loop); the files you read below are byte-identical vendored copies synced into NanoClaw via scripts/vendor-design-artifact-loop.ts. Any re-vendor or technique change must land in the PLUGIN repo first, then be synced.
 - changed: vendored design-system files (DESIGN.md/tokens.css) that now differ from upstream — re-vendor candidates. Each: {system, file, reason}.
 - newly_added: design systems ADDED upstream since our last check (names).
 - our_count / upstream_count: systems we've vendored vs upstream's full catalog. We intentionally vendor a curated SUBSET — that gap is EXPECTED, not drift.
@@ -59,7 +59,7 @@ DECIDE: If NOTHING is actionable — no \`changed\`, no \`newly_added\`, and no 
 **Technique review:** {"no technique drift" | a short assessment}
 {- concrete recommendation tied to a file in our impl, if any}
 
-**Recommendation:** {Re-vendor X | Investigate technique change Y | No action — advisory}
+**Recommendation:** {Re-vendor X into davekim917/design-artifact-loop (then sync via scripts/vendor-design-artifact-loop.ts) | Investigate technique change Y | No action — advisory}
 **Reason:** {one sentence}
 
 Use **bold** with double asterisks and \`-\` bullets; keep it concise. These are ADVISORY findings for the operator — do NOT implement any change yourself, just report.`;

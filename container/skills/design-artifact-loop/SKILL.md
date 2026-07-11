@@ -60,6 +60,11 @@ critic findings in step 5 so they aren't mistaken for a stale review.
 > static and self-contained.
 
 ### 4. Run the INDEPENDENT visual critic on the render
+- **Run the critic on the FIRST render** — do not spend rounds polishing deterministic
+  findings before the first critic pass. Visual findings are the expensive ones: a
+  critic issue costs a revise → re-render → re-critique cycle, and the round cap only
+  leaves room for ~2 of those. Fix lint findings in the same revision that addresses
+  critic findings, not before it.
 - Spawn a **separate** critic pass (NOT your own self-review) and have it **`Read` one
   of the `screenshotPaths` from disk** — reading the PNG yields a vision block so the
   critic actually *sees* the design. **Do not** pass the screenshot as a chat
@@ -101,6 +106,7 @@ critic findings in step 5 so they aren't mistaken for a stale review.
 
 ## Hard rules
 - Commit a concrete system FIRST (step 1) — this is the actual slop fix.
+- Critic on the FIRST render, and again on any version you intend to ship.
 - The critic must be independent and **see the render via `Read`**, not self-review.
 - No JS; everything self-contained; colours via `:root` tokens.
 - The loop is bounded; never silently ship unresolved HIGH findings.
