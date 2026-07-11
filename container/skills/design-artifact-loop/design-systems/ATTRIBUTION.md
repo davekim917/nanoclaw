@@ -9,7 +9,7 @@ subset of its `design-systems/` corpus to use as concrete generative targets (th
 "author-then-conform" mechanism). No modifications were made to the vendored
 `DESIGN.md` / `tokens.css` files.
 
-Curated subset (54 systems): airbnb, airtable, ant, apple, application, arc, atelier-zero, bento, brutalism, cal, claude, claymorphism, clean, clickhouse, cohere, coinbase, composio, corporate, cursor, dashboard, dithered, doodle, duolingo, editorial, framer, github, glassmorphism, hud, kami, linear-app, luxury, minimal, mission-control, mono, neobrutalism, nike, notion, pacman, publication, raycast, retro, revolut, shadcn, spotify, starbucks, stripe, tetris, theverge, tom-modern, trading-terminal, vercel, vintage, warm-editorial, wired.
+Curated subset (59 systems): airbnb, airtable, ant, apple, application, arc, atelier-zero, bento, bmw, brutalism, cal, claude, claymorphism, clean, clickhouse, cohere, coinbase, composio, corporate, cursor, dashboard, dithered, doodle, duolingo, editorial, framer, github, glassmorphism, hud, ibm, kami, linear-app, luxury, mastercard, minimal, mission-control, mono, neobrutalism, nike, notion, pacman, publication, raycast, retro, revolut, shadcn, spotify, starbucks, stripe, tesla, tetris, theverge, tom-modern, trading-terminal, vercel, vintage, vodafone, warm-editorial, wired.
 
 To add more systems, copy additional `design-systems/<name>/{DESIGN.md,tokens.css}` from
 the upstream repo and add a row to `index.md`.
