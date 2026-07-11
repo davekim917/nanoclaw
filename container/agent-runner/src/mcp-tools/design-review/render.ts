@@ -119,6 +119,21 @@ const CHROMIUM_BASE_ARGS = [
 
 const CHROMIUM = process.env.CHROMIUM_BIN || 'chromium';
 
+/**
+ * Env for chromium child processes. Chromium's crashpad helper derives its
+ * database path from XDG_CONFIG_HOME (default $HOME/.config); when that dir
+ * exists but is not writable — e.g. a credential file bind-mounted beneath it
+ * caused the runtime to create the parent as root — chromium aborts with
+ * `chrome_crashpad_handler: --database is required` (exit 133) before any
+ * render, which surfaced as blanket render-blank findings. Point XDG at a
+ * per-run dir we create ourselves, so rendering never depends on $HOME layout.
+ */
+function chromiumEnv(outDir: string): NodeJS.ProcessEnv {
+  const xdg = path.join(outDir, '.chromium-xdg');
+  try { fs.mkdirSync(xdg, { recursive: true }); } catch { /* execFileSync will surface it */ }
+  return { ...process.env, XDG_CONFIG_HOME: xdg, XDG_CACHE_HOME: xdg };
+}
+
 const MEASURE_SENTINEL = '__NC_DR__';
 
 // Monotonic suffix so each render call's throwaway measure file is unique even for
@@ -160,7 +175,7 @@ function measureDom(html: string, outDir: string, vpName: string, width: number,
       // probe at the SAME height as the screenshot viewport so scrollHeight is comparable
       // to viewportHeight (Codex P2: 900 ≠ the 844 mobile height ⇒ missed render-blank:mobile)
       [...CHROMIUM_BASE_ARGS, `--window-size=${width},${height}`, '--dump-dom', `file://${tmp}`],
-      { timeout: 15_000, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] },
+      { timeout: 15_000, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], env: chromiumEnv(outDir) },
     );
     const m = dom.match(new RegExp(`${MEASURE_SENTINEL}:(\\d+),(\\d+),(\\d+),(\\d+)`));
     if (!m) return null;
@@ -208,7 +223,7 @@ export function renderViewports(htmlPath: string, outDir: string, token = ''): V
           `--screenshot=${pngPath}`,
           `file://${htmlPath}`,
         ],
-        { stdio: 'ignore', timeout: 30_000 },
+        { stdio: 'ignore', timeout: 30_000, env: chromiumEnv(outDir) },
       );
     } catch {
       exitOk = false;
