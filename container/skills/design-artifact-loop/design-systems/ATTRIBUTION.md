@@ -9,9 +9,7 @@ subset of its `design-systems/` corpus to use as concrete generative targets (th
 "author-then-conform" mechanism). No modifications were made to the vendored
 `DESIGN.md` / `tokens.css` files.
 
-Curated subset (18 app/product-oriented systems): airtable, ant, apple, application,
-arc, cal, claude, clean, clickhouse, cohere, coinbase, composio, corporate, cursor,
-dashboard, notion, stripe, vercel.
+Curated subset (46 systems): airbnb, airtable, ant, apple, application, arc, atelier-zero, bento, brutalism, cal, claude, clean, clickhouse, cohere, coinbase, composio, corporate, cursor, dashboard, duolingo, editorial, framer, github, glassmorphism, kami, linear-app, luxury, minimal, mono, neobrutalism, nike, notion, publication, raycast, retro, revolut, shadcn, spotify, starbucks, stripe, theverge, tom-modern, trading-terminal, vercel, warm-editorial, wired.
 
 To add more systems, copy additional `design-systems/<name>/{DESIGN.md,tokens.css}` from
 the upstream repo and add a row to `index.md`.
