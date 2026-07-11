@@ -260,7 +260,10 @@ describe('worker agent def sync (orchestrator roster)', () => {
     fs.mkdirSync(agentsDir, { recursive: true });
     // Container-writable state an agent could plant; prune must ignore it
     // entirely (targets come only from the in-source MANAGED_WORKER_DEFS list).
-    fs.writeFileSync(path.join(agentsDir, '.nanoclaw-managed.json'), JSON.stringify(['../../../../canary-must-survive.txt']));
+    fs.writeFileSync(
+      path.join(agentsDir, '.nanoclaw-managed.json'),
+      JSON.stringify(['../../../../canary-must-survive.txt']),
+    );
 
     buildMounts(ag, session('s-wd-sec', ag.id), containerConfig(), 'claude', {});
 

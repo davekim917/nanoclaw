@@ -1,9 +1,9 @@
 /**
  * design-artifact-loop — disk-backed, atomic round/cap state machine.
  *
- * Why disk, not module memory (Reviewer A F1): on Codex the app-server (and its
- * child nanoclaw MCP process) is spawned/torn down per query, so in-memory state
- * would reset mid-loop. State is rehydrated from disk on every call.
+ * Why disk, not module memory (Reviewer A F1): some harnesses (Codex among them)
+ * spawn and tear down the MCP server process per query, so in-memory state would
+ * reset mid-loop. State is rehydrated from disk on every call.
  *
  * Base dir: $DESIGN_ARTIFACT_LOOP_ROOT if set, else `.design-artifact-loop/` under
  * the server's working directory — persistent and user-visible.

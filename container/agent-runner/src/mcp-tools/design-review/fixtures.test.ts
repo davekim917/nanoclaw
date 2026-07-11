@@ -10,7 +10,7 @@ import { lintArtifact, maxSeverity } from './linter.js';
 
 const FIX = [
   path.resolve(import.meta.dir, '../skills/design-artifact-loop/fixtures'), // plugin-repo layout
-  path.resolve(import.meta.dir, '../../../../skills/design-artifact-loop/fixtures'), // vendored NanoClaw layout
+  path.resolve(import.meta.dir, '../../../../skills/design-artifact-loop/fixtures'), // vendored consumer-tree layout
 ].find((p) => fs.existsSync(p))!;
 const read = (f: string) => fs.readFileSync(path.join(FIX, f), 'utf-8');
 

@@ -44,7 +44,11 @@ function buildVendoredMap(): Array<{ from: string; to: string; dir?: boolean }> 
   }
   entries.push(
     { from: 'skills/design-artifact-loop/SKILL.md', to: 'container/skills/design-artifact-loop/SKILL.md' },
-    { from: 'skills/design-artifact-loop/design-systems', to: 'container/skills/design-artifact-loop/design-systems', dir: true },
+    {
+      from: 'skills/design-artifact-loop/design-systems',
+      to: 'container/skills/design-artifact-loop/design-systems',
+      dir: true,
+    },
     { from: 'skills/design-artifact-loop/fixtures', to: 'container/skills/design-artifact-loop/fixtures', dir: true },
   );
   return entries;

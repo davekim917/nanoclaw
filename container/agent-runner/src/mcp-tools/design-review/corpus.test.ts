@@ -12,7 +12,7 @@ import path from 'path';
 // Resolve the corpus wherever this file lives (plugin repo or vendored tree).
 const CORPUS = [
   path.resolve(import.meta.dir, '../skills/design-artifact-loop/design-systems'), // plugin-repo layout
-  path.resolve(import.meta.dir, '../../../../skills/design-artifact-loop/design-systems'), // vendored NanoClaw layout
+  path.resolve(import.meta.dir, '../../../../skills/design-artifact-loop/design-systems'), // vendored consumer-tree layout
 ].find((p) => fs.existsSync(p))!;
 
 function systemDirs(): string[] {
