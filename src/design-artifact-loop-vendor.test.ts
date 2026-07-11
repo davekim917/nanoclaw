@@ -56,7 +56,7 @@ describe('design-review wrapper contract', () => {
   const src = fs.readFileSync(wrapperPath, 'utf-8');
 
   it('pins DESIGN_ARTIFACT_LOOP_ROOT before importing the engine', () => {
-    const pin = src.indexOf("process.env.DESIGN_ARTIFACT_LOOP_ROOT ??=");
+    const pin = src.indexOf('process.env.DESIGN_ARTIFACT_LOOP_ROOT ??=');
     const imp = src.indexOf("await import('./design-review.js')");
     expect(pin).toBeGreaterThan(-1);
     expect(imp).toBeGreaterThan(-1);
