@@ -1741,7 +1741,21 @@ export class ClaudeProvider implements AgentProvider {
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'api_retry') {
           yield { type: 'error', message: 'API retry', retryable: true };
         } else if (message.type === 'rate_limit_event') {
-          yield { type: 'error', message: 'Rate limit', retryable: false, classification: 'quota' };
+          // INFORMATIONAL, not an error: the SDK emits this whenever the
+          // subscription's rate-limit info changes, with status
+          // 'allowed' | 'allowed_warning' | 'rejected'. Treating it as a
+          // fatal error killed every turn under high sub utilization and
+          // posted "Turn ended with an error: Rate limit" to chat
+          // (fleet-wide on 2026-07-12 — the branch was dead pre-merge
+          // because it matched a system/subtype shape the SDK never sends).
+          // A truly rejected limit also fails the API call itself, which
+          // surfaces as result text and engages QUOTA_RESULT_RE rotation —
+          // so log here, never end the turn.
+          const info = (message as { rate_limit_info?: { status?: string; rateLimitType?: string; utilization?: number } })
+            .rate_limit_info;
+          log(
+            `rate_limit_event (informational): status=${info?.status ?? 'unknown'} type=${info?.rateLimitType ?? '-'} utilization=${info?.utilization ?? '-'}`,
+          );
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'compact_boundary') {
           const meta = (message as { compact_metadata?: { pre_tokens?: number } }).compact_metadata;
           const detail = meta?.pre_tokens ? ` (${meta.pre_tokens.toLocaleString()} tokens compacted)` : '';
