@@ -32,9 +32,9 @@
  *
  * # F6 stagger
  *
- * The `synthOffsetMinutes` parameter lets a bulk caller offset each group's
- * processAfter so the cron's first-fire isn't all clustered at the same
- * instant. Callers without staggering needs pass 0.
+ * The `synthCron` / `lintCron` options let a bulk caller stagger each group's
+ * recurring schedule so daily and weekly runs are not clustered at the same
+ * instant. Single-group callers omit them and use the defaults below.
  */
 import { spawnSync } from 'child_process';
 import fs from 'fs';
@@ -55,13 +55,13 @@ export const MEMORY_SOURCE_SUBDIRS = [
 ] as const;
 
 // Default cron: 03:00 local. Bulk-enable overrides per-group with a staggered
-// minute offset so 11 groups don't all wake their Opus/high synth turn at the
-// same instant (Codex F6). Single-group enable uses the default.
+// minute offset so 11 groups don't all wake their synth turn at the same
+// instant (Codex F6). Single-group enable uses the default.
 export const SYNTH_CRON_DEFAULT = '0 3 * * *';
 export const SYNTH_SERIES_PREFIX = 'memory-synth-';
 
 // Default cron: Sundays 10:00 local. Bulk-enable passes a per-group staggered
-// minute offset so 11+ groups don't all hit Opus simultaneously at 10:00 every
+// minute offset so 11+ groups don't all run simultaneously at 10:00 every
 // Sunday — same F6 reasoning as synth, except weekly instead of daily.
 export const LINT_CRON_DEFAULT = '0 10 * * 0';
 export const LINT_SERIES_PREFIX = 'memory-lint-';
@@ -87,6 +87,10 @@ Walk wiki/ and check for:
 FIX-FIRST DISCIPLINE: do not ask permission. Fix every finding you discover in this pass, then report what you fixed. Do not split the work into "small portion now, more later" — the operator has standing approval for full cleanup. Append a single audit entry to wiki/log.md covering everything fixed.
 
 REPORT DISCIPLINE: if zero findings, the chat reply is EMPTY. Send nothing. Produce no text. Do not announce that you are being silent. Do not post "no findings", "wiki is clean", "nothing to fix", "per discipline completing silently", or any other meta-explanation of why nothing happened — those are still chat messages and they are noise. Posting any meta-comment is a rule violation. If you fixed findings, post ONE concise summary line listing what was fixed (e.g. "Fixed 3 contradictions, removed 2 orphan pages, added 4 missing cross-references, reconciled index drift on 1 page."). Do not narrate, do not list every page individually, do not ask for further approval.`;
+
+function synthGateScript(seriesId: string): string {
+  return `bun /app/src/scheduling/wiki-synth-gate.ts ${seriesId}`;
+}
 
 export interface BootstrapResult {
   step1_sourcesDirsCreated: boolean;
@@ -226,17 +230,11 @@ export async function bootstrapMemoryForGroup(
         processAfter,
         seriesId: result.step3_synthSeriesId,
         prompt: SYNTH_PROMPT,
+        // Deterministic zero-token gate: skip the model when Mnemon has not
+        // changed since this series' last completed occurrence.
+        script: synthGateScript(result.step3_synthSeriesId),
         quietStatus: true,
         destination,
-        // Wiki synthesis is a high-leverage low-frequency reasoning task —
-        // read N mnemon facts, dedupe, organize across multiple wiki pages,
-        // update index. Run on Opus with reasoning_effort=medium once a day;
-        // chat in the same group keeps the agent's sticky config (typically
-        // Sonnet) since these are turn-only overrides.
-        flagIntent: {
-          turnModel: 'claude-opus-4-8',
-          turnEffort: 'medium',
-        },
       },
       DATA_DIR,
     );
@@ -250,7 +248,8 @@ export async function bootstrapMemoryForGroup(
   // weekly so processAfter must be the NEXT cron fire (not "now") — otherwise
   // a re-bootstrap fires lint immediately, ahead of the user's expected
   // "Sundays at 10am" cadence. Same destination as synth (parent channel,
-  // threadId=null), same Opus+medium config, same quietStatus:true.
+  // threadId=null) and same quietStatus:true. Both tasks intentionally leave
+  // model/effort unpinned so provider-level scheduled-task defaults apply.
   let lintProcessAfter: string;
   try {
     const { CronExpressionParser } = await import('cron-parser');
@@ -275,10 +274,6 @@ export async function bootstrapMemoryForGroup(
         prompt: LINT_PROMPT,
         quietStatus: true,
         destination,
-        flagIntent: {
-          turnModel: 'claude-opus-4-8',
-          turnEffort: 'medium',
-        },
       },
       DATA_DIR,
     );

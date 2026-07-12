@@ -12,7 +12,7 @@ Three-layer pipeline:
 Raw sources (inbox/, articles/, docs/, transcripts/, clips/, media/)
     ↓ extraction (source-ingestor worker)
 mnemon graph (~/.mnemon/data/<agentGroupId>/)
-    ↓ synthesise task (daily 03:00 UTC)
+    ↓ synthesise task (daily 03:00 local, change-gated)
 Wiki pages (groups/<g>/wiki/)
 ```
 
@@ -21,7 +21,7 @@ Wiki pages (groups/<g>/wiki/)
 | Op | When | Effect |
 |---|---|---|
 | **extract** | On file drop into sources/ or chat-stream classifier match | Facts written to mnemon store |
-| **synthesise** | Daily cron (03:00 UTC) via scheduled task | Wiki pages updated from current fact graph |
+| **synthesise** | Daily local-time cron via a change-gated scheduled task | Wiki pages updated only when the fact graph changed since the previous completed run |
 | **recall** | On agent turn (via MCP tool) | Ranked facts injected into context |
 
 **Host daemon** (`nanoclaw-memory-daemon`, `dist/memory-daemon/index.js`): runs as a systemd service alongside `nanoclaw-v2`. Watches enabled groups' `sources/inbox/` directories via inotify and classifies chat-stream turns. Reads `container.json`'s `memory.enabled` field per group on each 60s sweep.
@@ -44,7 +44,7 @@ What happens:
 1. `groups/<g>/container.json` gets `memory.enabled = true` (atomic write via `.tmp` + rename).
 2. Seven `groups/<g>/sources/` subdirs created: `inbox/`, `articles/`, `docs/`, `transcripts/`, `clips/`, `media/`, `processed/`. Existing dirs are preserved.
 3. `mnemon store create <agentGroupId>` runs — "already exists" errors are silently swallowed.
-4. A daily synthesise task is scheduled (cron `0 3 * * *`, seriesId `memory-synth-<agentGroupId>`). Idempotent — re-running updates the existing row instead of inserting a duplicate.
+4. A daily synthesise task is scheduled (cron `0 3 * * *`, seriesId `memory-synth-<agentGroupId>`). It inherits the provider's scheduled-task model/effort defaults and uses a deterministic pre-task gate, so an unchanged Mnemon graph costs no model call and posts nothing. Idempotent — re-running updates the existing row instead of inserting a duplicate.
 
 No service restart needed. The daemon picks up newly enabled groups on its next 60s sweep.
 

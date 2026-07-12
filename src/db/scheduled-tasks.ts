@@ -72,9 +72,9 @@ export interface TaskDef {
   /**
    * Per-task model + effort override. The container's poll-loop applyFlagBatch
    * reads this and pins model/effort for the wake-turn without changing the
-   * agent group's sticky config. Used by daily wiki-synthesise to run on Opus
-   * with reasoning_effort=high while keeping normal chat on the group's
-   * default (typically Sonnet).
+   * agent group's sticky config. Module-owned tasks normally omit this and
+   * inherit the provider's scheduled-task default; operators can still pin an
+   * individual task when it genuinely needs a different model or effort.
    *
    * Schema mirrors the chat-side FlagIntent contract — turnModel/turnEffort
    * apply for this fire only; sticky variants would persist across fires.

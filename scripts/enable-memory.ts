@@ -14,7 +14,7 @@
  *
  * Side-effect bootstrap (step 2) is shared with `create_agent` so default-on
  * groups born via the delivery action get the same scaffolding. See
- * `scripts/lib/bootstrap-memory-for-group.ts` for why.
+ * `src/modules/memory/bootstrap.ts` for why.
  */
 import fs from 'fs';
 import path from 'path';
@@ -80,12 +80,16 @@ async function main(): Promise<void> {
     console.warn(`      Warning: mnemon store create failed: ${r.step2_mnemonStoreError}`);
   }
   if (r.step3_synthTaskScheduled) {
-    console.log(`      daily synth task scheduled (Opus + effort=high, seriesId: ${r.step3_synthSeriesId})`);
+    console.log(
+      `      daily synth task scheduled (provider task defaults, change-gated, seriesId: ${r.step3_synthSeriesId})`,
+    );
   } else {
     console.warn(`      Warning: synth task scheduling failed (re-run to retry)`);
   }
   if (r.step4_lintTaskScheduled) {
-    console.log(`      weekly lint task scheduled (Opus + effort=high, cron='${r.step4_lintCron}', seriesId: ${r.step4_lintSeriesId})`);
+    console.log(
+      `      weekly lint task scheduled (provider task defaults, cron='${r.step4_lintCron}', seriesId: ${r.step4_lintSeriesId})`,
+    );
   } else {
     console.warn(`      Warning: lint task scheduling failed (re-run to retry)`);
   }

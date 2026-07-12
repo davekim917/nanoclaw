@@ -8,8 +8,8 @@
  *   1. Iterates every directory under groups/ that has a container.json with
  *      an agentGroupId. Skips groups already memory-enabled.
  *   2. Staggers synth-task processAfter offsets across groups (Codex F6) so
- *      the first run of the daily Opus/high synth task fires at most one
- *      group at a time, not 11 simultaneous.
+ *      the first run of the daily synth task fires at most one group at a
+ *      time, not 11 simultaneous.
  *   3. Two-pass docker-stop with a settle window (architecture-advisor
  *      recommendation): stop containers immediately, wait 30s for any
  *      in-flight spawns to land, stop the now-running containers a second
@@ -30,8 +30,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DB_PATH = path.join(__dirname, '..', 'data', 'v2.db');
 
 // 5-minute spacing between groups; 11 groups → max 55min of stagger.
-// Each fired synth turn takes ~2-5min on Opus/high, so this also bounds
-// peak concurrent classifier-host load to one group at a time.
+// Synth turns can take several minutes, so this also bounds peak concurrent
+// classifier-host load to one group at a time.
 // Per-group cron is e.g. "3 3 * * *", "8 3 * * *", "13 3 * * *" — picking
 // non-:00 minutes is also good API-wide jitter etiquette.
 const STAGGER_INTERVAL_MINUTES = 5;
@@ -54,7 +54,7 @@ function synthCronForIndex(i: number): string {
 
 function lintCronForIndex(i: number): string {
   // Same stagger pattern as synth, except weekly: Sundays 10:03–10:53 ET.
-  // Avoids 11+ Opus calls firing simultaneously every Sunday morning.
+  // Avoids 11+ lint calls firing simultaneously every Sunday morning.
   const minute = STAGGER_FIRST_MINUTE + (i % 11) * STAGGER_INTERVAL_MINUTES;
   return `${minute} 10 * * 0`;
 }
