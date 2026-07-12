@@ -283,6 +283,10 @@ function parseUtcMs(s: string | null): number | null {
  *   failed → failed · expired → missed · board-cancelled (audit) → cancelled
  */
 function outcomeFor(row: HistoryRow, replyTs: string | undefined, cancelTsMs: number | null): FireOutcomeLabel {
+  // Post-2.1.46 cancels mark the row 'cancelled' directly — label it as such.
+  // The audit-ts heuristic below still covers legacy rows cancelled while
+  // cancelTask wrote 'completed'.
+  if (row.status === 'cancelled') return 'cancelled';
   // Label 'cancelled' ONLY for the occurrence the board-cancel actually ended — a
   // completed row whose scheduled due (process_after) is at/after the cancel audit
   // ts. Prior completed fires (due < cancelTs) genuinely RAN and keep their ran /
@@ -321,7 +325,7 @@ function readHistory(
         `SELECT id, status, process_after, timestamp
            FROM messages_in
           WHERE series_id = ? AND kind = 'task'
-            AND status IN ('completed', 'failed', 'expired')
+            AND status IN ('completed', 'failed', 'expired', 'cancelled')
           ORDER BY seq DESC LIMIT 5`,
       )
       .all(seriesId) as HistoryRow[];
