@@ -520,7 +520,7 @@ describe('cancelHandler', () => {
       .prepare("SELECT 1 AS ok FROM scheduled_audit WHERE series_id = 'ser-1' AND action = 'cancel'")
       .get() as { ok: number } | undefined;
     expect(audit).toBeDefined();
-    expect(liveRow('ser-1')!.status).toBe('completed');
+    expect(liveRow('ser-1')!.status).toBe('cancelled');
   });
 
   it('test_cancel_strand_succeeds', async () => {

@@ -28,8 +28,8 @@
     "build:dashboard": "cd dashboard && pnpm install --ignore-workspace && pnpm vite build"
   },
   "dependencies": {
-    "@chat-adapter/discord": "4.26.0",
-    "@chat-adapter/slack": "4.26.0",
+    "@chat-adapter/discord": "4.29.0",
+    "@chat-adapter/slack": "4.29.0",
     "@clack/core": "^1.2.0",
     "@clack/prompts": "^1.2.0",
     "@onecli-sh/sdk": "^0.5.0",
@@ -63,6 +63,9 @@
   "pnpm": {
     "overrides": {
       "ws@<8.20.1": "^8.20.1"
+    },
+    "patchedDependencies": {
+      "@chat-adapter/discord@4.29.0": "patches/@chat-adapter__discord@4.29.0.patch"
     }
   }
 }

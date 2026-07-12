@@ -149,7 +149,7 @@ describe('handleCancelTask scope resolution', () => {
     } finally {
       inDb.close();
     }
-    expect(tasksIn(thr.id)[0].status).toBe('completed');
+    expect(tasksIn(thr.id)[0].status).toBe('cancelled');
   });
 
   it('cancelling a channel task from a thread session falls back to channel root', async () => {
@@ -173,7 +173,7 @@ describe('handleCancelTask scope resolution', () => {
     } finally {
       inDb.close();
     }
-    expect(tasksIn(root.id)[0].status).toBe('completed');
+    expect(tasksIn(root.id)[0].status).toBe('cancelled');
   });
 });
 

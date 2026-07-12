@@ -1,8 +1,8 @@
 diff --git a/dist/index.js b/dist/index.js
-index 8b490cf67e4d4dcec82404a27ef364f440c617b6..1a8e6e5aed119601f4a48a1523b6e502452a0cf7 100644
+index e4f6fe07808ab3c9858fda724c36f7aef5084502..c27c6aaa40d732eca409dc9fe2d90f9b269dc357 100644
 --- a/dist/index.js
 +++ b/dist/index.js
-@@ -247,7 +247,13 @@ var DiscordFormatConverter = class extends BaseFormatConverter {
+@@ -276,7 +276,13 @@ var DiscordFormatConverter = class extends BaseFormatConverter {
     * @name → <@name>
     */
    convertMentionsToDiscord(text) {
@@ -17,7 +17,7 @@ index 8b490cf67e4d4dcec82404a27ef364f440c617b6..1a8e6e5aed119601f4a48a1523b6e502
    }
    /**
     * Override renderPostable to convert @mentions in plain strings.
-@@ -293,7 +299,10 @@ var DiscordFormatConverter = class extends BaseFormatConverter {
+@@ -322,7 +328,10 @@ var DiscordFormatConverter = class extends BaseFormatConverter {
        return getNodeChildren(node).map((child) => this.nodeToDiscordMarkdown(child)).join("");
      }
      if (isTextNode(node)) {
@@ -29,7 +29,7 @@ index 8b490cf67e4d4dcec82404a27ef364f440c617b6..1a8e6e5aed119601f4a48a1523b6e502
      }
      if (isStrongNode(node)) {
        const content = getNodeChildren(node).map((child) => this.nodeToDiscordMarkdown(child)).join("");
-@@ -1658,14 +1667,23 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -1786,14 +1795,23 @@ var DiscordAdapter = class _DiscordAdapter {
          this.logger.debug("Ignoring message - Gateway is shutting down");
          return;
        }
@@ -57,7 +57,7 @@ index 8b490cf67e4d4dcec82404a27ef364f440c617b6..1a8e6e5aed119601f4a48a1523b6e502
        const isUserMentioned = message.mentions.has(client.user?.id ?? "");
        const isRoleMentioned = this.mentionRoleIds.length > 0 && message.mentions.roles.some(
          (role) => this.mentionRoleIds.includes(role.id)
-@@ -1687,13 +1705,17 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -1833,13 +1851,17 @@ var DiscordAdapter = class _DiscordAdapter {
          this.logger.debug("Ignoring reaction - Gateway is shutting down");
          return;
        }
@@ -80,7 +80,7 @@ index 8b490cf67e4d4dcec82404a27ef364f440c617b6..1a8e6e5aed119601f4a48a1523b6e502
        this.logger.info("Discord Gateway reaction added", {
          emoji: reaction.emoji.name,
          messageId: reaction.message.id,
-@@ -1715,13 +1737,17 @@ var DiscordAdapter = class _DiscordAdapter {
+@@ -1861,13 +1883,17 @@ var DiscordAdapter = class _DiscordAdapter {
          );
          return;
        }

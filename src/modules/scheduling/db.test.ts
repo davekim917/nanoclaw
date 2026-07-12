@@ -58,8 +58,9 @@ describe('insertTaskRow', () => {
 
   it('persists thread_id for a thread-scoped task', () => {
     const db = freshDb();
-    insertTask(db, {
+    insertTaskRow(db, {
       id: 'task-thr',
+      seriesId: 'task-thr',
       processAfter: new Date().toISOString(),
       recurrence: '*/10 * * * *',
       platformId: 'C0AJA89MN2E',
@@ -74,8 +75,9 @@ describe('insertTaskRow', () => {
 
   it('carries thread_id forward across a recurrence fire', () => {
     const db = freshDb();
-    insertTask(db, {
+    insertTaskRow(db, {
       id: 'task-thr',
+      seriesId: 'task-thr',
       processAfter: new Date().toISOString(),
       recurrence: '*/10 * * * *',
       platformId: 'C0AJA89MN2E',
@@ -129,8 +131,13 @@ describe('cancelTask / pauseTask / resumeTask series matching', () => {
 
     const msg: RecurringMessage = {
       id: 'task-orig',
+      kind: 'task',
       content: JSON.stringify({ prompt: 'noop' }),
       recurrence: '0 9 * * *',
+      process_after: null,
+      platform_id: null,
+      channel_type: null,
+      thread_id: null,
       series_id: 'task-orig',
     };
     insertRecurrence(db, msg, 'task-next', new Date(Date.now() + 86400000).toISOString());
@@ -309,8 +316,13 @@ describe('updateTask', () => {
 
     const msg: RecurringMessage = {
       id: 'task-orig',
+      kind: 'task',
       content: JSON.stringify({ prompt: 'old' }),
       recurrence: '0 9 * * *',
+      process_after: null,
+      platform_id: null,
+      channel_type: null,
+      thread_id: null,
       series_id: 'task-orig',
     };
     insertRecurrence(db, msg, 'task-next', new Date(Date.now() + 86400000).toISOString());
@@ -465,7 +477,7 @@ describe('cancelSeriesWithStrandClear', () => {
     const term = db.prepare("SELECT recurrence FROM messages_in WHERE id = 'series-term'").get() as {
       recurrence: string | null;
     };
-    expect(live.status).toBe('completed');
+    expect(live.status).toBe('cancelled');
     expect(live.recurrence).toBeNull();
     expect(term.recurrence).toBeNull();
     expect(count).toBe(2);
@@ -489,8 +501,13 @@ describe('insertRecurrence', () => {
 
     const msg: RecurringMessage = {
       id: 'task-orig',
+      kind: 'task',
       content: '{}',
       recurrence: '0 9 * * *',
+      process_after: null,
+      platform_id: null,
+      channel_type: null,
+      thread_id: null,
       series_id: 'task-orig',
     };
     insertRecurrence(db, msg, 'task-next', new Date().toISOString());

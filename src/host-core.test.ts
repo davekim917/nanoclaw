@@ -831,6 +831,9 @@ describe('router — per-wiring thread policy', () => {
       ignored_message_policy: 'drop',
       session_mode: 'shared',
       priority: 0,
+      default_model: null,
+      default_effort: null,
+      default_tone: null,
       created_at: now(),
     });
   });
@@ -972,10 +975,10 @@ describe('router — per-wiring thread policy', () => {
     await routeInbound(mention('tp-declared', 'tp:D1', false));
     expect(getMessagingGroupByPlatform('tp-declared', 'tp:D1')!.unknown_sender_policy).toBe('strict');
 
-    // Undeclared channel: the behavior-faithful fallback reproduces the
-    // historical hardcoded 'request_approval'.
+    // Undeclared channel — fork policy: public-by-default (sibling gate +
+    // auto-wire flow, 2026-05-13), NOT upstream's 'request_approval' fallback.
     await routeInbound(mention('tp-undeclared', 'tp:U1', true));
-    expect(getMessagingGroupByPlatform('tp-undeclared', 'tp:U1')!.unknown_sender_policy).toBe('request_approval');
+    expect(getMessagingGroupByPlatform('tp-undeclared', 'tp:U1')!.unknown_sender_policy).toBe('public');
   });
 });
 

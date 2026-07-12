@@ -41,6 +41,15 @@ vi.mock('./db/sessions.js', () => ({
 
 vi.mock('./channels/channel-registry.js', () => ({
   getChannelAdapter: vi.fn(() => null),
+  // Static behavior-faithful fallback (fork: plain mention groups) — the real
+  // registry never returns undefined; it resolves undeclared adapters through
+  // fallbackChannelDefaults.
+  getChannelDefaults: vi.fn(() => ({
+    dm: { engageMode: 'pattern', engagePattern: '.', threads: true, unknownSenderPolicy: 'request_approval' },
+    group: { engageMode: 'mention', threads: true, unknownSenderPolicy: 'request_approval' },
+    mentions: 'platform',
+  })),
+  hasDeclaredChannelDefaults: vi.fn(() => false),
 }));
 
 vi.mock('./session-manager.js', () => ({
@@ -101,7 +110,7 @@ import {
   setAccessGate,
   setUnwiredChannelResolver,
   setChannelRequestGate,
-  setMessageInterceptor,
+  registerMessageInterceptor,
   isSlackChannelType,
   isDiscordChannelType,
 } from './router.js';
@@ -171,7 +180,7 @@ beforeEach(() => {
   setAccessGate(() => ({ allowed: true }));
   setUnwiredChannelResolver(() => []);
   setChannelRequestGate(() => Promise.resolve());
-  setMessageInterceptor(() => Promise.resolve(false));
+  registerMessageInterceptor(() => Promise.resolve(false));
   vi.mocked(isAnyAdmin).mockReturnValue(true);
 });
 

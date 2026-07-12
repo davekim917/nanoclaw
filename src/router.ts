@@ -18,7 +18,7 @@
  * for policy refusals.
  */
 import { persistInboundAttachments } from './attachment-downloader.js';
-import { getChannelAdapter, getChannelDefaults } from './channels/channel-registry.js';
+import { getChannelAdapter, getChannelDefaults, hasDeclaredChannelDefaults } from './channels/channel-registry.js';
 import { resolveThreadPolicy, resolveUnknownSenderPolicy } from './channels/channel-defaults.js';
 import { gateCommand, preFanoutGate, getInterceptHandler } from './command-gate.js';
 import type { InterceptContext } from './command-gate.js';
@@ -404,13 +404,19 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
       // explicit message.isGroup, fall back to the isDM inverse. When
       // unknown, default to 0 (DM-style) to preserve legacy behavior.
       is_group: (event.message.isGroup ?? event.isDM === false) ? 1 : 0,
-      // Fork policy: public-by-default — any sender in the channel can
-      // mention the bot without a separate sender-approval cascade (sibling
-      // gate + auto-wire flow, 2026-05-13). Operator can lock individual
-      // channels down later via messaging_groups.unknown_sender_policy.
-      // Upstream resolves this from declared channel defaults
-      // (resolveUnknownSenderPolicy) — deliberately not adopted.
-      unknown_sender_policy: 'public',
+      // Declared adapters get their declared policy (DM vs group context).
+      // Fork policy for UNDECLARED adapters: public-by-default — any sender
+      // in the channel can mention the bot without a separate sender-approval
+      // cascade (sibling gate + auto-wire flow, 2026-05-13); upstream's
+      // faithful fallback would be 'request_approval'. Operator can lock
+      // individual channels down later via messaging_groups.unknown_sender_policy.
+      unknown_sender_policy: hasDeclaredChannelDefaults(event.instance ?? event.channelType, event.channelType)
+        ? resolveUnknownSenderPolicy(
+            event.instance ?? event.channelType,
+            (event.message.isGroup ?? event.isDM === false) === true,
+            event.channelType,
+          )
+        : 'public',
       denied_at: null,
       created_at: new Date().toISOString(),
     };
@@ -672,7 +678,18 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
     const scopeOk = engages && (!senderScopeGate || senderScopeGate(event, userId, mg, agent).allowed);
 
     if (engages && accessOk && scopeOk) {
-      await deliverToAgent(agent, agentGroup, mg, event, userId, threadsEnabled, effectiveThreadId, true, parsed, adapter);
+      await deliverToAgent(
+        agent,
+        agentGroup,
+        mg,
+        event,
+        userId,
+        threadsEnabled,
+        effectiveThreadId,
+        true,
+        parsed,
+        adapter,
+      );
       engagedCount++;
 
       // Mention-sticky: ask the adapter to subscribe the thread so the
@@ -704,7 +721,18 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
       // message (which also stages their attachments to disk via
       // writeSessionMessage → extractAttachmentFiles) is exactly what the
       // gate is meant to prevent.
-      await deliverToAgent(agent, agentGroup, mg, event, userId, threadsEnabled, effectiveThreadId, false, parsed, adapter);
+      await deliverToAgent(
+        agent,
+        agentGroup,
+        mg,
+        event,
+        userId,
+        threadsEnabled,
+        effectiveThreadId,
+        false,
+        parsed,
+        adapter,
+      );
       accumulatedCount++;
     } else {
       log.debug('Message not engaged for agent (drop policy)', {
@@ -976,7 +1004,7 @@ async function deliverToAgent(
   }
   if (
     wake &&
-    adapterSupportsThreads &&
+    threadsEnabled &&
     effectiveThreadId !== null &&
     adapter?.fetchThreadHistory &&
     (event.message.kind === 'chat' || event.message.kind === 'chat-sdk')

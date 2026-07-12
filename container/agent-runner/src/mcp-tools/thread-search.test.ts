@@ -39,6 +39,10 @@ mock.module('bun:sqlite', () => ({
     close() { /* keep singleton alive across calls in same test */ }
     run(sql: string, ...params: unknown[]) { return this._real.run(sql, ...params as Parameters<Database['run']>); }
     query(sql: string) { return this._real.query(sql); }
+    // bun's mock.module is process-global: later test files' connection.ts
+    // singletons are built from THIS class. Forward transaction so code like
+    // markScriptSkipped (db.transaction(...)()) keeps working cross-file.
+    transaction(fn: (...args: unknown[]) => unknown) { return this._real.transaction(fn); }
     get(sql: string, ...params: unknown[]) { return (this._real as unknown as Record<string, (...a: unknown[]) => unknown>)['get']?.(sql, ...params); }
   },
 }));

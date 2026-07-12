@@ -57,7 +57,7 @@ describe('composeGroupClaudeMd persona prepend', () => {
     seed(ag);
     writePersona(ag.folder, 'You are an SDR agent.\n');
 
-    composeGroupClaudeMd(ag);
+    composeGroupClaudeMd(ag, 'claude');
 
     const imports = importsOf(ag.folder);
     expect(imports[0]).toBe('@./.claude-fragments/persona.md');
@@ -72,8 +72,8 @@ describe('composeGroupClaudeMd persona prepend', () => {
     seed(ag);
     writePersona(ag.folder, 'persona body');
 
-    composeGroupClaudeMd(ag);
-    composeGroupClaudeMd(ag);
+    composeGroupClaudeMd(ag, 'claude');
+    composeGroupClaudeMd(ag, 'claude');
 
     expect(fs.existsSync(path.join(GROUPS_DIR, ag.folder, '.claude-fragments', 'persona.md'))).toBe(true);
     expect(importsOf(ag.folder)[0]).toBe('@./.claude-fragments/persona.md');
@@ -83,7 +83,7 @@ describe('composeGroupClaudeMd persona prepend', () => {
     const ag = group('ag-no-persona', 'no-persona-group');
     seed(ag);
 
-    composeGroupClaudeMd(ag);
+    composeGroupClaudeMd(ag, 'claude');
 
     const imports = importsOf(ag.folder);
     expect(imports[0]).toBe('@./.claude-shared.md');
@@ -99,20 +99,22 @@ describe('composeGroupClaudeMd scheduling instructions (ncl tasks reach-in)', ()
     const ag = group('ag-sched', 'sched-group');
     seed(ag);
 
-    composeGroupClaudeMd(ag);
+    composeGroupClaudeMd(ag, 'claude');
 
     expect(importsOf(ag.folder)).toContain('@./.claude-fragments/module-scheduling.md');
   });
 
-  it('excludes module-scheduling.md (and module-cli.md) when cli_scope is disabled', () => {
+  it('excludes module-cli.md but KEEPS module-scheduling.md when cli_scope is disabled (fork keeps the scheduling MCP surface)', () => {
     const ag = group('ag-sched-off', 'sched-group-off');
     seed(ag);
     updateContainerConfigScalars(ag.id, { cli_scope: 'disabled' });
 
-    composeGroupClaudeMd(ag);
+    composeGroupClaudeMd(ag, 'claude');
 
     const imports = importsOf(ag.folder);
-    expect(imports).not.toContain('@./.claude-fragments/module-scheduling.md');
+    // Fork: scheduling instructions describe the schedule_task/... MCP tools,
+    // which exist regardless of ncl access — only the ncl fragment goes.
+    expect(imports).toContain('@./.claude-fragments/module-scheduling.md');
     expect(imports).not.toContain('@./.claude-fragments/module-cli.md');
   });
 });

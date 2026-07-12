@@ -57,8 +57,9 @@ describe('design-system corpus integrity', () => {
     expect(attr).toContain('nexu-io/open-design');
   });
 
-  it('test_curated_count_is_reasonable', () => {
-    expect(systemDirs().length).toBeGreaterThanOrEqual(15);
-    expect(systemDirs().length).toBeLessThanOrEqual(25);
+  it('test_curated_count_matches_the_shipped_catalog', () => {
+    // Keep additions and removals deliberate. The index/dir tests above prove
+    // structural integrity; this assertion makes a catalog-size change visible.
+    expect(systemDirs()).toHaveLength(59);
   });
 });

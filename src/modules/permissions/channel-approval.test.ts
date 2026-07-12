@@ -48,6 +48,11 @@ vi.mock('../../container-runner.js', () => ({
 const deliverMock = vi.fn().mockResolvedValue('plat-msg-id');
 vi.mock('../../delivery.js', () => ({
   getDeliveryAdapter: () => ({ deliver: deliverMock }),
+  // Fork modules (bash-gate etc.) self-register delivery actions and
+  // adapter-ready hooks at import time via the router's module graph — stub
+  // the registries.
+  registerDeliveryAction: vi.fn(),
+  onDeliveryAdapterReady: vi.fn(),
 }));
 
 // Mock ensureUserDm — look up the owner's preconfigured DM row instead of
@@ -114,6 +119,34 @@ beforeEach(async () => {
        VALUES (?, ?, ?, ?)`,
     )
     .run('telegram:owner', 'telegram', 'mg-dm-owner', now());
+
+  // Fork: pickApprovalDelivery keeps workspace boundaries — the approver is
+  // matched by user-id channel prefix against the ORIGIN channel_type. Seed a
+  // wamock-identity owner (+ DM) so the undeclared-channel ('wamock')
+  // registration tests can deliver a card.
+  upsertUser({ id: 'wamock:owner', kind: 'wamock', display_name: 'Owner', created_at: now() });
+  grantRole({
+    user_id: 'wamock:owner',
+    role: 'owner',
+    agent_group_id: null,
+    granted_by: null,
+    granted_at: now(),
+  });
+  createMessagingGroup({
+    id: 'mg-dm-owner-wamock',
+    channel_type: 'wamock',
+    platform_id: 'dm-owner-wamock',
+    name: 'Owner wamock DM',
+    is_group: 0,
+    unknown_sender_policy: 'public',
+    created_at: now(),
+  });
+  getDb()
+    .prepare(
+      `INSERT INTO user_dms (user_id, channel_type, messaging_group_id, resolved_at)
+       VALUES (?, ?, ?, ?)`,
+    )
+    .run('wamock:owner', 'wamock', 'mg-dm-owner-wamock', now());
 
   deliverMock.mockClear();
 });

@@ -107,8 +107,8 @@ async function handleRegisteredApproval(
   }
 
   // Approved — dispatch to the module that registered for this action.
-  const notify = (text: string): void => {
-    writeSessionMessage(session.agent_group_id, session.id, {
+  const notify = async (text: string): Promise<void> => {
+    await writeSessionMessage(session.agent_group_id, session.id, {
       id: `appr-note-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       kind: 'chat',
       timestamp: new Date().toISOString(),

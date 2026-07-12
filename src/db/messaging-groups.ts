@@ -267,6 +267,7 @@ export function getMessagingGroupAgents(messagingGroupId: string): MessagingGrou
          COALESCE(session_mode, 'per-thread') AS session_mode,
          COALESCE(priority, 0) AS priority,
          default_model, default_effort, default_tone,
+         threads,
          created_at
        FROM messaging_group_agents
        WHERE messaging_group_id = ?

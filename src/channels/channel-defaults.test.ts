@@ -140,7 +140,8 @@ describe('fallbackChannelDefaults — behavior-faithful values', () => {
     const { fallbackChannelDefaults } = await import('./channel-registry.js');
     expect(fallbackChannelDefaults(true)).toEqual({
       dm: { engageMode: 'pattern', engagePattern: '.', threads: true, unknownSenderPolicy: 'request_approval' },
-      group: { engageMode: 'mention-sticky', threads: true, unknownSenderPolicy: 'request_approval' },
+      // Fork policy: plain mention, not mention-sticky (owner directive 2026-05-26).
+      group: { engageMode: 'mention', threads: true, unknownSenderPolicy: 'request_approval' },
       mentions: 'platform',
     });
     // threads track the raw capability in BOTH contexts so NULL-inherit
@@ -148,7 +149,7 @@ describe('fallbackChannelDefaults — behavior-faithful values', () => {
     const nonThreaded = fallbackChannelDefaults(false);
     expect(nonThreaded.dm.threads).toBe(false);
     expect(nonThreaded.group.threads).toBe(false);
-    expect(nonThreaded.group.engageMode).toBe('mention-sticky');
+    expect(nonThreaded.group.engageMode).toBe('mention'); // fork policy
   });
 });
 

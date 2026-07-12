@@ -17,8 +17,13 @@ import { nextEvenSeq } from '../../db/session-db.js';
 /**
  * Insert one pending task occurrence. `seriesId` is the series join key — equal
  * to `id` for a brand-new series, or the existing series for a recurrence clone
- * or an on-demand run. Tasks never set platform/channel/thread (they fire into
- * an isolated system session), so those columns are always NULL.
+ * or an on-demand run.
+ *
+ * New-style `ncl tasks` rows fire into an isolated system session and pass no
+ * routing (platform/channel/thread default NULL). Fork: MCP-scheduled tasks
+ * (actions.ts) and recurrence clones DO carry routing — channel-scoped tasks
+ * post to their channel and thread-scoped loops report in-thread, so the
+ * columns must survive every re-arm (task-reply routing, dac5d9b3).
  */
 export function insertTaskRow(
   db: Database.Database,
@@ -29,13 +34,19 @@ export function insertTaskRow(
     recurrence: string | null;
     content: string;
     status?: 'pending' | 'paused';
+    platformId?: string | null;
+    channelType?: string | null;
+    threadId?: string | null;
   },
 ): void {
   db.prepare(
     `INSERT INTO messages_in (id, seq, timestamp, status, tries, process_after, recurrence, kind, platform_id, channel_type, thread_id, content, series_id)
-     VALUES (@id, @seq, @timestamp, @status, 0, @processAfter, @recurrence, 'task', NULL, NULL, NULL, @content, @seriesId)`,
+     VALUES (@id, @seq, @timestamp, @status, 0, @processAfter, @recurrence, 'task', @platformId, @channelType, @threadId, @content, @seriesId)`,
   ).run({
     status: 'pending',
+    platformId: null,
+    channelType: null,
+    threadId: null,
     ...row,
     timestamp: new Date().toISOString(),
     seq: nextEvenSeq(db),
@@ -155,12 +166,17 @@ export function updateTask(db: Database.Database, taskId: string, update: TaskUp
 }
 
 // Only tasks carry a recurrence (non-task writeSessionMessage never sets one),
-// so getCompletedRecurring only ever returns task rows — the fields below are
-// all that handleRecurrence needs to clone the next occurrence.
+// so getCompletedRecurring only ever returns task rows. The routing columns
+// ride along so recurrence clones keep posting to their channel/thread.
 export interface RecurringMessage {
   id: string;
+  kind: string;
   content: string;
   recurrence: string;
+  process_after: string | null;
+  platform_id: string | null;
+  channel_type: string | null;
+  thread_id: string | null;
   series_id: string;
 }
 
@@ -218,6 +234,11 @@ export function insertRecurrence(
     recurrence: msg.recurrence,
     content: msg.content,
     status,
+    // Carry routing forward — a channel/thread-scoped series must keep
+    // posting to its channel/thread across every re-arm.
+    platformId: msg.platform_id,
+    channelType: msg.channel_type,
+    threadId: msg.thread_id,
   });
 }
 

@@ -53,7 +53,7 @@ import { parseMessageFlags, type FlagIntent } from '../../flag-parser.js';
 import { log } from '../../log.js';
 import { openInboundDb, writeSessionMessage } from '../../session-manager.js';
 import type { Session } from '../../types.js';
-import { cancelTask, insertTask, pauseTask, resumeTask, updateTask, type TaskUpdate } from './db.js';
+import { cancelTask, insertTaskRow, pauseTask, resumeTask, updateTask, type TaskUpdate } from './db.js';
 
 /** Per-fire model/effort a scheduled task carries; mirrors the chat FlagIntent. */
 type TaskFlagIntent = Pick<FlagIntent, 'turnModel' | 'turnEffort'>;
@@ -181,8 +181,9 @@ export async function handleScheduleTask(
   // `scope:'thread'` from a channel-root session has no thread to bind to, so
   // it falls through to the channel-root path below.
   if (scopeThread && session.thread_id) {
-    insertTask(inDb, {
+    insertTaskRow(inDb, {
       id: taskId,
+      seriesId: taskId,
       processAfter,
       recurrence,
       platformId: mg.platform_id,
@@ -209,8 +210,9 @@ export async function handleScheduleTask(
   }
 
   await withChannelInbound(session.agent_group_id, session.messaging_group_id, (channelInDb) => {
-    insertTask(channelInDb, {
+    insertTaskRow(channelInDb, {
       id: taskId,
+      seriesId: taskId,
       processAfter,
       recurrence,
       platformId: mg.platform_id,

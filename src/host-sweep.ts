@@ -306,7 +306,6 @@ async function sweep(): Promise<void> {
   // their deadline, spawn window, no-progress timeout, or whose child container exited.
   await sweepTaskWatchdog();
 
-
   setTimeout(sweep, SWEEP_INTERVAL_MS);
 }
 

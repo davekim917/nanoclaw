@@ -18,6 +18,7 @@ vi.mock('../group-init.js', async () => {
 
 vi.mock('../log.js', () => ({
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+  setLogScrubber: vi.fn(),
 }));
 
 // `wirings.ts`'s postCommit projects the new destination into every running

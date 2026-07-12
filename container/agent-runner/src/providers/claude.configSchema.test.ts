@@ -30,7 +30,13 @@ mock.module('@anthropic-ai/claude-agent-sdk', () => ({
   query: mockSdkQuery,
 }));
 
+// Spread the real module and stub only the tool-in-flight markers —
+// bun's mock.module leaks across test files in the same process, and a
+// bare two-export mock strips getOutboundDb/transaction from later files
+// (task-script.test.ts markScriptSkipped went red on exactly this).
+const realConnection = await import('../db/connection.js');
 mock.module('../db/connection.js', () => ({
+  ...realConnection,
   clearContainerToolInFlight: () => {},
   setContainerToolInFlight: () => {},
 }));

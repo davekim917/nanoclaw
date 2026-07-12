@@ -13,9 +13,18 @@ import {
   threadWorktreeDir,
   threadsBaseDir,
   initSessionFolder,
+  inboundDbPath,
   outboundDbPath,
+  sessionDir,
   writeOutboundDirect,
+  writeSessionMessage,
 } from './session-manager.js';
+import { initTestDb, closeDb, runMigrations, createAgentGroup } from './db/index.js';
+import { createSession } from './db/sessions.js';
+import type { Session } from './types.js';
+
+const AG = 'ag-test';
+const SESS = 'sess-test';
 
 describe('threadWorktreeDir', () => {
   it('uses thread_id directly as the key when present', () => {
@@ -188,12 +197,12 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
     closeDb();
   });
 
-  it('re-creates the folder + inbound.db and does not throw when the row still exists', () => {
+  it('re-creates the folder + inbound.db and does not throw when the row still exists', async () => {
     // Operator resets a stuck session by deleting its folder; the row survives.
     fs.rmSync(sessionDir(AG, SESS), { recursive: true, force: true });
     expect(fs.existsSync(inboundDbPath(AG, SESS))).toBe(false);
 
-    expect(() =>
+    await expect(
       writeSessionMessage(AG, SESS, {
         id: 'after-reset-1',
         kind: 'chat',
@@ -203,7 +212,7 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
         threadId: null,
         content: JSON.stringify({ text: 'still here?' }),
       }),
-    ).not.toThrow();
+    ).resolves.not.toThrow();
 
     // The folder + inbound.db are back and the message landed.
     expect(fs.existsSync(inboundDbPath(AG, SESS))).toBe(true);
