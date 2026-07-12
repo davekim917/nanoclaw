@@ -8,8 +8,8 @@
  *
  * Simplified from v1's src/plugin-updater.ts:
  *   - No DB-backed scheduled_tasks row. v2 has no scheduled_tasks
- *     table on the host side; task scheduling is an agent-level MCP
- *     tool (`schedule_task`). Host cron work uses setInterval, the
+ *     table on the host side; task scheduling is agent-level via
+ *     `ncl tasks`. Host cron work uses setInterval, the
  *     same pattern worktree-cleanup (5.0's host-side sibling) uses.
  *   - No cron-parser dep. Hourly is hard-coded; a later refactor can
  *     generalize if we need sub-hour or TZ-aware schedules.

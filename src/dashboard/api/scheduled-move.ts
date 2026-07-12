@@ -26,6 +26,7 @@ import { getAgentGroup } from '../../db/agent-groups.js';
 import { getWorkgroupOnecliSecrets } from '../../db/agent-groups.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { getDb } from '../../db/connection.js';
+import { findSystemSession, taskThreadId } from '../../db/sessions.js';
 import { openInboundDb } from '../../db/session-db.js';
 import * as scheduledTasks from '../../db/scheduled-tasks.js';
 import { type TaskDef } from '../../db/scheduled-tasks.js';
@@ -419,21 +420,16 @@ function scopedLiveCount(
   target: { agentGroupId: string; sessionId: string | null },
   seriesId: string,
 ): { count: number; unreadable: boolean } {
-  return countLiveRowsInSessions(
-    dataDir,
-    [source, target.sessionId ? { agentGroupId: target.agentGroupId, sessionId: target.sessionId } : null],
-    seriesId,
-  );
+  const locators = [source];
+  if (target.sessionId && target.sessionId !== source.sessionId) {
+    locators.push({ agentGroupId: target.agentGroupId, sessionId: target.sessionId });
+  }
+  return countLiveRowsInSessions(dataDir, locators, seriesId);
 }
 
-/** Resolve the target channel-root session id (after scheduleTask created it). */
-function targetSessionIdFor(targetAgentGroupId: string, targetMessagingGroupId: string): string | null {
-  const row = getDb()
-    .prepare(
-      "SELECT id FROM sessions WHERE agent_group_id = ? AND messaging_group_id = ? AND thread_id IS NULL AND status = 'active' LIMIT 1",
-    )
-    .get(targetAgentGroupId, targetMessagingGroupId) as { id: string } | undefined;
-  return row?.id ?? null;
+/** Resolve the target per-series system session id (after scheduleTask created it). */
+function targetSessionIdFor(targetAgentGroupId: string, seriesId: string): string | null {
+  return findSystemSession(targetAgentGroupId, taskThreadId(seriesId))?.id ?? null;
 }
 
 export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
@@ -586,7 +582,7 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
         taskDefFromSnapshot(snapshot, source.seriesId, target.agentGroupId, targetMg, stagedProcessAfter),
         dataDir,
       );
-      const tgtSessId = targetSessionIdFor(target.agentGroupId, target.messagingGroupId);
+      const tgtSessId = targetSessionIdFor(target.agentGroupId, source.seriesId);
       if (tgtSessId) {
         const tgtDb = openInboundDb(inboundPathOf(dataDir, target.agentGroupId, tgtSessId));
         try {
@@ -614,7 +610,7 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
     });
     let restored = false;
     try {
-      const tgtSessId = targetSessionIdFor(target.agentGroupId, target.messagingGroupId);
+      const tgtSessId = targetSessionIdFor(target.agentGroupId, source.seriesId);
       const live = scopedLiveCount(
         dataDir,
         { agentGroupId: source.agentGroupId, sessionId: source.sessionId },
@@ -657,7 +653,7 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
   // LEAVE the move_intent unresolved so the recovery sweep repairs it. An
   // UNREADABLE post-state is equally not-success (never claim a move succeeded
   // on a state we couldn't observe).
-  const tgtSessId = targetSessionIdFor(target.agentGroupId, target.messagingGroupId);
+  const tgtSessId = targetSessionIdFor(target.agentGroupId, source.seriesId);
   const post = scopedLiveCount(
     dataDir,
     { agentGroupId: source.agentGroupId, sessionId: source.sessionId },
@@ -681,7 +677,8 @@ export const moveExecuteHandler: AuthHandler = async (req, params, ctx) => {
   }
 
   // Step 7: resolve the intent (stamp + purge body, F5) + two-sided move audit
-  // (one row per group, shared correlation_id) + invalidate cache.
+  // (one row per side, shared correlation_id) + invalidate cache. Same-agent
+  // reroutes intentionally write both directions against the same group.
   purgeIntentBody(central, correlationId);
   const secretDetail = { secretGainsCount: delta.gains.length, secretLossesCount: delta.losses.length };
   writeAudit(central, {

@@ -2,7 +2,7 @@
 
 v2 supports daily digests two ways: a built-in host-side default (covers
 ship_log + backlog automatically for every wired group) and an agent-driven
-pattern (richer per-group content via `schedule_task`). They coexist —
+pattern (richer per-group content via `ncl tasks create`). They coexist —
 pick the one that fits the use case, or run both.
 
 ## Path A — Host-side daily summary (default)
@@ -85,18 +85,16 @@ In the chat where you want the digest delivered, say something like:
 > line summary. Skip the message entirely on days with nothing
 > noteworthy — don't send "nothing happened" filler.
 
-The agent calls `schedule_task` with `processAfter` = next 8am in TZ,
-`recurrence = '0 8 * * *'`, and the prompt. When the task fires, the
-agent re-runs, pulls from whatever tools it has access to, composes
-the summary, and replies in the same chat.
+The agent runs `ncl tasks create --recurrence "0 8 * * *"` with the
+prompt. The task fires in its own isolated session; replies default to
+the channel the agent scheduled from (routing is stamped at create).
 
 **Variations:**
 
-- **Per-project:** schedule inside the project's thread; the agent
-  scopes itself by context.
+- **Per-project:** schedule from the project's thread with `--thread`;
+  replies land in-thread.
 - **Weekly:** swap cron to `0 8 * * 1`.
-- **Different content:** re-run `schedule_task` (or `update_task`) with
-  a new prompt — no code change.
+- **Different content:** `ncl tasks update --prompt` — no code change.
 - **Team digests:** the agent runs the summary prompt and cross-posts
   via the agent-to-agent messaging primitive (when wired).
 

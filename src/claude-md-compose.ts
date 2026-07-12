@@ -93,10 +93,9 @@ export function composeGroupClaudeMd(group: AgentGroup, provider: string): void 
 
   // Built-in module fragments — every MCP/CLI module that ships a
   // sibling `<name>.instructions.md`. These describe how the agent should
-  // use that module's MCP tools (schedule_task, install_packages, etc.).
-  // Skip cli.instructions.md when cli_scope is disabled. (This fork keeps
-  // the scheduling MCP surface, so scheduling.instructions.md stays valid
-  // even without ncl.)
+  // use that module's tools (install_packages, ncl tasks, etc.). Scheduling
+  // guidance lives entirely in cli.instructions.md and is therefore excluded
+  // when cli_scope is disabled; there is no separate scheduling MCP fragment.
   // Skip memory-recall.instructions.md when memory is disabled — the
   // recall_memory tool only registers when MNEMON_STORE is set (memory
   // enabled), so the fragment would describe a tool the agent doesn't have.

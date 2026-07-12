@@ -49,7 +49,6 @@ import { readEnvFileMatching } from './env.js';
 import { getAgentGroup, getWorkgroupOnecliSecrets, getWorkgroupOnecliSecretsById } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
-import { findSessionByAgentGroupAndMessagingGroup } from './db/sessions.js';
 import { buildArchiveProjection, buildCentralProjection } from './db/per-agent-projections.js';
 import { initGroupFilesystem } from './group-init.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
@@ -1197,30 +1196,6 @@ export function buildMounts(
       const tDir = threadWorktreeDir(mg.platform_id, session.thread_id);
       fs.mkdirSync(tDir, { recursive: true });
       mounts.push({ hostPath: tDir, containerPath: '/workspace/worktrees', readonly: false });
-    }
-  }
-
-  // Channel-root inbound.db at /workspace/channel-inbound.db (read-only).
-  // Scheduled tasks live in the channel-root session for this (agent, MG)
-  // pair, not in the calling thread's session. The container's `list_tasks`
-  // MCP tool reads from this mount so any thread can list/inspect tasks
-  // scoped to the channel. Writes still go through the host system-action
-  // path, which routes to the same channel-root inbound.db.
-  //
-  // Always mount when a channel-root session exists, including when the
-  // current session IS the channel-root — duplicate bind-mount of the same
-  // file is harmless and keeps `getChannelInboundDb()` uniform.
-  if (session.messaging_group_id) {
-    const channelSession = findSessionByAgentGroupAndMessagingGroup(agentGroup.id, session.messaging_group_id);
-    if (channelSession) {
-      const channelInboundFile = path.join(sessionDir(agentGroup.id, channelSession.id), 'inbound.db');
-      if (fs.existsSync(channelInboundFile)) {
-        mounts.push({
-          hostPath: channelInboundFile,
-          containerPath: '/workspace/channel-inbound.db',
-          readonly: true,
-        });
-      }
     }
   }
 

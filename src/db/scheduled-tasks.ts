@@ -11,8 +11,8 @@
  *     `messaging_group_agents`. If it isn't, scheduleTask refuses — this
  *     catches the case where a task is wired to the wrong agent group (the
  *     credential boundary).
- *   - The session is resolved by (agent_group_id, messaging_group_id), never
- *     by agent_group_id alone.
+ *   - The task session is isolated by (agent_group_id, series_id). Destination
+ *     routing remains independent and is stamped directly on the task row.
  *
  * Idempotent via series_id: re-running with the same seriesId UPDATEs the
  * existing row's cron + processAfter + content rather than inserting a
@@ -24,6 +24,7 @@ import path from 'path';
 import Database from 'better-sqlite3';
 
 import { DATA_DIR } from '../config.js';
+import { resolveTaskSession } from '../session-manager.js';
 import { createSession, findSessionByAgentGroupAndMessagingGroup } from './sessions.js';
 import { getDb } from './connection.js';
 import { ensureSchema } from './session-db.js';
@@ -48,9 +49,8 @@ export interface TaskDef {
   script?: string;
   tz?: string;
   /**
-   * REQUIRED. Where the task's chat output lands AND the messaging group
-   * whose session the task is inserted into. The (agent_group_id,
-   * messaging_group_id) pair must already be wired via
+   * REQUIRED. Where the task's chat output lands. The (agent_group_id,
+   * messaging_group_id) destination pair must already be wired via
    * `messaging_group_agents` — scheduleTask refuses unwired pairs to prevent
    * a misconfigured task from silently leaking into a chat the operator
    * didn't authorize for that agent.
@@ -228,8 +228,8 @@ function resolveAndValidateDestination(def: TaskDef): { messagingGroupId: string
 
 export async function scheduleTask(def: TaskDef, _dataDir?: string): Promise<void> {
   const dataDir = _dataDir ?? DATA_DIR;
-  const { messagingGroupId } = resolveAndValidateDestination(def);
-  const session = await resolveActiveSession(def.agentGroupId, messagingGroupId, dataDir);
+  resolveAndValidateDestination(def);
+  const { session } = resolveTaskSession(def.agentGroupId, def.seriesId);
   const inboundDbPath = path.join(dataDir, 'v2-sessions', def.agentGroupId, session.id, 'inbound.db');
 
   const db = new Database(inboundDbPath);

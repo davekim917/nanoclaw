@@ -694,7 +694,7 @@ After cutover is stable. Priority order:
 - [ ] Ported
 
 ### 5.4 Daily Digests
-**v2 target:** Implement as a scheduled task via v2's `schedule_task` MCP tool. The agent creates its own recurring task that generates the digest.
+**v2 target:** Implement as a scheduled task via `ncl tasks create`. The agent creates its own recurring task that generates the digest.
 - [ ] Ported
 
 ### 5.5 Effort Level Switching
@@ -733,7 +733,7 @@ After cutover is stable. Priority order:
 
 ### 5.12 Plugin Updater Cron (NEW — added in fourth-pass audit)
 **v1 source:** `~/nanoclaw/src/plugin-updater.ts` + `PLUGIN_UPDATE_NOTIFY_JID` env
-**v2 target:** Agent creates recurring task via `schedule_task` MCP tool that runs `git pull` across plugin repos and messages destination on updates. Distinct from 5.6 plugin discovery.
+**v2 target:** Agent creates recurring task via `ncl tasks create` that runs `git pull` across plugin repos and messages destination on updates. Distinct from 5.6 plugin discovery.
 - [ ] Ported
 
 ### 5.13 Multi-Workspace Slack (NEW — added in fourth-pass audit)

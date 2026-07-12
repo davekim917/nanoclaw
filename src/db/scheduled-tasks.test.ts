@@ -3,16 +3,22 @@
  *
  * TDD: these tests were written before the implementation.
  * Uses temp-file SQLite DBs. Session resolution is tested via the actual
- * `findSessionByAgentGroup` query on an in-memory central DB.
+ * the per-series system-session query on an in-memory central DB.
  */
 import fs from 'fs';
 import path from 'path';
-import { describe, it, expect, afterEach, beforeEach } from 'vitest';
+import { describe, it, expect, afterEach, beforeEach, vi } from 'vitest';
+
+vi.mock('../config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../config.js')>()),
+  DATA_DIR: '/tmp/nanoclaw-scheduled-tasks-test',
+}));
 
 import { initTestDb, closeDb, getDb } from './connection.js';
 import { ensureSchema, openInboundDb } from './session-db.js';
 import { scheduleTask, resolveActiveSession } from './scheduled-tasks.js';
 import { migration024 } from './migrations/024-sessions-channel-root-unique.js';
+import { taskThreadId } from './sessions.js';
 
 const TEST_DIR = '/tmp/nanoclaw-scheduled-tasks-test';
 const AGENT_GROUP_ID = 'ag-test-c1';
@@ -32,6 +38,16 @@ function agentSessionDir(sessionId = SESSION_ID): string {
 
 function inboundPath(sessionId = SESSION_ID): string {
   return path.join(agentSessionDir(sessionId), 'inbound.db');
+}
+
+function taskInboundPath(seriesId: string): string {
+  const row = getDb()
+    .prepare(
+      "SELECT id FROM sessions WHERE agent_group_id = ? AND messaging_group_id IS NULL AND thread_id = ? AND status = 'active' LIMIT 1",
+    )
+    .get(AGENT_GROUP_ID, taskThreadId(seriesId)) as { id: string } | undefined;
+  if (!row) throw new Error(`missing task session for ${seriesId}`);
+  return inboundPath(row.id);
 }
 
 function setupCentralDb(): void {
@@ -327,7 +343,7 @@ describe('test_scheduletask_omits_script_when_absent', () => {
       TEST_DIR,
     );
 
-    const db = openInboundDb(inboundPath());
+    const db = openInboundDb(taskInboundPath('s-no-script'));
     const row = db.prepare("SELECT content FROM messages_in WHERE series_id = 's-no-script'").get() as {
       content: string;
     };
@@ -359,7 +375,7 @@ describe('test_scheduletask_includes_script_when_present', () => {
       TEST_DIR,
     );
 
-    const db = openInboundDb(inboundPath());
+    const db = openInboundDb(taskInboundPath('s-with-script'));
     const row = db.prepare("SELECT content FROM messages_in WHERE series_id = 's-with-script'").get() as {
       content: string;
     };
@@ -391,7 +407,7 @@ describe('test_scheduleTask_inserts_new', () => {
       TEST_DIR,
     );
 
-    const db = openInboundDb(inboundPath());
+    const db = openInboundDb(taskInboundPath('s1'));
     const rows = db.prepare("SELECT * FROM messages_in WHERE series_id = 's1'").all() as Array<{
       series_id: string;
       kind: string;
@@ -440,7 +456,7 @@ describe('test_scheduleTask_idempotent', () => {
       TEST_DIR,
     );
 
-    const db = openInboundDb(inboundPath());
+    const db = openInboundDb(taskInboundPath('s-idempotent'));
     const rows = db.prepare("SELECT * FROM messages_in WHERE series_id = 's-idempotent'").all() as Array<{
       series_id: string;
       process_after: string;
@@ -475,7 +491,7 @@ describe('test_scheduleTask_does_not_resurrect_completed_row', () => {
       TEST_DIR,
     );
     {
-      const db = openInboundDb(inboundPath());
+      const db = openInboundDb(taskInboundPath('s-completed-history'));
       db.prepare("UPDATE messages_in SET status = 'completed' WHERE series_id = ?").run('s-completed-history');
       db.close();
     }
@@ -494,7 +510,7 @@ describe('test_scheduleTask_does_not_resurrect_completed_row', () => {
       TEST_DIR,
     );
 
-    const db = openInboundDb(inboundPath());
+    const db = openInboundDb(taskInboundPath('s-completed-history'));
     const rows = db
       .prepare('SELECT id, status, process_after FROM messages_in WHERE series_id = ? ORDER BY status')
       .all('s-completed-history') as Array<{ id: string; status: string; process_after: string }>;
@@ -532,7 +548,7 @@ describe('test_scheduleTask_re_enable_after_cancel', () => {
     );
     // Operator runs disable-mnemon — flips the row to cancelled.
     {
-      const db = openInboundDb(inboundPath());
+      const db = openInboundDb(taskInboundPath('s-cancel-reenable'));
       db.prepare("UPDATE messages_in SET status = 'cancelled', recurrence = NULL WHERE series_id = ?").run(
         's-cancel-reenable',
       );
@@ -554,7 +570,7 @@ describe('test_scheduleTask_re_enable_after_cancel', () => {
       TEST_DIR,
     );
 
-    const db = openInboundDb(inboundPath());
+    const db = openInboundDb(taskInboundPath('s-cancel-reenable'));
     const rows = db
       .prepare('SELECT id, status FROM messages_in WHERE series_id = ? ORDER BY status')
       .all('s-cancel-reenable') as Array<{ id: string; status: string }>;
@@ -584,14 +600,13 @@ describe('test_scheduleTask_resolves_session_when_missing', () => {
       TEST_DIR,
     );
 
-    // A session row should now exist in the central DB, scoped to the
-    // wired (agent_group_id, messaging_group_id) pair.
+    // A per-series system session row should now exist in the central DB.
     const centralDb = getDb();
     const sessionRow = centralDb
       .prepare(
-        "SELECT id FROM sessions WHERE agent_group_id = ? AND messaging_group_id = ? AND status = 'active' LIMIT 1",
+        "SELECT id FROM sessions WHERE agent_group_id = ? AND messaging_group_id IS NULL AND thread_id = ? AND status = 'active' LIMIT 1",
       )
-      .get(AGENT_GROUP_ID, MESSAGING_GROUP_ID) as { id: string } | undefined;
+      .get(AGENT_GROUP_ID, taskThreadId('s3')) as { id: string } | undefined;
     expect(sessionRow).toBeDefined();
 
     // The inbound.db in the created session dir should have the task row.

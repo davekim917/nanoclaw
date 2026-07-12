@@ -275,7 +275,6 @@ const UPDATE_CONTAINER_PROMPT = [
   '- `@anthropic-ai/claude-agent-sdk` — the SDK Claude Code uses inside containers. Patch drift here has historically broken MCP tool arg passing (incident 2026-05-20: schedule_task bailed after 0.2.116→0.2.138).',
   '- `@modelcontextprotocol/sdk` — the MCP server library every tool registers against.',
   '- `zod` — peer dep of the SDK; mismatched versions can corrupt schema validation.',
-  '- `cron-parser` — schedule_task uses it for recurrence parsing; regressions land silently.',
   '',
   'Note: `--frozen-lockfile` in container/Dockerfile (line ~300) means rebuilding the image alone WILL NOT pull dep patches — the lockfile must be bumped explicitly first (see Step 4 → Agent-runner dep bumps).',
   '',

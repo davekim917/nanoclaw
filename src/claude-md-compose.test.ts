@@ -92,19 +92,25 @@ describe('composeGroupClaudeMd persona prepend', () => {
   });
 });
 
-describe('composeGroupClaudeMd scheduling instructions (ncl tasks reach-in)', () => {
-  // Red-on-delete guard for the `scheduling`/`cli` exclusion at the
-  // module-fragment loop: the agent is taught `ncl tasks` iff it has ncl.
-  it('imports module-scheduling.md at the default cli_scope', () => {
+describe('composeGroupClaudeMd scheduling instructions through ncl tasks', () => {
+  it('imports module-cli.md with ncl tasks guidance and never imports module-scheduling.md', () => {
     const ag = group('ag-sched', 'sched-group');
     seed(ag);
 
     composeGroupClaudeMd(ag, 'claude');
 
-    expect(importsOf(ag.folder)).toContain('@./.claude-fragments/module-scheduling.md');
+    const imports = importsOf(ag.folder);
+    expect(imports).toContain('@./.claude-fragments/module-cli.md');
+    expect(imports).not.toContain('@./.claude-fragments/module-scheduling.md');
+    expect(
+      fs.readFileSync(
+        path.join(process.cwd(), 'container', 'agent-runner', 'src', 'mcp-tools', 'cli.instructions.md'),
+        'utf-8',
+      ),
+    ).toContain('ncl tasks create');
   });
 
-  it('excludes module-cli.md but KEEPS module-scheduling.md when cli_scope is disabled (fork keeps the scheduling MCP surface)', () => {
+  it('excludes all scheduling guidance when cli_scope is disabled', () => {
     const ag = group('ag-sched-off', 'sched-group-off');
     seed(ag);
     updateContainerConfigScalars(ag.id, { cli_scope: 'disabled' });
@@ -112,9 +118,7 @@ describe('composeGroupClaudeMd scheduling instructions (ncl tasks reach-in)', ()
     composeGroupClaudeMd(ag, 'claude');
 
     const imports = importsOf(ag.folder);
-    // Fork: scheduling instructions describe the schedule_task/... MCP tools,
-    // which exist regardless of ncl access — only the ncl fragment goes.
-    expect(imports).toContain('@./.claude-fragments/module-scheduling.md');
     expect(imports).not.toContain('@./.claude-fragments/module-cli.md');
+    expect(imports).not.toContain('@./.claude-fragments/module-scheduling.md');
   });
 });

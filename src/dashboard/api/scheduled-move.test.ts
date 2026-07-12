@@ -11,18 +11,24 @@ import os from 'os';
 import path from 'path';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
+vi.mock('../../config.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../config.js')>()),
+  DATA_DIR: '/tmp/nanoclaw-scheduled-move-test',
+  GROUPS_DIR: '/tmp/nanoclaw-scheduled-move-test/groups',
+}));
+
 import { initTestDb, closeDb, getDb } from '../../db/connection.js';
 import { ensureSchema, openInboundDb } from '../../db/session-db.js';
+import { taskThreadId } from '../../db/sessions.js';
 import { migration043 } from '../../db/migrations/043-scheduled-audit.js';
 import { encodeKey, invalidateScheduledCache, _resetScheduledRateLimitForTesting } from './scheduled-shared.js';
 import { movePreviewHandler, moveExecuteHandler, _setMoveTestOptions } from './scheduled-move.js';
 import { computeSecretDelta, isCrossWorkgroup } from './scheduled-move.js';
 import type { AuthedRequestContext } from '../router.js';
 
-// Unique per-file temp root (mkdtempSync) so parallel vitest workers never
-// share a fixed path and clobber each other's rmSync. beforeEach still
-// wipes/recreates this dir for per-test isolation.
-const TEST_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-scheduled-move-test-'));
+// Config is mocked to this test-only root because resolveTaskSession owns task
+// session folder creation and uses DATA_DIR directly.
+const TEST_DIR = path.join(os.tmpdir(), 'nanoclaw-scheduled-move-test');
 const NOW = Date.parse('2026-06-13T12:00:00Z');
 
 function isoIn(ms: number): string {
@@ -87,12 +93,12 @@ function wire(mgId: string, agId: string): void {
     )
     .run(`mga-${mgId}-${agId}`, mgId, agId);
 }
-function addSession(id: string, agentGroupId: string, mgId: string): void {
+function addTaskSession(id: string, agentGroupId: string, seriesId = 'ser-1'): void {
   getDb()
     .prepare(
-      "INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, status, container_status, created_at) VALUES (?, ?, ?, NULL, 'active', 'stopped', datetime('now'))",
+      "INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, status, container_status, created_at) VALUES (?, ?, NULL, ?, 'active', 'stopped', datetime('now'))",
     )
-    .run(id, agentGroupId, mgId);
+    .run(id, agentGroupId, taskThreadId(seriesId));
 }
 function addUser(id: string): void {
   getDb().prepare("INSERT INTO users (id, kind, created_at) VALUES (?, 'phone', datetime('now'))").run(id);
@@ -199,7 +205,7 @@ function seedMoveFixture(opts?: { sourceStatus?: string; sourceProcessAfter?: st
   addMg('tgt-mg', 'discord', 'tgt:1', 'tgt-chan');
   wire('src-mg', 'src-ag');
   wire('tgt-mg', 'tgt-ag'); // target wired by default
-  addSession('src-sess', 'src-ag', 'src-mg');
+  addTaskSession('src-sess', 'src-ag');
   setGroupSecrets('src-folder', ['Anthropic']); // effective source = wg ∪ group = {Anthropic, Linear}
   setGroupSecrets('tgt-folder', ['Datafold-Prod']); // effective target = {Anthropic, Linear, Datafold-Prod}
   const { inbound } = seedSession('src-ag', 'src-sess');
@@ -337,13 +343,13 @@ function liveRowsForSeries(
   return rows;
 }
 
-/** Target session id for (tgt-ag, tgt-mg) — scheduleTask creates a channel-root session. */
+/** Target session id for (tgt-ag, ser-1) — scheduleTask creates a per-series system session. */
 function targetSessionId(): string | null {
   const row = getDb()
     .prepare(
-      "SELECT id FROM sessions WHERE agent_group_id = 'tgt-ag' AND messaging_group_id = 'tgt-mg' AND status='active' LIMIT 1",
+      "SELECT id FROM sessions WHERE agent_group_id = 'tgt-ag' AND messaging_group_id IS NULL AND thread_id = ? AND status='active' LIMIT 1",
     )
-    .get() as { id: string } | undefined;
+    .get(taskThreadId('ser-1')) as { id: string } | undefined;
   return row?.id ?? null;
 }
 
@@ -370,6 +376,37 @@ describe('moveExecuteHandler', () => {
     const tgtLive = liveRowsForSeries('tgt-ag', tgtSess!, 'ser-1');
     expect(tgtLive).toHaveLength(1);
     expect(tgtLive[0].recurrence).toBe('0 9 * * *');
+  });
+
+  it('same-agent paused move reuses one system session without double-counting or breaking staged restore', async () => {
+    const { key } = seedMoveFixture({ sourceStatus: 'paused', sourceProcessAfter: isoIn(-48 * 3600_000) });
+    wire('tgt-mg', 'src-ag');
+    const confirmedDeltaHash = computeSecretDelta(
+      'src-ag',
+      'src-folder',
+      'src-ag',
+      'src-folder',
+      'tgt-mg',
+      path.join(TEST_DIR, 'groups'),
+    ).deltaHash;
+
+    const res = (await moveExecuteHandler(
+      req({ targetAgentGroupId: 'src-ag', targetMessagingGroupId: 'tgt-mg', confirmedDeltaHash }),
+      { key },
+      ctxFor('owner', OWNER_SCOPES),
+    ))!;
+
+    expect(res.status).toBe(200);
+    expect((await readJson(res)).moved).toBe(true);
+    const live = liveRowsForSeries('src-ag', 'src-sess', 'ser-1');
+    expect(live).toHaveLength(1);
+    expect(live[0]).toMatchObject({ status: 'paused', process_after: isoIn(-48 * 3600_000) });
+    const db = openInboundDb(path.join(TEST_DIR, 'v2-sessions', 'src-ag', 'src-sess', 'inbound.db'));
+    const routing = db
+      .prepare("SELECT platform_id, channel_type FROM messages_in WHERE series_id = 'ser-1' AND status = 'paused'")
+      .get() as { platform_id: string; channel_type: string };
+    db.close();
+    expect(routing).toEqual({ platform_id: 'tgt:1', channel_type: 'discord' });
   });
 
   it('test_move_paused_stages_insert_never_due_pending', async () => {
@@ -508,11 +545,11 @@ describe('moveExecuteHandler', () => {
   it('test_move_intent_stores_target_locator', async () => {
     // Force a path where the intent is written then left unresolved so its body
     // survives: a post-move invariant violation (E-2) leaves the intent. We get
-    // there by pre-seeding TWO live ser-1 rows in the target channel-root session
+    // there by pre-seeding TWO live ser-1 rows in the target system session
     // — scheduleTask's idempotent UPDATE only touches one, so both stay live and
     // the post-move {source,target} count becomes 2 (invariant violated).
     const { key } = seedMoveFixture({ sourceProcessAfter: isoIn(10 * 3600_000) });
-    addSession('tgt-sess', 'tgt-ag', 'tgt-mg');
+    addTaskSession('tgt-sess', 'tgt-ag');
     const tgtInbound = seedSession('tgt-ag', 'tgt-sess').inbound;
     insertRow(tgtInbound, { id: 'stray-a', series_id: 'ser-1', status: 'pending' });
     insertRow(tgtInbound, { id: 'stray-b', series_id: 'ser-1', status: 'pending' });
@@ -534,7 +571,7 @@ describe('moveExecuteHandler', () => {
     const { key } = seedMoveFixture({ sourceProcessAfter: isoIn(10 * 3600_000) });
     // Two pre-existing live ser-1 rows in the target session → after the move's
     // idempotent UPDATE, both remain → post-move count == 2.
-    addSession('tgt-sess', 'tgt-ag', 'tgt-mg');
+    addTaskSession('tgt-sess', 'tgt-ag');
     const tgtInbound = seedSession('tgt-ag', 'tgt-sess').inbound;
     insertRow(tgtInbound, { id: 'stray-a', series_id: 'ser-1', status: 'pending' });
     insertRow(tgtInbound, { id: 'stray-b', series_id: 'ser-1', status: 'pending' });
@@ -565,9 +602,9 @@ describe('moveExecuteHandler', () => {
     // the {source,target} count would read. Simpler + deterministic: unwire +
     // corrupt the target's would-be session dir so the count read throws.
     getDb().prepare("DELETE FROM messaging_group_agents WHERE agent_group_id = 'tgt-ag'").run();
-    // Pre-create the target channel-root session pointer + a CORRUPT inbound.db so
+    // Pre-create the target system-session pointer + a CORRUPT inbound.db so
     // the post-cancel compensation count read throws → unreadable.
-    addSession('tgt-sess', 'tgt-ag', 'tgt-mg');
+    addTaskSession('tgt-sess', 'tgt-ag');
     const tgtDir = path.join(TEST_DIR, 'v2-sessions', 'tgt-ag', 'tgt-sess');
     fs.mkdirSync(tgtDir, { recursive: true });
     fs.writeFileSync(path.join(tgtDir, 'inbound.db'), 'this is not sqlite');

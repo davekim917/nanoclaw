@@ -7,7 +7,6 @@
  */
 import { loadConfig } from '../config.js';
 import './core.js';
-import './scheduling.js';
 import './interactive.js';
 import './agents.js';
 import './self-mod.js';
