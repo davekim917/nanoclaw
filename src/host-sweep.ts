@@ -32,8 +32,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { ensureEgressNetwork } from './egress-lockdown.js';
-import { getActiveSessions } from './db/sessions.js';
-import { getSession } from './db/sessions.js';
+import { getActiveSessions, getSession, isTaskThread, updateSession } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import {
   countDueMessages,
@@ -247,6 +246,18 @@ async function sweep(): Promise<void> {
     }
   }
 
+  // Finalize any "Reject with reason…" holds whose reply window elapsed (admin
+  // ghosted, or the host restarted mid-capture). Central-DB scan, once per tick
+  // — not per session.
+  // MODULE-HOOK:approvals-reason-sweep:start
+  try {
+    const { sweepAwaitingReasonRejects } = await import('./modules/approvals/index.js');
+    await sweepAwaitingReasonRejects();
+  } catch (err) {
+    log.error('Reject-with-reason sweep failed', { err });
+  }
+  // MODULE-HOOK:approvals-reason-sweep:end
+
   // MODULE-HOOK:orchestrator-dispatch:reconciler — complete admitted-but-incomplete tasks.
   // Runs after per-session sweeps so container state is current.
   runReconcilerSweep();
@@ -295,7 +306,17 @@ async function sweep(): Promise<void> {
   // their deadline, spawn window, no-progress timeout, or whose child container exited.
   await sweepTaskWatchdog();
 
+
   setTimeout(sweep, SWEEP_INTERVAL_MS);
+}
+
+/** A per-task session with no live tasks and no running container is spent → close it. */
+export function shouldCloseTaskSession(
+  threadId: string | null,
+  containerRunning: boolean,
+  liveTaskCount: number,
+): boolean {
+  return isTaskThread(threadId) && !containerRunning && liveTaskCount === 0;
 }
 
 // ─── Scheduled-move recovery + audit-body prune (D3 / D4) ─────────────────────
@@ -627,6 +648,24 @@ async function sweepSession(session: Session): Promise<void> {
     const { handleRecurrence } = await import('./modules/scheduling/recurrence.js');
     await handleRecurrence(inDb, session);
     // MODULE-HOOK:scheduling-recurrence:end
+
+    // 6. GC spent task sessions. An isolated per-task session with no live task
+    // rows left (one-shot fired, or all cancelled/deleted) and no container
+    // running is dead — close it so it stops being swept and listed. Runs after
+    // recurrence so a just-fired recurring series has already re-armed its next
+    // pending row and is never collected. The per-task log file in the workspace
+    // is the durable history and survives the close.
+    if (isTaskThread(session.thread_id)) {
+      const liveTasks = (
+        inDb
+          .prepare("SELECT COUNT(*) AS c FROM messages_in WHERE kind = 'task' AND status IN ('pending', 'paused')")
+          .get() as { c: number }
+      ).c;
+      if (shouldCloseTaskSession(session.thread_id, isContainerRunning(session.id), liveTasks)) {
+        updateSession(session.id, { status: 'closed' });
+        log.info('Closed spent task session', { sessionId: session.id, threadId: session.thread_id });
+      }
+    }
   } finally {
     inDb.close();
     outDb?.close();

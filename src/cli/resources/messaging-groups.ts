@@ -1,3 +1,6 @@
+import { resolveUnknownSenderPolicy } from '../../channels/channel-defaults.js';
+import { hasDeclaredChannelDefaults } from '../../channels/channel-registry.js';
+import { log } from '../../log.js';
 import { registerResource } from '../crud.js';
 
 registerResource({
@@ -24,6 +27,14 @@ registerResource({
       required: true,
     },
     {
+      name: 'instance',
+      type: 'string',
+      description:
+        'Adapter instance that owns this chat, when running N adapters of one channel type. Defaults to channel_type (the default instance) when omitted.',
+      defaultFrom: 'channel_type',
+      updatable: true,
+    },
+    {
       name: 'name',
       type: 'string',
       description: 'Display name. Often auto-populated by the channel adapter.',
@@ -40,7 +51,7 @@ registerResource({
       name: 'unknown_sender_policy',
       type: 'string',
       description:
-        'What happens when an unrecognized sender posts. "strict" drops silently. "request_approval" sends an approval card to an admin. "public" allows anyone.',
+        'What happens when an unrecognized sender posts. "strict" drops silently. "request_approval" sends an approval card to an admin. "public" allows anyone. Default: declared by the channel adapter for this context (DM vs group); "strict" when the channel has no declaration.',
       enum: ['strict', 'request_approval', 'public'],
       default: 'strict',
       updatable: true,
@@ -55,4 +66,21 @@ registerResource({
     { name: 'created_at', type: 'string', description: 'Auto-set.', generated: true },
   ],
   operations: { list: 'open', get: 'open', create: 'approval', update: 'approval', delete: 'approval' },
+  resolveDefaults: (values) => {
+    if (values.unknown_sender_policy !== undefined) return;
+    const channelType = String(values.channel_type);
+    const channelKey = (values.instance as string | undefined) ?? channelType;
+    // Static 'strict' stays the no-declaration fallback: a trunk update alone
+    // must not change ncl's creation defaults for stale (undeclared) adapters.
+    if (!hasDeclaredChannelDefaults(channelKey, channelType)) {
+      log.warn(
+        `messaging-group create: channel '${channelKey}' has no declared defaults (adapter not installed or stale) — using legacy static defaults`,
+      );
+      return;
+    }
+    // is_group carries its static default (0) only after this hook runs, so
+    // treat "not provided" as the same DM context the static default means.
+    const isGroup = Number(values.is_group ?? 0) === 1;
+    values.unknown_sender_policy = resolveUnknownSenderPolicy(channelKey, isGroup, channelType);
+  },
 });

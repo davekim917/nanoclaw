@@ -891,3 +891,17 @@ describe('workgroup secrets merge at spawn (C3 contract verification)', () => {
     expect(merged).toEqual(['Datafold-Illysium']);
   });
 });
+
+describe('container boot-failure tripwire (structural)', () => {
+  // A container that dies at boot (unknown provider, missing CLI binary, bad
+  // config) explains itself only on stderr — which logs at debug, below the
+  // default level. The spawn handler must keep a stderr tail and surface it
+  // at warn on a non-zero exit, or the operator sees only "exited code 1" on
+  // repeat. Driving a real failing spawn needs a container runtime, so this
+  // guards the wiring structurally, matching the invariant test above.
+  it('surfaces the stderr tail when the container exits non-zero', () => {
+    const src = fs.readFileSync(path.join(process.cwd(), 'src', 'container-runner.ts'), 'utf-8');
+    expect(src).toContain('stderrTail.push(line)');
+    expect(src).toMatch(/Container exited non-zero.*stderrTail/s);
+  });
+});

@@ -37,10 +37,23 @@ import type { MessagingGroup, PendingApproval, Session } from '../../types.js';
 import { getAdminsOfAgentGroup, getGlobalAdmins, getOwners } from '../permissions/db/user-roles.js';
 import { ensureUserDm } from '../permissions/user-dm.js';
 
-/** Two-button approval UI — the only options the primitive supports today. */
+/**
+ * Card value for the "Reject with reason…" button. Selecting it doesn't
+ * finalize the reject — it holds the row and captures the approver's next DM
+ * as a one-line reason relayed to the requesting agent. See reason-capture.ts.
+ */
+export const REJECT_WITH_REASON_VALUE = 'reject_with_reason';
+
+/**
+ * Three-button approval UI. Plain Reject is the instant fast path; "Reject with
+ * reason…" opts into the reason-capture flow. Shared by every module approval
+ * (create_agent, install_packages, add_mcp_server); OneCLI credential cards
+ * keep their own two-button set in onecli-approvals.ts.
+ */
 const APPROVAL_OPTIONS: RawOption[] = [
   { label: 'Approve', selectedLabel: '✅ Approved', value: 'approve', style: 'primary' },
   { label: 'Reject', selectedLabel: '❌ Rejected', value: 'reject', style: 'danger' },
+  { label: 'Reject with reason…', selectedLabel: '📝 Rejected (awaiting reason)', value: REJECT_WITH_REASON_VALUE },
 ];
 
 // ── Approval handler registry ──
@@ -239,6 +252,8 @@ export interface RequestApprovalOptions {
    *   approval authority for this target.
    */
   deliveryTarget?: 'thread' | 'admin';
+  /** Deliver the card to this specific user instead of all of the session group's admins. */
+  approverUserId?: string;
 }
 
 /**
@@ -248,7 +263,7 @@ export interface RequestApprovalOptions {
  * approval handler for this action via the response dispatcher.
  */
 export async function requestApproval(opts: RequestApprovalOptions): Promise<boolean> {
-  const { session, action, payload, title, question, agentName, deliveryTarget = 'admin' } = opts;
+  const { session, action, payload, title, question, agentName, deliveryTarget = 'admin', approverUserId } = opts;
 
   // Resolve delivery destination based on target policy.
   // thread: originating messaging_group + session's thread_id.
@@ -271,7 +286,9 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<boo
       label: `thread ${mg.channel_type}/${mg.platform_id}${session.thread_id ? ':' + session.thread_id : ''}`,
     };
   } else {
-    const approvers = pickApprover(session.agent_group_id);
+    // A named approver (e.g. an a2a policy's designated user) narrows the set
+    // to exactly that user; otherwise fall back to the group's approver chain.
+    const approvers = approverUserId ? [approverUserId] : pickApprover(session.agent_group_id);
     if (approvers.length === 0) {
       await notifyAgent(session, `${action} failed: no owner or admin configured to approve.`);
       return false;
@@ -311,6 +328,7 @@ export async function requestApproval(opts: RequestApprovalOptions): Promise<boo
     channel_type: destination.channelType,
     platform_id: destination.platformId,
     thread_id: destination.threadId,
+    approver_user_id: approverUserId ?? null,
   });
 
   const adapter = getDeliveryAdapter();

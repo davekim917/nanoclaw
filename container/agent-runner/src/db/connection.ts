@@ -288,14 +288,6 @@ export function closeSessionDb(): void {
   _outbound = null;
 }
 
-/**
- * @deprecated Use getInboundDb() / getOutboundDb() instead.
- * Kept for backward compatibility during migration.
- */
-export function getSessionDb(): Database {
-  return getInboundDb();
-}
-
 /** Central DB — read-only from the container. Mounted at /workspace/central.db. */
 let _central: Database | null = null;
 const CENTRAL_DB_PATH = '/workspace/central.db';

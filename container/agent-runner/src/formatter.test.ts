@@ -15,7 +15,7 @@ import { initTestSessionDb, closeSessionDb, getInboundDb } from './db/connection
 import { getPendingMessages } from './db/messages-in.js';
 import { formatMessages, stripInternalTags, categorizeMessage, hasFlagIntent, isClearCommand } from './formatter.js';
 import type { MessageInRow } from './db/messages-in.js';
-import { TIMEZONE } from './timezone.js';
+import { TIMEZONE, formatLocalTime } from './timezone.js';
 
 // seq is NULL-allowed in the schema; assign monotonically per test so
 // `getPendingMessages` ORDER BY seq is deterministic.
@@ -114,6 +114,14 @@ describe('timestamp formatting', () => {
     insertMessage('m1', 'chat', { sender: 'Alice', text: 'hi' }, { timestamp: '2026-06-15T15:30:00.000Z' });
     const result = formatMessages(getPendingMessages());
     expect(result).toMatch(/(AM|PM)/);
+  });
+});
+
+describe('task timestamps', () => {
+  it('renders task time in the user TZ, same as chat rows', () => {
+    insertMessage('t1', 'task', { prompt: 'do the thing' }, { timestamp: '2026-01-05T12:00:00.000Z' });
+    const result = formatMessages(getPendingMessages());
+    expect(result).toContain(`time="${formatLocalTime('2026-01-05T12:00:00.000Z', TIMEZONE)}"`);
   });
 });
 

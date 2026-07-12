@@ -1,24 +1,16 @@
 /**
- * Per-batch context the poll loop publishes for downstream consumers
- * (MCP tools, etc.) that don't sit on the poll-loop's call stack.
+ * Per-batch, per-destination reply anchors, used ONLY inside the poll-loop
+ * process (module state is fine there — the poll loop is single-process and
+ * handles one batch at a time, and every reader runs on its call stack).
  *
- * Today the only field is `inReplyTo` — the id of the first inbound
- * message in the batch the agent is currently processing. MCP tools like
- * `send_message` and `send_file` read this and stamp it onto the outbound
- * row so the host's a2a return-path routing can correlate replies back to
- * the originating session.
+ * The batch-level a2a reply stamp that used to live here moved to
+ * outbound.db session_state (`setCurrentInReplyTo` / `getCurrentInReplyTo`
+ * in db/session-state.ts): the nanoclaw MCP server can run as a separate
+ * stdio subprocess from the poll loop, so module state set here was
+ * invisible to it.
  *
- * This is module-level state on purpose: the agent-runner is single-process
- * and processes one batch at a time. Poll-loop calls `setCurrentInReplyTo`
- * before invoking the provider and `clearCurrentInReplyTo` after the batch
- * completes (or errors out).
- */
-let currentInReplyTo: string | null = null;
-
-/**
- * Per-destination reply anchors for the batch being processed, keyed by
- * `<channelType>\0<platformId>`. In agent-shared sessions one batch can
- * carry messages from several channels; a reply sent to channel X must
+ * Keyed by `<channelType>\0<platformId>`. In agent-shared sessions one batch
+ * can carry messages from several channels; a reply sent to channel X must
  * anchor to X's inbound message, not the batch's first message.
  *
  * Derived ONLY from the claimed batch — never resolved from the newest
@@ -49,16 +41,6 @@ export function getBatchAnchor(channelType: string, platformId: string): string 
   return batchAnchors.get(anchorKey(channelType, platformId)) ?? null;
 }
 
-export function setCurrentInReplyTo(id: string | null): void {
-  currentInReplyTo = id;
-}
-
-export function clearCurrentInReplyTo(): void {
-  currentInReplyTo = null;
+export function clearBatchAnchors(): void {
   batchAnchors.clear();
 }
-
-export function getCurrentInReplyTo(): string | null {
-  return currentInReplyTo;
-}
-

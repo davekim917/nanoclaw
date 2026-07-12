@@ -11,8 +11,7 @@
  *
  * Runs on every spawn from `container-runner.buildMounts()`. Deterministic —
  * same inputs produce the same CLAUDE.md, and stale fragments are pruned.
- *
- * See `docs/claude-md-composition.md` for the full design.
+ * The composition order and fragment sources are documented inline above.
  */
 import fs from 'fs';
 import os from 'os';
@@ -25,8 +24,13 @@ import { buildSessionServicesSnapshot, renderSessionCapabilities } from './capab
 import { flattenClaudeMd } from './agents-md-flatten.js';
 import { capCodexProjectDoc } from './codex-project-doc-cap.js';
 import { rewriteCodexRtkGuidance } from './codex-rtk-guidance.js';
+import { readGroupPersona } from './group-persona.js';
 import { log } from './log.js';
 import type { AgentGroup } from './types.js';
+
+// Fragment holding a template's persona prepend. Imported FIRST (before the
+// shared base) so the persona is the top of the composed system prompt.
+const PERSONA_FRAGMENT = 'persona.md';
 
 // Symlink targets are container paths — dangling on host (hence the readlink
 // dance instead of existsSync), valid inside the container via RO mounts.
@@ -87,10 +91,12 @@ export function composeGroupClaudeMd(group: AgentGroup, provider: string): void 
     }
   }
 
-  // Built-in module fragments — every MCP tool source file that ships a
+  // Built-in module fragments — every MCP/CLI module that ships a
   // sibling `<name>.instructions.md`. These describe how the agent should
   // use that module's MCP tools (schedule_task, install_packages, etc.).
-  // Skip cli.instructions.md when cli_scope is disabled.
+  // Skip cli.instructions.md when cli_scope is disabled. (This fork keeps
+  // the scheduling MCP surface, so scheduling.instructions.md stays valid
+  // even without ncl.)
   // Skip memory-recall.instructions.md when memory is disabled — the
   // recall_memory tool only registers when MNEMON_STORE is set (memory
   // enabled), so the fragment would describe a tool the agent doesn't have.
@@ -179,6 +185,13 @@ export function composeGroupClaudeMd(group: AgentGroup, provider: string): void 
     }
   }
 
+  // Template persona (if any) — inline so it survives the prune below; imported
+  // first (see the imports assembly) so it prepends the composed system prompt.
+  const persona = readGroupPersona(groupDir);
+  if (persona) {
+    desired.set(PERSONA_FRAGMENT, { type: 'inline', content: persona });
+  }
+
   // Reconcile: drop stale, write desired.
   for (const existing of fs.readdirSync(fragmentsDir)) {
     if (!desired.has(existing)) {
@@ -194,9 +207,14 @@ export function composeGroupClaudeMd(group: AgentGroup, provider: string): void 
     }
   }
 
-  // Composed entry — imports only.
-  const imports = ['@./.claude-shared.md'];
-  for (const name of [...desired.keys()].sort()) {
+  // Composed entry — imports only. Persona first (top of the system prompt),
+  // then the shared base, then the remaining fragments sorted.
+  const imports: string[] = [];
+  if (desired.has(PERSONA_FRAGMENT)) {
+    imports.push(`@./.claude-fragments/${PERSONA_FRAGMENT}`);
+  }
+  imports.push('@./.claude-shared.md');
+  for (const name of [...desired.keys()].filter((n) => n !== PERSONA_FRAGMENT).sort()) {
     imports.push(`@./.claude-fragments/${name}`);
   }
   const body = [COMPOSED_HEADER, ...imports, ''].join('\n');

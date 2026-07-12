@@ -1,3 +1,4 @@
+import { randomUUID } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
@@ -5,7 +6,7 @@ import { GROUPS_DIR } from '../../config.js';
 import { type McpServerConfig, updateContainerConfig } from '../../container-config.js';
 import { buildAgentGroupImage, killContainer, wakeContainer } from '../../container-runner.js';
 import { restartAgentGroupContainers } from '../../container-restart.js';
-import { getAgentGroup, getAgentGroupByFolder } from '../../db/agent-groups.js';
+import { createAgentGroup, getAgentGroup, getAgentGroupByFolder } from '../../db/agent-groups.js';
 import { getDb, hasTable } from '../../db/connection.js';
 import { getSession } from '../../db/sessions.js';
 import { writeSessionMessage } from '../../session-manager.js';
@@ -16,8 +17,10 @@ import {
 } from '../../db/container-configs.js';
 import { getDeniedModel } from '../../db/denied-models.js';
 import { assertValidGroupFolder } from '../../group-folder.js';
+import { initGroupFilesystem } from '../../group-init.js';
 import { SIBLING_BOUND_FIELDS } from '../../sibling-parity.js';
-import type { ContainerConfigRow } from '../../types.js';
+import { createAgentFromTemplate } from '../../templates/create-agent.js';
+import type { AgentGroup, ContainerConfigRow } from '../../types.js';
 import { registerResource } from '../crud.js';
 
 /** Deserialize JSON columns for display. */
@@ -66,11 +69,46 @@ registerResource({
     },
     { name: 'created_at', type: 'string', description: 'Auto-set.', generated: true },
   ],
-  // `delete` is intentionally not in `operations` — the generic single-table
-  // DELETE violates FK constraints (see #2525). The cascading handler is
-  // provided as `customOperations.delete` below.
-  operations: { list: 'open', get: 'open', create: 'approval', update: 'approval' },
+  // `create` and `delete` are intentionally not in `operations` — create needs
+  // a `--template` branch (below); the generic single-table DELETE violates FK
+  // constraints (see #2525). Both are provided as `customOperations`.
+  operations: { list: 'open', get: 'open', update: 'approval' },
   customOperations: {
+    create: {
+      access: 'approval',
+      description:
+        'Create an agent group. With --template <ref>, stamp from a local template under templates/ ' +
+        '(MCP servers + instructions + skills); else insert a bare row (--name, --folder).',
+      handler: async (args) => {
+        if (args.template) {
+          return createAgentFromTemplate(String(args.template), {
+            name: args.name ? String(args.name) : undefined,
+          });
+        }
+        const name = args.name ? String(args.name) : '';
+        const folder = args.folder ? String(args.folder) : '';
+        if (!name) throw new Error('--name is required');
+        if (!folder) throw new Error('--folder is required');
+        const group: AgentGroup = {
+          id: randomUUID(),
+          name,
+          folder,
+          agent_provider: null,
+          created_at: new Date().toISOString(),
+        };
+        createAgentGroup(group);
+        // Provision the workspace folder and the `container_configs` row that
+        // `getContainerConfig` and the spawn path require. Without this, a
+        // group created via `ncl groups create` would throw "Container config
+        // not found" on first spawn and stay broken until the host restart
+        // backfill ran (#2415). The template branch above provisions its own
+        // config + folder in `createAgentFromTemplate`; this covers the bare
+        // path. Mirrors what `setup/register.ts` does after creating an agent
+        // group via the setup flow.
+        initGroupFilesystem(group);
+        return group;
+      },
+    },
     delete: {
       access: 'approval',
       description:

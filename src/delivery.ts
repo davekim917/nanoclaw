@@ -486,6 +486,7 @@ async function deliverMessage(
   }
 
   // System actions — handle internally (schedule_task, cancel_task, etc.)
+
   if (msg.kind === 'system') {
     const result = await handleSystemAction(content, session, inDb);
     if (result && result.deferAck) return { deferAck: true };

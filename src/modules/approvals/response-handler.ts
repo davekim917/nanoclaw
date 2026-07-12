@@ -5,7 +5,10 @@
  *   1. Module-initiated actions — the module called `requestApproval()` with
  *      some free-form `action` string and registered a handler via
  *      `registerApprovalHandler(action, handler)`. On approve, we look up the
- *      handler and call it; on reject, we notify the agent and move on.
+ *      handler and call it; on plain reject we relay a decline to the agent; on
+ *      "Reject with reason…" we hold the row and capture the admin's next DM as
+ *      a one-line reason (see reason-capture.ts). Reject finalization is shared
+ *      via finalizeReject.
  *   2. OneCLI credential approvals (`action = 'onecli_credential'`). Resolved
  *      via an in-memory Promise — see onecli-approvals.ts.
  *
@@ -20,8 +23,10 @@ import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import type { PendingApproval, Session } from '../../types.js';
 import { hasAdminPrivilege, isGlobalAdmin, isOwner } from '../permissions/db/user-roles.js';
+import { finalizeReject } from './finalize.js';
 import { ONECLI_ACTION, resolveOneCLIApproval } from './onecli-approvals.js';
-import { getApprovalHandler, pickApprover, notifyApprovalResolved } from './primitive.js';
+import { getApprovalHandler, notifyApprovalResolved, REJECT_WITH_REASON_VALUE } from './primitive.js';
+import { armReasonCapture } from './reason-capture.js';
 
 /**
  * Detect whether this approval was delivered into the session's own thread/
@@ -29,7 +34,7 @@ import { getApprovalHandler, pickApprover, notifyApprovalResolved } from './prim
  * Compares the approval row's stored destination against the session's
  * messaging group. Thread-target cards live in the originating chat, where
  * thread access IS the approval authority — see primitive.ts. Admin-target
- * cards require clicker-identity verification against pickApprover.
+ * cards require clicker-identity verification (isAuthorizedApprovalClick).
  */
 function isThreadDelivery(approval: PendingApproval, session: Session): boolean {
   if (!session.messaging_group_id) return false;
@@ -87,8 +92,23 @@ async function handleRegisteredApproval(
     return;
   }
 
-  const notify = async (text: string): Promise<void> => {
-    await writeSessionMessage(session.agent_group_id, session.id, {
+  // "Reject with reason…" — hold the row and capture the admin's next DM
+  // instead of finalizing now. The agent is notified exactly once: after the
+  // reason arrives, or after the sweep's timeout if the admin ghosts.
+  if (selectedOption === REJECT_WITH_REASON_VALUE) {
+    await armReasonCapture(approval, session, userId);
+    return;
+  }
+
+  // Plain Reject (or any other non-approve value) — instant fast path.
+  if (selectedOption !== 'approve') {
+    await finalizeReject(approval, session, userId);
+    return;
+  }
+
+  // Approved — dispatch to the module that registered for this action.
+  const notify = (text: string): void => {
+    writeSessionMessage(session.agent_group_id, session.id, {
       id: `appr-note-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       kind: 'chat',
       timestamp: new Date().toISOString(),
@@ -99,38 +119,6 @@ async function handleRegisteredApproval(
     });
   };
 
-  // SECURITY (cross-tenant audit 2026-05-03): for admin-target cards, verify
-  // the clicker is in pickApprover's set. The card is DM'd to a specific
-  // admin so practically only they see it, but defense-in-depth: reject any
-  // click from outside the approver set (handles DM cache poisoning,
-  // unintended forwards, multi-admin compromise where one admin's session
-  // is stolen). For thread-target cards, thread access IS the approval
-  // authority — see primitive.ts comment block.
-  if (!isThreadDelivery(approval, session)) {
-    const approvers = pickApprover(session.agent_group_id);
-    if (userId && !approvers.includes(userId)) {
-      log.warn('Approval click rejected: clicker not in approver set', {
-        approvalId: approval.approval_id,
-        action: approval.action,
-        userId,
-        approvers,
-      });
-      await notify(`Your ${approval.action} click was rejected — clicker is not an authorized approver.`);
-      // Don't delete the row; let it expire or another approver retry.
-      return;
-    }
-  }
-
-  if (selectedOption !== 'approve') {
-    await notify(`Your ${approval.action} request was rejected by admin.`);
-    log.info('Approval rejected', { approvalId: approval.approval_id, action: approval.action, userId });
-    deletePendingApproval(approval.approval_id);
-    await notifyApprovalResolved({ approval, session, outcome: 'reject', userId });
-    await wakeContainer(session);
-    return;
-  }
-
-  // Approved — dispatch to the module that registered for this action.
   const handler = getApprovalHandler(approval.action);
   if (!handler) {
     log.warn('No approval handler registered — row dropped', {
@@ -168,6 +156,19 @@ function namespacedUserId(payload: ResponsePayload): string | null {
 function isAuthorizedApprovalClick(approval: PendingApproval, payload: ResponsePayload): boolean {
   const userId = namespacedUserId(payload);
   if (!userId) return false;
+
+  // An approval may name a specific approver; only that exact user may resolve it.
+  if (approval.approver_user_id) {
+    return userId === approval.approver_user_id;
+  }
+
+  // Thread-delivered cards (deliveryTarget='thread', e.g. bash/email gates)
+  // post into the originating conversation, where thread access IS the
+  // approval authority — any thread member may resolve. See primitive.ts.
+  if (approval.session_id) {
+    const session = getSession(approval.session_id);
+    if (session && isThreadDelivery(approval, session)) return true;
+  }
 
   const agentGroupId =
     approval.agent_group_id ?? (approval.session_id ? getSession(approval.session_id)?.agent_group_id : null);

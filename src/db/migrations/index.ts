@@ -6,6 +6,10 @@ import { migration002 } from './002-chat-sdk-state.js';
 import { moduleApprovalsPendingApprovals } from './module-approvals-pending-approvals.js';
 import { moduleAgentToAgentDestinations } from './module-agent-to-agent-destinations.js';
 import { moduleApprovalsTitleOptions } from './module-approvals-title-options.js';
+// Upstream's 017/018 — file numbers clash with local 017/018 (uniqueness is by
+// `name`); aliased to dodge the JS identifier collisions.
+import { migration017 as agentMessagePolicies } from './017-agent-message-policies.js';
+import { migration018 as approvalsApproverUserId } from './018-approvals-approver-user-id.js';
 import { migration008 } from './008-dropped-messages.js';
 import { migration009 } from './009-drop-pending-credentials.js';
 // Upstream v2 migrations (012/011/010 on disk = 12/11/10 in code):
@@ -50,6 +54,7 @@ import { migration015 as cliScope } from './015-cli-scope.js';
 // local 016-channel-tone above; aliased (uniqueness is by `name`). Idempotent
 // recreate that backfills instance = channel_type; safe on existing DBs.
 import { migration016 as messagingGroupInstance } from './016-messaging-group-instance.js';
+import { migration019 } from './019-wiring-threads.js';
 
 export interface Migration {
   version: number;
@@ -71,7 +76,9 @@ export const migrations: Migration[] = [
   migration002,
   moduleApprovalsPendingApprovals,
   moduleAgentToAgentDestinations,
+  agentMessagePolicies,
   moduleApprovalsTitleOptions,
+  approvalsApproverUserId,
   migration008,
   migration009,
   migration010,
@@ -106,6 +113,7 @@ export const migrations: Migration[] = [
   containerConfigs,
   cliScope,
   messagingGroupInstance,
+  migration019,
 ];
 
 /** Row shape of PRAGMA foreign_key_check. Child rowids are stable across a

@@ -63,6 +63,9 @@ CREATE TABLE messaging_group_agents (
   default_model          TEXT,
   default_effort         TEXT,
   default_tone           TEXT,          -- migration 016: per-channel tone profile name
+  threads                INTEGER, -- NULL = inherit the channel adapter's declared
+                                  -- thread default; 1/0 = per-wiring override
+                                  -- (migration 019)
   created_at             TEXT NOT NULL,
   UNIQUE(messaging_group_id, agent_group_id)
 );

@@ -13,6 +13,7 @@ import {
 } from '@anthropic-ai/claude-agent-sdk';
 
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/connection.js';
+import { TIMEZONE, formatLocalStamp } from '../timezone.js';
 import { registerProvider, registerProviderConfigSchema } from './provider-registry.js';
 import { buildSecretEnvVarList, MCP_HEADER_ONLY_SECRET_VARS } from './secret-env.js';
 import type { AgentProvider, AgentQuery, McpServerConfig, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
@@ -106,7 +107,7 @@ export function deriveProgressLabels(message: unknown): string[] {
 // Code's interactive UI and would hang here).
 //
 // - CronCreate / CronDelete / CronList / ScheduleWakeup: we have durable
-//   scheduling via mcp__nanoclaw__schedule_task.
+//   scheduling via `ncl tasks`.
 // - AskUserQuestion: SDK returns a placeholder instead of blocking on a
 //   real answer — we have mcp__nanoclaw__ask_user_question that persists
 //   the question and blocks on the real reply.
@@ -299,7 +300,9 @@ function archiveTranscriptFile(transcriptPath: string | undefined, sessionId: st
 
     const conversationsDir = process.env.NANOCLAW_CONVERSATIONS_DIR || '/workspace/agent/conversations';
     fs.mkdirSync(conversationsDir, { recursive: true });
-    const filename = `${new Date().toISOString().split('T')[0]}-${name}.md`;
+    // Local calendar date — the fallback `name` above already uses local
+    // hours, and the agent navigates conversations/ by these date prefixes.
+    const filename = `${formatLocalStamp(new Date(), TIMEZONE).slice(0, 10)}-${name}.md`;
     fs.writeFileSync(path.join(conversationsDir, filename), formatTranscriptMarkdown(messages, summary, assistantName));
     log(`Archived conversation to ${filename}`);
     return true;
@@ -1701,7 +1704,15 @@ export class ClaudeProvider implements AgentProvider {
         if (message.type === 'system' && message.subtype === 'init') {
           yield { type: 'init', continuation: message.session_id };
         } else if (message.type === 'result') {
-          const text = 'result' in message ? (message as { result?: string }).result ?? null : null;
+          // `result` text exists only on subtype:"success"; error subtypes
+          // (e.g. a non-retryable 403 billing_error) carry their message in
+          // `errors[]` instead. Surface either so the poll-loop can deliver a
+          // billing/quota notice to the user rather than dropping the turn.
+          const m = message as { result?: string; is_error?: boolean; errors?: string[] };
+          const text = m.result ?? (m.errors && m.errors.length > 0 ? m.errors.join('\n') : null);
+          // Retry-path guards run FIRST — these turn error text into a throw so
+          // poll-loop's rotation / recap / backoff machinery retries instead of
+          // posting the raw error to the user's channel.
           if (text && QUOTA_RESULT_RE.test(text)) {
             // Throw so poll-loop's catch path can rotate to the next OAuth
             // fallback and retry instead of dispatching the quota message
@@ -1726,10 +1737,10 @@ export class ClaudeProvider implements AgentProvider {
             // to the user's channel as the agent's reply.
             throw new Error(`transient_overload: ${text}`);
           }
-          yield { type: 'result', text };
+          yield { type: 'result', text, isError: m.is_error === true };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'api_retry') {
           yield { type: 'error', message: 'API retry', retryable: true };
-        } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'rate_limit_event') {
+        } else if (message.type === 'rate_limit_event') {
           yield { type: 'error', message: 'Rate limit', retryable: false, classification: 'quota' };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'compact_boundary') {
           const meta = (message as { compact_metadata?: { pre_tokens?: number } }).compact_metadata;

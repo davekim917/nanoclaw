@@ -13,7 +13,7 @@
  * primary/danger, Teams: positive/destructive, Discord: primary/danger).
  * `undefined` renders as the platform's neutral/default button.
  */
-export type OptionStyle = 'primary' | 'danger';
+export type OptionStyle = 'primary' | 'danger' | 'default';
 
 export interface OptionInput {
   label: string;
@@ -40,7 +40,7 @@ export function normalizeOption(raw: RawOption): NormalizedOption {
     label,
     selectedLabel: raw.selectedLabel ?? label,
     value: raw.value ?? label,
-    style: raw.style,
+    style: raw.style === 'primary' || raw.style === 'danger' || raw.style === 'default' ? raw.style : undefined,
   };
 }
 

@@ -184,6 +184,11 @@ export interface RoutingContext {
    * notable findings should reach chat.
    */
   quietStatus: boolean;
+  /** Batch is a task fire — explicit `<message to>` sends must NOT inherit
+   *  inReplyTo (the series id), or the host's task-fire suppression drops
+   *  them as turn-final echoes: zero delivery. Deliberate sends are
+   *  in_reply_to-null, same as the out-of-process MCP send_message path. */
+  taskFire: boolean;
 }
 
 /**
@@ -250,6 +255,7 @@ export function extractRouting(messages: MessageInRow[]): RoutingContext {
     threadId: useOwnRouting ? (first.thread_id ?? null) : (sessionRouting.thread_id ?? null),
     inReplyTo: first?.id ?? null,
     quietStatus,
+    taskFire: messages.length > 0 && messages.every((m) => m.kind === 'task'),
   };
 }
 

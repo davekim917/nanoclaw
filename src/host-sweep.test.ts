@@ -28,6 +28,7 @@ import {
   pruneIdleSessionArtifacts,
   pruneIdleThreadArtifacts,
   pruneSteerIdempotency,
+  shouldCloseTaskSession,
 } from './host-sweep.js';
 import { getDb } from './db/connection.js';
 import type { Session } from './types.js';
@@ -1759,5 +1760,24 @@ describe('recoverMoveIntents (D3) + pruneAuditBodies (D4)', () => {
     const row = db.prepare('SELECT action FROM scheduled_audit WHERE id = ?').get(id) as { action: string };
     expect(row.action).toBe('cancel'); // row survives so history can still label the cancellation
     db.close();
+  });
+});
+
+describe('shouldCloseTaskSession', () => {
+  it('closes a spent per-task session (no live tasks, no container)', () => {
+    expect(shouldCloseTaskSession('system:tasks:task-1', false, 0)).toBe(true);
+  });
+
+  it('keeps it while a task is still live (recurring re-armed, or pending/paused)', () => {
+    expect(shouldCloseTaskSession('system:tasks:task-1', false, 1)).toBe(false);
+  });
+
+  it('keeps it while its container is running (mid-fire)', () => {
+    expect(shouldCloseTaskSession('system:tasks:task-1', true, 0)).toBe(false);
+  });
+
+  it('never touches non-task sessions', () => {
+    expect(shouldCloseTaskSession('telegram:12345', false, 0)).toBe(false);
+    expect(shouldCloseTaskSession(null, false, 0)).toBe(false);
   });
 });

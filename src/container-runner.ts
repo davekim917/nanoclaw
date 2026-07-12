@@ -3,15 +3,17 @@
  * Spawns agent containers with session folder + agent group folder mounts.
  * The container runs the v2 agent-runner which polls the session DB.
  */
-import { ChildProcess, execSync, spawn } from 'child_process';
+import { ChildProcess, exec, spawn } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { promisify } from 'util';
 
 import { OneCLI } from '@onecli-sh/sdk';
 
 import { getHostCapabilities } from './capabilities.js';
 import {
+  CONTAINER_CPU_LIMIT,
   CONTAINER_IMAGE,
   CONTAINER_IMAGE_BASE,
   CONTAINER_INSTALL_LABEL,
@@ -2301,6 +2303,13 @@ async function buildContainerArgs(
   const args: string[] = ['run', '--rm', '--name', containerName, '--label', CONTAINER_INSTALL_LABEL];
   args.push(...dockerResourceLimitArgs());
 
+  // Per-container resource caps (opt-in; empty = unbounded, today's behavior).
+  // Only --memory is set. Whether that's a hard cap depends on the host having no
+  // swap (a deployment concern) — on a swapless host --memory is hard and a runaway
+  // is OOM-killed; we don't manage swap from here.
+  if (CONTAINER_CPU_LIMIT) args.push('--cpus', CONTAINER_CPU_LIMIT);
+  if (CONTAINER_MEMORY_LIMIT) args.push('--memory', CONTAINER_MEMORY_LIMIT);
+
   // Environment — only vars read by code we don't own.
   // Everything NanoClaw-specific is in container.json (read by runner at startup).
   args.push('-e', `TZ=${TIMEZONE}`);
@@ -3217,6 +3226,7 @@ export function dockerResourceLimitArgs(): string[] {
   pushDockerLimit(args, '--memory', CONTAINER_MEMORY_LIMIT);
   pushDockerLimit(args, '--memory-reservation', CONTAINER_MEMORY_RESERVATION);
   pushDockerLimit(args, '--memory-swap', CONTAINER_MEMORY_SWAP_LIMIT);
+  pushDockerLimit(args, '--cpus', CONTAINER_CPU_LIMIT);
   if (CONTAINER_PIDS_LIMIT > 0) {
     args.push('--pids-limit', String(CONTAINER_PIDS_LIMIT));
   }
@@ -3228,6 +3238,8 @@ function pushDockerLimit(args: string[], flag: string, value: string): void {
   if (!trimmed || trimmed === '0') return;
   args.push(flag, trimmed);
 }
+
+const execAsync = promisify(exec);
 
 /** Build a per-agent-group Docker image with custom packages. */
 export async function buildAgentGroupImage(agentGroupId: string): Promise<void> {
@@ -3264,9 +3276,12 @@ export async function buildAgentGroupImage(agentGroupId: string): Promise<void> 
   const tmpDockerfile = path.join(DATA_DIR, `Dockerfile.${agentGroupId}`);
   fs.writeFileSync(tmpDockerfile, dockerfile);
   try {
-    execSync(`${CONTAINER_RUNTIME_BIN} build -t ${imageTag} -f ${tmpDockerfile} .`, {
+    // Awaited async exec so the single-threaded host stays responsive during
+    // the build (can take minutes) instead of blocking on execSync. exec buffers
+    // stdout/stderr (matching the old stdio: 'pipe') and rejects on a non-zero
+    // exit, so error propagation is unchanged.
+    await execAsync(`${CONTAINER_RUNTIME_BIN} build -t ${imageTag} -f ${tmpDockerfile} .`, {
       cwd: DATA_DIR,
-      stdio: 'pipe',
       timeout: 900_000,
     });
   } finally {

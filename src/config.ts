@@ -13,9 +13,24 @@ const envConfig = readEnvFile([
   'ONECLI_API_KEY',
   'TZ',
   'NANOCLAW_WORKGROUP_SHARED_FS',
+  'CONTAINER_CPU_LIMIT',
+  'CONTAINER_MEMORY_LIMIT',
+  'NANOCLAW_EGRESS_LOCKDOWN',
+  'NANOCLAW_EGRESS_NETWORK',
+  'ONECLI_GATEWAY_CONTAINER',
 ]);
 
+/**
+ * @deprecated WhatsApp adapter copies now read the ASSISTANT_NAME .env key
+ * directly. Re-export retained one release for stale adapter copies
+ * (origin/channels whatsapp.ts:42 imports it); scheduled for deletion.
+ */
 export const ASSISTANT_NAME = process.env.ASSISTANT_NAME || envConfig.ASSISTANT_NAME || 'Andy';
+/**
+ * @deprecated WhatsApp adapter copies now read the ASSISTANT_HAS_OWN_NUMBER
+ * .env key directly. Re-export retained one release for stale adapter copies
+ * (origin/channels whatsapp.ts:42 imports it); scheduled for deletion.
+ */
 export const ASSISTANT_HAS_OWN_NUMBER =
   (process.env.ASSISTANT_HAS_OWN_NUMBER || envConfig.ASSISTANT_HAS_OWN_NUMBER) === 'true';
 
@@ -50,6 +65,12 @@ export const WORKGROUP_SHARED_FS =
 // project directory name (e.g. `-home-ubuntu-nanoclaw-v2`).
 export const CC_PROJECTS_DIR = path.join(HOME_DIR, '.claude', 'projects');
 export const CC_MEMORY_MARKER = '.memory-enabled';
+// Local agent-template library. Committed but ships empty (+ README). Resolved
+// once at load. Override to another LOCAL path via NANOCLAW_TEMPLATES_DIR; never
+// a remote URL, never an ncl flag, never runtime-mutable.
+export const TEMPLATES_DIR = process.env.NANOCLAW_TEMPLATES_DIR
+  ? path.resolve(process.env.NANOCLAW_TEMPLATES_DIR)
+  : path.resolve(PROJECT_ROOT, 'templates');
 
 // Per-checkout image tag so two installs on the same host don't share
 // `nanoclaw-agent:latest` and clobber each other on rebuild.
@@ -76,23 +97,18 @@ export const MAX_CONCURRENT_CONTAINERS =
   Number.isFinite(parsedMaxConcurrentContainers) && parsedMaxConcurrentContainers >= 0
     ? parsedMaxConcurrentContainers
     : 24;
+// Per-container CPU cap, passed through to `docker run`. Default empty =
+// no flag added (memory/pids limits above already bound each container).
+// Operators opt in: CONTAINER_CPU_LIMIT=2.
+export const CONTAINER_CPU_LIMIT = process.env.CONTAINER_CPU_LIMIT || envConfig.CONTAINER_CPU_LIMIT || '';
 
-function escapeRegex(str: string): string {
-  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-export function buildTriggerPattern(trigger: string): RegExp {
-  return new RegExp(`^${escapeRegex(trigger.trim())}\\b`, 'i');
-}
-
-export const DEFAULT_TRIGGER = `@${ASSISTANT_NAME}`;
-
-export function getTriggerPattern(trigger?: string): RegExp {
-  const normalizedTrigger = trigger?.trim();
-  return buildTriggerPattern(normalizedTrigger || DEFAULT_TRIGGER);
-}
-
-export const TRIGGER_PATTERN = buildTriggerPattern(DEFAULT_TRIGGER);
+// Egress lockdown — force all agent traffic through the OneCLI gateway on a
+// no-internet Docker network. Off by default; consumed by src/egress-lockdown.ts.
+export const EGRESS_LOCKDOWN = (process.env.NANOCLAW_EGRESS_LOCKDOWN || envConfig.NANOCLAW_EGRESS_LOCKDOWN) === 'true';
+export const EGRESS_NETWORK =
+  process.env.NANOCLAW_EGRESS_NETWORK || envConfig.NANOCLAW_EGRESS_NETWORK || 'nanoclaw-egress';
+export const ONECLI_GATEWAY_CONTAINER =
+  process.env.ONECLI_GATEWAY_CONTAINER || envConfig.ONECLI_GATEWAY_CONTAINER || 'onecli';
 
 // Timezone for scheduled tasks, message formatting, etc.
 // Validates each candidate is a real IANA identifier before accepting.
