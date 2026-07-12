@@ -24,6 +24,7 @@ import path from 'path';
 import { promisify } from 'util';
 
 import { syncCodexLocalMarketplacePluginCache, syncCodexPluginSkills, syncCodexSubagents } from './codex-sync.js';
+import { vendorDesignArtifactLoop } from './design-artifact-loop-vendor.js';
 import { log } from './log.js';
 import { syncOpenCodePluginSkills, syncOpenCodeSubagents } from './opencode-sync.js';
 
@@ -123,7 +124,32 @@ export async function runPluginUpdates(): Promise<UpdateResult[]> {
   if (results.some((r) => r.changed)) {
     await refreshCodexPluginSurfaces();
   }
+  if (results.some((r) => r.plugin === 'design-artifact-loop' && r.changed)) {
+    vendorDesignArtifactLoopIfPresent();
+  }
   return results;
+}
+
+/**
+ * design-artifact-loop's plugin repo is the dev home; the container tree
+ * carries vendored copies under container/agent-runner/src/mcp-tools/ and
+ * container/skills/, both read-only bind-mounted into containers at spawn
+ * (never baked into the image) — so no rebuild is needed for this to take
+ * effect. This writes directly into the fork's git-tracked tree, so unlike
+ * the codex/opencode mirrors above (untracked runtime caches) it does NOT
+ * commit — Dave commits + pushes the result when he next reviews it.
+ */
+function vendorDesignArtifactLoopIfPresent(): void {
+  try {
+    const changed = vendorDesignArtifactLoop();
+    if (changed.length > 0) {
+      log.info('design-artifact-loop auto-vendored from updated plugin repo', { files: changed });
+    } else {
+      log.debug('design-artifact-loop plugin repo updated but nothing to vendor (e.g. docs/assets only)');
+    }
+  } catch (err) {
+    log.warn('design-artifact-loop auto-vendor failed', { err });
+  }
 }
 
 /**
