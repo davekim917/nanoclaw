@@ -725,6 +725,24 @@ export function buildSessionServicesSnapshot(
     services.push({ name: 'Slack (read)', declaredTools: [], scopes: [], credentialPaths: [], useFor });
   }
 
+  // Cloudflare — official Cloudflare API MCP, gated on BOTH the workgroup's
+  // OneCLI secret and the per-group MCP declaration. The secret alone is not
+  // a usable agent surface, and the MCP without the secret cannot authenticate;
+  // requiring both prevents the capabilities prompt from over-claiming access.
+  const hasCloudflareSecret = mergedSecrets.some((s) => /^cloudflare(-|$)/i.test(s));
+  const hasCloudflareMcp = !!cfg?.mcpServers?.['cloudflare-api'];
+  if (hasCloudflareSecret && hasCloudflareMcp) {
+    services.push({
+      name: 'Cloudflare',
+      mcpNamespace: 'mcp__cloudflare-api__*',
+      declaredTools: declaredMatchingTools(['cloudflare']),
+      scopes: folder ? [folder] : [],
+      credentialPaths: [],
+      useFor:
+        'Official Cloudflare API MCP at https://mcp.cloudflare.com/mcp — auth pre-injected as `Authorization: Bearer`; do NOT ask for or send the token. Use `mcp__cloudflare-api__docs` for Cloudflare product documentation, `mcp__cloudflare-api__search` to locate the correct OpenAPI endpoint, then `mcp__cloudflare-api__execute` to call it. The server pre-selects the account from the token and exposes its `accountId` to execute code. Covers Cloudflare account APIs such as DNS, Workers, Pages, and R2 API endpoints, subject to the token’s granted permissions. The separate S3-compatible access-key/secret pair is not exposed through this MCP; do not attempt AWS SDK/CLI access or claim direct S3 access unless a signing-capable S3 client is separately wired.',
+    });
+  }
+
   // Wix — gated on a Wix OneCLI secret (REST) and/or a mounted ~/.wix (CLI).
   // REST: the gateway injects the API key on www.wixapis.com. CLI: OAuth via the
   // mounted ~/.wix (operator ran `wix login` on the host). The site/account IDs

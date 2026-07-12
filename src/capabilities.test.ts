@@ -1,5 +1,4 @@
 import fs from 'fs';
-import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const dirs = vi.hoisted(() => {
@@ -57,6 +56,69 @@ afterEach(() => {
 });
 
 describe('buildSessionServicesSnapshot', () => {
+  it('surfaces Cloudflare when the workgroup secret and MCP server are both wired', () => {
+    insertWorkgroup('number-drinks', ['Cloudflare-NumberDrinks']);
+    const ag = group('ag-number-drinks', 'number-drinks');
+    createGroupInWorkgroup(ag, 'number-drinks');
+    writeContainerConfig(ag.folder, {
+      mcpServers: {
+        'cloudflare-api': {
+          command: 'bun',
+          args: ['/app/src/remote-mcp-bridge.ts', 'https://mcp.cloudflare.com/mcp'],
+          env: {
+            REMOTE_MCP_NAME: 'cloudflare-api',
+            REMOTE_MCP_AUTHORIZATION: 'Bearer placeholder',
+          },
+        },
+      },
+      packages: { apt: [], npm: [] },
+      additionalMounts: [],
+      skills: 'all',
+      tools: [],
+    });
+
+    const snapshot = buildSessionServicesSnapshot(ag.id);
+
+    const service = snapshot.services.find((s) => s.name === 'Cloudflare');
+    expect(service).toBeDefined();
+    expect(service?.mcpNamespace).toBe('mcp__cloudflare-api__*');
+    expect(service?.scopes).toEqual(['number-drinks']);
+    expect(service?.useFor).toContain('mcp.cloudflare.com/mcp');
+    expect(service?.useFor).toContain('mcp__cloudflare-api__search');
+    expect(service?.useFor).toContain('mcp__cloudflare-api__execute');
+    expect(service?.useFor).toContain('S3-compatible access-key/secret pair is not exposed');
+
+    const rendered = renderSessionCapabilities(snapshot);
+    expect(rendered).toContain('**Cloudflare**');
+    expect(rendered).toContain('MCP `mcp__cloudflare-api__*`');
+  });
+
+  it('does not surface Cloudflare unless both its secret and MCP server are wired', () => {
+    insertWorkgroup('number-drinks', ['Cloudflare-NumberDrinks']);
+    const secretOnly = group('ag-secret-only', 'number-drinks-secret-only');
+    createGroupInWorkgroup(secretOnly, 'number-drinks');
+
+    const noSecretWorkgroup = 'number-drinks-no-secret';
+    insertWorkgroup(noSecretWorkgroup, []);
+    const mcpOnly = group('ag-mcp-only', 'number-drinks-mcp-only');
+    createGroupInWorkgroup(mcpOnly, noSecretWorkgroup);
+    writeContainerConfig(mcpOnly.folder, {
+      mcpServers: {
+        'cloudflare-api': {
+          command: 'bun',
+          args: ['/app/src/remote-mcp-bridge.ts', 'https://mcp.cloudflare.com/mcp'],
+        },
+      },
+      packages: { apt: [], npm: [] },
+      additionalMounts: [],
+      skills: 'all',
+      tools: [],
+    });
+
+    expect(buildSessionServicesSnapshot(secretOnly.id).services.some((s) => s.name === 'Cloudflare')).toBe(false);
+    expect(buildSessionServicesSnapshot(mcpOnly.id).services.some((s) => s.name === 'Cloudflare')).toBe(false);
+  });
+
   it('surfaces Profound when the workgroup declares the Profound OneCLI secret', () => {
     insertWorkgroup('madison-reed', ['Profound']);
     const ag = group('ag-mr', 'madison-reed');
