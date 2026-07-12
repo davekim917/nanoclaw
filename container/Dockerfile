@@ -394,8 +394,14 @@ RUN chmod +x /app/entrypoint.sh
 # base image's UID 1000 is arbitrary; no baked dir hard-codes it.
 ARG HOST_UID=1001
 ARG HOST_GID=1001
+# /home/node/.config must exist in the image: cred mounts land nested under it
+# (/home/node/.config/gws/accounts, .../google-calendar-mcp), and Docker creates
+# missing bind-mount parents ROOT-owned — leaving `node` unable to write
+# ~/.config at all (chromium crashpad aborts with exit 133, gcloud can't create
+# its config dir). Pre-creating it node-owned means Docker only root-creates the
+# nested read-only cred paths, which nothing needs to write.
 RUN groupmod -g ${HOST_GID} node && usermod -u ${HOST_UID} -g ${HOST_GID} node && \
-    mkdir -p /workspace/group /workspace/global /workspace/extra && \
+    mkdir -p /workspace/group /workspace/global /workspace/extra /home/node/.config && \
     chown -R ${HOST_UID}:${HOST_GID} /workspace /home/node && \
     chmod 755 /home/node
 

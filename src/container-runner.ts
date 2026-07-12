@@ -933,14 +933,17 @@ const GCP_SA_KEYS_DIR = path.join(os.homedir(), '.config', 'nanoclaw-gcp');
 const GCP_KEY_CONTAINER_PATH = '/home/node/.gcp/service-account.json';
 
 /**
- * gcloud's config dir for these containers. The default `~/.config/gcloud` is
- * unusable here: the gws accounts mount (`/home/node/.config/gws/accounts`)
- * makes Docker create `/home/node/.config` ROOT-owned, but the container runs
- * as `node` (uid 1001) — so gcloud/bq can't create their config dir and
- * activation fails with "Could not create directory [/home/node/.config/gcloud]".
- * Point CLOUDSDK_CONFIG at a node-writable home dir instead. As a container env
- * var it's also inherited by `docker exec`, so manual gcloud/bq invocations see
- * the activated account too.
+ * gcloud's config dir for these containers. Historically the default
+ * `~/.config/gcloud` was unusable: the gws accounts mount
+ * (`/home/node/.config/gws/accounts`) made Docker create `/home/node/.config`
+ * ROOT-owned, but the container runs as `node` (uid 1001) — so gcloud/bq
+ * couldn't create their config dir and activation failed with "Could not
+ * create directory [/home/node/.config/gcloud]". The image now pre-creates
+ * `/home/node/.config` node-owned (container/Dockerfile permissions block),
+ * so the default would work again — but a dedicated dir keeps gcloud state
+ * isolated from cred mounts, so CLOUDSDK_CONFIG stays pointed here. As a
+ * container env var it's also inherited by `docker exec`, so manual gcloud/bq
+ * invocations see the activated account too.
  */
 const GCP_CLOUDSDK_CONFIG_CONTAINER_PATH = '/home/node/.gcloud-config';
 
