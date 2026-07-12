@@ -6,6 +6,7 @@ import { CronExpressionParser } from 'cron-parser';
 
 import { GROUPS_DIR, TIMEZONE } from '../../config.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
+import { getMessagingGroup } from '../../db/messaging-groups.js';
 import {
   findTaskSessions,
   getActiveSessions,
@@ -23,6 +24,7 @@ import {
   updateTask,
   type TaskUpdate,
 } from '../../modules/scheduling/db.js';
+import { resolveTaskFlagIntent } from '../../modules/scheduling/task-flags.js';
 import { inboundDbPath, resolveTaskSession, withInboundDb } from '../../session-manager.js';
 import { formatLocalStamp, parseZonedToUtc } from '../../timezone.js';
 import { registerResource } from '../crud.js';
@@ -41,7 +43,19 @@ interface TaskRow {
   timestamp: string;
   tries: number;
   seq: number;
+  platform_id: string | null;
+  channel_type: string | null;
+  thread_id: string | null;
 }
+
+/** Routing a task series posts to on fire; all-null means unaddressed output is discarded. */
+interface TaskRouting {
+  platformId: string | null;
+  channelType: string | null;
+  threadId: string | null;
+}
+
+const NO_ROUTING: TaskRouting = { platformId: null, channelType: null, threadId: null };
 
 interface ScopedSession {
   id: string;
@@ -232,6 +246,10 @@ function toOutput(session: ScopedSession, row: TaskRow) {
     origin_session_id: content.originSessionId, // which session created the task (null for CLI-created)
     created_at: row.timestamp,
     tries: row.tries,
+    // Where an unaddressed reply lands on fire; null = discarded (isolated).
+    routed: row.platform_id
+      ? { channel_type: row.channel_type, platform_id: row.platform_id, thread_id: row.thread_id }
+      : null,
   };
 }
 
@@ -239,7 +257,8 @@ function selectLiveTasks(db: Database.Database, status?: TaskStatus): TaskRow[] 
   const statusSql = status ? 'status = ?' : "status IN ('pending', 'paused')";
   return db
     .prepare(
-      `SELECT id AS row_id, series_id, status, process_after, recurrence, content, timestamp, tries, MAX(seq) AS seq
+      `SELECT id AS row_id, series_id, status, process_after, recurrence, content, timestamp, tries,
+              platform_id, channel_type, thread_id, MAX(seq) AS seq
          FROM messages_in
         WHERE kind = 'task'
           AND ${statusSql}
@@ -252,7 +271,8 @@ function selectLiveTasks(db: Database.Database, status?: TaskStatus): TaskRow[] 
 function selectTask(db: Database.Database, id: string): TaskRow | undefined {
   return db
     .prepare(
-      `SELECT id AS row_id, series_id, status, process_after, recurrence, content, timestamp, tries, seq
+      `SELECT id AS row_id, series_id, status, process_after, recurrence, content, timestamp, tries, seq,
+              platform_id, channel_type, thread_id
          FROM messages_in
         WHERE kind = 'task'
           AND (id = ? OR series_id = ?)
@@ -268,6 +288,62 @@ function taskId(args: Record<string, unknown>): string {
   return id;
 }
 
+/**
+ * Resolve the routing a new task series stamps, host-authoritatively.
+ *
+ * Agent callers derive routing from their OWN session (never agent-supplied
+ * ids — the cross-tenant leak class actions.ts's header warns about): default
+ * stamps the session's channel (thread null); `--thread` additionally binds
+ * the session's own thread (falls back to channel-only, with a note, if the
+ * caller isn't a thread session); `--isolated` or a session with no
+ * messaging group stamps nothing. `--messaging-group`/`--thread-id` are
+ * host-only raw stamps and are rejected outright from an agent caller.
+ *
+ * Host callers get no implicit stamp — routing only via the host-only flags.
+ */
+function resolveTaskRouting(
+  args: Record<string, unknown>,
+  ctx: CallerContext,
+): { routing: TaskRouting; note?: string } {
+  const messagingGroupArg = str(args.messaging_group);
+  const threadIdArg = str(args.thread_id);
+
+  if (ctx.caller === 'agent') {
+    if (messagingGroupArg !== undefined || threadIdArg !== undefined) {
+      throw new Error('--messaging-group / --thread-id are host-only; an agent cannot set raw routing');
+    }
+    if (bool(args.isolated)) return { routing: NO_ROUTING };
+
+    const callingSession = getSession(ctx.sessionId);
+    if (!callingSession?.messaging_group_id) return { routing: NO_ROUTING };
+
+    const mg = getMessagingGroup(callingSession.messaging_group_id);
+    if (!mg) throw new Error(`routing failed: messaging group not found for session ${ctx.sessionId}`);
+
+    if (bool(args.thread)) {
+      if (callingSession.thread_id) {
+        return {
+          routing: { platformId: mg.platform_id, channelType: mg.channel_type, threadId: callingSession.thread_id },
+        };
+      }
+      return {
+        routing: { platformId: mg.platform_id, channelType: mg.channel_type, threadId: null },
+        note: '--thread requested from a non-thread session — stamped channel routing instead',
+      };
+    }
+    return { routing: { platformId: mg.platform_id, channelType: mg.channel_type, threadId: null } };
+  }
+
+  // Host caller: no implicit stamp — routing only via the explicit flags below.
+  if (threadIdArg !== undefined && messagingGroupArg === undefined) {
+    throw new Error('--thread-id requires --messaging-group');
+  }
+  if (messagingGroupArg === undefined) return { routing: NO_ROUTING };
+  const mg = getMessagingGroup(messagingGroupArg);
+  if (!mg) throw new Error(`messaging group not found: ${messagingGroupArg}`);
+  return { routing: { platformId: mg.platform_id, channelType: mg.channel_type, threadId: threadIdArg ?? null } };
+}
+
 function createTask(args: Record<string, unknown>, ctx: CallerContext) {
   const group = groupArg(args, ctx);
   if (!group) throw new Error('--group is required');
@@ -280,12 +356,22 @@ function createTask(args: Record<string, unknown>, ctx: CallerContext) {
   const processAfter = firstRunIso(args.process_after, recurrence);
   const id = makeTaskId(args.name);
   const originSessionId = ctx.caller === 'agent' ? ctx.sessionId : null;
+  const { routing, note: routingNote } = resolveTaskRouting(args, ctx);
+  const { flagIntent, error: flagError } = resolveTaskFlagIntent(
+    { model: str(args.model), effort: str(args.effort) },
+    { agent_group_id: group },
+  );
+  if (flagError) throw new Error(flagError);
+
   // Each series runs in its own isolated session; point the fire at its own log.
   const { session } = resolveTaskSession(group, id);
+  const messageBullet = routing.platformId
+    ? `• MESSAGE (only if asked): if the task says to report/notify the user, just reply normally — replies default to the originating ${routing.threadId ? 'thread' : 'channel'} this task is wired to; use an explicit <message to="name">…</message> or send_message({ to: "name", … }) only to reach a DIFFERENT destination.\n`
+    : `• MESSAGE (only if asked): if the task says to report/notify the user, send your result with an EXPLICIT destination — <message to="name">…</message> or send_message({ to: "name", … }). This run has no chat attached: an unaddressed reply is DISCARDED, so the explicit send is the ONLY thing the user receives.\n`;
   const promptWithLog =
     `${prompt}\n\n` +
     `[A task serves the user two separate ways — do whichever the task above asks for, and ALWAYS the run log:\n` +
-    `• MESSAGE (only if asked): if the task says to report/notify the user, send your result with an EXPLICIT destination — <message to="name">…</message> or send_message({ to: "name", … }). This run has no chat attached: an unaddressed reply is DISCARDED, so the explicit send is the ONLY thing the user receives.\n` +
+    messageBullet +
     `• RUN LOG (ALWAYS — even if you sent no message and did nothing else this run): after any sends, end the run with:\n` +
     `    ncl tasks append-log --msg "<what you did, and why it mattered>"\n` +
     `  Write it like a work-log entry a human keeps — concrete: what you did and WHY (a no-op run still gets a line saying why nothing was needed). If you wrote or modified files this run, name them in --msg. Not a greeting, not a copy of the message you sent. The host stamps the local time (do NOT add one), do NOT edit tasks/${id}.md by hand, and this NEVER goes to the user.\n` +
@@ -297,12 +383,21 @@ function createTask(args: Record<string, unknown>, ctx: CallerContext) {
       seriesId: id,
       processAfter,
       recurrence,
-      content: JSON.stringify({ prompt: promptWithLog, script, originSessionId }),
+      platformId: routing.platformId,
+      channelType: routing.channelType,
+      threadId: routing.threadId,
+      content: JSON.stringify({
+        prompt: promptWithLog,
+        script,
+        originSessionId,
+        ...(flagIntent && (flagIntent.turnModel || flagIntent.turnEffort) ? { flagIntent } : {}),
+      }),
     });
     return selectTask(db, id);
   });
   if (!created) throw new Error('task system session inbound.db not found');
-  return toOutput(session, created);
+  const output = toOutput(session, created);
+  return routingNote ? { ...output, routing_note: routingNote } : output;
 }
 
 /**
@@ -474,6 +569,15 @@ function updateTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
     update.recurrence = recurrence;
   }
   if (script !== undefined) update.script = script;
+  const model = str(args.model);
+  const effort = str(args.effort);
+  if (model !== undefined || effort !== undefined) {
+    const group = groupArg(args, ctx);
+    if (!group) throw new Error('--group is required to validate --model/--effort');
+    const { flagIntent, error: flagError } = resolveTaskFlagIntent({ model, effort }, { agent_group_id: group });
+    if (flagError) throw new Error(flagError);
+    if (flagIntent && (flagIntent.turnModel || flagIntent.turnEffort)) update.flagIntent = flagIntent;
+  }
   const fields = Object.keys(update);
   if (fields.length === 0) throw new Error('nothing to update');
 
@@ -513,12 +617,17 @@ function runTaskCommand(args: Record<string, unknown>, ctx: CallerContext) {
       const seriesKey = row.series_id ?? row.row_id;
       const rowId = makeTaskId(`${seriesKey}-run`);
       // recurrence=NULL is load-bearing: a run-now row must not be re-armed by
-      // handleRecurrence into a phantom series.
+      // handleRecurrence into a phantom series. Routing carries forward from
+      // the source row — an on-demand fire reports to the same destination
+      // the series is wired to.
       insertTaskRow(db, {
         id: rowId,
         seriesId: seriesKey,
         processAfter: new Date().toISOString(),
         recurrence: null,
+        platformId: row.platform_id,
+        channelType: row.channel_type,
+        threadId: row.thread_id,
         content: row.content,
       });
       return { series_id: seriesKey, row_id: rowId, status: 'pending' };
@@ -613,7 +722,8 @@ registerResource({
         `carries a --script gate (the script decides whether each fire needs you — a gated fire that\n` +
         `finds nothing costs zero tokens) or you pass --dangerously-override-recurrence-limit after\n` +
         `the user explicitly confirmed they want an ungated frequent task.\n\n` +
-        `Failure backoff: a script that ERRORS repeatedly backs the series off (2,4,8,…60 min between fires; each errored fire counts as a failed run); after 8 consecutive failures the series is auto-paused with a note in its run log — fix the script, then \`ncl tasks resume <id>\`. A deliberate wakeAgent=false is a normal run and never backs off. \`ncl tasks get <id>\` shows failed_runs and the run log.`,
+        `Failure backoff: a script that ERRORS repeatedly backs the series off (2,4,8,…60 min between fires; each errored fire counts as a failed run); after 8 consecutive failures the series is auto-paused with a note in its run log — fix the script, then \`ncl tasks resume <id>\`. A deliberate wakeAgent=false is a normal run and never backs off. \`ncl tasks get <id>\` shows failed_runs and the run log.\n\n` +
+        `Routing (where an unaddressed reply lands): an agent caller stamps its own channel by default (thread null) — a normal reply with no explicit destination lands there; --thread also binds your own thread (falls back to channel if you aren't in a thread session); --isolated stamps no routing (unaddressed replies are discarded, only an explicit <message to=...> reaches anyone). --messaging-group/--thread-id are host-only raw stamps.`,
       args: [
         {
           name: 'name',
@@ -647,6 +757,37 @@ registerResource({
           name: 'group',
           type: 'string',
           description: 'Agent group id (host callers; auto-filled to your own group inside a container).',
+        },
+        {
+          name: 'thread',
+          type: 'boolean',
+          description:
+            'Agent callers only: also bind the calling session\'s own thread (parity with the legacy scope:"thread"). Falls back to channel-only if the caller is not a thread session.',
+        },
+        {
+          name: 'isolated',
+          type: 'boolean',
+          description: 'Stamp no routing — an unaddressed reply is discarded; only an explicit send reaches anyone.',
+        },
+        {
+          name: 'messaging_group',
+          type: 'string',
+          description: 'Host-only: stamp routing to this messaging group id (rejected from an agent caller).',
+        },
+        {
+          name: 'thread_id',
+          type: 'string',
+          description: 'Host-only: raw thread id, paired with --messaging-group (rejected from an agent caller).',
+        },
+        {
+          name: 'model',
+          type: 'string',
+          description: "Per-fire model pin, validated against the agent group's provider vocabulary.",
+        },
+        {
+          name: 'effort',
+          type: 'string',
+          description: "Per-fire effort pin, validated against the agent group's provider vocabulary.",
         },
       ],
       examples: [
@@ -705,6 +846,16 @@ registerResource({
           description: 'Agent group id (host callers; auto-filled to your own group inside a container).',
         },
         { name: 'session', type: 'string', description: 'Limit to one task session id.' },
+        {
+          name: 'model',
+          type: 'string',
+          description: "Per-fire model pin, validated against the agent group's provider vocabulary.",
+        },
+        {
+          name: 'effort',
+          type: 'string',
+          description: "Per-fire effort pin, validated against the agent group's provider vocabulary.",
+        },
       ],
       handler: async (args, ctx) => updateTaskCommand(args, ctx),
     },

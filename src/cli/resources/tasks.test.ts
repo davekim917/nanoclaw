@@ -22,6 +22,7 @@ vi.mock('../../container-runner.js', () => ({
 const TEST_DIR = '/tmp/nanoclaw-test-cli-tasks';
 
 import { initTestDb, closeDb, runMigrations, createAgentGroup } from '../../db/index.js';
+import { createMessagingGroup } from '../../db/messaging-groups.js';
 import { createSession, findSessionByAgentGroup, getSessionsByAgentGroup, taskThreadId } from '../../db/sessions.js';
 import { countDueMessages } from '../../db/session-db.js';
 import { inboundDbPath, initSessionFolder } from '../../session-manager.js';
@@ -52,6 +53,34 @@ function createChatSession(group: string, id: string): void {
     created_at: now(),
   });
   initSessionFolder(group, id);
+}
+
+/** A session wired to a real messaging group — the shape a channel session actually has. */
+function createMgSession(group: string, id: string, mgId: string, threadId: string | null = null): void {
+  createSession({
+    id,
+    agent_group_id: group,
+    messaging_group_id: mgId,
+    thread_id: threadId,
+    agent_provider: null,
+    status: 'active',
+    container_status: 'stopped',
+    last_active: null,
+    created_at: now(),
+  });
+  initSessionFolder(group, id);
+}
+
+function createMg(id: string, channelType = 'slack', platformId = 'C123'): void {
+  createMessagingGroup({
+    id,
+    channel_type: channelType,
+    platform_id: platformId,
+    name: 'general',
+    is_group: 1,
+    unknown_sender_policy: 'strict',
+    created_at: now(),
+  });
 }
 
 function agentCtx(group = 'ag-1', session = 'chat-1'): CallerContext {
@@ -500,6 +529,250 @@ describe('tasks CLI resource', () => {
       );
       expect(resp.ok).toBe(false);
       if (!resp.ok) expect(resp.error.message).toMatch(/--id is required/);
+    });
+  });
+
+  describe('routing stamped at create', () => {
+    it('an agent caller from a plain chat session (no messaging group) stamps nothing', async () => {
+      const r = await dispatch(
+        { id: 'r1', command: 'tasks-create', args: { prompt: 'x', process_after: '2999-01-01T00:00:00Z' } },
+        agentCtx('ag-1', 'chat-1'), // chat-1 has messaging_group_id: null
+      );
+      expect(r.ok).toBe(true);
+      if (!r.ok) return;
+      expect((r.data as { routed: unknown }).routed).toBeNull();
+    });
+
+    it("default stamps the calling session's own channel, thread null", async () => {
+      createMg('mg-1');
+      createMgSession('ag-1', 'chan-1', 'mg-1');
+      const r = await dispatch(
+        { id: 'r2', command: 'tasks-create', args: { prompt: 'x', process_after: '2999-01-01T00:00:00Z' } },
+        agentCtx('ag-1', 'chan-1'),
+      );
+      expect(r.ok).toBe(true);
+      if (!r.ok) return;
+      expect(
+        (r.data as { routed: { channel_type: string; platform_id: string; thread_id: string | null } }).routed,
+      ).toEqual({ channel_type: 'slack', platform_id: 'C123', thread_id: null });
+    });
+
+    it("--thread additionally binds the calling session's own thread", async () => {
+      createMg('mg-1');
+      createMgSession('ag-1', 'thread-1', 'mg-1', 'thread-xyz');
+      const r = await dispatch(
+        {
+          id: 'r3',
+          command: 'tasks-create',
+          args: { prompt: 'x', process_after: '2999-01-01T00:00:00Z', thread: true },
+        },
+        agentCtx('ag-1', 'thread-1'),
+      );
+      expect(r.ok).toBe(true);
+      if (!r.ok) return;
+      const data = r.data as { routed: { thread_id: string | null }; routing_note?: string };
+      expect(data.routed.thread_id).toBe('thread-xyz');
+      expect(data.routing_note).toBeUndefined();
+    });
+
+    it('--thread from a non-thread session falls back to channel-only with a note', async () => {
+      createMg('mg-1');
+      createMgSession('ag-1', 'chan-2', 'mg-1'); // channel-root session, no thread_id
+      const r = await dispatch(
+        {
+          id: 'r4',
+          command: 'tasks-create',
+          args: { prompt: 'x', process_after: '2999-01-01T00:00:00Z', thread: true },
+        },
+        agentCtx('ag-1', 'chan-2'),
+      );
+      expect(r.ok).toBe(true);
+      if (!r.ok) return;
+      const data = r.data as { routed: { thread_id: string | null }; routing_note?: string };
+      expect(data.routed.thread_id).toBeNull();
+      expect(data.routing_note).toMatch(/non-thread session/);
+    });
+
+    it('--isolated stamps nothing even from a messaging-group-wired session', async () => {
+      createMg('mg-1');
+      createMgSession('ag-1', 'chan-3', 'mg-1');
+      const r = await dispatch(
+        {
+          id: 'r5',
+          command: 'tasks-create',
+          args: { prompt: 'x', process_after: '2999-01-01T00:00:00Z', isolated: true },
+        },
+        agentCtx('ag-1', 'chan-3'),
+      );
+      expect(r.ok).toBe(true);
+      if (!r.ok) return;
+      expect((r.data as { routed: unknown }).routed).toBeNull();
+    });
+
+    it('an agent caller passing --messaging-group is rejected', async () => {
+      const r = await dispatch(
+        {
+          id: 'r6',
+          command: 'tasks-create',
+          args: { prompt: 'x', process_after: '2999-01-01T00:00:00Z', messaging_group: 'mg-1' },
+        },
+        agentCtx('ag-1', 'chat-1'),
+      );
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error.message).toContain('host-only');
+    });
+
+    it('an agent caller passing --thread-id is rejected', async () => {
+      const r = await dispatch(
+        {
+          id: 'r7',
+          command: 'tasks-create',
+          args: { prompt: 'x', process_after: '2999-01-01T00:00:00Z', thread_id: 'some-thread' },
+        },
+        agentCtx('ag-1', 'chat-1'),
+      );
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error.message).toContain('host-only');
+    });
+
+    it('a host caller stamps routing only via --messaging-group/--thread-id, never implicitly', async () => {
+      createMg('mg-1');
+      const bare = await dispatch(
+        {
+          id: 'r8',
+          command: 'tasks-create',
+          args: { prompt: 'x', process_after: '2999-01-01T00:00:00Z', group: 'ag-1' },
+        },
+        { caller: 'host' },
+      );
+      expect(bare.ok).toBe(true);
+      if (bare.ok) expect((bare.data as { routed: unknown }).routed).toBeNull();
+
+      const stamped = await dispatch(
+        {
+          id: 'r9',
+          command: 'tasks-create',
+          args: {
+            prompt: 'x',
+            process_after: '2999-01-01T00:00:00Z',
+            group: 'ag-1',
+            messaging_group: 'mg-1',
+            thread_id: 'host-thread',
+          },
+        },
+        { caller: 'host' },
+      );
+      expect(stamped.ok).toBe(true);
+      if (!stamped.ok) return;
+      expect((stamped.data as { routed: { thread_id: string } }).routed).toEqual({
+        channel_type: 'slack',
+        platform_id: 'C123',
+        thread_id: 'host-thread',
+      });
+    });
+
+    it('--thread-id without --messaging-group is rejected for a host caller', async () => {
+      const r = await dispatch(
+        {
+          id: 'r10',
+          command: 'tasks-create',
+          args: { prompt: 'x', process_after: '2999-01-01T00:00:00Z', group: 'ag-1', thread_id: 'x' },
+        },
+        { caller: 'host' },
+      );
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error.message).toContain('--messaging-group');
+    });
+
+    it('run copies routing forward from the source row', async () => {
+      createMg('mg-1');
+      createMgSession('ag-1', 'chan-4', 'mg-1');
+      const created = await dispatch(
+        { id: 'r11', command: 'tasks-create', args: { prompt: 'x', process_after: '2999-01-01T00:00:00Z' } },
+        agentCtx('ag-1', 'chan-4'),
+      );
+      expect(created.ok).toBe(true);
+      if (!created.ok) return;
+      const { series_id, session_id } = created.data as { series_id: string; session_id: string };
+
+      const run = await dispatch(
+        { id: 'r12', command: 'tasks-run', args: { id: series_id } },
+        agentCtx('ag-1', 'chan-4'),
+      );
+      expect(run.ok).toBe(true);
+      if (!run.ok) return;
+      const { row_id } = run.data as { row_id: string };
+
+      const db = new Database(inboundDbPath('ag-1', session_id), { readonly: true });
+      const row = db
+        .prepare('SELECT platform_id, channel_type, thread_id FROM messages_in WHERE id = ?')
+        .get(row_id) as { platform_id: string; channel_type: string; thread_id: string | null };
+      db.close();
+      expect(row).toEqual({ platform_id: 'C123', channel_type: 'slack', thread_id: null });
+    });
+  });
+
+  describe('--model/--effort per-fire pin', () => {
+    it('create validates and lands the pin in content.flagIntent', async () => {
+      const r = await dispatch(
+        {
+          id: 'f1',
+          command: 'tasks-create',
+          args: { prompt: 'x', process_after: '2999-01-01T00:00:00Z', model: 'sonnet', effort: 'low' },
+        },
+        agentCtx('ag-1', 'chat-1'),
+      );
+      expect(r.ok).toBe(true);
+      if (!r.ok) return;
+      const { session_id, series_id } = r.data as { session_id: string; series_id: string };
+      const db = new Database(inboundDbPath('ag-1', session_id), { readonly: true });
+      const row = db.prepare("SELECT content FROM messages_in WHERE kind = 'task' AND id = ?").get(series_id) as {
+        content: string;
+      };
+      db.close();
+      const content = JSON.parse(row.content);
+      expect(content.flagIntent).toEqual({ turnModel: 'sonnet', turnEffort: 'low' });
+    });
+
+    it('create rejects an unknown model', async () => {
+      const r = await dispatch(
+        {
+          id: 'f2',
+          command: 'tasks-create',
+          args: { prompt: 'x', process_after: '2999-01-01T00:00:00Z', model: 'gpt-5.5' },
+        },
+        agentCtx('ag-1', 'chat-1'),
+      );
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.error.message).toContain('unknown model');
+    });
+
+    it('update merges flagIntent — a model-only update keeps a prior effort pin', async () => {
+      const created = await dispatch(
+        {
+          id: 'f3',
+          command: 'tasks-create',
+          args: { prompt: 'x', name: 'pin', process_after: '2999-01-01T00:00:00Z', effort: 'low' },
+        },
+        agentCtx('ag-1', 'chat-1'),
+      );
+      expect(created.ok).toBe(true);
+      if (!created.ok) return;
+      const { series_id, session_id } = created.data as { series_id: string; session_id: string };
+
+      const upd = await dispatch(
+        { id: 'f4', command: 'tasks-update', args: { id: series_id, model: 'sonnet', group: 'ag-1' } },
+        agentCtx('ag-1', 'chat-1'),
+      );
+      expect(upd.ok).toBe(true);
+
+      const db = new Database(inboundDbPath('ag-1', session_id), { readonly: true });
+      const row = db.prepare("SELECT content FROM messages_in WHERE kind = 'task' AND id = ?").get(series_id) as {
+        content: string;
+      };
+      db.close();
+      const content = JSON.parse(row.content);
+      expect(content.flagIntent).toEqual({ turnModel: 'sonnet', turnEffort: 'low' });
     });
   });
 });

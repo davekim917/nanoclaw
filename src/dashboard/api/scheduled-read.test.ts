@@ -72,12 +72,12 @@ function addMg(id: string, channelType: string, platformId: string, name: string
     )
     .run(id, channelType, platformId, name);
 }
-function addSession(id: string, agentGroupId: string, mgId: string): void {
+function addSession(id: string, agentGroupId: string, mgId: string | null, threadId: string | null = null): void {
   getDb()
     .prepare(
-      "INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, status, created_at) VALUES (?, ?, ?, NULL, 'active', datetime('now'))",
+      "INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, status, created_at) VALUES (?, ?, ?, ?, 'active', datetime('now'))",
     )
-    .run(id, agentGroupId, mgId);
+    .run(id, agentGroupId, mgId, threadId);
 }
 function addUser(id: string): void {
   getDb().prepare("INSERT INTO users (id, kind, created_at) VALUES (?, 'phone', datetime('now'))").run(id);
@@ -108,13 +108,16 @@ function insertRow(
     process_after?: string | null;
     content?: string;
     timestamp?: string;
+    platform_id?: string | null;
+    channel_type?: string | null;
+    thread_id?: string | null;
   },
 ): void {
   const db = openInboundDb(inboundPath);
   const seq = (db.prepare('SELECT COALESCE(MAX(seq),0) AS m FROM messages_in').get() as { m: number }).m + 2;
   db.prepare(
-    `INSERT INTO messages_in (id, seq, kind, timestamp, status, process_after, recurrence, series_id, content, platform_id, channel_type)
-     VALUES (@id, @seq, 'task', @timestamp, @status, @processAfter, @recurrence, @seriesId, @content, 'd:1', 'discord')`,
+    `INSERT INTO messages_in (id, seq, kind, timestamp, status, process_after, recurrence, series_id, content, platform_id, channel_type, thread_id)
+     VALUES (@id, @seq, 'task', @timestamp, @status, @processAfter, @recurrence, @seriesId, @content, @platformId, @channelType, @threadId)`,
   ).run({
     id: row.id,
     seq,
@@ -124,6 +127,9 @@ function insertRow(
     recurrence: row.recurrence === undefined ? '0 9 * * *' : row.recurrence,
     seriesId: row.series_id ?? row.id,
     content: row.content ?? JSON.stringify({ prompt: 'do thing', script: 'echo hi' }),
+    platformId: row.platform_id === undefined ? 'd:1' : row.platform_id,
+    channelType: row.channel_type === undefined ? 'discord' : row.channel_type,
+    threadId: row.thread_id ?? null,
   });
   db.close();
 }
@@ -542,6 +548,78 @@ describe('scheduledDetailHandler', () => {
     expect('next_fire_local' in row).toBe(true);
     expect('quiet_status' in row).toBe(true);
     expect('flag_intent' in row).toBe(true);
+  });
+});
+
+describe('system task session read paths', () => {
+  it('builds detail/history and searches prompt text without a messaging-group destination', async () => {
+    addGroup('ag-1', 'G1');
+    addSession('sys-ser-1', 'ag-1', null, 'system:tasks:ser-system');
+    const { inbound, outbound } = seedSession('ag-1', 'sys-ser-1');
+
+    insertRow(inbound, {
+      id: 'fire-ran',
+      series_id: 'ser-system',
+      status: 'completed',
+      recurrence: null,
+      process_after: isoIn(-7200_000),
+      timestamp: isoIn(-7200_000),
+      platform_id: null,
+      channel_type: null,
+    });
+    addReply(outbound, 'fire-ran', isoIn(-7100_000));
+    insertRow(inbound, {
+      id: 'fire-cancelled',
+      series_id: 'ser-system',
+      status: 'cancelled',
+      recurrence: null,
+      process_after: isoIn(-3600_000),
+      timestamp: isoIn(-3600_000),
+      platform_id: null,
+      channel_type: null,
+    });
+    insertRow(inbound, {
+      id: 'live-system',
+      series_id: 'ser-system',
+      process_after: isoIn(3600_000),
+      content: JSON.stringify({ prompt: 'prepare the isolated capybara digest', script: 'echo system' }),
+      platform_id: null,
+      channel_type: null,
+      thread_id: null,
+    });
+    addUser('owner');
+    grant('owner', 'owner', null);
+
+    const key = encodeKey('ag-1', 'sys-ser-1', 'ser-system');
+    const detail = (await scheduledDetailHandler(
+      new Request('http://x/dashboard/api/scheduled/key'),
+      { key },
+      ctxFor('owner', OWNER_SCOPES),
+    ))!;
+    expect(detail.status).toBe(200);
+    const body = await readJson(detail);
+    expect(body.prompt).toBe('prepare the isolated capybara digest');
+    expect(body.script).toBe('echo system');
+    expect(body.row).toMatchObject({
+      key,
+      series_id: 'ser-system',
+      channel_name: null,
+      channel_type: null,
+      thread_id: null,
+      kind: 'recurring',
+      health: 'healthy',
+    });
+    expect(Array.isArray((body.row as { available_verbs: unknown }).available_verbs)).toBe(true);
+    const history = body.history as Array<{ id: string; outcome: string }>;
+    expect(history.find((h) => h.id === 'fire-ran')?.outcome).toBe('ran');
+    expect(history.find((h) => h.id === 'fire-cancelled')?.outcome).toBe('cancelled');
+
+    const search = (await scheduledSearchHandler(
+      new Request('http://x/dashboard/api/scheduled/search?q=capybara'),
+      {},
+      ctxFor('owner', OWNER_SCOPES),
+    ))!;
+    expect((await readJson(search)).keys).toEqual([key]);
   });
 });
 

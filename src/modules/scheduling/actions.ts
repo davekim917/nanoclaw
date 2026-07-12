@@ -45,46 +45,14 @@
 import type Database from 'better-sqlite3';
 
 import { wakeContainer } from '../../container-runner.js';
-import { getContainerConfig, resolveProviderName } from '../../db/container-configs.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { resolveActiveSession } from '../../db/scheduled-tasks.js';
 import { getSession } from '../../db/sessions.js';
-import { parseMessageFlags, type FlagIntent } from '../../flag-parser.js';
 import { log } from '../../log.js';
 import { openInboundDb, writeSessionMessage } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 import { cancelTask, insertTaskRow, pauseTask, resumeTask, updateTask, type TaskUpdate } from './db.js';
-
-/** Per-fire model/effort a scheduled task carries; mirrors the chat FlagIntent. */
-type TaskFlagIntent = Pick<FlagIntent, 'turnModel' | 'turnEffort'>;
-
-/**
- * Resolve a `{ model?, effort? }` schedule/update payload into a per-fire
- * flagIntent, validated against the agent group's provider vocabulary. Reuses
- * the exact chat flag-parser (`-m1`/`-e1` = per-turn) so a task pin is resolved
- * and rejected identically to an interactive `-m1 sonnet -e1 medium` — no
- * second, drifting validation path. Returns `{ flagIntent }` on success (empty
- * object when neither field was given), or `{ error }` with a human-readable
- * reason the agent sees.
- */
-function resolveTaskFlagIntent(
-  content: Record<string, unknown>,
-  session: Session,
-): { flagIntent?: TaskFlagIntent; error?: string } {
-  const model = typeof content.model === 'string' ? content.model.trim() : '';
-  const effort = typeof content.effort === 'string' ? content.effort.trim() : '';
-  if (!model && !effort) return {};
-
-  const provider = resolveProviderName(session.agent_provider, getContainerConfig(session.agent_group_id)?.provider);
-  const flagStr = [model ? `-m1 ${model}` : '', effort ? `-e1 ${effort}` : ''].filter(Boolean).join(' ');
-  const parsed = parseMessageFlags(flagStr, provider);
-  if (parsed.errors.length > 0) return { error: parsed.errors.join('; ') };
-
-  const flagIntent: TaskFlagIntent = {};
-  if (parsed.intent?.turnModel) flagIntent.turnModel = parsed.intent.turnModel;
-  if (parsed.intent?.turnEffort) flagIntent.turnEffort = parsed.intent.turnEffort;
-  return { flagIntent };
-}
+import { resolveTaskFlagIntent } from './task-flags.js';
 
 /**
  * Open the channel-root session's inbound.db for a (agent_group_id,

@@ -927,6 +927,85 @@ describe('dispatchResultText — unwrapped output fallback', () => {
   });
 });
 
+describe('task-fire routing — a stamped `ncl tasks` row routes end-to-end', () => {
+  // Simulates what the host now writes for a routed task series (WI1): a
+  // messages_in row with kind='task' carrying its own platform_id/channel_type/
+  // thread_id, plus a matching `destinations` row for that channel (as if
+  // writeDestinations projected the agent group's wired channel on wake).
+  function seedDestination(name: string, channelType: string, platformId: string): void {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES (?, ?, 'channel', ?, ?, NULL)`,
+      )
+      .run(name, name, channelType, platformId);
+  }
+
+  function insertTaskRow(
+    id: string,
+    platformId: string | null,
+    channelType: string | null,
+    threadId: string | null,
+  ): void {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, kind, timestamp, status, trigger, platform_id, channel_type, thread_id, content)
+         VALUES (?, 'task', datetime('now'), 'pending', 1, ?, ?, ?, '{"prompt":"do the thing"}')`,
+      )
+      .run(id, platformId, channelType, threadId);
+  }
+
+  it('an unwrapped reply from a task-only batch routes to the row\'s stamped channel+thread, in_reply_to null', () => {
+    seedDestination('slack-main', 'slack', 'C-TASK');
+    insertTaskRow('task-1', 'C-TASK', 'slack', 'thread-99');
+
+    const routing = extractRouting(getPendingMessages());
+    expect(routing.taskFire).toBe(true);
+    expect(routing.platformId).toBe('C-TASK');
+    expect(routing.threadId).toBe('thread-99');
+
+    dispatchResultText('forgot to wrap — here is the run summary', routing);
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(out[0].channel_type).toBe('slack');
+    expect(out[0].platform_id).toBe('C-TASK');
+    // Inherited via resolveDestinationThread — the task row is the latest
+    // (only) messages_in row for this channel+platform in this session.
+    expect(out[0].thread_id).toBe('thread-99');
+    expect(out[0].in_reply_to).toBeNull();
+    expect(JSON.parse(out[0].content).text).toBe('forgot to wrap — here is the run summary');
+  });
+
+  it('an explicit <message to=...> from the same task fire also lands with the stamped thread and in_reply_to null', () => {
+    seedDestination('slack-main', 'slack', 'C-TASK');
+    insertTaskRow('task-2', 'C-TASK', 'slack', 'thread-99');
+
+    const routing = extractRouting(getPendingMessages());
+    dispatchResultText('<message to="slack-main">explicit task reply</message>', routing);
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(1);
+    expect(out[0].thread_id).toBe('thread-99');
+    expect(out[0].in_reply_to).toBeNull();
+    expect(JSON.parse(out[0].content).text).toBe('explicit task reply');
+  });
+
+  it('an isolated (unrouted) task row has no destination match and the unwrapped reply is dropped', () => {
+    // No destination seeded, and the task row itself carries null routing
+    // (the --isolated case) — origin-fallback and single-destination
+    // fallback both miss, so the reply is discarded, not broadcast.
+    insertTaskRow('task-3', null, null, null);
+
+    const routing = extractRouting(getPendingMessages());
+    expect(routing.platformId).toBeNull();
+
+    dispatchResultText('nobody to tell', routing);
+
+    expect(getUndeliveredMessages()).toHaveLength(0);
+  });
+});
+
 describe('dispatchResultText — unclosed-wrapper tolerance', () => {
   // Production repro (illie-codex, 2026-05-17 Slack thread C0AJA89MN2E):
   // the agent emitted two `<message to="slack_illysium_agents_xzo">`

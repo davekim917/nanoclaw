@@ -67,12 +67,17 @@ function addMg(id: string, channelType: string, platformId: string, name: string
     .run(id, channelType, platformId, name);
 }
 
-function addSession(id: string, agentGroupId: string, messagingGroupId: string | null): void {
+function addSession(
+  id: string,
+  agentGroupId: string,
+  messagingGroupId: string | null,
+  threadId: string | null = null,
+): void {
   getDb()
     .prepare(
-      "INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, status, created_at) VALUES (?, ?, ?, NULL, 'active', datetime('now'))",
+      "INSERT INTO sessions (id, agent_group_id, messaging_group_id, thread_id, status, created_at) VALUES (?, ?, ?, ?, 'active', datetime('now'))",
     )
-    .run(id, agentGroupId, messagingGroupId);
+    .run(id, agentGroupId, messagingGroupId, threadId);
 }
 
 function sessionDir(agentGroupId: string, sessionId: string): string {
@@ -290,6 +295,75 @@ describe('assembleSnapshot — chunking + cache + partial', () => {
     const dupRows = snap.rows.filter((r) => r.series_id === 'dup');
     // Both fireable rows surface (not just MAX(seq)) so neither stays hidden.
     expect(dupRows.length).toBe(2);
+  });
+});
+
+describe('assembleSnapshot — isolated system task sessions', () => {
+  it('enumerates unstamped and routing-stamped system-session rows', async () => {
+    addGroup('ag-1', 'G1', 'g1', 'claude');
+    addMg('mg-1', 'discord', 'd:1', 'chan-1');
+
+    addSession('sys-unstamped', 'ag-1', null, 'system:tasks:series-unstamped');
+    insertInboundRow(seedSessionDbs('ag-1', 'sys-unstamped').inbound, {
+      id: 'unstamped-row',
+      series_id: 'series-unstamped',
+      process_after: isoIn(3600_000),
+      content: JSON.stringify({ prompt: 'compile the system-session quokka report' }),
+      platform_id: null,
+      channel_type: null,
+      thread_id: null,
+    });
+
+    addSession('sys-stamped', 'ag-1', null, 'system:tasks:series-stamped');
+    insertInboundRow(seedSessionDbs('ag-1', 'sys-stamped').inbound, {
+      id: 'stamped-row',
+      series_id: 'series-stamped',
+      process_after: isoIn(3600_000),
+      platform_id: 'd:1',
+      channel_type: 'discord',
+      thread_id: 'chat-thread-42',
+    });
+
+    const snap = await assembleSnapshot(ALL_SCOPES, opts());
+    const unstamped = snap.rows.find((r) => r.series_id === 'series-unstamped')!;
+    const stamped = snap.rows.find((r) => r.series_id === 'series-stamped')!;
+
+    expect(unstamped).toMatchObject({
+      agent_group_id: 'ag-1',
+      provider: 'claude',
+      channel_name: null,
+      channel_type: null,
+      thread_id: null,
+      kind: 'recurring',
+      health: 'healthy',
+    });
+    expect(unstamped.available_verbs).toContain('move');
+    expect(snap.search_index[unstamped.key]).toContain('quokka');
+
+    expect(stamped).toMatchObject({
+      channel_name: 'chan-1',
+      channel_type: 'discord',
+      thread_id: 'chat-thread-42',
+      kind: 'thread_loop',
+      health: 'healthy',
+    });
+    expect(stamped.available_verbs).not.toContain('move');
+  });
+
+  it('derives overdue health for a system-session row', async () => {
+    addGroup('ag-1', 'G1', 'g1');
+    addSession('sys-overdue', 'ag-1', null, 'system:tasks:series-overdue');
+    insertInboundRow(seedSessionDbs('ag-1', 'sys-overdue').inbound, {
+      id: 'overdue-row',
+      series_id: 'series-overdue',
+      recurrence: '0 9 * * *',
+      process_after: isoIn(-13 * 3600_000),
+    });
+
+    const snap = await assembleSnapshot(ALL_SCOPES, opts());
+    const overdue = snap.rows.find((r) => r.series_id === 'series-overdue')!;
+    expect(overdue.health).toBe('stalled');
+    expect(overdue.available_verbs).toContain('run_now');
   });
 });
 
