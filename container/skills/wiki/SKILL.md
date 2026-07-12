@@ -25,7 +25,7 @@ You are the maintainer of `wiki/` — a persistent, compounding markdown knowled
 ```
 wiki/
   index.md            — catalog of every page; updated on every ingest
-  log.md              — append-only activity log; every ingest/lint adds an entry
+  log.md              — append-only activity log; every ingest and every lint that changes the wiki adds an entry
   entities/           — clients, products, repos, people (apollo.md, xzo.md, ...)
   concepts/           — reusable patterns and playbooks (snowflake-sp-overloads.md, dbt-refactor-grep.md, ...)
   timelines/          — chronological arcs (xzo-multi-tenant-refactor.md, apollo-go-live.md, ...)
@@ -75,7 +75,7 @@ Periodic health check. Triggered manually or by a scheduled task. Walk the wiki 
 - **Concept gaps** — repeated mentions of a topic across multiple pages with no dedicated concept page.
 - **Index drift** — pages that exist on disk but aren't in `index.md`, or index entries pointing at deleted files.
 
-Report findings to the user. Offer to fix; don't fix silently.
+For a manual lint, report findings to the user and offer to fix them. A scheduled lint task may carry standing approval to fix first; follow that task prompt. Append a lint entry to `log.md` only when the lint changes the wiki. If there are zero findings, do not modify `log.md` and do not post a no-op message.
 
 ## Page conventions
 

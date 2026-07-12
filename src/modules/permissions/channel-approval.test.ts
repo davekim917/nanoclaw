@@ -73,7 +73,11 @@ vi.mock('./user-dm.js', () => ({
 
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-channel-approval' };
+  return {
+    ...actual,
+    DATA_DIR: '/tmp/nanoclaw-test-channel-approval',
+    GROUPS_DIR: '/tmp/nanoclaw-test-channel-approval/groups',
+  };
 });
 
 const TEST_DIR = '/tmp/nanoclaw-test-channel-approval';
@@ -85,6 +89,7 @@ function now() {
 beforeEach(async () => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
   fs.mkdirSync(TEST_DIR, { recursive: true });
+  fs.mkdirSync(`${TEST_DIR}/groups`, { recursive: true });
   const db = initTestDb();
   runMigrations(db);
 

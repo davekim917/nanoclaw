@@ -7,9 +7,8 @@
  *
  *   1. Iterates every directory under groups/ that has a container.json with
  *      an agentGroupId. Skips groups already memory-enabled.
- *   2. Staggers synth-task processAfter offsets across groups (Codex F6) so
- *      the first run of the daily synth task fires at most one group at a
- *      time, not 11 simultaneous.
+ *   2. Staggers recurring synth and lint crons across groups (Codex F6) so
+ *      their model calls do not fire simultaneously.
  *   3. Two-pass docker-stop with a settle window (architecture-advisor
  *      recommendation): stop containers immediately, wait 30s for any
  *      in-flight spawns to land, stop the now-running containers a second
@@ -160,7 +159,9 @@ async function main(): Promise<void> {
     console.log(`  • sources subdirs: ok`);
     console.log(`  • mnemon store: ${bs.step2_mnemonStoreStatus}${bs.step2_mnemonStoreError ? ` (${bs.step2_mnemonStoreError.trim()})` : ''}`);
     console.log(`  • synth task: ${bs.step3_synthTaskScheduled ? `scheduled (cron='${bs.step3_synthCron}')` : 'FAILED — re-run to retry'}`);
-    console.log(`  • lint task:  ${bs.step4_lintTaskScheduled ? `scheduled (cron='${bs.step4_lintCron}')` : 'FAILED — re-run to retry'}`);
+    console.log(
+      `  • lint task:  ${bs.step4_lintTaskScheduled ? `scheduled (change-gated, cron='${bs.step4_lintCron}')` : 'FAILED — re-run to retry'}`,
+    );
 
     // Step 3: first-pass docker stop
     const r1 = restartGroupContainers(g.folder);
@@ -187,6 +188,7 @@ async function main(): Promise<void> {
     `\nBulk enable complete.\n` +
       `  • ${groups.length} groups reconciled (${newlyEnabled.length} newly enabled, ${reconcile.length} re-bootstrapped).\n` +
       `  • Synth tasks distributed across 03:03–03:53 local time, ${STAGGER_INTERVAL_MINUTES}min apart.\n` +
+      `  • Lint tasks distributed across Sundays 10:03–10:53 local time and change-gated.\n` +
       `  • Memory daemon picks up new watchers on its next 60s sweep.\n` +
       `\n` +
       `If you see a group with no captures landing in groups/<folder>/sources/inbox/ after\n` +

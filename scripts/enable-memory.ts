@@ -9,6 +9,7 @@
  *        a. Create the 7 sources subdirs (idempotent).
  *        b. Create the mnemon store for the agentGroupId if it doesn't exist.
  *        c. Schedule the daily synthesise task (idempotent via seriesId).
+ *        d. Schedule the weekly wiki-lint task (idempotent via seriesId).
  *   3. Stop running containers for this group so the next inbound message
  *      respawns with MNEMON_STORE set.
  *
@@ -67,7 +68,7 @@ async function main(): Promise<void> {
   atomicWriteJson(containerJsonPath, raw);
   console.log(`[1/3] memory.enabled = true written to groups/${folder}/container.json`);
 
-  // Step 2: shared bootstrap (sources/ + mnemon store + synth task)
+  // Step 2: shared bootstrap (sources/ + mnemon store + wiki tasks)
   const r = await bootstrapMemoryForGroup(folder, agentGroupId);
   console.log(`[2/3] sources subdirs created/verified`);
   if (r.step2_mnemonStoreStatus === 'created') {
@@ -88,7 +89,7 @@ async function main(): Promise<void> {
   }
   if (r.step4_lintTaskScheduled) {
     console.log(
-      `      weekly lint task scheduled (provider task defaults, cron='${r.step4_lintCron}', seriesId: ${r.step4_lintSeriesId})`,
+      `      weekly lint task scheduled (provider task defaults, change-gated, cron='${r.step4_lintCron}', seriesId: ${r.step4_lintSeriesId})`,
     );
   } else {
     console.warn(`      Warning: lint task scheduling failed (re-run to retry)`);

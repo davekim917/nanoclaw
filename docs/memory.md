@@ -16,12 +16,13 @@ mnemon graph (~/.mnemon/data/<agentGroupId>/)
 Wiki pages (groups/<g>/wiki/)
 ```
 
-**Three core ops:**
+**Four core ops:**
 
 | Op | When | Effect |
 |---|---|---|
 | **extract** | On file drop into sources/ or chat-stream classifier match | Facts written to mnemon store |
 | **synthesise** | Daily local-time cron via a change-gated scheduled task | Wiki pages updated only when the fact graph changed since the previous completed run |
+| **lint** | Weekly local-time cron via a change-gated scheduled task | Wiki consistency checked only when wiki content changed since the previous completed lint; `log.md` alone never triggers it |
 | **recall** | On agent turn (via MCP tool) | Ranked facts injected into context |
 
 **Host daemon** (`nanoclaw-memory-daemon`, `dist/memory-daemon/index.js`): runs as a systemd service alongside `nanoclaw-v2`. Watches enabled groups' `sources/inbox/` directories via inotify and classifies chat-stream turns. Reads `container.json`'s `memory.enabled` field per group on each 60s sweep.
@@ -45,6 +46,7 @@ What happens:
 2. Seven `groups/<g>/sources/` subdirs created: `inbox/`, `articles/`, `docs/`, `transcripts/`, `clips/`, `media/`, `processed/`. Existing dirs are preserved.
 3. `mnemon store create <agentGroupId>` runs — "already exists" errors are silently swallowed.
 4. A daily synthesise task is scheduled (cron `0 3 * * *`, seriesId `memory-synth-<agentGroupId>`). It inherits the provider's scheduled-task model/effort defaults and uses a deterministic pre-task gate, so an unchanged Mnemon graph costs no model call and posts nothing. Idempotent — re-running updates the existing row instead of inserting a duplicate.
+5. A weekly wiki-lint task is scheduled (cron `0 10 * * 0`, seriesId `memory-lint-<agentGroupId>`). It uses the same provider defaults and a deterministic pre-task gate, so an unchanged or empty wiki costs no model call and posts nothing. Changes to `wiki/log.md` alone are ignored. Idempotent like synth.
 
 No service restart needed. The daemon picks up newly enabled groups on its next 60s sweep.
 
@@ -64,7 +66,7 @@ pnpm exec tsx scripts/disable-memory.ts illysium
 
 What happens:
 1. `memory` block removed from `groups/<g>/container.json` (atomic write).
-2. Active synthesise task cancelled from the group's session `inbound.db`.
+2. Active synthesise and wiki-lint tasks cancelled from the group's session `inbound.db`.
 3. `watermarks` rows for this `agentGroupId` removed from `data/mnemon-ingest.db`.
 4. `dead_letters` rows in `data/mnemon-ingest.db` are **preserved** for operator review.
 5. `~/.mnemon/data/<agentGroupId>/` is **preserved** for operator audit.

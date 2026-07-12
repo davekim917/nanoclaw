@@ -5,7 +5,7 @@
  *
  * Steps:
  *   1. Remove the memory block from groups/<g>/container.json (atomic write).
- *   2. Cancel the synthesise scheduled task in the group's session inbound.db.
+ *   2. Cancel the synthesise and lint scheduled tasks in the group's session inbound.db.
  *   3. Remove watermarks rows for this agentGroupId from data/mnemon-ingest.db.
  *   4. Preserve dead_letters rows (operator review).
  *   5. Preserve ~/.mnemon/data/<agentGroupId>/ (operator audit trail).
@@ -19,12 +19,11 @@ import Database from 'better-sqlite3';
 import { DATA_DIR, GROUPS_DIR } from '../src/config.js';
 import { initDb } from '../src/db/connection.js';
 import { openMnemonIngestDb, runMnemonIngestMigrations } from '../src/db/migrations/019-mnemon-ingest-db.js';
+import { LINT_SERIES_PREFIX, SYNTH_SERIES_PREFIX } from '../src/modules/memory/bootstrap.js';
 import { restartGroupContainers } from './lib/restart-group-containers.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DB_PATH = path.join(__dirname, '..', 'data', 'v2.db');
-
-const SYNTH_SERIES_PREFIX = 'memory-synth-';
 
 function atomicWriteJson(filePath: string, data: unknown): void {
   const tmp = `${filePath}.tmp`;
@@ -70,9 +69,9 @@ async function main(): Promise<void> {
   // Step 1: remove memory block from container.json (atomic write)
   delete raw.memory;
   atomicWriteJson(containerJsonPath, raw);
-  console.log(`[1/3] memory block removed from groups/${folder}/container.json`);
+  console.log(`[1/4] memory block removed from groups/${folder}/container.json`);
 
-  // Step 2: cancel synthesise scheduled task wherever it lives.
+  // Step 2: cancel synthesise and lint scheduled tasks wherever they live.
   //
   // Pre-2026-05-08 the synth task could land in either a thread session's
   // inbound.db (legacy MCP-route) or the channel-root session (correct
@@ -80,7 +79,7 @@ async function main(): Promise<void> {
   // (agent, primary MG) pair. To handle both worlds safely without a central
   // DB lookup, scan every session inbound.db belonging to the agent group
   // and delete + de-recur on whichever has the series.
-  const seriesId = `${SYNTH_SERIES_PREFIX}${agentGroupId}`;
+  const seriesIds = [`${SYNTH_SERIES_PREFIX}${agentGroupId}`, `${LINT_SERIES_PREFIX}${agentGroupId}`];
   const groupSessionsDir = path.join(DATA_DIR, 'v2-sessions', agentGroupId);
   let totalDeleted = 0;
   let totalCleared = 0;
@@ -96,16 +95,16 @@ async function main(): Promise<void> {
       try {
         const deleted = db
           .prepare(
-            "DELETE FROM messages_in WHERE series_id = ? AND status IN ('pending', 'paused') AND kind = 'task'",
+            "DELETE FROM messages_in WHERE series_id IN (?, ?) AND status IN ('pending', 'paused') AND kind = 'task'",
           )
-          .run(seriesId);
+          .run(...seriesIds);
         // Clear recurrence on completed/failed rows so the recurrence handler
         // can't clone a fresh pending instance from a terminal row.
         const cleared = db
           .prepare(
-            "UPDATE messages_in SET recurrence = NULL WHERE series_id = ? AND recurrence IS NOT NULL AND kind = 'task'",
+            "UPDATE messages_in SET recurrence = NULL WHERE series_id IN (?, ?) AND recurrence IS NOT NULL AND kind = 'task'",
           )
-          .run(seriesId);
+          .run(...seriesIds);
         totalDeleted += deleted.changes;
         totalCleared += cleared.changes;
       } finally {
@@ -115,11 +114,11 @@ async function main(): Promise<void> {
   }
   if (totalDeleted > 0 || totalCleared > 0) {
     console.log(
-      `[2/3] cancelled synthesise task (seriesId: ${seriesId}) across ${scanned} session DB(s): ${totalDeleted} active row(s) deleted, ${totalCleared} terminal row(s) cleared of recurrence`,
+      `[2/4] cancelled memory tasks (seriesIds: ${seriesIds.join(', ')}) across ${scanned} session DB(s): ${totalDeleted} active row(s) deleted, ${totalCleared} terminal row(s) cleared of recurrence`,
     );
   } else {
     console.log(
-      `[2/3] no synthesise task found for seriesId: ${seriesId} across ${scanned} session DB(s) (already cancelled or never scheduled)`,
+      `[2/4] no memory tasks found for seriesIds: ${seriesIds.join(', ')} across ${scanned} session DB(s) (already cancelled or never scheduled)`,
     );
   }
 
@@ -131,7 +130,7 @@ async function main(): Promise<void> {
     const r = ingestDb
       .prepare('DELETE FROM watermarks WHERE agent_group_id = ?')
       .run(agentGroupId);
-    console.log(`[3/3] removed ${r.changes} watermark row(s) for ${agentGroupId} from data/mnemon-ingest.db`);
+    console.log(`[3/4] removed ${r.changes} watermark row(s) for ${agentGroupId} from data/mnemon-ingest.db`);
     console.log(`      dead_letters rows preserved for operator review`);
     console.log(`      ~/.mnemon/data/${agentGroupId}/ preserved for operator audit`);
   } finally {

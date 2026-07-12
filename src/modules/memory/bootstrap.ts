@@ -74,7 +74,7 @@ If two facts contradict, surface both rather than silently picking one. If a fac
 
 REPORT DISCIPLINE: if you made ZERO new pages and ZERO updates to existing pages, the chat reply is EMPTY. Send nothing. Produce no text. Do not announce that you are being silent. Do not post "no-op logged", "mnemon empty", "nothing to compile", "wiki directories are empty", "per discipline completing silently", or any other meta-explanation of why nothing happened — those are still chat messages and they are noise. The wiki/log.md entry is the only record of the no-op run. Posting any meta-comment is a rule violation. Otherwise (if real changes were made), send ONE concise line summarising what changed (e.g. "Updated 2 entity pages, created 1 timeline page."). Do not narrate the work, do not list every page touched.`;
 
-const LINT_PROMPT = `Run wiki lint per the lint section of /app/container/skills/wiki/SKILL.md.
+export const LINT_PROMPT = `Run wiki lint per the lint section of /app/container/skills/wiki/SKILL.md.
 
 Walk wiki/ and check for:
 - Contradictions (page A says X, page B says ¬X)
@@ -84,12 +84,16 @@ Walk wiki/ and check for:
 - Concept gaps (repeated topic across multiple pages with no dedicated concept page)
 - Index drift (pages on disk not in index.md, or index entries pointing at deleted files)
 
-FIX-FIRST DISCIPLINE: do not ask permission. Fix every finding you discover in this pass, then report what you fixed. Do not split the work into "small portion now, more later" — the operator has standing approval for full cleanup. Append a single audit entry to wiki/log.md covering everything fixed.
+FIX-FIRST DISCIPLINE: do not ask permission. Fix every finding you discover in this pass, then report what you fixed. Do not split the work into "small portion now, more later" — the operator has standing approval for full cleanup. If you fixed at least one finding, append a single audit entry to wiki/log.md covering everything fixed. If you found nothing, do not modify wiki/log.md.
 
 REPORT DISCIPLINE: if zero findings, the chat reply is EMPTY. Send nothing. Produce no text. Do not announce that you are being silent. Do not post "no findings", "wiki is clean", "nothing to fix", "per discipline completing silently", or any other meta-explanation of why nothing happened — those are still chat messages and they are noise. Posting any meta-comment is a rule violation. If you fixed findings, post ONE concise summary line listing what was fixed (e.g. "Fixed 3 contradictions, removed 2 orphan pages, added 4 missing cross-references, reconciled index drift on 1 page."). Do not narrate, do not list every page individually, do not ask for further approval.`;
 
 function synthGateScript(seriesId: string): string {
   return `bun /app/src/scheduling/wiki-synth-gate.ts ${seriesId}`;
+}
+
+function lintGateScript(seriesId: string): string {
+  return `bun /app/src/scheduling/wiki-lint-gate.ts ${seriesId}`;
 }
 
 export interface BootstrapResult {
@@ -129,8 +133,8 @@ export interface BootstrapOptions {
 }
 
 /**
- * Idempotently create the sources/ subdirs, mnemon store, and synth scheduled
- * task for a memory-enabled group. Does NOT touch container.json (caller's
+ * Idempotently create the sources/ subdirs, mnemon store, and scheduled wiki
+ * tasks for a memory-enabled group. Does NOT touch container.json (caller's
  * responsibility — single-group enable writes it explicitly; create_agent
  * relies on the emptyConfig default). Does NOT restart containers (also
  * caller's responsibility — create_agent's spawn-once flow already gets
@@ -248,8 +252,9 @@ export async function bootstrapMemoryForGroup(
   // weekly so processAfter must be the NEXT cron fire (not "now") — otherwise
   // a re-bootstrap fires lint immediately, ahead of the user's expected
   // "Sundays at 10am" cadence. Same destination as synth (parent channel,
-  // threadId=null) and same quietStatus:true. Both tasks intentionally leave
-  // model/effort unpinned so provider-level scheduled-task defaults apply.
+  // threadId=null), same quietStatus:true, and its own deterministic zero-token
+  // gate. Both tasks intentionally leave model/effort unpinned so
+  // provider-level scheduled-task defaults apply.
   let lintProcessAfter: string;
   try {
     const { CronExpressionParser } = await import('cron-parser');
@@ -272,6 +277,9 @@ export async function bootstrapMemoryForGroup(
         processAfter: lintProcessAfter,
         seriesId: result.step4_lintSeriesId,
         prompt: LINT_PROMPT,
+        // Skip the model when no wiki content changed since this series' last
+        // completed occurrence. Root wiki/log.md is excluded from the gate.
+        script: lintGateScript(result.step4_lintSeriesId),
         quietStatus: true,
         destination,
       },
