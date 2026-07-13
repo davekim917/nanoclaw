@@ -82,6 +82,8 @@ describe('createCodexConfigOverrides', () => {
     expect(createCodexConfigOverrides({ reasoning_effort: 'xhigh' })).toContain(
       'model_reasoning_effort="xhigh"',
     );
+    expect(createCodexConfigOverrides({ reasoning_effort: 'max' })).toContain('model_reasoning_effort="max"');
+    expect(createCodexConfigOverrides({ reasoning_effort: 'ultra' })).toContain('model_reasoning_effort="ultra"');
   });
 });
 

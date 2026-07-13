@@ -951,8 +951,8 @@ async function deliverToAgent(
   // store the flag in this session's sticky config when the operator
   // never intended it. Observed: `@Bo -e max` triggered Bo-codex's
   // accumulate path on the shared MR channel; Bo-codex emitted its own
-  // "effort → max" message and stored "max" in its session_state even
-  // though "max" isn't a valid Codex reasoning_effort value.
+  // "effort → max" message and stored the sibling-targeted value in its own
+  // session_state even though the operator never addressed that agent.
   let flagIntent: FlagIntent | undefined;
   let flagCleanedText: string | null = null;
   if (wake && (event.message.kind === 'chat' || event.message.kind === 'chat-sdk')) {

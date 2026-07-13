@@ -133,8 +133,8 @@ const MODEL_EFFORT_SUPPORT: Record<string, ReadonlySet<EffortLevel>> = {
 // sticky_model — then silently ignored by the codex provider — while
 // `-m gpt-5.5` (the model actually running) was rejected as unknown.
 
-/** Codex reasoning_effort enum — mirrors `codexConfigSchema` in the agent-runner. */
-const CODEX_VALID_EFFORT: ReadonlySet<string> = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh']);
+/** Current Codex reasoning-effort surface — mirrors `codexConfigSchema` in the agent-runner. */
+const CODEX_VALID_EFFORT: ReadonlySet<string> = new Set(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
 
 /** Convenience aliases for codex model ids (typo-tolerant dot forms). */
 const CODEX_MODEL_ALIAS_MAP: Record<string, string> = {
@@ -183,7 +183,7 @@ const CODEX_VOCAB: ProviderFlagVocab = {
   isValidModel: (resolved) => CODEX_VALID_MODEL_RE.test(resolved),
   modelHint: ' (codex models look like gpt-5.6-sol, gpt-5.5)',
   validEfforts: CODEX_VALID_EFFORT,
-  effortHint: 'none|minimal|low|medium|high|xhigh',
+  effortHint: 'low|medium|high|xhigh|max|ultra',
   allowsUltracode: false,
   effortSupportFor: () => undefined,
 };

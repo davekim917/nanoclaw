@@ -144,7 +144,7 @@ export interface ProviderOptions {
    */
   model?: string;
   /**
-   * Reasoning effort (`'low' | 'medium' | 'high' | 'xhigh' | 'max'`). Passed
+   * Reasoning effort (`'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'`). Passed
    * through to the underlying SDK. If omitted, the SDK default is used.
    */
   effort?: string;

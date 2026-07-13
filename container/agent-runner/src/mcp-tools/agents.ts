@@ -60,7 +60,7 @@ export const createAgent: McpToolDefinition = {
           description:
             "Provider-specific config. Shape depends on 'provider'. " +
             "Claude: { model?: string, effort?: 'low'|'medium'|'high'|'xhigh'|'max' }. " +
-            "Codex: { model?: string, reasoning_effort?: 'low'|'medium'|'high' }. " +
+            "Codex: { model?: string, reasoning_effort?: 'low'|'medium'|'high'|'xhigh'|'max'|'ultra' }. " +
             "Unknown keys are rejected. Keep this in sync with each provider's configSchema — " +
             "see R6 in the design for the future z.toJSONSchema() migration.",
         },

@@ -548,7 +548,7 @@ export function writeCodexHooksJson(opts?: { emailGateTimeoutSec?: number }): vo
  * shadow but not improve precedence.
  */
 export function createCodexConfigOverrides(stickyConfig?: {
-  reasoning_effort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+  reasoning_effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
 }): string[] {
   // `features.goals=true` enables Codex's goals feature for every container
   // agent — same always-on pattern as `features.use_linux_sandbox_bwrap`.

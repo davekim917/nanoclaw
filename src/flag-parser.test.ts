@@ -305,16 +305,16 @@ describe('provider-aware vocabulary (codex)', () => {
     expect(r.errors[0]).toMatch(/gpt-5\.5/);
   });
 
-  it('accepts the codex effort enum including none/minimal', () => {
-    expect(parseMessageFlags('-e minimal hi', 'codex').intent).toEqual({ stickyEffort: 'minimal' });
-    expect(parseMessageFlags('-e xhigh hi', 'codex').intent).toEqual({ stickyEffort: 'xhigh' });
+  it.each(['low', 'medium', 'high', 'xhigh', 'max', 'ultra'])('accepts the current codex effort level %s', (effort) => {
+    expect(parseMessageFlags(`-e ${effort} hi`, 'codex').intent).toEqual({ stickyEffort: effort });
+    expect(parseMessageFlags(`-e1 ${effort} hi`, 'codex').intent).toEqual({ turnEffort: effort });
   });
 
-  it("rejects claude-only 'max' effort on codex, listing the codex enum", () => {
-    const r = parseMessageFlags('-e max hi', 'codex');
+  it.each(['none', 'minimal'])('rejects unsupported codex effort level %s', (effort) => {
+    const r = parseMessageFlags(`-e ${effort} hi`, 'codex');
     expect(r.intent).toBeUndefined();
-    expect(r.errors[0]).toMatch(/unknown effort level: max/);
-    expect(r.errors[0]).toMatch(/none\|minimal\|low\|medium\|high\|xhigh/);
+    expect(r.errors[0]).toMatch(new RegExp(`unknown effort level: ${effort}`));
+    expect(r.errors[0]).toMatch(/low\|medium\|high\|xhigh\|max\|ultra/);
   });
 
   it('rejects ultracode on codex with an honest provider message', () => {

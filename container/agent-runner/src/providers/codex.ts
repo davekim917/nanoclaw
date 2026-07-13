@@ -84,9 +84,10 @@ import {
 const TURN_IDLE_TIMEOUT_MS = Number(process.env.CODEX_TURN_IDLE_TIMEOUT_MS) || 5 * 60 * 1000;
 
 /**
- * Lookup tables for translating Codex's `collabAgentToolCall` tool names
- * into human-readable progress labels. See the schema
- * `definitions/CollabAgentTool` in `codex_app_server_protocol.schemas.json`.
+ * Lookup tables for translating Codex collaboration ThreadItems into
+ * human-readable progress labels. Codex 0.144.1 emits both the legacy
+ * `collabAgentToolCall` shape and the current `subAgentActivity` lifecycle
+ * shape; both carry the originating collaboration call ID.
  */
 const COLLAB_TOOL_EMOJI: Record<string, string> = {
   spawnAgent: '🌱',
@@ -102,6 +103,69 @@ const COLLAB_TOOL_VERB: Record<string, string> = {
   wait: 'waiting on',
   closeAgent: 'closed',
 };
+
+type SubAgentActivityKind = 'started' | 'interacted' | 'interrupted';
+
+const SUBAGENT_ACTIVITY_EMOJI: Record<SubAgentActivityKind, string> = {
+  started: '🌱',
+  interacted: '📨',
+  interrupted: '🛑',
+};
+
+type CodexCollaborationThreadItem = {
+  id?: unknown;
+  type?: unknown;
+  tool?: unknown;
+  receiverThreadIds?: unknown;
+  agentPath?: unknown;
+  kind?: unknown;
+};
+
+/**
+ * Translate a Codex collaboration ThreadItem into a status message.
+ *
+ * The app-server may surface the same collaboration action through both
+ * `collabAgentToolCall` and `subAgentActivity` (and through both item lifecycle
+ * notifications). Their required `id` is the originating collaboration call
+ * ID, so a per-turn set safely suppresses duplicate renderings without hiding
+ * distinct actions against the same child agent.
+ */
+export function formatCodexCollaborationProgress(
+  rawItem: unknown,
+  emittedItemIds: Set<string>,
+): string | null {
+  if (!rawItem || typeof rawItem !== 'object') return null;
+  const item = rawItem as CodexCollaborationThreadItem;
+  let message: string | null = null;
+
+  if (item.type === 'collabAgentToolCall' && typeof item.tool === 'string') {
+    const emoji = COLLAB_TOOL_EMOJI[item.tool] ?? '🔧';
+    const verb = COLLAB_TOOL_VERB[item.tool] ?? item.tool;
+    const receivers = Array.isArray(item.receiverThreadIds)
+      ? item.receiverThreadIds.filter((id): id is string => typeof id === 'string')
+      : [];
+    const receiverLabel = receivers.length > 0
+      ? ` (${receivers.length} agent${receivers.length === 1 ? '' : 's'})`
+      : '';
+    message = `${emoji} subagent: ${verb}${receiverLabel}`;
+  } else if (
+    item.type === 'subAgentActivity'
+    && (item.kind === 'started' || item.kind === 'interacted' || item.kind === 'interrupted')
+  ) {
+    const kind = item.kind;
+    const agentPath = typeof item.agentPath === 'string' && item.agentPath.trim()
+      ? ` (${item.agentPath.trim()})`
+      : '';
+    message = `${SUBAGENT_ACTIVITY_EMOJI[kind]} subagent: ${kind}${agentPath}`;
+  }
+
+  if (!message) return null;
+
+  const itemId = typeof item.id === 'string' ? item.id.trim() : '';
+  if (itemId && emittedItemIds.has(itemId)) return null;
+  if (itemId) emittedItemIds.add(itemId);
+  return message;
+}
 
 // Thinking-label helpers — mirror the Claude provider's truncate /
 // formatBlockquoteLabel / NANOCLAW_HIDE_THINKING semantics so Codex
@@ -206,10 +270,10 @@ export function materializeRawImageGeneration(
 
 // ── Provider config schema ──────────────────────────────────────────────────
 // Mirrors the `claudeConfigSchema` pattern but with Codex-native vocabulary:
-// `reasoning_effort` instead of Claude's `effort`. Enum mirrors the
-// `ReasoningEffort` definition exposed by `codex app-server generate-json-schema`
-// (none | minimal | low | medium | high | xhigh) — gpt-5.2-codex and gpt-5.5
-// both support xhigh per OpenAI's model docs.
+// `reasoning_effort` instead of Claude's `effort`. Codex 0.144.1 exposes
+// reasoning effort as a model-advertised string; its current model catalog
+// uses low | medium | high | xhigh | max | ultra. Ultra is a real Codex effort
+// value that adds proactive task delegation, not Claude's `ultracode` flag.
 //
 // Default is `xhigh` for the production model (gpt-5.6-sol); operators can dial
 // down per-agent via container.json when cost/latency matters more than
@@ -220,7 +284,7 @@ export function materializeRawImageGeneration(
 // fields are not currently exposed by Codex's `thread/start` shape.
 export const codexConfigSchema = z.strictObject({
   model: z.string().min(1).optional(),
-  reasoning_effort: z.enum(['none', 'minimal', 'low', 'medium', 'high', 'xhigh']).optional().default('xhigh'),
+  reasoning_effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']).optional().default('xhigh'),
 });
 
 registerProviderConfigSchema('codex', codexConfigSchema);
@@ -236,7 +300,7 @@ registerProviderConfigSchema('codex', codexConfigSchema);
 /** Mirrors CODEX_VALID_MODEL_RE in the host's flag-parser (separate package trees). */
 export const CODEX_MODEL_RE = /^gpt-[a-z0-9][a-z0-9.-]*$/;
 
-const CODEX_EFFORT_VALUES: ReadonlySet<string> = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh']);
+const CODEX_EFFORT_VALUES: ReadonlySet<string> = new Set(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
 
 type CodexStickyConfig = z.infer<typeof codexConfigSchema>;
 
@@ -250,7 +314,7 @@ export function resolveQueryModel(requested: string | undefined, fallback: strin
 
 /**
  * Sticky config with the flag-requested effort folded in (when valid for
- * codex's reasoning_effort enum). Returned object feeds
+ * Codex's currently supported reasoning-effort set). Returned object feeds
  * createCodexConfigOverrides at app-server spawn — one server per query, so
  * a per-query effort lands as `-c model_reasoning_effort` naturally.
  */
@@ -1090,6 +1154,7 @@ async function* runOneTurn(
   const reasoningItemsWithDeltas = new Set<string>();
   const emittedReasoningItemIds = new Set<string>();
   const emittedImageKeys = new Set<string>();
+  const emittedCollaborationItemIds = new Set<string>();
 
   // Buffered event queue so we can `yield` across the async notification
   // callback. Each notification pushes zero or more ProviderEvents; the
@@ -1125,6 +1190,11 @@ async function* runOneTurn(
     if (emittedImageKeys.has(key)) return;
     emittedImageKeys.add(key);
     buffer.push({ type: 'file', path: filePath });
+  };
+
+  const emitCollaborationProgress = (item: unknown): void => {
+    const message = formatCodexCollaborationProgress(item, emittedCollaborationItemIds);
+    if (message) buffer.push({ type: 'progress', message });
   };
 
   // Idle watchdog: armed below, reset on every notification when no
@@ -1216,31 +1286,15 @@ async function* runOneTurn(
         break;
       }
       case 'item/started': {
-        // Surface subagent activity (spawn/wait/close) as progress events
-        // so the dashboard + Slack status messages show the same kind of
-        // signal Claude sessions emit via parent_tool_use_id rendering.
-        // Codex shape (per codex_app_server_protocol schema):
-        //   { type: 'collabAgentToolCall', tool: <spawnAgent|sendInput|
-        //     resumeAgent|wait|closeAgent>, senderThreadId, receiverThreadIds }
-        const item = params.item as
-          | {
-              type?: string;
-              tool?: 'spawnAgent' | 'sendInput' | 'resumeAgent' | 'wait' | 'closeAgent';
-              receiverThreadIds?: string[];
-            }
-          | undefined;
-        if (item?.type === 'collabAgentToolCall' && item.tool) {
-          const emoji = COLLAB_TOOL_EMOJI[item.tool] ?? '🔧';
-          const verb = COLLAB_TOOL_VERB[item.tool] ?? item.tool;
-          const recv = item.receiverThreadIds?.length
-            ? ` (${item.receiverThreadIds.length} agent${item.receiverThreadIds.length === 1 ? '' : 's'})`
-            : '';
-          buffer.push({ type: 'progress', message: `${emoji} subagent: ${verb}${recv}` });
-        }
+        // Surface both the legacy collab tool-call shape and Codex 0.144.1's
+        // native sub-agent lifecycle events. Some app-server versions also
+        // repeat ThreadItems at completion; the required item ID dedupes them.
+        emitCollaborationProgress(params.item);
         break;
       }
       case 'item/completed': {
         const item = params.item as ({ type?: string; text?: string } & ReasoningThreadItem & ImageGenerationThreadItem) | undefined;
+        emitCollaborationProgress(item);
         if (item?.type === 'agentMessage' && item.text) resultText = item.text;
         if (item?.type === 'reasoning') emitCompletedReasoningItem(item);
         const generatedImagePath = extractImageGenerationPath(item);

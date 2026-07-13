@@ -13,6 +13,7 @@ import {
   extractImageGenerationPath,
   findNewestRolloutAcrossHomes,
   findRolloutFile,
+  formatCodexCollaborationProgress,
   materializeRawImageGeneration,
   mirrorCodexAgentsToHome,
   refreshCodexAuthFromHost,
@@ -242,6 +243,79 @@ describe('createProvider (codex)', () => {
         else process.env.HTTPS_PROXY = snapshot;
       }
     });
+  });
+});
+
+describe('formatCodexCollaborationProgress', () => {
+  it('renders current subAgentActivity lifecycle events with the agent path', () => {
+    const emittedIds = new Set<string>();
+
+    expect(formatCodexCollaborationProgress({
+      type: 'subAgentActivity',
+      id: 'call-start',
+      agentPath: '/root/researcher',
+      agentThreadId: 'thread-1',
+      kind: 'started',
+    }, emittedIds)).toBe('🌱 subagent: started (/root/researcher)');
+    expect(formatCodexCollaborationProgress({
+      type: 'subAgentActivity',
+      id: 'call-interact',
+      agentPath: '/root/researcher',
+      agentThreadId: 'thread-1',
+      kind: 'interacted',
+    }, emittedIds)).toBe('📨 subagent: interacted (/root/researcher)');
+    expect(formatCodexCollaborationProgress({
+      type: 'subAgentActivity',
+      id: 'call-interrupt',
+      agentPath: '/root/researcher',
+      agentThreadId: 'thread-1',
+      kind: 'interrupted',
+    }, emittedIds)).toBe('🛑 subagent: interrupted (/root/researcher)');
+  });
+
+  it('preserves legacy collabAgentToolCall progress rendering', () => {
+    expect(formatCodexCollaborationProgress({
+      type: 'collabAgentToolCall',
+      id: 'call-spawn',
+      tool: 'spawnAgent',
+      receiverThreadIds: ['thread-1'],
+    }, new Set())).toBe('🌱 subagent: spawned (1 agent)');
+  });
+
+  it('deduplicates legacy and current event shapes sharing a protocol item id', () => {
+    const emittedIds = new Set<string>();
+    const legacy = {
+      type: 'collabAgentToolCall',
+      id: 'call-shared',
+      tool: 'spawnAgent',
+      receiverThreadIds: ['thread-1'],
+    };
+    const current = {
+      type: 'subAgentActivity',
+      id: 'call-shared',
+      agentPath: '/root/researcher',
+      agentThreadId: 'thread-1',
+      kind: 'started',
+    };
+
+    expect(formatCodexCollaborationProgress(legacy, emittedIds)).not.toBeNull();
+    expect(formatCodexCollaborationProgress(current, emittedIds)).toBeNull();
+
+    const reverseOrderIds = new Set<string>();
+    expect(formatCodexCollaborationProgress(current, reverseOrderIds)).not.toBeNull();
+    expect(formatCodexCollaborationProgress(legacy, reverseOrderIds)).toBeNull();
+  });
+
+  it('ignores unrelated and malformed collaboration items', () => {
+    const emittedIds = new Set<string>();
+    expect(formatCodexCollaborationProgress({ type: 'reasoning', id: 'reasoning-1' }, emittedIds)).toBeNull();
+    expect(formatCodexCollaborationProgress({
+      type: 'subAgentActivity',
+      id: 'call-unknown',
+      agentPath: '/root/researcher',
+      agentThreadId: 'thread-1',
+      kind: 'finished',
+    }, emittedIds)).toBeNull();
   });
 });
 
@@ -1025,7 +1099,8 @@ describe('per-query model/effort overrides (-m/-e flags)', () => {
 
     it('folds a valid codex effort into the sticky config', () => {
       expect(resolveQueryEffort('medium', sticky).reasoning_effort).toBe('medium');
-      expect(resolveQueryEffort('none', sticky).reasoning_effort).toBe('none');
+      expect(resolveQueryEffort('max', sticky).reasoning_effort).toBe('max');
+      expect(resolveQueryEffort('ultra', sticky).reasoning_effort).toBe('ultra');
     });
 
     it('does not mutate the original sticky config', () => {
@@ -1038,8 +1113,9 @@ describe('per-query model/effort overrides (-m/-e flags)', () => {
       expect(resolveQueryEffort('', sticky).reasoning_effort).toBe('xhigh');
     });
 
-    it("ignores claude-only values ('max', poisoned pre-provider-aware stickies)", () => {
-      expect(resolveQueryEffort('max', sticky).reasoning_effort).toBe('xhigh');
+    it('ignores unsupported or provider-specific values', () => {
+      expect(resolveQueryEffort('none', sticky).reasoning_effort).toBe('xhigh');
+      expect(resolveQueryEffort('minimal', sticky).reasoning_effort).toBe('xhigh');
       expect(resolveQueryEffort('ultracode', sticky).reasoning_effort).toBe('xhigh');
     });
   });
