@@ -154,7 +154,7 @@ export function decideStuckAction(args: {
 }): StuckDecision {
   const { now, heartbeatMtimeMs, containerState, claims } = args;
   const spawnedAtMs = args.spawnedAtMs ?? 0;
-  const declaredBashMs = bashTimeoutMs(containerState);
+  const declaredOperationMs = activeOperationTimeoutMs(containerState);
 
   // Ceiling check only applies when we have an actual heartbeat timestamp.
   // A freshly-spawned container hasn't had any SDK activity yet so no
@@ -166,7 +166,7 @@ export function decideStuckAction(args: {
   // claim-stuck check below handles it.
   if (heartbeatMtimeMs !== 0) {
     const heartbeatAge = now - heartbeatMtimeMs;
-    const ceiling = Math.max(ABSOLUTE_CEILING_MS, declaredBashMs ?? 0);
+    const ceiling = Math.max(ABSOLUTE_CEILING_MS, declaredOperationMs ?? 0);
     if (heartbeatAge > ceiling) {
       // Skip kill when the stale heartbeat is from a PRIOR container
       // instance AND we're still inside the spawn-grace window. The
@@ -186,7 +186,7 @@ export function decideStuckAction(args: {
     }
   }
 
-  const tolerance = Math.max(CLAIM_STUCK_MS, declaredBashMs ?? 0);
+  const tolerance = Math.max(CLAIM_STUCK_MS, declaredOperationMs ?? 0);
   // True only for claims this container could have produced itself; older
   // claims are leftovers from a prior crashed container and the fresh one
   // gets SPAWN_GRACE_MS to clean them on startup before we kill for them.
@@ -875,8 +875,8 @@ function heartbeatMtimeMs(agentGroupId: string, sessionId: string): number {
   }
 }
 
-function bashTimeoutMs(state: ContainerState | null): number | null {
-  if (!state || state.current_tool !== 'Bash') return null;
+function activeOperationTimeoutMs(state: ContainerState | null): number | null {
+  if (!state || (state.current_tool !== 'Bash' && state.current_tool !== 'CodexItem')) return null;
   return typeof state.tool_declared_timeout_ms === 'number' ? state.tool_declared_timeout_ms : null;
 }
 
@@ -1049,7 +1049,9 @@ function resetStuckProcessingRows(
   writableOutDb?: Database.Database,
 ): void {
   const claims = getProcessingClaims(outDb);
-  const respondedStmt = outDb.prepare('SELECT 1 FROM messages_out WHERE in_reply_to = ? LIMIT 1');
+  // Progress rows are not answers. Match the container-side pending-message
+  // query so an interrupted turn that emitted only status updates is retried.
+  const respondedStmt = outDb.prepare("SELECT 1 FROM messages_out WHERE in_reply_to = ? AND kind != 'status' LIMIT 1");
   const markCompletedInboundStmt = inDb.prepare(
     "UPDATE messages_in SET status = 'completed' WHERE id = ? AND status = 'pending'",
   );

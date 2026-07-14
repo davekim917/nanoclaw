@@ -181,7 +181,7 @@ Access: `container/agent-runner/src/db/session-state.ts`.
 
 ### 4.4 `container_state`
 
-Single-row (`id=1`) tool-in-flight tracker. The container records the currently-running tool on `PreToolUse` and clears it on `PostToolUse`/`PostToolUseFailure`; the host reads it during the stale-container sweep to widen its stuck-tolerance window when `Bash` is running with a user-declared `timeout` over the normal threshold, so long-running scripts aren't killed as "stuck".
+Single-row (`id=1`) host-visible operation tracker. Claude records `Bash` on `PreToolUse` and clears it on `PostToolUse`/`PostToolUseFailure`; Codex records the transition between zero and nonzero native in-flight items with a bounded one-hour deadline. The host reads the row during the stale-container sweep so known long operations are not killed by the normal 30-minute ceiling.
 
 ```sql
 CREATE TABLE container_state (
@@ -193,8 +193,9 @@ CREATE TABLE container_state (
 );
 ```
 
-- **Writer (container):** `setContainerToolInFlight()` / `clearContainerToolInFlight()` in `container/agent-runner/src/db/connection.ts`, called from the `preToolUseHook` / `postToolUseHook` in `container/agent-runner/src/providers/claude.ts`.
-- **Reader (host):** `getContainerState()` in `src/db/session-db.ts`; consumed by the sweep's `bashTimeoutMs()` helper in `src/host-sweep.ts`.
+- **Writer (container):** `setContainerToolInFlight()` / `clearContainerToolInFlight()` in `container/agent-runner/src/db/connection.ts`, called from Claude's tool hooks and Codex's native item lifecycle.
+- **Reader (host):** `getContainerState()` in `src/db/session-db.ts`; consumed by the sweep's `activeOperationTimeoutMs()` helper in `src/host-sweep.ts`.
+- **Restart cleanup:** container startup clears the prior instance's operation row along with stale `processing_ack` claims.
 - `CREATE TABLE IF NOT EXISTS` — forward-compatible with `outbound.db` files created before this table existed; `getContainerState()` returns `null` if the table or row is absent.
 
 ---

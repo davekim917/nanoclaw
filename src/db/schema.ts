@@ -281,10 +281,9 @@ CREATE TABLE IF NOT EXISTS session_state (
   updated_at TEXT NOT NULL
 );
 
--- Current tool-in-flight state. Single-row table (id=1). Container writes on
--- PreToolUse and clears on PostToolUse / PostToolUseFailure. Host reads in the
--- sweep to extend the stuck-tolerance window when Bash is running with a
--- declared timeout > 60s (long-running scripts shouldn't be flagged as stuck).
+-- Host-visible operation state. Single-row table (id=1). Claude records Bash
+-- hooks; Codex records native item lifecycle. Host reads it in the sweep to
+-- extend stuck tolerance to the bounded declared timeout.
 CREATE TABLE IF NOT EXISTS container_state (
   id                       INTEGER PRIMARY KEY CHECK (id = 1),
   current_tool             TEXT,

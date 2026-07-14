@@ -623,6 +623,29 @@ describe('codex turn timer is idle-based, not wall-clock', () => {
     // And it must still arm setTimeout in the no-tool case.
     expect(fnBody).toContain('setTimeout');
   });
+
+  it('publishes native in-flight items to the host with a bounded timeout', () => {
+    const src = fs.readFileSync(new URL('./codex.ts', import.meta.url), 'utf8');
+    const codeOnly = src
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .split('\n')
+      .map((l) => {
+        const i = l.indexOf('//');
+        return i >= 0 ? l.slice(0, i) : l;
+      })
+      .join('\n');
+
+    const decl = codeOnly.match(/const\s+CODEX_IN_FLIGHT_ITEM_TIMEOUT_MS\s*=\s*([^;]+);/);
+    expect(decl).not.toBeNull();
+    const ms = Function(`'use strict'; return (${decl![1]});`)() as number;
+    expect(ms).toBe(60 * 60 * 1000);
+
+    // The first native item publishes a host-visible bounded operation;
+    // returning to zero clears it, and finally cleanup covers abort/error.
+    expect(codeOnly).toContain("setContainerToolInFlight('CodexItem', CODEX_IN_FLIGHT_ITEM_TIMEOUT_MS)");
+    expect(codeOnly).toMatch(/inFlightItems\s*===\s*0[\s\S]{0,300}clearContainerToolInFlight\(\)/);
+    expect(codeOnly).toMatch(/finally\s*\{[\s\S]{0,500}clearContainerToolInFlight\(\)/);
+  });
 });
 
 describe('codex turn-failure classification (systemError + turn/completed:failed)', () => {

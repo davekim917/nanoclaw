@@ -19,6 +19,7 @@ import path from 'path';
 
 import { z } from 'zod';
 
+import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/connection.js';
 import { registerProvider, registerProviderConfigSchema } from './provider-registry.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
 import {
@@ -77,11 +78,11 @@ import {
  * run silently until `item/completed`. The handler tracks an
  * `inFlightItems` counter from those events and suppresses the watchdog
  * while > 0 — long silence during a known-active tool is not a wedge.
- * Backstop for a tool that truly hangs forever: host-sweep's 30-min
- * ABSOLUTE_CEILING_MS (host-sweep.ts:163, same place that extends its
- * own ceiling for declared Bash timeouts).
+ * Backstop for a tool that truly hangs forever: the provider publishes a
+ * bounded one-hour deadline to host-sweep while native items are in flight.
  */
 const TURN_IDLE_TIMEOUT_MS = Number(process.env.CODEX_TURN_IDLE_TIMEOUT_MS) || 5 * 60 * 1000;
+const CODEX_IN_FLIGHT_ITEM_TIMEOUT_MS = 60 * 60 * 1000;
 
 /**
  * Lookup tables for translating Codex collaboration ThreadItems into
@@ -1206,12 +1207,21 @@ async function* runOneTurn(
   // long-running Bash call (think `go test ./...` or `hex project run
   // --timeout 30m`) emits start, then runs silently for minutes, then
   // emits complete. While the inflight count is > 0, long notification
-  // silence is expected — suppress the watchdog. Mirrors host-sweep's
-  // declared-Bash extension at host-sweep.ts:163. If a tool call truly
-  // hangs forever, host-sweep's 30-min ABSOLUTE_CEILING_MS is the
-  // backstop.
+  // silence is expected — suppress the watchdog. The in-flight transition is
+  // also published to host-sweep with a bounded one-hour deadline.
   let idleTimer: ReturnType<typeof setTimeout> | null = null;
   let inFlightItems = 0;
+  const syncHostInFlightState = (previousInFlightItems: number): void => {
+    try {
+      if (previousInFlightItems === 0 && inFlightItems > 0) {
+        setContainerToolInFlight('CodexItem', CODEX_IN_FLIGHT_ITEM_TIMEOUT_MS);
+      } else if (previousInFlightItems > 0 && inFlightItems === 0) {
+        clearContainerToolInFlight();
+      }
+    } catch (err) {
+      console.error('[codex-provider] Failed to update host in-flight state:', err);
+    }
+  };
   // Instrumentation: the last notification method seen before the watchdog
   // armed. Logged at fire time so we can tell a pre-first-item stall
   // (last='turn/started') from an inter-item one (last='item/completed') —
@@ -1247,6 +1257,7 @@ async function* runOneTurn(
     // every item type (tool calls, reasoning, agentMessage). On
     // turn/completed and turn/failed we also clear the count — covers
     // the rare case of an orphan start with no matching completion.
+    const previousInFlightItems = inFlightItems;
     if (method === 'item/started') {
       inFlightItems++;
     } else if (method === 'item/completed') {
@@ -1254,6 +1265,7 @@ async function* runOneTurn(
     } else if (method === 'turn/completed' || method === 'turn/failed') {
       inFlightItems = 0;
     }
+    syncHostInFlightState(previousInFlightItems);
 
     // Reset the idle watchdog on every notification — even ones we don't
     // translate to a ProviderEvent. The app-server emitting ANYTHING
@@ -1477,6 +1489,11 @@ async function* runOneTurn(
 
     yield { type: 'result', text: resultText || null };
   } finally {
+    try {
+      clearContainerToolInFlight();
+    } catch (err) {
+      console.error('[codex-provider] Failed to clear host in-flight state:', err);
+    }
     if (idleTimer !== null) clearTimeout(idleTimer);
     const idx = server.notificationHandlers.indexOf(handler);
     if (idx >= 0) server.notificationHandlers.splice(idx, 1);

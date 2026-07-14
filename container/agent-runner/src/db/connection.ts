@@ -100,9 +100,9 @@ export function getOutboundDb(): Database {
     if (!cols.has('updated_at')) {
       _outbound.exec(`ALTER TABLE session_state ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''`);
     }
-    // container_state: tracks the current tool in flight (if any) so the host
-    // sweep can widen its stuck tolerance when Bash is running with a user-
-    // declared long timeout. Forward-compat for older outbound.db files.
+    // container_state: tracks the current host-visible long operation. Claude
+    // publishes declared Bash timeouts; Codex publishes a bounded deadline
+    // while native items are in flight. Forward-compat for older outbound.db.
     _outbound.exec(`
       CREATE TABLE IF NOT EXISTS container_state (
         id                       INTEGER PRIMARY KEY CHECK (id = 1),
@@ -117,9 +117,9 @@ export function getOutboundDb(): Database {
 }
 
 /**
- * Record that a tool is starting. `declaredTimeoutMs` is the tool's own
- * timeout hint when one is available (Bash exposes it in the tool_use input);
- * omit for tools with no declared timeout.
+ * Record that a host-visible operation is starting. `declaredTimeoutMs` is
+ * either the operation's own timeout hint (Bash) or a provider-owned bound
+ * (native Codex items); omit for operations with no declared timeout.
  */
 export function setContainerToolInFlight(tool: string, declaredTimeoutMs: number | null): void {
   const now = new Date().toISOString();
@@ -136,7 +136,7 @@ export function setContainerToolInFlight(tool: string, declaredTimeoutMs: number
     .run(tool, declaredTimeoutMs, now, now);
 }
 
-/** Clear the in-flight tool — called on PostToolUse / PostToolUseFailure. */
+/** Clear the host-visible in-flight operation. */
 export function clearContainerToolInFlight(): void {
   const now = new Date().toISOString();
   getOutboundDb()
@@ -172,12 +172,13 @@ export function touchHeartbeat(): void {
 }
 
 /**
- * Clear stale processing_ack entries on container startup.
- * If the previous container crashed, 'processing' entries are leftover.
- * Clearing them lets the new container re-process those messages.
+ * Clear stale processing state on container startup. If the previous
+ * container crashed, processing acks and its host-visible in-flight operation
+ * are leftover. Clearing both lets the new container start with a clean SLA.
  */
 export function clearStaleProcessingAcks(): void {
   getOutboundDb().prepare("DELETE FROM processing_ack WHERE status = 'processing'").run();
+  clearContainerToolInFlight();
 }
 
 /** For tests — creates in-memory DBs with the session schemas. */

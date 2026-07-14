@@ -3,7 +3,14 @@ import * as fs from 'fs';
 import os from 'os';
 import path from 'path';
 
-import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from './db/connection.js';
+import {
+  clearStaleProcessingAcks,
+  closeSessionDb,
+  getInboundDb,
+  getOutboundDb,
+  initTestSessionDb,
+  setContainerToolInFlight,
+} from './db/connection.js';
 import { getPendingMessages, markCompleted } from './db/messages-in.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { formatMessages, extractRouting } from './formatter.js';
@@ -42,6 +49,21 @@ function insertMessage(
     )
     .run(id, kind, opts?.processAfter ?? null, opts?.trigger ?? 1, opts?.onWake ?? 0, JSON.stringify(content));
 }
+
+describe('container startup recovery', () => {
+  it('clears both stale claims and a prior container in-flight deadline', () => {
+    const db = getOutboundDb();
+    db.prepare("INSERT INTO processing_ack VALUES ('stale', 'processing', ?)").run(new Date().toISOString());
+    setContainerToolInFlight('CodexItem', 60 * 60 * 1000);
+
+    clearStaleProcessingAcks();
+
+    expect(db.prepare('SELECT COUNT(*) AS count FROM processing_ack').get()).toEqual({ count: 0 });
+    expect(db.prepare('SELECT current_tool FROM container_state WHERE id = 1').get()).toEqual({
+      current_tool: null,
+    });
+  });
+});
 
 describe('formatter', () => {
   it('should format a single chat message', () => {

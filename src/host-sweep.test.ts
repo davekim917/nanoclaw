@@ -179,6 +179,38 @@ describe('decideStuckAction', () => {
     expect(res.action).toBe('ok');
   });
 
+  it('extends the ceiling while a native Codex item is in flight', () => {
+    const oneHrMs = 60 * 60 * 1000;
+    const res = decideStuckAction({
+      now: BASE,
+      // Native Codex subagents can legitimately run past the default
+      // 30-minute ceiling without emitting app-server notifications.
+      heartbeatMtimeMs: BASE - 45 * 60 * 1000,
+      containerState: {
+        current_tool: 'CodexItem',
+        tool_declared_timeout_ms: oneHrMs,
+        tool_started_at: new Date(BASE - 45 * 60 * 1000).toISOString(),
+      },
+      claims: [claim('msg-codex', 45 * 60 * 1000)],
+    });
+    expect(res.action).toBe('ok');
+  });
+
+  it('keeps the native Codex extension bounded by its declared timeout', () => {
+    const oneHrMs = 60 * 60 * 1000;
+    const res = decideStuckAction({
+      now: BASE,
+      heartbeatMtimeMs: BASE - oneHrMs - 1,
+      containerState: {
+        current_tool: 'CodexItem',
+        tool_declared_timeout_ms: oneHrMs,
+        tool_started_at: new Date(BASE - oneHrMs - 1).toISOString(),
+      },
+      claims: [],
+    });
+    expect(res.action).toBe('kill-ceiling');
+  });
+
   it('returns kill-claim when a claim is past 60s and heartbeat has not moved', () => {
     const claimedAgeMs = CLAIM_STUCK_MS + 10_000;
     const res = decideStuckAction({
@@ -226,6 +258,21 @@ describe('decideStuckAction', () => {
         tool_started_at: new Date(BASE - 5 * 60 * 1000).toISOString(),
       },
       claims: [claim('msg-1', 5 * 60 * 1000)],
+    });
+    expect(res.action).toBe('ok');
+  });
+
+  it('widens per-claim tolerance while a native Codex item is in flight', () => {
+    const oneHrMs = 60 * 60 * 1000;
+    const res = decideStuckAction({
+      now: BASE,
+      heartbeatMtimeMs: BASE - 6 * 60 * 1000,
+      containerState: {
+        current_tool: 'CodexItem',
+        tool_declared_timeout_ms: oneHrMs,
+        tool_started_at: new Date(BASE - 5 * 60 * 1000).toISOString(),
+      },
+      claims: [claim('msg-codex', 5 * 60 * 1000)],
     });
     expect(res.action).toBe('ok');
   });
@@ -480,6 +527,62 @@ describe('resetStuckProcessingRows — orphan claim cleanup', () => {
     expect(getProcessingClaims(outDb)).toEqual([]);
     const row = inDb.prepare('SELECT tries FROM messages_in WHERE id = ?').get('m-2') as { tries: number };
     expect(row.tries).toBe(1); // not bumped, the skip path held
+  });
+
+  it('retries an input that produced only progress/status rows', () => {
+    const { inDb, outDb } = makeSessionDbs();
+    const claimedAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+
+    inDb
+      .prepare(
+        "INSERT INTO messages_in (id, seq, kind, timestamp, status, content) VALUES ('m-status-only', 3, 'chat', ?, 'pending', '{}')",
+      )
+      .run(claimedAt);
+    outDb.prepare("INSERT INTO processing_ack VALUES ('m-status-only', 'processing', ?)").run(claimedAt);
+    outDb
+      .prepare(
+        "INSERT INTO messages_out (id, seq, in_reply_to, timestamp, kind, content) VALUES ('progress-1', 2, 'm-status-only', ?, 'status', '{}')",
+      )
+      .run(new Date().toISOString());
+
+    _resetStuckProcessingRowsForTesting(inDb, outDb, fakeSession(), 'absolute-ceiling');
+
+    const row = inDb
+      .prepare('SELECT status, tries, process_after FROM messages_in WHERE id = ?')
+      .get('m-status-only') as { status: string; tries: number; process_after: string | null };
+    expect(row.status).toBe('pending');
+    expect(row.tries).toBe(1);
+    expect(row.process_after).not.toBeNull();
+    expect(getProcessingClaims(outDb)).toEqual([]);
+  });
+
+  it('does not retry an input after a non-status response was written', () => {
+    const { inDb, outDb } = makeSessionDbs();
+    const claimedAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+
+    inDb
+      .prepare(
+        "INSERT INTO messages_in (id, seq, kind, timestamp, status, content) VALUES ('m-answered', 4, 'chat', ?, 'pending', '{}')",
+      )
+      .run(claimedAt);
+    outDb.prepare("INSERT INTO processing_ack VALUES ('m-answered', 'processing', ?)").run(claimedAt);
+    outDb
+      .prepare(
+        "INSERT INTO messages_out (id, seq, in_reply_to, timestamp, kind, content) VALUES ('reply-1', 4, 'm-answered', ?, 'chat', '{}')",
+      )
+      .run(new Date().toISOString());
+
+    _resetStuckProcessingRowsForTesting(inDb, outDb, fakeSession(), 'absolute-ceiling');
+
+    const row = inDb.prepare('SELECT status, tries, process_after FROM messages_in WHERE id = ?').get('m-answered') as {
+      status: string;
+      tries: number;
+      process_after: string | null;
+    };
+    expect(row.status).toBe('completed');
+    expect(row.tries).toBe(0);
+    expect(row.process_after).toBeNull();
+    expect(getProcessingClaims(outDb)).toEqual([]);
   });
 });
 

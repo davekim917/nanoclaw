@@ -329,8 +329,8 @@ export interface ContainerState {
 /**
  * Read the container's current tool-in-flight state, if any. Returns null
  * when either the table doesn't exist yet (older session DB) or no tool is
- * active. Host sweep reads this to widen stuck-detection tolerance while
- * Bash is running with a long declared timeout.
+ * active. Host sweep reads this to widen stuck-detection tolerance while a
+ * declared Bash operation or a bounded native Codex item is in flight.
  */
 export function getContainerState(outDb: Database.Database): ContainerState | null {
   try {

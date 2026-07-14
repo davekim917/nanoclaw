@@ -204,6 +204,11 @@ SDK message (so the idle timer stays honest) and maps recognized messages to `Pr
 
 ### Codex Provider
 
+Codex publishes a `CodexItem` operation to `container_state` while one or more
+native items are active. This extends the host sweep ceiling from 30 minutes to
+a bounded hour during silent subagent/tool work; completion, failure, provider
+cleanup, and replacement-container startup all clear the state.
+
 Wraps `@openai/codex-sdk`.
 
 ```typescript
