@@ -905,3 +905,11 @@ describe('container boot-failure tripwire (structural)', () => {
     expect(src).toMatch(/Container exited non-zero.*stderrTail/s);
   });
 });
+
+describe('Claude Bash timeout policy (structural)', () => {
+  it('raises only the maximum Bash timeout for spawned containers', () => {
+    const src = fs.readFileSync(path.join(process.cwd(), 'src', 'container-runner.ts'), 'utf-8');
+    expect(src).toContain("args.push('-e', 'BASH_MAX_TIMEOUT_MS=3600000')");
+    expect(src).not.toMatch(/args\.push\('-e', 'BASH_DEFAULT_TIMEOUT_MS=/);
+  });
+});

@@ -2292,6 +2292,9 @@ async function buildContainerArgs(
   // Claude Code behavior locks — duplicated from settings.json env block so
   // the values are set regardless of the SDK's settings-loading order.
   args.push('-e', 'CLAUDE_CODE_DISABLE_AUTO_MEMORY=0');
+  // Allow long foreground worker-codex calls without lengthening the default
+  // timeout for ordinary Bash calls.
+  args.push('-e', 'BASH_MAX_TIMEOUT_MS=3600000');
   args.push('-e', 'CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80');
   // Claude Code 2.1+ has a built-in auto-compact window default that is well
   // under 200k even when the session uses a 1M-context model (claude-opus-4-7[1m]).

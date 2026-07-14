@@ -80,8 +80,30 @@ describe('initGroupFilesystem agent surfaces', () => {
     const groupDir = path.join(GROUPS_DIR, ag.folder);
     const claudeDir = path.join(DATA_DIR, 'v2-sessions', ag.id, '.claude-shared');
     expect(fs.readFileSync(path.join(groupDir, 'CLAUDE.local.md'), 'utf-8')).toBe('hello\n');
-    expect(fs.existsSync(path.join(claudeDir, 'settings.json'))).toBe(true);
+    const settings = JSON.parse(fs.readFileSync(path.join(claudeDir, 'settings.json'), 'utf-8')) as {
+      env: Record<string, string>;
+    };
+    expect(settings.env.BASH_MAX_TIMEOUT_MS).toBe('3600000');
+    expect(settings.env).not.toHaveProperty('BASH_DEFAULT_TIMEOUT_MS');
     expect(fs.existsSync(path.join(claudeDir, 'skills'))).toBe(true);
+  });
+
+  it('reconciles the managed Bash maximum while preserving an operator-owned default', () => {
+    const ag = group('ag-bash-timeout', 'bash-timeout-group');
+    createAgentGroup(ag);
+    initGroupFilesystem(ag, {});
+
+    const settingsFile = path.join(DATA_DIR, 'v2-sessions', ag.id, '.claude-shared', 'settings.json');
+    const settings = JSON.parse(fs.readFileSync(settingsFile, 'utf-8')) as { env: Record<string, string> };
+    settings.env.BASH_MAX_TIMEOUT_MS = '600000';
+    settings.env.BASH_DEFAULT_TIMEOUT_MS = '45000';
+    fs.writeFileSync(settingsFile, JSON.stringify(settings, null, 2) + '\n');
+
+    initGroupFilesystem(ag, {});
+
+    const reconciled = JSON.parse(fs.readFileSync(settingsFile, 'utf-8')) as { env: Record<string, string> };
+    expect(reconciled.env.BASH_MAX_TIMEOUT_MS).toBe('3600000');
+    expect(reconciled.env.BASH_DEFAULT_TIMEOUT_MS).toBe('45000');
   });
 
   it('writes the seed into the memory scaffold — never CLAUDE.* — for a provider with its own surfaces', () => {
@@ -238,6 +260,18 @@ describe('worker agent def sync (orchestrator roster)', () => {
     // not a bare id that collapses to 200k under proxy auth. Reverting to
     // `model: opus` or bare `claude-opus-4-8` fails here.
     expect(fs.readFileSync(path.join(agentsDir, 'worker-opus.md'), 'utf-8')).toContain('model: claude-opus-4-8[1m]');
+    const codexWorker = fs.readFileSync(path.join(agentsDir, 'worker-codex.md'), 'utf-8');
+    expect(codexWorker).toContain('Always run Codex in the foreground');
+    expect(codexWorker).toContain('`timeout` to `3600000`');
+    expect(codexWorker).toContain('never set `run_in_background` for the Codex call');
+    expect(codexWorker).toContain('the orchestrator owns continued monitoring');
+    expect(codexWorker).not.toContain('timeout to 600000');
+    const orchestratorInstructions = fs.readFileSync(
+      path.join(process.cwd(), 'container', 'agent-runner', 'src', 'mcp-tools', 'orchestrator-workers.instructions.md'),
+      'utf-8',
+    );
+    expect(orchestratorInstructions).toContain('Invoke `worker-codex` with `run_in_background: true`');
+    expect(orchestratorInstructions).toContain('keeps its `codex exec` Bash call in the foreground');
     // Delegation-rules fragment composed for claude. The fragment itself is a
     // symlink to a container path (dangling on the host), so assert on the
     // composed doc's include line rather than existsSync (which follows links).

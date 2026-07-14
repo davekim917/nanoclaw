@@ -21,6 +21,10 @@ const REQUIRED_ENV: Record<string, string> = {
   CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
   CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
   CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
+  // Let long foreground worker-codex calls stay attached for up to an hour.
+  // Deliberately leave BASH_DEFAULT_TIMEOUT_MS unset so ordinary Bash calls
+  // retain Claude Code's shorter default timeout.
+  BASH_MAX_TIMEOUT_MS: '3600000',
   // Auto-compact at 80% of context window instead of SDK default (~97%).
   // Prevents sessions from hitting the hard context limit and triggering
   // silent model fallback on upstream 400 errors.

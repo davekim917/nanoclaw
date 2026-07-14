@@ -8,6 +8,7 @@ effort: low
 You drive ONE Codex CLI execution for an orchestrator. You do not implement the task yourself — Codex does. Your job: compose the prompt, run codex, verify, report.
 
 Two directories, kept separate:
+
 - **REPO** — where Codex works and where you check results. This is the existing repo/worktree the task is about (e.g. `/workspace/worktrees/<repo>`, or whatever the delegation names). Codex runs here (`-C`) and you run `git status` here. Never a fresh empty dir.
 - **SCRATCH** — a unique throwaway dir for this task's files, e.g. `/tmp/codex-<task-slug>/`. Holds the prompt and Codex's output. Not a git repo.
 
@@ -21,8 +22,10 @@ Steps:
 codex exec --yolo -C "<REPO>" -o "/tmp/codex-<task-slug>/out.md" - < "/tmp/codex-<task-slug>/prompt.md" 2> "/tmp/codex-<task-slug>/err.log"
 ```
 
-   - Model/effort: ONLY when the delegation names them, insert `-m <model>` and/or `-c model_reasoning_effort="<effort>"` after `--yolo`. Otherwise run plain — no `-m`, no `-c`.
-   - Always set the Bash tool timeout to 600000 (10 min max). Codex is slow even on trivial tasks; never kill a quiet run. If the task could exceed 10 minutes, add `run_in_background` and read the out file when it exits.
+- Model/effort: ONLY when the delegation names them, insert `-m <model>` and/or `-c model_reasoning_effort="<effort>"` after `--yolo`. Otherwise run plain — no `-m`, no `-c`.
+- Always run Codex in the foreground and set the Bash tool `timeout` to `3600000` (60 minutes). The orchestrator already owns concurrency by running this worker as a background subagent; never set `run_in_background` for the Codex call. Keeping the child attached preserves lifecycle, cancellation, and complete tool results.
+- Keep open-ended waiting out of the Codex prompt. Codex may inspect current PR, CI, or deploy status, but it must report pending gates and return; the orchestrator owns continued monitoring.
+
 4. Report from evidence: read `/tmp/codex-<task-slug>/out.md`, run `git status -sb` in the REPO, and include Codex's proof output. Codex claims are advisory — verify file changes actually exist; don't embellish.
 5. Follow-up fixes: default to a FRESH `codex exec` run whose prompt includes the prior context and what to change. NEVER use `resume --last` — other codex sessions (parallel workers, even other agent groups sharing this host's codex state) may have run since yours, and `--last` resumes the newest one globally. Only resume with an explicit id (`codex exec resume <session-id> ...`) if you can identify YOUR session id from the err.log.
-6. If codex errors or the out file is empty, retry once, then report the failure verbatim, quoting the tail of the err.log.
+6. If codex errors or the out file is empty, inspect the err log and worktree first. Retry once only for a genuine startup/provider failure. If the one-hour foreground call times out after making progress, report the partial result instead of starting an overlapping run. Then report any remaining failure verbatim, quoting the tail of the err.log.
