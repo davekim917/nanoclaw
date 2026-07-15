@@ -250,36 +250,56 @@ describe('formatCodexCollaborationProgress', () => {
   it('renders current subAgentActivity lifecycle events with the agent path', () => {
     const emittedIds = new Set<string>();
 
-    expect(formatCodexCollaborationProgress({
-      type: 'subAgentActivity',
-      id: 'call-start',
-      agentPath: '/root/researcher',
-      agentThreadId: 'thread-1',
-      kind: 'started',
-    }, emittedIds)).toBe('🌱 subagent: started (/root/researcher)');
-    expect(formatCodexCollaborationProgress({
-      type: 'subAgentActivity',
-      id: 'call-interact',
-      agentPath: '/root/researcher',
-      agentThreadId: 'thread-1',
-      kind: 'interacted',
-    }, emittedIds)).toBe('📨 subagent: interacted (/root/researcher)');
-    expect(formatCodexCollaborationProgress({
-      type: 'subAgentActivity',
-      id: 'call-interrupt',
-      agentPath: '/root/researcher',
-      agentThreadId: 'thread-1',
-      kind: 'interrupted',
-    }, emittedIds)).toBe('🛑 subagent: interrupted (/root/researcher)');
+    expect(
+      formatCodexCollaborationProgress(
+        {
+          type: 'subAgentActivity',
+          id: 'call-start',
+          agentPath: '/root/researcher',
+          agentThreadId: 'thread-1',
+          kind: 'started',
+        },
+        emittedIds,
+      ),
+    ).toBe('🌱 subagent: started (/root/researcher)');
+    expect(
+      formatCodexCollaborationProgress(
+        {
+          type: 'subAgentActivity',
+          id: 'call-interact',
+          agentPath: '/root/researcher',
+          agentThreadId: 'thread-1',
+          kind: 'interacted',
+        },
+        emittedIds,
+      ),
+    ).toBe('📨 subagent: interacted (/root/researcher)');
+    expect(
+      formatCodexCollaborationProgress(
+        {
+          type: 'subAgentActivity',
+          id: 'call-interrupt',
+          agentPath: '/root/researcher',
+          agentThreadId: 'thread-1',
+          kind: 'interrupted',
+        },
+        emittedIds,
+      ),
+    ).toBe('🛑 subagent: interrupted (/root/researcher)');
   });
 
   it('preserves legacy collabAgentToolCall progress rendering', () => {
-    expect(formatCodexCollaborationProgress({
-      type: 'collabAgentToolCall',
-      id: 'call-spawn',
-      tool: 'spawnAgent',
-      receiverThreadIds: ['thread-1'],
-    }, new Set())).toBe('🌱 subagent: spawned (1 agent)');
+    expect(
+      formatCodexCollaborationProgress(
+        {
+          type: 'collabAgentToolCall',
+          id: 'call-spawn',
+          tool: 'spawnAgent',
+          receiverThreadIds: ['thread-1'],
+        },
+        new Set(),
+      ),
+    ).toBe('🌱 subagent: spawned (1 agent)');
   });
 
   it('deduplicates legacy and current event shapes sharing a protocol item id', () => {
@@ -309,13 +329,18 @@ describe('formatCodexCollaborationProgress', () => {
   it('ignores unrelated and malformed collaboration items', () => {
     const emittedIds = new Set<string>();
     expect(formatCodexCollaborationProgress({ type: 'reasoning', id: 'reasoning-1' }, emittedIds)).toBeNull();
-    expect(formatCodexCollaborationProgress({
-      type: 'subAgentActivity',
-      id: 'call-unknown',
-      agentPath: '/root/researcher',
-      agentThreadId: 'thread-1',
-      kind: 'finished',
-    }, emittedIds)).toBeNull();
+    expect(
+      formatCodexCollaborationProgress(
+        {
+          type: 'subAgentActivity',
+          id: 'call-unknown',
+          agentPath: '/root/researcher',
+          agentThreadId: 'thread-1',
+          kind: 'finished',
+        },
+        emittedIds,
+      ),
+    ).toBeNull();
   });
 });
 
@@ -513,22 +538,9 @@ describe('codex gen() self-heals on hard turn errors (Layer-2 fix)', () => {
   });
 });
 
-describe('codex turn timer is idle-based, not wall-clock', () => {
-  // Background: the old TURN_TIMEOUT_MS was a wall-clock setTimeout from
-  // turn start. xhigh-reasoning turns that legitimately ran 5+ min while
-  // emitting reasoning deltas every 1–10s got killed at the wall-clock
-  // boundary — same exit point as a real wedge, with the same Slack
-  // "Turn ended with an error" surface. The fix replaces the wall-clock
-  // with an idle watchdog reset on every notification: real wedges (zero
-  // events) are caught in ~5min (env-overridable); legitimate long reasoning
-  // chains are not cut off so long as the app-server keeps emitting events.
-  //
-  // Source-anchored guards, matching the F4 + Layer-2 patterns.
-
-  it('declares an idle threshold, not a wall-clock total-turn threshold', () => {
+describe('codex turn watchdog is health-based, not wall-clock', () => {
+  it('declares bounded control-plane probe settings, not a total-turn threshold', () => {
     const src = fs.readFileSync(new URL('./codex.ts', import.meta.url), 'utf8');
-    // Strip block + line comments so explanatory prose about the prior
-    // pattern can mention `TURN_TIMEOUT_MS` without satisfying the check.
     const codeOnly = src
       .replace(/\/\*[\s\S]*?\*\//g, '')
       .split('\n')
@@ -537,94 +549,53 @@ describe('codex turn timer is idle-based, not wall-clock', () => {
         return i >= 0 ? l.slice(0, i) : l;
       })
       .join('\n');
-    // Old constant must be gone from non-comment source.
     expect(codeOnly).not.toMatch(/\bTURN_TIMEOUT_MS\b/);
-    // New idle constant must be present.
-    expect(codeOnly).toMatch(/\bTURN_IDLE_TIMEOUT_MS\b/);
-    // Env-overridable (CODEX_TURN_IDLE_TIMEOUT_MS) with a hardcoded default.
-    // Capture the full RHS and eval it; with the env var unset (as in test) it
-    // resolves to the default. Default must sit in a sane range (1-10 min):
-    // too short trips false-positives on codex's inherently slow turns (60s
-    // broke codex wholesale, 2026-06-27); too long delays wedge detection.
-    const decl = codeOnly.match(/const\s+TURN_IDLE_TIMEOUT_MS\s*=\s*([^;]+);/);
-    expect(decl).not.toBeNull();
-    const ms = Function(`'use strict'; return (${decl![1]});`)() as number;
-    expect(ms).toBeGreaterThanOrEqual(60_000);
-    expect(ms).toBeLessThanOrEqual(600_000);
+    expect(codeOnly).not.toMatch(/\bTURN_IDLE_TIMEOUT_MS\b/);
+    expect(codeOnly).toContain('CODEX_HEALTH_PROBE_QUIET_MS');
+    expect(codeOnly).toContain('CODEX_HEALTH_PROBE_INTERVAL_MS');
+    expect(codeOnly).toContain('CODEX_HEALTH_PROBE_TIMEOUT_MS');
+    expect(codeOnly).toContain('CODEX_HEALTH_PROBE_FAILURE_LIMIT');
   });
 
-  it('handler resets the idle timer on every notification', () => {
+  it('tracks every notification and item identity through CodexTurnLiveness', () => {
     const src = fs.readFileSync(new URL('./codex.ts', import.meta.url), 'utf8');
-    // The handler body (in runOneTurn) must call resetIdleTimer near the
-    // top — before the per-method switch — so EVERY notification refreshes
-    // the watchdog, including ones we don't translate to a ProviderEvent.
     const handlerStart = src.indexOf('const handler = (n: JsonRpcNotification)');
     expect(handlerStart).toBeGreaterThan(-1);
     const switchStart = src.indexOf('switch (method)', handlerStart);
     expect(switchStart).toBeGreaterThan(-1);
     const handlerPreamble = src.slice(handlerStart, switchStart);
-    expect(handlerPreamble).toContain('resetIdleTimer()');
+    expect(handlerPreamble).toContain('liveness.noteItemStarted(params.item)');
+    expect(handlerPreamble).toContain('liveness.noteItemCompleted(params.item)');
+    expect(handlerPreamble).toContain('liveness.noteNotification()');
   });
 
-  it('idle timer is armed before the first turn dispatch and cleared in finally', () => {
+  it('starts health probes before turn dispatch and clears them in finally', () => {
     const src = fs.readFileSync(new URL('./codex.ts', import.meta.url), 'utf8');
-    // Initial arm is needed because startCodexTurn could hang at the
-    // JSON-RPC layer before any notification arrives. Without an initial
-    // arm, the timer would only start after the first notification — and
-    // a wedged turn/start would never trigger a wedge-error event.
     const startCodexTurnIdx = src.indexOf('await startCodexTurn(server,');
     expect(startCodexTurnIdx).toBeGreaterThan(-1);
     const preStart = src.slice(0, startCodexTurnIdx);
-    expect(preStart).toMatch(/resetIdleTimer\(\);\s*$|resetIdleTimer\(\);\s*\n[^\n]*try/m);
-    // Cleanup: finally clears the idle timer.
-    expect(src).toMatch(/finally\s*\{[\s\S]*clearTimeout\(idleTimer\)/);
+    expect(preStart).toContain('healthTimer = setInterval');
+    expect(src).toMatch(/finally\s*\{[\s\S]*clearInterval\(healthTimer\)/);
   });
 
-  // Codex review feedback (P1): long-running tool calls (Bash test runs,
-  // `hex project run --timeout 30m`, etc.) emit one `item/started`,
-  // execute silently for minutes, then `item/completed`. A naïve 120s
-  // idle watchdog would kill the turn mid-tool. The fix tracks an
-  // inFlightItems counter from start/completed events; the watchdog
-  // stays suppressed while the counter is > 0.
-  it('inFlightItems counter rises on item/started and falls on item/completed', () => {
+  it('successful protocol probes emit activity instead of terminating a quiet turn', () => {
     const src = fs.readFileSync(new URL('./codex.ts', import.meta.url), 'utf8');
-    // Strip comments so explanatory prose mentioning the prior pattern
-    // can't satisfy the assertions.
-    const codeOnly = src
-      .replace(/\/\*[\s\S]*?\*\//g, '')
-      .split('\n')
-      .map((l) => {
-        const i = l.indexOf('//');
-        return i >= 0 ? l.slice(0, i) : l;
-      })
-      .join('\n');
-
-    // Counter must be declared and adjusted by start/completed events.
-    expect(codeOnly).toMatch(/let\s+inFlightItems\s*=\s*0/);
-    expect(codeOnly).toMatch(/method\s*===\s*['"]item\/started['"][\s\S]{0,200}inFlightItems\+\+/);
-    expect(codeOnly).toMatch(/method\s*===\s*['"]item\/completed['"][\s\S]{0,200}inFlightItems\s*=\s*Math\.max\(0,\s*inFlightItems\s*-\s*1\)/);
-    // turn/completed and turn/failed must clear the counter — covers the
-    // rare orphan-start case (item starts but never completes).
-    expect(codeOnly).toMatch(/turn\/completed[\s\S]{0,200}inFlightItems\s*=\s*0|turn\/failed[\s\S]{0,200}inFlightItems\s*=\s*0/);
+    const probeStart = src.indexOf('const runHealthProbe');
+    expect(probeStart).toBeGreaterThan(-1);
+    const probeBody = src.slice(probeStart, src.indexOf('const handler', probeStart));
+    expect(probeBody).toContain('probeCodexThreadHealth');
+    expect(probeBody).toContain("buffer.push({ type: 'activity' })");
+    expect(probeBody).toContain('finishForLivenessFailure(decision.classification, decision.reason)');
   });
 
-  it('resetIdleTimer suppresses re-arm when a tool item is in flight', () => {
+  it('does not retain the blanket inFlightItems watchdog suppression', () => {
     const src = fs.readFileSync(new URL('./codex.ts', import.meta.url), 'utf8');
-    // The reset function must consult inFlightItems and skip the
-    // re-arm when > 0. Anchor on the function name; check the body.
-    const fnStart = src.indexOf('const resetIdleTimer');
-    expect(fnStart).toBeGreaterThan(-1);
-    // Take a generous window — the body is small but spans comments.
-    const fnBody = src.slice(fnStart, fnStart + 600);
-    // The body must check inFlightItems and short-circuit (return)
-    // before calling setTimeout, otherwise the watchdog re-arms during
-    // a tool call.
-    expect(fnBody).toMatch(/inFlightItems\s*>\s*0[\s\S]{0,200}return/);
-    // And it must still arm setTimeout in the no-tool case.
-    expect(fnBody).toContain('setTimeout');
+    const codeOnly = src.replace(/\/\*[\s\S]*?\*\//g, '');
+    expect(codeOnly).not.toMatch(/let\s+inFlightItems\s*=\s*0/);
+    expect(codeOnly).toContain('new CodexTurnLiveness');
   });
 
-  it('publishes native in-flight items to the host with a bounded timeout', () => {
+  it('publishes the whole turn to the host as a bounded catastrophic backstop', () => {
     const src = fs.readFileSync(new URL('./codex.ts', import.meta.url), 'utf8');
     const codeOnly = src
       .replace(/\/\*[\s\S]*?\*\//g, '')
@@ -640,10 +611,7 @@ describe('codex turn timer is idle-based, not wall-clock', () => {
     const ms = Function(`'use strict'; return (${decl![1]});`)() as number;
     expect(ms).toBe(60 * 60 * 1000);
 
-    // The first native item publishes a host-visible bounded operation;
-    // returning to zero clears it, and finally cleanup covers abort/error.
     expect(codeOnly).toContain("setContainerToolInFlight('CodexItem', CODEX_IN_FLIGHT_ITEM_TIMEOUT_MS)");
-    expect(codeOnly).toMatch(/inFlightItems\s*===\s*0[\s\S]{0,300}clearContainerToolInFlight\(\)/);
     expect(codeOnly).toMatch(/finally\s*\{[\s\S]{0,500}clearContainerToolInFlight\(\)/);
   });
 });
@@ -877,16 +845,10 @@ describe('codex OAuth fallback — rotation primitives', () => {
     }
 
     it('parses CODEX_FALLBACK_HOMES into an ordered list', () => {
-      withEnv(
-        { CODEX_FALLBACK_HOMES: '/home/node/.codex-fallback-1:/home/node/.codex-fallback-2' },
-        () => {
-          const p = new CodexProvider();
-          expect(p.fallbackHomes).toEqual([
-            '/home/node/.codex-fallback-1',
-            '/home/node/.codex-fallback-2',
-          ]);
-        },
-      );
+      withEnv({ CODEX_FALLBACK_HOMES: '/home/node/.codex-fallback-1:/home/node/.codex-fallback-2' }, () => {
+        const p = new CodexProvider();
+        expect(p.fallbackHomes).toEqual(['/home/node/.codex-fallback-1', '/home/node/.codex-fallback-2']);
+      });
     });
 
     it('returns empty fallbackHomes when CODEX_FALLBACK_HOMES is unset or blank', () => {
@@ -948,7 +910,13 @@ describe('codex OAuth fallback — rotation primitives', () => {
       return fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-codex-newest-'));
     }
 
-    function writeRollout(home: string, dateSubpath: string, threadId: string, content: string, mtimeMs?: number): string {
+    function writeRollout(
+      home: string,
+      dateSubpath: string,
+      threadId: string,
+      content: string,
+      mtimeMs?: number,
+    ): string {
       const dir = path.join(home, 'sessions', dateSubpath);
       fs.mkdirSync(dir, { recursive: true });
       const file = path.join(dir, `rollout-2026-05-21T03-15-00-${threadId}.jsonl`);

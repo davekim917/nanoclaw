@@ -109,9 +109,29 @@ export function getOutboundDb(): Database {
         current_tool             TEXT,
         tool_declared_timeout_ms INTEGER,
         tool_started_at          TEXT,
+        provider_status          TEXT,
+        provider_last_event_at   TEXT,
+        provider_last_probe_at   TEXT,
+        provider_probe_failures  INTEGER,
+        provider_recovery_attempts INTEGER,
+        provider_failure_reason  TEXT,
         updated_at               TEXT NOT NULL
       );
     `);
+    const containerCols = new Set(
+      (_outbound.prepare("PRAGMA table_info('container_state')").all() as Array<{ name: string }>).map((c) => c.name),
+    );
+    const providerColumns: Array<[string, string]> = [
+      ['provider_status', 'TEXT'],
+      ['provider_last_event_at', 'TEXT'],
+      ['provider_last_probe_at', 'TEXT'],
+      ['provider_probe_failures', 'INTEGER'],
+      ['provider_recovery_attempts', 'INTEGER'],
+      ['provider_failure_reason', 'TEXT'],
+    ];
+    for (const [name, type] of providerColumns) {
+      if (!containerCols.has(name)) _outbound.exec(`ALTER TABLE container_state ADD COLUMN ${name} ${type}`);
+    }
   }
   return _outbound;
 }
@@ -152,6 +172,60 @@ export function clearContainerToolInFlight(): void {
     .run(now);
 }
 
+export type ProviderHealthStatus = 'active' | 'healthy' | 'suspect' | 'recovering' | 'failed' | 'idle';
+
+export interface ProviderHealthState {
+  status: ProviderHealthStatus;
+  lastEventAt: string | null;
+  lastProbeAt: string | null;
+  probeFailures: number;
+  recoveryAttempts: number;
+  failureReason: string | null;
+}
+
+/** Persist low-frequency provider health transitions for host diagnostics. */
+export function setProviderHealthState(state: ProviderHealthState, outbound: Database = getOutboundDb()): void {
+  const now = new Date().toISOString();
+  outbound
+    .prepare(
+      `INSERT INTO container_state (
+         id, provider_status, provider_last_event_at, provider_last_probe_at,
+         provider_probe_failures, provider_recovery_attempts, provider_failure_reason, updated_at
+       ) VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         provider_status = excluded.provider_status,
+         provider_last_event_at = excluded.provider_last_event_at,
+         provider_last_probe_at = excluded.provider_last_probe_at,
+         provider_probe_failures = excluded.provider_probe_failures,
+         provider_recovery_attempts = excluded.provider_recovery_attempts,
+         provider_failure_reason = excluded.provider_failure_reason,
+         updated_at = excluded.updated_at`,
+    )
+    .run(
+      state.status,
+      state.lastEventAt,
+      state.lastProbeAt,
+      state.probeFailures,
+      state.recoveryAttempts,
+      state.failureReason,
+      now,
+    );
+}
+
+export function clearProviderHealthState(outbound: Database = getOutboundDb()): void {
+  setProviderHealthState(
+    {
+      status: 'idle',
+      lastEventAt: null,
+      lastProbeAt: null,
+      probeFailures: 0,
+      recoveryAttempts: 0,
+      failureReason: null,
+    },
+    outbound,
+  );
+}
+
 /**
  * Touch the heartbeat file — replaces the old touchProcessing() DB writes.
  * The host checks this file's mtime for stale container detection.
@@ -179,6 +253,7 @@ export function touchHeartbeat(): void {
 export function clearStaleProcessingAcks(): void {
   getOutboundDb().prepare("DELETE FROM processing_ack WHERE status = 'processing'").run();
   clearContainerToolInFlight();
+  clearProviderHealthState();
 }
 
 /** For tests — creates in-memory DBs with the session schemas. */
@@ -252,6 +327,12 @@ export function initTestSessionDb(): { inbound: Database; outbound: Database } {
       current_tool             TEXT,
       tool_declared_timeout_ms INTEGER,
       tool_started_at          TEXT,
+      provider_status          TEXT,
+      provider_last_event_at   TEXT,
+      provider_last_probe_at   TEXT,
+      provider_probe_failures  INTEGER,
+      provider_recovery_attempts INTEGER,
+      provider_failure_reason  TEXT,
       updated_at               TEXT NOT NULL
     );
   `);

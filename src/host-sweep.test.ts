@@ -1487,6 +1487,27 @@ describe('notifyKillCeiling (Layer-3 fix)', () => {
     expect(body._system?.kind).toBe('agent_restart_inactivity');
   });
 
+  it('reports a persisted Codex control-plane failure instead of calling it generic silence', () => {
+    const { inDb, outDb } = makeNotifyTestDbs();
+    _notifyKillCeilingForTesting(inDb, outDb, fakeSession(), 62 * 60_000, 1, {
+      current_tool: 'CodexItem',
+      tool_declared_timeout_ms: 3_600_000,
+      tool_started_at: '2026-07-15T11:22:53.000Z',
+      provider_status: 'failed',
+      provider_failure_reason: 'three JSON-RPC health probes timed out',
+    });
+
+    const row = outDb.prepare('SELECT content FROM messages_out').get() as { content: string };
+    const body = JSON.parse(row.content) as {
+      text: string;
+      _system: { provider_status: string; provider_failure_reason: string };
+    };
+    expect(body.text).toContain('Codex control-plane recovery did not complete');
+    expect(body.text).toContain('three JSON-RPC health probes timed out');
+    expect(body.text).not.toContain('went silent');
+    expect(body._system.provider_status).toBe('failed');
+  });
+
   it('skips when no inbound was claimed at kill time (idle session, no user waiting)', () => {
     // The kill-ceiling sweep fires on every container that hits the 30-min
     // idle ceiling, not just ones with users waiting on a reply. Without

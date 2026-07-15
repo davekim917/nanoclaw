@@ -19,7 +19,12 @@ import path from 'path';
 
 import { z } from 'zod';
 
-import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/connection.js';
+import {
+  clearContainerToolInFlight,
+  setContainerToolInFlight,
+  setProviderHealthState,
+  type ProviderHealthState,
+} from '../db/connection.js';
 import { registerProvider, registerProviderConfigSchema } from './provider-registry.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
 import {
@@ -30,7 +35,9 @@ import {
   attachCodexAutoApproval,
   createCodexConfigOverrides,
   initializeCodexAppServer,
+  interruptCodexTurn,
   killCodexAppServer,
+  probeCodexThreadHealth,
   spawnCodexAppServer,
   startCodexTurn,
   startOrResumeCodexThread,
@@ -38,9 +45,11 @@ import {
   writeCodexHooksJson,
   writeCodexMcpConfigToml,
 } from './codex-app-server.js';
+import { CodexTurnLiveness, normalizeCodexThreadStatus } from './codex-liveness.js';
 
 /**
- * Idle watchdog for a single turn. Guards against codex-app-server wedging.
+ * Health watchdog for a single turn. Guards against codex-app-server wedging
+ * without treating a quiet Ultra/model/tool operation as dead.
  *
  * Previously this was a wall-clock timer from turn start (`TURN_TIMEOUT_MS
  * = 300_000`). That cut off every legitimate long turn — `xhigh` reasoning
@@ -48,41 +57,60 @@ import {
  * reasoning deltas every 1–10s. Wall-clock can't tell "thinking hard" from
  * "wedged"; idle-from-last-notification can.
  *
- * The handler at runOneTurn resets the timer on every JSON-RPC
- * notification (including `thread/status/changed` and `item/reasoning/*`
- * deltas). It suppresses itself while a tool/reasoning item is in flight
- * (`inFlightItems > 0`, see below), so it measures the gap BETWEEN items —
- * the turn/started → first-item latency and inter-item gaps.
+ * Notifications remain the primary activity signal. Once they go quiet, the
+ * provider sends non-mutating thread/read + descendant thread/list requests.
+ * A responsive active root/descendant may remain quiet indefinitely; only
+ * repeated control-plane failures or repeated impossible inactive snapshots
+ * trigger app-server replacement.
  *
- * 5 minutes, generously. Codex is inherently slow in-container — a TRIVIAL
- * `codex exec "reply OK"` measured ~15s (xhigh reasoning effort + ~12k tokens
- * of skills/hooks/system prompt loaded per invocation), and a real task's
- * first-item / inter-item gap under load is tens of seconds to minutes. The
- * between-item gaps are NOT "seconds" for codex at xhigh. A 2026-06-27 attempt
- * to tighten to 60s broke codex wholesale: with the poll-loop retry on top, a
- * turn that would finish at ~75s got killed at 60s, restarted, killed again —
- * never completing ("codex returns nothing"). So we err HARD toward
- * tolerance: a false-fire on a slow-but-healthy turn is far worse than slow
- * detection of a rare real wedge (host-sweep's 30-min ABSOLUTE_CEILING is the
- * ultimate backstop). At a 5-min ceiling a fire almost certainly IS a real
- * wedge — so poll-loop retries only ONCE (a re-run rarely revives a 5-min
- * stall). Override via CODEX_TURN_IDLE_TIMEOUT_MS without a recompile.
- *
- * The handler tags a fire as classification 'idle_timeout' so poll-loop
- * retries the turn in-place (search `idle_timeout` in poll-loop.ts), and at
- * fire time logs the last notification method seen so real wedges stay
- * diagnosable despite the container's --rm losing the trace.
- *
- * Long-tool suppression: long-running tool calls (e.g. multi-minute Bash
- * tests, `hex project run --timeout 30m`) emit one `item/started` then
- * run silently until `item/completed`. The handler tracks an
- * `inFlightItems` counter from those events and suppresses the watchdog
- * while > 0 — long silence during a known-active tool is not a wedge.
- * Backstop for a tool that truly hangs forever: the provider publishes a
- * bounded one-hour deadline to host-sweep while native items are in flight.
+ * Initial production defaults: wait 60s of notification silence, probe every
+ * 30s with a 10s response deadline, and recover after three consecutive
+ * failures. At those defaults a hard wedge is replaced in roughly two minutes.
+ * Successful probes yield ProviderEvent.activity, keeping the host heartbeat
+ * fresh even for a legitimate turn that stays notification-silent for hours.
  */
-const TURN_IDLE_TIMEOUT_MS = Number(process.env.CODEX_TURN_IDLE_TIMEOUT_MS) || 5 * 60 * 1000;
+const CODEX_HEALTH_PROBE_QUIET_MS = 60_000;
+const CODEX_HEALTH_PROBE_INTERVAL_MS = 30_000;
+const CODEX_HEALTH_PROBE_TIMEOUT_MS = 10_000;
+const CODEX_HEALTH_PROBE_FAILURE_LIMIT = 3;
+const CODEX_INACTIVE_SNAPSHOT_LIMIT = 2;
+const CODEX_HEALTH_STILL_WORKING_NOTICE_MS = 15 * 60_000;
 const CODEX_IN_FLIGHT_ITEM_TIMEOUT_MS = 60 * 60 * 1000;
+const CODEX_CONTROL_PLANE_RECOVERY_MAX = 1;
+const CODEX_INTERRUPT_TIMEOUT_MS = 2_000;
+
+export interface CodexTurnHealthConfig {
+  quietMs: number;
+  intervalMs: number;
+  timeoutMs: number;
+  probeFailureLimit: number;
+  inactiveSnapshotLimit: number;
+  stillWorkingNoticeMs: number;
+}
+
+function positiveEnvMs(name: string, fallback: number): number {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+export function codexTurnHealthConfigFromEnv(): CodexTurnHealthConfig {
+  return {
+    quietMs: positiveEnvMs('CODEX_HEALTH_PROBE_QUIET_MS', CODEX_HEALTH_PROBE_QUIET_MS),
+    intervalMs: positiveEnvMs('CODEX_HEALTH_PROBE_INTERVAL_MS', CODEX_HEALTH_PROBE_INTERVAL_MS),
+    timeoutMs: positiveEnvMs('CODEX_HEALTH_PROBE_TIMEOUT_MS', CODEX_HEALTH_PROBE_TIMEOUT_MS),
+    probeFailureLimit: positiveEnvMs('CODEX_HEALTH_PROBE_FAILURE_LIMIT', CODEX_HEALTH_PROBE_FAILURE_LIMIT),
+    inactiveSnapshotLimit: positiveEnvMs('CODEX_INACTIVE_SNAPSHOT_LIMIT', CODEX_INACTIVE_SNAPSHOT_LIMIT),
+    stillWorkingNoticeMs: positiveEnvMs('CODEX_HEALTH_STILL_WORKING_NOTICE_MS', CODEX_HEALTH_STILL_WORKING_NOTICE_MS),
+  };
+}
+
+function persistCodexProviderHealth(state: ProviderHealthState): void {
+  try {
+    setProviderHealthState(state);
+  } catch (err) {
+    console.error('[codex-provider] Failed to persist provider health state:', err);
+  }
+}
 
 /**
  * Lookup tables for translating Codex collaboration ThreadItems into
@@ -131,10 +159,7 @@ type CodexCollaborationThreadItem = {
  * ID, so a per-turn set safely suppresses duplicate renderings without hiding
  * distinct actions against the same child agent.
  */
-export function formatCodexCollaborationProgress(
-  rawItem: unknown,
-  emittedItemIds: Set<string>,
-): string | null {
+export function formatCodexCollaborationProgress(rawItem: unknown, emittedItemIds: Set<string>): string | null {
   if (!rawItem || typeof rawItem !== 'object') return null;
   const item = rawItem as CodexCollaborationThreadItem;
   let message: string | null = null;
@@ -145,18 +170,15 @@ export function formatCodexCollaborationProgress(
     const receivers = Array.isArray(item.receiverThreadIds)
       ? item.receiverThreadIds.filter((id): id is string => typeof id === 'string')
       : [];
-    const receiverLabel = receivers.length > 0
-      ? ` (${receivers.length} agent${receivers.length === 1 ? '' : 's'})`
-      : '';
+    const receiverLabel =
+      receivers.length > 0 ? ` (${receivers.length} agent${receivers.length === 1 ? '' : 's'})` : '';
     message = `${emoji} subagent: ${verb}${receiverLabel}`;
   } else if (
-    item.type === 'subAgentActivity'
-    && (item.kind === 'started' || item.kind === 'interacted' || item.kind === 'interrupted')
+    item.type === 'subAgentActivity' &&
+    (item.kind === 'started' || item.kind === 'interacted' || item.kind === 'interrupted')
   ) {
     const kind = item.kind;
-    const agentPath = typeof item.agentPath === 'string' && item.agentPath.trim()
-      ? ` (${item.agentPath.trim()})`
-      : '';
+    const agentPath = typeof item.agentPath === 'string' && item.agentPath.trim() ? ` (${item.agentPath.trim()})` : '';
     message = `${SUBAGENT_ACTIVITY_EMOJI[kind]} subagent: ${kind}${agentPath}`;
   }
 
@@ -463,18 +485,16 @@ export function augmentWithProxyEnv(baseEnv: Record<string, string>): Record<str
  * identity is used. Source: openai/codex `CodexErrorInfo` enum + the TUI's
  * `app_server_rate_limit_error_kind` rate-limit classifier.
  */
-const ROTATABLE_CODEX_ERROR_KINDS: ReadonlySet<string> = new Set([
-  'UsageLimitExceeded',
-  'ServerOverloaded',
-]);
+const ROTATABLE_CODEX_ERROR_KINDS: ReadonlySet<string> = new Set(['UsageLimitExceeded', 'ServerOverloaded']);
 
 /**
  * Map a terminal turn error to a ProviderEvent `classification` consumed by
  * the poll-loop catch path:
  *   - `quota` / `overloaded` → rotation-eligible (structured CodexErrorInfo)
  *   - `system_error` → coarse thread/status/changed wedge (no structured detail)
- *   - `idle_timeout` → app-server silence past TURN_IDLE_TIMEOUT_MS; transient,
- *     poll-loop retries in-place
+ *   - `control_plane_unresponsive` / `protocol_desync` → provider-local
+ *     app-server replacement + persisted-thread resume
+ *   - `idle_timeout` → legacy compatibility for older emitted errors
  * A rotation-eligible `errorKind` short-circuits the message checks (a
  * structured quota/overload error is never also a system/idle error).
  */
@@ -485,8 +505,19 @@ export function classifyCodexError(message: string, errorKind: string | null): s
     return undefined;
   }
   if (message.startsWith('codex_system_error')) return 'system_error';
+  if (message.startsWith('codex_control_plane_unresponsive')) return 'control_plane_unresponsive';
+  if (message.startsWith('codex_protocol_desync')) return 'protocol_desync';
   if (message.includes('idle for')) return 'idle_timeout';
   return undefined;
+}
+
+export function buildCodexRecoveryPrompt(): string {
+  return [
+    "The prior turn's Codex control plane stopped responding and was restarted.",
+    'Continue the same user request from the persisted thread state.',
+    'Inspect completed work before acting and do not repeat completed external side effects.',
+    'If the prior turn completed before the disconnect, return its result instead of redoing it.',
+  ].join(' ');
 }
 
 /**
@@ -547,11 +578,7 @@ export function findRolloutFile(threadId: string, codexHome: string): string | n
  * failed turn anyway (the rotation routine will replay the user input
  * against the new app-server, generating a fresh assistant response).
  */
-export function copyRolloutToFallback(
-  srcRollout: string,
-  srcCodexHome: string,
-  dstCodexHome: string,
-): string | null {
+export function copyRolloutToFallback(srcRollout: string, srcCodexHome: string, dstCodexHome: string): string | null {
   const srcSessionsRoot = path.join(srcCodexHome, 'sessions');
   const rel = path.relative(srcSessionsRoot, srcRollout);
   if (rel.startsWith('..') || path.isAbsolute(rel)) return null;
@@ -652,10 +679,7 @@ export interface RolloutCandidate {
   size: number;
 }
 
-export function findNewestRolloutAcrossHomes(
-  threadId: string,
-  codexHomes: readonly string[],
-): RolloutCandidate | null {
+export function findNewestRolloutAcrossHomes(threadId: string, codexHomes: readonly string[]): RolloutCandidate | null {
   const needle = threadId.toLowerCase();
   let best: RolloutCandidate | null = null;
   for (const home of codexHomes) {
@@ -684,11 +708,7 @@ export function findNewestRolloutAcrossHomes(
         }
         if (!entry.endsWith('.jsonl')) continue;
         if (!entry.toLowerCase().includes(needle)) continue;
-        if (
-          best === null ||
-          stat.mtimeMs > best.mtimeMs ||
-          (stat.mtimeMs === best.mtimeMs && stat.size > best.size)
-        ) {
+        if (best === null || stat.mtimeMs > best.mtimeMs || (stat.mtimeMs === best.mtimeMs && stat.size > best.size)) {
           best = { home, path: full, mtimeMs: stat.mtimeMs, size: stat.size };
         }
       }
@@ -763,10 +783,7 @@ export class CodexProvider implements AgentProvider {
 
     // Model precedence: stickyConfig (per-agent) > CODEX_MODEL env (host
     // default) > built-in default.
-    this.model =
-      this.stickyConfig.model ??
-      (options.env?.CODEX_MODEL as string | undefined) ??
-      'gpt-5.6-sol';
+    this.model = this.stickyConfig.model ?? (options.env?.CODEX_MODEL as string | undefined) ?? 'gpt-5.6-sol';
 
     // Fallback OAuth identities. Empty when CODEX_FALLBACK_HOMES is unset
     // (the host didn't mount any fallbacks). Read from process.env rather
@@ -881,10 +898,7 @@ export class CodexProvider implements AgentProvider {
         // no fallbacks are configured. The fast-path skip is what makes this
         // free for the 99% of installs not using OAuth fallback.
         if (threadId && self.fallbackHomes.length > 0) {
-          const candidate = findNewestRolloutAcrossHomes(threadId, [
-            currentCodexHome,
-            ...self.fallbackHomes,
-          ]);
+          const candidate = findNewestRolloutAcrossHomes(threadId, [currentCodexHome, ...self.fallbackHomes]);
           if (candidate && candidate.home !== currentCodexHome) {
             const copied = copyRolloutToFallback(candidate.path, candidate.home, currentCodexHome);
             if (copied) {
@@ -909,6 +923,8 @@ export class CodexProvider implements AgentProvider {
           if (pending.length === 0 && ended) return;
 
           const text = pending.shift()!;
+          let attemptText = text;
+          let controlPlaneRecoveryAttempts = 0;
 
           // Rotation loop. Each iteration runs the same `text` against the
           // current app-server; on a rotation-eligible error with fallback
@@ -917,7 +933,7 @@ export class CodexProvider implements AgentProvider {
           // re-run the same input. Up to (1 + fallbackHomes.length)
           // attempts so an exhausted rotation falls through to surface the
           // error instead of looping.
-          let attemptsRemaining = self.fallbackHomes.length + 1;
+          let attemptsRemaining = self.fallbackHomes.length + 1 + CODEX_CONTROL_PLANE_RECOVERY_MAX;
           let rotateAndRetry = true;
           while (rotateAndRetry && attemptsRemaining-- > 0) {
             rotateAndRetry = false;
@@ -927,16 +943,11 @@ export class CodexProvider implements AgentProvider {
             // poll-loop's idle timer stays honest) and then, where relevant,
             // an init / result / progress event.
             //
-            // We inspect each event while re-yielding it: on a
-            // `retryable:false` error (e.g. TURN_IDLE_TIMEOUT_MS) the codex
-            // app-server is wedged server-side — there's no turn-cancel RPC,
-            // only turn/start and turn/steer, so the next startCodexTurn
-            // would either block or immediately re-time-out. Return from
-            // gen() so the outer finally calls killCodexAppServer and the
-            // next poll-loop iteration spawns a fresh app-server within
-            // seconds. Without this, every subsequent turn dies the same
-            // way until host-sweep reaps the whole container at its 30-min
-            // ABSOLUTE_CEILING_MS.
+            // We inspect each event while re-yielding it. Confirmed control-
+            // plane failures are recovered here by interrupting when possible,
+            // replacing only app-server, resuming the persisted thread, and
+            // continuing once. Other hard errors still return from gen() so
+            // its finally tears down the per-query app-server cleanly.
             //
             // EXCEPTION: when the error's classification matches a
             // rotation-eligible kind AND we have a fallback CODEX_HOME
@@ -945,7 +956,7 @@ export class CodexProvider implements AgentProvider {
             for await (const ev of runOneTurn(
               server,
               threadId!,
-              text,
+              attemptText,
               effectiveModel,
               input.cwd,
               () => initYielded,
@@ -953,8 +964,80 @@ export class CodexProvider implements AgentProvider {
                 initYielded = true;
               },
               turnTracker,
+              codexTurnHealthConfigFromEnv(),
+              controlPlaneRecoveryAttempts,
             )) {
               if (ev.type === 'error' && ev.retryable === false) {
+                const controlPlaneFailure =
+                  ev.classification === 'control_plane_unresponsive' || ev.classification === 'protocol_desync';
+                if (controlPlaneFailure && controlPlaneRecoveryAttempts < CODEX_CONTROL_PLANE_RECOVERY_MAX) {
+                  controlPlaneRecoveryAttempts++;
+                  persistCodexProviderHealth({
+                    status: 'recovering',
+                    lastEventAt: new Date().toISOString(),
+                    lastProbeAt: new Date().toISOString(),
+                    probeFailures:
+                      ev.classification === 'control_plane_unresponsive' ? CODEX_HEALTH_PROBE_FAILURE_LIMIT : 0,
+                    recoveryAttempts: controlPlaneRecoveryAttempts,
+                    failureReason: ev.message,
+                  });
+                  yield {
+                    type: 'progress',
+                    message: formatBlockquoteLabel(
+                      '↻',
+                      `Codex control plane ${ev.classification === 'protocol_desync' ? 'lost turn state' : 'stopped responding'}; ` +
+                        `restarting app-server and resuming this task`,
+                    ),
+                  };
+
+                  // A responsive but inconsistent server gets a graceful
+                  // interrupt. An unresponsive server already failed three
+                  // bounded probes, so waiting on another RPC only delays
+                  // recovery; replace it directly.
+                  if (ev.classification === 'protocol_desync' && turnTracker.threadId && turnTracker.currentTurnId) {
+                    try {
+                      await interruptCodexTurn(
+                        server,
+                        { threadId: turnTracker.threadId, turnId: turnTracker.currentTurnId },
+                        CODEX_INTERRUPT_TIMEOUT_MS,
+                      );
+                    } catch (err) {
+                      console.error(
+                        `[codex-provider] Graceful turn interrupt failed before control-plane recovery: ` +
+                          `${err instanceof Error ? err.message : String(err)}`,
+                      );
+                    }
+                  }
+
+                  turnTracker.server = null;
+                  turnTracker.threadId = null;
+                  turnTracker.currentTurnId = null;
+                  killCodexAppServer(server);
+
+                  writeCodexMcpConfigToml(self.mcpServers);
+                  writeCodexHooksJson();
+                  server = spawnCodexAppServer(createCodexConfigOverrides(effectiveConfig));
+                  turnTracker.server = server;
+                  attachCodexAutoApproval(server);
+                  await initializeCodexAppServer(server);
+
+                  const previousThreadId: string | undefined = threadId;
+                  threadId = await startOrResumeCodexThread(server, threadId, threadParams);
+                  turnTracker.threadId = threadId ?? null;
+                  if (threadId !== previousThreadId) {
+                    // The persisted rollout was unavailable. Re-send the
+                    // original request because the new thread has no context.
+                    initYielded = false;
+                    attemptText = text;
+                  } else {
+                    // Same persisted thread: ask Codex to continue rather than
+                    // duplicating the original user request and its side effects.
+                    attemptText = buildCodexRecoveryPrompt();
+                  }
+
+                  rotateAndRetry = true;
+                  break;
+                }
                 const eligible =
                   ev.classification === 'quota' ||
                   ev.classification === 'overloaded' ||
@@ -1126,7 +1209,7 @@ export class CodexProvider implements AgentProvider {
 // and because it's a natural seam for future unit tests that drive it with
 // a fake notification stream.
 
-async function* runOneTurn(
+export async function* runOneTurn(
   server: AppServer,
   threadId: string,
   inputText: string,
@@ -1135,6 +1218,8 @@ async function* runOneTurn(
   hasInit: () => boolean,
   markInit: () => void,
   turnTracker?: { currentTurnId: string | null },
+  healthConfig: CodexTurnHealthConfig = codexTurnHealthConfigFromEnv(),
+  recoveryAttempts = 0,
 ): AsyncGenerator<ProviderEvent> {
   // Mutable refs via object properties — TS can't track closure assignments
   // for narrowing, but property access keeps the declared type visible.
@@ -1198,52 +1283,112 @@ async function* runOneTurn(
     if (message) buffer.push({ type: 'progress', message });
   };
 
-  // Idle watchdog: armed below, reset on every notification when no
-  // tool item is in flight. See TURN_IDLE_TIMEOUT_MS comment block for
-  // design notes.
-  //
-  // Tool-aware suppression: codex emits item/started for every tool /
-  // reasoning / agent-message item and pairs it with item/completed. A
-  // long-running Bash call (think `go test ./...` or `hex project run
-  // --timeout 30m`) emits start, then runs silently for minutes, then
-  // emits complete. While the inflight count is > 0, long notification
-  // silence is expected — suppress the watchdog. The in-flight transition is
-  // also published to host-sweep with a bounded one-hour deadline.
-  let idleTimer: ReturnType<typeof setTimeout> | null = null;
-  let inFlightItems = 0;
-  const syncHostInFlightState = (previousInFlightItems: number): void => {
-    try {
-      if (previousInFlightItems === 0 && inFlightItems > 0) {
-        setContainerToolInFlight('CodexItem', CODEX_IN_FLIGHT_ITEM_TIMEOUT_MS);
-      } else if (previousInFlightItems > 0 && inFlightItems === 0) {
-        clearContainerToolInFlight();
-      }
-    } catch (err) {
-      console.error('[codex-provider] Failed to update host in-flight state:', err);
-    }
-  };
-  // Instrumentation: the last notification method seen before the watchdog
-  // armed. Logged at fire time so we can tell a pre-first-item stall
-  // (last='turn/started') from an inter-item one (last='item/completed') —
-  // the difference between "model never started" and "model paused between
-  // steps" — without the lost-to-`--rm` container trace.
+  const liveness = new CodexTurnLiveness({
+    probeFailureLimit: healthConfig.probeFailureLimit,
+    inactiveSnapshotLimit: healthConfig.inactiveSnapshotLimit,
+  });
+  let healthTimer: ReturnType<typeof setInterval> | null = null;
+  let healthProbeInFlight = false;
+  let lastProbeAt: string | null = null;
+  let providerRecoveryRequested = false;
+  let noticeForLastNotificationAtMs: number | null = null;
   let lastMethod = '<turn-start>';
 
-  const resetIdleTimer = (): void => {
-    if (idleTimer !== null) {
-      clearTimeout(idleTimer);
-      idleTimer = null;
-    }
-    if (inFlightItems > 0) return;
-    idleTimer = setTimeout(() => {
-      console.error(
-        `[codex-provider] idle watchdog fired after ${TURN_IDLE_TIMEOUT_MS}ms of silence ` +
-          `(last notification: ${lastMethod}, model: ${model}) — poll-loop will retry`,
-      );
-      turnState.error = new Error(`Codex turn idle for ${TURN_IDLE_TIMEOUT_MS}ms (no notifications)`);
-      turnDone = true;
+  const persistHealth = (status: ProviderHealthState['status'], failureReason: string | null = null): void => {
+    const snapshot = liveness.snapshot();
+    persistCodexProviderHealth({
+      status,
+      lastEventAt: new Date(snapshot.lastNotificationAtMs).toISOString(),
+      lastProbeAt,
+      probeFailures: snapshot.consecutiveProbeFailures,
+      recoveryAttempts,
+      failureReason,
+    });
+  };
+
+  const finishForLivenessFailure = (
+    classification: 'control_plane_unresponsive' | 'protocol_desync',
+    reason: string,
+  ): void => {
+    if (turnDone) return;
+    const prefix =
+      classification === 'control_plane_unresponsive' ? 'codex_control_plane_unresponsive' : 'codex_protocol_desync';
+    console.error(
+      `[codex-provider] health watchdog requested recovery ` +
+        `(classification=${classification}, last notification=${lastMethod}, model=${model}): ${reason}`,
+    );
+    buffer.push({
+      type: 'progress',
+      message: formatBlockquoteLabel('↻', 'Codex control plane became unhealthy; preparing an app-server restart'),
+    });
+    providerRecoveryRequested = true;
+    persistHealth('failed', reason);
+    turnState.error = new Error(`${prefix}: ${reason}`);
+    turnDone = true;
+    kick();
+  };
+
+  const runHealthProbe = async (): Promise<void> => {
+    if (turnDone || healthProbeInFlight) return;
+    const before = liveness.snapshot();
+    if (Date.now() - before.lastNotificationAtMs < healthConfig.quietMs) return;
+
+    healthProbeInFlight = true;
+    const probeStartedAtMs = Date.now();
+    try {
+      const raw = await probeCodexThreadHealth(server, threadId, healthConfig.timeoutMs);
+      if (turnDone) return;
+      lastProbeAt = new Date().toISOString();
+      const decision = liveness.noteProbeSuccess({
+        rootStatus: normalizeCodexThreadStatus(raw.rootStatus),
+        descendantStatuses: raw.descendantStatuses.map(normalizeCodexThreadStatus),
+      });
+
+      // A successful control-plane round trip is real liveness even when the
+      // model/tool emitted no user-visible event. The poll-loop converts this
+      // activity event into the host heartbeat file touch.
+      buffer.push({ type: 'activity' });
+      if (decision.kind === 'recover') {
+        finishForLivenessFailure(decision.classification, decision.reason);
+      } else if (decision.kind === 'suspect') {
+        persistHealth('suspect', decision.reason);
+      } else {
+        persistHealth('healthy');
+        const quietForMs = Date.now() - liveness.snapshot().lastNotificationAtMs;
+        if (
+          quietForMs >= healthConfig.stillWorkingNoticeMs &&
+          noticeForLastNotificationAtMs !== liveness.snapshot().lastNotificationAtMs
+        ) {
+          noticeForLastNotificationAtMs = liveness.snapshot().lastNotificationAtMs;
+          buffer.push({
+            type: 'progress',
+            message: formatBlockquoteLabel(
+              '⏳',
+              'Codex is still active; its control plane is responding while the current work remains quiet',
+            ),
+          });
+        }
+      }
+    } catch (err) {
+      if (turnDone) return;
+      // A notification arriving while the probe was pending proves the
+      // control plane is alive; do not count a raced request timeout.
+      if (liveness.snapshot().lastNotificationAtMs > probeStartedAtMs) {
+        liveness.noteProbeSuccess({ rootStatus: 'unknown', descendantStatuses: [] });
+        return;
+      }
+      const reason = err instanceof Error ? err.message : String(err);
+      lastProbeAt = new Date().toISOString();
+      const decision = liveness.noteProbeFailure(reason);
+      if (decision.kind === 'recover') {
+        finishForLivenessFailure(decision.classification, decision.reason);
+      } else if (decision.kind === 'suspect') {
+        persistHealth('suspect', decision.reason);
+      }
+    } finally {
+      healthProbeInFlight = false;
       kick();
-    }, TURN_IDLE_TIMEOUT_MS);
+    }
   };
 
   const handler = (n: JsonRpcNotification): void => {
@@ -1251,26 +1396,15 @@ async function* runOneTurn(
     const params = n.params;
     lastMethod = method;
 
-    // Adjust the tool-in-flight count BEFORE resetting the idle timer,
-    // so the reset logic sees the new count and skips re-arming while a
-    // tool is running. Codex pairs item/started ↔ item/completed for
-    // every item type (tool calls, reasoning, agentMessage). On
-    // turn/completed and turn/failed we also clear the count — covers
-    // the rare case of an orphan start with no matching completion.
-    const previousInFlightItems = inFlightItems;
     if (method === 'item/started') {
-      inFlightItems++;
+      liveness.noteItemStarted(params.item);
     } else if (method === 'item/completed') {
-      inFlightItems = Math.max(0, inFlightItems - 1);
+      liveness.noteItemCompleted(params.item);
     } else if (method === 'turn/completed' || method === 'turn/failed') {
-      inFlightItems = 0;
+      liveness.noteTurnEnded();
+    } else {
+      liveness.noteNotification();
     }
-    syncHostInFlightState(previousInFlightItems);
-
-    // Reset the idle watchdog on every notification — even ones we don't
-    // translate to a ProviderEvent. The app-server emitting ANYTHING
-    // means it's alive; only total silence is a wedge signal.
-    resetIdleTimer();
 
     // Every inbound notification counts as activity for the poll-loop's
     // idle timer — yield before any event-specific translation so even
@@ -1287,8 +1421,7 @@ async function* runOneTurn(
         break;
       }
       case 'turn/started': {
-        const tid = (params as { turnId?: string }).turnId
-          ?? ((params as { turn?: { id?: string } }).turn?.id);
+        const tid = (params as { turnId?: string }).turnId ?? (params as { turn?: { id?: string } }).turn?.id;
         if (turnTracker && typeof tid === 'string') turnTracker.currentTurnId = tid;
         break;
       }
@@ -1305,7 +1438,9 @@ async function* runOneTurn(
         break;
       }
       case 'item/completed': {
-        const item = params.item as ({ type?: string; text?: string } & ReasoningThreadItem & ImageGenerationThreadItem) | undefined;
+        const item = params.item as
+          | ({ type?: string; text?: string } & ReasoningThreadItem & ImageGenerationThreadItem)
+          | undefined;
         emitCollaborationProgress(item);
         if (item?.type === 'agentMessage' && item.text) resultText = item.text;
         if (item?.type === 'reasoning') emitCompletedReasoningItem(item);
@@ -1401,8 +1536,7 @@ async function* runOneTurn(
           label = raw;
         } else if (raw && typeof raw === 'object') {
           const obj = raw as Record<string, unknown>;
-          const candidate =
-            obj.label ?? obj.state ?? obj.status ?? obj.kind ?? obj.type ?? obj.message ?? obj.text;
+          const candidate = obj.label ?? obj.state ?? obj.status ?? obj.kind ?? obj.type ?? obj.message ?? obj.text;
           label = typeof candidate === 'string' ? candidate : JSON.stringify(raw);
         }
         // `systemError` is a thread-fatal state — Codex stops processing the
@@ -1435,11 +1569,18 @@ async function* runOneTurn(
 
   server.notificationHandlers.push(handler);
 
-  // Arm the idle watchdog before turn/start dispatches — there's a small
-  // window where startCodexTurn could hang at the JSON-RPC layer with no
-  // notifications ever arriving. The timer will be reset by the first
-  // real notification (typically thread/started or turn/started).
-  resetIdleTimer();
+  // Publish the entire Codex turn as host-visible work. Successful protocol
+  // probes refresh the heartbeat, so the one-hour value is now only the host's
+  // catastrophic fallback if this in-container recovery loop itself stops.
+  try {
+    setContainerToolInFlight('CodexItem', CODEX_IN_FLIGHT_ITEM_TIMEOUT_MS);
+  } catch (err) {
+    console.error('[codex-provider] Failed to update host in-flight state:', err);
+  }
+  persistHealth('active');
+  healthTimer = setInterval(() => {
+    void runHealthProbe();
+  }, healthConfig.intervalMs);
 
   try {
     // If we yield init before turn/start, the poll-loop stores
@@ -1472,8 +1613,8 @@ async function* runOneTurn(
       // The `system_error` value below covers the coarse-systemError path
       // where thread/status/changed fired but no follow-up turn/completed
       // carried structured detail (observed wedge in codex-cli 0.130.0).
-      // idle_timeout (TURN_IDLE_TIMEOUT_MS stall) classifies as transient and
-      // is retried in-place by poll-loop instead of dead-ending the user.
+      // Control-plane classifications are intercepted by CodexProvider.gen,
+      // which replaces only app-server and resumes this persisted thread.
       // retryable stays false: this is NOT the SDK-internal-retry signal (that
       // path keeps the stream open) — the turn is dead and must be re-run via
       // the catch path. See classifyCodexError.
@@ -1494,7 +1635,10 @@ async function* runOneTurn(
     } catch (err) {
       console.error('[codex-provider] Failed to clear host in-flight state:', err);
     }
-    if (idleTimer !== null) clearTimeout(idleTimer);
+    if (healthTimer !== null) clearInterval(healthTimer);
+    if (!providerRecoveryRequested) {
+      persistHealth(turnState.error ? 'failed' : 'idle', turnState.error?.message ?? null);
+    }
     const idx = server.notificationHandlers.indexOf(handler);
     if (idx >= 0) server.notificationHandlers.splice(idx, 1);
   }

@@ -9,6 +9,13 @@ afterEach(() => {
 });
 
 beforeEach(() => {
+  // The host test process may inherit OneCLI proxy variables. Clear them so
+  // the backend uses the globally stubbed fetch below instead of undiciFetch;
+  // proxy behavior is covered separately by the production-path tests.
+  vi.stubEnv('HTTPS_PROXY', '');
+  vi.stubEnv('https_proxy', '');
+  vi.stubEnv('HTTP_PROXY', '');
+  vi.stubEnv('http_proxy', '');
   _resetProxyDispatcherForTest();
 });
 

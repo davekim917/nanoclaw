@@ -324,6 +324,12 @@ export interface ContainerState {
   current_tool: string | null;
   tool_declared_timeout_ms: number | null;
   tool_started_at: string | null;
+  provider_status?: string | null;
+  provider_last_event_at?: string | null;
+  provider_last_probe_at?: string | null;
+  provider_probe_failures?: number | null;
+  provider_recovery_attempts?: number | null;
+  provider_failure_reason?: string | null;
 }
 
 /**
@@ -336,14 +342,27 @@ export function getContainerState(outDb: Database.Database): ContainerState | nu
   try {
     const row = outDb
       .prepare(
-        `SELECT current_tool, tool_declared_timeout_ms, tool_started_at
+        `SELECT current_tool, tool_declared_timeout_ms, tool_started_at,
+                provider_status, provider_last_event_at, provider_last_probe_at,
+                provider_probe_failures, provider_recovery_attempts, provider_failure_reason
            FROM container_state WHERE id = 1`,
       )
       .get() as ContainerState | undefined;
     return row ?? null;
   } catch {
-    // Table not present on older session DBs — treat as "no tool in flight".
-    return null;
+    // Older DBs may have container_state without provider-health columns.
+    // Preserve the legacy tool timeout instead of discarding the whole row.
+    try {
+      const row = outDb
+        .prepare(
+          `SELECT current_tool, tool_declared_timeout_ms, tool_started_at
+             FROM container_state WHERE id = 1`,
+        )
+        .get() as ContainerState | undefined;
+      return row ?? null;
+    } catch {
+      return null;
+    }
   }
 }
 

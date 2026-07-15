@@ -1,0 +1,150 @@
+export type CodexThreadStatus = 'active' | 'idle' | 'systemError' | 'notLoaded' | 'unknown';
+
+export interface CodexHealthSnapshot {
+  rootStatus: CodexThreadStatus;
+  descendantStatuses: CodexThreadStatus[];
+}
+
+export interface CodexLivenessOptions {
+  probeFailureLimit: number;
+  inactiveSnapshotLimit: number;
+  now?: () => number;
+}
+
+export type CodexLivenessDecision =
+  | { kind: 'healthy' }
+  | { kind: 'suspect'; reason: string; consecutiveFailures: number }
+  | { kind: 'recover'; classification: 'control_plane_unresponsive' | 'protocol_desync'; reason: string };
+
+export interface CodexLivenessSnapshot {
+  lastNotificationAtMs: number;
+  consecutiveProbeFailures: number;
+  consecutiveInactiveSnapshots: number;
+  openItems: Array<{ id: string; type: string }>;
+}
+
+/**
+ * Normalize the app-server's version-dependent thread status shape.
+ * Unknown shapes deliberately fail open: a responsive future Codex version
+ * must not be restarted merely because it added a status variant.
+ */
+export function normalizeCodexThreadStatus(value: unknown): CodexThreadStatus {
+  let candidate = value;
+  if (value && typeof value === 'object') {
+    const obj = value as Record<string, unknown>;
+    candidate = obj.type ?? obj.state ?? obj.status ?? obj.kind;
+  }
+
+  if (candidate === 'active') return 'active';
+  if (candidate === 'idle') return 'idle';
+  if (candidate === 'systemError' || candidate === 'system_error') return 'systemError';
+  if (candidate === 'notLoaded' || candidate === 'not_loaded') return 'notLoaded';
+  return 'unknown';
+}
+
+/**
+ * Pure state machine for a single Codex turn. Timers and JSON-RPC live in the
+ * provider; this class only decides whether observed protocol state is safe.
+ */
+export class CodexTurnLiveness {
+  private readonly now: () => number;
+  private readonly openItems = new Map<string, string>();
+  private consecutiveProbeFailures = 0;
+  private consecutiveInactiveSnapshots = 0;
+  private lastNotificationAtMs: number;
+
+  constructor(private readonly options: CodexLivenessOptions) {
+    if (options.probeFailureLimit < 1) throw new Error('probeFailureLimit must be at least 1');
+    if (options.inactiveSnapshotLimit < 1) throw new Error('inactiveSnapshotLimit must be at least 1');
+    this.now = options.now ?? Date.now;
+    this.lastNotificationAtMs = this.now();
+  }
+
+  noteNotification(): void {
+    this.lastNotificationAtMs = this.now();
+  }
+
+  noteItemStarted(item: unknown): void {
+    const parsed = parseItemIdentity(item);
+    if (parsed) this.openItems.set(parsed.id, parsed.type);
+    this.noteNotification();
+  }
+
+  noteItemCompleted(item: unknown): void {
+    const parsed = parseItemIdentity(item);
+    if (parsed) this.openItems.delete(parsed.id);
+    this.noteNotification();
+  }
+
+  noteTurnEnded(): void {
+    this.openItems.clear();
+    this.noteNotification();
+  }
+
+  noteProbeFailure(reason: string): CodexLivenessDecision {
+    this.consecutiveProbeFailures++;
+    if (this.consecutiveProbeFailures >= this.options.probeFailureLimit) {
+      return {
+        kind: 'recover',
+        classification: 'control_plane_unresponsive',
+        reason:
+          `Codex app-server failed ${this.consecutiveProbeFailures} consecutive health probes` +
+          (reason ? `: ${reason}` : ''),
+      };
+    }
+    return { kind: 'suspect', reason, consecutiveFailures: this.consecutiveProbeFailures };
+  }
+
+  noteProbeSuccess(snapshot: CodexHealthSnapshot): CodexLivenessDecision {
+    this.consecutiveProbeFailures = 0;
+
+    if (snapshot.rootStatus === 'systemError') {
+      return {
+        kind: 'recover',
+        classification: 'protocol_desync',
+        reason: 'Codex root thread entered systemError while the turn was pending',
+      };
+    }
+
+    const statuses = [snapshot.rootStatus, ...snapshot.descendantStatuses];
+    const hasActiveWork = statuses.includes('active');
+    const hasUnknownStatus = statuses.includes('unknown');
+    if (hasActiveWork || hasUnknownStatus) {
+      this.consecutiveInactiveSnapshots = 0;
+      return { kind: 'healthy' };
+    }
+
+    this.consecutiveInactiveSnapshots++;
+    if (this.consecutiveInactiveSnapshots >= this.options.inactiveSnapshotLimit) {
+      return {
+        kind: 'recover',
+        classification: 'protocol_desync',
+        reason:
+          `Codex app-server responded but the pending root/descendant threads were inactive for ` +
+          `${this.consecutiveInactiveSnapshots} consecutive probes`,
+      };
+    }
+
+    return {
+      kind: 'suspect',
+      reason: 'Codex app-server responded but no pending root/descendant thread reported active',
+      consecutiveFailures: this.consecutiveInactiveSnapshots,
+    };
+  }
+
+  snapshot(): CodexLivenessSnapshot {
+    return {
+      lastNotificationAtMs: this.lastNotificationAtMs,
+      consecutiveProbeFailures: this.consecutiveProbeFailures,
+      consecutiveInactiveSnapshots: this.consecutiveInactiveSnapshots,
+      openItems: [...this.openItems].map(([id, type]) => ({ id, type })),
+    };
+  }
+}
+
+function parseItemIdentity(item: unknown): { id: string; type: string } | null {
+  if (!item || typeof item !== 'object') return null;
+  const obj = item as Record<string, unknown>;
+  if (typeof obj.id !== 'string') return null;
+  return { id: obj.id, type: typeof obj.type === 'string' ? obj.type : 'unknown' };
+}

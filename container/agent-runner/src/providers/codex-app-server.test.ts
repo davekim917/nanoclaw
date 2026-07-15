@@ -4,11 +4,90 @@ import os from 'os';
 import path from 'path';
 
 import {
+  type AppServer,
   buildCodexHooksJson,
   createCodexConfigOverrides,
+  interruptCodexTurn,
+  probeCodexThreadHealth,
   writeCodexHooksJson,
   writeCodexMcpConfigToml,
 } from './codex-app-server.js';
+
+interface RecordedRequest {
+  id: number;
+  method: string;
+  params: Record<string, unknown>;
+}
+
+function fakeAppServer(
+  respond: (request: RecordedRequest) => { result?: unknown; error?: { code: number; message: string } } | null,
+): { server: AppServer; requests: RecordedRequest[] } {
+  const requests: RecordedRequest[] = [];
+  const pending = new Map<number, { resolve: (value: never) => void; reject: (error: Error) => void }>();
+  const server = {
+    process: {
+      stdin: {
+        write(line: string) {
+          const request = JSON.parse(line) as RecordedRequest;
+          requests.push(request);
+          const response = respond(request);
+          if (response) {
+            queueMicrotask(() => {
+              const handler = pending.get(request.id);
+              pending.delete(request.id);
+              handler?.resolve({ id: request.id, ...response } as never);
+            });
+          }
+          return true;
+        },
+      },
+      kill() {
+        return true;
+      },
+    },
+    readline: { close() {} },
+    pending,
+    notificationHandlers: [],
+    serverRequestHandlers: [],
+  } as unknown as AppServer;
+  return { server, requests };
+}
+
+describe('Codex app-server liveness RPCs', () => {
+  it('reads the root and all descendants without mutating the thread', async () => {
+    const { server, requests } = fakeAppServer((request) => {
+      if (request.method === 'thread/read') return { result: { thread: { status: { type: 'idle' } } } };
+      if (request.method === 'thread/list') {
+        return { result: { data: [{ status: { type: 'active' } }, { status: { type: 'idle' } }] } };
+      }
+      return { error: { code: -32601, message: 'unexpected method' } };
+    });
+
+    await expect(probeCodexThreadHealth(server, 'root-1', 50)).resolves.toEqual({
+      rootStatus: { type: 'idle' },
+      descendantStatuses: [{ type: 'active' }, { type: 'idle' }],
+    });
+    expect(requests.map((request) => request.method)).toEqual(['thread/read', 'thread/list']);
+    expect(requests[1]?.params).toMatchObject({ ancestorThreadId: 'root-1', limit: 100 });
+  });
+
+  it('rejects when the control plane does not answer before the probe deadline', async () => {
+    const { server } = fakeAppServer(() => null);
+    await expect(probeCodexThreadHealth(server, 'root-1', 5)).rejects.toThrow(
+      'Timeout waiting for thread/read response',
+    );
+  });
+
+  it('interrupts a responsive in-flight turn before replacement', async () => {
+    const { server, requests } = fakeAppServer(() => ({ result: {} }));
+    await interruptCodexTurn(server, { threadId: 'thread-1', turnId: 'turn-1' }, 50);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toMatchObject({
+      method: 'turn/interrupt',
+      params: { threadId: 'thread-1', turnId: 'turn-1' },
+    });
+  });
+});
 
 describe('buildCodexHooksJson', () => {
   it('emits a PreToolUse and PostToolUse entry with command type', () => {
@@ -79,9 +158,7 @@ describe('createCodexConfigOverrides', () => {
     expect(createCodexConfigOverrides()).not.toEqual(
       expect.arrayContaining([expect.stringMatching(/^model_reasoning_effort=/)]),
     );
-    expect(createCodexConfigOverrides({ reasoning_effort: 'xhigh' })).toContain(
-      'model_reasoning_effort="xhigh"',
-    );
+    expect(createCodexConfigOverrides({ reasoning_effort: 'xhigh' })).toContain('model_reasoning_effort="xhigh"');
     expect(createCodexConfigOverrides({ reasoning_effort: 'max' })).toContain('model_reasoning_effort="max"');
     expect(createCodexConfigOverrides({ reasoning_effort: 'ultra' })).toContain('model_reasoning_effort="ultra"');
   });

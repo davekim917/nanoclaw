@@ -289,6 +289,12 @@ CREATE TABLE IF NOT EXISTS container_state (
   current_tool             TEXT,
   tool_declared_timeout_ms INTEGER,
   tool_started_at          TEXT,
+  provider_status          TEXT,
+  provider_last_event_at   TEXT,
+  provider_last_probe_at   TEXT,
+  provider_probe_failures  INTEGER,
+  provider_recovery_attempts INTEGER,
+  provider_failure_reason  TEXT,
   updated_at               TEXT NOT NULL
 );
 `;

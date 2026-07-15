@@ -3,14 +3,10 @@ import { describe, it, expect } from 'bun:test';
 import { classifyCodexError } from './codex.js';
 
 // classifyCodexError maps a terminal codex turn error to the ProviderEvent
-// `classification` the poll-loop catch path keys on. 'idle_timeout' is the
-// signal that routes the codex idle-watchdog stall to in-place retry instead
-// of dead-ending the user (2026-06-27).
+// `classification` the provider recovery and poll-loop catch paths key on.
 describe('classifyCodexError', () => {
   it('classifies the idle-watchdog stall as idle_timeout', () => {
-    expect(classifyCodexError('Codex turn idle for 60000ms (no notifications)', null)).toBe(
-      'idle_timeout',
-    );
+    expect(classifyCodexError('Codex turn idle for 60000ms (no notifications)', null)).toBe('idle_timeout');
   });
 
   it('classifies structured quota/overload errorKinds (rotation-eligible)', () => {
@@ -25,9 +21,14 @@ describe('classifyCodexError', () => {
   });
 
   it('classifies the coarse system-error wedge', () => {
-    expect(classifyCodexError('codex_system_error: thread status changed', null)).toBe(
-      'system_error',
+    expect(classifyCodexError('codex_system_error: thread status changed', null)).toBe('system_error');
+  });
+
+  it('classifies control-plane health failures for provider-local recovery', () => {
+    expect(classifyCodexError('codex_control_plane_unresponsive: three probes timed out', null)).toBe(
+      'control_plane_unresponsive',
     );
+    expect(classifyCodexError('codex_protocol_desync: root was idle', null)).toBe('protocol_desync');
   });
 
   it('returns undefined for an unclassified terminal error', () => {

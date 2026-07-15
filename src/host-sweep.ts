@@ -886,10 +886,11 @@ function enforceRunningContainerSla(
   session: Session,
   agentGroupId: string,
 ): void {
+  const containerState = getContainerState(outDb);
   const decision = decideStuckAction({
     now: Date.now(),
     heartbeatMtimeMs: heartbeatMtimeMs(agentGroupId, session.id),
-    containerState: getContainerState(outDb),
+    containerState,
     claims: getProcessingClaims(outDb),
     spawnedAtMs: getContainerSpawnedAt(session.id),
   });
@@ -912,7 +913,7 @@ function enforceRunningContainerSla(
     // `pendingClaims === 0` (no user was waiting) to avoid spamming
     // restart notices on quiet sessions that just naturally reached the
     // 30-min idle ceiling.
-    notifyKillCeiling(inDb, outDb, session, decision.heartbeatAgeMs, pendingClaims);
+    notifyKillCeiling(inDb, outDb, session, decision.heartbeatAgeMs, pendingClaims, undefined, containerState);
     resetStuckProcessingRows(inDb, outDb, session, 'absolute-ceiling');
     return;
   }
@@ -962,6 +963,7 @@ export function notifyKillCeiling(
   heartbeatAgeMs: number,
   pendingClaims: number,
   writableOutDb?: Database.Database,
+  containerState?: ContainerState | null,
 ): void {
   try {
     if (pendingClaims === 0) {
@@ -999,14 +1001,28 @@ export function notifyKillCeiling(
     // retryWithBackoff on every claimed pending message. Unclaimed pending
     // rows just sit until the next wake. Either way the system recovers
     // the user's existing input — a resend would just create duplicates.
+    const providerFailure =
+      containerState?.provider_status === 'failed' ||
+      containerState?.provider_status === 'recovering' ||
+      containerState?.provider_status === 'suspect';
+    const failureReason = containerState?.provider_failure_reason?.slice(0, 300) ?? null;
+    const text = providerFailure
+      ? `⚠️ Codex control-plane recovery did not complete` +
+        (failureReason ? ` (${failureReason})` : '') +
+        `. The host is restarting the agent runner; your existing messages will be retried automatically — ` +
+        `no need to resend.`
+      : `⚠️ The agent runner stopped updating for ${minutes} minutes and the host is restarting it. ` +
+        `Your last messages will be picked up automatically on the next wake — no need to resend.`;
     const content = JSON.stringify({
-      text:
-        `⚠️ I went silent for ${minutes} minutes and the host is restarting me. ` +
-        `Your last messages will be picked up automatically on the next wake — ` +
-        `no need to resend.`,
+      text,
       // Machine-readable marker so the idempotency check above (and any
       // future consumer that wants to react) doesn't need to grep prose.
-      _system: { kind: 'agent_restart_inactivity', heartbeat_age_ms: heartbeatAgeMs },
+      _system: {
+        kind: 'agent_restart_inactivity',
+        heartbeat_age_ms: heartbeatAgeMs,
+        provider_status: containerState?.provider_status ?? null,
+        provider_failure_reason: failureReason,
+      },
     });
     if (writableOutDb) {
       writableOutDb
@@ -1037,8 +1053,9 @@ export function _notifyKillCeilingForTesting(
   session: Session,
   heartbeatAgeMs: number,
   pendingClaims: number,
+  containerState?: ContainerState | null,
 ): void {
-  notifyKillCeiling(inDb, outDb, session, heartbeatAgeMs, pendingClaims, outDb);
+  notifyKillCeiling(inDb, outDb, session, heartbeatAgeMs, pendingClaims, outDb, containerState);
 }
 
 function resetStuckProcessingRows(

@@ -22,7 +22,9 @@ function log(msg: string): void {
 const INIT_TIMEOUT_MS = 30_000;
 
 const CODEX_INITIALIZE_CAPABILITIES = {
-  experimentalApi: false,
+  // Required for thread/list.ancestorThreadId, which lets the liveness probe
+  // see work delegated below a quiet root thread.
+  experimentalApi: true,
   // `optOutNotificationMethods` is a suppression list, not an allow-list.
   // Keep it empty so high-volume streams such as item/agentMessage/delta and
   // item/reasoning/* remain eligible for delivery on this connection.
@@ -362,6 +364,58 @@ export async function startCodexTurn(server: AppServer, params: TurnParams): Pro
     cwd: params.cwd,
   });
   if (resp.error) throw new Error(`turn/start failed: ${resp.error.message}`);
+}
+
+export interface CodexThreadHealthProbe {
+  rootStatus: unknown;
+  descendantStatuses: unknown[];
+}
+
+/**
+ * Non-mutating control-plane probe for a running turn. A successful response
+ * proves the app-server JSON-RPC loop is responsive even when the model or a
+ * tool has emitted no notifications. Descendants are included because an
+ * Ultra root may be idle-looking while delegated agents remain active.
+ */
+export async function probeCodexThreadHealth(
+  server: AppServer,
+  threadId: string,
+  timeoutMs: number,
+): Promise<CodexThreadHealthProbe> {
+  const rootResponse = await sendCodexRequest(server, 'thread/read', { threadId, includeTurns: false }, timeoutMs);
+  if (rootResponse.error) throw new Error(`thread/read health probe failed: ${rootResponse.error.message}`);
+
+  const rootResult = rootResponse.result as { thread?: { status?: unknown } } | undefined;
+  if (!rootResult?.thread) throw new Error('thread/read health probe response missing thread');
+
+  const descendantsResponse = await sendCodexRequest(
+    server,
+    'thread/list',
+    { ancestorThreadId: threadId, limit: 100 },
+    timeoutMs,
+  );
+  if (descendantsResponse.error) {
+    throw new Error(`thread/list descendant health probe failed: ${descendantsResponse.error.message}`);
+  }
+  const descendantsResult = descendantsResponse.result as
+    | { data?: Array<{ status?: unknown }>; threads?: Array<{ status?: unknown }> }
+    | undefined;
+  const descendants = descendantsResult?.data ?? descendantsResult?.threads ?? [];
+
+  return {
+    rootStatus: rootResult.thread.status,
+    descendantStatuses: descendants.map((thread) => thread.status),
+  };
+}
+
+/** Best-effort graceful cancellation before replacing a responsive server. */
+export async function interruptCodexTurn(
+  server: AppServer,
+  params: { threadId: string; turnId: string },
+  timeoutMs = 5_000,
+): Promise<void> {
+  const response = await sendCodexRequest(server, 'turn/interrupt', params, timeoutMs);
+  if (response.error) throw new Error(`turn/interrupt failed: ${response.error.message}`);
 }
 
 /**
