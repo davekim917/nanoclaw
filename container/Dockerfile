@@ -21,6 +21,8 @@
 # lets us pull the binary via COPY --from below while keeping the version
 # pinned via build-arg.
 ARG MCP_TOOLBOX_VERSION=1.6.0
+ARG GITNEXUS_VERSION=1.6.9
+ARG PNPM_VERSION=10.33.4
 FROM us-central1-docker.pkg.dev/database-toolbox/toolbox/toolbox:${MCP_TOOLBOX_VERSION} AS mcp-toolbox-src
 
 # ---- rtk builder stage -------------------------------------------------------
@@ -36,6 +38,54 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     cargo install --git https://github.com/rtk-ai/rtk --tag "v${RTK_VERSION}" --locked --root /out rtk
 
+# ---- GitNexus builder stage --------------------------------------------------
+# GitNexus ships native LadybugDB, ONNX, and tree-sitter components. ARM64
+# does not have a usable prebuild for every grammar, so install scripts must be
+# explicitly allowed and a C++ toolchain must be present while pnpm installs.
+# The completed /pnpm tree is copied into the final image; make/g++ stay here.
+FROM node:22-slim AS gitnexus-builder
+ARG GITNEXUS_VERSION
+ARG PNPM_VERSION
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        g++ \
+        git \
+        make \
+        python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PNPM_HOME="/pnpm"
+ENV PATH="$PNPM_HOME:$PATH"
+
+RUN corepack enable && corepack prepare pnpm@${PNPM_VERSION} --activate
+
+RUN --mount=type=cache,target=/root/.cache/pnpm \
+    printf '%s\n' \
+        'only-built-dependencies[]=gitnexus' \
+        'only-built-dependencies[]=@ladybugdb/core' \
+        'only-built-dependencies[]=onnxruntime-node' \
+        'only-built-dependencies[]=tree-sitter' \
+        'only-built-dependencies[]=tree-sitter-c-sharp' \
+        'only-built-dependencies[]=tree-sitter-cpp' \
+        'only-built-dependencies[]=tree-sitter-go' \
+        'only-built-dependencies[]=tree-sitter-java' \
+        'only-built-dependencies[]=tree-sitter-javascript' \
+        'only-built-dependencies[]=tree-sitter-php' \
+        'only-built-dependencies[]=tree-sitter-python' \
+        'only-built-dependencies[]=tree-sitter-ruby' \
+        'only-built-dependencies[]=tree-sitter-rust' \
+        'only-built-dependencies[]=tree-sitter-typescript' \
+        > /root/.npmrc \
+    && pnpm install -g "gitnexus@${GITNEXUS_VERSION}" \
+    && mkdir -p /opt/gitnexus-home \
+    && HOME=/opt/gitnexus-home node /pnpm/global/5/node_modules/gitnexus/scripts/install-duckdb-extension.mjs fts 17179869184 \
+    && HOME=/opt/gitnexus-home node /pnpm/global/5/node_modules/gitnexus/scripts/install-duckdb-extension.mjs vector 17179869184 \
+    && /pnpm/gitnexus --version \
+    && HOME=/opt/gitnexus-home /pnpm/gitnexus doctor
+
 FROM node:22-slim
 
 # ---- Build-time arguments ----------------------------------------------------
@@ -48,7 +98,6 @@ ARG INSTALL_CJK_FONTS=false
 ARG CLAUDE_CODE_VERSION=2.1.207
 ARG AGENT_BROWSER_VERSION=0.31.1
 ARG VERCEL_VERSION=52.2.1
-ARG GITNEXUS_VERSION=1.6.9
 ARG BUN_VERSION=1.3.14
 ARG MMDC_VERSION=11.16.0
 ARG GWS_VERSION=0.22.5
@@ -312,6 +361,13 @@ RUN --mount=type=cache,target=/root/.bun/install/cache \
 #     the SDK fails at spawn time with "native binary not found".
 ENV PNPM_HOME="/pnpm"
 ENV PATH="$PNPM_HOME:$PATH"
+# Copy the fully built ARM64-safe GitNexus install before adding the remaining
+# global CLIs. Using the same pnpm major keeps the shared global tree coherent.
+COPY --from=gitnexus-builder /pnpm /pnpm
+# MCP/query paths intentionally use load-only extension policy. Bake the FTS
+# and VECTOR binaries into the runtime user's home so fresh containers can
+# query an existing index without reaching the network or re-running analyze.
+COPY --from=gitnexus-builder /opt/gitnexus-home/.lbdb /home/node/.lbdb
 # Pin pnpm to match the host (package.json packageManager). pnpm 11 stopped
 # honoring `only-built-dependencies[]=` in .npmrc for global installs, which
 # silently skips claude-code's native-binary postinstall and agent-browser's
@@ -319,7 +375,7 @@ ENV PATH="$PNPM_HOME:$PATH"
 # installed". 10.x also avoids pnpm 11's `blockExoticSubdeps=true` default
 # which rejects git-resolved subdeps like `tree-sitter-dart` inside gitnexus.
 # Keep this in lockstep with package.json's `packageManager`.
-ARG PNPM_VERSION=10.33.4
+ARG PNPM_VERSION
 RUN corepack enable && corepack prepare pnpm@${PNPM_VERSION} --activate
 
 # Global Node CLIs the agent invokes at runtime are installed explicitly below,
@@ -353,11 +409,14 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
 # mount (see src/container-runner.ts:581).
 RUN --mount=type=cache,target=/root/.cache/pnpm \
     pnpm install -g \
-        "gitnexus@${GITNEXUS_VERSION}" \
         "@mermaid-js/mermaid-cli@${MMDC_VERSION}" \
         "@googleworkspace/cli@${GWS_VERSION}" \
         "@openai/codex@${CODEX_VERSION}" \
         "opencode-ai@${OPENCODE_VERSION}"
+
+# Verify the copied native components still load after the shared global pnpm
+# tree has been extended with the other runtime CLIs.
+RUN /pnpm/gitnexus --version && HOME=/home/node /pnpm/gitnexus doctor
 
 # Login shells reset PATH on Debian and can drop Docker ENV-provided /pnpm,
 # which makes globally installed CLIs invisible to Codex/OpenCode shell tools.

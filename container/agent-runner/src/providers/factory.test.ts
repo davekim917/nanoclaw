@@ -61,6 +61,15 @@ describe('loadConfig providerConfig', () => {
     });
   });
 
+  it('test_loadConfig_preserves_excluded_mcp_servers', () => {
+    const result = parseRawConfig({
+      provider: 'codex',
+      excludeMcpServers: ['gitnexus', 'exa'],
+    });
+
+    expect(result.excludeMcpServers).toEqual(['gitnexus', 'exa']);
+  });
+
   it('test_loadConfig_rejects_deprecated_sse_mcp_servers', () => {
     expect(() =>
       parseRawConfig({

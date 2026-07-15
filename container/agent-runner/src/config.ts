@@ -18,6 +18,7 @@ export interface RunnerConfig {
   agentGroupId: string;
   maxMessagesPerPrompt: number;
   mcpServers: Record<string, McpServerConfig>;
+  excludeMcpServers: string[];
 
   // ADDED: per-provider sticky config from container.json.providerConfig
   providerConfig: Record<string, unknown>;
@@ -59,6 +60,9 @@ export function parseRawConfig(raw: Record<string, unknown>): RunnerConfig {
     agentGroupId: (raw.agentGroupId as string) || '',
     maxMessagesPerPrompt: (raw.maxMessagesPerPrompt as number) || DEFAULT_MAX_MESSAGES,
     mcpServers: validateMcpServers((raw.mcpServers as RunnerConfig['mcpServers']) || {}),
+    excludeMcpServers: Array.isArray(raw.excludeMcpServers)
+      ? raw.excludeMcpServers.filter((name): name is string => typeof name === 'string')
+      : [],
     providerConfig: (raw.providerConfig as Record<string, unknown>) ?? {},
     model: (raw.model as string) || undefined,
     effort: (raw.effort as string) || undefined,

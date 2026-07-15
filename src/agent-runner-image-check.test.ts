@@ -82,3 +82,36 @@ describe('agent runner image global CLI PATH', () => {
     expect(dockerfile).toContain('/usr/local/bin/\\$(basename \\"\\$1\\")');
   });
 });
+
+describe('agent runner image GitNexus runtime', () => {
+  it('builds the pinned GitNexus native dependencies on ARM64 and verifies them', async () => {
+    const dockerfile = await readFile(path.join(REPO_ROOT, 'container/Dockerfile'), 'utf-8');
+
+    expect(dockerfile).toMatch(/\n\s*make\s*\\/);
+    expect(dockerfile).toMatch(/\n\s*g\+\+\s*\\/);
+
+    for (const packageName of [
+      'gitnexus',
+      '@ladybugdb/core',
+      'onnxruntime-node',
+      'tree-sitter',
+      'tree-sitter-c-sharp',
+      'tree-sitter-cpp',
+      'tree-sitter-go',
+      'tree-sitter-java',
+      'tree-sitter-javascript',
+      'tree-sitter-php',
+      'tree-sitter-python',
+      'tree-sitter-ruby',
+      'tree-sitter-rust',
+      'tree-sitter-typescript',
+    ]) {
+      expect(dockerfile).toContain(`only-built-dependencies[]=${packageName}`);
+    }
+
+    expect(dockerfile).toContain('/pnpm/gitnexus doctor');
+    expect(dockerfile).toContain('install-duckdb-extension.mjs fts');
+    expect(dockerfile).toContain('install-duckdb-extension.mjs vector');
+    expect(dockerfile).toContain('/opt/gitnexus-home/.lbdb /home/node/.lbdb');
+  });
+});

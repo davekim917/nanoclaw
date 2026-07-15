@@ -235,8 +235,10 @@ export interface ContainerConfig {
   credentialFolder?: string;
 
   /**
-   * When true, sets `GITNEXUS_INJECT_AGENTS_MD=true` in the container so
-   * GitNexus auto-injects AGENTS.md into repos the agent works on.
+   * Legacy-named compatibility flag. When true, injects GitNexus impact and
+   * pre-commit guidance into the runtime system prompt, but only while the
+   * GitNexus plugin is mounted and its MCP server is active. It never writes
+   * AGENTS.md or CLAUDE.md into a repository.
    */
   gitnexusInjectAgentsMd?: boolean;
 
