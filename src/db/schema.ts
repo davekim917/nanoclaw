@@ -162,8 +162,10 @@ CREATE TABLE pending_sender_approvals (
 `;
 
 /**
- * Session DB schemas — split into two files so each has exactly one writer.
- * This eliminates SQLite write contention across the host-container mount boundary.
+ * Session DB schemas — split into two files so each has exactly one writing
+ * side. This eliminates SQLite writer contention across the host-container
+ * mount boundary; multiple processes inside the owning container may still
+ * serialize outbound writes through SQLite locking.
  *
  *   inbound.db  — host writes, container reads (read-only mount or open read-only)
  *   outbound.db — container writes, host reads (read-only open)

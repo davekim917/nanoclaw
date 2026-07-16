@@ -7,7 +7,10 @@
  *   inbound.db  — host writes new messages here; container opens READ-ONLY
  *   outbound.db — container writes responses + acks here; host opens read-only
  *
- * Each file has exactly one writer, so no cross-process lock contention.
+ * Each file has exactly one writer across the host/container boundary, so no
+ * cross-mount writer contention. Inside the container, the runner and
+ * provider-spawned MCP subprocesses use separate outbound connections; their
+ * short writes rely on SQLite locking + busy_timeout for serialization.
  *
  * ⚠ Cross-mount visibility: inbound.db MUST be journal_mode=DELETE (set by
  * the host when the file is created). WAL's `-shm` is memory-mapped and
@@ -75,35 +78,41 @@ export function getInboundDb(): Database {
   return _inbound;
 }
 
-/** Outbound DB — container owns this file (sole writer). */
-export function getOutboundDb(): Database {
-  if (!_outbound) {
-    _outbound = new Database(DEFAULT_OUTBOUND_PATH);
-    _outbound.exec('PRAGMA journal_mode = DELETE');
-    _outbound.exec('PRAGMA busy_timeout = 5000');
-    _outbound.exec('PRAGMA foreign_keys = ON');
-    // Lightweight forward-compat: session_state was added after the initial
-    // v2 schema, so older session DBs don't have it. Create it on demand
-    // instead of requiring a formal migration pass. Also handle the case
-    // where an earlier revision of this table existed without updated_at —
-    // ALTER TABLE to add any missing columns.
-    _outbound.exec(`
+/**
+ * Configure a newly opened outbound connection.
+ *
+ * The container is the sole writer across the host/container boundary, but
+ * the runner and provider-spawned MCP subprocesses hold separate connections
+ * and may write concurrently. Install the busy handler before journal-mode or
+ * schema pragmas so first-use initialization waits out a sibling write instead
+ * of failing immediately.
+ */
+export function configureOutboundDb(outbound: Database): void {
+  outbound.exec('PRAGMA busy_timeout = 5000');
+  outbound.exec('PRAGMA journal_mode = DELETE');
+  outbound.exec('PRAGMA foreign_keys = ON');
+  // Lightweight forward-compat: session_state was added after the initial
+  // v2 schema, so older session DBs don't have it. Create it on demand
+  // instead of requiring a formal migration pass. Also handle the case
+  // where an earlier revision of this table existed without updated_at —
+  // ALTER TABLE to add any missing columns.
+  outbound.exec(`
       CREATE TABLE IF NOT EXISTS session_state (
         key        TEXT PRIMARY KEY,
         value      TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
     `);
-    const cols = new Set(
-      (_outbound.prepare("PRAGMA table_info('session_state')").all() as Array<{ name: string }>).map((c) => c.name),
-    );
-    if (!cols.has('updated_at')) {
-      _outbound.exec(`ALTER TABLE session_state ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''`);
-    }
-    // container_state: tracks the current host-visible long operation. Claude
-    // publishes declared Bash timeouts; Codex publishes a bounded deadline
-    // while native items are in flight. Forward-compat for older outbound.db.
-    _outbound.exec(`
+  const cols = new Set(
+    (outbound.prepare("PRAGMA table_info('session_state')").all() as Array<{ name: string }>).map((c) => c.name),
+  );
+  if (!cols.has('updated_at')) {
+    outbound.exec(`ALTER TABLE session_state ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''`);
+  }
+  // container_state: tracks the current host-visible long operation. Claude
+  // publishes declared Bash timeouts; Codex publishes a bounded deadline
+  // while native items are in flight. Forward-compat for older outbound.db.
+  outbound.exec(`
       CREATE TABLE IF NOT EXISTS container_state (
         id                       INTEGER PRIMARY KEY CHECK (id = 1),
         current_tool             TEXT,
@@ -118,20 +127,40 @@ export function getOutboundDb(): Database {
         updated_at               TEXT NOT NULL
       );
     `);
-    const containerCols = new Set(
-      (_outbound.prepare("PRAGMA table_info('container_state')").all() as Array<{ name: string }>).map((c) => c.name),
-    );
-    const providerColumns: Array<[string, string]> = [
-      ['provider_status', 'TEXT'],
-      ['provider_last_event_at', 'TEXT'],
-      ['provider_last_probe_at', 'TEXT'],
-      ['provider_probe_failures', 'INTEGER'],
-      ['provider_recovery_attempts', 'INTEGER'],
-      ['provider_failure_reason', 'TEXT'],
-    ];
-    for (const [name, type] of providerColumns) {
-      if (!containerCols.has(name)) _outbound.exec(`ALTER TABLE container_state ADD COLUMN ${name} ${type}`);
-    }
+  const containerCols = new Set(
+    (outbound.prepare("PRAGMA table_info('container_state')").all() as Array<{ name: string }>).map((c) => c.name),
+  );
+  const providerColumns: Array<[string, string]> = [
+    ['provider_status', 'TEXT'],
+    ['provider_last_event_at', 'TEXT'],
+    ['provider_last_probe_at', 'TEXT'],
+    ['provider_probe_failures', 'INTEGER'],
+    ['provider_recovery_attempts', 'INTEGER'],
+    ['provider_failure_reason', 'TEXT'],
+  ];
+  for (const [name, type] of providerColumns) {
+    if (!containerCols.has(name)) outbound.exec(`ALTER TABLE container_state ADD COLUMN ${name} ${type}`);
+  }
+}
+
+/** Open and fully configure one outbound connection, closing it on failure. */
+export function openOutboundDb(create: () => Database = () => new Database(DEFAULT_OUTBOUND_PATH)): Database {
+  const candidate = create();
+  try {
+    configureOutboundDb(candidate);
+    return candidate;
+  } catch (error) {
+    candidate.close();
+    throw error;
+  }
+}
+
+/** Outbound DB singleton for this process. */
+export function getOutboundDb(): Database {
+  if (!_outbound) {
+    // Publish only a fully initialized connection. If initialization fails,
+    // openOutboundDb closes the candidate and the next call starts clean.
+    _outbound = openOutboundDb();
   }
   return _outbound;
 }

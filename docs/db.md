@@ -19,7 +19,7 @@ NanoClaw uses **three kinds of SQLite database**, all on the host filesystem:
 | **Session inbound** | `data/v2-sessions/<agent_group_id>/<session_id>/inbound.db` | host | host (sync), container (read-only) | Host → container messages + routing projections |
 | **Session outbound** | `data/v2-sessions/<agent_group_id>/<session_id>/outbound.db` | container | host (poll), container | Container → host messages + processing status |
 
-**Single-writer rule.** Every SQLite file has exactly one writer. Host writes the central DB and every `inbound.db`; container writes only its own `outbound.db`. This eliminates write contention across the Docker/Apple Container mount boundary — SQLite locking across that boundary is unreliable.
+**Single-writer boundary.** Every SQLite file has exactly one writing side of the host/container boundary. The host writes the central DB and every `inbound.db`; only processes inside the owning container write its `outbound.db`. This eliminates writer contention across the Docker/Apple Container mount boundary, where SQLite locking is unreliable. It does not imply one OS process inside the container: the runner and provider-spawned MCP subprocesses can hold separate outbound connections, serialized by SQLite's busy timeout.
 
 **Everything is a message.** There is no IPC, stdin piping, or file watcher between host and container. The two session DBs are the sole IO surface. Heartbeat is a file `touch(2)` on `.heartbeat`, not a DB write.
 
@@ -58,7 +58,7 @@ Path helpers: `sessionDir()`, `inboundDbPath()`, `outboundDbPath()`, `heartbeatP
 | Approvals & pending questions | central | Survive container restarts, admin-visible |
 | Dropped-message audit | central | Global ops view |
 | Inbound messages, retry state | session `inbound.db` | Per-session workload; host is sole writer |
-| Outbound messages, agent state | session `outbound.db` | Container is sole writer; host polls |
+| Outbound messages, agent state | session `outbound.db` | Container side writes (runner + MCP subprocesses); host polls read-only |
 | Delivery outcome | session `inbound.db` (`delivered`) | Host writes on success; container reads for edit targeting |
 | Processing status | session `outbound.db` (`processing_ack`) | Container can't write to `inbound.db` |
 
@@ -81,7 +81,7 @@ These rules are enforced by convention in `src/session-manager.ts` and `containe
 
 ## 5. Design patterns at a glance
 
-1. **Two-DB session split.** `inbound.db` and `outbound.db` each have one writer, one direction of flow — no cross-mount lock contention.
+1. **Two-DB session split.** `inbound.db` and `outbound.db` each have one writing side and one direction of flow — no cross-mount writer contention. Multiple processes within the container may serialize outbound writes.
 2. **Seq parity.** Even = host, odd = container. Disjoint namespace across both tables lets the agent reference any message by `seq` alone. Details in [db-session.md §3](db-session.md#3-sequence-numbering-invariant).
 3. **Projection pattern.** `agent_destinations` and `session_routing` are projected from the central DB into each session's `inbound.db` on container wake — the container gets a fast, local read path without querying across the mount.
 4. **Ack via reverse channel.** Container never writes to `inbound.db`. Status sync happens through `processing_ack` in `outbound.db`, which the host polls and reconciles.

@@ -42,7 +42,8 @@ const TEST_DIR = '/tmp/nanoclaw-test-support-dispatch';
 import { initTestDb, closeDb, runMigrations, createAgentGroup, createMessagingGroup, getDb } from '../../db/index.js';
 import { getSession } from '../../db/sessions.js';
 import { getSupportThread } from '../../db/support-threads.js';
-import { resolveSession } from '../../session-manager.js';
+import { openInboundDb, resolveSession, resolveTaskSession } from '../../session-manager.js';
+import { insertTaskRow } from '../scheduling/db.js';
 import { wakeContainer } from '../../container-runner.js';
 import { handleDispatchSupportIssue, handleUpdateSupportTicket } from './dispatch.js';
 
@@ -135,6 +136,39 @@ describe('handleDispatchSupportIssue — new issue (purest: no ticket from polle
     expect(seeded[0].content).toContain('no Linear ticket yet');
     expect(seeded[0].content).toContain('update_support_ticket');
     expect(wakeContainer).toHaveBeenCalledTimes(1);
+  });
+
+  it('inherits isolated poller routing and turn flags as sticky support-session defaults', async () => {
+    seed();
+    const seriesId = 'task-support-poller';
+    const { session: poller } = resolveTaskSession('ag-1', seriesId);
+    const pollerDb = openInboundDb('ag-1', poller.id);
+    insertTaskRow(pollerDb, {
+      id: 'task-fire-1',
+      seriesId,
+      processAfter: now(),
+      recurrence: '*/15 * * * *',
+      channelType: 'slack',
+      platformId: 'slack:C1',
+      threadId: null,
+      content: JSON.stringify({
+        prompt: 'poll support inbox',
+        flagIntent: { turnModel: 'gpt-5.6-terra', turnEffort: 'xhigh' },
+      }),
+    });
+
+    await handleDispatchSupportIssue(dispatchContent('gthread-task', 'new issue'), poller, pollerDb);
+    const row = getSupportThread('gthread-task');
+    expect(row).toBeTruthy();
+    await handleDispatchSupportIssue(dispatchContent('gthread-task', 'customer replied'), poller, pollerDb);
+    pollerDb.close();
+    const [seedMessage, followupMessage] = inboundOf(row!.session_id!);
+    expect(JSON.parse(seedMessage.content)).toMatchObject({
+      flagIntent: { stickyModel: 'gpt-5.6-terra', stickyEffort: 'xhigh' },
+    });
+    expect(JSON.parse(followupMessage.content)).toMatchObject({
+      flagIntent: { stickyModel: 'gpt-5.6-terra', stickyEffort: 'xhigh' },
+    });
   });
 
   it('with a known ticket (legacy dispatcher), seeds the comment-not-duplicate protocol', async () => {

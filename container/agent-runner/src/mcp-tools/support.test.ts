@@ -7,7 +7,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
 import { initTestSessionDb, closeSessionDb } from '../db/connection.js';
 import { getUndeliveredMessages } from '../db/messages-out.js';
-import { dispatchSupportIssue, updateSupportTicket } from './support.js';
+import { dispatchSupportIssue, updateSupportTicket, writeSupportAction } from './support.js';
 
 beforeEach(() => {
   initTestSessionDb();
@@ -43,6 +43,68 @@ describe('dispatch_support_issue tool', () => {
     const res = await dispatchSupportIssue.handler({});
     expect(res.isError).toBe(true);
     expect(getUndeliveredMessages()).toHaveLength(0);
+  });
+
+  it('retries transient outbound DB locks without waiting for the next poll run', async () => {
+    let attempts = 0;
+    const waits: number[] = [];
+
+    await writeSupportAction(
+      { id: 'sys-retry', kind: 'system', content: '{}' },
+      {
+        write: () => {
+          attempts += 1;
+          if (attempts < 3) throw new Error('database is locked');
+          return 1;
+        },
+        sleep: async (ms) => {
+          waits.push(ms);
+        },
+      },
+    );
+
+    expect(attempts).toBe(3);
+    expect(waits).toEqual([50, 100]);
+  });
+
+  it('does not retry non-lock SQLite failures', async () => {
+    let attempts = 0;
+
+    const result = writeSupportAction(
+      { id: 'sys-fail', kind: 'system', content: '{}' },
+      {
+        write: () => {
+          attempts += 1;
+          throw new Error('disk I/O error');
+        },
+        sleep: async () => {},
+      },
+    );
+
+    await expect(result).rejects.toThrow('disk I/O error');
+    expect(attempts).toBe(1);
+  });
+
+  it('bounds persistent lock retries', async () => {
+    let attempts = 0;
+    const waits: number[] = [];
+
+    const result = writeSupportAction(
+      { id: 'sys-still-locked', kind: 'system', content: '{}' },
+      {
+        write: () => {
+          attempts += 1;
+          throw Object.assign(new Error('busy'), { code: 'SQLITE_BUSY' });
+        },
+        sleep: async (ms) => {
+          waits.push(ms);
+        },
+      },
+    );
+
+    await expect(result).rejects.toThrow('busy');
+    expect(attempts).toBe(5);
+    expect(waits).toEqual([50, 100, 250, 500]);
   });
 });
 

@@ -31,9 +31,9 @@
  * resolveSession('per-thread') → seed → wake), mirroring dispatch.ts:311-405.
  *
  * SECURITY: routing is derived from the CALLING session's own messaging group
- * (`session.messaging_group_id`) and agent group — never from agent-supplied
- * platform/channel fields — preserving the post-2026-05-02 cross-tenant
- * invariant (see scheduling/actions.ts).
+ * or, for an isolated system task, its host-written messages_in routing
+ * columns — never from agent-supplied action content. This preserves the
+ * post-2026-05-02 cross-tenant invariant (see scheduling/actions.ts).
  */
 import { randomUUID } from 'node:crypto';
 
@@ -41,7 +41,7 @@ import type Database from 'better-sqlite3';
 
 import { getChannelAdapter } from '../../channels/channel-registry.js';
 import { wakeContainer } from '../../container-runner.js';
-import { getMessagingGroup } from '../../db/messaging-groups.js';
+import { getMessagingGroup, getMessagingGroupByPlatform } from '../../db/messaging-groups.js';
 import { getSession } from '../../db/sessions.js';
 import {
   getSupportThread,
@@ -55,6 +55,16 @@ import { resolveSession, writeSessionMessage } from '../../session-manager.js';
 import type { Session } from '../../types.js';
 
 const MAX_BODY = 3000;
+const TASK_SESSION_PREFIX = 'system:tasks:';
+
+interface SupportTaskContext {
+  channelType: string;
+  platformId: string;
+  flagIntent?: {
+    stickyModel?: string;
+    stickyEffort?: string;
+  };
+}
 
 function clip(s: unknown, n = MAX_BODY): string {
   const str = typeof s === 'string' ? s : '';
@@ -63,6 +73,54 @@ function clip(s: unknown, n = MAX_BODY): string {
 
 function str(v: unknown): string | null {
   return typeof v === 'string' && v.length > 0 ? v : null;
+}
+
+/**
+ * Isolated scheduled-task sessions have no central messaging_group_id. Their
+ * host-authored task row carries the delivery route instead, and its per-fire
+ * turn flags are the model policy that should follow work dispatched from that
+ * fire. Convert those one-turn flags to sticky flags for the dedicated support
+ * session so later engineer replies stay on the same model/effort.
+ */
+function getSupportTaskContext(session: Session, inDb: Database.Database): SupportTaskContext | null {
+  if (!session.thread_id?.startsWith(TASK_SESSION_PREFIX)) return null;
+  const seriesId = session.thread_id.slice(TASK_SESSION_PREFIX.length);
+  if (!seriesId) return null;
+
+  const row = inDb
+    .prepare(
+      `SELECT channel_type, platform_id, content
+         FROM messages_in
+        WHERE kind = 'task'
+          AND series_id = ?
+          AND channel_type IS NOT NULL
+          AND platform_id IS NOT NULL
+     ORDER BY seq DESC
+        LIMIT 1`,
+    )
+    .get(seriesId) as { channel_type: string; platform_id: string; content: string } | undefined;
+  if (!row) return null;
+
+  let flagIntent: SupportTaskContext['flagIntent'];
+  try {
+    const parsed = JSON.parse(row.content) as {
+      flagIntent?: { turnModel?: unknown; turnEffort?: unknown };
+    };
+    const stickyModel = str(parsed.flagIntent?.turnModel);
+    const stickyEffort = str(parsed.flagIntent?.turnEffort);
+    if (stickyModel || stickyEffort) {
+      flagIntent = {
+        ...(stickyModel ? { stickyModel } : {}),
+        ...(stickyEffort ? { stickyEffort } : {}),
+      };
+    }
+  } catch (err) {
+    if (!(err instanceof SyntaxError)) throw err;
+    // A malformed task prompt must not block support routing. Task creation
+    // normally validates this JSON; fall back to provider defaults if corrupt.
+  }
+
+  return { channelType: row.channel_type, platformId: row.platform_id, flagIntent };
 }
 
 /** The channel-level announcement (the working thread's parent message). */
@@ -128,25 +186,27 @@ function followupText(sender: string, bodyText: unknown, linearIssue: string | n
 export async function handleDispatchSupportIssue(
   content: Record<string, unknown>,
   session: Session,
-  _inDb: Database.Database,
+  inDb: Database.Database,
 ): Promise<void> {
   const gmailThreadId = str(content.gmailThreadId);
   if (!gmailThreadId) {
     log.warn('dispatch_support_issue: rejected — missing gmailThreadId', { sessionId: session.id });
     return;
   }
-  if (!session.messaging_group_id) {
-    log.warn('dispatch_support_issue: rejected — calling session has no messaging_group_id', {
+  const taskContext = getSupportTaskContext(session, inDb);
+  const mg = session.messaging_group_id
+    ? getMessagingGroup(session.messaging_group_id)
+    : taskContext
+      ? getMessagingGroupByPlatform(taskContext.channelType, taskContext.platformId)
+      : undefined;
+  if (!mg) {
+    log.warn('dispatch_support_issue: rejected — no host-authoritative messaging group route', {
       gmailThreadId,
       sessionId: session.id,
     });
     return;
   }
-  const mg = getMessagingGroup(session.messaging_group_id);
-  if (!mg) {
-    log.error('dispatch_support_issue: messaging group not found', { messagingGroupId: session.messaging_group_id });
-    return;
-  }
+  const supportFlagIntent = taskContext?.flagIntent;
 
   const now = new Date().toISOString();
   const lastMessageId = str(content.lastMessageId);
@@ -174,6 +234,7 @@ export async function handleDispatchSupportIssue(
           text: followupText(sender, content.bodyText, linearIssue),
           sender: 'system',
           senderId: 'system',
+          ...(supportFlagIntent ? { flagIntent: supportFlagIntent } : {}),
         }),
       });
       touchSupportThread(gmailThreadId, now, lastMessageId);
@@ -220,7 +281,12 @@ export async function handleDispatchSupportIssue(
     channelType: mg.channel_type,
     platformId: mg.platform_id,
     threadId: encodedThreadId,
-    content: JSON.stringify({ text: seedPrompt(linearIssue), sender: 'system', senderId: 'system' }),
+    content: JSON.stringify({
+      text: seedPrompt(linearIssue),
+      sender: 'system',
+      senderId: 'system',
+      ...(supportFlagIntent ? { flagIntent: supportFlagIntent } : {}),
+    }),
   });
 
   upsertSupportThread(

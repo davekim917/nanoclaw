@@ -12,8 +12,16 @@
  * follow-up into the existing thread/session instead of opening a new one.
  */
 import { writeMessageOut } from '../db/messages-out.js';
+import type { WriteMessageOut } from '../db/messages-out.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
+
+const SQLITE_LOCK_RETRY_DELAYS_MS = [50, 100, 250, 500] as const;
+
+type SupportActionWriteDependencies = {
+  write?: (message: WriteMessageOut) => number;
+  sleep?: (ms: number) => Promise<void>;
+};
 
 function log(msg: string): void {
   console.error(`[mcp-tools] ${msg}`);
@@ -27,6 +35,38 @@ function err(text: string) {
   return { content: [{ type: 'text' as const, text: `Error: ${text}` }], isError: true };
 }
 
+function isTransientSqliteLock(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const code = (error as Error & { code?: unknown }).code;
+  return code === 'SQLITE_BUSY' || code === 'SQLITE_LOCKED' || /database (?:table )?is locked/i.test(error.message);
+}
+
+/**
+ * The MCP server and poll loop are separate processes that share the
+ * container-owned outbound DB. Their short writes can overlap even though the
+ * host only reads this file. Retry that narrow transient collision here so a
+ * support email does not wait another 15-minute poll cycle.
+ */
+export async function writeSupportAction(
+  message: WriteMessageOut,
+  dependencies: SupportActionWriteDependencies = {},
+): Promise<void> {
+  const write = dependencies.write ?? writeMessageOut;
+  const sleep = dependencies.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      write(message);
+      return;
+    } catch (error) {
+      const delay = SQLITE_LOCK_RETRY_DELAYS_MS[attempt];
+      if (!isTransientSqliteLock(error) || delay === undefined) throw error;
+      log(`outbound DB locked; retrying support action in ${delay}ms`);
+      await sleep(delay);
+    }
+  }
+}
+
 export const dispatchSupportIssue: McpToolDefinition = {
   tool: {
     name: 'dispatch_support_issue',
@@ -36,12 +76,22 @@ export const dispatchSupportIssue: McpToolDefinition = {
       type: 'object' as const,
       properties: {
         gmailThreadId: { type: 'string', description: 'Gmail thread id of the email (the stable per-issue key).' },
-        linearIssue: { type: 'string', description: 'Linear issue identifier, ONLY if one is already known for this thread. Usually omit — the per-issue session creates the ticket.' },
+        linearIssue: {
+          type: 'string',
+          description:
+            'Linear issue identifier, ONLY if one is already known for this thread. Usually omit — the per-issue session creates the ticket.',
+        },
         linearTeam: { type: 'string', description: 'Linear team, only if already known. Usually omit.' },
         subject: { type: 'string', description: 'Email subject (used in the channel announcement + thread title).' },
         sender: { type: 'string', description: 'Email sender (display form, e.g. "Jane Doe <jane@acme.com>").' },
-        bodyText: { type: 'string', description: 'The cleaned email body (quoted history stripped). Posted into the thread.' },
-        lastMessageId: { type: 'string', description: 'RFC-822 Message-ID header of this email, retained for future reply threading. Optional.' },
+        bodyText: {
+          type: 'string',
+          description: 'The cleaned email body (quoted history stripped). Posted into the thread.',
+        },
+        lastMessageId: {
+          type: 'string',
+          description: 'RFC-822 Message-ID header of this email, retained for future reply threading. Optional.',
+        },
       },
       required: ['gmailThreadId'],
     },
@@ -50,7 +100,7 @@ export const dispatchSupportIssue: McpToolDefinition = {
     const gmailThreadId = args.gmailThreadId as string;
     if (!gmailThreadId) return err('gmailThreadId is required');
 
-    writeMessageOut({
+    await writeSupportAction({
       id: `sys-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       kind: 'system',
       content: JSON.stringify({
@@ -88,7 +138,7 @@ export const updateSupportTicket: McpToolDefinition = {
     const linearIssue = args.linearIssue as string;
     if (!linearIssue) return err('linearIssue is required');
 
-    writeMessageOut({
+    await writeSupportAction({
       id: `sys-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
       kind: 'system',
       content: JSON.stringify({

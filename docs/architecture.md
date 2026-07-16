@@ -9,10 +9,12 @@ mechanism between host and container. No IPC files, no stdin piping. `inbound.db
 host → agent-runner messages (`messages_in`); `outbound.db` carries agent-runner → host
 messages (`messages_out`) plus the container's processing acks. Everything is a message.
 
-The split exists so each file has exactly one writer: the host writes `inbound.db` (the
-container opens it read-only) and the container writes `outbound.db` (the host opens it
-read-only). One writer per file means no cross-process lock contention over the
-host↔container mount. Both files run `journal_mode=DELETE`, **not** WAL: WAL's memory-mapped
+The split exists so each file has exactly one writing side: the host writes `inbound.db` (the
+container opens it read-only) and only the container side writes `outbound.db` (the host opens it
+read-only). That removes writer contention over the host↔container mount. The runner and
+provider-spawned MCP subprocesses can still use separate outbound connections inside the
+container, so SQLite's busy timeout serializes their short writes. Both files run
+`journal_mode=DELETE`, **not** WAL: WAL's memory-mapped
 `-shm` coherency does not propagate across VirtioFS, so a WAL reader in the guest would
 freeze on an early snapshot and never see new host writes.
 
@@ -459,9 +461,10 @@ Two directory mounts: session folder at `/workspace`, agent group folder at `/wo
 
 The runtime is Docker (`src/container-runtime.ts` hardcodes the `docker` binary); nested bind mounts make this layout straightforward. The layout deliberately sticks to directory mounts (no file-level mounts) so it stays portable to runtimes that only support directory mounts.
 
-**Cross-mount DB access:** The two files exist precisely so each has a single writer — the
-host writes `inbound.db`, the container writes `outbound.db` — which removes writer
-contention across the mount. Both files use `journal_mode=DELETE`, **not** WAL: WAL keeps its
+**Cross-mount DB access:** The two files exist precisely so each has a single writing side — the
+host writes `inbound.db`, only the container side writes `outbound.db` — which removes writer
+contention across the mount. Multiple container processes may serialize outbound writes through
+SQLite locking and `busy_timeout`. Both files use `journal_mode=DELETE`, **not** WAL: WAL keeps its
 index in a memory-mapped `-shm` file, and VirtioFS does not propagate that mmap coherency
 from host to guest, so a WAL reader in the container would freeze on an early snapshot and
 silently never see new host writes. Readers that must see fresh host writes promptly (the
