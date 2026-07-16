@@ -17,7 +17,7 @@ data/v2-sessions/<agent_group_id>/<session_id>/
   outbox/<message_id>/    ← attachments the agent produced
 ```
 
-The session directory itself is mounted read-write into the container (`src/container-runner.ts`) — read-only is *not* a mount property. The container opens `inbound.db` with `{ readonly: true }` at the SQLite connection layer (`container/agent-runner/src/db/connection.ts`), so the container could technically write to the underlying file via another path, but every code path that touches `inbound.db` from inside the container goes through that read-only handle.
+The session directory itself is mounted read-write into the container (`src/container-runner.ts`) — read-only is _not_ a mount property. The container opens `inbound.db` with `{ readonly: true }` at the SQLite connection layer (`container/agent-runner/src/db/connection.ts`), so the container could technically write to the underlying file via another path, but every code path that touches `inbound.db` from inside the container goes through that read-only handle.
 
 One session = one folder = one pair of DBs. The `agent_group_id` parent directory also holds per-group state (`.claude-shared/`) that is shared across every session of that agent group. (The agent-runner source is not copied per group — it's a shared read-only mount from `container/agent-runner/src` into every container; see `src/container-runner.ts`.)
 
@@ -111,10 +111,10 @@ Written by `writeSessionRouting()` on every container wake, derived from `sessio
 
 ## 3. Sequence numbering invariant
 
-Every message (in or out) gets a monotonic integer `seq`, unique *within the session* across both tables.
+Every message (in or out) gets a monotonic integer `seq`, unique _within the session_ across both tables.
 
 - **Host writes even seq** (2, 4, 6, …) to `messages_in` — `nextEvenSeq()` at `src/db/session-db.ts:75`.
-- **Container writes odd seq** (1, 3, 5, …) to `messages_out` — logic at `container/agent-runner/src/db/messages-out.ts:54` (`max % 2 === 0 ? max + 1 : max + 2`), reading `MAX(seq)` across *both* tables to preserve global ordering.
+- **Container writes odd seq** (1, 3, 5, …) to `messages_out` — logic at `container/agent-runner/src/db/messages-out.ts:54` (`max % 2 === 0 ? max + 1 : max + 2`), reading `MAX(seq)` across _both_ tables to preserve global ordering.
 
 Why disjoint? `seq` is the agent-facing message ID. When the agent calls `edit_message(seq=5)` or `add_reaction(seq=6)`, `getMessageIdBySeq()` uses the parity to route the lookup: odd → `messages_out`, even → `messages_in`. The parity alone disambiguates without a join. Collisions would break editing.
 
@@ -181,7 +181,7 @@ Access: `container/agent-runner/src/db/session-state.ts`.
 
 ### 4.4 `container_state`
 
-Single-row (`id=1`) host-visible operation tracker. Claude records `Bash` on `PreToolUse` and clears it on `PostToolUse`/`PostToolUseFailure`; Codex records the transition between zero and nonzero native in-flight items with a bounded one-hour deadline. The host reads the row during the stale-container sweep so known long operations are not killed by the normal 30-minute ceiling.
+Single-row (`id=1`) host-visible operation and resource tracker. Claude records `Bash` on `PreToolUse` and clears it on `PostToolUse`/`PostToolUseFailure`; Codex records the transition between zero and nonzero native in-flight items with a bounded one-hour deadline. The runner also samples cgroup v2 memory state every 15 seconds. The host reads the row during the stale-container sweep so known long operations are not killed by the normal 30-minute ceiling and OOM counter increases are logged with their configured limit and observed peak.
 
 ```sql
 CREATE TABLE container_state (
@@ -189,13 +189,25 @@ CREATE TABLE container_state (
   current_tool             TEXT,
   tool_declared_timeout_ms INTEGER,
   tool_started_at          TEXT,
+  provider_status          TEXT,
+  provider_last_event_at   TEXT,
+  provider_last_probe_at   TEXT,
+  provider_probe_failures  INTEGER,
+  provider_recovery_attempts INTEGER,
+  provider_failure_reason  TEXT,
+  memory_current_bytes     INTEGER,
+  memory_peak_bytes        INTEGER,
+  memory_max_bytes         INTEGER,
+  memory_oom_events        INTEGER,
+  memory_oom_kill_events   INTEGER,
+  memory_telemetry_at      TEXT,
   updated_at               TEXT NOT NULL
 );
 ```
 
-- **Writer (container):** `setContainerToolInFlight()` / `clearContainerToolInFlight()` in `container/agent-runner/src/db/connection.ts`, called from Claude's tool hooks and Codex's native item lifecycle.
+- **Writer (container):** operation/provider state helpers in `container/agent-runner/src/db/connection.ts` plus `resource-telemetry.ts` for cgroup samples.
 - **Reader (host):** `getContainerState()` in `src/db/session-db.ts`; consumed by the sweep's `activeOperationTimeoutMs()` helper in `src/host-sweep.ts`.
-- **Restart cleanup:** container startup clears the prior instance's operation row along with stale `processing_ack` claims.
+- **Restart cleanup:** container startup clears prior operation/provider state and immediately overwrites resource fields with the new cgroup's counters.
 - `CREATE TABLE IF NOT EXISTS` — forward-compatible with `outbound.db` files created before this table existed; `getContainerState()` returns `null` if the table or row is absent.
 
 ---

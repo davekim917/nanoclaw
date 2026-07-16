@@ -24,7 +24,11 @@ vi.mock('../../container-runner.js', () => ({
 
 vi.mock('../../config.js', async () => {
   const actual = await vi.importActual('../../config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-cli-groups' };
+  return {
+    ...actual,
+    DATA_DIR: '/tmp/nanoclaw-test-cli-groups',
+    GROUPS_DIR: '/tmp/nanoclaw-test-cli-groups/groups',
+  };
 });
 
 const TEST_DIR = '/tmp/nanoclaw-test-cli-groups';
@@ -32,6 +36,7 @@ const TEST_DIR = '/tmp/nanoclaw-test-cli-groups';
 import { initTestDb, closeDb, runMigrations, createAgentGroup, getDb } from '../../db/index.js';
 import { createSession } from '../../db/sessions.js';
 import { dispatch } from '../dispatch.js';
+import { readContainerConfig } from '../../container-config.js';
 // Side-effect import: registers the `groups-*` commands (including delete).
 import './groups.js';
 
@@ -268,5 +273,68 @@ describe('groups CLI delete cascades dependent rows (#2525)', () => {
     expect(data.removed.workgroups).toBe(1);
     expect(count('SELECT COUNT(*) AS c FROM agent_groups WHERE id = ?', SOLO)).toBe(0);
     expect(count('SELECT COUNT(*) AS c FROM workgroups WHERE id = ?', WG)).toBe(0);
+  });
+});
+
+describe('groups CLI resource config', () => {
+  beforeEach(() => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+    const db = initTestDb();
+    runMigrations(db);
+  });
+
+  afterEach(() => {
+    closeDb();
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+  });
+
+  it('test_groups_config_update_persists_file_canonical_resources', async () => {
+    const id = 'ag-resource-test';
+    const folder = 'resource-test';
+    createAgentGroup({ id, name: folder, folder, agent_provider: null, created_at: now() });
+    getDb()
+      .prepare(
+        `INSERT INTO container_configs
+           (agent_group_id, provider, model, effort, image_tag, assistant_name, max_messages_per_prompt,
+            skills, mcp_servers, packages_apt, packages_npm, additional_mounts, cli_scope, updated_at)
+         VALUES (?, NULL, NULL, NULL, NULL, NULL, NULL, '"all"', '{}', '[]', '[]', '[]', 'group', ?)`,
+      )
+      .run(id, now());
+    const groupDir = `${TEST_DIR}/groups/${folder}`;
+    fs.mkdirSync(groupDir, { recursive: true });
+    fs.writeFileSync(
+      `${groupDir}/container.json`,
+      JSON.stringify({ mcpServers: {}, packages: { apt: [], npm: [] }, additionalMounts: [], skills: 'all' }, null, 2) +
+        '\n',
+    );
+
+    const response = await dispatch(
+      {
+        id: 'req-resource-update',
+        command: 'groups-config-update',
+        args: {
+          id,
+          memory_request_mb: 5120,
+          memory_limit_mb: 5120,
+          memory_swap_limit_mb: 5120,
+          cpus: 2,
+          pids_limit: 768,
+        },
+      },
+      { caller: 'host' },
+    );
+
+    expect(response.ok).toBe(true);
+    expect(readContainerConfig(folder).resources).toEqual({
+      memory: { requestMb: 5120, limitMb: 5120, memorySwapLimitMb: 5120 },
+      cpus: 2,
+      pidsLimit: 768,
+    });
+    expect((response as { ok: true; data: Record<string, unknown> }).data.effective_resources).toEqual({
+      memory: { requestMb: 5120, limitMb: 5120, memorySwapLimitMb: 5120 },
+      cpus: 2,
+      pidsLimit: 768,
+    });
   });
 });

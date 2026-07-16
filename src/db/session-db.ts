@@ -330,6 +330,12 @@ export interface ContainerState {
   provider_probe_failures?: number | null;
   provider_recovery_attempts?: number | null;
   provider_failure_reason?: string | null;
+  memory_current_bytes?: number | null;
+  memory_peak_bytes?: number | null;
+  memory_max_bytes?: number | null;
+  memory_oom_events?: number | null;
+  memory_oom_kill_events?: number | null;
+  memory_telemetry_at?: string | null;
 }
 
 /**
@@ -344,24 +350,38 @@ export function getContainerState(outDb: Database.Database): ContainerState | nu
       .prepare(
         `SELECT current_tool, tool_declared_timeout_ms, tool_started_at,
                 provider_status, provider_last_event_at, provider_last_probe_at,
-                provider_probe_failures, provider_recovery_attempts, provider_failure_reason
+                provider_probe_failures, provider_recovery_attempts, provider_failure_reason,
+                memory_current_bytes, memory_peak_bytes, memory_max_bytes,
+                memory_oom_events, memory_oom_kill_events, memory_telemetry_at
            FROM container_state WHERE id = 1`,
       )
       .get() as ContainerState | undefined;
     return row ?? null;
   } catch {
-    // Older DBs may have container_state without provider-health columns.
-    // Preserve the legacy tool timeout instead of discarding the whole row.
+    // Older DBs may have provider-health but not resource telemetry columns.
     try {
       const row = outDb
         .prepare(
-          `SELECT current_tool, tool_declared_timeout_ms, tool_started_at
+          `SELECT current_tool, tool_declared_timeout_ms, tool_started_at,
+                  provider_status, provider_last_event_at, provider_last_probe_at,
+                  provider_probe_failures, provider_recovery_attempts, provider_failure_reason
              FROM container_state WHERE id = 1`,
         )
         .get() as ContainerState | undefined;
       return row ?? null;
     } catch {
-      return null;
+      // Preserve the legacy tool timeout instead of discarding the whole row.
+      try {
+        const row = outDb
+          .prepare(
+            `SELECT current_tool, tool_declared_timeout_ms, tool_started_at
+               FROM container_state WHERE id = 1`,
+          )
+          .get() as ContainerState | undefined;
+        return row ?? null;
+      } catch {
+        return null;
+      }
     }
   }
 }

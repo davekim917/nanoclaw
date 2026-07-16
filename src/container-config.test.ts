@@ -223,6 +223,42 @@ describe('readContainerConfig — memory block', () => {
   });
 });
 
+describe('readContainerConfig — resource block', () => {
+  it('test_container_resources_round_trip', () => {
+    writeGroupConfig('test-resources', {
+      mcpServers: {},
+      packages: { apt: [], npm: [] },
+      additionalMounts: [],
+      skills: 'all',
+      resources: {
+        memory: { requestMb: 5120, limitMb: 5120, memorySwapLimitMb: 5120 },
+        cpus: 2,
+        pidsLimit: 768,
+      },
+    });
+
+    expect(readContainerConfig('test-resources').resources).toEqual({
+      memory: { requestMb: 5120, limitMb: 5120, memorySwapLimitMb: 5120 },
+      cpus: 2,
+      pidsLimit: 768,
+    });
+  });
+
+  it('test_container_resources_invalid_file_fails_closed', () => {
+    writeGroupConfig('test-invalid-resources', {
+      mcpServers: {},
+      packages: { apt: [], npm: [] },
+      additionalMounts: [],
+      skills: 'all',
+      resources: {
+        memory: { requestMb: 5120, limitMb: 3072, memorySwapLimitMb: 5120 },
+      },
+    });
+
+    expect(() => readContainerConfig('test-invalid-resources')).toThrow(/requestMb.*limitMb/);
+  });
+});
+
 describe('MCP server transport validation', () => {
   it('preserves stdio and Streamable HTTP MCP server configs', () => {
     writeGroupConfig('test-mcp-transports', {

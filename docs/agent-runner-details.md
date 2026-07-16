@@ -52,8 +52,8 @@ interface ProviderOptions {
   mcpServers?: Record<string, McpServerConfig>;
   env?: Record<string, string | undefined>;
   additionalDirectories?: string[];
-  model?: string;   // alias (sonnet/opus/haiku) or full model ID
-  effort?: string;  // low | medium | high | xhigh | max
+  model?: string; // alias (sonnet/opus/haiku) or full model ID
+  effort?: string; // low | medium | high | xhigh | max
 }
 
 interface QueryInput {
@@ -135,7 +135,7 @@ class ClaudeProvider implements AgentProvider {
   //    .model, .effort, .assistantName...
 
   query(input: QueryInput): AgentQuery {
-    const stream = new MessageStream();  // AsyncIterable<SDKUserMessage>
+    const stream = new MessageStream(); // AsyncIterable<SDKUserMessage>
     stream.push(input.prompt);
 
     const sdkResult = sdkQuery({
@@ -175,7 +175,10 @@ class ClaudeProvider implements AgentProvider {
       end: () => stream.end(),
       // Abort doesn't call into the SDK — it flips a flag the event generator
       // checks and ends the input stream so the query drains and stops.
-      abort: () => { aborted = true; stream.end(); },
+      abort: () => {
+        aborted = true;
+        stream.end();
+      },
       events: translateEvents(sdkResult, () => aborted),
     };
   }
@@ -184,6 +187,7 @@ class ClaudeProvider implements AgentProvider {
 
 `translateEvents` is an async generator that yields `{ type: 'activity' }` for **every**
 SDK message (so the idle timer stays honest) and maps recognized messages to `ProviderEvent`:
+
 - `system`/`init` → `{ type: 'init', continuation: session_id }`
 - `result` → `{ type: 'result', text, isError }` — `text` is `result.result`, or the joined `result.errors[]` on error subtypes (billing/quota), so the notice still reaches the user
 - `system`/`api_retry` → `{ type: 'error', retryable: true }`
@@ -193,11 +197,13 @@ SDK message (so the idle timer stays honest) and maps recognized messages to `Pr
 - when the `aborted` flag is set → the generator returns immediately
 
 **Claude-specific behavior inside the provider:**
+
 - `MessageStream` for async iterable input (push-based follow-ups)
 - Resume via the SDK `resume` option keyed on the stored `continuation` (the SDK session ID) — no separate resume-at cursor
 - `TOOL_ALLOWLIST` (Bash, Read, Write, Edit, Glob, Grep, WebSearch, WebFetch, Task, Skill, …) extended at the call site with a `mcp__<server>__*` pattern per registered MCP server; `SDK_DISALLOWED_TOOLS` blocks SDK builtins that collide with NanoClaw's own scheduling/interaction model (CronCreate/Delete/List, ScheduleWakeup, AskUserQuestion, Enter/ExitPlanMode, Enter/ExitWorktree)
 - **PreToolUse hook** records the current tool + its declared timeout to `container_state` (so the host sweep widens its stuck tolerance while a long Bash runs) and, as defense-in-depth, blocks any `SDK_DISALLOWED_TOOLS` call that slips through. It does **not** sanitize bash env vars — there is no such hook.
 - **PostToolUse / PostToolUseFailure** hooks clear the in-flight tool
+- **Resource telemetry** samples cgroup v2 `memory.current`, `memory.peak`, `memory.max`, and `memory.events` every 15 seconds into `container_state`; the host sweep logs increases in `oom_kill`
 - **PreCompact** hook archives the transcript to `conversations/` before compaction
 - `maybeRotateContinuation` drops an oversized/aged transcript (default caps 12 MB / 14 days, both operator-overridable) so a cold container isn't killed reloading days of `.jsonl` before the host idle ceiling; `isSessionInvalid` clears a continuation whose transcript is gone
 - `additionalDirectories` for multi-directory access
@@ -229,7 +235,9 @@ class CodexProvider implements AgentProvider {
         pendingFollowUp = msg;
         abortController.abort();
       },
-      end: () => { /* no-op — Codex turns end naturally */ },
+      end: () => {
+        /* no-op — Codex turns end naturally */
+      },
       abort: () => abortController.abort(),
       events: this.run(thread, input.prompt, abortController, () => pendingFollowUp),
     };
@@ -287,6 +295,7 @@ class CodexProvider implements AgentProvider {
 ```
 
 **Codex-specific behavior inside the provider:**
+
 - `developer_instructions` for system prompt (loaded from CLAUDE.md)
 - `git init` in workspace (Codex requires a git repo)
 - Abort+restart pattern for follow-up messages
@@ -310,10 +319,15 @@ class OpenCodeProvider implements AgentProvider {
     return {
       push: (msg) => {
         pendingFollowUp = msg;
-        server.close();  // interrupt current query
+        server.close(); // interrupt current query
       },
-      end: () => { /* no-op */ },
-      abort: () => { aborted = true; server.close(); },
+      end: () => {
+        /* no-op */
+      },
+      abort: () => {
+        aborted = true;
+        server.close();
+      },
       events: this.run(client, server, stream, input, () => pendingFollowUp),
     };
   }
@@ -355,6 +369,7 @@ class OpenCodeProvider implements AgentProvider {
 ```
 
 **OpenCode-specific behavior inside the provider:**
+
 - Local gRPC/HTTP server lifecycle (`server.close()`)
 - SSE event stream for output
 - Provider/model selection via config (`OPENCODE_PROVIDER`, `OPENCODE_MODEL`)
@@ -401,6 +416,7 @@ Everything below is handled by the agent-runner, not the provider.
 **Idle behavior:** When no messages are pending and no query is active, the agent-runner sleeps briefly (1s) and re-polls. The container stays warm until the host kills it (idle timeout).
 
 **Idle detection exceptions:** The container should NOT be considered idle when:
+
 - An `ask_user_question` tool call is pending (waiting for user response in messages_in)
 - The agent is actively working (tool calls in progress, subagents running)
 
@@ -419,9 +435,11 @@ the destination map), so the agent always knows where a message came from — ro
 themselves are never shown.
 
 - **`chat`** — one `<message>` per row:
+
   ```xml
   <message id="5" from="family" sender="John" time="Jan 1, 10:00 AM">Check this PR</message>
   ```
+
   A reply carries a `reply_to` attribute and an inline `<quoted_message from="…">…</quoted_message>`.
 
 - **`chat-sdk`** — same `<message>` shape, fields extracted from the serialized Chat SDK
@@ -430,6 +448,7 @@ themselves are never shown.
   natively are also passed as content blocks (see Media Handling below).
 
 - **`task`** — a `<task>` element, script output first when present:
+
   ```xml
   <task from="scheduler" time="Jan 1, 9:00 AM">Script output:
   {"data": …}
@@ -439,6 +458,7 @@ themselves are never shown.
   ```
 
 - **`webhook`** — a `<webhook>` element wrapping the JSON payload:
+
   ```xml
   <webhook from="github" source="github" event="pull_request">{"action": "opened", …}</webhook>
   ```
@@ -476,7 +496,7 @@ interface RoutingContext {
   platformId: string | null;
   channelType: string | null;
   threadId: string | null;
-  inReplyTo: string | null;  // messages_in.id of the triggering message
+  inReplyTo: string | null; // messages_in.id of the triggering message
 }
 ```
 
@@ -553,6 +573,7 @@ Send a file to a named destination (same destination model as `send_message`).
 ```
 
 Implementation:
+
 1. Resolve routing via `resolveRouting(to)` (as `send_message`)
 2. Generate a message ID and create `/workspace/outbox/{messageId}/`
 3. Copy the file into that outbox directory
@@ -591,6 +612,7 @@ Send an interactive question and wait for the user's response. This is a **block
 ```
 
 Implementation:
+
 1. Generate a `questionId` and normalize each option to `{ label, selectedLabel, value }`
 2. Write a `messages_out` row with `kind: 'chat-sdk'` and content `{ type: 'ask_question', questionId, title, question, options }`
 3. Poll `inbound.db` (read-only) for a pending `messages_in` row whose content carries the matching `questionId` (`findQuestionResponse`), skipping any already in `processing_ack`
@@ -697,12 +719,12 @@ The agent-runner inspects attachments in chat/chat-sdk messages and handles them
 
 **Provider-native content blocks:**
 
-| Type | Claude | Codex / OpenCode |
-|------|--------|------------------|
-| Images (JPEG, PNG, GIF, WebP) | Native image content block | Save to disk |
-| PDFs | Native document content block | Save to disk |
-| Audio | Native audio content block | Save to disk |
-| Other files (code, data, video, archives) | Save to disk | Save to disk |
+| Type                                      | Claude                        | Codex / OpenCode |
+| ----------------------------------------- | ----------------------------- | ---------------- |
+| Images (JPEG, PNG, GIF, WebP)             | Native image content block    | Save to disk     |
+| PDFs                                      | Native document content block | Save to disk     |
+| Audio                                     | Native audio content block    | Save to disk     |
+| Other files (code, data, video, archives) | Save to disk                  | Save to disk     |
 
 **"Save to disk"** means: download to `/workspace/downloads/{messageId}/`, reference in the prompt text:
 

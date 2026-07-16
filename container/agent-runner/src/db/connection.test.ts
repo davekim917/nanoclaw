@@ -93,4 +93,30 @@ describe('outbound DB initialization', () => {
       'PRAGMA foreign_keys = ON',
     ]);
   });
+
+  it('test_container_state_forward_compat_adds_resource_telemetry_columns', () => {
+    const db = new Database(':memory:');
+    db.exec(`
+      CREATE TABLE container_state (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        current_tool TEXT,
+        tool_declared_timeout_ms INTEGER,
+        tool_started_at TEXT,
+        updated_at TEXT NOT NULL
+      )
+    `);
+
+    configureOutboundDb(db);
+
+    const columns = new Set(
+      (db.prepare("PRAGMA table_info('container_state')").all() as Array<{ name: string }>).map((row) => row.name),
+    );
+    expect(columns.has('memory_current_bytes')).toBe(true);
+    expect(columns.has('memory_peak_bytes')).toBe(true);
+    expect(columns.has('memory_max_bytes')).toBe(true);
+    expect(columns.has('memory_oom_events')).toBe(true);
+    expect(columns.has('memory_oom_kill_events')).toBe(true);
+    expect(columns.has('memory_telemetry_at')).toBe(true);
+    db.close();
+  });
 });

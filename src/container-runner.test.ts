@@ -8,6 +8,7 @@ import type Database from 'better-sqlite3';
 import {
   DATAFOLD_MCP_SERVER,
   dockerResourceLimitArgs,
+  resolveMemoryAdmissionBudgetMb,
   serializeMcpServersEnv,
   resolveAnthropicAuth,
   resolveCodexAuthFallbacks,
@@ -48,12 +49,43 @@ describe('dockerResourceLimitArgs', () => {
       '--memory',
       '3g',
       '--memory-reservation',
-      '2g',
+      '3g',
       '--memory-swap',
       '3g',
       '--pids-limit',
       '512',
     ]);
+  });
+
+  it('test_docker_resource_args_apply_group_override_once', () => {
+    const args = dockerResourceLimitArgs({
+      memory: { requestMb: 5120, limitMb: 5120, memorySwapLimitMb: 5120 },
+      cpus: 2,
+      pidsLimit: 768,
+    });
+
+    expect(args).toEqual([
+      '--memory',
+      '5g',
+      '--memory-reservation',
+      '5g',
+      '--memory-swap',
+      '5g',
+      '--cpus',
+      '2',
+      '--pids-limit',
+      '768',
+    ]);
+  });
+});
+
+describe('memory admission budget', () => {
+  it('test_memory_budget_defaults_to_80_percent_of_docker_visible_ram', () => {
+    expect(resolveMemoryAdmissionBudgetMb(24 * 1024, '')).toBe(19_660);
+  });
+
+  it('test_memory_budget_accepts_explicit_docker_size_override', () => {
+    expect(resolveMemoryAdmissionBudgetMb(24 * 1024, '18g')).toBe(18_432);
   });
 });
 

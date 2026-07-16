@@ -15,6 +15,11 @@ const envConfig = readEnvFile([
   'NANOCLAW_WORKGROUP_SHARED_FS',
   'CONTAINER_CPU_LIMIT',
   'CONTAINER_MEMORY_LIMIT',
+  'CONTAINER_MEMORY_RESERVATION',
+  'CONTAINER_MEMORY_SWAP_LIMIT',
+  'CONTAINER_MEMORY_BUDGET',
+  'CONTAINER_PIDS_LIMIT',
+  'MAX_CONCURRENT_CONTAINERS',
   'NANOCLAW_EGRESS_LOCKDOWN',
   'NANOCLAW_EGRESS_NETWORK',
   'ONECLI_GATEWAY_CONTAINER',
@@ -82,17 +87,26 @@ export const INSTALL_SLUG = getInstallSlug(PROJECT_ROOT);
 export const CONTAINER_INSTALL_LABEL = `nanoclaw-install=${INSTALL_SLUG}`;
 export const CONTAINER_TIMEOUT = parseInt(process.env.CONTAINER_TIMEOUT || '1800000', 10);
 export const CONTAINER_MAX_OUTPUT_SIZE = parseInt(process.env.CONTAINER_MAX_OUTPUT_SIZE || '10485760', 10); // 10MB default
-export const CONTAINER_MEMORY_LIMIT = process.env.CONTAINER_MEMORY_LIMIT || '3g';
-export const CONTAINER_MEMORY_RESERVATION = process.env.CONTAINER_MEMORY_RESERVATION || '2g';
-export const CONTAINER_MEMORY_SWAP_LIMIT = process.env.CONTAINER_MEMORY_SWAP_LIMIT || CONTAINER_MEMORY_LIMIT;
-export const CONTAINER_PIDS_LIMIT = Math.max(64, parseInt(process.env.CONTAINER_PIDS_LIMIT || '512', 10) || 512);
+export const CONTAINER_MEMORY_LIMIT = process.env.CONTAINER_MEMORY_LIMIT || envConfig.CONTAINER_MEMORY_LIMIT || '3g';
+export const CONTAINER_MEMORY_RESERVATION =
+  process.env.CONTAINER_MEMORY_RESERVATION || envConfig.CONTAINER_MEMORY_RESERVATION || CONTAINER_MEMORY_LIMIT;
+export const CONTAINER_MEMORY_SWAP_LIMIT =
+  process.env.CONTAINER_MEMORY_SWAP_LIMIT || envConfig.CONTAINER_MEMORY_SWAP_LIMIT || CONTAINER_MEMORY_LIMIT;
+export const CONTAINER_MEMORY_BUDGET = process.env.CONTAINER_MEMORY_BUDGET || envConfig.CONTAINER_MEMORY_BUDGET || '';
+export const CONTAINER_PIDS_LIMIT = Math.max(
+  1,
+  parseInt(process.env.CONTAINER_PIDS_LIMIT || envConfig.CONTAINER_PIDS_LIMIT || '512', 10) || 512,
+);
 export const ONECLI_URL = process.env.ONECLI_URL || envConfig.ONECLI_URL;
 export const ONECLI_API_KEY = process.env.ONECLI_API_KEY || envConfig.ONECLI_API_KEY;
 export const MAX_MESSAGES_PER_PROMPT = Math.max(1, parseInt(process.env.MAX_MESSAGES_PER_PROMPT || '10', 10) || 10);
 export const IDLE_TIMEOUT = parseInt(process.env.IDLE_TIMEOUT || '1800000', 10); // 30min default — how long to keep container alive after last result
 // Host-level admission cap. 0 disables the cap entirely; Docker memory/PID
 // limits still bound each individual agent container.
-const parsedMaxConcurrentContainers = parseInt(process.env.MAX_CONCURRENT_CONTAINERS || '24', 10);
+const parsedMaxConcurrentContainers = parseInt(
+  process.env.MAX_CONCURRENT_CONTAINERS || envConfig.MAX_CONCURRENT_CONTAINERS || '24',
+  10,
+);
 export const MAX_CONCURRENT_CONTAINERS =
   Number.isFinite(parsedMaxConcurrentContainers) && parsedMaxConcurrentContainers >= 0
     ? parsedMaxConcurrentContainers

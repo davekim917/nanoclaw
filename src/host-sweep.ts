@@ -32,6 +32,8 @@ import fs from 'fs';
 import path from 'path';
 
 import { ensureEgressNetwork } from './egress-lockdown.js';
+import { readContainerConfig } from './container-config.js';
+import { resolveContainerResources } from './container-resources.js';
 import { getActiveSessions, getSession, isTaskThread, updateSession } from './db/sessions.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import {
@@ -87,6 +89,9 @@ import {
 import { getCapabilityConfig } from './modules/orchestrator-dispatch/db/agent-group-capabilities.js';
 import { runReconcilerSweep } from './modules/orchestrator-dispatch/reconciler.js';
 import { decideTaskAction, pendingTerminalSpawnOutboundSeenAt } from './modules/orchestrator-dispatch/watchdog.js';
+import { OomKillObserver } from './resource-oom-observer.js';
+
+const oomKillObserver = new OomKillObserver();
 
 /**
  * SQLite TIMESTAMP columns store UTC without a timezone marker. Date.parse
@@ -631,7 +636,7 @@ async function sweepSession(session: Session): Promise<void> {
     // yet. Without this grace period, stale claims cause an immediate
     // spawn-kill loop.
     if (alive && outDb && !justWoke) {
-      enforceRunningContainerSla(inDb, outDb, session, agentGroup.id);
+      enforceRunningContainerSla(inDb, outDb, session, agentGroup.id, agentGroup.folder);
     }
 
     // 4. Crashed-container cleanup: processing rows left behind get retried.
@@ -885,8 +890,10 @@ function enforceRunningContainerSla(
   outDb: Database.Database,
   session: Session,
   agentGroupId: string,
+  agentGroupFolder: string,
 ): void {
   const containerState = getContainerState(outDb);
+  reportContainerOomTelemetry(session, agentGroupFolder, containerState);
   const decision = decideStuckAction({
     now: Date.now(),
     heartbeatMtimeMs: heartbeatMtimeMs(agentGroupId, session.id),
@@ -926,6 +933,35 @@ function enforceRunningContainerSla(
   });
   killContainer(session.id, 'claim-stuck');
   resetStuckProcessingRows(inDb, outDb, session, 'claim-stuck');
+}
+
+function reportContainerOomTelemetry(session: Session, agentGroupFolder: string, state: ContainerState | null): void {
+  const count = state?.memory_oom_kill_events;
+  if (typeof count !== 'number') return;
+  const spawnedAtMs = getContainerSpawnedAt(session.id);
+  const delta = oomKillObserver.observe(session.id, spawnedAtMs, count);
+  if (delta <= 0) return;
+
+  let configuredLimitMb: number | null = null;
+  try {
+    configuredLimitMb = resolveContainerResources(readContainerConfig(agentGroupFolder).resources).memory.limitMb;
+  } catch {
+    // Resource validation already fails closed in the spawn path. Keep OOM
+    // diagnostics available even if an operator edits the file mid-run.
+  }
+  log.warn('Container cgroup OOM kill observed', {
+    sessionId: session.id,
+    agentGroup: agentGroupFolder,
+    newOomKills: delta,
+    oomKillCount: count,
+    oomEventCount: state?.memory_oom_events ?? null,
+    configuredLimitMb,
+    cgroupMaxMb: typeof state?.memory_max_bytes === 'number' ? Math.round(state.memory_max_bytes / 1024 / 1024) : null,
+    peakMb: typeof state?.memory_peak_bytes === 'number' ? Math.round(state.memory_peak_bytes / 1024 / 1024) : null,
+    currentMb:
+      typeof state?.memory_current_bytes === 'number' ? Math.round(state.memory_current_bytes / 1024 / 1024) : null,
+    telemetryAt: state?.memory_telemetry_at ?? null,
+  });
 }
 
 export function _resetStuckProcessingRowsForTesting(

@@ -297,6 +297,12 @@ CREATE TABLE IF NOT EXISTS container_state (
   provider_probe_failures  INTEGER,
   provider_recovery_attempts INTEGER,
   provider_failure_reason  TEXT,
+  memory_current_bytes     INTEGER,
+  memory_peak_bytes        INTEGER,
+  memory_max_bytes         INTEGER,
+  memory_oom_events        INTEGER,
+  memory_oom_kill_events   INTEGER,
+  memory_telemetry_at      TEXT,
   updated_at               TEXT NOT NULL
 );
 `;

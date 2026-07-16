@@ -20,6 +20,7 @@ import fs from 'fs';
 import path from 'path';
 
 import { GROUPS_DIR } from './config.js';
+import { validateContainerResources, type ContainerResources } from './container-resources.js';
 import type { AgentGroup, ContainerConfigRow } from './types.js';
 
 /**
@@ -115,6 +116,8 @@ export interface ContainerConfig {
   assistantName?: string;
   agentGroupId?: string;
   maxMessagesPerPrompt?: number;
+  /** Per-session container resource request and hard ceilings. */
+  resources?: ContainerResources;
 
   /**
    * Provider-level model / reasoning effort tracked in the container_configs
@@ -460,6 +463,8 @@ export function readContainerConfig(folder: string): ContainerConfig {
     return emptyConfig();
   }
 
+  validateContainerResources(raw.resources);
+
   return {
     mcpServers: validateMcpServers(raw.mcpServers ?? {}),
     packages: {
@@ -474,6 +479,7 @@ export function readContainerConfig(folder: string): ContainerConfig {
     assistantName: raw.assistantName,
     agentGroupId: raw.agentGroupId,
     maxMessagesPerPrompt: raw.maxMessagesPerPrompt,
+    resources: raw.resources,
     model: raw.model,
     effort: raw.effort,
     githubTokenEnv: raw.githubTokenEnv,
@@ -505,6 +511,7 @@ export function readContainerConfig(folder: string): ContainerConfig {
  */
 export function writeContainerConfig(folder: string, config: ContainerConfig): void {
   validateMcpServers(config.mcpServers ?? {});
+  validateContainerResources(config.resources);
   const p = configPath(folder);
   const dir = path.dirname(p);
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });

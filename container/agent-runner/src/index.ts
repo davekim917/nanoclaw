@@ -37,6 +37,7 @@ import { runPollLoop } from './poll-loop.js';
 import { setupCodexRuntime, syncAgentSkillsMirror } from './codex-companion-setup.js';
 import { activateGcpServiceAccount } from './gcp-auth-setup.js';
 import { configureGitNexusRuntime } from './gitnexus-runtime.js';
+import { startResourceTelemetry } from './resource-telemetry.js';
 
 function log(msg: string): void {
   console.error(`[agent-runner] ${msg}`);
@@ -187,9 +188,7 @@ async function main(): Promise<void> {
   // text (since there's no codex-plugin loader on opencode), while codex
   // runtime continues to deny them (loaded via .codex-plugin/ instead).
   const skillRuntime: 'codex' | 'opencode' | 'claude' =
-    providerName === 'codex' ? 'codex' :
-    providerName === 'opencode' ? 'opencode' :
-    'claude';
+    providerName === 'codex' ? 'codex' : providerName === 'opencode' ? 'opencode' : 'claude';
   syncAgentSkillsMirror(skillRuntime);
 
   // Container-local CODEX_HOME for codex-as-peer mode (invoked by Claude
@@ -221,12 +220,17 @@ async function main(): Promise<void> {
   // and keeps its native memory untouched.
   if (provider.usesMemoryScaffold) ensureMemoryScaffold();
 
-  await runPollLoop({
-    provider,
-    providerName,
-    cwd: CWD,
-    systemContext: { instructions },
-  });
+  const stopResourceTelemetry = startResourceTelemetry(log);
+  try {
+    await runPollLoop({
+      provider,
+      providerName,
+      cwd: CWD,
+      systemContext: { instructions },
+    });
+  } finally {
+    stopResourceTelemetry();
+  }
 }
 
 main().catch((err) => {

@@ -3,7 +3,8 @@ import fs from 'fs';
 import path from 'path';
 
 import { GROUPS_DIR } from '../../config.js';
-import { type McpServerConfig, updateContainerConfig } from '../../container-config.js';
+import { readContainerConfig, type McpServerConfig, updateContainerConfig } from '../../container-config.js';
+import { resolveContainerResources, type ContainerResources } from '../../container-resources.js';
 import { buildAgentGroupImage, killContainer, wakeContainer } from '../../container-runner.js';
 import { restartAgentGroupContainers } from '../../container-restart.js';
 import { createAgentGroup, getAgentGroup, getAgentGroupByFolder } from '../../db/agent-groups.js';
@@ -24,7 +25,8 @@ import type { AgentGroup, ContainerConfigRow } from '../../types.js';
 import { registerResource } from '../crud.js';
 
 /** Deserialize JSON columns for display. */
-function presentConfig(row: ContainerConfigRow): Record<string, unknown> {
+function presentConfig(row: ContainerConfigRow, folder?: string): Record<string, unknown> {
+  const fileConfig = folder ? readContainerConfig(folder) : undefined;
   return {
     agent_group_id: row.agent_group_id,
     provider: row.provider,
@@ -39,8 +41,29 @@ function presentConfig(row: ContainerConfigRow): Record<string, unknown> {
     packages_npm: JSON.parse(row.packages_npm),
     additional_mounts: JSON.parse(row.additional_mounts),
     cli_scope: row.cli_scope,
+    resources: fileConfig?.resources ?? null,
+    effective_resources: fileConfig ? resolveContainerResources(fileConfig.resources) : null,
     updated_at: row.updated_at,
   };
+}
+
+function optionalNumberArg(args: Record<string, unknown>, ...names: string[]): number | undefined {
+  for (const name of names) {
+    const raw = args[name];
+    if (raw === undefined) continue;
+    const value = Number(raw);
+    if (!Number.isFinite(value) || value <= 0) throw new Error(`--${names[0]} must be a positive number`);
+    return value;
+  }
+  return undefined;
+}
+
+function optionalIntegerArg(args: Record<string, unknown>, ...names: string[]): number | undefined {
+  const value = optionalNumberArg(args, ...names);
+  if (value !== undefined && !Number.isInteger(value)) {
+    throw new Error(`--${names[0]} must be a positive integer`);
+  }
+  return value;
 }
 
 registerResource({
@@ -293,19 +316,24 @@ registerResource({
         if (!id) throw new Error('--id is required');
         const row = getContainerConfig(id);
         if (!row) throw new Error(`No container config for group: ${id}`);
-        return presentConfig(row);
+        const group = getAgentGroup(id);
+        if (!group) throw new Error(`No agent group: ${id}`);
+        return presentConfig(row, group.folder);
       },
     },
     'config update': {
       access: 'approval',
       description:
-        'Update container config scalar fields. Changes are saved but do NOT take effect until you run `ncl groups restart`. ' +
-        'Use --id <group-id> and any of: --provider, --model, --effort, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope.',
+        'Update container config fields. Changes are saved but do NOT take effect until you run `ncl groups restart`. ' +
+        'Use --id <group-id> and scalar flags, or resource flags: --memory-request-mb, --memory-limit-mb, ' +
+        '--memory-swap-limit-mb, --cpus, --pids-limit.',
       handler: async (args) => {
         const id = args.id as string;
         if (!id) throw new Error('--id is required');
         const row = getContainerConfig(id);
         if (!row) throw new Error(`No container config for group: ${id}`);
+        const group = getAgentGroup(id);
+        if (!group) throw new Error(`No agent group: ${id}`);
 
         const updates: Partial<
           Pick<
@@ -328,9 +356,21 @@ registerResource({
           updates.cli_scope = scope;
         }
 
-        if (Object.keys(updates).length === 0) {
+        const memoryRequestMb = optionalIntegerArg(args, 'memory-request-mb', 'memory_request_mb');
+        const memoryLimitMb = optionalIntegerArg(args, 'memory-limit-mb', 'memory_limit_mb');
+        const memorySwapLimitMb = optionalIntegerArg(args, 'memory-swap-limit-mb', 'memory_swap_limit_mb');
+        const cpus = optionalNumberArg(args, 'cpus');
+        const pidsLimit = optionalIntegerArg(args, 'pids-limit', 'pids_limit');
+        const hasResourceUpdate =
+          memoryRequestMb !== undefined ||
+          memoryLimitMb !== undefined ||
+          memorySwapLimitMb !== undefined ||
+          cpus !== undefined ||
+          pidsLimit !== undefined;
+
+        if (Object.keys(updates).length === 0 && !hasResourceUpdate) {
           throw new Error(
-            'Nothing to update — provide at least one of: --provider, --model, --effort, --image-tag, --assistant-name, --max-messages-per-prompt, --cli-scope',
+            'Nothing to update — provide a scalar config flag or one of: --memory-request-mb, --memory-limit-mb, --memory-swap-limit-mb, --cpus, --pids-limit',
           );
         }
 
@@ -354,10 +394,26 @@ registerResource({
           }
         }
 
-        updateContainerConfigScalars(id, updates);
+        if (Object.keys(updates).length > 0) updateContainerConfigScalars(id, updates);
+
+        if (hasResourceUpdate) {
+          updateContainerConfig(group.folder, (config) => {
+            const resources: ContainerResources = {
+              ...(config.resources ?? {}),
+              memory: { ...(config.resources?.memory ?? {}) },
+            };
+            if (memoryRequestMb !== undefined) resources.memory!.requestMb = memoryRequestMb;
+            if (memoryLimitMb !== undefined) resources.memory!.limitMb = memoryLimitMb;
+            if (memorySwapLimitMb !== undefined) resources.memory!.memorySwapLimitMb = memorySwapLimitMb;
+            if (cpus !== undefined) resources.cpus = cpus;
+            if (pidsLimit !== undefined) resources.pidsLimit = pidsLimit;
+            resolveContainerResources(resources);
+            config.resources = resources;
+          });
+        }
 
         const updated = getContainerConfig(id)!;
-        return presentConfig(updated);
+        return presentConfig(updated, group.folder);
       },
     },
     'config add-mcp-server': {

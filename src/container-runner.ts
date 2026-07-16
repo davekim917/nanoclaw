@@ -3,7 +3,7 @@
  * Spawns agent containers with session folder + agent group folder mounts.
  * The container runs the v2 agent-runner which polls the session DB.
  */
-import { ChildProcess, exec, spawn } from 'child_process';
+import { ChildProcess, exec, execFileSync, spawn } from 'child_process';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -13,14 +13,10 @@ import { OneCLI } from '@onecli-sh/sdk';
 
 import { getHostCapabilities } from './capabilities.js';
 import {
-  CONTAINER_CPU_LIMIT,
   CONTAINER_IMAGE,
   CONTAINER_IMAGE_BASE,
   CONTAINER_INSTALL_LABEL,
-  CONTAINER_MEMORY_LIMIT,
-  CONTAINER_MEMORY_RESERVATION,
-  CONTAINER_MEMORY_SWAP_LIMIT,
-  CONTAINER_PIDS_LIMIT,
+  CONTAINER_MEMORY_BUDGET,
   DATA_DIR,
   GROUPS_DIR,
   MAX_CONCURRENT_CONTAINERS,
@@ -38,8 +34,14 @@ import {
   type McpServerConfig,
   type RecallScope,
 } from './container-config.js';
+import {
+  formatMemoryMb,
+  parseMemoryMb,
+  resolveContainerResources,
+  type ContainerResources,
+} from './container-resources.js';
 import { getContainerConfig, resolveProviderName } from './db/container-configs.js';
-import { updateContainerConfigScalars, updateContainerConfigJson } from './db/container-configs.js';
+import { updateContainerConfigScalars } from './db/container-configs.js';
 import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainer } from './container-runtime.js';
 import { checkAgentRunnerDepsDrift } from './agent-runner-image-check.js';
 import { EGRESS_NETWORK, egressNetworkArgs, ensureEgressNetwork } from './egress-lockdown.js';
@@ -79,6 +81,7 @@ import {
   writeSessionRouting,
 } from './session-manager.js';
 import { assertStorageAdmission } from './storage-manager.js';
+import { MemoryAdmissionController } from './memory-admission.js';
 import type { AgentGroup, Session } from './types.js';
 
 export const DATAFOLD_MCP_SERVER = {
@@ -161,6 +164,58 @@ export function getContainerSpawnedAt(sessionId: string): number {
  * racy double-replies.
  */
 const wakePromises = new Map<string, Promise<boolean>>();
+
+let memoryAdmission: MemoryAdmissionController<Session> | null = null;
+let containerShutdownInProgress = false;
+
+export function resolveMemoryAdmissionBudgetMb(
+  dockerMemoryMb: number,
+  override: string = CONTAINER_MEMORY_BUDGET,
+): number {
+  if (!Number.isInteger(dockerMemoryMb) || dockerMemoryMb <= 0) {
+    throw new Error(`Docker-visible memory must be a positive integer MiB value: ${dockerMemoryMb}`);
+  }
+  return override.trim() ? parseMemoryMb(override) : Math.max(1, Math.floor(dockerMemoryMb * 0.8));
+}
+
+export function detectDockerMemoryMb(): number {
+  try {
+    const raw = execFileSync(CONTAINER_RUNTIME_BIN, ['info', '--format', '{{.MemTotal}}'], {
+      encoding: 'utf8',
+      timeout: 10_000,
+    }).trim();
+    const bytes = Number(raw);
+    if (Number.isFinite(bytes) && bytes > 0) return Math.floor(bytes / 1024 / 1024);
+  } catch (err) {
+    log.warn('Could not read Docker-visible memory; falling back to host total memory', { err });
+  }
+  return Math.floor(os.totalmem() / 1024 / 1024);
+}
+
+function getMemoryAdmission(): MemoryAdmissionController<Session> {
+  if (!memoryAdmission) {
+    const dockerMemoryMb = detectDockerMemoryMb();
+    const budgetMb = resolveMemoryAdmissionBudgetMb(dockerMemoryMb);
+    memoryAdmission = new MemoryAdmissionController<Session>(budgetMb);
+    log.info('Initialized container memory admission', {
+      dockerMemoryMb,
+      budgetMb,
+      budgetSource: CONTAINER_MEMORY_BUDGET.trim() ? 'CONTAINER_MEMORY_BUDGET' : '80% of Docker-visible RAM',
+    });
+  }
+  return memoryAdmission;
+}
+
+function releaseMemoryReservation(sessionId: string): void {
+  if (!memoryAdmission) return;
+  if (containerShutdownInProgress) return;
+  const ready = memoryAdmission.release(sessionId);
+  for (const queuedSession of ready) {
+    void startReservedWake(queuedSession).catch((err) => {
+      log.warn('Queued container wake failed', { sessionId: queuedSession.id, err });
+    });
+  }
+}
 
 export function getActiveContainerCount(): number {
   return activeContainers.size;
@@ -368,6 +423,10 @@ export function resolveMnemonStore(
  * can branch on the boolean.
  */
 export function wakeContainer(session: Session): Promise<boolean> {
+  if (containerShutdownInProgress) {
+    log.debug('Container wake ignored — host shutdown in progress', { sessionId: session.id });
+    return Promise.resolve(false);
+  }
   if (activeContainers.has(session.id)) {
     log.debug('Container already running', { sessionId: session.id });
     return Promise.resolve(true);
@@ -394,6 +453,74 @@ export function wakeContainer(session: Session): Promise<boolean> {
     return Promise.resolve(false);
   }
 
+  const admission = getMemoryAdmission();
+  if (admission.isQueued(session.id)) {
+    log.debug('Container wake already queued for memory', { sessionId: session.id });
+    return Promise.resolve(false);
+  }
+
+  const agentGroup = getAgentGroup(session.agent_group_id);
+  if (!agentGroup) {
+    log.error('Container wake rejected — agent group not found', {
+      sessionId: session.id,
+      agentGroupId: session.agent_group_id,
+    });
+    return Promise.resolve(false);
+  }
+  let effectiveResources;
+  try {
+    effectiveResources = resolveContainerResources(readContainerConfig(agentGroup.folder).resources);
+  } catch (err) {
+    log.error('Container wake rejected — invalid resource configuration', {
+      sessionId: session.id,
+      agentGroup: agentGroup.folder,
+      err,
+    });
+    return Promise.resolve(false);
+  }
+
+  const decision = admission.request(session.id, effectiveResources.memory.requestMb, session);
+  if (decision.status === 'rejected') {
+    log.error('Container wake rejected — memory request exceeds host budget', {
+      sessionId: session.id,
+      agentGroup: agentGroup.folder,
+      requestMb: decision.requestMb,
+      budgetMb: decision.budgetMb,
+    });
+    return Promise.resolve(false);
+  }
+  if (decision.status === 'queued') {
+    log.warn('Container wake queued — memory budget exhausted', {
+      sessionId: session.id,
+      agentGroup: agentGroup.folder,
+      requestMb: decision.requestMb,
+      budgetMb: decision.budgetMb,
+      reservedMb: admission.reservedMb,
+      position: decision.position,
+    });
+    return Promise.resolve(false);
+  }
+
+  return startReservedWake(session, true);
+}
+
+function startReservedWake(session: Session, storageAlreadyChecked = false): Promise<boolean> {
+  if (activeContainers.has(session.id)) return Promise.resolve(true);
+  const existing = wakePromises.get(session.id);
+  if (existing) return existing;
+
+  if (!storageAlreadyChecked) {
+    const storageAdmission = assertStorageAdmission({ isContainerRunning });
+    if (!storageAdmission.allowed) {
+      log.warn('Queued container wake deferred — disk usage remains above storage admission threshold', {
+        sessionId: session.id,
+        reason: storageAdmission.reason,
+      });
+      releaseMemoryReservation(session.id);
+      return Promise.resolve(false);
+    }
+  }
+
   const activeCount = activeContainers.size;
   const inFlightWakes = wakePromises.size;
   if (MAX_CONCURRENT_CONTAINERS > 0 && activeCount + inFlightWakes >= MAX_CONCURRENT_CONTAINERS) {
@@ -403,12 +530,15 @@ export function wakeContainer(session: Session): Promise<boolean> {
       inFlightWakes,
       maxConcurrentContainers: MAX_CONCURRENT_CONTAINERS,
     });
+    releaseMemoryReservation(session.id);
     return Promise.resolve(false);
   }
+
   const promise = spawnContainer(session)
     .then(() => true)
     .catch((err) => {
       log.warn('wakeContainer failed — host-sweep will retry', { sessionId: session.id, err });
+      releaseMemoryReservation(session.id);
       return false;
     })
     .finally(() => {
@@ -421,8 +551,7 @@ export function wakeContainer(session: Session): Promise<boolean> {
 async function spawnContainer(session: Session): Promise<void> {
   const agentGroup = getAgentGroup(session.agent_group_id);
   if (!agentGroup) {
-    log.error('Agent group not found', { agentGroupId: session.agent_group_id });
-    return;
+    throw new Error(`Agent group not found: ${session.agent_group_id}`);
   }
 
   // Refresh the destination map and default reply routing so any admin
@@ -442,6 +571,7 @@ async function spawnContainer(session: Session): Promise<void> {
   // Read container config once — threaded through provider resolution,
   // buildMounts, and buildContainerArgs so we don't re-read the file.
   const containerConfig = readContainerConfig(agentGroup.folder);
+  const effectiveResources = resolveContainerResources(containerConfig.resources);
 
   // Refuse spawn if the agent-runner deps (package.json + bun.lock) on disk
   // don't match what's baked into the image we'd spawn from. Source is
@@ -568,10 +698,19 @@ async function spawnContainer(session: Session): Promise<void> {
 
   container.on('close', (code) => {
     activeContainers.delete(session.id);
+    releaseMemoryReservation(session.id);
     markContainerStopped(session.id);
     stopTypingRefresh(session.id);
     // code null = killed by signal (normal shutdown path), not a boot failure.
-    if (code !== 0 && code !== null && stderrTail.length > 0) {
+    if (code === 137) {
+      log.warn('Container exited 137 — likely OOM kill or forced SIGKILL', {
+        sessionId: session.id,
+        containerName,
+        memoryRequestMb: effectiveResources.memory.requestMb,
+        memoryLimitMb: effectiveResources.memory.limitMb,
+        stderrTail,
+      });
+    } else if (code !== 0 && code !== null && stderrTail.length > 0) {
       log.warn('Container exited non-zero', { sessionId: session.id, code, containerName, stderrTail });
     } else {
       log.info('Container exited', { sessionId: session.id, code, containerName });
@@ -580,6 +719,7 @@ async function spawnContainer(session: Session): Promise<void> {
 
   container.on('error', (err) => {
     activeContainers.delete(session.id);
+    releaseMemoryReservation(session.id);
     markContainerStopped(session.id);
     stopTypingRefresh(session.id);
     log.error('Container spawn error', { sessionId: session.id, err });
@@ -617,6 +757,8 @@ export function killContainer(sessionId: string, reason: string, onExit?: () => 
  * to `gracePeriodMs`, then hard-kills anything still alive.
  */
 export async function stopAllContainers(gracePeriodMs: number = 10_000): Promise<void> {
+  containerShutdownInProgress = true;
+  memoryAdmission?.shutdown();
   const entries = Array.from(activeContainers.entries());
   if (entries.length === 0) return;
   log.info('Stopping all containers', { count: entries.length, gracePeriodMs });
@@ -2276,14 +2418,7 @@ async function buildContainerArgs(
   resolvedWgId?: string,
 ): Promise<string[]> {
   const args: string[] = ['run', '--rm', '--name', containerName, '--label', CONTAINER_INSTALL_LABEL];
-  args.push(...dockerResourceLimitArgs());
-
-  // Per-container resource caps (opt-in; empty = unbounded, today's behavior).
-  // Only --memory is set. Whether that's a hard cap depends on the host having no
-  // swap (a deployment concern) — on a swapless host --memory is hard and a runaway
-  // is OOM-killed; we don't manage swap from here.
-  if (CONTAINER_CPU_LIMIT) args.push('--cpus', CONTAINER_CPU_LIMIT);
-  if (CONTAINER_MEMORY_LIMIT) args.push('--memory', CONTAINER_MEMORY_LIMIT);
+  args.push(...dockerResourceLimitArgs(containerConfig.resources));
 
   // Environment — only vars read by code we don't own.
   // Everything NanoClaw-specific is in container.json (read by runner at startup).
@@ -3199,22 +3334,19 @@ async function buildContainerArgs(
   return args;
 }
 
-export function dockerResourceLimitArgs(): string[] {
-  const args: string[] = [];
-  pushDockerLimit(args, '--memory', CONTAINER_MEMORY_LIMIT);
-  pushDockerLimit(args, '--memory-reservation', CONTAINER_MEMORY_RESERVATION);
-  pushDockerLimit(args, '--memory-swap', CONTAINER_MEMORY_SWAP_LIMIT);
-  pushDockerLimit(args, '--cpus', CONTAINER_CPU_LIMIT);
-  if (CONTAINER_PIDS_LIMIT > 0) {
-    args.push('--pids-limit', String(CONTAINER_PIDS_LIMIT));
-  }
+export function dockerResourceLimitArgs(resources?: ContainerResources): string[] {
+  const effective = resolveContainerResources(resources);
+  const args = [
+    '--memory',
+    formatMemoryMb(effective.memory.limitMb),
+    '--memory-reservation',
+    formatMemoryMb(effective.memory.requestMb),
+    '--memory-swap',
+    formatMemoryMb(effective.memory.memorySwapLimitMb),
+  ];
+  if (effective.cpus !== undefined) args.push('--cpus', String(effective.cpus));
+  args.push('--pids-limit', String(effective.pidsLimit));
   return args;
-}
-
-function pushDockerLimit(args: string[], flag: string, value: string): void {
-  const trimmed = value.trim();
-  if (!trimmed || trimmed === '0') return;
-  args.push(flag, trimmed);
 }
 
 const execAsync = promisify(exec);

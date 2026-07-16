@@ -124,21 +124,33 @@ export function configureOutboundDb(outbound: Database): void {
         provider_probe_failures  INTEGER,
         provider_recovery_attempts INTEGER,
         provider_failure_reason  TEXT,
+        memory_current_bytes     INTEGER,
+        memory_peak_bytes        INTEGER,
+        memory_max_bytes         INTEGER,
+        memory_oom_events        INTEGER,
+        memory_oom_kill_events   INTEGER,
+        memory_telemetry_at      TEXT,
         updated_at               TEXT NOT NULL
       );
     `);
   const containerCols = new Set(
     (outbound.prepare("PRAGMA table_info('container_state')").all() as Array<{ name: string }>).map((c) => c.name),
   );
-  const providerColumns: Array<[string, string]> = [
+  const forwardColumns: Array<[string, string]> = [
     ['provider_status', 'TEXT'],
     ['provider_last_event_at', 'TEXT'],
     ['provider_last_probe_at', 'TEXT'],
     ['provider_probe_failures', 'INTEGER'],
     ['provider_recovery_attempts', 'INTEGER'],
     ['provider_failure_reason', 'TEXT'],
+    ['memory_current_bytes', 'INTEGER'],
+    ['memory_peak_bytes', 'INTEGER'],
+    ['memory_max_bytes', 'INTEGER'],
+    ['memory_oom_events', 'INTEGER'],
+    ['memory_oom_kill_events', 'INTEGER'],
+    ['memory_telemetry_at', 'TEXT'],
   ];
-  for (const [name, type] of providerColumns) {
+  for (const [name, type] of forwardColumns) {
     if (!containerCols.has(name)) outbound.exec(`ALTER TABLE container_state ADD COLUMN ${name} ${type}`);
   }
 }
@@ -362,6 +374,12 @@ export function initTestSessionDb(): { inbound: Database; outbound: Database } {
       provider_probe_failures  INTEGER,
       provider_recovery_attempts INTEGER,
       provider_failure_reason  TEXT,
+      memory_current_bytes     INTEGER,
+      memory_peak_bytes        INTEGER,
+      memory_max_bytes         INTEGER,
+      memory_oom_events        INTEGER,
+      memory_oom_kill_events   INTEGER,
+      memory_telemetry_at      TEXT,
       updated_at               TEXT NOT NULL
     );
   `);
