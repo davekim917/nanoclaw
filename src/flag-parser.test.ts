@@ -274,6 +274,13 @@ describe('formatFlagConfirmation', () => {
     expect(out).toContain('ultracode ON');
     expect(out).not.toContain('effort → xhigh');
   });
+
+  it('formats sticky and one-turn fast-mode confirmations, including off', () => {
+    expect(formatFlagConfirmation({ stickyFast: true }, [], [])).toBe('⚙️ fast mode → ON');
+    expect(formatFlagConfirmation({ stickyFast: false }, [], [])).toBe('⚙️ fast mode → OFF');
+    expect(formatFlagConfirmation({ turnFast: true }, [], [])).toBe('⚙️ fast mode (this turn) → ON');
+    expect(formatFlagConfirmation({ turnFast: false }, [], [])).toBe('⚙️ fast mode (this turn) → OFF');
+  });
 });
 
 describe('provider-aware vocabulary (codex)', () => {
@@ -337,6 +344,44 @@ describe('provider-aware vocabulary (codex)', () => {
     const r = parseMessageFlags('-m gpt-5.5 -e xhigh hi', 'codex');
     expect(r.intent).toEqual({ stickyModel: 'gpt-5.5', stickyEffort: 'xhigh' });
     expect(r.warnings).toEqual([]);
+  });
+
+  it('parses sticky fast mode on and off', () => {
+    expect(parseMessageFlags('-f on hi', 'codex')).toMatchObject({
+      intent: { stickyFast: true },
+      cleanedText: 'hi',
+      errors: [],
+    });
+    expect(parseMessageFlags('-f OFF hi', 'codex')).toMatchObject({
+      intent: { stickyFast: false },
+      cleanedText: 'hi',
+      errors: [],
+    });
+  });
+
+  it('parses one-turn fast mode on and off', () => {
+    expect(parseMessageFlags('-f1 on hi', 'codex').intent).toEqual({ turnFast: true });
+    expect(parseMessageFlags('-f1 off hi', 'codex').intent).toEqual({ turnFast: false });
+  });
+
+  it('composes fast mode with model and effort flags', () => {
+    const r = parseMessageFlags('-m gpt-5.6-sol -e xhigh -f on hi', 'codex');
+    expect(r.intent).toEqual({
+      stickyModel: 'gpt-5.6-sol',
+      stickyEffort: 'xhigh',
+      stickyFast: true,
+    });
+    expect(r.cleanedText).toBe('hi');
+  });
+
+  it('rejects invalid or empty fast-mode values', () => {
+    expect(parseMessageFlags('-f maybe hi', 'codex').errors[0]).toMatch(/-f expects on\|off/);
+    expect(parseMessageFlags("-f1 '' hi", 'codex').errors[0]).toMatch(/-f1 expects on\|off/);
+  });
+
+  it('rejects fast mode on non-codex providers', () => {
+    expect(parseMessageFlags('-f on hi', 'claude').errors[0]).toMatch(/fast mode is Codex-only/);
+    expect(parseMessageFlags('-f1 off hi', 'opencode').errors[0]).toMatch(/fast mode is Codex-only/);
   });
 
   it('defaults to the claude vocabulary when no provider is passed (back-compat)', () => {

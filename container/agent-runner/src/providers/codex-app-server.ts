@@ -601,9 +601,12 @@ export function writeCodexHooksJson(opts?: { emailGateTimeoutSec?: number }): vo
  * first-class JSON-RPC parameter; emitting it via `-c model=...` would
  * shadow but not improve precedence.
  */
-export function createCodexConfigOverrides(stickyConfig?: {
-  reasoning_effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
-}): string[] {
+export function createCodexConfigOverrides(
+  stickyConfig?: {
+    reasoning_effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+  },
+  fast = false,
+): string[] {
   // `features.goals=true` enables Codex's goals feature for every container
   // agent — same always-on pattern as `features.use_linux_sandbox_bwrap`.
   //
@@ -627,6 +630,7 @@ export function createCodexConfigOverrides(stickyConfig?: {
     'features.use_linux_sandbox_bwrap=false',
     'features.goals=true',
     'features.steer=true',
+    'features.fast_mode=true',
     // Memories: writing AND reading. `[memories]` is Codex CLI's own
     // session-summary store (separate from NanoClaw's mnemon graph, which is
     // host-side). `generate_memories=true` writes summaries on turn boundaries;
@@ -637,6 +641,9 @@ export function createCodexConfigOverrides(stickyConfig?: {
   ];
   if (stickyConfig?.reasoning_effort) {
     overrides.push(`model_reasoning_effort="${stickyConfig.reasoning_effort}"`);
+  }
+  if (fast) {
+    overrides.push('service_tier="fast"');
   }
   // Force reasoning-summary notifications on. Without this, gpt-5.x runs in
   // xhigh effort still produce zero `item/reasoning/summaryTextDelta` events

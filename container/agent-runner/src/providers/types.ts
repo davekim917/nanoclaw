@@ -189,6 +189,12 @@ export interface QueryInput {
    * to xhigh upstream. Providers that don't support it ignore this field.
    */
   ultracode?: boolean;
+
+  /**
+   * Use Codex's fast service tier for this query. Other providers ignore it.
+   * Effective value is: one-turn override → sticky override → false.
+   */
+  fast?: boolean;
 }
 
 export type McpServerConfig = StdioMcpServerConfig | HttpMcpServerConfig | SseMcpServerConfig;

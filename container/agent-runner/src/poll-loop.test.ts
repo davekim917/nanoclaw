@@ -17,6 +17,7 @@ import { formatMessages, extractRouting } from './formatter.js';
 import {
   dispatchFileAttachment,
   dispatchResultText,
+  applyFlagBatch,
   handleEvent,
   isAdmissibleTrigger,
   isAupRefusal,
@@ -127,6 +128,36 @@ describe('formatter', () => {
     const prompt = formatMessages(messages);
     expect(prompt).toContain('A&lt;B');
     expect(prompt).toContain('x &gt; y &amp;&amp; z');
+  });
+});
+
+describe('fast-mode flag application', () => {
+  it('persists sticky Codex on/off and honors one-turn precedence', () => {
+    insertMessage('m1', 'chat', { sender: 'Dave', text: 'hi', flagIntent: { stickyFast: true } });
+    const messages = getPendingMessages();
+    const routing = extractRouting(messages);
+
+    expect(applyFlagBatch(messages, routing, 'codex').fast).toBe(true);
+    expect(applyFlagBatch([], routing, 'codex').fast).toBe(true);
+
+    insertMessage('m2', 'chat', { sender: 'Dave', text: 'standard once', flagIntent: { turnFast: false } });
+    const oneTurn = getPendingMessages().filter((m) => m.id === 'm2');
+    expect(applyFlagBatch(oneTurn, routing, 'codex').fast).toBe(false);
+    expect(applyFlagBatch([], routing, 'codex').fast).toBe(true);
+
+    insertMessage('m3', 'chat', { sender: 'Dave', text: 'standard', flagIntent: { stickyFast: false } });
+    const stickyOff = getPendingMessages().filter((m) => m.id === 'm3');
+    expect(applyFlagBatch(stickyOff, routing, 'codex').fast).toBe(false);
+    expect(applyFlagBatch([], routing, 'codex').fast).toBe(false);
+  });
+
+  it('does not apply a preserved Codex sticky to another provider', () => {
+    insertMessage('m1', 'chat', { sender: 'Dave', text: 'hi', flagIntent: { stickyFast: true } });
+    const messages = getPendingMessages();
+    const routing = extractRouting(messages);
+    expect(applyFlagBatch(messages, routing, 'codex').fast).toBe(true);
+    expect(applyFlagBatch([], routing, 'claude').fast).toBe(false);
+    expect(applyFlagBatch([], routing, 'opencode').fast).toBe(false);
   });
 });
 
@@ -1284,6 +1315,44 @@ const ERR_ROUTING = {
   inReplyTo: 'm1',
   quietStatus: false,
 };
+
+describe('mid-turn fast-mode changes', () => {
+  it('ends the active query and leaves the flag row pending for a fast-tier respawn', async () => {
+    insertMessage('m-fast', 'chat', {
+      sender: 'Dave',
+      text: 'use fast mode',
+      flagIntent: { turnFast: true },
+    });
+
+    let release!: () => void;
+    const ended = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let endCalls = 0;
+    let pushCalls = 0;
+    async function* events(): AsyncGenerator<ProviderEvent> {
+      yield { type: 'init', continuation: 'codex-thread' };
+      await ended;
+    }
+    const query: AgentQuery = {
+      push: () => {
+        pushCalls += 1;
+      },
+      end: () => {
+        endCalls += 1;
+        release();
+      },
+      abort: release,
+      events: events(),
+    };
+
+    await processQuery(query, ERR_ROUTING, [], 'codex', undefined, 'initial', undefined, { fast: false });
+
+    expect(endCalls).toBe(1);
+    expect(pushCalls).toBe(0);
+    expect(getPendingMessages().map((m) => m.id)).toContain('m-fast');
+  });
+});
 
 describe('error result with no <message> envelope', () => {
   it('delivers a budget/billing error to the triggering channel and does not nudge', async () => {

@@ -847,6 +847,7 @@ export class CodexProvider implements AgentProvider {
     // back to configured defaults — see resolveQueryModel/resolveQueryEffort).
     const effectiveModel = resolveQueryModel(input.model, this.model);
     const effectiveConfig = resolveQueryEffort(input.effort, this.stickyConfig);
+    const effectiveFast = input.fast === true;
 
     async function* gen(): AsyncGenerator<ProviderEvent> {
       // One app-server per query invocation. The poll-loop keeps a single
@@ -854,7 +855,7 @@ export class CodexProvider implements AgentProvider {
       // spawn-per-query matches that cadence naturally.
       writeCodexMcpConfigToml(self.mcpServers);
       writeCodexHooksJson();
-      let server = spawnCodexAppServer(createCodexConfigOverrides(effectiveConfig));
+      let server = spawnCodexAppServer(createCodexConfigOverrides(effectiveConfig, effectiveFast));
       turnTracker.server = server;
       attachCodexAutoApproval(server);
 
@@ -1016,7 +1017,7 @@ export class CodexProvider implements AgentProvider {
 
                   writeCodexMcpConfigToml(self.mcpServers);
                   writeCodexHooksJson();
-                  server = spawnCodexAppServer(createCodexConfigOverrides(effectiveConfig));
+                  server = spawnCodexAppServer(createCodexConfigOverrides(effectiveConfig, effectiveFast));
                   turnTracker.server = server;
                   attachCodexAutoApproval(server);
                   await initializeCodexAppServer(server);
@@ -1065,7 +1066,7 @@ export class CodexProvider implements AgentProvider {
                   writeCodexMcpConfigToml(self.mcpServers);
                   writeCodexHooksJson();
 
-                  server = spawnCodexAppServer(createCodexConfigOverrides(effectiveConfig));
+                  server = spawnCodexAppServer(createCodexConfigOverrides(effectiveConfig, effectiveFast));
                   turnTracker.server = server;
                   attachCodexAutoApproval(server);
                   await initializeCodexAppServer(server);
@@ -1131,7 +1132,7 @@ export class CodexProvider implements AgentProvider {
                     writeCodexHooksJson();
                     mirrorCodexAgentsToHome(primaryCodexHome, nextHome);
 
-                    server = spawnCodexAppServer(createCodexConfigOverrides(effectiveConfig));
+                    server = spawnCodexAppServer(createCodexConfigOverrides(effectiveConfig, effectiveFast));
                     turnTracker.server = server;
                     attachCodexAutoApproval(server);
                     await initializeCodexAppServer(server);

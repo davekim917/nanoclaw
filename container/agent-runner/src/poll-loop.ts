@@ -21,6 +21,8 @@ import {
   getStickyUltracode,
   setStickyUltracode,
   clearStickyUltracode,
+  getStickyFast,
+  setStickyFast,
 } from './db/session-state.js';
 import { clearBatchAnchors, getBatchAnchor, setCurrentBatchAnchors } from './current-batch.js';
 import {
@@ -350,10 +352,11 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     const keptIds = keep.map((m) => m.id);
     markProcessing(keptIds);
 
-    const flagBatch = applyFlagBatch(keep, routing);
+    const flagBatch = applyFlagBatch(keep, routing, config.providerName);
     let effectiveModel = flagBatch.model;
     let effectiveEffort = flagBatch.effort;
     const effectiveUltracode = flagBatch.ultracode;
+    const effectiveFast = flagBatch.fast;
 
     // Scheduled-task default (Claude only): an unpinned scheduled-task fire
     // runs on Sonnet at xhigh effort, independent of any interactive sticky
@@ -375,7 +378,8 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     log(
       `Processing ${keep.length} message(s), kinds: ${[...new Set(keep.map((m) => m.kind))].join(',')}` +
         (effectiveModel ? ` model=${effectiveModel}` : '') +
-        (effectiveEffort ? ` effort=${effectiveEffort}` : ''),
+        (effectiveEffort ? ` effort=${effectiveEffort}` : '') +
+        (config.providerName === 'codex' ? ` fast=${effectiveFast ? 'on' : 'off'}` : ''),
     );
 
     // Fresh credential-rotation cycle for this turn: the active token stays
@@ -391,6 +395,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       model: effectiveModel,
       effort: effectiveEffort,
       ultracode: effectiveUltracode,
+      fast: effectiveFast,
       systemContext: config.systemContext,
     });
 
@@ -423,7 +428,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         config.provider.onExchangeComplete?.bind(config.provider),
         prompt,
         continuation,
-        { model: effectiveModel, effort: effectiveEffort, ultracode: effectiveUltracode },
+        { model: effectiveModel, effort: effectiveEffort, ultracode: effectiveUltracode, fast: effectiveFast },
       );
       if (result.continuation && result.continuation !== continuation) {
         continuation = result.continuation;
@@ -468,6 +473,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
               model: effectiveModel,
               effort: effectiveEffort,
               ultracode: effectiveUltracode,
+              fast: effectiveFast,
             });
             const retryResult = await processQuery(
               retryQuery,
@@ -477,7 +483,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
               config.provider.onExchangeComplete?.bind(config.provider),
               prompt,
               continuation,
-              { model: effectiveModel, effort: effectiveEffort, ultracode: effectiveUltracode },
+              { model: effectiveModel, effort: effectiveEffort, ultracode: effectiveUltracode, fast: effectiveFast },
             );
             if (retryResult.continuation && retryResult.continuation !== continuation) {
               continuation = retryResult.continuation;
@@ -536,6 +542,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
               model: effectiveModel,
               effort: effectiveEffort,
               ultracode: effectiveUltracode,
+              fast: effectiveFast,
             });
             const retryResult = await processQuery(
               retryQuery,
@@ -545,7 +552,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
               config.provider.onExchangeComplete?.bind(config.provider),
               prompt,
               continuation,
-              { model: effectiveModel, effort: effectiveEffort, ultracode: effectiveUltracode },
+              { model: effectiveModel, effort: effectiveEffort, ultracode: effectiveUltracode, fast: effectiveFast },
             );
             if (retryResult.continuation && retryResult.continuation !== continuation) {
               continuation = retryResult.continuation;
@@ -603,6 +610,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             model: effectiveModel,
             effort: effectiveEffort,
             ultracode: effectiveUltracode,
+            fast: effectiveFast,
           });
           const retryResult = await processQuery(
             retryQuery,
@@ -612,7 +620,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             config.provider.onExchangeComplete?.bind(config.provider),
             prompt,
             continuation,
-            { model: effectiveModel, effort: effectiveEffort, ultracode: effectiveUltracode },
+            { model: effectiveModel, effort: effectiveEffort, ultracode: effectiveUltracode, fast: effectiveFast },
           );
           if (retryResult.continuation && retryResult.continuation !== continuation) {
             continuation = retryResult.continuation;
@@ -665,6 +673,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             model: effectiveModel,
             effort: effectiveEffort,
             ultracode: effectiveUltracode,
+            fast: effectiveFast,
           });
           const retryResult = await processQuery(
             retryQuery,
@@ -674,7 +683,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             config.provider.onExchangeComplete?.bind(config.provider),
             prompt,
             undefined,
-            { model: effectiveModel, effort: effectiveEffort, ultracode: effectiveUltracode },
+            { model: effectiveModel, effort: effectiveEffort, ultracode: effectiveUltracode, fast: effectiveFast },
           );
           if (retryResult.continuation) {
             continuation = retryResult.continuation;
@@ -714,6 +723,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             model: effectiveModel,
             effort: effectiveEffort,
             ultracode: effectiveUltracode,
+            fast: effectiveFast,
           });
           const retryResult = await processQuery(
             retryQuery,
@@ -723,7 +733,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             config.provider.onExchangeComplete?.bind(config.provider),
             prompt,
             undefined,
-            { model: effectiveModel, effort: effectiveEffort, ultracode: effectiveUltracode },
+            { model: effectiveModel, effort: effectiveEffort, ultracode: effectiveUltracode, fast: effectiveFast },
           );
           if (retryResult.continuation) {
             continuation = retryResult.continuation;
@@ -766,6 +776,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             model: effectiveModel,
             effort: effectiveEffort,
             ultracode: effectiveUltracode,
+            fast: effectiveFast,
           });
           const retryResult = await processQuery(
             retryQuery,
@@ -775,7 +786,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
             config.provider.onExchangeComplete?.bind(config.provider),
             prompt,
             undefined,
-            { model: effectiveModel, effort: effectiveEffort, ultracode: effectiveUltracode },
+            { model: effectiveModel, effort: effectiveEffort, ultracode: effectiveUltracode, fast: effectiveFast },
           );
           if (retryResult.continuation) {
             continuation = retryResult.continuation;
@@ -942,10 +953,10 @@ export async function processQuery(
   onExchangeComplete: ((exchange: ProviderExchange) => void) | undefined,
   initialPrompt: string,
   initialContinuation: string | undefined,
-  // The model/effort/ultracode this query was created with. The follow-up
+  // The model/effort/ultracode/fast settings this query was created with. The follow-up
   // handler compares the current effective values against these to detect a
   // mid-turn change (flag OR change_model) and end-and-reopen on the new model.
-  querySettings: { model?: string; effort?: string; ultracode?: boolean },
+  querySettings: { model?: string; effort?: string; ultracode?: boolean; fast?: boolean },
 ): Promise<QueryResult> {
   let queryContinuation: string | undefined;
   let done = false;
@@ -1003,12 +1014,12 @@ export async function processQuery(
           return;
         }
 
-        // Flag-bearing messages (-m/-e) are handled after admission, below:
-        // stickies are persisted and the changes applied to the LIVE query
-        // via provider control requests (query.applySettings) — same
-        // conversation, same stream. Ending the stream is only the fallback
-        // when the provider has no live controls or the combination can't
-        // be expressed (e.g. effort 'max').
+        // Flag-bearing messages (-m/-e/-f) are handled after admission, below:
+        // stickies are persisted and live-capable settings are applied via
+        // provider control requests (query.applySettings). Ending the stream
+        // is the fallback when the provider has no live controls, the
+        // combination can't be expressed, or Codex's app-server-scoped fast
+        // service tier changed.
 
         // Filtering on thread_id here caused deadlocks when the initial batch
         // and follow-ups had mismatched thread_ids (e.g. a host-generated welcome
@@ -1059,7 +1070,7 @@ export async function processQuery(
           return;
         }
 
-        // Model/effort change since this query was created — from a -m/-e flag
+        // Settings change since this query was created — from a flag
         // row OR a mid-turn change_model tool call (which writes sticky_model
         // directly, with NO flag row). applyFlagBatch persists any flag stickies
         // (previously this never ran on the follow-up path, so flags were acked
@@ -1071,15 +1082,20 @@ export async function processQuery(
         // provider without live controls (opencode/codex) ends the stream so the
         // outer loop reopens on the new model, leaving these rows pending; one
         // with live controls (claude) applies it in place, same stream.
-        const fb = applyFlagBatch(keep, extractRouting(keep));
-        const modelOrEffortChanged =
+        const fb = applyFlagBatch(keep, extractRouting(keep), providerName);
+        const liveSettingsChanged =
           fb.model !== querySettings.model ||
           fb.effort !== querySettings.effort ||
           fb.ultracode !== querySettings.ultracode;
-        if (modelOrEffortChanged) {
-          if (!query.applySettings) {
+        const fastChanged = fb.fast !== (querySettings.fast ?? false);
+        if (liveSettingsChanged || fastChanged) {
+          // Codex fast mode is selected when its app-server starts. Even if a
+          // provider supports live model/effort controls, a tier change must
+          // end this query so the outer loop can respawn with new overrides.
+          if (fastChanged || !query.applySettings) {
             log(
-              `Model/effort change (${querySettings.model ?? 'default'} → ${fb.model ?? 'default'}) — ` +
+              `Query settings changed (${querySettings.model ?? 'default'} → ${fb.model ?? 'default'}, ` +
+                `fast=${querySettings.fast ? 'on' : 'off'} → ${fb.fast ? 'on' : 'off'}) — ` +
                 'ending stream; next query honors it',
             );
             endedForCommand = true;
@@ -1734,16 +1750,19 @@ interface FlagIntent {
   stickyUltracode?: boolean;
   turnUltracode?: boolean;
   clearStickyUltracode?: boolean;
+  stickyFast?: boolean;
+  turnFast?: boolean;
 }
 
 // Precedence: turn override → sticky. Effort defaults (operator override env +
 // per-model-family) are applied inside the claude provider, not here.
 // ultracode follows the same precedence; effort is already forced to xhigh
 // host-side when ultracode is requested, so it rides alongside effort here.
-function applyFlagBatch(
+export function applyFlagBatch(
   messages: MessageInRow[],
   _routing: RoutingContext,
-): { model?: string; effort?: string; ultracode?: boolean } {
+  providerName: string,
+): { model?: string; effort?: string; ultracode?: boolean; fast: boolean } {
   let intent: FlagIntent | undefined;
   for (const m of messages) {
     // Tasks carry flagIntent the same way chat messages do — used by scheduled
@@ -1781,6 +1800,9 @@ function applyFlagBatch(
       // turns ultracode off — `-e high` after `-e ultracode` means plain high.
       clearStickyUltracode();
     }
+    if (providerName === 'codex' && intent.stickyFast !== undefined) {
+      setStickyFast(intent.stickyFast);
+    }
   }
 
   const model = intent?.turnModel ?? getStickyModel();
@@ -1792,8 +1814,11 @@ function applyFlagBatch(
   // opencode model-native) and never consumed this env fold.
   const effort = intent?.turnEffort ?? getStickyEffort();
   const ultracode = intent?.turnUltracode ?? getStickyUltracode() ?? false;
+  // Preserve a Codex sticky across provider migrations, but never let it
+  // perturb a Claude/OpenCode query or trigger a false mid-turn restart there.
+  const fast = providerName === 'codex' ? (intent?.turnFast ?? getStickyFast() ?? false) : false;
 
-  return { model, effort, ultracode };
+  return { model, effort, ultracode, fast };
 }
 
 // A scheduled-task wake is a batch driven purely by kind='task' rows with no

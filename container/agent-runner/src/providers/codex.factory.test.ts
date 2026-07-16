@@ -1128,6 +1128,7 @@ describe('per-query model/effort overrides (-m/-e flags)', () => {
     it('resolves overrides from QueryInput before gen()', () => {
       expect(codeOnly).toMatch(/resolveQueryModel\(input\.model,\s*this\.model\)/);
       expect(codeOnly).toMatch(/resolveQueryEffort\(input\.effort,\s*this\.stickyConfig\)/);
+      expect(codeOnly).toMatch(/effectiveFast\s*=\s*input\.fast\s*===\s*true/);
     });
 
     it('thread params and per-turn model use the resolved model', () => {
@@ -1136,10 +1137,13 @@ describe('per-query model/effort overrides (-m/-e flags)', () => {
       expect(codeOnly).not.toMatch(/runOneTurn\(\s*server,\s*threadId!,\s*text,\s*self\.model/);
     });
 
-    it('every app-server spawn uses the effort-folded config', () => {
+    it('every app-server spawn uses the effort-folded config and per-query fast mode', () => {
       const spawns = codeOnly.match(/spawnCodexAppServer\(createCodexConfigOverrides\(([^)]*)\)\)/g) ?? [];
       expect(spawns.length).toBeGreaterThanOrEqual(2);
-      for (const s of spawns) expect(s).toContain('effectiveConfig');
+      for (const s of spawns) {
+        expect(s).toContain('effectiveConfig');
+        expect(s).toContain('effectiveFast');
+      }
     });
   });
 });

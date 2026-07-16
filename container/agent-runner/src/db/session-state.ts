@@ -15,6 +15,7 @@ const LEGACY_KEY = 'sdk_session_id';
 const STICKY_MODEL_KEY = 'sticky_model';
 const STICKY_EFFORT_KEY = 'sticky_effort';
 const STICKY_ULTRACODE_KEY = 'sticky_ultracode';
+const STICKY_FAST_KEY = 'sticky_fast';
 
 function continuationKey(providerName: string): string {
   return `continuation:${providerName.toLowerCase()}`;
@@ -82,9 +83,10 @@ export function clearContinuation(providerName: string): void {
 }
 
 /**
- * Session-sticky model/effort overrides. Set by `-m1 <model>` and
- * `-e1 <level>` flags on an inbound message; cleared by explicit
- * `-m1 ''` / `-e1 ''` (or /clear which wipes the row on session reset).
+ * Session-sticky model/effort overrides. Set by `-m <model>` and
+ * `-e <level>` flags on an inbound message; cleared by explicit
+ * `-m ''` / `-e ''`. Survives `/clear`, which resets only the provider
+ * continuation and intentionally keeps user-selected runtime settings.
  * Survives container restart via session_state.
  */
 export function getStickyModel(): string | undefined {
@@ -128,6 +130,17 @@ export function setStickyUltracode(on: boolean): void {
 
 export function clearStickyUltracode(): void {
   deleteValue(STICKY_ULTRACODE_KEY);
+}
+
+/** Codex fast service-tier override (`-f on|off`). */
+export function getStickyFast(): boolean | undefined {
+  const v = getValue(STICKY_FAST_KEY);
+  if (v === undefined) return undefined;
+  return v === '1';
+}
+
+export function setStickyFast(on: boolean): void {
+  setValue(STICKY_FAST_KEY, on ? '1' : '0');
 }
 
 /**

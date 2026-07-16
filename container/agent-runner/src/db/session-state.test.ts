@@ -4,8 +4,10 @@ import { getOutboundDb, initTestSessionDb } from './connection.js';
 import {
   clearContinuation,
   getContinuation,
+  getStickyFast,
   migrateLegacyContinuation,
   setContinuation,
+  setStickyFast,
 } from './session-state.js';
 
 beforeEach(() => {
@@ -97,4 +99,15 @@ describe('session-state — legacy migration', () => {
     const second = migrateLegacyContinuation('claude');
     expect(second).toBe('once');
   });
+});
+
+describe('session-state — sticky fast mode', () => {
+  test('round-trips both on and off states', () => {
+    expect(getStickyFast()).toBeUndefined();
+    setStickyFast(true);
+    expect(getStickyFast()).toBe(true);
+    setStickyFast(false);
+    expect(getStickyFast()).toBe(false);
+  });
+
 });

@@ -1,5 +1,5 @@
 /**
- * Model/effort flag parser. Called at the router boundary; the result is
+ * Model/effort/fast-mode flag parser. Called at the router boundary; the result is
  * attached to inbound content as structured metadata, so downstream code
  * never re-parses text.
  *
@@ -8,6 +8,8 @@
  *   -m1  <value>   one-turn model override
  *   -e   <value>   sticky effort
  *   -e1  <value>   one-turn effort override
+ *   -f   on|off    sticky Codex fast mode
+ *   -f1  on|off    one-turn Codex fast-mode override
  *   -m   ''        clear sticky model
  *   -e   ''        clear sticky effort
  *
@@ -164,6 +166,8 @@ interface ProviderFlagVocab {
   effortHint: string;
   /** ultracode is a Claude Agent SDK feature; other providers reject it. */
   allowsUltracode: boolean;
+  /** Fast mode is a Codex service tier; other providers reject it. */
+  allowsFast: boolean;
   /** Per-model effort matrix, or undefined when the provider has none. */
   effortSupportFor(model: string): ReadonlySet<EffortLevel> | undefined;
 }
@@ -175,6 +179,7 @@ const CLAUDE_VOCAB: ProviderFlagVocab = {
   validEfforts: VALID_EFFORT,
   effortHint: 'low|medium|high|xhigh|max|ultracode',
   allowsUltracode: true,
+  allowsFast: false,
   effortSupportFor: (model) => MODEL_EFFORT_SUPPORT[model],
 };
 
@@ -185,6 +190,7 @@ const CODEX_VOCAB: ProviderFlagVocab = {
   validEfforts: CODEX_VALID_EFFORT,
   effortHint: 'low|medium|high|xhigh|max|ultra',
   allowsUltracode: false,
+  allowsFast: true,
   effortSupportFor: () => undefined,
 };
 
@@ -235,6 +241,7 @@ const OPENCODE_VOCAB: ProviderFlagVocab = {
   validEfforts: OPENCODE_VALID_EFFORT,
   effortHint: 'low|medium|high|max',
   allowsUltracode: false,
+  allowsFast: false,
   effortSupportFor: () => undefined,
 };
 
@@ -268,6 +275,9 @@ export interface FlagIntent {
   stickyUltracode?: boolean;
   clearStickyUltracode?: boolean;
   turnUltracode?: boolean;
+  /** Codex fast service tier. False is explicit and must remain distinguishable from unset. */
+  stickyFast?: boolean;
+  turnFast?: boolean;
 }
 
 export interface FlagParseResult {
@@ -287,7 +297,7 @@ export interface FlagParseResult {
 
 const MENTION_PREFIX_RE = /^\s*(?:<@!?[^>]+>|@[\w.-]+)\s*/;
 const SWITCH_COMMAND_RE = /^\s*\/switch(?:\s+|$)/i;
-const FLAG_TOKEN_RE = /^\s*(-[me]1?)\s+("([^"]*)"|'([^']*)'|(\S*))\s*/;
+const FLAG_TOKEN_RE = /^\s*(-[mef]1?)\s+("([^"]*)"|'([^']*)'|(\S*))\s*/;
 
 /**
  * Parse mention + flags from the front of the message text. Always returns a
@@ -374,6 +384,22 @@ export function parseMessageFlags(rawText: string, provider: string = 'claude'):
         }
         break;
       }
+      case '-f':
+      case '-f1': {
+        if (!vocab.allowsFast) {
+          errors.push(`fast mode is Codex-only — this is a ${provider} agent`);
+          break;
+        }
+        const normalized = rawValue.toLowerCase();
+        if (normalized !== 'on' && normalized !== 'off') {
+          errors.push(`${flag} expects on|off`);
+          break;
+        }
+        const enabled = normalized === 'on';
+        if (flag === '-f') intent.stickyFast = enabled;
+        else intent.turnFast = enabled;
+        break;
+      }
     }
   }
 
@@ -409,6 +435,8 @@ export function parseMessageFlags(rawText: string, provider: string = 'claude'):
     intent.turnEffort !== undefined ||
     intent.stickyUltracode !== undefined ||
     intent.turnUltracode !== undefined ||
+    intent.stickyFast !== undefined ||
+    intent.turnFast !== undefined ||
     intent.clearStickyModel === true ||
     intent.clearStickyEffort === true ||
     intent.clearStickyUltracode === true;
@@ -448,6 +476,12 @@ export function formatFlagConfirmation(intent: FlagIntent, warnings: string[], e
     parts.push('ultracode this turn (xhigh + dynamic workflows)');
   } else if (intent.turnEffort) {
     parts.push(`effort (this turn) → ${intent.turnEffort}`);
+  }
+  if (intent.stickyFast !== undefined) {
+    parts.push(`fast mode → ${intent.stickyFast ? 'ON' : 'OFF'}`);
+  }
+  if (intent.turnFast !== undefined) {
+    parts.push(`fast mode (this turn) → ${intent.turnFast ? 'ON' : 'OFF'}`);
   }
 
   const suffix: string[] = [];

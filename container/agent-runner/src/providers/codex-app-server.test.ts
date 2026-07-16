@@ -139,6 +139,18 @@ describe('createCodexConfigOverrides', () => {
     expect(overrides).toContain('features.use_linux_sandbox_bwrap=false');
   });
 
+  it('always enables the native fast-mode feature', () => {
+    expect(createCodexConfigOverrides()).toContain('features.fast_mode=true');
+  });
+
+  it('sets the fast service tier only when requested', () => {
+    expect(createCodexConfigOverrides(undefined, true)).toContain('service_tier="fast"');
+    expect(createCodexConfigOverrides(undefined, false)).not.toEqual(
+      expect.arrayContaining([expect.stringMatching(/^service_tier=/)]),
+    );
+    expect(createCodexConfigOverrides()).not.toEqual(expect.arrayContaining([expect.stringMatching(/^service_tier=/)]));
+  });
+
   it('always enables Codex memories — both read and write', () => {
     // Codex's [memories] block opts the session into its own
     // turn-summary store (distinct from NanoClaw mnemon). Both halves
