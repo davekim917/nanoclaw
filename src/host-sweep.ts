@@ -324,6 +324,21 @@ export function shouldCloseTaskSession(
   return isTaskThread(threadId) && !containerRunning && liveTaskCount === 0;
 }
 
+/**
+ * Scheduled-task containers have no interactive follow-up window to preserve.
+ * Once the provider is idle, no message is claimed, and no work is due, reap
+ * the container immediately so background work does not hold a memory
+ * reservation until the general 30-minute idle ceiling.
+ */
+export function shouldReapIdleTaskContainer(
+  threadId: string | null,
+  dueMessageCount: number,
+  processingClaimCount: number,
+  providerStatus: string | null | undefined,
+): boolean {
+  return isTaskThread(threadId) && dueMessageCount === 0 && processingClaimCount === 0 && providerStatus === 'idle';
+}
+
 // ─── Scheduled-move recovery + audit-body prune (D3 / D4) ─────────────────────
 
 interface MoveRecoveryOptions {
@@ -644,7 +659,16 @@ async function sweepSession(session: Session): Promise<void> {
     // yet. Without this grace period, stale claims cause an immediate
     // spawn-kill loop.
     if (alive && outDb && !justWoke) {
-      enforceRunningContainerSla(inDb, outDb, session, agentGroup.id, agentGroup.folder);
+      const containerState = getContainerState(outDb);
+      const processingClaimCount = getProcessingClaims(outDb).length;
+      if (
+        shouldReapIdleTaskContainer(session.thread_id, dueCount, processingClaimCount, containerState?.provider_status)
+      ) {
+        log.info('Reaping idle scheduled-task container', { sessionId: session.id, threadId: session.thread_id });
+        killContainer(session.id, 'scheduled-task-idle');
+      } else {
+        enforceRunningContainerSla(inDb, outDb, session, agentGroup.id, agentGroup.folder);
+      }
     }
 
     // 4. Crashed-container cleanup: processing rows left behind get retried.

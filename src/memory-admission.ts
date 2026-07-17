@@ -5,50 +5,32 @@ export type MemoryAdmissionResult =
 
 export type MemoryAdmissionPriority = 'interactive' | 'scheduled';
 
-export const SCHEDULED_PRIORITY_AGING_MS = 15 * 60 * 1000;
-
-interface MemoryAdmissionOptions {
-  scheduledAgingMs?: number;
-  now?: () => number;
-}
-
 interface QueuedRequest<T> {
   id: string;
   requestMb: number;
   payload: T;
   priority: MemoryAdmissionPriority;
-  enqueuedAt: number;
   sequence: number;
 }
 
 /**
  * Host-local priority-aware memory reservation controller.
  * Reservations cover both in-flight spawns and active containers.
- * Interactive work runs before scheduled work, FIFO is preserved within each
- * effective priority class, and scheduled work ages into the interactive
- * class so sustained chat traffic cannot starve it forever.
+ * Interactive work always runs before scheduled work, with FIFO preserved
+ * within each priority class. Background work may wait under sustained chat
+ * load; that is deliberate because an operator message must never lose a slot
+ * to a scheduled wake merely because the scheduled wake has waited longer.
  */
 export class MemoryAdmissionController<T> {
   private readonly reservations = new Map<string, number>();
   private readonly queue: QueuedRequest<T>[] = [];
   private readonly queuedIds = new Set<string>();
-  private readonly scheduledAgingMs: number;
-  private readonly now: () => number;
   private nextSequence = 0;
 
-  constructor(
-    readonly budgetMb: number,
-    options: MemoryAdmissionOptions = {},
-  ) {
+  constructor(readonly budgetMb: number) {
     if (!Number.isInteger(budgetMb) || budgetMb <= 0) {
       throw new Error(`Memory admission budget must be a positive integer MiB value: ${budgetMb}`);
     }
-    const scheduledAgingMs = options.scheduledAgingMs ?? SCHEDULED_PRIORITY_AGING_MS;
-    if (!Number.isInteger(scheduledAgingMs) || scheduledAgingMs < 0) {
-      throw new Error(`Scheduled priority aging must be a non-negative integer millisecond value: ${scheduledAgingMs}`);
-    }
-    this.scheduledAgingMs = scheduledAgingMs;
-    this.now = options.now ?? Date.now;
   }
 
   get reservedMb(): number {
@@ -86,7 +68,9 @@ export class MemoryAdmissionController<T> {
     }
     if (this.queuedIds.has(id)) {
       const entry = this.queue.find((queued) => queued.id === id)!;
-      entry.priority = priority;
+      // A task retry must not demote a session that an operator has already
+      // promoted by sending an interactive message into the same session.
+      if (priority === 'interactive') entry.priority = priority;
       if (this.tryAdmit(id)) {
         return { status: 'admitted', budgetMb: this.budgetMb, requestMb };
       }
@@ -99,7 +83,6 @@ export class MemoryAdmissionController<T> {
       requestMb,
       payload,
       priority,
-      enqueuedAt: this.now(),
       sequence: this.nextSequence++,
     });
     this.queuedIds.add(id);
@@ -152,16 +135,14 @@ export class MemoryAdmissionController<T> {
   }
 
   private orderedQueue(): QueuedRequest<T>[] {
-    const now = this.now();
     return [...this.queue].sort((a, b) => {
-      const priorityDelta = this.effectivePriority(b, now) - this.effectivePriority(a, now);
+      const priorityDelta = this.priorityValue(b) - this.priorityValue(a);
       return priorityDelta || a.sequence - b.sequence;
     });
   }
 
-  private effectivePriority(entry: QueuedRequest<T>, now: number): number {
-    if (entry.priority === 'interactive') return 1;
-    return now - entry.enqueuedAt >= this.scheduledAgingMs ? 1 : 0;
+  private priorityValue(entry: QueuedRequest<T>): number {
+    return entry.priority === 'interactive' ? 1 : 0;
   }
 
   private removeQueued(id: string): void {

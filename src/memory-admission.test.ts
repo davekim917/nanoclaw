@@ -87,20 +87,25 @@ describe('MemoryAdmissionController', () => {
     expect(admission.isQueued('scheduled-large')).toBe(true);
   });
 
-  it('ages scheduled work into the interactive class to prevent starvation', () => {
-    let now = 0;
-    const admission = new MemoryAdmissionController<string>(4096, {
-      now: () => now,
-      scheduledAgingMs: 1000,
-    });
+  it('keeps genuine interactive work ahead of older scheduled work', () => {
+    const admission = new MemoryAdmissionController<string>(4096);
     admission.request('active', 4096, 'active');
     admission.request('scheduled', 4096, 'scheduled', 'scheduled');
-    now = 500;
     admission.request('interactive', 4096, 'interactive', 'interactive');
 
-    now = 1001;
-    expect(admission.release('active')).toEqual(['scheduled']);
-    expect(admission.isQueued('interactive')).toBe(true);
+    expect(admission.release('active')).toEqual(['interactive']);
+    expect(admission.isQueued('scheduled')).toBe(true);
+  });
+
+  it('does not demote an interactive session when a scheduled retry arrives', () => {
+    const admission = new MemoryAdmissionController<string>(4096);
+    admission.request('active', 4096, 'active');
+    admission.request('same-session', 4096, 'same-session', 'interactive');
+    admission.request('same-session', 4096, 'same-session', 'scheduled');
+    admission.request('scheduled', 4096, 'scheduled', 'scheduled');
+
+    expect(admission.release('active')).toEqual(['same-session']);
+    expect(admission.isQueued('scheduled')).toBe(true);
   });
 
   it('test_memory_admission_rejects_request_above_budget', () => {

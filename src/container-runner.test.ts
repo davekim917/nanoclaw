@@ -16,6 +16,7 @@ import {
   reconcileWorkgroupAtSpawn,
   resolveMnemonStore,
 } from './container-runner.js';
+import { formatMemoryMb, resolveContainerResources } from './container-resources.js';
 import { mergeWorkgroupAndGroupSecrets } from './onecli-secrets.js';
 import { getProviderContainerConfig } from './providers/provider-container-registry.js';
 
@@ -44,17 +45,20 @@ describe('resolveProviderName', () => {
 });
 
 describe('dockerResourceLimitArgs', () => {
-  it('adds install-wide default resource ceilings', () => {
-    expect(dockerResourceLimitArgs()).toEqual([
+  it('adds the configured install-wide resource ceilings', () => {
+    const configured = resolveContainerResources();
+    const expected = [
       '--memory',
-      '3g',
+      formatMemoryMb(configured.memory.limitMb),
       '--memory-reservation',
-      '3g',
+      formatMemoryMb(configured.memory.requestMb),
       '--memory-swap',
-      '3g',
-      '--pids-limit',
-      '512',
-    ]);
+      formatMemoryMb(configured.memory.memorySwapLimitMb),
+    ];
+    if (configured.cpus !== undefined) expected.push('--cpus', String(configured.cpus));
+    expected.push('--pids-limit', String(configured.pidsLimit));
+
+    expect(dockerResourceLimitArgs()).toEqual(expected);
   });
 
   it('test_docker_resource_args_apply_group_override_once', () => {

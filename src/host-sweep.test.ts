@@ -29,6 +29,7 @@ import {
   pruneIdleThreadArtifacts,
   pruneSteerIdempotency,
   shouldCloseTaskSession,
+  shouldReapIdleTaskContainer,
 } from './host-sweep.js';
 import { getDb } from './db/connection.js';
 import type { Session } from './types.js';
@@ -1903,5 +1904,26 @@ describe('shouldCloseTaskSession', () => {
   it('never touches non-task sessions', () => {
     expect(shouldCloseTaskSession('telegram:12345', false, 0)).toBe(false);
     expect(shouldCloseTaskSession(null, false, 0)).toBe(false);
+  });
+});
+
+describe('shouldReapIdleTaskContainer', () => {
+  it('reaps an idle scheduled-task container with no claimed or due work', () => {
+    expect(shouldReapIdleTaskContainer('system:tasks:task-1', 0, 0, 'idle')).toBe(true);
+  });
+
+  it('keeps a scheduled-task container while work is due or claimed', () => {
+    expect(shouldReapIdleTaskContainer('system:tasks:task-1', 1, 0, 'idle')).toBe(false);
+    expect(shouldReapIdleTaskContainer('system:tasks:task-1', 0, 1, 'idle')).toBe(false);
+  });
+
+  it('keeps a scheduled-task container while its provider is active or unknown', () => {
+    expect(shouldReapIdleTaskContainer('system:tasks:task-1', 0, 0, 'active')).toBe(false);
+    expect(shouldReapIdleTaskContainer('system:tasks:task-1', 0, 0, null)).toBe(false);
+  });
+
+  it('never reaps an interactive session through the scheduled-task policy', () => {
+    expect(shouldReapIdleTaskContainer('discord:guild:channel:thread', 0, 0, 'idle')).toBe(false);
+    expect(shouldReapIdleTaskContainer(null, 0, 0, 'idle')).toBe(false);
   });
 });
