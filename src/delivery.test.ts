@@ -271,6 +271,219 @@ describe('deliverSessionMessages — concurrent invocations', () => {
     expect(edit.messageId).toBe('plat-status-2'); // Edits turn-2's message.
   });
 
+  it.each(['discord', 'discord-codex'] as const)(
+    'posts and tracks a fresh %s status after edit error 30046',
+    async (channelType) => {
+      createAgentGroup({
+        id: 'ag-1',
+        name: 'Test Agent',
+        folder: 'test-agent',
+        agent_provider: null,
+        created_at: now(),
+      });
+      createMessagingGroup({
+        id: 'mg-1',
+        channel_type: channelType,
+        platform_id: 'discord:guild-1:channel-1',
+        name: 'Test Discord Thread',
+        is_group: 1,
+        unknown_sender_policy: 'public',
+        created_at: now(),
+      });
+      const { session } = resolveSession('ag-1', 'mg-1', 'thread-1', 'per-thread');
+
+      type DeliverCall = { operation?: string; messageId?: string; text?: string };
+      const calls: DeliverCall[] = [];
+      const deletes: string[] = [];
+      let freshPosts = 0;
+      let rejectedOldEdit = false;
+      setDeliveryAdapter({
+        async deliver(_channelType, _platformId, _threadId, _kind, content) {
+          const parsed = JSON.parse(content) as DeliverCall;
+          calls.push(parsed);
+          if (parsed.operation === 'edit') {
+            if (!rejectedOldEdit) {
+              rejectedOldEdit = true;
+              throw new Error(
+                'NetworkError: Discord API error: 429 {"message":"Maximum number of edits to messages older than 1 hour reached","code":30046}',
+              );
+            }
+            return;
+          }
+          freshPosts++;
+          return `status-${freshPosts}`;
+        },
+        async deleteMessage(_channelType, _platformId, _threadId, messageId) {
+          deletes.push(messageId);
+        },
+      });
+
+      insertOutboundKind(
+        'ag-1',
+        session.id,
+        'status-1',
+        'status',
+        channelType,
+        'discord:guild-1:channel-1',
+        { text: 'first' },
+        'thread-1',
+        'turn-1',
+      );
+      await deliverSessionMessages(session);
+
+      insertOutboundKind(
+        'ag-1',
+        session.id,
+        'status-2',
+        'status',
+        channelType,
+        'discord:guild-1:channel-1',
+        { text: 'second' },
+        'thread-1',
+        'turn-1',
+      );
+      await deliverSessionMessages(session);
+
+      expect(calls).toHaveLength(3);
+      expect(calls[1]).toMatchObject({ operation: 'edit', messageId: 'status-1', text: 'second' });
+      expect(calls[2]).toEqual({ text: 'second' });
+      expect(deletes).toEqual(['status-1']);
+
+      insertOutboundKind(
+        'ag-1',
+        session.id,
+        'status-3',
+        'status',
+        channelType,
+        'discord:guild-1:channel-1',
+        { text: 'third' },
+        'thread-1',
+        'turn-1',
+      );
+      await deliverSessionMessages(session);
+
+      expect(calls[3]).toMatchObject({ operation: 'edit', messageId: 'status-2', text: 'third' });
+      const inDb = openInboundDb('ag-1', session.id);
+      const delivered = getDeliveredIds(inDb);
+      inDb.close();
+      expect(delivered.has('status-2')).toBe(true);
+      expect(delivered.has('status-3')).toBe(true);
+    },
+  );
+
+  it('preserves status order when a Discord 30046 replacement post fails transiently', async () => {
+    createAgentGroup({
+      id: 'ag-1',
+      name: 'Test Agent',
+      folder: 'test-agent',
+      agent_provider: null,
+      created_at: now(),
+    });
+    createMessagingGroup({
+      id: 'mg-1',
+      channel_type: 'discord-codex',
+      platform_id: 'discord:guild-1:channel-1',
+      name: 'Test Discord Thread',
+      is_group: 1,
+      unknown_sender_policy: 'public',
+      created_at: now(),
+    });
+    const { session } = resolveSession('ag-1', 'mg-1', 'thread-1', 'per-thread');
+
+    type DeliverCall = { operation?: string; messageId?: string; text?: string };
+    const calls: DeliverCall[] = [];
+    const deletes: string[] = [];
+    let postCount = 0;
+    let oldEditRejected = false;
+    let replacementPostRejected = false;
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, _threadId, _kind, content) {
+        const parsed = JSON.parse(content) as DeliverCall;
+        calls.push(parsed);
+        if (parsed.operation === 'edit' && parsed.messageId === 'status-1' && !oldEditRejected) {
+          oldEditRejected = true;
+          throw new Error(
+            'NetworkError: Discord API error: 429 {"message":"Maximum number of edits to messages older than 1 hour reached","code":30046}',
+          );
+        }
+        if (!parsed.operation && parsed.text === 'second' && !replacementPostRejected) {
+          replacementPostRejected = true;
+          throw new Error('transient Discord post failure');
+        }
+        if (!parsed.operation) return `status-${++postCount}`;
+      },
+      async deleteMessage(_channelType, _platformId, _threadId, messageId) {
+        deletes.push(messageId);
+      },
+    });
+
+    insertOutboundKind(
+      'ag-1',
+      session.id,
+      'status-1',
+      'status',
+      'discord-codex',
+      'discord:guild-1:channel-1',
+      { text: 'first' },
+      'thread-1',
+      'turn-1',
+    );
+    await deliverSessionMessages(session);
+
+    insertOutboundKind(
+      'ag-1',
+      session.id,
+      'status-2',
+      'status',
+      'discord-codex',
+      'discord:guild-1:channel-1',
+      { text: 'second' },
+      'thread-1',
+      'turn-1',
+    );
+    insertOutboundKind(
+      'ag-1',
+      session.id,
+      'status-3',
+      'status',
+      'discord-codex',
+      'discord:guild-1:channel-1',
+      { text: 'third' },
+      'thread-1',
+      'turn-1',
+    );
+
+    await deliverSessionMessages(session);
+
+    expect(calls).toEqual([
+      { text: 'first' },
+      { operation: 'edit', messageId: 'status-1', text: 'second' },
+      { text: 'second' },
+    ]);
+    expect(deletes).toEqual([]);
+    let inDb = openInboundDb('ag-1', session.id);
+    let delivered = getDeliveredIds(inDb);
+    inDb.close();
+    expect(delivered.has('status-2')).toBe(false);
+    expect(delivered.has('status-3')).toBe(false);
+
+    await deliverSessionMessages(session);
+
+    expect(calls).toEqual([
+      { text: 'first' },
+      { operation: 'edit', messageId: 'status-1', text: 'second' },
+      { text: 'second' },
+      { text: 'second' },
+      { operation: 'edit', messageId: 'status-2', text: 'third' },
+    ]);
+    expect(deletes).toEqual(['status-1']);
+    inDb = openInboundDb('ag-1', session.id);
+    delivered = getDeliveredIds(inDb);
+    inDb.close();
+    expect(delivered.has('status-2')).toBe(true);
+    expect(delivered.has('status-3')).toBe(true);
+  });
+
   it('threads the messaging-group instance through status delivery and the orphan delete', async () => {
     // Multi-instance install: a messaging_groups row whose `instance` differs
     // from its `channel_type` (two bots of the same platform). The status post

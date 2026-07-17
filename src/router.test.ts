@@ -117,6 +117,7 @@ import {
 import { getMessagingGroupWithAgentCount, getMessagingGroupAgents } from './db/messaging-groups.js';
 import { writeSessionMessage, writeOutboundDirect, resolveSession } from './session-manager.js';
 import { wakeContainer } from './container-runner.js';
+import { getSession } from './db/sessions.js';
 import { isAnyAdmin } from './modules/permissions/db/user-roles.js';
 import { registerInterceptHandler, clearInterceptHandlers } from './command-gate.js';
 import type { ChannelAdapter, InboundEvent } from './channels/adapter.js';
@@ -266,26 +267,27 @@ describe('C2: pre-fanout intercept dispatch', () => {
       agent_provider: null,
       created_at: new Date().toISOString(),
     });
-    vi.mocked(resolveSession).mockReturnValue({
-      session: {
-        id: 's-1',
-        agent_group_id: 'ag-1',
-        messaging_group_id: 'mg-1',
-        thread_id: null,
-        agent_provider: null,
-        status: 'active',
-        container_status: 'idle',
-        last_active: null,
-        created_at: new Date().toISOString(),
-      },
-      created: true,
-    });
+    const session = {
+      id: 's-1',
+      agent_group_id: 'ag-1',
+      messaging_group_id: 'mg-1',
+      thread_id: null,
+      agent_provider: null,
+      status: 'active' as const,
+      container_status: 'idle' as const,
+      last_active: null,
+      created_at: new Date().toISOString(),
+    };
+    vi.mocked(resolveSession).mockReturnValue({ session, created: true });
+    vi.mocked(getSession).mockReturnValue(session);
+    vi.mocked(wakeContainer).mockResolvedValue(false);
 
     const event = makeChatEvent('hello world');
     await routeInbound(event);
 
     // Normal path: writeSessionMessage called (fan-out ran)
     expect(writeSessionMessage).toHaveBeenCalledOnce();
+    expect(wakeContainer).toHaveBeenCalledWith(session, 'interactive');
   });
 
   it('test_routeInbound_intercept_filter_drops', async () => {

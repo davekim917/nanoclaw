@@ -81,7 +81,7 @@ import {
   writeSessionRouting,
 } from './session-manager.js';
 import { assertStorageAdmission } from './storage-manager.js';
-import { MemoryAdmissionController } from './memory-admission.js';
+import { MemoryAdmissionController, type MemoryAdmissionPriority } from './memory-admission.js';
 import type { AgentGroup, Session } from './types.js';
 
 export const DATAFOLD_MCP_SERVER = {
@@ -422,7 +422,7 @@ export function resolveMnemonStore(
  * its next tick. Callers that care (e.g. the router's typing indicator)
  * can branch on the boolean.
  */
-export function wakeContainer(session: Session): Promise<boolean> {
+export function wakeContainer(session: Session, priority: MemoryAdmissionPriority = 'interactive'): Promise<boolean> {
   if (containerShutdownInProgress) {
     log.debug('Container wake ignored — host shutdown in progress', { sessionId: session.id });
     return Promise.resolve(false);
@@ -454,11 +454,6 @@ export function wakeContainer(session: Session): Promise<boolean> {
   }
 
   const admission = getMemoryAdmission();
-  if (admission.isQueued(session.id)) {
-    log.debug('Container wake already queued for memory', { sessionId: session.id });
-    return Promise.resolve(false);
-  }
-
   const agentGroup = getAgentGroup(session.agent_group_id);
   if (!agentGroup) {
     log.error('Container wake rejected — agent group not found', {
@@ -479,7 +474,12 @@ export function wakeContainer(session: Session): Promise<boolean> {
     return Promise.resolve(false);
   }
 
-  const decision = admission.request(session.id, effectiveResources.memory.requestMb, session);
+  // Priority is part of the atomic admission decision. A task-only wake must
+  // never enter as interactive and be demoted afterward: it could otherwise
+  // reserve free memory and bypass an older scheduled head before demotion.
+  // Re-requesting an already queued session updates its class and returns the
+  // real admission/spawn outcome to the caller.
+  const decision = admission.request(session.id, effectiveResources.memory.requestMb, session, priority);
   if (decision.status === 'rejected') {
     log.error('Container wake rejected — memory request exceeds host budget', {
       sessionId: session.id,
@@ -497,6 +497,7 @@ export function wakeContainer(session: Session): Promise<boolean> {
       budgetMb: decision.budgetMb,
       reservedMb: admission.reservedMb,
       position: decision.position,
+      priority,
     });
     return Promise.resolve(false);
   }

@@ -197,6 +197,27 @@ export function countDueMessages(db: Database.Database): number {
 }
 
 /**
+ * Priority for a session wake based on the work that is due right now.
+ * A wake is scheduled only when every due triggering row is a scheduled-task
+ * row. Any due chat, system notification, approval, or agent message makes
+ * the wake interactive. No due rows defaults to interactive, which is the
+ * fail-safe classification for callers racing with another writer.
+ */
+export function getDueWakePriority(db: Database.Database): 'interactive' | 'scheduled' {
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS count,
+              MAX(CASE WHEN kind <> 'task' THEN 1 ELSE 0 END) AS has_interactive
+         FROM messages_in
+        WHERE status = 'pending'
+          AND trigger = 1
+          AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))`,
+    )
+    .get() as { count: number; has_interactive: number | null };
+  return row.count > 0 && row.has_interactive === 0 ? 'scheduled' : 'interactive';
+}
+
+/**
  * Mark long-pending NON-RECURRING rows as 'expired' so sweep stops re-waking
  * sessions on one-shot messages that have sat unprocessed for a day or more.
  *

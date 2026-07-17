@@ -29,7 +29,7 @@ import { pauseTypingRefreshAfterDelivery, setTypingAdapter } from './modules/typ
 import { flagNeedsInput, getTaskByChildSession } from './modules/orchestrator-dispatch/db/tasks.js';
 import { emitDashboardEvent, emitSessionEvent } from './dashboard/api/events.js';
 import type { OutboundFile } from './channels/adapter.js';
-import type { Session } from './types.js';
+import { isChannelVariant, type Session } from './types.js';
 
 /**
  * A session is a spawn-task child when a row in the `tasks` table names it
@@ -86,8 +86,29 @@ interface StatusTrack {
    *  💭 orphan undeleted and the next turn editing it in place above the
    *  user's newer message). Null only when the turn had no inbound anchor. */
   inReplyTo: string | null;
+  /** Discord rejected further edits to this message with code 30046. Keep
+   *  the route until a replacement post succeeds, but never retry the doomed
+   *  edit while the replacement is pending. */
+  editExhausted?: boolean;
 }
 const statusTracking = new Map<string, StatusTrack>();
+
+/** Discord refuses further edits after an old message reaches its edit cap. */
+function isDiscordStatusEditLimitError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const code = (err as { code?: unknown }).code;
+  if (code === 30046 || code === '30046') return true;
+  const message = (err as { message?: unknown }).message;
+  return (
+    typeof message === 'string' &&
+    /\b30046\b/.test(message) &&
+    /discord api error|maximum number of edits to messages older than 1 hour/i.test(message)
+  );
+}
+
+function isDiscordChannelType(channelType: string): boolean {
+  return channelType === 'discord' || isChannelVariant(channelType, 'discord');
+}
 
 /**
  * Per-session anchor for threading a turn's multiple channel-root messages.
@@ -423,6 +444,11 @@ async function drainSession(session: Session): Promise<void> {
             maxAttempts: MAX_DELIVERY_ATTEMPTS,
             err,
           });
+          // Preserve outbound ordering across retries. Continuing would let a
+          // newer status/chat overtake this row; if the failed row later
+          // retries, it can overwrite newer progress or appear after the final
+          // answer. The next poll resumes from this oldest undelivered row.
+          break;
         }
       }
     }
@@ -622,8 +648,10 @@ async function deliverMessage(
     }
 
     const existing = statusTracking.get(session.id);
-    let outbound = scrubSecrets(msg.content);
-    if (existing) {
+    const freshOutbound = scrubSecrets(msg.content);
+    const replacingExhaustedStatus = existing?.editExhausted === true;
+    let outbound = freshOutbound;
+    if (existing && !replacingExhaustedStatus) {
       const parsed = JSON.parse(outbound);
       outbound = JSON.stringify({
         operation: 'edit',
@@ -631,16 +659,45 @@ async function deliverMessage(
         text: parsed.text,
       });
     }
-    const platformMsgId = await deliveryAdapter.deliver(
-      msg.channel_type,
-      msg.platform_id,
-      msg.thread_id,
-      msg.kind,
-      outbound,
-      undefined,
-      deliverInstance,
-    );
-    if (platformMsgId && !existing) {
+    let mode: 'edit' | 'post' | 'repost' = existing ? (replacingExhaustedStatus ? 'repost' : 'edit') : 'post';
+    let replacedStatus: StatusTrack | undefined = replacingExhaustedStatus ? existing : undefined;
+    let platformMsgId: string | undefined;
+    try {
+      platformMsgId = await deliveryAdapter.deliver(
+        msg.channel_type,
+        msg.platform_id,
+        msg.thread_id,
+        msg.kind,
+        outbound,
+        undefined,
+        deliverInstance,
+      );
+    } catch (err) {
+      if (!existing || !isDiscordChannelType(msg.channel_type) || !isDiscordStatusEditLimitError(err)) throw err;
+
+      // Discord code 30046 makes further edits to this message useless. Keep
+      // the old status visible and tracked until its replacement posts, but
+      // mark the edit path exhausted so a retry goes straight to a fresh post.
+      existing.editExhausted = true;
+      platformMsgId = await deliveryAdapter.deliver(
+        msg.channel_type,
+        msg.platform_id,
+        msg.thread_id,
+        msg.kind,
+        freshOutbound,
+        undefined,
+        deliverInstance,
+      );
+      if (!platformMsgId) {
+        throw new Error('Discord replacement status post returned no message id', { cause: err });
+      }
+      mode = 'repost';
+      replacedStatus = existing;
+    }
+    if (mode === 'repost' && !platformMsgId) {
+      throw new Error('Discord replacement status post returned no message id');
+    }
+    if (platformMsgId && mode !== 'edit') {
       // Pin the route at post-time. The cleanup branch on chat delivery uses
       // *this* route to delete the orphan, NOT the chat-final's route — the
       // agent's send_message MCP tool can target a different channel/thread,
@@ -655,11 +712,35 @@ async function deliverMessage(
         inReplyTo: msg.in_reply_to,
       });
     }
+    if (replacedStatus && platformMsgId) {
+      if (deliveryAdapter.deleteMessage) {
+        try {
+          await deliveryAdapter.deleteMessage(
+            replacedStatus.channelType,
+            replacedStatus.platformId,
+            replacedStatus.threadId,
+            replacedStatus.messageId,
+            replacedStatus.instance,
+          );
+        } catch (deleteErr) {
+          log.warn('Failed to delete Discord status after edit cap — replacement remains visible', {
+            sessionId: session.id,
+            messageId: replacedStatus.messageId,
+            err: deleteErr instanceof Error ? deleteErr.message : String(deleteErr),
+          });
+        }
+      }
+      log.warn('Discord status edit cap reached — posted fresh status', {
+        sessionId: session.id,
+        replacedMessageId: replacedStatus.messageId,
+        platformMsgId,
+      });
+    }
     log.info('Status delivered', {
       id: msg.id,
       sessionId: session.id,
-      mode: existing ? 'edit' : 'post',
-      platformMsgId: platformMsgId ?? existing?.messageId,
+      mode,
+      platformMsgId: platformMsgId ?? (mode === 'edit' ? existing?.messageId : undefined),
     });
     return { platformMsgId: platformMsgId ?? undefined };
   }

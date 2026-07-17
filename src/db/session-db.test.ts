@@ -13,6 +13,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 import {
   ensureSchema,
   expireStalePending,
+  getDueWakePriority,
   getInboundSourceSessionId,
   migrateMessagesInTable,
   sessionInboundHasMessage,
@@ -27,6 +28,73 @@ const DB_PATH = path.join(TEST_DIR, 'inbound.db');
 
 afterEach(() => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+});
+
+describe('getDueWakePriority', () => {
+  function makeInboundDb(): Database.Database {
+    const db = new Database(':memory:');
+    db.pragma('journal_mode = DELETE');
+    db.exec(INBOUND_SCHEMA);
+    return db;
+  }
+
+  function insertDueRow(
+    db: Database.Database,
+    id: string,
+    kind: string,
+    options: { trigger?: 0 | 1; processAfter?: string | null } = {},
+  ): void {
+    const seq = (db.prepare('SELECT COALESCE(MAX(seq), 0) AS m FROM messages_in').get() as { m: number }).m + 2;
+    db.prepare(
+      `INSERT INTO messages_in
+         (id, seq, kind, timestamp, status, content, process_after, series_id, trigger)
+       VALUES (?, ?, ?, ?, 'pending', '{}', ?, ?, ?)`,
+    ).run(id, seq, kind, new Date().toISOString(), options.processAfter ?? null, id, options.trigger ?? 1);
+  }
+
+  it('classifies scheduled-only due work as scheduled', () => {
+    const db = makeInboundDb();
+    try {
+      insertDueRow(db, 'task-1', 'task');
+      expect(getDueWakePriority(db)).toBe('scheduled');
+    } finally {
+      db.close();
+    }
+  });
+
+  it('classifies any due non-task message as interactive', () => {
+    const db = makeInboundDb();
+    try {
+      insertDueRow(db, 'task-1', 'task');
+      insertDueRow(db, 'chat-1', 'chat-sdk');
+      expect(getDueWakePriority(db)).toBe('interactive');
+    } finally {
+      db.close();
+    }
+  });
+
+  it('ignores future and non-triggering chat context', () => {
+    const db = makeInboundDb();
+    try {
+      insertDueRow(db, 'task-1', 'task');
+      insertDueRow(db, 'future-chat', 'chat', {
+        processAfter: new Date(Date.now() + 60_000).toISOString(),
+      });
+      insertDueRow(db, 'context-chat', 'chat-sdk', { trigger: 0 });
+      expect(getDueWakePriority(db)).toBe('scheduled');
+    } finally {
+      db.close();
+    }
+  });
+
+  it('defaults to interactive when no work is due', () => {
+    const db = makeInboundDb();
+    try {
+      expect(getDueWakePriority(db)).toBe('interactive');
+    } finally {
+      db.close();
+    }
+  });
 });
 
 describe('migrateMessagesInTable', () => {

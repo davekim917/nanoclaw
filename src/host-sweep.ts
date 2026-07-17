@@ -41,6 +41,7 @@ import {
   deleteOrphanProcessingClaims,
   expireStalePending,
   getContainerState,
+  getDueWakePriority,
   getMessageForRetry,
   getProcessingClaims,
   markMessageFailed,
@@ -621,10 +622,17 @@ async function sweepSession(session: Session): Promise<void> {
     const dueCount = countDueMessages(inDb);
     let justWoke = false;
     if (dueCount > 0 && !isContainerRunning(session.id)) {
-      log.info('Waking container for due messages', { sessionId: session.id, count: dueCount });
+      const wakePriority = getDueWakePriority(inDb);
+      log.info('Waking container for due messages', {
+        sessionId: session.id,
+        count: dueCount,
+        priority: wakePriority,
+      });
       // wakeContainer never throws — transient spawn failures (OneCLI down,
       // etc.) return false and leave messages pending for the next tick.
-      await wakeContainer(session);
+      // Classification is passed into the atomic admission decision so a
+      // scheduled wake can never reserve memory as interactive first.
+      await wakeContainer(session, wakePriority);
       justWoke = true;
     }
 

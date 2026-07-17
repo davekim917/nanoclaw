@@ -1119,7 +1119,10 @@ async function deliverToAgent(
     }
     const freshSession = getSession(session.id);
     if (freshSession) {
-      const woke = await wakeContainer(freshSession);
+      // Priority is applied atomically inside wakeContainer. If this session
+      // was queued for scheduled work, the returned promise now represents
+      // the real promotion/admission result rather than a stale queued=false.
+      const woke = await wakeContainer(freshSession, 'interactive');
       // wakeContainer never throws — it returns false on transient spawn
       // failure (host-sweep retries). Stop the typing indicator we just
       // started so it doesn't leak; the inbound row stays pending.
