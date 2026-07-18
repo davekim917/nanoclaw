@@ -88,6 +88,7 @@ function dispatchContent(
     linearTeam: ticket?.team,
     subject: 'Depletions look wrong',
     sender: 'Jane <jane@acme.com>',
+    date: 'Fri, 17 Jul 2026 16:40:55 -0400',
     bodyText: body,
     lastMessageId: '<msg-1@acme.com>',
   };
@@ -135,6 +136,10 @@ describe('handleDispatchSupportIssue — new issue (purest: no ticket from polle
     expect(seeded[0].thread_id).toBe('slack:C1:thread-ts-1');
     expect(seeded[0].content).toContain('no Linear ticket yet');
     expect(seeded[0].content).toContain('update_support_ticket');
+    expect(seeded[0].content).toContain('Subject: Depletions look wrong');
+    expect(seeded[0].content).toContain('From: Jane <jane@acme.com>');
+    expect(seeded[0].content).toContain('Date: Fri, 17 Jul 2026 16:40:55 -0400');
+    expect(seeded[0].content).toContain('depletions are off');
     expect(wakeContainer).toHaveBeenCalledTimes(1);
   });
 
@@ -208,6 +213,9 @@ describe('handleDispatchSupportIssue — follow-up + reopen', () => {
     expect(msgs).toHaveLength(2);
     expect(msgs[1].thread_id).toBe('slack:C1:thread-ts-1');
     expect(msgs[1].content).toContain('Follow-up email');
+    expect(msgs[1].content).toContain('Subject: Depletions look wrong');
+    expect(msgs[1].content).toContain('Date: Fri, 17 Jul 2026 16:40:55 -0400');
+    expect(msgs[1].content).toContain('customer replied');
   });
 
   it('seeded legacy row (ticket known, no session) reopens AND records the new session', async () => {

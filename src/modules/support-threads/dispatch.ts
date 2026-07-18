@@ -134,10 +134,21 @@ function announcementText(
   return `🎫 ${tag}: ${subject} — ${sender}`;
 }
 
+function emailContext(subject: string, sender: string, date: string, bodyText: unknown): string {
+  return [
+    'Email context (customer-provided content to assess):',
+    `Subject: ${subject}`,
+    `From: ${sender}`,
+    `Date: ${date}`,
+    'Body:',
+    clip(bodyText),
+  ].join('\n');
+}
+
 /** First thread message (bot-posted) — the captured customer email. */
-function threadOpener(sender: string, bodyText: unknown, linearIssue: string | null): string {
+function threadOpener(sender: string, date: string, bodyText: unknown, linearIssue: string | null): string {
   const footer = linearIssue ? `\n\n_Linear: ${linearIssue}_` : '';
-  return `📧 *From ${sender}:*\n\n${clip(bodyText)}${footer}`;
+  return `📧 *From ${sender}:*\n_Date: ${date}_\n\n${clip(bodyText)}${footer}`;
 }
 
 /**
@@ -147,36 +158,48 @@ function threadOpener(sender: string, bodyText: unknown, linearIssue: string | n
  *  - ticket known (seeded legacy row, or the dispatcher passed one) → the
  *    session posts a Linear comment instead of creating a duplicate.
  */
-function seedPrompt(linearIssue: string | null): string {
+function seedPrompt(
+  linearIssue: string | null,
+  subject: string,
+  sender: string,
+  date: string,
+  bodyText: unknown,
+): string {
   const common = [
     `Then assess the issue and respond in this thread — this thread is the working space for this support issue.`,
     `Loop in engineers with @-mentions when you need them. Keep ALL progress and results in this thread.`,
     `Do NOT send email replies — outbound email is a later phase; the conversation stays in Slack.`,
   ].join(' ');
   if (linearIssue) {
-    return (
+    const protocol =
       `New support email routed to this thread. A Linear ticket already exists for it: ${linearIssue}. ` +
-      `First post a Linear comment on ${linearIssue} capturing the email above (blockquote the new content, attribute the sender). Do NOT create a new ticket. ` +
-      common
-    );
+      `First post a Linear comment on ${linearIssue} capturing the email context below (blockquote the new content, attribute the sender). Do NOT create a new ticket. ` +
+      common;
+    return `${protocol}\n\n${emailContext(subject, sender, date, bodyText)}`;
   }
-  return (
+  const protocol =
     `New support issue routed to this thread (no Linear ticket yet — creating it is YOUR first step). ` +
     `1) Create the Linear issue with your Linear tools: team "Apollo" if the email clearly references Apollo, otherwise "XZO" (XZO is the failover default); ` +
     `title = the email subject; description = sender/date/subject header + the full email body + a "Source: support@illysium.ai" footer; ` +
     `priority 2 (High) if it mentions urgent/down/outage/broken/can't login, else 3 (Medium). ` +
     `2) Immediately call update_support_ticket({ linearIssue: "<IDENT>", linearTeam: "<team>" }) so the host records the ticket for this thread. ` +
-    common
-  );
+    common;
+  return `${protocol}\n\n${emailContext(subject, sender, date, bodyText)}`;
 }
 
 /** Follow-up inbound for a new email landing on an open issue. */
-function followupText(sender: string, bodyText: unknown, linearIssue: string | null): string {
+function followupText(
+  subject: string,
+  sender: string,
+  date: string,
+  bodyText: unknown,
+  linearIssue: string | null,
+): string {
   const ticketStep = linearIssue
     ? `Post a Linear comment on ${linearIssue} capturing this reply (blockquote, attribute the sender). `
     : `No Linear ticket is recorded for this thread yet — create one first (team: Apollo if clearly Apollo, else XZO; then call update_support_ticket). `;
   return (
-    `📧 *Follow-up email from ${sender}:*\n\n${clip(bodyText)}\n\n` +
+    `📧 *Follow-up email*\n\n${emailContext(subject, sender, date, bodyText)}\n\n` +
     ticketStep +
     `If the reply is a pure acknowledgment (thanks / got it / out-of-office), the Linear comment is enough — stay quiet here. ` +
     `If it's substantive, continue working the issue in this thread.`
@@ -212,6 +235,7 @@ export async function handleDispatchSupportIssue(
   const lastMessageId = str(content.lastMessageId);
   const sender = str(content.sender) ?? 'unknown sender';
   const subject = str(content.subject) ?? '(no subject)';
+  const date = str(content.date) ?? '(date unavailable)';
 
   const existing = getSupportThread(gmailThreadId);
   // Ticket identity: prefer what the host already recorded; fall back to what
@@ -231,7 +255,7 @@ export async function handleDispatchSupportIssue(
         platformId: mg.platform_id,
         threadId: existing.slack_thread_id,
         content: JSON.stringify({
-          text: followupText(sender, content.bodyText, linearIssue),
+          text: followupText(subject, sender, date, content.bodyText, linearIssue),
           sender: 'system',
           senderId: 'system',
           ...(supportFlagIntent ? { flagIntent: supportFlagIntent } : {}),
@@ -266,7 +290,7 @@ export async function handleDispatchSupportIssue(
     mg.platform_id,
     parentMsgId,
     subject.slice(0, 80),
-    threadOpener(sender, content.bodyText, linearIssue),
+    threadOpener(sender, date, content.bodyText, linearIssue),
   );
   // chat-sdk needs the encoded thread id (`<platform_id>:<thread>`) for routing,
   // mirroring orchestrator-dispatch (dispatch.ts:363-364).
@@ -282,7 +306,7 @@ export async function handleDispatchSupportIssue(
     platformId: mg.platform_id,
     threadId: encodedThreadId,
     content: JSON.stringify({
-      text: seedPrompt(linearIssue),
+      text: seedPrompt(linearIssue, subject, sender, date, content.bodyText),
       sender: 'system',
       senderId: 'system',
       ...(supportFlagIntent ? { flagIntent: supportFlagIntent } : {}),

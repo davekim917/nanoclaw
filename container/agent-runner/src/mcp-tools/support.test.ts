@@ -25,6 +25,7 @@ describe('dispatch_support_issue tool', () => {
       linearTeam: 'XZO',
       subject: 'help',
       sender: 'a@b.com',
+      date: 'Fri, 17 Jul 2026 16:40:55 -0400',
       bodyText: 'something is broken',
       lastMessageId: '<m1@b.com>',
     });
@@ -36,12 +37,26 @@ describe('dispatch_support_issue tool', () => {
     expect(c.action).toBe('dispatch_support_issue');
     expect(c.gmailThreadId).toBe('gt-1');
     expect(c.linearIssue).toBe('XZO-9');
+    expect(c.date).toBe('Fri, 17 Jul 2026 16:40:55 -0400');
     expect(c.lastMessageId).toBe('<m1@b.com>');
   });
 
   it('rejects a call without gmailThreadId', async () => {
     const res = await dispatchSupportIssue.handler({});
     expect(res.isError).toBe(true);
+    expect(getUndeliveredMessages()).toHaveLength(0);
+  });
+
+  it('rejects a dispatch when required email context is missing', async () => {
+    const res = await dispatchSupportIssue.handler({
+      gmailThreadId: 'gt-1',
+      subject: 'help',
+      sender: 'a@b.com',
+      bodyText: 'something is broken',
+    });
+
+    expect(res.isError).toBe(true);
+    expect(res.content[0]?.text).toContain('date is required');
     expect(getUndeliveredMessages()).toHaveLength(0);
   });
 

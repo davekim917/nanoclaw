@@ -27,7 +27,7 @@ For EACH message:
 2) Pre-flight — is this a real person asking for help with XZO/Apollo (bug, question, access request, follow-up)? If it's vendor marketing, a newsletter, a receipt, a security/login alert, cold sales, a calendar/recruiting notice, or any notification system → SKIP: just label it `bot-ticketed` and move on (no dispatch). When in doubt, look at the From domain.
 
 3) Dispatch — one call per email, new threads AND replies alike:
-   `dispatch_support_issue({ gmailThreadId: "<threadId>", subject: "<subject>", sender: "<from>", bodyText: "<stripped body>", lastMessageId: "<messageIdHeader>" })`
+   `dispatch_support_issue({ gmailThreadId: "<threadId>", subject: "<subject>", sender: "<from>", date: "<date>", bodyText: "<stripped body>", lastMessageId: "<messageIdHeader>" })`
    Do NOT create Linear tickets yourself and do NOT track which threads are ticketed — the host routes the email to its support thread (existing thread for replies, fresh thread otherwise), and the per-issue session handles all Linear work.
 
 4) Label — after the dispatch call returns ok:

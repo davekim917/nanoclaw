@@ -84,6 +84,7 @@ export const dispatchSupportIssue: McpToolDefinition = {
         linearTeam: { type: 'string', description: 'Linear team, only if already known. Usually omit.' },
         subject: { type: 'string', description: 'Email subject (used in the channel announcement + thread title).' },
         sender: { type: 'string', description: 'Email sender (display form, e.g. "Jane Doe <jane@acme.com>").' },
+        date: { type: 'string', description: 'Original email Date header, used in the per-issue ticket context.' },
         bodyText: {
           type: 'string',
           description: 'The cleaned email body (quoted history stripped). Posted into the thread.',
@@ -93,12 +94,15 @@ export const dispatchSupportIssue: McpToolDefinition = {
           description: 'RFC-822 Message-ID header of this email, retained for future reply threading. Optional.',
         },
       },
-      required: ['gmailThreadId'],
+      required: ['gmailThreadId', 'subject', 'sender', 'date', 'bodyText'],
     },
   },
   async handler(args) {
     const gmailThreadId = args.gmailThreadId as string;
     if (!gmailThreadId) return err('gmailThreadId is required');
+    for (const field of ['subject', 'sender', 'date', 'bodyText'] as const) {
+      if (typeof args[field] !== 'string') return err(`${field} is required`);
+    }
 
     await writeSupportAction({
       id: `sys-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -110,6 +114,7 @@ export const dispatchSupportIssue: McpToolDefinition = {
         linearTeam: (args.linearTeam as string) || null,
         subject: (args.subject as string) || null,
         sender: (args.sender as string) || null,
+        date: (args.date as string) || null,
         bodyText: (args.bodyText as string) || null,
         lastMessageId: (args.lastMessageId as string) || null,
       }),
