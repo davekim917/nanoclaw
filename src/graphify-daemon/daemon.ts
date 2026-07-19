@@ -1,12 +1,17 @@
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
-import { mkdir, realpath, rename, rm } from 'node:fs/promises';
+import { mkdir, readdir, realpath, rename, rm } from 'node:fs/promises';
 import { join, posix, relative, sep } from 'node:path';
 
 import Database from 'better-sqlite3';
 import chokidar, { type FSWatcher } from 'chokidar';
 
-import { discoverWorkgroup, type DiscoverWorkgroupOptions, type DiscoveredSource } from '../graphify/discovery.js';
+import {
+  discoverWorkgroup,
+  isGraphifyDefaultExcludedPath,
+  type DiscoverWorkgroupOptions,
+  type DiscoveredSource,
+} from '../graphify/discovery.js';
 import { preprocessDiscoveredSource, type PreprocessedSource } from '../graphify/extractors.js';
 import { WorkgroupGraphStore } from '../graphify/store.js';
 import type {
@@ -126,6 +131,15 @@ function stableSourceId(workgroupId: string, relativePath: string): string {
 }
 function cleanSlug(value: string): string {
   return value.replace(/[^A-Za-z0-9._-]/g, '_');
+}
+
+function sourceExtractionFailure(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return `deterministic extraction failed: ${message}`.slice(0, 1_000);
+}
+
+function isAbortFailure(error: unknown, signal?: AbortSignal): boolean {
+  return Boolean(signal?.aborted) || (error instanceof Error && error.name === 'AbortError');
 }
 
 function mergeBundles(...bundles: Array<ExtractionBundle | undefined>): ExtractionBundle {
@@ -755,6 +769,7 @@ export class WorkgroupGraphDaemon {
     if (this.closing) return;
     const desired = new Set<string>();
     for (const descriptor of descriptors) {
+      const state = this.requireState(descriptor.id);
       for (const root of descriptor.roots) {
         const key = `${descriptor.id}\0${root.absolutePath}`;
         desired.add(key);
@@ -763,6 +778,7 @@ export class WorkgroupGraphDaemon {
           ignoreInitial: true,
           followSymlinks: false,
           awaitWriteFinish: false,
+          ignored: (candidate) => isGraphifyDefaultExcludedPath(root.absolutePath, candidate),
         });
         let debounce: NodeJS.Timeout | undefined;
         watcher.on('all', () => {
@@ -773,6 +789,9 @@ export class WorkgroupGraphDaemon {
             this.queueReconcile(descriptor.id);
           }, this.options.debounceMs ?? 3_000);
           debounce.unref();
+        });
+        watcher.on('error', (error) => {
+          state.lastFailure = `filesystem watcher: ${error instanceof Error ? error.message : String(error)}`;
         });
         this.watchers.set(key, watcher);
       }
@@ -857,8 +876,11 @@ export class WorkgroupGraphDaemon {
     const enrichmentVersion = state.enrichmentVersion;
     const directory = join(this.options.dataDir, 'graphify', 'workgroups', state.descriptor.id);
     const livePath = join(directory, 'index.db');
-    const nextPath = join(directory, `index.next-${hash(randomToken(), state.lastStartedAt)}.db`);
     await mkdir(directory, { recursive: true, mode: 0o700 });
+    for (const entry of await readdir(directory)) {
+      if (entry.startsWith('index.next-')) await rm(join(directory, entry), { force: true });
+    }
+    const nextPath = join(directory, `index.next-${hash(randomToken(), state.lastStartedAt)}.db`);
     let next: WorkgroupGraphStore | undefined;
     try {
       if (!state.cacheLoaded) {
@@ -886,8 +908,15 @@ export class WorkgroupGraphDaemon {
             });
             continue;
           }
-          const preprocessed = await preprocessDiscoveredSource(source);
           const input = this.toInput(source);
+          let preprocessed: PreprocessedSource;
+          try {
+            preprocessed = await preprocessDiscoveredSource(source);
+          } catch (error) {
+            if (isAbortFailure(error, signal)) throw error;
+            sourceStates.push({ source: input, state: 'failed', error: sourceExtractionFailure(error) });
+            continue;
+          }
           const cached = this.enrichments.get(source.id);
           upserts.push({
             source: input,
@@ -1414,12 +1443,18 @@ export class WorkgroupGraphDaemon {
         for (const source of mapped) {
           if (source.state !== 'pending' && source.state !== 'indexed')
             store.markSourceState(this.toInput(source), source.state, generation, source.stateReason);
-          else
-            store.upsertSource(
-              this.toInput(source),
-              deterministicBundle(source, await preprocessDiscoveredSource(source)),
-              generation,
-            );
+          else {
+            try {
+              store.upsertSource(
+                this.toInput(source),
+                deterministicBundle(source, await preprocessDiscoveredSource(source)),
+                generation,
+              );
+            } catch (error) {
+              if (isAbortFailure(error)) throw error;
+              store.markSourceState(this.toInput(source), 'failed', generation, sourceExtractionFailure(error));
+            }
+          }
         }
       }
       store.completeGeneration(generation);

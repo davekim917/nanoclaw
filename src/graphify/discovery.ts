@@ -59,8 +59,25 @@ const EXCLUDED_DIRECTORIES = new Set([
   'build',
   '.next',
   'coverage',
+  'allure-results',
+  'allure-report',
+  'playwright-report',
+  'test-results',
+  '.nyc_output',
   'dbt_packages',
 ]);
+
+/**
+ * Keep filesystem watchers on the same default directory surface as corpus
+ * discovery. Watching excluded package/build caches can consume hundreds of
+ * thousands of inotify entries even though none of those files are indexable.
+ */
+export function isGraphifyDefaultExcludedPath(root: string, candidate: string): boolean {
+  const relativePath = normalizeRelativePath(relative(resolve(root), resolve(candidate)));
+  if (!relativePath || relativePath === '.') return false;
+  if (relativePath === '..' || relativePath.startsWith('../')) return true;
+  return relativePath.split('/').some((segment) => EXCLUDED_DIRECTORIES.has(segment.toLowerCase()));
+}
 
 const CODE_EXTENSIONS = new Set([
   '.asm',

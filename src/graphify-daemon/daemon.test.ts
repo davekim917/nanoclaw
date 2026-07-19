@@ -106,6 +106,53 @@ describe('WorkgroupGraphDaemon', () => {
     await daemon.close();
   });
 
+  it('removes incomplete next-generation databases left by an interrupted process', async () => {
+    const f = fixture();
+    const graphDir = join(f.data, 'graphify', 'workgroups', 'madison');
+    mkdirSync(graphDir, { recursive: true });
+    const staleDb = join(graphDir, 'index.next-interrupted.db');
+    const staleWal = `${staleDb}-wal`;
+    writeFileSync(staleDb, 'partial');
+    writeFileSync(staleWal, 'partial');
+    writeFileSync(join(f.groups, 'madison-agent', 'brief.md'), 'stable knowledge');
+    const daemon = new WorkgroupGraphDaemon({
+      dataDir: f.data,
+      groupsDir: f.groups,
+      centralDbPath: f.central,
+      enableEnrichment: false,
+    });
+    await daemon.refreshCatalog();
+    await daemon.ensureFresh('madison');
+    expect(existsSync(staleDb)).toBe(false);
+    expect(existsSync(staleWal)).toBe(false);
+    expect(existsSync(join(graphDir, 'index.db'))).toBe(true);
+    await daemon.close();
+  });
+
+  it('isolates malformed source extraction without blocking the workgroup generation', async () => {
+    const f = fixture();
+    writeFileSync(join(f.groups, 'madison-agent', 'brief.md'), 'valid strategy knowledge');
+    writeFileSync(join(f.groups, 'madison-agent', 'partial.json'), '{"unfinished":');
+    const daemon = new WorkgroupGraphDaemon({
+      dataDir: f.data,
+      groupsDir: f.groups,
+      centralDbPath: f.central,
+      enableEnrichment: false,
+    });
+    await daemon.refreshCatalog();
+    const status = await daemon.ensureFresh('madison');
+    expect(status.freshness.dirty).toBe(false);
+    expect(status.counts.failed).toBe(1);
+    expect(status.failures).toEqual([
+      expect.objectContaining({
+        relativePath: 'agents/ag-a/partial.json',
+        error: expect.stringContaining('extraction'),
+      }),
+    ]);
+    expect((await daemon.query('madison', 'valid strategy knowledge')).nodes.length).toBeGreaterThan(0);
+    await daemon.close();
+  });
+
   it('canonical semantic entities bridge conversations documents and SQL without stale payload', () => {
     const root = temp();
     const store = new WorkgroupGraphStore(join(root, 'index.db'), 'madison');

@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import { rmSync } from 'node:fs';
 
-import { discoverWorkgroup, readVerifiedSource } from './discovery.js';
+import { discoverWorkgroup, isGraphifyDefaultExcludedPath, readVerifiedSource } from './discovery.js';
 
 const { createReadStreamSpy } = vi.hoisted(() => ({ createReadStreamSpy: vi.fn() }));
 
@@ -40,6 +40,25 @@ afterEach(() => {
 });
 
 describe('discoverWorkgroup', () => {
+  test('test_default_watcher_filter_prunes_package_build_and_tool_caches', () => {
+    const root = '/workspace/group';
+    for (const path of [
+      'node_modules/pkg/index.js',
+      '.pnpm-store/v10/files/aa/blob',
+      'repo/.git/objects/pack',
+      'repo/dist/app.js',
+      'analysis/.cache/result.json',
+      'python/.venv/lib/site.py',
+      'service/allure-results/run-result.json',
+      'web/playwright-report/index.html',
+      'web/test-results/screenshot.png',
+    ]) {
+      expect(isGraphifyDefaultExcludedPath(root, join(root, path))).toBe(true);
+    }
+    expect(isGraphifyDefaultExcludedPath(root, join(root, 'research', 'brief.md'))).toBe(false);
+    expect(isGraphifyDefaultExcludedPath(root, join(root, '.notes', 'decision.md'))).toBe(false);
+  });
+
   test('test_discovery_includes_gitignored_and_untracked_clone_files', async () => {
     const root = makeRoot();
     put(root, 'repos/analytics/.git/HEAD', 'ref: refs/heads/main');
