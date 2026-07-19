@@ -1,0 +1,40 @@
+{
+  "status": "COMPLETE",
+  "runs": 36,
+  "provenance": {
+    "candidateImageId": "sha256:2e08da6285983d0891e8bc0e6afab385e5d83ceb93ccef032e47248acac059c3",
+    "codexCliVersion": "codex-cli 0.144.3",
+    "sourceSnapshotFingerprint": "f4d0983b79ad2affba6a734d45467bb14090089e3e3eda97f9f2d9ba4990e0bd",
+    "sourceSnapshotFileCount": 1243,
+    "repositoryCommit": "e2aca6aeb7a8d44f75b7b0386c1114d65b2f758e",
+    "requestedModel": "gpt-5.6-sol",
+    "reasoningEffort": "xhigh",
+    "instructionIsolation": "instruction-free-eval-root-with-nested-repo",
+    "privateProtocolSha256": "33ccf2dfc149851bf0ee8f6b12126af93dce260bb1fba5f59e7b566531e87282",
+    "evaluatorSourceSha256": "40abd00be4305f47899c4f78543de7a098e864813e168ac4b42ce043595015a5"
+  },
+  "validation": {
+    "passed": false,
+    "failures": [
+      "container-resource-resolution:graphify:1: Graphify arm did not invoke the public Graphify CLI",
+      "container-resource-resolution:graphify:2: Graphify arm did not invoke the public Graphify CLI",
+      "container-resource-resolution:graphify:3: Graphify arm did not invoke the public Graphify CLI",
+      "graphify-container-contract:graphify:1: Graphify arm did not invoke the public Graphify CLI",
+      "graphify-container-contract:graphify:2: Graphify arm did not invoke the public Graphify CLI",
+      "graphify-container-contract:graphify:3: Graphify arm did not invoke the public Graphify CLI",
+      "graphify-container-contract:source-only:3: auditable source-navigation contract violation",
+      "graphify-cache-identity:graphify:1: Graphify arm did not invoke the public Graphify CLI",
+      "graphify-cache-identity:graphify:2: Graphify arm did not invoke the public Graphify CLI",
+      "graphify-cache-identity:graphify:3: Graphify arm did not invoke the public Graphify CLI",
+      "memory-admission-priority:graphify:1: Graphify arm did not invoke the public Graphify CLI",
+      "memory-admission-priority:graphify:2: Graphify arm did not invoke the public Graphify CLI",
+      "memory-admission-priority:graphify:3: Graphify arm did not invoke the public Graphify CLI",
+      "command-gate-routing:graphify:1: Graphify arm did not invoke the public Graphify CLI",
+      "command-gate-routing:graphify:2: Graphify arm did not invoke the public Graphify CLI",
+      "command-gate-routing:graphify:3: Graphify arm did not invoke the public Graphify CLI",
+      "timezone-conversion-contract:graphify:1: Graphify arm did not invoke the public Graphify CLI",
+      "timezone-conversion-contract:graphify:2: Graphify arm did not invoke the public Graphify CLI",
+      "timezone-conversion-contract:graphify:3: Graphify arm did not invoke the public Graphify CLI"
+    ]
+  }
+}

@@ -24,10 +24,9 @@ function now() { return new Date().toISOString(); }
 function genId(prefix: string) { return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`; }
 
 // V1 container configs per folder
-const GROUP_CONFIGS: Record<string, { tools?: string[]; gitnexusInjectAgentsMd?: boolean; additionalMounts?: Array<{hostPath:string;containerPath:string;readonly?:boolean}> }> = {
+const GROUP_CONFIGS: Record<string, { tools?: string[]; additionalMounts?: Array<{hostPath:string;containerPath:string;readonly?:boolean}> }> = {
   'main': {
     tools: ['gmail', 'calendar', 'granola', 'google-workspace', 'railway', 'exa'],
-    gitnexusInjectAgentsMd: true,
   },
   'illysium': {
     tools: [
@@ -37,34 +36,27 @@ const GROUP_CONFIGS: Record<string, { tools?: string[]; gitnexusInjectAgentsMd?:
       'google-workspace:illysium', 'render:illysium', 'exa',
       'browser-auth:illyse', 'aws:xzo', 'aws:apollo',
     ],
-    gitnexusInjectAgentsMd: true,
   },
   'number-drinks': {
     tools: ['gmail:numberdrinks', 'calendar', 'granola', 'google-workspace', 'exa'],
-    gitnexusInjectAgentsMd: true,
   },
   'axis-labs': {
     tools: [
       'gmail', 'calendar', 'granola', 'google-workspace', 'railway', 'exa',
       'snowflake', 'aws', 'gcloud', 'dbt', 'render', 'browser-auth', 'github',
     ],
-    gitnexusInjectAgentsMd: true,
   },
   'axie-dev': {
     tools: [],
-    gitnexusInjectAgentsMd: true,
   },
   'madison-reed': {
     tools: ['gmail:madison-reed', 'calendar:madison-reed', 'granola', 'google-workspace:madison-reed', 'exa'],
-    gitnexusInjectAgentsMd: true,
   },
   'dirt-market': {
     tools: ['gmail', 'calendar', 'granola', 'google-workspace', 'railway', 'exa'],
-    gitnexusInjectAgentsMd: true,
   },
   'xerus': {
     tools: ['gmail', 'calendar', 'granola', 'google-workspace', 'exa'],
-    gitnexusInjectAgentsMd: true,
   },
   'video-agent': {
     tools: [],
@@ -162,7 +154,6 @@ async function main() {
       packages: { apt: [], npm: [] },
       additionalMounts: [],
       ...(cfg.tools !== undefined ? { tools: cfg.tools } : {}),
-      gitnexusInjectAgentsMd: cfg.gitnexusInjectAgentsMd ?? false,
       ...(cfg.additionalMounts ? { additionalMounts: cfg.additionalMounts } : {}),
     };
     writeContainerConfig(folder, config);

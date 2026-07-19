@@ -96,6 +96,22 @@ export function threadWorktreeDir(platformId: string, threadId: string | null): 
   return path.join(threadsBaseDir(), fsSlug(tid), 'worktrees');
 }
 
+/** Per-session Graphify cache. Sessions never share this directory. */
+export function sessionGraphifyCacheDir(agentGroupId: string, sessionId: string): string {
+  return path.join(sessionDir(agentGroupId, sessionId), 'graphify-cache');
+}
+
+/** Thread-scoped Graphify cache shared by sibling agents in one conversation. */
+export function threadGraphifyCacheDir(platformId: string, threadId: string | null): string {
+  const tid = threadId ?? `dm-${platformId}`;
+  return path.join(threadsBaseDir(), fsSlug(tid), 'graphify-cache');
+}
+
+/** Install-scoped runtime state for the Graphify gateway. */
+export function graphifyRuntimeDir(): string {
+  return path.join(DATA_DIR, 'graphify-runtime');
+}
+
 /** Path to the host-owned inbound DB (messages_in + delivered). */
 export function inboundDbPath(agentGroupId: string, sessionId: string): string {
   return path.join(sessionDir(agentGroupId, sessionId), 'inbound.db');

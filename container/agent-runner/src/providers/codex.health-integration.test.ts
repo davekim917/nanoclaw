@@ -132,6 +132,50 @@ describe('runOneTurn Codex control-plane health integration', () => {
     expect(events.filter((event) => event.type === 'activity').length).toBeGreaterThan(0);
   });
 
+  it('rejects a successful turn that abandons an open command execution', async () => {
+    const fixture = fakeServer((request) => {
+      if (request.method === 'turn/start') return { result: { turn: { id: 'turn-1' } } };
+      return { error: { code: -32601, message: 'unexpected method' } };
+    });
+
+    const resultPromise = collectTurn(fixture.server);
+    fixture.emit('item/started', { item: { id: 'command-1', type: 'commandExecution' } });
+    fixture.emit('turn/completed', { status: 'completed' });
+    const events = await resultPromise;
+
+    expect(events.find((event) => event.type === 'error')).toMatchObject({
+      type: 'error',
+      classification: 'protocol_desync',
+    });
+    expect(events.some((event) => event.type === 'result')).toBe(false);
+  });
+
+  it('preserves a current-schema failed turn instead of misclassifying its open command as desync', async () => {
+    const fixture = fakeServer((request) => {
+      if (request.method === 'turn/start') return { result: { turn: { id: 'turn-1' } } };
+      return { error: { code: -32601, message: 'unexpected method' } };
+    });
+
+    const resultPromise = collectTurn(fixture.server);
+    fixture.emit('item/started', { item: { id: 'command-1', type: 'commandExecution' } });
+    fixture.emit('turn/completed', {
+      turn: {
+        status: 'failed',
+        error: {
+          message: 'usage limit reached',
+          codexErrorInfo: { type: 'UsageLimitExceeded' },
+        },
+      },
+    });
+    const events = await resultPromise;
+
+    expect(events.find((event) => event.type === 'error')).toMatchObject({
+      type: 'error',
+      classification: 'quota',
+    });
+    expect(events.some((event) => event.classification === 'protocol_desync')).toBe(false);
+  });
+
   it('classifies a truly unresponsive app-server after three bounded probes', async () => {
     const fixture = fakeServer((request) => {
       if (request.method === 'turn/start') return { result: {} };

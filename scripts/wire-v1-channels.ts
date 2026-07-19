@@ -161,7 +161,7 @@ async function main() {
 
   for (const g of groupsToCreate) {
     console.log(`--- Agent group: ${g.name} (${g.folder}) ---`);
-    const config: Record<string, unknown> = { gitnexusInjectAgentsMd: true };
+    const config: Record<string, unknown> = {};
     if (g.tools) config.tools = g.tools;
     if (g.additionalMounts) config.additionalMounts = g.additionalMounts;
     ensureFolderAndConfig(g.folder, config);

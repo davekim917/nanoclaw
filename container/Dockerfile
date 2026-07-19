@@ -4,7 +4,7 @@
 #
 # Runtime split:
 #   - agent-runner (our TypeScript code): Bun, mounted RO at /app/src by host
-#   - globally-installed Node CLIs (claude-code, agent-browser, vercel, gitnexus): pnpm + Node
+#   - globally-installed Node CLIs (claude-code, agent-browser, vercel): pnpm + Node
 #
 # Source is never baked in — /app/src is provided by a shared read-only
 # bind mount at runtime (see src/container-runner.ts). Source-only changes
@@ -13,7 +13,6 @@
 # Illysium additions on top of upstream/v2:
 #   - GitHub CLI (gh) — used by git-worktree MCP tools for `gh pr create`
 #   - PostgreSQL + Redis clients, Python + dbt + snowflake-cli — data-team tooling
-#   - gitnexus CLI (global) — code intelligence used by agents
 
 # ---- mcp-toolbox alias stage -------------------------------------------------
 # Google publishes the toolbox as a multi-arch distroless image but does NOT
@@ -21,7 +20,6 @@
 # lets us pull the binary via COPY --from below while keeping the version
 # pinned via build-arg.
 ARG MCP_TOOLBOX_VERSION=1.6.0
-ARG GITNEXUS_VERSION=1.6.9
 ARG PNPM_VERSION=10.33.4
 FROM us-central1-docker.pkg.dev/database-toolbox/toolbox/toolbox:${MCP_TOOLBOX_VERSION} AS mcp-toolbox-src
 
@@ -37,54 +35,6 @@ ARG RTK_VERSION=0.43.0
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     cargo install --git https://github.com/rtk-ai/rtk --tag "v${RTK_VERSION}" --locked --root /out rtk
-
-# ---- GitNexus builder stage --------------------------------------------------
-# GitNexus ships native LadybugDB, ONNX, and tree-sitter components. ARM64
-# does not have a usable prebuild for every grammar, so install scripts must be
-# explicitly allowed and a C++ toolchain must be present while pnpm installs.
-# The completed /pnpm tree is copied into the final image; make/g++ stay here.
-FROM node:22-slim AS gitnexus-builder
-ARG GITNEXUS_VERSION
-ARG PNPM_VERSION
-
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked \
-    apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates \
-        g++ \
-        git \
-        make \
-        python3 \
-    && rm -rf /var/lib/apt/lists/*
-
-ENV PNPM_HOME="/pnpm"
-ENV PATH="$PNPM_HOME:$PATH"
-
-RUN corepack enable && corepack prepare pnpm@${PNPM_VERSION} --activate
-
-RUN --mount=type=cache,target=/root/.cache/pnpm \
-    printf '%s\n' \
-        'only-built-dependencies[]=gitnexus' \
-        'only-built-dependencies[]=@ladybugdb/core' \
-        'only-built-dependencies[]=onnxruntime-node' \
-        'only-built-dependencies[]=tree-sitter' \
-        'only-built-dependencies[]=tree-sitter-c-sharp' \
-        'only-built-dependencies[]=tree-sitter-cpp' \
-        'only-built-dependencies[]=tree-sitter-go' \
-        'only-built-dependencies[]=tree-sitter-java' \
-        'only-built-dependencies[]=tree-sitter-javascript' \
-        'only-built-dependencies[]=tree-sitter-php' \
-        'only-built-dependencies[]=tree-sitter-python' \
-        'only-built-dependencies[]=tree-sitter-ruby' \
-        'only-built-dependencies[]=tree-sitter-rust' \
-        'only-built-dependencies[]=tree-sitter-typescript' \
-        > /root/.npmrc \
-    && pnpm install -g "gitnexus@${GITNEXUS_VERSION}" \
-    && mkdir -p /opt/gitnexus-home \
-    && HOME=/opt/gitnexus-home node /pnpm/global/5/node_modules/gitnexus/scripts/install-duckdb-extension.mjs fts 17179869184 \
-    && HOME=/opt/gitnexus-home node /pnpm/global/5/node_modules/gitnexus/scripts/install-duckdb-extension.mjs vector 17179869184 \
-    && /pnpm/gitnexus --version \
-    && HOME=/opt/gitnexus-home /pnpm/gitnexus doctor
 
 FROM node:22-slim
 
@@ -139,6 +89,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         xz-utils \
         postgresql-client \
         redis-tools \
+        ripgrep \
         python3 \
         python3-pip \
         python3-venv \
@@ -361,19 +312,12 @@ RUN --mount=type=cache,target=/root/.bun/install/cache \
 #     the SDK fails at spawn time with "native binary not found".
 ENV PNPM_HOME="/pnpm"
 ENV PATH="$PNPM_HOME:$PATH"
-# Copy the fully built ARM64-safe GitNexus install before adding the remaining
-# global CLIs. Using the same pnpm major keeps the shared global tree coherent.
-COPY --from=gitnexus-builder /pnpm /pnpm
-# MCP/query paths intentionally use load-only extension policy. Bake the FTS
-# and VECTOR binaries into the runtime user's home so fresh containers can
-# query an existing index without reaching the network or re-running analyze.
-COPY --from=gitnexus-builder /opt/gitnexus-home/.lbdb /home/node/.lbdb
 # Pin pnpm to match the host (package.json packageManager). pnpm 11 stopped
 # honoring `only-built-dependencies[]=` in .npmrc for global installs, which
 # silently skips claude-code's native-binary postinstall and agent-browser's
 # bin chmod — the agent then crashes at runtime with "native binary not
 # installed". 10.x also avoids pnpm 11's `blockExoticSubdeps=true` default
-# which rejects git-resolved subdeps like `tree-sitter-dart` inside gitnexus.
+# which rejects some git-resolved transitive dependencies.
 # Keep this in lockstep with package.json's `packageManager`.
 ARG PNPM_VERSION
 RUN corepack enable && corepack prepare pnpm@${PNPM_VERSION} --activate
@@ -414,9 +358,63 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
         "@openai/codex@${CODEX_VERSION}" \
         "opencode-ai@${OPENCODE_VERSION}"
 
-# Verify the copied native components still load after the shared global pnpm
-# tree has been extended with the other runtime CLIs.
-RUN /pnpm/gitnexus --version && HOME=/home/node /pnpm/gitnexus doctor
+# ---- Graphify code intelligence ----------------------------------------------
+# Graphify is a private, wheel-only Python environment. The upstream console
+# script is removed; only NanoClaw's policy-enforcing freshness gateway is
+# public. The audited wheelhouse remains private so the offline source contract
+# can be rerun against the finished image without dependency resolution.
+RUN python3 -m venv /opt/graphify
+COPY graphify-requirements.lock graphify-wheel-audit.json graphify-v0.9.16-nanoclaw.patch /opt/graphify/
+RUN chmod 0444 \
+        /opt/graphify/graphify-requirements.lock \
+        /opt/graphify/graphify-wheel-audit.json \
+        /opt/graphify/graphify-v0.9.16-nanoclaw.patch \
+    && mkdir -p /opt/graphify/wheelhouse \
+    && /opt/graphify/bin/pip download \
+        --require-hashes \
+        --only-binary=:all: \
+        --no-deps \
+        --dest /opt/graphify/wheelhouse \
+        -r /opt/graphify/graphify-requirements.lock \
+    && /opt/graphify/bin/pip install \
+        --no-index \
+        --find-links=/opt/graphify/wheelhouse \
+        --require-hashes \
+        --only-binary=:all: \
+        --no-deps \
+        -r /opt/graphify/graphify-requirements.lock \
+    && SITE_PACKAGES="$(/opt/graphify/bin/python -c 'import site; print(site.getsitepackages()[0])')" \
+    && cd "$SITE_PACKAGES" \
+    && git apply --check /opt/graphify/graphify-v0.9.16-nanoclaw.patch \
+    && git apply /opt/graphify/graphify-v0.9.16-nanoclaw.patch \
+    && ! git apply --check /opt/graphify/graphify-v0.9.16-nanoclaw.patch >/dev/null 2>&1 \
+    && git apply --reverse --check /opt/graphify/graphify-v0.9.16-nanoclaw.patch \
+    && /opt/graphify/bin/python -c 'from importlib.metadata import version; assert version("graphifyy") == "0.9.16"' \
+    && /opt/graphify/bin/pip freeze --local | tr '[:upper:]' '[:lower:]' | LC_ALL=C sort > /tmp/graphify-freeze \
+    && grep -v '^#' /opt/graphify/graphify-requirements.lock | sed '/^[[:space:]]*$/d; s/ --hash=.*//' | tr '[:upper:]' '[:lower:]' | LC_ALL=C sort > /tmp/graphify-locked \
+    && diff -u /tmp/graphify-locked /tmp/graphify-freeze \
+    && rm -f /opt/graphify/bin/graphify \
+    && rm -f /tmp/graphify-freeze /tmp/graphify-locked
+
+COPY graphify-gateway.py /usr/local/bin/graphify
+COPY graphify-worker.py /opt/graphify/graphify-worker.py
+RUN sed -i '1c#!/opt/graphify/bin/python' /usr/local/bin/graphify \
+    && chmod 0755 /usr/local/bin/graphify \
+    && chmod 0644 /opt/graphify/graphify-worker.py \
+    && test "$(command -v graphify)" = /usr/local/bin/graphify \
+    && test ! -e /opt/graphify/bin/graphify \
+    && graphify --version \
+    && graphify --help >/dev/null
+
+# Run the exact Group A source contracts against the installed ARM64
+# environment. The upstream checkout and test copies are build-only; the
+# audited wheelhouse above remains for post-build offline verification.
+COPY graphify-gateway.py graphify-worker.py graphify-requirements.lock graphify-wheel-audit.json graphify-v0.9.16-nanoclaw.patch /tmp/graphify-build/container/
+COPY tests/test_graphify_gateway.py tests/test_graphify_worker.py tests/test_graphify_upstream_contract.py tests/test_graphify_supply_chain.py /tmp/graphify-build/container/tests/
+RUN git clone --quiet --depth 1 --branch v0.9.16 https://github.com/Graphify-Labs/graphify.git /tmp/graphify-design \
+    && cd /tmp/graphify-build \
+    && GRAPHIFY_WHEELHOUSE=/opt/graphify/wheelhouse /opt/graphify/bin/python -m unittest discover -s container/tests -p 'test_graphify_*.py' \
+    && rm -rf /tmp/graphify-build /tmp/graphify-design
 
 # Login shells reset PATH on Debian and can drop Docker ENV-provided /pnpm,
 # which makes globally installed CLIs invisible to Codex/OpenCode shell tools.

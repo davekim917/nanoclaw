@@ -37,14 +37,15 @@ function resolveCodexSourceDir(agentGroupFolder: string | undefined, agentGroupI
 
 function stripMcpServerBlocks(toml: string): string {
   const out: string[] = [];
-  let inMcpBlock = false;
+  let inGitNexusBlock = false;
   for (const line of toml.split('\n')) {
     const header = line.match(/^\s*\[([^\]]+)\]\s*$/);
     if (header) {
-      inMcpBlock = header[1].trim().startsWith('mcp_servers.');
-      if (inMcpBlock) continue;
+      const table = header[1].trim().replace(/["']/g, '').toLowerCase();
+      inGitNexusBlock = table.includes('gitnexus');
+      if (inGitNexusBlock) continue;
     }
-    if (!inMcpBlock) out.push(line);
+    if (!inGitNexusBlock) out.push(line);
   }
   return out.join('\n').trimEnd() + '\n';
 }
@@ -102,8 +103,9 @@ registerProviderContainerConfig('codex', (ctx) => {
 
   // Copy auth.json from the per-group Codex home when present
   // (`~/.codex-<folder>/auth.json`), otherwise fall back to global ~/.codex.
-  // Copy config.toml too, but strip MCP blocks: the container rewrites MCPs
-  // from runtime wiring, while non-MCP blocks such as [plugins.*] must survive.
+  // Copy config.toml too, but remove only container-retired GitNexus reentry
+  // tables. All unrelated MCP, plugin, model, approval, and sandbox settings
+  // remain intact.
   const hostHome = ctx.hostEnv.HOME || os.homedir();
   if (hostHome) {
     const sourceDir = resolveCodexSourceDir(ctx.agentGroupFolder, ctx.agentGroupId, hostHome);

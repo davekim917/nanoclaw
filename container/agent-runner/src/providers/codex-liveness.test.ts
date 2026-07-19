@@ -38,6 +38,35 @@ describe('CodexTurnLiveness', () => {
     expect(liveness.snapshot().openItems).toEqual([{ id: 'spawn-1', type: 'subAgentActivity' }]);
   });
 
+  it('declares protocol desync when a turn completes with an execution item still open', () => {
+    const { liveness } = tracker();
+    liveness.noteItemStarted({ id: 'command-1', type: 'commandExecution' });
+
+    expect(liveness.noteTurnEnded()).toEqual({
+      kind: 'recover',
+      classification: 'protocol_desync',
+      reason: 'Codex turn completed with unfinished execution items: commandExecution:command-1',
+    });
+    expect(liveness.snapshot().openItems).toEqual([]);
+  });
+
+  it('allows a turn to complete after the execution item lifecycle closes normally', () => {
+    const { liveness } = tracker();
+    liveness.noteItemStarted({ id: 'command-1', type: 'commandExecution' });
+    liveness.noteItemCompleted({ id: 'command-1', type: 'commandExecution' });
+
+    expect(liveness.noteTurnEnded()).toEqual({ kind: 'healthy' });
+    expect(liveness.snapshot().openItems).toEqual([]);
+  });
+
+  it('allows a turn to complete with only non-execution lifecycle items open', () => {
+    const { liveness } = tracker();
+    liveness.noteItemStarted({ id: 'reason-1', type: 'reasoning' });
+
+    expect(liveness.noteTurnEnded()).toEqual({ kind: 'healthy' });
+    expect(liveness.snapshot().openItems).toEqual([]);
+  });
+
   it('records the latest notification timestamp', () => {
     const { liveness, advance } = tracker();
     advance(250);

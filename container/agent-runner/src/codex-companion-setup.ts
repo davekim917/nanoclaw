@@ -303,6 +303,22 @@ function splitTomlArray(inside: string): string[] {
   return parts;
 }
 
+/** Remove only host-derived GitNexus activation tables. */
+function stripGitNexusReentrySurfaces(toml: string): string {
+  const out: string[] = [];
+  let inGitNexusBlock = false;
+  for (const line of toml.split('\n')) {
+    const header = line.match(/^\s*\[([^\]]+)\]\s*$/);
+    if (header) {
+      const table = header[1].trim().replace(/["']/g, '').toLowerCase();
+      inGitNexusBlock = table.includes('gitnexus');
+      if (inGitNexusBlock) continue;
+    }
+    if (!inGitNexusBlock) out.push(line);
+  }
+  return out.join('\n');
+}
+
 /**
  * Build the merged config.toml. Sourced from:
  *   - the host's config.toml (less its MCP-server blocks — we re-emit them)
@@ -314,11 +330,14 @@ function splitTomlArray(inside: string): string[] {
  */
 function buildMergedConfig(hostConfig: string, mcpServers: Record<string, McpServerConfig>): string {
   const { stripped } = stripExistingMcpServers(hostConfig);
-  const base = rewriteLocalMarketplaceSourcesForContainer(stripped).trimEnd();
+  const base = rewriteLocalMarketplaceSourcesForContainer(stripGitNexusReentrySurfaces(stripped)).trimEnd();
   const hostMcps = parseHostMcpServers(hostConfig);
 
   // Runtime wins on name collision — that's why `mcpServers` is spread second.
   const merged: Record<string, McpServerConfig> = { ...hostMcps, ...mcpServers };
+  for (const name of Object.keys(merged)) {
+    if (name.toLowerCase() === 'gitnexus') delete merged[name];
+  }
 
   const mcpLines: string[] = [];
   for (const [name, config] of Object.entries(merged)) {
@@ -385,23 +404,6 @@ export function setupCodexRuntime(mcpServers: Record<string, McpServerConfig>): 
   } catch (err) {
     log(`Failed to symlink auth.json: ${err instanceof Error ? err.message : String(err)}`);
     return null;
-  }
-
-  // AGENTS.md: symlink the host's behavioral rules so the container-side
-  // codex inherits the same global instructions as host codex.
-  const hostAgents = path.join(HOST_CODEX_DIR, 'AGENTS.md');
-  const runtimeAgents = path.join(RUNTIME_CODEX_DIR, 'AGENTS.md');
-  if (fs.existsSync(hostAgents)) {
-    try {
-      try {
-        fs.unlinkSync(runtimeAgents);
-      } catch {
-        /* fresh */
-      }
-      fs.symlinkSync(hostAgents, runtimeAgents);
-    } catch (err) {
-      log(`Failed to symlink AGENTS.md: ${err instanceof Error ? err.message : String(err)}`);
-    }
   }
 
   // agents/: symlink the host's subagent TOML dir so codex-as-peer sees
@@ -474,7 +476,7 @@ export function setupCodexRuntime(mcpServers: Record<string, McpServerConfig>): 
  * skill — container-bundled NanoClaw skills + host plugin tree. Codex
  * auto-scans this dir (verified via `codex debug prompt-input`; appears as
  * discovery root `r1`), so this is what makes plugin skills like
- * `humanizer`, `gitnexus-*`, `impeccable`, etc. visible to Codex sessions.
+ * `humanizer`, `impeccable`, etc. visible to Codex sessions.
  *
  * Called unconditionally from agent-runner startup — needed for BOTH
  * codex-primary (illie-codex) and codex-as-peer (illie running the codex
@@ -488,8 +490,8 @@ export function syncAgentSkillsMirror(runtime?: AgentRuntime): void {
   //   2. Host plugin tree mounted RO at /workspace/plugins/, discovered via
   //      the same rules the host script applies (`.agents/skills/` preferred,
   //      Claude-only sub-plugins denied).
-  // Defers to any pre-existing non-symlink content (host-side mounts, or
-  // anything an in-container `gitnexus setup` would later write).
+  // Defers to any pre-existing non-symlink content (host-side mounts or
+  // operator-managed runtime installs).
   const containerSkillEntries: Array<{ name: string; skillDir: string; plugin: string }> = [];
   try {
     for (const entry of fs.readdirSync(CONTAINER_CLAUDE_SKILLS_DIR)) {

@@ -1,4 +1,7 @@
 import { describe, it, expect, mock, beforeAll } from 'bun:test';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 
 // Mock the SDK before importing claude.ts, so sdkQuery is interceptable.
 // We capture the options passed to sdkQuery to verify sticky config behavior.
@@ -313,5 +316,42 @@ describe('subagent model env', () => {
     expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('claude-sonnet-5');
     // Cross-family aliases stay untouched so explicit frontmatter choices resolve freely.
     expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBeUndefined();
+  });
+});
+
+describe('container GitNexus retirement', () => {
+  it('test_claude_plugin_discovery_preserves_non_gitnexus_plugins', () => {
+    const pluginsRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'claude-plugin-discovery-'));
+    const pluginDir = path.join(pluginsRoot, 'ordinary-plugin');
+    fs.mkdirSync(path.join(pluginDir, '.claude-plugin'), { recursive: true });
+    fs.writeFileSync(
+      path.join(pluginDir, '.claude-plugin', 'plugin.json'),
+      JSON.stringify({ name: 'ordinary-plugin' }),
+    );
+
+    const previousRoot = process.env.CLAUDE_PLUGINS_ROOT;
+    try {
+      process.env.CLAUDE_PLUGINS_ROOT = pluginsRoot;
+      capturedSdkOptions = null;
+      mockSdkQuery.mockClear();
+      new ClaudeProvider({}).query({ prompt: 'hi', cwd: '/tmp' });
+
+      expect(capturedSdkOptions?.plugins).toEqual([{ type: 'local', path: pluginDir }]);
+      const source = fs.readFileSync(new URL('./claude.ts', import.meta.url), 'utf8');
+      expect(source).not.toContain('prepareGitNexusPluginForClaude');
+      expect(source).not.toContain('gitnexus-runtime');
+      expect(source).not.toContain('nanoclaw-plugin-overlays');
+    } finally {
+      if (previousRoot === undefined) delete process.env.CLAUDE_PLUGINS_ROOT;
+      else process.env.CLAUDE_PLUGINS_ROOT = previousRoot;
+      fs.rmSync(pluginsRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('test_runner_startup_has_no_gitnexus_runtime_setup', () => {
+    const runnerSource = fs.readFileSync(new URL('../index.ts', import.meta.url), 'utf8');
+    expect(runnerSource).not.toMatch(/GitNexus|gitnexus|GITNEXUS_INJECT_AGENTS_MD/);
+    expect(runnerSource).not.toContain('configureGitNexusRuntime');
+    expect(fs.existsSync(new URL('../gitnexus-runtime.ts', import.meta.url))).toBe(false);
   });
 });

@@ -63,9 +63,9 @@ export interface HostCapabilities {
     codex: boolean;
   };
 
-  /** Which plugin repos are mounted into containers from ~/plugins/ + the built-in nanoclaw-hooks. */
+  /** Which plugin repos are available to containers. */
   plugins: {
-    builtin: string[]; // always-on built-in plugins (nanoclaw-hooks)
+    builtin: string[]; // reserved for future always-on built-ins; currently empty
     installed: string[]; // ~/plugins/* subdirs
   };
 
@@ -74,7 +74,6 @@ export interface HostCapabilities {
     id: string;
     name: string;
     folder: string;
-    gitnexusInjectAgentsMd: boolean;
     ollamaAdminTools: boolean;
     excludePlugins: string[];
     githubTokenEnv: string | null;
@@ -187,6 +186,7 @@ function listHostPlugins(): string[] {
   if (!fs.existsSync(dir)) return [];
   try {
     return fs.readdirSync(dir).filter((entry) => {
+      if (entry.toLowerCase() === 'gitnexus') return false;
       try {
         return fs.statSync(path.join(dir, entry)).isDirectory();
       } catch {
@@ -196,11 +196,6 @@ function listHostPlugins(): string[] {
   } catch {
     return [];
   }
-}
-
-function builtinPlugins(): string[] {
-  const builtinPluginDir = path.resolve(GROUPS_DIR, '..', 'container', 'nanoclaw-plugin');
-  return fs.existsSync(builtinPluginDir) ? ['nanoclaw-hooks'] : [];
 }
 
 /**
@@ -844,7 +839,6 @@ export function getHostCapabilities(
       id: ag.id,
       name: ag.name,
       folder: ag.folder,
-      gitnexusInjectAgentsMd: !!cfg.gitnexusInjectAgentsMd,
       ollamaAdminTools: !!cfg.ollamaAdminTools,
       excludePlugins: cfg.excludePlugins ?? [],
       githubTokenEnv: cfg.githubTokenEnv ?? null,
@@ -875,7 +869,7 @@ export function getHostCapabilities(
       codex: hostDirExists('.codex'),
     },
     plugins: {
-      builtin: builtinPlugins(),
+      builtin: [],
       installed: listHostPlugins(),
     },
     agentGroups,

@@ -27,7 +27,6 @@
  *     tiers, image tags, or per-call defaults independently without changing
  *     skills/MCPs/tools/secrets.
  *   - Memory + summary: per-sibling memory state; one writer per workgroup.
- *   - Scaffold artifacts: /clone-as-* writes these unconditionally.
  */
 export const SIBLING_BOUND_FIELDS: ReadonlySet<string> = new Set([
   // Identity-bound (always per-group)
@@ -48,8 +47,6 @@ export const SIBLING_BOUND_FIELDS: ReadonlySet<string> = new Set([
   // Memory + summary (per-sibling state; one writer per workgroup)
   'memory',
   'dailySummary',
-  // /clone-as-* scaffolds write this true unconditionally; source may not have it.
-  'gitnexusInjectAgentsMd',
 ]);
 
 /**

@@ -45,7 +45,7 @@ import {
   writeCodexHooksJson,
   writeCodexMcpConfigToml,
 } from './codex-app-server.js';
-import { CodexTurnLiveness, normalizeCodexThreadStatus } from './codex-liveness.js';
+import { CodexTurnLiveness, normalizeCodexThreadStatus, type CodexLivenessDecision } from './codex-liveness.js';
 
 /**
  * Health watchdog for a single turn. Guards against codex-app-server wedging
@@ -1396,13 +1396,14 @@ export async function* runOneTurn(
     const method = n.method;
     const params = n.params;
     lastMethod = method;
+    let turnEndDecision: CodexLivenessDecision | null = null;
 
     if (method === 'item/started') {
       liveness.noteItemStarted(params.item);
     } else if (method === 'item/completed') {
       liveness.noteItemCompleted(params.item);
     } else if (method === 'turn/completed' || method === 'turn/failed') {
-      liveness.noteTurnEnded();
+      turnEndDecision = liveness.noteTurnEnded();
     } else {
       liveness.noteNotification();
     }
@@ -1495,11 +1496,29 @@ export async function* runOneTurn(
         const p = params as {
           status?: string;
           error?: { message?: string; codexErrorInfo?: { type?: string } };
+          turn?: {
+            status?: string;
+            error?: { message?: string; codexErrorInfo?: { type?: string } } | null;
+          };
         };
-        if (p.status === 'failed' || p.error) {
-          const kind = p.error?.codexErrorInfo?.type;
-          turnState.error = new Error(p.error?.message || 'Turn failed');
+        // Codex 0.144.x follows the generated v2 schema and nests status/error
+        // under params.turn. Retain the top-level fallback for older servers.
+        const status = p.turn?.status ?? p.status;
+        const error = p.turn?.error ?? p.error;
+        if (status === 'failed' || error) {
+          const kind = error?.codexErrorInfo?.type;
+          turnState.error = new Error(error?.message || 'Turn failed');
           if (typeof kind === 'string') turnState.errorKind = kind;
+        } else if (turnEndDecision?.kind === 'recover') {
+          // A successful turn cannot be trusted while an execution/tool item
+          // remains open: this is the exact lifecycle corruption that let a
+          // Graphify command start, disappear, and still produce an answer.
+          // The server already declared the turn complete, so waiting cannot
+          // produce the missing notification. Fail into the existing one-shot
+          // app-server replacement + persisted-thread resume path instead.
+          if (turnTracker) turnTracker.currentTurnId = null;
+          finishForLivenessFailure(turnEndDecision.classification, turnEndDecision.reason);
+          break;
         }
         flushReasoning();
         if (turnTracker) turnTracker.currentTurnId = null;

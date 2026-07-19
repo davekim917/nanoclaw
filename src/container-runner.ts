@@ -73,10 +73,13 @@ import {
 } from './providers/provider-container-registry.js';
 import { getSessionClaudeMounts } from './session-claude-mounts.js';
 import {
+  graphifyRuntimeDir,
   heartbeatPath,
   markContainerRunning,
   markContainerStopped,
+  sessionGraphifyCacheDir,
   sessionDir,
+  threadGraphifyCacheDir,
   threadWorktreeDir,
   writeSessionRouting,
 } from './session-manager.js';
@@ -1312,6 +1315,21 @@ export function buildMounts(
     mounts.push({ hostPath: inboundDbFile, containerPath: '/workspace/inbound.db', readonly: true });
   }
 
+  // Graphify indexes persist beside the checkout scope they describe. Normal
+  // sessions keep an isolated cache; thread-worktree siblings share the cache
+  // derived from the same platform/thread key. Runtime coordination remains
+  // install-scoped and is never placed under a source checkout or host home.
+  let graphifyCache = sessionGraphifyCacheDir(agentGroup.id, session.id);
+  if (session.messaging_group_id && process.env.NANOCLAW_THREAD_WORKTREES === '1') {
+    const mg = getMessagingGroup(session.messaging_group_id);
+    if (mg) graphifyCache = threadGraphifyCacheDir(mg.platform_id, session.thread_id);
+  }
+  const graphifyRuntime = graphifyRuntimeDir();
+  fs.mkdirSync(graphifyCache, { recursive: true });
+  fs.mkdirSync(graphifyRuntime, { recursive: true });
+  mounts.push({ hostPath: graphifyCache, containerPath: '/workspace/.cache/graphify', readonly: false });
+  mounts.push({ hostPath: graphifyRuntime, containerPath: '/run/nanoclaw-graphify', readonly: false });
+
   // Thread-scoped worktrees: shared bind-mount across all sibling agents
   // (Claude + Codex) in the same thread, so collaborative code edits land
   // in one repo checkout regardless of which agent ran them. The session
@@ -1587,20 +1605,6 @@ export function buildMounts(
     });
   }
 
-  // Built-in nanoclaw-hooks plugin: project-relative, always mounted.
-  // Provides the GitNexus repo-readiness guard (PreToolUse) and the
-  // post-commit blast-radius verification hook (PostToolUse). Unlike
-  // external plugins, this one ships with NanoClaw itself. Same
-  // discovery path (CLAUDE_PLUGINS_ROOT → /workspace/plugins/*).
-  const builtinPlugin = path.resolve(GROUPS_DIR, '..', 'container', 'nanoclaw-plugin');
-  if (fs.existsSync(builtinPlugin)) {
-    mounts.push({
-      hostPath: builtinPlugin,
-      containerPath: '/workspace/plugins/nanoclaw-hooks',
-      readonly: true,
-    });
-  }
-
   // Plugin mounts: every subdir of ~/plugins is mounted RO at
   // /workspace/plugins/<name>. Claude Code SDK auto-discovers via
   // CLAUDE_PLUGINS_ROOT (set in buildContainerArgs). Per-group
@@ -1615,7 +1619,7 @@ export function buildMounts(
     // Plugins whose capability ships in-tree: mounting them would duplicate the
     // in-tree skill and (via CLAUDE_PLUGINS_ROOT auto-discovery) start a second
     // MCP server with a different allowed root. Host/OSS-only by design.
-    const IN_TREE_SHADOWED_PLUGINS = ['design-artifact-loop'];
+    const IN_TREE_SHADOWED_PLUGINS = ['design-artifact-loop', 'gitnexus'];
     const excluded = new Set([...IN_TREE_SHADOWED_PLUGINS, ...(containerConfig.excludePlugins ?? [])]);
     let entries: string[] = [];
     try {
@@ -2384,18 +2388,37 @@ async function resolveAssistantName(
  * Resolve the group's skill selection to concrete names — `'all'` recomputes
  * from `container/skills/` so newly-added upstream skills appear automatically.
  */
-function selectedSkillNames(containerConfig: import('./container-config.js').ContainerConfig): string[] {
-  if (containerConfig.skills !== 'all') return containerConfig.skills;
-  const sharedSkillsDir = path.join(process.cwd(), 'container', 'skills');
-  return fs.existsSync(sharedSkillsDir)
-    ? fs.readdirSync(sharedSkillsDir).filter((e) => {
-        try {
-          return fs.statSync(path.join(sharedSkillsDir, e)).isDirectory();
-        } catch {
-          return false;
-        }
-      })
-    : [];
+export function selectedSkillNames(containerConfig: import('./container-config.js').ContainerConfig): string[] {
+  const requested =
+    containerConfig.skills === 'all'
+      ? (() => {
+          const sharedSkillsDir = path.join(process.cwd(), 'container', 'skills');
+          return fs.existsSync(sharedSkillsDir)
+            ? fs
+                .readdirSync(sharedSkillsDir)
+                .filter((entry) => {
+                  try {
+                    return fs.statSync(path.join(sharedSkillsDir, entry)).isDirectory();
+                  } catch {
+                    return false;
+                  }
+                })
+                .sort()
+            : [];
+        })()
+      : containerConfig.skills;
+
+  return [...new Set([...requested, 'graphify'])];
+}
+
+/** Universal, bounded Graphify runtime flags applied to every provider. */
+export function graphifyContainerArgs(): string[] {
+  return [
+    '-e',
+    'NANOCLAW_CONTAINER=1',
+    '--tmpfs',
+    '/workspace/.graphify-stage:rw,size=201326592,mode=0700,uid=1001,gid=1001',
+  ];
 }
 
 async function buildContainerArgs(
@@ -2420,6 +2443,7 @@ async function buildContainerArgs(
 ): Promise<string[]> {
   const args: string[] = ['run', '--rm', '--name', containerName, '--label', CONTAINER_INSTALL_LABEL];
   args.push(...dockerResourceLimitArgs(containerConfig.resources));
+  args.push(...graphifyContainerArgs());
 
   // Environment — only vars read by code we don't own.
   // Everything NanoClaw-specific is in container.json (read by runner at startup).
@@ -2787,9 +2811,6 @@ async function buildContainerArgs(
   }
 
   // Per-group opt-in flags from container.json.
-  if (containerConfig.gitnexusInjectAgentsMd) {
-    args.push('-e', 'GITNEXUS_INJECT_AGENTS_MD=true');
-  }
   if (containerConfig.ollamaAdminTools) {
     args.push('-e', 'OLLAMA_ADMIN_TOOLS=true');
   }
@@ -3323,8 +3344,8 @@ async function buildContainerArgs(
 
   // Override entrypoint so we skip tini's stdin-read wait (host-spawned
   // sessions don't pipe stdin — all IO flows through the mounted session
-  // DBs). Run the image's entrypoint.sh directly via bash so XDG / gws /
-  // GitHub-auth / Render / GitNexus setup fires before bun starts.
+  // DBs). Run the image's entrypoint.sh directly via bash so credential and
+  // provider setup fires before bun starts.
   args.push('--entrypoint', 'bash');
 
   const imageTag = containerConfig.imageTag || CONTAINER_IMAGE;

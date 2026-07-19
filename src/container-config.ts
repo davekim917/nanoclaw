@@ -238,10 +238,8 @@ export interface ContainerConfig {
   credentialFolder?: string;
 
   /**
-   * Legacy-named compatibility flag. When true, injects GitNexus impact and
-   * pre-commit guidance into the runtime system prompt, but only while the
-   * GitNexus plugin is mounted and its MCP server is active. It never writes
-   * AGENTS.md or CLAUDE.md into a repository.
+   * Parse-only legacy compatibility data. Retained so old container.json files
+   * still deserialize without loss; true and false are behaviorally inert.
    */
   gitnexusInjectAgentsMd?: boolean;
 

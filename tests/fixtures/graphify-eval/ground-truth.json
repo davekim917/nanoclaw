@@ -1,0 +1,342 @@
+{
+  "version": 1,
+  "generations": [
+    {
+      "id": "initial",
+      "fingerprint": "07b4b5d8b70130051c7ad328784238287cbbd2141ab26280d00a614978911353",
+      "files": [
+        {
+          "path": "dataset.json",
+          "bytes": 92,
+          "sha256": "ded8cd80d2d9e70342baca0ba74c140830ec6fc3c8d9409b68e5d3541cdba1c8"
+        },
+        {
+          "path": "src/order-router.ts",
+          "bytes": 352,
+          "sha256": "b9bd8ea00ca41545ad84b4efd9d26c4881e945d495dfc6d56e5fe71eba51508d"
+        },
+        {
+          "path": "src/order-service.ts",
+          "bytes": 428,
+          "sha256": "cec9b5c238bb5e7c26174ec200c630db998d2970f58fa15af00b5d5c38fee50a"
+        },
+        {
+          "path": "src/repository.py",
+          "bytes": 317,
+          "sha256": "7ca79028aa4ea330f73e1b21b4de5f8a7205573a194864477e86089fdf3ed1ca"
+        },
+        {
+          "path": "src/worker.py",
+          "bytes": 277,
+          "sha256": "f5a9844135adc486e8368233c48e763af52840ad30a20773a9080ff36c1f2ab5"
+        }
+      ],
+      "intentionalExclusions": ["dataset.json"],
+      "cases": [
+        {
+          "id": "query-submit-order-ambiguous",
+          "command": "query",
+          "arguments": ["submitOrder"],
+          "requiredFacts": ["symbol:submitOrder", "symbol:submitOrderBatch", "file:src/order-service.ts"],
+          "forbiddenFacts": ["symbol:process_order", "file:src/worker.py"]
+        },
+        {
+          "id": "path-route-to-validate",
+          "command": "path",
+          "arguments": ["routeOrder", "validateOrder"],
+          "requiredFacts": [
+            "symbol:routeOrder",
+            "symbol:submitOrder",
+            "symbol:validateOrder",
+            "edge:routeOrder->submitOrder",
+            "edge:submitOrder->validateOrder"
+          ],
+          "forbiddenFacts": ["symbol:process_order"]
+        },
+        {
+          "id": "explain-process-order",
+          "command": "explain",
+          "arguments": ["process_order"],
+          "requiredFacts": ["symbol:process_order", "file:src/worker.py"],
+          "forbiddenFacts": ["symbol:routeOrder"]
+        },
+        {
+          "id": "affected-validate-order",
+          "command": "affected",
+          "arguments": ["validateOrder"],
+          "requiredFacts": ["symbol:submitOrder", "symbol:routeOrder"],
+          "forbiddenFacts": ["symbol:process_order"]
+        },
+        {
+          "id": "negative-missing-path",
+          "command": "path",
+          "arguments": ["missingOrder", "validateOrder"],
+          "requiredFacts": [],
+          "forbiddenFacts": [],
+          "expectEmpty": true
+        }
+      ]
+    },
+    {
+      "id": "cached",
+      "fingerprint": "07b4b5d8b70130051c7ad328784238287cbbd2141ab26280d00a614978911353",
+      "files": [
+        {
+          "path": "dataset.json",
+          "bytes": 92,
+          "sha256": "ded8cd80d2d9e70342baca0ba74c140830ec6fc3c8d9409b68e5d3541cdba1c8"
+        },
+        {
+          "path": "src/order-router.ts",
+          "bytes": 352,
+          "sha256": "b9bd8ea00ca41545ad84b4efd9d26c4881e945d495dfc6d56e5fe71eba51508d"
+        },
+        {
+          "path": "src/order-service.ts",
+          "bytes": 428,
+          "sha256": "cec9b5c238bb5e7c26174ec200c630db998d2970f58fa15af00b5d5c38fee50a"
+        },
+        {
+          "path": "src/repository.py",
+          "bytes": 317,
+          "sha256": "7ca79028aa4ea330f73e1b21b4de5f8a7205573a194864477e86089fdf3ed1ca"
+        },
+        {
+          "path": "src/worker.py",
+          "bytes": 277,
+          "sha256": "f5a9844135adc486e8368233c48e763af52840ad30a20773a9080ff36c1f2ab5"
+        }
+      ],
+      "intentionalExclusions": ["dataset.json"],
+      "cases": [
+        {
+          "id": "cached-query-submit-order",
+          "command": "query",
+          "arguments": ["submitOrder"],
+          "requiredFacts": ["symbol:submitOrder", "symbol:submitOrderBatch", "file:src/order-service.ts"],
+          "forbiddenFacts": ["symbol:process_order", "file:src/worker.py"]
+        }
+      ]
+    },
+    {
+      "id": "modified",
+      "fingerprint": "9de268d79634e5301f8275c48088c824fdba70c1ac8087b1418246f76ae2e10c",
+      "files": [
+        {
+          "path": "dataset.json",
+          "bytes": 92,
+          "sha256": "ded8cd80d2d9e70342baca0ba74c140830ec6fc3c8d9409b68e5d3541cdba1c8"
+        },
+        {
+          "path": "src/order-router.ts",
+          "bytes": 352,
+          "sha256": "b9bd8ea00ca41545ad84b4efd9d26c4881e945d495dfc6d56e5fe71eba51508d"
+        },
+        {
+          "path": "src/order-service.ts",
+          "bytes": 424,
+          "sha256": "95b00ca1750e407e7b26949cee74191d1aa2460e8e39eec800bba0e800ef3b62"
+        },
+        {
+          "path": "src/repository.py",
+          "bytes": 317,
+          "sha256": "7ca79028aa4ea330f73e1b21b4de5f8a7205573a194864477e86089fdf3ed1ca"
+        },
+        {
+          "path": "src/worker.py",
+          "bytes": 277,
+          "sha256": "f5a9844135adc486e8368233c48e763af52840ad30a20773a9080ff36c1f2ab5"
+        }
+      ],
+      "intentionalExclusions": ["dataset.json"],
+      "mutations": [
+        {
+          "operation": "write",
+          "path": "src/order-service.ts",
+          "content": "import { enqueueOrder } from \"./order-router.js\";\n\nexport function verifyOrder(orderId: string): boolean {\n  return orderId.trim().length > 0;\n}\n\nexport function submitOrder(orderId: string): string {\n  if (!verifyOrder(orderId)) throw new Error(\"invalid order\");\n  return enqueueOrder(orderId);\n}\n\nexport function submitOrderBatch(orderIds: string[]): string[] {\n  return orderIds.map((orderId) => submitOrder(orderId));\n}\n"
+        }
+      ],
+      "cases": [
+        {
+          "id": "modified-path-route-to-verify",
+          "command": "path",
+          "arguments": ["routeOrder", "verifyOrder"],
+          "requiredFacts": [
+            "symbol:routeOrder",
+            "symbol:submitOrder",
+            "symbol:verifyOrder",
+            "edge:routeOrder->submitOrder",
+            "edge:submitOrder->verifyOrder"
+          ],
+          "forbiddenFacts": ["symbol:validateOrder"]
+        },
+        {
+          "id": "modified-explain-verify",
+          "command": "explain",
+          "arguments": ["verifyOrder"],
+          "requiredFacts": ["symbol:verifyOrder", "file:src/order-service.ts"],
+          "forbiddenFacts": ["symbol:validateOrder"]
+        }
+      ]
+    },
+    {
+      "id": "untracked",
+      "fingerprint": "45b8e884dcb797eb11d494133fdd39b76b4c3972c75425a069f4f5ed619d1d08",
+      "files": [
+        {
+          "path": "dataset.json",
+          "bytes": 92,
+          "sha256": "ded8cd80d2d9e70342baca0ba74c140830ec6fc3c8d9409b68e5d3541cdba1c8"
+        },
+        {
+          "path": "src/order-router.ts",
+          "bytes": 352,
+          "sha256": "b9bd8ea00ca41545ad84b4efd9d26c4881e945d495dfc6d56e5fe71eba51508d"
+        },
+        {
+          "path": "src/order-service.ts",
+          "bytes": 428,
+          "sha256": "cec9b5c238bb5e7c26174ec200c630db998d2970f58fa15af00b5d5c38fee50a"
+        },
+        {
+          "path": "src/repository.py",
+          "bytes": 317,
+          "sha256": "7ca79028aa4ea330f73e1b21b4de5f8a7205573a194864477e86089fdf3ed1ca"
+        },
+        {
+          "path": "src/untracked-helper.ts",
+          "bytes": 141,
+          "sha256": "05814f2a4f160656c54f6cb0e2e2b4a52ddf69618129fb0a05e3e2cd575ec7c7"
+        },
+        {
+          "path": "src/worker.py",
+          "bytes": 277,
+          "sha256": "f5a9844135adc486e8368233c48e763af52840ad30a20773a9080ff36c1f2ab5"
+        }
+      ],
+      "intentionalExclusions": ["dataset.json"],
+      "mutations": [
+        {
+          "operation": "write",
+          "path": "src/untracked-helper.ts",
+          "content": "import { submitOrder } from \"./order-service.js\";\n\nexport function scheduleOrder(orderId: string): string {\n  return submitOrder(orderId);\n}\n"
+        }
+      ],
+      "cases": [
+        {
+          "id": "untracked-query-schedule-order",
+          "command": "query",
+          "arguments": ["scheduleOrder"],
+          "requiredFacts": ["symbol:scheduleOrder", "file:src/untracked-helper.ts"],
+          "forbiddenFacts": ["symbol:process_order"]
+        },
+        {
+          "id": "untracked-path-schedule-to-validate",
+          "command": "path",
+          "arguments": ["scheduleOrder", "validateOrder"],
+          "requiredFacts": [
+            "symbol:scheduleOrder",
+            "symbol:submitOrder",
+            "symbol:validateOrder",
+            "edge:scheduleOrder->submitOrder",
+            "edge:submitOrder->validateOrder"
+          ],
+          "forbiddenFacts": ["symbol:process_order"]
+        }
+      ]
+    },
+    {
+      "id": "deleted",
+      "fingerprint": "cdc4ec83dc557b86df2dc99e3cc9d391adb33cc39977fba80fd4197a1f50b1c9",
+      "files": [
+        {
+          "path": "dataset.json",
+          "bytes": 92,
+          "sha256": "ded8cd80d2d9e70342baca0ba74c140830ec6fc3c8d9409b68e5d3541cdba1c8"
+        },
+        {
+          "path": "src/order-router.ts",
+          "bytes": 352,
+          "sha256": "b9bd8ea00ca41545ad84b4efd9d26c4881e945d495dfc6d56e5fe71eba51508d"
+        },
+        {
+          "path": "src/order-service.ts",
+          "bytes": 428,
+          "sha256": "cec9b5c238bb5e7c26174ec200c630db998d2970f58fa15af00b5d5c38fee50a"
+        },
+        {
+          "path": "src/worker.py",
+          "bytes": 277,
+          "sha256": "f5a9844135adc486e8368233c48e763af52840ad30a20773a9080ff36c1f2ab5"
+        }
+      ],
+      "intentionalExclusions": ["dataset.json"],
+      "mutations": [{ "operation": "delete", "path": "src/repository.py" }],
+      "cases": [
+        {
+          "id": "deleted-query-load-order",
+          "command": "query",
+          "arguments": ["load_order"],
+          "requiredFacts": [],
+          "forbiddenFacts": [],
+          "expectEmpty": true
+        },
+        {
+          "id": "deleted-query-process-order",
+          "command": "query",
+          "arguments": ["process_order"],
+          "requiredFacts": ["symbol:process_order", "file:src/worker.py"],
+          "forbiddenFacts": ["file:src/repository.py"]
+        }
+      ]
+    },
+    {
+      "id": "data-json",
+      "fingerprint": "7af3482d0774a526c5ba9425df17ac5c142f7ae4d2eae4a7a86320e20b99d489",
+      "files": [
+        {
+          "path": "dataset.json",
+          "bytes": 95,
+          "sha256": "2e320e73e5f70bc2c2eecfcf2253097cf33b62cac56b8ddb74ce4e6be0d26c94"
+        },
+        {
+          "path": "src/order-router.ts",
+          "bytes": 352,
+          "sha256": "b9bd8ea00ca41545ad84b4efd9d26c4881e945d495dfc6d56e5fe71eba51508d"
+        },
+        {
+          "path": "src/order-service.ts",
+          "bytes": 428,
+          "sha256": "cec9b5c238bb5e7c26174ec200c630db998d2970f58fa15af00b5d5c38fee50a"
+        },
+        {
+          "path": "src/repository.py",
+          "bytes": 317,
+          "sha256": "7ca79028aa4ea330f73e1b21b4de5f8a7205573a194864477e86089fdf3ed1ca"
+        },
+        {
+          "path": "src/worker.py",
+          "bytes": 277,
+          "sha256": "f5a9844135adc486e8368233c48e763af52840ad30a20773a9080ff36c1f2ab5"
+        }
+      ],
+      "intentionalExclusions": ["dataset.json"],
+      "mutations": [
+        {
+          "operation": "write",
+          "path": "dataset.json",
+          "content": "[\n  { \"id\": \"order-003\", \"status\": \"retrying\" },\n  { \"id\": \"order-004\", \"status\": \"queued\" }\n]\n"
+        }
+      ],
+      "cases": [
+        {
+          "id": "data-json-query-submit-order",
+          "command": "query",
+          "arguments": ["submitOrder"],
+          "requiredFacts": ["symbol:submitOrder", "symbol:submitOrderBatch", "file:src/order-service.ts"],
+          "forbiddenFacts": ["symbol:order-003", "file:dataset.json"]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,51 @@
+{
+  "status": "ACTIVATION_BLOCKED",
+  "recordedAt": "2026-07-19T00:00:50Z",
+  "retainedEvidence": {
+    "runs": 36,
+    "rawJsonlSha256": "da67b6f7d83ecc4a4bc2fdd7b39eb4a8e5f428b0f3d873cb898e8af282b05bc9",
+    "originalSummarySha256": "4064bb685a4e31ed0f23f06c0cd849a0d9e43b3f60c68721f9fbdddb13d2dcb0",
+    "candidateImageId": "sha256:2e08da6285983d0891e8bc0e6afab385e5d83ceb93ccef032e47248acac059c3",
+    "selectiveRerunOrReplacement": false
+  },
+  "originalValidatorDefect": {
+    "effect": "Shell-quoted Graphify commands were falsely reported as missing.",
+    "rawTraceResult": "All 18 Graphify-arm runs invoked the public Graphify CLI.",
+    "disposition": "The future-facing validator now reuses the audited shell-command parser. The retained raw evidence and original summary were not rewritten or rerun."
+  },
+  "independentScoringFromRetainedRawRuns": {
+    "method": "Exact typed claims, required files, and recorded run errors using the committed scoreRun contract; the invocation false positives do not count as run errors.",
+    "graphifyCorrectRuns": 14,
+    "graphifyRuns": 18,
+    "graphifyCorrectness": 0.7777777777777778,
+    "sourceOnlyCorrectRuns": 16,
+    "sourceOnlyRuns": 18,
+    "sourceOnlyCorrectness": 0.8888888888888888,
+    "graphifyMedianToolOutputBytes": 18429,
+    "sourceOnlyMedianToolOutputBytes": 24739.5,
+    "toolOutputByteReduction": 0.2550779118413873,
+    "graphifyMedianFilesOpened": 13.5,
+    "sourceOnlyMedianFilesOpened": 13,
+    "graphifyMedianPeakCgroupMemoryBytes": 616187904,
+    "sourceOnlyMedianPeakCgroupMemoryBytes": 165191680
+  },
+  "genuineFailures": {
+    "graphify": [
+      "graphify-cache-identity:graphify:3",
+      "memory-admission-priority:graphify:1",
+      "command-gate-routing:graphify:1",
+      "timezone-conversion-contract:graphify:1"
+    ],
+    "graphifyCommonCause": "Each run invoked graphify query --help; the approved gateway rejects all public subcommand flags with exit code 2.",
+    "sourceOnly": ["graphify-container-contract:source-only:3", "command-gate-routing:source-only:1"]
+  },
+  "activationGate": {
+    "passed": false,
+    "failures": ["Graphify correctness is below 90%.", "Graphify correctness is below source-only correctness."],
+    "passedConditions": [
+      "Median tool-output bytes improved by 25.5%, above the required 20%.",
+      "Median files opened regressed by 3.8%, within the allowed 10%."
+    ]
+  },
+  "requiredNextDecision": "A safe public subcommand-help contract and a new versioned evaluation protocol would change the approved boundary and require a rebuilt candidate plus a fresh non-replacement evaluation matrix."
+}

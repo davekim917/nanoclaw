@@ -366,9 +366,9 @@ export function buildOpenCodeConfig(
 
   const mcp = mcpServersToOpenCodeConfig(options.mcpServers);
 
-  // NanoClaw guard plugin: the destructive-action gate (+ best-effort GitNexus
-  // post-commit reindex), at parity with the Claude Code `block-destructive`
-  // hook via a shared decision core. opencode auto-approves every tool call
+  // NanoClaw guard plugin: the destructive-action gate, at parity with the
+  // Claude Code `block-destructive` hook via a shared decision core. OpenCode
+  // auto-approves every tool call
   // (`permission: 'allow'` + permission auto-reply), so this plugin's
   // `tool.execute.before` throw is the ONLY guardrail standing between the agent
   // and a destructive command. The plugin is mounted read-only from the

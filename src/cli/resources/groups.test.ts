@@ -37,6 +37,7 @@ import { initTestDb, closeDb, runMigrations, createAgentGroup, getDb } from '../
 import { createSession } from '../../db/sessions.js';
 import { dispatch } from '../dispatch.js';
 import { readContainerConfig } from '../../container-config.js';
+import { isSiblingBoundField } from '../../sibling-parity.js';
 // Side-effect import: registers the `groups-*` commands (including delete).
 import './groups.js';
 
@@ -336,5 +337,25 @@ describe('groups CLI resource config', () => {
       cpus: 2,
       pidsLimit: 768,
     });
+  });
+
+  it('test_legacy_gitnexus_key_is_behaviorally_inert', () => {
+    const folder = 'legacy-gitnexus';
+    const groupDir = `${TEST_DIR}/groups/${folder}`;
+    fs.mkdirSync(groupDir, { recursive: true });
+    const base = { mcpServers: {}, packages: { apt: [], npm: [] }, additionalMounts: [], skills: 'all' };
+
+    fs.writeFileSync(`${groupDir}/container.json`, JSON.stringify({ ...base, gitnexusInjectAgentsMd: true }));
+    expect(readContainerConfig(folder).gitnexusInjectAgentsMd).toBe(true);
+    fs.writeFileSync(`${groupDir}/container.json`, JSON.stringify({ ...base, gitnexusInjectAgentsMd: false }));
+    expect(readContainerConfig(folder).gitnexusInjectAgentsMd).toBe(false);
+    expect(isSiblingBoundField('gitnexusInjectAgentsMd')).toBe(false);
+  });
+
+  it('test_current_config_generators_do_not_emit_gitnexus_fields', () => {
+    const wireSource = fs.readFileSync(new URL('../../../scripts/wire-v1-channels.ts', import.meta.url), 'utf8');
+    const migrationSource = fs.readFileSync(new URL('../../../scripts/migrate-groups.ts', import.meta.url), 'utf8');
+    expect(wireSource).not.toMatch(/gitnexusInjectAgentsMd|GITNEXUS_INJECT_AGENTS_MD/);
+    expect(migrationSource).not.toMatch(/gitnexusInjectAgentsMd|GITNEXUS_INJECT_AGENTS_MD/);
   });
 });

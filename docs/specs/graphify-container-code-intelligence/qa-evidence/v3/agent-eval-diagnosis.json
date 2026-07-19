@@ -1,0 +1,41 @@
+{
+  "protocolVersion": "v3",
+  "candidateImageId": "sha256:48717117fdb5f2c5e5b270d8765df5c9fc8f41639925bb7c3af002fcdb28b025",
+  "rawRunsSha256": "49e640c6b15b940d78461c31dcb9e44502e5fb914dd271e7156cc9d561f7ad83",
+  "retainedRuns": 36,
+  "validationPassed": false,
+  "validationClassification": {
+    "genuineSourceOnlyNavigationViolations": [
+      "graphify-container-contract:source-only:1",
+      "command-gate-routing:source-only:2"
+    ],
+    "genuineGraphifyReadNoncompliance": ["memory-admission-priority:graphify:3"]
+  },
+  "diagnosticMetrics": {
+    "graphifyClaimCorrect": 18,
+    "sourceOnlyClaimCorrect": 18,
+    "graphifyStrictCorrect": 16,
+    "sourceOnlyStrictCorrect": 16,
+    "graphifyStrictCorrectness": 0.8888888889,
+    "sourceOnlyStrictCorrectness": 0.8888888889,
+    "graphifyActualReadRuns": 17,
+    "graphifyMedianFilesOpened": 8,
+    "sourceOnlyMedianFilesOpened": 11,
+    "filesOpenedImprovementPercent": 27.272727273,
+    "graphifyMedianToolOutputBytes": 19622,
+    "sourceOnlyMedianToolOutputBytes": 25993.5,
+    "toolOutputBytesImprovementPercent": 24.511897205
+  },
+  "graphifyStrictFailures": [
+    {
+      "runId": "memory-admission-priority:graphify:1",
+      "classification": "partial rg search returned matches but exited 2 because literal path test did not exist"
+    },
+    {
+      "runId": "timezone-conversion-contract:graphify:2",
+      "classification": "partial rg search returned matches but exited 2 because literal path test did not exist"
+    }
+  ],
+  "activationPassed": false,
+  "reason": "The immutable v3 matrix failed protocol validation and both arms scored 16 of 18 under the predeclared rule that command errors count against correctness, below the 90 percent floor."
+}

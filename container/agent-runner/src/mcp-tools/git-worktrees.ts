@@ -35,6 +35,23 @@ function workgroupDir(): string {
   return process.env.NANOCLAW_WORKGROUP_DIR_OVERRIDE || '/workspace/workgroup';
 }
 
+/** Contained per-repository Graphify cache path. */
+export function graphifyCacheDir(repo: string): string {
+  const nameErr = validateRepoName(repo);
+  if (nameErr) throw new Error(nameErr);
+  const root = path.resolve(process.env.NANOCLAW_GRAPHIFY_CACHE_DIR_OVERRIDE || '/workspace/.cache/graphify');
+  const cacheDir = path.resolve(root, repo);
+  if (path.dirname(cacheDir) !== root) {
+    throw new Error(`Invalid Graphify cache path for repo: ${repo}`);
+  }
+  return cacheDir;
+}
+
+/** Drop stale index state immediately before replacing a corrupt worktree. */
+export function invalidateGraphifyCacheForCorruptWorktree(repo: string): void {
+  fs.rmSync(graphifyCacheDir(repo), { recursive: true, force: true });
+}
+
 /**
  * Resolve where new clones land. Cloned repos live under `<base>/repos/<name>`
  * so they stay namespaced away from the agent's bedroom files and a single
@@ -525,7 +542,13 @@ export const createWorktreeTool: McpToolDefinition = {
     if (fs.existsSync(worktreeDir)) {
       if (!fs.existsSync(path.join(worktreeDir, '.git'))) {
         log(`create_worktree: corrupt worktree at ${worktreeDir}, removing`);
-        try { fs.rmSync(worktreeDir, { recursive: true, force: true }); } catch { /* ignore */ }
+        try {
+          invalidateGraphifyCacheForCorruptWorktree(repo);
+          fs.rmSync(worktreeDir, { recursive: true, force: true });
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          return err(`Cannot replace corrupt worktree at ${worktreeDir}: ${msg}`);
+        }
       } else {
         // Stale-attachment guard (codex #126 N4): refuse to reuse a worktree bound
         // to a clone other than the currently-resolved one (workgroup now shadows
@@ -591,71 +614,6 @@ export const createWorktreeTool: McpToolDefinition = {
 // git_commit
 // -----------------------------------------------------------------------------
 
-/**
- * Locate the shared post-commit blast-radius analyzer. It is the SAME .cjs the
- * Claude container runs as a PostToolUse hook — reused here (not reimplemented)
- * so the two paths can never drift. Always-mounted at /workspace/plugins/
- * nanoclaw-hooks; the env override exists for tests and non-standard mounts.
- */
-function findPostCommitCjs(): string | null {
-  const candidates = [
-    process.env.NANOCLAW_POSTCOMMIT_CJS,
-    process.env.CLAUDE_PLUGINS_ROOT
-      ? path.join(process.env.CLAUDE_PLUGINS_ROOT, 'nanoclaw-hooks/hooks/post-commit-verify.cjs')
-      : undefined,
-    '/workspace/plugins/nanoclaw-hooks/hooks/post-commit-verify.cjs',
-    '/workspace/project/container/nanoclaw-plugin/hooks/post-commit-verify.cjs',
-  ];
-  for (const c of candidates) {
-    if (c && fs.existsSync(c)) return c;
-  }
-  return null;
-}
-
-/**
- * Best-effort GitNexus blast-radius checklist for the commit just made in
- * `worktreeDir`. Container agents commit via this MCP tool (not raw `git
- * commit`), so a Bash-matched hook never sees these commits — running the
- * analyzer here is what gives BOTH Claude and OpenCode siblings the advisory on
- * their real commit path.
- *
- * Fail-safe by construction: a missing analyzer, missing/stale index, timeout,
- * or any error returns null and git_commit returns its plain result. The
- * advisory must never block, delay unduly, or fail a commit — so the analyzer
- * runs under a tight self-limiting budget with a hard process cap above it.
- */
-export function blastRadiusAdvisory(worktreeDir: string): string | null {
-  const cjs = findPostCommitCjs();
-  if (!cjs) return null;
-  try {
-    const input = JSON.stringify({
-      hook_event_name: 'PostToolUse',
-      tool_name: 'Bash',
-      tool_input: { command: 'git commit' },
-      tool_output: { exit_code: 0 },
-      cwd: worktreeDir,
-    });
-    const out = execFileSync('node', [cjs], {
-      input,
-      cwd: worktreeDir,
-      encoding: 'utf-8',
-      // The .cjs self-limits to this budget (printing partial results); the
-      // process timeout below is a backstop slightly above it.
-      env: { ...process.env, GITNEXUS_ADVISORY_BUDGET_MS: '12000' },
-      timeout: 15_000,
-      maxBuffer: 4 * 1024 * 1024,
-      stdio: ['pipe', 'pipe', 'pipe'],
-    });
-    const trimmed = (out || '').trim();
-    if (!trimmed) return null;
-    const parsed = JSON.parse(trimmed) as { hookSpecificOutput?: { additionalContext?: string } };
-    const ctx = parsed.hookSpecificOutput?.additionalContext;
-    return typeof ctx === 'string' && ctx.trim() ? ctx.trim() : null;
-  } catch {
-    return null;
-  }
-}
-
 export const gitCommitTool: McpToolDefinition = {
   tool: {
     name: 'git_commit',
@@ -696,8 +654,7 @@ export const gitCommitTool: McpToolDefinition = {
         'commit', '--no-verify', '-m', message,
       ]);
       const sha = runGit(worktreeDir, ['rev-parse', '--short', 'HEAD']);
-      const advisory = blastRadiusAdvisory(worktreeDir);
-      return ok(advisory ? `Committed ${sha}\n\n${advisory}` : `Committed ${sha}`);
+      return ok(`Committed ${sha}`);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       return err(`git commit failed: ${msg}`);

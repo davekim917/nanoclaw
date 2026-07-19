@@ -13,7 +13,6 @@ import {
 } from '@anthropic-ai/claude-agent-sdk';
 
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/connection.js';
-import { prepareGitNexusPluginForClaude } from '../gitnexus-runtime.js';
 import { TIMEZONE, formatLocalStamp } from '../timezone.js';
 import { registerProvider, registerProviderConfigSchema } from './provider-registry.js';
 import { buildSecretEnvVarList, MCP_HEADER_ONLY_SECRET_VARS } from './secret-env.js';
@@ -1099,7 +1098,7 @@ function discoverPlugins(): SdkPluginConfig[] {
       continue;
     }
     if (hasManifest(repoPath)) {
-      plugins.push({ type: 'local', path: prepareGitNexusPluginForClaude(repoPath) });
+      plugins.push({ type: 'local', path: repoPath });
       continue;
     }
     let subs: string[] = [];
@@ -1116,7 +1115,7 @@ function discoverPlugins(): SdkPluginConfig[] {
         continue;
       }
       if (hasManifest(subPath)) {
-        plugins.push({ type: 'local', path: prepareGitNexusPluginForClaude(subPath) });
+        plugins.push({ type: 'local', path: subPath });
         continue;
       }
       let sub2s: string[] = [];
@@ -1133,7 +1132,7 @@ function discoverPlugins(): SdkPluginConfig[] {
           continue;
         }
         if (hasManifest(sub2Path)) {
-          plugins.push({ type: 'local', path: prepareGitNexusPluginForClaude(sub2Path) });
+          plugins.push({ type: 'local', path: sub2Path });
         }
       }
     }

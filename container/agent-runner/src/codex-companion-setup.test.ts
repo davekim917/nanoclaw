@@ -150,11 +150,11 @@ describe('buildMergedConfig', () => {
 
     expect(merged).toContain('model = "gpt-5.5"');
     expect(merged).toContain('[projects."/home/x"]');
-    // Host MCPs are preserved (re-emitted in the union)
+    // Unrelated host MCPs are preserved (re-emitted in the union).
     expect(merged).toContain('[mcp_servers.exa]');
     expect(merged).toContain('url = "https://exa"');
-    expect(merged).toContain('[mcp_servers.gitnexus]');
-    expect(merged).toContain('args = ["-y", "gitnexus", "mcp"]');
+    expect(merged).not.toContain('[mcp_servers.gitnexus]');
+    expect(merged).not.toContain('args = ["-y", "gitnexus", "mcp"]');
     // Container MCPs added
     expect(merged).toContain('[mcp_servers.nanoclaw]');
     expect(merged).toContain('command = "bun"');
@@ -162,7 +162,7 @@ describe('buildMergedConfig', () => {
     expect(merged).toContain('url = "https://mcp.deepwiki.com/mcp"');
     // No duplicate table headers for a given name
     expect((merged.match(/\[mcp_servers\.exa\]/g) ?? []).length).toBe(1);
-    expect((merged.match(/\[mcp_servers\.gitnexus\]/g) ?? []).length).toBe(1);
+    expect((merged.match(/\[mcp_servers\.gitnexus\]/g) ?? []).length).toBe(0);
     expect((merged.match(/\[mcp_servers\.nanoclaw\]/g) ?? []).length).toBe(1);
   });
 
@@ -196,6 +196,47 @@ describe('buildMergedConfig', () => {
     expect(merged).toContain('model = "x"');
     expect(merged).toContain('[mcp_servers.foo]');
     expect(merged).toContain('url = "u"');
+  });
+
+  it('test_codex_companion_does_not_link_host_gitnexus_instructions', () => {
+    const hostConfig = [
+      'model = "gpt-5.5"',
+      'approval_policy = "on-request"',
+      '',
+      '[mcp_servers.context7]',
+      'type = "http"',
+      'url = "https://context7.example.com/mcp"',
+      '',
+      '[mcp_servers.gitnexus]',
+      'command = "npx"',
+      'args = ["-y", "gitnexus", "mcp"]',
+      '',
+      '[plugins.humanizer]',
+      'enabled = true',
+      '',
+      '[plugins.gitnexus]',
+      'enabled = true',
+      'cache_path = "/home/node/.codex/plugins/cache/gitnexus/1.0.0"',
+      '',
+      '[plugin_marketplaces.gitnexus]',
+      'source = "/home/ubuntu/plugins/gitnexus"',
+    ].join('\n');
+    const merged = buildMergedConfigForTest(hostConfig, {
+      nanoclaw: { type: 'stdio', command: 'bun', args: ['run', '/app/mcp.ts'], env: {} },
+      gitnexus: { type: 'stdio', command: '/pnpm/gitnexus', args: ['mcp'], env: {} },
+    });
+
+    expect(merged).not.toMatch(/gitnexus/i);
+    expect(merged).toContain('model = "gpt-5.5"');
+    expect(merged).toContain('approval_policy = "on-request"');
+    expect(merged).toContain('[mcp_servers.context7]');
+    expect(merged).toContain('[mcp_servers.nanoclaw]');
+    expect(merged).toContain('[plugins.humanizer]');
+
+    const source = fs.readFileSync(new URL('./codex-companion-setup.ts', import.meta.url), 'utf8');
+    expect(source).not.toContain("path.join(HOST_CODEX_DIR, 'AGENTS.md')");
+    expect(source).not.toContain("path.join(RUNTIME_CODEX_DIR, 'AGENTS.md')");
+    expect(source).not.toContain('symlink the host\'s behavioral rules');
   });
 });
 
@@ -325,7 +366,7 @@ const CAN_RUN_FS = (() => {
     });
     const merged = fs.readFileSync(path.join(RUNTIME_CODEX_DIR, 'config.toml'), 'utf-8');
     expect(merged).toContain('model = "gpt-5.5"');
-    expect(merged).not.toContain('[mcp_servers.exa]');
+    expect(merged).toContain('[mcp_servers.exa]');
     expect(merged).toContain('[mcp_servers.nanoclaw]');
   });
 });

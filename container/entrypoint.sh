@@ -14,8 +14,6 @@
 #   service-account override of user-OAuth
 # - GitHub git auth via `gh auth setup-git` when GH_TOKEN is set
 # - Render CLI workspace pre-configuration
-# - GitNexus repo auto-registration (so code-intel MCP tools see mounted
-#   repos without the agent having to register them by hand)
 #
 # All steps are idempotent and best-effort. If a tool isn't installed or
 # an env var isn't set, the corresponding step no-ops silently.
@@ -114,41 +112,6 @@ exec "$GWS_BIN" "\$@"
 WRAPPER
   chmod +x /tmp/bin/gws
   export PATH="/tmp/bin:$PATH"
-fi
-
-# --- GitNexus repo auto-registration ---
-# Scan mounted workspace for git repos that already have a GitNexus index
-# and register them in the container's registry.json so the gitnexus MCP
-# tools can query them. Doesn't run analysis — a stale index means the
-# agent runs `gitnexus analyze` itself when it needs to.
-mkdir -p /home/node/.gitnexus
-_gitnexus_repos=()
-for gitdir in $(find /workspace -maxdepth 4 -name .git \( -type d -o -type f \) 2>/dev/null); do
-  repo=$(dirname "$gitdir")
-  [ -f "$repo/.gitnexus/meta.json" ] && _gitnexus_repos+=("$repo")
-done
-if [ ${#_gitnexus_repos[@]} -gt 0 ]; then
-  # Prefer node (always installed), fall back to bun. Both can run this one-liner.
-  _runtime=$(command -v node 2>/dev/null || command -v bun 2>/dev/null || true)
-  if [ -n "$_runtime" ]; then
-    "$_runtime" -e '
-      const fs = require("fs"), p = require("path");
-      const regPath = p.join(process.env.HOME, ".gitnexus", "registry.json");
-      const reg = fs.existsSync(regPath) ? JSON.parse(fs.readFileSync(regPath, "utf8")) : [];
-      for (const repo of process.argv.slice(1)) {
-        if (reg.some((r) => r.path === repo)) continue;
-        try {
-          const meta = JSON.parse(fs.readFileSync(p.join(repo, ".gitnexus", "meta.json"), "utf8"));
-          reg.push({
-            name: p.basename(repo), path: repo, storagePath: p.join(repo, ".gitnexus"),
-            indexedAt: meta.indexedAt, lastCommit: meta.lastCommit, stats: meta.stats,
-          });
-        } catch {}
-      }
-      fs.writeFileSync(regPath, JSON.stringify(reg, null, 2) + "\n");
-    ' "${_gitnexus_repos[@]}" 2>/dev/null \
-      && echo "[entrypoint] GitNexus: registered ${#_gitnexus_repos[@]} repo(s)" >&2 || true
-  fi
 fi
 
 # --- Run the agent-runner ---

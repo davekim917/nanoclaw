@@ -123,6 +123,17 @@ interface WorktreeTarget {
   repo: string;
   worktreePath: string;
   canonicalRepoPath: string;
+  graphifyCachePath: string;
+}
+
+export interface OrphanGraphifyCacheTarget {
+  scope: 'session' | 'thread';
+  agentGroupId: string;
+  sessionId: string;
+  sessionIds: string[];
+  repo: string;
+  worktreePath: string;
+  graphifyCachePath: string;
 }
 
 function discoverWorktrees(): WorktreeTarget[] {
@@ -150,6 +161,7 @@ function discoverWorktrees(): WorktreeTarget[] {
             repo,
             worktreePath: path.join(worktreesDir, repo),
             canonicalRepoPath: path.join(canonicalBase, repo),
+            graphifyCachePath: path.join(agDir, entry, 'graphify-cache', repo),
           });
         }
       }
@@ -166,7 +178,7 @@ interface ThreadParticipant {
   worktreeDir: string;
 }
 
-function discoverThreadWorktrees(): WorktreeTarget[] {
+function discoverThreadParticipantsByDir(): Map<string, ThreadParticipant[]> {
   let rows: Array<{
     session_id: string;
     agent_group_id: string;
@@ -184,7 +196,7 @@ function discoverThreadWorktrees(): WorktreeTarget[] {
       .all() as typeof rows;
   } catch (err) {
     log.warn('Worktree cleanup: failed to discover thread worktrees', { err });
-    return [];
+    return new Map();
   }
 
   const participantsByDir = new Map<string, ThreadParticipant[]>();
@@ -198,6 +210,12 @@ function discoverThreadWorktrees(): WorktreeTarget[] {
     });
     participantsByDir.set(worktreeDir, participants);
   }
+
+  return participantsByDir;
+}
+
+function discoverThreadWorktrees(): WorktreeTarget[] {
+  const participantsByDir = discoverThreadParticipantsByDir();
 
   const results: WorktreeTarget[] = [];
   for (const [worktreeDir, participants] of participantsByDir) {
@@ -215,6 +233,7 @@ function discoverThreadWorktrees(): WorktreeTarget[] {
         repo,
         worktreePath: path.join(worktreeDir, repo),
         canonicalRepoPath,
+        graphifyCachePath: path.join(path.dirname(worktreeDir), 'graphify-cache', repo),
       });
     }
   }
@@ -235,24 +254,132 @@ function resolveCanonicalRepoPath(repo: string, participants: ThreadParticipant[
   return fallback;
 }
 
+function discoverOrphanGraphifyCaches(): OrphanGraphifyCacheTarget[] {
+  const results: OrphanGraphifyCacheTarget[] = [];
+  const sessionsRoot = path.join(DATA_DIR, 'v2-sessions');
+
+  if (fs.existsSync(sessionsRoot)) {
+    for (const agentGroupId of safeReaddir(sessionsRoot)) {
+      const ag = getAgentGroup(agentGroupId);
+      if (!ag) continue;
+      const agDir = path.join(sessionsRoot, agentGroupId);
+      for (const sessionId of safeReaddir(agDir)) {
+        if (sessionId === 'agent-runner-src' || sessionId === '.claude-shared') continue;
+        const sessionRoot = path.join(agDir, sessionId);
+        const cacheRoot = path.join(sessionRoot, 'graphify-cache');
+        for (const repo of safeReaddir(cacheRoot)) {
+          const worktreePath = path.join(sessionRoot, 'worktrees', repo);
+          if (fs.existsSync(worktreePath)) continue;
+          results.push({
+            scope: 'session',
+            agentGroupId,
+            sessionId,
+            sessionIds: [sessionId],
+            repo,
+            worktreePath,
+            graphifyCachePath: path.join(cacheRoot, repo),
+          });
+        }
+      }
+    }
+  }
+
+  for (const [worktreeDir, participants] of discoverThreadParticipantsByDir()) {
+    if (participants.length === 0) continue;
+    const cacheRoot = path.join(path.dirname(worktreeDir), 'graphify-cache');
+    const primary = participants[0]!;
+    for (const repo of safeReaddir(cacheRoot)) {
+      const worktreePath = path.join(worktreeDir, repo);
+      if (fs.existsSync(worktreePath)) continue;
+      results.push({
+        scope: 'thread',
+        agentGroupId: primary.agentGroupId,
+        sessionId: primary.sessionId,
+        sessionIds: participants.map((participant) => participant.sessionId),
+        repo,
+        worktreePath,
+        graphifyCachePath: path.join(cacheRoot, repo),
+      });
+    }
+  }
+
+  return results;
+}
+
+function preserveForParticipantGuard(
+  target: Pick<WorktreeTarget, 'scope' | 'agentGroupId' | 'sessionId' | 'sessionIds' | 'repo'>,
+): boolean {
+  const { scope, agentGroupId, sessionId, sessionIds, repo } = target;
+  const ctx = { scope, agentGroupId, sessionId, repo };
+  const liveStates = sessionIds.map((id) => ({ id, running: isContainerRunning(id) }));
+  if (liveStates.some(({ running }) => running)) {
+    log.debug('Worktree cleanup: skipping target with live container', { ...ctx, sessionIds });
+    return true;
+  }
+
+  // Preserve the existing conservative DB rule: an entirely unknown mapping
+  // is never enough authority to delete worktree or cache state.
+  const hasKnownSession = sessionIds.some((id) => Boolean(getSession(id)));
+  if (!hasKnownSession) {
+    log.debug('Worktree cleanup: no mapped session in DB, skipping', { ...ctx, sessionIds });
+    return true;
+  }
+  return false;
+}
+
+function removeContainedGraphifyCache(
+  target: Pick<WorktreeTarget, 'worktreePath' | 'graphifyCachePath' | 'repo' | 'scope' | 'sessionId'>,
+): void {
+  const cacheRoot = path.resolve(path.dirname(path.dirname(target.worktreePath)), 'graphify-cache');
+  const expected = path.resolve(cacheRoot, target.repo);
+  const actual = path.resolve(target.graphifyCachePath);
+  if (actual !== expected || path.dirname(actual) !== cacheRoot) {
+    log.warn('Worktree cleanup: refusing graphify cache path outside derived root', {
+      scope: target.scope,
+      sessionId: target.sessionId,
+      repo: target.repo,
+      graphifyCachePath: target.graphifyCachePath,
+      cacheRoot,
+    });
+    return;
+  }
+  fs.rmSync(actual, { recursive: true, force: true });
+}
+
+export function removeGraphifyCacheAfterWorktree(target: WorktreeTarget): void {
+  removeContainedGraphifyCache(target);
+}
+
+function cleanupOrphanGraphifyCache(target: OrphanGraphifyCacheTarget): void {
+  if (preserveForParticipantGuard(target)) return;
+  if (fs.existsSync(target.worktreePath)) {
+    log.debug('Worktree cleanup: orphan cache regained matching worktree, skipping', {
+      scope: target.scope,
+      sessionId: target.sessionId,
+      repo: target.repo,
+    });
+    return;
+  }
+  try {
+    removeContainedGraphifyCache(target);
+  } catch (err) {
+    log.error('Worktree cleanup: error pruning orphan graphify cache', {
+      scope: target.scope,
+      sessionId: target.sessionId,
+      repo: target.repo,
+      err,
+    });
+  }
+}
+
 function cleanupOne(target: WorktreeTarget): void {
   const { sessionId, sessionIds, worktreePath, canonicalRepoPath, repo, agentGroupId, scope } = target;
   const ctx = { scope, agentGroupId, sessionId, repo };
 
-  // Guard: skip if any mapped session's container is live — it may be mid-git.
-  if (sessionIds.some((id) => isContainerRunning(id))) {
-    log.debug('Worktree cleanup: skipping target with live container', { ...ctx, sessionIds });
-    return;
-  }
-
-  // Skip if every mapped session is gone from the DB — but keep the worktree
-  // for now in case it was an unexpected DB prune. Deletion-by-DB-absence is
-  // not safe without a separate sweep.
-  const hasKnownSession = sessionIds.some((id) => Boolean(getSession(id)));
-  if (!hasKnownSession) {
-    log.debug('Worktree cleanup: no mapped session in DB, skipping', { ...ctx, sessionIds });
-    return;
-  }
+  // Guard every mapped session before touching either the checkout or its
+  // stable Graphify lock/cache. isContainerRunning remains the authoritative
+  // liveness source; kernel close releases Graphify's fcntl lock.
+  if (preserveForParticipantGuard(target)) return;
 
   if (!fs.existsSync(path.join(canonicalRepoPath, '.git'))) {
     log.debug('Worktree cleanup: canonical repo missing, skipping', { ...ctx, canonicalRepoPath });
@@ -297,6 +424,7 @@ function cleanupOne(target: WorktreeTarget): void {
           ageDays: Math.round(ageDays),
         });
         removeWorktree(canonicalRepoPath, worktreePath);
+        removeGraphifyCacheAfterWorktree(target);
       } else {
         log.debug('Worktree cleanup: detached HEAD recently active, skipping', {
           ...ctx,
@@ -311,6 +439,7 @@ function cleanupOne(target: WorktreeTarget): void {
     if (merged || branchGone) {
       log.info('Worktree cleanup: removing', { ...ctx, branch, merged, branchGone });
       removeWorktree(canonicalRepoPath, worktreePath);
+      removeGraphifyCacheAfterWorktree(target);
       return;
     }
 
@@ -329,15 +458,31 @@ function cleanupOne(target: WorktreeTarget): void {
 
 function runOnce(): void {
   const targets = discoverWorktrees();
-  if (targets.length === 0) return;
-  log.info('Worktree cleanup: scanning', { count: targets.length });
+  const orphanCaches = discoverOrphanGraphifyCaches();
+  if (targets.length === 0 && orphanCaches.length === 0) return;
+  log.info('Worktree cleanup: scanning', { count: targets.length, orphanCaches: orphanCaches.length });
   for (const t of targets) {
     cleanupOne(t);
+  }
+  for (const orphan of orphanCaches) {
+    cleanupOrphanGraphifyCache(orphan);
   }
 }
 
 export function _discoverWorktreesForTesting(): WorktreeTarget[] {
   return discoverWorktrees();
+}
+
+export function _cleanupOneForTesting(target: WorktreeTarget): void {
+  cleanupOne(target);
+}
+
+export function _discoverOrphanGraphifyCachesForTesting(): OrphanGraphifyCacheTarget[] {
+  return discoverOrphanGraphifyCaches();
+}
+
+export function _cleanupOrphanGraphifyCacheForTesting(target: OrphanGraphifyCacheTarget): void {
+  cleanupOrphanGraphifyCache(target);
 }
 
 let intervalHandle: NodeJS.Timeout | null = null;

@@ -320,8 +320,8 @@ export function discoverPortableSkills(pluginsRoot: string, options: DiscoverOpt
  * - Creates real-dir `<dst>/<name>/` + child symlinks for each source entry.
  * - If `<dst>/<name>/` already exists as a real dir, reconciles its child
  *   symlinks (adds missing, removes stale, leaves non-symlinks alone) —
- *   so on every re-run it converges. A native install (e.g. `gitnexus setup`
- *   wrote real files there) is preserved verbatim.
+ *   so on every re-run it converges. A native install that wrote real files
+ *   there is preserved verbatim.
  * - Skips a name entirely when `<dst>/<name>/` contains real (non-symlink)
  *   files — that's the "operator-placed or natively-installed" signal.
  * - Removes our previously-managed mirror dirs for names no longer in the
@@ -409,7 +409,7 @@ export function syncSkillSymlinks(
     }
 
     if (dstStat?.isDirectory() && !isManagedMirror(skillDirAtDst)) {
-      // Native install present (e.g. gitnexus setup wrote real files).
+      // Native install present (real files rather than our managed links).
       // Don't touch it.
       skipped.push(name);
       continue;
@@ -435,7 +435,7 @@ export function syncSkillSymlinks(
 
 /**
  * Marker file we drop inside every mirror dir we create. Lets us
- * distinguish our writes from native installs (e.g. `gitnexus setup`)
+ * distinguish our writes from native installs
  * without ambiguity — a native install never has this file.
  */
 const MIRROR_MARKER = '.nanoclaw-managed';

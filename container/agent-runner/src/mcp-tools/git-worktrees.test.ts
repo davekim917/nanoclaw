@@ -1,11 +1,11 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { execFileSync } from 'child_process';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 
 import {
-  blastRadiusAdvisory,
+  graphifyCacheDir,
   getReposDir,
   resolveRepoDir,
   cloneRepoTool,
@@ -15,76 +15,11 @@ import {
   openPrTool,
 } from './git-worktrees';
 
-// The advisory shells out to `node <post-commit-verify.cjs>`. Where node is
-// absent the helper must fail safe (return null) — but the parse-path tests
-// genuinely need node, so guard them. The container image ships node 22.
-function nodeAvailable(): boolean {
-  try {
-    execFileSync('node', ['--version'], { stdio: 'pipe' });
-    return true;
-  } catch {
-    return false;
-  }
-}
-const hasNode = nodeAvailable();
-
-/** Run blastRadiusAdvisory with NANOCLAW_POSTCOMMIT_CJS pointed at `cjs`. */
-function withAnalyzer(cjs: string, worktreeDir: string): string | null {
-  const prev = process.env.NANOCLAW_POSTCOMMIT_CJS;
-  const prevRoot = process.env.CLAUDE_PLUGINS_ROOT;
-  process.env.NANOCLAW_POSTCOMMIT_CJS = cjs;
-  delete process.env.CLAUDE_PLUGINS_ROOT; // don't let a real mount interfere
-  try {
-    return blastRadiusAdvisory(worktreeDir);
-  } finally {
-    if (prev !== undefined) process.env.NANOCLAW_POSTCOMMIT_CJS = prev;
-    else delete process.env.NANOCLAW_POSTCOMMIT_CJS;
-    if (prevRoot !== undefined) process.env.CLAUDE_PLUGINS_ROOT = prevRoot;
-  }
-}
-
-function stubAnalyzer(body: string): { dir: string; cjs: string } {
-  const dir = mkdtempSync(join(tmpdir(), 'pcv-'));
-  const cjs = join(dir, 'stub.cjs');
-  writeFileSync(cjs, body);
-  return { dir, cjs };
-}
-
-describe('blastRadiusAdvisory', () => {
-  test('returns null when no analyzer .cjs is resolvable (fail-safe)', () => {
-    expect(withAnalyzer('/nonexistent/post-commit-verify.cjs', tmpdir())).toBeNull();
-  });
-
-  test.skipIf(!hasNode)('parses additionalContext from analyzer stdout', () => {
-    const { dir, cjs } = stubAnalyzer(
-      `console.log(JSON.stringify({ hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: '## Post-Commit Verification CHECKLIST-MARKER' } }));`,
-    );
-    expect(withAnalyzer(cjs, dir)).toContain('CHECKLIST-MARKER');
-  });
-
-  test.skipIf(!hasNode)('returns null on empty analyzer output (no index / early-return)', () => {
-    const { dir, cjs } = stubAnalyzer(`// analyzer printed nothing — mirrors the no-index early return`);
-    expect(withAnalyzer(cjs, dir)).toBeNull();
-  });
-
-  test.skipIf(!hasNode)('returns null on malformed analyzer output (fail-safe parse)', () => {
-    const { dir, cjs } = stubAnalyzer(`console.log('not json at all');`);
-    expect(withAnalyzer(cjs, dir)).toBeNull();
-  });
-
-  test.skipIf(!hasNode)('returns null when additionalContext is blank', () => {
-    const { dir, cjs } = stubAnalyzer(
-      `console.log(JSON.stringify({ hookSpecificOutput: { additionalContext: '   ' } }));`,
-    );
-    expect(withAnalyzer(cjs, dir)).toBeNull();
-  });
-});
-
 // ---------------------------------------------------------------------------
 // getReposDir / resolveRepoDir / clone_repo (Group G — workgroup repoint)
 //
-// These exercise the real filesystem (matching the blastRadiusAdvisory tests'
-// real-dir style rather than module mocks). The dir-resolution helpers read
+// These exercise the real filesystem rather than module mocks. The
+// dir-resolution helpers read
 // their base paths from NANOCLAW_*_DIR_OVERRIDE env vars (a test-only escape
 // hatch that production never sets), so we point them at fresh temp dirs.
 // ---------------------------------------------------------------------------
@@ -104,6 +39,7 @@ describe('getReposDir / resolveRepoDir / clone_repo', () => {
     'NANOCLAW_AGENT_DIR_OVERRIDE',
     'NANOCLAW_WORKTREES_DIR_OVERRIDE',
     'NANOCLAW_WORKGROUP_DIR_OVERRIDE',
+    'NANOCLAW_GRAPHIFY_CACHE_DIR_OVERRIDE',
     'NANOCLAW_WORKGROUP_ID',
   ] as const;
   let savedEnv: Record<string, string | undefined>;
@@ -120,6 +56,7 @@ describe('getReposDir / resolveRepoDir / clone_repo', () => {
     process.env.NANOCLAW_AGENT_DIR_OVERRIDE = agentDir;
     process.env.NANOCLAW_WORKGROUP_DIR_OVERRIDE = workgroupDir;
     process.env.NANOCLAW_WORKTREES_DIR_OVERRIDE = join(root, 'worktrees');
+    process.env.NANOCLAW_GRAPHIFY_CACHE_DIR_OVERRIDE = join(root, 'graphify-cache');
     delete process.env.NANOCLAW_WORKGROUP_ID;
   });
 
@@ -477,5 +414,96 @@ describe('getReposDir / resolveRepoDir / clone_repo', () => {
     const text = res.content[0].text;
     expect(text).toContain(privateClone);
     expect(text).not.toContain('PRIVATE'); // the new gate did NOT fire
+  });
+
+  test('test_corrupt_worktree_replacement_removes_matching_graphify_cache', async () => {
+    const name = 'corrupt-repo';
+    const repo = join(agentDir, 'repos', name);
+    initRepoWithOrigin(repo, 'https://github.com/acme/corrupt-repo.git');
+    execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '--allow-empty', '-m', 'init'], {
+      cwd: repo,
+      stdio: 'pipe',
+    });
+    execFileSync('git', ['branch', 'feature'], { cwd: repo, stdio: 'pipe' });
+
+    const corruptWorktree = join(root, 'worktrees', name);
+    mkdirSync(corruptWorktree, { recursive: true });
+    writeFileSync(join(corruptWorktree, 'partial-checkout'), 'corrupt');
+    const cache = graphifyCacheDir(name);
+    mkdirSync(join(cache, 'timeout-debris'), { recursive: true });
+    writeFileSync(join(cache, 'enospc.partial'), 'partial');
+    writeFileSync(join(cache, 'lock'), '');
+
+    const response = await createWorktreeTool.handler({ repo: name, branch: 'feature' });
+
+    expect(response.isError).toBeFalsy();
+    expect(existsSync(join(corruptWorktree, '.git'))).toBe(true);
+    expect(existsSync(cache)).toBe(false);
+  });
+
+  test('test_valid_worktree_reuse_keeps_graphify_cache', async () => {
+    const name = 'valid-repo';
+    const repo = join(agentDir, 'repos', name);
+    initRepoWithOrigin(repo, 'https://github.com/acme/valid-repo.git');
+    execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '--allow-empty', '-m', 'init'], {
+      cwd: repo,
+      stdio: 'pipe',
+    });
+    const worktree = join(root, 'worktrees', name);
+    execFileSync('git', ['worktree', 'add', '-b', 'feature', worktree], { cwd: repo, stdio: 'pipe' });
+    const cache = graphifyCacheDir(name);
+    mkdirSync(cache, { recursive: true });
+    writeFileSync(join(cache, 'index.db'), 'stable');
+
+    const reused = await createWorktreeTool.handler({ repo: name, branch: 'feature' });
+    expect(reused.isError).toBeFalsy();
+    expect(existsSync(join(cache, 'index.db'))).toBe(true);
+
+    const mismatch = await createWorktreeTool.handler({ repo: name, branch: 'different-branch' });
+    expect(mismatch.isError).toBe(true);
+    expect(existsSync(join(cache, 'index.db'))).toBe(true);
+
+    writeFileSync(join(worktree, 'dirty.ts'), 'uncommitted');
+    const editedReuse = await createWorktreeTool.handler({ repo: name, branch: 'feature' });
+    expect(editedReuse.isError).toBeFalsy();
+    expect(existsSync(join(cache, 'index.db'))).toBe(true);
+  });
+
+  test('test_git_commit_returns_sha_without_advisory_subprocess', async () => {
+    const name = 'commit-repo';
+    const repo = join(agentDir, 'repos', name);
+    initRepoWithOrigin(repo, 'https://github.com/acme/commit-repo.git');
+    execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '--allow-empty', '-m', 'init'], {
+      cwd: repo,
+      stdio: 'pipe',
+    });
+    const worktree = join(root, 'worktrees', name);
+    execFileSync('git', ['worktree', 'add', '-b', 'feature', worktree], { cwd: repo, stdio: 'pipe' });
+    writeFileSync(join(worktree, 'changed.ts'), 'export const changed = true;\n');
+
+    const fakeBin = join(root, 'fake-bin');
+    const nodeCanary = join(root, 'node-was-run');
+    mkdirSync(fakeBin, { recursive: true });
+    writeFileSync(join(fakeBin, 'node'), `#!/bin/sh\ntouch "${nodeCanary}"\nexit 99\n`);
+    chmodSync(join(fakeBin, 'node'), 0o755);
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${fakeBin}:${previousPath ?? ''}`;
+
+    try {
+      const response = await gitCommitTool.handler({ repo: name, message: 'commit everything' });
+      const sha = execFileSync('git', ['rev-parse', '--short', 'HEAD'], {
+        cwd: worktree,
+        encoding: 'utf-8',
+      }).trim();
+      expect(response.isError).toBeFalsy();
+      expect(response.content[0].text).toBe(`Committed ${sha}`);
+      expect(existsSync(nodeCanary)).toBe(false);
+      expect(execFileSync('git', ['status', '--porcelain'], { cwd: worktree, encoding: 'utf-8' }).trim()).toBe('');
+      expect(
+        execFileSync('git', ['log', '-1', '--format=%an <%ae>'], { cwd: worktree, encoding: 'utf-8' }).trim(),
+      ).toBe('agent <agent@nanoclaw.local>');
+    } finally {
+      process.env.PATH = previousPath;
+    }
   });
 });

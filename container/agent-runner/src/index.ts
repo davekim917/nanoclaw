@@ -36,7 +36,6 @@ import type { McpServerConfig } from './providers/types.js';
 import { runPollLoop } from './poll-loop.js';
 import { setupCodexRuntime, syncAgentSkillsMirror } from './codex-companion-setup.js';
 import { activateGcpServiceAccount } from './gcp-auth-setup.js';
-import { configureGitNexusRuntime } from './gitnexus-runtime.js';
 import { startResourceTelemetry } from './resource-telemetry.js';
 
 function log(msg: string): void {
@@ -166,24 +165,12 @@ async function main(): Promise<void> {
     }
   }
 
-  // GitNexus is optional and plugin-owned. A mounted GitNexus plugin activates
-  // the image-pinned MCP server for every provider; repos and generic workflow
-  // skills stay free of GitNexus-specific requirements. Claude receives a
-  // plugin overlay below so its unpinned `.mcp.json` server is not launched a
-  // second time.
-  const gitnexusRuntime = configureGitNexusRuntime(mcpServers, {
-    excludedMcpServers: config.excludeMcpServers,
-    injectInstructions: process.env.GITNEXUS_INJECT_AGENTS_MD === 'true',
-  });
-  if (gitnexusRuntime.injected) {
-    log('GitNexus plugin active: added image-pinned MCP server');
-  }
-  const instructions = [baseInstructions, gitnexusRuntime.instructions].filter(Boolean).join('\n\n');
+  const instructions = baseInstructions;
 
   // Skills parity: populate `/home/node/.agents/skills/` unconditionally so
   // BOTH codex-primary (illie-codex) AND codex-as-peer (illie running the
-  // codex companion) see the same plugin skills (humanizer, gitnexus-*,
-  // impeccable, etc.). Pass runtime so runtime-specific denylists apply
+  // codex companion) see the same plugin skills (humanizer, impeccable,
+  // etc.). Pass runtime so runtime-specific denylists apply
   // correctly — e.g., opencode runtime surfaces workflow-agents skills as
   // text (since there's no codex-plugin loader on opencode), while codex
   // runtime continues to deny them (loaded via .codex-plugin/ instead).

@@ -1,0 +1,916 @@
+version: 1
+feature: graphify-container-code-intelligence
+created_at: 2026-07-18
+status: activation_approved
+
+constraints:
+  - id: C1
+    classification: HARD
+    text: Container-agent index freshness is fully automatic and requires no operator refresh.
+    source: user
+    affects_groups: [A, B, D, E]
+  - id: C2
+    classification: HARD
+    text: GitNexus is absent from the container-agent runtime after activation.
+    source: user
+    affects_groups: [B, C, D]
+  - id: C3
+    classification: HARD
+    text: Graphify runs only as bounded CLI processes with no persistent MCP server or daemon.
+    source: approved-architecture
+    affects_groups: [A, D, E]
+  - id: C4
+    classification: HARD
+    text: Generated graph data stays outside source repositories and Git history.
+    source: approved-architecture
+    affects_groups: [A, B, D, E]
+  - id: C5
+    classification: HARD
+    text: Managed-worktree safety and provider parity are preserved.
+    source: project
+    affects_groups: [B, C, D, E]
+  - id: C6
+    classification: HARD
+    text: Refresh failure cannot expose a partially updated or silently stale graph.
+    source: derived-requirement
+    affects_groups: [A, B, E]
+  - id: C7
+    classification: SOFT
+    text: Extraction cost is deferred until graph-backed code intelligence is requested.
+    source: approved-architecture
+    affects_groups: [A, B, D, E]
+  - id: C8
+    classification: HARD
+    text: The NanoClaw freshness gateway is the only supported graphify command on PATH and rejects output or graph path bypasses.
+    source: design-constraint-analysis
+    affects_groups: [A, D]
+  - id: C9
+    classification: HARD
+    text: Cache identity and locking are shared by sibling agents on one managed worktree and isolated between worktrees.
+    source: design-constraint-analysis
+    affects_groups: [A, B, E]
+  - id: C10
+    classification: HARD
+    text: The Graphify workflow skill remains projected for every provider even under an explicit restricted skill list.
+    source: design-constraint-analysis
+    affects_groups: [B, D, E]
+  - id: C11
+    classification: HARD
+    text: The complete resolved and hash-locked Graphify dependency closure satisfies the three-day dependency-age policy without an exclusion.
+    source: design-constraint-analysis
+    affects_groups: [A, D, E]
+  - id: C12
+    classification: HARD
+    text: Graphify lock waits and child processes have deadlines, extraction workers are bounded, and first-ship extraction admission is one slot across the host.
+    source: review-cycle-1
+    affects_groups: [A, B, D, E]
+  - id: C13
+    classification: HARD
+    text: Activation requires source-grounded retrieval correctness and measurable benefit in addition to memory reduction.
+    source: review-cycle-1
+    affects_groups: [A, E]
+
+decisions:
+  - id: D1
+    status: accepted
+    decision: Make Graphify universally available to container agents but lazy per thread and repository.
+    rationale: Conversations can transition from knowledge work to code work without knowing that need at routing time.
+    affects_groups: [B, D, E]
+    alternatives:
+      - Restrict Graphify to statically selected agent groups.
+      - Create and index worktrees for every thread at startup.
+  - id: D2
+    status: accepted
+    decision: Enforce freshness at query time and treat post-commit refresh as insufficient.
+    rationale: Query-time reconciliation includes uncommitted, added, and deleted files and removes reliance on manual behavior.
+    affects_groups: [A, B, D, E]
+    alternatives:
+      - Refresh only after commits.
+      - Warn the agent when stale and require a manual analyze command.
+  - id: D3
+    status: proposed
+    decision: Hold disruptive live restart until in-flight work is checked and rollout is explicitly safe.
+    rationale: Image activation can terminate active agent turns even when code and image validation are complete.
+    affects_groups: [D, E]
+    alternatives:
+      - Restart all agent containers immediately after build.
+  - id: D4
+    status: superseded
+    decision: Use a NanoClaw-owned CLI freshness gateway with a locked transactional cache in each linked worktree Git administrative directory.
+    rationale: This is the only evaluated option that enforces query-time freshness, fail-closed behavior, provider parity, clean repositories, lazy indexing, and one-shot execution together.
+    constraint_refs: [C1, C2, C3, C4, C5, C6, C7, C8, C9, C10, C11]
+    affects_groups: [A, B, C, D, E]
+    alternatives:
+      - Skill-only direct upstream Graphify CLI workflow.
+      - Commit-hook or watcher-maintained Graphify index.
+    superseded_by: D7
+  - id: D5
+    status: rejected
+    decision: Install the upstream Graphify CLI and skill directly and rely on agents to refresh before querying.
+    rationale: The upstream fast path and manual extraction workflow can query stale state and make correctness depend on model compliance.
+    constraint_refs: [C1, C4, C8, C10]
+    affects_groups: [A, D]
+  - id: D6
+    status: rejected
+    decision: Maintain freshness with post-commit hooks or a persistent worktree watcher.
+    rationale: Hooks miss required uncommitted state while a watcher violates the one-shot and bounded-idle-memory constraints; both still require a query gate for correctness.
+    constraint_refs: [C1, C3, C6]
+    affects_groups: [A, B, C, D]
+  - id: D7
+    status: superseded
+    decision: Keep the enforcing CLI gateway but store its per-repository cache under an application-owned hidden directory in the host-backed thread/session worktree root.
+    rationale: Siblings retain one shared cache and cleanup lifecycle while NanoClaw avoids relying on Git-private administrative storage; cleanup explicitly excludes and removes the hidden directory.
+    constraint_refs: [C4, C5, C7, C9]
+    affects_groups: [B]
+    alternatives:
+      - Store cache in the linked worktree Git administrative directory.
+      - Store cache inside the checked-out repository.
+    superseded_by: D13
+  - id: D8
+    status: superseded
+    decision: Define freshness at a stable SHA-256 source-inventory fingerprint and retry when source changes overlap extraction.
+    rationale: The cache lock cannot stop source writers; fingerprint comparison provides a precise linearization point and coalesces unchanged queued callers without manual refresh.
+    constraint_refs: [C1, C6, C8, C9]
+    affects_groups: [A]
+    alternatives:
+      - Lock every source writer.
+      - Index a copied immutable source snapshot.
+    superseded_by: D14
+  - id: D9
+    status: superseded
+    decision: Install Graphify from a committed exact-version and hash-locked dependency resolution generated with a three-day release cutoff.
+    rationale: Pinning only graphifyy leaves broad transitive ranges floating across image rebuilds.
+    constraint_refs: [C11]
+    affects_groups: [A, D]
+    superseded_by: D15
+  - id: D10
+    status: superseded
+    decision: Start with two AST workers, one host-wide extraction slot, a 900-second shared refresh budget, a 120-second query budget, and process-group termination.
+    rationale: Conservative explicit bounds prevent the replacement from recreating OOM and silent-wait failure modes; raising them requires the same production cgroup gate.
+    constraint_refs: [C3, C6, C12]
+    affects_groups: [A, B, D, E]
+    alternatives:
+      - Use Graphify os.cpu_count worker default with per-worktree locks only.
+      - Defer all limits until after rollout.
+    superseded_by: D16
+  - id: D11
+    status: accepted
+    decision: Scope repository code-intelligence instructions by NANOCLAW_CONTAINER so container agents use Graphify and host operator sessions retain GitNexus.
+    rationale: Complete container retirement cannot leave an applicable repository instruction requiring absent GitNexus tools.
+    constraint_refs: [C2, C5, C10]
+    affects_groups: [B, C, D, E]
+  - id: D12
+    status: superseded
+    decision: Gate activation on deterministic command-quality fixtures and a grounded Graphify-assisted versus source-only comparison.
+    rationale: Freshness and lower memory do not establish that the replacement improves agent code work.
+    constraint_refs: [C13]
+    affects_groups: [E]
+    superseded_by: D17
+  - id: D13
+    status: accepted
+    decision: Mount Graphify cache from application state beside the owning thread or session worktree directory at /workspace/.cache/graphify.
+    rationale: Sibling agents retain one cache without colliding with any legal repository name, checked-out source, or Git-private metadata.
+    constraint_refs: [C4, C5, C7, C9]
+    affects_groups: [B, D, E]
+    alternatives:
+      - Reserve a hidden direct child under /workspace/worktrees.
+      - Store cache in linked-worktree Git administrative metadata.
+  - id: D14
+    status: accepted
+    decision: Extract only from an immutable private source snapshot and rebuild the complete graph on changes while reusing only versioned content-addressed AST cache entries.
+    rationale: Endpoint fingerprints cannot prove which bytes a live-tree extraction parsed; excluding the prior graph and manifest also prevents stale source contributions from surviving a soft extraction failure.
+    constraint_refs: [C1, C6, C8, C9]
+    affects_groups: [A, E]
+    alternatives:
+      - Live-tree fingerprint before and after incremental extraction.
+      - Fork Graphify to add a source filesystem transaction.
+  - id: D15
+    status: accepted
+    decision: Install Graphify from a production ARM64 and Python targeted exact wheel lock with hashes, a three-day cutoff, and no source distributions.
+    rationale: Wheel-only hash-required installation closes the runtime and PEP 517 build-dependency supply-chain surfaces without making the image's uv installation part of Graphify runtime enforcement.
+    constraint_refs: [C11]
+    affects_groups: [A, D, E]
+  - id: D16
+    status: superseded
+    decision: Start with one AST worker, one host-wide extraction slot, 4000 files and 64 MiB source caps, a 256 MiB graph cap, 640 MiB descendant RSS, 128 MiB protected runner reserve, and existing refresh/query deadlines.
+    rationale: Concurrency limits alone do not prevent one large Graphify process from OOM-killing the agent; pre-admission and active descendant enforcement make failure bounded and recoverable.
+    constraint_refs: [C3, C6, C12]
+    affects_groups: [A, B, D, E]
+    alternatives:
+      - Rely on the container 5 GiB cgroup limit.
+      - Benchmark representative repositories without enforcing runtime limits.
+    superseded_by: D20
+  - id: D17
+    status: superseded
+    decision: Gate activation on six committed tasks, three runs per arm, fixed model and prompts, exact correctness scoring, and a 20 percent median source-read or tool-byte reduction with bounded regression in the other metric.
+    rationale: A named but underspecified A/B can pass on one favorable run and does not demonstrate reproducible value.
+    constraint_refs: [C13]
+    affects_groups: [E]
+    superseded_by: D35
+  - id: D18
+    status: accepted
+    decision: Define freshness as exact graph equality to the immutable source generation captured by the current invocation, with repeated live comparisons for ordinary overlap detection but no claim of a filesystem-wide atomic instant against non-cooperating writers.
+    rationale: Ext4 and ordinary userspace readers cannot atomically snapshot arbitrary multi-file writes; the user-facing invariant is automatic current-invocation capture with no stale prior-cache query, which the immutable generation enforces.
+    constraint_refs: [C1, C6]
+    affects_groups: [A, E]
+  - id: D19
+    status: accepted
+    decision: Keep all detected files in freshness state but classify only the pinned JSON extractor's exact data-json skip as intentionally non-applicable to graph contribution.
+    rationale: Graphify deliberately omits ordinary datasets and fixtures while treating .json as code; exact intentional exclusion preserves strict completeness without rejecting valid repositories.
+    constraint_refs: [C1, C6, C13]
+    affects_groups: [A, E]
+  - id: D20
+    status: accepted
+    decision: Run patched sequential Graphify extraction, validation, and query inside one private worker under hard RLIMIT_AS, RLIMIT_FSIZE, and RLIMIT_NPROC, supervised outside the limit for deadlines and promotion.
+    rationale: Userspace RSS polling cannot prevent a rapid allocation from OOM-killing the agent; kernel limits applied before Graphify import are enforceable, and zero process allowance prevents descendants from acquiring independent limits.
+    constraint_refs: [C3, C6, C12]
+    affects_groups: [A, D, E]
+    alternatives:
+      - Userspace descendant RSS monitor
+      - Delegated child cgroup, unavailable in the current Docker runtime
+      - Separate Graphify sidecar container, which would materially expand runtime architecture
+  - id: D21
+    status: accepted
+    decision: Keep the deployed 2048 MiB request for normal residency and admit the single kernel-bounded Graphify burst against the 5120 MiB hard limit with 512 MiB protected for the runner.
+    rationale: Request is host scheduling reservation, not the cgroup ceiling; charging the full transient address-space cap to every 2 GiB request would reject Graphify at the measured 1.2 GiB baseline, while one host-wide slot bounds burst concurrency.
+    constraint_refs: [C7, C12, C13]
+    affects_groups: [A, B, D, E]
+    alternatives:
+      - Raise every container request to include a rarely used transient burst.
+      - Make every changed Graphify query fail admission at the current request.
+  - id: D22
+    status: accepted
+    decision: Backport Graphify's source-root and cache-location separation, reject subprocess-backed capital-F Fortran, and suppress all worker descendants under RLIMIT_NPROC zero.
+    rationale: Pinned v0.9.16 external output otherwise misanchors source attribution, while its Fortran cpp and Git metadata subprocesses escape a per-process address-space accounting model.
+    constraint_refs: [C1, C3, C6, C12, C13]
+    affects_groups: [A, D, E]
+  - id: D23
+    status: accepted
+    decision: Extend NanoClaw sequential mode to Graphify manifest hashing and pin native library thread counts so the real workflow succeeds under RLIMIT_NPROC zero.
+    rationale: The pinned manifest writer otherwise starts a mandatory ThreadPoolExecutor and deterministically fails after task creation is prohibited.
+    constraint_refs: [C3, C6, C12]
+    affects_groups: [A, D, E]
+  - id: D24
+    status: accepted
+    decision: Require the host-wide Graphify worker slot for extraction and cached or changed queries alike.
+    rationale: Query workers have the same transient address-space ceiling as extraction; excluding cached reads would permit fleet-wide burst multiplication.
+    constraint_refs: [C3, C12]
+    affects_groups: [A, E]
+  - id: D25
+    status: accepted
+    decision: Generate and validate Graphify output in a 192 MiB per-container tmpfs quota before copying a successful candidate into persistent same-filesystem staging.
+    rationale: Per-file limits and post-run directory checks cannot stop thousands of small AST cache files from exhausting host disk or cgroup-charged page cache during generation.
+    constraint_refs: [C4, C6, C12]
+    affects_groups: [A, B, D, E]
+  - id: D26
+    status: accepted
+    decision: Acquire the host-wide all-worker slot before the final two cached-query source inventories.
+    rationale: Revalidating before a potentially long slot wait allows source changes during that wait to bypass the query-time freshness gate.
+    constraint_refs: [C1, C6, C9, C12]
+    affects_groups: [A, E]
+  - id: D27
+    status: accepted
+    decision: Seed only v0.9.16 AST cache files whose exact content-plus-relative-path hashes occur in the captured current source generation.
+    rationale: Same-version cache cleanup does not remove obsolete edit and deletion entries; copying them all eventually makes the bounded generation fail permanently.
+    constraint_refs: [C1, C6, C7, C12]
+    affects_groups: [A, E]
+  - id: D28
+    status: accepted
+    decision: Reuse an expected AST cache hash only when the exact case-sensitive path persists from prior to current state and neither generation has a case-fold path collision.
+    rationale: Graphify lowercases relative paths in cache keys, so case-only renames and legal Linux case-distinct files can otherwise alias entries with stale embedded source attribution.
+    constraint_refs: [C1, C6, C7, C13]
+    affects_groups: [A, E]
+  - id: D29
+    status: accepted
+    decision: Keep parsing gitnexusInjectAgentsMd as inert legacy compatibility data while removing every behavioral consumer and advertised output.
+    rationale: Removing the parser would touch the CRITICAL readContainerConfig boundary and force destructive bulk rewrites of install-specific materialized group configuration without improving runtime retirement.
+    constraint_refs: [C2, C5]
+    affects_groups: [B, C, D]
+    alternatives:
+      - Remove the key from the critical parser and type surface immediately.
+      - Bulk rewrite every materialized group container.json.
+      - Preserve active runtime behavior behind the legacy key.
+  - id: D30
+    status: accepted
+    decision: Preserve the completed 36-run matrix exactly as recorded and block activation because Graphify missed the correctness floor and source-only parity despite passing the tool-byte efficiency threshold.
+    rationale: C13 explicitly counts failures against the arm and forbids selective rerun replacement; correcting a validator false positive does not erase four genuine Graphify command failures in the retained traces.
+    constraint_refs: [C13]
+    affects_groups: [E]
+    alternatives:
+      - Discard the four failed runs and rerun only those repetitions.
+      - Treat the 25.5 percent byte reduction as sufficient by itself.
+      - Reinterpret rejected help probes as successful runs despite recorded command errors.
+  - id: D31
+    status: accepted
+    decision: Reuse the evaluator's audited shell-command parser when classifying public Graphify invocation in both arms.
+    rationale: The original ad hoc regular expression missed every shell-quoted invocation even though all 18 Graphify runs called the CLI; symmetric parsing prevents both false negatives and source-only bypasses in future protocols.
+    constraint_refs: [C13]
+    affects_groups: [E]
+    alternatives:
+      - Keep the original regex and post-process the summary manually.
+      - Match the word graphify anywhere, including echo output and unrelated command names.
+  - id: D32
+    status: accepted
+    decision: Expose root and public-read subcommand help as identical side-effect-free syntax summaries while continuing to reject help mixed with query arguments and every path, graph, cache, extraction, watch, hook, MCP, or daemon bypass.
+    rationale: The first retained matrix showed that ordinary agents probe subcommand help before use; supporting that standard CLI convention removes needless tool errors without entering repository resolution or weakening the freshness gateway.
+    constraint_refs: [C1, C3, C6, C8, C13]
+    affects_groups: [A, D, E]
+    alternatives:
+      - Continue rejecting every subcommand help form.
+      - Delegate subcommand help to upstream Graphify.
+      - Permit arbitrary flags on public read commands.
+  - id: D33
+    status: accepted
+    decision: Preserve v1, v2, and v3 agent-value evidence as separate immutable protocol directories and refuse selective replacement or reinterpretation of any retained raw row.
+    rationale: Side-effect-free help, quote-aware command classification, and stronger treatment instructions materially changed the protocol; versioned evidence makes each correction auditable without erasing unfavorable outcomes.
+    constraint_refs: [C13]
+    affects_groups: [E]
+    alternatives:
+      - Overwrite the original failed matrix.
+      - Replace only invalid or failed repetitions.
+      - Merge rows from different protocol versions into one favorable matrix.
+  - id: D34
+    status: accepted
+    decision: Keep activation blocked after v2 and v3 even though both revised matrices achieved 18 of 18 exact claims per arm and material retrieval-efficiency improvements.
+    rationale: v2 failed immutable protocol validation; v3 failed protocol validation and both arms scored 16 of 18 under the predeclared strict rule that command errors count against correctness. Relaxing partial-search or per-run-use semantics after observing results would change the activation policy and needs an explicit user decision.
+    constraint_refs: [C13]
+    affects_groups: [E]
+    alternatives:
+      - Treat exact claims and the measured file/byte reductions as sufficient for activation.
+      - Reclassify partial rg exit-2 results or Graphify non-use after the fact.
+      - Run further matrices until one passes without first changing and approving the protocol.
+  - id: D35
+    status: accepted
+    decision: Freeze and run exactly one final v4 C13 matrix with claim-only correctness, separate execution grounding, start-ordered Graphify treatment adherence, the narrow attributed partial-rg exception, and the unchanged efficiency gate.
+    rationale: The user explicitly approved these semantics before v4 execution. Separating answer quality from execution compliance preserves all 18 rows per arm while still making grounding and treatment hard gates; the narrow exit-2 exception accepts usable partial rg results without excusing unauditable commands or errors without known-file matches.
+    constraint_refs: [C13]
+    affects_groups: [E]
+    exact_semantics:
+      correctness: Exact typed claims over all 18 rows per arm; Graphify must score at least 17 of 18 and not below source-only. Execution status and treatment do not remove rows.
+      execution_grounding: Exactly 36 balanced fresh read-only runs on one immutable image, model, prompts, snapshot, and evaluator; shell only; at most 12 calls; every expected file read; zero forbidden access, unauditable navigation, fatal runtime schema or command errors, and source-only Graphify invocations.
+      partial_rg_exit_2: Nonfatal only for an actual auditable rg executable whose output has at least one path-attributed match to a known frozen repository file; otherwise fatal. Existing grep and rg exit-1 no-match behavior is unchanged.
+      treatment: A public Graphify query, path, explain, or affected item must start before every ordinary source search or content read. Help and version do not count. At least 17 of 18 Graphify rows must adhere; 16 fails. Nonadherent rows remain in every denominator.
+      efficiency: At least 20 percent better median files with tool bytes at most 10 percent worse, or at least 20 percent better median tool bytes with files at most 10 percent worse, over all 18 rows per arm. Source bytes, time, and memory are diagnostic only.
+      retention: v1-v3 are immutable. v4 writes only its versioned output, refuses any nonempty retained raw file, permits no selective rerun or exclusion, and may not change semantics after results.
+    alternatives:
+      - Keep the v3 strict policy and do not activate.
+      - Reinterpret v3 evidence after observing it.
+      - Run repeated matrices until one passes.
+  - id: D36
+    status: accepted
+    decision: Preserve the one authorized v4 matrix unchanged and block activation because six public Graphify tool starts had no matching completion.
+    rationale: Claim correctness and both efficiency measures passed, but D35 makes execution grounding a zero-tolerance hard gate. All 18 Graphify rows raw-started treatment before source navigation, while the frozen completed-call summary reports 12 of 18; the six unfinished tools explain the difference and independently fail activation, so neither rerun nor reinterpretation is permitted.
+    constraint_refs: [C13]
+    affects_groups: [E]
+    evidence:
+      - v4 retained 36 rows on candidate sha256:8f92cba804ec5ea894195724f77c6ea44f2681be3e0581526cdd6f572a83fca6.
+      - Both arms scored 18 of 18 exact claims; Graphify improved median files by 27.777777778 percent and median tool-output bytes by 20.39230689 percent.
+      - Six Graphify rows retained item.started without matching item.completed, violating execution grounding.
+      - Raw SHA-256 b0bb910ed411b8febd684f1e3128a7ff3a105a5ba22325371628a30d9e84216b and summary SHA-256 02cb3669b9a7432e777f4d8f9c04b5e7f33f1e07169cb7b2e69ac588a6b41397 are retained.
+    alternatives:
+      - Rerun or replace only the six unfinished rows.
+      - Reinterpret unmatched starts as successful completed Graphify calls.
+      - Advance on correctness and efficiency while waiving execution grounding.
+  - id: D37
+    status: accepted
+    decision: Fail closed when Codex reports a successful turn while an execution item remains unfinished, then perform the existing one-shot app-server replacement and persisted-thread resume.
+    rationale: The retained v4 traces exposed a provider lifecycle gap that could accept an apparently complete answer after abandoning a command. Preserving closed-item state through turn completion makes the failure observable and recoverable without duplicating the prompt or requiring manual intervention.
+    constraint_refs: [C1, C5, C13]
+    affects_groups: [B, E]
+    boundaries:
+      - A normally completed execution lifecycle remains healthy.
+      - Non-execution lifecycle items such as reasoning do not trigger recovery.
+      - Current Codex failed-turn errors are read from the nested turn object with legacy fallback.
+      - The deterministic fix does not alter, rerun, replace, or reinterpret the frozen v4 evidence and does not authorize activation.
+    alternatives:
+      - Continue accepting successful turns with abandoned execution items.
+      - Treat every unfinished informational lifecycle item as fatal.
+      - Require an operator to restart and repeat the user prompt manually.
+  - id: D38
+    status: accepted
+    decision: Treat the current live topology as a partial Graphify exposure rather than as an untouched pre-feature baseline.
+    rationale: The running container uses a July 18 latest image that already contains the Graphify CLI and bind-mounts the current Graphify skill, while its host-created mount set has no shared cache, install-wide runtime lock, or bounded staging tmpfs. No observed query used that surface, but availability without the required topology is not a safe inactive state.
+    constraint_refs: [C1, C3, C4, C6, C9, C12]
+    affects_groups: [B, D, E]
+    boundaries:
+      - Do not describe the live system as fully activated or safely rolled back.
+      - Do not restart, retag, or deploy while D36 remains controlling without an explicit user decision.
+      - A rollback must remove both the image capability and bind-mounted source, skill, and instruction exposure.
+      - A full activation must install the validated image and host mount, tmpfs, cache, runtime-lock, and recovery behavior together.
+  - id: D39
+    status: accepted
+    decision: Refuse every public Graphify read before repository or cache access unless the exact dedicated cache and runtime bind mounts and the exact private bounded staging tmpfs are present.
+    rationale: The partial live exposure proved that image or skill availability can precede the host topology. A gateway-local preflight makes that intermediate state fail closed instead of silently using unshared cache, an unbounded host filesystem, or a per-container worker lock.
+    constraint_refs: [C1, C3, C4, C6, C9, C12]
+    affects_groups: [A, D, E]
+    boundaries:
+      - Cache and runtime roots must be exact dedicated writable mounts.
+      - The staging root must be an exact writable tmpfs mount, owned by the effective runtime UID, mode 0700, with positive capacity no greater than 192 MiB.
+      - Validation occurs before managed-repository resolution, source inventory, cache access, and worker spawn.
+      - Root and public-read subcommand help and version remain side-effect-free and do not require runtime mounts.
+      - The protected candidate remains non-live and does not supersede D36.
+    alternatives:
+      - Trust host and image activation to remain perfectly synchronized.
+      - Allow a degraded per-container cache or ordinary-directory staging fallback.
+  - id: D40
+    status: accepted
+    decision: Activate the exact protected d3773a candidate through the direct commit, push, service-restart, and live-verification path.
+    rationale: The user explicitly approved full activation after reviewing the frozen-v4 result, deterministic Codex lifecycle remediation, hard runtime-topology guard, complete regression suites, finished-image contracts, freshness fixture, and production-style runtime evidence.
+    constraint_refs: [C1, C2, C3, C4, C5, C6, C9, C10, C12, C13]
+    affects_groups: [A, B, C, D, E]
+    boundaries:
+      - Activate only image sha256:d3773a52500ae98d8b80c0dd128ef094af1ce87f6a603d912d5d7b9383122f8b.
+      - Commit and push the validated source before service activation.
+      - Verify live Claude and Codex containers have the exact cache, runtime-lock, and bounded tmpfs topology, automatic freshness, and no container GitNexus surface.
+      - The approval supersedes D36 only for rollout disposition and does not alter, rerun, replace, or reinterpret any frozen v4 row or result.
+    user_instruction: Approve full activation of d3773a
+    recorded_at: 2026-07-19T05:14:23Z
+
+assumptions:
+  - id: A1
+    text: graphifyy 0.9.16 installs and runs code-only extraction on the production ARM64 image without policy exceptions.
+    validation: Build from scratch and run version, import, extraction, and query smoke tests without API keys.
+    validated: true
+  - id: A2
+    text: A separately mounted application cache sibling is shared by thread siblings and removed through guarded worktree or session cleanup without a repository-name collision.
+    validation: Exercise sibling mounts plus live-container, clean, dirty, unpushed, orphan, and wholesale workspace cleanup paths.
+    validated: true
+  - id: A3
+    text: Patched Graphify 0.9.16 sequentially rebuilds a complete graph and manifest from an immutable private source generation while reusing only unambiguous portable AST entries whose exact-case path and content state remains current.
+    validation: Run tracked, untracked, deleted, one-way mutation, ABA, repeated edit-delete churn, case-only rename, and simultaneous case-distinct paths under zero task allowance with graph manifest attribution and bounded-cache assertions.
+    validated: true
+  - id: A4
+    text: Inventory hashing plus snapshot copy on changes and the no-extract fast path are acceptable for interactive graph-backed queries.
+    validation: Benchmark fingerprint-only, changed-refresh, and query paths and enforce both deadlines plus the one frozen v4 C13 matrix.
+    validated: false
+  - id: A5
+    text: Mandatory shared-skill projection reaches Claude, Codex, OpenCode, and restricted group skill configurations.
+    validation: Test skill selection and inspect production-style provider containers.
+    validated: true
+  - id: A6
+    text: Pinned diagnostic classification, exact applicable-file graph coverage, and exact intentional data-JSON exclusion prove a complete Graphify 0.9.16 code-only candidate.
+    validation: Fault-inject every audited failure plus representative config and data JSON and run the contract-drift inventory.
+    validated: true
+  - id: A7
+    text: One patched child-free sequential worker, one host-wide all-worker slot, 1024 MiB RLIMIT_AS, 64 MiB RLIMIT_FSIZE, RLIMIT_NPROC zero, 192 MiB tmpfs, input and cache caps, 512 MiB reserve below the 5120 MiB hard limit, and deadlines protect the runner without making Graphify unusably slow.
+    validation: Production cgroup, rapid allocation file process thread and output growth, oversized-corpus, cached-query contention, and changed-refresh contention benchmarks; fail rather than silently raising bounds or normal-residency request.
+    validated: true
+  - id: A8
+    text: Graphify provides measurable source-grounded value across six committed tasks and three repetitions per arm.
+    validation: Enforce the frozen v4 claim correctness, execution grounding, treatment adherence, and 20 percent efficiency thresholds and retain every raw row.
+    validated: false
+
+escalations:
+  - stage: Build
+    iteration: 1
+    category: hard-constraint
+    finding: The retained 36-run Graphify agent-value matrix failed the C13 correctness floor and source-only parity gate because four Graphify runs probed an intentionally rejected public subcommand-help form.
+    evidence:
+      - qa-evidence/agent-eval-runs.jsonl sha256 da67b6f7d83ecc4a4bc2fdd7b39eb4a8e5f428b0f3d873cb898e8af282b05bc9
+      - qa-evidence/agent-eval-diagnosis.json records 14 of 18 Graphify runs correct versus 16 of 18 source-only and a 25.5 percent tool-byte improvement
+      - container/graphify-gateway.py rejects public query flags, so allowing safe subcommand help changes observable CLI behavior
+    required_user_decision: Approve or reject safe side-effect-free subcommand help plus a rebuilt candidate and new versioned non-replacement evaluation protocol.
+    recorded_at: 2026-07-19T00:04:50Z
+  - stage: Build
+    iteration: 2
+    category: hard-constraint
+    finding: The approved help change, rebuilt candidate, and two new immutable matrices demonstrate strong claim correctness and retrieval efficiency, but neither v2 nor v3 satisfies every predeclared E3 validation and strict-correctness condition.
+    evidence:
+      - qa-evidence/v2/agent-eval-runs.jsonl sha256 121e8185c4d6556016cfc7aa1c9bb12e1b2b94c5c993efb38bf2e78653cb5406
+      - qa-evidence/v2/agent-eval-diagnosis.json records 18 of 18 exact claims per arm, 32 percent fewer median files, two detector false positives, and one genuine Graphify-read noncompliance
+      - qa-evidence/v3/agent-eval-runs.jsonl sha256 49e640c6b15b940d78461c31dcb9e44502e5fb914dd271e7156cc9d561f7ad83
+      - qa-evidence/v3/agent-eval-diagnosis.json records 18 of 18 exact claims per arm, 27.3 percent fewer median files, 24.5 percent fewer median tool bytes, 16 of 18 strict correctness per arm, and one genuine Graphify-read noncompliance
+    required_user_decision: Keep the current strict E3 policy and do not activate, or explicitly approve revised treatment-adherence and partial-search semantics before any further evaluation or rollout.
+    recorded_at: 2026-07-19T01:22:37Z
+  - stage: Build
+    iteration: 3
+    category: user-decision-resolved
+    finding: The user explicitly approved the frozen revised C13 semantics and exactly one final v4 matrix. No v4 row existed and no matrix had run when the protocol and pre-execution artifacts were frozen.
+    evidence:
+      - 'User instruction: Approve revised C13 and one final v4.'
+      - D35 records claim-only correctness, separate execution grounding, attributed partial-rg exit-2 handling, start-ordered treatment adherence, unchanged efficiency, and immutable one-run retention.
+      - eval/tasks.json plus v1-v3 prompts and retained evidence remain immutable.
+    required_next_action: Run exactly one complete v4 matrix with no selective rerun or semantic change, then accept or block activation from its frozen gates.
+    recorded_at: 2026-07-19T02:30:17Z
+  - stage: Build
+    iteration: 4
+    category: hard-constraint
+    finding: The one authorized immutable v4 matrix passed claim correctness and efficiency but failed zero-tolerance execution grounding because six public Graphify tool starts had no matching completion.
+    evidence:
+      - qa-evidence/v4/agent-eval-runs.jsonl sha256 b0bb910ed411b8febd684f1e3128a7ff3a105a5ba22325371628a30d9e84216b
+      - qa-evidence/v4/agent-eval-summary.json sha256 02cb3669b9a7432e777f4d8f9c04b5e7f33f1e07169cb7b2e69ac588a6b41397
+      - qa-evidence/v4/agent-eval-diagnosis.json records 18 of 18 exact claims per arm, 27.777777778 percent fewer median files, 20.39230689 percent fewer median tool-output bytes, and six unfinished public Graphify tool calls.
+    required_next_action: Preserve v4 without rerun or reinterpretation and keep activation blocked.
+    recorded_at: 2026-07-19T03:49:33Z
+  - stage: Build
+    iteration: 5
+    category: operational-risk
+    finding: The final live-topology audit found a pre-existing partial Graphify exposure despite no service restart during remediation.
+    evidence:
+      - The running Madison Reed container uses latest image sha256:d23404afc6a6fc459687227b6520b1f538fc04511adeab261174672974acb968, created 2026-07-18T19:19:41Z, and exposes /usr/local/bin/graphify plus the bind-mounted Graphify skill.
+      - Docker mount inspection shows no /workspace/.cache/graphify or /run/nanoclaw-graphify bind mount, and HostConfig.Tmpfs is null, so the intended shared cache, install-wide worker lock, and 192 MiB staging quota are absent.
+      - The old host process still mounts /home/ubuntu/plugins/gitnexus into the container even though command -v gitnexus is empty; the validated host source excludes that plugin mount after activation.
+      - Container logs contain no Graphify execution, and nanoclaw-v2.service reports NRestarts=0 with active start 2026-07-18T02:54:31Z.
+    required_user_decision: Explicitly authorize either a complete validated Graphify activation that supersedes D36 or a rollback of both the image and bind-mounted feature surface.
+    recorded_at: 2026-07-19T04:30:08Z
+  - stage: Build
+    iteration: 6
+    category: operational-risk-contained
+    finding: A protected non-live candidate now rejects the observed partial topology before any repository, cache, source, or worker access and passes the complete deterministic validation matrix.
+    evidence:
+      - Candidate sha256:d3773a52500ae98d8b80c0dd128ef094af1ce87f6a603d912d5d7b9383122f8b passed 12 of 12 finished-image contracts, including the missing-topology negative contract.
+      - Six automatic-freshness generations each scored 1.0; fixture evidence SHA-256 is 9d0c9c2ac2bddbbddc5bdf691650fe279a75d4248b499359cec7f4d40504283e.
+      - All 38 production-style scenarios passed at 156975104-byte peak with zero OOM or oom_kill, no request overage, stale query, partial promotion, cache bleed, orphan process, stage debris, or repository mutation; runtime evidence SHA-256 is 14f32ecbfafd1efaf5505b5f09002abfd71bb95498f177854b29016a2baec261.
+      - The full source, runner, and host regression suites plus both TypeScript checks passed.
+      - No agent containers were running at 2026-07-19T05:02:22Z, but the unchanged old host and latest image can recreate the partial topology on the next wake.
+    required_user_decision: Explicitly authorize either complete activation of the protected candidate, superseding D36, or rollback of the partial feature surface.
+    recorded_at: 2026-07-19T05:02:22Z
+  - stage: Ship
+    iteration: 7
+    category: user-decision-resolved
+    finding: The user explicitly approved full activation of the exact protected d3773a candidate.
+    evidence:
+      - 'User instruction: Approve full activation of d3773a'
+      - D40 preserves the frozen v4 result while authorizing direct commit, push, service restart, and live verification.
+      - The pre-ship gate passed 2469 host tests, 830 runner tests, and 52 Graphify tests plus host build and runner typecheck.
+    required_next_action: Commit and push the validated source, activate only the exact protected image, restart the service, and verify live Claude and Codex runtime topology and behavior.
+    recorded_at: 2026-07-19T05:14:23Z
+
+review_cycles:
+  - iteration: 1
+    must_fix_count: 8
+    should_fix_count: 4
+    wont_fix_count: 0
+    completed_at: 2026-07-18T15:34:06Z
+  - iteration: 2
+    must_fix_count: 6
+    should_fix_count: 3
+    wont_fix_count: 1
+    completed_at: 2026-07-18T15:56:22Z
+  - iteration: 3
+    must_fix_count: 3
+    should_fix_count: 0
+    wont_fix_count: 0
+    completed_at: 2026-07-18T16:06:20Z
+  - iteration: 4
+    must_fix_count: 3
+    should_fix_count: 0
+    wont_fix_count: 0
+    completed_at: 2026-07-18T16:16:34Z
+  - iteration: 5
+    must_fix_count: 3
+    should_fix_count: 0
+    wont_fix_count: 0
+    completed_at: 2026-07-18T16:23:50Z
+  - iteration: 6
+    must_fix_count: 2
+    should_fix_count: 0
+    wont_fix_count: 0
+    completed_at: 2026-07-18T16:31:00Z
+  - iteration: 7
+    must_fix_count: 1
+    should_fix_count: 0
+    wont_fix_count: 0
+    completed_at: 2026-07-18T16:34:31Z
+  - iteration: 8
+    must_fix_count: 0
+    should_fix_count: 0
+    wont_fix_count: 0
+    completed_at: 2026-07-18T16:36:30Z
+
+auto_judgments:
+  - stage: Plan
+    iteration: 1
+    decision: Leave the critical legacy config parser compatible while proving the key is behaviorally inert everywhere else.
+    alternatives_considered:
+      - Edit readContainerConfig and migrate all group JSON
+      - Preserve active behavior for compatibility
+      - Keep parse-only compatibility and remove all consumers and output
+    grounding:
+      - 'GitNexus impact analysis - readContainerConfig has CRITICAL blast radius with 22 direct dependents'
+      - 'Approved design - complete container runtime retirement does not require destructive local config rewrites'
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-07-18T16:53:10Z
+  - stage: Review
+    iteration: 7
+    decision: Require exact-case path continuity and absence of current or prior case-fold collisions before seeding a Graphify AST cache entry.
+    alternatives_considered:
+      - Trust Graphify lowercased path hashes on Linux
+      - Disable all AST cache reuse
+      - Reuse only unambiguous exact-case path-content entries
+    grounding:
+      - 'Reviewer C cycle-7 M1 - lowercased path keys alias case-only renames and simultaneous case-distinct files'
+      - 'Graphify v0.9.16 cache.py - cache keys lowercase the repository-relative path while embedded source_file preserves case'
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-07-18T16:34:31Z
+  - stage: Review
+    iteration: 6
+    decision: Acquire the all-worker slot before cached-query final freshness scans and restart refresh on any post-wait mismatch.
+    alternatives_considered:
+      - Revalidate before waiting for the worker slot
+      - Revalidate both before and after waiting
+      - Acquire first then perform the authoritative final scans once
+    grounding:
+      - 'Reviewer A cycle-6 M1 - source can change during the 120-second slot wait after the prior validation'
+      - 'Design flowchart - already encoded the correct acquire then revalidate order'
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-07-18T16:31:00Z
+  - stage: Review
+    iteration: 6
+    decision: Filter reusable AST cache to exact current-generation Graphify path-content hashes before copying into tmpfs.
+    alternatives_considered:
+      - Copy the whole same-version cache
+      - Disable all AST reuse
+      - Select only current expected cache keys
+    grounding:
+      - 'Reviewer A cycle-6 M2 - old same-version edit and deletion entries accumulate indefinitely'
+      - 'Graphify v0.9.16 cache.py - file_hash is SHA256 over content plus lowercased repository-relative path'
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-07-18T16:31:00Z
+  - stage: Review
+    iteration: 5
+    decision: Extend the pinned sequential patch to manifest hashing and apply zero-task execution to the real end-to-end worker.
+    alternatives_considered:
+      - Remove RLIMIT_NPROC and rely on source audit
+      - Allow a fixed thread count under a nonzero per-UID limit
+      - Eliminate mandatory Graphify task creation under NanoClaw mode
+    grounding:
+      - 'Reviewer A cycle-5 M1 - save_manifest unconditionally starts ThreadPoolExecutor and fails under RLIMIT_NPROC zero'
+      - 'Live kernel check - zero process allowance rejects task creation with EAGAIN for the service UID'
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-07-18T16:23:50Z
+  - stage: Review
+    iteration: 5
+    decision: Serialize cached queries and changed extraction under the same host-wide Graphify worker slot.
+    alternatives_considered:
+      - Bound extraction only
+      - Create separate extraction and query concurrency pools
+      - Use one conservative all-worker slot until measurements justify expansion
+    grounding:
+      - 'Reviewer A cycle-5 M2 - cached query workers otherwise multiply the same burst ceiling across containers'
+      - 'First-ship priority - protect responsiveness before optimizing graph query concurrency'
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-07-18T16:23:50Z
+  - stage: Review
+    iteration: 5
+    decision: Use a 192 MiB per-container tmpfs as the hard aggregate quota for newly generated Graphify output.
+    alternatives_considered:
+      - Post-run directory size validation
+      - Patch every current and future upstream write site with shared quota accounting
+      - Kernel-sized disposable tmpfs followed by validated persistent copy
+    grounding:
+      - 'Reviewer C cycle-5 M3 - thousands of sub-limit cache files can exhaust disk before post-run validation'
+      - 'Container runtime - an empty tmpfs has zero idle residency and provides ENOSPC enforcement without a daemon'
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-07-18T16:23:50Z
+  - stage: Review
+    iteration: 4
+    decision: Preserve 2048 MiB normal-residency request accounting and bound the one-at-a-time Graphify burst against the 5120 MiB hard limit with a 512 MiB runner reserve.
+    alternatives_considered:
+      - Charge the full transient address-space cap to every request
+      - Raise every group request for a lazy capability
+      - Use the existing request-versus-limit burst semantics plus one global extraction slot
+    grounding:
+      - 'Reviewers B C cycle-4 M1 - request-based arithmetic leaves only 640 MiB for a measured 1.2 GiB agent'
+      - 'Approved incident configuration - requestMb is 2048 and limitMb is 5120 specifically to separate admission from OOM protection'
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-07-18T16:16:34Z
+  - stage: Review
+    iteration: 4
+    decision: Enforce zero worker descendants, reject subprocess-backed capital-F Fortran, and backport source-root separation in the exact-version NanoClaw patch.
+    alternatives_considered:
+      - Assume sequential AST mode covers every subprocess
+      - Budget independent limits for descendants
+      - Prohibit descendants and unsupported subprocess-backed extraction paths
+    grounding:
+      - 'Reviewer A cycle-4 M2 - capital-F Fortran invokes cpp outside the AST process pool'
+      - 'Primary source audit - v0.9.16 external cache overwrites its source root and later upstream code separates those concepts'
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-07-18T16:16:34Z
+  - stage: Review
+    iteration: 3
+    decision: State the enforceable current-invocation source-generation freshness contract without claiming a filesystem-wide linearization point against arbitrary writers.
+    alternatives_considered:
+      - Preserve the impossible global point-in-time claim
+      - Require every arbitrary source writer to adopt a new lock
+      - Define exact immutable-generation equality and ordinary overlap detection
+    grounding:
+      - 'Reviewer C cycle-3 M2 - two-file alternating writers can tear any userspace multi-file scan'
+      - 'Approved brief - freshness forbids stale prior-cache queries and manual refreshes; it does not require adversarial filesystem transactions'
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-07-18T16:06:20Z
+  - stage: Review
+    iteration: 3
+    decision: Use an exact-version sequential Graphify patch and run the complete private workload under kernel RLIMIT_AS and RLIMIT_FSIZE limits.
+    alternatives_considered:
+      - Sample descendant RSS and kill after threshold
+      - Delegated child cgroup
+      - Sequential in-process worker under kernel resource limits
+    grounding:
+      - 'Reviewers B C cycle-3 M3 - polling cannot prevent rapid cgroup OOM and excludes gateway validation'
+      - 'Live runtime check - nanoclaw-v2.service has Delegate=no and the cgroup2 mount is not writable for the service user'
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-07-18T16:06:20Z
+  - stage: Review
+    iteration: 3
+    decision: Treat only the pinned JSON extractor's exact data-json skip as an intentional non-applicable source contribution.
+    alternatives_considered:
+      - Require graph nodes for every detected JSON file
+      - Exclude all JSON from freshness and graphing
+      - Preserve JSON freshness while exactly classifying intentional data skips
+    grounding:
+      - 'Reviewer A cycle-3 M1 - Graphify detects all JSON as code but intentionally skips dataset and fixture JSON'
+      - 'NanoClaw contains ordinary fixture JSON and therefore exercises the upstream intentional skip'
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-07-18T16:06:20Z
+  - stage: Review
+    iteration: 1
+    decision: Move cache ownership from Git administrative metadata to NanoClaw's hidden thread worktree namespace with explicit cleanup integration.
+    alternatives_considered:
+      - Linked worktree Git administrative directory
+      - NanoClaw-owned hidden worktree-root cache
+    grounding:
+      - 'Reviewer B S1 - official Git worktree guidance does not define the Git administrative directory as an application cache extension point'
+      - 'src/worktree-cleanup.ts:128-160 - cycle-1 fact-check showed direct children require an explicit discovery exclusion'
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-07-18T15:39:15Z
+  - stage: Review
+    iteration: 2
+    decision: Supersede the cycle-1 live fingerprint sandwich with extraction from an immutable private source snapshot and reuse only Graphify's content-addressed AST cache.
+    alternatives_considered:
+      - Live worktree extraction with before and after fingerprints
+      - Immutable snapshot with prior graph incremental reuse
+      - Immutable snapshot with AST-cache-only reuse and complete graph assembly
+    grounding:
+      - 'Reviewers A B C M1 - endpoint equality cannot prove what bytes a live extraction parsed under ABA or multi-file mutation'
+      - 'Graphify v0.9.16 graphify/cache.py - AST entries are versioned, content-addressed, and source paths are stored relatively'
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-07-18T15:56:22Z
+  - stage: Review
+    iteration: 2
+    decision: Move cache state to a separately mounted application path beside the owning thread or session worktree directory.
+    alternatives_considered:
+      - Reserve a hidden child in the worktrees repository namespace
+      - Separate application-state mount shared by the same participants
+    grounding:
+      - 'Reviewer A M4 - the proposed hidden child is a legal repository name and can be deleted by create_worktree'
+      - 'src/container-runner.ts:1315-1342 - host already resolves the sibling-shared thread worktree mount'
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-07-18T15:56:22Z
+  - stage: Review
+    iteration: 2
+    decision: Enforce conservative first-ship input, output, cgroup-headroom, and descendant-RSS bounds with one AST worker.
+    alternatives_considered:
+      - Concurrency and timeout bounds only
+      - Container cgroup limit as the only memory ceiling
+      - Pre-admission caps plus a protected-runner reserve and active child monitor
+    grounding:
+      - 'Reviewer A M5 - one Graphify parent still materializes complete graph structures and can OOM the agent'
+      - 'User incident objective - the replacement must not recreate container unresponsiveness'
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-07-18T15:56:22Z
+  - stage: Review
+    iteration: 2
+    decision: Define activation value as six committed tasks, three repetitions, no correctness regression, and a 20 percent median source-read or tool-byte improvement.
+    alternatives_considered:
+      - Deterministic Graphify command fixtures only
+      - One representative agent comparison
+      - Repeated fixed-condition agent A B with an explicit meaningful threshold
+    grounding:
+      - 'Reviewer C M6 - an unspecified representative comparison can clear on one favorable run'
+      - 'C13 - measurable source-grounded benefit is a hard activation condition'
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-07-18T15:56:22Z
+  - stage: Review
+    iteration: 1
+    decision: Use stable content fingerprints with bounded retries instead of copying an immutable source snapshot for concurrent-edit correctness.
+    alternatives_considered:
+      - Content fingerprint before and after extraction with retry
+      - Full immutable source snapshot per refresh
+    grounding:
+      - 'Reviewer C M1 - source writers do not participate in the cache lock and require a linearization point'
+      - 'Reviewer B transaction-boundary finding - a stable source observation is required before publication'
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-07-18T15:39:15Z
+  - stage: Review
+    iteration: 1
+    decision: Start conservatively with two Graphify AST workers and one host-wide extraction slot under explicit refresh and query budgets.
+    alternatives_considered:
+      - Graphify os.cpu_count default with per-worktree serialization only
+      - Conservative bounded workers and fleet admission
+    grounding:
+      - 'Graphify v0.9.16 extract.py:4163-4198 - Reviewer A verified the default scales to os.cpu_count'
+      - 'container/agent-runner/src/mcp-tools/git-worktrees.ts:184-190 - Reviewer A surfaced the project precedent for bounded subprocesses'
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-07-18T15:39:15Z
+  - stage: Build
+    iteration: 1
+    decision: Normalize only source-proven Graphify v0.9.16 unresolved-edge shapes and preserve TypeScript type and value namespaces before enforcing zero duplicate and zero dangling endpoints.
+    alternatives_considered:
+      - Reject every raw dangling edge produced by Graphify
+      - Drop every dangling edge before graph publication
+      - Repair unique local mappings and drop only exact pinned external or intentionally relocatable shapes
+    grounding:
+      - 'Frozen-corpus correction - five case-folded TypeScript type/function IDs collapsed by declaration order until namespace-aware callable IDs and routing were added'
+      - 'Exact patched corpus - 19,711 raw edges, 2,162 source-classified dangling edges, 112 repairs, 7 exact deduplications, 17,654 final edges, zero duplicate IDs, and zero final dangling endpoints'
+      - 'Group A verification - 41 tests passed with one expected source-lane wheelhouse skip before the staged-support correction'
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-07-18T21:45:00Z
+  - stage: Build
+    iteration: 1
+    decision: Carry only bounded, hashed support-file proofs into the immutable Graphify source snapshot so exact local CSS imports and owned skill-template exceptions remain verifiable after code-only staging.
+    alternatives_considered:
+      - Ignore unresolved CSS imports by suffix
+      - Stage the entire worktree or every non-code file
+      - Keep the code-only snapshot and reject valid local asset and template imports
+      - Stage only quoted relative CSS targets plus exact ownership markers tied to detected skill code or setup/pair-<channel>.ts
+    grounding:
+      - 'Disposable production-stage probe - dashboard/src/main.tsx:L13 failed because styles.css existed in the managed checkout but was absent from the immutable code-only snapshot'
+      - 'Follow-on production-stage probe - owned add-dashboard template failed because its hashed SKILL.md ownership marker was absent from the snapshot'
+      - 'Clean-cache production query - 903 code files plus 18 verified support files completed refresh and query with reason=ok'
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-07-18T22:45:30Z

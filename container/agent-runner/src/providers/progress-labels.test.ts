@@ -80,7 +80,7 @@ describe('deriveProgressLabels', () => {
       { type: 'thinking', thinking: 'Looking up the schema.', signature: 's' },
       { type: 'tool_use', name: 'Bash', input: { command: 'dbt build' } },
       { type: 'tool_use', name: 'Skill', input: { skill: 'team-brief' } },
-      { type: 'tool_use', name: 'mcp__gitnexus__query', input: { query: 'auth' } },
+      { type: 'tool_use', name: 'mcp__context7__query-docs', input: { libraryId: '/example', query: 'auth' } },
     ]);
     expect(deriveProgressLabels(msg)).toEqual(['> 💭 Looking up the schema.']);
   });

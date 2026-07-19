@@ -8,6 +8,7 @@ import type Database from 'better-sqlite3';
 import {
   DATAFOLD_MCP_SERVER,
   dockerResourceLimitArgs,
+  graphifyContainerArgs,
   resolveMemoryAdmissionBudgetMb,
   serializeMcpServersEnv,
   resolveAnthropicAuth,
@@ -80,6 +81,21 @@ describe('dockerResourceLimitArgs', () => {
       '--pids-limit',
       '768',
     ]);
+  });
+});
+
+describe('Graphify container runtime contract', () => {
+  it('test_graphify_runtime_args_are_universal_and_bounded', () => {
+    const args = graphifyContainerArgs();
+
+    expect(args).toEqual([
+      '-e',
+      'NANOCLAW_CONTAINER=1',
+      '--tmpfs',
+      '/workspace/.graphify-stage:rw,size=201326592,mode=0700,uid=1001,gid=1001',
+    ]);
+    expect(args.filter((arg) => arg === 'NANOCLAW_CONTAINER=1')).toHaveLength(1);
+    expect(args.filter((arg) => arg.startsWith('/workspace/.graphify-stage:'))).toHaveLength(1);
   });
 });
 

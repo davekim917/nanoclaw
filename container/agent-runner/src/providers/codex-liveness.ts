@@ -23,6 +23,23 @@ export interface CodexLivenessSnapshot {
   openItems: Array<{ id: string; type: string }>;
 }
 
+// ThreadItems whose lifecycle represents work that must finish before a
+// successful turn can be trusted. Keep this explicit so informational items
+// such as reasoning remain version-tolerant, while commands and tools fail
+// closed if app-server reports turn completion without their item/completed.
+const TURN_BLOCKING_ITEM_TYPES = new Set([
+  'commandExecution',
+  'fileChange',
+  'mcpToolCall',
+  'dynamicToolCall',
+  'collabAgentToolCall',
+  'subAgentActivity',
+  'webSearch',
+  'imageView',
+  'sleep',
+  'imageGeneration',
+]);
+
 /**
  * Normalize the app-server's version-dependent thread status shape.
  * Unknown shapes deliberately fail open: a responsive future Codex version
@@ -76,9 +93,20 @@ export class CodexTurnLiveness {
     this.noteNotification();
   }
 
-  noteTurnEnded(): void {
+  noteTurnEnded(): CodexLivenessDecision {
+    const unfinishedExecutionItems = [...this.openItems]
+      .filter(([, type]) => TURN_BLOCKING_ITEM_TYPES.has(type))
+      .map(([id, type]) => `${type}:${id}`);
     this.openItems.clear();
     this.noteNotification();
+    if (unfinishedExecutionItems.length > 0) {
+      return {
+        kind: 'recover',
+        classification: 'protocol_desync',
+        reason: `Codex turn completed with unfinished execution items: ${unfinishedExecutionItems.join(', ')}`,
+      };
+    }
+    return { kind: 'healthy' };
   }
 
   noteProbeFailure(reason: string): CodexLivenessDecision {

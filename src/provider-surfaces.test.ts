@@ -1,4 +1,5 @@
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -22,6 +23,17 @@ vi.mock('./log.js', async (importOriginal) => ({
     fatal: vi.fn(),
   },
 }));
+
+vi.mock('./db/messaging-groups.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./db/messaging-groups.js')>();
+  return {
+    ...actual,
+    getMessagingGroup: (id: string) =>
+      id === 'mg-shared'
+        ? { id, channel_type: 'slack-test', platform_id: 'slack:C1', thread_policy: 'native' }
+        : actual.getMessagingGroup(id),
+  };
+});
 
 import { buildMounts } from './container-runner.js';
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from './db/index.js';
@@ -228,6 +240,108 @@ describe('buildMounts agent surfaces', () => {
     expect(containerPaths).toContain('/workspace/agent');
     expect(containerPaths).toContain('/app/src');
     expect(containerPaths).toContain('/workspace/agent/OWN-DOC.md');
+  });
+
+  it('test_mandatory_graphify_skill_for_all_and_restricted_configs', () => {
+    const cases: Array<{ provider: string; skills: ContainerConfig['skills']; suffix: string }> = [
+      { provider: 'claude', skills: 'all', suffix: 'all' },
+      { provider: 'codex', skills: [], suffix: 'empty' },
+      { provider: 'opencode', skills: ['debug', 'graphify', 'debug'], suffix: 'restricted' },
+    ];
+
+    for (const testCase of cases) {
+      const ag = group(`ag-graphify-${testCase.suffix}`, `graphify-${testCase.suffix}`);
+      createAgentGroup(ag);
+      withWorkgroup(ag);
+      ensureContainerConfig(ag.id);
+      initGroupFilesystem(ag, {});
+
+      buildMounts(
+        ag,
+        session(`s-graphify-${testCase.suffix}`, ag.id),
+        { ...containerConfig(), skills: testCase.skills },
+        testCase.provider,
+        {},
+      );
+
+      const skillsDir = path.join(DATA_DIR, 'v2-sessions', ag.id, '.claude-shared', 'skills');
+      const selected = fs.readdirSync(skillsDir);
+      expect(selected.filter((name) => name === 'graphify')).toHaveLength(1);
+      expect(fs.readlinkSync(path.join(skillsDir, 'graphify'))).toBe('/app/skills/graphify');
+      if (testCase.suffix === 'restricted') {
+        expect(selected).toEqual(['debug', 'graphify']);
+      }
+    }
+  });
+
+  it('test_graphify_cache_mounts_share_only_with_thread_siblings', () => {
+    const previousThreadWorktrees = process.env.NANOCLAW_THREAD_WORKTREES;
+    process.env.NANOCLAW_THREAD_WORKTREES = '1';
+    try {
+      const ag = group('ag-graphify-cache', 'graphify-cache');
+      createAgentGroup(ag);
+      withWorkgroup(ag);
+      ensureContainerConfig(ag.id);
+      initGroupFilesystem(ag, {});
+
+      const siblingA = { ...session('s-cache-a', ag.id), messaging_group_id: 'mg-shared', thread_id: 'thread-one' };
+      const siblingB = { ...session('s-cache-b', ag.id), messaging_group_id: 'mg-shared', thread_id: 'thread-one' };
+      const unrelated = { ...session('s-cache-c', ag.id), messaging_group_id: 'mg-shared', thread_id: 'thread-two' };
+      const isolated = session('s-cache-isolated', ag.id);
+
+      const graphifyMount = (sess: Session) =>
+        buildMounts(ag, sess, containerConfig(), 'claude', {}).find(
+          (mount) => mount.containerPath === '/workspace/.cache/graphify',
+        );
+
+      const first = graphifyMount(siblingA);
+      const second = graphifyMount(siblingB);
+      const differentThread = graphifyMount(unrelated);
+      const differentSession = graphifyMount(isolated);
+
+      expect(first).toMatchObject({ readonly: false });
+      expect(first?.hostPath).toBe(second?.hostPath);
+      expect(first?.hostPath).not.toBe(differentThread?.hostPath);
+      expect(first?.hostPath).not.toBe(differentSession?.hostPath);
+
+      const runtimeMounts = buildMounts(ag, isolated, containerConfig(), 'claude', {}).filter(
+        (mount) => mount.containerPath === '/run/nanoclaw-graphify',
+      );
+      expect(runtimeMounts).toHaveLength(1);
+      expect(runtimeMounts[0]).toMatchObject({
+        hostPath: path.join(DATA_DIR, 'graphify-runtime'),
+        readonly: false,
+      });
+    } finally {
+      if (previousThreadWorktrees === undefined) delete process.env.NANOCLAW_THREAD_WORKTREES;
+      else process.env.NANOCLAW_THREAD_WORKTREES = previousThreadWorktrees;
+    }
+  });
+
+  it('test_gitnexus_host_plugin_and_builtin_hook_never_mount', () => {
+    const homedir = path.join(TEST_ROOT, 'home');
+    const pluginsDir = path.join(homedir, 'plugins');
+    const builtinDir = path.join(TEST_ROOT, 'container', 'nanoclaw-plugin');
+    fs.mkdirSync(path.join(pluginsDir, 'gitnexus'), { recursive: true });
+    fs.mkdirSync(path.join(pluginsDir, 'unrelated-plugin'), { recursive: true });
+    fs.mkdirSync(builtinDir, { recursive: true });
+    const homedirSpy = vi.spyOn(os, 'homedir').mockReturnValue(homedir);
+
+    try {
+      const ag = group('ag-plugin-shadow', 'plugin-shadow');
+      createAgentGroup(ag);
+      withWorkgroup(ag);
+      ensureContainerConfig(ag.id);
+      initGroupFilesystem(ag, {});
+
+      const mounts = buildMounts(ag, session('s-plugin-shadow', ag.id), containerConfig(), 'claude', {});
+      const paths = mounts.map((mount) => mount.containerPath);
+      expect(paths).not.toContain('/workspace/plugins/gitnexus');
+      expect(paths).not.toContain('/workspace/plugins/nanoclaw-hooks');
+      expect(paths).toContain('/workspace/plugins/unrelated-plugin');
+    } finally {
+      homedirSpy.mockRestore();
+    }
   });
 });
 

@@ -80,4 +80,70 @@ describe('codex provider container-config: agents/ mount', () => {
       fs.rmSync(bareHome, { recursive: true, force: true });
     }
   });
+
+  it('test_codex_config_strips_only_gitnexus_reentry_surfaces', () => {
+    const fn = getProviderContainerConfig('codex')!;
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-codex-sanitize-'));
+    const sessionDir = path.join(home, 'session');
+    const codexHome = path.join(home, '.codex');
+    fs.mkdirSync(path.join(codexHome, 'plugins'), { recursive: true });
+    fs.mkdirSync(sessionDir, { recursive: true });
+    fs.writeFileSync(path.join(codexHome, 'auth.json'), '{"tokens":{"access_token":"kept"}}\n');
+    const hostConfig = [
+      'model = "gpt-5.5"',
+      'approval_policy = "on-request"',
+      'sandbox_mode = "workspace-write"',
+      '',
+      '[mcp_servers.context7]',
+      'url = "https://mcp.context7.com/mcp"',
+      '',
+      '[mcp_servers.gitnexus]',
+      'command = "npx"',
+      'args = ["-y", "gitnexus", "mcp"]',
+      '',
+      '[plugins.humanizer]',
+      'enabled = true',
+      '',
+      '[plugins.gitnexus]',
+      'enabled = true',
+      `cache_path = "${home}/.codex/plugins/cache/gitnexus/1.0.0"`,
+      '',
+      '[plugin_marketplaces.gitnexus]',
+      `source = "${home}/plugins/gitnexus"`,
+      '',
+      '[plugin_marketplaces.team_tools]',
+      `source = "${home}/plugins/team-tools"`,
+      '',
+    ].join('\n');
+    fs.writeFileSync(path.join(codexHome, 'config.toml'), hostConfig);
+
+    try {
+      const contribution = fn(
+        makeCtx({
+          sessionDir,
+          agentGroupFolder: 'sanitize',
+          hostEnv: { HOME: home } as NodeJS.ProcessEnv,
+        }),
+      );
+      const written = fs.readFileSync(path.join(sessionDir, 'codex', 'config.toml'), 'utf8');
+
+      expect(written).not.toMatch(/gitnexus/i);
+      expect(written).toContain('model = "gpt-5.5"');
+      expect(written).toContain('approval_policy = "on-request"');
+      expect(written).toContain('sandbox_mode = "workspace-write"');
+      expect(written).toContain('[mcp_servers.context7]\nurl = "https://mcp.context7.com/mcp"');
+      expect(written).toContain('[plugins.humanizer]\nenabled = true');
+      expect(written).toContain('[plugin_marketplaces.team_tools]\nsource = "/workspace/plugins/team-tools"');
+      expect(fs.readFileSync(path.join(sessionDir, 'codex', 'auth.json'), 'utf8')).toBe(
+        '{"tokens":{"access_token":"kept"}}\n',
+      );
+      expect(contribution.mounts).toContainEqual({
+        hostPath: path.join(codexHome, 'plugins'),
+        containerPath: '/home/node/.codex/plugins',
+        readonly: true,
+      });
+    } finally {
+      fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
 });

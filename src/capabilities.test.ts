@@ -14,9 +14,10 @@ vi.mock('./config.js', async (importOriginal) => ({
   GROUPS_DIR: dirs.GROUPS_DIR,
 }));
 
-import { buildSessionServicesSnapshot, renderSessionCapabilities } from './capabilities.js';
+import { buildSessionServicesSnapshot, getHostCapabilities, renderSessionCapabilities } from './capabilities.js';
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from './db/index.js';
 import { writeContainerConfig } from './container-config.js';
+import { SIBLING_BOUND_FIELDS } from './sibling-parity.js';
 import type { AgentGroup } from './types.js';
 
 function group(id: string, folder: string): AgentGroup {
@@ -147,5 +148,38 @@ describe('buildSessionServicesSnapshot', () => {
     const snapshot = buildSessionServicesSnapshot(ag.id);
 
     expect(snapshot.services.some((s) => s.name === 'Profound')).toBe(false);
+  });
+
+  it('test_capability_and_parity_output_omit_legacy_gitnexus_field', () => {
+    fs.mkdirSync(`${dirs.TEST_ROOT}/container/nanoclaw-plugin`, { recursive: true });
+    fs.mkdirSync(`${dirs.TEST_ROOT}/plugins/gitnexus`, { recursive: true });
+    fs.mkdirSync(`${dirs.TEST_ROOT}/plugins/ordinary-plugin`, { recursive: true });
+    insertWorkgroup('legacy', []);
+    const ag = group('ag-legacy', 'legacy');
+    createGroupInWorkgroup(ag, 'legacy');
+    writeContainerConfig(ag.folder, {
+      mcpServers: {},
+      packages: { apt: [], npm: [] },
+      additionalMounts: [],
+      skills: 'all',
+      tools: [],
+      gitnexusInjectAgentsMd: true,
+    });
+
+    const previousHome = process.env.HOME;
+    process.env.HOME = dirs.TEST_ROOT;
+    try {
+      const capabilities = getHostCapabilities();
+      const capabilityGroup = capabilities.agentGroups.find((candidate) => candidate.id === ag.id);
+      expect(capabilityGroup).toBeDefined();
+      expect(capabilityGroup).not.toHaveProperty('gitnexusInjectAgentsMd');
+      expect(capabilities.plugins.builtin).not.toContain('nanoclaw-hooks');
+      expect(capabilities.plugins.installed).not.toContain('gitnexus');
+      expect(capabilities.plugins.installed).toContain('ordinary-plugin');
+      expect(SIBLING_BOUND_FIELDS.has('gitnexusInjectAgentsMd')).toBe(false);
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+    }
   });
 });

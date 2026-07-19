@@ -1,0 +1,25 @@
+{
+  "status": "COMPLETE",
+  "runs": 36,
+  "provenance": {
+    "protocolVersion": "v3",
+    "candidateImageId": "sha256:48717117fdb5f2c5e5b270d8765df5c9fc8f41639925bb7c3af002fcdb28b025",
+    "codexCliVersion": "codex-cli 0.144.3",
+    "sourceSnapshotFingerprint": "18c49543dc3ba0248793ca0dd8abd1c75df23710f917ea5304637cca0d63bf59",
+    "sourceSnapshotFileCount": 1245,
+    "repositoryCommit": "e2aca6aeb7a8d44f75b7b0386c1114d65b2f758e",
+    "requestedModel": "gpt-5.6-sol",
+    "reasoningEffort": "xhigh",
+    "instructionIsolation": "instruction-free-eval-root-with-nested-repo",
+    "privateProtocolSha256": "3b0aa8eed87342e784c3252e8ad6c4376c92305a15335630c3b0922ced039811",
+    "evaluatorSourceSha256": "6024e2c10a1893a9cc7769f1ba738294a3f87657b113152cc6f443ef579eeb03"
+  },
+  "validation": {
+    "passed": false,
+    "failures": [
+      "graphify-container-contract:source-only:1: auditable source-navigation contract violation",
+      "memory-admission-priority:graphify:3: Graphify arm did not invoke a public Graphify read command",
+      "command-gate-routing:source-only:2: auditable source-navigation contract violation"
+    ]
+  }
+}

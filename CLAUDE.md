@@ -328,14 +328,34 @@ The agent container runs on **Bun**; the host runs on **Node** (pnpm). They comm
 
 Off by default (~200MB). On signals the user works with CJK content (CJK conversation, `Asia/Tokyo|Shanghai|Seoul|Taipei|Hong_Kong` timezone, screenshots/PDFs needing CJK render — symptom is "tofu" rectangles), offer to set `INSTALL_CJK_FONTS=true` in `.env` and rebuild. Full runbook: `docs/cjk-fonts.md`.
 
-## Code intelligence (GitNexus)
+## Code intelligence
 
-This project is indexed by GitNexus as **nanoclaw-v2**. The MCP tools (`gitnexus_*`) understand the call graph; use them instead of grep/find for impact and refactoring work.
+The applicable code-intelligence workflow depends on the environment:
 
-**MUST do, every code modification:**
-- Run `gitnexus_impact({target, direction: "upstream"})` before editing a function/class — report blast radius, stop on HIGH/CRITICAL.
+- **NanoClaw container sessions (`NANOCLAW_CONTAINER=1`)** use the mandatory
+  Graphify skill and the public `graphify` gateway for source navigation. The
+  host/operator modification gates do not apply in container sessions; do not
+  invoke GitNexus there. Graphify reconciles the current managed worktree at
+  query time. Its output is advisory: source and tests remain authoritative,
+  and direct source inspection is the fallback when Graphify refuses or lacks
+  coverage.
+- **Host/operator sessions** use GitNexus. This project is indexed as
+  **nanoclaw-v2**, and the `gitnexus_*` MCP tools understand the call graph.
+  Use them instead of text search for impact and refactoring work.
+
+**Host/operator sessions MUST do this for every code modification:**
+
+- Run `gitnexus_impact({target, direction: "upstream"})` before editing a
+  function/class — report blast radius and stop on HIGH/CRITICAL.
 - Run `gitnexus_detect_changes()` before committing to verify scope.
 - Use `gitnexus_rename` for cross-file renames (never find-and-replace).
-- After commit, the post-commit hook fires `npx gitnexus analyze --skip-agents-md --embeddings` automatically. `--skip-agents-md` is intentional — it stops the tool from re-bloating CLAUDE.md/AGENTS.md with its 100-line auto-block.
+- After commit, the post-commit hook fires
+  `npx gitnexus analyze --skip-agents-md --embeddings` automatically.
+  `--skip-agents-md` prevents regenerated GitNexus instructions from bloating
+  `CLAUDE.md`/`AGENTS.md`.
 
-For exploring/debugging/refactoring workflows, the rules-with-examples live in `.claude/skills/gitnexus/`. Tools quick-reference: `gitnexus_query` (find by concept), `gitnexus_context` (360° on a symbol), `gitnexus_impact` (blast radius), `gitnexus_detect_changes` (pre-commit scope), `gitnexus_rename` (safe multi-file rename), `gitnexus_cypher` (raw graph queries).
+Host exploration/debugging/refactoring examples live in
+`.claude/skills/gitnexus/`. Tools quick-reference: `gitnexus_query` (find by
+concept), `gitnexus_context` (360° on a symbol), `gitnexus_impact` (blast
+radius), `gitnexus_detect_changes` (pre-commit scope), `gitnexus_rename` (safe
+multi-file rename), `gitnexus_cypher` (raw graph queries).
