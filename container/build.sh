@@ -103,6 +103,28 @@ else
 fi
 BUILD_ARGS+=(--build-arg "AGENT_RUNNER_DEPS_HASH=${AGENT_RUNNER_DEPS_HASH}")
 
+# Retention metadata is ARG-driven so the final LABEL layer is re-stamped even
+# when every content layer is cached. The canonical spawn image is protected by
+# configuration and therefore carries a zero-hour temporary lease. Candidate
+# tags default to seven days and may be tuned by the caller.
+NANOCLAW_RETENTION_CREATED_AT="$(node -e 'process.stdout.write(new Date().toISOString())')"
+if [ "$TAG" = "latest" ]; then
+    NANOCLAW_RETENTION_HOURS=0
+    NANOCLAW_IMAGE_ROLE=canonical
+else
+    NANOCLAW_RETENTION_HOURS="${NANOCLAW_IMAGE_RETENTION_HOURS:-168}"
+    NANOCLAW_IMAGE_ROLE=candidate
+fi
+if ! [[ "$NANOCLAW_RETENTION_HOURS" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    echo "NANOCLAW_IMAGE_RETENTION_HOURS must be a non-negative number" >&2
+    exit 1
+fi
+NANOCLAW_RETENTION_OWNER="${NANOCLAW_IMAGE_RETENTION_OWNER:-}"
+BUILD_ARGS+=(--build-arg "NANOCLAW_RETENTION_CREATED_AT=${NANOCLAW_RETENTION_CREATED_AT}")
+BUILD_ARGS+=(--build-arg "NANOCLAW_RETENTION_HOURS=${NANOCLAW_RETENTION_HOURS}")
+BUILD_ARGS+=(--build-arg "NANOCLAW_RETENTION_OWNER=${NANOCLAW_RETENTION_OWNER}")
+BUILD_ARGS+=(--build-arg "NANOCLAW_IMAGE_ROLE=${NANOCLAW_IMAGE_ROLE}")
+
 echo "Building NanoClaw agent container image..."
 echo "Image: ${IMAGE_REF} (commit ${NANOCLAW_COMMIT}, agent-runner-deps ${AGENT_RUNNER_DEPS_HASH})"
 

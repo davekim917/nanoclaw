@@ -497,3 +497,15 @@ LABEL nanoclaw.commit=$NANOCLAW_COMMIT
 # `docker build --label` is silently dropped on fully-cached rebuilds.
 ARG AGENT_RUNNER_DEPS_HASH=unknown
 LABEL nanoclaw.agentRunnerDepsHash=$AGENT_RUNNER_DEPS_HASH
+
+# Pressure-aware storage cleanup reads these immutable labels before deleting
+# any managed image. Keeping them in an ARG-driven final layer renews a
+# candidate's lease even when all content layers are cache hits.
+ARG NANOCLAW_RETENTION_CREATED_AT=unknown
+ARG NANOCLAW_RETENTION_HOURS=0
+ARG NANOCLAW_RETENTION_OWNER
+ARG NANOCLAW_IMAGE_ROLE=canonical
+LABEL nanoclaw.retention.created_at=$NANOCLAW_RETENTION_CREATED_AT
+LABEL nanoclaw.retention.hours=$NANOCLAW_RETENTION_HOURS
+LABEL nanoclaw.retention.owner=$NANOCLAW_RETENTION_OWNER
+LABEL nanoclaw.image.role=$NANOCLAW_IMAGE_ROLE

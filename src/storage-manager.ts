@@ -3,7 +3,7 @@
  *
  * Reclaims only regenerable storage:
  *   - package/build caches inside idle session and thread worktrees
- *   - stopped NanoClaw containers from this install and legacy NanoClaw agents
+ *   - stopped containers carrying this NanoClaw install's ownership label
  *   - unused NanoClaw images and bounded Docker builder cache
  *
  * It deliberately does not remove DBs, outboxes, source checkouts, .git
@@ -15,10 +15,10 @@ import path from 'path';
 
 import Database from 'better-sqlite3';
 
-import { CONTAINER_INSTALL_LABEL, DATA_DIR } from './config.js';
+import { CONTAINER_IMAGE, CONTAINER_IMAGE_BASE, CONTAINER_INSTALL_LABEL, DATA_DIR } from './config.js';
 import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';
 import { getDb } from './db/connection.js';
-import { getAgentGroup } from './db/agent-groups.js';
+import { getAllContainerConfigs } from './db/container-configs.js';
 import { log } from './log.js';
 import {
   inboundDbPath,
@@ -35,6 +35,10 @@ const DEFAULT_SCAN_INTERVAL_HOURS = 1;
 const DEFAULT_DOCKER_PRUNE_INTERVAL_HOURS = 6;
 const DEFAULT_DOCKER_BUILD_CACHE_UNUSED_FOR = '168h';
 const DEFAULT_IDLE_HOURS = 24;
+const DEFAULT_CLEANUP_TARGET_MARGIN_PCT = 3;
+const DEFAULT_EMERGENCY_RETRY_SECONDS = 60;
+const DEFAULT_IMAGE_RETENTION_HOURS = 168;
+const DEFAULT_LEGACY_IMAGE_GRACE_HOURS = 168;
 
 const parsedIdleHours = Number(process.env.SESSION_ARTIFACT_IDLE_HOURS);
 export const SESSION_ARTIFACT_IDLE_MS =
@@ -45,6 +49,7 @@ const SKIP_DESCEND_DIR_NAMES = new Set(['.git']);
 
 let lastStorageMaintenanceMs = 0;
 let lastDockerPruneAttemptMs = 0;
+let lastEmergencyDockerAttemptMs = 0;
 
 export type StorageMode = 'dry-run' | 'apply';
 export type StoragePool = 'session-cache' | 'thread-cache' | 'docker';
@@ -63,6 +68,10 @@ export interface StoragePolicy {
   scanCadenceMs: number;
   dockerPruneCadenceMs: number;
   dockerBuildCacheUnusedFor: string;
+  cleanupTargetPct: number;
+  emergencyRetryMs: number;
+  candidateRetentionHours: number;
+  legacyImageGraceHours: number;
 }
 
 export interface FilesystemUsage {
@@ -86,8 +95,119 @@ export interface StorageActionReport {
   error?: string;
 }
 
+export interface DockerImageInventory {
+  id: string;
+  repoTags: string[];
+  repoDigests?: string[];
+  createdAt: string;
+  sizeBytes: number;
+  labels: Record<string, string>;
+}
+
+export type DockerImageDisposition = 'protected' | 'eligible' | 'unmanaged';
+
+export interface DockerImageDispositionReport extends DockerImageInventory {
+  disposition: DockerImageDisposition;
+  protectionReason:
+    | 'canonical-image'
+    | 'configured-image'
+    | 'container-referenced'
+    | 'configuration-unreadable'
+    | 'retention-lease'
+    | 'invalid-retention-metadata'
+    | 'legacy-grace'
+    | 'expired-unreferenced'
+    | 'unmanaged-image';
+  owner: string | null;
+  leaseExpiresAt: string | null;
+}
+
+export interface DockerImageProtectionContext {
+  now: number;
+  canonicalImage: string;
+  configuredImages: Set<string>;
+  containerImageIds: Set<string>;
+  candidateRetentionHours: number;
+  legacyGraceHours: number;
+  configurationReadable: boolean;
+}
+
+const RETENTION_CREATED_AT_LABEL = 'nanoclaw.retention.created_at';
+const RETENTION_HOURS_LABEL = 'nanoclaw.retention.hours';
+const RETENTION_OWNER_LABEL = 'nanoclaw.retention.owner';
+const IMAGE_ROLE_LABEL = 'nanoclaw.image.role';
+
+export function classifyDockerImage(
+  image: DockerImageInventory,
+  context: DockerImageProtectionContext,
+): DockerImageDispositionReport {
+  const imageReferences = [...image.repoTags, ...(image.repoDigests ?? [])];
+  const isCanonical = imageReferences.includes(context.canonicalImage) || image.id === context.canonicalImage;
+  const isConfigured =
+    imageReferences.some((reference) => context.configuredImages.has(reference)) ||
+    context.configuredImages.has(image.id);
+  const isContainerReferenced = context.containerImageIds.has(image.id);
+  const isNanoClawTag = image.repoTags.some(
+    (tag) => tag === CONTAINER_IMAGE_BASE || tag.startsWith(`${CONTAINER_IMAGE_BASE}:`),
+  );
+  const isManaged =
+    isCanonical ||
+    isConfigured ||
+    isNanoClawTag ||
+    Boolean(image.labels[DOCKER_PRUNE_IMAGE_LABEL]) ||
+    Boolean(image.labels[IMAGE_ROLE_LABEL]);
+
+  const base = {
+    ...image,
+    owner: image.labels[RETENTION_OWNER_LABEL]?.trim() || null,
+    leaseExpiresAt: null as string | null,
+  };
+  const protectedResult = (
+    protectionReason: DockerImageDispositionReport['protectionReason'],
+  ): DockerImageDispositionReport => ({ ...base, disposition: 'protected', protectionReason });
+
+  if (!isManaged) {
+    return { ...base, disposition: 'unmanaged', protectionReason: 'unmanaged-image' };
+  }
+
+  const createdLabel = image.labels[RETENTION_CREATED_AT_LABEL];
+  const hoursLabel = image.labels[RETENTION_HOURS_LABEL];
+  const hasAnyRetentionMetadata =
+    createdLabel !== undefined || hoursLabel !== undefined || image.labels[RETENTION_OWNER_LABEL] !== undefined;
+  let invalidRetentionMetadata = false;
+  let activeLeaseReason: 'retention-lease' | 'legacy-grace' | null = null;
+  if (hasAnyRetentionMetadata) {
+    const createdMs = createdLabel ? Date.parse(createdLabel) : NaN;
+    const hours = hoursLabel === undefined || hoursLabel.trim() === '' ? NaN : Number(hoursLabel);
+    if (!Number.isFinite(createdMs) || !Number.isFinite(hours) || hours < 0) {
+      invalidRetentionMetadata = true;
+    } else {
+      const leaseExpiresMs = createdMs + hours * 60 * 60 * 1000;
+      base.leaseExpiresAt = new Date(leaseExpiresMs).toISOString();
+      if (hours > 0 && context.now < leaseExpiresMs) activeLeaseReason = 'retention-lease';
+    }
+  } else {
+    const createdMs = Date.parse(image.createdAt);
+    if (!Number.isFinite(createdMs)) {
+      invalidRetentionMetadata = true;
+    } else {
+      const legacyExpiresMs = createdMs + context.legacyGraceHours * 60 * 60 * 1000;
+      base.leaseExpiresAt = new Date(legacyExpiresMs).toISOString();
+      if (context.now < legacyExpiresMs) activeLeaseReason = 'legacy-grace';
+    }
+  }
+
+  if (isCanonical) return protectedResult('canonical-image');
+  if (isConfigured) return protectedResult('configured-image');
+  if (isContainerReferenced) return protectedResult('container-referenced');
+  if (!context.configurationReadable) return protectedResult('configuration-unreadable');
+  if (invalidRetentionMetadata) return protectedResult('invalid-retention-metadata');
+  if (activeLeaseReason) return protectedResult(activeLeaseReason);
+  return { ...base, disposition: 'eligible', protectionReason: 'expired-unreferenced' };
+}
+
 interface StorageAction extends StorageActionReport {
-  apply: () => void;
+  apply: () => void | boolean;
 }
 
 export interface StorageReport {
@@ -100,6 +220,19 @@ export interface StorageReport {
     actualReclaimedBytes: number;
   };
   estimatedReclaimableBytes: number;
+  pressure: {
+    level: 'unknown' | 'normal' | 'cleanup' | 'critical';
+    cleanupTargetPct: number;
+    targetReached: boolean;
+    nextEmergencyRetryAt: string | null;
+  };
+  images: {
+    dispositions: DockerImageDispositionReport[];
+    protectedCount: number;
+    protectedBytes: number;
+    eligibleCount: number;
+    eligibleBytes: number;
+  };
   actions: StorageActionReport[];
   pools: Record<StoragePool, { actions: number; estimatedBytes: number }>;
   skipped: {
@@ -149,6 +282,12 @@ function parsePositiveInt(value: string | undefined, fallback: number): number {
   return Math.floor(parsed);
 }
 
+function parseNonNegativeNumber(value: string | undefined, fallback: number): number {
+  if (value === undefined || value.trim() === '') return fallback;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
 export function resolveStoragePolicy(overrides: Partial<StoragePolicy> = {}): StoragePolicy {
   const cleanupThreshold = Math.min(
     99,
@@ -170,6 +309,16 @@ export function resolveStoragePolicy(overrides: Partial<StoragePolicy> = {}): St
     process.env.NANOCLAW_DOCKER_PRUNE_INTERVAL_HOURS,
     DEFAULT_DOCKER_PRUNE_INTERVAL_HOURS,
   );
+  const cleanupTarget = Math.max(
+    1,
+    Math.min(
+      cleanupThreshold,
+      parsePositiveInt(
+        process.env.NANOCLAW_STORAGE_CLEANUP_TARGET_PCT,
+        cleanupThreshold - DEFAULT_CLEANUP_TARGET_MARGIN_PCT,
+      ),
+    ),
+  );
 
   return {
     enabled: process.env.NANOCLAW_STORAGE_MANAGER_ENABLED !== '0',
@@ -181,6 +330,17 @@ export function resolveStoragePolicy(overrides: Partial<StoragePolicy> = {}): St
     dockerPruneCadenceMs: dockerPruneHours * 60 * 60 * 1000,
     dockerBuildCacheUnusedFor:
       process.env.NANOCLAW_DOCKER_BUILD_CACHE_UNUSED_FOR || DEFAULT_DOCKER_BUILD_CACHE_UNUSED_FOR,
+    cleanupTargetPct: cleanupTarget,
+    emergencyRetryMs:
+      parsePositiveNumber(process.env.NANOCLAW_STORAGE_EMERGENCY_RETRY_SECONDS, DEFAULT_EMERGENCY_RETRY_SECONDS) * 1000,
+    candidateRetentionHours: parseNonNegativeNumber(
+      process.env.NANOCLAW_IMAGE_RETENTION_HOURS,
+      DEFAULT_IMAGE_RETENTION_HOURS,
+    ),
+    legacyImageGraceHours: parseNonNegativeNumber(
+      process.env.NANOCLAW_LEGACY_IMAGE_GRACE_HOURS,
+      DEFAULT_LEGACY_IMAGE_GRACE_HOURS,
+    ),
     ...overrides,
   };
 }
@@ -320,12 +480,12 @@ function sessionLastActivityMs(sessPath: string): number {
   return newest;
 }
 
-function dbHasRows(dbPath: string, sql: string): boolean | null {
+function dbHasRows(dbPath: string, sql: string, params: unknown[] = []): boolean | null {
   if (!fs.existsSync(dbPath)) return false;
   let db: Database.Database | null = null;
   try {
     db = new Database(dbPath, { readonly: true, fileMustExist: true });
-    const row = db.prepare(sql).get() as { found: number } | undefined;
+    const row = db.prepare(sql).get(...params) as { found: number } | undefined;
     return (row?.found ?? 0) > 0;
   } catch {
     return null;
@@ -334,10 +494,19 @@ function dbHasRows(dbPath: string, sql: string): boolean | null {
   }
 }
 
-function sessionHasOpenWork(agentGroupId: string, sessionId: string, sessPath?: string): boolean | null {
+function sessionHasOpenWork(agentGroupId: string, sessionId: string, now: number, sessPath?: string): boolean | null {
   const inbound = dbHasRows(
     sessPath ? path.join(sessPath, 'inbound.db') : inboundDbPath(agentGroupId, sessionId),
-    "SELECT 1 AS found FROM messages_in WHERE status IN ('pending','processing') LIMIT 1",
+    `SELECT 1 AS found
+       FROM messages_in
+      WHERE status = 'processing'
+         OR (
+           status = 'pending'
+           AND trigger = 1
+           AND (process_after IS NULL OR datetime(process_after) <= datetime(?))
+         )
+      LIMIT 1`,
+    [new Date(now).toISOString()],
   );
   if (inbound === null || inbound) return inbound;
 
@@ -350,6 +519,7 @@ function sessionHasOpenWork(agentGroupId: string, sessionId: string, sessPath?: 
 
 export function collectThreadWorktreeActivity(
   isContainerRunning: (sessionId: string) => boolean,
+  now = Date.now(),
 ): Map<string, ThreadWorktreeActivity> {
   const activity = new Map<string, ThreadWorktreeActivity>();
   let rows: Array<{
@@ -387,7 +557,7 @@ export function collectThreadWorktreeActivity(
     if (isContainerRunning(row.id)) {
       current.hasRunningContainer = true;
     }
-    const openWork = sessionHasOpenWork(row.agent_group_id, row.id);
+    const openWork = sessionHasOpenWork(row.agent_group_id, row.id, now);
     if (openWork !== false) {
       current.hasBusySession = true;
     }
@@ -449,7 +619,7 @@ function collectSessionCacheActions(args: {
       }
 
       const sessPath = path.join(groupPath, sessionId);
-      const busy = sessionHasOpenWork(groupDirent.name, sessionId, sessPath);
+      const busy = sessionHasOpenWork(groupDirent.name, sessionId, args.now, sessPath);
       if (busy !== false) {
         if (busy === null) args.skipped.unreadableSessions += 1;
         else args.skipped.busySessions += 1;
@@ -593,6 +763,7 @@ function createDockerAction(args: {
   estimatedBytes: number;
   reason: string;
   safety: string;
+  apply?: () => void | boolean;
 }): StorageAction {
   return {
     id: args.id,
@@ -603,13 +774,145 @@ function createDockerAction(args: {
     reason: args.reason,
     safety: args.safety,
     status: 'planned',
-    apply: () => {
-      execFileSync(CONTAINER_RUNTIME_BIN, args.dockerArgs, {
-        stdio: 'pipe',
-        timeout: 120_000,
-      });
-    },
+    apply:
+      args.apply ??
+      (() => {
+        execFileSync(CONTAINER_RUNTIME_BIN, args.dockerArgs, {
+          stdio: 'pipe',
+          timeout: 120_000,
+        });
+      }),
   };
+}
+
+interface DockerContainerInventory {
+  id: string;
+  imageId: string;
+  running: boolean;
+  labels: Record<string, string>;
+}
+
+interface DockerInventory {
+  containers: DockerContainerInventory[];
+  images: DockerImageInventory[];
+}
+
+function dockerOutput(args: string[], timeout = 30_000): string {
+  return execFileSync(CONTAINER_RUNTIME_BIN, args, {
+    encoding: 'utf-8',
+    stdio: ['pipe', 'pipe', 'pipe'],
+    timeout,
+  });
+}
+
+function nonEmptyLines(output: string): string[] {
+  return output
+    .split('\n')
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+function inspectDockerContainers(ids?: string[]): DockerContainerInventory[] {
+  const selectedIds = [...new Set(ids ?? nonEmptyLines(dockerOutput(['container', 'ls', '-a', '-q', '--no-trunc'])))];
+  if (selectedIds.length === 0) return [];
+  const rows = JSON.parse(dockerOutput(['container', 'inspect', ...selectedIds])) as Array<{
+    Id?: string;
+    Image?: string;
+    State?: { Running?: boolean };
+    Config?: { Labels?: Record<string, string> | null };
+  }>;
+  return rows
+    .filter((row): row is typeof row & { Id: string } => typeof row.Id === 'string' && row.Id.length > 0)
+    .map((row) => ({
+      id: row.Id,
+      imageId: row.Image ?? '',
+      running: row.State?.Running === true,
+      labels: row.Config?.Labels ?? {},
+    }));
+}
+
+function inspectDockerImages(ids?: string[]): DockerImageInventory[] {
+  const selectedIds = [...new Set(ids ?? nonEmptyLines(dockerOutput(['image', 'ls', '-a', '-q', '--no-trunc'])))];
+  if (selectedIds.length === 0) return [];
+  const rows = JSON.parse(dockerOutput(['image', 'inspect', ...selectedIds])) as Array<{
+    Id?: string;
+    RepoTags?: string[] | null;
+    RepoDigests?: string[] | null;
+    Created?: string;
+    Size?: number;
+    Config?: { Labels?: Record<string, string> | null };
+  }>;
+  return rows
+    .filter((row): row is typeof row & { Id: string } => typeof row.Id === 'string' && row.Id.length > 0)
+    .map((row) => ({
+      id: row.Id,
+      repoTags: Array.isArray(row.RepoTags) ? row.RepoTags : [],
+      repoDigests: Array.isArray(row.RepoDigests) ? row.RepoDigests : [],
+      createdAt: row.Created ?? '',
+      sizeBytes: Number.isFinite(row.Size) ? Math.max(0, Number(row.Size)) : 0,
+      labels: row.Config?.Labels ?? {},
+    }));
+}
+
+function readDockerInventory(): DockerInventory {
+  return { containers: inspectDockerContainers(), images: inspectDockerImages() };
+}
+
+function configuredImageProtection(): { images: Set<string>; readable: boolean } {
+  try {
+    return {
+      images: new Set(
+        getAllContainerConfigs()
+          .map((config) => config.image_tag?.trim())
+          .filter((tag): tag is string => Boolean(tag)),
+      ),
+      readable: true,
+    };
+  } catch (err) {
+    log.warn('storage-manager: failed to read configured image tags; image deletion disabled', { err });
+    return { images: new Set(), readable: false };
+  }
+}
+
+function classifyDockerInventory(
+  inventory: DockerInventory,
+  policy: StoragePolicy,
+  now: number,
+): DockerImageDispositionReport[] {
+  const configured = configuredImageProtection();
+  const containerImageIds = new Set(inventory.containers.map((container) => container.imageId).filter(Boolean));
+  return inventory.images.map((image) =>
+    classifyDockerImage(image, {
+      now,
+      canonicalImage: CONTAINER_IMAGE,
+      configuredImages: configured.images,
+      containerImageIds,
+      candidateRetentionHours: policy.candidateRetentionHours,
+      legacyGraceHours: policy.legacyImageGraceHours,
+      configurationReadable: configured.readable,
+    }),
+  );
+}
+
+function installLabelParts(): { key: string; value: string } {
+  const equals = CONTAINER_INSTALL_LABEL.indexOf('=');
+  return {
+    key: equals === -1 ? CONTAINER_INSTALL_LABEL : CONTAINER_INSTALL_LABEL.slice(0, equals),
+    value: equals === -1 ? '' : CONTAINER_INSTALL_LABEL.slice(equals + 1),
+  };
+}
+
+function usageAtOrBelowTarget(policy: StoragePolicy): boolean {
+  const usage = getFilesystemUsage(policy.filesystemPath);
+  return usage !== null && usage.usagePct <= policy.cleanupTargetPct;
+}
+
+function builderSupportsMinFreeSpace(): boolean {
+  try {
+    return dockerOutput(['builder', 'prune', '--help'], 10_000).includes('--min-free-space');
+  } catch {
+    return false;
+  }
 }
 
 function collectDockerActions(
@@ -617,29 +920,45 @@ function collectDockerActions(
   now: number,
   mode: StorageMode,
   warnings: string[],
-): StorageAction[] {
+  usageBefore: FilesystemUsage | null,
+  force: boolean,
+): { actions: StorageAction[]; images: DockerImageDispositionReport[] } {
   let dockerRoot: string;
   try {
     dockerRoot = dockerRootDir();
   } catch (err) {
     warnings.push(`docker info failed: ${err instanceof Error ? err.message : String(err)}`);
-    return [];
+    return { actions: [], images: [] };
   }
 
-  const usage = getFilesystemUsage(dockerRoot);
-  if (!usage) {
+  const dockerUsage = getFilesystemUsage(dockerRoot);
+  if (!dockerUsage) {
     warnings.push(`df failed for Docker root ${dockerRoot}`);
-    return [];
+    return { actions: [], images: [] };
   }
 
-  if (
-    mode === 'apply' &&
-    lastDockerPruneAttemptMs > 0 &&
-    now - lastDockerPruneAttemptMs < policy.dockerPruneCadenceMs
-  ) {
-    warnings.push('docker prune skipped by cadence throttle');
-    return [];
+  const pressurePct = usageBefore?.usagePct ?? dockerUsage.usagePct;
+  const critical = pressurePct >= policy.admissionRefusePct;
+  if (mode === 'apply' && !force) {
+    if (critical && lastEmergencyDockerAttemptMs > 0 && now - lastEmergencyDockerAttemptMs < policy.emergencyRetryMs) {
+      warnings.push('docker cleanup skipped by emergency retry throttle');
+      return { actions: [], images: [] };
+    }
+    if (!critical && lastDockerPruneAttemptMs > 0 && now - lastDockerPruneAttemptMs < policy.dockerPruneCadenceMs) {
+      warnings.push('docker cleanup skipped by cadence throttle');
+      return { actions: [], images: [] };
+    }
   }
+  if (mode === 'apply' && critical) lastEmergencyDockerAttemptMs = now;
+
+  let inventory: DockerInventory;
+  try {
+    inventory = readDockerInventory();
+  } catch (err) {
+    warnings.push(`docker inventory failed: ${err instanceof Error ? err.message : String(err)}`);
+    return { actions: [], images: [] };
+  }
+  const imageDispositions = classifyDockerInventory(inventory, policy, now);
 
   let estimates: Partial<Record<'Images' | 'Containers' | 'Build Cache', number>> = {};
   try {
@@ -649,35 +968,35 @@ function collectDockerActions(
   }
 
   const actions: StorageAction[] = [];
-  const thresholdReason = `Docker filesystem usage is ${usage.usagePct}% (threshold ${policy.cleanupThresholdPct}%)`;
-  if (usage.usagePct >= policy.cleanupThresholdPct) {
-    actions.push(
-      createDockerAction({
-        id: 'docker:containers:stopped-install-labeled',
-        kind: 'docker-prune-containers',
-        dockerArgs: ['container', 'prune', '-f', '--filter', `label=${CONTAINER_INSTALL_LABEL}`],
-        estimatedBytes: estimates.Containers ?? 0,
-        reason: thresholdReason,
-        safety: 'Docker only removes stopped containers carrying this NanoClaw install label.',
-      }),
-      createDockerAction({
-        id: 'docker:containers:stopped-nanoclaw-labeled',
-        kind: 'docker-prune-containers',
-        dockerArgs: ['container', 'prune', '-f', '--filter', `label=${DOCKER_PRUNE_IMAGE_LABEL}`],
-        estimatedBytes: 0,
-        reason: thresholdReason,
-        safety:
-          'Docker only removes stopped containers carrying the NanoClaw commit label, including legacy containers that predate install labels.',
-      }),
-      createDockerAction({
-        id: 'docker:images:unused-nanoclaw',
-        kind: 'docker-prune-images',
-        dockerArgs: ['image', 'prune', '-a', '-f', '--filter', `label=${DOCKER_PRUNE_IMAGE_LABEL}`],
-        estimatedBytes: estimates.Images ?? 0,
-        reason: thresholdReason,
-        safety: 'Docker only removes images unused by any container and carrying the NanoClaw image commit label.',
-      }),
-    );
+  const thresholdReason = `filesystem usage is ${pressurePct}% (threshold ${policy.cleanupThresholdPct}%, target ${policy.cleanupTargetPct}%)`;
+  if (pressurePct >= policy.cleanupThresholdPct) {
+    const installLabel = installLabelParts();
+    for (const container of inventory.containers) {
+      if (container.running || container.labels[installLabel.key] !== installLabel.value) continue;
+      const dockerArgs = ['container', 'rm', container.id];
+      actions.push(
+        createDockerAction({
+          id: `docker:container:${container.id}`,
+          kind: 'docker-prune-containers',
+          dockerArgs,
+          estimatedBytes: 0,
+          reason: thresholdReason,
+          safety: 'Exact non-forced removal of a stopped container carrying this install label.',
+          apply: () => {
+            let current: DockerContainerInventory[];
+            try {
+              current = inspectDockerContainers([container.id]);
+            } catch {
+              return false;
+            }
+            const target = current[0];
+            if (!target || target.running || target.labels[installLabel.key] !== installLabel.value) return false;
+            execFileSync(CONTAINER_RUNTIME_BIN, dockerArgs, { stdio: 'pipe', timeout: 120_000 });
+            return true;
+          },
+        }),
+      );
+    }
   }
 
   actions.push(
@@ -690,7 +1009,74 @@ function collectDockerActions(
       safety: 'Docker removes only BuildKit cache records unused for at least the configured age window.',
     }),
   );
-  return actions;
+
+  if (critical) {
+    if (builderSupportsMinFreeSpace()) {
+      const targetAvailableBytes = Math.ceil(
+        ((100 - policy.cleanupTargetPct) / 100) * (usageBefore?.sizeBytes ?? dockerUsage.sizeBytes),
+      );
+      const dockerArgs = ['builder', 'prune', '-a', '-f', '--min-free-space', `${targetAvailableBytes}B`];
+      actions.push(
+        createDockerAction({
+          id: 'docker:builder-cache:min-free-space',
+          kind: 'docker-prune-builder-cache',
+          dockerArgs,
+          estimatedBytes: 0,
+          reason: `critical pressure requires bounded BuildKit reclamation toward ${policy.cleanupTargetPct}%`,
+          safety: 'Uses Docker BuildKit min-free-space; it does not remove named images or containers.',
+          apply: () => {
+            if (usageAtOrBelowTarget(policy)) return false;
+            execFileSync(CONTAINER_RUNTIME_BIN, dockerArgs, { stdio: 'pipe', timeout: 120_000 });
+            return true;
+          },
+        }),
+      );
+    } else {
+      warnings.push('Docker builder does not support --min-free-space; aggressive BuildKit cleanup skipped');
+    }
+  }
+
+  if (pressurePct >= policy.cleanupThresholdPct) {
+    const eligible = imageDispositions
+      .filter((image) => image.disposition === 'eligible')
+      .sort((a, b) => {
+        const aCreated = Date.parse(a.createdAt);
+        const bCreated = Date.parse(b.createdAt);
+        return (
+          (Number.isFinite(aCreated) ? aCreated : Number.MAX_SAFE_INTEGER) -
+          (Number.isFinite(bCreated) ? bCreated : Number.MAX_SAFE_INTEGER)
+        );
+      });
+    for (const image of eligible) {
+      const dockerArgs = ['image', 'rm', image.id];
+      actions.push(
+        createDockerAction({
+          id: `docker:image:${image.id}`,
+          kind: 'docker-prune-images',
+          dockerArgs,
+          estimatedBytes: image.sizeBytes,
+          reason: thresholdReason,
+          safety: 'Exact non-forced removal after immediate protection and reference revalidation.',
+          apply: () => {
+            if (usageAtOrBelowTarget(policy)) return false;
+            let currentInventory: DockerInventory;
+            try {
+              currentInventory = readDockerInventory();
+            } catch {
+              return false;
+            }
+            const current = classifyDockerInventory(currentInventory, policy, Date.now()).find(
+              (candidate) => candidate.id === image.id,
+            );
+            if (!current || current.disposition !== 'eligible') return false;
+            execFileSync(CONTAINER_RUNTIME_BIN, dockerArgs, { stdio: 'pipe', timeout: 120_000 });
+            return true;
+          },
+        }),
+      );
+    }
+  }
+  return { actions, images: imageDispositions };
 }
 
 function summarize(actions: StorageActionReport[]): StorageReport['pools'] {
@@ -723,6 +1109,38 @@ function emptySkipped(): StorageReport['skipped'] {
   };
 }
 
+function summarizeImages(dispositions: DockerImageDispositionReport[]): StorageReport['images'] {
+  const protectedImages = dispositions.filter((image) => image.disposition === 'protected');
+  const eligibleImages = dispositions.filter((image) => image.disposition === 'eligible');
+  return {
+    dispositions,
+    protectedCount: protectedImages.length,
+    protectedBytes: protectedImages.reduce((sum, image) => sum + image.sizeBytes, 0),
+    eligibleCount: eligibleImages.length,
+    eligibleBytes: eligibleImages.reduce((sum, image) => sum + image.sizeBytes, 0),
+  };
+}
+
+function pressureReport(usage: FilesystemUsage | null, policy: StoragePolicy): StorageReport['pressure'] {
+  const level =
+    usage === null
+      ? 'unknown'
+      : usage.usagePct >= policy.admissionRefusePct
+        ? 'critical'
+        : usage.usagePct >= policy.cleanupThresholdPct
+          ? 'cleanup'
+          : 'normal';
+  return {
+    level,
+    cleanupTargetPct: policy.cleanupTargetPct,
+    targetReached: usage !== null && usage.usagePct <= policy.cleanupTargetPct,
+    nextEmergencyRetryAt:
+      level === 'critical' && lastEmergencyDockerAttemptMs > 0
+        ? new Date(lastEmergencyDockerAttemptMs + policy.emergencyRetryMs).toISOString()
+        : null,
+  };
+}
+
 export function getStorageReport(options: StorageReportOptions = {}): StorageReport {
   const mode = options.mode ?? 'dry-run';
   const now = options.now ?? Date.now();
@@ -742,6 +1160,8 @@ export function getStorageReport(options: StorageReportOptions = {}): StorageRep
       policy,
       filesystem: { before: usageBefore, after: usageBefore, actualReclaimedBytes: 0 },
       estimatedReclaimableBytes: 0,
+      pressure: pressureReport(usageBefore, policy),
+      images: summarizeImages([]),
       actions: [],
       pools: summarize([]),
       skipped,
@@ -749,11 +1169,13 @@ export function getStorageReport(options: StorageReportOptions = {}): StorageRep
     };
   }
 
-  const underCleanupThreshold = usageBefore !== null && usageBefore.usagePct < policy.cleanupThresholdPct;
+  const criticalPressure = usageBefore !== null && usageBefore.usagePct >= policy.admissionRefusePct;
   const cadenceActive =
     options.respectCadence === true &&
     !options.force &&
-    (underCleanupThreshold || (lastStorageMaintenanceMs > 0 && now - lastStorageMaintenanceMs < policy.scanCadenceMs));
+    !criticalPressure &&
+    lastStorageMaintenanceMs > 0 &&
+    now - lastStorageMaintenanceMs < policy.scanCadenceMs;
 
   if (cadenceActive) {
     return {
@@ -762,6 +1184,8 @@ export function getStorageReport(options: StorageReportOptions = {}): StorageRep
       policy,
       filesystem: { before: usageBefore, after: usageBefore, actualReclaimedBytes: 0 },
       estimatedReclaimableBytes: 0,
+      pressure: pressureReport(usageBefore, policy),
+      images: summarizeImages([]),
       actions: [],
       pools: summarize([]),
       skipped,
@@ -769,16 +1193,21 @@ export function getStorageReport(options: StorageReportOptions = {}): StorageRep
     };
   }
 
+  const dockerCollection = includeDocker
+    ? collectDockerActions(policy, now, mode, warnings, usageBefore, options.force === true)
+    : { actions: [], images: [] };
   const actions: StorageAction[] = [
     ...collectSessionCacheActions({ now, root: sessionsRoot, policy, isContainerRunning, skipped }),
     ...collectThreadCacheActions({
       now,
       root: threadsRoot,
       policy,
-      activityByWorktreeDir: fs.existsSync(threadsRoot) ? collectThreadWorktreeActivity(isContainerRunning) : new Map(),
+      activityByWorktreeDir: fs.existsSync(threadsRoot)
+        ? collectThreadWorktreeActivity(isContainerRunning, now)
+        : new Map(),
       skipped,
     }),
-    ...(includeDocker ? collectDockerActions(policy, now, mode, warnings) : []),
+    ...dockerCollection.actions,
   ];
 
   lastStorageMaintenanceMs = now;
@@ -786,11 +1215,8 @@ export function getStorageReport(options: StorageReportOptions = {}): StorageRep
   if (mode === 'apply') {
     for (const action of actions) {
       try {
-        action.apply();
-        action.status = 'applied';
-        if (action.pool === 'docker') {
-          lastDockerPruneAttemptMs = now;
-        }
+        const applied = action.apply();
+        action.status = applied === false ? 'skipped' : 'applied';
       } catch (err) {
         action.status = 'failed';
         action.error = err instanceof Error ? err.message : String(err);
@@ -803,6 +1229,13 @@ export function getStorageReport(options: StorageReportOptions = {}): StorageRep
   const actualReclaimedBytes =
     usageBefore && usageAfter ? Math.max(0, usageBefore.usedBytes - usageAfter.usedBytes) : 0;
   const actionReports = actions.map(withoutApply);
+  if (
+    mode === 'apply' &&
+    (actionReports.some((action) => action.pool === 'docker' && action.status === 'applied') ||
+      actualReclaimedBytes > 0)
+  ) {
+    lastDockerPruneAttemptMs = now;
+  }
 
   if (mode === 'apply') {
     log.info('storage-manager: maintenance complete', {
@@ -822,6 +1255,8 @@ export function getStorageReport(options: StorageReportOptions = {}): StorageRep
     policy,
     filesystem: { before: usageBefore, after: usageAfter, actualReclaimedBytes },
     estimatedReclaimableBytes: actionReports.reduce((sum, action) => sum + action.estimatedBytes, 0),
+    pressure: pressureReport(usageAfter, policy),
+    images: summarizeImages(dockerCollection.images),
     actions: actionReports,
     pools: summarize(actionReports),
     skipped,
@@ -849,7 +1284,7 @@ export function assertStorageAdmission(options: Omit<StorageReportOptions, 'mode
     return { allowed: true, reason: 'below-threshold', report };
   }
 
-  const report = getStorageReport({ ...options, policy, mode: 'apply', force: true });
+  const report = getStorageReport({ ...options, policy, mode: 'apply', force: false });
   const afterPct = report.filesystem.after?.usagePct ?? before.usagePct;
   if (afterPct >= policy.admissionRefusePct) {
     return { allowed: false, reason: 'still-over-threshold', report };
@@ -913,4 +1348,5 @@ export function pruneIdleThreadArtifacts(
 export function _resetStorageManagerThrottleForTesting(): void {
   lastStorageMaintenanceMs = 0;
   lastDockerPruneAttemptMs = 0;
+  lastEmergencyDockerAttemptMs = 0;
 }

@@ -80,6 +80,7 @@ import {
   runStorageMaintenance,
   type ThreadWorktreeActivity,
 } from './storage-manager.js';
+import { handleStoragePressureAlert } from './storage-pressure-alert.js';
 import type { Session } from './types.js';
 import { getDb } from './db/connection.js';
 import {
@@ -285,7 +286,8 @@ async function sweep(): Promise<void> {
   // Reclaim disk from idle caches and Docker artifacts after per-session
   // sweep work has had a chance to notice and wake due messages.
   try {
-    runStorageMaintenance({ isContainerRunning });
+    const storageReport = runStorageMaintenance({ isContainerRunning });
+    await handleStoragePressureAlert(storageReport);
   } catch (err) {
     log.warn('storage-manager: host sweep maintenance failed', { err });
   }

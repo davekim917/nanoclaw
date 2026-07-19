@@ -83,7 +83,8 @@ import {
   threadWorktreeDir,
   writeSessionRouting,
 } from './session-manager.js';
-import { assertStorageAdmission } from './storage-manager.js';
+import { assertStorageAdmission, resolveStoragePolicy } from './storage-manager.js';
+import { handleStoragePressureAlert } from './storage-pressure-alert.js';
 import { MemoryAdmissionController, type MemoryAdmissionPriority } from './memory-admission.js';
 import type { AgentGroup, Session } from './types.js';
 
@@ -453,6 +454,9 @@ export function wakeContainer(session: Session, priority: MemoryAdmissionPriorit
       actions: storageAdmission.report.actions.length,
       failedActions: storageAdmission.report.actions.filter((a) => a.status === 'failed').length,
     });
+    void handleStoragePressureAlert(storageAdmission.report).catch((err) =>
+      log.warn('storage-manager: admission pressure alert failed', { err }),
+    );
     return Promise.resolve(false);
   }
 
@@ -520,6 +524,9 @@ function startReservedWake(session: Session, storageAlreadyChecked = false): Pro
         sessionId: session.id,
         reason: storageAdmission.reason,
       });
+      void handleStoragePressureAlert(storageAdmission.report).catch((err) =>
+        log.warn('storage-manager: queued admission pressure alert failed', { err }),
+      );
       releaseMemoryReservation(session.id);
       return Promise.resolve(false);
     }
@@ -3401,6 +3408,13 @@ export async function buildAgentGroupImage(agentGroupId: string): Promise<void> 
     const allowBuilds = JSON.stringify(Object.fromEntries(npmPackages.map((pkg) => [pkg, true])));
     dockerfile += `RUN ${legacyAllowlist} && pnpm config set --global --json allowBuilds '${allowBuilds}' && pnpm install -g ${npmPackages.join(' ')}\n`;
   }
+  const retentionCreatedAt = new Date().toISOString();
+  const retentionHours = resolveStoragePolicy().candidateRetentionHours;
+  dockerfile += `LABEL nanoclaw.retention.created_at=${JSON.stringify(retentionCreatedAt)}\n`;
+  dockerfile += `LABEL nanoclaw.retention.hours=${retentionHours}\n`;
+  dockerfile += `LABEL nanoclaw.retention.owner=${JSON.stringify(agentGroupId)}\n`;
+  dockerfile += 'LABEL nanoclaw.image.role=agent-group\n';
+  dockerfile += `LABEL nanoclaw.agent_group_id=${JSON.stringify(agentGroupId)}\n`;
   dockerfile += 'USER node\n';
 
   const imageTag = `${CONTAINER_IMAGE_BASE}:${agentGroupId}`;

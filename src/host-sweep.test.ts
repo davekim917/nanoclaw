@@ -1141,7 +1141,11 @@ describe('pruneIdleSessionArtifacts', () => {
     fs.mkdirSync(dir, { recursive: true });
     const dbPath = path.join(dir, 'inbound.db');
     const db = new Database(dbPath);
-    db.exec("CREATE TABLE messages_in (status TEXT NOT NULL DEFAULT 'completed')");
+    db.exec(`CREATE TABLE messages_in (
+      status TEXT NOT NULL DEFAULT 'completed',
+      trigger INTEGER NOT NULL DEFAULT 1,
+      process_after TEXT
+    )`);
     db.close();
     const mtime = (Date.now() - opts.dbAgeMs) / 1000;
     fs.utimesSync(dbPath, mtime, mtime);
