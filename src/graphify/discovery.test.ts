@@ -49,6 +49,9 @@ describe('discoverWorkgroup', () => {
       'repo/dist/app.js',
       'analysis/.cache/result.json',
       'python/.venv/lib/site.py',
+      'python/sqlfluff-venv/lib/python3.11/site-packages/babel/locale-data/zu_ZA.dat',
+      'python/.direnv/python-3.11/lib/site.py',
+      'python/__pypackages__/3.11/lib/tool.py',
       'service/allure-results/run-result.json',
       'web/playwright-report/index.html',
       'web/test-results/screenshot.png',
@@ -91,6 +94,18 @@ describe('discoverWorkgroup', () => {
     expect(paths).not.toEqual(
       expect.arrayContaining(['node_modules/pkg/index.ts', 'project/dist/bundle.js', '.cache/copied.md']),
     );
+  });
+
+  test('test_discovery_excludes_named_python_virtualenvs', async () => {
+    const root = makeRoot();
+    put(root, 'sqlfluff-venv/lib/python3.11/site-packages/babel/messages/catalog.py', 'noise');
+    put(root, 'project/.direnv/python-3.11/lib/python/site.py', 'noise');
+    put(root, 'project/__pypackages__/3.11/lib/tool.py', 'noise');
+    put(root, 'research/environment-notes.md', '# Valuable knowledge');
+
+    const sources = await discoverWorkgroup({ workgroupId: 'wg', root });
+
+    expect(sources.map((source) => source.relativePath)).toEqual(['research/environment-notes.md']);
   });
 
   test('test_discovery_never_follows_symlink_escape', async () => {

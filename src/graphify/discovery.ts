@@ -47,6 +47,9 @@ const EXCLUDED_DIRECTORIES = new Set([
   'vendor',
   '.venv',
   'venv',
+  '.direnv',
+  '__pypackages__',
+  'site-packages',
   '__pycache__',
   '.pytest_cache',
   '.mypy_cache',
@@ -67,6 +70,15 @@ const EXCLUDED_DIRECTORIES = new Set([
   'dbt_packages',
 ]);
 
+function isExcludedDirectorySegment(segment: string): boolean {
+  const normalized = segment.toLowerCase();
+  return (
+    EXCLUDED_DIRECTORIES.has(normalized) ||
+    /^(?:\.?venv)(?:[-_.].+)?$/.test(normalized) ||
+    /[-_.]venv$/.test(normalized)
+  );
+}
+
 /**
  * Keep filesystem watchers on the same default directory surface as corpus
  * discovery. Watching excluded package/build caches can consume hundreds of
@@ -76,7 +88,7 @@ export function isGraphifyDefaultExcludedPath(root: string, candidate: string): 
   const relativePath = normalizeRelativePath(relative(resolve(root), resolve(candidate)));
   if (!relativePath || relativePath === '.') return false;
   if (relativePath === '..' || relativePath.startsWith('../')) return true;
-  return relativePath.split('/').some((segment) => EXCLUDED_DIRECTORIES.has(segment.toLowerCase()));
+  return relativePath.split('/').some(isExcludedDirectorySegment);
 }
 
 const CODE_EXTENSIONS = new Set([
@@ -414,7 +426,7 @@ export async function discoverWorkgroup(options: DiscoverWorkgroupOptions): Prom
       const entryStat = await lstat(absolutePath);
       if (entryStat.isSymbolicLink()) continue;
       if (entryStat.isDirectory()) {
-        if (EXCLUDED_DIRECTORIES.has(entry.name.toLowerCase())) continue;
+        if (isExcludedDirectorySegment(entry.name)) continue;
         if (ignoredByRules(rules, relativePath, true)) continue;
         const resolvedPath = await realpath(absolutePath);
         if (!isInsideRoot(root, resolvedPath)) continue;
