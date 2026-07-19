@@ -33,6 +33,8 @@ groups/*
 # Temp files
 .tmp-*
 .playwright-mcp/
+__pycache__/
+*.py[cod]
 
 # OS
 .DS_Store

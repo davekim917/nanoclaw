@@ -23,9 +23,7 @@ afterEach(() => {
 });
 
 /** Fake runCommand: unhandled commands fail (binary missing / daemon down). */
-function fakeRun(
-  handlers: Record<string, (args: string[]) => { status: number | null; stdout: string }>,
-): RunCommand {
+function fakeRun(handlers: Record<string, (args: string[]) => { status: number | null; stdout: string }>): RunCommand {
   return (cmd, args) => (handlers[cmd] ?? (() => ({ status: 1, stdout: '' })))(args);
 }
 
@@ -58,16 +56,8 @@ describe('scanInstall path groups', () => {
 
     const inv = scanInstall(deps());
 
-    expect(inv.data.map((i) => path.basename(i.path))).toEqual([
-      'data',
-      'logs',
-      '.env',
-      'start-nanoclaw.sh',
-    ]);
-    expect(inv.runtime.map((i) => path.basename(i.path))).toEqual([
-      'dist',
-      'node_modules',
-    ]);
+    expect(inv.data.map((i) => path.basename(i.path))).toEqual(['data', 'logs', '.env', 'start-nanoclaw.sh']);
+    expect(inv.runtime.map((i) => path.basename(i.path))).toEqual(['dist', 'node_modules']);
     expect(inv.user.map((i) => path.basename(i.path))).toEqual(['groups', 'store']);
   });
 
@@ -83,12 +73,7 @@ describe('scanInstall path groups', () => {
 
 describe('scanInstall service artifacts', () => {
   it('detects the launchd plist on macOS', () => {
-    const plist = path.join(
-      home,
-      'Library',
-      'LaunchAgents',
-      `${getLaunchdLabel(root)}.plist`,
-    );
+    const plist = path.join(home, 'Library', 'LaunchAgents', `${getLaunchdLabel(root)}.plist`);
     fs.mkdirSync(path.dirname(plist), { recursive: true });
     fs.writeFileSync(plist, '<plist/>');
 
@@ -97,22 +82,35 @@ describe('scanInstall service artifacts', () => {
     expect(inv.service.systemdUserUnit).toBeUndefined();
   });
 
-  it('detects systemd user unit and pidfile on Linux', () => {
-    const unit = path.join(
-      home,
-      '.config',
-      'systemd',
-      'user',
-      `${getSystemdUnit(root)}.service`,
-    );
+  it('detects main and Graphify systemd user units and pidfile on Linux', () => {
+    const unitName = getSystemdUnit(root);
+    const unit = path.join(home, '.config', 'systemd', 'user', `${unitName}.service`);
+    const graphifyUnit = path.join(home, '.config', 'systemd', 'user', `${unitName}-graphify.service`);
     fs.mkdirSync(path.dirname(unit), { recursive: true });
     fs.writeFileSync(unit, '[Unit]');
+    fs.writeFileSync(graphifyUnit, '[Unit]');
     fs.writeFileSync(path.join(root, 'nanoclaw.pid'), '12345');
 
     const inv = scanInstall(deps({ platform: 'linux' }));
     expect(inv.service.systemdUserUnit).toBe(unit);
+    expect(inv.service.graphifySystemdUserUnit).toBe(graphifyUnit);
     expect(inv.service.pidFile).toBe(path.join(root, 'nanoclaw.pid'));
     expect(inv.service.launchdPlist).toBeUndefined();
+  });
+
+  it('treats a Graphify-only systemd unit as an existing install', () => {
+    const graphifyUnit = path.join(home, '.config', 'systemd', 'user', `${getSystemdUnit(root)}-graphify.service`);
+    fs.mkdirSync(path.dirname(graphifyUnit), { recursive: true });
+    fs.writeFileSync(graphifyUnit, '[Unit]');
+
+    const originalHome = process.env.HOME;
+    process.env.HOME = home;
+    try {
+      expect(detectExistingInstall(root)).toBe(true);
+    } finally {
+      if (originalHome === undefined) delete process.env.HOME;
+      else process.env.HOME = originalHome;
+    }
   });
 
   it('captures container ids and image when docker is up', () => {

@@ -8,12 +8,15 @@ import ast
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import resource
+import stat
 import sys
+import tempfile
 import time
 from typing import Any, Sequence
+import zipfile
 
 
 def _load_integration_manifest() -> dict:
@@ -46,6 +49,18 @@ MAX_TMPFS_BYTES = 192 * 1024 * 1024
 MAX_DIAGNOSTIC_BYTES = 64 * 1024
 MAX_METADATA_BYTES = 8 * 1024 * 1024
 MAX_QUERY_RESULT_BYTES = MAX_DIAGNOSTIC_BYTES
+MAX_PREPROCESS_SOURCE_BYTES = 50 * 1024 * 1024
+MAX_PREPROCESSED_JSON_BYTES = MAX_METADATA_BYTES
+MAX_PREPROCESS_TEXT_BYTES = 4 * 1024 * 1024
+MAX_PREPROCESS_SECTIONS = 2048
+MAX_ARCHIVE_MEMBERS = 4096
+MAX_ARCHIVE_UNCOMPRESSED_BYTES = 128 * 1024 * 1024
+MAX_ARCHIVE_COMPRESSION_RATIO = 200
+MAX_DOCX_BLOCKS = 20_000
+MAX_XLSX_ROWS_PER_SHEET = 10_000
+MAX_XLSX_COLUMNS = 256
+MAX_XLSX_CELLS = 250_000
+MAX_CELL_CHARS = 16_384
 MAX_EDGE_RECONCILIATIONS = MAX_GRAPH_BYTES // 64
 MAX_SOURCE_ANCESTORS = 64
 MAX_OWNERSHIP_PREFIX_PARTS = 64
@@ -79,6 +94,12 @@ class WorkerError(RuntimeError):
 
 class WorkerValidationError(WorkerError):
     pass
+
+
+class _PreprocessFailure(WorkerError):
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
 
 
 @dataclass
@@ -1041,6 +1062,376 @@ def _write_bounded_json(path: Path, value: object, cap: int) -> tuple[int, str]:
     return total, digest.hexdigest()
 
 
+def _write_atomic_bounded_json(path: Path, value: object, cap: int) -> tuple[int, str]:
+    """Write one bounded JSON artifact without exposing a partial destination."""
+    encoder = json.JSONEncoder(sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.stem}.", suffix=".tmp"
+    )
+    temporary = Path(temporary_name)
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        os.chmod(temporary, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            descriptor = -1
+            for piece in encoder.iterencode(value):
+                raw = piece.encode("utf-8")
+                total += len(raw)
+                if total > cap:
+                    raise WorkerValidationError(f"artifact exceeds limit: {path.name}")
+                digest.update(raw)
+                stream.write(piece)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
+    return total, digest.hexdigest()
+
+
+def _bounded_text(value: object, byte_cap: int) -> tuple[str, bool]:
+    if byte_cap <= 0:
+        return "", bool(value)
+    text = str(value).replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return "", False
+    # A character is at least one UTF-8 byte, so this slice bounds the encode.
+    candidate = text[:byte_cap]
+    raw = candidate.encode("utf-8")
+    truncated = len(text) > len(candidate)
+    if len(raw) > byte_cap:
+        candidate = raw[:byte_cap].decode("utf-8", errors="ignore")
+        truncated = True
+    return candidate, truncated
+
+
+def _append_preprocessed_section(
+    sections: list[dict],
+    *,
+    kind: str,
+    locator: str,
+    label: str,
+    provenance: dict,
+    text: object,
+    remaining: int,
+) -> tuple[int, bool]:
+    if len(sections) >= MAX_PREPROCESS_SECTIONS:
+        return remaining, bool(str(text).strip())
+    bounded, truncated = _bounded_text(text, remaining)
+    if not bounded:
+        return remaining, truncated
+    used = len(bounded.encode("utf-8"))
+    sections.append({
+        "kind": kind,
+        "locator": locator,
+        "label": label,
+        "provenance": provenance,
+        "text": bounded,
+    })
+    return remaining - used, truncated
+
+
+def _validate_office_archive(path: Path) -> None:
+    """Fully stream an Office ZIP after rejecting unsafe central-directory claims."""
+    try:
+        with zipfile.ZipFile(path) as archive:
+            members = archive.infolist()
+            if not members or len(members) > MAX_ARCHIVE_MEMBERS:
+                raise _PreprocessFailure("unsafe_archive")
+            claimed_total = 0
+            for member in members:
+                name = member.filename
+                parts = PurePosixPath(name).parts
+                mode = (member.external_attr >> 16) & 0xFFFF
+                if (
+                    not name
+                    or len(name) > 4096
+                    or name.startswith(("/", "\\"))
+                    or "\\" in name
+                    or "\x00" in name
+                    or any(part in {"", ".", ".."} for part in parts)
+                    or member.flag_bits & 0x1
+                    or stat.S_ISLNK(mode)
+                    or member.file_size < 0
+                    or member.compress_size < 0
+                ):
+                    raise _PreprocessFailure("unsafe_archive")
+                claimed_total += member.file_size
+                if claimed_total > MAX_ARCHIVE_UNCOMPRESSED_BYTES:
+                    raise _PreprocessFailure("unsafe_archive")
+                if member.file_size:
+                    if member.compress_size == 0:
+                        raise _PreprocessFailure("unsafe_archive")
+                    if member.file_size / member.compress_size > MAX_ARCHIVE_COMPRESSION_RATIO:
+                        raise _PreprocessFailure("unsafe_archive")
+
+            streamed_total = 0
+            for member in members:
+                if member.is_dir():
+                    continue
+                with archive.open(member) as stream:
+                    while True:
+                        chunk = stream.read(64 * 1024)
+                        if not chunk:
+                            break
+                        streamed_total += len(chunk)
+                        if streamed_total > MAX_ARCHIVE_UNCOMPRESSED_BYTES:
+                            raise _PreprocessFailure("unsafe_archive")
+            if streamed_total != sum(member.file_size for member in members if not member.is_dir()):
+                raise _PreprocessFailure("unsafe_archive")
+    except _PreprocessFailure:
+        raise
+    except (OSError, RuntimeError, zipfile.BadZipFile, zipfile.LargeZipFile) as exc:
+        raise _PreprocessFailure("unsafe_archive") from exc
+
+
+def _pdf_sections(path: Path) -> tuple[list[dict], bool]:
+    from pypdf import PdfReader
+
+    reader = PdfReader(path)
+    if getattr(reader, "is_encrypted", False):
+        raise _PreprocessFailure("encrypted_document")
+    sections: list[dict] = []
+    remaining = MAX_PREPROCESS_TEXT_BYTES
+    truncated = False
+    pages = reader.pages
+    for index, page in enumerate(pages, start=1):
+        if index > MAX_PREPROCESS_SECTIONS:
+            truncated = True
+            break
+        remaining, section_truncated = _append_preprocessed_section(
+            sections,
+            kind="page",
+            locator=f"page:{index}",
+            label=f"Page {index}",
+            provenance={"page": index},
+            text=page.extract_text() or "",
+            remaining=remaining,
+        )
+        truncated = truncated or section_truncated
+        if remaining <= 0:
+            truncated = index < len(pages) or truncated
+            break
+    return sections, truncated
+
+
+def _docx_sections(path: Path) -> tuple[list[dict], bool]:
+    from docx import Document
+
+    document = Document(path)
+    blocks: list[str] = []
+    characters = 0
+    truncated = False
+    for paragraph in document.paragraphs:
+        text = str(paragraph.text).strip()
+        if not text:
+            continue
+        if len(blocks) >= MAX_DOCX_BLOCKS or characters >= MAX_PREPROCESS_TEXT_BYTES:
+            truncated = True
+            break
+        text = text[:MAX_PREPROCESS_TEXT_BYTES - characters]
+        blocks.append(text)
+        characters += len(text) + 1
+    if not truncated:
+        for table in document.tables:
+            for row in table.rows:
+                if len(blocks) >= MAX_DOCX_BLOCKS or characters >= MAX_PREPROCESS_TEXT_BYTES:
+                    truncated = True
+                    break
+                values = [str(cell.text).strip().replace("\n", " ")[:MAX_CELL_CHARS] for cell in row.cells]
+                line = " | ".join(values).strip()
+                if line:
+                    line = line[:MAX_PREPROCESS_TEXT_BYTES - characters]
+                    blocks.append(line)
+                    characters += len(line) + 1
+            if truncated:
+                break
+    sections: list[dict] = []
+    remaining, section_truncated = _append_preprocessed_section(
+        sections,
+        kind="document",
+        locator="document",
+        label="Document",
+        provenance={},
+        text="\n\n".join(blocks),
+        remaining=MAX_PREPROCESS_TEXT_BYTES,
+    )
+    return sections, truncated or section_truncated or remaining <= 0
+
+
+def _xlsx_sections(path: Path) -> tuple[list[dict], bool]:
+    from openpyxl import load_workbook
+
+    workbook = load_workbook(path, read_only=True, data_only=True, keep_links=False)
+    sections: list[dict] = []
+    remaining = MAX_PREPROCESS_TEXT_BYTES
+    truncated = False
+    cells = 0
+    try:
+        for sheet_index, sheet in enumerate(workbook.worksheets, start=1):
+            if sheet_index > MAX_PREPROCESS_SECTIONS or remaining <= 0:
+                truncated = True
+                break
+            lines: list[str] = []
+            characters = 0
+            for row_index, row in enumerate(sheet.iter_rows(values_only=True), start=1):
+                if row_index > MAX_XLSX_ROWS_PER_SHEET:
+                    truncated = True
+                    break
+                values: list[str] = []
+                for value in row[:MAX_XLSX_COLUMNS]:
+                    cells += 1
+                    if cells > MAX_XLSX_CELLS:
+                        truncated = True
+                        break
+                    rendered = "" if value is None else str(value)
+                    values.append(rendered.replace("\r", " ").replace("\n", " ")[:MAX_CELL_CHARS])
+                if len(row) > MAX_XLSX_COLUMNS:
+                    truncated = True
+                if cells > MAX_XLSX_CELLS:
+                    break
+                line = " | ".join(values).rstrip()
+                if line:
+                    room = min(remaining, MAX_PREPROCESS_TEXT_BYTES) - characters
+                    if room <= 0:
+                        truncated = True
+                        break
+                    lines.append(line[:room])
+                    characters += len(lines[-1]) + 1
+                    if len(line) > room:
+                        truncated = True
+                        break
+            title, title_truncated = _bounded_text(sheet.title, 512)
+            if not title:
+                title = f"Sheet {sheet_index}"
+            remaining, section_truncated = _append_preprocessed_section(
+                sections,
+                kind="sheet",
+                locator=f"sheet:{title}",
+                label=title,
+                provenance={"sheet": title},
+                text="\n".join(lines),
+                remaining=remaining,
+            )
+            truncated = truncated or title_truncated or section_truncated
+            if cells > MAX_XLSX_CELLS:
+                break
+    finally:
+        workbook.close()
+    return sections, truncated
+
+
+def _verified_preprocess_source(descriptor: dict) -> tuple[Path, Path, dict]:
+    source_root_raw = descriptor.get("source_root")
+    output_root_raw = descriptor.get("output_root")
+    source = descriptor.get("source")
+    if not isinstance(source_root_raw, str) or not isinstance(output_root_raw, str):
+        raise WorkerValidationError("invalid preprocess roots")
+    if not isinstance(source, dict) or set(source) != {"path", "sha256", "bytes"}:
+        raise WorkerValidationError("invalid preprocess source descriptor schema")
+    relative = source.get("path")
+    digest = source.get("sha256")
+    declared_size = source.get("bytes")
+    if (
+        not isinstance(relative, str)
+        or "\\" in relative
+        or PurePosixPath(relative).as_posix() != relative
+        or any(part in {"", ".", ".."} for part in PurePosixPath(relative).parts)
+        or not isinstance(digest, str)
+        or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        or not isinstance(declared_size, int)
+        or isinstance(declared_size, bool)
+        or declared_size < 0
+    ):
+        raise WorkerValidationError("invalid preprocess source descriptor schema")
+    source_root = Path(source_root_raw)
+    if not source_root.is_dir() or source_root.is_symlink():
+        raise WorkerValidationError("private preprocess source is unavailable")
+    path = _safe_relative(source_root, relative)
+    if path.suffix.lower() not in {".pdf", ".docx", ".xlsx"}:
+        raise WorkerValidationError("unsupported preprocess source type")
+    actual_size = path.stat().st_size
+    if actual_size > MAX_PREPROCESS_SOURCE_BYTES:
+        raise WorkerValidationError("preprocess source exceeds 50 MiB cap")
+    if actual_size != declared_size:
+        raise WorkerValidationError("private preprocess source hash mismatch")
+    actual_digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while True:
+            chunk = stream.read(64 * 1024)
+            if not chunk:
+                break
+            actual_digest.update(chunk)
+    if actual_digest.hexdigest() != digest:
+        raise WorkerValidationError("private preprocess source hash mismatch")
+
+    output_root = Path(output_root_raw)
+    if output_root.exists() and output_root.is_symlink():
+        raise WorkerValidationError("preprocess output may not be a symlink")
+    output_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if not output_root.is_dir() or output_root.is_symlink():
+        raise WorkerValidationError("preprocess output is unavailable")
+    return path, output_root, {
+        "path": relative,
+        "sha256": digest,
+        "bytes": actual_size,
+        "mediaType": {
+            ".pdf": "application/pdf",
+            ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        }[path.suffix.lower()],
+    }
+
+
+def preprocess_source(descriptor: dict) -> dict:
+    """Preprocess one verified local document into a bounded provenance artifact."""
+    path, output_root, source = _verified_preprocess_source(descriptor)
+    sections: list[dict] = []
+    truncated = False
+    error: str | None = None
+    try:
+        suffix = path.suffix.lower()
+        if suffix in {".docx", ".xlsx"}:
+            _validate_office_archive(path)
+        if suffix == ".pdf":
+            sections, truncated = _pdf_sections(path)
+        elif suffix == ".docx":
+            sections, truncated = _docx_sections(path)
+        else:
+            sections, truncated = _xlsx_sections(path)
+    except _PreprocessFailure as exc:
+        error = exc.code
+    except (ImportError, ModuleNotFoundError):
+        error = "dependency_unavailable"
+    except Exception:
+        error = "parse_failed"
+
+    status = "failed" if error else ("ok" if sections else "empty")
+    artifact = {
+        "schemaVersion": 1,
+        "status": status,
+        "source": source,
+        "sections": [] if error else sections,
+        "truncated": False if error else truncated,
+        "error": error,
+    }
+    artifact_path = output_root / "preprocessed.json"
+    artifact_bytes, artifact_sha256 = _write_atomic_bounded_json(
+        artifact_path, artifact, MAX_PREPROCESSED_JSON_BYTES
+    )
+    _METRICS.update({
+        "preprocess_source_bytes": source["bytes"],
+        "preprocess_output_bytes": artifact_bytes,
+        "preprocess_output_sha256": artifact_sha256,
+        "preprocess_sections": len(artifact["sections"]),
+        "preprocess_status": status,
+    })
+    return artifact
+
+
 def extract_candidate(descriptor: dict) -> ExtractionStatus:
     source_root = Path(descriptor["source_root"])
     output_root = Path(descriptor["output_root"])
@@ -1283,6 +1674,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise WorkerValidationError("descriptor Graphify version mismatch")
         if mode == "extract":
             extract_candidate(descriptor)
+        elif mode == "preprocess":
+            preprocess_source(descriptor)
         elif mode == "query":
             command = descriptor.get("command")
             arguments = descriptor.get("arguments")

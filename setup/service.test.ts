@@ -2,6 +2,10 @@ import { describe, it, expect } from 'vitest';
 import path from 'path';
 
 import { getLaunchdLabel } from '../src/install-slug.js';
+import {
+  installGraphifySystemdSidecar,
+  resolveGraphifySystemIdentity,
+} from './service.js';
 
 /**
  * Tests for service configuration generation.
@@ -184,5 +188,111 @@ echo $! > ${JSON.stringify(pidFile)}`;
     expect(wrapper).toContain('nohup');
     expect(wrapper).toContain(nodePath);
     expect(wrapper).toContain('nanoclaw.pid');
+  });
+});
+
+describe('Graphify Linux sidecar setup', () => {
+  it('drops a root-installed sidecar to the checkout owner identity', () => {
+    expect(
+      resolveGraphifySystemIdentity(
+        true,
+        '/root',
+        1000,
+        1001,
+        'root:x:0:0:root:/root:/bin/bash\nalice:x:1000:1001::/home/alice:/bin/bash\n',
+      ),
+    ).toEqual({
+      homeDir: '/home/alice',
+      identity: { systemUser: 'alice', systemGroup: '1001' },
+    });
+  });
+
+  it('keeps user units and genuinely root-owned checkouts unchanged', () => {
+    expect(
+      resolveGraphifySystemIdentity(false, '/home/alice', 1000, 1000, ''),
+    ).toEqual({ homeDir: '/home/alice', identity: {} });
+    expect(resolveGraphifySystemIdentity(true, '/root', 0, 0, '')).toEqual({
+      homeDir: '/root',
+      identity: {},
+    });
+  });
+
+  it('test_linux_setup_installs_slug_scoped_graphify_sidecar', () => {
+    const commands: string[] = [];
+    const writes: Array<{ filePath: string; content: string }> = [];
+
+    const result = installGraphifySystemdSidecar(
+      {
+        projectRoot: '/home/alice/nanoclaw',
+        nodePath: '/usr/bin/node',
+        homeDir: '/home/alice',
+        runningAsRoot: false,
+        mainUnitName: 'nanoclaw-v2-ab12cd34',
+        mainUnitPath:
+          '/home/alice/.config/systemd/user/nanoclaw-v2-ab12cd34.service',
+        systemctlPrefix: 'systemctl --user',
+      },
+      {
+        writeFile(filePath, content) {
+          writes.push({ filePath, content });
+        },
+        run(command) {
+          commands.push(command);
+        },
+      },
+    );
+
+    expect(result).toEqual({
+      unitName: 'nanoclaw-v2-ab12cd34-graphify',
+      unitPath:
+        '/home/alice/.config/systemd/user/nanoclaw-v2-ab12cd34-graphify.service',
+      loaded: true,
+    });
+    expect(writes).toHaveLength(1);
+    expect(writes[0]?.filePath).toBe(result.unitPath);
+    expect(writes[0]?.content).toContain('WantedBy=default.target');
+    expect(commands).toEqual([
+      'systemctl --user daemon-reload',
+      'systemctl --user enable nanoclaw-v2-ab12cd34-graphify',
+      'systemctl --user restart nanoclaw-v2-ab12cd34-graphify',
+      'systemctl --user is-active nanoclaw-v2-ab12cd34-graphify',
+    ]);
+  });
+
+  it('test_graphify_service_failure_does_not_block_host_service', () => {
+    const commands: string[] = [];
+    let result:
+      | ReturnType<typeof installGraphifySystemdSidecar>
+      | undefined;
+
+    expect(() => {
+      result = installGraphifySystemdSidecar(
+        {
+          projectRoot: '/home/alice/nanoclaw',
+          nodePath: '/usr/bin/node',
+          homeDir: '/home/alice',
+          runningAsRoot: false,
+          mainUnitName: 'nanoclaw-v2-ab12cd34',
+          mainUnitPath:
+            '/home/alice/.config/systemd/user/nanoclaw-v2-ab12cd34.service',
+          systemctlPrefix: 'systemctl --user',
+        },
+        {
+          writeFile() {},
+          run(command) {
+            commands.push(command);
+            if (command.includes('restart')) {
+              throw new Error('sidecar failed');
+            }
+          },
+        },
+      );
+    }).not.toThrow();
+
+    expect(result?.loaded).toBe(false);
+    expect(result?.error).toContain('restart: sidecar failed');
+    expect(commands).toContain(
+      'systemctl --user is-active nanoclaw-v2-ab12cd34-graphify',
+    );
   });
 });

@@ -16,6 +16,7 @@ import json
 import os
 from pathlib import Path
 import re
+import selectors
 import shutil
 import signal
 import shlex
@@ -53,12 +54,14 @@ RUNTIME_DIR = Path("/run/nanoclaw-graphify")
 WORKER_LOCK = RUNTIME_DIR / "worker.lock"
 WORKER_PYTHON = Path("/opt/graphify/bin/python")
 WORKER_SCRIPT = Path("/opt/graphify/graphify-worker.py")
+NCL_BINARY = Path("/usr/local/bin/ncl")
 CGROUP_MEMORY_CURRENT = Path("/sys/fs/cgroup/memory.current")
 CGROUP_MEMORY_MAX = Path("/sys/fs/cgroup/memory.max")
 MOUNTINFO_PATH = Path("/proc/self/mountinfo")
 
 REFRESH_SECONDS = 900.0
 QUERY_SECONDS = 120.0
+NCL_TIMEOUT_SECONDS = 120.0
 TERM_GRACE_SECONDS = 5.0
 LOCK_POLL_SECONDS = 0.02
 MAX_FILE_BYTES = 5 * 1024 * 1024
@@ -74,6 +77,7 @@ MAX_REQUEST_BYTES = 8 * 1024 * 1024
 MAX_METADATA_BYTES = 8 * 1024 * 1024
 MAX_STATE_BYTES = MAX_METADATA_BYTES
 MAX_MOUNTINFO_BYTES = 1024 * 1024
+MAX_PROXY_OUTPUT_BYTES = 8 * 1024 * 1024
 MAX_OWNERSHIP_PREFIX_PARTS = 64
 WORKER_RESERVE_BYTES = 1024 * 1024 * 1024
 OUTPUT_RESERVE_BYTES = 384 * 1024 * 1024
@@ -146,6 +150,16 @@ class AdmissionError(GatewayError):
 class QueryCommand:
     name: str
     arguments: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ProxyResult:
+    returncode: int
+    stdout: str = ""
+    stderr: str = ""
+    unavailable: bool = False
+    timed_out: bool = False
+    output_exceeded: bool = False
 
 
 @dataclass(frozen=True)
@@ -234,27 +248,29 @@ class AcceptedSourceState:
 
 HELP = """Usage: graphify COMMAND [ARGS]
 
-Fresh, read-only code intelligence for the current managed worktree.
+Fresh, read-only workgroup knowledge and code intelligence.
 
 Commands:
-  query TEXT       search graph nodes
-  path FROM TO     find a shortest dependency path
-  explain NODE     describe a node and its connections
-  affected NODE    list transitive dependents
+  query TEXT       search workgroup knowledge and graph nodes
+  path FROM TO     find a shortest evidence-backed path
+  explain NODE     describe a node, its connections, and provenance
+  affected NODE    list transitive code dependents
+  status           show graph freshness and indexing status
   help             show this help
   version          show the pinned Graphify version
 
 Run graphify COMMAND --help for this same side-effect-free syntax summary.
 
-The private index is refreshed automatically from current source before every
-read. Output/cache paths, graph selection, extraction, update, watch, hooks,
-MCP, global graphs, daemons, networking, and query history are not exposed.
+The workgroup graph is maintained automatically and can be queried from any
+directory. In a managed worktree, current thread changes are reconciled as an
+overlay. Workgroup selection, filesystem roots, output/cache paths, graph
+selection, extraction, update, watch, hooks, MCP, and networking are not exposed.
 """
 
 
 def parse_public_command(argv: Sequence[str]) -> QueryCommand:
     args = list(argv)
-    read_commands = {"query", "path", "explain", "affected"}
+    read_commands = {"query", "path", "explain", "affected", "status"}
     if not args:
         return QueryCommand("help")
     if args == ["--help"] or args == ["-h"]:
@@ -268,7 +284,7 @@ def parse_public_command(argv: Sequence[str]) -> QueryCommand:
     if name not in allowed:
         raise PolicyError(f"unsupported command: {name}")
     rest = tuple(args[1:])
-    if name in {"help", "version"}:
+    if name in {"help", "version", "status"}:
         if rest:
             raise PolicyError(f"{name} takes no arguments")
         return QueryCommand(name)
@@ -277,12 +293,186 @@ def parse_public_command(argv: Sequence[str]) -> QueryCommand:
     forbidden = {"--graph", "--out", "--global", "--mcp", "--watch", "--hooks"}
     if any(a in forbidden or a.startswith("--graph=") or a.startswith("--out=") for a in rest):
         raise PolicyError("graph/output/global overrides are forbidden")
+    scope_overrides = {
+        "--workgroup", "--workgroup-id", "--path", "--root", "--cwd", "--repo",
+        "--source-root",
+    }
+    if any(
+        argument in scope_overrides
+        or any(argument.startswith(option + "=") for option in scope_overrides)
+        for argument in rest
+    ):
+        raise PolicyError("workgroup/path overrides are forbidden")
     if any(a.startswith("-") for a in rest):
         raise PolicyError("public query flags are not supported")
     expected = 2 if name == "path" else 1
     if len(rest) != expected or any(not a for a in rest):
         raise PolicyError(f"{name} requires exactly {expected} argument(s)")
     return QueryCommand(name, rest)
+
+
+def _ncl_argv(command: QueryCommand) -> list[str]:
+    argv = [str(NCL_BINARY), "graphify", command.name]
+    if command.name == "query":
+        return [*argv, "--query", command.arguments[0]]
+    if command.name == "path":
+        return [
+            *argv,
+            "--from", command.arguments[0],
+            "--to", command.arguments[1],
+        ]
+    if command.name in {"explain", "affected"}:
+        return [*argv, "--node", command.arguments[0]]
+    if command.name == "status":
+        return argv
+    raise PolicyError(f"unsupported workgroup graph command: {command.name}")
+
+
+_POLICY_FAILURE_MARKERS = (
+    "forbidden",
+    "unauthorized",
+    "permission denied",
+    "outside caller scope",
+    "cross-workgroup",
+    "invalid argument",
+    "unknown operation",
+    "requires exactly",
+)
+_UNAVAILABLE_MARKERS = (
+    "graphify daemon unavailable",
+    "graphify daemon is unavailable",
+    "cannot connect to graphify daemon",
+    "failed to connect to graphify daemon",
+    "connect econnrefused",
+    "connect enoent",
+    "connection refused",
+    "ncl service unavailable",
+    "host cli unavailable",
+    'module not found "/app/src/cli/ncl.ts"',
+)
+
+
+def _response_is_unavailable(returncode: int, stdout: str, stderr: str) -> bool:
+    if returncode == 0:
+        return False
+    response = f"{stdout}\n{stderr}".casefold()
+    if any(marker in response for marker in _POLICY_FAILURE_MARKERS):
+        return False
+    return any(marker in response for marker in _UNAVAILABLE_MARKERS)
+
+
+def _invoke_ncl(command: QueryCommand) -> ProxyResult:
+    """Run the trusted group-scoped ncl bridge with bounded time and output."""
+    try:
+        process = subprocess.Popen(
+            _ncl_argv(command),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            shell=False,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except FileNotFoundError:
+        return ProxyResult(
+            127,
+            stderr="graphify: ncl CLI unavailable\n",
+            unavailable=True,
+        )
+    except OSError as exc:
+        unavailable = exc.errno in {errno.ENOENT, errno.ENOTDIR, errno.ECONNREFUSED}
+        return ProxyResult(
+            2,
+            stderr=(
+                "graphify: ncl CLI unavailable\n"
+                if unavailable
+                else f"graphify: ncl execution failed: {exc.strerror or type(exc).__name__}\n"
+            ),
+            unavailable=unavailable,
+        )
+
+    assert process.stdout is not None
+    assert process.stderr is not None
+    stdout_descriptor = process.stdout.fileno()
+    stderr_descriptor = process.stderr.fileno()
+    streams = {
+        stdout_descriptor: (process.stdout, bytearray()),
+        stderr_descriptor: (process.stderr, bytearray()),
+    }
+    selector = selectors.DefaultSelector()
+    for descriptor, (stream, _buffer) in streams.items():
+        os.set_blocking(descriptor, False)
+        selector.register(stream, selectors.EVENT_READ, descriptor)
+    deadline = time.monotonic() + NCL_TIMEOUT_SECONDS
+    total = 0
+    timed_out = False
+    output_exceeded = False
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            events = selector.select(min(0.05, remaining))
+            if not events and process.poll() is not None:
+                # A closed process can leave an EOF-ready pipe for one more
+                # selector turn; continue so both streams are drained.
+                continue
+            for key, _mask in events:
+                descriptor = key.data
+                try:
+                    chunk = os.read(descriptor, 64 * 1024)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                remaining_output = MAX_PROXY_OUTPUT_BYTES - total
+                if len(chunk) > remaining_output:
+                    output_exceeded = True
+                    break
+                streams[descriptor][1].extend(chunk)
+                total += len(chunk)
+            if output_exceeded:
+                break
+    except KeyboardInterrupt:
+        _terminate_group(
+            process,
+            time.monotonic() + min(TERM_GRACE_SECONDS, max(0.05, NCL_TIMEOUT_SECONDS)),
+        )
+        raise
+    finally:
+        selector.close()
+        process.stdout.close()
+        process.stderr.close()
+
+    if timed_out or output_exceeded:
+        _terminate_group(
+            process,
+            time.monotonic() + min(TERM_GRACE_SECONDS, max(0.05, NCL_TIMEOUT_SECONDS)),
+        )
+        if timed_out:
+            return ProxyResult(
+                2,
+                stderr="graphify: ncl/daemon request timed out\n",
+                unavailable=True,
+                timed_out=True,
+            )
+        return ProxyResult(
+            2,
+            stderr="graphify: ncl response exceeded the output limit\n",
+            output_exceeded=True,
+        )
+
+    returncode = process.wait()
+    stdout = bytes(streams[stdout_descriptor][1]).decode("utf-8", errors="replace")
+    stderr = bytes(streams[stderr_descriptor][1]).decode("utf-8", errors="replace")
+    return ProxyResult(
+        returncode,
+        stdout,
+        stderr,
+        unavailable=_response_is_unavailable(returncode, stdout, stderr),
+    )
 
 
 def _decode_mountinfo_field(value: str) -> str:
@@ -1332,9 +1522,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         if command.name == "version":
             print(PUBLIC_VERSION)
             return 0
-        emit_telemetry = True
+
+        proxy = _invoke_ncl(command)
+        if proxy.returncode == 0:
+            sys.stdout.write(proxy.stdout)
+            sys.stderr.write(proxy.stderr)
+            return 0
+        if command.name == "status" or not proxy.unavailable:
+            sys.stdout.write(proxy.stdout)
+            sys.stderr.write(proxy.stderr)
+            return proxy.returncode or 2
+
+        # The host-derived workgroup graph is primary. A current managed
+        # worktree can still answer code-only reads when that service is
+        # unreachable; policy and isolation failures never enter this path.
         validate_runtime_topology()
         repo = resolve_managed_repo(Path.cwd())
+        print(
+            "graphify: workgroup daemon unavailable; using code-only managed-worktree fallback.",
+            file=sys.stderr,
+        )
+        emit_telemetry = True
         inventory_started = time.monotonic()
         generation = inventory_source(repo.root)
         _TELEMETRY["inventory_ms"] = round((time.monotonic() - inventory_started) * 1000, 3)

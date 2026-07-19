@@ -64,6 +64,22 @@ export function buildRemovalPlan(inv: Inventory, d: Decisions): RemovalAction[] 
         unitName: path.basename(s.launchdPlist, '.plist'),
       });
     }
+    if (s.graphifySystemdUserUnit) {
+      actions.push({
+        kind: 'unload-service',
+        flavor: 'systemd-user',
+        unitPath: s.graphifySystemdUserUnit,
+        unitName: path.basename(s.graphifySystemdUserUnit, '.service'),
+      });
+    }
+    if (s.graphifySystemdSystemUnit) {
+      actions.push({
+        kind: 'unload-service',
+        flavor: 'systemd-system',
+        unitPath: s.graphifySystemdSystemUnit,
+        unitName: path.basename(s.graphifySystemdSystemUnit, '.service'),
+      });
+    }
     if (s.systemdUserUnit) {
       actions.push({
         kind: 'unload-service',
@@ -119,9 +135,7 @@ export function buildRemovalPlan(inv: Inventory, d: Decisions): RemovalAction[] 
 
   if (d.data) {
     const tail = [...inv.runtime].sort(
-      (a, b) =>
-        Number(path.basename(a.path) === 'node_modules') -
-        Number(path.basename(b.path) === 'node_modules'),
+      (a, b) => Number(path.basename(a.path) === 'node_modules') - Number(path.basename(b.path) === 'node_modules'),
     );
     for (const item of tail) actions.push({ kind: 'delete-runtime-path', item });
   }

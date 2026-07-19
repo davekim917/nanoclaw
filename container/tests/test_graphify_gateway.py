@@ -122,6 +122,250 @@ class GatewayTest(unittest.TestCase):
             return 0, "QUERY\n", "", {"duration_ms": 1}
         return invoke
 
+    @staticmethod
+    def _proxy_result(
+        returncode=0,
+        stdout="",
+        stderr="",
+        *,
+        unavailable=False,
+        timed_out=False,
+        output_exceeded=False,
+    ):
+        return SimpleNamespace(
+            returncode=returncode,
+            stdout=stdout,
+            stderr=stderr,
+            unavailable=unavailable,
+            timed_out=timed_out,
+            output_exceeded=output_exceeded,
+        )
+
+    def test_workgroup_query_proxies_to_ncl_from_any_cwd(self):
+        self.assertEqual(
+            self.gw._ncl_argv(self.gw.QueryCommand("query", ("retention decision",))),
+            [
+                str(self.gw.NCL_BINARY),
+                "graphify",
+                "query",
+                "--query",
+                "retention decision",
+            ],
+        )
+        self.assertEqual(
+            self.gw._ncl_argv(self.gw.QueryCommand("path", ("decision", "report"))),
+            [
+                str(self.gw.NCL_BINARY),
+                "graphify",
+                "path",
+                "--from",
+                "decision",
+                "--to",
+                "report",
+            ],
+        )
+        self.assertEqual(
+            self.gw._ncl_argv(self.gw.QueryCommand("explain", ("customer_ltv",))),
+            [
+                str(self.gw.NCL_BINARY),
+                "graphify",
+                "explain",
+                "--node",
+                "customer_ltv",
+            ],
+        )
+        self.assertEqual(
+            self.gw._ncl_argv(self.gw.QueryCommand("affected", ("authorize",))),
+            [
+                str(self.gw.NCL_BINARY),
+                "graphify",
+                "affected",
+                "--node",
+                "authorize",
+            ],
+        )
+        outside = Path(self.tmp.name) / "knowledge-work"
+        outside.mkdir()
+        result = self._proxy_result(stdout="workgroup result\n")
+        previous = Path.cwd()
+        try:
+            os.chdir(outside)
+            with mock.patch.object(
+                self.gw, "_invoke_ncl", return_value=result, create=True
+            ) as invoke, mock.patch.object(
+                self.gw,
+                "resolve_managed_repo",
+                side_effect=AssertionError("worktree fallback should not run"),
+            ), contextlib.redirect_stdout(io.StringIO()) as stdout:
+                self.assertEqual(self.gw.main(["query", "retention decision"]), 0)
+        finally:
+            os.chdir(previous)
+
+        invoke.assert_called_once_with(
+            self.gw.QueryCommand("query", ("retention decision",))
+        )
+        self.assertEqual(stdout.getvalue(), "workgroup result\n")
+
+    def test_managed_worktree_uses_code_only_fallback_only_when_daemon_unavailable(self):
+        (self.repo / "a.py").write_text("value = 1\n")
+        unavailable = self._proxy_result(
+            returncode=2,
+            stderr="graphify daemon unavailable\n",
+            unavailable=True,
+        )
+        with mock.patch.object(
+            self.gw, "_invoke_ncl", return_value=unavailable, create=True
+        ), mock.patch.object(
+            self.gw, "refresh_index", return_value=0
+        ) as refresh, contextlib.redirect_stderr(io.StringIO()) as stderr:
+            previous = Path.cwd()
+            try:
+                os.chdir(self.repo)
+                self.assertEqual(self.gw.main(["query", "value"]), 0)
+            finally:
+                os.chdir(previous)
+
+        refresh.assert_called_once()
+        self.assertEqual(
+            stderr.getvalue().splitlines()[0],
+            "graphify: workgroup daemon unavailable; using code-only managed-worktree fallback.",
+        )
+
+    def test_forbidden_response_never_falls_back(self):
+        forbidden = self._proxy_result(
+            returncode=3,
+            stderr="forbidden: caller cannot access this workgroup\n",
+        )
+        with mock.patch.object(
+            self.gw, "_invoke_ncl", return_value=forbidden, create=True
+        ), mock.patch.object(
+            self.gw, "resolve_managed_repo"
+        ) as resolve, mock.patch.object(
+            self.gw, "refresh_index"
+        ) as refresh, contextlib.redirect_stdout(io.StringIO()) as stdout, contextlib.redirect_stderr(
+            io.StringIO()
+        ) as stderr:
+            self.assertEqual(self.gw.main(["query", "private decision"]), 3)
+
+        resolve.assert_not_called()
+        refresh.assert_not_called()
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(
+            stderr.getvalue(), "forbidden: caller cannot access this workgroup\n"
+        )
+
+    def test_status_is_daemon_only(self):
+        unavailable = self._proxy_result(
+            returncode=2,
+            stderr="graphify daemon unavailable\n",
+            unavailable=True,
+        )
+        with mock.patch.object(
+            self.gw, "_invoke_ncl", return_value=unavailable, create=True
+        ) as invoke, mock.patch.object(
+            self.gw, "resolve_managed_repo"
+        ) as resolve, mock.patch.object(
+            self.gw, "refresh_index"
+        ) as refresh, contextlib.redirect_stderr(io.StringIO()) as stderr:
+            self.assertEqual(self.gw.main(["status"]), 2)
+
+        invoke.assert_called_once_with(self.gw.QueryCommand("status"))
+        resolve.assert_not_called()
+        refresh.assert_not_called()
+        self.assertEqual(stderr.getvalue(), "graphify daemon unavailable\n")
+
+    def test_proxy_has_bounded_output_and_timeout(self):
+        output_script = "import os; os.write(1, b'x' * 65536)"
+        with mock.patch.object(
+            self.gw,
+            "_ncl_argv",
+            return_value=[sys.executable, "-c", output_script],
+            create=True,
+        ), mock.patch.object(
+            self.gw, "MAX_PROXY_OUTPUT_BYTES", 1024, create=True
+        ):
+            result = self.gw._invoke_ncl(self.gw.QueryCommand("query", ("x",)))
+        self.assertTrue(result.output_exceeded)
+        self.assertLessEqual(
+            len(result.stdout.encode()) + len(result.stderr.encode()), 1024
+        )
+
+        timeout_script = "import time; time.sleep(30)"
+        started = time.monotonic()
+        with mock.patch.object(
+            self.gw,
+            "_ncl_argv",
+            return_value=[sys.executable, "-c", timeout_script],
+            create=True,
+        ), mock.patch.object(
+            self.gw, "NCL_TIMEOUT_SECONDS", 0.08, create=True
+        ):
+            result = self.gw._invoke_ncl(self.gw.QueryCommand("query", ("x",)))
+        self.assertTrue(result.timed_out)
+        self.assertTrue(result.unavailable)
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_proxy_classifies_missing_runtime_mounted_ncl_source_as_unavailable(self):
+        self.assertTrue(
+            self.gw._response_is_unavailable(
+                1,
+                "",
+                'error: Module not found "/app/src/cli/ncl.ts"\n',
+            )
+        )
+        self.assertFalse(
+            self.gw._response_is_unavailable(
+                3,
+                "",
+                'forbidden: Module not found "/app/src/cli/ncl.ts"\n',
+            )
+        )
+
+    def test_help_and_version_remain_side_effect_free(self):
+        for argv in (["help"], ["--help"], ["version"], ["--version"]):
+            with self.subTest(argv=argv), mock.patch.object(
+                self.gw,
+                "_invoke_ncl",
+                side_effect=AssertionError("ncl touched"),
+                create=True,
+            ) as invoke, mock.patch.object(
+                self.gw,
+                "resolve_managed_repo",
+                side_effect=AssertionError("repository touched"),
+            ), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(self.gw.main(argv), 0)
+            invoke.assert_not_called()
+
+    def test_public_cli_rejects_workgroup_and_path_overrides(self):
+        cases = (
+            ["query", "needle", "--workgroup", "madison-reed"],
+            ["query", "needle", "--workgroup=madison-reed"],
+            ["query", "needle", "--path", "/workspace/group"],
+            ["query", "needle", "--path=/workspace/group"],
+        )
+        for argv in cases:
+            with self.subTest(argv=argv), self.assertRaisesRegex(
+                self.gw.PolicyError, "workgroup/path overrides are forbidden"
+            ):
+                self.gw.parse_public_command(argv)
+
+    def test_skill_describes_automatic_knowledge_graph_and_thread_overlay(self):
+        skill = (
+            Path(__file__).parents[1] / "skills" / "graphify" / "SKILL.md"
+        ).read_text(encoding="utf-8")
+        for phrase in (
+            "automatic workgroup knowledge graph",
+            "canonical clones",
+            "conversations",
+            "thread-local worktree overlay",
+            "prior decisions",
+            "cross-artifact lineage",
+            ".graphifyignore",
+            "rare opt-out",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, skill)
+
     def test_gateway_referenced_css_asset_is_hashed_staged_and_freshness_bound(self):
         source = self.repo / "src/main.tsx"
         asset = self.repo / "src/styles.css"
@@ -494,7 +738,7 @@ class GatewayTest(unittest.TestCase):
         help_forms = [["help"], ["--help"], ["-h"]]
         help_forms.extend(
             [command, flag]
-            for command in ("query", "path", "explain", "affected")
+            for command in ("query", "path", "explain", "affected", "status")
             for flag in ("--help", "-h")
         )
         for argv in [*help_forms, ["version"], ["--version"]]:

@@ -1,0 +1,322 @@
+import { afterEach, describe, expect, test } from 'vitest';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+
+import { WorkgroupGraphStore } from './store.js';
+import type { ExtractionBundle, SourceInput } from './types.js';
+
+const roots: string[] = [];
+
+afterEach(() => {
+  for (const root of roots.splice(0)) {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+function makeStore(workgroupId = 'madison-reed'): WorkgroupGraphStore {
+  const root = mkdtempSync(join(tmpdir(), 'graphify-store-'));
+  roots.push(root);
+  return new WorkgroupGraphStore(join(root, 'index.db'), workgroupId);
+}
+
+function source(id: string, relativePath: string, contentHash = `hash-${id}`): SourceInput {
+  return {
+    id,
+    workgroupId: 'madison-reed',
+    kind: 'document',
+    relativePath,
+    contentHash,
+  };
+}
+
+function bundleFor(sourceId: string, relativePath: string, nodeId: string, nodeName: string): ExtractionBundle {
+  return {
+    nodes: [
+      {
+        id: nodeId,
+        name: nodeName,
+        type: 'concept',
+        description: `${nodeName} description`,
+        evidence: [{ sourceId, relativePath, line: 7, excerpt: nodeName }],
+      },
+    ],
+    edges: [],
+    hyperedges: [],
+  };
+}
+
+describe('WorkgroupGraphStore', () => {
+  test('test_graph_store_atomic_source_replacement', () => {
+    const store = makeStore();
+    const generation = store.beginGeneration('initial');
+    const input = source('source-1', 'notes/metrics.md');
+
+    store.upsertSource(input, bundleFor(input.id, input.relativePath, 'old-node', 'Old Metric'), generation);
+    store.upsertSource(
+      { ...input, contentHash: 'replacement-hash' },
+      bundleFor(input.id, input.relativePath, 'new-node', 'New Metric'),
+      generation,
+    );
+
+    expect(store.query('Old Metric').nodes).toHaveLength(0);
+    expect(store.query('New Metric').nodes.map((node) => node.id)).toEqual(['new-node']);
+    expect(store.getSourceById(input.id)).toMatchObject({
+      contentHash: 'replacement-hash',
+      state: 'indexed',
+      generation,
+    });
+
+    expect(() =>
+      store.upsertSource(
+        { ...input, contentHash: 'broken-hash' },
+        {
+          nodes: [],
+          edges: [
+            {
+              id: 'broken-edge',
+              from: 'missing-a',
+              to: 'missing-b',
+              type: 'depends_on',
+              structural: true,
+            },
+          ],
+          hyperedges: [],
+        },
+        generation,
+      ),
+    ).toThrow(/missing nodes/i);
+    expect(store.query('New Metric').nodes.map((node) => node.id)).toEqual(['new-node']);
+    expect(store.getSourceById(input.id)?.contentHash).toBe('replacement-hash');
+    store.close();
+  });
+
+  test('test_graph_store_duplicate_content_preserves_source_aliases', () => {
+    const store = makeStore();
+    const generation = store.beginGeneration('duplicates');
+    const first = source('source-a', 'repos/dbt/models/orders.sql', 'same-content');
+    const second = source('source-b', 'exports/orders.sql', 'same-content');
+
+    store.upsertSource(first, bundleFor(first.id, first.relativePath, 'orders', 'Orders'), generation);
+    store.upsertSource(second, bundleFor(second.id, second.relativePath, 'orders', 'Orders'), generation);
+
+    const result = store.explain('orders');
+    expect(result?.evidence.map((item) => item.relativePath).sort()).toEqual([
+      'exports/orders.sql',
+      'repos/dbt/models/orders.sql',
+    ]);
+    expect(store.getSource('exports/orders.sql')?.id).toBe('source-b');
+    store.close();
+  });
+
+  test('test_graph_store_affected_ignores_semantic_edges', () => {
+    const store = makeStore();
+    const generation = store.beginGeneration('dependencies');
+    const input = source('source-1', 'models/metrics.lkml');
+    const evidence = [{ sourceId: input.id, relativePath: input.relativePath }];
+    store.upsertSource(
+      input,
+      {
+        nodes: [
+          { id: 'base', name: 'Base', type: 'model', evidence },
+          { id: 'structural-dependent', name: 'Structural', type: 'model', evidence },
+          { id: 'semantic-dependent', name: 'Semantic', type: 'concept', evidence },
+        ],
+        edges: [
+          {
+            id: 'structural-edge',
+            from: 'structural-dependent',
+            to: 'base',
+            type: 'depends_on',
+            structural: true,
+            evidence,
+          },
+          {
+            id: 'semantic-edge',
+            from: 'semantic-dependent',
+            to: 'base',
+            type: 'related_to',
+            structural: false,
+            evidence,
+          },
+        ],
+        hyperedges: [],
+      },
+      generation,
+    );
+
+    expect(store.affected('base').nodes.map((node) => node.id)).toEqual(['structural-dependent']);
+    store.close();
+  });
+
+  test('test_graph_store_path_and_explain_return_provenance', () => {
+    const store = makeStore();
+    const generation = store.beginGeneration('path');
+    const input = source('source-1', 'specs/revenue.md');
+    const evidence = [
+      {
+        sourceId: input.id,
+        relativePath: input.relativePath,
+        page: 3,
+        excerpt: 'Revenue feeds net revenue',
+      },
+    ];
+    store.upsertSource(
+      input,
+      {
+        nodes: [
+          { id: 'revenue', name: 'Revenue', type: 'metric', evidence },
+          { id: 'net-revenue', name: 'Net Revenue', type: 'metric', evidence },
+        ],
+        edges: [
+          {
+            id: 'feeds',
+            from: 'revenue',
+            to: 'net-revenue',
+            type: 'feeds',
+            structural: true,
+            evidence,
+          },
+        ],
+        hyperedges: [],
+      },
+      generation,
+    );
+
+    const path = store.path('revenue', 'net-revenue');
+    expect(path?.nodes.map((node) => node.id)).toEqual(['revenue', 'net-revenue']);
+    expect(path?.edges[0]).toMatchObject({ id: 'feeds', structural: true });
+    expect(path?.edges[0]?.evidence[0]).toMatchObject({
+      relativePath: 'specs/revenue.md',
+      page: 3,
+    });
+    expect(store.explain('revenue')?.evidence[0]).toMatchObject({
+      relativePath: 'specs/revenue.md',
+      excerpt: 'Revenue feeds net revenue',
+    });
+    store.close();
+  });
+
+  test('test_graph_store_deletion_removes_orphaned_contributions', () => {
+    const store = makeStore();
+    const generation = store.beginGeneration('delete');
+    const input = source('source-1', 'notes/obsolete.md');
+    store.upsertSource(input, bundleFor(input.id, input.relativePath, 'obsolete', 'Obsolete Concept'), generation);
+
+    store.deleteSource(input.id, generation);
+
+    expect(store.query('Obsolete Concept').nodes).toHaveLength(0);
+    expect(store.explain('obsolete')).toBeNull();
+    expect(store.getSourceById(input.id)?.state).toBe('deleted');
+    store.close();
+  });
+
+  test('atomically reconciles changed sources while leaving unchanged contributions untouched', () => {
+    const store = makeStore();
+    const initial = store.beginGeneration('initial archive');
+    const unchanged = source('unchanged', 'conversations/unchanged.md');
+    const removed = source('removed', 'conversations/removed.md');
+    store.upsertSource(unchanged, bundleFor(unchanged.id, unchanged.relativePath, 'shared-node', 'Shared'), initial);
+    store.upsertSource(removed, bundleFor(removed.id, removed.relativePath, 'removed-node', 'Removed'), initial);
+    store.completeGeneration(initial);
+
+    const added = source('added', 'conversations/added.md');
+    const result = store.reconcileSources(
+      'archive delta',
+      [
+        { source: unchanged, bundle: bundleFor(unchanged.id, unchanged.relativePath, 'should-not-replace', 'Wrong') },
+        { source: added, bundle: bundleFor(added.id, added.relativePath, 'added-node', 'Added') },
+      ],
+      [removed.id],
+    );
+
+    expect(result).toMatchObject({
+      upsertedSourceIds: ['added'],
+      deletedSourceIds: ['removed'],
+      unchangedSourceIds: ['unchanged'],
+    });
+    expect(store.getSourceById(unchanged.id)?.generation).toBe(initial);
+    expect(store.query('Shared').nodes.map((node) => node.id)).toEqual(['shared-node']);
+    expect(store.query('Wrong').nodes).toHaveLength(0);
+    expect(store.query('Removed').nodes).toHaveLength(0);
+    expect(store.explain('removed-node')).toBeNull();
+    expect(store.query('Added').nodes.map((node) => node.id)).toEqual(['added-node']);
+    store.close();
+  });
+
+  test('rolls back the complete source batch when one replacement is invalid', () => {
+    const store = makeStore();
+    const initial = store.beginGeneration('initial archive');
+    const stable = source('stable', 'conversations/stable.md');
+    store.upsertSource(stable, bundleFor(stable.id, stable.relativePath, 'stable-node', 'Stable'), initial);
+    store.completeGeneration(initial);
+    const valid = source('valid', 'conversations/valid.md');
+    const broken = source('broken', 'conversations/broken.md');
+
+    expect(() =>
+      store.reconcileSources(
+        'broken archive delta',
+        [
+          { source: valid, bundle: bundleFor(valid.id, valid.relativePath, 'valid-node', 'Valid') },
+          {
+            source: broken,
+            bundle: {
+              nodes: [],
+              edges: [{ id: 'bad', from: 'missing', to: 'also-missing', type: 'related', structural: false }],
+              hyperedges: [],
+            },
+          },
+        ],
+        [stable.id],
+      ),
+    ).toThrow(/missing nodes/i);
+
+    expect(store.status().completeGeneration).toBe(initial);
+    expect(store.getSourceById(valid.id)).toBeNull();
+    expect(store.getSourceById(stable.id)?.state).toBe('indexed');
+    expect(store.query('Stable').nodes.map((node) => node.id)).toEqual(['stable-node']);
+    store.close();
+  });
+
+  test('test_graph_store_status_exposes_quarantine_and_pending', () => {
+    const store = makeStore();
+    const generation = store.beginGeneration('backfill');
+    store.markSourceState(source('pending-source', 'pending/new.md'), 'pending', generation);
+    store.markSourceState(
+      source('quarantined-source', 'unsafe/secret.env'),
+      'quarantined',
+      generation,
+      'credential-like content',
+    );
+
+    const before = store.status();
+    expect(before.currentGeneration).toBe(generation);
+    expect(before.completeGeneration).toBe(0);
+    expect(before.pendingJobs).toBe(1);
+    expect(before.counts.pending).toBe(1);
+    expect(before.counts.quarantined).toBe(1);
+    expect(before.quarantines).toEqual([
+      expect.objectContaining({ id: 'quarantined-source', error: 'credential-like content' }),
+    ]);
+
+    store.completeGeneration(generation);
+    expect(store.status().completeGeneration).toBe(generation);
+    store.close();
+  });
+
+  test('test_graph_store_rejects_cross_source_evidence', () => {
+    const store = makeStore();
+    const generation = store.beginGeneration('isolation');
+    const input = source('source-1', 'notes/owned.md');
+
+    expect(() =>
+      store.upsertSource(
+        input,
+        bundleFor('source-2', '../other-workgroup/private.md', 'escaped', 'Escaped'),
+        generation,
+      ),
+    ).toThrow(/evidence.*source/i);
+    expect(store.getSourceById(input.id)).toBeNull();
+    store.close();
+  });
+});

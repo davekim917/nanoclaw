@@ -95,6 +95,54 @@ class UpstreamContractTest(unittest.TestCase):
             reverse = subprocess.run(["git", "apply", "--reverse", "--check", str(PATCH)], cwd=root, capture_output=True, text=True)
             self.assertNotEqual(reverse.returncode, 0)
 
+    def test_manifest_tracks_semantic_prompt_and_watch_drift(self):
+        surfaces = INTEGRATION["upstream"]["semanticSurfaces"]
+        required = {
+            "codex-extraction-spec",
+            "detector",
+            "extractor",
+            "codex-watch",
+            "watcher",
+            "codex-transcribe",
+            "transcriber",
+            "inert-wrapper",
+        }
+        self.assertEqual(set(surfaces), required)
+        for surface, pinned in surfaces.items():
+            with self.subTest(surface=surface):
+                content = show(pinned["path"])
+                self.assertEqual(hashlib.sha256(content.encode()).hexdigest(), pinned["sha256"])
+
+    def test_every_upstream_capability_is_classified(self):
+        inventory = set(INTEGRATION["upstreamCapabilities"])
+        classified = {item["id"]: item for item in INTEGRATION["capabilities"]}
+        self.assertEqual(inventory, set(classified))
+        self.assertEqual(len(INTEGRATION["upstreamCapabilities"]), len(inventory))
+        for capability in inventory:
+            with self.subTest(capability=capability):
+                self.assertIn(classified[capability]["status"], {
+                    "adopted", "implemented-differently", "deferred", "rejected"
+                })
+                self.assertTrue(classified[capability]["note"])
+
+        expected = {
+            "semantic-document-extraction": "adopted",
+            "pdf-preprocessing": "adopted",
+            "office-preprocessing": "adopted",
+            "image-semantic-extraction": "adopted",
+            "media-transcription": "deferred",
+            "automatic-index-freshness": "implemented-differently",
+            "watch": "implemented-differently",
+            "extract": "adopted",
+        }
+        self.assertEqual(
+            {capability: classified[capability]["status"] for capability in expected},
+            expected,
+        )
+        self.assertIn("verified local", classified["image-semantic-extraction"]["note"])
+        self.assertIn("Codex attachment", classified["image-semantic-extraction"]["note"])
+        self.assertIn("offline", classified["media-transcription"]["note"])
+
     def test_agent_environment_cannot_override_the_integration_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
             hostile = Path(tmp) / "hostile.json"

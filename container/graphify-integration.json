@@ -2,14 +2,53 @@
   "schemaVersion": 1,
   "package": {
     "name": "graphifyy",
-    "version": "0.9.20"
+    "version": "0.9.20",
+    "extras": [
+      "pdf",
+      "office",
+      "sql"
+    ]
   },
   "upstream": {
     "repo": "Graphify-Labs/graphify",
     "tag": "v0.9.20",
     "commit": "edec9eabeceeae6aa2375eddb3835efa1a32c0a3",
     "skillPath": "graphify/skill.md",
-    "skillSha256": "1f150a12dc49d6e39c35f8a89f2a2819136a3edff8e95f1f214b6ef666d43c6b"
+    "skillSha256": "1f150a12dc49d6e39c35f8a89f2a2819136a3edff8e95f1f214b6ef666d43c6b",
+    "semanticSurfaces": {
+      "codex-extraction-spec": {
+        "path": "graphify/skills/codex/references/extraction-spec.md",
+        "sha256": "32d7decad42d58129c6694ea4e4ce1f72a531bc5161827d2095787e9448735e9"
+      },
+      "detector": {
+        "path": "graphify/detect.py",
+        "sha256": "e24b8a3b0be0519f4ac4bbf8c47b1c15b4a65608373814b90091d1d6d70baa0a"
+      },
+      "extractor": {
+        "path": "graphify/extract.py",
+        "sha256": "8fec4f272c93d0b58aae40015b9fad37877cd49b8b2ab53f768d3a2b5c496961"
+      },
+      "codex-watch": {
+        "path": "graphify/skills/codex/references/add-watch.md",
+        "sha256": "b3f67570240582689c2834b4831917550c2d1aaf042148868c39dcbf387ce3fd"
+      },
+      "watcher": {
+        "path": "graphify/watch.py",
+        "sha256": "1bcfa1495c77560aacc3d4a3db6cc44a50e6f284faad4540a3a848f5d27fc457"
+      },
+      "codex-transcribe": {
+        "path": "graphify/skills/codex/references/transcribe.md",
+        "sha256": "676a1e39aa6d43cdfcc416ec56616e36f7bad74066a82bd33a9485515b9a865c"
+      },
+      "transcriber": {
+        "path": "graphify/transcribe.py",
+        "sha256": "b01c127af5a7bf44865e517848dbb2d3dd88af0b146674c87ea56079cd926d55"
+      },
+      "inert-wrapper": {
+        "path": "graphify/llm.py",
+        "sha256": "baed2b0fc860ecdb068c5d2f1938f215c8888ca60c6b57dfda4f335efc1996ed"
+      }
+    }
   },
   "patch": {
     "path": "container/graphify-nanoclaw.patch",
@@ -37,11 +76,30 @@
     "explain",
     "affected"
   ],
+  "upstreamCapabilities": [
+    "automatic-index-freshness",
+    "resource-bounded-extraction",
+    "query",
+    "path",
+    "explain",
+    "affected",
+    "extract",
+    "watch",
+    "upstream-agent-skill",
+    "semantic-document-extraction",
+    "pdf-preprocessing",
+    "office-preprocessing",
+    "image-semantic-extraction",
+    "media-transcription",
+    "sql-structural-extraction",
+    "remote-url-ingest",
+    "visual-graph-exports"
+  ],
   "capabilities": [
     {
       "id": "automatic-index-freshness",
       "status": "implemented-differently",
-      "note": "NanoClaw refreshes before reads through its gateway."
+      "note": "The workgroup daemon watches filesystem roots, polls the conversation archive, performs a six-hour safety reconciliation, and exposes a bounded read freshness fence."
     },
     {
       "id": "resource-bounded-extraction",
@@ -70,18 +128,58 @@
     },
     {
       "id": "extract",
-      "status": "rejected",
-      "note": "Direct extraction bypasses freshness and resource policy."
+      "status": "adopted",
+      "note": "NanoClaw invokes upstream structural and semantic extraction inside bounded private workers."
     },
     {
       "id": "watch",
-      "status": "rejected",
-      "note": "Long-running watchers conflict with per-session container isolation."
+      "status": "implemented-differently",
+      "note": "A workgroup-scoped NanoClaw daemon provides autonomous file and conversation freshness."
     },
     {
       "id": "upstream-agent-skill",
       "status": "implemented-differently",
       "note": "Used as a drift signal; NanoClaw keeps a smaller policy-safe skill."
+    },
+    {
+      "id": "semantic-document-extraction",
+      "status": "adopted",
+      "note": "Documents are extracted with the pinned upstream Codex semantic schema."
+    },
+    {
+      "id": "pdf-preprocessing",
+      "status": "adopted",
+      "note": "The audited pdf extra provides bounded PDF text preprocessing."
+    },
+    {
+      "id": "office-preprocessing",
+      "status": "adopted",
+      "note": "The audited office extra provides DOCX and XLSX preprocessing."
+    },
+    {
+      "id": "image-semantic-extraction",
+      "status": "adopted",
+      "note": "The daemon sends one verified local image through the bounded Codex attachment path; the private preprocess worker never parses or downloads images."
+    },
+    {
+      "id": "media-transcription",
+      "status": "deferred",
+      "note": "Deferred because the image has no preseeded offline Whisper model; the video extra and transcription dependency closure are intentionally absent."
+    },
+    {
+      "id": "sql-structural-extraction",
+      "status": "adopted",
+      "note": "The audited sql extra provides tree-sitter SQL parsing."
+    },
+    {
+      "id": "remote-url-ingest",
+      "status": "rejected",
+      "note": "Autonomous indexing covers local workgroup sources and never downloads remote URLs."
+    },
+    {
+      "id": "visual-graph-exports",
+      "status": "deferred",
+      "note": "NanoClaw prioritizes source-grounded agent queries over user-facing graph exports."
     }
   ]
 }

@@ -398,8 +398,8 @@ RUN chmod 0444 \
     && ! git apply --check /opt/graphify/graphify-nanoclaw.patch >/dev/null 2>&1 \
     && git apply --reverse --check /opt/graphify/graphify-nanoclaw.patch \
     && /opt/graphify/bin/python -c 'import json; from importlib.metadata import version; expected=json.load(open("/opt/graphify/graphify-integration.json"))["package"]["version"]; assert version("graphifyy") == expected' \
-    && /opt/graphify/bin/pip freeze --local | tr '[:upper:]' '[:lower:]' | LC_ALL=C sort > /tmp/graphify-freeze \
-    && grep -v '^#' /opt/graphify/graphify-requirements.lock | sed '/^[[:space:]]*$/d; s/ --hash=.*//' | tr '[:upper:]' '[:lower:]' | LC_ALL=C sort > /tmp/graphify-locked \
+    && /opt/graphify/bin/pip freeze --local | tr '[:upper:]' '[:lower:]' | tr '_' '-' | LC_ALL=C sort > /tmp/graphify-freeze \
+    && grep -v '^#' /opt/graphify/graphify-requirements.lock | sed '/^[[:space:]]*$/d; s/ --hash=.*//' | tr '[:upper:]' '[:lower:]' | tr '_' '-' | LC_ALL=C sort > /tmp/graphify-locked \
     && diff -u /tmp/graphify-locked /tmp/graphify-freeze \
     && rm -f /opt/graphify/bin/graphify \
     && rm -f /tmp/graphify-freeze /tmp/graphify-locked
@@ -419,6 +419,8 @@ RUN sed -i '1c#!/opt/graphify/bin/python' /usr/local/bin/graphify \
 # audited wheelhouse above remains for post-build offline verification.
 COPY graphify-gateway.py graphify-worker.py graphify-requirements.lock graphify-wheel-audit.json graphify-integration.json graphify-nanoclaw.patch /tmp/graphify-build/container/
 COPY tests/test_graphify_gateway.py tests/test_graphify_worker.py tests/test_graphify_upstream_contract.py tests/test_graphify_supply_chain.py /tmp/graphify-build/container/tests/
+COPY skills/graphify/SKILL.md /tmp/graphify-build/container/skills/graphify/SKILL.md
+COPY --from=graphify-release-adapter update-graphify.ts /tmp/graphify-build/scripts/update-graphify.ts
 RUN GRAPHIFY_TAG="$(jq -r '.upstream.tag' /opt/graphify/graphify-integration.json)" \
     && git clone --quiet --depth 1 --branch "$GRAPHIFY_TAG" https://github.com/Graphify-Labs/graphify.git /tmp/graphify-design \
     && cd /tmp/graphify-build \

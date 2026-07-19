@@ -1,0 +1,116 @@
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+import { EnrichmentRepository } from './enrichment-cache.js';
+
+const roots: string[] = [];
+afterEach(() => {
+  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+
+describe('EnrichmentRepository', () => {
+  it('persists enrichment across daemon restart', () => {
+    const root = mkdtempSync(join(tmpdir(), 'graphify-cache-'));
+    roots.push(root);
+    const path = join(root, 'cache.db');
+    const first = new EnrichmentRepository(path);
+    first.put({
+      sourceId: 's',
+      workgroupId: 'wg',
+      contentHash: 'h',
+      semantic: { nodes: [{ id: 'n', name: 'metric', type: 'concept' }], edges: [], hyperedges: [] },
+    });
+    first.close();
+    const second = new EnrichmentRepository(path);
+    expect(second.load('wg')[0].semantic?.nodes[0].name).toBe('metric');
+    second.close();
+  });
+
+  it('does not mix complementary enrichment layers across content hashes', () => {
+    const root = mkdtempSync(join(tmpdir(), 'graphify-cache-hash-'));
+    roots.push(root);
+    const repo = new EnrichmentRepository(join(root, 'cache.db'));
+    repo.put({
+      sourceId: 's',
+      workgroupId: 'wg',
+      contentHash: 'old',
+      semantic: { nodes: [{ id: 'old-semantic', name: 'Old', type: 'concept' }], edges: [], hyperedges: [] },
+    });
+    repo.put({
+      sourceId: 's',
+      workgroupId: 'wg',
+      contentHash: 'new',
+      code: { nodes: [{ id: 'new-code', name: 'New', type: 'function' }], edges: [], hyperedges: [] },
+    });
+    const [entry] = repo.load('wg');
+    expect(entry).toEqual(expect.objectContaining({ sourceId: 's', contentHash: 'new', code: expect.any(Object) }));
+    expect(entry.semantic).toBeUndefined();
+    repo.close();
+  });
+
+  it('clears persisted cache and queued jobs for a full workgroup reindex', () => {
+    const root = mkdtempSync(join(tmpdir(), 'graphify-cache-clear-'));
+    roots.push(root);
+    const repo = new EnrichmentRepository(join(root, 'cache.db'));
+    repo.put({ sourceId: 's', workgroupId: 'wg', contentHash: 'h', code: { nodes: [], edges: [], hyperedges: [] } });
+    repo.enqueue([
+      {
+        source: { id: 's', workgroupId: 'wg', kind: 'document', relativePath: 'a.md', contentHash: 'h' },
+        segments: ['a'],
+        priority: 1,
+      },
+    ]);
+    repo.clearWorkgroup('wg');
+    expect(repo.load('wg')).toEqual([]);
+    expect(repo.pending('wg')).toBe(0);
+    repo.close();
+  });
+
+  it('large corpus uses one bounded persisted semantic batch', () => {
+    const root = mkdtempSync(join(tmpdir(), 'graphify-queue-'));
+    roots.push(root);
+    const repo = new EnrichmentRepository(join(root, 'queue.db'));
+    repo.enqueue(
+      Array.from({ length: 5_000 }, (_, index) => ({
+        source: {
+          id: `s${index}`,
+          workgroupId: 'wg',
+          kind: 'document' as const,
+          relativePath: `${index}.md`,
+          contentHash: 'h',
+        },
+        segments: ['x'.repeat(1024)],
+        priority: 10,
+      })),
+    );
+    const batch = repo.claimBatch();
+    expect(batch.length).toBeLessThanOrEqual(25);
+    expect(Buffer.byteLength(batch.flatMap((item) => item.segments).join('\n'))).toBeLessThanOrEqual(256 * 1024);
+    expect(repo.pending('wg')).toBe(5_000);
+    repo.close();
+  });
+
+  it('retries transient semantic failures with bounded backoff', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+    const root = mkdtempSync(join(tmpdir(), 'graphify-retry-'));
+    roots.push(root);
+    const repo = new EnrichmentRepository(join(root, 'queue.db'));
+    repo.enqueue([
+      {
+        source: { id: 's', workgroupId: 'wg', kind: 'document', relativePath: 'a.md', contentHash: 'h' },
+        segments: ['a'],
+        priority: 1,
+      },
+    ]);
+    expect(repo.claimBatch()).toHaveLength(1);
+    repo.retry(['s'], 'transient');
+    expect(repo.claimBatch()).toHaveLength(0);
+    vi.advanceTimersByTime(5_001);
+    expect(repo.claimBatch()).toHaveLength(1);
+    repo.close();
+    vi.useRealTimers();
+  });
+});

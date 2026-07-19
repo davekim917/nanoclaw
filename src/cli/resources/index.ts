@@ -16,3 +16,4 @@ import './approvals.js';
 import './sessions.js';
 import './denied-models.js';
 import './tasks.js';
+import './graphify.js';

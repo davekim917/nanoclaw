@@ -4,14 +4,48 @@
   "uv_version": "uv 0.11.28 (aarch64-unknown-linux-gnu)",
   "python_version": "3.11",
   "platform": "manylinux2014_aarch64",
-  "generated_at": "2026-07-19T15:43:42.705Z",
+  "requirement": "graphifyy[pdf,office,sql]==0.9.20",
+  "extras": [
+    "pdf",
+    "office",
+    "sql"
+  ],
+  "generated_at": "2026-07-19T19:43:53.846Z",
   "wheels": [
+    {
+      "package": "beautifulsoup4",
+      "version": "4.15.0",
+      "filename": "beautifulsoup4-4.15.0-py3-none-any.whl",
+      "sha256": "d6f88de62e1d4e38ecb1077eb9724cd0eff29d2a08ca16a401e9b9e93f117cf9",
+      "uploaded_at": "2026-06-07T16:44:21.566528Z"
+    },
+    {
+      "package": "et-xmlfile",
+      "version": "2.0.0",
+      "filename": "et_xmlfile-2.0.0-py3-none-any.whl",
+      "sha256": "7a91720bc756843502c3b7504c77b8fe44217c85c537d85037f0f536151b2caa",
+      "uploaded_at": "2024-10-25T17:25:39.051783Z"
+    },
     {
       "package": "graphifyy",
       "version": "0.9.20",
       "filename": "graphifyy-0.9.20-py3-none-any.whl",
       "sha256": "5dc067210e8003433c92343db0dd976e17b58956c0b9f27f91a84ae331b74e82",
       "uploaded_at": "2026-07-18T21:29:51.388244Z"
+    },
+    {
+      "package": "lxml",
+      "version": "6.1.1",
+      "filename": "lxml-6.1.1-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.whl",
+      "sha256": "a4bbea04c97f6d78a48e3fbc1cb9116d2780b1b39e03a23f6eb9b603fd61f510",
+      "uploaded_at": "2026-05-18T19:17:42.917674Z"
+    },
+    {
+      "package": "markdownify",
+      "version": "1.2.3",
+      "filename": "markdownify-1.2.3-py3-none-any.whl",
+      "sha256": "a189a0bedfd14009030fde5f85bb6f77c56897cb839b5c25315dd7d4e3e290ba",
+      "uploaded_at": "2026-06-30T20:27:38.094619Z"
     },
     {
       "package": "networkx",
@@ -28,11 +62,46 @@
       "uploaded_at": "2025-05-17T21:32:23.332718Z"
     },
     {
+      "package": "openpyxl",
+      "version": "3.1.5",
+      "filename": "openpyxl-3.1.5-py2.py3-none-any.whl",
+      "sha256": "5282c12b107bffeef825f4617dc029afaf41d0ea60823bbb665ef3079dc79de2",
+      "uploaded_at": "2024-06-28T14:03:41.161372Z"
+    },
+    {
+      "package": "pypdf",
+      "version": "6.14.2",
+      "filename": "pypdf-6.14.2-py3-none-any.whl",
+      "sha256": "3f07891af76dc002657e04993ab9b4de81de29f9013b9761d0b7968bff12e946",
+      "uploaded_at": "2026-06-23T14:18:28.867545Z"
+    },
+    {
+      "package": "python-docx",
+      "version": "1.2.0",
+      "filename": "python_docx-1.2.0-py3-none-any.whl",
+      "sha256": "3fd478f3250fbbbfd3b94fe1e985955737c145627498896a8a6bf81f4baf66c7",
+      "uploaded_at": "2025-06-16T20:46:22.506016Z"
+    },
+    {
       "package": "rapidfuzz",
       "version": "3.13.0",
       "filename": "rapidfuzz-3.13.0-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
       "sha256": "98e0bfa602e1942d542de077baf15d658bd9d5dcfe9b762aff791724c1c38b70",
       "uploaded_at": "2025-04-03T20:35:45.158767Z"
+    },
+    {
+      "package": "six",
+      "version": "1.17.0",
+      "filename": "six-1.17.0-py2.py3-none-any.whl",
+      "sha256": "4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274",
+      "uploaded_at": "2024-12-04T17:35:26.475808Z"
+    },
+    {
+      "package": "soupsieve",
+      "version": "2.9",
+      "filename": "soupsieve-2.9-py3-none-any.whl",
+      "sha256": "a2b2c76d67df2382d245409fd71e321a571717e58463efa32ace87dcadac2c12",
+      "uploaded_at": "2026-07-19T01:35:17.106393Z"
     },
     {
       "package": "tree-sitter",
@@ -189,6 +258,13 @@
       "uploaded_at": "2026-04-18T22:23:53.141824Z"
     },
     {
+      "package": "tree-sitter-sql",
+      "version": "0.3.11",
+      "filename": "tree_sitter_sql-0.3.11-cp310-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl",
+      "sha256": "344e99b59c8c8d72f7154041e9d054400f4a3fccc16c2c96ac106dde0e7f8d0c",
+      "uploaded_at": "2025-10-01T13:44:10.211933Z"
+    },
+    {
       "package": "tree-sitter-swift",
       "version": "0.7.3",
       "filename": "tree_sitter_swift-0.7.3-cp38-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl",
@@ -215,6 +291,13 @@
       "filename": "tree_sitter_zig-1.1.2-cp39-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
       "sha256": "1962e95067ac5ee784daddd573f828ef32f15e9c871967df6833d3d389113eae",
       "uploaded_at": "2024-12-22T01:27:30.320608Z"
+    },
+    {
+      "package": "typing-extensions",
+      "version": "4.16.0",
+      "filename": "typing_extensions-4.16.0-py3-none-any.whl",
+      "sha256": "481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8",
+      "uploaded_at": "2026-07-02T08:40:04.659120Z"
     }
   ]
 }

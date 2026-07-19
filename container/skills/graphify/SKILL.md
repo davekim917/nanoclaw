@@ -1,43 +1,60 @@
 ---
 name: graphify
-description: Use Graphify for source-grounded codebase exploration, architecture questions, dependency paths, symbol explanations, and affected-code analysis inside NanoClaw managed worktrees.
+description: Use the automatic workgroup knowledge graph for knowledge work, prior decisions, cross-artifact lineage, architecture, dependency paths, explanations, and affected-code analysis.
 allowed-tools: Bash(graphify:*)
 ---
 
-# Graphify Code Intelligence
+# Graphify Workgroup Knowledge Intelligence
 
-Use Graphify as a read-only navigation aid for code work in a managed worktree.
-The gateway automatically reconciles current source before every read, including
-tracked edits, new files, and deletions.
+Use Graphify as the first read-only navigation aid when a question depends on
+relationships across the workgroup. The automatic workgroup knowledge graph
+combines workgroup files, canonical clones, conversations, and a thread-local
+worktree overlay when the current thread has code changes. It is useful for
+knowledge work as well as coding: prior decisions, cross-artifact lineage,
+requirements-to-spec-to-SQL/LookML-to-code-to-report connections, architecture,
+dependency paths, and affected-code questions.
+
+The graph is selected from trusted session context and maintained automatically.
+Graphify automatically reconciles current source before every query, within a
+bounded freshness deadline; slower structural and semantic enrichment remains
+asynchronous.
+You do not need to choose a project, pre-authorize a folder, or manually refresh
+an index before asking a question. Queries work from any directory. In a managed
+worktree, the gateway reconciles current edits, new files, and deletions as the
+thread-local worktree overlay.
 
 ## Workflow
 
-1. Create or reuse the repository with the managed `create_worktree` tool.
-2. Change directory into the repository under `/workspace/worktrees/`.
-3. Choose the smallest useful read command:
+Choose the smallest useful read:
 
-   ```bash
-   graphify query "authentication middleware"
-   graphify path "routeHandler" "authorizeRequest"
-   graphify explain "authorizeRequest"
-   graphify affected "authorizeRequest"
-   ```
+```bash
+graphify query "What prior decisions shaped the retention model?"
+graphify path "retention requirements" "customer_ltv.sql"
+graphify explain "customer_ltv"
+graphify affected "authorizeRequest"
+graphify status
+```
 
-   For syntax only, `graphify --help` and `graphify <command> --help` are
-   side-effect-free and do not inspect or refresh a repository.
+Then inspect the source directly by opening the cited file or conversation
+provenance before drawing a final conclusion or changing code. Graphify results
+are advisory. Source and tests are authoritative; for code changes, run the
+repository's normal verification.
 
-4. Open the exact files and tests named by the result before drawing a
-   conclusion or changing code. Graphify is advisory; source and tests are authoritative.
-5. Run the repository's normal tests and verification after any change.
+`graphify --help` and `graphify <command> --help` show syntax without inspecting
+or refreshing a graph. `graphify status` reports workgroup freshness and indexing
+state.
 
 ## Boundaries and fallback
 
-- Use only `query`, `path`, `explain`, and `affected` for graph reads.
-- Let the gateway own freshness, cache location, graph selection, deadlines,
-  and failure recovery. Do not choose an output or cache location.
-- Keep repository lifecycle operations in `create_worktree`; Graphify does not
-  create, switch, fetch, or rebase repositories.
-- If Graphify refuses the repository, times out, lacks language coverage, or
-  returns insufficient context, inspect the source directly. Report the
-  limitation when it materially affects confidence, and retry Graphify later
-  only when useful.
+- Use only `query`, `path`, `explain`, `affected`, and `status` for graph reads.
+- Do not pass a workgroup, filesystem root, graph, cache, or output override. The
+  gateway derives isolation scope from the trusted caller context.
+- Let the service own discovery and freshness. There is no allowlist workflow.
+- `.graphifyignore` is a rare opt-out for content that truly must not be indexed,
+  not a project-selection mechanism.
+- If the workgroup service is temporarily unavailable inside a managed worktree,
+  the gateway may explicitly use its code-only fallback. That fallback cannot
+  answer conversation or broad workgroup-knowledge questions.
+- If Graphify refuses a request, lacks coverage, or returns insufficient context,
+  inspect authoritative artifacts directly and state the limitation when it
+  materially affects confidence.

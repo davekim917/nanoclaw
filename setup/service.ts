@@ -11,6 +11,10 @@ import path from 'path';
 
 import { log } from '../src/log.js';
 import { getLaunchdLabel, getSystemdUnit } from '../src/install-slug.js';
+import {
+  getGraphifySystemdUnit,
+  renderGraphifySystemdUnit,
+} from '../src/graphify/service.js';
 import { writeUpgradeState } from '../src/upgrade-state.js';
 import { cleanupUnhealthyPeers } from './peer-cleanup.js';
 import {
@@ -18,9 +22,7 @@ import {
   getPlatform,
   getNodePath,
   getServiceManager,
-  hasSystemd,
   isRoot,
-  isWSL,
 } from './platform.js';
 import { emitStatus } from './status.js';
 
@@ -223,6 +225,8 @@ function setupLaunchd(
     PROJECT_PATH: projectRoot,
     PLIST_PATH: plistPath,
     SERVICE_LOADED: serviceLoaded,
+    GRAPHIFY_SERVICE_MODE: 'unsupported_launchd',
+    GRAPHIFY_SERVICE_LOADED: false,
     STATUS: 'success',
     LOG: 'logs/setup.log',
   });
@@ -421,6 +425,40 @@ WantedBy=${runningAsRoot ? 'multi-user.target' : 'default.target'}`;
     // Not active
   }
 
+  // Graphify is an independently managed, resource-capped sidecar. Install it
+  // only after the interactive host has been restarted and checked, and keep
+  // every sidecar failure non-fatal so indexing can never block messaging.
+  const projectOwner = fs.statSync(projectRoot);
+  const graphifyIdentity = resolveGraphifySystemIdentity(
+    runningAsRoot,
+    homeDir,
+    projectOwner.uid,
+    projectOwner.gid,
+    fs.readFileSync('/etc/passwd', 'utf8'),
+  );
+  const graphifyService = installGraphifySystemdSidecar({
+    projectRoot,
+    nodePath,
+    homeDir: graphifyIdentity.homeDir,
+    runningAsRoot,
+    mainUnitName: unitName,
+    mainUnitPath: unitPath,
+    systemctlPrefix,
+    ...graphifyIdentity.identity,
+  });
+  if (graphifyService.loaded) {
+    log.info('Graphify daemon service is active', {
+      unitName: graphifyService.unitName,
+      unitPath: graphifyService.unitPath,
+    });
+  } else {
+    log.warn('Graphify daemon service is not active (non-fatal)', {
+      unitName: graphifyService.unitName,
+      unitPath: graphifyService.unitPath,
+      error: graphifyService.error,
+    });
+  }
+
   emitStatus('SETUP_SERVICE', {
     SERVICE_TYPE: runningAsRoot ? 'systemd-system' : 'systemd-user',
     SERVICE_UNIT: unitName,
@@ -428,6 +466,12 @@ WantedBy=${runningAsRoot ? 'multi-user.target' : 'default.target'}`;
     PROJECT_PATH: projectRoot,
     UNIT_PATH: unitPath,
     SERVICE_LOADED: serviceLoaded,
+    GRAPHIFY_SERVICE_UNIT: graphifyService.unitName,
+    GRAPHIFY_UNIT_PATH: graphifyService.unitPath,
+    GRAPHIFY_SERVICE_LOADED: graphifyService.loaded,
+    ...(graphifyService.error
+      ? { GRAPHIFY_SERVICE_ERROR: graphifyService.error }
+      : {}),
     ...(dockerGroupStale ? { DOCKER_GROUP_STALE: true } : {}),
     LINGER_ENABLED: !runningAsRoot,
     STATUS: 'success',
@@ -435,10 +479,137 @@ WantedBy=${runningAsRoot ? 'multi-user.target' : 'default.target'}`;
   });
 }
 
+/**
+ * A system-level setup may be invoked through sudo even though the checkout,
+ * Codex login, and Docker access belong to the checkout owner. Keep the
+ * Graphify process at that identity instead of silently giving an untrusted
+ * content processor root privileges. Numeric groups avoid locale/name lookup
+ * ambiguity; systemd accepts both names and numeric ids.
+ */
+export function resolveGraphifySystemIdentity(
+  runningAsRoot: boolean,
+  fallbackHomeDir: string,
+  ownerUid: number,
+  ownerGid: number,
+  passwdText: string,
+): { homeDir: string; identity: { systemUser?: string; systemGroup?: string } } {
+  if (!runningAsRoot || ownerUid === 0) {
+    return { homeDir: fallbackHomeDir, identity: {} };
+  }
+
+  const record = passwdText
+    .split('\n')
+    .map((line) => line.split(':'))
+    .find((fields) => Number(fields[2]) === ownerUid);
+  const user = record?.[0]?.trim() || String(ownerUid);
+  const ownerHome = record?.[5]?.trim() || fallbackHomeDir;
+  return {
+    homeDir: ownerHome,
+    identity: { systemUser: user, systemGroup: String(ownerGid) },
+  };
+}
+
+export interface GraphifySystemdInstallOptions {
+  projectRoot: string;
+  nodePath: string;
+  homeDir: string;
+  runningAsRoot: boolean;
+  mainUnitName: string;
+  mainUnitPath: string;
+  systemctlPrefix: string;
+  systemUser?: string;
+  systemGroup?: string;
+}
+
+export interface GraphifySystemdInstallDependencies {
+  writeFile(filePath: string, content: string): void;
+  run(command: string): void;
+}
+
+export interface GraphifySystemdInstallResult {
+  unitName: string;
+  unitPath: string;
+  loaded: boolean;
+  error?: string;
+}
+
+/**
+ * Install the checkout-scoped Graphify sibling unit.
+ *
+ * This boundary is intentionally best-effort: it reports all failed steps and
+ * always returns a result instead of throwing into the host setup path.
+ */
+export function installGraphifySystemdSidecar(
+  options: GraphifySystemdInstallOptions,
+  dependencies: GraphifySystemdInstallDependencies = {
+    writeFile: (filePath, content) => fs.writeFileSync(filePath, content),
+    run: (command) => execSync(command, { stdio: 'ignore' }),
+  },
+): GraphifySystemdInstallResult {
+  const unitName = getGraphifySystemdUnit(options.mainUnitName);
+  const unitPath = path.join(
+    path.dirname(options.mainUnitPath),
+    `${unitName}.service`,
+  );
+  const failures: string[] = [];
+
+  const unit = renderGraphifySystemdUnit({
+    projectRoot: options.projectRoot,
+    nodePath: options.nodePath,
+    homeDir: options.homeDir,
+    installTarget: options.runningAsRoot
+      ? 'multi-user.target'
+      : 'default.target',
+    ...(options.runningAsRoot && options.systemUser
+      ? { user: options.systemUser }
+      : {}),
+    ...(options.runningAsRoot && options.systemGroup
+      ? { group: options.systemGroup }
+      : {}),
+  });
+
+  try {
+    dependencies.writeFile(unitPath, unit);
+  } catch (err) {
+    failures.push(`write: ${formatServiceError(err)}`);
+  }
+
+  for (const [step, command] of [
+    ['daemon-reload', `${options.systemctlPrefix} daemon-reload`],
+    ['enable', `${options.systemctlPrefix} enable ${unitName}`],
+    ['restart', `${options.systemctlPrefix} restart ${unitName}`],
+  ] as const) {
+    try {
+      dependencies.run(command);
+    } catch (err) {
+      failures.push(`${step}: ${formatServiceError(err)}`);
+    }
+  }
+
+  let active = false;
+  try {
+    dependencies.run(`${options.systemctlPrefix} is-active ${unitName}`);
+    active = true;
+  } catch (err) {
+    failures.push(`verify: ${formatServiceError(err)}`);
+  }
+
+  return {
+    unitName,
+    unitPath,
+    loaded: active && failures.length === 0,
+    ...(failures.length > 0 ? { error: failures.join('; ') } : {}),
+  };
+}
+
+function formatServiceError(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 function setupNohupFallback(
   projectRoot: string,
   nodePath: string,
-  homeDir: string,
+  _homeDir: string,
 ): void {
   log.warn('No systemd detected — generating nohup wrapper script');
 
@@ -484,6 +655,8 @@ function setupNohupFallback(
     PROJECT_PATH: projectRoot,
     WRAPPER_PATH: wrapperPath,
     SERVICE_LOADED: false,
+    GRAPHIFY_SERVICE_MODE: 'unsupported_nohup',
+    GRAPHIFY_SERVICE_LOADED: false,
     FALLBACK: 'wsl_no_systemd',
     STATUS: 'success',
     LOG: 'logs/setup.log',

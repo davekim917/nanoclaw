@@ -14,20 +14,42 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const MANIFEST_PATH = path.join(ROOT, 'container/graphify-integration.json');
 const LOCK_PATH = path.join(ROOT, 'container/graphify-requirements.lock');
 const AUDIT_PATH = path.join(ROOT, 'container/graphify-wheel-audit.json');
+const ENABLED_EXTRAS = ['pdf', 'office', 'sql'] as const;
+const SEMANTIC_SURFACE_PATHS = {
+  'codex-extraction-spec': 'graphify/skills/codex/references/extraction-spec.md',
+  detector: 'graphify/detect.py',
+  extractor: 'graphify/extract.py',
+  'codex-watch': 'graphify/skills/codex/references/add-watch.md',
+  watcher: 'graphify/watch.py',
+  'codex-transcribe': 'graphify/skills/codex/references/transcribe.md',
+  transcriber: 'graphify/transcribe.py',
+  'inert-wrapper': 'graphify/llm.py',
+} as const;
+
+function graphifyRequirement(version: string): string {
+  return `graphifyy[${ENABLED_EXTRAS.join(',')}]==${version}`;
+}
+
+interface SemanticSurface {
+  path: string;
+  sha256: string;
+}
 
 interface IntegrationManifest {
   schemaVersion: 1;
-  package: { name: string; version: string };
+  package: { name: string; version: string; extras: string[] };
   upstream: {
     repo: string;
     tag: string;
     commit: string;
     skillPath: string;
     skillSha256: string;
+    semanticSurfaces: Record<string, SemanticSurface>;
   };
   patch: { path: string; sha256: string };
   sourceSha256: Record<string, string>;
   commands: string[];
+  upstreamCapabilities: string[];
   capabilities: Array<{ id: string; status: string; note: string }>;
 }
 
@@ -71,30 +93,80 @@ function validateCapabilities(manifest: IntegrationManifest): void {
   for (const command of manifest.commands) {
     if (!ids.has(command)) throw new Error(`Graphify command is missing from capability ledger: ${command}`);
   }
+  const inventory = new Set(manifest.upstreamCapabilities);
+  if (inventory.size !== manifest.upstreamCapabilities.length) {
+    throw new Error('Graphify upstream capability inventory contains duplicates');
+  }
+  for (const capability of inventory) {
+    if (!ids.has(capability)) throw new Error(`unclassified Graphify capability: ${capability}`);
+  }
+  for (const capability of ids) {
+    if (!inventory.has(capability)) {
+      throw new Error(`Graphify capability is absent from upstream inventory: ${capability}`);
+    }
+  }
 }
 
 async function resolveWheels(version: string, workRoot: string): Promise<WheelAudit[]> {
   const uvPath = process.env.GRAPHIFY_UV_BIN ?? 'uv';
   const inputPath = path.join(workRoot, 'requirements.in');
   const compiledPath = path.join(workRoot, 'requirements.txt');
-  await writeFile(inputPath, `graphifyy==${version}\n`);
-  await execFileAsync(uvPath, [
-    'pip', 'compile', '--python-version', '3.11',
-    '--python-platform', 'aarch64-manylinux2014', '--only-binary=:all:',
-    '--prerelease', 'disallow', '--resolution', 'highest',
-    '--generate-hashes', '--no-annotate', '--no-header',
-    '--cache-dir', path.join(workRoot, 'uv-cache'),
-    '--output-file', compiledPath, inputPath,
-  ], { cwd: workRoot, maxBuffer: 16 * 1024 * 1024 });
+  const requirement = graphifyRequirement(version);
+  await writeFile(inputPath, `${requirement}\n`);
+  await execFileAsync(
+    uvPath,
+    [
+      'pip',
+      'compile',
+      '--python-version',
+      '3.11',
+      '--python-platform',
+      'aarch64-manylinux2014',
+      '--only-binary=:all:',
+      '--prerelease',
+      'disallow',
+      '--resolution',
+      'highest',
+      '--generate-hashes',
+      '--no-annotate',
+      '--no-header',
+      '--cache-dir',
+      path.join(workRoot, 'uv-cache'),
+      '--output-file',
+      compiledPath,
+      inputPath,
+    ],
+    { cwd: workRoot, maxBuffer: 16 * 1024 * 1024 },
+  );
   const wheelhouse = path.join(workRoot, 'wheelhouse');
   await execFileAsync('mkdir', ['-p', wheelhouse]);
-  await execFileAsync('python3', [
-    '-m', 'pip', 'download', '--disable-pip-version-check', '--no-cache-dir',
-    '--only-binary=:all:', '--platform', 'manylinux2014_aarch64',
-    '--python-version', '3.11', '--implementation', 'cp',
-    '--abi', 'cp311', '--abi', 'abi3', '--abi', 'none',
-    '--dest', wheelhouse, `graphifyy==${version}`,
-  ], { cwd: workRoot, maxBuffer: 16 * 1024 * 1024 });
+  await execFileAsync(
+    'python3',
+    [
+      '-m',
+      'pip',
+      'download',
+      '--disable-pip-version-check',
+      '--no-cache-dir',
+      '--only-binary=:all:',
+      '--platform',
+      'manylinux2014_aarch64',
+      '--python-version',
+      '3.11',
+      '--implementation',
+      'cp',
+      '--abi',
+      'cp311',
+      '--abi',
+      'abi3',
+      '--abi',
+      'none',
+      '--dest',
+      wheelhouse,
+      requirement,
+    ],
+    { cwd: workRoot, maxBuffer: 16 * 1024 * 1024 },
+  );
   const filenames = (await readdir(wheelhouse)).sort();
   if (filenames.length === 0 || filenames.some((filename) => !filename.endsWith('.whl'))) {
     throw new Error('Graphify closure is not wheel-only for CPython 3.11 ARM64');
@@ -106,7 +178,9 @@ async function resolveWheels(version: string, workRoot: string): Promise<WheelAu
     const packageName = match[1].replaceAll('_', '-');
     const packageVersion = match[2];
     if (!isStableVersion(packageVersion)) throw new Error(`prerelease wheel selected: ${filename}`);
-    const metadata = await fetchJson(`https://pypi.org/pypi/${encodeURIComponent(packageName)}/${encodeURIComponent(packageVersion)}/json`);
+    const metadata = await fetchJson(
+      `https://pypi.org/pypi/${encodeURIComponent(packageName)}/${encodeURIComponent(packageVersion)}/json`,
+    );
     const file = metadata.urls?.find((candidate: any) => candidate.filename === filename);
     if (!file) throw new Error(`PyPI metadata does not contain selected wheel: ${filename}`);
     if (file.yanked) throw new Error(`selected wheel is yanked: ${filename}`);
@@ -124,8 +198,10 @@ async function resolveWheels(version: string, workRoot: string): Promise<WheelAu
   wheels.sort((left, right) => left.package.localeCompare(right.package));
   const compiled = await readFile(compiledPath, 'utf8');
   const compiledVersions = new Map(
-    [...compiled.matchAll(/^([A-Za-z0-9_.-]+)==([^\s\\]+).*$/gm)]
-      .map((match) => [match[1].replaceAll('_', '-').toLowerCase(), match[2]]),
+    [...compiled.matchAll(/^([A-Za-z0-9_.-]+)==([^\s\\]+).*$/gm)].map((match) => [
+      match[1].replaceAll('_', '-').toLowerCase(),
+      match[2],
+    ]),
   );
   const selectedVersions = new Map(wheels.map((wheel) => [wheel.package.toLowerCase(), wheel.version]));
   if (JSON.stringify([...compiledVersions].sort()) !== JSON.stringify([...selectedVersions].sort())) {
@@ -137,7 +213,7 @@ async function resolveWheels(version: string, workRoot: string): Promise<WheelAu
 function renderLock(wheels: WheelAudit[], uvVersion: string): string {
   return [
     `# Generated by ${uvVersion} for CPython 3.11 on manylinux2014 aarch64.`,
-    '# Latest-stable, wheel-only core graphifyy dependency set; optional extras are excluded.',
+    `# Latest-stable, wheel-only graphifyy dependency set. Enabled extras: ${ENABLED_EXTRAS.join(', ')}.`,
     ...wheels.map((wheel) => `${wheel.package}==${wheel.version} --hash=sha256:${wheel.sha256} # ${wheel.filename}`),
     '',
   ].join('\n');
@@ -147,9 +223,15 @@ async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const requested = valueAfter(args, '--version');
   if (!requested || !isStableVersion(requested)) {
-    throw new Error('usage: bun scripts/update-graphify.ts --version <stable-version> [--reviewed-skill-sha <sha> --capability-review <json>]');
+    throw new Error(
+      'usage: bun scripts/update-graphify.ts --version <stable-version> ' +
+        '[--reviewed-skill-sha <sha> --reviewed-surface-sha <id=sha> --capability-review <json>]',
+    );
   }
   const current = JSON.parse(await readFile(MANIFEST_PATH, 'utf8')) as IntegrationManifest;
+  if (JSON.stringify(current.package.extras) !== JSON.stringify([...ENABLED_EXTRAS])) {
+    throw new Error(`Graphify manifest extras must be exactly: ${ENABLED_EXTRAS.join(', ')}`);
+  }
   validateCapabilities(current);
 
   const pypi = await fetchJson(`https://pypi.org/pypi/${current.package.name}/json`);
@@ -166,8 +248,14 @@ async function main(): Promise<void> {
   const workRoot = await mkdtemp(path.join(tmpdir(), 'nanoclaw-graphify-update-'));
   const upstreamRoot = path.join(workRoot, 'upstream');
   await execFileAsync('git', [
-    'clone', '--quiet', '--depth', '1', '--branch', latestRelease.tag,
-    `https://github.com/${current.upstream.repo}.git`, upstreamRoot,
+    'clone',
+    '--quiet',
+    '--depth',
+    '1',
+    '--branch',
+    latestRelease.tag,
+    `https://github.com/${current.upstream.repo}.git`,
+    upstreamRoot,
   ]);
   const { stdout: commitOutput } = await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: upstreamRoot });
   const commit = commitOutput.trim();
@@ -178,18 +266,47 @@ async function main(): Promise<void> {
   const reviewedSkillSha = valueAfter(args, '--reviewed-skill-sha');
   if (skillSha !== current.upstream.skillSha256 && reviewedSkillSha !== skillSha) {
     throw new Error(
-      `Graphify upstream skill drift (${current.upstream.skillSha256} -> ${skillSha}); `
-        + 'route this bump to a Graphify-review change with an updated capability ledger',
+      `Graphify upstream skill drift (${current.upstream.skillSha256} -> ${skillSha}); ` +
+        'route this bump to a Graphify-review change with an updated capability ledger',
     );
   }
 
+  const semanticSurfaces: Record<string, SemanticSurface> = {};
+  const surfaceDrift: string[] = [];
+  for (const [id, relative] of Object.entries(SEMANTIC_SURFACE_PATHS)) {
+    const digest = sha256(await readFile(path.join(upstreamRoot, relative)));
+    semanticSurfaces[id] = { path: relative, sha256: digest };
+    const pinned = current.upstream.semanticSurfaces?.[id];
+    if (!pinned || pinned.path !== relative || pinned.sha256 !== digest) surfaceDrift.push(id);
+  }
+  const reviewedSurfaces = new Set<string>();
+  for (let index = 0; index < args.length; index += 1) {
+    if (args[index] === '--reviewed-surface-sha' && args[index + 1]) reviewedSurfaces.add(args[index + 1]);
+  }
+  const unreviewedSurfaceDrift = surfaceDrift.filter(
+    (id) => !reviewedSurfaces.has(`${id}=${semanticSurfaces[id].sha256}`),
+  );
+  if (unreviewedSurfaceDrift.length > 0) {
+    throw new Error(
+      `Graphify upstream semantic surface drift (${unreviewedSurfaceDrift.join(', ')}); ` +
+        'review each surface and pass --reviewed-surface-sha <id=sha>',
+    );
+  }
+
+  let upstreamCapabilities = current.upstreamCapabilities;
   let capabilities = current.capabilities;
   const capabilityReviewPath = valueAfter(args, '--capability-review');
-  if (skillSha !== current.upstream.skillSha256) {
-    if (!capabilityReviewPath) throw new Error('changed upstream skill requires --capability-review');
-    capabilities = JSON.parse(await readFile(path.resolve(capabilityReviewPath), 'utf8'));
+  if (skillSha !== current.upstream.skillSha256 || surfaceDrift.length > 0) {
+    if (!capabilityReviewPath) throw new Error('changed upstream semantic contract requires --capability-review');
+    const review = JSON.parse(await readFile(path.resolve(capabilityReviewPath), 'utf8'));
+    if (Array.isArray(review)) {
+      capabilities = review;
+    } else {
+      upstreamCapabilities = review.upstreamCapabilities;
+      capabilities = review.capabilities;
+    }
   }
-  const candidate = { ...current, capabilities } as IntegrationManifest;
+  const candidate = { ...current, upstreamCapabilities, capabilities } as IntegrationManifest;
   validateCapabilities(candidate);
 
   const patchPath = path.join(ROOT, current.patch.path);
@@ -211,9 +328,11 @@ async function main(): Promise<void> {
       tag: latestRelease.tag,
       commit,
       skillSha256: skillSha,
+      semanticSurfaces,
     },
     patch: { ...current.patch, sha256: patchSha },
     sourceSha256,
+    upstreamCapabilities,
     capabilities,
   };
   const audit = {
@@ -222,6 +341,8 @@ async function main(): Promise<void> {
     uv_version: uvVersion,
     python_version: '3.11',
     platform: 'manylinux2014_aarch64',
+    requirement: graphifyRequirement(requested),
+    extras: [...ENABLED_EXTRAS],
     generated_at: new Date().toISOString(),
     wheels,
   };

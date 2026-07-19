@@ -15,6 +15,7 @@ import textwrap
 import types
 import unittest
 from unittest import mock
+import zipfile
 
 
 MODULE_PATH = Path(__file__).parents[1] / "graphify-worker.py"
@@ -66,6 +67,219 @@ class WorkerTest(unittest.TestCase):
             "sha256": hashlib.sha256(raw).hexdigest(),
             "bytes": len(raw),
         }
+
+    def _preprocess_item(self, root: Path, relative: str) -> dict:
+        raw = (root / relative).read_bytes()
+        return {
+            "path": relative,
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "bytes": len(raw),
+        }
+
+    def _preprocess_descriptor(self, source_root: Path, output_root: Path, relative: str) -> dict:
+        return {
+            "source_root": str(source_root),
+            "output_root": str(output_root),
+            "source": self._preprocess_item(source_root, relative),
+        }
+
+    def _write_office_fixture(self, path: Path, member: str = "fixture.xml", raw: bytes = b"<x/>") -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr(member, raw)
+
+    def test_worker_preprocesses_one_verified_pdf_with_page_provenance(self):
+        source_root = self.root / "source"
+        source_root.mkdir()
+        (source_root / "brief.pdf").write_bytes(b"%PDF-1.7\n% bounded fixture\n")
+        output_root = self.root / "output"
+
+        class Page:
+            def __init__(self, text: str):
+                self.text = text
+
+            def extract_text(self):
+                return self.text
+
+        pypdf = types.ModuleType("pypdf")
+        pypdf.PdfReader = lambda _path: types.SimpleNamespace(
+            is_encrypted=False,
+            pages=[Page("Executive summary"), Page("Risks and actions")],
+        )
+        with mock.patch.dict(sys.modules, {"pypdf": pypdf}):
+            result = self.worker.preprocess_source(
+                self._preprocess_descriptor(source_root, output_root, "brief.pdf")
+            )
+
+        artifact = json.loads((output_root / "preprocessed.json").read_text())
+        self.assertEqual(result, artifact)
+        self.assertEqual(artifact["status"], "ok")
+        self.assertEqual(artifact["source"]["path"], "brief.pdf")
+        self.assertEqual(
+            [(section["locator"], section["provenance"]) for section in artifact["sections"]],
+            [("page:1", {"page": 1}), ("page:2", {"page": 2})],
+        )
+        self.assertLessEqual(
+            (output_root / "preprocessed.json").stat().st_size,
+            self.worker.MAX_PREPROCESSED_JSON_BYTES,
+        )
+        self.assertEqual(list(output_root.glob(".preprocessed.*.tmp")), [])
+
+    def test_worker_preprocesses_docx_and_xlsx_with_sheet_provenance(self):
+        source_root = self.root / "source"
+        source_root.mkdir()
+        self._write_office_fixture(source_root / "notes.docx")
+        self._write_office_fixture(source_root / "model.xlsx")
+
+        docx = types.ModuleType("docx")
+        docx.Document = lambda _path: types.SimpleNamespace(
+            paragraphs=[types.SimpleNamespace(text="Decision log")],
+            tables=[types.SimpleNamespace(rows=[types.SimpleNamespace(cells=[
+                types.SimpleNamespace(text="Owner"), types.SimpleNamespace(text="Dave")
+            ])])],
+        )
+
+        class Worksheet:
+            def __init__(self, title, rows):
+                self.title = title
+                self._rows = rows
+
+            def iter_rows(self, *, values_only):
+                self.assert_values_only = values_only
+                return iter(self._rows)
+
+        workbook = types.SimpleNamespace(
+            worksheets=[Worksheet("Forecast", [("Month", "Revenue"), ("July", 42)])],
+            close=mock.Mock(),
+        )
+        openpyxl = types.ModuleType("openpyxl")
+        openpyxl.load_workbook = mock.Mock(return_value=workbook)
+
+        with mock.patch.dict(sys.modules, {"docx": docx, "openpyxl": openpyxl}):
+            docx_result = self.worker.preprocess_source(
+                self._preprocess_descriptor(source_root, self.root / "docx-output", "notes.docx")
+            )
+            xlsx_result = self.worker.preprocess_source(
+                self._preprocess_descriptor(source_root, self.root / "xlsx-output", "model.xlsx")
+            )
+
+        self.assertEqual(docx_result["status"], "ok")
+        self.assertEqual(docx_result["sections"][0]["kind"], "document")
+        self.assertIn("Decision log", docx_result["sections"][0]["text"])
+        self.assertEqual(xlsx_result["status"], "ok")
+        self.assertEqual(xlsx_result["sections"][0]["locator"], "sheet:Forecast")
+        self.assertEqual(xlsx_result["sections"][0]["provenance"], {"sheet": "Forecast"})
+        self.assertIn("July", xlsx_result["sections"][0]["text"])
+        openpyxl.load_workbook.assert_called_once_with(
+            source_root / "model.xlsx", read_only=True, data_only=True, keep_links=False
+        )
+        workbook.close.assert_called_once_with()
+
+    def test_worker_preprocess_has_explicit_empty_and_nonsensitive_failure_results(self):
+        source_root = self.root / "source"
+        source_root.mkdir()
+        (source_root / "empty.pdf").write_bytes(b"%PDF empty")
+        (source_root / "broken.pdf").write_bytes(b"%PDF broken")
+
+        class EmptyReader:
+            is_encrypted = False
+            pages = [types.SimpleNamespace(extract_text=lambda: " \n ")]
+
+        class BrokenReader:
+            def __init__(self, _path):
+                raise ValueError("secret parser detail /private/source.pdf")
+
+        pypdf = types.ModuleType("pypdf")
+        pypdf.PdfReader = lambda _path: EmptyReader()
+        with mock.patch.dict(sys.modules, {"pypdf": pypdf}):
+            empty = self.worker.preprocess_source(
+                self._preprocess_descriptor(source_root, self.root / "empty-output", "empty.pdf")
+            )
+        self.assertEqual(empty["status"], "empty")
+        self.assertEqual(empty["sections"], [])
+        self.assertIsNone(empty["error"])
+
+        pypdf.PdfReader = BrokenReader
+        with mock.patch.dict(sys.modules, {"pypdf": pypdf}):
+            failed = self.worker.preprocess_source(
+                self._preprocess_descriptor(source_root, self.root / "failed-output", "broken.pdf")
+            )
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["sections"], [])
+        self.assertEqual(failed["error"], "parse_failed")
+        self.assertNotIn("secret", json.dumps(failed))
+        self.assertNotIn("/private", json.dumps(failed))
+
+    def test_worker_preprocess_rejects_real_archive_bomb_oversize_and_hash_mismatch(self):
+        source_root = self.root / "source"
+        source_root.mkdir()
+        bomb = source_root / "bomb.docx"
+        self._write_office_fixture(bomb, "word/document.xml", b"A" * (1024 * 1024))
+        bomb_result = self.worker.preprocess_source(
+            self._preprocess_descriptor(source_root, self.root / "bomb-output", "bomb.docx")
+        )
+        self.assertEqual(bomb_result["status"], "failed")
+        self.assertEqual(bomb_result["error"], "unsafe_archive")
+        self.assertEqual(bomb_result["sections"], [])
+
+        oversized = source_root / "oversized.pdf"
+        with oversized.open("wb") as stream:
+            stream.truncate(self.worker.MAX_PREPROCESS_SOURCE_BYTES + 1)
+        oversize_descriptor = {
+            "source_root": str(source_root),
+            "output_root": str(self.root / "oversize-output"),
+            "source": {
+                "path": "oversized.pdf",
+                "sha256": "0" * 64,
+                "bytes": oversized.stat().st_size,
+            },
+        }
+        with self.assertRaisesRegex(self.worker.WorkerValidationError, "source exceeds"):
+            self.worker.preprocess_source(oversize_descriptor)
+        self.assertFalse((self.root / "oversize-output/preprocessed.json").exists())
+
+        (source_root / "mismatch.pdf").write_bytes(b"%PDF mismatch")
+        mismatch = self._preprocess_descriptor(
+            source_root, self.root / "mismatch-output", "mismatch.pdf"
+        )
+        mismatch["source"]["sha256"] = "f" * 64
+        with self.assertRaisesRegex(self.worker.WorkerValidationError, "hash mismatch"):
+            self.worker.preprocess_source(mismatch)
+        self.assertFalse((self.root / "mismatch-output/preprocessed.json").exists())
+
+    def test_worker_preprocess_descriptor_is_local_strict_and_dispatched_after_guards(self):
+        source_root = self.root / "source"
+        source_root.mkdir()
+        (source_root / "brief.pdf").write_bytes(b"%PDF local")
+        descriptor = self._preprocess_descriptor(
+            source_root, self.root / "output", "brief.pdf"
+        )
+        descriptor.update({
+            "operation": "preprocess",
+            "limits": {
+                "address_space_bytes": self.worker.MAX_ADDRESS_SPACE,
+                "file_bytes": self.worker.MAX_FILE_BYTES,
+                "process_count": 0,
+            },
+        })
+        request = self.root / "preprocess.json"
+        request.write_text(json.dumps(descriptor))
+        events = []
+        with mock.patch.object(
+            self.worker, "apply_limits", side_effect=lambda *_args: events.append("limits")
+        ), mock.patch.object(
+            self.worker, "install_task_guards", side_effect=lambda: events.append("guards")
+        ), mock.patch.object(
+            self.worker, "preprocess_source", side_effect=lambda _descriptor: events.append("preprocess")
+        ), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.worker.main([str(request)]), 0)
+        self.assertEqual(events, ["limits", "guards", "preprocess"])
+
+        invalid = self._preprocess_descriptor(source_root, self.root / "invalid-output", "brief.pdf")
+        invalid["source"]["url"] = "https://example.com/brief.pdf"
+        with self.assertRaisesRegex(self.worker.WorkerValidationError, "source descriptor schema"):
+            self.worker.preprocess_source(invalid)
+        self.assertNotIn("requests", MODULE_PATH.read_text(encoding="utf-8"))
 
     def test_worker_applies_limits_before_import(self):
         source = MODULE_PATH.read_text(encoding="utf-8")
