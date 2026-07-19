@@ -1,7 +1,7 @@
 version: 1
 feature: graphify-container-code-intelligence
 created_at: 2026-07-18
-status: activation_approved
+status: activated
 
 constraints:
   - id: C1
@@ -425,6 +425,22 @@ decisions:
       - The approval supersedes D36 only for rollout disposition and does not alter, rerun, replace, or reinterpret any frozen v4 row or result.
     user_instruction: Approve full activation of d3773a
     recorded_at: 2026-07-19T05:14:23Z
+  - id: D41
+    status: accepted
+    decision: Keep the production rebuild labeled with the shipped runtime-source commit as the active form of the approved d3773a candidate because its complete RootFS is byte-identical and only the provenance label differs.
+    rationale: The container-rebuild watcher correctly replaced the stale pre-commit provenance label after source publication; pinning the stale label as latest would make production provenance false without changing any runtime byte.
+    constraint_refs: [C1, C2, C3, C4, C5, C6, C9, C10, C12, C13]
+    affects_groups: [A, B, C, D, E]
+    evidence:
+      - Approved candidate sha256:d3773a52500ae98d8b80c0dd128ef094af1ce87f6a603d912d5d7b9383122f8b and active image sha256:dc6d4e8431106fee8accde525040f73343fc81aa8b0536077f587dc276504274 have identical creation time, size, RootFS layer list, and RootFS SHA-256 034171e40dd4538f1d10dc80b9e3d23fc070a9e23320fff341360acc64a953d6.
+      - The only image-config difference is nanoclaw.commit, which changed from the pre-publication e2aca6ae label to shipped commit 3e2feb7341c5dc171e8514f5464ffecd5adffb7e.
+      - Live Claude and Codex containers both used the active image with a 2048 MiB reservation, 5120 MiB hard and swap limit, exact dedicated cache and runtime mounts, and the private 192 MiB staging tmpfs.
+      - Both providers returned concrete Graphify 0.9.16 symbol matches from managed nanoclaw worktrees; command -v gitnexus failed in both containers, and both cgroups retained zero OOM and oom_kill events.
+    boundaries:
+      - Runtime bytes and topology remain exactly those validated in the protected d3773a candidate.
+      - The frozen v4 evidence and its failed execution-grounding result remain unchanged.
+      - Future rebuilds must preserve current-commit provenance and pass the same finished-image and live-topology contracts.
+    recorded_at: 2026-07-19T05:41:46Z
 
 assumptions:
   - id: A1
@@ -535,6 +551,18 @@ escalations:
       - The pre-ship gate passed 2469 host tests, 830 runner tests, and 52 Graphify tests plus host build and runner typecheck.
     required_next_action: Commit and push the validated source, activate only the exact protected image, restart the service, and verify live Claude and Codex runtime topology and behavior.
     recorded_at: 2026-07-19T05:14:23Z
+  - stage: Ship
+    iteration: 8
+    category: activation-complete
+    finding: The approved Graphify runtime is published, active, and verified through real Claude and Codex session paths.
+    evidence:
+      - Source commit 3e2feb7341c5dc171e8514f5464ffecd5adffb7e is present on origin/main.
+      - Active image sha256:dc6d4e8431106fee8accde525040f73343fc81aa8b0536077f587dc276504274 has RootFS SHA-256 034171e40dd4538f1d10dc80b9e3d23fc070a9e23320fff341360acc64a953d6, identical to approved candidate d3773a, with only the current commit provenance label changed.
+      - Live Claude query sendMessage returned container/agent-runner/src/mcp-tools/core.ts and live Codex query sessionGraphifyCacheDir returned src/session-manager.ts from 918-source-file managed worktrees with reason ok.
+      - Both live containers had the exact cache and runtime bind mounts plus 192 MiB private staging tmpfs, 2048 MiB reservation, 5120 MiB hard and swap limit, no GitNexus executable or plugin mount, and zero OOM or oom_kill events.
+      - The temporary CLI validation wiring and messaging group were removed after verification.
+    required_next_action: None. Preserve the shipped runtime contracts and monitor normal production use.
+    recorded_at: 2026-07-19T05:41:46Z
 
 review_cycles:
   - iteration: 1
