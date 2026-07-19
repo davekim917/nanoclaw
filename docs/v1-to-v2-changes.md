@@ -136,7 +136,7 @@ Owner gets seeded during the `/migrate-from-v1` skill's interview phase ("Which 
 
 **v2:** Node host at top, Bun-runtime Docker container per session. They communicate only via the two session DBs. No shared modules, no IPC, no stdin piping. If you wrote custom code that reached from the agent into host internals (or vice versa), that surface no longer exists — porting it is a `/migrate-from-v1` skill topic, not a mechanical copy.
 
-Lockfiles: host uses `pnpm-lock.yaml`, agent-runner uses `bun.lock`. `minimumReleaseAge: 4320` on the host side (3-day supply-chain wait); agent-runner has no release-age gate.
+Lockfiles: host uses `pnpm-lock.yaml`, agent-runner uses `bun.lock`. Both follow the current latest-stable policy with explicit approval and committed lockfile resolution; prereleases and unresolved registry checks fail closed.
 
 ---
 

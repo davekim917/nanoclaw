@@ -3391,12 +3391,15 @@ export async function buildAgentGroupImage(agentGroupId: string): Promise<void> 
     dockerfile += `RUN apt-get update && apt-get install -y ${aptPackages.join(' ')} && rm -rf /var/lib/apt/lists/*\n`;
   }
   if (npmPackages.length > 0) {
-    // pnpm skips build scripts unless packages are allowlisted. Append each
-    // to /root/.npmrc (base image sets it up for agent-browser) so packages
-    // with postinstall — e.g. playwright, puppeteer, native addons — don't
-    // install silently broken.
-    const allowlist = npmPackages.map((p) => `echo 'only-built-dependencies[]=${p}' >> /root/.npmrc`).join(' && ');
-    dockerfile += `RUN ${allowlist} && pnpm install -g ${npmPackages.join(' ')}\n`;
+    // pnpm skips build scripts unless packages are allowlisted. Write both
+    // formats: pnpm 10 global installs still honor the legacy .npmrc keys,
+    // while pnpm 11 reads the global allowBuilds YAML map. Every entry here
+    // passed strict npm-name validation before the admin approved it.
+    const legacyAllowlist = npmPackages
+      .map((pkg) => `echo 'only-built-dependencies[]=${pkg}' >> /root/.npmrc`)
+      .join(' && ');
+    const allowBuilds = JSON.stringify(Object.fromEntries(npmPackages.map((pkg) => [pkg, true])));
+    dockerfile += `RUN ${legacyAllowlist} && pnpm config set --global --json allowBuilds '${allowBuilds}' && pnpm install -g ${npmPackages.join(' ')}\n`;
   }
   dockerfile += 'USER node\n';
 

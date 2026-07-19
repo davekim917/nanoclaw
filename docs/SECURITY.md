@@ -244,38 +244,27 @@ belong to the same agent group.
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-## Supply Chain Security (pnpm)
+## Supply Chain Security
 
-NanoClaw uses pnpm with two supply chain defenses configured in `pnpm-workspace.yaml`:
+NanoClaw intentionally tracks the latest stable dependency releases without a release-age delay. The shared release adapter rejects prerelease/beta/RC/dev/nightly, draft, yanked, source-only Graphify, and target-incompatible candidates. A registry error is reported as unknown and cannot be treated as current.
 
-### Minimum Release Age
+`bun scripts/container-updates.ts audit --format json` is the canonical audit for host pnpm dependencies, agent-runner Bun dependencies, Dockerfile pins, Graphify, and Codex-synchronized files. `apply` requires explicit item IDs and a writable clone. The Monday task is advisory only; `/update-container` asks for human selection and prepares reviewed PRs. Neither path merges or deploys.
 
-`minimumReleaseAge: 4320` (3 days). pnpm will refuse to resolve any package version published less than 3 days ago. This defends against typosquatting and compromised maintainer accounts — most malicious publishes are detected and pulled within 72 hours.
+Release freshness is not the safety boundary. These controls are:
 
-**Excluding a package from the release age gate** (`minimumReleaseAgeExclude`):
-
-This should be rare. When a zero-day fix or critical dependency requires an immediate update:
-
-1. The exclusion must be reviewed and approved by a human maintainer
-2. The entry must pin the **exact version** being excluded — never a range or wildcard
-   ```yaml
-   minimumReleaseAgeExclude:
-     some-package: '1.2.3' # Approved by @user, 2026-04-14 — CVE-XXXX-YYYY fix
-   ```
-3. The exclusion should be removed once the version ages past the threshold (i.e. after 3 days)
-4. Automated agents (Claude, CI bots) must never add exclusions without human sign-off
+- exact Docker/runtime pins and committed pnpm/Bun/Graphify lockfiles;
+- unchanged build-script allowlists unless a human explicitly approves a new entry;
+- test, build, diff, and manual-merge gates;
+- separate host and container PRs because they have different activation and rollback boundaries;
+- Graphify patch, upstream source, skill hash, wheel hash, platform, and capability-ledger checks.
 
 ### Build Script Allowlist
 
-`onlyBuiltDependencies` restricts which packages can execute install/postinstall scripts. Only packages on this list are permitted to run build scripts during `pnpm install`. Currently allowed:
+`allowBuilds` restricts which packages can execute install/postinstall scripts. Only packages set to `true` in this map are permitted to run build scripts during `pnpm install`. Currently allowed:
 
 - `better-sqlite3` — compiles native SQLite bindings
 - `esbuild` — downloads platform-specific binary
 - `protobufjs` — generates protobuf bindings (used by Baileys/libsignal)
 - `sharp` — downloads platform-specific image processing binary
 
-Adding a package to this list requires human approval — build scripts execute arbitrary code with the installing user's permissions.
-
-### `.npmrc` Safety Net
-
-The `.npmrc` file contains `minReleaseAge=3d` as a fallback. The authoritative setting is in `pnpm-workspace.yaml`, but `.npmrc` provides defense-in-depth if npm is ever invoked directly (e.g. by a tool that doesn't respect pnpm).
+Adding or enabling a package in this map requires human approval — build scripts execute arbitrary code with the installing user's permissions. `minimumReleaseAge: 0` is explicit because pnpm 11 otherwise defaults to a one-day delay; the project relies on exact locks, hashes, review, and build-script approvals instead.

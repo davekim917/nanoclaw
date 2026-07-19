@@ -20,7 +20,7 @@
 # lets us pull the binary via COPY --from below while keeping the version
 # pinned via build-arg.
 ARG MCP_TOOLBOX_VERSION=1.6.0
-ARG PNPM_VERSION=10.33.4
+ARG PNPM_VERSION=10.33.0
 FROM us-central1-docker.pkg.dev/database-toolbox/toolbox/toolbox:${MCP_TOOLBOX_VERSION} AS mcp-toolbox-src
 
 # ---- rtk builder stage -------------------------------------------------------
@@ -56,6 +56,14 @@ ARG OPENCODE_VERSION=1.17.18
 ARG WIX_CLI_VERSION=1.1.226
 ARG DBT_MCP_VERSION=1.21.2
 ARG SLACK_MCP_VERSION=1.3.0
+ARG PIP_VERSION=26.1.2
+ARG SETUPTOOLS_VERSION=83.0.0
+ARG WHEEL_VERSION=0.47.0
+ARG SNOWFLAKE_CLI_VERSION=3.23.0
+ARG DBT_CORE_VERSION=1.12.0
+ARG DBT_SNOWFLAKE_VERSION=1.12.0
+ARG UV_VERSION=0.11.29
+ARG AWS_CLI_VERSION=2.36.2
 
 # ---- System dependencies -----------------------------------------------------
 # tini: correct PID 1 / signal forwarding so outbound.db writes finalize on
@@ -114,20 +122,20 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 #   /opt/snow-venv/bin/snow → /usr/local/bin/snow
 #   /opt/dbt-venv/bin/dbt → /usr/local/bin/dbt
 RUN python3 -m venv /opt/snow-venv \
-    && /opt/snow-venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel \
-    && /opt/snow-venv/bin/pip install --no-cache-dir snowflake-cli==3.22.0 \
+    && /opt/snow-venv/bin/pip install --no-cache-dir --upgrade "pip==${PIP_VERSION}" "setuptools==${SETUPTOOLS_VERSION}" "wheel==${WHEEL_VERSION}" \
+    && /opt/snow-venv/bin/pip install --no-cache-dir "snowflake-cli==${SNOWFLAKE_CLI_VERSION}" \
     && ln -sf /opt/snow-venv/bin/snow /usr/local/bin/snow
 
 RUN python3 -m venv /opt/dbt-venv \
-    && /opt/dbt-venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel \
-    && /opt/dbt-venv/bin/pip install --no-cache-dir dbt-core==1.11.12 dbt-snowflake==1.11.6 \
+    && /opt/dbt-venv/bin/pip install --no-cache-dir --upgrade "pip==${PIP_VERSION}" "setuptools==${SETUPTOOLS_VERSION}" "wheel==${WHEEL_VERSION}" \
+    && /opt/dbt-venv/bin/pip install --no-cache-dir "dbt-core==${DBT_CORE_VERSION}" "dbt-snowflake==${DBT_SNOWFLAKE_VERSION}" \
     && ln -sf /opt/dbt-venv/bin/dbt /usr/local/bin/dbt
 
 # sooperset/mcp-atlassian — stdio MCP server for Jira + Confluence (72 tools).
 # Isolated venv to avoid clashing with snow/dbt transitive deps.
 ARG MCP_ATLASSIAN_VERSION=0.22.1
 RUN python3 -m venv /opt/atlassian-venv \
-    && /opt/atlassian-venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel \
+    && /opt/atlassian-venv/bin/pip install --no-cache-dir --upgrade "pip==${PIP_VERSION}" "setuptools==${SETUPTOOLS_VERSION}" "wheel==${WHEEL_VERSION}" \
     && /opt/atlassian-venv/bin/pip install --no-cache-dir "mcp-atlassian==${MCP_ATLASSIAN_VERSION}" \
     && ln -sf /opt/atlassian-venv/bin/mcp-atlassian /usr/local/bin/mcp-atlassian
 
@@ -167,8 +175,8 @@ RUN ARCH=$(uname -m) \
 # dbt-mcp's deps. uv lives in its own venv to match the snow/dbt/atlassian
 # isolation pattern.
 RUN python3 -m venv /opt/uv-venv \
-    && /opt/uv-venv/bin/pip install --no-cache-dir --upgrade pip setuptools wheel \
-    && /opt/uv-venv/bin/pip install --no-cache-dir uv \
+    && /opt/uv-venv/bin/pip install --no-cache-dir --upgrade "pip==${PIP_VERSION}" "setuptools==${SETUPTOOLS_VERSION}" "wheel==${WHEEL_VERSION}" \
+    && /opt/uv-venv/bin/pip install --no-cache-dir "uv==${UV_VERSION}" \
     && ln -sf /opt/uv-venv/bin/uv /usr/local/bin/uv \
     && ln -sf /opt/uv-venv/bin/uvx /usr/local/bin/uvx \
     && UV_TOOL_DIR=/opt/uv-tools \
@@ -179,7 +187,7 @@ RUN python3 -m venv /opt/uv-venv \
 
 # AWS CLI v2 (isolated from pip to avoid version churn)
 RUN ARCH=$(uname -m) \
-    && curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-${ARCH}.zip" -o /tmp/awscli.zip \
+    && curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-${ARCH}-${AWS_CLI_VERSION}.zip" -o /tmp/awscli.zip \
     && unzip -q /tmp/awscli.zip -d /tmp \
     && /tmp/aws/install \
     && rm -rf /tmp/awscli.zip /tmp/aws
@@ -305,20 +313,17 @@ RUN --mount=type=cache,target=/root/.bun/install/cache \
 # Most stable first, most frequently bumped last. Bumping claude-code
 # (the most common change) only invalidates one layer.
 #
-# only-built-dependencies gates pnpm's supply-chain policy:
+# allowBuilds gates pnpm's supply-chain policy:
 #   - agent-browser has a postinstall build step.
 #   - @anthropic-ai/claude-code's postinstall downloads the native Claude
 #     binary (linux-arm64 variant on our image). Without the allowlist
 #     the SDK fails at spawn time with "native binary not found".
 ENV PNPM_HOME="/pnpm"
 ENV PATH="$PNPM_HOME:$PATH"
-# Pin pnpm to match the host (package.json packageManager). pnpm 11 stopped
-# honoring `only-built-dependencies[]=` in .npmrc for global installs, which
-# silently skips claude-code's native-binary postinstall and agent-browser's
-# bin chmod — the agent then crashes at runtime with "native binary not
-# installed". 10.x also avoids pnpm 11's `blockExoticSubdeps=true` default
-# which rejects some git-resolved transitive dependencies.
-# Keep this in lockstep with package.json's `packageManager`.
+# Pin pnpm to match the host (package.json packageManager). Build approvals are
+# deliberately written in both formats: pnpm 10 global installs still honor
+# the legacy .npmrc keys, while pnpm 11 removes those keys and reads the global
+# `allowBuilds` YAML setting. Keep this in lockstep with package.json.
 ARG PNPM_VERSION
 RUN corepack enable && corepack prepare pnpm@${PNPM_VERSION} --activate
 
@@ -332,6 +337,8 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
     echo "only-built-dependencies[]=@anthropic-ai/claude-code" >> /root/.npmrc && \
     echo "only-built-dependencies[]=@googleworkspace/cli" >> /root/.npmrc && \
     echo "only-built-dependencies[]=opencode-ai" >> /root/.npmrc && \
+    pnpm config set --global --json allowBuilds \
+        '{"agent-browser":true,"@anthropic-ai/claude-code":true,"@googleworkspace/cli":true,"opencode-ai":true}' && \
     pnpm install -g "vercel@${VERCEL_VERSION}"
 
 RUN --mount=type=cache,target=/root/.cache/pnpm \
@@ -364,11 +371,12 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
 # public. The audited wheelhouse remains private so the offline source contract
 # can be rerun against the finished image without dependency resolution.
 RUN python3 -m venv /opt/graphify
-COPY graphify-requirements.lock graphify-wheel-audit.json graphify-v0.9.16-nanoclaw.patch /opt/graphify/
+COPY graphify-requirements.lock graphify-wheel-audit.json graphify-integration.json graphify-nanoclaw.patch /opt/graphify/
 RUN chmod 0444 \
         /opt/graphify/graphify-requirements.lock \
         /opt/graphify/graphify-wheel-audit.json \
-        /opt/graphify/graphify-v0.9.16-nanoclaw.patch \
+        /opt/graphify/graphify-integration.json \
+        /opt/graphify/graphify-nanoclaw.patch \
     && mkdir -p /opt/graphify/wheelhouse \
     && /opt/graphify/bin/pip download \
         --require-hashes \
@@ -385,11 +393,11 @@ RUN chmod 0444 \
         -r /opt/graphify/graphify-requirements.lock \
     && SITE_PACKAGES="$(/opt/graphify/bin/python -c 'import site; print(site.getsitepackages()[0])')" \
     && cd "$SITE_PACKAGES" \
-    && git apply --check /opt/graphify/graphify-v0.9.16-nanoclaw.patch \
-    && git apply /opt/graphify/graphify-v0.9.16-nanoclaw.patch \
-    && ! git apply --check /opt/graphify/graphify-v0.9.16-nanoclaw.patch >/dev/null 2>&1 \
-    && git apply --reverse --check /opt/graphify/graphify-v0.9.16-nanoclaw.patch \
-    && /opt/graphify/bin/python -c 'from importlib.metadata import version; assert version("graphifyy") == "0.9.16"' \
+    && git apply --check /opt/graphify/graphify-nanoclaw.patch \
+    && git apply /opt/graphify/graphify-nanoclaw.patch \
+    && ! git apply --check /opt/graphify/graphify-nanoclaw.patch >/dev/null 2>&1 \
+    && git apply --reverse --check /opt/graphify/graphify-nanoclaw.patch \
+    && /opt/graphify/bin/python -c 'import json; from importlib.metadata import version; expected=json.load(open("/opt/graphify/graphify-integration.json"))["package"]["version"]; assert version("graphifyy") == expected' \
     && /opt/graphify/bin/pip freeze --local | tr '[:upper:]' '[:lower:]' | LC_ALL=C sort > /tmp/graphify-freeze \
     && grep -v '^#' /opt/graphify/graphify-requirements.lock | sed '/^[[:space:]]*$/d; s/ --hash=.*//' | tr '[:upper:]' '[:lower:]' | LC_ALL=C sort > /tmp/graphify-locked \
     && diff -u /tmp/graphify-locked /tmp/graphify-freeze \
@@ -409,9 +417,10 @@ RUN sed -i '1c#!/opt/graphify/bin/python' /usr/local/bin/graphify \
 # Run the exact Group A source contracts against the installed ARM64
 # environment. The upstream checkout and test copies are build-only; the
 # audited wheelhouse above remains for post-build offline verification.
-COPY graphify-gateway.py graphify-worker.py graphify-requirements.lock graphify-wheel-audit.json graphify-v0.9.16-nanoclaw.patch /tmp/graphify-build/container/
+COPY graphify-gateway.py graphify-worker.py graphify-requirements.lock graphify-wheel-audit.json graphify-integration.json graphify-nanoclaw.patch /tmp/graphify-build/container/
 COPY tests/test_graphify_gateway.py tests/test_graphify_worker.py tests/test_graphify_upstream_contract.py tests/test_graphify_supply_chain.py /tmp/graphify-build/container/tests/
-RUN git clone --quiet --depth 1 --branch v0.9.16 https://github.com/Graphify-Labs/graphify.git /tmp/graphify-design \
+RUN GRAPHIFY_TAG="$(jq -r '.upstream.tag' /opt/graphify/graphify-integration.json)" \
+    && git clone --quiet --depth 1 --branch "$GRAPHIFY_TAG" https://github.com/Graphify-Labs/graphify.git /tmp/graphify-design \
     && cd /tmp/graphify-build \
     && GRAPHIFY_WHEELHOUSE=/opt/graphify/wheelhouse /opt/graphify/bin/python -m unittest discover -s container/tests -p 'test_graphify_*.py' \
     && rm -rf /tmp/graphify-build /tmp/graphify-design

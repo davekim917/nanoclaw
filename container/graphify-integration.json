@@ -1,0 +1,87 @@
+{
+  "schemaVersion": 1,
+  "package": {
+    "name": "graphifyy",
+    "version": "0.9.20"
+  },
+  "upstream": {
+    "repo": "Graphify-Labs/graphify",
+    "tag": "v0.9.20",
+    "commit": "edec9eabeceeae6aa2375eddb3835efa1a32c0a3",
+    "skillPath": "graphify/skill.md",
+    "skillSha256": "1f150a12dc49d6e39c35f8a89f2a2819136a3edff8e95f1f214b6ef666d43c6b"
+  },
+  "patch": {
+    "path": "container/graphify-nanoclaw.patch",
+    "sha256": "75ff7712e918314d91d3af961e2644500e9c001f14e4d493335d294721a3252e"
+  },
+  "sourceSha256": {
+    "graphify/build.py": "e256a196064faf0dedd9e99d0963eef611702ca00b2bece9279827c997d50bca",
+    "graphify/cache.py": "653e5dd0f95b3f5e0add72d9c4e592f23e6b716ba04dc52b7cbd5ce4f0699c9a",
+    "graphify/cli.py": "d550adafd8f17002a4dfebe502aa6a25930c4023f6e2d3dd9d40e64744c00a02",
+    "graphify/detect.py": "e24b8a3b0be0519f4ac4bbf8c47b1c15b4a65608373814b90091d1d6d70baa0a",
+    "graphify/export.py": "511d297f346fea8135f2b52a013fe7475ab5f060a4a9999d7678a9a4d91464e5",
+    "graphify/extract.py": "8fec4f272c93d0b58aae40015b9fad37877cd49b8b2ab53f768d3a2b5c496961",
+    "graphify/extractors/base.py": "022d2a0466f9dead9d98ae832e2d04afff21a1e6936fc5397b571c74613b2ba2",
+    "graphify/extractors/engine.py": "07a0abd00e62af360119ac0f17545b32ff9cf06105f20fa8fa3eebb6dec76678",
+    "graphify/extractors/fortran.py": "8caf869d542e5c1fbd491ed35cca07d1f8505386083a47ef8dfa87482c83cf75",
+    "graphify/extractors/json_config.py": "d15ea6d9b48cc71e73615c44c72808562ad4a1dbc82d5a340e3ad0c2fb4fc945",
+    "graphify/extractors/models.py": "25f7abc6eec405e82c8dc22bd48f36ff061e6e52468f5b0172a4be8ec3ade7fd",
+    "graphify/extractors/resolution.py": "8a229d6a034b439ee64af2fd3e62fbaa8f6b2e0b319bdcd446bcab370b758f9e",
+    "graphify/manifest_ingest.py": "1f79a52f3c7f7a47d3a5006204bc00310c52d72c0b021200d9d5c477cbdc7f7f",
+    "graphify/mcp_ingest.py": "7553845a7cae7c310803bf37d992b695b27d21e1b827c1c33dbed2b15971be61"
+  },
+  "commands": [
+    "query",
+    "path",
+    "explain",
+    "affected"
+  ],
+  "capabilities": [
+    {
+      "id": "automatic-index-freshness",
+      "status": "implemented-differently",
+      "note": "NanoClaw refreshes before reads through its gateway."
+    },
+    {
+      "id": "resource-bounded-extraction",
+      "status": "implemented-differently",
+      "note": "NanoClaw uses a private worker with cgroup and tmpfs limits."
+    },
+    {
+      "id": "query",
+      "status": "adopted",
+      "note": "Exposed through the minimal container skill."
+    },
+    {
+      "id": "path",
+      "status": "adopted",
+      "note": "Exposed through the minimal container skill."
+    },
+    {
+      "id": "explain",
+      "status": "adopted",
+      "note": "Exposed through the minimal container skill."
+    },
+    {
+      "id": "affected",
+      "status": "adopted",
+      "note": "Exposed through the minimal container skill."
+    },
+    {
+      "id": "extract",
+      "status": "rejected",
+      "note": "Direct extraction bypasses freshness and resource policy."
+    },
+    {
+      "id": "watch",
+      "status": "rejected",
+      "note": "Long-running watchers conflict with per-session container isolation."
+    },
+    {
+      "id": "upstream-agent-skill",
+      "status": "implemented-differently",
+      "note": "Used as a drift signal; NanoClaw keeps a smaller policy-safe skill."
+    }
+  ]
+}

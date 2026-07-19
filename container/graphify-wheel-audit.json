@@ -1,16 +1,17 @@
 {
-  "uv_version": "uv 0.11.28",
+  "schemaVersion": 1,
+  "releasePolicy": "latest-stable",
+  "uv_version": "uv 0.11.28 (aarch64-unknown-linux-gnu)",
   "python_version": "3.11",
   "platform": "manylinux2014_aarch64",
-  "cutoff": "2026-07-15T16:36:30Z",
-  "generated_at": "2026-07-18T17:46:53Z",
+  "generated_at": "2026-07-19T15:43:42.705Z",
   "wheels": [
     {
       "package": "graphifyy",
-      "version": "0.9.16",
-      "filename": "graphifyy-0.9.16-py3-none-any.whl",
-      "sha256": "24eefd6cd8e0f47eb8167671fbe3aceb31b49a6508b91fe1b60c4fd1978e32bc",
-      "uploaded_at": "2026-07-14T23:03:35.446714Z"
+      "version": "0.9.20",
+      "filename": "graphifyy-0.9.20-py3-none-any.whl",
+      "sha256": "5dc067210e8003433c92343db0dd976e17b58956c0b9f27f91a84ae331b74e82",
+      "uploaded_at": "2026-07-18T21:29:51.388244Z"
     },
     {
       "package": "networkx",

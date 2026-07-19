@@ -1,7 +1,7 @@
 /**
  * Discord slash commands — administrative surface for managing nanoclaw:
  *   /deploy           — pull main, build, rebuild image if needed, restart
- *   /update-container — audit Dockerfile package drift, agent opens PR
+ *   /update-container — audit repository dependency drift, agent opens PRs
  *   /update-plugins   — git pull every ~/plugins/<name>
  *
  * Runs a dedicated discord.js Client parallel to @chat-adapter/discord's
@@ -17,11 +17,9 @@
  *
  * /update-container injects a synthetic chat message into the router
  * (routeInbound) carrying an audit prompt. The agent (running in a
- * container for the receiving messaging group) runs the audit, presents
- * the drift table, asks which packages to bump, clones the repo to a
- * writable temp dir, edits the Dockerfile, opens a PR, and stops. The
- * container-rebuild watcher picks up the PR on merge and rebuilds the
- * image automatically.
+ * container for the receiving messaging group) invokes the shared deterministic
+ * audit/apply CLI, asks which exact items to bump, and keeps host, container,
+ * and bootstrap changes in separate approval and activation boundaries.
  */
 import { spawn } from 'child_process';
 import fs from 'fs';
@@ -45,7 +43,7 @@ import { routeInbound } from '../router.js';
 
 const COMMANDS = [
   { name: 'deploy', description: 'Pull, build, and restart NanoClaw v2 from main' },
-  { name: 'update-container', description: 'Audit container package drift and open a bump PR' },
+  { name: 'update-container', description: 'Audit stable dependency drift and open reviewed PRs' },
   { name: 'update-plugins', description: 'Run git pull on all ~/plugins repos now' },
 ];
 
@@ -247,112 +245,33 @@ async function handleUpdatePlugins(interaction: ChatInputCommandInteraction): Pr
   }
 }
 
-const UPDATE_CONTAINER_PROMPT = [
-  'Run the container update audit.',
+export const UPDATE_CONTAINER_PROMPT = [
+  'Run the deterministic repository update audit with:',
+  '`bun /workspace/project/scripts/container-updates.ts audit --format json`',
   '',
-  '## Step 1 — Detect Dockerfile package drift',
-  'Read /workspace/project/container/Dockerfile and extract every package install. /workspace/project is READ-ONLY — you cannot edit it in place (see Step 4).',
-  '- npm/pnpm: lines in `npm install -g` or `pnpm install -g`. Both pinned (`pkg@x.y.z` or `pkg@${ARG}`) AND unpinned (no version) — report both.',
-  '- pip: lines in `pip install`. Both pinned (`pkg==x.y.z`) AND unpinned — report both.',
-  '- ARG: lines like `ARG PACKAGE_VERSION=x.y.z` (many pins in v2 are indirected via ARG — resolve to the package name by looking at which install line references the ARG).',
+  'Treat the JSON as the source of truth. Do not parse Dockerfiles, package manifests, registries, or upstream tables yourself.',
+  'If every item is current, reply with one concise no-op result and stop.',
+  'If any item is unknown or blocked, report the exact diagnostic; never call it current and never apply it.',
   '',
-  'For each PINNED package, check the latest available version:',
-  '- npm: `npm view <pkg> version`',
-  '- pip: `curl -s https://pypi.org/pypi/<pkg>/json | jq -r .info.version`',
-  '- GitHub release ARGs: `gh release view --repo <owner>/<repo> --json tagName -q .tagName` for RENDER_VERSION → render-oss/cli, RAILWAY_VERSION → railwayapp/cli, SUPABASE_VERSION → supabase/cli, MNEMON_VERSION → mnemon-dev/mnemon, RTK_VERSION → rtk-ai/rtk (built from source in the rtk-builder Dockerfile stage; `gh release view` returns the latest stable and skips the dev-*-rc pre-releases).',
+  'Present outdated items grouped by activation boundary:',
+  '- host: host package.json/pnpm-lock changes; these require the host deploy flow after manual merge.',
+  '- container: Docker pins, agent-runner Bun dependencies, and Graphify; these require an image rebuild after manual merge.',
+  '- bootstrap: Codex-synced files; these belong in a separate bootstrap-repository PR.',
+  'Latest stable includes major versions. Show the exact item IDs and ask which IDs to update. This is the approval gate; do not clone, edit, branch, commit, push, or open a PR before the user answers.',
   '',
-  'For each UNPINNED package, also check the latest version and report with status ❓ unpinned. These drift on every rebuild without attention.',
+  'After approval, create writable clones. Never edit /workspace/project in place.',
+  'Keep host and container changes in separate NanoClaw PRs because their activation and rollback boundaries differ. Keep bootstrap changes in a separate bootstrap PR.',
+  'In each NanoClaw clone, rerun the audit, then apply only the approved IDs:',
+  '`bun scripts/container-updates.ts apply --repo <clone> --items <comma-separated-ids>`',
+  'If Graphify reports patch or upstream-skill drift, stop and route it to a dedicated Graphify-review PR. Do not mix unclassified Graphify drift into a routine container bump.',
   '',
-  '## Step 1.5 — Detect agent-runner dependency drift',
-  'Read /workspace/project/container/agent-runner/package.json — both `dependencies` and `devDependencies`. The Dockerfile installs these via `bun install --frozen-lockfile`, so /workspace/project/container/agent-runner/bun.lock is the actual source of truth for what the container runs.',
-  '',
-  'For each dep:',
-  '- Locked version: read /workspace/project/container/agent-runner/bun.lock and find the line `"<pkg>": ["<pkg>@x.y.z", ...]` — extract the version from the `pkg@version` token.',
-  '- Latest version: `npm view <pkg> version`.',
-  '- Compare. If locked < latest, mark as ⬆️ outdated with Kind=bun-dep in the audit table.',
-  '',
-  'Specifically check these high-impact runtime deps every run, even if everything else looks fresh:',
-  '- `@anthropic-ai/claude-agent-sdk` — the SDK Claude Code uses inside containers. Patch drift here has historically broken MCP tool arg passing (incident 2026-05-20: schedule_task bailed after 0.2.116→0.2.138).',
-  '- `@modelcontextprotocol/sdk` — the MCP server library every tool registers against.',
-  '- `zod` — peer dep of the SDK; mismatched versions can corrupt schema validation.',
-  '',
-  'Note: `--frozen-lockfile` in container/Dockerfile (line ~300) means rebuilding the image alone WILL NOT pull dep patches — the lockfile must be bumped explicitly first (see Step 4 → Agent-runner dep bumps).',
-  '',
-  '## Step 2 — Detect upstream-synced file drift',
-  'Read /workspace/plugins/bootstrap/plugins/workflow/skills/team-qa/references/CODEX-SOURCES.md to find verbatim copies of files from openai/codex-plugin-cc and their pinned upstream commit SHAs (stored as 7-char prefixes).',
-  '',
-  'For each entry, fetch the latest upstream 7-char SHA:',
-  '`gh api "repos/openai/codex-plugin-cc/commits?path=<upstream-path>&per_page=1" --jq \'.[0].sha[0:7]\'`',
-  '',
-  'If it differs from the pinned SHA, the file has drifted.',
-  '',
-  '## Step 3 — Present a unified audit table',
-  '| Item | Kind | Current | Latest | Status |',
-  'Kind values: `dockerfile-pin` (pinned in Dockerfile), `dockerfile-unpinned` (no pin in Dockerfile), `bun-dep` (locked in container/agent-runner/bun.lock), `codex-sync` (verbatim copy from openai/codex-plugin-cc).',
-  'Status: ✅ up to date, ⬆️ outdated, ❓ unpinned.',
-  'Below the table, summarize: "N outdated (D dockerfile, B bun-deps, S codex-sync), M unpinned: <names>".',
-  'Then ask: "Update all, specific ones, or skip?" Group your prompt so the user can opt in/out of each kind separately (Dockerfile pins vs. bun deps vs. codex resync) — they have different blast radii.',
-  '',
-  '## Step 4 — Apply updates (after user confirms)',
-  '',
-  '### Dockerfile package bumps',
-  '/workspace/project is READ-ONLY. Clone the repo to a writable temp dir:',
-  '1. `rm -rf /tmp/nanoclaw-update && gh repo clone davekim917/nanoclaw /tmp/nanoclaw-update`',
-  '2. Edit /tmp/nanoclaw-update/container/Dockerfile in place — update the pinned ARGs / package versions. For ARG-indirected pins, bump the `ARG ...=x.y.z` line. For inline pins, bump `pkg@x.y.z`.',
-  '3. `cd /tmp/nanoclaw-update && git checkout -b chore/container-pins-$(date +%Y%m%d-%H%M)`',
-  '4. `git add container/Dockerfile && git commit -m "chore(container): bump <packages> to latest"`',
-  '5. `git push -u origin HEAD`',
-  '6. `gh pr create --repo davekim917/nanoclaw --base main --title "chore(container): bump <packages>" --body "..."` — the `--repo` flag is REQUIRED. Without it, `gh pr create` defaults to the fork\'s upstream parent (nanocoai/nanoclaw) and the PR lands on the wrong repo.',
-  '7. Verify the PR landed on the fork: `gh pr view <#> --repo davekim917/nanoclaw --json url -q .url` must print a URL under `github.com/davekim917/nanoclaw/`. If the command errors with "no pull requests found" or the URL is on a different repo, find where it actually landed (`gh search prs --owner nanocoai head:<branch>`), close it (`gh pr close <#> --repo <wrong-repo>`), and re-run step 6.',
-  '8. HOST PARITY (required whenever the bumped set includes `@openai/codex` / the `CODEX_VERSION` ARG): the host runs its own standalone Codex install that shares `~/.codex` with every container — version skew between them poisons the shared model-list cache (models_cache.json) and hides new models from the host picker. The PR body MUST end with this checklist so the merge reminder survives review:',
-  '   - [ ] Host parity — run on the host after merge: `curl -fsSL https://chatgpt.com/codex/install.sh | sh -s -- --release <new version>` then `mv ~/.codex/models_cache.json /tmp/`',
-  '9. STOP. Report the PR URL back to the chat (and repeat the host-parity line in chat if codex was bumped). Do NOT run `gh pr merge` — Dave reviews and merges manually via the GitHub UI.',
-  '',
-  "After Dave merges, the host's container-rebuild watcher (src/container-rebuild-watcher.ts) will detect the merge within ~60s, run `git pull && container/build.sh v2`, and post the rebuild result to Discord. No timer wait, no manual step.",
-  '',
-  '### Agent-runner dep bumps (bun.lock)',
-  'These bump the agent-container runtime deps that the Dockerfile installs via `--frozen-lockfile`. The lockfile MUST be regenerated on the host (or here in the temp clone) — rebuilding the image without a new lock is a no-op for deps.',
-  '1. `rm -rf /tmp/nanoclaw-update && gh repo clone davekim917/nanoclaw /tmp/nanoclaw-update` (or reuse the clone from the Dockerfile sub-section).',
-  '2. `cd /tmp/nanoclaw-update/container/agent-runner`',
-  '3. For each outdated dep: `bun update <pkg>` (stays within the existing caret range in package.json). If the latest is outside the caret and the user explicitly approved a major/minor bump, use `bun update --latest <pkg>` which will widen the caret in package.json too.',
-  '4. Verify the lock actually moved: `grep "@anthropic-ai/claude-agent-sdk:" bun.lock` (or whichever pkg) and confirm the new version matches what npm reported. If the lock did not change, ABORT and report — usually means the dep was already at the locked max for its caret and we need to edit package.json first.',
-  '5. `cd /tmp/nanoclaw-update && git checkout -b chore/agent-runner-deps-$(date +%Y%m%d-%H%M)` (or amend the Dockerfile branch if doing both in one PR — see "Combined PR" below).',
-  '6. `git add container/agent-runner/package.json container/agent-runner/bun.lock`',
-  '7. `git commit -m "chore(agent-runner): bump <packages> in bun.lock"`',
-  '8. `git push -u origin HEAD`',
-  '9. `gh pr create --repo davekim917/nanoclaw --base main --title "chore(agent-runner): bump <packages>" --body "..."` — same `--repo` requirement as the Dockerfile flow.',
-  '10. Verify the PR landed on the fork with `gh pr view <#> --repo davekim917/nanoclaw --json url -q .url`.',
-  '11. STOP. Report the PR URL. Do NOT run `gh pr merge`.',
-  '',
-  'Combined PR (preferred when both Dockerfile pins AND bun deps are outdated): use one branch and one PR with two commits — one for the Dockerfile, one for the bun lockfile. The host container-rebuild watcher rebuilds once on merge regardless of how many commits the PR has.',
-  '',
-  '### Upstream-synced file resync (Codex prompts/schemas)',
-  '/workspace/plugins/bootstrap is mounted READ-ONLY, so push via the upstream repo:',
-  '1. /workspace/plugins/codex is mounted with the latest pulled by nanoclaw-plugins-update.timer — read the new file content directly from there (e.g. /workspace/plugins/codex/plugins/codex/prompts/adversarial-review.md).',
-  '2. Get the new 7-char SHA: `gh api "repos/openai/codex-plugin-cc/commits?path=<path>&per_page=1" --jq \'.[0].sha[0:7]\'`',
-  '3. `rm -rf /tmp/bootstrap-update && gh repo clone davekim917/bootstrap /tmp/bootstrap-update`',
-  '4. Copy the new file content into /tmp/bootstrap-update/plugins/workflow/skills/team-qa/references/<local-name>',
-  '5. CRITICAL — verify the resynced file still contains all template placeholders ({{TARGET_LABEL}}, {{USER_FOCUS}}, {{REVIEW_INPUT}}). If any are missing, ABORT and report — Validator E depends on these markers.',
-  "6. Update the SHA pin row in CODEX-SOURCES.md to the new 7-char SHA and today's date.",
-  '7. Bump plugins/workflow/.claude-plugin/plugin.json `version` (patch bump for resync).',
-  '8. `cd /tmp/bootstrap-update && git checkout -b chore/codex-resync-$(date +%Y%m%d-%H%M)`',
-  '9. `git add -A && git commit -m "chore(team-qa): resync codex <files> to <short-sha>"`',
-  '10. `git push -u origin HEAD && gh pr create --repo davekim917/bootstrap --base main --title "..." --body "..."` — the `--repo` flag is REQUIRED. Without it, `gh pr create` defaults to the fork\'s upstream parent and the PR lands on the wrong repo.',
-  '11. Verify the PR landed on the fork: `gh pr view <#> --repo davekim917/bootstrap --json url -q .url` must print a URL under `github.com/davekim917/bootstrap/`. If the command errors with "no pull requests found" or the URL is on a different repo, find where it actually landed (`gh search prs --owner openai head:<branch>` or similar), close it (`gh pr close <#> --repo <wrong-repo>`), and re-run step 10.',
-  '12. STOP. Report the PR URL. Do NOT run `gh pr merge` — Dave reviews and merges. After merge, nanoclaw-plugins-update.timer pulls within the hour and the resync goes live.',
-  '',
-  '## Step 5 — Schema migration verification (if MNEMON_VERSION bumped)',
-  'Spin up a temp copy of one enabled mnemon store DB against the new binary,',
-  'run `mnemon status --store <store>` as a smoke query.',
-  'If it errors with schema incompatibility, ABORT the bump and report the diagnostic.',
-  'Gate the PR on this check passing.',
-  '',
-  '## Important notes',
-  '- Show diffs before committing each repo. Ask for explicit approval per repo.',
-  '- The two repos (nanoclaw + bootstrap) are independent — separate PRs, separate manual merges.',
-  '- If everything is up to date, say so in one line and stop. Do not create empty PRs.',
-  '- DO NOT run `gh pr merge` — merging is a manual human step.',
-  '- DO NOT run `./container/build.sh` from inside the container (you cannot run docker from inside a container, and the host watcher handles rebuild automatically post-merge).',
+  'Validate before publishing:',
+  '- host: `pnpm install --frozen-lockfile && pnpm run build && pnpm test`.',
+  '- container: `cd container/agent-runner && bun install --frozen-lockfile && bun test`, then from the repo root run `pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit` and the Graphify Python contracts when Graphify changed.',
+  '- Mnemon: when its version changes, smoke-test a copied store with the new binary and abort on schema incompatibility.',
+  '- Codex CLI: put the exact host-parity installation and models-cache reset command in the PR checklist.',
+  'Show the final diff before committing. Commit and push only the validated, approved files, open the PR against davekim917/nanoclaw (or davekim917/bootstrap), verify the PR URL is in the intended repository, then stop.',
+  'Never merge, deploy, restart services, or build Docker from inside the agent container.',
 ].join('\n');
 
 async function handleUpdateContainer(interaction: ChatInputCommandInteraction): Promise<void> {

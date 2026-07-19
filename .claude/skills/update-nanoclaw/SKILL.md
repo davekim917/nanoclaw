@@ -38,7 +38,7 @@ Run `/update-nanoclaw` in Claude Code.
 - **B. Container rebuild requirement** — flags when `container/`, `src/config.ts`, or `src/install-slug.ts` changes mean the built agent-container image is stale; the final restart is gated on this.
 - **C. Live migration preflight** — scans pending migrations against the real `data/v2.db` for `ALTER ... NOT NULL`, `DROP`, or destructive `UPDATE` that tests (scratch DB) miss.
 - **D. Env var drift** — finds `.env` keys no source file reads anymore and new required keys the user hasn't set.
-- **E. Supply-chain policy drift** — hard-fails if upstream silently added `minimumReleaseAgeExclude` or `onlyBuiltDependencies` entries.
+- **E. Supply-chain policy drift** — hard-fails if upstream silently reintroduces a release-age gate/exclusion or adds `onlyBuiltDependencies` entries.
 
 **Breaking changes check**: after the audit, reads CHANGELOG.md for any `[BREAKING]` entries introduced by the update. If found, shows each breaking change and offers to run the recommended skill to migrate.
 

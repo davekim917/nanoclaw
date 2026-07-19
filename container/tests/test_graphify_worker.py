@@ -299,14 +299,14 @@ class WorkerTest(unittest.TestCase):
         cache_hits = []
 
         def fake_extract(
-            paths, cache_root=None, *, source_root=None, parallel=True, max_workers=None
+            paths, cache_root=None, *, root=None, parallel=True, max_workers=None
         ):
             paths = [Path(path) for path in paths]
-            inferred_root = Path(source_root) if source_root is not None else Path(
+            inferred_root = Path(root) if root is not None else Path(
                 os.path.commonpath([str(path) for path in paths])
             )
             calls.append((inferred_root, Path(cache_root), parallel, max_workers))
-            cache_dir = Path(cache_root) / "graphify-out" / "cache" / "ast" / "v0.9.16"
+            cache_dir = Path(cache_root) / "graphify-out" / "cache" / "ast" / f"v{self.worker.GRAPHIFY_VERSION}"
             cache_dir.mkdir(parents=True, exist_ok=True)
             nodes = []
             for path in paths:
@@ -341,7 +341,7 @@ class WorkerTest(unittest.TestCase):
             sys.modules, {"graphify": graphify, "graphify.cache": graphify_cache}
         ):
             self.worker.extract_candidate(descriptor(source_one, outputs[0]))
-            seed = outputs[1] / "graphify-out" / "cache" / "ast" / "v0.9.16"
+            seed = outputs[1] / "graphify-out" / "cache" / "ast" / f"v{self.worker.GRAPHIFY_VERSION}"
             seed.parent.mkdir(parents=True, exist_ok=True)
             shutil.copytree(outputs[0] / "ast", seed)
             self.worker.extract_candidate(descriptor(source_two, outputs[1]))
@@ -371,14 +371,14 @@ class WorkerTest(unittest.TestCase):
         anchors = []
 
         def exact_patched_extract(
-            paths, cache_root=None, *, source_root=None, parallel=True, max_workers=None
+            paths, cache_root=None, *, root=None, parallel=True, max_workers=None
         ):
             paths = [Path(path) for path in paths]
-            anchor = Path(source_root) if source_root is not None else Path(
+            anchor = Path(root) if root is not None else Path(
                 os.path.commonpath([str(path) for path in paths])
             )
             anchors.append(anchor)
-            ast = Path(cache_root) / "graphify-out/cache/ast/v0.9.16"
+            ast = Path(cache_root) / f"graphify-out/cache/ast/v{self.worker.GRAPHIFY_VERSION}"
             ast.mkdir(parents=True, exist_ok=True)
             nodes = []
             for path in paths:

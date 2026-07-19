@@ -12,7 +12,7 @@ Host and container each have their own package tree:
 ```
 /                             pnpm + Node 22
   pnpm-lock.yaml              host deps (channels, Chat SDK, Baileys, better-sqlite3, etc.)
-  pnpm-workspace.yaml         minimumReleaseAge + onlyBuiltDependencies policy
+  pnpm-workspace.yaml         allowBuilds + latest-stable policy
 
 /container/agent-runner/      Bun 1.3+
   bun.lock                    agent-runner runtime deps (Claude Agent SDK, MCP SDK, zod, etc.)
@@ -25,17 +25,17 @@ The container image also has pnpm + Node inside for global CLIs (`@anthropic-ai/
 
 | Tree | Lockfile | Manager | Regenerate after dep change |
 |------|----------|---------|----------------------------|
-| Host | `pnpm-lock.yaml` | pnpm 10 | `pnpm install` |
+| Host | `pnpm-lock.yaml` | package.json-pinned pnpm | `pnpm install` |
 | Agent-runner | `container/agent-runner/bun.lock` | Bun 1.3+ | `cd container/agent-runner && bun install` |
-| Graphify | `container/graphify-requirements.lock` | pip, exact wheel hashes | Regenerate only with the recorded target, uv version, and cutoff in the lock/audit files |
+| Graphify | `container/graphify-requirements.lock` | uv + pip, exact wheel hashes | `bun scripts/update-graphify.ts --version <latest-stable>` |
 
 All are committed. CI and the Dockerfile run frozen/hash-locked install variants — any dependency drift fails the build.
 
 ## Supply chain
 
-- **Host + global CLIs** (pnpm): `minimumReleaseAge: 4320` (3-day hold on new versions), `onlyBuiltDependencies` allowlist for postinstall scripts. See `pnpm-workspace.yaml` and `docs/SECURITY.md`.
-- **Agent-runner** (Bun): no release-age policy — Bun doesn't have an equivalent today. The defenses are `bun.lock` pinning plus a version-pinned Bun itself via a Dockerfile ARG (global CLIs use their own exact Dockerfile ARGs). When bumping `@anthropic-ai/claude-agent-sdk` or any runtime dep, review the release date on npm and bump deliberately, not via `bun update`.
-- **Graphify** (Python): [`graphify-requirements.lock`](../container/graphify-requirements.lock) and [`graphify-wheel-audit.json`](../container/graphify-wheel-audit.json) define the complete Python 3.11/Linux ARM64, wheel-only closure. The image downloads with hashes, then installs offline with `--require-hashes --only-binary=:all: --no-deps`; no package range or source build is resolved during installation. [`graphify-v0.9.16-nanoclaw.patch`](../container/graphify-v0.9.16-nanoclaw.patch) applies once with exact-context and reverse-application checks.
+- **Host + global CLIs** (pnpm): latest stable releases, including majors, with committed manifests/lockfiles and the unchanged `allowBuilds` map. `minimumReleaseAge: 0` makes the no-delay policy explicit across pnpm 10 and 11. See `pnpm-workspace.yaml`, `docs/SECURITY.md`, and `docs/dependency-updates.md`.
+- **Agent-runner** (Bun): the same latest-stable policy, exact manifest declarations, and committed `bun.lock`. High-impact SDK majors still require review and the full container test lane.
+- **Graphify** (Python): [`graphify-integration.json`](../container/graphify-integration.json) is the canonical release/commit/patch/capability ledger. [`graphify-requirements.lock`](../container/graphify-requirements.lock) and [`graphify-wheel-audit.json`](../container/graphify-wheel-audit.json) define the complete Python 3.11/Linux ARM64, wheel-only closure without an age cutoff. The image downloads with hashes, then installs offline with `--require-hashes --only-binary=:all: --no-deps`; no package range or source build is resolved during installation. [`graphify-nanoclaw.patch`](../container/graphify-nanoclaw.patch) applies once with exact-context and reverse-application checks.
 
 ## Image build surface
 

@@ -19,7 +19,7 @@ quality_gates:
   - "host typecheck via tsc passes; container typecheck via bun run typecheck passes"
   - "vitest suite passes on host; bun:test passes inside container/agent-runner"
   - "no destructive operations on production session DBs without backup"
-  - "supply-chain hygiene: pnpm minimumReleaseAge: 4320 (3 days) preserved; no minimumReleaseAgeExclude additions without operator approval"
+  - "supply-chain hygiene: latest stable only; exact pins and regenerated lockfiles; deterministic audit/apply; no new build-script allowlist entries without operator approval"
 
 security_surface:
   - "credential injection via OneCLI proxy (containers must not see raw API keys)"

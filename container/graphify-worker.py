@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Private, resource-capped Graphify v0.9.16 extraction/query worker."""
+"""Private, resource-capped worker for the manifest-pinned Graphify release."""
 from __future__ import annotations
 
 from collections import deque
@@ -16,7 +16,24 @@ import time
 from typing import Any, Sequence
 
 
-GRAPHIFY_VERSION = "0.9.16"
+def _load_integration_manifest() -> dict:
+    candidates = [
+        Path(__file__).with_name("graphify-integration.json"),
+        Path("/opt/graphify/graphify-integration.json"),
+    ]
+    for candidate in candidates:
+        try:
+            payload = json.loads(candidate.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            continue
+        if payload.get("schemaVersion") != 1:
+            raise RuntimeError(f"unsupported Graphify integration manifest: {candidate}")
+        return payload
+    raise RuntimeError("Graphify integration manifest not found")
+
+
+GRAPHIFY_INTEGRATION = _load_integration_manifest()
+GRAPHIFY_VERSION = GRAPHIFY_INTEGRATION["package"]["version"]
 MAX_ADDRESS_SPACE = 1024 * 1024 * 1024
 MAX_FILE_BYTES = 64 * 1024 * 1024
 MAX_INPUT_BYTES = 64 * 1024 * 1024
@@ -233,7 +250,7 @@ def _intentional_data_json(relative: str, content: bytes) -> bool:
     if path.suffix.lower() != ".json":
         return False
     if len(content) > 1_048_576:
-        raise WorkerValidationError(f"JSON source exceeds v0.9.16 extractor limit: {relative}")
+        raise WorkerValidationError(f"JSON source exceeds pinned Graphify extractor limit: {relative}")
     try:
         value = json.loads(content)
     except (UnicodeError, json.JSONDecodeError) as exc:
@@ -520,7 +537,7 @@ def _normalize_extracted_graph(
     intentional_paths: Sequence[str],
     verified_assets: set[str] | frozenset[str] = frozenset(),
 ) -> dict:
-    """Reconcile only pinned v0.9.16 unresolved-edge shapes, fail closed otherwise."""
+    """Reconcile only manifest-pinned unresolved-edge shapes, fail closed otherwise."""
     expected = set(expected_paths)
     intentional = set(intentional_paths)
     applicable = expected - intentional
@@ -1074,7 +1091,7 @@ def extract_candidate(descriptor: dict) -> ExtractionStatus:
         result = extract(
             paths,
             cache_root=output_root,
-            source_root=source_root,
+            root=source_root,
             parallel=False,
             max_workers=1,
         )

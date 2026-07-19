@@ -15,29 +15,17 @@ from unittest import mock
 
 
 UPSTREAM = Path("/tmp/graphify-design")
-TAG = "v0.9.16"
-PATCH = Path(__file__).parents[1] / "graphify-v0.9.16-nanoclaw.patch"
+INTEGRATION_PATH = Path(__file__).parents[1] / "graphify-integration.json"
+INTEGRATION = json.loads(INTEGRATION_PATH.read_text(encoding="utf-8"))
+TAG = INTEGRATION["upstream"]["tag"]
+VERSION = INTEGRATION["package"]["version"]
+PATCH = Path(__file__).parents[2] / INTEGRATION["patch"]["path"]
 GATEWAY = Path(__file__).parents[1] / "graphify-gateway.py"
 
-PINNED_SHA256 = {
-    "graphify/detect.py": "d8ef6da01605a1a561c0a2ce0f7b118336eb78ad230fa300927675fef9ea0638",
-    "graphify/extract.py": "6773dfb69a70a74ee951fd93f4819c77131a3a78a36bb7e90888f821480cd8d5",
-    "graphify/build.py": "b17307b91523651d67297b34d32243592c76058c31dc6cbdb70b108ef94e249c",
-    "graphify/cache.py": "aa4642f85cc9e8db04d55f07d97eb8c3e820999c5921751c822c7f973d908fcb",
-    "graphify/extractors/base.py": "022d2a0466f9dead9d98ae832e2d04afff21a1e6936fc5397b571c74613b2ba2",
-    "graphify/extractors/engine.py": "858b4d6d0b7f864c3358efb0bc1d085800973cf6a7bed87817ab07e4ed865697",
-    "graphify/extractors/models.py": "6f4c1180bb4eff19a3df24742d6f686e6c787d51f05f702b5e2f86af4dd550f9",
-    "graphify/extractors/resolution.py": "75031e42090994a75b6ac9abc8ca5baf102de62184df0df016c1731da9b460db",
-    "graphify/extractors/json_config.py": "d15ea6d9b48cc71e73615c44c72808562ad4a1dbc82d5a340e3ad0c2fb4fc945",
-    "graphify/extractors/fortran.py": "8caf869d542e5c1fbd491ed35cca07d1f8505386083a47ef8dfa87482c83cf75",
-    "graphify/export.py": "5ad339b97c3954ab26cab97322741215e27b6b3885138c6fa36b1057ac2d73ce",
-    "graphify/manifest_ingest.py": "1f79a52f3c7f7a47d3a5006204bc00310c52d72c0b021200d9d5c477cbdc7f7f",
-    "graphify/cli.py": "94bb40726b283145aec3f550e5e815270c2dfbef03393224b08a98b71244a6cc",
-    "graphify/mcp_ingest.py": "7553845a7cae7c310803bf37d992b695b27d21e1b827c1c33dbed2b15971be61",
-}
+PINNED_SHA256 = INTEGRATION["sourceSha256"]
 
 PINNED_DISPATCH = frozenset({
-    '.py', '.js', '.jsx', '.mjs', '.ts', '.tsx', '.mts', '.cts', '.go', '.rs',
+    '.py', '.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx', '.mts', '.cts', '.go', '.rs',
     '.java', '.groovy', '.gradle', '.c', '.h', '.cpp', '.cc', '.cxx', '.hpp',
     '.cu', '.cuh', '.metal', '.rb', '.rake', '.cs', '.kt', '.kts', '.scala',
     '.php', '.swift', '.lua', '.luau', '.toc', '.zig', '.ps1', '.psm1', '.psd1',
@@ -47,7 +35,7 @@ PINNED_DISPATCH = frozenset({
     '.dpk', '.lpr', '.inc', '.dfm', '.lfm', '.lpk', '.sh', '.bash', '.json',
     '.tf', '.tfvars', '.hcl', '.dm', '.dme', '.dmi', '.dmm', '.dmf', '.sln',
     '.slnx', '.csproj', '.fsproj', '.vbproj', '.xaml', '.razor', '.cshtml',
-    '.cls', '.trigger',
+    '.cls', '.trigger', '.skill',
 })
 
 
@@ -80,7 +68,19 @@ class UpstreamContractTest(unittest.TestCase):
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(show(relative), encoding="utf-8")
 
-    def test_patch_applies_exactly_once_to_v0916(self):
+    def test_manifest_patch_and_upstream_identity_are_exact(self):
+        self.assertEqual(hashlib.sha256(PATCH.read_bytes()).hexdigest(), INTEGRATION["patch"]["sha256"])
+        commit = subprocess.run(
+            ["git", "rev-parse", f"{TAG}^{{commit}}"], cwd=UPSTREAM,
+            check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        self.assertEqual(commit, INTEGRATION["upstream"]["commit"])
+        skill = show(INTEGRATION["upstream"]["skillPath"])
+        self.assertEqual(hashlib.sha256(skill.encode()).hexdigest(), INTEGRATION["upstream"]["skillSha256"])
+        allowed = {"adopted", "implemented-differently", "deferred", "rejected"}
+        self.assertTrue(INTEGRATION["capabilities"])
+        self.assertTrue(all(item["status"] in allowed and item["note"] for item in INTEGRATION["capabilities"]))
+
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             self._materialize(root)
@@ -95,15 +95,22 @@ class UpstreamContractTest(unittest.TestCase):
             reverse = subprocess.run(["git", "apply", "--reverse", "--check", str(PATCH)], cwd=root, capture_output=True, text=True)
             self.assertNotEqual(reverse.returncode, 0)
 
+    def test_agent_environment_cannot_override_the_integration_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            hostile = Path(tmp) / "hostile.json"
+            hostile.write_text(json.dumps({"schemaVersion": 1, "package": {"version": "999.0.0"}}))
+            with mock.patch.dict(os.environ, {"NANOCLAW_GRAPHIFY_MANIFEST": str(hostile)}):
+                gateway = load_gateway()
+            self.assertEqual(gateway.GRAPHIFY_VERSION, VERSION)
+
     def test_sequential_patch_removes_required_task_creation(self):
         text = PATCH.read_text(encoding="utf-8")
         self.assertEqual(text.count("NANOCLAW_GRAPHIFY_SEQUENTIAL"), 2)
         self.assertIn('parallel = False', text)
         self.assertIn('raw = map(_stat_and_hash, all_files)', text)
-        self.assertIn('-    if cache_root is not None:', text)
-        self.assertIn('+    source_root: Path | None = None,', text)
-        self.assertIn('+    if source_root is not None:', text)
-        self.assertIn('source path escapes explicit source_root', text)
+        self.assertIn('+    if anchor_root is not None:', text)
+        self.assertIn('source path escapes explicit root', text)
+        self.assertNotIn('+    source_root:', text)
         self.assertEqual(text.count("diff --git"), 4)
         self.assertIn("type_colliding_callables", text)
         self.assertIn("callable_symbol_nodes", text)
@@ -133,7 +140,8 @@ class UpstreamContractTest(unittest.TestCase):
         cache = sources["graphify/cache.py"]
         self.assertIn("h.update(content)", cache)
         self.assertIn('h.update(b"\\x00")', cache)
-        self.assertIn("h.update(rel.as_posix().lower().encode())", cache)
+        self.assertIn("salt = resolved.relative_to(Path(root).resolve()).as_posix().lower()", cache)
+        self.assertIn("h.update(salt.encode())", cache)
         json_source = sources["graphify/extractors/json_config.py"]
         self.assertIn('"skipped": "data json (not a config/manifest)"', json_source)
         self.assertIn('"skipped": "data json (non-object root)"', json_source)
@@ -174,12 +182,12 @@ class UpstreamContractTest(unittest.TestCase):
             )
             self.assertEqual(
                 [argument.arg for argument in function.args.kwonlyargs],
-                ["source_root", "parallel", "max_workers"],
+                ["root", "parallel", "max_workers"],
             )
 
             # Execute the exact patched function until its first cache lookup.
-            # This proves the NanoClaw-only source anchor remains separate from
-            # the external cache location and is part of the pinned signature.
+            # This proves upstream's explicit source anchor remains separate
+            # from the external cache location and is part of the pinned signature.
             executable = ast.Module(
                 body=[ast.ImportFrom(
                     module="__future__", names=[ast.alias(name="annotations", asname=None)], level=0
@@ -221,22 +229,22 @@ class UpstreamContractTest(unittest.TestCase):
                     namespace["extract"](
                         [checkout_one / "one/service.py", checkout_one / "two/service.py"],
                         cache_root=external,
-                        source_root=checkout_one,
+                        root=checkout_one,
                         parallel=False,
                         max_workers=1,
                     )
             self.assertEqual(captured[0][1:], (checkout_one, external.resolve()))
             with mock.patch.dict(os.environ, {"NANOCLAW_GRAPHIFY_SEQUENTIAL": "1"}):
-                with self.assertRaisesRegex(ValueError, "escapes explicit source_root"):
+                with self.assertRaisesRegex(ValueError, "escapes explicit root"):
                     namespace["extract"](
                         [checkout_one / "one/service.py"],
                         cache_root=external,
-                        source_root=checkout_two,
+                        root=checkout_two,
                         parallel=False,
                         max_workers=1,
                     )
 
-            # Exercise v0.9.16's real cache implementation: identical content
+            # Exercise the pinned upstream cache implementation: identical content
             # at duplicate basenames receives distinct relative-path keys, and
             # the same external cache re-anchors cleanly in another checkout.
             package = types.ModuleType("graphify")
@@ -251,7 +259,7 @@ class UpstreamContractTest(unittest.TestCase):
                 "graphify.cache": cache_module,
             }):
                 exec(compile(show("graphify/cache.py"), "graphify/cache.py", "exec"), cache_module.__dict__)
-                cache_module._EXTRACTOR_VERSION = "0.9.16"
+                cache_module._EXTRACTOR_VERSION = VERSION
                 for relative in ("one/service.py", "two/service.py"):
                     source = checkout_one / relative
                     payload = {
@@ -259,7 +267,7 @@ class UpstreamContractTest(unittest.TestCase):
                         "edges": [],
                     }
                     cache_module.save_cached(source, payload, checkout_one, cache_root=external)
-                entries = sorted((external / "graphify-out/cache/ast/v0.9.16").glob("*.json"))
+                entries = sorted((external / f"graphify-out/cache/ast/v{VERSION}").glob("*.json"))
                 self.assertEqual(len(entries), 2)
                 stored_sources = sorted(
                     json.loads(entry.read_text())["nodes"][0]["source_file"] for entry in entries
@@ -334,7 +342,7 @@ from graphify.extract import extract
 
 root = Path('/fixture')
 def run(cache):
-    result = extract(sorted(root.glob('*.ts')), cache_root=Path(cache), source_root=root, parallel=False, max_workers=1)
+    result = extract(sorted(root.glob('*.ts')), cache_root=Path(cache), root=root, parallel=False, max_workers=1)
     return json.loads(json.dumps(result, sort_keys=True, separators=(',', ':')))
 first = run('/tmp/first')
 second = run('/tmp/second')

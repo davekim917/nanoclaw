@@ -170,14 +170,14 @@ Cross-check each new env ref against `.env`; flag anything required that isn't s
 
 ## E. Supply-chain policy drift
 
-Per CLAUDE.md's Supply Chain Security section: `minimumReleaseAgeExclude` and `onlyBuiltDependencies` additions require explicit human sign-off. Merging upstream MUST NOT silently accept new entries.
+Per CLAUDE.md's Supply Chain Security section, release-age gates are retired. `onlyBuiltDependencies` additions still require explicit human sign-off, and upstream must not silently reintroduce an age delay or exclusion mechanism.
 
 ```bash
 git diff $BACKUP..HEAD -- pnpm-workspace.yaml package.json \
-  | grep -E '^\+' | grep -E 'minimumReleaseAgeExclude|onlyBuiltDependencies|"[a-z].*@[0-9]' | head -20
+  | grep -E '^\+' | grep -E 'minimumReleaseAge|minimumReleaseAgeExclude|onlyBuiltDependencies|"[a-z].*@[0-9]' | head -20
 ```
 
-Any added entry under either key → BLOCK. Ask via AskUserQuestion, one question per added entry:
+Any added age-policy key or build-script allowlist entry → BLOCK. Ask via AskUserQuestion, one question per entry:
 
 - "Approve — I reviewed this specific version and accept"
 - "Revert this entry" → drop the line via an Edit, amend the merge commit (or add a follow-up commit)

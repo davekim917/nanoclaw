@@ -1,0 +1,43 @@
+{
+  "schemaVersion": 1,
+  "dockerfile": [
+    { "id": "mcp-toolbox", "name": "Google MCP Toolbox", "arg": "MCP_TOOLBOX_VERSION", "source": { "kind": "github", "repo": "googleapis/genai-toolbox" } },
+    { "id": "pnpm", "name": "pnpm", "arg": "PNPM_VERSION", "source": { "kind": "npm", "package": "pnpm" }, "mirrors": [{ "file": "package.json", "jsonPath": ["packageManager"], "format": "pnpm@{version}" }] },
+    { "id": "rtk", "name": "RTK", "arg": "RTK_VERSION", "source": { "kind": "github", "repo": "rtk-ai/rtk" } },
+    { "id": "claude-code", "name": "Claude Code", "arg": "CLAUDE_CODE_VERSION", "source": { "kind": "npm", "package": "@anthropic-ai/claude-code" } },
+    { "id": "agent-browser", "name": "agent-browser", "arg": "AGENT_BROWSER_VERSION", "source": { "kind": "npm", "package": "agent-browser" } },
+    { "id": "vercel", "name": "Vercel CLI", "arg": "VERCEL_VERSION", "source": { "kind": "npm", "package": "vercel" } },
+    { "id": "bun", "name": "Bun", "arg": "BUN_VERSION", "source": { "kind": "github", "repo": "oven-sh/bun" } },
+    { "id": "mermaid-cli", "name": "Mermaid CLI", "arg": "MMDC_VERSION", "source": { "kind": "npm", "package": "@mermaid-js/mermaid-cli" } },
+    { "id": "google-workspace-cli", "name": "Google Workspace CLI", "arg": "GWS_VERSION", "source": { "kind": "npm", "package": "@googleworkspace/cli" } },
+    { "id": "codex", "name": "Codex CLI", "arg": "CODEX_VERSION", "source": { "kind": "npm", "package": "@openai/codex" } },
+    { "id": "opencode", "name": "OpenCode", "arg": "OPENCODE_VERSION", "source": { "kind": "npm", "package": "opencode-ai" } },
+    { "id": "wix-cli", "name": "Wix CLI", "arg": "WIX_CLI_VERSION", "source": { "kind": "npm", "package": "@wix/cli" } },
+    { "id": "dbt-mcp", "name": "dbt MCP", "arg": "DBT_MCP_VERSION", "source": { "kind": "pypi", "package": "dbt-mcp" } },
+    { "id": "slack-mcp", "name": "Slack MCP", "arg": "SLACK_MCP_VERSION", "source": { "kind": "github", "repo": "korotovsky/slack-mcp-server" } },
+    { "id": "pip", "name": "pip", "arg": "PIP_VERSION", "source": { "kind": "pypi", "package": "pip" } },
+    { "id": "setuptools", "name": "setuptools", "arg": "SETUPTOOLS_VERSION", "source": { "kind": "pypi", "package": "setuptools" } },
+    { "id": "wheel", "name": "wheel", "arg": "WHEEL_VERSION", "source": { "kind": "pypi", "package": "wheel" } },
+    { "id": "snowflake-cli", "name": "Snowflake CLI", "arg": "SNOWFLAKE_CLI_VERSION", "source": { "kind": "pypi", "package": "snowflake-cli" } },
+    { "id": "dbt-core", "name": "dbt Core", "arg": "DBT_CORE_VERSION", "source": { "kind": "pypi", "package": "dbt-core" } },
+    { "id": "dbt-snowflake", "name": "dbt Snowflake", "arg": "DBT_SNOWFLAKE_VERSION", "source": { "kind": "pypi", "package": "dbt-snowflake" } },
+    { "id": "uv", "name": "uv", "arg": "UV_VERSION", "source": { "kind": "pypi", "package": "uv" } },
+    { "id": "aws-cli", "name": "AWS CLI v2", "arg": "AWS_CLI_VERSION", "source": { "kind": "github-tags", "repo": "aws/aws-cli" } },
+    { "id": "mcp-atlassian", "name": "MCP Atlassian", "arg": "MCP_ATLASSIAN_VERSION", "source": { "kind": "pypi", "package": "mcp-atlassian" } },
+    { "id": "render", "name": "Render CLI", "arg": "RENDER_VERSION", "source": { "kind": "github", "repo": "render-oss/cli" } },
+    { "id": "railway", "name": "Railway CLI", "arg": "RAILWAY_VERSION", "source": { "kind": "github", "repo": "railwayapp/cli" } },
+    { "id": "supabase", "name": "Supabase CLI", "arg": "SUPABASE_VERSION", "source": { "kind": "github", "repo": "supabase/cli" } },
+    { "id": "mnemon", "name": "Mnemon", "arg": "MNEMON_VERSION", "source": { "kind": "github", "repo": "mnemon-dev/mnemon" }, "checksums": [
+      { "arg": "MNEMON_SHA256_arm64", "url": "https://github.com/mnemon-dev/mnemon/releases/download/v{version}/checksums.txt", "filename": "mnemon_{version}_linux_arm64.tar.gz" },
+      { "arg": "MNEMON_SHA256_amd64", "url": "https://github.com/mnemon-dev/mnemon/releases/download/v{version}/checksums.txt", "filename": "mnemon_{version}_linux_amd64.tar.gz" }
+    ] },
+    { "id": "hex-cli", "name": "Hex CLI", "arg": "HEX_CLI_VERSION", "source": { "kind": "github", "repo": "hex-inc/hex-cli" }, "checksums": [
+      { "arg": "HEX_CLI_SHA256_arm64", "url": "https://github.com/hex-inc/hex-cli/releases/download/v{version}/hex-aarch64-unknown-linux-gnu.tar.xz.sha256" },
+      { "arg": "HEX_CLI_SHA256_amd64", "url": "https://github.com/hex-inc/hex-cli/releases/download/v{version}/hex-x86_64-unknown-linux-gnu.tar.xz.sha256" }
+    ] }
+  ],
+  "codex": {
+    "repo": "openai/codex-plugin-cc",
+    "sourcesFile": "/workspace/plugins/bootstrap/plugins/workflow/skills/team-qa/references/CODEX-SOURCES.md"
+  }
+}

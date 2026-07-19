@@ -27,8 +27,25 @@ import time
 from typing import Callable, Iterator, Sequence
 
 
-GRAPHIFY_VERSION = "0.9.16"
-PUBLIC_VERSION = "nanoclaw-graphify 0.9.16"
+def _load_integration_manifest() -> dict:
+    candidates = [
+        Path(__file__).with_name("graphify-integration.json"),
+        Path("/opt/graphify/graphify-integration.json"),
+    ]
+    for candidate in candidates:
+        try:
+            payload = json.loads(candidate.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            continue
+        if payload.get("schemaVersion") != 1:
+            raise RuntimeError(f"unsupported Graphify integration manifest: {candidate}")
+        return payload
+    raise RuntimeError("Graphify integration manifest not found")
+
+
+GRAPHIFY_INTEGRATION = _load_integration_manifest()
+GRAPHIFY_VERSION = GRAPHIFY_INTEGRATION["package"]["version"]
+PUBLIC_VERSION = f"nanoclaw-graphify {GRAPHIFY_VERSION}"
 WORKTREE_ROOT = Path("/workspace/worktrees")
 CACHE_BASE = Path("/workspace/.cache/graphify")
 SOURCE_STAGE_ROOT = Path("/workspace/.graphify-stage")
@@ -62,11 +79,11 @@ WORKER_RESERVE_BYTES = 1024 * 1024 * 1024
 OUTPUT_RESERVE_BYTES = 384 * 1024 * 1024
 RUNNER_RESERVE_BYTES = 512 * 1024 * 1024
 
-# Exact graphify/detect.py v0.9.16 CODE_EXTENSIONS.  Keep the case-sensitive
+# Exact pinned-upstream graphify/detect.py CODE_EXTENSIONS. Keep the case-sensitive
 # spellings: capital-F Fortran is detected and then policy-rejected because its
 # upstream extractor shells out to cpp.
 CODE_EXTENSIONS = frozenset({
-    '.py', '.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.ejs', '.ets',
+    '.py', '.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs', '.ejs', '.ets',
     '.go', '.rs', '.java', '.groovy', '.gradle', '.cpp', '.cc', '.cxx', '.c',
     '.h', '.hpp', '.cu', '.cuh', '.metal', '.rb', '.rake', '.swift', '.kt',
     '.kts', '.cs', '.scala', '.php', '.lua', '.luau', '.toc', '.zig', '.ps1',
@@ -79,7 +96,7 @@ CODE_EXTENSIONS = frozenset({
     '.cshtml', '.cls', '.trigger',
 })
 
-# The v0.9.16 in-process dispatch.  Deliberately excludes .r (detected but no
+# The pinned-upstream in-process dispatch. Deliberately excludes .r (detected but no
 # extractor), ambiguous MATLAB .m (checked by the worker), and capital-F forms.
 IN_PROCESS_EXTENSIONS = frozenset(
     CODE_EXTENSIONS - {'.ejs', '.ets', '.r', '.F', '.F90', '.F95', '.F03', '.F08'}

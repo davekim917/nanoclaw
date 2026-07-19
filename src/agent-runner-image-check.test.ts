@@ -1,11 +1,17 @@
 import { describe, it, expect } from 'vitest';
 import { execFileSync } from 'child_process';
 import { createHash } from 'crypto';
+import { readFileSync } from 'fs';
 import { readFile } from 'fs/promises';
 import * as path from 'path';
 
 import { checkAgentRunnerDepsDrift, computeAgentRunnerDepsHash } from './agent-runner-image-check.js';
 import { CONTAINER_IMAGE, REPO_ROOT } from './config.js';
+
+const GRAPHIFY_INTEGRATION = JSON.parse(
+  readFileSync(path.join(REPO_ROOT, 'container/graphify-integration.json'), 'utf8'),
+) as { package: { version: string }; patch: { path: string }; upstream: { tag: string } };
+const GRAPHIFY_VERSION = GRAPHIFY_INTEGRATION.package.version;
 
 describe('computeAgentRunnerDepsHash', () => {
   it('matches sha256(sha256(package.json) || sha256(bun.lock)) sliced to 16 chars', async () => {
@@ -116,13 +122,14 @@ describe('agent runner image Graphify runtime', () => {
 
     expect(dockerfile).toContain('python3 -m venv /opt/graphify');
     expect(dockerfile).toContain('COPY graphify-requirements.lock graphify-wheel-audit.json');
-    expect(dockerfile).toContain('graphify-v0.9.16-nanoclaw.patch');
+    expect(dockerfile).toContain('graphify-integration.json graphify-nanoclaw.patch');
     expect(dockerfile).toContain('--require-hashes');
     expect(dockerfile).toContain('--only-binary=:all:');
     expect(dockerfile).toContain('--no-deps');
     expect(dockerfile).toContain('--no-index');
     expect(dockerfile).toContain('git apply --check');
-    expect(dockerfile).toContain('git apply /opt/graphify/graphify-v0.9.16-nanoclaw.patch');
+    expect(dockerfile).toContain('git apply /opt/graphify/graphify-nanoclaw.patch');
+    expect(dockerfile).toContain("jq -r '.upstream.tag' /opt/graphify/graphify-integration.json");
     expect(dockerfile).toContain('COPY graphify-gateway.py /usr/local/bin/graphify');
     expect(dockerfile).toContain('COPY graphify-worker.py /opt/graphify/graphify-worker.py');
     expect(dockerfile).toContain('rm -f /opt/graphify/bin/graphify');
@@ -178,7 +185,7 @@ graphify --version >/tmp/graphify-version
 grep -q 'query TEXT' /tmp/graphify-help
 cmp /tmp/graphify-help /tmp/graphify-query-help
 cmp /tmp/graphify-help /tmp/graphify-path-help
-grep -q '^nanoclaw-graphify 0.9.16$' /tmp/graphify-version
+grep -q '^nanoclaw-graphify ${GRAPHIFY_VERSION}$' /tmp/graphify-version
 test ! -e /workspace/.cache/graphify
 test ! -e /workspace/.graphify-stage
 test ! -e /run/nanoclaw-graphify
@@ -249,7 +256,7 @@ for suffix in ('one', 'two'):
     root = base / f'source-{suffix}'
     descriptor = {
         'operation': 'extract',
-        'graphify_version': '0.9.16',
+        'graphify_version': '${GRAPHIFY_VERSION}',
         'source_root': str(root),
         'output_root': str(base / f'out-{suffix}'),
         'files': [item(root, 'one/service.py'), item(root, 'two/service.py')],
@@ -260,8 +267,8 @@ for suffix in ('one', 'two'):
 PY
 
 /opt/graphify/bin/python /opt/graphify/graphify-worker.py /tmp/graphify-real/extract-one.json >/tmp/graphify-real/extract-one.out 2>/tmp/graphify-real/extract-one.err
-mkdir -p /tmp/graphify-real/out-two/graphify-out/cache/ast/v0.9.16
-cp -a /tmp/graphify-real/out-one/ast/. /tmp/graphify-real/out-two/graphify-out/cache/ast/v0.9.16/
+mkdir -p /tmp/graphify-real/out-two/graphify-out/cache/ast/v${GRAPHIFY_VERSION}
+cp -a /tmp/graphify-real/out-one/ast/. /tmp/graphify-real/out-two/graphify-out/cache/ast/v${GRAPHIFY_VERSION}/
 /opt/graphify/bin/python /opt/graphify/graphify-worker.py /tmp/graphify-real/extract-two.json >/tmp/graphify-real/extract-two.out 2>/tmp/graphify-real/extract-two.err
 
 /opt/graphify/bin/python - <<'PY'
@@ -277,7 +284,7 @@ assert sorted(p.name for p in (base / 'out-one' / 'ast').glob('*.json')) == sort
     p.name for p in (base / 'out-two' / 'ast').glob('*.json')
 )
 query = {
-    'operation': 'query', 'graphify_version': '0.9.16',
+    'operation': 'query', 'graphify_version': '${GRAPHIFY_VERSION}',
     'graph': str(base / 'out-two' / 'graph.json'),
     'command': 'query', 'arguments': ['service'],
     'limits': {'address_space_bytes': 1073741824, 'file_bytes': 67108864, 'process_count': 0},

@@ -275,11 +275,12 @@ Two rules, no exceptions:
 
 ## Supply Chain Security (pnpm)
 
-This project uses pnpm with `minimumReleaseAge: 4320` (3 days) in `pnpm-workspace.yaml`. New package versions must exist on the npm registry for 3 days before pnpm will resolve them.
+This project intentionally tracks the latest stable releases, including majors. Prerelease, beta, RC, dev, nightly, draft, yanked, source-only, and target-incompatible releases are rejected. There is no release-age delay.
 
 **Rules — do not bypass without explicit human approval:**
-- **`minimumReleaseAgeExclude`**: Never add entries without human sign-off. If a package must bypass the release age gate, the human must approve and the entry must pin the exact version being excluded (e.g. `package@1.2.3`), never a range.
-- **`onlyBuiltDependencies`**: Never add packages to this list without human approval — build scripts execute arbitrary code during install.
+- **Deterministic updates**: Audit with `bun scripts/container-updates.ts audit`; apply only explicitly approved item IDs in a writable clone. Weekly automation is advisory and never opens, merges, or deploys PRs.
+- **Exact resolution**: Commit package manifests with their regenerated lockfiles; Docker/runtime tools stay exact-pinned. Registry failure is `unknown`, never "current."
+- **`allowBuilds`**: Never add or enable packages in this map without human approval — build scripts execute arbitrary code during install.
 - **`pnpm install --frozen-lockfile`** should be used in CI, automation, and container builds. Never run bare `pnpm install` in those contexts.
 
 ## Docs Index
@@ -317,7 +318,7 @@ The agent container runs on **Bun**; the host runs on **Node** (pnpm). They comm
 **Gotchas — trigger + action:**
 
 - **Adding or bumping a runtime dep in `container/agent-runner/`** → edit `package.json`, then `cd container/agent-runner && bun install` and commit the updated `bun.lock`. Do not run `pnpm install` there — agent-runner is not a pnpm workspace.
-- **Bumping `@anthropic-ai/claude-agent-sdk`, `@modelcontextprotocol/sdk`, or any agent-runner runtime dep** → no `minimumReleaseAge` policy applies to this tree. Check the release date on npm, pin deliberately, never `bun update` blindly.
+- **Bumping `@anthropic-ai/claude-agent-sdk`, `@modelcontextprotocol/sdk`, or any agent-runner runtime dep** → use the shared latest-stable audit/apply flow, review majors deliberately, and commit the regenerated `bun.lock`; never run `bun update` blindly.
 - **Writing a new named-param SQL insert/update in the container** → use `$name` in both SQL and JS keys: `.run({ $id: msg.id })`. `bun:sqlite` does not auto-strip the prefix the way `better-sqlite3` does on the host. Positional `?` params work normally.
 - **Adding a test in `container/agent-runner/src/`** → import from `bun:test`, not `vitest`. Vitest runs on Node and can't load `bun:sqlite`. `vitest.config.ts` excludes this tree.
 - **Adding a Node CLI the agent invokes at runtime** (like `agent-browser`, `claude-code`, `vercel`) → put it in the Dockerfile's pnpm global-install block, pinned to an exact version via a new `ARG`. Don't use `bun install -g` — that bypasses the pnpm supply-chain policy.

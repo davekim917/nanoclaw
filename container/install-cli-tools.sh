@@ -8,17 +8,20 @@
 # Every tool is installed via `pnpm install -g`, pinned to an exact version, so
 # the pnpm supply-chain policy still applies. Tools with a native postinstall
 # set "onlyBuilt": true to opt in to running build scripts (pnpm skips them by
-# default). Run as root before `USER node`, so /root/.npmrc is the right home.
+# default). Run as root before `USER node`, so the global pnpm config is root's.
 set -eu
 
 MANIFEST="${1:-/tmp/cli-tools.json}"
 
-# Write the per-tool only-built-dependencies opt-ins pnpm reads at install time.
-node -e '
+# Write both approval formats: pnpm 10 global installs still read the legacy
+# .npmrc keys; pnpm 11 reads the global allowBuilds YAML map.
+ALLOW_BUILDS="$(node -e '
   const tools = require(process.argv[1]);
   const optIns = tools.filter((t) => t.onlyBuilt).map((t) => "only-built-dependencies[]=" + t.name);
   require("fs").writeFileSync("/root/.npmrc", optIns.join("\n") + (optIns.length ? "\n" : ""));
-' "$MANIFEST"
+  console.log(JSON.stringify(Object.fromEntries(tools.filter((t) => t.onlyBuilt).map((t) => [t.name, true]))));
+' "$MANIFEST")"
+pnpm config set --global --json allowBuilds "$ALLOW_BUILDS"
 
 # Install every tool, pinned. name@version specs never contain spaces, so the
 # unquoted expansion word-splits cleanly into positional args.
