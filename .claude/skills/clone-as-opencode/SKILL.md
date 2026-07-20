@@ -1,6 +1,6 @@
 ---
 name: clone-as-opencode
-description: Create an OpenCode-backed sibling agent for an existing Claude or Codex group. The sibling shares the source group's CLAUDE.md, repos, sources, conversations, and mnemon store via symlinks + scoped-env. Cross-agent collaboration happens via standard platform `@`-mentions — requires installing a second bot app for the sibling so each agent has its own real bot user. Works on Slack and Discord. Targets OpenCode Go / Zen via OAuth-issued API key.
+description: Create an OpenCode-backed sibling agent for an existing Claude or Codex group. The sibling joins the source workgroup and shares its CLAUDE.md, repos, sources, conversations, and Graphify graph. Cross-agent collaboration happens via standard platform `@`-mentions — requires installing a second bot app for the sibling so each agent has its own real bot user. Works on Slack and Discord. Targets OpenCode Go / Zen via OAuth-issued API key.
 ---
 
 # Clone Group As OpenCode Sibling
@@ -10,9 +10,9 @@ Create `groups/<source>-opencode/` from `groups/<source>/`. The opencode sibling
 - **CLAUDE.md** — regenerated per-group by composeGroupClaudeMd on every spawn (do NOT symlink — the composer overwrites it).
 - **CLAUDE.local.md** — symlinked to the source's CLAUDE.local.md when present, so both siblings share per-group memory.
 - **Repos** — symlinked top-level dirs that contain `.git/`.
-- **sources/** — mnemon inbox; both agents feed the same memory.
+- **sources/** — ordinary knowledge files; Graphify indexes changes automatically for the workgroup.
 - **conversations/** — transcript archive; both agents see each other's archived turns.
-- **mnemon store** — scoped-env override (`MNEMON_STORE_<SIBLING>=<source-ag-id>`) routes both writers to the same store.
+- **Graphify graph** — `workgroup_id` routes all siblings to the same code-and-knowledge graph while keeping other workgroups isolated.
 - **Thread worktree** — when `NANOCLAW_THREAD_WORKTREES=1`, both siblings in the same platform thread mount the same `data/v2-threads/<thread-id>/worktrees/<repo>/` host path. Uncommitted edits flow across.
 
 > Under workgroup shared-FS (`data/workgroups/<wg>/.migrated` present), the **Repos / sources / conversations** links point at the container-absolute `/workspace/workgroup/<name>` mount instead of `../<source>/` — Step 4 detects the mode and reproduces exactly what `reconcileWorkgroupSharedDirs` already did for the existing siblings. **CLAUDE.local.md** stays a relative link in both modes (it's a loose file, never migrated).
@@ -64,7 +64,7 @@ SOURCE_FOLDER=<source-folder>             # e.g. illysium
 SOURCE_ID=$(pnpm exec tsx scripts/q.ts data/v2.db "select id from agent_groups where folder='${SOURCE_FOLDER}'" | tr -d '\n')
 test -n "${SOURCE_ID}" || { echo "ERROR: source group '${SOURCE_FOLDER}' not found"; exit 1; }
 # Workgroup the sibling must JOIN — the SOURCE's workgroup, not the sibling's
-# own folder. This is what grants shared chat-archive, mnemon store, and
+# own folder. This is what grants shared chat-archive, Graphify graph, and
 # workgroup-level OneCLI secrets. For a primary source it equals the folder;
 # clone from a codex sibling and it still resolves to the shared workgroup.
 SOURCE_WORKGROUP=$(pnpm exec tsx scripts/q.ts data/v2.db "select coalesce(workgroup_id, folder) from agent_groups where folder='${SOURCE_FOLDER}'" | tr -d '\n')
@@ -220,7 +220,6 @@ jq --arg folder "${SIBLING_FOLDER}" --arg src "${SOURCE_FOLDER}" '
   | .assistantName = $folder
   | .agentGroupId = $folder
   | .credentialFolder = $src
-  | .gitnexusInjectAgentsMd = true
   | .memory = { "enabled": true }
 ' groups/${SOURCE_FOLDER}/container.json > /tmp/cj-sibling.json && \
   mv /tmp/cj-sibling.json groups/${SIBLING_FOLDER}/container.json
@@ -231,7 +230,7 @@ diff <(jq -S "$DEL" groups/${SOURCE_FOLDER}/container.json) \
      <(jq -S "$DEL" groups/${SIBLING_FOLDER}/container.json) && echo "  ✅ parity clean" || true
 ```
 
-**Why `credentialFolder`**: container-runner's per-group credential lookups (LOOKER_*, DBT_*, GITHUB_TOKEN_*, RENDER_PG_*, GIT_AUTHOR_*, Snowflake, etc.) key on `<BASE>_<FOLDER_UPPER>`. Without this field a sibling folder like `madison-reed-opencode` would look for `LOOKER_BASE_URL_MADISON_REED_OPENCODE`, which doesn't exist. `credentialFolder` redirects credential lookups to the source folder; identity-bound paths (container name, group dir mount, MNEMON_STORE override, OpenCode auth dir) stay on the sibling's own folder.
+**Why `credentialFolder`**: container-runner's per-group credential lookups (LOOKER_*, DBT_*, GITHUB_TOKEN_*, RENDER_PG_*, GIT_AUTHOR_*, Snowflake, etc.) key on `<BASE>_<FOLDER_UPPER>`. Without this field a sibling folder like `madison-reed-opencode` would look for `LOOKER_BASE_URL_MADISON_REED_OPENCODE`, which doesn't exist. `credentialFolder` redirects credential lookups to the source folder; identity-bound paths (container name, group dir mount, OpenCode auth dir) stay on the sibling's own folder.
 
 **Note: no `opencodeHostAuth` field** — the host-side opencode provider (`src/providers/opencode.ts`) always copies the per-group `auth.json` into the per-session XDG dir; there's no opt-in gate like `codexHostAuth`.
 
@@ -240,7 +239,7 @@ diff <(jq -S "$DEL" groups/${SOURCE_FOLDER}/container.json) \
 OpenCode auth.json lives at `~/.local/share/opencode/auth.json` by default. The host-side provider (`resolveOpenCodeSourceDir`) prefers a scoped `~/.local/share/opencode-<sibling-folder>/auth.json` when present, falling back to the global one. To put this sibling on its own OpenCode subscription (separate billing, separate model limits), create the scoped dir and login into it:
 
 ```bash
-# OpenCode CLI must be installed on the host (pnpm i -g opencode-ai@1.15.7).
+# OpenCode CLI must be installed on the host (pnpm i -g opencode-ai@1.17.18).
 # Verify: opencode --version
 
 # Run login under a throwaway XDG_DATA_HOME so any existing global
@@ -261,19 +260,7 @@ ls -la ~/.local/share/opencode-${SIBLING_FOLDER}/auth.json
 
 To share one OpenCode account across all opencode siblings instead, skip this step entirely — the host falls back to the global `~/.local/share/opencode/auth.json`.
 
-### 6b. Scoped MNEMON_STORE override — OPTIONAL (legacy escape-hatch)
-
-**Skip this for normal siblings.** `workgroup_id` on the `agent_groups` row (step 7) already routes both mnemon recall and writes to the workgroup's shared store — `resolveMnemonStore`'s DB path (`container-runner.ts:295`) joins through `workgroups.mnemon_store_id`, and `recall_scope` defaults to `'workgroup'`. The env override wins over that DB resolution (`container-runner.ts:276`), so a stale one creates **split-brain memory** if `workgroups.mnemon_store_id` ever changes without also editing `.env`. Live codex and opencode siblings run with NO override.
-
-Set this **only** to force a store *different* from the workgroup's canonical one (rare):
-
-```bash
-# Optional — usually unnecessary; workgroup_id (step 7) handles routing.
-ENV_KEY=MNEMON_STORE_$(echo "${SIBLING_FOLDER}" | tr 'a-z-' 'A-Z_')
-echo "${ENV_KEY}=${SOURCE_ID}" >> .env   # only to override the workgroup's shared store
-```
-
-### 6c. OpenCode model selection
+### 6b. OpenCode model selection
 
 Model/effort config follows the same template as claude/codex: a **code-level
 default** is the floor, the **per-group DB value** (`container_configs`, set via
@@ -329,7 +316,7 @@ it updates dynamically. Examples: `opencode-go/kimi-k2.7-code`,
 
 `agent_groups.created_at` is `NOT NULL` with no default.
 
-**`workgroup_id` is the load-bearing field.** It places the sibling in the SAME workgroup as its source + codex sibling, which is what grants shared chat-archive visibility, mnemon recall fan-out, and workgroup-level OneCLI-secret inheritance. It lives on the `agent_groups` row, NOT in `container.json` (matching how migration 036 set up the codex siblings — `reconcileWorkgroupAtSpawn` reads the DB value, and `recall_scope` defaults to `'workgroup'` whenever it is set; putting it in container.json instead would trip the parity-check since `workgroup_id` is not a sibling-bound field). Omitting it here is the bug that isolated the first opencode sibling (`illysium-opencode`) into its own workgroup-of-one: migration 036 only auto-pairs the `-codex` suffix, never `-opencode`.
+**`workgroup_id` is the load-bearing field.** It places the sibling in the SAME workgroup as its source + codex sibling, which grants shared chat-archive and Graphify visibility plus workgroup-level OneCLI-secret inheritance. It lives on the `agent_groups` row, NOT in `container.json` (matching how migration 036 set up the codex siblings; `reconcileWorkgroupAtSpawn` reads the DB value, and putting it in container.json instead would trip the parity-check since `workgroup_id` is not a sibling-bound field). Omitting it here is the bug that isolated the first opencode sibling (`illysium-opencode`) into its own workgroup-of-one: migration 036 only auto-pairs the `-codex` suffix, never `-opencode`.
 
 `agent_groups.name` should match `id` and `folder` — the workspace convention (`<source>-opencode`), NOT the Slack/Discord bot display name. The bot display name is platform-side (configured at api.slack.com/apps or the Discord dev portal) and is purely how chat users see the avatar; mixing the two leaves the dashboard with inconsistent groupings.
 
@@ -523,6 +510,16 @@ Expected: a path under `/pnpm` or `/usr/local/bin`, followed by an
 `agent-browser` version. Failure means the sibling is not at capability parity;
 rebuild/fix the image or remove the custom `imageTag` before shipping.
 
+**Check E - sibling resolves the source workgroup's Graphify graph:**
+
+```bash
+ncl graphify status --group "${SIBLING_ID}" --json \
+  | jq -e --arg workgroup "${SOURCE_WORKGROUP}" '.data.workgroupId == $workgroup'
+```
+
+Expected: `true`. This proves retrieval is workgroup-scoped for the sibling;
+an isolated workgroup id is a failed clone even when chat delivery works.
+
 > **Note on rebuilds:** an agent-runner *source* change (e.g. fixing the provider
 > config) does **not** need `./container/build.sh` — `container/agent-runner/src`
 > is bind-mounted read-only into the container, so a respawn (`ncl groups restart`
@@ -628,12 +625,10 @@ rm -rf groups/${SIBLING_FOLDER}
 rm -rf ~/.local/share/opencode-${SIBLING_FOLDER}
 
 # Drop env entries.
-ENV_KEY=MNEMON_STORE_$(echo "${SIBLING_FOLDER}" | tr 'a-z-' 'A-Z_')
 FOLDER_UPPER=$(echo "${SIBLING_FOLDER}" | tr 'a-z-' 'A-Z_')
 
 # Slack sibling:
 sed -i.bak \
-  -e "/^${ENV_KEY}=/d" \
   -e "/^SLACK_BOT_TOKEN_${ENV_SUFFIX}=/d" \
   -e "/^SLACK_SIGNING_SECRET_${ENV_SUFFIX}=/d" \
   -e "/^OPENCODE_PROVIDER_${FOLDER_UPPER}=/d" \
@@ -644,7 +639,6 @@ sed -i.bak \
 
 # Discord sibling (alternative — drop these lines instead of the SLACK_* ones):
 sed -i.bak \
-  -e "/^${ENV_KEY}=/d" \
   -e "/^DISCORD_BOT_TOKEN_${ENV_SUFFIX}=/d" \
   -e "/^DISCORD_APPLICATION_ID_${ENV_SUFFIX}=/d" \
   -e "/^DISCORD_PUBLIC_KEY_${ENV_SUFFIX}=/d" \
@@ -669,7 +663,7 @@ Optionally, uninstall the sibling's bot app from the platform.
 - The opencode container reads MCP server config from `mcpServers` in container.json (and any merged in via `NANOCLAW_MCP_SERVERS`), which the runtime translates to OpenCode's `mcp` config field via `mcpServersToOpenCodeConfig`.
 - The host opencode provider copies `auth.json` from the per-sibling scoped dir on every spawn. Session state (opencode.db) stays per-session in `<sessionDir>/opencode-xdg/opencode/`; only the auth token is shared.
 - Worktrees are thread-scoped when `NANOCLAW_THREAD_WORKTREES=1`. Concurrent git ops across siblings share standard `.git/index.lock` semantics; turn-taking via `@`-mentions mitigates by design.
-- **opencode-ai 1.15.7 is pinned** in `container/Dockerfile`. Bump deliberately (not `bun update`) and re-run `bun test src/providers/` after — the SDK type surface has been stable through 1.15.x, but rebase carefully if you jump multiple majors.
+- **opencode-ai 1.17.18 is pinned** in `container/Dockerfile` and `@opencode-ai/sdk` matches it exactly. Bump both deliberately (not `bun update`) and re-run `bun test src/providers/` after.
 
 ### Notes on cross-sibling auth and OpenCode plan choice
 

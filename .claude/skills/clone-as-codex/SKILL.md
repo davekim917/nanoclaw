@@ -1,6 +1,6 @@
 ---
 name: clone-as-codex
-description: Create a Codex-backed sibling agent for an existing Claude group. The sibling shares the source group's CLAUDE.md, repos, sources, conversations, and mnemon store via symlinks + scoped-env. Cross-agent collaboration happens via standard platform `@`-mentions — requires installing a second bot app for the sibling so each agent has its own real bot user. Works on Slack and Discord.
+description: Create a Codex-backed sibling agent for an existing Claude group. The sibling joins the source workgroup and shares its CLAUDE.md, repos, sources, conversations, and Graphify graph. Cross-agent collaboration happens via standard platform `@`-mentions — requires installing a second bot app for the sibling so each agent has its own real bot user. Works on Slack and Discord.
 ---
 
 # Clone Group As Codex Sibling
@@ -10,9 +10,9 @@ Create `groups/<source>-codex/` from `groups/<source>/`. The codex sibling share
 - **CLAUDE.md** — regenerated per-group by composeGroupClaudeMd on every spawn (do NOT symlink — the composer overwrites it); AGENTS.md flat-include is derived from it for Codex.
 - **CLAUDE.local.md** — symlinked to the source's CLAUDE.local.md when present, so both siblings share per-group memory (consulting context, project notes, etc.).
 - **Repos** — symlinked top-level dirs that contain `.git/`.
-- **sources/** — mnemon inbox; both agents feed the same memory.
+- **sources/** — ordinary knowledge files; Graphify indexes changes automatically for the workgroup.
 - **conversations/** — transcript archive; both agents see each other's archived turns.
-- **mnemon store** — scoped-env override (`MNEMON_STORE_<sibling>=<source-ag-id>`) routes both writers to the same store.
+- **Graphify graph** — `workgroup_id` routes both siblings to the same code-and-knowledge graph while keeping other workgroups isolated.
 - **Thread worktree** — when `NANOCLAW_THREAD_WORKTREES=1`, both siblings in the same platform thread mount the same `data/v2-threads/<thread-id>/worktrees/<repo>/` host path. Uncommitted edits flow across.
 
 > Under workgroup shared-FS (`data/workgroups/<wg>/.migrated` present), the **Repos / sources / conversations** links point at the container-absolute `/workspace/workgroup/<name>` mount instead of `../<source>/` — Step 4 detects the mode and reproduces exactly what `reconcileWorkgroupSharedDirs` already did for the existing siblings. **CLAUDE.local.md** stays a relative link in both modes (it's a loose file, never migrated).
@@ -65,7 +65,7 @@ SOURCE_FOLDER=<source-folder>             # e.g. illysium
 SOURCE_ID=$(pnpm exec tsx scripts/q.ts data/v2.db "select id from agent_groups where folder='${SOURCE_FOLDER}'" | tr -d '\n')
 test -n "${SOURCE_ID}" || { echo "ERROR: source group '${SOURCE_FOLDER}' not found"; exit 1; }
 # Workgroup the sibling must JOIN — the SOURCE's workgroup, not the sibling's
-# own folder. This is what grants shared chat-archive, mnemon store, and
+# own folder. This is what grants shared chat-archive, Graphify graph, and
 # workgroup-level OneCLI secrets. For a primary source it equals the folder;
 # clone from another sibling and it still resolves to the shared workgroup.
 SOURCE_WORKGROUP=$(pnpm exec tsx scripts/q.ts data/v2.db "select coalesce(workgroup_id, folder) from agent_groups where folder='${SOURCE_FOLDER}'" | tr -d '\n')
@@ -230,7 +230,6 @@ jq --arg folder "${SIBLING_FOLDER}" --arg src "${SOURCE_FOLDER}" '
   | .assistantName = $folder
   | .agentGroupId = $folder
   | .credentialFolder = $src
-  | .gitnexusInjectAgentsMd = true
   | .memory = { "enabled": true }
   | .codexHostAuth = true
 ' groups/${SOURCE_FOLDER}/container.json > /tmp/cj-sibling.json && \
@@ -249,12 +248,12 @@ sibling folder like `madison-reed-codex` would look for
 `LOOKER_BASE_URL_MADISON_REED_CODEX`, which doesn't exist — leaving the
 codex sibling stripped of every per-group credential. `credentialFolder`
 redirects ONLY the credential lookups to the source folder; identity-bound
-paths (container name, group dir mount, MNEMON_STORE override) stay on
+paths (container name and group dir mount) stay on
 the sibling's own folder. The Codex auth dir lookup (~/.codex-<folder>/)
 also stays on the sibling's folder so per-sibling Codex accounts work
 correctly.
 
-### 6a. Per-group Codex account (optional — skip for shared account)
+### 6. Per-group Codex account (optional — skip for shared account)
 
 By default, every codex-provider container mounts the host's primary `~/.codex/` (single OpenAI/ChatGPT account shared across groups). To run this sibling on a **different OpenAI account** — e.g., a client's MR-codex account distinct from your personal one — create a scoped `~/.codex-<sibling-folder>/` dir on the host:
 
@@ -272,23 +271,11 @@ CODEX_HOME=~/.codex-${SIBLING_FOLDER} codex login
 
 Mirrors the per-group OAuth pattern Claude already uses via scoped `CLAUDE_CODE_OAUTH_TOKEN_<FOLDER>` env vars (see `resolveAnthropicAuth`).
 
-### 6. Scoped MNEMON_STORE override — OPTIONAL (legacy escape-hatch)
-
-**Skip this for normal siblings.** `workgroup_id` on the `agent_groups` row (step 7) already routes both mnemon recall and writes to the workgroup's shared store — `resolveMnemonStore`'s DB path (`container-runner.ts:295`) joins through `workgroups.mnemon_store_id`, and `recall_scope` defaults to `'workgroup'`. The env override wins over that DB resolution (`container-runner.ts:276`), so a stale one creates **split-brain memory** if `workgroups.mnemon_store_id` ever changes without also editing `.env`. Live codex and opencode siblings run with NO override.
-
-Set this **only** to force a store *different* from the workgroup's canonical one (rare):
-
-```bash
-# Optional — usually unnecessary; workgroup_id (step 7) handles routing.
-ENV_KEY=MNEMON_STORE_$(echo "${SIBLING_FOLDER}" | tr 'a-z-' 'A-Z_')
-echo "${ENV_KEY}=${SOURCE_ID}" >> .env   # only to override the workgroup's shared store
-```
-
 ### 7. Insert the agent_groups row
 
 `agent_groups.created_at` is `NOT NULL` with no default.
 
-**`workgroup_id` is the load-bearing field.** It places the sibling in the SAME workgroup as its source, granting shared chat-archive visibility, mnemon recall fan-out, and workgroup-level OneCLI-secret inheritance. It lives on the `agent_groups` row, NOT in `container.json` (`reconcileWorkgroupAtSpawn` reads the DB value, and `recall_scope` defaults to `'workgroup'` whenever it is set; putting it in container.json would trip the parity-check since `workgroup_id` is not a sibling-bound field). Migration 036 auto-paired the codex siblings that pre-dated it — but it has already run and won't re-run, so a codex sibling created TODAY without this column is isolated in its own workgroup-of-one.
+**`workgroup_id` is the load-bearing field.** It places the sibling in the SAME workgroup as its source, granting shared chat-archive and Graphify visibility plus workgroup-level OneCLI-secret inheritance. It lives on the `agent_groups` row, NOT in `container.json` (`reconcileWorkgroupAtSpawn` reads the DB value; putting it in container.json would trip the parity-check since `workgroup_id` is not a sibling-bound field). Migration 036 auto-paired the codex siblings that pre-dated it — but it has already run and won't re-run, so a codex sibling created TODAY without this column is isolated in its own workgroup-of-one.
 
 `agent_groups.name` should match `id` and `folder` — the workspace
 convention (`<source>-codex`), NOT the Slack/Discord bot display name.
@@ -482,6 +469,16 @@ Expected: a path under `/pnpm` or `/usr/local/bin`, followed by an
 `agent-browser` version. Failure means the sibling is not at capability parity;
 rebuild/fix the image or remove the custom `imageTag` before shipping.
 
+**Check D - sibling resolves the source workgroup's Graphify graph:**
+
+```bash
+ncl graphify status --group "${SIBLING_ID}" --json \
+  | jq -e --arg workgroup "${SOURCE_WORKGROUP}" '.data.workgroupId == $workgroup'
+```
+
+Expected: `true`. This proves retrieval is workgroup-scoped for the sibling;
+an isolated workgroup id is a failed clone even when chat delivery works.
+
 > **Note on rebuilds:** an agent-runner *source* change does **not** need
 > `./container/build.sh` — `container/agent-runner/src` is bind-mounted read-only
 > into the container, so a respawn (`ncl groups restart` or host restart) reloads
@@ -589,17 +586,14 @@ pnpm exec tsx scripts/q.ts data/v2.db "delete from agent_groups where id='${SIBL
 rm -rf groups/${SIBLING_FOLDER}
 
 # Drop env entries — run ONE of these blocks depending on your channel.
-ENV_KEY=MNEMON_STORE_$(echo "${SIBLING_FOLDER}" | tr 'a-z-' 'A-Z_')
 
 # Slack sibling:
 sed -i.bak \
-  -e "/^${ENV_KEY}=/d" \
   -e "/^SLACK_BOT_TOKEN_${ENV_SUFFIX}=/d" \
   -e "/^SLACK_SIGNING_SECRET_${ENV_SUFFIX}=/d" .env
 
 # Discord sibling (alternative — drop these lines instead of the SLACK_* ones):
 sed -i.bak \
-  -e "/^${ENV_KEY}=/d" \
   -e "/^DISCORD_BOT_TOKEN_${ENV_SUFFIX}=/d" \
   -e "/^DISCORD_APPLICATION_ID_${ENV_SUFFIX}=/d" \
   -e "/^DISCORD_PUBLIC_KEY_${ENV_SUFFIX}=/d" .env
@@ -664,7 +658,7 @@ The three providers (Claude, Codex, OpenCode) are **one team that must be at com
 
 The Claude-as-canonical / Codex-as-sibling split is just symlink direction + `messaging_group_agents` rows. Three escape hatches if the Claude Max subscription gets squeezed:
 
-- **Drop Claude side**: delete the source's `messaging_group_agents` rows; the codex sibling stays wired to the same channels. `@<source>` just stops responding; `@<sibling-name>` continues. Shared store + repos stay put. ~30 seconds of SQL.
+- **Drop Claude side**: delete the source's `messaging_group_agents` rows; the codex sibling stays wired to the same channels. `@<source>` just stops responding; `@<sibling-name>` continues. The shared workgroup graph + repos stay put. ~30 seconds of SQL.
 - **Flip canonical**: `mv groups/<source> groups/<source>.tmp && mv groups/<source>-codex groups/<source> && ...` — relink symlinks the other way. ~10 min of mechanical work.
 - **Inverse skill**: a `clone-as-claude` skill that takes a codex-backed source group and creates a Claude-backed sibling. Currently a copy of `/clone-as-codex` with provider strings flipped.
 

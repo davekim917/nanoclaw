@@ -3,6 +3,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import Database from 'better-sqlite3';
+
 import { EnrichmentRepository } from './enrichment-cache.js';
 
 const roots: string[] = [];
@@ -11,6 +13,32 @@ afterEach(() => {
 });
 
 describe('EnrichmentRepository', () => {
+  it('allows status readers to overlap semantic queue commits', () => {
+    const root = mkdtempSync(join(tmpdir(), 'graphify-cache-concurrency-'));
+    roots.push(root);
+    const path = join(root, 'cache.db');
+    const repo = new EnrichmentRepository(path);
+    const reader = new Database(path, { readonly: true, fileMustExist: true });
+    try {
+      expect(reader.pragma('journal_mode', { simple: true })).toBe('wal');
+      reader.exec('BEGIN');
+      reader.prepare('SELECT count(*) FROM semantic_queue').get();
+      expect(() =>
+        repo.enqueue([
+          {
+            source: { id: 's', workgroupId: 'wg', kind: 'document', relativePath: 'a.md', contentHash: 'h' },
+            segments: ['fresh knowledge'],
+            priority: 1,
+          },
+        ]),
+      ).not.toThrow();
+    } finally {
+      reader.exec('ROLLBACK');
+      reader.close();
+      repo.close();
+    }
+  });
+
   it('persists enrichment across daemon restart', () => {
     const root = mkdtempSync(join(tmpdir(), 'graphify-cache-'));
     roots.push(root);

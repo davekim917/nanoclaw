@@ -60,10 +60,10 @@ import './opencode.js';
 
 ### 4. Add the agent-runner dependency
 
-Pinned. Bump deliberately, not with `bun update`. Use `1.15.7` — must match the `opencode-ai` CLI version pinned in step 5. The SDK type surface is OpenAPI-generated and has been API-stable from 1.4.x through 1.15.x; older add-opencode skill copies warned that 1.14.x was incompatible, but a byte-level diff of `sdk.gen.d.ts` shows zero breaking changes.
+Pinned. Bump deliberately, not with `bun update`. Use `1.17.18` — it must match the `opencode-ai` CLI version pinned in step 5.
 
 ```bash
-cd container/agent-runner && bun add @opencode-ai/sdk@1.15.7 && cd -
+cd container/agent-runner && bun add @opencode-ai/sdk@1.17.18 && cd -
 ```
 
 ### 5. Add `opencode-ai` to the container Dockerfile
@@ -73,17 +73,16 @@ Two edits to `container/Dockerfile`, both idempotent (skip if already present):
 **(a)** In the "Pin CLI versions" ARG block (around line 45–57), add after `ARG CODEX_VERSION=...`:
 
 ```dockerfile
-ARG OPENCODE_VERSION=1.15.7
+ARG OPENCODE_VERSION=1.17.18
 ```
 
 > **Pin to an exact version** — keep host CLI, container CLI, and SDK locked to the same release. `latest` works but caves to upstream cadence; bump deliberately when there's a reason.
 
-**(b)** In the "Illysium additions" `pnpm install -g` block (around line 339–344, the one that already lists `gitnexus`, `mermaid-cli`, `@googleworkspace/cli`, and `@openai/codex`), append `"opencode-ai@${OPENCODE_VERSION}"`:
+**(b)** In the global `pnpm install -g` block that already lists `mermaid-cli`, `@googleworkspace/cli`, and `@openai/codex`, append `"opencode-ai@${OPENCODE_VERSION}"`:
 
 ```dockerfile
 RUN --mount=type=cache,target=/root/.cache/pnpm \
     pnpm install -g \
-        "gitnexus@${GITNEXUS_VERSION}" \
         "@mermaid-js/mermaid-cli@${MMDC_VERSION}" \
         "@googleworkspace/cli@${GWS_VERSION}" \
         "@openai/codex@${CODEX_VERSION}" \

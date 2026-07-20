@@ -28,4 +28,17 @@ describe('clone provider skills parity guidance', () => {
     expect(skill).toContain('Expose the shared global CLI surface');
     expect(skill).toContain('agent-browser');
   });
+
+  it('keeps retired Mnemon and GitNexus surfaces out of future provider installs', () => {
+    for (const name of ['clone-as-codex', 'clone-as-opencode']) {
+      const skill = readSkill(name);
+      expect(skill).toContain('Graphify graph');
+      expect(skill).toContain('ncl graphify status');
+      expect(skill).not.toMatch(/MNEMON_STORE/i);
+      expect(skill).not.toMatch(/mnemon (store|recall|inbox)/i);
+      expect(skill).not.toMatch(/\.gitnexusInjectAgentsMd\s*=\s*true/);
+    }
+
+    expect(readSkill('add-opencode')).not.toMatch(/gitnexus@/i);
+  });
 });

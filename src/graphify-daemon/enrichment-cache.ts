@@ -40,9 +40,14 @@ export class EnrichmentRepository {
   constructor(path: string) {
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     this.db = new Database(path);
-    this.db.pragma('journal_mode = DELETE');
-    this.db.pragma('foreign_keys = ON');
+    // Full-corpus workers enqueue semantic jobs while the control daemon serves
+    // status reads from a separate connection. WAL keeps those readers from
+    // blocking a worker commit long enough to abort the entire safety scan.
+    // Set the timeout before negotiating journal mode so a concurrent opener
+    // also waits rather than failing immediately during startup.
     this.db.pragma('busy_timeout = 5000');
+    this.db.pragma('journal_mode = WAL');
+    this.db.pragma('foreign_keys = ON');
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS enrichments (
         source_id TEXT PRIMARY KEY, workgroup_id TEXT NOT NULL, content_hash TEXT NOT NULL,
