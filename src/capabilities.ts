@@ -74,7 +74,6 @@ export interface HostCapabilities {
     id: string;
     name: string;
     folder: string;
-    ollamaAdminTools: boolean;
     excludePlugins: string[];
     githubTokenEnv: string | null;
   }>;
@@ -839,7 +838,6 @@ export function getHostCapabilities(
       id: ag.id,
       name: ag.name,
       folder: ag.folder,
-      ollamaAdminTools: !!cfg.ollamaAdminTools,
       excludePlugins: cfg.excludePlugins ?? [],
       githubTokenEnv: cfg.githubTokenEnv ?? null,
     };

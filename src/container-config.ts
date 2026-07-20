@@ -211,12 +211,6 @@ export interface ContainerConfig {
   gitnexusInjectAgentsMd?: boolean;
 
   /**
-   * When true, sets `OLLAMA_ADMIN_TOOLS=true` to enable the Ollama
-   * admin-level MCP tools (model management, etc.).
-   */
-  ollamaAdminTools?: boolean;
-
-  /**
    * Per-group default model when the agent uses the bare `opus` alias.
    * Resolves the SDK's opus-alias short-circuit ANTHROPIC_DEFAULT_OPUS_MODEL.
    * Overrides the install-wide DEFAULT_OPUS_MODEL constant in
@@ -436,7 +430,6 @@ export function readContainerConfig(folder: string): ContainerConfig {
     credentialFolder: raw.credentialFolder,
     excludeMcpServers: raw.excludeMcpServers,
     gitnexusInjectAgentsMd: raw.gitnexusInjectAgentsMd,
-    ollamaAdminTools: raw.ollamaAdminTools,
     defaultModel: raw.defaultModel,
     defaultEffort: raw.defaultEffort,
     tone: raw.tone,
