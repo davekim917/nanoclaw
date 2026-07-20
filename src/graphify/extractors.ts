@@ -604,6 +604,17 @@ export async function preprocessDiscoveredSource(source: DiscoveredSourceLike): 
 
   const raw = (await readVerifiedSource(source, 10 * 1024 * 1024)).toString('utf8');
   const redacted = redactHighConfidenceSecrets(raw);
+  if (redacted.text.trim().length === 0) {
+    return {
+      sourceId: source.id,
+      semanticSegments: [],
+      nodes: [],
+      edges: [],
+      redactionCount: redacted.redactionCount,
+      metadata: { ...baseMetadata, empty: true },
+      binary: false,
+    };
+  }
   let semanticText = redacted.text;
   let nodes: GraphNode[] = [];
   let edges: GraphEdge[] = [];
@@ -620,9 +631,18 @@ export async function preprocessDiscoveredSource(source: DiscoveredSourceLike): 
     metadata.rowCount = summary.rowCount;
     metadata.types = summary.types;
   } else if (extension === '.json') {
-    const summary = summarizeJson(redacted.text);
-    semanticText = summary.semanticText;
-    metadata.schema = summary.schema;
+    try {
+      const summary = summarizeJson(redacted.text);
+      semanticText = summary.semanticText;
+      metadata.schema = summary.schema;
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) throw error;
+      // Real knowledge corpora commonly contain JSONC, JSONL, Mongo shell
+      // literals, concatenated payloads, and redacted exports. Preserve their
+      // already-redacted text instead of dropping the whole source merely
+      // because strict JSON schema summarization is unavailable.
+      metadata.structuredParseFallback = 'plain_text';
+    }
   }
 
   return {

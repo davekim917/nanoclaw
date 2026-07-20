@@ -8,13 +8,14 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { BackgroundGraphRunner, scanInteractivePressure } from './background-runner.js';
+import { BackgroundGraphRunner, InteractivePressureScanner, scanInteractivePressure } from './background-runner.js';
 import { CodexSemanticBackend } from './codex-backend.js';
 import { GraphifyCodeWorker } from './code-worker.js';
 
@@ -472,6 +473,43 @@ function sessionPressureFixture(kind: string, ack?: string): string {
 }
 
 describe('BackgroundGraphRunner', () => {
+  it('caches unchanged inactive session databases and rescans on inbound mutation', () => {
+    const sessions = sessionPressureFixture('task');
+    let inspections = 0;
+    const scanner = new InteractivePressureScanner(sessions, () => {
+      inspections += 1;
+      return false;
+    });
+    expect(scanner.scan()).toBe(false);
+    expect(inspections).toBe(1);
+    expect(scanner.scan()).toBe(false);
+    expect(inspections).toBe(1);
+
+    const inboundPath = join(sessions, 'ag', 'sess', 'inbound.db');
+    const changed = new Date(Date.now() + 5_000);
+    utimesSync(inboundPath, changed, changed);
+    expect(scanner.scan()).toBe(false);
+    expect(inspections).toBe(2);
+  });
+
+  it('keeps active pressure cached until inbound or outbound state changes', () => {
+    const sessions = sessionPressureFixture('chat', 'processing');
+    let inspections = 0;
+    const scanner = new InteractivePressureScanner(sessions, () => {
+      inspections += 1;
+      return true;
+    });
+    expect(scanner.scan()).toBe(true);
+    expect(scanner.scan()).toBe(true);
+    expect(inspections).toBe(1);
+
+    const outboundPath = join(sessions, 'ag', 'sess', 'outbound.db');
+    const changed = new Date(Date.now() + 5_000);
+    utimesSync(outboundPath, changed, changed);
+    expect(scanner.scan()).toBe(true);
+    expect(inspections).toBe(2);
+  });
+
   it('test_interactive_chat_preempts_background_graph_job', async () => {
     const sessions = sessionPressureFixture('chat', 'processing');
     expect(scanInteractivePressure(sessions)).toBe(true);

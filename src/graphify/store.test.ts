@@ -109,6 +109,64 @@ describe('WorkgroupGraphStore', () => {
     store.close();
   });
 
+  test('test_graph_store_bounded_append_uses_one_open_generation', () => {
+    const store = makeStore();
+    const generation = store.beginGeneration('streamed corpus');
+    const first = source('source-a', 'knowledge/strategy.md');
+    const second = source('source-b', 'models/customer_ltv.sql');
+
+    store.appendSources(
+      [
+        { source: first, bundle: bundleFor(first.id, first.relativePath, 'strategy', 'Retention Strategy') },
+        { source: second, bundle: bundleFor(second.id, second.relativePath, 'ltv', 'Customer LTV') },
+      ],
+      generation,
+    );
+
+    expect(store.status()).toMatchObject({ currentGeneration: generation, completeGeneration: 0 });
+    expect(store.query('Retention Strategy').nodes.map((node) => node.id)).toEqual(['strategy']);
+    expect(store.query('Customer LTV').nodes.map((node) => node.id)).toEqual(['ltv']);
+    const metadata = source('source-metadata', 'knowledge/.env');
+    store.appendSourceStates(
+      [{ source: metadata, state: 'metadata_only', error: 'Sensitive credential-shaped file' }],
+      generation,
+    );
+    expect(store.getSourceById(metadata.id)).toMatchObject({
+      state: 'metadata_only',
+      error: 'Sensitive credential-shaped file',
+      generation,
+    });
+    expect(() =>
+      store.appendSources(
+        [{ source: first, bundle: bundleFor(first.id, first.relativePath, 'replacement', 'Replacement') }],
+        generation,
+      ),
+    ).toThrow(/unique constraint failed/i);
+    expect(store.query('Retention Strategy').nodes.map((node) => node.id)).toEqual(['strategy']);
+    expect(store.query('Replacement').nodes).toEqual([]);
+
+    store.completeGeneration(generation);
+    expect(store.status().completeGeneration).toBe(generation);
+    expect(() =>
+      store.appendSources(
+        [
+          {
+            source: source('source-c', 'knowledge/after-complete.md'),
+            bundle: bundleFor('source-c', 'knowledge/after-complete.md', 'late', 'Late'),
+          },
+        ],
+        generation,
+      ),
+    ).toThrow(/no complete generation/i);
+    expect(() =>
+      store.appendSourceStates(
+        [{ source: source('source-late-state', 'knowledge/late.env'), state: 'metadata_only' }],
+        generation,
+      ),
+    ).toThrow(/no complete generation/i);
+    store.close();
+  });
+
   test('test_graph_store_affected_ignores_semantic_edges', () => {
     const store = makeStore();
     const generation = store.beginGeneration('dependencies');

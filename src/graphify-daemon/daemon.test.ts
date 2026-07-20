@@ -106,6 +106,30 @@ describe('WorkgroupGraphDaemon', () => {
     await daemon.close();
   });
 
+  it('activates immediate freshness watching after the initial generation', async () => {
+    const f = fixture();
+    const knowledge = join(f.groups, 'madison-agent', 'brief.md');
+    writeFileSync(knowledge, 'version one knowledge');
+    const discover = vi.fn(discoverWorkgroup);
+    const daemon = new WorkgroupGraphDaemon({
+      dataDir: f.data,
+      groupsDir: f.groups,
+      centralDbPath: f.central,
+      enableEnrichment: false,
+      backgroundRunner: immediateRunner() as never,
+      debounceMs: 5,
+      discover,
+    });
+    await daemon.start();
+    await waitUntil(() => !daemon.status('madison').freshness.dirty);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    writeFileSync(knowledge, 'version two knowledge');
+    await waitUntil(() => discover.mock.calls.length >= 2 && !daemon.status('madison').freshness.dirty, 5_000);
+    expect((await daemon.query('madison', 'version two knowledge')).nodes.length).toBeGreaterThan(0);
+    await daemon.close();
+  });
+
   it('removes incomplete next-generation databases left by an interrupted process', async () => {
     const f = fixture();
     const graphDir = join(f.data, 'graphify', 'workgroups', 'madison');
@@ -129,7 +153,7 @@ describe('WorkgroupGraphDaemon', () => {
     await daemon.close();
   });
 
-  it('isolates malformed source extraction without blocking the workgroup generation', async () => {
+  it('indexes malformed structured text without blocking the workgroup generation', async () => {
     const f = fixture();
     writeFileSync(join(f.groups, 'madison-agent', 'brief.md'), 'valid strategy knowledge');
     writeFileSync(join(f.groups, 'madison-agent', 'partial.json'), '{"unfinished":');
@@ -142,14 +166,10 @@ describe('WorkgroupGraphDaemon', () => {
     await daemon.refreshCatalog();
     const status = await daemon.ensureFresh('madison');
     expect(status.freshness.dirty).toBe(false);
-    expect(status.counts.failed).toBe(1);
-    expect(status.failures).toEqual([
-      expect.objectContaining({
-        relativePath: 'agents/ag-a/partial.json',
-        error: expect.stringContaining('extraction'),
-      }),
-    ]);
+    expect(status.counts.failed).toBe(0);
+    expect(status.failures).toEqual([]);
     expect((await daemon.query('madison', 'valid strategy knowledge')).nodes.length).toBeGreaterThan(0);
+    expect((await daemon.query('madison', 'unfinished')).nodes.length).toBeGreaterThan(0);
     await daemon.close();
   });
 
@@ -433,11 +453,15 @@ describe('WorkgroupGraphDaemon', () => {
     await daemon.close();
   });
 
-  it('preempts a background discovery in the middle of one root', async () => {
+  it('finishes an admitted deterministic baseline when interactive pressure begins', async () => {
     const f = fixture();
     let pressure = false;
     let started = false;
     let aborted = false;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
     const background = new BackgroundGraphRunner({
       sessionsRoot: join(f.data, 'none'),
       pressure: () => pressure,
@@ -452,24 +476,20 @@ describe('WorkgroupGraphDaemon', () => {
       backgroundRunner: background,
       discover: async (options) => {
         started = true;
-        await new Promise<void>((_resolve, reject) =>
-          options.signal?.addEventListener(
-            'abort',
-            () => {
-              aborted = true;
-              reject(new Error('aborted mid-root'));
-            },
-            { once: true },
-          ),
-        );
+        options.signal?.addEventListener('abort', () => {
+          aborted = true;
+        });
+        await gate;
         return [];
       },
     });
     await daemon.start();
     await waitUntil(() => started);
     pressure = true;
-    await waitUntil(() => aborted);
-    expect(daemon.status('madison').freshness.dirty).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(aborted).toBe(false);
+    release();
+    await waitUntil(() => !daemon.status('madison').freshness.dirty);
     await daemon.close();
   });
 
@@ -672,6 +692,50 @@ describe('WorkgroupGraphDaemon', () => {
     daemon.pause('madison');
     expect(daemon.status('madison').freshness.paused).toBe(true);
     expect(daemon.status('other').freshness.paused).toBe(false);
+    await daemon.close();
+  });
+
+  it('pause aborts an active reconciliation and resume completes it', async () => {
+    const f = fixture();
+    writeFileSync(join(f.groups, 'madison-agent', 'brief.md'), 'stable knowledge');
+    let calls = 0;
+    let started!: () => void;
+    const activeDiscovery = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const daemon = new WorkgroupGraphDaemon({
+      dataDir: f.data,
+      groupsDir: f.groups,
+      centralDbPath: f.central,
+      enableEnrichment: false,
+      discover: async (options) => {
+        calls += 1;
+        if (calls === 2) {
+          started();
+          await new Promise<never>((_resolve, reject) => {
+            const abort = (): void => reject(new DOMException('paused', 'AbortError'));
+            if (options.signal?.aborted) abort();
+            else options.signal?.addEventListener('abort', abort, { once: true });
+          });
+        }
+        return discoverWorkgroup(options);
+      },
+    });
+    await daemon.refreshCatalog();
+    await daemon.ensureFresh('madison');
+    daemon.markDirty('madison');
+    const reconciliation = daemon.ensureFresh('madison', 5_000);
+    await activeDiscovery;
+
+    daemon.pause('madison');
+    await reconciliation;
+    expect(daemon.status('madison').freshness).toMatchObject({ dirty: true, reconciling: false, paused: true });
+    expect((await daemon.query('madison', 'stable knowledge')).nodes.length).toBeGreaterThan(0);
+    expect(calls).toBe(2);
+
+    daemon.resume('madison');
+    await waitUntil(() => calls === 3 && !daemon.status('madison').freshness.dirty);
+    expect(daemon.status('madison').freshness).toMatchObject({ dirty: false, reconciling: false, paused: false });
     await daemon.close();
   });
 

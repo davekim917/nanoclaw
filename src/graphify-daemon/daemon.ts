@@ -13,7 +13,7 @@ import {
   type DiscoveredSource,
 } from '../graphify/discovery.js';
 import { preprocessDiscoveredSource, type PreprocessedSource } from '../graphify/extractors.js';
-import { WorkgroupGraphStore } from '../graphify/store.js';
+import { WorkgroupGraphStore, type SourceReconciliation, type SourceStateAppend } from '../graphify/store.js';
 import type {
   ExtractionBundle,
   GraphAffectedResult,
@@ -32,10 +32,9 @@ import type { DaemonWorkgroupStatus, TrustedOverlayContext, WorkgroupDescriptor,
 export const DEFAULT_FULL_RECONCILE_MS = 6 * 60 * 60_000;
 export const DEFAULT_CATALOG_REFRESH_MS = 60_000;
 
-interface SourceBuild {
+interface CodeSourceBuild {
   source: DiscoveredSource;
   root: WorkgroupRoot;
-  preprocessed: PreprocessedSource;
 }
 interface WorkgroupState {
   descriptor: WorkgroupDescriptor;
@@ -57,10 +56,11 @@ interface WorkgroupState {
   enrichmentVersion: number;
   fullReindexRequested: boolean;
   fullReindexVersion: number;
+  reconcileAborts: Set<AbortController>;
 }
 
 interface BackgroundRunnerLike {
-  run<T>(job: (signal: AbortSignal) => Promise<T>): Promise<BackgroundResult<T>>;
+  run<T>(job: (signal: AbortSignal) => Promise<T>, options?: { preemptActive?: boolean }): Promise<BackgroundResult<T>>;
   stop?(): Promise<void> | void;
 }
 
@@ -140,6 +140,18 @@ function sourceExtractionFailure(error: unknown): string {
 
 function isAbortFailure(error: unknown, signal?: AbortSignal): boolean {
   return Boolean(signal?.aborted) || (error instanceof Error && error.name === 'AbortError');
+}
+
+function anySignal(signals: AbortSignal[]): AbortSignal {
+  const controller = new AbortController();
+  for (const signal of signals) {
+    if (signal.aborted) {
+      controller.abort(signal.reason);
+      break;
+    }
+    signal.addEventListener('abort', () => controller.abort(signal.reason), { once: true });
+  }
+  return controller.signal;
 }
 
 function mergeBundles(...bundles: Array<ExtractionBundle | undefined>): ExtractionBundle {
@@ -474,6 +486,7 @@ export class WorkgroupGraphDaemon {
           enrichmentVersion: 0,
           fullReindexRequested: false,
           fullReindexVersion: 0,
+          reconcileAborts: new Set(),
         });
     }
     const active = new Set(descriptors.map((descriptor) => descriptor.id));
@@ -552,8 +565,9 @@ export class WorkgroupGraphDaemon {
     this.queueReconcile(workgroupId);
   }
   pause(workgroupId: string): void {
-    this.requireState(workgroupId);
+    const state = this.requireState(workgroupId);
     this.paused.add(workgroupId);
+    for (const controller of state.reconcileAborts) controller.abort('workgroup indexing paused');
   }
   resume(workgroupId: string): void {
     const state = this.requireState(workgroupId);
@@ -600,7 +614,11 @@ export class WorkgroupGraphDaemon {
     if (context) await this.validateOverlayContext(workgroupId, context);
     const state = this.requireState(workgroupId);
     const deadline = Date.now() + timeoutMs;
-    while ((state.dirty || state.archiveDirty || state.reconciling) && Date.now() < deadline) {
+    while (
+      !this.paused.has(workgroupId) &&
+      (state.dirty || state.archiveDirty || state.reconciling) &&
+      Date.now() < deadline
+    ) {
       // A full rebuild is intentionally background-only. Interactive queries
       // continue to use the last complete generation while it is pending.
       if (state.fullReindexRequested && !state.reconciling) {
@@ -608,8 +626,11 @@ export class WorkgroupGraphDaemon {
         break;
       }
       if (!state.reconciling) {
-        const operation = state.dirty ? this.reconcile(state) : this.reconcileArchive(state);
-        this.trackReconciliation(state, operation);
+        const controller = new AbortController();
+        const operation = state.dirty
+          ? this.reconcile(state, controller.signal)
+          : this.reconcileArchive(state, controller.signal);
+        this.trackReconciliation(state, operation, controller);
       }
       const active = state.reconciling;
       if (!active) break;
@@ -756,6 +777,8 @@ export class WorkgroupGraphDaemon {
 
   async close(): Promise<void> {
     this.closing = true;
+    for (const state of this.states.values())
+      for (const controller of state.reconcileAborts) controller.abort('Graphify daemon stopping');
     for (const timer of this.timers) clearInterval(timer);
     if (this.semanticWakeTimer) clearTimeout(this.semanticWakeTimer);
     await Promise.all([...this.watchers.values()].map((watcher) => watcher.close()));
@@ -770,31 +793,11 @@ export class WorkgroupGraphDaemon {
     const desired = new Set<string>();
     for (const descriptor of descriptors) {
       const state = this.requireState(descriptor.id);
-      for (const root of descriptor.roots) {
-        const key = `${descriptor.id}\0${root.absolutePath}`;
-        desired.add(key);
-        if (this.watchers.has(key)) continue;
-        const watcher = chokidar.watch(root.absolutePath, {
-          ignoreInitial: true,
-          followSymlinks: false,
-          awaitWriteFinish: false,
-          ignored: (candidate) => isGraphifyDefaultExcludedPath(root.absolutePath, candidate),
-        });
-        let debounce: NodeJS.Timeout | undefined;
-        watcher.on('all', () => {
-          if (debounce) clearTimeout(debounce);
-          debounce = setTimeout(() => {
-            if (!this.states.has(descriptor.id)) return;
-            this.markDirty(descriptor.id);
-            this.queueReconcile(descriptor.id);
-          }, this.options.debounceMs ?? 3_000);
-          debounce.unref();
-        });
-        watcher.on('error', (error) => {
-          state.lastFailure = `filesystem watcher: ${error instanceof Error ? error.message : String(error)}`;
-        });
-        this.watchers.set(key, watcher);
-      }
+      for (const root of descriptor.roots) desired.add(`${descriptor.id}\0${root.absolutePath}`);
+      // Avoid a host-wide recursive crawl at process start. The serialized
+      // first reconciliation establishes the baseline, then activates this
+      // workgroup's immediate freshness watchers.
+      if (state.lastCompletedAt) this.ensureWatchers(descriptor);
     }
     for (const [key, watcher] of this.watchers) {
       if (desired.has(key)) continue;
@@ -803,22 +806,63 @@ export class WorkgroupGraphDaemon {
     }
   }
 
+  private ensureWatchers(descriptor: WorkgroupDescriptor): void {
+    if (this.closing) return;
+    const state = this.requireState(descriptor.id);
+    for (const root of descriptor.roots) {
+      const key = `${descriptor.id}\0${root.absolutePath}`;
+      if (this.watchers.has(key)) continue;
+      const watcher = chokidar.watch(root.absolutePath, {
+        ignoreInitial: true,
+        followSymlinks: false,
+        awaitWriteFinish: false,
+        ignored: (candidate) => isGraphifyDefaultExcludedPath(root.absolutePath, candidate),
+      });
+      let debounce: NodeJS.Timeout | undefined;
+      watcher.on('all', () => {
+        if (debounce) clearTimeout(debounce);
+        debounce = setTimeout(() => {
+          if (!this.states.has(descriptor.id)) return;
+          this.markDirty(descriptor.id);
+          this.queueReconcile(descriptor.id);
+        }, this.options.debounceMs ?? 3_000);
+        debounce.unref();
+      });
+      watcher.on('error', (error) => {
+        state.lastFailure = `filesystem watcher: ${error instanceof Error ? error.message : String(error)}`;
+      });
+      this.watchers.set(key, watcher);
+    }
+  }
+
   private queueReconcile(workgroupId: string): void {
     const state = this.requireState(workgroupId);
     if (state.backgroundQueued || this.closing) return;
     state.backgroundQueued = true;
     void this.background
-      .run(async (signal) => {
-        if (this.paused.has(workgroupId)) throw new Error('workgroup indexing paused');
-        const prior = state.reconciling;
-        const operation = (async () => {
-          if (prior) await prior;
-          if (state.fullReindexRequested) await this.prepareFullReindex(state);
-          if (state.dirty) await this.reconcile(state, signal);
-          else if (state.archiveDirty) await this.reconcileArchive(state, signal);
-        })();
-        await this.trackReconciliation(state, operation);
-      })
+      .run(
+        async (signal) => {
+          if (this.paused.has(workgroupId)) throw new Error('workgroup indexing paused');
+          const controller = new AbortController();
+          const reconcileSignal = anySignal([signal, controller.signal]);
+          const prior = state.reconciling;
+          const operation = (async () => {
+            if (prior) await prior;
+            if (reconcileSignal.aborted || this.paused.has(workgroupId)) {
+              throw new Error('workgroup indexing paused');
+            }
+            if (state.fullReindexRequested) await this.prepareFullReindex(state);
+            if (state.dirty) await this.reconcile(state, reconcileSignal);
+            else if (state.archiveDirty) await this.reconcileArchive(state, reconcileSignal);
+          })();
+          await this.trackReconciliation(state, operation, controller);
+        },
+        // Admission still yields to chat. Once admitted, the deterministic
+        // atomic baseline must finish or a busy workgroup can discard hours
+        // of progress forever. OS/cgroup priority keeps it subordinate; only
+        // manual pause, shutdown, and preemptible Docker/Codex jobs abort.
+        { preemptActive: false },
+      )
       .then((result) => {
         state.backgroundQueued = false;
         if ((result.status === 'preempted' || result.status === 'deferred') && !this.closing) {
@@ -843,9 +887,18 @@ export class WorkgroupGraphDaemon {
       });
   }
 
-  private trackReconciliation(state: WorkgroupState, operation: Promise<void>): Promise<void> {
+  private trackReconciliation(
+    state: WorkgroupState,
+    operation: Promise<void>,
+    controller: AbortController,
+  ): Promise<void> {
+    state.reconcileAborts.add(controller);
     const tracked = operation.finally(() => {
-      if (state.reconciling === tracked) state.reconciling = undefined;
+      state.reconcileAborts.delete(controller);
+      if (state.reconciling === tracked) {
+        state.reconciling = undefined;
+        this.kickSemanticPump();
+      }
     });
     state.reconciling = tracked;
     return tracked;
@@ -889,9 +942,32 @@ export class WorkgroupGraphDaemon {
         state.cacheLoaded = true;
       }
       next = new WorkgroupGraphStore(nextPath, state.descriptor.id);
-      const builds: SourceBuild[] = [];
-      const upserts: Array<{ source: SourceInput; bundle: ExtractionBundle }> = [];
-      const sourceStates: Array<{ source: SourceInput; state: DiscoveredSource['state']; error?: string }> = [];
+      const generation = next.beginGeneration('fast-reconcile');
+      const codeSources: CodeSourceBuild[] = [];
+      let indexBatch: SourceReconciliation[] = [];
+      let stateBatch: SourceStateAppend[] = [];
+      let semanticBatch: SemanticQueueItem[] = [];
+      let rasterQueued = 0;
+      const flushSources = async (): Promise<void> => {
+        if (indexBatch.length === 0 && stateBatch.length === 0) return;
+        if (indexBatch.length > 0) next!.appendSources(indexBatch, generation);
+        if (stateBatch.length > 0) next!.appendSourceStates(stateBatch, generation);
+        indexBatch = [];
+        stateBatch = [];
+        // better-sqlite3 mutations are synchronous. Bound each critical
+        // section and return control so status/pause/preemption can run.
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        if (signal?.aborted) throw new Error('fast reconcile preempted by interactive chat');
+      };
+      const flushSemantic = (): void => {
+        if (semanticBatch.length === 0) return;
+        this.enrichmentRepository.enqueue(semanticBatch);
+        semanticBatch = [];
+      };
+      const queueSemantic = (item: SemanticQueueItem): void => {
+        semanticBatch.push(item);
+        if (semanticBatch.length >= 25) flushSemantic();
+      };
       for (const root of state.descriptor.roots) {
         if (signal?.aborted) throw new Error('fast reconcile preempted by interactive chat');
         const found = await this.discover({ workgroupId: state.descriptor.id, root: root.absolutePath, signal });
@@ -900,33 +976,72 @@ export class WorkgroupGraphDaemon {
           const relativePath = prefixed(root.prefix, original.relativePath);
           const id = stableSourceId(state.descriptor.id, relativePath);
           const source = { ...original, id, relativePath, workgroupId: state.descriptor.id };
+          const input = this.toInput(source);
           if (source.state !== 'pending' && source.state !== 'indexed') {
-            sourceStates.push({
-              source: this.toInput(source),
-              state: source.state,
-              ...(source.stateReason ? { error: source.stateReason } : {}),
-            });
+            stateBatch.push({ source: input, state: source.state, error: source.stateReason });
+            if (indexBatch.length + stateBatch.length >= 25) await flushSources();
             continue;
           }
-          const input = this.toInput(source);
           let preprocessed: PreprocessedSource;
           try {
             preprocessed = await preprocessDiscoveredSource(source);
           } catch (error) {
             if (isAbortFailure(error, signal)) throw error;
-            sourceStates.push({ source: input, state: 'failed', error: sourceExtractionFailure(error) });
+            stateBatch.push({ source: input, state: 'failed', error: sourceExtractionFailure(error) });
+            if (indexBatch.length + stateBatch.length >= 25) await flushSources();
             continue;
           }
           const cached = this.enrichments.get(source.id);
-          upserts.push({
+          const baseBundle = deterministicBundle(source, preprocessed);
+          indexBatch.push({
             source: input,
             bundle: mergeBundles(
-              deterministicBundle(source, preprocessed),
+              baseBundle,
               cached?.contentHash === source.sha256 ? cached.code : undefined,
               cached?.contentHash === source.sha256 ? cached.semantic : undefined,
             ),
           });
-          builds.push({ source, root, preprocessed });
+          if (indexBatch.length + stateBatch.length >= 25) await flushSources();
+          codeSources.push({ source, root });
+
+          if (
+            this.enableEnrichment &&
+            this.semantic &&
+            !this.paused.has(state.descriptor.id) &&
+            !(cached?.contentHash === source.sha256 && cached.semantic)
+          ) {
+            const semanticCode = source.kind === 'code' && /\.sql$/i.test(source.relativePath);
+            if ((source.kind !== 'code' || semanticCode) && preprocessed.semanticSegments.length > 0) {
+              queueSemantic({
+                source: input,
+                segments: preprocessed.semanticSegments,
+                baseBundle,
+                priority: source.kind === 'document' ? 60 : semanticCode ? 50 : 40,
+              });
+            }
+            if (this.codeWorker?.preprocess && /\.(?:pdf|docx|xlsx)$/i.test(source.relativePath)) {
+              queueSemantic({
+                source: input,
+                segments: [],
+                baseBundle,
+                documentPath: source.absolutePath,
+                sourceRoot: root.absolutePath,
+                rootRelativePath: portable(relative(root.absolutePath, source.absolutePath)),
+                priority: 55,
+              });
+            }
+            if (rasterQueued < 100 && source.kind === 'image' && /\.(?:png|jpe?g|webp)$/i.test(source.relativePath)) {
+              rasterQueued += 1;
+              queueSemantic({
+                source: input,
+                segments: [`Raster image at ${source.relativePath}`],
+                baseBundle,
+                imagePath: source.absolutePath,
+                sourceRoot: root.absolutePath,
+                priority: 5,
+              });
+            }
+          }
         }
       }
       const conversations = existsSync(this.archivePath)
@@ -934,23 +1049,18 @@ export class WorkgroupGraphDaemon {
         : [];
       for (const conversation of conversations) {
         const cached = this.enrichments.get(conversation.input.id);
-        upserts.push({
+        indexBatch.push({
           source: conversation.input,
           bundle: mergeBundles(
             conversation.bundle,
             cached?.contentHash === conversation.input.contentHash ? cached.semantic : undefined,
           ),
         });
+        if (indexBatch.length + stateBatch.length >= 25) await flushSources();
       }
-      const reconciled = next.reconcileSources('fast-reconcile', upserts, []);
-      if (sourceStates.length > 0) {
-        const generation = next.beginGeneration('source-states');
-        for (const item of sourceStates) next.markSourceState(item.source, item.state, generation, item.error);
-        next.completeGeneration(generation);
-      } else if (reconciled.generation === 0) {
-        const generation = next.beginGeneration('empty-reconcile');
-        next.completeGeneration(generation);
-      }
+      await flushSources();
+      flushSemantic();
+      next.completeGeneration(generation);
       next.close();
       next = undefined;
       state.store?.close();
@@ -961,8 +1071,9 @@ export class WorkgroupGraphDaemon {
       state.archiveDirty = state.archiveVersion !== archiveVersion;
       state.lastCompletedAt = new Date().toISOString();
       state.lastFailure = undefined;
+      this.ensureWatchers(state.descriptor);
       if (this.enableEnrichment && !this.paused.has(state.descriptor.id))
-        this.scheduleEnrichment(state, builds, conversations);
+        this.scheduleEnrichment(state, codeSources, conversations);
     } catch (error) {
       next?.close();
       await rm(nextPath, { force: true });
@@ -1025,7 +1136,7 @@ export class WorkgroupGraphDaemon {
 
   private scheduleEnrichment(
     state: WorkgroupState,
-    builds: SourceBuild[],
+    builds: CodeSourceBuild[],
     conversations: ConversationGraphSource[],
   ): void {
     if (this.closing) return;
@@ -1040,7 +1151,7 @@ export class WorkgroupGraphDaemon {
               this.enrichments.get(item.source.id)?.code
             ),
         );
-        let batch: SourceBuild[] = [];
+        let batch: DiscoveredSource[] = [];
         let bytes = 0;
         const flush = (): void => {
           if (batch.length) this.enqueueCode(state, root, batch);
@@ -1049,14 +1160,19 @@ export class WorkgroupGraphDaemon {
         };
         for (const item of candidates) {
           if (batch.length >= 4_000 || bytes + item.source.bytes > 64 * 1024 * 1024) flush();
-          batch.push(item);
+          batch.push(item.source);
           bytes += item.source.bytes;
         }
         flush();
       }
     }
     if (this.semantic) {
-      const queued: SemanticQueueItem[] = [];
+      let queued: SemanticQueueItem[] = [];
+      const flush = (): void => {
+        if (queued.length === 0) return;
+        this.enrichmentRepository.enqueue(queued);
+        queued = [];
+      };
       for (const item of conversations) {
         if (
           this.enrichments.get(item.input.id)?.contentHash === item.input.contentHash &&
@@ -1069,72 +1185,22 @@ export class WorkgroupGraphDaemon {
           baseBundle: item.bundle,
           priority: 100,
         });
+        if (queued.length >= 25) flush();
       }
-      for (const item of builds) {
-        const input = this.toInput(item.source);
-        const cached = this.enrichments.get(input.id);
-        if (cached?.contentHash === input.contentHash && cached.semantic) continue;
-        const semanticCode = item.source.kind === 'code' && /\.sql$/i.test(item.source.relativePath);
-        if ((item.source.kind !== 'code' || semanticCode) && item.preprocessed.semanticSegments.length > 0) {
-          queued.push({
-            source: input,
-            segments: item.preprocessed.semanticSegments,
-            baseBundle: deterministicBundle(item.source, item.preprocessed),
-            priority: item.source.kind === 'document' ? 60 : semanticCode ? 50 : 40,
-          });
-        }
-      }
-      if (this.codeWorker?.preprocess) {
-        for (const item of builds.filter((candidate) => /\.(?:pdf|docx|xlsx)$/i.test(candidate.source.relativePath))) {
-          const input = this.toInput(item.source);
-          const cached = this.enrichments.get(input.id);
-          if (cached?.contentHash === input.contentHash && cached.semantic) continue;
-          queued.push({
-            source: input,
-            segments: [],
-            baseBundle: deterministicBundle(item.source, item.preprocessed),
-            documentPath: item.source.absolutePath,
-            sourceRoot: item.root.absolutePath,
-            rootRelativePath: portable(relative(item.root.absolutePath, item.source.absolutePath)),
-            priority: 55,
-          });
-        }
-      }
-      // Raster vision is deliberately a bounded low-priority backlog. SVG and
-      // media are not passed to Codex; no URL or caller-provided path is used.
-      const raster = builds
-        .filter((item) => item.source.kind === 'image' && /\.(?:png|jpe?g|webp)$/i.test(item.source.relativePath))
-        .filter(
-          (item) =>
-            !(
-              this.enrichments.get(item.source.id)?.contentHash === item.source.sha256 &&
-              this.enrichments.get(item.source.id)?.semantic
-            ),
-        )
-        .slice(0, 100);
-      for (const item of raster)
-        queued.push({
-          source: this.toInput(item.source),
-          segments: [`Raster image at ${item.source.relativePath}`],
-          baseBundle: deterministicBundle(item.source, item.preprocessed),
-          imagePath: item.source.absolutePath,
-          sourceRoot: item.root.absolutePath,
-          priority: 5,
-        });
-      this.enrichmentRepository.enqueue(queued);
+      flush();
       this.kickSemanticPump();
     }
   }
 
-  private enqueueCode(state: WorkgroupState, root: WorkgroupRoot, batch: SourceBuild[]): void {
-    const key = `code:${state.descriptor.id}:${hash(...batch.map((item) => `${item.source.id}:${item.source.sha256}`))}`;
+  private enqueueCode(state: WorkgroupState, root: WorkgroupRoot, batch: DiscoveredSource[]): void {
+    const key = `code:${state.descriptor.id}:${hash(...batch.map((source) => `${source.id}:${source.sha256}`))}`;
     if (this.attempted.has(key)) return;
     this.attempted.add(key);
     state.pendingEnrichment += 1;
     const epoch = state.epoch;
-    const sources: CodeWorkerSource[] = batch.map((item) => ({
-      ...item.source,
-      rootRelativePath: portable(relative(root.absolutePath, item.source.absolutePath)),
+    const sources: CodeWorkerSource[] = batch.map((source) => ({
+      ...source,
+      rootRelativePath: portable(relative(root.absolutePath, source.absolutePath)),
     }));
     void this.background
       .run(async (signal) => {
@@ -1148,25 +1214,34 @@ export class WorkgroupGraphDaemon {
         if (state.epoch !== epoch) return;
         const entries: PersistedEnrichment[] = [];
         const upserts: Array<{ source: SourceInput; bundle: ExtractionBundle; force: boolean }> = [];
-        for (const item of batch) {
-          const bundle = output.get(item.source.id);
+        for (const source of batch) {
+          const bundle = output.get(source.id);
           if (!bundle) continue;
-          const input = this.toInput(item.source);
+          const input = this.toInput(source);
           const current = this.requireStore(state).getSourceById(input.id);
           if (current?.state !== 'indexed' || current.contentHash !== input.contentHash) continue;
-          const prior = this.enrichments.get(item.source.id);
+          let preprocessed: PreprocessedSource;
+          try {
+            preprocessed = await preprocessDiscoveredSource(source);
+          } catch (error) {
+            if (isAbortFailure(error, signal)) throw error;
+            this.markDirty(state.descriptor.id);
+            this.queueReconcile(state.descriptor.id);
+            continue;
+          }
+          const prior = this.enrichments.get(source.id);
           const entry: PersistedEnrichment = {
-            ...(prior?.contentHash === item.source.sha256 ? prior : {}),
-            sourceId: item.source.id,
+            ...(prior?.contentHash === source.sha256 ? prior : {}),
+            sourceId: source.id,
             workgroupId: state.descriptor.id,
-            contentHash: item.source.sha256,
+            contentHash: source.sha256,
             code: bridgeCodeBundle(input, bundle),
           };
           entries.push(entry);
           upserts.push({
             source: input,
             force: true,
-            bundle: mergeBundles(deterministicBundle(item.source, item.preprocessed), entry.code, entry.semantic),
+            bundle: mergeBundles(deterministicBundle(source, preprocessed), entry.code, entry.semantic),
           });
         }
         if (upserts.length > 0) {
@@ -1219,7 +1294,9 @@ export class WorkgroupGraphDaemon {
       }
       return;
     }
-    const active = [...this.states.keys()].filter((id) => !this.paused.has(id));
+    const active = [...this.states.entries()]
+      .filter(([id, state]) => !this.paused.has(id) && !state.reconciling)
+      .map(([id]) => id);
     const batch = this.enrichmentRepository.claimBatch(25, 256 * 1024, active);
     if (batch.length === 0) return;
     const epochs = new Map(

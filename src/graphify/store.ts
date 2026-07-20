@@ -105,6 +105,12 @@ export interface SourceReconciliation {
   force?: boolean;
 }
 
+export interface SourceStateAppend {
+  source: SourceInput;
+  state: Exclude<SourceState, 'indexed'>;
+  error?: string;
+}
+
 export interface SourceReconciliationResult {
   generation: number;
   upsertedSourceIds: string[];
@@ -197,29 +203,113 @@ export class WorkgroupGraphStore {
   }
 
   upsertSource(source: SourceInput, bundle: ExtractionBundle, generation: number): void {
+    this.upsertSources([{ source, bundle }], generation);
+  }
+
+  /**
+   * Apply a bounded batch inside one transaction while keeping the caller's
+   * generation open. Full-corpus builders use this to avoid retaining every
+   * extracted bundle in memory before the private next-generation DB is
+   * promoted.
+   */
+  upsertSources(upserts: SourceReconciliation[], generation: number): void {
     this.assertOpen();
-    this.validateSource(source);
-    this.validateBundle(source, bundle);
     this.assertGenerationNumber(generation);
+    const seen = new Set<string>();
+    for (const { source, bundle } of upserts) {
+      if (seen.has(source.id)) throw new Error(`duplicate upserted source id ${source.id}`);
+      seen.add(source.id);
+      this.validateSource(source);
+      this.validateBundle(source, bundle);
+    }
 
     this.db
       .transaction(() => {
         this.requireGeneration(generation);
-        this.assertPathOwnership(source);
-        this.removeSourceContributions(source.id);
+        for (const { source } of upserts) {
+          this.assertPathOwnership(source);
+          this.removeSourceContributions(source.id);
+        }
         this.removeOrphanedNodes();
-        this.writeSource(source, 'indexed', generation);
+        for (const { source, bundle } of upserts) {
+          this.writeSource(source, 'indexed', generation);
+          for (const node of bundle.nodes) this.writeNode(source, node);
+          for (const edge of bundle.edges) this.writeEdge(source, edge);
+          for (const hyperedge of bundle.hyperedges) this.writeHyperedge(source, hyperedge);
+        }
+        this.removeOrphanedNodes();
+      })
+      .immediate();
+  }
 
-        for (const node of bundle.nodes) {
-          this.writeNode(source, node);
+  /**
+   * Append a bounded batch to a brand-new, incomplete graph generation.
+   *
+   * Unlike upsertSources(), this deliberately performs no replacement or
+   * whole-graph orphan cleanup. Strict source INSERTs preserve duplicate id
+   * and path detection across batches. Callers must only use this while
+   * building a private next-generation database whose complete generation is
+   * still zero.
+   */
+  appendSources(upserts: SourceReconciliation[], generation: number): void {
+    this.assertOpen();
+    this.assertGenerationNumber(generation);
+    const seenIds = new Set<string>();
+    const seenPaths = new Set<string>();
+    for (const { source, bundle } of upserts) {
+      if (seenIds.has(source.id)) throw new Error(`duplicate appended source id ${source.id}`);
+      if (seenPaths.has(source.relativePath)) throw new Error(`duplicate appended source path ${source.relativePath}`);
+      seenIds.add(source.id);
+      seenPaths.add(source.relativePath);
+      this.validateSource(source);
+      this.validateBundle(source, bundle);
+    }
+
+    this.db
+      .transaction(() => {
+        this.requireGeneration(generation);
+        if (this.readMetadataNumber('complete_generation') !== 0) {
+          throw new Error('appendSources requires a private graph with no complete generation');
         }
-        for (const edge of bundle.edges) {
-          this.writeEdge(source, edge);
+        for (const { source, bundle } of upserts) {
+          this.insertSource(source, 'indexed', generation);
+          for (const node of bundle.nodes) this.writeNode(source, node);
+          for (const edge of bundle.edges) this.writeEdge(source, edge);
+          for (const hyperedge of bundle.hyperedges) this.writeHyperedge(source, hyperedge);
         }
-        for (const hyperedge of bundle.hyperedges) {
-          this.writeHyperedge(source, hyperedge);
+      })
+      .immediate();
+  }
+
+  /**
+   * Append state-only sources while building a private generation.
+   *
+   * There cannot be source contributions to remove in a brand-new graph, so
+   * the live-graph orphan sweep in markSourceState() would only rescan every
+   * node already appended. Keeping this path insert-only makes metadata and
+   * extraction failures O(1) with respect to the corpus built so far.
+   */
+  appendSourceStates(items: SourceStateAppend[], generation: number): void {
+    this.assertOpen();
+    this.assertGenerationNumber(generation);
+    const seenIds = new Set<string>();
+    const seenPaths = new Set<string>();
+    for (const { source, state } of items) {
+      if (seenIds.has(source.id)) throw new Error(`duplicate appended source id ${source.id}`);
+      if (seenPaths.has(source.relativePath)) throw new Error(`duplicate appended source path ${source.relativePath}`);
+      seenIds.add(source.id);
+      seenPaths.add(source.relativePath);
+      this.validateSource(source);
+      if (!SOURCE_STATES.includes(state)) throw new Error(`invalid source state: ${String(state)}`);
+    }
+
+    this.db
+      .transaction(() => {
+        this.requireGeneration(generation);
+        if (this.readMetadataNumber('complete_generation') !== 0) {
+          throw new Error('appendSourceStates requires a private graph with no complete generation');
         }
-        this.removeOrphanedNodes();
+        for (const { source, state, error } of items) this.insertSource(source, state, generation, error);
       })
       .immediate();
   }
@@ -958,6 +1048,31 @@ export class WorkgroupGraphStore {
            generation = excluded.generation,
            error = excluded.error,
            updated_at = excluded.updated_at`,
+      )
+      .run(
+        source.id,
+        this.workgroupId,
+        source.kind,
+        source.relativePath,
+        source.contentHash,
+        source.sizeBytes ?? null,
+        source.modifiedAt ?? null,
+        state,
+        generation,
+        error ?? null,
+        now,
+        now,
+      );
+  }
+
+  private insertSource(source: SourceInput, state: SourceState, generation: number, error?: string): void {
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        `INSERT INTO sources (
+           id, workgroup_id, kind, relative_path, content_hash,
+           size_bytes, modified_at, state, generation, error, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         source.id,

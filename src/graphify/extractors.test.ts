@@ -109,6 +109,54 @@ describe('deterministic Graphify adapters', () => {
     expect(result.semanticText).not.toContain('unique-payload-999');
   });
 
+  test('test_empty_structured_artifact_is_indexed_without_a_parse_failure', async () => {
+    const { absolutePath } = put('.mnemon-rollout.json', '');
+
+    const result = await preprocessDiscoveredSource({
+      id: 'source-empty-json',
+      workgroupId: 'wg',
+      relativePath: '.mnemon-rollout.json',
+      absolutePath,
+      kind: 'structured',
+      bytes: 0,
+      mtimeMs: Date.now(),
+      sha256: createHash('sha256').update('').digest('hex'),
+      state: 'pending',
+    });
+
+    expect(result).toMatchObject({
+      sourceId: 'source-empty-json',
+      semanticSegments: [],
+      nodes: [],
+      edges: [],
+      redactionCount: 0,
+      metadata: { empty: true },
+      binary: false,
+    });
+  });
+
+  test('test_json_adjacent_artifact_falls_back_to_redacted_plain_text', async () => {
+    const contents = '{ "decision": "keep", // operator note\n "token": "sk-proj-abcdefghijklmnopqrstuvwxyz" }';
+    const { absolutePath } = put('decision.json', contents);
+
+    const result = await preprocessDiscoveredSource({
+      id: 'source-jsonc',
+      workgroupId: 'wg',
+      relativePath: 'decision.json',
+      absolutePath,
+      kind: 'structured',
+      bytes: Buffer.byteLength(contents),
+      mtimeMs: Date.now(),
+      sha256: createHash('sha256').update(contents).digest('hex'),
+      state: 'pending',
+    });
+
+    expect(result.metadata).toMatchObject({ structuredParseFallback: 'plain_text' });
+    expect(result.semanticSegments.join('\n')).toContain('operator note');
+    expect(result.semanticSegments.join('\n')).not.toContain('sk-proj-');
+    expect(result.redactionCount).toBeGreaterThan(0);
+  });
+
   test('test_semantic_preprocessing_redacts_secrets_before_chunking', async () => {
     const contents = [
       '# Deployment decision',
