@@ -66,6 +66,8 @@ interface WorkgroupState {
   fullReindexRequested: boolean;
   fullReindexVersion: number;
   reconcileAborts: Set<AbortController>;
+  activeReads: number;
+  promotionGate?: Promise<void>;
 }
 
 interface BackgroundRunnerLike {
@@ -525,6 +527,7 @@ export class WorkgroupGraphDaemon {
           fullReindexRequested: false,
           fullReindexVersion: 0,
           reconcileAborts: new Set(),
+          activeReads: 0,
         });
     }
     const active = new Set(descriptors.map((descriptor) => descriptor.id));
@@ -657,6 +660,15 @@ export class WorkgroupGraphDaemon {
     timeoutMs = 30_000,
     context?: TrustedOverlayContext,
   ): Promise<DaemonWorkgroupStatus> {
+    await this.waitForFreshness(workgroupId, timeoutMs, context);
+    return await this.statusAsync(workgroupId);
+  }
+
+  private async waitForFreshness(
+    workgroupId: string,
+    timeoutMs: number,
+    context?: TrustedOverlayContext,
+  ): Promise<void> {
     if (context) await this.validateOverlayContext(workgroupId, context);
     const state = this.requireState(workgroupId);
     const deadline = Date.now() + timeoutMs;
@@ -668,7 +680,7 @@ export class WorkgroupGraphDaemon {
       // A restart safety scan must not make an already-complete generation
       // unavailable. Watchers are active and the background lane will promote
       // a new atomic generation when the downtime reconciliation finishes.
-      if (state.serveStaleDuringStartup && this.requireStore(state).status().completeGeneration > 0) {
+      if (state.serveStaleDuringStartup && state.lastCompletedAt) {
         if (!state.reconciling) this.queueReconcile(workgroupId);
         break;
       }
@@ -701,7 +713,6 @@ export class WorkgroupGraphDaemon {
         break;
       }
     }
-    return this.status(workgroupId);
   }
 
   async query(
@@ -710,24 +721,27 @@ export class WorkgroupGraphDaemon {
     limit = 20,
     context?: TrustedOverlayContext,
   ): Promise<GraphQueryResult> {
-    await this.ensureFresh(workgroupId, 30_000, context);
-    const base = this.isolateReconcile
-      ? await runIsolatedRead<GraphQueryResult>(this.graphPath(workgroupId), workgroupId, 'query', { term, limit })
-      : this.requireStore(this.requireState(workgroupId)).query(term, { limit });
-    if (!context) return base;
-    return this.withOverlay(workgroupId, context, (store) => {
-      const overlay = store.query(term, { limit });
-      const nodes = [
-        ...overlay.nodes,
-        ...base.nodes.filter((node) => !overlay.nodes.some((item) => item.id === node.id)),
-      ].slice(0, limit);
-      return {
-        term,
-        nodes,
-        edges: [...overlay.edges, ...base.edges],
-        hyperedges: [...overlay.hyperedges, ...base.hyperedges],
-        indexedGeneration: Math.max(overlay.indexedGeneration, base.indexedGeneration),
-      };
+    await this.waitForFreshness(workgroupId, 30_000, context);
+    const state = this.requireState(workgroupId);
+    return await this.withStableGeneration(state, async () => {
+      const base = this.isolateReconcile
+        ? await runIsolatedRead<GraphQueryResult>(this.graphPath(workgroupId), workgroupId, 'query', { term, limit })
+        : this.requireStore(state).query(term, { limit });
+      if (!context) return base;
+      return await this.withOverlay(workgroupId, context, (store) => {
+        const overlay = store.query(term, { limit });
+        const nodes = [
+          ...overlay.nodes,
+          ...base.nodes.filter((node) => !overlay.nodes.some((item) => item.id === node.id)),
+        ].slice(0, limit);
+        return {
+          term,
+          nodes,
+          edges: [...overlay.edges, ...base.edges],
+          hyperedges: [...overlay.hyperedges, ...base.hyperedges],
+          indexedGeneration: Math.max(overlay.indexedGeneration, base.indexedGeneration),
+        };
+      });
     });
   }
 
@@ -737,24 +751,27 @@ export class WorkgroupGraphDaemon {
     depth = 2,
     context?: TrustedOverlayContext,
   ): Promise<GraphExplainResult | null> {
-    await this.ensureFresh(workgroupId, 30_000, context);
-    const baseStore = context || !this.isolateReconcile ? this.requireStore(this.requireState(workgroupId)) : undefined;
-    if (!context)
-      return this.isolateReconcile
-        ? await runIsolatedRead<GraphExplainResult | null>(this.graphPath(workgroupId), workgroupId, 'explain', {
-            reference,
-            depth,
-          })
-        : this.explainDepth(baseStore!, this.resolveReference(baseStore!, reference), depth);
-    return this.withOverlay(workgroupId, context, (store) => {
-      try {
-        return this.explainDepth(store, this.resolveReference(store, reference), depth);
-      } catch (error) {
-        if (error instanceof Error && error.message.startsWith('unknown graph reference')) {
-          return this.explainDepth(baseStore!, this.resolveReference(baseStore!, reference), depth);
+    await this.waitForFreshness(workgroupId, 30_000, context);
+    const state = this.requireState(workgroupId);
+    return await this.withStableGeneration(state, async () => {
+      const baseStore = context || !this.isolateReconcile ? this.requireStore(state) : undefined;
+      if (!context)
+        return this.isolateReconcile
+          ? await runIsolatedRead<GraphExplainResult | null>(this.graphPath(workgroupId), workgroupId, 'explain', {
+              reference,
+              depth,
+            })
+          : this.explainDepth(baseStore!, this.resolveReference(baseStore!, reference), depth);
+      return await this.withOverlay(workgroupId, context, (store) => {
+        try {
+          return this.explainDepth(store, this.resolveReference(store, reference), depth);
+        } catch (error) {
+          if (error instanceof Error && error.message.startsWith('unknown graph reference')) {
+            return this.explainDepth(baseStore!, this.resolveReference(baseStore!, reference), depth);
+          }
+          throw error;
         }
-        throw error;
-      }
+      });
     });
   }
   async path(
@@ -764,27 +781,30 @@ export class WorkgroupGraphDaemon {
     maxDepth = 8,
     context?: TrustedOverlayContext,
   ): Promise<GraphPathResult | null> {
-    await this.ensureFresh(workgroupId, 30_000, context);
-    const baseStore = context || !this.isolateReconcile ? this.requireStore(this.requireState(workgroupId)) : undefined;
-    const basePath = (): GraphPathResult | null =>
-      baseStore!.path(this.resolveReference(baseStore!, from), this.resolveReference(baseStore!, to), { maxDepth });
-    if (!context)
-      return this.isolateReconcile
-        ? await runIsolatedRead<GraphPathResult | null>(this.graphPath(workgroupId), workgroupId, 'path', {
-            from,
-            to,
-            maxDepth,
-          })
-        : basePath();
-    return this.withOverlay(workgroupId, context, (store) => {
-      try {
-        return (
-          store.path(this.resolveReference(store, from), this.resolveReference(store, to), { maxDepth }) ?? basePath()
-        );
-      } catch (error) {
-        if (error instanceof Error && error.message.startsWith('unknown graph reference')) return basePath();
-        throw error;
-      }
+    await this.waitForFreshness(workgroupId, 30_000, context);
+    const state = this.requireState(workgroupId);
+    return await this.withStableGeneration(state, async () => {
+      const baseStore = context || !this.isolateReconcile ? this.requireStore(state) : undefined;
+      const basePath = (): GraphPathResult | null =>
+        baseStore!.path(this.resolveReference(baseStore!, from), this.resolveReference(baseStore!, to), { maxDepth });
+      if (!context)
+        return this.isolateReconcile
+          ? await runIsolatedRead<GraphPathResult | null>(this.graphPath(workgroupId), workgroupId, 'path', {
+              from,
+              to,
+              maxDepth,
+            })
+          : basePath();
+      return await this.withOverlay(workgroupId, context, (store) => {
+        try {
+          return (
+            store.path(this.resolveReference(store, from), this.resolveReference(store, to), { maxDepth }) ?? basePath()
+          );
+        } catch (error) {
+          if (error instanceof Error && error.message.startsWith('unknown graph reference')) return basePath();
+          throw error;
+        }
+      });
     });
   }
   async affected(
@@ -793,24 +813,27 @@ export class WorkgroupGraphDaemon {
     maxDepth = 8,
     context?: TrustedOverlayContext,
   ): Promise<GraphAffectedResult> {
-    await this.ensureFresh(workgroupId, 30_000, context);
-    const baseStore = context || !this.isolateReconcile ? this.requireStore(this.requireState(workgroupId)) : undefined;
-    const base = (): GraphAffectedResult =>
-      baseStore!.affected(this.resolveReference(baseStore!, reference), { maxDepth });
-    if (!context)
-      return this.isolateReconcile
-        ? await runIsolatedRead<GraphAffectedResult>(this.graphPath(workgroupId), workgroupId, 'affected', {
-            reference,
-            maxDepth,
-          })
-        : base();
-    return this.withOverlay(workgroupId, context, (store) => {
-      try {
-        return store.affected(this.resolveReference(store, reference), { maxDepth });
-      } catch (error) {
-        if (error instanceof Error && error.message.startsWith('unknown graph reference')) return base();
-        throw error;
-      }
+    await this.waitForFreshness(workgroupId, 30_000, context);
+    const state = this.requireState(workgroupId);
+    return await this.withStableGeneration(state, async () => {
+      const baseStore = context || !this.isolateReconcile ? this.requireStore(state) : undefined;
+      const base = (): GraphAffectedResult =>
+        baseStore!.affected(this.resolveReference(baseStore!, reference), { maxDepth });
+      if (!context)
+        return this.isolateReconcile
+          ? await runIsolatedRead<GraphAffectedResult>(this.graphPath(workgroupId), workgroupId, 'affected', {
+              reference,
+              maxDepth,
+            })
+          : base();
+      return await this.withOverlay(workgroupId, context, (store) => {
+        try {
+          return store.affected(this.resolveReference(store, reference), { maxDepth });
+        } catch (error) {
+          if (error instanceof Error && error.message.startsWith('unknown graph reference')) return base();
+          throw error;
+        }
+      });
     });
   }
 
@@ -840,7 +863,9 @@ export class WorkgroupGraphDaemon {
   async statusAsync(workgroupId: string): Promise<DaemonWorkgroupStatus> {
     if (!this.isolateReconcile) return this.status(workgroupId);
     const state = this.requireState(workgroupId);
-    const status = await runIsolatedRead<WorkgroupGraphStatus>(this.graphPath(workgroupId), workgroupId, 'status', {});
+    const status = await this.withStableGeneration(state, () =>
+      runIsolatedRead<WorkgroupGraphStatus>(this.graphPath(workgroupId), workgroupId, 'status', {}),
+    );
     return this.withFreshness(state, status);
   }
 
@@ -873,9 +898,9 @@ export class WorkgroupGraphDaemon {
     this.enrichmentRepository.close();
   }
 
-  /** Single-run entrypoint used only by the isolated production worker. */
-  async reconcileOnce(workgroupId: string, signal?: AbortSignal): Promise<IsolatedReconcileResult> {
-    return await this.reconcileInProcess(this.requireState(workgroupId), signal);
+  /** Build-only entrypoint used by the isolated production worker. */
+  async buildCandidateOnce(workgroupId: string, signal?: AbortSignal): Promise<IsolatedReconcileResult> {
+    return await this.reconcileInProcess(this.requireState(workgroupId), signal, false);
   }
 
   private async syncWatchers(descriptors: WorkgroupDescriptor[]): Promise<void> {
@@ -1022,18 +1047,38 @@ export class WorkgroupGraphDaemon {
     const dirtyVersion = state.dirtyVersion;
     const archiveVersion = state.archiveVersion;
     const enrichmentVersion = state.enrichmentVersion;
-    const result = await runIsolatedReconcile({
-      dataDir: this.options.dataDir,
-      groupsDir: this.options.groupsDir,
-      centralDbPath: this.centralDbPath,
-      archivePath: this.archivePath,
-      workgroupId: state.descriptor.id,
-      enableEnrichment: this.enableEnrichment,
-      signal,
-    });
-    state.store?.close();
-    state.store = undefined;
-    this.requireStore(state);
+    let candidatePath: string | undefined;
+    let result: IsolatedReconcileResult;
+    try {
+      result = await runIsolatedReconcile({
+        dataDir: this.options.dataDir,
+        groupsDir: this.options.groupsDir,
+        centralDbPath: this.centralDbPath,
+        archivePath: this.archivePath,
+        workgroupId: state.descriptor.id,
+        enableEnrichment: this.enableEnrichment,
+        signal,
+      });
+      candidatePath = result.candidatePath;
+      if (!candidatePath) throw new Error('isolated Graphify reconcile did not return a candidate database');
+      const candidateStatus = await runIsolatedRead<WorkgroupGraphStatus>(
+        candidatePath,
+        state.descriptor.id,
+        'status',
+        {},
+      );
+      if (candidateStatus.completeGeneration <= 0)
+        throw new Error('isolated Graphify reconcile returned an incomplete candidate database');
+      await this.promoteCandidate(state, candidatePath);
+      candidatePath = undefined;
+    } catch (error) {
+      if (candidatePath) {
+        await rm(candidatePath, { force: true });
+        await rm(`${candidatePath}-wal`, { force: true });
+        await rm(`${candidatePath}-shm`, { force: true });
+      }
+      throw error;
+    }
     state.dirty = state.dirtyVersion !== dirtyVersion || state.enrichmentVersion !== enrichmentVersion;
     state.archiveDirty = state.archiveVersion !== archiveVersion;
     state.lastCompletedAt = result.completedAt;
@@ -1044,7 +1089,11 @@ export class WorkgroupGraphDaemon {
       this.scheduleEnrichment(state, result.codeSources, []);
   }
 
-  private async reconcileInProcess(state: WorkgroupState, signal?: AbortSignal): Promise<IsolatedReconcileResult> {
+  private async reconcileInProcess(
+    state: WorkgroupState,
+    signal?: AbortSignal,
+    promote = true,
+  ): Promise<IsolatedReconcileResult> {
     state.lastStartedAt = new Date().toISOString();
     const dirtyVersion = state.dirtyVersion;
     const archiveVersion = state.archiveVersion;
@@ -1206,13 +1255,28 @@ export class WorkgroupGraphDaemon {
       await next.completeGeneration(generation);
       await next.close();
       next = undefined;
+      // The candidate is private, so force every committed WAL page into the
+      // main file and validate it before handing promotion back to the parent.
+      // DELETE mode also ensures the atomic rename cannot inherit sidecars
+      // belonging to the previous live generation.
+      const candidate = new Database(nextPath);
+      try {
+        candidate.pragma('wal_checkpoint(TRUNCATE)');
+        candidate.pragma('journal_mode = DELETE');
+        const quickCheck = candidate.pragma('quick_check', { simple: true });
+        if (quickCheck !== 'ok') throw new Error(`Graphify candidate integrity check failed: ${String(quickCheck)}`);
+      } finally {
+        candidate.close();
+      }
+      const completedAt = new Date().toISOString();
+      if (!promote) return { codeSources, completedAt, candidatePath: nextPath };
       state.store?.close();
       state.store = undefined;
       await rename(nextPath, livePath);
       state.store = new WorkgroupGraphStore(livePath, state.descriptor.id);
       state.dirty = state.dirtyVersion !== dirtyVersion || state.enrichmentVersion !== enrichmentVersion;
       state.archiveDirty = state.archiveVersion !== archiveVersion;
-      state.lastCompletedAt = new Date().toISOString();
+      state.lastCompletedAt = completedAt;
       state.serveStaleDuringStartup = false;
       state.lastFailure = undefined;
       this.ensureWatchers(state.descriptor);
@@ -1619,6 +1683,44 @@ export class WorkgroupGraphDaemon {
     if (!state) throw new Error(`unknown workgroup: ${workgroupId}`);
     return state;
   }
+
+  private async withStableGeneration<T>(state: WorkgroupState, operation: () => Promise<T> | T): Promise<T> {
+    while (state.promotionGate) await state.promotionGate;
+    state.activeReads += 1;
+    try {
+      return await operation();
+    } finally {
+      state.activeReads -= 1;
+    }
+  }
+
+  private async promoteCandidate(state: WorkgroupState, candidatePath: string): Promise<void> {
+    const directory = join(this.options.dataDir, 'graphify', 'workgroups', state.descriptor.id);
+    const expectedPrefix = `${directory}${sep}index.next-`;
+    if (!candidatePath.startsWith(expectedPrefix) || !candidatePath.endsWith('.db'))
+      throw new Error(`isolated Graphify reconcile returned an invalid candidate path: ${candidatePath}`);
+    if (state.promotionGate) throw new Error(`Graphify promotion already active for ${state.descriptor.id}`);
+
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    state.promotionGate = gate;
+    try {
+      while (state.activeReads > 0) await new Promise<void>((resolve) => setImmediate(resolve));
+      state.store?.close();
+      state.store = undefined;
+      const livePath = this.graphPath(state.descriptor.id);
+      await rm(`${livePath}-wal`, { force: true });
+      await rm(`${livePath}-shm`, { force: true });
+      await rename(candidatePath, livePath);
+      state.store = new WorkgroupGraphStore(livePath, state.descriptor.id);
+    } finally {
+      if (state.promotionGate === gate) state.promotionGate = undefined;
+      release();
+    }
+  }
+
   private requireStore(state: WorkgroupState): WorkgroupGraphStore {
     if (!state.store) {
       const path = this.graphPath(state.descriptor.id);

@@ -138,8 +138,11 @@ describe('WorkgroupGraphDaemon', () => {
     });
     await restarted.start();
     await waitUntil(() => started);
+    const statusSpy = vi.spyOn(WorkgroupGraphStore.prototype, 'status');
     const result = await restarted.query('madison', 'durable restart knowledge');
     expect(result.nodes.length).toBeGreaterThan(0);
+    expect(statusSpy).not.toHaveBeenCalled();
+    statusSpy.mockRestore();
     expect(restarted.status('madison').freshness).toMatchObject({ dirty: true, reconciling: true });
     release();
     await waitUntil(() => !restarted.status('madison').freshness.dirty);

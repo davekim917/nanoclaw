@@ -11,6 +11,8 @@ export interface IsolatedCodeSourceBuild {
 export interface IsolatedReconcileResult {
   codeSources: IsolatedCodeSourceBuild[];
   completedAt: string;
+  /** Private, complete database for the parent daemon to validate and promote. */
+  candidatePath?: string;
 }
 
 export interface IsolatedReconcileOptions {

@@ -1,9 +1,12 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import Database from 'better-sqlite3';
+
 import { WorkgroupGraphStore, type SourceReconciliation } from '../graphify/store.js';
 import type { ExtractionBundle, SourceInput } from '../graphify/types.js';
+import { WorkgroupGraphDaemon } from './daemon.js';
 import { runIsolatedRead } from './isolated-read.js';
 import { runIsolatedSourceReconcile } from './isolated-source-reconcile.js';
 
@@ -99,8 +102,51 @@ export async function main(): Promise<void> {
       fresh.nodes.some((node) => node.name === 'bulk concept 499'),
       'committed update was not immediately retrievable',
     );
+
+    const daemonData = join(root, 'daemon-data');
+    const daemonGroups = join(root, 'daemon-groups');
+    const groupFolder = join(daemonGroups, 'alpha-agent');
+    await mkdir(groupFolder, { recursive: true });
+    const centralPath = join(daemonData, 'v2.db');
+    await mkdir(daemonData, { recursive: true });
+    const central = new Database(centralPath);
+    central.exec(`
+      CREATE TABLE workgroups (id TEXT PRIMARY KEY);
+      CREATE TABLE agent_groups (id TEXT PRIMARY KEY, folder TEXT NOT NULL, workgroup_id TEXT NOT NULL);
+      INSERT INTO workgroups VALUES ('atomic-alpha');
+      INSERT INTO agent_groups VALUES ('atomic-agent', 'alpha-agent', 'atomic-alpha');
+    `);
+    central.close();
+    const knowledgePath = join(groupFolder, 'brief.md');
+    await writeFile(knowledgePath, 'atomic generation one');
+    const daemon = new WorkgroupGraphDaemon({
+      dataDir: daemonData,
+      groupsDir: daemonGroups,
+      centralDbPath: centralPath,
+      enableEnrichment: false,
+      watchFilesystem: false,
+    });
+    try {
+      await daemon.refreshCatalog();
+      await daemon.ensureFresh('atomic-alpha');
+      assert(
+        (await daemon.query('atomic-alpha', 'atomic generation one')).nodes.length > 0,
+        'first isolated generation was not retrievable',
+      );
+      await writeFile(knowledgePath, 'atomic generation two');
+      daemon.markDirty('atomic-alpha');
+      await Promise.all([daemon.ensureFresh('atomic-alpha'), daemon.query('atomic-alpha', 'atomic generation one')]);
+      assert(
+        (await daemon.query('atomic-alpha', 'atomic generation two')).nodes.length > 0,
+        'atomically promoted second generation was not retrievable',
+      );
+      const promoted = await daemon.statusAsync('atomic-alpha');
+      assert(promoted.completeGeneration > 0, 'promoted generation failed its post-swap status read');
+    } finally {
+      await daemon.close();
+    }
     process.stdout.write(
-      `${JSON.stringify({ passed: true, readLatencyMs: Math.round(readLatencyMs), checks: ['sharing', 'isolation', 'provenance', 'concurrent-read', 'freshness'] })}\n`,
+      `${JSON.stringify({ passed: true, readLatencyMs: Math.round(readLatencyMs), checks: ['sharing', 'isolation', 'provenance', 'concurrent-read', 'freshness', 'atomic-promotion'] })}\n`,
     );
   } finally {
     await rm(root, { recursive: true, force: true });

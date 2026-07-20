@@ -28,7 +28,7 @@ const daemon = new WorkgroupGraphDaemon({
 
 try {
   await daemon.refreshCatalog();
-  const result = await daemon.reconcileOnce(options.workgroupId);
+  const result = await daemon.buildCandidateOnce(options.workgroupId);
   await daemon.close();
   port.postMessage({ ok: true, result });
 } catch (error) {
