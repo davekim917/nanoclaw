@@ -104,22 +104,20 @@ data/graphify/jobs/
 The jobs directory is deliberately under `data/`, not `/tmp`, because the
 systemd service uses `PrivateTmp` while Docker bind mounts resolve host paths.
 
-## Relationship to Mnemon
+## Memory architecture
 
-Graphify and Mnemon overlap, but they are not equivalent today. Graphify is the
-broader source-grounded graph: it preserves full files, conversations, code
-topology, provenance, and cross-artifact relationships. Mnemon still owns two
-behaviors Graphify does not yet replace:
+Graphify is the sole derived, workgroup-scoped retrieval layer. Authoritative
+memory remains in source files, external conversation history, canonical
+repository clones, provider-native context, and operator-curated
+`CLAUDE.local.md`. Graphify retrieves across those surfaces with provenance; it
+does not replace them with opaque synthesized facts.
 
-1. automatic pre-turn recall injection without relying on the agent to invoke a
-   skill; and
-2. temporal memory semantics for preferences and decisions, including
-   supersession and current validity.
+Durable content fetched during knowledge work is captured into
+`sources/inbox`, then indexed automatically. Teammates and sibling agents in the
+same workgroup query the same derived graph. Workgroups remain hard isolation
+boundaries, and a caller cannot select a different graph.
 
-For that reason, enabling Graphify does not disable or mutate Mnemon. The
-intended consolidation path is to add a measured Graphify recall/injection
-layer, compare it with Mnemon on real workgroup turns, and retire the separate
-classifier/embedding/wiki/judge stack only after Graphify is non-inferior on
-load-bearing recall and materially better on irrelevant context, latency, and
-resource cost. Mnemon stores should be retained read-only or exported during any
-retirement period.
+The former Mnemon classifier, passive recall injection, recall MCP, Ollama
+embedding dependency, and synthesized wiki pipeline are retired. Their final
+state is retained in an operator-owned rollback snapshot outside Graphify's
+indexed roots. Historical schema columns remain migration compatibility only.

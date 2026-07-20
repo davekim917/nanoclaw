@@ -121,9 +121,9 @@ export interface SourceReconciliationResult {
 /**
  * Synchronous, single-writer store for one workgroup graph.
  *
- * Callers must serialize mutation calls through the owning daemon. SQLite still
- * protects the database from accidental concurrent writes, while DELETE journal
- * mode keeps committed changes visible across bind mounts.
+ * Callers must serialize mutation calls through the owning daemon. Graph state
+ * is host-local derived data, so WAL allows interactive readers to keep using
+ * the last committed snapshot while isolated background workers mutate it.
  */
 export class WorkgroupGraphStore {
   private readonly db: Database.Database;
@@ -132,19 +132,22 @@ export class WorkgroupGraphStore {
   constructor(
     dbPath: string,
     public readonly workgroupId: string,
+    options: { readonly?: boolean } = {},
   ) {
     if (!workgroupId.trim()) {
       throw new Error('workgroupId must not be empty');
     }
 
-    mkdirSync(dirname(dbPath), { recursive: true });
-    this.db = new Database(dbPath);
+    if (!options.readonly) mkdirSync(dirname(dbPath), { recursive: true });
+    this.db = new Database(dbPath, options.readonly ? { readonly: true, fileMustExist: true } : undefined);
     try {
-      this.db.pragma('journal_mode = DELETE');
       this.db.pragma('foreign_keys = ON');
       this.db.pragma('busy_timeout = 5000');
-      this.initializeSchema();
-      this.claimWorkgroup();
+      if (!options.readonly) {
+        this.db.pragma('journal_mode = WAL');
+        this.initializeSchema();
+        this.claimWorkgroup();
+      }
     } catch (error) {
       this.db.close();
       throw error;

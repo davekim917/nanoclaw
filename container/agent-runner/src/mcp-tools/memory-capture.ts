@@ -6,23 +6,19 @@ import type { HookCallback } from '@anthropic-ai/claude-agent-sdk';
 
 const INBOX_DIR = '/workspace/agent/sources/inbox';
 // Sibling staging directory for atomic-write temp files. MUST live OUTSIDE
-// INBOX_DIR — the host memory daemon's inotify watcher fires on every
-// IN_CLOSE_WRITE inside the inbox, including .tmp files. Writing the tmp here
-// then linking into INBOX_DIR means the daemon only sees the final filename's
-// IN_CREATE event, not the transient .tmp. Keeps the atomic semantics
-// (link + unlink for no-clobber) while eliminating dead-letter rows for
-// already-renamed-away .tmp paths.
+// INBOX_DIR so Graphify never observes a partial temporary file. Writing the
+// temp here and then linking into INBOX_DIR means discovery only sees the
+// final filename. This keeps atomic no-clobber semantics without transient
+// artifacts entering the workgroup graph.
 const STAGING_DIR = '/workspace/agent/sources/.tmp';
 // Cap captured content size. A large web page or a `gws gmail search` returning
-// hundreds of items could otherwise write a multi-MB file. The classifier reads
-// captured files via readFileSync and sends them to the Anthropic API; an
-// unbounded write path is both a cost risk and a way to push files past the
-// model's context window (200K for Haiku 4.5), which would dead-letter them
-// after 3 wasted API calls. 50KB is large enough for a substantive article or
-// meeting transcript and small enough to bound waste from adversarial input.
+// hundreds of items could otherwise write a multi-MB file. An unbounded write
+// path increases Graphify indexing cost and can swamp later retrieval context.
+// 50KB is large enough for a substantive article or meeting transcript while
+// bounding waste from adversarial or accidentally enormous tool output.
 const MAX_CAPTURE_BYTES = 50_000;
 const TRUNCATION_NOTICE =
-  '\n\n[Content truncated by memory-capture: exceeded 50KB cap. Original size in attachment metadata.]\n';
+  '\n\n[Content truncated by source-capture: exceeded 50KB cap. Original size in attachment metadata.]\n';
 
 function sha8(input: string): string {
   return crypto.createHash('sha256').update(input).digest('hex').slice(0, 8);
@@ -49,7 +45,7 @@ let _captureFailureLogCount = 0;
 const CAPTURE_FAILURE_LOG_LIMIT = 20;
 /**
  * Best-effort stderr log for capture errors — capped so a misconfigured tool
- * doesn't flood logs. Operators see "memory-capture failed N times for
+ * doesn't flood logs. Operators see "source-capture failed N times for
  * <toolName>: <errClass>" without seeing payload contents (which could be
  * sensitive).
  */
@@ -58,7 +54,7 @@ function logCaptureFailure(context: string, err: unknown): void {
   _captureFailureLogCount++;
   const errClass = err instanceof Error ? err.constructor.name + ':' + err.message.slice(0, 80) : String(err).slice(0, 80);
   const suffix = _captureFailureLogCount === CAPTURE_FAILURE_LOG_LIMIT ? ' (further capture errors suppressed)' : '';
-  console.error(`[memory-capture] ${context}: ${errClass}${suffix}`);
+  console.error(`[source-capture] ${context}: ${errClass}${suffix}`);
 }
 
 /**

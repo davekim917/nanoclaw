@@ -26,13 +26,11 @@ import {
   WORKGROUP_SHARED_FS,
 } from './config.js';
 import {
-  getRecallScope,
   readContainerConfig,
   validateMcpServers,
   writeContainerConfig,
   type ContainerConfig,
   type McpServerConfig,
-  type RecallScope,
 } from './container-config.js';
 import {
   formatMemoryMb,
@@ -252,12 +250,7 @@ export function isContainerRunning(sessionId: string): boolean {
  * sever every migrated pairing on first spawn after deploy. Operator silence
  * means "preserve whatever's there" — not "force own-folder."
  *
- * Race / spawn-order safety: parent lookup is by FOLDER (not by sibling id),
- * so spawning illie-codex before illie still resolves to illie's id once
- * illie's agent_groups row exists. If the parent row doesn't exist yet, we
- * fall back to the calling group's own id (workgroup-of-1) so the container
- * can still spawn; this is the CD-4 spawn-order race documented in
- * docs/workgroups.md § Staleness window. (Codex P1 catch on PR #107.)
+ * The workgroup row is created idempotently before agent_groups is updated.
  */
 export function reconcileWorkgroupAtSpawn(
   db: Database.Database,
@@ -275,22 +268,14 @@ export function reconcileWorkgroupAtSpawn(
     declared = existing?.workgroup_id ?? agentGroup.folder;
   }
 
-  // Look up the seed agent_groups row for the declared workgroup id (folder).
-  const parentRow = db.prepare('SELECT id FROM agent_groups WHERE folder = ? LIMIT 1').get(declared) as
-    | { id: string }
-    | undefined;
-  const mnemonStoreId = parentRow?.id ?? agentGroup.id;
-
   db.transaction(() => {
-    // Insert workgroup row idempotently. ON CONFLICT DO NOTHING preserves any
-    // mnemon_store_id already set by a prior spawn or migration 036.
     db.prepare(
       `
-      INSERT INTO workgroups (id, display_name, onecli_secrets, mnemon_store_id, created_at)
-      VALUES (?, ?, '[]', ?, datetime('now'))
+      INSERT INTO workgroups (id, display_name, onecli_secrets, created_at)
+      VALUES (?, ?, '[]', ?)
       ON CONFLICT(id) DO NOTHING
     `,
-    ).run(declared, declared, mnemonStoreId);
+    ).run(declared, declared, new Date().toISOString());
 
     // Atomic conditional update: only update if the column is NULL or stale.
     db.prepare(
@@ -308,110 +293,6 @@ export function reconcileWorkgroupAtSpawn(
   // inside the same spawn observe different workgroup ids under a
   // concurrent reconcile.
   return { workgroupId: declared };
-}
-
-/**
- * Pattern for a valid mnemon store identifier. Must align with the in-container
- * mnemon-wrapper regex (`container/mnemon-wrapper.sh:12`: `^[a-zA-Z0-9_-]+$`),
- * with an added 128-char length cap as defense-in-depth. Crucially REJECTS:
- *   - `..` (path traversal — the `.` class char is not allowed at all)
- *   - `/` or `\` (path separators)
- *   - empty / whitespace-only strings
- *   - shell metacharacters that could break --store arg parsing
- *
- * Why host-side validation: even though .env write is already privileged, an
- * unvalidated env override would let a `.env` line like
- * `MNEMON_STORE_illie_codex=../../.ssh` escape ~/.mnemon/data and bind-mount
- * an arbitrary host path RW into the container before the container wrapper
- * could reject it. Validate at the host resolution point so every caller
- * (env mount, container env, write redirection) is protected before any
- * filesystem operation runs.
- *
- * Why align with the container wrapper (not stricter or looser): a value
- * accepted by the host but rejected by the wrapper produces a silent recall
- * outage — mount succeeds, env is set, then every `mnemon recall` invocation
- * inside the container exits with code 2 and returns empty. The two patterns
- * must agree. (Codex P2 catches on PR #107.)
- */
-const STORE_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
-
-export function isValidStoreId(value: string): boolean {
-  return STORE_ID_PATTERN.test(value);
-}
-
-/**
- * Resolve the MNEMON_STORE value for a container spawn.
- *
- * Precedence (most specific wins):
- *   1. MNEMON_STORE_<folder> env override (case-insensitive fallback per PR #105)
- *   2. If recallScope === 'self': agentGroup.id (honors explicit isolation opt-out)
- *   3. workgroups.mnemon_store_id for this agent's workgroup
- *   4. agentGroup.id (graceful fallback when no workgroup row exists)
- *
- * The `recallScope` parameter controls behavior at step 2: when a group has
- * declared `memory.recall_scope: 'self'` for isolation, both the mount and the
- * in-container `MNEMON_STORE` env must point at the group's own store, not the
- * workgroup canonical — otherwise in-container `mnemon recall` reads the
- * shared store, bypassing the documented self-only contract. The host-side
- * recall-injection path already honors recall_scope; this keeps the
- * container-side symmetric. (Codex P2 catch on PR #107.)
- *
- * Throws if any source produces a value that fails {@link isValidStoreId} —
- * fail-closed posture prevents an .env mistake or attacker-controlled path
- * traversal from escaping `~/.mnemon/data` via the mount or container env.
- */
-export function resolveMnemonStore(
-  db: Database.Database,
-  agentGroup: Pick<AgentGroup, 'id' | 'folder'>,
-  env: NodeJS.ProcessEnv = process.env,
-  recallScope?: RecallScope,
-  // Resolved workgroup id from spawnContainer. When set, use this directly
-  // instead of re-joining on agent_groups.workgroup_id — eliminates the race
-  // where a concurrent reconcile flips the workgroup between the JOIN read
-  // and the mount/env write.
-  resolvedWgId?: string,
-): string {
-  const scopedKey = `MNEMON_STORE_${agentGroup.folder.replace(/-/g, '_')}`;
-  const envOverride = env[scopedKey] ?? env[scopedKey.toUpperCase()];
-  if (envOverride) {
-    if (!isValidStoreId(envOverride)) {
-      throw new Error(
-        `resolveMnemonStore: ${scopedKey} value is not a valid store id (got ${JSON.stringify(envOverride)}). ` +
-          `Must match /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/ with no '..' sequences.`,
-      );
-    }
-    return envOverride;
-  }
-
-  if (recallScope === 'self') {
-    if (!isValidStoreId(agentGroup.id)) {
-      throw new Error(
-        `resolveMnemonStore: agent_group.id is not a valid store id (got ${JSON.stringify(agentGroup.id)}).`,
-      );
-    }
-    return agentGroup.id;
-  }
-
-  const wgRow = resolvedWgId
-    ? (db.prepare(`SELECT mnemon_store_id FROM workgroups WHERE id = ?`).get(resolvedWgId) as
-        | { mnemon_store_id: string | null }
-        | undefined)
-    : (db
-        .prepare(
-          `SELECT w.mnemon_store_id FROM workgroups w
-           JOIN agent_groups a ON a.workgroup_id = w.id
-           WHERE a.id = ?`,
-        )
-        .get(agentGroup.id) as { mnemon_store_id: string | null } | undefined);
-
-  const resolved = wgRow?.mnemon_store_id ?? agentGroup.id;
-  if (!isValidStoreId(resolved)) {
-    throw new Error(
-      `resolveMnemonStore: resolved store id is invalid (got ${JSON.stringify(resolved)} for agent_group ${agentGroup.id}). ` +
-        `Workgroup row or agent_groups.id has an unexpected shape.`,
-    );
-  }
-  return resolved;
 }
 
 /**
@@ -1374,8 +1255,8 @@ export function buildMounts(
   // (e.g. groups/illie-codex/XZO -> ../illie/XZO) so two siblings share the
   // same source repos / sources / conversations on the host. Inside the
   // container, those symlinks would dereference to /workspace/illie/XZO,
-  // which isn't mounted — so create_worktree, conversations reads, mnemon
-  // source-ingest all fail with ENOENT. Overlay each host-resolvable
+  // which isn't mounted — so create_worktree, conversation reads, and source
+  // discovery all fail with ENOENT. Overlay each host-resolvable
   // symlink with a bind mount at the same container path so the entry
   // appears as a real directory inside the container, transparently
   // pointing at the source group's files.
@@ -1581,35 +1462,6 @@ export function buildMounts(
   if (containerConfig.additionalMounts && containerConfig.additionalMounts.length > 0) {
     const validated = validateAdditionalMounts(containerConfig.additionalMounts, agentGroup.name);
     mounts.push(...validated);
-  }
-
-  // Memory store: RW mount so sqlite can create journal/lock files.
-  //
-  // CRITICAL: the mount path must match the resolved MNEMON_STORE env value, NOT
-  // just agentGroup.id. With PR #105's env override + PR #106's workgroups.mnemon_store_id
-  // resolution, the codex twin's MNEMON_STORE points at the parent's store id —
-  // mounting only ~/.mnemon/data/<agentGroup.id> would leave the parent's store
-  // directory absent from the container, so recall would see an empty store.
-  // (Codex review on PR #105 caught this — the original cross-tenant narrowing
-  // comment was correct, but the implementation tied the mount to the wrong id.)
-  //
-  // Cross-tenant narrowing still holds: resolveMnemonStore is bounded to the
-  // spawning agent's workgroup (via workgroups.mnemon_store_id JOIN on agent_groups)
-  // or to an explicit env override. Never mounts ~/.mnemon/ at large.
-  if (containerConfig.memory?.enabled === true) {
-    // Pass recall_scope so 'self' opt-outs mount their own store, not the
-    // workgroup canonical (Codex P2 catch on PR #107 — host-side
-    // recall-injection honors recall_scope; this keeps the container-side
-    // symmetric so in-container `mnemon recall` reads from the same store).
-    const recallScope = getRecallScope(containerConfig.memory);
-    const resolvedStore = resolveMnemonStore(getDb(), agentGroup, process.env, recallScope, wgId);
-    const mnemonDataDir = path.join(os.homedir(), '.mnemon', 'data', resolvedStore);
-    fs.mkdirSync(mnemonDataDir, { recursive: true });
-    mounts.push({
-      hostPath: mnemonDataDir,
-      containerPath: `/home/node/.mnemon/data/${resolvedStore}`,
-      readonly: false,
-    });
   }
 
   // Plugin mounts: every subdir of ~/plugins is mounted RO at
@@ -2324,16 +2176,12 @@ function ensureRuntimeFields(
   if (dirty) {
     // Race-safe write: re-read container.json immediately before persisting
     // and merge our identity fields onto the freshest disk state. Without
-    // this, a concurrent writer (e.g. enable-memory.ts flipping
-    // memory.enabled, or any future config-mutating script) can have its
+    // this, a concurrent config-mutating script can have its
     // update silently clobbered when our write lands later in the spawn
     // flow with a stale in-memory containerConfig.
     //
-    // Real-world incident: bulk-enable-memory across 11 groups left 2
-    // (video-agent, xerus — the two without a pre-existing agentGroupId
-    // in container.json) with memory.enabled=false on disk despite the
-    // bulk script writing memory.enabled=true, because the spawn flow's
-    // ensureRuntimeFields write-back lost the race.
+    // This read/merge/write shape preserves any operator-owned fields written
+    // after the spawn began.
     const fresh = readContainerConfig(agentGroup.folder);
     fresh.agentGroupId = agentGroup.id;
     fresh.groupName = agentGroup.name;
@@ -2341,7 +2189,6 @@ function ensureRuntimeFields(
     // Sync the in-memory copy with anything the concurrent writer may have
     // added between our read and write — downstream spawn code reads other
     // fields from containerConfig and would otherwise miss those updates.
-    if (fresh.memory !== undefined) containerConfig.memory = fresh.memory;
     if (fresh.tools !== undefined) containerConfig.tools = fresh.tools;
     if (fresh.mcpServers !== undefined) containerConfig.mcpServers = fresh.mcpServers;
   }
@@ -2680,8 +2527,8 @@ async function buildContainerArgs(
   // OAuth, Codex auth dir, etc.) without duplicating every var with a
   // sibling-specific suffix.
   //
-  // Identity-bound concerns (containerName, group dir mount, MNEMON_STORE
-  // override env-key, log fields) stay on `agentGroup.folder` so siblings
+  // Identity-bound concerns (containerName, group dir mount, log fields)
+  // stay on `agentGroup.folder` so siblings
   // remain individually addressable.
   const credentialFolder = containerConfig.credentialFolder ?? agentGroup.folder;
 
@@ -2820,30 +2667,6 @@ async function buildContainerArgs(
   // Per-group opt-in flags from container.json.
   if (containerConfig.ollamaAdminTools) {
     args.push('-e', 'OLLAMA_ADMIN_TOOLS=true');
-  }
-
-  // Memory env vars: injected only when memory is enabled for this group.
-  //
-  // MNEMON_STORE resolution precedence (most specific wins):
-  //   1. MNEMON_STORE_<folder> env override (case-insensitive fallback, PR #105)
-  //   2. recall_scope === 'self' → agentGroup.id (honors isolation opt-out)
-  //   3. workgroups.mnemon_store_id for this agent's workgroup (set by the
-  //      reconciler at spawn time — ensures illie-codex shares illie's store)
-  //   4. agentGroup.id (graceful fallback when workgroups row is absent)
-  //
-  // Must agree with the mount path resolved in buildMounts — both call
-  // resolveMnemonStore with the same recallScope argument.
-  if (containerConfig.memory?.enabled === true) {
-    const recallScope = getRecallScope(containerConfig.memory);
-    // Pass resolvedWgId so MNEMON_STORE stays aligned with the mount path
-    // computed in buildMounts (which already uses wgId). Without it, a
-    // concurrent reconcile could make the env point at a different workgroup
-    // than the mount — silent recall-divergence. (Codex round-2 catch.)
-    const mnemonStore = resolveMnemonStore(getDb(), agentGroup, process.env, recallScope, resolvedWgId);
-    args.push('-e', `MNEMON_STORE=${mnemonStore}`);
-    args.push('-e', 'MNEMON_READ_ONLY=1');
-    args.push('-e', 'MNEMON_EMBED_ENDPOINT=http://host.docker.internal:11434');
-    args.push('-e', 'MNEMON_EMBED_MODEL=nomic-embed-text');
   }
 
   // Provider-contributed env vars (e.g. XDG_DATA_HOME, OPENCODE_*, NO_PROXY).

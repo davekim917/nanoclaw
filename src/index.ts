@@ -14,12 +14,7 @@ import { migrateGroupsToClaudeLocal } from './claude-md-compose.js';
 import { initDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
 import { registerSecretsFromEnv } from './secret-scrubber.js';
-import {
-  getMessagingGroupsByChannel,
-  getMessagingGroupAgents,
-  getMessagingGroupByPlatform,
-  updateMessagingGroup,
-} from './db/messaging-groups.js';
+import { getMessagingGroupByPlatform, updateMessagingGroup } from './db/messaging-groups.js';
 import { ensureContainerRuntimeRunning, cleanupOrphans } from './container-runtime.js';
 import { resetPhantomContainerStatus } from './db/sessions.js';
 import { stopAllContainers } from './container-runner.js';
@@ -39,7 +34,6 @@ import { restoreRemoteControl } from './remote-control.js';
 import { startDiscordSlashCommands, stopDiscordSlashCommands } from './channels/discord-slash-commands.js';
 import { routeInbound } from './router.js';
 import { log } from './log.js';
-import { runStartupOllamaCheck } from './host-ollama-status.js';
 import { startDashboard } from './dashboard/index.js';
 import { enforceUpgradeTripwire } from './upgrade-state.js';
 
@@ -105,8 +99,7 @@ import './modules/index.js';
 // since the reconciler queries the central DB.
 import { runReconcilerOnStartup as runDispatchReconcilerOnStartup } from './modules/orchestrator-dispatch/index.js';
 
-// Workgroup FS reconciler — drains the _migration036_report temp table and
-// writes recall_scope to paired groups' container.json. Runs after migrations.
+// Workgroup FS reconciler — drains the migration-036 report after migrations.
 import { reconcileWorkgroupFsState } from './modules/workgroup/fs-reconcile.js';
 import { reconcileWorkgroupSharedDirs } from './modules/workgroup/shared-dirs.js';
 import { WORKGROUP_SHARED_FS } from './config.js';
@@ -138,15 +131,6 @@ async function main(): Promise<void> {
   // 0b. Register secret values from .env for outbound scrubbing.
   registerSecretsFromEnv();
 
-  // 0c. Non-blocking Ollama startup check — writes data/.host-ollama-status.json.
-  runStartupOllamaCheck()
-    .then((s) => {
-      log.info('host-ollama-status', { ok: s.ok, endpoint: s.endpoint, error: s.error });
-    })
-    .catch(() => {
-      /* never throws */
-    });
-
   // 0.5 Upgrade tripwire — refuse to start if this install was updated
   // outside the sanctioned path (raw `git pull` instead of /update-nanoclaw).
   enforceUpgradeTripwire();
@@ -157,8 +141,7 @@ async function main(): Promise<void> {
   runMigrations(db);
 
   // Workgroup FS reconciliation — runs after migrations to drain the
-  // _migration036_report temp table and write recall_scope to paired
-  // groups' container.json. On FS failure, exit; restart is the recovery
+  // _migration036_report temp table. On FS failure, exit; restart is the recovery
   // (reconciler is idempotent).
   try {
     reconcileWorkgroupFsState(db);

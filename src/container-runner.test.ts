@@ -15,7 +15,6 @@ import {
   resolveCodexAuthFallbacks,
   resolveProviderName,
   reconcileWorkgroupAtSpawn,
-  resolveMnemonStore,
 } from './container-runner.js';
 import { formatMemoryMb, resolveContainerResources } from './container-resources.js';
 import { mergeWorkgroupAndGroupSecrets } from './onecli-secrets.js';
@@ -586,11 +585,11 @@ function insertGroup(db: Database.Database, id: string, folder: string, workgrou
   ).run(id, folder, folder, workgroupId ?? null);
 }
 
-function insertWorkgroup(db: Database.Database, id: string, mnemonStoreId: string, onecliSecrets = '[]'): void {
+function insertWorkgroup(db: Database.Database, id: string, onecliSecrets = '[]'): void {
   db.prepare(
-    `INSERT INTO workgroups (id, display_name, onecli_secrets, mnemon_store_id, created_at)
-     VALUES (?, ?, ?, ?, datetime('now'))`,
-  ).run(id, id, onecliSecrets, mnemonStoreId);
+    `INSERT INTO workgroups (id, display_name, onecli_secrets, created_at)
+     VALUES (?, ?, ?, ?)`,
+  ).run(id, id, onecliSecrets, new Date().toISOString());
 }
 
 describe('reconcileWorkgroupAtSpawn — C1', () => {
@@ -600,7 +599,7 @@ describe('reconcileWorkgroupAtSpawn — C1', () => {
     db = makeWorkgroupDb();
   });
 
-  it('test_reconciler_uses_parent_folder_for_mnemon_store_id', () => {
+  it('test_reconciler_creates_workgroup_and_updates_membership', () => {
     // Seed illie (parent) and illie-codex (sibling)
     insertGroup(db, 'ag-illie', 'illysium');
     insertGroup(db, 'ag-illie-codex', 'illysium-codex');
@@ -611,12 +610,9 @@ describe('reconcileWorkgroupAtSpawn — C1', () => {
 
     reconcileWorkgroupAtSpawn(db, agentGroup, containerConfig);
 
-    // workgroup row should exist with mnemon_store_id = illie's agent_groups.id
-    const wg = db.prepare('SELECT mnemon_store_id FROM workgroups WHERE id = ?').get('illysium') as {
-      mnemon_store_id: string;
-    };
+    const wg = db.prepare('SELECT id FROM workgroups WHERE id = ?').get('illysium') as { id: string };
     expect(wg).toBeDefined();
-    expect(wg.mnemon_store_id).toBe('ag-illie');
+    expect(wg.id).toBe('illysium');
 
     // agent_groups.workgroup_id should be updated
     const ag = db.prepare('SELECT workgroup_id FROM agent_groups WHERE id = ?').get('ag-illie-codex') as {
@@ -626,22 +622,20 @@ describe('reconcileWorkgroupAtSpawn — C1', () => {
   });
 
   it('test_reconciler_preserves_existing_workgroup_row', () => {
-    // Pre-seed workgroup with custom mnemon_store_id
-    const customStoreId = 'ag-custom-store';
+    // Pre-seed workgroup with operator-owned secret configuration.
     insertGroup(db, 'ag-illie', 'illysium');
     insertGroup(db, 'ag-illie-codex', 'illysium-codex');
-    insertWorkgroup(db, 'illysium', customStoreId);
+    insertWorkgroup(db, 'illysium', '["Shared-Secret"]');
 
     const agentGroup = { id: 'ag-illie-codex', folder: 'illysium-codex' };
     const containerConfig = { workgroup_id: 'illysium' };
 
     reconcileWorkgroupAtSpawn(db, agentGroup, containerConfig);
 
-    // ON CONFLICT DO NOTHING: existing row preserved
-    const wg = db.prepare('SELECT mnemon_store_id FROM workgroups WHERE id = ?').get('illysium') as {
-      mnemon_store_id: string;
+    const wg = db.prepare('SELECT onecli_secrets FROM workgroups WHERE id = ?').get('illysium') as {
+      onecli_secrets: string;
     };
-    expect(wg.mnemon_store_id).toBe(customStoreId);
+    expect(wg.onecli_secrets).toBe('["Shared-Secret"]');
   });
 
   it('test_reconciler_standalone_fallback_to_self', () => {
@@ -653,12 +647,9 @@ describe('reconcileWorkgroupAtSpawn — C1', () => {
 
     reconcileWorkgroupAtSpawn(db, agentGroup, containerConfig);
 
-    // workgroup id = own folder; mnemon_store_id = own agent_groups.id
-    const wg = db.prepare('SELECT mnemon_store_id FROM workgroups WHERE id = ?').get('solo-agent') as {
-      mnemon_store_id: string;
-    };
+    const wg = db.prepare('SELECT id FROM workgroups WHERE id = ?').get('solo-agent') as { id: string };
     expect(wg).toBeDefined();
-    expect(wg.mnemon_store_id).toBe('ag-solo');
+    expect(wg.id).toBe('solo-agent');
 
     const ag = db.prepare('SELECT workgroup_id FROM agent_groups WHERE id = ?').get('ag-solo') as {
       workgroup_id: string;
@@ -694,7 +685,7 @@ describe('reconcileWorkgroupAtSpawn — C1', () => {
   it('test_reconciler_noop_when_unchanged', () => {
     // Pre-set workgroup_id correctly
     insertGroup(db, 'ag-bar', 'bar', 'bar');
-    insertWorkgroup(db, 'bar', 'ag-bar');
+    insertWorkgroup(db, 'bar');
 
     // Spy on prepare to check that UPDATE runs but updates 0 rows
     const before = db.prepare('SELECT workgroup_id FROM agent_groups WHERE id = ?').get('ag-bar') as {
@@ -709,145 +700,6 @@ describe('reconcileWorkgroupAtSpawn — C1', () => {
       workgroup_id: string;
     };
     expect(after.workgroup_id).toBe('bar');
-  });
-});
-
-// ── MNEMON_STORE resolver tests (C2) ─────────────────────────────────────────
-
-describe('resolveMnemonStore — C2', () => {
-  let db: Database.Database;
-
-  beforeEach(() => {
-    db = makeWorkgroupDb();
-  });
-
-  it('test_mnemon_store_from_workgroups_when_no_env_override', () => {
-    insertGroup(db, 'ag-illie-codex', 'illysium-codex', 'illysium');
-    insertWorkgroup(db, 'illysium', 'ag-illie'); // parent's id
-
-    const result = resolveMnemonStore(db, { id: 'ag-illie-codex', folder: 'illysium-codex' }, {});
-    expect(result).toBe('ag-illie');
-  });
-
-  it('test_pr_105_env_override_takes_precedence', () => {
-    insertGroup(db, 'ag-illie-codex', 'illysium-codex', 'illysium');
-    insertWorkgroup(db, 'illysium', 'ag-illie');
-
-    // Env override should win over workgroups.mnemon_store_id
-    const env = { MNEMON_STORE_illysium_codex: 'env-override-store' };
-    const result = resolveMnemonStore(db, { id: 'ag-illie-codex', folder: 'illysium-codex' }, env);
-    expect(result).toBe('env-override-store');
-  });
-
-  it('test_uppercase_env_override_fallback_preserved', () => {
-    insertGroup(db, 'ag-foo', 'foo', 'foo');
-    insertWorkgroup(db, 'foo', 'ag-foo');
-
-    // Uppercase variant should also be honored (PR #105 case-insensitive fallback)
-    const env = { MNEMON_STORE_FOO: 'uppercase-override' };
-    const result = resolveMnemonStore(db, { id: 'ag-foo', folder: 'foo' }, env);
-    expect(result).toBe('uppercase-override');
-  });
-
-  it('test_fallback_to_agent_group_id_when_workgroups_row_missing', () => {
-    // No workgroups row and no workgroup_id on agent_groups
-    insertGroup(db, 'ag-orphan', 'orphan');
-
-    const result = resolveMnemonStore(db, { id: 'ag-orphan', folder: 'orphan' }, {});
-    expect(result).toBe('ag-orphan');
-  });
-
-  // ── Codex P2: path-traversal validation ────────────────────────────────────
-
-  it('test_rejects_env_override_with_path_traversal', () => {
-    insertGroup(db, 'ag-illie-codex', 'illysium-codex', 'illysium');
-    insertWorkgroup(db, 'illysium', 'ag-illie');
-
-    // An operator typo (or attacker who controls .env) sets a traversal value.
-    // Must throw rather than silently mount ~/.ssh or similar.
-    const env = { MNEMON_STORE_illysium_codex: '../../.ssh' };
-    expect(() => resolveMnemonStore(db, { id: 'ag-illie-codex', folder: 'illysium-codex' }, env)).toThrow(
-      /not a valid store id/,
-    );
-  });
-
-  it('test_rejects_env_override_with_slash', () => {
-    insertGroup(db, 'ag-illie-codex', 'illysium-codex', 'illysium');
-    insertWorkgroup(db, 'illysium', 'ag-illie');
-
-    const env = { MNEMON_STORE_illysium_codex: 'subdir/store' };
-    expect(() => resolveMnemonStore(db, { id: 'ag-illie-codex', folder: 'illysium-codex' }, env)).toThrow(
-      /not a valid store id/,
-    );
-  });
-
-  it('test_rejects_env_override_with_dot_character', () => {
-    insertGroup(db, 'ag-illie-codex', 'illysium-codex', 'illysium');
-    insertWorkgroup(db, 'illysium', 'ag-illie');
-
-    // The host-side pattern aligns with the container wrapper's
-    // `^[a-zA-Z0-9_-]+$` regex (`container/mnemon-wrapper.sh:12`), which
-    // disallows `.` entirely. A value the container would later reject
-    // must also fail at the host so we don't mount-then-fail silently.
-    const env = { MNEMON_STORE_illysium_codex: 'foo.bar' };
-    expect(() => resolveMnemonStore(db, { id: 'ag-illie-codex', folder: 'illysium-codex' }, env)).toThrow(
-      /not a valid store id/,
-    );
-  });
-
-  it('test_rejects_empty_env_override_falls_through_to_workgroup', () => {
-    // Empty string is falsy → falls through to workgroup lookup (not validated
-    // because we never reach the validation path).
-    insertGroup(db, 'ag-illie-codex', 'illysium-codex', 'illysium');
-    insertWorkgroup(db, 'illysium', 'ag-illie');
-
-    const env = { MNEMON_STORE_illysium_codex: '' };
-    const result = resolveMnemonStore(db, { id: 'ag-illie-codex', folder: 'illysium-codex' }, env);
-    expect(result).toBe('ag-illie'); // workgroups.mnemon_store_id wins
-  });
-
-  it('test_accepts_normal_store_ids', () => {
-    // Sanity: don't break legitimate ids.
-    insertGroup(db, 'ag-1776377699463-2axxhg', 'illysium');
-    insertWorkgroup(db, 'illysium', 'ag-1776377699463-2axxhg');
-
-    const result = resolveMnemonStore(db, { id: 'ag-1776377699463-2axxhg', folder: 'illysium' }, {});
-    expect(result).toBe('ag-1776377699463-2axxhg');
-  });
-
-  // ── Codex P2 #3 (PR #107): honor recall_scope='self' at the mount path ─────
-
-  it('test_self_scope_returns_agent_id_not_workgroup_canonical', () => {
-    // A workgroup member explicitly opting out of shared recall via
-    // recall_scope: 'self' must mount its OWN store, not the workgroup canonical
-    // — otherwise the in-container `mnemon recall` reads the shared store and
-    // bypasses the isolation contract.
-    insertGroup(db, 'ag-illie-codex', 'illysium-codex', 'illysium');
-    insertWorkgroup(db, 'illysium', 'ag-illie'); // canonical points at seed
-
-    const result = resolveMnemonStore(db, { id: 'ag-illie-codex', folder: 'illysium-codex' }, {}, 'self');
-    expect(result).toBe('ag-illie-codex'); // own id, NOT 'ag-illie'
-  });
-
-  it('test_workgroup_scope_falls_through_to_canonical', () => {
-    // Default behavior preserved when scope is 'workgroup' (the new default).
-    insertGroup(db, 'ag-illie-codex', 'illysium-codex', 'illysium');
-    insertWorkgroup(db, 'illysium', 'ag-illie');
-
-    const result = resolveMnemonStore(db, { id: 'ag-illie-codex', folder: 'illysium-codex' }, {}, 'workgroup');
-    expect(result).toBe('ag-illie');
-  });
-
-  it('test_env_override_still_wins_over_self_scope', () => {
-    // Operator-set env override is the most specific source and beats every
-    // other selector, including a recall_scope='self' opt-out (otherwise an
-    // operator could not redirect a self-scoped agent to a custom store).
-    insertGroup(db, 'ag-foo', 'foo', 'foo');
-    insertWorkgroup(db, 'foo', 'ag-foo');
-
-    const env = { MNEMON_STORE_foo: 'custom-store' };
-    const result = resolveMnemonStore(db, { id: 'ag-foo', folder: 'foo' }, env, 'self');
-    expect(result).toBe('custom-store');
   });
 });
 
@@ -867,11 +719,10 @@ describe('reconcileWorkgroupAtSpawn — workgroup_id preservation', () => {
   it('test_preserves_migrated_workgroup_id_when_container_config_silent', () => {
     // Simulate post-migration-036 state for illie + illie-codex pair:
     // both agent_groups rows have workgroup_id='illysium' set by migration,
-    // but illie-codex's container.json does not declare workgroup_id (FS
-    // reconciler only wrote recall_scope).
+    // while existing container.json files did not declare workgroup_id.
     insertGroup(db, 'ag-illie', 'illysium', 'illysium');
     insertGroup(db, 'ag-illie-codex', 'illysium-codex', 'illysium');
-    insertWorkgroup(db, 'illysium', 'ag-illie');
+    insertWorkgroup(db, 'illysium');
 
     // Spawn illie-codex with no workgroup_id in containerConfig — must preserve
     // the migrated pairing rather than overwriting to 'illysium-codex'.
@@ -882,11 +733,8 @@ describe('reconcileWorkgroupAtSpawn — workgroup_id preservation', () => {
     };
     expect(after.workgroup_id).toBe('illysium'); // preserved, NOT overwritten to 'illysium-codex'
 
-    // workgroups row for 'illysium' must still point at the seed sibling.
-    const wg = db.prepare('SELECT mnemon_store_id FROM workgroups WHERE id = ?').get('illysium') as {
-      mnemon_store_id: string;
-    };
-    expect(wg.mnemon_store_id).toBe('ag-illie');
+    const wg = db.prepare('SELECT id FROM workgroups WHERE id = ?').get('illysium') as { id: string };
+    expect(wg.id).toBe('illysium');
   });
 
   it('test_explicit_config_workgroup_id_overrides_db_value', () => {

@@ -96,19 +96,7 @@ export function composeGroupClaudeMd(group: AgentGroup, provider: string): void 
   // use that module's tools (install_packages, ncl tasks, etc.). Scheduling
   // guidance lives entirely in cli.instructions.md and is therefore excluded
   // when cli_scope is disabled; there is no separate scheduling MCP fragment.
-  // Skip memory-recall.instructions.md when memory is disabled — the
-  // recall_memory tool only registers when MNEMON_STORE is set (memory
-  // enabled), so the fragment would describe a tool the agent doesn't have.
   const cliDisabled = configRow?.cli_scope === 'disabled';
-  let memoryDisabled = true;
-  try {
-    const raw = JSON.parse(fs.readFileSync(path.join(groupDir, 'container.json'), 'utf8')) as {
-      memory?: { enabled?: boolean };
-    };
-    memoryDisabled = raw.memory?.enabled !== true;
-  } catch {
-    // No container.json (or unreadable) — treat as memory-disabled.
-  }
   const mcpToolsHostDir = path.join(process.cwd(), MCP_TOOLS_HOST_SUBPATH);
   if (fs.existsSync(mcpToolsHostDir)) {
     for (const entry of fs.readdirSync(mcpToolsHostDir)) {
@@ -116,7 +104,6 @@ export function composeGroupClaudeMd(group: AgentGroup, provider: string): void 
       if (!match) continue;
       const moduleName = match[1];
       if (moduleName === 'cli' && cliDisabled) continue;
-      if (moduleName === 'memory-recall' && memoryDisabled) continue;
       // Worker-def orchestration is Claude-only (Task-tool subagents from
       // ~/.claude/agents); codex/opencode groups must not get these instructions.
       if (moduleName === 'orchestrator-workers' && provider !== 'claude') continue;

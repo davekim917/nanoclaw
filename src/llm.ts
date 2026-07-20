@@ -3,9 +3,8 @@
  * topic classification, search reranking).
  *
  * Goes straight to Anthropic's `/v1/messages` over the OneCLI gateway
- * proxy — the same path `src/dashboard/session-title-sweep.ts` and
- * `src/memory-daemon/backends/anthropic.ts` use, both of which run in
- * this same host process so the proxy + OAuth-token env is already
+ * proxy — the same path `src/dashboard/session-title-sweep.ts` uses in
+ * this host process, so the proxy + OAuth-token env is already
  * wired (the systemd unit sets HTTPS_PROXY + CLAUDE_CODE_OAUTH_TOKEN=
  * placeholder; the gateway swaps the placeholder for the vault token).
  *

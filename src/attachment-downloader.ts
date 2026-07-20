@@ -21,8 +21,7 @@ import path from 'path';
 
 import { GROUPS_DIR } from './config.js';
 import { getAgentGroup } from './db/agent-groups.js';
-import { readContainerConfig } from './container-config.js';
-import { isNonSymlinkChain } from './memory-daemon/source-ingest.js';
+import { isNonSymlinkDirectoryChain } from './fs-safety.js';
 import { sessionDir } from './session-manager.js';
 import { log } from './log.js';
 
@@ -101,75 +100,69 @@ export function persistInboundAttachments(
       const absPath = path.join(baseDir, filename);
       fs.writeFileSync(absPath, buffer);
 
-      // Memory sources mirror — additive, only when memory is enabled for this group.
+      // Graphify source mirror — attachments become workgroup knowledge
+      // immediately through the daemon's sources/inbox watcher.
       try {
         const ag = getAgentGroup(agentGroupId);
         if (ag) {
-          const cfg = readContainerConfig(ag.folder);
-          if (cfg.memory?.enabled === true) {
-            // Codex F7 round 3 (2026-05-05): the daemon hardens its sweep
-            // path against intermediate-symlink bypasses (sources or
-            // sources/inbox symlinked to another group's matching path
-            // would cross-ingest victim files). The host attachment mirror
-            // writes directly into the same tree and was bypassing the
-            // chain check — an attachment routed to group A could land in
-            // group B's inbox and become B's facts. Apply the same chain
-            // validation here.
-            const groupRoot = path.join(GROUPS_DIR, ag.folder);
-            if (isNonSymlinkChain(groupRoot, 'sources', 'inbox')) {
-              const sourcesInbox = path.join(groupRoot, 'sources', 'inbox');
-              fs.mkdirSync(sourcesInbox, { recursive: true });
-              const mirrorExt = ext || '.bin';
-              const finalName = `attachment-${sha}${mirrorExt}`;
-              const finalPath = path.join(sourcesInbox, finalName);
-              // Codex F11 round 4 (2026-05-05): the prior tmpPath was
-              // `<finalName>.tmp` — fully predictable from attacker-supplied
-              // attachment bytes and extension. An attacker with write
-              // access to the inbox can pre-place that tmp path as a
-              // symlink to /etc/passwd or another group's inbox file;
-              // default writeFileSync follows symlinks and the host
-              // truncates/writes the symlink target. Defense:
-              //   1. Randomize tmp name so it can't be pre-placed
-              //   2. Open with O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW —
-              //      O_EXCL refuses to clobber existing entries, O_NOFOLLOW
-              //      refuses to traverse if the final path component is a
-              //      symlink. Together they bound the write to a fresh,
-              //      regular-file fd that we control.
-              const tmpName = `${finalName}.${randomBytes(8).toString('hex')}.tmp`;
-              const tmpPath = path.join(sourcesInbox, tmpName);
-              if (!fs.existsSync(finalPath)) {
-                let fd: number | undefined;
-                try {
-                  fd = fs.openSync(
-                    tmpPath,
-                    fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
-                    0o600,
-                  );
-                  fs.writeSync(fd, buffer);
-                } finally {
-                  if (fd !== undefined) {
-                    try {
-                      fs.closeSync(fd);
-                    } catch {
-                      /* best-effort */
-                    }
+          const groupRoot = path.join(GROUPS_DIR, ag.folder);
+          if (isNonSymlinkDirectoryChain(groupRoot, 'sources', 'inbox')) {
+            const sourcesInbox = path.join(groupRoot, 'sources', 'inbox');
+            fs.mkdirSync(sourcesInbox, { recursive: true });
+            const mirrorExt = ext || '.bin';
+            const finalName = `attachment-${sha}${mirrorExt}`;
+            const finalPath = path.join(sourcesInbox, finalName);
+            // Codex F11 round 4 (2026-05-05): the prior tmpPath was
+            // `<finalName>.tmp` — fully predictable from attacker-supplied
+            // attachment bytes and extension. An attacker with write
+            // access to the inbox can pre-place that tmp path as a
+            // symlink to /etc/passwd or another group's inbox file;
+            // default writeFileSync follows symlinks and the host
+            // truncates/writes the symlink target. Defense:
+            //   1. Randomize tmp name so it can't be pre-placed
+            //   2. Open with O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW —
+            //      O_EXCL refuses to clobber existing entries, O_NOFOLLOW
+            //      refuses to traverse if the final path component is a
+            //      symlink. Together they bound the write to a fresh,
+            //      regular-file fd that we control.
+            const tmpName = `${finalName}.${randomBytes(8).toString('hex')}.tmp`;
+            const tmpPath = path.join(sourcesInbox, tmpName);
+            if (!fs.existsSync(finalPath)) {
+              let fd: number | undefined;
+              try {
+                fd = fs.openSync(
+                  tmpPath,
+                  fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
+                  0o600,
+                );
+                fs.writeSync(fd, buffer);
+              } finally {
+                if (fd !== undefined) {
+                  try {
+                    fs.closeSync(fd);
+                  } catch {
+                    /* best-effort */
                   }
                 }
-                // renameSync moves the directory entry; if finalPath was
-                // pre-placed as a symlink the rename replaces the symlink
-                // with the regular file (the symlink target is untouched).
-                fs.renameSync(tmpPath, finalPath);
               }
-            } else {
-              log.warn('Skipped attachment mirror — sources/inbox chain failed validation', {
-                messageId,
-                folder: ag.folder,
-              });
+              // renameSync moves the directory entry; if finalPath was
+              // pre-placed as a symlink the rename replaces the symlink
+              // with the regular file (the symlink target is untouched).
+              fs.renameSync(tmpPath, finalPath);
             }
+          } else {
+            log.warn('Skipped attachment mirror — sources/inbox chain failed validation', {
+              messageId,
+              folder: ag.folder,
+            });
           }
         }
       } catch (mirrorErr) {
-        log.warn('Failed to mirror attachment to memory sources inbox', { messageId, name: raw.name, err: mirrorErr });
+        log.warn('Failed to mirror attachment to Graphify sources inbox', {
+          messageId,
+          name: raw.name,
+          err: mirrorErr,
+        });
       }
 
       // Relative to the session root (which the container mounts as /workspace)

@@ -47,6 +47,23 @@ function bundleFor(sourceId: string, relativePath: string, nodeId: string, nodeN
 }
 
 describe('WorkgroupGraphStore', () => {
+  test('read-only store serves retrieval without claiming a writer lock', () => {
+    const root = mkdtempSync(join(tmpdir(), 'graphify-store-readonly-'));
+    roots.push(root);
+    const path = join(root, 'index.db');
+    const writer = new WorkgroupGraphStore(path, 'madison-reed');
+    const generation = writer.beginGeneration('seed');
+    const input = source('source-readonly', 'notes/readonly.md');
+    writer.upsertSource(input, bundleFor(input.id, input.relativePath, 'readonly-node', 'Read Only'), generation);
+    writer.completeGeneration(generation);
+    writer.close();
+
+    const reader = new WorkgroupGraphStore(path, 'madison-reed', { readonly: true });
+    expect(reader.query('Read Only').nodes.map((node) => node.id)).toEqual(['readonly-node']);
+    expect(() => reader.beginGeneration('forbidden')).toThrow(/readonly/i);
+    reader.close();
+  });
+
   test('test_graph_store_atomic_source_replacement', () => {
     const store = makeStore();
     const generation = store.beginGeneration('initial');

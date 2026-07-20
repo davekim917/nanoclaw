@@ -3,6 +3,8 @@ import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { freemem } from 'node:os';
 import { join } from 'node:path';
 
+import { IsolatedPressureScanner } from './isolated-pressure.js';
+
 function directoryNames(root: string): string[] {
   try {
     return readdirSync(root, { withFileTypes: true })
@@ -181,7 +183,7 @@ export interface BackgroundGraphRunnerOptions {
   freeMemory?: () => number;
   minimumFreeBytes?: number;
   pollMs?: number;
-  pressure?: () => boolean;
+  pressure?: () => boolean | Promise<boolean>;
 }
 
 export interface BackgroundJobOptions {
@@ -197,14 +199,21 @@ export class BackgroundGraphRunner {
   private readonly freeMemory: () => number;
   private readonly pollMs: number;
   private readonly minimumFreeBytes: number;
-  private readonly pressure: () => boolean;
+  private readonly pressure: () => boolean | Promise<boolean>;
+  private readonly isolatedPressure?: IsolatedPressureScanner;
 
   constructor(options: BackgroundGraphRunnerOptions) {
     this.freeMemory = options.freeMemory ?? availableMemoryBytes;
     this.pollMs = Math.min(2_000, Math.max(10, options.pollMs ?? 2_000));
     this.minimumFreeBytes = options.minimumFreeBytes ?? 6 * 1024 ** 3;
-    const pressureScanner = new InteractivePressureScanner(options.sessionsRoot);
-    this.pressure = options.pressure ?? (() => pressureScanner.scan());
+    if (options.pressure) this.pressure = options.pressure;
+    else if (import.meta.url.endsWith('.ts')) {
+      const pressureScanner = new InteractivePressureScanner(options.sessionsRoot);
+      this.pressure = () => pressureScanner.scan();
+    } else {
+      this.isolatedPressure = new IsolatedPressureScanner(options.sessionsRoot);
+      this.pressure = () => this.isolatedPressure!.scan();
+    }
   }
 
   run<T>(job: (signal: AbortSignal) => Promise<T>, options: BackgroundJobOptions = {}): Promise<BackgroundResult<T>> {
@@ -220,6 +229,7 @@ export class BackgroundGraphRunner {
     this.stopped = true;
     for (const controller of this.active) controller.abort('Graphify daemon stopping');
     await this.tail;
+    await this.isolatedPressure?.close();
   }
 
   private async execute<T>(
@@ -228,18 +238,26 @@ export class BackgroundGraphRunner {
   ): Promise<BackgroundResult<T>> {
     if (this.stopped) return { status: 'preempted' };
     if (this.freeMemory() < this.minimumFreeBytes) return { status: 'deferred', reason: 'memory' };
-    if (this.pressure()) return { status: 'preempted' };
+    if (await this.pressure()) return { status: 'preempted' };
     const controller = new AbortController();
     this.active.add(controller);
     let preempted = false;
+    let pressureScanRunning = false;
     const timer =
       options.preemptActive === false
         ? undefined
         : setInterval(() => {
-            if (this.pressure()) {
-              preempted = true;
-              controller.abort('interactive chat pressure');
-            }
+            if (pressureScanRunning) return;
+            pressureScanRunning = true;
+            void Promise.resolve(this.pressure())
+              .then((pressure) => {
+                if (!pressure) return;
+                preempted = true;
+                controller.abort('interactive chat pressure');
+              })
+              .finally(() => {
+                pressureScanRunning = false;
+              });
           }, this.pollMs);
     timer?.unref();
     try {

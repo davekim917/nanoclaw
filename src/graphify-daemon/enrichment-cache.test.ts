@@ -25,6 +25,10 @@ describe('EnrichmentRepository', () => {
     first.close();
     const second = new EnrichmentRepository(path);
     expect(second.load('wg')[0].semantic?.nodes[0].name).toBe('metric');
+    expect(second.get('s')?.semantic?.nodes[0].name).toBe('metric');
+    expect(second.hasCurrent('s', 'h', 'semantic')).toBe(true);
+    expect(second.hasCurrent('s', 'wrong', 'semantic')).toBe(false);
+    expect(second.hasCurrent('s', 'h', 'code')).toBe(false);
     second.close();
   });
 

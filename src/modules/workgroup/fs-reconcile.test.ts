@@ -1,9 +1,7 @@
 /**
  * Tests for reconcileWorkgroupFsState — startup FS reconciler.
  *
- * Uses an in-memory better-sqlite3 DB. Mocks readContainerConfig and
- * writeContainerConfig to avoid real FS group dirs. Uses a temp dir for
- * the logs/ output.
+ * Uses an in-memory better-sqlite3 DB and a temp dir for logs/ output.
  */
 import fs from 'fs';
 import os from 'os';
@@ -16,11 +14,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 // Must be declared before the import of the module under test so vitest
 // applies them via its static mock hoisting.
 
-vi.mock('../../container-config.js', () => ({
-  readContainerConfig: vi.fn(),
-  writeContainerConfig: vi.fn(),
-}));
-
 // We need log to not throw so silence it.
 vi.mock('../../log.js', () => ({
   log: {
@@ -32,7 +25,6 @@ vi.mock('../../log.js', () => ({
   },
 }));
 
-import { readContainerConfig, writeContainerConfig } from '../../container-config.js';
 import { reconcileWorkgroupFsState } from './fs-reconcile.js';
 
 // -----------------------------------------------------------------------
@@ -73,43 +65,6 @@ function seedMigrationReport(db: Database.Database, report: object): void {
   db.prepare(`INSERT INTO _migration036_report (report) VALUES (?)`).run(JSON.stringify(report));
 }
 
-/** Seed workgroups + agent_groups rows for the paired/standalone scenario. */
-function seedGroupRows(db: Database.Database): void {
-  const now = new Date().toISOString();
-
-  // workgroup for illysium pair
-  db.prepare(`INSERT INTO workgroups (id, onecli_secrets, created_at) VALUES (?, '[]', ?)`).run('illysium', now);
-  // standalone workgroup
-  db.prepare(`INSERT INTO workgroups (id, onecli_secrets, created_at) VALUES (?, '[]', ?)`).run('standalone-x', now);
-
-  // illie — parent/standalone (workgroup_id === folder)
-  db.prepare(`INSERT INTO agent_groups (id, name, folder, workgroup_id, created_at) VALUES (?, ?, ?, ?, ?)`).run(
-    'ag-illie',
-    'illie',
-    'illysium',
-    'illysium',
-    now,
-  );
-
-  // illie-codex — paired sibling (workgroup_id !== folder)
-  db.prepare(`INSERT INTO agent_groups (id, name, folder, workgroup_id, created_at) VALUES (?, ?, ?, ?, ?)`).run(
-    'ag-illie-codex',
-    'illie-codex',
-    'illysium-codex',
-    'illysium',
-    now,
-  );
-
-  // standalone-x — standalone (workgroup_id === folder)
-  db.prepare(`INSERT INTO agent_groups (id, name, folder, workgroup_id, created_at) VALUES (?, ?, ?, ?, ?)`).run(
-    'ag-standalone',
-    'standalone-x',
-    'standalone-x',
-    'standalone-x',
-    now,
-  );
-}
-
 // -----------------------------------------------------------------------
 // Test fixtures
 // -----------------------------------------------------------------------
@@ -122,10 +77,6 @@ beforeEach(() => {
   tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'test-reconcile-'));
   origCwd = process.cwd();
   process.chdir(tmpDir);
-
-  // Reset mocks between tests
-  vi.mocked(readContainerConfig).mockReset();
-  vi.mocked(writeContainerConfig).mockReset();
 });
 
 afterEach(() => {
@@ -148,9 +99,6 @@ describe('reconcileWorkgroupFsState', () => {
     };
     seedMigrationReport(db, report);
 
-    // No agent_groups rows — avoids needing readContainerConfig mocked
-    // readContainerConfig won't be called when there are no rows.
-
     await reconcileWorkgroupFsState(db);
 
     // logs/ dir should now exist in tmpDir
@@ -171,123 +119,7 @@ describe('reconcileWorkgroupFsState', () => {
     expect(tableRow, '_migration036_report dropped').toBeUndefined();
   });
 
-  // ── T2: writes recall_scope only for paired siblings ───────────────
-  it('test_writes_recall_scope_for_paired_groups_only', async () => {
-    const db = makeDb();
-    seedGroupRows(db);
-
-    // illie (standalone parent) — has memory.enabled but NOT recall_scope
-    vi.mocked(readContainerConfig).mockImplementation((folder: string) => {
-      if (folder === 'illysium') {
-        return {
-          mcpServers: {},
-          packages: { apt: [], npm: [] },
-          additionalMounts: [],
-          skills: 'all',
-          tools: [],
-          memory: { enabled: true },
-        };
-      }
-      if (folder === 'illysium-codex') {
-        return {
-          mcpServers: {},
-          packages: { apt: [], npm: [] },
-          additionalMounts: [],
-          skills: 'all',
-          tools: [],
-          memory: { enabled: true },
-        };
-      }
-      if (folder === 'standalone-x') {
-        return {
-          mcpServers: {},
-          packages: { apt: [], npm: [] },
-          additionalMounts: [],
-          skills: 'all',
-          tools: [],
-          memory: { enabled: true },
-        };
-      }
-      throw new Error(`Unexpected folder: ${folder}`);
-    });
-
-    await reconcileWorkgroupFsState(db);
-
-    // writeContainerConfig called exactly once — for illie-codex (the paired sibling)
-    expect(vi.mocked(writeContainerConfig)).toHaveBeenCalledTimes(1);
-    const [calledFolder, calledCfg] = vi.mocked(writeContainerConfig).mock.calls[0] as [
-      string,
-      { memory?: { recall_scope?: string } },
-    ];
-    expect(calledFolder).toBe('illysium-codex');
-    expect(calledCfg.memory?.recall_scope).toBe('workgroup');
-
-    // illie and standalone-x must NOT have been written
-    const writtenFolders = vi.mocked(writeContainerConfig).mock.calls.map(([f]) => f);
-    expect(writtenFolders).not.toContain('illysium');
-    expect(writtenFolders).not.toContain('standalone-x');
-  });
-
-  // ── T3: idempotency ─────────────────────────────────────────────────
-  it('test_idempotent', async () => {
-    const db = makeDb();
-    seedGroupRows(db);
-
-    // First call — illie-codex not yet set
-    vi.mocked(readContainerConfig).mockImplementation((folder: string) => {
-      if (folder === 'illysium-codex') {
-        return {
-          mcpServers: {},
-          packages: { apt: [], npm: [] },
-          additionalMounts: [],
-          skills: 'all',
-          tools: [],
-          memory: { enabled: true },
-        };
-      }
-      return {
-        mcpServers: {},
-        packages: { apt: [], npm: [] },
-        additionalMounts: [],
-        skills: 'all',
-        tools: [],
-        memory: { enabled: true },
-      };
-    });
-
-    await reconcileWorkgroupFsState(db);
-    const firstCallCount = vi.mocked(writeContainerConfig).mock.calls.length;
-    expect(firstCallCount).toBe(1); // illie-codex written once
-
-    // Second call — illie-codex already has recall_scope: 'workgroup'
-    vi.mocked(readContainerConfig).mockImplementation((folder: string) => {
-      if (folder === 'illysium-codex') {
-        return {
-          mcpServers: {},
-          packages: { apt: [], npm: [] },
-          additionalMounts: [],
-          skills: 'all',
-          tools: [],
-          memory: { enabled: true, recall_scope: 'workgroup' },
-        };
-      }
-      return {
-        mcpServers: {},
-        packages: { apt: [], npm: [] },
-        additionalMounts: [],
-        skills: 'all',
-        tools: [],
-        memory: { enabled: true },
-      };
-    });
-
-    await reconcileWorkgroupFsState(db);
-    // writeContainerConfig should NOT have been called again for illie-codex
-    const totalCallCount = vi.mocked(writeContainerConfig).mock.calls.length;
-    expect(totalCallCount, 'second run must not write again').toBe(1);
-  });
-
-  // ── T4: throws on FS failure ─────────────────────────────────────────
+  // ── T2: throws on FS failure ─────────────────────────────────────────
   it('test_throws_on_fs_failure', () => {
     const db = makeDb();
     const report = { pairings: [], standalone: ['foo'], suffix_strip_unmatched: [] };
@@ -313,16 +145,7 @@ describe('reconcileWorkgroupFsState', () => {
 
   // ── T5: index.ts structural check ────────────────────────────────────
   it('test_index_ts_calls_reconciler_after_migrations', () => {
-    // Read src/index.ts and assert structural properties about call order.
-    const indexPath = path.join(
-      // Walk up from __dirname (dist/modules/workgroup or src/modules/workgroup)
-      // to the src/ root, then index.ts
-      path.dirname(path.dirname(path.dirname(__dirname ?? ''))),
-      'index.ts',
-    );
-
     // Resolve from repo root (worktree) using the known absolute path pattern.
-    // __dirname is not available in ESM, so we use import.meta.url.
     // The test runner sets cwd to the worktree root so we can use a relative path.
     const repoRoot = origCwd; // preserved before chdir
     const srcIndexPath = path.join(repoRoot, 'src', 'index.ts');

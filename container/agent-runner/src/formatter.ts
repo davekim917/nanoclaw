@@ -446,9 +446,8 @@ function formatWebhookMessage(msg: MessageInRow): string {
 function formatSystemMessage(msg: MessageInRow): string {
   const content = parseContent(msg.content);
 
-  // Mnemon recall context: ambient memory injected by the host before each
-  // user turn. Plain text by design — the agent reads it as background
-  // context, not a structured system response to act on.
+  // Legacy recall_context compatibility for already-persisted inbound rows.
+  // Graphify is the active retrieval layer and no longer creates these rows.
   if (content.subtype === 'recall_context') {
     return `[Recalled context]\n${content.text}`;
   }

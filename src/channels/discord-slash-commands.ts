@@ -268,7 +268,7 @@ export const UPDATE_CONTAINER_PROMPT = [
   'Validate before publishing:',
   '- host: `pnpm install --frozen-lockfile && pnpm run build && pnpm test`.',
   '- container: `cd container/agent-runner && bun install --frozen-lockfile && bun test`, then from the repo root run `pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit` and the Graphify Python contracts when Graphify changed.',
-  '- Mnemon: when its version changes, smoke-test a copied store with the new binary and abort on schema incompatibility.',
+  '- Graphify: require the upstream contract, patch-drift, supply-chain, and runtime acceptance checks before publishing.',
   '- Codex CLI: put the exact host-parity installation and models-cache reset command in the PR checklist.',
   'Show the final diff before committing. Commit and push only the validated, approved files, open the PR against davekim917/nanoclaw (or davekim917/bootstrap), verify the PR URL is in the intended repository, then stop.',
   'Never merge, deploy, restart services, or build Docker from inside the agent container.',

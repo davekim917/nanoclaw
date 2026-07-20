@@ -18,7 +18,6 @@ import { registerProvider, registerProviderConfigSchema } from './provider-regis
 import { buildSecretEnvVarList, MCP_HEADER_ONLY_SECRET_VARS } from './secret-env.js';
 import type { AgentProvider, AgentQuery, McpServerConfig, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
 import { autoCommitDirtyWorktrees } from '../worktree-autosave.js';
-import { createBlockMnemonRealHook } from '../modules/memory/block-mnemon-real-hook.js';
 import {
   createMemoryCaptureWebFetchHook,
   createMemoryCaptureBashHook,
@@ -1640,30 +1639,19 @@ export class ClaudeProvider implements AgentProvider {
                 createBlockGitCloneHook(),
                 createBlockCodexCompanionHook(),
                 createEmailGateHook(),
-                ...(process.env.MNEMON_READ_ONLY === '1' ? [createBlockMnemonRealHook()] : []),
               ],
             },
           ],
           PostToolUse: [
             { hooks: [postToolUseHook] },
-            // Memory-capture hooks should only run when the group has memory
-            // enabled. The container env var MNEMON_STORE is only set by
-            // container-runner.ts when config.memory.enabled === true, so use
-            // it as the gate. Without this gate, disabling memory still
-            // accumulates inbox files (silent disk growth, no daemon to consume
-            // them).
-            ...(process.env.MNEMON_STORE
-              ? [
-                  { matcher: 'WebFetch', hooks: [createMemoryCaptureWebFetchHook()] },
-                  { matcher: 'Bash', hooks: [createMemoryCaptureBashHook()] },
-                  // mcp__.* matches every MCP tool call; the hook itself
-                  // dispatches via MCP_CAPTURE_MAP and no-ops for tools not
-                  // on the allowlist. Adding a new server entry to
-                  // MCP_CAPTURE_TOOLS in memory-capture.ts is therefore a
-                  // one-line change — the matcher regex stays put.
-                  { matcher: 'mcp__.*', hooks: [createMemoryCaptureMcpHook()] },
-                ]
-              : []),
+            // Capture intentionally fetched knowledge into sources/inbox.
+            // Graphify watches the workgroup source tree and indexes these
+            // files for autonomous Graphify discovery without an opt-in flag.
+            { matcher: 'WebFetch', hooks: [createMemoryCaptureWebFetchHook()] },
+            { matcher: 'Bash', hooks: [createMemoryCaptureBashHook()] },
+            // mcp__.* matches every MCP tool call; the hook itself dispatches
+            // through its allowlist and ignores non-durable results.
+            { matcher: 'mcp__.*', hooks: [createMemoryCaptureMcpHook()] },
           ],
           PostToolUseFailure: [{ hooks: [postToolUseHook] }],
           PreCompact: [{ hooks: [createPreCompactHook(this.assistantName)] }],

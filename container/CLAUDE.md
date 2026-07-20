@@ -69,14 +69,13 @@ If `/workspace/workgroup/` exists, it is **shared read-write with every sibling 
 
 The file `CLAUDE.local.md` in your workspace is your per-group memory. Record things there that you'll want to remember in future sessions — user preferences, project context, recurring facts. Keep entries short and structured.
 
-## Memory
+## Memory and knowledge retrieval
 
-Two memory surfaces, both effectively read-only from the agent's perspective during chat:
+- **Provider-native context** carries the current conversation and provider-managed continuity.
+- **CLAUDE.local.md** contains operator-curated behavioral rules and high-frequency preferences. Read it; do not edit it unless the user explicitly asks.
+- **Graphify** is the workgroup's source-grounded retrieval layer. It indexes sibling workspaces, shared workgroup files, canonical repository clones, tracked and untracked knowledge files, external conversation history, and the current thread's worktree overlay. Read the `graphify` skill and query it first when prior work, decisions, requirements, code relationships, or cross-artifact lineage could matter.
 
-- **CLAUDE.local.md** (your per-group file) — operator-curated behavioral rules and high-frequency preferences. The operator edits this; you read it on every session start. Do not write to it during chat unless the user explicitly asks you to update it.
-- **mnemon graph** (auto-curated facts) — atomic facts extracted from chat turn-pairs and curated source files (articles, transcripts, attachments) by an async host-side daemon. Recall context arrives as a `[Recalled context]` system message before each user turn, keyed on the user's words. For anything **you** are about to recommend or assert (a vendor, tool, plan, person the group may have already evaluated), query `recall_memory` mid-turn — the automatic injection cannot see your draft. You do not call `mnemon remember` directly — the daemon handles all writes.
-
-When the user shares substantive information you'd want to remember, you don't need to do anything explicit — the daemon's classifier picks it up on its next 60s sweep. If a fact is critical and time-sensitive, use scratch context (worktree files, conversation memory) for immediate use; the daemon's eventual extraction handles long-term persistence.
+Graphify is a navigation aid, not an authority. Open its cited file or conversation provenance before making a consequential claim or code change. Durable WebFetch, attachment, Google Workspace, and selected MCP results are captured into `sources/inbox` automatically and become available to the workgroup graph without an allowlist or manual reindex.
 
 ## Working with peer agents in the same thread
 

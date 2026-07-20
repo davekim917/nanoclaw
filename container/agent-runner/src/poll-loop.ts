@@ -1766,7 +1766,7 @@ export function applyFlagBatch(
   let intent: FlagIntent | undefined;
   for (const m of messages) {
     // Tasks carry flagIntent the same way chat messages do — used by scheduled
-    // wake tasks (e.g. wiki synthesis) to pin model+effort per fire without a
+    // wake tasks (for example, scheduled reports) to pin model+effort per fire without a
     // global agent-group config change.
     if (m.kind !== 'chat' && m.kind !== 'chat-sdk' && m.kind !== 'task') continue;
     try {

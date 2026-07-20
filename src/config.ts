@@ -63,13 +63,6 @@ export const REPO_ROOT = PROJECT_ROOT;
 // process.env, or the flag silently reads false. See docs/specs/workgroup-shared-fs.md.
 export const WORKGROUP_SHARED_FS =
   (process.env.NANOCLAW_WORKGROUP_SHARED_FS ?? envConfig.NANOCLAW_WORKGROUP_SHARED_FS) === '1';
-// Per-CC-project mnemon discovery root. The memory daemon walks this in
-// addition to GROUPS_DIR; any subdir containing a `.memory-enabled` marker
-// becomes a discovered group with agentGroupId = `cc-<slug>` and a
-// per-project mnemon store at ~/.mnemon/data/cc-<slug>/. Slug is the CC
-// project directory name (e.g. `-home-ubuntu-nanoclaw-v2`).
-export const CC_PROJECTS_DIR = path.join(HOME_DIR, '.claude', 'projects');
-export const CC_MEMORY_MARKER = '.memory-enabled';
 // Local agent-template library. Committed but ships empty (+ README). Resolved
 // once at load. Override to another LOCAL path via NANOCLAW_TEMPLATES_DIR; never
 // a remote URL, never an ncl flag, never runtime-mutable.

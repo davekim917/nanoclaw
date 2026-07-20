@@ -103,7 +103,7 @@ export function buildSystemPromptAddendum(assistantName?: string): string {
   if (assistantName) {
     // Workgroup awareness — set by the host (container-runner) via
     // NANOCLAW_WORKGROUP_ID when the agent_group has one. The workgroup is
-    // the multi-agent tenant boundary (chat archive, mnemon recall, OneCLI
+    // the multi-agent tenant boundary (chat archive, Graphify retrieval, OneCLI
     // secret pool). The agent knows which scope it operates under so prompts
     // grounded in "my workgroup is X" reach the right peers and data pool.
     const workgroupId =

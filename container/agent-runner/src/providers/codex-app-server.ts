@@ -524,7 +524,7 @@ export function writeCodexMcpConfigToml(servers: Record<string, CodexMcpServer>)
   log(`Wrote MCP config.toml (${Object.keys(servers).length} server(s))`);
 }
 
-// ── hooks.json (NanoClaw guardrails + memory-capture) ───────────────────────
+// ── hooks.json (NanoClaw guardrails + Graphify source capture) ─────────────
 // Codex app-server reads ~/.codex/hooks.json at session start and fires
 // shell-command hooks on PreToolUse / PostToolUse / etc. We point each
 // event at `bun /app/src/codex-hooks/cli.ts <event>` which dispatches to
@@ -632,7 +632,7 @@ export function createCodexConfigOverrides(
     'features.steer=true',
     'features.fast_mode=true',
     // Memories: writing AND reading. `[memories]` is Codex CLI's own
-    // session-summary store (separate from NanoClaw's mnemon graph, which is
+    // session-summary store (separate from NanoClaw's Graphify retrieval, which is
     // host-side). `generate_memories=true` writes summaries on turn boundaries;
     // `use_memories=true` makes the next-turn prompt include them. Operator
     // parity with Dave's local Codex CLI config — both default false upstream.

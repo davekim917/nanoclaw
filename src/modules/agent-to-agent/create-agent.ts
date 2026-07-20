@@ -2,8 +2,8 @@
  * `create_agent` delivery-action handler.
  *
  * SECURITY: spawning a new agent group is a host-level state change (creates
- * a directory under groups/, inserts an agent_groups row, opens bidirectional
- * agent_destinations grants, schedules memory tasks). Any tenant agent can
+ * a directory under groups/, inserts an agent_groups row, and opens bidirectional
+ * agent_destinations grants). Any tenant agent can
  * call this — but allowing direct execution lets prompt injection in any
  * tenant chat fan out unbounded child groups, each with its own credentials
  * and recurring tasks. This handler now requests an owner/admin approval and
@@ -18,14 +18,13 @@ import { getDb } from '../../db/connection.js';
 import { getSession } from '../../db/sessions.js';
 import { wakeContainer } from '../../container-runner.js';
 import { initGroupFilesystem } from '../../group-init.js';
-import { readContainerConfig, updateContainerConfig } from '../../container-config.js';
+import { updateContainerConfig } from '../../container-config.js';
 import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import type { AgentGroup, Session } from '../../types.js';
 import { requestApproval, type ApprovalHandler } from '../approvals/index.js';
 import { createDestination, getDestinationByName, normalizeName } from './db/agent-destinations.js';
 import { writeDestinations } from './write-destinations.js';
-import { bootstrapMemoryForGroup } from '../memory/bootstrap.js';
 
 async function notifyAgent(session: Session, text: string): Promise<void> {
   await writeSessionMessage(session.agent_group_id, session.id, {
@@ -290,41 +289,8 @@ export const applyCreateAgent: ApprovalHandler = async ({ session, payload, noti
   // tries to send to the newly-created child.
   writeDestinations(session.agent_group_id, session.id);
 
-  // Memory bootstrap (Codex F5). New groups default to memory.enabled = true
-  // via emptyConfig(); a child group born here without an explicit override
-  // therefore gets the flag flipped on but never has its sources/ subdirs,
-  // mnemon store, or synth task scaffolded — leaving the container with
-  // MNEMON_STORE set but the daemon with nothing to write into. Run the
-  // shared bootstrap here so default-on groups are fully functional from
-  // first message. (agentGroupId was persisted into container.json in
-  // step 2, so the daemon's discoverMemoryGroups can read it directly.)
-  try {
-    const cfg = readContainerConfig(folder);
-    if (cfg.memory?.enabled === true) {
-      const bs = await bootstrapMemoryForGroup(folder, agentGroupId);
-      log.info('Memory bootstrap completed for new agent group', {
-        agentGroupId,
-        folder,
-        sourcesDirs: bs.step1_sourcesDirsCreated,
-        mnemonStore: bs.step2_mnemonStoreStatus,
-        synthTask: bs.step3_synthTaskScheduled,
-        lintTask: bs.step4_lintTaskScheduled,
-      });
-    }
-  } catch (err) {
-    // Don't fail the agent creation — the group is fully created in the DB
-    // and container.json already has agentGroupId, so enable-memory.ts CAN
-    // retry recovery. Log loud so the gap is visible.
-    log.error('create_agent: memory bootstrap failed (group still created, run enable-memory.ts to retry)', {
-      err,
-      agentGroupId,
-      folder,
-    });
-  }
-
   // notifyAgent is async since the writeSessionMessage signature change.
-  // Awaiting ensures the notification (and its recall_context, if any) commits
-  // and the container wakes only after both rows are written.
+  // Awaiting ensures the notification commits before the container wakes.
   await notifyAgent(
     session,
     `Agent "${localName}" created. You can now message it with <message to="${localName}">...</message>.`,

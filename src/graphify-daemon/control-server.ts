@@ -279,7 +279,7 @@ export class GraphifyControlServer {
       }
       case 'status':
         noExtraArgs(args, []);
-        return this.daemon.status(request.workgroupId);
+        return this.daemon.statusAsync?.(request.workgroupId) ?? this.daemon.status(request.workgroupId);
       case 'ensure-fresh':
         noExtraArgs(args, []);
         return this.daemon.ensureFresh(request.workgroupId, undefined, context);
@@ -287,15 +287,15 @@ export class GraphifyControlServer {
         noExtraArgs(args, ['full']);
         if (args.full !== undefined && typeof args.full !== 'boolean') throw new Error('full must be boolean');
         await this.daemon.reindex(request.workgroupId, args.full === true);
-        return this.daemon.status(request.workgroupId);
+        return this.daemon.statusAsync?.(request.workgroupId) ?? this.daemon.status(request.workgroupId);
       case 'pause':
         noExtraArgs(args, []);
         this.daemon.pause(request.workgroupId);
-        return this.daemon.status(request.workgroupId);
+        return this.daemon.statusAsync?.(request.workgroupId) ?? this.daemon.status(request.workgroupId);
       case 'resume':
         noExtraArgs(args, []);
         this.daemon.resume(request.workgroupId);
-        return this.daemon.status(request.workgroupId);
+        return this.daemon.statusAsync?.(request.workgroupId) ?? this.daemon.status(request.workgroupId);
     }
   }
 }

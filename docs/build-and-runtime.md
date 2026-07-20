@@ -50,7 +50,7 @@ All are committed. CI and the Dockerfile run frozen/hash-locked install variants
 
 ## Container code intelligence (Graphify)
 
-Container sessions use Graphify for advisory source navigation; host/operator sessions continue to use the host GitNexus gates documented in `CLAUDE.md`. The Graphify runtime has a deliberately narrow public/private split:
+Container sessions and host/operator work use Graphify for advisory source navigation. The Graphify runtime has a deliberately narrow public/private split:
 
 - `/opt/graphify` is a private, wheel-locked Python environment. Its upstream console script is removed and its `bin` directory is not added to `PATH`.
 - `/usr/local/bin/graphify` is NanoClaw's public, standard-library gateway from [`graphify-gateway.py`](../container/graphify-gateway.py). It exposes only `query`, `path`, `explain`, and `affected`, plus side-effect-free help/version.

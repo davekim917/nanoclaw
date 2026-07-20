@@ -20,8 +20,8 @@
  * After a move, the seed's old path and every sibling's old symlink become a
  * CONTAINER-ABSOLUTE compat symlink `<name> -> /workspace/workgroup/<name>`.
  * That dangles on the host (so container-runner's symlink-overlay skips it,
- * and the mnemon daemon must use the data/workgroups discovery root — handled
- * separately) but resolves correctly inside the container via the mount, so
+ * while Graphify indexes the canonical data/workgroups root directly) but
+ * resolves correctly inside the container via the mount, so
  * existing `/workspace/agent/<name>` reader paths keep working with no repoint.
  */
 import fs from 'fs';

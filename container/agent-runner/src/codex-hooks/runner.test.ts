@@ -38,14 +38,14 @@ describe('runPreToolUseChain — guardrails', () => {
   const savedEnv: Record<string, string | undefined> = {};
   // The destructive guard is fail-CLOSED (D17/C4): with no core, it denies
   // everything. These tests exercise the OTHER chain hooks (self-approval,
-  // snowflake, git-clone, mnemon), so point the destructive guard at the stub
+  // snowflake, git-clone), so point the destructive guard at the stub
   // core (allows anything but STUB_BLOCK/STUB_GATE) to let benign commands
   // through to the assertions under test.
   const STUB_CORE = new URL('./__test-fixtures__/guard-core-stub.ts', import.meta.url).pathname;
 
   beforeEach(() => {
     // Snapshot env vars the hooks read.
-    for (const k of ['MNEMON_READ_ONLY', 'NANOCLAW_IS_SCHEDULED_TASK', 'NANOCLAW_DESTRUCTIVE_GUARD_CORE'])
+    for (const k of ['NANOCLAW_IS_SCHEDULED_TASK', 'NANOCLAW_DESTRUCTIVE_GUARD_CORE'])
       savedEnv[k] = process.env[k];
     process.env.NANOCLAW_DESTRUCTIVE_GUARD_CORE = STUB_CORE;
   });
@@ -104,15 +104,6 @@ describe('runPreToolUseChain — guardrails', () => {
     })) as { continue?: boolean; hookSpecificOutput?: { permissionDecision?: string } };
     // Sanitize may insert updatedInput; assert nothing was denied.
     expect(out.hookSpecificOutput?.permissionDecision).toBeUndefined();
-  });
-
-  it('blocks mnemon real when MNEMON_READ_ONLY=1', async () => {
-    process.env.MNEMON_READ_ONLY = '1';
-    const out = (await runPreToolUseChain({
-      tool_name: 'exec_command',
-      tool_input: { command: 'mnemon-real remember foo bar' },
-    })) as { hookSpecificOutput?: { permissionDecision?: string } };
-    expect(out.hookSpecificOutput?.permissionDecision).toBe('deny');
   });
 
   it('passes through non-Bash tools', async () => {

@@ -27,10 +27,6 @@
     { "id": "render", "name": "Render CLI", "arg": "RENDER_VERSION", "source": { "kind": "github", "repo": "render-oss/cli" } },
     { "id": "railway", "name": "Railway CLI", "arg": "RAILWAY_VERSION", "source": { "kind": "github", "repo": "railwayapp/cli" } },
     { "id": "supabase", "name": "Supabase CLI", "arg": "SUPABASE_VERSION", "source": { "kind": "github", "repo": "supabase/cli" } },
-    { "id": "mnemon", "name": "Mnemon", "arg": "MNEMON_VERSION", "source": { "kind": "github", "repo": "mnemon-dev/mnemon" }, "checksums": [
-      { "arg": "MNEMON_SHA256_arm64", "url": "https://github.com/mnemon-dev/mnemon/releases/download/v{version}/checksums.txt", "filename": "mnemon_{version}_linux_arm64.tar.gz" },
-      { "arg": "MNEMON_SHA256_amd64", "url": "https://github.com/mnemon-dev/mnemon/releases/download/v{version}/checksums.txt", "filename": "mnemon_{version}_linux_amd64.tar.gz" }
-    ] },
     { "id": "hex-cli", "name": "Hex CLI", "arg": "HEX_CLI_VERSION", "source": { "kind": "github", "repo": "hex-inc/hex-cli" }, "checksums": [
       { "arg": "HEX_CLI_SHA256_arm64", "url": "https://github.com/hex-inc/hex-cli/releases/download/v{version}/hex-aarch64-unknown-linux-gnu.tar.xz.sha256" },
       { "arg": "HEX_CLI_SHA256_amd64", "url": "https://github.com/hex-inc/hex-cli/releases/download/v{version}/hex-x86_64-unknown-linux-gnu.tar.xz.sha256" }

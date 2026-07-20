@@ -2,7 +2,7 @@
  * Container config types and access layer.
  *
  * `groups/<folder>/container.json` is the canonical source of truth for every
- * non-DB field (onecliSecrets, tools, credentialFolder, codexHostAuth, memory,
+ * non-DB field (onecliSecrets, tools, credentialFolder, codexHostAuth,
  * dailySummary, etc.) — read by `readContainerConfig`, written by
  * `writeContainerConfig`, modified directly on disk by skills and operators.
  *
@@ -70,38 +70,6 @@ export interface AdditionalMountConfig {
   hostPath: string;
   containerPath: string;
   readonly?: boolean;
-}
-
-/**
- * Recall scope for agent memory. Controls which mnemon stores are queried
- * during recall injection.
- *
- * - 'self'       — only the calling agent's own store
- * - 'all-groups' — all memory-enabled groups in GROUPS_DIR
- * - 'workgroup'  — the shared store for this agent's workgroup (default)
- *                  Standalone agents (no workgroup_id) fall back to 'self'.
- * - string[]    — explicit list of group folder names to include
- */
-export type RecallScope = 'self' | 'all-groups' | 'workgroup' | string[];
-
-export interface MemoryConfig {
-  enabled: boolean;
-  feedback_enabled?: boolean;
-  query_strategy?: 'raw' | 'heuristic' | 'llm';
-  recall_scope?: RecallScope;
-}
-
-export function isFeedbackEnabled(cfg: MemoryConfig | undefined): boolean {
-  if (!cfg?.enabled) return false;
-  return cfg.feedback_enabled !== false;
-}
-
-export function getQueryStrategy(cfg: MemoryConfig | undefined): 'raw' | 'heuristic' | 'llm' {
-  return cfg?.query_strategy ?? 'raw';
-}
-
-export function getRecallScope(cfg: MemoryConfig | undefined): RecallScope {
-  return cfg?.recall_scope ?? 'workgroup';
 }
 
 /** Shape of the materialized `container.json` file read by the container runner. */
@@ -231,9 +199,8 @@ export interface ContainerConfig {
    * `LOOKER_BASE_URL_MADISON_REED` instead of looking for the non-existent
    * `LOOKER_BASE_URL_MADISON_REED_CODEX`.
    *
-   * Does NOT affect identity-bound paths: container name, group dir mount,
-   * MNEMON_STORE override env-key, log fields — those stay on
-   * `agent_groups.folder`.
+   * Does NOT affect identity-bound paths such as container name, group dir
+   * mount, and log fields; those stay on `agent_groups.folder`.
    */
   credentialFolder?: string;
 
@@ -302,15 +269,6 @@ export interface ContainerConfig {
   providerConfig?: Record<string, unknown>;
 
   /**
-   * Memory integration. When enabled, the host mounts the per-group mnemon store
-   * filesystem-RW into the container (sqlite needs journal/lock files) but sets
-   * `MNEMON_READ_ONLY=1` so the wrapper rejects write subcommands. Container can
-   * `mnemon recall` (read), but writes go through the host daemon. See
-   * `docs/memory.md` § Architecture and `data/systemd/nanoclaw-memory-daemon.service`.
-   */
-  memory?: MemoryConfig;
-
-  /**
    * Per-group daily summary digest config. The host-side daily-summary timer
    * (src/daily-summary.ts) posts a per-group activity digest once a day; by
    * default it targets the primary wired channel (highest mga.priority,
@@ -323,12 +281,10 @@ export interface ContainerConfig {
 
   /**
    * The workgroup this agent belongs to. Set by migration 036 and written
-   * into container.json so the projection layer can perform workgroup-scoped
-   * recall without hitting the central DB at runtime.
+   * into container.json for workgroup-scoped Graphify indexing and retrieval.
    *
    * Value matches workgroups.id (e.g. "madison-reed" for both madison-reed
-   * and madison-reed-codex agents). Read by scope-resolver.ts when
-   * recall_scope = 'workgroup'.
+   * and madison-reed-codex agents).
    */
   workgroup_id?: string;
 
@@ -394,13 +350,6 @@ export interface SlackUserTokenConfig {
 }
 
 function emptyConfig(): ContainerConfig {
-  // memory.enabled defaults to true for new groups — operator opt-out via
-  // `disable-memory.ts <group>` for surfaces that shouldn't accumulate
-  // facts (e.g., one-shot service accounts, ephemeral test groups). The
-  // initial container.json carries the flag so the daemon picks it up on
-  // its next 60s sweep, and the container's MNEMON_STORE env gets set on
-  // first spawn so memory-capture hooks are wired without an extra step.
-  //
   // tools defaults to `[]` (default-deny) for new groups so a child
   // spawned via create_agent doesn't inherit every credential surface
   // (snowflake, gws, aws, dbt, etc.). Operators add tool entries to
@@ -413,7 +362,6 @@ function emptyConfig(): ContainerConfig {
     additionalMounts: [],
     skills: 'all',
     tools: [],
-    memory: { enabled: true },
   };
 }
 
@@ -494,7 +442,6 @@ export function readContainerConfig(folder: string): ContainerConfig {
     tone: raw.tone,
     tools: raw.tools,
     providerConfig: raw.providerConfig,
-    memory: (raw as Record<string, unknown>).memory as MemoryConfig | undefined,
     dailySummary: raw.dailySummary,
     onecliSecrets: raw.onecliSecrets,
     workgroup_id: raw.workgroup_id,

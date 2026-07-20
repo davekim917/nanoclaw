@@ -7,14 +7,6 @@ export interface AgentProvider {
   readonly supportsNativeSlashCommands: boolean;
 
   /**
-   * Optional. When true, the runner scaffolds a persistent `memory/` tree in the
-   * agent's workspace at boot. Providers with their own native memory (e.g.
-   * Claude's `CLAUDE.local.md`) omit this and get nothing — memory is opt-in per
-   * provider, never gated on a provider name.
-   */
-  readonly usesMemoryScaffold?: boolean;
-
-  /**
    * Optional. Called by the poll-loop after each completed exchange (a
    * result, a wrapping retry, or an error). Providers whose harness keeps no
    * on-disk transcript implement this to persist exchanges themselves (e.g.

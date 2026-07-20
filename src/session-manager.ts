@@ -20,7 +20,6 @@ import type { OutboundFile } from './channels/adapter.js';
 import { DATA_DIR } from './config.js';
 import { assertChannelRoutingConsistency } from './delivery.js';
 import { ensureContainedInboxDir, isPathInside } from './inbox-safety.js';
-import { maybeInjectRecall } from './modules/memory/recall-injection.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
 import {
   createSession,
@@ -477,23 +476,6 @@ export async function writeSessionMessage(
 
   // Extract base64 attachment data, save to inbox, replace with file paths
   const content = extractAttachmentFiles(agentGroupId, sessionId, message.id, message.content);
-
-  // Inject recall context BEFORE the inbound message so recall_context gets a
-  // lower seq and the container reads it first. maybeInjectRecall fails open.
-  await maybeInjectRecall({
-    agentGroupId,
-    sessionId,
-    inboundMessage: {
-      ...message,
-      content,
-      trigger: message.trigger ?? 1,
-    },
-    routing: {
-      channelType: message.channelType ?? null,
-      platformId: message.platformId ?? null,
-      threadId: message.threadId ?? null,
-    },
-  });
 
   const db = openInboundDb(agentGroupId, sessionId);
   try {

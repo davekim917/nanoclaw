@@ -91,6 +91,34 @@ export class EnrichmentRepository {
       ...(row.semantic_json ? { semantic: JSON.parse(row.semantic_json) as ExtractionBundle } : {}),
     }));
   }
+  get(sourceId: string): PersistedEnrichment | undefined {
+    const row = this.db.prepare('SELECT * FROM enrichments WHERE source_id = ?').get(sourceId) as
+      | {
+          source_id: string;
+          workgroup_id: string;
+          content_hash: string;
+          code_json: string | null;
+          semantic_json: string | null;
+        }
+      | undefined;
+    if (!row) return undefined;
+    return {
+      sourceId: row.source_id,
+      workgroupId: row.workgroup_id,
+      contentHash: row.content_hash,
+      ...(row.code_json ? { code: JSON.parse(row.code_json) as ExtractionBundle } : {}),
+      ...(row.semantic_json ? { semantic: JSON.parse(row.semantic_json) as ExtractionBundle } : {}),
+    };
+  }
+  hasCurrent(sourceId: string, contentHash: string, kind: 'code' | 'semantic'): boolean {
+    const column = kind === 'code' ? 'code_json' : 'semantic_json';
+    const row = this.db
+      .prepare(
+        `SELECT 1 AS present FROM enrichments WHERE source_id = ? AND content_hash = ? AND ${column} IS NOT NULL`,
+      )
+      .get(sourceId, contentHash) as { present: number } | undefined;
+    return row?.present === 1;
+  }
   put(entry: PersistedEnrichment): void {
     const prior = this.db
       .prepare('SELECT content_hash, code_json, semantic_json FROM enrichments WHERE source_id = ?')

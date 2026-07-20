@@ -21,16 +21,25 @@ import type {
   GraphPathResult,
   GraphQueryResult,
   SourceInput,
+  WorkgroupGraphStatus,
 } from '../graphify/types.js';
 import { ArchiveConversationReader, type ConversationGraphSource } from './archive.js';
 import { BackgroundGraphRunner, type BackgroundResult } from './background-runner.js';
 import { CodexSemanticBackend } from './codex-backend.js';
 import { GraphifyCodeWorker, type BinaryPreprocessResult, type CodeWorkerSource } from './code-worker.js';
 import { EnrichmentRepository, type PersistedEnrichment, type SemanticQueueItem } from './enrichment-cache.js';
+import { runIsolatedReconcile, type IsolatedReconcileResult } from './isolated-reconcile.js';
+import { runIsolatedSourceReconcile } from './isolated-source-reconcile.js';
+import { IsolatedGraphifyWatchers } from './isolated-watchers.js';
+import { runIsolatedRead } from './isolated-read.js';
+import { createReconcileStore, type ReconcileStore, type ReconcileStoreFactory } from './reconcile-store-worker.js';
 import type { DaemonWorkgroupStatus, TrustedOverlayContext, WorkgroupDescriptor, WorkgroupRoot } from './types.js';
 
 export const DEFAULT_FULL_RECONCILE_MS = 6 * 60 * 60_000;
 export const DEFAULT_CATALOG_REFRESH_MS = 60_000;
+const MAX_RECONCILE_BATCH_SOURCES = 25;
+const MAX_RECONCILE_BATCH_CONTRIBUTIONS = 500;
+const MAX_RECONCILE_BATCH_TEXT_BYTES = 1024 * 1024;
 
 interface CodeSourceBuild {
   source: DiscoveredSource;
@@ -46,7 +55,6 @@ interface WorkgroupState {
   serveStaleDuringStartup?: boolean;
   lastFailure?: string;
   pendingEnrichment: number;
-  cacheLoaded?: boolean;
   backgroundQueued?: boolean;
   archiveFingerprint?: string;
   archiveDirty?: boolean;
@@ -108,6 +116,10 @@ export interface WorkgroupGraphDaemonOptions {
   reconcileRetryBaseMs?: number;
   preemptRetryMs?: number;
   catalogRefreshMs?: number;
+  reconcileStoreFactory?: ReconcileStoreFactory;
+  isolateReconcile?: boolean;
+  scheduleEnrichmentAfterReconcile?: boolean;
+  watchFilesystem?: boolean;
 }
 
 /** Host-visible even when the systemd service uses PrivateTmp=yes. */
@@ -175,7 +187,10 @@ function deterministicBundle(source: DiscoveredSource, prepared: PreprocessedSou
       id: rootId,
       name: posix.basename(source.relativePath),
       type: source.kind,
-      description: prepared.semanticSegments.join('\n\n') || source.relativePath,
+      // Chunk nodes own the searchable body. Repeating the entire source on
+      // the root doubles FTS/storage cost and makes one SQLite insert scale
+      // with the full file rather than a bounded chunk.
+      description: source.relativePath,
       properties: { ...prepared.metadata, redactionCount: prepared.redactionCount, binary: prepared.binary },
       evidence,
     },
@@ -388,8 +403,12 @@ export class WorkgroupGraphDaemon {
   private readonly codeWorker?: CodeWorkerLike;
   private readonly enableEnrichment: boolean;
   private readonly states = new Map<string, WorkgroupState>();
-  private readonly enrichments = new Map<string, PersistedEnrichment>();
   private readonly enrichmentRepository: EnrichmentRepository;
+  private readonly reconcileStoreFactory: ReconcileStoreFactory;
+  private readonly isolateReconcile: boolean;
+  private readonly scheduleEnrichmentAfterReconcile: boolean;
+  private readonly watchFilesystem: boolean;
+  private readonly isolatedWatchers?: IsolatedGraphifyWatchers;
   private readonly attempted = new Set<string>();
   private readonly retryAttempts = new Map<string, number>();
   private readonly watchers = new Map<string, FSWatcher>();
@@ -411,6 +430,24 @@ export class WorkgroupGraphDaemon {
     this.enableEnrichment = options.enableEnrichment ?? true;
     this.threadWorktrees = options.threadWorktrees ?? process.env.NANOCLAW_THREAD_WORKTREES === '1';
     this.enrichmentRepository = new EnrichmentRepository(join(options.dataDir, 'graphify', 'enrichment.db'));
+    this.reconcileStoreFactory = options.reconcileStoreFactory ?? createReconcileStore;
+    this.isolateReconcile = options.isolateReconcile ?? !import.meta.url.endsWith('.ts');
+    this.scheduleEnrichmentAfterReconcile = options.scheduleEnrichmentAfterReconcile ?? true;
+    this.watchFilesystem = options.watchFilesystem ?? true;
+    if (this.watchFilesystem && !import.meta.url.endsWith('.ts')) {
+      this.isolatedWatchers = new IsolatedGraphifyWatchers({
+        onDirty: (workgroupId) => {
+          if (!this.states.has(workgroupId) || this.closing) return;
+          this.markDirty(workgroupId);
+          this.queueReconcile(workgroupId);
+        },
+        onError: (workgroupId, error) => {
+          if (workgroupId && this.states.has(workgroupId))
+            this.requireState(workgroupId).lastFailure = `filesystem watcher: ${error}`;
+          else for (const state of this.states.values()) state.lastFailure = `filesystem watcher: ${error}`;
+        },
+      });
+    }
     const jobsRoot = graphifyJobsRoot(options.dataDir);
     this.semantic =
       options.semanticBackend ?? (this.enableEnrichment ? new CodexSemanticBackend({ tempRoot: jobsRoot }) : undefined);
@@ -504,7 +541,7 @@ export class WorkgroupGraphDaemon {
     const descriptors = await this.refreshCatalog();
     for (const descriptor of descriptors) {
       const state = this.requireState(descriptor.id);
-      const completedAt = this.requireStore(state).lastCompletedAt();
+      const completedAt = this.readExistingLastCompletedAt(descriptor.id);
       if (completedAt) {
         state.lastCompletedAt = completedAt;
         state.serveStaleDuringStartup = true;
@@ -674,7 +711,9 @@ export class WorkgroupGraphDaemon {
     context?: TrustedOverlayContext,
   ): Promise<GraphQueryResult> {
     await this.ensureFresh(workgroupId, 30_000, context);
-    const base = this.requireStore(this.requireState(workgroupId)).query(term, { limit });
+    const base = this.isolateReconcile
+      ? await runIsolatedRead<GraphQueryResult>(this.graphPath(workgroupId), workgroupId, 'query', { term, limit })
+      : this.requireStore(this.requireState(workgroupId)).query(term, { limit });
     if (!context) return base;
     return this.withOverlay(workgroupId, context, (store) => {
       const overlay = store.query(term, { limit });
@@ -699,14 +738,20 @@ export class WorkgroupGraphDaemon {
     context?: TrustedOverlayContext,
   ): Promise<GraphExplainResult | null> {
     await this.ensureFresh(workgroupId, 30_000, context);
-    const baseStore = this.requireStore(this.requireState(workgroupId));
-    if (!context) return this.explainDepth(baseStore, this.resolveReference(baseStore, reference), depth);
+    const baseStore = context || !this.isolateReconcile ? this.requireStore(this.requireState(workgroupId)) : undefined;
+    if (!context)
+      return this.isolateReconcile
+        ? await runIsolatedRead<GraphExplainResult | null>(this.graphPath(workgroupId), workgroupId, 'explain', {
+            reference,
+            depth,
+          })
+        : this.explainDepth(baseStore!, this.resolveReference(baseStore!, reference), depth);
     return this.withOverlay(workgroupId, context, (store) => {
       try {
         return this.explainDepth(store, this.resolveReference(store, reference), depth);
       } catch (error) {
         if (error instanceof Error && error.message.startsWith('unknown graph reference')) {
-          return this.explainDepth(baseStore, this.resolveReference(baseStore, reference), depth);
+          return this.explainDepth(baseStore!, this.resolveReference(baseStore!, reference), depth);
         }
         throw error;
       }
@@ -720,10 +765,17 @@ export class WorkgroupGraphDaemon {
     context?: TrustedOverlayContext,
   ): Promise<GraphPathResult | null> {
     await this.ensureFresh(workgroupId, 30_000, context);
-    const baseStore = this.requireStore(this.requireState(workgroupId));
+    const baseStore = context || !this.isolateReconcile ? this.requireStore(this.requireState(workgroupId)) : undefined;
     const basePath = (): GraphPathResult | null =>
-      baseStore.path(this.resolveReference(baseStore, from), this.resolveReference(baseStore, to), { maxDepth });
-    if (!context) return basePath();
+      baseStore!.path(this.resolveReference(baseStore!, from), this.resolveReference(baseStore!, to), { maxDepth });
+    if (!context)
+      return this.isolateReconcile
+        ? await runIsolatedRead<GraphPathResult | null>(this.graphPath(workgroupId), workgroupId, 'path', {
+            from,
+            to,
+            maxDepth,
+          })
+        : basePath();
     return this.withOverlay(workgroupId, context, (store) => {
       try {
         return (
@@ -742,10 +794,16 @@ export class WorkgroupGraphDaemon {
     context?: TrustedOverlayContext,
   ): Promise<GraphAffectedResult> {
     await this.ensureFresh(workgroupId, 30_000, context);
-    const baseStore = this.requireStore(this.requireState(workgroupId));
+    const baseStore = context || !this.isolateReconcile ? this.requireStore(this.requireState(workgroupId)) : undefined;
     const base = (): GraphAffectedResult =>
-      baseStore.affected(this.resolveReference(baseStore, reference), { maxDepth });
-    if (!context) return base();
+      baseStore!.affected(this.resolveReference(baseStore!, reference), { maxDepth });
+    if (!context)
+      return this.isolateReconcile
+        ? await runIsolatedRead<GraphAffectedResult>(this.graphPath(workgroupId), workgroupId, 'affected', {
+            reference,
+            maxDepth,
+          })
+        : base();
     return this.withOverlay(workgroupId, context, (store) => {
       try {
         return store.affected(this.resolveReference(store, reference), { maxDepth });
@@ -758,7 +816,10 @@ export class WorkgroupGraphDaemon {
 
   status(workgroupId: string): DaemonWorkgroupStatus {
     const state = this.requireState(workgroupId);
-    const status = this.requireStore(state).status();
+    return this.withFreshness(state, this.requireStore(state).status());
+  }
+
+  private withFreshness(state: WorkgroupState, status: WorkgroupGraphStatus): DaemonWorkgroupStatus {
     return {
       ...status,
       freshness: {
@@ -769,11 +830,18 @@ export class WorkgroupGraphDaemon {
         lagMs: state.lastCompletedAt
           ? Math.max(0, Date.now() - Date.parse(state.lastCompletedAt))
           : Number.MAX_SAFE_INTEGER,
-        pendingEnrichment: state.pendingEnrichment + this.enrichmentRepository.pending(workgroupId),
+        pendingEnrichment: state.pendingEnrichment + this.enrichmentRepository.pending(state.descriptor.id),
         lastFailure: state.lastFailure,
-        paused: this.paused.has(workgroupId),
+        paused: this.paused.has(state.descriptor.id),
       },
     };
+  }
+
+  async statusAsync(workgroupId: string): Promise<DaemonWorkgroupStatus> {
+    if (!this.isolateReconcile) return this.status(workgroupId);
+    const state = this.requireState(workgroupId);
+    const status = await runIsolatedRead<WorkgroupGraphStatus>(this.graphPath(workgroupId), workgroupId, 'status', {});
+    return this.withFreshness(state, status);
   }
 
   async validateOverlayContext(workgroupId: string, context: TrustedOverlayContext): Promise<void> {
@@ -799,13 +867,23 @@ export class WorkgroupGraphDaemon {
     if (this.semanticWakeTimer) clearTimeout(this.semanticWakeTimer);
     await Promise.all([...this.watchers.values()].map((watcher) => watcher.close()));
     this.watchers.clear();
+    await this.isolatedWatchers?.close();
     await this.background.stop?.();
     for (const state of this.states.values()) state.store?.close();
     this.enrichmentRepository.close();
   }
 
+  /** Single-run entrypoint used only by the isolated production worker. */
+  async reconcileOnce(workgroupId: string, signal?: AbortSignal): Promise<IsolatedReconcileResult> {
+    return await this.reconcileInProcess(this.requireState(workgroupId), signal);
+  }
+
   private async syncWatchers(descriptors: WorkgroupDescriptor[]): Promise<void> {
     if (this.closing) return;
+    if (this.isolatedWatchers) {
+      await this.isolatedWatchers.sync(descriptors, this.options.debounceMs ?? 3_000);
+      return;
+    }
     const desired = new Set<string>();
     for (const descriptor of descriptors) {
       const state = this.requireState(descriptor.id);
@@ -823,7 +901,7 @@ export class WorkgroupGraphDaemon {
   }
 
   private ensureWatchers(descriptor: WorkgroupDescriptor): void {
-    if (this.closing) return;
+    if (this.closing || !this.watchFilesystem || this.isolatedWatchers) return;
     const state = this.requireState(descriptor.id);
     for (const root of descriptor.roots) {
       const key = `${descriptor.id}\0${root.absolutePath}`;
@@ -926,9 +1004,6 @@ export class WorkgroupGraphDaemon {
     state.store?.close();
     state.store = undefined;
     this.enrichmentRepository.clearWorkgroup(workgroupId);
-    for (const [sourceId, entry] of this.enrichments)
-      if (entry.workgroupId === workgroupId) this.enrichments.delete(sourceId);
-    state.cacheLoaded = false;
     state.pendingEnrichment = 0;
     for (const key of [...this.attempted]) if (key.startsWith(`code:${workgroupId}:`)) this.attempted.delete(key);
     for (const key of [...this.retryAttempts.keys()])
@@ -939,6 +1014,37 @@ export class WorkgroupGraphDaemon {
   }
 
   private async reconcile(state: WorkgroupState, signal?: AbortSignal): Promise<void> {
+    if (!this.isolateReconcile) {
+      await this.reconcileInProcess(state, signal);
+      return;
+    }
+    state.lastStartedAt = new Date().toISOString();
+    const dirtyVersion = state.dirtyVersion;
+    const archiveVersion = state.archiveVersion;
+    const enrichmentVersion = state.enrichmentVersion;
+    const result = await runIsolatedReconcile({
+      dataDir: this.options.dataDir,
+      groupsDir: this.options.groupsDir,
+      centralDbPath: this.centralDbPath,
+      archivePath: this.archivePath,
+      workgroupId: state.descriptor.id,
+      enableEnrichment: this.enableEnrichment,
+      signal,
+    });
+    state.store?.close();
+    state.store = undefined;
+    this.requireStore(state);
+    state.dirty = state.dirtyVersion !== dirtyVersion || state.enrichmentVersion !== enrichmentVersion;
+    state.archiveDirty = state.archiveVersion !== archiveVersion;
+    state.lastCompletedAt = result.completedAt;
+    state.serveStaleDuringStartup = false;
+    state.lastFailure = undefined;
+    this.ensureWatchers(state.descriptor);
+    if (this.enableEnrichment && !this.paused.has(state.descriptor.id))
+      this.scheduleEnrichment(state, result.codeSources, []);
+  }
+
+  private async reconcileInProcess(state: WorkgroupState, signal?: AbortSignal): Promise<IsolatedReconcileResult> {
     state.lastStartedAt = new Date().toISOString();
     const dirtyVersion = state.dirtyVersion;
     const archiveVersion = state.archiveVersion;
@@ -950,26 +1056,25 @@ export class WorkgroupGraphDaemon {
       if (entry.startsWith('index.next-')) await rm(join(directory, entry), { force: true });
     }
     const nextPath = join(directory, `index.next-${hash(randomToken(), state.lastStartedAt)}.db`);
-    let next: WorkgroupGraphStore | undefined;
+    let next: ReconcileStore | undefined;
     try {
-      if (!state.cacheLoaded) {
-        for (const item of this.enrichmentRepository.load(state.descriptor.id))
-          this.enrichments.set(item.sourceId, item);
-        state.cacheLoaded = true;
-      }
-      next = new WorkgroupGraphStore(nextPath, state.descriptor.id);
-      const generation = next.beginGeneration('fast-reconcile');
+      next = this.reconcileStoreFactory(nextPath, state.descriptor.id);
+      const generation = await next.beginGeneration('fast-reconcile');
       const codeSources: CodeSourceBuild[] = [];
       let indexBatch: SourceReconciliation[] = [];
       let stateBatch: SourceStateAppend[] = [];
+      let batchContributions = 0;
+      let batchTextBytes = 0;
       let semanticBatch: SemanticQueueItem[] = [];
       let rasterQueued = 0;
       const flushSources = async (): Promise<void> => {
         if (indexBatch.length === 0 && stateBatch.length === 0) return;
-        if (indexBatch.length > 0) next!.appendSources(indexBatch, generation);
-        if (stateBatch.length > 0) next!.appendSourceStates(stateBatch, generation);
+        if (indexBatch.length > 0) await next!.appendSources(indexBatch, generation);
+        if (stateBatch.length > 0) await next!.appendSourceStates(stateBatch, generation);
         indexBatch = [];
         stateBatch = [];
+        batchContributions = 0;
+        batchTextBytes = 0;
         // better-sqlite3 mutations are synchronous. Bound each critical
         // section and return control so status/pause/preemption can run.
         await new Promise<void>((resolve) => setImmediate(resolve));
@@ -995,7 +1100,7 @@ export class WorkgroupGraphDaemon {
           const input = this.toInput(source);
           if (source.state !== 'pending' && source.state !== 'indexed') {
             stateBatch.push({ source: input, state: source.state, error: source.stateReason });
-            if (indexBatch.length + stateBatch.length >= 25) await flushSources();
+            if (indexBatch.length + stateBatch.length >= MAX_RECONCILE_BATCH_SOURCES) await flushSources();
             continue;
           }
           let preprocessed: PreprocessedSource;
@@ -1004,10 +1109,10 @@ export class WorkgroupGraphDaemon {
           } catch (error) {
             if (isAbortFailure(error, signal)) throw error;
             stateBatch.push({ source: input, state: 'failed', error: sourceExtractionFailure(error) });
-            if (indexBatch.length + stateBatch.length >= 25) await flushSources();
+            if (indexBatch.length + stateBatch.length >= MAX_RECONCILE_BATCH_SOURCES) await flushSources();
             continue;
           }
-          const cached = this.enrichments.get(source.id);
+          const cached = this.enrichmentRepository.get(source.id);
           const baseBundle = deterministicBundle(source, preprocessed);
           indexBatch.push({
             source: input,
@@ -1017,7 +1122,18 @@ export class WorkgroupGraphDaemon {
               cached?.contentHash === source.sha256 ? cached.semantic : undefined,
             ),
           });
-          if (indexBatch.length + stateBatch.length >= 25) await flushSources();
+          const indexed = indexBatch[indexBatch.length - 1].bundle;
+          batchContributions += indexed.nodes.length + indexed.edges.length + indexed.hyperedges.length;
+          batchTextBytes += indexed.nodes.reduce(
+            (total, node) => total + Buffer.byteLength(node.name) + Buffer.byteLength(node.description ?? ''),
+            0,
+          );
+          if (
+            indexBatch.length + stateBatch.length >= MAX_RECONCILE_BATCH_SOURCES ||
+            batchContributions >= MAX_RECONCILE_BATCH_CONTRIBUTIONS ||
+            batchTextBytes >= MAX_RECONCILE_BATCH_TEXT_BYTES
+          )
+            await flushSources();
           codeSources.push({ source, root });
 
           if (
@@ -1064,7 +1180,7 @@ export class WorkgroupGraphDaemon {
         ? this.archiveReader.read(state.descriptor.id, state.descriptor.memberIds)
         : [];
       for (const conversation of conversations) {
-        const cached = this.enrichments.get(conversation.input.id);
+        const cached = this.enrichmentRepository.get(conversation.input.id);
         indexBatch.push({
           source: conversation.input,
           bundle: mergeBundles(
@@ -1072,12 +1188,23 @@ export class WorkgroupGraphDaemon {
             cached?.contentHash === conversation.input.contentHash ? cached.semantic : undefined,
           ),
         });
-        if (indexBatch.length + stateBatch.length >= 25) await flushSources();
+        const indexed = indexBatch[indexBatch.length - 1].bundle;
+        batchContributions += indexed.nodes.length + indexed.edges.length + indexed.hyperedges.length;
+        batchTextBytes += indexed.nodes.reduce(
+          (total, node) => total + Buffer.byteLength(node.name) + Buffer.byteLength(node.description ?? ''),
+          0,
+        );
+        if (
+          indexBatch.length + stateBatch.length >= MAX_RECONCILE_BATCH_SOURCES ||
+          batchContributions >= MAX_RECONCILE_BATCH_CONTRIBUTIONS ||
+          batchTextBytes >= MAX_RECONCILE_BATCH_TEXT_BYTES
+        )
+          await flushSources();
       }
       await flushSources();
       flushSemantic();
-      next.completeGeneration(generation);
-      next.close();
+      await next.completeGeneration(generation);
+      await next.close();
       next = undefined;
       state.store?.close();
       state.store = undefined;
@@ -1089,10 +1216,11 @@ export class WorkgroupGraphDaemon {
       state.serveStaleDuringStartup = false;
       state.lastFailure = undefined;
       this.ensureWatchers(state.descriptor);
-      if (this.enableEnrichment && !this.paused.has(state.descriptor.id))
+      if (this.scheduleEnrichmentAfterReconcile && this.enableEnrichment && !this.paused.has(state.descriptor.id))
         this.scheduleEnrichment(state, codeSources, conversations);
+      return { codeSources, completedAt: state.lastCompletedAt };
     } catch (error) {
-      next?.close();
+      await next?.abort();
       await rm(nextPath, { force: true });
       if (!state.store && existsSync(livePath)) state.store = new WorkgroupGraphStore(livePath, state.descriptor.id);
       state.dirty = true;
@@ -1123,7 +1251,7 @@ export class WorkgroupGraphDaemon {
         .filter((source) => source.relativePath.startsWith('conversations/') && !incoming.has(source.id))
         .map((source) => source.id);
       const upserts = conversations.map((conversation) => {
-        const cached = this.enrichments.get(conversation.input.id);
+        const cached = this.enrichmentRepository.get(conversation.input.id);
         return {
           source: conversation.input,
           bundle: mergeBundles(
@@ -1132,7 +1260,16 @@ export class WorkgroupGraphDaemon {
           ),
         };
       });
-      const reconciled = store.reconcileSources('archive-reconcile', upserts, deletes);
+      const reconciled = this.isolateReconcile
+        ? await runIsolatedSourceReconcile({
+            path: livePath,
+            workgroupId: state.descriptor.id,
+            reason: 'archive-reconcile',
+            upserts,
+            deletes,
+            signal,
+          })
+        : store.reconcileSources('archive-reconcile', upserts, deletes);
       state.archiveDirty = state.archiveVersion !== archiveVersion;
       state.lastCompletedAt = new Date().toISOString();
       state.lastFailure = undefined;
@@ -1164,10 +1301,7 @@ export class WorkgroupGraphDaemon {
             item.root.absolutePath === root.absolutePath &&
             item.source.kind === 'code' &&
             !/\.toml$/i.test(item.source.relativePath) &&
-            !(
-              this.enrichments.get(item.source.id)?.contentHash === item.source.sha256 &&
-              this.enrichments.get(item.source.id)?.code
-            ),
+            !this.hasCurrentEnrichment(item.source.id, item.source.sha256, 'code'),
         );
         let batch: DiscoveredSource[] = [];
         let bytes = 0;
@@ -1192,11 +1326,7 @@ export class WorkgroupGraphDaemon {
         queued = [];
       };
       for (const item of conversations) {
-        if (
-          this.enrichments.get(item.input.id)?.contentHash === item.input.contentHash &&
-          this.enrichments.get(item.input.id)?.semantic
-        )
-          continue;
+        if (this.hasCurrentEnrichment(item.input.id, item.input.contentHash, 'semantic')) continue;
         queued.push({
           source: item.input,
           segments: item.bundle.nodes.map((node) => node.description ?? '').filter(Boolean),
@@ -1247,7 +1377,7 @@ export class WorkgroupGraphDaemon {
             this.queueReconcile(state.descriptor.id);
             continue;
           }
-          const prior = this.enrichments.get(source.id);
+          const prior = this.enrichmentRepository.get(source.id);
           const entry: PersistedEnrichment = {
             ...(prior?.contentHash === source.sha256 ? prior : {}),
             sourceId: source.id,
@@ -1264,9 +1394,17 @@ export class WorkgroupGraphDaemon {
         }
         if (upserts.length > 0) {
           state.enrichmentVersion += 1;
-          this.requireStore(state).reconcileSources('code-enrichment', upserts, []);
+          if (this.isolateReconcile)
+            await runIsolatedSourceReconcile({
+              path: join(this.options.dataDir, 'graphify', 'workgroups', state.descriptor.id, 'index.db'),
+              workgroupId: state.descriptor.id,
+              reason: 'code-enrichment',
+              upserts,
+              deletes: [],
+              signal,
+            });
+          else this.requireStore(state).reconcileSources('code-enrichment', upserts, []);
           for (const entry of entries) {
-            this.enrichments.set(entry.sourceId, entry);
             this.enrichmentRepository.put(entry);
           }
         }
@@ -1308,6 +1446,23 @@ export class WorkgroupGraphDaemon {
 
   private kickSemanticPump(): void {
     if (this.semanticPumpRunning || this.closing || !this.semantic) return;
+    // Deterministic freshness has priority over enrichment. In particular,
+    // do not let a queued large workgroup look idle merely because another
+    // workgroup currently owns the serialized background lane.
+    if (
+      [...this.states.values()].some(
+        (state) => state.dirty || state.archiveDirty || state.reconciling || state.backgroundQueued,
+      )
+    ) {
+      if (!this.semanticWakeTimer) {
+        this.semanticWakeTimer = setTimeout(() => {
+          this.semanticWakeTimer = undefined;
+          this.kickSemanticPump();
+        }, this.options.semanticPumpDelayMs ?? 5_000);
+        this.semanticWakeTimer.unref();
+      }
+      return;
+    }
     const wait = (this.options.semanticMinIntervalMs ?? 30_000) - (Date.now() - this.lastSemanticStartedAt);
     if (wait > 0) {
       if (!this.semanticWakeTimer) {
@@ -1387,7 +1542,7 @@ export class WorkgroupGraphDaemon {
           const semanticBundle = semantic.get(item.source.id);
           const binaryBundle = binary.get(item.source.id);
           if (!semanticBundle && !binaryBundle) continue;
-          const prior = this.enrichments.get(item.source.id);
+          const prior = this.enrichmentRepository.get(item.source.id);
           const entry: PersistedEnrichment = {
             ...(prior?.contentHash === item.source.contentHash ? prior : {}),
             sourceId: item.source.id,
@@ -1408,9 +1563,17 @@ export class WorkgroupGraphDaemon {
         for (const [workgroupId, items] of workgroups) {
           const state = this.requireState(workgroupId);
           state.enrichmentVersion += 1;
-          this.requireStore(state).reconcileSources('semantic-enrichment', items, []);
+          if (this.isolateReconcile)
+            await runIsolatedSourceReconcile({
+              path: join(this.options.dataDir, 'graphify', 'workgroups', workgroupId, 'index.db'),
+              workgroupId,
+              reason: 'semantic-enrichment',
+              upserts: items,
+              deletes: [],
+              signal,
+            });
+          else this.requireStore(state).reconcileSources('semantic-enrichment', items, []);
           for (const item of items) {
-            this.enrichments.set(item.entry.sourceId, item.entry);
             this.enrichmentRepository.put(item.entry);
           }
         }
@@ -1447,6 +1610,10 @@ export class WorkgroupGraphDaemon {
     };
   }
 
+  private hasCurrentEnrichment(sourceId: string, contentHash: string, kind: 'code' | 'semantic'): boolean {
+    return this.enrichmentRepository.hasCurrent(sourceId, contentHash, kind);
+  }
+
   private requireState(workgroupId: string): WorkgroupState {
     const state = this.states.get(workgroupId);
     if (!state) throw new Error(`unknown workgroup: ${workgroupId}`);
@@ -1454,10 +1621,34 @@ export class WorkgroupGraphDaemon {
   }
   private requireStore(state: WorkgroupState): WorkgroupGraphStore {
     if (!state.store) {
-      const path = join(this.options.dataDir, 'graphify', 'workgroups', state.descriptor.id, 'index.db');
+      const path = this.graphPath(state.descriptor.id);
       state.store = new WorkgroupGraphStore(path, state.descriptor.id);
     }
     return state.store;
+  }
+
+  private graphPath(workgroupId: string): string {
+    return join(this.options.dataDir, 'graphify', 'workgroups', workgroupId, 'index.db');
+  }
+
+  private readExistingLastCompletedAt(workgroupId: string): string | undefined {
+    const path = join(this.options.dataDir, 'graphify', 'workgroups', workgroupId, 'index.db');
+    if (!existsSync(path)) return undefined;
+    const db = new Database(path, { readonly: true, fileMustExist: true });
+    try {
+      const row = db
+        .prepare(
+          `SELECT completed_at FROM generations
+            WHERE completed_at IS NOT NULL ORDER BY generation DESC LIMIT 1`,
+        )
+        .get() as { completed_at: string } | undefined;
+      return row?.completed_at;
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('no such table')) return undefined;
+      throw error;
+    } finally {
+      db.close();
+    }
   }
 
   private resolveReference(store: WorkgroupGraphStore, reference: string): string {

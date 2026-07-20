@@ -3,7 +3,7 @@
 A **workgroup** is a tenant-level grouping that contains one or more `agent_groups`. It is the data-pool boundary for:
 
 - **Chat archive** — sibling agents in a workgroup can read each other's archived chat history via the existing `resolve_thread_link` / `search_threads` / `read_thread` MCP tools.
-- **Mnemon recall** — workgroup members read/write a single canonical mnemon store.
+- **Graphify knowledge retrieval** — members query one source-grounded graph over shared files, repositories, and conversations.
 - **OneCLI secret declarations** — workgroup-level secrets are inherited by all member agent_groups at container spawn time.
 
 Sibling `agent_groups` (e.g., a Claude twin + a Codex twin, plus future siblings like `<x>-research` or `<x>-data-analyst`) are peers — each remains a separate row in the database with its own platform bot user, CLAUDE.md, container, and routing identity. No sibling is a parent of another; the workgroup is the layer **above** them, not a collapse and not a hierarchy.
@@ -12,9 +12,9 @@ Sibling `agent_groups` (e.g., a Claude twin + a Codex twin, plus future siblings
 
 ## Why workgroups exist
 
-NanoClaw's sibling-agent architecture requires per-agent bot identity for native `@`-mentions on Slack and Discord. But the data layer was scoped per `agent_group_id`, so siblings could not see each other's chat history, mnemon facts, or shared credentials.
+NanoClaw's sibling-agent architecture requires per-agent bot identity for native `@`-mentions on Slack and Discord. But the data layer was scoped per `agent_group_id`, so siblings could not see each other's chat history, knowledge graph, or shared credentials.
 
-Before workgroups, this was patched up implicitly via scattered symlinks (`CLAUDE.local.md`, `sources/`, `conversations/`) and a fragile per-pair env override (`MNEMON_STORE_<folder>`). The pairing was implicit (naming convention `<x>` + `<x>-codex`) and broke silently if any wiring drifted.
+Before workgroups, this was patched up implicitly via scattered symlinks (`CLAUDE.local.md`, `sources/`, `conversations/`). The pairing was implicit (naming convention `<x>` + `<x>-codex`) and broke silently if any wiring drifted.
 
 The workgroup model formalizes the pairing as a first-class concept with explicit semantics.
 
@@ -82,21 +82,19 @@ When sibling agents are wired to the same chat channel, each agent's adapter wri
 
 ---
 
-## Mnemon store routing
+## Graphify graph routing
 
-Every workgroup has exactly one canonical mnemon store, identified by `workgroups.mnemon_store_id`.
+Every workgroup has one derived Graphify database under
+`data/graphify/workgroups/<workgroup-id>/index.db`. The daemon resolves group
+membership from the central DB and indexes all sibling group roots, the shared
+workgroup root, canonical clones, and projected conversation history. Git does
+not determine eligibility: tracked, untracked, and gitignored knowledge files
+are included unless a narrow `.graphifyignore` rule excludes them.
 
-For Dave's install (and any other install with pre-existing mnemon stores), migration 036 backfills `mnemon_store_id` to the **seed sibling's existing `agent_groups.id`** — the sibling whose folder matches the workgroup id, since that's where the populated mnemon store lives on disk. E.g., the `illysium` workgroup's `mnemon_store_id` is set to `ag-1776377699463-2axxhg` (illie's existing store path). This preserves 43MB+ of accumulated recall history without a separate filesystem migration.
-
-The "seed sibling" is a path-selection convention, not a hierarchy. If the seed sibling is deleted later, the store keeps living at the same path on disk and the remaining siblings keep using it via `workgroups.mnemon_store_id`. Workgroup members are peers; no sibling is a parent of another.
-
-At container spawn, the host sets `MNEMON_STORE=<workgroups.mnemon_store_id>` on the agent. Precedence (highest first):
-
-1. `MNEMON_STORE_<folder>` env var (PR #105's case-insensitive lookup) — preserved for backward compatibility per the project's hard constraint C6.
-2. `workgroups.mnemon_store_id` from the DB.
-3. `agentGroup.id` (graceful fallback for fresh installs before the reconciler runs).
-
-The `MNEMON_STORE_<folder>` env override is redundant once workgroups are populated, but stays in place to honor PR #105 compatibility. A future cleanup PR may remove it after operator confirmation.
+Containers call Graphify through `ncl`, which derives the workgroup from trusted
+session context. Callers cannot supply a cross-workgroup override. A current
+thread's managed worktree is admitted only after the host validates that the
+session belongs to the same workgroup.
 
 ---
 

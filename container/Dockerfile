@@ -224,27 +224,6 @@ RUN DPKG_ARCH=$(dpkg --print-architecture) && UARCH=$(uname -m) \
 # Binary copied from the alias stage declared at the top of this Dockerfile.
 COPY --from=mcp-toolbox-src /toolbox /usr/local/bin/toolbox
 
-# Pinned mnemon binary — auto-tracked by /update-container audit.
-# Per-arch SHA256 from https://github.com/mnemon-dev/mnemon/releases/download/v0.1.17/checksums.txt
-ARG MNEMON_VERSION=0.1.17
-ARG MNEMON_SHA256_arm64=0904ee5c4f8826a454cc103fa7f3459a1662dc65a5f5193b79de27c691b0dd9a
-ARG MNEMON_SHA256_amd64=3a2809c4cdb06fe99dcf13f806414331ef678f5658d514105719942fd4d821f7
-
-RUN ARCH=$(dpkg --print-architecture) \
-    && SHA=$(if [ "$ARCH" = "arm64" ]; then echo "$MNEMON_SHA256_arm64"; else echo "$MNEMON_SHA256_amd64"; fi) \
-    && curl -fsSL "https://github.com/mnemon-dev/mnemon/releases/download/v${MNEMON_VERSION}/mnemon_${MNEMON_VERSION}_linux_${ARCH}.tar.gz" -o /tmp/mnemon.tar.gz \
-    && echo "$SHA  /tmp/mnemon.tar.gz" | sha256sum -c - \
-    && tar -xzf /tmp/mnemon.tar.gz -C /tmp mnemon \
-    && mv /tmp/mnemon /usr/local/bin/mnemon-real \
-    && chmod +x /usr/local/bin/mnemon-real \
-    && rm -rf /tmp/mnemon*
-
-# Wrapper script (created in Task A2). Symlinked to canonical PATH location.
-COPY mnemon-wrapper.sh /usr/local/bin/mnemon-wrapper.sh
-RUN chmod +x /usr/local/bin/mnemon-wrapper.sh \
-    && ln -s /usr/local/bin/mnemon-wrapper.sh /usr/local/bin/mnemon \
-    && /usr/local/bin/mnemon --version
-
 # Hex CLI — closed-source Rust binary released as multi-arch tarballs at
 # https://github.com/hex-inc/hex-cli/releases. Auth is OAuth-only (no static
 # token env var); the real `hex` binary reads XDG_CONFIG_HOME, and the

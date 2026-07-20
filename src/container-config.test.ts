@@ -3,15 +3,7 @@ import os from 'os';
 import path from 'path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
-import {
-  readContainerConfig,
-  writeContainerConfig,
-  isFeedbackEnabled,
-  getQueryStrategy,
-  getRecallScope,
-  type MemoryConfig,
-  type RecallScope,
-} from './container-config.js';
+import { readContainerConfig, writeContainerConfig } from './container-config.js';
 
 let tmpDir: string;
 
@@ -42,88 +34,7 @@ function writeGroupConfig(folder: string, content: object): void {
   fs.writeFileSync(path.join(dir, 'container.json'), JSON.stringify(content, null, 2) + '\n');
 }
 
-describe('MemoryConfig resolvers', () => {
-  it('test_isFeedbackEnabled_default_true', () => {
-    const cfg: MemoryConfig = { enabled: true };
-    expect(isFeedbackEnabled(cfg)).toBe(true);
-  });
-
-  it('test_isFeedbackEnabled_explicit_opt_out', () => {
-    const cfg: MemoryConfig = { enabled: true, feedback_enabled: false };
-    expect(isFeedbackEnabled(cfg)).toBe(false);
-  });
-
-  it('test_isFeedbackEnabled_memory_disabled', () => {
-    const cfg: MemoryConfig = { enabled: false, feedback_enabled: true };
-    expect(isFeedbackEnabled(cfg)).toBe(false);
-  });
-
-  it('test_isFeedbackEnabled_undefined_cfg', () => {
-    expect(isFeedbackEnabled(undefined)).toBe(false);
-  });
-
-  it('test_getQueryStrategy_default', () => {
-    const cfg: MemoryConfig = { enabled: true };
-    expect(getQueryStrategy(cfg)).toBe('raw');
-  });
-
-  it('test_getQueryStrategy_undefined', () => {
-    expect(getQueryStrategy(undefined)).toBe('raw');
-  });
-
-  it('test_getQueryStrategy_llm', () => {
-    const cfg: MemoryConfig = { enabled: true, query_strategy: 'llm' };
-    expect(getQueryStrategy(cfg)).toBe('llm');
-  });
-
-  it('test_getQueryStrategy_heuristic', () => {
-    const cfg: MemoryConfig = { enabled: true, query_strategy: 'heuristic' };
-    expect(getQueryStrategy(cfg)).toBe('heuristic');
-  });
-
-  it('test_getRecallScope_default', () => {
-    const cfg: MemoryConfig = { enabled: true };
-    expect(getRecallScope(cfg)).toBe('workgroup');
-  });
-
-  it('test_getRecallScope_undefined', () => {
-    expect(getRecallScope(undefined)).toBe('workgroup');
-  });
-
-  it('test_getRecallScope_all_groups', () => {
-    const cfg: MemoryConfig = { enabled: true, recall_scope: 'all-groups' };
-    expect(getRecallScope(cfg)).toBe('all-groups');
-  });
-
-  it('test_getRecallScope_array', () => {
-    const cfg: MemoryConfig = { enabled: true, recall_scope: ['axie-dev', 'madison-reed'] };
-    expect(getRecallScope(cfg)).toEqual(['axie-dev', 'madison-reed']);
-  });
-});
-
-describe('RecallScope type + getRecallScope (B1)', () => {
-  it('test_recall_scope_default_is_workgroup', () => {
-    // Default flipped 2026-05-19 — workgroups feature exists to widen recall,
-    // so the default IS the wider behavior. Standalone agents (no workgroup_id)
-    // fall back to 'self' in resolveRecallScope (see scope-resolver tests).
-    expect(getRecallScope(undefined)).toBe('workgroup');
-    const cfg: MemoryConfig = { enabled: true };
-    expect(getRecallScope(cfg)).toBe('workgroup');
-  });
-
-  it('test_recall_scope_accepts_workgroup', () => {
-    // 'workgroup' is now a valid RecallScope value (type narrowing should pass)
-    const scope: RecallScope = 'workgroup';
-    const cfg: MemoryConfig = { enabled: true, recall_scope: scope };
-    expect(getRecallScope(cfg)).toBe('workgroup');
-  });
-
-  it('test_recall_scope_accepts_string_array', () => {
-    const scope: RecallScope = ['axie-dev', 'madison-reed'];
-    const cfg: MemoryConfig = { enabled: true, recall_scope: scope };
-    expect(getRecallScope(cfg)).toEqual(['axie-dev', 'madison-reed']);
-  });
-
+describe('workgroup and capability config', () => {
   it('test_workgroup_id_round_trip', () => {
     // writeContainerConfig + readContainerConfig must preserve workgroup_id
     const folder = 'test-wg-roundtrip';
@@ -175,51 +86,6 @@ describe('RecallScope type + getRecallScope (B1)', () => {
     });
     const result = readContainerConfig(folder);
     expect(result.slack_user_token).toBeUndefined();
-  });
-});
-
-describe('readContainerConfig — memory block', () => {
-  it('test_readContainerConfig_no_memory', () => {
-    writeGroupConfig('test-group', {
-      mcpServers: {},
-      packages: { apt: [], npm: [] },
-      additionalMounts: [],
-      skills: 'all',
-    });
-
-    const result = readContainerConfig('test-group');
-
-    expect(result.memory).toBeUndefined();
-  });
-
-  it('test_readContainerConfig_memory_enabled', () => {
-    writeGroupConfig('test-group2', {
-      memory: { enabled: true },
-      mcpServers: {},
-      packages: { apt: [], npm: [] },
-      additionalMounts: [],
-      skills: 'all',
-    });
-
-    const result = readContainerConfig('test-group2');
-
-    expect(result.memory).toEqual({ enabled: true } satisfies MemoryConfig);
-  });
-
-  it('test_readContainerConfig_drops_legacy_mnemon_field', () => {
-    // Legacy mnemon field with embeddings — should be silently dropped (not mapped to memory)
-    writeGroupConfig('test-group3', {
-      mnemon: { enabled: true, embeddings: true },
-      mcpServers: {},
-      packages: { apt: [], npm: [] },
-      additionalMounts: [],
-      skills: 'all',
-    });
-
-    const result = readContainerConfig('test-group3');
-
-    expect(result.memory).toBeUndefined();
-    expect((result as unknown as Record<string, unknown>).mnemon).toBeUndefined();
   });
 });
 

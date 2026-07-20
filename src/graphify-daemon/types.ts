@@ -84,6 +84,7 @@ export interface GraphifyDaemonApi {
     context?: TrustedOverlayContext,
   ): Promise<GraphReadResult>;
   status(workgroupId: string): Promise<DaemonWorkgroupStatus> | DaemonWorkgroupStatus;
+  statusAsync?(workgroupId: string): Promise<DaemonWorkgroupStatus>;
   ensureFresh(workgroupId: string, timeoutMs?: number, context?: TrustedOverlayContext): Promise<DaemonWorkgroupStatus>;
   markDirty(workgroupId: string): void;
   reindex(workgroupId: string, full: boolean): Promise<void> | void;

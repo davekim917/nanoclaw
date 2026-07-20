@@ -425,7 +425,7 @@ export function getMessagingGroupsByAgentGroup(agentGroupId: string): MessagingG
 
 /**
  * Pick the "primary" messaging group for an agent group — the one a background
- * task (e.g. daily wiki synthesise) should post its findings to. Ranks by
+ * task (for example, a daily source audit) should post its findings to. Ranks by
  * messaging_group_agents.priority DESC, with messaging_groups.created_at ASC
  * as a stable tiebreaker (older wiring wins). Returns null when the agent
  * group has no wired channels yet (e.g. brand-new agents from create_agent

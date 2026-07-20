@@ -354,14 +354,14 @@ describe('Graphify container agent instructions', () => {
     expect(skill).not.toMatch(/--(?:out|graph|global)\b/);
   });
 
-  it('test_environment_scoped_instructions_have_no_runtime_contradiction', async () => {
+  it('test_graphify_instructions_cover_container_and_host_access_without_runtime_contradiction', async () => {
     const instructions = await readFile(path.join(REPO_ROOT, 'CLAUDE.md'), 'utf-8');
-    const codeIntelligence = instructions.slice(instructions.indexOf('## Code intelligence'));
+    const codeIntelligence = instructions.slice(instructions.indexOf('## Code and knowledge intelligence'));
 
-    expect(codeIntelligence).toContain('NANOCLAW_CONTAINER=1');
-    expect(codeIntelligence).toMatch(/container sessions[\s\S]*Graphify/i);
-    expect(codeIntelligence).toMatch(/host\/operator sessions[\s\S]*GitNexus/i);
-    expect(codeIntelligence).toMatch(/container sessions[\s\S]*do not apply[\s\S]*GitNexus/i);
-    expect(codeIntelligence).toMatch(/Graphify[\s\S]*source and tests remain authoritative/i);
+    expect(codeIntelligence).toMatch(/container sessions use the `graphify` gateway/i);
+    expect(codeIntelligence).toMatch(/host\/operator sessions use[\s\S]*`ncl graphify/i);
+    expect(codeIntelligence).toMatch(/tracked and untracked workgroup files/i);
+    expect(codeIntelligence).toMatch(/Graphify output is advisory/i);
+    expect(codeIntelligence).toMatch(/direct source inspection[\s\S]*tests as the authority/i);
   });
 });

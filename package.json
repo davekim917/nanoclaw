@@ -25,6 +25,7 @@
     "lint:fix": "eslint src/ --fix",
     "test": "vitest run",
     "test:watch": "vitest",
+    "check:graphify-runtime": "pnpm run build && node dist/graphify-daemon/runtime-acceptance.js",
     "build:dashboard": "cd dashboard && pnpm install --ignore-workspace && pnpm vite build"
   },
   "dependencies": {

@@ -11,7 +11,7 @@ const { tmpRoot } = vi.hoisted(() => {
 
 vi.mock('./db/agent-groups.js', () => ({ getAgentGroup: () => undefined }));
 vi.mock('./container-config.js', () => ({ readContainerConfig: () => ({}) }));
-vi.mock('./memory-daemon/source-ingest.js', () => ({ isNonSymlinkChain: () => false }));
+vi.mock('./fs-safety.js', () => ({ isNonSymlinkDirectoryChain: () => false }));
 vi.mock('./session-manager.js', () => ({
   sessionDir: (ag: string, sess: string) => path.join(tmpRoot, ag, sess),
 }));
