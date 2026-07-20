@@ -145,4 +145,52 @@ describe('EnrichmentRepository', () => {
     repo.close();
     vi.useRealTimers();
   });
+
+  it('does not consume retry budget when semantic work is preempted', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-01-01T00:00:00Z'));
+    const root = mkdtempSync(join(tmpdir(), 'graphify-preempt-'));
+    roots.push(root);
+    const repo = new EnrichmentRepository(join(root, 'queue.db'));
+    repo.enqueue([
+      {
+        source: { id: 's', workgroupId: 'wg', kind: 'document', relativePath: 'a.md', contentHash: 'h' },
+        segments: ['a'],
+        priority: 1,
+      },
+    ]);
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      expect(repo.claimBatch()).toHaveLength(1);
+      repo.defer(['s']);
+      vi.advanceTimersByTime(5_001);
+    }
+    expect(repo.claimBatch()).toHaveLength(1);
+    repo.close();
+    vi.useRealTimers();
+  });
+
+  it('repairs retry debt left by legacy preemption handling', () => {
+    const root = mkdtempSync(join(tmpdir(), 'graphify-preempt-repair-'));
+    roots.push(root);
+    const path = join(root, 'queue.db');
+    const original = new EnrichmentRepository(path);
+    original.enqueue([
+      {
+        source: { id: 's', workgroupId: 'wg', kind: 'document', relativePath: 'a.md', contentHash: 'h' },
+        segments: ['a'],
+        priority: 1,
+      },
+    ]);
+    original.close();
+    const legacy = new Database(path);
+    legacy
+      .prepare("UPDATE semantic_queue SET state='failed', attempts=5, available_at=?, last_error='preempted'")
+      .run('2025-01-01T00:00:00.000Z');
+    legacy.close();
+
+    const repaired = new EnrichmentRepository(path);
+    expect(repaired.pending('wg')).toBe(1);
+    expect(repaired.claimBatch()).toHaveLength(1);
+    repaired.close();
+  });
 });

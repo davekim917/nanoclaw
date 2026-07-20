@@ -1887,13 +1887,17 @@ export class WorkgroupGraphDaemon {
       .then((result) => {
         this.semanticPumpRunning = false;
         const ids = batch.map((item) => item.source.id);
-        if (result.status !== 'completed') {
-          const message = result.status === 'failed' ? result.error.message : result.status;
+        if (result.status === 'failed') {
+          const message = result.error.message;
           this.enrichmentRepository.retry(ids, message);
           for (const item of batch) {
             const state = this.states.get(item.source.workgroupId);
             if (state) state.lastFailure = `semantic enrichment: ${message}`;
           }
+        } else if (result.status === 'preempted' || result.status === 'deferred') {
+          // Interactive turns and freshness work are expected to win this
+          // lane. Requeue without consuming the real failure retry budget.
+          this.enrichmentRepository.defer(ids, this.options.semanticPumpDelayMs ?? 5_000);
         }
         if (!this.closing) {
           const timer = setTimeout(() => this.kickSemanticPump(), this.options.semanticPumpDelayMs ?? 5_000);

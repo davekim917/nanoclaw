@@ -1032,6 +1032,62 @@ describe('WorkgroupGraphDaemon', () => {
     await daemon.close();
   });
 
+  it('eventually enriches semantic jobs after repeated priority preemption', async () => {
+    const f = fixture();
+    writeFileSync(join(f.groups, 'madison-agent', 'brief.md'), 'durable customer lifetime value knowledge');
+    let preemptions = 0;
+    const backgroundRunner = {
+      run: async (
+        job: (signal: AbortSignal) => Promise<unknown>,
+        options?: { priority?: 'freshness' | 'normal' | 'enrichment' },
+      ) => {
+        if (options?.priority !== 'freshness' && preemptions < 6) {
+          preemptions += 1;
+          return { status: 'preempted' };
+        }
+        return { status: 'completed', value: await job(new AbortController().signal) };
+      },
+    };
+    const semanticBackend = {
+      extract: vi.fn(async () => ({ nodes: [], edges: [], hyperedges: [] })),
+      extractBatch: vi.fn(
+        async (items: Array<{ source: SourceInput }>) =>
+          new Map(
+            items.map(({ source }) => [
+              source.id,
+              {
+                nodes: [{ id: `concept-${source.id}`, name: 'Customer LTV', type: 'metric' }],
+                edges: [],
+                hyperedges: [],
+              } satisfies ExtractionBundle,
+            ]),
+          ),
+      ),
+    };
+    const daemon = new WorkgroupGraphDaemon({
+      dataDir: f.data,
+      groupsDir: f.groups,
+      centralDbPath: f.central,
+      semanticBackend,
+      backgroundRunner: backgroundRunner as never,
+      semanticMinIntervalMs: 0,
+      semanticPumpDelayMs: 0,
+    });
+    await daemon.refreshCatalog();
+    await daemon.ensureFresh('madison');
+    await waitUntil(
+      () =>
+        semanticBackend.extractBatch.mock.calls.length === 1 &&
+        daemon.status('madison').freshness.pendingEnrichment === 0,
+      5_000,
+    );
+    expect(preemptions).toBe(6);
+    expect((await daemon.query('madison', 'Customer LTV')).nodes).toEqual(
+      expect.arrayContaining([expect.objectContaining({ name: 'Customer LTV' })]),
+    );
+    await daemon.close();
+  });
+
   it('bisects failed code batches so valid sources still receive enrichment', async () => {
     const f = fixture();
     for (const name of ['good-a.ts', 'good-b.ts', 'isolated-bad.py']) {

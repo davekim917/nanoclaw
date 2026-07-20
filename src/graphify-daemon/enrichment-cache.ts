@@ -76,6 +76,16 @@ export class EnrichmentRepository {
         /* additive column already exists */
       }
     }
+    // Older daemons counted expected background preemption as a failed
+    // semantic attempt. Heal that retry debt on open so jobs which lost five
+    // races to freshness are not stranded forever in the terminal state.
+    this.db
+      .prepare(
+        `UPDATE semantic_queue
+            SET state='pending', attempts=0, available_at=?, last_error=NULL
+          WHERE last_error IN ('preempted', 'deferred')`,
+      )
+      .run(new Date().toISOString());
   }
   close(): void {
     this.db.close();
@@ -222,6 +232,13 @@ export class EnrichmentRepository {
     const statement = this.db.prepare('DELETE FROM semantic_queue WHERE source_id=?');
     this.db.transaction((ids: string[]) => {
       for (const id of ids) statement.run(id);
+    })(sourceIds);
+  }
+  defer(sourceIds: string[], delayMs = 5_000): void {
+    const availableAt = new Date(Date.now() + delayMs).toISOString();
+    const statement = this.db.prepare("UPDATE semantic_queue SET state='pending', available_at=? WHERE source_id=?");
+    this.db.transaction((ids: string[]) => {
+      for (const id of ids) statement.run(availableAt, id);
     })(sourceIds);
   }
   retry(sourceIds: string[], error: string): void {
