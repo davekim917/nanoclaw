@@ -346,7 +346,9 @@ describe('Graphify container agent instructions', () => {
     for (const command of ['query', 'path', 'explain', 'affected']) {
       expect(skill).toContain(`graphify ${command}`);
     }
-    expect(skill).toMatch(/automatically reconciles current source before every (?:read|query)/i);
+    expect(skill).toMatch(/file additions, edits, and deletions are applied as small transactional\s+deltas/i);
+    expect(skill).toMatch(/latest complete generation immediately/i);
+    expect(skill).toMatch(/status` reports `dirty` or\s+`reconciling`/i);
     expect(skill).toMatch(/source and tests are authoritative/i);
     expect(skill).toMatch(/inspect (?:the )?source directly/i);
     expect(skill).not.toMatch(/`graphify (?:extract|install|update|watch|mcp|serve|daemon|hook)\b/i);

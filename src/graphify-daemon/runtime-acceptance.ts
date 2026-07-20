@@ -39,6 +39,14 @@ function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
 }
 
+async function waitUntil(check: () => Promise<boolean>, timeoutMs = 10_000): Promise<void> {
+  const started = performance.now();
+  while (!(await check())) {
+    if (performance.now() - started >= timeoutMs) throw new Error('runtime acceptance timed out');
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+}
+
 export async function main(): Promise<void> {
   const root = await mkdtemp(join(tmpdir(), 'graphify-runtime-acceptance-'));
   try {
@@ -119,15 +127,16 @@ export async function main(): Promise<void> {
     central.close();
     const knowledgePath = join(groupFolder, 'brief.md');
     await writeFile(knowledgePath, 'atomic generation one');
+    let incrementalLatencyMs = 0;
     const daemon = new WorkgroupGraphDaemon({
       dataDir: daemonData,
       groupsDir: daemonGroups,
       centralDbPath: centralPath,
       enableEnrichment: false,
-      watchFilesystem: false,
+      debounceMs: 25,
     });
     try {
-      await daemon.refreshCatalog();
+      await daemon.start();
       await daemon.ensureFresh('atomic-alpha');
       assert(
         (await daemon.query('atomic-alpha', 'atomic generation one')).nodes.length > 0,
@@ -142,11 +151,35 @@ export async function main(): Promise<void> {
       );
       const promoted = await daemon.statusAsync('atomic-alpha');
       assert(promoted.completeGeneration > 0, 'promoted generation failed its post-swap status read');
+
+      const incrementalStarted = performance.now();
+      const beforeUpdate = (await daemon.statusAsync('atomic-alpha')).completeGeneration;
+      await writeFile(knowledgePath, 'atomic generation three');
+      await waitUntil(async () => {
+        const status = await daemon.statusAsync('atomic-alpha');
+        return status.completeGeneration > beforeUpdate && !status.freshness.dirty;
+      });
+      assert(
+        (await daemon.query('atomic-alpha', 'atomic generation three')).nodes.length > 0,
+        'incremental filesystem update was not retrievable',
+      );
+      const beforeDelete = (await daemon.statusAsync('atomic-alpha')).completeGeneration;
+      await rm(knowledgePath);
+      await waitUntil(async () => {
+        const status = await daemon.statusAsync('atomic-alpha');
+        return status.completeGeneration > beforeDelete && !status.freshness.dirty;
+      });
+      assert(
+        (await daemon.query('atomic-alpha', 'atomic generation three')).nodes.length === 0,
+        'incremental filesystem deletion remained retrievable',
+      );
+      incrementalLatencyMs = performance.now() - incrementalStarted;
+      assert(incrementalLatencyMs < 10_000, 'incremental filesystem reconciliation exceeded 10s');
     } finally {
       await daemon.close();
     }
     process.stdout.write(
-      `${JSON.stringify({ passed: true, readLatencyMs: Math.round(readLatencyMs), checks: ['sharing', 'isolation', 'provenance', 'concurrent-read', 'freshness', 'atomic-promotion'] })}\n`,
+      `${JSON.stringify({ passed: true, readLatencyMs: Math.round(readLatencyMs), incrementalLatencyMs: Math.round(incrementalLatencyMs), checks: ['sharing', 'isolation', 'provenance', 'concurrent-read', 'freshness', 'atomic-promotion', 'incremental-update', 'incremental-delete'] })}\n`,
     );
   } finally {
     await rm(root, { recursive: true, force: true });

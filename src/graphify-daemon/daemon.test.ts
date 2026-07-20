@@ -165,11 +165,65 @@ describe('WorkgroupGraphDaemon', () => {
     });
     await daemon.start();
     await waitUntil(() => !daemon.status('madison').freshness.dirty);
+    const initialGeneration = daemon.status('madison').completeGeneration;
     await new Promise((resolve) => setTimeout(resolve, 100));
 
     writeFileSync(knowledge, 'version two knowledge');
-    await waitUntil(() => discover.mock.calls.length >= 2 && !daemon.status('madison').freshness.dirty, 5_000);
+    await waitUntil(
+      () =>
+        daemon.status('madison').completeGeneration > initialGeneration && !daemon.status('madison').freshness.dirty,
+      5_000,
+    );
     expect((await daemon.query('madison', 'version two knowledge')).nodes.length).toBeGreaterThan(0);
+    expect(discover).toHaveBeenCalledTimes(1);
+
+    const changedGeneration = daemon.status('madison').completeGeneration;
+    rmSync(knowledge);
+    await waitUntil(
+      () =>
+        daemon.status('madison').completeGeneration > changedGeneration && !daemon.status('madison').freshness.dirty,
+      5_000,
+    );
+    expect((await daemon.query('madison', 'version two knowledge')).nodes).toHaveLength(0);
+    expect(discover).toHaveBeenCalledTimes(1);
+    await daemon.close();
+  });
+
+  it('serves the complete generation immediately while a filesystem delta is pending', async () => {
+    const f = fixture();
+    const root = join(f.groups, 'madison-agent');
+    const knowledge = join(root, 'brief.md');
+    writeFileSync(knowledge, 'stable generation knowledge');
+    const daemon = new WorkgroupGraphDaemon({
+      dataDir: f.data,
+      groupsDir: f.groups,
+      centralDbPath: f.central,
+      enableEnrichment: false,
+    });
+    await daemon.refreshCatalog();
+    await daemon.ensureFresh('madison');
+    const initialGeneration = daemon.status('madison').completeGeneration;
+
+    daemon.pause('madison');
+    writeFileSync(knowledge, 'incremental generation knowledge');
+    daemon.markFilesystemChanges('madison', [{ root, path: knowledge, kind: 'change' }]);
+    const stable = await Promise.race([
+      daemon.query('madison', 'stable generation knowledge'),
+      new Promise<never>((_resolve, reject) =>
+        setTimeout(() => reject(new Error('interactive read waited for filesystem reconciliation')), 250),
+      ),
+    ]);
+    expect(stable.nodes.length).toBeGreaterThan(0);
+    expect(daemon.status('madison').freshness).toMatchObject({ dirty: true, paused: true });
+
+    daemon.resume('madison');
+    await waitUntil(
+      () =>
+        daemon.status('madison').completeGeneration > initialGeneration && !daemon.status('madison').freshness.dirty,
+      5_000,
+    );
+    expect((await daemon.query('madison', 'incremental generation knowledge')).nodes.length).toBeGreaterThan(0);
+    expect((await daemon.query('madison', 'stable generation knowledge')).nodes).toHaveLength(0);
     await daemon.close();
   });
 
@@ -370,7 +424,7 @@ describe('WorkgroupGraphDaemon', () => {
     await daemon.close();
   });
 
-  it('test_query_waits_for_dirty_fast_reconcile_but_not_enrichment', async () => {
+  it('test_initial_query_waits_for_first_generation_but_not_enrichment', async () => {
     const f = fixture();
     writeFileSync(join(f.groups, 'madison-agent', 'fresh.md'), 'fresh deterministic knowledge');
     const enrich = { run: vi.fn(() => new Promise(() => {})) };
@@ -814,6 +868,47 @@ describe('WorkgroupGraphDaemon', () => {
     await Promise.all([active, full]);
     await waitUntil(() => calls === 3 && !daemon.status('madison').freshness.dirty);
     expect(daemon.status('madison').freshness).toMatchObject({ dirty: false, reconciling: false });
+    await daemon.close();
+  });
+
+  it('keeps the complete generation queryable throughout a full reindex', async () => {
+    const f = fixture();
+    writeFileSync(join(f.groups, 'madison-agent', 'brief.md'), 'stable maintenance knowledge');
+    let calls = 0;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const daemon = new WorkgroupGraphDaemon({
+      dataDir: f.data,
+      groupsDir: f.groups,
+      centralDbPath: f.central,
+      enableEnrichment: false,
+      backgroundRunner: immediateRunner() as never,
+      discover: async (options) => {
+        calls += 1;
+        if (calls === 2) await gate;
+        return discoverWorkgroup(options);
+      },
+    });
+    await daemon.refreshCatalog();
+    await daemon.ensureFresh('madison');
+
+    await daemon.reindex('madison', true);
+    await waitUntil(() => calls === 2);
+    expect(existsSync(join(f.data, 'graphify', 'workgroups', 'madison', 'index.db'))).toBe(true);
+    const stable = await Promise.race([
+      daemon.query('madison', 'stable maintenance knowledge'),
+      new Promise<never>((_resolve, reject) =>
+        setTimeout(() => reject(new Error('interactive read waited for full reindex')), 250),
+      ),
+    ]);
+    expect(stable.nodes.length).toBeGreaterThan(0);
+    expect(daemon.status('madison').freshness).toMatchObject({ dirty: true, reconciling: true });
+
+    release();
+    await waitUntil(() => !daemon.status('madison').freshness.dirty, 5_000);
+    expect((await daemon.query('madison', 'stable maintenance knowledge')).nodes.length).toBeGreaterThan(0);
     await daemon.close();
   });
 

@@ -1,13 +1,14 @@
 import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { mkdir, readdir, realpath, rename, rm } from 'node:fs/promises';
-import { join, posix, relative, sep } from 'node:path';
+import { basename, join, posix, relative, resolve, sep } from 'node:path';
 
 import Database from 'better-sqlite3';
 import chokidar, { type FSWatcher } from 'chokidar';
 
 import {
   discoverWorkgroup,
+  discoverSourcePath,
   isGraphifyDefaultExcludedPath,
   type DiscoverWorkgroupOptions,
   type DiscoveredSource,
@@ -33,13 +34,20 @@ import { runIsolatedSourceReconcile } from './isolated-source-reconcile.js';
 import { IsolatedGraphifyWatchers } from './isolated-watchers.js';
 import { runIsolatedRead } from './isolated-read.js';
 import { createReconcileStore, type ReconcileStore, type ReconcileStoreFactory } from './reconcile-store-worker.js';
-import type { DaemonWorkgroupStatus, TrustedOverlayContext, WorkgroupDescriptor, WorkgroupRoot } from './types.js';
+import type {
+  DaemonWorkgroupStatus,
+  GraphifyFilesystemChange,
+  TrustedOverlayContext,
+  WorkgroupDescriptor,
+  WorkgroupRoot,
+} from './types.js';
 
 export const DEFAULT_FULL_RECONCILE_MS = 6 * 60 * 60_000;
 export const DEFAULT_CATALOG_REFRESH_MS = 60_000;
 const MAX_RECONCILE_BATCH_SOURCES = 25;
 const MAX_RECONCILE_BATCH_CONTRIBUTIONS = 500;
 const MAX_RECONCILE_BATCH_TEXT_BYTES = 1024 * 1024;
+const MAX_INCREMENTAL_FILESYSTEM_CHANGES = 1_000;
 
 interface CodeSourceBuild {
   source: DiscoveredSource;
@@ -68,10 +76,16 @@ interface WorkgroupState {
   reconcileAborts: Set<AbortController>;
   activeReads: number;
   promotionGate?: Promise<void>;
+  pendingFilesystemChanges: Map<string, GraphifyFilesystemChange>;
+  fullScanRequired: boolean;
+  fullScanVersion: number;
 }
 
 interface BackgroundRunnerLike {
-  run<T>(job: (signal: AbortSignal) => Promise<T>, options?: { preemptActive?: boolean }): Promise<BackgroundResult<T>>;
+  run<T>(
+    job: (signal: AbortSignal) => Promise<T>,
+    options?: { preemptActive?: boolean; priority?: 'freshness' | 'normal' | 'enrichment' },
+  ): Promise<BackgroundResult<T>>;
   stop?(): Promise<void> | void;
 }
 
@@ -438,10 +452,9 @@ export class WorkgroupGraphDaemon {
     this.watchFilesystem = options.watchFilesystem ?? true;
     if (this.watchFilesystem && !import.meta.url.endsWith('.ts')) {
       this.isolatedWatchers = new IsolatedGraphifyWatchers({
-        onDirty: (workgroupId) => {
+        onDirty: (workgroupId, changes, fullScan) => {
           if (!this.states.has(workgroupId) || this.closing) return;
-          this.markDirty(workgroupId);
-          this.queueReconcile(workgroupId);
+          this.markFilesystemChanges(workgroupId, changes, fullScan);
         },
         onError: (workgroupId, error) => {
           if (workgroupId && this.states.has(workgroupId))
@@ -513,6 +526,8 @@ export class WorkgroupGraphDaemon {
         if (JSON.stringify(descriptor) !== prior) {
           existing.dirty = true;
           existing.dirtyVersion += 1;
+          existing.fullScanRequired = true;
+          existing.fullScanVersion += 1;
         }
       } else
         this.states.set(id, {
@@ -528,6 +543,9 @@ export class WorkgroupGraphDaemon {
           fullReindexVersion: 0,
           reconcileAborts: new Set(),
           activeReads: 0,
+          pendingFilesystemChanges: new Map(),
+          fullScanRequired: true,
+          fullScanVersion: 1,
         });
     }
     const active = new Set(descriptors.map((descriptor) => descriptor.id));
@@ -536,6 +554,8 @@ export class WorkgroupGraphDaemon {
       state.descriptor = { id, memberIds: [], roots: [] };
       state.dirty = true;
       state.dirtyVersion += 1;
+      state.fullScanRequired = true;
+      state.fullScanVersion += 1;
     }
     return descriptors;
   }
@@ -599,6 +619,19 @@ export class WorkgroupGraphDaemon {
     const state = this.requireState(workgroupId);
     state.dirty = true;
     state.dirtyVersion += 1;
+    state.fullScanRequired = true;
+    state.fullScanVersion += 1;
+  }
+  markFilesystemChanges(workgroupId: string, changes: GraphifyFilesystemChange[], fullScan = false): void {
+    const state = this.requireState(workgroupId);
+    if (fullScan || changes.length === 0 || changes.length > MAX_INCREMENTAL_FILESYSTEM_CHANGES) {
+      this.markDirty(workgroupId);
+    } else {
+      for (const change of changes) state.pendingFilesystemChanges.set(`${change.root}\0${change.path}`, change);
+      state.dirty = true;
+      state.dirtyVersion += 1;
+    }
+    this.queueReconcile(workgroupId);
   }
   async reindex(workgroupId: string, full: boolean): Promise<void> {
     const state = this.requireState(workgroupId);
@@ -611,6 +644,8 @@ export class WorkgroupGraphDaemon {
     }
     state.dirty = true;
     state.dirtyVersion += 1;
+    state.fullScanRequired = true;
+    state.fullScanVersion += 1;
     this.queueReconcile(workgroupId);
   }
   pause(workgroupId: string): void {
@@ -693,7 +728,9 @@ export class WorkgroupGraphDaemon {
       if (!state.reconciling) {
         const controller = new AbortController();
         const operation = state.dirty
-          ? this.reconcile(state, controller.signal)
+          ? this.canReconcileIncrementally(state)
+            ? this.reconcileFilesystemChanges(state, controller.signal)
+            : this.reconcile(state, controller.signal)
           : this.reconcileArchive(state, controller.signal);
         this.trackReconciliation(state, operation, controller);
       }
@@ -715,14 +752,44 @@ export class WorkgroupGraphDaemon {
     }
   }
 
+  private canReconcileIncrementally(state: WorkgroupState): boolean {
+    return (
+      !state.fullScanRequired &&
+      Boolean(state.lastCompletedAt) &&
+      state.pendingFilesystemChanges.size > 0 &&
+      existsSync(this.graphPath(state.descriptor.id))
+    );
+  }
+
+  /**
+   * Interactive reads use the last complete generation immediately. Initial
+   * reads still wait for the first usable baseline; callers that explicitly
+   * require the newest mutation use ensureFresh().
+   */
+  private async prepareRead(workgroupId: string, context?: TrustedOverlayContext): Promise<WorkgroupState> {
+    const state = this.requireState(workgroupId);
+    if (state.lastCompletedAt && existsSync(this.graphPath(workgroupId))) {
+      if (context) await this.validateOverlayContext(workgroupId, context);
+      if (
+        !this.paused.has(workgroupId) &&
+        (state.dirty || state.archiveDirty || state.fullReindexRequested) &&
+        !state.reconciling &&
+        !state.backgroundQueued
+      )
+        this.queueReconcile(workgroupId);
+      return state;
+    }
+    await this.waitForFreshness(workgroupId, 30_000, context);
+    return this.requireState(workgroupId);
+  }
+
   async query(
     workgroupId: string,
     term: string,
     limit = 20,
     context?: TrustedOverlayContext,
   ): Promise<GraphQueryResult> {
-    await this.waitForFreshness(workgroupId, 30_000, context);
-    const state = this.requireState(workgroupId);
+    const state = await this.prepareRead(workgroupId, context);
     return await this.withStableGeneration(state, async () => {
       const base = this.isolateReconcile
         ? await runIsolatedRead<GraphQueryResult>(this.graphPath(workgroupId), workgroupId, 'query', { term, limit })
@@ -751,8 +818,7 @@ export class WorkgroupGraphDaemon {
     depth = 2,
     context?: TrustedOverlayContext,
   ): Promise<GraphExplainResult | null> {
-    await this.waitForFreshness(workgroupId, 30_000, context);
-    const state = this.requireState(workgroupId);
+    const state = await this.prepareRead(workgroupId, context);
     return await this.withStableGeneration(state, async () => {
       const baseStore = context || !this.isolateReconcile ? this.requireStore(state) : undefined;
       if (!context)
@@ -781,8 +847,7 @@ export class WorkgroupGraphDaemon {
     maxDepth = 8,
     context?: TrustedOverlayContext,
   ): Promise<GraphPathResult | null> {
-    await this.waitForFreshness(workgroupId, 30_000, context);
-    const state = this.requireState(workgroupId);
+    const state = await this.prepareRead(workgroupId, context);
     return await this.withStableGeneration(state, async () => {
       const baseStore = context || !this.isolateReconcile ? this.requireStore(state) : undefined;
       const basePath = (): GraphPathResult | null =>
@@ -813,8 +878,7 @@ export class WorkgroupGraphDaemon {
     maxDepth = 8,
     context?: TrustedOverlayContext,
   ): Promise<GraphAffectedResult> {
-    await this.waitForFreshness(workgroupId, 30_000, context);
-    const state = this.requireState(workgroupId);
+    const state = await this.prepareRead(workgroupId, context);
     return await this.withStableGeneration(state, async () => {
       const baseStore = context || !this.isolateReconcile ? this.requireStore(state) : undefined;
       const base = (): GraphAffectedResult =>
@@ -938,12 +1002,28 @@ export class WorkgroupGraphDaemon {
         ignored: (candidate) => isGraphifyDefaultExcludedPath(root.absolutePath, candidate),
       });
       let debounce: NodeJS.Timeout | undefined;
-      watcher.on('all', () => {
+      const changes = new Map<string, GraphifyFilesystemChange>();
+      let fullScan = false;
+      watcher.on('all', (event, candidate) => {
+        const path = resolve(root.absolutePath, candidate);
+        if (basename(path) === '.graphifyignore' || event === 'unlinkDir') {
+          fullScan = true;
+          changes.clear();
+        } else if (event === 'add' || event === 'change' || event === 'unlink') {
+          changes.set(path, { root: root.absolutePath, path, kind: event });
+          if (changes.size > MAX_INCREMENTAL_FILESYSTEM_CHANGES) {
+            fullScan = true;
+            changes.clear();
+          }
+        } else {
+          return;
+        }
         if (debounce) clearTimeout(debounce);
         debounce = setTimeout(() => {
           if (!this.states.has(descriptor.id)) return;
-          this.markDirty(descriptor.id);
-          this.queueReconcile(descriptor.id);
+          this.markFilesystemChanges(descriptor.id, [...changes.values()], fullScan);
+          changes.clear();
+          fullScan = false;
         }, this.options.debounceMs ?? 3_000);
         debounce.unref();
       });
@@ -971,8 +1051,10 @@ export class WorkgroupGraphDaemon {
               throw new Error('workgroup indexing paused');
             }
             if (state.fullReindexRequested) await this.prepareFullReindex(state);
-            if (state.dirty) await this.reconcile(state, reconcileSignal);
-            else if (state.archiveDirty) await this.reconcileArchive(state, reconcileSignal);
+            if (state.dirty) {
+              if (this.canReconcileIncrementally(state)) await this.reconcileFilesystemChanges(state, reconcileSignal);
+              else await this.reconcile(state, reconcileSignal);
+            } else if (state.archiveDirty) await this.reconcileArchive(state, reconcileSignal);
           })();
           await this.trackReconciliation(state, operation, controller);
         },
@@ -980,7 +1062,7 @@ export class WorkgroupGraphDaemon {
         // atomic baseline must finish or a busy workgroup can discard hours
         // of progress forever. OS/cgroup priority keeps it subordinate; only
         // manual pause, shutdown, and preemptible Docker/Codex jobs abort.
-        { preemptActive: false },
+        { preemptActive: false, priority: 'freshness' },
       )
       .then((result) => {
         state.backgroundQueued = false;
@@ -1026,14 +1108,15 @@ export class WorkgroupGraphDaemon {
   private async prepareFullReindex(state: WorkgroupState): Promise<void> {
     const workgroupId = state.descriptor.id;
     const requestVersion = state.fullReindexVersion;
-    state.store?.close();
-    state.store = undefined;
+    // The normal reconcile already builds an empty private candidate. Keep the
+    // last complete live generation open until that candidate validates and is
+    // atomically promoted; a maintenance request must never create read
+    // downtime for an otherwise healthy workgroup.
     this.enrichmentRepository.clearWorkgroup(workgroupId);
     state.pendingEnrichment = 0;
     for (const key of [...this.attempted]) if (key.startsWith(`code:${workgroupId}:`)) this.attempted.delete(key);
     for (const key of [...this.retryAttempts.keys()])
       if (key.startsWith(`code:${workgroupId}:`)) this.retryAttempts.delete(key);
-    await rm(join(this.options.dataDir, 'graphify', 'workgroups', workgroupId), { recursive: true, force: true });
     state.archiveDirty = false;
     state.fullReindexRequested = state.fullReindexVersion !== requestVersion;
   }
@@ -1047,6 +1130,8 @@ export class WorkgroupGraphDaemon {
     const dirtyVersion = state.dirtyVersion;
     const archiveVersion = state.archiveVersion;
     const enrichmentVersion = state.enrichmentVersion;
+    const fullScanVersion = state.fullScanVersion;
+    const filesystemChanges = new Map(state.pendingFilesystemChanges);
     let candidatePath: string | undefined;
     let result: IsolatedReconcileResult;
     try {
@@ -1079,7 +1164,14 @@ export class WorkgroupGraphDaemon {
       }
       throw error;
     }
-    state.dirty = state.dirtyVersion !== dirtyVersion || state.enrichmentVersion !== enrichmentVersion;
+    for (const [key, change] of filesystemChanges)
+      if (state.pendingFilesystemChanges.get(key) === change) state.pendingFilesystemChanges.delete(key);
+    state.fullScanRequired = state.fullScanVersion !== fullScanVersion;
+    state.dirty =
+      state.dirtyVersion !== dirtyVersion ||
+      state.enrichmentVersion !== enrichmentVersion ||
+      state.fullScanRequired ||
+      state.pendingFilesystemChanges.size > 0;
     state.archiveDirty = state.archiveVersion !== archiveVersion;
     state.lastCompletedAt = result.completedAt;
     state.serveStaleDuringStartup = false;
@@ -1098,6 +1190,8 @@ export class WorkgroupGraphDaemon {
     const dirtyVersion = state.dirtyVersion;
     const archiveVersion = state.archiveVersion;
     const enrichmentVersion = state.enrichmentVersion;
+    const fullScanVersion = state.fullScanVersion;
+    const filesystemChanges = new Map(state.pendingFilesystemChanges);
     const directory = join(this.options.dataDir, 'graphify', 'workgroups', state.descriptor.id);
     const livePath = join(directory, 'index.db');
     await mkdir(directory, { recursive: true, mode: 0o700 });
@@ -1274,7 +1368,14 @@ export class WorkgroupGraphDaemon {
       state.store = undefined;
       await rename(nextPath, livePath);
       state.store = new WorkgroupGraphStore(livePath, state.descriptor.id);
-      state.dirty = state.dirtyVersion !== dirtyVersion || state.enrichmentVersion !== enrichmentVersion;
+      for (const [key, change] of filesystemChanges)
+        if (state.pendingFilesystemChanges.get(key) === change) state.pendingFilesystemChanges.delete(key);
+      state.fullScanRequired = state.fullScanVersion !== fullScanVersion;
+      state.dirty =
+        state.dirtyVersion !== dirtyVersion ||
+        state.enrichmentVersion !== enrichmentVersion ||
+        state.fullScanRequired ||
+        state.pendingFilesystemChanges.size > 0;
       state.archiveDirty = state.archiveVersion !== archiveVersion;
       state.lastCompletedAt = completedAt;
       state.serveStaleDuringStartup = false;
@@ -1290,6 +1391,145 @@ export class WorkgroupGraphDaemon {
       state.dirty = true;
       state.lastFailure = error instanceof Error ? error.message : String(error);
       throw error;
+    }
+  }
+
+  /** Apply ordinary watcher changes transactionally without rebuilding the corpus. */
+  private async reconcileFilesystemChanges(state: WorkgroupState, signal?: AbortSignal): Promise<void> {
+    const livePath = this.graphPath(state.descriptor.id);
+    if (!existsSync(livePath)) {
+      state.fullScanRequired = true;
+      state.fullScanVersion += 1;
+      await this.reconcile(state, signal);
+      return;
+    }
+    state.lastStartedAt = new Date().toISOString();
+    const dirtyVersion = state.dirtyVersion;
+    const changes = new Map(state.pendingFilesystemChanges);
+    const upserts: SourceReconciliation[] = [];
+    const deletes: string[] = [];
+    const codeSources: CodeSourceBuild[] = [];
+    const semanticItems: SemanticQueueItem[] = [];
+    let rasterQueued = 0;
+
+    for (const change of changes.values()) {
+      if (signal?.aborted) throw new Error('filesystem reconcile preempted by interactive chat');
+      const root = state.descriptor.roots.find((candidate) => candidate.absolutePath === change.root);
+      if (!root) {
+        state.fullScanRequired = true;
+        state.fullScanVersion += 1;
+        await this.reconcile(state, signal);
+        return;
+      }
+      const rootRelativePath = portable(relative(root.absolutePath, resolve(change.path)));
+      const relativePath = prefixed(root.prefix, rootRelativePath);
+      const id = stableSourceId(state.descriptor.id, relativePath);
+      const original = await discoverSourcePath({
+        workgroupId: state.descriptor.id,
+        root: root.absolutePath,
+        path: change.path,
+        signal,
+      });
+      if (!original) {
+        deletes.push(id);
+        continue;
+      }
+      if (original.state !== 'pending' && original.state !== 'indexed') {
+        // Metadata-only and failure state transitions use the full generation
+        // path so their status rows retain exactly the same semantics.
+        state.fullScanRequired = true;
+        state.fullScanVersion += 1;
+        await this.reconcile(state, signal);
+        return;
+      }
+      const source = { ...original, id, relativePath, workgroupId: state.descriptor.id };
+      const input = this.toInput(source);
+      let prepared: PreprocessedSource;
+      try {
+        prepared = await preprocessDiscoveredSource(source);
+      } catch (error) {
+        if (isAbortFailure(error, signal)) throw error;
+        // The full path records extraction failures as source state instead of
+        // retrying one bad watcher event forever.
+        state.fullScanRequired = true;
+        state.fullScanVersion += 1;
+        await this.reconcile(state, signal);
+        return;
+      }
+      const cached = this.enrichmentRepository.get(source.id);
+      const baseBundle = deterministicBundle(source, prepared);
+      upserts.push({
+        source: input,
+        bundle: mergeBundles(
+          baseBundle,
+          cached?.contentHash === source.sha256 ? cached.code : undefined,
+          cached?.contentHash === source.sha256 ? cached.semantic : undefined,
+        ),
+      });
+      codeSources.push({ source, root });
+
+      if (
+        this.enableEnrichment &&
+        this.semantic &&
+        !this.paused.has(state.descriptor.id) &&
+        !(cached?.contentHash === source.sha256 && cached.semantic)
+      ) {
+        const semanticCode = source.kind === 'code' && /\.(?:sql|toml)$/i.test(source.relativePath);
+        if ((source.kind !== 'code' || semanticCode) && prepared.semanticSegments.length > 0) {
+          semanticItems.push({
+            source: input,
+            segments: prepared.semanticSegments,
+            baseBundle,
+            priority: source.kind === 'document' ? 60 : semanticCode ? 50 : 40,
+          });
+        }
+        if (this.codeWorker?.preprocess && /\.(?:pdf|docx|xlsx)$/i.test(source.relativePath)) {
+          semanticItems.push({
+            source: input,
+            segments: [],
+            baseBundle,
+            documentPath: source.absolutePath,
+            sourceRoot: root.absolutePath,
+            rootRelativePath,
+            priority: 55,
+          });
+        }
+        if (rasterQueued < 100 && source.kind === 'image' && /\.(?:png|jpe?g|webp)$/i.test(source.relativePath)) {
+          rasterQueued += 1;
+          semanticItems.push({
+            source: input,
+            segments: [`Raster image at ${source.relativePath}`],
+            baseBundle,
+            imagePath: source.absolutePath,
+            sourceRoot: root.absolutePath,
+            priority: 5,
+          });
+        }
+      }
+    }
+
+    if (this.isolateReconcile)
+      await runIsolatedSourceReconcile({
+        path: livePath,
+        workgroupId: state.descriptor.id,
+        reason: 'filesystem-reconcile',
+        upserts,
+        deletes,
+        signal,
+      });
+    else this.requireStore(state).reconcileSources('filesystem-reconcile', upserts, deletes);
+
+    for (const [key, change] of changes)
+      if (state.pendingFilesystemChanges.get(key) === change) state.pendingFilesystemChanges.delete(key);
+    state.dirty =
+      state.dirtyVersion !== dirtyVersion || state.fullScanRequired || state.pendingFilesystemChanges.size > 0;
+    state.lastCompletedAt = new Date().toISOString();
+    state.serveStaleDuringStartup = false;
+    state.lastFailure = undefined;
+    if (semanticItems.length > 0) this.enrichmentRepository.enqueue(semanticItems);
+    if (this.enableEnrichment && !this.paused.has(state.descriptor.id)) {
+      this.scheduleEnrichment(state, codeSources, []);
+      if (semanticItems.length > 0) this.kickSemanticPump();
     }
   }
 

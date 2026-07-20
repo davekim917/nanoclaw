@@ -15,9 +15,11 @@ requirements-to-spec-to-SQL/LookML-to-code-to-report connections, architecture,
 dependency paths, and affected-code questions.
 
 The graph is selected from trusted session context and maintained automatically.
-Graphify automatically reconciles current source before every query, within a
-bounded freshness deadline; slower structural and semantic enrichment remains
-asynchronous.
+Ordinary file additions, edits, and deletions are applied as small transactional
+deltas. Queries use the latest complete generation immediately instead of
+blocking behind a safety rebuild; `graphify status` reports `dirty` or
+`reconciling` while a newer generation is in flight. Slower structural and
+semantic enrichment remains asynchronous.
 You do not need to choose a project, pre-authorize a folder, or manually refresh
 an index before asking a question. Queries work from any directory. In a managed
 worktree, the gateway reconciles current edits, new files, and deletions as the
@@ -42,7 +44,9 @@ repository's normal verification.
 
 `graphify --help` and `graphify <command> --help` show syntax without inspecting
 or refreshing a graph. `graphify status` reports workgroup freshness and indexing
-state.
+state. When a conclusion specifically depends on a just-written artifact and the
+status is dirty, inspect that authoritative artifact directly while Graphify
+finishes the autonomous delta; do not invent a manual index workflow.
 
 ## Boundaries and fallback
 

@@ -189,12 +189,25 @@ export interface BackgroundGraphRunnerOptions {
 export interface BackgroundJobOptions {
   /** Abort an admitted job if interactive pressure appears. Defaults to true. */
   preemptActive?: boolean;
+  /** Freshness runs before queued enrichment and may preempt active enrichment. Defaults to enrichment. */
+  priority?: 'freshness' | 'normal' | 'enrichment';
+}
+
+interface QueuedBackgroundJob {
+  job: (signal: AbortSignal) => Promise<unknown>;
+  options: BackgroundJobOptions;
+  resolve(result: BackgroundResult<unknown>): void;
 }
 
 /** Single global lane for Docker/Codex graph jobs, outside chat admission. */
 export class BackgroundGraphRunner {
-  private tail: Promise<void> = Promise.resolve();
-  private readonly active = new Set<AbortController>();
+  private readonly queues: Record<'freshness' | 'normal' | 'enrichment', QueuedBackgroundJob[]> = {
+    freshness: [],
+    normal: [],
+    enrichment: [],
+  };
+  private draining?: Promise<void>;
+  private readonly active = new Map<AbortController, BackgroundJobOptions>();
   private stopped = false;
   private readonly freeMemory: () => number;
   private readonly pollMs: number;
@@ -217,19 +230,64 @@ export class BackgroundGraphRunner {
   }
 
   run<T>(job: (signal: AbortSignal) => Promise<T>, options: BackgroundJobOptions = {}): Promise<BackgroundResult<T>> {
-    const result = this.tail.then(() => this.execute(job, options));
-    this.tail = result.then(
-      () => undefined,
-      () => undefined,
-    );
+    if (this.stopped) return Promise.resolve({ status: 'preempted' });
+    const priority = options.priority ?? 'enrichment';
+    const normalizedOptions = { ...options, priority };
+    const result = new Promise<BackgroundResult<T>>((resolve) => {
+      this.queues[priority].push({
+        job,
+        options: normalizedOptions,
+        resolve: (outcome) => resolve(outcome as BackgroundResult<T>),
+      });
+    });
+    if (priority === 'freshness') {
+      for (const [controller, activeOptions] of this.active) {
+        if (activeOptions.priority === 'enrichment' && activeOptions.preemptActive !== false)
+          controller.abort('Graphify freshness work queued');
+      }
+    }
+    this.startDrain();
     return result;
   }
 
   async stop(): Promise<void> {
     this.stopped = true;
-    for (const controller of this.active) controller.abort('Graphify daemon stopping');
-    await this.tail;
+    for (const controller of this.active.keys()) controller.abort('Graphify daemon stopping');
+    this.preemptQueued();
+    await this.draining;
     await this.isolatedPressure?.close();
+  }
+
+  private startDrain(): void {
+    if (this.draining || this.stopped) return;
+    const draining = this.drain().finally(() => {
+      if (this.draining === draining) this.draining = undefined;
+      if (!this.stopped && this.hasQueued()) this.startDrain();
+    });
+    this.draining = draining;
+  }
+
+  private async drain(): Promise<void> {
+    while (!this.stopped) {
+      const next = this.nextQueued();
+      if (!next) return;
+      next.resolve(await this.execute(next.job, next.options));
+    }
+    this.preemptQueued();
+  }
+
+  private nextQueued(): QueuedBackgroundJob | undefined {
+    return this.queues.freshness.shift() ?? this.queues.normal.shift() ?? this.queues.enrichment.shift();
+  }
+
+  private hasQueued(): boolean {
+    return this.queues.freshness.length + this.queues.normal.length + this.queues.enrichment.length > 0;
+  }
+
+  private preemptQueued(): void {
+    for (const queue of Object.values(this.queues)) {
+      for (const item of queue.splice(0)) item.resolve({ status: 'preempted' });
+    }
   }
 
   private async execute<T>(
@@ -239,8 +297,9 @@ export class BackgroundGraphRunner {
     if (this.stopped) return { status: 'preempted' };
     if (this.freeMemory() < this.minimumFreeBytes) return { status: 'deferred', reason: 'memory' };
     if (await this.pressure()) return { status: 'preempted' };
+    if (this.stopped) return { status: 'preempted' };
     const controller = new AbortController();
-    this.active.add(controller);
+    this.active.set(controller, options);
     let preempted = false;
     let pressureScanRunning = false;
     const timer =

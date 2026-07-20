@@ -23,6 +23,12 @@ export interface TrustedOverlayContext {
   sessionId: string;
 }
 
+export interface GraphifyFilesystemChange {
+  root: string;
+  path: string;
+  kind: 'add' | 'change' | 'unlink';
+}
+
 export interface FreshnessStatus {
   dirty: boolean;
   reconciling: boolean;

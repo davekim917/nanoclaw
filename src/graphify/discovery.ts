@@ -30,6 +30,15 @@ export interface DiscoverWorkgroupOptions {
   signal?: AbortSignal;
 }
 
+export interface DiscoverSourcePathOptions {
+  workgroupId: string;
+  root: string;
+  /** Absolute path reported by the trusted filesystem watcher. */
+  path: string;
+  ignoreFile?: string;
+  signal?: AbortSignal;
+}
+
 const MIB = 1024 * 1024;
 
 const EXCLUDED_DIRECTORIES = new Set([
@@ -394,6 +403,77 @@ function ignoredByRules(rules: IgnoreRule[], path: string, isDirectory: boolean)
   return rules.some((rule) => rule.matches(path, isDirectory));
 }
 
+async function discoverRegularSource(
+  workgroupId: string,
+  root: string,
+  rules: IgnoreRule[],
+  absolutePath: string,
+  relativePath: string,
+  signal?: AbortSignal,
+): Promise<DiscoveredSource | undefined> {
+  if (ignoredByRules(rules, relativePath, false)) return undefined;
+  const credential = isCredentialPath(relativePath);
+  const kind = classifyPath(relativePath) ?? (credential ? 'document' : undefined);
+  if (!kind) return undefined;
+
+  const resolvedPath = await realpath(absolutePath);
+  if (!isInsideRoot(root, resolvedPath)) return undefined;
+  const fileStat = await stat(resolvedPath);
+  if (!fileStat.isFile()) return undefined;
+  const cap = maxBytesFor(relativePath, kind);
+  const state = credential || fileStat.size > cap ? 'metadata_only' : 'pending';
+  const stateReason = credential
+    ? 'Sensitive credential-shaped file: content extraction disabled'
+    : fileStat.size > cap
+      ? `Source exceeds the ${cap / MIB} MiB ${kind} extraction cap`
+      : undefined;
+  const fingerprintKind = state === 'metadata_only' ? 'metadata' : 'content';
+
+  return {
+    id: stableSourceId(workgroupId, relativePath),
+    workgroupId,
+    relativePath,
+    absolutePath: resolvedPath,
+    kind,
+    bytes: fileStat.size,
+    mtimeMs: fileStat.mtimeMs,
+    sha256:
+      state === 'metadata_only'
+        ? metadataFingerprint(relativePath, fileStat.size, fileStat.mtimeMs)
+        : await sha256File(resolvedPath, signal),
+    state,
+    ...(stateReason ? { stateReason } : {}),
+    metadata: { extractionCapBytes: cap, fingerprintKind },
+  };
+}
+
+/**
+ * Resolve one watcher-reported path through the same safety, ignore, size, and
+ * credential policy as a full workgroup discovery. Absence means the source
+ * should not contribute to the graph (deleted, ignored, unsupported, or no
+ * longer a regular file).
+ */
+export async function discoverSourcePath(options: DiscoverSourcePathOptions): Promise<DiscoveredSource | undefined> {
+  throwIfAborted(options.signal);
+  if (!options.workgroupId.trim()) throw new Error('workgroupId is required');
+  const root = await realpath(resolve(options.root));
+  const candidate = resolve(root, options.path);
+  if (!isInsideRoot(root, candidate)) throw new Error('source path is outside the workgroup root');
+  const relativePath = normalizeRelativePath(relative(root, candidate));
+  if (!relativePath || relativePath === '.graphifyignore') return undefined;
+  if (isGraphifyDefaultExcludedPath(root, candidate)) return undefined;
+  const rules = await loadIgnoreRules(root, options.ignoreFile);
+  let entryStat;
+  try {
+    entryStat = await lstat(candidate);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw error;
+  }
+  if (entryStat.isSymbolicLink() || !entryStat.isFile()) return undefined;
+  return await discoverRegularSource(options.workgroupId, root, rules, candidate, relativePath, options.signal);
+}
+
 export async function discoverWorkgroup(options: DiscoverWorkgroupOptions): Promise<DiscoveredSource[]> {
   throwIfAborted(options.signal);
   if (!options.workgroupId.trim()) throw new Error('workgroupId is required');
@@ -433,40 +513,16 @@ export async function discoverWorkgroup(options: DiscoverWorkgroupOptions): Prom
         await walk(resolvedPath);
         continue;
       }
-      if (!entryStat.isFile() || ignoredByRules(rules, relativePath, false)) continue;
-
-      const credential = isCredentialPath(relativePath);
-      const kind = classifyPath(relativePath) ?? (credential ? 'document' : undefined);
-      if (!kind) continue;
-
-      const resolvedPath = await realpath(absolutePath);
-      if (!isInsideRoot(root, resolvedPath)) continue;
-      const fileStat = await stat(resolvedPath);
-      const cap = maxBytesFor(relativePath, kind);
-      const state = credential || fileStat.size > cap ? 'metadata_only' : 'pending';
-      const stateReason = credential
-        ? 'Sensitive credential-shaped file: content extraction disabled'
-        : fileStat.size > cap
-          ? `Source exceeds the ${cap / MIB} MiB ${kind} extraction cap`
-          : undefined;
-      const fingerprintKind = state === 'metadata_only' ? 'metadata' : 'content';
-
-      discovered.push({
-        id: stableSourceId(options.workgroupId, relativePath),
-        workgroupId: options.workgroupId,
+      if (!entryStat.isFile()) continue;
+      const source = await discoverRegularSource(
+        options.workgroupId,
+        root,
+        rules,
+        absolutePath,
         relativePath,
-        absolutePath: resolvedPath,
-        kind,
-        bytes: fileStat.size,
-        mtimeMs: fileStat.mtimeMs,
-        sha256:
-          state === 'metadata_only'
-            ? metadataFingerprint(relativePath, fileStat.size, fileStat.mtimeMs)
-            : await sha256File(resolvedPath, options.signal),
-        state,
-        ...(stateReason ? { stateReason } : {}),
-        metadata: { extractionCapBytes: cap, fingerprintKind },
-      });
+        options.signal,
+      );
+      if (source) discovered.push(source);
     }
   }
 

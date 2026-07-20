@@ -1,9 +1,9 @@
 import { Worker } from 'node:worker_threads';
 
-import type { WorkgroupDescriptor } from './types.js';
+import type { GraphifyFilesystemChange, WorkgroupDescriptor } from './types.js';
 
 interface WatcherCallbacks {
-  onDirty(workgroupId: string): void;
+  onDirty(workgroupId: string, changes: GraphifyFilesystemChange[], fullScan: boolean): void;
   onError(workgroupId: string | undefined, error: string): void;
 }
 
@@ -16,8 +16,15 @@ export class IsolatedGraphifyWatchers {
     this.worker = new Worker(new URL('./isolated-watchers-thread.js', import.meta.url));
     this.worker.on(
       'message',
-      (message: { event: 'dirty' | 'error' | 'fatal' | 'synced' | 'closed'; workgroupId?: string; error?: string }) => {
-        if (message.event === 'dirty' && message.workgroupId) callbacks.onDirty(message.workgroupId);
+      (message: {
+        event: 'dirty' | 'error' | 'fatal' | 'synced' | 'closed';
+        workgroupId?: string;
+        error?: string;
+        changes?: GraphifyFilesystemChange[];
+        fullScan?: boolean;
+      }) => {
+        if (message.event === 'dirty' && message.workgroupId)
+          callbacks.onDirty(message.workgroupId, message.changes ?? [], message.fullScan === true);
         else if (message.event === 'error') callbacks.onError(message.workgroupId, message.error ?? 'watcher error');
         else if (message.event === 'fatal') {
           const waiter = this.syncWaiters.shift();

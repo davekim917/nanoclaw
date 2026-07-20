@@ -4,7 +4,12 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, test, vi } from 'vitest';
 import { rmSync } from 'node:fs';
 
-import { discoverWorkgroup, isGraphifyDefaultExcludedPath, readVerifiedSource } from './discovery.js';
+import {
+  discoverSourcePath,
+  discoverWorkgroup,
+  isGraphifyDefaultExcludedPath,
+  readVerifiedSource,
+} from './discovery.js';
 
 const { createReadStreamSpy } = vi.hoisted(() => ({ createReadStreamSpy: vi.fn() }));
 
@@ -191,6 +196,23 @@ describe('discoverWorkgroup', () => {
     const sources = await discoverWorkgroup({ workgroupId: 'wg', root });
 
     expect(sources.map((source) => source.relativePath)).toEqual(['models/orders.sql', 'unlisted/strategy.md']);
+  });
+
+  test('test_single_source_discovery_matches_full_policy_and_reports_absence', async () => {
+    const root = makeRoot();
+    const sourcePath = put(root, 'notes/decision.md', '# Immediate knowledge');
+    const [full] = await discoverWorkgroup({ workgroupId: 'wg', root });
+
+    await expect(discoverSourcePath({ workgroupId: 'wg', root, path: sourcePath })).resolves.toEqual(full);
+
+    put(root, '.graphifyignore', 'notes/decision.md\n');
+    await expect(discoverSourcePath({ workgroupId: 'wg', root, path: sourcePath })).resolves.toBeUndefined();
+
+    rmSync(sourcePath);
+    await expect(discoverSourcePath({ workgroupId: 'wg', root, path: sourcePath })).resolves.toBeUndefined();
+    await expect(discoverSourcePath({ workgroupId: 'wg', root, path: join(makeRoot(), 'outside.md') })).rejects.toThrow(
+      /outside/,
+    );
   });
 
   test('test_discovery_aborts_an_active_hash_when_interactive_work_arrives', async () => {

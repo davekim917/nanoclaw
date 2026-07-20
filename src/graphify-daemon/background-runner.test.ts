@@ -20,6 +20,41 @@ Cached:         14950632 kB`),
 });
 
 describe('BackgroundGraphRunner shutdown', () => {
+  it('runs freshness ahead of queued enrichment and preempts active enrichment', async () => {
+    const runner = new BackgroundGraphRunner({
+      sessionsRoot: '/nonexistent',
+      pressure: () => false,
+      freeMemory: () => 10_000_000_000,
+      pollMs: 10,
+    });
+    const order: string[] = [];
+    let enrichmentStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      enrichmentStarted = resolve;
+    });
+    const active = runner.run(async (signal) => {
+      order.push('active-enrichment');
+      enrichmentStarted();
+      await new Promise<void>((resolve) => signal.addEventListener('abort', () => resolve(), { once: true }));
+    });
+    await started;
+    const queued = runner.run(async () => {
+      order.push('queued-enrichment');
+    });
+    const freshness = runner.run(
+      async () => {
+        order.push('freshness');
+      },
+      { priority: 'freshness', preemptActive: false },
+    );
+
+    expect((await active).status).toBe('preempted');
+    expect((await freshness).status).toBe('completed');
+    expect((await queued).status).toBe('completed');
+    expect(order).toEqual(['active-enrichment', 'freshness', 'queued-enrichment']);
+    await runner.stop();
+  });
+
   it('does not destroy an admitted non-preemptible job when pressure rises', async () => {
     let pressure = false;
     let release!: () => void;

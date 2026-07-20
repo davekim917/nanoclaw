@@ -22,5 +22,7 @@ ncl graphify status --group madison-reed
 Use the smallest useful read, then open the cited file or conversation
 provenance. Graphify is advisory; source and tests are authoritative. Discovery
 is automatic and includes tracked, untracked, and gitignored knowledge unless a
-narrow `.graphifyignore` excludes it. Do not invent a project allowlist or
-manual freshness workflow.
+narrow `.graphifyignore` excludes it. Ordinary file changes reconcile as
+transactional deltas; reads stay responsive on the latest complete generation
+while maintenance rebuilds run. Use `status` to observe a newer in-flight
+generation, and do not invent a project allowlist or manual freshness workflow.
