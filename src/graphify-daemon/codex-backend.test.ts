@@ -1,4 +1,4 @@
-import { lstatSync, mkdirSync, mkdtempSync, readlinkSync, rmSync, writeFileSync } from 'node:fs';
+import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -16,6 +16,38 @@ afterEach(() => {
 });
 
 describe('CodexSemanticBackend output boundary', () => {
+  it('writes a Codex-compatible strict output schema', async () => {
+    const processRun = vi.fn(async (_command: string, args: string[]) => {
+      const schema = JSON.parse(readFileSync(args[args.indexOf('--output-schema') + 1], 'utf8')) as Record<
+        string,
+        unknown
+      >;
+      const assertStrictObjects = (value: unknown): void => {
+        if (!value || typeof value !== 'object') return;
+        const record = value as Record<string, unknown>;
+        if (record.type === 'object') {
+          expect(record.additionalProperties).toBe(false);
+          const properties = (record.properties ?? {}) as Record<string, unknown>;
+          expect(new Set(record.required as string[])).toEqual(new Set(Object.keys(properties)));
+        }
+        if ('const' in record) expect(record.type).toBeDefined();
+        for (const child of Object.values(record)) assertStrictObjects(child);
+      };
+      assertStrictObjects(schema);
+      writeFileSync(
+        args[args.indexOf('--output-last-message') + 1],
+        JSON.stringify({ sources: [{ sourceId: 's', nodes: [], edges: [], hyperedges: [] }] }),
+      );
+      return { exitCode: 0, stdout: '', stderr: '' };
+    });
+    const backend = new CodexSemanticBackend({ processRun, tempRoot: temp() });
+    await backend.extract(
+      { id: 's', workgroupId: 'wg', kind: 'document', relativePath: 'brief.md', contentHash: 'h' },
+      ['safe'],
+    );
+    expect(processRun).toHaveBeenCalledTimes(1);
+  });
+
   it('uses a private writable home with only inherited auth linked in', async () => {
     const inherited = temp();
     mkdirSync(inherited, { recursive: true });
