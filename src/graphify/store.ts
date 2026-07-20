@@ -863,6 +863,9 @@ export class WorkgroupGraphStore {
         FOREIGN KEY (node_id) REFERENCES nodes(id) ON DELETE CASCADE
       );
 
+      CREATE INDEX IF NOT EXISTS source_nodes_node_idx
+        ON source_nodes(node_id, source_id);
+
       CREATE TABLE IF NOT EXISTS edges (
         source_id TEXT NOT NULL,
         id TEXT NOT NULL,
@@ -881,6 +884,8 @@ export class WorkgroupGraphStore {
 
       CREATE INDEX IF NOT EXISTS edges_from_idx ON edges(from_node, structural);
       CREATE INDEX IF NOT EXISTS edges_to_idx ON edges(to_node, structural);
+      CREATE INDEX IF NOT EXISTS edges_from_to_idx
+        ON edges(from_node, to_node, source_id);
 
       CREATE TABLE IF NOT EXISTS hyperedges (
         source_id TEXT NOT NULL,

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from 'vitest';
+import Database from 'better-sqlite3';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -47,6 +48,25 @@ function bundleFor(sourceId: string, relativePath: string, nodeId: string, nodeN
 }
 
 describe('WorkgroupGraphStore', () => {
+  test('creates reverse lookup indexes used by interactive retrieval', () => {
+    const root = mkdtempSync(join(tmpdir(), 'graphify-store-indexes-'));
+    roots.push(root);
+    const path = join(root, 'index.db');
+    new WorkgroupGraphStore(path, 'madison-reed').close();
+
+    const db = new Database(path, { readonly: true });
+    const indexes = db
+      .prepare(
+        `SELECT name FROM sqlite_master
+          WHERE type = 'index'
+            AND name IN ('source_nodes_node_idx', 'edges_from_to_idx')
+          ORDER BY name`,
+      )
+      .all() as Array<{ name: string }>;
+    db.close();
+    expect(indexes.map((row) => row.name)).toEqual(['edges_from_to_idx', 'source_nodes_node_idx']);
+  });
+
   test('read-only store serves retrieval without claiming a writer lock', () => {
     const root = mkdtempSync(join(tmpdir(), 'graphify-store-readonly-'));
     roots.push(root);
