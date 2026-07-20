@@ -3,11 +3,7 @@
   "package": {
     "name": "graphifyy",
     "version": "0.9.20",
-    "extras": [
-      "pdf",
-      "office",
-      "sql"
-    ]
+    "extras": ["pdf", "office", "sql", "terraform"]
   },
   "upstream": {
     "repo": "Graphify-Labs/graphify",
@@ -70,12 +66,7 @@
     "graphify/manifest_ingest.py": "1f79a52f3c7f7a47d3a5006204bc00310c52d72c0b021200d9d5c477cbdc7f7f",
     "graphify/mcp_ingest.py": "7553845a7cae7c310803bf37d992b695b27d21e1b827c1c33dbed2b15971be61"
   },
-  "commands": [
-    "query",
-    "path",
-    "explain",
-    "affected"
-  ],
+  "commands": ["query", "path", "explain", "affected"],
   "upstreamCapabilities": [
     "automatic-index-freshness",
     "resource-bounded-extraction",

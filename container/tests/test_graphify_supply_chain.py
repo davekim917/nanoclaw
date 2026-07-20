@@ -40,17 +40,17 @@ def parse_lock() -> dict[str, dict[str, str]]:
 
 
 class SupplyChainTest(unittest.TestCase):
-    def test_release_adapter_enables_pdf_office_sql_video_extras(self):
+    def test_release_adapter_enables_pdf_office_sql_terraform_extras(self):
         # Keep this stable CI entry-point name while asserting the revised policy:
         # local media transcription is deferred until an offline model is seeded.
-        expected_extras = ["pdf", "office", "sql"]
+        expected_extras = ["pdf", "office", "sql", "terraform"]
         self.assertEqual(INTEGRATION["package"]["extras"], expected_extras)
         script = UPDATE_SCRIPT.read_text(encoding="utf-8")
-        self.assertIn("const ENABLED_EXTRAS = ['pdf', 'office', 'sql']", script)
+        self.assertIn("const ENABLED_EXTRAS = ['pdf', 'office', 'sql', 'terraform']", script)
         self.assertIn("const requirement = graphifyRequirement(version)", script)
         self.assertIn("await writeFile(inputPath, `${requirement}\\n`)", script)
         self.assertRegex(script, r"'--dest',\s*wheelhouse,\s*requirement")
-        self.assertIn("Enabled extras: pdf, office, sql.", LOCK.read_text(encoding="utf-8"))
+        self.assertIn("Enabled extras: pdf, office, sql, terraform.", LOCK.read_text(encoding="utf-8"))
 
         locked = parse_lock()
         # One distinctive distribution from every selected extra.
@@ -83,8 +83,8 @@ class SupplyChainTest(unittest.TestCase):
 
     def test_arm64_closure_contains_only_audited_wheels(self):
         audit = json.loads(AUDIT.read_text(encoding="utf-8"))
-        self.assertEqual(audit["extras"], ["pdf", "office", "sql"])
-        self.assertEqual(audit["requirement"], "graphifyy[pdf,office,sql]==0.9.20")
+        self.assertEqual(audit["extras"], ["pdf", "office", "sql", "terraform"])
+        self.assertEqual(audit["requirement"], "graphifyy[pdf,office,sql,terraform]==0.9.20")
         self.assertGreater(len(audit["wheels"]), 1)
         for wheel in audit["wheels"]:
             with self.subTest(wheel=wheel["filename"]):

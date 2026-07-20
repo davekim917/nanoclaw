@@ -14,7 +14,7 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const MANIFEST_PATH = path.join(ROOT, 'container/graphify-integration.json');
 const LOCK_PATH = path.join(ROOT, 'container/graphify-requirements.lock');
 const AUDIT_PATH = path.join(ROOT, 'container/graphify-wheel-audit.json');
-const ENABLED_EXTRAS = ['pdf', 'office', 'sql'] as const;
+const ENABLED_EXTRAS = ['pdf', 'office', 'sql', 'terraform'] as const;
 const SEMANTIC_SURFACE_PATHS = {
   'codex-extraction-spec': 'graphify/skills/codex/references/extraction-spec.md',
   detector: 'graphify/detect.py',

@@ -1,16 +1,12 @@
 {
   "schemaVersion": 1,
   "releasePolicy": "latest-stable",
-  "uv_version": "uv 0.11.28 (aarch64-unknown-linux-gnu)",
+  "uv_version": "uv 0.11.29 (aarch64-unknown-linux-gnu)",
   "python_version": "3.11",
   "platform": "manylinux2014_aarch64",
-  "requirement": "graphifyy[pdf,office,sql]==0.9.20",
-  "extras": [
-    "pdf",
-    "office",
-    "sql"
-  ],
-  "generated_at": "2026-07-19T19:43:53.846Z",
+  "requirement": "graphifyy[pdf,office,sql,terraform]==0.9.20",
+  "extras": ["pdf", "office", "sql", "terraform"],
+  "generated_at": "2026-07-20T00:46:31.534Z",
   "wheels": [
     {
       "package": "beautifulsoup4",
@@ -165,6 +161,13 @@
       "filename": "tree_sitter_groovy-0.1.2-cp39-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
       "sha256": "4cdb4c62284f19fbfdd4900e816c3e8604672de107e4e52a8e65b663f368b4cb",
       "uploaded_at": "2024-11-19T04:32:59.511176Z"
+    },
+    {
+      "package": "tree-sitter-hcl",
+      "version": "1.2.0",
+      "filename": "tree_sitter_hcl-1.2.0-cp310-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl",
+      "sha256": "d2e9f3cfb6694e33f5b880e74bed842398cbacd21024251e2ec90f19dee6a64d",
+      "uploaded_at": "2025-06-16T13:36:51.951532Z"
     },
     {
       "package": "tree-sitter-java",

@@ -43,6 +43,7 @@ interface WorkgroupState {
   reconciling?: Promise<void>;
   lastStartedAt?: string;
   lastCompletedAt?: string;
+  serveStaleDuringStartup?: boolean;
   lastFailure?: string;
   pendingEnrichment: number;
   cacheLoaded?: boolean;
@@ -501,6 +502,14 @@ export class WorkgroupGraphDaemon {
 
   async start(): Promise<void> {
     const descriptors = await this.refreshCatalog();
+    for (const descriptor of descriptors) {
+      const state = this.requireState(descriptor.id);
+      const completedAt = this.requireStore(state).lastCompletedAt();
+      if (completedAt) {
+        state.lastCompletedAt = completedAt;
+        state.serveStaleDuringStartup = true;
+      }
+    }
     try {
       await this.codeWorker?.cleanupOrphans?.();
     } catch (error) {
@@ -619,6 +628,13 @@ export class WorkgroupGraphDaemon {
       (state.dirty || state.archiveDirty || state.reconciling) &&
       Date.now() < deadline
     ) {
+      // A restart safety scan must not make an already-complete generation
+      // unavailable. Watchers are active and the background lane will promote
+      // a new atomic generation when the downtime reconciliation finishes.
+      if (state.serveStaleDuringStartup && this.requireStore(state).status().completeGeneration > 0) {
+        if (!state.reconciling) this.queueReconcile(workgroupId);
+        break;
+      }
       // A full rebuild is intentionally background-only. Interactive queries
       // continue to use the last complete generation while it is pending.
       if (state.fullReindexRequested && !state.reconciling) {
@@ -1010,7 +1026,7 @@ export class WorkgroupGraphDaemon {
             !this.paused.has(state.descriptor.id) &&
             !(cached?.contentHash === source.sha256 && cached.semantic)
           ) {
-            const semanticCode = source.kind === 'code' && /\.sql$/i.test(source.relativePath);
+            const semanticCode = source.kind === 'code' && /\.(?:sql|toml)$/i.test(source.relativePath);
             if ((source.kind !== 'code' || semanticCode) && preprocessed.semanticSegments.length > 0) {
               queueSemantic({
                 source: input,
@@ -1070,6 +1086,7 @@ export class WorkgroupGraphDaemon {
       state.dirty = state.dirtyVersion !== dirtyVersion || state.enrichmentVersion !== enrichmentVersion;
       state.archiveDirty = state.archiveVersion !== archiveVersion;
       state.lastCompletedAt = new Date().toISOString();
+      state.serveStaleDuringStartup = false;
       state.lastFailure = undefined;
       this.ensureWatchers(state.descriptor);
       if (this.enableEnrichment && !this.paused.has(state.descriptor.id))
@@ -1146,6 +1163,7 @@ export class WorkgroupGraphDaemon {
           (item) =>
             item.root.absolutePath === root.absolutePath &&
             item.source.kind === 'code' &&
+            !/\.toml$/i.test(item.source.relativePath) &&
             !(
               this.enrichments.get(item.source.id)?.contentHash === item.source.sha256 &&
               this.enrichments.get(item.source.id)?.code
@@ -1266,8 +1284,15 @@ export class WorkgroupGraphDaemon {
           const timer = setTimeout(() => this.enqueueCode(state, root, batch), 5_000);
           timer.unref();
         } else {
-          state.lastFailure = `code enrichment: ${result.error.message}`;
           this.attempted.delete(key);
+          if (batch.length > 1) {
+            this.retryAttempts.delete(key);
+            const midpoint = Math.ceil(batch.length / 2);
+            this.enqueueCode(state, root, batch.slice(0, midpoint));
+            this.enqueueCode(state, root, batch.slice(midpoint));
+            return;
+          }
+          state.lastFailure = `code enrichment: ${result.error.message}`;
           const attempt = (this.retryAttempts.get(key) ?? 0) + 1;
           this.retryAttempts.set(key, attempt);
           if (attempt < 5) {

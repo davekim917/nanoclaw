@@ -749,6 +749,20 @@ export class WorkgroupGraphStore {
     };
   }
 
+  lastCompletedAt(): string | undefined {
+    this.assertOpen();
+    const row = this.db
+      .prepare(
+        `SELECT completed_at
+           FROM generations
+          WHERE completed_at IS NOT NULL
+          ORDER BY generation DESC
+          LIMIT 1`,
+      )
+      .get() as { completed_at: string } | undefined;
+    return row?.completed_at;
+  }
+
   private initializeSchema(): void {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS metadata (

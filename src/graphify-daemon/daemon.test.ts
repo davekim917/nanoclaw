@@ -106,6 +106,46 @@ describe('WorkgroupGraphDaemon', () => {
     await daemon.close();
   });
 
+  it('serves the last complete generation while restart reconciliation runs', async () => {
+    const f = fixture();
+    writeFileSync(join(f.groups, 'madison-agent', 'brief.md'), 'durable restart knowledge');
+    const initial = new WorkgroupGraphDaemon({
+      dataDir: f.data,
+      groupsDir: f.groups,
+      centralDbPath: f.central,
+      enableEnrichment: false,
+    });
+    await initial.refreshCatalog();
+    await initial.ensureFresh('madison');
+    await initial.close();
+
+    let started = false;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const restarted = new WorkgroupGraphDaemon({
+      dataDir: f.data,
+      groupsDir: f.groups,
+      centralDbPath: f.central,
+      enableEnrichment: false,
+      backgroundRunner: immediateRunner() as never,
+      discover: async (options) => {
+        started = true;
+        await gate;
+        return discoverWorkgroup(options);
+      },
+    });
+    await restarted.start();
+    await waitUntil(() => started);
+    const result = await restarted.query('madison', 'durable restart knowledge');
+    expect(result.nodes.length).toBeGreaterThan(0);
+    expect(restarted.status('madison').freshness).toMatchObject({ dirty: true, reconciling: true });
+    release();
+    await waitUntil(() => !restarted.status('madison').freshness.dirty);
+    await restarted.close();
+  });
+
   it('activates immediate freshness watching after the initial generation', async () => {
     const f = fixture();
     const knowledge = join(f.groups, 'madison-agent', 'brief.md');
@@ -853,6 +893,93 @@ describe('WorkgroupGraphDaemon', () => {
     await waitUntil(() => !daemon.status('madison').freshness.dirty);
     expect((await daemon.query('madison', 'available without docker')).nodes.length).toBeGreaterThan(0);
     expect(codeWorker.cleanupOrphans).toHaveBeenCalledTimes(1);
+    await daemon.close();
+  });
+
+  it('routes TOML to semantic enrichment instead of the code worker', async () => {
+    const f = fixture();
+    writeFileSync(join(f.groups, 'madison-agent', 'app.ts'), 'export const value = 1;');
+    writeFileSync(join(f.groups, 'madison-agent', 'agent_config.toml'), 'name = "research"');
+    const codeWorker = {
+      extract: vi.fn(async () => new Map()),
+    };
+    const semanticBackend = {
+      extract: vi.fn(async () => ({ nodes: [], edges: [], hyperedges: [] })),
+      extractBatch: vi.fn(async () => new Map()),
+    };
+    const daemon = new WorkgroupGraphDaemon({
+      dataDir: f.data,
+      groupsDir: f.groups,
+      centralDbPath: f.central,
+      codeWorker,
+      semanticBackend,
+      backgroundRunner: immediateRunner() as never,
+      semanticMinIntervalMs: 0,
+      semanticPumpDelayMs: 0,
+    });
+    await daemon.refreshCatalog();
+    await daemon.ensureFresh('madison');
+    await waitUntil(
+      () => codeWorker.extract.mock.calls.length > 0 && semanticBackend.extractBatch.mock.calls.length > 0,
+    );
+    const codeCalls = codeWorker.extract.mock.calls as unknown as Array<
+      [string, string, string, Array<{ relativePath: string }>]
+    >;
+    const semanticCalls = semanticBackend.extractBatch.mock.calls as unknown as Array<[Array<{ source: SourceInput }>]>;
+    const codePaths = codeCalls.flatMap((call) => call[3].map((source) => source.relativePath));
+    const semanticPaths = semanticCalls.flatMap((call) => call[0].map((item) => item.source.relativePath));
+    expect(codePaths).toContain('agents/ag-a/app.ts');
+    expect(codePaths).not.toContain('agents/ag-a/agent_config.toml');
+    expect(semanticPaths).toContain('agents/ag-a/agent_config.toml');
+    await daemon.close();
+  });
+
+  it('bisects failed code batches so valid sources still receive enrichment', async () => {
+    const f = fixture();
+    for (const name of ['good-a.ts', 'good-b.ts', 'isolated-bad.py']) {
+      writeFileSync(join(f.groups, 'madison-agent', name), `export const ${name.replace(/\W/g, '_')} = 1;`);
+    }
+    const successful = new Set<string>();
+    const codeWorker = {
+      extract: vi.fn(async (_workgroupId, _root, _prefix, sources: Array<{ id: string; relativePath: string }>) => {
+        const containsBad = sources.some((source) => source.relativePath.endsWith('isolated-bad.py'));
+        if (containsBad && sources.length > 1) throw new Error('one source rejected the batch');
+        return new Map(
+          sources.map((source) => {
+            successful.add(source.relativePath);
+            return [
+              source.id,
+              {
+                nodes: [{ id: `symbol-${source.id}`, name: source.relativePath, type: 'symbol' }],
+                edges: [],
+                hyperedges: [],
+              } satisfies ExtractionBundle,
+            ];
+          }),
+        );
+      }),
+    };
+    const daemon = new WorkgroupGraphDaemon({
+      dataDir: f.data,
+      groupsDir: f.groups,
+      centralDbPath: f.central,
+      codeWorker,
+      backgroundRunner: immediateRunner() as never,
+    });
+    await daemon.refreshCatalog();
+    await daemon.ensureFresh('madison');
+    await waitUntil(() => successful.size === 3);
+    expect(codeWorker.extract.mock.calls[0]?.[3]).toHaveLength(3);
+    expect(
+      codeWorker.extract.mock.calls.some(
+        (call) =>
+          (call[3] as Array<{ relativePath: string }>).length === 1 &&
+          (call[3] as Array<{ relativePath: string }>)[0]?.relativePath.endsWith('isolated-bad.py'),
+      ),
+    ).toBe(true);
+    expect(successful).toEqual(
+      new Set(['agents/ag-a/good-a.ts', 'agents/ag-a/good-b.ts', 'agents/ag-a/isolated-bad.py']),
+    );
     await daemon.close();
   });
 
