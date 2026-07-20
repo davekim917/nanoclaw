@@ -518,7 +518,10 @@ export class WorkgroupGraphStore {
       }
     };
 
-    const like = `%${normalized.replaceAll('\\', '\\\\').replaceAll('%', '\\%').replaceAll('_', '\\_')}%`;
+    // Keep exact identifiers and names ahead of full-text results. Do not use
+    // a leading-wildcard LIKE here: on a multi-gigabyte workgroup graph that
+    // forces an unindexed scan before FTS and can block interactive queries
+    // for more than a minute.
     addRows(
       this.db
         .prepare(
@@ -527,16 +530,13 @@ export class WorkgroupGraphStore {
              JOIN source_nodes sn ON sn.node_id = n.id
              JOIN sources s ON s.id = sn.source_id
             WHERE s.workgroup_id = ? AND s.state = 'indexed'
-              AND (
-                lower(n.id) = lower(?) OR lower(n.name) = lower(?) OR
-                n.id LIKE ? ESCAPE '\\' OR n.name LIKE ? ESCAPE '\\'
-              )
+              AND (n.id = ? COLLATE NOCASE OR n.name = ? COLLATE NOCASE)
             ORDER BY
-              CASE WHEN lower(n.id) = lower(?) OR lower(n.name) = lower(?) THEN 0 ELSE 1 END,
+              CASE WHEN n.id = ? COLLATE NOCASE THEN 0 ELSE 1 END,
               n.name, n.id
             LIMIT ?`,
         )
-        .all(this.workgroupId, normalized, normalized, like, like, normalized, normalized, limit) as Array<{
+        .all(this.workgroupId, normalized, normalized, normalized, limit) as Array<{
         id: string;
       }>,
     );
@@ -556,6 +556,27 @@ export class WorkgroupGraphStore {
                 LIMIT ?`,
             )
             .all(ftsQuery, this.workgroupId, limit - nodeIds.length) as Array<{
+            id: string;
+          }>,
+        );
+      }
+    }
+
+    if (nodeIds.length < limit) {
+      const prefixQuery = this.toFtsQuery(normalized, true);
+      if (prefixQuery) {
+        addRows(
+          this.db
+            .prepare(
+              `SELECT DISTINCT node_fts.node_id AS id
+                 FROM node_fts
+                 JOIN sources s ON s.id = node_fts.source_id
+                WHERE node_fts MATCH ?
+                  AND s.workgroup_id = ? AND s.state = 'indexed'
+                ORDER BY node_fts.node_id
+                LIMIT ?`,
+            )
+            .all(prefixQuery, this.workgroupId, limit - nodeIds.length) as Array<{
             id: string;
           }>,
         );
@@ -1492,10 +1513,10 @@ export class WorkgroupGraphStore {
     return Math.min(depth, MAX_TRAVERSAL_DEPTH);
   }
 
-  private toFtsQuery(term: string): string | null {
+  private toFtsQuery(term: string, prefix = false): string | null {
     const tokens = term.match(/[\p{L}\p{N}_-]+/gu);
     if (!tokens?.length) return null;
-    return tokens.map((token) => `"${token.replaceAll('"', '""')}"`).join(' AND ');
+    return tokens.map((token) => `"${token.replaceAll('"', '""')}"${prefix ? '*' : ''}`).join(' AND ');
   }
 
   private stringifyProperties(properties: Record<string, unknown> | undefined): string | null {

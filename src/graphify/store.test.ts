@@ -109,6 +109,22 @@ describe('WorkgroupGraphStore', () => {
     store.close();
   });
 
+  test('test_graph_store_uses_full_text_prefixes_for_partial_terms', () => {
+    const store = makeStore();
+    const generation = store.beginGeneration('prefix search');
+    const input = source('source-prefix', 'knowledge/retention.md');
+    store.upsertSource(
+      input,
+      bundleFor(input.id, input.relativePath, 'customer-lifetime-value', 'Customer Lifetime Value'),
+      generation,
+    );
+    store.completeGeneration(generation);
+
+    expect(store.query('CUSTOMER-LIFETIME-VALUE').nodes.map((node) => node.id)).toEqual(['customer-lifetime-value']);
+    expect(store.query('cust life val').nodes.map((node) => node.id)).toEqual(['customer-lifetime-value']);
+    store.close();
+  });
+
   test('test_graph_store_bounded_append_uses_one_open_generation', () => {
     const store = makeStore();
     const generation = store.beginGeneration('streamed corpus');
