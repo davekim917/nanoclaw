@@ -234,6 +234,49 @@ export class EnrichmentRepository {
       for (const id of ids) statement.run(id);
     })(sourceIds);
   }
+  removeSources(sourceIds: string[]): void {
+    if (sourceIds.length === 0) return;
+    const removeQueued = this.db.prepare('DELETE FROM semantic_queue WHERE source_id=?');
+    const removeEnrichment = this.db.prepare('DELETE FROM enrichments WHERE source_id=?');
+    this.db.transaction((ids: string[]) => {
+      for (const id of ids) {
+        removeQueued.run(id);
+        removeEnrichment.run(id);
+      }
+    })(sourceIds);
+  }
+  pruneWorkgroup(workgroupId: string, retainedSourceIds: string[]): void {
+    this.db.exec(`CREATE TEMP TABLE IF NOT EXISTS retained_enrichment_sources (
+      source_id TEXT PRIMARY KEY
+    ) WITHOUT ROWID`);
+    const clearRetained = this.db.prepare('DELETE FROM retained_enrichment_sources');
+    const retain = this.db.prepare('INSERT OR IGNORE INTO retained_enrichment_sources (source_id) VALUES (?)');
+    this.db.transaction((sourceIds: string[]) => {
+      clearRetained.run();
+      for (const sourceId of sourceIds) retain.run(sourceId);
+      this.db
+        .prepare(
+          `DELETE FROM semantic_queue
+            WHERE workgroup_id=?
+              AND NOT EXISTS (
+                SELECT 1 FROM retained_enrichment_sources retained
+                 WHERE retained.source_id=semantic_queue.source_id
+              )`,
+        )
+        .run(workgroupId);
+      this.db
+        .prepare(
+          `DELETE FROM enrichments
+            WHERE workgroup_id=?
+              AND NOT EXISTS (
+                SELECT 1 FROM retained_enrichment_sources retained
+                 WHERE retained.source_id=enrichments.source_id
+              )`,
+        )
+        .run(workgroupId);
+      clearRetained.run();
+    })(retainedSourceIds);
+  }
   defer(sourceIds: string[], delayMs = 5_000): void {
     const availableAt = new Date(Date.now() + delayMs).toISOString();
     const statement = this.db.prepare("UPDATE semantic_queue SET state='pending', available_at=? WHERE source_id=?");

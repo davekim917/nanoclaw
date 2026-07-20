@@ -17,6 +17,7 @@ import {
 } from './daemon.js';
 import { BackgroundGraphRunner } from './background-runner.js';
 import { ArchiveConversationReader } from './archive.js';
+import { EnrichmentRepository } from './enrichment-cache.js';
 
 const roots: string[] = [];
 function temp(): string {
@@ -187,6 +188,138 @@ describe('WorkgroupGraphDaemon', () => {
     expect((await daemon.query('madison', 'version two knowledge')).nodes).toHaveLength(0);
     expect(discover).toHaveBeenCalledTimes(1);
     await daemon.close();
+  });
+
+  it('removes semantic queue and cache state when an indexed source is deleted', async () => {
+    const f = fixture();
+    const root = join(f.groups, 'madison-agent');
+    const knowledge = join(root, 'brief.md');
+    writeFileSync(knowledge, 'temporary semantic knowledge');
+    const semanticBackend = {
+      extract: vi.fn(async () => ({ nodes: [], edges: [], hyperedges: [] })),
+      extractBatch: vi.fn(
+        async (items: Array<{ source: SourceInput }>) =>
+          new Map(
+            items.map(({ source }) => [
+              source.id,
+              {
+                nodes: [{ id: `concept-${source.id}`, name: 'Temporary concept', type: 'concept' }],
+                edges: [],
+                hyperedges: [],
+              } satisfies ExtractionBundle,
+            ]),
+          ),
+      ),
+    };
+    const daemon = new WorkgroupGraphDaemon({
+      dataDir: f.data,
+      groupsDir: f.groups,
+      centralDbPath: f.central,
+      semanticBackend,
+      backgroundRunner: immediateRunner() as never,
+      semanticMinIntervalMs: 0,
+      semanticPumpDelayMs: 0,
+    });
+    await daemon.refreshCatalog();
+    await daemon.ensureFresh('madison');
+    await waitUntil(() => daemon.status('madison').freshness.pendingEnrichment === 0);
+    const enrichmentPath = join(f.data, 'graphify', 'enrichment.db');
+    const before = new Database(enrichmentPath, { readonly: true });
+    expect(
+      (
+        before.prepare("SELECT count(*) AS count FROM enrichments WHERE workgroup_id='madison'").get() as {
+          count: number;
+        }
+      ).count,
+    ).toBe(1);
+    before.close();
+
+    rmSync(knowledge);
+    daemon.markFilesystemChanges('madison', [{ root, path: knowledge, kind: 'unlink' }]);
+    await daemon.ensureFresh('madison');
+
+    const after = new Database(enrichmentPath, { readonly: true });
+    expect(
+      (
+        after.prepare("SELECT count(*) AS count FROM enrichments WHERE workgroup_id='madison'").get() as {
+          count: number;
+        }
+      ).count,
+    ).toBe(0);
+    expect(
+      (
+        after.prepare("SELECT count(*) AS count FROM semantic_queue WHERE workgroup_id='madison'").get() as {
+          count: number;
+        }
+      ).count,
+    ).toBe(0);
+    after.close();
+    expect((await daemon.query('madison', 'Temporary concept')).nodes).toHaveLength(0);
+    await daemon.close();
+  });
+
+  it('repairs stale enrichment rows against the last complete generation on restart', async () => {
+    const f = fixture();
+    writeFileSync(join(f.groups, 'madison-agent', 'brief.md'), 'retained graph knowledge');
+    const initial = new WorkgroupGraphDaemon({
+      dataDir: f.data,
+      groupsDir: f.groups,
+      centralDbPath: f.central,
+      enableEnrichment: false,
+    });
+    await initial.refreshCatalog();
+    await initial.ensureFresh('madison');
+    await initial.close();
+
+    const enrichmentPath = join(f.data, 'graphify', 'enrichment.db');
+    const repository = new EnrichmentRepository(enrichmentPath);
+    repository.put({
+      sourceId: 'stale-source',
+      workgroupId: 'madison',
+      contentHash: 'stale',
+      semantic: { nodes: [], edges: [], hyperedges: [] },
+    });
+    repository.enqueue([
+      {
+        source: {
+          id: 'stale-source',
+          workgroupId: 'madison',
+          kind: 'document',
+          relativePath: 'deleted.md',
+          contentHash: 'stale',
+        },
+        segments: ['deleted knowledge'],
+        priority: 1,
+      },
+    ]);
+    repository.close();
+
+    const restarted = new WorkgroupGraphDaemon({
+      dataDir: f.data,
+      groupsDir: f.groups,
+      centralDbPath: f.central,
+      enableEnrichment: false,
+      backgroundRunner: { run: vi.fn(async () => ({ status: 'deferred' })) } as never,
+    });
+    await restarted.start();
+
+    const repaired = new Database(enrichmentPath, { readonly: true });
+    expect(
+      (
+        repaired.prepare("SELECT count(*) AS count FROM enrichments WHERE source_id='stale-source'").get() as {
+          count: number;
+        }
+      ).count,
+    ).toBe(0);
+    expect(
+      (
+        repaired.prepare("SELECT count(*) AS count FROM semantic_queue WHERE source_id='stale-source'").get() as {
+          count: number;
+        }
+      ).count,
+    ).toBe(0);
+    repaired.close();
+    await restarted.close();
   });
 
   it('serves the complete generation immediately while a filesystem delta is pending', async () => {

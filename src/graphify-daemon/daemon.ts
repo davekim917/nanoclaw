@@ -568,6 +568,7 @@ export class WorkgroupGraphDaemon {
       if (completedAt) {
         state.lastCompletedAt = completedAt;
         state.serveStaleDuringStartup = true;
+        this.pruneEnrichmentToCurrentGeneration(state);
       }
     }
     try {
@@ -1155,6 +1156,7 @@ export class WorkgroupGraphDaemon {
       if (candidateStatus.completeGeneration <= 0)
         throw new Error('isolated Graphify reconcile returned an incomplete candidate database');
       await this.promoteCandidate(state, candidatePath);
+      this.pruneEnrichmentToCurrentGeneration(state);
       candidatePath = undefined;
     } catch (error) {
       if (candidatePath) {
@@ -1368,6 +1370,7 @@ export class WorkgroupGraphDaemon {
       state.store = undefined;
       await rename(nextPath, livePath);
       state.store = new WorkgroupGraphStore(livePath, state.descriptor.id);
+      this.pruneEnrichmentToCurrentGeneration(state);
       for (const [key, change] of filesystemChanges)
         if (state.pendingFilesystemChanges.get(key) === change) state.pendingFilesystemChanges.delete(key);
       state.fullScanRequired = state.fullScanVersion !== fullScanVersion;
@@ -1519,6 +1522,8 @@ export class WorkgroupGraphDaemon {
       });
     else this.requireStore(state).reconcileSources('filesystem-reconcile', upserts, deletes);
 
+    this.enrichmentRepository.removeSources(deletes);
+
     for (const [key, change] of changes)
       if (state.pendingFilesystemChanges.get(key) === change) state.pendingFilesystemChanges.delete(key);
     state.dirty =
@@ -1574,6 +1579,10 @@ export class WorkgroupGraphDaemon {
             signal,
           })
         : store.reconcileSources('archive-reconcile', upserts, deletes);
+      // Remove even already-deleted legacy rows: reconcileSources only reports
+      // newly deleted IDs, while the shared enrichment DB may still contain
+      // queue/cache residue from an older daemon.
+      this.enrichmentRepository.removeSources(deletes);
       state.archiveDirty = state.archiveVersion !== archiveVersion;
       state.lastCompletedAt = new Date().toISOString();
       state.lastFailure = undefined;
@@ -1920,6 +1929,14 @@ export class WorkgroupGraphDaemon {
 
   private hasCurrentEnrichment(sourceId: string, contentHash: string, kind: 'code' | 'semantic'): boolean {
     return this.enrichmentRepository.hasCurrent(sourceId, contentHash, kind);
+  }
+
+  private pruneEnrichmentToCurrentGeneration(state: WorkgroupState): void {
+    const store = this.requireStore(state);
+    const retainedSourceIds = [...store.listSourcesByState('indexed'), ...store.listSourcesByState('pending')].map(
+      (source) => source.id,
+    );
+    this.enrichmentRepository.pruneWorkgroup(state.descriptor.id, retainedSourceIds);
   }
 
   private requireState(workgroupId: string): WorkgroupState {

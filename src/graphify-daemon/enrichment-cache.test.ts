@@ -100,6 +100,44 @@ describe('EnrichmentRepository', () => {
     repo.close();
   });
 
+  it('removes deleted sources and prunes stale workgroup enrichment in one transaction', () => {
+    const root = mkdtempSync(join(tmpdir(), 'graphify-cache-prune-'));
+    roots.push(root);
+    const repo = new EnrichmentRepository(join(root, 'cache.db'));
+    for (const sourceId of ['keep', 'remove', 'other-workgroup']) {
+      const workgroupId = sourceId === 'other-workgroup' ? 'other' : 'wg';
+      repo.put({
+        sourceId,
+        workgroupId,
+        contentHash: 'h',
+        semantic: { nodes: [], edges: [], hyperedges: [] },
+      });
+      repo.enqueue([
+        {
+          source: {
+            id: sourceId,
+            workgroupId,
+            kind: 'document',
+            relativePath: `${sourceId}.md`,
+            contentHash: 'h',
+          },
+          segments: [sourceId],
+          priority: 1,
+        },
+      ]);
+    }
+
+    repo.removeSources(['remove']);
+    expect(repo.get('remove')).toBeUndefined();
+    repo.pruneWorkgroup('wg', ['keep']);
+
+    expect(repo.load('wg').map((entry) => entry.sourceId)).toEqual(['keep']);
+    expect(repo.pending('wg')).toBe(1);
+    expect(repo.get('other-workgroup')).toBeDefined();
+    expect(repo.pending('other')).toBe(1);
+    repo.close();
+  });
+
   it('large corpus uses one bounded persisted semantic batch', () => {
     const root = mkdtempSync(join(tmpdir(), 'graphify-queue-'));
     roots.push(root);
