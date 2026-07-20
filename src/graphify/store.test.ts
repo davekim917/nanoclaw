@@ -125,6 +125,39 @@ describe('WorkgroupGraphStore', () => {
     store.close();
   });
 
+  test('test_graph_store_prioritizes_name matches over description matches', () => {
+    const store = makeStore();
+    const generation = store.beginGeneration('name priority');
+    const descriptionMatch = source('source-description', 'knowledge/description.md');
+    const nameMatch = source('source-name', 'knowledge/name.md');
+    store.upsertSource(
+      descriptionMatch,
+      {
+        nodes: [
+          {
+            id: 'a-description-match',
+            name: 'Unrelated title',
+            type: 'concept',
+            description: 'Customer Lifetime Value appears only in this description.',
+            evidence: [{ sourceId: descriptionMatch.id, relativePath: descriptionMatch.relativePath }],
+          },
+        ],
+        edges: [],
+        hyperedges: [],
+      },
+      generation,
+    );
+    store.upsertSource(
+      nameMatch,
+      bundleFor(nameMatch.id, nameMatch.relativePath, 'z-name-match', 'Customer Lifetime Value'),
+      generation,
+    );
+    store.completeGeneration(generation);
+
+    expect(store.query('customer lifetime value', { limit: 1 }).nodes.map((node) => node.id)).toEqual(['z-name-match']);
+    store.close();
+  });
+
   test('test_graph_store_bounded_append_uses_one_open_generation', () => {
     const store = makeStore();
     const generation = store.beginGeneration('streamed corpus');

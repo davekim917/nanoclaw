@@ -518,28 +518,50 @@ export class WorkgroupGraphStore {
       }
     };
 
-    // Keep exact identifiers and names ahead of full-text results. Do not use
-    // a leading-wildcard LIKE here: on a multi-gigabyte workgroup graph that
-    // forces an unindexed scan before FTS and can block interactive queries
-    // for more than a minute.
+    // Keep exact identifiers ahead of full-text results. Do not scan names
+    // here: on a multi-gigabyte workgroup graph, both leading-wildcard LIKE
+    // and case-insensitive equality can block interactive queries for more
+    // than a minute. The name-only FTS pass below preserves name priority.
     addRows(
       this.db
         .prepare(
-          `SELECT DISTINCT n.id
+          `SELECT n.id
              FROM nodes n
-             JOIN source_nodes sn ON sn.node_id = n.id
-             JOIN sources s ON s.id = sn.source_id
-            WHERE s.workgroup_id = ? AND s.state = 'indexed'
-              AND (n.id = ? COLLATE NOCASE OR n.name = ? COLLATE NOCASE)
-            ORDER BY
-              CASE WHEN n.id = ? COLLATE NOCASE THEN 0 ELSE 1 END,
-              n.name, n.id
-            LIMIT ?`,
+            WHERE n.id = ?
+              AND EXISTS (
+                SELECT 1
+                  FROM source_nodes sn
+                  JOIN sources s ON s.id = sn.source_id
+                 WHERE sn.node_id = n.id
+                   AND s.workgroup_id = ? AND s.state = 'indexed'
+              )
+            LIMIT 1`,
         )
-        .all(this.workgroupId, normalized, normalized, normalized, limit) as Array<{
+        .all(normalized, this.workgroupId) as Array<{
         id: string;
       }>,
     );
+
+    if (nodeIds.length < limit) {
+      const ftsQuery = this.toFtsQuery(normalized);
+      if (ftsQuery) {
+        addRows(
+          this.db
+            .prepare(
+              `SELECT DISTINCT node_fts.node_id AS id
+                 FROM node_fts
+                 JOIN sources s ON s.id = node_fts.source_id
+                WHERE node_fts MATCH ?
+                  AND s.workgroup_id = ? AND s.state = 'indexed'
+                ORDER BY node_fts.node_id
+                LIMIT ?`,
+            )
+            .all(`name : (${ftsQuery})`, this.workgroupId, limit - nodeIds.length) as Array<{
+            id: string;
+          }>,
+        );
+      }
+    }
 
     if (nodeIds.length < limit) {
       const ftsQuery = this.toFtsQuery(normalized);
