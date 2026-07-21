@@ -18,6 +18,9 @@ describe('clone provider skills parity guidance', () => {
       expect(skill).toContain('agent-browser');
       expect(skill).toContain('remote-mcp-bridge');
       expect(skill).toContain('type: "sse"');
+      expect(skill).toContain('.resources');
+      expect(skill).toContain('.codexAuthFallbacks');
+      expect(skill).toContain('del(.also_allowed_in)');
     }
   });
 
@@ -27,6 +30,9 @@ describe('clone provider skills parity guidance', () => {
     expect(skill).toContain('Preserve native MCP transport parity');
     expect(skill).toContain('Expose the shared global CLI surface');
     expect(skill).toContain('agent-browser');
+    expect(skill).toContain('Resource budgets are operator-tunable');
+    expect(skill).toContain('slack_user_token.enabled');
+    expect(skill).toContain('also_allowed_in');
   });
 
   it('keeps retired Mnemon and GitNexus surfaces out of future provider installs', () => {

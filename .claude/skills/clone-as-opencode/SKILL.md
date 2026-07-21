@@ -199,7 +199,13 @@ cd -
 
 ### 5. Write container.json
 
-Construct the sibling's container.json as **the source's, minus every sibling-bound field, plus this sibling's own identity + provider + memory**. Inheriting "everything except sibling-bound" (rather than a hand-picked subset like `onecliSecrets`/`tools`/`mcpServers`) is what guarantees a clean `ncl groups parity-check` *by construction* and carries over operator fields a fixed list would silently drop (e.g. `slack_user_token`). The sibling-bound set is the source of truth in `src/sibling-parity.ts` (`SIBLING_BOUND_FIELDS`) — keep this `del(...)` list in sync with it.
+Construct the sibling's container.json from the source capability surface, then
+replace identity/provider-bound fields. Preserve the source resource budget as
+the safe clone-time baseline; resources are operator-tunable afterward and are
+not a capability-parity invariant. Preserve `slack_user_token.enabled`, but
+remove `also_allowed_in` because those exact messaging-group IDs belong to the
+source adapter and must never be copied to a sibling. The sibling-bound set and
+semantic comparison live in `src/sibling-parity.ts`.
 
 This is also the MCP parity step. Do not rewrite `mcpServers` while cloning:
 the runtime now supports the native matrix across all three providers
@@ -210,11 +216,14 @@ and prefer converting the source to `type: "http"` before cloning when the
 server supports Streamable HTTP.
 
 ```bash
-# Source MINUS every sibling-bound field, PLUS this sibling's identity/provider/memory.
+# Preserve shared capabilities and resource baseline; replace sibling identity/provider state.
 jq --arg folder "${SIBLING_FOLDER}" --arg src "${SOURCE_FOLDER}" '
   del(.groupName, .assistantName, .agentGroupId, .credentialFolder, .provider,
-      .codexHostAuth, .model, .effort, .imageTag, .defaultModel, .defaultEffort,
-      .maxMessagesPerPrompt, .memory, .dailySummary, .gitnexusInjectAgentsMd)
+      .codexHostAuth, .codexAuthFallbacks, .model, .effort, .imageTag,
+      .defaultModel, .defaultEffort, .maxMessagesPerPrompt, .memory, .dailySummary)
+  | if (.slack_user_token | type) == "object" then
+      .slack_user_token |= del(.also_allowed_in)
+    else . end
   | { provider: "opencode" } + .
   | .groupName = $folder
   | .assistantName = $folder
@@ -225,7 +234,7 @@ jq --arg folder "${SIBLING_FOLDER}" --arg src "${SOURCE_FOLDER}" '
   mv /tmp/cj-sibling.json groups/${SIBLING_FOLDER}/container.json
 
 # Verify parity — only sibling-bound fields may differ (clean by construction).
-DEL='del(.groupName,.assistantName,.agentGroupId,.credentialFolder,.provider,.codexHostAuth,.model,.effort,.imageTag,.defaultModel,.defaultEffort,.maxMessagesPerPrompt,.memory,.dailySummary,.gitnexusInjectAgentsMd,.workgroup_id)'
+DEL='del(.groupName,.assistantName,.agentGroupId,.credentialFolder,.provider,.codexHostAuth,.codexAuthFallbacks,.model,.effort,.imageTag,.defaultModel,.defaultEffort,.maxMessagesPerPrompt,.resources,.memory,.dailySummary,.workgroup_id) | if (.slack_user_token | type) == "object" then .slack_user_token |= del(.also_allowed_in) else . end'
 diff <(jq -S "$DEL" groups/${SOURCE_FOLDER}/container.json) \
      <(jq -S "$DEL" groups/${SIBLING_FOLDER}/container.json) && echo "  ✅ parity clean" || true
 ```
@@ -552,7 +561,9 @@ If handoff doesn't continue, check:
 
 ### 11. Parity audit
 
-The sibling-parity invariant says only model + provider may differ between source and sibling. This step diffs the two and prints any unexpected drift before you ship.
+The sibling-parity invariant protects shared capabilities while allowing
+identity, provider auth, model/runtime tuning, resource budgets, and exact
+Slack allowlist IDs to differ. This step prints unexpected drift before ship.
 
 ```bash
 SIBLING_FOLDER=${SIBLING_FOLDER}
@@ -560,9 +571,10 @@ SOURCE_FOLDER=${SOURCE_FOLDER}
 
 bash <(cat <<'AUDIT'
 SF="$1"; SR="$2"
-echo "=== container.json structural diff (only model/provider/identity-bound fields should differ) ==="
-diff <(jq -S 'del(.groupName,.assistantName,.agentGroupId,.credentialFolder,.provider,.memory,.codexHostAuth,.dailySummary)' groups/${SF}/container.json) \
-     <(jq -S 'del(.groupName,.assistantName,.agentGroupId,.credentialFolder,.provider,.memory,.codexHostAuth)' groups/${SR}/container.json) \
+echo "=== container.json capability diff (identity/provider/runtime fields may differ) ==="
+PARITY_FILTER='del(.groupName,.assistantName,.agentGroupId,.credentialFolder,.provider,.codexHostAuth,.codexAuthFallbacks,.model,.effort,.imageTag,.defaultModel,.defaultEffort,.maxMessagesPerPrompt,.resources,.memory,.dailySummary) | if (.slack_user_token | type) == "object" then .slack_user_token |= del(.also_allowed_in) else . end'
+diff <(jq -S "$PARITY_FILTER" groups/${SF}/container.json) \
+     <(jq -S "$PARITY_FILTER" groups/${SR}/container.json) \
   && echo "  ✅ structural parity"
 echo
 echo "=== OneCLI secret name list parity ==="

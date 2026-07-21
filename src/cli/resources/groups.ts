@@ -19,7 +19,7 @@ import {
 import { getDeniedModel } from '../../db/denied-models.js';
 import { assertValidGroupFolder } from '../../group-folder.js';
 import { initGroupFilesystem } from '../../group-init.js';
-import { SIBLING_BOUND_FIELDS } from '../../sibling-parity.js';
+import { findSiblingParityDrifts } from '../../sibling-parity.js';
 import { createAgentFromTemplate } from '../../templates/create-agent.js';
 import type { AgentGroup, ContainerConfigRow } from '../../types.js';
 import { registerResource } from '../crud.js';
@@ -553,7 +553,7 @@ registerResource({
     'parity-check': {
       access: 'approval',
       description:
-        'Diff a sibling group against its source group on the parity invariant (model + provider are the only fields allowed to differ). ' +
+        'Diff a sibling group against its source group on the capability-parity invariant. ' +
         'Use --source <source-folder> --sibling <sibling-folder>. Reads container.json from disk for non-DB fields (onecliSecrets, tools, etc.) ' +
         'plus the DB for wiring + container config scalars. Reports drift, does NOT auto-fix.',
       handler: async (args, ctx) => {
@@ -589,17 +589,7 @@ registerResource({
         const src = readJson(sourceFolder);
         const sib = readJson(siblingFolder);
 
-        // The set of allowed-to-differ fields lives in src/sibling-parity.ts
-        // so the /clone-as-* skills and this verb agree mechanically.
-
-        const allKeys = new Set([...Object.keys(src), ...Object.keys(sib)]);
-        const drifts: Array<{ field: string; source: unknown; sibling: unknown }> = [];
-        for (const k of allKeys) {
-          if (SIBLING_BOUND_FIELDS.has(k)) continue;
-          const a = JSON.stringify(src[k] ?? null);
-          const b = JSON.stringify(sib[k] ?? null);
-          if (a !== b) drifts.push({ field: k, source: src[k], sibling: sib[k] });
-        }
+        const drifts = findSiblingParityDrifts(src, sib);
 
         return {
           source: sourceFolder,
@@ -607,8 +597,9 @@ registerResource({
           status: drifts.length === 0 ? 'parity' : 'drift',
           drifts,
           note:
-            'Only model + provider + identity-bound fields are allowed to differ. Runtime parity (OneCLI secret ' +
-            'assignment, MCP server availability) requires a warm-up spawn + post-spawn verification.',
+            'Identity, provider auth, model/runtime tuning, resource budgets, and Slack allowlist IDs may differ. ' +
+            'Slack capability, tools, secrets, mounts, packages, and MCP definitions must match. Runtime parity ' +
+            '(OneCLI secret assignment, MCP server availability) requires a warm-up spawn + post-spawn verification.',
         };
       },
     },
