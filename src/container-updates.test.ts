@@ -1,10 +1,11 @@
 import { mkdtemp, readFile, writeFile, mkdir } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 
 import {
   applySelectedUpdates,
+  auditRepository,
   buildScheduledAuditGate,
   latestStableGitHubRelease,
   latestStableGitHubTag,
@@ -278,5 +279,42 @@ describe('tracked repository update surfaces', () => {
     expect(cliInstaller).toContain('only-built-dependencies[]=');
     expect(dockerfile).not.toMatch(/pip install[^\n]*--upgrade pip setuptools wheel/);
     expect(dockerfile).not.toMatch(/pip install[^\n]*--no-cache-dir uv(?:\s|\\)/);
+  });
+});
+
+describe('plugin version surface', () => {
+  it('reports a manifest-version bump as outdated and refuses to auto-apply it', async () => {
+    const root = path.resolve(import.meta.dirname, '..');
+    const sources = JSON.parse(await readFile(path.join(root, 'container', 'update-sources.json'), 'utf8')) as {
+      plugins?: Array<{ id: string; dir: string; repo: string; manifestPath: string }>;
+    };
+    const entry = sources.plugins?.[0];
+    expect(entry).toBeDefined();
+
+    // Local clone must exist where the audit looks for it, or the check is a silent no-op.
+    const localManifest = path.join(homedir(), 'plugins', entry!.dir, '.claude-plugin', 'plugin.json');
+    const local = JSON.parse(await readFile(localManifest, 'utf8')) as { version: string };
+    expect(typeof local.version).toBe('string');
+
+    const items = await auditRepository(root, async (url: string) => {
+      if (url.includes('raw.githubusercontent.com')) {
+        expect(url).toContain(`${entry!.repo}/main/${entry!.manifestPath}`);
+        return { version: '99.0.0' };
+      }
+      throw new Error('network blocked in test');
+    });
+    const item = items.find((candidate) => candidate.id === `plugin:${entry!.id}`);
+    expect(item).toMatchObject({
+      kind: 'plugin-version',
+      surface: 'plugins',
+      current: local.version,
+      latest: '99.0.0',
+      status: 'outdated',
+    });
+
+    // Plugin clones update via `git pull`, never by rewriting a manifest in this repo.
+    await expect(applySelectedUpdates({ repoRoot: root, items, selectedIds: [`plugin:${entry!.id}`] })).rejects.toThrow(
+      /git pull/,
+    );
   });
 });

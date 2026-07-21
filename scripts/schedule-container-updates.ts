@@ -22,7 +22,7 @@ export const prompt = `You are running the weekly latest-stable dependency advis
 
 Post exactly one concise advisory to #axie-dev. Do not re-query registries, inspect manifests, edit files, open PRs, merge, deploy, or restart anything.
 
-Group outdated items by surface: host, container, and bootstrap. For each, show current -> latest and include the audit item ID. Call out unknown/blocked items with their exact diagnostic; never describe them as current. If Graphify appears, state whether it is a routine version bump or requires Graphify review based on the diagnostic.
+Group outdated items by surface: host, container, bootstrap, and plugins. For each, show current -> latest and include the audit item ID. Plugin items are clones under ~/plugins tracked by their .claude-plugin/plugin.json version; they are updated with git pull in the clone, not by /update-container. Call out unknown/blocked items with their exact diagnostic; never describe them as current. If Graphify appears, state whether it is a routine version bump or requires Graphify review based on the diagnostic.
 
 End with: "Run /update-container to choose and prepare reviewed PRs." This scheduled task is advisory only.`;
 

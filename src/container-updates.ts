@@ -1,12 +1,22 @@
 import { execFile } from 'node:child_process';
 import { access, readFile, writeFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
 
-export type UpdateKind = 'host-dependency' | 'bun-dependency' | 'dockerfile-pin' | 'graphify' | 'codex-sync';
-export type UpdateSurface = 'host' | 'container' | 'bootstrap';
+/** Where ~/plugins is mounted inside agent containers (see container-runner.ts). */
+const CONTAINER_PLUGINS_ROOT = '/workspace/plugins';
+
+export type UpdateKind =
+  | 'host-dependency'
+  | 'bun-dependency'
+  | 'dockerfile-pin'
+  | 'graphify'
+  | 'codex-sync'
+  | 'plugin-version';
+export type UpdateSurface = 'host' | 'container' | 'bootstrap' | 'plugins';
 export type AuditStatus = 'current' | 'outdated' | 'unknown' | 'blocked';
 
 export interface AuditItem {
@@ -50,6 +60,23 @@ interface DockerUpdateSource {
   mirrors?: Array<{ file: string; jsonPath: string[]; format: string }>;
 }
 
+interface PluginUpdateSource {
+  id: string;
+  name: string;
+  /** Plugin dir relative to the plugins root, e.g. `knowledge-work-plugins/data`. */
+  dir: string;
+  repo: string;
+  /** Path to that plugin's manifest inside the upstream repo. */
+  manifestPath: string;
+  /**
+   * Manifest dir inside the local clone. Claude plugins use `.claude-plugin`;
+   * Codex-native plugins (openai/role-specific-plugins) use `.codex-plugin`.
+   */
+  manifestDir?: string;
+  /** Upstream branch to compare against (default `main`). */
+  ref?: string;
+}
+
 interface UpdateSourcesManifest {
   schemaVersion: 1;
   dockerfile: DockerUpdateSource[];
@@ -57,6 +84,7 @@ interface UpdateSourcesManifest {
     repo: string;
     sourcesFile: string;
   };
+  plugins?: PluginUpdateSource[];
 }
 
 interface GraphifyIntegrationManifest {
@@ -292,7 +320,10 @@ async function firstReadable(paths: string[]): Promise<string | null> {
 async function auditCodexSources(manifest: UpdateSourcesManifest, fetchJson: JsonFetcher): Promise<AuditItem[]> {
   if (!manifest.codex) return [];
   const configured = process.env.NANOCLAW_CODEX_SOURCES;
-  const hostFallback = manifest.codex.sourcesFile.replace('/workspace/plugins/', '/home/ubuntu/plugins/');
+  const hostFallback = manifest.codex.sourcesFile.replace(
+    `${CONTAINER_PLUGINS_ROOT}/`,
+    `${path.join(homedir(), 'plugins')}/`,
+  );
   const sourcePath = await firstReadable([
     ...(configured ? [configured] : []),
     manifest.codex.sourcesFile,
@@ -356,6 +387,66 @@ async function auditCodexSources(manifest: UpdateSourcesManifest, fetchJson: Jso
   );
 }
 
+/**
+ * Plugin clones under `~/plugins` are versioned by their `.claude-plugin/plugin.json`
+ * `version` field, not by a package registry — so compare the local clone against the
+ * same manifest upstream. A bump means `git pull` in the clone.
+ *
+ * Deliberately per-plugin rather than repo-HEAD: marketplace monorepos
+ * (anthropics/knowledge-work-plugins) carry many unrelated plugins, and a commit
+ * touching a sibling plugin is not an update to ours.
+ */
+async function auditPluginVersions(manifest: UpdateSourcesManifest, fetchJson: JsonFetcher): Promise<AuditItem[]> {
+  if (!manifest.plugins?.length) return [];
+  return Promise.all(
+    manifest.plugins.map(async (entry): Promise<AuditItem> => {
+      const base = {
+        id: `plugin:${entry.id}`,
+        name: entry.name,
+        kind: 'plugin-version' as const,
+        surface: 'plugins' as const,
+        source: 'github' as const,
+      };
+      // Container mount first, then the host clone location.
+      const localManifest = await firstReadable(
+        [CONTAINER_PLUGINS_ROOT, path.join(homedir(), 'plugins')].map((root) =>
+          path.join(root, entry.dir, entry.manifestDir ?? '.claude-plugin', 'plugin.json'),
+        ),
+      );
+      if (!localManifest) {
+        return {
+          ...base,
+          current: 'unavailable',
+          latest: null,
+          status: 'unknown',
+          detail: `plugin manifest not found for ${entry.dir} under ${CONTAINER_PLUGINS_ROOT} or ~/plugins`,
+        };
+      }
+      const current = await audited(entry.name, async () => {
+        const parsed = JSON.parse(await readFile(localManifest, 'utf8')) as { version?: unknown };
+        if (typeof parsed.version !== 'string') throw new Error(`no version field in ${localManifest}`);
+        return parsed.version;
+      });
+      if (current instanceof Error) {
+        return { ...base, current: 'invalid', latest: null, status: 'blocked', detail: current.message };
+      }
+      const result = await audited(entry.name, async (): Promise<ReleaseResolution> => {
+        const payload = (await fetchJson(
+          `https://raw.githubusercontent.com/${entry.repo}/${entry.ref ?? 'main'}/${entry.manifestPath}`,
+        )) as { version?: unknown } | null;
+        const version = payload?.version;
+        if (typeof version !== 'string') throw new Error('upstream plugin manifest has no version field');
+        return isStableVersion(version)
+          ? { status: 'resolved', version }
+          : { status: 'blocked', reason: `upstream version is not stable: ${version}` };
+      });
+      return result instanceof Error
+        ? { ...base, current, latest: null, status: 'unknown', detail: result.message }
+        : itemFromResolution({ ...base, current }, result);
+    }),
+  );
+}
+
 export async function auditRepository(
   repoRoot: string,
   fetchJson: JsonFetcher = defaultFetchJson,
@@ -406,8 +497,11 @@ export async function auditRepository(
     graphifyResult instanceof Error
       ? { ...graphifyBase, latest: null, status: 'unknown' as const, detail: graphifyResult.message }
       : itemFromResolution(graphifyBase, graphifyResult);
-  const codex = await auditCodexSources(manifest, fetchJson);
-  return [...host, ...bun, ...docker, graphifyItem, ...codex].sort((a, b) => a.id.localeCompare(b.id));
+  const [codex, plugins] = await Promise.all([
+    auditCodexSources(manifest, fetchJson),
+    auditPluginVersions(manifest, fetchJson),
+  ]);
+  return [...host, ...bun, ...docker, graphifyItem, ...codex, ...plugins].sort((a, b) => a.id.localeCompare(b.id));
 }
 
 function statusLabel(status: AuditStatus): string {
@@ -517,6 +611,9 @@ export async function applySelectedUpdates(options: {
   const fetchText = options.fetchText ?? defaultFetchText;
   if (selected.some((item) => item.kind === 'codex-sync')) {
     throw new Error('Codex sync updates target the bootstrap repository and must be applied there');
+  }
+  if (selected.some((item) => item.kind === 'plugin-version')) {
+    throw new Error('Plugin updates are applied with `git pull` in the plugin clone under ~/plugins');
   }
   const host = selected.filter((item) => item.kind === 'host-dependency');
   const bun = selected.filter((item) => item.kind === 'bun-dependency');
