@@ -443,6 +443,30 @@ export function setupCodexRuntime(mcpServers: Record<string, McpServerConfig>): 
     }
   }
 
+  // .tmp/marketplaces/: snapshot roots for GIT-sourced marketplaces. Without
+  // these, `[marketplaces.*]` entries whose snapshot lives here resolve to a
+  // path that doesn't exist under CODEX_HOME and Codex hard-errors with
+  // "marketplace root does not contain a supported manifest" — verified in a
+  // container against the bootstrap + ponytail marketplaces. Prompt assembly
+  // tolerates it (plugins load from plugins/cache), but `codex plugin list`
+  // fails outright, so an agent inspecting its own plugins hits a wall.
+  //
+  // Only `marketplaces` is linked, not all of `.tmp` — `.tmp` is a scratch dir
+  // and the host mount is read-only, so aliasing the whole thing would turn
+  // ordinary temp writes into EROFS failures.
+  const hostMarketplacesDir = path.join(HOST_CODEX_DIR, '.tmp', 'marketplaces');
+  if (fs.existsSync(hostMarketplacesDir)) {
+    try {
+      const runtimeTmpDir = path.join(RUNTIME_CODEX_DIR, '.tmp');
+      fs.mkdirSync(runtimeTmpDir, { recursive: true });
+      const runtimeMarketplaces = path.join(runtimeTmpDir, 'marketplaces');
+      fs.rmSync(runtimeMarketplaces, { recursive: true, force: true });
+      fs.symlinkSync(hostMarketplacesDir, runtimeMarketplaces);
+    } catch (err) {
+      log(`Failed to symlink .tmp/marketplaces/: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   // Read host config (tolerate missing — we'll generate a minimal one).
   const hostConfigPath = path.join(HOST_CODEX_DIR, 'config.toml');
   let hostConfig = '';
