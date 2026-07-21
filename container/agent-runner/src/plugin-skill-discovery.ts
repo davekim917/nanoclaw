@@ -249,6 +249,24 @@ function discoverInPlugin(
     }
   }
 
+  // 8. marketplace monorepos: <plugin>/<sub>/skills/<name>/ — sub-plugins at the
+  //    REPO ROOT rather than under `plugins/` (rule 7). anthropics/knowledge-work-plugins
+  //    is shaped this way. Gated on `<sub>/.claude-plugin/plugin.json` so we only walk
+  //    dirs that declare themselves a plugin — the same signal Claude's own
+  //    discoverPlugins uses — instead of every subdirectory in the repo.
+  for (const sub of fs.readdirSync(pluginDir)) {
+    if (RUNTIME_SPECIFIC_DIRS.has(sub)) continue;
+    const subDir = path.join(pluginDir, sub);
+    if (!isDirectory(subDir)) continue;
+    if (!fs.existsSync(path.join(subDir, '.claude-plugin', 'plugin.json'))) continue;
+    if (denySubPluginSkillDirs.has(`${pluginName}/${sub}/skills`)) continue;
+    const subSkillsDir = path.join(subDir, 'skills');
+    if (!isDirectory(subSkillsDir)) continue;
+    for (const skillName of fs.readdirSync(subSkillsDir)) {
+      recordCandidate(path.join(subSkillsDir, skillName));
+    }
+  }
+
   return [...skills.values()];
 }
 
