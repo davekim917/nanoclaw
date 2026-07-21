@@ -7,11 +7,10 @@
  * the standalone codex CLI uses, so the container and host share one
  * provider-integration story.
  *
- * Codex turns don't accept mid-turn input. Follow-up `push()` messages are
- * queued and drained after the current turn completes (same pattern as the
- * opencode provider — see poll-loop for why that's correct: the poll-loop
- * only pushes once it has new pending messages, and we only drain between
- * turns, so no message is dropped).
+ * Codex turns accept mid-turn input through the app-server's `turn/steer`
+ * RPC. Follow-up `push()` messages steer the active turn by default and fall
+ * back to the pending queue only when no turn is in flight or the steer races
+ * with turn completion.
  */
 import fs from 'fs';
 import crypto from 'crypto';
