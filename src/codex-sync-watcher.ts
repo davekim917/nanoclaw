@@ -20,8 +20,10 @@
  * What it does on change:
  *   - debounce 5s (collapse rapid edits into one run)
  *   - acquire file lock at `~/.codex/.sync.lock` (concurrent fires no-op)
- *   - refresh Codex AGENTS.md, mirrored portable skills, subagents, and local
- *     marketplace plugin cache in-process
+ *   - refresh Codex AGENTS.md, subagents, and the local marketplace plugin
+ *     cache in-process. Plugin SKILLS are deliberately not mirrored to host
+ *     CLI paths — `~/plugins` is the container agents' plugin source, and
+ *     containers build their own skill set from /workspace/plugins at spawn.
  *   - touch `~/.codex/.sync-heartbeat` on success for future healthcheck timer
  *
  * On startup:
@@ -39,13 +41,8 @@ import path from 'path';
 
 import chokidar from 'chokidar';
 
-import {
-  syncCodexAgentsMd,
-  syncCodexLocalMarketplacePluginCache,
-  syncCodexPluginSkills,
-  syncCodexSubagents,
-} from './codex-sync.js';
-import { syncOpenCodePluginSkills, syncOpenCodeSubagents } from './opencode-sync.js';
+import { syncCodexAgentsMd, syncCodexLocalMarketplacePluginCache, syncCodexSubagents } from './codex-sync.js';
+import { syncOpenCodeSubagents } from './opencode-sync.js';
 
 const HOME = os.homedir();
 const CODEX_DIR = path.join(HOME, '.codex');
@@ -256,12 +253,9 @@ async function runSync(trigger: string): Promise<void> {
       `agents-md: ${agentsResult.changed ? 'wrote' : 'unchanged'} ${agentsResult.target} ` +
         `(${agentsResult.bytes} bytes)`,
     );
-    const skillsResult = syncCodexPluginSkills();
-    log(
-      `plugin-skills: ${skillsResult.target} — discovered=${skillsResult.discovered} ` +
-        `created=${skillsResult.created.length} removed=${skillsResult.removed.length} ` +
-        `unchanged=${skillsResult.unchanged.length} skipped=${skillsResult.skipped.length}`,
-    );
+    // Plugin skills are NOT mirrored to host CLI paths — `~/plugins` feeds
+    // container agents, which build their own skill set from
+    // /workspace/plugins at spawn. The operator owns host CLI plugins.
     const subagentsResult = syncCodexSubagents();
     log(
       `subagents: ${subagentsResult.targets.length} target(s) — discovered=${subagentsResult.discovered} ` +
@@ -275,12 +269,6 @@ async function runSync(trigger: string): Promise<void> {
         `writes=${ocSubagentsResult.writes} unchangedFiles=${ocSubagentsResult.unchangedFiles} ` +
         `removedFiles=${ocSubagentsResult.removedFiles} skipped=${ocSubagentsResult.skipped.length} ` +
         `targets=${ocSubagentsResult.targets.join(',')}`,
-    );
-    const ocSkillsResult = syncOpenCodePluginSkills();
-    log(
-      `opencode-skills: ${ocSkillsResult.targets.length} target(s) — discovered=${ocSkillsResult.discovered} ` +
-        `created=${ocSkillsResult.created} unchanged=${ocSkillsResult.unchanged} ` +
-        `removed=${ocSkillsResult.removed} skipped=${ocSkillsResult.skipped.length}`,
     );
     const localPluginCacheResult = syncCodexLocalMarketplacePluginCache();
     log(

@@ -23,10 +23,10 @@ import os from 'os';
 import path from 'path';
 import { promisify } from 'util';
 
-import { syncCodexLocalMarketplacePluginCache, syncCodexPluginSkills, syncCodexSubagents } from './codex-sync.js';
+import { syncCodexLocalMarketplacePluginCache, syncCodexSubagents } from './codex-sync.js';
 import { vendorDesignArtifactLoop } from './design-artifact-loop-vendor.js';
 import { log } from './log.js';
-import { syncOpenCodePluginSkills, syncOpenCodeSubagents } from './opencode-sync.js';
+import { syncOpenCodeSubagents } from './opencode-sync.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -57,10 +57,8 @@ export interface UpdateResult {
 }
 
 export interface CodexSurfaceRefreshResult {
-  skills?: ReturnType<typeof syncCodexPluginSkills>;
   subagents?: ReturnType<typeof syncCodexSubagents>;
   opencodeSubagents?: ReturnType<typeof syncOpenCodeSubagents>;
-  opencodeSkills?: ReturnType<typeof syncOpenCodePluginSkills>;
   marketplaceUpgrade?: {
     changed: boolean;
     output?: string;
@@ -156,28 +154,26 @@ function vendorDesignArtifactLoopIfPresent(): void {
  * Refresh every Codex surface derived from plugin repos.
  *
  * Codex marketplaces are copied into Codex's installed plugin cache after local
- * `git pull` and after Codex's own Git marketplace checkout is upgraded. The
- * legacy `.agents/skills` and `.codex/agents` mirrors remain for non-native
- * plugin surfaces, but plugin-native workflow skills are excluded by
- * `plugin-skill-discovery`.
+ * `git pull` and after Codex's own Git marketplace checkout is upgraded. That
+ * cache is bind-mounted into containers, so it is a container delivery path,
+ * not a host-CLI convenience.
+ *
+ * Only surfaces that reach containers are refreshed here — see the note in the
+ * body for why plugin skills are not mirrored to host CLI paths.
  */
 export async function refreshCodexPluginSurfaces(): Promise<CodexSurfaceRefreshResult> {
   const result: CodexSurfaceRefreshResult = {};
 
-  try {
-    result.skills = syncCodexPluginSkills();
-    log.info('Codex plugin skill mirror refreshed', {
-      target: result.skills.target,
-      discovered: result.skills.discovered,
-      created: result.skills.created.length,
-      removed: result.skills.removed.length,
-      unchanged: result.skills.unchanged.length,
-      skipped: result.skills.skipped.length,
-    });
-  } catch (err) {
-    log.warn('Codex plugin skill mirror refresh failed', { err });
-  }
-
+  // NOTE: plugin SKILLS are deliberately not mirrored to host CLI paths
+  // (`~/.agents/skills`, OpenCode's XDG skill dirs). `~/plugins` is the
+  // container agents' plugin source; the operator installs plugins on the host
+  // CLIs themselves. Container agents build their own
+  // `/home/node/.agents/skills` from `/workspace/plugins` at spawn
+  // (container/agent-runner/src/codex-companion-setup.ts), so these host
+  // mirrors served nothing but the host's own Codex/OpenCode.
+  //
+  // Subagent mirrors below DO stay: they target `~/.codex*/agents`, which is
+  // bind-mounted into containers, so they are a container delivery path.
   try {
     result.subagents = syncCodexSubagents();
     log.info('Codex subagent mirror refreshed', {
@@ -202,20 +198,6 @@ export async function refreshCodexPluginSurfaces(): Promise<CodexSurfaceRefreshR
     });
   } catch (err) {
     log.warn('OpenCode subagent mirror refresh failed', { err });
-  }
-
-  try {
-    result.opencodeSkills = syncOpenCodePluginSkills();
-    log.info('OpenCode plugin skill mirror refreshed', {
-      targets: result.opencodeSkills.targets.length,
-      discovered: result.opencodeSkills.discovered,
-      created: result.opencodeSkills.created,
-      unchanged: result.opencodeSkills.unchanged,
-      removed: result.opencodeSkills.removed,
-      skipped: result.opencodeSkills.skipped.length,
-    });
-  } catch (err) {
-    log.warn('OpenCode plugin skill mirror refresh failed', { err });
   }
 
   try {
