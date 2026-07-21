@@ -1640,6 +1640,23 @@ export function buildMounts(
     }
   }
 
+  // Narrow exception to the scripts/ exclusion above: the dependency-audit
+  // script is the one scripts/ file agents must be able to run. The weekly
+  // update-advisory pre-check and /update-container both invoke
+  // `bun /workspace/project/scripts/container-updates.ts`; without this mount
+  // that resolves to a nonexistent path and the audit dies with "Module not
+  // found". It reads only manifests already mounted here (package.json,
+  // container/*) and imports src/container-updates.ts (mounted via 'src'), so
+  // it exposes no credential-path topology — the reason scripts/ is excluded.
+  const auditScript = path.join(projectRoot, 'scripts', 'container-updates.ts');
+  if (fs.existsSync(auditScript)) {
+    mounts.push({
+      hostPath: auditScript,
+      containerPath: '/workspace/project/scripts/container-updates.ts',
+      readonly: true,
+    });
+  }
+
   // Tone profiles — project-relative, shared across all groups. Read-only:
   // groups select a profile in their CLAUDE.md; the files themselves are
   // managed via the /add-tone-profile skill on the host.
