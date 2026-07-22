@@ -60,10 +60,22 @@ deliverable changes and the verification steps so future drift can be caught.
     symlinks (`/app/CLAUDE.md`, `/app/skills/...`, `/app/src/mcp-tools/...`)
     to their host paths so the flattener can read through them.
 
-12. **Plugin-skill discovery + sync** (`src/plugin-skill-discovery.ts`,
-    `scripts/sync-codex-plugin-skills.ts`) — walks `~/plugins/*/` and
-    materializes mirror dirs at `~/.agents/skills/<name>/` for every portable skill
-    using this preference order:
+12. **Plugin-skill discovery** (`src/plugin-skill-discovery.ts`) — walks
+    `~/plugins/*/` and materializes mirror dirs at `~/.agents/skills/<name>/`
+    for every portable skill using the preference order below.
+
+    > **Superseded for Codex (2026-07-22).** Codex now loads `~/plugins`
+    > NATIVELY via its own marketplace + `~/.codex/plugins/cache` — skills arrive
+    > namespaced `<plugin>:<skill>` WITH each plugin's MCP server. The mirror
+    > duplicated those skills unprefixed and stripped their MCP, so it was retired
+    > for Codex: `syncCodexPluginSkills()` and `scripts/sync-codex-plugin-skills.ts`
+    > are deleted, and `codex-companion-setup` mirrors only container-bundled
+    > skills when `runtime === 'codex'`. The mirror below now serves **OpenCode
+    > only** (it has no plugin loader). Registration is done by
+    > `scripts/enable-agent-plugin.ts`, which generates a `.codex-plugin` manifest
+    > when a plugin ships none. Tests 20b/20c below are obsolete.
+
+    Preference order:
 
     1. `<plugin>/.agents/skills/<name>/` — the runtime-agnostic canonical
        (impeccable ships here; no Claude-specific frontmatter)
@@ -97,8 +109,10 @@ deliverable changes and the verification steps so future drift can be caught.
     `scripts/nanoclaw-codex-sync.service`) — closes the host-side drift
     gap with event-driven sync. Watches `~/.claude/*.md` and `~/plugins/`
     (recursive, `node_modules`/`.git` ignored). On 5s-debounced change,
-    runs `syncCodexAgentsMd()` + `syncCodexPluginSkills()` in-process
-    (`src/codex-sync.ts` extracts the shared functions). File lock at
+    runs `syncCodexAgentsMd()`, the subagent mirrors, and the local marketplace
+    plugin cache in-process (`src/codex-sync.ts` extracts the shared functions).
+    Plugin SKILLS are no longer synced to host CLI paths — Codex loads them
+    natively and OpenCode's mirror is built at container spawn. File lock at
     `~/.codex/.sync.lock` with stale-PID detection. Heartbeat file at
     `~/.codex/.sync-heartbeat` for future healthcheck timer. Installed
     as `nanoclaw-codex-sync.service` (system unit, User=ubuntu, 512MB
@@ -175,8 +189,9 @@ Use `rtk proxy docker ps` to bypass the rtk docker-wrapper rewrite — plain
 | 19 | Container: Codex skill symlinks present | `docker exec <c> ls /home/node/.codex-runtime/skills/ \| wc -l` | ~41 (10 container-bundled NanoClaw + ~31 plugin-discovered) |
 | 20 | Container: skill content reads through symlink | `docker exec <c> head -3 /home/node/.codex-runtime/skills/agent-browser/SKILL.md` | shows frontmatter `name: agent-browser` |
 | 20a | Container: plugin canonical source preferred | `docker exec <c> readlink /home/node/.codex-runtime/skills/impeccable` | `/workspace/plugins/impeccable/.agents/skills/impeccable` (NOT `.claude/skills/`) |
-| 20b | Host: plugin-skill sync is idempotent | `pnpm exec tsx scripts/sync-codex-plugin-skills.ts` (rerun) | reports `created: 0, removed: 0, unchanged: 31` |
-| 20c | Host: re-discover after a plugin update | After `git pull` in `~/plugins/<x>/`: no script rerun needed — symlinks point at source dirs |
+| ~~20b~~ | ~~Host: plugin-skill sync is idempotent~~ | OBSOLETE — the host codex mirror and `scripts/sync-codex-plugin-skills.ts` were deleted when Codex moved to native plugin loading | — |
+| ~~20c~~ | ~~Host: re-discover after a plugin update~~ | OBSOLETE for Codex. Native replacement: after `git pull` in `~/plugins/<x>/`, rerun `pnpm exec tsx scripts/enable-agent-plugin.ts <x>` and the emitted `codex plugin` commands. Required if the plugin's `SKILL.md` is a symlink (Codex skips those; the enabler materializes a real copy under `<plugin>/.nanoclaw/codex-skills/`, which is a COPY and will drift until rerun) | — |
+| 20d | Codex: plugin skills load natively, no mirror dupes | In a codex container: `codex debug prompt-input` | skills appear namespaced `<plugin>:<skill>` (e.g. `taste-skill:brandkit`); NO unprefixed duplicates of the same skills |
 
 ### End-to-end test (manual, recommended)
 

@@ -217,11 +217,12 @@ export interface OpenCodeSkillSyncResult {
 /**
  * Mirror portable plugin skills into OpenCode's skill discovery path.
  *
- * Why a separate sync from `syncCodexPluginSkills`:
- *   - Codex sync uses `runtime: 'codex'` which denies workflow-agents/skills
- *     (codex loads those via `.codex-plugin/plugin.json` instead). The shared
- *     `~/.agents/skills/` mirror reflects the codex-filtered set, so OpenCode
- *     reading from `~/.agents/skills/` misses /team-* today.
+ * Why this is OpenCode-specific (and now the ONLY plugin-skill mirror):
+ *   - Codex loads `~/plugins` natively (marketplace + `~/.codex/plugins/cache`),
+ *     so its mirror was retired — `syncCodexPluginSkills()` is deleted. The
+ *     codex-filtered `~/.agents/skills/` set also omitted workflow-agents
+ *     (codex loads it via `.codex-plugin/plugin.json`), so OpenCode could never
+ *     have shared that mirror without missing /team-*.
  *   - OpenCode has no plugin loader for slash commands. The supported route
  *     for /team-* is "every SKILL.md becomes a command automatically" via
  *     `packages/opencode/src/command/index.ts` (verified in source).
