@@ -39,13 +39,13 @@ import os from 'os';
 import path from 'path';
 
 import { discoverPortableSkills, readPluginDenySiblings, type AgentRuntime } from '../src/plugin-skill-discovery.js';
+import { findCodexSkillsRoot, materializeSymlinkedSkills } from '../src/codex-skill-materialize.js';
 import { syncOpenCodePluginSkills } from '../src/opencode-sync.js';
 import { readContainerConfig, writeContainerConfig } from '../src/container-config.js';
 import { GROUPS_DIR } from '../src/config.js';
 
 const PLUGINS_ROOT = path.join(os.homedir(), 'plugins');
 const VALID_RUNTIMES = new Set<AgentRuntime>(['claude', 'codex', 'opencode']);
-const CODEX_SKILLS_ROOT_CANDIDATES = ['.agents/skills', 'skills', 'plugin/skills'];
 
 interface Classification {
   name: string;
@@ -223,73 +223,6 @@ function generateClaudeManifest(dir: string, name: string, dryRun: boolean): boo
 }
 
 /** First existing candidate skills root, relative to the plugin dir (posix-style). */
-function findCodexSkillsRoot(dir: string): string | null {
-  for (const rel of CODEX_SKILLS_ROOT_CANDIDATES) {
-    if (isDirectory(path.join(dir, rel))) return rel;
-  }
-  return null;
-}
-
-/** NanoClaw-owned, git-untracked skills root we materialize into when upstream symlinks SKILL.md. */
-const CODEX_MATERIALIZED_ROOT = path.join('.nanoclaw', 'codex-skills');
-
-/**
- * Codex's native plugin loader silently skips a skill whose `SKILL.md` is a SYMLINK
- * (verified in-container 2026-07-22: humanizer ships `skills/humanizer/SKILL.md ->
- * ../../SKILL.md` and loaded 0 skills, while impeccable's real file loaded fine).
- * Some upstreams ship exactly that shape to keep a root-level SKILL.md as the source
- * of truth.
- *
- * When we detect it, materialize a real skills tree under `<plugin>/.nanoclaw/codex-skills/`
- * — a real dir per skill with a REAL SKILL.md copy plus symlinks for any sibling files —
- * and point the generated manifest there. Same technique the OpenCode mirror already uses.
- * The path is inside the plugin clone but under our own `.nanoclaw/` namespace, so it stays
- * untracked by the plugin's git and never conflicts with `git pull`.
- *
- * Returns the skills root to use (the materialized one, or the original when no symlink).
- */
-function materializeSymlinkedSkills(dir: string, skillsRoot: string, dryRun: boolean): string {
-  const srcRoot = path.join(dir, skillsRoot);
-  let entries: string[] = [];
-  try {
-    entries = fs.readdirSync(srcRoot);
-  } catch {
-    return skillsRoot;
-  }
-  const symlinked = entries.filter((e) => {
-    try {
-      return fs.lstatSync(path.join(srcRoot, e, 'SKILL.md')).isSymbolicLink();
-    } catch {
-      return false;
-    }
-  });
-  if (symlinked.length === 0) return skillsRoot;
-  if (dryRun) return CODEX_MATERIALIZED_ROOT;
-
-  for (const skill of entries) {
-    const from = path.join(srcRoot, skill);
-    if (!fs.existsSync(path.join(from, 'SKILL.md'))) continue;
-    const to = path.join(dir, CODEX_MATERIALIZED_ROOT, skill);
-    fs.mkdirSync(to, { recursive: true });
-    for (const child of fs.readdirSync(from)) {
-      const childSrc = path.join(from, child);
-      const childDst = path.join(to, child);
-      try {
-        fs.rmSync(childDst, { recursive: true, force: true });
-        if (child === 'SKILL.md') {
-          // Real copy — the whole point: Codex must see a regular file here.
-          fs.writeFileSync(childDst, fs.readFileSync(childSrc));
-        } else {
-          fs.symlinkSync(fs.realpathSync(childSrc), childDst);
-        }
-      } catch {
-        /* best-effort per child; a partial skill dir is still better than none */
-      }
-    }
-  }
-  return CODEX_MATERIALIZED_ROOT;
-}
-
 function ensureCodexPluginManifest(dir: string, name: string, skillsRoot: string, dryRun: boolean): boolean {
   const manifestPath = path.join(dir, '.codex-plugin', 'plugin.json');
   if (fs.existsSync(manifestPath)) return false;

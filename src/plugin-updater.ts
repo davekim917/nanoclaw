@@ -24,6 +24,7 @@ import path from 'path';
 import { promisify } from 'util';
 
 import { syncCodexLocalMarketplacePluginCache, syncCodexSubagents } from './codex-sync.js';
+import { refreshMaterializedCodexSkills } from './codex-skill-materialize.js';
 import { vendorDesignArtifactLoop } from './design-artifact-loop-vendor.js';
 import { log } from './log.js';
 import { syncOpenCodeSubagents } from './opencode-sync.js';
@@ -231,6 +232,21 @@ export async function refreshCodexPluginSurfaces(): Promise<CodexSurfaceRefreshR
     } else {
       log.warn('Codex marketplace upgrade failed', { err: msg });
     }
+  }
+
+  // MUST run before the plugin cache is re-copied. A plugin whose upstream ships a
+  // symlinked SKILL.md has a materialized REAL copy under .nanoclaw/codex-skills/;
+  // that copy goes stale on `git pull`, and the cache would faithfully copy the stale
+  // file. Refreshing here makes a pull propagate all the way to what Codex reads.
+  try {
+    const materialized = refreshMaterializedCodexSkills();
+    if (materialized.refreshed.length > 0) {
+      log.info('Re-materialized codex skills for symlink-shipping plugins', {
+        plugins: materialized.refreshed,
+      });
+    }
+  } catch (err) {
+    log.warn('Codex skill re-materialization failed', { err });
   }
 
   try {
