@@ -149,6 +149,45 @@ describe('discoverPortableSkills', () => {
     }
   });
 
+  it('codex-native sub-plugin (.codex-plugin) is skipped from the codex mirror, kept for opencode', () => {
+    // A sub-plugin that ships .codex-plugin is loaded natively by Codex (with its MCP), so the
+    // Codex mirror must NOT duplicate it. OpenCode has no codex-plugin loader, so it still gets it.
+    // This is the manifest rule — orthogonal to the .nanoclaw-plugin.json marker.
+    const sub = path.join(tmpDir, 'role-specific-plugins', 'plugins', 'data-analytics');
+    writeSkill(path.join(sub, 'skills', 'build-report'), { name: 'build-report' });
+    fs.mkdirSync(path.join(sub, '.codex-plugin'), { recursive: true });
+    fs.writeFileSync(
+      path.join(sub, '.codex-plugin', 'plugin.json'),
+      JSON.stringify({ name: 'data-analytics', version: '0.0.0' }),
+    );
+    expect(discoverPortableSkills(tmpDir, { runtime: 'codex' }).map((s) => s.name)).not.toContain('build-report');
+    expect(discoverPortableSkills(tmpDir, { runtime: 'opencode' }).map((s) => s.name)).toContain('build-report');
+  });
+
+  it('.nanoclaw-plugin.json denySiblings routes per runtime (default: all three)', () => {
+    // A plugin denied for one sibling is skipped ONLY for that sibling.
+    writeSkill(path.join(tmpDir, 'data-anthropic', 'skills', 'write-query'), { name: 'write-query' });
+    fs.writeFileSync(
+      path.join(tmpDir, 'data-anthropic', '.nanoclaw-plugin.json'),
+      JSON.stringify({ denySiblings: ['codex'] }),
+    );
+    const names = (rt: 'claude' | 'codex' | 'opencode') =>
+      discoverPortableSkills(tmpDir, { runtime: rt }).map((s) => s.name);
+    expect(names('claude')).toContain('write-query');
+    expect(names('opencode')).toContain('write-query');
+    expect(names('codex')).not.toContain('write-query');
+  });
+
+  it('.nanoclaw-plugin.json absent/malformed → delivered to all siblings', () => {
+    writeSkill(path.join(tmpDir, 'plug-nomark', 'skills', 'k'), { name: 'k' });
+    writeSkill(path.join(tmpDir, 'plug-badmark', 'skills', 'm'), { name: 'm' });
+    fs.writeFileSync(path.join(tmpDir, 'plug-badmark', '.nanoclaw-plugin.json'), 'not valid json {');
+    for (const rt of ['claude', 'codex', 'opencode'] as const) {
+      const names = discoverPortableSkills(tmpDir, { runtime: rt }).map((s) => s.name);
+      expect(names).toEqual(expect.arrayContaining(['k', 'm']));
+    }
+  });
+
   it('cross-plugin name collision: first plugin alphabetically wins', () => {
     writeSkill(path.join(tmpDir, 'aaa', 'skills', 'dup'), { name: 'dup', body: 'FROM-AAA' });
     writeSkill(path.join(tmpDir, 'bbb', 'skills', 'dup'), { name: 'dup', body: 'FROM-BBB' });

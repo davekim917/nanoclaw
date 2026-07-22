@@ -132,6 +132,43 @@ const RUNTIME_SPECIFIC_DIRS = new Set<string>([
   '.pi',
 ]);
 
+/**
+ * A (sub)plugin dir that ships `.codex-plugin/plugin.json` is loaded natively by
+ * Codex through its plugin marketplace/cache — skills namespaced `<plugin>:`,
+ * plus any MCP server the plugin declares. Mirroring such a plugin into the
+ * portable-skill set would DUPLICATE every skill (unprefixed, and — worse —
+ * stripped of its MCP server). So the Codex mirror skips a plugin Codex already
+ * loads natively. This is orthogonal to the .nanoclaw-plugin.json marker: the
+ * marker says "don't deliver to this sibling AT ALL" (any mechanism); this rule
+ * says "don't DOUBLE-deliver to Codex via the mirror what it already gets
+ * natively." A Codex-native plugin therefore stays OUT of `denySiblings` for
+ * codex (Codex should have it) yet is still skipped from the Codex mirror here.
+ */
+function loadedNativelyByCodex(pluginRootDir: string): boolean {
+  return fs.existsSync(path.join(pluginRootDir, '.codex-plugin', 'plugin.json'));
+}
+
+/**
+ * Per-plugin sibling routing marker: `~/plugins/<plugin>/.nanoclaw-plugin.json`.
+ * The single source of truth for which of the three container agent providers
+ * (claude | codex | opencode) a plugin is delivered to. Default is all three;
+ * `denySiblings` is the exception list. Written/updated by enable-agent-plugin
+ * (`--deny`/`--allow`) or edited by hand, and re-read on every reconcile and
+ * every container spawn — so a change after initial enabling just takes effect,
+ * no drift. See docs and enable-agent-plugin.ts.
+ */
+export function readPluginDenySiblings(pluginDir: string): Set<AgentRuntime> {
+  try {
+    const raw = fs.readFileSync(path.join(pluginDir, '.nanoclaw-plugin.json'), 'utf-8');
+    const parsed = JSON.parse(raw) as { denySiblings?: unknown };
+    const list = Array.isArray(parsed.denySiblings) ? parsed.denySiblings : [];
+    return new Set(list.filter((x): x is AgentRuntime => x === 'claude' || x === 'codex' || x === 'opencode'));
+  } catch {
+    // No marker / unreadable / malformed → deliver to all siblings (the default).
+    return new Set();
+  }
+}
+
 function hasSkillMd(dir: string): boolean {
   try {
     return fs.statSync(path.join(dir, 'SKILL.md')).isFile();
@@ -186,8 +223,15 @@ function discoverInPlugin(
   pluginName: string,
   denySubPluginSkillDirs: Set<string>,
   allowNonInvocable: boolean,
+  runtime: AgentRuntime,
 ): DiscoveredSkill[] {
   const skills = new Map<string, DiscoveredSkill>();
+
+  // Manifest-derived mirror routing: the Codex mirror skips any plugin root
+  // Codex loads natively (see loadedNativelyByCodex). Applied per plugin root
+  // — the top-level plugin (rules 1–6) and each sub-plugin (rules 7–8).
+  const skipCodexNative = (root: string) => runtime === 'codex' && loadedNativelyByCodex(root);
+  const doTopLevel = !skipCodexNative(pluginDir);
 
   const recordCandidate = (skillDir: string) => {
     if (!hasSkillMd(skillDir)) return;
@@ -207,7 +251,7 @@ function discoverInPlugin(
 
   // 1. .agents/skills/<name>/
   const agentsSkillsDir = path.join(pluginDir, '.agents', 'skills');
-  if (isDirectory(agentsSkillsDir)) {
+  if (doTopLevel && isDirectory(agentsSkillsDir)) {
     for (const sub of fs.readdirSync(agentsSkillsDir)) {
       recordCandidate(path.join(agentsSkillsDir, sub));
     }
@@ -215,18 +259,18 @@ function discoverInPlugin(
 
   // 2. skills/<name>/
   const topSkillsDir = path.join(pluginDir, 'skills');
-  if (isDirectory(topSkillsDir)) {
+  if (doTopLevel && isDirectory(topSkillsDir)) {
     for (const sub of fs.readdirSync(topSkillsDir)) {
       recordCandidate(path.join(topSkillsDir, sub));
     }
   }
 
   // 3. <plugin>/SKILL.md (single-skill plugin)
-  recordCandidate(pluginDir);
+  if (doTopLevel) recordCandidate(pluginDir);
 
   // 4. plugin/skills/<name>/ (impeccable's `plugin/` subdir)
   const pluginSubDir = path.join(pluginDir, 'plugin', 'skills');
-  if (isDirectory(pluginSubDir)) {
+  if (doTopLevel && isDirectory(pluginSubDir)) {
     for (const sub of fs.readdirSync(pluginSubDir)) {
       recordCandidate(path.join(pluginSubDir, sub));
     }
@@ -234,7 +278,7 @@ function discoverInPlugin(
 
   // 5. <plugin>-cursor-integration/skills/<name>/
   const cursorDir = path.join(pluginDir, `${pluginName}-cursor-integration`, 'skills');
-  if (isDirectory(cursorDir)) {
+  if (doTopLevel && isDirectory(cursorDir)) {
     for (const sub of fs.readdirSync(cursorDir)) {
       recordCandidate(path.join(cursorDir, sub));
     }
@@ -242,20 +286,22 @@ function discoverInPlugin(
 
   // 6. <plugin>-claude-plugin/skills/<name>/ (last resort)
   const claudePluginDir = path.join(pluginDir, `${pluginName}-claude-plugin`, 'skills');
-  if (isDirectory(claudePluginDir)) {
+  if (doTopLevel && isDirectory(claudePluginDir)) {
     for (const sub of fs.readdirSync(claudePluginDir)) {
       recordCandidate(path.join(claudePluginDir, sub));
     }
   }
 
   // 7. multi-plugin repos: <plugin>/plugins/<sub>/skills/<name>/
-  //    Common in davekim917/bootstrap. Respect runtime-specific denylist.
+  //    Common in davekim917/bootstrap. Respect manifest routing + curated denylist.
   const multiPluginDir = path.join(pluginDir, 'plugins');
   if (isDirectory(multiPluginDir)) {
     for (const sub of fs.readdirSync(multiPluginDir)) {
+      const subDir = path.join(multiPluginDir, sub);
+      if (skipCodexNative(subDir)) continue;
       const subKey = `${pluginName}/plugins/${sub}/skills`;
       if (denySubPluginSkillDirs.has(subKey)) continue;
-      const subSkillsDir = path.join(multiPluginDir, sub, 'skills');
+      const subSkillsDir = path.join(subDir, 'skills');
       if (!isDirectory(subSkillsDir)) continue;
       for (const skillName of fs.readdirSync(subSkillsDir)) {
         recordCandidate(path.join(subSkillsDir, skillName));
@@ -273,6 +319,7 @@ function discoverInPlugin(
     const subDir = path.join(pluginDir, sub);
     if (!isDirectory(subDir)) continue;
     if (!fs.existsSync(path.join(subDir, '.claude-plugin', 'plugin.json'))) continue;
+    if (skipCodexNative(subDir)) continue;
     if (denySubPluginSkillDirs.has(`${pluginName}/${sub}/skills`)) continue;
     const subSkillsDir = path.join(subDir, 'skills');
     if (!isDirectory(subSkillsDir)) continue;
@@ -324,9 +371,12 @@ export function discoverPortableSkills(pluginsRoot: string, options: DiscoverOpt
     if (RUNTIME_SPECIFIC_DIRS.has(pluginName)) continue;
     const pluginDir = path.join(pluginsRoot, pluginName);
     if (!isDirectory(pluginDir)) continue;
+    // Per-plugin sibling routing: skip this plugin for the current runtime if
+    // its .nanoclaw-plugin.json marker denies this sibling (default: all three).
+    if (readPluginDenySiblings(pluginDir).has(runtime)) continue;
     // Skip deprecated subtree contents — they live at <plugin>/deprecated/ and
     // shouldn't appear as portable skills.
-    for (const skill of discoverInPlugin(pluginDir, pluginName, denySubPluginSkillDirs, allowNonInvocable)) {
+    for (const skill of discoverInPlugin(pluginDir, pluginName, denySubPluginSkillDirs, allowNonInvocable, runtime)) {
       if (denySkills.has(skill.name)) continue;
       if (skill.skillDir.includes('/deprecated/')) continue;
       // First-plugin-wins by name (alphabetical iteration); a later plugin
