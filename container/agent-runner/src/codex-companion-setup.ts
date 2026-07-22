@@ -12,10 +12,18 @@
  * `/home/node/.codex-runtime/`, populated with:
  *   - a symlink to the mounted host `auth.json` (so OAuth refresh still
  *     persists back to the host)
- *   - a symlink to the mounted host `plugins/` cache, so `[plugins.*]`
- *     config blocks resolve the same installed Codex plugins in peer mode
- *   - a config.toml that wraps the host's config with the additional MCP
- *     servers the agent-runner has wired (including `nanoclaw`).
+ *   - a config.toml that wraps the host's config — with every `[plugins.*]`
+ *     and `[marketplaces.*]` table stripped, not carried over — plus the
+ *     additional MCP servers the agent-runner has wired (including
+ *     `nanoclaw`)
+ *   - a container-owned Codex plugin registration built fresh from
+ *     `/workspace/plugins` (see `registerContainerCodexPlugins`)
+ *
+ * Containers must have ZERO dependency on host CLI plugin state: the runtime
+ * CODEX_HOME never symlinks the host's `~/.codex/plugins` cache, and never
+ * inherits host `[plugins.*]`/`[marketplaces.*]` config blocks. Every plugin
+ * available to codex-as-peer is registered directly from the container's own
+ * `/workspace/plugins` mount on each spawn.
  *
  * The agent-runner sets `process.env.CODEX_HOME` to this directory before
  * constructing the provider — `env: { ...process.env }` is snapshotted into
@@ -27,6 +35,7 @@
  *   - we're already inside a Codex-provider session (Codex's own writer
  *     handles `~/.codex/config.toml` directly)
  */
+import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
 import fs from 'fs';
 import path from 'path';
 
@@ -34,6 +43,7 @@ import { tomlBasicString } from './providers/codex-app-server.js';
 import {
   type AgentRuntime,
   discoverPortableSkills,
+  readPluginDenySiblings,
   syncSkillSymlinks as syncDiscoveredSkillSymlinks,
 } from './plugin-skill-discovery.js';
 import type { McpServerConfig } from './providers/types.js';
@@ -42,6 +52,18 @@ const HOST_CODEX_DIR = '/home/node/.codex';
 const RUNTIME_CODEX_DIR = '/home/node/.codex-runtime';
 const CONTAINER_CLAUDE_SKILLS_DIR = '/home/node/.claude/skills';
 const CONTAINER_PLUGINS_DIR = '/workspace/plugins';
+/**
+ * Plugins whose capability ships in-tree (vendored skill + an agent-runner MCP tool
+ * rooted at /workspace/agent). `container-runner.ts` already omits these from the
+ * /workspace/plugins mount, so in production they never reach this code — but we skip
+ * them explicitly anyway. Registering one natively would double-deliver the skill
+ * (in-tree copy + namespaced plugin copy) AND start the plugin's own MCP server rooted
+ * at the plugin cache instead of /workspace/agent. That exact failure already happened
+ * once via the host `~/.codex` cache; relying on a mount rule in a distant file to
+ * prevent it is not a guarantee worth betting on. Keep in sync with
+ * `IN_TREE_SHADOWED_PLUGINS` in src/container-runner.ts.
+ */
+const IN_TREE_SHADOWED_PLUGINS = new Set(['design-artifact-loop', 'gitnexus']);
 // Runtime-agnostic skill discovery path. Codex auto-scans this in addition
 // to $CODEX_HOME/skills/ — verified empirically via `codex debug
 // prompt-input` (~/.agents/skills/ appears as discovery root `r1`).
@@ -72,6 +94,10 @@ export function parseHostMcpServersForTest(toml: string): Record<string, McpServ
 
 export function buildMergedConfigForTest(hostConfig: string, mcpServers: Record<string, McpServerConfig>): string {
   return buildMergedConfig(hostConfig, mcpServers);
+}
+
+export function stripPluginsAndMarketplacesForTest(toml: string): string {
+  return stripPluginsAndMarketplaces(toml);
 }
 
 function renderMcpServer(name: string, config: McpServerConfig): string[] {
@@ -330,7 +356,7 @@ function stripGitNexusReentrySurfaces(toml: string): string {
  */
 function buildMergedConfig(hostConfig: string, mcpServers: Record<string, McpServerConfig>): string {
   const { stripped } = stripExistingMcpServers(hostConfig);
-  const base = rewriteLocalMarketplaceSourcesForContainer(stripGitNexusReentrySurfaces(stripped)).trimEnd();
+  const base = stripPluginsAndMarketplaces(stripGitNexusReentrySurfaces(stripped)).trimEnd();
   const hostMcps = parseHostMcpServers(hostConfig);
 
   // Runtime wins on name collision — that's why `mcpServers` is spread second.
@@ -347,35 +373,53 @@ function buildMergedConfig(hostConfig: string, mcpServers: Record<string, McpSer
   return [base, '', '# --- nanoclaw merged MCP servers (host ∪ container) ---', '', ...mcpLines].join('\n');
 }
 
-function rewriteLocalMarketplaceSourcesForContainer(toml: string): string {
-  return (
-    toml
-      .split('\n')
-      .map((line) => {
-        const match = line.match(/^(\s*source\s*=\s*)"((?:\\.|[^"\\])*)"\s*$/);
-        if (!match) return line;
-        const source = match[2].replace(/\\"/g, '"').replace(/\\\\/g, '\\');
-        const marker = '/plugins/';
-        const markerAt = source.indexOf(marker);
-        if (markerAt < 0) return line;
-        const relative = source.slice(markerAt + marker.length);
-        const pluginName = relative.split('/')[0];
-        if (!pluginName) return line;
-        const containerSource = `/workspace/plugins/${relative}`;
-        if (!fs.existsSync(`/workspace/plugins/${pluginName}`)) return line;
-        return `${match[1]}${tomlBasicString(containerSource)}`;
-      })
-      .join('\n')
-      .trimEnd() + '\n'
-  );
+/**
+ * Strip every `[plugins.*]` and `[marketplaces.*]` table from the host
+ * config. Containers must have ZERO dependency on host CLI plugin state —
+ * rather than rewrite the host's marketplace `source =` paths to point into
+ * the container (the old approach), we drop these tables entirely and
+ * register plugins fresh from `/workspace/plugins` via
+ * `registerContainerCodexPlugins`.
+ *
+ * Matches both bare (`[marketplaces.foo]`) and quoted-segment
+ * (`[plugins."foo@bar"]`) dotted table headers, plus the bare table name on
+ * its own (`[plugins]`). Same line-scanning shape as `stripExistingMcpServers`
+ * / `stripGitNexusReentrySurfaces` — a real TOML table ends at the next
+ * `[...]` header, matching or not.
+ */
+function stripPluginsAndMarketplaces(toml: string): string {
+  const out: string[] = [];
+  let inStrippedBlock = false;
+  for (const line of toml.split('\n')) {
+    const header = line.match(/^\s*\[([^\]]+)\]\s*$/);
+    if (header) {
+      const tableName = header[1].trim();
+      inStrippedBlock =
+        tableName === 'plugins' ||
+        tableName === 'marketplaces' ||
+        tableName.startsWith('plugins.') ||
+        tableName.startsWith('marketplaces.');
+      if (inStrippedBlock) continue;
+    }
+    if (!inStrippedBlock) out.push(line);
+  }
+  return out.join('\n');
 }
 
 /**
  * Set up `/home/node/.codex-runtime/` and return the path so callers can
  * point `CODEX_HOME` at it. Returns `null` when the codex auth mount is
  * absent (no host `~/.codex/auth.json`).
+ *
+ * `runtime` identifies the host agent runtime driving this peer-mode Codex
+ * invocation (never `'codex'` itself — a codex-primary session writes its
+ * own CODEX_HOME directly and never calls this function). Defaults to
+ * `'claude'` for back-compat with callers that don't pass it.
  */
-export function setupCodexRuntime(mcpServers: Record<string, McpServerConfig>): string | null {
+export function setupCodexRuntime(
+  mcpServers: Record<string, McpServerConfig>,
+  runtime: AgentRuntime = 'claude',
+): string | null {
   const hostAuth = path.join(HOST_CODEX_DIR, 'auth.json');
   if (!fs.existsSync(hostAuth)) {
     log('Host codex auth not mounted — skipping CODEX_HOME runtime setup');
@@ -428,44 +472,14 @@ export function setupCodexRuntime(mcpServers: Record<string, McpServerConfig>): 
     }
   }
 
-  // plugins/: preserve native Codex plugin installs for codex-as-peer mode.
-  // The merged config below keeps non-MCP blocks, including `[plugins.*]`;
-  // without this symlink those blocks can point at a cache tree that is absent
-  // from CODEX_HOME and Codex falls back to whatever legacy skill mirrors exist.
-  const hostPluginsDir = path.join(HOST_CODEX_DIR, 'plugins');
-  const runtimePluginsDir = path.join(RUNTIME_CODEX_DIR, 'plugins');
-  if (fs.existsSync(hostPluginsDir)) {
-    try {
-      fs.rmSync(runtimePluginsDir, { recursive: true, force: true });
-      fs.symlinkSync(hostPluginsDir, runtimePluginsDir);
-    } catch (err) {
-      log(`Failed to symlink plugins/: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  }
-
-  // .tmp/marketplaces/: snapshot roots for GIT-sourced marketplaces. Without
-  // these, `[marketplaces.*]` entries whose snapshot lives here resolve to a
-  // path that doesn't exist under CODEX_HOME and Codex hard-errors with
-  // "marketplace root does not contain a supported manifest" — verified in a
-  // container against the bootstrap + ponytail marketplaces. Prompt assembly
-  // tolerates it (plugins load from plugins/cache), but `codex plugin list`
-  // fails outright, so an agent inspecting its own plugins hits a wall.
-  //
-  // Only `marketplaces` is linked, not all of `.tmp` — `.tmp` is a scratch dir
-  // and the host mount is read-only, so aliasing the whole thing would turn
-  // ordinary temp writes into EROFS failures.
-  const hostMarketplacesDir = path.join(HOST_CODEX_DIR, '.tmp', 'marketplaces');
-  if (fs.existsSync(hostMarketplacesDir)) {
-    try {
-      const runtimeTmpDir = path.join(RUNTIME_CODEX_DIR, '.tmp');
-      fs.mkdirSync(runtimeTmpDir, { recursive: true });
-      const runtimeMarketplaces = path.join(runtimeTmpDir, 'marketplaces');
-      fs.rmSync(runtimeMarketplaces, { recursive: true, force: true });
-      fs.symlinkSync(hostMarketplacesDir, runtimeMarketplaces);
-    } catch (err) {
-      log(`Failed to symlink .tmp/marketplaces/: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  }
+  // NOTE: no `plugins/` cache symlink and no `.tmp/marketplaces/` snapshot
+  // symlink here (deliberately removed). Both existed only to make sense of
+  // host-inherited `[plugins.*]` / `[marketplaces.*]` config blocks — now
+  // that `buildMergedConfig` strips those blocks entirely (see
+  // `stripPluginsAndMarketplaces`), nothing in the runtime config.toml
+  // references either path, and every plugin is registered fresh below via
+  // `registerContainerCodexPlugins`. Containers must have zero dependency on
+  // host CLI plugin state.
 
   // Read host config (tolerate missing — we'll generate a minimal one).
   const hostConfigPath = path.join(HOST_CODEX_DIR, 'config.toml');
@@ -485,6 +499,12 @@ export function setupCodexRuntime(mcpServers: Record<string, McpServerConfig>): 
     return null;
   }
 
+  // Container-owned plugin registration: build the runtime's own plugin
+  // cache from /workspace/plugins rather than inheriting the host's. Must
+  // run AFTER config.toml is written (registration mutates config.toml
+  // in-place via `codex plugin` under CODEX_HOME=RUNTIME_CODEX_DIR).
+  registerContainerCodexPlugins(RUNTIME_CODEX_DIR, runtime);
+
   // Skills mirror is already populated by index.ts at startup with the correct
   // runtime; calling it again here without a runtime arg would default to
   // 'codex' and strip workflow-agents skills for opencode containers that have
@@ -493,6 +513,185 @@ export function setupCodexRuntime(mcpServers: Record<string, McpServerConfig>): 
 
   log(`CODEX_HOME runtime ready at ${RUNTIME_CODEX_DIR} (${Object.keys(mcpServers).length} MCP servers merged)`);
   return RUNTIME_CODEX_DIR;
+}
+
+function isDirectorySafe(p: string): boolean {
+  try {
+    return fs.statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Read the registerable ENTRY NAME for a plugin dir from its
+ * `.codex-plugin/plugin.json` `name` field — NOT the folder name. A plugin
+ * repo's folder name doesn't always match its Codex plugin name (e.g. the
+ * Wix skills repo ships at `~/plugins/skills` but its plugin.json name is
+ * `wix`; using the folder name for `codex plugin add` would hard-error with
+ * "plugin.json name `wix` does not match marketplace plugin name `skills`").
+ * Returns `null` when the manifest is absent/unreadable/malformed — the
+ * caller treats that as "not a registerable Codex plugin", not an error.
+ */
+function readCodexPluginEntryName(pluginDir: string): string | null {
+  try {
+    const raw = fs.readFileSync(path.join(pluginDir, '.codex-plugin', 'plugin.json'), 'utf-8');
+    const parsed = JSON.parse(raw) as { name?: unknown };
+    return typeof parsed.name === 'string' && parsed.name.trim() ? parsed.name : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Read the MARKETPLACE NAME for a plugin dir from its
+ * `.agents/plugins/marketplace.json` `name` field — this is the name
+ * `codex plugin marketplace add <dir>` registers the marketplace under, and
+ * the `@marketplace` half of the `codex plugin add <entry>@<marketplace>`
+ * argument. Returns `null` when the manifest is missing — plugins without it
+ * aren't natively Codex-registerable.
+ */
+function readCodexMarketplaceName(pluginDir: string): string | null {
+  try {
+    const raw = fs.readFileSync(path.join(pluginDir, '.agents', 'plugins', 'marketplace.json'), 'utf-8');
+    const parsed = JSON.parse(raw) as { name?: unknown };
+    return typeof parsed.name === 'string' && parsed.name.trim() ? parsed.name : null;
+  } catch {
+    return null;
+  }
+}
+
+export interface CodexPluginRegistrationPlan {
+  name: string;
+  action: 'register' | 'skip';
+  reason?: string;
+  entryName?: string;
+  marketplaceName?: string;
+}
+
+/**
+ * Pure planning pass over a plugins root: decides register-vs-skip for each
+ * top-level entry without spawning `codex` and without any writes. Kept
+ * separate from `registerContainerCodexPlugins` so the decision logic
+ * (deny-sibling routing, manifest presence, name resolution) is unit-testable
+ * against a fake plugins root with no subprocess involved.
+ *
+ * Per-group `excludePlugins` and `IN_TREE_SHADOWED_PLUGINS` need no handling
+ * here — `container-runner.ts` already omits those entries from the
+ * `/workspace/plugins` mount before the container ever starts, so they
+ * simply never appear as entries in `pluginsRoot`.
+ */
+export function planCodexPluginRegistration(pluginsRoot: string): CodexPluginRegistrationPlan[] {
+  let entries: string[] = [];
+  try {
+    entries = fs.readdirSync(pluginsRoot);
+  } catch {
+    return [];
+  }
+
+  const plans: CodexPluginRegistrationPlan[] = [];
+  for (const name of entries) {
+    const dir = path.join(pluginsRoot, name);
+    if (!isDirectorySafe(dir)) {
+      plans.push({ name, action: 'skip', reason: 'not-a-directory' });
+      continue;
+    }
+    if (IN_TREE_SHADOWED_PLUGINS.has(name)) {
+      plans.push({ name, action: 'skip', reason: 'in-tree-shadowed' });
+      continue;
+    }
+    if (readPluginDenySiblings(dir).has('codex')) {
+      plans.push({ name, action: 'skip', reason: 'denied-for-codex' });
+      continue;
+    }
+    const entryName = readCodexPluginEntryName(dir);
+    if (!entryName) {
+      plans.push({ name, action: 'skip', reason: 'no-codex-plugin-manifest' });
+      continue;
+    }
+    const marketplaceName = readCodexMarketplaceName(dir);
+    if (!marketplaceName) {
+      plans.push({ name, action: 'skip', reason: 'no-marketplace-manifest' });
+      continue;
+    }
+    plans.push({ name, action: 'register', entryName, marketplaceName });
+  }
+  return plans;
+}
+
+function describeSpawnFailure(result: SpawnSyncReturns<string>): string {
+  if (result.error) return result.error.message;
+  const stderr = (result.stderr ?? '').toString().trim();
+  return stderr || `exit code ${result.status ?? 'unknown'}`;
+}
+
+/**
+ * Register every registerable plugin under `/workspace/plugins` into the
+ * runtime CODEX_HOME's OWN plugin cache. This is the container-owned
+ * replacement for the old host-plugins-cache symlink: instead of borrowing
+ * whatever `~/.codex/plugins/cache` the host happens to have, the container
+ * runs `codex plugin marketplace add <dir>` then
+ * `codex plugin add <entryName>@<marketplaceName>` for each plugin, both
+ * with `CODEX_HOME` pointed at the runtime dir — materializing a
+ * container-local cache under `<runtimeHome>/plugins/cache/...`.
+ *
+ * A single bad plugin must not break container startup: every `spawnSync`
+ * failure is captured into `errors` and the loop continues, never throws.
+ */
+export function registerContainerCodexPlugins(
+  runtimeHome: string,
+  runtime: AgentRuntime,
+): { registered: string[]; skipped: string[]; errors: string[] } {
+  const registered: string[] = [];
+  const skipped: string[] = [];
+  const errors: string[] = [];
+
+  // Cheap no-op when no plugins are mounted at all (e.g. operator has no
+  // ~/plugins tree, or every entry was excluded before the mount).
+  if (!fs.existsSync(CONTAINER_PLUGINS_DIR)) {
+    return { registered, skipped, errors };
+  }
+
+  const plans = planCodexPluginRegistration(CONTAINER_PLUGINS_DIR);
+  const env = { ...process.env, CODEX_HOME: runtimeHome };
+
+  for (const plan of plans) {
+    if (plan.action === 'skip') {
+      skipped.push(plan.name);
+      continue;
+    }
+
+    const dir = path.join(CONTAINER_PLUGINS_DIR, plan.name);
+    const addMarketplace = spawnSync('codex', ['plugin', 'marketplace', 'add', dir], {
+      env,
+      timeout: 60_000,
+      encoding: 'utf-8',
+    });
+    if (addMarketplace.status !== 0) {
+      errors.push(`${plan.name}: marketplace add failed — ${describeSpawnFailure(addMarketplace)}`);
+      continue;
+    }
+
+    const addPlugin = spawnSync('codex', ['plugin', 'add', `${plan.entryName}@${plan.marketplaceName}`], {
+      env,
+      timeout: 60_000,
+      encoding: 'utf-8',
+    });
+    if (addPlugin.status !== 0) {
+      errors.push(`${plan.name}: plugin add failed — ${describeSpawnFailure(addPlugin)}`);
+      continue;
+    }
+
+    registered.push(plan.name);
+  }
+
+  log(
+    `Container Codex plugin registration (runtime=${runtime}): ` +
+      `${registered.length} registered, ${skipped.length} skipped, ${errors.length} errors` +
+      (errors.length > 0 ? ` — ${errors.join('; ')}` : ''),
+  );
+
+  return { registered, skipped, errors };
 }
 
 /**

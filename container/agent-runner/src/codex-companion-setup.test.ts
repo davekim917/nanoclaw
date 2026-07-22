@@ -8,14 +8,17 @@
  */
 import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 
 import {
   buildMergedConfigForTest,
   parseHostMcpServersForTest,
+  planCodexPluginRegistration,
   renderMcpServerForTest,
   setupCodexRuntime,
   stripExistingMcpServersForTest,
+  stripPluginsAndMarketplacesForTest,
 } from './codex-companion-setup.js';
 
 describe('renderMcpServer', () => {
@@ -231,7 +234,12 @@ describe('buildMergedConfig', () => {
     expect(merged).toContain('approval_policy = "on-request"');
     expect(merged).toContain('[mcp_servers.context7]');
     expect(merged).toContain('[mcp_servers.nanoclaw]');
-    expect(merged).toContain('[plugins.humanizer]');
+    // Containers must have zero dependency on host CLI plugin state: ALL
+    // [plugins.*] / [plugin_marketplaces.*] blocks are stripped now, not just
+    // gitnexus's — even a harmless-looking one like humanizer.
+    expect(merged).not.toContain('[plugins.humanizer]');
+    expect(merged).not.toContain('[plugins.gitnexus]');
+    expect(merged).not.toContain('[plugin_marketplaces.gitnexus]');
 
     const source = fs.readFileSync(new URL('./codex-companion-setup.ts', import.meta.url), 'utf8');
     expect(source).not.toContain("path.join(HOST_CODEX_DIR, 'AGENTS.md')");
@@ -290,6 +298,175 @@ describe('parseHostMcpServers', () => {
   it('rejects deprecated SSE host MCP entries', () => {
     const toml = ['[mcp_servers.legacy]', 'type = "sse"', 'url = "https://example.com/sse"'].join('\n');
     expect(() => parseHostMcpServersForTest(toml)).toThrow(/deprecated SSE transport/);
+  });
+});
+
+describe('stripPluginsAndMarketplaces', () => {
+  it('strips real Codex plugin/marketplace table shapes (verified against a live ~/.codex/config.toml)', () => {
+    // Real Codex writes `[plugins."<entry>@<marketplace>"]` (quoted, dotted-@)
+    // and `[marketplaces.<name>]` (bare) — verified against a live host
+    // config.toml, not guessed.
+    const toml = [
+      'model = "gpt-5.5"',
+      '',
+      '[plugins."wix@skills"]',
+      'enabled = true',
+      '',
+      '[plugins."humanizer@humanizer"]',
+      'enabled = true',
+      '',
+      '[marketplaces.skills]',
+      'source_type = "local"',
+      'source = "/home/ubuntu/plugins/skills"',
+      '',
+      '[marketplaces.humanizer]',
+      'source_type = "local"',
+      'source = "/home/ubuntu/plugins/humanizer"',
+      '',
+      '[mcp_servers.exa]',
+      'type = "http"',
+      'url = "https://exa"',
+      '',
+      '[projects."/home/x"]',
+      'trust_level = "trusted"',
+    ].join('\n');
+
+    const stripped = stripPluginsAndMarketplacesForTest(toml);
+    expect(stripped).not.toContain('[plugins."wix@skills"]');
+    expect(stripped).not.toContain('[plugins."humanizer@humanizer"]');
+    expect(stripped).not.toContain('[marketplaces.skills]');
+    expect(stripped).not.toContain('[marketplaces.humanizer]');
+    expect(stripped).not.toContain('/home/ubuntu/plugins/skills');
+    // Unrelated tables survive untouched.
+    expect(stripped).toContain('model = "gpt-5.5"');
+    expect(stripped).toContain('[mcp_servers.exa]');
+    expect(stripped).toContain('url = "https://exa"');
+    expect(stripped).toContain('[projects."/home/x"]');
+    expect(stripped).toContain('trust_level = "trusted"');
+  });
+
+  it('strips a bare [plugins] / [marketplaces] table header with no dotted suffix', () => {
+    // `model = "x"` must precede any table header — once a `[table]` header
+    // is seen, subsequent key = value lines belong to THAT table in real
+    // TOML, so a trailing top-level key would need its own header to close
+    // the preceding block (exactly like stripExistingMcpServers/
+    // stripGitNexusReentrySurfaces, which share this same block-scoping).
+    const toml = ['model = "x"', '', '[plugins]', 'some_key = true', '', '[marketplaces]', 'other = false'].join(
+      '\n',
+    );
+    const stripped = stripPluginsAndMarketplacesForTest(toml);
+    expect(stripped).not.toContain('some_key');
+    expect(stripped).not.toContain('other = false');
+    expect(stripped).toContain('model = "x"');
+  });
+
+  it('passes through TOML with no plugins/marketplaces tables', () => {
+    const toml = 'model = "x"\n[mcp_servers.foo]\ntype = "http"\nurl = "u"\n';
+    expect(stripPluginsAndMarketplacesForTest(toml)).toBe(toml);
+  });
+
+  it('handles empty input', () => {
+    expect(stripPluginsAndMarketplacesForTest('')).toBe('');
+  });
+});
+
+describe('planCodexPluginRegistration', () => {
+  let root: string;
+
+  beforeEach(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-plugin-plan-'));
+  });
+
+  afterEach(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  function writeJson(p: string, obj: unknown) {
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, JSON.stringify(obj));
+  }
+
+  it('returns an empty plan for a missing plugins root', () => {
+    expect(planCodexPluginRegistration(path.join(root, 'does-not-exist'))).toEqual([]);
+  });
+
+  it('skips a non-directory entry', () => {
+    fs.writeFileSync(path.join(root, 'stray-file'), 'not a plugin');
+    const plans = planCodexPluginRegistration(root);
+    expect(plans).toEqual([{ name: 'stray-file', action: 'skip', reason: 'not-a-directory' }]);
+  });
+
+  it('skips a plugin whose .nanoclaw-plugin.json denies codex', () => {
+    const dir = path.join(root, 'some-plugin');
+    fs.mkdirSync(dir, { recursive: true });
+    writeJson(path.join(dir, '.nanoclaw-plugin.json'), { denySiblings: ['codex'] });
+    writeJson(path.join(dir, '.codex-plugin', 'plugin.json'), { name: 'some-plugin' });
+    writeJson(path.join(dir, '.agents', 'plugins', 'marketplace.json'), { name: 'some-plugin' });
+
+    const plans = planCodexPluginRegistration(root);
+    expect(plans).toEqual([{ name: 'some-plugin', action: 'skip', reason: 'denied-for-codex' }]);
+  });
+
+  it('skips a plugin with no .codex-plugin/plugin.json (not Codex-registerable)', () => {
+    const dir = path.join(root, 'skill-only-plugin');
+    fs.mkdirSync(dir, { recursive: true });
+    writeJson(path.join(dir, '.agents', 'plugins', 'marketplace.json'), { name: 'skill-only-plugin' });
+
+    const plans = planCodexPluginRegistration(root);
+    expect(plans).toEqual([{ name: 'skill-only-plugin', action: 'skip', reason: 'no-codex-plugin-manifest' }]);
+  });
+
+  it('skips a plugin with no .agents/plugins/marketplace.json', () => {
+    const dir = path.join(root, 'no-marketplace-plugin');
+    fs.mkdirSync(dir, { recursive: true });
+    writeJson(path.join(dir, '.codex-plugin', 'plugin.json'), { name: 'no-marketplace-plugin' });
+
+    const plans = planCodexPluginRegistration(root);
+    expect(plans).toEqual([{ name: 'no-marketplace-plugin', action: 'skip', reason: 'no-marketplace-manifest' }]);
+  });
+
+  it('resolves entry name from plugin.json and marketplace name from marketplace.json — NOT the folder name', () => {
+    // Reproduces the real wix-in-~/plugins/skills shape: folder is "skills",
+    // but .codex-plugin/plugin.json name is "wix" and
+    // .agents/plugins/marketplace.json name is "skills". `codex plugin add`
+    // must be called as `wix@skills`, never `skills@skills`.
+    const dir = path.join(root, 'skills');
+    fs.mkdirSync(dir, { recursive: true });
+    writeJson(path.join(dir, '.codex-plugin', 'plugin.json'), { name: 'wix', version: '1.15.0' });
+    writeJson(path.join(dir, '.agents', 'plugins', 'marketplace.json'), {
+      name: 'skills',
+      plugins: [{ name: 'wix', source: { source: 'local', path: './' } }],
+    });
+
+    const plans = planCodexPluginRegistration(root);
+    expect(plans).toEqual([
+      { name: 'skills', action: 'register', entryName: 'wix', marketplaceName: 'skills' },
+    ]);
+  });
+
+  it('handles a mix of register + every skip reason across multiple entries', () => {
+    fs.writeFileSync(path.join(root, 'a-stray-file'), 'x');
+
+    const denied = path.join(root, 'denied-plugin');
+    fs.mkdirSync(denied, { recursive: true });
+    writeJson(path.join(denied, '.nanoclaw-plugin.json'), { denySiblings: ['codex'] });
+
+    const registerable = path.join(root, 'taste-skill');
+    fs.mkdirSync(registerable, { recursive: true });
+    writeJson(path.join(registerable, '.codex-plugin', 'plugin.json'), { name: 'taste-skill' });
+    writeJson(path.join(registerable, '.agents', 'plugins', 'marketplace.json'), { name: 'taste-skill' });
+
+    const plans = planCodexPluginRegistration(root);
+    const byName = new Map(plans.map((p) => [p.name, p]));
+    expect(byName.get('a-stray-file')).toEqual({ name: 'a-stray-file', action: 'skip', reason: 'not-a-directory' });
+    expect(byName.get('denied-plugin')).toEqual({ name: 'denied-plugin', action: 'skip', reason: 'denied-for-codex' });
+    expect(byName.get('taste-skill')).toEqual({
+      name: 'taste-skill',
+      action: 'register',
+      entryName: 'taste-skill',
+      marketplaceName: 'taste-skill',
+    });
+    expect(plans).toHaveLength(3);
   });
 });
 

@@ -184,7 +184,10 @@ async function main(): Promise<void> {
   // No-op when codex is the primary provider — its own writer handles
   // ~/.codex/config.toml at thread/start time.
   if (providerName !== 'codex') {
-    const codexHome = setupCodexRuntime(mcpServers);
+    // Pass the host runtime so the registration log names it accurately. Only the
+    // label varies — which plugins get registered is always codex's own set,
+    // since this CODEX_HOME is what the peer `codex` process reads.
+    const codexHome = setupCodexRuntime(mcpServers, providerName === 'opencode' ? 'opencode' : 'claude');
     if (codexHome) {
       process.env.CODEX_HOME = codexHome;
     }
