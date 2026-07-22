@@ -532,7 +532,17 @@ export function syncAgentSkillsMirror(runtime?: AgentRuntime): void {
     /* container skills dir missing */
   }
 
-  const pluginSkills = discoverPortableSkills(CONTAINER_PLUGINS_DIR, { runtime });
+  // Codex loads ~/plugins natively (marketplace + `~/.codex/plugins/cache`, which is
+  // symlinked into CODEX_HOME) — skills arrive namespaced `<plugin>:<skill>` WITH any
+  // MCP server the plugin declares. Mirroring them here too would double-list every
+  // skill unprefixed and MCP-less, which is exactly the duplication this mirror used to
+  // cause. So for codex the mirror carries ONLY container-bundled NanoClaw skills
+  // (agent-browser, welcome, …) — those are not plugins and have no native path.
+  //
+  // OpenCode has NO plugin loader at all, so the mirror remains its sole delivery for
+  // plugin skills. Per-plugin routing (.nanoclaw-plugin.json `denySiblings`) is applied
+  // inside discoverPortableSkills.
+  const pluginSkills = runtime === 'codex' ? [] : discoverPortableSkills(CONTAINER_PLUGINS_DIR, { runtime });
 
   // Plugin skills first (preferred source), then container-bundled —
   // first occurrence wins by name.
