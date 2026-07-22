@@ -17,6 +17,7 @@ import { registerSecretsFromEnv } from './secret-scrubber.js';
 import { getMessagingGroupByPlatform, updateMessagingGroup } from './db/messaging-groups.js';
 import { ensureContainerRuntimeRunning, cleanupOrphans } from './container-runtime.js';
 import { resetPhantomContainerStatus } from './db/sessions.js';
+import { resetProcessingChannelIngress } from './db/channel-ingress-receipts.js';
 import { stopAllContainers } from './container-runner.js';
 import {
   getDeliveryAdapter,
@@ -26,12 +27,21 @@ import {
   stopDeliveryPolls,
 } from './delivery.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
+import { stopStorageMaintenanceWorker } from './storage-maintenance-worker.js';
+import { resetStorageActivityState } from './storage-activity.js';
 import { startWorktreeCleanup, stopWorktreeCleanup } from './worktree-cleanup.js';
 import { startPluginUpdater, stopPluginUpdater } from './plugin-updater.js';
 import { startCommitScan, stopCommitScan } from './commit-scan.js';
 import { startDailySummary, stopDailySummary } from './daily-summary.js';
 import { restoreRemoteControl } from './remote-control.js';
 import { startDiscordSlashCommands, stopDiscordSlashCommands } from './channels/discord-slash-commands.js';
+import {
+  recoverChannelAdapter,
+  recoverAllChannelsAfterStartup,
+  StartupChannelIngressGate,
+  startChannelRecoveryMonitor,
+  stopChannelRecoveryMonitor,
+} from './channels/channel-recovery.js';
 import { routeInbound } from './router.js';
 import { log } from './log.js';
 import { startDashboard } from './dashboard/index.js';
@@ -139,6 +149,7 @@ async function main(): Promise<void> {
   const dbPath = path.join(DATA_DIR, 'v2.db');
   const db = initDb(dbPath);
   runMigrations(db);
+  resetProcessingChannelIngress();
 
   // Workgroup FS reconciliation — runs after migrations to drain the
   // _migration036_report temp table. On FS failure, exit; restart is the recovery
@@ -184,6 +195,7 @@ async function main(): Promise<void> {
   // 2. Container runtime
   ensureContainerRuntimeRunning();
   cleanupOrphans();
+  resetStorageActivityState();
 
   // 2a. Surface agent-runner deps drift at boot, not when an agent silently
   // stops responding. Non-fatal — the hard gate lives in spawnContainer, this
@@ -215,37 +227,56 @@ async function main(): Promise<void> {
   }
 
   // 3. Channel adapters
+  // Gateway READY can arrive while adapters are still initializing. Hold its
+  // recovery callback until every adapter identity, the sibling allow-list,
+  // and the delivery bridge are ready; the bridge serializes later Gateway
+  // packets behind this promise, so live traffic cannot overtake catch-up.
+  let releaseChannelRecoveryReady!: () => void;
+  const channelRecoveryReady = new Promise<void>((resolve) => {
+    releaseChannelRecoveryReady = resolve;
+  });
+  const startupIngress = new StartupChannelIngressGate();
   await initChannelAdapters((adapter: ChannelAdapter): ChannelSetup => {
     return {
       onInbound(platformId, threadId, message) {
-        routeInbound({
-          channelType: adapter.channelType,
-          // The one host-side stamping seam: adapters stay instance-blind,
-          // the host stamps the receiving instance on every inbound event.
-          instance: adapter.instance ?? adapter.channelType,
-          platformId,
-          threadId,
-          isDM: message.isDM,
-          message: {
-            id: message.id,
-            kind: message.kind,
-            content: JSON.stringify(message.content),
-            timestamp: message.timestamp,
-            isMention: message.isMention,
-            isGroup: message.isGroup,
-          },
-        }).catch((err) => {
-          log.error('Failed to route inbound message', { channelType: adapter.channelType, err });
-        });
+        return startupIngress.run(message.recovered === true, () =>
+          routeInbound({
+            channelType: adapter.channelType,
+            // The one host-side stamping seam: adapters stay instance-blind,
+            // the host stamps the receiving instance on every inbound event.
+            instance: adapter.instance ?? adapter.channelType,
+            platformId,
+            threadId,
+            isDM: message.isDM,
+            recovered: message.recovered,
+            message: {
+              id: message.id,
+              kind: message.kind,
+              content: JSON.stringify(message.content),
+              timestamp: message.timestamp,
+              isMention: message.isMention,
+              isGroup: message.isGroup,
+            },
+          }).catch((err) => {
+            log.error('Failed to route inbound message', { channelType: adapter.channelType, err });
+            throw err;
+          }),
+        );
       },
       onInboundEvent(event) {
-        routeInbound(event).catch((err) => {
-          log.error('Failed to route inbound event', {
-            sourceAdapter: adapter.channelType,
-            targetChannelType: event.channelType,
-            err,
-          });
-        });
+        return startupIngress.run(event.recovered === true, () =>
+          routeInbound(event).catch((err) => {
+            log.error('Failed to route inbound event', {
+              sourceAdapter: adapter.channelType,
+              targetChannelType: event.channelType,
+              err,
+            });
+            throw err;
+          }),
+        );
+      },
+      onConnectionRestored(info) {
+        return channelRecoveryReady.then(() => recoverChannelAdapter(adapter, info));
       },
       onMetadata(platformId, name, isGroup) {
         const mg = getMessagingGroupByPlatform(adapter.channelType, platformId);
@@ -282,7 +313,6 @@ async function main(): Promise<void> {
       },
     };
   });
-
   // Wire the access gate's sibling-bot allow-list now that channel adapters are
   // up and their known-bot registries are populated. A message authored by one
   // of our own bots (Axie, Axie-Codex, Axie-OpenCode, …) is then allowed to
@@ -322,6 +352,23 @@ async function main(): Promise<void> {
   // also carries our support-thread surfaces (deleteMessage/postParent/
   // createThread). See createChannelDeliveryAdapter in channel-registry.ts.
   setDeliveryAdapter(createChannelDeliveryAdapter());
+
+  // Start recovery only after permissions and delivery are fully wired. A
+  // replay can immediately exercise either surface (sibling bots, unknown
+  // sender/channel approval), so it must not race partial host startup.
+  releaseChannelRecoveryReady();
+  void recoverAllChannelsAfterStartup(Date.now() - 10 * 60 * 1000)
+    .catch((err) => {
+      // Per-adapter failures schedule their own retry; this is a coordinator
+      // guard so an unexpected aggregate failure cannot hold live ingress.
+      log.error('Initial channel recovery coordinator failed', { err });
+    })
+    .finally(() =>
+      startupIngress.open().then(() => {
+        log.info('Startup channel ingress released');
+      }),
+    );
+  startChannelRecoveryMonitor();
 
   // 5. Start delivery polls
   startActiveDeliveryPoll();
@@ -399,6 +446,14 @@ async function shutdown(signal: string): Promise<void> {
   }
   stopDeliveryPolls();
   stopHostSweep();
+  stopChannelRecoveryMonitor();
+  try {
+    await stopStorageMaintenanceWorker();
+  } catch (err) {
+    // Worker teardown failure must not prevent channel teardown and container
+    // reaping; those children otherwise linger until systemd's hard timeout.
+    log.error('Storage maintenance worker failed to stop cleanly', { err });
+  }
   stopWorktreeCleanup();
   stopPluginUpdater();
   stopCommitScan();

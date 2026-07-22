@@ -81,7 +81,9 @@ import {
   threadWorktreeDir,
   writeSessionRouting,
 } from './session-manager.js';
-import { assertStorageAdmission, resolveStoragePolicy } from './storage-manager.js';
+import { resolveStoragePolicy } from './storage-manager.js';
+import { assertStorageAdmissionInBackground } from './storage-maintenance-worker.js';
+import { acquireStorageActivityLease, type StorageActivityLease } from './storage-activity.js';
 import { handleStoragePressureAlert } from './storage-pressure-alert.js';
 import { MemoryAdmissionController, type MemoryAdmissionPriority } from './memory-admission.js';
 import type { AgentGroup, Session } from './types.js';
@@ -120,7 +122,15 @@ const DEFAULT_HAIKU_MODEL = 'claude-haiku-4-5-20251001';
 // in the claude provider; NANOCLAW_EFFORT_OVERRIDE is operator-override-only.)
 
 /** Active containers tracked by session ID. */
-const activeContainers = new Map<string, { process: ChildProcess; containerName: string; spawnedAt: number }>();
+const activeContainers = new Map<
+  string,
+  {
+    process: ChildProcess;
+    containerName: string;
+    spawnedAt: number;
+    storageActivity: StorageActivityLease;
+  }
+>();
 
 /**
  * Sticky set: every session id whose container has *ever* been observed
@@ -166,6 +176,7 @@ export function getContainerSpawnedAt(sessionId: string): number {
  * racy double-replies.
  */
 const wakePromises = new Map<string, Promise<boolean>>();
+const spawningSessions = new Set<string>();
 
 let memoryAdmission: MemoryAdmissionController<Session> | null = null;
 let containerShutdownInProgress = false;
@@ -225,6 +236,11 @@ export function getActiveContainerCount(): number {
 
 export function isContainerRunning(sessionId: string): boolean {
   return activeContainers.has(sessionId);
+}
+
+/** Snapshot passed to isolated maintenance workers; never expose the mutable map. */
+export function getActiveContainerSessionIds(): string[] {
+  return [...activeContainers.keys()];
 }
 
 // ── Workgroup reconciler ────────────────────────────────────────────────────
@@ -322,99 +338,131 @@ export function wakeContainer(session: Session, priority: MemoryAdmissionPriorit
     return existing;
   }
 
-  const storageAdmission = assertStorageAdmission({ isContainerRunning });
-  if (!storageAdmission.allowed) {
-    log.warn('Container wake deferred — disk usage remains above storage admission threshold', {
-      sessionId: session.id,
-      reason: storageAdmission.reason,
-      usagePct:
-        storageAdmission.report.filesystem.after?.usagePct ?? storageAdmission.report.filesystem.before?.usagePct,
-      admissionRefusePct: storageAdmission.report.policy.admissionRefusePct,
-      estimatedReclaimableMb: Math.round(storageAdmission.report.estimatedReclaimableBytes / 1024 / 1024),
-      actualReclaimedMb: Math.round(storageAdmission.report.filesystem.actualReclaimedBytes / 1024 / 1024),
-      actions: storageAdmission.report.actions.length,
-      failedActions: storageAdmission.report.actions.filter((a) => a.status === 'failed').length,
-    });
-    void handleStoragePressureAlert(storageAdmission.report).catch((err) =>
-      log.warn('storage-manager: admission pressure alert failed', { err }),
-    );
-    return Promise.resolve(false);
-  }
+  return trackWake(session.id, async () => {
+    if (!(await checkStorageAdmission(session, false))) return false;
 
-  const admission = getMemoryAdmission();
-  const agentGroup = getAgentGroup(session.agent_group_id);
-  if (!agentGroup) {
-    log.error('Container wake rejected — agent group not found', {
-      sessionId: session.id,
-      agentGroupId: session.agent_group_id,
-    });
-    return Promise.resolve(false);
-  }
-  let effectiveResources;
-  try {
-    effectiveResources = resolveContainerResources(readContainerConfig(agentGroup.folder).resources);
-  } catch (err) {
-    log.error('Container wake rejected — invalid resource configuration', {
-      sessionId: session.id,
-      agentGroup: agentGroup.folder,
-      err,
-    });
-    return Promise.resolve(false);
-  }
+    const admission = getMemoryAdmission();
+    const agentGroup = getAgentGroup(session.agent_group_id);
+    if (!agentGroup) {
+      log.error('Container wake rejected — agent group not found', {
+        sessionId: session.id,
+        agentGroupId: session.agent_group_id,
+      });
+      return false;
+    }
+    let effectiveResources;
+    try {
+      effectiveResources = resolveContainerResources(readContainerConfig(agentGroup.folder).resources);
+    } catch (err) {
+      log.error('Container wake rejected — invalid resource configuration', {
+        sessionId: session.id,
+        agentGroup: agentGroup.folder,
+        err,
+      });
+      return false;
+    }
 
-  // Priority is part of the atomic admission decision. A task-only wake must
-  // never enter as interactive and be demoted afterward: it could otherwise
-  // reserve free memory and bypass an older scheduled head before demotion.
-  // Re-requesting an already queued session updates its class and returns the
-  // real admission/spawn outcome to the caller.
-  const decision = admission.request(session.id, effectiveResources.memory.requestMb, session, priority);
-  if (decision.status === 'rejected') {
-    log.error('Container wake rejected — memory request exceeds host budget', {
-      sessionId: session.id,
-      agentGroup: agentGroup.folder,
-      requestMb: decision.requestMb,
-      budgetMb: decision.budgetMb,
-    });
-    return Promise.resolve(false);
-  }
-  if (decision.status === 'queued') {
-    log.warn('Container wake queued — memory budget exhausted', {
-      sessionId: session.id,
-      agentGroup: agentGroup.folder,
-      requestMb: decision.requestMb,
-      budgetMb: decision.budgetMb,
-      reservedMb: admission.reservedMb,
-      position: decision.position,
-      priority,
-    });
-    return Promise.resolve(false);
-  }
+    // Priority is part of the atomic admission decision. A task-only wake must
+    // never enter as interactive and be demoted afterward: it could otherwise
+    // reserve free memory and bypass an older scheduled head before demotion.
+    const decision = admission.request(session.id, effectiveResources.memory.requestMb, session, priority);
+    if (decision.status === 'rejected') {
+      log.error('Container wake rejected — memory request exceeds host budget', {
+        sessionId: session.id,
+        agentGroup: agentGroup.folder,
+        requestMb: decision.requestMb,
+        budgetMb: decision.budgetMb,
+      });
+      return false;
+    }
+    if (decision.status === 'queued') {
+      log.warn('Container wake queued — memory budget exhausted', {
+        sessionId: session.id,
+        agentGroup: agentGroup.folder,
+        requestMb: decision.requestMb,
+        budgetMb: decision.budgetMb,
+        reservedMb: admission.reservedMb,
+        position: decision.position,
+        priority,
+      });
+      return false;
+    }
 
-  return startReservedWake(session, true);
+    return spawnReservedContainer(session);
+  });
 }
 
-function startReservedWake(session: Session, storageAlreadyChecked = false): Promise<boolean> {
+function startReservedWake(session: Session): Promise<boolean> {
   if (activeContainers.has(session.id)) return Promise.resolve(true);
   const existing = wakePromises.get(session.id);
   if (existing) return existing;
 
-  if (!storageAlreadyChecked) {
-    const storageAdmission = assertStorageAdmission({ isContainerRunning });
-    if (!storageAdmission.allowed) {
-      log.warn('Queued container wake deferred — disk usage remains above storage admission threshold', {
+  return trackWake(session.id, async () => {
+    if (!(await checkStorageAdmission(session, true))) {
+      releaseMemoryReservation(session.id);
+      return false;
+    }
+    return spawnReservedContainer(session);
+  });
+}
+
+function trackWake(sessionId: string, run: () => Promise<boolean>): Promise<boolean> {
+  const tracked = run()
+    .catch((err) => {
+      log.warn('wakeContainer failed — host-sweep will retry', { sessionId, err });
+      return false;
+    })
+    .finally(() => {
+      if (wakePromises.get(sessionId) === tracked) wakePromises.delete(sessionId);
+    });
+  wakePromises.set(sessionId, tracked);
+  return tracked;
+}
+
+async function checkStorageAdmission(session: Session, queued: boolean): Promise<boolean> {
+  try {
+    const storageAdmission = await assertStorageAdmissionInBackground(getActiveContainerSessionIds());
+    if (storageAdmission.allowed) return true;
+    log.warn(
+      queued
+        ? 'Queued container wake deferred — disk usage remains above storage admission threshold'
+        : 'Container wake deferred — disk usage remains above storage admission threshold',
+      {
         sessionId: session.id,
         reason: storageAdmission.reason,
-      });
-      void handleStoragePressureAlert(storageAdmission.report).catch((err) =>
-        log.warn('storage-manager: queued admission pressure alert failed', { err }),
-      );
-      releaseMemoryReservation(session.id);
-      return Promise.resolve(false);
-    }
+        usagePct:
+          storageAdmission.report.filesystem.after?.usagePct ?? storageAdmission.report.filesystem.before?.usagePct,
+        admissionRefusePct: storageAdmission.report.policy.admissionRefusePct,
+        estimatedReclaimableMb: Math.round(storageAdmission.report.estimatedReclaimableBytes / 1024 / 1024),
+        actualReclaimedMb: Math.round(storageAdmission.report.filesystem.actualReclaimedBytes / 1024 / 1024),
+        actions: storageAdmission.report.actions.length,
+        failedActions: storageAdmission.report.actions.filter((a) => a.status === 'failed').length,
+      },
+    );
+    void handleStoragePressureAlert(storageAdmission.report).catch((err) =>
+      log.warn('storage-manager: admission pressure alert failed', { err }),
+    );
+    return false;
+  } catch (err) {
+    // Fail closed: if pressure cannot be checked, leave the inbound row pending
+    // for the next sweep instead of spawning into potentially exhausted disk.
+    log.warn('Container wake deferred — background storage admission failed', {
+      sessionId: session.id,
+      queued,
+      err,
+    });
+    return false;
   }
+}
 
+async function spawnReservedContainer(session: Session): Promise<boolean> {
+  if (containerShutdownInProgress) return false;
   const activeCount = activeContainers.size;
-  const inFlightWakes = wakePromises.size;
+  // Storage-admission promises are tracked for dedupe but are not consuming a
+  // container slot. Count spawning sessions only until their process enters
+  // activeContainers; the brief async handoff must not double-count one
+  // process and incorrectly reject another wake at the cap.
+  const inFlightWakes = [...spawningSessions].filter((sessionId) => !activeContainers.has(sessionId)).length;
   if (MAX_CONCURRENT_CONTAINERS > 0 && activeCount + inFlightWakes >= MAX_CONCURRENT_CONTAINERS) {
     log.warn('Container wake deferred — concurrency cap reached', {
       sessionId: session.id,
@@ -423,24 +471,54 @@ function startReservedWake(session: Session, storageAlreadyChecked = false): Pro
       maxConcurrentContainers: MAX_CONCURRENT_CONTAINERS,
     });
     releaseMemoryReservation(session.id);
-    return Promise.resolve(false);
+    return false;
   }
 
-  const promise = spawnContainer(session)
-    .then(() => true)
-    .catch((err) => {
-      log.warn('wakeContainer failed — host-sweep will retry', { sessionId: session.id, err });
-      releaseMemoryReservation(session.id);
-      return false;
-    })
-    .finally(() => {
-      wakePromises.delete(session.id);
-    });
-  wakePromises.set(session.id, promise);
-  return promise;
+  spawningSessions.add(session.id);
+  let storageActivity: StorageActivityLease | null = null;
+  try {
+    storageActivity = await acquireContainerStorageActivity(session);
+    await spawnContainer(session, storageActivity);
+    storageActivity = null; // activeContainers owns it until process exit
+    return true;
+  } catch (err) {
+    log.warn('wakeContainer failed — host-sweep will retry', { sessionId: session.id, err });
+    releaseMemoryReservation(session.id);
+    return false;
+  } finally {
+    if (storageActivity) await storageActivity.release();
+    spawningSessions.delete(session.id);
+  }
 }
 
-async function spawnContainer(session: Session): Promise<void> {
+async function acquireContainerStorageActivity(session: Session): Promise<StorageActivityLease> {
+  const roots = new Set<string>([sessionDir(session.agent_group_id, session.id)]);
+  if (session.messaging_group_id && process.env.NANOCLAW_THREAD_WORKTREES === '1') {
+    const mg = getMessagingGroup(session.messaging_group_id);
+    if (mg) roots.add(threadWorktreeDir(mg.platform_id, session.thread_id));
+  }
+
+  const leases: StorageActivityLease[] = [];
+  try {
+    for (const root of [...roots].sort()) {
+      leases.push(await acquireStorageActivityLease(root, session.id));
+    }
+  } catch (err) {
+    await Promise.allSettled(leases.map((lease) => lease.release()));
+    throw err;
+  }
+
+  let released = false;
+  return {
+    async release() {
+      if (released) return;
+      released = true;
+      await Promise.all(leases.map((lease) => lease.release()));
+    },
+  };
+}
+
+async function spawnContainer(session: Session, storageActivity: StorageActivityLease): Promise<void> {
   const agentGroup = getAgentGroup(session.agent_group_id);
   if (!agentGroup) {
     throw new Error(`Agent group not found: ${session.agent_group_id}`);
@@ -561,9 +639,20 @@ async function spawnContainer(session: Session): Promise<void> {
   // immediate kill before the new container touches the file itself.
   fs.rmSync(heartbeatPath(agentGroup.id, session.id), { force: true });
 
+  // Admission and container preparation are asynchronous. Shutdown may begin
+  // after wakeContainer's entry check but before the process exists; refuse
+  // that late spawn so stopAllContainers cannot miss it in its snapshot.
+  if (containerShutdownInProgress) {
+    throw new Error('Container spawn cancelled because host shutdown is in progress');
+  }
   const container = spawn(CONTAINER_RUNTIME_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
-  activeContainers.set(session.id, { process: container, containerName, spawnedAt: Date.now() });
+  activeContainers.set(session.id, {
+    process: container,
+    containerName,
+    spawnedAt: Date.now(),
+    storageActivity,
+  });
   everSeenRunningSessions.add(session.id);
   markContainerRunning(session.id);
 
@@ -588,11 +677,33 @@ async function spawnContainer(session: Session): Promise<void> {
   // (see src/host-sweep.ts). This avoids killing long-running legitimate work
   // on a wall-clock timer.
 
+  let finalized = false;
+  const finalizeContainer = (): void => {
+    if (finalized) return;
+    finalized = true;
+
+    const active = activeContainers.get(session.id);
+    // ChildProcess emits `close` after `error`. Finalize this exact process
+    // only once, and never let a late event delete or release a replacement
+    // container that was spawned for the same session in the meantime.
+    if (active?.process === container) {
+      activeContainers.delete(session.id);
+      void active.storageActivity.release().catch((err) => {
+        log.warn('Failed to release container storage activity lease', { sessionId: session.id, err });
+      });
+      releaseMemoryReservation(session.id);
+      markContainerStopped(session.id);
+      stopTypingRefresh(session.id);
+      return;
+    }
+
+    void storageActivity.release().catch((err) => {
+      log.warn('Failed to release untracked container storage activity lease', { sessionId: session.id, err });
+    });
+  };
+
   container.on('close', (code) => {
-    activeContainers.delete(session.id);
-    releaseMemoryReservation(session.id);
-    markContainerStopped(session.id);
-    stopTypingRefresh(session.id);
+    finalizeContainer();
     // code null = killed by signal (normal shutdown path), not a boot failure.
     if (code === 137) {
       log.warn('Container exited 137 — likely OOM kill or forced SIGKILL', {
@@ -610,10 +721,7 @@ async function spawnContainer(session: Session): Promise<void> {
   });
 
   container.on('error', (err) => {
-    activeContainers.delete(session.id);
-    releaseMemoryReservation(session.id);
-    markContainerStopped(session.id);
-    stopTypingRefresh(session.id);
+    finalizeContainer();
     log.error('Container spawn error', { sessionId: session.id, err });
   });
 }

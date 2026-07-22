@@ -8,15 +8,14 @@
  *   1. Gather all existing agent groups.
  *   2. Pick an eligible approver (owner / admin) and a reachable DM for
  *      them, reusing the same primitives the sender-approval flow uses.
- *   3. Deliver a card with three action families:
+ *   3. Record a `pending_channel_approvals` row holding the original event
+ *      so it can be re-routed on connect/create.
+ *   4. Deliver a card with three action families:
  *        a. Connect to [agent] — one button per existing agent group.
  *           Single-agent installs get a one-click connect.
  *        b. Connect new agent — prompts for a free-text name, creates
  *           the agent immediately on reply.
  *        c. Reject — deny the channel.
- *   4. Record a `pending_channel_approvals` row holding the original event
- *      so it can be re-routed on connect/create.
- *
  * On connect (handler in index.ts):
  *   - Create `messaging_group_agents` with the channel's declared engage
  *     defaults (resolveWiringDefaults, DM vs group context;
@@ -35,14 +34,16 @@
  *     escalating on this channel until an admin explicitly re-wires
  *   - Delete the pending row
  *
- * Dedup: `pending_channel_approvals` PK on messaging_group_id. Second
- * mention while pending silently dropped.
+ * Dedup: `pending_channel_approvals` PK on messaging_group_id. A replay of
+ * the retained event remains deferred; a later mention while pending is an
+ * ordinary completed drop and never replaces the event awaiting approval.
  *
  * Failure modes (log + no row, so a future attempt can try again):
  *   - No agent groups exist (install never set up a first agent).
  *   - No eligible approver in user_roles (no owner yet).
  *   - Approver has no reachable DM.
- *   - Delivery adapter missing.
+ * Once the row exists, delivery failures leave it available for dashboard or
+ * manual review; only failures before persistence return without a row.
  */
 import { normalizeOptions, type NormalizedOption, type RawOption } from '../../channels/ask-question.js';
 import { resolveWiringDefaults } from '../../channels/channel-defaults.js';
@@ -55,7 +56,11 @@ import { log } from '../../log.js';
 import type { InboundEvent } from '../../channels/adapter.js';
 import type { AgentGroup } from '../../types.js';
 import { pickApprovalDelivery, pickApprover } from '../approvals/primitive.js';
-import { createPendingChannelApproval, hasInFlightChannelApproval } from './db/pending-channel-approvals.js';
+import {
+  createPendingChannelApproval,
+  getPendingChannelApproval,
+  hasInFlightChannelApproval,
+} from './db/pending-channel-approvals.js';
 import { hasAdminPrivilege } from './db/user-roles.js';
 
 // ── Value constants (response handler in index.ts parses these) ──
@@ -164,12 +169,28 @@ export interface RequestChannelApprovalInput {
   event: InboundEvent;
 }
 
-export async function requestChannelApproval(input: RequestChannelApprovalInput): Promise<void> {
+function isSameInboundEvent(raw: string, event: InboundEvent): boolean {
+  try {
+    const stored = JSON.parse(raw) as InboundEvent;
+    return (
+      stored.channelType === event.channelType &&
+      (stored.instance ?? stored.channelType) === (event.instance ?? event.channelType) &&
+      stored.platformId === event.platformId &&
+      stored.message.id === event.message.id
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** True only when this exact event is the one retained for later replay. */
+export async function requestChannelApproval(input: RequestChannelApprovalInput): Promise<boolean> {
   const { messagingGroupId, event } = input;
 
   if (hasInFlightChannelApproval(messagingGroupId)) {
     log.debug('Channel registration already in flight — dropping retry', { messagingGroupId });
-    return;
+    const existing = getPendingChannelApproval(messagingGroupId);
+    return existing ? isSameInboundEvent(existing.original_message, event) : false;
   }
 
   const agentGroups = getAllAgentGroups();
@@ -177,7 +198,7 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
     log.warn('Channel registration skipped — no agent groups configured. Run /init-first-agent.', {
       messagingGroupId,
     });
-    return;
+    return false;
   }
   // Use first agent group for approver resolution — owners and global admins
   // are returned regardless of which group we pass.
@@ -189,7 +210,7 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
       messagingGroupId,
       targetAgentGroupId: referenceGroup.id,
     });
-    return;
+    return false;
   }
 
   const originMg = getMessagingGroup(messagingGroupId);
@@ -226,7 +247,7 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
       targetAgentGroupId: referenceGroup.id,
       approverCount: approvers.length,
     });
-    return;
+    return false;
   }
 
   const isGroup = event.message?.isGroup ?? originMg?.is_group === 1;
@@ -253,7 +274,7 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
   const question = buildQuestionText(isGroup, senderName, channelName, originChannelType, ruleNote);
   const options = normalizeOptions(buildApprovalOptions(agentGroups, delivery.userId));
 
-  createPendingChannelApproval({
+  const created = createPendingChannelApproval({
     messaging_group_id: messagingGroupId,
     agent_group_id: referenceGroup.id,
     original_message: JSON.stringify(event),
@@ -262,11 +283,15 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
     title,
     options_json: JSON.stringify(options),
   });
+  if (!created) {
+    const raced = getPendingChannelApproval(messagingGroupId);
+    return raced ? isSameInboundEvent(raced.original_message, event) : false;
+  }
 
   const adapter = getDeliveryAdapter();
   if (!adapter) {
     log.error('Channel registration row created but no delivery adapter is wired', { messagingGroupId });
-    return;
+    return true;
   }
 
   try {
@@ -291,6 +316,7 @@ export async function requestChannelApproval(input: RequestChannelApprovalInput)
   } catch (err) {
     log.error('Channel registration card delivery failed', { messagingGroupId, err });
   }
+  return true;
 }
 
 // ── Helpers for the response handler (index.ts) ──

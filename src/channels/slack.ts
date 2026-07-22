@@ -32,6 +32,7 @@ import { readEnvFileMatching } from '../env.js';
 import { log } from '../log.js';
 import { markdownHeadingsToBold } from '../text-styles.js';
 import { createChatSdkBridge } from './chat-sdk-bridge.js';
+import type { ChannelRecoveryRequest, ChannelRecoveryTarget } from './adapter.js';
 import { registerChannelAdapter } from './channel-registry.js';
 import {
   fetchSlackBotIdentity,
@@ -44,6 +45,105 @@ export interface SlackWorkspace {
   channelType: string;
   botToken: string;
   signingSecret: string;
+}
+
+interface SlackRecoveryMessage {
+  ts?: string;
+  thread_ts?: string;
+  reply_count?: number;
+  latest_reply?: string;
+}
+
+type SlackRecoveryAdapter = ReturnType<typeof createSlackAdapter> & {
+  parseSlackMessage(raw: unknown, encodedThreadId: string): Promise<import('chat').Message>;
+};
+
+export function makeSlackRecoveryPageFetcher(slackAdapter: ReturnType<typeof createSlackAdapter>, client: WebClient) {
+  return async (
+    threadId: string,
+    options: { limit: number; direction: 'backward'; cursor?: string; since: string },
+  ) => {
+    const parts = threadId.split(':');
+    const channel = parts[1];
+    const threadTs = parts[2] ?? '';
+    const oldest = String(Date.parse(options.since) / 1000);
+    const response = threadTs
+      ? await client.conversations.replies({
+          channel,
+          ts: threadTs,
+          limit: options.limit,
+          cursor: options.cursor,
+          oldest,
+        })
+      : await client.conversations.history({
+          channel,
+          limit: options.limit,
+          cursor: options.cursor,
+          oldest,
+        });
+    const parseSlackMessage = (slackAdapter as SlackRecoveryAdapter).parseSlackMessage;
+    const messages = await Promise.all(
+      (response.messages ?? []).map((raw) => {
+        const slackMessage = raw as SlackRecoveryMessage;
+        const nativeThreadTs = threadTs
+          ? threadTs
+          : channel.startsWith('D')
+            ? (slackMessage.thread_ts ?? '')
+            : (slackMessage.thread_ts ?? slackMessage.ts ?? '');
+        return parseSlackMessage.call(slackAdapter, raw, `slack:${channel}:${nativeThreadTs}`);
+      }),
+    );
+    messages.sort((a, b) => a.metadata.dateSent.getTime() - b.metadata.dateSent.getTime());
+    return { messages, nextCursor: response.response_metadata?.next_cursor || undefined };
+  };
+}
+
+/** Find threads created or updated during the gap before they have a session. */
+export async function discoverSlackRecoveryTargets(
+  client: WebClient,
+  request: ChannelRecoveryRequest,
+): Promise<{ targets: ChannelRecoveryTarget[]; complete: boolean }> {
+  const sinceMs = Date.parse(request.since);
+  const targets: ChannelRecoveryTarget[] = [];
+  let complete = true;
+
+  for (const root of request.targets) {
+    if (root.threadId !== null) continue;
+    const channel = root.platformId.split(':')[1];
+    if (!channel) continue;
+    let cursor: string | undefined;
+    let coveredBoundary = false;
+    const seenCursors = new Set<string>();
+    for (;;) {
+      const response = await client.conversations.history({ channel, limit: 100, cursor });
+      const messages = (response.messages ?? []) as SlackRecoveryMessage[];
+      for (const message of messages) {
+        const rootTs = message.ts ?? '';
+        const rootMs = Number(rootTs) * 1000;
+        const latestReplyMs = Number(message.latest_reply) * 1000;
+        const hasGapReply = (message.reply_count ?? 0) > 0 && Number.isFinite(latestReplyMs) && latestReplyMs > sinceMs;
+        const createdInGap = Number.isFinite(rootMs) && rootMs > sinceMs;
+        if ((hasGapReply || createdInGap) && rootTs) {
+          targets.push({ platformId: root.platformId, threadId: `slack:${channel}:${rootTs}`, isDM: root.isDM });
+        }
+      }
+      const nextCursor = response.response_metadata?.next_cursor || undefined;
+      // Slack has no thread-activity index: an old channel or DM root can
+      // receive its first reply during the gap. Cover the conversation's full
+      // root history so those threads are discoverable, not just roots newer
+      // than `since`.
+      if (!nextCursor) {
+        coveredBoundary = true;
+        break;
+      }
+      if (seenCursors.has(nextCursor)) break;
+      seenCursors.add(nextCursor);
+      cursor = nextCursor;
+    }
+    if (!coveredBoundary) complete = false;
+  }
+
+  return { targets, complete };
 }
 
 /**
@@ -209,6 +309,13 @@ for (const ws of workspaces) {
         // so order is independent for correctness but consistent for
         // intent.
         transformOutboundMarkdown: (text) => markdownHeadingsToBold(resolveSlackMentions(text, ws.channelType)),
+        detectRecoveredMention: (message) => {
+          if (!identity) return false;
+          const raw = message.raw as { text?: string } | undefined;
+          return raw?.text?.includes(`<@${identity.userId}>`) === true;
+        },
+        fetchRecoveryPage: makeSlackRecoveryPageFetcher(slackAdapter, client),
+        discoverRecoveryTargets: (request) => discoverSlackRecoveryTargets(client, request),
       });
       bridge.postParent = (platformId, text) => slackPostParent(client, platformId, text);
       bridge.createThread = (platformId, parentMessageId, title, firstMessage) =>

@@ -10,10 +10,76 @@ import {
   rewriteDiscordLinks,
   discordPostParent,
   discordCreateThread,
+  discoverDiscordRecoveryTargets,
   extractDiscordChannelId,
   type DiscordBotIdentity,
   type DiscordRestClient,
 } from './discord.js';
+
+describe('Discord recovery target discovery', () => {
+  it('adds a newly-created active thread even when no session exists yet', async () => {
+    const get = vi
+      .fn()
+      .mockResolvedValueOnce({ threads: [{ id: 'thread-new', parent_id: 'channel-1' }] })
+      .mockResolvedValueOnce({ threads: [], has_more: false })
+      .mockResolvedValueOnce({ threads: [], has_more: false });
+
+    const result = await discoverDiscordRecoveryTargets({ get } as never, {
+      since: '2026-07-21T18:16:00Z',
+      reason: 'transport-ready',
+      targets: [{ platformId: 'discord:guild-1:channel-1', threadId: null, isDM: false }],
+    });
+
+    expect(result).toEqual({
+      targets: [
+        {
+          platformId: 'discord:guild-1:channel-1',
+          threadId: 'discord:guild-1:channel-1:thread-new',
+          isDM: false,
+        },
+      ],
+      complete: true,
+    });
+  });
+
+  it('paginates joined private archives with thread snowflakes and exhausts the id-ordered endpoint', async () => {
+    const get = vi
+      .fn()
+      .mockResolvedValueOnce({ threads: [] })
+      .mockResolvedValueOnce({ threads: [] })
+      .mockResolvedValueOnce({
+        threads: [
+          {
+            id: '900',
+            parent_id: 'channel-1',
+            thread_metadata: { archive_timestamp: '2020-01-01T00:00:00Z' },
+          },
+        ],
+        has_more: true,
+      })
+      .mockResolvedValueOnce({
+        threads: [{ id: '800', parent_id: 'channel-1' }],
+        has_more: false,
+      });
+
+    const result = await discoverDiscordRecoveryTargets({ get } as never, {
+      since: '2026-07-21T18:16:00Z',
+      reason: 'host-startup',
+      targets: [{ platformId: 'discord:guild-1:channel-1', threadId: null, isDM: false }],
+    });
+
+    expect(get).toHaveBeenNthCalledWith(
+      4,
+      expect.any(String),
+      expect.objectContaining({ query: new URLSearchParams({ limit: '100', before: '900' }) }),
+    );
+    expect(result.complete).toBe(true);
+    expect(result.targets.map((target) => target.threadId)).toEqual([
+      'discord:guild-1:channel-1:900',
+      'discord:guild-1:channel-1:800',
+    ]);
+  });
+});
 
 describe('resolveDiscordMentions', () => {
   const bots = new Map<string, DiscordBotIdentity>([

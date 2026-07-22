@@ -37,6 +37,7 @@ import {
   openOutboundDbRw as openOutboundDbRwRaw,
   upsertSessionRouting,
   insertMessage,
+  insertMessageIfNew,
   migrateMessagesInTable,
 } from './db/session-db.js';
 import { log } from './log.js';
@@ -431,39 +432,70 @@ export function writeSessionRouting(agentGroupId: string, sessionId: string): vo
  * long-lived connection — see the "Cross-mount visibility invariants" note
  * at the top of this file.
  */
+export interface SessionMessageInput {
+  id: string;
+  kind: string;
+  timestamp: string;
+  platformId?: string | null;
+  channelType?: string | null;
+  threadId?: string | null;
+  content: string;
+  processAfter?: string | null;
+  recurrence?: string | null;
+  /**
+   * 1 = this message should wake the agent (the default); 0 = accumulate
+   * as context only, don't wake. Host's countDueMessages gates on this
+   * column; the container still reads all prior messages as context when
+   * a trigger-1 message does arrive.
+   */
+  trigger?: 0 | 1;
+  /**
+   * For agent-to-agent inbound: the source session id that emitted the
+   * outbound message which became this inbound row. Used as the return
+   * path so the target's reply routes back to that exact session.
+   */
+  sourceSessionId?: string | null;
+  /**
+   * 1 = only deliver on the container's first poll (fresh start).
+   * Dying containers (past first poll) skip these rows.
+   */
+  onWake?: 0 | 1;
+}
+
+/** Read-only replay guard used before router side effects. */
+export function sessionMessageExists(agentGroupId: string, sessionId: string, messageId: string): boolean {
+  if (!fs.existsSync(inboundDbPath(agentGroupId, sessionId))) return false;
+  const db = openInboundDb(agentGroupId, sessionId);
+  try {
+    return db.prepare('SELECT 1 FROM messages_in WHERE id = ? LIMIT 1').get(messageId) !== undefined;
+  } finally {
+    db.close();
+  }
+}
+
 export async function writeSessionMessage(
   agentGroupId: string,
   sessionId: string,
-  message: {
-    id: string;
-    kind: string;
-    timestamp: string;
-    platformId?: string | null;
-    channelType?: string | null;
-    threadId?: string | null;
-    content: string;
-    processAfter?: string | null;
-    recurrence?: string | null;
-    /**
-     * 1 = this message should wake the agent (the default); 0 = accumulate
-     * as context only, don't wake. Host's countDueMessages gates on this
-     * column; the container still reads all prior messages as context when
-     * a trigger-1 message does arrive.
-     */
-    trigger?: 0 | 1;
-    /**
-     * For agent-to-agent inbound: the source session id that emitted the
-     * outbound message which became this inbound row. Used as the return
-     * path so the target's reply routes back to that exact session.
-     */
-    sourceSessionId?: string | null;
-    /**
-     * 1 = only deliver on the container's first poll (fresh start).
-     * Dying containers (past first poll) skip these rows.
-     */
-    onWake?: 0 | 1;
-  },
+  message: SessionMessageInput,
 ): Promise<void> {
+  await writeSessionMessageInternal(agentGroupId, sessionId, message, false);
+}
+
+/** Idempotent channel-ingress variant; false means this platform id was already routed. */
+export async function writeSessionMessageIfNew(
+  agentGroupId: string,
+  sessionId: string,
+  message: SessionMessageInput,
+): Promise<boolean> {
+  return writeSessionMessageInternal(agentGroupId, sessionId, message, true);
+}
+
+async function writeSessionMessageInternal(
+  agentGroupId: string,
+  sessionId: string,
+  message: SessionMessageInput,
+  ignoreDuplicateId: boolean,
+): Promise<boolean> {
   // Documented reset: operators `rm -rf` a session folder to clear a stuck
   // session. The sessions row survives, so the next message takes the
   // existing-session path and lands here with a missing inbound.db — the open
@@ -478,8 +510,9 @@ export async function writeSessionMessage(
   const content = extractAttachmentFiles(agentGroupId, sessionId, message.id, message.content);
 
   const db = openInboundDb(agentGroupId, sessionId);
+  let inserted: boolean;
   try {
-    insertMessage(db, {
+    const row = {
       id: message.id,
       kind: message.kind,
       timestamp: message.timestamp,
@@ -492,9 +525,20 @@ export async function writeSessionMessage(
       trigger: message.trigger ?? 1,
       sourceSessionId: message.sourceSessionId ?? null,
       onWake: message.onWake ?? 0,
-    });
+    };
+    if (ignoreDuplicateId) {
+      inserted = insertMessageIfNew(db, row);
+    } else {
+      insertMessage(db, row);
+      inserted = true;
+    }
   } finally {
     db.close();
+  }
+
+  if (!inserted) {
+    log.debug('Duplicate inbound message ignored', { agentGroupId, sessionId, messageId: message.id });
+    return false;
   }
 
   updateSession(sessionId, { last_active: new Date().toISOString() });
@@ -514,6 +558,7 @@ export async function writeSessionMessage(
     .catch(() => {
       /* dashboard module not initialized — tests + early boot */
     });
+  return true;
 }
 
 /**
@@ -585,21 +630,49 @@ function extractAttachmentFiles(
     if (!inboxDir) break;
 
     const filePath = path.join(inboxDir, filename);
+    const attachmentBytes = Buffer.from(att.data as string, 'base64');
     try {
       // wx = exclusive create. Refuses to follow a pre existing symlink or
       // overwrite any existing file. The host expects to be the sole writer
       // of these attachments.
-      fs.writeFileSync(filePath, Buffer.from(att.data as string, 'base64'), { flag: 'wx' });
+      fs.writeFileSync(filePath, attachmentBytes, { flag: 'wx' });
     } catch (err: unknown) {
       const e = err as NodeJS.ErrnoException;
       if (e.code === 'EEXIST') {
-        log.warn('Inbox attachment target already exists, refusing to overwrite', {
-          messageId,
-          filename,
-        });
-        continue;
+        // A host crash can land after the exclusive file write but before the
+        // messages_in insert. Accept only an identical, regular file inside
+        // the already-validated inbox directory so the exact platform replay
+        // can finish without weakening the symlink/overwrite defenses.
+        try {
+          const existing = fs.lstatSync(filePath);
+          const realFile = fs.realpathSync(filePath);
+          if (
+            existing.isFile() &&
+            !existing.isSymbolicLink() &&
+            isPathInside(inboxDir, realFile) &&
+            fs.readFileSync(realFile).equals(attachmentBytes)
+          ) {
+            log.debug('Reusing identical inbox attachment from interrupted ingress', {
+              messageId,
+              filename,
+            });
+          } else {
+            log.warn('Inbox attachment target already exists, refusing to overwrite', {
+              messageId,
+              filename,
+            });
+            continue;
+          }
+        } catch {
+          log.warn('Inbox attachment target could not be verified, refusing to reuse', {
+            messageId,
+            filename,
+          });
+          continue;
+        }
+      } else {
+        throw err;
       }
-      throw err;
     }
 
     att.name = filename;

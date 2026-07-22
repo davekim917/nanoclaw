@@ -182,15 +182,25 @@ describe('unknown-sender request_approval flow', () => {
 
   it('dedups a second message from the same stranger while pending', async () => {
     const { routeInbound } = await import('../../router.js');
-    await routeInbound(stranger('hello'));
+    const first = stranger('hello');
+    const second = stranger('are you there?');
+    await routeInbound(first);
     await new Promise((r) => setTimeout(r, 10));
-    await routeInbound(stranger('are you there?'));
+    await routeInbound(second);
     await new Promise((r) => setTimeout(r, 10));
 
     expect(deliverMock).toHaveBeenCalledTimes(1);
     const { getDb } = await import('../../db/connection.js');
     const count = (getDb().prepare('SELECT COUNT(*) AS c FROM pending_sender_approvals').get() as { c: number }).c;
     expect(count).toBe(1);
+    const receipts = getDb().prepare('SELECT message_id, status FROM channel_ingress_receipts').all() as Array<{
+      message_id: string;
+      status: string;
+    }>;
+    expect(Object.fromEntries(receipts.map((row) => [row.message_id, row.status]))).toEqual({
+      [first.message.id]: 'deferred',
+      [second.message.id]: 'completed',
+    });
   });
 
   it('approve → adds member and replays the original message', async () => {

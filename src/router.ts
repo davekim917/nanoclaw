@@ -31,11 +31,25 @@ import {
   getMessagingGroupWithAgentCount,
 } from './db/messaging-groups.js';
 import { getDb } from './db/connection.js';
+import {
+  claimChannelIngress,
+  claimDeferredChannelIngress,
+  completeChannelIngress,
+  completeDeferredChannelIngress,
+  deferChannelIngress,
+  releaseChannelIngress,
+  type ChannelIngressReceiptKey,
+} from './db/channel-ingress-receipts.js';
 import { findSessionForAgent } from './db/sessions.js';
 import { cancelPendingGatesForSession, sessionHasActiveGates } from './modules/bash-gate/index.js';
 import { startTypingRefresh, stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
-import { resolveSession, writeSessionMessage, writeOutboundDirect } from './session-manager.js';
+import {
+  resolveSession,
+  sessionMessageExists,
+  writeSessionMessageIfNew,
+  writeOutboundDirect,
+} from './session-manager.js';
 import { upsertArchiveMessage } from './message-archive.js';
 import { parseMessageFlags, formatFlagConfirmation, type FlagIntent } from './flag-parser.js';
 import { maybeRenameNewThread } from './topic-title.js';
@@ -175,14 +189,14 @@ export function setSenderResolver(fn: SenderResolverFn): void {
  * own `dropped_messages` row on refusal (structural drops are already
  * recorded by core before the gate runs).
  */
-export type AccessGateResult = { allowed: true } | { allowed: false; reason: string };
+export type AccessGateResult = { allowed: true } | { allowed: false; reason: string; replayPending?: boolean };
 
 export type AccessGateFn = (
   event: InboundEvent,
   userId: string | null,
   mg: MessagingGroup,
   agentGroupId: string,
-) => AccessGateResult;
+) => AccessGateResult | Promise<AccessGateResult>;
 
 let accessGate: AccessGateFn | null = null;
 
@@ -261,13 +275,13 @@ export function registerMessageInterceptor(fn: MessageInterceptorFn): void {
  * Channel-registration hook. Runs when the router sees a mention/DM on a
  * messaging group that has no wirings AND hasn't been denied. The hook is
  * expected to escalate to an owner (card, etc.) and arrange for future
- * replay via routeInbound after approval. Fire-and-forget from the
- * router's perspective.
+ * replay after approval. Its boolean result says whether this exact event was
+ * persisted and must remain deferred.
  *
  * Registered by the permissions module. Without the module the router
  * silently records the drop with reason='no_agent_wired' and moves on.
  */
-export type ChannelRequestGateFn = (mg: MessagingGroup, event: InboundEvent) => Promise<void>;
+export type ChannelRequestGateFn = (mg: MessagingGroup, event: InboundEvent) => Promise<boolean>;
 
 let channelRequestGate: ChannelRequestGateFn | null = null;
 
@@ -353,6 +367,53 @@ function parseUtcTimestampMs(value: string | null | undefined): number | null {
  * Creates messaging group + session if they don't exist yet.
  */
 export async function routeInbound(event: InboundEvent): Promise<void> {
+  const receipt = receiptKey(event);
+  if (!claimChannelIngress(receipt)) {
+    log.debug('Duplicate channel event ignored before routing side effects', { ...receipt });
+    return;
+  }
+  await routeClaimedInbound(event, receipt);
+}
+
+function receiptKey(event: InboundEvent): ChannelIngressReceiptKey {
+  return {
+    channelType: event.channelType,
+    instance: event.instance ?? event.channelType,
+    platformId: event.platformId,
+    messageId: event.message.id,
+  };
+}
+
+/** Replay only the event intentionally released by a completed approval. */
+export async function replayDeferredInbound(event: InboundEvent): Promise<void> {
+  const receipt = receiptKey(event);
+  if (!claimDeferredChannelIngress(receipt)) {
+    log.debug('Deferred channel event replay ignored because it is already claimed or completed', { ...receipt });
+    return;
+  }
+  await routeClaimedInbound(event, receipt);
+}
+
+/** Resolve a denied or abandoned approval without allowing recovery to reopen it. */
+export function completeDeferredInbound(event: InboundEvent): void {
+  completeDeferredChannelIngress(receiptKey(event));
+}
+
+async function routeClaimedInbound(event: InboundEvent, receipt: ChannelIngressReceiptKey): Promise<void> {
+  let replayPending = false;
+  try {
+    await routeInboundClaimed(event, () => {
+      replayPending = true;
+    });
+    if (replayPending) deferChannelIngress(receipt);
+    else completeChannelIngress(receipt);
+  } catch (err) {
+    releaseChannelIngress(receipt);
+    throw err;
+  }
+}
+
+async function routeInboundClaimed(event: InboundEvent, markReplayPending: () => void): Promise<void> {
   // Pre-route interceptors — let modules consume messages before any routing
   // (e.g. free-text DM replies during multi-step approval flows). They run in
   // registration order; the first to claim the message stops routing. The
@@ -482,7 +543,7 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
           platformId: event.platformId,
         });
         // Re-enter routing with the fresh wiring in place.
-        return routeInbound(event);
+        return routeInboundClaimed(event, markReplayPending);
       } catch (err) {
         log.warn('Workspace-trust auto-wire failed — falling through to approval', {
           messagingGroupId: mg.id,
@@ -506,7 +567,7 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
           platformId: event.platformId,
           agentGroupIds: wirings.map((w) => w.agent_group_id),
         });
-        return routeInbound(event);
+        return routeInboundClaimed(event, markReplayPending);
       }
     }
 
@@ -522,13 +583,14 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
     });
 
     if (channelRequestGate) {
-      // Fire-and-forget escalation. The gate is expected to build a card,
-      // persist pending_channel_approvals, and replay the event via
-      // routeInbound after approval. Errors are logged internally — the
-      // user's message still stays dropped here either way.
-      void channelRequestGate(mg, event).catch((err) =>
-        log.error('Channel-request gate threw', { messagingGroupId: mg.id, err }),
-      );
+      // Defer only the exact event retained by the approval row. Later
+      // messages while a card is pending remain ordinary drops and cannot
+      // strand unrelated ingress receipts indefinitely.
+      try {
+        if (await channelRequestGate(mg, event)) markReplayPending();
+      } catch (err) {
+        log.error('Channel-request gate threw', { messagingGroupId: mg.id, err });
+      }
     } else {
       log.warn('MESSAGE DROPPED — no agent groups wired and no channel-request gate registered', {
         messagingGroupId: mg.id,
@@ -674,7 +736,9 @@ export async function routeInbound(event: InboundEvent): Promise<void> {
 
     const engages = evaluateEngage(agent, messageText, isMention, mg, effectiveThreadId, supportsThreads);
 
-    const accessOk = engages && (!accessGate || accessGate(event, userId, mg, agent.agent_group_id).allowed);
+    const accessDecision = engages && accessGate ? await accessGate(event, userId, mg, agent.agent_group_id) : null;
+    if (accessDecision && !accessDecision.allowed && accessDecision.replayPending) markReplayPending();
+    const accessOk = engages && (!accessDecision || accessDecision.allowed);
     const scopeOk = engages && (!senderScopeGate || senderScopeGate(event, userId, mg, agent).allowed);
 
     if (engages && accessOk && scopeOk) {
@@ -865,6 +929,20 @@ async function deliverToAgent(
   }
 
   const { session, created } = resolveSession(agent.agent_group_id, mg.id, effectiveThreadId, effectiveSessionMode);
+  const routedMessageId = messageIdForAgent(event.message.id, agent.agent_group_id);
+
+  // A receipt table added after existing session DBs cannot retroactively know
+  // their old platform ids. Check the actual per-session id before every side
+  // effect as a migration-safe second line of defense, and also make a partial
+  // fan-out retry harmless for agents whose row was already committed.
+  if (sessionMessageExists(agent.agent_group_id, session.id, routedMessageId)) {
+    log.debug('Duplicate session message ignored before agent side effects', {
+      sessionId: session.id,
+      agentGroup: session.agent_group_id,
+      platformMessageId: event.message.id,
+    });
+    return;
+  }
 
   // v1 behavior: a follow-up message to a session with a pending
   // bash/destructive gate implicitly rejects the gate so the agent's
@@ -900,7 +978,7 @@ async function deliverToAgent(
   const persistedContent = persistInboundAttachments(
     agent.agent_group_id,
     session.id,
-    messageIdForAgent(event.message.id, agent.agent_group_id),
+    routedMessageId,
     event.message.content,
   );
 
@@ -1055,8 +1133,8 @@ async function deliverToAgent(
     );
   }
 
-  await writeSessionMessage(session.agent_group_id, session.id, {
-    id: messageIdForAgent(event.message.id, agent.agent_group_id),
+  const inserted = await writeSessionMessageIfNew(session.agent_group_id, session.id, {
+    id: routedMessageId,
     kind: event.message.kind,
     timestamp: event.message.timestamp,
     platformId: deliveryAddr.platformId,
@@ -1065,6 +1143,15 @@ async function deliverToAgent(
     content: contentForWrite,
     trigger: wake ? 1 : 0,
   });
+  if (!inserted) {
+    if (wake) stopTypingRefresh(session.id);
+    log.debug('Duplicate routed message ignored', {
+      sessionId: session.id,
+      agentGroup: session.agent_group_id,
+      platformMessageId: event.message.id,
+    });
+    return;
+  }
 
   // Mirror inbound user messages into archive.db for future-wake thread
   // context replay. Scoped per-agent-group to match the archive's PK

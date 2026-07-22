@@ -19,8 +19,10 @@ import {
   inboundDbPath,
   outboundDbPath,
   sessionDir,
+  sessionMessageExists,
   writeOutboundDirect,
   writeSessionMessage,
+  writeSessionMessageIfNew,
 } from './session-manager.js';
 import { initTestDb, closeDb, runMigrations, createAgentGroup } from './db/index.js';
 import { createSession } from './db/sessions.js';
@@ -259,5 +261,83 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
     } finally {
       db.close();
     }
+  });
+
+  it('treats a missing inbound DB as unseen without creating it', () => {
+    fs.rmSync(sessionDir(AG, SESS), { recursive: true, force: true });
+
+    expect(sessionMessageExists(AG, SESS, 'next-platform-message')).toBe(false);
+    expect(fs.existsSync(sessionDir(AG, SESS))).toBe(false);
+  });
+
+  it('deduplicates replayed platform message ids before they can create a second agent turn', async () => {
+    const input = {
+      id: 'discord-message-1:ag-test',
+      kind: 'chat-sdk',
+      timestamp: '2026-07-21T18:18:00.000Z',
+      platformId: 'discord:g:c',
+      channelType: 'discord',
+      threadId: 'discord:g:c:t',
+      content: JSON.stringify({ text: '@Axie recover this' }),
+    };
+    await expect(writeSessionMessageIfNew(AG, SESS, input)).resolves.toBe(true);
+    await expect(writeSessionMessageIfNew(AG, SESS, input)).resolves.toBe(false);
+
+    const db = new Database(inboundDbPath(AG, SESS), { readonly: true });
+    try {
+      const row = db.prepare('SELECT COUNT(*) AS count FROM messages_in WHERE id = ?').get(input.id) as {
+        count: number;
+      };
+      expect(row.count).toBe(1);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('finishes an idempotent replay when identical attachment bytes survived an interrupted insert', async () => {
+    const messageId = 'discord-attachment-replay:ag-test';
+    const filename = 'evidence.txt';
+    const bytes = Buffer.from('same attachment bytes');
+    const inboxDir = path.join(sessionDir(AG, SESS), 'inbox', messageId);
+    fs.mkdirSync(inboxDir, { recursive: true });
+    fs.writeFileSync(path.join(inboxDir, filename), bytes);
+
+    await expect(
+      writeSessionMessageIfNew(AG, SESS, {
+        id: messageId,
+        kind: 'chat-sdk',
+        timestamp: '2026-07-21T18:18:00.000Z',
+        platformId: 'discord:g:c',
+        channelType: 'discord',
+        threadId: 'discord:g:c:t',
+        content: JSON.stringify({
+          text: 'recover the attachment',
+          attachments: [{ name: filename, data: bytes.toString('base64') }],
+        }),
+      }),
+    ).resolves.toBe(true);
+
+    const db = new Database(inboundDbPath(AG, SESS), { readonly: true });
+    try {
+      const row = db.prepare('SELECT content FROM messages_in WHERE id = ?').get(messageId) as { content: string };
+      const parsed = JSON.parse(row.content) as { attachments: Array<{ data?: string; localPath?: string }> };
+      expect(parsed.attachments[0]).toEqual({
+        name: filename,
+        localPath: `inbox/${messageId}/${filename}`,
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  it('keeps duplicate ids strict for non-channel host writes', async () => {
+    const input = {
+      id: 'system-message-1',
+      kind: 'system',
+      timestamp: '2026-07-21T18:18:00.000Z',
+      content: JSON.stringify({ text: 'wake once' }),
+    };
+    await expect(writeSessionMessage(AG, SESS, input)).resolves.toBeUndefined();
+    await expect(writeSessionMessage(AG, SESS, input)).rejects.toThrow(/UNIQUE constraint failed/);
   });
 });

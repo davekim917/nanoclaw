@@ -25,10 +25,10 @@ export interface PendingSenderApproval {
   options_json: string;
 }
 
-export function createPendingSenderApproval(row: PendingSenderApproval): void {
-  getDb()
+export function createPendingSenderApproval(row: PendingSenderApproval): boolean {
+  const result = getDb()
     .prepare(
-      `INSERT INTO pending_sender_approvals (
+      `INSERT OR IGNORE INTO pending_sender_approvals (
          id, messaging_group_id, agent_group_id, sender_identity,
          sender_name, original_message, approver_user_id, created_at,
          title, options_json
@@ -40,6 +40,7 @@ export function createPendingSenderApproval(row: PendingSenderApproval): void {
        )`,
     )
     .run(row);
+  return result.changes > 0;
 }
 
 export function getPendingSenderApproval(id: string): PendingSenderApproval | undefined {
@@ -49,10 +50,16 @@ export function getPendingSenderApproval(id: string): PendingSenderApproval | un
 }
 
 export function hasInFlightSenderApproval(messagingGroupId: string, senderIdentity: string): boolean {
-  const row = getDb()
-    .prepare('SELECT 1 AS x FROM pending_sender_approvals WHERE messaging_group_id = ? AND sender_identity = ?')
-    .get(messagingGroupId, senderIdentity) as { x: number } | undefined;
-  return row !== undefined;
+  return getInFlightSenderApproval(messagingGroupId, senderIdentity) !== undefined;
+}
+
+export function getInFlightSenderApproval(
+  messagingGroupId: string,
+  senderIdentity: string,
+): PendingSenderApproval | undefined {
+  return getDb()
+    .prepare('SELECT * FROM pending_sender_approvals WHERE messaging_group_id = ? AND sender_identity = ?')
+    .get(messagingGroupId, senderIdentity) as PendingSenderApproval | undefined;
 }
 
 export function deletePendingSenderApproval(id: string): void {

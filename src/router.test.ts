@@ -11,6 +11,14 @@ vi.mock('./db/connection.js', () => ({
   getDb: vi.fn(),
   hasTable: vi.fn(() => true),
 }));
+vi.mock('./db/channel-ingress-receipts.js', () => ({
+  claimChannelIngress: vi.fn(() => true),
+  claimDeferredChannelIngress: vi.fn(() => true),
+  completeChannelIngress: vi.fn(),
+  completeDeferredChannelIngress: vi.fn(),
+  deferChannelIngress: vi.fn(),
+  releaseChannelIngress: vi.fn(),
+}));
 vi.mock('./db/container-configs.js', async (importOriginal) => ({
   // resolveProviderName is pure — keep it real so flag parsing sees the
   // genuine provider cascade. getContainerConfig hits the central DB; stub
@@ -54,7 +62,8 @@ vi.mock('./channels/channel-registry.js', () => ({
 
 vi.mock('./session-manager.js', () => ({
   resolveSession: vi.fn(),
-  writeSessionMessage: vi.fn(),
+  sessionMessageExists: vi.fn(() => false),
+  writeSessionMessageIfNew: vi.fn(async () => true),
   writeOutboundDirect: vi.fn(),
 }));
 
@@ -115,10 +124,11 @@ import {
   isDiscordChannelType,
 } from './router.js';
 import { getMessagingGroupWithAgentCount, getMessagingGroupAgents } from './db/messaging-groups.js';
-import { writeSessionMessage, writeOutboundDirect, resolveSession } from './session-manager.js';
+import { writeSessionMessageIfNew, writeOutboundDirect, resolveSession } from './session-manager.js';
 import { wakeContainer } from './container-runner.js';
 import { getSession } from './db/sessions.js';
 import { isAnyAdmin } from './modules/permissions/db/user-roles.js';
+import { claimChannelIngress, completeChannelIngress } from './db/channel-ingress-receipts.js';
 import { registerInterceptHandler, clearInterceptHandlers } from './command-gate.js';
 import type { ChannelAdapter, InboundEvent } from './channels/adapter.js';
 import type { MessagingGroup, MessagingGroupAgent } from './types.js';
@@ -180,9 +190,10 @@ beforeEach(() => {
   setSenderResolver(() => 'u1');
   setAccessGate(() => ({ allowed: true }));
   setUnwiredChannelResolver(() => []);
-  setChannelRequestGate(() => Promise.resolve());
+  setChannelRequestGate(() => Promise.resolve(false));
   registerMessageInterceptor(() => Promise.resolve(false));
   vi.mocked(isAnyAdmin).mockReturnValue(true);
+  vi.mocked(claimChannelIngress).mockReturnValue(true);
 });
 
 afterEach(() => {
@@ -190,6 +201,17 @@ afterEach(() => {
 });
 
 describe('C2: pre-fanout intercept dispatch', () => {
+  it('drops a replay before intercept handlers run', async () => {
+    vi.mocked(claimChannelIngress).mockReturnValue(false);
+    const handlerSpy = vi.fn().mockResolvedValue(undefined);
+    registerInterceptHandler('dashboard_token_issue', handlerSpy);
+
+    await routeInbound(makeChatEvent('/dashboard-token'));
+
+    expect(handlerSpy).not.toHaveBeenCalled();
+    expect(completeChannelIngress).not.toHaveBeenCalled();
+  });
+
   it('test_routeInbound_intercept_skips_fanout', async () => {
     const mg = makeMg();
     vi.mocked(getMessagingGroupWithAgentCount).mockReturnValue({ mg, agentCount: 1 });
@@ -208,7 +230,7 @@ describe('C2: pre-fanout intercept dispatch', () => {
       command: '/dashboard-token',
       args: '',
     });
-    expect(writeSessionMessage).not.toHaveBeenCalled();
+    expect(writeSessionMessageIfNew).not.toHaveBeenCalled();
     expect(wakeContainer).not.toHaveBeenCalled();
   });
 
@@ -228,7 +250,7 @@ describe('C2: pre-fanout intercept dispatch', () => {
 
     // Must be called EXACTLY ONCE — pre-fanout, not per-agent
     expect(handlerSpy).toHaveBeenCalledOnce();
-    expect(writeSessionMessage).not.toHaveBeenCalled();
+    expect(writeSessionMessageIfNew).not.toHaveBeenCalled();
   });
 
   it('test_routeInbound_intercept_5s_timeout', async () => {
@@ -249,7 +271,7 @@ describe('C2: pre-fanout intercept dispatch', () => {
     await routePromise;
 
     // Should have returned without crashing; no session messages written
-    expect(writeSessionMessage).not.toHaveBeenCalled();
+    expect(writeSessionMessageIfNew).not.toHaveBeenCalled();
 
     vi.useRealTimers();
   });
@@ -285,8 +307,8 @@ describe('C2: pre-fanout intercept dispatch', () => {
     const event = makeChatEvent('hello world');
     await routeInbound(event);
 
-    // Normal path: writeSessionMessage called (fan-out ran)
-    expect(writeSessionMessage).toHaveBeenCalledOnce();
+    // Normal path: idempotent session write called (fan-out ran)
+    expect(writeSessionMessageIfNew).toHaveBeenCalledOnce();
     expect(wakeContainer).toHaveBeenCalledWith(session, 'interactive');
   });
 
@@ -298,7 +320,7 @@ describe('C2: pre-fanout intercept dispatch', () => {
     const event = makeChatEvent('/help');
     await routeInbound(event);
 
-    expect(writeSessionMessage).not.toHaveBeenCalled();
+    expect(writeSessionMessageIfNew).not.toHaveBeenCalled();
   });
 });
 
@@ -534,8 +556,8 @@ describe('thread context fetch', () => {
       limit: 50,
       excludeMessageId: 'latest-msg',
     });
-    expect(writeSessionMessage).toHaveBeenCalledOnce();
-    const written = vi.mocked(writeSessionMessage).mock.calls[0]![2];
+    expect(writeSessionMessageIfNew).toHaveBeenCalledOnce();
+    const written = vi.mocked(writeSessionMessageIfNew).mock.calls[0]![2];
     const text = JSON.parse(written.content).text as string;
     expect(text).toContain('[New in thread since last response]');
     expect(text).toContain('Mike: fresh context after the prior response');

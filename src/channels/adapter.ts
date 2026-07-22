@@ -23,6 +23,35 @@ export interface ChannelSetup {
 
   /** Called when a user clicks a button/action in a card (e.g., ask_user_question response). */
   onAction(questionId: string, selectedOption: string, userId: string): void;
+
+  /**
+   * Called when an adapter knows its inbound transport reconnected. Core also
+   * detects host event-loop stalls and invokes the same recovery surface for
+   * every active adapter, so catch-up is transport-agnostic.
+   */
+  onConnectionRestored?(info: ChannelConnectionRestored): void | Promise<void>;
+}
+
+export interface ChannelConnectionRestored {
+  /** Earliest timestamp that may contain missed inbound events. */
+  since: string;
+  reason: 'transport-ready' | 'transport-resumed' | 'event-loop-stall' | 'host-startup';
+}
+
+export interface ChannelRecoveryTarget {
+  platformId: string;
+  threadId: string | null;
+  isDM: boolean;
+}
+
+export interface ChannelRecoveryRequest extends ChannelConnectionRestored {
+  targets: ChannelRecoveryTarget[];
+}
+
+export interface ChannelRecoveryResult {
+  scannedTargets: number;
+  recoveredMessages: number;
+  failedTargets: number;
 }
 
 /** Delivery address used for reply-to overrides and (normally) the inbound's own origin. */
@@ -56,6 +85,8 @@ export interface InboundEvent {
    * adapter didn't tell us — router defaults to is_group=0.
    */
   isDM?: boolean;
+  /** Internal replay marker used to bypass the host's startup live-ingress queue. */
+  recovered?: boolean;
   message: {
     id: string;
     kind: 'chat' | 'chat-sdk';
@@ -105,6 +136,8 @@ export interface InboundMessage {
   isDM?: boolean;
   /** Inverse of isDM. Kept alongside for upstream code paths that key off isGroup. */
   isGroup?: boolean;
+  /** Internal replay marker used to bypass the host's startup live-ingress queue. */
+  recovered?: boolean;
 }
 
 /** A file attachment to deliver alongside a message. */
@@ -250,6 +283,14 @@ export interface ChannelAdapter {
     threadId: string,
     opts?: { limit?: number; excludeMessageId?: string },
   ): Promise<Array<{ sender: string; text: string; timestamp: string; isAnchor?: boolean }>>;
+
+  /**
+   * Replay platform history after a transport gap. Implementations must emit
+   * recovered messages through the setup callback so they traverse the normal
+   * router/access/engagement path. Core supplies known conversation targets;
+   * native adapters may augment them with platform-specific discovery.
+   */
+  recoverMissedMessages?(request: ChannelRecoveryRequest): Promise<ChannelRecoveryResult>;
 
   /**
    * Open (or fetch) a DM with this user, returning the platform_id of the

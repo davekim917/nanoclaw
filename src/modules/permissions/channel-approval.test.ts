@@ -235,15 +235,25 @@ describe('unknown-channel registration flow', () => {
 
   it('dedups a second mention while the card is pending', async () => {
     const { routeInbound } = await import('../../router.js');
-    await routeInbound(groupMention('chat-busy'));
+    const first = groupMention('chat-busy');
+    const second = groupMention('chat-busy', '@bot still here');
+    await routeInbound(first);
     await new Promise((r) => setTimeout(r, 10));
-    await routeInbound(groupMention('chat-busy', '@bot still here'));
+    await routeInbound(second);
     await new Promise((r) => setTimeout(r, 10));
 
     expect(deliverMock).toHaveBeenCalledTimes(1);
     const { getDb } = await import('../../db/connection.js');
     const count = (getDb().prepare('SELECT COUNT(*) AS c FROM pending_channel_approvals').get() as { c: number }).c;
     expect(count).toBe(1);
+    const receipts = getDb().prepare('SELECT message_id, status FROM channel_ingress_receipts').all() as Array<{
+      message_id: string;
+      status: string;
+    }>;
+    expect(Object.fromEntries(receipts.map((row) => [row.message_id, row.status]))).toEqual({
+      [first.message.id]: 'deferred',
+      [second.message.id]: 'completed',
+    });
   });
 
   it('approve → creates wiring, admits triggering sender, replays', async () => {

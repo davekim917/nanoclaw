@@ -5,8 +5,165 @@ import {
   parseSlackWorkspaces,
   slackPostParent,
   slackCreateThread,
+  discoverSlackRecoveryTargets,
+  makeSlackRecoveryPageFetcher,
   type SlackPostMessageClient,
 } from './slack.js';
+
+describe('Slack missed-message recovery', () => {
+  it('parses channel-root history with each message native thread id', async () => {
+    const parseSlackMessage = vi.fn(async (raw: unknown, threadId: string) => ({
+      id: (raw as { ts: string }).ts,
+      threadId,
+      metadata: { dateSent: new Date('2026-07-21T18:17:00Z') },
+    }));
+    const fetchPage = makeSlackRecoveryPageFetcher(
+      { fetchMessages: vi.fn(), parseSlackMessage } as never,
+      {
+        conversations: {
+          history: vi.fn().mockResolvedValue({ messages: [{ ts: '1753121820.000001' }] }),
+        },
+      } as never,
+    );
+
+    const result = await fetchPage('slack:C1:', {
+      limit: 100,
+      direction: 'backward',
+      since: '2026-07-21T18:16:00Z',
+    });
+
+    expect(parseSlackMessage).toHaveBeenCalledWith({ ts: '1753121820.000001' }, 'slack:C1:1753121820.000001');
+    expect(result.messages[0].threadId).toBe('slack:C1:1753121820.000001');
+  });
+
+  it('uses Slack native cursor pagination for large threads instead of the adapter backward-fetch truncation', async () => {
+    const replies = vi.fn().mockResolvedValue({
+      messages: [{ ts: '1753121880.000001', thread_ts: '1650000000.000001' }],
+      response_metadata: { next_cursor: 'next-page' },
+    });
+    const parseSlackMessage = vi.fn(async (raw: unknown, threadId: string) => ({
+      id: (raw as { ts: string }).ts,
+      threadId,
+      metadata: { dateSent: new Date('2026-07-21T18:18:00Z') },
+    }));
+    const adapterFetchMessages = vi.fn();
+    const slackAdapter = { fetchMessages: adapterFetchMessages, parseSlackMessage };
+    const fetchPage = makeSlackRecoveryPageFetcher(
+      slackAdapter as never,
+      {
+        conversations: { replies },
+      } as never,
+    );
+
+    const result = await fetchPage('slack:C1:1650000000.000001', {
+      limit: 100,
+      direction: 'backward',
+      cursor: 'current-page',
+      since: '2025-07-21T18:16:00Z',
+    });
+
+    expect(adapterFetchMessages).not.toHaveBeenCalled();
+    expect(replies).toHaveBeenCalledWith({
+      channel: 'C1',
+      ts: '1650000000.000001',
+      limit: 100,
+      cursor: 'current-page',
+      oldest: String(Date.parse('2025-07-21T18:16:00Z') / 1000),
+    });
+    expect(parseSlackMessage).toHaveBeenCalledWith(
+      { ts: '1753121880.000001', thread_ts: '1650000000.000001' },
+      'slack:C1:1650000000.000001',
+    );
+    expect(result.nextCursor).toBe('next-page');
+  });
+
+  it('discovers a thread created during the recovery gap', async () => {
+    const result = await discoverSlackRecoveryTargets(
+      {
+        conversations: {
+          history: vi.fn().mockResolvedValue({
+            messages: [{ ts: '1753121820.000001', reply_count: 1, latest_reply: '1753121880.000001' }],
+          }),
+        },
+      } as never,
+      {
+        since: '2025-07-21T18:16:00Z',
+        reason: 'event-loop-stall',
+        targets: [{ platformId: 'slack:C1', threadId: null, isDM: false }],
+      },
+    );
+
+    expect(result).toEqual({
+      targets: [{ platformId: 'slack:C1', threadId: 'slack:C1:1753121820.000001', isDM: false }],
+      complete: true,
+    });
+  });
+
+  it('continues past old roots because they can receive their first reply during the gap', async () => {
+    const history = vi
+      .fn()
+      .mockResolvedValueOnce({
+        messages: [{ ts: '1700000000.000001' }],
+        response_metadata: { next_cursor: 'older' },
+      })
+      .mockResolvedValueOnce({
+        messages: [{ ts: '1650000000.000001', reply_count: 1, latest_reply: '1753121880.000001' }],
+      });
+
+    const result = await discoverSlackRecoveryTargets({ conversations: { history } } as never, {
+      since: '2025-07-21T18:16:00Z',
+      reason: 'event-loop-stall',
+      targets: [{ platformId: 'slack:C1', threadId: null, isDM: false }],
+    });
+
+    expect(history).toHaveBeenCalledTimes(2);
+    expect(result).toEqual({
+      targets: [{ platformId: 'slack:C1', threadId: 'slack:C1:1650000000.000001', isDM: false }],
+      complete: true,
+    });
+  });
+
+  it('continues discovery through an empty page that still has a cursor', async () => {
+    const history = vi
+      .fn()
+      .mockResolvedValueOnce({ messages: [], response_metadata: { next_cursor: 'next' } })
+      .mockResolvedValueOnce({
+        messages: [{ ts: '1650000000.000001', reply_count: 1, latest_reply: '1753121880.000001' }],
+      });
+
+    const result = await discoverSlackRecoveryTargets({ conversations: { history } } as never, {
+      since: '2025-07-21T18:16:00Z',
+      reason: 'host-startup',
+      targets: [{ platformId: 'slack:C1', threadId: null, isDM: false }],
+    });
+
+    expect(history).toHaveBeenCalledTimes(2);
+    expect(result.complete).toBe(true);
+    expect(result.targets).toHaveLength(1);
+  });
+
+  it('discovers a previously unseen DM sub-thread that received a gap reply', async () => {
+    const result = await discoverSlackRecoveryTargets(
+      {
+        conversations: {
+          history: vi.fn().mockResolvedValue({
+            messages: [{ ts: '1650000000.000001', reply_count: 1, latest_reply: '1753121880.000001' }],
+          }),
+        },
+      } as never,
+      {
+        since: '2025-07-21T18:16:00Z',
+        reason: 'host-startup',
+        targets: [{ platformId: 'slack:D1', threadId: null, isDM: true }],
+      },
+    );
+
+    expect(result).toEqual({
+      targets: [{ platformId: 'slack:D1', threadId: 'slack:D1:1650000000.000001', isDM: true }],
+      complete: true,
+    });
+  });
+});
 
 describe('parseSlackWorkspaces', () => {
   it('returns an empty list when no credentials present', () => {

@@ -20,6 +20,7 @@ import { CONTAINER_RUNTIME_BIN } from './container-runtime.js';
 import { getDb } from './db/connection.js';
 import { getAllContainerConfigs } from './db/container-configs.js';
 import { log } from './log.js';
+import { tryRunWithStorageCleanupClaim } from './storage-activity.js';
 import {
   inboundDbPath,
   outboundDbPath,
@@ -584,14 +585,16 @@ function createDeleteCacheAction(args: {
     safety: 'Regenerable cache directory under an idle NanoClaw-owned session/thread subtree.',
     status: 'planned',
     apply: () => {
-      if (!isPathInside(args.root, args.target)) {
-        throw new Error(`refusing to remove path outside root: ${args.target}`);
-      }
-      const st = fs.lstatSync(args.target);
-      if (!st.isDirectory() || st.isSymbolicLink()) {
-        throw new Error(`refusing to remove non-directory or symlink: ${args.target}`);
-      }
-      fs.rmSync(args.target, { recursive: true, force: true });
+      return tryRunWithStorageCleanupClaim(args.root, () => {
+        if (!isPathInside(args.root, args.target)) {
+          throw new Error(`refusing to remove path outside root: ${args.target}`);
+        }
+        const st = fs.lstatSync(args.target);
+        if (!st.isDirectory() || st.isSymbolicLink()) {
+          throw new Error(`refusing to remove non-directory or symlink: ${args.target}`);
+        }
+        fs.rmSync(args.target, { recursive: true, force: true });
+      });
     },
   };
 }
@@ -1141,6 +1144,28 @@ function pressureReport(usage: FilesystemUsage | null, policy: StoragePolicy): S
   };
 }
 
+/** Build a cheap report from a filesystem probe without inventorying caches or Docker. */
+export function createStorageStatusReport(
+  policy: StoragePolicy,
+  usage: FilesystemUsage | null,
+  now = Date.now(),
+  warnings: string[] = [],
+): StorageReport {
+  return {
+    timestamp: new Date(now).toISOString(),
+    mode: 'dry-run',
+    policy,
+    filesystem: { before: usage, after: usage, actualReclaimedBytes: 0 },
+    estimatedReclaimableBytes: 0,
+    pressure: pressureReport(usage, policy),
+    images: summarizeImages([]),
+    actions: [],
+    pools: summarize([]),
+    skipped: emptySkipped(),
+    warnings,
+  };
+}
+
 export function getStorageReport(options: StorageReportOptions = {}): StorageReport {
   const mode = options.mode ?? 'dry-run';
   const now = options.now ?? Date.now();
@@ -1272,15 +1297,17 @@ export function assertStorageAdmission(options: Omit<StorageReportOptions, 'mode
   const policy = resolveStoragePolicy(options.policy);
   const before = getFilesystemUsage(policy.filesystemPath);
   if (!policy.enabled) {
-    const report = getStorageReport({ ...options, policy, mode: 'dry-run' });
+    const report = createStorageStatusReport(policy, before, options.now, [
+      'storage manager disabled by NANOCLAW_STORAGE_MANAGER_ENABLED=0',
+    ]);
     return { allowed: true, reason: 'disabled', report };
   }
   if (!before) {
-    const report = getStorageReport({ ...options, policy, mode: 'dry-run' });
+    const report = createStorageStatusReport(policy, null, options.now, ['filesystem usage probe unavailable']);
     return { allowed: true, reason: 'usage-unavailable', report };
   }
   if (before.usagePct < policy.cleanupThresholdPct) {
-    const report = getStorageReport({ ...options, policy, mode: 'dry-run', respectCadence: true });
+    const report = createStorageStatusReport(policy, before, options.now);
     return { allowed: true, reason: 'below-threshold', report };
   }
 
@@ -1329,7 +1356,7 @@ export function pruneIdleThreadArtifacts(
   let estimated = 0;
   for (const action of actions) {
     try {
-      action.apply();
+      if (action.apply() === false) continue;
       applied += 1;
       estimated += action.estimatedBytes;
     } catch (err) {

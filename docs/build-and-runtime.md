@@ -23,11 +23,11 @@ The container image also has pnpm + Node inside for global CLIs (`@anthropic-ai/
 
 ## Lockfiles
 
-| Tree | Lockfile | Manager | Regenerate after dep change |
-|------|----------|---------|----------------------------|
-| Host | `pnpm-lock.yaml` | package.json-pinned pnpm | `pnpm install` |
-| Agent-runner | `container/agent-runner/bun.lock` | Bun 1.3+ | `cd container/agent-runner && bun install` |
-| Graphify | `container/graphify-requirements.lock` | uv + pip, exact wheel hashes | `bun scripts/update-graphify.ts --version <latest-stable>` |
+| Tree         | Lockfile                               | Manager                      | Regenerate after dep change                                |
+| ------------ | -------------------------------------- | ---------------------------- | ---------------------------------------------------------- |
+| Host         | `pnpm-lock.yaml`                       | package.json-pinned pnpm     | `pnpm install`                                             |
+| Agent-runner | `container/agent-runner/bun.lock`      | Bun 1.3+                     | `cd container/agent-runner && bun install`                 |
+| Graphify     | `container/graphify-requirements.lock` | uv + pip, exact wheel hashes | `bun scripts/update-graphify.ts --version <latest-stable>` |
 
 All are committed. CI and the Dockerfile run frozen/hash-locked install variants — any dependency drift fails the build.
 
@@ -84,6 +84,12 @@ The approved production-style Graphify profile keeps `requestMb=2048` as normal-
 2. **Host-spawned session** — `src/container-runner.ts` at line ~503 uses `--entrypoint bash` with `-c 'exec bun run /app/src/index.ts'`. Bypasses tini (Docker's default PID 1 handling applies). Stdin is unused; all IO flows through the mounted session DBs.
 
 Both paths end with Bun running the same source file from `/app/src/index.ts`.
+
+## Host liveness and channel catch-up
+
+Storage inventory and cleanup remain enabled, but their synchronous filesystem walks, SQLite reads, recursive cache removals, and Docker commands run in a persistent Node worker thread (`src/storage-maintenance-worker*.ts`). The host sweep only submits/coalesces work and handles the resulting pressure report. Normal container admission uses an asynchronous `statfs` probe; only a filesystem at cleanup pressure enters the serialized maintenance queue. This keeps the main Node event loop available for channel heartbeats and inbound routing without weakening disk-pressure admission.
+
+Channel recovery is an adapter contract rather than a Discord special case. Before platform initialization, each Chat SDK bridge durably preserves the prior cursor as an unresolved startup gap. The host then catches up after startup, transport reconnects, and detected event-loop stalls; platform adapters can augment wired roots and known sessions with native thread discovery (including threads created while the host was unavailable). Live callbacks received during partial startup are held in arrival order until the first recovery pass has run and permissions/delivery wiring is ready. Replayed messages traverse the normal router and are deduplicated by platform message ID at channel ingress and again in each session DB. A cursor advances only after every target was covered successfully, while incomplete passes retain the earliest gap and retry autonomously with bounded exponential backoff.
 
 ## CI shape
 

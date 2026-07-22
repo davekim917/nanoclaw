@@ -27,6 +27,99 @@ import { log } from '../log.js';
 import { transformOutsideProtectedRegions } from '../text-styles.js';
 import { createChatSdkBridge, type ReplyContext } from './chat-sdk-bridge.js';
 import { registerChannelAdapter } from './channel-registry.js';
+import type { ChannelRecoveryRequest, ChannelRecoveryTarget } from './adapter.js';
+
+interface DiscordRecoveryThread {
+  id: string;
+  parent_id?: string | null;
+  guild_id?: string | null;
+  thread_metadata?: { archive_timestamp?: string };
+}
+
+interface DiscordThreadList {
+  threads?: DiscordRecoveryThread[];
+  has_more?: boolean;
+}
+
+function discordThreadTarget(root: ChannelRecoveryTarget, guildId: string, threadId: string): ChannelRecoveryTarget {
+  const channelId = root.platformId.split(':')[2];
+  return {
+    platformId: root.platformId,
+    threadId: `discord:${guildId}:${channelId}:${threadId}`,
+    isDM: false,
+  };
+}
+
+/** Discover threads that received messages during a gap before a session existed. */
+export async function discoverDiscordRecoveryTargets(
+  rest: Pick<REST, 'get'>,
+  request: ChannelRecoveryRequest,
+): Promise<{ targets: ChannelRecoveryTarget[]; complete: boolean }> {
+  const roots = request.targets.filter((target) => !target.isDM && target.threadId === null);
+  const targets: ChannelRecoveryTarget[] = [];
+  const rootsByGuild = new Map<string, ChannelRecoveryTarget[]>();
+  for (const root of roots) {
+    const [, guildId, channelId] = root.platformId.split(':');
+    if (!guildId || !channelId) continue;
+    const guildRoots = rootsByGuild.get(guildId) ?? [];
+    guildRoots.push(root);
+    rootsByGuild.set(guildId, guildRoots);
+  }
+
+  for (const [guildId, guildRoots] of rootsByGuild) {
+    const active = (await rest.get(Routes.guildActiveThreads(guildId))) as DiscordThreadList;
+    const rootByChannel = new Map(guildRoots.map((root) => [root.platformId.split(':')[2], root]));
+    for (const thread of active.threads ?? []) {
+      const root = thread.parent_id ? rootByChannel.get(thread.parent_id) : undefined;
+      if (root) targets.push(discordThreadTarget(root, guildId, thread.id));
+    }
+  }
+
+  let complete = true;
+  const sinceMs = Date.parse(request.since);
+  for (const root of roots) {
+    const [, guildId, channelId] = root.platformId.split(':');
+    if (!guildId || !channelId) continue;
+    for (const archive of [
+      { route: Routes.channelThreads(channelId, 'public'), cursor: 'timestamp' as const },
+      { route: Routes.channelJoinedArchivedThreads(channelId), cursor: 'snowflake' as const },
+    ]) {
+      let before: string | undefined;
+      let coveredBoundary = false;
+      const seenCursors = new Set<string>();
+      for (;;) {
+        const query = new URLSearchParams({ limit: '100' });
+        if (before) query.set('before', before);
+        const archived = (await rest.get(archive.route, { query })) as DiscordThreadList;
+        const threads = archived.threads ?? [];
+        let oldestArchiveMs = Number.POSITIVE_INFINITY;
+        for (const thread of threads) {
+          targets.push(discordThreadTarget(root, guildId, thread.id));
+          const archivedMs = Date.parse(thread.thread_metadata?.archive_timestamp ?? '');
+          if (Number.isFinite(archivedMs)) oldestArchiveMs = Math.min(oldestArchiveMs, archivedMs);
+        }
+        // Public archives are ordered by archive_timestamp, so reaching the
+        // gap boundary proves older pages cannot contain a missed message.
+        // Joined private archives are ordered by thread snowflake instead;
+        // an old private thread can be reactivated during the gap, so that
+        // endpoint must be exhausted regardless of archive timestamps.
+        const reachedTimeBoundary = archive.cursor === 'timestamp' && oldestArchiveMs <= sinceMs;
+        if (reachedTimeBoundary || archived.has_more !== true) {
+          coveredBoundary = true;
+          break;
+        }
+        before =
+          archive.cursor === 'timestamp' ? threads.at(-1)?.thread_metadata?.archive_timestamp : threads.at(-1)?.id;
+        if (!before) break;
+        if (seenCursors.has(before)) break;
+        seenCursors.add(before);
+      }
+      if (!coveredBoundary) complete = false;
+    }
+  }
+
+  return { targets, complete };
+}
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function extractReplyContext(raw: Record<string, any>): ReplyContext | null {
@@ -610,6 +703,18 @@ for (const ws of workspaces) {
         // can address its peer by name instead of guessing.
         transformInboundText: (text) => resolveIncomingDiscordMentions(text),
         inboundFilter: isUserMessage,
+        detectRecoveredMention: (message) => {
+          if (!identity) return false;
+          const raw = message.raw as { mentions?: Array<{ id?: string }> } | undefined;
+          return raw?.mentions?.some((mention) => mention.id === identity.userId) === true;
+        },
+        // Match the live Gateway patch: self echoes are removed by the bridge;
+        // among remaining bots, only known NanoClaw siblings are admissible.
+        allowRecoveredBotMessage: (message) => {
+          const authorId = message.author.userId;
+          return authorId !== identity?.userId && [...knownDiscordBots.values()].some((bot) => bot.userId === authorId);
+        },
+        discoverRecoveryTargets: (request) => discoverDiscordRecoveryTargets(rest, request),
         fetchThreadAnchor: makeFetchThreadAnchor(ws.botToken),
       });
       bridge.postParent = (platformId, text) => discordPostParent(rest, platformId, text);

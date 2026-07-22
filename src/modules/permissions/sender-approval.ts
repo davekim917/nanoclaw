@@ -7,9 +7,9 @@
  *
  *   1. Pick an eligible approver (owner / admin of the agent group).
  *   2. Open / reuse a DM to that approver on a reachable channel.
- *   3. Deliver an Approve / Deny card.
- *   4. Record a pending_sender_approvals row that holds the original message
+ *   3. Record a pending_sender_approvals row that holds the original message
  *      so it can be re-routed on approve.
+ *   4. Deliver an Approve / Deny card.
  *
  * On approve: the handler in index.ts adds an agent_group_members row for
  * the sender and re-invokes routeInbound with the stored event — the second
@@ -20,11 +20,13 @@
  *   - No eligible approver in user_roles — fresh install, no owner yet.
  *   - Approver has no reachable DM (no user_dms row + channel can't
  *     openDM) — e.g. owner hasn't registered on any channel we're wired to.
- *   - Delivery adapter missing.
+ * Once the row exists, delivery failures leave it available for dashboard or
+ * manual review; only failures before persistence return without a row.
  *
  * Dedup: `pending_sender_approvals` has UNIQUE(messaging_group_id,
- * sender_identity). A retry / rapid second message from the same unknown
- * sender is silently dropped (no duplicate card sent).
+ * sender_identity). A replay of the retained event remains deferred; a later
+ * message from that sender is dropped without replacing it or sending another
+ * card.
  */
 import { normalizeOptions, type RawOption } from '../../channels/ask-question.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
@@ -32,7 +34,7 @@ import { getDeliveryAdapter } from '../../delivery.js';
 import { log } from '../../log.js';
 import type { InboundEvent } from '../../channels/adapter.js';
 import { pickApprovalDelivery, pickApprover } from '../approvals/primitive.js';
-import { createPendingSenderApproval, hasInFlightSenderApproval } from './db/pending-sender-approvals.js';
+import { createPendingSenderApproval, getInFlightSenderApproval } from './db/pending-sender-approvals.js';
 
 const APPROVAL_OPTIONS: RawOption[] = [
   { label: 'Allow', selectedLabel: '✅ Allowed', value: 'approve', style: 'primary' },
@@ -51,17 +53,34 @@ export interface RequestSenderApprovalInput {
   event: InboundEvent;
 }
 
-export async function requestSenderApproval(input: RequestSenderApprovalInput): Promise<void> {
+function isSameInboundEvent(raw: string, event: InboundEvent): boolean {
+  try {
+    const stored = JSON.parse(raw) as InboundEvent;
+    return (
+      stored.channelType === event.channelType &&
+      (stored.instance ?? stored.channelType) === (event.instance ?? event.channelType) &&
+      stored.platformId === event.platformId &&
+      stored.message.id === event.message.id
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** True only when this exact event is the one retained for later replay. */
+export async function requestSenderApproval(input: RequestSenderApprovalInput): Promise<boolean> {
   const { messagingGroupId, agentGroupId, senderIdentity, senderName, event } = input;
 
   // In-flight dedup: don't spam the admin if the same unknown sender
-  // retries while a card is already pending.
-  if (hasInFlightSenderApproval(messagingGroupId, senderIdentity)) {
+  // retries while a card is already pending. A replay of the retained event
+  // stays deferred; a later, different message is intentionally dropped.
+  const existing = getInFlightSenderApproval(messagingGroupId, senderIdentity);
+  if (existing) {
     log.debug('Unknown-sender approval already in flight — dropping retry', {
       messagingGroupId,
       senderIdentity,
     });
-    return;
+    return isSameInboundEvent(existing.original_message, event);
   }
 
   const approvers = pickApprover(agentGroupId);
@@ -71,7 +90,7 @@ export async function requestSenderApproval(input: RequestSenderApprovalInput): 
       agentGroupId,
       senderIdentity,
     });
-    return;
+    return false;
   }
 
   const originMg = getMessagingGroup(messagingGroupId);
@@ -80,8 +99,7 @@ export async function requestSenderApproval(input: RequestSenderApprovalInput): 
   // identity and (often) message body from this workspace — don't fall
   // back cross-workspace to a different surface where the same owner
   // happens to be registered. If nobody on this channel_type can be
-  // notified, the pending_sender_approvals row stays in DB for dashboard
-  // review and the dedup gate prevents card spam on retries.
+  // notified, no row is created and a future message can try again.
   const target = await pickApprovalDelivery(approvers, originChannelType, { sameChannelTypeOnly: true });
   if (!target) {
     log.warn('Unknown-sender approval skipped — no in-workspace approver reachable on origin channel_type', {
@@ -90,7 +108,7 @@ export async function requestSenderApproval(input: RequestSenderApprovalInput): 
       agentGroupId,
       senderIdentity,
     });
-    return;
+    return false;
   }
 
   const approvalId = generateId();
@@ -101,7 +119,7 @@ export async function requestSenderApproval(input: RequestSenderApprovalInput): 
   const question = `${senderDisplay} wants to talk to your agent in ${originName}. Allow?`;
   const options = normalizeOptions(APPROVAL_OPTIONS);
 
-  createPendingSenderApproval({
+  const created = createPendingSenderApproval({
     id: approvalId,
     messaging_group_id: messagingGroupId,
     agent_group_id: agentGroupId,
@@ -113,6 +131,10 @@ export async function requestSenderApproval(input: RequestSenderApprovalInput): 
     title,
     options_json: JSON.stringify(options),
   });
+  if (!created) {
+    const raced = getInFlightSenderApproval(messagingGroupId, senderIdentity);
+    return raced ? isSameInboundEvent(raced.original_message, event) : false;
+  }
 
   const adapter = getDeliveryAdapter();
   if (!adapter) {
@@ -122,7 +144,7 @@ export async function requestSenderApproval(input: RequestSenderApprovalInput): 
     log.error('Unknown-sender approval row created but no delivery adapter is wired', {
       approvalId,
     });
-    return;
+    return true;
   }
 
   try {
@@ -152,6 +174,7 @@ export async function requestSenderApproval(input: RequestSenderApprovalInput): 
       err,
     });
   }
+  return true;
 }
 
 /**

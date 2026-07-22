@@ -1,5 +1,5 @@
-import { isContainerRunning } from '../../container-runner.js';
-import { getStorageReport } from '../../storage-manager.js';
+import { getActiveContainerSessionIds } from '../../container-runner.js';
+import { getStorageReportInBackground } from '../../storage-maintenance-worker.js';
 import { register } from '../registry.js';
 
 function parseApply(raw: Record<string, unknown>): { apply: boolean } {
@@ -11,7 +11,7 @@ register({
   description: 'Show reclaimable host storage without deleting anything.',
   access: 'approval',
   parseArgs: () => ({}),
-  handler: async () => getStorageReport({ mode: 'dry-run', isContainerRunning }),
+  handler: async () => getStorageReportInBackground(getActiveContainerSessionIds(), { mode: 'dry-run' }),
 });
 
 register({
@@ -20,9 +20,8 @@ register({
   access: 'approval',
   parseArgs: parseApply,
   handler: async ({ apply }) =>
-    getStorageReport({
+    getStorageReportInBackground(getActiveContainerSessionIds(), {
       mode: apply ? 'apply' : 'dry-run',
-      isContainerRunning,
       force: apply,
     }),
 });

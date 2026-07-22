@@ -68,6 +68,7 @@ import {
 import {
   getContainerSpawnedAt,
   hasContainerEverRun,
+  getActiveContainerSessionIds,
   isContainerRunning,
   killContainer,
   wakeContainer,
@@ -77,10 +78,10 @@ import {
   collectThreadWorktreeActivity,
   pruneIdleSessionArtifacts as pruneIdleSessionArtifactsImpl,
   pruneIdleThreadArtifacts as pruneIdleThreadArtifactsImpl,
-  runStorageMaintenance,
   type ThreadWorktreeActivity,
 } from './storage-manager.js';
 import { handleStoragePressureAlert } from './storage-pressure-alert.js';
+import { runStorageMaintenanceInBackground } from './storage-maintenance-worker.js';
 import type { Session } from './types.js';
 import { getDb } from './db/connection.js';
 import {
@@ -92,6 +93,7 @@ import { getCapabilityConfig } from './modules/orchestrator-dispatch/db/agent-gr
 import { runReconcilerSweep } from './modules/orchestrator-dispatch/reconciler.js';
 import { decideTaskAction, pendingTerminalSpawnOutboundSeenAt } from './modules/orchestrator-dispatch/watchdog.js';
 import { OomKillObserver } from './resource-oom-observer.js';
+import { pruneChannelIngressReceipts } from './db/channel-ingress-receipts.js';
 
 const oomKillObserver = new OomKillObserver();
 
@@ -271,6 +273,7 @@ async function sweep(): Promise<void> {
 
   // Prune steer_idempotency rows: applied rows older than 60s, pending rows older than 5min.
   pruneSteerIdempotency();
+  pruneChannelIngressReceipts();
 
   // MODULE-HOOK:scheduled-move-recovery — autonomous recovery of unresolved
   // move intents + 90d audit-body prune. Additive (same pattern as the
@@ -285,12 +288,12 @@ async function sweep(): Promise<void> {
 
   // Reclaim disk from idle caches and Docker artifacts after per-session
   // sweep work has had a chance to notice and wake due messages.
-  try {
-    const storageReport = runStorageMaintenance({ isContainerRunning });
-    await handleStoragePressureAlert(storageReport);
-  } catch (err) {
-    log.warn('storage-manager: host sweep maintenance failed', { err });
-  }
+  // Fire-and-forget into a persistent worker. The worker owns the expensive
+  // synchronous filesystem/Docker implementation and its cadence state; the
+  // host event loop stays available for channel heartbeats and inbound events.
+  void runStorageMaintenanceInBackground(getActiveContainerSessionIds())
+    .then((storageReport) => (storageReport ? handleStoragePressureAlert(storageReport) : undefined))
+    .catch((err) => log.warn('storage-manager: background maintenance failed', { err }));
 
   // Auto-archive completed tasks older than 24h so the "Done" lane stays
   // representative of recent work; failed tasks are intentionally skipped.

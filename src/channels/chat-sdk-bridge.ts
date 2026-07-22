@@ -26,7 +26,15 @@ import { SqliteStateAdapter } from '../state-sqlite.js';
 import { registerWebhookAdapter } from '../webhook-server.js';
 import { getAskQuestionRender } from '../db/sessions.js';
 import { normalizeOptions, type NormalizedOption } from './ask-question.js';
-import type { ChannelAdapter, ChannelDefaults, ChannelSetup, InboundMessage } from './adapter.js';
+import type {
+  ChannelAdapter,
+  ChannelDefaults,
+  ChannelRecoveryRequest,
+  ChannelRecoveryResult,
+  ChannelRecoveryTarget,
+  ChannelSetup,
+  InboundMessage,
+} from './adapter.js';
 
 /** Adapter with optional gateway support (e.g., Discord). */
 interface GatewayAdapter extends Adapter {
@@ -248,6 +256,19 @@ export interface ChatSdkBridgeConfig {
    * which would otherwise reach the agent as ordinary user messages.
    */
   inboundFilter?: (message: ChatMessage) => boolean;
+  /** Recover mention semantics from REST-fetched history (SDK fetches may omit isMention). */
+  detectRecoveredMention?: (message: ChatMessage) => boolean;
+  /** Allow selected bot-authored history rows (default recovery policy drops bots). */
+  allowRecoveredBotMessage?: (message: ChatMessage) => boolean;
+  /** Platform override for history pagination when adapter.fetchMessages lacks channel-root support. */
+  fetchRecoveryPage?: (
+    threadId: string,
+    options: { limit: number; direction: 'backward'; cursor?: string; since: string },
+  ) => Promise<{ messages: ChatMessage[]; nextCursor?: string }>;
+  /** Discover thread targets that do not yet have a NanoClaw session. */
+  discoverRecoveryTargets?: (
+    request: ChannelRecoveryRequest,
+  ) => Promise<{ targets: ChannelRecoveryTarget[]; complete: boolean }>;
   /**
    * Override the channelType (and webhook path) for this bridge. Defaults to
    * `adapter.name`. Used by channels that register multiple instances in one
@@ -288,6 +309,57 @@ export interface ChatSdkBridgeConfig {
     threadId: string,
     opts?: { excludeMessageId?: string },
   ) => Promise<Array<{ sender: string; text: string; timestamp: string; isAnchor: true }> | null>;
+}
+
+/**
+ * Allows normal live ingress to remain concurrent while giving recovery an
+ * exclusive barrier. Setting the recovery flag and incrementing activeLive
+ * are synchronous operations on one JS thread, so a live route can never
+ * slip between recovery's check and its wait for the current live set.
+ */
+export class RecoveryIngressGate {
+  private activeLive = 0;
+  private recoveryActive = false;
+  private recoveryDone: Promise<void> = Promise.resolve();
+  private resolveRecoveryDone: (() => void) | null = null;
+  private liveDrained: Promise<void> = Promise.resolve();
+  private resolveLiveDrained: (() => void) | null = null;
+
+  async runLive<T>(run: () => Promise<T>): Promise<T> {
+    while (this.recoveryActive) await this.recoveryDone;
+    this.activeLive++;
+    try {
+      return await run();
+    } finally {
+      this.activeLive--;
+      if (this.activeLive === 0) {
+        this.resolveLiveDrained?.();
+        this.resolveLiveDrained = null;
+        this.liveDrained = Promise.resolve();
+      }
+    }
+  }
+
+  async runRecovery<T>(run: () => Promise<T>): Promise<T> {
+    while (this.recoveryActive) await this.recoveryDone;
+    this.recoveryActive = true;
+    this.recoveryDone = new Promise<void>((resolve) => {
+      this.resolveRecoveryDone = resolve;
+    });
+    if (this.activeLive > 0) {
+      this.liveDrained = new Promise<void>((resolve) => {
+        this.resolveLiveDrained = resolve;
+      });
+      await this.liveDrained;
+    }
+    try {
+      return await run();
+    } finally {
+      this.recoveryActive = false;
+      this.resolveRecoveryDone?.();
+      this.resolveRecoveryDone = null;
+    }
+  }
 }
 
 /**
@@ -416,6 +488,54 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
   let state: SqliteStateAdapter;
   let setupConfig: ChannelSetup;
   let gatewayAbort: AbortController | null = null;
+  let recoveryCursorMs = 0;
+  let recoveryGapFloorMs: number | null = null;
+  const ingressGate = new RecoveryIngressGate();
+  const recoveryCursorKey = `nanoclaw:recovery-cursor:${config.channelType ?? adapter.name}`;
+  const recoveryGapKey = `nanoclaw:recovery-gap:${config.channelType ?? adapter.name}`;
+
+  async function advanceRecoveryCursor(timestamp: string): Promise<void> {
+    const timestampMs = Date.parse(timestamp);
+    if (recoveryGapFloorMs !== null || !Number.isFinite(timestampMs) || timestampMs <= recoveryCursorMs) return;
+    await state.set(recoveryCursorKey, new Date(timestampMs).toISOString());
+    recoveryCursorMs = timestampMs;
+  }
+
+  async function preserveRecoveryGap(sinceMs: number): Promise<number> {
+    const floor = Math.min(
+      sinceMs,
+      recoveryGapFloorMs ?? Number.POSITIVE_INFINITY,
+      recoveryCursorMs > 0 ? recoveryCursorMs : Number.POSITIVE_INFINITY,
+    );
+    recoveryGapFloorMs = floor;
+    recoveryCursorMs = floor;
+    await state.set(recoveryGapKey, new Date(floor).toISOString());
+    await state.set(recoveryCursorKey, new Date(floor).toISOString());
+    return floor;
+  }
+
+  async function completeRecovery(timestampMs: number): Promise<void> {
+    await state.set(recoveryCursorKey, new Date(timestampMs).toISOString());
+    await state.delete(recoveryGapKey);
+    recoveryCursorMs = timestampMs;
+    recoveryGapFloorMs = null;
+  }
+
+  async function forwardInbound(
+    platformId: string,
+    threadId: string | null,
+    message: InboundMessage,
+    updateCursor = true,
+  ): Promise<void> {
+    if (!updateCursor) {
+      await setupConfig.onInbound(platformId, threadId, message);
+      return;
+    }
+    await ingressGate.runLive(async () => {
+      await setupConfig.onInbound(platformId, threadId, message);
+      await advanceRecoveryCursor(message.timestamp);
+    });
+  }
 
   /**
    * Ask the SDK adapter whether a given thread id represents a DM.
@@ -427,7 +547,12 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
     return typeof fn === 'function' ? fn.call(a, threadId) : undefined;
   }
 
-  async function messageToInbound(message: ChatMessage, isMention: boolean, isDM?: boolean): Promise<InboundMessage> {
+  async function messageToInbound(
+    message: ChatMessage,
+    isMention: boolean,
+    isDM?: boolean,
+    recovered = false,
+  ): Promise<InboundMessage> {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const serialized = message.toJSON() as Record<string, any>;
 
@@ -544,6 +669,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       isMention,
       isDM,
       isGroup: isDM === undefined ? undefined : !isDM,
+      recovered,
     };
   }
 
@@ -569,6 +695,22 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       // keyspace — prefixing the default would orphan every live install's
       // chat_sdk_subscriptions/kv/locks/lists rows.
       state = new SqliteStateAdapter(config.instance && config.instance !== adapter.name ? config.instance : undefined);
+
+      // Establish the durable startup gap before Chat initializes the
+      // platform adapter or registers any live traffic. Otherwise an early
+      // webhook/Gateway event can advance the cursor past messages missed
+      // while the host was down, and the later host-startup pass has no way
+      // to recover the overwritten floor.
+      await state.connect();
+      recoveryCursorMs = 0;
+      recoveryGapFloorMs = null;
+      const storedCursor = await state.get<string>(recoveryCursorKey);
+      const storedCursorMs = storedCursor ? Date.parse(storedCursor) : Number.NaN;
+      if (Number.isFinite(storedCursorMs)) recoveryCursorMs = storedCursorMs;
+      const storedGap = await state.get<string>(recoveryGapKey);
+      const storedGapMs = storedGap ? Date.parse(storedGap) : Number.NaN;
+      if (Number.isFinite(storedGapMs)) recoveryGapFloorMs = storedGapMs;
+      await preserveRecoveryGap(Date.now() - 10 * 60 * 1000);
 
       chat = new Chat({
         adapters: { [adapter.name]: adapter },
@@ -630,7 +772,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         const channelId = adapter.channelIdFromThreadId(thread.id);
         const isDM = adapterIsDM(adapter, thread.id);
         reportChannelMetadata(channelId);
-        await setupConfig.onInbound(
+        await forwardInbound(
           channelId,
           resolveThreadId(thread.id, channelId),
           await messageToInbound(message, message.isMention === true, isDM),
@@ -643,7 +785,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         const channelId = adapter.channelIdFromThreadId(thread.id);
         const isDM = adapterIsDM(adapter, thread.id);
         reportChannelMetadata(channelId);
-        await setupConfig.onInbound(
+        await forwardInbound(
           channelId,
           resolveThreadId(thread.id, channelId),
           await messageToInbound(message, true, isDM),
@@ -688,7 +830,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
           threadId: normalizedThreadId,
         });
         // onDirectMessage only fires for real DMs — isDM=true unconditionally.
-        await setupConfig.onInbound(channelId, normalizedThreadId, await messageToInbound(message, true, true));
+        await forwardInbound(channelId, normalizedThreadId, await messageToInbound(message, true, true));
       });
 
       // Plain messages in unsubscribed threads.
@@ -706,7 +848,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         const channelId = adapter.channelIdFromThreadId(thread.id);
         const isDM = adapterIsDM(adapter, thread.id);
         reportChannelMetadata(channelId);
-        await setupConfig.onInbound(
+        await forwardInbound(
           channelId,
           resolveThreadId(thread.id, channelId),
           await messageToInbound(message, false, isDM),
@@ -755,7 +897,10 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
         gatewayAbort = new AbortController();
 
         // Start local HTTP server to receive forwarded Gateway events (including interactions)
-        const webhookUrl = await startLocalWebhookServer(gatewayAdapter, setupConfig, config.botToken);
+        const webhookUrl = await startLocalWebhookServer(gatewayAdapter, setupConfig, config.botToken, (reason) => {
+          const sinceMs = recoveryCursorMs > 0 ? recoveryCursorMs : Date.now() - 10 * 60 * 1000;
+          return setupConfig.onConnectionRestored?.({ since: new Date(sinceMs).toISOString(), reason });
+        });
 
         // Exponential backoff capped at 1h. Without this, an unrecoverable
         // failure (e.g., TokenInvalid) restarts ~10×/sec and Discord's
@@ -1145,6 +1290,168 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
       return inThread;
     },
 
+    async recoverMissedMessages(request: ChannelRecoveryRequest): Promise<ChannelRecoveryResult> {
+      return ingressGate.runRecovery(async () => {
+        const requestedSinceMs = Date.parse(request.since);
+        if (!Number.isFinite(requestedSinceMs)) {
+          throw new Error(`Invalid channel recovery timestamp: ${request.since}`);
+        }
+        const sinceMs = await preserveRecoveryGap(requestedSinceMs);
+        const effectiveSince = new Date(sinceMs).toISOString();
+        const recoveryStartedAtMs = Date.now();
+
+        const targetsByAddress = new Map<string, ChannelRecoveryTarget>();
+        for (const target of request.targets) {
+          targetsByAddress.set(`${target.platformId}\u0000${target.threadId ?? ''}`, target);
+        }
+        let failedTargets = 0;
+        if (config.discoverRecoveryTargets) {
+          try {
+            const discovery = await config.discoverRecoveryTargets({
+              ...request,
+              since: effectiveSince,
+              targets: [...targetsByAddress.values()],
+            });
+            for (const target of discovery.targets) {
+              targetsByAddress.set(`${target.platformId}\u0000${target.threadId ?? ''}`, target);
+            }
+            if (!discovery.complete) failedTargets++;
+          } catch (err) {
+            failedTargets++;
+            log.warn('Channel recovery target discovery failed', {
+              adapter: adapter.name,
+              since: effectiveSince,
+              err: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
+        const targets = [...targetsByAddress.values()];
+
+        const recovered: Array<{
+          target: ChannelRecoveryRequest['targets'][number];
+          message: ChatMessage;
+        }> = [];
+        const seen = new Set<string>();
+
+        // Fetch newest-first pages until the requested gap boundary is covered.
+        // A fixed cap would retry the same newest pages forever on a large gap,
+        // so pagination continues to the boundary and rejects cursor loops.
+        for (const target of targets) {
+          const targetThreadId =
+            target.threadId ??
+            (adapter.name.startsWith('slack') && !target.platformId.endsWith(':')
+              ? `${target.platformId}:`
+              : target.platformId);
+          let cursor: string | undefined;
+          let coveredBoundary = false;
+          const seenCursors = new Set<string>();
+          try {
+            for (;;) {
+              const fetchPage = config.fetchRecoveryPage ?? adapter.fetchMessages.bind(adapter);
+              const result = await fetchPage(targetThreadId, {
+                limit: 100,
+                direction: 'backward',
+                cursor,
+                since: effectiveSince,
+              });
+              const messages = result?.messages ?? [];
+              let oldestMs = Number.POSITIVE_INFINITY;
+              for (const message of messages) {
+                const messageMs = message.metadata.dateSent.getTime();
+                oldestMs = Math.min(oldestMs, messageMs);
+                if (messageMs <= sinceMs) continue;
+                if (message.author.isMe) continue;
+                if (message.author.isBot === true && !config.allowRecoveredBotMessage?.(message)) continue;
+                if (config.inboundFilter && !config.inboundFilter(message)) continue;
+                const dedupeKey = `${target.platformId}\u0000${message.id}`;
+                if (seen.has(dedupeKey)) continue;
+                seen.add(dedupeKey);
+                recovered.push({ target, message });
+              }
+              if (oldestMs <= sinceMs || !result?.nextCursor) {
+                coveredBoundary = true;
+                break;
+              }
+              if (seenCursors.has(result.nextCursor)) {
+                log.warn('Channel recovery pagination cursor repeated before gap boundary', {
+                  adapter: adapter.name,
+                  targetThreadId,
+                  since: effectiveSince,
+                  cursor: result.nextCursor,
+                });
+                break;
+              }
+              seenCursors.add(result.nextCursor);
+              cursor = result.nextCursor;
+            }
+            if (!coveredBoundary) {
+              failedTargets++;
+              log.warn('Channel recovery could not reach gap boundary', {
+                adapter: adapter.name,
+                targetThreadId,
+                since: effectiveSince,
+              });
+            }
+          } catch (err) {
+            failedTargets++;
+            log.warn('Channel recovery target fetch failed', {
+              adapter: adapter.name,
+              targetThreadId,
+              since: effectiveSince,
+              err: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
+
+        recovered.sort((a, b) => a.message.metadata.dateSent.getTime() - b.message.metadata.dateSent.getTime());
+        let recoveredMessages = 0;
+        let newestRecoveredAt = 0;
+        for (const { target, message } of recovered) {
+          let threadId = target.threadId;
+          if (target.isDM) {
+            threadId = message.threadId;
+            if (adapter.name.startsWith('slack') && threadId.endsWith(':')) {
+              threadId = `${threadId}${message.id}`;
+            }
+          } else if (threadId === null && message.threadId && message.threadId !== target.platformId) {
+            // Some adapters model a channel-root post as the root of a native
+            // reply thread (Slack: slack:<channel>:<message-ts>). Preserve that
+            // address; Discord root messages use message.threadId===platformId
+            // and correctly remain null.
+            threadId = message.threadId;
+          }
+          const isMention =
+            target.isDM || message.isMention === true || config.detectRecoveredMention?.(message) === true;
+          try {
+            await forwardInbound(
+              target.platformId,
+              threadId,
+              await messageToInbound(message, isMention, target.isDM, true),
+              false,
+            );
+            recoveredMessages++;
+            newestRecoveredAt = Math.max(newestRecoveredAt, message.metadata.dateSent.getTime());
+          } catch (err) {
+            failedTargets++;
+            log.warn('Channel recovery message routing failed', {
+              adapter: adapter.name,
+              messageId: message.id,
+              err: err instanceof Error ? err.message : String(err),
+            });
+            break;
+          }
+        }
+
+        // Never advance the durable cursor across an incomplete target. A later
+        // recovery safely replays the overlap. The gap floor also suppresses
+        // cursor advancement by later live messages until a complete pass.
+        if (failedTargets === 0) {
+          await completeRecovery(Math.max(newestRecoveredAt, recoveryStartedAtMs));
+        }
+        return { scannedTargets: targets.length, recoveredMessages, failedTargets };
+      });
+    },
+
     async subscribe(_platformId: string, threadId: string) {
       // Chat SDK's subscription state lives on the StateAdapter (not on the
       // Chat instance itself). SqliteStateAdapter.subscribe is idempotent —
@@ -1185,14 +1492,24 @@ function startLocalWebhookServer(
   adapter: GatewayAdapter,
   setupConfig: ChannelSetup,
   botToken?: string,
+  onConnectionRestored?: (reason: 'transport-ready' | 'transport-resumed') => void | Promise<void>,
 ): Promise<string> {
   return new Promise((resolve) => {
+    let eventTail: Promise<void> = Promise.resolve();
     const server = http.createServer((req, res) => {
       const chunks: Buffer[] = [];
       req.on('data', (chunk: Buffer) => chunks.push(chunk));
       req.on('end', () => {
         const body = Buffer.concat(chunks).toString();
-        handleForwardedEvent(body, adapter, setupConfig, botToken)
+        // The Discord adapter launches one async HTTP request per raw Gateway
+        // packet. EventEmitter does not await those listeners, so READY and a
+        // following MESSAGE_CREATE can otherwise complete out of order. Queue
+        // the local handlers and hold later packets behind reconnect recovery.
+        const handled = eventTail.then(() =>
+          handleForwardedEvent(body, adapter, setupConfig, botToken, onConnectionRestored),
+        );
+        eventTail = handled.catch(() => undefined);
+        handled
           .then(() => {
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end('{"ok":true}');
@@ -1214,11 +1531,12 @@ function startLocalWebhookServer(
   });
 }
 
-async function handleForwardedEvent(
+export async function handleForwardedEvent(
   body: string,
   adapter: GatewayAdapter,
   setupConfig: ChannelSetup,
   botToken?: string,
+  onConnectionRestored?: (reason: 'transport-ready' | 'transport-resumed') => void | Promise<void>,
 ): Promise<void> {
   let event: { type: string; data: Record<string, unknown> };
   try {
@@ -1291,6 +1609,9 @@ async function handleForwardedEvent(
     }
   }
 
+  const connectionReason =
+    event.type === 'GATEWAY_READY' ? 'transport-ready' : event.type === 'GATEWAY_RESUMED' ? 'transport-resumed' : null;
+
   // Forward other events to the adapter's webhook handler for normal processing
   const fakeRequest = new Request('http://localhost/webhook', {
     method: 'POST',
@@ -1301,4 +1622,16 @@ async function handleForwardedEvent(
     body,
   });
   await adapter.handleWebhook(fakeRequest, {});
+  if (connectionReason && onConnectionRestored) {
+    try {
+      await onConnectionRestored(connectionReason);
+    } catch (err) {
+      log.warn('Connection-restored recovery callback failed', {
+        adapter: adapter.name,
+        reason: connectionReason,
+        err,
+      });
+      throw err;
+    }
+  }
 }

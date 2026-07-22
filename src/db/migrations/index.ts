@@ -46,6 +46,7 @@ import { migration040 } from './040-pair-provider-siblings.js';
 import { migration041 } from './041-support-threads.js';
 import { migration042 } from './042-support-threads-subject-sender.js';
 import { migration043 } from './043-scheduled-audit.js';
+import { migration044 } from './044-channel-ingress-receipts.js';
 // Upstream's 014/015 — file numbers clash with local but uniqueness is by `name`.
 // Aliased to avoid JS identifier collisions with the local 014/015 above.
 import { migration014 as containerConfigs } from './014-container-configs.js';
@@ -110,6 +111,7 @@ export const migrations: Migration[] = [
   migration041,
   migration042,
   migration043,
+  migration044,
   containerConfigs,
   cliScope,
   messagingGroupInstance,

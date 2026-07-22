@@ -141,46 +141,49 @@ export function nextEvenSeq(db: Database.Database): number {
   return maxSeq < 2 ? 2 : maxSeq + 2 - (maxSeq % 2);
 }
 
-export function insertMessage(
-  db: Database.Database,
-  message: {
-    id: string;
-    kind: string;
-    timestamp: string;
-    platformId: string | null;
-    channelType: string | null;
-    threadId: string | null;
-    content: string;
-    processAfter: string | null;
-    recurrence: string | null;
-    /**
-     * 1 = wake the agent (default); 0 = accumulate as context only.
-     * Host countDueMessages gates on this; container reads everything.
-     */
-    trigger?: 0 | 1;
-    /**
-     * For agent-to-agent inbound: the source session id that emitted the
-     * outbound message which became this inbound row. Used as the return
-     * path for the target's reply. NULL on channel-side inbound.
-     */
-    sourceSessionId?: string | null;
-    /**
-     * 1 = only deliver on the container's first poll (fresh start).
-     * Dying containers (past first poll) skip these rows.
-     */
-    onWake?: 0 | 1;
-  },
-): void {
-  db.prepare(
-    `INSERT INTO messages_in (id, seq, kind, timestamp, status, platform_id, channel_type, thread_id, content, process_after, recurrence, series_id, trigger, source_session_id, on_wake)
-     VALUES (@id, @seq, @kind, @timestamp, 'pending', @platformId, @channelType, @threadId, @content, @processAfter, @recurrence, @id, @trigger, @sourceSessionId, @onWake)`,
-  ).run({
-    ...message,
-    trigger: message.trigger ?? 1,
-    onWake: message.onWake ?? 0,
-    sourceSessionId: message.sourceSessionId ?? null,
-    seq: nextEvenSeq(db),
-  });
+interface MessageInsert {
+  id: string;
+  kind: string;
+  timestamp: string;
+  platformId: string | null;
+  channelType: string | null;
+  threadId: string | null;
+  content: string;
+  processAfter: string | null;
+  recurrence: string | null;
+  /** 1 = wake the agent (default); 0 = accumulate as context only. */
+  trigger?: 0 | 1;
+  /** Source session for agent-to-agent return routing. NULL on channel inbound. */
+  sourceSessionId?: string | null;
+  /** 1 = only deliver on the container's first poll (fresh start). */
+  onWake?: 0 | 1;
+}
+
+function runInsertMessage(db: Database.Database, message: MessageInsert, ignoreDuplicateId: boolean): boolean {
+  const conflictClause = ignoreDuplicateId ? ' ON CONFLICT(id) DO NOTHING' : '';
+  const result = db
+    .prepare(
+      `INSERT INTO messages_in (id, seq, kind, timestamp, status, platform_id, channel_type, thread_id, content, process_after, recurrence, series_id, trigger, source_session_id, on_wake)
+       VALUES (@id, @seq, @kind, @timestamp, 'pending', @platformId, @channelType, @threadId, @content, @processAfter, @recurrence, @id, @trigger, @sourceSessionId, @onWake)${conflictClause}`,
+    )
+    .run({
+      ...message,
+      trigger: message.trigger ?? 1,
+      onWake: message.onWake ?? 0,
+      sourceSessionId: message.sourceSessionId ?? null,
+      seq: nextEvenSeq(db),
+    });
+  return result.changes > 0;
+}
+
+/** Strict insert used by internal host flows; duplicate ids remain programmer errors. */
+export function insertMessage(db: Database.Database, message: MessageInsert): void {
+  runInsertMessage(db, message, false);
+}
+
+/** Channel replay insert; only an id collision is ignored, never other constraints. */
+export function insertMessageIfNew(db: Database.Database, message: MessageInsert): boolean {
+  return runInsertMessage(db, message, true);
 }
 
 export function countDueMessages(db: Database.Database): number {

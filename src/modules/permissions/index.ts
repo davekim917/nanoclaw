@@ -20,7 +20,8 @@ import { getAgentGroup, getAllAgentGroups } from '../../db/agent-groups.js';
 import { createMessagingGroupAgent, getMessagingGroup, setMessagingGroupDeniedAt } from '../../db/messaging-groups.js';
 import { resolveWiringDefaults } from '../../channels/channel-defaults.js';
 import {
-  routeInbound,
+  completeDeferredInbound,
+  replayDeferredInbound,
   setAccessGate,
   setChannelRequestGate,
   registerMessageInterceptor,
@@ -113,13 +114,21 @@ function safeParseContent(raw: string): { text?: string; sender?: string; sender
   }
 }
 
-function handleUnknownSender(
+function completeStoredDeferredInbound(raw: string): void {
+  try {
+    completeDeferredInbound(JSON.parse(raw) as InboundEvent);
+  } catch {
+    // Malformed legacy approval rows have no recoverable receipt key.
+  }
+}
+
+async function handleUnknownSender(
   mg: MessagingGroup,
   userId: string | null,
   agentGroupId: string,
   accessReason: string,
   event: InboundEvent,
-): void {
+): Promise<boolean> {
   const parsed = safeParseContent(event.message.content);
   const senderName = parsed.sender ?? null;
   const dropRecord = {
@@ -140,7 +149,7 @@ function handleUnknownSender(
       accessReason,
     });
     recordDroppedMessage(dropRecord);
-    return;
+    return false;
   }
 
   if (mg.unknown_sender_policy === 'request_approval') {
@@ -151,24 +160,26 @@ function handleUnknownSender(
       accessReason,
     });
     recordDroppedMessage(dropRecord);
-    // Fire-and-forget; pick-approver + delivery + row-insert are all async.
-    // If it fails it logs internally — the user's message still stays dropped
-    // either way. Requires a resolved userId (senderResolver populates users
-    // row before the gate fires); if we got here without one, there's nothing
-    // to identify for approval and we just stay in the "silent strict" branch.
+    // Await persistence so the router defers only the exact event stored for
+    // replay. Requires a resolved userId; without one there is nothing stable
+    // to approve and this remains an ordinary completed drop.
     if (userId) {
-      requestSenderApproval({
+      return requestSenderApproval({
         messagingGroupId: mg.id,
         agentGroupId,
         senderIdentity: userId,
         senderName,
         event,
-      }).catch((err) => log.error('Sender-approval flow threw', { err }));
+      }).catch((err) => {
+        log.error('Sender-approval flow threw', { err });
+        return false;
+      });
     }
-    return;
+    return false;
   }
 
   // 'public' should have been handled before the gate; fall through silently.
+  return false;
 }
 
 setSenderResolver(extractAndUpsertUser);
@@ -186,15 +197,19 @@ export function setSiblingBotIdsProvider(provider: () => ReadonlySet<string>): v
   getSiblingBotIds = provider;
 }
 
-setAccessGate((event, userId, mg, agentGroupId): AccessGateResult => {
+setAccessGate(async (event, userId, mg, agentGroupId): Promise<AccessGateResult> => {
   // Public channels skip the access check entirely.
   if (mg.unknown_sender_policy === 'public') {
     return { allowed: true };
   }
 
   if (!userId) {
-    handleUnknownSender(mg, null, agentGroupId, 'unknown_user', event);
-    return { allowed: false, reason: 'unknown_user' };
+    await handleUnknownSender(mg, null, agentGroupId, 'unknown_user', event);
+    return {
+      allowed: false,
+      reason: 'unknown_user',
+      replayPending: false,
+    };
   }
 
   const decision = canAccessAgentGroup(userId, agentGroupId);
@@ -217,8 +232,12 @@ setAccessGate((event, userId, mg, agentGroupId): AccessGateResult => {
     return { allowed: true };
   }
 
-  handleUnknownSender(mg, userId, agentGroupId, decision.reason, event);
-  return { allowed: false, reason: decision.reason };
+  const replayPending = await handleUnknownSender(mg, userId, agentGroupId, decision.reason, event);
+  return {
+    allowed: false,
+    reason: decision.reason,
+    replayPending,
+  };
 });
 
 /**
@@ -299,7 +318,7 @@ async function handleSenderApprovalResponse(payload: ResponsePayload): Promise<b
 
     try {
       const event = JSON.parse(row.original_message) as InboundEvent;
-      await routeInbound(event);
+      await replayDeferredInbound(event);
     } catch (err) {
       log.error('Failed to replay message after sender approval', { approvalId: row.id, err });
     }
@@ -313,6 +332,7 @@ async function handleSenderApprovalResponse(payload: ResponsePayload): Promise<b
     approverId,
   });
   deletePendingSenderApproval(row.id);
+  completeStoredDeferredInbound(row.original_message);
   return true;
 }
 
@@ -321,7 +341,7 @@ registerResponseHandler(handleSenderApprovalResponse);
 // ── Unknown-channel registration flow ──
 
 setChannelRequestGate(async (mg, event) => {
-  await requestChannelApproval({ messagingGroupId: mg.id, event });
+  return requestChannelApproval({ messagingGroupId: mg.id, event });
 });
 
 /**
@@ -372,6 +392,7 @@ async function wireApprovedChannel(
       err,
     });
     deletePendingChannelApproval(row.messaging_group_id);
+    completeDeferredInbound(event);
     return false;
   }
 
@@ -417,7 +438,7 @@ async function wireApprovedChannel(
   deletePendingChannelApproval(row.messaging_group_id);
 
   try {
-    await routeInbound(event);
+    await replayDeferredInbound(event);
   } catch (err) {
     log.error('Failed to replay message after channel approval', {
       messagingGroupId: row.messaging_group_id,
@@ -466,6 +487,7 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
   if (payload.value === REJECT_VALUE) {
     setMessagingGroupDeniedAt(row.messaging_group_id, new Date().toISOString());
     deletePendingChannelApproval(row.messaging_group_id);
+    completeStoredDeferredInbound(row.original_message);
     log.info('Channel registration denied', {
       messagingGroupId: row.messaging_group_id,
       approverId,
@@ -570,6 +592,7 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
         targetAgentGroupId,
       });
       deletePendingChannelApproval(row.messaging_group_id);
+      completeStoredDeferredInbound(row.original_message);
       return true;
     }
     if (!hasAdminPrivilege(approverId, targetAgentGroupId)) {
