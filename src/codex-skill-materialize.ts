@@ -102,7 +102,9 @@ export interface MaterializeRefreshResult {
  * refresh, not a discovery pass, so it never invents materialized trees for plugins
  * the operator hasn't enabled for Codex.
  */
-export function refreshMaterializedCodexSkills(pluginsRoot = path.join(os.homedir(), 'plugins')): MaterializeRefreshResult {
+export function refreshMaterializedCodexSkills(
+  pluginsRoot = path.join(os.homedir(), 'plugins'),
+): MaterializeRefreshResult {
   const refreshed: string[] = [];
   let names: string[] = [];
   try {
