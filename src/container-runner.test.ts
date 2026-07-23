@@ -552,6 +552,35 @@ describe('codex provider primary auth refresh mount', () => {
   });
 });
 
+describe('dependency-audit script mount', () => {
+  // scripts/ is excluded from the /workspace/project allowlist, so nothing
+  // mounted the audit script and the weekly update advisory died every week
+  // with `Module not found "/workspace/project/scripts/container-updates.ts"`.
+  // That literal now lives in three in-repo places (the mount, the slash-command
+  // prompt, the precheck script) plus verbatim copies embedded in live
+  // recurring-task rows in session inbound.dbs. Drift in any of them silently
+  // breaks the advisory again, so pin them to one value here.
+  const AUDIT_CONTAINER_PATH = '/workspace/project/scripts/container-updates.ts';
+
+  it('mounts the audit script read-only at the path its callers invoke', () => {
+    const src = fs.readFileSync(new URL('./container-runner.ts', import.meta.url), 'utf8');
+    const mountIdx = src.indexOf(`containerPath: '${AUDIT_CONTAINER_PATH}'`);
+    const readOnlyIdx = src.indexOf('readonly: true', mountIdx);
+
+    expect(mountIdx).toBeGreaterThan(-1);
+    expect(readOnlyIdx).toBeGreaterThan(mountIdx);
+  });
+
+  it('keeps the slash-command prompt and precheck script on that same path', () => {
+    const prompt = fs.readFileSync(new URL('./channels/discord-slash-commands.ts', import.meta.url), 'utf8');
+    expect(prompt).toContain(AUDIT_CONTAINER_PATH);
+
+    const precheck = fs.readFileSync(new URL('../scripts/container-updates-precheck.sh', import.meta.url), 'utf8');
+    expect(precheck).toContain('NANOCLAW_PROJECT_ROOT:-/workspace/project');
+    expect(precheck).toContain('$PROJECT_ROOT/scripts/container-updates.ts');
+  });
+});
+
 // ── Workgroup reconciler tests (C1) ──────────────────────────────────────────
 
 /** Create a minimal in-memory DB with the workgroup schema (migration 036). */
