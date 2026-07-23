@@ -281,10 +281,97 @@ interface CodexRegistration {
 
 /** Codex-native registration: generate `.codex-plugin/plugin.json` + a self-referencing
  * marketplace.json when missing, then report (never execute) the `codex plugin` commands. */
+/**
+ * Marketplace monorepos carry no skills at the repo root — each plugin lives one level
+ * down (`claude-plugins-official/plugins/playground`, `role-specific-plugins/plugins/
+ * data-analytics`, `knowledge-work-plugins/data`). Generate a `.codex-plugin` manifest
+ * inside each CHECKED-OUT sub-plugin so Codex can register them; a sparse checkout then
+ * naturally yields only what's on disk.
+ *
+ * Returns the sub-plugin dirs we generated (or already found) manifests for.
+ */
+/** Marketplace name from either manifest location Codex accepts. */
+function readAnyMarketplaceName(repoDir: string): string | null {
+  for (const rel of [
+    path.join('.agents', 'plugins', 'marketplace.json'),
+    path.join('.claude-plugin', 'marketplace.json'),
+  ]) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(path.join(repoDir, rel), 'utf-8')) as { name?: unknown };
+      if (typeof parsed.name === 'string' && parsed.name.trim()) return parsed.name;
+    } catch {
+      /* try next */
+    }
+  }
+  return null;
+}
+
+/** The `name` a plugin dir declares in its own .codex-plugin manifest. */
+function readDeclaredCodexName(pluginDir: string): string | null {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(path.join(pluginDir, '.codex-plugin', 'plugin.json'), 'utf-8')) as {
+      name?: unknown;
+    };
+    return typeof parsed.name === 'string' && parsed.name.trim() ? parsed.name : null;
+  } catch {
+    return null;
+  }
+}
+
+function ensureCodexSubPluginManifests(repoDir: string, dryRun: boolean): { dir: string; generated: boolean }[] {
+  const out: { dir: string; generated: boolean }[] = [];
+  const seen = new Set<string>();
+  for (const container of [path.join(repoDir, 'plugins'), repoDir]) {
+    if (!isDirectory(container)) continue;
+    let subs: string[] = [];
+    try {
+      subs = fs.readdirSync(container);
+    } catch {
+      continue;
+    }
+    for (const sub of subs) {
+      if (sub.startsWith('.')) continue;
+      const subDir = path.join(container, sub);
+      if (seen.has(subDir) || !isDirectory(subDir)) continue;
+      // Only dirs that declare themselves a plugin — the same signal the native loaders use.
+      if (!fs.existsSync(path.join(subDir, '.claude-plugin', 'plugin.json'))) continue;
+      const root = findCodexSkillsRoot(subDir);
+      if (root === null) continue;
+      seen.add(subDir);
+      const resolved = materializeSymlinkedSkills(subDir, root, dryRun);
+      out.push({ dir: subDir, generated: ensureCodexPluginManifest(subDir, sub, resolved, dryRun) });
+    }
+  }
+  return out;
+}
+
 function resolveCodexRegistration(dir: string, name: string, dryRun: boolean): CodexRegistration {
   const discoveredRoot = findCodexSkillsRoot(dir);
   const skillsRoot = discoveredRoot === null ? null : materializeSymlinkedSkills(dir, discoveredRoot, dryRun);
   if (skillsRoot === null) {
+    // No skills at the root — treat it as a marketplace monorepo and handle its
+    // sub-plugins. The repo's own marketplace.json supplies the marketplace name.
+    const subs = ensureCodexSubPluginManifests(dir, dryRun);
+    if (subs.length > 0) {
+      const self = parseCodexMarketplaceSelfEntry(path.join(dir, '.agents', 'plugins', 'marketplace.json'));
+      const mkt = self?.marketplaceName ?? readAnyMarketplaceName(dir);
+      const entries = subs
+        .map((s) => readDeclaredCodexName(s.dir))
+        .filter((n): n is string => Boolean(n));
+      return {
+        skillsRoot: `${subs.length} sub-plugin(s)`,
+        manifestGenerated: subs.some((s) => s.generated),
+        marketplaceGenerated: false,
+        registered: Boolean(mkt) && entries.length > 0,
+        commands: mkt
+          ? [
+              `codex plugin marketplace add ${dir}`,
+              ...entries.map((e) => `codex plugin add ${e}@${mkt}`),
+            ]
+          : [],
+        reason: mkt ? null : 'monorepo has no marketplace.json name',
+      };
+    }
     return {
       skillsRoot: null,
       manifestGenerated: false,

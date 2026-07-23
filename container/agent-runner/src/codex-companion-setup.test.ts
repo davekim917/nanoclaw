@@ -440,7 +440,7 @@ describe('planCodexPluginRegistration', () => {
 
     const plans = planCodexPluginRegistration(root);
     expect(plans).toEqual([
-      { name: 'skills', action: 'register', entryName: 'wix', marketplaceName: 'skills' },
+      { name: 'skills', action: 'register', entryName: 'wix', marketplaceName: 'skills', repoName: 'skills' },
     ]);
   });
 
@@ -465,8 +465,39 @@ describe('planCodexPluginRegistration', () => {
       action: 'register',
       entryName: 'taste-skill',
       marketplaceName: 'taste-skill',
+      // `repoName` is the dir `codex plugin marketplace add` targets. For a
+      // single-plugin repo it equals `name`; for a monorepo sub-plugin the label
+      // is `<repo>/<entry>` while repoName stays the repo root.
+      repoName: 'taste-skill',
     });
     expect(plans).toHaveLength(3);
+  });
+
+  it('registers marketplace-monorepo sub-plugins (no manifest at the repo root)', () => {
+    // Regression guard. role-specific-plugins / claude-plugins-official / bootstrap keep
+    // their .codex-plugin manifests one level down. Planning only top-level manifests
+    // silently dropped those ENTIRE repos — data-analytics (14 skills) and
+    // bootstrap-workflow-agents (17) vanished from codex containers with no error.
+    const repo = path.join(root, 'monorepo');
+    fs.mkdirSync(path.join(repo, '.agents', 'plugins'), { recursive: true });
+    writeJson(path.join(repo, '.agents', 'plugins', 'marketplace.json'), { name: 'monorepo-mkt' });
+    // Checked-out sub-plugin WITH a manifest → registers.
+    const sub = path.join(repo, 'plugins', 'analytics');
+    fs.mkdirSync(path.join(sub, '.codex-plugin'), { recursive: true });
+    writeJson(path.join(sub, '.codex-plugin', 'plugin.json'), { name: 'data-analytics' });
+    // Sub-dir advertised by the marketplace but NOT checked out / no manifest → ignored,
+    // which is what makes a sparse checkout register only what is actually present.
+    fs.mkdirSync(path.join(repo, 'plugins', 'not-checked-out'), { recursive: true });
+
+    const byName = new Map(planCodexPluginRegistration(root).map((p) => [p.name, p]));
+    expect(byName.get('monorepo/data-analytics')).toEqual({
+      name: 'monorepo/data-analytics',
+      action: 'register',
+      entryName: 'data-analytics',
+      marketplaceName: 'monorepo-mkt',
+      repoName: 'monorepo',
+    });
+    expect(byName.has('monorepo/not-checked-out')).toBe(false);
   });
 });
 

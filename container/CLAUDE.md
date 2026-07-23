@@ -158,6 +158,20 @@ bundled imagegen `SKILL.md` claim that file output needs the OpenAI API is wrong
 that's only for transparent backgrounds, and NanoClaw uses no OpenAI key. Never
 report "blocked / access_restricted" for an ordinary image-file request.
 
+## Delivering HTML / interactive artifacts (playgrounds, reports, dashboards)
+
+Some skills tell you to "open the file in a browser" (the `playground` plugin says to run
+`open <file>.html`). That instruction assumes local Claude Code. **It does nothing useful
+here** — the container has no display, and the user isn't sitting at this machine. `open`
+and `xdg-open` exist in the image, so the command won't even error loudly; it just
+silently fails to reach anyone.
+
+Instead: write the file into your workspace and **send it as a chat attachment**, then
+tell the user to download and open it. Self-contained single-file HTML is ideal for this
+(no server, no build step). For a playground specifically, the loop is: you build it →
+attach it → the user opens it locally, adjusts the controls, copies the generated prompt
+→ pastes that prompt back into the thread.
+
 ## Conversation history
 
 The `conversations/` folder in your workspace holds searchable transcripts of past sessions with this group. Use it to recall prior context when a request references something that happened before. For structured long-lived data, prefer dedicated files (`customers.md`, `preferences.md`, etc.); split any file over ~500 lines into a folder with an index.

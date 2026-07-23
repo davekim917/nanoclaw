@@ -552,21 +552,75 @@ function readCodexPluginEntryName(pluginDir: string): string | null {
  * aren't natively Codex-registerable.
  */
 function readCodexMarketplaceName(pluginDir: string): string | null {
-  try {
-    const raw = fs.readFileSync(path.join(pluginDir, '.agents', 'plugins', 'marketplace.json'), 'utf-8');
-    const parsed = JSON.parse(raw) as { name?: unknown };
-    return typeof parsed.name === 'string' && parsed.name.trim() ? parsed.name : null;
-  } catch {
-    return null;
+  // `.agents/plugins/` is the Codex-native location; Codex also accepts a
+  // `.claude-plugin/marketplace.json` (verified: `codex plugin marketplace add`
+  // resolves anthropics/knowledge-work-plugins through it), which is what
+  // Claude-first marketplace monorepos ship.
+  for (const rel of [
+    path.join('.agents', 'plugins', 'marketplace.json'),
+    path.join('.claude-plugin', 'marketplace.json'),
+  ]) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(path.join(pluginDir, rel), 'utf-8')) as { name?: unknown };
+      if (typeof parsed.name === 'string' && parsed.name.trim()) return parsed.name;
+    } catch {
+      /* try the next location */
+    }
   }
+  return null;
+}
+
+/**
+ * Sub-plugin dirs inside a marketplace MONOREPO that are themselves registerable.
+ *
+ * Some repos carry no top-level `.codex-plugin/plugin.json` — the manifests live one
+ * level down (`role-specific-plugins/plugins/data-analytics/`,
+ * `claude-plugins-official/plugins/playground/`, `knowledge-work-plugins/data/`).
+ * Registering only top-level manifests silently drops those entire repos, which is
+ * exactly how data-analytics stopped reaching Codex containers.
+ *
+ * We only return sub-dirs that BOTH exist on disk AND carry a `.codex-plugin` manifest.
+ * That is what makes a sparse checkout do the right thing: a monorepo's marketplace.json
+ * may advertise a dozen plugins, but if only one was checked out, only that one registers.
+ */
+function findCodexSubPlugins(pluginDir: string): Array<{ dir: string; entryName: string }> {
+  const found: Array<{ dir: string; entryName: string }> = [];
+  const seen = new Set<string>();
+  // Both monorepo layouts: `<root>/plugins/<sub>` and `<root>/<sub>`.
+  for (const container of [path.join(pluginDir, 'plugins'), pluginDir]) {
+    if (!isDirectorySafe(container)) continue;
+    let subs: string[] = [];
+    try {
+      subs = fs.readdirSync(container);
+    } catch {
+      continue;
+    }
+    for (const sub of subs) {
+      if (sub.startsWith('.')) continue;
+      const dir = path.join(container, sub);
+      if (seen.has(dir) || !isDirectorySafe(dir)) continue;
+      const entryName = readCodexPluginEntryName(dir);
+      if (!entryName) continue;
+      seen.add(dir);
+      found.push({ dir, entryName });
+    }
+  }
+  return found;
 }
 
 export interface CodexPluginRegistrationPlan {
+  /** Display label. For a monorepo sub-plugin this is `<repo>/<entry>`. */
   name: string;
   action: 'register' | 'skip';
   reason?: string;
   entryName?: string;
   marketplaceName?: string;
+  /**
+   * Top-level folder under the plugins root that `codex plugin marketplace add`
+   * must target. Distinct from `name`: a monorepo sub-plugin's marketplace is the
+   * REPO root, not the sub-directory, so the dir can't be derived from the label.
+   */
+  repoName?: string;
 }
 
 /**
@@ -604,17 +658,34 @@ export function planCodexPluginRegistration(pluginsRoot: string): CodexPluginReg
       plans.push({ name, action: 'skip', reason: 'denied-for-codex' });
       continue;
     }
-    const entryName = readCodexPluginEntryName(dir);
-    if (!entryName) {
-      plans.push({ name, action: 'skip', reason: 'no-codex-plugin-manifest' });
-      continue;
-    }
     const marketplaceName = readCodexMarketplaceName(dir);
     if (!marketplaceName) {
       plans.push({ name, action: 'skip', reason: 'no-marketplace-manifest' });
       continue;
     }
-    plans.push({ name, action: 'register', entryName, marketplaceName });
+    const entryName = readCodexPluginEntryName(dir);
+    if (entryName) {
+      // Single-plugin repo: the repo root IS the plugin.
+      plans.push({ name, action: 'register', entryName, marketplaceName, repoName: name });
+      continue;
+    }
+    // Marketplace monorepo: no manifest at the root, so register each checked-out
+    // sub-plugin against the repo's marketplace. `codex plugin marketplace add` is
+    // run once per plan against the same repo dir, which is idempotent.
+    const subs = findCodexSubPlugins(dir);
+    if (subs.length === 0) {
+      plans.push({ name, action: 'skip', reason: 'no-codex-plugin-manifest' });
+      continue;
+    }
+    for (const sub of subs) {
+      plans.push({
+        name: `${name}/${sub.entryName}`,
+        action: 'register',
+        entryName: sub.entryName,
+        marketplaceName,
+        repoName: name,
+      });
+    }
   }
   return plans;
 }
@@ -661,7 +732,8 @@ export function registerContainerCodexPlugins(
       continue;
     }
 
-    const dir = path.join(CONTAINER_PLUGINS_DIR, plan.name);
+    // Monorepo sub-plugins register against their REPO root, not the label path.
+    const dir = path.join(CONTAINER_PLUGINS_DIR, plan.repoName ?? plan.name);
     const addMarketplace = spawnSync('codex', ['plugin', 'marketplace', 'add', dir], {
       env,
       timeout: 60_000,
