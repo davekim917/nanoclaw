@@ -604,6 +604,7 @@ export function writeCodexHooksJson(opts?: { emailGateTimeoutSec?: number }): vo
 export function createCodexConfigOverrides(
   stickyConfig?: {
     reasoning_effort?: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra';
+    max_concurrent_threads_per_session?: number;
   },
   fast = false,
 ): string[] {
@@ -631,6 +632,14 @@ export function createCodexConfigOverrides(
     'features.goals=true',
     'features.steer=true',
     'features.fast_mode=true',
+    // Bound native collaboration at the app-server boundary. Each Codex
+    // subagent owns a full MCP subprocess tree, so an inherited host setting
+    // that permits an unbounded/high worker count can exhaust the container's
+    // PID cgroup and surface as a misleading protocol-desync error.
+    'features.multi_agent_v2=true',
+    `features.multi_agent_v2.max_concurrent_threads_per_session=${
+      stickyConfig?.max_concurrent_threads_per_session ?? DEFAULT_CODEX_MAX_CONCURRENT_THREADS_PER_SESSION
+    }`,
     // Memories: writing AND reading. `[memories]` is Codex CLI's own
     // session-summary store (separate from NanoClaw's Graphify retrieval, which is
     // host-side). `generate_memories=true` writes summaries on turn boundaries;
@@ -654,3 +663,10 @@ export function createCodexConfigOverrides(
   overrides.push('model_reasoning_summary="detailed"');
   return overrides;
 }
+
+// The coordinator consumes one slot, leaving six worker slots by default.
+// Six is the minimum required by the deep-security workflow while remaining
+// comfortably inside the install-wide 1024 PID ceiling for the MCP-heavy
+// production groups observed during the July 2026 incident. Operators can
+// override this per group through providerConfig when a workload warrants it.
+export const DEFAULT_CODEX_MAX_CONCURRENT_THREADS_PER_SESSION = 7;

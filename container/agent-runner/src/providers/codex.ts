@@ -29,6 +29,7 @@ import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryIn
 import {
   type AppServer,
   type CodexMcpServer,
+  DEFAULT_CODEX_MAX_CONCURRENT_THREADS_PER_SESSION,
   type JsonRpcNotification,
   STALE_THREAD_RE,
   attachCodexAutoApproval,
@@ -301,12 +302,19 @@ export function materializeRawImageGeneration(
 // down per-agent via container.json when cost/latency matters more than
 // reasoning depth.
 //
-// Sticky-only: `model` and `reasoning_effort` are applied at thread-start /
-// codex-spawn time and persist for the session. Per-turn overrides for these
-// fields are not currently exposed by Codex's `thread/start` shape.
+// Sticky-only: `model` is applied at thread-start; `reasoning_effort` and the
+// native collaboration cap are applied at app-server spawn. They persist for
+// the query/session. Per-turn overrides for these fields are not currently
+// exposed by Codex's `thread/start` shape.
 export const codexConfigSchema = z.strictObject({
   model: z.string().min(1).optional(),
   reasoning_effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']).optional().default('xhigh'),
+  max_concurrent_threads_per_session: z
+    .number()
+    .int()
+    .positive()
+    .optional()
+    .default(DEFAULT_CODEX_MAX_CONCURRENT_THREADS_PER_SESSION),
 });
 
 registerProviderConfigSchema('codex', codexConfigSchema);
@@ -406,10 +414,26 @@ function readAgentAndGlobalClaudeMd(): string | undefined {
   return parts.length > 0 ? parts.join('\n\n---\n\n') : undefined;
 }
 
-function composeBaseInstructions(promptAddendum: string | undefined): string | undefined {
+export function buildCodexSubagentLifecycleInstructions(maxConcurrentThreadsPerSession: number): string {
+  const workerSlots = Math.max(0, maxConcurrentThreadsPerSession - 1);
+  return `## Codex subagent lifecycle
+
+This session is limited to ${maxConcurrentThreadsPerSession} concurrent threads: one coordinator plus up to ${workerSlots} subagents.
+
+- Track every subagent you spawn.
+- A completed, errored, or interrupted subagent still owns runtime resources until you call \`close_agent\`.
+- Call \`close_agent\` as soon as you no longer need follow-up from that subagent. Waiting for completion is not cleanup.
+- Before ending your turn, close every subagent you spawned, including failure and cancellation paths.`;
+}
+
+function composeBaseInstructions(
+  promptAddendum: string | undefined,
+  maxConcurrentThreadsPerSession: number,
+): string {
   const claudeMd = readAgentAndGlobalClaudeMd();
-  const pieces = [claudeMd, promptAddendum].filter((s): s is string => Boolean(s));
-  return pieces.length > 0 ? pieces.join('\n\n---\n\n') : undefined;
+  const lifecycle = buildCodexSubagentLifecycleInstructions(maxConcurrentThreadsPerSession);
+  const pieces = [claudeMd, promptAddendum, lifecycle].filter((s): s is string => Boolean(s));
+  return pieces.join('\n\n---\n\n');
 }
 
 // ── Provider ────────────────────────────────────────────────────────────────
@@ -882,7 +906,10 @@ export class CodexProvider implements AgentProvider {
           sandbox: 'danger-full-access',
           approvalPolicy: 'never',
           personality: 'friendly',
-          baseInstructions: composeBaseInstructions(input.systemContext?.instructions),
+          baseInstructions: composeBaseInstructions(
+            input.systemContext?.instructions,
+            effectiveConfig.max_concurrent_threads_per_session,
+          ),
         };
 
         // Cross-container rollout repair. When a prior session rotated to a

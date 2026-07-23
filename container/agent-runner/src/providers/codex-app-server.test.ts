@@ -143,6 +143,18 @@ describe('createCodexConfigOverrides', () => {
     expect(createCodexConfigOverrides()).toContain('features.fast_mode=true');
   });
 
+  it('bounds native subagent concurrency with a safe fleet default', () => {
+    const overrides = createCodexConfigOverrides();
+    expect(overrides).toContain('features.multi_agent_v2=true');
+    expect(overrides).toContain('features.multi_agent_v2.max_concurrent_threads_per_session=7');
+  });
+
+  it('honors the validated per-group native subagent concurrency override', () => {
+    expect(createCodexConfigOverrides({ max_concurrent_threads_per_session: 5 })).toContain(
+      'features.multi_agent_v2.max_concurrent_threads_per_session=5',
+    );
+  });
+
   it('sets the fast service tier only when requested', () => {
     expect(createCodexConfigOverrides(undefined, true)).toContain('service_tier="fast"');
     expect(createCodexConfigOverrides(undefined, false)).not.toEqual(

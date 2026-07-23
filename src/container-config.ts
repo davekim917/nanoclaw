@@ -255,7 +255,9 @@ export interface ContainerConfig {
    *   container/agent-runner/src/providers/<name>.ts — see the exported
    *   `<name>ConfigSchema`. Currently:
    *     - 'claude': { model?: string, effort?: 'low'|'medium'|'high'|'xhigh'|'max' }
-   *     - 'codex':  { model?: string, reasoning_effort?: 'low'|'medium'|'high' }
+   *     - 'codex':  { model?: string,
+   *                   reasoning_effort?: 'low'|'medium'|'high'|'xhigh'|'max'|'ultra',
+   *                   max_concurrent_threads_per_session?: positive integer }
    *     - Others (e.g. opencode, mock): no configSchema — must be empty {}.
    *
    * See decision D4 / D11 in .context/specs/create-agent-provider/decisions.yaml.

@@ -86,9 +86,18 @@ export const CONTAINER_MEMORY_RESERVATION =
 export const CONTAINER_MEMORY_SWAP_LIMIT =
   process.env.CONTAINER_MEMORY_SWAP_LIMIT || envConfig.CONTAINER_MEMORY_SWAP_LIMIT || CONTAINER_MEMORY_LIMIT;
 export const CONTAINER_MEMORY_BUDGET = process.env.CONTAINER_MEMORY_BUDGET || envConfig.CONTAINER_MEMORY_BUDGET || '';
+// Codex app-server gives every native subagent its own MCP process tree. The
+// previous 512 default was exhausted by one coordinator plus five workers in
+// MCP-heavy groups before memory pressure was material. Keep a finite Docker
+// safety boundary, but leave enough room for the provider's bounded worker
+// pool and transient tool subprocesses.
+export const DEFAULT_CONTAINER_PIDS_LIMIT = 1024;
 export const CONTAINER_PIDS_LIMIT = Math.max(
   1,
-  parseInt(process.env.CONTAINER_PIDS_LIMIT || envConfig.CONTAINER_PIDS_LIMIT || '512', 10) || 512,
+  parseInt(
+    process.env.CONTAINER_PIDS_LIMIT || envConfig.CONTAINER_PIDS_LIMIT || String(DEFAULT_CONTAINER_PIDS_LIMIT),
+    10,
+  ) || DEFAULT_CONTAINER_PIDS_LIMIT,
 );
 export const ONECLI_URL = process.env.ONECLI_URL || envConfig.ONECLI_URL;
 export const ONECLI_API_KEY = process.env.ONECLI_API_KEY || envConfig.ONECLI_API_KEY;

@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 
 import { createCodexConfigOverrides } from './codex-app-server.js';
-import { CodexProvider, codexConfigSchema } from './codex.js';
+import { buildCodexSubagentLifecycleInstructions, CodexProvider, codexConfigSchema } from './codex.js';
 import { getProviderConfigSchema, validateProviderConfig } from './provider-registry.js';
 
 // Importing the providers barrel triggers all `registerProvider*` calls so the
@@ -12,7 +12,11 @@ import './index.js';
 describe('codexConfigSchema', () => {
   it('test_codexConfigSchema_valid_config', () => {
     const parsed = codexConfigSchema.parse({ model: 'gpt-5.5', reasoning_effort: 'high' });
-    expect(parsed).toEqual({ model: 'gpt-5.5', reasoning_effort: 'high' });
+    expect(parsed).toEqual({
+      model: 'gpt-5.5',
+      reasoning_effort: 'high',
+      max_concurrent_threads_per_session: 7,
+    });
   });
 
   it('test_codexConfigSchema_accepts_xhigh_effort', () => {
@@ -54,25 +58,43 @@ describe('codexConfigSchema', () => {
     // tier that doesn't require an extra opt-in. Operators dial down via
     // container.json when cost/latency matter more than reasoning depth.
     const parsed = codexConfigSchema.parse({});
-    expect(parsed).toEqual({ reasoning_effort: 'xhigh' });
+    expect(parsed).toEqual({ reasoning_effort: 'xhigh', max_concurrent_threads_per_session: 7 });
   });
 
   it('test_codexConfigSchema_explicit_low_overrides_default', () => {
     const parsed = codexConfigSchema.parse({ reasoning_effort: 'low' });
-    expect(parsed).toEqual({ reasoning_effort: 'low' });
+    expect(parsed).toEqual({ reasoning_effort: 'low', max_concurrent_threads_per_session: 7 });
   });
 
   it('test_codexConfigSchema_registered_after_barrel_import', () => {
     const schema = getProviderConfigSchema('codex');
     expect(schema).toBeDefined();
     const parsed = schema!.parse({ reasoning_effort: 'medium' });
-    expect(parsed).toEqual({ reasoning_effort: 'medium' });
+    expect(parsed).toEqual({ reasoning_effort: 'medium', max_concurrent_threads_per_session: 7 });
   });
 
   it('test_validateProviderConfig_codex_rejects_invalid_effort', () => {
     const result = validateProviderConfig('codex', { reasoning_effort: 'extreme' });
     expect(result.ok).toBe(false);
     if (!result.ok) expect(typeof result.error).toBe('string');
+  });
+
+  it('test_codexConfigSchema_validates_native_thread_cap', () => {
+    expect(codexConfigSchema.parse({ max_concurrent_threads_per_session: 5 }).max_concurrent_threads_per_session).toBe(
+      5,
+    );
+    expect(codexConfigSchema.safeParse({ max_concurrent_threads_per_session: 0 }).success).toBe(false);
+    expect(codexConfigSchema.safeParse({ max_concurrent_threads_per_session: 2.5 }).success).toBe(false);
+  });
+});
+
+describe('Codex subagent lifecycle instructions', () => {
+  it('states both the enforced worker budget and mandatory close behavior', () => {
+    const instructions = buildCodexSubagentLifecycleInstructions(7);
+    expect(instructions).toContain('one coordinator plus up to 6 subagents');
+    expect(instructions).toContain('call `close_agent`');
+    expect(instructions).toContain('Waiting for completion is not cleanup');
+    expect(instructions).toContain('including failure and cancellation paths');
   });
 });
 

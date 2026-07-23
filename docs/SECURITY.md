@@ -190,7 +190,7 @@ memory budget.
 | `CONTAINER_MEMORY_RESERVATION` | same as memory limit      | Install-wide admission request and `--memory-reservation` fallback.            |
 | `CONTAINER_MEMORY_SWAP_LIMIT`  | same as memory limit      | Docker RAM-plus-swap total. Equal to the memory limit disables container swap. |
 | `CONTAINER_MEMORY_BUDGET`      | 80% of Docker-visible RAM | Maximum sum of active and in-flight container memory requests.                 |
-| `CONTAINER_PIDS_LIMIT`         | `512`                     | Per-container PID ceiling.                                                     |
+| `CONTAINER_PIDS_LIMIT`         | `1024`                    | Per-container PID ceiling.                                                     |
 | `MAX_CONCURRENT_CONTAINERS`    | `24`                      | Secondary container-count ceiling. `0` disables only this count cap.           |
 
 Per-group overrides are file-canonical in `groups/<folder>/container.json`:
@@ -204,7 +204,21 @@ Per-group overrides are file-canonical in `groups/<folder>/container.json`:
       "memorySwapLimitMb": 5120
     },
     "cpus": 2,
-    "pidsLimit": 512
+    "pidsLimit": 1024
+  }
+}
+```
+
+Codex groups also bound native subagent collaboration independently of the
+Docker ceiling. The default is seven concurrent threads (one coordinator plus
+six workers), and completed workers are instructed to call `close_agent` so
+their MCP process trees are released. Exceptional groups can override the
+provider cap without removing the container safety boundary:
+
+```json
+{
+  "providerConfig": {
+    "max_concurrent_threads_per_session": 5
   }
 }
 ```

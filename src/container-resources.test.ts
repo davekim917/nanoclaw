@@ -6,6 +6,7 @@ import {
   resolveContainerResources,
   type ContainerResourceDefaults,
 } from './container-resources.js';
+import { DEFAULT_CONTAINER_PIDS_LIMIT } from './config.js';
 
 const defaults: ContainerResourceDefaults = {
   memoryLimit: '3g',
@@ -16,6 +17,10 @@ const defaults: ContainerResourceDefaults = {
 };
 
 describe('container resource resolution', () => {
+  it('test_install_default_pids_limit_leaves_codex_worker_headroom', () => {
+    expect(DEFAULT_CONTAINER_PIDS_LIMIT).toBe(1024);
+  });
+
   it('test_resource_defaults_preserve_3gb_compatibility', () => {
     expect(resolveContainerResources(undefined, defaults)).toEqual({
       memory: {
