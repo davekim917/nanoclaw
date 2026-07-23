@@ -77,3 +77,6 @@ AGENTS.md
 docs/maintainer-guide.md
 docs/drafts/
 forks.md
+
+# impeccable plugin hook cache — regenerated wherever the hook runs
+.impeccable/
