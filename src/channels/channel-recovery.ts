@@ -24,47 +24,6 @@ let monitor: NodeJS.Timeout | null = null;
 let lastMonitorTickMs = 0;
 let retriesEnabled = true;
 
-/**
- * Buffers live adapter callbacks until the first startup catch-up pass has
- * finished. Recovery-emitted events bypass the queue so the catch-up itself
- * cannot deadlock. Queued live events retain arrival order while the gate is
- * draining, including events arriving between release and the final drain.
- */
-export class StartupChannelIngressGate {
-  private state: 'holding' | 'draining' | 'open' = 'holding';
-  private readonly ready: Promise<void>;
-  private releaseReady!: () => void;
-  private tail: Promise<void> = Promise.resolve();
-
-  constructor() {
-    this.ready = new Promise<void>((resolve) => {
-      this.releaseReady = resolve;
-    });
-  }
-
-  run(recovered: boolean, route: () => Promise<void>): void | Promise<void> {
-    if (recovered || this.state === 'open') return route();
-    const queued = this.tail.then(() => this.ready).then(route);
-    // The route callback owns logging. Keep the queue alive after one failure
-    // so later live events are not stranded behind a rejected tail.
-    this.tail = queued.catch(() => undefined);
-  }
-
-  async open(): Promise<void> {
-    if (this.state === 'open') return;
-    if (this.state === 'holding') {
-      this.state = 'draining';
-      this.releaseReady();
-    }
-    for (;;) {
-      const observed = this.tail;
-      await observed;
-      if (observed === this.tail) break;
-    }
-    this.state = 'open';
-  }
-}
-
 function adapterKey(adapter: ChannelAdapter): string {
   return adapter.instance ?? adapter.channelType;
 }
@@ -119,18 +78,23 @@ function scheduleRecoveryRetry(adapter: ChannelAdapter, info: ChannelConnectionR
   });
 }
 
-/** Build a bounded recovery set: every wired conversation root plus active threads. */
+/**
+ * Build a bounded recovery set. Adapters with platform-native thread
+ * discovery receive roots only; all others receive roots plus known threads.
+ */
 export function getChannelRecoveryTargets(adapter: ChannelAdapter): ChannelRecoveryTarget[] {
   const key = adapterKey(adapter);
   const groups = getMessagingGroupsByChannel(adapter.channelType).filter(
     (group) => (group.instance ?? group.channel_type) === key,
   );
   const sessionsByGroup = new Map<string, Set<string>>();
-  for (const session of getActiveSessions()) {
-    if (!session.messaging_group_id || !session.thread_id) continue;
-    const threads = sessionsByGroup.get(session.messaging_group_id) ?? new Set<string>();
-    threads.add(session.thread_id);
-    sessionsByGroup.set(session.messaging_group_id, threads);
+  if (adapter.recoveryDiscoversThreads !== true) {
+    for (const session of getActiveSessions()) {
+      if (!session.messaging_group_id || !session.thread_id) continue;
+      const threads = sessionsByGroup.get(session.messaging_group_id) ?? new Set<string>();
+      threads.add(session.thread_id);
+      sessionsByGroup.set(session.messaging_group_id, threads);
+    }
   }
 
   const targets = new Map<string, ChannelRecoveryTarget>();
@@ -176,7 +140,9 @@ export function recoverChannelAdapter(adapter: ChannelAdapter, info: ChannelConn
           log.info('Channel recovery complete', context);
         } else {
           log.warn('Channel recovery pass incomplete', context);
-          scheduleRecoveryRetry(adapter, next);
+          const retryInfo = drain.pending ? mergeRecoveryInfo(next, drain.pending) : next;
+          drain.pending = null;
+          scheduleRecoveryRetry(adapter, retryInfo);
         }
       } catch (err) {
         log.warn('Channel recovery failed', {
@@ -186,7 +152,9 @@ export function recoverChannelAdapter(adapter: ChannelAdapter, info: ChannelConn
           since: next.since,
           err,
         });
-        scheduleRecoveryRetry(adapter, next);
+        const retryInfo = drain.pending ? mergeRecoveryInfo(next, drain.pending) : next;
+        drain.pending = null;
+        scheduleRecoveryRetry(adapter, retryInfo);
       }
     }
   })().finally(() => {

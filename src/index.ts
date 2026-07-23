@@ -38,7 +38,6 @@ import { startDiscordSlashCommands, stopDiscordSlashCommands } from './channels/
 import {
   recoverChannelAdapter,
   recoverAllChannelsAfterStartup,
-  StartupChannelIngressGate,
   startChannelRecoveryMonitor,
   stopChannelRecoveryMonitor,
 } from './channels/channel-recovery.js';
@@ -229,51 +228,45 @@ async function main(): Promise<void> {
   // 3. Channel adapters
   // Gateway READY can arrive while adapters are still initializing. Hold its
   // recovery callback until every adapter identity, the sibling allow-list,
-  // and the delivery bridge are ready; the bridge serializes later Gateway
-  // packets behind this promise, so live traffic cannot overtake catch-up.
+  // and the delivery bridge are ready.
   let releaseChannelRecoveryReady!: () => void;
   const channelRecoveryReady = new Promise<void>((resolve) => {
     releaseChannelRecoveryReady = resolve;
   });
-  const startupIngress = new StartupChannelIngressGate();
   await initChannelAdapters((adapter: ChannelAdapter): ChannelSetup => {
     return {
       onInbound(platformId, threadId, message) {
-        return startupIngress.run(message.recovered === true, () =>
-          routeInbound({
-            channelType: adapter.channelType,
-            // The one host-side stamping seam: adapters stay instance-blind,
-            // the host stamps the receiving instance on every inbound event.
-            instance: adapter.instance ?? adapter.channelType,
-            platformId,
-            threadId,
-            isDM: message.isDM,
-            recovered: message.recovered,
-            message: {
-              id: message.id,
-              kind: message.kind,
-              content: JSON.stringify(message.content),
-              timestamp: message.timestamp,
-              isMention: message.isMention,
-              isGroup: message.isGroup,
-            },
-          }).catch((err) => {
-            log.error('Failed to route inbound message', { channelType: adapter.channelType, err });
-            throw err;
-          }),
-        );
+        return routeInbound({
+          channelType: adapter.channelType,
+          // The one host-side stamping seam: adapters stay instance-blind,
+          // the host stamps the receiving instance on every inbound event.
+          instance: adapter.instance ?? adapter.channelType,
+          platformId,
+          threadId,
+          isDM: message.isDM,
+          recovered: message.recovered,
+          message: {
+            id: message.id,
+            kind: message.kind,
+            content: JSON.stringify(message.content),
+            timestamp: message.timestamp,
+            isMention: message.isMention,
+            isGroup: message.isGroup,
+          },
+        }).catch((err) => {
+          log.error('Failed to route inbound message', { channelType: adapter.channelType, err });
+          throw err;
+        });
       },
       onInboundEvent(event) {
-        return startupIngress.run(event.recovered === true, () =>
-          routeInbound(event).catch((err) => {
-            log.error('Failed to route inbound event', {
-              sourceAdapter: adapter.channelType,
-              targetChannelType: event.channelType,
-              err,
-            });
-            throw err;
-          }),
-        );
+        return routeInbound(event).catch((err) => {
+          log.error('Failed to route inbound event', {
+            sourceAdapter: adapter.channelType,
+            targetChannelType: event.channelType,
+            err,
+          });
+          throw err;
+        });
       },
       onConnectionRestored(info) {
         return channelRecoveryReady.then(() => recoverChannelAdapter(adapter, info));
@@ -358,16 +351,14 @@ async function main(): Promise<void> {
   // sender/channel approval), so it must not race partial host startup.
   releaseChannelRecoveryReady();
   void recoverAllChannelsAfterStartup(Date.now() - 10 * 60 * 1000)
-    .catch((err) => {
-      // Per-adapter failures schedule their own retry; this is a coordinator
-      // guard so an unexpected aggregate failure cannot hold live ingress.
-      log.error('Initial channel recovery coordinator failed', { err });
+    .then(() => {
+      log.info('Initial channel recovery pass finished');
     })
-    .finally(() =>
-      startupIngress.open().then(() => {
-        log.info('Startup channel ingress released');
-      }),
-    );
+    .catch((err) => {
+      // Per-adapter failures schedule their own retry; this guard reports an
+      // unexpected aggregate failure without affecting live ingress.
+      log.error('Initial channel recovery coordinator failed', { err });
+    });
   startChannelRecoveryMonitor();
 
   // 5. Start delivery polls

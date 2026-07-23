@@ -85,7 +85,7 @@ export interface InboundEvent {
    * adapter didn't tell us — router defaults to is_group=0.
    */
   isDM?: boolean;
-  /** Internal replay marker used to bypass the host's startup live-ingress queue. */
+  /** Internal replay marker identifying platform-history catch-up. */
   recovered?: boolean;
   message: {
     id: string;
@@ -136,7 +136,7 @@ export interface InboundMessage {
   isDM?: boolean;
   /** Inverse of isDM. Kept alongside for upstream code paths that key off isGroup. */
   isGroup?: boolean;
-  /** Internal replay marker used to bypass the host's startup live-ingress queue. */
+  /** Internal replay marker identifying platform-history catch-up. */
   recovered?: boolean;
 }
 
@@ -291,6 +291,13 @@ export interface ChannelAdapter {
    * native adapters may augment them with platform-specific discovery.
    */
   recoverMissedMessages?(request: ChannelRecoveryRequest): Promise<ChannelRecoveryResult>;
+
+  /**
+   * True when recoverMissedMessages discovers every thread with activity in
+   * the recovery window from conversation roots. Core then supplies roots
+   * only instead of also fanning out across every historical session.
+   */
+  recoveryDiscoversThreads?: boolean;
 
   /**
    * Open (or fetch) a DM with this user, returning the platform_id of the

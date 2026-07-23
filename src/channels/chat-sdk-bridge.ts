@@ -312,53 +312,24 @@ export interface ChatSdkBridgeConfig {
 }
 
 /**
- * Allows normal live ingress to remain concurrent while giving recovery an
- * exclusive barrier. Setting the recovery flag and incrementing activeLive
- * are synchronous operations on one JS thread, so a live route can never
- * slip between recovery's check and its wait for the current live set.
+ * Serializes recovery passes without blocking live ingress. The durable gap
+ * floor prevents live cursor advancement across an incomplete window, and the
+ * router's ingress receipts atomically deduplicate a live/recovery race.
  */
 export class RecoveryIngressGate {
-  private activeLive = 0;
-  private recoveryActive = false;
-  private recoveryDone: Promise<void> = Promise.resolve();
-  private resolveRecoveryDone: (() => void) | null = null;
-  private liveDrained: Promise<void> = Promise.resolve();
-  private resolveLiveDrained: (() => void) | null = null;
+  private recoveryTail: Promise<void> = Promise.resolve();
 
   async runLive<T>(run: () => Promise<T>): Promise<T> {
-    while (this.recoveryActive) await this.recoveryDone;
-    this.activeLive++;
-    try {
-      return await run();
-    } finally {
-      this.activeLive--;
-      if (this.activeLive === 0) {
-        this.resolveLiveDrained?.();
-        this.resolveLiveDrained = null;
-        this.liveDrained = Promise.resolve();
-      }
-    }
+    return run();
   }
 
-  async runRecovery<T>(run: () => Promise<T>): Promise<T> {
-    while (this.recoveryActive) await this.recoveryDone;
-    this.recoveryActive = true;
-    this.recoveryDone = new Promise<void>((resolve) => {
-      this.resolveRecoveryDone = resolve;
-    });
-    if (this.activeLive > 0) {
-      this.liveDrained = new Promise<void>((resolve) => {
-        this.resolveLiveDrained = resolve;
-      });
-      await this.liveDrained;
-    }
-    try {
-      return await run();
-    } finally {
-      this.recoveryActive = false;
-      this.resolveRecoveryDone?.();
-      this.resolveRecoveryDone = null;
-    }
+  runRecovery<T>(run: () => Promise<T>): Promise<T> {
+    const result = this.recoveryTail.then(run);
+    this.recoveryTail = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
   }
 }
 
@@ -685,6 +656,7 @@ export function createChatSdkBridge(config: ChatSdkBridgeConfig): ChannelAdapter
     channelType,
     supportsThreads: config.supportsThreads,
     defaults: config.defaults,
+    recoveryDiscoversThreads: config.discoverRecoveryTargets !== undefined,
 
     async setup(hostConfig: ChannelSetup) {
       setupConfig = hostConfig;

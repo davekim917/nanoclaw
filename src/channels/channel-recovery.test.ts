@@ -21,7 +21,6 @@ import {
   recoverAllChannelsAfterStall,
   recoverAllChannelsAfterStartup,
   recoverChannelAdapter,
-  StartupChannelIngressGate,
 } from './channel-recovery.js';
 import type { ChannelAdapter } from './adapter.js';
 
@@ -69,6 +68,15 @@ describe('channel recovery coordinator', () => {
     ]);
   });
 
+  it('supplies roots only when the adapter discovers changed threads itself', () => {
+    mocks.groups = [{ id: 'mg-s', channel_type: 'slack', instance: 'slack', platform_id: 'slack:C1', is_group: 1 }];
+    mocks.sessions = [{ messaging_group_id: 'mg-s', thread_id: 'slack:C1:old-thread' }];
+    const slack = adapter('slack');
+    slack.recoveryDiscoversThreads = true;
+
+    expect(getChannelRecoveryTargets(slack)).toEqual([{ platformId: 'slack:C1', threadId: null, isDM: false }]);
+  });
+
   it('invokes the same recovery contract for every active channel type after a host stall', async () => {
     const discordRecover = vi.fn().mockResolvedValue({ scannedTargets: 1, recoveredMessages: 1, failedTargets: 0 });
     const slackRecover = vi.fn().mockResolvedValue({ scannedTargets: 1, recoveredMessages: 1, failedTargets: 0 });
@@ -95,25 +103,6 @@ describe('channel recovery coordinator', () => {
     await recoverAllChannelsAfterStartup(Date.parse('2026-07-21T18:16:00Z'));
     expect(slackRecover).toHaveBeenCalledOnce();
     expect(slackRecover.mock.calls[0][0]).toMatchObject({ reason: 'host-startup' });
-  });
-
-  it('holds live startup ingress in order while allowing recovery events to route immediately', async () => {
-    const gate = new StartupChannelIngressGate();
-    const order: string[] = [];
-
-    gate.run(false, async () => {
-      order.push('live-1');
-    });
-    await gate.run(true, async () => {
-      order.push('recovery');
-    });
-    gate.run(false, async () => {
-      order.push('live-2');
-    });
-
-    expect(order).toEqual(['recovery']);
-    await gate.open();
-    expect(order).toEqual(['recovery', 'live-1', 'live-2']);
   });
 
   it('queues a follow-up pass when another recovery trigger arrives in flight', async () => {
@@ -151,6 +140,45 @@ describe('channel recovery coordinator', () => {
       expect(recover).toHaveBeenCalledOnce();
       await vi.advanceTimersByTimeAsync(1_000);
       await vi.waitFor(() => expect(recover).toHaveBeenCalledTimes(2));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('backs off an incomplete pass instead of immediately draining a queued trigger', async () => {
+    vi.useFakeTimers();
+    try {
+      let finishFirst!: (result: { scannedTargets: number; recoveredMessages: number; failedTargets: number }) => void;
+      const recover = vi
+        .fn()
+        .mockImplementationOnce(
+          () =>
+            new Promise<{ scannedTargets: number; recoveredMessages: number; failedTargets: number }>((resolve) => {
+              finishFirst = resolve;
+            }),
+        )
+        .mockResolvedValue({ scannedTargets: 1, recoveredMessages: 1, failedTargets: 0 });
+      const live = adapter('slack', recover);
+
+      const first = recoverChannelAdapter(live, {
+        since: '2026-07-21T18:16:00Z',
+        reason: 'host-startup',
+      });
+      void recoverChannelAdapter(live, {
+        since: '2026-07-21T18:16:01Z',
+        reason: 'event-loop-stall',
+      });
+      finishFirst({ scannedTargets: 1, recoveredMessages: 0, failedTargets: 1 });
+      await first;
+
+      expect(recover).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(999);
+      expect(recover).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(1);
+      await vi.waitFor(() => expect(recover).toHaveBeenCalledTimes(2));
+      expect(recover.mock.calls[1][0]).toMatchObject({
+        since: '2026-07-21T18:16:00.000Z',
+      });
     } finally {
       vi.useRealTimers();
     }

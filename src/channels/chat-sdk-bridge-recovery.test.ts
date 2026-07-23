@@ -144,42 +144,32 @@ describe('Chat SDK bridge missed-message recovery', () => {
     expect(finished).toBe(true);
   });
 
-  it('holds new live ingress until in-flight live work drains and recovery finishes', async () => {
+  it('keeps live ingress flowing during recovery while serializing recovery passes', async () => {
     const gate = new RecoveryIngressGate();
-    let finishFirstLive!: () => void;
-    let finishRecovery!: () => void;
+    let finishFirstRecovery!: () => void;
     const order: string[] = [];
 
-    const firstLive = gate.runLive(
+    const firstRecovery = gate.runRecovery(
       () =>
         new Promise<void>((resolve) => {
-          order.push('live-1-start');
-          finishFirstLive = () => {
-            order.push('live-1-end');
+          order.push('recovery-1-start');
+          finishFirstRecovery = () => {
+            order.push('recovery-1-end');
             resolve();
           };
         }),
     );
-    const recovery = gate.runRecovery(
-      () =>
-        new Promise<void>((resolve) => {
-          order.push('recovery-start');
-          finishRecovery = () => {
-            order.push('recovery-end');
-            resolve();
-          };
-        }),
-    );
-    const secondLive = gate.runLive(async () => {
-      order.push('live-2');
+    const secondRecovery = gate.runRecovery(async () => {
+      order.push('recovery-2');
+    });
+    const live = gate.runLive(async () => {
+      order.push('live');
     });
 
-    await vi.waitFor(() => expect(order).toEqual(['live-1-start']));
-    finishFirstLive();
-    await vi.waitFor(() => expect(order).toEqual(['live-1-start', 'live-1-end', 'recovery-start']));
-    finishRecovery();
-    await Promise.all([firstLive, recovery, secondLive]);
-    expect(order).toEqual(['live-1-start', 'live-1-end', 'recovery-start', 'recovery-end', 'live-2']);
+    await vi.waitFor(() => expect(order).toEqual(['live', 'recovery-1-start']));
+    finishFirstRecovery();
+    await Promise.all([firstRecovery, secondRecovery, live]);
+    expect(order).toEqual(['live', 'recovery-1-start', 'recovery-1-end', 'recovery-2']);
   });
 
   it('replays only post-gap user messages in timestamp order with recovered mention semantics', async () => {
