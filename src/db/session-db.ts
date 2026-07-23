@@ -28,8 +28,46 @@ export function openInboundDb(dbPath: string): Database.Database {
   return db;
 }
 
+/**
+ * Roll back a hot journal before a READ-ONLY open.
+ *
+ * When a container is SIGKILLed mid-transaction (exit 137 / OOM kill), SQLite
+ * leaves a `<db>-journal` next to outbound.db. Any later connection must roll
+ * that journal back BEFORE it can read — and a rollback is a WRITE. The host's
+ * outbound handle is read-only by design (the container owns writes), so it
+ * can't perform the rollback, and every read fails with "attempt to write a
+ * readonly database" — including the plain SELECT at the top of
+ * `syncProcessingAcks`.
+ *
+ * That state is permanent and self-sustaining: the sweep can never mark those
+ * messages complete, so it retries the same session every 60s forever. Observed
+ * in the wild across 42 sessions and ~4k log errors before this fix.
+ *
+ * A brief read-write open lets SQLite perform the rollback and delete the
+ * journal, restoring a consistent DB; the normal read-only path then works.
+ * Safe alongside a running container — both sides use DELETE journal +
+ * busy_timeout, the same basis on which `writeOutboundDirect` already writes
+ * here. Best-effort: if recovery fails we fall through and let the real open
+ * surface the error rather than masking it.
+ */
+export function recoverHotJournal(dbPath: string): boolean {
+  if (!fs.existsSync(`${dbPath}-journal`) || !fs.existsSync(dbPath)) return false;
+  try {
+    const db = new Database(dbPath);
+    db.pragma('busy_timeout = 5000');
+    // Touching the DB is what forces the rollback; the read itself is incidental.
+    db.prepare('SELECT 1').get();
+    db.close();
+    return !fs.existsSync(`${dbPath}-journal`);
+  } catch {
+    return false;
+  }
+}
+
 /** Open the outbound DB for a session (host reads only). */
 export function openOutboundDb(dbPath: string): Database.Database {
+  // Cheap existsSync guard — no cost on the normal path, where no journal exists.
+  recoverHotJournal(dbPath);
   const db = new Database(dbPath, { readonly: true });
   db.pragma('busy_timeout = 5000');
   return db;

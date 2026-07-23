@@ -5,8 +5,10 @@
  * insertRecurrence) live in `src/modules/scheduling/db.test.ts` with the
  * rest of the scheduling module.
  */
+import { spawnSync } from 'child_process';
 import Database from 'better-sqlite3';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { describe, it, expect, afterEach } from 'vitest';
 
@@ -16,6 +18,8 @@ import {
   getDueWakePriority,
   getInboundSourceSessionId,
   migrateMessagesInTable,
+  openOutboundDb,
+  recoverHotJournal,
   sessionInboundHasMessage,
   syncProcessingAcks,
   upsertSessionRouting,
@@ -667,5 +671,77 @@ describe('syncProcessingAcks — script-skip counter', () => {
     syncProcessingAcks(inDb, outDb);
 
     expect(status(inDb, 't1')).toBe('completed');
+  });
+});
+
+describe('hot journal recovery (readonly outbound opens)', () => {
+  it('recovers a REAL hot rollback journal so the read-only host handle can read', () => {
+    // A container SIGKILLed mid-transaction (exit 137 / OOM) leaves a `<db>-journal`.
+    // SQLite must roll it back before ANY read, and rollback is a WRITE — so a
+    // read-only handle throws "attempt to write a readonly database" on a plain
+    // SELECT, permanently wedging the sweep for that session.
+    //
+    // A hand-written junk file will NOT reproduce this: SQLite validates the journal
+    // header and silently ignores an invalid one. We therefore create a GENUINE hot
+    // journal by killing a child process mid-transaction.
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hotjournal-'));
+    const dbPath = path.join(dir, 'outbound.db');
+    const seed = new Database(dbPath);
+    seed.pragma('journal_mode = DELETE');
+    seed.exec('CREATE TABLE processing_ack (message_id TEXT, status TEXT)');
+    seed.prepare('INSERT INTO processing_ack VALUES (?, ?)').run('m1', 'completed');
+    seed.close();
+
+    const child = `
+      const Database = require('better-sqlite3');
+      const db = new Database(${JSON.stringify(dbPath)});
+      db.pragma('journal_mode = DELETE');
+      db.prepare('BEGIN EXCLUSIVE').run();
+      db.prepare('INSERT INTO processing_ack VALUES (?, ?)').run('m2', 'completed');
+      process.kill(process.pid, 'SIGKILL');
+    `;
+    spawnSync(process.execPath, ['-e', child], { cwd: process.cwd() });
+
+    if (!fs.existsSync(`${dbPath}-journal`)) {
+      // Couldn't reproduce the crash residue on this platform — skip rather than
+      // assert something we didn't actually set up.
+      fs.rmSync(dir, { recursive: true, force: true });
+      return;
+    }
+
+    // Confirm the precondition is REAL before asserting on it: a genuinely hot
+    // journal makes a bare read-only read fail. If the child's crash didn't leave
+    // one (timing/platform dependent), skip rather than assert on a condition we
+    // never actually established.
+    let reproduced = false;
+    try {
+      const ro = new Database(dbPath, { readonly: true });
+      ro.prepare('SELECT message_id FROM processing_ack').all();
+      ro.close();
+    } catch (err) {
+      reproduced = /readonly database/.test((err as Error).message);
+    }
+    if (!reproduced) {
+      fs.rmSync(dir, { recursive: true, force: true });
+      return;
+    }
+
+    // The fix: openOutboundDb recovers first, so the read-only read succeeds.
+    const db = openOutboundDb(dbPath);
+    expect(db.prepare('SELECT message_id FROM processing_ack').all().length).toBeGreaterThan(0);
+    db.close();
+    expect(fs.existsSync(`${dbPath}-journal`)).toBe(false);
+
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('is a no-op when there is no journal (normal path stays cheap)', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nojournal-'));
+    const dbPath = path.join(dir, 'outbound.db');
+    const seed = new Database(dbPath);
+    seed.exec('CREATE TABLE processing_ack (message_id TEXT, status TEXT)');
+    seed.close();
+    expect(recoverHotJournal(dbPath)).toBe(false);
+    fs.rmSync(dir, { recursive: true, force: true });
   });
 });
