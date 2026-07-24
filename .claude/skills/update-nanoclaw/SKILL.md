@@ -1,13 +1,15 @@
 ---
 name: update-nanoclaw
-description: Efficiently bring upstream NanoClaw updates into a customized install, with preview, selective cherry-pick, and low token usage.
+description: Safely bring upstream NanoClaw updates into a customized install while treating local customization behavior as the release-blocking invariant. Use for preview, full merge, selective cherry-pick, rebase, semantic customization compatibility auditing, validation, and rollback.
 ---
 
 # About
 
-Your NanoClaw fork drifts from upstream as you customize it. This skill pulls upstream changes into your install without losing your modifications.
+Your NanoClaw fork drifts from upstream as you customize it. This skill pulls upstream changes into your install without losing or behaviorally regressing local customizations.
 
-Run `/update-nanoclaw` in Claude Code.
+**Priority invariant:** local customization intent is more important than accepting any particular upstream change. A clean merge, successful build, and generic passing test suite are necessary but never sufficient evidence that the update is safe.
+
+Run `/update-nanoclaw` in Claude Code or Codex. Use `AskUserQuestion` in Claude Code; in Codex, use its interactive-input tool when available or ask the question directly.
 
 ## How it works
 
@@ -29,16 +31,17 @@ Run `/update-nanoclaw` in Claude Code.
 
 **Conflict preview**: before merging, runs a dry-run (`git merge --no-commit --no-ff`) to show which files would conflict. You can still abort at this point.
 
-**Conflict resolution**: opens only conflicted files, resolves the conflict markers, keeps your local customizations intact.
+**Conflict resolution**: resolves textual conflicts against a pre-merge customization contract, then audits clean auto-merges for semantic regressions.
 
 **Validation**: runs `pnpm run build` and `pnpm test`. If container files changed, also runs the container typecheck and `./container/build.sh`.
 
-**Post-merge audit**: five checks that go beyond build + tests (details in `audit.md`):
-- **A. Silent drops** — exports or individual lines your pre-merge HEAD had that the auto-merge dropped without firing a conflict marker.
+**Post-merge audit**: six checks that go beyond build + tests (details in `audit.md`):
+- **A. Customization preservation and compatibility** — proves each high-risk local customization still has its intended integration path and targeted verification, including clean auto-merges that preserved text but changed behavior.
 - **B. Container rebuild requirement** — flags when `container/`, `src/config.ts`, or `src/install-slug.ts` changes mean the built agent-container image is stale; the final restart is gated on this.
 - **C. Live migration preflight** — scans pending migrations against the real `data/v2.db` for `ALTER ... NOT NULL`, `DROP`, or destructive `UPDATE` that tests (scratch DB) miss.
 - **D. Env var drift** — finds `.env` keys no source file reads anymore and new required keys the user hasn't set.
 - **E. Supply-chain policy drift** — hard-fails if upstream silently reintroduces a release-age gate/exclusion or adds `onlyBuiltDependencies` entries.
+- **F. Merge ancestry** — proves the captured merge commit has the upstream commit in real two-parent ancestry, even if compatibility fixes add follow-up commits.
 
 **Breaking changes check**: after the audit, reads CHANGELOG.md for any `[BREAKING]` entries introduced by the update. If found, shows each breaking change and offers to run the recommended skill to migrate.
 
@@ -53,7 +56,7 @@ Backup branch `backup/pre-update-<hash>-<timestamp>` also exists.
 
 ## Token usage
 
-Only opens files with actual conflicts. Uses `git log`, `git diff`, and `git status` for everything else. Does not scan or refactor unrelated code.
+Uses Git-native inventory to keep the review focused. Never truncate or skip a customization-relevant diff, file, caller path, test, or provenance source to save tokens. Do not scan or refactor unrelated code.
 
 ---
 
@@ -63,9 +66,10 @@ Help a user with a customized NanoClaw install safely incorporate upstream chang
 # Operating principles
 - Never proceed with a dirty working tree.
 - Always create a rollback point (backup branch + tag) before touching anything.
-- Prefer git-native operations (fetch, merge, cherry-pick). Do not manually rewrite files except conflict markers.
+- Preserve verified local customization intent ahead of upstream behavior.
+- Prefer git-native operations (fetch, merge, cherry-pick). Permit only the minimal compatibility edits and regression tests required to preserve a proven customization contract; do not refactor unrelated code.
 - Default to MERGE (one-pass conflict resolution). Offer REBASE as an explicit option.
-- Keep token usage low: rely on `git status`, `git log`, `git diff`, and open only conflicted files.
+- Use `git status`, `git log`, and `git diff` for inventory, then read every customization-relevant diff and dependency path end-to-end.
 
 # Step 0: Preflight (stop early if unsafe)
 Run:
@@ -131,6 +135,24 @@ Present these buckets to the user and ask them to choose one path using AskUserQ
 
 If Abort: stop here.
 
+# Step 2.5: Capture the customization contract
+
+Before any apply path except Abort, read Section A of `.claude/skills/update-nanoclaw/audit.md` and complete its pre-merge baseline against `BASE`, the backup tag, and the upstream changes being applied. For cherry-pick, scope `UPSTREAM_FILES` to the selected commits.
+
+Build a contract row for every high-risk customization:
+
+```
+ID | intent + provenance | integration point | upstream overlap/dependency | preservation requirement | verification
+```
+
+Do not infer intent from the final file alone. Read the complete local diff, relevant non-merge commit history, adjacent tests/specs, and direct callers. If intent remains ambiguous, ask the user before merging.
+
+Do not proceed until every high-risk customization has:
+- a concrete preservation requirement, and
+- a targeted test or non-destructive smoke that exercises the real integration point.
+
+Missing evidence is a `BLOCK`, not an assumed pass. Generic build/typecheck/full-suite success does not replace this contract.
+
 # Step 3: Conflict preview (before committing anything)
 If Full update or Rebase:
 - Dry-run merge to preview conflicts. Run these as a single chained command so the abort always executes:
@@ -146,31 +168,40 @@ Capture the upstream SHA being merged (used by the safety guards below):
 - `UPSTREAM_SHA=$(git rev-parse upstream/$UPSTREAM_BRANCH)`
 
 Run:
-- `git merge upstream/$UPSTREAM_BRANCH --no-edit`
+- `git merge --no-ff upstream/$UPSTREAM_BRANCH --no-edit`
 
 **Critical — do NOT run `git stash`, `git reset`, or `git checkout` while in merge state** (i.e. while `.git/MERGE_HEAD` exists). All three discard `MERGE_HEAD` silently, after which the next `git commit` produces a single-parent commit instead of a merge. The upstream commits then remain orphaned from your ancestry: GitHub's compare API and any `git rev-list origin..upstream` check will keep reporting the fork as "behind upstream" even though the file content was integrated.
 
 If conflicts occur:
 - Run `git status` and identify conflicted files.
 - For each conflicted file:
-  - Open the file.
-  - Resolve only conflict markers.
-  - Preserve intentional local customizations.
+  - Open the complete base, backup, upstream, and conflicted diff relevant to the file.
+  - Resolve the conflict markers against the customization contract.
+  - Preserve the behavior and integration path of intentional local customizations.
   - Incorporate upstream fixes/improvements.
   - Do not refactor surrounding code.
   - `git add <file>`
 - When all resolved:
-  - **Pre-commit guard** — verify `.git/MERGE_HEAD` still exists. If something cleared it during conflict resolution, restore it from the SHA captured above so the next commit becomes a proper merge:
+  - **Pre-commit guard** — verify Git's resolved `MERGE_HEAD` path still exists. If something cleared it during conflict resolution, restore it from the SHA captured above so the next commit becomes a proper merge:
     ```bash
-    if [ ! -f .git/MERGE_HEAD ]; then
-      echo "$UPSTREAM_SHA" > .git/MERGE_HEAD
+    MERGE_HEAD_PATH=$(git rev-parse --git-path MERGE_HEAD)
+    if [ ! -f "$MERGE_HEAD_PATH" ]; then
+      printf '%s\n' "$UPSTREAM_SHA" > "$MERGE_HEAD_PATH"
     fi
     ```
   - If merge did not auto-commit: `git commit --no-edit`
 
-**Post-commit verification** — confirm the resulting commit has 2 parents:
+Immediately capture the merge commit before any compatibility follow-up:
+
 ```bash
-PARENT_COUNT=$(git rev-list --parents -1 HEAD | awk '{print NF-1}')
+MERGE_COMMIT=$(git rev-parse HEAD)
+```
+
+Persist `MERGE_COMMIT` and `UPSTREAM_SHA` for audit F.
+
+**Post-commit verification** — confirm the captured merge commit has 2 parents and contains the upstream SHA:
+```bash
+PARENT_COUNT=$(git rev-list --parents -1 "$MERGE_COMMIT" | awk '{print NF-1}')
 if [ "$PARENT_COUNT" != "2" ]; then
   echo "ERROR: merge produced a $PARENT_COUNT-parent commit (expected 2)."
   echo "Upstream commits are NOT in your ancestry — the fork will keep reporting 'behind upstream'."
@@ -178,8 +209,14 @@ if [ "$PARENT_COUNT" != "2" ]; then
   echo "Avoid 'git stash', 'git reset', 'git checkout' during conflict resolution."
   exit 1
 fi
+git merge-base --is-ancestor "$UPSTREAM_SHA" "$MERGE_COMMIT" || {
+  echo "ERROR: upstream SHA is not in the captured merge commit ancestry."
+  exit 1
+}
 ```
 If this fails, abort the skill — do not proceed to Step 5. The user must reset to the backup tag and retry.
+
+After this guard passes, make only the minimal compatibility edits or regression-test additions required by the customization contract. Commit them separately so the merge commit remains auditable.
 
 # Step 4B: Selective update (CHERRY-PICK)
 If user chose Selective:
@@ -189,7 +226,7 @@ If user chose Selective:
 - Apply: `git cherry-pick <hash1> <hash2> ...`
 
 If conflicts during cherry-pick:
-- Resolve only conflict markers, then:
+- Resolve conflict markers against the customization contract, then:
   - `git add <file>`
   - `git cherry-pick --continue`
 If user wants to stop:
@@ -200,7 +237,7 @@ Run:
 - `git rebase upstream/$UPSTREAM_BRANCH`
 
 If conflicts:
-- Resolve conflict markers only, then:
+- Resolve conflict markers against the customization contract, then:
   - `git add <file>`
   - `git rebase --continue`
 If it gets messy (more than 3 rounds of conflicts):
@@ -220,6 +257,12 @@ Skip this step if neither lockfile changed.
 # Step 5: Validation
 Check which areas changed to determine what to validate:
 - `CHANGED_FILES=$(git diff --name-only <backup-tag-from-step-1>..HEAD)`
+
+**Customization contract verification** (always):
+- Run every targeted command recorded in Step 2.5.
+- Confirm each test drives the real integration point; directly unit-testing only the customization's internal helper does not count.
+- For runtime-only behavior, run the recorded non-destructive smoke against the built artifact.
+- Any missing, skipped, flaky, or failed required verification → BLOCK. Fix the merge-caused regression or roll back; do not accept generic suite success as a substitute.
 
 **Host build** (always):
 - `pnpm run build`
@@ -243,7 +286,7 @@ If build fails:
 After validation passes, run the full audit defined in `.claude/skills/update-nanoclaw/audit.md`:
 
 1. Read `.claude/skills/update-nanoclaw/audit.md` with the Read tool.
-2. Follow every sub-audit (A–E) in order, passing `BACKUP=<backup-tag-from-step-1>` through the environment.
+2. Follow every sub-audit (A–F) in order, passing `BACKUP=<backup-tag-from-step-1>`. For a full merge, also pass `MERGE_COMMIT=<captured-merge-sha>` and `UPSTREAM_SHA=<captured-upstream-sha>`; skip F for cherry-pick or rebase.
 3. Collect findings into the consolidated report format at the end of `audit.md`.
 4. Apply the decision rules:
    - Any `BLOCK` → stop here; require user resolution before continuing.
@@ -355,7 +398,8 @@ Show:
 - New HEAD: `git rev-parse --short HEAD`
 - Upstream HEAD: `git rev-parse --short upstream/$UPSTREAM_BRANCH`
 - Conflicts resolved (list files, if any)
-- Audit findings (A–E verdicts from Step 6)
+- Customization contract: total rows, high-risk rows, verification commands run, and any compatibility fixes
+- Audit findings (A–F verdicts from Step 6)
 - Breaking changes applied (list skills run, if any)
 - Remaining local diff vs upstream: `git diff --name-only upstream/$UPSTREAM_BRANCH..HEAD`
 
