@@ -86,6 +86,21 @@ const TASK_NOTIFICATION_EMOJI: Record<string, string> = {
   stopped: '⏹',
 };
 
+/**
+ * The SDK fires `task_notification` for two very different things: real
+ * subagent (Task) completions AND auto-backgrounded Bash commands. For a
+ * backgrounded Bash task the `summary` is the *raw command text* (env-var
+ * unsets, pipelines, python heredocs) — internal noise that leaked into user
+ * channels as "> ✅ <command>" and stranded there whenever the command
+ * settled after the turn's real reply. Forward completion lines only for
+ * genuine subagent work; a known non-Task tool (Bash) is suppressed. An
+ * unknown/absent tool_use_id means a planned task not tied to a single tool —
+ * forward it (the case the feature was built for).
+ */
+export function shouldForwardTaskNotification(toolName: string | undefined): boolean {
+  return toolName === undefined || toolName === 'Task';
+}
+
 export function deriveProgressLabels(message: unknown): string[] {
   if (!message || typeof message !== 'object') return [];
   const content = (message as { message?: { content?: unknown } }).message?.content;
@@ -1669,6 +1684,11 @@ export class ClaudeProvider implements AgentProvider {
       let lastToolProgressAt = 0;
       const TOOL_PROGRESS_MIN_INTERVAL_MS = 1500;
 
+      // tool_use_id → tool name, so task_notification can tell a real subagent
+      // (Task) completion from an auto-backgrounded Bash command whose summary
+      // is raw command text. Turn-scoped, bounded by tool calls — no eviction.
+      const toolNameById = new Map<string, string>();
+
       // Enable ultracode for the session before consuming the stream. It's a
       // flag SETTING (not an effort value, not read from settings.json), so the
       // SDK's apply_flag_settings control request is the only programmatic
@@ -1751,11 +1771,24 @@ export class ClaudeProvider implements AgentProvider {
           const detail = meta?.pre_tokens ? ` (${meta.pre_tokens.toLocaleString()} tokens compacted)` : '';
           yield { type: 'result', text: `Context compacted${detail}.` };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
-          const tn = message as { summary?: string; status?: string };
-          const summary = tn.summary || 'Task notification';
-          const emoji = (tn.status && TASK_NOTIFICATION_EMOJI[tn.status]) || '🔧';
-          yield { type: 'progress', message: formatBlockquoteLabel(emoji, summary) };
+          const tn = message as { summary?: string; status?: string; tool_use_id?: string };
+          const toolName = tn.tool_use_id ? toolNameById.get(tn.tool_use_id) : undefined;
+          if (shouldForwardTaskNotification(toolName)) {
+            const summary = tn.summary || 'Task notification';
+            const emoji = (tn.status && TASK_NOTIFICATION_EMOJI[tn.status]) || '🔧';
+            yield { type: 'progress', message: formatBlockquoteLabel(emoji, summary) };
+          }
         } else if (message.type === 'assistant') {
+          // Record tool_use id → name so a later task_notification can be
+          // classified (Task subagent vs backgrounded Bash). See
+          // shouldForwardTaskNotification.
+          const blocks = (message as { message?: { content?: unknown } }).message?.content;
+          if (Array.isArray(blocks)) {
+            for (const block of blocks) {
+              const b = block as { type?: string; id?: string; name?: string };
+              if (b.type === 'tool_use' && b.id && b.name) toolNameById.set(b.id, b.name);
+            }
+          }
           // SDK task_notification only fires for multi-step planned tasks, so
           // simple turns (single tool call, direct answers) never get a
           // status line. Derive labels from thinking + tool_use blocks on

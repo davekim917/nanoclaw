@@ -1,5 +1,5 @@
 import { describe, expect, test, beforeEach, afterEach } from 'bun:test';
-import { deriveProgressLabels } from './claude.js';
+import { deriveProgressLabels, shouldForwardTaskNotification } from './claude.js';
 
 function assistantMessage(content: unknown[]): unknown {
   return { type: 'assistant', message: { content } };
@@ -105,5 +105,23 @@ describe('deriveProgressLabels', () => {
       { type: 'thinking', thinking: 'Real content.', signature: 'good' },
     ]);
     expect(deriveProgressLabels(msg)).toEqual(['> 💭 Real content.']);
+  });
+});
+
+describe('shouldForwardTaskNotification', () => {
+  test('suppresses backgrounded Bash command completions (summary is raw command)', () => {
+    expect(shouldForwardTaskNotification('Bash')).toBe(false);
+  });
+
+  test('forwards genuine subagent (Task) completions', () => {
+    expect(shouldForwardTaskNotification('Task')).toBe(true);
+  });
+
+  test('forwards when tool is unknown/absent (planned task not tied to a tool)', () => {
+    expect(shouldForwardTaskNotification(undefined)).toBe(true);
+  });
+
+  test('suppresses any other known tool', () => {
+    expect(shouldForwardTaskNotification('WebFetch')).toBe(false);
   });
 });
