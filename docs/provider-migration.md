@@ -9,9 +9,11 @@ to Codex and back. The switch runs from the host.
    rebuild the container image. Reapplication matters when core adds a provider
    contract such as a lifecycle hook.
 2. Configure the provider's authentication as documented by its skill.
-3. If the group still has `.seed.md`, `CLAUDE.local.md`, or unindexed
+3. If the group still has `.seed.md`, Claude native auto-memory, or unindexed
    legacy `memory/memories/imported-agent-memory.md`, run `/migrate-memory`
    first. This is a one-time upgrade migration, not part of a provider switch.
+   `CLAUDE.local.md` remains an operator-curated customization surface and the
+   migration preserves it byte-for-byte.
 
 ## Switching
 

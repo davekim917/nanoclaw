@@ -72,7 +72,9 @@ async function main(): Promise<void> {
   // invariants + live destinations map. Rest of the system prompt (per-module
   // instructions, per-channel formatting) is loaded by Claude Code from
   // /workspace/agent/CLAUDE.md (composed base + module fragments). Per-group
-  // memory lives in /workspace/agent/CLAUDE.local.md (auto-loaded).
+  // standing operator customizations live in
+  // /workspace/agent/CLAUDE.local.md (auto-loaded); durable memory lives in
+  // /workspace/agent/memory/ and enters through the provider lifecycle hook.
   const taskId = getTaskSeriesId();
   const addendum = buildSystemPromptAddendum(
     config.assistantName || undefined,
