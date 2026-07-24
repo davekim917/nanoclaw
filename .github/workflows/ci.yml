@@ -16,7 +16,10 @@ jobs:
           cache: pnpm
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: 1.3.12
+          # Keep in lockstep with ARG BUN_VERSION in container/Dockerfile. This pin
+          # last moved in April; the image went to 1.3.14 in May, so CI spent two
+          # months testing agent-runner code against a Bun we never ship.
+          bun-version: 1.3.14
       - run: pnpm install --frozen-lockfile
       - name: Install agent-runner deps (Bun)
         working-directory: container/agent-runner
