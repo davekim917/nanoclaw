@@ -11,8 +11,9 @@
  * The target agent can then forward the file onward via its own `send_file`
  * call using the absolute `/workspace/inbox/<a2a-msg-id>/<filename>` path.
  *
- * Self-messages are always allowed (used for system notes injected back into
- * an agent's own session, e.g. post-approval follow-up prompts).
+ * Self-chat messages are allowed (used for deliberate notes injected back
+ * into an agent's own session). Self-directed status messages are dropped:
+ * streaming progress is output, never a new input turn.
  *
  * Core delivery.ts dispatches into this via a dynamic import guarded by a
  * `channel_type === 'agent'` check. When the module is absent the check in
@@ -172,6 +173,7 @@ export function forwardAttachedFiles(
 
 export interface RoutableAgentMessage {
   id: string;
+  kind?: string;
   platform_id: string | null;
   content: string;
   /**
@@ -181,6 +183,16 @@ export interface RoutableAgentMessage {
    * reply back to the originating session — see `resolveTargetSession`.
    */
   in_reply_to: string | null;
+}
+
+function isExactSameSessionLoopback(msg: RoutableAgentMessage, session: Session): boolean {
+  if (!msg.in_reply_to) return false;
+  const db = openInboundDb(session.agent_group_id, session.id);
+  try {
+    return getInboundSourceSessionId(db, msg.in_reply_to) === session.id;
+  } finally {
+    db.close();
+  }
 }
 
 /**
@@ -262,6 +274,21 @@ export async function routeAgentMessage(msg: RoutableAgentMessage, session: Sess
     throw new Error(`agent-to-agent message ${msg.id} is missing a target agent group id`);
   }
   const isSelf = targetAgentGroupId === sourceAgentGroupId;
+  const loopReason =
+    isSelf && msg.kind === 'status'
+      ? 'self-directed status'
+      : isSelf && isExactSameSessionLoopback(msg, session)
+        ? 'same-session loopback'
+        : null;
+  if (loopReason) {
+    log.warn('agent-route: dropping self-directed loop message', {
+      agentGroupId: sourceAgentGroupId,
+      sessionId: session.id,
+      msgId: msg.id,
+      reason: loopReason,
+    });
+    return;
+  }
   if (!isSelf && !hasDestination(sourceAgentGroupId, 'agent', targetAgentGroupId)) {
     throw new Error(`unauthorized agent-to-agent: ${sourceAgentGroupId} has no destination for ${targetAgentGroupId}`);
   }

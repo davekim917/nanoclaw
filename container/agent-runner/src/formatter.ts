@@ -192,6 +192,22 @@ export interface RoutingContext {
 }
 
 /**
+ * Host-generated notifications (approval outcomes, restart notes, self-mod
+ * results, etc.) are written as self-agent messages so they reach the running
+ * container. They are inputs to the current session, not an explicit request
+ * to make the agent itself the reply destination.
+ */
+function isSessionLocalSystemNotification(message: MessageInRow | undefined): boolean {
+  if (message?.channel_type !== 'agent') return false;
+  try {
+    const content = JSON.parse(message.content) as { sender?: unknown; senderId?: unknown };
+    return content.sender === 'system' && content.senderId === 'system';
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Extract routing context from a batch of messages.
  *
  * Routing rule: if the first non-system message has `platform_id` set,
@@ -213,6 +229,10 @@ export interface RoutingContext {
  *     info; the reply needs to route to the originating session's
  *     channel/thread, so per-field session_routing fallback is correct
  *     for that case (gated by `platform_id == null`).
+ *   - Host-generated self-agent system notifications carry the agent group
+ *     id as platform_id only as an internal delivery address. Their replies
+ *     must stay on the session's Slack/Discord origin rather than route back
+ *     into the same agent as a new inbound message.
  */
 export function extractRouting(messages: MessageInRow[]): RoutingContext {
   // Skip system rows when picking the routing anchor — recall_context system
@@ -248,7 +268,7 @@ export function extractRouting(messages: MessageInRow[]): RoutingContext {
   // Treat (platform_id, channel_type, thread_id) as a unit. `platform_id`
   // is the discriminator — when set, the message itself specifies WHERE
   // to go and we respect even an explicit null thread_id (= channel root).
-  const useOwnRouting = first?.platform_id != null;
+  const useOwnRouting = first?.platform_id != null && !isSessionLocalSystemNotification(first);
   return {
     platformId: useOwnRouting ? first.platform_id : (sessionRouting.platform_id ?? null),
     channelType: useOwnRouting ? (first.channel_type ?? null) : (sessionRouting.channel_type ?? null),

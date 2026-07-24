@@ -514,6 +514,35 @@ describe('on_wake filtering', () => {
 });
 
 describe('routing', () => {
+  function seedSessionRouting(channelType: string, platformId: string, threadId: string): void {
+    const db = getInboundDb();
+    db.prepare(
+      `CREATE TABLE IF NOT EXISTS session_routing (
+         id INTEGER PRIMARY KEY,
+         channel_type TEXT,
+         platform_id TEXT,
+         thread_id TEXT
+       )`,
+    ).run();
+    db.prepare(
+      `INSERT OR REPLACE INTO session_routing (id, channel_type, platform_id, thread_id)
+       VALUES (1, ?, ?, ?)`,
+    ).run(channelType, platformId, threadId);
+  }
+
+  function insertInternalAgentNotification(id: string, agentGroupId: string): void {
+    getInboundDb()
+      .prepare(
+        `INSERT INTO messages_in (id, kind, timestamp, status, platform_id, channel_type, thread_id, content)
+       VALUES (?, 'chat', datetime('now'), 'pending', ?, 'agent', NULL, ?)`,
+      )
+      .run(
+        id,
+        agentGroupId,
+        JSON.stringify({ text: 'Your approval request was rejected.', sender: 'system', senderId: 'system' }),
+      );
+  }
+
   it('should extract routing from messages', () => {
     getInboundDb()
       .prepare(
@@ -623,6 +652,28 @@ describe('routing', () => {
     expect(routing.platformId).toBe('slack:C123');
     expect(routing.channelType).toBe('slack');
     expect(routing.threadId).toBe('slack:C123:home-thread');
+  });
+
+  it('keeps the Discord session origin for an internal self-agent notification', () => {
+    seedSessionRouting('discord', 'discord:1479489865702703155:1496304577081770106', '1496304577081770106');
+    insertInternalAgentNotification('appr-note-discord', 'number-drinks-codex');
+
+    const routing = extractRouting(getPendingMessages());
+    expect(routing.platformId).toBe('discord:1479489865702703155:1496304577081770106');
+    expect(routing.channelType).toBe('discord');
+    expect(routing.threadId).toBe('1496304577081770106');
+    expect(routing.inReplyTo).toBe('appr-note-discord');
+  });
+
+  it('keeps the Slack session origin for an internal self-agent notification', () => {
+    seedSessionRouting('slack', 'slack:C0AJA89MN2E', 'slack:C0AJA89MN2E:1784808844.188429');
+    insertInternalAgentNotification('appr-note-slack', 'number-drinks-codex');
+
+    const routing = extractRouting(getPendingMessages());
+    expect(routing.platformId).toBe('slack:C0AJA89MN2E');
+    expect(routing.channelType).toBe('slack');
+    expect(routing.threadId).toBe('slack:C0AJA89MN2E:1784808844.188429');
+    expect(routing.inReplyTo).toBe('appr-note-slack');
   });
 
   it('task in batch dominates routing — chat-row thread does not hijack', () => {

@@ -387,6 +387,45 @@ describe('routeAgentMessage return-path', () => {
     expect(JSON.parse(s2Rows[0].content).text).toBe('self-note');
   });
 
+  it('drops a self-directed status message instead of reinjecting it as chat', async () => {
+    await routeAgentMessage(
+      {
+        id: 'self-status',
+        kind: 'status',
+        platform_id: A,
+        content: JSON.stringify({ text: '> Working' }),
+        in_reply_to: null,
+      },
+      S1,
+    );
+
+    expect(readInbound(A, S1.id)).toHaveLength(0);
+    expect(readInbound(A, S2.id)).toHaveLength(0);
+  });
+
+  it('drops a chat response that loops back into the exact same session', async () => {
+    await routeAgentMessage(
+      { id: 'self-seed', kind: 'chat', platform_id: A, content: '{"text":"seed"}', in_reply_to: null },
+      S2,
+    );
+    const seedInbound = readInbound(A, S2.id);
+    expect(seedInbound).toHaveLength(1);
+    expect(seedInbound[0].source_session_id).toBe(S2.id);
+
+    await routeAgentMessage(
+      {
+        id: 'self-loop-reply',
+        kind: 'chat',
+        platform_id: A,
+        content: '{"text":"loop reply"}',
+        in_reply_to: seedInbound[0].id,
+      },
+      S2,
+    );
+
+    expect(readInbound(A, S2.id)).toHaveLength(1);
+  });
+
   it('BUG: no volume cap on a2a routing — unbounded ping-pong is allowed (#2063)', async () => {
     // Two agents can exchange unlimited messages with no rate limit or loop
     // detection. This test documents the gap — it should FAIL once #2063 lands.
