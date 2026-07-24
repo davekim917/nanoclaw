@@ -190,6 +190,15 @@ Before reading content:
 Then organize every import now, not in a future NanoClaw turn. This includes
 every regular file inside each `imported-claude-auto-memory*` directory:
 
+For a staged Claude auto-memory directory whose files are already distilled
+Markdown notes, use `scripts/migrate-auto-memory.mjs --source <staged-dir>
+--memory <group-memory-dir>` to preserve every note's content, normalize its
+top-level OKF `type`, build a complete imported-memory index, and print the
+source-to-destination report. The helper refuses symlinks, special files,
+unknown non-Markdown files, nested directories, and destination collisions;
+review its report and the resulting files rather than treating successful
+execution as approval.
+
 1. Ensure `memory/index.md` includes `okf_version: "0.1"`,
    `memory/system/index.md` links the system files, and
    `memory/system/definition.md` has `type: system`, preserving unknown fields
@@ -240,7 +249,9 @@ Verify for every group:
 - root `index.md` declares OKF v0.1 and each non-reserved durable Markdown
   concept has a non-empty `type`
 - Core Memory contains facts, not an initial-instructions prompt
-- standing behavior is in `instructions.prepend.md`
+- standing behavior extracted from staged legacy imports is in
+  `instructions.prepend.md`; the independently protected `CLAUDE.local.md`
+  remains unchanged
 - every inventoried `CLAUDE.local.md` is still at its original path with the
   same path type and, for regular files, the same checksum
 - every generated `CLAUDE.md` excluded by its composed-at-spawn marker is still

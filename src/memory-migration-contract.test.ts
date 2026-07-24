@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 
 const skill = fs.readFileSync(path.resolve('.claude/skills/migrate-memory/SKILL.md'), 'utf-8');
 const updateSkill = fs.readFileSync(path.resolve('.claude/skills/update-nanoclaw/SKILL.md'), 'utf-8');
+const helper = fs.readFileSync(path.resolve('.claude/skills/migrate-memory/scripts/migrate-auto-memory.mjs'), 'utf-8');
 
 describe('shared-memory migration contract', () => {
   it('inventories every legacy memory surface disabled or replaced by the cutover', () => {
@@ -54,6 +55,15 @@ describe('shared-memory migration contract', () => {
     expect(skill).toMatch(/every\s+final concept is reachable from `memory\/index\.md`/);
     expect(skill).toContain('Produce a source-to-destination report');
     expect(skill).toContain('Do not call the migration complete');
+  });
+
+  it('uses a deterministic helper that refuses unsafe or ambiguous staged inputs', () => {
+    expect(skill).toContain('scripts/migrate-auto-memory.mjs');
+    expect(skill).toContain('nested directories');
+    expect(helper).toContain('preserved-content-with-okf-type');
+    expect(helper).toContain('Nested staged directories require operator review');
+    expect(helper).toContain('Refusing to overwrite existing destination');
+    expect(helper).not.toContain('preserved-verbatim-with-okf-type');
   });
 
   it('does not recreate or delete the old default memory folders', () => {
