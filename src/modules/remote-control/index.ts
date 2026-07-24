@@ -14,6 +14,7 @@
 import type Database from 'better-sqlite3';
 
 import { registerDeliveryAction } from '../../delivery.js';
+import { unguarded } from '../../guard/index.js';
 import { getActiveSession, startRemoteControl, stopRemoteControl } from '../../remote-control.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import type { Session } from '../../types.js';
@@ -106,8 +107,11 @@ const applyStopRemoteControl: ApprovalHandler = async ({ session, notify }) => {
   notifyAgent(session, text);
 };
 
-registerDeliveryAction('start_remote_control', handleStartRemoteControl);
-registerDeliveryAction('stop_remote_control', handleStopRemoteControl);
-registerDeliveryAction('get_remote_control_status', handleGetRemoteControlStatus);
+const REMOTE_CONTROL_ACTION = unguarded(
+  'start/stop only create approval requests; status is read-only and all effects remain in approval handlers',
+);
+registerDeliveryAction('start_remote_control', handleStartRemoteControl, REMOTE_CONTROL_ACTION);
+registerDeliveryAction('stop_remote_control', handleStopRemoteControl, REMOTE_CONTROL_ACTION);
+registerDeliveryAction('get_remote_control_status', handleGetRemoteControlStatus, REMOTE_CONTROL_ACTION);
 registerApprovalHandler('start_remote_control', applyStartRemoteControl);
 registerApprovalHandler('stop_remote_control', applyStopRemoteControl);

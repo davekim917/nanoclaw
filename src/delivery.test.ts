@@ -21,7 +21,7 @@ vi.mock('./container-runner.js', () => ({
 
 vi.mock('./config.js', async () => {
   const actual = await vi.importActual<typeof import('./config.js')>('./config.js');
-  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-delivery' };
+  return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-delivery', GROUPS_DIR: '/tmp/nanoclaw-test-delivery/groups' };
 });
 
 const TEST_DIR = '/tmp/nanoclaw-test-delivery';
@@ -30,6 +30,7 @@ import { initTestDb, closeDb, runMigrations, createAgentGroup, createMessagingGr
 import { getDeliveredIds } from './db/session-db.js';
 import { resolveSession, outboundDbPath, openInboundDb } from './session-manager.js';
 import { deliverSessionMessages, setDeliveryAdapter, assertChannelRoutingConsistency } from './delivery.js';
+import { createChannelDeliveryAdapter } from './channels/channel-registry.js';
 
 function now(): string {
   return new Date().toISOString();
@@ -686,6 +687,40 @@ describe('deliverSessionMessages — retry and permanent failure', () => {
     const delivered = getDeliveredIds(inDb);
     inDb.close();
     expect(delivered.has('out-flaky')).toBe(true);
+  });
+
+  it('does not acknowledge a message when no channel adapter is registered (#2995)', async () => {
+    // Regression: the real bridge used to return undefined when the exact
+    // adapter lookup missed, and drainSession marked the row delivered with
+    // platform_message_id=NULL even though no send happened. The bridge must
+    // throw so the row takes the normal retry → failed path. Uses the REAL
+    // createChannelDeliveryAdapter with an empty registry — the state after
+    // an adapter factory returns null (missing credentials) at startup.
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertOutbound('ag-1', session.id, 'out-offline');
+
+    setDeliveryAdapter(createChannelDeliveryAdapter());
+
+    // Attempt 1 — must NOT be acknowledged as delivered
+    await deliverSessionMessages(session);
+    let inDb = openInboundDb('ag-1', session.id);
+    expect(getDeliveredIds(inDb).has('out-offline')).toBe(false);
+    inDb.close();
+
+    // Attempts 2 and 3 — exhausts MAX_DELIVERY_ATTEMPTS
+    await deliverSessionMessages(session);
+    await deliverSessionMessages(session);
+
+    // The row must end as status='failed', never 'delivered'
+    inDb = openInboundDb('ag-1', session.id);
+    const row = inDb
+      .prepare('SELECT status, platform_message_id FROM delivered WHERE message_out_id = ?')
+      .get('out-offline') as { status: string; platform_message_id: string | null } | undefined;
+    inDb.close();
+    expect(row).toBeDefined();
+    expect(row!.status).toBe('failed');
+    expect(row!.platform_message_id).toBeNull();
   });
 
   it('clears attempt counter on successful delivery', async () => {

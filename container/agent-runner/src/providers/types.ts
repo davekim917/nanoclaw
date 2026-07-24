@@ -1,3 +1,5 @@
+import type { MemorySessionHookRegistration } from '../memory/session-hook.js';
+
 export interface AgentProvider {
   /**
    * True if the provider's underlying SDK handles slash commands natively and
@@ -5,6 +7,9 @@ export interface AgentProvider {
    * slash commands like any other chat message.
    */
   readonly supportsNativeSlashCommands: boolean;
+
+  /** Register authoritative file memory through this provider's lifecycle seam. */
+  registerMemorySessionHook(hook: MemorySessionHookRegistration): void;
 
   /**
    * Optional. Called by the poll-loop after each completed exchange (a

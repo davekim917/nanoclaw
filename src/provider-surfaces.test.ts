@@ -39,6 +39,8 @@ import { buildMounts } from './container-runner.js';
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from './db/index.js';
 import { ensureContainerConfig } from './db/container-configs.js';
 import { initGroupFilesystem } from './group-init.js';
+import { PERSONA_PREPEND_FILE } from './group-persona.js';
+import { log } from './log.js';
 import { registerProviderContainerConfig } from './providers/provider-container-registry.js';
 import type { ContainerConfig } from './container-config.js';
 import type { AgentGroup, Session } from './types.js';
@@ -72,6 +74,7 @@ function containerConfig(): ContainerConfig {
 }
 
 beforeEach(() => {
+  vi.clearAllMocks();
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
   fs.mkdirSync(TEST_ROOT, { recursive: true });
   runMigrations(initTestDb());
@@ -83,7 +86,7 @@ afterEach(() => {
 });
 
 describe('initGroupFilesystem agent surfaces', () => {
-  it('writes the default surfaces when no provider is given (today’s behavior)', () => {
+  it('preserves local instructions and stages default Claude support files', () => {
     const ag = group('ag-default', 'default-group');
     createAgentGroup(ag);
 
@@ -93,11 +96,16 @@ describe('initGroupFilesystem agent surfaces', () => {
     const claudeDir = path.join(DATA_DIR, 'v2-sessions', ag.id, '.claude-shared');
     expect(fs.readFileSync(path.join(groupDir, 'CLAUDE.local.md'), 'utf-8')).toBe('hello\n');
     const settings = JSON.parse(fs.readFileSync(path.join(claudeDir, 'settings.json'), 'utf-8')) as {
+      autoMemoryEnabled?: boolean;
       env: Record<string, string>;
+      hooks: Record<string, unknown>;
     };
     expect(settings.env.BASH_MAX_TIMEOUT_MS).toBe('3600000');
     expect(settings.env).not.toHaveProperty('BASH_DEFAULT_TIMEOUT_MS');
     expect(fs.existsSync(path.join(claudeDir, 'skills'))).toBe(true);
+    expect(settings.autoMemoryEnabled).toBe(false);
+    expect(settings.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY).toBe('1');
+    expect(settings.hooks.SessionStart).toBeUndefined();
   });
 
   it('reconciles the managed Bash maximum while preserving an operator-owned default', () => {
@@ -127,13 +135,11 @@ describe('initGroupFilesystem agent surfaces', () => {
     const groupDir = path.join(GROUPS_DIR, ag.folder);
     const sessionRoot = path.join(DATA_DIR, 'v2-sessions', ag.id);
     expect(fs.existsSync(groupDir)).toBe(true);
-    // A fresh group on a surfaces-owning provider must not contain stale
-    // Claude surfaces; its seed lands in the scaffold's conventional file,
-    // which the container-side scaffold preserves at boot.
     expect(fs.existsSync(path.join(groupDir, 'CLAUDE.local.md'))).toBe(false);
     expect(fs.readFileSync(path.join(groupDir, 'memory', 'memories', 'imported-agent-memory.md'), 'utf-8')).toBe(
       'hello\n',
     );
+    expect(fs.existsSync(path.join(groupDir, PERSONA_PREPEND_FILE))).toBe(false);
     expect(fs.existsSync(path.join(sessionRoot, '.claude-shared'))).toBe(false);
   });
 
@@ -146,50 +152,35 @@ describe('initGroupFilesystem agent surfaces', () => {
     const groupDir = path.join(GROUPS_DIR, ag.folder);
     expect(fs.existsSync(path.join(groupDir, 'CLAUDE.local.md'))).toBe(false);
     expect(fs.existsSync(path.join(groupDir, 'memory'))).toBe(false);
+    expect(fs.existsSync(path.join(groupDir, PERSONA_PREPEND_FILE))).toBe(false);
   });
 
-  it('treats an unregistered provider name as default surfaces', () => {
+  it('treats an unregistered provider name as default support files without creating memory', () => {
     const ag = group('ag-unknown', 'unknown-group');
     createAgentGroup(ag);
 
     initGroupFilesystem(ag, { provider: 'not-registered' });
 
-    expect(fs.existsSync(path.join(GROUPS_DIR, ag.folder, 'CLAUDE.local.md'))).toBe(true);
+    const groupDir = path.join(GROUPS_DIR, ag.folder);
+    expect(fs.existsSync(path.join(groupDir, 'CLAUDE.local.md'))).toBe(true);
+    expect(fs.existsSync(path.join(groupDir, 'memory'))).toBe(false);
   });
 });
 
-describe('initGroupFilesystem deferred seed (.seed.md)', () => {
-  // Creation is provider-agnostic: the DM-agent creators drop a neutral
-  // `.seed.md` and defer placement to the first spawn, where the DB-resolved
-  // provider is known. group-init places it into the right surface and
-  // consumes it. Red-on-delete: if that placement is removed, these fail.
-  it('places .seed.md into CLAUDE.local.md for the default provider, then consumes it', () => {
-    const ag = group('ag-seed-default', 'seed-default');
+describe('initGroupFilesystem legacy seed isolation', () => {
+  it('places .seed.md into CLAUDE.local.md once and consumes it', () => {
+    const ag = group('ag-seed', 'seed-group');
     createAgentGroup(ag);
     const groupDir = path.join(GROUPS_DIR, ag.folder);
     fs.mkdirSync(groupDir, { recursive: true });
     fs.writeFileSync(path.join(groupDir, '.seed.md'), 'seeded identity\n');
 
-    initGroupFilesystem(ag, {}); // no inline instructions — must read .seed.md
+    initGroupFilesystem(ag, {});
 
+    expect(fs.existsSync(path.join(groupDir, '.seed.md'))).toBe(false);
     expect(fs.readFileSync(path.join(groupDir, 'CLAUDE.local.md'), 'utf-8')).toBe('seeded identity\n');
-    expect(fs.existsSync(path.join(groupDir, '.seed.md'))).toBe(false);
-  });
-
-  it('places .seed.md into the memory scaffold (never CLAUDE.*) for a surfaces-owning provider, then consumes it', () => {
-    const ag = group('ag-seed-surfy', 'seed-surfy');
-    createAgentGroup(ag);
-    const groupDir = path.join(GROUPS_DIR, ag.folder);
-    fs.mkdirSync(groupDir, { recursive: true });
-    fs.writeFileSync(path.join(groupDir, '.seed.md'), 'seeded identity\n');
-
-    initGroupFilesystem(ag, { provider: 'surfaces-test-provider' });
-
-    expect(fs.existsSync(path.join(groupDir, 'CLAUDE.local.md'))).toBe(false);
-    expect(fs.readFileSync(path.join(groupDir, 'memory', 'memories', 'imported-agent-memory.md'), 'utf-8')).toBe(
-      'seeded identity\n',
-    );
-    expect(fs.existsSync(path.join(groupDir, '.seed.md'))).toBe(false);
+    expect(fs.existsSync(path.join(groupDir, PERSONA_PREPEND_FILE))).toBe(false);
+    expect(fs.existsSync(path.join(groupDir, 'memory'))).toBe(false);
   });
 });
 

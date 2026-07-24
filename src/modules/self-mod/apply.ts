@@ -1,11 +1,12 @@
 /**
- * Approval handlers for self-modification actions.
+ * Guarded handler bodies for self-modification actions.
  *
- * The approvals module calls these when an admin clicks Approve on a
- * pending_approvals row whose action matches. Each handler mutates the
- * container config in the DB, rebuilds/kills the container as needed,
- * and writes an on_wake message so the fresh container picks up where
- * the old one left off.
+ * The delivery registry's guard wrapper runs these only on `allow` — which,
+ * for self-mod, means an approved replay carrying a valid grant (the
+ * decision holds unconditionally from the container path; see ./guard.ts).
+ * Each body mutates the container config in the DB, rebuilds/kills the
+ * container as needed, and writes an on_wake message so the fresh container
+ * picks up where the old one left off.
  *
  * install_packages: update DB + rebuild image + kill container + on_wake.
  * add_mcp_server: update DB + kill container + on_wake.
@@ -24,18 +25,18 @@ import { validateMcpServers, type McpServerConfig } from '../../container-config
 import { log } from '../../log.js';
 import { writeSessionMessage } from '../../session-manager.js';
 import type { Session } from '../../types.js';
-import type { ApprovalHandler } from '../approvals/index.js';
+import { notifyAgent, type ApprovalHandler } from '../approvals/index.js';
 
-export const applyInstallPackages: ApprovalHandler = async ({ session, payload, userId, notify }) => {
+export async function applyInstallPackages(payload: Record<string, unknown>, session: Session): Promise<void> {
   const agentGroup = getAgentGroup(session.agent_group_id);
   if (!agentGroup) {
-    await notify('install_packages approved but agent group missing.');
+    notifyAgent(session, 'install_packages approved but agent group missing.');
     return;
   }
 
   const configRow = getContainerConfig(agentGroup.id);
   if (!configRow) {
-    notify('install_packages approved but container config missing.');
+    notifyAgent(session, 'install_packages approved but container config missing.');
     return;
   }
 
@@ -59,7 +60,7 @@ export const applyInstallPackages: ApprovalHandler = async ({ session, payload, 
     ...((payload.apt as string[] | undefined) || []),
     ...((payload.npm as string[] | undefined) || []),
   ].join(', ');
-  log.info('Package install approved', { agentGroupId: session.agent_group_id, userId });
+  log.info('Package install approved', { agentGroupId: session.agent_group_id });
   try {
     await buildAgentGroupImage(session.agent_group_id);
     writeSessionMessage(session.agent_group_id, session.id, {
@@ -82,23 +83,24 @@ export const applyInstallPackages: ApprovalHandler = async ({ session, payload, 
     });
     log.info('Container rebuild completed (bundled with install)', { agentGroupId: session.agent_group_id });
   } catch (e) {
-    await notify(
+    notifyAgent(
+      session,
       `Packages added to config (${pkgs}) but rebuild failed: ${e instanceof Error ? e.message : String(e)}. Tell the user — an admin will need to retry the install_packages request or inspect the build logs.`,
     );
     log.error('Bundled rebuild failed after install approval', { agentGroupId: session.agent_group_id, err: e });
   }
-};
+}
 
-export const applyAddMcpServer: ApprovalHandler = async ({ session, payload, userId, notify }) => {
+export async function applyAddMcpServer(payload: Record<string, unknown>, session: Session): Promise<void> {
   const agentGroup = getAgentGroup(session.agent_group_id);
   if (!agentGroup) {
-    await notify('add_mcp_server approved but agent group missing.');
+    notifyAgent(session, 'add_mcp_server approved but agent group missing.');
     return;
   }
 
   const configRow = getContainerConfig(agentGroup.id);
   if (!configRow) {
-    notify('add_mcp_server approved but container config missing.');
+    notifyAgent(session, 'add_mcp_server approved but container config missing.');
     return;
   }
 
@@ -129,8 +131,8 @@ export const applyAddMcpServer: ApprovalHandler = async ({ session, payload, use
     const s = getSession(session.id);
     if (s) wakeContainer(s);
   });
-  log.info('MCP server add approved', { agentGroupId: session.agent_group_id, userId });
-};
+  log.info('MCP server add approved', { agentGroupId: session.agent_group_id });
+}
 
 /**
  * Apply a model (+ optional effort) change to an agent group's container config

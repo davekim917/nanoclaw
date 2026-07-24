@@ -7,6 +7,7 @@ fact store:
 - external user and assistant messages projected into `data/archive.db`;
 - workgroup and sibling files, including tracked, untracked, and gitignored
   knowledge artifacts;
+- each group’s portable Markdown memory tree under `groups/<folder>/memory/`;
 - canonical repository clones and the current thread's managed worktree; and
 - operator-curated `CLAUDE.local.md` instructions and preferences.
 
@@ -15,6 +16,36 @@ disposable graph per workgroup, returns file or conversation provenance, and
 cannot be used to cross the caller's workgroup boundary. Source artifacts stay
 authoritative; agents must open cited provenance before consequential claims or
 changes.
+
+## Portable file memory
+
+Inside a container, the group memory tree is `/workspace/agent/memory/`:
+
+```text
+memory/
+├── index.md
+└── system/
+    ├── index.md
+    └── definition.md
+```
+
+The runner creates missing scaffold files at boot and never overwrites existing
+content. `index.md` holds concise core memory and pointers; deeper facts,
+projects, decisions, and people live in linked Markdown files.
+`system/definition.md` documents the memory conventions. Concept files use the
+Open Knowledge Format (OKF) v0.1 frontmatter convention, but malformed or
+legacy Markdown remains readable and is not rejected.
+
+The runner registers the same lifecycle memory seam for Claude, Codex, and
+OpenCode. It supplies `index.md` and `system/definition.md` as authoritative
+context with a 16k-character budget per file; deeper context is read directly
+from linked files. This is source loading, not a second retrieval engine:
+Graphify indexes the same on-disk tree and remains the only derived retrieval
+layer.
+
+`CLAUDE.local.md` is separate. It remains operator-curated standing
+instructions and is never an agent memory write target. Claude native
+auto-memory and Codex’s opaque summary-memory store are disabled.
 
 ## Autonomous capture and freshness
 

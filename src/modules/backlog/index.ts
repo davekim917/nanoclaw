@@ -11,6 +11,7 @@
  * them during delivery and applies the change to the central DB here.
  */
 import { registerDeliveryAction } from '../../delivery.js';
+import { unguarded } from '../../guard/index.js';
 import { log } from '../../log.js';
 import type { Session } from '../../types.js';
 import { addShipLogEntry, addBacklogItem, updateBacklogItem, deleteBacklogItem } from '../../db/backlog.js';
@@ -126,18 +127,36 @@ async function handleDeleteBacklogItem(content: Record<string, unknown>, session
   }
 }
 
-registerDeliveryAction('add_ship_log', async (content, session) => {
-  await handleAddShipLog(content, session);
-});
+const BACKLOG_ACTION = unguarded('group-scoped work log; handler derives the agent group from the trusted session');
 
-registerDeliveryAction('add_backlog_item', async (content, session) => {
-  await handleAddBacklogItem(content, session);
-});
+registerDeliveryAction(
+  'add_ship_log',
+  async (content, session) => {
+    await handleAddShipLog(content, session);
+  },
+  BACKLOG_ACTION,
+);
 
-registerDeliveryAction('update_backlog_item', async (content, session) => {
-  await handleUpdateBacklogItem(content, session);
-});
+registerDeliveryAction(
+  'add_backlog_item',
+  async (content, session) => {
+    await handleAddBacklogItem(content, session);
+  },
+  BACKLOG_ACTION,
+);
 
-registerDeliveryAction('delete_backlog_item', async (content, session) => {
-  await handleDeleteBacklogItem(content, session);
-});
+registerDeliveryAction(
+  'update_backlog_item',
+  async (content, session) => {
+    await handleUpdateBacklogItem(content, session);
+  },
+  BACKLOG_ACTION,
+);
+
+registerDeliveryAction(
+  'delete_backlog_item',
+  async (content, session) => {
+    await handleDeleteBacklogItem(content, session);
+  },
+  BACKLOG_ACTION,
+);

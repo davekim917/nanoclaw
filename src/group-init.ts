@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 
-import { DATA_DIR, GROUPS_DIR } from './config.js';
+import { DATA_DIR, DEFAULT_AGENT_PROVIDER, GROUPS_DIR } from './config.js';
 import { log } from './log.js';
 import { providerProvidesAgentSurfaces } from './providers/provider-container-registry.js';
 import type { AgentGroup } from './types.js';
@@ -20,7 +20,7 @@ export const GLOBAL_CLAUDE_IMPORT = `@./${GLOBAL_MEMORY_LINK_NAME}`;
 const REQUIRED_ENV: Record<string, string> = {
   CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
   CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
-  CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
+  CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1',
   // Let long foreground worker-codex calls stay attached for up to an hour.
   // Deliberately leave BASH_DEFAULT_TIMEOUT_MS unset so ordinary Bash calls
   // retain Claude Code's shorter default timeout.
@@ -75,9 +75,9 @@ const DEPRECATED_ENV: readonly string[] = [
 // REQUIRED_ENV above.
 const REQUIRED_SETTINGS: Record<string, unknown> = {
   $schema: 'https://json.schemastore.org/claude-code-settings.json',
-  // Background memory consolidation — prunes stale notes, resolves
-  // contradictions, keeps MEMORY.md concise so auto-memory stays useful.
-  autoDreamEnabled: true,
+  // Graphify is this install's only derived retrieval layer. Claude's native
+  // auto-memory must not rewrite the operator-curated CLAUDE.local.md surface.
+  autoMemoryEnabled: false,
   // Explicit opt-in to thinking for supported models. The SDK treats
   // absent-or-true as "enabled automatically" but we keep this explicit
   // so `/update-nanoclaw` can never leave a group with thinking disabled
@@ -209,9 +209,8 @@ function ensureRequiredSettings(settingsFile: string): boolean {
  * Source code and skills are shared RO mounts — not copied per-group.
  * Skill symlinks are synced at spawn time by container-runner.ts.
  *
- * The composed `CLAUDE.md` is NOT written here — it's regenerated on every
- * spawn by `composeGroupClaudeMd()` (see `claude-md-compose.ts`). Initial
- * per-group instructions (if provided) seed `CLAUDE.local.md`.
+ * The composed `CLAUDE.md` is regenerated on every spawn. Initial per-group
+ * instructions seed the provider's own durable memory surface.
  */
 export function initGroupFilesystem(
   group: AgentGroup,
@@ -219,11 +218,11 @@ export function initGroupFilesystem(
 ): void {
   const initialized: string[] = [];
 
-  // Default agent surfaces apply unless the group's provider declares (at
-  // registration) that it provides its own. Callers that don't know the
-  // provider omit it — unregistered/unknown names report no capabilities,
-  // so the default surfaces are written, exactly as before this seam.
-  const defaultSurfaces = !providerProvidesAgentSurfaces(opts?.provider);
+  // Default surfaces apply unless the resolved provider declares its own.
+  // An absent provider is the install default; unknown providers retain the
+  // long-standing Claude-compatible fallback.
+  const providerHint = (opts?.provider ?? DEFAULT_AGENT_PROVIDER).toLowerCase();
+  const defaultSurfaces = !providerProvidesAgentSurfaces(providerHint);
 
   // 1. groups/<folder>/ — group memory + working dir
   const groupDir = path.resolve(GROUPS_DIR, group.folder);
@@ -232,18 +231,10 @@ export function initGroupFilesystem(
     initialized.push('groupDir');
   }
 
-  // Seed instructions land in the provider's OWN memory surface. Default
-  // (Claude) surfaces auto-load CLAUDE.local.md natively. A surfaces-owning
-  // provider must never see stale CLAUDE.* files in its workspace — its seed
-  // goes into the memory scaffold's conventional landing file instead
-  // (memory/memories/imported-agent-memory.md): the container-side scaffold
-  // preserves pre-existing files, and the doctrine tells the agent to read
-  // that file on its first turn.
-  //
-  // Creation stays provider-agnostic: a DM-agent creator drops the seed in a
-  // neutral `.seed.md`, and placement is deferred to here (the first spawn,
-  // where the DB-resolved provider is known). Once placed it's consumed.
-  // `opts.instructions` still wins for any caller that passes it inline.
+  // Preserve the customization contract: default providers load
+  // CLAUDE.local.md; surface-owning providers receive the same seed in their
+  // provider-neutral memory tree. A deferred .seed.md is consumed exactly
+  // once after the provider is known.
   const neutralSeedFile = path.join(groupDir, '.seed.md');
   const seed =
     opts?.instructions ??
@@ -252,20 +243,18 @@ export function initGroupFilesystem(
   if (defaultSurfaces) {
     const claudeLocalFile = path.join(groupDir, 'CLAUDE.local.md');
     if (!fs.existsSync(claudeLocalFile)) {
-      fs.writeFileSync(claudeLocalFile, seed ? seed + '\n' : '');
+      fs.writeFileSync(claudeLocalFile, seed ? `${seed}\n` : '');
       initialized.push('CLAUDE.local.md');
     }
   } else if (seed) {
     const seedFile = path.join(groupDir, 'memory', 'memories', 'imported-agent-memory.md');
     if (!fs.existsSync(seedFile)) {
       fs.mkdirSync(path.dirname(seedFile), { recursive: true });
-      fs.writeFileSync(seedFile, seed + '\n');
+      fs.writeFileSync(seedFile, `${seed}\n`);
       initialized.push('memory/memories/imported-agent-memory.md');
     }
   }
 
-  // The neutral seed is single-use — drop it once the surface it belonged in
-  // has been resolved, so it can't re-seed after the operator edits theirs.
   if (fs.existsSync(neutralSeedFile)) {
     fs.rmSync(neutralSeedFile);
     initialized.push('.seed.md consumed');

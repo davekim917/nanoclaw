@@ -174,12 +174,12 @@ describe('OpenCode tool enumeration — classify-or-fail (F4)', () => {
     expect(m![1]).toBe(OPENCODE_CAPTURED_VERSION);
   });
 
-  it('test_oc_exposes_no_denied_builtin: none of the 9 SDK_DISALLOWED_TOOLS names appear in OpenCode built-ins', () => {
+  it('test_oc_exposes_no_denied_builtin: no SDK_DISALLOWED_TOOLS names appear in OpenCode built-ins', () => {
     // Absence = parity with the Claude block surface (D-D / M3). OpenCode's
     // built-ins (bash/read/glob/...) are a disjoint namespace from Claude's
     // PascalCase SDK builtins (CronCreate/EnterPlanMode/...).
     const builtins = new Set<string>(OPENCODE_BUILTIN_TOOLS);
-    expect(SDK_DISALLOWED_TOOLS.length).toBe(9); // pin the expected surface size
+    expect(SDK_DISALLOWED_TOOLS.length).toBe(11); // pin the expected surface size
     for (const denied of SDK_DISALLOWED_TOOLS) {
       expect(builtins.has(denied)).toBe(false);
     }
@@ -220,7 +220,7 @@ describe('OpenCode tool enumeration — classify-or-fail (F4)', () => {
   });
 
   it('test_denylist_single_source: SDK_DISALLOWED_TOOLS is imported from claude.ts (not duplicated)', () => {
-    // The exact 9 Claude-disallowed names, asserted against the imported symbol.
+    // The exact Claude-disallowed names, asserted against the imported symbol.
     // This file declares no local copy — the import IS the single source. If the
     // import were removed/forked, this test would not compile or would drift.
     expect(SDK_DISALLOWED_TOOLS).toEqual([
@@ -233,6 +233,8 @@ describe('OpenCode tool enumeration — classify-or-fail (F4)', () => {
       'ExitPlanMode',
       'EnterWorktree',
       'ExitWorktree',
+      'DesignSync',
+      'ReportFindings',
     ]);
   });
 });

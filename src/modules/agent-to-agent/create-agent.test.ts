@@ -88,7 +88,7 @@ vi.mock('../approvals/index.js', () => ({
 import { initTestDb, closeDb, runMigrations, createAgentGroup } from '../../db/index.js';
 import { getAgentGroupByFolder } from '../../db/agent-groups.js';
 import { applyCreateAgent, handleCreateAgent } from './create-agent.js';
-import type { Session } from '../../types.js';
+import type { PendingApproval, Session } from '../../types.js';
 
 /**
  * Test helper: invokes handleCreateAgent (envelope guards), then if a
@@ -103,6 +103,24 @@ async function runCreateAgent(content: Record<string, unknown>, session: Session
     await applyCreateAgent({
       session: req.session as Session,
       payload: req.payload,
+      approval: {
+        approval_id: 'test-approval',
+        session_id: (req.session as Session).id,
+        request_id: 'test-request',
+        action: 'create_agent',
+        payload: JSON.stringify(req.payload),
+        created_at: now(),
+        agent_group_id: (req.session as Session).agent_group_id,
+        channel_type: null,
+        platform_id: null,
+        thread_id: null,
+        platform_message_id: null,
+        expires_at: null,
+        status: 'pending',
+        title: 'Create agent',
+        options_json: '[]',
+        approver_user_id: 'test-admin',
+      } satisfies PendingApproval,
       userId: 'test-admin',
       notify: async () => {},
     });

@@ -4,6 +4,7 @@ import os from 'os';
 import path from 'path';
 
 import { closeSessionDb, initTestSessionDb } from '../db/connection.js';
+import { MEMORY_SESSION_HOOK } from '../memory/session-hook.js';
 import { CodexProvider } from './codex.js';
 
 const ORIGINAL_ENV = {
@@ -177,6 +178,7 @@ lines.on('line', (line) => {
         process.env.CODEX_HEALTH_STILL_WORKING_NOTICE_MS = '1000';
 
         const provider = new CodexProvider({ providerConfig: { reasoning_effort: 'ultra' } });
+        provider.registerMemorySessionHook(MEMORY_SESSION_HOOK);
         const query = provider.query({ prompt: 'perform the original task once', cwd: tmpDir });
         const events: Array<{ type: string; text?: string | null; message?: string }> = [];
         for await (const event of query.events) {

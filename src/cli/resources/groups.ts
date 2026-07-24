@@ -3,7 +3,12 @@ import fs from 'fs';
 import path from 'path';
 
 import { GROUPS_DIR } from '../../config.js';
-import { readContainerConfig, type McpServerConfig, updateContainerConfig } from '../../container-config.js';
+import {
+  readContainerConfig,
+  type AdditionalMountConfig,
+  type McpServerConfig,
+  updateContainerConfig,
+} from '../../container-config.js';
 import { resolveContainerResources, type ContainerResources } from '../../container-resources.js';
 import { buildAgentGroupImage, killContainer, wakeContainer } from '../../container-runner.js';
 import { restartAgentGroupContainers } from '../../container-restart.js';
@@ -92,33 +97,34 @@ registerResource({
     },
     { name: 'created_at', type: 'string', description: 'Auto-set.', generated: true },
   ],
-  // `create` and `delete` are intentionally not in `operations` — create needs
-  // a `--template` branch (below); the generic single-table DELETE violates FK
-  // constraints (see #2525). Both are provided as `customOperations`.
+  // `create` and `delete` are custom (below): create needs a `--template`
+  // branch, and the generic create inserts a bare agent_groups row but never
+  // the container_config a working group needs; the generic single-table
+  // DELETE violates FK constraints (#2525).
   operations: { list: 'open', get: 'open', update: 'approval' },
   customOperations: {
     create: {
       access: 'approval',
       description:
-        'Create an agent group. With --template <ref>, stamp from a local template under templates/ ' +
-        '(MCP servers + instructions + skills); else insert a bare row (--name, --folder).',
+        'Create (or return the existing) agent group with its container config. Idempotent on --folder. ' +
+        'With --template <ref>, stamp from a local template under templates/ (MCP servers + instructions ' +
+        '+ skills + paused recurring tasks). Use --folder <slug> and --name <display name>.',
       handler: async (args) => {
         if (args.template) {
           return createAgentFromTemplate(String(args.template), {
             name: args.name ? String(args.name) : undefined,
           });
         }
-        const name = args.name ? String(args.name) : '';
-        const folder = args.folder ? String(args.folder) : '';
-        if (!name) throw new Error('--name is required');
+        const folder = args.folder as string;
         if (!folder) throw new Error('--folder is required');
-        const group: AgentGroup = {
-          id: randomUUID(),
-          name,
-          folder,
-          agent_provider: null,
-          created_at: new Date().toISOString(),
-        };
+        const name = (args.name as string) ?? folder;
+        const existing = getAgentGroupByFolder(folder);
+        if (existing) {
+          initGroupFilesystem(existing); // ensure a reused group is fully configured too (idempotent; also repairs a missing workspace folder)
+          return existing;
+        }
+        const id = `ag-${randomUUID()}`;
+        const group: AgentGroup = { id, name, folder, agent_provider: null, created_at: new Date().toISOString() };
         createAgentGroup(group);
         // Provision the workspace folder and the `container_configs` row that
         // `getContainerConfig` and the spawn path require. Without this, a
@@ -127,9 +133,11 @@ registerResource({
         // backfill ran (#2415). The template branch above provisions its own
         // config + folder in `createAgentFromTemplate`; this covers the bare
         // path. Mirrors what `setup/register.ts` does after creating an agent
-        // group via the setup flow.
+        // group via the setup flow. The config row is stamped with the
+        // instance default provider (`ensureContainerConfig` inside) — per-group
+        // `groups config update --provider` still wins.
         initGroupFilesystem(group);
-        return group;
+        return getAgentGroupByFolder(folder);
       },
     },
     delete: {
@@ -548,6 +556,69 @@ registerResource({
           removed: { apt: apt || null, npm: npm || null },
           note: 'Image rebuild required for package changes to take effect.',
         };
+      },
+    },
+    'config add-mount': {
+      access: 'approval',
+      hostOnly: true,
+      description:
+        "Mount a host directory into a group's containers. OPERATOR-ONLY — never runnable from " +
+        'inside a container (mounting host paths is a filesystem-access boundary). Requires ' +
+        '`ncl groups restart` to take effect. Use --id <group-id> --host <host-path> --container <container-path> [--ro].',
+      handler: async (args) => {
+        const id = args.id as string;
+        if (!id) throw new Error('--id is required');
+        const hostPath = (args.host ?? args['host-path']) as string | undefined;
+        const containerPath = (args.container ?? args['container-path']) as string | undefined;
+        if (!hostPath || !containerPath) throw new Error('Provide --host <host-path> and --container <container-path>');
+
+        const group = getAgentGroup(id);
+        if (!group) throw new Error(`No agent group: ${id}`);
+        const row = getContainerConfig(id);
+        if (!row) throw new Error(`No container config for group: ${id}`);
+
+        const mount: AdditionalMountConfig = {
+          hostPath,
+          containerPath,
+          ...(args.ro || args.readonly ? { readonly: true } : {}),
+        };
+        const fileConfig = updateContainerConfig(group.folder, (cfg) => {
+          if (!cfg.additionalMounts) cfg.additionalMounts = [];
+          if (!cfg.additionalMounts.some((m) => m.hostPath === hostPath && m.containerPath === containerPath)) {
+            cfg.additionalMounts.push(mount);
+          }
+        });
+        updateContainerConfigJson(id, 'additional_mounts', fileConfig.additionalMounts ?? []);
+
+        return { added: mount, note: `Run \`ncl groups restart --id ${id}\` for the mount to take effect.` };
+      },
+    },
+    'config remove-mount': {
+      access: 'approval',
+      hostOnly: true,
+      description:
+        'Remove a host mount from a group. OPERATOR-ONLY. Requires `ncl groups restart` to take effect. ' +
+        'Use --id <group-id> --host <host-path> --container <container-path>.',
+      handler: async (args) => {
+        const id = args.id as string;
+        if (!id) throw new Error('--id is required');
+        const hostPath = (args.host ?? args['host-path']) as string | undefined;
+        const containerPath = (args.container ?? args['container-path']) as string | undefined;
+        if (!hostPath || !containerPath) throw new Error('Provide --host <host-path> and --container <container-path>');
+
+        const group = getAgentGroup(id);
+        if (!group) throw new Error(`No agent group: ${id}`);
+        const row = getContainerConfig(id);
+        if (!row) throw new Error(`No container config for group: ${id}`);
+
+        const fileConfig = updateContainerConfig(group.folder, (cfg) => {
+          cfg.additionalMounts = (cfg.additionalMounts ?? []).filter(
+            (m) => !(m.hostPath === hostPath && m.containerPath === containerPath),
+          );
+        });
+        updateContainerConfigJson(id, 'additional_mounts', fileConfig.additionalMounts ?? []);
+
+        return { removed: { hostPath, containerPath }, note: `Run \`ncl groups restart --id ${id}\` to apply.` };
       },
     },
     'parity-check': {

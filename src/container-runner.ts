@@ -524,7 +524,7 @@ async function spawnContainer(session: Session, storageActivity: StorageActivity
     throw new Error(`Agent group not found: ${session.agent_group_id}`);
   }
 
-  // Refresh the destination map and default reply routing so any admin
+  // Refresh the destination map and current-thread routing so any admin
   // changes take effect on wake. Destinations come from the agent-to-agent
   // module — skip when the module isn't installed (table absent).
   if (hasTable(getDb(), 'agent_destinations')) {
@@ -1356,7 +1356,7 @@ export function buildMounts(
     }
   }
 
-  // Agent group folder at /workspace/agent (RW for working files + CLAUDE.local.md)
+  // Agent group folder at /workspace/agent (RW for working files + shared memory)
   mounts.push({ hostPath: groupDir, containerPath: '/workspace/agent', readonly: false });
 
   // Sibling-group symlink overlay. clone-as-codex creates relative symlinks
@@ -1413,8 +1413,8 @@ export function buildMounts(
 
   // Composer-managed CLAUDE.md artifacts — nested RO mounts. These are
   // regenerated from the shared base + fragments on every spawn; any
-  // agent-side writes would be clobbered, so enforce read-only. Only
-  // CLAUDE.local.md (per-group memory) remains RW via the group-dir mount.
+  // agent-side writes would be clobbered, so enforce read-only. The shared
+  // memory tree and standing-instructions source remain RW via the group mount.
   // `.claude-shared.md` is a symlink whose target (`/app/CLAUDE.md`) is
   // already RO-mounted, so writes through it fail regardless — no need for
   // a nested mount there.
@@ -2211,15 +2211,26 @@ function syncSkillSymlinks(claudeDir: string, containerConfig: import('./contain
   // Create symlinks for desired skills (container path targets)
   for (const skill of desired) {
     const linkPath = path.join(skillsDir, skill);
-    let exists = false;
+    let entry: fs.Stats | undefined;
     try {
-      fs.lstatSync(linkPath);
-      exists = true;
+      entry = fs.lstatSync(linkPath);
     } catch {
       /* missing */
     }
-    if (!exists) {
+    if (!entry) {
       fs.symlinkSync(`/app/skills/${skill}`, linkPath);
+    } else if (!entry.isSymbolicLink()) {
+      // A real entry here is either a template overlay (intentional; see
+      // src/group-skills.ts) or a stale pre-refactor skill copy that shadows
+      // the shared skill (#3001). No marker distinguishes them yet, so
+      // surface the skip instead of staying silent.
+      log.warn(
+        'Shared skill not symlinked: real entry occupies the path (template overlay or stale pre-refactor copy)',
+        {
+          skill,
+          path: linkPath,
+        },
+      );
     }
   }
 }
@@ -2430,7 +2441,7 @@ async function buildContainerArgs(
 
   // Claude Code behavior locks — duplicated from settings.json env block so
   // the values are set regardless of the SDK's settings-loading order.
-  args.push('-e', 'CLAUDE_CODE_DISABLE_AUTO_MEMORY=0');
+  args.push('-e', 'CLAUDE_CODE_DISABLE_AUTO_MEMORY=1');
   // Allow long foreground worker-codex calls without lengthening the default
   // timeout for ordinary Bash calls.
   args.push('-e', 'BASH_MAX_TIMEOUT_MS=3600000');

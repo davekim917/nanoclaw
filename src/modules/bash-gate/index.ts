@@ -49,6 +49,7 @@
 import type Database from 'better-sqlite3';
 
 import { registerDeliveryAction } from '../../delivery.js';
+import { unguarded } from '../../guard/index.js';
 import { markDelivered, markDeliveryFailed, markPending } from '../../db/session-db.js';
 import { openInboundDb } from '../../session-manager.js';
 import { log } from '../../log.js';
@@ -333,9 +334,17 @@ const DESTRUCTIVE_GATE: GateCategory = {
   kindNoun: 'destructive command',
 };
 
-registerDeliveryAction(BASH_GATE.deliveryAction, createGateHandler(BASH_GATE));
+registerDeliveryAction(
+  BASH_GATE.deliveryAction,
+  createGateHandler(BASH_GATE),
+  unguarded('request path only; execution waits for the registered bash-gate approval handler'),
+);
 registerApprovalHandler(BASH_GATE.approvalAction, createApprovalHandler(BASH_GATE.logPrefix));
-registerDeliveryAction(DESTRUCTIVE_GATE.deliveryAction, createGateHandler(DESTRUCTIVE_GATE));
+registerDeliveryAction(
+  DESTRUCTIVE_GATE.deliveryAction,
+  createGateHandler(DESTRUCTIVE_GATE),
+  unguarded('request path only; execution waits for the registered destructive-gate approval handler'),
+);
 registerApprovalHandler(DESTRUCTIVE_GATE.approvalAction, createApprovalHandler(DESTRUCTIVE_GATE.logPrefix));
 
 /**

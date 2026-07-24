@@ -34,6 +34,7 @@
 import type Database from 'better-sqlite3';
 
 import { registerDeliveryAction } from '../../delivery.js';
+import { unguarded } from '../../guard/index.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import {
   getMessagingGroup,
@@ -228,8 +229,11 @@ async function handleSetChannelEffort(
   );
 }
 
-registerDeliveryAction('set_channel_model', handleSetChannelModel);
-registerDeliveryAction('set_channel_effort', handleSetChannelEffort);
+const CHANNEL_CONFIG_ACTION = unguarded(
+  'handler derives the human caller from session input and enforces owner/admin authority before mutation',
+);
+registerDeliveryAction('set_channel_model', handleSetChannelModel, CHANNEL_CONFIG_ACTION);
+registerDeliveryAction('set_channel_effort', handleSetChannelEffort, CHANNEL_CONFIG_ACTION);
 
 // Export for testing.
 export { deriveCallerId as _deriveCallerId, resolveChannelMessagingGroupId as _resolveChannelMessagingGroupId };

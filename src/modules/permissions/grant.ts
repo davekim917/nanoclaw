@@ -24,6 +24,7 @@
 import type Database from 'better-sqlite3';
 
 import { registerDeliveryAction } from '../../delivery.js';
+import { unguarded } from '../../guard/index.js';
 import { getAgentGroup } from '../../db/agent-groups.js';
 import { getMessagingGroup } from '../../db/messaging-groups.js';
 import { log } from '../../log.js';
@@ -311,6 +312,9 @@ export async function handleListAccess(
   notifyAgent(session, lines.join('\n'));
 }
 
-registerDeliveryAction('grant_access', handleGrantAccess);
-registerDeliveryAction('revoke_access', handleRevokeAccess);
-registerDeliveryAction('list_access', handleListAccess);
+const ACCESS_ACTION = unguarded(
+  'handler derives caller identity from the trusted session and enforces owner/admin authority tiers',
+);
+registerDeliveryAction('grant_access', handleGrantAccess, ACCESS_ACTION);
+registerDeliveryAction('revoke_access', handleRevokeAccess, ACCESS_ACTION);
+registerDeliveryAction('list_access', handleListAccess, ACCESS_ACTION);

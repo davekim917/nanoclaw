@@ -1,4 +1,4 @@
-import { describe, it, expect, mock, beforeAll } from 'bun:test';
+import { describe, it, expect, mock, beforeAll, afterAll } from 'bun:test';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -51,6 +51,27 @@ mock.module('../worktree-autosave.js', () => ({
 // Now import the schema and provider (after mocks are set up)
 const { claudeConfigSchema } = await import('./claude.js');
 const { ClaudeProvider } = await import('./claude.js');
+const { MEMORY_SESSION_HOOK } = await import('../memory/session-hook.js');
+const TEST_CLAUDE_CONFIG_DIR = '/tmp/nanoclaw-claude-config-schema';
+const ORIGINAL_CLAUDE_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR;
+
+beforeAll(() => {
+  fs.rmSync(TEST_CLAUDE_CONFIG_DIR, { recursive: true, force: true });
+  fs.mkdirSync(TEST_CLAUDE_CONFIG_DIR, { recursive: true });
+  process.env.CLAUDE_CONFIG_DIR = TEST_CLAUDE_CONFIG_DIR;
+});
+
+afterAll(() => {
+  fs.rmSync(TEST_CLAUDE_CONFIG_DIR, { recursive: true, force: true });
+  if (ORIGINAL_CLAUDE_CONFIG_DIR === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+  else process.env.CLAUDE_CONFIG_DIR = ORIGINAL_CLAUDE_CONFIG_DIR;
+});
+
+function makeClaudeProvider(options: ConstructorParameters<typeof ClaudeProvider>[0] = {}): InstanceType<typeof ClaudeProvider> {
+  const provider = new ClaudeProvider(options);
+  provider.registerMemorySessionHook(MEMORY_SESSION_HOOK);
+  return provider;
+}
 
 describe('claudeConfigSchema', () => {
   it('test_claudeConfigSchema_valid_effort_max: parses { effort: max }', () => {
@@ -96,7 +117,7 @@ describe('ClaudeProvider sticky config', () => {
     capturedSdkOptions = null;
     mockSdkQuery.mockClear();
 
-    const provider = new ClaudeProvider({
+    const provider = makeClaudeProvider({
       providerConfig: { model: 'claude-opus-4-7', effort: 'high' },
     });
 
@@ -114,7 +135,7 @@ describe('ClaudeProvider sticky config', () => {
     capturedSdkOptions = null;
     mockSdkQuery.mockClear();
 
-    const provider = new ClaudeProvider({
+    const provider = makeClaudeProvider({
       providerConfig: { model: 'claude-opus-4-7' },
     });
 
@@ -131,7 +152,7 @@ describe('ClaudeProvider sticky config', () => {
     capturedSdkOptions = null;
     mockSdkQuery.mockClear();
 
-    const provider = new ClaudeProvider({});
+    const provider = makeClaudeProvider({});
 
     provider.query({ prompt: 'hi', cwd: '/tmp', continuation: undefined });
 
@@ -143,7 +164,7 @@ describe('ClaudeProvider sticky config', () => {
     capturedSdkOptions = null;
     mockSdkQuery.mockClear();
 
-    const provider = new ClaudeProvider({});
+    const provider = makeClaudeProvider({});
 
     provider.query({ prompt: 'hi', cwd: '/tmp', model: 'claude-fable-5' });
 
@@ -160,7 +181,7 @@ describe('per-model-family effort defaults', () => {
     if (env === undefined) delete process.env.NANOCLAW_EFFORT_OVERRIDE;
     else process.env.NANOCLAW_EFFORT_OVERRIDE = env;
     try {
-      const provider = new ClaudeProvider({});
+      const provider = makeClaudeProvider({});
       provider.query({ prompt: 'hi', cwd: '/tmp', ...input });
       return capturedSdkOptions;
     } finally {
@@ -252,7 +273,7 @@ describe('poisoned continuation detection (cross-auth-path thinking signatures)'
   });
 
   it('test_isSessionInvalid_matches_rethrown_error: the re-thrown error engages the stale-session recovery branch', () => {
-    const provider = new ClaudeProvider({});
+    const provider = makeClaudeProvider({});
     expect(provider.isSessionInvalid(new Error(DRILL_ERROR))).toBe(true);
   });
 });
@@ -262,7 +283,7 @@ describe('live applySettings (-m/-e on an active query — same conversation, no
     capturedSetModel = [];
     capturedFlagSettings = [];
     mockSdkQuery.mockClear();
-    const provider = new ClaudeProvider({});
+    const provider = makeClaudeProvider({});
     return provider.query({ prompt: 'hi', cwd: '/tmp', ...input });
   };
 
@@ -307,7 +328,7 @@ describe('subagent model env', () => {
     capturedSdkOptions = null;
     mockSdkQuery.mockClear();
 
-    const provider = new ClaudeProvider({});
+    const provider = makeClaudeProvider({});
     provider.query({ prompt: 'hi', cwd: '/tmp', model: 'claude-sonnet-5' });
 
     expect(mockSdkQuery).toHaveBeenCalledTimes(1);
@@ -334,7 +355,7 @@ describe('container GitNexus retirement', () => {
       process.env.CLAUDE_PLUGINS_ROOT = pluginsRoot;
       capturedSdkOptions = null;
       mockSdkQuery.mockClear();
-      new ClaudeProvider({}).query({ prompt: 'hi', cwd: '/tmp' });
+      makeClaudeProvider({}).query({ prompt: 'hi', cwd: '/tmp' });
 
       expect(capturedSdkOptions?.plugins).toEqual([{ type: 'local', path: pluginDir }]);
       const source = fs.readFileSync(new URL('./claude.ts', import.meta.url), 'utf8');

@@ -1059,40 +1059,34 @@ describe('task-fire routing — a stamped `ncl tasks` row routes end-to-end', ()
       .run(id, platformId, channelType, threadId);
   }
 
-  it('an unwrapped reply from a task-only batch routes to the row\'s stamped channel+thread, in_reply_to null', () => {
+  it('keeps a task-only batch route available without auto-delivering unwrapped final text', () => {
     seedDestination('slack-main', 'slack', 'C-TASK');
     insertTaskRow('task-1', 'C-TASK', 'slack', 'thread-99');
 
     const routing = extractRouting(getPendingMessages());
-    expect(routing.taskFire).toBe(true);
+    expect(routing.taskRun).toBe(true);
     expect(routing.platformId).toBe('C-TASK');
     expect(routing.threadId).toBe('thread-99');
 
-    dispatchResultText('forgot to wrap — here is the run summary', routing);
+    const result = dispatchResultText('forgot to wrap — here is the run summary', routing);
 
-    const out = getUndeliveredMessages();
-    expect(out).toHaveLength(1);
-    expect(out[0].channel_type).toBe('slack');
-    expect(out[0].platform_id).toBe('C-TASK');
-    // Inherited via resolveDestinationThread — the task row is the latest
-    // (only) messages_in row for this channel+platform in this session.
-    expect(out[0].thread_id).toBe('thread-99');
-    expect(out[0].in_reply_to).toBeNull();
-    expect(JSON.parse(out[0].content).text).toBe('forgot to wrap — here is the run summary');
+    expect(result).toEqual({ sent: 0, hasUnwrapped: false, taskBlocks: [] });
+    expect(getUndeliveredMessages()).toHaveLength(0);
   });
 
-  it('an explicit <message to=...> from the same task fire also lands with the stamped thread and in_reply_to null', () => {
+  it('captures a legacy <message to=...> block for correction without auto-delivering it', () => {
     seedDestination('slack-main', 'slack', 'C-TASK');
     insertTaskRow('task-2', 'C-TASK', 'slack', 'thread-99');
 
     const routing = extractRouting(getPendingMessages());
-    dispatchResultText('<message to="slack-main">explicit task reply</message>', routing);
+    const result = dispatchResultText('<message to="slack-main">explicit task reply</message>', routing);
 
-    const out = getUndeliveredMessages();
-    expect(out).toHaveLength(1);
-    expect(out[0].thread_id).toBe('thread-99');
-    expect(out[0].in_reply_to).toBeNull();
-    expect(JSON.parse(out[0].content).text).toBe('explicit task reply');
+    expect(result).toEqual({
+      sent: 0,
+      hasUnwrapped: false,
+      taskBlocks: [{ to: 'slack-main', body: 'explicit task reply' }],
+    });
+    expect(getUndeliveredMessages()).toHaveLength(0);
   });
 
   it('an isolated (unrouted) task row has no destination match and the unwrapped reply is dropped', () => {

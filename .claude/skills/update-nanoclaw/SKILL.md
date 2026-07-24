@@ -295,6 +295,7 @@ After validation passes, run the full audit defined in `.claude/skills/update-na
 5. Persist the audit verdict. Step 9 needs:
    - `REBUILD_REQUIRED` (from sub-audit B) — whether the final restart must be gated on `./container/build.sh`.
    - `DB_BACKUP_RECOMMENDED` (from sub-audit C) — whether the user should back up `data/v2.db` before restart.
+   - `UNRESOLVED_MIGRATIONS` — any skipped, failed, or incomplete breaking-change migration skills.
 
 Rollback recipe (for BLOCK or user-rejected FLAG):
 
@@ -320,12 +321,16 @@ If one or more `[BREAKING]` lines are found:
 - Display a warning header to the user: "This update includes breaking changes that may require action:"
 - For each breaking change, display the full description.
 - Collect all skill names referenced in the breaking change entries (the `/<skill-name>` part).
+- Initialize an unresolved-migrations list with every referenced skill. Remove a
+  skill only after it completes successfully.
 - Use AskUserQuestion to ask the user which migration skills they want to run now. Options:
-  - One option per referenced skill (e.g., "Run /add-whatsapp to re-add WhatsApp channel")
+  - One recommended option per referenced skill (e.g., "Run /add-whatsapp (Recommended)")
   - "Skip — I'll handle these manually"
 - Set `multiSelect: true` so the user can pick multiple skills if there are several breaking changes.
 - For each skill the user selects, invoke it using the Skill tool.
-- After all selected skills complete (or if user chose Skip), proceed to Step 8 (skill updates check).
+- Remove a skill from the unresolved list only after it completes successfully.
+  Keep every skipped, failed, or incomplete skill unresolved, then proceed to
+  Step 8.
 
 # Step 8: Skill updates (part of updating NanoClaw)
 
@@ -401,12 +406,26 @@ Show:
 - Customization contract: total rows, high-risk rows, verification commands run, and any compatibility fixes
 - Audit findings (A–F verdicts from Step 6)
 - Breaking changes applied (list skills run, if any)
+- Unresolved breaking migrations (list skipped, failed, or incomplete skills)
 - Remaining local diff vs upstream: `git diff --name-only upstream/$UPSTREAM_BRANCH..HEAD`
 
 Apply audit-driven gating before suggesting the restart:
 
 - If `REBUILD_REQUIRED=yes` (from audit sub-B): the restart command MUST be preceded by `./container/build.sh`. State this as a required pre-step, not optional. If sub-B also noted buildx cache staleness, add `docker buildx prune -f` before the build.
 - If `DB_BACKUP_RECOMMENDED=yes` (from audit sub-C): suggest `cp data/v2.db data/v2.db.pre-update-$(date +%s)` before restart.
+
+If unresolved migrations remain, explain that the code merge succeeded but the
+affected features may ignore old state until those migrations run. Before
+showing restart commands, ask whether to:
+
+- **Run unresolved migrations (Recommended):** invoke each unresolved skill
+  and remove it only after successful completion.
+- **Restart anyway:** continue only with explicit confirmation and repeat the
+  unresolved skill names in the final warning.
+
+If a retried migration remains unresolved, ask again. Do not show restart
+commands until the list is empty or the user explicitly accepts restarting
+anyway.
 
 Tell the user:
 - To rollback: `git reset --hard <backup-tag-from-step-1>`

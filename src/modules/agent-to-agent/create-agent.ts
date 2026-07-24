@@ -1,5 +1,5 @@
 /**
- * `create_agent` delivery-action handler.
+ * `create_agent` delivery-action bodies.
  *
  * SECURITY: spawning a new agent group is a host-level state change (creates
  * a directory under groups/, inserts an agent_groups row, and opens bidirectional

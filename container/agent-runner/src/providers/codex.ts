@@ -19,6 +19,10 @@ import path from 'path';
 import { z } from 'zod';
 
 import {
+  memoryContextForSessionStart,
+  type MemorySessionHookRegistration,
+} from '../memory/session-hook.js';
+import {
   clearContainerToolInFlight,
   setContainerToolInFlight,
   setProviderHealthState,
@@ -806,6 +810,7 @@ export class CodexProvider implements AgentProvider {
   private readonly mcpServers: Record<string, CodexMcpServer>;
   private readonly model: string;
   private readonly stickyConfig: z.infer<typeof codexConfigSchema>;
+  private memorySessionHook?: MemorySessionHookRegistration;
 
   /**
    * Ordered fallback CODEX_HOME paths from the `CODEX_FALLBACK_HOMES` env
@@ -899,12 +904,17 @@ export class CodexProvider implements AgentProvider {
     return this.fallbackHomes[this.nextFallback++];
   }
 
+  registerMemorySessionHook(hook: MemorySessionHookRegistration): void {
+    this.memorySessionHook = hook;
+  }
+
   isSessionInvalid(err: unknown): boolean {
     const msg = err instanceof Error ? err.message : String(err);
     return STALE_THREAD_RE.test(msg);
   }
 
   query(input: QueryInput): AgentQuery {
+    if (!this.memorySessionHook) throw new Error('Codex memory session hook was not registered');
     const pending: string[] = [];
     let waiting: (() => void) | null = null;
     let ended = false;
@@ -960,6 +970,11 @@ export class CodexProvider implements AgentProvider {
       try {
         await initializeCodexAppServer(server);
 
+        // Codex preserves base instructions across its native compaction
+        // lifecycle. Re-supplying authoritative file memory when a runner
+        // creates/resumes the app-server query also covers legacy threads.
+        const memoryContext = memoryContextForSessionStart('startup');
+        const lifecycleInstructions = [input.systemContext?.instructions, memoryContext].filter(Boolean).join('\n\n');
         const threadParams = {
           model: effectiveModel,
           cwd: input.cwd,
@@ -967,7 +982,7 @@ export class CodexProvider implements AgentProvider {
           approvalPolicy: 'never',
           personality: 'friendly',
           baseInstructions: composeBaseInstructions(
-            input.systemContext?.instructions,
+            lifecycleInstructions,
             effectiveConfig.max_concurrent_threads_per_session,
           ),
         };

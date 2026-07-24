@@ -64,6 +64,12 @@ const APPROVAL_OPTIONS: RawOption[] = [
 export interface ApprovalHandlerContext {
   session: Session;
   payload: Record<string, unknown>;
+  /**
+   * The verified approval row — the grant an approved continuation carries
+   * when it re-enters its guarded entry point. Still live here; resolution
+   * deletes it after the handler returns, so a grant executes exactly once.
+   */
+  approval: PendingApproval;
   /** User ID of the admin who approved. Empty string if unknown. */
   userId: string;
   /** Send a system chat message to the requesting agent's session. */

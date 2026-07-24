@@ -32,6 +32,7 @@ import {
 import type { InboundEvent } from '../../channels/adapter.js';
 import { registerResponseHandler, type ResponsePayload } from '../../response-registry.js';
 import { getDeliveryAdapter } from '../../delivery.js';
+import { guard } from '../../guard/index.js';
 import { log } from '../../log.js';
 import type { MessagingGroup, MessagingGroupAgent } from '../../types.js';
 import { canAccessAgentGroup, isSiblingBotSender } from './access.js';
@@ -56,6 +57,7 @@ import { hasAdminPrivilege } from './db/user-roles.js';
 import { getUser, upsertUser } from './db/users.js';
 import './grant.js';
 import { requestSenderApproval } from './sender-approval.js';
+import { channelsRegister, sendersAdmit } from './guard.js';
 import { ensureUserDm } from './user-dm.js';
 
 // ── Free-text name input state ──
@@ -141,44 +143,49 @@ async function handleUnknownSender(
     agent_group_id: agentGroupId,
   };
 
-  if (mg.unknown_sender_policy === 'strict') {
-    log.info('MESSAGE DROPPED — unknown sender (strict policy)', {
+  // The admission decision is the guard's senders.admit decision (./guard.ts)
+  // — unknown_sender_policy verbatim: strict → deny, request_approval → hold,
+  // public → allow (short-circuited before the gate). Drop-recording and the
+  // hold creation stay here.
+  const decision = guard(sendersAdmit, {
+    actor: userId ? { kind: 'human', userId } : { kind: 'system' },
+    payload: {
+      messagingGroupId: mg.id,
+      agentGroupId,
+      senderIdentity: userId,
+      policy: mg.unknown_sender_policy,
+    },
+  });
+
+  if (decision.effect === 'allow') return false; // public is handled before this gate.
+
+  log.info(
+    decision.effect === 'hold'
+      ? 'MESSAGE DROPPED — unknown sender (approval requested)'
+      : 'MESSAGE DROPPED — unknown sender (strict policy)',
+    {
       messagingGroupId: mg.id,
       agentGroupId,
       userId,
       accessReason,
-    });
-    recordDroppedMessage(dropRecord);
-    return false;
-  }
+    },
+  );
+  recordDroppedMessage(dropRecord);
 
-  if (mg.unknown_sender_policy === 'request_approval') {
-    log.info('MESSAGE DROPPED — unknown sender (approval requested)', {
+  // Persist the exact event only for a held sender with a stable identity.
+  // A deny or identity-less hold remains an ordinary completed drop.
+  if (decision.effect === 'hold' && userId) {
+    return requestSenderApproval({
       messagingGroupId: mg.id,
       agentGroupId,
-      userId,
-      accessReason,
+      senderIdentity: userId,
+      senderName,
+      event,
+    }).catch((err) => {
+      log.error('Sender-approval flow threw', { err });
+      return false;
     });
-    recordDroppedMessage(dropRecord);
-    // Await persistence so the router defers only the exact event stored for
-    // replay. Requires a resolved userId; without one there is nothing stable
-    // to approve and this remains an ordinary completed drop.
-    if (userId) {
-      return requestSenderApproval({
-        messagingGroupId: mg.id,
-        agentGroupId,
-        senderIdentity: userId,
-        senderName,
-        event,
-      }).catch((err) => {
-        log.error('Sender-approval flow threw', { err });
-        return false;
-      });
-    }
-    return false;
   }
-
-  // 'public' should have been handled before the gate; fall through silently.
   return false;
 }
 
@@ -466,18 +473,23 @@ async function handleChannelApprovalResponse(payload: ResponsePayload): Promise<
   const row = getPendingChannelApproval(payload.questionId);
   if (!row) return false;
 
+  // Click authorization is the guard's channels.register decision (./guard.ts):
+  // the delivered approver, or an admin of the pending row's anchor agent group.
   const clickerId = payload.userId
     ? payload.userId.includes(':')
       ? payload.userId
       : `${payload.channelType}:${payload.userId}`
     : null;
-  const isAuthorized =
-    clickerId !== null && (clickerId === row.approver_user_id || hasAdminPrivilege(clickerId, row.agent_group_id));
-  if (!isAuthorized) {
+  const decision = guard(channelsRegister, {
+    actor: { kind: 'human', userId: clickerId ?? '' },
+    payload: { questionId: payload.questionId },
+  });
+  if (!clickerId || decision.effect !== 'allow') {
     log.warn('Channel registration click rejected — unauthorized clicker', {
       messagingGroupId: row.messaging_group_id,
       clickerId,
       expectedApprover: row.approver_user_id,
+      reason: decision.reason,
     });
     return true;
   }

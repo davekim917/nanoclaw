@@ -665,13 +665,11 @@ export function createCodexConfigOverrides(
     `features.multi_agent_v2.max_concurrent_threads_per_session=${
       stickyConfig?.max_concurrent_threads_per_session ?? DEFAULT_CODEX_MAX_CONCURRENT_THREADS_PER_SESSION
     }`,
-    // Memories: writing AND reading. `[memories]` is Codex CLI's own
-    // session-summary store (separate from NanoClaw's Graphify retrieval, which is
-    // host-side). `generate_memories=true` writes summaries on turn boundaries;
-    // `use_memories=true` makes the next-turn prompt include them. Operator
-    // parity with Dave's local Codex CLI config — both default false upstream.
-    'memories.generate_memories=true',
-    'memories.use_memories=true',
+    // Graphify is the sole derived retrieval layer. Codex's opaque summary
+    // store is disabled; authoritative memory files enter through the shared
+    // provider lifecycle hook and remain indexable by Graphify.
+    'memories.generate_memories=false',
+    'memories.use_memories=false',
   ];
   if (stickyConfig?.reasoning_effort) {
     overrides.push(`model_reasoning_effort="${stickyConfig.reasoning_effort}"`);

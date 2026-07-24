@@ -164,59 +164,39 @@ For each agent group that should have Gmail (ask the user — typically their pe
 ncl groups list
 ```
 
-### Register the MCP server + mount
+### Register the MCP server
 
-For each chosen group folder, edit `groups/<folder>/container.json` to merge in:
-
-```json
-{
-  "mcpServers": {
-    "gmail": {
-      "type": "stdio",
-      "command": "gmail-mcp",
-      "args": [],
-      "env": {
-        "GMAIL_OAUTH_PATH": "/workspace/extra/.gmail-mcp/gcp-oauth.keys.json",
-        "GMAIL_CREDENTIALS_PATH": "/workspace/extra/.gmail-mcp/credentials.json"
-      }
-    }
-  },
-  "additionalMounts": [
-    {
-      "hostPath": "/home/<user>/.gmail-mcp",
-      "containerPath": ".gmail-mcp",
-      "readonly": false
-    }
-  ]
-}
-```
-
-Or scripted with `jq`:
+For each chosen `<group-id>`:
 
 ```bash
-FOLDER=<group-folder>
-HOST_PATH="$HOME/.gmail-mcp"
-jq --arg h "$HOST_PATH" '
-  .mcpServers["gmail"] = {
-    "type": "stdio",
-    "command": "gmail-mcp",
-    "args": [],
-    "env": {
-      "GMAIL_OAUTH_PATH": "/workspace/extra/.gmail-mcp/gcp-oauth.keys.json",
-      "GMAIL_CREDENTIALS_PATH": "/workspace/extra/.gmail-mcp/credentials.json"
-    }
-  } |
-  .additionalMounts += [{
-    "hostPath": $h,
-    "containerPath": ".gmail-mcp",
-    "readonly": false
-  }]
-' groups/$FOLDER/container.json > /tmp/cj.json && mv /tmp/cj.json groups/$FOLDER/container.json
+ncl groups config add-mcp-server \
+  --id <group-id> \
+  --name gmail \
+  --command gmail-mcp \
+  --args '[]' \
+  --env '{"GMAIL_OAUTH_PATH":"/workspace/extra/.gmail-mcp/gcp-oauth.keys.json","GMAIL_CREDENTIALS_PATH":"/workspace/extra/.gmail-mcp/credentials.json"}'
 ```
 
-`containerPath` is relative — `mount-security` rejects absolute paths. Additional mounts land at `/workspace/extra/<relative>`, so `containerPath: ".gmail-mcp"` resolves to `/workspace/extra/.gmail-mcp` inside the container. The MCP server's `GMAIL_OAUTH_PATH` / `GMAIL_CREDENTIALS_PATH` env vars point at that absolute location.
+From a container, `ncl` write verbs are approval-gated. From a host operator
+shell with full scope, the command executes immediately.
 
-> **Alternative — `ncl groups config add-mcp-server`** dual-writes (file + DB) and is approval-gated for in-container callers. The direct-file edit above is more explicit; both work. There's no `ncl groups config add-mount` verb yet, so the mount step is still file-direct either way.
+### Add the `.gmail-mcp` mount
+
+Register the mount with the host-only operator verb:
+
+```bash
+ncl groups config add-mount \
+  --id <group-id> \
+  --host "$HOME/.gmail-mcp" \
+  --container .gmail-mcp
+```
+
+The relative path lands at `/workspace/extra/.gmail-mcp`. Keep it read-write
+because the MCP server persists refreshed token state. The verb is idempotent
+and rejected inside containers, even at global `cli_scope`.
+
+**Why this cannot be a hand edit:** `materializeContainerJson` rewrites
+`groups/<folder>/container.json` from the DB on every spawn.
 
 ## Phase 4: Build, Validate, Restart
 

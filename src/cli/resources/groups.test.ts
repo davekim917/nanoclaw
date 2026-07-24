@@ -37,6 +37,7 @@ import { initTestDb, closeDb, runMigrations, createAgentGroup, getDb } from '../
 import { createSession } from '../../db/sessions.js';
 import { dispatch } from '../dispatch.js';
 import { readContainerConfig } from '../../container-config.js';
+import { ensureContainerConfig, getContainerConfig } from '../../db/container-configs.js';
 import { isSiblingBoundField } from '../../sibling-parity.js';
 // Side-effect import: registers the `groups-*` commands (including delete).
 import './groups.js';
@@ -357,5 +358,54 @@ describe('groups CLI resource config', () => {
     const migrationSource = fs.readFileSync(new URL('../../../scripts/migrate-groups.ts', import.meta.url), 'utf8');
     expect(wireSource).not.toMatch(/gitnexusInjectAgentsMd|GITNEXUS_INJECT_AGENTS_MD/);
     expect(migrationSource).not.toMatch(/gitnexusInjectAgentsMd|GITNEXUS_INJECT_AGENTS_MD/);
+  });
+});
+
+describe('groups config add-mount / remove-mount (host-only)', () => {
+  beforeEach(() => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+    runMigrations(initTestDb());
+  });
+  afterEach(() => {
+    closeDb();
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+  });
+
+  it('adds a mount idempotently and removes it (host caller)', async () => {
+    const GID = 'ag-mount';
+    createAgentGroup({ id: GID, name: 'm', folder: 'm', agent_provider: null, created_at: now() });
+    ensureContainerConfig(GID);
+    const groupDir = `${TEST_DIR}/groups/m`;
+    fs.mkdirSync(groupDir, { recursive: true });
+    fs.writeFileSync(
+      `${groupDir}/container.json`,
+      JSON.stringify({ mcpServers: {}, packages: { apt: [], npm: [] }, additionalMounts: [], skills: 'all' }, null, 2) +
+        '\n',
+    );
+    const args = { id: GID, host: '/data/.gmail-mcp', container: '/home/node/.gmail-mcp', ro: true };
+
+    const add = await dispatch({ id: 'r1', command: 'groups-config-add-mount', args }, { caller: 'host' });
+    expect(add.ok).toBe(true);
+    const expectedMounts = [{ hostPath: '/data/.gmail-mcp', containerPath: '/home/node/.gmail-mcp', readonly: true }];
+    expect(JSON.parse(getContainerConfig(GID)!.additional_mounts)).toEqual(expectedMounts);
+    expect(readContainerConfig('m').additionalMounts).toEqual(expectedMounts);
+
+    // idempotent: a second add does not duplicate
+    await dispatch({ id: 'r2', command: 'groups-config-add-mount', args }, { caller: 'host' });
+    expect(JSON.parse(getContainerConfig(GID)!.additional_mounts)).toHaveLength(1);
+    expect(readContainerConfig('m').additionalMounts).toHaveLength(1);
+
+    const rm = await dispatch(
+      {
+        id: 'r3',
+        command: 'groups-config-remove-mount',
+        args: { id: GID, host: '/data/.gmail-mcp', container: '/home/node/.gmail-mcp' },
+      },
+      { caller: 'host' },
+    );
+    expect(rm.ok).toBe(true);
+    expect(JSON.parse(getContainerConfig(GID)!.additional_mounts)).toEqual([]);
+    expect(readContainerConfig('m').additionalMounts).toEqual([]);
   });
 });

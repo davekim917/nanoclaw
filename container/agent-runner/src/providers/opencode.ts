@@ -3,6 +3,10 @@ import { spawn, type ChildProcess } from 'child_process';
 
 import { createOpencodeClient, type OpencodeClient } from '@opencode-ai/sdk';
 
+import {
+  memoryContextForSessionStart,
+  type MemorySessionHookRegistration,
+} from '../memory/session-hook.js';
 import { registerProvider } from './provider-registry.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
 import { mcpServersToOpenCodeConfig } from './mcp-to-opencode.js';
@@ -545,6 +549,7 @@ export class OpenCodeProvider implements AgentProvider {
 
   private readonly options: ProviderOptions;
   private activeSessionId: string | undefined;
+  private memorySessionHook?: MemorySessionHookRegistration;
 
   constructor(options: ProviderOptions = {}) {
     this.options = options;
@@ -555,7 +560,12 @@ export class OpenCodeProvider implements AgentProvider {
     return STALE_SESSION_RE.test(msg);
   }
 
+  registerMemorySessionHook(hook: MemorySessionHookRegistration): void {
+    this.memorySessionHook = hook;
+  }
+
   query(input: QueryInput): AgentQuery {
+    if (!this.memorySessionHook) throw new Error('OpenCode memory session hook was not registered');
     if (input.continuation) {
       this.activeSessionId = input.continuation;
     } else {
@@ -578,7 +588,11 @@ export class OpenCodeProvider implements AgentProvider {
     const effectiveModel = input.model ?? process.env.OPENCODE_MODEL;
     const promptModel = effectiveModel ? splitModelSlug(effectiveModel) : null;
 
-    const systemInstructions = input.systemContext?.instructions;
+    // OpenCode has no session-start hook API. Its native prompt lifecycle
+    // carries standing system context on every prompt, which also refreshes
+    // authoritative file memory after compaction without a passive retriever.
+    const memoryContext = memoryContextForSessionStart('startup');
+    const systemInstructions = [input.systemContext?.instructions, memoryContext].filter(Boolean).join('\n\n');
     pending.push(wrapPromptWithContext(input.prompt, systemInstructions, effectiveModel));
 
     const kick = (): void => {

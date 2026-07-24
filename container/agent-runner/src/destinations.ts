@@ -21,6 +21,8 @@ export interface DestinationEntry {
   agentGroupId?: string;
 }
 
+export type SessionMode = { kind: 'chat' } | { kind: 'task'; taskId: string };
+
 interface DestRow {
   name: string;
   display_name: string | null;
@@ -97,7 +99,7 @@ function sanitizeDisplayName(name: string): string {
  * per-agent-group and changes when the operator renames an agent, while
  * the shared base is identical across all agents.
  */
-export function buildSystemPromptAddendum(assistantName?: string): string {
+export function buildSystemPromptAddendum(assistantName?: string, mode: SessionMode = { kind: 'chat' }): string {
   const sections: string[] = [];
 
   if (assistantName) {
@@ -151,7 +153,7 @@ export function buildSystemPromptAddendum(assistantName?: string): string {
     ].join('\n'),
   );
 
-  sections.push(buildDestinationsSection());
+  sections.push(buildDestinationsSection(mode));
 
   return sections.join('\n\n');
 }
@@ -238,19 +240,14 @@ function buildPeersSection(peers: PeerEntry[]): string | null {
   return lines.join('\n');
 }
 
-function buildDestinationsSection(): string {
+function buildDestinationsSection(mode: SessionMode): string {
   const all = getAllDestinations();
+  const lines = ['## Sending messages', ''];
 
   if (all.length === 0) {
-    return [
-      '## Sending messages',
-      '',
-      'You currently have no configured destinations. You cannot send messages until an admin wires one up.',
-    ].join('\n');
-  }
-
-  const lines = ['## Sending messages', ''];
-  if (all.length === 1) {
+    lines.push('You currently have no configured destinations. You cannot send messages until an admin wires one up.');
+    if (mode.kind === 'chat') return lines.join('\n');
+  } else if (all.length === 1) {
     const d = all[0];
     lines.push(`Your destination is \`${d.name}\`${destinationLabel(d)}.`);
   } else {
@@ -259,7 +256,18 @@ function buildDestinationsSection(): string {
       lines.push(`- \`${d.name}\`${destinationLabel(d)}`);
     }
   }
+
   lines.push('');
+
+  if (mode.kind === 'task') {
+    lines.push(
+      'This is an isolated task run with no attached chat. Only notify someone when the task asks you to. For a user-visible message, call `send_message({ to: "name", text: "..." })`; for a file, call `send_file` with `to`. Always pass the explicit named destination.',
+      '',
+      `Your final output is not sent to the user. End with a concise work-log summary. It is recorded automatically in \`tasks/${mode.taskId}.md\`. Read that file when you need context from earlier runs. Use \`ncl tasks append-log --msg "…"\` only for optional mid-run notes.`,
+    );
+    return lines.join('\n');
+  }
+
   lines.push(
     'Wrap each delivered message in a `<message to="name">…</message>` block; include several blocks in one response to address several destinations. `<internal>…</internal>` marks thinking you don\'t want sent.',
   );

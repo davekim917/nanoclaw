@@ -58,6 +58,12 @@ container only ever sees the paths above plus any provider-contributed mounts
 (e.g. an OpenCode XDG dir). Host application source (`src/`, `dist/`,
 `package.json`) is not reachable.
 
+Shared memory content is read only by the provider's SessionStart hook inside
+the container. Host-side project-document composers emit pointers but never
+open `memory/index.md` or linked agent-controlled files. A memory symlink can
+therefore reach only paths already visible inside that container, not arbitrary
+host files.
+
 **Additional-mount allowlist** — extra mounts from a group's container config
 are validated against an allowlist at `~/.config/nanoclaw/mount-allowlist.json`,
 which is:

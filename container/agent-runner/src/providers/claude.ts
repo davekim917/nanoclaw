@@ -13,6 +13,7 @@ import {
 } from '@anthropic-ai/claude-agent-sdk';
 
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/connection.js';
+import type { MemorySessionHookRegistration } from '../memory/session-hook.js';
 import { TIMEZONE, formatLocalStamp } from '../timezone.js';
 import { registerProvider, registerProviderConfigSchema } from './provider-registry.js';
 import { buildSecretEnvVarList, MCP_HEADER_ONLY_SECRET_VARS } from './secret-env.js';
@@ -34,6 +35,37 @@ export const claudeConfigSchema = z.strictObject({
 
 function log(msg: string): void {
   console.error(`[claude-provider] ${msg}`);
+}
+
+export interface SdkRateLimitInfo {
+  status?: string;
+  resetsAt?: number;
+  rateLimitType?: string;
+  utilization?: number;
+  errorCode?: string;
+  overageDisabledReason?: string;
+}
+
+/**
+ * SDK rate-limit events are telemetry unless the SDK explicitly rejects the
+ * request. Rejected credit exhaustion is quota; other rejected windows are
+ * transient rate limits and retain their reset metadata.
+ */
+export function classifyRateLimitEvent(
+  info: SdkRateLimitInfo | undefined,
+): { message: string; classification: 'rate_limit' | 'quota' } | null {
+  if (info?.status !== 'rejected') return null;
+  const outOfCredits = info.errorCode === 'credits_required' || info.overageDisabledReason === 'out_of_credits';
+  let detail = '';
+  if (typeof info.resetsAt === 'number' && Number.isFinite(info.resetsAt)) {
+    const ms = info.resetsAt < 1e12 ? info.resetsAt * 1000 : info.resetsAt;
+    detail = ` (resets ${new Date(ms).toISOString()})`;
+  }
+  const window = info.rateLimitType ? ` [${info.rateLimitType}]` : '';
+  return {
+    message: `${outOfCredits ? 'Out of credits' : 'Rate limit'}${window}${detail}`,
+    classification: outOfCredits ? 'quota' : 'rate_limit',
+  };
 }
 
 /** Max chars per thinking label. Bumped from 500 — thinking prose is usually
@@ -137,6 +169,8 @@ export const SDK_DISALLOWED_TOOLS = [
   'ExitPlanMode',
   'EnterWorktree',
   'ExitWorktree',
+  'DesignSync',
+  'ReportFindings',
 ];
 
 // No explicit `allowedTools` list is set. The SDK's `allowedTools` is
@@ -217,10 +251,15 @@ function parseTranscript(content: string): ParsedMessage[] {
     try {
       const entry = JSON.parse(line);
       if (entry.type === 'user' && entry.message?.content) {
-        const text = typeof entry.message.content === 'string' ? entry.message.content : entry.message.content.map((c: { text?: string }) => c.text || '').join('');
+        const text =
+          typeof entry.message.content === 'string'
+            ? entry.message.content
+            : entry.message.content.map((c: { text?: string }) => c.text || '').join('');
         if (text) messages.push({ role: 'user', content: text });
       } else if (entry.type === 'assistant' && entry.message?.content) {
-        const textParts = entry.message.content.filter((c: { type: string }) => c.type === 'text').map((c: { text: string }) => c.text);
+        const textParts = entry.message.content
+          .filter((c: { type: string }) => c.type === 'text')
+          .map((c: { text: string }) => c.text);
         const text = textParts.join('');
         if (text) messages.push({ role: 'assistant', content: text });
       }
@@ -233,7 +272,13 @@ function parseTranscript(content: string): ParsedMessage[] {
 
 function formatTranscriptMarkdown(messages: ParsedMessage[], title?: string | null, assistantName?: string): string {
   const now = new Date();
-  const dateStr = now.toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', hour12: true });
+  const dateStr = now.toLocaleString('en-US', {
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true,
+  });
   const lines = [`# ${title || 'Conversation'}`, '', `Archived: ${dateStr}`, '', '---', ''];
   for (const msg of messages) {
     const sender = msg.role === 'user' ? 'User' : assistantName || 'Assistant';
@@ -285,7 +330,11 @@ export const postToolUseHook: HookCallback = async () => {
  * the agent's `conversations/` folder so context survives a compaction or a
  * session rotation. Best-effort: returns false (and logs) on any failure.
  */
-function archiveTranscriptFile(transcriptPath: string | undefined, sessionId: string | undefined, assistantName?: string): boolean {
+function archiveTranscriptFile(
+  transcriptPath: string | undefined,
+  sessionId: string | undefined,
+  assistantName?: string,
+): boolean {
   if (!transcriptPath || !fs.existsSync(transcriptPath)) {
     log('No transcript found for archiving');
     return false;
@@ -302,14 +351,20 @@ function archiveTranscriptFile(transcriptPath: string | undefined, sessionId: st
     if (fs.existsSync(indexPath)) {
       try {
         const index = JSON.parse(fs.readFileSync(indexPath, 'utf-8'));
-        summary = index.entries?.find((e: { sessionId: string; summary?: string }) => e.sessionId === sessionId)?.summary;
+        summary = index.entries?.find(
+          (e: { sessionId: string; summary?: string }) => e.sessionId === sessionId,
+        )?.summary;
       } catch {
         /* ignore */
       }
     }
 
     const name = summary
-      ? summary.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 50)
+      ? summary
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, '-')
+          .replace(/^-+|-+$/g, '')
+          .slice(0, 50)
       : `conversation-${new Date().getHours().toString().padStart(2, '0')}${new Date().getMinutes().toString().padStart(2, '0')}`;
 
     const conversationsDir = process.env.NANOCLAW_CONVERSATIONS_DIR || '/workspace/agent/conversations';
@@ -1178,8 +1233,52 @@ function transcriptRotateAgeMs(): number {
 }
 
 function claudeProjectsDir(): string {
-  const base = process.env.CLAUDE_CONFIG_DIR || path.join(process.env.HOME || os.homedir(), '.claude');
-  return path.join(base, 'projects');
+  return path.join(claudeConfigDir(), 'projects');
+}
+
+function claudeConfigDir(): string {
+  return process.env.CLAUDE_CONFIG_DIR || path.join(process.env.HOME || os.homedir(), '.claude');
+}
+
+function writeMemorySessionHook(hook: MemorySessionHookRegistration): void {
+  const configDir = claudeConfigDir();
+  const settingsFile = path.join(configDir, 'settings.json');
+  fs.mkdirSync(configDir, { recursive: true });
+
+  const parsed: unknown = fs.existsSync(settingsFile) ? JSON.parse(fs.readFileSync(settingsFile, 'utf-8')) : {};
+  if (!isRecord(parsed)) throw new Error(`${settingsFile} must contain a JSON object`);
+
+  const hooks = parsed.hooks === undefined ? {} : parsed.hooks;
+  if (!isRecord(hooks)) throw new Error(`${settingsFile} hooks must be a JSON object`);
+
+  const sessionStart = hooks.SessionStart === undefined ? [] : hooks.SessionStart;
+  if (!Array.isArray(sessionStart)) throw new Error(`${settingsFile} hooks.SessionStart must be an array`);
+
+  const memoryCommands = new Set([hook.command, ...hook.legacyCommands]);
+  const nextSessionStart = sessionStart
+    .map((entry) => removeMemoryCommands(entry, memoryCommands))
+    .filter((entry) => entry !== undefined);
+  nextSessionStart.push({
+    matcher: hook.sources.join('|'),
+    hooks: [{ type: 'command', command: hook.command, timeout: 10 }],
+  });
+
+  hooks.SessionStart = nextSessionStart;
+  parsed.hooks = hooks;
+  fs.writeFileSync(settingsFile, JSON.stringify(parsed, null, 2) + '\n');
+}
+
+function removeMemoryCommands(value: unknown, commands: ReadonlySet<string>): unknown {
+  if (!isRecord(value) || !Array.isArray(value.hooks)) return value;
+  const hooks = value.hooks.filter((hook) => {
+    if (!isRecord(hook)) return true;
+    return typeof hook.command !== 'string' || !commands.has(hook.command);
+  });
+  return hooks.length > 0 ? { ...value, hooks } : undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 /**
@@ -1374,6 +1473,7 @@ export class ClaudeProvider implements AgentProvider {
   private oauthRotationsThisCycle = 0;
   private model?: string;
   private effort?: string;
+  private memorySessionHook?: MemorySessionHookRegistration;
 
   constructor(options: ProviderOptions = {}) {
     this.assistantName = options.assistantName;
@@ -1421,6 +1521,11 @@ export class ClaudeProvider implements AgentProvider {
     }
     this.model = options.model;
     this.effort = options.effort;
+  }
+
+  registerMemorySessionHook(hook: MemorySessionHookRegistration): void {
+    writeMemorySessionHook(hook);
+    this.memorySessionHook = hook;
   }
 
   isSessionInvalid(err: unknown): boolean {
@@ -1555,6 +1660,7 @@ export class ClaudeProvider implements AgentProvider {
   }
 
   query(input: QueryInput): AgentQuery {
+    if (!this.memorySessionHook) throw new Error('Claude memory session hook was not registered');
     const stream = new MessageStream();
     stream.push(input.prompt);
 
@@ -1751,25 +1857,29 @@ export class ClaudeProvider implements AgentProvider {
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'api_retry') {
           yield { type: 'error', message: 'API retry', retryable: true };
         } else if (message.type === 'rate_limit_event') {
-          // INFORMATIONAL, not an error: the SDK emits this whenever the
-          // subscription's rate-limit info changes, with status
-          // 'allowed' | 'allowed_warning' | 'rejected'. Treating it as a
-          // fatal error killed every turn under high sub utilization and
-          // posted "Turn ended with an error: Rate limit" to chat
-          // (fleet-wide on 2026-07-12 — the branch was dead pre-merge
-          // because it matched a system/subtype shape the SDK never sends).
-          // A truly rejected limit also fails the API call itself, which
-          // surfaces as result text and engages QUOTA_RESULT_RE rotation —
-          // so log here, never end the turn.
-          const info = (message as { rate_limit_info?: { status?: string; rateLimitType?: string; utilization?: number } })
-            .rate_limit_info;
-          log(
-            `rate_limit_event (informational): status=${info?.status ?? 'unknown'} type=${info?.rateLimitType ?? '-'} utilization=${info?.utilization ?? '-'}`,
-          );
+          const info = (message as { rate_limit_info?: SdkRateLimitInfo }).rate_limit_info;
+          const blocked = classifyRateLimitEvent(info);
+          if (!blocked) {
+            if (info?.status === 'allowed_warning') {
+              log(
+                `rate-limit warning: ${info.rateLimitType ?? 'window'} at ${
+                  info.utilization != null ? `${Math.round(info.utilization * 100)}%` : 'high'
+                } utilization`,
+              );
+            }
+          } else {
+            yield { type: 'error', message: blocked.message, retryable: false, classification: blocked.classification };
+          }
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'compact_boundary') {
           const meta = (message as { compact_metadata?: { pre_tokens?: number } }).compact_metadata;
           const detail = meta?.pre_tokens ? ` (${meta.pre_tokens.toLocaleString()} tokens compacted)` : '';
-          yield { type: 'result', text: `Context compacted${detail}.` };
+          // Not a `result`: the poll loop treats result text as the agent's turn
+          // output — a synthetic "Context compacted." result has no <message>
+          // block, so it triggers the "response was not delivered — please
+          // re-send" nudge and the agent duplicates its previous message.
+          // Compaction is bookkeeping: log it, count it as activity only.
+          log(`Context compacted${detail}.`);
+          yield { type: 'activity' };
         } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
           const tn = message as { summary?: string; status?: string; tool_use_id?: string };
           const toolName = tn.tool_use_id ? toolNameById.get(tn.tool_use_id) : undefined;

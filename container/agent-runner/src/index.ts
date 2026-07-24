@@ -27,6 +27,9 @@ import { fileURLToPath } from 'url';
 
 import { loadConfig } from './config.js';
 import { buildSystemPromptAddendum } from './destinations.js';
+import { getTaskSeriesId } from './db/session-routing.js';
+import { ensureMemoryScaffold } from './memory/scaffold.js';
+import { MEMORY_SESSION_HOOK } from './memory/session-hook.js';
 // Providers barrel — each enabled provider self-registers on import.
 // Provider skills append imports to providers/index.ts.
 import './providers/index.js';
@@ -61,12 +64,20 @@ async function main(): Promise<void> {
   // activate it so the `gcloud`/`bq` CLIs authenticate. No-op otherwise. All providers.
   activateGcpServiceAccount(log);
 
+  // All providers share one authoritative file-memory tree. Graphify indexes
+  // these source files; no second derived retrieval store is introduced.
+  ensureMemoryScaffold();
+
   // Runtime-generated system-prompt addendum: agent identity + communication
   // invariants + live destinations map. Rest of the system prompt (per-module
   // instructions, per-channel formatting) is loaded by Claude Code from
   // /workspace/agent/CLAUDE.md (composed base + module fragments). Per-group
   // memory lives in /workspace/agent/CLAUDE.local.md (auto-loaded).
-  const addendum = buildSystemPromptAddendum(config.assistantName || undefined);
+  const taskId = getTaskSeriesId();
+  const addendum = buildSystemPromptAddendum(
+    config.assistantName || undefined,
+    taskId ? { kind: 'task', taskId } : { kind: 'chat' },
+  );
 
   // Always-on tone profile injection. Host resolves per-channel tone (via
   // messaging_group_agents.default_tone → container.json `tone`) and forwards
@@ -202,6 +213,7 @@ async function main(): Promise<void> {
     model: config.model,
     effort: config.effort,
   });
+  provider.registerMemorySessionHook(MEMORY_SESSION_HOOK);
 
   const stopResourceTelemetry = startResourceTelemetry(log);
   try {

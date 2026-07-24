@@ -14,7 +14,7 @@ import { awaitDeliveryAck } from '../db/delivery-acks.js';
 import { findByName, getAllDestinations } from '../destinations.js';
 import { getMessageIdBySeq, getRoutingBySeq, writeMessageOut } from '../db/messages-out.js';
 import { getCurrentInReplyTo } from '../db/session-state.js';
-import { getSessionRouting } from '../db/session-routing.js';
+import { getSessionRouting, getTaskSeriesId } from '../db/session-routing.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
 
@@ -89,7 +89,10 @@ function resolveRouting(
   to: string | undefined,
 ): { channel_type: string; platform_id: string; thread_id: string | null; resolvedName: string } | { error: string } {
   if (!to) {
-    // Default: reply to whatever thread/channel this session is bound to.
+    if (getTaskSeriesId()) {
+      return { error: `to is required for task sessions. Options: ${destinationList()}` };
+    }
+
     const session = getSessionRouting();
     if (session.channel_type && session.platform_id) {
       return {
@@ -99,8 +102,10 @@ function resolveRouting(
         resolvedName: '(current conversation)',
       };
     }
-    // No session routing (e.g., agent-shared or internal-only agent) —
-    // fall back to the legacy single-destination shortcut.
+
+    // Legacy/internal sessions may not have a routing row. Preserve the
+    // unambiguous one-destination fallback while failing closed when several
+    // destinations exist.
     const all = getAllDestinations();
     if (all.length === 0) return { error: 'No destinations configured.' };
     if (all.length > 1) {
@@ -110,6 +115,7 @@ function resolveRouting(
     }
     to = all[0].name;
   }
+
   const dest = findByName(to);
   if (!dest) return { error: `Unknown destination "${to}". Known: ${destinationList()}` };
   if (dest.type === 'channel') {
@@ -138,7 +144,7 @@ export const sendMessage: McpToolDefinition = {
       properties: {
         to: {
           type: 'string',
-          description: 'Destination name (e.g., "family", "worker-1"). Optional if you have only one destination.',
+          description: 'Destination name (e.g., "family", "worker-1"). Optional when replying in this conversation.',
         },
         text: { type: 'string', description: 'Message content' },
       },
@@ -176,7 +182,7 @@ export const sendFile: McpToolDefinition = {
     inputSchema: {
       type: 'object' as const,
       properties: {
-        to: { type: 'string', description: 'Destination name. Optional if you have only one destination.' },
+        to: { type: 'string', description: 'Destination name. Optional when replying in this conversation.' },
         path: { type: 'string', description: 'File path (relative to /workspace/agent/ or absolute)' },
         text: { type: 'string', description: 'Optional accompanying message' },
         filename: { type: 'string', description: 'Display name (default: basename of path)' },

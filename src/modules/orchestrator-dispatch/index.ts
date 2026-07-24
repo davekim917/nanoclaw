@@ -12,6 +12,7 @@
  * workspace, memory, CLAUDE.md, channels. Only the session/thread is isolated.
  */
 import { registerDeliveryAction } from '../../delivery.js';
+import { unguarded } from '../../guard/index.js';
 import { applySpawnTask } from './dispatch.js';
 import { applySpawnComplete, applySpawnFailed } from './completion.js';
 import { applySpawnProgress } from './progress.js';
@@ -23,11 +24,14 @@ import { applySpawnNeedsInput } from './needs-input.js';
 // the central DB and MUST run AFTER initDb() + runMigrations() in main(). Re-export
 // the startup hook so src/index.ts can call it at the right moment instead of
 // running it here at module-import time (which would crash because the DB isn't ready).
-registerDeliveryAction('spawn_task', applySpawnTask);
-registerDeliveryAction('spawn_complete', applySpawnComplete);
-registerDeliveryAction('spawn_failed', applySpawnFailed);
-registerDeliveryAction('spawn_cancel', applySpawnCancel);
-registerDeliveryAction('spawn_progress', applySpawnProgress);
-registerDeliveryAction('spawn_request_steer', applySpawnNeedsInput);
+const ORCHESTRATOR_ACTION = unguarded(
+  'same-agent-group session orchestration; handlers derive parent and child scope from trusted session state',
+);
+registerDeliveryAction('spawn_task', applySpawnTask, ORCHESTRATOR_ACTION);
+registerDeliveryAction('spawn_complete', applySpawnComplete, ORCHESTRATOR_ACTION);
+registerDeliveryAction('spawn_failed', applySpawnFailed, ORCHESTRATOR_ACTION);
+registerDeliveryAction('spawn_cancel', applySpawnCancel, ORCHESTRATOR_ACTION);
+registerDeliveryAction('spawn_progress', applySpawnProgress, ORCHESTRATOR_ACTION);
+registerDeliveryAction('spawn_request_steer', applySpawnNeedsInput, ORCHESTRATOR_ACTION);
 
 export { runReconcilerOnStartup } from './reconciler.js';

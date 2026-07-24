@@ -184,11 +184,9 @@ export interface RoutingContext {
    * notable findings should reach chat.
    */
   quietStatus: boolean;
-  /** Batch is a task fire — explicit `<message to>` sends must NOT inherit
-   *  inReplyTo (the series id), or the host's task-fire suppression drops
-   *  them as turn-final echoes: zero delivery. Deliberate sends are
-   *  in_reply_to-null, same as the out-of-process MCP send_message path. */
-  taskFire: boolean;
+  /** Batch is an isolated task run. Final-text message blocks are inert;
+   *  only explicitly addressed tools deliver, and final text is logged. */
+  taskRun: boolean;
 }
 
 /**
@@ -275,7 +273,7 @@ export function extractRouting(messages: MessageInRow[]): RoutingContext {
     threadId: useOwnRouting ? (first.thread_id ?? null) : (sessionRouting.thread_id ?? null),
     inReplyTo: first?.id ?? null,
     quietStatus,
-    taskFire: messages.length > 0 && messages.every((m) => m.kind === 'task'),
+    taskRun: messages.length > 0 && messages.every((m) => m.kind === 'task'),
   };
 }
 
@@ -451,8 +449,29 @@ function formatTaskMessage(msg: MessageInRow): string {
   if (content.scriptOutput) {
     parts.push('Script output:', JSON.stringify(content.scriptOutput, null, 2), '');
   }
-  parts.push('Instructions:', content.prompt || '');
+  parts.push('Instructions:', stripLegacyTaskContract(content.prompt || ''));
   return `<task${from} time="${escapeXml(time)}">${parts.join('\n')}</task>`;
+}
+
+const LEGACY_TASK_CONTRACT_MARKERS = [
+  '\n\n[A task serves the user two separate ways —',
+  '\n\n[Task delivery contract:',
+];
+
+/**
+ * PR #2981 persisted its generated delivery contract inside each task prompt.
+ * New sessions receive the contract from their runtime system prompt instead.
+ * Strip only a known generated suffix, at read time, so existing task rows stay
+ * compatible without a session-DB migration or contradictory model guidance.
+ */
+export function stripLegacyTaskContract(prompt: string): string {
+  if (!prompt.trimEnd().endsWith(']')) return prompt;
+
+  let contractStart = -1;
+  for (const marker of LEGACY_TASK_CONTRACT_MARKERS) {
+    contractStart = Math.max(contractStart, prompt.lastIndexOf(marker));
+  }
+  return contractStart >= 0 ? prompt.slice(0, contractStart).trimEnd() : prompt;
 }
 
 function formatWebhookMessage(msg: MessageInRow): string {
