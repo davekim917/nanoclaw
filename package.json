@@ -31,32 +31,32 @@
   "dependencies": {
     "@chat-adapter/discord": "4.29.0",
     "@chat-adapter/slack": "4.29.0",
-    "@clack/core": "^1.2.0",
-    "@clack/prompts": "^1.2.0",
-    "@onecli-sh/sdk": "^0.5.0",
-    "@slack/web-api": "7.15.1",
+    "@clack/core": "^1.4.3",
+    "@clack/prompts": "^1.7.0",
+    "@onecli-sh/sdk": "^2.8.0",
+    "@slack/web-api": "8.0.0",
     "better-sqlite3": "11.10.0",
     "chat": "4.29.0",
     "chokidar": "5.0.0",
-    "cron-parser": "5.5.0",
-    "discord.js": "^14.26.0",
+    "cron-parser": "5.6.2",
+    "discord.js": "^14.27.0",
     "kleur": "^4.1.5",
     "undici": "6.24.1",
-    "yaml": "^2.8.3"
+    "yaml": "^2.9.0"
   },
   "devDependencies": {
-    "@eslint/js": "^9.35.0",
-    "@types/better-sqlite3": "^7.6.12",
+    "@eslint/js": "^10.0.1",
+    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.10.0",
-    "eslint": "^9.35.0",
+    "eslint": "^10.8.0",
     "eslint-plugin-no-catch-all": "^1.1.0",
-    "globals": "^15.12.0",
+    "globals": "^17.7.0",
     "husky": "^9.1.7",
     "prettier": "^3.8.1",
-    "tsx": "^4.19.0",
+    "tsx": "^4.23.1",
     "typescript": "^5.7.0",
-    "typescript-eslint": "^8.35.0",
-    "vitest": "^4.0.18"
+    "typescript-eslint": "^8.65.0",
+    "vitest": "^4.1.10"
   },
   "engines": {
     "node": ">=20"
