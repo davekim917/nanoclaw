@@ -27,13 +27,17 @@ export interface CodexLivenessSnapshot {
 // successful turn can be trusted. Keep this explicit so informational items
 // such as reasoning remain version-tolerant, while commands and tools fail
 // closed if app-server reports turn completion without their item/completed.
+//
+// Collaboration items are deliberately excluded. `collabAgentToolCall` and
+// `subAgentActivity` describe a persistent parent/child relationship, not an
+// execution barrier for the parent turn. Codex can leave them `inProgress`
+// after the child has emitted task_complete, and can intentionally keep a
+// completed child available for follow-up work until closeAgent is called.
 const TURN_BLOCKING_ITEM_TYPES = new Set([
   'commandExecution',
   'fileChange',
   'mcpToolCall',
   'dynamicToolCall',
-  'collabAgentToolCall',
-  'subAgentActivity',
   'webSearch',
   'imageView',
   'sleep',
@@ -46,6 +50,10 @@ const TURN_BLOCKING_ITEM_TYPES = new Set([
 // snapshot as the authoritative reconciliation source while keeping unknown
 // and in-progress statuses fail-closed.
 const TERMINAL_ITEM_STATUSES = new Set(['completed', 'failed', 'declined']);
+
+// These item schemas carry no status field in Codex 0.144.x. Their presence
+// in a completed turn's final item snapshot is therefore the terminal signal.
+const STATUSLESS_TERMINAL_ITEM_TYPES = new Set(['webSearch', 'imageView', 'sleep']);
 
 /**
  * Normalize the app-server's version-dependent thread status shape.
@@ -117,6 +125,10 @@ export class CodexTurnLiveness {
     return { kind: 'healthy' };
   }
 
+  hasOpenBlockingItems(): boolean {
+    return [...this.openItems.values()].some((type) => TURN_BLOCKING_ITEM_TYPES.has(type));
+  }
+
   private reconcileTerminalTurnItems(turn: unknown): void {
     if (!turn || typeof turn !== 'object') return;
     const items = (turn as { items?: unknown }).items;
@@ -126,7 +138,10 @@ export class CodexTurnLiveness {
       const parsed = parseItemIdentity(item);
       if (!parsed || this.openItems.get(parsed.id) !== parsed.type) continue;
       const status = (item as Record<string, unknown>).status;
-      if (typeof status === 'string' && TERMINAL_ITEM_STATUSES.has(status)) {
+      if (
+        (typeof status === 'string' && TERMINAL_ITEM_STATUSES.has(status)) ||
+        (status === undefined && STATUSLESS_TERMINAL_ITEM_TYPES.has(parsed.type))
+      ) {
         this.openItems.delete(parsed.id);
       }
     }

@@ -38,6 +38,7 @@ import {
   interruptCodexTurn,
   killCodexAppServer,
   probeCodexThreadHealth,
+  readCodexTurnSnapshot,
   spawnCodexAppServer,
   startCodexTurn,
   startOrResumeCodexThread,
@@ -45,7 +46,7 @@ import {
   writeCodexHooksJson,
   writeCodexMcpConfigToml,
 } from './codex-app-server.js';
-import { CodexTurnLiveness, normalizeCodexThreadStatus, type CodexLivenessDecision } from './codex-liveness.js';
+import { CodexTurnLiveness, normalizeCodexThreadStatus } from './codex-liveness.js';
 
 /**
  * Health watchdog for a single turn. Guards against codex-app-server wedging
@@ -78,6 +79,8 @@ const CODEX_HEALTH_STILL_WORKING_NOTICE_MS = 15 * 60_000;
 const CODEX_IN_FLIGHT_ITEM_TIMEOUT_MS = 60 * 60 * 1000;
 const CODEX_CONTROL_PLANE_RECOVERY_MAX = 1;
 const CODEX_INTERRUPT_TIMEOUT_MS = 2_000;
+const CODEX_TURN_BACKFILL_MAX_ATTEMPTS = 3;
+const CODEX_TURN_BACKFILL_RETRY_BASE_MS = 50;
 
 export interface CodexTurnHealthConfig {
   quietMs: number;
@@ -188,6 +191,63 @@ export function formatCodexCollaborationProgress(rawItem: unknown, emittedItemId
   if (itemId && emittedItemIds.has(itemId)) return null;
   if (itemId) emittedItemIds.add(itemId);
   return message;
+}
+
+export function isCodexNotificationForActiveTurn(
+  method: string,
+  params: Record<string, unknown>,
+  threadId: string,
+  currentTurnId: string | null,
+): boolean {
+  if (method === 'thread/started') {
+    const thread = params.thread;
+    return (
+      !!thread &&
+      typeof thread === 'object' &&
+      (thread as Record<string, unknown>).id === threadId
+    );
+  }
+
+  // Every current Codex lifecycle notification except thread/started carries
+  // a top-level threadId. Missing scope is malformed under the exact-pinned
+  // protocol and must not be allowed to mutate the active turn.
+  if (params.threadId !== threadId) return false;
+
+  const turn = params.turn;
+  const nestedTurnId =
+    turn && typeof turn === 'object' && typeof (turn as Record<string, unknown>).id === 'string'
+      ? ((turn as Record<string, unknown>).id as string)
+      : null;
+  const notificationTurnId = typeof params.turnId === 'string' ? params.turnId : nestedTurnId;
+  const isTurnScoped =
+    method.startsWith('turn/') ||
+    method.startsWith('item/') ||
+    method.startsWith('rawResponseItem/');
+  if (isTurnScoped && !notificationTurnId) return false;
+  if (isTurnScoped && currentTurnId && notificationTurnId !== currentTurnId) return false;
+  return true;
+}
+
+async function readCodexTurnSnapshotWithRetry(
+  server: AppServer,
+  threadId: string,
+  turnId: string,
+  timeoutMs: number,
+): Promise<Record<string, unknown>> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= CODEX_TURN_BACKFILL_MAX_ATTEMPTS; attempt++) {
+    try {
+      return await readCodexTurnSnapshot(server, threadId, turnId, timeoutMs);
+    } catch (err) {
+      lastError = err;
+      if (attempt < CODEX_TURN_BACKFILL_MAX_ATTEMPTS) {
+        await new Promise<void>((resolve) => {
+          setTimeout(resolve, CODEX_TURN_BACKFILL_RETRY_BASE_MS * attempt);
+        });
+      }
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
 // Thinking-label helpers — mirror the Claude provider's truncate /
@@ -1318,6 +1378,7 @@ export async function* runOneTurn(
   let healthProbeInFlight = false;
   let lastProbeAt: string | null = null;
   let providerRecoveryRequested = false;
+  let turnCompletionInFlight = false;
   let noticeForLastNotificationAtMs: number | null = null;
   let lastMethod = '<turn-start>';
 
@@ -1418,18 +1479,111 @@ export async function* runOneTurn(
     }
   };
 
+  const completeTurn = async (rawParams: Record<string, unknown>): Promise<void> => {
+    const p = rawParams as {
+      status?: string;
+      error?: { message?: string; codexErrorInfo?: { type?: string } };
+      turn?: {
+        id?: string;
+        status?: string;
+        items?: unknown[];
+        itemsView?: string;
+        error?: { message?: string; codexErrorInfo?: { type?: string } } | null;
+      };
+    };
+    let completedTurn = p.turn;
+    const initialStatus = completedTurn?.status ?? p.status;
+
+    // Current Codex app-server can guarantee turn/completed while omitting
+    // turn.items under notification backpressure. It can also explicitly mark
+    // a non-empty payload as `itemsView: summary`, which is not authoritative.
+    // Match the official `codex exec` recovery and extend it to the protocol's
+    // explicit partial-view marker before deciding that a locally open
+    // execution item was abandoned.
+    const completedTurnId = completedTurn?.id ?? turnTracker?.currentTurnId ?? null;
+    const items = completedTurn?.items;
+    if (
+      initialStatus === 'completed' &&
+      liveness.hasOpenBlockingItems() &&
+      (!Array.isArray(items) ||
+        items.length === 0 ||
+        (completedTurn?.itemsView !== undefined && completedTurn.itemsView !== 'full')) &&
+      completedTurnId
+    ) {
+      try {
+        const backfilled = await readCodexTurnSnapshotWithRetry(
+          server,
+          threadId,
+          completedTurnId,
+          healthConfig.timeoutMs,
+        );
+        completedTurn = {
+          ...completedTurn,
+          ...backfilled,
+          id: completedTurnId,
+          status:
+            typeof backfilled.status === 'string'
+              ? backfilled.status
+              : completedTurn?.status,
+          items: Array.isArray(backfilled.items) ? backfilled.items : completedTurn?.items,
+          itemsView:
+            typeof backfilled.itemsView === 'string'
+              ? backfilled.itemsView
+              : completedTurn?.itemsView,
+        };
+      } catch (err) {
+        console.error(
+          `[codex-provider] Failed to backfill completed turn ${completedTurnId}: ` +
+            `${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
+
+    const status = completedTurn?.status ?? p.status;
+    const error = completedTurn?.error ?? p.error;
+    const turnEndDecision = liveness.noteTurnEnded(completedTurn);
+    if (status === 'failed' || error) {
+      const kind = error?.codexErrorInfo?.type;
+      turnState.error = new Error(error?.message || 'Turn failed');
+      if (typeof kind === 'string') turnState.errorKind = kind;
+    } else if (status === 'interrupted') {
+      // Interruption is an explicit terminal state, not evidence that the
+      // app-server lost execution lifecycle state.
+      turnState.error = new Error('Turn interrupted');
+    } else if (turnEndDecision.kind === 'recover') {
+      if (turnTracker) turnTracker.currentTurnId = null;
+      finishForLivenessFailure(turnEndDecision.classification, turnEndDecision.reason);
+      return;
+    }
+
+    flushReasoning();
+    if (turnTracker) turnTracker.currentTurnId = null;
+    turnDone = true;
+    kick();
+  };
+
   const handler = (n: JsonRpcNotification): void => {
     const method = n.method;
     const params = n.params;
     lastMethod = method;
-    let turnEndDecision: CodexLivenessDecision | null = null;
+    const isActiveTurnNotification = isCodexNotificationForActiveTurn(
+      method,
+      params,
+      threadId,
+      turnTracker?.currentTurnId ?? null,
+    );
 
-    if (method === 'item/started') {
+    if (!isActiveTurnNotification) {
+      // Child/older-turn traffic still proves the shared app-server control
+      // plane is responsive, but it must never mutate the root turn's item
+      // tracker, result text, error, or completion state.
+      liveness.noteNotification();
+    } else if (method === 'item/started') {
       liveness.noteItemStarted(params.item);
     } else if (method === 'item/completed') {
       liveness.noteItemCompleted(params.item);
-    } else if (method === 'turn/completed' || method === 'turn/failed') {
-      turnEndDecision = liveness.noteTurnEnded(params.turn);
+    } else if (method === 'turn/failed') {
+      liveness.noteTurnEnded(params.turn);
     } else {
       liveness.noteNotification();
     }
@@ -1438,6 +1592,19 @@ export async function* runOneTurn(
     // idle timer — yield before any event-specific translation so even
     // long tool executions keep the loop awake.
     buffer.push({ type: 'activity' });
+
+    if (!isActiveTurnNotification) {
+      kick();
+      return;
+    }
+
+    if (method === 'turn/completed') {
+      if (!turnCompletionInFlight) {
+        turnCompletionInFlight = true;
+        void completeTurn(params);
+      }
+      return;
+    }
 
     switch (method) {
       case 'thread/started': {
@@ -1508,47 +1675,6 @@ export async function* runOneTurn(
         // accumulated so the user sees thinking updates as they happen,
         // not just one giant label at turn end.
         flushReasoning();
-        break;
-      }
-      case 'turn/completed': {
-        // Codex's `turn/completed` is overloaded: it fires for both successful
-        // and failed turns. A failed turn carries `status: 'failed'` and an
-        // `error` object with `message`, `codexErrorInfo` (structured enum:
-        // UsageLimitExceeded | ServerOverloaded | ContextWindowExceeded |
-        // Unauthorized | BadRequest | ...), and optional `additionalDetails`.
-        // Treating every `turn/completed` as success made rate-limit hangs
-        // invisible — the agent yielded an empty result and the poll loop
-        // looped back into the same systemError.
-        const p = params as {
-          status?: string;
-          error?: { message?: string; codexErrorInfo?: { type?: string } };
-          turn?: {
-            status?: string;
-            error?: { message?: string; codexErrorInfo?: { type?: string } } | null;
-          };
-        };
-        // Codex 0.144.x follows the generated v2 schema and nests status/error
-        // under params.turn. Retain the top-level fallback for older servers.
-        const status = p.turn?.status ?? p.status;
-        const error = p.turn?.error ?? p.error;
-        if (status === 'failed' || error) {
-          const kind = error?.codexErrorInfo?.type;
-          turnState.error = new Error(error?.message || 'Turn failed');
-          if (typeof kind === 'string') turnState.errorKind = kind;
-        } else if (turnEndDecision?.kind === 'recover') {
-          // A successful turn cannot be trusted while an execution/tool item
-          // remains open: this is the exact lifecycle corruption that let a
-          // Graphify command start, disappear, and still produce an answer.
-          // The server already declared the turn complete, so waiting cannot
-          // produce the missing notification. Fail into the existing one-shot
-          // app-server replacement + persisted-thread resume path instead.
-          if (turnTracker) turnTracker.currentTurnId = null;
-          finishForLivenessFailure(turnEndDecision.classification, turnEndDecision.reason);
-          break;
-        }
-        flushReasoning();
-        if (turnTracker) turnTracker.currentTurnId = null;
-        turnDone = true;
         break;
       }
       case 'turn/failed': {
@@ -1636,7 +1762,8 @@ export async function* runOneTurn(
       buffer.push({ type: 'init', continuation: threadId });
     }
 
-    await startCodexTurn(server, { threadId, inputText, model, cwd });
+    const startedTurnId = await startCodexTurn(server, { threadId, inputText, model, cwd });
+    if (turnTracker && startedTurnId) turnTracker.currentTurnId = startedTurnId;
 
     while (true) {
       while (buffer.length > 0) {

@@ -9,6 +9,7 @@ import {
   createCodexConfigOverrides,
   interruptCodexTurn,
   probeCodexThreadHealth,
+  readCodexTurnSnapshot,
   writeCodexHooksJson,
   writeCodexMcpConfigToml,
 } from './codex-app-server.js';
@@ -54,6 +55,36 @@ function fakeAppServer(
 }
 
 describe('Codex app-server liveness RPCs', () => {
+  it('reloads one completed turn from persisted thread state', async () => {
+    const { server, requests } = fakeAppServer((request) => ({
+      result: {
+        thread: {
+          turns: [
+            { id: 'turn-older', items: [] },
+            { id: 'turn-1', status: 'completed', items: [{ id: 'command-1', status: 'completed' }] },
+          ],
+        },
+      },
+    }));
+
+    await expect(readCodexTurnSnapshot(server, 'root-1', 'turn-1', 50)).resolves.toMatchObject({
+      id: 'turn-1',
+      status: 'completed',
+      items: [{ id: 'command-1', status: 'completed' }],
+    });
+    expect(requests[0]).toMatchObject({
+      method: 'thread/read',
+      params: { threadId: 'root-1', includeTurns: true },
+    });
+  });
+
+  it('fails closed when persisted thread state omits the requested turn', async () => {
+    const { server } = fakeAppServer(() => ({ result: { thread: { turns: [] } } }));
+    await expect(readCodexTurnSnapshot(server, 'root-1', 'turn-missing', 50)).rejects.toThrow(
+      'thread/read turn backfill response missing turn turn-missing',
+    );
+  });
+
   it('reads the root and all descendants without mutating the thread', async () => {
     const { server, requests } = fakeAppServer((request) => {
       if (request.method === 'thread/read') return { result: { thread: { status: { type: 'idle' } } } };

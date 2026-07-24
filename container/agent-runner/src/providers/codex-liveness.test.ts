@@ -86,6 +86,46 @@ describe('CodexTurnLiveness', () => {
     });
   });
 
+  it('allows persistent collaboration items to remain open across a completed parent turn', () => {
+    const { liveness } = tracker();
+    liveness.noteItemStarted({
+      id: 'collab-1',
+      type: 'collabAgentToolCall',
+      tool: 'spawnAgent',
+      status: 'inProgress',
+      receiverThreadIds: ['child-1'],
+    });
+
+    expect(
+      liveness.noteTurnEnded({
+        status: 'completed',
+        items: [
+          {
+            id: 'collab-1',
+            type: 'collabAgentToolCall',
+            tool: 'spawnAgent',
+            status: 'inProgress',
+            receiverThreadIds: ['child-1'],
+          },
+        ],
+      }),
+    ).toEqual({ kind: 'healthy' });
+    expect(liveness.snapshot().openItems).toEqual([]);
+  });
+
+  it('allows sub-agent activity markers to remain open across a completed parent turn', () => {
+    const { liveness } = tracker();
+    liveness.noteItemStarted({
+      id: 'activity-1',
+      type: 'subAgentActivity',
+      kind: 'started',
+      agentPath: 'child-1',
+    });
+
+    expect(liveness.noteTurnEnded({ status: 'completed' })).toEqual({ kind: 'healthy' });
+    expect(liveness.snapshot().openItems).toEqual([]);
+  });
+
   it('does not reconcile an open item from an unrelated terminal item', () => {
     const { liveness } = tracker();
     liveness.noteItemStarted({ id: 'command-1', type: 'commandExecution', status: 'inProgress' });
@@ -105,6 +145,20 @@ describe('CodexTurnLiveness', () => {
       expect(
         liveness.noteTurnEnded({
           items: [{ id: `command-${status}`, type: 'commandExecution', status }],
+        }),
+      ).toEqual({ kind: 'healthy' });
+    }
+  });
+
+  it('reconciles statusless lifecycle items from the completed turn snapshot', () => {
+    for (const type of ['webSearch', 'imageView', 'sleep']) {
+      const { liveness } = tracker();
+      liveness.noteItemStarted({ id: `${type}-1`, type });
+
+      expect(
+        liveness.noteTurnEnded({
+          status: 'completed',
+          items: [{ id: `${type}-1`, type }],
         }),
       ).toEqual({ kind: 'healthy' });
     }

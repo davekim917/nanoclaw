@@ -14,6 +14,7 @@ import {
   findNewestRolloutAcrossHomes,
   findRolloutFile,
   formatCodexCollaborationProgress,
+  isCodexNotificationForActiveTurn,
   materializeRawImageGeneration,
   mirrorCodexAgentsToHome,
   refreshCodexAuthFromHost,
@@ -21,6 +22,69 @@ import {
   resolveQueryModel,
   resolveQueryEffort,
 } from './codex.js';
+
+describe('isCodexNotificationForActiveTurn', () => {
+  it('accepts the active root thread and turn', () => {
+    expect(
+      isCodexNotificationForActiveTurn(
+        'item/started',
+        { threadId: 'root-1', turnId: 'turn-1' },
+        'root-1',
+        'turn-1',
+      ),
+    ).toBe(true);
+  });
+
+  it('rejects child threads and stale turns from the same root thread', () => {
+    expect(
+      isCodexNotificationForActiveTurn(
+        'item/started',
+        { threadId: 'child-1', turnId: 'child-turn-1' },
+        'root-1',
+        'turn-1',
+      ),
+    ).toBe(false);
+    expect(
+      isCodexNotificationForActiveTurn(
+        'turn/completed',
+        { threadId: 'root-1', turn: { id: 'turn-older' } },
+        'root-1',
+        'turn-1',
+      ),
+    ).toBe(false);
+  });
+
+  it('rejects malformed lifecycle notifications that omit required scope identifiers', () => {
+    expect(isCodexNotificationForActiveTurn('item/started', {}, 'root-1', 'turn-1')).toBe(false);
+    expect(
+      isCodexNotificationForActiveTurn(
+        'turn/completed',
+        { threadId: 'root-1', turn: { status: 'completed' } },
+        'root-1',
+        'turn-1',
+      ),
+    ).toBe(false);
+  });
+
+  it('accepts root thread notifications that are not scoped to one turn', () => {
+    expect(
+      isCodexNotificationForActiveTurn(
+        'thread/status/changed',
+        { threadId: 'root-1', status: { type: 'active' } },
+        'root-1',
+        'turn-1',
+      ),
+    ).toBe(true);
+    expect(
+      isCodexNotificationForActiveTurn(
+        'thread/started',
+        { thread: { id: 'root-1' } },
+        'root-1',
+        null,
+      ),
+    ).toBe(true);
+  });
+});
 
 describe('createProvider (codex)', () => {
   it('returns CodexProvider for codex', () => {
@@ -655,7 +719,7 @@ describe('codex turn-failure classification (systemError + turn/completed:failed
     expect(window).toMatch(/turnDone\s*=\s*true/);
   });
 
-  it('turn/completed branch handles status=failed + carries codexErrorInfo.type into turnState.errorKind', () => {
+  it('completed-turn handler handles status=failed + carries codexErrorInfo.type into turnState.errorKind', () => {
     const src = fs.readFileSync(new URL('./codex.ts', import.meta.url), 'utf8');
     const codeOnly = src
       .replace(/\/\*[\s\S]*?\*\//g, '')
@@ -666,11 +730,12 @@ describe('codex turn-failure classification (systemError + turn/completed:failed
       })
       .join('\n');
 
-    // Anchor on `case 'turn/completed'`. The next ~500 chars must contain
-    // the failed-status branch and the kind capture.
-    const caseIdx = codeOnly.indexOf("case 'turn/completed'");
-    expect(caseIdx).toBeGreaterThan(-1);
-    const window = codeOnly.slice(caseIdx, caseIdx + 800);
+    // Completion is asynchronous because an empty notification snapshot may
+    // need a thread/read backfill. Anchor on that handler rather than the
+    // notification dispatch branch.
+    const handlerIdx = codeOnly.indexOf('const completeTurn = async');
+    expect(handlerIdx).toBeGreaterThan(-1);
+    const window = codeOnly.slice(handlerIdx, handlerIdx + 2400);
 
     // status==='failed' OR error-presence path
     expect(window).toMatch(/p\.status\s*===\s*['"]failed['"]|status\s*===\s*['"]failed['"]/);

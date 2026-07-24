@@ -97,17 +97,29 @@ lines.on('line', (line) => {
   }
   if (request.method === 'turn/start') {
     send({ id: request.id, result: { turn: { id: 'turn-' + instance } } });
-    send({ method: 'turn/started', params: { turnId: 'turn-' + instance } });
+    send({
+      method: 'turn/started',
+      params: {
+        threadId: 'thread-1',
+        turn: { id: 'turn-' + instance, status: 'inProgress', items: [] },
+      },
+    });
     if (instance === 1 && failureMode === 'unfinished-command') {
       setTimeout(() => {
         send({
           method: 'item/started',
-          params: { item: { id: 'command-1', type: 'commandExecution', status: 'inProgress' } },
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-' + instance,
+            item: { id: 'command-1', type: 'commandExecution', status: 'inProgress' },
+          },
         });
         send({
           method: 'turn/completed',
           params: {
+            threadId: 'thread-1',
             turn: {
+              id: 'turn-' + instance,
               status: 'completed',
               items: [{ id: 'command-1', type: 'commandExecution', status: 'inProgress' }],
             },
@@ -117,8 +129,21 @@ lines.on('line', (line) => {
     }
     if (instance > 1) {
       setTimeout(() => {
-        send({ method: 'item/agentMessage/delta', params: { delta: 'recovered result' } });
-        send({ method: 'turn/completed', params: { status: 'completed' } });
+        send({
+          method: 'item/agentMessage/delta',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-' + instance,
+            delta: 'recovered result',
+          },
+        });
+        send({
+          method: 'turn/completed',
+          params: {
+            threadId: 'thread-1',
+            turn: { id: 'turn-' + instance, status: 'completed', items: [] },
+          },
+        });
       }, 5);
     }
     return;

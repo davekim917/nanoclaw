@@ -356,7 +356,7 @@ export interface TurnParams {
   cwd?: string;
 }
 
-export async function startCodexTurn(server: AppServer, params: TurnParams): Promise<void> {
+export async function startCodexTurn(server: AppServer, params: TurnParams): Promise<string | null> {
   const resp = await sendCodexRequest(server, 'turn/start', {
     threadId: params.threadId,
     input: [{ type: 'text', text: params.inputText }],
@@ -364,11 +364,36 @@ export async function startCodexTurn(server: AppServer, params: TurnParams): Pro
     cwd: params.cwd,
   });
   if (resp.error) throw new Error(`turn/start failed: ${resp.error.message}`);
+  const result = resp.result as { turn?: { id?: unknown } } | undefined;
+  return typeof result?.turn?.id === 'string' ? result.turn.id : null;
 }
 
 export interface CodexThreadHealthProbe {
   rootStatus: unknown;
   descendantStatuses: unknown[];
+}
+
+export async function readCodexTurnSnapshot(
+  server: AppServer,
+  threadId: string,
+  turnId: string,
+  timeoutMs: number,
+): Promise<Record<string, unknown>> {
+  const response = await sendCodexRequest(server, 'thread/read', { threadId, includeTurns: true }, timeoutMs);
+  if (response.error) throw new Error(`thread/read turn backfill failed: ${response.error.message}`);
+
+  const result = response.result as { thread?: { turns?: unknown } } | undefined;
+  const turns = result?.thread?.turns;
+  if (!Array.isArray(turns)) throw new Error('thread/read turn backfill response missing turns');
+
+  const turn = turns.find(
+    (candidate): candidate is Record<string, unknown> =>
+      !!candidate &&
+      typeof candidate === 'object' &&
+      (candidate as Record<string, unknown>).id === turnId,
+  );
+  if (!turn) throw new Error(`thread/read turn backfill response missing turn ${turnId}`);
+  return turn;
 }
 
 /**
