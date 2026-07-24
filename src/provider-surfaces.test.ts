@@ -363,8 +363,8 @@ describe('worker agent def sync (orchestrator roster)', () => {
     expect(fs.readFileSync(path.join(agentsDir, 'custom-op.md'), 'utf-8')).toBe('operator-owned\n');
     // Regression guard for the 1M-window fix (F4): opus worker must carry [1m],
     // not a bare id that collapses to 200k under proxy auth. Reverting to
-    // `model: opus` or bare `claude-opus-4-8` fails here.
-    expect(fs.readFileSync(path.join(agentsDir, 'worker-opus.md'), 'utf-8')).toContain('model: claude-opus-4-8[1m]');
+    // `model: opus` or bare `claude-opus-5` fails here.
+    expect(fs.readFileSync(path.join(agentsDir, 'worker-opus.md'), 'utf-8')).toContain('model: claude-opus-5[1m]');
     const codexWorker = fs.readFileSync(path.join(agentsDir, 'worker-codex.md'), 'utf-8');
     expect(codexWorker).toContain('Always run Codex in the foreground');
     expect(codexWorker).toContain('`timeout` to `3600000`');

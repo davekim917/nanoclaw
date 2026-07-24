@@ -1,11 +1,42 @@
 import { describe, it, expect } from 'vitest';
 
-import { parseMessageFlags, formatFlagConfirmation, ensureOpus1mSuffix, isOpenCodeModelSlug } from './flag-parser.js';
+import {
+  parseMessageFlags,
+  formatFlagConfirmation,
+  ensureOpus1mSuffix,
+  resolveModelAlias,
+  isOpenCodeModelSlug,
+} from './flag-parser.js';
+
+// Exported for the spawn path (container-runner buildContainerArgs): a channel
+// or container.json default stored as a PINNED short alias must resolve before
+// it reaches ANTHROPIC_DEFAULT_OPUS_MODEL, or the API gets an invalid model id.
+describe('resolveModelAlias', () => {
+  it('resolves pinned short aliases to concrete 1M ids', () => {
+    expect(resolveModelAlias('opus5')).toBe('claude-opus-5[1m]');
+    expect(resolveModelAlias('opus48')).toBe('claude-opus-4-8[1m]');
+    expect(resolveModelAlias('sonnet5')).toBe('claude-sonnet-5');
+    expect(resolveModelAlias('haiku45')).toBe('claude-haiku-4-5');
+  });
+
+  it('appends [1m] to bare opus ids and leaves resolved ids alone', () => {
+    expect(resolveModelAlias('claude-opus-5')).toBe('claude-opus-5[1m]');
+    expect(resolveModelAlias('claude-opus-5[1m]')).toBe('claude-opus-5[1m]');
+  });
+
+  it('passes bare family aliases through (container-runner maps those first)', () => {
+    expect(resolveModelAlias('opus')).toBe('opus');
+    expect(resolveModelAlias('sonnet')).toBe('sonnet');
+  });
+});
 
 describe('ensureOpus1mSuffix', () => {
   it('appends [1m] to a bare claude-opus id (1M auto-compact window guard)', () => {
     expect(ensureOpus1mSuffix('claude-opus-4-8')).toBe('claude-opus-4-8[1m]');
     expect(ensureOpus1mSuffix('claude-opus-4-7')).toBe('claude-opus-4-7[1m]');
+    // Single-digit version scheme (Opus 5) — same policy as the 4.x ids.
+    expect(ensureOpus1mSuffix('claude-opus-5')).toBe('claude-opus-5[1m]');
+    expect(ensureOpus1mSuffix('claude-opus-5[1m]')).toBe('claude-opus-5[1m]');
   });
 
   it('is a no-op when the [1m] suffix is already present', () => {
@@ -83,6 +114,27 @@ describe('parseMessageFlags', () => {
     it('auto-appends [1m] to bare claude-opus-4-8 id', () => {
       const r = parseMessageFlags('-m claude-opus-4-8 hi');
       expect(r.intent).toEqual({ stickyModel: 'claude-opus-4-8[1m]' });
+    });
+
+    it('resolves opus5 / opus-5 aliases to claude-opus-5[1m]', () => {
+      expect(parseMessageFlags('-m opus5 hi').intent).toEqual({ stickyModel: 'claude-opus-5[1m]' });
+      expect(parseMessageFlags('-m opus-5 hi').intent).toEqual({ stickyModel: 'claude-opus-5[1m]' });
+    });
+
+    // Opus 5 uses the single-digit version scheme (claude-opus-5, not -5-0), so
+    // the id must survive VALID_MODEL_RE *and* pick up [1m] like the 4.x ids.
+    it('auto-appends [1m] to bare claude-opus-5 id', () => {
+      const r = parseMessageFlags('-m claude-opus-5 hi');
+      expect(r.intent).toEqual({ stickyModel: 'claude-opus-5[1m]' });
+      expect(r.warnings).toEqual([]);
+    });
+
+    it('accepts the full effort ladder on opus 5', () => {
+      for (const effort of ['low', 'medium', 'high', 'xhigh', 'max']) {
+        const r = parseMessageFlags(`-m opus5 -e ${effort} hi`);
+        expect(r.intent).toEqual({ stickyModel: 'claude-opus-5[1m]', stickyEffort: effort });
+        expect(r.warnings).toEqual([]);
+      }
     });
 
     it('accepts xhigh effort on opus 4.8 (effort matrix knows the new id)', () => {

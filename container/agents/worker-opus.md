@@ -1,7 +1,7 @@
 ---
 name: worker-opus
 description: Heavyweight execution worker for complex subtasks — deep debugging, architecture-sensitive edits, gnarly refactors. Use when the user asks for opus workers or a task needs more reasoning than the default worker. Runs on Opus at xhigh effort.
-model: claude-opus-4-8[1m]
+model: claude-opus-5[1m]
 effort: xhigh
 ---
 

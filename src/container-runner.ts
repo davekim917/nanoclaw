@@ -44,7 +44,8 @@ import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContaine
 import { checkAgentRunnerDepsDrift } from './agent-runner-image-check.js';
 import { EGRESS_NETWORK, egressNetworkArgs, ensureEgressNetwork } from './egress-lockdown.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
-import { ensureOpus1mSuffix } from './flag-parser.js';
+// resolveModelAlias applies ensureOpus1mSuffix internally — see its use below.
+import { resolveModelAlias } from './flag-parser.js';
 import { readEnvFileMatching } from './env.js';
 import { getAgentGroup, getWorkgroupOnecliSecrets, getWorkgroupOnecliSecretsById } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
@@ -115,7 +116,7 @@ const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY, timeout: 30
 // (messaging_group_agents.default_model/effort) and per-group
 // (container.json defaultModel/defaultEffort) layers can still override.
 // Per-session flags (-m / -e) and sticky config override on top of those.
-const DEFAULT_OPUS_MODEL = 'claude-opus-4-8[1m]';
+const DEFAULT_OPUS_MODEL = 'claude-opus-5[1m]';
 const DEFAULT_SONNET_MODEL = 'claude-sonnet-5';
 const DEFAULT_HAIKU_MODEL = 'claude-haiku-4-5-20251001';
 // (DEFAULT_EFFORT removed 2026-06-10 — effort defaults are per-model-family
@@ -2501,7 +2502,14 @@ async function buildContainerArgs(
     sonnet: DEFAULT_SONNET_MODEL,
     haiku: DEFAULT_HAIKU_MODEL,
   };
-  const defaultOpusModel = ensureOpus1mSuffix(familyDefaults[rawDefaultModel.toLowerCase()] ?? rawDefaultModel);
+  // PINNED short aliases (`opus5`, `opus48`, `sonnet5`, `haiku45`, `fable`)
+  // resolve here too — resolveModelAlias covers MODEL_ALIAS_MAP and still
+  // applies ensureOpus1mSuffix to bare/unmapped ids. Without it, the very
+  // spelling the set_channel_model tool documents ("pass a short alias") was
+  // stored verbatim and shipped to the API as an invalid model id. Family
+  // aliases are mapped first so `opus` keeps tracking DEFAULT_OPUS_MODEL
+  // rather than freezing to whatever MODEL_ALIAS_MAP pins.
+  const defaultOpusModel = resolveModelAlias(familyDefaults[rawDefaultModel.toLowerCase()] ?? rawDefaultModel);
   args.push('-e', `ANTHROPIC_DEFAULT_OPUS_MODEL=${defaultOpusModel}`);
   args.push('-e', `ANTHROPIC_DEFAULT_SONNET_MODEL=${DEFAULT_SONNET_MODEL}`);
   args.push('-e', `ANTHROPIC_DEFAULT_HAIKU_MODEL=${DEFAULT_HAIKU_MODEL}`);
