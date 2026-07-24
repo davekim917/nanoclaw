@@ -7,7 +7,7 @@ import { promisify } from 'node:util';
 const execFileAsync = promisify(execFile);
 
 /** Where ~/plugins is mounted inside agent containers (see container-runner.ts). */
-const CONTAINER_PLUGINS_ROOT = '/workspace/plugins';
+export const CONTAINER_PLUGINS_ROOT = '/workspace/plugins';
 
 export type UpdateKind =
   | 'host-dependency'

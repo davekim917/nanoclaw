@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import { mkdtemp, readFile, writeFile, mkdir } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
@@ -7,6 +8,7 @@ import {
   applySelectedUpdates,
   auditRepository,
   buildScheduledAuditGate,
+  CONTAINER_PLUGINS_ROOT,
   latestStableGitHubRelease,
   latestStableGitHubTag,
   latestStableNpmVersion,
@@ -312,17 +314,26 @@ describe('tracked repository update surfaces', () => {
 });
 
 describe('plugin version surface', () => {
-  it('reports a manifest-version bump as outdated and refuses to auto-apply it', async () => {
+  it('reports a manifest-version bump as outdated and refuses to auto-apply it', async (ctx) => {
     const root = path.resolve(import.meta.dirname, '..');
     const sources = JSON.parse(await readFile(path.join(root, 'container', 'update-sources.json'), 'utf8')) as {
-      plugins?: Array<{ id: string; dir: string; repo: string; manifestPath: string }>;
+      plugins?: Array<{ id: string; dir: string; repo: string; manifestPath: string; manifestDir?: string }>;
     };
     const entry = sources.plugins?.[0];
     expect(entry).toBeDefined();
 
-    // Local clone must exist where the audit looks for it, or the check is a silent no-op.
-    const localManifest = path.join(homedir(), 'plugins', entry!.dir, '.claude-plugin', 'plugin.json');
-    const local = JSON.parse(await readFile(localManifest, 'utf8')) as { version: string };
+    // Resolve the clone exactly as auditRepository does: container mount first, then
+    // the host clone, honouring `manifestDir` (Codex-native plugins use .codex-plugin).
+    // Checking only ~/plugins made this fail on every CI run, where neither exists.
+    const localManifest = [CONTAINER_PLUGINS_ROOT, path.join(homedir(), 'plugins')]
+      .map((pluginsRoot) => path.join(pluginsRoot, entry!.dir, entry!.manifestDir ?? '.claude-plugin', 'plugin.json'))
+      .find((candidate) => existsSync(candidate));
+
+    // No clone anywhere means a CI runner, where this check cannot say anything. Skip
+    // rather than fail; where a clone IS present every assertion below still hard-fails.
+    if (!localManifest) ctx.skip();
+
+    const local = JSON.parse(await readFile(localManifest!, 'utf8')) as { version: string };
     expect(typeof local.version).toBe('string');
 
     const items = await auditRepository(root, async (url: string) => {
