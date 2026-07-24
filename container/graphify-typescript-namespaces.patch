@@ -1,52 +1,8 @@
-diff --git a/graphify/detect.py b/graphify/detect.py
-index c2638a0..80274cc 100644
---- a/graphify/detect.py
-+++ b/graphify/detect.py
-@@ -1653,8 +1653,13 @@ def save_manifest(
-         manifest[f] = normalised
- 
-     all_files = [f for file_list in files.values() for f in file_list]
--    with ThreadPoolExecutor() as pool:
--        raw = pool.map(_stat_and_hash, all_files)
-+    if os.environ.get("NANOCLAW_GRAPHIFY_SEQUENTIAL") == "1":
-+        # NanoClaw's private worker forbids task creation. Preserve the exact
-+        # input order while hashing in the already resource-capped process.
-+        raw = map(_stat_and_hash, all_files)
-+    else:
-+        with ThreadPoolExecutor() as pool:
-+            raw = list(pool.map(_stat_and_hash, all_files))
-     hashed: dict[str, tuple[float, str]] = {
-         r[0]: (r[1], r[2]) for r in raw if r is not None
-     }
 diff --git a/graphify/extract.py b/graphify/extract.py
-index a18a9b1..7067e2d 100644
+index e5a48dc..6e7b14a 100644
 --- a/graphify/extract.py
 +++ b/graphify/extract.py
-@@ -4328,6 +4328,10 @@ def extract(
-         max_workers: max subprocess count. Defaults to cpu_count (or the
-             value of GRAPHIFY_MAX_WORKERS if set), bounded by len(uncached_work).
-     """
-+    if os.environ.get("NANOCLAW_GRAPHIFY_SEQUENTIAL") == "1":
-+        # The NanoClaw worker is single-process by contract; never construct a
-+        # ProcessPoolExecutor even when a caller leaves the default unchanged.
-+        parallel = False
-     paths = [Path(p) for p in paths]
-     anchor_root = Path(root) if root is not None else None
-     _check_tree_sitter_version()
-@@ -4362,6 +4366,12 @@ def extract(
-     elif cache_root is not None:
-         root = cache_root
-     root = root.resolve()
-+    if anchor_root is not None:
-+        for source_path in paths:
-+            try:
-+                source_path.resolve().relative_to(root)
-+            except ValueError as exc:
-+                raise ValueError(f"source path escapes explicit root: {source_path}") from exc
- 
-     # #1774: the cache is an OUTPUT, so when no explicit cache_root is given it is
-     # written under the current working directory — never `root` (the inferred
-@@ -4854,6 +4864,14 @@ def extract(
+@@ -5073,6 +5073,14 @@ def extract(
              ]
              if not candidates:
                  continue
@@ -62,7 +18,7 @@ index a18a9b1..7067e2d 100644
          # Resolve the caller's file via the raw_call's own source_file string,
          # which is stable regardless of any caller_nid remap. An indirect
 diff --git a/graphify/extractors/engine.py b/graphify/extractors/engine.py
-index e0601cc..b0e0bb6 100644
+index 723606e..ee7542f 100644
 --- a/graphify/extractors/engine.py
 +++ b/graphify/extractors/engine.py
 @@ -2245,6 +2245,40 @@ def _extract_generic(
@@ -106,7 +62,7 @@ index e0601cc..b0e0bb6 100644
      def add_node(nid: str, label: str, line: int, *, node_type: str | None = None,
                   metadata: dict | None = None) -> None:
          if nid in seen_ids:
-@@ -3153,6 +3187,9 @@ def _extract_generic(
+@@ -3165,6 +3199,9 @@ def _extract_generic(
                  add_edge(parent_class_nid, func_nid, "method", line)
              else:
                  func_nid = _make_id(stem, func_name)
@@ -116,7 +72,7 @@ index e0601cc..b0e0bb6 100644
                  add_node(func_nid, f"{func_name}()", line)
                  add_edge(file_nid, func_nid, "contains", line)
              callable_def_nids.add(func_nid)  # function / method def is callable
-@@ -3586,8 +3623,12 @@ def _extract_generic(
+@@ -3598,8 +3635,12 @@ def _extract_generic(
              continue
          raw = n["label"]
          normalised = raw.strip("()").lstrip(".")
@@ -132,7 +88,7 @@ index e0601cc..b0e0bb6 100644
      seen_call_pairs: set[tuple[str, str]] = set()
      seen_indirect_pairs: set[tuple[str, str]] = set()  # Python indirect_call dedup
 diff --git a/graphify/extractors/resolution.py b/graphify/extractors/resolution.py
-index 31a2e79..f2f9e77 100644
+index e88e363..6a080de 100644
 --- a/graphify/extractors/resolution.py
 +++ b/graphify/extractors/resolution.py
 @@ -762,13 +762,20 @@ def _apply_symbol_resolution_facts(
@@ -157,7 +113,7 @@ index 31a2e79..f2f9e77 100644
  
      def ensure_symbol_node(path: Path, name: str, line: int) -> str:
          resolved_path = path.resolve()
-@@ -960,6 +967,16 @@ def _apply_symbol_resolution_facts(
+@@ -965,6 +972,16 @@ def _apply_symbol_resolution_facts(
              import_fact.line,
              import_fact.file_path,
          )
@@ -173,8 +129,8 @@ index 31a2e79..f2f9e77 100644
 +            )
  
      # #1146: emit file-to-file imports_from edges for package-form submodule imports.
-     for from_path, to_path, line in facts.module_imports:
-@@ -978,7 +995,10 @@ def _apply_symbol_resolution_facts(
+     for from_path, to_path, line, local_name in facts.module_imports:
+@@ -986,7 +1003,10 @@ def _apply_symbol_resolution_facts(
          unresolved_origin = local_aliases_by_file.get(file_path, {}).get(use_fact.local_name)
          if unresolved_origin is not None:
              origin_path, origin_symbol = resolve_exported_origin(*unresolved_origin)

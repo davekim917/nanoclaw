@@ -88,7 +88,7 @@ interface UpdateSourcesManifest {
 }
 
 interface GraphifyIntegrationManifest {
-  schemaVersion: 1;
+  schemaVersion: 2;
   package: { name: string; version: string };
   upstream: { repo: string; tag: string; commit: string };
 }
@@ -461,7 +461,7 @@ export async function auditRepository(
   const manifest = JSON.parse(sourceText) as UpdateSourcesManifest;
   if (manifest.schemaVersion !== 1) throw new Error('unsupported container/update-sources.json schema');
   const graphify = JSON.parse(graphifyText) as GraphifyIntegrationManifest;
-  if (graphify.schemaVersion !== 1) throw new Error('unsupported Graphify integration manifest schema');
+  if (graphify.schemaVersion !== 2) throw new Error('unsupported Graphify integration manifest schema');
 
   const docker = await Promise.all(
     manifest.dockerfile.map(async (entry): Promise<AuditItem> => {

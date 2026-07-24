@@ -35,7 +35,7 @@ All are committed. CI and the Dockerfile run frozen/hash-locked install variants
 
 - **Host + global CLIs** (pnpm): latest stable releases, including majors, with committed manifests/lockfiles and the unchanged `allowBuilds` map. `minimumReleaseAge: 0` makes the no-delay policy explicit across pnpm 10 and 11. See `pnpm-workspace.yaml`, `docs/SECURITY.md`, and `docs/dependency-updates.md`.
 - **Agent-runner** (Bun): the same latest-stable policy, exact manifest declarations, and committed `bun.lock`. High-impact SDK majors still require review and the full container test lane.
-- **Graphify** (Python): [`graphify-integration.json`](../container/graphify-integration.json) is the canonical release/commit/patch/capability ledger. [`graphify-requirements.lock`](../container/graphify-requirements.lock) and [`graphify-wheel-audit.json`](../container/graphify-wheel-audit.json) define the complete Python 3.11/Linux ARM64, wheel-only closure without an age cutoff. The image downloads with hashes, then installs offline with `--require-hashes --only-binary=:all: --no-deps`; no package range or source build is resolved during installation. [`graphify-nanoclaw.patch`](../container/graphify-nanoclaw.patch) applies once with exact-context and reverse-application checks.
+- **Graphify** (Python): [`graphify-integration.json`](../container/graphify-integration.json) is the canonical release/commit/optional-compatibility-patch/capability ledger. [`graphify-requirements.lock`](../container/graphify-requirements.lock) and [`graphify-wheel-audit.json`](../container/graphify-wheel-audit.json) define the complete Python 3.11/Linux ARM64, wheel-only closure without an age cutoff. The image downloads with hashes, then installs offline with `--require-hashes --only-binary=:all: --no-deps`; no package range or source build is resolved during installation. When active, [`graphify-typescript-namespaces.patch`](../container/graphify-typescript-namespaces.patch) applies once with exact-context and reverse-application checks after the candidate engine has been behavior-tested.
 
 ## Image build surface
 
@@ -57,6 +57,14 @@ Container sessions and host/operator work use Graphify for advisory source navig
 - `/opt/graphify/graphify-worker.py` is the private worker from [`graphify-worker.py`](../container/graphify-worker.py). The gateway invokes it by absolute path after applying command, freshness, admission, and resource policy. Agents do not run extraction, installation, watch, MCP, global-graph, or user-selected output paths.
 
 The mandatory [`graphify` skill](../container/skills/graphify/SKILL.md) tells container agents to create or reuse a managed checkout below `/workspace/worktrees` and invoke a read command from there. There is no startup scan, background indexer, commit hook, or manual refresh step. Every read inventories the current checkout, including tracked edits, untracked source, and deletions.
+
+Engine releases are accepted by installed behavior, not by matching Graphify's
+internal file layout or upstream agent instructions. The ARM64 wheel closure is
+hash-locked, and `container/tests/graphify_engine_contract.py` verifies
+deterministic TypeScript type/value namespace extraction. The manifest's
+temporary compatibility patch is applied only while unmodified upstream fails
+that contract; upstream skill and prompt changes are reviewed on their own
+lifecycle.
 
 For a changed generation, the gateway captures an immutable source copy, verifies that capture against fresh live inventories, runs Graphify in a limited private process, validates the complete graph and per-file contribution, and only then promotes the candidate. Promotion uses same-filesystem renames to provide process-atomic namespace visibility; it is not a claim of an atomic live-filesystem snapshot or power-loss durability. If capture, extraction, validation, admission, or promotion fails after source changed, the command returns an error with direct-source-inspection guidance and never queries a stale prior graph.
 

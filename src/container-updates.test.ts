@@ -211,6 +211,35 @@ describe('deterministic update application', () => {
     ).rejects.toThrow('could not resolve SHA256');
     expect(await readFile(dockerfilePath, 'utf8')).toBe(original);
   });
+
+  it('routes an approved Graphify update through the dedicated release adapter', async () => {
+    const root = await mkdtemp(path.join(tmpdir(), 'container-updates-'));
+    const item: AuditItem = {
+      id: 'graphify:graphifyy',
+      name: 'graphifyy',
+      kind: 'graphify',
+      surface: 'container',
+      current: '0.9.25',
+      latest: '0.9.26',
+      status: 'outdated',
+      source: 'pypi',
+    };
+    const commands: Array<{ command: string[]; cwd: string }> = [];
+    await applySelectedUpdates({
+      repoRoot: root,
+      items: [item],
+      selectedIds: [item.id],
+      run: async (command, cwd) => {
+        commands.push({ command, cwd });
+      },
+    });
+    expect(commands).toEqual([
+      {
+        command: ['bun', 'scripts/update-graphify.ts', '--version', '0.9.26'],
+        cwd: root,
+      },
+    ]);
+  });
 });
 
 describe('audit rendering', () => {

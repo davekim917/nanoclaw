@@ -84,7 +84,10 @@ class SupplyChainTest(unittest.TestCase):
     def test_arm64_closure_contains_only_audited_wheels(self):
         audit = json.loads(AUDIT.read_text(encoding="utf-8"))
         self.assertEqual(audit["extras"], ["pdf", "office", "sql", "terraform"])
-        self.assertEqual(audit["requirement"], "graphifyy[pdf,office,sql,terraform]==0.9.20")
+        self.assertEqual(
+            audit["requirement"],
+            f"graphifyy[pdf,office,sql,terraform]=={INTEGRATION['package']['version']}",
+        )
         self.assertGreater(len(audit["wheels"]), 1)
         for wheel in audit["wheels"]:
             with self.subTest(wheel=wheel["filename"]):
@@ -110,6 +113,21 @@ class SupplyChainTest(unittest.TestCase):
         audit = json.loads(AUDIT.read_text(encoding="utf-8"))
         self.assertEqual(audit["releasePolicy"], "latest-stable")
         self.assertNotIn("cutoff", audit)
+
+    def test_engine_updates_are_behavior_gated_not_source_shape_gated(self):
+        script = UPDATE_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("verifyEngineCompatibility", script)
+        self.assertIn("graphify_engine_contract.py", script)
+        self.assertIn("if (unmodifiedFailure === null) return undefined", script)
+        for obsolete_gate in (
+            "skillSha256",
+            "semanticSurfaces",
+            "sourceSha256",
+            "--reviewed-skill-sha",
+            "--reviewed-surface-sha",
+            "--capability-review",
+        ):
+            self.assertNotIn(obsolete_gate, script)
 
     def test_offline_no_deps_install_contract(self):
         locked = parse_lock()

@@ -4,9 +4,14 @@
   "uv_version": "uv 0.11.29 (aarch64-unknown-linux-gnu)",
   "python_version": "3.11",
   "platform": "manylinux2014_aarch64",
-  "requirement": "graphifyy[pdf,office,sql,terraform]==0.9.20",
-  "extras": ["pdf", "office", "sql", "terraform"],
-  "generated_at": "2026-07-20T00:46:31.534Z",
+  "requirement": "graphifyy[pdf,office,sql,terraform]==0.9.25",
+  "extras": [
+    "pdf",
+    "office",
+    "sql",
+    "terraform"
+  ],
+  "generated_at": "2026-07-24T14:46:47.810Z",
   "wheels": [
     {
       "package": "beautifulsoup4",
@@ -24,10 +29,10 @@
     },
     {
       "package": "graphifyy",
-      "version": "0.9.20",
-      "filename": "graphifyy-0.9.20-py3-none-any.whl",
-      "sha256": "5dc067210e8003433c92343db0dd976e17b58956c0b9f27f91a84ae331b74e82",
-      "uploaded_at": "2026-07-18T21:29:51.388244Z"
+      "version": "0.9.25",
+      "filename": "graphifyy-0.9.25-py3-none-any.whl",
+      "sha256": "e902205873d129e9c76c11fea4268480042603590290ed600707354e74314c0c",
+      "uploaded_at": "2026-07-22T22:57:06.463771Z"
     },
     {
       "package": "lxml",
@@ -94,10 +99,10 @@
     },
     {
       "package": "soupsieve",
-      "version": "2.9",
-      "filename": "soupsieve-2.9-py3-none-any.whl",
-      "sha256": "a2b2c76d67df2382d245409fd71e321a571717e58463efa32ace87dcadac2c12",
-      "uploaded_at": "2026-07-19T01:35:17.106393Z"
+      "version": "2.9.1",
+      "filename": "soupsieve-2.9.1-py3-none-any.whl",
+      "sha256": "4f4477399246b7a0c720a88ca2454b11cd6bb9ae4c9d170140786e916776c14c",
+      "uploaded_at": "2026-07-21T16:57:16.421373Z"
     },
     {
       "package": "tree-sitter",

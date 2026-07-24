@@ -10,7 +10,11 @@ import { CONTAINER_IMAGE, REPO_ROOT } from './config.js';
 
 const GRAPHIFY_INTEGRATION = JSON.parse(
   readFileSync(path.join(REPO_ROOT, 'container/graphify-integration.json'), 'utf8'),
-) as { package: { version: string }; patch: { path: string }; upstream: { tag: string } };
+) as {
+  package: { version: string };
+  compatibilityPatch?: { path: string };
+  upstream: { tag: string };
+};
 const GRAPHIFY_VERSION = GRAPHIFY_INTEGRATION.package.version;
 
 describe('computeAgentRunnerDepsHash', () => {
@@ -122,14 +126,16 @@ describe('agent runner image Graphify runtime', () => {
 
     expect(dockerfile).toContain('python3 -m venv /opt/graphify');
     expect(dockerfile).toContain('COPY graphify-requirements.lock graphify-wheel-audit.json');
-    expect(dockerfile).toContain('graphify-integration.json graphify-nanoclaw.patch');
+    expect(dockerfile).toContain('graphify-integration.json graphify-typescript-namespaces.patch');
     expect(dockerfile).toContain('--require-hashes');
     expect(dockerfile).toContain('--only-binary=:all:');
     expect(dockerfile).toContain('--no-deps');
     expect(dockerfile).toContain('--no-index');
     expect(dockerfile).toContain('git apply --check');
-    expect(dockerfile).toContain('git apply /opt/graphify/graphify-nanoclaw.patch');
-    expect(dockerfile).toContain("jq -r '.upstream.tag' /opt/graphify/graphify-integration.json");
+    expect(dockerfile).toContain("jq -r '.compatibilityPatch.path // empty'");
+    expect(dockerfile).toContain('git apply "$PATCH_FILE"');
+    expect(dockerfile).toContain('tests/graphify_engine_contract.py');
+    expect(dockerfile).not.toContain('/tmp/graphify-design');
     expect(dockerfile).toContain('COPY graphify-gateway.py /usr/local/bin/graphify');
     expect(dockerfile).toContain('COPY graphify-worker.py /opt/graphify/graphify-worker.py');
     expect(dockerfile).toContain('rm -f /opt/graphify/bin/graphify');

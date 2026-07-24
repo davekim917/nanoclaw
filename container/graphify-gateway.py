@@ -38,7 +38,7 @@ def _load_integration_manifest() -> dict:
             payload = json.loads(candidate.read_text(encoding="utf-8"))
         except FileNotFoundError:
             continue
-        if payload.get("schemaVersion") != 1:
+        if payload.get("schemaVersion") != 2:
             raise RuntimeError(f"unsupported Graphify integration manifest: {candidate}")
         return payload
     raise RuntimeError("Graphify integration manifest not found")

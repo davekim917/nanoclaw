@@ -347,15 +347,15 @@ RUN --mount=type=cache,target=/root/.cache/pnpm \
 # ---- Graphify code intelligence ----------------------------------------------
 # Graphify is a private, wheel-only Python environment. The upstream console
 # script is removed; only NanoClaw's policy-enforcing freshness gateway is
-# public. The audited wheelhouse remains private so the offline source contract
-# can be rerun against the finished image without dependency resolution.
+# public. The audited wheelhouse remains private so the installed-engine
+# contracts can be rerun against the finished image without dependency resolution.
 RUN python3 -m venv /opt/graphify
-COPY graphify-requirements.lock graphify-wheel-audit.json graphify-integration.json graphify-nanoclaw.patch /opt/graphify/
+COPY graphify-requirements.lock graphify-wheel-audit.json graphify-integration.json graphify-typescript-namespaces.patch /opt/graphify/
 RUN chmod 0444 \
         /opt/graphify/graphify-requirements.lock \
         /opt/graphify/graphify-wheel-audit.json \
         /opt/graphify/graphify-integration.json \
-        /opt/graphify/graphify-nanoclaw.patch \
+        /opt/graphify/graphify-typescript-namespaces.patch \
     && mkdir -p /opt/graphify/wheelhouse \
     && /opt/graphify/bin/pip download \
         --require-hashes \
@@ -370,17 +370,21 @@ RUN chmod 0444 \
         --only-binary=:all: \
         --no-deps \
         -r /opt/graphify/graphify-requirements.lock \
-    && SITE_PACKAGES="$(/opt/graphify/bin/python -c 'import site; print(site.getsitepackages()[0])')" \
-    && cd "$SITE_PACKAGES" \
-    && git apply --check /opt/graphify/graphify-nanoclaw.patch \
-    && git apply /opt/graphify/graphify-nanoclaw.patch \
-    && ! git apply --check /opt/graphify/graphify-nanoclaw.patch >/dev/null 2>&1 \
-    && git apply --reverse --check /opt/graphify/graphify-nanoclaw.patch \
-    && /opt/graphify/bin/python -c 'import json; from importlib.metadata import version; expected=json.load(open("/opt/graphify/graphify-integration.json"))["package"]["version"]; assert version("graphifyy") == expected' \
     && /opt/graphify/bin/pip freeze --local | tr '[:upper:]' '[:lower:]' | tr '_' '-' | LC_ALL=C sort > /tmp/graphify-freeze \
     && grep -v '^#' /opt/graphify/graphify-requirements.lock | sed '/^[[:space:]]*$/d; s/ --hash=.*//' | tr '[:upper:]' '[:lower:]' | tr '_' '-' | LC_ALL=C sort > /tmp/graphify-locked \
     && diff -u /tmp/graphify-locked /tmp/graphify-freeze \
+    && PATCH_PATH="$(jq -r '.compatibilityPatch.path // empty' /opt/graphify/graphify-integration.json)" \
     && rm -f /opt/graphify/bin/graphify \
+    && if [ -n "$PATCH_PATH" ]; then \
+        PATCH_FILE="/opt/graphify/$(basename "$PATCH_PATH")"; \
+        SITE_PACKAGES="$(/opt/graphify/bin/python -c 'import site; print(site.getsitepackages()[0])')"; \
+        cd "$SITE_PACKAGES"; \
+        git apply --check "$PATCH_FILE"; \
+        git apply "$PATCH_FILE"; \
+        ! git apply --check "$PATCH_FILE" >/dev/null 2>&1; \
+        git apply --reverse --check "$PATCH_FILE"; \
+    fi \
+    && /opt/graphify/bin/python -c 'import json; from importlib.metadata import version; expected=json.load(open("/opt/graphify/graphify-integration.json"))["package"]["version"]; assert version("graphifyy") == expected' \
     && rm -f /tmp/graphify-freeze /tmp/graphify-locked
 
 COPY graphify-gateway.py /usr/local/bin/graphify
@@ -393,18 +397,16 @@ RUN sed -i '1c#!/opt/graphify/bin/python' /usr/local/bin/graphify \
     && graphify --version \
     && graphify --help >/dev/null
 
-# Run the exact Group A source contracts against the installed ARM64
-# environment. The upstream checkout and test copies are build-only; the
-# audited wheelhouse above remains for post-build offline verification.
-COPY graphify-gateway.py graphify-worker.py graphify-requirements.lock graphify-wheel-audit.json graphify-integration.json graphify-nanoclaw.patch /tmp/graphify-build/container/
-COPY tests/test_graphify_gateway.py tests/test_graphify_worker.py tests/test_graphify_upstream_contract.py tests/test_graphify_supply_chain.py /tmp/graphify-build/container/tests/
+# Run the Group A behavior contracts against the installed ARM64 environment.
+# Test copies are build-only; the audited wheelhouse remains for post-build
+# offline verification.
+COPY graphify-gateway.py graphify-worker.py graphify-requirements.lock graphify-wheel-audit.json graphify-integration.json graphify-typescript-namespaces.patch /tmp/graphify-build/container/
+COPY tests/graphify_engine_contract.py tests/test_graphify_gateway.py tests/test_graphify_worker.py tests/test_graphify_upstream_contract.py tests/test_graphify_supply_chain.py /tmp/graphify-build/container/tests/
 COPY skills/graphify/SKILL.md /tmp/graphify-build/container/skills/graphify/SKILL.md
 COPY --from=graphify-release-adapter update-graphify.ts /tmp/graphify-build/scripts/update-graphify.ts
-RUN GRAPHIFY_TAG="$(jq -r '.upstream.tag' /opt/graphify/graphify-integration.json)" \
-    && git clone --quiet --depth 1 --branch "$GRAPHIFY_TAG" https://github.com/Graphify-Labs/graphify.git /tmp/graphify-design \
-    && cd /tmp/graphify-build \
+RUN cd /tmp/graphify-build \
     && GRAPHIFY_WHEELHOUSE=/opt/graphify/wheelhouse /opt/graphify/bin/python -m unittest discover -s container/tests -p 'test_graphify_*.py' \
-    && rm -rf /tmp/graphify-build /tmp/graphify-design
+    && rm -rf /tmp/graphify-build
 
 # Login shells reset PATH on Debian and can drop Docker ENV-provided /pnpm,
 # which makes globally installed CLIs invisible to Codex/OpenCode shell tools.

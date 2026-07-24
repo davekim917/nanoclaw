@@ -512,6 +512,43 @@ describe('WorkgroupGraphDaemon', () => {
     await daemon.close();
   });
 
+  it('indexes workgroup files and every sibling agent folder without crossing workgroup boundaries', async () => {
+    const f = fixture();
+    const db = new Database(f.central);
+    db.exec(`
+      INSERT INTO agent_groups VALUES ('ag-b', 'madison-codex', 'madison');
+      INSERT INTO workgroups VALUES ('other');
+      INSERT INTO agent_groups VALUES ('ag-other', 'other-agent', 'other');
+    `);
+    db.close();
+    mkdirSync(join(f.data, 'workgroups', 'madison'), { recursive: true });
+    mkdirSync(join(f.groups, 'madison-codex'));
+    mkdirSync(join(f.groups, 'other-agent'));
+    writeFileSync(join(f.data, 'workgroups', 'madison', 'shared.md'), 'shared workgroup operating decision');
+    writeFileSync(join(f.groups, 'madison-agent', 'primary.md'), 'primary agent private knowledge');
+    writeFileSync(join(f.groups, 'madison-codex', 'sibling.md'), 'codex sibling private knowledge');
+    writeFileSync(join(f.groups, 'other-agent', 'other.md'), 'other workgroup secret knowledge');
+
+    const daemon = new WorkgroupGraphDaemon({
+      dataDir: f.data,
+      groupsDir: f.groups,
+      centralDbPath: f.central,
+      enableEnrichment: false,
+    });
+    await daemon.refreshCatalog();
+    await daemon.ensureFresh('madison');
+
+    const evidenceFor = async (query: string): Promise<string[]> =>
+      (await daemon.query('madison', query)).nodes.flatMap((node) =>
+        node.evidence.map((evidence) => evidence.relativePath),
+      );
+    expect(await evidenceFor('shared workgroup operating')).toContain('workgroup/shared.md');
+    expect(await evidenceFor('primary agent private')).toContain('agents/ag-a/primary.md');
+    expect(await evidenceFor('codex sibling private')).toContain('agents/ag-b/sibling.md');
+    expect(await evidenceFor('other workgroup secret')).toHaveLength(0);
+    await daemon.close();
+  });
+
   it('resolves unique labels and rejects ambiguous or unknown graph references', async () => {
     const f = fixture();
     mkdirSync(join(f.groups, 'madison-agent', 'one'));

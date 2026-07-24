@@ -471,7 +471,7 @@ export class WorkgroupGraphDaemon {
       (this.enableEnrichment && options.containerImage
         ? new GraphifyCodeWorker({
             image: options.containerImage,
-            graphifyVersion: options.graphifyVersion ?? '0.9.20',
+            graphifyVersion: options.graphifyVersion ?? '0.9.25',
             tempRoot: jobsRoot,
             installLabel: options.installLabel,
           })

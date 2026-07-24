@@ -68,11 +68,15 @@ Remote URL ingest is rejected. Media transcription and visual graph exports are
 deferred. The container intentionally omits the video/Whisper dependency set
 until an offline, resource-bounded model is part of the runtime contract.
 
-Graphify `0.9.20` and its complete wheel closure are hash-pinned. The integration
-manifest also hashes upstream semantic surfaces and records whether each
-upstream capability is adopted, implemented differently, deferred, or rejected.
-`/update-container` uses `scripts/update-graphify.ts` to refresh this adapter and
-re-run its drift and supply-chain checks.
+Graphify `0.9.25` and its complete wheel closure are hash-pinned. The integration
+manifest records NanoClaw's adapter capability decisions and a temporary
+TypeScript namespace compatibility patch. `/update-container` uses
+`scripts/update-graphify.ts` to install the candidate engine in isolation and
+run a black-box extraction contract before refreshing the ARM64 supply-chain
+lock. When an unmodified upstream release passes that contract, the updater
+retires the patch automatically. Upstream skills, prompts, watcher code, and
+internal source layout have independent lifecycles and do not block engine
+updates.
 
 ## Agent and operator interface
 

@@ -2,7 +2,7 @@
 # Latest-stable, wheel-only graphifyy dependency set. Enabled extras: pdf, office, sql, terraform.
 beautifulsoup4==4.15.0 --hash=sha256:d6f88de62e1d4e38ecb1077eb9724cd0eff29d2a08ca16a401e9b9e93f117cf9 # beautifulsoup4-4.15.0-py3-none-any.whl
 et-xmlfile==2.0.0 --hash=sha256:7a91720bc756843502c3b7504c77b8fe44217c85c537d85037f0f536151b2caa # et_xmlfile-2.0.0-py3-none-any.whl
-graphifyy==0.9.20 --hash=sha256:5dc067210e8003433c92343db0dd976e17b58956c0b9f27f91a84ae331b74e82 # graphifyy-0.9.20-py3-none-any.whl
+graphifyy==0.9.25 --hash=sha256:e902205873d129e9c76c11fea4268480042603590290ed600707354e74314c0c # graphifyy-0.9.25-py3-none-any.whl
 lxml==6.1.1 --hash=sha256:a4bbea04c97f6d78a48e3fbc1cb9116d2780b1b39e03a23f6eb9b603fd61f510 # lxml-6.1.1-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.whl
 markdownify==1.2.3 --hash=sha256:a189a0bedfd14009030fde5f85bb6f77c56897cb839b5c25315dd7d4e3e290ba # markdownify-1.2.3-py3-none-any.whl
 networkx==3.6.1 --hash=sha256:d47fbf302e7d9cbbb9e2555a0d267983d2aa476bac30e90dfbe5669bd57f3762 # networkx-3.6.1-py3-none-any.whl
@@ -12,7 +12,7 @@ pypdf==6.14.2 --hash=sha256:3f07891af76dc002657e04993ab9b4de81de29f9013b9761d0b7
 python-docx==1.2.0 --hash=sha256:3fd478f3250fbbbfd3b94fe1e985955737c145627498896a8a6bf81f4baf66c7 # python_docx-1.2.0-py3-none-any.whl
 rapidfuzz==3.13.0 --hash=sha256:98e0bfa602e1942d542de077baf15d658bd9d5dcfe9b762aff791724c1c38b70 # rapidfuzz-3.13.0-cp311-cp311-manylinux_2_17_aarch64.manylinux2014_aarch64.whl
 six==1.17.0 --hash=sha256:4721f391ed90541fddacab5acf947aa0d3dc7d27b2e1e8eda2be8970586c3274 # six-1.17.0-py2.py3-none-any.whl
-soupsieve==2.9 --hash=sha256:a2b2c76d67df2382d245409fd71e321a571717e58463efa32ace87dcadac2c12 # soupsieve-2.9-py3-none-any.whl
+soupsieve==2.9.1 --hash=sha256:4f4477399246b7a0c720a88ca2454b11cd6bb9ae4c9d170140786e916776c14c # soupsieve-2.9.1-py3-none-any.whl
 tree-sitter==0.25.2 --hash=sha256:1799609636c0193e16c38f366bda5af15b1ce476df79ddaae7dd274df9e44266 # tree_sitter-0.25.2-cp311-cp311-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl
 tree-sitter-bash==0.25.1 --hash=sha256:e76c4cfb20b076552406782b7f8c2a3946835993df0a44df006de54b7030c7dc # tree_sitter_bash-0.25.1-cp310-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl
 tree-sitter-c==0.24.2 --hash=sha256:c098bedcd5ac86ff93fa734d51d1dd86aed40fd5ed7d634c7af11380a0469969 # tree_sitter_c-0.24.2-cp310-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.manylinux_2_28_aarch64.whl
