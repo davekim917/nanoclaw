@@ -339,7 +339,8 @@ extra. Channel and provider code ships on long-lived branches (`channels`,
 `providers`) that the host merge above doesn't touch — so stopping here leaves
 that code on whatever version you installed, which is how an important upstream
 fix gets silently left behind. The default is to continue into `/update-skills`,
-which re-applies your installed channels/providers to pull their latest code.
+which compatibility-audits your installed channels/providers and re-applies
+only candidates that preserve newer local integration and custom behavior.
 
 Detect whether anything is installed: read `src/channels/index.ts` and
 `src/providers/index.ts`, collecting `import './<name>.js';` lines (excluding
@@ -354,8 +355,8 @@ Name the installed skills in the question so the choice is concrete:
   channels/providers (<list the detected ones>) ride separate branches the host
   update didn't touch. Continue into `/update-skills` to bring them up to date?"
 - Option 1 (Recommended): "Continue into skill updates" — description: "Runs
-  `/update-skills`, which re-applies your installed channels/providers to pull
-  their latest upstream code. You pick which ones there."
+  `/update-skills`, which compares installed code with branch candidates and
+  re-applies only compatibility-cleared updates. You pick which ones there."
 - Option 2: "Skip — I'll run `/update-skills` myself later" — description: "Your
   installed skill code stays as-is and may be behind upstream."
 
@@ -366,6 +367,9 @@ Keep it to these two options — the per-skill selection lives inside
   touches container code, `/update-skills` rebuilds the agent image itself — see
   its Step 4 — so nothing container-related is owed back here.)
 - On "Skip": note that `/update-skills` can be run anytime, then proceed.
+- If `/update-skills` correctly skips a candidate because replay would regress
+  local behavior, treat that as a resolved preservation result, not an
+  unresolved migration or evidence that the live adapter is stale.
 
 ## Known behavior changes when channel adapters update
 

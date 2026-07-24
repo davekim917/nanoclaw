@@ -1,13 +1,19 @@
 ---
 name: update-skills
-description: Re-apply your installed skills to pull their latest code from upstream.
+description: Safely refresh installed channel and provider skills from their long-lived branches without overwriting newer or customized local behavior. Use after an upstream NanoClaw update or when installed adapter/provider code may be stale.
 ---
 
 # About
 
-Each skill is a self-installing additive unit: its folder under `.claude/skills/<name>/` carries its own apply steps (`SKILL.md`), and channel/provider skills fetch their code files from a long-lived upstream branch (`channels`, `providers`) with `git fetch origin <branch>` + `git show origin/<branch>:path > path`. Every apply is idempotent and safe to re-run.
+Each skill is a self-installing additive unit: its folder under
+`.claude/skills/<name>/` carries its own apply steps (`SKILL.md`), and
+channel/provider skills fetch code files from a long-lived branch (`channels`,
+`providers`).
 
-Updating a skill means **re-running its own apply**. The apply re-fetches the latest files from upstream and overwrites the copied-in code, so newer versions land additively.
+Those branch copies are update candidates, not automatically authoritative.
+An installed file may contain newer trunk integration or operator
+customizations that the branch does not. Never re-run an apply until a
+candidate comparison proves that it will not remove required local behavior.
 
 Run `/update-skills` in Claude Code.
 
@@ -19,16 +25,26 @@ Run `/update-skills` in Claude Code.
 
 **Selection**: presents the installed skills and lets you pick which to re-apply.
 
-**Re-apply**: invokes each selected skill's own apply (e.g. `/add-slack`), which fetches its latest files. Then validates with build + test.
+**Compatibility preview**: compares every candidate branch file with the live
+copy and blocks destructive or stale replays.
+
+**Re-apply**: invokes only the skills whose candidate payload clears that
+preview. Then validates with build + tests.
 
 ---
 
 # Goal
-Help users pull the latest skill code from upstream by re-applying their installed skills, without losing local customizations and without merging any branch.
+Help users pull the latest skill code from upstream without losing local
+customizations and without merging any branch.
 
 # Operating principles
 - Never proceed with a dirty working tree.
-- Re-apply each skill through its own idempotent apply step — re-applying overwrites only that skill's code files; credentials, wiring, and DB state are untouched.
+- Treat local customization behavior as the release-blocking invariant.
+- Never call an overwrite idempotent merely because repeating it produces the
+  same branch copy. Idempotence does not prove compatibility.
+- Re-apply a skill through its own apply step only after the candidate payload
+  proves it will preserve newer local integration and custom behavior.
+- Credentials, wiring, and DB state stay untouched.
 - Keep token usage low: detect installed skills with `git` and barrel reads; let each skill's apply do its own fetching.
 
 # Step 0: Preflight
@@ -70,17 +86,47 @@ If installed channel/provider skills are found:
   - Add an option: "Skip — don't update any skills now".
 - If the user selects Skip, stop here.
 
-# Step 3: Re-apply each selected skill
+# Step 3: Preview each selected payload
+
+Process one skill at a time. Read its complete `SKILL.md` and collect every path
+owned by its copy directives or shell `git show` commands. For each path:
+
+1. Confirm the path exists on the candidate branch. A candidate missing a file
+   required by the current installer or registration tests is `BLOCK`.
+2. Compare the candidate bytes with the live file without overwriting it:
+   `cmp -s <(git show origin/<branch>:<path>) <path>`.
+3. For every difference, inspect the complete candidate-to-live diff and the
+   live file's relevant non-merge history. Classify live-only changes as:
+   - required local customization or newer trunk integration;
+   - an obsolete implementation with a proven candidate replacement; or
+   - ambiguous.
+4. Build a preservation row for every functional live-only change:
+
+   ```
+   intent + provenance | integration point | preservation requirement | targeted verification
+   ```
+
+Any candidate that would delete a required or ambiguous live-only change is
+`BLOCK`; skip that skill and report it as "refresh correctly skipped: candidate
+would regress local behavior." Do not invoke its add skill, copy a subset
+blindly, or describe the live code as stale.
+
+A candidate may proceed only when all differences are additive or every
+removed behavior has a proven compatible replacement and targeted
+verification. Generic build and full-suite success do not replace this
+comparison.
+
+# Step 4: Re-apply each cleared skill
 
 For each selected skill (process one at a time):
 
-1. Tell the user which skill is being re-applied.
+1. Tell the user which compatibility-cleared skill is being re-applied.
 2. Invoke the corresponding `/add-<name>` skill using the Skill tool.
    - Its apply runs its own pre-flight, fetches the latest files from upstream (`git fetch origin <branch>` + `git show origin/<branch>:path > path`), overwrites the copied-in code, and installs any pinned dependency.
    - Re-applying is additive: it refreshes only that skill's own files. The barrel import line is left in place if already present, and `.env` credentials and DB wiring are untouched.
 3. If a skill's apply reports a problem (a missing upstream file, a failing dependency install), record it and continue with the remaining skills.
 
-# Step 4: Validation
+# Step 5: Validation
 
 After all selected skills are re-applied:
 - `pnpm run build`
@@ -89,17 +135,21 @@ After all selected skills are re-applied:
 
 Each channel/provider skill copies in its own registration test; those run as part of `pnpm test` and assert the barrel still registers the adapter against the freshly fetched code.
 
+Also run every targeted verification recorded in Step 3. A skipped or failed
+preservation check is a failed refresh even when the generic suite passes.
+
 If build fails:
 - Show the error.
 - Only fix issues clearly caused by the refreshed code (missing imports, type mismatches).
 - Do not refactor unrelated code.
 - If unclear, ask the user.
 
-# Step 5: Summary
+# Step 6: Summary
 
 Show:
 - Skills re-applied (list)
-- Skills skipped or that reported problems (if any)
+- Skills correctly skipped because their candidate would regress local behavior
+- Skills skipped or that reported other problems (if any)
 - New HEAD: `git rev-parse --short HEAD`
 
 If the service is running, remind the user to restart it to pick up the refreshed code.
