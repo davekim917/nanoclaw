@@ -40,6 +40,13 @@ const TURN_BLOCKING_ITEM_TYPES = new Set([
   'imageGeneration',
 ]);
 
+// Codex 0.144.x includes the final ThreadItems in turn/completed. Under load,
+// the app-server can omit an individual item/completed notification even
+// though that final snapshot marks the item terminal. Treat the completed-turn
+// snapshot as the authoritative reconciliation source while keeping unknown
+// and in-progress statuses fail-closed.
+const TERMINAL_ITEM_STATUSES = new Set(['completed', 'failed', 'declined']);
+
 /**
  * Normalize the app-server's version-dependent thread status shape.
  * Unknown shapes deliberately fail open: a responsive future Codex version
@@ -93,7 +100,8 @@ export class CodexTurnLiveness {
     this.noteNotification();
   }
 
-  noteTurnEnded(): CodexLivenessDecision {
+  noteTurnEnded(turn?: unknown): CodexLivenessDecision {
+    this.reconcileTerminalTurnItems(turn);
     const unfinishedExecutionItems = [...this.openItems]
       .filter(([, type]) => TURN_BLOCKING_ITEM_TYPES.has(type))
       .map(([id, type]) => `${type}:${id}`);
@@ -107,6 +115,21 @@ export class CodexTurnLiveness {
       };
     }
     return { kind: 'healthy' };
+  }
+
+  private reconcileTerminalTurnItems(turn: unknown): void {
+    if (!turn || typeof turn !== 'object') return;
+    const items = (turn as { items?: unknown }).items;
+    if (!Array.isArray(items)) return;
+
+    for (const item of items) {
+      const parsed = parseItemIdentity(item);
+      if (!parsed || this.openItems.get(parsed.id) !== parsed.type) continue;
+      const status = (item as Record<string, unknown>).status;
+      if (typeof status === 'string' && TERMINAL_ITEM_STATUSES.has(status)) {
+        this.openItems.delete(parsed.id);
+      }
+    }
   }
 
   noteProbeFailure(reason: string): CodexLivenessDecision {

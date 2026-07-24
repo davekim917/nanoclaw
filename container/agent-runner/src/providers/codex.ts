@@ -1429,7 +1429,7 @@ export async function* runOneTurn(
     } else if (method === 'item/completed') {
       liveness.noteItemCompleted(params.item);
     } else if (method === 'turn/completed' || method === 'turn/failed') {
-      turnEndDecision = liveness.noteTurnEnded();
+      turnEndDecision = liveness.noteTurnEnded(params.turn);
     } else {
       liveness.noteNotification();
     }

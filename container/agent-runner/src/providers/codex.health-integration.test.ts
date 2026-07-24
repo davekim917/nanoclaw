@@ -139,8 +139,15 @@ describe('runOneTurn Codex control-plane health integration', () => {
     });
 
     const resultPromise = collectTurn(fixture.server);
-    fixture.emit('item/started', { item: { id: 'command-1', type: 'commandExecution' } });
-    fixture.emit('turn/completed', { status: 'completed' });
+    fixture.emit('item/started', {
+      item: { id: 'command-1', type: 'commandExecution', status: 'inProgress' },
+    });
+    fixture.emit('turn/completed', {
+      turn: {
+        status: 'completed',
+        items: [{ id: 'command-1', type: 'commandExecution', status: 'inProgress' }],
+      },
+    });
     const events = await resultPromise;
 
     expect(events.find((event) => event.type === 'error')).toMatchObject({
@@ -148,6 +155,29 @@ describe('runOneTurn Codex control-plane health integration', () => {
       classification: 'protocol_desync',
     });
     expect(events.some((event) => event.type === 'result')).toBe(false);
+  });
+
+  it('accepts a successful turn whose final snapshot closes a missed command completion notification', async () => {
+    const fixture = fakeServer((request) => {
+      if (request.method === 'turn/start') return { result: { turn: { id: 'turn-1' } } };
+      return { error: { code: -32601, message: 'unexpected method' } };
+    });
+
+    const resultPromise = collectTurn(fixture.server);
+    fixture.emit('item/started', {
+      item: { id: 'command-1', type: 'commandExecution', status: 'inProgress' },
+    });
+    fixture.emit('item/agentMessage/delta', { delta: 'completed result' });
+    fixture.emit('turn/completed', {
+      turn: {
+        status: 'completed',
+        items: [{ id: 'command-1', type: 'commandExecution', status: 'completed', exitCode: 0 }],
+      },
+    });
+    const events = await resultPromise;
+
+    expect(events.some((event) => event.type === 'error')).toBe(false);
+    expect(events.at(-1)).toMatchObject({ type: 'result', text: 'completed result' });
   });
 
   it('preserves a current-schema failed turn instead of misclassifying its open command as desync', async () => {

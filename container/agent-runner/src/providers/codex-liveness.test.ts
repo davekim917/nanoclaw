@@ -59,6 +59,57 @@ describe('CodexTurnLiveness', () => {
     expect(liveness.snapshot().openItems).toEqual([]);
   });
 
+  it('reconciles a missing item/completed notification from the completed turn snapshot', () => {
+    const { liveness } = tracker();
+    liveness.noteItemStarted({ id: 'command-1', type: 'commandExecution', status: 'inProgress' });
+
+    expect(
+      liveness.noteTurnEnded({
+        items: [{ id: 'command-1', type: 'commandExecution', status: 'completed', exitCode: 0 }],
+      }),
+    ).toEqual({ kind: 'healthy' });
+    expect(liveness.snapshot().openItems).toEqual([]);
+  });
+
+  it('keeps recovery enabled when the completed turn snapshot still shows execution in progress', () => {
+    const { liveness } = tracker();
+    liveness.noteItemStarted({ id: 'command-1', type: 'commandExecution', status: 'inProgress' });
+
+    expect(
+      liveness.noteTurnEnded({
+        items: [{ id: 'command-1', type: 'commandExecution', status: 'inProgress' }],
+      }),
+    ).toEqual({
+      kind: 'recover',
+      classification: 'protocol_desync',
+      reason: 'Codex turn completed with unfinished execution items: commandExecution:command-1',
+    });
+  });
+
+  it('does not reconcile an open item from an unrelated terminal item', () => {
+    const { liveness } = tracker();
+    liveness.noteItemStarted({ id: 'command-1', type: 'commandExecution', status: 'inProgress' });
+
+    expect(
+      liveness.noteTurnEnded({
+        items: [{ id: 'command-2', type: 'commandExecution', status: 'completed', exitCode: 0 }],
+      }),
+    ).toMatchObject({ kind: 'recover', classification: 'protocol_desync' });
+  });
+
+  it('reconciles terminal failed and declined execution items without requiring success', () => {
+    for (const status of ['failed', 'declined']) {
+      const { liveness } = tracker();
+      liveness.noteItemStarted({ id: `command-${status}`, type: 'commandExecution', status: 'inProgress' });
+
+      expect(
+        liveness.noteTurnEnded({
+          items: [{ id: `command-${status}`, type: 'commandExecution', status }],
+        }),
+      ).toEqual({ kind: 'healthy' });
+    }
+  });
+
   it('allows a turn to complete with only non-execution lifecycle items open', () => {
     const { liveness } = tracker();
     liveness.noteItemStarted({ id: 'reason-1', type: 'reasoning' });

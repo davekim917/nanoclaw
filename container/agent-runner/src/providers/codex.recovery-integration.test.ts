@@ -100,8 +100,19 @@ lines.on('line', (line) => {
     send({ method: 'turn/started', params: { turnId: 'turn-' + instance } });
     if (instance === 1 && failureMode === 'unfinished-command') {
       setTimeout(() => {
-        send({ method: 'item/started', params: { item: { id: 'command-1', type: 'commandExecution' } } });
-        send({ method: 'turn/completed', params: { status: 'completed' } });
+        send({
+          method: 'item/started',
+          params: { item: { id: 'command-1', type: 'commandExecution', status: 'inProgress' } },
+        });
+        send({
+          method: 'turn/completed',
+          params: {
+            turn: {
+              status: 'completed',
+              items: [{ id: 'command-1', type: 'commandExecution', status: 'inProgress' }],
+            },
+          },
+        });
       }, 5);
     }
     if (instance > 1) {
