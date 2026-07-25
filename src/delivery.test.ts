@@ -943,8 +943,47 @@ describe('per-turn channel-root threading', () => {
     expect(calls).toHaveLength(2);
     // First posts at root (no thread).
     expect(calls[0]).toEqual({ id: 'out-1', threadId: null });
-    // Second threads under the first message's returned platform id.
-    expect(calls[1]).toEqual({ id: 'out-2', threadId: 'plat-1' });
+    // Second threads under the first, addressed as `<platform_id>:<messageId>`.
+    //
+    // This assertion used to expect the BARE `'plat-1'`. That was wrong and it
+    // masked a live bug: adapters decode thread ids as `discord:<guild>:<channel>:
+    // <thread>` / `slack:<channel>:<ts>` and throw ValidationError on anything
+    // else, so in production every follow-up was retried 3x and dropped. The fake
+    // adapter here accepts any string, which is precisely why it never surfaced.
+    // Fixed 2026-07-25 after the madison-reed meeting digest lost 3 of 4 chunks.
+    expect(calls[1]).toEqual({ id: 'out-2', threadId: 'telegram:123:plat-1' });
+  });
+
+  it('falls back to root instead of dropping when threading under the anchor fails', async () => {
+    seedAgentAndChannel();
+    const { session } = resolveSession('ag-1', 'mg-1', null, 'shared');
+    insertChatReply('ag-1', session.id, 'out-1', 'task-fire-A', '2026-05-30T12:00:00.000Z');
+    insertChatReply('ag-1', session.id, 'out-2', 'task-fire-A', '2026-05-30T12:00:01.000Z');
+    insertChatReply('ag-1', session.id, 'out-3', 'task-fire-A', '2026-05-30T12:00:02.000Z');
+
+    const calls: Array<{ id: string; threadId: string | null }> = [];
+    let n = 0;
+    setDeliveryAdapter({
+      async deliver(_channelType, _platformId, threadId, _kind, content) {
+        const id = (JSON.parse(content) as { text: string }).text;
+        calls.push({ id, threadId });
+        // Discord's shape: a thread sharing the parent message's snowflake only
+        // resolves if a thread was actually created. None was, so it 404s.
+        if (threadId !== null) throw new Error('Unknown Channel');
+        return `plat-${++n}`;
+      },
+    });
+
+    await deliverSessionMessages(session);
+
+    // out-2 tries the anchor once, fails, reposts at root. out-3 then goes
+    // straight to root — anchoring is off for the rest of the turn, so it never
+    // pays another failing call.
+    expect(calls.map((c) => c.threadId)).toEqual([null, 'telegram:123:plat-1', null, null]);
+    // The property that actually matters: nothing was dropped.
+    expect(new Set(calls.map((c) => c.id))).toEqual(new Set(['out-1', 'out-2', 'out-3']));
+    const delivered = getDeliveredIds(openInboundDb('ag-1', session.id));
+    expect([...delivered].sort()).toEqual(['out-1', 'out-2', 'out-3']);
   });
 
   it('starts a new root thread when the turn (in_reply_to) changes', async () => {

@@ -150,6 +150,15 @@ interface ChatThreadAnchor {
 const chatThreadAnchor = new Map<string, ChatThreadAnchor>();
 
 /**
+ * Sessions whose turn anchor proved unusable, keyed sessionId -> that turn's
+ * `in_reply_to`. Set when a threaded send under the anchor throws; the rest of
+ * that turn then posts at root without re-paying a failing call. A new turn has
+ * a different `in_reply_to`, so threading is retried — a transient failure
+ * costs one turn, not the session.
+ */
+const chatThreadAnchorDisabled = new Map<string, string>();
+
+/**
  * Sessions whose outbound queue is currently being drained.
  *
  * The active poll (1s, running sessions) and the sweep poll (60s, all
@@ -839,7 +848,8 @@ async function deliverMessage(
   const baseThreadId = msg.thread_id && msg.thread_id.length > 0 ? msg.thread_id : null;
   const anchorEligible = baseThreadId === null && msg.in_reply_to != null;
   let effectiveThreadId = baseThreadId;
-  if (anchorEligible) {
+  let usedAnchor = false;
+  if (anchorEligible && chatThreadAnchorDisabled.get(session.id) !== msg.in_reply_to) {
     const anchor = chatThreadAnchor.get(session.id);
     if (
       anchor &&
@@ -847,19 +857,67 @@ async function deliverMessage(
       anchor.channelType === msg.channel_type &&
       anchor.platformId === msg.platform_id
     ) {
-      effectiveThreadId = anchor.messageId;
+      // Adapters decode a thread id as `<platform-address>:<thread>` —
+      // `discord:<guild>:<channel>:<thread>`, `slack:<channel>:<ts>`. `platform_id`
+      // IS that address, so appending the anchor's message id produces the encoded
+      // form both decoders accept.
+      //
+      // This previously passed the BARE message id, which no adapter can decode:
+      // @chat-adapter/discord's decodeThreadId requires parts[0] === 'discord',
+      // slack's requires parts[0] === 'slack'. So every message after a turn's
+      // first threw ValidationError, burned 3 retries, and was dropped — silently
+      // truncating every multi-message scheduled task on both platforms. Observed
+      // 2026-07-25: the madison-reed meeting digest posted its first 1.7KB chunk
+      // and lost the next three ("Invalid Discord thread ID: 1530412025665159280"
+      // — that snowflake is a *message* id, never a thread id).
+      effectiveThreadId = `${anchor.platformId}:${anchor.messageId}`;
+      usedAnchor = true;
     }
   }
 
-  const platformMsgId = await deliveryAdapter.deliver(
-    msg.channel_type,
-    msg.platform_id,
-    effectiveThreadId,
-    msg.kind,
-    scrubbedContent,
-    files,
-    deliverInstance,
-  );
+  let platformMsgId: string | undefined;
+  try {
+    platformMsgId = await deliveryAdapter.deliver(
+      msg.channel_type,
+      msg.platform_id,
+      effectiveThreadId,
+      msg.kind,
+      scrubbedContent,
+      files,
+      deliverInstance,
+    );
+  } catch (err) {
+    if (!usedAnchor) throw err;
+    // Platforms disagree on whether a parent message is addressable as a thread.
+    // Slack threads on the parent's ts, so the encoded anchor works. Discord
+    // needs a real thread object to exist first — a thread started from a message
+    // shares its snowflake, but when none was created the encoded id resolves to
+    // nothing. Never let that cost the message: post at root instead.
+    //
+    // Also record that anchoring is off for the REST OF THIS TURN, so the
+    // remaining messages go straight to root rather than each paying a failed
+    // call. Keyed by in_reply_to, so the next turn retries — a transient error
+    // costs one turn of threading, not the session's.
+    log.warn('Threaded delivery under turn anchor failed — posting at root', {
+      id: msg.id,
+      sessionId: session.id,
+      attemptedThreadId: effectiveThreadId,
+      err: err instanceof Error ? err.message : String(err),
+    });
+    chatThreadAnchor.delete(session.id);
+    chatThreadAnchorDisabled.set(session.id, msg.in_reply_to as string);
+    effectiveThreadId = null;
+    usedAnchor = false;
+    platformMsgId = await deliveryAdapter.deliver(
+      msg.channel_type,
+      msg.platform_id,
+      null,
+      msg.kind,
+      scrubbedContent,
+      files,
+      deliverInstance,
+    );
+  }
 
   // Record the turn's first root post as the anchor for its follow-ups. Only
   // when we actually posted at root (effectiveThreadId still null) — a message
