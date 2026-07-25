@@ -196,6 +196,21 @@ describe('per-model-family effort defaults', () => {
     expect(opts?.effort).toBe('xhigh');
   });
 
+  // The concrete id the `opus` alias now resolves to. Guards the version gate
+  // in defaultEffortForModel/clampEffortForModel: it only special-cases
+  // claude-opus-4-[0-6] (no xhigh before 4.7), so a single-digit Opus 5 id
+  // must fall through to the full ladder, not get clamped down to high.
+  it('test_effort_default_opus5_xhigh: explicit claude-opus-5[1m] defaults to xhigh', () => {
+    const opts = run({ model: 'claude-opus-5[1m]' });
+    expect(opts?.model).toBe('claude-opus-5[1m]');
+    expect(opts?.effort).toBe('xhigh');
+  });
+
+  it('test_effort_xhigh_on_opus5_not_clamped: an explicit -e xhigh survives on Opus 5', () => {
+    const opts = run({ model: 'claude-opus-5[1m]', effort: 'xhigh' });
+    expect(opts?.effort).toBe('xhigh');
+  });
+
   it('test_effort_default_fable_high: -m fable without -e defaults to high (2x-cost model, docs-recommended default)', () => {
     const opts = run({ model: 'claude-fable-5[1m]' });
     expect(opts?.effort).toBe('high');

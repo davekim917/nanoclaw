@@ -75,6 +75,41 @@ const MODEL_ALIAS_MAP: Record<string, string> = {
   'haiku4-5': 'claude-haiku-4-5',
 };
 
+// Default model per family. SINGLE source of truth for what `opus` / `sonnet`
+// / `haiku` mean in this install — both for the spawn env (container-runner
+// pushes these as ANTHROPIC_DEFAULT_*_MODEL) and for the chat ack, so what the
+// user is told is exactly what will run.
+//
+// To change the install-wide default, edit these constants. Per-channel
+// (messaging_group_agents.default_model/effort) and per-group
+// (container.json defaultModel/defaultEffort) layers can still override.
+// Per-session flags (-m / -e) and sticky config override on top of those.
+export const DEFAULT_OPUS_MODEL = 'claude-opus-5[1m]';
+export const DEFAULT_SONNET_MODEL = 'claude-sonnet-5';
+export const DEFAULT_HAIKU_MODEL = 'claude-haiku-4-5-20251001';
+
+/**
+ * Bare FAMILY aliases. Deliberately NOT in MODEL_ALIAS_MAP: storing `opus`
+ * keeps a sticky choice tracking the family default across future bumps,
+ * whereas `opus5` freezes to that version. Resolution happens at the point of
+ * USE (spawn env, chat ack), not at the point of storage.
+ */
+const FAMILY_DEFAULTS: Record<string, string> = {
+  opus: DEFAULT_OPUS_MODEL,
+  sonnet: DEFAULT_SONNET_MODEL,
+  haiku: DEFAULT_HAIKU_MODEL,
+};
+
+/**
+ * The concrete model a raw `-m` value / stored default actually runs as:
+ * family alias → install default, pinned alias → its id, bare opus id → [1m].
+ * Non-Claude values (codex `gpt-*`, opencode slugs) pass through untouched —
+ * no family key collides with them.
+ */
+export function resolveEffectiveModel(raw: string): string {
+  return resolveModelAlias(FAMILY_DEFAULTS[raw.toLowerCase()] ?? raw);
+}
+
 const VALID_MODEL_RE =
   /^(?:opus|sonnet|haiku|default|claude-opus-\d+(?:-\d+)?(?:\[\dm\])?|claude-haiku-\d+-\d+(?:\[\dm\])?|claude-sonnet-\d+(?:\[\dm\])?|claude-fable-\d+(?:\[\dm\])?)$/;
 
@@ -462,6 +497,19 @@ export function parseMessageFlags(rawText: string, provider: string = 'claude'):
 }
 
 /**
+ * Render a stored model value as the fully-qualified id it will actually run
+ * as. A bare family alias (`opus`) is stored unresolved on purpose so it keeps
+ * tracking the install default, but echoing it back tells the user nothing
+ * about which model they got — so resolve it here and name the alias that
+ * produced it, keeping "pinned to a version" visibly distinct from "tracks the
+ * family default".
+ */
+function describeModel(stored: string): string {
+  const effective = resolveEffectiveModel(stored);
+  return effective === stored ? effective : `${effective} (via ${stored})`;
+}
+
+/**
  * Format a structured FlagIntent + warnings/errors into the chat-visible
  * confirmation line. Called by the router to emit an immediate reply.
  */
@@ -471,10 +519,10 @@ export function formatFlagConfirmation(intent: FlagIntent, warnings: string[], e
   if (intent.clearStickyModel) {
     parts.push('sticky model cleared');
   } else if (intent.stickyModel) {
-    parts.push(`model → ${intent.stickyModel}`);
+    parts.push(`model → ${describeModel(intent.stickyModel)}`);
   }
   if (intent.turnModel) {
-    parts.push(`model (this turn) → ${intent.turnModel}`);
+    parts.push(`model (this turn) → ${describeModel(intent.turnModel)}`);
   }
   if (intent.clearStickyEffort) {
     parts.push('sticky effort cleared');

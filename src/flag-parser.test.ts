@@ -11,6 +11,35 @@ import {
 // Exported for the spawn path (container-runner buildContainerArgs): a channel
 // or container.json default stored as a PINNED short alias must resolve before
 // it reaches ANTHROPIC_DEFAULT_OPUS_MODEL, or the API gets an invalid model id.
+// The ack must name the concrete model, never the bare family alias: "model →
+// opus" tells the user nothing about which Opus they got.
+describe('formatFlagConfirmation model rendering', () => {
+  it('resolves a bare family alias to the fully-qualified id', () => {
+    const r = parseMessageFlags('-m opus hi');
+    const ack = formatFlagConfirmation(r.intent ?? {}, r.warnings, r.errors);
+    expect(ack).toContain('claude-opus-5[1m]');
+    expect(ack).not.toBe('⚙️ model → opus');
+    expect(ack).toContain('via opus');
+  });
+
+  it('shows a pinned alias as its id with no "via" noise', () => {
+    const r = parseMessageFlags('-m opus5 hi');
+    expect(formatFlagConfirmation(r.intent ?? {}, r.warnings, r.errors)).toBe('⚙️ model → claude-opus-5[1m]');
+  });
+
+  it('resolves sonnet and haiku family aliases too', () => {
+    const s = parseMessageFlags('-m sonnet hi');
+    expect(formatFlagConfirmation(s.intent ?? {}, s.warnings, s.errors)).toContain('claude-sonnet-5');
+    const h = parseMessageFlags('-m haiku hi');
+    expect(formatFlagConfirmation(h.intent ?? {}, h.warnings, h.errors)).toContain('claude-haiku-4-5');
+  });
+
+  it('applies the same resolution to a per-turn -m1 flag', () => {
+    const r = parseMessageFlags('-m1 opus hi');
+    expect(formatFlagConfirmation(r.intent ?? {}, r.warnings, r.errors)).toContain('claude-opus-5[1m]');
+  });
+});
+
 describe('resolveModelAlias', () => {
   it('resolves pinned short aliases to concrete 1M ids', () => {
     expect(resolveModelAlias('opus5')).toBe('claude-opus-5[1m]');
@@ -296,19 +325,21 @@ describe('parseMessageFlags', () => {
 });
 
 describe('formatFlagConfirmation', () => {
+  // Family aliases render as the concrete id they resolve to — the ack has to
+  // name the model that will actually run, not the alias the user typed.
   it('formats a plain sticky switch', () => {
     const out = formatFlagConfirmation({ stickyModel: 'haiku' }, [], []);
-    expect(out).toBe('⚙️ model → haiku');
+    expect(out).toBe('⚙️ model → claude-haiku-4-5-20251001 (via haiku)');
   });
 
   it('combines model + effort on one line', () => {
     const out = formatFlagConfirmation({ stickyModel: 'opus', stickyEffort: 'high' }, [], []);
-    expect(out).toBe('⚙️ model → opus, effort → high');
+    expect(out).toBe('⚙️ model → claude-opus-5[1m] (via opus), effort → high');
   });
 
   it('appends warnings on their own line', () => {
     const out = formatFlagConfirmation({ stickyModel: 'haiku' }, ["haiku doesn't support effort — skipped effort"], []);
-    expect(out).toContain('⚙️ model → haiku');
+    expect(out).toContain('⚙️ model → claude-haiku-4-5-20251001');
     expect(out).toContain('⚠️');
   });
 

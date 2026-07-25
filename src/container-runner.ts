@@ -44,8 +44,9 @@ import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContaine
 import { checkAgentRunnerDepsDrift } from './agent-runner-image-check.js';
 import { EGRESS_NETWORK, egressNetworkArgs, ensureEgressNetwork } from './egress-lockdown.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
-// resolveModelAlias applies ensureOpus1mSuffix internally — see its use below.
-import { resolveModelAlias } from './flag-parser.js';
+// resolveEffectiveModel applies the family-default map, MODEL_ALIAS_MAP and
+// ensureOpus1mSuffix — see its use below.
+import { resolveEffectiveModel, DEFAULT_OPUS_MODEL, DEFAULT_SONNET_MODEL, DEFAULT_HAIKU_MODEL } from './flag-parser.js';
 import { readEnvFileMatching } from './env.js';
 import { getAgentGroup, getWorkgroupOnecliSecrets, getWorkgroupOnecliSecretsById } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
@@ -108,17 +109,10 @@ export function serializeMcpServersEnv(servers: Record<string, unknown>): string
 // 30s rides out the transient blip without hanging spawns indefinitely.
 const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY, timeout: 30_000 });
 
-// Default model + effort. SINGLE source of truth for what containers
-// resolve `opus` / `sonnet` / `haiku` aliases to and what reasoning
-// effort they use when the user hasn't specified anything.
-//
-// To change the install-wide default, edit these constants. Per-channel
-// (messaging_group_agents.default_model/effort) and per-group
-// (container.json defaultModel/defaultEffort) layers can still override.
-// Per-session flags (-m / -e) and sticky config override on top of those.
-const DEFAULT_OPUS_MODEL = 'claude-opus-5[1m]';
-const DEFAULT_SONNET_MODEL = 'claude-sonnet-5';
-const DEFAULT_HAIKU_MODEL = 'claude-haiku-4-5-20251001';
+// Default model constants moved to flag-parser.ts (DEFAULT_OPUS_MODEL etc.) —
+// the chat ack has to resolve family aliases the same way this spawn path
+// does, and flag-parser is the leaf both can import without a cycle. Edit them
+// there; this file only consumes them.
 // (DEFAULT_EFFORT removed 2026-06-10 — effort defaults are per-model-family
 // in the claude provider; NANOCLAW_EFFORT_OVERRIDE is operator-override-only.)
 
@@ -2497,19 +2491,12 @@ async function buildContainerArgs(
   // 5.1) then propagates on respawn with no DB edit. Without this, the bare
   // alias would reach the API verbatim and 400 (see comment above).
   const rawDefaultModel = channelDefaults?.channelDefaultModel ?? containerConfig.defaultModel ?? DEFAULT_OPUS_MODEL;
-  const familyDefaults: Record<string, string> = {
-    opus: DEFAULT_OPUS_MODEL,
-    sonnet: DEFAULT_SONNET_MODEL,
-    haiku: DEFAULT_HAIKU_MODEL,
-  };
-  // PINNED short aliases (`opus5`, `opus48`, `sonnet5`, `haiku45`, `fable`)
-  // resolve here too — resolveModelAlias covers MODEL_ALIAS_MAP and still
-  // applies ensureOpus1mSuffix to bare/unmapped ids. Without it, the very
-  // spelling the set_channel_model tool documents ("pass a short alias") was
-  // stored verbatim and shipped to the API as an invalid model id. Family
-  // aliases are mapped first so `opus` keeps tracking DEFAULT_OPUS_MODEL
-  // rather than freezing to whatever MODEL_ALIAS_MAP pins.
-  const defaultOpusModel = resolveModelAlias(familyDefaults[rawDefaultModel.toLowerCase()] ?? rawDefaultModel);
+  // resolveEffectiveModel maps family aliases first (so `opus` keeps tracking
+  // DEFAULT_OPUS_MODEL rather than freezing), then PINNED short aliases
+  // (`opus5`, `opus48`, `sonnet5`, `fable`), then applies ensureOpus1mSuffix to
+  // bare ids. The chat ack calls the same function, so the confirmation the
+  // user sees is exactly what lands in ANTHROPIC_DEFAULT_OPUS_MODEL here.
+  const defaultOpusModel = resolveEffectiveModel(rawDefaultModel);
   args.push('-e', `ANTHROPIC_DEFAULT_OPUS_MODEL=${defaultOpusModel}`);
   args.push('-e', `ANTHROPIC_DEFAULT_SONNET_MODEL=${DEFAULT_SONNET_MODEL}`);
   args.push('-e', `ANTHROPIC_DEFAULT_HAIKU_MODEL=${DEFAULT_HAIKU_MODEL}`);
