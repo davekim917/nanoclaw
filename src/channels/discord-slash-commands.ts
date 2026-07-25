@@ -259,6 +259,15 @@ export const UPDATE_CONTAINER_PROMPT = [
   '- bootstrap: Codex-synced files; these belong in a separate bootstrap-repository PR.',
   'Latest stable includes major versions. Show the exact item IDs and ask which IDs to update. This is the approval gate; do not clone, edit, branch, commit, push, or open a PR before the user answers.',
   '',
+  // Added after @onecli-sh/sdk ^0.5.0 -> ^2.8.0 (#135) took the whole fleet down
+  // on 2026-07-25. That bump passed every gate the prompt asked for: it touched
+  // only package.json + pnpm-lock.yaml, build and tests were green, and the
+  // method names the host calls were unchanged across both majors. Only the HTTP
+  // path moved (/api -> /v1), against a gateway that serves only /api. Two
+  // reporting duties exist because of it:
+  "For every host or container item, report `git show upstream/main:<manifest>`'s pin NEXT TO latest-stable, and say explicitly when they differ. For anything exact-pinned, upstream parity is the DEFAULT recommendation and latest-stable is the exception — an exact pin is usually load-bearing, and upstream is the strongest evidence about what a version is compatible with. Never present latest-stable as the only option.",
+  'Flag any item that is one half of a client/server pair with something running locally — an SDK whose service is a container or daemon on this host (`@onecli-sh/sdk` and the OneCLI gateway are the known case). These CANNOT be validated by compiling: the client and server share a wire contract that no type or unit test sees, so a version-skewed pair type-checks perfectly and fails at the first real call. Say which local component must move in the same change, and treat the pair as one item that is approved or skipped together — never bundle it into a bulk bump.',
+  '',
   'After approval, create writable clones. Never edit /workspace/project in place.',
   'Keep host and container changes in separate NanoClaw PRs because their activation and rollback boundaries differ. Keep bootstrap changes in a separate bootstrap PR.',
   'In each NanoClaw clone, rerun the audit, then apply only the approved IDs:',
@@ -266,7 +275,8 @@ export const UPDATE_CONTAINER_PROMPT = [
   'If Graphify fails its installed-engine behavior contract, or the temporary compatibility patch no longer repairs it, stop and route it to a dedicated Graphify-review PR.',
   '',
   'Validate before publishing:',
-  '- host: `pnpm install --frozen-lockfile && pnpm run build && pnpm test`.',
+  '- host: `pnpm install --frozen-lockfile && pnpm run build && pnpm test`, plus `pnpm run lint` and `pnpm run format:check` — CI runs format:check, and the pre-commit hook would otherwise leak an unrelated reformat into the next PR.',
+  '- client/server pairs: a LIVE call against the running service, not a compile. For the OneCLI SDK that means constructing the client the way `src/container-runner.ts` does and invoking a real method; a green build proves nothing about the wire contract. If you cannot make that call, say so and mark the item unverified rather than validated.',
   '- container: `cd container/agent-runner && bun install --frozen-lockfile && bun test`, then from the repo root run `pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit` and the Graphify Python contracts when Graphify changed.',
   '- Graphify: require the installed-engine behavior, supply-chain, and runtime acceptance checks before publishing.',
   // No models-cache reset here on purpose. ~/.codex/models_cache.json carries no
