@@ -26,7 +26,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "check:graphify-runtime": "pnpm run build && node dist/graphify-daemon/runtime-acceptance.js",
-    "build:dashboard": "cd dashboard && pnpm install --ignore-workspace && pnpm vite build"
+    "build:dashboard": "cd dashboard && pnpm install --ignore-workspace --frozen-lockfile && pnpm vite build"
   },
   "dependencies": {
     "@chat-adapter/discord": "4.29.0",
