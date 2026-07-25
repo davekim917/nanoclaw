@@ -29,6 +29,22 @@ if ! git pull origin main >> "$LOG" 2>&1; then
   exit 1
 fi
 
+# Fail fast if the pull advanced package.json past the upgrade marker.
+# src/index.ts:145 runs enforceUpgradeTripwire(), which process.exit(1)s when
+# data/upgrade-state.json's version != package.json's. Without this gate the
+# restart crash-loops AND goes silent: write_status "ok" is written *before*
+# the restart, and the "Deploy complete" announcement only fires from a
+# successful boot — so Discord reports nothing at all. Catch it here, where
+# the poller in the still-alive host process can still report the failure.
+write_status "running" "upgrade marker" ""
+CODE_VER=$(node -p "require('./package.json').version" 2>/dev/null)
+MARKER_VER=$(node -p "require('./data/upgrade-state.json').version" 2>/dev/null)
+if [ "$CODE_VER" != "$MARKER_VER" ]; then
+  write_status "failed" "upgrade marker" \
+    "code ${CODE_VER} != marker ${MARKER_VER:-none} — run /update-nanoclaw (do NOT hand-stamp unless the upgrade really completed)"
+  exit 1
+fi
+
 write_status "running" "install" ""
 if ! pnpm install --frozen-lockfile >> "$LOG" 2>&1; then
   write_status "failed" "install" "pnpm install failed — check deploy.log"
@@ -36,6 +52,10 @@ if ! pnpm install --frozen-lockfile >> "$LOG" 2>&1; then
 fi
 
 write_status "running" "build" ""
+# `build` is bare `tsc` — it never prunes dist/. A renamed or deleted source
+# file leaves an orphan .js behind that the service (ExecStart runs
+# dist/index.js) still resolves at runtime. Clean first.
+rm -rf dist
 if ! pnpm run build >> "$LOG" 2>&1; then
   write_status "failed" "build" "TypeScript build failed"
   exit 1
