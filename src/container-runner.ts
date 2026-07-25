@@ -107,18 +107,22 @@ export function serializeMcpServersEnv(servers: Record<string, unknown>): string
 // stale containers against it at once. A 5s abort there fails the spawn and
 // forces a ~60s sweep-retry (observed delaying the opencode-sibling spawns).
 // 30s rides out the transient blip without hanging spawns indefinitely.
-// @onecli-sh/sdk is EXACT-pinned at 0.5.0 and must stay that way until the
-// gateway is upgraded in the same change. OneCLI ships as two components (SDK +
-// gateway container) and they share a wire contract: 0.5.x calls `/api/*`, 2.x
-// calls `/v1/*`. Our gateway (ghcr.io/onecli/onecli, running since 2026-05-16)
-// serves `/api/agents` 200 and `/v1/agents` 404.
+// @onecli-sh/sdk is EXACT-pinned, and the pin is COUPLED TO THE GATEWAY VERSION.
+// OneCLI ships as two components (SDK + gateway container) sharing a wire
+// contract: 0.5.x calls `/api/*`, 2.x calls `/v1/*`. Both must move together.
 //
-// A blind `^0.5.0` -> `^2.8.0` bump in #135 took the whole fleet down for ~1h:
-// ensureAgent 404'd, so every spawn aborted, and the host sweep retried at WARN
-// forever with no escalation. Nothing caught it — build and tests pass because
-// neither touches the live gateway, and the method names are IDENTICAL across
-// both majors (only the path moved), so a surface/type check cannot see it.
-// Verify any future bump against a running gateway, not by compiling.
+// Current state (2026-07-25): SDK 2.2.1 — upstream's pin — against gateway
+// v1.42.0. Verified live rather than by compiling: getGatewaySkill() returns
+// 200. v1.42.0 serves BOTH prefixes, which is why `src/onecli-secrets.ts`'s raw
+// `/api/<resource>` call still works; don't assume that holds forever.
+//
+// History worth not repeating: a blind `^0.5.0` -> `^2.8.0` bump in #135 took
+// the whole fleet down for ~1h against the then-current v1.18.6 gateway, which
+// served only `/api`. ensureAgent 404'd, every spawn aborted, and the sweep
+// retried at WARN forever with no escalation. Nothing caught it — build and
+// tests pass because neither touches the live gateway, and the method names are
+// IDENTICAL across both majors (only the path moved), so a surface or type check
+// cannot see it. Verify any future bump by CALLING a running gateway.
 const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY, timeout: 30_000 });
 
 // Default model constants moved to flag-parser.ts (DEFAULT_OPUS_MODEL etc.) —
