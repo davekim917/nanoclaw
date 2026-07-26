@@ -46,6 +46,11 @@ const NATIVE_RUNTIME_SKILLS_POINTER = [
   'Skills YOU author or install yourself go in `~/.codex/skills/<name>/SKILL.md` — persistent across sessions and discovered by Codex automatically. Never write skills elsewhere: paths outside `~/.codex` and `~/.agents` are ephemeral or not discovered.',
 ].join('\n\n');
 
+const FEATURE_WORK_ROUTING = [
+  'For work that needs an explicit contract because it changes behavior, crosses a trust boundary, has meaningful rollback risk, or benefits from coordinated implementation, start with `/team-plan`. File count alone does not decide: a mechanical multi-file edit may stay small, while a one-file credential migration needs deep review.',
+  'After the user approves `plan.md`, run `/team-build`, then `/team-review --implementation`. `/team-auto` may run an approved plan through build and implementation review, but it never ships. `/team-ship` is a separate human-controlled publish or merge boundary. Trivial fixes, config changes, and conversation do not need the workflow.',
+].join('\n\n');
+
 interface AgentsMdSection {
   name: string;
   content: string;
@@ -80,6 +85,7 @@ export function composeGroupAgentsMd(group: AgentGroup, groupDir: string): void 
 
   pushSection('Memory System', MEMORY_POINTER);
   pushSection('Native Runtime Skills', NATIVE_RUNTIME_SKILLS_POINTER);
+  pushSection('Feature Work Routing', FEATURE_WORK_ROUTING);
 
   const cliDisabled = configRow?.cli_scope === 'disabled';
   const mcpToolsHostDir = path.join(process.cwd(), MCP_TOOLS_HOST_SUBPATH);

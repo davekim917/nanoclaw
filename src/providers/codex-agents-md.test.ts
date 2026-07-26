@@ -65,6 +65,14 @@ describe('composeGroupAgentsMd cap handling', () => {
       expect(doc).toContain('write_memory_file');
       expect(doc).not.toContain('preferences are binding');
       expect(doc).not.toContain('memories, data');
+      expect(doc).toContain('start with `/team-plan`');
+      expect(doc).toContain('/team-build');
+      expect(doc).toContain('/team-review --implementation');
+      expect(doc).toContain('/team-auto');
+      expect(doc).toContain('/team-ship');
+      expect(doc).not.toContain('/team-brief');
+      expect(doc).not.toContain('/team-design');
+      expect(doc).not.toContain('/team-qa');
       expect(Buffer.byteLength(doc, 'utf-8')).toBeLessThanOrEqual(CODEX_PROJECT_DOC_MAX_BYTES);
     } finally {
       fs.rmSync(groupDir, { recursive: true, force: true });
