@@ -8,7 +8,7 @@
  * the SDK tells us whether it's a transient window limit or genuinely no credits.
  */
 import { describe, expect, it } from 'bun:test';
-import { classifyRateLimitEvent } from './claude.js';
+import { ClaudeProvider, classifyRateLimitEvent } from './claude.js';
 
 describe('classifyRateLimitEvent', () => {
   it('ignores informational events — the turn must not be disturbed', () => {
@@ -44,5 +44,25 @@ describe('classifyRateLimitEvent', () => {
     const byOverage = classifyRateLimitEvent({ status: 'rejected', overageDisabledReason: 'out_of_credits' });
     expect(byOverage!.classification).toBe('quota');
     expect(byOverage!.message).toContain('Out of credits');
+  });
+
+  it('makes structured rejected-window and quota events eligible for credential rotation', () => {
+    const provider = new ClaudeProvider();
+    const quota = Object.assign(new Error('Out of credits [seven_day]'), {
+      classification: 'quota',
+      retryable: false,
+    });
+    const window = Object.assign(new Error('Request blocked by upstream window'), {
+      classification: 'rate_limit',
+      retryable: false,
+    });
+    const billing = Object.assign(new Error('Billing account disabled'), {
+      classification: 'billing',
+      retryable: false,
+    });
+
+    expect(provider.isRetryable(quota)).toBe(true);
+    expect(provider.isRetryable(window)).toBe(true);
+    expect(provider.isRetryable(billing)).toBe(false);
   });
 });

@@ -1540,6 +1540,11 @@ export class ClaudeProvider implements AgentProvider {
   }
 
   isRetryable(err: unknown): boolean {
+    const classification =
+      typeof err === 'object' && err !== null && 'classification' in err
+        ? (err as { classification?: unknown }).classification
+        : undefined;
+    if (classification === 'quota' || classification === 'rate_limit') return true;
     const msg = err instanceof Error ? err.message : String(err);
     return RETRYABLE_ERROR_RE.test(msg);
   }
