@@ -112,6 +112,27 @@ afterEach(() => {
   fs.rmSync(TEST_ROOT, { recursive: true, force: true });
 });
 
+describe('container instruction contracts', () => {
+  it('routes Claude and OpenCode through the current seven-skill workflow', () => {
+    const retiredRoutes = ['/team-brief', '/team-design', '/team-qa'];
+    const instructions = fs.readFileSync(path.join(process.cwd(), 'container/CLAUDE.md'), 'utf-8');
+    expect(instructions).toContain('start with `/team-plan`');
+    expect(instructions).toContain('/team-build');
+    expect(instructions).toContain('/team-review --implementation');
+    expect(instructions).toContain('/team-auto');
+    expect(instructions).toContain('/team-ship');
+    for (const retired of retiredRoutes) expect(instructions).not.toContain(retired);
+  });
+
+  it('keeps nested-container Codex delegation on the supported foreground transport', () => {
+    const instructions = fs.readFileSync(path.join(process.cwd(), 'container/CLAUDE.md'), 'utf-8');
+    expect(instructions).toContain('codex exec --yolo');
+    expect(instructions).toContain("`timeout` to `3600000`");
+    expect(instructions).not.toContain('`timeout` to `600000`');
+    expect(instructions).not.toContain('team-qa/team-review');
+  });
+});
+
 describe('initGroupFilesystem agent surfaces', () => {
   it('preserves local instructions and stages default Claude support files', () => {
     const ag = group('ag-default', 'default-group');

@@ -144,7 +144,7 @@ here — their companion runtime hardcodes a read-only/workspace-write
 sandbox that cannot create its namespaces under nested Docker, so they
 fail with sandbox errors. The container is already the isolation
 boundary; `--yolo` (no inner sandbox) is the correct mode and is exactly
-how the team-qa/team-review codex validators invoke it.
+how the team-plan/team-review cross-model reviews invoke it.
 
 ## Generating image FILES (not just inline previews)
 
@@ -158,8 +158,8 @@ into `/workspace/workgroup/`. Do NOT shell out to `codex exec` — you don't nee
 **Claude / OpenCode agents (no native generation):** either delegate to your Codex
 sibling (@-mention it — it generates natively), or run it yourself via
 `codex exec --yolo "Generate <desc> and save it as /workspace/workgroup/<name>.png"`.
-If you run it yourself you MUST set your Bash tool's `timeout` to `600000` (10 min,
-the max) and do ONE image per call — the default 2-min timeout kills the render
+If you run it yourself you MUST set your Bash tool's `timeout` to `3600000` (60 min,
+the configured max) and do ONE image per call — the default 2-min timeout kills the render
 mid-flight with no file. This uses the built-in generator (no `OPENAI_API_KEY`); the
 bundled imagegen `SKILL.md` claim that file output needs the OpenAI API is wrong —
 that's only for transparent backgrounds, and NanoClaw uses no OpenAI key. Never
@@ -203,4 +203,6 @@ The `conversations/` folder in your workspace holds searchable transcripts of pa
 
 ## Feature Work Routing
 
-For non-trivial feature requests (3+ files, new API, new data model, ambiguous requirements), start with `/team-brief` via the Skill tool. Follow the chain: brief → design → review → plan → build → qa → ship. Each step has an approval gate. Do NOT write briefs/designs/plans yourself — the skills produce those. Trivial work (single-file fixes, config, conversation) skips the workflow.
+For work that needs an explicit contract because it changes behavior, crosses a trust boundary, has meaningful rollback risk, or benefits from coordinated implementation, start with `/team-plan`. File count alone does not decide: a mechanical multi-file edit may stay small, while a one-file credential migration needs deep review.
+
+After the user approves `plan.md`, run `/team-build`, then `/team-review --implementation`. `/team-auto` may run an approved plan through build and implementation review, but it never ships. `/team-ship` is a separate human-controlled publish or merge boundary. Trivial fixes, config changes, and conversation do not need the workflow.
