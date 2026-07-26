@@ -8,6 +8,7 @@
  * processing_ack. The host reads processing_ack to sync message lifecycle.
  */
 import { getConfig } from '../config.js';
+import { isClearCommand } from '../formatter.js';
 import { openInboundDb, getOutboundDb } from './connection.js';
 
 // Cache whether inbound.db has the on_wake column (added in v2.0.48).
@@ -61,41 +62,177 @@ function getMaxMessagesPerPrompt(): number {
   }
 }
 
+export interface PendingSelectionDiagnostics {
+  /** Physical inbound rows materialized across the bounded candidate queries. */
+  inboundRowsRead: number;
+  /** Maximum physical inbound rows those queries can materialize for this call. */
+  inboundRowBudget: number;
+}
+
+function recallTargetId(m: MessageInRow): string | null {
+  if (m.kind !== 'system' || !m.id.startsWith('recall-')) return null;
+  try {
+    const content = JSON.parse(m.content) as { subtype?: unknown };
+    return content.subtype === 'recall_context' ? m.id.slice('recall-'.length) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Keep recall-enabled batches atomic in both cold-start and in-turn paths.
+ *
+ * A standalone harness or pre-workgroup batch with no valid recall pair keeps
+ * its legacy trigger behavior. A real workgroup runtime is always
+ * recall-enabled (NANOCLAW_WORKGROUP_ID is trusted host configuration), so
+ * every admissible trigger must have its own recall partner even when the
+ * entire observed batch is damaged. Accumulated context and /clear are not
+ * recall-bearing triggers.
+ */
+export function retainCompleteRecallUnits(rows: MessageInRow[]): MessageInRow[] {
+  const ids = new Set(rows.map((row) => row.id));
+  const recallByTarget = new Map<string, string>();
+  for (const row of rows) {
+    const targetId = recallTargetId(row);
+    if (targetId !== null && ids.has(targetId)) recallByTarget.set(targetId, row.id);
+  }
+  const recallRequired = Boolean(process.env.NANOCLAW_WORKGROUP_ID) || recallByTarget.size > 0;
+  if (!recallRequired) return rows.filter((row) => recallTargetId(row) === null);
+
+  return rows.filter((row) => {
+    const targetId = recallTargetId(row);
+    if (targetId !== null) return ids.has(targetId);
+    const requiresRecall =
+      row.trigger === 1 &&
+      row.kind !== 'system' &&
+      !((row.kind === 'chat' || row.kind === 'chat-sdk') && isClearCommand(row));
+    return !requiresRecall || recallByTarget.has(row.id);
+  });
+}
+
 /**
  * Fetch pending messages that are due for processing.
  * Reads from inbound.db (read-only), filters against processing_ack in outbound.db
  * to skip messages already picked up by this or a previous container run.
  *
- * Returns the most recent `maxMessagesPerPrompt` pending rows in
- * chronological order, regardless of their `trigger` flag: accumulated
- * context (trigger=0) rides along with the wake-eligible rows so the agent
- * sees the prior context it missed. Host's countDueMessages gates waking on
- * trigger=1 separately (see src/db/session-db.ts).
+ * Returns the most recent `maxMessagesPerPrompt` logical trigger units in
+ * chronological order. A host-injected `recall-<X>` row and its target `<X>`
+ * are one unit, so a prompt boundary can never split the pair. Accumulated
+ * context (trigger=0) still rides along with wake-eligible rows. Host's
+ * countDueMessages gates waking on trigger=1 separately (see
+ * src/db/session-db.ts).
  */
-export function getPendingMessages(isFirstPoll = false): MessageInRow[] {
+export function getPendingMessages(isFirstPoll = false, diagnostics?: PendingSelectionDiagnostics): MessageInRow[] {
   const inbound = openInboundDb();
   const outbound = getOutboundDb();
 
   try {
-    const onWakeFilter = hasOnWakeColumn(inbound) ? 'AND (on_wake = 0 OR ?1 = 1)' : '';
-    const pending = inbound
+    const maxUnits = Math.max(1, Math.floor(getMaxMessagesPerPrompt()));
+    const recentLimit = maxUnits * 4 + 8;
+    const wakeLimit = maxUnits + 2;
+    // One extra exact bootstrap lookup ensures a cold burst larger than the
+    // prompt limit cannot strand the only once-per-context capability/index
+    // pair outside the recent window. Its target is covered by the bounded
+    // partner query below.
+    const inboundRowBudget = 2 * (recentLimit + wakeLimit) + 2;
+    if (diagnostics) {
+      diagnostics.inboundRowsRead = 0;
+      diagnostics.inboundRowBudget = inboundRowBudget;
+    }
+
+    const onWakeFilter = hasOnWakeColumn(inbound) && !isFirstPoll ? 'AND on_wake = 0' : '';
+    const dueFilter = `
+         status = 'pending'
+         AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))
+         ${onWakeFilter}`;
+    const recent = inbound
       .prepare(
         `SELECT * FROM messages_in
-         WHERE status = 'pending'
-           AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))
-           ${onWakeFilter}
+         WHERE ${dueFilter}
          ORDER BY seq DESC
-         LIMIT ?2`,
+         LIMIT ?`,
       )
-      .all(isFirstPoll ? 1 : 0, getMaxMessagesPerPrompt()) as MessageInRow[];
+      .all(recentLimit) as MessageInRow[];
 
-    if (pending.length === 0) return [];
+    // A long trigger=0 tail can fill the recent window while an older task or
+    // mention is the row that actually woke the container. Fetch a separately
+    // bounded wake window so that tail cannot suppress every due trigger.
+    // More than one row is intentional: recently completed rows can remain
+    // pending in inbound.db until the host syncs processing_ack.
+    const wakes = inbound
+      .prepare(
+        `SELECT * FROM messages_in
+         WHERE ${dueFilter}
+           AND trigger = 1
+           AND kind != 'system'
+         ORDER BY seq DESC
+         LIMIT ?`,
+      )
+      .all(wakeLimit) as MessageInRow[];
+
+    const bootstrap = inbound
+      .prepare(
+        `SELECT * FROM messages_in
+         WHERE ${dueFilter}
+           AND kind = 'system'
+           AND json_valid(content)
+           AND json_extract(content, '$.subtype') = 'recall_context'
+           AND json_type(content, '$.trustedCapabilities') = 'object'
+         ORDER BY seq DESC
+         LIMIT 1`,
+      )
+      .get() as MessageInRow | undefined;
+
+    if (diagnostics) diagnostics.inboundRowsRead += recent.length + wakes.length + (bootstrap ? 1 : 0);
+    if (recent.length === 0 && wakes.length === 0 && !bootstrap) return [];
+
+    const candidateById = new Map<string, MessageInRow>();
+    for (const row of [...recent, ...wakes, ...(bootstrap ? [bootstrap] : [])]) candidateById.set(row.id, row);
+
+    // Complete any recall pair split by either bounded window. Each candidate
+    // requests at most one exact partner id, so this query can materialize no
+    // more rows than the two initial windows combined.
+    const partnerIds = new Set<string>();
+    for (const row of candidateById.values()) {
+      const targetId = recallTargetId(row);
+      partnerIds.add(targetId ?? `recall-${row.id}`);
+    }
+    for (const id of candidateById.keys()) partnerIds.delete(id);
+
+    if (partnerIds.size > 0) {
+      const placeholders = [...partnerIds].map(() => '?').join(', ');
+      const partners = inbound
+        .prepare(
+          `SELECT * FROM messages_in
+           WHERE ${dueFilter}
+             AND id IN (${placeholders})
+           ORDER BY seq DESC`,
+        )
+        .all(...partnerIds) as MessageInRow[];
+      if (diagnostics) diagnostics.inboundRowsRead += partners.length;
+      for (const row of partners) candidateById.set(row.id, row);
+    }
+
+    const pending = [...candidateById.values()].sort((a, b) => {
+      const bySeq = (b.seq ?? Number.NEGATIVE_INFINITY) - (a.seq ?? Number.NEGATIVE_INFINITY);
+      if (bySeq !== 0) return bySeq;
+      const byTimestamp = parseDbUtc(b.timestamp) - parseDbUtc(a.timestamp);
+      return byTimestamp !== 0 ? byTimestamp : b.id.localeCompare(a.id);
+    });
+    const candidateIds = [...candidateById.keys()];
+    const candidatePlaceholders = candidateIds.map(() => '?').join(', ');
 
     // Filter out messages already acknowledged in outbound.db
-    const ackedIds = new Set(
-      (outbound.prepare('SELECT message_id FROM processing_ack').all() as Array<{ message_id: string }>).map(
-        (r) => r.message_id,
-      ),
+    const ackedAt = new Map(
+      (
+        outbound
+          .prepare(
+            `SELECT message_id, status_changed
+               FROM processing_ack
+              WHERE message_id IN (${candidatePlaceholders})`,
+          )
+          .all(...candidateIds) as Array<{ message_id: string; status_changed: string }>
+      ).map((row) => [row.message_id, parseDbUtc(row.status_changed)] as const),
     );
 
     // Idempotency guard: a message that already has a real response in
@@ -120,12 +257,22 @@ export function getPendingMessages(isFirstPoll = false): MessageInRow[] {
          FROM messages_out
          WHERE in_reply_to IS NOT NULL
            AND kind != 'status'
+           AND in_reply_to IN (${candidatePlaceholders})
          GROUP BY in_reply_to`,
       )
-      .all() as Array<{ id: string; ts: string }>) {
+      .all(...candidateIds) as Array<{ id: string; ts: string }>) {
       respondedAt.set(r.id, parseDbUtc(r.ts));
     }
     const pendingById = new Map(pending.map((m) => [m.id, m]));
+    const isAcked = (id: string): boolean => {
+      const ts = ackedAt.get(id);
+      if (ts === undefined) return false;
+      const row = pendingById.get(id);
+      if (!row || row.process_after == null) return true;
+      // Admission may recycle recall-<X> after a backoff or task edit. An ack
+      // from before the new due boundary belongs to the prior generation.
+      return ts >= parseDbUtc(row.process_after);
+    };
     const isResponded = (id: string): boolean => {
       const ts = respondedAt.get(id);
       if (ts === undefined) return false;
@@ -142,18 +289,76 @@ export function getPendingMessages(isFirstPoll = false): MessageInRow[] {
     // poll-loop.ts:148) or a task gated by pre-task script — the orphan
     // recall sits pending. Without this filter, the cold-start path's
     // accept-any-recall_context filter would later turn the orphan into a
-    // standalone "[Recalled context]" prompt with no user message; the
-    // in-turn helper drops it but it stays pending forever and gets
+    // standalone structured recall payload with no user message; the in-turn
+    // helper drops it but it stays pending forever and gets
     // re-evaluated every poll. Drop it here so both paths see a clean view.
-    const isOrphanRecall = (m: MessageInRow): boolean => {
-      if (!m.id.startsWith('recall-')) return false;
-      const pairedId = m.id.slice('recall-'.length);
-      return ackedIds.has(pairedId) || isResponded(pairedId);
+    // First remove completed rows, then retain a recall row only when its
+    // target is also present in the same eligible snapshot. This drains
+    // completed-trigger orphans and also prevents a recall for a not-yet-due
+    // target from being promoted into a standalone prompt.
+    const eligible = pending.filter((m) => !isAcked(m.id) && !isResponded(m.id));
+    const paired = retainCompleteRecallUnits(eligible);
+
+    const unitKey = (m: MessageInRow): string => recallTargetId(m) ?? m.id;
+    const selectedKeys: string[] = [];
+    const selectedSet = new Set<string>();
+    const protectedKeys = new Set<string>();
+    const evictOldestUnprotected = (): void => {
+      for (let index = selectedKeys.length - 1; index >= 0; index--) {
+        const candidate = selectedKeys[index]!;
+        if (protectedKeys.has(candidate)) continue;
+        selectedKeys.splice(index, 1);
+        selectedSet.delete(candidate);
+        return;
+      }
     };
 
-    // Reverse: we fetched DESC to take the most recent N, but the agent
-    // should see them in chronological order (oldest first).
-    return pending.filter((m) => !ackedIds.has(m.id) && !isResponded(m.id) && !isOrphanRecall(m)).reverse();
+    // Rows are DESC. Select newest logical units, not newest physical rows.
+    for (const row of paired) {
+      const key = unitKey(row);
+      if (selectedSet.has(key)) continue;
+      if (selectedKeys.length >= maxUnits) break;
+      selectedKeys.push(key);
+      selectedSet.add(key);
+    }
+
+    // The host emits the full capabilities/index bootstrap once per provider
+    // context. Retain that logical unit even when a cold burst exceeds the
+    // normal newest-unit limit; otherwise the first provider prompt could be
+    // fresh but under-informed.
+    const bootstrapRow = paired.find((row) => {
+      if (row.kind !== 'system') return false;
+      try {
+        const content = JSON.parse(row.content) as Record<string, unknown>;
+        return content.subtype === 'recall_context' && Object.hasOwn(content, 'trustedCapabilities');
+      } catch {
+        return false;
+      }
+    });
+    if (bootstrapRow) {
+      const bootstrapKey = unitKey(bootstrapRow);
+      if (!selectedSet.has(bootstrapKey)) {
+        if (selectedKeys.length >= maxUnits) evictOldestUnprotected();
+        selectedKeys.push(bootstrapKey);
+        selectedSet.add(bootstrapKey);
+      }
+      protectedKeys.add(bootstrapKey);
+    }
+
+    // A large tail of trigger=0 context must not hide an older row that just
+    // became due. Keep one real wake unit in the bounded selection whenever
+    // the eligible snapshot contains one.
+    if (!paired.some((m) => selectedSet.has(unitKey(m)) && m.trigger === 1 && m.kind !== 'system')) {
+      const newestWake = paired.find((m) => m.trigger === 1 && m.kind !== 'system');
+      if (newestWake) {
+        if (selectedKeys.length >= maxUnits) evictOldestUnprotected();
+        selectedKeys.push(unitKey(newestWake));
+        selectedSet.add(unitKey(newestWake));
+      }
+    }
+
+    // Reverse the selected DESC rows so the prompt remains chronological.
+    return paired.filter((m) => selectedSet.has(unitKey(m))).reverse();
   } finally {
     inbound.close();
   }
@@ -197,16 +402,15 @@ export function markScriptSkipped(skips: Array<{ id: string; reason: string }>):
     'INSERT OR REPLACE INTO processing_ack (message_id, status, status_changed) VALUES (?, ?, ?)',
   );
   db.transaction(() => {
-    for (const s of skips) stmt.run(s.id, s.reason === 'error' ? 'script-skip:error' : 'completed', new Date().toISOString());
+    for (const s of skips)
+      stmt.run(s.id, s.reason === 'error' ? 'script-skip:error' : 'completed', new Date().toISOString());
   })();
 }
 
 /** Mark a single message as failed — writes to processing_ack in outbound.db. */
 export function markFailed(id: string): void {
   getOutboundDb()
-    .prepare(
-      "INSERT OR REPLACE INTO processing_ack (message_id, status, status_changed) VALUES (?, 'failed', ?)",
-    )
+    .prepare("INSERT OR REPLACE INTO processing_ack (message_id, status, status_changed) VALUES (?, 'failed', ?)")
     .run(id, new Date().toISOString());
 }
 

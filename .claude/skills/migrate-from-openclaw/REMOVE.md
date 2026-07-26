@@ -33,21 +33,26 @@ rm -f groups/*/openclaw-migration-tasks.md
 
 ## 4. Migrated content files (review before deleting)
 
-These are content you chose to bring over, now part of your agent groups. Delete
-only the ones you no longer want — review each first.
+These are content you chose to bring over. Removing the skill must not delete
+them. Review the recorded migration report and permanent snapshots before any
+separate content-removal decision.
 
-- Identity / personality: `groups/*/instructions.prepend.md` and the memory
-  concepts recorded for identity reference material
+- Identity / personality: the byte-preserved group instruction files recorded
+  by the migration, kept outside memory
 - User context and memories: the destination files recorded in the migration's
-  source-to-destination summary under `groups/*/memory/`
+  source-to-destination report under
+  `data/workgroups/<workgroup-id>/memory/`
 - Copied OpenClaw skills: directories you added under `container/skills/`
   (compare against the stock set before removing — do not delete
   `onecli-gateway`, `welcome`, `self-customize`, `agent-browser`,
   `slack-formatting`, or other shipped container skills).
 
 Per-group standing instructions live in `groups/<folder>/instructions.prepend.md`;
-durable facts live under `groups/<folder>/memory/`. Review and revert only the
-OpenClaw-derived entries by hand if desired.
+durable facts live in the one workgroup canon at
+`data/workgroups/<workgroup-id>/memory/`. Every provider sibling reaches that
+canon through workgroup membership. `/workspace/agent/memory` is only a
+compatibility link. Never delete the permanent pre-import or migrator rollback
+snapshots automatically.
 
 ## 5. Rebuild if you removed copied skills
 
@@ -79,8 +84,13 @@ ncl groups list
 ncl roles list
 ```
 
-Then delete what the migration added with the matching `ncl ... delete` /
-`ncl roles revoke` / `ncl members remove` verbs. Remove migrated channel tokens
-from `.env`, and remove vault secrets with `onecli secrets delete` (list them
-with `onecli secrets list`). There is no automatic rollback — delete only the
-entities you recognize as migration output.
+Memory rollback is report-driven, checksummed, and separate from removing the
+entities below. For an applied report whose runtime verification failed, follow
+the exact rollback and pre-import restoration procedure in `SKILL.md`; keep the
+failed canon and both permanent snapshots for audit. For a blocked report,
+never run generic rollback.
+
+Then delete only non-memory entities you recognize as migration output with the
+matching `ncl ... delete` / `ncl roles revoke` / `ncl members remove` verbs.
+Remove migrated channel tokens from `.env`, and remove vault secrets with
+`onecli secrets delete` (list them with `onecli secrets list`).

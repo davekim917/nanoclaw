@@ -2,8 +2,10 @@ import fs from 'fs';
 import path from 'path';
 
 import { DATA_DIR, DEFAULT_AGENT_PROVIDER, GROUPS_DIR } from './config.js';
+import { stageGroupPersona } from './group-persona.js';
 import { log } from './log.js';
 import { providerProvidesAgentSurfaces } from './providers/provider-container-registry.js';
+import { prepareWorkgroupMemoryMember } from './modules/workgroup/shared-dirs.js';
 import type { AgentGroup } from './types.js';
 
 // Symlink name inside the group's dir. Claude Code's @-import only
@@ -75,8 +77,8 @@ const DEPRECATED_ENV: readonly string[] = [
 // REQUIRED_ENV above.
 const REQUIRED_SETTINGS: Record<string, unknown> = {
   $schema: 'https://json.schemastore.org/claude-code-settings.json',
-  // Graphify is this install's only derived retrieval layer. Claude's native
-  // auto-memory must not rewrite the operator-curated CLAUDE.local.md surface.
+  // Workgroup memory is the only durable authority. Claude's native
+  // auto-memory must not create a second, provider-specific store.
   autoMemoryEnabled: false,
   // Explicit opt-in to thinking for supported models. The SDK treats
   // absent-or-true as "enabled automatically" but we keep this explicit
@@ -124,6 +126,14 @@ const REQUIRED_HOOKS = {
 
 const DEFAULT_SETTINGS_JSON =
   JSON.stringify({ env: REQUIRED_ENV, hooks: REQUIRED_HOOKS, ...REQUIRED_SETTINGS }, null, 2) + '\n';
+
+export function prepareGroupCanonicalMemory(
+  group: AgentGroup,
+  dirs: { groupsDir?: string; dataDir?: string } = {},
+): string {
+  const workgroupId = group.workgroup_id ?? group.folder;
+  return prepareWorkgroupMemoryMember({ id: group.id, folder: group.folder }, workgroupId, dirs).canonicalPath;
+}
 
 /**
  * Reconcile an existing settings.json against trunk.
@@ -210,7 +220,8 @@ function ensureRequiredSettings(settingsFile: string): boolean {
  * Skill symlinks are synced at spawn time by container-runner.ts.
  *
  * The composed `CLAUDE.md` is regenerated on every spawn. Initial per-group
- * instructions seed the provider's own durable memory surface.
+ * instructions are staged on the provider-neutral standing-instructions
+ * surface consumed by each provider's project-document composer.
  */
 export function initGroupFilesystem(
   group: AgentGroup,
@@ -230,34 +241,21 @@ export function initGroupFilesystem(
     fs.mkdirSync(groupDir, { recursive: true });
     initialized.push('groupDir');
   }
+  prepareGroupCanonicalMemory(group);
 
-  // Preserve the customization contract: default providers load
-  // CLAUDE.local.md; surface-owning providers receive the same seed in their
-  // provider-neutral memory tree. A deferred .seed.md is consumed exactly
-  // once after the provider is known.
-  const neutralSeedFile = path.join(groupDir, '.seed.md');
-  const seed =
-    opts?.instructions ??
-    (fs.existsSync(neutralSeedFile) ? fs.readFileSync(neutralSeedFile, 'utf-8').trimEnd() : undefined);
+  // Standing instructions are provider identity, not memory. The provider's
+  // project-document composer consumes this shared surface at spawn. Exclusive
+  // creation preserves any existing operator-owned instructions.
+  if (opts?.instructions && stageGroupPersona(groupDir, opts.instructions)) {
+    initialized.push('instructions.prepend.md');
+  }
 
   if (defaultSurfaces) {
     const claudeLocalFile = path.join(groupDir, 'CLAUDE.local.md');
     if (!fs.existsSync(claudeLocalFile)) {
-      fs.writeFileSync(claudeLocalFile, seed ? `${seed}\n` : '');
+      fs.writeFileSync(claudeLocalFile, '');
       initialized.push('CLAUDE.local.md');
     }
-  } else if (seed) {
-    const seedFile = path.join(groupDir, 'memory', 'memories', 'imported-agent-memory.md');
-    if (!fs.existsSync(seedFile)) {
-      fs.mkdirSync(path.dirname(seedFile), { recursive: true });
-      fs.writeFileSync(seedFile, `${seed}\n`);
-      initialized.push('memory/memories/imported-agent-memory.md');
-    }
-  }
-
-  if (fs.existsSync(neutralSeedFile)) {
-    fs.rmSync(neutralSeedFile);
-    initialized.push('.seed.md consumed');
   }
 
   // Note: the container_configs DB row is NOT created here. Local's

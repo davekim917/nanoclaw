@@ -24,6 +24,7 @@ and a Dockerfile rebuild. Not a regression — agents can paste mermaid source
 into chat today; only affects image-output channels.
 
 **How to implement:**
+
 1. Add `@mermaid-js/mermaid-cli@<pinned>` to the pnpm global-install block in
    `container/Dockerfile` alongside `agent-browser` etc.
 2. Set `PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium` and `PUPPETEER_SKIP_DOWNLOAD=1`
@@ -45,6 +46,7 @@ into chat today; only affects image-output channels.
 **SHIPPED** (2026-04-20).
 
 Files:
+
 - `src/db/backlog.ts` — all accessors for ship_log, backlog_items, commit_digest_state
 - `src/db/migrations/015-backlog.ts` — central DB tables
 - `src/modules/backlog/index.ts` — delivery action handlers (add_ship_log, add/update/delete_backlog_item)
@@ -56,29 +58,22 @@ Files:
 
 ---
 
-## 3. Memory CRUD with sqlite-vec
+## 3. Semantic memory CRUD / provider-native auto-memory authority — retired
 
-**What v1 did:** semantic memory retrieval via sqlite-vec virtual table
-(`vec_memories`) + OpenAI-embedded vectors. MCP tools `save_memory`,
-`delete_memory`, `update_memory`, `list_memories`, `search_memories`.
-Agents used this for "remember that X" / "what do we know about Y?".
+**NOT ACTIVE WORK.** v1 used a sqlite-vec store and an early v2 experiment
+treated Claude-native auto-memory as durable authority. Both designs are
+superseded.
 
-**v2 status — ON HOLD:** Claude Code's built-in auto-memory writes to
-`~/.claude/projects/{project}/memory/MEMORY.md` and is verified working
-in v2 (2026-04-20). Shared via `.claude-shared` mount at `~/.claude/`
-so all sessions in an agent group read/write the same memory index.
-`autoDreamEnabled: true` in `settings.json` handles pruning/consolidation.
-Dave wants to evaluate whether this suffices before adding sqlite-vec
-complexity.
+The current contract is one canonical Markdown tree per workgroup at
+`data/workgroups/<workgroup-id>/memory`, shared by every sibling provider.
+Provider-native memory paths are compatibility views only. The host injects
+bounded, source-grounded canonical and archive recall before each admissible
+turn, and agents update the canon through `write_memory_file` (or deliberate
+shell editing). See [memory.md](memory.md).
 
-**When to revisit:** if auto-memory + autoDream proves insufficient for
-cross-thread recall, resume from here.
-
-**If revisiting:** requires an embedding-provider decision (OpenAI,
-Voyage, or host-side Haiku trick), sqlite-vec setup, and the full
-MCP tool chain. See v1 `src/memory-store.ts` for the full feature.
-
-**Est:** ~3hr after decision to proceed.
+Do not resume the old sqlite-vec or native auto-memory plan from this backlog.
+Any future semantic index must remain derived, rebuildable retrieval over the
+workgroup canon rather than becoming a second memory authority.
 
 ---
 

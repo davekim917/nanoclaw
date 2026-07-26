@@ -1,6 +1,14 @@
 import type Database from 'better-sqlite3';
 import type { Migration } from './index.js';
 
+/**
+ * Historical schema compatibility only.
+ *
+ * Existing installs may contain rows from the retired v1 semantic-memory
+ * experiment, so the deterministic migration chain must continue to create
+ * and preserve this table. Runtime code has no reader or writer for it. The
+ * sole active memory authority is the canonical workgroup Markdown tree.
+ */
 export const migration013: Migration = {
   version: 13,
   name: 'memories',

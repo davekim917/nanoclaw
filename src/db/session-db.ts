@@ -179,7 +179,7 @@ export function nextEvenSeq(db: Database.Database): number {
   return maxSeq < 2 ? 2 : maxSeq + 2 - (maxSeq % 2);
 }
 
-interface MessageInsert {
+export interface MessageInsert {
   id: string;
   kind: string;
   timestamp: string;
@@ -222,6 +222,39 @@ export function insertMessage(db: Database.Database, message: MessageInsert): vo
 /** Channel replay insert; only an id collision is ignored, never other constraints. */
 export function insertMessageIfNew(db: Database.Database, message: MessageInsert): boolean {
   return runInsertMessage(db, message, true);
+}
+
+/**
+ * Idempotent channel-ingress insert for a logical recall/trigger pair.
+ *
+ * The trigger id is the replay key. A duplicate trigger returns false before
+ * either insert, while a fresh trigger commits context first and trigger
+ * second in one transaction. `nextEvenSeq` therefore gives the pair adjacent
+ * even sequence values and a crash cannot expose a half-pair.
+ */
+export function insertMessageWithContextIfNew(
+  db: Database.Database,
+  trigger: MessageInsert,
+  context: MessageInsert | null,
+): boolean {
+  return db.transaction(() => {
+    if (db.prepare('SELECT 1 FROM messages_in WHERE id = ? LIMIT 1').get(trigger.id) !== undefined) return false;
+    if (context) runInsertMessage(db, context, false);
+    runInsertMessage(db, trigger, false);
+    return true;
+  })();
+}
+
+/** Strict internal-host variant: duplicate ids retain the existing constraint error contract. */
+export function insertMessageWithContext(
+  db: Database.Database,
+  trigger: MessageInsert,
+  context: MessageInsert | null,
+): void {
+  db.transaction(() => {
+    if (context) runInsertMessage(db, context, false);
+    runInsertMessage(db, trigger, false);
+  })();
 }
 
 export function countDueMessages(db: Database.Database): number {

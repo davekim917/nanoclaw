@@ -51,6 +51,40 @@ function now() {
 
 const TEST_DIR = '/tmp/nanoclaw-test-host';
 
+interface TestInboundRow {
+  id: string;
+  seq: number;
+  kind: string;
+  trigger: number;
+  status: string;
+  platform_id: string | null;
+  channel_type: string | null;
+  thread_id: string | null;
+  content: string;
+}
+
+function readPairedInboundTriggers(db: Database.Database): TestInboundRow[] {
+  const rows = db.prepare('SELECT * FROM messages_in ORDER BY seq').all() as TestInboundRow[];
+  const triggers = rows.filter((row) => row.trigger === 1 && row.kind !== 'system');
+  const recallRows = rows.filter((row) => {
+    if (row.kind !== 'system' || row.trigger !== 0) return false;
+    return (JSON.parse(row.content) as { subtype?: string }).subtype === 'recall_context';
+  });
+  expect(recallRows).toHaveLength(triggers.length);
+  for (const trigger of triggers) {
+    const index = rows.indexOf(trigger);
+    const recall = rows[index - 1];
+    expect(recall).toMatchObject({
+      id: `recall-${trigger.id}`,
+      kind: 'system',
+      trigger: 0,
+      seq: trigger.seq - 2,
+    });
+    expect(JSON.parse(recall!.content)).toMatchObject({ subtype: 'recall_context' });
+  }
+  return triggers;
+}
+
 beforeEach(() => {
   // Clean test directory
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
@@ -291,12 +325,7 @@ describe('session manager', () => {
     // Read from the inbound DB
     const dbPath = inboundDbPath('ag-1', session.id);
     const db = new Database(dbPath);
-    const rows = db.prepare('SELECT * FROM messages_in').all() as Array<{
-      id: string;
-      kind: string;
-      status: string;
-      content: string;
-    }>;
+    const rows = readPairedInboundTriggers(db);
     db.close();
 
     expect(rows).toHaveLength(1);
@@ -419,7 +448,7 @@ describe('router', () => {
     // Verify message was written to inbound DB
     const dbPath = inboundDbPath('ag-1', session!.id);
     const db = new Database(dbPath);
-    const rows = db.prepare('SELECT * FROM messages_in').all() as Array<{ id: string; content: string }>;
+    const rows = readPairedInboundTriggers(db);
     db.close();
 
     expect(rows).toHaveLength(1);
@@ -493,7 +522,7 @@ describe('router', () => {
     const session = findSession('mg-1', null);
     const dbPath = inboundDbPath('ag-1', session!.id);
     const db = new Database(dbPath);
-    const rows = db.prepare('SELECT * FROM messages_in ORDER BY timestamp').all();
+    const rows = readPairedInboundTriggers(db);
     db.close();
 
     expect(rows).toHaveLength(2);
@@ -573,13 +602,16 @@ describe('router', () => {
     const session = findSession('mg-1', null);
     expect(session).toBeDefined();
     const db = new Database(inboundDbPath('ag-1', session!.id));
-    const rows = db.prepare('SELECT id, trigger FROM messages_in').all() as Array<{
+    const rows = db.prepare('SELECT id, kind, trigger FROM messages_in ORDER BY seq').all() as Array<{
       id: string;
+      kind: string;
       trigger: number;
     }>;
     db.close();
     expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ id: 'msg-nomatch:ag-1', kind: 'chat' });
     expect(rows[0].trigger).toBe(0);
+    expect(rows.some((row) => row.id.startsWith('recall-'))).toBe(false);
   });
 
   it('drops silently when engage fails + ignored_message_policy=drop', async () => {
@@ -715,14 +747,11 @@ describe('router — channel instances', () => {
       expect(getSessionsByAgentGroup('ag-1')).toHaveLength(0);
 
       const tDb = new Database(inboundDbPath('ag-2', testerSessions[0].id));
-      const tRow = tDb.prepare('SELECT thread_id, content FROM messages_in').get() as {
-        thread_id: string | null;
-        content: string;
-      };
+      const [tRow] = readPairedInboundTriggers(tDb);
       tDb.close();
-      expect(JSON.parse(tRow.content).text).toBe('to tester');
+      expect(JSON.parse(tRow!.content).text).toBe('to tester');
       // Collapsed by the named instance's thread policy.
-      expect(tRow.thread_id).toBeNull();
+      expect(tRow!.thread_id).toBeNull();
 
       // Same address, no instance ⇒ default instance ⇒ default mg/agent,
       // and the default adapter is threaded so the threadId survives.
@@ -742,9 +771,9 @@ describe('router — channel instances', () => {
       expect(defaultSessions).toHaveLength(1);
       expect(defaultSessions[0].messaging_group_id).toBe('mg-default');
       const dDb = new Database(inboundDbPath('ag-1', defaultSessions[0].id));
-      const dRow = dDb.prepare('SELECT thread_id FROM messages_in').get() as { thread_id: string | null };
+      const [dRow] = readPairedInboundTriggers(dDb);
       dDb.close();
-      expect(dRow.thread_id).toBe('thread-9');
+      expect(dRow!.thread_id).toBe('thread-9');
     } finally {
       await teardownChannelAdapters();
     }
@@ -883,9 +912,9 @@ describe('router — per-wiring thread policy', () => {
       expect(sessions[0].thread_id).toBe('thread-42');
 
       const db = new Database(inboundDbPath('ag-tp', sessions[0].id));
-      const row = db.prepare('SELECT thread_id FROM messages_in').get() as { thread_id: string | null };
+      const [row] = readPairedInboundTriggers(db);
       db.close();
-      expect(row.thread_id).toBe('thread-42');
+      expect(row!.thread_id).toBe('thread-42');
     });
   });
 
@@ -905,9 +934,9 @@ describe('router — per-wiring thread policy', () => {
       expect(sessions[0].thread_id).toBeNull();
 
       const db = new Database(inboundDbPath('ag-tp', sessions[0].id));
-      const row = db.prepare('SELECT thread_id FROM messages_in').get() as { thread_id: string | null };
+      const [row] = readPairedInboundTriggers(db);
       db.close();
-      expect(row.thread_id).toBeNull();
+      expect(row!.thread_id).toBeNull();
     });
   });
 
@@ -926,15 +955,12 @@ describe('router — per-wiring thread policy', () => {
       const sessions = getSessionsByAgentGroup('ag-tp');
       expect(sessions).toHaveLength(1);
       const db = new Database(inboundDbPath('ag-tp', sessions[0].id));
-      const row = db.prepare('SELECT channel_type, thread_id FROM messages_in').get() as {
-        channel_type: string;
-        thread_id: string | null;
-      };
+      const [row] = readPairedInboundTriggers(db);
       db.close();
       // The reply address is the operator's, thread id intact — only the
       // event-derived address is policy-stripped.
-      expect(row.channel_type).toBe('cli');
-      expect(row.thread_id).toBe('term-1');
+      expect(row!.channel_type).toBe('cli');
+      expect(row!.thread_id).toBe('term-1');
     });
   });
 
@@ -1058,18 +1084,12 @@ describe('routing metadata preservation', () => {
     // Threaded adapter in a group chat forces a per-thread session.
     const session = findSession('mg-1', 'thread-42');
     const db = new Database(inboundDbPath('ag-1', session!.id));
-    const row = db
-      .prepare('SELECT platform_id, channel_type, thread_id FROM messages_in WHERE id LIKE ?')
-      .get('msg-r1%') as {
-      platform_id: string | null;
-      channel_type: string | null;
-      thread_id: string | null;
-    };
+    const row = readPairedInboundTriggers(db).find((candidate) => candidate.id.startsWith('msg-r1'));
     db.close();
 
-    expect(row.platform_id).toBe('chan-123');
-    expect(row.channel_type).toBe('discord');
-    expect(row.thread_id).toBe('thread-42');
+    expect(row?.platform_id).toBe('chan-123');
+    expect(row?.channel_type).toBe('discord');
+    expect(row?.thread_id).toBe('thread-42');
   });
 
   it('fan-out gives each agent its own routing, not leaked from sibling', async () => {
@@ -1111,15 +1131,11 @@ describe('routing metadata preservation', () => {
       const sessions = getSessionsByAgentGroup(agId);
       expect(sessions).toHaveLength(1);
       const db = new Database(inboundDbPath(agId, sessions[0].id));
-      const row = db.prepare('SELECT platform_id, channel_type, thread_id FROM messages_in LIMIT 1').get() as {
-        platform_id: string | null;
-        channel_type: string | null;
-        thread_id: string | null;
-      };
+      const [row] = readPairedInboundTriggers(db);
       db.close();
-      expect(row.platform_id).toBe('chan-123');
-      expect(row.channel_type).toBe('discord');
-      expect(row.thread_id).toBe('thread-fanout');
+      expect(row!.platform_id).toBe('chan-123');
+      expect(row!.channel_type).toBe('discord');
+      expect(row!.thread_id).toBe('thread-fanout');
     }
   });
 });
@@ -1415,11 +1431,7 @@ describe('agent-to-agent routing', () => {
     expect(researcherSessions.length).toBeGreaterThanOrEqual(1);
 
     const rDb = new Database(inboundDbPath('ag-researcher', researcherSessions[0].id));
-    const rows = rDb.prepare('SELECT platform_id, channel_type, content FROM messages_in').all() as Array<{
-      platform_id: string | null;
-      channel_type: string | null;
-      content: string;
-    }>;
+    const rows = readPairedInboundTriggers(rDb);
     rDb.close();
 
     expect(rows).toHaveLength(1);
@@ -1463,11 +1475,11 @@ describe('agent-to-agent routing', () => {
     );
 
     const slackDb = new Database(inboundDbPath('ag-pa', paSlackSession.id));
-    const slackA2a = slackDb.prepare("SELECT * FROM messages_in WHERE channel_type = 'agent'").all();
+    const slackA2a = readPairedInboundTriggers(slackDb).filter((row) => row.channel_type === 'agent');
     slackDb.close();
 
     const discordDb = new Database(inboundDbPath('ag-pa', paDiscordSession.id));
-    const discordA2a = discordDb.prepare("SELECT * FROM messages_in WHERE channel_type = 'agent'").all();
+    const discordA2a = readPairedInboundTriggers(discordDb).filter((row) => row.channel_type === 'agent');
     discordDb.close();
 
     // Fixed: response lands in Slack (origin) not Discord (newest)

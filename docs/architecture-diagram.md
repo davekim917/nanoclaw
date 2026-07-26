@@ -20,7 +20,7 @@ flowchart TB
     Runner["Container Runner<br/>(src/container-runner.ts)<br/>OneCLI ensureAgent + spawn"]
     Delivery["Delivery Poller<br/>(src/delivery.ts)<br/>1s active / 60s sweep"]
     Sweep["Host Sweep<br/>(src/host-sweep.ts)<br/>heartbeat, retry, recurrence"]
-    Central[("Central DB<br/>data/v2.db<br/>agent_groups<br/>messaging_groups<br/>messaging_group_agents<br/>sessions<br/>pending_approvals")]
+    Central[("Central DB<br/>data/v2.db<br/>workgroups<br/>agent_groups<br/>messaging_groups<br/>messaging_group_agents<br/>sessions<br/>pending_approvals")]
   end
 
   subgraph OneCLI["OneCLI Gateway (0.3.1)"]
@@ -39,7 +39,11 @@ flowchart TB
   end
 
   subgraph Groups["Agent Group Filesystem (groups/*)"]
-    Folder["CLAUDE.md<br/>memory<br/>per-group skills<br/>container.json (materialized from container_configs)"]
+    Folder["CLAUDE.md / CLAUDE.local.md<br/>provider + identity instructions<br/>per-group skills<br/>container.json (materialized from container_configs)"]
+  end
+
+  subgraph Workgroup["Workgroup Filesystem (data/workgroups/*)"]
+    Memory["memory/<br/>one canonical Markdown tree<br/>shared by sibling agent groups"]
   end
 
   P1 & P2 & P3 & P4 & P5 --> Bridge
@@ -63,6 +67,7 @@ flowchart TB
   Sweep --> OutDB
   Sweep --> Central
   Runner -.mounts.-> Folder
+  Runner -.mounts.-> Memory
   MCP -.approval.-> Approvals
   Approvals --> Central
   Provider -.API calls.-> Vault
@@ -128,6 +133,7 @@ flowchart LR
 
 ```mermaid
 erDiagram
+  workgroups ||--o{ agent_groups : contains
   agent_groups ||--o{ messaging_group_agents : wired
   messaging_groups ||--o{ messaging_group_agents : wired
   agent_groups ||--o{ sessions : runs
@@ -135,11 +141,16 @@ erDiagram
   agent_groups ||--o{ agent_destinations : owns
   agent_groups ||--o{ pending_approvals : requests
 
+  workgroups {
+    string id PK
+    string display_name
+  }
   agent_groups {
     int id
     string name
     string folder
     string agent_provider
+    string workgroup_id FK
   }
   messaging_groups {
     int id
@@ -189,9 +200,9 @@ erDiagram
 
 | Level | `session_mode` | What's shared | Example |
 |---|---|---|---|
-| 1. Shared session | `agent-shared` | Workspace + memory + conversation | Slack + GitHub webhooks in one thread |
-| 2. Same agent, separate sessions | `shared` / `per-thread` | Workspace + memory only | One agent across 3 Telegram chats |
-| 3. Separate agent groups | (different `agent_group_id`) | Nothing | Personal vs work channels |
+| 1. Shared session | `agent-shared` | Agent workspace + conversation; workgroup memory | Slack + GitHub webhooks in one thread |
+| 2. Same agent, separate sessions | `shared` / `per-thread` | Agent workspace; workgroup memory | One agent across 3 Telegram chats |
+| 3. Separate agent groups | (different `agent_group_id`) | Memory only when intentionally in the same workgroup | Provider siblings, or isolated personal/work workgroups |
 
 ## Two-DB Split (why)
 

@@ -38,18 +38,24 @@ permission checks, the attack surface is limited by what's mounted.
 `buildMounts` (`src/container-runner.ts`) composes a fixed set of mounts per
 spawn. For the default (Claude) provider these are:
 
-| Container path                       | Host source                                | Mode                    | Purpose                                                             |
-| ------------------------------------ | ------------------------------------------ | ----------------------- | ------------------------------------------------------------------- |
-| `/workspace`                         | `data/v2-sessions/<group>/<session>/`      | RW                      | Session folder — `inbound.db`, `outbound.db`, `outbox/`, `.claude/` |
-| `/workspace/agent`                   | `groups/<folder>/`                         | RW                      | Agent group working files + `CLAUDE.local.md`                       |
-| `/workspace/agent/container.json`    | group `container.json`                     | RO                      | Container config — readable, not writable                           |
-| `/workspace/agent/CLAUDE.md`         | composed `CLAUDE.md`                       | RO                      | Regenerated every spawn; agent edits would be clobbered             |
-| `/workspace/agent/.claude-fragments` | group `.claude-fragments/`                 | RO                      | Composer skill/MCP fragments                                        |
-| `/app/CLAUDE.md`                     | `container/CLAUDE.md`                      | RO                      | Shared base doc imported by the composed entry point                |
-| `/home/node/.claude`                 | `data/v2-sessions/<group>/.claude-shared/` | RW                      | Claude state, settings, skill symlinks                              |
-| `/app/src`                           | `container/agent-runner/src/`              | RO                      | Shared agent-runner source (same for all groups)                    |
-| `/app/skills`                        | `container/skills/`                        | RO                      | Shared container skills                                             |
-| `/workspace/extra/<name>`            | allowlisted host dir                       | RO (RW only if allowed) | Operator-configured additional mounts                               |
+| Container path                                 | Host source                                         | Mode                     | Purpose                                                                      |
+| ---------------------------------------------- | --------------------------------------------------- | ------------------------ | ---------------------------------------------------------------------------- |
+| `/workspace`                                   | `data/v2-sessions/<group>/<session>/`               | RW                       | Session folder — DBs, outbox, heartbeat, and worktrees                       |
+| `/workspace/inbound.db`                        | session `inbound.db`                                | RO overlay               | Host-owned inbound transport; container cannot forge delivery state          |
+| `/workspace/agent`                             | `groups/<folder>/`                                  | RW                       | Agent-private working files and standing instructions                        |
+| `/workspace/workgroup`                         | `data/workgroups/<workgroup>/`                      | RW when shared-FS active | Workgroup house shared by sibling agent groups                               |
+| `/workspace/workgroup/memory`                  | `data/workgroups/<workgroup>/memory`                | RW overlay               | Sole writable workgroup Markdown memory canon; mounted in every mode         |
+| `/workspace/agent/memory`                      | compatibility link to `/workspace/workgroup/memory` | RW view                  | Existing provider/group path backed by the same canon                        |
+| `/workspace/workgroup/.memory-write.lock`      | `data/workgroups/<workgroup>/.memory-write.lock`    | RW exact-file overlay    | Stable shared kernel-lock inode; cannot be replaced through the parent mount |
+| `/home/node/.claude/projects/<project>/memory` | workgroup memory canon                              | RO overlay               | Claude-native compatibility view; never a second memory authority            |
+| `/workspace/agent/container.json`              | group `container.json`                              | RO                       | Container config — readable, not writable                                    |
+| `/workspace/agent/CLAUDE.md`                   | composed `CLAUDE.md`                                | RO                       | Regenerated every spawn; agent edits would be clobbered                      |
+| `/workspace/agent/.claude-fragments`           | group `.claude-fragments/`                          | RO                       | Composer skill/MCP fragments                                                 |
+| `/app/CLAUDE.md`                               | `container/CLAUDE.md`                               | RO                       | Shared base doc imported by the composed entry point                         |
+| `/home/node/.claude`                           | `data/v2-sessions/<group>/.claude-shared/`          | RW with nested overlays  | Claude state, settings, skills, and the read-only native-memory view         |
+| `/app/src`                                     | `container/agent-runner/src/`                       | RO                       | Shared agent-runner source (same for all groups)                             |
+| `/app/skills`                                  | `container/skills/`                                 | RO                       | Shared container skills                                                      |
+| `/workspace/extra/<name>`                      | allowlisted host dir                                | RO (RW only if allowed)  | Operator-configured additional mounts                                        |
 
 The config mounts (`container.json`, `CLAUDE.md`, `.claude-fragments`) are
 **nested read-only mounts on top of the read-write group dir** — the agent can
@@ -58,11 +64,15 @@ container only ever sees the paths above plus any provider-contributed mounts
 (e.g. an OpenCode XDG dir). Host application source (`src/`, `dist/`,
 `package.json`) is not reachable.
 
-Shared memory content is read only by the provider's SessionStart hook inside
-the container. Host-side project-document composers emit pointers but never
-open `memory/index.md` or linked agent-controlled files. A memory symlink can
-therefore reach only paths already visible inside that container, not arbitrary
-host files.
+The trusted host builds bounded context before every admissible turn. It opens
+the canonical Markdown tree with containment and no-follow checks, queries the
+workgroup-scoped message archive, and renders the actual session capability
+snapshot. Those bytes are paired with the trigger as explicitly untrusted
+evidence; provider SessionStart hooks contain only static handling guidance and
+do not load memory bytes. Project-document composers likewise emit handling
+guidance rather than memory content. The compatibility and provider-native
+views resolve only to the already-mounted workgroup canon, not arbitrary host
+files.
 
 **Additional-mount allowlist** — extra mounts from a group's container config
 are validated against an allowlist at `~/.config/nanoclaw/mount-allowlist.json`,
@@ -106,10 +116,15 @@ Per-session state lives under `data/v2-sessions/<agent-group>/<session>/`
 (`inbound.db`, `outbound.db`, `outbox/`, `.claude/`). Claude state
 (`.claude-shared`) and the working folder are scoped to the agent group, so:
 
-- Different agent groups cannot see each other's conversation history or files.
-- A group's sessions share that group's memory but keep separate message DBs.
+- Agent groups in different workgroups cannot see each other's conversation
+  history, memory, or files.
+- Sibling agent groups in one workgroup share the canonical memory tree, the
+  workgroup-scoped archive projection, and workgroup files while retaining
+  separate private group folders, provider state, bot identities, and routing.
+- Every session keeps separate inbound and outbound message DBs.
 
-This prevents cross-group information disclosure.
+This makes the workgroup—not the individual sibling—the intentional sharing
+boundary while preventing cross-workgroup disclosure.
 
 ### 4. Credential Isolation (OneCLI Agent Vault)
 

@@ -8,7 +8,7 @@ export interface AgentProvider {
    */
   readonly supportsNativeSlashCommands: boolean;
 
-  /** Register authoritative file memory through this provider's lifecycle seam. */
+  /** Register trusted static memory guidance through this provider's lifecycle seam. */
   registerMemorySessionHook(hook: MemorySessionHookRegistration): void;
 
   /**

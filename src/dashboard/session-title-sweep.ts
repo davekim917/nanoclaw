@@ -101,9 +101,9 @@ export function isBackendConfigured(): boolean {
   return hasProxy && !!process.env['CLAUDE_CODE_OAUTH_TOKEN'];
 }
 
-// Lazy-init proxy dispatcher — mirrors src/memory-daemon/backends/anthropic.ts.
-// Resolved on first call so tests don't pick up stale state from earlier
-// proxy env, and a service restart after env changes Just Works.
+// Lazy-init the proxy dispatcher on first use so tests do not inherit stale
+// state from earlier proxy env, and a service restart after env changes works
+// without another initialization path.
 let _envProxyDispatcher: Dispatcher | null | undefined;
 function getProxyDispatcher(): Dispatcher | null {
   if (_envProxyDispatcher !== undefined) return _envProxyDispatcher;
@@ -146,8 +146,7 @@ async function callTitleBackend(system: string, user: string, signal: AbortSigna
 
   // When a proxy is configured, route through undici with EnvHttpProxyAgent
   // so the OneCLI gateway can swap the placeholder OAuth token for the
-  // real vault token at request time. Same pattern as
-  // `src/memory-daemon/backends/anthropic.ts`.
+  // real vault token at request time.
   const dispatcher = getProxyDispatcher();
   const fetchImpl: typeof fetch = dispatcher
     ? (url, init) =>

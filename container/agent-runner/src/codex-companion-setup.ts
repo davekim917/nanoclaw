@@ -387,23 +387,43 @@ function buildMergedConfig(hostConfig: string, mcpServers: Record<string, McpSer
  * / `stripGitNexusReentrySurfaces` — a real TOML table ends at the next
  * `[...]` header, matching or not.
  */
-function stripPluginsAndMarketplaces(toml: string): string {
-  const out: string[] = [];
+function isPluginTable(tableName: string): boolean {
+  return (
+    tableName === 'plugins' ||
+    tableName === 'marketplaces' ||
+    tableName === 'plugin_marketplaces' ||
+    tableName.startsWith('plugins.') ||
+    tableName.startsWith('marketplaces.') ||
+    tableName.startsWith('plugin_marketplaces.')
+  );
+}
+
+function splitPluginsAndMarketplaces(toml: string): { base: string; plugins: string } {
+  const base: string[] = [];
+  const plugins: string[] = [];
   let inStrippedBlock = false;
   for (const line of toml.split('\n')) {
     const header = line.match(/^\s*\[([^\]]+)\]\s*$/);
     if (header) {
-      const tableName = header[1].trim();
-      inStrippedBlock =
-        tableName === 'plugins' ||
-        tableName === 'marketplaces' ||
-        tableName.startsWith('plugins.') ||
-        tableName.startsWith('marketplaces.');
-      if (inStrippedBlock) continue;
+      inStrippedBlock = isPluginTable(header[1].trim());
     }
-    if (!inStrippedBlock) out.push(line);
+    (inStrippedBlock ? plugins : base).push(line);
   }
-  return out.join('\n');
+  return { base: base.join('\n'), plugins: plugins.join('\n') };
+}
+
+function stripPluginsAndMarketplaces(toml: string): string {
+  return splitPluginsAndMarketplaces(toml).base;
+}
+
+function projectCodexPluginConfig(primaryToml: string, targetToml: string): string {
+  const primaryPlugins = splitPluginsAndMarketplaces(primaryToml).plugins.trim();
+  const targetBase = stripPluginsAndMarketplaces(targetToml).trimEnd();
+  return [targetBase, primaryPlugins].filter(Boolean).join('\n\n') + '\n';
+}
+
+export function projectCodexPluginConfigForTest(primaryToml: string, targetToml: string): string {
+  return projectCodexPluginConfig(primaryToml, targetToml);
 }
 
 /**
@@ -513,6 +533,59 @@ export function setupCodexRuntime(
 
   log(`CODEX_HOME runtime ready at ${RUNTIME_CODEX_DIR} (${Object.keys(mcpServers).length} MCP servers merged)`);
   return RUNTIME_CODEX_DIR;
+}
+
+function replaceWithDirectorySymlink(linkPath: string, targetPath: string): void {
+  fs.rmSync(linkPath, { recursive: true, force: true });
+  if (!fs.existsSync(targetPath)) return;
+  fs.mkdirSync(path.dirname(linkPath), { recursive: true });
+  fs.symlinkSync(targetPath, linkPath, 'dir');
+}
+
+/**
+ * Register plugins for a Codex-primary session into its session-local
+ * `/home/node/.codex` and project that one registration into any OAuth
+ * fallback homes. Fallback homes share the derived cache through symlinks;
+ * auth and rollout state remain independent.
+ */
+export function setupCodexPrimaryRuntime(
+  fallbackHomes: string[] = (process.env.CODEX_FALLBACK_HOMES ?? '')
+    .split(':')
+    .map((home) => home.trim())
+    .filter(Boolean),
+): { registered: string[]; skipped: string[]; errors: string[]; projectedFallbacks: string[] } {
+  const registration = registerContainerCodexPlugins(HOST_CODEX_DIR, 'codex');
+  const projectedFallbacks: string[] = [];
+  const primaryConfigPath = path.join(HOST_CODEX_DIR, 'config.toml');
+  const primaryConfig = fs.existsSync(primaryConfigPath) ? fs.readFileSync(primaryConfigPath, 'utf-8') : '';
+
+  for (const fallbackHome of fallbackHomes) {
+    try {
+      fs.mkdirSync(fallbackHome, { recursive: true });
+      replaceWithDirectorySymlink(path.join(fallbackHome, 'plugins'), path.join(HOST_CODEX_DIR, 'plugins'));
+      replaceWithDirectorySymlink(
+        path.join(fallbackHome, '.tmp', 'marketplaces'),
+        path.join(HOST_CODEX_DIR, '.tmp', 'marketplaces'),
+      );
+
+      const fallbackConfigPath = path.join(fallbackHome, 'config.toml');
+      const fallbackConfig = fs.existsSync(fallbackConfigPath)
+        ? fs.readFileSync(fallbackConfigPath, 'utf-8')
+        : '';
+      fs.writeFileSync(fallbackConfigPath, projectCodexPluginConfig(primaryConfig, fallbackConfig));
+      projectedFallbacks.push(fallbackHome);
+    } catch (err) {
+      registration.errors.push(
+        `${fallbackHome}: fallback projection failed — ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  log(
+    `Codex-primary plugin runtime: ${registration.registered.length} registered, ` +
+      `${projectedFallbacks.length} fallback(s) projected, ${registration.errors.length} errors`,
+  );
+  return { ...registration, projectedFallbacks };
 }
 
 function isDirectorySafe(p: string): boolean {

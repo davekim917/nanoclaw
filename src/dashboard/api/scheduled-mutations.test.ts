@@ -30,9 +30,17 @@ import type { AuthedRequestContext } from '../router.js';
 
 // wakeContainer is mocked so run-now doesn't try to spawn a real container.
 const mockWakeContainer = vi.fn().mockResolvedValue(true);
+const mockAdmitDueTaskContexts = vi.fn().mockReturnValue(1);
 vi.mock('../../container-runner.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('../../container-runner.js')>();
   return { ...real, wakeContainer: (...args: unknown[]) => mockWakeContainer(...args) };
+});
+vi.mock('../../session-manager.js', async (importOriginal) => {
+  const real = await importOriginal<typeof import('../../session-manager.js')>();
+  return {
+    ...real,
+    admitDueTaskContexts: (...args: unknown[]) => mockAdmitDueTaskContexts(...args),
+  };
 });
 
 import {
@@ -137,16 +145,32 @@ function setClaim(outboundPath: string, messageId: string): void {
   db.close();
 }
 
-function liveRow(
-  seriesId: string,
-): { status: string; process_after: string | null; recurrence: string | null; content: string } | undefined {
+function liveRow(seriesId: string):
+  | {
+      id: string;
+      seq: number;
+      status: string;
+      trigger: number;
+      process_after: string | null;
+      recurrence: string | null;
+      content: string;
+    }
+  | undefined {
   const db = openInboundDb(path.join(TEST_DIR, 'v2-sessions', AG, SESS, 'inbound.db'));
   const row = db
     .prepare(
-      'SELECT status, process_after, recurrence, content FROM messages_in WHERE series_id = ? ORDER BY seq DESC LIMIT 1',
+      'SELECT id, seq, status, trigger, process_after, recurrence, content FROM messages_in WHERE series_id = ? ORDER BY seq DESC LIMIT 1',
     )
     .get(seriesId) as
-    | { status: string; process_after: string | null; recurrence: string | null; content: string }
+    | {
+        id: string;
+        seq: number;
+        status: string;
+        trigger: number;
+        process_after: string | null;
+        recurrence: string | null;
+        content: string;
+      }
     | undefined;
   db.close();
   return row;
@@ -190,6 +214,36 @@ beforeEach(() => {
   invalidateScheduledCache();
   _resetScheduledRateLimitForTesting();
   mockWakeContainer.mockClear();
+  mockAdmitDueTaskContexts.mockReset();
+  mockAdmitDueTaskContexts.mockImplementation((db: Database.Database) => {
+    const task = db
+      .prepare(
+        `SELECT id, timestamp, process_after
+           FROM messages_in
+          WHERE kind = 'task' AND status = 'pending' AND trigger = 0
+            AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))
+          ORDER BY seq
+          LIMIT 1`,
+      )
+      .get() as { id: string; timestamp: string; process_after: string | null } | undefined;
+    if (!task) return 0;
+    const maxSeq = (db.prepare('SELECT COALESCE(MAX(seq), 0) AS seq FROM messages_in').get() as { seq: number }).seq;
+    const recallSeq = maxSeq + 2 - (maxSeq % 2);
+    db.prepare(
+      `INSERT INTO messages_in
+         (id, seq, kind, timestamp, status, process_after, recurrence, series_id, trigger, content)
+       VALUES (?, ?, 'system', ?, 'pending', ?, NULL, ?, 0, ?)`,
+    ).run(
+      `recall-${task.id}`,
+      recallSeq,
+      task.timestamp,
+      task.process_after,
+      `recall-${task.id}`,
+      JSON.stringify({ subtype: 'recall_context', source: 'fresh-test-admission' }),
+    );
+    db.prepare('UPDATE messages_in SET seq = ?, trigger = 1 WHERE id = ? AND trigger = 0').run(recallSeq + 2, task.id);
+    return 1;
+  });
   _setMutationsTestOptions({ dataDir: TEST_DIR, nowMs: NOW });
   addUser('owner');
   grant('owner', 'owner', null);
@@ -222,6 +276,7 @@ describe('editHandler', () => {
     // process_after recomputed to the next 06:00 occurrence — strictly future, not the old 09:00 slot.
     expect(Date.parse(row.process_after!)).toBeGreaterThan(NOW);
     expect(row.process_after).not.toBe(isoIn(3600_000));
+    expect(row.trigger).toBe(0);
   });
 
   it('test_edit_invalid_cron_400', async () => {
@@ -301,6 +356,7 @@ describe('editHandler', () => {
     expect(parsed.prompt).toBe('new prompt');
     expect(parsed.script).toBe('echo old');
     expect(parsed.extra).toBe('keep');
+    expect(liveRow('ser-1')!.trigger).toBe(0);
   });
 
   it('gate: non-manage caller → 404; malformed key → 400', async () => {
@@ -421,6 +477,7 @@ describe('pause / resume', () => {
     const row = liveRow('ser-1')!;
     expect(row.status).toBe('pending');
     expect(Date.parse(row.process_after!)).toBeGreaterThan(NOW);
+    expect(row.trigger).toBe(0);
   });
 
   it('test_resume_recomputes_slot_no_immediate_fire', async () => {
@@ -457,9 +514,32 @@ describe('runNowHandler', () => {
     const res = (await runNowHandler(postReq(), { key: keyFor('ser-1') }, ctxFor('owner', OWNER_SCOPES)))!;
     expect(res.status).toBe(200);
     expect((await readJson(res)).fired).toBe(true);
-    // process_after set to ~now; wakeContainer called.
+    // Fresh due admission completes before the direct wake.
+    expect(mockAdmitDueTaskContexts).toHaveBeenCalledWith(expect.anything(), AG, SESS);
     expect(mockWakeContainer).toHaveBeenCalledTimes(1);
-    expect(Date.parse(liveRow('ser-1')!.process_after!)).toBeLessThanOrEqual(NOW + 1000);
+    expect(mockAdmitDueTaskContexts.mock.invocationCallOrder[0]).toBeLessThan(
+      mockWakeContainer.mock.invocationCallOrder[0]!,
+    );
+    const row = liveRow('ser-1')!;
+    expect(Date.parse(row.process_after!)).toBeLessThanOrEqual(NOW + 1000);
+    expect(row.trigger).toBe(1);
+  });
+
+  it('does not report fired or wake when fresh context admission fails', async () => {
+    const originalSlot = isoIn(30_000);
+    insertRow(seedSession().inbound, { id: 'r1', series_id: 'ser-1', process_after: originalSlot });
+    mockAdmitDueTaskContexts.mockReturnValueOnce(0);
+
+    const res = (await runNowHandler(
+      postReq({ force: true }),
+      { key: keyFor('ser-1') },
+      ctxFor('owner', OWNER_SCOPES),
+    ))!;
+
+    expect(res.status).toBe(503);
+    expect((await readJson(res)).error).toBe('context_admission_failed');
+    expect(mockWakeContainer).not.toHaveBeenCalled();
+    expect(liveRow('ser-1')).toMatchObject({ trigger: 0, process_after: originalSlot });
   });
 
   it('test_runnow_unknown_503', async () => {

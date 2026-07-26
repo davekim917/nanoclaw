@@ -1,0 +1,12 @@
+{
+  "acknowledgments": [
+    {
+      "id": "B1",
+      "reason": "The revised plan intentionally requires the operator-run, permanently snapshotted A2 migration before importing or link-replacing any substantive legacy tree. Reverting to automatic startup cutover would weaken the customization-first and reversible-migration invariants."
+    },
+    {
+      "id": "B2",
+      "reason": "Read-only inventory may hash live sources only for preview. It authorizes no mutation; apply must prove container absence, create and verify the permanent snapshot, and rehash every source before cutover, aborting on any mismatch."
+    }
+  ]
+}

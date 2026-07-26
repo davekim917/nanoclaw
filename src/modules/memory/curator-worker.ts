@@ -1,0 +1,588 @@
+import fs from 'fs';
+import path from 'path';
+import { randomUUID } from 'crypto';
+
+import { getDb } from '../../db/connection.js';
+import { listClaudeStructuredCredentialSlots, type ClaudeCredentialSlot } from '../../llm.js';
+import { log } from '../../log.js';
+import {
+  claimMemoryCurationEpisode,
+  claimMemoryMaintenance,
+  completeMemoryMaintenance,
+  completeMemoryCurationEpisode,
+  failMemoryMaintenance,
+  failMemoryCurationEpisode,
+  finishMemoryCurationCall,
+  markMemoryCurationCredentialAvailable,
+  markMemoryCurationCredentialUnavailable,
+  memoryCurationAdmission,
+  readMemoryCurationEpisodeMessages,
+  recordAcceptedGeneratedMemory,
+  recordMemoryCurationCall,
+  selectMemoryCurationCredential,
+  type MemoryCurationArchiveRow,
+  type MemoryCurationCredentialSelection,
+  type MemoryCurationEpisode,
+  type MemoryMaintenanceJob,
+} from '../../message-archive.js';
+import { tokenizeForRecall } from './pre-turn-context.js';
+import { workgroupMemoryDir } from '../workgroup/shared-dirs.js';
+import {
+  MemoryCuratorBackend,
+  MEMORY_CURATOR_EFFORT,
+  type CuratorBackendResult,
+  type MaintenanceBackendResult,
+} from './curator-backend.js';
+import {
+  buildCuratorPrompt,
+  buildMemoryMaintenancePrompt,
+  parseGeneratedMemoryFacts,
+  validateCuratorDecision,
+  validateMemoryMaintenanceDecision,
+  type CuratorDecision,
+} from './curator-contract.js';
+import { readGeneratedMemory, writeGeneratedMemory, type CuratorWriteResult } from './curator-write.js';
+
+const MAX_RAW_MESSAGES = 80;
+const MAX_EPISODE_MESSAGES = 20;
+const MAX_EPISODE_CHARS = 24_000;
+const MAX_MANUAL_FILES = 256;
+const MAX_MANUAL_SCAN_BYTES = 1_048_576;
+const MAX_MANUAL_FILE_BYTES = 65_536;
+const MAX_MANUAL_EXCERPTS = 3;
+const MAX_MANUAL_EXCERPT_CHARS = 1200;
+
+export interface MemoryCuratorRunReport {
+  workgroupId: string;
+  episodeKey: string;
+  action: CuratorDecision['action'] | 'maintenance_noop' | 'maintenance_written';
+  messageCount: number;
+  transcriptChars: number;
+  model?: string;
+  effort?: string;
+  credentialSlot?: string;
+  usage?: CuratorBackendResult['usage'];
+  elapsedMs: number;
+}
+
+export interface MemoryCuratorWorkerDependencies {
+  admission: (nowMs: number) => {
+    allowed: boolean;
+    hourly: number;
+    daily: number;
+    hourlyLimit: number;
+    dailyLimit: number;
+  };
+  credentials: () => ClaudeCredentialSlot[];
+  selectCredential: (slots: ClaudeCredentialSlot[], nowMs: number) => MemoryCurationCredentialSelection;
+  markCredentialUnavailable: (
+    slot: ClaudeCredentialSlot,
+    errorClass: 'quota' | 'auth',
+    nowMs: number,
+    retryAfterMs: number | null,
+  ) => string;
+  markCredentialAvailable: (slot: ClaudeCredentialSlot, nowMs: number) => void;
+  claim: (owner: string, nowMs: number) => MemoryCurationEpisode | null;
+  claimMaintenance: (owner: string, nowMs: number) => MemoryMaintenanceJob | null;
+  members: (workgroupId: string) => string[];
+  messages: (episode: MemoryCurationEpisode, members: string[]) => MemoryCurationArchiveRow[];
+  complete: (episode: MemoryCurationEpisode, nowMs: number) => boolean;
+  fail: (episode: MemoryCurationEpisode, errorClass: string, nowMs: number) => boolean;
+  completeMaintenance: (job: MemoryMaintenanceJob, nowMs: number) => boolean;
+  failMaintenance: (job: MemoryMaintenanceJob, nowMs: number) => boolean;
+  recordCall: (id: string, workgroupId: string, credentialSlot: ClaudeCredentialSlot, nowMs: number) => boolean;
+  finishCall: (id: string, outcome: string) => void;
+  readGenerated: (workgroupId: string) => { content: string; sha256: string | null };
+  writeGenerated: (
+    workgroupId: string,
+    content: string,
+    expectedSha256: string | null,
+    nowMs: number,
+  ) => Promise<CuratorWriteResult>;
+  recordAccepted: (workgroupId: string, contentBytes: number, nowMs: number) => void;
+  manualMemory: (workgroupId: string, query: string) => Array<{ path: string; text: string }>;
+  curate: (
+    system: string,
+    user: string,
+    credentialSlot: ClaudeCredentialSlot,
+    signal?: AbortSignal,
+  ) => Promise<CuratorBackendResult>;
+  maintain: (
+    system: string,
+    user: string,
+    credentialSlot: ClaudeCredentialSlot,
+    signal?: AbortSignal,
+  ) => Promise<MaintenanceBackendResult>;
+  uuid: () => string;
+}
+
+function actualDependencies(): MemoryCuratorWorkerDependencies {
+  const backend = new MemoryCuratorBackend();
+  return {
+    admission: (nowMs) => memoryCurationAdmission({ nowMs }),
+    credentials: () => listClaudeStructuredCredentialSlots(),
+    selectCredential: (slots, nowMs) => selectMemoryCurationCredential(slots, { nowMs }),
+    markCredentialUnavailable: (slot, errorClass, nowMs, retryAfterMs) =>
+      markMemoryCurationCredentialUnavailable(slot, errorClass, { nowMs, retryAfterMs }),
+    markCredentialAvailable: (slot, nowMs) => markMemoryCurationCredentialAvailable(slot, { nowMs }),
+    claim: (owner, nowMs) => claimMemoryCurationEpisode(owner, { nowMs }),
+    claimMaintenance: (owner, nowMs) => claimMemoryMaintenance(owner, { nowMs }),
+    members: getWorkgroupMemberIds,
+    messages: (episode, members) => readMemoryCurationEpisodeMessages(episode, members, MAX_RAW_MESSAGES),
+    complete: (episode, nowMs) => completeMemoryCurationEpisode(episode, { nowMs }),
+    fail: (episode, errorClass, nowMs) => failMemoryCurationEpisode(episode, errorClass, { nowMs }),
+    completeMaintenance: (job, nowMs) => completeMemoryMaintenance(job, { nowMs }),
+    failMaintenance: (job, nowMs) => failMemoryMaintenance(job, { nowMs }),
+    recordCall: (id, workgroupId, credentialSlot, nowMs) =>
+      recordMemoryCurationCall(id, workgroupId, { nowMs, credentialSlot }),
+    finishCall: finishMemoryCurationCall,
+    readGenerated: readGeneratedMemory,
+    writeGenerated: (workgroupId, content, expectedSha256, nowMs) =>
+      writeGeneratedMemory(workgroupId, content, expectedSha256, { nowMs }),
+    recordAccepted: (workgroupId, contentBytes, nowMs) =>
+      recordAcceptedGeneratedMemory(workgroupId, contentBytes, { nowMs }),
+    manualMemory: readRelevantManualMemory,
+    curate: (system, user, credentialSlot, signal) => backend.curate(system, user, credentialSlot, signal),
+    maintain: (system, user, credentialSlot, signal) => backend.maintain(system, user, credentialSlot, signal),
+    uuid: randomUUID,
+  };
+}
+
+export function isMemoryCuratorEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return /^(?:1|true|yes|on)$/i.test(env.NANOCLAW_MEMORY_CURATOR_ENABLED ?? '');
+}
+
+export function getWorkgroupMemberIds(workgroupId: string): string[] {
+  return (
+    getDb().prepare('SELECT id FROM agent_groups WHERE workgroup_id = ? ORDER BY id').all(workgroupId) as Array<{
+      id: string;
+    }>
+  ).map((row) => row.id);
+}
+
+function normalizeDuplicateKey(message: MemoryCurationArchiveRow): string {
+  return `${message.role}\0${message.sentAt}\0${message.text.replace(/\s+/g, ' ').trim()}`;
+}
+
+export function boundEpisodeMessages(raw: MemoryCurationArchiveRow[]): {
+  messages: MemoryCurationArchiveRow[];
+  handledThroughRowid: number;
+  transcriptChars: number;
+} {
+  const messages: MemoryCurationArchiveRow[] = [];
+  const seen = new Set<string>();
+  let transcriptChars = 0;
+  let handledThroughRowid = raw[0]?.rowid ?? 0;
+  for (const item of raw) {
+    if (messages.length >= MAX_EPISODE_MESSAGES || transcriptChars >= MAX_EPISODE_CHARS) break;
+    handledThroughRowid = item.rowid;
+    const key = normalizeDuplicateKey(item);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const remaining = MAX_EPISODE_CHARS - transcriptChars;
+    const text =
+      item.text.length <= remaining
+        ? item.text
+        : `${item.text.slice(0, Math.max(0, remaining - 24))}\n[truncated:episode]`;
+    messages.push({ ...item, text });
+    transcriptChars += text.length;
+  }
+  return { messages, handledThroughRowid, transcriptChars };
+}
+
+function safeReadManualFile(filePath: string, canonicalRoot: string, maxBytes: number): string | null {
+  let fd: number | null = null;
+  try {
+    fd = fs.openSync(filePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    const opened = fs.fstatSync(fd);
+    if (!opened.isFile()) return null;
+    const resolved = fs.realpathSync(filePath);
+    const relative = path.relative(canonicalRoot, resolved);
+    if (relative.startsWith('..') || path.isAbsolute(relative)) return null;
+    const resolvedStat = fs.statSync(resolved);
+    if (!resolvedStat.isFile() || resolvedStat.dev !== opened.dev || resolvedStat.ino !== opened.ino) return null;
+    const bytes = Math.min(opened.size, maxBytes, MAX_MANUAL_FILE_BYTES);
+    const buffer = Buffer.alloc(bytes);
+    const read = bytes > 0 ? fs.readSync(fd, buffer, 0, bytes, 0) : 0;
+    return buffer.subarray(0, read).toString('utf8');
+  } catch {
+    return null;
+  } finally {
+    if (fd !== null) fs.closeSync(fd);
+  }
+}
+
+export function readRelevantManualMemory(workgroupId: string, query: string): Array<{ path: string; text: string }> {
+  const root = workgroupMemoryDir(workgroupId);
+  if (!fs.existsSync(root)) return [];
+  const rootStat = fs.lstatSync(root);
+  const workgroupRoot = path.dirname(root);
+  const workgroupStat = fs.lstatSync(workgroupRoot);
+  if (
+    rootStat.isSymbolicLink() ||
+    !rootStat.isDirectory() ||
+    workgroupStat.isSymbolicLink() ||
+    !workgroupStat.isDirectory()
+  ) {
+    return [];
+  }
+  const canonicalWorkgroupRoot = fs.realpathSync(workgroupRoot);
+  const canonicalRoot = fs.realpathSync(root);
+  if (path.dirname(canonicalRoot) !== canonicalWorkgroupRoot) return [];
+  const queryTokens = new Set(tokenizeForRecall(query));
+  if (queryTokens.size === 0) return [];
+  const pending = [''];
+  const candidates: Array<{ path: string; text: string; score: number }> = [];
+  let visited = 0;
+  let scanned = 0;
+  while (pending.length > 0 && visited < MAX_MANUAL_FILES && scanned < MAX_MANUAL_SCAN_BYTES) {
+    const relativeDir = pending.shift()!;
+    const absoluteDir = path.join(canonicalRoot, relativeDir);
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(absoluteDir, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (visited++ >= MAX_MANUAL_FILES || scanned >= MAX_MANUAL_SCAN_BYTES) break;
+      const relative = path.posix.join(relativeDir.split(path.sep).join('/'), entry.name);
+      if (entry.isSymbolicLink()) continue;
+      if (entry.isDirectory()) {
+        if (relative === 'generated' || relative.startsWith('.')) continue;
+        pending.push(relative);
+        continue;
+      }
+      if (!entry.isFile() || !entry.name.toLowerCase().endsWith('.md')) continue;
+      if (relative === 'system/definition.md') continue;
+      const text = safeReadManualFile(
+        path.join(canonicalRoot, relative),
+        canonicalRoot,
+        MAX_MANUAL_SCAN_BYTES - scanned,
+      );
+      if (text === null) continue;
+      scanned += Buffer.byteLength(text);
+      const tokens = new Set(tokenizeForRecall(text));
+      let score = 0;
+      for (const token of queryTokens) if (tokens.has(token)) score++;
+      if (score > 0) {
+        candidates.push({
+          path: relative,
+          text: text.slice(0, MAX_MANUAL_EXCERPT_CHARS),
+          score,
+        });
+      }
+    }
+  }
+  return candidates
+    .sort((a, b) => b.score - a.score || a.path.localeCompare(b.path))
+    .slice(0, MAX_MANUAL_EXCERPTS)
+    .map(({ path: relativePath, text }) => ({ path: relativePath, text }));
+}
+
+function classifyError(error: unknown): string {
+  const status = (error as { status?: number }).status;
+  if (status === 429) return 'quota';
+  if (status === 401 || status === 403) return 'auth';
+  if (typeof status === 'number' && status >= 500) return 'provider_5xx';
+  if ((error as Error)?.name === 'AbortError') return 'timeout';
+  const message = error instanceof Error ? error.message : String(error);
+  if (/\b429\b/.test(message)) return 'quota';
+  if (/\b(?:401|403)\b/.test(message)) return 'auth';
+  if (/\b5\d\d\b/.test(message)) return 'provider_5xx';
+  if (/conflict/i.test(message)) return 'write_conflict';
+  if (/secret|evidence|memory id|curator|JSON|model mismatch|refused/i.test(message)) return 'validation';
+  return 'unexpected';
+}
+
+function retryAfterMs(error: unknown): number | null {
+  const value = (error as { retryAfterMs?: unknown }).retryAfterMs;
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+interface SuccessfulModelAttempt<T> {
+  result: T;
+  callId: string;
+}
+
+export class MemoryCuratorWorker {
+  constructor(private readonly deps: MemoryCuratorWorkerDependencies = actualDependencies()) {}
+
+  async runOne(nowMs = Date.now(), signal?: AbortSignal): Promise<MemoryCuratorRunReport | null> {
+    const admission = this.deps.admission(nowMs);
+    if (!admission.allowed) {
+      logAdmissionExhausted(nowMs, admission);
+      return null;
+    }
+    const credentials = this.deps.credentials();
+    const availability = this.deps.selectCredential(credentials, nowMs);
+    if (!availability.slot) {
+      logCredentialUnavailable(nowMs, {
+        retryAt: availability.retryAt,
+        unavailableSlots: availability.unavailableSlots,
+        configuredSlots: credentials,
+      });
+      return null;
+    }
+    const owner = `memory-curator-${this.deps.uuid()}`;
+    const maintenance = await this.runMaintenance(owner, credentials, nowMs, signal);
+    if (maintenance !== undefined) return maintenance;
+    const episode = this.deps.claim(owner, nowMs);
+    if (!episode) return null;
+    const started = Date.now();
+    let callId: string | null = null;
+    let outcome = 'failed';
+    try {
+      const members = this.deps.members(episode.workgroupId);
+      const raw = this.deps.messages(episode, members);
+      if (raw.length === 0) {
+        if (!this.deps.complete(episode, nowMs)) throw new Error('memory curator lost its empty episode lease');
+        return {
+          workgroupId: episode.workgroupId,
+          episodeKey: episode.episodeKey,
+          action: 'noop',
+          messageCount: 0,
+          transcriptChars: 0,
+          elapsedMs: Date.now() - started,
+        };
+      }
+      const bounded = boundEpisodeMessages(raw);
+      const handledEpisode = { ...episode, claimedThroughRowid: bounded.handledThroughRowid };
+      const generated = this.deps.readGenerated(episode.workgroupId);
+      const query = bounded.messages.map((message) => message.text).join('\n');
+      const manual = this.deps.manualMemory(episode.workgroupId, query);
+      const prompt = buildCuratorPrompt({
+        workgroupId: episode.workgroupId,
+        messages: bounded.messages,
+        generatedMemory: generated.content,
+        relevantManualMemory: manual,
+        boundary: this.deps.uuid().replaceAll('-', ''),
+      });
+      const attempt = await this.runModelWithFailover(
+        'memory-curator',
+        episode.workgroupId,
+        credentials,
+        nowMs,
+        (slot) => this.deps.curate(prompt.system, prompt.user, slot, signal),
+      );
+      callId = attempt.callId;
+      const backend = attempt.result;
+      const priorEvidence = parseGeneratedMemoryFacts(generated.content).flatMap((fact) => fact.evidenceIds);
+      const allowedEvidenceIds = new Set([...priorEvidence, ...bounded.messages.map((message) => message.id)]);
+      const decision = validateCuratorDecision(backend.decision, {
+        currentContent: generated.content,
+        allowedEvidenceIds,
+        currentEpisodeEvidence: new Map(bounded.messages.map((message) => [message.id, message.sentAt])),
+      });
+      if (decision.action === 'replace_generated_memory') {
+        const write = await this.deps.writeGenerated(episode.workgroupId, decision.content, generated.sha256, nowMs);
+        if (write.status !== 'success') throw new Error(`memory write ${write.status}: ${write.error ?? 'unknown'}`);
+        this.deps.recordAccepted(episode.workgroupId, Buffer.byteLength(decision.content, 'utf8'), nowMs);
+      }
+      if (!this.deps.complete(handledEpisode, nowMs)) throw new Error('memory curator lost its episode lease');
+      outcome = decision.action === 'noop' ? 'noop' : 'memory_written';
+      return {
+        workgroupId: episode.workgroupId,
+        episodeKey: episode.episodeKey,
+        action: decision.action,
+        messageCount: bounded.messages.length,
+        transcriptChars: bounded.transcriptChars,
+        model: backend.model,
+        effort: MEMORY_CURATOR_EFFORT,
+        credentialSlot: backend.credentialSlot,
+        usage: backend.usage,
+        elapsedMs: Date.now() - started,
+      };
+    } catch (error) {
+      const errorClass = classifyError(error);
+      this.deps.fail(episode, errorClass, nowMs);
+      log.warn('memory-curator: episode failed', {
+        workgroupId: episode.workgroupId,
+        episodeKey: episode.episodeKey,
+        errorClass,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    } finally {
+      if (callId) this.deps.finishCall(callId, outcome);
+    }
+  }
+
+  private async runMaintenance(
+    owner: string,
+    credentials: ClaudeCredentialSlot[],
+    nowMs: number,
+    signal?: AbortSignal,
+  ): Promise<MemoryCuratorRunReport | null | undefined> {
+    const job = this.deps.claimMaintenance(owner, nowMs);
+    if (!job) return undefined;
+    const started = Date.now();
+    let callId: string | null = null;
+    let outcome = 'maintenance_failed';
+    try {
+      const generated = this.deps.readGenerated(job.workgroupId);
+      if (!generated.content || parseGeneratedMemoryFacts(generated.content).length === 0) {
+        if (!this.deps.completeMaintenance(job, nowMs)) throw new Error('memory maintenance lost its empty lease');
+        return {
+          workgroupId: job.workgroupId,
+          episodeKey: 'maintenance',
+          action: 'maintenance_noop',
+          messageCount: 0,
+          transcriptChars: 0,
+          elapsedMs: Date.now() - started,
+        };
+      }
+      const prompt = buildMemoryMaintenancePrompt(generated.content, this.deps.uuid().replaceAll('-', ''));
+      const attempt = await this.runModelWithFailover(
+        'memory-maintenance',
+        job.workgroupId,
+        credentials,
+        nowMs,
+        (slot) => this.deps.maintain(prompt.system, prompt.user, slot, signal),
+      );
+      callId = attempt.callId;
+      const backend = attempt.result;
+      const decision = validateMemoryMaintenanceDecision(backend.decision, generated.content);
+      if (decision.action === 'replace_generated_memory') {
+        const write = await this.deps.writeGenerated(job.workgroupId, decision.content, generated.sha256, nowMs);
+        if (write.status !== 'success') {
+          throw new Error(`memory maintenance write ${write.status}: ${write.error ?? 'unknown'}`);
+        }
+      }
+      if (!this.deps.completeMaintenance(job, nowMs)) throw new Error('memory maintenance lost its lease');
+      const maintenanceAction =
+        decision.action === 'noop' ? ('maintenance_noop' as const) : ('maintenance_written' as const);
+      outcome = maintenanceAction;
+      return {
+        workgroupId: job.workgroupId,
+        episodeKey: 'maintenance',
+        action: maintenanceAction,
+        messageCount: 0,
+        transcriptChars: generated.content.length,
+        model: backend.model,
+        effort: MEMORY_CURATOR_EFFORT,
+        credentialSlot: backend.credentialSlot,
+        usage: backend.usage,
+        elapsedMs: Date.now() - started,
+      };
+    } catch (error) {
+      this.deps.failMaintenance(job, nowMs);
+      log.warn('memory-curator: maintenance failed', {
+        workgroupId: job.workgroupId,
+        errorClass: classifyError(error),
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return null;
+    } finally {
+      if (callId) this.deps.finishCall(callId, outcome);
+    }
+  }
+
+  private async runModelWithFailover<T>(
+    callPrefix: string,
+    workgroupId: string,
+    credentials: ClaudeCredentialSlot[],
+    nowMs: number,
+    execute: (slot: ClaudeCredentialSlot) => Promise<T>,
+  ): Promise<SuccessfulModelAttempt<T>> {
+    const remaining = new Set(credentials);
+    let lastCredentialError: unknown = null;
+    while (remaining.size > 0) {
+      const admission = this.deps.admission(nowMs);
+      if (!admission.allowed) {
+        throw new Error(
+          `memory curator model-call admission exhausted (${admission.hourly}/${admission.hourlyLimit} hourly, ` +
+            `${admission.daily}/${admission.dailyLimit} daily)`,
+        );
+      }
+      const selection = this.deps.selectCredential([...remaining], nowMs);
+      if (!selection.slot) break;
+      const slot = selection.slot as ClaudeCredentialSlot;
+      remaining.delete(slot);
+      const callId = `${callPrefix}-${this.deps.uuid()}`;
+      if (!this.deps.recordCall(callId, workgroupId, slot, nowMs)) {
+        throw new Error('memory curator could not record model-call admission');
+      }
+      try {
+        const result = await execute(slot);
+        this.deps.markCredentialAvailable(slot, nowMs);
+        return { result, callId };
+      } catch (error) {
+        const errorClass = classifyError(error);
+        this.deps.finishCall(callId, errorClass);
+        if (errorClass !== 'quota' && errorClass !== 'auth') throw error;
+        lastCredentialError = error;
+        const unavailableUntil = this.deps.markCredentialUnavailable(slot, errorClass, nowMs, retryAfterMs(error));
+        log.warn('memory-curator: credential unavailable; trying sibling credential', {
+          credentialSlot: slot,
+          errorClass,
+          unavailableUntil,
+          remainingCredentials: remaining.size,
+        });
+      }
+    }
+    if (lastCredentialError) throw lastCredentialError;
+    throw new Error('memory curator has no currently available Anthropic credential');
+  }
+}
+
+let activePump: Promise<MemoryCuratorRunReport | null> | null = null;
+let activeController: AbortController | null = null;
+let lastCredentialUnavailableWarningMs = 0;
+let lastAdmissionWarningMs = 0;
+
+function logAdmissionExhausted(
+  nowMs: number,
+  admission: {
+    hourly: number;
+    daily: number;
+    hourlyLimit: number;
+    dailyLimit: number;
+  },
+): void {
+  if (nowMs - lastAdmissionWarningMs < 15 * 60_000) return;
+  lastAdmissionWarningMs = nowMs;
+  log.warn('memory-curator: admission limit delaying durable queue', admission);
+}
+
+function logCredentialUnavailable(
+  nowMs: number,
+  details: {
+    retryAt: string | null;
+    unavailableSlots: string[];
+    configuredSlots: string[];
+  },
+): void {
+  if (nowMs - lastCredentialUnavailableWarningMs < 15 * 60_000) return;
+  lastCredentialUnavailableWarningMs = nowMs;
+  log.warn('memory-curator: all credentials unavailable; durable queue retained', details);
+}
+
+export function runMemoryCurationInBackground(): Promise<MemoryCuratorRunReport | null> {
+  if (!isMemoryCuratorEnabled()) return Promise.resolve(null);
+  if (activePump) return activePump;
+  activeController = new AbortController();
+  activePump = new MemoryCuratorWorker()
+    .runOne(Date.now(), activeController.signal)
+    .then((report) => {
+      if (report) log.info('memory-curator: episode complete', { ...report });
+      return report;
+    })
+    .finally(() => {
+      activePump = null;
+      activeController = null;
+    });
+  return activePump;
+}
+
+export function stopMemoryCurationInBackground(): void {
+  activeController?.abort();
+}
+
+export function _resetMemoryCuratorPumpForTest(): void {
+  activeController?.abort();
+  activePump = null;
+  activeController = null;
+  lastCredentialUnavailableWarningMs = 0;
+  lastAdmissionWarningMs = 0;
+}

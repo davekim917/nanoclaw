@@ -43,6 +43,12 @@ import { updateContainerConfigScalars } from './db/container-configs.js';
 import { CONTAINER_RUNTIME_BIN, hostGatewayArgs, readonlyMountArgs, stopContainer } from './container-runtime.js';
 import { checkAgentRunnerDepsDrift } from './agent-runner-image-check.js';
 import { EGRESS_NETWORK, egressNetworkArgs, ensureEgressNetwork } from './egress-lockdown.js';
+import {
+  assertRealDirectory,
+  removeUntrustedPathEntry,
+  replaceUntrustedDirectory,
+  replaceUntrustedFile,
+} from './fs-safety.js';
 import { composeGroupClaudeMd } from './claude-md-compose.js';
 // resolveEffectiveModel applies the family-default map, MODEL_ALIAS_MAP and
 // ensureOpus1mSuffix — see its use below.
@@ -56,7 +62,13 @@ import { initGroupFilesystem } from './group-init.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { applyOnecliSecrets, mergeWorkgroupAndGroupSecrets, slackUserTokenSecrets } from './onecli-secrets.js';
-import { workgroupSharedDir, WORKGROUP_CONTAINER_PATH } from './modules/workgroup/shared-dirs.js';
+import {
+  reconcileWorkgroupMemory,
+  workgroupMemoryDir,
+  workgroupSharedDir,
+  WORKGROUP_CONTAINER_PATH,
+  WORKGROUP_MEMORY_CONTAINER_PATH,
+} from './modules/workgroup/shared-dirs.js';
 import type Database from 'better-sqlite3';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
 import YAML from 'yaml';
@@ -73,6 +85,7 @@ import {
 } from './providers/provider-container-registry.js';
 import { getSessionClaudeMounts } from './session-claude-mounts.js';
 import {
+  CLAUDE_CODE_PROJECTS_DIR,
   graphifyRuntimeDir,
   heartbeatPath,
   markContainerRunning,
@@ -591,12 +604,19 @@ async function spawnContainer(session: Session, storageActivity: StorageActivity
   // which would race against any concurrent reconcile.
   const { workgroupId: resolvedWgId } = reconcileWorkgroupAtSpawn(getDb(), agentGroup, containerConfig);
 
+  const [memoryReport] = reconcileWorkgroupMemory(getDb(), { workgroupIds: [resolvedWgId] });
+  if (!memoryReport || memoryReport.state.status === 'migration-required') {
+    throw new Error(
+      `Workgroup memory migration-required for ${resolvedWgId}; refusing container spawn before operator migration`,
+    );
+  }
+
   // Per-group filesystem state lives forever after first creation. Init is
   // idempotent: it only writes paths that don't already exist, so this call
   // is a no-op for groups that have spawned before. Runs before the provider
   // contribution so a surfaces-providing provider finds the group dir ready.
   const providerName = resolveProviderName(session.agent_provider, containerConfig.provider);
-  initGroupFilesystem(agentGroup, { provider: providerName });
+  initGroupFilesystem({ ...agentGroup, workgroup_id: resolvedWgId }, { provider: providerName });
 
   // Resolve the effective provider + any host-side contribution it declares
   // (extra mounts, env passthrough). Computed once and threaded through both
@@ -936,6 +956,60 @@ export function resolveCodexAuthFallbacks(
     out.push({ hostPath: expanded, containerPath: `/home/node/.codex-fallback-${out.length + 1}` });
   }
   return out;
+}
+
+/**
+ * Build a session-local CODEX_HOME for one fallback identity. Only the two
+ * pieces of mutable identity/history state that must survive are bind-mounted
+ * from the host home: auth.json and sessions/. Config, hooks, agents, and
+ * plugin state are generated inside the NanoClaw session.
+ */
+export function materializeCodexFallbackRuntime(fallback: CodexAuthFallback, runtimeHostPath: string): VolumeMount[] {
+  fs.mkdirSync(runtimeHostPath, { recursive: true });
+  assertRealDirectory(runtimeHostPath);
+  assertRealDirectory(fallback.hostPath);
+  removeUntrustedPathEntry(runtimeHostPath, 'plugins');
+  removeUntrustedPathEntry(runtimeHostPath, '.tmp');
+
+  const hostConfig = path.join(fallback.hostPath, 'config.toml');
+  const hostConfigStat = fs.lstatSync(hostConfig, { throwIfNoEntry: false });
+  if (hostConfigStat && (hostConfigStat.isSymbolicLink() || !hostConfigStat.isFile())) {
+    throw new Error(`Unsafe fallback config file: ${hostConfig}`);
+  }
+  const fallbackAuth = path.join(fallback.hostPath, 'auth.json');
+  const fallbackAuthStat = fs.lstatSync(fallbackAuth, { throwIfNoEntry: false });
+  if (!fallbackAuthStat || fallbackAuthStat.isSymbolicLink() || !fallbackAuthStat.isFile()) {
+    throw new Error(`Unsafe fallback auth file: ${fallbackAuth}`);
+  }
+  const configContents = hostConfigStat ? fs.readFileSync(hostConfig) : '';
+  replaceUntrustedFile(runtimeHostPath, 'config.toml', configContents);
+
+  // Docker file bind targets must exist before the parent runtime-home mount.
+  replaceUntrustedFile(runtimeHostPath, 'auth.json', '');
+
+  const mounts: VolumeMount[] = [
+    { hostPath: runtimeHostPath, containerPath: fallback.containerPath, readonly: false },
+    {
+      hostPath: fallbackAuth,
+      containerPath: `${fallback.containerPath}/auth.json`,
+      readonly: false,
+    },
+  ];
+
+  const hostSessions = path.join(fallback.hostPath, 'sessions');
+  const hostSessionsStat = fs.lstatSync(hostSessions, { throwIfNoEntry: false });
+  if (hostSessionsStat === undefined) {
+    fs.mkdirSync(hostSessions);
+  } else if (hostSessionsStat.isSymbolicLink() || !hostSessionsStat.isDirectory()) {
+    throw new Error(`Unsafe fallback sessions directory: ${hostSessions}`);
+  }
+  replaceUntrustedDirectory(runtimeHostPath, 'sessions');
+  mounts.push({
+    hostPath: hostSessions,
+    containerPath: `${fallback.containerPath}/sessions`,
+    readonly: false,
+  });
+  return mounts;
 }
 
 /**
@@ -1414,6 +1488,12 @@ export function buildMounts(
     fs.mkdirSync(wgShared, { recursive: true });
     mounts.push({ hostPath: wgShared, containerPath: WORKGROUP_CONTAINER_PATH, readonly: false });
   }
+  // These nested mounts are unconditional. In memory-only mode
+  // /workspace/workgroup itself is container-local, so the lock needs its own
+  // host bind to make every provider and sibling flock the exact same inode.
+  // In full shared-FS mode the file overlay comes after the parent mount,
+  // which also prevents the container from unlinking/replacing the inode.
+  mounts.push(...resolveWorkgroupMemoryMounts(wgId));
 
   // container.json — nested RO mount on top of RW group dir so the agent
   // can read its config but cannot modify it.
@@ -1444,13 +1524,20 @@ export function buildMounts(
     mounts.push({ hostPath: globalDir, containerPath: '/workspace/global', readonly: true });
   }
 
-  // .claude mount triple (group-shared parent + per-session projects overlay
-  // + group-shared memory overlay). See session-claude-mounts.ts for the
-  // ordering invariant and the race it prevents. Gated on defaultSurfaces: a
-  // provider that owns its agent surfaces (providesAgentSurfaces) must not get
-  // the Claude state mounted. No-op for claude/codex/opencode (all default).
+  // Ordered .claude mounts (group-shared parent + skills + per-session project
+  // overlay + native-memory overlay). Validate the exact final legacy
+  // native-memory mount and replace it with the canonical workgroup tree RO;
+  // the guarded provider-neutral path above remains RW. Gated on
+  // defaultSurfaces: a provider that owns its agent surfaces
+  // (providesAgentSurfaces) must not get Claude state mounted.
   if (defaultSurfaces) {
-    mounts.push(...getSessionClaudeMounts(agentGroup, session));
+    mounts.push(
+      ...replaceClaudeNativeMemoryMount(getSessionClaudeMounts(agentGroup, session), {
+        provider,
+        agentGroupId: agentGroup.id,
+        workgroupId: wgId,
+      }),
+    );
   }
 
   // Shared CLAUDE.md — read-only, imported by the composed entry point via
@@ -1716,8 +1803,17 @@ export function buildMounts(
       // /home/node/.codex mount source is that path or a session-local
       // copy. Lets a fallback declaration matching the primary be skipped.
       const resolvedFallbacks = resolveCodexAuthFallbacks(containerConfig.codexAuthFallbacks, primaryHostPath);
-      resolvedFallbacks.forEach((entry) => {
-        mounts.push({ hostPath: entry.hostPath, containerPath: entry.containerPath, readonly: false });
+      resolvedFallbacks.forEach((entry, index) => {
+        if (providerHasCodexMount) {
+          const fallbackRuntime = path.join(
+            sessionDir(agentGroup.id, session.id),
+            'codex-fallbacks',
+            String(index + 1),
+          );
+          mounts.push(...materializeCodexFallbackRuntime(entry, fallbackRuntime));
+        } else {
+          mounts.push({ hostPath: entry.hostPath, containerPath: entry.containerPath, readonly: false });
+        }
       });
     }
   }
@@ -2191,6 +2287,100 @@ export function buildMounts(
   return mounts;
 }
 
+export function resolveWorkgroupMemoryMount(workgroupId: string, dataDir: string = DATA_DIR): VolumeMount {
+  return {
+    hostPath: workgroupMemoryDir(workgroupId, dataDir),
+    containerPath: WORKGROUP_MEMORY_CONTAINER_PATH,
+    readonly: false,
+  };
+}
+
+export const WORKGROUP_MEMORY_LOCK_CONTAINER_PATH = `${WORKGROUP_CONTAINER_PATH}/.memory-write.lock`;
+
+/**
+ * Prepare the stable workgroup-wide kernel-lock inode and return its exact
+ * file bind mount. The sidecar lives beside (never inside) the canonical
+ * memory tree, so coordination metadata cannot affect memory tree hashes.
+ *
+ * The first caller creates the file exclusively at 0600. Later callers only
+ * inspect the existing inode through O_NOFOLLOW and never truncate, unlink, or
+ * rewrite it; the in-container writer owns the flock-protected metadata.
+ */
+export function resolveWorkgroupMemoryLockMount(workgroupId: string, dataDir: string = DATA_DIR): VolumeMount {
+  const workgroupDir = path.dirname(workgroupMemoryDir(workgroupId, dataDir));
+  const lockPath = path.join(workgroupDir, '.memory-write.lock');
+  fs.mkdirSync(workgroupDir, { recursive: true });
+
+  let fd: number;
+  try {
+    fd = fs.openSync(lockPath, 'wx+', 0o600);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+    fd = fs.openSync(lockPath, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK | fs.constants.O_NOFOLLOW);
+  }
+
+  try {
+    if (!fs.fstatSync(fd).isFile()) {
+      throw new Error(`Workgroup memory lock is not a regular file: ${lockPath}`);
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+
+  return {
+    hostPath: lockPath,
+    containerPath: WORKGROUP_MEMORY_LOCK_CONTAINER_PATH,
+    readonly: false,
+  };
+}
+
+/** Provider-neutral nested mounts, ordered memory first and lock overlay last. */
+export function resolveWorkgroupMemoryMounts(workgroupId: string, dataDir: string = DATA_DIR): VolumeMount[] {
+  return [resolveWorkgroupMemoryMount(workgroupId, dataDir), resolveWorkgroupMemoryLockMount(workgroupId, dataDir)];
+}
+
+export function replaceClaudeNativeMemoryMount(
+  claudeMounts: readonly VolumeMount[],
+  options: {
+    provider: string;
+    agentGroupId: string;
+    workgroupId: string;
+    dataDir?: string;
+  },
+): VolumeMount[] {
+  const dataDir = options.dataDir ?? DATA_DIR;
+  const expectedNative: VolumeMount = {
+    hostPath: path.join(
+      dataDir,
+      'v2-sessions',
+      options.agentGroupId,
+      '.claude-shared',
+      'projects',
+      CLAUDE_CODE_PROJECTS_DIR,
+      'memory',
+    ),
+    containerPath: `/home/node/.claude/projects/${CLAUDE_CODE_PROJECTS_DIR}/memory`,
+    readonly: false,
+  };
+  const actualNative = claudeMounts.at(-1);
+  if (
+    !actualNative ||
+    actualNative.hostPath !== expectedNative.hostPath ||
+    actualNative.containerPath !== expectedNative.containerPath ||
+    actualNative.readonly !== expectedNative.readonly
+  ) {
+    throw new Error(`Provider ${options.provider} did not return the exact final Claude native-memory mount contract`);
+  }
+  return [
+    ...claudeMounts.slice(0, -1),
+    {
+      hostPath: workgroupMemoryDir(options.workgroupId, dataDir),
+      containerPath: expectedNative.containerPath,
+      readonly: true,
+    },
+  ];
+}
+
 /**
  * Sync skill symlinks in .claude-shared/skills/ to match the container.json
  * selection. Each symlink points to a container path (/app/skills/<name>)
@@ -2208,7 +2398,7 @@ function syncSkillSymlinks(claudeDir: string, containerConfig: import('./contain
   // Remove symlinks not in the desired set
   for (const entry of fs.readdirSync(skillsDir)) {
     const entryPath = path.join(skillsDir, entry);
-    let isSymlink = false;
+    let isSymlink: boolean;
     try {
       isSymlink = fs.lstatSync(entryPath).isSymbolicLink();
     } catch {
@@ -2657,7 +2847,7 @@ async function buildContainerArgs(
   // Format: colon-joined container paths in mount order, which is the same
   // as declaration order in codexAuthFallbacks (see resolveCodexAuthFallbacks).
   const codexFallbackPaths = mounts
-    .filter((m) => m.containerPath.startsWith('/home/node/.codex-fallback-'))
+    .filter((m) => /^\/home\/node\/\.codex-fallback-\d+$/.test(m.containerPath))
     .map((m) => m.containerPath);
   if (codexFallbackPaths.length > 0) {
     args.push('-e', `CODEX_FALLBACK_HOMES=${codexFallbackPaths.join(':')}`);

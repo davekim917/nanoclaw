@@ -11,6 +11,7 @@ vi.mock('./config.js', async (importOriginal) => ({
   ...(await importOriginal<typeof import('./config.js')>()),
   DATA_DIR: '/tmp/nanoclaw-provider-surfaces-test/data',
   GROUPS_DIR: '/tmp/nanoclaw-provider-surfaces-test/groups',
+  WORKGROUP_SHARED_FS: false,
 }));
 
 vi.mock('./log.js', async (importOriginal) => ({
@@ -39,9 +40,12 @@ import { buildMounts } from './container-runner.js';
 import { closeDb, createAgentGroup, getDb, initTestDb, runMigrations } from './db/index.js';
 import { ensureContainerConfig } from './db/container-configs.js';
 import { initGroupFilesystem } from './group-init.js';
-import { PERSONA_PREPEND_FILE } from './group-persona.js';
-import { log } from './log.js';
-import { registerProviderContainerConfig } from './providers/provider-container-registry.js';
+import { PERSONA_PREPEND_FILE, readGroupPersona } from './group-persona.js';
+import {
+  getProviderContainerConfig,
+  registerProviderContainerConfig,
+  type ProviderContainerContribution,
+} from './providers/provider-container-registry.js';
 import type { ContainerConfig } from './container-config.js';
 import type { AgentGroup, Session } from './types.js';
 
@@ -69,8 +73,31 @@ function withWorkgroup(ag: AgentGroup): void {
   db.prepare('UPDATE agent_groups SET workgroup_id = ? WHERE id = ?').run(ag.folder, ag.id);
 }
 
+function assignWorkgroup(ag: AgentGroup, workgroupId: string): void {
+  const db = getDb();
+  db.prepare(
+    `INSERT OR IGNORE INTO workgroups (id, display_name, onecli_secrets, mnemon_store_id, created_at)
+     VALUES (?, ?, '[]', ?, datetime('now'))`,
+  ).run(workgroupId, workgroupId, ag.id);
+  db.prepare('UPDATE agent_groups SET workgroup_id = ? WHERE id = ?').run(workgroupId, ag.id);
+}
+
 function containerConfig(): ContainerConfig {
   return { mcpServers: {}, packages: { apt: [], npm: [] }, additionalMounts: [], skills: [] };
+}
+
+function providerContribution(provider: string, ag: AgentGroup, sess: Session): ProviderContainerContribution {
+  const factory = getProviderContainerConfig(provider);
+  return (
+    factory?.({
+      sessionDir: path.join(DATA_DIR, 'v2-sessions', ag.id, sess.id),
+      agentGroupId: ag.id,
+      agentGroupFolder: ag.folder,
+      groupDir: path.join(GROUPS_DIR, ag.folder),
+      selectedSkills: [],
+      hostEnv: { HOME: path.join(TEST_ROOT, 'home') },
+    }) ?? {}
+  );
 }
 
 beforeEach(() => {
@@ -94,7 +121,8 @@ describe('initGroupFilesystem agent surfaces', () => {
 
     const groupDir = path.join(GROUPS_DIR, ag.folder);
     const claudeDir = path.join(DATA_DIR, 'v2-sessions', ag.id, '.claude-shared');
-    expect(fs.readFileSync(path.join(groupDir, 'CLAUDE.local.md'), 'utf-8')).toBe('hello\n');
+    expect(fs.readFileSync(path.join(groupDir, PERSONA_PREPEND_FILE), 'utf-8')).toBe('hello\n');
+    expect(fs.readFileSync(path.join(groupDir, 'CLAUDE.local.md'), 'utf-8')).toBe('');
     const settings = JSON.parse(fs.readFileSync(path.join(claudeDir, 'settings.json'), 'utf-8')) as {
       autoMemoryEnabled?: boolean;
       env: Record<string, string>;
@@ -106,6 +134,12 @@ describe('initGroupFilesystem agent surfaces', () => {
     expect(settings.autoMemoryEnabled).toBe(false);
     expect(settings.env.CLAUDE_CODE_DISABLE_AUTO_MEMORY).toBe('1');
     expect(settings.hooks.SessionStart).toBeUndefined();
+
+    withWorkgroup(ag);
+    ensureContainerConfig(ag.id);
+    buildMounts(ag, session('s-default-instructions', ag.id), containerConfig(), 'claude', {});
+    expect(fs.readFileSync(path.join(groupDir, '.claude-fragments', 'persona.md'), 'utf-8')).toBe('hello');
+    expect(fs.readFileSync(path.join(groupDir, 'CLAUDE.md'), 'utf-8')).toContain('@./.claude-fragments/persona.md');
   });
 
   it('reconciles the managed Bash maximum while preserving an operator-owned default', () => {
@@ -126,20 +160,24 @@ describe('initGroupFilesystem agent surfaces', () => {
     expect(reconciled.env.BASH_DEFAULT_TIMEOUT_MS).toBe('45000');
   });
 
-  it('writes the seed into the memory scaffold — never CLAUDE.* — for a provider with its own surfaces', () => {
+  it('stages instructions outside memory for a provider with its own surfaces and is idempotent', () => {
     const ag = group('ag-surfy', 'surfy-group');
     createAgentGroup(ag);
 
     initGroupFilesystem(ag, { instructions: 'hello', provider: 'surfaces-test-provider' });
+    initGroupFilesystem(ag, { instructions: 'replacement', provider: 'surfaces-test-provider' });
 
     const groupDir = path.join(GROUPS_DIR, ag.folder);
     const sessionRoot = path.join(DATA_DIR, 'v2-sessions', ag.id);
+    const canonicalMemory = path.join(DATA_DIR, 'workgroups', ag.folder, 'memory');
+    const compatibilityLink = path.join(groupDir, 'memory');
     expect(fs.existsSync(groupDir)).toBe(true);
     expect(fs.existsSync(path.join(groupDir, 'CLAUDE.local.md'))).toBe(false);
-    expect(fs.readFileSync(path.join(groupDir, 'memory', 'memories', 'imported-agent-memory.md'), 'utf-8')).toBe(
-      'hello\n',
-    );
-    expect(fs.existsSync(path.join(groupDir, PERSONA_PREPEND_FILE))).toBe(false);
+    expect(fs.readFileSync(path.join(groupDir, PERSONA_PREPEND_FILE), 'utf-8')).toBe('hello\n');
+    expect(readGroupPersona(groupDir)).toBe('hello');
+    expect(fs.existsSync(path.join(canonicalMemory, 'memories', 'imported-agent-memory.md'))).toBe(false);
+    expect(fs.lstatSync(compatibilityLink).isSymbolicLink()).toBe(true);
+    expect(fs.readlinkSync(compatibilityLink)).toBe('/workspace/workgroup/memory');
     expect(fs.existsSync(path.join(sessionRoot, '.claude-shared'))).toBe(false);
   });
 
@@ -168,23 +206,124 @@ describe('initGroupFilesystem agent surfaces', () => {
 });
 
 describe('initGroupFilesystem legacy seed isolation', () => {
-  it('places .seed.md into CLAUDE.local.md once and consumes it', () => {
+  it('never reads, transforms, or deletes .seed.md', () => {
     const ag = group('ag-seed', 'seed-group');
     createAgentGroup(ag);
     const groupDir = path.join(GROUPS_DIR, ag.folder);
+    const seedFile = path.join(groupDir, '.seed.md');
+    const seedBytes = Buffer.from('seeded identity\r\n  trailing bytes \n');
     fs.mkdirSync(groupDir, { recursive: true });
-    fs.writeFileSync(path.join(groupDir, '.seed.md'), 'seeded identity\n');
+    fs.writeFileSync(seedFile, seedBytes);
 
-    initGroupFilesystem(ag, {});
+    const readSpy = vi.spyOn(fs, 'readFileSync');
+    try {
+      initGroupFilesystem(ag, {});
+      initGroupFilesystem(ag, {});
+      expect(readSpy.mock.calls.some(([target]) => path.resolve(String(target)) === seedFile)).toBe(false);
+    } finally {
+      readSpy.mockRestore();
+    }
 
-    expect(fs.existsSync(path.join(groupDir, '.seed.md'))).toBe(false);
-    expect(fs.readFileSync(path.join(groupDir, 'CLAUDE.local.md'), 'utf-8')).toBe('seeded identity\n');
+    expect(fs.readFileSync(seedFile)).toEqual(seedBytes);
+    expect(fs.readFileSync(path.join(groupDir, 'CLAUDE.local.md'), 'utf-8')).toBe('');
     expect(fs.existsSync(path.join(groupDir, PERSONA_PREPEND_FILE))).toBe(false);
     expect(fs.existsSync(path.join(groupDir, 'memory'))).toBe(false);
+  });
+
+  it('does not overwrite existing nonempty instruction surfaces', () => {
+    const ag = group('ag-existing-instructions', 'existing-instructions-group');
+    createAgentGroup(ag);
+    const groupDir = path.join(GROUPS_DIR, ag.folder);
+    fs.mkdirSync(groupDir, { recursive: true });
+    fs.writeFileSync(path.join(groupDir, PERSONA_PREPEND_FILE), 'operator persona\n');
+    fs.writeFileSync(path.join(groupDir, 'CLAUDE.local.md'), 'operator local\n');
+
+    initGroupFilesystem(ag, { instructions: 'replacement' });
+    initGroupFilesystem(ag, { instructions: 'another replacement' });
+
+    expect(fs.readFileSync(path.join(groupDir, PERSONA_PREPEND_FILE), 'utf-8')).toBe('operator persona\n');
+    expect(fs.readFileSync(path.join(groupDir, 'CLAUDE.local.md'), 'utf-8')).toBe('operator local\n');
   });
 });
 
 describe('buildMounts agent surfaces', () => {
+  it('mounts one shared kernel-lock inode for real Claude, Codex, and OpenCode build plans', () => {
+    const workgroupId = 'shared-house';
+    const providerGroups = [
+      { provider: 'claude', ag: group('ag-lock-claude', 'lock-claude') },
+      { provider: 'codex', ag: group('ag-lock-codex', 'lock-codex') },
+      { provider: 'opencode', ag: group('ag-lock-opencode', 'lock-opencode') },
+    ];
+
+    for (const { provider, ag } of providerGroups) {
+      createAgentGroup(ag);
+      assignWorkgroup(ag, workgroupId);
+      ensureContainerConfig(ag.id);
+      initGroupFilesystem({ ...ag, workgroup_id: workgroupId }, { provider });
+    }
+
+    const buildProviderMounts = (provider: string, ag: AgentGroup, suffix: string) => {
+      const sess = session(`s-lock-${provider}-${suffix}`, ag.id);
+      return buildMounts(ag, sess, containerConfig(), provider, providerContribution(provider, ag, sess), workgroupId);
+    };
+    const assertNestedMounts = (
+      mounts: ReturnType<typeof buildMounts>,
+      expectParent: boolean,
+    ): { dev: number; ino: number } => {
+      const parentIdx = mounts.findIndex((mount) => mount.containerPath === '/workspace/workgroup');
+      const memoryIdx = mounts.findIndex((mount) => mount.containerPath === '/workspace/workgroup/memory');
+      const lockMounts = mounts.filter((mount) => mount.containerPath === '/workspace/workgroup/.memory-write.lock');
+      const lockIdx = mounts.indexOf(lockMounts[0]);
+
+      expect(parentIdx >= 0).toBe(expectParent);
+      expect(memoryIdx).toBeGreaterThan(parentIdx);
+      expect(lockMounts).toEqual([
+        {
+          hostPath: path.join(DATA_DIR, 'workgroups', workgroupId, '.memory-write.lock'),
+          containerPath: '/workspace/workgroup/.memory-write.lock',
+          readonly: false,
+        },
+      ]);
+      expect(lockIdx).toBeGreaterThan(memoryIdx);
+      const stat = fs.lstatSync(lockMounts[0].hostPath);
+      return { dev: stat.dev, ino: stat.ino };
+    };
+
+    // The test config forces WORKGROUP_SHARED_FS off. All three real provider
+    // build plans still receive the exact nested memory + lock mounts.
+    const memoryOnlyIdentities = providerGroups.map(({ provider, ag }) =>
+      assertNestedMounts(buildProviderMounts(provider, ag, 'memory-only'), false),
+    );
+    expect(new Set(memoryOnlyIdentities.map(({ dev, ino }) => `${dev}:${ino}`)).size).toBe(1);
+
+    // A prior full-FS migration marker activates the parent mount even with
+    // the flag disabled. The nested file overlay must remain later than both
+    // the parent and memory mounts for every provider.
+    fs.writeFileSync(path.join(DATA_DIR, 'workgroups', workgroupId, '.migrated'), '{}\n');
+    const fullIdentities = providerGroups.map(({ provider, ag }) =>
+      assertNestedMounts(buildProviderMounts(provider, ag, 'full'), true),
+    );
+    expect(new Set(fullIdentities.map(({ dev, ino }) => `${dev}:${ino}`)).size).toBe(1);
+    expect(fullIdentities[0]).toEqual(memoryOnlyIdentities[0]);
+
+    const outsider = group('ag-lock-outsider', 'lock-outsider');
+    createAgentGroup(outsider);
+    assignWorkgroup(outsider, 'other-house');
+    ensureContainerConfig(outsider.id);
+    initGroupFilesystem({ ...outsider, workgroup_id: 'other-house' }, { provider: 'claude' });
+    const outsiderSession = session('s-lock-outsider', outsider.id);
+    const outsiderLock = buildMounts(
+      outsider,
+      outsiderSession,
+      containerConfig(),
+      'claude',
+      providerContribution('claude', outsider, outsiderSession),
+      'other-house',
+    ).find((mount) => mount.containerPath === '/workspace/workgroup/.memory-write.lock');
+    expect(outsiderLock?.hostPath).toBe(path.join(DATA_DIR, 'workgroups', 'other-house', '.memory-write.lock'));
+    expect(outsiderLock?.hostPath).not.toBe(path.join(DATA_DIR, 'workgroups', workgroupId, '.memory-write.lock'));
+  });
+
   it('mounts the default surfaces for an unregistered provider (today’s behavior)', () => {
     const ag = group('ag-mounts-default', 'mounts-default');
     createAgentGroup(ag);

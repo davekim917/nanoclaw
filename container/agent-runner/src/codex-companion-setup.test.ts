@@ -15,6 +15,7 @@ import {
   buildMergedConfigForTest,
   parseHostMcpServersForTest,
   planCodexPluginRegistration,
+  projectCodexPluginConfigForTest,
   renderMcpServerForTest,
   setupCodexRuntime,
   stripExistingMcpServersForTest,
@@ -367,6 +368,43 @@ describe('stripPluginsAndMarketplaces', () => {
 
   it('handles empty input', () => {
     expect(stripPluginsAndMarketplacesForTest('')).toBe('');
+  });
+
+  it('projects one container-owned registration into an OAuth fallback config', () => {
+    const primary = [
+      'model = "gpt-5.6-sol"',
+      '',
+      '[plugins."bootstrap-workflow-agents@davekim917-bootstrap"]',
+      'enabled = true',
+      '',
+      '[marketplaces.davekim917-bootstrap]',
+      'source_type = "local"',
+      'source = "/workspace/plugins/bootstrap"',
+      '',
+      '[mcp_servers.nanoclaw]',
+      'command = "bun"',
+    ].join('\n');
+    const fallback = [
+      'model = "gpt-5.6-sol"',
+      '',
+      '[plugins."stale@host"]',
+      'enabled = true',
+      '',
+      '[marketplaces.host]',
+      'source = "/home/ubuntu/.codex/plugins"',
+      '',
+      '[features]',
+      'codex_hooks = true',
+    ].join('\n');
+
+    const projected = projectCodexPluginConfigForTest(primary, fallback);
+    expect(projected).toContain('[plugins."bootstrap-workflow-agents@davekim917-bootstrap"]');
+    expect(projected).toContain('[marketplaces.davekim917-bootstrap]');
+    expect(projected).not.toContain('[plugins."stale@host"]');
+    expect(projected).not.toContain('/home/ubuntu/.codex/plugins');
+    expect(projected).toContain('[features]');
+    expect(projected).toContain('codex_hooks = true');
+    expect(projected).not.toContain('[mcp_servers.nanoclaw]');
   });
 });
 

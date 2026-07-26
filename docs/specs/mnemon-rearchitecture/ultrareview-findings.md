@@ -1,5 +1,9 @@
 # mnemon-rearchitecture — ultrareview findings (PR #69)
 
+> **ARCHIVED AND SUPERSEDED — not current findings.** This spec family records
+> the retired Mnemon/Ollama/daemon architecture. See the
+> [current one-canon design](../workgroup-memory-and-session-capabilities/design.md).
+
 > **Captured 2026-05-01 02:35 UTC for compaction-survival.** The ultrareview ran on PR #69 (https://github.com/davekim917/nanoclaw/pull/69) — 10 commits, the entire mnemon-rearchitecture arc — but **crashed mid-Verify** due to an Anthropic-side rate limit (`API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited`). The session URL is https://claude.ai/code/session_01LqsBsPxEFqcbv1ZJiRxCgb but auth-gated; the only artifact is a screenshot showing the Verify panel header `17 confirmed · 3 refuted` and a list of finding titles. Per docs, the run still consumed 1 of 3 free runs (worth reporting as feedback since the failure was service-side).
 >
 > Below: every legible finding from the screenshot, transcribed and triaged via spot-checking against the actual code. The screenshot does NOT visually distinguish confirmed from refuted, so the triage column is my own verdict from the spot-check, not the reviewer's. Some findings can't be precisely verified without exact line numbers, which the screenshot crops; those are marked NEEDS-CONFIRMATION.

@@ -258,6 +258,9 @@ export function buildSessionServicesSnapshot(
   // "credentials missing — Ask Dave" for every sibling.
   const folder = cfg?.credentialFolder ?? ag?.folder ?? '';
   const tools = cfg?.tools;
+  const excludedMcpServers = new Set(cfg?.excludeMcpServers ?? []);
+  const universalMcpAvailable = (name: string): boolean =>
+    !excludedMcpServers.has(name) || cfg?.mcpServers?.[name] !== undefined;
 
   const listAccounts = (absDir: string): string[] => {
     try {
@@ -454,62 +457,68 @@ export function buildSessionServicesSnapshot(
   // Exa — universal. Always shown; container-runner injects the MCP
   // unconditionally and the OneCLI gateway proxy injects auth at request
   // time (vault entry "Exa-MCP" → mcp.exa.ai).
-  services.push({
-    name: 'Exa',
-    mcpNamespace: 'mcp__exa__*',
-    declaredTools: declaredMatchingTools(['exa']),
-    scopes: [],
-    credentialPaths: [],
-    useFor:
-      'Web search, research, and code context. Prefer exa over ad-hoc WebSearch/WebFetch for: web search (`mcp__exa__web_search_exa`), company research (`mcp__exa__company_research_exa`), people search (`mcp__exa__people_search_exa`), deep research (`mcp__exa__deep_researcher_start` then `_check`), code context from public repos (`mcp__exa__get_code_context_exa`), crawling specific URLs (`mcp__exa__crawling_exa`).',
-  });
+  if (universalMcpAvailable('exa')) {
+    services.push({
+      name: 'Exa',
+      mcpNamespace: 'mcp__exa__*',
+      declaredTools: declaredMatchingTools(['exa']),
+      scopes: [],
+      credentialPaths: [],
+      useFor:
+        'Web search, research, and code context. Prefer exa over ad-hoc WebSearch/WebFetch for: web search (`mcp__exa__web_search_exa`), company research (`mcp__exa__company_research_exa`), people search (`mcp__exa__people_search_exa`), deep research (`mcp__exa__deep_researcher_start` then `_check`), code context from public repos (`mcp__exa__get_code_context_exa`), crawling specific URLs (`mcp__exa__crawling_exa`).',
+    });
+  }
 
   // DeepWiki — always-on. No tool gate; host injects the MCP server unconditionally.
-  services.push({
-    name: 'DeepWiki',
-    mcpNamespace: 'mcp__deepwiki__*',
-    declaredTools: [],
-    scopes: [],
-    credentialPaths: [],
-    useFor:
-      'AI-powered documentation for any public GitHub repo. Use when the user asks "how does repo X work", for reading wiki structure, fetching wiki contents, or asking free-form questions about a repo. Tools: `mcp__deepwiki__read_wiki_structure`, `mcp__deepwiki__read_wiki_contents`, `mcp__deepwiki__ask_question`.',
-  });
+  if (universalMcpAvailable('deepwiki'))
+    services.push({
+      name: 'DeepWiki',
+      mcpNamespace: 'mcp__deepwiki__*',
+      declaredTools: [],
+      scopes: [],
+      credentialPaths: [],
+      useFor:
+        'AI-powered documentation for any public GitHub repo. Use when the user asks "how does repo X work", for reading wiki structure, fetching wiki contents, or asking free-form questions about a repo. Tools: `mcp__deepwiki__read_wiki_structure`, `mcp__deepwiki__read_wiki_contents`, `mcp__deepwiki__ask_question`.',
+    });
 
   // Context7 — always-on. Fetches up-to-date library docs; useful when the
   // agent would otherwise rely on stale training knowledge.
-  services.push({
-    name: 'Context7',
-    mcpNamespace: 'mcp__context7__*',
-    declaredTools: [],
-    scopes: [],
-    credentialPaths: [],
-    useFor:
-      'Live library / framework / SDK / API docs — React, Next.js, Prisma, Tailwind, Claude SDKs, Stripe, etc. Prefer Context7 over training-memory for: library-specific debugging, API syntax, config options, version migrations, CLI usage. Do NOT use for refactoring, business logic, or general concepts.',
-  });
+  if (universalMcpAvailable('context7'))
+    services.push({
+      name: 'Context7',
+      mcpNamespace: 'mcp__context7__*',
+      declaredTools: [],
+      scopes: [],
+      credentialPaths: [],
+      useFor:
+        'Live library / framework / SDK / API docs — React, Next.js, Prisma, Tailwind, Claude SDKs, Stripe, etc. Prefer Context7 over training-memory for: library-specific debugging, API syntax, config options, version migrations, CLI usage. Do NOT use for refactoring, business logic, or general concepts.',
+    });
 
   // Pocket — universal. Always shown; container-runner injects the MCP
   // unconditionally and the OneCLI gateway proxy injects auth at request
   // time (vault entry "Pocket" → public.heypocketai.com).
-  services.push({
-    name: 'Pocket',
-    mcpNamespace: 'mcp__pocket__*',
-    declaredTools: declaredMatchingTools(['pocket']),
-    scopes: [],
-    credentialPaths: [],
-    useFor:
-      'Personal knowledge / memory via https://public.heypocketai.com/mcp. Auth pre-injected (Authorization: Bearer). Use Pocket tools to save references, recall prior context, search personal knowledge.',
-  });
+  if (universalMcpAvailable('pocket'))
+    services.push({
+      name: 'Pocket',
+      mcpNamespace: 'mcp__pocket__*',
+      declaredTools: declaredMatchingTools(['pocket']),
+      scopes: [],
+      credentialPaths: [],
+      useFor:
+        'Personal knowledge / memory via https://public.heypocketai.com/mcp. Auth pre-injected (Authorization: Bearer). Use Pocket tools to save references, recall prior context, search personal knowledge.',
+    });
 
   // Granola — universal. Always shown; container-runner injects unconditionally.
-  services.push({
-    name: 'Granola',
-    mcpNamespace: 'mcp__granola__*',
-    declaredTools: declaredMatchingTools(['granola']),
-    scopes: [],
-    credentialPaths: [],
-    useFor:
-      'Meeting transcripts + notes via Granola REST API. Auth injected by OneCLI on public-api.granola.ai; no token visible in-container. Tools: `mcp__granola__list_meetings`, `mcp__granola__get_meeting` (set include_transcript=true for raw transcript).',
-  });
+  if (universalMcpAvailable('granola'))
+    services.push({
+      name: 'Granola',
+      mcpNamespace: 'mcp__granola__*',
+      declaredTools: declaredMatchingTools(['granola']),
+      scopes: [],
+      credentialPaths: [],
+      useFor:
+        'Meeting transcripts + notes via Granola REST API. Auth injected by OneCLI on public-api.granola.ai; no token visible in-container. Tools: `mcp__granola__list_meetings`, `mcp__granola__get_meeting` (set include_transcript=true for raw transcript).',
+    });
 
   // Linear — gated by tool entry. Container-runner injects when 'linear' is in
   // container.json.tools and the OneCLI gateway proxy injects auth at request

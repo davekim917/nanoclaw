@@ -1,5 +1,9 @@
 # Post-Build Drift Report — instrumented-memory-recall
 
+> **ARCHIVED AND SUPERSEDED — not a current conformance report.** This spec
+> family instruments the retired Mnemon/daemon recall architecture. See the
+> [current one-canon design](../workgroup-memory-and-session-capabilities/design.md).
+
 **SOT:** `docs/specs/instrumented-memory-recall/plan.md` (post pre-build fix)
 **Target:** Implementation across 41 files (5 commits on `feat/instrumented-memory-recall`)
 **Run:** /team-auto Stage C, post-build drift

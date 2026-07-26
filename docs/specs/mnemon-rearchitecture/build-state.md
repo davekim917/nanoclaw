@@ -1,5 +1,9 @@
 # Build State Checkpoint — mnemon-rearchitecture
 
+> **ARCHIVED AND SUPERSEDED — not current runtime state.** This spec family
+> records the retired Mnemon/Ollama/daemon architecture. See the
+> [current one-canon design](../workgroup-memory-and-session-capabilities/design.md).
+
 Last updated: 2026-04-30T03:15:30Z
 
 ## Groups Completed

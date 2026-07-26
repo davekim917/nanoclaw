@@ -24,10 +24,11 @@
  *      can silently lose transcripts, causing the next `resume` to start a
  *      fresh Claude session instead of reloading prior context.
  *
- *   4. Group-shared `memory/` → `/home/node/.claude/projects/<hash>/memory`
- *      Overlays the SDK's auto-memory path inside the per-session projects
- *      mount so auto-memory stays group-shared across every thread. Matches
- *      v1's nested-mount pattern (v1 container-runner.ts:1935-1945).
+ *   4. Workgroup memory compatibility view →
+ *      `/home/node/.claude/projects/<hash>/memory`
+ *      Projects the one canonical workgroup tree read-only at Claude's native
+ *      path. Claude-native auto-memory is disabled; this mount is compatibility,
+ *      not an independent authority.
  */
 import path from 'path';
 

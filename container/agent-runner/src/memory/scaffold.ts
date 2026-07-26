@@ -5,9 +5,10 @@ import { fileURLToPath } from 'url';
 /**
  * Create the agent's persistent memory scaffold, container-side, at boot.
  *
- * The runner owns its own workspace: it writes the memory tree straight into
- * `/workspace/agent` (the host-backed, RW group dir, so it persists across the
- * ephemeral container). No host-side step, nothing mounted in.
+ * The runner scaffolds through `/workspace/agent/memory`, the compatibility
+ * link to the host-mounted workgroup canon at `/workspace/workgroup/memory`.
+ * Every sibling provider in the workgroup therefore resolves the same
+ * persistent tree.
  *
  * The default memory files live as real markdown templates next to this module
  * (under `templates/`) — not as strings in code — so the

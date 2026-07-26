@@ -2,8 +2,10 @@ import { beforeEach, describe, expect, test } from 'bun:test';
 
 import { getOutboundDb, initTestSessionDb } from './connection.js';
 import {
+  advanceMemoryContextEpoch,
   clearContinuation,
   getContinuation,
+  getMemoryContextEpoch,
   getStickyFast,
   migrateLegacyContinuation,
   setContinuation,
@@ -48,6 +50,25 @@ describe('session-state — per-provider continuations', () => {
 
   test('unknown provider returns undefined', () => {
     expect(getContinuation('never-used')).toBeUndefined();
+  });
+});
+
+describe('session-state — provider memory context epochs', () => {
+  test('defaults to zero and advances monotonically per provider', () => {
+    expect(getMemoryContextEpoch('claude')).toBe(0);
+    expect(advanceMemoryContextEpoch('claude')).toBe(1);
+    expect(advanceMemoryContextEpoch('Claude')).toBe(2);
+    expect(getMemoryContextEpoch('claude')).toBe(2);
+  });
+
+  test('provider epochs remain isolated', () => {
+    advanceMemoryContextEpoch('claude');
+    advanceMemoryContextEpoch('codex');
+    advanceMemoryContextEpoch('codex');
+
+    expect(getMemoryContextEpoch('claude')).toBe(1);
+    expect(getMemoryContextEpoch('codex')).toBe(2);
+    expect(getMemoryContextEpoch('opencode')).toBe(0);
   });
 });
 

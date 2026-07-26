@@ -1,5 +1,9 @@
 # /team-auto paused at Stage A (Review)
 
+> **ARCHIVED IMPLEMENTATION RECORD — not an active workflow pause.** The
+> workgroup model shipped, but this spec's Mnemon/store mechanics are
+> superseded by the [current one-canon design](../workgroup-memory-and-session-capabilities/design.md).
+
 **Stage:** Review
 **Reason:** cap-reached
 **Cycles consumed:** 3/3

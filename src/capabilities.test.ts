@@ -150,6 +150,28 @@ describe('buildSessionServicesSnapshot', () => {
     expect(snapshot.services.some((s) => s.name === 'Profound')).toBe(false);
   });
 
+  it('does not advertise universal MCPs excluded from the effective container config', () => {
+    insertWorkgroup('restricted', []);
+    const ag = group('ag-restricted', 'restricted');
+    createGroupInWorkgroup(ag, 'restricted');
+    writeContainerConfig(ag.folder, {
+      mcpServers: {},
+      packages: { apt: [], npm: [] },
+      additionalMounts: [],
+      skills: 'all',
+      tools: [],
+      excludeMcpServers: ['exa', 'deepwiki', 'context7', 'pocket', 'granola'],
+    });
+
+    const names = buildSessionServicesSnapshot(ag.id).services.map((service) => service.name);
+
+    expect(names).not.toContain('Exa');
+    expect(names).not.toContain('DeepWiki');
+    expect(names).not.toContain('Context7');
+    expect(names).not.toContain('Pocket');
+    expect(names).not.toContain('Granola');
+  });
+
   it('test_capability_and_parity_output_omit_legacy_gitnexus_field', () => {
     fs.mkdirSync(`${dirs.TEST_ROOT}/container/nanoclaw-plugin`, { recursive: true });
     fs.mkdirSync(`${dirs.TEST_ROOT}/plugins/gitnexus`, { recursive: true });

@@ -1,5 +1,9 @@
 # /team-auto paused at Stage D (QA) — schema-decision escalation
 
+> **ARCHIVED AND SUPERSEDED — not an active workflow pause.** This spec family
+> instruments the retired Mnemon/daemon recall architecture. See the
+> [current one-canon design](../workgroup-memory-and-session-capabilities/design.md).
+
 **Stage:** QA (post-build, fix-cycle 1 of 3)
 **Reason:** `hard-constraint` — schema migration / design call required
 **Last action attempted:** Codex Validator E adversarial review — 4 MUST-FIX, 1 SHOULD-FIX surfaced.

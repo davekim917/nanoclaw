@@ -4,9 +4,35 @@ import fs from 'fs';
 import Database from 'better-sqlite3';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+const { CAPABILITY_STATE } = vi.hoisted(() => ({
+  CAPABILITY_STATE: { revision: 'initial' },
+}));
+
 vi.mock('./config.js', async () => {
   const actual = await vi.importActual<typeof import('./config.js')>('./config.js');
   return { ...actual, DATA_DIR: '/tmp/nanoclaw-test-write-outbound' };
+});
+
+vi.mock('./capabilities.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./capabilities.js')>();
+  return {
+    ...actual,
+    buildSessionServicesSnapshot: (...args: Parameters<typeof actual.buildSessionServicesSnapshot>) => {
+      const snapshot = actual.buildSessionServicesSnapshot(...args);
+      return {
+        ...snapshot,
+        services: [
+          ...snapshot.services,
+          {
+            name: `Test capability ${CAPABILITY_STATE.revision}`,
+            declaredTools: [],
+            scopes: [],
+            credentialPaths: [],
+          },
+        ],
+      };
+    },
+  };
 });
 
 import {
@@ -23,13 +49,45 @@ import {
   writeOutboundDirect,
   writeSessionMessage,
   writeSessionMessageIfNew,
+  isAdmissiblePreTurnTrigger,
+  reconcilePendingUpgradeContexts,
 } from './session-manager.js';
-import { initTestDb, closeDb, runMigrations, createAgentGroup } from './db/index.js';
+import { initTestDb, closeDb, runMigrations, createAgentGroup, getDb } from './db/index.js';
 import { createSession } from './db/sessions.js';
+import { insertRecurrence, insertTaskRow, type RecurringMessage } from './modules/scheduling/db.js';
 import type { Session } from './types.js';
 
 const AG = 'ag-test';
 const SESS = 'sess-test';
+
+async function admitDueTaskContexts(db: Database.Database, agentGroupId: string, sessionId: string): Promise<number> {
+  const module = (await import('./session-manager.js')) as typeof import('./session-manager.js') & {
+    admitDueTaskContexts: (db: Database.Database, agentGroupId: string, sessionId: string) => number;
+  };
+  return module.admitDueTaskContexts(db, agentGroupId, sessionId);
+}
+
+async function admitPendingUpgradeContexts(
+  db: Database.Database,
+  agentGroupId: string,
+  sessionId: string,
+): Promise<number> {
+  const module = (await import('./session-manager.js')) as typeof import('./session-manager.js') & {
+    admitPendingUpgradeContexts: (db: Database.Database, agentGroupId: string, sessionId: string) => number;
+  };
+  return module.admitPendingUpgradeContexts(db, agentGroupId, sessionId);
+}
+
+async function deferMessageForFreshContextRetry(
+  db: Database.Database,
+  messageId: string,
+  backoffSec: number,
+): Promise<void> {
+  const module = (await import('./session-manager.js')) as typeof import('./session-manager.js') & {
+    deferMessageForFreshContextRetry: (db: Database.Database, messageId: string, backoffSec: number) => void;
+  };
+  module.deferMessageForFreshContextRetry(db, messageId, backoffSec);
+}
 
 describe('threadWorktreeDir', () => {
   it('uses thread_id directly as the key when present', () => {
@@ -205,6 +263,7 @@ describe('writeOutboundDirect', () => {
  */
 describe('writeSessionMessage re-provisions a deleted session folder', () => {
   beforeEach(() => {
+    fs.rmSync(sessionDir(AG, SESS), { recursive: true, force: true });
     const db = initTestDb();
     runMigrations(db);
     createAgentGroup({
@@ -214,6 +273,10 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
       agent_provider: null,
       created_at: new Date().toISOString(),
     });
+    getDb()
+      .prepare(`INSERT INTO workgroups (id, display_name, created_at) VALUES ('reset','Reset',?)`)
+      .run(new Date().toISOString());
+    getDb().prepare(`UPDATE agent_groups SET workgroup_id = 'reset' WHERE id = ?`).run(AG);
     const sess: Session = {
       id: SESS,
       agent_group_id: AG,
@@ -339,5 +402,812 @@ describe('writeSessionMessage re-provisions a deleted session folder', () => {
     };
     await expect(writeSessionMessage(AG, SESS, input)).resolves.toBeUndefined();
     await expect(writeSessionMessage(AG, SESS, input)).rejects.toThrow(/UNIQUE constraint failed/);
+  });
+
+  it('test_write_inserts_recall_then_trigger_atomically', async () => {
+    const input = {
+      id: 'paired-message',
+      kind: 'chat-sdk',
+      timestamp: '2026-07-25T00:00:00.000Z',
+      platformId: 'discord:g:c',
+      channelType: 'discord',
+      threadId: 'discord:g:c:t',
+      content: JSON.stringify({ text: 'Where is the project context?' }),
+    };
+    await expect(writeSessionMessageIfNew(AG, SESS, input)).resolves.toBe(true);
+
+    const db = new Database(inboundDbPath(AG, SESS), { readonly: true });
+    try {
+      const rows = db
+        .prepare(
+          `SELECT id, seq, kind, trigger, platform_id, channel_type, thread_id, timestamp, content
+             FROM messages_in
+            WHERE id IN ('recall-paired-message', 'paired-message')
+            ORDER BY seq`,
+        )
+        .all() as Array<Record<string, unknown>>;
+      expect(rows.map((row) => row.id)).toEqual(['recall-paired-message', 'paired-message']);
+      expect((rows[1]!.seq as number) - (rows[0]!.seq as number)).toBe(2);
+      expect(rows[0]).toMatchObject({
+        kind: 'system',
+        trigger: 0,
+        platform_id: input.platformId,
+        channel_type: input.channelType,
+        thread_id: input.threadId,
+        timestamp: input.timestamp,
+      });
+      expect(JSON.parse(rows[0]!.content as string)).toMatchObject({ subtype: 'recall_context' });
+    } finally {
+      db.close();
+    }
+  });
+
+  it('emits one bootstrap per provider context epoch and suppresses unchanged warm evidence', async () => {
+    const memoryRoot = path.join('/tmp/nanoclaw-test-write-outbound', 'workgroups', 'reset', 'memory');
+    fs.mkdirSync(path.join(memoryRoot, 'facts'), { recursive: true });
+    fs.writeFileSync(path.join(memoryRoot, 'index.md'), '# Canon\nJordan owns deployment.');
+    fs.writeFileSync(path.join(memoryRoot, 'facts', 'owner.md'), '# Deployment owner\nJordan owns deployment.');
+    const message = (id: string) => ({
+      id,
+      kind: 'chat-sdk',
+      timestamp: '2026-07-25T00:00:00.000Z',
+      content: JSON.stringify({ text: 'Who owns deployment?' }),
+    });
+
+    await writeSessionMessage(AG, SESS, message('epoch-first'));
+    const inbound = new Database(inboundDbPath(AG, SESS));
+    const outbound = new Database(outboundDbPath(AG, SESS));
+    try {
+      inbound
+        .prepare(`UPDATE messages_in SET status = 'completed' WHERE id IN ('recall-epoch-first', 'epoch-first')`)
+        .run();
+      outbound
+        .prepare('INSERT OR REPLACE INTO session_state (key, value, updated_at) VALUES (?, ?, ?)')
+        .run('continuation:claude', 'claude-context-1', new Date().toISOString());
+      outbound
+        .prepare('INSERT OR REPLACE INTO session_state (key, value, updated_at) VALUES (?, ?, ?)')
+        .run('memory_context_epoch:claude', '0', new Date().toISOString());
+
+      await writeSessionMessage(AG, SESS, message('epoch-warm'));
+      const first = JSON.parse(
+        (
+          inbound.prepare('SELECT content FROM messages_in WHERE id = ?').get('recall-epoch-first') as {
+            content: string;
+          }
+        ).content,
+      );
+      const warm = JSON.parse(
+        (
+          inbound.prepare('SELECT content FROM messages_in WHERE id = ?').get('recall-epoch-warm') as {
+            content: string;
+          }
+        ).content,
+      );
+      expect(first.trustedCapabilities).toMatchObject({ agentGroupId: AG });
+      expect(first.memoryEvidence.core.map((row: { path: string }) => row.path)).toEqual(['index.md']);
+      expect(first.memoryEvidence.excerpts.map((row: { path: string }) => row.path)).toContain('facts/owner.md');
+      expect(warm).not.toHaveProperty('trustedCapabilities');
+      expect(warm.memoryEvidence.core).toEqual([]);
+      expect(warm.memoryEvidence.excerpts).toEqual([]);
+      expect(warm.notices.some((notice: { code: string }) => notice.code === 'evidence-already-delivered')).toBe(true);
+
+      outbound
+        .prepare('INSERT OR REPLACE INTO session_state (key, value, updated_at) VALUES (?, ?, ?)')
+        .run('memory_context_epoch:claude', '1', new Date().toISOString());
+      await writeSessionMessage(AG, SESS, message('epoch-reset'));
+      const reset = JSON.parse(
+        (
+          inbound.prepare('SELECT content FROM messages_in WHERE id = ?').get('recall-epoch-reset') as {
+            content: string;
+          }
+        ).content,
+      );
+      expect(reset.contextEpoch).toBe(1);
+      expect(reset.trustedCapabilities).toMatchObject({ agentGroupId: AG });
+      expect(reset.memoryEvidence.core.map((row: { path: string }) => row.path)).toEqual(['index.md']);
+      expect(reset.memoryEvidence.excerpts.map((row: { path: string }) => row.path)).toContain('facts/owner.md');
+    } finally {
+      outbound.close();
+      inbound.close();
+    }
+  });
+
+  it('treats input queued behind a pending clear as a fresh provider context', async () => {
+    const memoryRoot = path.join('/tmp/nanoclaw-test-write-outbound', 'workgroups', 'reset', 'memory');
+    fs.mkdirSync(path.join(memoryRoot, 'facts'), { recursive: true });
+    fs.writeFileSync(path.join(memoryRoot, 'index.md'), '# Canon\nJordan owns deployment.');
+    fs.writeFileSync(path.join(memoryRoot, 'facts', 'owner.md'), '# Deployment owner\nJordan owns deployment.');
+    const message = (id: string, text: string) => ({
+      id,
+      kind: 'chat-sdk',
+      timestamp: '2026-07-25T00:00:00.000Z',
+      content: JSON.stringify({ text }),
+    });
+
+    await writeSessionMessage(AG, SESS, message('clear-epoch-first', 'Who owns deployment?'));
+    const inbound = new Database(inboundDbPath(AG, SESS));
+    const outbound = new Database(outboundDbPath(AG, SESS));
+    try {
+      inbound
+        .prepare(
+          `UPDATE messages_in SET status = 'completed'
+            WHERE id IN ('recall-clear-epoch-first', 'clear-epoch-first')`,
+        )
+        .run();
+      outbound
+        .prepare('INSERT OR REPLACE INTO session_state (key, value, updated_at) VALUES (?, ?, ?)')
+        .run('continuation:claude', 'claude-context-before-clear', new Date().toISOString());
+      outbound
+        .prepare('INSERT OR REPLACE INTO session_state (key, value, updated_at) VALUES (?, ?, ?)')
+        .run('memory_context_epoch:claude', '0', new Date().toISOString());
+
+      await writeSessionMessage(AG, SESS, message('clear-epoch-command', '/clear'));
+      const insertNoise = inbound.prepare(
+        `INSERT INTO messages_in
+           (id, seq, kind, timestamp, status, content, trigger, on_wake)
+         VALUES (?, ?, 'chat-sdk', ?, 'pending', ?, 0, 0)`,
+      );
+      let seq = (inbound.prepare('SELECT COALESCE(MAX(seq), 0) AS seq FROM messages_in').get() as { seq: number }).seq;
+      inbound.transaction(() => {
+        for (let index = 0; index < 300; index++) {
+          seq += 2;
+          insertNoise.run(
+            `clear-epoch-noise-${index}`,
+            seq,
+            '2026-07-25T00:00:00.000Z',
+            JSON.stringify({ text: `queued non-triggering context ${index}` }),
+          );
+        }
+      })();
+      await writeSessionMessage(AG, SESS, message('clear-epoch-followup', 'Who owns deployment?'));
+
+      const followup = JSON.parse(
+        (
+          inbound.prepare('SELECT content FROM messages_in WHERE id = ?').get('recall-clear-epoch-followup') as {
+            content: string;
+          }
+        ).content,
+      );
+      expect(followup.trustedCapabilities).toMatchObject({ agentGroupId: AG });
+      expect(followup.memoryEvidence.core.map((row: { path: string }) => row.path)).toEqual(['index.md']);
+      expect(followup.memoryEvidence.excerpts.map((row: { path: string }) => row.path)).toContain('facts/owner.md');
+    } finally {
+      outbound.close();
+      inbound.close();
+    }
+  });
+
+  it('does not repeat the bootstrap after more than 256 recall rows in one provider epoch', async () => {
+    const memoryRoot = path.join('/tmp/nanoclaw-test-write-outbound', 'workgroups', 'reset', 'memory');
+    fs.mkdirSync(memoryRoot, { recursive: true });
+    fs.writeFileSync(path.join(memoryRoot, 'index.md'), '# Canon\nBootstrap once.');
+    const message = (id: string) => ({
+      id,
+      kind: 'chat-sdk',
+      timestamp: '2026-07-25T00:00:00.000Z',
+      content: JSON.stringify({ text: 'What is current?' }),
+    });
+
+    await writeSessionMessage(AG, SESS, message('long-epoch-first'));
+    const inbound = new Database(inboundDbPath(AG, SESS));
+    const outbound = new Database(outboundDbPath(AG, SESS));
+    try {
+      inbound
+        .prepare(
+          `UPDATE messages_in SET status = 'completed' WHERE id IN ('recall-long-epoch-first', 'long-epoch-first')`,
+        )
+        .run();
+      outbound
+        .prepare('INSERT OR REPLACE INTO session_state (key, value, updated_at) VALUES (?, ?, ?)')
+        .run('continuation:claude', 'claude-context-long', new Date().toISOString());
+      outbound
+        .prepare('INSERT OR REPLACE INTO session_state (key, value, updated_at) VALUES (?, ?, ?)')
+        .run('memory_context_epoch:claude', '0', new Date().toISOString());
+
+      const insertNoise = inbound.prepare(
+        `INSERT INTO messages_in
+           (id, seq, kind, timestamp, status, content, trigger, on_wake)
+         VALUES (?, ?, 'system', ?, 'completed', ?, 0, 0)`,
+      );
+      let seq = (inbound.prepare('SELECT COALESCE(MAX(seq), 0) AS seq FROM messages_in').get() as { seq: number }).seq;
+      inbound.transaction(() => {
+        for (let index = 0; index < 300; index++) {
+          seq += 2;
+          insertNoise.run(
+            `recall-long-epoch-noise-${index}`,
+            seq,
+            '2026-07-25T00:00:00.000Z',
+            JSON.stringify({
+              subtype: 'recall_context',
+              provider: 'claude',
+              contextEpoch: 0,
+              memoryEvidence: { core: [], excerpts: [] },
+              conversationEvidence: { excerpts: [] },
+              notices: [],
+            }),
+          );
+        }
+      })();
+
+      await writeSessionMessage(AG, SESS, message('long-epoch-warm'));
+      const warm = JSON.parse(
+        (
+          inbound.prepare('SELECT content FROM messages_in WHERE id = ?').get('recall-long-epoch-warm') as {
+            content: string;
+          }
+        ).content,
+      );
+      expect(warm).not.toHaveProperty('trustedCapabilities');
+      expect(warm.memoryEvidence.core).toEqual([]);
+    } finally {
+      outbound.close();
+      inbound.close();
+    }
+  });
+
+  it('keeps task ingress inert until the due-time recall seam admits it', async () => {
+    await writeSessionMessage(AG, SESS, {
+      id: 'scheduled-through-session-manager',
+      kind: 'task',
+      timestamp: '2026-07-25T00:00:00.000Z',
+      content: JSON.stringify({ prompt: 'run later' }),
+      processAfter: '2099-01-01T00:00:00.000Z',
+    });
+
+    const inbound = new Database(inboundDbPath(AG, SESS), { readonly: true });
+    try {
+      expect(
+        inbound
+          .prepare(
+            `SELECT id, kind, trigger
+               FROM messages_in
+              WHERE id IN ('recall-scheduled-through-session-manager', 'scheduled-through-session-manager')
+              ORDER BY seq`,
+          )
+          .all(),
+      ).toEqual([{ id: 'scheduled-through-session-manager', kind: 'task', trigger: 0 }]);
+    } finally {
+      inbound.close();
+    }
+  });
+
+  it('test_duplicate_ingress_inserts_neither_row_twice', async () => {
+    const input = {
+      id: 'duplicate-pair',
+      kind: 'chat-sdk',
+      timestamp: '2026-07-25T00:00:00.000Z',
+      content: JSON.stringify({ text: 'pair once' }),
+    };
+
+    await expect(writeSessionMessageIfNew(AG, SESS, input)).resolves.toBe(true);
+    await expect(writeSessionMessageIfNew(AG, SESS, input)).resolves.toBe(false);
+
+    const db = new Database(inboundDbPath(AG, SESS), { readonly: true });
+    try {
+      expect(
+        db
+          .prepare(`SELECT id FROM messages_in WHERE id IN ('recall-duplicate-pair', 'duplicate-pair') ORDER BY seq`)
+          .all(),
+      ).toEqual([{ id: 'recall-duplicate-pair' }, { id: 'duplicate-pair' }]);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('pairs pending and processing upgrade turns exactly once while leaving scheduled tasks untouched', async () => {
+    initSessionFolder(AG, SESS);
+    const db = new Database(inboundDbPath(AG, SESS));
+    const insertTurn = db.prepare(
+      `INSERT INTO messages_in
+         (id,seq,kind,timestamp,status,trigger,platform_id,channel_type,thread_id,content,on_wake)
+       VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+    );
+    insertTurn.run(
+      'pending-before-upgrade',
+      2,
+      'chat-sdk',
+      '2026-07-25T23:47:02.398Z',
+      'pending',
+      1,
+      'slack:C1',
+      'slack',
+      'slack:C1:T1',
+      JSON.stringify({ text: 'preserve this pending turn' }),
+      0,
+    );
+    insertTurn.run(
+      'processing-before-upgrade',
+      4,
+      'chat-sdk',
+      '2026-07-25T23:47:03.398Z',
+      'processing',
+      1,
+      'slack:C1',
+      'slack',
+      'slack:C1:T1',
+      JSON.stringify({ text: 'recover this interrupted turn' }),
+      0,
+    );
+    insertTaskRow(db, {
+      id: 'task-before-upgrade',
+      seriesId: 'task-before-upgrade',
+      processAfter: '2020-01-01T00:00:00.000Z',
+      recurrence: null,
+      content: JSON.stringify({ prompt: 'wait for the scheduled-task admission seam' }),
+    });
+    const scheduledBefore = db
+      .prepare('SELECT status, trigger FROM messages_in WHERE id = ?')
+      .get('task-before-upgrade');
+    const memoryRoot = path.join('/tmp/nanoclaw-test-write-outbound', 'workgroups', 'reset', 'memory');
+    fs.mkdirSync(path.join(memoryRoot, 'system'), { recursive: true });
+    fs.writeFileSync(path.join(memoryRoot, 'index.md'), '# Current canon\nupgrade-cutover context');
+    fs.writeFileSync(path.join(memoryRoot, 'system', 'definition.md'), '# Definition\nfresh upgrade context');
+
+    expect(await admitPendingUpgradeContexts(db, AG, SESS)).toBe(2);
+    const pairs = db
+      .prepare(
+        `SELECT id,seq,kind,status,trigger,content
+           FROM messages_in
+          WHERE id IN (?,?,?,?)
+          ORDER BY seq`,
+      )
+      .all(
+        'recall-pending-before-upgrade',
+        'pending-before-upgrade',
+        'recall-processing-before-upgrade',
+        'processing-before-upgrade',
+      ) as Array<{
+      id: string;
+      seq: number;
+      kind: string;
+      status: string;
+      trigger: number;
+      content: string;
+    }>;
+    expect(pairs.map((row) => row.id)).toEqual([
+      'recall-pending-before-upgrade',
+      'pending-before-upgrade',
+      'recall-processing-before-upgrade',
+      'processing-before-upgrade',
+    ]);
+    for (let index = 0; index < pairs.length; index += 2) {
+      expect(pairs[index + 1]!.seq - pairs[index]!.seq).toBe(2);
+      expect(pairs[index]).toMatchObject({ kind: 'system', status: 'pending', trigger: 0 });
+      expect(pairs[index + 1]).toMatchObject({ kind: 'chat-sdk', status: 'pending', trigger: 1 });
+      expect(JSON.parse(pairs[index]!.content)).toMatchObject({
+        subtype: 'recall_context',
+        provider: 'claude',
+        contextEpoch: 0,
+      });
+    }
+    const firstUpgradeRecall = JSON.parse(pairs[0]!.content);
+    const secondUpgradeRecall = JSON.parse(pairs[2]!.content);
+    expect(firstUpgradeRecall.trustedCapabilities).toMatchObject({ agentGroupId: AG });
+    expect(JSON.stringify(firstUpgradeRecall.memoryEvidence)).toContain('upgrade-cutover context');
+    expect(secondUpgradeRecall).not.toHaveProperty('trustedCapabilities');
+    expect(secondUpgradeRecall.memoryEvidence.core).toEqual([]);
+    expect(db.prepare('SELECT status, trigger FROM messages_in WHERE id = ?').get('task-before-upgrade')).toEqual(
+      scheduledBefore,
+    );
+    expect(db.prepare('SELECT id FROM messages_in WHERE id = ?').get('recall-task-before-upgrade')).toBeUndefined();
+
+    expect(await admitPendingUpgradeContexts(db, AG, SESS)).toBe(0);
+    expect(
+      (
+        db
+          .prepare('SELECT COUNT(*) AS count FROM messages_in WHERE id LIKE ? OR id IN (?,?)')
+          .get('recall-%-before-upgrade', 'pending-before-upgrade', 'processing-before-upgrade') as { count: number }
+      ).count,
+    ).toBe(4);
+    db.close();
+  });
+
+  it('upgrades a legacy inbound schema before startup reconciliation admits fresh context', () => {
+    const legacySessionId = 'sess-legacy-memory-upgrade';
+    createSession({
+      id: legacySessionId,
+      agent_group_id: AG,
+      messaging_group_id: null,
+      thread_id: null,
+      agent_provider: null,
+      status: 'active',
+      container_status: 'stopped',
+      last_active: null,
+      created_at: '2026-07-25T23:47:00.000Z',
+    });
+    const legacyPath = inboundDbPath(AG, legacySessionId);
+    fs.mkdirSync(path.dirname(legacyPath), { recursive: true });
+    const legacy = new Database(legacyPath);
+    legacy.exec(`
+      CREATE TABLE messages_in (
+        id TEXT PRIMARY KEY,
+        seq INTEGER NOT NULL UNIQUE,
+        kind TEXT NOT NULL,
+        timestamp TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        platform_id TEXT,
+        channel_type TEXT,
+        thread_id TEXT,
+        content TEXT NOT NULL,
+        process_after TEXT,
+        recurrence TEXT
+      )
+    `);
+    legacy
+      .prepare(
+        `INSERT INTO messages_in
+           (id,seq,kind,timestamp,status,platform_id,channel_type,thread_id,content)
+         VALUES (?,?,?,?,?,?,?,?,?)`,
+      )
+      .run(
+        'legacy-pending',
+        2,
+        'chat-sdk',
+        '2026-07-25T23:47:02.398Z',
+        'pending',
+        'slack:C1',
+        'slack',
+        'slack:C1:T1',
+        JSON.stringify({ text: 'admit me after the schema upgrade' }),
+      );
+    legacy.close();
+
+    const memoryRoot = path.join('/tmp/nanoclaw-test-write-outbound', 'workgroups', 'reset', 'memory');
+    fs.mkdirSync(path.join(memoryRoot, 'system'), { recursive: true });
+    fs.writeFileSync(path.join(memoryRoot, 'index.md'), '# Current canon\nlegacy upgrade context');
+    fs.writeFileSync(path.join(memoryRoot, 'system', 'definition.md'), '# Definition\nfresh legacy context');
+
+    expect(reconcilePendingUpgradeContexts(getDb(), ['reset'])).toEqual({ sessions: 1, admitted: 1 });
+
+    const verified = new Database(legacyPath, { readonly: true });
+    try {
+      const columns = new Set(
+        (verified.prepare("PRAGMA table_info('messages_in')").all() as Array<{ name: string }>).map(
+          (column) => column.name,
+        ),
+      );
+      for (const column of ['series_id', 'trigger', 'source_session_id', 'on_wake']) {
+        expect(columns.has(column), `missing lazy-migrated column ${column}`).toBe(true);
+      }
+      const rows = verified
+        .prepare('SELECT id,seq,status,trigger,on_wake FROM messages_in ORDER BY seq')
+        .all() as Array<{ id: string; seq: number; status: string; trigger: number; on_wake: number }>;
+      expect(rows.map((row) => row.id)).toEqual(['recall-legacy-pending', 'legacy-pending']);
+      expect(rows[1]!.seq - rows[0]!.seq).toBe(2);
+      expect(rows[0]).toMatchObject({ status: 'pending', trigger: 0, on_wake: 0 });
+      expect(rows[1]).toMatchObject({ status: 'pending', trigger: 1, on_wake: 0 });
+    } finally {
+      verified.close();
+    }
+  });
+
+  it('admits a first scheduled fire as one fresh adjacent pair and is idempotent on sweep retry', async () => {
+    initSessionFolder(AG, SESS);
+    const db = new Database(inboundDbPath(AG, SESS));
+    insertTaskRow(db, {
+      id: 'task-first-fire',
+      seriesId: 'task-first-fire',
+      processAfter: '2020-01-01T00:00:00.000Z',
+      recurrence: null,
+      content: JSON.stringify({ prompt: 'use the current task context' }),
+    });
+
+    const memoryRoot = path.join('/tmp/nanoclaw-test-write-outbound', 'workgroups', 'reset', 'memory');
+    fs.mkdirSync(path.join(memoryRoot, 'system'), { recursive: true });
+    fs.writeFileSync(path.join(memoryRoot, 'index.md'), '# Current canon\nfirst-fire context written after scheduling');
+    fs.writeFileSync(path.join(memoryRoot, 'system', 'definition.md'), '# Definition\nfresh on every admission');
+
+    expect(await admitDueTaskContexts(db, AG, SESS)).toBe(1);
+    const pair = db
+      .prepare('SELECT id, seq, kind, trigger, content FROM messages_in WHERE id IN (?, ?) ORDER BY seq')
+      .all('recall-task-first-fire', 'task-first-fire') as Array<{
+      id: string;
+      seq: number;
+      kind: string;
+      trigger: number;
+      content: string;
+    }>;
+    expect(pair.map((row) => row.id)).toEqual(['recall-task-first-fire', 'task-first-fire']);
+    expect(pair[1]!.seq - pair[0]!.seq).toBe(2);
+    expect(pair[0]).toMatchObject({ kind: 'system', trigger: 0 });
+    expect(pair[1]).toMatchObject({ kind: 'task', trigger: 1 });
+    const recall = JSON.parse(pair[0]!.content);
+    expect(recall).toMatchObject({
+      subtype: 'recall_context',
+      trustedCapabilities: { agentGroupId: AG },
+    });
+    expect(recall.trustedCapabilities.services).toEqual(
+      expect.arrayContaining([expect.objectContaining({ name: 'Exa' })]),
+    );
+    expect(JSON.stringify(recall.memoryEvidence)).toContain('first-fire context written after scheduling');
+
+    expect(await admitDueTaskContexts(db, AG, SESS)).toBe(0);
+    expect(
+      (
+        db
+          .prepare('SELECT COUNT(*) AS count FROM messages_in WHERE id IN (?, ?)')
+          .get('recall-task-first-fire', 'task-first-fire') as { count: number }
+      ).count,
+    ).toBe(2);
+    db.close();
+  });
+
+  it('admits a due recurrence clone through the same adjacent-pair seam', async () => {
+    initSessionFolder(AG, SESS);
+    const db = new Database(inboundDbPath(AG, SESS));
+    const original: RecurringMessage = {
+      id: 'task-recurring-original',
+      kind: 'task',
+      content: JSON.stringify({ prompt: 'recurring context' }),
+      recurrence: '0 9 * * *',
+      process_after: '2020-01-01T00:00:00.000Z',
+      platform_id: 'slack:C1',
+      channel_type: 'slack',
+      thread_id: 'slack:C1:T1',
+      series_id: 'task-recurring-original',
+    };
+    insertRecurrence(db, original, 'task-recurring-next', '2020-01-02T00:00:00.000Z');
+    const memoryRoot = path.join('/tmp/nanoclaw-test-write-outbound', 'workgroups', 'reset', 'memory');
+    fs.mkdirSync(path.join(memoryRoot, 'system'), { recursive: true });
+    fs.writeFileSync(path.join(memoryRoot, 'index.md'), '# Current canon\nrecurrence memory written after cloning');
+    fs.writeFileSync(path.join(memoryRoot, 'system', 'definition.md'), '# Definition\nfresh on every admission');
+
+    expect(await admitDueTaskContexts(db, AG, SESS)).toBe(1);
+    const pair = db
+      .prepare(
+        'SELECT id, seq, kind, trigger, series_id, recurrence, platform_id, channel_type, thread_id, content FROM messages_in WHERE id IN (?, ?) ORDER BY seq',
+      )
+      .all('recall-task-recurring-next', 'task-recurring-next') as Array<Record<string, unknown>>;
+    expect(pair.map((row) => row.id)).toEqual(['recall-task-recurring-next', 'task-recurring-next']);
+    expect((pair[1]!.seq as number) - (pair[0]!.seq as number)).toBe(2);
+    expect(pair[1]).toMatchObject({
+      kind: 'task',
+      trigger: 1,
+      series_id: 'task-recurring-original',
+      recurrence: '0 9 * * *',
+      platform_id: 'slack:C1',
+      channel_type: 'slack',
+      thread_id: 'slack:C1:T1',
+    });
+    const recall = JSON.parse(pair[0]!.content as string);
+    expect(recall).toMatchObject({
+      subtype: 'recall_context',
+      trustedCapabilities: { agentGroupId: AG },
+    });
+    expect(recall.trustedCapabilities.services).toEqual(
+      expect.arrayContaining([expect.objectContaining({ name: 'Exa' })]),
+    );
+    expect(JSON.stringify(recall.memoryEvidence)).toContain('recurrence memory written after cloning');
+    db.close();
+  });
+
+  it('replaces crashed-turn recall with current memory and capabilities when backoff becomes due', async () => {
+    const memoryRoot = path.join('/tmp/nanoclaw-test-write-outbound', 'workgroups', 'reset', 'memory');
+    fs.mkdirSync(path.join(memoryRoot, 'system'), { recursive: true });
+    fs.writeFileSync(path.join(memoryRoot, 'index.md'), '# Current canon\nmemory before crash');
+    fs.writeFileSync(path.join(memoryRoot, 'system', 'definition.md'), '# Definition\nfresh retry context');
+    CAPABILITY_STATE.revision = 'before-crash';
+
+    await writeSessionMessageIfNew(AG, SESS, {
+      id: 'chat-crash-retry',
+      kind: 'chat-sdk',
+      timestamp: '2026-07-25T00:00:00.000Z',
+      platformId: 'discord:g:c',
+      channelType: 'discord',
+      threadId: 'discord:g:c:t',
+      content: JSON.stringify({ text: 'retry with current context' }),
+    });
+
+    const db = new Database(inboundDbPath(AG, SESS));
+    try {
+      const firstRecall = JSON.parse(
+        (
+          db.prepare('SELECT content FROM messages_in WHERE id = ?').get('recall-chat-crash-retry') as {
+            content: string;
+          }
+        ).content,
+      );
+      expect(JSON.stringify(firstRecall.memoryEvidence)).toContain('memory before crash');
+      expect(firstRecall.trustedCapabilities.services).toEqual(
+        expect.arrayContaining([expect.objectContaining({ name: 'Test capability before-crash' })]),
+      );
+
+      await deferMessageForFreshContextRetry(db, 'chat-crash-retry', 60);
+      const deferred = db
+        .prepare('SELECT id, trigger, process_after FROM messages_in WHERE id IN (?, ?) ORDER BY id')
+        .all('chat-crash-retry', 'recall-chat-crash-retry') as Array<{
+        id: string;
+        trigger: number;
+        process_after: string | null;
+      }>;
+      expect(deferred).toHaveLength(2);
+      expect(deferred.every((row) => row.trigger === 0)).toBe(true);
+      expect(deferred[0]!.process_after).not.toBeNull();
+      expect(deferred[0]!.process_after).toBe(deferred[1]!.process_after);
+      expect(
+        (
+          db
+            .prepare(
+              `SELECT COUNT(*) AS count
+                 FROM messages_in
+                WHERE status = 'pending' AND trigger = 1
+                  AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))`,
+            )
+            .get() as { count: number }
+        ).count,
+      ).toBe(0);
+
+      fs.writeFileSync(path.join(memoryRoot, 'index.md'), '# Current canon\nmemory after crash');
+      CAPABILITY_STATE.revision = 'after-crash';
+      db.prepare('UPDATE messages_in SET process_after = ? WHERE id IN (?, ?)').run(
+        '2020-01-01T00:00:00.000Z',
+        'chat-crash-retry',
+        'recall-chat-crash-retry',
+      );
+
+      expect(await admitDueTaskContexts(db, AG, SESS)).toBe(1);
+      const replacement = db
+        .prepare('SELECT id, seq, kind, trigger, content FROM messages_in WHERE id IN (?, ?) ORDER BY seq')
+        .all('recall-chat-crash-retry', 'chat-crash-retry') as Array<{
+        id: string;
+        seq: number;
+        kind: string;
+        trigger: number;
+        content: string;
+      }>;
+      expect(replacement.map((row) => row.id)).toEqual(['recall-chat-crash-retry', 'chat-crash-retry']);
+      expect(replacement[1]!.seq - replacement[0]!.seq).toBe(2);
+      expect(replacement[0]).toMatchObject({ kind: 'system', trigger: 0 });
+      expect(replacement[1]).toMatchObject({ kind: 'chat-sdk', trigger: 1 });
+      const freshRecall = JSON.parse(replacement[0]!.content);
+      expect(JSON.stringify(freshRecall.memoryEvidence)).toContain('memory after crash');
+      expect(JSON.stringify(freshRecall.memoryEvidence)).not.toContain('memory before crash');
+      expect(freshRecall.trustedCapabilities.services).toEqual(
+        expect.arrayContaining([expect.objectContaining({ name: 'Test capability after-crash' })]),
+      );
+      expect(freshRecall.trustedCapabilities.services).not.toEqual(
+        expect.arrayContaining([expect.objectContaining({ name: 'Test capability before-crash' })]),
+      );
+
+      expect(await admitDueTaskContexts(db, AG, SESS)).toBe(0);
+      expect(
+        (
+          db
+            .prepare('SELECT COUNT(*) AS count FROM messages_in WHERE id IN (?, ?)')
+            .get('recall-chat-crash-retry', 'chat-crash-retry') as { count: number }
+        ).count,
+      ).toBe(2);
+    } finally {
+      CAPABILITY_STATE.revision = 'initial';
+      db.close();
+    }
+  });
+
+  it('never promotes ordinary accumulated chat without a retry recall marker', async () => {
+    await writeSessionMessage(AG, SESS, {
+      id: 'accumulated-chat-only',
+      kind: 'chat',
+      timestamp: '2026-07-25T00:00:00.000Z',
+      content: JSON.stringify({ text: 'context only' }),
+      processAfter: '2020-01-01T00:00:00.000Z',
+      trigger: 0,
+    });
+    const db = new Database(inboundDbPath(AG, SESS));
+    try {
+      expect(await admitDueTaskContexts(db, AG, SESS)).toBe(0);
+      expect(db.prepare('SELECT kind, trigger FROM messages_in WHERE id = ?').get('accumulated-chat-only')).toEqual({
+        kind: 'chat',
+        trigger: 0,
+      });
+      expect(db.prepare('SELECT id FROM messages_in WHERE id = ?').get('recall-accumulated-chat-only')).toBeUndefined();
+    } finally {
+      db.close();
+    }
+  });
+
+  it('leaves a malformed deferred clear-shaped pair inert instead of aborting the due sweep', async () => {
+    initSessionFolder(AG, SESS);
+    const db = new Database(inboundDbPath(AG, SESS));
+    db.prepare(
+      `INSERT INTO messages_in
+         (id, seq, kind, timestamp, status, content, process_after, trigger, on_wake)
+       VALUES
+         ('recall-malformed-clear', 2, 'system', ?, 'pending', ?, ?, 0, 0),
+         ('malformed-clear', 4, 'chat', ?, 'pending', ?, ?, 0, 0)`,
+    ).run(
+      '2026-07-25T00:00:00.000Z',
+      JSON.stringify({ subtype: 'recall_context', provider: 'claude', contextEpoch: 0 }),
+      '2020-01-01T00:00:00.000Z',
+      '2026-07-25T00:00:00.000Z',
+      JSON.stringify({ text: '/clear malformed retry' }),
+      '2020-01-01T00:00:00.000Z',
+    );
+
+    try {
+      expect(await admitDueTaskContexts(db, AG, SESS)).toBe(0);
+      expect(db.prepare('SELECT trigger FROM messages_in WHERE id = ?').get('malformed-clear')).toEqual({
+        trigger: 0,
+      });
+    } finally {
+      db.close();
+    }
+  });
+
+  it('test_lifecycle_turns_use_the_same_fresh_pair_contract', async () => {
+    const lifecycleTurns = [
+      { id: 'lifecycle-first-wake', text: 'cold start context', onWake: 1 as const },
+      { id: 'lifecycle-warm', text: 'warm continuation context', onWake: 0 as const },
+      { id: 'lifecycle-compaction', text: '/compact preserve context', onWake: 0 as const },
+      { id: 'lifecycle-rotation', text: 'rotated provider context', onWake: 1 as const },
+      { id: 'lifecycle-replacement', text: 'replacement provider context', onWake: 1 as const },
+    ];
+
+    for (const [index, turn] of lifecycleTurns.entries()) {
+      await expect(
+        writeSessionMessageIfNew(AG, SESS, {
+          id: turn.id,
+          kind: 'chat-sdk',
+          timestamp: `2026-07-25T00:00:0${index}.000Z`,
+          platformId: 'discord:g:c',
+          channelType: 'discord',
+          threadId: 'discord:g:c:t',
+          content: JSON.stringify({ text: turn.text }),
+          onWake: turn.onWake,
+        }),
+      ).resolves.toBe(true);
+    }
+
+    const db = new Database(inboundDbPath(AG, SESS), { readonly: true });
+    try {
+      for (const turn of lifecycleTurns) {
+        const rows = db
+          .prepare(
+            `SELECT id, seq, kind, trigger, on_wake, content
+               FROM messages_in
+              WHERE id IN (?, ?)
+              ORDER BY seq`,
+          )
+          .all(`recall-${turn.id}`, turn.id) as Array<{
+          id: string;
+          seq: number;
+          kind: string;
+          trigger: number;
+          on_wake: number;
+          content: string;
+        }>;
+        expect(rows.map((row) => row.id)).toEqual([`recall-${turn.id}`, turn.id]);
+        expect(rows[1]!.seq - rows[0]!.seq).toBe(2);
+        expect(rows[0]).toMatchObject({ kind: 'system', trigger: 0, on_wake: turn.onWake });
+        expect(JSON.parse(rows[0]!.content)).toMatchObject({ subtype: 'recall_context' });
+      }
+    } finally {
+      db.close();
+    }
+  });
+
+  it.each([
+    ['system', 1, '{"text":"system"}'],
+    ['chat', 0, '{"text":"context only"}'],
+    ['chat-sdk', 1, '{"text":"/clear"}'],
+    ['chat-sdk', 1, '{"text":"[Thread context]\\nold\\n[Latest message]\\n<@bot> /clear now"}'],
+  ])('does not pair inadmissible %s trigger=%s rows', async (kind, trigger, content) => {
+    const id = `inadmissible-${kind}-${trigger}-${content.length}`;
+    expect(
+      isAdmissiblePreTurnTrigger({ id, kind, timestamp: new Date().toISOString(), content, trigger: trigger as 0 | 1 }),
+    ).toBe(false);
+    await writeSessionMessage(AG, SESS, {
+      id,
+      kind,
+      timestamp: new Date().toISOString(),
+      content,
+      trigger: trigger as 0 | 1,
+    });
+    const db = new Database(inboundDbPath(AG, SESS), { readonly: true });
+    try {
+      expect(db.prepare('SELECT id FROM messages_in WHERE id = ?').get(id)).toEqual({ id });
+      expect(db.prepare('SELECT id FROM messages_in WHERE id = ?').get(`recall-${id}`)).toBeUndefined();
+    } finally {
+      db.close();
+    }
   });
 });

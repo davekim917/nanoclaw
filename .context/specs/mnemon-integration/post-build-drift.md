@@ -1,5 +1,9 @@
 # Post-Build Drift Report — mnemon-integration
 
+> **ARCHIVED AND SUPERSEDED — not a current conformance report.** This entire
+> spec family records a retired Mnemon/Ollama/provider-native design. See the
+> [current memory contract](../../../docs/specs/workgroup-memory-and-session-capabilities/design.md).
+
 **Source of Truth:** `.context/specs/mnemon-integration/plan.md`
 **Target:** assembled implementation files from all 4 groups (Group A foundation, Group B container hooks, Group C scheduling, Group D integration)
 **Run mode:** 2-agent (Claude Sonnet via Task + Codex via CLI; Gemini CLI unavailable)

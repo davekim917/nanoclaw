@@ -43,15 +43,37 @@ function policyCount(): number {
   return (getDb().prepare('SELECT COUNT(*) AS n FROM agent_message_policies').get() as { n: number }).n;
 }
 
-function readInbound(agentGroupId: string, sessionId: string) {
+function readPairedInboundTriggers(agentGroupId: string, sessionId: string) {
   const db = new Database(inboundDbPath(agentGroupId, sessionId), { readonly: true });
-  const rows = db.prepare('SELECT id, platform_id, content FROM messages_in ORDER BY seq').all() as Array<{
+  const rows = db
+    .prepare('SELECT id, seq, kind, trigger, platform_id, content FROM messages_in ORDER BY seq')
+    .all() as Array<{
     id: string;
+    seq: number;
+    kind: string;
+    trigger: number;
     platform_id: string | null;
     content: string;
   }>;
   db.close();
-  return rows;
+  const triggers = rows.filter((row) => row.trigger === 1 && row.kind !== 'system');
+  const recallRows = rows.filter((row) => {
+    if (row.kind !== 'system' || row.trigger !== 0) return false;
+    return (JSON.parse(row.content) as { subtype?: string }).subtype === 'recall_context';
+  });
+  expect(recallRows).toHaveLength(triggers.length);
+  for (const trigger of triggers) {
+    const index = rows.indexOf(trigger);
+    const recall = rows[index - 1];
+    expect(recall).toMatchObject({
+      id: `recall-${trigger.id}`,
+      kind: 'system',
+      trigger: 0,
+      seq: trigger.seq - 2,
+    });
+    expect(JSON.parse(recall!.content)).toMatchObject({ subtype: 'recall_context' });
+  }
+  return triggers;
 }
 
 function makeSession(id: string, agentGroupId: string): Session {
@@ -143,7 +165,7 @@ describe('agent message policies', () => {
       { id: 'm1', platform_id: B, content: JSON.stringify({ text: 'hi B' }), in_reply_to: null },
       SA,
     );
-    expect(readInbound(B, SB.id)).toHaveLength(1);
+    expect(readPairedInboundTriggers(B, SB.id)).toHaveLength(1);
     expect(requestApproval).not.toHaveBeenCalled();
   });
 
@@ -156,7 +178,7 @@ describe('agent message policies', () => {
     );
 
     // Held: nothing routed to B.
-    expect(readInbound(B, SB.id)).toHaveLength(0);
+    expect(readPairedInboundTriggers(B, SB.id)).toHaveLength(0);
     // One approval requested, to the policy's approver.
     expect(requestApproval).toHaveBeenCalledTimes(1);
     const opts = vi.mocked(requestApproval).mock.calls[0][0];
@@ -173,7 +195,7 @@ describe('agent message policies', () => {
       SA,
     );
     expect(requestApproval).not.toHaveBeenCalled();
-    expect(readInbound(A, SA.id)).toHaveLength(1);
+    expect(readPairedInboundTriggers(A, SA.id)).toHaveLength(1);
   });
 
   it('ghost policy (policy row, no destination row) still denies — deny beats the policy hold', async () => {
@@ -184,7 +206,7 @@ describe('agent message policies', () => {
       routeAgentMessage({ id: 'ghost', platform_id: B, content: JSON.stringify({ text: 'x' }), in_reply_to: null }, SA),
     ).rejects.toThrow(/unauthorized agent-to-agent/);
     expect(requestApproval).not.toHaveBeenCalled();
-    expect(readInbound(B, SB.id)).toHaveLength(0);
+    expect(readPairedInboundTriggers(B, SB.id)).toHaveLength(0);
   });
 
   // ── approve handler re-enters the guarded route with the grant ──
@@ -197,7 +219,7 @@ describe('agent message policies', () => {
     const notify = vi.fn();
     await applyA2aMessageGate({ session: SA, userId: 'telegram:dana', notify, payload, approval });
 
-    const bRows = readInbound(B, SB.id);
+    const bRows = readPairedInboundTriggers(B, SB.id);
     expect(bRows).toHaveLength(1);
     expect(JSON.parse(bRows[0].content).text).toBe('approved!');
     expect(notify).not.toHaveBeenCalled();
@@ -217,7 +239,7 @@ describe('agent message policies', () => {
     // handler never records it as a handler crash.
     await applyA2aMessageGate({ session: SA, userId: 'telegram:dana', notify, payload, approval });
 
-    expect(readInbound(B, SB.id)).toHaveLength(0);
+    expect(readPairedInboundTriggers(B, SB.id)).toHaveLength(0);
     expect(notify).toHaveBeenCalledWith(expect.stringMatching(/not delivered.*no destination for/));
   });
 
@@ -230,7 +252,7 @@ describe('agent message policies', () => {
     const notify = vi.fn();
     await applyA2aMessageGate({ session: SA, userId: 'telegram:dana', notify, payload, approval });
 
-    expect(readInbound(B, SB.id)).toHaveLength(0);
+    expect(readPairedInboundTriggers(B, SB.id)).toHaveLength(0);
     expect(notify).toHaveBeenCalledWith(expect.stringMatching(/not delivered.*invalid or mismatched grant/));
   });
 
@@ -244,7 +266,7 @@ describe('agent message policies', () => {
     const notify = vi.fn();
     await applyA2aMessageGate({ session: SA, userId: 'telegram:dana', notify, payload, approval });
 
-    expect(readInbound(B, SB.id)).toHaveLength(0);
+    expect(readPairedInboundTriggers(B, SB.id)).toHaveLength(0);
     expect(notify).toHaveBeenCalledWith(expect.stringMatching(/not delivered.*invalid or mismatched grant/));
   });
 

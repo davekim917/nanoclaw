@@ -143,7 +143,7 @@ Via [korotovsky/slack-mcp-server v1.3.0](https://github.com/korotovsky/slack-mcp
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
-| `mnemon recall` style "unauthorized" error from Slack | OneCLI substitution not configured for `slack.com` | Step 3 above |
+| Credentialed CLI reports "unauthorized" from Slack | OneCLI substitution not configured for `slack.com` | Step 3 above |
 | MCP not appearing in the agent's tool list at all | `slack_user_token.enabled` not set, OR session is in a non-allowlisted channel | Check `container.json` + host log for `slack-user-token MCP gated off for this session` |
 | `xoxp-onecli-managed-placeholder` reaches Slack and gets rejected | OneCLI vault doesn't have the matching secret assigned to this agent | Step 4 above; verify `onecli agents get-secrets --id <agent-id>` shows the Slack secret |
 | Search returns nothing for known content | Token scopes missing (e.g., `search:read` not added) | Step 1 — regenerate the Slack app's user-token after adding the scope |

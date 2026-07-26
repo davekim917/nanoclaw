@@ -428,7 +428,7 @@ export function resolveQueryEffort(requested: string | undefined, sticky: CodexS
 // CLAUDE.md, and doesn't auto-load CLAUDE.local.md from the working dir the
 // way Claude Code does. Left alone, the agent sees only the raw import
 // directives as literal text and none of the composed content — no shared
-// CLAUDE.md, no module fragments, no per-group memory. We resolve both here
+// CLAUDE.md or module fragments. We resolve both here
 // so Codex (and any other non-Claude provider) gets the same effective
 // system prompt the Claude provider gets natively.
 
@@ -970,9 +970,9 @@ export class CodexProvider implements AgentProvider {
       try {
         await initializeCodexAppServer(server);
 
-        // Codex preserves base instructions across its native compaction
-        // lifecycle. Re-supplying authoritative file memory when a runner
-        // creates/resumes the app-server query also covers legacy threads.
+        // Codex preserves base instructions across native compaction. The
+        // lifecycle seam adds trusted static memory handling/write guidance;
+        // canonical bytes arrive per turn only in paired untrusted recall.
         const memoryContext = memoryContextForSessionStart('startup');
         const lifecycleInstructions = [input.systemContext?.instructions, memoryContext].filter(Boolean).join('\n\n');
         const threadParams = {

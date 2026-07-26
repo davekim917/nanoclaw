@@ -20,7 +20,7 @@ describe('provider memory lifecycle wiring', () => {
     'utf-8',
   );
 
-  it('requires and registers the shared lifecycle contract for every provider', () => {
+  it('requires and registers the shared trusted-static lifecycle contract for every provider', () => {
     expect(runnerSource).toMatch(/provider\.registerMemorySessionHook\(MEMORY_SESSION_HOOK\)/);
     expect(providerTypesSource).toMatch(/registerMemorySessionHook\(hook: MemorySessionHookRegistration\): void/);
     for (const source of Object.values(providerSources)) {
@@ -29,7 +29,7 @@ describe('provider memory lifecycle wiring', () => {
     }
   });
 
-  it('uses one authoritative file-memory path and disables Codex opaque memory', () => {
+  it('keeps canonical bytes on paired recall while disabling Codex opaque memory', () => {
     expect(providerSources.claude).not.toContain('memorySessionStartHook');
     expect(providerSources.claude).not.toContain('providesMemorySessionHook');
     expect(providerSources.codex).toMatch(/memoryContextForSessionStart\('startup'\)/);

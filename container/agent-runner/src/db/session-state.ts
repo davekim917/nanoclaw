@@ -21,6 +21,10 @@ function continuationKey(providerName: string): string {
   return `continuation:${providerName.toLowerCase()}`;
 }
 
+function memoryContextEpochKey(providerName: string): string {
+  return `memory_context_epoch:${providerName.toLowerCase()}`;
+}
+
 function getValue(key: string): string | undefined {
   const row = getOutboundDb()
     .prepare('SELECT value FROM session_state WHERE key = ?')
@@ -80,6 +84,24 @@ export function setContinuation(providerName: string, id: string): void {
 
 export function clearContinuation(providerName: string): void {
   deleteValue(continuationKey(providerName));
+}
+
+/**
+ * Monotonic provider-context identity used by host-side recall deduplication.
+ * This reuses session_state rather than introducing a second lifecycle store.
+ */
+export function getMemoryContextEpoch(providerName: string): number {
+  const parsed = Number.parseInt(getValue(memoryContextEpochKey(providerName)) ?? '0', 10);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : 0;
+}
+
+export function advanceMemoryContextEpoch(providerName: string): number {
+  return getOutboundDb().transaction(() => {
+    const current = getMemoryContextEpoch(providerName);
+    const next = current >= Number.MAX_SAFE_INTEGER ? 0 : current + 1;
+    setValue(memoryContextEpochKey(providerName), String(next));
+    return next;
+  })();
 }
 
 /**

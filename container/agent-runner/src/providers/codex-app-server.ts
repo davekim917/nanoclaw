@@ -666,8 +666,9 @@ export function createCodexConfigOverrides(
       stickyConfig?.max_concurrent_threads_per_session ?? DEFAULT_CODEX_MAX_CONCURRENT_THREADS_PER_SESSION
     }`,
     // Graphify is the sole derived retrieval layer. Codex's opaque summary
-    // store is disabled; authoritative memory files enter through the shared
-    // provider lifecycle hook and remain indexable by Graphify.
+    // store is disabled; canonical memory bytes enter through paired untrusted
+    // recall and remain indexable by Graphify. The provider lifecycle carries
+    // trusted static guidance only.
     'memories.generate_memories=false',
     'memories.use_memories=false',
   ];

@@ -13,6 +13,9 @@
 //   3. acquire inputs     — resolve every `prompt` via `inputs` / `resolveInput`
 //   4. mutate             — copy/append/env-set, journaled + idempotent
 //   5. run                — build/test/fetch (+ dep install) via injected exec
+//
+// A failed `effect:check` is a true precondition failure: apply stops at that
+// directive, before any later file/dependency/config mutation can occur.
 // Remove is derived from the journal — no hand-written REMOVE.md.
 //
 // Inputs + `resolveInput` make one engine serve three contexts:
@@ -612,12 +615,10 @@ async function applyOne(
       // effect:check runs the body as a shell PREDICATE — a precondition gate
       // that mutates NOTHING. It pushes no journal entry and binds no capture: a
       // zero exit is a silent pass; a non-zero exit throws → the outer catch
-      // bounces it to an agent (which reads the prose and decides); an unresolved
-      // {{var}} throws from substitute first → deferred (like any other run, e.g.
-      // a headless rebuild before the value is collected). Because a bounce here
-      // latches `blocked`, a failed precondition gates the dangerous side effects
-      // (a restart, a pairing/QR step, a wire) that follow — a broken local
-      // config or an un-registered app never reaches a doomed restart/QR.
+      // bounces it to an agent (which reads the prose and decides) and stops the
+      // apply before every later directive. An unresolved {{var}} throws from
+      // substitute first → deferred (like any other run, e.g. a headless rebuild
+      // before the value is collected) and does not stop unrelated later work.
       if (d.attrs.effect === 'check') {
         for (const cmd of d.body) await exec(substitute(cmd, vars));
         break;
@@ -835,8 +836,16 @@ export async function applySkill(skillDir: string, root: string, opts: ApplyOpti
         const end = { kind: d.kind, line: d.line, label: inFlight.label, ok: false, durationMs: Date.now() - inFlight.at, error: msg };
         try { await opts.onEvent({ type: 'step-end', ...end }); } catch { /* already failing — the close is best-effort */ }
       }
-      if (/unresolved \{\{/.test(msg)) res.deferred.push(msg); // blocked on a prompt input
-      else bounce(d, `engine could not apply (${msg}) — an agent applies it from the prose`);
+      if (/unresolved \{\{/.test(msg)) {
+        res.deferred.push(msg); // blocked on a prompt input
+      } else {
+        bounce(d, `engine could not apply (${msg}) — an agent applies it from the prose`);
+        // `effect:check` is a PRECONDITION, not a best-effort health signal.
+        // Continuing could overwrite customized source before the agent gets a
+        // chance to resolve the failed check. Stop with exactly the failed
+        // check as the handoff; successful and check-free flows are unchanged.
+        if (d.kind === 'run' && d.attrs.effect === 'check') break;
+      }
     }
   }
   // Surface the non-secret resolved values for a caller to consume.

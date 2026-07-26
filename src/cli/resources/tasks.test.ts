@@ -87,6 +87,13 @@ function agentCtx(group = 'ag-1', session = 'chat-1'): CallerContext {
   return { caller: 'agent', agentGroupId: group, sessionId: session, messagingGroupId: 'mg-1' };
 }
 
+async function admitDueTaskContexts(db: Database.Database, agentGroupId: string, sessionId: string): Promise<number> {
+  const module = (await import('../../session-manager.js')) as typeof import('../../session-manager.js') & {
+    admitDueTaskContexts: (db: Database.Database, agentGroupId: string, sessionId: string) => number;
+  };
+  return module.admitDueTaskContexts(db, agentGroupId, sessionId);
+}
+
 describe('tasks CLI resource', () => {
   beforeEach(() => {
     if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
@@ -132,11 +139,17 @@ describe('tasks CLI resource', () => {
     chatDb.close();
 
     const systemDb = new Database(inboundDbPath('ag-1', created.session_id), { readonly: true });
-    const row = systemDb.prepare("SELECT content FROM messages_in WHERE kind = 'task'").get() as { content: string };
+    const row = systemDb.prepare("SELECT id, content, trigger FROM messages_in WHERE kind = 'task'").get() as {
+      id: string;
+      content: string;
+      trigger: number;
+    };
     const content = JSON.parse(row.content);
     expect(content).toMatchObject({ originSessionId: 'chat-1' });
     expect(content.prompt).toBe('send a briefing');
     expect(content.prompt).not.toContain('Task delivery contract');
+    expect(row.trigger).toBe(0);
+    expect(systemDb.prepare('SELECT id FROM messages_in WHERE id = ?').get(`recall-${row.id}`)).toBeUndefined();
     systemDb.close();
   });
 
@@ -350,18 +363,57 @@ describe('tasks CLI resource', () => {
     expect(fired.row_id).not.toBe(series_id);
     expect(fired.status).toBe('pending');
 
-    const db = new Database(inboundDbPath('ag-1', session_id), { readonly: true });
+    const dbPath = inboundDbPath('ag-1', session_id);
+    const db = new Database(dbPath);
     const pending = db
       .prepare(
-        "SELECT id, recurrence, process_after FROM messages_in WHERE kind = 'task' AND status = 'pending' AND series_id = ?",
+        "SELECT id, recurrence, process_after, trigger FROM messages_in WHERE kind = 'task' AND status = 'pending' AND series_id = ?",
       )
-      .all(series_id) as Array<{ id: string; recurrence: string | null; process_after: string }>;
-    db.close();
+      .all(series_id) as Array<{ id: string; recurrence: string | null; process_after: string; trigger: number }>;
     // Original scheduled row + the new run-now occurrence both still pending.
     expect(pending).toHaveLength(2);
     const runRow = pending.find((p) => p.id === fired.row_id);
     expect(runRow?.recurrence).toBeNull(); // never re-armed into a phantom series
     expect(new Date(runRow!.process_after).getTime()).toBeLessThanOrEqual(Date.now());
+    expect(runRow?.trigger).toBe(0);
+
+    const memoryRoot = `${TEST_DIR}/workgroups/ag-1/memory`;
+    fs.mkdirSync(`${memoryRoot}/system`, { recursive: true });
+    fs.writeFileSync(`${memoryRoot}/index.md`, '# Current canon\nrun-now memory written after scheduling');
+    fs.writeFileSync(`${memoryRoot}/system/definition.md`, '# Definition\nfresh context at admission');
+
+    expect(await admitDueTaskContexts(db, 'ag-1', session_id)).toBe(1);
+    const pair = db
+      .prepare('SELECT id, seq, kind, trigger, content FROM messages_in WHERE id IN (?, ?) ORDER BY seq')
+      .all(`recall-${fired.row_id}`, fired.row_id) as Array<{
+      id: string;
+      seq: number;
+      kind: string;
+      trigger: number;
+      content: string;
+    }>;
+    expect(pair.map((row) => row.id)).toEqual([`recall-${fired.row_id}`, fired.row_id]);
+    expect(pair[1]!.seq - pair[0]!.seq).toBe(2);
+    expect(pair[0]).toMatchObject({ kind: 'system', trigger: 0 });
+    expect(pair[1]).toMatchObject({ kind: 'task', trigger: 1 });
+    const recall = JSON.parse(pair[0]!.content);
+    expect(recall).toMatchObject({
+      subtype: 'recall_context',
+      trustedCapabilities: { agentGroupId: 'ag-1' },
+    });
+    expect(recall.trustedCapabilities.services).toEqual(
+      expect.arrayContaining([expect.objectContaining({ name: 'Exa' })]),
+    );
+    expect(JSON.stringify(recall.memoryEvidence)).toContain('run-now memory written after scheduling');
+    expect(await admitDueTaskContexts(db, 'ag-1', session_id)).toBe(0);
+    expect(
+      (
+        db
+          .prepare('SELECT COUNT(*) AS count FROM messages_in WHERE id IN (?, ?)')
+          .get(`recall-${fired.row_id}`, fired.row_id) as { count: number }
+      ).count,
+    ).toBe(2);
+    db.close();
   });
 
   it('task object exposes origin_session_id and created_at', async () => {
@@ -442,13 +494,11 @@ describe('tasks CLI resource', () => {
     expect(row?.log).toBe(`tasks/${series_id}.md`);
   });
 
-  // The schedule→wake primitive without a container: a task created through the
-  // real `ncl tasks create` path must land in the agent group's system session
-  // AND be counted by the same due-message query the host sweep uses to decide a
-  // wake. Goes red if trigger defaulting, system-session routing, or the due
-  // predicate ever drift apart.
-  describe('a due task makes the system session wakeable', () => {
-    it('countDueMessages sees a past task and ignores a future one', async () => {
+  // The schedule→admit→wake primitive without a container: a task created
+  // through the real `ncl tasks create` path is inert until the host sweep
+  // injects fresh context, then the normal due-message query sees it.
+  describe('a due task becomes wakeable only after fresh context admission', () => {
+    it('countDueMessages sees an admitted past task and ignores a future one', async () => {
       const created = await dispatch(
         { id: 'r-due', command: 'tasks-create', args: { prompt: 'run me', 'process-after': '2020-01-01T00:00:00Z' } },
         agentCtx('ag-1', 'chat-1'),
@@ -457,7 +507,9 @@ describe('tasks CLI resource', () => {
       if (!created.ok) return;
       const systemId = (created.data as { session_id: string }).session_id;
 
-      const dueDb = new Database(inboundDbPath('ag-1', systemId), { readonly: true });
+      const dueDb = new Database(inboundDbPath('ag-1', systemId));
+      expect(countDueMessages(dueDb)).toBe(0);
+      expect(await admitDueTaskContexts(dueDb, 'ag-1', systemId)).toBe(1);
       expect(countDueMessages(dueDb)).toBe(1); // host sweep would wake this session
       dueDb.close();
 

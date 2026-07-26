@@ -61,7 +61,7 @@ Body: shell command(s), with `{{vars}}` substituted in. **Idempotency: the comma
 | `wire` | Runs `ncl …` to wire collected input. No undo — the rows it creates are user runtime data, not reversed on skill remove |
 | `restart` | Restarts the service so following `ncl` runs reach it. A caller that owns the restart (a rebuild, or a setup that restarts once) skips it via `ApplyOptions.skipEffects` |
 | `step` | A long-running, operator-interactive step (a pairing code, a QR device-link) run through the streaming exec: its `=== NANOCLAW SETUP: … ===` status blocks render to the operator live. Degrades to an agent when no streaming exec is wired |
-| `check` | A shell **predicate** (a precondition gate): mutates nothing — no journal, no capture. Zero exit passes silently; non-zero bounces to an agent (degrade, not crash) and, via the run-health gate, blocks the dangerous side effects that follow it (a restart, a pairing/QR step, a wire). An unresolved `{{var}}` defers |
+| `check` | A shell **predicate** (a precondition gate): mutates nothing — no journal, no capture. Zero exit passes silently; non-zero bounces to an agent (degrade, not crash) and stops before every later directive, including file/config mutations. An unresolved `{{var}}` defers |
 
 `capture:` binds command output into vars (the twin of `prompt`):
 

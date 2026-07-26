@@ -438,9 +438,10 @@ RUN chmod +x /app/entrypoint.sh
 # processes (setup scripts, group-init, systemd unit user) run as UID 1001,
 # and host-owned bind mounts — notably `.claude-shared/` at /home/node/.claude
 # — arrive in the container at UID 1001. Without this remap, the container's
-# `node` (UID 1000) can *read* those dirs under 755 perms but can't *write*,
-# which silently freezes Claude Code auto-memory and autodream pruning. The
-# base image's UID 1000 is arbitrary; no baked dir hard-codes it.
+# `node` (UID 1000) can *read* those dirs under 755 perms but can't *write*
+# provider state. The canonical workgroup-memory mount also relies on the
+# runtime UID matching its host ownership. The base image's UID 1000 is
+# arbitrary; no baked dir hard-codes it.
 ARG HOST_UID=1001
 ARG HOST_GID=1001
 # /home/node/.config must exist in the image: cred mounts land nested under it

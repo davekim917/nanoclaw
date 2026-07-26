@@ -67,15 +67,18 @@ Files you create are saved in `/workspace/agent/` — this is your **private** s
 
 If `/workspace/workgroup/` exists, it is **shared read-write with every sibling agent in your workgroup** (your Claude / Codex / OpenCode twins) — the "house". Put collaborative work there so siblings can see it directly: shared repos, source/research files, decks, anything you're building together. When a teammate asks you to review or build on something, write it under `/workspace/workgroup/` rather than `/workspace/agent/`, and read shared artifacts from there. (If `/workspace/workgroup/` is absent, this install hasn't enabled workgroup file sharing yet — use `/workspace/agent/` and share by pasting or by an agreed path.)
 
-The durable memory you maintain lives under `/workspace/agent/memory/`. Keep
-`memory/index.md` concise and link to deeper concept files. `CLAUDE.local.md`
-is operator-curated standing guidance: read it, but do not edit it unless the
-user explicitly asks.
+The workgroup's durable memory lives under `/workspace/workgroup/memory/`;
+`/workspace/agent/memory/` is a compatibility path to the same canon. Keep
+`memory/index.md` concise and link to deeper concept files. Use
+`write_memory_file` with the current SHA-256 for updates or `null` for a unique
+create-only path. A raw shell write is an explicit last-writer escape hatch
+that bypasses conflict protection. `CLAUDE.local.md` is operator-curated
+standing guidance: read it, but do not edit it unless the user explicitly asks.
 
 ## Memory and knowledge retrieval
 
 - **Provider-native context** carries the current conversation and provider-managed continuity.
-- **memory/** contains authoritative, portable Markdown memory shared across provider switches. Update it directly; Graphify indexes the same source files.
+- **memory/** is the compatibility view of authoritative, portable Markdown memory shared by every sibling in the workgroup. Edit Markdown with `write_memory_file`; Graphify indexes the same source files.
 - **CLAUDE.local.md** contains operator-curated behavioral rules and high-frequency preferences. Read it; do not edit it unless the user explicitly asks.
 - **Graphify** is the workgroup's source-grounded retrieval layer. It indexes sibling workspaces, shared workgroup files, canonical repository clones, tracked and untracked knowledge files, external conversation history, and the current thread's worktree overlay. Read the `graphify` skill and query it first when prior work, decisions, requirements, code relationships, or cross-artifact lineage could matter.
 

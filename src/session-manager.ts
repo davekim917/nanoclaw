@@ -10,7 +10,7 @@
  *   3. One writer per file — DELETE-mode journal-unlink isn't atomic across
  *      the mount; concurrent writers corrupt the DB.
  */
-import type Database from 'better-sqlite3';
+import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
 
@@ -21,6 +21,7 @@ import { DATA_DIR } from './config.js';
 import { assertChannelRoutingConsistency } from './delivery.js';
 import { ensureContainedInboxDir, isPathInside } from './inbox-safety.js';
 import { getMessagingGroup } from './db/messaging-groups.js';
+import { getContainerConfig, resolveProviderName } from './db/container-configs.js';
 import {
   createSession,
   findSystemSession,
@@ -36,11 +37,14 @@ import {
   openOutboundDb as openOutboundDbRaw,
   openOutboundDbRw as openOutboundDbRwRaw,
   upsertSessionRouting,
-  insertMessage,
-  insertMessageIfNew,
+  insertMessageWithContext,
+  insertMessageWithContextIfNew,
   migrateMessagesInTable,
+  nextEvenSeq,
+  type MessageInsert,
 } from './db/session-db.js';
 import { log } from './log.js';
+import { buildPreTurnContext } from './modules/memory/pre-turn-context.js';
 import type { Session, SessionMode } from './types.js';
 
 /** Root directory for all session data. */
@@ -151,20 +155,11 @@ export function sessionClaudeProjectsDir(agentGroupId: string, sessionId: string
 }
 
 /**
- * Group-level auto-memory dir. Overlay-mounted at
- * `/home/node/.claude/projects/<hash>/memory` INSIDE the per-session projects
- * mount so Claude Code's auto-memory (MEMORY.md + autodream pruning) stays
- * shared across every session in the agent group regardless of channel or
- * thread.
+ * Recognized legacy Claude-native memory source for this agent group.
  *
- * Points at the same physical path the SDK has been using under the outer
- * `.claude-shared` mount (`.claude-shared/projects/<hash>/memory/`). That way:
- *   - Existing MEMORY.md carries forward when the per-session projects
- *     overlay first engages — no migration step needed.
- *   - Auto-dream pruning from any session lands in the same file every other
- *     session sees.
- *   - If a future migration ever moves session transcripts elsewhere, memory
- *     stays put.
+ * `/migrate-memory` inventories this path and, after verified cutover, replaces
+ * it with a compatibility view of the workgroup canon. It is never a separate
+ * runtime memory authority.
  */
 export function groupClaudeMemoryDir(agentGroupId: string): string {
   return path.join(
@@ -438,6 +433,8 @@ export interface SessionMessageInput {
   timestamp: string;
   platformId?: string | null;
   channelType?: string | null;
+  /** Trusted central-DB route identity; needed because agent-shared sessions intentionally persist no MG binding. */
+  messagingGroupId?: string | null;
   threadId?: string | null;
   content: string;
   processAfter?: string | null;
@@ -460,6 +457,225 @@ export interface SessionMessageInput {
    * Dying containers (past first poll) skip these rows.
    */
   onWake?: 0 | 1;
+}
+
+function latestUserText(content: string): string {
+  let text = content;
+  try {
+    const parsed = JSON.parse(content) as { text?: unknown };
+    if (typeof parsed.text === 'string') text = parsed.text;
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
+    // Plain-text content is valid.
+  }
+  const marker = '[Latest message]\n';
+  const markerIndex = text.lastIndexOf(marker);
+  if (markerIndex !== -1) text = text.slice(markerIndex + marker.length);
+  let previous: string;
+  do {
+    previous = text;
+    text = text.replace(/^\s*<@[!&]?[\w-]+(\|[^>]*)?>\s*/, '');
+    text = text.replace(/^\s*@[\w-]+\s+/, '');
+  } while (previous !== text);
+  return text.trim();
+}
+
+/** Host equivalent of the runner's `isAdmissibleTrigger`. */
+export function isAdmissiblePreTurnTrigger(message: SessionMessageInput): boolean {
+  if ((message.trigger ?? 1) !== 1) return false;
+  if (message.kind === 'system') return false;
+  if (
+    (message.kind === 'chat' || message.kind === 'chat-sdk') &&
+    latestUserText(message.content).toLocaleLowerCase('en-US').startsWith('/clear')
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function buildRecallRow(
+  agentGroupId: string,
+  sessionId: string,
+  message: SessionMessageInput,
+  normalizedContent: string,
+  inboundDb: Database.Database,
+): MessageInsert | null {
+  if (!isAdmissiblePreTurnTrigger({ ...message, content: normalizedContent })) return null;
+  const lifecycle = resolveRecallLifecycle(inboundDb, agentGroupId, sessionId, `recall-${message.id}`);
+  return {
+    id: `recall-${message.id}`,
+    kind: 'system',
+    timestamp: message.timestamp,
+    platformId: message.platformId ?? null,
+    channelType: message.channelType ?? null,
+    threadId: message.threadId ?? null,
+    content: JSON.stringify({
+      subtype: 'recall_context',
+      ...buildPreTurnContext({
+        agentGroupId,
+        sessionId,
+        messagingGroupId: message.messagingGroupId,
+        threadId: message.threadId,
+        kind: message.kind,
+        trigger: message.trigger ?? 1,
+        normalizedContent,
+        provider: lifecycle.provider,
+        contextEpoch: lifecycle.contextEpoch,
+        includeBootstrap: lifecycle.includeBootstrap,
+        seenEvidenceFingerprints: lifecycle.seenEvidenceFingerprints,
+      }),
+    }),
+    processAfter: message.processAfter ?? null,
+    recurrence: null,
+    trigger: 0,
+    sourceSessionId: message.sourceSessionId ?? null,
+    onWake: message.onWake ?? 0,
+  };
+}
+
+interface ParsedRecallContext {
+  provider?: unknown;
+  contextEpoch?: unknown;
+  trustedCapabilities?: unknown;
+  memoryEvidence?: {
+    core?: Array<{ fingerprint?: unknown }>;
+    excerpts?: Array<{ fingerprint?: unknown }>;
+  };
+  conversationEvidence?: {
+    excerpts?: Array<{ fingerprint?: unknown }>;
+  };
+}
+
+interface RecallLifecycle {
+  provider: string;
+  contextEpoch: number;
+  includeBootstrap: boolean;
+  seenEvidenceFingerprints: string[];
+}
+
+function parseRecallContext(content: string): ParsedRecallContext | null {
+  try {
+    const parsed = JSON.parse(content) as ParsedRecallContext & { subtype?: unknown };
+    return parsed && parsed.subtype === 'recall_context' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function recallFingerprints(context: ParsedRecallContext): string[] {
+  const rows = [
+    ...(context.memoryEvidence?.core ?? []),
+    ...(context.memoryEvidence?.excerpts ?? []),
+    ...(context.conversationEvidence?.excerpts ?? []),
+  ];
+  return rows
+    .map((row) => row.fingerprint)
+    .filter((fingerprint): fingerprint is string => typeof fingerprint === 'string' && fingerprint.length > 0);
+}
+
+/**
+ * Resolve bootstrap/delta state from the existing provider continuation and
+ * recall rows. This is deliberately bounded and adds no lifecycle ledger.
+ */
+function resolveRecallLifecycle(
+  inboundDb: Database.Database,
+  agentGroupId: string,
+  sessionId: string,
+  excludeRecallId?: string,
+): RecallLifecycle {
+  const session = getSession(sessionId);
+  const provider = resolveProviderName(session?.agent_provider, getContainerConfig(agentGroupId)?.provider);
+  let contextEpoch = 0;
+  let hasContinuation = false;
+  try {
+    const outbound = openOutboundDb(agentGroupId, sessionId);
+    try {
+      const epochRow = outbound
+        .prepare('SELECT value FROM session_state WHERE key = ?')
+        .get(`memory_context_epoch:${provider}`) as { value: string } | undefined;
+      const parsedEpoch = Number.parseInt(epochRow?.value ?? '0', 10);
+      contextEpoch = Number.isSafeInteger(parsedEpoch) && parsedEpoch >= 0 ? parsedEpoch : 0;
+      hasContinuation =
+        outbound.prepare('SELECT 1 FROM session_state WHERE key = ? LIMIT 1').get(`continuation:${provider}`) !==
+        undefined;
+    } finally {
+      outbound.close();
+    }
+  } catch (error) {
+    log.warn('Unable to read provider recall lifecycle; admitting a fresh bootstrap', {
+      agentGroupId,
+      sessionId,
+      provider,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  // A /clear already queued ahead of this message will reset the provider
+  // before the message is prompted. The runner owns the epoch write, so the
+  // host cannot observe that future epoch yet; treat the pending boundary as
+  // fresh now so same-batch follow-ups carry full canon and unsuppressed
+  // relevant evidence into the reset context.
+  const pendingClear = (
+    inboundDb
+      .prepare(
+        `SELECT content
+           FROM messages_in
+          WHERE kind IN ('chat', 'chat-sdk')
+            AND status NOT IN ('completed', 'failed', 'cancelled')
+            AND instr(lower(content), '/clear') > 0
+          ORDER BY seq DESC
+        `,
+      )
+      .all() as Array<{ content: string }>
+  ).some((row) => latestUserText(row.content).toLocaleLowerCase('en-US').startsWith('/clear'));
+  if (pendingClear) hasContinuation = false;
+
+  const rows = inboundDb
+    .prepare(
+      `SELECT id, status, content
+         FROM messages_in
+        WHERE kind = 'system'
+          AND id LIKE 'recall-%'
+        ORDER BY seq DESC
+        LIMIT 256`,
+    )
+    .all() as Array<{ id: string; status: string; content: string }>;
+  const bootstrapAlreadyQueuedOrDelivered =
+    !pendingClear &&
+    inboundDb
+      .prepare(
+        `SELECT 1
+           FROM messages_in
+          WHERE kind = 'system'
+            AND id LIKE 'recall-%'
+            AND (? IS NULL OR id <> ?)
+            AND status NOT IN ('failed', 'cancelled')
+            AND json_valid(content)
+            AND json_extract(content, '$.subtype') = 'recall_context'
+            AND json_extract(content, '$.provider') = ?
+            AND json_extract(content, '$.contextEpoch') = ?
+            AND json_type(content, '$.trustedCapabilities') = 'object'
+          LIMIT 1`,
+      )
+      .get(excludeRecallId ?? null, excludeRecallId ?? null, provider, contextEpoch) !== undefined;
+  const seen = new Set<string>();
+  for (const row of rows) {
+    if (row.id === excludeRecallId) continue;
+    const parsed = parseRecallContext(row.content);
+    if (!parsed || parsed.provider !== provider || parsed.contextEpoch !== contextEpoch) {
+      continue;
+    }
+    if (hasContinuation && (row.status === 'completed' || row.status === 'processing')) {
+      for (const fingerprint of recallFingerprints(parsed)) seen.add(fingerprint);
+    }
+  }
+
+  return {
+    provider,
+    contextEpoch,
+    includeBootstrap: !bootstrapAlreadyQueuedOrDelivered,
+    seenEvidenceFingerprints: [...seen],
+  };
 }
 
 /** Read-only replay guard used before router side effects. */
@@ -509,27 +725,32 @@ async function writeSessionMessageInternal(
   // Extract base64 attachment data, save to inbox, replace with file paths
   const content = extractAttachmentFiles(agentGroupId, sessionId, message.id, message.content);
 
+  // Scheduled occurrences are always inert until the due-time admission seam
+  // builds current recall and flips them wakeable. Keep this invariant even if
+  // a future caller uses the general session writer instead of insertTaskRow.
+  const isScheduledTask = message.kind === 'task';
+  const row = {
+    id: message.id,
+    kind: message.kind,
+    timestamp: message.timestamp,
+    platformId: message.platformId ?? null,
+    channelType: message.channelType ?? null,
+    threadId: message.threadId ?? null,
+    content,
+    processAfter: message.processAfter ?? null,
+    recurrence: message.recurrence ?? null,
+    trigger: isScheduledTask ? (0 as const) : (message.trigger ?? 1),
+    sourceSessionId: message.sourceSessionId ?? null,
+    onWake: message.onWake ?? 0,
+  };
   const db = openInboundDb(agentGroupId, sessionId);
   let inserted: boolean;
   try {
-    const row = {
-      id: message.id,
-      kind: message.kind,
-      timestamp: message.timestamp,
-      platformId: message.platformId ?? null,
-      channelType: message.channelType ?? null,
-      threadId: message.threadId ?? null,
-      content,
-      processAfter: message.processAfter ?? null,
-      recurrence: message.recurrence ?? null,
-      trigger: message.trigger ?? 1,
-      sourceSessionId: message.sourceSessionId ?? null,
-      onWake: message.onWake ?? 0,
-    };
+    const recallRow = isScheduledTask ? null : buildRecallRow(agentGroupId, sessionId, message, content, db);
     if (ignoreDuplicateId) {
-      inserted = insertMessageIfNew(db, row);
+      inserted = insertMessageWithContextIfNew(db, row, recallRow);
     } else {
-      insertMessage(db, row);
+      insertMessageWithContext(db, row, recallRow);
       inserted = true;
     }
   } finally {
@@ -559,6 +780,325 @@ async function writeSessionMessageInternal(
       /* dashboard module not initialized — tests + early boot */
     });
   return true;
+}
+
+interface DueTaskForAdmission {
+  id: string;
+  kind: string;
+  timestamp: string;
+  platform_id: string | null;
+  channel_type: string | null;
+  thread_id: string | null;
+  content: string;
+  process_after: string | null;
+  source_session_id: string | null;
+  on_wake: 0 | 1;
+}
+
+interface PendingUpgradeForAdmission extends DueTaskForAdmission {
+  status: 'pending' | 'processing';
+}
+
+/**
+ * Pair non-task turns that were already live when the automatic pre-turn
+ * context contract was activated. Containers are absent when this runs (the
+ * migration and startup gates prove that first), so a row left in processing
+ * can safely return to pending. Scheduled tasks stay untouched: their existing
+ * due-time seam admits context immediately before execution.
+ */
+export function admitPendingUpgradeContexts(db: Database.Database, agentGroupId: string, sessionId: string): number {
+  const pending = db
+    .prepare(
+      `SELECT id, kind, timestamp, status, platform_id, channel_type, thread_id, content, process_after,
+              source_session_id, on_wake
+         FROM messages_in
+        WHERE status IN ('pending', 'processing')
+          AND trigger = 1
+          AND kind NOT IN ('system', 'task')
+          AND NOT EXISTS (
+            SELECT 1
+              FROM messages_in AS recall
+             WHERE recall.id = 'recall-' || messages_in.id
+          )
+        ORDER BY seq`,
+    )
+    .all() as PendingUpgradeForAdmission[];
+
+  let admitted = 0;
+  for (const message of pending) {
+    const recall = buildRecallRow(
+      agentGroupId,
+      sessionId,
+      {
+        id: message.id,
+        kind: message.kind,
+        timestamp: message.timestamp,
+        platformId: message.platform_id,
+        channelType: message.channel_type,
+        threadId: message.thread_id,
+        content: message.content,
+        processAfter: message.process_after,
+        trigger: 1,
+        sourceSessionId: message.source_session_id,
+        onWake: message.on_wake,
+      },
+      message.content,
+      db,
+    );
+    if (!recall) continue;
+
+    const inserted = db.transaction(() => {
+      const stillUnpaired = db
+        .prepare(
+          `SELECT 1
+             FROM messages_in
+            WHERE id = ?
+              AND status IN ('pending', 'processing')
+              AND trigger = 1
+              AND kind NOT IN ('system', 'task')
+              AND NOT EXISTS (
+                SELECT 1
+                  FROM messages_in AS recall
+                 WHERE recall.id = 'recall-' || messages_in.id
+              )`,
+        )
+        .get(message.id);
+      if (!stillUnpaired) return false;
+
+      const recallSeq = nextEvenSeq(db);
+      db.prepare(
+        `INSERT INTO messages_in
+           (id, seq, kind, timestamp, status, platform_id, channel_type, thread_id, content,
+            process_after, recurrence, series_id, trigger, source_session_id, on_wake)
+         VALUES
+           (@id, @seq, @kind, @timestamp, 'pending', @platformId, @channelType, @threadId, @content,
+            @processAfter, NULL, @id, 0, @sourceSessionId, @onWake)`,
+      ).run({ ...recall, seq: recallSeq });
+      const changed = db
+        .prepare(
+          `UPDATE messages_in
+              SET seq = ?, status = 'pending'
+            WHERE id = ?
+              AND status IN ('pending', 'processing')
+              AND trigger = 1`,
+        )
+        .run(recallSeq + 2, message.id).changes;
+      if (changed !== 1) throw new Error(`pending upgrade turn ${message.id} changed during context admission`);
+      return true;
+    })();
+    if (inserted) admitted++;
+  }
+  return admitted;
+}
+
+export function reconcilePendingUpgradeContexts(
+  centralDb: Database.Database,
+  workgroupIds: string[],
+  dataDir = DATA_DIR,
+): { sessions: number; admitted: number } {
+  let sessions = 0;
+  let admitted = 0;
+  for (const workgroupId of [...new Set(workgroupIds)].sort()) {
+    const rows = centralDb
+      .prepare(
+        `SELECT s.id, s.agent_group_id
+           FROM sessions s
+           JOIN agent_groups a ON a.id = s.agent_group_id
+          WHERE a.workgroup_id = ?
+          ORDER BY s.agent_group_id, s.id`,
+      )
+      .all(workgroupId) as Array<{ id: string; agent_group_id: string }>;
+    for (const row of rows) {
+      const inboundPath = path.join(dataDir, 'v2-sessions', row.agent_group_id, row.id, 'inbound.db');
+      if (!fs.existsSync(inboundPath)) continue;
+      const inbound = openInboundDbRaw(inboundPath);
+      try {
+        migrateMessagesInTable(inbound);
+        sessions++;
+        admitted += admitPendingUpgradeContexts(inbound, row.agent_group_id, row.id);
+      } finally {
+        inbound.close();
+      }
+    }
+  }
+  return { sessions, admitted };
+}
+
+/**
+ * Put a crashed provider turn behind its retry deadline without exposing the
+ * old pair to a warm poller. The existing recall row is retained as a
+ * no-schema admission marker, but both rows become non-triggering and share
+ * the future process_after. Due admission replaces that recall from current
+ * host state before restoring trigger=1.
+ *
+ * Rows without a recall keep their current trigger value. In particular, an
+ * ordinary trigger=0 accumulated chat row cannot become a provider turn merely
+ * because generic crash cleanup touched its id.
+ */
+export function deferMessageForFreshContextRetry(db: Database.Database, messageId: string, backoffSec: number): void {
+  const processAfter = new Date(Date.now() + backoffSec * 1000).toISOString();
+  db.transaction(() => {
+    const recallId = `recall-${messageId}`;
+    const hasRecall =
+      db.prepare("SELECT 1 FROM messages_in WHERE id = ? AND kind = 'system' LIMIT 1").get(recallId) !== undefined;
+    const changed = db
+      .prepare(
+        `UPDATE messages_in
+            SET tries = tries + 1,
+                process_after = ?,
+                trigger = CASE WHEN ? THEN 0 ELSE trigger END
+          WHERE id = ? AND status = 'pending'`,
+      )
+      .run(processAfter, hasRecall ? 1 : 0, messageId).changes;
+    if (changed === 1 && hasRecall) {
+      db.prepare("UPDATE messages_in SET process_after = ?, trigger = 0 WHERE id = ? AND kind = 'system'").run(
+        processAfter,
+        recallId,
+      );
+    }
+  }).immediate();
+}
+
+/**
+ * Admit due scheduled occurrences and paired crash retries through the same
+ * fresh recall seam as channel and agent ingress.
+ *
+ * Scheduled rows are persisted with trigger=0, so neither a warm poller nor
+ * the cold-wake query can claim them before this host-owned step. Admission
+ * builds current context, then atomically appends the recall row and moves the
+ * existing turn immediately after it while flipping trigger=1. Identity,
+ * status, tries, series, recurrence, content, and routing stay on the original
+ * row. A repeated sweep sees the paired trigger and is a no-op. Ordinary
+ * trigger=0 accumulated chat has no recall marker and is never promoted.
+ */
+export function admitDueTaskContexts(db: Database.Database, agentGroupId: string, sessionId: string): number {
+  // Legacy rows predate inert scheduling and were stored trigger=1. Demote
+  // only unpaired live tasks before selecting due work; already-admitted
+  // pairs remain wakeable and untouched.
+  db.prepare(
+    `UPDATE messages_in
+        SET trigger = 0
+      WHERE kind = 'task'
+        AND status = 'pending'
+        AND trigger = 1
+        AND NOT EXISTS (
+          SELECT 1
+            FROM messages_in AS recall
+           WHERE recall.id = 'recall-' || messages_in.id
+        )`,
+  ).run();
+
+  const due = db
+    .prepare(
+      `SELECT id, kind, timestamp, platform_id, channel_type, thread_id, content, process_after,
+              source_session_id, on_wake
+         FROM messages_in
+        WHERE status = 'pending'
+          AND trigger = 0
+          AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))
+          AND (
+            kind = 'task'
+            OR EXISTS (
+              SELECT 1
+                FROM messages_in AS recall
+               WHERE recall.id = 'recall-' || messages_in.id
+                 AND recall.kind = 'system'
+                 AND recall.trigger = 0
+            )
+          )
+        ORDER BY seq`,
+    )
+    .all() as DueTaskForAdmission[];
+
+  let admitted = 0;
+  for (const task of due) {
+    let recall: MessageInsert;
+    try {
+      recall = buildRecallRow(
+        agentGroupId,
+        sessionId,
+        {
+          id: task.id,
+          kind: task.kind,
+          timestamp: task.timestamp,
+          platformId: task.platform_id,
+          channelType: task.channel_type,
+          threadId: task.thread_id,
+          content: task.content,
+          processAfter: task.process_after,
+          trigger: 1,
+          sourceSessionId: task.source_session_id,
+          onWake: task.on_wake,
+        },
+        task.content,
+        db,
+      )!;
+    } catch (error) {
+      if (!(error instanceof Error)) throw error;
+      log.warn('Due context admission failed; leaving turn inert for retry', {
+        agentGroupId,
+        sessionId,
+        taskId: task.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      continue;
+    }
+    if (!recall) {
+      log.warn('Due context admission produced no pair; leaving turn inert for inspection', {
+        agentGroupId,
+        sessionId,
+        taskId: task.id,
+        kind: task.kind,
+      });
+      continue;
+    }
+
+    const inserted = db.transaction(() => {
+      const stillDue = db
+        .prepare(
+          `SELECT 1
+             FROM messages_in
+            WHERE id = ?
+              AND status = 'pending'
+              AND trigger = 0
+              AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))
+              AND (
+                kind = 'task'
+                OR EXISTS (
+                  SELECT 1
+                    FROM messages_in AS recall
+                   WHERE recall.id = 'recall-' || messages_in.id
+                     AND recall.kind = 'system'
+                     AND recall.trigger = 0
+                )
+              )`,
+        )
+        .get(task.id);
+      if (!stillDue) return false;
+      db.prepare("DELETE FROM messages_in WHERE id = ? AND kind = 'system'").run(recall.id);
+
+      const recallSeq = nextEvenSeq(db);
+      db.prepare(
+        `INSERT INTO messages_in
+           (id, seq, kind, timestamp, status, platform_id, channel_type, thread_id, content,
+            process_after, recurrence, series_id, trigger, source_session_id, on_wake)
+         VALUES
+           (@id, @seq, @kind, @timestamp, 'pending', @platformId, @channelType, @threadId, @content,
+            @processAfter, NULL, @id, 0, @sourceSessionId, @onWake)`,
+      ).run({ ...recall, seq: recallSeq });
+      const changed = db
+        .prepare(
+          `UPDATE messages_in
+              SET seq = ?, trigger = 1
+            WHERE id = ? AND status = 'pending' AND trigger = 0`,
+        )
+        .run(recallSeq + 2, task.id).changes;
+      if (changed !== 1) throw new Error(`due turn ${task.id} changed during context admission`);
+      return true;
+    })();
+    if (inserted) admitted++;
+  }
+  return admitted;
 }
 
 /**

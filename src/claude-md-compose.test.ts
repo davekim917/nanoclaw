@@ -122,3 +122,15 @@ describe('composeGroupClaudeMd scheduling instructions through ncl tasks', () =>
     expect(imports).not.toContain('@./.claude-fragments/module-scheduling.md');
   });
 });
+
+describe('session capability authority', () => {
+  it('does not bake a group-only capability snapshot into composed instructions', () => {
+    const ag = group('ag-no-group-caps', 'no-group-caps');
+    seed(ag);
+
+    composeGroupClaudeMd(ag, 'claude');
+
+    expect(importsOf(ag.folder)).not.toContain('@./.claude-fragments/session-capabilities.md');
+    expect(fs.existsSync(path.join(GROUPS_DIR, ag.folder, '.claude-fragments', 'session-capabilities.md'))).toBe(false);
+  });
+});

@@ -1,5 +1,9 @@
 # mnemon-rearchitecture — follow-up items (post-ship)
 
+> **ARCHIVED AND SUPERSEDED — no items here remain active.** This spec family
+> records the retired Mnemon/Ollama/daemon architecture. See the
+> [current one-canon design](../workgroup-memory-and-session-capabilities/design.md).
+
 > Captured 2026-04-30 before context compaction. The mnemon-rearchitecture is committed (`8ae875f`) and live in production across 11 agent groups. Three items deferred from the main PR are tracked here.
 
 ## Production state at handoff

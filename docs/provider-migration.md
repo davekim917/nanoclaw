@@ -1,68 +1,75 @@
 # Switching an agent group between providers
 
-How an operator moves a live agent group between providers, for example Claude
-to Codex and back. The switch runs from the host.
+An operator can move an agent group between Claude, Codex, OpenCode, or another
+installed provider without moving its durable memory. Run the switch from the
+host.
 
 ## Preconditions
 
-1. Install or reapply the target provider's `/add-<provider>` skill, then
-   rebuild the container image. Reapplication matters when core adds a provider
-   contract such as a lifecycle hook.
-2. Configure the provider's authentication as documented by its skill.
-3. If the group still has `.seed.md`, Claude native auto-memory, or unindexed
-   legacy `memory/memories/imported-agent-memory.md`, run `/migrate-memory`
-   first. This is a one-time upgrade migration, not part of a provider switch.
-   `CLAUDE.local.md` remains an operator-curated customization surface and the
-   migration preserves it byte-for-byte.
+1. Install or reapply the target provider's `/add-<provider>` skill.
+2. Configure its authentication and supported model settings.
+3. Rebuild the container image when the provider skill or container code
+   requires it.
+4. If this installation has not completed the shared-workgroup cutover, run
+   `/migrate-memory` first. Do not switch or restart while its inventory,
+   checksummed apply, runtime verification, or rollback is unresolved.
 
-## Switching
+## Switch
 
 ```bash
 ncl groups config update --id <group-id> --provider codex
 ncl groups restart --id <group-id>
 ```
 
-Sessions resolve their provider at container spawn, so existing sessions use
-the new provider on their next wake unless the session itself was explicitly
-pinned.
+Sessions resolve their provider at container spawn. An unpinned session uses
+the new provider on its next wake.
 
-## What carries over
+## Shared across siblings and providers
 
-| State | How |
-|-------|-----|
-| Group identity, wiring, members, roles, destinations | Provider-neutral central DB |
-| Container config, skills, MCP servers, packages, mounts, CLI scope | Provider-neutral config |
-| Standing role and persona | `instructions.prepend.md`, composed into each provider's native project document |
-| Durable memory | Shared `memory/` tree; the provider hook loads its index and definition |
-| Workspace files and conversation archives | Same group workspace for every provider |
+The workgroup's durable memory canon is
+`data/workgroups/<workgroup-id>/memory`. It is mounted at
+`/workspace/workgroup/memory`; `/workspace/agent/memory` is a compatibility
+view. Recognized provider-native memory paths are also compatibility views, not
+authorities. Treat raw provider-native projections as read-only.
 
-The memory hook runs when a context window is created: `startup`, `clear`, and
-`compact`. It does not run on `resume`, because the resumed conversation already
-contains the injected memory context.
+Use `write_memory_file` for Markdown edits. Pass the current expected SHA-256
+when replacing a file, or `expected_sha256: null` for create-only. This guarded
+write reaches the same canon from every sibling.
 
-The shared tree is an Open Knowledge Format (OKF) v0.1 bundle. Durable Markdown
-concepts use YAML frontmatter with a `type`, while reserved `index.md` and
-`log.md` files do not. Missing metadata does not block recall; the agent repairs
-it opportunistically when working with that file. Search remains ordinary
-filesystem search (`rg`, `find`, and relative Markdown links).
+Before every admissible turn, the host pushes actual session capabilities,
+canonical memory, same-thread context, workgroup-wide archive recall, exact
+Slack/Discord permalink provenance, and any explicit degraded notice. This
+works on first wake, warm continuation, compaction, rotation, and replacement;
+it does not depend on provider-native history or an optional tool call.
+Graphify is optional and advisory for deeper retrieval.
 
-## What does not carry over
+## Kept separate
 
-- **In-flight conversation context.** Continuations are provider-specific (a
-  Claude SDK session, a Codex thread). The target provider starts a fresh
-  context; the old continuation remains available if you switch back.
-- **Provider state directories.** `.claude-shared/` and `.codex-shared/` remain
-  separate and idle while their provider is not selected.
-- **Provider-specific model settings.** Confirm the selected model and effort
-  are valid for the target provider.
+The following remain outside the memory canon:
 
-## Rolling back
+- provider identity and provider instructions;
+- provider config, authentication, model, and effort;
+- provider state and continuations such as `.claude-shared/` and
+  `.codex-shared/`;
+- group wiring, roles, destinations, skills, packages, mounts, and CLI scope;
+  and
+- repositories, worktrees, workspace files, standing instructions, and all
+  other non-memory customizations.
+
+These surfaces are not migrated into the memory canon. They are not copied or
+merged with one another. Switching providers selects another runtime around the
+same workgroup data; it does not collapse sibling bot identity or continuation
+state. The prior provider's continuation remains available if you switch back,
+subject to its normal rotation policy.
+
+## Roll back the provider choice
 
 ```bash
 ncl groups config update --id <group-id> --provider claude
 ncl groups restart --id <group-id>
 ```
 
-Memory and standing instructions need no reverse migration because both
-providers use the same files. The prior provider resumes its own continuation,
-subject to its normal transcript rotation policy.
+No reverse memory migration is needed after a completed shared-memory cutover.
+If the original cutover itself is unresolved, stop the service and use the
+retained `/migrate-memory` report and permanent snapshot rollback before any
+restart.

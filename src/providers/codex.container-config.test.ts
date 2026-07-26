@@ -81,7 +81,7 @@ describe('codex provider container-config: agents/ mount', () => {
     }
   });
 
-  it('test_codex_config_strips_only_gitnexus_reentry_surfaces', () => {
+  it('test_codex_config_drops_host_plugin_state_and_keeps_unrelated_settings', () => {
     const fn = getProviderContainerConfig('codex')!;
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-codex-sanitize-'));
     const sessionDir = path.join(home, 'session');
@@ -132,18 +132,93 @@ describe('codex provider container-config: agents/ mount', () => {
       expect(written).toContain('approval_policy = "on-request"');
       expect(written).toContain('sandbox_mode = "workspace-write"');
       expect(written).toContain('[mcp_servers.context7]\nurl = "https://mcp.context7.com/mcp"');
-      expect(written).toContain('[plugins.humanizer]\nenabled = true');
-      expect(written).toContain('[plugin_marketplaces.team_tools]\nsource = "/workspace/plugins/team-tools"');
+      expect(written).not.toContain('[plugins.humanizer]');
+      expect(written).not.toContain('[plugin_marketplaces.team_tools]');
       expect(fs.readFileSync(path.join(sessionDir, 'codex', 'auth.json'), 'utf8')).toBe(
         '{"tokens":{"access_token":"kept"}}\n',
       );
-      expect(contribution.mounts).toContainEqual({
-        hostPath: path.join(codexHome, 'plugins'),
-        containerPath: '/home/node/.codex/plugins',
-        readonly: true,
-      });
+      expect(contribution.mounts).not.toContainEqual(
+        expect.objectContaining({ containerPath: '/home/node/.codex/plugins' }),
+      );
     } finally {
       fs.rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  it('test_spawn_replaces_poisoned_runtime_entries_and_clears_stale_config_without_host_config', () => {
+    const fn = getProviderContainerConfig('codex')!;
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-codex-poisoned-'));
+    const home = path.join(root, 'home');
+    const sessionDir = path.join(root, 'session');
+    const runtimeHome = path.join(sessionDir, 'codex');
+    const outside = path.join(root, 'outside');
+    fs.mkdirSync(path.join(home, '.codex'), { recursive: true });
+    fs.mkdirSync(runtimeHome, { recursive: true });
+    fs.mkdirSync(path.join(outside, 'tmp', 'marketplaces'), { recursive: true });
+    fs.mkdirSync(path.join(outside, 'plugins'), { recursive: true });
+    fs.mkdirSync(path.join(outside, 'agents'), { recursive: true });
+    fs.writeFileSync(path.join(home, '.codex', 'auth.json'), '{"fresh":true}');
+    fs.writeFileSync(path.join(outside, 'tmp', 'marketplaces', 'sentinel'), 'keep');
+    fs.writeFileSync(path.join(outside, 'plugins', 'sentinel'), 'keep');
+    fs.writeFileSync(path.join(outside, 'agents', 'sentinel'), 'keep');
+    fs.writeFileSync(path.join(outside, 'config-victim'), 'keep');
+    fs.writeFileSync(path.join(outside, 'auth-victim'), 'keep');
+    fs.symlinkSync(path.join(outside, 'tmp'), path.join(runtimeHome, '.tmp'), 'dir');
+    fs.symlinkSync(path.join(outside, 'plugins'), path.join(runtimeHome, 'plugins'), 'dir');
+    fs.symlinkSync(path.join(outside, 'agents'), path.join(runtimeHome, 'agents'), 'dir');
+    fs.symlinkSync(path.join(outside, 'config-victim'), path.join(runtimeHome, 'config.toml'));
+    fs.symlinkSync(path.join(outside, 'auth-victim'), path.join(runtimeHome, 'auth.json'));
+
+    try {
+      fn(
+        makeCtx({
+          sessionDir,
+          agentGroupFolder: 'poisoned',
+          hostEnv: { HOME: home } as NodeJS.ProcessEnv,
+        }),
+      );
+
+      expect(fs.readFileSync(path.join(outside, 'tmp', 'marketplaces', 'sentinel'), 'utf8')).toBe('keep');
+      expect(fs.readFileSync(path.join(outside, 'plugins', 'sentinel'), 'utf8')).toBe('keep');
+      expect(fs.readFileSync(path.join(outside, 'agents', 'sentinel'), 'utf8')).toBe('keep');
+      expect(fs.readFileSync(path.join(outside, 'config-victim'), 'utf8')).toBe('keep');
+      expect(fs.readFileSync(path.join(outside, 'auth-victim'), 'utf8')).toBe('keep');
+      expect(fs.lstatSync(path.join(runtimeHome, 'config.toml')).isFile()).toBe(true);
+      expect(fs.readFileSync(path.join(runtimeHome, 'config.toml'), 'utf8')).toBe('');
+      expect(fs.lstatSync(path.join(runtimeHome, 'auth.json')).isFile()).toBe(true);
+      expect(fs.readFileSync(path.join(runtimeHome, 'auth.json'), 'utf8')).toBe('{"fresh":true}');
+      expect(fs.existsSync(path.join(runtimeHome, '.tmp'))).toBe(false);
+      expect(fs.existsSync(path.join(runtimeHome, 'plugins'))).toBe(false);
+      expect(fs.existsSync(path.join(runtimeHome, 'agents'))).toBe(false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('test_spawn_rejects_a_symlinked_runtime_root', () => {
+    const fn = getProviderContainerConfig('codex')!;
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nc-codex-root-link-'));
+    const home = path.join(root, 'home');
+    const sessionDir = path.join(root, 'session');
+    const outside = path.join(root, 'outside');
+    fs.mkdirSync(path.join(home, '.codex'), { recursive: true });
+    fs.mkdirSync(sessionDir, { recursive: true });
+    fs.mkdirSync(outside);
+    fs.writeFileSync(path.join(home, '.codex', 'auth.json'), '{}');
+    fs.symlinkSync(outside, path.join(sessionDir, 'codex'), 'dir');
+
+    try {
+      expect(() =>
+        fn(
+          makeCtx({
+            sessionDir,
+            agentGroupFolder: 'root-link',
+            hostEnv: { HOME: home } as NodeJS.ProcessEnv,
+          }),
+        ),
+      ).toThrow(/Unsafe runtime directory/);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
     }
   });
 });

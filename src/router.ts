@@ -50,7 +50,7 @@ import {
   writeSessionMessageIfNew,
   writeOutboundDirect,
 } from './session-manager.js';
-import { upsertArchiveMessage } from './message-archive.js';
+import { archiveMessageAndScheduleMemoryCuration } from './message-archive.js';
 import { parseMessageFlags, formatFlagConfirmation, type FlagIntent } from './flag-parser.js';
 import { maybeRenameNewThread } from './topic-title.js';
 import { wakeContainer } from './container-runner.js';
@@ -1139,6 +1139,7 @@ async function deliverToAgent(
     timestamp: event.message.timestamp,
     platformId: deliveryAddr.platformId,
     channelType: deliveryAddr.channelType,
+    messagingGroupId: mg.id,
     threadId: deliveryAddr.threadId,
     content: contentForWrite,
     trigger: wake ? 1 : 0,
@@ -1158,20 +1159,23 @@ async function deliverToAgent(
   // slicing; assistant replies are archived on delivery.ts's path.
   if ((event.message.kind === 'chat' || event.message.kind === 'chat-sdk') && parsedContent.text) {
     try {
-      upsertArchiveMessage({
-        id: messageIdForAgent(event.message.id, agent.agent_group_id),
-        agentGroupId: agent.agent_group_id,
-        messagingGroupId: mg.id,
-        channelType: event.channelType,
-        channelName: mg.name ?? null,
-        platformId: event.platformId,
-        threadId: effectiveThreadId,
-        role: 'user',
-        senderId: userId,
-        senderName: parsedContent.sender ?? null,
-        text: parsedContent.text,
-        sentAt: event.message.timestamp,
-      });
+      archiveMessageAndScheduleMemoryCuration(
+        {
+          id: messageIdForAgent(event.message.id, agent.agent_group_id),
+          agentGroupId: agent.agent_group_id,
+          messagingGroupId: mg.id,
+          channelType: event.channelType,
+          channelName: mg.name ?? null,
+          platformId: event.platformId,
+          threadId: effectiveThreadId,
+          role: 'user',
+          senderId: userId,
+          senderName: parsedContent.sender ?? null,
+          text: parsedContent.text,
+          sentAt: event.message.timestamp,
+        },
+        agentGroup.workgroup_id ?? agentGroup.folder,
+      );
     } catch (err) {
       log.warn('Failed to archive inbound user message', {
         sessionId: session.id,

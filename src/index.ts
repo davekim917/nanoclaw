@@ -6,6 +6,7 @@
  */
 import fs from 'fs';
 import path from 'path';
+import { pathToFileURL } from 'url';
 
 import { backfillContainerConfigs } from './backfill-container-configs.js';
 import { DATA_DIR } from './config.js';
@@ -15,7 +16,7 @@ import { initDb } from './db/connection.js';
 import { runMigrations } from './db/migrations/index.js';
 import { registerSecretsFromEnv } from './secret-scrubber.js';
 import { getMessagingGroupByPlatform, updateMessagingGroup } from './db/messaging-groups.js';
-import { ensureContainerRuntimeRunning, cleanupOrphans } from './container-runtime.js';
+import { ensureContainerRuntimeRunning, cleanupOrphansStrict } from './container-runtime.js';
 import { resetPhantomContainerStatus } from './db/sessions.js';
 import { resetProcessingChannelIngress } from './db/channel-ingress-receipts.js';
 import { stopAllContainers } from './container-runner.js';
@@ -45,6 +46,7 @@ import { routeInbound } from './router.js';
 import { log } from './log.js';
 import { startDashboard } from './dashboard/index.js';
 import { enforceUpgradeTripwire } from './upgrade-state.js';
+import { reconcilePendingUpgradeContexts } from './session-manager.js';
 
 // Response + shutdown registries live in response-registry.ts to break the
 // circular import cycle: src/index.ts imports src/modules/index.js for side
@@ -110,7 +112,11 @@ import { runReconcilerOnStartup as runDispatchReconcilerOnStartup } from './modu
 
 // Workgroup FS reconciler — drains the migration-036 report after migrations.
 import { reconcileWorkgroupFsState } from './modules/workgroup/fs-reconcile.js';
-import { reconcileWorkgroupSharedDirs } from './modules/workgroup/shared-dirs.js';
+import {
+  reconcileWorkgroupMemory,
+  reconcileWorkgroupSharedDirs,
+  type WorkgroupMemoryReport,
+} from './modules/workgroup/shared-dirs.js';
 import { WORKGROUP_SHARED_FS } from './config.js';
 // CLI command barrel — populates the `ncl` registry before the CLI server
 // accepts connections.
@@ -124,8 +130,22 @@ import {
   teardownChannelAdapters,
   createChannelDeliveryAdapter,
 } from './channels/channel-registry.js';
+import type Database from 'better-sqlite3';
 
-async function main(): Promise<void> {
+export function runWorkgroupMemoryStartupGate(
+  db: Database.Database,
+  deps: {
+    ensureRuntime?: () => void;
+    cleanupStrict?: () => string[];
+    reconcile?: (db: Database.Database) => WorkgroupMemoryReport[];
+  } = {},
+): WorkgroupMemoryReport[] {
+  (deps.ensureRuntime ?? ensureContainerRuntimeRunning)();
+  (deps.cleanupStrict ?? cleanupOrphansStrict)();
+  return (deps.reconcile ?? reconcileWorkgroupMemory)(db);
+}
+
+export async function main(): Promise<void> {
   log.info('NanoClaw starting');
 
   // 0. Circuit breaker — backoff on rapid restarts
@@ -173,6 +193,34 @@ async function main(): Promise<void> {
     }
   }
 
+  // Canonical memory reconciliation can create links only after install-scoped
+  // container absence has been proved. A failed runtime listing is not
+  // equivalent to "none running": cleanupOrphansStrict throws and startup
+  // stops before any filesystem cutover.
+  const memoryReports = runWorkgroupMemoryStartupGate(db);
+  for (const report of memoryReports) {
+    if (report.state.status === 'migration-required') {
+      log.warn('Workgroup memory requires operator migration; automatic startup left it untouched', {
+        workgroupId: report.workgroupId,
+        sources: report.state.sources,
+      });
+    }
+  }
+  try {
+    const pendingUpgrade = reconcilePendingUpgradeContexts(
+      db,
+      memoryReports
+        .filter((report) => report.state.status !== 'migration-required')
+        .map((report) => report.workgroupId),
+    );
+    if (pendingUpgrade.admitted > 0) {
+      log.info('Admitted pending pre-turn contexts during startup', pendingUpgrade);
+    }
+  } catch (pendingErr) {
+    log.error('Pending pre-turn context reconciliation failed at startup', { err: pendingErr });
+    process.exit(1);
+  }
+
   log.info('Central DB ready', { path: dbPath });
 
   // 1a. Start dashboard — after migrations (028 must exist) and before
@@ -191,9 +239,8 @@ async function main(): Promise<void> {
   // 1d. One-time filesystem cutover — idempotent, no-op after first run.
   migrateGroupsToClaudeLocal();
 
-  // 2. Container runtime
-  ensureContainerRuntimeRunning();
-  cleanupOrphans();
+  // 2. Container runtime was already proved available/quiescent before the
+  // canonical memory reconciliation above.
   resetStorageActivityState();
 
   // 2a. Surface agent-runner deps drift at boot, not when an agent silently
@@ -470,10 +517,15 @@ async function shutdown(signal: string): Promise<void> {
   }
 }
 
-process.on('SIGTERM', () => shutdown('SIGTERM'));
-process.on('SIGINT', () => shutdown('SIGINT'));
+export function isDirectExecution(moduleUrl: string, argvEntry: string | undefined): boolean {
+  return !!argvEntry && pathToFileURL(path.resolve(argvEntry)).href === moduleUrl;
+}
 
-main().catch((err) => {
-  log.fatal('Startup failed', { err });
-  process.exit(1);
-});
+if (isDirectExecution(import.meta.url, process.argv[1])) {
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  main().catch((err) => {
+    log.fatal('Startup failed', { err });
+    process.exit(1);
+  });
+}

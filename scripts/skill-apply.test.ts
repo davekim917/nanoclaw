@@ -2,7 +2,17 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { applySkill, removeSkill, planSkill, fullyApplied, firstFailureHint, referenceProse, stepLabel, type ApplyEvent, type InputMeta } from './skill-apply.js';
+import {
+  applySkill,
+  removeSkill,
+  planSkill,
+  fullyApplied,
+  firstFailureHint,
+  referenceProse,
+  stepLabel,
+  type ApplyEvent,
+  type InputMeta,
+} from './skill-apply.js';
 import { parseDirectives, validate } from './skill-directives.js';
 
 // A synthetic skill exercising the fs handlers for real (no network), plus one
@@ -37,7 +47,10 @@ register demo
 let root: string;
 let skillDir: string;
 // A headless resolveInput fake: answers from a fixed map; a missing var defers.
-const headless = (vals: Record<string, string>) => async (name: string): Promise<string | undefined> => vals[name];
+const headless =
+  (vals: Record<string, string>) =>
+  async (name: string): Promise<string | undefined> =>
+    vals[name];
 const recordingExec = () => {
   const cmds: string[] = [];
   return { cmds, exec: (c: string) => void cmds.push(c) };
@@ -98,7 +111,7 @@ describe('apply engine lifecycle', () => {
   });
 
   it('plan marks the unknown step ↳agent and the prompt ? needs-input before any write', () => {
-    const { steps, agentSteps, needsInput } = planSkill(skillDir, root);
+    const { agentSteps, needsInput } = planSkill(skillDir, root);
     expect(agentSteps).toBe(1);
     expect(needsInput).toContain('token');
     expect(existsSync(join(root, 'src/sample.ts'))).toBe(false); // planning mutated nothing
@@ -132,7 +145,13 @@ describe('from-branch copy apply path', () => {
     // (mocked here) would not fail with ENOENT on a real run
     expect(existsSync(join(froot, 'container/skills/demo-formatting'))).toBe(true);
     expect(cmds).toContain('git fetch origin channels');
-    expect(cmds.some((c) => /^git show origin\/channels:container\/skills\/demo-formatting\/SKILL\.md > container\/skills\/demo-formatting\/SKILL\.md$/.test(c))).toBe(true);
+    expect(
+      cmds.some((c) =>
+        /^git show origin\/channels:container\/skills\/demo-formatting\/SKILL\.md > container\/skills\/demo-formatting\/SKILL\.md$/.test(
+          c,
+        ),
+      ),
+    ).toBe(true);
     expect(res.journal).toContainEqual({ op: 'wrote', path: 'container/skills/demo-formatting/SKILL.md' });
 
     rmSync(fskill, { recursive: true, force: true });
@@ -203,7 +222,14 @@ describe('json-merge directive', () => {
 });
 
 // append at:<marker>: insert before a dormant region's closing line.
-const MARKER_FILE = ['const STEPS = {', "  auth: () => import('./auth.js'),", '  // >>> nanoclaw:setup-steps', '  // <<< nanoclaw:setup-steps', '};', ''].join('\n');
+const MARKER_FILE = [
+  'const STEPS = {',
+  "  auth: () => import('./auth.js'),",
+  '  // >>> nanoclaw:setup-steps',
+  '  // <<< nanoclaw:setup-steps',
+  '};',
+  '',
+].join('\n');
 const APPEND_AT_SKILL = `# append-at demo
 
 ## Register a setup step
@@ -243,7 +269,9 @@ describe('append at:<marker>', () => {
     await applySkill(askill, aroot, { resolveInput: headless({}), exec: () => {} });
     const second = await applySkill(askill, aroot, { resolveInput: headless({}), exec: () => {} });
     expect(second.applied).toEqual([]);
-    const count = readFileSync(join(aroot, 'setup/index.ts'), 'utf8').split('\n').filter((l) => l.trim() === "codex: () => import('./codex.js'),").length;
+    const count = readFileSync(join(aroot, 'setup/index.ts'), 'utf8')
+      .split('\n')
+      .filter((l) => l.trim() === "codex: () => import('./codex.js'),").length;
     expect(count).toBe(1);
   });
 
@@ -306,8 +334,11 @@ describe('nc:run variable substitution', () => {
   });
 
   it('journals the ORIGINAL command (placeholders intact) — a substituted value never lands in the journal', async () => {
-    const res = await applySkill(rskill, rroot, { resolveInput: headless({ owner_email: 'you@example.com' }), exec: () => {} });
-    const ran = res.journal.filter((e) => e.op === 'ran').map((e) => 'cmd' in e ? e.cmd : '');
+    const res = await applySkill(rskill, rroot, {
+      resolveInput: headless({ owner_email: 'you@example.com' }),
+      exec: () => {},
+    });
+    const ran = res.journal.filter((e) => e.op === 'ran').map((e) => ('cmd' in e ? e.cmd : ''));
     expect(ran).toContain(
       'ncl messaging-groups create --channel-type resend --platform-id resend:{{owner_email}} --is-group 0',
     );
@@ -415,7 +446,11 @@ describe('nc:run multi-field JSON capture + validate', () => {
 
   it('binds three vars from one JSON stdout via dot-paths (incl. a nested .owner.id) and feeds them downstream', async () => {
     writeFileSync(join(mskill, 'SKILL.md'), MULTI_CAPTURE_SKILL);
-    const json = JSON.stringify({ id: '111111111111111111', verify_key: 'abc123', owner: { id: '999999999999999999' } });
+    const json = JSON.stringify({
+      id: '111111111111111111',
+      verify_key: 'abc123',
+      owner: { id: '999999999999999999' },
+    });
     const res = await applySkill(mskill, mroot, { inputs: {}, exec: () => json + '\n' });
     expect(fullyApplied(res)).toBe(true);
     expect(res.vars.application_id).toBe('111111111111111111');
@@ -431,7 +466,10 @@ describe('nc:run multi-field JSON capture + validate', () => {
   });
 
   it('single capture:<var> (no =) still binds stdout as-is — unchanged', async () => {
-    writeFileSync(join(mskill, 'SKILL.md'), '# single\n\n```nc:run capture:dm effect:fetch\nresolve\n```\n```nc:env-set\nDM={{dm}}\n```\n');
+    writeFileSync(
+      join(mskill, 'SKILL.md'),
+      '# single\n\n```nc:run capture:dm effect:fetch\nresolve\n```\n```nc:env-set\nDM={{dm}}\n```\n',
+    );
     const res = await applySkill(mskill, mroot, { inputs: {}, exec: () => 'D123\n' });
     expect(res.vars.dm).toBe('D123');
     expect(readFileSync(join(mroot, '.env'), 'utf8')).toContain('DM=D123');
@@ -482,7 +520,10 @@ describe('nc:operator', () => {
 
   it('an unresolved {{var}} in the operator body defers the whole block — nothing collected, no event fired', async () => {
     // the body references {{bot}} but no prompt/capture defines it
-    writeFileSync(join(oskill, 'SKILL.md'), '# o\n\nTell the user:\n```nc:operator\nOpen @{{bot}} in Telegram and keep it on screen.\n```\n');
+    writeFileSync(
+      join(oskill, 'SKILL.md'),
+      '# o\n\nTell the user:\n```nc:operator\nOpen @{{bot}} in Telegram and keep it on screen.\n```\n',
+    );
     const events: ApplyEvent[] = [];
     const res = await applySkill(oskill, oroot, { inputs: {}, exec: () => {}, onEvent: (e) => void events.push(e) });
     expect(events).toEqual([]); // never emitted — deferred before any event
@@ -550,9 +591,15 @@ describe('programmatic apply via inputs', () => {
   });
 
   it('inputs win over resolveInput; resolveInput only fills the gaps', async () => {
-    writeFileSync(join(pskill, 'SKILL.md'), '# two prompts\n\n```nc:prompt a\nA?\n```\n```nc:prompt b\nB?\n```\n```nc:env-set\nA={{a}}\nB={{b}}\n```\n');
+    writeFileSync(
+      join(pskill, 'SKILL.md'),
+      '# two prompts\n\n```nc:prompt a\nA?\n```\n```nc:prompt b\nB?\n```\n```nc:env-set\nA={{a}}\nB={{b}}\n```\n',
+    );
     const asked: string[] = [];
-    const resolveInput = async (n: string): Promise<string> => { asked.push(n); return 'fromResolveInput'; };
+    const resolveInput = async (n: string): Promise<string> => {
+      asked.push(n);
+      return 'fromResolveInput';
+    };
     await applySkill(pskill, proot, { inputs: { a: 'fromInputs' }, resolveInput, exec: () => {} });
     const env = readFileSync(join(proot, '.env'), 'utf8');
     expect(env).toContain('A=fromInputs'); // input wins
@@ -566,7 +613,11 @@ describe('programmatic apply via inputs', () => {
       '# restart demo\n\n```nc:run effect:build\npnpm run build\n```\n```nc:run effect:restart\nbash setup/lib/restart.sh\n```\n```nc:run effect:wire\nncl wire\n```\n',
     );
     const cmds: string[] = [];
-    const res = await applySkill(pskill, proot, { inputs: {}, skipEffects: ['restart'], exec: (c) => void cmds.push(c) });
+    const res = await applySkill(pskill, proot, {
+      inputs: {},
+      skipEffects: ['restart'],
+      exec: (c) => void cmds.push(c),
+    });
     expect(cmds).toContain('pnpm run build');
     expect(cmds).toContain('ncl wire');
     expect(cmds).not.toContain('bash setup/lib/restart.sh'); // restart owned by the caller → skipped
@@ -645,7 +696,10 @@ describe('when: guard', () => {
 
   it('remote mode: the remote branch applies, the local-only env-set is skipped', async () => {
     const { sdir, rdir } = modeScratch();
-    const res = await applySkill(sdir, rdir, { inputs: { mode: 'remote', server_url: 'https://photon.example' }, exec: () => {} });
+    const res = await applySkill(sdir, rdir, {
+      inputs: { mode: 'remote', server_url: 'https://photon.example' },
+      exec: () => {},
+    });
     expect(fullyApplied(res)).toBe(true);
     const env = readFileSync(join(rdir, '.env'), 'utf8');
     expect(env).toContain('IMESSAGE_SERVER_URL=https://photon.example');
@@ -915,7 +969,7 @@ describe('nc:run effect:check (precondition gate)', () => {
     writeFileSync(join(chkRoot, '.env'), '');
   });
 
-  it('a non-zero check bounces to an agent and gates a following effect:restart', async () => {
+  it('a non-zero check bounces to an agent and stops before a following effect:restart', async () => {
     writeFileSync(join(chkSkill, 'SKILL.md'), CHECK_GATE_SKILL);
     const cmds: string[] = [];
     const exec = (c: string): string | void => {
@@ -926,11 +980,50 @@ describe('nc:run effect:check (precondition gate)', () => {
 
     expect(cmds).toContain('[ "$(uname)" = Darwin ]'); // the predicate actually ran
     expect(cmds).not.toContain('bash restart.sh'); // restart never executed — gated by the failed check
-    // two agent tasks: the failed check itself + the gated restart
-    expect(res.agentTasks).toHaveLength(2);
+    // The failed precondition is the single handoff; later directives were
+    // never entered, so none can mutate or produce redundant agent tasks.
+    expect(res.agentTasks).toHaveLength(1);
     expect(res.agentTasks[0].kind).toBe('run');
-    expect(res.agentTasks.some((t) => /an earlier step did not complete/.test(t.reason))).toBe(true);
     expect(res.journal).toEqual([]); // a check mutates nothing
+  });
+
+  it('a non-zero check stops before every later mutation and leaves existing bytes untouched', async () => {
+    writeFileSync(join(chkSkill, 'payload.txt'), 'replacement\n');
+    writeFileSync(join(chkRoot, 'payload.txt'), 'customized\n');
+    writeFileSync(
+      join(chkSkill, 'SKILL.md'),
+      [
+        '# fail-closed payload',
+        '',
+        '## Validate the registry payload',
+        '```nc:run effect:check',
+        'validate-provider-payload',
+        '```',
+        '',
+        '## Copy only after validation',
+        '```nc:copy',
+        'payload.txt',
+        '```',
+        '```nc:env-set',
+        'PROVIDER_INSTALLED=1',
+        '```',
+        '',
+      ].join('\n'),
+    );
+    const beforePayload = readFileSync(join(chkRoot, 'payload.txt'), 'utf8');
+    const beforeEnv = readFileSync(join(chkRoot, '.env'), 'utf8');
+    const res = await applySkill(chkSkill, chkRoot, {
+      inputs: {},
+      exec: (command) => {
+        if (command === 'validate-provider-payload') throw new Error('stale payload');
+      },
+    });
+
+    expect(readFileSync(join(chkRoot, 'payload.txt'), 'utf8')).toBe(beforePayload);
+    expect(readFileSync(join(chkRoot, '.env'), 'utf8')).toBe(beforeEnv);
+    expect(res.journal).toEqual([]);
+    expect(res.agentTasks).toHaveLength(1);
+    expect(res.agentTasks[0].reason).toContain('stale payload');
   });
 
   it('an unresolved {{var}} in a check defers (headless rebuild) — not a bounce', async () => {
@@ -999,7 +1092,10 @@ describe('onEvent (core event seam)', () => {
     await applySkill(eskill, eroot, { exec: () => {}, onEvent: (e) => void events.push(e) });
 
     expect(events.map((e) => `${e.type}:${'kind' in e ? e.kind : ''}`)).toEqual([
-      'step-start:run', 'step-end:run', 'step-start:env-set', 'step-end:env-set',
+      'step-start:run',
+      'step-end:run',
+      'step-start:env-set',
+      'step-end:env-set',
     ]);
     const start = events[0] as Extract<ApplyEvent, { type: 'step-start' }>;
     expect(start.label).toBe('Verify the credential'); // heading-derived
@@ -1018,19 +1114,28 @@ describe('onEvent (core event seam)', () => {
     };
     const res = await applySkill(eskill, eroot, { exec, onEvent: (e) => void events.push(e) });
 
-    const end = events.find((e): e is Extract<ApplyEvent, { type: 'step-end' }> => e.type === 'step-end' && e.kind === 'run')!;
+    const end = events.find(
+      (e): e is Extract<ApplyEvent, { type: 'step-end' }> => e.type === 'step-end' && e.kind === 'run',
+    )!;
     expect(end.ok).toBe(false);
     expect(end.error).toMatch(/401 bad credential/);
-    expect(events.filter((e) => e.type === 'step-start')).toHaveLength(events.filter((e) => e.type === 'step-end').length);
+    expect(events.filter((e) => e.type === 'step-start')).toHaveLength(
+      events.filter((e) => e.type === 'step-end').length,
+    );
     expect(res.agentTasks).toHaveLength(1); // degraded to an agent, not a crash
   });
 
   it('emits an operator event with the rendered text + fence line, after collecting operatorMessages', async () => {
-    const md = '# op\n\n```nc:prompt who\nName?\n```\nTell the user:\n```nc:operator\nHello {{who}} — go click the button.\n```\n';
+    const md =
+      '# op\n\n```nc:prompt who\nName?\n```\nTell the user:\n```nc:operator\nHello {{who}} — go click the button.\n```\n';
     writeFileSync(join(eskill, 'SKILL.md'), md);
     const opLine = parseDirectives(md).find((d) => d.kind === 'operator')!.line;
     const events: ApplyEvent[] = [];
-    const res = await applySkill(eskill, eroot, { inputs: { who: 'world' }, exec: () => {}, onEvent: (e) => void events.push(e) });
+    const res = await applySkill(eskill, eroot, {
+      inputs: { who: 'world' },
+      exec: () => {},
+      onEvent: (e) => void events.push(e),
+    });
 
     const op = events.find((e): e is Extract<ApplyEvent, { type: 'operator' }> => e.type === 'operator')!;
     expect(op.text).toBe('Hello world — go click the button.'); // {{var}} substituted
@@ -1092,20 +1197,40 @@ describe('onEvent (core event seam)', () => {
 describe('stepLabel', () => {
   it('labels effectful kinds from the nearest heading, instant kinds null; step is silent', () => {
     const md = [
-      '# s', '',
-      '## Install deps', '```nc:dep', 'pkg@1.0.0', '```', '',
-      '## Copy a file', '```nc:copy', 'a -> b', '```', '',
-      '## Pull from the branch', '```nc:copy from-branch:channels', 'x -> y', '```', '',
-      '## Link the device', '```nc:run effect:step capture:platform_id=PLATFORM_ID', 'pair', '```', '',
-      '## Wire it', '```nc:run effect:wire', 'ncl wire', '```',
+      '# s',
+      '',
+      '## Install deps',
+      '```nc:dep',
+      'pkg@1.0.0',
+      '```',
+      '',
+      '## Copy a file',
+      '```nc:copy',
+      'a -> b',
+      '```',
+      '',
+      '## Pull from the branch',
+      '```nc:copy from-branch:channels',
+      'x -> y',
+      '```',
+      '',
+      '## Link the device',
+      '```nc:run effect:step capture:platform_id=PLATFORM_ID',
+      'pair',
+      '```',
+      '',
+      '## Wire it',
+      '```nc:run effect:wire',
+      'ncl wire',
+      '```',
     ].join('\n');
     const ds = parseDirectives(md);
     const nth = (k: string, i = 0) => ds.filter((d) => d.kind === k)[i];
-    expect(stepLabel(nth('dep'), md)).toBe('Install deps');               // heading-derived
-    expect(stepLabel(nth('copy', 0), md)).toBe(null);                     // local copy = instant
-    expect(stepLabel(nth('copy', 1), md)).toBe('Pull from the branch');   // from-branch fetch spins
-    expect(stepLabel(nth('run', 0), md)).toBe(null);                      // effect:step renders its own live output
-    expect(stepLabel(nth('run', 1), md)).toBe('Wire it');                 // heading-derived only — no attr override
+    expect(stepLabel(nth('dep'), md)).toBe('Install deps'); // heading-derived
+    expect(stepLabel(nth('copy', 0), md)).toBe(null); // local copy = instant
+    expect(stepLabel(nth('copy', 1), md)).toBe('Pull from the branch'); // from-branch fetch spins
+    expect(stepLabel(nth('run', 0), md)).toBe(null); // effect:step renders its own live output
+    expect(stepLabel(nth('run', 1), md)).toBe('Wire it'); // heading-derived only — no attr override
   });
 
   it('falls back to a kind/effect default when there is no heading above the fence', () => {
@@ -1199,7 +1324,10 @@ describe('nc:prompt normalize at bind + InputMeta declaration', () => {
   });
 
   it('normalize:rstrip-slash strips a trailing slash on an interactive answer too (same bind path)', async () => {
-    const res = await applySkill(nskill, nroot, { resolveInput: headless({ public_url: 'https://x.ngrok.io/' }), exec: () => {} });
+    const res = await applySkill(nskill, nroot, {
+      resolveInput: headless({ public_url: 'https://x.ngrok.io/' }),
+      exec: () => {},
+    });
     expect(res.vars.public_url).toBe('https://x.ngrok.io'); // identical to the inputs path
     expect(readFileSync(join(nroot, '.env'), 'utf8')).toContain('PUBLIC_URL=https://x.ngrok.io');
   });
@@ -1384,7 +1512,10 @@ describe('validate-at-bind (inputs + resolveInput answers)', () => {
   });
 
   it('a secret value never appears in the deferred entry — only the var name + regex source', async () => {
-    writeFileSync(join(vskill, 'SKILL.md'), '# s\n\n```nc:prompt token secret validate:^xoxb-\nPaste the bot token.\n```\n');
+    writeFileSync(
+      join(vskill, 'SKILL.md'),
+      '# s\n\n```nc:prompt token secret validate:^xoxb-\nPaste the bot token.\n```\n',
+    );
     const res = await applySkill(vskill, vroot, { inputs: { token: 'SUPER-SECRET-VALUE' }, exec: () => {} });
     expect(res.deferred).toContain('token: invalid value (does not match validate:^xoxb-)');
     expect(JSON.stringify(res)).not.toContain('SUPER-SECRET-VALUE');
@@ -1396,7 +1527,6 @@ describe('validate-at-bind (inputs + resolveInput answers)', () => {
     expect(res.deferred).toEqual([]);
     expect(res.vars.h).toBe('U12345678');
   });
-
 });
 
 // referenceProse slices the author-written reference FLOOR — the engine-ignored
@@ -1466,11 +1596,22 @@ describe('referenceProse (reference-floor slice)', () => {
     // {{token}} placeholder: the nc: block is dropped wholesale, while the literal
     // placeholder stays literal — referenceProse keys on raw author text, not vars.
     const md = [
-      '# s', '',
-      '## Apply', '```nc:prompt token secret', 'Paste it.', '```', '',
-      '## Troubleshooting', 'If it fails, confirm {{token}} was written.',
-      '```nc:run effect:restart', 'bash restart.sh', '```',
-      '```bash', 'grep TOK .env', '```', '',
+      '# s',
+      '',
+      '## Apply',
+      '```nc:prompt token secret',
+      'Paste it.',
+      '```',
+      '',
+      '## Troubleshooting',
+      'If it fails, confirm {{token}} was written.',
+      '```nc:run effect:restart',
+      'bash restart.sh',
+      '```',
+      '```bash',
+      'grep TOK .env',
+      '```',
+      '',
     ].join('\n');
     const ref = referenceProse(md);
     expect(ref).toContain('## Troubleshooting');

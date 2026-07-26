@@ -330,7 +330,8 @@ describe.each(SKILLS)('%s', (name) => {
       expect(streamedAfterSabotage).toBe(0);
       // Any unguarded later side effect must surface as a gated agentTask, so
       // an agent finishes it from the prose once the failure is fixed.
-      const gatedExpected = directives.some(
+      const sabotaged = byLine.get(sabotagedLine);
+      const gatedExpected = sabotaged?.attrs.effect !== 'check' && directives.some(
         (d) => isSideEffectRun(d) && !isString(d.attrs.when) && d.line > sabotagedLine,
       );
       if (gatedExpected) {

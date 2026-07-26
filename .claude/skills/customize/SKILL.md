@@ -16,7 +16,7 @@ This skill helps users add capabilities or modify behavior. Use AskUserQuestion 
    - Container directory access: `/manage-mounts`.
    - Agent providers (non-default): `/add-opencode`, `/add-codex`, `/add-ollama-provider`.
    - Integrations as MCP tools: `/add-gmail-tool`, `/add-gcal-tool`, `/add-ollama-tool`, etc.
-3. **Plan the changes** — Identify the v2 surface the change belongs to (entity model in the central DB, per-agent-group container config, per-group `CLAUDE.md`, or core code).
+3. **Plan the changes** — Identify the v2 surface the change belongs to (entity model in the central DB, per-agent-group container config or instructions, workgroup memory canon, or core code).
 4. **Implement** — Make the change on the right surface.
 5. **Test guidance** — Tell the user how to verify.
 
@@ -37,7 +37,8 @@ Customizations route through the v2 entity model: users → messaging groups →
 | `src/config.ts` | Process-level config (assistant name, paths, timeouts) read from `.env` |
 | `data/v2.db` | Central DB: users, roles, agent_groups, messaging_groups, wirings, container_configs |
 | `data/v2-sessions/<session>/` | Per-session `inbound.db` (host→container) + `outbound.db` (container→host) |
-| `groups/<folder>/CLAUDE.md` | Per-agent-group memory/persona and instructions |
+| `groups/<folder>/CLAUDE.md` / `CLAUDE.local.md` | Per-agent-group provider, identity, persona, and standing instructions; not memory |
+| `data/workgroups/<workgroup-id>/memory/` | Canonical Markdown memory shared by every sibling in the workgroup |
 
 For ad-hoc DB queries, use `pnpm exec tsx scripts/q.ts <db> "<sql>"`.
 
@@ -74,6 +75,9 @@ Questions to ask:
 
 Implementation:
 - Persona, instructions, and personality live per agent group in `groups/<folder>/CLAUDE.md` — edit that file for the target group.
+- Durable facts, decisions, and knowledge live in the workgroup memory canon.
+  Use `write_memory_file` for ordinary agent edits; do not put memory into
+  `CLAUDE.md` or `CLAUDE.local.md`. Use `/migrate-memory` for legacy stores.
 - Container runtime behavior (provider, model, packages, MCP servers) lives in the `container_configs` table: `ncl groups config get/update --id <group-id>`.
 
 ### Adding New Commands

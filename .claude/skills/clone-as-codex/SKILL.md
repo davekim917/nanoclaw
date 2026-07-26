@@ -8,16 +8,27 @@ description: Create a Codex-backed sibling agent for an existing Claude group. T
 Create `groups/<source>-codex/` from `groups/<source>/`. The codex sibling shares:
 
 - **CLAUDE.md** — regenerated per-group by composeGroupClaudeMd on every spawn (do NOT symlink — the composer overwrites it); AGENTS.md flat-include is derived from it for Codex.
-- **CLAUDE.local.md** — symlinked to the source's CLAUDE.local.md when present, so both siblings share per-group memory (consulting context, project notes, etc.).
+- **Workgroup memory canon** — `data/workgroups/<workgroup-id>/memory` on the
+  host and `/workspace/workgroup/memory` in every sibling container.
+  `/workspace/agent/memory` is only the compatibility link.
+- **CLAUDE.local.md** — symlinked to the source file when present so its
+  standing instruction state is preserved byte-for-byte. It is not a memory
+  root and never becomes part of the workgroup memory canon.
 - **Repos** — symlinked top-level dirs that contain `.git/`.
 - **sources/** — ordinary knowledge files; Graphify indexes changes automatically for the workgroup.
 - **conversations/** — transcript archive; both agents see each other's archived turns.
 - **Graphify graph** — `workgroup_id` routes both siblings to the same code-and-knowledge graph while keeping other workgroups isolated.
 - **Thread worktree** — when `NANOCLAW_THREAD_WORKTREES=1`, both siblings in the same platform thread mount the same `data/v2-threads/<thread-id>/worktrees/<repo>/` host path. Uncommitted edits flow across.
 
-> Under workgroup shared-FS (`data/workgroups/<wg>/.migrated` present), the **Repos / sources / conversations** links point at the container-absolute `/workspace/workgroup/<name>` mount instead of `../<source>/` — Step 4 detects the mode and reproduces exactly what `reconcileWorkgroupSharedDirs` already did for the existing siblings. **CLAUDE.local.md** stays a relative link in both modes (it's a loose file, never migrated).
+> Under workgroup shared-FS (`data/workgroups/<wg>/.migrated` present), the **Repos / sources / conversations** links point at the container-absolute `/workspace/workgroup/<name>` mount instead of `../<source>/` — Step 4 detects the mode and reproduces exactly what `reconcileWorkgroupSharedDirs` already did for the existing siblings. **CLAUDE.local.md** stays a relative link in both modes because it is group/provider instruction state, not memory.
 
 `container.json` for the new sibling gets `provider: "codex"` and `memory.enabled: true`.
+
+**One-memory invariant.** Every current and future sibling — Claude, Codex,
+OpenCode, or another provider — joins the source workgroup. Workgroup membership
+therefore makes it inherit the one workgroup memory canon; cloning never creates
+a provider-owned copy. Once the workgroup canon is active, no memory migration
+is part of cloning or a later provider-role change.
 
 **Capability parity invariant for new siblings.** A Codex sibling must inherit
 the source group's NanoClaw capability surface unless a provider/runtime
@@ -168,12 +179,13 @@ WG_DIR_ABS="$(pwd)/data/workgroups/${SOURCE_WORKGROUP}"
 mkdir -p groups/${SIBLING_FOLDER}
 cd groups/${SIBLING_FOLDER}
 
-# Per-group memory: share the source's CLAUDE.local.md so both siblings remember
-# the same project context. It's a loose FILE (the shared-FS migration only moves
-# directories), so a RELATIVE symlink is correct in BOTH modes — container-runner
-# realpath-overlays it into the sibling container. Conditional — if the source has
-# none, leave it absent and let composeGroupClaudeMd create an empty one at first
-# spawn. Do NOT symlink CLAUDE.md: the composer overwrites it every spawn.
+# Shared standing instructions: preserve the source's CLAUDE.local.md
+# byte-for-byte. This is group/provider instruction state, not memory. It is a
+# loose FILE, so a RELATIVE symlink is correct in BOTH shared-FS modes and
+# container-runner realpath-overlays it into the sibling container. Conditional
+# — if the source has none, leave it absent and let composeGroupClaudeMd create
+# an empty one at first spawn. Do NOT symlink CLAUDE.md: the composer overwrites
+# it every spawn.
 [ -f ../${SOURCE_FOLDER}/CLAUDE.local.md ] && ln -sfn ../${SOURCE_FOLDER}/CLAUDE.local.md CLAUDE.local.md
 
 if [ -f "${WG_DIR_ABS}/.migrated" ]; then
@@ -284,7 +296,7 @@ Mirrors the per-group OAuth pattern Claude already uses via scoped `CLAUDE_CODE_
 
 `agent_groups.created_at` is `NOT NULL` with no default.
 
-**`workgroup_id` is the load-bearing field.** It places the sibling in the SAME workgroup as its source, granting shared chat-archive and Graphify visibility plus workgroup-level OneCLI-secret inheritance. It lives on the `agent_groups` row, NOT in `container.json` (`reconcileWorkgroupAtSpawn` reads the DB value; putting it in container.json would trip the parity-check since `workgroup_id` is not a sibling-bound field). Migration 036 auto-paired the codex siblings that pre-dated it — but it has already run and won't re-run, so a codex sibling created TODAY without this column is isolated in its own workgroup-of-one.
+**`workgroup_id` is the load-bearing field.** It places the sibling in the SAME workgroup as its source, granting the same memory canon, shared chat-archive and Graphify visibility plus workgroup-level OneCLI-secret inheritance. It lives on the `agent_groups` row, NOT in `container.json` (`reconcileWorkgroupAtSpawn` reads the DB value; putting it in container.json would trip the parity-check since `workgroup_id` is not a sibling-bound field). Migration 036 auto-paired the codex siblings that pre-dated it — but it has already run and won't re-run, so a codex sibling created TODAY without this column is isolated in its own workgroup-of-one.
 
 `agent_groups.name` should match `id` and `folder` — the workspace
 convention (`<source>-codex`), NOT the Slack/Discord bot display name.

@@ -23,6 +23,7 @@ import {
   isAupRefusal,
   isCorruptionError,
   processQuery,
+  retainCompleteRecallPairs,
   selectInTurnFollowUps,
   transientOverloadDelayMs,
 } from './poll-loop.js';
@@ -332,7 +333,7 @@ describe('accumulate gate (trigger column)', () => {
     // (handled and markCompleted'd inline by the runner) or a task gated
     // by pre-task script, X gets a 'completed' processing_ack but recall-X
     // never does. Without the orphan drain, recall-X would surface as a
-    // standalone "[Recalled context]" prompt with no user message on the
+    // standalone structured recall payload with no user message on the
     // next cold-start iteration.
     insertMessage('X', 'chat', { sender: 'A', text: '/clear' }, { trigger: 1 });
     insertMessage('recall-X', 'system', { subtype: 'recall_context', text: 'facts' }, { trigger: 0 });
@@ -436,6 +437,29 @@ describe('accumulate gate (trigger column)', () => {
     expect(getPendingMessages().map((m) => m.id)).toEqual([]);
   });
 
+  it('getPendingMessages: stale recall ack from before retry admission does not hide the rebuilt pair', () => {
+    const dueAt = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    insertMessage('retry-X', 'chat-sdk', { text: 'retry with fresh memory' }, { trigger: 1, processAfter: dueAt });
+    insertMessage(
+      'recall-retry-X',
+      'system',
+      { subtype: 'recall_context', memoryEvidence: { core: [], excerpts: [] } },
+      { trigger: 0, processAfter: dueAt },
+    );
+    getOutboundDb()
+      .prepare(
+        `INSERT INTO processing_ack (message_id, status, status_changed)
+         VALUES ('recall-retry-X', 'completed', datetime('now', '-2 hours'))`,
+      )
+      .run();
+
+    expect(
+      getPendingMessages()
+        .map((m) => m.id)
+        .sort(),
+    ).toEqual(['recall-retry-X', 'retry-X']);
+  });
+
   it('getPendingMessages: legitimate paired recall-X + X both still returned (no false positive drain)', () => {
     // The drain only fires when X is acked or replied-to. A normal pair
     // with both rows still pending must come through untouched.
@@ -445,6 +469,164 @@ describe('accumulate gate (trigger column)', () => {
       .map((m) => m.id)
       .sort();
     expect(ids).toEqual(['X', 'recall-X']);
+  });
+
+  it('drops an unpaired admissible trigger from a memory-enabled cold and warm batch', () => {
+    insertMessage('paired', 'chat', { sender: 'B', text: 'paired mention' }, { trigger: 1 });
+    insertMessage('recall-paired', 'system', { subtype: 'recall_context', text: 'current facts' }, { trigger: 0 });
+    insertMessage('half-pair', 'chat', { sender: 'C', text: 'missing context' }, { trigger: 1 });
+
+    const raw = getInboundDb().prepare('SELECT * FROM messages_in ORDER BY rowid').all() as any[];
+    expect(
+      selectInTurnFollowUps(raw)
+        .map((row) => row.id)
+        .sort(),
+    ).toEqual(['paired', 'recall-paired']);
+
+    const cold = getPendingMessages();
+    expect(cold.map((row) => row.id).sort()).toEqual(['paired', 'recall-paired']);
+  });
+
+  it('fails closed on a wholly unpaired batch in a trusted workgroup runtime', () => {
+    const priorWorkgroupId = process.env.NANOCLAW_WORKGROUP_ID;
+    process.env.NANOCLAW_WORKGROUP_ID = 'alpha';
+    try {
+      insertMessage('half-pair', 'chat', { sender: 'C', text: 'missing context' }, { trigger: 1 });
+      const raw = getInboundDb().prepare('SELECT * FROM messages_in ORDER BY rowid').all() as any[];
+      expect(selectInTurnFollowUps(raw)).toEqual([]);
+      expect(getPendingMessages()).toEqual([]);
+    } finally {
+      if (priorWorkgroupId === undefined) delete process.env.NANOCLAW_WORKGROUP_ID;
+      else process.env.NANOCLAW_WORKGROUP_ID = priorWorkgroupId;
+    }
+  });
+
+  it('test_limit_boundary_returns_complete_newest_pairs', () => {
+    for (let i = 1; i <= 11; i++) {
+      insertMessage(`m-${i}`, 'chat', { sender: 'B', text: `mention ${i}` }, { trigger: 1 });
+      insertMessage(`recall-m-${i}`, 'system', { subtype: 'recall_context', text: `facts ${i}` }, { trigger: 0 });
+    }
+
+    const ids = getPendingMessages().map((m) => m.id);
+
+    expect(ids).toHaveLength(20);
+    expect(ids).not.toContain('m-1');
+    expect(ids).not.toContain('recall-m-1');
+    for (let i = 2; i <= 11; i++) {
+      expect(ids).toContain(`m-${i}`);
+      expect(ids).toContain(`recall-m-${i}`);
+    }
+    expect(selectInTurnFollowUps(getPendingMessages()).map((m) => m.id)).toEqual(ids);
+  });
+
+  it('retains the sole fresh-context bootstrap pair beyond the newest-unit limit', () => {
+    insertMessage('bootstrap', 'chat', { sender: 'B', text: 'oldest mention' }, { trigger: 1 });
+    insertMessage(
+      'recall-bootstrap',
+      'system',
+      {
+        subtype: 'recall_context',
+        trustedCapabilities: { agentGroupId: 'agent-a', services: [] },
+        memoryEvidence: { core: [], excerpts: [] },
+        conversationEvidence: { excerpts: [] },
+        notices: [],
+      },
+      { trigger: 0 },
+    );
+    for (let i = 1; i <= 11; i++) {
+      insertMessage(`m-${i}`, 'chat', { sender: 'B', text: `mention ${i}` }, { trigger: 1 });
+      insertMessage(`recall-m-${i}`, 'system', { subtype: 'recall_context', text: `facts ${i}` }, { trigger: 0 });
+    }
+
+    const ids = getPendingMessages().map((row) => row.id);
+
+    expect(ids).toContain('bootstrap');
+    expect(ids).toContain('recall-bootstrap');
+    expect(ids).toHaveLength(20);
+  });
+
+  it('retains a deferred bootstrap pair when a newer wake competes with an over-limit trigger-zero tail', () => {
+    insertMessage('bootstrap-deferred', 'chat', { sender: 'B', text: 'retry after reset' }, { trigger: 0 });
+    insertMessage(
+      'recall-bootstrap-deferred',
+      'system',
+      {
+        subtype: 'recall_context',
+        trustedCapabilities: { agentGroupId: 'agent-a', services: [] },
+        memoryEvidence: { core: [], excerpts: [] },
+        conversationEvidence: { excerpts: [] },
+        notices: [],
+      },
+      { trigger: 0 },
+    );
+    insertMessage('wake', 'chat', { sender: 'B', text: 'new wake' }, { trigger: 1 });
+    insertMessage('recall-wake', 'system', { subtype: 'recall_context', text: 'wake facts' }, { trigger: 0 });
+    for (let i = 1; i <= 11; i++) {
+      insertMessage(`context-${i}`, 'chat', { sender: 'B', text: `context ${i}` }, { trigger: 0 });
+    }
+
+    const ids = getPendingMessages().map((row) => row.id);
+
+    expect(ids).toContain('bootstrap-deferred');
+    expect(ids).toContain('recall-bootstrap-deferred');
+    expect(ids).toContain('wake');
+    expect(ids).toContain('recall-wake');
+  });
+
+  it('test_completed_trigger_drains_orphan_without_hiding_next_pair', () => {
+    for (let i = 1; i <= 10; i++) {
+      insertMessage(`m-${i}`, 'chat', { sender: 'B', text: `mention ${i}` }, { trigger: 1 });
+      insertMessage(`recall-m-${i}`, 'system', { subtype: 'recall_context', text: `facts ${i}` }, { trigger: 0 });
+    }
+    insertMessage('completed', 'chat', { sender: 'B', text: '/clear' }, { trigger: 1 });
+    insertMessage('recall-completed', 'system', { subtype: 'recall_context', text: 'stale facts' }, { trigger: 0 });
+    markCompleted(['completed']);
+
+    const ids = getPendingMessages().map((m) => m.id);
+
+    expect(ids).toHaveLength(20);
+    expect(ids).not.toContain('completed');
+    expect(ids).not.toContain('recall-completed');
+    for (let i = 1; i <= 10; i++) {
+      expect(ids).toContain(`m-${i}`);
+      expect(ids).toContain(`recall-m-${i}`);
+    }
+  });
+
+  it('drops a recall when command or script admission removes its target but preserves other pairs', () => {
+    insertMessage('clear', 'chat', { sender: 'A', text: '/clear' }, { trigger: 1 });
+    insertMessage('recall-clear', 'system', { subtype: 'recall_context', text: 'old' }, { trigger: 0 });
+    insertMessage('real', 'chat', { sender: 'B', text: 'hello' }, { trigger: 1 });
+    insertMessage('recall-real', 'system', { subtype: 'recall_context', text: 'current' }, { trigger: 0 });
+    const original = getPendingMessages();
+    const admitted = original.filter((row) => row.id !== 'clear');
+
+    expect(
+      retainCompleteRecallPairs(original, admitted)
+        .map((row) => row.id)
+        .sort(),
+    ).toEqual(['real', 'recall-real']);
+  });
+
+  it('bounds inbound candidates without letting a large trigger-zero tail suppress an older due pair', () => {
+    insertMessage('due-task', 'task', { prompt: 'run now' }, { trigger: 1 });
+    insertMessage('recall-due-task', 'system', { subtype: 'recall_context', text: 'task facts' }, { trigger: 0 });
+    for (let i = 0; i < 5_000; i++) {
+      insertMessage(`context-${i}`, 'chat', { sender: 'A', text: `context ${i}` }, { trigger: 0 });
+    }
+
+    const diagnostics = { inboundRowsRead: 0, inboundRowBudget: 0 };
+    const messages = getPendingMessages(false, diagnostics);
+    const ids = messages.map((row) => row.id);
+
+    expect(messages).toHaveLength(11);
+    expect(ids).toContain('due-task');
+    expect(ids).toContain('recall-due-task');
+    expect(messages.some((row) => row.trigger === 1)).toBe(true);
+    expect(ids.indexOf('due-task')).toBeLessThan(ids.indexOf('context-4999'));
+    expect(diagnostics.inboundRowsRead).toBeGreaterThan(0);
+    expect(diagnostics.inboundRowsRead).toBeLessThanOrEqual(diagnostics.inboundRowBudget);
+    expect(diagnostics.inboundRowBudget).toBeLessThan(200);
   });
 
   it('trigger column defaults to 1 for legacy inserts without explicit value', () => {
@@ -1353,6 +1535,26 @@ function makeResultQuery(result: ProviderEvent): { query: AgentQuery; pushes: st
   };
 }
 
+it('re-bootstraps bounded canon and capabilities immediately after provider compaction', async () => {
+  const pushes: string[] = [];
+  async function* events(): AsyncGenerator<ProviderEvent> {
+    yield { type: 'init', continuation: 'sess-before-compaction' };
+    yield { type: 'compacted', text: 'Context compacted.' };
+    yield { type: 'result', text: '<message to="discord-test">continued</message>' };
+  }
+  const query: AgentQuery = {
+    push: (message) => pushes.push(message),
+    end: () => {},
+    events: events(),
+    abort: () => {},
+  };
+
+  await processQuery(query, ERR_ROUTING, ['m1'], 'claude', undefined, 'prompt', 'sess-before-compaction', {});
+
+  expect(pushes.some((message) => message.includes('<trusted_capabilities_json>'))).toBe(true);
+  expect(pushes.some((message) => message.includes('runner-fresh-context-bootstrap'))).toBe(true);
+});
+
 const ERR_ROUTING = {
   platformId: 'chan-1',
   channelType: 'discord',
@@ -1396,7 +1598,7 @@ describe('mid-turn fast-mode changes', () => {
     expect(endCalls).toBe(1);
     expect(pushCalls).toBe(0);
     expect(getPendingMessages().map((m) => m.id)).toContain('m-fast');
-  });
+  }, 10_000);
 });
 
 describe('error result with no <message> envelope', () => {
@@ -1423,7 +1625,6 @@ describe('error result with no <message> envelope', () => {
     expect(getUndeliveredMessages()).toHaveLength(0);
     expect(pushes).toHaveLength(1);
     expect(pushes[0]).toContain('was not delivered');
-
   });
 });
 

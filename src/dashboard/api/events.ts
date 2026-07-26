@@ -10,6 +10,7 @@ import path from 'path';
 import http from 'http';
 import { createHash } from 'crypto';
 import Database from 'better-sqlite3';
+import type { Stats } from 'node:fs';
 
 import type { AuthedRequestContext, AuthHandler } from '../router.js';
 import { log } from '../../log.js';
@@ -133,6 +134,27 @@ const PER_USER_CAP = 20;
 const AGGREGATE_CAP = 200;
 const KEEPALIVE_INTERVAL_MS = 25_000;
 const SESSIONS_ROOT = path.resolve(process.cwd(), 'data/v2-sessions');
+const SESSION_DATABASE_FILES = new Set(['inbound.db', 'outbound.db']);
+
+type SessionWatchStats = Pick<Stats, 'isDirectory' | 'isSymbolicLink'>;
+
+export function shouldIgnoreSessionWatchPath(filePath: string, stats?: SessionWatchStats): boolean {
+  const relative = path.relative(SESSIONS_ROOT, path.resolve(filePath));
+  if (relative === '') {
+    return stats !== undefined && (stats.isSymbolicLink() || !stats.isDirectory());
+  }
+  if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return true;
+  const parts = relative.split(path.sep);
+  // Traverse only v2-sessions/<agent-group>/<session>. Session worktrees can
+  // contain hundreds of thousands of directories and are irrelevant here.
+  if (parts.length <= 2) {
+    // Chokidar calls a two-argument ignored function once before and once
+    // after stat. Admit the path-only pass, then require a real directory.
+    return stats !== undefined && (stats.isSymbolicLink() || !stats.isDirectory());
+  }
+  if (parts.length !== 3 || !SESSION_DATABASE_FILES.has(parts[2]!)) return true;
+  return stats !== undefined && (stats.isSymbolicLink() || stats.isDirectory());
+}
 
 function addConnection(conn: SseConnection): void {
   let userSet = connectionsByUser.get(conn.userId);
@@ -181,20 +203,12 @@ export function startSSEFeed(): void {
       // returning false = DO watch the file; returning true = ignore
       watcher = watch(SESSIONS_ROOT, {
         ignoreInitial: true,
+        followSymlinks: false,
         awaitWriteFinish: { stabilityThreshold: 100, pollInterval: 50 },
-        // ignored: return true = skip the path; return false = watch it.
-        // Accept inbound.db and outbound.db (M4-c2). Accept directories so
-        // chokidar can traverse them. Ignore everything else.
-        ignored: (filePath: string) => {
-          const base = path.basename(filePath);
-          // Always watch the sessions root dir itself
-          if (filePath === SESSIONS_ROOT) return false;
-          // Accept the two DB files we care about
-          if (base === 'inbound.db' || base === 'outbound.db') return false;
-          // Accept intermediate directory segments (no extension = directory-like)
-          if (!base.includes('.')) return false;
-          return true;
-        },
+        // Accept only the two session DBs and their two directory ancestors.
+        // A filename heuristic would recurse into session worktrees and exhaust
+        // the process-wide inotify budget on large repositories.
+        ignored: shouldIgnoreSessionWatchPath,
       });
 
       // Post-build QA fix SF-9: chokidar emits `error` events; without a handler

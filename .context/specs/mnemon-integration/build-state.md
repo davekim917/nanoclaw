@@ -1,4 +1,8 @@
 # Build State Checkpoint
+
+> **ARCHIVED AND SUPERSEDED — do not execute.** This entire spec family records
+> a retired Mnemon/Ollama/provider-native design. See the
+> [current memory contract](../../../docs/specs/workgroup-memory-and-session-capabilities/design.md).
 Last updated: 2026-04-27 00:38 UTC
 
 ## Groups Completed

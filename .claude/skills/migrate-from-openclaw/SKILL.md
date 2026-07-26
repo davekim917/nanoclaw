@@ -11,8 +11,9 @@ the user, decide together what to bring over and where it belongs in v2's
 entity model, and show proposed changes before applying.
 
 **Principle:** Never silently copy data. Read it, explain it, place it, then
-apply. Credentials are masked when displayed (first 4 + `...` + last 4). Make
-judgment calls about what's core vs. reference material.
+apply. Credentials are masked when displayed (first 4 + `...` + last 4).
+Memory and instruction migration is not a curation exercise: classify the
+source, preserve every byte, and keep the two states separate.
 
 **UX:** Use `AskUserQuestion` for multiple-choice only. Use plain text for
 free-form input. Don't dump raw data — summarize and explain conversationally.
@@ -20,12 +21,14 @@ free-form input. Don't dump raw data — summarize and explain conversationally.
 ## What this skill changes (conformance)
 
 This skill drives existing NanoClaw entry points (`setup/index.ts --step
-register`, `scripts/init-first-agent.ts`, the `onecli` CLI) and copies a few
-files in (workspace markdown, OpenClaw skills, and its own transform module +
-test). It makes no code-level reach-in into core. Its integration assumptions
-about v2 are guarded by `scripts/transform.test.ts`, which is copied into the
-project's `scripts/` test tree on apply (Phase 8) so vitest runs it against the
-composed install. `REMOVE.md` reverses every file the skill copies.
+register`, `scripts/init-first-agent.ts`, the `onecli` CLI), preserves imported
+user data, and copies selected OpenClaw skills. It makes no code-level reach-in
+into core. Its integration assumptions about v2 are guarded by
+`scripts/transform.test.ts`, which is copied into the project's `scripts/` test
+tree on apply (Phase 8) so vitest runs it against the composed install. The
+transform module and test are the only shared code files this skill installs;
+`REMOVE.md` reverses those files, never migrated user data or permanent
+snapshots.
 
 ## v2 architecture the migration targets
 
@@ -36,13 +39,17 @@ OpenClaw and NanoClaw v2 differ structurally. Keep these in mind throughout:
   `messaging_group_agents` wiring between them. There is no `store/messages.db`
   and no `scheduled_tasks` table.
 - **Container isolation.** Each agent group runs in its own Linux container.
-  An OpenClaw "agent" maps to a v2 *agent group* (workspace + memory +
-  CLAUDE.md); an OpenClaw chat/group maps to a v2 *messaging group*; the wiring
-  row connects them.
+  An OpenClaw "agent" maps to a v2 *agent group* (workspace plus provider/group
+  instruction state); an OpenClaw chat/group maps to a v2 *messaging group*;
+  the wiring row connects them.
 - **Standing instructions vs memory.** Per-group role, personality, and
-  behavior live in `groups/<folder>/instructions.prepend.md`. Durable facts
-  live under `groups/<folder>/memory/`. The provider project document is
-  composed at spawn and must not be edited.
+  behavior live outside memory in group instruction state. The one durable
+  memory canon is `data/workgroups/<workgroup-id>/memory` on the host and
+  `/workspace/workgroup/memory` in containers. `/workspace/agent/memory` is a
+  compatibility link, not another store. Every current and future sibling in
+  the workgroup — Claude, Codex, OpenCode, or another provider — sees that same
+  canon. The provider project document is composed at spawn and must not be
+  edited.
 - **Credentials.** Container-facing API credentials (Anthropic, OpenAI, …) are
   held in the OneCLI Agent Vault and injected per request — never in container
   env vars. Host-side channel tokens (Telegram/Discord/Slack bot tokens) stay
@@ -71,7 +78,8 @@ Sections to maintain:
 - **Registered Groups** — table: folder, platform_id, channel, session_mode
 - **Credentials** — table: credential, destination (vault / .env), status
 - **Settings Migrated** — timezone, container timeout
-- **Identity & Memory** — prepend and memory paths created for each group
+- **Identity & Memory** — byte-preserved instruction import paths, target
+  workgroup ids, canonical memory paths, SHA-256 manifests, and migration report
 - **Scheduled Tasks** — table: original_id, name, mapped schedule, status
 - **Deferred / Not Applicable** — unsupported channels, OpenClaw-only features
 
@@ -122,21 +130,26 @@ time."
 **OpenClaw model:** all groups routed to one agent share a workspace
 (SOUL/MEMORY/IDENTITY) and personality; only the session is per-group.
 
-**v2 model:** each agent group is a separate container with its own filesystem,
-standing instructions, and `memory/` tree. Multiple messaging groups wired to
-the same agent group share that state. There is no `groups/global/`.
+**v2 model:** each agent group is a separate container with its own filesystem
+and standing instructions. Memory belongs to the workgroup above agent groups:
+all sibling providers in one workgroup share one canon, while separate
+workgroups have independent canons. Multiple messaging groups wired to the same
+agent group naturally use that group's workgroup.
 
 AskUserQuestion: "In OpenClaw your groups shared one personality and memory. In
-v2 each agent group is separate. How do you want to handle this?"
+v2, standing instructions stay per agent group while memory is shared by
+workgroup. How do you want to map it?"
 
-1. **Shared identity (recommended if it was one bot)** — apply the same core
-   identity to each selected group's `instructions.prepend.md`; keep group
-   facts in each group's memory tree.
-2. **Fully separate** — each group gets independent memory and instructions; no
-   shared base edit.
+1. **One workgroup (recommended if it was one bot)** — every selected current
+   or future provider sibling shares one memory canon; each group keeps its own
+   byte-preserved instruction state.
+2. **Separate workgroups** — each selected agent group gets an independent
+   memory canon and independent instruction state.
 3. **Just the primary agent for now** — set one agent up; add others later.
 
-Remember this choice for Phase 3.
+Remember this choice for Phase 3 and record the resulting `workgroup_id` for
+every registered agent group. Workgroup membership, not provider or folder
+suffix, determines memory sharing.
 
 ### Confirm the assistant name
 
@@ -249,58 +262,164 @@ before running the commands.
 
 ## Phase 3: Identity and Memory
 
-Fully conversational — read files directly and discuss. **Placement depends on
-the Phase 1 choice:**
-
-- **Shared identity:** merge the same core identity/personality into every
-  selected group's `instructions.prepend.md`.
-- **Fully separate / primary only:** merge identity/personality only into the
-  corresponding group's `instructions.prepend.md`.
-
-Never edit a composed `CLAUDE.md` or `AGENTS.md`; it is regenerated each spawn.
-Put standing behavior in `instructions.prepend.md` and facts in `memory/`.
+This phase has two deliberately separate tracks. Never turn instruction files
+into memory, and never semantically rewrite memory while migrating it.
 
 Find workspace files at `<STATE_DIR>/workspace/`. If `AGENT_COUNT > 1`, also
-check `<STATE_DIR>/agents/*/workspace/` and ask which agent maps to which v2
-agent group.
+inventory every `<STATE_DIR>/agents/*/workspace/` and map each source agent to
+its target v2 workgroup. Record every source path before copying anything.
 
-### IDENTITY.md / SOUL.md
+### Instruction state: preserve first, reconcile separately
 
-Read them. Distinguish always-loaded vs reference:
-- **Standing behavior** (core traits, communication style, key rules) → weave
-  into the group's `instructions.prepend.md`.
-- **Reference** (backstory, extended guidelines) → a separate durable concept
-  in an appropriate folder under `groups/<folder>/memory/`, linked from that
-  folder's `index.md` and the root Map.
+`IDENTITY.md`, `SOUL.md`, and `USER.md` are OpenClaw instruction state, not
+NanoClaw memory inputs. Preserve the instruction files byte-for-byte under a
+group-local import directory such as
+`groups/<folder>/openclaw-instructions/<source-agent>/`. Never edit a composed
+`CLAUDE.md` or `AGENTS.md`; it is regenerated each spawn.
 
-Choose each memory folder based on which related information will be easiest to
-find together; a folder may contain different concept types. Before writing the
-first concept into a new folder, create the folder and its `index.md`. Follow
-`memory/system/definition.md`, including its YAML frontmatter rules, for every
-new concept.
+```bash
+INSTRUCTION_IMPORT="groups/<folder>/openclaw-instructions/<source-agent>"
+mkdir -p "${INSTRUCTION_IMPORT}"
+for file in IDENTITY.md SOUL.md USER.md; do
+  [ -e "<openclaw-workspace>/${file}" ] && \
+    cp -a "<openclaw-workspace>/${file}" "${INSTRUCTION_IMPORT}/${file}"
+done
+```
 
-Show proposed edits before applying — this is a thoughtful merge, not a paste.
+Instruction files are byte-preserved. Never summarize, weave, or distill any
+instruction file into the memory canon.
+Legacy instruction reconciliation is an explicit separate operator workflow:
+after the memory cutover is verified, show the preserved files and separately
+propose any verbatim include or standing-instruction change the user wants.
+Until that approval, leave the active group instructions unchanged.
 
-### USER.md
+### Memory state: byte-preserving import into the workgroup canon
 
-Create a focused user-context concept in an appropriate memory folder and link
-it through that folder's index and the root Map. Put only facts relevant in
-nearly every conversation (for example name or timezone) into `## Core Memory`;
-keep all other details in the linked file.
+OpenClaw `MEMORY.md` and every file under `workspace/memory/` are memory
+sources. Import all selected sources byte-for-byte; never choose a winner,
+derive facts, consolidate, or discard a file during migration. The
+source OpenClaw tree remains untouched.
 
-### MEMORY.md and daily memory files
+Quiesce every target workgroup before creating an import path, and keep it
+quiescent through runtime verification or rollback. Then resolve the canonical
+host root from each target `workgroup_id`:
 
-Show `MEMORY.md`; keep relevant items in focused concepts under the chosen
-memory folders, with links through each folder index and the root Map. For
-daily files (`workspace/memory/*.md`, count = DAILY_MEMORY_FILES):
+```bash
+TARGET_WORKGROUP=<workgroup-id>
+OPENCLAW_WORKSPACE="<absolute-openclaw-workspace>"
+IMPORT_RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)"
+CANON="data/workgroups/${TARGET_WORKGROUP}/memory"
+CANON_MARKER="data/workgroups/${TARGET_WORKGROUP}/.memory-migration.json"
+PREIMPORT_SNAPSHOT="data/memory-migration-snapshots/openclaw-${IMPORT_RUN_ID}/${TARGET_WORKGROUP}"
+IMPORT_ROOT="${CANON}/imports/openclaw/<source-agent>"
+MANIFEST_DIR="data/memory-migration-reports"
+SOURCE_MANIFEST="${MANIFEST_DIR}/openclaw-${TARGET_WORKGROUP}-<source-agent>-source.sha256"
+IMPORT_MANIFEST="${MANIFEST_DIR}/openclaw-${TARGET_WORKGROUP}-<source-agent>-import.sha256"
+test ! -e "${IMPORT_ROOT}" || { echo "ERROR: OpenClaw import already exists: ${IMPORT_ROOT}"; exit 1; }
 
-AskUserQuestion: "You have N daily memory files. How to handle them?"
-1. **Copy as-is** — agree on a descriptive folder, create it and its `index.md`,
-   then copy with `cp <workspace>/memory/*.md <group_dir>/memory/<chosen-folder>/`
-   and link the retained files through its index and the root Map.
-2. **Consolidate** — read, extract durable facts, and place them in focused
-   linked memory files.
-3. **Skip.**
+# Run once per target workgroup, before its first external memory copy. This is
+# a permanent pre-import snapshot, separate from the migrator's later snapshot.
+test ! -e "${PREIMPORT_SNAPSHOT}" || { echo "ERROR: snapshot already exists: ${PREIMPORT_SNAPSHOT}"; exit 1; }
+mkdir -p "${PREIMPORT_SNAPSHOT}" "${MANIFEST_DIR}"
+if [ -e "${CANON}" ]; then
+  cp -a "${CANON}" "${PREIMPORT_SNAPSHOT}/memory"
+  printf 'present\n' > "${PREIMPORT_SNAPSHOT}/memory.state"
+  diff -qr "${CANON}" "${PREIMPORT_SNAPSHOT}/memory"
+else
+  printf 'missing\n' > "${PREIMPORT_SNAPSHOT}/memory.state"
+fi
+if [ -e "${CANON_MARKER}" ]; then
+  cp -a "${CANON_MARKER}" "${PREIMPORT_SNAPSHOT}/.memory-migration.json"
+  printf 'present\n' > "${PREIMPORT_SNAPSHOT}/marker.state"
+else
+  printf 'missing\n' > "${PREIMPORT_SNAPSHOT}/marker.state"
+fi
+
+mkdir -p "${IMPORT_ROOT}/workspace"
+
+memory_manifest() {
+  (
+    cd "$1"
+    [ ! -f MEMORY.md ] || sha256sum MEMORY.md
+    [ ! -L MEMORY.md ] || printf 'SYMLINK MEMORY.md -> %s\n' "$(readlink MEMORY.md)"
+    if [ -d memory ]; then
+      find memory -type f -print0 | sort -z | xargs -0r sha256sum
+      find memory -type l -printf 'SYMLINK %p -> %l\n' | sort
+    fi
+  )
+}
+memory_manifest "${OPENCLAW_WORKSPACE}" > "${SOURCE_MANIFEST}"
+test -s "${SOURCE_MANIFEST}" || { echo "ERROR: no OpenClaw memory files found"; exit 1; }
+
+# Preserve the original relative layout and metadata. Never copy through the
+# per-group compatibility link after cutover.
+[ -e "${OPENCLAW_WORKSPACE}/MEMORY.md" ] && \
+  cp -a "${OPENCLAW_WORKSPACE}/MEMORY.md" "${IMPORT_ROOT}/workspace/MEMORY.md"
+[ -d "${OPENCLAW_WORKSPACE}/memory" ] && \
+  cp -a "${OPENCLAW_WORKSPACE}/memory" "${IMPORT_ROOT}/workspace/memory"
+
+# Byte check at the same relative layout. A mismatch blocks migration.
+[ ! -e "${OPENCLAW_WORKSPACE}/MEMORY.md" ] || \
+  cmp "${OPENCLAW_WORKSPACE}/MEMORY.md" "${IMPORT_ROOT}/workspace/MEMORY.md"
+[ ! -d "${OPENCLAW_WORKSPACE}/memory" ] || \
+  diff -qr "${OPENCLAW_WORKSPACE}/memory" "${IMPORT_ROOT}/workspace/memory"
+memory_manifest "${IMPORT_ROOT}/workspace" > "${IMPORT_MANIFEST}"
+diff -u "${SOURCE_MANIFEST}" "${IMPORT_MANIFEST}"
+```
+
+Before and after the copy, record a SHA-256 manifest for every selected file
+and compare source bytes with the corresponding import path. Any missing entry
+or hash mismatch blocks apply. Store the manifest files beside the migration
+report and record their paths in `migration-state.md`; do not restart or
+activate a container on a mismatch.
+
+The copy above only stages an external OpenClaw source where NanoClaw's normal
+migrator can inventory it together with every existing group root,
+provider-native root, and canonical entry. While the workgroups remain
+quiescent, run the real inventory/apply/verify sequence:
+
+```bash
+REPORT="data/memory-migration-reports/openclaw-$(date -u +%Y%m%dT%H%M%SZ).json"
+mkdir -p "$(dirname "$REPORT")"
+pnpm exec tsx scripts/migrate-workgroup-memory.ts inventory --all --report "$REPORT"
+# Review every source, outcome, collision import, and permanent snapshot path.
+pnpm exec tsx scripts/migrate-workgroup-memory.ts apply --report "$REPORT"
+pnpm exec tsx scripts/verify-workgroup-memory-runtime.ts --all --json --require-applied-migration
+```
+
+Apply must follow `/migrate-memory`'s lossless cutover contract: blocked apply
+means fix the cause and create a fresh inventory report; runtime failure after
+status `applied` means explicit rollback from the report. Keep the permanent
+host-only snapshot and source OpenClaw tree. Do not restart until runtime
+verification is green for every workgroup.
+
+The permanent pre-import snapshot is the restore point for a blocked apply or
+runtime verification failure: preserve the failed canon for forensics, then
+restore the exact pre-import canon and marker. On a blocked apply, do not run
+the report rollback first; on a runtime failure after `applied`, run the report
+rollback first and then restore the pre-import snapshot. Keep both snapshots
+permanently.
+
+```bash
+FAILED_STATE="${PREIMPORT_SNAPSHOT}/failed-state-$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "${FAILED_STATE}"
+[ ! -e "${CANON}" ] || mv "${CANON}" "${FAILED_STATE}/memory"
+[ ! -e "${CANON_MARKER}" ] || mv "${CANON_MARKER}" "${FAILED_STATE}/.memory-migration.json"
+
+if grep -qx present "${PREIMPORT_SNAPSHOT}/memory.state"; then
+  mkdir -p "$(dirname "${CANON}")"
+  cp -a "${PREIMPORT_SNAPSHOT}/memory" "${CANON}"
+fi
+if grep -qx present "${PREIMPORT_SNAPSHOT}/marker.state"; then
+  mkdir -p "$(dirname "${CANON_MARKER}")"
+  cp -a "${PREIMPORT_SNAPSHOT}/.memory-migration.json" "${CANON_MARKER}"
+fi
+```
+
+Once verified, the canon remains `data/workgroups/<workgroup-id>/memory`, every
+sibling reads `/workspace/workgroup/memory`, and `/workspace/agent/memory`
+remains only the compatibility link. Adding or switching providers requires no
+memory migration.
 
 ### OpenClaw skills
 
@@ -485,8 +604,9 @@ recurrence mapping. It imports the real `cron-parser` (the same parser the host
 recurrence sweep uses), so a missing/renamed dependency turns it red. `build`
 typechecks the transform module against the project.
 
-These copied files are the only files the skill installs into the project tree;
-`REMOVE.md` deletes them.
+These are the only shared code files the skill installs into the project tree;
+`REMOVE.md` deletes them. It does not delete migrated user data, reports, or
+permanent snapshots.
 
 ### If a container rebuild is needed
 
@@ -500,9 +620,12 @@ Print what was migrated:
 - Additional groups → messaging groups + wiring (folders + session modes)
 - Timezone → `.env TZ`; container timeout → noted
 - Access grants → members/roles for OpenClaw allowlist senders
-- Identity/personality → per-group `instructions.prepend.md` + linked memory concepts
-- User context / memories → Core Memory only for universal facts; otherwise
-  linked concepts in content-based folders under `memory/`
+- Identity/personality/user instruction files → byte-preserved group-local
+  import, with any activation deferred to separate explicit instruction
+  reconciliation
+- OpenClaw `MEMORY.md` + daily memory files → byte-preserved imports in
+  `data/workgroups/<workgroup-id>/memory`, with SHA-256 comparison and a green
+  inventory/apply/runtime-verification report
 - OpenClaw skills → `container/skills/`
 - Channel tokens → `.env` (list channels)
 - Container-facing credentials → OneCLI vault (list)

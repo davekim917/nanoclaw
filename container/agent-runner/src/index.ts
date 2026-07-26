@@ -36,7 +36,11 @@ import './providers/index.js';
 import { createProvider, type ProviderName } from './providers/factory.js';
 import type { McpServerConfig } from './providers/types.js';
 import { runPollLoop } from './poll-loop.js';
-import { setupCodexRuntime, syncAgentSkillsMirror } from './codex-companion-setup.js';
+import {
+  setupCodexPrimaryRuntime,
+  setupCodexRuntime,
+  syncAgentSkillsMirror,
+} from './codex-companion-setup.js';
 import { activateGcpServiceAccount } from './gcp-auth-setup.js';
 import { startResourceTelemetry } from './resource-telemetry.js';
 
@@ -64,8 +68,8 @@ async function main(): Promise<void> {
   // activate it so the `gcloud`/`bq` CLIs authenticate. No-op otherwise. All providers.
   activateGcpServiceAccount(log);
 
-  // All providers share one authoritative file-memory tree. Graphify indexes
-  // these source files; no second derived retrieval store is introduced.
+  // All providers share one canonical file-memory tree. Graphify indexes these
+  // source files; no second derived retrieval store is introduced.
   ensureMemoryScaffold();
 
   // Runtime-generated system-prompt addendum: agent identity + communication
@@ -74,7 +78,9 @@ async function main(): Promise<void> {
   // /workspace/agent/CLAUDE.md (composed base + module fragments). Per-group
   // standing operator customizations live in
   // /workspace/agent/CLAUDE.local.md (auto-loaded); durable memory lives in
-  // /workspace/agent/memory/ and enters through the provider lifecycle hook.
+  // /workspace/agent/memory/. Canonical bytes enter each admissible turn only
+  // through paired untrusted recall; the provider lifecycle hook supplies
+  // trusted static handling and write guidance.
   const taskId = getTaskSeriesId();
   const addendum = buildSystemPromptAddendum(
     config.assistantName || undefined,
@@ -106,7 +112,7 @@ async function main(): Promise<void> {
   const capabilityNote = [
     '## Capability Awareness',
     '',
-    "Before saying you don't have access to a service, VERIFY. Call `mcp__nanoclaw__get_capabilities` with `section: \"session\"` for a live per-service snapshot — it lists the scoped accounts/connections actually wired in this session AND the exact activation step (e.g. which env var to export). Gmail/Calendar/Drive/Docs/Sheets/Slides go through the `gws` CLI via Bash in v2 — there are NO `mcp__gmail__*` / `mcp__calendar__*` tools. Note: `gws auth status` reports `auth_method: none` until you `export GOOGLE_WORKSPACE_CLI_CREDENTIALS_FILE=/home/node/.config/gws/accounts/<name>.json`; that's the CLI's default-path probe missing the mounted files, not the creds being absent.",
+    "Before saying a service is unavailable, verify it with `mcp__nanoclaw__get_capabilities` using `section: \"session\"`. Absence of a dedicated MCP tool is not proof of no access; follow the live snapshot's activation instructions.",
   ].join('\n');
 
   const baseInstructions = [toneBlock, capabilityNote, addendum].filter(Boolean).join('\n\n');
@@ -194,9 +200,11 @@ async function main(): Promise<void> {
   // via the codex-companion script). Builds ~/.codex-runtime/ with auth.json
   // symlink + merged config.toml so the peer sees the same MCP servers
   // Claude does — most importantly the in-container `nanoclaw` server.
-  // No-op when codex is the primary provider — its own writer handles
-  // ~/.codex/config.toml at thread/start time.
-  if (providerName !== 'codex') {
+  // Codex-primary owns a persistent session-local ~/.codex and registers
+  // plugins there. Peer-mode Codex uses the synthesized ~/.codex-runtime.
+  if (providerName === 'codex') {
+    setupCodexPrimaryRuntime();
+  } else {
     // Pass the host runtime so the registration log names it accurately. Only the
     // label varies — which plugins get registered is always codex's own set,
     // since this CODEX_HOME is what the peer `codex` process reads.

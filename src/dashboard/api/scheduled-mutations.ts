@@ -25,6 +25,7 @@ import { getSession } from '../../db/sessions.js';
 import { openInboundDb } from '../../db/session-db.js';
 import { cancelSeriesWithStrandClear, pauseTask, resumeTask, updateTask } from '../../modules/scheduling/db.js';
 import { wakeContainer } from '../../container-runner.js';
+import { admitDueTaskContexts } from '../../session-manager.js';
 import { log } from '../../log.js';
 import { emitDashboardEvent } from './events.js';
 import { verbVerdict, type HealthState, type SeriesKind } from './scheduled-board-matrix.js';
@@ -299,7 +300,7 @@ export const editHandler: AuthHandler = async (req, params, ctx) => {
   }
 
   const db = openInboundDb(t.inboundPath);
-  let touched = 0;
+  let touched: number;
   try {
     touched = updateTask(db, t.seriesId, update);
   } finally {
@@ -340,7 +341,7 @@ export const pauseHandler: AuthHandler = async (_req, params, ctx) => {
   if (!verdict.allowed) return verdictResponse(verdict);
 
   const db = openInboundDb(t.inboundPath);
-  let touched = 0;
+  let touched: number;
   try {
     touched = pauseTask(db, t.seriesId);
   } finally {
@@ -375,7 +376,7 @@ export const resumeHandler: AuthHandler = async (_req, params, ctx) => {
   if (!verdict.allowed) return verdictResponse(verdict);
 
   const db = openInboundDb(t.inboundPath);
-  let touched = 0;
+  let touched: number;
   try {
     // §4.7: recompute process_after to the next FUTURE slot BEFORE flipping to
     // pending (skip-don't-replay, D3) — a paused-past-its-slot series must not
@@ -432,13 +433,52 @@ export const runNowHandler: AuthHandler = async (req, params, ctx) => {
   // Fire: process_after = now, then wake the container. Recurrence advances
   // normally on completion (an early fire does not shift the schedule — §4.6).
   const db = openInboundDb(t.inboundPath);
-  let touched = 0;
+  let touched: number;
+  let admittedTarget = false;
   try {
     touched = updateTask(db, t.seriesId, { processAfter: new Date(nowMs).toISOString() });
+    if (touched > 0) {
+      admitDueTaskContexts(db, t.agentGroupId, t.sessionId);
+      admittedTarget =
+        db
+          .prepare(
+            `SELECT 1
+               FROM messages_in AS task
+               JOIN messages_in AS recall
+                 ON recall.id = 'recall-' || task.id
+                AND recall.seq = task.seq - 2
+                AND recall.kind = 'system'
+                AND recall.trigger = 0
+              WHERE task.id = ?
+                AND task.kind = 'task'
+                AND task.status = 'pending'
+                AND task.trigger = 1`,
+          )
+          .get(t.live.id) !== undefined;
+      if (!admittedTarget) {
+        // Do not silently turn a failed run-now request into a later run-now.
+        // Keep the row inert (updateTask already invalidated stale recall) but
+        // restore its prior schedule so only the pre-existing fire remains.
+        db.prepare(
+          `UPDATE messages_in
+              SET process_after = ?
+            WHERE id = ? AND kind = 'task' AND status = 'pending' AND trigger = 0`,
+        ).run(t.live.process_after, t.live.id);
+      }
+    }
   } finally {
     db.close();
   }
   if (touched === 0) return json({ error: 'stale_key', reason: 'stale_key' }, 409);
+  if (!admittedTarget) {
+    return json(
+      {
+        error: 'context_admission_failed',
+        reason: 'Fresh context could not be admitted; the task remains inert and was not fired.',
+      },
+      503,
+    );
+  }
 
   const session = getSession(t.sessionId);
   if (session) {
@@ -478,7 +518,7 @@ export const cancelHandler: AuthHandler = async (_req, params, ctx) => {
   if (!inboundPath) return json({ error: 'not_found' }, 404);
   if (!fs.existsSync(inboundPath)) return json({ error: 'session_unreadable', reason: 'session_unreadable' }, 503);
 
-  let touched = 0;
+  let touched: number;
   try {
     const db = openInboundDb(inboundPath);
     try {

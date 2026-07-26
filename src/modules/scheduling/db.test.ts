@@ -43,16 +43,31 @@ function insertBasicTask(db: ReturnType<typeof openInboundDb>, id: string, recur
   });
 }
 
+function simulateAdmittedTask(db: ReturnType<typeof openInboundDb>, id: string): void {
+  db.prepare('UPDATE messages_in SET seq = 4, trigger = 1 WHERE id = ?').run(id);
+  db.prepare(
+    `INSERT INTO messages_in
+       (id, seq, kind, timestamp, status, process_after, recurrence, series_id, tries, trigger, content)
+     SELECT ?, 2, 'system', timestamp, 'pending', process_after, NULL, ?, 0, 0, ?
+       FROM messages_in
+      WHERE id = ?`,
+  ).run(`recall-${id}`, `recall-${id}`, JSON.stringify({ subtype: 'recall_context', revision: 'stale' }), id);
+}
+
 afterEach(() => {
   if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
 });
 
 describe('insertTaskRow', () => {
-  it('stamps series_id = id on insert', () => {
+  it('stamps series_id and keeps a scheduled occurrence inert until due admission', () => {
     const db = freshDb();
     insertBasicTask(db, 'task-1', null);
-    const row = db.prepare('SELECT series_id FROM messages_in WHERE id = ?').get('task-1') as { series_id: string };
+    const row = db.prepare('SELECT series_id, trigger FROM messages_in WHERE id = ?').get('task-1') as {
+      series_id: string;
+      trigger: number;
+    };
     expect(row.series_id).toBe('task-1');
+    expect(row.trigger).toBe(0);
     db.close();
   });
 
@@ -92,6 +107,9 @@ describe('insertTaskRow', () => {
       thread_id: string;
     };
     expect(next.thread_id).toBe('thr-xyz');
+    expect(
+      (db.prepare("SELECT trigger FROM messages_in WHERE id = 'task-thr-2'").get() as { trigger: number }).trigger,
+    ).toBe(0);
     db.close();
   });
 });
@@ -222,6 +240,30 @@ describe('cancelTask / pauseTask / resumeTask series matching', () => {
     db.close();
   });
 
+  it('resume atomically invalidates an admitted paused row before its next execution', () => {
+    const db = freshDb();
+    insertBasicTask(db, 'task-admitted-resume', '0 9 * * *');
+    simulateAdmittedTask(db, 'task-admitted-resume');
+    pauseTask(db, 'task-admitted-resume');
+
+    expect(resumeTask(db, 'task-admitted-resume')).toBe(1);
+
+    const rows = db.prepare('SELECT id, seq, status, trigger FROM messages_in ORDER BY seq').all() as Array<{
+      id: string;
+      seq: number;
+      status: string;
+      trigger: number;
+    }>;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      id: 'task-admitted-resume',
+      status: 'pending',
+      trigger: 0,
+    });
+    expect(rows[0]!.seq).toBeGreaterThan(4);
+    db.close();
+  });
+
   it('pause/resume touch ONLY status — recurrence and process_after survive the cycle', () => {
     const db = freshDb();
     seedRecurringChain(db);
@@ -245,6 +287,43 @@ describe('cancelTask / pauseTask / resumeTask series matching', () => {
 });
 
 describe('updateTask', () => {
+  it('invalidates stale admission when an active occurrence is edited or snoozed', () => {
+    const db = freshDb();
+    insertTaskRow(db, {
+      id: 'task-admitted-update',
+      seriesId: 'task-admitted-update',
+      processAfter: '2026-01-01T00:00:00Z',
+      recurrence: '0 9 * * *',
+      content: JSON.stringify({ prompt: 'old' }),
+    });
+    simulateAdmittedTask(db, 'task-admitted-update');
+
+    const touched = updateTask(db, 'task-admitted-update', {
+      prompt: 'new',
+      processAfter: '2026-02-01T00:00:00Z',
+    });
+
+    expect(touched).toBe(1);
+    const rows = db.prepare('SELECT id, seq, status, trigger, process_after, content FROM messages_in').all() as Array<{
+      id: string;
+      seq: number;
+      status: string;
+      trigger: number;
+      process_after: string;
+      content: string;
+    }>;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      id: 'task-admitted-update',
+      status: 'pending',
+      trigger: 0,
+      process_after: '2026-02-01T00:00:00Z',
+    });
+    expect(rows[0]!.seq).toBeGreaterThan(4);
+    expect(JSON.parse(rows[0]!.content)).toMatchObject({ prompt: 'new' });
+    db.close();
+  });
+
   it('merges supplied fields into content JSON without clobbering others', () => {
     const db = freshDb();
     insertTaskRow(db, {

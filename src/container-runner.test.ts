@@ -13,7 +13,12 @@ import {
   serializeMcpServersEnv,
   resolveAnthropicAuth,
   resolveCodexAuthFallbacks,
+  materializeCodexFallbackRuntime,
   resolveProviderName,
+  resolveWorkgroupMemoryLockMount,
+  resolveWorkgroupMemoryMount,
+  WORKGROUP_MEMORY_LOCK_CONTAINER_PATH,
+  replaceClaudeNativeMemoryMount,
   reconcileWorkgroupAtSpawn,
 } from './container-runner.js';
 import { formatMemoryMb, resolveContainerResources } from './container-resources.js';
@@ -95,6 +100,152 @@ describe('Graphify container runtime contract', () => {
     ]);
     expect(args.filter((arg) => arg === 'NANOCLAW_CONTAINER=1')).toHaveLength(1);
     expect(args.filter((arg) => arg.startsWith('/workspace/.graphify-stage:'))).toHaveLength(1);
+  });
+});
+
+describe('canonical workgroup memory mount', () => {
+  it('resolves the trusted DB workgroup id to one provider-neutral canonical host path', () => {
+    expect(resolveWorkgroupMemoryMount('wg-alpha', '/srv/nanoclaw/data')).toEqual({
+      hostPath: '/srv/nanoclaw/data/workgroups/wg-alpha/memory',
+      containerPath: '/workspace/workgroup/memory',
+      readonly: false,
+    });
+  });
+
+  it.each(['claude', 'codex', 'opencode'])(
+    'maps the %s native loader to the same canonical host path read-only and after the RW neutral mount',
+    (provider) => {
+      const dataDir = '/srv/nanoclaw/data';
+      const agentGroupId = 'ag-alpha';
+      const workgroupId = 'wg-alpha';
+      const nativeContainerPath = '/home/node/.claude/projects/-workspace-agent/memory';
+      const claudeMounts = [
+        {
+          hostPath: `${dataDir}/v2-sessions/${agentGroupId}/.claude-shared`,
+          containerPath: '/home/node/.claude',
+          readonly: false,
+        },
+        {
+          hostPath: '/srv/nanoclaw/container/skills',
+          containerPath: '/home/node/.claude/skills',
+          readonly: true,
+        },
+        {
+          hostPath: `${dataDir}/v2-sessions/${agentGroupId}/session/.claude-projects/-workspace-agent`,
+          containerPath: '/home/node/.claude/projects/-workspace-agent',
+          readonly: false,
+        },
+        {
+          hostPath: `${dataDir}/v2-sessions/${agentGroupId}/.claude-shared/projects/-workspace-agent/memory`,
+          containerPath: nativeContainerPath,
+          readonly: false,
+        },
+      ];
+
+      const resolved = replaceClaudeNativeMemoryMount(claudeMounts, {
+        provider,
+        agentGroupId,
+        workgroupId,
+        dataDir,
+      });
+      const neutral = resolveWorkgroupMemoryMount(workgroupId, dataDir);
+      const plan = [neutral, ...resolved];
+      const native = plan.find((mount) => mount.containerPath === nativeContainerPath);
+
+      expect(resolved.slice(0, -1)).toEqual(claudeMounts.slice(0, -1));
+      expect(native).toEqual({
+        hostPath: neutral.hostPath,
+        containerPath: nativeContainerPath,
+        readonly: true,
+      });
+      expect(plan.indexOf(neutral)).toBeLessThan(plan.indexOf(native!));
+      expect(neutral.readonly).toBe(false);
+    },
+  );
+
+  it('rejects a changed final Claude native-memory mount contract instead of suffix-matching it', () => {
+    expect(() =>
+      replaceClaudeNativeMemoryMount(
+        [
+          {
+            hostPath: '/srv/nanoclaw/data/unrecognized/memory',
+            containerPath: '/home/node/.claude/projects/-workspace-agent/memory',
+            readonly: false,
+          },
+        ],
+        {
+          provider: 'claude',
+          agentGroupId: 'ag-alpha',
+          workgroupId: 'wg-alpha',
+          dataDir: '/srv/nanoclaw/data',
+        },
+      ),
+    ).toThrow(/exact final Claude native-memory mount contract/);
+  });
+
+  it('creates one host-shared lock sidecar beside the canon at mode 0600', () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-memory-lock-'));
+    try {
+      const mount = resolveWorkgroupMemoryLockMount('wg-alpha', dataDir);
+      const expected = path.join(dataDir, 'workgroups', 'wg-alpha', '.memory-write.lock');
+
+      expect(mount).toEqual({
+        hostPath: expected,
+        containerPath: '/workspace/workgroup/.memory-write.lock',
+        readonly: false,
+      });
+      expect(WORKGROUP_MEMORY_LOCK_CONTAINER_PATH).toBe('/workspace/workgroup/.memory-write.lock');
+      const stat = fs.lstatSync(expected);
+      expect(stat.isFile()).toBe(true);
+      expect(stat.isSymbolicLink()).toBe(false);
+      expect(stat.mode & 0o777).toBe(0o600);
+    } finally {
+      fs.rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects an untrusted workgroup id before constructing the host lock path', () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-memory-lock-'));
+    try {
+      expect(() => resolveWorkgroupMemoryLockMount('../escape', dataDir)).toThrow(/Invalid workgroup id/);
+      expect(fs.existsSync(path.join(dataDir, 'workgroups', 'escape', '.memory-write.lock'))).toBe(false);
+    } finally {
+      fs.rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it('is idempotent and never truncates an existing regular lock file', () => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-memory-lock-'));
+    try {
+      const first = resolveWorkgroupMemoryLockMount('wg-alpha', dataDir);
+      fs.writeFileSync(first.hostPath, 'owner-metadata');
+      const before = fs.lstatSync(first.hostPath);
+
+      const second = resolveWorkgroupMemoryLockMount('wg-alpha', dataDir);
+      const after = fs.lstatSync(second.hostPath);
+
+      expect(second).toEqual(first);
+      expect(fs.readFileSync(second.hostPath, 'utf8')).toBe('owner-metadata');
+      expect({ dev: after.dev, ino: after.ino }).toEqual({ dev: before.dev, ino: before.ino });
+    } finally {
+      fs.rmSync(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    ['symlink', (lockPath: string) => fs.symlinkSync('/tmp', lockPath)],
+    ['directory', (lockPath: string) => fs.mkdirSync(lockPath)],
+  ])('fails closed when the existing lock path is a %s', (_kind, createInvalid) => {
+    const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-memory-lock-'));
+    try {
+      const workgroupDir = path.join(dataDir, 'workgroups', 'wg-alpha');
+      fs.mkdirSync(workgroupDir, { recursive: true });
+      createInvalid(path.join(workgroupDir, '.memory-write.lock'));
+
+      expect(() => resolveWorkgroupMemoryLockMount('wg-alpha', dataDir)).toThrow();
+    } finally {
+      fs.rmSync(dataDir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -529,6 +680,148 @@ describe('resolveCodexAuthFallbacks', () => {
     const out = resolveCodexAuthFallbacks(messy, path.join(home, '.codex-mr'), home);
     expect(out).toHaveLength(1);
     expect(out[0].hostPath).toBe(path.join(home, '.codex'));
+  });
+});
+
+describe('materializeCodexFallbackRuntime', () => {
+  it('mounts only mutable auth and rollout state from the host home', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-codex-fb-runtime-'));
+    const hostHome = path.join(root, 'host-home');
+    const runtimeHome = path.join(root, 'session', 'fallback-1');
+    fs.mkdirSync(path.join(hostHome, 'sessions'), { recursive: true });
+    fs.mkdirSync(path.join(hostHome, 'plugins', 'cache', 'stale-host-plugin'), { recursive: true });
+    fs.writeFileSync(path.join(hostHome, 'auth.json'), '{"token":"opaque"}');
+    fs.writeFileSync(
+      path.join(hostHome, 'config.toml'),
+      '[plugins."stale@host"]\nenabled = true\n[features]\ncodex_hooks = true\n',
+    );
+
+    try {
+      const mounts = materializeCodexFallbackRuntime(
+        { hostPath: hostHome, containerPath: '/home/node/.codex-fallback-1' },
+        runtimeHome,
+      );
+
+      expect(mounts).toEqual([
+        { hostPath: runtimeHome, containerPath: '/home/node/.codex-fallback-1', readonly: false },
+        {
+          hostPath: path.join(hostHome, 'auth.json'),
+          containerPath: '/home/node/.codex-fallback-1/auth.json',
+          readonly: false,
+        },
+        {
+          hostPath: path.join(hostHome, 'sessions'),
+          containerPath: '/home/node/.codex-fallback-1/sessions',
+          readonly: false,
+        },
+      ]);
+      expect(fs.readFileSync(path.join(runtimeHome, 'config.toml'), 'utf8')).toContain('[features]');
+      expect(fs.existsSync(path.join(runtimeHome, 'auth.json'))).toBe(true);
+      expect(mounts.some((mount) => mount.hostPath.includes('/plugins'))).toBe(false);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('creates first-use rollout persistence and replaces poisoned runtime entries without following them', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-codex-fb-poisoned-'));
+    const hostHome = path.join(root, 'host-home');
+    const runtimeHome = path.join(root, 'session', 'fallback-1');
+    const outside = path.join(root, 'outside');
+    fs.mkdirSync(hostHome, { recursive: true });
+    fs.mkdirSync(runtimeHome, { recursive: true });
+    fs.mkdirSync(path.join(outside, 'tmp', 'marketplaces'), { recursive: true });
+    fs.mkdirSync(path.join(outside, 'plugins'), { recursive: true });
+    fs.mkdirSync(path.join(outside, 'sessions'), { recursive: true });
+    fs.writeFileSync(path.join(hostHome, 'auth.json'), '{"token":"opaque"}');
+    fs.writeFileSync(path.join(hostHome, 'config.toml'), 'model = "gpt-5.6-terra"\n');
+    fs.writeFileSync(path.join(outside, 'config-victim'), 'keep');
+    fs.writeFileSync(path.join(outside, 'auth-victim'), 'keep');
+    fs.writeFileSync(path.join(outside, 'tmp', 'marketplaces', 'sentinel'), 'keep');
+    fs.writeFileSync(path.join(outside, 'plugins', 'sentinel'), 'keep');
+    fs.writeFileSync(path.join(outside, 'sessions', 'sentinel'), 'keep');
+    fs.symlinkSync(path.join(outside, 'tmp'), path.join(runtimeHome, '.tmp'), 'dir');
+    fs.symlinkSync(path.join(outside, 'plugins'), path.join(runtimeHome, 'plugins'), 'dir');
+    fs.symlinkSync(path.join(outside, 'config-victim'), path.join(runtimeHome, 'config.toml'));
+    fs.symlinkSync(path.join(outside, 'auth-victim'), path.join(runtimeHome, 'auth.json'));
+    fs.symlinkSync(path.join(outside, 'sessions'), path.join(runtimeHome, 'sessions'), 'dir');
+
+    try {
+      const mounts = materializeCodexFallbackRuntime(
+        { hostPath: hostHome, containerPath: '/home/node/.codex-fallback-1' },
+        runtimeHome,
+      );
+
+      expect(fs.readFileSync(path.join(outside, 'config-victim'), 'utf8')).toBe('keep');
+      expect(fs.readFileSync(path.join(outside, 'auth-victim'), 'utf8')).toBe('keep');
+      expect(fs.readFileSync(path.join(outside, 'tmp', 'marketplaces', 'sentinel'), 'utf8')).toBe('keep');
+      expect(fs.readFileSync(path.join(outside, 'plugins', 'sentinel'), 'utf8')).toBe('keep');
+      expect(fs.readFileSync(path.join(outside, 'sessions', 'sentinel'), 'utf8')).toBe('keep');
+      expect(fs.lstatSync(path.join(runtimeHome, 'config.toml')).isFile()).toBe(true);
+      expect(fs.readFileSync(path.join(runtimeHome, 'config.toml'), 'utf8')).toBe('model = "gpt-5.6-terra"\n');
+      expect(fs.lstatSync(path.join(runtimeHome, 'auth.json')).isFile()).toBe(true);
+      expect(fs.lstatSync(path.join(runtimeHome, 'sessions')).isDirectory()).toBe(true);
+      expect(fs.existsSync(path.join(runtimeHome, '.tmp'))).toBe(false);
+      expect(fs.existsSync(path.join(runtimeHome, 'plugins'))).toBe(false);
+      expect(fs.lstatSync(path.join(hostHome, 'sessions')).isDirectory()).toBe(true);
+      expect(mounts).toContainEqual({
+        hostPath: path.join(hostHome, 'sessions'),
+        containerPath: '/home/node/.codex-fallback-1/sessions',
+        readonly: false,
+      });
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects symlinked runtime roots and fallback source entries', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-codex-fb-root-link-'));
+    const hostHome = path.join(root, 'host-home');
+    const outside = path.join(root, 'outside');
+    const linkedRuntime = path.join(root, 'runtime-link');
+    fs.mkdirSync(hostHome);
+    fs.mkdirSync(outside);
+    fs.writeFileSync(path.join(hostHome, 'auth.json'), '{}');
+    fs.symlinkSync(outside, linkedRuntime, 'dir');
+
+    try {
+      expect(() =>
+        materializeCodexFallbackRuntime(
+          { hostPath: hostHome, containerPath: '/home/node/.codex-fallback-1' },
+          linkedRuntime,
+        ),
+      ).toThrow(/Unsafe runtime directory/);
+
+      fs.unlinkSync(linkedRuntime);
+      fs.symlinkSync(outside, path.join(hostHome, 'sessions'), 'dir');
+      expect(() =>
+        materializeCodexFallbackRuntime(
+          { hostPath: hostHome, containerPath: '/home/node/.codex-fallback-1' },
+          path.join(root, 'runtime'),
+        ),
+      ).toThrow(/Unsafe fallback sessions directory/);
+
+      fs.unlinkSync(path.join(hostHome, 'sessions'));
+      fs.symlinkSync(outside, path.join(hostHome, 'config.toml'), 'dir');
+      expect(() =>
+        materializeCodexFallbackRuntime(
+          { hostPath: hostHome, containerPath: '/home/node/.codex-fallback-1' },
+          path.join(root, 'runtime'),
+        ),
+      ).toThrow(/Unsafe fallback config file/);
+
+      fs.unlinkSync(path.join(hostHome, 'config.toml'));
+      fs.unlinkSync(path.join(hostHome, 'auth.json'));
+      fs.symlinkSync(outside, path.join(hostHome, 'auth.json'), 'dir');
+      expect(() =>
+        materializeCodexFallbackRuntime(
+          { hostPath: hostHome, containerPath: '/home/node/.codex-fallback-1' },
+          path.join(root, 'runtime'),
+        ),
+      ).toThrow(/Unsafe fallback auth file/);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 

@@ -4,7 +4,13 @@ Reverses every change `/add-codex` makes and returns every group to the default 
 
 ## 1. Switch codex groups back to the default
 
-List groups still on codex and switch each one (each group's `memory/` tree stays on disk and readable; run `/migrate-memory` per group if its memory should carry back to Claude — see [docs/provider-migration.md](../../docs/provider-migration.md)):
+List groups still on codex and switch each one. Once the workgroup canon is
+active, Claude reads the same memory files and switching back requires no
+memory migration. If the installation's shared-memory cutover is incomplete,
+run `/migrate-memory`; it consolidates discovered group memory and recognized
+provider-native memory roots, never standing instructions or other
+customizations. See
+[docs/provider-migration.md](../../docs/provider-migration.md).
 
 ```bash
 ncl groups list
@@ -27,7 +33,6 @@ Delete (do not comment out) the `import './codex.js';` line from each of:
 rm -f src/providers/codex.ts \
       src/providers/codex-agents-md.ts \
       src/providers/codex-registration.test.ts \
-      src/providers/codex-host-contribution.test.ts \
       src/providers/codex-agents-md.test.ts \
       container/agent-runner/src/providers/codex.ts \
       container/agent-runner/src/providers/codex-app-server.ts \
@@ -35,9 +40,7 @@ rm -f src/providers/codex.ts \
       container/agent-runner/src/providers/exchange-archive.test.ts \
       container/agent-runner/src/providers/codex-registration.test.ts \
       container/agent-runner/src/providers/codex.factory.test.ts \
-      container/agent-runner/src/providers/codex.turns.test.ts \
       container/agent-runner/src/providers/codex-app-server.test.ts \
-      container/agent-runner/src/providers/codex-cli-tools.test.ts \
       setup/providers/codex.ts \
       setup/providers/codex.test.ts \
       setup/providers/codex-registration.test.ts
@@ -47,19 +50,11 @@ This skill itself (`.claude/skills/add-codex/`) stays — it ships with trunk so
 
 `container/AGENTS.md` stays only if another installed provider uses agent surfaces; otherwise remove it too.
 
-## 4. Remove the CLI manifest entry
+## 4. Retain the install-wide Codex CLI
 
-Delete the `@openai/codex` entry from `container/cli-tools.json`:
-
-```bash
-node -e '
-  const fs = require("fs");
-  const file = "container/cli-tools.json";
-  const tools = JSON.parse(fs.readFileSync(file, "utf8")).filter((t) => t.name !== "@openai/codex");
-  const fmt = (t) => "  { " + Object.entries(t).map(([k, v]) => JSON.stringify(k) + ": " + JSON.stringify(v)).join(", ") + " }";
-  fs.writeFileSync(file, "[\n" + tools.map(fmt).join(",\n") + "\n]\n");
-'
-```
+Do not edit `container/cli-tools.json`, `CODEX_VERSION`, or the Dockerfile's
+`@openai/codex` install. This fork uses the Codex CLI independently for
+cross-model QA/review even when no agent group selects the Codex provider.
 
 ## 5. Vault secret (optional)
 

@@ -5,7 +5,13 @@ import path from 'path';
 import Database from 'better-sqlite3';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
-import { reconcileWorkgroupSharedDirs } from './shared-dirs.js';
+import {
+  inspectWorkgroupMemoryState,
+  prepareWorkgroupMemoryMember,
+  reconcileWorkgroupMemory,
+  reconcileWorkgroupSharedDirs,
+  workgroupMemoryDir,
+} from './shared-dirs.js';
 
 function setupDb(): Database.Database {
   const db = new Database(':memory:');
@@ -104,6 +110,53 @@ describe('reconcileWorkgroupSharedDirs', () => {
     expect(fs.readFileSync(path.join(sibDbt, 'own.txt'), 'utf-8')).toBe('mine'); // untouched
   });
 
+  it('never moves or repoints memory because the dedicated memory migrator owns it', () => {
+    const seedMemory = path.join(groupsDir, 'wgx', 'memory');
+    const siblingMemory = path.join(groupsDir, 'wgx-codex', 'memory');
+    fs.mkdirSync(path.join(seedMemory, 'memories'), { recursive: true });
+    fs.writeFileSync(path.join(seedMemory, 'memories', 'fact.md'), 'legacy memory\n');
+    fs.symlinkSync('../wgx/memory', siblingMemory);
+
+    reconcileWorkgroupSharedDirs(db, { groupsDir, dataDir });
+
+    expect(fs.lstatSync(seedMemory).isDirectory()).toBe(true);
+    expect(fs.readFileSync(path.join(seedMemory, 'memories', 'fact.md'), 'utf8')).toBe('legacy memory\n');
+    expect(fs.readlinkSync(siblingMemory)).toBe('../wgx/memory');
+    expect(fs.existsSync(path.join(dataDir, 'workgroups', 'wgx', 'memory'))).toBe(false);
+
+    const marker = JSON.parse(fs.readFileSync(path.join(dataDir, 'workgroups', 'wgx', '.migrated'), 'utf8')) as {
+      moved: string[];
+      candidates: string[];
+    };
+    expect(marker.moved).not.toContain('memory');
+    expect(marker.candidates).not.toContain('memory');
+  });
+
+  it('never adopts canonical memory through generic crash recovery', () => {
+    const seedMemory = path.join(groupsDir, 'wgx', 'memory');
+    const canonicalMemory = path.join(dataDir, 'workgroups', 'wgx', 'memory');
+    const siblingMemory = path.join(groupsDir, 'wgx-codex', 'memory');
+    fs.mkdirSync(path.join(seedMemory, 'memories'), { recursive: true });
+    fs.mkdirSync(path.join(canonicalMemory, 'memories'), { recursive: true });
+    fs.writeFileSync(path.join(seedMemory, 'memories', 'legacy.md'), 'legacy bytes\n');
+    fs.writeFileSync(path.join(canonicalMemory, 'memories', 'canon.md'), 'canonical bytes\n');
+    fs.symlinkSync('../wgx/memory', siblingMemory);
+
+    reconcileWorkgroupSharedDirs(db, { groupsDir, dataDir });
+
+    expect(fs.lstatSync(seedMemory).isDirectory()).toBe(true);
+    expect(fs.readFileSync(path.join(seedMemory, 'memories', 'legacy.md'), 'utf8')).toBe('legacy bytes\n');
+    expect(fs.readFileSync(path.join(canonicalMemory, 'memories', 'canon.md'), 'utf8')).toBe('canonical bytes\n');
+    expect(fs.readlinkSync(siblingMemory)).toBe('../wgx/memory');
+
+    const marker = JSON.parse(fs.readFileSync(path.join(dataDir, 'workgroups', 'wgx', '.migrated'), 'utf8')) as {
+      moved: string[];
+      candidates: string[];
+    };
+    expect(marker.moved).not.toContain('memory');
+    expect(marker.candidates).not.toContain('memory');
+  });
+
   it('cross-filesystem move uses copy+staging and leaves no partial dir', () => {
     // Force sameFilesystem(groupsDir, dataDir) -> false so the copy path runs.
     // sameFilesystem is the only fs.statSync(JS) caller in the migration; cpSync/
@@ -163,5 +216,102 @@ describe('reconcileWorkgroupSharedDirs', () => {
     // And it's recorded as moved (recovery completed the cutover).
     const marker = JSON.parse(fs.readFileSync(path.join(wgDir, '.migrated'), 'utf-8'));
     expect(marker.moved).toContain('repo.partial');
+  });
+});
+
+describe('canonical workgroup memory', () => {
+  let tmp: string;
+  let groupsDir: string;
+  let dataDir: string;
+  let db: Database.Database;
+
+  beforeEach(() => {
+    tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'wg-memory-'));
+    groupsDir = path.join(tmp, 'groups');
+    dataDir = path.join(tmp, 'data');
+    fs.mkdirSync(groupsDir, { recursive: true });
+    fs.mkdirSync(dataDir, { recursive: true });
+    db = setupDb();
+    db.prepare(`INSERT INTO agent_groups (id, folder, workgroup_id) VALUES (?,?,?)`).run(
+      'ag-opencode',
+      'wgx-opencode',
+      'wgx',
+    );
+    for (const folder of ['wgx', 'wgx-codex', 'wgx-opencode']) {
+      fs.mkdirSync(path.join(groupsDir, folder), { recursive: true });
+    }
+  });
+
+  afterEach(() => {
+    db.close();
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it('test_reconcile_links_all_provider_siblings_to_one_canon', () => {
+    const canon = workgroupMemoryDir('wgx', dataDir);
+    fs.mkdirSync(path.join(canon, 'memories'), { recursive: true });
+    fs.writeFileSync(path.join(canon, 'memories', 'shared.md'), 'one authority\n');
+
+    const reports = reconcileWorkgroupMemory(db, { groupsDir, dataDir });
+
+    expect(reports).toEqual([
+      expect.objectContaining({
+        workgroupId: 'wgx',
+        state: { status: 'canonical', basis: 'exact-links-and-canon' },
+      }),
+    ]);
+    for (const folder of ['wgx', 'wgx-codex', 'wgx-opencode']) {
+      const local = path.join(groupsDir, folder, 'memory');
+      expect(fs.lstatSync(local).isSymbolicLink()).toBe(true);
+      expect(fs.readlinkSync(local)).toBe('/workspace/workgroup/memory');
+    }
+    expect(fs.readFileSync(path.join(canon, 'memories', 'shared.md'), 'utf8')).toBe('one authority\n');
+  });
+
+  it('uses one shared per-member primitive for canonical creation and compatibility linking', () => {
+    const result = prepareWorkgroupMemoryMember({ id: 'ag-codex', folder: 'wgx-codex' }, 'wgx', { groupsDir, dataDir });
+
+    expect(result).toEqual({
+      canonicalPath: workgroupMemoryDir('wgx', dataDir),
+      changed: true,
+    });
+    expect(fs.lstatSync(result.canonicalPath).isDirectory()).toBe(true);
+    const local = path.join(groupsDir, 'wgx-codex', 'memory');
+    expect(fs.lstatSync(local).isSymbolicLink()).toBe(true);
+    expect(fs.readlinkSync(local)).toBe('/workspace/workgroup/memory');
+  });
+
+  it('test_reconcile_blocks_substantive_legacy_tree_without_mutation', () => {
+    const legacy = path.join(groupsDir, 'wgx-codex', 'memory');
+    fs.mkdirSync(path.join(legacy, 'memories'), { recursive: true });
+    const payload = Buffer.from('provider-local bytes\n');
+    fs.writeFileSync(path.join(legacy, 'memories', 'fact.md'), payload);
+    const beforeType = fs.lstatSync(legacy).isDirectory();
+    const beforeHash = fs.readFileSync(path.join(legacy, 'memories', 'fact.md'));
+
+    const reports = reconcileWorkgroupMemory(db, { groupsDir, dataDir });
+
+    expect(reports[0].state.status).toBe('migration-required');
+    expect(fs.lstatSync(legacy).isDirectory()).toBe(beforeType);
+    expect(fs.readFileSync(path.join(legacy, 'memories', 'fact.md'))).toEqual(beforeHash);
+    expect(fs.existsSync(workgroupMemoryDir('wgx', dataDir))).toBe(false);
+    expect(fs.existsSync(path.join(groupsDir, 'wgx', 'memory'))).toBe(false);
+    expect(fs.existsSync(path.join(groupsDir, 'wgx-opencode', 'memory'))).toBe(false);
+  });
+
+  it('test_reconcile_allows_only_canonical_or_exact_empty_group', () => {
+    const templateRoot = path.resolve('container/agent-runner/src/memory/templates');
+    const exactEmpty = path.join(groupsDir, 'wgx', 'memory');
+    fs.cpSync(templateRoot, exactEmpty, { recursive: true });
+
+    expect(inspectWorkgroupMemoryState(db, 'wgx', { groupsDir, dataDir })).toEqual({ status: 'exact-empty' });
+
+    fs.appendFileSync(path.join(exactEmpty, 'index.md'), 'x');
+    const before = fs.readFileSync(path.join(exactEmpty, 'index.md'));
+    expect(inspectWorkgroupMemoryState(db, 'wgx', { groupsDir, dataDir }).status).toBe('migration-required');
+    reconcileWorkgroupMemory(db, { groupsDir, dataDir });
+    expect(fs.lstatSync(exactEmpty).isDirectory()).toBe(true);
+    expect(fs.readFileSync(path.join(exactEmpty, 'index.md'))).toEqual(before);
+    expect(fs.existsSync(workgroupMemoryDir('wgx', dataDir))).toBe(false);
   });
 });

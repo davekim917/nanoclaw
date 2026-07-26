@@ -1,5 +1,9 @@
 # /team-auto paused at Stage A (Review) — Cycle 3 cap reached
 
+> **ARCHIVED AND SUPERSEDED — not an active workflow pause.** This spec family
+> records the retired Mnemon/Ollama/daemon architecture. See the
+> [current one-canon design](../workgroup-memory-and-session-capabilities/design.md).
+
 **Stage:** Review
 **Reason:** `cap-reached` (3/3 review cycles consumed)
 **Cycles consumed:** 3/3

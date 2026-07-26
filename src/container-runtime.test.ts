@@ -23,6 +23,7 @@ import {
   stopContainer,
   ensureContainerRuntimeRunning,
   cleanupOrphans,
+  cleanupOrphansStrict,
 } from './container-runtime.js';
 import { CONTAINER_INSTALL_LABEL } from './config.js';
 import { log } from './log.js';
@@ -156,5 +157,32 @@ describe('cleanupOrphans', () => {
       count: 2,
       names: ['nanoclaw-a-1', 'nanoclaw-b-2'],
     });
+  });
+});
+
+describe('cleanupOrphansStrict', () => {
+  it('test_startup_refuses_cutover_when_orphan_absence_is_unproved', () => {
+    mockExecSync.mockImplementationOnce(() => {
+      throw new Error('runtime listing failed');
+    });
+
+    expect(() => cleanupOrphansStrict()).toThrow(/prove install-scoped container absence/);
+    expect(mockExecSync).toHaveBeenCalledTimes(1);
+  });
+
+  it('stops install-scoped containers and proves the postcondition with a second listing', () => {
+    mockExecSync.mockReturnValueOnce('nanoclaw-a-1\n').mockReturnValueOnce('').mockReturnValueOnce('');
+
+    expect(cleanupOrphansStrict()).toEqual(['nanoclaw-a-1']);
+    expect(mockExecSync).toHaveBeenCalledTimes(3);
+    expect(mockExecSync).toHaveBeenNthCalledWith(2, `${CONTAINER_RUNTIME_BIN} stop -t 1 nanoclaw-a-1`, {
+      stdio: 'pipe',
+    });
+  });
+
+  it('throws when an install-scoped container remains after cleanup', () => {
+    mockExecSync.mockReturnValueOnce('nanoclaw-a-1\n').mockReturnValueOnce('').mockReturnValueOnce('nanoclaw-a-1\n');
+
+    expect(() => cleanupOrphansStrict()).toThrow(/still running/);
   });
 });

@@ -2,6 +2,15 @@
 
 Original requirements and design decisions from the project creator.
 
+> **Historical v1 requirements.** This document preserves the original design
+> context; its CLAUDE.md-based global/per-group memory model is not the current
+> v2 contract. Current v2 uses one canonical Markdown tree at
+> `data/workgroups/<workgroup-id>/memory`, shared by every sibling agent group.
+> Agent-group `CLAUDE.md` and `CLAUDE.local.md` files hold provider, identity,
+> persona, and standing instructions, not memory. See [memory.md](memory.md) and
+> [workgroups.md](workgroups.md). Do not use the historical memory instructions
+> below as an operator runbook.
+
 ---
 
 ## Why This Exists

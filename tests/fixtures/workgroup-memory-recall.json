@@ -1,0 +1,229 @@
+{
+  "revision": "2026-07-25.1",
+  "documents": [
+    {
+      "id": "siptrue-wix-current",
+      "source": "archive",
+      "thread": "siptrue",
+      "text": "For SipTrue, DNS is managed in Wix. Mike adds the CNAME records in Wix under Manage DNS Records."
+    },
+    {
+      "id": "siptrue-cloudflare-distractor",
+      "source": "archive",
+      "thread": "siptrue",
+      "text": "The SipTrue application and widget are deployed on Cloudflare Pages."
+    },
+    {
+      "id": "gsc-snowflake",
+      "source": "memory",
+      "thread": "madison-reed",
+      "text": "Google Search Console data is already ingested into Snowflake. Do not try Google Workspace for GSC analysis."
+    },
+    {
+      "id": "looker-rest",
+      "source": "memory",
+      "thread": "madison-reed",
+      "text": "Use the Looker REST API for source-faithful dashboard and explore inspection."
+    },
+    {
+      "id": "correction-support-email",
+      "source": "archive",
+      "thread": "siptrue",
+      "text": "Correction: the support variable is VITE_PUBLIC_SUPPORT_EMAIL, not VITE_SUPPORT_EMAIL."
+    },
+    {
+      "id": "correction-domain-cost",
+      "source": "archive",
+      "thread": "siptrue",
+      "text": "Correction: Supabase custom domains require the Pro plan plus the Custom Domain add-on."
+    },
+    {
+      "id": "slack-link-target",
+      "source": "archive",
+      "thread": "slack-thread",
+      "link": "https://acme.slack.com/archives/C123ABC/p1770000000123456?thread_ts=1770000000.123456",
+      "text": "The launch owner is Priya and the rollback window is Friday."
+    },
+    {
+      "id": "discord-link-target",
+      "source": "archive",
+      "thread": "discord-thread",
+      "link": "https://discord.com/channels/111111111111111111/222222222222222222/333333333333333333",
+      "text": "The approved release color is amber, not green."
+    },
+    {
+      "id": "worktree-sharing",
+      "source": "memory",
+      "thread": "nanoclaw",
+      "text": "Sibling agents in one workgroup share the same thread worktrees while keeping separate provider state."
+    },
+    {
+      "id": "one-canon",
+      "source": "memory",
+      "thread": "nanoclaw",
+      "text": "There is exactly one writable Markdown memory canon for each workgroup."
+    },
+    {
+      "id": "onecli-floor",
+      "source": "memory",
+      "thread": "nanoclaw",
+      "text": "When a dedicated MCP is absent, try the real HTTPS API through the OneCLI gateway before claiming no access."
+    },
+    {
+      "id": "snowflake-ordinal",
+      "source": "memory",
+      "thread": "illysium",
+      "text": "Snowflake ordinal gaps require explicit column ordering during additive schema changes."
+    },
+    {
+      "id": "fivetran-connector",
+      "source": "memory",
+      "thread": "madison-reed",
+      "text": "Fivetran connector state is available from the REST API through the Madison Reed credential scope."
+    },
+    {
+      "id": "hex-context",
+      "source": "memory",
+      "thread": "madison-reed",
+      "text": "Hex Context Studio suggestions are inspected with hex suggestion list."
+    },
+    {
+      "id": "irrelevant-recipes",
+      "source": "archive",
+      "thread": "social",
+      "text": "Sunday dinner was tomato soup and grilled cheese."
+    },
+    {
+      "id": "irrelevant-running",
+      "source": "archive",
+      "thread": "social",
+      "text": "The morning running route loops around the lake."
+    }
+  ],
+  "cases": [
+    {
+      "id": "exact-1",
+      "category": "exact",
+      "query": "Where is SipTrue DNS managed?",
+      "expected": "siptrue-wix-current"
+    },
+    {
+      "id": "exact-2",
+      "category": "exact",
+      "query": "Where is Google Search Console data?",
+      "expected": "gsc-snowflake"
+    },
+    {
+      "id": "exact-3",
+      "category": "exact",
+      "query": "Which API should inspect Looker explores?",
+      "expected": "looker-rest"
+    },
+    {
+      "id": "correction-1",
+      "category": "correction",
+      "query": "What is the corrected support variable?",
+      "expected": "correction-support-email"
+    },
+    {
+      "id": "correction-2",
+      "category": "correction",
+      "query": "What was corrected about Supabase custom domain cost?",
+      "expected": "correction-domain-cost"
+    },
+    {
+      "id": "link-1",
+      "category": "link",
+      "query": "Read https://acme.slack.com/archives/C123ABC/p1770000000123456?thread_ts=1770000000.123456",
+      "expected": "slack-link-target"
+    },
+    {
+      "id": "link-2",
+      "category": "link",
+      "query": "Use https://discord.com/channels/111111111111111111/222222222222222222/333333333333333333",
+      "expected": "discord-link-target"
+    },
+    {
+      "id": "paraphrase-1",
+      "category": "paraphrase",
+      "query": "Which warehouse already has our search console metrics?",
+      "expected": "gsc-snowflake"
+    },
+    {
+      "id": "paraphrase-2",
+      "category": "paraphrase",
+      "query": "How do sibling providers collaborate on a checkout?",
+      "expected": "worktree-sharing"
+    },
+    {
+      "id": "paraphrase-3",
+      "category": "paraphrase",
+      "query": "How many writable Markdown canons should a workgroup have?",
+      "expected": "one-canon"
+    },
+    {
+      "id": "paraphrase-4",
+      "category": "paraphrase",
+      "query": "What should happen before saying an external service is unavailable?",
+      "expected": "onecli-floor"
+    },
+    {
+      "id": "paraphrase-5",
+      "category": "paraphrase",
+      "query": "How are additive Snowflake columns kept in order?",
+      "expected": "snowflake-ordinal"
+    },
+    {
+      "id": "cross-1",
+      "category": "cross_thread",
+      "query": "Where can we inspect Fivetran connector state?",
+      "expected": "fivetran-connector"
+    },
+    {
+      "id": "cross-2",
+      "category": "cross_thread",
+      "query": "How do we list Hex Context Studio suggestions?",
+      "expected": "hex-context"
+    },
+    {
+      "id": "cross-3",
+      "category": "cross_thread",
+      "query": "What provider state stays separate between sibling agents?",
+      "expected": "worktree-sharing"
+    },
+    {
+      "id": "cross-4",
+      "category": "cross_thread",
+      "query": "What owns distilled workgroup memory?",
+      "expected": "one-canon"
+    },
+    {
+      "id": "distractor-1",
+      "category": "distractor",
+      "query": "What was the quarterly insurance premium?",
+      "expected": null
+    },
+    {
+      "id": "distractor-2",
+      "category": "distractor",
+      "query": "Which train reaches Boston before noon?",
+      "expected": null
+    },
+    { "id": "distractor-3", "category": "distractor", "query": "Who won the tennis match?", "expected": null },
+    {
+      "id": "distractor-4",
+      "category": "distractor",
+      "query": "What is the warehouse lease renewal date?",
+      "expected": null
+    },
+    {
+      "id": "distractor-5",
+      "category": "distractor",
+      "query": "How many chairs are in the conference room?",
+      "expected": null
+    },
+    { "id": "no-match-1", "category": "no_match", "query": "zxqv unmatched token constellation", "expected": null },
+    { "id": "no-match-2", "category": "no_match", "query": "Tell me the lunar greenhouse password", "expected": null },
+    { "id": "no-match-3", "category": "no_match", "query": "What is the alpaca veterinary schedule?", "expected": null }
+  ]
+}

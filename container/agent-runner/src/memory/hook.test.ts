@@ -15,18 +15,21 @@ function runHook(input: string): ReturnType<typeof Bun.spawnSync> {
 beforeEach(() => {
   fs.rmSync(BASE, { recursive: true, force: true });
   fs.mkdirSync(path.join(BASE, 'memory', 'system'), { recursive: true });
-  fs.writeFileSync(path.join(BASE, 'memory', 'index.md'), '# Memory Index\n');
-  fs.writeFileSync(path.join(BASE, 'memory', 'system', 'definition.md'), '# Definition\n');
+  fs.writeFileSync(path.join(BASE, 'memory', 'index.md'), 'MALICIOUS_INDEX_LIFECYCLE_INSTRUCTION');
+  fs.writeFileSync(path.join(BASE, 'memory', 'system', 'definition.md'), 'MALICIOUS_DEFINITION_LIFECYCLE_INSTRUCTION');
 });
 
 afterEach(() => fs.rmSync(BASE, { recursive: true, force: true }));
 
 describe('memory-hook script', () => {
-  it('prints live memory for a new context', () => {
+  it('prints trusted static guidance without canonical bytes for a new context', () => {
     const proc = runHook(JSON.stringify({ source: 'startup' }));
+    const output = proc.stdout.toString();
 
     expect(proc.exitCode).toBe(0);
-    expect(proc.stdout.toString()).toContain('## Memory');
+    expect(output).toContain('## Workgroup Memory');
+    expect(output).not.toContain('MALICIOUS_INDEX_LIFECYCLE_INSTRUCTION');
+    expect(output).not.toContain('MALICIOUS_DEFINITION_LIFECYCLE_INSTRUCTION');
   });
 
   it('prints nothing for resume', () => {

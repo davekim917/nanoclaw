@@ -125,10 +125,24 @@ Owner gets seeded during the `/migrate-from-v1` skill's interview phase ("Which 
 **v2:** each group still lives at `groups/<folder>/`, but the shape is richer:
 - `CLAUDE.md` or `AGENTS.md` — **composed at container spawn** from the provider's shared base, standing instructions, and capability fragments. **Don't edit it directly.**
 - `instructions.prepend.md` — provider-neutral standing role, personality, and behavior.
-- `memory/` — provider-neutral durable memory. Its index and system definition are injected when a context window starts.
-- `CLAUDE.local.md` — legacy staging only. The deterministic v1 migration writes the old `CLAUDE.md` here; `/migrate-from-v1` invokes `/migrate-memory` to move and distill it.
+- `memory/` — a compatibility view of the workgroup's provider-neutral durable
+  memory canon at `data/workgroups/<workgroup-id>/memory`.
+- `CLAUDE.local.md` — a byte-preserved standing-instruction/customization
+  surface. The deterministic v1 migration writes the old `CLAUDE.md` here, but
+  it is not a memory migration input.
 - `container.json` — optional per-group container config (apt deps, env, mounts). v1's `registered_groups.container_config` JSON is close but not identical — the migration stores the v1 payload at `groups/<folder>/.v1-container-config.json` for the skill to reconcile, rather than silently mapping it.
 - Provider document fragments are installed at spawn, and the container scaffolds `memory/` without importing legacy files.
+
+`/migrate-memory` losslessly consolidates only discovered group-local memory
+roots and recognized provider-native memory roots into the one workgroup canon.
+It never moves or distills `.seed.md`, `CLAUDE.md`, `CLAUDE.local.md`,
+`instructions.prepend.md`, or another non-memory customization.
+
+When old standing instructions need porting, legacy instruction reconciliation
+is an explicit separate operator workflow: preserve `CLAUDE.local.md`
+byte-for-byte, show and approve any proposed `instructions.prepend.md` change,
+verify the original checksum, and record the result separately. Never move or
+distill an instruction surface into the memory canon.
 
 ---
 

@@ -24,8 +24,10 @@
  * resolves correctly inside the container via the mount, so
  * existing `/workspace/agent/<name>` reader paths keep working with no repoint.
  */
+import { createHash } from 'crypto';
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 
 import type Database from 'better-sqlite3';
 
@@ -39,6 +41,355 @@ export function workgroupSharedDir(workgroupId: string): string {
 
 /** Container path the shared dir is mounted at. */
 export const WORKGROUP_CONTAINER_PATH = '/workspace/workgroup';
+export const WORKGROUP_MEMORY_CONTAINER_PATH = `${WORKGROUP_CONTAINER_PATH}/memory`;
+
+export interface InventoriedSource {
+  groupId: string;
+  folder: string;
+  path: string;
+  type: 'missing' | 'directory' | 'symlink' | 'file' | 'unsupported';
+  size: number;
+  linkTarget?: string;
+}
+
+export type WorkgroupMemoryState =
+  | { status: 'canonical'; basis: 'exact-links-and-canon' | 'verified-manifest' }
+  | { status: 'exact-empty' }
+  | { status: 'migration-required'; sources: InventoriedSource[] };
+
+export interface WorkgroupMemoryReport {
+  workgroupId: string;
+  state: WorkgroupMemoryState;
+  changed: boolean;
+}
+
+export interface WorkgroupMemoryDirs {
+  groupsDir?: string;
+  dataDir?: string;
+  workgroupIds?: string[];
+}
+
+const MEMORY_MANIFEST = '.memory-migration.json';
+// Canonical memory has its own lossless inventory/migration/reconciliation
+// lifecycle below. The older generic shared-directory migrator must never move,
+// adopt, repoint, or report this name, even during crash recovery.
+const RESERVED_SHARED_DIR_NAMES = new Set(['memory']);
+const MEMORY_TEMPLATES_DIR = fileURLToPath(
+  new URL('../../../container/agent-runner/src/memory/templates/', import.meta.url),
+);
+
+function assertTrustedPathSegment(value: string, label: string): void {
+  if (
+    !value ||
+    value === '.' ||
+    value === '..' ||
+    value.includes('/') ||
+    value.includes('\\') ||
+    value.includes('\0')
+  ) {
+    throw new Error(`Invalid ${label}: ${JSON.stringify(value)}`);
+  }
+}
+
+/** Canonical host path. Container-only compatibility links must never be dereferenced by host tools. */
+export function workgroupMemoryDir(workgroupId: string, dataDir: string = DATA_DIR): string {
+  assertTrustedPathSegment(workgroupId, 'workgroup id');
+  return path.resolve(dataDir, 'workgroups', workgroupId, 'memory');
+}
+
+export function workgroupMemoryManifestPath(workgroupId: string, dataDir: string = DATA_DIR): string {
+  return path.join(path.dirname(workgroupMemoryDir(workgroupId, dataDir)), MEMORY_MANIFEST);
+}
+
+export function memoryTreeSha256(root: string): string {
+  const hash = createHash('sha256');
+  const visit = (absolute: string, relative: string): void => {
+    const st = fs.lstatSync(absolute);
+    if (st.isSymbolicLink()) {
+      const target = fs.readlinkSync(absolute);
+      hash.update(`symlink\0${relative}\0${Buffer.byteLength(target)}\0${target}\n`);
+      return;
+    }
+    if (st.isFile()) {
+      const bytes = fs.readFileSync(absolute);
+      hash.update(`file\0${relative}\0${bytes.length}\0`);
+      hash.update(bytes);
+      hash.update('\n');
+      return;
+    }
+    if (!st.isDirectory()) {
+      hash.update(`unsupported\0${relative}\0${st.mode}\0${st.size}\n`);
+      return;
+    }
+    hash.update(`directory\0${relative}\n`);
+    for (const child of fs.readdirSync(absolute).sort()) {
+      visit(path.join(absolute, child), relative ? path.join(relative, child) : child);
+    }
+  };
+  visit(root, '');
+  return hash.digest('hex');
+}
+
+function memoryMembers(db: Database.Database, workgroupId: string): Array<{ id: string; folder: string }> {
+  return db
+    .prepare(`SELECT id, folder FROM agent_groups WHERE workgroup_id = ? ORDER BY folder, id`)
+    .all(workgroupId) as Array<{ id: string; folder: string }>;
+}
+
+function sourceFor(group: { id: string; folder: string }, groupsDir: string): InventoriedSource {
+  assertTrustedPathSegment(group.folder, 'agent group folder');
+  const sourcePath = path.join(groupsDir, group.folder, 'memory');
+  const st = lstatOrNull(sourcePath);
+  if (!st) {
+    return { groupId: group.id, folder: group.folder, path: sourcePath, type: 'missing', size: 0 };
+  }
+  if (st.isSymbolicLink()) {
+    return {
+      groupId: group.id,
+      folder: group.folder,
+      path: sourcePath,
+      type: 'symlink',
+      size: st.size,
+      linkTarget: safeReadlink(sourcePath) ?? undefined,
+    };
+  }
+  if (st.isDirectory()) {
+    return { groupId: group.id, folder: group.folder, path: sourcePath, type: 'directory', size: st.size };
+  }
+  if (st.isFile()) {
+    return { groupId: group.id, folder: group.folder, path: sourcePath, type: 'file', size: st.size };
+  }
+  return { groupId: group.id, folder: group.folder, path: sourcePath, type: 'unsupported', size: st.size };
+}
+
+function sameTreeExact(actual: string, expected: string): boolean {
+  let actualEntries: fs.Dirent[];
+  let expectedEntries: fs.Dirent[];
+  try {
+    actualEntries = fs.readdirSync(actual, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
+    expectedEntries = fs.readdirSync(expected, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name));
+  } catch (error) {
+    if (!(error instanceof Error)) throw error;
+    return false;
+  }
+  if (actualEntries.length !== expectedEntries.length) return false;
+  for (let i = 0; i < expectedEntries.length; i++) {
+    const a = actualEntries[i];
+    const e = expectedEntries[i];
+    if (a.name !== e.name || a.isDirectory() !== e.isDirectory() || a.isFile() !== e.isFile()) return false;
+    const actualPath = path.join(actual, a.name);
+    const expectedPath = path.join(expected, e.name);
+    if (e.isDirectory()) {
+      if (!sameTreeExact(actualPath, expectedPath)) return false;
+    } else if (e.isFile()) {
+      if (!fs.readFileSync(actualPath).equals(fs.readFileSync(expectedPath))) return false;
+    } else {
+      return false;
+    }
+  }
+  return true;
+}
+
+export function isExactShippedMemoryScaffold(memoryPath: string): boolean {
+  const st = lstatOrNull(memoryPath);
+  return !!st && st.isDirectory() && !st.isSymbolicLink() && sameTreeExact(memoryPath, MEMORY_TEMPLATES_DIR);
+}
+
+/**
+ * Prepare one member's view of canonical memory.
+ *
+ * This is the only policy seam that may create a missing canon or replace an
+ * exact shipped scaffold with the container-absolute compatibility link.
+ * Substantive or ambiguous paths always require the operator migration.
+ */
+export function prepareWorkgroupMemoryMember(
+  member: { id: string; folder: string },
+  workgroupId: string,
+  dirs: { groupsDir?: string; dataDir?: string } = {},
+): { canonicalPath: string; changed: boolean } {
+  const groupsDir = dirs.groupsDir ?? GROUPS_DIR;
+  const dataDir = dirs.dataDir ?? DATA_DIR;
+  assertTrustedPathSegment(member.folder, 'agent group folder');
+  const canonicalPath = workgroupMemoryDir(workgroupId, dataDir);
+  const local = path.join(groupsDir, member.folder, 'memory');
+  const canonicalStat = lstatOrNull(canonicalPath);
+  const localStat = lstatOrNull(local);
+
+  if (canonicalStat && (!canonicalStat.isDirectory() || canonicalStat.isSymbolicLink())) {
+    throw new Error(`workgroup memory migration-required: canonical path is not a real directory: ${canonicalPath}`);
+  }
+
+  const exactLink = localStat?.isSymbolicLink() === true && safeReadlink(local) === WORKGROUP_MEMORY_CONTAINER_PATH;
+  const exactScaffold = localStat?.isDirectory() === true && isExactShippedMemoryScaffold(local);
+  if (localStat && !exactLink && !exactScaffold) {
+    throw new Error(`workgroup memory migration-required: substantive provider-local path: ${local}`);
+  }
+  if (exactLink && !canonicalStat) {
+    throw new Error(`workgroup memory migration-required: compatibility link has no real canon: ${local}`);
+  }
+
+  let changed = false;
+  if (!canonicalStat) {
+    fs.mkdirSync(path.dirname(canonicalPath), { recursive: true });
+    if (exactScaffold) {
+      fs.cpSync(local, canonicalPath, { recursive: true, errorOnExist: true, force: false });
+    } else {
+      fs.mkdirSync(canonicalPath);
+    }
+    changed = true;
+  }
+
+  if (!exactLink) {
+    if (exactScaffold) fs.rmSync(local, { recursive: true });
+    fs.mkdirSync(path.dirname(local), { recursive: true });
+    fs.symlinkSync(WORKGROUP_MEMORY_CONTAINER_PATH, local);
+    changed = true;
+  }
+  return { canonicalPath, changed };
+}
+
+function hasVerifiedManifest(workgroupId: string, dataDir: string): boolean {
+  try {
+    const manifest = JSON.parse(fs.readFileSync(workgroupMemoryManifestPath(workgroupId, dataDir), 'utf8')) as {
+      version?: number;
+      workgroupId?: string;
+      status?: string;
+      snapshotDir?: string;
+      canonicalSha256?: string;
+    };
+    return (
+      manifest.version === 1 &&
+      manifest.workgroupId === workgroupId &&
+      manifest.status === 'applied' &&
+      typeof manifest.snapshotDir === 'string' &&
+      path.isAbsolute(manifest.snapshotDir) &&
+      fs.existsSync(manifest.snapshotDir) &&
+      typeof manifest.canonicalSha256 === 'string' &&
+      manifest.canonicalSha256 === memoryTreeSha256(workgroupMemoryDir(workgroupId, dataDir))
+    );
+  } catch (error) {
+    if (!(error instanceof Error)) throw error;
+    return false;
+  }
+}
+
+/**
+ * Inventory one workgroup without mutation. A real provider-local tree is
+ * substantive unless it is byte-for-byte the shipped missing-only scaffold.
+ */
+export function inspectWorkgroupMemoryState(
+  db: Database.Database,
+  workgroupId: string,
+  dirs: WorkgroupMemoryDirs = {},
+): WorkgroupMemoryState {
+  const groupsDir = dirs.groupsDir ?? GROUPS_DIR;
+  const dataDir = dirs.dataDir ?? DATA_DIR;
+  const canonical = workgroupMemoryDir(workgroupId, dataDir);
+  const canonicalStat = lstatOrNull(canonical);
+  const sources = memoryMembers(db, workgroupId).map((member) => sourceFor(member, groupsDir));
+
+  const substantive = sources.filter((source) => {
+    if (source.type === 'missing') return false;
+    if (source.type === 'symlink') return source.linkTarget !== WORKGROUP_MEMORY_CONTAINER_PATH;
+    return source.type !== 'directory' || !isExactShippedMemoryScaffold(source.path);
+  });
+
+  if (!canonicalStat) {
+    // A dangling compatibility link is not proof of canon. It needs the
+    // operator migration rather than silently manufacturing an authority.
+    if (substantive.length > 0 || sources.some((source) => source.type === 'symlink')) {
+      return { status: 'migration-required', sources: sources.filter((source) => source.type !== 'missing') };
+    }
+    return { status: 'exact-empty' };
+  }
+
+  if (!canonicalStat.isDirectory() || canonicalStat.isSymbolicLink() || substantive.length > 0) {
+    return {
+      status: 'migration-required',
+      sources: [
+        {
+          groupId: workgroupId,
+          folder: workgroupId,
+          path: canonical,
+          type: canonicalStat.isSymbolicLink()
+            ? 'symlink'
+            : canonicalStat.isFile()
+              ? 'file'
+              : canonicalStat.isDirectory()
+                ? 'directory'
+                : 'unsupported',
+          size: canonicalStat.size,
+          linkTarget: canonicalStat.isSymbolicLink() ? (safeReadlink(canonical) ?? undefined) : undefined,
+        },
+        ...substantive,
+      ],
+    };
+  }
+
+  return {
+    status: 'canonical',
+    basis: hasVerifiedManifest(workgroupId, dataDir) ? 'verified-manifest' : 'exact-links-and-canon',
+  };
+}
+
+function linkMembersToCanonical(
+  db: Database.Database,
+  workgroupId: string,
+  groupsDir: string,
+  dataDir: string,
+): boolean {
+  let changed = false;
+  const members = memoryMembers(db, workgroupId).sort((left, right) => {
+    const leftScaffold = isExactShippedMemoryScaffold(path.join(groupsDir, left.folder, 'memory'));
+    const rightScaffold = isExactShippedMemoryScaffold(path.join(groupsDir, right.folder, 'memory'));
+    return Number(rightScaffold) - Number(leftScaffold);
+  });
+  for (const member of members) {
+    const prepared = prepareWorkgroupMemoryMember(member, workgroupId, { groupsDir, dataDir });
+    changed = prepared.changed || changed;
+  }
+  return changed;
+}
+
+/**
+ * Canonical-only automatic reconciliation. It may materialize a genuinely
+ * empty/scaffold-only canon and compatibility links, but never imports or
+ * replaces substantive provider-local bytes.
+ */
+export function reconcileWorkgroupMemory(
+  db: Database.Database,
+  dirs: WorkgroupMemoryDirs = {},
+): WorkgroupMemoryReport[] {
+  const groupsDir = dirs.groupsDir ?? GROUPS_DIR;
+  const dataDir = dirs.dataDir ?? DATA_DIR;
+  const selected = dirs.workgroupIds ? new Set(dirs.workgroupIds) : null;
+  const workgroups = db.prepare(`SELECT id FROM workgroups ORDER BY id`).all() as Array<{ id: string }>;
+  const reports: WorkgroupMemoryReport[] = [];
+
+  for (const { id } of workgroups) {
+    if (selected && !selected.has(id)) continue;
+    const before = inspectWorkgroupMemoryState(db, id, { groupsDir, dataDir });
+    if (before.status === 'migration-required') {
+      reports.push({ workgroupId: id, state: before, changed: false });
+      continue;
+    }
+
+    let changed = false;
+    const canonical = workgroupMemoryDir(id, dataDir);
+    if (before.status === 'exact-empty' && memoryMembers(db, id).length === 0) {
+      fs.mkdirSync(path.dirname(canonical), { recursive: true });
+      fs.mkdirSync(canonical);
+      changed = true;
+    }
+    changed = linkMembersToCanonical(db, id, groupsDir, dataDir) || changed;
+    reports.push({
+      workgroupId: id,
+      state: inspectWorkgroupMemoryState(db, id, { groupsDir, dataDir }),
+      changed,
+    });
+  }
+  return reports;
+}
 
 interface MigrationReport {
   migratedAt: string;
@@ -88,6 +439,7 @@ function migrateWorkgroup(db: Database.Database, workgroupId: string, groupsDir:
   for (const entry of fs.readdirSync(seedDir, { withFileTypes: true })) {
     if (!entry.isDirectory() || entry.isSymbolicLink()) continue; // dirs only, not symlinks
     if (entry.name.startsWith('.') || entry.name === 'node_modules') continue; // dotdirs/build
+    if (RESERVED_SHARED_DIR_NAMES.has(entry.name)) continue; // owned by a dedicated migrator
     const full = path.join(seedDir, entry.name);
     if (entry.name === 'sources' || entry.name === 'conversations' || isGitRepo(full)) {
       shared.add(entry.name);
@@ -108,6 +460,7 @@ function migrateWorkgroup(db: Database.Database, workgroupId: string, groupsDir:
     for (const e of entries) {
       if (!e.isSymbolicLink()) continue;
       if (e.name.startsWith('.') || e.name === 'node_modules') continue; // match the seed scan: never share dot/build dirs
+      if (RESERVED_SHARED_DIR_NAMES.has(e.name)) continue;
       const seedEntry = path.join(seedDir, e.name);
       if (isRealDir(seedEntry)) {
         shared.add(e.name);
@@ -129,13 +482,17 @@ function migrateWorkgroup(db: Database.Database, workgroupId: string, groupsDir:
   // excluding a real shared dir whose name happens to end in `.partial`.
   try {
     for (const e of fs.readdirSync(wgDir, { withFileTypes: true })) {
-      if (e.isDirectory() && !e.name.startsWith('.')) {
+      if (e.isDirectory() && !e.name.startsWith('.') && !RESERVED_SHARED_DIR_NAMES.has(e.name)) {
         shared.add(e.name);
       }
     }
   } catch {
     /* wgDir doesn't exist yet (first run) — nothing to recover */
   }
+
+  // Defense in depth: a reserved name can never reach the mutating loop even
+  // if another discovery source is added without applying the filters above.
+  for (const name of RESERVED_SHARED_DIR_NAMES) shared.delete(name);
 
   if (shared.size === 0) {
     log.info('reconcileWorkgroupSharedDirs: nothing to consolidate', { workgroupId });

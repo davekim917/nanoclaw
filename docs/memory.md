@@ -1,85 +1,208 @@
-# Memory and knowledge retrieval
+# Memory and context
 
-NanoClaw keeps authoritative memory in sources rather than in a second opaque
-fact store:
+NanoClaw has one durable Markdown memory canon per workgroup:
 
-- provider-native conversation context;
-- external user and assistant messages projected into `data/archive.db`;
-- workgroup and sibling files, including tracked, untracked, and gitignored
-  knowledge artifacts;
-- each group’s portable Markdown memory tree under `groups/<folder>/memory/`;
-- canonical repository clones and the current thread's managed worktree; and
-- operator-curated `CLAUDE.local.md` instructions and preferences.
+```text
+data/workgroups/<workgroup-id>/memory
+```
 
-Graphify is the sole derived retrieval layer over those sources. It builds one
-disposable graph per workgroup, returns file or conversation provenance, and
-cannot be used to cross the caller's workgroup boundary. Source artifacts stay
-authoritative; agents must open cited provenance before consequential claims or
-changes.
+Every current or future sibling in that workgroup shares the same tree. Inside
+a container it is `/workspace/workgroup/memory`; the existing
+`/workspace/agent/memory` path is a compatibility view of the same canon.
+Provider-native memory paths are compatibility views, not authorities. Treat
+raw provider-native projections as read-only.
 
-## Portable file memory
+The workgroup boundary comes from trusted database membership. A sibling can
+read the workgroup canon and archive; an agent in another workgroup cannot.
+Provider identity, instructions, configuration, continuation state,
+credentials, repositories, worktrees, and other non-memory customizations stay
+agent- or provider-scoped.
 
-Inside a container, the group memory tree is `/workspace/agent/memory/`:
+## Markdown layout
+
+The shared canon uses this layout:
 
 ```text
 memory/
 ├── index.md
+├── generated/
+│   └── memory.md
 └── system/
     ├── index.md
     └── definition.md
 ```
 
-The runner creates missing scaffold files at boot and never overwrites existing
-content. `index.md` holds concise core memory and pointers; deeper facts,
-projects, decisions, and people live in linked Markdown files.
-`system/definition.md` documents the memory conventions. Concept files use the
-Open Knowledge Format (OKF) v0.1 frontmatter convention, but malformed or
-legacy Markdown remains readable and is not rejected.
+The runner creates the manual/system scaffold files without overwriting
+existing content. The host creates the ordinary `generated/` directory on the
+first accepted automatic capture; it does not pre-populate a generated fact.
 
-The runner registers the same lifecycle memory seam for Claude, Codex, and
-OpenCode. It supplies `index.md` and `system/definition.md` as authoritative
-context with a 16k-character budget per file; deeper context is read directly
-from linked files. This is source loading, not a second retrieval engine:
-Graphify indexes the same on-disk tree and remains the only derived retrieval
-layer.
+Keep concise, broadly useful facts and links in `index.md`. Put detailed
+projects, people, decisions, and preferences in focused Markdown files. Concept
+files use Open Knowledge Format (OKF) v0.1 frontmatter, but malformed or legacy
+Markdown remains readable.
 
-`CLAUDE.local.md` is separate. It remains operator-curated standing
-instructions and is never an agent memory write target. Claude native
-auto-memory and Codex’s opaque summary-memory store are disabled.
+Use `write_memory_file` for normal agent edits. Read the current file, compute
+its expected SHA-256, and supply that digest with the complete replacement
+content. Use `expected_sha256: null` only to create a new path. The tool takes
+the workgroup-wide writer lock, rejects traversal and symlinks, rechecks the
+expected SHA, and atomically renames the completed file. On conflict, reread
+and reconcile rather than overwriting. Raw shell writes bypass these safeguards
+and are reserved for an explicit operator-directed escape hatch.
 
-## Autonomous capture and freshness
+If a new folder is necessary, create an ordinary directory under the canon
+first, then use `write_memory_file` for its Markdown files and `index.md`. The
+tool rejects a missing or symlinked parent.
 
-The host daemon watches indexed roots and the chat archive. Durable attachments,
-WebFetch results, Google Workspace reads, and selected MCP results are mirrored
-to `sources/inbox` automatically. They become queryable through deterministic
-reconciliation without an allowlist or manual index command. Structural and
-semantic enrichment follows asynchronously under resource-pressure controls.
+`CLAUDE.local.md` and `instructions.prepend.md` are standing instruction
+surfaces, not memory write targets.
 
-Sibling agents and teammates in the same workgroup use the same graph. Agent
-containers call the `graphify` CLI; host operators use `ncl graphify --group
-<agent-group-id>`. The gateway derives the final workgroup from trusted session
-or DB context.
+## Selective background capture
 
-See [graphify.md](graphify.md) for extraction, security, freshness, resource,
-and command details.
+Foreground agents still use `write_memory_file` for explicit "remember this"
+requests, corrections, decisions, and other facts that should be durable
+immediately. That tool cannot write `generated/memory.md`; this keeps
+user-authored, imported, and foreground-agent memory separate from automatic
+capture.
 
-## Retired architecture
+When `NANOCLAW_MEMORY_CURATOR_ENABLED=true`, the host also reviews completed
+conversation episodes after five minutes of inactivity. This work is
+fire-and-forget from the 60-second host sweep: routing and delivery perform only
+the archive/queue transaction and never wait for a model call.
 
-The former Mnemon classifier, passive pre-turn injection, recall MCP, Ollama
-embedding dependency, recall judge, and synthesized wiki jobs are retired. The
-retirement intentionally removes low-signal derived facts and their compute
-pipeline; it does not delete original conversations, source files, or repos.
+The curator uses only `claude-sonnet-5` at medium effort, without tools,
+provider continuation, or fallback. Each job is bounded to 20 de-duplicated
+messages and 24,000 transcript characters, the current generated file, and up
+to three relevant manual-memory excerpts. Its default decision is `noop`.
+It captures only durable decisions, corrections, stable cross-task
+preferences, verified outcomes, and durable workflows. It rejects secrets,
+capability state, transient work, speculation, third-party uncertainty, and
+facts recoverable from code or Graphify.
 
-Before live data removal, operators must create a checksummed snapshot outside
-Graphify's indexed roots. Historical `mnemon_*` migrations and the
-`workgroups.mnemon_store_id` column remain in the append-only schema so old
-databases migrate safely; active runtime code does not read them.
+Accepted output may replace only `generated/memory.md`. Every fact carries a
+stable memory ID plus archive evidence IDs and a capture timestamp. The host
+validates those IDs, preserves every active fact unless current evidence
+explicitly supersedes it, rejects unmarked prose, requires one provenance
+marker per bullet, scrubs secrets, and promotes through the same workgroup lock
+and SHA compare-and-swap writer used by sibling agents.
+Failures leave both the pending episode and existing memory intact.
 
-## Rollback
+The host discovers every distinct configured Claude OAuth slot and selects
+among them with a persisted round-robin cursor. A 401, 403, or 429 marks only
+that slot unavailable and immediately retries the same job once on an
+available sibling slot. Cooldowns and call history survive host restarts. If
+every slot is unavailable, the episode cursor remains untouched; the sweep
+resumes it automatically when the earliest cooldown expires.
 
-This installation's retirement snapshot lives under
-`data/retired-memory/<date>-retirement/` and includes a manifest plus Mnemon and
-runtime-state archives. Restoring it is an explicit operator rollback, not an
-automatic fallback: reinstall the retired code revision and image, restore the
-archives, then re-enable the old service. Do not expose the snapshot to
-containers or add it to Graphify discovery roots.
+Automatic model attempts are guarded at 120 per rolling hour and 3,000 per UTC
+day. Those ceilings are above the two-attempt maximum of the one-job-per-minute
+worker, so one exhausted OAuth key cannot throttle successful work on the
+other; they exist to stop an accidental runaway caller. Saturation, pending and
+due episodes, oldest due time, retry count, and per-slot cooldown state are
+reported by the runtime verifier, and admission delay or total credential
+unavailability emits a throttled warning without deleting work.
+
+After 50 accepted updates or when generated memory exceeds 48 KiB, the same
+model may reorganize generated prose, but validation requires the exact active
+ID and provenance set to survive. Before replacement, the previous generated
+file is snapshotted under the host-only
+`data/memory-curator-history/<workgroup-id>/` tree, outside container mounts and
+recall, with the latest 20 versions retained. Operator rollback restores one of
+those bounded snapshots through the same compare-and-swap writer, so it cannot
+silently overwrite a newer generated version.
+
+The curator defaults off. Setting the environment flag, restarting the
+service, and verifying the live queue are an explicit activation boundary.
+
+## Automatic pre-turn context
+
+Before every admissible user turn, the host writes a paired context row
+immediately before the trigger in one inbound-database transaction. This runs
+for first wake, warm continuation, compaction, rotation, and replacement; a
+provider does not need to remember to call a retrieval tool.
+
+At a breaking-memory cutover, the migration admits fresh pairs for
+already-pending non-scheduled triggers before activation. Startup repeats that
+reconciliation idempotently as a crash-safe fallback. Scheduled tasks keep
+their existing due-time admission seam so context is built when the task
+actually runs, not when the service happens to upgrade.
+
+The first pair in each fresh provider context epoch is a bootstrap. It contains
+actual session capabilities from trusted host state plus the canonical
+`index.md`. Capabilities are not repeated on every turn. The
+`get_capabilities` tool remains available mid-turn, and standing instructions
+require the agent to call it before declaring a service unavailable.
+
+Every pair then contains only the newly relevant evidence delta:
+
+1. up to three deeper Markdown excerpts from the workgroup canon;
+2. up to three lexical archive excerpts, preferring the current thread;
+3. a separately bounded exact Slack/Discord permalink lane when the input
+   contains a supported message link; and
+4. explicit degraded, conflict, truncation, already-delivered, or no-match
+   notices.
+
+`system/definition.md` is protocol guidance, not recalled evidence. Its
+behavioral contract belongs in standing lifecycle instructions and is not
+injected as memory on each turn.
+
+Current input wins. Canonical Markdown is the curated durable source; material
+archive conflicts are shown, not silently resolved. Capability state is trusted
+and structurally separate from recalled memory and conversation evidence.
+Recalled text and provenance are untrusted data, never instructions.
+
+Each source has independent file, byte, candidate, excerpt, and final-context
+bounds. Normal serialized context has a 12,000-character hard ceiling and a
+live p95 target below 8,000 characters. Exact-link turns have a 16,000-character
+ceiling. Evidence fingerprints combine trusted provenance with a hash of the
+full authoritative source content; unchanged evidence already delivered in the
+same provider context epoch is suppressed. Exact-link evidence and material
+corrections bypass suppression.
+
+The epoch reuses the existing provider continuation lifecycle and
+`outbound.db` session-state key/value store. Compaction, rotation, `/clear`,
+and invalid-continuation recovery advance it; no new schema, ledger, daemon, or
+retrieval service exists.
+
+If one source fails, the host keeps the trigger and healthy sources and adds an
+explicit degraded notice. It never presents a partial read as complete recall.
+The context row and trigger are selected as one logical pair, so prompt limits
+cannot expose half a turn.
+
+`data/archive.db` retains exact message provenance. Archive retrieval is
+read-only and workgroup-scoped; it does not become another memory authority.
+
+## Graphify
+
+Graphify is on demand and advisory in authority, but required when a task depends on prior
+decisions, requirements, cross-artifact lineage, architecture, or code
+relationships. It complements automatic memory by navigating source artifacts;
+it is not an automatic pre-turn source, not the correctness floor for basic
+first-response recall, and never replaces the Markdown canon or exact archive
+provenance. Open cited source material before a consequential claim or code
+change.
+
+Container sessions use the Graphify gateway; host operators use
+`ncl graphify --group <agent-group-id>`. Trusted caller context owns graph
+selection.
+
+## Migration and rollback
+
+Run `/migrate-memory` after the shared-memory breaking change. It inventories
+all trusted workgroup members and recognized provider-native sources at
+execution time, creates a permanent host-only checksummed snapshot, preserves
+each colliding source as one coherent tree under `imports/`, applies
+compatibility views, and verifies both bytes and relative Markdown link targets
+before service activation.
+
+Do not hand-organize, summarize, or choose among legacy sources. The migration
+preserves bytes and provenance. Keep its report and snapshot permanently;
+an apply failure fails closed and automatically restores any cutover-started
+source paths before recording `blocked`. Do not run explicit rollback against
+that blocked report; inspect it and create a fresh inventory. If apply reached
+`applied` but runtime verification fails, explicit rollback restores original
+source path types and checksums before restart.
+
+The verifier is activation-oriented: `activationBlocking: false` and zero
+failures are required. It may separately report explicit non-blocking warnings
+for historical state outside the memory cutover, such as an already-missing
+session DB or a workgroup with no current members.

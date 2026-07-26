@@ -29,19 +29,42 @@ function now(): string {
   return new Date().toISOString();
 }
 
-function readInbound(agentGroupId: string, sessionId: string) {
+function readPairedInboundTriggers(agentGroupId: string, sessionId: string) {
   const db = new Database(inboundDbPath(agentGroupId, sessionId), { readonly: true });
   const rows = db
-    .prepare('SELECT id, platform_id, channel_type, content, source_session_id FROM messages_in ORDER BY seq')
+    .prepare(
+      'SELECT id, seq, kind, trigger, platform_id, channel_type, content, source_session_id FROM messages_in ORDER BY seq',
+    )
     .all() as Array<{
     id: string;
+    seq: number;
+    kind: string;
+    trigger: number;
     platform_id: string | null;
     channel_type: string | null;
     content: string;
     source_session_id: string | null;
   }>;
   db.close();
-  return rows;
+  const triggers = rows.filter((row) => row.trigger === 1 && row.kind !== 'system');
+  const recallRows = rows.filter((row) => {
+    if (row.kind !== 'system' || row.trigger !== 0) return false;
+    const content = JSON.parse(row.content) as { subtype?: string };
+    return content.subtype === 'recall_context';
+  });
+  expect(recallRows).toHaveLength(triggers.length);
+  for (const trigger of triggers) {
+    const index = rows.indexOf(trigger);
+    const recall = rows[index - 1];
+    expect(recall).toMatchObject({
+      id: `recall-${trigger.id}`,
+      kind: 'system',
+      trigger: 0,
+      seq: trigger.seq - 2,
+    });
+    expect(JSON.parse(recall!.content)).toMatchObject({ subtype: 'recall_context' });
+  }
+  return triggers;
 }
 
 describe('isSafeAttachmentName', () => {
@@ -178,7 +201,7 @@ describe('routeAgentMessage return-path', () => {
       S1,
     );
 
-    const bRows = readInbound(B, SB.id);
+    const bRows = readPairedInboundTriggers(B, SB.id);
     expect(bRows).toHaveLength(1);
     expect(bRows[0].platform_id).toBe(A);
     expect(bRows[0].source_session_id).toBe(S1.id); // <- the return address
@@ -198,7 +221,7 @@ describe('routeAgentMessage return-path', () => {
 
     // Capture the synthetic id the host stamped on B's inbound — that's what
     // B's container would reference as `in_reply_to` when replying.
-    const bRows = readInbound(B, SB.id);
+    const bRows = readPairedInboundTriggers(B, SB.id);
     const yId = bRows[0].id;
 
     // B replies to that message.
@@ -212,8 +235,8 @@ describe('routeAgentMessage return-path', () => {
       SB,
     );
 
-    const s1Rows = readInbound(A, S1.id);
-    const s2Rows = readInbound(A, S2.id);
+    const s1Rows = readPairedInboundTriggers(A, S1.id);
+    const s2Rows = readPairedInboundTriggers(A, S2.id);
 
     // The reply lands in S1 (originator) even though S2 is newer.
     expect(s1Rows).toHaveLength(1);
@@ -235,8 +258,8 @@ describe('routeAgentMessage return-path', () => {
     );
 
     // Newest session wins (current heuristic, preserved).
-    const s1Rows = readInbound(A, S1.id);
-    const s2Rows = readInbound(A, S2.id);
+    const s1Rows = readPairedInboundTriggers(A, S1.id);
+    const s2Rows = readPairedInboundTriggers(A, S2.id);
     expect(s1Rows).toHaveLength(0);
     expect(s2Rows).toHaveLength(1);
   });
@@ -268,8 +291,8 @@ describe('routeAgentMessage return-path', () => {
       SB,
     );
 
-    const s1Rows = readInbound(A, S1.id);
-    const s2Rows = readInbound(A, S2.id);
+    const s1Rows = readPairedInboundTriggers(A, S1.id);
+    const s2Rows = readPairedInboundTriggers(A, S2.id);
     // Affinity wins: reply to S1, not the newer S2.
     expect(s1Rows).toHaveLength(1);
     expect(JSON.parse(s1Rows[0].content).text).toBe('standing by');
@@ -282,7 +305,7 @@ describe('routeAgentMessage return-path', () => {
       { id: 'msg-fwd', platform_id: B, content: JSON.stringify({ text: 'hello' }), in_reply_to: null },
       S1,
     );
-    const bRows = readInbound(B, SB.id);
+    const bRows = readPairedInboundTriggers(B, SB.id);
     const inboundId = bRows[0].id;
 
     // Close S1 — simulates session cleanup or channel disconnect.
@@ -294,8 +317,8 @@ describe('routeAgentMessage return-path', () => {
       SB,
     );
 
-    const s1Rows = readInbound(A, S1.id);
-    const s2Rows = readInbound(A, S2.id);
+    const s1Rows = readPairedInboundTriggers(A, S1.id);
+    const s2Rows = readPairedInboundTriggers(A, S2.id);
     expect(s1Rows).toHaveLength(0);
     expect(s2Rows).toHaveLength(1);
   });
@@ -323,7 +346,7 @@ describe('routeAgentMessage return-path', () => {
       { id: 'msg-from-C', platform_id: B, content: JSON.stringify({ text: 'from C' }), in_reply_to: null },
       SC,
     );
-    const bRows = readInbound(B, SB.id);
+    const bRows = readPairedInboundTriggers(B, SB.id);
     const cInboundId = bRows.find((r) => r.platform_id === C)!.id;
 
     // B replies to A, but in_reply_to references the C-originated row.
@@ -338,8 +361,8 @@ describe('routeAgentMessage return-path', () => {
       SB,
     );
 
-    const s1Rows = readInbound(A, S1.id);
-    const s2Rows = readInbound(A, S2.id);
+    const s1Rows = readPairedInboundTriggers(A, S1.id);
+    const s2Rows = readPairedInboundTriggers(A, S2.id);
     expect(s1Rows).toHaveLength(0);
     expect(s2Rows).toHaveLength(1);
   });
@@ -368,8 +391,8 @@ describe('routeAgentMessage return-path', () => {
       SB,
     );
 
-    const s1Rows = readInbound(A, S1.id);
-    const s2Rows = readInbound(A, S2.id);
+    const s1Rows = readPairedInboundTriggers(A, S1.id);
+    const s2Rows = readPairedInboundTriggers(A, S2.id);
     expect(s1Rows).toHaveLength(0);
     expect(s2Rows).toHaveLength(1);
   });
@@ -382,7 +405,7 @@ describe('routeAgentMessage return-path', () => {
     );
 
     // Lands in S2 (newest active session of A via resolveSession fallback).
-    const s2Rows = readInbound(A, S2.id);
+    const s2Rows = readPairedInboundTriggers(A, S2.id);
     expect(s2Rows).toHaveLength(1);
     expect(JSON.parse(s2Rows[0].content).text).toBe('self-note');
   });
@@ -399,8 +422,8 @@ describe('routeAgentMessage return-path', () => {
       S1,
     );
 
-    expect(readInbound(A, S1.id)).toHaveLength(0);
-    expect(readInbound(A, S2.id)).toHaveLength(0);
+    expect(readPairedInboundTriggers(A, S1.id)).toHaveLength(0);
+    expect(readPairedInboundTriggers(A, S2.id)).toHaveLength(0);
   });
 
   it('drops a chat response that loops back into the exact same session', async () => {
@@ -408,7 +431,7 @@ describe('routeAgentMessage return-path', () => {
       { id: 'self-seed', kind: 'chat', platform_id: A, content: '{"text":"seed"}', in_reply_to: null },
       S2,
     );
-    const seedInbound = readInbound(A, S2.id);
+    const seedInbound = readPairedInboundTriggers(A, S2.id);
     expect(seedInbound).toHaveLength(1);
     expect(seedInbound[0].source_session_id).toBe(S2.id);
 
@@ -423,7 +446,7 @@ describe('routeAgentMessage return-path', () => {
       S2,
     );
 
-    expect(readInbound(A, S2.id)).toHaveLength(1);
+    expect(readPairedInboundTriggers(A, S2.id)).toHaveLength(1);
   });
 
   it('BUG: no volume cap on a2a routing — unbounded ping-pong is allowed (#2063)', async () => {
@@ -447,9 +470,9 @@ describe('routeAgentMessage return-path', () => {
     }
     // BUG: all 40 messages go through — no cap, no throttle.
     // Once loop prevention lands, this should throw or reject after a threshold.
-    const bRows = readInbound(B, SB.id);
-    const s1Rows = readInbound(A, S1.id);
-    const s2Rows = readInbound(A, S2.id);
+    const bRows = readPairedInboundTriggers(B, SB.id);
+    const s1Rows = readPairedInboundTriggers(A, S1.id);
+    const s2Rows = readPairedInboundTriggers(A, S2.id);
     expect(errors).toHaveLength(0);
     expect(bRows).toHaveLength(20);
     expect(s1Rows.length + s2Rows.length).toBe(20);
@@ -471,7 +494,7 @@ describe('routeAgentMessage return-path', () => {
       S1,
     );
 
-    const bRows = readInbound(B, SB.id);
+    const bRows = readPairedInboundTriggers(B, SB.id);
     expect(bRows).toHaveLength(1);
     const parsed = JSON.parse(bRows[0].content);
     expect(parsed.attachments).toHaveLength(1);
@@ -502,7 +525,7 @@ describe('routeAgentMessage return-path', () => {
       S1,
     );
 
-    const bRows = readInbound(B, SB.id);
+    const bRows = readPairedInboundTriggers(B, SB.id);
     expect(bRows).toHaveLength(1);
     const parsed = JSON.parse(bRows[0].content);
     expect(parsed.attachments).toHaveLength(0);
@@ -538,7 +561,7 @@ describe('routeAgentMessage return-path', () => {
     );
 
     // Message still routes — just with no attachments.
-    const bRows = readInbound(B, SB.id);
+    const bRows = readPairedInboundTriggers(B, SB.id);
     expect(bRows).toHaveLength(1);
     expect(JSON.parse(bRows[0].content).attachments).toHaveLength(0);
 
@@ -623,7 +646,7 @@ describe('routeAgentMessage return-path', () => {
       S1,
     );
 
-    const bRows = readInbound(B, SB.id);
+    const bRows = readPairedInboundTriggers(B, SB.id);
     expect(bRows).toHaveLength(1);
     const parsed = JSON.parse(bRows[0].content);
     expect(parsed.attachments).toHaveLength(1);

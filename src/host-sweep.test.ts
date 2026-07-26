@@ -20,6 +20,7 @@ import {
   SESSION_ARTIFACT_IDLE_MS,
   SPAWN_GRACE_MS,
   _notifyKillCeilingForTesting,
+  _prepareDueWakeForTesting,
   _resetStuckProcessingRowsForTesting,
   _sweepTaskWatchdogForTesting,
   autoArchiveOldCompleted,
@@ -44,6 +45,7 @@ const mockTransitionToTerminal = vi.fn();
 const mockGetCapabilityConfig = vi.fn();
 const mockPendingTerminalDispatchOutboundSeenAt = vi.fn();
 const mockWriteSessionMessage = vi.fn();
+const mockAdmitDueTaskContexts = vi.fn().mockReturnValue(0);
 const mockWakeContainer = vi.fn();
 const mockIsContainerRunning = vi.fn();
 const mockHasContainerEverRun = vi.fn();
@@ -76,6 +78,7 @@ vi.mock('./session-manager.js', async (importOriginal) => {
   const real = await importOriginal<typeof import('./session-manager.js')>();
   return {
     ...real,
+    admitDueTaskContexts: (...args: unknown[]) => mockAdmitDueTaskContexts(...args),
     writeSessionMessage: (...args: unknown[]) => mockWriteSessionMessage(...args),
     outboundDbPath: real.outboundDbPath,
   };
@@ -473,6 +476,25 @@ describe('deleteOrphanProcessingClaims', () => {
   });
 });
 
+describe('scheduled due admission precedes wake classification', () => {
+  it('counts and classifies the trigger inserted by the admission seam', () => {
+    const { inDb } = makeSessionDbs();
+    mockAdmitDueTaskContexts.mockImplementationOnce((db: Database.Database) => {
+      db.prepare(
+        `INSERT INTO messages_in
+           (id, seq, kind, timestamp, status, process_after, recurrence, series_id, trigger, content)
+         VALUES ('task-admitted', 2, 'task', ?, 'pending', ?, NULL, 'task-admitted', 1, '{}')`,
+      ).run(new Date().toISOString(), new Date(Date.now() - 1_000).toISOString());
+      return 1;
+    });
+
+    const result = _prepareDueWakeForTesting(inDb, 'ag-test', 'sess-test');
+
+    expect(mockAdmitDueTaskContexts).toHaveBeenCalledWith(inDb, 'ag-test', 'sess-test');
+    expect(result).toEqual({ admittedTasks: 1, dueCount: 1, wakePriority: 'scheduled' });
+  });
+});
+
 describe('resetStuckProcessingRows — orphan claim cleanup', () => {
   it('deletes orphan processing_ack rows so next sweep tick does not see them', () => {
     const { inDb, outDb } = makeSessionDbs();
@@ -506,6 +528,54 @@ describe('resetStuckProcessingRows — orphan claim cleanup', () => {
     expect(row.status).toBe('pending');
     expect(row.tries).toBe(1);
     expect(row.process_after).not.toBeNull();
+  });
+
+  it('makes a paired crashed turn inert with its recall until fresh due admission', () => {
+    const { inDb, outDb } = makeSessionDbs();
+    const claimedAt = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+    inDb
+      .prepare(
+        `INSERT INTO messages_in
+           (id, seq, kind, timestamp, status, process_after, tries, trigger, content)
+         VALUES ('recall-m-paired', 2, 'system', ?, 'pending', ?, 0, 0, ?),
+                ('m-paired', 4, 'chat', ?, 'pending', ?, 0, 1, ?)`,
+      )
+      .run(
+        claimedAt,
+        claimedAt,
+        JSON.stringify({ subtype: 'recall_context', revision: 'before-crash' }),
+        claimedAt,
+        claimedAt,
+        JSON.stringify({ text: 'retry me' }),
+      );
+    outDb.prepare("INSERT INTO processing_ack VALUES ('m-paired', 'processing', ?)").run(claimedAt);
+
+    _resetStuckProcessingRowsForTesting(inDb, outDb, fakeSession(), 'container-crash');
+
+    const pair = inDb.prepare('SELECT id, trigger, tries, process_after FROM messages_in ORDER BY seq').all() as Array<{
+      id: string;
+      trigger: number;
+      tries: number;
+      process_after: string | null;
+    }>;
+    expect(pair).toHaveLength(2);
+    expect(pair[0]).toMatchObject({ id: 'recall-m-paired', trigger: 0, tries: 0 });
+    expect(pair[1]).toMatchObject({ id: 'm-paired', trigger: 0, tries: 1 });
+    expect(pair[0]!.process_after).not.toBeNull();
+    expect(pair[0]!.process_after).toBe(pair[1]!.process_after);
+    expect(
+      (
+        inDb
+          .prepare(
+            `SELECT COUNT(*) AS count
+               FROM messages_in
+              WHERE status = 'pending' AND trigger = 1
+                AND (process_after IS NULL OR datetime(process_after) <= datetime('now'))`,
+          )
+          .get() as { count: number }
+      ).count,
+    ).toBe(0);
+    expect(getProcessingClaims(outDb)).toEqual([]);
   });
 
   it('still clears orphan claims even when the inbound message has already been retried (skip path)', () => {

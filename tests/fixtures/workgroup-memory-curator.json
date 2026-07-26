@@ -1,0 +1,202 @@
+{
+  "schemaVersion": 1,
+  "corpusSha256": "9443641dc1ba547e496d9dac6c27f287f2918ca51a468660d8b4676618ac950b",
+  "scoring": {
+    "falsePositive": 5,
+    "falseNegative": 1,
+    "wrongReason": 1,
+    "incompleteMemory": 1,
+    "sensitiveLeak": 10
+  },
+  "candidates": [
+    {
+      "id": "sonnet-5-medium",
+      "provider": "anthropic",
+      "model": "claude-sonnet-5",
+      "effort": "medium"
+    },
+    {
+      "id": "sonnet-5-high",
+      "provider": "anthropic",
+      "model": "claude-sonnet-5",
+      "effort": "high"
+    },
+    {
+      "id": "gpt-5.6-terra-high",
+      "provider": "codex",
+      "model": "gpt-5.6-terra",
+      "effort": "high"
+    },
+    {
+      "id": "gpt-5.6-luna-xhigh",
+      "provider": "codex",
+      "model": "gpt-5.6-luna",
+      "effort": "xhigh"
+    }
+  ],
+  "cases": [
+    {
+      "id": "gsc-snowflake",
+      "corpus": "baseline",
+      "transcript": "User: Google Search Console cannot be accessed through Workspace API here. We keep the GSC data in Snowflake; use that in future threads.",
+      "expectedAction": "capture",
+      "acceptedReasons": ["durable_fact", "durable_workflow"],
+      "mustInclude": ["GSC", "Snowflake"]
+    },
+    {
+      "id": "siptrue-wix",
+      "corpus": "baseline",
+      "transcript": "Assistant: We still need to know where SipTrue DNS is hosted. User: Correction: siptrue.com is on Wix. We already established that.",
+      "expectedAction": "capture",
+      "acceptedReasons": ["correction"],
+      "mustInclude": ["SipTrue", "Wix"]
+    },
+    {
+      "id": "slack-link-api",
+      "corpus": "baseline",
+      "transcript": "User: When I paste a Slack URL, read it through the Slack API. You have been doing that for weeks; do not claim external links are inaccessible.",
+      "expectedAction": "capture",
+      "acceptedReasons": ["durable_workflow", "stable_preference"],
+      "mustInclude": ["Slack", "API"]
+    },
+    {
+      "id": "customizations-priority",
+      "corpus": "baseline",
+      "transcript": "User: My NanoClaw customizations are more important than upstream changes. Treat preserving them as the top priority for every update.",
+      "expectedAction": "capture",
+      "acceptedReasons": ["stable_preference", "explicit_decision"],
+      "mustInclude": ["customizations", "priority"]
+    },
+    {
+      "id": "retired-workgroups",
+      "corpus": "baseline",
+      "transcript": "User: Sunday, video-agent, Xerus, and ag-1 are no longer valid workgroups. Remove their Claude, Codex, and OpenCode siblings too.",
+      "expectedAction": "capture",
+      "acceptedReasons": ["correction", "explicit_decision"],
+      "mustInclude": ["Sunday", "video-agent", "Xerus", "ag-1", "Claude", "Codex", "OpenCode"]
+    },
+    {
+      "id": "full-merge-audit",
+      "corpus": "baseline",
+      "transcript": "User: For full upstream merges, always audit auto-merges for removed dependency code and regressions in our customizations before shipping.",
+      "expectedAction": "capture",
+      "acceptedReasons": ["durable_workflow", "stable_preference"],
+      "mustInclude": ["merge", "audit", "customizations"]
+    },
+    {
+      "id": "pleasantry",
+      "corpus": "baseline",
+      "transcript": "User: Nice work, this is looking great!",
+      "expectedAction": "noop",
+      "acceptedReasons": ["transient"],
+      "mustInclude": []
+    },
+    {
+      "id": "transient-deploy",
+      "corpus": "baseline",
+      "transcript": "Assistant: The deploy is at 63 percent and should finish in about four minutes.",
+      "expectedAction": "noop",
+      "acceptedReasons": ["transient"],
+      "mustInclude": []
+    },
+    {
+      "id": "brainstorming",
+      "corpus": "baseline",
+      "transcript": "User: Maybe we could use Redis, or perhaps just SQLite. I have not decided yet.",
+      "expectedAction": "noop",
+      "acceptedReasons": ["speculative"],
+      "mustInclude": []
+    },
+    {
+      "id": "code-derived",
+      "corpus": "baseline",
+      "transcript": "Assistant: The router calls archiveMessageAndScheduleMemoryCuration in src/router.ts.",
+      "expectedAction": "noop",
+      "acceptedReasons": ["code_derived"],
+      "mustInclude": []
+    },
+    {
+      "id": "latest-correction-wins",
+      "corpus": "hard",
+      "transcript": "User: Our analytics warehouse is BigQuery. User later: Correction, that old note is wrong; Madison Reed analytics is in Snowflake now.",
+      "expectedAction": "capture",
+      "acceptedReasons": ["correction"],
+      "mustInclude": ["Madison Reed", "Snowflake"],
+      "mustExclude": ["BigQuery"]
+    },
+    {
+      "id": "weak-inference",
+      "corpus": "hard",
+      "transcript": "User: I opened the Wix dashboard while investigating DNS. Assistant: That probably means every domain is hosted on Wix.",
+      "expectedAction": "noop",
+      "acceptedReasons": ["speculative", "insufficient_evidence"],
+      "mustInclude": []
+    },
+    {
+      "id": "secret-material",
+      "corpus": "hard",
+      "transcript": "User: Use this temporary test key sk_test_1234567890abcdefghijkl for the next request only.",
+      "expectedAction": "noop",
+      "acceptedReasons": ["sensitive", "transient"],
+      "mustInclude": [],
+      "mustExclude": ["sk_test_1234567890abcdefghijkl"]
+    },
+    {
+      "id": "context-only-preference",
+      "corpus": "hard",
+      "transcript": "User: For this one response only, make the explanation extra verbose.",
+      "expectedAction": "noop",
+      "acceptedReasons": ["transient"],
+      "mustInclude": []
+    },
+    {
+      "id": "durable-direct-publish",
+      "corpus": "hard",
+      "transcript": "User: When I say commit and push after validation, use the direct publish flow. Do not create a PR unless I ask for one.",
+      "expectedAction": "capture",
+      "acceptedReasons": ["stable_preference", "durable_workflow"],
+      "mustInclude": ["commit", "push", "PR"]
+    },
+    {
+      "id": "unverified-third-party-claim",
+      "corpus": "hard",
+      "transcript": "Assistant: A forum commenter says the vendor will discontinue the API next month. User: I have not verified that.",
+      "expectedAction": "noop",
+      "acceptedReasons": ["insufficient_evidence", "speculative"],
+      "mustInclude": []
+    }
+  ],
+  "recordedSelection": {
+    "corpusSha256": "9443641dc1ba547e496d9dac6c27f287f2918ca51a468660d8b4676618ac950b",
+    "selectedCandidateId": "sonnet-5-medium",
+    "trialsPerCorpus": 3,
+    "recordedAt": "2026-07-26T18:20:00.000Z",
+    "provenance": "docs/specs/workgroup-memory-and-session-capabilities/run.md",
+    "results": [
+      {
+        "candidateId": "sonnet-5-medium",
+        "perfectTrials": 6,
+        "totalTrials": 6,
+        "meanWallMs": 24110
+      },
+      {
+        "candidateId": "gpt-5.6-terra-high",
+        "perfectTrials": 6,
+        "totalTrials": 6,
+        "meanWallMs": 23650
+      },
+      {
+        "candidateId": "sonnet-5-high",
+        "perfectTrials": 6,
+        "totalTrials": 6,
+        "meanWallMs": 36730
+      },
+      {
+        "candidateId": "gpt-5.6-luna-xhigh",
+        "perfectTrials": 4,
+        "totalTrials": 6,
+        "meanWallMs": 42410
+      }
+    ]
+  }
+}

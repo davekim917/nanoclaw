@@ -118,6 +118,7 @@ const SECRET_SHAPE_PATTERNS: ReadonlyArray<[RegExp, string]> = [
   [/(?:-u|--user)\s+[^:\s]+:[^\s]+/g, '-u [REDACTED]'],
   [/([?&])(api[_-]?key|token|access[_-]?token|password|passwd|pwd|auth|sig|signature)=[^&\s"'`]+/gi, '$1$2=[REDACTED]'],
   [/\bsk-(?:ant-)?[A-Za-z0-9_-]{20,}\b/g, '[REDACTED]'],
+  [/\b(?:sk|rk)_(?:live|test)_[A-Za-z0-9_-]{12,}\b/g, '[REDACTED]'],
   [/\bxox[abpr]-[A-Za-z0-9-]+\b/g, '[REDACTED]'],
   [/\bghp_[A-Za-z0-9]+\b/g, '[REDACTED]'],
   [/\bglpat-[A-Za-z0-9_-]+\b/g, '[REDACTED]'],

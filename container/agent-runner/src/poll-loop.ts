@@ -2,11 +2,19 @@ import fs from 'fs';
 import path from 'path';
 
 import { findByName, findByRouting, findPeerName, getAllDestinations, type DestinationEntry } from './destinations.js';
-import { getPendingMessages, markProcessing, markCompleted, markScriptSkipped, type MessageInRow } from './db/messages-in.js';
+import {
+  getPendingMessages,
+  markProcessing,
+  markCompleted,
+  markScriptSkipped,
+  retainCompleteRecallUnits,
+  type MessageInRow,
+} from './db/messages-in.js';
 import { writeMessageOut } from './db/messages-out.js';
 import { getSessionSpawnTaskId } from './db/session-routing.js';
 import { getInboundDb, touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
 import {
+  advanceMemoryContextEpoch,
   clearContinuation,
   clearCurrentInReplyTo,
   migrateLegacyContinuation,
@@ -38,9 +46,15 @@ import { isUploadTraceCommand, uploadTrace } from './upload-trace.js';
 import type { AgentProvider, AgentQuery, ProviderEvent, ProviderExchange } from './providers/types.js';
 import { autoCommitDirtyWorktrees } from './worktree-autosave.js';
 import { buildSessionRecap, wrapRecap } from './session-recap.js';
+import { ensureFreshContextBootstrap } from './memory/bootstrap.js';
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
+
+function resetProviderContext(providerName: string): void {
+  clearContinuation(providerName);
+  advanceMemoryContextEpoch(providerName);
+}
 
 /**
  * Number of consecutive `database disk image is malformed` errors after which
@@ -199,6 +213,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   // other providers may reload a thread ID, etc.). Keyed per-provider so
   // a Codex thread id never gets handed to Claude or vice versa.
   let continuation: string | undefined = migrateLegacyContinuation(config.providerName);
+  let freshContextBootstrapRequired = continuation === undefined;
 
   // Before resuming, drop a session whose on-disk transcript has grown too
   // large/old to cold-resume within the host's idle ceiling. Without this a
@@ -208,8 +223,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     const rotateReason = config.provider.maybeRotateContinuation?.(continuation, config.cwd);
     if (rotateReason) {
       log(`Rotating session — ${rotateReason}; starting fresh`);
-      clearContinuation(config.providerName);
+      resetProviderContext(config.providerName);
       continuation = undefined;
+      freshContextBootstrapRequired = true;
     }
   }
 
@@ -275,14 +291,15 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // host stale-claim sweep cleared it (~60s). Now we claim only the
     // rows that will actually reach the prompt — same pattern as the
     // in-turn helper.
-    const normalMessages: MessageInRow[] = [];
+    let normalMessages: MessageInRow[] = [];
     const commandIds: string[] = [];
 
     for (const msg of messages) {
       if ((msg.kind === 'chat' || msg.kind === 'chat-sdk') && isClearCommand(msg)) {
         log('Clearing session (resetting continuation)');
         continuation = undefined;
-        clearContinuation(config.providerName);
+        resetProviderContext(config.providerName);
+        freshContextBootstrapRequired = true;
         writeMessageOut({
           id: generateId(),
           kind: 'chat',
@@ -310,6 +327,11 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       normalMessages.push(msg);
     }
 
+    // Command admission can remove X while recall-X was encountered earlier
+    // in the same batch. Keep the pair invariant at the actual prompt
+    // boundary: both rows survive, or neither does.
+    normalMessages = retainCompleteRecallPairs(messages, normalMessages);
+
     if (commandIds.length > 0) {
       markCompleted(commandIds);
     }
@@ -329,7 +351,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // MODULE-HOOK:scheduling-pre-task:start
     const { applyPreTaskScripts } = await import('./scheduling/task-script.js');
     const preTask = await applyPreTaskScripts(normalMessages);
-    keep = preTask.keep;
+    keep = retainCompleteRecallPairs(normalMessages, preTask.keep);
     skipped = preTask.skipped;
     if (skipped.length > 0) {
       markScriptSkipped(skipped);
@@ -373,7 +395,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
     // Format messages: passthrough commands get raw text (only if the
     // provider natively handles slash commands), others get XML.
-    const prompt = formatMessagesWithCommands(keep, config.provider.supportsNativeSlashCommands);
+    const formattedPrompt = formatMessagesWithCommands(keep, config.provider.supportsNativeSlashCommands);
+    const prompt = freshContextBootstrapRequired ? ensureFreshContextBootstrap(formattedPrompt) : formattedPrompt;
+    freshContextBootstrapRequired = false;
 
     log(
       `Processing ${keep.length} message(s), kinds: ${[...new Set(keep.map((m) => m.kind))].join(',')}` +
@@ -520,8 +544,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // "next message" that's already known to work. Bounded with a short
       // linear backoff; heartbeat touched across the sleep so host-sweep
       // doesn't reap the container mid-retry.
-      const codexIdle =
-        !recovered && err instanceof ProviderEventError && err.classification === 'idle_timeout';
+      const codexIdle = !recovered && err instanceof ProviderEventError && err.classification === 'idle_timeout';
       if (codexIdle) {
         for (let attempt = 0; attempt < CODEX_IDLE_RETRY_MAX && !recovered; attempt++) {
           const sleepMs = CODEX_IDLE_RETRY_BASE_MS * (attempt + 1);
@@ -596,9 +619,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       // contains "Rate limited"), but rotation is the wrong cure — it was
       // already handled by the backoff loop above. Exclude it here.
       let rotation =
-        !transient && !recovered && config.provider.isRetryable?.(err)
-          ? config.provider.rotateApiKey?.()
-          : undefined;
+        !transient && !recovered && config.provider.isRetryable?.(err) ? config.provider.rotateApiKey?.() : undefined;
       while (rotation?.rotated && !recovered) {
         log(`Upstream transient error — rotated credential, retrying same prompt in-turn`);
         try {
@@ -657,14 +678,17 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       if (!recovered && continuation && config.provider.isContextTooLong?.(err)) {
         log(`Context-too-long detected — clearing session and retrying once with fresh continuation`);
         continuation = undefined;
-        clearContinuation(config.providerName);
+        resetProviderContext(config.providerName);
+        freshContextBootstrapRequired = true;
         try {
           const recap = buildSessionRecap();
-          const retryPrompt =
+          const retryPrompt = ensureFreshContextBootstrap(
             (recap
               ? wrapRecap(recap, 'context-window-exceeded')
               : '[The prior session exceeded the model context window and was reset. Continuing fresh from here.]\n\n') +
-            prompt;
+              prompt,
+          );
+          freshContextBootstrapRequired = false;
           const retryQuery = config.provider.query({
             prompt: retryPrompt,
             continuation: undefined,
@@ -707,14 +731,17 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         // doesn't lose conversational context.
         log(`Stale session detected (${continuation}) — clearing and retrying with recap`);
         continuation = undefined;
-        clearContinuation(config.providerName);
+        resetProviderContext(config.providerName);
+        freshContextBootstrapRequired = true;
         try {
           const recap = buildSessionRecap();
-          const retryPrompt =
+          const retryPrompt = ensureFreshContextBootstrap(
             (recap
               ? wrapRecap(recap, 'stale-session-recovered')
               : '[The prior agent session transcript was unavailable and could not be resumed. Starting a fresh session.]\n\n') +
-            prompt;
+              prompt,
+          );
+          freshContextBootstrapRequired = false;
           const retryQuery = config.provider.query({
             prompt: retryPrompt,
             continuation: undefined,
@@ -760,14 +787,17 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       if (!recovered && continuation && isProviderSystemError(err)) {
         log(`Provider system_error (${continuation}) - clearing session and retrying with recap`);
         continuation = undefined;
-        clearContinuation(config.providerName);
+        resetProviderContext(config.providerName);
+        freshContextBootstrapRequired = true;
         try {
           const recap = buildSessionRecap();
-          const retryPrompt =
+          const retryPrompt = ensureFreshContextBootstrap(
             (recap
               ? wrapRecap(recap, 'provider-system-error-recovered')
               : '[The prior provider thread entered a terminal system error and was reset. Starting a fresh session.]\n\n') +
-            prompt;
+              prompt,
+          );
+          freshContextBootstrapRequired = false;
           const retryQuery = config.provider.query({
             prompt: retryPrompt,
             continuation: undefined,
@@ -858,6 +888,42 @@ export function isAdmissibleTrigger(m: MessageInRow): boolean {
   return true;
 }
 
+function recallTargetId(m: MessageInRow): string | null {
+  if (m.kind !== 'system' || !m.id.startsWith('recall-')) return null;
+  try {
+    const parsed = JSON.parse(m.content) as { subtype?: unknown };
+    return parsed.subtype === 'recall_context' ? m.id.slice('recall-'.length) : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Preserve complete host recall pairs across a later admission step. The
+ * original batch defines which pairs existed; if command handling or a
+ * pre-task gate removes either member, the survivor is removed too.
+ */
+export function retainCompleteRecallPairs(original: MessageInRow[], admitted: MessageInRow[]): MessageInRow[] {
+  const originalRecallByTarget = new Map<string, string>();
+  for (const row of original) {
+    const targetId = recallTargetId(row);
+    if (targetId !== null && original.some((candidate) => candidate.id === targetId)) {
+      originalRecallByTarget.set(targetId, row.id);
+    }
+  }
+  if (originalRecallByTarget.size === 0) return admitted;
+
+  const admittedIds = new Set(admitted.map((row) => row.id));
+  return admitted.filter((row) => {
+    const targetId = recallTargetId(row);
+    if (targetId !== null && originalRecallByTarget.get(targetId) === row.id) {
+      return admittedIds.has(targetId);
+    }
+    const recallId = originalRecallByTarget.get(row.id);
+    return recallId === undefined || admittedIds.has(recallId);
+  });
+}
+
 /**
  * Decide which pending rows to admit as a mid-turn follow-up push to an
  * in-flight query. Pure function — no DB writes — so tests can exercise
@@ -879,11 +945,12 @@ export function isAdmissibleTrigger(m: MessageInRow): boolean {
  * - All other system rows are dropped.
  */
 export function selectInTurnFollowUps(allPending: MessageInRow[]): MessageInRow[] {
+  const completePending = retainCompleteRecallUnits(allPending);
   const isChatRow = (m: MessageInRow): boolean => m.kind === 'chat' || m.kind === 'chat-sdk';
-  const triggerIds = new Set(allPending.filter(isAdmissibleTrigger).map((m) => m.id));
+  const triggerIds = new Set(completePending.filter(isAdmissibleTrigger).map((m) => m.id));
   if (triggerIds.size === 0) return [];
 
-  return allPending.filter((m) => {
+  return completePending.filter((m) => {
     if (m.kind === 'system') {
       try {
         const parsed = JSON.parse(m.content) as { subtype?: string };
@@ -900,9 +967,10 @@ export function selectInTurnFollowUps(allPending: MessageInRow[]): MessageInRow[
   });
 }
 
-// Invariant: the `recall-` prefix is reserved for host-side recall-injection
-// (src/modules/memory/recall-injection.ts). Platform message ids written by
-// router.ts always carry the shape `<platform-baseId>:<agentGroupId>`; no
+// Invariant: the `recall-` prefix is reserved for the host-side paired write in
+// `src/session-manager.ts` (`buildRecallRow`/`writeSessionMessageInternal`).
+// Platform message ids written by router.ts always carry the shape
+// `<platform-baseId>:<agentGroupId>`; no
 // adapter produces baseIds starting with `recall-`, so the strip below
 // cannot collide with a real inbound id. Keep this contract — adding an
 // adapter that breaks it would silently corrupt recall pairing.
@@ -1045,7 +1113,7 @@ export async function processQuery(
         // MODULE-HOOK:scheduling-pre-task-followup:start
         const { applyPreTaskScripts } = await import('./scheduling/task-script.js');
         const preTask = await applyPreTaskScripts(candidates);
-        const keep: MessageInRow[] = preTask.keep;
+        const keep: MessageInRow[] = retainCompleteRecallPairs(candidates, preTask.keep);
         const skipped = preTask.skipped;
         // MODULE-HOOK:scheduling-pre-task-followup:end
 
@@ -1309,28 +1377,28 @@ export async function processQuery(
             // The wrapping-retry result answers the SAME user prompt — keep it
             // queued so the retry archives against it, not the nudge text.
             if (!willRetryWrapping && !willRetryTaskBlocks) archivePrompts.shift();
-
           }
         } else {
           archivePrompts.shift();
         }
       } else if (event.type === 'compacted') {
+        advanceMemoryContextEpoch(providerName);
         // The SDK auto-compacted the conversation. After compaction the
-        // model often drops the learned `<message to="…">` wrapping
-        // discipline (the destinations are still in the system prompt,
-        // but the behavioral pattern is summarized away). Inject a
-        // reminder back into the live query so the next turn re-anchors
-        // on the destination model. Only do this when there's >1
-        // destination — single-destination groups have a fallback that
-        // works without wrapping. See qwibitai/nanoclaw#2325.
+        // model can lose both the once-per-context bootstrap and learned
+        // `<message to="…">` wrapping discipline. Re-inject the bounded
+        // canonical index + capabilities immediately, before any queued
+        // follow-up can run against the compacted context. This is the
+        // runner fallback only: the next host-admitted turn observes the
+        // advanced epoch and resumes normal relevant-delta recall.
         const destinations = getAllDestinations();
+        let reminder = '[system] Context was just compacted. Canonical memory and capabilities were refreshed.';
         if (destinations.length > 1) {
           const names = destinations.map((d) => d.name).join(', ');
-          query.push(
-            `[system] Context was just compacted. Reminder: you have ${destinations.length} destinations (${names}). ` +
-              `Use <message to="name"> blocks to address them. Bare text goes to the scratchpad fallback only.`,
-          );
+          reminder +=
+            ` Reminder: you have ${destinations.length} destinations (${names}). ` +
+            'Use <message to="name"> blocks to address them. Bare text goes to the scratchpad fallback only.';
         }
+        query.push(ensureFreshContextBootstrap(reminder));
       } else if (event.type === 'file') {
         dispatchFileAttachment(event, routing);
       }
@@ -1808,11 +1876,11 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
     let timeout: ReturnType<typeof setTimeout> | undefined;
     const finish = () => {
       if (timeout !== undefined) clearTimeout(timeout);
-      signal?.removeEventListener("abort", finish);
+      signal?.removeEventListener('abort', finish);
       resolve();
     };
     timeout = setTimeout(finish, ms);
-    signal?.addEventListener("abort", finish, { once: true });
+    signal?.addEventListener('abort', finish, { once: true });
   });
 }
 

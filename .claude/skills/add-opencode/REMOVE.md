@@ -2,7 +2,21 @@
 
 Idempotent — safe to run even if some steps were never applied. Reverses both the host (`src/providers/`) and container (`container/agent-runner/src/providers/`) trees, the agent-runner dependency, and the Dockerfile CLI install.
 
-## 1. Delete the barrel import lines (both trees)
+## 1. Move active groups off OpenCode
+
+Before unregistering or deleting anything, list the groups and switch every
+group that still uses OpenCode through the container-config source of truth:
+
+```bash
+ncl groups list
+ncl groups config update --id <group-id> --provider claude
+ncl groups restart --id <group-id>
+```
+
+Do not hand-edit materialized `container.json` files or legacy
+`agent_groups.agent_provider` fields.
+
+## 2. Delete the barrel import lines (both trees)
 
 Delete (do not comment out) the `import './opencode.js';` line from each barrel:
 
@@ -11,7 +25,7 @@ Delete (do not comment out) the `import './opencode.js';` line from each barrel:
 
 This unregisters the provider from both `listProviderContainerConfigNames()` (host) and `listProviderNames()` (container).
 
-## 2. Delete the copied files (both trees)
+## 3. Delete the copied files (both trees)
 
 ```bash
 rm -f src/providers/opencode.ts \
@@ -24,7 +38,7 @@ rm -f src/providers/opencode.ts \
       container/agent-runner/src/providers/opencode-registration.test.ts
 ```
 
-## 3. Remove the agent-runner dependency
+## 4. Remove the agent-runner dependency
 
 `@opencode-ai/sdk` is an importable package in the container tree (agent-runner is a Bun package, not a pnpm workspace — use `bun remove`):
 
@@ -32,38 +46,25 @@ rm -f src/providers/opencode.ts \
 cd container/agent-runner && bun remove @opencode-ai/sdk && cd -
 ```
 
-## 4. Revert the Dockerfile CLI install
+## 5. Revert the Dockerfile CLI install
 
 In `container/Dockerfile`, remove both OpenCode edits (skip whichever is already gone):
 
 **(a)** Delete the version ARG from the "Pin CLI versions" block:
 
 ```dockerfile
-ARG OPENCODE_VERSION=1.4.17
+ARG OPENCODE_VERSION=1.17.18
 ```
 
-**(b)** Delete the standalone OpenCode install layer:
+**(b)** Remove the OpenCode entry from the shared global CLI install block:
 
 ```dockerfile
-RUN --mount=type=cache,target=/root/.cache/pnpm \
-    pnpm install -g "opencode-ai@${OPENCODE_VERSION}"
+"opencode-ai@${OPENCODE_VERSION}"
 ```
 
-Leave the other per-CLI install layers (claude-code, agent-browser, vercel) untouched.
-
-## 5. Clean up per-group overlays
-
-Any group that had the OpenCode files copied into its live source overlay still carries them — remove the OpenCode-specific files from each overlay (the barrel `index.ts` is re-synced from the cleaned tree, not deleted):
-
-```bash
-for overlay in data/v2-sessions/*/agent-runner-src/providers/; do
-  [ -d "$overlay" ] || continue
-  rm -f "$overlay/opencode.ts" "$overlay/mcp-to-opencode.ts"
-  [ -f container/agent-runner/src/providers/index.ts ] && \
-    cp container/agent-runner/src/providers/index.ts "$overlay"
-  echo "Cleaned: $overlay"
-done
-```
+**(c)** Remove only the `opencode-ai` entries from the container
+`only-built-dependencies` and `allowBuilds` configuration. Leave every other
+CLI and build permission untouched.
 
 ## 6. Unset OpenCode env vars
 
@@ -73,7 +74,8 @@ Remove any OpenCode-specific lines you added to `.env` (`OPENCODE_PROVIDER`, `OP
 mkdir -p data/env && cp .env data/env/env
 ```
 
-Switch any group still on OpenCode back to the default provider — set `"provider": "claude"` in `groups/<folder>/container.json` and clear `agent_provider` on the group/session in the DB.
+Agent-runner source is one shared read-only mount; there are no per-group
+source overlays to clean.
 
 ## 7. Rebuild and restart
 
@@ -102,4 +104,5 @@ grep "@opencode-ai/sdk" container/agent-runner/package.json                     
 grep "opencode-ai" container/Dockerfile                                                        # no output
 ```
 
-In a wired agent, requesting `agent_provider = 'opencode'` should fall back to the default provider since `opencode` is no longer in the registry.
+No group should still request `provider = 'opencode'`; step 1 moves every active
+group back to Claude before the provider is unregistered.

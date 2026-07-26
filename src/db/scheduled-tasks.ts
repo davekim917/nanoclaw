@@ -242,36 +242,61 @@ export async function scheduleTask(def: TaskDef, _dataDir?: string): Promise<voi
       ...(def.quietStatus ? { quietStatus: true } : {}),
       ...(def.flagIntent ? { flagIntent: def.flagIntent } : {}),
     });
-    // Idempotency: active series (pending/paused) → UPDATE; terminal rows (completed/failed/cancelled)
-    // are treated as absent so a fresh row is inserted, enabling re-scheduling after cancellation.
-    const activeRow = db
-      .prepare("SELECT id FROM messages_in WHERE series_id = ? AND status IN ('pending', 'paused')")
-      .get(def.seriesId) as { id: string } | undefined;
-
     const platformId = def.destination.platformId;
     const channelType = def.destination.channelType;
     const threadId = def.destination.threadId;
 
-    if (activeRow) {
-      db.prepare(
-        `UPDATE messages_in
-            SET process_after = ?,
-                recurrence    = ?,
-                content       = ?,
-                platform_id   = ?,
-                channel_type  = ?,
-                thread_id     = ?,
-                tries         = 0
-          WHERE id = ?`,
-      ).run(def.processAfter, def.cron, content, platformId, channelType, threadId, activeRow.id);
-    } else {
+    const persist = db.transaction(() => {
+      // Idempotency: active series (pending/paused) → UPDATE; terminal rows
+      // (completed/failed/cancelled) are treated as absent so a fresh row is
+      // inserted, enabling re-scheduling after cancellation.
+      const activeRow = db
+        .prepare("SELECT id FROM messages_in WHERE series_id = ? AND status IN ('pending', 'paused')")
+        .get(def.seriesId) as { id: string } | undefined;
+
+      if (activeRow) {
+        // A due row may already have been admitted as recall + trigger before
+        // an operator reschedules it. Remove that now-stale recall and move the
+        // task to a fresh inert seq atomically; the next due sweep will build
+        // current context immediately before making it wakeable again.
+        db.prepare("DELETE FROM messages_in WHERE id = ? AND kind = 'system'").run(`recall-${activeRow.id}`);
+        const seq = nextEvenSeq(db);
+        db.prepare(
+          `UPDATE messages_in
+              SET seq           = ?,
+                  process_after = ?,
+                  recurrence    = ?,
+                  content       = ?,
+                  platform_id   = ?,
+                  channel_type  = ?,
+                  thread_id     = ?,
+                  tries         = 0,
+                  trigger       = 0
+            WHERE id = ?`,
+        ).run(seq, def.processAfter, def.cron, content, platformId, channelType, threadId, activeRow.id);
+        return;
+      }
+
       const seq = nextEvenSeq(db);
       db.prepare(
         `INSERT INTO messages_in
-           (id, seq, kind, timestamp, status, tries, process_after, recurrence, series_id, content, platform_id, channel_type, thread_id)
-         VALUES (?, ?, 'task', datetime('now'), 'pending', 0, ?, ?, ?, ?, ?, ?, ?)`,
-      ).run(def.id, seq, def.processAfter, def.cron, def.seriesId, content, platformId, channelType, threadId);
-    }
+           (id, seq, kind, timestamp, status, tries, process_after, recurrence, series_id, content,
+            platform_id, channel_type, thread_id, trigger)
+         VALUES (?, ?, 'task', ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, 0)`,
+      ).run(
+        def.id,
+        seq,
+        new Date().toISOString(),
+        def.processAfter,
+        def.cron,
+        def.seriesId,
+        content,
+        platformId,
+        channelType,
+        threadId,
+      );
+    });
+    persist.immediate();
   } finally {
     db.close();
   }

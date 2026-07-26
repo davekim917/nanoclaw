@@ -1,5 +1,10 @@
 # Codex ↔ Claude parity test plan
 
+> **Archived historical test plan — do not execute as current setup guidance.**
+> Its Mnemon, GitNexus, hook, and personal host-config surfaces are retired.
+> Current provider parity is defined by the provider install skills and
+> [workgroup memory design](specs/workgroup-memory-and-session-capabilities/design.md).
+
 The audit on 2026-05-13 found Codex was materially under-equipped to act as a
 peer to Claude Code (host) and to container agents. This document captures the
 deliverable changes and the verification steps so future drift can be caught.

@@ -47,7 +47,6 @@ import {
   markMessageFailed,
   openInboundDb as openInboundDbByPath,
   readSessionRouting,
-  retryWithBackoff,
   syncProcessingAcks,
   type ContainerState,
 } from './db/session-db.js';
@@ -64,6 +63,8 @@ import {
   sessionsBaseDir,
   writeOutboundDirect,
   writeSessionMessage,
+  admitDueTaskContexts,
+  deferMessageForFreshContextRetry,
 } from './session-manager.js';
 import {
   getContainerSpawnedAt,
@@ -94,6 +95,7 @@ import { runReconcilerSweep } from './modules/orchestrator-dispatch/reconciler.j
 import { decideTaskAction, pendingTerminalSpawnOutboundSeenAt } from './modules/orchestrator-dispatch/watchdog.js';
 import { OomKillObserver } from './resource-oom-observer.js';
 import { pruneChannelIngressReceipts } from './db/channel-ingress-receipts.js';
+import { runMemoryCurationInBackground, stopMemoryCurationInBackground } from './modules/memory/curator-worker.js';
 
 const oomKillObserver = new OomKillObserver();
 
@@ -223,6 +225,7 @@ export function startHostSweep(): void {
 
 export function stopHostSweep(): void {
   running = false;
+  stopMemoryCurationInBackground();
 }
 
 async function sweep(): Promise<void> {
@@ -306,6 +309,10 @@ async function sweep(): Promise<void> {
     .then((mod) => mod.runSessionTitleSweep())
     .catch((err) => log.warn('session-title sweep failed', { err }));
 
+  // Workgroup memory curation is durable, debounced, and never awaited by the
+  // sweep. The module enforces one active pump globally and fails closed.
+  void runMemoryCurationInBackground().catch((err) => log.warn('memory-curator: background pump failed', { err }));
+
   // Prune dashboard_tokens rows past expiry + 1d grace (post-build QA fix SF-6).
   void import('./dashboard/db/dashboard-tokens.js')
     .then((mod) => mod.pruneDashboardTokens())
@@ -342,6 +349,28 @@ export function shouldReapIdleTaskContainer(
   providerStatus: string | null | undefined,
 ): boolean {
   return isTaskThread(threadId) && dueMessageCount === 0 && processingClaimCount === 0 && providerStatus === 'idle';
+}
+
+function prepareDueWake(
+  inDb: Database.Database,
+  agentGroupId: string,
+  sessionId: string,
+): { admittedTasks: number; dueCount: number; wakePriority: 'interactive' | 'scheduled' } {
+  const admittedTasks = admitDueTaskContexts(inDb, agentGroupId, sessionId);
+  const dueCount = countDueMessages(inDb);
+  return {
+    admittedTasks,
+    dueCount,
+    wakePriority: dueCount > 0 ? getDueWakePriority(inDb) : 'interactive',
+  };
+}
+
+export function _prepareDueWakeForTesting(
+  inDb: Database.Database,
+  agentGroupId: string,
+  sessionId: string,
+): { admittedTasks: number; dueCount: number; wakePriority: 'interactive' | 'scheduled' } {
+  return prepareDueWake(inDb, agentGroupId, sessionId);
 }
 
 // ─── Scheduled-move recovery + audit-body prune (D3 / D4) ─────────────────────
@@ -633,16 +662,32 @@ async function sweepSession(session: Session): Promise<void> {
       });
     }
 
-    // 2. Wake a container if work is due and nothing is running. Ordered
-    // before the crashed-container cleanup so a fresh container gets a chance
-    // to clean its own orphan processing_ack rows on startup (see
-    // container/agent-runner/src/db/connection.ts). Otherwise the reset path
-    // would keep bumping process_after into the future, dueCount would stay 0,
-    // and the wake would never fire.
-    const dueCount = countDueMessages(inDb);
+    // 2. A stopped container with processing claims crashed mid-turn. Defer
+    // the paired input first, while it is still inert-able, and clear the
+    // orphan claim before any due-count or wake decision can expose its stale
+    // recall to a replacement/warm poller. When backoff elapses, the admission
+    // seam below replaces that recall from current host state.
+    if (!isContainerRunning(session.id) && outDb && getProcessingClaims(outDb).length > 0) {
+      resetStuckProcessingRows(inDb, outDb, session, 'container not running');
+    }
+
+    // 3. Admit due scheduled occurrences and crash retries with fresh
+    // recall/capabilities
+    // immediately before they become wakeable. Task rows stay trigger=0 from
+    // creation through this point; paired retries stay trigger=0 throughout
+    // backoff. A warm poller cannot race ahead of either context pair, and a
+    // repeated sweep is idempotent.
+    const { admittedTasks, dueCount, wakePriority } = prepareDueWake(inDb, agentGroup.id, session.id);
+    if (admittedTasks > 0) {
+      log.debug('Admitted due turns with fresh context', {
+        sessionId: session.id,
+        count: admittedTasks,
+      });
+    }
+
+    // 4. Wake a container if work is due and nothing is running.
     let justWoke = false;
     if (dueCount > 0 && !isContainerRunning(session.id)) {
-      const wakePriority = getDueWakePriority(inDb);
       log.info('Waking container for due messages', {
         sessionId: session.id,
         count: dueCount,
@@ -658,7 +703,7 @@ async function sweepSession(session: Session): Promise<void> {
 
     const alive = isContainerRunning(session.id);
 
-    // 3. Running-container SLA: absolute ceiling + per-claim stuck rules.
+    // 5. Running-container SLA: absolute ceiling + per-claim stuck rules.
     // Skip on the same iteration that just woke the container — it hasn't
     // had a chance to clear stale processing_ack rows from a previous crash
     // yet. Without this grace period, stale claims cause an immediate
@@ -676,21 +721,20 @@ async function sweepSession(session: Session): Promise<void> {
       }
     }
 
-    // 4. Crashed-container cleanup: processing rows left behind get retried.
-    // Only fires when wake in step 2 didn't pick up the work (no due messages,
-    // or wake failed). resetStuckProcessingRows itself is idempotent — it
-    // skips messages already scheduled for a future retry.
+    // 6. Retry cleanup if the pre-wake orphan-claim clear could not finish.
+    // resetStuckProcessingRows is idempotent: future retries are not bumped
+    // again, and already-cleared claim sets are a no-op.
     if (!alive && outDb) {
       resetStuckProcessingRows(inDb, outDb, session, 'container not running');
     }
 
-    // 5. Recurrence fanout for completed recurring tasks.
+    // 7. Recurrence fanout for completed recurring tasks.
     // MODULE-HOOK:scheduling-recurrence:start
     const { handleRecurrence } = await import('./modules/scheduling/recurrence.js');
     await handleRecurrence(inDb, session);
     // MODULE-HOOK:scheduling-recurrence:end
 
-    // 6. GC spent task sessions. An isolated per-task session with no live task
+    // 8. GC spent task sessions. An isolated per-task session with no live task
     // rows left (one-shot fired, or all cancelled/deleted) and no container
     // running is dead — close it so it stops being swept and listed. Runs after
     // recurrence so a just-fired recurring series has already re-armed its next
@@ -1070,8 +1114,8 @@ export function notifyKillCeiling(
     const minutes = Math.round(heartbeatAgeMs / 60_000);
     const id = `sys-kill-ceiling-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     // Don't ask the user to resend: the kill-ceiling branch runs
-    // resetStuckProcessingRows immediately after, which calls
-    // retryWithBackoff on every claimed pending message. Unclaimed pending
+    // resetStuckProcessingRows immediately after, which defers every claimed
+    // pending message behind fresh-context retry admission. Unclaimed pending
     // rows just sit until the next wake. Either way the system recovers
     // the user's existing input — a resend would just create duplicates.
     const providerFailure =
@@ -1188,7 +1232,7 @@ function resetStuckProcessingRows(
     } else {
       const backoffMs = BACKOFF_BASE_MS * Math.pow(2, msg.tries);
       const backoffSec = Math.floor(backoffMs / 1000);
-      retryWithBackoff(inDb, msg.id, backoffSec);
+      deferMessageForFreshContextRetry(inDb, msg.id, backoffSec);
       log.info('Reset stale message with backoff', {
         messageId: msg.id,
         tries: msg.tries,

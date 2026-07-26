@@ -1,5 +1,11 @@
 # Workgroup Shared Filesystem — "Same House, Own Bedrooms"
 
+> **Archived implementation record — do not execute this rollout.** The
+> workgroup filesystem model shipped, but the Mnemon daemon, feature-flag, and
+> migration instructions below are superseded. Current memory behavior is
+> defined by [the one-canon design](workgroup-memory-and-session-capabilities/design.md)
+> and [memory.md](../memory.md).
+
 **Status (2026-05-26):** Phase 1 (mount + migration + tests, `b4b3ce38`) ✅, Phase 2 (mnemon daemon discovery, `7ccc2ce4`) ✅, Phase 3 agent-facing note in `container/CLAUDE.md` ✅. Built behind a default-off flag `NANOCLAW_WORKGROUP_SHARED_FS`; the live-data migration does not fire until the flag is set and the owner enables it after a controlled test.
 
 **Remaining follow-on (does NOT block enabling for the existing 10 workgroups):** update `/clone-as-codex` + `/clone-as-opencode` step 4 to stop creating per-dir relative symlinks and rely on the `/workspace/workgroup` mount. Relevant only for NEW siblings created *after* the flag is enabled (the existing workgroups are handled by the startup migration). The relative symlinks a clone currently creates would, post-migration, resolve to the seed's container-absolute compat symlink — messy but mount-saved; best fixed when the flag is actually enabled, with flag-aware symlink logic. Tracked here.

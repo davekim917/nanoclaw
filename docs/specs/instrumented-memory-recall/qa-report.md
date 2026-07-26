@@ -1,5 +1,9 @@
 # QA Report — instrumented-memory-recall
 
+> **ARCHIVED AND SUPERSEDED — not current QA evidence.** This spec family
+> instruments the retired Mnemon/daemon recall architecture. See the
+> [current one-canon design](../workgroup-memory-and-session-capabilities/design.md).
+
 **Branch:** `feat/instrumented-memory-recall` (5 commits ahead of main, ready for ship gate after fixes)
 **Run:** /team-auto Stage D — first QA cycle
 **Date:** 2026-05-07

@@ -8,16 +8,27 @@ description: Create an OpenCode-backed sibling agent for an existing Claude or C
 Create `groups/<source>-opencode/` from `groups/<source>/`. The opencode sibling shares:
 
 - **CLAUDE.md** — regenerated per-group by composeGroupClaudeMd on every spawn (do NOT symlink — the composer overwrites it).
-- **CLAUDE.local.md** — symlinked to the source's CLAUDE.local.md when present, so both siblings share per-group memory.
+- **Workgroup memory canon** — `data/workgroups/<workgroup-id>/memory` on the
+  host and `/workspace/workgroup/memory` in every sibling container.
+  `/workspace/agent/memory` is only the compatibility link.
+- **CLAUDE.local.md** — symlinked to the source file when present so its
+  standing instruction state is preserved byte-for-byte. It is not a memory
+  root and never becomes part of the workgroup memory canon.
 - **Repos** — symlinked top-level dirs that contain `.git/`.
 - **sources/** — ordinary knowledge files; Graphify indexes changes automatically for the workgroup.
 - **conversations/** — transcript archive; both agents see each other's archived turns.
 - **Graphify graph** — `workgroup_id` routes all siblings to the same code-and-knowledge graph while keeping other workgroups isolated.
 - **Thread worktree** — when `NANOCLAW_THREAD_WORKTREES=1`, both siblings in the same platform thread mount the same `data/v2-threads/<thread-id>/worktrees/<repo>/` host path. Uncommitted edits flow across.
 
-> Under workgroup shared-FS (`data/workgroups/<wg>/.migrated` present), the **Repos / sources / conversations** links point at the container-absolute `/workspace/workgroup/<name>` mount instead of `../<source>/` — Step 4 detects the mode and reproduces exactly what `reconcileWorkgroupSharedDirs` already did for the existing siblings. **CLAUDE.local.md** stays a relative link in both modes (it's a loose file, never migrated).
+> Under workgroup shared-FS (`data/workgroups/<wg>/.migrated` present), the **Repos / sources / conversations** links point at the container-absolute `/workspace/workgroup/<name>` mount instead of `../<source>/` — Step 4 detects the mode and reproduces exactly what `reconcileWorkgroupSharedDirs` already did for the existing siblings. **CLAUDE.local.md** stays a relative link in both modes because it is group/provider instruction state, not memory.
 
 `container.json` for the new sibling gets `provider: "opencode"` and `memory.enabled: true`.
+
+**One-memory invariant.** Every current and future sibling — Claude, Codex,
+OpenCode, or another provider — joins the source workgroup. Workgroup membership
+therefore makes it inherit the one workgroup memory canon; cloning never creates
+a provider-owned copy. Once the workgroup canon is active, no memory migration
+is part of cloning or a later provider-role change.
 
 **Capability parity invariant for new siblings.** An OpenCode sibling must
 inherit the source group's NanoClaw capability surface unless a provider/runtime
@@ -159,11 +170,12 @@ WG_DIR_ABS="$(pwd)/data/workgroups/${SOURCE_WORKGROUP}"
 mkdir -p groups/${SIBLING_FOLDER}
 cd groups/${SIBLING_FOLDER}
 
-# Per-group memory: share the source's CLAUDE.local.md so both siblings remember
-# the same project context. It's a loose FILE (the shared-FS migration only moves
-# directories), so a RELATIVE symlink is correct in BOTH modes — container-runner
-# realpath-overlays it into the sibling container. Conditional — absent if the
-# source has none. Do NOT symlink CLAUDE.md: the composer overwrites it every spawn.
+# Shared standing instructions: preserve the source's CLAUDE.local.md
+# byte-for-byte. This is group/provider instruction state, not memory. It is a
+# loose FILE, so a RELATIVE symlink is correct in BOTH shared-FS modes and
+# container-runner realpath-overlays it into the sibling container. Conditional
+# — absent if the source has none. Do NOT symlink CLAUDE.md: the composer
+# overwrites it every spawn.
 [ -f ../${SOURCE_FOLDER}/CLAUDE.local.md ] && ln -sfn ../${SOURCE_FOLDER}/CLAUDE.local.md CLAUDE.local.md
 
 if [ -f "${WG_DIR_ABS}/.migrated" ]; then
@@ -325,7 +337,7 @@ it updates dynamically. Examples: `opencode-go/kimi-k2.7-code`,
 
 `agent_groups.created_at` is `NOT NULL` with no default.
 
-**`workgroup_id` is the load-bearing field.** It places the sibling in the SAME workgroup as its source + codex sibling, which grants shared chat-archive and Graphify visibility plus workgroup-level OneCLI-secret inheritance. It lives on the `agent_groups` row, NOT in `container.json` (matching how migration 036 set up the codex siblings; `reconcileWorkgroupAtSpawn` reads the DB value, and putting it in container.json instead would trip the parity-check since `workgroup_id` is not a sibling-bound field). Omitting it here is the bug that isolated the first opencode sibling (`illysium-opencode`) into its own workgroup-of-one: migration 036 only auto-pairs the `-codex` suffix, never `-opencode`.
+**`workgroup_id` is the load-bearing field.** It places the sibling in the SAME workgroup as its source + codex sibling, which grants the same memory canon, shared chat-archive and Graphify visibility plus workgroup-level OneCLI-secret inheritance. It lives on the `agent_groups` row, NOT in `container.json` (matching how migration 036 set up the codex siblings; `reconcileWorkgroupAtSpawn` reads the DB value, and putting it in container.json instead would trip the parity-check since `workgroup_id` is not a sibling-bound field). Omitting it here is the bug that isolated the first opencode sibling (`illysium-opencode`) into its own workgroup-of-one: migration 036 only auto-pairs the `-codex` suffix, never `-opencode`.
 
 `agent_groups.name` should match `id` and `folder` — the workspace convention (`<source>-opencode`), NOT the Slack/Discord bot display name. The bot display name is platform-side (configured at api.slack.com/apps or the Discord dev portal) and is purely how chat users see the avatar; mixing the two leaves the dashboard with inconsistent groupings.
 

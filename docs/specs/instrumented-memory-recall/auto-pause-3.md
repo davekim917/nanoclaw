@@ -1,5 +1,9 @@
 # /team-auto paused at Stage D (QA) — fix-cycle cap reached
 
+> **ARCHIVED AND SUPERSEDED — not an active workflow pause.** This spec family
+> instruments the retired Mnemon/daemon recall architecture. See the
+> [current one-canon design](../workgroup-memory-and-session-capabilities/design.md).
+
 **Stage:** QA (post-build, fix-cycle 3 of 3)
 **Reason:** `cap-reached` — Codex round 3 surfaced 1 new HIGH finding (E9 chained-overlap)
 **Last action attempted:** Codex Validator E round 3 verification on commit `98faba9`

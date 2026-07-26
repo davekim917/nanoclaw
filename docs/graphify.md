@@ -110,11 +110,14 @@ systemd service uses `PrivateTmp` while Docker bind mounts resolve host paths.
 
 ## Memory architecture
 
-Graphify is the sole derived, workgroup-scoped retrieval layer. Authoritative
-memory remains in source files, external conversation history, canonical
-repository clones, provider-native context, and operator-curated
-`CLAUDE.local.md`. Graphify retrieves across those surfaces with provenance; it
-does not replace them with opaque synthesized facts.
+Graphify is the sole derived, workgroup-scoped retrieval layer. Durable agent
+memory has one authority: the canonical Markdown tree at
+`data/workgroups/<workgroup-id>/memory`. External conversation history,
+canonical repository clones, provider state, and operator-curated instruction
+files remain authoritative for their own content but are not alternate memory
+stores. Graphify retrieves across all of those distinct surfaces with
+provenance; it never promotes derived output or provider-native context into a
+second memory authority.
 
 Durable content fetched during knowledge work is captured into
 `sources/inbox`, then indexed automatically. Teammates and sibling agents in the

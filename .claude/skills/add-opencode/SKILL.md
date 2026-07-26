@@ -1,11 +1,13 @@
 ---
 name: add-opencode
-description: Use OpenCode as an agent provider (AGENT_PROVIDER=opencode). OpenRouter, OpenAI, Google, DeepSeek, etc. via OpenCode config — not the Anthropic Agent SDK. Per-session and per-group via agent_provider; host passes OPENCODE_* and XDG mount when spawning containers.
+description: Use OpenCode as an agent provider. OpenRouter, OpenAI, Google, DeepSeek, etc. via OpenCode config — not the Anthropic Agent SDK. Per group via `ncl groups config update --provider opencode`; host materializes provider config and mounts provider state when spawning containers.
 ---
 
 # OpenCode agent provider
 
-NanoClaw runs agents in a long-lived **poll loop** inside the container. The backend is selected with **`AGENT_PROVIDER`** (`claude` | `opencode` | `mock`).
+NanoClaw runs agents in a long-lived **poll loop** inside the container. The
+backend is selected per agent group by the **`provider`** field materialized
+from `container_configs` into that group's `container.json`.
 
 Trunk ships with only the `claude` provider baked in. This skill copies the OpenCode provider files in from the `providers` branch, wires them into the host and container barrels, installs dependencies, and rebuilds the image.
 
@@ -13,33 +15,49 @@ Trunk ships with only the `claude` provider baked in. This skill copies the Open
 
 ### Pre-flight
 
-If all of the following are already present, skip to **Configuration**:
+Use the following as an installed-state inventory:
 
 - `src/providers/opencode.ts`
+- `src/providers/opencode-registration.test.ts`
 - `container/agent-runner/src/providers/opencode.ts`
+- `container/agent-runner/src/providers/opencode-registration.test.ts`
 - `import './opencode.js';` line in `src/providers/index.ts`
 - `import './opencode.js';` line in `container/agent-runner/src/providers/index.ts`
 - `@opencode-ai/sdk` in `container/agent-runner/package.json`
 - `opencode-ai@${OPENCODE_VERSION}` in the pnpm global-install block in `container/Dockerfile`
 
-Missing pieces — continue below. All steps are idempotent; re-running is safe.
+Whether every item is present or some are missing, continue through the fetched
+candidate and composed-tree gates below. An installed provider must not skip
+those gates: they are what make reapply safe when the registry branch or shared
+memory contract changes. All steps are idempotent.
 
-### 1. Fetch the providers branch
+### 1. Fetch, validate, and create-only install the provider payload
 
 ```bash
-git fetch origin providers
+bash -lc 'set -euo pipefail; source setup/lib/channels-remote.sh; remote=$(resolve_channels_remote); git fetch "$remote" providers; pnpm exec tsx scripts/provider-memory-contract.ts --provider opencode --ref "$remote/providers" --install'
 ```
 
-### 2. Copy the OpenCode source files
+The installer reads and validates the complete candidate before writing any
+target. It creates missing files and accepts byte-identical existing files, but
+fails closed before the first write when an existing provider-owned file
+differs from the fetched payload. Treat that difference as a possible local
+customization and reconcile it through `/update-nanoclaw`'s full-merge audit;
+provider reapply is not permission to overwrite it. For an eligible install,
+the installer publishes missing files create-only, leaves identical files
+untouched, and validates the composed roster. Because a portable atomic
+compare-and-unlink does not exist, a later failure retains any create-only
+paths already published and reports them for inspection; it never risks
+deleting a concurrent customization. On a stale or differing preflight it
+leaves the tree untouched.
 
-Wholesale copies (owned entirely by this skill — user edits to these files won't survive a re-run, as designed):
+### 2. Verify the composed payload
+
+The provider skill plus seven provider-owned source/test paths are create-or-identical copies; a conformant
+re-run confirms them, while a stale, partial, or locally differing tree is
+never replaced.
 
 ```bash
-git show origin/providers:src/providers/opencode.ts                                    > src/providers/opencode.ts
-git show origin/providers:container/agent-runner/src/providers/opencode.ts             > container/agent-runner/src/providers/opencode.ts
-git show origin/providers:container/agent-runner/src/providers/mcp-to-opencode.ts      > container/agent-runner/src/providers/mcp-to-opencode.ts
-git show origin/providers:container/agent-runner/src/providers/mcp-to-opencode.test.ts > container/agent-runner/src/providers/mcp-to-opencode.test.ts
-git show origin/providers:container/agent-runner/src/providers/opencode.factory.test.ts > container/agent-runner/src/providers/opencode.factory.test.ts
+pnpm exec tsx scripts/provider-memory-contract.ts --provider opencode --require-payload
 ```
 
 ### 3. Append the self-registration imports
@@ -113,23 +131,15 @@ pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit   # container typ
 ```
 
 > **Build cache gotcha:** The container buildkit caches COPY steps aggressively. If provider files were already present in the build context before, the new files may not be picked up. If you see "Unknown provider: opencode" after the build, prune the builder and rebuild:
+>
 > ```bash
 > docker builder prune -f && ./container/build.sh
 > ```
 
-### 7. Propagate to existing per-group overlays
-
-Each agent group has a live source overlay at `data/v2-sessions/<group-id>/agent-runner-src/providers/` that **overrides the image at runtime**. This overlay is created when the group is first wired and never auto-updated by image rebuilds. Any group that already existed before this skill ran needs the new files copied in manually.
-
-```bash
-for overlay in data/v2-sessions/*/agent-runner-src/providers/; do
-  [ -d "$overlay" ] || continue
-  cp container/agent-runner/src/providers/opencode.ts "$overlay"
-  cp container/agent-runner/src/providers/mcp-to-opencode.ts "$overlay"
-  cp container/agent-runner/src/providers/index.ts "$overlay"
-  echo "Updated: $overlay"
-done
-```
+Agent-runner source is not copied per group. The host bind-mounts the one
+`container/agent-runner/src` tree read-only at `/app/src` for every container,
+so the installed provider source is picked up on the next spawn. Do not create
+or mutate retired per-group source overlays.
 
 ## Configuration
 
@@ -137,7 +147,8 @@ done
 
 Model, provider, and effort live in the **`container_configs`** DB row, set via `ncl` — the same one-pattern template claude and codex use (a code-level default, overridden per-group in the DB). The host **no longer reads** `OPENCODE_PROVIDER` / `OPENCODE_MODEL` / `OPENCODE_SMALL_MODEL` / `OPENCODE_EFFORT` from `.env` for model selection (those scoped vars are dead — see `src/providers/opencode.ts`). The provider is **derived from the model slug's prefix** (`deepseek/…` → deepseek, `opencode-go/…` → Go, `opencode/…` → Zen, `nvidia/…` → NVIDIA); there is no base-URL var to set — opencode's provider registry routes by prefix + the auth.json/OneCLI cred.
 
-Set the model on the group (after `agent_provider=opencode` is set, below — the group row must exist):
+Set the model on the group after selecting `provider=opencode` below (the group
+row must exist):
 
 ```bash
 ncl groups config update --id <agentGroupFolder> --model deepseek/deepseek-chat --effort high
@@ -175,6 +186,7 @@ onecli secrets create --name "DeepSeek" --type generic \
 #### Example: OpenRouter
 
 Model id for `--model`: `openrouter/anthropic/claude-sonnet-4`. Register the key:
+
 ```bash
 onecli secrets create --name "OpenRouter" --type generic \
   --value YOUR_KEY --host-pattern "openrouter.ai" \
@@ -189,7 +201,10 @@ Model id for `--model`: `anthropic/claude-sonnet-4-20250514`. When the model is 
 
 Zen's HTTP API (e.g. `POST …/zen/v1/messages`) expects the key in the **`x-api-key`** header. If OneCLI injects **`Authorization: Bearer …`** only, Zen often returns **401 / "Missing API key"** even though the gateway is working.
 
-**Naming:** NanoClaw **`AGENT_PROVIDER=opencode`** (DB `agent_provider`) means "run the **OpenCode agent provider**." Separately, the **`opencode`** prefix in a model slug is OpenCode's **Zen provider id** — the host derives the routing provider from the slug prefix (see [Zen docs](https://opencode.ai/docs/zen/)).
+**Naming:** NanoClaw's group config **`provider=opencode`** means "run the
+**OpenCode agent provider**." Separately, the **`opencode`** prefix in a model
+slug is OpenCode's **Zen provider id** — the host derives the routing provider
+from the slug prefix (see [Zen docs](https://opencode.ai/docs/zen/)).
 
 Model id for `--model`: an `opencode/<id>` slug, e.g. `opencode/big-pickle` (use a real Zen model id from the docs).
 
@@ -201,9 +216,19 @@ onecli secrets create --name "OpenCode Zen" --type generic \
   --header-name "x-api-key" --value-format "{value}"
 ```
 
-### Per group / per session
+### Per group
 
-Set `"provider": "opencode"` in the group's **`container.json`** (`groups/<folder>/container.json`) — the in-container runner reads `provider` from there, not from the DB. The DB columns **`agent_groups.agent_provider`** and **`sessions.agent_provider`** (session overrides group) only drive host-side provider contribution — per-session XDG mount, `OPENCODE_*` env passthrough — and do not propagate into `container.json` at spawn time. Set both, or just edit `container.json`; if they disagree, the runner uses `container.json` and the host-side resolver falls back through session → group → `container.json` → `'claude'`.
+Select OpenCode through the container-config source of truth, then restart the
+group so the host materializes the new `provider` into `container.json` and
+spawns with the matching host contribution:
+
+```bash
+ncl groups config update --id <group-id> --provider opencode
+ncl groups restart --id <group-id>
+```
+
+Do not hand-edit `groups/<folder>/container.json` or legacy
+`agent_groups.agent_provider` fields.
 
 Extra MCP servers still come from **`NANOCLAW_MCP_SERVERS`** / `container_config.mcpServers` on the host; the runner merges them into the same `mcpServers` object passed to **both** Claude and OpenCode providers.
 
@@ -211,7 +236,7 @@ Extra MCP servers still come from **`NANOCLAW_MCP_SERVERS`** / `container_config
 
 - OpenCode keeps a local **`opencode serve`** process and SSE subscription; the provider tears down with **`stream.return`** and **SIGKILL** on the server process on **`abort()`** / shared runtime reset to avoid MCP/zombie hangs.
 - Session continuation passes through whatever opaque id OpenCode hands back; stale sessions are cleared by `isSessionInvalid` on OpenCode-specific error patterns. If you see session-not-found errors after an accidental CLI version mismatch, clear `session_state` in `outbound.db` and wipe the `opencode-xdg` directory under the session folder.
-- **`NO_PROXY`** for localhost matters when the OpenCode client talks to `127.0.0.1` inside the container while HTTP(S)_PROXY is set (e.g. OneCLI).
+- **`NO_PROXY`** for localhost matters when the OpenCode client talks to `127.0.0.1` inside the container while HTTP(S)\_PROXY is set (e.g. OneCLI).
 
 ## Verify
 
@@ -220,5 +245,7 @@ grep -q "./opencode.js" container/agent-runner/src/providers/index.ts && echo "c
 grep -q "./opencode.js" src/providers/index.ts && echo "host barrel: OK"
 grep -q "@opencode-ai/sdk" container/agent-runner/package.json && echo "agent-runner dep: OK"
 grep -q "opencode-ai@" container/Dockerfile && echo "Dockerfile install: OK"
+pnpm exec vitest run src/providers/opencode-registration.test.ts
 cd container/agent-runner && bun test src/providers/ && cd -
+pnpm exec tsx scripts/provider-memory-contract.ts --provider opencode --require-payload
 ```

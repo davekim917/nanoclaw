@@ -1,5 +1,11 @@
 # Spike Notes
 
+> **ARCHIVED AND SUPERSEDED — do not execute.** These pre-v2 spike findings
+> include a retired per-agent semantic-memory design, stale file paths, and
+> incomplete implementation sketches. Current memory behavior is defined by
+> [memory.md](memory.md) and the
+> [one-canon design](specs/workgroup-memory-and-session-capabilities/design.md).
+
 Findings from pre-flight uncertainty-reduction spikes. Logged before Phase 2 formally starts so insights aren't lost.
 
 ## Empirical Questions Answered

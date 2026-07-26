@@ -3,7 +3,8 @@
 A **workgroup** is a tenant-level grouping that contains one or more `agent_groups`. It is the data-pool boundary for:
 
 - **Chat archive** — sibling agents in a workgroup can read each other's archived chat history via the existing `resolve_thread_link` / `search_threads` / `read_thread` MCP tools.
-- **Graphify knowledge retrieval** — members query one source-grounded graph over shared files, repositories, and conversations.
+- **Durable memory** — siblings read and edit one canonical Markdown tree and receive workgroup-wide recall before every admissible turn.
+- **Graphify knowledge retrieval** — members may query one advisory graph over shared files, repositories, and conversations.
 - **OneCLI secret declarations** — workgroup-level secrets are inherited by all member agent_groups at container spawn time.
 
 Sibling `agent_groups` (e.g., a Claude twin + a Codex twin, plus future siblings like `<x>-research` or `<x>-data-analyst`) are peers — each remains a separate row in the database with its own platform bot user, CLAUDE.md, container, and routing identity. No sibling is a parent of another; the workgroup is the layer **above** them, not a collapse and not a hierarchy.
@@ -17,6 +18,44 @@ NanoClaw's sibling-agent architecture requires per-agent bot identity for native
 Before workgroups, this was patched up implicitly via scattered symlinks (`CLAUDE.local.md`, `sources/`, `conversations/`). The pairing was implicit (naming convention `<x>` + `<x>-codex`) and broke silently if any wiring drifted.
 
 The workgroup model formalizes the pairing as a first-class concept with explicit semantics.
+
+---
+
+## Shared memory, background capture, and pre-turn context
+
+The single memory authority for a workgroup is
+`data/workgroups/<workgroup-id>/memory`. Containers mount it at
+`/workspace/workgroup/memory`; `/workspace/agent/memory` and recognized
+provider-native paths are compatibility views of the same files, not
+authorities.
+
+Use `write_memory_file` for direct Markdown edits. Its expected SHA-256 check
+and atomic replacement prevent a sibling from silently overwriting an edit made
+after it last read the file. Treat raw provider-native projections as
+read-only. Ordinary same-file raw shell writes retain normal filesystem
+last-writer semantics and are an explicit operator escape hatch.
+
+When automatic curation is enabled, all siblings also feed one durable
+workgroup episode queue in `data/archive.db`. After an idle debounce, one host
+worker selectively writes only
+`data/workgroups/<workgroup-id>/memory/generated/memory.md`. Claude, Codex, and
+OpenCode therefore generate and recall from the same automatic-memory canon;
+there is no provider-specific generated store. Imported/manual files remain
+protected, failed jobs retain their cursor, and fixed admission limits leave
+excess work queued rather than dropping it.
+
+Before every admissible turn, the host supplies actual session capabilities,
+canonical memory, same-thread evidence, workgroup-wide archive recall, and
+exact Slack/Discord permalink provenance. Missing or failed sources produce an
+explicit degraded notice; they never broaden the workgroup boundary. Graphify
+is advisory rather than a memory authority, but agents must use it on demand
+when a task depends on code, architecture, requirements, prior decisions, or
+cross-artifact lineage. It is not a prerequisite for basic first-response
+memory recall.
+
+Provider identity, instructions, configuration, continuation state, and all
+non-memory customizations remain sibling-scoped. Sharing memory does not merge
+bots, sessions, worktrees, routing identity, permissions, or credentials.
 
 ---
 
@@ -37,9 +76,14 @@ A `CHECK` constraint on `workgroups.id` rejects values matching the opaque `agen
 
 - **Operator-facing source of truth:** `container.json.workgroup_id` (optional field).
 - **Runtime canonical:** `agent_groups.workgroup_id` (DB column).
-- **Reconciliation:** the host re-reads `container.json` on every container spawn and reconciles the DB column atomically. If the operator changes `container.json.workgroup_id`, the next spawn of any group will propagate the change.
+- **Reconciliation:** the host re-reads `container.json` on every container spawn and reconciles the DB column atomically. An explicit `container.json.workgroup_id` replaces the current DB assignment.
 
-When `container.json.workgroup_id` is omitted, the workgroup defaults to the agent group's own folder slug — i.e., a workgroup-of-1 (functionally identical to today's `'self'` mode).
+Omitting `container.json.workgroup_id` preserves an existing non-null DB
+assignment, including sibling pairings created by migration 036. Only a group
+with neither an explicit config value nor an existing DB assignment defaults to
+its own folder slug as a workgroup-of-1. To intentionally unpair an existing
+member, set `container.json.workgroup_id` explicitly to that member's own folder
+slug and restart its containers; removing the field does not unpair it.
 
 ### Auto-pairing (migration 036)
 
@@ -59,13 +103,13 @@ Future siblings beyond the `<x>-codex` convention (e.g., `<x>-research`, `<x>-da
 
 The per-agent projection (built by the host at every container spawn) widens **only** the chat archive table. All other central-DB tables stay agent-scoped:
 
-| Table | Pool to workgroup? | Why |
-|---|---|---|
-| `messages_archive` | **Yes** — workgroup-wide projection | Siblings share chat history (Requirement R2) |
-| `backlog_items` | No (agent-scoped) | Each agent has its own todo list |
-| `ship_log` | No (agent-scoped) | Each agent's commits are its own activity |
-| `tasks` | No (filtered by `parent_agent_group_id` — schema column name; refers to the orchestrating agent) | Dispatch ownership is per-agent |
-| `agent_group_capabilities` | No (agent-scoped) | Orchestrator role is per-agent — pooling would silently widen capability |
+| Table                      | Pool to workgroup?                                                                               | Why                                                                      |
+| -------------------------- | ------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------ |
+| `messages_archive`         | **Yes** — workgroup-wide projection                                                              | Siblings share chat history (Requirement R2)                             |
+| `backlog_items`            | No (agent-scoped)                                                                                | Each agent has its own todo list                                         |
+| `ship_log`                 | No (agent-scoped)                                                                                | Each agent's commits are its own activity                                |
+| `tasks`                    | No (filtered by `parent_agent_group_id` — schema column name; refers to the orchestrating agent) | Dispatch ownership is per-agent                                          |
+| `agent_group_capabilities` | No (agent-scoped)                                                                                | Orchestrator role is per-agent — pooling would silently widen capability |
 
 The structural test at `tests/structural/projection-chokepoint.test.ts` enforces this invariant: any future MCP tool query against `messages_archive` must go through the projection's chokepoint, and the agent-scoped tables retain their in-container `WHERE agent_group_id = ?` filters.
 
@@ -94,7 +138,8 @@ are included unless a narrow `.graphifyignore` rule excludes them.
 Containers call Graphify through `ncl`, which derives the workgroup from trusted
 session context. Callers cannot supply a cross-workgroup override. A current
 thread's managed worktree is admitted only after the host validates that the
-session belongs to the same workgroup.
+session belongs to the same workgroup. Graphify output is optional and
+advisory. Canonical Markdown and exact archive provenance remain authoritative.
 
 ---
 
@@ -132,7 +177,11 @@ The migration writes `logs/migration-036-secrets.log` containing per-workgroup i
 
 ## Staleness window
 
-The reconciler runs on every container spawn, but does NOT propagate `container.json.workgroup_id` changes to **already-running** containers. Long-running containers hold their `workgroup_id` from spawn time; operator-edited `container.json` doesn't reach them until they restart.
+The reconciler runs on every container spawn, but does NOT propagate explicit
+`container.json.workgroup_id` changes to **already-running** containers.
+Long-running containers hold their `workgroup_id` from spawn time;
+operator-edited `container.json` doesn't reach them until they restart. Removing
+the field is not a change request: it preserves the current DB assignment.
 
 For typical NanoClaw operation (containers restart frequently or per-session), this is acceptable. For long-running scenarios, restart the container after editing its `container.json.workgroup_id`. A future `/reconcile-workgroups` admin command could force a re-read without spawn — currently out of scope.
 
@@ -157,16 +206,20 @@ The migration path is well-understood (table rebuild with a new column for the o
 
 ## Where things live
 
-| What | Where |
-|---|---|
-| Schema | `src/db/migrations/036-workgroup-id.ts` |
-| Per-agent projection | `src/db/per-agent-projections.ts` (`buildArchiveProjection`, `buildCentralProjection`) |
-| Scope resolver | `src/modules/memory/scope-resolver.ts` (`resolveWorkgroupMembers`, `resolveWorkgroupStoreId`) |
-| Container config types | `src/container-config.ts` (`RecallScope`, `ContainerConfig.workgroup_id`) |
-| Spawn-time reconciler | `src/container-runner.ts` (search for `reconcileWorkgroupAtSpawn`) |
-| OneCLI secret merge | `src/onecli-secrets.ts` (`mergeWorkgroupAndGroupSecrets`) |
-| FS reconciliation (startup) | `src/modules/workgroup/fs-reconcile.ts` (`reconcileWorkgroupFsState`) |
-| Operator CLI | `scripts/set-workgroup-secrets.ts` |
-| Structural assertion | `tests/structural/projection-chokepoint.test.ts` |
+| What                                 | Where                                                                                     |
+| ------------------------------------ | ----------------------------------------------------------------------------------------- |
+| Schema                               | `src/db/migrations/036-workgroup-id.ts`                                                   |
+| Per-agent projection                 | `src/db/per-agent-projections.ts` (`buildArchiveProjection`, `buildCentralProjection`)    |
+| Trusted pre-turn scope and recall    | `src/modules/memory/pre-turn-context.ts` (`buildPreTurnContext`)                          |
+| Container config types               | `src/container-config.ts` (`ContainerConfig.workgroup_id`)                                |
+| Spawn-time reconciler                | `src/container-runner.ts` (search for `reconcileWorkgroupAtSpawn`)                        |
+| OneCLI secret merge                  | `src/onecli-secrets.ts` (`mergeWorkgroupAndGroupSecrets`)                                 |
+| FS reconciliation (startup)          | `src/modules/workgroup/fs-reconcile.ts` (`reconcileWorkgroupFsState`)                     |
+| Memory canon and compatibility views | `src/modules/workgroup/shared-dirs.ts` (`workgroupMemoryDir`, `reconcileWorkgroupMemory`) |
+| Operator CLI                         | `scripts/set-workgroup-secrets.ts`                                                        |
+| Structural assertion                 | `tests/structural/projection-chokepoint.test.ts`                                          |
 
-Specification: `docs/specs/workgroup-scoped-data-layer/` (brief, design, review, plan, decisions).
+Current memory contract:
+`docs/specs/workgroup-memory-and-session-capabilities/design.md`. The original
+workgroup entity-model history remains under
+`docs/specs/workgroup-scoped-data-layer/`.

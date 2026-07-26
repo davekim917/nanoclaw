@@ -1,0 +1,569 @@
+feature: workgroup-memory-and-session-capabilities
+created_by: /team-brief
+last_updated_by: /team-auto
+record_status: superseded_non_normative
+normative_contract: docs/specs/workgroup-memory-and-session-capabilities/plan.md
+contract_version: 3
+
+superseded_record_note: >-
+  This compact ledger predates the operator-approved background curator.
+  plan.md is the sole normative contract and supersedes this record wherever
+  they differ, including automatic semantic capture and writer ownership.
+
+historical_note:
+  status: superseded_non_normative
+  text: >-
+    The prior accreted design and 119 review decisions were discarded after the
+    user identified a whack-a-mole architecture failure. Their coordinator,
+    audience, ledger, COW, declassification, Graphify-token, spawn, delivery,
+    and credential machinery is not implementation authority. Git preserves it.
+
+constraints:
+  - {
+      id: C1,
+      type: HARD,
+      text: 'Customizations and durable memory outrank defaults; preserve unknown and conflicting bytes.',
+      source: brief,
+      verified: true,
+      affects_groups: [A, D],
+    }
+  - {
+      id: C2,
+      type: HARD,
+      text: 'Exactly one read/write Markdown memory tree exists per workgroup.',
+      source: brief,
+      verified: true,
+      affects_groups: [A, B, D],
+    }
+  - {
+      id: C3,
+      type: HARD,
+      text: 'Trusted host DB workgroup membership bounds recall; unrelated workgroups remain isolated.',
+      source: brief,
+      verified: true,
+      affects_groups: [A, B, D],
+    }
+  - {
+      id: C4,
+      type: HARD,
+      text: 'Existing session owner-safety still filters capabilities and credentials.',
+      source: brief,
+      verified: true,
+      affects_groups: [B, D],
+    }
+  - {
+      id: C5,
+      type: HARD,
+      text: 'Recalled Markdown and archive messages are delimited data, not instructions or actions.',
+      source: brief,
+      verified: true,
+      affects_groups: [B, C, D],
+    }
+  - {
+      id: C6,
+      type: HARD,
+      text: 'Migration is checksummed, collision-safe, reversible, and keeps rollback permanently.',
+      source: brief,
+      verified: true,
+      affects_groups: [A, D],
+    }
+  - {
+      id: C7,
+      type: HARD,
+      text: 'Provider identity, instructions, config, credentials, state, and non-memory customizations remain separate.',
+      source: brief,
+      verified: true,
+      affects_groups: [A, D],
+    }
+  - {
+      id: C8,
+      type: SOFT,
+      text: 'Reuse current storage, archive, capability, and message seams.',
+      source: brief,
+      verified: true,
+      affects_groups: [A, B, C, D],
+    }
+  - {
+      id: C9,
+      type: SOFT,
+      text: 'Keep injected context bounded and relevant.',
+      source: brief,
+      verified: true,
+      affects_groups: [B, C, D],
+    }
+
+decisions:
+  - id: D1
+    stage: design
+    description: 'Canonical memory and compatibility'
+    chosen: >-
+      Canon is data/workgroups/<workgroup-id>/memory, mounted at
+      /workspace/workgroup/memory; every sibling keeps /workspace/agent/memory
+      through the current compatibility-link pattern. Startup/group-init/spawn
+      reconcile only missing paths and exact shipped scaffolds. Any substantive
+      or ambiguous local tree fails closed to the quiescent lossless migrator;
+      only its verified cutover imports bytes and installs the link. Host tools
+      use canonical host paths, never the container-only link.
+    rejected:
+      - { option: 'Independent group copies', reason: 'Copies diverge and violate one canon.' }
+      - {
+          option: 'Host-only coordinator and projections',
+          reason: 'Breaks direct Markdown editing and adds another authority.',
+        }
+    constraint_refs: [C1, C2, C3, C7, C8]
+    affects_groups: [A, D]
+
+  - id: D2
+    stage: design
+    description: 'Automatic provider context'
+    chosen: >-
+      At writeSessionMessageInternal, pass normalized row/content as untrusted
+      query input, derive scope from trusted DB state, apply the host equivalent
+      of isAdmissibleTrigger, and transactionally insert the paired row first.
+      Serialize untrusted excerpts collision-safely apart from trusted
+      capabilities; bound/fail-open each source with degraded notices. Only
+      trusted scope-resolution failure blocks ingress. Runner prompt limits
+      select pair-complete recall/trigger logical units.
+    rejected:
+      - { option: 'Require provider tools', reason: 'Optional discovery caused the observed failures.' }
+      - {
+          option: 'New runtime schema and admission protocol',
+          reason: 'The paired row already provides ordered transport.',
+        }
+    constraint_refs: [C4, C5, C8, C9]
+    affects_groups: [B, C]
+
+  - id: D3
+    stage: design
+    description: 'Recall sources'
+    chosen: >-
+      Search canonical Markdown and current host archive directly, preferring
+      current thread and exact pasted links. First spike the lexical corpus;
+      permit only bounded ephemeral current-query expansion if needed, then stop
+      if unchanged gates still fail. Graphify stays optional/advisory.
+    rejected:
+      - {
+          option: 'Graphify correctness floor',
+          reason: 'It missed production SipTrue evidence retained in the archive.',
+        }
+      - { option: 'Archive as distilled canon', reason: 'Archive is exact provenance; Markdown is distilled memory.' }
+    constraint_refs: [C2, C3, C5, C8, C9]
+    affects_groups: [B, D]
+
+  - id: D4
+    stage: design
+    description: 'Durable capture'
+    chosen: 'Archive exact history and preserve direct agent-curated shared Markdown; add no semantic classifier or fact store.'
+    rejected:
+      - { option: 'Classify every turn into facts', reason: 'Duplicates provenance and creates another authority.' }
+    constraint_refs: [C1, C2, C5, C7, C8]
+    affects_groups: [B, D]
+
+  - id: D5
+    stage: design
+    description: 'Write concurrency'
+    chosen: >-
+      One provider-neutral command holds a bounded nonblocking kernel flock on
+      one host-created, no-follow regular sidecar shared by every workgroup
+      sibling. The lock covers expected-hash validation, temp write/fsync,
+      recheck, descriptor-anchored rename, and parent fsync; process death
+      releases it without PID/time stealing. New notes use unique names. Raw
+      shell edit remains an explicit ordinary-filesystem escape hatch.
+    rejected:
+      - { option: 'Distributed writer/ledger', reason: 'No demonstrated workload justifies breaking direct edits.' }
+    constraint_refs: [C1, C2, C7, C8]
+    affects_groups: [C]
+
+  - id: D6
+    stage: design
+    description: 'Migration and rollback'
+    chosen: >-
+      Discover all sources at execution time, snapshot and checksum every byte,
+      ignore only exact scaffold, copy without overwrite, preserve collisions
+      under imports/<source-group>/, and verify report/rollback. Before snapshot
+      and again before cutover, clean install-scoped orphans and prove no affected
+      container remains; rehash immediately before switching links.
+    rejected:
+      - {
+          option: 'Hard-code stores or choose one winner',
+          reason: 'Live inputs change and winner selection loses customizations.',
+        }
+      - { option: 'Semantic conflict merge', reason: 'Equivalence cannot be proven.' }
+    constraint_refs: [C1, C2, C6, C7]
+    affects_groups: [A, D]
+
+  - id: D7
+    stage: design
+    description: 'Security boundary'
+    chosen: >-
+      Derive workgroup and session messaging context from trusted host DB state;
+      reuse workgroup pooling and owner-safe capability filtering without new
+      intra-workgroup audience algebra.
+    rejected:
+      - { option: 'Model-provided scope', reason: 'Untrusted identifiers cannot authorize access.' }
+      - { option: 'New audience/isolation systems', reason: 'Outside the approved boundary and regression.' }
+    constraint_refs: [C3, C4, C5, C8]
+    affects_groups: [B, D]
+
+waivers: []
+assumptions:
+  - id: A1
+    stage: design
+    text: 'Memory links work for Claude, Codex, and OpenCode.'
+    validation: 'Edit via each provider path and verify one host tree.'
+    validated: true
+    invalidated_at: null
+  - id: A2
+    stage: design
+    text: 'Live Markdown fits a practical bounded direct-scan budget.'
+    validation: 'Inventory and benchmark cold/warm incident turns before setting constants.'
+    validated: true
+    invalidated_at: null
+  - id: A3
+    stage: design
+    text: 'Bounded lexical lookup is representative beyond the known incidents.'
+    validation: 'First spike: unchanged corpus gates; ephemeral query expansion only after lexical failure; stop if still failing.'
+    validated: true
+    invalidated_at: null
+
+review_cycles:
+  - stage: review
+    reviewer: team-review
+    iteration: 1
+    verdict: APPROVE-WITH-CHANGES
+    must_fix_count: 7
+    should_fix_count: 0
+    wont_fix_count: 0
+    resolution: >-
+      The compact architecture was retained. Review found seven bounded
+      correctness gaps: cutover quiescence, future-sibling reconciliation,
+      current-input and trigger eligibility, structural escaping, per-source
+      failure isolation, stale-write detection for routine edits, and broader
+      lexical retrieval evaluation. No new subsystem was accepted.
+    completed_at: 2026-07-25T20:57:32.223Z
+  - stage: review
+    reviewer: team-review
+    iteration: 2
+    verdict: APPROVE-WITH-CHANGES
+    must_fix_count: 6
+    should_fix_count: 0
+    wont_fix_count: 0
+    resolution: >-
+      Cycle 1 changes were materially present. Six bounded edge gaps remained:
+      orphan-container quiescence, pre-link future-sibling seeds, real
+      per-path mutual exclusion, pair-complete prompt limits, behavioral
+      indirect-injection evaluation, and an early lexical/paraphrase spike with
+      bounded query expansion only if required. No platform subsystem was added.
+    completed_at: 2026-07-25T21:06:46.279Z
+  - stage: review
+    reviewer: team-review
+    iteration: 3
+    verdict: APPROVED
+    must_fix_count: 0
+    should_fix_count: 0
+    wont_fix_count: 0
+    resolution: >-
+      Architecture, live-source best-practice, and adversarial reviewers each
+      returned no findings after verifying M8-M13 closure against the compact
+      approved contract. No new scope or subsystem was introduced.
+    completed_at: 2026-07-25T21:12:53.726Z
+auto_qa_cycles:
+  - iteration: 13
+    validators:
+      [focused-regressions, full-host-suite, typechecks, build, runtime-verifier, live-activation, provider-parity]
+    must_fix_count: 0
+    should_fix_count: 0
+    completed_at: 2026-07-26T09:45:58Z
+    resolution: >-
+      Repaired legacy inbound-schema reconciliation and locale-dependent memory
+      ordering, added direct pending/processing/scheduled/startup/idempotence and
+      deterministic-order regressions, passed 108 focused and 3,017 full-host
+      tests, both TypeScript boundaries, build and hygiene gates, activated the
+      host, verified all eight applied workgroups with no activation blocker,
+      and proved all 23 protected provider payload paths byte-equal to the
+      frozen provider tree. Final two-reviewer zero-drift confirmation remains
+      the release gate.
+  - iteration: 14
+    validators:
+      [
+        focused-regressions,
+        full-host-suite,
+        full-container-suite,
+        typechecks,
+        build,
+        runtime-verifier,
+        live-activation,
+        provider-parity,
+      ]
+    must_fix_count: 0
+    should_fix_count: 0
+    completed_at: 2026-07-26T10:24:00Z
+    resolution: >-
+      Repaired all four source-proven Gate 13 findings at shared seams:
+      production pair-complete prompt admission, migration source-ancestor
+      containment, deterministic secondary collision preservation, and
+      symlink-safe provider publication. Passed 150 focused, 3,020 full-host,
+      and 921 full-container tests, both TypeScript boundaries, build and
+      hygiene gates; activated and verified all eight applied workgroups with
+      no blocker; and reconfirmed exact 23-path provider parity. Two fresh
+      zero-drift reviewers remain the final implementation gate.
+  - iteration: 15
+    validators: [documentation-contract, focused-regression, build, typecheck, diff-hygiene]
+    must_fix_count: 0
+    should_fix_count: 0
+    completed_at: 2026-07-26T10:43:59Z
+    resolution: >-
+      Repaired Gate 14's sole divergence by documenting the runtime's existing
+      reconciliation contract: omitted config preserves a non-null DB
+      assignment, while intentional unpairing requires an explicit own-folder
+      workgroup_id and restart. Added a focused contract regression. Two fresh
+      zero-drift reviewers remain the final implementation gate.
+  - iteration: 16
+    validators: [migration-path-identity, applied-report-audit, focused-regression, formatting, diff-hygiene]
+    must_fix_count: 0
+    should_fix_count: 0
+    completed_at: 2026-07-26T11:09:47Z
+    resolution: >-
+      Repaired Gate 15's source-proven migration defect by making exact-byte
+      deduplication relative-path-aware. Same-path duplicates still retain all
+      origins while distinct paths and their Markdown references remain
+      present. Added apply/report/link/rollback coverage, and confirmed the
+      already-applied live report contains no omitted requested path. Two fresh
+      zero-drift reviewers remain the final implementation gate.
+  - iteration: 17
+    validators:
+      [canonical-path-identity, unsafe-collapse-rejection, workgroup-lock-docs, focused-regression, runtime-verifier]
+    must_fix_count: 0
+    should_fix_count: 0
+    completed_at: 2026-07-26T11:39:19Z
+    resolution: >-
+      Repaired both Gate 16 divergences. Exact replay of lineage already at its
+      deterministic import path now shares that canonical identity without
+      forcing per-file duplicates, while distinct intended paths remain
+      separate and unsafe cross-path outcome collapse blocks activation. The
+      operator guide now states the actual workgroup-wide kernel-lock scope.
+      Focused validation passes 87 tests and the live verifier reports zero
+      failures and no activation blocker. Two fresh zero-drift reviewers remain
+      the final implementation gate.
+auto_judgments:
+  - stage: Build
+    iteration: 1
+    decision: 'Group C consumes only the four plan-level context fields and treats evidence internals as opaque JSON.'
+    alternatives_considered:
+      - 'Invent a nested evidence schema in Group C before Group B exists.'
+      - 'Use the exact plan-level fields and keep untrusted internals opaque.'
+    grounding:
+      - 'plan.md Task B1 defines trustedCapabilities, memoryEvidence, conversationEvidence, and notices.'
+      - 'plan.md Task C2 requires trusted capability state and untrusted evidence to remain separate.'
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-07-25T22:49:59.883Z
+  - stage: Build
+    iteration: 1
+    decision: 'Assign the existing provider-surface regression test to Group A and update it for canonical host memory plus the container-absolute link.'
+    alternatives_considered:
+      - 'Keep the obsolete host-dereference assertion.'
+      - 'Weaken the container-absolute compatibility-link design.'
+      - 'Update the regression test within Group A ownership.'
+    grounding:
+      - 'src/provider-surfaces.test.ts:129-142 asserts the legacy group-local host memory path.'
+      - 'design.md Canon and Compatibility requires the provider path to be container-absolute and intentionally host-dangling.'
+      - 'plan.md Task A1 requires provider mount plans to resolve one canonical workgroup tree.'
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-07-25T22:56:54.310Z
+  - stage: Build
+    iteration: 1
+    decision: 'Keep the D2 verifier rooted only in trusted install config; remove unused path and clock injection.'
+    alternatives_considered:
+      - 'Retain uncalled dataDir, groupsDir, dbPath, and now overrides.'
+      - 'Use DATA_DIR, GROUPS_DIR, and the configured central DB directly.'
+    grounding:
+      - 'design.md Verifier Contract requires DB-derived scope and forbids untrusted path overrides.'
+      - 'scripts/verify-workgroup-memory-runtime.test.ts exercises the CLI through trusted cwd/config without programmatic path injection.'
+      - 'ponytail-review found the overrides had no caller or test and duplicated configuration authority.'
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-07-26T02:07:55.000Z
+  - stage: Build
+    iteration: 2
+    decision: 'Persist explicit group-creation instructions through the existing instructions.prepend.md persona seam and leave legacy .seed.md completely untouched.'
+    alternatives_considered:
+      - 'Consume .seed.md into CLAUDE.local.md.'
+      - 'Import instructions into canonical memory.'
+      - 'Use the existing standing-instruction surface without reading or deleting legacy bytes.'
+    grounding:
+      - 'design.md lines 139-140 require prompts, identity, CLAUDE.local.md, and all non-memory files to remain untouched.'
+      - 'src/group-persona.ts already owns the provider-neutral standing-instruction surface.'
+      - 'Provider-surface regressions prove repeated initialization cannot overwrite existing instruction state.'
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-07-26T03:32:18.000Z
+  - stage: Build
+    iteration: 2
+    decision: 'Use opened-file identity validation for portable host Markdown reads and opened Linux directory descriptors for container-side atomic memory commits.'
+    alternatives_considered:
+      - 'Rely on final-component O_NOFOLLOW after path enumeration.'
+      - 'Revalidate string paths immediately before rename.'
+      - 'Pin the object read by the host and anchor the container rename to opened filesystem objects.'
+    grounding:
+      - 'design.md lines 141-147 require bounded token-owned locking through atomic rename without a new service.'
+      - 'Host tests prove ancestor swaps cannot expose outside Markdown bytes.'
+      - 'Container tests prove a final-window parent swap cannot redirect the committed write outside canon.'
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-07-26T03:32:18.000Z
+  - stage: Build
+    iteration: 2
+    decision: 'Represent abandoned writer recovery with a bounded owner-token/time lease and no PID authority.'
+    alternatives_considered:
+      - 'Treat a numeric PID as live-owner proof across sibling containers.'
+      - 'Add a coordinator service or schema.'
+      - 'Keep the existing token/time lock pattern and make commit fencing use the same bounded lease.'
+    grounding:
+      - 'design.md lines 141-147 selects token/time ownership and bounded stale recovery.'
+      - 'Sibling containers do not share a reliable PID ownership namespace.'
+      - 'The stale/reused PID regression and stale-writer fencing suite pass without a new service or schema.'
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-07-26T03:32:18.000Z
+  - stage: Build
+    iteration: 2
+    decision: 'Reuse an inert paired recall row as the no-schema crash-retry marker, replace it with fresh context when due, and admit dashboard run-now synchronously before wake.'
+    alternatives_considered:
+      - 'Reuse the old recall on replacement.'
+      - 'Promote every due trigger-zero row.'
+      - 'Mark only previously paired retries and rebuild their context through the existing due-admission seam.'
+    grounding:
+      - 'design.md lines 190-200 require an adjacent pair and fresh context on replacement.'
+      - 'Ordinary trigger-zero rows have no recall marker and remain non-triggering.'
+      - 'Dashboard run-now now verifies the fresh pair before wake and fails closed without claiming fired.'
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-07-26T03:32:18.000Z
+  - stage: Build
+    iteration: 3
+    decision: 'Supersede the elapsed-time writer lease with one always-shared workgroup kernel lock held across the complete atomic Markdown transaction.'
+    alternatives_considered:
+      - 'Add another user-space token check immediately before rename.'
+      - 'Keep time-based lock stealing across container PID namespaces.'
+      - 'Use one stable host-created sidecar bind mount and kernel flock for the low-rate workgroup writer.'
+    grounding:
+      - 'A deterministic two-process regression proved both elapsed-time lease owners could publish from the same expected SHA.'
+      - 'Kernel flock releases on process death and cannot be stolen from a live holder by elapsed time.'
+      - 'The exact sidecar is outside the canonical memory tree and must be bind-mounted in both nested-memory and full-workgroup modes.'
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-07-26T04:05:07.000Z
+  - stage: Build
+    iteration: 3
+    decision: 'Keep provider lifecycle injection as trusted static handling guidance only; canonical and archive bytes enter exclusively through paired untrusted recall.'
+    alternatives_considered:
+      - 'Inject canonical index and definition bytes into SessionStart or base instructions.'
+      - 'Remove lifecycle guidance entirely.'
+      - 'Retain one static provider-neutral write/handling contract while excluding all recalled bytes.'
+    grounding:
+      - 'design.md lines 177-181 require collision-safe separation between trusted capability state and all memory/archive evidence.'
+      - 'A malicious-core regression proved prior lifecycle readers promoted canonical bytes into trusted instructions.'
+      - 'Claude, Codex, and OpenCode still need provider-neutral guarded-write guidance after startup and compaction.'
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-07-26T04:19:01.000Z
+  - stage: Build
+    iteration: 3
+    decision: 'Make provider reapply fail closed on stale branch payloads and transactionally preserve every existing provider-owned file.'
+    alternatives_considered:
+      - 'Document the stale providers branch without an executable gate.'
+      - 'Copy sequentially and rely on post-copy tests.'
+      - 'Prevalidate the complete payload, install by atomic files with full rollback, and require exact fetched-ref parity before later mutations.'
+    grounding:
+      - 'origin/providers lacked the shared lifecycle contract, Codex opaque-memory disables, and thirteen advertised Codex payload files.'
+      - 'A failed effect:check now stops before every later directive, so stale Codex payloads leave customized trees byte-identical.'
+      - 'Transactional Codex/OpenCode regressions cover mid-install failure and non-regular customization paths.'
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-07-26T04:19:01.000Z
+  - stage: Post-Build Drift
+    iteration: 18
+    decision: 'Place every non-base memory source as one coherent tree and verify relative Markdown link identity from the permanent snapshot.'
+    alternatives_considered:
+      - 'Continue repairing individual leaf-deduplication exceptions.'
+      - 'Rewrite Markdown links during migration.'
+      - 'Keep each source tree under one direct, imported, shared-identical, or SHA-qualified collision root.'
+    grounding:
+      - 'Gate 17 found three source links whose bytes survived but whose canonical targets changed.'
+      - 'Tree-coherent placement preserves relative paths by construction and avoids semantic rewriting.'
+      - 'Fresh rollback, inventory, apply, and runtime verification cleared all eight live workgroups.'
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-07-26T12:34:00.000Z
+  - stage: Post-Build Drift
+    iteration: 18
+    decision: 'Close the final source-drift gate after two independent zero-finding audits; retain the Claude 429 as an external release-evidence note.'
+    alternatives_considered:
+      - 'Treat the external weekly rate limit as source drift.'
+      - 'Wait until Jul 28 despite two clean source audits and live zero-failure verification.'
+      - 'Close the implementation gate while recording the exact unavailable reviewer evidence.'
+    grounding:
+      - 'Two independent Gate 18 auditors returned MISSING 0, DIVERGED 0, PARTIAL 0.'
+      - 'The final claude -p attempt returned the exact weekly-limit reset message before review output.'
+      - 'Live verification and the full host gate remained clean after Cycle 18.'
+    scope_check:
+      adds_user_facing_capability: false
+      changes_external_behavior: false
+      changes_hard_constraint: false
+      weakens_safety_invariant: false
+    recorded_at: 2026-07-26T12:45:00.000Z
+
+plan_audit:
+  stage: plan
+  generated_at: 2026-07-25T21:22:48.156Z
+  revision: 2
+  revision_reason: >-
+    The user resumed team-auto for targeted drift reconciliation. B2-B9 and
+    mechanically related partial wording were injected into existing tasks
+    without changing files, groups, interfaces, architecture, or subsystems;
+    the prior non-mutating legacy-memory reconciliation remains binding.
+  drift_reconciliation: user_resumed_targeted_B2_B9
+  groups: 4
+  tasks: 10
+  file_conflicts: 0
+  parallel_symbol_dependencies: 0
+  missing_test_specs: 0
+  untraced_hard_constraints: 0
+  untraced_rejected_options: 0
+  render_check_flags: 0
+  waived_findings_carried: 0

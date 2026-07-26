@@ -36,7 +36,7 @@ describe('ensureMemoryScaffold', () => {
   it('never imports legacy workspace memory during normal startup', () => {
     const base = fs.mkdtempSync(path.join(os.tmpdir(), 'nanoclaw-mem-'));
     try {
-      fs.writeFileSync(path.join(base, 'CLAUDE.local.md'), '# group memory\nuser prefers terse replies\n');
+      fs.writeFileSync(path.join(base, 'CLAUDE.local.md'), '# standing instructions\nuser prefers terse replies\n');
 
       ensureMemoryScaffold(base);
 

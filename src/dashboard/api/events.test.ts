@@ -169,20 +169,43 @@ describe('SSE feed — D1', () => {
     expect(mockWatch).not.toHaveBeenCalledWith(expect.stringContaining('v2.db'), expect.anything());
   });
 
-  it('test_chokidar_ignored_accepts_inbound_and_outbound', async () => {
+  it('test_chokidar_ignored_accepts_only_session_databases_and_never_descends_into_worktrees', async () => {
     vi.useRealTimers();
     startSSEFeed();
     await new Promise<void>((resolve) => setTimeout(resolve, 20));
 
     expect(mockWatch).toHaveBeenCalledTimes(1);
-    const [, opts] = mockWatch.mock.calls[0] as [string, { ignored: (p: string) => boolean }];
+    const [sessionsRoot, opts] = mockWatch.mock.calls[0] as [
+      string,
+      {
+        followSymlinks: boolean;
+        ignored: (p: string, stats?: { isDirectory(): boolean; isSymbolicLink(): boolean }) => boolean;
+      },
+    ];
     const ignored = opts.ignored;
+    const session = `${sessionsRoot}/ag-1/sess-1`;
+    const directory = { isDirectory: () => true, isSymbolicLink: () => false };
+    const regularFile = { isDirectory: () => false, isSymbolicLink: () => false };
+    const symbolicLink = { isDirectory: () => false, isSymbolicLink: () => true };
 
-    // inbound.db and outbound.db should NOT be ignored (return false)
-    expect(ignored('/data/v2-sessions/ag-1/sess-1/inbound.db')).toBe(false);
-    expect(ignored('/data/v2-sessions/ag-1/sess-1/outbound.db')).toBe(false);
-    // Other files should be ignored
-    expect(ignored('/data/v2-sessions/ag-1/sess-1/other.txt')).toBe(true);
+    expect(opts.followSymlinks).toBe(false);
+    expect(ignored(sessionsRoot)).toBe(false);
+    expect(ignored(`${sessionsRoot}/ag-1`)).toBe(false);
+    expect(ignored(session)).toBe(false);
+    expect(ignored(`${sessionsRoot}/ag-1`, directory)).toBe(false);
+    expect(ignored(session, directory)).toBe(false);
+    expect(ignored(`${sessionsRoot}/ag-file`, regularFile)).toBe(true);
+    expect(ignored(`${sessionsRoot}/ag-link`, symbolicLink)).toBe(true);
+    expect(ignored(`${sessionsRoot}/ag-1/session-file`, regularFile)).toBe(true);
+    expect(ignored(`${sessionsRoot}/ag-1/session-link`, symbolicLink)).toBe(true);
+    expect(ignored(`${session}/inbound.db`, regularFile)).toBe(false);
+    expect(ignored(`${session}/outbound.db`, regularFile)).toBe(false);
+    expect(ignored(`${session}/other.txt`)).toBe(true);
+    expect(ignored(`${session}/worktree`)).toBe(true);
+    expect(ignored(`${session}/worktree/node_modules/pkg`)).toBe(true);
+    expect(ignored(`${session}/inbound.db`, directory)).toBe(true);
+    expect(ignored(`${session}/outbound.db`, symbolicLink)).toBe(true);
+    expect(ignored(`${sessionsRoot}-lookalike/ag-1/sess-1/inbound.db`)).toBe(true);
   });
 
   it('test_sse_handler_registers_close_listener: connection removed on close', async () => {

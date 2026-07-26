@@ -88,3 +88,47 @@ export function cleanupOrphans(): void {
     log.warn('Failed to clean up orphaned containers', { err });
   }
 }
+
+function listInstallContainersStrict(): string[] {
+  try {
+    const output = execSync(
+      `${CONTAINER_RUNTIME_BIN} ps --filter label=${CONTAINER_INSTALL_LABEL} --format '{{.Names}}'`,
+      {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        encoding: 'utf-8',
+      },
+    );
+    return output.trim().split('\n').filter(Boolean);
+  } catch (err) {
+    throw new Error('Cannot prove install-scoped container absence: runtime listing failed', { cause: err });
+  }
+}
+
+/**
+ * Stop leftovers from this install and prove the install is quiescent.
+ *
+ * Unlike the legacy best-effort cleanup above, this is a hard precondition for
+ * filesystem authority changes. Listing, stopping, and the post-stop listing
+ * all fail closed.
+ */
+export function cleanupOrphansStrict(): string[] {
+  const orphans = listInstallContainersStrict();
+  for (const name of orphans) {
+    try {
+      stopContainer(name);
+    } catch (err) {
+      throw new Error(`Cannot prove install-scoped container absence: failed to stop ${name}`, { cause: err });
+    }
+  }
+  const remaining = listInstallContainersStrict();
+  if (remaining.length > 0) {
+    throw new Error(`Install-scoped containers still running after cleanup: ${remaining.join(', ')}`);
+  }
+  if (orphans.length > 0) {
+    log.info('Stopped orphaned containers and proved install quiescence', {
+      count: orphans.length,
+      names: orphans,
+    });
+  }
+  return orphans;
+}

@@ -21,6 +21,7 @@ import './render-diagram.js';
 import './design-review/index.js';
 import './backlog.js';
 import './support.js';
+import './memory-write.js';
 import { startMcpServer, mountSpawnTools } from './server.js';
 
 function log(msg: string): void {

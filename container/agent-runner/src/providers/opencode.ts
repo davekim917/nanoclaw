@@ -589,8 +589,8 @@ export class OpenCodeProvider implements AgentProvider {
     const promptModel = effectiveModel ? splitModelSlug(effectiveModel) : null;
 
     // OpenCode has no session-start hook API. Its native prompt lifecycle
-    // carries standing system context on every prompt, which also refreshes
-    // authoritative file memory after compaction without a passive retriever.
+    // carries trusted static memory handling/write guidance on every prompt;
+    // canonical bytes arrive per turn only in paired untrusted recall.
     const memoryContext = memoryContextForSessionStart('startup');
     const systemInstructions = [input.systemContext?.instructions, memoryContext].filter(Boolean).join('\n\n');
     pending.push(wrapPromptWithContext(input.prompt, systemInstructions, effectiveModel));

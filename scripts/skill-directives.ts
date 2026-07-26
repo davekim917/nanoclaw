@@ -41,9 +41,9 @@
 //        capture). Degrades to an agent when no streaming exec is wired.
 //        effect:check runs the body as a shell PREDICATE (a precondition gate):
 //        it mutates nothing (no journal, no capture). A zero exit passes silently;
-//        a non-zero exit bounces to an agent (degrade, not crash) and, via the
-//        run-health gate, blocks the dangerous side effects that follow it (a
-//        restart, a pairing/QR step, a wire). An unresolved {{var}} defers.
+//        a non-zero exit bounces to an agent (degrade, not crash) and stops the
+//        apply before every later directive, including file/config mutations.
+//        An unresolved {{var}} defers.
 //   prompt <var> [secret] [validate:<re>] [flags:<re-flags>]
 //          [normalize:trim|rstrip-slash|lower] [reuse:<ENV_KEY>]
 //        body: the question → binds {{var}}                       skip if satisfied
@@ -116,7 +116,8 @@ const KNOWN = new Set(['copy', 'append', 'dep', 'run', 'prompt', 'operator', 'en
 // Retired directives get a targeted lint error (not just "unknown") so an
 // author knows the removal was deliberate and what to do instead.
 const RETIRED: Record<string, string> = {
-  'env-sync': 'nc:env-sync was retired — nothing reads the data/env/env mirror (and it copied live tokens); delete the fence, the adapter reads .env directly',
+  'env-sync':
+    'nc:env-sync was retired — nothing reads the data/env/env mirror (and it copied live tokens); delete the fence, the adapter reads .env directly',
 };
 const PROMPT_FLAGS = new Set(['secret']);
 
@@ -192,7 +193,7 @@ function referencedVars(d: Directive): string[] {
  * the packages section have no `specifier`). Returns undefined if not found.
  */
 export function resolveChatCoreVersion(root: string): string | undefined {
-  let lock = '';
+  let lock: string;
   try {
     lock = readFileSync(join(root, 'pnpm-lock.yaml'), 'utf8');
   } catch {
@@ -220,7 +221,10 @@ export function validate(directives: Directive[], ctx?: { chatVersion?: string }
           // lockfile — the family moves together. This catches pin drift (the
           // 4.27.0-vs-chat@4.26.0 mismatch) at lint time.
           if (ctx?.chatVersion && name.startsWith('@chat-adapter/') && version !== ctx.chatVersion) {
-            flag(d, `${name} pinned ${version} but our chat core is ${ctx.chatVersion} — a @chat-adapter/* adapter must match the chat package`);
+            flag(
+              d,
+              `${name} pinned ${version} but our chat core is ${ctx.chatVersion} — a @chat-adapter/* adapter must match the chat package`,
+            );
           }
         }
         break;
@@ -316,7 +320,8 @@ export function validate(directives: Directive[], ctx?: { chatVersion?: string }
         flag(d, `when:${d.attrs.when} must be <var>=<value>`);
       } else {
         const wvar = d.attrs.when.slice(0, eq).trim();
-        if (!defined.has(wvar)) flag(d, `when:${d.attrs.when} references {{${wvar}}} but no earlier nc:prompt or nc:run capture defined it`);
+        if (!defined.has(wvar))
+          flag(d, `when:${d.attrs.when} references {{${wvar}}} but no earlier nc:prompt or nc:run capture defined it`);
       }
     }
     if (d.kind === 'prompt') {
@@ -357,11 +362,14 @@ export function lintReferenceFloor(markdown: string): Problem[] {
   if (!anchor) return []; // no credential / interactive step ⇒ no floor expected
   const hasTroubleshooting = markdown.split('\n').some((l) => /^##\s+Troubleshooting\s*$/.test(l.trim()));
   if (hasTroubleshooting) return [];
-  return [{
-    line: anchor.line,
-    kind: 'reference-floor',
-    message: 'a credentialed/interactive skill should carry a ## Troubleshooting section (the human floor when a live step misbehaves)',
-  }];
+  return [
+    {
+      line: anchor.line,
+      kind: 'reference-floor',
+      message:
+        'a credentialed/interactive skill should carry a ## Troubleshooting section (the human floor when a live step misbehaves)',
+    },
+  ];
 }
 
 /**

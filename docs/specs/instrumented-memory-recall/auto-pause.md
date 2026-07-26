@@ -1,5 +1,9 @@
 # /team-auto paused at Stage A (Review) — CAP-REACHED ESCALATION
 
+> **ARCHIVED AND SUPERSEDED — not an active workflow pause.** This spec family
+> instruments the retired Mnemon/daemon recall architecture. See the
+> [current one-canon design](../workgroup-memory-and-session-capabilities/design.md).
+
 **Stage:** Review
 **Reason:** `cap-reached` (3-cycle limit hit) + `no-grounding` (3 of 7 cycle-3 MUST-FIX involve equally-grounded path choices)
 **Cycles consumed:** 3/3

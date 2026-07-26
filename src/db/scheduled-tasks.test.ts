@@ -412,6 +412,7 @@ describe('test_scheduleTask_inserts_new', () => {
       series_id: string;
       kind: string;
       recurrence: string;
+      trigger: number;
     }>;
     db.close();
 
@@ -419,6 +420,7 @@ describe('test_scheduleTask_inserts_new', () => {
     expect(rows[0].kind).toBe('task');
     expect(rows[0].recurrence).toBe('0 3 * * *');
     expect(rows[0].series_id).toBe('s1');
+    expect(rows[0].trigger).toBe(0);
   });
 });
 
@@ -465,6 +467,86 @@ describe('test_scheduleTask_idempotent', () => {
 
     expect(rows).toHaveLength(1);
     expect(rows[0].process_after).toBe(processAfter2);
+  });
+
+  it('removes stale recall and re-sequences an admitted active row as inert when rescheduled', async () => {
+    seedActiveSession();
+    seedInboundDb();
+
+    const initialProcessAfter = new Date(Date.now() + 86400000).toISOString();
+    await scheduleTask(
+      {
+        id: 't-admitted',
+        agentGroupId: AGENT_GROUP_ID,
+        cron: '0 3 * * *',
+        processAfter: initialProcessAfter,
+        seriesId: 's-admitted',
+        destination: TEST_DESTINATION,
+        prompt: 'first version',
+      },
+      TEST_DIR,
+    );
+
+    const inboundDbPath = taskInboundPath('s-admitted');
+    {
+      const db = openInboundDb(inboundDbPath);
+      db.prepare("UPDATE messages_in SET seq = 4, trigger = 1, status = 'paused' WHERE id = ?").run('t-admitted');
+      db.prepare(
+        `INSERT INTO messages_in
+           (id, seq, kind, timestamp, status, process_after, recurrence, series_id, tries, trigger,
+            platform_id, channel_type, thread_id, content)
+         VALUES (?, 2, 'system', ?, 'pending', ?, NULL, ?, 0, 0, ?, ?, ?, ?)`,
+      ).run(
+        'recall-t-admitted',
+        new Date().toISOString(),
+        initialProcessAfter,
+        't-admitted',
+        TEST_DESTINATION.platformId,
+        TEST_DESTINATION.channelType,
+        TEST_DESTINATION.threadId,
+        JSON.stringify({ subtype: 'recall_context', memoryEvidence: 'stale' }),
+      );
+      db.close();
+    }
+
+    const updatedProcessAfter = new Date(Date.now() + 172800000).toISOString();
+    await scheduleTask(
+      {
+        id: 'ignored-for-active-update',
+        agentGroupId: AGENT_GROUP_ID,
+        cron: '0 4 * * *',
+        processAfter: updatedProcessAfter,
+        seriesId: 's-admitted',
+        destination: TEST_DESTINATION,
+        prompt: 'second version',
+      },
+      TEST_DIR,
+    );
+
+    const db = openInboundDb(inboundDbPath);
+    const rows = db
+      .prepare('SELECT id, seq, status, trigger, process_after, recurrence, content FROM messages_in ORDER BY seq')
+      .all() as Array<{
+      id: string;
+      seq: number;
+      status: string;
+      trigger: number;
+      process_after: string;
+      recurrence: string | null;
+      content: string;
+    }>;
+    db.close();
+
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      id: 't-admitted',
+      status: 'paused',
+      trigger: 0,
+      process_after: updatedProcessAfter,
+      recurrence: '0 4 * * *',
+    });
+    expect(rows[0].seq).toBeGreaterThan(4);
+    expect(JSON.parse(rows[0].content)).toMatchObject({ prompt: 'second version' });
   });
 });
 
@@ -546,7 +628,7 @@ describe('test_scheduleTask_re_enable_after_cancel', () => {
       },
       TEST_DIR,
     );
-    // Operator runs disable-mnemon — flips the row to cancelled.
+    // A module disable flow flips the seeded row to cancelled.
     {
       const db = openInboundDb(taskInboundPath('s-cancel-reenable'));
       db.prepare("UPDATE messages_in SET status = 'cancelled', recurrence = NULL WHERE series_id = ?").run(

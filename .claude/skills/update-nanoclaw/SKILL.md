@@ -9,7 +9,16 @@ Your NanoClaw fork drifts from upstream as you customize it. This skill pulls up
 
 **Priority invariant:** local customization intent is more important than accepting any particular upstream change. A clean merge, successful build, and generic passing test suite are necessary but never sufficient evidence that the update is safe.
 
+Customizations outrank upstream defaults. The dependency code that makes those
+customizations work has the same priority. The default full merge therefore
+includes a clean auto-merge dependency audit and targeted regression
+verification; conflict resolution alone is not an update audit.
+
 Run `/update-nanoclaw` in Claude Code or Codex. Use `AskUserQuestion` in Claude Code; in Codex, use its interactive-input tool when available or ask the question directly.
+
+This tracked skill is the one operator contract. `.agents/skills` resolves to
+the same `.claude/skills` bytes for Claude, Codex, and OpenCode; do not maintain
+provider-specific copies.
 
 ## How it works
 
@@ -18,12 +27,14 @@ Run `/update-nanoclaw` in Claude Code or Codex. Use `AskUserQuestion` in Claude 
 **Backup**: creates a timestamped backup branch and tag (`backup/pre-update-<hash>-<timestamp>`, `pre-update-<hash>-<timestamp>`) before touching anything. Safe to run multiple times.
 
 **Preview**: runs `git log` and `git diff` against the merge base to show upstream changes since your last sync. Groups changed files into categories:
+
 - **Skills** (`.claude/skills/`): unlikely to conflict unless you edited an upstream skill
 - **Host source** (`src/`): may conflict if you modified the same files
 - **Container** (`container/`): triggers container rebuild
 - **Build/config** (`package.json`, `pnpm-lock.yaml`, `tsconfig*.json`): lockfile changes trigger dep install
 
 **Update paths** (you pick one):
+
 - `merge` (default): `git merge upstream/<branch>`. Resolves all conflicts in one pass.
 - `cherry-pick`: `git cherry-pick <hashes>`. Pull in only the commits you want.
 - `rebase`: `git rebase upstream/<branch>`. Linear history, but conflicts resolve per-commit.
@@ -36,6 +47,7 @@ Run `/update-nanoclaw` in Claude Code or Codex. Use `AskUserQuestion` in Claude 
 **Validation**: runs `pnpm run build` and `pnpm test`. If container files changed, also runs the container typecheck and `./container/build.sh`.
 
 **Post-merge audit**: six checks that go beyond build + tests (details in `audit.md`):
+
 - **A. Customization preservation and compatibility** — proves each high-risk local customization still has its intended integration path and targeted verification, including clean auto-merges that preserved text but changed behavior.
 - **B. Container rebuild requirement** — flags when `container/`, `src/config.ts`, or `src/install-slug.ts` changes mean the built agent-container image is stale; the final restart is gated on this.
 - **C. Live migration preflight** — scans pending migrations against the real `data/v2.db` for `ALTER ... NOT NULL`, `DROP`, or destructive `UPDATE` that tests (scratch DB) miss.
@@ -48,6 +60,7 @@ Run `/update-nanoclaw` in Claude Code or Codex. Use `AskUserQuestion` in Claude 
 ## Rollback
 
 The backup tag is printed at the end of each run:
+
 ```
 git reset --hard pre-update-<hash>-<timestamp>
 ```
@@ -61,9 +74,11 @@ Uses Git-native inventory to keep the review focused. Never truncate or skip a c
 ---
 
 # Goal
+
 Help a user with a customized NanoClaw install safely incorporate upstream changes without a fresh reinstall and without blowing tokens.
 
 # Operating principles
+
 - Never proceed with a dirty working tree.
 - Always create a rollback point (backup branch + tag) before touching anything.
 - Preserve verified local customization intent ahead of upstream behavior.
@@ -72,19 +87,23 @@ Help a user with a customized NanoClaw install safely incorporate upstream chang
 - Use `git status`, `git log`, and `git diff` for inventory, then read every customization-relevant diff and dependency path end-to-end.
 
 # Step 0: Preflight (stop early if unsafe)
+
 Run:
+
 - `git status --porcelain`
-If output is non-empty:
+  If output is non-empty:
 - Tell the user to commit or stash first, then stop.
 
 Confirm remotes:
+
 - `git remote -v`
-If `upstream` is missing:
+  If `upstream` is missing:
 - Ask the user for the upstream repo URL (default: `https://github.com/nanocoai/nanoclaw.git`).
 - Add it: `git remote add upstream <user-provided-url>`
 - Then: `git fetch upstream --prune`
 
 Determine the upstream branch name:
+
 - `git branch -r | grep upstream/`
 - If `upstream/main` exists, use `main`.
 - If only `upstream/master` exists, use `master`.
@@ -92,33 +111,43 @@ Determine the upstream branch name:
 - Store this as UPSTREAM_BRANCH for all subsequent commands. Every command below that references `upstream/main` should use `upstream/$UPSTREAM_BRANCH` instead.
 
 Fetch:
+
 - `git fetch upstream --prune`
 
 # Step 1: Create a safety net
+
 Capture current state:
+
 - `HASH=$(git rev-parse --short HEAD)`
 - `TIMESTAMP=$(date +%Y%m%d-%H%M%S)`
 
 Create backup branch and tag (using timestamp to avoid collisions on retry):
+
 - `git branch backup/pre-update-$HASH-$TIMESTAMP`
 - `git tag pre-update-$HASH-$TIMESTAMP`
 
 Save the tag name for later reference in the summary and rollback instructions.
 
 # Step 2: Preview what upstream changed (no edits yet)
+
 Compute common base:
+
 - `BASE=$(git merge-base HEAD upstream/$UPSTREAM_BRANCH)`
 
 Show upstream commits since BASE:
+
 - `git log --oneline $BASE..upstream/$UPSTREAM_BRANCH`
 
 Show local commits since BASE (custom drift):
+
 - `git log --oneline $BASE..HEAD`
 
 Show file-level impact from upstream:
+
 - `git diff --name-only $BASE..upstream/$UPSTREAM_BRANCH`
 
 Bucket the upstream changed files:
+
 - **Skills** (`.claude/skills/`): unlikely to conflict unless the user edited an upstream skill
 - **Host source** (`src/`): may conflict if user modified the same files
 - **Container** (`container/`): triggers container rebuild (+ typecheck if `agent-runner/src/` changed)
@@ -128,6 +157,7 @@ Bucket the upstream changed files:
 **Large drift check:** If the upstream commit count and age suggest the user has a lot of catching up to do, mention that `/migrate-nanoclaw` might be a better fit — it extracts customizations and reapplies them on clean upstream instead of merging. Offer it as an option but don't push.
 
 Present these buckets to the user and ask them to choose one path using AskUserQuestion:
+
 - A) **Full update**: merge all upstream changes
 - B) **Selective update**: cherry-pick specific upstream commits
 - C) **Abort**: they only wanted the preview
@@ -142,19 +172,29 @@ Before any apply path except Abort, read Section A of `.claude/skills/update-nan
 Build a contract row for every high-risk customization:
 
 ```
-ID | intent + provenance | integration point | upstream overlap/dependency | preservation requirement | verification
+ID | intent + provenance | integration point | dependency closure | upstream overlap | preservation requirement | regression verification
 ```
 
 Do not infer intent from the final file alone. Read the complete local diff, relevant non-merge commit history, adjacent tests/specs, and direct callers. If intent remains ambiguous, ask the user before merging.
 
+For each row, trace the full dependency closure needed for the customization to
+behave: direct callers, imports, registrations, configuration/schema fields,
+provider/channel adapters, generated surfaces, runtime packaging, and targeted
+tests. Compare that closure with every upstream-touched path. A clean
+auto-merge is not evidence of preservation when upstream changed a dependency
+outside the customization's own file.
+
 Do not proceed until every high-risk customization has:
+
 - a concrete preservation requirement, and
 - a targeted test or non-destructive smoke that exercises the real integration point.
 
 Missing evidence is a `BLOCK`, not an assumed pass. Generic build/typecheck/full-suite success does not replace this contract.
 
 # Step 3: Conflict preview (before committing anything)
+
 If Full update or Rebase:
+
 - Dry-run merge to preview conflicts. Run these as a single chained command so the abort always executes:
   ```
   git merge --no-commit --no-ff upstream/$UPSTREAM_BRANCH; git diff --name-only --diff-filter=U; git merge --abort
@@ -165,14 +205,17 @@ If Full update or Rebase:
 # Step 4A: Full update (MERGE, default)
 
 Capture the upstream SHA being merged (used by the safety guards below):
+
 - `UPSTREAM_SHA=$(git rev-parse upstream/$UPSTREAM_BRANCH)`
 
 Run:
+
 - `git merge --no-ff upstream/$UPSTREAM_BRANCH --no-edit`
 
 **Critical — do NOT run `git stash`, `git reset`, or `git checkout` while in merge state** (i.e. while `.git/MERGE_HEAD` exists). All three discard `MERGE_HEAD` silently, after which the next `git commit` produces a single-parent commit instead of a merge. The upstream commits then remain orphaned from your ancestry: GitHub's compare API and any `git rev-list origin..upstream` check will keep reporting the fork as "behind upstream" even though the file content was integrated.
 
 If conflicts occur:
+
 - Run `git status` and identify conflicted files.
 - For each conflicted file:
   - Open the complete base, backup, upstream, and conflicted diff relevant to the file.
@@ -200,6 +243,7 @@ MERGE_COMMIT=$(git rev-parse HEAD)
 Persist `MERGE_COMMIT` and `UPSTREAM_SHA` for audit F.
 
 **Post-commit verification** — confirm the captured merge commit has 2 parents and contains the upstream SHA:
+
 ```bash
 PARENT_COUNT=$(git rev-list --parents -1 "$MERGE_COMMIT" | awk '{print NF-1}')
 if [ "$PARENT_COUNT" != "2" ]; then
@@ -214,38 +258,47 @@ git merge-base --is-ancestor "$UPSTREAM_SHA" "$MERGE_COMMIT" || {
   exit 1
 }
 ```
+
 If this fails, abort the skill — do not proceed to Step 5. The user must reset to the backup tag and retry.
 
 After this guard passes, make only the minimal compatibility edits or regression-test additions required by the customization contract. Commit them separately so the merge commit remains auditable.
 
 # Step 4B: Selective update (CHERRY-PICK)
+
 If user chose Selective:
+
 - Recompute BASE if needed: `BASE=$(git merge-base HEAD upstream/$UPSTREAM_BRANCH)`
 - Show commit list again: `git log --oneline $BASE..upstream/$UPSTREAM_BRANCH`
 - Ask user which commit hashes they want.
 - Apply: `git cherry-pick <hash1> <hash2> ...`
 
 If conflicts during cherry-pick:
+
 - Resolve conflict markers against the customization contract, then:
   - `git add <file>`
   - `git cherry-pick --continue`
-If user wants to stop:
+    If user wants to stop:
   - `git cherry-pick --abort`
 
 # Step 4C: Rebase (only if user explicitly chose option D)
+
 Run:
+
 - `git rebase upstream/$UPSTREAM_BRANCH`
 
 If conflicts:
+
 - Resolve conflict markers against the customization contract, then:
   - `git add <file>`
   - `git rebase --continue`
-If it gets messy (more than 3 rounds of conflicts):
+    If it gets messy (more than 3 rounds of conflicts):
   - `git rebase --abort`
   - Recommend merge instead.
 
 # Step 4.5: Install dependencies (if lockfiles changed)
+
 Check if the merge changed any lockfiles or package manifests:
+
 - `git diff <backup-tag-from-step-1>..HEAD --name-only | grep -E '^(pnpm-lock\.yaml|package\.json)$'`
   - If matched: `pnpm install`
 - `git diff <backup-tag-from-step-1>..HEAD --name-only | grep -E '^container/agent-runner/(bun\.lock|package\.json)$'`
@@ -255,27 +308,39 @@ Check if the merge changed any lockfiles or package manifests:
 Skip this step if neither lockfile changed.
 
 # Step 5: Validation
+
 Check which areas changed to determine what to validate:
+
 - `CHANGED_FILES=$(git diff --name-only <backup-tag-from-step-1>..HEAD)`
 
 **Customization contract verification** (always):
+
 - Run every targeted command recorded in Step 2.5.
 - Confirm each test drives the real integration point; directly unit-testing only the customization's internal helper does not count.
+- Re-read every upstream-touched path in each customization's dependency closure
+  and audit clean auto-merges for deleted exports, changed defaults, reordered
+  registration, schema/config drift, and packaging omissions.
+- Record explicit regression verification for each contract row. Textual
+  survival without behavioral evidence is a BLOCK.
 - For runtime-only behavior, run the recorded non-destructive smoke against the built artifact.
 - Any missing, skipped, flaky, or failed required verification → BLOCK. Fix the merge-caused regression or roll back; do not accept generic suite success as a substitute.
 
 **Host build** (always):
+
 - `pnpm run build`
 - `pnpm test` (do not fail the flow if tests are not configured)
 
 **Container typecheck** (only if `container/agent-runner/src/` files are in CHANGED_FILES AND bun types are available):
+
 - Check: `pnpm exec tsc -p container/agent-runner/tsconfig.json --noEmit`
 - If this fails because bun types are missing (`Cannot find type definition file for 'bun'`), skip with a note — type errors will surface at container runtime instead
 
 **Container image rebuild** (only if any `container/` files are in CHANGED_FILES):
+
 - `./container/build.sh`
 
 If build fails:
+
 - Show the error.
 - Only fix issues clearly caused by the merge (missing imports, type mismatches from merged code).
 - Do not refactor unrelated code.
@@ -296,6 +361,10 @@ After validation passes, run the full audit defined in `.claude/skills/update-na
    - `REBUILD_REQUIRED` (from sub-audit B) — whether the final restart must be gated on `./container/build.sh`.
    - `DB_BACKUP_RECOMMENDED` (from sub-audit C) — whether the user should back up `data/v2.db` before restart.
    - `UNRESOLVED_MIGRATIONS` — any skipped, failed, or incomplete breaking-change migration skills.
+   - `MEMORY_ACTIVATION_BLOCKED` — no only when the update needs no memory
+     cutover or every required memory inventory, migration, permanent
+     snapshot/report check, and read-only runtime verification passed. Set it to
+     yes for any unresolved, failed, incomplete, skipped, or degraded result.
 
 Rollback recipe (for BLOCK or user-rejected FLAG):
 
@@ -304,20 +373,25 @@ git reset --hard <backup-tag-from-step-1>
 ```
 
 # Step 7: Breaking changes check
+
 After the audit clears, check if the update introduced any breaking changes.
 
 Determine which CHANGELOG entries are new by diffing against the backup tag:
+
 - `git diff <backup-tag-from-step-1>..HEAD -- CHANGELOG.md`
 
 Parse the diff output for lines that contain `[BREAKING]` anywhere in the line. Each such line is one breaking change entry. The format is:
+
 ```
 [BREAKING] <description>. Run `/<skill-name>` to <action>.
 ```
 
 If no `[BREAKING]` lines are found:
+
 - Skip this step silently. Proceed to Step 8 (skill updates check).
 
 If one or more `[BREAKING]` lines are found:
+
 - Display a warning header to the user: "This update includes breaking changes that may require action:"
 - For each breaking change, display the full description.
 - Collect all skill names referenced in the breaking change entries (the `/<skill-name>` part).
@@ -331,6 +405,12 @@ If one or more `[BREAKING]` lines are found:
 - Remove a skill from the unresolved list only after it completes successfully.
   Keep every skipped, failed, or incomplete skill unresolved, then proceed to
   Step 8.
+
+For `/migrate-memory`, "completes successfully" means its inventory report,
+verified apply, permanent rollback snapshot, and read-only runtime verification
+all pass. A skipped or partial inventory is unresolved even if the apply command
+did not fail. Set `MEMORY_ACTIVATION_BLOCKED=yes` until the entire flow is
+verified. Do not restart or activate the service while it is yes.
 
 # Step 8: Skill updates (part of updating NanoClaw)
 
@@ -351,6 +431,7 @@ Detect whether anything is installed: read `src/channels/index.ts` and
 
 **Hand-off — default in, minimal opt-out.** Use AskUserQuestion (single-select).
 Name the installed skills in the question so the choice is concrete:
+
 - Question: "Skill updates are part of this NanoClaw update — your installed
   channels/providers (<list the detected ones>) ride separate branches the host
   update didn't touch. Continue into `/update-skills` to bring them up to date?"
@@ -402,7 +483,9 @@ stale pending approvals.
 Proceed to Step 9.
 
 # Step 9: Summary + rollback instructions
+
 Show:
+
 - Backup tag: the tag name created in Step 1
 - New HEAD: `git rev-parse --short HEAD`
 - Upstream HEAD: `git rev-parse --short upstream/$UPSTREAM_BRANCH`
@@ -411,6 +494,8 @@ Show:
 - Audit findings (A–F verdicts from Step 6)
 - Breaking changes applied (list skills run, if any)
 - Unresolved breaking migrations (list skipped, failed, or incomplete skills)
+- Memory activation gate: `MEMORY_ACTIVATION_BLOCKED=yes|no`, with the
+  inventory/report/runtime-verification evidence
 - Remaining local diff vs upstream: `git diff --name-only upstream/$UPSTREAM_BRANCH..HEAD`
 
 Apply audit-driven gating before suggesting the restart:
@@ -418,20 +503,27 @@ Apply audit-driven gating before suggesting the restart:
 - If `REBUILD_REQUIRED=yes` (from audit sub-B): the restart command MUST be preceded by `./container/build.sh`. State this as a required pre-step, not optional. If sub-B also noted buildx cache staleness, add `docker buildx prune -f` before the build.
 - If `DB_BACKUP_RECOMMENDED=yes` (from audit sub-C): suggest `cp data/v2.db data/v2.db.pre-update-$(date +%s)` before restart.
 
+If `MEMORY_ACTIVATION_BLOCKED=yes`, stop. Show the exact unresolved memory
+inventory, migration, snapshot/report, or runtime-verification result. Offer to
+finish `/migrate-memory` or roll back with the backup tag and retained migration
+report. Do not show or execute any service restart or activation command. There
+is no override.
+
 If unresolved migrations remain, explain that the code merge succeeded but the
 affected features may ignore old state until those migrations run. Before
-showing restart commands, ask whether to:
+showing restart commands, offer:
 
 - **Run unresolved migrations (Recommended):** invoke each unresolved skill
   and remove it only after successful completion.
-- **Restart anyway:** continue only with explicit confirmation and repeat the
-  unresolved skill names in the final warning.
+- **Roll back the update:** use
+  `git reset --hard <backup-tag-from-step-1>` and restore any migration with
+  its retained report/snapshot procedure.
 
-If a retried migration remains unresolved, ask again. Do not show restart
-commands until the list is empty or the user explicitly accepts restarting
-anyway.
+If a retried migration remains unresolved, stop. Roll back or finish its
+migration and verification before continuing.
 
 Tell the user:
+
 - To rollback: `git reset --hard <backup-tag-from-step-1>`
 - Backup branch also exists: `backup/pre-update-<HASH>-<TIMESTAMP>`
 - Restart the service to apply changes (after rebuild/backup if flagged above). Detect platform with `uname -s`:
@@ -439,7 +531,6 @@ Tell the user:
   - **Linux (systemd user)**: detect the service name with `systemctl --user list-units --type=service | grep nanoclaw | awk '{print $1}'`, then `systemctl --user restart <detected-name>` (or `source setup/lib/install-slug.sh && systemctl --user restart $(systemd_unit)`)
   - **Linux (systemd system)**: `sudo systemctl restart nanoclaw-v2`
   - **Manual** (no service found): restart `pnpm run dev`
-
 
 ## Diagnostics
 

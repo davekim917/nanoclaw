@@ -40,8 +40,8 @@ export function insertTaskRow(
   },
 ): void {
   db.prepare(
-    `INSERT INTO messages_in (id, seq, timestamp, status, tries, process_after, recurrence, kind, platform_id, channel_type, thread_id, content, series_id)
-     VALUES (@id, @seq, @timestamp, @status, 0, @processAfter, @recurrence, 'task', @platformId, @channelType, @threadId, @content, @seriesId)`,
+    `INSERT INTO messages_in (id, seq, timestamp, status, tries, process_after, recurrence, kind, platform_id, channel_type, thread_id, content, series_id, trigger)
+     VALUES (@id, @seq, @timestamp, @status, 0, @processAfter, @recurrence, 'task', @platformId, @channelType, @threadId, @content, @seriesId, 0)`,
   ).run({
     status: 'pending',
     platformId: null,
@@ -86,11 +86,24 @@ export function pauseTask(db: Database.Database, taskId: string): number {
 }
 
 export function resumeTask(db: Database.Database, taskId: string): number {
-  return db
-    .prepare(
-      "UPDATE messages_in SET status = 'pending' WHERE (id = ? OR series_id = ?) AND kind = 'task' AND status = 'paused'",
-    )
-    .run(taskId, taskId).changes;
+  const resume = db.transaction(() => {
+    const rows = db
+      .prepare("SELECT id FROM messages_in WHERE (id = ? OR series_id = ?) AND kind = 'task' AND status = 'paused'")
+      .all(taskId, taskId) as Array<{ id: string }>;
+    let touched = 0;
+    for (const row of rows) {
+      db.prepare("DELETE FROM messages_in WHERE id = ? AND kind = 'system'").run(`recall-${row.id}`);
+      touched += db
+        .prepare(
+          `UPDATE messages_in
+              SET seq = ?, status = 'pending', trigger = 0
+            WHERE id = ? AND kind = 'task' AND status = 'paused'`,
+        )
+        .run(nextEvenSeq(db), row.id).changes;
+    }
+    return touched;
+  });
+  return resume.immediate();
 }
 
 export function deleteTask(db: Database.Database, taskId: string): number {
@@ -117,19 +130,18 @@ export interface TaskUpdate {
 // occurrence of a recurring task is updated, not just the completed row the
 // agent last saw. Returns the number of rows touched.
 export function updateTask(db: Database.Database, taskId: string, update: TaskUpdate): number {
-  const rows = db
-    .prepare(
-      "SELECT id, content FROM messages_in WHERE (id = ? OR series_id = ?) AND kind = 'task' AND status IN ('pending', 'paused')",
-    )
-    .all(taskId, taskId) as Array<{ id: string; content: string }>;
-
-  if (rows.length === 0) return 0;
-
   const setProcessAfter = update.processAfter !== undefined;
   const setRecurrence = update.recurrence !== undefined;
   const mergeContent = update.prompt !== undefined || update.script !== undefined || update.flagIntent !== undefined;
 
-  const tx = db.transaction(() => {
+  const updateRows = db.transaction(() => {
+    const rows = db
+      .prepare(
+        "SELECT id, content FROM messages_in WHERE (id = ? OR series_id = ?) AND kind = 'task' AND status IN ('pending', 'paused')",
+      )
+      .all(taskId, taskId) as Array<{ id: string; content: string }>;
+
+    let touched = 0;
     for (const row of rows) {
       let content = row.content;
       if (mergeContent) {
@@ -145,9 +157,13 @@ export function updateTask(db: Database.Database, taskId: string, update: TaskUp
         content = JSON.stringify(parsed);
       }
 
-      // Build SET clause dynamically so callers can update fields independently.
-      const sets: string[] = ['content = ?'];
-      const params: unknown[] = [content];
+      // Any live edit can change what the next provider invocation should
+      // execute or when it should execute. Invalidate an already-admitted
+      // recall and move the task to a fresh inert seq in the same transaction;
+      // the due-admission seam will rebuild current context before waking.
+      db.prepare("DELETE FROM messages_in WHERE id = ? AND kind = 'system'").run(`recall-${row.id}`);
+      const sets: string[] = ['seq = ?', 'trigger = 0', 'content = ?'];
+      const params: unknown[] = [nextEvenSeq(db), content];
       if (setProcessAfter) {
         sets.push('process_after = ?');
         params.push(update.processAfter);
@@ -158,11 +174,17 @@ export function updateTask(db: Database.Database, taskId: string, update: TaskUp
       }
       params.push(row.id);
 
-      db.prepare(`UPDATE messages_in SET ${sets.join(', ')} WHERE id = ?`).run(...params);
+      touched += db
+        .prepare(
+          `UPDATE messages_in
+              SET ${sets.join(', ')}
+            WHERE id = ? AND kind = 'task' AND status IN ('pending', 'paused')`,
+        )
+        .run(...params).changes;
     }
+    return touched;
   });
-  tx();
-  return rows.length;
+  return updateRows.immediate();
 }
 
 // Only tasks carry a recurrence (non-task writeSessionMessage never sets one),
@@ -285,8 +307,8 @@ export interface TaskRowSnapshot {
  */
 export function restoreTaskRow(db: Database.Database, snapshot: TaskRowSnapshot): void {
   db.prepare(
-    `INSERT INTO messages_in (id, seq, kind, timestamp, status, tries, process_after, recurrence, platform_id, channel_type, thread_id, content, series_id)
-     VALUES (@id, @seq, @kind, datetime('now'), @status, 0, @processAfter, @recurrence, @platformId, @channelType, @threadId, @content, @seriesId)`,
+    `INSERT INTO messages_in (id, seq, kind, timestamp, status, tries, process_after, recurrence, platform_id, channel_type, thread_id, content, series_id, trigger)
+     VALUES (@id, @seq, @kind, datetime('now'), @status, 0, @processAfter, @recurrence, @platformId, @channelType, @threadId, @content, @seriesId, 0)`,
   ).run({
     id: snapshot.id,
     seq: nextEvenSeq(db),

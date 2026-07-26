@@ -20,7 +20,6 @@ import path from 'path';
 import { GROUPS_DIR } from './config.js';
 import { readContainerConfig, validateMcpServers, type McpServerConfig } from './container-config.js';
 import { getContainerConfig } from './db/container-configs.js';
-import { buildSessionServicesSnapshot, renderSessionCapabilities } from './capabilities.js';
 import { flattenClaudeMd } from './agents-md-flatten.js';
 import { capCodexProjectDoc } from './codex-project-doc-cap.js';
 import { rewriteCodexRtkGuidance } from './codex-rtk-guidance.js';
@@ -126,21 +125,6 @@ export function composeGroupClaudeMd(group: AgentGroup, provider: string): void 
     }
   }
 
-  // Session capabilities fragment — the services actually wired into this
-  // container (Looker, Google Workspace, Snowflake, …) with their activation
-  // steps, so the agent reads them every turn instead of (wrongly) concluding
-  // it lacks access and rediscovering each session. Push, not pull: the same
-  // snapshot the `get_capabilities` MCP tool returns, baked into the prompt.
-  // Best-effort — a failure here must never block CLAUDE.md regeneration.
-  try {
-    const capsFragment = renderSessionCapabilities(buildSessionServicesSnapshot(group.id));
-    if (capsFragment) {
-      desired.set('session-capabilities.md', { type: 'inline', content: capsFragment });
-    }
-  } catch (err) {
-    log.warn('Session capabilities fragment skipped', { group: group.id, err: String(err) });
-  }
-
   // Always-on agent-plugin rulesets — NON-Claude groups only. A Claude group
   // gets a plugin's always-on behavior from its mounted SessionStart hook
   // (CLAUDE_PLUGINS_ROOT auto-loads it); Codex/OpenCode containers fire NO
@@ -161,7 +145,7 @@ export function composeGroupClaudeMd(group: AgentGroup, provider: string): void 
     for (const name of pluginDirs) {
       if (excluded.has(name)) continue;
       const rulesetFile = path.join(pluginsRoot, name, '.nanoclaw-always-on.md');
-      let content = '';
+      let content: string;
       try {
         if (!fs.statSync(rulesetFile).isFile()) continue;
         content = fs.readFileSync(rulesetFile, 'utf-8').trim();
@@ -241,9 +225,10 @@ export function composeGroupClaudeMd(group: AgentGroup, provider: string): void 
  * For each group dir:
  *   - remove `.claude-global.md` symlink if present
  *   - rename `CLAUDE.md` → `CLAUDE.local.md` (only if `CLAUDE.local.md`
- *     doesn't already exist — preserves pre-cutover content as per-group
- *     memory; after the first spawn regenerates `CLAUDE.md`, this branch
- *     is skipped because `CLAUDE.local.md` now exists)
+ *     doesn't already exist — byte-preserves pre-cutover content as per-group
+ *     standing instructions for explicit instruction reconciliation; after the
+ *     first spawn regenerates `CLAUDE.md`, this branch is skipped because
+ *     `CLAUDE.local.md` now exists)
  *
  * Globally:
  *   - delete `groups/global/` (content already in `container/CLAUDE.md`)

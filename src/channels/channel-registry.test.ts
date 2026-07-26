@@ -27,6 +27,34 @@ function now() {
   return new Date().toISOString();
 }
 
+function readPairedInboundTriggers(db: Database.Database) {
+  const rows = db.prepare('SELECT * FROM messages_in ORDER BY seq').all() as Array<{
+    id: string;
+    seq: number;
+    kind: string;
+    trigger: number;
+    content: string;
+  }>;
+  const triggers = rows.filter((row) => row.trigger === 1 && row.kind !== 'system');
+  const recallRows = rows.filter((row) => {
+    if (row.kind !== 'system' || row.trigger !== 0) return false;
+    return (JSON.parse(row.content) as { subtype?: string }).subtype === 'recall_context';
+  });
+  expect(recallRows).toHaveLength(triggers.length);
+  for (const trigger of triggers) {
+    const index = rows.indexOf(trigger);
+    const recall = rows[index - 1];
+    expect(recall).toMatchObject({
+      id: `recall-${trigger.id}`,
+      kind: 'system',
+      trigger: 0,
+      seq: trigger.seq - 2,
+    });
+    expect(JSON.parse(recall!.content)).toMatchObject({ subtype: 'recall_context' });
+  }
+  return triggers;
+}
+
 /** Create a mock ChannelAdapter for testing. */
 function createMockAdapter(
   channelType: string,
@@ -315,7 +343,7 @@ describe('channel + router integration', () => {
 
     const dbPath = inboundDbPath('ag-1', session!.id);
     const db = new Database(dbPath);
-    const rows = db.prepare('SELECT * FROM messages_in').all() as Array<{ id: string; content: string }>;
+    const rows = readPairedInboundTriggers(db);
     db.close();
 
     expect(rows).toHaveLength(1);
