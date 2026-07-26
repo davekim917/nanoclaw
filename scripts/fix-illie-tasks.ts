@@ -127,9 +127,9 @@ Sections (in order):
       }
     }
     if (!illieSessionId) {
-      illieSessionId = 'sess-1776731585802-242url9';
-      illieSessDir = path.join(SESSIONS_DIR, illieId, illieSessionId);
-      if (!fs.existsSync(illieSessDir)) fs.mkdirSync(illieSessDir, { recursive: true });
+      throw new Error(
+        'No existing Illie session with inbound.db found; refusing to fabricate a session directory',
+      );
     }
   }
   console.log(`  Using session: ${illieSessionId}`);
