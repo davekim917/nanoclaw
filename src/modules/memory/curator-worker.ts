@@ -37,8 +37,9 @@ import {
 import { readGeneratedMemory, writeGeneratedMemory, type CuratorWriteResult } from './curator-write.js';
 
 const MAX_RAW_MESSAGES = 80;
-const MAX_EPISODE_MESSAGES = 20;
+const MAX_EPISODE_MESSAGES = 80;
 const MAX_EPISODE_CHARS = 24_000;
+const EPISODE_TRUNCATION_MARKER = '\n[truncated:episode]';
 const MAX_MANUAL_FILES = 256;
 const MAX_MANUAL_SCAN_BYTES = 1_048_576;
 const MAX_MANUAL_FILE_BYTES = 65_536;
@@ -169,7 +170,9 @@ export function boundEpisodeMessages(raw: MemoryCurationArchiveRow[]): {
     const text =
       item.text.length <= remaining
         ? item.text
-        : `${item.text.slice(0, Math.max(0, remaining - 24))}\n[truncated:episode]`;
+        : remaining > EPISODE_TRUNCATION_MARKER.length
+          ? `${item.text.slice(0, remaining - EPISODE_TRUNCATION_MARKER.length)}${EPISODE_TRUNCATION_MARKER}`
+          : item.text.slice(0, remaining);
     messages.push({ ...item, text });
     transcriptChars += text.length;
   }

@@ -77,7 +77,7 @@ sent over stdin, safe mode excludes project and user customizations, and the
 Anthropic model endpoint bypasses the OneCLI credential proxy so the gateway
 cannot replace the selected identity. The host also recovers the real primary
 from `.env` when the OneCLI service wrapper has shadowed it with its
-`placeholder` sentinel. Each job is bounded to 20 de-duplicated messages and
+`placeholder` sentinel. Each job is bounded to 80 de-duplicated messages and
 24,000 transcript characters, the current generated file, and up to three
 relevant manual-memory excerpts. Its default decision is `noop`.
 It captures only durable decisions, corrections, stable cross-task

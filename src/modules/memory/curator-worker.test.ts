@@ -262,6 +262,28 @@ describe('memory curator worker', () => {
     expect(result.handledThroughRowid).toBe(3);
   });
 
+  it('batches up to eighty short messages without increasing the transcript character ceiling', () => {
+    const raw = Array.from({ length: 81 }, (_, index) =>
+      message(index + 1, `msg-${index + 1}`, `short message ${index + 1}`),
+    );
+    const result = boundEpisodeMessages(raw);
+    expect(result.messages).toHaveLength(80);
+    expect(result.handledThroughRowid).toBe(80);
+    expect(result.transcriptChars).toBeLessThanOrEqual(24_000);
+  });
+
+  it('never lets a truncation marker exceed the transcript character ceiling', () => {
+    const result = boundEpisodeMessages([
+      message(1, 'msg-1', 'a'.repeat(30_000)),
+      message(2, 'msg-2', 'second message must remain pending'),
+    ]);
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0]?.text).toHaveLength(24_000);
+    expect(result.messages[0]?.text.endsWith('\n[truncated:episode]')).toBe(true);
+    expect(result.transcriptChars).toBe(24_000);
+    expect(result.handledThroughRowid).toBe(1);
+  });
+
   it('retires thresholded maintenance deterministically without another model-authored document', async () => {
     const current = [
       '# Generated workgroup memory',
